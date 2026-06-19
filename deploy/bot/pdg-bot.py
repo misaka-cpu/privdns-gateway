@@ -495,22 +495,12 @@ def handle_text(chat, text):
 
 def main():
     post("deleteWebhook", {"drop_pending_updates": False})
+    # 菜单只留快捷入口(其余功能走消息里的内联按钮, 避免与按钮重复);
+    # 其它斜杠命令(/exits /addexit /addrs …)仍可手打, 只是不塞进左下角菜单。
     cmds = [
-        {"command": "start", "description": "状态与菜单"},
-        {"command": "status", "description": "查看状态"},
-        {"command": "exits", "description": "出口列表"},
-        {"command": "addexit", "description": "添加出口(ss/vmess/trojan/vless)"},
-        {"command": "delexit", "description": "删除出口"},
-        {"command": "rules", "description": "分流规则"},
-        {"command": "addrule", "description": "添加规则(域名→出口|direct)"},
-        {"command": "delrule", "description": "删除规则"},
-        {"command": "addrs", "description": "添加规则集(.list/.srs URL→出口)"},
-        {"command": "delrs", "description": "删除规则集"},
-        {"command": "setfinal", "description": "设默认出口"},
-        {"command": "restart", "description": "重启服务"},
-        {"command": "update", "description": "更新规则库"},
-        {"command": "cancel", "description": "取消当前操作"}]
-    # 同时设 default 与 all_private_chats 两个 scope, 防止被其它 bot 残留的高优先级 scope 盖住
+        {"command": "start", "description": "打开菜单 / 状态"},
+        {"command": "cancel", "description": "取消当前输入"}]
+    # 两个 scope 都设, 防被其它 bot 残留的高优先级 scope 盖住
     post("setMyCommands", {"commands": cmds})
     post("setMyCommands", {"commands": cmds, "scope": {"type": "all_private_chats"}})
     print("pdg-bot v2 started, allowed:", ALLOWED, flush=True)
