@@ -35,7 +35,7 @@
 ## 一键安装 (Debian 12+ / Ubuntu 22+)
 
 ```bash
-git clone https://github.com/<你的用户名>/privdns-gateway.git
+git clone https://github.com/misaka-cpu/privdns-gateway.git
 cd privdns-gateway
 sudo ./install.sh
 ```

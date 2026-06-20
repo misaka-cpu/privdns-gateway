@@ -94,7 +94,8 @@ def _nav(key):
             [{"text": "🌐 DoT 自定义域名", "callback_data": "setdot"}]]),
         "ops": ("🛠 <b>运维</b> — 选一项:", [
             [{"text": "🔄 重启服务", "callback_data": "restart"}, {"text": "📦 更新规则库", "callback_data": "updgeo"}],
-            [{"text": "💾 备份", "callback_data": "backup"}, {"text": "♻️ 恢复", "callback_data": "restore"}]]),
+            [{"text": "💾 备份", "callback_data": "backup"}, {"text": "♻️ 恢复", "callback_data": "restore"}],
+            [{"text": "🌐 DNS 上游", "callback_data": "dnsup"}]]),
     }
     title, rows = subs[key]
     return title, {"inline_keyboard": rows + [[{"text": "⬅️ 返回主菜单", "callback_data": "menu"}]]}
@@ -288,6 +289,54 @@ def _write_direct(domains):
     with open(MOSDNS_DIRECT, "w") as f:
         f.write("# pdg-bot 自定义直连\n" + "".join("domain:" + d + "\n" for d in sorted(set(domains))))
     sh(["systemctl", "restart", "mosdns"])
+
+# ── mosdns DNS 上游 (remote=国际 / local=国内; 用于接 DNS 解锁等自定义解析器) ──
+def _upstreams(which):
+    tag = which + "_upstream"
+    try:
+        lines = open(MOSDNS_CONF).read().splitlines()
+    except Exception:  # noqa: BLE001
+        return []
+    for i, ln in enumerate(lines):
+        if ln.strip() == f"- tag: {tag}":
+            for j in range(i, min(i + 6, len(lines))):
+                if "upstreams" in lines[j]:
+                    return re.findall(r'addr:\s*"?([^",}\s]+)"?', lines[j])
+    return []
+
+def set_mosdns_upstream(which, addrs):
+    if which not in ("remote", "local"):
+        return False, "第一个词只能是 remote(国际) 或 local(国内)"
+    addrs = [a.strip() for a in addrs if a.strip()]
+    if not addrs:
+        return False, "至少给一个 DNS 地址 (udp://1.2.3.4:53 / tcp://.. / https://x/dns-query / tls://..)"
+    tag = which + "_upstream"
+    try:
+        lines = open(MOSDNS_CONF).read().splitlines()
+    except Exception as e:  # noqa: BLE001
+        return False, f"读 mosdns 配置失败: {e}"
+    items = ", ".join('{addr: "%s"}' % a for a in addrs)
+    done = False
+    for i, ln in enumerate(lines):
+        if ln.strip() == f"- tag: {tag}":
+            for j in range(i, min(i + 6, len(lines))):
+                if "upstreams" in lines[j]:
+                    indent = lines[j][:len(lines[j]) - len(lines[j].lstrip())]
+                    lines[j] = indent + "args: { upstreams: [ %s ] }" % items
+                    done = True
+                    break
+        if done:
+            break
+    if not done:
+        return False, f"没在 mosdns 配置里找到 {tag} 块"
+    shutil.copy(MOSDNS_CONF, MOSDNS_CONF + ".botbak")
+    with open(MOSDNS_CONF, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    sh(["systemctl", "restart", "mosdns"])
+    if sh(["systemctl", "is-active", "mosdns"]).stdout.strip() != "active":
+        shutil.copy(MOSDNS_CONF + ".botbak", MOSDNS_CONF); sh(["systemctl", "restart", "mosdns"])
+        return False, "mosdns 重启失败(配置可能不合法), 已回滚"
+    return True, f"✅ {which} 上游已设为: {', '.join(addrs)}"
 
 # ── 规则集 (Surge .list -> sing-box local rule_set) ──
 def _rs_meta():
@@ -788,6 +837,15 @@ def handle_cb(chat, mid, data):
         state[chat] = "restore"
         edit(chat, mid, "把之前「💾 备份」得到的 <code>.tar.gz</code> 作为文件发给我即可恢复"
              "(先 sing-box check, 失败自动回滚)。\n/cancel 取消。", BACK); return
+    if data == "dnsup":
+        state[chat] = "set_dns"
+        rem = _upstreams("remote"); loc = _upstreams("local")
+        edit(chat, mid, "🌐 <b>mosdns DNS 上游</b>\n"
+             f"国际(remote): <code>{', '.join(rem) or '?'}</code>\n"
+             f"国内(local): <code>{', '.join(loc) or '?'}</code>\n\n"
+             "改: 发「<b>remote 地址…</b>」或「<b>local 地址…</b>」(可多个, 空格分隔)\n"
+             "接 DNS 解锁: <code>remote udp://解锁DNS的IP:53</code>\n"
+             "恢复默认国际: <code>remote https://1.1.1.1/dns-query udp://8.8.8.8:53</code>\n/cancel 取消。", BACK); return
     if data == "restart":
         ok, msg = apply_sb(lambda c: None); sh(["systemctl", "restart", "mosdns"])
         edit(chat, mid, "✅ 已重启 sing-box + mosdns" if ok else msg, MENU); return
@@ -906,6 +964,11 @@ def handle_text(chat, text):
             send_plain(chat, "格式: 规则集URL 出口"); return
         send_plain(chat, "正在下载规则集…")
         ok, msg = add_ruleset(p[0], p[1]); send_plain(chat, ("✅ " if ok else "") + msg); return
+    if act == "set_dns":
+        p = text.split()
+        if len(p) < 2:
+            send_plain(chat, "格式: remote|local 地址1 [地址2 …]"); return
+        ok, msg = set_mosdns_upstream(p[0].lower(), p[1:]); send_plain(chat, msg if ok else ("❌ " + msg)); return
     if act == "set_dot":
         send_plain(chat, "正在校验域名并签发证书(约 30-60 秒, 期间代理短暂中断)…")
         ok, msg = set_dot_domain(text); send_plain(chat, msg if ok else ("❌ " + msg)); return
