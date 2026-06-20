@@ -11,7 +11,7 @@ UI 原地编辑消息(editMessageText), 不刷屏。改 sing-box 前备份, chec
 注: 模块可被 import (供定时任务调用 refresh_rulesets), 此时无需 token。
 """
 from __future__ import annotations
-import base64, hashlib, io, json, os, re, shutil, socket, subprocess, tarfile, tempfile, time, uuid
+import base64, hashlib, http.client, io, json, os, re, shutil, socket, subprocess, tarfile, tempfile, time, uuid
 import urllib.parse, urllib.request, urllib.error
 from collections import Counter
 
@@ -31,15 +31,30 @@ DELAY_URL = "http://www.gstatic.com/generate_204"
 API = "https://api.telegram.org/bot" + TOKEN
 state: dict[int, str] = {}
 
-# ── Telegram ──
+# ── Telegram (复用一条 HTTPS 长连接, 省掉每次 TLS 握手 → 按钮响应更快) ──
+_conn = None
+
 def post(method, params):
-    try:
-        req = urllib.request.Request(API + "/" + method, data=json.dumps(params).encode(),
-                                     headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=70) as r:
-            return json.load(r)
-    except Exception as e:  # noqa: BLE001
-        print("api", method, e); return {}
+    global _conn
+    body = json.dumps(params).encode()
+    path = "/bot" + TOKEN + "/" + method
+    hdr = {"Content-Type": "application/json", "Connection": "keep-alive"}
+    for attempt in (0, 1):                       # 连接断了就重连重试一次
+        try:
+            if _conn is None:
+                _conn = http.client.HTTPSConnection("api.telegram.org", timeout=70)
+            _conn.request("POST", path, body, hdr)
+            data = _conn.getresponse().read()
+            return json.loads(data) if data else {}
+        except Exception as e:  # noqa: BLE001
+            try:
+                if _conn:
+                    _conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+            _conn = None
+            if attempt:
+                print("api", method, e); return {}
 
 def send_document(chat, filename, data, caption=""):
     """multipart/form-data 上传文件 (备份 / iOS 描述文件)。"""
@@ -755,8 +770,10 @@ def _groups_desc(c):
     return "\n".join(f"🔀 故障组 <b>{o['tag']}</b>: {' › '.join(o.get('outbounds', []))}" for o in g)
 
 def status_text():
+    _st = sh(["systemctl", "is-active", "mosdns", "sing-box", "pdg-bot"]).stdout.split()
+    _states = dict(zip(["mosdns", "sing-box", "pdg-bot"], _st + ["?", "?", "?"]))
     def dot(s):
-        return "🟢" if sh(["systemctl", "is-active", s]).stdout.strip() == "active" else "🔴"
+        return "🟢" if _states.get(s) == "active" else "🔴"
     c = load(); exits = exit_tags(c)
     g = _groups_desc(c)
     final = c["route"].get("final")
