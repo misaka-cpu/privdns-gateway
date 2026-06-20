@@ -119,6 +119,11 @@ install -m755 "$REPO_DIR"/deploy/cert/proxy-gateway-open-cert-http.sh     /usr/l
 install -m755 "$REPO_DIR"/deploy/cert/proxy-gateway-restore-firewall.sh   /usr/local/bin/
 install -m755 "$REPO_DIR"/deploy/cert/99-reload-cert.deploy-hook.sh       /etc/letsencrypt/renewal-hooks/deploy/99-pdg-cert.sh
 install -m755 "$REPO_DIR"/deploy/bot/pdg-set-token.sh                     /usr/local/bin/pdg-set-token
+install -m755 "$REPO_DIR"/deploy/bot/pdg.sh                               /usr/local/bin/pdg
+# 把仓库放到 /opt/privdns-gateway 供 `pdg update` / `pdg uninstall` 用
+if [[ "$REPO_DIR" != "/opt/privdns-gateway" ]]; then
+  [[ -d /opt/privdns-gateway/.git ]] || { rm -rf /opt/privdns-gateway; cp -a "$REPO_DIR" /opt/privdns-gateway 2>/dev/null || true; }
+fi
 : > /etc/mosdns/rules/custom_direct.txt
 
 render(){ sed -e "s|__SERVER_IP__|$SERVER_IP|g" -e "s|__INTERNAL_CIDR__|$INTERNAL_CIDR|g" \
@@ -226,5 +231,6 @@ cat <<EOF
   3) iOS 用户: bot「📱 客户端 → iOS 描述文件」, 装上即可(蜂窝探测 :81 已就绪)
   4) 换域名随时用 bot「🌐 DoT 自定义域名」
 
+🛠 日常管理:  sudo pdg   (状态 / 更新 / 换 token / 重启 / 日志 / 卸载)
 ⚠️ SSH 端口当前按 $SSH_PORT 放行; 若你之后改 sshd Port, 记得同步改 /etc/nftables.conf 再 nft -f。
 EOF

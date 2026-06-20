@@ -57,6 +57,20 @@ cd privdns-gateway && sudo ./install.sh
 3. iOS:bot **📱 客户端 → iOS 描述文件**,装上即可(蜂窝双卡探测 `:81` 已自动配好)。
 4. 换域名:bot **🌐 DoT 自定义域名**,自动签证书并切换。
 
+## 日常管理
+
+```bash
+sudo pdg            # 进管理菜单
+sudo pdg update     # 一键更新到最新代码(git pull + 刷新, 不动配置/出口/token)
+sudo pdg token      # 设置 / 更换 bot token
+sudo pdg status     # 状态
+sudo pdg restart    # 重启服务
+sudo pdg log [n]    # 看日志
+sudo pdg uninstall [--purge]   # 卸载(--purge 连配置删)
+```
+
+> 分工:`pdg` 管**生命周期**(装/更新/卸载/token/状态);**出口 / 分流 / DNS 上游**等运行时配置都在 Telegram bot 里。
+
 ## 组成
 
 | 层 | 用什么 | 说明 |
