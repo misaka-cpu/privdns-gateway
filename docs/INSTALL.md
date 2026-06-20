@@ -84,6 +84,12 @@ sudo PDG_NONINTERACTIVE=1 \
 - **sing-box 固定 1.12.x**。1.13 移除了 `sniff_override_destination`,升级即失效。
 - mosdns v5.x。
 
+### 关于 "入站字段已废弃" 的启动告警
+
+sing-box 1.12 启动时会打一条**告警(不是错误)**:入站的 `sniff` / `sniff_override_destination` 字段已废弃、将在后续版本移除。
+
+**这是预期的、可忽略**。本网关正是依赖老写法的 `sniff_override_destination`(把连接目标改写成嗅探到的域名)才能工作;1.13 的新写法(`action: sniff`)**不覆盖目标地址**,会导致流量回环——所以本项目**刻意锁 1.12.x**。看到这条告警说明版本正确,服务照常运行,不用管。
+
 ## 卸载
 
 ```bash

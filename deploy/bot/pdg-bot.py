@@ -609,7 +609,7 @@ def set_dot_domain(domain):
     return True, (f"✅ DoT 域名已设为 <b>{domain}</b>\n"
                   f"• 手机私密 DNS 改成: <code>{domain}</code>\n"
                   "• 证书已签发, certbot.timer 自动续期\n"
-                  "• iOS: 重点一下「📱 iOS 描述文件」即可(自动用新域名)")
+                  "• iOS: 重新生成一次「📱 iOS 描述文件」即可(自动用新域名)")
 
 # ── iOS 描述文件 ──
 def _ios_profile():
@@ -657,7 +657,23 @@ def restore_from(data):
         newsb = os.path.join(tmp, "etc/sing-box/config.json")
         if not os.path.exists(newsb):
             return False, "备份里没有 sing-box 配置, 拒绝恢复"
-        chk = sh(["sing-box", "check", "-c", newsb])
+        # 校验前把 rule_set 的绝对路径临时指向解包出来的 rs/ —— 否则 check 会去找真实位置
+        # (备份里带着这些 rs 文件, 但此刻还没恢复到 /etc/sing-box/rs/, 直接 check 会 "no such file")。
+        checksb = newsb
+        try:
+            cfg = json.load(open(newsb))
+            changed = False
+            for rs in cfg.get("route", {}).get("rule_set", []):
+                p = rs.get("path", "")
+                cand = os.path.join(tmp, p.lstrip("/")) if p.startswith("/") else ""
+                if cand and os.path.exists(cand):
+                    rs["path"] = cand; changed = True
+            if changed:
+                checksb = newsb + ".check"
+                json.dump(cfg, open(checksb, "w"), ensure_ascii=False)
+        except Exception:  # noqa: BLE001
+            pass
+        chk = sh(["sing-box", "check", "-c", checksb])
         if chk.returncode != 0:
             return False, "备份的 sing-box 配置校验失败:\n" + (chk.stdout + chk.stderr)[-300:]
         ts = time.strftime("%Y%m%d-%H%M%S")
@@ -815,10 +831,9 @@ def handle_cb(chat, mid, data):
         edit(chat, mid, "正在生成 iOS 描述文件…", None)
         try:
             send_document(chat, "PrivDNS-Gateway.mobileconfig", _ios_profile(),
-                          f"📱 iOS/iPadOS 私密DNS 描述文件 (DoT {_dot_host()} → {_server_ip()})\n"
-                          "装法: 存到「文件」App → 点开 → 设置→「通用」→「已下载描述文件」→ 安装。\n"
-                          "⚠️ OnDemand 蜂窝规则探测 http://&lt;IP&gt;:81/probe, 需在服务器放一个只对内网卡放行的 "
-                          ":81→204 端点才会在蜂窝下激活(可让我帮你配)。")
+                          f"📱 iOS/iPadOS 私密DNS 描述文件\nDoT: {_dot_host()}\n"
+                          "装法: 存到「文件」App → 点开 → 设置→通用→「已下载描述文件」→ 安装。\n"
+                          "蜂窝下靠服务器 :81 探测激活, 安装时已自动配好。")
             edit(chat, mid, "✅ 描述文件已发送(见上一条)。", MENU)
         except Exception as e:  # noqa: BLE001
             edit(chat, mid, f"生成失败: {e}", MENU)
