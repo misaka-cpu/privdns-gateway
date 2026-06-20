@@ -147,3 +147,27 @@ gvt2.com / gvt3.com / android.com`，`systemctl restart dnsdist` 生效。
 ### bot 内联菜单改二级
 - 一级只留：状态 / 测出口 / 流量 + 四分类（📤出口管理 / 📑分流管理 / 📱客户端 / 🛠运维）；点分类展开二级子菜单，
   每个子菜单自带「返回主菜单」。`_nav(key)` 生成子菜单。减少一屏按钮。
+
+---
+
+## 阶段五：安全审查 + bug 修复（2026-06-20，已部署）
+
+一轮代码/配置审查，发现并修了 2 个安全问题 + 3 个 bug：
+
+### 🔴 安全：关闭 :53 开放解析器
+- 原 nftables `udp dport 53 accept`（无源限制）= **任意外网 IP 都能拿本机当 DNS 解析器** → DNS 放大攻击/被滥用。
+- 手机走 DoT(853) 不需要明文 53。改 `deploy/firewall/nftables.conf`：对全网只留 `{22, 853}`，
+  把 `53/80/81/443` 全收到 `ip saddr 172.22.0.0/16`。本机自身 DNS 走 127.0.0.1 经 lo 不受影响（实测内网卡源 53 仍正常 spoof）。
+
+### 🟠 安全：停掉 :8111 全网列目录服务器
+- 5GPN 残留 `proxy-gateway-ios-profile.service` = `python3 -m http.server 8111 --bind 0.0.0.0`，
+  把 `/opt/proxy-gateway/www`（含 DoT 域名+IP 的 iOS 描述文件）整目录暴露给全网，且已被 bot 的 sendDocument 取代。
+  `systemctl disable --now` + 防火墙撤掉 8111。
+
+### 🟠 Bug：证书续期会串证书
+- deploy-hook 原按 `RENEWED_LINEAGE` 部署 → 切自定义域名后，旧 `gkgj` 域名续期会把 gkgj 证书**覆盖回**活动域名，DoT 失配。
+- 改为以 `/opt/pdg-bot/dot-domain`（活动域名）为准，多域名也只部署当前生效那张；并写入当前 `gkgj.abrdns.com` 使其确定。
+
+### 🟡 Bug（bot）
+- `getUpdates` 网络出错时无退避 → 断网紧打循环。加 `if not r.get("ok"): sleep(3); continue`。
+- `del_rule` 清理过滤器漏了 `domain_keyword`（潜在会误删带关键词的规则）。补进保留条件。

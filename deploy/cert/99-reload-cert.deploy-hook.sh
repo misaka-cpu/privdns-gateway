@@ -3,11 +3,15 @@
 # 续期/签发后把证书拷到 mosdns(853 DoT) 读取的位置并重载 mosdns。
 # 选哪张证书: 优先 certbot 注入的 RENEWED_LINEAGE; 否则 /opt/pdg-bot/dot-domain 指定的活动域名; 再否则最近的 live。
 set -e
+# 活动 DoT 域名优先 (/opt/pdg-bot/dot-domain): 多域名时, 即便续期的是另一张证书,
+# 也只把"当前生效域名"的证书部署给 mosdns, 否则旧域名续期会把活动证书覆盖掉 → DoT 不匹配。
 DOMAIN_FILE=/opt/pdg-bot/dot-domain
-if [[ -n "${RENEWED_LINEAGE:-}" ]]; then
+ACTIVE=""
+[[ -f "$DOMAIN_FILE" ]] && ACTIVE="$(head -n1 "$DOMAIN_FILE" | tr -d '[:space:]')"
+if [[ -n "$ACTIVE" ]] && [[ -d "/etc/letsencrypt/live/$ACTIVE" ]]; then
+    LIVE_DIR="/etc/letsencrypt/live/$ACTIVE"
+elif [[ -n "${RENEWED_LINEAGE:-}" ]]; then
     LIVE_DIR="$RENEWED_LINEAGE"
-elif [[ -f "$DOMAIN_FILE" ]] && [[ -d "/etc/letsencrypt/live/$(head -n1 "$DOMAIN_FILE")" ]]; then
-    LIVE_DIR="/etc/letsencrypt/live/$(head -n1 "$DOMAIN_FILE")"
 else
     LIVE_DIR=$(find /etc/letsencrypt/live -maxdepth 1 -type d ! -path /etc/letsencrypt/live | sort | head -n1)
 fi

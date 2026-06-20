@@ -511,7 +511,8 @@ def del_rule(domain):
                         r[k] = [d for d in r[k] if d != domain]
             cc["route"]["rules"] = [r for r in cc["route"]["rules"]
                                     if r.get("action") or "outbound" not in r or r.get("rule_set")
-                                    or r.get("domain_suffix") or r.get("domain") or r.get("ip_cidr")]
+                                    or r.get("domain_suffix") or r.get("domain")
+                                    or r.get("domain_keyword") or r.get("ip_cidr")]
         apply_sb(mod); removed.append("出口规则")
     if domain in _read_direct():
         _write_direct([d for d in _read_direct() if d != domain]); removed.append("直连表")
@@ -944,6 +945,8 @@ def main():
     off = 0
     while True:
         r = post("getUpdates", {"offset": off, "timeout": 50})
+        if not r.get("ok"):          # 网络/API 出错 → 退避, 别紧打循环
+            time.sleep(3); continue
         for u in r.get("result", []):
             off = u["update_id"] + 1
             try:
