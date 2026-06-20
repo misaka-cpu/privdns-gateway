@@ -45,7 +45,7 @@ cmd_update(){
   python3 -m py_compile /opt/pdg-bot/bot.py 2>/dev/null || { c_y "新 bot.py 语法异常?? 已保留旧服务"; }
   systemctl daemon-reload
   systemctl restart pdg-bot pdg-probe81 2>/dev/null || true
-  c_g "✅ 已更新。$(git -C "$REPO_DIR" log --oneline -1 2>/dev/null)"
+  c_g "✅ 已更新。"
 }
 
 cmd_token(){ need_root token; pdg-set-token; }   # 不 exec, 设完/取消都回菜单
