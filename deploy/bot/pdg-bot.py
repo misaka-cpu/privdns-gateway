@@ -684,6 +684,28 @@ def backup_blob():
             tar.add(RS_DIR, arcname=RS_DIR.lstrip("/"))
     return buf.getvalue()
 
+def _machine_id(sb_path, mos_path):
+    """取一对 sing-box/mosdns 配置里的「本机身份」: (server_ip, internal_cidr, cert_dir)。"""
+    ip = cidr = certdir = None
+    try:
+        c = json.load(open(sb_path))
+        for r in c.get("route", {}).get("rules", []):
+            if r.get("action") == "reject":
+                for x in r.get("ip_cidr", []):
+                    if x.endswith("/32") and not x.startswith("127."):
+                        ip = x.split("/")[0]
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        t = open(mos_path).read()
+        m = re.search(r'ips:\s*\[\s*"([^"]+)"', t); cidr = m.group(1) if m else None
+        m = re.search(r'cert:\s*"([^"]+)"', t); certdir = os.path.dirname(m.group(1)) if m else None
+        if not ip:
+            m = re.search(r'black_hole\s+([0-9.]+)', t); ip = m.group(1) if m else None
+    except Exception:  # noqa: BLE001
+        pass
+    return ip, cidr, certdir
+
 def restore_from(data):
     try:
         tar = tarfile.open(fileobj=io.BytesIO(data), mode="r:gz")
@@ -699,8 +721,23 @@ def restore_from(data):
             except Exception:  # noqa: BLE001
                 pass
         newsb = os.path.join(tmp, "etc/sing-box/config.json")
+        newmos = os.path.join(tmp, "etc/mosdns/config.yaml")
         if not os.path.exists(newsb):
             return False, "备份里没有 sing-box 配置, 拒绝恢复"
+        # 机器感知: 用「本机」身份覆盖备份带来的 server_ip / 内网卡段 / 证书路径。
+        # 这样跨机导入(如把 .153 的备份导到 .200)只搬出口+分流+规则集, 不会把别人的 IP/证书路径搬来搞错位。
+        cur = _machine_id(SB, MOSDNS_CONF)
+        bak = _machine_id(newsb, newmos)
+        kept = []
+        subs = [(bak[i], cur[i]) for i in range(3) if bak[i] and cur[i] and bak[i] != cur[i]]
+        if subs:
+            kept = [cur[i] for i in range(3) if bak[i] and cur[i] and bak[i] != cur[i]]
+            for f in (newsb, newmos):
+                if os.path.exists(f):
+                    s = open(f).read()
+                    for old, new in subs:
+                        s = s.replace(old, new)
+                    open(f, "w").write(s)
         # 校验前把 rule_set 的绝对路径临时指向解包出来的 rs/ —— 否则 check 会去找真实位置
         # (备份里带着这些 rs 文件, 但此刻还没恢复到 /etc/sing-box/rs/, 直接 check 会 "no such file")。
         checksb = newsb
@@ -736,7 +773,10 @@ def restore_from(data):
             shutil.copy(SB + ".pre-restore-" + ts, SB); sh(["systemctl", "restart", "sing-box"])
             return False, "恢复后 sing-box 启动失败, 已回滚 sing-box"
         sh(["systemctl", "restart", "mosdns"])
-        return True, "已恢复: " + ", ".join(restored) + "\n已重启 sing-box + mosdns"
+        msg = "已恢复: " + ", ".join(restored) + "\n已重启 sing-box + mosdns"
+        if subs:
+            msg += "\n(跨机导入: 已保留本机身份 " + "、".join(kept) + ", 只搬了出口+分流+规则集)"
+        return True, msg
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
