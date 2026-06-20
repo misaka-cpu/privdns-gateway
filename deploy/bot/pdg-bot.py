@@ -1137,9 +1137,10 @@ def main():
                         handle_document(m["chat"]["id"], m["document"])
                 elif "callback_query" in u:
                     q = u["callback_query"]
-                    post("answerCallbackQuery", {"callback_query_id": q["id"]})
+                    # 先改内容(handle_cb 里的 edit)再停转圈(answerCallbackQuery): 内容只等 1 个来回出现, 体感更跟手
                     if q["from"]["id"] in ALLOWED:
                         handle_cb(q["message"]["chat"]["id"], q["message"]["message_id"], q["data"])
+                    post("answerCallbackQuery", {"callback_query_id": q["id"]})
             except Exception as e:  # noqa: BLE001
                 print("handle err", e, flush=True)
 
