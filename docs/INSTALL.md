@@ -79,6 +79,25 @@ sudo PDG_NONINTERACTIVE=1 \
 
 > 本仓库的 install.sh 已在全新 Debian 12 上实跑验证(mosdns/sing-box/bot/防火墙全部起来、DNS 劫持分流正确)。
 
+## 需要开放的端口
+
+本机 nftables 由 install.sh 自动配置(已按下表收敛);**云厂商安全组(控制台那层防火墙)也要放行**。
+
+| 端口 | 协议 | 开放范围 | 用途 |
+|---|---|---|---|
+| 22 | tcp | 全网 | SSH 管理 |
+| 853 | tcp | 仅内网卡段 | **DoT — 手机私密 DNS 入口(核心)** |
+| 443 | tcp+udp | 仅内网卡段 | **sing-box 数据入口(嗅 SNI / QUIC)** |
+| 80 | tcp | 仅内网卡段 | sing-box HTTP 入口(嗅 Host) |
+| 53 | tcp+udp | 仅内网卡段 | 明文 DNS |
+| 81 | tcp | 仅内网卡段 | iOS OnDemand 探测端点 |
+| 9090 | tcp | 仅 127.0.0.1 | sing-box clash_api(bot 用,不对外) |
+| 8443 | tcp | 临时·仅内网卡 | `pdg ios` 下发描述文件时短开,用完自动关 |
+
+⚠️ **证书签发/续期需要从公网访问 80 端口**(Let's Encrypt HTTP-01 校验):签发时 pre-hook 会把 80 临时对全网开放(并停 sing-box),完后还原。所以**云安全组必须允许入站 80**,否则证书续期会失败。
+
+出站:`output` 链 policy accept(全放行);网关需能访问 Telegram API、DNS 上游(1.1.1.1/8.8.8.8/223.5.5.5)、各落地节点、GitHub。
+
 ## 版本注意
 
 - **sing-box 固定 1.12.x**。1.13 移除了 `sniff_override_destination`,升级即失效。
