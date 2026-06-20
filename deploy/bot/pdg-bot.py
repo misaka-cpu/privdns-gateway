@@ -369,14 +369,45 @@ def del_rule(domain):
     return (bool(removed), f"已删除 {domain} ({'+'.join(removed)})" if removed else f"未找到含 {domain} 的规则")
 
 # ── 文案 ──
+_DOT_HOST = None
+
+def _dot_host():
+    global _DOT_HOST
+    if _DOT_HOST is None:
+        try:
+            out = sh(["openssl", "x509", "-in", "/etc/dnsdist/certs/fullchain.pem",
+                      "-noout", "-subject"]).stdout
+            m = re.search(r"CN\s*=\s*([A-Za-z0-9.*-]+)", out)
+            _DOT_HOST = m.group(1) if m else "?"
+        except Exception:  # noqa: BLE001
+            _DOT_HOST = "?"
+    return _DOT_HOST
+
+def _server_ip():
+    try:
+        for r in load()["route"]["rules"]:
+            if r.get("action") == "reject":
+                for cidr in r.get("ip_cidr", []):
+                    if not cidr.startswith("127."):
+                        return cidr.split("/")[0]
+    except Exception:  # noqa: BLE001
+        pass
+    return "?"
+
 def status_text():
-    a = sh(["systemctl", "is-active", "mosdns", "sing-box"]).stdout.split()
-    c = load()
-    return ("<b>PrivDNS Gateway</b>\n"
-            f"mosdns: {a[0] if a else '?'}   sing-box: {a[1] if len(a) > 1 else '?'}\n"
-            f"出口: {', '.join(exit_tags(c))}\n"
-            f"默认出口(其余国际): <b>{c['route'].get('final')}</b>\n"
-            "国内直连 / AI·加密→tw / 其余按规则+默认出口")
+    def dot(s):
+        return "🟢" if sh(["systemctl", "is-active", s]).stdout.strip() == "active" else "🔴"
+    c = load(); exits = exit_tags(c)
+    return ("🖥 <b>PrivDNS Gateway</b>\n\n"
+            f"{dot('mosdns')} mosdns（DNS 分流）\n"
+            f"{dot('sing-box')} sing-box（流量出口）\n"
+            f"{dot('pdg-bot')} pdg-bot（管理）\n\n"
+            f"📡 DoT: <code>{_dot_host()}:853</code>（Android 私密DNS / iOS 描述文件）\n"
+            f"🌐 IP: <code>{_server_ip()}</code>\n"
+            f"📤 出口({len(exits)}): {', '.join(exits)}\n"
+            f"🎯 默认出口(其余国际): <b>{c['route'].get('final')}</b>\n"
+            f"📚 规则集: {len(_rs_meta())} 个\n"
+            "🌏 分流: 国内直连 / AI·加密→tw / 其余→默认出口")
 
 def exits_text():
     c = load(); lines = []
