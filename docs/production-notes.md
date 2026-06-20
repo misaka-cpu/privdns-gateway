@@ -171,3 +171,10 @@ gvt2.com / gvt3.com / android.com`，`systemctl restart dnsdist` 生效。
 ### 🟡 Bug（bot）
 - `getUpdates` 网络出错时无退避 → 断网紧打循环。加 `if not r.get("ok"): sleep(3); continue`。
 - `del_rule` 清理过滤器漏了 `domain_keyword`（潜在会误删带关键词的规则）。补进保留条件。
+
+### 收尾优化（同日，手机在手时做）
+- **853(DoT) 也收进 172.22**：用"死手开关"灰度（`systemd-run --on-active=180` 自动回滚到 853 开放）+ 手机实测确认
+  DoT 源就是内网卡(172.22) → 固化。最终对全网只剩 `22`，`53/80/81/443/853` 全限 172.22。
+  关键避坑：nft 把单元素集 `{ 22 }` 归一化成 `22`（无大括号），别被 `grep 'dport [{]'` 误判成 22 规则丢了——SSH 实测可新建。
+- **journald 封顶 50M**：`/etc/systemd/journald.conf.d/50-pdg.conf` `SystemMaxUse=50M` + `journalctl --vacuum-size=50M`。
+- 注：`certbot delete gkgj.abrdns.com` 属于"切到自定义域名之后"的清理；当前 gkgj 仍是生效 DoT 证书，**不能删**。
