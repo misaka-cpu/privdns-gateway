@@ -11,7 +11,7 @@ UI 原地编辑消息(editMessageText), 不刷屏。改 sing-box 前备份, chec
 注: 模块可被 import (供定时任务调用 refresh_rulesets), 此时无需 token。
 """
 from __future__ import annotations
-import base64, hashlib, http.client, io, json, os, re, shutil, socket, subprocess, tarfile, tempfile, time, uuid
+import base64, hashlib, http.client, io, json, os, re, shutil, socket, subprocess, tarfile, tempfile, threading, time, uuid
 import urllib.parse, urllib.request, urllib.error
 from collections import Counter
 
@@ -139,6 +139,19 @@ def edit(chat, mid, text, kb=None):
     if post("editMessageText", p).get("ok"):
         return
     send(chat, text, kb)             # 仍不行(如消息已删)再发新消息
+
+def answer_cb_async(cb_id):
+    """后台停掉按钮转圈(独立连接, 不占用主 keep-alive、不阻塞主循环)。
+    主循环改完内容(edit)就能立刻回到 getUpdates → 连续点菜单不再为'停转圈'多等一个来回。"""
+    def go():
+        try:
+            urllib.request.urlopen(urllib.request.Request(
+                "https://api.telegram.org/bot" + TOKEN + "/answerCallbackQuery",
+                data=json.dumps({"callback_query_id": cb_id}).encode(),
+                headers={"Content-Type": "application/json"}), timeout=20).read()
+        except Exception:  # noqa: BLE001
+            pass
+    threading.Thread(target=go, daemon=True).start()
 
 def sh(cmd):
     return subprocess.run(cmd, capture_output=True, text=True, timeout=180)
@@ -1396,10 +1409,11 @@ def main():
                         handle_document(m["chat"]["id"], m["document"])
                 elif "callback_query" in u:
                     q = u["callback_query"]
-                    # 先改内容(handle_cb 里的 edit)再停转圈(answerCallbackQuery): 内容只等 1 个来回出现, 体感更跟手
+                    # 先改内容(handle_cb 里的 edit), 停转圈(answerCallbackQuery)丢后台:
+                    # 主循环 edit 完即回 getUpdates, 连点菜单不再每次多等一个'停转圈'来回。
                     if q["from"]["id"] in ALLOWED:
                         handle_cb(q["message"]["chat"]["id"], q["message"]["message_id"], q["data"])
-                    post("answerCallbackQuery", {"callback_query_id": q["id"]})
+                    answer_cb_async(q["id"])
             except Exception as e:  # noqa: BLE001
                 print("handle err", e, flush=True)
 
