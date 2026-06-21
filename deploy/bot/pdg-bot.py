@@ -155,28 +155,43 @@ def answer_cb_async(cb_id):
 
 def clear_chat(chat, top_mid):
     """后台删本会话近期消息(私聊里机器人可删双方消息, 仅限 48 小时内)。
-    从 /clear 那条往前逐条删, 连续失败多次即停(到 48h 边界)。独立连接, 不占主 _conn。"""
+    用 deleteMessages 批量删(每次最多 100 条, 一起消失、无逐条动画); 整批被拒才退回逐条。
+    独立连接, 不占主 _conn。"""
     if not top_mid:
         return
+    SPAN = 300  # 从 /clear 往前覆盖的消息 id 数(约 3 批)
+
     def go():
-        conn = http.client.HTTPSConnection("api.telegram.org", timeout=30)
-        miss = 0; mid = top_mid; tried = 0
-        while mid > 0 and miss < 25 and tried < 600:
+        conn = [http.client.HTTPSConnection("api.telegram.org", timeout=30)]
+
+        def call(method, params):
             try:
-                conn.request("POST", "/bot" + TOKEN + "/deleteMessage",
-                             json.dumps({"chat_id": chat, "message_id": mid}).encode(),
-                             {"Content-Type": "application/json", "Connection": "keep-alive"})
-                ok = json.loads(conn.getresponse().read() or "{}").get("ok")
+                conn[0].request("POST", "/bot" + TOKEN + "/" + method, json.dumps(params).encode(),
+                                {"Content-Type": "application/json", "Connection": "keep-alive"})
+                return json.loads(conn[0].getresponse().read() or "{}")
             except Exception:  # noqa: BLE001
                 try:
-                    conn.close()
+                    conn[0].close()
                 except Exception:  # noqa: BLE001
                     pass
-                conn = http.client.HTTPSConnection("api.telegram.org", timeout=30); ok = False
-            miss = 0 if ok else miss + 1
-            mid -= 1; tried += 1
+                conn[0] = http.client.HTTPSConnection("api.telegram.org", timeout=30)
+                return {}
+
+        ids = list(range(top_mid, max(0, top_mid - SPAN), -1))
+        for i in range(0, len(ids), 100):
+            chunk = ids[i:i + 100]
+            if call("deleteMessages", {"chat_id": chat, "message_ids": chunk}).get("ok"):
+                continue
+            miss = 0                       # 整批被拒(可能含 >48h/不可删的)→ 退回逐条, 连续失败多即停
+            for mid in chunk:
+                if call("deleteMessage", {"chat_id": chat, "message_id": mid}).get("ok"):
+                    miss = 0
+                else:
+                    miss += 1
+                    if miss >= 25:
+                        break
         try:
-            conn.close()
+            conn[0].close()
         except Exception:  # noqa: BLE001
             pass
     threading.Thread(target=go, daemon=True).start()
