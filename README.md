@@ -69,7 +69,7 @@ cd privdns-gateway && sudo ./install.sh
 
 ```bash
 sudo pdg            # 进管理菜单
-sudo pdg doctor     # 自检(只读, 一眼看出哪不对); 加 --json 可脚本化
+sudo pdg doctor     # 自检(只读); --json 可脚本化; --deep 加端到端检查(DoT握手/:81/DNS/clash)
 sudo pdg status     # 状态
 sudo pdg update     # 更新(更新前自动快照, 失败自动回滚; --dry-run 看待更新)
 sudo pdg snapshot   # 手动留一份配置快照
@@ -79,7 +79,7 @@ sudo pdg restart    # 重启服务
 sudo pdg log [n]    # 看日志
 sudo pdg traffic    # 网卡流量(vnstat)
 sudo pdg ios        # 不用 bot, 直接出 iOS 描述文件二维码
-sudo pdg report     # 生成脱敏诊断报告(贴给别人排障用, 自动隐藏 token/密码/uuid)
+sudo pdg report     # 脱敏诊断报告(隐藏 token/密码/uuid); --redact-ip 连IP/域名也隐藏; --full 不脱敏
 sudo pdg uninstall [--purge]   # 卸载(--purge 连配置删)
 ```
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """PrivDNS Gateway 只读检查库。doctor.py 跑全部, healthcheck.py 跑子集。
-每个 check() 返回 (level, label, detail), level ∈ 'ok'|'warn'|'fail'。只读, 不改任何东西。"""
-import os, re, json, ipaddress, subprocess
+每个 check() 返回 (level, label, detail), level ∈ 'ok'|'warn'|'fail'|'info'。只读, 不改任何东西。"""
+import os, re, json, ipaddress, subprocess, urllib.request
 
 SB = "/etc/sing-box/config.json"
 MOSDNS_CONF = "/etc/mosdns/config.yaml"
@@ -144,9 +144,61 @@ def check_singbox_config():
     return ("ok", "sing-box 配置", "check 通过") if rc == 0 \
         else ("fail", "sing-box 配置", "check 失败: " + (out + err)[-200:])
 
+# ── 深度(慢速)端到端检查: `pdg doctor --deep` 用, 仍只读 ──
+def check_deep_dot_handshake():
+    d = _dot_domain()
+    try:
+        p = subprocess.run(["openssl", "s_client", "-connect", "127.0.0.1:853",
+                            "-servername", d or "localhost"],
+                           input="Q\n", capture_output=True, text=True, timeout=12)
+        out = p.stdout + p.stderr
+    except Exception as e:  # noqa: BLE001
+        return ("fail", "DoT 握手(853)", f"连接失败: {e}")
+    if "BEGIN CERTIFICATE" not in out and "Verify return code" not in out:
+        return ("fail", "DoT 握手(853)", "TLS 握手未完成(mosdns DoT 没起?)")
+    m = re.search(r"subject=.*?CN\s*=\s*([A-Za-z0-9.*-]+)", out)
+    cn = m.group(1) if m else "?"
+    if d and cn not in ("?", d):
+        return ("warn", "DoT 握手(853)", f"握手 OK 但证书 CN={cn} 与 DoT 域名 {d} 不符")
+    return ("ok", "DoT 握手(853)", f"TLS 握手成功, CN={cn}")
+
+def check_deep_probe81():
+    rc, out, _ = _run(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+                       "--max-time", "5", "http://127.0.0.1:81/probe"])
+    code = out.strip()
+    return ("ok", "iOS 探测(:81)", "返回 200 ✓") if code == "200" \
+        else ("fail", "iOS 探测(:81)", f"返回 {code or '无响应'}(iOS 需要 200)")
+
+def check_deep_dns_cn():
+    # 本机源(127.0.0.1)不在内网卡段 → 走 remote_upstream; 国内域名应得真实 IP(非本机)
+    _, out, _ = _run(["dig", "+short", "+time=3", "+tries=1", "@127.0.0.1", "www.qq.com", "A"])
+    ips = [x for x in out.split() if re.match(r"^\d+\.\d+\.\d+\.\d+$", x)]
+    sip = _server_ip()
+    if not ips:
+        return ("fail", "DNS 解析(国内)", "www.qq.com 无 A 记录(mosdns/上游异常?)")
+    if sip and sip in ips:
+        return ("warn", "DNS 解析(国内)", f"www.qq.com → 本机 {sip}?? 国内域名不该被劫持")
+    return ("ok", "DNS 解析(国内)", f"www.qq.com → {ips[0]}(直连)")
+
+def check_deep_clash():
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:9090/proxies", timeout=5) as r:
+            n = len(json.load(r).get("proxies", {}))
+        return ("ok", "clash_api", f"127.0.0.1:9090 可读, {n} 个出站/组")
+    except Exception as e:  # noqa: BLE001
+        return ("warn", "clash_api", f"读不到 127.0.0.1:9090 ({e})")
+
+def check_deep_hijack_note():
+    c = _internal_cidr() or "内网卡段"
+    return ("info", "代理劫持验证",
+            f"A 劫持 / AAAA 抑制只对来源 {c} 生效; 本机 dig(源 127.0.0.1)走直连上游, "
+            "无法复现劫持。端到端请用手机走内网卡实测。")
+
 ALL = [check_services, check_singbox_version, check_dot_arecord, check_dot_domain_sync,
        check_internal_cidr, check_nft, check_cert, check_dns, check_singbox_config]
 ALERT = [check_services, check_dns, check_cert]  # healthcheck 用的轻量子集(运行期故障)
+DEEP = [check_deep_dot_handshake, check_deep_probe81, check_deep_dns_cn,
+        check_deep_clash, check_deep_hijack_note]  # pdg doctor --deep 追加
 
 def run(funcs=None):
     return [f() for f in (funcs or ALL)]

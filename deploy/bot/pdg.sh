@@ -13,6 +13,17 @@ c_g(){ echo -e "\033[1;32m$*\033[0m"; }
 c_y(){ echo -e "\033[1;33m$*\033[0m"; }
 need_root(){ [[ $EUID -eq 0 ]] || { echo "请用 root: sudo pdg $*"; exit 1; }; }
 
+# 串行化"会写配置/重启服务"的操作(update/rollback/snapshot), 防 bot 更新按钮与命令行并发。
+# 嵌套调用(update→snapshot)只锁一次。read-only 操作(status/doctor/report/log)不加锁。
+LOCK="/run/privdns-gateway.lock"
+PDG_LOCKED=""
+_lock(){
+  [[ -n "$PDG_LOCKED" ]] && return 0
+  exec 9>"$LOCK" 2>/dev/null || return 0
+  flock -n 9 || { echo "⛔ 已有 pdg 操作在运行, 请稍后再试 (锁: $LOCK)"; exit 1; }
+  PDG_LOCKED=1
+}
+
 cmd_status(){
   c_g "== 服务 =="
   for s in mosdns sing-box pdg-bot pdg-probe81; do
@@ -47,7 +58,7 @@ migrate_botenv(){
 SNAP_DIR="/var/lib/privdns-gateway/backups"
 
 cmd_snapshot(){
-  need_root snapshot
+  need_root snapshot; _lock
   local ts d; ts=$(date +%Y%m%d-%H%M%S); d="$SNAP_DIR/$ts"
   install -d -m700 "$d"
   # 整机配置 + 防火墙 + bot.env(含 token)+ service(相对 / 打包, 回滚直接 -C / 解开)
@@ -60,7 +71,7 @@ cmd_snapshot(){
 }
 
 cmd_rollback(){
-  need_root rollback
+  need_root rollback; _lock
   local snaps; mapfile -t snaps < <(ls -1dt "$SNAP_DIR"/*/ 2>/dev/null)
   [[ ${#snaps[@]} -gt 0 ]] || { echo "没有快照(先 pdg snapshot)"; return 1; }
   echo "可用快照(新→旧):"; local i=0; for s in "${snaps[@]}"; do echo "  [$i] $(basename "$s")"; i=$((i+1)); done
@@ -93,6 +104,7 @@ cmd_update(){
     git -C "$REPO_DIR" log --oneline HEAD..origin/main 2>/dev/null || echo "  (已是最新, 或无法比较)"
     return 0
   fi
+  _lock   # 取锁(嵌套的 cmd_snapshot 不会重复锁)
   c_g "更新前留快照…"; cmd_snapshot >/dev/null 2>&1 || true
   c_g "拉取最新代码…"
   if [[ -d "$REPO_DIR/.git" ]]; then
