@@ -30,6 +30,7 @@ CLASH = "http://127.0.0.1:9090"
 DELAY_URL = "http://www.gstatic.com/generate_204"
 API = "https://api.telegram.org/bot" + TOKEN
 state: dict[int, str] = {}
+del_sel: dict[int, set] = {}   # 删规则多选: chat -> 已勾选域名集合
 
 # ── Telegram (复用一条 HTTPS 长连接, 省掉每次 TLS 握手 → 按钮响应更快) ──
 _conn = None
@@ -781,6 +782,44 @@ def deletable_domains():
         items.append((d, f"{d}(直连)"))
     return items
 
+def del_rules_bulk(domains):
+    """一次删除多个域名(出口规则 + 直连表), 只重启一次 sing-box。"""
+    domains = {d.strip().lower() for d in domains if d.strip()}
+    if not domains:
+        return False, "没勾选任何域名"
+    def mod(cc):
+        for r in cc["route"]["rules"]:
+            for k in ("domain_suffix", "domain"):
+                if r.get(k):
+                    r[k] = [d for d in r[k] if d not in domains]
+        cc["route"]["rules"] = [r for r in cc["route"]["rules"]
+                                if r.get("action") or "outbound" not in r or r.get("rule_set")
+                                or r.get("domain_suffix") or r.get("domain")
+                                or r.get("domain_keyword") or r.get("ip_cidr")]
+    ok, msg = apply_sb(mod)
+    if not ok:
+        return False, msg
+    cur = _read_direct(); hit = [x for x in cur if x in domains]
+    if hit:
+        _write_direct([x for x in cur if x not in domains])   # 直连表改 mosdns 文件(与原 del_rule 一致, 不重启 mosdns)
+    return True, f"✅ 已删除 {len(domains)} 个域名" + (f"(含直连 {len(hit)} 个)" if hit else "")
+
+def del_rule_kb(chat):
+    """删规则多选键盘: 勾选/取消, 底部确认删除(N)。"""
+    items = deletable_domains()
+    valid = {d for d, _ in items}
+    sel = del_sel.setdefault(chat, set()) & valid
+    del_sel[chat] = sel
+    rows = []
+    for d, lbl in items[:80]:
+        if len(("dtog:" + d).encode()) > 64:
+            continue
+        rows.append([{"text": ("☑️ " if d in sel else "⬜️ ") + lbl, "callback_data": "dtog:" + d}])
+    rows.append([{"text": f"✅ 确认删除 ({len(sel)})", "callback_data": "ddel"}])
+    rows.append([{"text": "✍️ 手动输入", "callback_data": "del_rule_manual"},
+                 {"text": "⬅️ 返回主菜单", "callback_data": "menu"}])
+    return items, {"inline_keyboard": rows}
+
 # ── 改分流规则出口 / 出口排序 / 改故障组 ──
 def editable_rules(c):
     """可改出口的规则: [(索引, 简短标签)]。含域名规则与规则集规则。"""
@@ -1247,26 +1286,27 @@ def handle_cb(chat, mid, data):
              f"当前: <code>{' '.join(cur) or '空'}</code>\n可选: {', '.join(concrete_tags(load()))}\n"
              f"例: <code>hk tw us</code>\n/cancel 取消。", BACK); return
     if data == "del_rule":
-        items = deletable_domains()
+        del_sel[chat] = set()
+        items, kb = del_rule_kb(chat)
         if not items:
             edit(chat, mid, "暂无可删的单域名规则(规则集请用「🗑 删规则集」)。", BACK); return
-        rows = [[{"text": lbl, "callback_data": "drd:" + d}]
-                for d, lbl in items[:80] if len(("drd:" + d).encode()) <= 64]
-        rows.append([{"text": "✍️ 手动输入域名", "callback_data": "del_rule_manual"}])
-        rows.append([{"text": "⬅️ 返回主菜单", "callback_data": "menu"}])
-        edit(chat, mid, "点要删除的域名:", {"inline_keyboard": rows}); return
+        edit(chat, mid, "勾选要删的域名(可多选), 选好点「✅ 确认删除」一次删:", kb); return
+    if data.startswith("dtog:"):
+        d = data[5:]; sel = del_sel.setdefault(chat, set())
+        sel.discard(d) if d in sel else sel.add(d)
+        _, kb = del_rule_kb(chat)
+        edit(chat, mid, "勾选要删的域名(可多选), 选好点「✅ 确认删除」一次删:", kb); return
+    if data == "ddel":
+        doms = list(del_sel.get(chat, set()))
+        if not doms:
+            _, kb = del_rule_kb(chat)
+            edit(chat, mid, "还没勾选域名。勾选后再点「✅ 确认删除」:", kb); return
+        edit(chat, mid, f"⏳ 正在删除 {len(doms)} 个域名并重启 sing-box…", None)
+        ok, msg = del_rules_bulk(doms); del_sel.pop(chat, None)
+        edit(chat, mid, msg if ok else ("❌ " + msg), MENU); return
     if data == "del_rule_manual":
         state[chat] = "del_rule"
         edit(chat, mid, "发要删除的域名，例 <code>netflix.com</code>。/cancel 取消。", BACK); return
-    if data.startswith("drd:"):
-        ok, msg = del_rule(data[4:])
-        items = deletable_domains()
-        if not items:
-            edit(chat, mid, ("✅ " if ok else "") + msg + "\n\n已无更多单域名规则。", MENU); return
-        rows = [[{"text": lbl, "callback_data": "drd:" + d}]
-                for d, lbl in items[:80] if len(("drd:" + d).encode()) <= 64]
-        rows.append([{"text": "⬅️ 返回主菜单", "callback_data": "menu"}])
-        edit(chat, mid, ("✅ " if ok else "") + msg + "\n\n继续点要删的(没有就返回):", {"inline_keyboard": rows}); return
     if data == "testdom":
         state[chat] = "test_dom"
         edit(chat, mid, "发个域名, 查它走哪个出口/规则(还是国内直连)。\n例: <code>netflix.com</code>\n/cancel 取消。", BACK); return
