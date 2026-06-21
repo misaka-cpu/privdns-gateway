@@ -764,6 +764,18 @@ def del_rule(domain):
         _write_direct([d for d in _read_direct() if d != domain]); removed.append("直连表")
     return (bool(removed), f"已删除 {domain} ({'+'.join(removed)})" if removed else f"未找到含 {domain} 的规则")
 
+def deletable_domains():
+    """可删的单域名规则: [(域名, 显示文字)]。含各出口的 domain(_suffix) 与自定义直连表。"""
+    c = load(); items = []
+    for r in c["route"]["rules"]:
+        if "outbound" not in r or r.get("rule_set"):
+            continue
+        for d in r.get("domain_suffix", []) + r.get("domain", []):
+            items.append((d, f"{d} → {r['outbound']}"))
+    for d in _read_direct():
+        items.append((d, f"{d}(直连)"))
+    return items
+
 # ── 改分流规则出口 / 出口排序 / 改故障组 ──
 def editable_rules(c):
     """可改出口的规则: [(索引, 简短标签)]。含域名规则与规则集规则。"""
@@ -1230,8 +1242,26 @@ def handle_cb(chat, mid, data):
              f"当前: <code>{' '.join(cur) or '空'}</code>\n可选: {', '.join(concrete_tags(load()))}\n"
              f"例: <code>hk tw us</code>\n/cancel 取消。", BACK); return
     if data == "del_rule":
+        items = deletable_domains()
+        if not items:
+            edit(chat, mid, "暂无可删的单域名规则(规则集请用「🗑 删规则集」)。", BACK); return
+        rows = [[{"text": lbl, "callback_data": "drd:" + d}]
+                for d, lbl in items[:80] if len(("drd:" + d).encode()) <= 64]
+        rows.append([{"text": "✍️ 手动输入域名", "callback_data": "del_rule_manual"}])
+        rows.append([{"text": "⬅️ 返回主菜单", "callback_data": "menu"}])
+        edit(chat, mid, "点要删除的域名:", {"inline_keyboard": rows}); return
+    if data == "del_rule_manual":
         state[chat] = "del_rule"
         edit(chat, mid, "发要删除的域名，例 <code>netflix.com</code>。/cancel 取消。", BACK); return
+    if data.startswith("drd:"):
+        ok, msg = del_rule(data[4:])
+        items = deletable_domains()
+        if not items:
+            edit(chat, mid, ("✅ " if ok else "") + msg + "\n\n已无更多单域名规则。", MENU); return
+        rows = [[{"text": lbl, "callback_data": "drd:" + d}]
+                for d, lbl in items[:80] if len(("drd:" + d).encode()) <= 64]
+        rows.append([{"text": "⬅️ 返回主菜单", "callback_data": "menu"}])
+        edit(chat, mid, ("✅ " if ok else "") + msg + "\n\n继续点要删的(没有就返回):", {"inline_keyboard": rows}); return
     if data == "testdom":
         state[chat] = "test_dom"
         edit(chat, mid, "发个域名, 查它走哪个出口/规则(还是国内直连)。\n例: <code>netflix.com</code>\n/cancel 取消。", BACK); return
