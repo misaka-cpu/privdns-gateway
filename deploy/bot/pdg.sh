@@ -259,12 +259,13 @@ cmd_uninstall(){
 menu(){
   while true; do
     echo; c_g "===== PrivDNS Gateway 管理 ====="
+    echo "  快捷: 下次直接运行  sudo pdg  打开本菜单"
     echo "  1) 状态"
     echo "  2) 自检 (doctor)"
     echo "  3) 更新"
     echo "  4) 快照备份"
     echo "  5) 回滚"
-    echo "  6) 设置/更换 Bot Token 与你的 TG ID"
+    echo "  6) 设置/更换 Bot Token 与 TG ID"
     echo "  7) 重启服务"
     echo "  8) 日志"
     echo "  9) 流量 (vnstat)"
