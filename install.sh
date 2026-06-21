@@ -90,7 +90,9 @@ if [[ -z "$INTERNAL_CIDR" ]]; then
   else
     echo; c_y "识别【内网卡来源段】(抓包 ~90s, 期间用手机走【内网卡/蜂窝, 关 WiFi】访问本机一次)"
     DET_CIDR=$(bash "$REPO_DIR/lib/detect-internal-range.sh" 90 "$SERVER_IP" || true)
-    [[ -n "$DET_CIDR" ]] && c_g "抓到内网卡段: $DET_CIDR" || c_y "没抓到。请手填你内网卡精确的 /16 (如 172.22.0.0/16)。"
+    if [[ -n "$DET_CIDR" ]]; then c_g "抓到内网卡段: $DET_CIDR"
+    else c_y "没抓到(手机没走内网卡? 云安全组挡了 80/ICMP?)。可先手填(如 172.22.0.0/16),"
+         c_y "装完再从容跑 \`sudo pdg detect-cidr\` 重新识别并一键应用。"; fi
     read -rp "内网卡来源段 CIDR [${DET_CIDR:-请手填如 172.22.0.0/16}]: " INTERNAL_CIDR
     INTERNAL_CIDR="${INTERNAL_CIDR:-${DET_CIDR:-}}"
     [[ -n "$INTERNAL_CIDR" ]] || die "必须填内网卡来源段 (形如 172.22.0.0/16)"

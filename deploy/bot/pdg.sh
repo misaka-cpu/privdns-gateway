@@ -184,6 +184,31 @@ cmd_traffic(){ command -v vnstat >/dev/null && vnstat || echo "vnstat 未装: su
 
 cmd_report(){ need_root report; python3 /opt/pdg-bot/report.py "$@"; }
 
+# 抓包识别内网卡来源段, 检测到与现配不符时可一键写回 mosdns+nftables 并重启(装完随时跑, 比装机时从容)。
+cmd_detect_cidr(){
+  need_root detect-cidr
+  local dur="${1:-30}" sip det cur
+  sip=$(grep -oE '"[0-9.]+/32"' /etc/sing-box/config.json 2>/dev/null | tr -d '"' | grep -v '^127' | head -1 | cut -d/ -f1)
+  det=$(bash "$REPO_DIR/lib/detect-internal-range.sh" "$dur" "${sip:-本机IP}" || true)
+  if [[ -z "$det" ]]; then
+    c_y "没抓到。确认手机走内网卡(关 WiFi), 或云安全组放行入站 80/ICMP, 再重试。"; return 1
+  fi
+  cur=$(grep -oE 'ip saddr [0-9./]+' /etc/nftables.conf 2>/dev/null | head -1 | awk '{print $3}')
+  echo "  检测到内网卡段: $det"
+  echo "  当前配置:       ${cur:-未知}"
+  [[ "$det" == "$cur" ]] && { c_g "✅ 与当前一致, 无需改动。"; return 0; }
+  read -rp "把内网卡段 ${cur:-?} → $det 并应用(写 mosdns+nftables 并重启)? [y/N]: " yn
+  [[ "$yn" == [yY] ]] || { echo "已取消, 未改动。"; return 0; }
+  _lock; c_g "先留快照…"; cmd_snapshot >/dev/null 2>&1 || true
+  [[ -n "$cur" ]] && sed -i "s#${cur//./\\.}#$det#g" /etc/nftables.conf
+  sed -i -E "s#(ips:[[:space:]]*\[[[:space:]]*\")[0-9./]+(\")#\1$det\2#" /etc/mosdns/config.yaml
+  if ! nft -c -f /etc/nftables.conf >/dev/null 2>&1; then c_y "nft 校验失败, 回滚…"; cmd_rollback 0; return 1; fi
+  nft -f /etc/nftables.conf
+  systemctl restart mosdns; sleep 2
+  [[ "$(systemctl is-active mosdns)" == active ]] || { c_y "mosdns 重启异常, 回滚…"; cmd_rollback 0; return 1; }
+  c_g "✅ 内网卡段已更新为 $det 并重启 mosdns。"
+}
+
 cmd_ios(){
   need_root ios
   local TMPL=/opt/pdg-bot/pdg-dot.mobileconfig.tmpl
@@ -237,7 +262,8 @@ menu(){
     echo "  1) 状态        2) 自检(doctor)   3) 更新"
     echo "  4) 快照备份    5) 回滚            6) 设置/更换 token"
     echo "  7) 重启服务    8) 日志            9) 流量(vnstat)"
-    echo " 10) iOS 描述文件  11) 诊断报告(脱敏) 12) 卸载        0) 退出"
+    echo " 10) iOS 描述文件  11) 诊断报告(脱敏) 12) 识别内网卡段"
+    echo " 13) 卸载                                0) 退出"
     read -rp "选择: " c || exit 0
     case "$c" in
       1) cmd_status;;
@@ -251,7 +277,8 @@ menu(){
       9) cmd_traffic;;
       10) cmd_ios;;
       11) cmd_report;;
-      12) read -rp "卸载: 留空取消 / yes 仅卸载 / purge 连配置一起删: " x
+      12) cmd_detect_cidr;;
+      13) read -rp "卸载: 留空取消 / yes 仅卸载 / purge 连配置一起删: " x
          case "$x" in yes) cmd_uninstall;; purge) cmd_uninstall --purge;; *) echo "已取消";; esac;;
       0|q) exit 0;;
       *) echo "无效选择";;
@@ -272,6 +299,7 @@ case "${1:-menu}" in
   traffic|tr)    cmd_traffic;;
   ios)           cmd_ios;;
   report)        shift || true; cmd_report "$@";;
+  detect-cidr|cidr) shift || true; cmd_detect_cidr "${1:-}";;
   uninstall|rm)  shift || true; cmd_uninstall "${1:-}";;
-  *) echo "用法: pdg [menu|status|doctor [--json]|update [--dry-run]|snapshot|rollback [n]|token|restart|log [n]|traffic|ios|report|uninstall [--purge]]";;
+  *) echo "用法: pdg [menu|status|doctor [--json|--deep]|update [--dry-run]|snapshot|rollback [n]|token|restart|log [n]|traffic|ios|report [--redact-ip|--full]|detect-cidr|uninstall [--purge]]";;
 esac

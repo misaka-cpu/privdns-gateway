@@ -1,27 +1,32 @@
 #!/usr/bin/env bash
-# 自动识别「内网卡来源段」: 抓包看哪个私有网段(10/172.16-31/192.168)从内网卡打到本机, 推断成 /16。
+# 自动识别「内网卡来源段」: 抓"手机经内网卡打到本机网关服务"的包, 看私有源网段, 推断成 /16。
+# 覆盖 10/8、172.16-31、192.168、以及运营商常用的 CGNAT 100.64.0.0/10。
 # 用法: detect-internal-range.sh [抓包秒数] [本机公网IP(仅用于提示)]
 # 成功: stdout 打印 CIDR (如 172.22.0.0/16) 并 exit 0; 失败: 空输出 exit 1。
 set -uo pipefail
 DUR="${1:-90}"
 SERVER_IP="${2:-本机公网IP}"
 
-command -v tcpdump >/dev/null 2>&1 || { echo "" ; exit 1; }
+command -v tcpdump >/dev/null 2>&1 || { echo ""; exit 1; }
 
 cat >&2 <<EOF
 ──────────────────────────────────────────────
- 正在抓包识别内网卡网段, 持续约 ${DUR} 秒。
- 请现在用手机(确保走【内网卡/蜂窝】, 不要走 WiFi)做任意一件:
-   • 浏览器打开  http://${SERVER_IP}
-   • 或 在能 ping 的工具里 ping ${SERVER_IP}
- (只要有一个包从内网卡打到本机即可)
+ 正在抓包识别内网卡网段, 最多 ${DUR} 秒(抓到就提前结束)。
+ 让手机产生一点到本机的流量即可:
+   • 已在用网关(私密 DNS 已生效)→ 它本来就在发 DoT, 通常立刻抓到, 你什么都不用做。
+   • 还没用上 → 手机【走内网卡/蜂窝, 关 WiFi】打开 http://${SERVER_IP} 或 ping 它。
+ 注意:http 打不开是正常的(本机此时未必有 web 服务), 只要"包发出去"就行。
+ 抓不到的常见原因:① 手机没真走内网卡(WiFi 没关); ② 云安全组没放行入站 80 / ICMP。
 ──────────────────────────────────────────────
 EOF
 
-src=$(timeout "$DUR" tcpdump -ni any -c 40 \
-        '(tcp[tcpflags] & tcp-syn != 0 or icmp) and (net 10.0.0.0/8 or net 172.16.0.0/12 or net 192.168.0.0/16)' \
+# 抓"打到网关服务端口(53/80/443/853)或 ICMP"且源/目的在私网/CGNAT 段的包; 不限 SYN, 已建连的 DoT 也能抓到
+src=$(timeout "$DUR" tcpdump -ni any -c 60 \
+        '((tcp port 53 or tcp port 80 or tcp port 443 or tcp port 853) or icmp or udp port 53 or udp port 443)
+         and (net 10.0.0.0/8 or net 172.16.0.0/12 or net 192.168.0.0/16 or net 100.64.0.0/10)' \
         2>/dev/null \
-      | grep -oE '(10|172|192)\.[0-9]+\.[0-9]+\.[0-9]+' \
+      | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' \
+      | awk -F. '($1==10)||($1==172&&$2>=16&&$2<=31)||($1==192&&$2==168)||($1==100&&$2>=64&&$2<=127)' \
       | grep -vE '\.(255|0)$' \
       | sort | uniq -c | sort -rn | awk 'NR==1{print $2}')
 

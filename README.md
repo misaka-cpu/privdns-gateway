@@ -80,6 +80,7 @@ sudo pdg log [n]    # 看日志
 sudo pdg traffic    # 网卡流量(vnstat)
 sudo pdg ios        # 不用 bot, 直接出 iOS 描述文件二维码
 sudo pdg report     # 脱敏诊断报告(隐藏 token/密码/uuid); --redact-ip 连IP/域名也隐藏; --full 不脱敏
+sudo pdg detect-cidr # 抓包重新识别内网卡来源段, 与现配不符可一键写回并重启
 sudo pdg uninstall [--purge]   # 卸载(--purge 连配置删)
 ```
 
