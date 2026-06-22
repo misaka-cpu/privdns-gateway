@@ -6,21 +6,25 @@
 
 ---
 
-## 0. 先准备这些
+## 1. 先准备这些
 
 | 要什么 | 说明 |
 |---|---|
-| 一台**墙外 VPS** | Debian 12+ / Ubuntu 22+,1 vCPU / 512MB 就够(常驻约 60MB) |
-| 一张运营商**内网卡 / 定向内网 SIM** | 手机移动流量经运营商私网到达 VPS,源 IP 是固定私有段(如 `172.x`) |
+| 一台 **kfchost vps** | Debian 12+ / Ubuntu 22+,1 vCPU / 512MB 就够(常驻约 60MB) |
+| 一张**浙江联通手机号 SIM(暂时)** | 手机移动流量经运营商私网到达 VPS,源 IP 是固定私有段(如 `172.x`) |
 | 一个**域名** | 你能改它的 DNS 记录(给 DoT 用) |
 | 一个 **Telegram bot** | 找 [@BotFather](https://t.me/BotFather) 建,拿 token;再找 [@userinfobot](https://t.me/userinfobot) 拿你自己的 user id |
 | 一个或多个**落地节点** | 用来出国际流量(可选) |
 
-> 没有"内网卡"这类固定私有源段的 SIM,本项目不适用——它靠这个私有源段来区分该处理的查询。
+> 没有"浙江联通手机号 SIM"这类固定私有源段的 SIM,本项目不适用——它靠这个私有源段来区分该处理的查询。
+
+VPS 用的是 **kfchost**:
+- 官网(无 aff):https://kfchost.com/center/
+- 邀请注册(aff):https://kfchost.com/center/dashboard?aff=AFF1113558QDH
 
 ---
 
-## 1. 准备域名(这一步你自己做)
+## 2. 准备域名(这一步你自己做)
 
 给一个子域(如 `dot.example.com`)加一条 **A 记录指向你 VPS 的公网 IP**。
 
@@ -32,7 +36,7 @@
 
 ---
 
-## 2. 建 Telegram bot,拿 token 和 user id
+## 3. 建 Telegram bot,拿 token 和 user id
 
 1. Telegram 找 **@BotFather** → `/newbot` → 按提示起名 → 拿到 **token**(形如 `123456:AA...`)。
 2. Telegram 找 **@userinfobot** → 它直接回你的 **user id**(一串数字)。
@@ -42,7 +46,7 @@
 
 ---
 
-## 3. 一键安装
+## 4. 一键安装
 
 SSH 登录你的 VPS,跑:
 
@@ -62,7 +66,7 @@ curl -fsSL https://raw.githubusercontent.com/misaka-cpu/privdns-gateway/main/ins
 
 ---
 
-## 4. 启用管理 bot(如果安装时跳过了 token)
+## 5. 启用管理 bot(如果安装时跳过了 token)
 
 ```bash
 sudo pdg-set-token
@@ -75,7 +79,7 @@ sudo pdg-set-token
 
 ---
 
-## 5. 手机设置:只填一个「私密 DNS」
+## 6. 手机设置:只填一个「私密 DNS」
 
 **Android**:设置 → 网络和互联网 → **私人 DNS** → 选「指定主机名」→ 填你的域名 `dot.example.com`。
 
@@ -90,7 +94,7 @@ sudo pdg-set-token
 
 ---
 
-## 6. 在 bot 里配置出口和分流
+## 7. 在 bot 里配置出口和分流
 
 Telegram 给 bot 发 `/start`,出现主菜单:
 
@@ -111,7 +115,7 @@ Telegram 给 bot 发 `/start`,出现主菜单:
 
 ---
 
-## 7. 日常管理:一条命令
+## 8. 日常管理:一条命令
 
 VPS 上 `sudo pdg` 进管理菜单(状态 / 自检 / 更新 / 快照回滚 / 换 token / 日志 / 流量 / 识别内网卡段 / 卸载):
 
@@ -129,7 +133,7 @@ sudo pdg report       # 生成脱敏诊断报告(贴出来求助用)
 
 ---
 
-## 8. 常见问题
+## 9. 常见问题
 
 - **手机完全没网** → 多半 mosdns 没应答:`sudo pdg doctor` 看「服务 / 本机DNS」。
 - **某域名没生效** → bot **📑 分流管理 → 🔎 测域名**,看它命中哪条规则/出口。
