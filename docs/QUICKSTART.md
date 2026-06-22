@@ -81,18 +81,12 @@ curl -fsSL https://raw.githubusercontent.com/misaka-cpu/privdns-gateway/main/ins
 
 1. Telegram 找 **@BotFather** → `/newbot` 起名 → 拿到 **token**;再找 **@userinfobot** 拿你的 **user id**。
 
-   ![BotFather 建 bot 拿 token](images/botfather.png)
-   *@BotFather 创建 bot 并拿到 token*
-
 2. VPS 上跑(若安装时已填 token 可跳过):
 
    ```bash
    sudo pdg-set-token
    ```
    按提示粘 token 和 user id。**出口、分流规则都在 bot 里设,这步必须做**,否则没法配。
-
-   ![设置 token](images/set-token.png)
-   *sudo pdg-set-token 设置并启用 bot*
 
 ---
 
