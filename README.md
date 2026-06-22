@@ -104,7 +104,6 @@ sudo pdg uninstall [--purge]   # 卸载(--purge 连配置删)
 
 ## 文档
 
-- [docs/QUICKSTART.md](docs/QUICKSTART.md) — 新手图文教程(第一次部署照着走)
 - [docs/INSTALL.md](docs/INSTALL.md) — 安装细节 / DNS 配置 / 端口 / 版本注意
 - [docs/TROUBLESHOOTING-PLAYBOOK.md](docs/TROUBLESHOOTING-PLAYBOOK.md) — 排障手册(症状 → 查 → 修)
 - [docs/production-notes.md](docs/production-notes.md) — 实战记录与踩坑(sing-box 版本坑、QUIC 自环、ECS、安全加固等)
