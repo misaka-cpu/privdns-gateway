@@ -31,7 +31,7 @@ cmd_status(){
   done
   echo "  timer        $(systemctl is-active pdg-rules-update.timer 2>/dev/null)"
   echo "  DoT 域名     $(cat /opt/pdg-bot/dot-domain 2>/dev/null || echo ?)"
-  echo "  监听端口     $(ss -lntu 2>/dev/null | grep -oE ':(53|80|81|443|853|9090)\b' | sort -u | tr '\n' ' ')"
+  echo "  监听端口     $(ss -lntu 2>/dev/null | grep -oE ':(53|80|81|443|853|8445|9090)\b' | sort -u | tr '\n' ' ')"
   if [[ -d "$REPO_DIR/.git" ]]; then echo "  代码版本     $(git -C "$REPO_DIR" rev-parse --short HEAD 2>/dev/null)"; fi
 }
 
