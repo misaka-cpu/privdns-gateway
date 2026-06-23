@@ -112,7 +112,10 @@ def check_internal_cidr():
     return ("ok", "内网卡段", c)
 
 def check_nft():
+    # 兼容两种表名: 新版独立表 inet pdg; 旧装(尚未迁移)仍是 inet filter。
     _, out, _ = _run(["nft", "list", "chain", "inet", "pdg", "input"])
+    if not out:
+        _, out, _ = _run(["nft", "list", "chain", "inet", "filter", "input"])
     if not out:
         return ("warn", "防火墙", "读不到 nftables")
     leaked = set()

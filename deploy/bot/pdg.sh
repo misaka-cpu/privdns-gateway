@@ -55,6 +55,36 @@ migrate_botenv(){
     || sed -i -E 's#^\[Service\]#[Service]\nEnvironmentFile=-/etc/privdns-gateway/bot.env#' "$SVC"
 }
 
+# 旧装防火墙迁移: 把旧的 `flush ruleset` + `table inet filter` 迁到独立表 `inet pdg`。幂等。
+# 不迁移则: 证书续期 pre-hook 进不了 inet pdg 开不了 80、doctor 读不到防火墙、且仍会 flush 掉别的表。
+# 安全做法: 解析旧配置里的 SSH 端口/内网段 → 渲染新模板 → nft -c 校验 → 备份 → nft -f → 删旧表。
+# 全程 SSH 不断(established + 新表放行 SSH; 加载新表时旧 inet filter 仍在 → 双重放行)。
+migrate_firewall_to_pdg(){
+  local f=/etc/nftables.conf
+  [[ -f "$f" ]] || return 0
+  # 已是新表(有 inet pdg 且无 inet filter)→ 无需迁移
+  grep -q 'table inet pdg' "$f" && ! grep -q 'table inet filter' "$f" && return 0
+  # 必须看起来像本项目的防火墙(含我们放行的端口特征), 否则不乱动用户的自定义规则
+  grep -qE '\b(853|8445)\b' "$f" || return 0
+  local port cidr tmp; tmp="$(mktemp)"
+  port=$(grep -E 'tcp dport.*accept' "$f" | grep -v saddr | grep -oE '[0-9]+' | head -1)
+  cidr=$(grep -oE 'ip saddr [0-9./]+' "$f" | head -1 | awk '{print $3}')
+  if [[ -z "$port" || -z "$cidr" ]]; then
+    c_y "检测到旧防火墙但解析不出 SSH端口/内网段, 跳过自动迁移(可手动重渲染)。"; rm -f "$tmp"; return 0
+  fi
+  c_g "检测到旧版防火墙 → 迁移到独立表 inet pdg (SSH=$port, 内网段=$cidr)…"
+  sed -e "s/__SSH_PORT__/$port/g" -e "s#__INTERNAL_CIDR__#$cidr#g" \
+      "$REPO_DIR/deploy/firewall/nftables.conf" > "$tmp"
+  if ! nft -c -f "$tmp" >/dev/null 2>&1; then
+    c_y "  新规则 nft -c 校验未过, 保留旧防火墙不动。"; rm -f "$tmp"; return 0
+  fi
+  cp -a "$f" "$f.prepdg.$(date +%s)" 2>/dev/null
+  cp "$tmp" "$f"; rm -f "$tmp"
+  nft -f "$f" 2>/dev/null                              # 载入 inet pdg(此刻旧 inet filter 仍在 → SSH 双重放行)
+  nft delete table inet filter 2>/dev/null || true     # 删旧表, 只留 inet pdg
+  c_g "  ✅ 已迁移为 inet pdg。"
+}
+
 SNAP_DIR="/var/lib/privdns-gateway/backups"
 
 cmd_snapshot(){
@@ -130,7 +160,8 @@ cmd_update(){
   install -m755 "$REPO_DIR"/deploy/cert/99-reload-cert.deploy-hook.sh     /etc/letsencrypt/renewal-hooks/deploy/99-pdg-cert.sh
   install -m755 "$REPO_DIR"/deploy/bot/pdg-set-token.sh     /usr/local/bin/pdg-set-token
   install -m755 "$REPO_DIR"/deploy/bot/pdg.sh               /usr/local/bin/pdg
-  migrate_botenv   # 老装: token 从 unit 迁到 bot.env
+  migrate_botenv            # 老装: token 从 unit 迁到 bot.env
+  migrate_firewall_to_pdg   # 老装: 防火墙 inet filter → 独立表 inet pdg(否则证书续期开不了 80)
 
   # ── 更新后校验门: 任一硬校验失败即回滚到更新前快照 ──
   c_g "校验新版本…"

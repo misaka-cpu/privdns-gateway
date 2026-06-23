@@ -2,6 +2,14 @@
 
 本项目无正式版本号,按日期记录主要变化;完整提交见 git 历史。
 
+## 2026-06-23 — 评审第二轮:升级迁移 / 安装事务性 / 重启校验
+
+- **`pdg update` 自动迁移旧防火墙**:老机器升级后,把旧的 `flush ruleset` + `table inet filter` 迁到独立表 `inet pdg`(解析旧配置里的 SSH 端口/内网段 → 渲染新模板 → `nft -c` 校验 → 备份 → `nft -f` → 删旧表,全程 SSH 不断、幂等)。不迁移则证书续期 pre-hook 进不了 `inet pdg`、开不了 80。
+- **两种表名都兼容**:证书 pre-hook 与 `doctor` 的防火墙检查现同时认 `inet pdg`(新)和 `inet filter`(旧未迁移),避免老机器续期开不了 80 / 自检误报"读不到防火墙"。
+- **已有部署不再用 install.sh 覆盖**:检测到既有部署时 `install.sh` **直接拒绝并引导 `pdg update`**(带快照+回滚);确需原机重装的显式 `PDG_FORCE_REINSTALL=1`,此时先打快照,失败用 `pdg rollback` 恢复。修掉了"已有部署回滚实为空操作、配置却已被改写"的问题。
+- **安装成功门后移**:`systemd` 默认 `Type=simple`,`systemctl start` 返 0 不代表进程没随即崩溃。安装收尾改为**确认 mosdns/sing-box/probe81 真的 `active`** 才置"提交点",否则打印日志并触发回滚——不再"服务没起来也报装好"。
+- **规则更新重启失败兜底**:`refresh_rulesets` 改为**重启 → 确认 `active` → 再删 `.bak`**;起不来则还原旧规则集并重启,不会断网后无可回滚。`apply_sb` 同样补 `is-active` 复核(同 `Type=simple` 隐患)。
+
 ## 2026-06-23 — 供应链/事务性/真功能测试(社区评审·可选项)
 
 - **二进制 SHA256 校验(供应链)**:`install.sh` 下载 mosdns / sing-box 后,先比对**钉死的官方 SHA256**(amd64+arm64)再安装,不符即 `die` 拒装。版本号与 4 个哈希集中到单一可信源 [lib/versions.sh](lib/versions.sh),`install.sh` 与功能测试共用。

@@ -46,16 +46,29 @@ REPO_DIR="$SRC"
 source "$REPO_DIR/lib/versions.sh"
 
 # ── 事务性安装: 失败自动回滚(只撤本次新装的, 不误伤既有可用部署)──
-INSTALL_OK=0; ROLLBACK_DONE=0
+INSTALL_OK=0; ROLLBACK_DONE=0; FORCED_REINSTALL=0
 PRIOR_INSTALL=0; MOSDNS_INSTALLED=0; SINGBOX_INSTALLED=0; RESOLVED_DISABLED=0
 [[ -f /opt/pdg-bot/bot.py || -x /usr/local/bin/pdg ]] && PRIOR_INSTALL=1
+
+# 已有部署: install.sh 会重写配置, 半途失败难以无损还原 → 默认拒绝, 引导走 pdg update(带快照+回滚)。
+# 确需原机覆盖重装的显式 PDG_FORCE_REINSTALL=1; 此时先打快照, 失败用 pdg rollback 恢复。
+if [[ "$PRIOR_INSTALL" == 1 ]]; then
+  if [[ -z "${PDG_FORCE_REINSTALL:-}" ]]; then
+    die "检测到已有 PrivDNS Gateway 部署。
+  升级请用:  sudo pdg update   (带快照 + 校验门 + 失败自动回滚, 不动出口/分流/证书)
+  确要原机覆盖重装(会重写配置): sudo PDG_FORCE_REINSTALL=1 ./install.sh"
+  fi
+  FORCED_REINSTALL=1
+  c_y "PDG_FORCE_REINSTALL: 在已有部署上覆盖重装 → 先留一份快照(失败可 pdg rollback)…"
+  pdg snapshot >/dev/null 2>&1 || c_y "  (快照失败, 仍继续; 万一失败可能无法自动恢复)"
+fi
 
 rollback(){
   set +e
   [[ "$ROLLBACK_DONE" == 1 ]] && return; ROLLBACK_DONE=1
-  if [[ "$PRIOR_INSTALL" == 1 ]]; then
-    c_y "安装中途失败。检测到既有部署 → 不动它的服务/配置/二进制(避免误伤)。"
-    c_y "  当前运行的应仍是旧的可用版本。请跑  sudo pdg doctor  复查; 需要时  sudo pdg rollback。"
+  if [[ "$FORCED_REINSTALL" == 1 ]]; then
+    c_y "覆盖重装中途失败 —— 既有部署的配置可能已被改写。"
+    c_y "  恢复:  sudo pdg rollback   (用安装前那份快照), 再  sudo pdg doctor  复查。"
     return
   fi
   c_y "安装失败 → 回滚本次全新安装的改动…"
@@ -283,7 +296,27 @@ printf 'nameserver 127.0.0.1\nnameserver 1.1.1.1\n' > /etc/resolv.conf
 c_g "应用防火墙…"
 systemctl enable nftables >/dev/null 2>&1 || true
 nft -f /etc/nftables.conf
-INSTALL_OK=1   # 提交点: 至此核心已就绪, 后面只是打印, 不再触发回滚
+
+# ── 提交点前: 确认核心服务真的起来了 ──
+# (systemd 默认 Type=simple, `systemctl start` 返 0 只代表 exec 成功, 进程可能随即崩溃 → 必须查 is-active)
+c_g "校验核心服务…"
+svc_ok=0
+for _ in $(seq 1 12); do
+  svc_ok=1; svc_bad=0
+  for s in mosdns sing-box pdg-probe81; do
+    st=$(systemctl is-active "$s" 2>/dev/null)
+    [[ "$st" == active ]] || svc_ok=0
+    [[ "$st" == failed ]] && svc_bad=1
+  done
+  [[ "$svc_ok" == 1 || "$svc_bad" == 1 ]] && break
+  sleep 1
+done
+if [[ "$svc_ok" != 1 ]]; then
+  for s in mosdns sing-box pdg-probe81; do printf '  %-12s %s\n' "$s" "$(systemctl is-active "$s" 2>/dev/null)"; done
+  journalctl -u mosdns -u sing-box -n 20 --no-pager 2>/dev/null | sed 's/^/    /'
+  die "核心服务未能全部启动(见上日志)。"   # → 触发回滚
+fi
+INSTALL_OK=1   # 提交点: 核心服务已确认 active, 后面只是打印, 不再回滚
 
 # ── 10. 自检 ──
 echo; c_g "安装完成。状态:"

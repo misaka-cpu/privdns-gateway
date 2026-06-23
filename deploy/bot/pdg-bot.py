@@ -180,6 +180,14 @@ def _write(c):
     os.chmod(t, 0o600)        # config.json 含出口密码/uuid, 收紧到 600
     os.replace(t, SB)
 
+def _svc_active(unit, tries=6, delay=0.5):
+    """确认服务真的 active —— systemd 默认 Type=simple, restart 返 0 只代表 exec 成功, 进程可能随即崩溃。"""
+    for _ in range(tries):
+        if sh(["systemctl", "is-active", unit]).stdout.strip() == "active":
+            return True
+        time.sleep(delay)
+    return False
+
 def apply_sb(modify):
     shutil.copy(SB, SB + ".botbak"); os.chmod(SB + ".botbak", 0o600)
     c = load(); modify(c); _write(c)
@@ -189,7 +197,7 @@ def apply_sb(modify):
         return False, "配置校验失败,已回滚:\n" + (chk.stdout + chk.stderr)[-400:]
     sh(["systemctl", "reset-failed", "sing-box"])   # 清掉 start-limit 计数: 连改多条(如连删域名)快速多次重启不会触发限速锁死
     r = sh(["systemctl", "restart", "sing-box"])
-    if r.returncode != 0:                            # 万一没起来, 还原文件再重启一次, 别把代理留在挂掉状态
+    if r.returncode != 0 or not _svc_active("sing-box"):   # 没起来/起来又崩, 还原文件再重启一次, 别把代理留在挂掉状态
         shutil.copy(SB + ".botbak", SB)
         sh(["systemctl", "reset-failed", "sing-box"]); sh(["systemctl", "restart", "sing-box"])
         return False, "重启 sing-box 失败, 已还原上一份配置:\n" + (r.stdout + r.stderr)[-300:]
@@ -582,13 +590,25 @@ def refresh_rulesets():
             shutil.copy(bak, path)
         print("refresh rs: sing-box check 失败, 已回滚, 不重启")
         return 0
-    for _, bak in swapped:
+    # 先重启加载新规则集, 确认 sing-box 真的 active 再删 .bak; 起不来则还原旧规则集重启, 不断网。
+    sh(["systemctl", "reset-failed", "sing-box"]); sh(["systemctl", "restart", "sing-box"])
+    if not _svc_active("sing-box"):
+        for path, bak in swapped:
+            shutil.copy(bak, path)        # 还原旧规则集
+        sh(["systemctl", "reset-failed", "sing-box"]); sh(["systemctl", "restart", "sing-box"])
+        for _, bak in swapped:
+            try:
+                os.remove(bak)
+            except OSError:
+                pass
+        print("refresh rs: sing-box 重启后未 active, 已还原旧规则集并重启")
+        return 0
+    for _, bak in swapped:                 # 确认 active 后再清备份
         try:
             os.remove(bak)
         except OSError:
             pass
     _save_rs_meta(m)
-    sh(["systemctl", "reset-failed", "sing-box"]); sh(["systemctl", "restart", "sing-box"])
     return n
 
 # ── 测出口 (端到端延迟, clash_api; TCP 兜底) ──
