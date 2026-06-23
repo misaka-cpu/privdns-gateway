@@ -387,8 +387,9 @@ def set_mosdns_upstream(which, addrs):
             for j in range(i, min(i + 6, len(lines))):
                 if "upstreams" in lines[j]:
                     indent = lines[j][:len(lines[j]) - len(lines[j].lstrip())]
-                    # concurrent: 2 必须保留 —— 否则退回默认 1(随机选 1 个、不故障转移), 多上游形同虚设
-                    lines[j] = indent + "args: { concurrent: 2, upstreams: [ %s ] }" % items
+                    # 单上游=1(否则 mosdns 会对同一台并发查两次); 多上游=2 才有真故障转移(默认 1 不转移)
+                    conc = 1 if len(addrs) == 1 else 2
+                    lines[j] = indent + "args: { concurrent: %d, upstreams: [ %s ] }" % (conc, items)
                     done = True
                     break
         if done:

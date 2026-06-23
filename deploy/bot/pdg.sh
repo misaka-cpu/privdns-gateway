@@ -148,6 +148,42 @@ migrate_firewall_to_pdg(){
   fi
 }
 
+# 给 /etc/mosdns 里"缺 concurrent"的 forward args 行补上(单上游=1, 多上游=2)。幂等。读 $1 → stdout。
+# (mosdns 默认 concurrent=1=随机选1个不故障转移; 单上游配 2 会把同一台并发查两次, 故按上游数定。)
+_mosdns_add_concurrent(){
+  awk '
+    /args: \{ upstreams:/ {
+      n = gsub(/addr:/, "addr:")        # 数本行上游个数
+      c = (n <= 1) ? 1 : 2
+      sub(/args: \{ upstreams:/, "args: { concurrent: " c ", upstreams:")
+    }
+    { print }
+  ' "$1"
+}
+
+# 旧装迁移: 老的 /etc/mosdns/config.yaml 的 forward 块没有 concurrent(=默认随机单上游、不故障转移)。
+# pdg update 不重渲染该文件, 故在此幂等补上(不动用户现有上游/顺序)。
+migrate_mosdns_concurrent(){
+  local f=/etc/mosdns/config.yaml
+  [[ -f "$f" ]] || return 0
+  grep -qE 'args: [{] upstreams:' "$f" || return 0     # 没有"缺 concurrent"的行 → 无需迁移
+  c_g "检测到 mosdns forward 块缺 concurrent → 补上(单上游=1/多上游=2, 不动你的上游)…"
+  local bak; bak="$f.preconc.$(date +%s)"
+  if ! cp -a "$f" "$bak" 2>/dev/null || ! cmp -s "$f" "$bak"; then
+    c_y "  备份失败(磁盘满?), 中止、不动现网。"; rm -f "$bak" 2>/dev/null; return 0
+  fi
+  if ! _mosdns_add_concurrent "$f" > "$f.tmp" 2>/dev/null || ! grep -q concurrent "$f.tmp"; then
+    c_y "  生成失败, 中止。"; rm -f "$f.tmp"; return 0
+  fi
+  mv "$f.tmp" "$f"
+  systemctl restart mosdns 2>/dev/null; sleep 1
+  if [[ "$(systemctl is-active mosdns 2>/dev/null)" == active ]]; then
+    c_g "  ✅ 已补 concurrent。"
+  else
+    c_y "  ⚠️ mosdns 重启失败 → 还原。"; cp -a "$bak" "$f" 2>/dev/null; systemctl restart mosdns 2>/dev/null
+  fi
+}
+
 SNAP_DIR="/var/lib/privdns-gateway/backups"
 
 cmd_snapshot(){
@@ -397,7 +433,7 @@ menu(){
 if [[ $EUID -eq 0 ]]; then
   case "${1:-menu}" in
     status|st|doctor|dr|log|logs|traffic|tr|report|uninstall|rm) : ;;   # 只读/卸载: 不迁移
-    *) migrate_firewall_to_pdg || true ;;                                # 管理类命令才迁移
+    *) migrate_firewall_to_pdg || true; migrate_mosdns_concurrent || true ;;   # 管理类命令才迁移
   esac
 fi
 

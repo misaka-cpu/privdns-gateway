@@ -2,6 +2,12 @@
 
 本项目无正式版本号,按日期记录主要变化;完整提交见 git 历史。
 
+## 2026-06-23 — 评审第九轮:concurrent 也给旧装自动迁移 + 单上游不重复查
+
+- **旧装升级自动补 `concurrent`**:`pdg update` 不重渲染 `/etc/mosdns/config.yaml`,旧装升上来仍是默认随机单上游、无故障转移。新增 `migrate_mosdns_concurrent`(随管理类 `pdg` 命令幂等触发):只给**缺 concurrent** 的 forward 块补该字段、**不动用户现有上游**;备份 `cmp` 校验、重启 mosdns 失败自动还原。
+- **单上游不再被查两次**:bot 与迁移都按**上游数定值**——单上游 `concurrent: 1`(否则 mosdns 取模会对同一台并发发两次相同查询)、≥2 才 `concurrent: 2`。
+- 回归测试 [tests/test-mosdns-concurrent.sh](tests/test-mosdns-concurrent.sh)(进 CI):多上游→2 / 单上游→1 / 已有不动 / 二次幂等 / 上游顺序保留。
+
 ## 2026-06-23 — 评审第八轮:多上游真故障转移 + 测试去假阳性 + 探测发真查询
 
 - **多上游=真故障转移(`concurrent: 2`)**:mosdns `forward` 默认 `concurrent=1` = **随机选 1 个上游、出错不换下一个**,多写上游并不会自动转移(查到挂的就直接失败)。两个 forward 块都显式设 `concurrent: 2`(并发查随机起点的 2 个、先返回的有效结果胜、出错的跳过)→ 任一上游挂掉查询仍成功。bot 改上游时也强制保留 `concurrent: 2`(否则退回默认 1,多上游形同虚设)。新增「一台上游故障仍可解析」回归用例(实证:改回 `concurrent:1` 该用例即失败)。
