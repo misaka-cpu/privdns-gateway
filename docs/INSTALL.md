@@ -115,6 +115,19 @@ sudo PDG_NONINTERACTIVE=1 \
 > 本项目**锁 1.12.x** 的原因:1.13 移除了 `sniff_override_destination`,而它的新写法(`action: sniff`)**不覆盖目标地址**、会导致流量回环。
 > 所以**别升 1.13+,也别用比 1.12 旧的版本**。
 
+## 升级
+
+- 日常升级用 `sudo pdg update`(拉新代码 + 校验门 + 失败自动回滚到更新前快照,不动出口/分流/证书)。
+- **不要**用 `install.sh` 在已有部署上覆盖升级——它会拒绝并提示走 `pdg update`(确要覆盖重装才 `sudo PDG_FORCE_REINSTALL=1 ./install.sh`,会先打快照)。
+
+### 旧版升上来的一次性防火墙迁移
+
+早期版本的防火墙是 `flush ruleset` + `table inet filter`;新版改用独立表 **`inet pdg`**(不再清掉 Docker/fail2ban 等其它表)。
+
+- 从旧版 `pdg update` 上来时,**下一次以 root 运行"管理类"命令**(`update` / `restart` / 直接 `sudo pdg` 进菜单等)会**幂等自动迁移**到 `inet pdg`(解析旧 SSH端口/内网段 → 渲染 → `nft -c` 校验 → 备份 → 加载新表确认在内核 → 才删旧表;全程 SSH 不断)。
+- **只读命令**(`status` / `doctor` / `log` / `traffic` / `report`)**不会触发迁移**,以保持"只读不写"。只跑只读命令的可显式 `sudo pdg migrate-fw` 迁移。
+- 即使**尚未迁移**也能正常用:证书续期 hook 与 `doctor` 都兼容旧 `inet filter`。
+
 ## 卸载
 
 ```bash

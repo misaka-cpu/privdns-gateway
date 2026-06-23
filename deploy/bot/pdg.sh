@@ -78,9 +78,16 @@ migrate_firewall_to_pdg(){
   if ! nft -c -f "$tmp" >/dev/null 2>&1; then
     c_y "  新规则 nft -c 校验未过, 保留旧防火墙不动。"; rm -f "$tmp"; return 0
   fi
+  # 必须先确认备份完整(cmp 逐字节相同)才敢覆盖现网配置; 磁盘满/cp 失败时中止, 不动现网。
   local bak; bak="$f.prepdg.$(date +%s)"
-  cp -a "$f" "$bak" 2>/dev/null
-  cp "$tmp" "$f"; rm -f "$tmp"
+  if ! cp -a "$f" "$bak" 2>/dev/null || ! cmp -s "$f" "$bak"; then
+    c_y "  备份 $f 失败/不完整(磁盘满?), 中止迁移、不改动现网。"; rm -f "$tmp" "$bak" 2>/dev/null; return 0
+  fi
+  # 写新配置; 若写失败/不完整(磁盘满), 用刚验证过的备份还原, 不动内核(尚未 nft -f)。
+  if ! cp "$tmp" "$f" 2>/dev/null || ! cmp -s "$tmp" "$f"; then
+    c_y "  写入新配置失败/不完整(磁盘满?), 已还原备份、不改动现网。"; cp -a "$bak" "$f" 2>/dev/null; rm -f "$tmp"; return 0
+  fi
+  rm -f "$tmp"
   # 关键: 只有"新表加载成功且 inet pdg 确实在内核里"才删旧表; 否则绝不删 inet filter。
   # nft -f 是原子的, 失败则内核不变(旧 inet filter 仍在生效), 只需把 on-disk 配置还原回旧的。
   if nft -f "$f" 2>/dev/null && nft list table inet pdg >/dev/null 2>&1; then
@@ -335,12 +342,13 @@ menu(){
 }
 
 # 老装升级"自愈": 旧版 pdg update 跑的是旧脚本, 不会调用迁移 → 装上新 pdg.sh 后,
-# 下一次以 root 运行 pdg(任意子命令)就幂等自动迁移防火墙(已迁移则首个 grep 秒退、不动任何东西)。
-# 卸载不触发(否则会先建表再被删)。
+# 下一次以 root 运行"管理类"命令(update/restart/menu/…)时幂等自动迁移防火墙(已迁移则首个 grep 秒退)。
+# 只读命令(status/doctor/log/traffic/report)与卸载不触发, 以保持"只读命令不写任何东西"的语义;
+# 只跑只读命令的用户可显式 `sudo pdg migrate-fw` 迁移(且证书 hook/doctor 已兼容旧 inet filter, 不迁也能用)。
 if [[ $EUID -eq 0 ]]; then
   case "${1:-menu}" in
-    uninstall|rm) : ;;
-    *) migrate_firewall_to_pdg || true ;;
+    status|st|doctor|dr|log|logs|traffic|tr|report|uninstall|rm) : ;;   # 只读/卸载: 不迁移
+    *) migrate_firewall_to_pdg || true ;;                                # 管理类命令才迁移
   esac
 fi
 
