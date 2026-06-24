@@ -508,6 +508,8 @@ def set_wda_mode(on):
             c["route"]["rules"].insert(idx, {"rule_set": "unlock", "outbound": "jp"})
     ok, msg = apply_sb(mod)
     if not ok:
+        if on:
+            _write_unlock_file([])   # 回滚: sing-box 没开成, 把刚写满的 unlock.txt 清掉, 别留"mosdns已写但sing-box没开"的残留
         return False, msg
     if on:
         return True, ("✅ 已切到【🔓 WDA 解锁】: %d 个域名走 WDA(jp 直出 + 22.22.22.22 中继)。\n"
