@@ -117,7 +117,7 @@ sudo PDG_NONINTERACTIVE=1 \
 
 ## 升级
 
-- 日常升级用 `sudo pdg update`(拉新代码 + 校验门 + 失败自动回滚到更新前快照,不动出口/分流/证书)。
+- 日常升级用 `sudo pdg update`:**更新到最新发布 tag**(只跟 `v*` tag、不拉 main 上未发布的中间提交)+ 校验门 + 失败自动回滚到更新前快照,不动出口/分流/证书。版本号(`pdg status` / bot『🔄 更新』)用 `git describe` 显示,如 `v1.1.0`。
 - **不要**用 `install.sh` 在已有部署上覆盖升级——它会拒绝并提示走 `pdg update`(确要覆盖重装才 `sudo PDG_FORCE_REINSTALL=1 ./install.sh`,会先打快照)。
 
 ### 旧版升上来的一次性防火墙迁移

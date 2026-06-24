@@ -961,18 +961,26 @@ def _git(*args, t=60):
     return subprocess.run(["git", "-C", PDG_REPO, *args], capture_output=True, text=True, timeout=t)
 
 def update_check():
-    """git fetch + 列 HEAD..origin/main 待更新提交。返回 (有更新?, 文本)。"""
+    """检查是否有更新的发布 tag(只跟 tag, 不拉 main 中间提交)。返回 (有更新?, 文本)。"""
     try:
         _git("fetch", "-q", "--tags", "origin", "main")
         cur = _git("describe", "--tags", "--always").stdout.strip()
-        log = _git("log", "--oneline", "HEAD..origin/main").stdout.strip()
+        tags = _git("tag", "-l", "v*", "--sort=-v:refname").stdout.split()
     except Exception as e:  # noqa: BLE001
         return False, f"检查更新失败: {e}"
-    if not log:
-        return False, f"🟢 已是最新版本(当前 <code>{cur}</code>)。"
+    if not tags:
+        return False, "🟢 仓库还没有发布 tag。"
+    tgt = tags[0]
+    head = _git("rev-parse", "HEAD").stdout.strip()
+    tcommit = _git("rev-parse", tgt + "^{commit}").stdout.strip()
+    if head == tcommit:
+        return False, f"🟢 已是最新发布 <b>{tgt}</b>。"
+    if _git("merge-base", "--is-ancestor", "HEAD", tgt).returncode != 0:
+        return False, f"🟢 已是最新(当前 <code>{cur}</code> 不落后于最新发布 {tgt})。"
+    log = _git("log", "--oneline", "HEAD.." + tgt).stdout.strip()
     n = len(log.splitlines())
-    return True, (f"🔄 有 <b>{n}</b> 个待更新提交(当前 <code>{cur}</code>):\n"
-                  f"<pre>{_esc(log)}</pre>\n确认后在后台执行 pdg update(约 30-60 秒, bot 会自动重启回来)。")
+    return True, (f"🔄 有新发布 <b>{tgt}</b>(当前 <code>{cur}</code>,含 {n} 个提交):\n"
+                  f"<pre>{_esc(log)}</pre>\n确认后后台执行 pdg update → 更新到 {tgt}(约 30-60 秒, bot 自动重启回来)。")
 
 def start_update():
     """在独立的 systemd 瞬时单元里跑 pdg update, 不受 pdg-bot 自身重启影响。"""

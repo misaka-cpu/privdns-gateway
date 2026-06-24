@@ -2,6 +2,12 @@
 
 本项目无正式版本号,按日期记录主要变化;完整提交见 git 历史。
 
+## 2026-06-24 — v1.1.1(`pdg update` 只跟发布 tag)
+
+- `pdg update` / bot『🔄 更新』从「跟 `main` 最新提交」改为「**更新到最新发布 tag**」(`v*`,按版本号降序取最高)。外部用户只会拿到打了 tag 的发布版,不再拉到 main 上未发布的中间提交;仓库没 tag 时中止并提示。
+- `--dry-run` 与更新检查显示「当前 vs 最新发布 tag」及其间提交;`reset --hard <tag>`。
+- 适合「对外发布走 tag、main 随时迭代」:你推 main 不影响别人,打 tag 才算发布。
+
 ## 2026-06-24 — v1.1.0(版本显示改 git describe)
 
 - `pdg status` 的「代码版本」与 bot『🔄 更新』检查里的「当前」从 commit hash 改为 **`git describe --tags`**:在 tag 上显示 `v1.1.0`,领先 tag 则 `v1.1.0-N-g<hash>`。`pdg update` 与检查更新的 `git fetch` 加 `--tags`,确保各机能拿到 tag 供 describe。

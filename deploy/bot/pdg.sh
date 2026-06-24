@@ -276,18 +276,22 @@ cmd_update(){
   command -v git >/dev/null || { apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git; }
   if [[ "${1:-}" == "--dry-run" ]]; then
     [[ -d "$REPO_DIR/.git" ]] && git -C "$REPO_DIR" fetch -q --tags origin main 2>/dev/null
-    echo "待更新的提交(HEAD..origin/main):"
-    git -C "$REPO_DIR" log --oneline HEAD..origin/main 2>/dev/null || echo "  (已是最新, 或无法比较)"
+    local tgt; tgt=$(git -C "$REPO_DIR" tag -l 'v*' --sort=-v:refname 2>/dev/null | head -1)
+    echo "当前: $(git -C "$REPO_DIR" describe --tags --always 2>/dev/null)   最新发布: ${tgt:-(无 tag)}"
+    [[ -n "$tgt" ]] && { echo "待更新提交(HEAD..$tgt):"; git -C "$REPO_DIR" log --oneline "HEAD..$tgt" 2>/dev/null || echo "  (已是最新或无法比较)"; }
     return 0
   fi
   _lock   # 取锁(嵌套的 cmd_snapshot 不会重复锁)
   c_g "更新前留快照…"; cmd_snapshot >/dev/null 2>&1 || true
-  c_g "拉取最新代码…"
-  if [[ -d "$REPO_DIR/.git" ]]; then
-    git -C "$REPO_DIR" fetch -q --tags origin main && git -C "$REPO_DIR" reset --hard -q origin/main
-  else
-    rm -rf "$REPO_DIR"; git clone -q --depth 1 "$REPO_URL" "$REPO_DIR"
+  c_g "拉取最新发布 tag…"
+  [[ -d "$REPO_DIR/.git" ]] || { rm -rf "$REPO_DIR"; git clone -q "$REPO_URL" "$REPO_DIR"; }
+  git -C "$REPO_DIR" fetch -q --tags origin main
+  local tgt; tgt=$(git -C "$REPO_DIR" tag -l 'v*' --sort=-v:refname | head -1)
+  if [[ -z "$tgt" ]]; then
+    c_y "仓库没有发布 tag(v*), 中止更新。"; return 1
   fi
+  git -C "$REPO_DIR" reset --hard -q "$tgt"
+  c_g "→ 已切到发布 $tgt"
   c_g "刷新代码(配置/出口/token/证书均不动)…"
   install -m755 "$REPO_DIR"/deploy/bot/pdg-bot.py           /opt/pdg-bot/bot.py
   install -m755 "$REPO_DIR"/deploy/bot/parse-geosite.py     /opt/pdg-bot/
