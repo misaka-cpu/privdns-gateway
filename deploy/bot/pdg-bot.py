@@ -1431,7 +1431,7 @@ def handle_cb(chat, mid, data):
         edit(chat, mid, rules_text(), BACK); return
     if data == "add_exit":
         state[chat] = "add_exit"
-        edit(chat, mid, "发一条节点链接：<code>ss:// / vmess:// / trojan:// / vless://</code>\n/cancel 取消。", BACK); return
+        edit(chat, mid, "发一条节点链接：<code>ss:// / vmess:// / trojan:// / vless://</code>(也认 Surge 的 <code>名字 = ss, …</code> 行)\n/cancel 取消。", BACK); return
     if data == "add_grp":
         state[chat] = "add_group"
         edit(chat, mid, "发「<b>组名 出口1 出口2 …</b>」建故障切换组(自动选最快/坏了自动切)。\n"
@@ -1637,7 +1637,7 @@ def handle_text(chat, text):
         if cmd == "/rules":
             send(chat, rules_text(), BACK); return
         if cmd == "/addexit":
-            state[chat] = "add_exit"; send(chat, "发节点链接：<code>ss:// / vmess:// / trojan:// / vless://</code>。/cancel 取消。", BACK); return
+            state[chat] = "add_exit"; send(chat, "发节点链接：<code>ss:// / vmess:// / trojan:// / vless://</code>(也认 Surge 的 <code>名字 = ss, …</code> 行)。/cancel 取消。", BACK); return
         if cmd == "/group":
             state[chat] = "add_group"; send(chat, "发「<b>组名 出口1 出口2 …</b>」建故障切换组。/cancel 取消。", BACK); return
         if cmd == "/addrule":

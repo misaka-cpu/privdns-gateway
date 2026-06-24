@@ -122,7 +122,8 @@ Telegram 给 bot 发 `/start`,出现主菜单:
   <sub>bot <code>/start</code> 主菜单</sub>
 </p>
 
-- **📤 出口管理 → ➕ 添加**:粘贴你的落地节点链接(`ss:// / vmess:// / trojan:// / vless://`)。
+- **📤 出口管理 → ➕ 添加**:粘贴你的落地节点链接(`ss:// / vmess:// / trojan:// / vless://`,也认 Surge 的 `名字 = ss, …` 行)。
+  > 出口跑在 sing-box,**协议不止这四种**(还有 hysteria2 / tuic / vless-reality / shadowtls / anytls / ssh / socks / http 等)——这几种是 bot 能直接粘的,其它手写 `/etc/sing-box/config.json` 即可。
 - **📑 分流管理**:把域名或规则集指到某个出口;不指的默认走「其余国际」的默认出口。
 - **🚦 测出口**:看各出口的延迟、是否可用。
 

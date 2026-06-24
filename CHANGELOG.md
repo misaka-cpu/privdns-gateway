@@ -6,6 +6,7 @@
 
 - **「📤 出口管理 → 添加」除 `ss:// / vmess:// / trojan:// / vless://` 链接外,也认 Surge 代理行**:`名字 = ss, 服务器, 端口, encrypt-method=…, password="…", tfo=true, udp-relay=true`(`encrypt-method`→method、`tfo=true`→`tcp_fast_open`;SS2022 如 `2022-blake3-aes-128-gcm` OK;udp-relay 是 sing-box ss 出站默认行为)。其它类型仍用对应 URI。
 - 加 `tests/test-parse-links.py`(进 CI):Surge ss 行 / `ss://` SIP002 / 非法输入 三类断言。
+- **文档澄清**:README/QUICKSTART/forum-post 说明出口**协议 = sing-box 全部出站**;`ss://vmess://trojan://vless://` + Surge ss 行是 bot 能直接粘的,其它(hysteria2/tuic/vless-reality/shadowtls/anytls/ssh/socks/http/wireguard 等)手写 `config.json` 即可——避免误以为只支持这四种。
 
 ## 2026-06-24 — 流媒体/服务解锁开关(WDA)
 

@@ -33,7 +33,7 @@ sing-box 嗅探 SNI/Host 后再决定走哪个落地。
   - 没有这种内网卡 → DNS 劫持会影响到所有查询源,不适用本项目。
 - 一个你能改 DNS 记录的**域名**(给 DoT 用,签 Let's Encrypt 证书)。
 - 一个 **Telegram bot**(管理出口/分流)。
-- 一个或多个**落地节点**(ss2022 / vmess / trojan / vless),用来出国际流量(可选,默认其余国际从 VPS 直出)。
+- 一个或多个**落地节点**,用来出国际流量(可选,默认其余国际从 VPS 直出)。出口跑在 sing-box 上,**协议支持 sing-box 的全部出站**;bot 能直接粘贴的链接见下。
 
 ---
 
@@ -60,7 +60,8 @@ cd privdns-gateway && sudo ./install.sh
 
 1. 手机【私密 DNS / DoT】填你的域名(如 `dot.example.com`)。
 2. Telegram 给 bot 发 `/start`:
-   - **📤 出口管理 → 添加**:粘贴 `ss:// / vmess:// / trojan:// / vless://` 落地链接。
+   - **📤 出口管理 → 添加**:粘贴 `ss:// / vmess:// / trojan:// / vless://` 链接(也认 Surge 的 `名字 = ss, …` 行)。
+     > 这几种是 **bot 能直接粘** 的;sing-box 本身还支持 **hysteria / hysteria2 / tuic / vless-reality / shadowtls / anytls / ssh / socks / http / wireguard(endpoint)** 等——这些手写 `/etc/sing-box/config.json` 即可用,或开 issue 让 bot 加解析。
    - **📑 分流管理**:把域名、`.list` / `.txt` 等规则集指到出口(默认其余国际走 VPS 直出)。
    - **🔀 故障切换组**:多落地自动选最快 / 坏了自动切。
 3. iOS:bot **📱 客户端 → iOS 描述文件**;**不用 bot 的话** `sudo pdg ios` 会直接在终端打出二维码,手机(走内网卡)扫码 → Safari → 装。
