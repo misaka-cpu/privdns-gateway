@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Static regressions for Telegram bot navigation after operation results."""
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -58,6 +59,11 @@ assert_near('if data == "upd_check":', 'edit(chat, mid, "🔄 检查更新中…
 ))
 assert 'edit(chat, mid, "🔄 检查更新中…", None)' not in bot, (
     "passing None to edit() falls back to the full first-level MENU"
+)
+none_progress_edits = re.findall(r"edit\(chat, mid, [^\n]+, None\)", bot)
+assert not none_progress_edits, (
+    "progress/result edits must pass an explicit keyboard; None falls back to the full first-level MENU: "
+    + ", ".join(none_progress_edits)
 )
 assert_near('if data == "dnsup":', '"callback_data": "menu"', (
     "DNS upstream page should include a main-menu button"

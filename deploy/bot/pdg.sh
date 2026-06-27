@@ -39,7 +39,9 @@ cmd_status(){
   done
   echo "  timer        $(systemctl is-active pdg-rules-update.timer 2>/dev/null)"
   echo "  DoT 域名     $(cat /opt/pdg-bot/dot-domain 2>/dev/null || echo ?)"
-  echo "  监听端口     $(ss -lntu 2>/dev/null | grep -oE ':(53|80|81|443|853|8445|9090)\b' | sort -u | tr '\n' ' ')"
+  local ports
+  ports=$(ss -lntu 2>/dev/null | grep -oE ':(53|80|81|443|853|8445|9090)\b' | sed 's/^://' | sort -u | sed 's/^9090$/9090(local clash_api)/' | tr '\n' ' ')
+  echo "  监听端口     $ports"
   if [[ -d "$REPO_DIR/.git" ]]; then echo "  代码版本     $(git -C "$REPO_DIR" describe --tags --always 2>/dev/null)"; fi
 }
 
@@ -259,8 +261,11 @@ cmd_rollback(){
   local snaps; mapfile -t snaps < <(ls -1dt "$SNAP_DIR"/*/ 2>/dev/null)
   [[ ${#snaps[@]} -gt 0 ]] || { echo "没有快照(先 pdg snapshot)"; return 1; }
   echo "可用快照(新→旧):"; local i=0; for s in "${snaps[@]}"; do echo "  [$i] $(basename "$s")"; i=$((i+1)); done
-  local idx="${1:-0}" target="${snaps[${1:-0}]}"
-  [[ -n "$target" ]] || { echo "无效序号 $idx"; return 1; }
+  local idx="${1:-0}" target
+  [[ "$idx" =~ ^[0-9]+$ ]] || { echo "无效序号 $idx"; return 1; }
+  idx=$((10#$idx))
+  (( idx >= ${#snaps[@]} )) && { echo "无效序号 $idx"; return 1; }
+  target="${snaps[$idx]}"
   local f="$target/snap.tar.gz"
   [[ -f "$f" ]] || { echo "快照文件缺失: $f"; return 1; }
   # 先校验快照里的 sing-box / nft 再动手(rule_set 路径临时指向解包目录)
@@ -465,11 +470,12 @@ menu(){
     echo " 13) 卸载"
     echo "  0) 退出"
     echo "  下次打开本菜单命令: pdg"
-    read -rp "选择: " c || exit 0
+    printf "选择: "
+    read -r c || exit 0
     case "$c" in
       1) cmd_status;;
       2) cmd_doctor;;
-      3) cmd_update;;
+      3) cmd_update && exec /usr/local/bin/pdg menu;;
       4) cmd_snapshot;;
       5) read -rp "回滚到第几个快照(默认 0=最近, 回车确认): " i; cmd_rollback "${i:-0}";;
       6) cmd_token;;

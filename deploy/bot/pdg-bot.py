@@ -140,8 +140,12 @@ def send(chat, text, kb=None):
 
 def send_plain(chat, text):
     """纯文本回复, 不挂任何键盘 (操作结果/确认用, 避免每次刷出整排菜单)。"""
-    post("sendMessage", {"chat_id": chat, "text": text, "parse_mode": "HTML",
-                         "disable_web_page_preview": True})
+    p = {"chat_id": chat, "text": text, "parse_mode": "HTML",
+         "disable_web_page_preview": True}
+    if post("sendMessage", p).get("ok"):
+        return
+    p.pop("parse_mode", None)
+    post("sendMessage", p)
 
 def edit(chat, mid, text, kb=None):
     p = {"chat_id": chat, "message_id": mid, "text": text, "parse_mode": "HTML",
@@ -1534,12 +1538,12 @@ def handle_cb(chat, mid, data):
              "之后自动签 Let's Encrypt 证书并切换(约 30 秒内代理短暂中断)。/cancel 取消。", BACK); return
     if data.startswith("dosetdot:"):
         domain = data[9:]
-        edit(chat, mid, f"正在为 <code>{domain}</code> 校验 A 记录并签证书(约 30-60 秒, 代理短暂中断)…", None)
+        edit(chat, mid, f"正在为 <code>{domain}</code> 校验 A 记录并签证书(约 30-60 秒, 代理短暂中断)…", BACK)
         ok, msg = set_dot_domain(domain); edit(chat, mid, (msg if ok else "❌ " + msg), MENU); return
     if data == "test":
         edit(chat, mid, "测试中…", BACK); edit(chat, mid, test_exits(), BACK); return
     if data == "doctor":
-        edit(chat, mid, "🩺 自检中(几秒)…", None); edit(chat, mid, doctor_text(), BACK); return
+        edit(chat, mid, "🩺 自检中(几秒)…", BACK); edit(chat, mid, doctor_text(), BACK); return
     if data == "upd_check":
         edit(chat, mid, "🔄 检查更新中…", BACK)
         has, txt = update_check()
@@ -1618,7 +1622,7 @@ def handle_cb(chat, mid, data):
         if not doms:
             _, kb = del_rule_kb(chat)
             edit(chat, mid, "还没勾选域名。勾选后再点「✅ 确认删除」:", kb); return
-        edit(chat, mid, f"⏳ 正在删除 {len(doms)} 个域名并重启 sing-box…", None)
+        edit(chat, mid, f"⏳ 正在删除 {len(doms)} 个域名并重启 sing-box…", RULE_BACK)
         ok, msg = del_rules_bulk(doms); del_sel.pop(chat, None)
         edit(chat, mid, msg if ok else ("❌ " + msg), RULE_BACK); return
     if data == "testdom":
@@ -1663,7 +1667,7 @@ def handle_cb(chat, mid, data):
     if data == "setfinal":
         edit(chat, mid, "「其余国际」默认走哪个出口/组：", kb_pick("fin", exit_tags(load()), EXIT_BACK)); return
     if data == "ios":
-        edit(chat, mid, "正在生成 iOS 描述文件…", None)
+        edit(chat, mid, "正在生成 iOS 描述文件…", BACK)
         try:
             send_document(chat, "PrivDNS-Gateway.mobileconfig", _ios_profile(),
                           f"📱 iOS/iPadOS 私密DNS 描述文件\nDoT: {_dot_host()}\n"
@@ -1674,7 +1678,7 @@ def handle_cb(chat, mid, data):
             edit(chat, mid, f"生成失败: {e}", MENU)
         return
     if data == "backup":
-        edit(chat, mid, "正在打包配置…", None)
+        edit(chat, mid, "正在打包配置…", OPS_BACK)
         try:
             fn = "pdg-backup-" + time.strftime("%Y%m%d-%H%M") + ".tar.gz"
             send_document(chat, fn, backup_blob(),
@@ -1705,7 +1709,7 @@ def handle_cb(chat, mid, data):
                  [{"text": "⬅️ 返回运维", "callback_data": "nav:ops"}],
                  [{"text": "🏠 主菜单", "callback_data": "menu"}]]}); return
     if data in ("wda:on", "wda:off"):
-        edit(chat, mid, "正在切换解锁模式…", None)
+        edit(chat, mid, "正在切换解锁模式…", DNS_BACK)
         ok, msg = set_wda_mode(data == "wda:on")
         edit(chat, mid, msg if ok else ("❌ " + msg), DNS_BACK); return
     if data == "tfo":
@@ -1721,7 +1725,7 @@ def handle_cb(chat, mid, data):
         ok, msg = apply_sb(lambda c: None); sh(["systemctl", "restart", "mosdns"])
         edit(chat, mid, "✅ 已重启 sing-box + mosdns" if ok else msg, OPS_BACK); return
     if data == "updgeo":
-        edit(chat, mid, "正在更新 geosite + 规则集…", None)
+        edit(chat, mid, "正在更新 geosite + 规则集…", OPS_BACK)
         r = sh(["/bin/bash", UPDATE_SCRIPT]); n = refresh_rulesets()
         edit(chat, mid, (f"✅ geosite 已更新; 规则集刷新 {n} 个" if r.returncode == 0
                          else "geosite 更新失败:\n" + (r.stdout + r.stderr)[-300:]), OPS_BACK); return

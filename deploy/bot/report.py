@@ -67,6 +67,13 @@ def run(cmd, t=15):
     except Exception as e:  # noqa: BLE001
         return f"(执行失败: {e})"
 
+def run_rc(cmd, t=15):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=t)
+        return p.returncode, (p.stdout + p.stderr).strip() or "(无输出)"
+    except Exception as e:  # noqa: BLE001
+        return 1, f"(执行失败: {e})"
+
 def section(title, body):
     return f"\n===== {title} =====\n{body.rstrip()}\n"
 
@@ -92,7 +99,10 @@ def main():
                          run(["openssl", "x509", "-in", cert, "-noout", "-subject", "-enddate"])))
     parts.append(section(f"DoT A 记录 ({dom or '?'} @1.1.1.1, 本机应为 {sip or '?'})",
                          run(["dig", "+short", dom, "@1.1.1.1"]) if dom else "(未知 DoT 域名)"))
-    parts.append(section("防火墙 input 链", run(["nft", "list", "chain", "inet", "filter", "input"])))
+    fw_rc, fw = run_rc(["nft", "list", "chain", "inet", "pdg", "input"])
+    if fw_rc != 0:
+        fw = run(["nft", "list", "chain", "inet", "filter", "input"])
+    parts.append(section("防火墙 input 链", fw))
     parts.append(section("最近日志 (pdg-bot / mosdns / sing-box, 80 行)",
                          run(["journalctl", "-u", "pdg-bot", "-u", "mosdns", "-u", "sing-box",
                               "-n", "80", "--no-pager", "-o", "short-iso"], t=20)))
