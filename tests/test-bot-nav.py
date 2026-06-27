@@ -47,3 +47,9 @@ assert_near('if data == "add_rs":', "RULE_BACK", "add-ruleset prompt should retu
 assert_near('if data == "del_rs":', "RULE_BACK", "delete-ruleset selector should return to rule management")
 assert_near('if data == "edit_rs":', "RULE_BACK", "rename-ruleset selector should return to rule management")
 assert_near('if data.startswith("delrs:"):', "RULE_BACK", "ruleset deletion result should return to rule management")
+assert_near('if data == "test":', 'edit(chat, mid, "测试中…", BACK)', (
+    "exit latency test progress message should show only a back button, not the full first-level menu"
+))
+assert 'edit(chat, mid, "测试中…", None)' not in bot, (
+    "passing None to edit() falls back to the full first-level MENU"
+)

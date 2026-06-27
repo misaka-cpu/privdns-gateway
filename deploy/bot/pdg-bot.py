@@ -1236,7 +1236,8 @@ def _singbox_route(d):
             return r["outbound"], "关键词规则"
         rs = r.get("rule_set")
         if rs and _match_ruleset(rs, d, sufs):
-            return r["outbound"], f"规则集 {rs}"
+            label = _rs_meta().get(rs, {}).get("label") or rs
+            return r["outbound"], f"规则集 {label}"
     return c["route"].get("final"), "默认(其余国际)"
 
 def test_domain(domain):
@@ -1536,7 +1537,7 @@ def handle_cb(chat, mid, data):
         edit(chat, mid, f"正在为 <code>{domain}</code> 校验 A 记录并签证书(约 30-60 秒, 代理短暂中断)…", None)
         ok, msg = set_dot_domain(domain); edit(chat, mid, (msg if ok else "❌ " + msg), MENU); return
     if data == "test":
-        edit(chat, mid, "测试中…", None); edit(chat, mid, test_exits(), BACK); return
+        edit(chat, mid, "测试中…", BACK); edit(chat, mid, test_exits(), BACK); return
     if data == "doctor":
         edit(chat, mid, "🩺 自检中(几秒)…", None); edit(chat, mid, doctor_text(), BACK); return
     if data == "upd_check":
