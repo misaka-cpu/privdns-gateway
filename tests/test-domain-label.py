@@ -25,3 +25,10 @@ tag, why = bot._singbox_route("line-apps.com")
 assert tag == "hk"
 assert why == "规则集 line"
 assert "rs_9d05f092" not in why
+
+# 删除规则集的结果消息也要用显示名, 不是 rs_xxxx
+bot._rs_meta = lambda: {"rs_9d05f092": {"label": "line", "path": "/nonexistent.json"}}
+bot.apply_sb = lambda mod: (True, "")
+bot._save_rs_meta = lambda m: None
+ok, msg = bot.del_ruleset("rs_9d05f092")
+assert ok and "line" in msg and "rs_9d05f092" not in msg, msg

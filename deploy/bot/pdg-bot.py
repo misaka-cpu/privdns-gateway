@@ -793,7 +793,8 @@ def _rs_items():
     return [(n, (i.get("label") or n) + f" · {i.get('count', '?')}条") for n, i in _rs_meta().items()]
 
 def del_ruleset(name):
-    m = _rs_meta(); path = m.get(name, {}).get("path")
+    m = _rs_meta(); info = m.get(name, {}); path = info.get("path")
+    label = info.get("label") or name              # 删前取显示名(删完 meta 就没了)
     def mod(cc):
         cc["route"]["rule_set"] = [r for r in cc["route"].get("rule_set", []) if r.get("tag") != name]
         cc["route"]["rules"] = [r for r in cc["route"]["rules"] if r.get("rule_set") != name]
@@ -806,7 +807,7 @@ def del_ruleset(name):
                     os.remove(p)
             except OSError:
                 pass
-        return True, f"已删除规则集 {name}"
+        return True, f"已删除规则集 {label}"
     return False, msg
 
 def refresh_rulesets():
@@ -1557,8 +1558,6 @@ def handle_cb(chat, mid, data):
                          else "❌ 启动更新失败, 请在终端跑 sudo pdg update。"), BACK); return
     if data == "traffic":
         edit(chat, mid, traffic_text(), BACK); return
-    if data == "exits":
-        edit(chat, mid, exits_text(), BACK); return
     if data == "exit_list":
         edit(chat, mid, exits_text(), EXIT_BACK); return
     if data == "rules":
