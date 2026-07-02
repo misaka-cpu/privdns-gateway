@@ -91,6 +91,9 @@ jobs:
       - name: "bot 测域名规则集显示名回归"
         run: python3 tests/test-domain-label.py
 
+      - name: "出口改名级联回归 (规则/故障组/final/TG 同步)"
+        run: python3 tests/test-exit-rename.py
+
       - name: "自检防火墙端口回归"
         run: python3 tests/test-doctor-firewall.py
 

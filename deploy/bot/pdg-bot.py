@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """PrivDNS Gateway — Telegram 管理 bot v3 (纯标准库, long-poll)。
 
-出口  : 列表 / 添加(ss/vmess/trojan/vless 链接) / 删除 / 设默认出口 / 故障切换组(urltest)
+出口  : 列表 / 添加(ss/vmess/trojan/vless 链接) / 删除 / 改名(级联更新引用) / 设默认出口 / 故障切换组(urltest)
 分流  : 规则列表 / 添加(域名→出口|direct) / 删除 / 添加规则集(Surge .list URL→出口) / 删除规则集
 诊断  : 状态 / 端到端测出口延迟(clash_api) / 流量统计(clash_api)
 运维  : 重启 / 更新规则库(geosite + 规则集) / iOS 描述文件下发 / 配置备份·恢复
@@ -111,7 +111,8 @@ def _nav(key):
         "exit": ("📤 <b>出口管理</b> — 选一项:", [
             [{"text": "📋 列表", "callback_data": "exit_list"}, {"text": "➕ 添加", "callback_data": "add_exit"},
              {"text": "🗑 删除", "callback_data": "del_exit"}],
-            [{"text": "🎯 默认出口", "callback_data": "setfinal"}, {"text": "↕️ 出口排序", "callback_data": "order_exit"}],
+            [{"text": "🎯 默认出口", "callback_data": "setfinal"}, {"text": "↕️ 出口排序", "callback_data": "order_exit"},
+             {"text": "✏️ 改名", "callback_data": "ren_exit"}],
             [{"text": "🔀 新建故障组", "callback_data": "add_grp"}, {"text": "✏️ 改故障组", "callback_data": "edit_grp"}]]),
         "rule": ("📑 <b>分流管理</b> — 选一项:", [
             [{"text": "📋 规则", "callback_data": "rules"}, {"text": "➕ 加规则", "callback_data": "add_rule"},
@@ -1173,6 +1174,43 @@ def reorder_exits(order):
     ok, msg = apply_sb(mod)
     return ok, (f"✅ 出口顺序已更新: {' › '.join(order)}" if ok else msg)
 
+def rename_exit(old, new):
+    """真改名: 改 outbound 的 tag, 并级联更新全部引用 —— 分流规则(含 TG 出口规则)、
+    故障组成员、route.final、规则集元数据的 outbound 记录。direct(模板锚点, WDA 依赖其 tag)不可改。"""
+    c = load()
+    if old not in deletable_tags(c):
+        return False, f"出口 {old} 不存在或不可改名(direct 出口是模板锚点)"
+    new = _tag(new.strip(), "", "")
+    if not re.search(r"[A-Za-z0-9]", new):
+        return False, "新名字无效: 用字母/数字/_/./-(不支持中文), 40 字内"
+    if new == old:
+        return False, "新旧名字相同, 未改动"
+    if new in ("direct", "直连", "block", "dns-out"):
+        return False, f"{new} 是保留字, 换个名字"
+    if new in [o["tag"] for o in c["outbounds"]]:
+        return False, f"名字 {new} 已被占用"
+    def mod(cc):
+        for o in cc["outbounds"]:
+            if o.get("tag") == old:
+                o["tag"] = new
+            if o.get("type") == "urltest":
+                o["outbounds"] = [new if m == old else m for m in o.get("outbounds", [])]
+        for r in cc["route"]["rules"]:
+            if r.get("outbound") == old:
+                r["outbound"] = new
+        if cc["route"].get("final") == old:
+            cc["route"]["final"] = new
+    ok, msg = apply_sb(mod)
+    if not ok:
+        return False, msg
+    m = _rs_meta(); dirty = False          # 规则集元数据也记着目标出口, 同步掉, 免得日后误导
+    for info in m.values():
+        if info.get("outbound") == old:
+            info["outbound"] = new; dirty = True
+    if dirty:
+        _save_rs_meta(m)
+    return True, f"✅ 出口 <b>{old}</b> 已改名 <b>{new}</b>, 分流规则/故障组/默认出口里的引用已同步。"
+
 def urltest_groups(c):
     return [o["tag"] for o in c["outbounds"] if o.get("type") == "urltest"]
 
@@ -1663,6 +1701,14 @@ def handle_cb(chat, mid, data):
         tags = deletable_tags(load())
         edit(chat, mid, "选择要删除的出口/故障组：" if tags else "没有可删的出口",
              kb_pick("delx", tags, EXIT_BACK) if tags else EXIT_BACK); return
+    if data == "ren_exit":
+        tags = deletable_tags(load())
+        edit(chat, mid, "选择要改名的出口/故障组：" if tags else "没有可改名的出口",
+             kb_pick("renx", tags, EXIT_BACK) if tags else EXIT_BACK); return
+    if data.startswith("renx:"):
+        old = data[5:]; state[chat] = "rename_exit:" + old
+        edit(chat, mid, f"发出口 <b>{old}</b> 的新名字(字母/数字/_/./-, 40 字内)。\n"
+             "分流规则、故障组、默认出口里的引用会一并同步。/cancel 取消。", EXIT_BACK); return
     if data == "setfinal":
         edit(chat, mid, "「其余国际」默认走哪个出口/组：", kb_pick("fin", exit_tags(load()), EXIT_BACK)); return
     if data == "ios":
@@ -1832,6 +1878,9 @@ def handle_text(chat, text):
         ok, msg = reorder_exits(text.replace(",", " ").split()); send_plain(chat, msg if ok else ("❌ " + msg)); return
     if act.startswith("edit_grp:"):
         ok, msg = add_group(act.split(":", 1)[1], text.replace(",", " ").split())
+        send_plain(chat, msg if ok else ("❌ " + msg)); return
+    if act.startswith("rename_exit:"):
+        ok, msg = rename_exit(act.split(":", 1)[1], text)
         send_plain(chat, msg if ok else ("❌ " + msg)); return
     if act == "add_rule":
         p = text.split()
