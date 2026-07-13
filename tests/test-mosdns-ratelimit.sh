@@ -107,19 +107,28 @@ else
   echo "[SKIP] 无 mosdns/dig, 跳过限流实测(迁移与 doctor 已覆盖)"
 fi
 
-# ── C. doctor 只读检查 ───────────────────────────────────────────────────────
-MOSDNS_CONF="$WORK/old.yaml" python3 - "$ROOT/deploy/bot/checks.py" "$WORK/old.yaml" <<'PY' && ok "doctor: 就位=ok / 抽掉=warn" || bad "doctor 检查不符"
-import importlib.util, sys, os
+# ── C. doctor 只读检查(就位=ok; 抽掉/参数错/动作错=warn)────────────────────
+python3 - "$ROOT/deploy/bot/checks.py" "$WORK/old.yaml" <<'PY' && ok "doctor: 就位=ok / 抽掉·参数错·动作错=warn" || bad "doctor 检查不符"
+import importlib.util, re, sys
 spec=importlib.util.spec_from_file_location("checks", sys.argv[1])
 c=importlib.util.module_from_spec(spec); spec.loader.exec_module(c)
-c.MOSDNS_CONF=sys.argv[2]
-st,_,_=c.check_mosdns_ratelimit(); assert st=="ok", ("就位应 ok, 实为", st)
+base=open(sys.argv[2]).read()
+def st_of(text):
+    p=sys.argv[2]+".t"; open(p,'w').write(text); c.MOSDNS_CONF=p
+    return c.check_mosdns_ratelimit()[0]
+assert st_of(base)=="ok", "就位应 ok"
 # 抽掉 limiter → warn
-import re
-bad=re.sub(r'  - tag: client_limiter\n    type: rate_limiter\n    args:[^\n]*\n','',open(sys.argv[2]).read())
-bad=bad.replace('      - matches: "!$client_limiter"\n        exec: reject 5\n','')
-p=sys.argv[2]+".x"; open(p,'w').write(bad); c.MOSDNS_CONF=p
-st,_,_=c.check_mosdns_ratelimit(); assert st=="warn", ("抽掉应 warn, 实为", st)
+gone=re.sub(r'  - tag: client_limiter\n    type: rate_limiter\n    args:[^\n]*\n','',base)
+gone=gone.replace('      - matches: "!$client_limiter"\n        exec: reject 5\n','')
+assert st_of(gone)=="warn", "抽掉应 warn"
+# 参数错(qps 200→100)→ warn
+assert st_of(base.replace('qps: 200','qps: 100'))=="warn", "qps 错应 warn"
+# 参数错(mask4 32→24)→ warn
+assert st_of(base.replace('mask4: 32','mask4: 24'))=="warn", "mask4 错应 warn"
+# 动作错(reject 5→accept)→ warn
+assert st_of(base.replace('        exec: reject 5','        exec: accept'))=="warn", "动作 accept 应 warn"
+# 动作错(reject 5→reject 3)→ warn
+assert st_of(base.replace('        exec: reject 5','        exec: reject 3'))=="warn", "reject 3 应 warn"
 PY
 
 echo "────────────────────────────────────────"

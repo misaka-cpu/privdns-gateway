@@ -230,8 +230,10 @@ fi
 # 只调确认安全的项: mosdns cache(8192/2048)+ journald 上限(50M/20M)。不动 sysctl/swap/MemoryMax。
 case "${PDG_LOWMEM:-auto}" in
   1) LOWMEM=1;; 0) LOWMEM=0;;
-  *) _mt=$(sed -n 's/^MemTotal:[[:space:]]*\([0-9]*\).*/\1/p' /proc/meminfo 2>/dev/null)
-     if [[ -n "$_mt" && "$_mt" -le 1331200 ]]; then LOWMEM=1; else LOWMEM=0; fi;;
+  *) _cur=""; [[ -f /etc/privdns-gateway/profile.env ]] && _cur=$(sed -n 's/^PDG_LOWMEM=//p' /etc/privdns-gateway/profile.env | tail -1)
+     if [[ "$_cur" == 0 || "$_cur" == 1 ]]; then LOWMEM="$_cur"   # 已固定的模式沿用(强制重装不覆盖用户选择)
+     else _mt=$(sed -n 's/^MemTotal:[[:space:]]*\([0-9]*\).*/\1/p' /proc/meminfo 2>/dev/null)
+          if [[ -n "$_mt" && "$_mt" -le 1331200 ]]; then LOWMEM=1; else LOWMEM=0; fi; fi;;
 esac
 if [[ "$LOWMEM" == 1 ]]; then MOSDNS_CACHE=2048; JOURNALD_MAXUSE=20M; else MOSDNS_CACHE=8192; JOURNALD_MAXUSE=50M; fi
 install -d -m700 /etc/privdns-gateway

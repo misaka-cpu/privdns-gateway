@@ -173,22 +173,39 @@ def _internal_seq_block(conf):
             out.append(ln)
     return "\n".join(out)
 
+_RL_WARN = ("warn", "限流", "mosdns 单客户端 QPS 兜底(rate_limiter)缺失或参数/动作异常; "
+                            "运行 sudo pdg restart 或 sudo pdg 触发迁移。高度自定义配置请手动在 "
+                            "internal_sequence 缓存前加 client_limiter(qps200/burst400/mask4-32/mask6-128)+ "
+                            "'!$client_limiter → reject 5'。")
+_RL_WANT = {"qps": "200", "burst": "400", "mask4": "32", "mask6": "128"}
+
 def check_mosdns_ratelimit():
-    """单客户端 QPS 兜底(rate_limiter)是否就位: 插件存在 且 internal_sequence 缓存查询之前拦超限。
-    只读; 缺失/位置异常 → warn(不 fail, 老装未迁移或高度自定义配置属合法缺席)。"""
+    """单客户端 QPS 兜底(rate_limiter)是否就位且参数/动作正确:
+    插件 client_limiter 是 rate_limiter 且 qps200/burst400/mask4-32/mask6-128;
+    internal_sequence 缓存查询之前 '!$client_limiter' 的动作确为 reject 5。
+    只读; 任一不符 → warn(不 fail, 老装未迁移或高度自定义配置属合法缺席)。"""
     conf = _mos()
     if not conf:
         return ("warn", "限流", "读不到 mosdns 配置")
-    has_plugin = "type: rate_limiter" in conf and "client_limiter" in conf
+    # 1) 精确解析插件块参数(client_limiter / type: rate_limiter / args {...})
+    m = re.search(r"-\s*tag:\s*client_limiter\s*\n\s*type:\s*rate_limiter\s*\n\s*args:\s*\{([^}]*)\}", conf)
+    if not m:
+        return _RL_WARN
+    args = m.group(1)
+    for k, v in _RL_WANT.items():
+        mm = re.search(r"\b" + k + r"\s*:\s*(\d+)", args)
+        if not mm or mm.group(1) != v:
+            return _RL_WARN
+    # 2) internal_sequence 里 '!$client_limiter' 的紧邻 exec 必须是 reject 5, 且在缓存查询之前
     blk = _internal_seq_block(conf)
     i_lim = blk.find("!$client_limiter")
     i_cache = blk.find("$lazy_cache")
-    placed = i_lim >= 0 and (i_cache < 0 or i_lim < i_cache)   # 限流在缓存查询之前
-    if has_plugin and placed:
-        return ("ok", "限流", "单客户端 QPS 兜底已就位(rate_limiter, 缓存前)")
-    return ("warn", "限流", "mosdns 未启用单客户端 QPS 兜底(rate_limiter); "
-                            "运行 sudo pdg restart 或 sudo pdg 触发迁移。高度自定义配置请手动在 "
-                            "internal_sequence 缓存前加 '!$client_limiter → reject 5'。")
+    if i_lim < 0 or (i_cache >= 0 and i_lim >= i_cache):
+        return _RL_WARN
+    step = re.search(r'matches:\s*"?!\$client_limiter"?\s*\n\s*exec:\s*reject\s+5\b', blk)
+    if not step:
+        return _RL_WARN
+    return ("ok", "限流", "单客户端 QPS 兜底已就位(rate_limiter qps200/burst400, reject 5, 缓存前)")
 
 PROFILE_ENV = "/etc/privdns-gateway/profile.env"
 

@@ -70,6 +70,7 @@ _busy: dict[int, bool] = {}
 _busy_lock = threading.Lock()
 _cfg_lock = threading.Lock()                     # 进程内串行化"写 sing-box 配置"
 LOCKFILE = "/run/privdns-gateway.lock"           # 与 pdg update/rollback 共用, 防跨进程并发改配置
+BUSY_MSG = "已有配置操作正在执行,请稍候再试。"   # apply_sb 拿不到锁(进程内或跨进程)时的安全返回
 
 def _acquire_busy(chat):
     with _busy_lock:
@@ -94,13 +95,21 @@ def run_bg(chat, fn):
             print("bg task err", type(e).__name__, flush=True)
         finally:
             _release_busy(chat)
-    return _EXEC.submit(wrap)
+    try:
+        return _EXEC.submit(wrap)
+    except Exception:  # noqa: BLE001            # 执行器已关闭等 → 释放 BUSY, 不静默泄漏
+        _release_busy(chat)
+        send_plain(chat, "后台繁忙,请稍后再试")
+        return None
 
 @contextlib.contextmanager
 def _cfg_guard():
-    """进程内串行(_cfg_lock)+ 跨进程 flock(与 pdg update/rollback 协调)。
-    别的进程持锁 → yield False(友好返回, 不阻塞); 锁文件不可用 → 退化为仅进程内串行。"""
-    with _cfg_lock:
+    """进程内串行(_cfg_lock, 非阻塞)+ 跨进程 flock(与 pdg update/rollback 协调)。
+    两把锁任一被占 → yield False(立即友好返回, 绝不阻塞主轮询); 锁文件不可用 → 退化为仅进程内串行。"""
+    if not _cfg_lock.acquire(blocking=False):    # 非阻塞: 本进程已有配置操作在跑 → 立刻让路, 不卡主循环
+        yield False
+        return
+    try:
         try:
             f = open(LOCKFILE, "w")
         except OSError:
@@ -122,6 +131,8 @@ def _cfg_guard():
                 except Exception:  # noqa: BLE001
                     pass
             f.close()
+    finally:
+        _cfg_lock.release()
 
 def send_document(chat, filename, data, caption=""):
     """multipart/form-data 上传文件 (备份 / iOS 描述文件)。"""
@@ -233,6 +244,16 @@ def delete_message(chat, mid):
     except Exception:  # noqa: BLE001
         return False
 
+def delete_credential_async(chat, mid):
+    """独立线程删除含凭据的原消息 —— 不经 BUSY/后台执行器, 保证 BUSY 拒绝或提交失败时凭据仍被清除。
+    删不掉才提示手动删除, 不回显任何链接内容。"""
+    if not mid:
+        return
+    def go():
+        if not delete_message(chat, mid):
+            send_plain(chat, "未能自动删除含凭据的上一条消息,请手动删除")
+    threading.Thread(target=go, daemon=True).start()
+
 def answer_cb_async(cb_id):
     """后台停掉按钮转圈(独立连接, 不占用主 keep-alive、不阻塞主循环)。
     主循环改完内容(edit)就能立刻回到 getUpdates → 连续点菜单不再为'停转圈'多等一个来回。"""
@@ -290,7 +311,7 @@ def apply_sb(modify):
     # 串行化配置写 + 与 pdg update/rollback 用同一把 flock 协调(拿不到锁友好返回, 不卡死)。
     with _cfg_guard() as got:
         if not got:
-            return False, "系统正在执行更新/回滚,请稍后再试。"
+            return False, BUSY_MSG
         shutil.copy(SB, SB + ".botbak"); os.chmod(SB + ".botbak", 0o600)
         c = load(); modify(c); _write(c)
         chk = sh(["sing-box", "check", "-c", SB])
@@ -1959,11 +1980,11 @@ def handle_text(chat, text, mid=None):
     act = state.pop(chat, None) or ""   # 无待输入时为 "", 避免下面 act.startswith(...) 在 None 上崩
     if act == "add_exit":
         # state 已在上面 state.pop 清除 → 紧接着发的下一条不会再被当 add_exit。
-        # 含凭据(密码/uuid/服务器)的解析+校验+写配置+重启放后台, 主循环不等; 原消息尽力删除。
+        # 关键: 先无条件删含凭据(密码/uuid/服务器)的原消息 —— 独立线程, 不受 BUSY/执行器影响,
+        # 所以 BUSY 拒绝、提交失败等路径下凭据仍被清除。解析+校验+写配置+重启才放后台。
+        delete_credential_async(chat, mid)
         link = text
-        def task(link=link, mid=mid):
-            if not delete_message(chat, mid):        # 无论后续成败, 先尽力删含凭据的原消息
-                send_plain(chat, "未能自动删除含凭据的上一条消息,请手动删除")
+        def task(link=link):
             try:
                 ob = parse_link(link)
             except Exception:  # noqa: BLE001        # 不回显原始链接/异常正文(可能含凭据)
@@ -1973,10 +1994,14 @@ def handle_text(chat, text, mid=None):
             def mod(c):
                 c["outbounds"] = [o for o in c["outbounds"] if o.get("tag") != ob["tag"]]
                 c["outbounds"].append(ob)
-            ok, _ = apply_sb(mod)
+            ok, msg = apply_sb(mod)
             link = ob = None                         # 尽力减少凭据在内存驻留(非安全擦除, Python 无法保证)
-            send_plain(chat, f"✅ 已添加出口 <b>{tag}</b>" if ok
-                       else "❌ 添加失败: 配置校验未过, 已回滚(详情见服务器日志, 未回显链接内容)")
+            if ok:
+                send_plain(chat, f"✅ 已添加出口 <b>{tag}</b>")
+            elif msg == BUSY_MSG:                    # 锁冲突: 安全且准确, 原样回显(不是校验失败)
+                send_plain(chat, "❌ " + msg)
+            else:                                    # 校验/重启失败: 正文可能含凭据 → 通用提示
+                send_plain(chat, "❌ 添加失败: 配置校验未过, 已回滚(详情见服务器日志, 未回显链接内容)")
         run_bg(chat, task)
         return
     if act == "add_group":

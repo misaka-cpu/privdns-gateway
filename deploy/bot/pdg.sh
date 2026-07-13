@@ -65,19 +65,27 @@ migrate_lowmem(){
   if [[ -f "$mos" ]] && grep -q 'tag: lazy_cache' "$mos"; then
     local cur; cur="$(awk '/tag: lazy_cache/{f=1} f&&/size:/{print $2; exit}' "$mos")"
     if [[ -n "$cur" && "$cur" != "$cache" ]]; then
-      local bak; bak="$mos.prelowmem.$(date +%s)"
+      local bak tmp; bak="$mos.prelowmem.$(date +%s)"; tmp="$mos.lowmem.$$.tmp"
       if cp -a "$mos" "$bak" 2>/dev/null && cmp -s "$mos" "$bak"; then
-        python3 - "$mos" "$cache" <<'PY'
+        # 生成到同目录临时文件; 判 python 退出码 + 复核结果, 成功才原子替换 → 只有真改成功才重启。
+        if python3 - "$mos" "$tmp" "$cache" <<'PY'
 import sys, re
-f, cache = sys.argv[1], sys.argv[2]; s = open(f).read()
+src, dst, cache = sys.argv[1], sys.argv[2], sys.argv[3]
+s = open(src).read()
 i = s.index('tag: lazy_cache'); head, tail = s[:i], s[i:]      # 只改 lazy_cache 块里第一处 size:
-tail = re.sub(r'(size:\s*)\d+', r'\g<1>' + cache, tail, count=1)
-open(f, 'w').write(head + tail)
+tail, n = re.subn(r'(size:\s*)\d+', r'\g<1>' + cache, tail, count=1)
+assert n == 1, 'lazy_cache 块内未找到 size 行'
+open(dst, 'w').write(head + tail)
 PY
+        then :; else c_y "  生成 mosdns cache 失败 → 不改、不重启。"; rm -f "$tmp"; return 0; fi
+        if ! grep -qE "size:[[:space:]]*$cache\b" "$tmp"; then
+          c_y "  生成结果未含目标 cache size → 不改、不重启。"; rm -f "$tmp"; return 0
+        fi
+        mv "$tmp" "$mos"                                       # 原子替换(同目录 rename)
         systemctl restart mosdns 2>/dev/null; sleep 1
         if [[ "$(systemctl is-active mosdns 2>/dev/null)" != active ]]; then
-          c_y "mosdns cache 调整后重启失败 → 还原。"; cp -a "$bak" "$mos" 2>/dev/null; systemctl restart mosdns 2>/dev/null
-        else c_g "mosdns cache size → $cache"; fi
+          c_y "  mosdns cache 调整后重启失败 → 还原。"; cp -a "$bak" "$mos" 2>/dev/null; systemctl restart mosdns 2>/dev/null
+        else c_g "  mosdns cache size → $cache"; fi
       fi
     fi
   fi
