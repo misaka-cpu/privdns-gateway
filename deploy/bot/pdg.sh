@@ -58,9 +58,10 @@ pdg_lowmem_current(){
 
 # 老装迁移: 按 profile(内存模式)把 mosdns cache size / journald SystemMaxUse 调到目标。幂等。
 # 只改这两处已知项, 保留用户上游/其它内容; mosdns 改动走"备份+重启 active 门+失败还原"。
-# shellcheck disable=SC2120  # $1/$2 仅测试注入
+# shellcheck disable=SC2120  # $1/$2/$3 仅测试注入
 migrate_lowmem(){
   local mos="${1:-/etc/mosdns/config.yaml}" jrnl="${2:-/etc/systemd/journald.conf.d/50-pdg.conf}"
+  local jrnl_legacy="${3:-/etc/systemd/system/journald.conf.d/50-pdg.conf}"   # 历史装错目录
   local mode cache jmax; mode="$(pdg_lowmem_resolve)"; cache="$(pdg_cache_size "$mode")"; jmax="$(pdg_journald_max "$mode")"
   if [[ -f "$mos" ]] && grep -q 'tag: lazy_cache' "$mos"; then
     local cur; cur="$(awk '/tag: lazy_cache/{f=1} f&&/size:/{print $2; exit}' "$mos")"
@@ -91,9 +92,15 @@ PY
       fi
     fi
   fi
-  if [[ -f "$jrnl" ]] && ! grep -q "SystemMaxUse=$jmax" "$jrnl"; then
+  # journald: 清掉装错目录(system/)的历史残留(journald 不读它)+ 确保正确目录有目标封顶值
+  [[ "$jrnl_legacy" != "$jrnl" && -f "$jrnl_legacy" ]] && rm -f "$jrnl_legacy"
+  if [[ ! -f "$jrnl" ]]; then                    # 正确目录缺文件(如旧装只在错目录有)→ 补建
+    mkdir -p "$(dirname "$jrnl")" 2>/dev/null \
+      && printf '[Journal]\nSystemMaxUse=%s\n' "$jmax" > "$jrnl" 2>/dev/null \
+      && { systemctl restart systemd-journald 2>/dev/null || true; c_g "  journald 封顶补到正确目录 → $jmax"; }
+  elif ! grep -q "SystemMaxUse=$jmax" "$jrnl"; then
     sed -i -E "s/^SystemMaxUse=.*/SystemMaxUse=$jmax/" "$jrnl" 2>/dev/null \
-      && { systemctl restart systemd-journald 2>/dev/null || true; c_g "journald SystemMaxUse → $jmax"; }
+      && { systemctl restart systemd-journald 2>/dev/null || true; c_g "  journald SystemMaxUse → $jmax"; }
   fi
 }
 

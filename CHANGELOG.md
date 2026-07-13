@@ -2,6 +2,10 @@
 
 本项目无正式版本号,按日期记录主要变化;完整提交见 git 历史。
 
+## 2026-07-13 — v1.2.2(journald 迁移补齐: 清错目录残留 + 补建正确目录)
+
+- **修**:v1.2.1 只改「正确目录已有的」journald 文件;但用旧版 install.sh 装的机器,文件在**错目录**、正确目录为空,迁移会跳过 → 封顶仍不生效。`migrate_lowmem` 现在会清掉错目录(`/etc/systemd/system/journald.conf.d/`)的历史残留,并在正确目录缺文件时按内存模式补建(标准 50M / 低内存 20M)。回归加进 `test-lowmem.sh`。
+
 ## 2026-07-13 — v1.2.1(修 journald drop-in 路径)
 
 - **修**:journald 用量封顶(`50-pdg.conf`)一直被装到 `/etc/systemd/system/journald.conf.d/`——但 journald 实际只读 `/etc/systemd/journald.conf.d/`,导致封顶(标准 50M / 低内存 20M)从未生效。install.sh / uninstall.sh / pdg.sh(低内存迁移默认路径)统一改到正确目录;老装 `pdg update` 后触发迁移即把已有的正确路径文件调到目标值。此前 pre-existing,借低内存模式一并修正。

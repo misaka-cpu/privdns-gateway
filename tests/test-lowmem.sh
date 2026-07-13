@@ -63,7 +63,8 @@ sed -e 's/__SERVER_IP__/10.0.0.9/g' -e 's#__INTERNAL_CIDR__#127.0.0.0/8#g' -e 's
 sed 's/__JOURNALD_MAXUSE__/50M/' "$ROOT/deploy/firewall/journald-50-pdg.conf" > "$WORK/jrnl.conf"
 printf 'PDG_LOWMEM=1\n' > "$WORK/prof.env"     # 低内存 profile
 
-run_mig(){ PDG_PROFILE="$WORK/prof.env" PDG_MEMINFO="$WORK/mem512" bash -c "source '$WORK/harness.sh'; migrate_lowmem '$WORK/mos.yaml' '$WORK/jrnl.conf'"; }
+# $3 = 历史"装错目录"路径(测试用临时路径, 避免碰真实系统路径)
+run_mig(){ PDG_PROFILE="$WORK/prof.env" PDG_MEMINFO="$WORK/mem512" bash -c "source '$WORK/harness.sh'; migrate_lowmem '$WORK/mos.yaml' '$WORK/jrnl.conf' '$WORK/legacy.conf'"; }
 run_mig
 eq "$(awk '/tag: lazy_cache/{f=1} f&&/size:/{print $2; exit}' "$WORK/mos.yaml")" 2048 "迁移: cache 8192→2048"
 grep -q 'SystemMaxUse=20M' "$WORK/jrnl.conf" && ok "迁移: journald 50M→20M" || bad "journald 未迁移"
@@ -88,7 +89,7 @@ out=$(PDG_PROFILE="$WORK/prof.env" PDG_MEMINFO="$WORK/mem512" bash -c '
   systemctl(){ case "$1" in is-active) echo active;; restart) RESTARTS=$((RESTARTS+1));; esac; return 0; }
   python3(){ cat >/dev/null; return 1; }        # 生成器失败
   source "'"$WORK/lowmem.sh"'"
-  migrate_lowmem "'"$WORK/mosf.yaml"'" "'"$WORK/jrnlok.conf"'"
+  migrate_lowmem "'"$WORK/mosf.yaml"'" "'"$WORK/jrnlok.conf"'" "'"$WORK/legacyx.conf"'"
   echo "RESTARTS=$RESTARTS"')
 [[ "$(md5sum "$WORK/mosf.yaml" | awk '{print $1}')" == "$before" ]] && ok "生成器失败: mosdns 配置原样不变" || bad "生成器失败却改了配置"
 echo "$out" | grep -q 'RESTARTS=0' && ok "生成器失败: 未重启 mosdns" || bad "生成器失败却重启了 mosdns"
@@ -103,11 +104,21 @@ out=$(PDG_PROFILE="$WORK/prof.env" PDG_MEMINFO="$WORK/mem512" bash -c '
   systemctl(){ case "$1" in is-active) echo active;; restart) RESTARTS=$((RESTARTS+1));; esac; return 0; }
   mv(){ return 1; }                             # 原子替换失败
   source "'"$WORK/lowmem.sh"'"
-  migrate_lowmem "'"$WORK/mosm.yaml"'" "'"$WORK/jrnlok.conf"'"
+  migrate_lowmem "'"$WORK/mosm.yaml"'" "'"$WORK/jrnlok.conf"'" "'"$WORK/legacyx.conf"'"
   echo "RESTARTS=$RESTARTS"')
 [[ "$(md5sum "$WORK/mosm.yaml" | awk '{print $1}')" == "$before" ]] && ok "mv 失败: mosdns 配置原样不变" || bad "mv 失败却改了配置"
 echo "$out" | grep -q 'RESTARTS=0' && ok "mv 失败: 未重启 mosdns" || bad "mv 失败却重启了 mosdns"
 ls "$WORK"/mosm.yaml.*.tmp >/dev/null 2>&1 && bad "mv 失败残留临时文件" || ok "mv 失败: 临时文件已清理"
+
+# journald 装错目录的历史残留 → 清掉 + 正确目录补建目标值(旧装迁移场景)
+sed -e 's/__SERVER_IP__/10.0.0.9/g' -e 's#__INTERNAL_CIDR__#127.0.0.0/8#g' -e 's#__CERT_DIR__#/tmp/c#g' \
+    -e 's/__MOSDNS_CACHE__/8192/g' "$ROOT/deploy/mosdns/config.yaml" > "$WORK/mosj.yaml"
+printf '[Journal]\nSystemMaxUse=50M\n' > "$WORK/legacyj.conf"   # 装错目录里有旧文件
+rm -f "$WORK/correctj.conf"                                     # 正确目录没有
+printf 'PDG_LOWMEM=0\n' > "$WORK/prof.env"                      # 标准 → 目标 50M
+PDG_PROFILE="$WORK/prof.env" PDG_MEMINFO="$WORK/mem2g" bash -c "source '$WORK/harness.sh'; migrate_lowmem '$WORK/mosj.yaml' '$WORK/correctj.conf' '$WORK/legacyj.conf'"
+[[ ! -f "$WORK/legacyj.conf" ]] && ok "清掉装错目录的 journald 残留" || bad "错目录残留未清"
+grep -q 'SystemMaxUse=50M' "$WORK/correctj.conf" 2>/dev/null && ok "正确目录补建 journald 封顶=50M" || bad "正确目录未补建"
 
 echo "────────────────────────────────────────"
 echo "通过 $pass, 失败 $nfail"
