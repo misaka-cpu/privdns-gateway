@@ -94,6 +94,9 @@ jobs:
       - name: "bot 导航回归 (操作结果不刷一级菜单)"
         run: python3 tests/test-bot-nav.py
 
+      - name: "bot 凭据保护/后台执行器/BUSY 锁回归"
+        run: python3 tests/test-bot-credential.py
+
       - name: "bot 测域名规则集显示名回归"
         run: python3 tests/test-domain-label.py
 

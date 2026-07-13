@@ -11,7 +11,8 @@ UI 原地编辑消息(editMessageText), 不刷屏。改 sing-box 前备份, chec
 注: 模块可被 import (供定时任务调用 refresh_rulesets), 此时无需 token。
 """
 from __future__ import annotations
-import base64, hashlib, http.client, io, json, os, plistlib, re, shutil, socket, subprocess, tarfile, tempfile, threading, time, uuid
+import base64, contextlib, fcntl, hashlib, http.client, io, json, os, plistlib, re, shutil, socket, subprocess, tarfile, tempfile, threading, time, uuid
+import concurrent.futures
 import urllib.parse, urllib.request, urllib.error
 from collections import Counter
 
@@ -32,30 +33,95 @@ API = "https://api.telegram.org/bot" + TOKEN
 state: dict[int, str] = {}
 del_sel: dict[int, set] = {}   # 删规则多选: chat -> 已勾选域名集合
 
-# ── Telegram (复用一条 HTTPS 长连接, 省掉每次 TLS 握手 → 按钮响应更快) ──
-_conn = None
+# ── Telegram (每线程各复用一条 HTTPS 长连接) ──
+# thread-local: 主循环 getUpdates(轮询)与后台任务发消息(API)各用自己的连接,
+# 一条 HTTPS 连接不能被多线程并发复用(交错请求会串包), 故按线程隔离而非全局共享。
+_tls = threading.local()
 
 def post(method, params):
-    global _conn
     body = json.dumps(params).encode()
     path = "/bot" + TOKEN + "/" + method
     hdr = {"Content-Type": "application/json", "Connection": "keep-alive"}
     for attempt in (0, 1):                       # 连接断了就重连重试一次
         try:
-            if _conn is None:
-                _conn = http.client.HTTPSConnection("api.telegram.org", timeout=70)
-            _conn.request("POST", path, body, hdr)
-            data = _conn.getresponse().read()
+            conn = getattr(_tls, "conn", None)
+            if conn is None:
+                conn = http.client.HTTPSConnection("api.telegram.org", timeout=70)
+                _tls.conn = conn
+            conn.request("POST", path, body, hdr)
+            data = conn.getresponse().read()
             return json.loads(data) if data else {}
         except Exception as e:  # noqa: BLE001
             try:
-                if _conn:
-                    _conn.close()
+                c = getattr(_tls, "conn", None)
+                if c:
+                    c.close()
             except Exception:  # noqa: BLE001
                 pass
-            _conn = None
+            _tls.conn = None
             if attempt:
-                print("api", method, e); return {}
+                print("api", method, type(e).__name__); return {}   # 不打印异常正文(可能含参数)
+
+# ── 有界后台执行器 + per-chat BUSY 锁 + 配置写串行化 ──────────────────────────
+# 慢操作(解析/校验/写配置/重启服务)放进有上限的线程池, 主 getUpdates 轮询不等它;
+# 不每次操作新建线程。同一 chat 已有任务时拒绝再次触发(防重复点击/连发)。
+_EXEC = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="pdg-bg")
+_busy: dict[int, bool] = {}
+_busy_lock = threading.Lock()
+_cfg_lock = threading.Lock()                     # 进程内串行化"写 sing-box 配置"
+LOCKFILE = "/run/privdns-gateway.lock"           # 与 pdg update/rollback 共用, 防跨进程并发改配置
+
+def _acquire_busy(chat):
+    with _busy_lock:
+        if _busy.get(chat):
+            return False
+        _busy[chat] = True
+        return True
+
+def _release_busy(chat):
+    with _busy_lock:
+        _busy.pop(chat, None)
+
+def run_bg(chat, fn):
+    """提交后台任务; 同一 chat 已有任务则友好拒绝。fn 自行发消息。返回 Future(被拒=None)。"""
+    if not _acquire_busy(chat):
+        send_plain(chat, "正在处理上一项操作,请稍候")
+        return None
+    def wrap():
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001  # 不打印异常正文(可能含节点凭据)
+            print("bg task err", type(e).__name__, flush=True)
+        finally:
+            _release_busy(chat)
+    return _EXEC.submit(wrap)
+
+@contextlib.contextmanager
+def _cfg_guard():
+    """进程内串行(_cfg_lock)+ 跨进程 flock(与 pdg update/rollback 协调)。
+    别的进程持锁 → yield False(友好返回, 不阻塞); 锁文件不可用 → 退化为仅进程内串行。"""
+    with _cfg_lock:
+        try:
+            f = open(LOCKFILE, "w")
+        except OSError:
+            yield True                           # 无法打开锁文件(权限/路径) → 只做进程内串行
+            return
+        locked = False
+        try:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+            except OSError:
+                yield False                      # pdg update/rollback 正持锁
+                return
+            yield True
+        finally:
+            if locked:                           # 只在确实拿到锁时解锁(避免误放别的持有者)
+                try:
+                    fcntl.flock(f, fcntl.LOCK_UN)
+                except Exception:  # noqa: BLE001
+                    pass
+            f.close()
 
 def send_document(chat, filename, data, caption=""):
     """multipart/form-data 上传文件 (备份 / iOS 描述文件)。"""
@@ -158,6 +224,15 @@ def edit(chat, mid, text, kb=None):
         return
     send(chat, text, kb)             # 仍不行(如消息已删)再发新消息
 
+def delete_message(chat, mid):
+    """尽力删除一条消息(用于抹掉含节点凭据的原始链接消息)。失败返回 False, 不抛、不回显内容。"""
+    if not mid:
+        return False
+    try:
+        return bool(post("deleteMessage", {"chat_id": chat, "message_id": mid}).get("ok"))
+    except Exception:  # noqa: BLE001
+        return False
+
 def answer_cb_async(cb_id):
     """后台停掉按钮转圈(独立连接, 不占用主 keep-alive、不阻塞主循环)。
     主循环改完内容(edit)就能立刻回到 getUpdates → 连续点菜单不再为'停转圈'多等一个来回。"""
@@ -212,19 +287,23 @@ def _svc_active(unit, need=3, delay=0.6, max_polls=15):
     return False
 
 def apply_sb(modify):
-    shutil.copy(SB, SB + ".botbak"); os.chmod(SB + ".botbak", 0o600)
-    c = load(); modify(c); _write(c)
-    chk = sh(["sing-box", "check", "-c", SB])
-    if chk.returncode != 0:
-        shutil.copy(SB + ".botbak", SB)   # 运行中的 sing-box 没动过(check 只在文件上做), 还原文件即可, 不必重启
-        return False, "配置校验失败,已回滚:\n" + (chk.stdout + chk.stderr)[-400:]
-    sh(["systemctl", "reset-failed", "sing-box"])   # 清掉 start-limit 计数: 连改多条(如连删域名)快速多次重启不会触发限速锁死
-    r = sh(["systemctl", "restart", "sing-box"])
-    if r.returncode != 0 or not _svc_active("sing-box"):   # 没起来/起来又崩, 还原文件再重启一次, 别把代理留在挂掉状态
-        shutil.copy(SB + ".botbak", SB)
-        sh(["systemctl", "reset-failed", "sing-box"]); sh(["systemctl", "restart", "sing-box"])
-        return False, "重启 sing-box 失败, 已还原上一份配置:\n" + (r.stdout + r.stderr)[-300:]
-    return True, ""
+    # 串行化配置写 + 与 pdg update/rollback 用同一把 flock 协调(拿不到锁友好返回, 不卡死)。
+    with _cfg_guard() as got:
+        if not got:
+            return False, "系统正在执行更新/回滚,请稍后再试。"
+        shutil.copy(SB, SB + ".botbak"); os.chmod(SB + ".botbak", 0o600)
+        c = load(); modify(c); _write(c)
+        chk = sh(["sing-box", "check", "-c", SB])
+        if chk.returncode != 0:
+            shutil.copy(SB + ".botbak", SB)   # 运行中的 sing-box 没动过(check 只在文件上做), 还原文件即可, 不必重启
+            return False, "配置校验失败,已回滚:\n" + (chk.stdout + chk.stderr)[-400:]
+        sh(["systemctl", "reset-failed", "sing-box"])   # 清掉 start-limit 计数: 连改多条(如连删域名)快速多次重启不会触发限速锁死
+        r = sh(["systemctl", "restart", "sing-box"])
+        if r.returncode != 0 or not _svc_active("sing-box"):   # 没起来/起来又崩, 还原文件再重启一次, 别把代理留在挂掉状态
+            shutil.copy(SB + ".botbak", SB)
+            sh(["systemctl", "reset-failed", "sing-box"]); sh(["systemctl", "restart", "sing-box"])
+            return False, "重启 sing-box 失败, 已还原上一份配置:\n" + (r.stdout + r.stderr)[-300:]
+        return True, ""
 
 # 可作出口的代理协议(决定哪些出站算"出口": 可选默认/故障组成员/测出口/删除)。sing-box 支持的都列上。
 PROXY_TYPES = ("shadowsocks", "vmess", "trojan", "vless", "hysteria", "hysteria2",
@@ -1819,7 +1898,7 @@ def handle_cb(chat, mid, data):
         ok, msg = del_ruleset(data[6:]); edit(chat, mid, ("✅ " if ok else "") + msg, RULE_BACK); return
 
 # ── 文本 ──
-def handle_text(chat, text):
+def handle_text(chat, text, mid=None):
     text = text.strip()
     if text == "/cancel":
         state.pop(chat, None); send_plain(chat, "已取消"); return
@@ -1879,15 +1958,26 @@ def handle_text(chat, text):
         send_plain(chat, "未识别命令，发 /start 打开菜单"); return
     act = state.pop(chat, None) or ""   # 无待输入时为 "", 避免下面 act.startswith(...) 在 None 上崩
     if act == "add_exit":
-        try:
-            ob = parse_link(text)
+        # state 已在上面 state.pop 清除 → 紧接着发的下一条不会再被当 add_exit。
+        # 含凭据(密码/uuid/服务器)的解析+校验+写配置+重启放后台, 主循环不等; 原消息尽力删除。
+        link = text
+        def task(link=link, mid=mid):
+            if not delete_message(chat, mid):        # 无论后续成败, 先尽力删含凭据的原消息
+                send_plain(chat, "未能自动删除含凭据的上一条消息,请手动删除")
+            try:
+                ob = parse_link(link)
+            except Exception:  # noqa: BLE001        # 不回显原始链接/异常正文(可能含凭据)
+                send_plain(chat, "解析失败: 链接格式不支持或有误(内容已隐去,可重发正确链接)")
+                return
+            tag = ob.get("tag")
             def mod(c):
                 c["outbounds"] = [o for o in c["outbounds"] if o.get("tag") != ob["tag"]]
                 c["outbounds"].append(ob)
-            ok, msg = apply_sb(mod)
-            send_plain(chat, f"✅ 已添加出口 <b>{ob['tag']}</b> ({ob['type']} {ob['server']}:{ob['server_port']})" if ok else msg)
-        except Exception as e:  # noqa: BLE001
-            send_plain(chat, f"解析失败: {e}")
+            ok, _ = apply_sb(mod)
+            link = ob = None                         # 尽力减少凭据在内存驻留(非安全擦除, Python 无法保证)
+            send_plain(chat, f"✅ 已添加出口 <b>{tag}</b>" if ok
+                       else "❌ 添加失败: 配置校验未过, 已回滚(详情见服务器日志, 未回显链接内容)")
+        run_bg(chat, task)
         return
     if act == "add_group":
         p = text.split()
@@ -1987,7 +2077,7 @@ def main():
                     if m["from"]["id"] not in ALLOWED:
                         continue
                     if "text" in m:
-                        handle_text(m["chat"]["id"], m["text"])
+                        handle_text(m["chat"]["id"], m["text"], m.get("message_id"))
                     elif "document" in m:
                         handle_document(m["chat"]["id"], m["document"])
                 elif "callback_query" in u:
