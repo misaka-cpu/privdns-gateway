@@ -50,7 +50,7 @@ plugins:
   - tag: lazy_cache
     type: cache
     args:
-      size: 8192
+      size: __MOSDNS_CACHE__            # 标准 8192 / 低内存 2048(install 按内存模式渲染, pdg 更新按 profile 迁移)
       lazy_cache_ttl: 86400
   - tag: internal_sequence
     type: sequence

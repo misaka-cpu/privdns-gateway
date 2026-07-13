@@ -24,6 +24,69 @@ _lock(){
   PDG_LOCKED=1
 }
 
+# ── 克制版低内存模式 ─────────────────────────────────────────────────────────
+# PDG_LOWMEM=auto(默认)|1|0。MemTotal ≤ 1300 MiB 判低内存。只调确认安全的项:
+# mosdns cache(8192/2048)+ journald SystemMaxUse(50M/20M)。不动 sysctl/swap/MemoryMax/GOMEMLIMIT。
+# 决定持久化到 profile.env; auto 时 profile 已有就沿用(不每次更新改变用户已定模式)。
+LOWMEM_THRESHOLD_KB=1331200      # 1300 MiB
+PROFILE_ENV="${PDG_PROFILE:-/etc/privdns-gateway/profile.env}"
+_mem_total_kb(){ sed -n 's/^MemTotal:[[:space:]]*\([0-9]*\).*/\1/p' "${PDG_MEMINFO:-/proc/meminfo}" 2>/dev/null; }
+_profile_val(){ [[ -f "$PROFILE_ENV" ]] && sed -n 's/^PDG_LOWMEM=//p' "$PROFILE_ENV" | tail -1; }
+pdg_cache_size(){ [[ "$1" == 1 ]] && echo 2048 || echo 8192; }
+pdg_journald_max(){ [[ "$1" == 1 ]] && echo 20M || echo 50M; }
+
+# 解析并持久化内存模式, 回显 1(低内存)/0(标准)。显式 1/0 优先; auto 时 profile 已有沿用, 否则按内存检测。
+pdg_lowmem_resolve(){
+  local want="${PDG_LOWMEM:-auto}" cur res mt; cur="$(_profile_val)"
+  case "$want" in
+    1) res=1;;
+    0) res=0;;
+    *) if [[ "$cur" == 0 || "$cur" == 1 ]]; then res="$cur"
+       else mt="$(_mem_total_kb)"; if [[ -n "$mt" && "$mt" -le "$LOWMEM_THRESHOLD_KB" ]]; then res=1; else res=0; fi; fi;;
+  esac
+  mkdir -p "$(dirname "$PROFILE_ENV")" 2>/dev/null || true
+  printf 'PDG_LOWMEM=%s\n' "$res" > "$PROFILE_ENV" 2>/dev/null || true
+  echo "$res"
+}
+
+# 只读回显当前模式(profile 有则用之, 无则按内存推断; 不写盘)。供 status/doctor。
+pdg_lowmem_current(){
+  local cur mt; cur="$(_profile_val)"
+  if [[ "$cur" == 0 || "$cur" == 1 ]]; then echo "$cur"; return; fi
+  mt="$(_mem_total_kb)"; if [[ -n "$mt" && "$mt" -le "$LOWMEM_THRESHOLD_KB" ]]; then echo 1; else echo 0; fi
+}
+
+# 老装迁移: 按 profile(内存模式)把 mosdns cache size / journald SystemMaxUse 调到目标。幂等。
+# 只改这两处已知项, 保留用户上游/其它内容; mosdns 改动走"备份+重启 active 门+失败还原"。
+# shellcheck disable=SC2120  # $1/$2 仅测试注入
+migrate_lowmem(){
+  local mos="${1:-/etc/mosdns/config.yaml}" jrnl="${2:-/etc/systemd/system/journald.conf.d/50-pdg.conf}"
+  local mode cache jmax; mode="$(pdg_lowmem_resolve)"; cache="$(pdg_cache_size "$mode")"; jmax="$(pdg_journald_max "$mode")"
+  if [[ -f "$mos" ]] && grep -q 'tag: lazy_cache' "$mos"; then
+    local cur; cur="$(awk '/tag: lazy_cache/{f=1} f&&/size:/{print $2; exit}' "$mos")"
+    if [[ -n "$cur" && "$cur" != "$cache" ]]; then
+      local bak; bak="$mos.prelowmem.$(date +%s)"
+      if cp -a "$mos" "$bak" 2>/dev/null && cmp -s "$mos" "$bak"; then
+        python3 - "$mos" "$cache" <<'PY'
+import sys, re
+f, cache = sys.argv[1], sys.argv[2]; s = open(f).read()
+i = s.index('tag: lazy_cache'); head, tail = s[:i], s[i:]      # 只改 lazy_cache 块里第一处 size:
+tail = re.sub(r'(size:\s*)\d+', r'\g<1>' + cache, tail, count=1)
+open(f, 'w').write(head + tail)
+PY
+        systemctl restart mosdns 2>/dev/null; sleep 1
+        if [[ "$(systemctl is-active mosdns 2>/dev/null)" != active ]]; then
+          c_y "mosdns cache 调整后重启失败 → 还原。"; cp -a "$bak" "$mos" 2>/dev/null; systemctl restart mosdns 2>/dev/null
+        else c_g "mosdns cache size → $cache"; fi
+      fi
+    fi
+  fi
+  if [[ -f "$jrnl" ]] && ! grep -q "SystemMaxUse=$jmax" "$jrnl"; then
+    sed -i -E "s/^SystemMaxUse=.*/SystemMaxUse=$jmax/" "$jrnl" 2>/dev/null \
+      && { systemctl restart systemd-journald 2>/dev/null || true; c_g "journald SystemMaxUse → $jmax"; }
+  fi
+}
+
 pdg_fetch_release_tags(){
   local dir="${1:-$REPO_DIR}"
   git -C "$dir" fetch -q --tags origin main || return 1
@@ -43,6 +106,8 @@ cmd_status(){
   ports=$(ss -lntu 2>/dev/null | grep -oE ':(53|80|81|443|853|8445|9090)\b' | sed 's/^://' | sort -u | sed 's/^9090$/9090(local clash_api)/' | tr '\n' ' ')
   echo "  监听端口     $ports"
   if [[ -d "$REPO_DIR/.git" ]]; then echo "  代码版本     $(git -C "$REPO_DIR" describe --tags --always 2>/dev/null)"; fi
+  local lm cache; lm="$(pdg_lowmem_current)"; cache="$(awk '/tag: lazy_cache/{f=1} f&&/size:/{print $2; exit}' /etc/mosdns/config.yaml 2>/dev/null)"
+  echo "  内存模式     $([[ "$lm" == 1 ]] && echo 低内存 || echo 标准)(mosdns cache=${cache:-?})"
 }
 
 cmd_doctor(){ python3 /opt/pdg-bot/doctor.py "$@"; }
@@ -445,6 +510,7 @@ cmd_update(){
   migrate_singbox_gms       # 老装: sing-box 补 GMS 推送入站(5228-5230 嗅探分流)
   migrate_fw_gms            # 老装: 防火墙内网放行集补 5228-5230(配合上面入站)
   migrate_mosdns_ratelimit  # 老装: mosdns 补单客户端 QPS 兜底(rate_limiter)
+  migrate_lowmem            # 老装: 按内存模式调 mosdns cache / journald 上限(幂等)
 
   # ── 更新后校验门: 任一硬校验失败即回滚到更新前快照 ──
   c_g "校验新版本…"
@@ -619,7 +685,8 @@ if [[ $EUID -eq 0 ]]; then
   case "${1:-menu}" in
     status|st|doctor|dr|log|logs|traffic|tr|report|uninstall|rm) : ;;   # 只读/卸载: 不迁移
     *) migrate_firewall_to_pdg || true; migrate_mosdns_concurrent || true; migrate_mosdns_unlock || true
-       migrate_singbox_gms || true; migrate_fw_gms || true; migrate_mosdns_ratelimit || true ;;   # 管理类命令才迁移
+       migrate_singbox_gms || true; migrate_fw_gms || true; migrate_mosdns_ratelimit || true
+       migrate_lowmem || true ;;   # 管理类命令才迁移
   esac
 fi
 

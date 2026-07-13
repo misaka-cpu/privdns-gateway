@@ -190,6 +190,30 @@ def check_mosdns_ratelimit():
                             "运行 sudo pdg restart 或 sudo pdg 触发迁移。高度自定义配置请手动在 "
                             "internal_sequence 缓存前加 '!$client_limiter → reject 5'。")
 
+PROFILE_ENV = "/etc/privdns-gateway/profile.env"
+
+def check_mem():
+    """显示当前内存模式 + mosdns cache size(只读, 不写 profile)。始终 ok, 仅信息展示。"""
+    mode = None
+    try:
+        for ln in open(PROFILE_ENV):
+            if ln.startswith("PDG_LOWMEM="):
+                mode = ln.strip().split("=", 1)[1]
+    except OSError:
+        pass
+    if mode not in ("0", "1"):                      # 无 profile → 按内存推断(不写盘)
+        try:
+            kb = int(next(l.split()[1] for l in open("/proc/meminfo") if l.startswith("MemTotal:")))
+            mode = "1" if kb <= 1331200 else "0"    # 1300 MiB
+        except Exception:  # noqa: BLE001
+            mode = "?"
+    label = {"1": "低内存", "0": "标准", "?": "未知"}[mode]
+    size = "?"
+    m = re.search(r"tag: lazy_cache.*?size:\s*(\d+)", _mos(), re.S)
+    if m:
+        size = m.group(1)
+    return ("ok", "内存模式", f"{label} · mosdns cache={size}")
+
 def check_cert():
     p = _cert_path()
     if not os.path.exists(p):
@@ -353,8 +377,8 @@ def check_deep_upstreams():
     return (level, "DNS 上游探测", " ; ".join(parts))
 
 ALL = [check_services, check_singbox_version, check_dot_arecord, check_dot_domain_sync,
-       check_internal_cidr, check_nft, check_gms, check_mosdns_ratelimit, check_cert,
-       check_dns, check_singbox_config]
+       check_internal_cidr, check_nft, check_gms, check_mosdns_ratelimit, check_mem,
+       check_cert, check_dns, check_singbox_config]
 ALERT = [check_services, check_dns, check_cert]  # healthcheck 用的轻量子集(运行期故障)
 DEEP = [check_deep_dot_handshake, check_deep_probe81, check_deep_dns_cn,
         check_deep_clash, check_deep_upstreams, check_deep_hijack_note]  # pdg doctor --deep 追加

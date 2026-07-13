@@ -226,8 +226,20 @@ fi
 : > /etc/mosdns/rules/custom_direct.txt
 : > /etc/mosdns/rules/unlock.txt          # WDA 解锁域名集(空=休眠; bot『🔓 解锁走 WDA』填充)
 
+# 内存模式(克制版): PDG_LOWMEM=auto(默认)|1|0; MemTotal ≤ 1300MiB 判低内存。持久化到 profile.env。
+# 只调确认安全的项: mosdns cache(8192/2048)+ journald 上限(50M/20M)。不动 sysctl/swap/MemoryMax。
+case "${PDG_LOWMEM:-auto}" in
+  1) LOWMEM=1;; 0) LOWMEM=0;;
+  *) _mt=$(sed -n 's/^MemTotal:[[:space:]]*\([0-9]*\).*/\1/p' /proc/meminfo 2>/dev/null)
+     if [[ -n "$_mt" && "$_mt" -le 1331200 ]]; then LOWMEM=1; else LOWMEM=0; fi;;
+esac
+if [[ "$LOWMEM" == 1 ]]; then MOSDNS_CACHE=2048; JOURNALD_MAXUSE=20M; else MOSDNS_CACHE=8192; JOURNALD_MAXUSE=50M; fi
+install -d -m700 /etc/privdns-gateway
+printf 'PDG_LOWMEM=%s\n' "$LOWMEM" > /etc/privdns-gateway/profile.env
+
 render(){ sed -e "s|__SERVER_IP__|$SERVER_IP|g" -e "s|__INTERNAL_CIDR__|$INTERNAL_CIDR|g" \
-              -e "s|__CERT_DIR__|$CERT_DIR|g"   -e "s|__SSH_PORT__|$SSH_PORT|g" "$1"; }
+              -e "s|__CERT_DIR__|$CERT_DIR|g"   -e "s|__SSH_PORT__|$SSH_PORT|g" \
+              -e "s|__MOSDNS_CACHE__|$MOSDNS_CACHE|g" -e "s|__JOURNALD_MAXUSE__|$JOURNALD_MAXUSE|g" "$1"; }
 
 render "$REPO_DIR/deploy/mosdns/config.yaml"          > /etc/mosdns/config.yaml
 render "$REPO_DIR/deploy/singbox/config.json.tmpl"    > /etc/sing-box/config.json
@@ -246,7 +258,7 @@ install -m644 "$REPO_DIR"/deploy/bot/pdg-rules-update.timer   /etc/systemd/syste
 install -m644 "$REPO_DIR"/deploy/bot/pdg-health.service       /etc/systemd/system/
 install -m644 "$REPO_DIR"/deploy/bot/pdg-health.timer         /etc/systemd/system/
 install -m644 "$REPO_DIR"/deploy/ios/pdg-probe81.service      /etc/systemd/system/
-install -m644 "$REPO_DIR"/deploy/firewall/journald-50-pdg.conf /etc/systemd/system/journald.conf.d/50-pdg.conf
+render "$REPO_DIR/deploy/firewall/journald-50-pdg.conf" > /etc/systemd/system/journald.conf.d/50-pdg.conf; chmod 644 /etc/systemd/system/journald.conf.d/50-pdg.conf
 
 cat > /etc/systemd/system/mosdns.service <<'EOF'
 [Unit]
