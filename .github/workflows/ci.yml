@@ -100,6 +100,9 @@ jobs:
       - name: "观测面板回归 (zashboard 开关 + clash_api secret)"
         run: python3 tests/test-panel.py
 
+      - name: "面板快照/回滚净化回归 (secret 不入档)"
+        run: bash tests/test-panel-snapshot.sh
+
       - name: "bot 测域名规则集显示名回归"
         run: python3 tests/test-domain-label.py
 

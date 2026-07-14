@@ -69,7 +69,7 @@ assert "status|st|doctor|dr|log|logs|traffic|tr|report|uninstall|rm|__migrate)" 
 )
 
 # P2-2: snapshot 包含 journald drop-in(正确+历史错路径), rollback 重启 journald
-snapshot = block_after(pdg, "cmd_snapshot()", window=900)
+snapshot = block_after(pdg, "cmd_snapshot()", window=1800)
 assert "etc/systemd/journald.conf.d/50-pdg.conf" in snapshot, "snapshot must include journald drop-in (correct path)"
 assert "etc/systemd/system/journald.conf.d/50-pdg.conf" in snapshot, "snapshot should also capture legacy wrong-path file"
 assert "systemctl restart systemd-journald" in rollback, (
@@ -77,7 +77,18 @@ assert "systemctl restart systemd-journald" in rollback, (
 )
 # snapshot 只打包存在的路径(历史错路径可能已被迁移删掉)+ 检查 tar 返回值(否则 tar 返 2 仍报成功)
 assert '[[ -e "/$p" ]]' in snapshot, "snapshot must only tar existing paths (legacy path may be deleted by migration)"
-assert "if ! tar czf" in snapshot, "snapshot must check tar return code, not report success on failure"
+assert "! tar czf" in snapshot, "snapshot must check tar return code, not report success on failure"
+
+# 面板临时态净化: snapshot 受管开启态用净化 config 入档; rollback 就地净化; 有归属判定辅助函数
+assert "_sb_panel_managed_on" in pdg and "_sb_sanitize_panel" in pdg, (
+    "pdg.sh must provide panel-ownership + sanitize helpers for snapshot/rollback"
+)
+assert "_sb_panel_managed_on /etc/sing-box/config.json" in snapshot, (
+    "snapshot must sanitize a managed-on panel config so the secret never enters the archive"
+)
+assert "_sb_sanitize_panel /etc/sing-box/config.json" in rollback, (
+    "rollback must sanitize a restored managed-on panel config (temporary state not persisted)"
+)
 
 # P2-3: mosdns cache 与 journald 修复相互独立(各自成函数, migrate_lowmem 里 mosdns 失败不 return 全函数)
 assert "_migrate_mosdns_cache" in pdg and "_migrate_journald_cap" in pdg, (

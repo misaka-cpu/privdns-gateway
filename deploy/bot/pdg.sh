@@ -488,6 +488,23 @@ migrate_fw_gms(){
   fi
 }
 
+# 面板临时态净化(与 bot backup_blob/restore_from 对称): 快照/回滚不持久化面板的公网监听+密钥+UI。
+# 只认"本项目受管开启态"(0.0.0.0:9090 + 项目 UI 目录 + 有 secret); 自定义 clash_api 不动。$1=config 文件。
+_sb_panel_managed_on(){
+  command -v jq >/dev/null 2>&1 || return 1
+  jq -e '.experimental.clash_api as $c | ($c.external_controller=="0.0.0.0:9090")
+         and ($c.external_ui=="/etc/sing-box/ui/dist") and ((($c.secret) // "")|length>0)' "$1" >/dev/null 2>&1
+}
+# 把受管开启态就地净化为关闭态(clash_api 只留本地控制器)。改了返回 0, 未改/失败非 0。$1=config 文件。
+_sb_sanitize_panel(){
+  _sb_panel_managed_on "$1" || return 1
+  local t; t="$(mktemp)" || return 1
+  if jq '.experimental.clash_api={external_controller:"127.0.0.1:9090"}' "$1" > "$t" 2>/dev/null && [[ -s "$t" ]]; then
+    cat "$t" > "$1"; rm -f "$t"; return 0
+  fi
+  rm -f "$t"; return 1
+}
+
 SNAP_DIR="/var/lib/privdns-gateway/backups"
 
 cmd_snapshot(){
@@ -500,7 +517,23 @@ cmd_snapshot(){
               etc/systemd/system/pdg-bot.service etc/systemd/journald.conf.d/50-pdg.conf
               etc/systemd/system/journald.conf.d/50-pdg.conf)
   local items=(); local p; for p in "${cand[@]}"; do [[ -e "/$p" ]] && items+=("$p"); done
-  if ! tar czf "$d/snap.tar.gz" -C / "${items[@]}" 2>/dev/null; then
+  # 面板受管开启态: 用净化后的 config 入档(排除真实 config.json, 追加净化版), 快照不含临时监听/密钥/UI。
+  local stg=""
+  if [[ -e /etc/sing-box/config.json ]] && _sb_panel_managed_on /etc/sing-box/config.json; then
+    stg="$(mktemp -d)"; mkdir -p "$stg/etc/sing-box"
+    if ! jq '.experimental.clash_api={external_controller:"127.0.0.1:9090"}' /etc/sing-box/config.json \
+         > "$stg/etc/sing-box/config.json" 2>/dev/null || [[ ! -s "$stg/etc/sing-box/config.json" ]]; then
+      c_y "❌ 快照净化面板配置失败"; rm -rf "$stg"; rmdir "$d" 2>/dev/null; return 1
+    fi
+  fi
+  if [[ -n "$stg" ]]; then      # cf(排除真实 config)+ rf(追加净化 config)+ gzip: --exclude 只对第一次 tar 生效
+    if ! tar cf "$d/snap.tar" --exclude='etc/sing-box/config.json' -C / "${items[@]}" 2>/dev/null \
+       || ! tar rf "$d/snap.tar" -C "$stg" etc/sing-box/config.json 2>/dev/null \
+       || ! gzip -f "$d/snap.tar" 2>/dev/null; then
+      c_y "❌ 快照打包失败"; rm -f "$d/snap.tar" "$d/snap.tar.gz"; rm -rf "$stg"; rmdir "$d" 2>/dev/null; return 1
+    fi
+    rm -rf "$stg"
+  elif ! tar czf "$d/snap.tar.gz" -C / "${items[@]}" 2>/dev/null; then
     c_y "❌ 快照打包失败"; rm -f "$d/snap.tar.gz"; rmdir "$d" 2>/dev/null; return 1
   fi
   chmod 600 "$d/snap.tar.gz"
@@ -530,6 +563,8 @@ cmd_rollback(){
   rm -rf "$tmp"
   echo "回滚到 $(basename "$target") …"
   tar xzf "$f" -C /
+  # 面板是临时运行态, 不随回滚恢复: 旧快照若含受管开启态, 就地净化为关闭态(自定义 clash_api 不动)。
+  _sb_sanitize_panel /etc/sing-box/config.json && c_g "  已净化回滚出的面板临时态 → 关闭"
   systemctl daemon-reload
   nft -f /etc/nftables.conf 2>/dev/null || true
   systemctl restart mosdns sing-box pdg-bot pdg-probe81 2>/dev/null || true
