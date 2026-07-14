@@ -6,8 +6,9 @@ set -uo pipefail
 systemctl disable --now pdg-bot pdg-probe81 mosdns sing-box pdg-rules-update.timer pdg-health.timer 2>/dev/null || true
 rm -f /etc/systemd/system/{pdg-bot,pdg-probe81,mosdns,sing-box,pdg-rules-update,pdg-health}.service \
       /etc/systemd/system/pdg-rules-update.timer /etc/systemd/system/pdg-health.timer \
-      /etc/systemd/journald.conf.d/50-pdg.conf
+      /etc/systemd/journald.conf.d/50-pdg.conf /etc/systemd/system/journald.conf.d/50-pdg.conf   # 正确路径 + 历史错路径都删
 systemctl daemon-reload
+systemctl restart systemd-journald 2>/dev/null || true   # journald CanReload=no, 必须 restart 才会松开封顶
 
 # 防火墙: 删本项目独立表 inet pdg(不碰 Docker/fail2ban 等其它表); 有备份则还原 /etc/nftables.conf
 command -v nft >/dev/null 2>&1 && nft delete table inet pdg 2>/dev/null || true

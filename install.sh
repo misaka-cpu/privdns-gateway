@@ -104,8 +104,9 @@ rollback(){
       pdg-rules-update.timer pdg-health.timer 2>/dev/null
   rm -f /etc/systemd/system/{pdg-bot,pdg-probe81,mosdns,sing-box,pdg-rules-update,pdg-health}.service \
         /etc/systemd/system/pdg-rules-update.timer /etc/systemd/system/pdg-health.timer \
-        /etc/systemd/journald.conf.d/50-pdg.conf
+        /etc/systemd/journald.conf.d/50-pdg.conf /etc/systemd/system/journald.conf.d/50-pdg.conf   # 正确 + 历史错路径都删
   systemctl daemon-reload 2>/dev/null
+  systemctl restart systemd-journald 2>/dev/null || true   # CanReload=no: 必须 restart 才松开封顶
   nft delete table inet pdg 2>/dev/null
   rm -rf /etc/mosdns /etc/sing-box /opt/pdg-bot /etc/privdns-gateway
   rm -f /usr/local/bin/{pdg,pdg-set-token,proxy-gateway-open-cert-http.sh,proxy-gateway-restore-firewall.sh}

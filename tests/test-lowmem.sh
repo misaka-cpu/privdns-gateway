@@ -119,6 +119,29 @@ printf 'PDG_LOWMEM=0\n' > "$WORK/prof.env"                      # 标准 → 目
 PDG_PROFILE="$WORK/prof.env" PDG_MEMINFO="$WORK/mem2g" bash -c "source '$WORK/harness.sh'; migrate_lowmem '$WORK/mosj.yaml' '$WORK/correctj.conf' '$WORK/legacyj.conf'"
 [[ ! -f "$WORK/legacyj.conf" ]] && ok "清掉装错目录的 journald 残留" || bad "错目录残留未清"
 grep -q 'SystemMaxUse=50M' "$WORK/correctj.conf" 2>/dev/null && ok "正确目录补建 journald 封顶=50M" || bad "正确目录未补建"
+grep -q 'RuntimeMaxUse=50M' "$WORK/correctj.conf" 2>/dev/null && ok "补建同时含 RuntimeMaxUse=50M" || bad "补建缺 RuntimeMaxUse"
+
+# _journald_set_key: 只认未注释有效行 —— 缺则追加、注释不被蒙混、有则替换、幂等
+jset(){ bash -c "source '$WORK/harness.sh'; _journald_set_key \"\$1\" \"\$2\" \"\$3\"" _ "$@"; }
+printf '[Journal]\n' > "$WORK/j1.conf"                          # 无有效行
+jset "$WORK/j1.conf" SystemMaxUse 20M
+grep -qxE 'SystemMaxUse=20M' "$WORK/j1.conf" && ok "无有效行 → 追加 SystemMaxUse" || bad "无有效行未追加"
+printf '[Journal]\n#SystemMaxUse=20M\n' > "$WORK/j2.conf"        # 只有注释行(易被误判已存在)
+jset "$WORK/j2.conf" SystemMaxUse 20M
+grep -qxE 'SystemMaxUse=20M' "$WORK/j2.conf" && ok "只有注释行 → 补有效行(不被蒙混)" || bad "被注释行蒙混跳过"
+printf '[Journal]\nSystemMaxUse=50M\n' > "$WORK/j3.conf"         # 有效行值不同
+jset "$WORK/j3.conf" SystemMaxUse 20M
+[[ "$(grep -cE '^SystemMaxUse=' "$WORK/j3.conf")" == 1 ]] && grep -qxE 'SystemMaxUse=20M' "$WORK/j3.conf" && ok "有效行值不同 → 替换(不重复)" || bad "替换错误"
+printf '[Journal]\nSystemMaxUse=20M\n' > "$WORK/j4.conf"         # 已是目标
+if jset "$WORK/j4.conf" SystemMaxUse 20M; then bad "已是目标却报已改"; else ok "已是目标值 → 未改(幂等)"; fi
+
+# 集成: migrate_lowmem 对"缺 SystemMaxUse 的现有文件"补齐 System+Runtime(不再假成功)
+sed 's/8192/2048/' "$WORK/mosj.yaml" > "$WORK/mos2048.yaml"     # 已 2048, 低内存下 cache 无需动
+printf '[Journal]\n' > "$WORK/jempty.conf"                       # 现有文件但无有效封顶行
+printf 'PDG_LOWMEM=1\n' > "$WORK/prof.env"
+PDG_PROFILE="$WORK/prof.env" PDG_MEMINFO="$WORK/mem512" bash -c "source '$WORK/harness.sh'; migrate_lowmem '$WORK/mos2048.yaml' '$WORK/jempty.conf' '$WORK/legacyz.conf'"
+grep -qxE 'SystemMaxUse=20M' "$WORK/jempty.conf" && grep -qxE 'RuntimeMaxUse=20M' "$WORK/jempty.conf" \
+  && ok "集成: 缺封顶行的现有文件被补齐 System+Runtime=20M" || bad "缺封顶行未被补齐(假成功)"
 
 echo "────────────────────────────────────────"
 echo "通过 $pass, 失败 $nfail"

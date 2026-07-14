@@ -1,6 +1,12 @@
 # 更新日志
 
-本项目无正式版本号,按日期记录主要变化;完整提交见 git 历史。
+本项目按语义化 `v1.x` tag 正式发布;以下按版本/日期记录主要变化,完整提交见 git 历史。
+
+## 2026-07-13 — v1.2.3(journald 封顶稳健性 + RuntimeMaxUse)
+
+- **修**:低内存迁移写 journald 封顶只会替换已有的 `SystemMaxUse=` 行——文件没有该有效行时 `sed` 空替换却"假成功",只有 `#SystemMaxUse=` 注释行时又被 `grep` 误判为已存在而跳过。改为只认**未注释有效行**:缺则追加、有则替换,写后复核实际值。
+- **增**:模板与迁移同时维护 `RuntimeMaxUse`(管 `/run/log/journal` 易失日志),与 `SystemMaxUse`(管 `/var/log/journal` 持久日志)一起封顶,覆盖两类系统。
+- **修**:卸载 / 安装失败回滚现在同时删正确路径与历史错路径的 `50-pdg.conf`,并 `systemctl restart systemd-journald`(Debian 12 该服务 `CanReload=no`,不重启封顶不会松开)。
 
 ## 2026-07-13 — v1.2.2(journald 迁移补齐: 清错目录残留 + 补建正确目录)
 

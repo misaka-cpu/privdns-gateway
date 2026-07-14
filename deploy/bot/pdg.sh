@@ -35,6 +35,20 @@ _profile_val(){ [[ -f "$PROFILE_ENV" ]] && sed -n 's/^PDG_LOWMEM=//p' "$PROFILE_
 pdg_cache_size(){ [[ "$1" == 1 ]] && echo 2048 || echo 8192; }
 pdg_journald_max(){ [[ "$1" == 1 ]] && echo 20M || echo 50M; }
 
+# 确保 journald drop-in 里 key= 的"未注释有效值"==val。已是则返回 1(未改); 否则替换已有有效行、
+# 或(无有效行, 含只有 #注释行 的情形)追加一行, 返回 0(已改)。注释行不算数, 避免"假成功/被误判已存在"。
+_journald_set_key(){
+  local file="$1" key="$2" val="$3" cur
+  cur="$(sed -n -E "s/^[[:space:]]*${key}=([^[:space:]#]+).*/\1/p" "$file" 2>/dev/null | tail -1)"
+  [[ "$cur" == "$val" ]] && return 1
+  if grep -qE "^[[:space:]]*${key}=" "$file" 2>/dev/null; then
+    sed -i -E "s|^[[:space:]]*${key}=.*|${key}=${val}|" "$file"
+  else
+    printf '%s=%s\n' "$key" "$val" >> "$file"
+  fi
+  return 0
+}
+
 # 解析并持久化内存模式, 回显 1(低内存)/0(标准)。显式 1/0 优先; auto 时 profile 已有沿用, 否则按内存检测。
 pdg_lowmem_resolve(){
   local want="${PDG_LOWMEM:-auto}" cur res mt; cur="$(_profile_val)"
@@ -92,15 +106,23 @@ PY
       fi
     fi
   fi
-  # journald: 清掉装错目录(system/)的历史残留(journald 不读它)+ 确保正确目录有目标封顶值
+  # journald: 清掉装错目录(system/)的历史残留(journald 不读它)+ 确保正确目录封顶(System+Runtime)。
+  # SystemMaxUse 管 /var/log/journal(持久), RuntimeMaxUse 管 /run/log/journal(易失), 两者都封。
   [[ "$jrnl_legacy" != "$jrnl" && -f "$jrnl_legacy" ]] && rm -f "$jrnl_legacy"
   if [[ ! -f "$jrnl" ]]; then                    # 正确目录缺文件(如旧装只在错目录有)→ 补建
     mkdir -p "$(dirname "$jrnl")" 2>/dev/null \
-      && printf '[Journal]\nSystemMaxUse=%s\n' "$jmax" > "$jrnl" 2>/dev/null \
+      && printf '[Journal]\nSystemMaxUse=%s\nRuntimeMaxUse=%s\n' "$jmax" "$jmax" > "$jrnl" 2>/dev/null \
       && { systemctl restart systemd-journald 2>/dev/null || true; c_g "  journald 封顶补到正确目录 → $jmax"; }
-  elif ! grep -q "SystemMaxUse=$jmax" "$jrnl"; then
-    sed -i -E "s/^SystemMaxUse=.*/SystemMaxUse=$jmax/" "$jrnl" 2>/dev/null \
-      && { systemctl restart systemd-journald 2>/dev/null || true; c_g "  journald SystemMaxUse → $jmax"; }
+  else                                            # 已有文件: 只认未注释有效行, 缺则追加(不再被 #注释行 蒙混)
+    local ch=0
+    _journald_set_key "$jrnl" SystemMaxUse  "$jmax" && ch=1
+    _journald_set_key "$jrnl" RuntimeMaxUse "$jmax" && ch=1
+    if [[ "$ch" == 1 ]]; then
+      systemctl restart systemd-journald 2>/dev/null || true
+      local eff; eff="$(sed -n -E 's/^[[:space:]]*SystemMaxUse=([^[:space:]#]+).*/\1/p' "$jrnl" | tail -1)"  # 改后复核实际值
+      [[ "$eff" == "$jmax" ]] && c_g "  journald 封顶 → $jmax(System+Runtime)" \
+        || c_y "  journald 封顶写入后复核异常(SystemMaxUse 实为 ${eff:-空})"
+    fi
   fi
 }
 
