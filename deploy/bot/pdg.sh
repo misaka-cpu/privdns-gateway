@@ -35,16 +35,20 @@ _profile_val(){ [[ -f "$PROFILE_ENV" ]] && sed -n 's/^PDG_LOWMEM=//p' "$PROFILE_
 pdg_cache_size(){ [[ "$1" == 1 ]] && echo 2048 || echo 8192; }
 pdg_journald_max(){ [[ "$1" == 1 ]] && echo 20M || echo 50M; }
 
-# 确保 journald drop-in 里 key= 的"未注释有效值"==val。已是则返回 1(未改); 否则替换已有有效行、
-# 或(无有效行, 含只有 #注释行 的情形)追加一行, 返回 0(已改)。注释行不算数, 避免"假成功/被误判已存在"。
+# 确保 journald drop-in 里 key= 的"未注释有效值"==val。返回: 1=已是目标(未改); 0=已改; 2=写入失败。
+# 注释行不算数(避免"假成功/被误判已存在"); 追加时补 [Journal] 段与末尾换行(处理零字节/无换行文件)。
 _journald_set_key(){
   local file="$1" key="$2" val="$3" cur
   cur="$(sed -n -E "s/^[[:space:]]*${key}=([^[:space:]#]+).*/\1/p" "$file" 2>/dev/null | tail -1)"
   [[ "$cur" == "$val" ]] && return 1
-  if grep -qE "^[[:space:]]*${key}=" "$file" 2>/dev/null; then
-    sed -i -E "s|^[[:space:]]*${key}=.*|${key}=${val}|" "$file"
-  else
-    printf '%s=%s\n' "$key" "$val" >> "$file"
+  if grep -qE "^[[:space:]]*${key}=" "$file" 2>/dev/null; then       # 有未注释有效行 → 替换
+    sed -i -E "s|^[[:space:]]*${key}=.*|${key}=${val}|" "$file" 2>/dev/null || return 2
+  else                                                               # 无有效行 → 追加(补段头/换行)
+    if [[ -s "$file" && "$(tail -c1 "$file" 2>/dev/null | wc -l)" -eq 0 ]]; then
+      printf '\n' >> "$file" 2>/dev/null || return 2                 # 末尾无换行 → 先补, 避免 [Journal]Key 拼接
+    fi
+    grep -qE '^\[Journal\]' "$file" 2>/dev/null || printf '[Journal]\n' >> "$file" 2>/dev/null || return 2
+    printf '%s=%s\n' "$key" "$val" >> "$file" 2>/dev/null || return 2
   fi
   return 0
 }
@@ -70,20 +74,16 @@ pdg_lowmem_current(){
   mt="$(_mem_total_kb)"; if [[ -n "$mt" && "$mt" -le "$LOWMEM_THRESHOLD_KB" ]]; then echo 1; else echo 0; fi
 }
 
-# 老装迁移: 按 profile(内存模式)把 mosdns cache size / journald SystemMaxUse 调到目标。幂等。
-# 只改这两处已知项, 保留用户上游/其它内容; mosdns 改动走"备份+重启 active 门+失败还原"。
-# shellcheck disable=SC2120  # $1/$2/$3 仅测试注入
-migrate_lowmem(){
-  local mos="${1:-/etc/mosdns/config.yaml}" jrnl="${2:-/etc/systemd/journald.conf.d/50-pdg.conf}"
-  local jrnl_legacy="${3:-/etc/systemd/system/journald.conf.d/50-pdg.conf}"   # 历史装错目录
-  local mode cache jmax; mode="$(pdg_lowmem_resolve)"; cache="$(pdg_cache_size "$mode")"; jmax="$(pdg_journald_max "$mode")"
-  if [[ -f "$mos" ]] && grep -q 'tag: lazy_cache' "$mos"; then
-    local cur; cur="$(awk '/tag: lazy_cache/{f=1} f&&/size:/{print $2; exit}' "$mos")"
-    if [[ -n "$cur" && "$cur" != "$cache" ]]; then
-      local bak tmp; bak="$mos.prelowmem.$(date +%s)"; tmp="$mos.lowmem.$$.tmp"
-      if cp -a "$mos" "$bak" 2>/dev/null && cmp -s "$mos" "$bak"; then
-        # 生成到同目录临时文件; 判 python 退出码 + 复核结果, 成功才原子替换 → 只有真改成功才重启。
-        if python3 - "$mos" "$tmp" "$cache" <<'PY'
+# mosdns lazy_cache size 调到目标。失败只影响自己(return 非0), 绝不 exit 调用方 → 不连累 journald 修复。
+# 生成到同目录临时文件 + 判退出码/复核/原子替换, 只有真改成功才重启; 任何失败都不改原文件、不重启。
+_migrate_mosdns_cache(){
+  local mos="$1" cache="$2"
+  [[ -f "$mos" ]] && grep -q 'tag: lazy_cache' "$mos" || return 0
+  local cur; cur="$(awk '/tag: lazy_cache/{f=1} f&&/size:/{print $2; exit}' "$mos")"
+  [[ -n "$cur" && "$cur" != "$cache" ]] || return 0
+  local bak tmp; bak="$mos.prelowmem.$(date +%s)"; tmp="$mos.lowmem.$$.tmp"
+  cp -a "$mos" "$bak" 2>/dev/null && cmp -s "$mos" "$bak" || return 1
+  if ! python3 - "$mos" "$tmp" "$cache" <<'PY'
 import sys, re
 src, dst, cache = sys.argv[1], sys.argv[2], sys.argv[3]
 s = open(src).read()
@@ -92,38 +92,56 @@ tail, n = re.subn(r'(size:\s*)\d+', r'\g<1>' + cache, tail, count=1)
 assert n == 1, 'lazy_cache 块内未找到 size 行'
 open(dst, 'w').write(head + tail)
 PY
-        then :; else c_y "  生成 mosdns cache 失败 → 不改、不重启。"; rm -f "$tmp"; return 0; fi
-        if ! grep -qE "size:[[:space:]]*$cache\b" "$tmp"; then
-          c_y "  生成结果未含目标 cache size → 不改、不重启。"; rm -f "$tmp"; return 0
-        fi
-        if ! mv "$tmp" "$mos" 2>/dev/null; then               # 原子替换失败 → 清理临时文件, 不重启
-          c_y "  原子替换 mosdns 配置失败 → 清理临时文件, 不重启。"; rm -f "$tmp"; return 0
-        fi
-        systemctl restart mosdns 2>/dev/null; sleep 1
-        if [[ "$(systemctl is-active mosdns 2>/dev/null)" != active ]]; then
-          c_y "  mosdns cache 调整后重启失败 → 还原。"; cp -a "$bak" "$mos" 2>/dev/null; systemctl restart mosdns 2>/dev/null
-        else c_g "  mosdns cache size → $cache"; fi
-      fi
-    fi
+  then c_y "  生成 mosdns cache 失败 → 不改、不重启。"; rm -f "$tmp"; return 1; fi
+  if ! grep -qE "size:[[:space:]]*$cache\b" "$tmp"; then
+    c_y "  生成结果未含目标 cache size → 不改、不重启。"; rm -f "$tmp"; return 1; fi
+  if ! mv "$tmp" "$mos" 2>/dev/null; then
+    c_y "  原子替换 mosdns 配置失败 → 清理临时文件, 不重启。"; rm -f "$tmp"; return 1; fi
+  systemctl restart mosdns 2>/dev/null; sleep 1
+  if [[ "$(systemctl is-active mosdns 2>/dev/null)" != active ]]; then
+    c_y "  mosdns cache 调整后重启失败 → 还原。"; cp -a "$bak" "$mos" 2>/dev/null; systemctl restart mosdns 2>/dev/null; return 1
   fi
-  # journald: 清掉装错目录(system/)的历史残留(journald 不读它)+ 确保正确目录封顶(System+Runtime)。
-  # SystemMaxUse 管 /var/log/journal(持久), RuntimeMaxUse 管 /run/log/journal(易失), 两者都封。
+  c_g "  mosdns cache size → $cache"
+}
+
+# journald 封顶: 清错目录残留 + 正确目录 System/Runtime 都封到 jmax。写失败/复核不符/重启失败均 warn(不假绿)。
+_migrate_journald_cap(){
+  local jrnl="$1" jrnl_legacy="$2" jmax="$3"
   [[ "$jrnl_legacy" != "$jrnl" && -f "$jrnl_legacy" ]] && rm -f "$jrnl_legacy"
-  if [[ ! -f "$jrnl" ]]; then                    # 正确目录缺文件(如旧装只在错目录有)→ 补建
+  if [[ ! -f "$jrnl" ]]; then                    # 正确目录缺文件 → 补建
     mkdir -p "$(dirname "$jrnl")" 2>/dev/null \
       && printf '[Journal]\nSystemMaxUse=%s\nRuntimeMaxUse=%s\n' "$jmax" "$jmax" > "$jrnl" 2>/dev/null \
-      && { systemctl restart systemd-journald 2>/dev/null || true; c_g "  journald 封顶补到正确目录 → $jmax"; }
-  else                                            # 已有文件: 只认未注释有效行, 缺则追加(不再被 #注释行 蒙混)
-    local ch=0
-    _journald_set_key "$jrnl" SystemMaxUse  "$jmax" && ch=1
-    _journald_set_key "$jrnl" RuntimeMaxUse "$jmax" && ch=1
-    if [[ "$ch" == 1 ]]; then
-      systemctl restart systemd-journald 2>/dev/null || true
-      local eff; eff="$(sed -n -E 's/^[[:space:]]*SystemMaxUse=([^[:space:]#]+).*/\1/p' "$jrnl" | tail -1)"  # 改后复核实际值
-      [[ "$eff" == "$jmax" ]] && c_g "  journald 封顶 → $jmax(System+Runtime)" \
-        || c_y "  journald 封顶写入后复核异常(SystemMaxUse 实为 ${eff:-空})"
-    fi
+      && { systemctl restart systemd-journald 2>/dev/null || true; c_g "  journald 封顶补到正确目录 → $jmax"; } \
+      || c_y "  journald 封顶补建失败(目录只读?)→ 未生效, 请检查 $jrnl。"
+    return 0
   fi
+  local r1 r2; _journald_set_key "$jrnl" SystemMaxUse "$jmax"; r1=$?; _journald_set_key "$jrnl" RuntimeMaxUse "$jmax"; r2=$?
+  if [[ "$r1" == 2 || "$r2" == 2 ]]; then
+    c_y "  journald 封顶写入失败(目录只读?)→ 未完全生效, 请检查 $jrnl。"; return 0
+  fi
+  [[ "$r1" == 0 || "$r2" == 0 ]] || return 0     # 两个都"已是目标"(未改)→ 幂等, 无需重启
+  local rok=1; systemctl restart systemd-journald 2>/dev/null || rok=0
+  local es rs
+  es="$(sed -n -E 's/^[[:space:]]*SystemMaxUse=([^[:space:]#]+).*/\1/p'  "$jrnl" | tail -1)"
+  rs="$(sed -n -E 's/^[[:space:]]*RuntimeMaxUse=([^[:space:]#]+).*/\1/p' "$jrnl" | tail -1)"
+  if [[ "$es" == "$jmax" && "$rs" == "$jmax" && "$rok" == 1 ]]; then
+    c_g "  journald 封顶 → $jmax(System+Runtime)"
+  elif [[ "$es" == "$jmax" && "$rs" == "$jmax" ]]; then
+    c_y "  journald 封顶已写入但 journald 重启失败 → 重启系统后生效。"
+  else
+    c_y "  journald 封顶复核异常(System=${es:-空} Runtime=${rs:-空})。"
+  fi
+}
+
+# 老装迁移: 按 profile(内存模式)把 mosdns cache size / journald 封顶调到目标。幂等。
+# 两步互相独立: mosdns 调整失败也不影响 journald 修复(反之亦然)。
+# shellcheck disable=SC2120  # $1/$2/$3 仅测试注入
+migrate_lowmem(){
+  local mos="${1:-/etc/mosdns/config.yaml}" jrnl="${2:-/etc/systemd/journald.conf.d/50-pdg.conf}"
+  local jrnl_legacy="${3:-/etc/systemd/system/journald.conf.d/50-pdg.conf}"   # 历史装错目录
+  local mode cache jmax; mode="$(pdg_lowmem_resolve)"; cache="$(pdg_cache_size "$mode")"; jmax="$(pdg_journald_max "$mode")"
+  _migrate_mosdns_cache "$mos" "$cache" || true       # mosdns 失败不影响下面 journald
+  _migrate_journald_cap "$jrnl" "$jrnl_legacy" "$jmax"
 }
 
 pdg_fetch_release_tags(){
@@ -466,10 +484,11 @@ cmd_snapshot(){
   need_root snapshot; _lock
   local ts d; ts=$(date +%Y%m%d-%H%M%S); d="$SNAP_DIR/$ts"
   install -d -m700 "$d"
-  # 整机配置 + 防火墙 + bot.env(含 token)+ service(相对 / 打包, 回滚直接 -C / 解开)
+  # 整机配置 + 防火墙 + bot.env(含 token)+ service + journald 封顶(含历史错路径)(相对 / 打包, 回滚 -C / 解开)
   tar czf "$d/snap.tar.gz" -C / \
     etc/mosdns etc/sing-box opt/pdg-bot etc/privdns-gateway \
-    etc/nftables.conf etc/systemd/system/pdg-bot.service 2>/dev/null
+    etc/nftables.conf etc/systemd/system/pdg-bot.service \
+    etc/systemd/journald.conf.d/50-pdg.conf etc/systemd/system/journald.conf.d/50-pdg.conf 2>/dev/null
   chmod 600 "$d/snap.tar.gz"
   echo "✅ 快照: $d/snap.tar.gz"
   ls -1dt "$SNAP_DIR"/*/ 2>/dev/null | tail -n +11 | xargs -r rm -rf   # 只留最近 10 份
@@ -500,6 +519,7 @@ cmd_rollback(){
   systemctl daemon-reload
   nft -f /etc/nftables.conf 2>/dev/null || true
   systemctl restart mosdns sing-box pdg-bot pdg-probe81 2>/dev/null || true
+  systemctl restart systemd-journald 2>/dev/null || true   # journald CanReload=no: 还原封顶需 restart 才生效
   echo "✅ 已回滚并重启服务"
 }
 
@@ -544,12 +564,8 @@ cmd_update(){
   install -m755 "$REPO_DIR"/deploy/cert/99-reload-cert.deploy-hook.sh     /etc/letsencrypt/renewal-hooks/deploy/99-pdg-cert.sh
   install -m755 "$REPO_DIR"/deploy/bot/pdg-set-token.sh     /usr/local/bin/pdg-set-token
   install -m755 "$REPO_DIR"/deploy/bot/pdg.sh               /usr/local/bin/pdg
-  migrate_botenv            # 老装: token 从 unit 迁到 bot.env
-  migrate_firewall_to_pdg   # 老装: 防火墙 inet filter → 独立表 inet pdg(否则证书续期开不了 80)
-  migrate_singbox_gms       # 老装: sing-box 补 GMS 推送入站(5228-5230 嗅探分流)
-  migrate_fw_gms            # 老装: 防火墙内网放行集补 5228-5230(配合上面入站)
-  migrate_mosdns_ratelimit  # 老装: mosdns 补单客户端 QPS 兜底(rate_limiter)
-  migrate_lowmem            # 老装: 按内存模式调 mosdns cache / journald 上限(幂等)
+  # 迁移用"刚装好的新脚本"跑(本进程还是旧 bash, 直接调会用旧版函数 → 新迁移要等下次命令才生效)。
+  bash /usr/local/bin/pdg __migrate
 
   # ── 更新后校验门: 任一硬校验失败即回滚到更新前快照 ──
   c_g "校验新版本…"
@@ -717,20 +733,26 @@ menu(){
 }
 
 # 老装升级"自愈": 旧版 pdg update 跑的是旧脚本, 不会调用迁移 → 装上新 pdg.sh 后,
+# 全部老装迁移(幂等)。集中一处, 供管理类命令的自愈调用 + cmd_update 装好新脚本后经 `pdg __migrate` 调"新版"。
+run_all_migrations(){
+  migrate_botenv || true; migrate_firewall_to_pdg || true; migrate_mosdns_concurrent || true
+  migrate_mosdns_unlock || true; migrate_singbox_gms || true; migrate_fw_gms || true
+  migrate_mosdns_ratelimit || true; migrate_lowmem || true
+}
+
 # 下一次以 root 运行"管理类"命令(update/restart/menu/…)时幂等自动迁移防火墙(已迁移则首个 grep 秒退)。
 # 只读命令(status/doctor/log/traffic/report)与卸载不触发, 以保持"只读命令不写任何东西"的语义;
 # 只跑只读命令的用户可显式 `sudo pdg migrate-fw` 迁移(且证书 hook/doctor 已兼容旧 inet filter, 不迁也能用)。
 if [[ $EUID -eq 0 ]]; then
   case "${1:-menu}" in
-    status|st|doctor|dr|log|logs|traffic|tr|report|uninstall|rm) : ;;   # 只读/卸载: 不迁移
-    *) migrate_firewall_to_pdg || true; migrate_mosdns_concurrent || true; migrate_mosdns_unlock || true
-       migrate_singbox_gms || true; migrate_fw_gms || true; migrate_mosdns_ratelimit || true
-       migrate_lowmem || true ;;   # 管理类命令才迁移
+    status|st|doctor|dr|log|logs|traffic|tr|report|uninstall|rm|__migrate) : ;;   # 只读/卸载/内部迁移: 不重复迁移
+    *) run_all_migrations ;;   # 管理类命令才迁移(idempotent)
   esac
 fi
 
 case "${1:-menu}" in
   menu|"")       menu;;
+  __migrate)     need_root __migrate; run_all_migrations;;   # 内部: cmd_update 装好新脚本后据此跑"新版"迁移
   status|st)     cmd_status;;
   doctor|dr)     shift || true; cmd_doctor "${1:-}";;
   update|up)     shift || true; cmd_update "${1:-}";;

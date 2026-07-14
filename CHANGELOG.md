@@ -2,6 +2,14 @@
 
 本项目按语义化 `v1.x` tag 正式发布;以下按版本/日期记录主要变化,完整提交见 git 历史。
 
+## 2026-07-13 — v1.2.4(迁移即时生效 + journald 迁移稳健性)
+
+- **修**:`pdg update` / TG Bot 更新仍在旧 Bash 进程里跑,新版迁移要等下次 root 命令才生效。`cmd_update` 装好新脚本后改为 `bash /usr/local/bin/pdg __migrate` 用**新脚本**跑迁移(迁移集中到 `run_all_migrations`)。
+- **修**:`pdg snapshot/rollback` 未含 journald drop-in——强制重装失败后无法真正还原封顶。快照现纳入正确+历史错路径的 `50-pdg.conf`,回滚后 `restart systemd-journald`(`CanReload=no`)。
+- **修**:mosdns cache 迁移失败(生成/复核/mv)会 `return` 连带跳过后面的 journald 修复。拆成 `_migrate_mosdns_cache` / `_migrate_journald_cap` 两个独立函数,mosdns 失败也不影响 journald。
+- **修**:journald 写入失败(只读目录)仍报绿——`_journald_set_key` 现传播写失败(返回 2),迁移改后复核 **System 与 Runtime 两个值**并检查 journald 重启结果,任一异常给 warn。
+- **修**:零字节 / 末尾无换行的现有 drop-in 文件会生成缺 `[Journal]` 段头或 `[Journal]SystemMaxUse=…` 拼接的非法配置;追加时补段头与换行。
+
 ## 2026-07-13 — v1.2.3(journald 封顶稳健性 + RuntimeMaxUse)
 
 - **修**:低内存迁移写 journald 封顶只会替换已有的 `SystemMaxUse=` 行——文件没有该有效行时 `sed` 空替换却"假成功",只有 `#SystemMaxUse=` 注释行时又被 `grep` 误判为已存在而跳过。改为只认**未注释有效行**:缺则追加、有则替换,写后复核实际值。

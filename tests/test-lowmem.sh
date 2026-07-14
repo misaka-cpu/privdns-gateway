@@ -83,32 +83,38 @@ sed -e 's/__SERVER_IP__/10.0.0.9/g' -e 's#__INTERNAL_CIDR__#127.0.0.0/8#g' -e 's
     -e 's/__MOSDNS_CACHE__/8192/g' "$ROOT/deploy/mosdns/config.yaml" > "$WORK/mosf.yaml"
 printf '[Journal]\nSystemMaxUse=20M\n' > "$WORK/jrnlok.conf"   # 已是目标, journald 迁移不触发(隔离 mosdns 重启计数)
 printf 'PDG_LOWMEM=1\n' > "$WORK/prof.env"
+# 只数 mosdns 重启(journald 重启不算), 以隔离验证; journald 文件故意缺 RuntimeMaxUse, 用于证明 journald 仍被修
+mosonly='systemctl(){ case "$1 $2" in "is-active mosdns") echo active;; "restart mosdns") MOS=$((MOS+1));; esac; return 0; }'
 before="$(md5sum "$WORK/mosf.yaml" | awk '{print $1}')"
-out=$(PDG_PROFILE="$WORK/prof.env" PDG_MEMINFO="$WORK/mem512" bash -c '
-  c_g(){ :; }; c_y(){ :; }; RESTARTS=0
-  systemctl(){ case "$1" in is-active) echo active;; restart) RESTARTS=$((RESTARTS+1));; esac; return 0; }
+printf '[Journal]\nSystemMaxUse=20M\n' > "$WORK/jgen.conf"   # 缺 RuntimeMaxUse
+out=$(PDG_PROFILE="$WORK/prof.env" PDG_MEMINFO="$WORK/mem512" bash -c "
+  c_g(){ :; }; c_y(){ :; }; MOS=0
+  $mosonly
   python3(){ cat >/dev/null; return 1; }        # 生成器失败
-  source "'"$WORK/lowmem.sh"'"
-  migrate_lowmem "'"$WORK/mosf.yaml"'" "'"$WORK/jrnlok.conf"'" "'"$WORK/legacyx.conf"'"
-  echo "RESTARTS=$RESTARTS"')
+  source '$WORK/lowmem.sh'
+  migrate_lowmem '$WORK/mosf.yaml' '$WORK/jgen.conf' '$WORK/legacyx.conf'
+  echo \"MOS=\$MOS\"")
 [[ "$(md5sum "$WORK/mosf.yaml" | awk '{print $1}')" == "$before" ]] && ok "生成器失败: mosdns 配置原样不变" || bad "生成器失败却改了配置"
-echo "$out" | grep -q 'RESTARTS=0' && ok "生成器失败: 未重启 mosdns" || bad "生成器失败却重启了 mosdns"
+echo "$out" | grep -q 'MOS=0' && ok "生成器失败: 未重启 mosdns" || bad "生成器失败却重启了 mosdns"
 ls "$WORK"/mosf.yaml.*.tmp >/dev/null 2>&1 && bad "残留临时文件未清理" || ok "临时文件已清理"
+grep -qxE 'RuntimeMaxUse=20M' "$WORK/jgen.conf" && ok "mosdns 失败不连累 journald(仍补 RuntimeMaxUse)" || bad "mosdns 失败连带跳过了 journald"
 
-# 原子替换(mv)失败 → 配置不变、不重启、清临时文件
+# 原子替换(mv)失败 → 配置不变、不重启 mosdns、清临时文件; journald 仍被修
 sed -e 's/__SERVER_IP__/10.0.0.9/g' -e 's#__INTERNAL_CIDR__#127.0.0.0/8#g' -e 's#__CERT_DIR__#/tmp/c#g' \
     -e 's/__MOSDNS_CACHE__/8192/g' "$ROOT/deploy/mosdns/config.yaml" > "$WORK/mosm.yaml"
 before="$(md5sum "$WORK/mosm.yaml" | awk '{print $1}')"
-out=$(PDG_PROFILE="$WORK/prof.env" PDG_MEMINFO="$WORK/mem512" bash -c '
-  c_g(){ :; }; c_y(){ :; }; RESTARTS=0
-  systemctl(){ case "$1" in is-active) echo active;; restart) RESTARTS=$((RESTARTS+1));; esac; return 0; }
+printf '[Journal]\nSystemMaxUse=20M\n' > "$WORK/jgen2.conf"
+out=$(PDG_PROFILE="$WORK/prof.env" PDG_MEMINFO="$WORK/mem512" bash -c "
+  c_g(){ :; }; c_y(){ :; }; MOS=0
+  $mosonly
   mv(){ return 1; }                             # 原子替换失败
-  source "'"$WORK/lowmem.sh"'"
-  migrate_lowmem "'"$WORK/mosm.yaml"'" "'"$WORK/jrnlok.conf"'" "'"$WORK/legacyx.conf"'"
-  echo "RESTARTS=$RESTARTS"')
+  source '$WORK/lowmem.sh'
+  migrate_lowmem '$WORK/mosm.yaml' '$WORK/jgen2.conf' '$WORK/legacyx.conf'
+  echo \"MOS=\$MOS\"")
 [[ "$(md5sum "$WORK/mosm.yaml" | awk '{print $1}')" == "$before" ]] && ok "mv 失败: mosdns 配置原样不变" || bad "mv 失败却改了配置"
-echo "$out" | grep -q 'RESTARTS=0' && ok "mv 失败: 未重启 mosdns" || bad "mv 失败却重启了 mosdns"
+echo "$out" | grep -q 'MOS=0' && ok "mv 失败: 未重启 mosdns" || bad "mv 失败却重启了 mosdns"
 ls "$WORK"/mosm.yaml.*.tmp >/dev/null 2>&1 && bad "mv 失败残留临时文件" || ok "mv 失败: 临时文件已清理"
+grep -qxE 'RuntimeMaxUse=20M' "$WORK/jgen2.conf" && ok "mv 失败不连累 journald(仍补 RuntimeMaxUse)" || bad "mv 失败连带跳过了 journald"
 
 # journald 装错目录的历史残留 → 清掉 + 正确目录补建目标值(旧装迁移场景)
 sed -e 's/__SERVER_IP__/10.0.0.9/g' -e 's#__INTERNAL_CIDR__#127.0.0.0/8#g' -e 's#__CERT_DIR__#/tmp/c#g' \
@@ -142,6 +148,33 @@ printf 'PDG_LOWMEM=1\n' > "$WORK/prof.env"
 PDG_PROFILE="$WORK/prof.env" PDG_MEMINFO="$WORK/mem512" bash -c "source '$WORK/harness.sh'; migrate_lowmem '$WORK/mos2048.yaml' '$WORK/jempty.conf' '$WORK/legacyz.conf'"
 grep -qxE 'SystemMaxUse=20M' "$WORK/jempty.conf" && grep -qxE 'RuntimeMaxUse=20M' "$WORK/jempty.conf" \
   && ok "集成: 缺封顶行的现有文件被补齐 System+Runtime=20M" || bad "缺封顶行未被补齐(假成功)"
+
+# P3: 零字节文件 → 补 [Journal] 段头 + key(选项必须在 [Journal] 下)
+: > "$WORK/jzero.conf"
+jset "$WORK/jzero.conf" SystemMaxUse 20M
+grep -qxE '\[Journal\]' "$WORK/jzero.conf" && grep -qxE 'SystemMaxUse=20M' "$WORK/jzero.conf" \
+  && ok "零字节文件 → 补 [Journal] 段头 + key" || bad "零字节文件处理错(缺段头/key)"
+# P3: [Journal] 末尾无换行 → 不拼接成 [Journal]SystemMaxUse
+printf '[Journal]' > "$WORK/jnonl.conf"
+jset "$WORK/jnonl.conf" SystemMaxUse 20M
+grep -qxE 'SystemMaxUse=20M' "$WORK/jnonl.conf" && ! grep -q 'Journal]SystemMaxUse' "$WORK/jnonl.conf" \
+  && ok "末尾无换行 → 段头与 key 各占一行(不拼接)" || bad "拼接成了 [Journal]SystemMaxUse"
+
+# P2-4: 写入失败(只读目录)→ 返回 2 + 迁移 warn 不假绿(需非 root)
+if [[ "$(id -u)" != 0 ]]; then
+  mkdir -p "$WORK/ro"; printf '[Journal]\nSystemMaxUse=50M\n' > "$WORK/ro/j.conf"; chmod 0555 "$WORK/ro"
+  rc=0; bash -c "source '$WORK/harness.sh'; _journald_set_key '$WORK/ro/j.conf' SystemMaxUse 20M" || rc=$?
+  [[ "$rc" == 2 ]] && ok "写入失败(只读目录)→ _journald_set_key 返回 2" || bad "写入失败未返回 2(rc=$rc)"
+  out=$(bash -c "
+    c_g(){ echo GREEN; }; c_y(){ echo YELLOW; }
+    systemctl(){ [[ \"\$1\" == is-active ]] && echo active; return 0; }
+    source '$WORK/lowmem.sh'
+    _migrate_journald_cap '$WORK/ro/j.conf' '$WORK/none.conf' 20M")
+  { echo "$out" | grep -q YELLOW && ! echo "$out" | grep -q GREEN; } && ok "写入失败 → 迁移 warn 不假绿" || bad "写入失败却报绿(out=$out)"
+  chmod 0755 "$WORK/ro"
+else
+  ok "写入失败测试(需非 root, 已跳过)"
+fi
 
 echo "────────────────────────────────────────"
 echo "通过 $pass, 失败 $nfail"
