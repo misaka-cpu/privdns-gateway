@@ -5,6 +5,7 @@ import copy
 import io
 import json
 import os
+import shutil
 import tarfile
 import tempfile
 import zipfile
@@ -117,6 +118,13 @@ with tempfile.TemporaryDirectory() as td:
     assert ok, err
     assert Path(bot.UI_DIST, "index.html").read_text(encoding="utf-8") == "fixed-index"
     assert len(fetched) == 2, "UI 内容被替换后应重新下载已验证版本"
+    shutil.rmtree(bot.UI_DIST)
+    Path(bot.UI_DIST).write_text("replaced-by-file", encoding="utf-8")
+    ok, err = bot._ensure_zashboard()
+    assert ok, err
+    assert Path(bot.UI_DIST, "index.html").read_text(encoding="utf-8") == "fixed-index"
+    assert not os.path.lexists(bot.UI_DIST + ".pdg-old"), "修复后不应遗留文件或符号链接"
+    assert len(fetched) == 3
 bot.ZASHBOARD_VER, bot.ZASH_SHA, bot.ZASH_URL, bot.UI_DIR, bot.UI_DIST = old_pin
 bot.UI_META = os.path.join(bot.UI_DIR, ".pdg-zashboard.json")
 print("[OK]   zashboard 内容指纹不符 → 恢复固定版本")
@@ -152,6 +160,31 @@ assert bot._panel_state(old_managed) == "on"
 assert bot._panel_sanitize_config(old_managed) is True
 assert old_managed["experimental"]["clash_api"] == {"external_controller": "127.0.0.1:9090"}
 print("[OK]   升级后仍识别并收回旧版本受管面板")
+
+# 预检后到 apply_sb 真正读配置之间若被改成自定义，必须二次校验且不覆盖。
+prechecked_off = {"experimental": {"clash_api": {"external_controller": "127.0.0.1:9090"}}}
+race_custom = copy.deepcopy(before)
+race_before = copy.deepcopy(race_custom)
+bot.load = lambda: prechecked_off
+def race_apply(mod):
+    try:
+        mod(race_custom)
+    except Exception as e:
+        return False, type(e).__name__
+    return True, ""
+bot.apply_sb = race_apply
+bot._panel_firewall = lambda on, cidr: (True, "")
+ok, err = bot.set_panel(True)
+assert not ok and race_custom == race_before, (ok, err, race_custom)
+
+prechecked_on = {"experimental": {"clash_api": {
+    "external_controller": "0.0.0.0:9090", "secret": "S",
+    "external_ui": bot.UI_DIST, "external_ui_download_url": bot.ZASH_URL}}}
+race_custom = copy.deepcopy(before); race_before = copy.deepcopy(race_custom)
+bot.load = lambda: prechecked_on
+ok, err = bot.set_panel(False)
+assert not ok and race_custom == race_before, (ok, err, race_custom)
+print("[OK]   apply_sb 锁内二次校验配置归属，竞态下不覆盖自定义配置")
 
 # ── 防火墙开启失败：配置必须回滚到关闭态 ────────────────────────────────────
 cfg_fail = {"experimental": {"clash_api": {"external_controller": "127.0.0.1:9090"}}}
@@ -288,10 +321,13 @@ print("[OK]   自动关闭失败 → 保留状态并安排重试")
 # 手动关闭失败也不能先取消保障
 bot._panel_clear_state(); FakeTimer.made.clear()
 bot._panel_arm(4, 404, 600); original_timer = bot._panel_timer
-bot.set_panel = lambda on: (False, "close failed")
+close_calls = []
+bot.set_panel = lambda on: (close_calls.append(on), (False, "close failed"))[1]
 ok, err = bot._panel_close(4)
 assert not ok and bot._panel_link == (4, 404) and bot._panel_timer is not None
 assert original_timer.cancelled and bot._panel_timer.interval == bot.PANEL_RETRY_SECONDS
+original_timer.fire()                            # 模拟 cancel 时旧回调已经启动
+assert close_calls == [False], "被替换的旧计时器即使已启动也不能再次关闭"
 print("[OK]   手动关闭失败 → 保留链接并补自动重试")
 
 # 启动清理：自定义配置不动；受管面板关闭失败会重试

@@ -72,6 +72,9 @@ _cfg_lock = threading.Lock()                     # 进程内串行化"写 sing-b
 LOCKFILE = "/run/privdns-gateway.lock"           # 与 pdg update/rollback 共用, 防跨进程并发改配置
 BUSY_MSG = "已有配置操作正在执行,请稍候再试。"   # apply_sb 拿不到锁(进程内或跨进程)时的安全返回
 
+class _PanelOwnershipError(Exception):
+    pass
+
 def _acquire_busy(chat):
     with _busy_lock:
         if _busy.get(chat):
@@ -339,6 +342,8 @@ def apply_sb(modify):
                 sh(["systemctl", "reset-failed", "sing-box"]); sh(["systemctl", "restart", "sing-box"])
                 return False, "重启 sing-box 失败, 已还原上一份配置:\n" + (r.stdout + r.stderr)[-300:]
             return True, ""
+        except _PanelOwnershipError:
+            return False, "检测到自定义 clash_api 配置, 为避免覆盖已保持原样"
         except Exception as e:  # noqa: BLE001
             # check/restart 超时(TimeoutExpired)、modify/写盘等异常: 绝不留未验证的新配置。
             # 已写过新配置就还原备份并尽力重启回已知good; 返回失败(TG Bot 会据此提示), 不外泄异常正文。
@@ -871,6 +876,14 @@ def _panel_sanitize_config(c):
     api.pop("external_ui_download_url", None)
     return True
 
+def _panel_close_config(c):
+    """在 apply_sb 锁内复核归属；已关闭可幂等通过，自定义态立即中止。"""
+    state_now = _panel_state(c)
+    if state_now == "custom":
+        raise _PanelOwnershipError
+    if state_now == "on":
+        _panel_sanitize_config(c)
+
 def _panel_cidr():
     """从防火墙现有放行规则读内网卡段(和 853/443 同源门控)。"""
     out = sh(["nft", "list", "chain", "inet", "pdg", "input"]).stdout
@@ -894,6 +907,14 @@ def _ui_fingerprint(root):
                 for chunk in iter(lambda: f.read(1024 * 1024), b""):
                     digest.update(chunk)
     return digest.hexdigest()
+
+def _remove_path(path):
+    if not os.path.lexists(path):
+        return
+    if os.path.isdir(path) and not os.path.islink(path):
+        shutil.rmtree(path)
+    else:
+        os.unlink(path)
 
 def _zashboard_current():
     try:
@@ -932,7 +953,7 @@ def _ensure_zashboard():
         if not tree_sha:
             return False, "zashboard 内容指纹生成失败"
         old = UI_DIST + ".pdg-old"
-        shutil.rmtree(old, ignore_errors=True)
+        _remove_path(old)
         if os.path.lexists(UI_DIST):
             os.replace(UI_DIST, old)
         try:
@@ -941,7 +962,7 @@ def _ensure_zashboard():
             if os.path.lexists(old) and not os.path.lexists(UI_DIST):
                 os.replace(old, UI_DIST)
             raise
-        shutil.rmtree(old, ignore_errors=True)
+        _remove_path(old)
         old = None
         meta_tmp = UI_META + ".tmp"
         with open(meta_tmp, "w", encoding="utf-8") as f:
@@ -1008,6 +1029,8 @@ def _set_panel(on):
             return False, err
         secret = uuid.uuid4().hex
         def mod(c):
+            if _panel_state(c) == "custom":
+                raise _PanelOwnershipError
             api = c.setdefault("experimental", {}).setdefault("clash_api", {})
             api["external_controller"] = PANEL_LISTEN
             api["secret"] = secret
@@ -1018,7 +1041,7 @@ def _set_panel(on):
             return False, msg
         fw_ok, fw_msg = _panel_firewall(True, cidr)
         if not fw_ok:
-            rb_ok, rb_msg = apply_sb(_panel_sanitize_config)
+            rb_ok, rb_msg = apply_sb(_panel_close_config)
             clean_ok, clean_msg = _panel_firewall(False, cidr)
             detail = "防火墙开启失败: " + fw_msg
             if not rb_ok or not clean_ok:
@@ -1029,7 +1052,7 @@ def _set_panel(on):
         secret = None
         return True, link
     if state_now == "on":
-        ok, msg = apply_sb(_panel_sanitize_config)
+        ok, msg = apply_sb(_panel_close_config)
         if not ok:
             return False, msg
     fw_ok, fw_msg = _panel_firewall(False, _panel_cidr())
@@ -1097,8 +1120,7 @@ def _panel_schedule_retry(chat=None, generation=None):
         if generation is not None and generation != _panel_generation:
             return False
         old_timer = _panel_timer
-        if _panel_generation == 0:
-            _panel_generation = 1
+        _panel_generation += 1                 # 让被替换但已启动的旧回调立即失效
         if chat is not None:
             _panel_chat = chat
         current = _panel_generation
