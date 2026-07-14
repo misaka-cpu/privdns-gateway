@@ -34,6 +34,7 @@ print("[OK]   clash_get 按 secret 带/不带 Bearer")
 _REAL_ENSURE = bot._ensure_zashboard        # 存真函数, 供后面 SHA 校验用例
 bot._ensure_zashboard = lambda: (True, "")
 bot._panel_cidr = lambda: "172.22.0.0/16"
+_REAL_FW = bot._panel_firewall              # 存真函数, 供后面 firewall 用例
 fw = []
 bot._panel_firewall = lambda on, cidr: fw.append((on, cidr))
 bot._server_ip = lambda: "203.0.113.9"
@@ -104,6 +105,24 @@ bot._panel_cancel_timer(); bot._panel_delete_link()
 assert bot._panel_timer is None and bot._panel_link is None and (7, 555) in deleted
 print("[OK]   手动关: 取消定时器 + 删链接消息")
 
+# ── _panel_firewall: off 只删(供启动兜底清残留放行), on 删旧+加 ────────────────
+bot._panel_firewall = _REAL_FW              # 恢复真函数
+calls = []
+class _R:
+    def __init__(s, out=""): s.stdout = out
+def fake_sh(cmd):
+    calls.append(cmd)
+    if len(cmd) > 1 and cmd[1] == "-a":          # nft -a list chain … → 返回一条 pdg-panel 规则
+        return _R('ip saddr 172.22.0.0/16 tcp dport 9090 accept comment "pdg-panel" # handle 15\n')
+    return _R("")
+bot.sh = fake_sh
+calls.clear(); bot._panel_firewall(False, "172.22.0.0/16")
+assert any(c[:4] == ["nft", "delete", "rule", "inet"] and "15" in c for c in calls), "off 应按 handle 删残留规则"
+assert not any("insert" in c for c in calls), "off 不应 insert"
+calls.clear(); bot._panel_firewall(True, "172.22.0.0/16")
+assert any("insert" in c for c in calls), "on 应 insert 放行规则"
+print("[OK]   _panel_firewall: off 只删残留 / on 删旧+加(启动兜底可清 config-off 的残留放行)")
+
 # ── 菜单/回调接线 ────────────────────────────────────────────────────────────
 src = (ROOT / "deploy/bot/pdg-bot.py").read_text(encoding="utf-8")
 assert '"callback_data": "panel"' in src, "运维菜单应有观测面板入口"
@@ -112,6 +131,7 @@ for cb in ('if data == "panel":', 'if data.startswith("panel:on:"):', 'if data =
 for token in ('"panel:on:10"', '"panel:on:30"', '"panel:on:0"'):
     assert token in src, f"缺时长按钮 {token}"
 assert "_panel_arm(chat, link_mid" in src and "if _panel_on():" in src, "缺 arm 调用 / 启动兜底关面板"
-print("[OK]   运维菜单 + 时长按钮 + 回调接线 + 启动兜底")
+assert "_panel_firewall(False, _panel_cidr())" in src, "启动兜底应能清 config-off 但残留的放行规则"
+print("[OK]   运维菜单 + 时长按钮 + 回调接线 + 启动兜底(含清残留放行)")
 
 print("panel regression OK")

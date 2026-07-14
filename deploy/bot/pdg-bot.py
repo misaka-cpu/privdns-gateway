@@ -2275,8 +2275,10 @@ def main():
     print("pdg-bot v3 started, allowed:", ALLOWED, flush=True)
     try:                                   # 兜底: 上次留下的面板(bot 重启后定时器已丢)直接关掉, 限制暴露
         if _panel_on():
-            set_panel(False)
+            set_panel(False)               # 配置仍开 → 完整关闭(含撤防火墙)
             print("panel: closed leftover panel on startup", flush=True)
+        else:
+            _panel_firewall(False, _panel_cidr())   # 配置已关但可能残留放行规则(如中途崩溃)→ 清掉
     except Exception as e:  # noqa: BLE001
         print("panel startup close err", type(e).__name__, flush=True)
     off = 0
