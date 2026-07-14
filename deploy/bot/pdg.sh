@@ -488,21 +488,56 @@ migrate_fw_gms(){
   fi
 }
 
+# 返回一个已创建的非空临时目录；失败不输出路径。供 snapshot/rollback 共用，避免空路径退化到 /etc。
+_pdg_mktemp_dir(){
+  local d=""
+  d="$(mktemp -d)" || return 1
+  [[ -n "$d" && -d "$d" ]] || return 1
+  printf '%s\n' "$d"
+}
+
+# 按原归档成员清单把已验证临时树落到目标根；不递归顶层隐式父目录，避免误改 /etc、/opt 元数据。
+_pdg_apply_snapshot_tree(){
+  local tree="$1" members="$2" dest="$3"
+  [[ -d "$tree" && -s "$members" && -d "$dest" ]] || return 1
+  (
+    set -o pipefail
+    tar --no-recursion -cf - -C "$tree" -T "$members" 2>/dev/null \
+      | tar xpf - -C "$dest" 2>/dev/null
+  )
+}
+
 # 面板临时态净化(与 bot backup_blob/restore_from 对称): 快照/回滚不持久化面板的公网监听+密钥+UI。
-# 只认"本项目受管开启态"(0.0.0.0:9090 + 项目 UI 目录 + 有 secret); 自定义 clash_api 不动。$1=config 文件。
+# 只认"本项目受管开启态"(0.0.0.0:9090 + 项目 UI 目录 + 有 secret + 项目下载地址); 自定义 clash_api 不动。
 _sb_panel_managed_on(){
   command -v jq >/dev/null 2>&1 || return 1
   jq -e '.experimental.clash_api as $c | ($c.external_controller=="0.0.0.0:9090")
-         and ($c.external_ui=="/etc/sing-box/ui/dist") and ((($c.secret) // "")|length>0)' "$1" >/dev/null 2>&1
+         and ($c.external_ui=="/etc/sing-box/ui/dist") and ((($c.secret) // "")|length>0)
+         and (($c.external_ui_download_url // "") as $d |
+              if ($d|type)!="string" then false
+              else ($d=="" or ($d|test("^https://github[.]com/Zephyruso/zashboard/releases/download/[^/]+/dist-no-fonts[.]zip$"))) end)' \
+      "$1" >/dev/null 2>&1
 }
-# 把受管开启态就地净化为关闭态(clash_api 只留本地控制器)。改了返回 0, 未改/失败非 0。$1=config 文件。
+# 生成关闭态净化副本；调用方只传临时目标。成功副本固定 600，失败不留半成品。
+_sb_write_sanitized(){
+  local src="$1" dst="$2"
+  [[ "$src" != "$dst" ]] || return 1
+  if jq '.experimental.clash_api={external_controller:"127.0.0.1:9090"}' "$src" > "$dst" 2>/dev/null \
+     && [[ -s "$dst" ]] && chmod 600 "$dst"; then
+    return 0
+  fi
+  rm -f "$dst"; return 1
+}
+# 把受管开启态原子净化为关闭态(clash_api 只留本地控制器)。改了返回 0, 未改/失败非 0。
 _sb_sanitize_panel(){
   _sb_panel_managed_on "$1" || return 1
-  local t; t="$(mktemp)" || return 1
-  if jq '.experimental.clash_api={external_controller:"127.0.0.1:9090"}' "$1" > "$t" 2>/dev/null && [[ -s "$t" ]]; then
-    cat "$t" > "$1"; rm -f "$t"; return 0
+  local dir base t=""
+  dir="$(dirname -- "$1")"; base="$(basename -- "$1")"
+  t="$(mktemp "$dir/.${base}.pdg.XXXXXX")" || return 2
+  if _sb_write_sanitized "$1" "$t" && mv -f -- "$t" "$1"; then
+    return 0
   fi
-  rm -f "$t"; return 1
+  rm -f "$t"; return 2
 }
 
 SNAP_DIR="/var/lib/privdns-gateway/backups"
@@ -520,9 +555,11 @@ cmd_snapshot(){
   # 面板受管开启态: 用净化后的 config 入档(排除真实 config.json, 追加净化版), 快照不含临时监听/密钥/UI。
   local stg=""
   if [[ -e /etc/sing-box/config.json ]] && _sb_panel_managed_on /etc/sing-box/config.json; then
-    stg="$(mktemp -d)"; mkdir -p "$stg/etc/sing-box"
-    if ! jq '.experimental.clash_api={external_controller:"127.0.0.1:9090"}' /etc/sing-box/config.json \
-         > "$stg/etc/sing-box/config.json" 2>/dev/null || [[ ! -s "$stg/etc/sing-box/config.json" ]]; then
+    if ! stg="$(_pdg_mktemp_dir)"; then
+      c_y "❌ 快照创建临时目录失败"; rmdir "$d" 2>/dev/null; return 1
+    fi
+    if ! mkdir -p "$stg/etc/sing-box" \
+       || ! _sb_write_sanitized /etc/sing-box/config.json "$stg/etc/sing-box/config.json"; then
       c_y "❌ 快照净化面板配置失败"; rm -rf "$stg"; rmdir "$d" 2>/dev/null; return 1
     fi
   fi
@@ -553,18 +590,39 @@ cmd_rollback(){
   target="${snaps[$idx]}"
   local f="$target/snap.tar.gz"
   [[ -f "$f" ]] || { echo "快照文件缺失: $f"; return 1; }
-  # 先校验快照里的 sing-box / nft 再动手(rule_set 路径临时指向解包目录)
-  local tmp; tmp=$(mktemp -d); tar xzf "$f" -C "$tmp"
-  if [[ -f "$tmp/etc/sing-box/config.json" ]]; then
-    sed "s#/etc/sing-box/rs/#$tmp/etc/sing-box/rs/#g" "$tmp/etc/sing-box/config.json" > "$tmp/sb.chk"
-    sing-box check -c "$tmp/sb.chk" >/dev/null 2>&1 || { echo "❌ 快照的 sing-box 配置 check 失败, 中止"; rm -rf "$tmp"; return 1; }
+  # 先完整解包、净化并校验临时树，再把同一棵树落盘；坏包/净化失败不碰现网。
+  local tmp="" tree="" members="" panel_sanitized=0
+  if ! tmp="$(_pdg_mktemp_dir)"; then echo "❌ 无法创建回滚临时目录"; return 1; fi
+  tree="$tmp/tree"; members="$tmp/members"
+  if ! mkdir -p "$tree" || ! tar tzf "$f" > "$members" 2>/dev/null || [[ ! -s "$members" ]]; then
+    echo "❌ 快照目录或成员清单读取失败, 中止"; rm -rf "$tmp"; return 1
   fi
-  [[ -f "$tmp/etc/nftables.conf" ]] && { nft -c -f "$tmp/etc/nftables.conf" >/dev/null 2>&1 || { echo "❌ 快照的 nftables 语法错, 中止"; rm -rf "$tmp"; return 1; }; }
-  rm -rf "$tmp"
+  if grep -Eq '(^/|(^|/)\.\.(/|$))' "$members" || grep -Evq '^(etc|opt)(/|$)' "$members"; then
+    echo "❌ 快照含越界路径, 中止"; rm -rf "$tmp"; return 1
+  fi
+  if ! tar xzf "$f" -C "$tree" 2>/dev/null; then
+    echo "❌ 快照解包失败, 中止"; rm -rf "$tmp"; return 1
+  fi
+  if _sb_panel_managed_on "$tree/etc/sing-box/config.json"; then
+    if ! _sb_sanitize_panel "$tree/etc/sing-box/config.json"; then
+      echo "❌ 快照面板临时态净化失败, 中止"; rm -rf "$tmp"; return 1
+    fi
+    panel_sanitized=1
+  fi
+  if [[ -f "$tree/etc/sing-box/config.json" ]]; then
+    if ! sed "s#/etc/sing-box/rs/#$tree/etc/sing-box/rs/#g" "$tree/etc/sing-box/config.json" > "$tmp/sb.chk"; then
+      echo "❌ 快照的 sing-box 校验副本生成失败, 中止"; rm -rf "$tmp"; return 1
+    fi
+    sing-box check -c "$tmp/sb.chk" >/dev/null 2>&1 || { echo "❌ 快照的 sing-box 配置 check 失败, 中止"; rm -rf "$tmp"; return 1; }
+    rm -f "$tmp/sb.chk"
+  fi
+  [[ -f "$tree/etc/nftables.conf" ]] && { nft -c -f "$tree/etc/nftables.conf" >/dev/null 2>&1 || { echo "❌ 快照的 nftables 语法错, 中止"; rm -rf "$tmp"; return 1; }; }
   echo "回滚到 $(basename "$target") …"
-  tar xzf "$f" -C /
-  # 面板是临时运行态, 不随回滚恢复: 旧快照若含受管开启态, 就地净化为关闭态(自定义 clash_api 不动)。
-  _sb_sanitize_panel /etc/sing-box/config.json && c_g "  已净化回滚出的面板临时态 → 关闭"
+  if ! _pdg_apply_snapshot_tree "$tree" "$members" /; then
+    echo "❌ 快照落盘失败, 系统可能已部分恢复, 请立即检查"; rm -rf "$tmp"; return 1
+  fi
+  rm -rf "$tmp"
+  (( panel_sanitized == 1 )) && c_g "  已净化回滚出的面板临时态 → 关闭"
   systemctl daemon-reload
   nft -f /etc/nftables.conf 2>/dev/null || true
   systemctl restart mosdns sing-box pdg-bot pdg-probe81 2>/dev/null || true

@@ -54,7 +54,7 @@ assert "临时观测/控制面板" in install_doc and "临时观测/控制面板
     "install and production docs should document the temporary panel boundary"
 )
 
-rollback = block_after(pdg, "cmd_rollback()", window=1600)
+rollback = block_after(pdg, "cmd_rollback()", window=3400)
 assert '[[ "$idx" =~ ^[0-9]+$ ]]' in rollback, "rollback index should reject non-numeric input"
 assert 'idx >= ${#snaps[@]}' in rollback, "rollback index should reject out-of-range input"
 
@@ -79,15 +79,30 @@ assert "systemctl restart systemd-journald" in rollback, (
 assert '[[ -e "/$p" ]]' in snapshot, "snapshot must only tar existing paths (legacy path may be deleted by migration)"
 assert "! tar czf" in snapshot, "snapshot must check tar return code, not report success on failure"
 
-# 面板临时态净化: snapshot 受管开启态用净化 config 入档; rollback 就地净化; 有归属判定辅助函数
+# 面板临时态净化: snapshot 用净化 config 入档; rollback 在临时树净化后再落盘。
 assert "_sb_panel_managed_on" in pdg and "_sb_sanitize_panel" in pdg, (
     "pdg.sh must provide panel-ownership + sanitize helpers for snapshot/rollback"
 )
 assert "_sb_panel_managed_on /etc/sing-box/config.json" in snapshot, (
     "snapshot must sanitize a managed-on panel config so the secret never enters the archive"
 )
-assert "_sb_sanitize_panel /etc/sing-box/config.json" in rollback, (
-    "rollback must sanitize a restored managed-on panel config (temporary state not persisted)"
+assert '_sb_sanitize_panel "$tree/etc/sing-box/config.json"' in rollback, (
+    "rollback must sanitize a managed-on panel config before it reaches the live filesystem"
+)
+
+# CLI 快照/回滚失败路径必须 fail closed：不允许空临时路径、坏包继续落盘或先落真实配置再净化。
+assert 'stg="$(_pdg_mktemp_dir)"' in snapshot, "snapshot must use checked non-empty temporary directories"
+assert 'if ! tar xzf "$f" -C "$tree"' in rollback, "rollback must stop when preflight extraction fails"
+assert '_sb_sanitize_panel "$tree/etc/sing-box/config.json"' in rollback, (
+    "rollback must sanitize the temporary extracted config before writing live files"
+)
+assert '_sb_sanitize_panel /etc/sing-box/config.json' not in rollback, (
+    "rollback must not overwrite the live config before panel sanitization"
+)
+assert 'tar tzf "$f" > "$members"' in rollback, "rollback must validate and retain the original archive member list"
+assert "快照含越界路径" in rollback, "rollback must reject archive members outside the managed etc/opt roots"
+assert '_pdg_apply_snapshot_tree "$tree" "$members" /' in rollback, (
+    "rollback must apply the validated temporary tree using the original archive member list"
 )
 
 # P2-3: mosdns cache 与 journald 修复相互独立(各自成函数, migrate_lowmem 里 mosdns 失败不 return 全函数)

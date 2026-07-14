@@ -94,4 +94,20 @@
 3. 运行 CI 中全部 Shell 回归、`bash -n` 和 ShellCheck。
 4. 运行 sing-box/mosdns 功能测试和出站 schema 测试。
 5. 运行 `git diff --check`，检查工作树与差异统计。
-6. 逐项对照设计成功标准；只提交与本计划直接相关的文件，不推送、不打 tag、不发 release。
+6. 逐项对照设计成功标准；只提交与本计划直接相关的文件。
+
+## 任务 7：收紧 CLI 快照/回滚失败路径
+
+**文件：**
+
+- 修改：`tests/test-panel-snapshot.sh`
+- 修改：`tests/test-maintenance-polish.py`
+- 修改：`deploy/bot/pdg.sh`
+
+**步骤：**
+
+1. 新增失败回归：第三方 `external_ui_download_url` 必须判为自定义；临时目录创建失败不得产生空路径；净化写入失败必须保留原文件并返回失败；净化副本与恢复后的 `config.json` 必须保持 `0600`。
+2. 新增静态回归：回滚预解包、正式落盘和净化步骤都必须检查失败；净化必须在临时解包目录完成，不能先覆盖 `/etc/sing-box/config.json` 再补救。
+3. 运行 `bash tests/test-panel-snapshot.sh` 与 `python3 tests/test-maintenance-polish.py`，确认旧实现因上述四项缺口失败。
+4. 最小实现：统一 CLI 与 Bot 的受管下载地址规则；检查 `mktemp`/目录创建；用同目录临时文件加原子替换净化；快照副本固定 `0600`；回滚从已验证且已净化的临时树按原成员清单精确落盘，并传播所有错误。
+5. 重跑定向测试，并执行任务 6 的完整验证；直接推送 `main`，不移动 `v1.4.0` 标签、不创建 Release。
