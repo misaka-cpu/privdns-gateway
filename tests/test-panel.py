@@ -226,7 +226,8 @@ print("[OK]   定时到期: 自动关面板 + 删链接消息")
 
 # 手动关也删链接 + 取消定时器
 bot.set_panel(True); bot._panel_arm(7, 555, 3600)
-bot._panel_cancel_timer(); bot._panel_delete_link()
+ok, msg = bot._panel_close(7)
+assert ok, msg
 assert bot._panel_timer is None and bot._panel_link is None and (7, 555) in deleted
 print("[OK]   手动关: 取消定时器 + 删链接消息")
 

@@ -1082,23 +1082,6 @@ def _cancel_timer_obj(timer):
         except Exception:  # noqa: BLE001
             pass
 
-def _panel_cancel_timer():
-    global _panel_timer, _panel_generation
-    with _panel_state_lock:
-        timer = _panel_timer
-        _panel_timer = None
-        _panel_generation += 1
-    _cancel_timer_obj(timer)
-
-def _panel_delete_link():
-    """删掉当前含密钥链接；网络失败不改变本地状态。"""
-    global _panel_link
-    with _panel_state_lock:
-        link = _panel_link
-        _panel_link = None
-    if link:
-        delete_message(*link)
-
 def _panel_clear_state(generation=None):
     """成功关闭后的统一清理；generation 不匹配时绝不碰新会话。"""
     global _panel_timer, _panel_link, _panel_chat, _panel_generation

@@ -29,9 +29,9 @@ SB="$(echo "$WORK"/sing-box-*/sing-box)"
 echo "[*] $("$SB" version | head -1)"
 
 # 用 parse_link 拼各协议出站 → 写最小 config(占位但字段合法的值)
-python3 - "$ROOT" "$WORK/cfg.json" <<'PY'
+python3 - "$ROOT" "$WORK/cfg.json" "$ZASHBOARD_VER" <<'PY'
 import base64, json, sys, os, importlib.util
-root, out = sys.argv[1], sys.argv[2]
+root, out, zash_ver = sys.argv[1:4]
 spec = importlib.util.spec_from_file_location("b", os.path.join(root, "deploy/bot/pdg-bot.py"))
 b = importlib.util.module_from_spec(spec)
 try:
@@ -62,7 +62,11 @@ print("[*] 出站类型:", [o["type"] for o in obs])
 cfg = {"log": {"level": "error"},
        "inbounds": [{"type": "mixed", "tag": "in", "listen": "127.0.0.1", "listen_port": 12345}],
        "outbounds": obs + [{"type": "direct", "tag": "direct"}],
-       "route": {"final": "direct"}}
+       "route": {"final": "direct"},
+       "experimental": {"clash_api": {
+           "external_controller": "0.0.0.0:9090", "secret": "schema-test",
+           "external_ui": "/etc/sing-box/ui/dist",
+           "external_ui_download_url": f"https://github.com/Zephyruso/zashboard/releases/download/{zash_ver}/dist-no-fonts.zip"}}}
 json.dump(cfg, open(out, "w"), ensure_ascii=False)
 PY
 [ -f "$WORK/cfg.json" ] || fail "拼 config 失败(parse_link 出错?)"
@@ -70,4 +74,4 @@ PY
 echo "[*] sing-box check(锁定版 $SINGBOX_VER)…"
 "$SB" check -c "$WORK/cfg.json" \
   || fail "sing-box check 不过: parse_link 生成的出站与锁定版 $SINGBOX_VER 的 schema 不符"
-echo "✅ 各协议出站在锁定版 sing-box $SINGBOX_VER 下 schema 校验通过"
+echo "✅ 各协议出站 + 面板 clash_api 在锁定版 sing-box $SINGBOX_VER 下 schema 校验通过"
