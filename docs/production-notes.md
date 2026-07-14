@@ -98,6 +98,7 @@ gvt2.com / gvt3.com / android.com`，`systemctl restart dnsdist` 生效。
 ### sing-box 加 clash_api + 故障切换组
 - `experimental.clash_api`(127.0.0.1:9090，仅本机) + `cache_file`(/etc/sing-box/cache.db，持久化 urltest 选择)。
   官方 1.12.25 二进制自带 clash_api。
+- Bot 的“临时观测/控制面板”会在用户明确开启时，把受管 clash_api 临时切到 `0.0.0.0:9090`，配随机密钥并仅放行内网卡段。Zashboard 可查看流量/连接并断开连接；持久配置仍由 Bot/CLI 管理。关闭、到时或 Bot 重启后收回本地监听，检测到自定义 clash_api 时不接管。
 - 新增 `urltest` 故障切换组 **`auto` = [hk, tw, us]**（`url`=generate_204，interval 3m，tolerance 50）；
   自动选最快、成员故障自动切换。**故意不含 jp(direct)**——JP 本机直连延迟最低(14ms)会永远胜出，失去多出口意义。
   默认 `route.final` 仍 = hk；想要“最快+故障切换”把默认出口设成 auto 即可。

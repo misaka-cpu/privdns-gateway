@@ -166,8 +166,11 @@ cmd_status(){
   done
   echo "  timer        $(systemctl is-active pdg-rules-update.timer 2>/dev/null)"
   echo "  DoT 域名     $(cat /opt/pdg-bot/dot-domain 2>/dev/null || echo ?)"
-  local ports
-  ports=$(ss -lntu 2>/dev/null | grep -oE ':(53|80|81|443|853|8445|9090)\b' | sed 's/^://' | sort -u | sed 's/^9090$/9090(local clash_api)/' | tr '\n' ' ')
+  local ports p9090="9090(local clash_api)"
+  if jq -e '.experimental.clash_api as $c | $c.external_controller == "0.0.0.0:9090" and $c.external_ui == "/etc/sing-box/ui/dist" and (($c.secret // "") | length > 0)' /etc/sing-box/config.json >/dev/null 2>&1; then
+    p9090="9090(panel临时内网)"
+  fi
+  ports=$(ss -lntu 2>/dev/null | grep -oE ':(53|80|81|443|853|8445|9090)\b' | sed 's/^://' | sort -u | sed "s|^9090$|$p9090|" | tr '\n' ' ')
   echo "  监听端口     $ports"
   if [[ -d "$REPO_DIR/.git" ]]; then echo "  代码版本     $(git -C "$REPO_DIR" describe --tags --always 2>/dev/null)"; fi
   local lm cache; lm="$(pdg_lowmem_current)"; cache="$(awk '/tag: lazy_cache/{f=1} f&&/size:/{print $2; exit}' /etc/mosdns/config.yaml 2>/dev/null)"

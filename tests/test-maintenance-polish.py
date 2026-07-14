@@ -6,6 +6,8 @@ ROOT = Path(__file__).resolve().parents[1]
 bot = (ROOT / "deploy/bot/pdg-bot.py").read_text(encoding="utf-8")
 pdg = (ROOT / "deploy/bot/pdg.sh").read_text(encoding="utf-8")
 report = (ROOT / "deploy/bot/report.py").read_text(encoding="utf-8")
+install_doc = (ROOT / "docs/INSTALL.md").read_text(encoding="utf-8")
+prod_doc = (ROOT / "docs/production-notes.md").read_text(encoding="utf-8")
 
 
 def block_after(text: str, marker: str, window: int = 900) -> str:
@@ -35,7 +37,22 @@ assert '3) cmd_update && exec /usr/local/bin/pdg menu;;' in pdg, (
     "after a successful menu update, pdg should re-exec the freshly installed script"
 )
 
-assert '9090(local clash_api)' in pdg, "status output should label 9090 as local clash_api, not a normal exposed port"
+assert '9090(local clash_api)' in pdg, "status should retain the default local clash_api label"
+assert '9090(panel临时内网)' in pdg and 'external_controller' in pdg, (
+    "status should label a managed 0.0.0.0:9090 controller as a temporary LAN panel"
+)
+
+panel = block_after(bot, 'if data == "panel":', window=1250)
+assert "临时观测/控制面板" in panel and "断开连接" in panel, (
+    "panel copy should describe native Zashboard control capability accurately"
+)
+assert "只能观测" not in panel, "panel copy must not claim read-only behavior"
+assert 'send_plain(chat, "✅ 观测面板已开启' not in panel, (
+    "panel open flow must not leave a success message behind when sending the secret link fails"
+)
+assert "临时观测/控制面板" in install_doc and "临时观测/控制面板" in prod_doc, (
+    "install and production docs should document the temporary panel boundary"
+)
 
 rollback = block_after(pdg, "cmd_rollback()", window=1600)
 assert '[[ "$idx" =~ ^[0-9]+$ ]]' in rollback, "rollback index should reject non-numeric input"

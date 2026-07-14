@@ -808,20 +808,68 @@ def set_tfo(on):
     return ok, ((f"✅ TFO 已{'开启' if on else '关闭'}(出口+入口)\n"
                  "降到落地的握手延迟; 需落地端也支持, 否则自动回落普通握手。") if ok else msg)
 
-# ── 观测面板 (zashboard, 由 sing-box external_ui 托管在 clash_api 端口) ──────────
+# ── 临时观测/控制面板 (zashboard, 由 sing-box external_ui 托管) ──────────────
 # 默认关闭=零暴露: clash_api 只绑 127.0.0.1、无 secret、防火墙不放行 9090。
-# 开启=临时把 clash_api 绑 0.0.0.0 + 随机 secret + external_ui, 并放行"仅内网卡段"→9090,
-# 发一条 zashboard 一键链接(#/setup 自带 host/port/secret)。关闭撤销全部改动。
+# 开启=临时把 clash_api 绑 0.0.0.0 + 随机 secret + 固定来源 external_ui,
+# 并放行"仅内网卡段"→9090。只接管本项目的精确配置形态, 不覆盖用户自定义 clash_api。
 PANEL_PORT = 9090
+PANEL_LOCAL = "127.0.0.1:%d" % PANEL_PORT
+PANEL_LISTEN = "0.0.0.0:%d" % PANEL_PORT
 UI_DIR = "/etc/sing-box/ui"
-ZASH_URL = "https://github.com/Zephyruso/zashboard/releases/download/v3.15.0/dist-no-fonts.zip"
-ZASH_SHA = "403b351d3663f5fe65db053cb2f3dc980108d8f86e8c6968d56164d3452592e1"
 UI_DIST = os.path.join(UI_DIR, "dist")
+UI_META = os.path.join(UI_DIR, ".pdg-zashboard.json")
+VERSIONS_FILE = os.environ.get("PDG_VERSIONS_FILE", "/opt/privdns-gateway/lib/versions.sh")
+
+def _load_zashboard_pin():
+    """从项目版本清单读取 zashboard 版本与 SHA；缺失时失败关闭，不另设第二份常量。"""
+    repo_versions = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "lib", "versions.sh"))
+    for path in dict.fromkeys((VERSIONS_FILE, repo_versions)):
+        try:
+            text = open(path, encoding="utf-8").read()
+        except OSError:
+            continue
+        ver = re.search(r'^ZASHBOARD_VER="([^"]+)"', text, re.M)
+        sha = re.search(r'^\s*\[zashboard\]="([0-9a-f]{64})"', text, re.M)
+        if ver and sha:
+            return ver.group(1), sha.group(1)
+    return "", ""
+
+ZASHBOARD_VER, ZASH_SHA = _load_zashboard_pin()
+ZASH_URL = ("https://github.com/Zephyruso/zashboard/releases/download/%s/dist-no-fonts.zip"
+            % ZASHBOARD_VER) if ZASHBOARD_VER else ""
+
+def _panel_state(c=None):
+    """返回 off / on / custom；on 同时识别升级前未写 download_url 的受管形态。"""
+    if c is None:
+        c = load()
+    api = c.get("experimental", {}).get("clash_api", {}) or {}
+    if not isinstance(api, dict):
+        return "custom"
+    controller = api.get("external_controller", "")
+    transient = ("secret", "external_ui", "external_ui_download_url")
+    if controller == PANEL_LOCAL and not any(k in api for k in transient):
+        return "off"
+    download = api.get("external_ui_download_url")
+    managed_download = (not download or re.fullmatch(
+        r"https://github\.com/Zephyruso/zashboard/releases/download/[^/]+/dist-no-fonts\.zip", download))
+    if (controller == PANEL_LISTEN and api.get("secret") and api.get("external_ui") == UI_DIST
+            and managed_download):
+        return "on"
+    return "custom"
 
 def _panel_on(c=None):
-    c = c or load()
-    ec = (c.get("experimental", {}).get("clash_api", {}) or {}).get("external_controller", "")
-    return ec.startswith("0.0.0.0")
+    return _panel_state(c) == "on"
+
+def _panel_sanitize_config(c):
+    """只把本项目受管开启态收回本地；自定义 clash_api 原样保留。"""
+    if _panel_state(c) != "on":
+        return False
+    api = c["experimental"]["clash_api"]
+    api["external_controller"] = PANEL_LOCAL
+    api.pop("secret", None)
+    api.pop("external_ui", None)
+    api.pop("external_ui_download_url", None)
+    return True
 
 def _panel_cidr():
     """从防火墙现有放行规则读内网卡段(和 853/443 同源门控)。"""
@@ -829,35 +877,128 @@ def _panel_cidr():
     m = re.search(r"ip saddr ([0-9.]+/[0-9]+) tcp dport", out)
     return m.group(1) if m else ""
 
+def _ui_fingerprint(root):
+    """稳定计算 UI 目录内容指纹；路径也参与哈希，避免文件换名绕过。"""
+    if not os.path.isdir(root) or os.path.islink(root):
+        return ""
+    digest = hashlib.sha256()
+    for base, dirs, files in os.walk(root):
+        dirs[:] = sorted(d for d in dirs if not os.path.islink(os.path.join(base, d)))
+        for name in sorted(files):
+            path = os.path.join(base, name)
+            if os.path.islink(path):
+                return ""
+            rel = os.path.relpath(path, root).replace(os.sep, "/")
+            digest.update(rel.encode() + b"\0")
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                    digest.update(chunk)
+    return digest.hexdigest()
+
+def _zashboard_current():
+    try:
+        meta = json.load(open(UI_META, encoding="utf-8"))
+        return (meta.get("version") == ZASHBOARD_VER
+                and meta.get("archive_sha256") == ZASH_SHA
+                and meta.get("tree_sha256") == _ui_fingerprint(UI_DIST)
+                and os.path.isfile(os.path.join(UI_DIST, "index.html")))
+    except Exception:  # noqa: BLE001
+        return False
+
 def _ensure_zashboard():
-    """下载并校验 zashboard dist 到 UI_DIST(已有 index.html 则跳过)。返回 (ok, err)。"""
-    if os.path.exists(os.path.join(UI_DIST, "index.html")):
+    """验证或原子安装固定版本 zashboard；内容被替换时自动恢复。"""
+    if not ZASHBOARD_VER or not ZASH_SHA or not ZASH_URL:
+        return False, "读不到 zashboard 版本清单, 拒绝开启"
+    if _zashboard_current():
         return True, ""
+    stage = old = None
     try:
         data = _fetch_bytes(ZASH_URL)
         if hashlib.sha256(data).hexdigest() != ZASH_SHA:
             return False, "zashboard 校验失败(SHA256 不符, 拒绝安装)"
         os.makedirs(UI_DIR, exist_ok=True)
+        stage = tempfile.mkdtemp(prefix=".zashboard-", dir=UI_DIR)
         import zipfile
         with zipfile.ZipFile(io.BytesIO(data)) as z:
-            z.extractall(UI_DIR)
-        return (True, "") if os.path.exists(os.path.join(UI_DIST, "index.html")) else (False, "解压后缺 index.html")
+            for info in z.infolist():
+                name = info.filename.replace("\\", "/")
+                if name.startswith("/") or ".." in name.split("/") or (info.external_attr >> 16) & 0o170000 == 0o120000:
+                    return False, "zashboard 压缩包含不安全路径, 拒绝安装"
+            z.extractall(stage)
+        staged_dist = os.path.join(stage, "dist")
+        if not os.path.isfile(os.path.join(staged_dist, "index.html")):
+            return False, "解压后缺 index.html"
+        tree_sha = _ui_fingerprint(staged_dist)
+        if not tree_sha:
+            return False, "zashboard 内容指纹生成失败"
+        old = UI_DIST + ".pdg-old"
+        shutil.rmtree(old, ignore_errors=True)
+        if os.path.lexists(UI_DIST):
+            os.replace(UI_DIST, old)
+        try:
+            os.replace(staged_dist, UI_DIST)
+        except Exception:
+            if os.path.lexists(old) and not os.path.lexists(UI_DIST):
+                os.replace(old, UI_DIST)
+            raise
+        shutil.rmtree(old, ignore_errors=True)
+        old = None
+        meta_tmp = UI_META + ".tmp"
+        with open(meta_tmp, "w", encoding="utf-8") as f:
+            json.dump({"version": ZASHBOARD_VER, "archive_sha256": ZASH_SHA,
+                       "tree_sha256": tree_sha}, f, ensure_ascii=False)
+        os.replace(meta_tmp, UI_META)
+        return True, ""
     except Exception as e:  # noqa: BLE001
         return False, "下载/解压失败: " + type(e).__name__
+    finally:
+        if stage:
+            shutil.rmtree(stage, ignore_errors=True)
+        # 替换失败时保留 .pdg-old 供人工恢复；成功路径已在上面主动删除。
 
-def _panel_firewall(on, cidr):
-    """放行/撤销 内网卡段 → 9090(带 comment 便于幂等删除)。ephemeral: nft 重载会掉, 用时开即可。"""
-    out = sh(["nft", "-a", "list", "chain", "inet", "pdg", "input"]).stdout
+def _panel_firewall_apply(on, cidr):
+    """放行/撤销 内网卡段 → 9090，并核验最终状态。返回 (ok, err)。"""
+    listed = sh(["nft", "-a", "list", "chain", "inet", "pdg", "input"])
+    if listed.returncode != 0:
+        return False, "nft list 失败: " + (listed.stdout + listed.stderr)[-200:]
+    out = listed.stdout
     for ln in out.splitlines():
         if "pdg-panel" in ln:
             m = re.search(r"handle (\d+)", ln)
             if m:
-                sh(["nft", "delete", "rule", "inet", "pdg", "input", "handle", m.group(1)])
+                r = sh(["nft", "delete", "rule", "inet", "pdg", "input", "handle", m.group(1)])
+                if r.returncode != 0:
+                    return False, "nft delete 失败: " + (r.stdout + r.stderr)[-200:]
     if on and cidr:
-        sh(["nft", "insert", "rule", "inet", "pdg", "input", "ip", "saddr", cidr,
-            "tcp", "dport", str(PANEL_PORT), "accept", "comment", "pdg-panel"])
+        r = sh(["nft", "insert", "rule", "inet", "pdg", "input", "ip", "saddr", cidr,
+                "tcp", "dport", str(PANEL_PORT), "accept", "comment", "pdg-panel"])
+        if r.returncode != 0:
+            return False, "nft insert 失败: " + (r.stdout + r.stderr)[-200:]
+    verified = sh(["nft", "-a", "list", "chain", "inet", "pdg", "input"])
+    if verified.returncode != 0:
+        return False, "nft verify 失败: " + (verified.stdout + verified.stderr)[-200:]
+    managed = [ln for ln in verified.stdout.splitlines() if "pdg-panel" in ln]
+    if on and not any(cidr in ln and str(PANEL_PORT) in ln for ln in managed):
+        return False, "nft verify 失败: 未找到内网 9090 放行规则"
+    if not on and managed:
+        return False, "nft verify 失败: 9090 放行规则仍存在"
+    return True, ""
 
-def set_panel(on):
+def _panel_firewall(on, cidr):
+    try:
+        return _panel_firewall_apply(on, cidr)
+    except Exception as e:  # noqa: BLE001
+        return False, "nft 操作异常(%s)" % type(e).__name__
+
+_panel_op_lock = threading.Lock()
+
+def _set_panel(on):
+    try:
+        state_now = _panel_state()
+    except Exception as e:  # noqa: BLE001
+        return False, "读取 clash_api 配置失败: " + type(e).__name__
+    if state_now == "custom":
+        return False, "检测到自定义 clash_api 配置, 为避免覆盖已保持原样"
     if on:
         cidr = _panel_cidr()
         if not cidr:
@@ -868,66 +1009,182 @@ def set_panel(on):
         secret = uuid.uuid4().hex
         def mod(c):
             api = c.setdefault("experimental", {}).setdefault("clash_api", {})
-            api["external_controller"] = "0.0.0.0:%d" % PANEL_PORT
+            api["external_controller"] = PANEL_LISTEN
             api["secret"] = secret
             api["external_ui"] = UI_DIST
+            api["external_ui_download_url"] = ZASH_URL
         ok, msg = apply_sb(mod)
         if not ok:
             return False, msg
-        _panel_firewall(True, cidr)
+        fw_ok, fw_msg = _panel_firewall(True, cidr)
+        if not fw_ok:
+            rb_ok, rb_msg = apply_sb(_panel_sanitize_config)
+            clean_ok, clean_msg = _panel_firewall(False, cidr)
+            detail = "防火墙开启失败: " + fw_msg
+            if not rb_ok or not clean_ok:
+                detail += "; 回滚不完整: " + (rb_msg if not rb_ok else clean_msg)
+            return False, detail
         ip = _server_ip()
         link = "http://%s:%d/ui/#/setup?hostname=%s&port=%d&secret=%s" % (ip, PANEL_PORT, ip, PANEL_PORT, secret)
         secret = None
         return True, link
-    def mod(c):
-        api = c.setdefault("experimental", {}).setdefault("clash_api", {})
-        api["external_controller"] = "127.0.0.1:%d" % PANEL_PORT
-        api.pop("secret", None); api.pop("external_ui", None)
-    ok, msg = apply_sb(mod)
-    if not ok:
-        return False, msg
-    _panel_firewall(False, _panel_cidr())
+    if state_now == "on":
+        ok, msg = apply_sb(_panel_sanitize_config)
+        if not ok:
+            return False, msg
+    fw_ok, fw_msg = _panel_firewall(False, _panel_cidr())
+    if not fw_ok:
+        return False, "clash_api 已收回本地, 但撤销防火墙失败: " + fw_msg
     return True, "✅ 观测面板已关闭(clash_api 收回 127.0.0.1、撤销内网 9090 放行)。"
 
-# ── 面板定时自动关闭(到点关面板 + 删含密钥的链接消息, 忘了关也有暴露上限)──
-_panel_timer = None            # threading.Timer 或 None
-_panel_link = None             # (chat, message_id) 含密钥的链接消息, 供自动删除
-
-def _panel_cancel_timer():
-    global _panel_timer
-    if _panel_timer is not None:
+def set_panel(on):
+    with _panel_op_lock:
         try:
-            _panel_timer.cancel()
+            return _set_panel(on)
+        except Exception as e:  # noqa: BLE001
+            return False, "面板操作异常(%s)" % type(e).__name__
+
+# ── 面板定时自动关闭(会话代号隔离旧回调；关闭失败保留状态并重试) ──────────────
+PANEL_RETRY_SECONDS = 60
+_panel_timer = None            # threading.Timer 或 None
+_panel_link = None             # (chat, message_id) 含密钥的链接消息
+_panel_chat = None             # 无链接时也保留通知对象
+_panel_generation = 0          # 每次重新开启/取消都递增，旧回调见到不一致即退出
+_panel_state_lock = threading.Lock()
+
+def _cancel_timer_obj(timer):
+    if timer is not None:
+        try:
+            timer.cancel()
         except Exception:  # noqa: BLE001
             pass
+
+def _panel_cancel_timer():
+    global _panel_timer, _panel_generation
+    with _panel_state_lock:
+        timer = _panel_timer
         _panel_timer = None
-
-def _panel_autoclose():
-    """定时到期: 关面板 → 删掉含密钥的链接消息 → 通知。"""
-    global _panel_timer
-    _panel_timer = None
-    ok, _ = set_panel(False)
-    ch = _panel_link[0] if _panel_link else None
-    _panel_delete_link()
-    if ch:
-        send_plain(ch, "⏱ 观测面板已到时自动关闭,上面那条链接已失效。" if ok
-                       else "⏱ 到时自动关闭观测面板时出错,请手动点「🔒 关闭」确认。")
-
-def _panel_arm(chat, link_mid, ttl):
-    """记录链接消息 + 按 ttl(秒)排自动关闭定时器; ttl<=0 = 常开不排。"""
-    global _panel_timer, _panel_link
-    _panel_cancel_timer()
-    _panel_link = (chat, link_mid) if link_mid else None
-    if ttl > 0:
-        _panel_timer = threading.Timer(ttl, _panel_autoclose)
-        _panel_timer.daemon = True
-        _panel_timer.start()
+        _panel_generation += 1
+    _cancel_timer_obj(timer)
 
 def _panel_delete_link():
-    """删掉含密钥的链接消息(手动关/自动关都调)。"""
+    """删掉当前含密钥链接；网络失败不改变本地状态。"""
     global _panel_link
-    if _panel_link:
-        delete_message(*_panel_link); _panel_link = None
+    with _panel_state_lock:
+        link = _panel_link
+        _panel_link = None
+    if link:
+        delete_message(*link)
+
+def _panel_clear_state(generation=None):
+    """成功关闭后的统一清理；generation 不匹配时绝不碰新会话。"""
+    global _panel_timer, _panel_link, _panel_chat, _panel_generation
+    with _panel_state_lock:
+        if generation is not None and generation != _panel_generation:
+            return False
+        timer, link = _panel_timer, _panel_link
+        _panel_timer = _panel_link = _panel_chat = None
+        _panel_generation += 1
+    _cancel_timer_obj(timer)
+    if link:
+        delete_message(*link)
+    return True
+
+def _panel_schedule_retry(chat=None, generation=None):
+    """关闭失败时把当前计时器替换为短间隔重试，不重复堆积。"""
+    global _panel_timer, _panel_chat, _panel_generation
+    with _panel_state_lock:
+        if generation is not None and generation != _panel_generation:
+            return False
+        old_timer = _panel_timer
+        if _panel_generation == 0:
+            _panel_generation = 1
+        if chat is not None:
+            _panel_chat = chat
+        current = _panel_generation
+        timer = threading.Timer(PANEL_RETRY_SECONDS, _panel_autoclose, args=(current,))
+        timer.daemon = True
+        _panel_timer = timer
+    _cancel_timer_obj(old_timer)
+    timer.start()
+    return True
+
+def _panel_autoclose(generation=None):
+    """定时到期：只处理当前会话；失败保留链接并自动重试。"""
+    global _panel_timer
+    with _panel_state_lock:
+        current = _panel_generation if generation is None else generation
+        if current != _panel_generation:
+            return
+        _panel_timer = None
+        chat = _panel_chat
+    ok, msg = set_panel(False)
+    if ok:
+        if _panel_clear_state(current) and chat:
+            send_plain(chat, "⏱ 观测面板已到时自动关闭,上面那条链接已失效。")
+        return
+    if _panel_schedule_retry(chat, current) and chat:
+        send_plain(chat, "⏱ 自动关闭观测面板失败,将在 60 秒后重试: " + msg)
+
+def _panel_arm(chat, link_mid, ttl):
+    """记录新会话并按 ttl 排自动关闭；重新开启会删旧链接。ttl<=0 为常开。"""
+    global _panel_timer, _panel_link, _panel_chat, _panel_generation
+    with _panel_state_lock:
+        old_timer, old_link = _panel_timer, _panel_link
+        _panel_generation += 1
+        current = _panel_generation
+        new_link = (chat, link_mid) if link_mid else None
+        _panel_link = new_link
+        _panel_chat = chat
+        timer = threading.Timer(ttl, _panel_autoclose, args=(current,)) if ttl > 0 else None
+        if timer:
+            timer.daemon = True
+        _panel_timer = timer
+    _cancel_timer_obj(old_timer)
+    if old_link and old_link != new_link:
+        delete_message(*old_link)
+    if timer:
+        timer.start()
+
+def _panel_close(chat=None):
+    """手动关闭：成功后才清理链接；失败时保留并补重试计时器。"""
+    with _panel_state_lock:
+        generation = _panel_generation
+    ok, msg = set_panel(False)
+    if ok:
+        _panel_clear_state(generation)
+    else:
+        _panel_schedule_retry(chat, generation)
+    return ok, msg
+
+def _panel_publish(chat, link, ttl):
+    """发送含密钥链接并开始计时；发送失败时立即收回面板。"""
+    link_mid = send_get_mid(chat, "✅ 临时观测/控制面板已开启（链接含密钥，请勿转发）:\n" + link)
+    if link_mid:
+        _panel_arm(chat, link_mid, ttl)
+        return True, ""
+    closed, close_msg = set_panel(False)
+    _panel_clear_state()
+    if not closed:
+        _panel_schedule_retry(chat)
+        return False, "面板链接发送失败，且关闭失败，将自动重试: " + close_msg
+    return False, "面板链接发送失败，已自动关闭面板"
+
+def _panel_startup_cleanup():
+    """bot 重启后只清理本项目受管状态；自定义 clash_api 不动。"""
+    try:
+        state_now = _panel_state()
+    except Exception as e:  # noqa: BLE001
+        return False, "读取 clash_api 配置失败: " + type(e).__name__
+    if state_now == "custom":
+        return False, "检测到自定义 clash_api 配置, 启动清理未改动"
+    if state_now == "on":
+        ok, msg = set_panel(False)
+        if not ok:
+            _panel_schedule_retry()
+        return ok, msg
+    ok, msg = _panel_firewall(False, _panel_cidr())
+    return (True, "panel: 默认关闭态已确认") if ok else (False, msg)
 
 def send_get_mid(chat, text):
     """发纯文本(不解析 HTML, 保链接可点)并返回 message_id, 供之后删除。"""
@@ -1629,6 +1886,14 @@ def backup_blob():
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
         for p in BACKUP_FILES:
             if os.path.exists(p):
+                if p == SB:
+                    cfg = json.load(open(p))
+                    if _panel_sanitize_config(cfg):
+                        raw = json.dumps(cfg, ensure_ascii=False, indent=2).encode()
+                        info = tar.gettarinfo(p, arcname=p.lstrip("/"))
+                        info.size = len(raw)
+                        tar.addfile(info, io.BytesIO(raw))
+                        continue
                 tar.add(p, arcname=p.lstrip("/"))
         if os.path.isdir(RS_DIR):
             tar.add(RS_DIR, arcname=RS_DIR.lstrip("/"))
@@ -1688,6 +1953,10 @@ def restore_from(data):
                     for old, new in subs:
                         s = s.replace(old, new)
                     open(f, "w").write(s)
+        # 面板是临时运行态，不随备份恢复。只净化本项目受管形态，自定义 clash_api 保持原样。
+        cfg = json.load(open(newsb))
+        if _panel_sanitize_config(cfg):
+            json.dump(cfg, open(newsb, "w"), ensure_ascii=False, indent=2)
         # 校验前把 rule_set 的绝对路径临时指向解包出来的 rs/ —— 否则 check 会去找真实位置
         # (备份里带着这些 rs 文件, 但此刻还没恢复到 /etc/sing-box/rs/, 直接 check 会 "no such file")。
         checksb = newsb
@@ -2038,9 +2307,9 @@ def handle_cb(chat, mid, data):
         ok, msg = set_tfo(data == "tfo:on"); edit(chat, mid, msg if ok else ("❌ " + msg), OPS_BACK); return
     if data == "panel":
         on = _panel_on()
-        edit(chat, mid, "📊 <b>观测面板 (zashboard)</b>\n"
+        edit(chat, mid, "📊 <b>临时观测/控制面板 (zashboard)</b>\n"
              f"当前: <b>{'开启' if on else '关闭'}</b>\n"
-             "看连接/流量/延迟/日志、右键测速。<b>只能观测, 改配置仍走 bot</b>。\n"
+             "可看连接/流量/延迟/日志、测速并断开连接；<b>持久配置仍走 bot/CLI</b>。\n"
              "开启 = clash_api 临时绑 0.0.0.0 + 随机密钥 + 放行<b>仅内网卡段</b>→9090, 发一键链接。\n"
              "选自动关闭时长: 到点自动关面板 + 删掉含密钥的链接(忘了关也有暴露上限)。\n"
              "⚠️ HTTP 明文、链接含密钥(别转发)。",
@@ -2055,20 +2324,19 @@ def handle_cb(chat, mid, data):
         edit(chat, mid, "正在开启观测面板(首次会下载 zashboard、改 clash_api、放行内网 9090)…", OPS_BACK)
         ok, res = set_panel(True)
         if ok:
-            send_plain(chat, "✅ 观测面板已开启。手机在<b>内网卡</b>下点开下面链接直接进面板(已自带密钥):")
-            link_mid = send_get_mid(chat, res)   # 单独纯文本, 保链接可点; 记 id 供到时删除
-            _panel_arm(chat, link_mid, mins * 60)
-            tip = (f"⏱ {mins} 分钟后自动关闭并删除上面的链接。" if mins > 0
-                   else "🔓 常开模式: 不自动关闭, 看完请手动点「🔒 关闭」。")
-            edit(chat, mid, "✅ 已开启(链接见上一条)。" + tip + "\n"
-                            "⚠️ 链接含密钥别转发。首次打不开多半是手机没走内网卡到 9090, 换内网卡/专线再试。", OPS_BACK)
+            published, publish_msg = _panel_publish(chat, res, mins * 60)
+            if published:
+                tip = (f"⏱ {mins} 分钟后自动关闭并删除上面的链接。" if mins > 0
+                       else "🔓 常开模式: 不自动关闭, 看完请手动点「🔒 关闭」。")
+                edit(chat, mid, "✅ 已开启，含密钥链接已单独发送。" + tip + "\n"
+                                "⚠️ 链接含密钥别转发。首次打不开多半是手机没走内网卡到 9090, 换内网卡/专线再试。", OPS_BACK)
+            else:
+                edit(chat, mid, "❌ " + publish_msg, OPS_BACK)
         else:
             edit(chat, mid, "❌ 开启失败: " + res, OPS_BACK)
         return
     if data == "panel:off":
-        _panel_cancel_timer()
-        ok, msg = set_panel(False)
-        _panel_delete_link()                     # 手动关也删掉含密钥的链接消息
+        ok, msg = _panel_close(chat)
         edit(chat, mid, msg if ok else ("❌ " + msg), OPS_BACK); return
     if data == "restart":
         ok, msg = apply_sb(lambda c: None); sh(["systemctl", "restart", "mosdns"])
@@ -2273,12 +2541,9 @@ def main():
     post("setMyCommands", {"commands": cmds})
     post("setMyCommands", {"commands": cmds, "scope": {"type": "all_private_chats"}})
     print("pdg-bot v3 started, allowed:", ALLOWED, flush=True)
-    try:                                   # 兜底: 上次留下的面板(bot 重启后定时器已丢)直接关掉, 限制暴露
-        if _panel_on():
-            set_panel(False)               # 配置仍开 → 完整关闭(含撤防火墙)
-            print("panel: closed leftover panel on startup", flush=True)
-        else:
-            _panel_firewall(False, _panel_cidr())   # 配置已关但可能残留放行规则(如中途崩溃)→ 清掉
+    try:                                   # 兜底: bot 重启后核验并收回本项目遗留的临时面板
+        panel_ok, panel_msg = _panel_startup_cleanup()
+        print(panel_msg if panel_ok else ("panel startup close failed: " + panel_msg), flush=True)
     except Exception as e:  # noqa: BLE001
         print("panel startup close err", type(e).__name__, flush=True)
     off = 0
