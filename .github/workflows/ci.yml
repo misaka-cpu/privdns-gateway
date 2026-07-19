@@ -121,6 +121,9 @@ jobs:
       - name: "sb2mihomo 渲染层回归 (sing-box 配置→mihomo 各协议/组/规则映射)"
         run: python3 tests/test-sb2mihomo.py
 
+      - name: "bot 内核后端切换回归 (mihomo/singbox 分支 + apply_sb 事务回滚)"
+        run: python3 tests/test-mihomo-backend.py
+
   functional:
     # 真功能测试: 下载钉死 SHA256 的 sing-box / mosdns, 真起一遍, 验证两层核心链路。
     runs-on: ubuntu-latest

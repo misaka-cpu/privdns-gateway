@@ -20,6 +20,14 @@ TOKEN = os.environ.get("PDG_BOT_TOKEN", "")
 ALLOWED = {int(x) for x in os.environ.get("PDG_BOT_ALLOWED", "").replace(" ", "").split(",") if x}
 SB = "/etc/sing-box/config.json"
 RS_DIR = "/etc/sing-box/rs"
+# ── 内核后端(原型: sing-box | mihomo)──────────────────────────────────────────
+# model 始终以 SB(sing-box JSON)为唯一数据源; mihomo 模式下由 sb2mihomo 渲染成 YAML 再跑。
+# 所有出口/规则/故障组管理代码不变(仍改 SB), 只有 apply 的"校验+重启核心"这层按后端分支。
+MIHOMO_DIR = "/etc/mihomo"
+MIHOMO_CFG = MIHOMO_DIR + "/config.yaml"
+MIHOMO_BIN = "mihomo"
+MIHOMO_REDIR = 7893
+BACKEND_MARKER = "/etc/privdns-gateway/backend"   # 内容 mihomo / singbox; 读不到则默认 singbox
 MOSDNS_CONF = "/etc/mosdns/config.yaml"
 MOSDNS_DIRECT = "/etc/mosdns/rules/custom_direct.txt"
 RS_META = "/opt/pdg-bot/rulesets.json"
@@ -322,6 +330,79 @@ def _svc_active(unit, need=3, delay=0.6, max_polls=15):
         time.sleep(delay)
     return False
 
+def _core_backend():
+    """当前活动内核: mihomo / singbox(读不到标记默认 singbox, 向后兼容既有装置)。"""
+    try:
+        b = open(BACKEND_MARKER, encoding="utf-8").read().strip()
+        if b in ("mihomo", "singbox"):
+            return b
+    except OSError:
+        pass
+    return "singbox"
+
+def _panel_render_args(model):
+    """把 model 的 experimental.clash_api(面板状态)透传给渲染器 —— mihomo 原生 clash API,
+    面板开关/secret/external_ui 语义与 sing-box 一致, 无需另建状态。"""
+    api = (model.get("experimental", {}) or {}).get("clash_api", {}) or {}
+    if not isinstance(api, dict):
+        api = {}
+    return {
+        "controller": api.get("external_controller") or "127.0.0.1:9090",
+        "secret": api.get("secret"),
+        "external_ui": api.get("external_ui"),
+        "external_ui_url": api.get("external_ui_download_url"),
+    }
+
+def _write_mihomo(cfg):
+    os.makedirs(MIHOMO_DIR, exist_ok=True)
+    t = MIHOMO_CFG + ".tmp"
+    with open(t, "w") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)   # mihomo 只吃 YAML; JSON 是 YAML 子集, 直接可解析
+    os.chmod(t, 0o600)                                     # 含出口密码/uuid + 面板 secret, 收紧 600
+    os.replace(t, MIHOMO_CFG)
+
+def _render_mihomo_file():
+    """从当前 model(SB)渲染出 mihomo 配置并落盘。返回渲染 meta(dropped/unknown)。"""
+    import sb2mihomo
+    cfg, meta = sb2mihomo.singbox_to_mihomo(load(), redir_port=MIHOMO_REDIR, **_panel_render_args(load()))
+    _write_mihomo(cfg)
+    return meta
+
+def _core_apply():
+    """按当前后端校验 model 渲染出的核心配置并重启核心。不改 model 文件本身。
+    返回 (ok, errtext, restarted): restarted 标明核心是否已被重启(决定回滚要不要再重启)。"""
+    if _core_backend() == "mihomo":
+        try:
+            _render_mihomo_file()
+        except Exception as e:  # noqa: BLE001  渲染失败(未知协议/写盘): 视为校验失败, 核心未动
+            return False, "渲染 mihomo 配置失败(%s)" % type(e).__name__, False
+        chk = sh([MIHOMO_BIN, "-t", "-d", MIHOMO_DIR, "-f", MIHOMO_CFG])
+        if chk.returncode != 0:
+            return False, "mihomo 配置校验失败:\n" + (chk.stdout + chk.stderr)[-400:], False
+        sh(["systemctl", "reset-failed", "mihomo"])
+        r = sh(["systemctl", "restart", "mihomo"])
+        if r.returncode != 0 or not _svc_active("mihomo"):
+            return False, "重启 mihomo 失败:\n" + (r.stdout + r.stderr)[-300:], True
+        return True, "", True
+    # sing-box
+    chk = sh(["sing-box", "check", "-c", SB])
+    if chk.returncode != 0:
+        return False, "配置校验失败,已回滚:\n" + (chk.stdout + chk.stderr)[-400:], False
+    sh(["systemctl", "reset-failed", "sing-box"])   # 清 start-limit: 连改多条快速重启不触发限速锁死
+    r = sh(["systemctl", "restart", "sing-box"])
+    if r.returncode != 0 or not _svc_active("sing-box"):
+        return False, "重启 sing-box 失败, 已还原上一份配置:\n" + (r.stdout + r.stderr)[-300:], True
+    return True, "", True
+
+def _core_sync_file():
+    """校验失败回滚后: 把渲染文件同步回(已还原的)good model, 但不重启(运行中的核心未受影响)。
+    sing-box 直接读 SB, 无需额外文件; mihomo 需把 good model 重新渲染落盘, 免得磁盘上留着坏配置。"""
+    if _core_backend() == "mihomo":
+        try:
+            _render_mihomo_file()
+        except Exception:  # noqa: BLE001
+            pass
+
 def apply_sb(modify):
     # 串行化配置写 + 与 pdg update/rollback 用同一把 flock 协调(拿不到锁友好返回, 不卡死)。
     with _cfg_guard() as got:
@@ -331,16 +412,14 @@ def apply_sb(modify):
         wrote = False
         try:
             c = load(); modify(c); _write(c); wrote = True   # 写了新配置后, 任何异常都必须还原
-            chk = sh(["sing-box", "check", "-c", SB])
-            if chk.returncode != 0:
-                shutil.copy(SB + ".botbak", SB)   # 运行中的 sing-box 没动过(check 只在文件上做), 还原文件即可, 不必重启
-                return False, "配置校验失败,已回滚:\n" + (chk.stdout + chk.stderr)[-400:]
-            sh(["systemctl", "reset-failed", "sing-box"])   # 清掉 start-limit 计数: 连改多条(如连删域名)快速多次重启不会触发限速锁死
-            r = sh(["systemctl", "restart", "sing-box"])
-            if r.returncode != 0 or not _svc_active("sing-box"):   # 没起来/起来又崩, 还原文件再重启一次, 别把代理留在挂掉状态
-                shutil.copy(SB + ".botbak", SB)
-                sh(["systemctl", "reset-failed", "sing-box"]); sh(["systemctl", "restart", "sing-box"])
-                return False, "重启 sing-box 失败, 已还原上一份配置:\n" + (r.stdout + r.stderr)[-300:]
+            ok, err, restarted = _core_apply()
+            if not ok:
+                shutil.copy(SB + ".botbak", SB)              # 还原 model
+                if restarted:
+                    _core_apply()                            # 重启失败: 用 good model 再渲染+重启回已知good
+                else:
+                    _core_sync_file()                        # 校验失败: 只同步渲染文件, 不重启(核心没动过)
+                return False, err
             return True, ""
         except _PanelOwnershipError:
             return False, "检测到自定义 clash_api 配置, 为避免覆盖已保持原样"
@@ -350,7 +429,7 @@ def apply_sb(modify):
             if wrote:
                 try:
                     shutil.copy(SB + ".botbak", SB)
-                    sh(["systemctl", "reset-failed", "sing-box"]); sh(["systemctl", "restart", "sing-box"])
+                    _core_apply()
                 except Exception:  # noqa: BLE001
                     pass
             return False, "应用配置异常(%s),已还原上一份配置。" % type(e).__name__
