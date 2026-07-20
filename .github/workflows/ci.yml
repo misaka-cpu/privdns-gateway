@@ -118,6 +118,9 @@ jobs:
       - name: "CLI/report/bot 杂项回归 (rollback 校验/inet pdg/菜单 exec)"
         run: python3 tests/test-maintenance-polish.py
 
+      - name: "TFO 状态回归 (持久化意图 + 加出口不冲掉)"
+        run: python3 tests/test-tfo.py
+
   functional:
     # 真功能测试: 下载钉死 SHA256 的 sing-box / mosdns, 真起一遍, 验证两层核心链路。
     runs-on: ubuntu-latest

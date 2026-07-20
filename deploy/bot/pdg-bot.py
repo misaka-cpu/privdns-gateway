@@ -20,6 +20,7 @@ TOKEN = os.environ.get("PDG_BOT_TOKEN", "")
 ALLOWED = {int(x) for x in os.environ.get("PDG_BOT_ALLOWED", "").replace(" ", "").split(",") if x}
 SB = "/etc/sing-box/config.json"
 RS_DIR = "/etc/sing-box/rs"
+PROFILE_ENV = "/etc/privdns-gateway/profile.env"  # 持久化开关(PDG_LOWMEM / PDG_TFO 等)
 MOSDNS_CONF = "/etc/mosdns/config.yaml"
 MOSDNS_DIRECT = "/etc/mosdns/rules/custom_direct.txt"
 RS_META = "/opt/pdg-bot/rulesets.json"
@@ -330,7 +331,11 @@ def apply_sb(modify):
         shutil.copy(SB, SB + ".botbak"); os.chmod(SB + ".botbak", 0o600)
         wrote = False
         try:
-            c = load(); modify(c); _write(c); wrote = True   # 写了新配置后, 任何异常都必须还原
+            c = load()
+            tfo = _tfo_intent(c)                     # 改动前判定 TFO 意图(持久标志优先, 老装回退推断)
+            modify(c)
+            _tfo_apply(c, tfo)                        # 同步到(含新增的)所有出口 → 加/改出口不冲掉 TFO 状态
+            _write(c); wrote = True                   # 写了新配置后, 任何异常都必须还原
             chk = sh(["sing-box", "check", "-c", SB])
             if chk.returncode != 0:
                 shutil.copy(SB + ".botbak", SB)   # 运行中的 sing-box 没动过(check 只在文件上做), 还原文件即可, 不必重启
@@ -784,34 +789,86 @@ def set_wda_mode(on):
     return True, ("✅ 已切到【🛬 落地出口】(sing-box 规则已撤)。\n"
                   "⚠️ 但清空 mosdns unlock.txt 失败(" + errc + "): 本机解析这些域名可能仍走解锁 DNS, 可再点一次 🛬 或手动清空。")
 
+# ── 持久化开关 (profile.env: PDG_LOWMEM / PDG_TFO …) ──
+def _profile_get(key, default=""):
+    try:
+        for line in open(PROFILE_ENV, encoding="utf-8"):
+            line = line.strip()
+            if line.startswith(key + "="):
+                return line.split("=", 1)[1]
+    except OSError:
+        pass
+    return default
+
+def _profile_set(key, val):
+    try:
+        lines = open(PROFILE_ENV, encoding="utf-8").read().splitlines()
+    except OSError:
+        lines = []
+    out, found = [], False
+    for line in lines:
+        if line.strip().startswith(key + "="):
+            out.append(f"{key}={val}"); found = True
+        else:
+            out.append(line)
+    if not found:
+        out.append(f"{key}={val}")
+    os.makedirs(os.path.dirname(PROFILE_ENV), exist_ok=True)
+    tmp = PROFILE_ENV + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("\n".join(out) + "\n")
+    os.replace(tmp, PROFILE_ENV)
+
 # ── TCP Fast Open ──
-def _tfo_on(c):
-    obs = [o for o in c["outbounds"] if o.get("type") in PROXY_TYPES]
+# 状态以持久化意图(PDG_TFO)为准, 不再靠"所有出口都带 tcp_fast_open"推断 —— 否则加一个新出口
+# (parse_link 出来的不带标志)就把 all(...) 打成假, 表现为"开了 TFO 却显示关闭、新出口也没享受到"。
+# apply_sb 每次改配置都会把意图同步到(含新增的)所有出口, 状态不再被冲掉。
+def _tfo_intent(c=None):
+    v = _profile_get("PDG_TFO")
+    if v in ("0", "1"):
+        return v == "1"
+    # 老装未持久化: 回退到旧的"所有代理出口都带标志"判断(一次 apply 后即随出口固化)
+    if c is None:
+        try:
+            c = load()
+        except Exception:  # noqa: BLE001
+            return False
+    obs = [o for o in c.get("outbounds", []) if o.get("type") in PROXY_TYPES]
     return bool(obs) and all(o.get("tcp_fast_open") for o in obs)
 
-def set_tfo(on):
-    def mod(c):
-        for o in c["outbounds"]:
-            if o.get("type") in PROXY_TYPES:
-                if on:
-                    o["tcp_fast_open"] = True
-                else:
-                    o.pop("tcp_fast_open", None)
-        for i in c.get("inbounds", []):
+def _tfo_apply(c, on):
+    """把 TFO 意图同步到所有代理出口 + 入站(在 apply_sb 内每次调用)。"""
+    for o in c.get("outbounds", []):
+        if o.get("type") in PROXY_TYPES:
             if on:
-                i["tcp_fast_open"] = True
+                o["tcp_fast_open"] = True
             else:
-                i.pop("tcp_fast_open", None)
-    ok, msg = apply_sb(mod)
-    if ok and on:
+                o.pop("tcp_fast_open", None)
+    for i in c.get("inbounds", []):
+        if on:
+            i["tcp_fast_open"] = True
+        else:
+            i.pop("tcp_fast_open", None)
+
+def _tfo_on(c=None):
+    return _tfo_intent(c)
+
+def set_tfo(on):
+    prev = _profile_get("PDG_TFO")
+    _profile_set("PDG_TFO", "1" if on else "0")     # 先持久化意图, apply_sb 的同步据此执行
+    ok, msg = apply_sb(lambda c: None)              # 空 mod: 仅触发 _tfo_apply 同步 + 重启
+    if not ok:
+        _profile_set("PDG_TFO", prev)               # 失败回滚意图, 与配置回滚一致
+        return ok, msg
+    if on:
         sh(["sysctl", "-w", "net.ipv4.tcp_fastopen=3"])
         try:
             with open("/etc/sysctl.d/99-pdg-tfo.conf", "w") as f:
                 f.write("net.ipv4.tcp_fastopen=3\n")
         except Exception:  # noqa: BLE001
             pass
-    return ok, ((f"✅ TFO 已{'开启' if on else '关闭'}(出口+入口)\n"
-                 "降到落地的握手延迟; 需落地端也支持, 否则自动回落普通握手。") if ok else msg)
+    return True, (f"✅ TFO 已{'开启' if on else '关闭'}(出口+入口)\n"
+                  "新增出口会自动继承此设置。降到落地的握手延迟; 需落地端也支持, 否则自动回落普通握手。")
 
 # ── 临时观测/控制面板 (zashboard, 由 sing-box external_ui 托管) ──────────────
 # 默认关闭=零暴露: clash_api 只绑 127.0.0.1、无 secret、防火墙不放行 9090。
