@@ -36,6 +36,11 @@ plugins:
   - tag: hijack_set
     type: domain_set
     args: { files: ["/etc/mosdns/rules/__HIJACK_SET_FILE__"] }
+  # MITM 接管域名集(Feature B / iOS): 这些域名强制劫持到网关(即使是 Apple/国内直连域名),
+  # 好让 mihomo 把它们路由到 MITM 服务终止 TLS。平时空文件 = 无接管(休眠); bot 启用插件时填。
+  - tag: force_hijack
+    type: domain_set
+    args: { files: ["/etc/mosdns/rules/mitm_hijack.txt"] }
   - tag: ecs_china
     type: ecs_handler
     args: {forward: false, send: true, preset: "139.226.48.0", mask4: 24, mask6: 48}
@@ -57,6 +62,17 @@ plugins:
     args:
       size: __MOSDNS_CACHE__            # 标准 8192 / 低内存 2048(install 按内存模式渲染, pdg 更新按 profile 迁移)
       lazy_cache_ttl: 86400
+  # MITM 接管域名的劫持序列(经 goto 进入, 不返回): 抑制 AAAA/HTTPS + A 劫持到网关。
+  - tag: force_hijack_seq
+    type: sequence
+    args:
+      - matches: qtype 28
+        exec: reject 0
+      - matches: qtype 65
+        exec: reject 0
+      - exec: jump has_resp
+      - matches: qtype 1
+        exec: black_hole __SERVER_IP__
   - tag: internal_sequence
     type: sequence
     args:
@@ -64,6 +80,9 @@ plugins:
         exec: reject 5
       - exec: $lazy_cache
       - exec: jump has_resp
+      # MITM 接管域名: 强制劫持(在 CN 判断之前, 即使 Apple/国内域名也劫持; goto 不返回)
+      - matches: qname $force_hijack
+        exec: goto force_hijack_seq
       - matches: qname $geosite_cn
         exec: $ecs_china
       - matches: qname $geosite_cn

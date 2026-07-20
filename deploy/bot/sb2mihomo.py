@@ -209,7 +209,8 @@ def _rules_from_route(sb, direct_tags, rulesets):
 
 def singbox_to_mihomo(sb, *, redir_port=7893, controller="127.0.0.1:9090",
                       secret=None, external_ui=None, external_ui_url=None,
-                      tls_ports=None, http_ports=None, rulesets=None):
+                      tls_ports=None, http_ports=None, rulesets=None,
+                      mitm_domains=None, mitm_port=7894):
     """把 sing-box 配置 dict 翻译成 mihomo 配置 dict。
 
     rulesets: 可选 {name: {url, behavior, format}} —— 提供则渲染 rule-providers + RULE-SET,
@@ -242,6 +243,17 @@ def singbox_to_mihomo(sb, *, redir_port=7893, controller="127.0.0.1:9090",
             })
 
     rules, dropped = _rules_from_route(sb, direct_tags, rulesets)
+
+    # MITM(Feature B / iOS): 接管域名路由到本地 MITM 服务(socks5 出站, 由它终止 TLS 交插件)。
+    # 规则插在开头的 IP-CIDR REJECT(反自环)之后、普通域名规则之前, 优先级最高。
+    if mitm_domains:
+        proxies.append({"name": "MITM-OUT", "type": "socks5",
+                        "server": "127.0.0.1", "port": mitm_port, "udp": False})
+        mitm_rules = [f"DOMAIN,{d},MITM-OUT" for d in mitm_domains]
+        i = 0
+        while i < len(rules) and rules[i].startswith("IP-CIDR") and rules[i].endswith("REJECT,no-resolve"):
+            i += 1
+        rules = rules[:i] + mitm_rules + rules[i:]
 
     tls_ports = tls_ports if tls_ports is not None else DEFAULT_TLS_PORTS
     http_ports = http_ports if http_ports is not None else DEFAULT_HTTP_PORTS

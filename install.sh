@@ -259,6 +259,7 @@ if [[ "$REPO_DIR" != "/opt/privdns-gateway" ]]; then
 fi
 : > /etc/mosdns/rules/custom_direct.txt
 : > /etc/mosdns/rules/unlock.txt          # WDA 解锁域名集(空=休眠; bot『🔓 解锁走 WDA』填充)
+: > /etc/mosdns/rules/mitm_hijack.txt     # MITM 接管域名集(空=休眠; iOS 启用 MITM 插件时填充)
 
 # 内存模式(克制版): PDG_LOWMEM=auto(默认)|1|0; MemTotal ≤ 1300MiB 判低内存。持久化到 profile.env。
 # 只调确认安全的项: mosdns cache(8192/2048)+ journald 上限(50M/20M)。不动 sysctl/swap/MemoryMax。

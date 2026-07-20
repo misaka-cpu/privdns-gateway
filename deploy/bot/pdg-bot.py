@@ -29,6 +29,8 @@ MIHOMO_DIR = "/etc/mihomo"
 MIHOMO_CFG = MIHOMO_DIR + "/config.yaml"
 MIHOMO_BIN = "mihomo"
 MIHOMO_REDIR = 7893
+MITM_PORT = 7894                                  # MITM 服务(socks5)监听; mihomo 把接管域名路由到这
+MITM_HIJACK_FILE = "/etc/mosdns/rules/mitm_hijack.txt"   # 接管域名(mosdns 强制劫持集, 与 mihomo 路由同源)
 # mihomo 有路径安全限制: external-ui 等文件路径须在工作目录(-d)下或 SAFE_PATHS 白名单内。
 # 观测面板 UI 在 /etc/sing-box/ui/dist(与 sing-box 共用), 不在 /etc/mihomo 下 → 用 SAFE_PATHS 放行,
 # 使 mihomo 服务运行 + 本进程发起的所有 `mihomo -t` 校验都认这个 UI 路径。
@@ -403,12 +405,27 @@ def _mihomo_rulesets():
         out[name] = {"url": info.get("url", ""), "behavior": behavior, "format": fmt}
     return out
 
+def _mitm_domains():
+    """接管域名列表(仅 iOS 平台且有插件启用时非空)。读 mosdns mitm_hijack.txt(去 domain: 前缀), 与 mosdns 强制劫持同源。"""
+    if _platform() != "ios":
+        return []
+    out = []
+    try:
+        for line in open(MITM_HIJACK_FILE, encoding="utf-8"):
+            line = line.strip()
+            if line and not line.startswith("#"):
+                out.append(line.replace("domain:", "").strip())
+    except OSError:
+        pass
+    return out
+
 def _render_mihomo_file():
     """从当前 model(SB)渲染出 mihomo 配置并落盘。返回渲染 meta(dropped/unknown)。"""
     import sb2mihomo
     model = load()
     cfg, meta = sb2mihomo.singbox_to_mihomo(
-        model, redir_port=MIHOMO_REDIR, rulesets=_mihomo_rulesets(), **_panel_render_args(model))
+        model, redir_port=MIHOMO_REDIR, rulesets=_mihomo_rulesets(),
+        mitm_domains=_mitm_domains(), mitm_port=MITM_PORT, **_panel_render_args(model))
     _write_mihomo(cfg)
     return meta
 
