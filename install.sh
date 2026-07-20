@@ -100,9 +100,9 @@ rollback(){
     return
   fi
   c_y "安装失败 → 回滚本次全新安装的改动…"
-  systemctl disable --now pdg-bot pdg-probe81 mosdns sing-box mihomo \
+  systemctl disable --now pdg-bot pdg-probe81 mosdns sing-box mihomo pdg-mitm \
       pdg-rules-update.timer pdg-health.timer 2>/dev/null
-  rm -f /etc/systemd/system/{pdg-bot,pdg-probe81,mosdns,sing-box,mihomo,pdg-rules-update,pdg-health}.service \
+  rm -f /etc/systemd/system/{pdg-bot,pdg-probe81,mosdns,sing-box,mihomo,pdg-mitm,pdg-rules-update,pdg-health}.service \
         /etc/systemd/system/pdg-rules-update.timer /etc/systemd/system/pdg-health.timer \
         /etc/systemd/journald.conf.d/50-pdg.conf /etc/systemd/system/journald.conf.d/50-pdg.conf   # 正确 + 历史错路径都删
   systemctl daemon-reload 2>/dev/null
@@ -246,6 +246,9 @@ install -m755 "$REPO_DIR"/deploy/bot/checks.py           /opt/pdg-bot/
 install -m755 "$REPO_DIR"/deploy/bot/doctor.py           /opt/pdg-bot/
 install -m755 "$REPO_DIR"/deploy/bot/report.py           /opt/pdg-bot/
 install -m755 "$REPO_DIR"/deploy/bot/sb2mihomo.py        /opt/pdg-bot/
+install -m755 "$REPO_DIR"/deploy/bot/mitm_ca.py          /opt/pdg-bot/
+install -m755 "$REPO_DIR"/deploy/bot/mitm_server.py      /opt/pdg-bot/
+install -m755 "$REPO_DIR"/deploy/bot/mitm_wloc.py        /opt/pdg-bot/
 install -m755 "$REPO_DIR"/deploy/ios/probe81.py           /opt/pdg-bot/
 install -m644 "$REPO_DIR"/deploy/ios/pdg-dot-ondemand.mobileconfig.tmpl /opt/pdg-bot/pdg-dot.mobileconfig.tmpl
 install -m755 "$REPO_DIR"/deploy/cert/proxy-gateway-open-cert-http.sh     /usr/local/bin/
@@ -369,6 +372,22 @@ WantedBy=multi-user.target
 EOF
 fi
 
+# pdg-mitm: MITM 插件服务(Feature B, 仅 iOS)。按 /etc/privdns-gateway/mitm.json 加载启用的插件。
+if [[ "$PLATFORM" == ios ]]; then
+  cat > /etc/systemd/system/pdg-mitm.service <<'EOF'
+[Unit]
+Description=pdg-mitm (PrivDNS Gateway MITM plugins)
+After=network-online.target
+Wants=network-online.target
+[Service]
+ExecStart=/usr/bin/python3 /opt/pdg-bot/mitm_server.py 7894
+Restart=on-failure
+RestartSec=3
+[Install]
+WantedBy=multi-user.target
+EOF
+fi
+
 # ── 6. DoT 证书 ──
 if [[ -n "${PDG_SKIP_CERT:-}" ]]; then
   c_y "PDG_SKIP_CERT: 跳过 certbot, 生成自签占位证书 (生产请用 bot『🌐 DoT 自定义域名』补正式证书)"
@@ -407,6 +426,7 @@ rm -f /etc/resolv.conf; printf 'nameserver 1.1.1.1\n' > /etc/resolv.conf
 systemctl daemon-reload
 systemctl restart systemd-journald
 systemctl enable --now mosdns "$CORE_SVC" pdg-probe81 >/dev/null 2>&1 || true
+[[ "$PLATFORM" == ios ]] && { systemctl enable --now pdg-mitm >/dev/null 2>&1 || true; }
 systemctl enable --now pdg-rules-update.timer >/dev/null 2>&1 || true
 systemctl enable --now pdg-health.timer >/dev/null 2>&1 || true
 if [[ -n "$BOT_TOKEN" && -n "$ALLOWED_IDS" ]]; then

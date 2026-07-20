@@ -227,6 +227,8 @@ def _nav(key):
             [{"text": "🌐 DNS 上游", "callback_data": "dnsup"}, {"text": "🚀 TFO", "callback_data": "tfo"}],
             [{"text": "📊 观测面板", "callback_data": "panel"}]]),
     }
+    if _platform() == "ios":                          # iOS 专属: 位置改写(WLOC)
+        subs["ops"][1].append([{"text": "🍏 位置改写(WLOC)", "callback_data": "wloc"}])
     title, rows = subs[key]
     return title, {"inline_keyboard": rows + [[{"text": "⬅️ 返回主菜单", "callback_data": "menu"}]]}
 
@@ -418,6 +420,78 @@ def _mitm_domains():
     except OSError:
         pass
     return out
+
+# ── MITM 插件(Feature B / iOS): WLOC 位置改写 ──
+MITM_CONFIG = "/etc/privdns-gateway/mitm.json"
+MITM_PLUGIN_DOMAINS = {"wloc": ["gs-loc.apple.com"]}   # 插件 → 接管域名(与 mitm_server.PLUGIN_DOMAINS 同源)
+
+def _mitm_config():
+    try:
+        return json.load(open(MITM_CONFIG))
+    except OSError:
+        return {}
+
+def _save_mitm_config(cfg):
+    os.makedirs(os.path.dirname(MITM_CONFIG), exist_ok=True)
+    t = MITM_CONFIG + ".tmp"
+    with open(t, "w") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    os.chmod(t, 0o600)
+    os.replace(t, MITM_CONFIG)
+
+def _mitm_enabled_domains():
+    cfg = _mitm_config()
+    doms = []
+    for name, dl in MITM_PLUGIN_DOMAINS.items():
+        if (cfg.get(name) or {}).get("enabled"):
+            doms += dl
+    return doms
+
+def _mitm_ca_pem():
+    try:
+        import mitm_ca
+        return mitm_ca.ca_cert_pem()
+    except Exception:  # noqa: BLE001
+        return ""
+
+def _mitm_sync():
+    """按启用插件同步: 写 mitm_hijack.txt(接管域名)+ 重启 pdg-mitm 载插件 + 重渲染 mihomo + 重启 mosdns 载 force_hijack。"""
+    doms = _mitm_enabled_domains()
+    with open(MITM_HIJACK_FILE, "w") as f:
+        f.write("".join("domain:" + d + "\n" for d in doms))
+    if doms:
+        _mitm_ca_pem()                       # 确保 CA 已生成(供叶子签发 + iOS 下发)
+    sh(["systemctl", "restart", "pdg-mitm"])
+    ok, msg = apply_sb(lambda c: None)       # 重渲染 mihomo(mitm_domains)+ 重启核心
+    sh(["systemctl", "restart", "mosdns"])   # 载入 force_hijack 域名集
+    return ok, msg
+
+def _wloc_state():
+    w = _mitm_config().get("wloc") or {}
+    return w
+
+def set_wloc(on, lat=None, lon=None):
+    """开/关 WLOC 位置改写(仅 iOS)。lat/lon 给出即更新坐标。"""
+    if _platform() != "ios":
+        return False, "位置改写(WLOC)仅 iOS 平台可用(安卓需 root, 且走 Google 定位, 不支持)。"
+    cfg = _mitm_config()
+    w = cfg.setdefault("wloc", {})
+    if lat is not None:
+        w["lat"] = lat
+    if lon is not None:
+        w["lon"] = lon
+    w.setdefault("accuracy", 50)
+    if on and ("lat" not in w or "lon" not in w):
+        return False, "请先设定坐标: 发「纬度,经度」如 35.6812,139.7671"
+    w["enabled"] = bool(on)
+    _save_mitm_config(cfg)
+    ok, msg = _mitm_sync()
+    if not ok:
+        return False, msg
+    if on:
+        return True, (f"✅ 位置改写已开启 → ({w['lat']}, {w['lon']})\n"
+                      "⚠️ iPhone 需装并信任本网关 CA(在「📱 客户端 → iOS 描述文件」里已内含)才生效。")
+    return True, "✅ 位置改写已关闭。"
 
 def _render_mihomo_file():
     """从当前 model(SB)渲染出 mihomo 配置并落盘。返回渲染 meta(dropped/unknown)。"""
@@ -2043,9 +2117,21 @@ def set_dot_domain(domain):
                   "• iOS: 重新生成一次「📱 iOS 描述文件」即可(自动用新域名)")
 
 # ── iOS 描述文件 ──
+def _mitm_ca_der():
+    """根 CA 证书的 DER 字节(供 iOS 描述文件的 root 证书 payload)。"""
+    pem = _mitm_ca_pem()
+    if not pem:
+        return b""
+    body = "".join(l for l in pem.splitlines() if "CERTIFICATE" not in l)
+    try:
+        return base64.b64decode(body)
+    except Exception:  # noqa: BLE001
+        return b""
+
 def _ios_profile(ssids=()):
-    """ssids 非空时在 OnDemandRules 最前插一条「命中这些 SSID 的 Wi-Fi 强制直连(不启用 DoT)」;
-    其余 Wi-Fi/蜂窝仍按模板里的 :81 探测判定。用 plistlib 插入, SSID 含 &<> 等也不会破 XML。"""
+    """ssids 非空时在 OnDemandRules 最前插一条「命中这些 SSID 的 Wi-Fi 强制直连」;
+    MITM 插件启用时(iOS)再附一个根 CA payload 让设备信任本网关 CA(WLOC 等 MITM 才生效)。
+    用 plistlib 插入, SSID 含 &<> 等也不会破 XML。"""
     if not os.path.exists(IOS_TMPL):
         raise FileNotFoundError("缺少模板 " + IOS_TMPL)
     t = open(IOS_TMPL).read()
@@ -2053,11 +2139,23 @@ def _ios_profile(ssids=()):
             .replace("__JP_IP__", _server_ip())
             .replace("__UUID1__", str(uuid.uuid4()).upper())
             .replace("__UUID2__", str(uuid.uuid4()).upper())).encode()
-    if not ssids:
+    der = _mitm_ca_der() if _mitm_enabled_domains() else b""
+    if not ssids and not der:
         return raw
     p = plistlib.loads(raw)
-    p["PayloadContent"][0]["OnDemandRules"].insert(
-        0, {"InterfaceTypeMatch": "WiFi", "SSIDMatch": list(ssids), "Action": "Disconnect"})
+    if ssids:
+        p["PayloadContent"][0]["OnDemandRules"].insert(
+            0, {"InterfaceTypeMatch": "WiFi", "SSIDMatch": list(ssids), "Action": "Disconnect"})
+    if der:
+        p["PayloadContent"].append({
+            "PayloadType": "com.apple.security.root",
+            "PayloadVersion": 1,
+            "PayloadIdentifier": "com.privdns.mitm.ca",
+            "PayloadUUID": str(uuid.uuid4()).upper(),
+            "PayloadDisplayName": "PrivDNS Gateway MITM CA",
+            "PayloadContent": der,
+            "PayloadCertificateFileName": "pdg-mitm-ca.crt",
+        })
     return plistlib.dumps(p)
 
 # ── 配置备份 / 恢复 ──
@@ -2509,6 +2607,23 @@ def handle_cb(chat, mid, data):
                                   [{"text": "🏠 主菜单", "callback_data": "menu"}]]}); return
     if data in ("tfo:on", "tfo:off"):
         ok, msg = set_tfo(data == "tfo:on"); edit(chat, mid, msg if ok else ("❌ " + msg), OPS_BACK); return
+    if data == "wloc":
+        if _platform() != "ios":
+            edit(chat, mid, "位置改写(WLOC)仅 iOS 平台可用。", OPS_BACK); return
+        w = _wloc_state(); on = bool(w.get("enabled"))
+        coord = f"({w['lat']}, {w['lon']})" if "lat" in w and "lon" in w else "未设"
+        edit(chat, mid, f"🍏 <b>位置改写 (WLOC)</b>\n当前: <b>{'开启' if on else '关闭'}</b>　坐标: <b>{coord}</b>\n"
+             "把 iPhone 定位改写到设定坐标(MITM 截 gs-loc.apple.com)。\n"
+             "⚠️ 需在「📱 客户端 → iOS 描述文件」装并<b>信任本网关 CA</b>(设置→通用→VPN与设备管理 装描述文件, 再到 关于→证书信任设置 开启完全信任)才生效。",
+             {"inline_keyboard": [[{"text": "开启", "callback_data": "wloc:on"}, {"text": "关闭", "callback_data": "wloc:off"}],
+                                  [{"text": "📍 设坐标", "callback_data": "wloc:coord"}],
+                                  [{"text": "⬅️ 返回运维", "callback_data": "nav:ops"}],
+                                  [{"text": "🏠 主菜单", "callback_data": "menu"}]]}); return
+    if data == "wloc:coord":
+        state[chat] = "wloc_coord"
+        send(chat, "发「<b>纬度,经度</b>」如 <code>35.6812,139.7671</code>(小数;北纬东经为正)。/cancel 取消。", BACK); return
+    if data in ("wloc:on", "wloc:off"):
+        ok, msg = set_wloc(data == "wloc:on"); edit(chat, mid, msg if ok else ("❌ " + msg), OPS_BACK); return
     if data == "panel":
         on = _panel_on()
         edit(chat, mid, "📊 <b>临时观测/控制面板 (zashboard)</b>\n"
@@ -2707,6 +2822,18 @@ def handle_text(chat, text, mid=None):
         if len(p) < 2:
             send_plain(chat, "格式: remote|local 地址1 [地址2 …]"); return
         ok, msg = set_mosdns_upstream(p[0].lower(), p[1:]); send_plain(chat, msg if ok else ("❌ " + msg)); return
+    if act == "wloc_coord":
+        m = re.match(r"^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$", text)
+        if not m:
+            send_plain(chat, "格式: 纬度,经度  如 35.6812,139.7671"); return
+        lat, lon = float(m.group(1)), float(m.group(2))
+        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            send_plain(chat, "坐标超范围(纬度 -90~90, 经度 -180~180)"); return
+        cur_on = bool(_wloc_state().get("enabled"))
+        ok, msg = set_wloc(cur_on, lat=lat, lon=lon)
+        if ok and not cur_on:
+            msg = f"✅ 坐标已设为 ({lat}, {lon})。到「🍏 位置改写」点开启生效。"
+        send_plain(chat, msg if ok else ("❌ " + msg)); return
     if act == "set_dot":
         send_plain(chat, "正在校验域名并签发证书(约 30-60 秒, 期间代理短暂中断)…")
         ok, msg = set_dot_domain(text); send_plain(chat, msg if ok else ("❌ " + msg)); return

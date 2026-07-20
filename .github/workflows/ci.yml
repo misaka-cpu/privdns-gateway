@@ -136,6 +136,9 @@ jobs:
       - name: "Apple WLOC 插件回归 (gs-loc protobuf 编解码 + 坐标改写 + 负坐标)"
         run: python3 tests/test-mitm-wloc.py
 
+      - name: "WLOC bot 后端回归 (set_wloc 开关/坐标/平台门控/接管域名同源)"
+        run: python3 tests/test-mitm-wloc-bot.py
+
   functional:
     # 真功能测试: 下载钉死 SHA256 的 sing-box / mosdns, 真起一遍, 验证两层核心链路。
     runs-on: ubuntu-latest

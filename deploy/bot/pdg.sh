@@ -663,6 +663,9 @@ cmd_update(){
   install -m755 "$REPO_DIR"/deploy/bot/doctor.py           /opt/pdg-bot/
   install -m755 "$REPO_DIR"/deploy/bot/report.py           /opt/pdg-bot/
   install -m755 "$REPO_DIR"/deploy/bot/sb2mihomo.py        /opt/pdg-bot/
+  install -m755 "$REPO_DIR"/deploy/bot/mitm_ca.py          /opt/pdg-bot/ 2>/dev/null || true
+  install -m755 "$REPO_DIR"/deploy/bot/mitm_server.py      /opt/pdg-bot/ 2>/dev/null || true
+  install -m755 "$REPO_DIR"/deploy/bot/mitm_wloc.py        /opt/pdg-bot/ 2>/dev/null || true
   install -m755 "$REPO_DIR"/deploy/ios/probe81.py           /opt/pdg-bot/
   install -m644 "$REPO_DIR"/deploy/bot/pdg-health.service  /etc/systemd/system/ 2>/dev/null || true
   install -m644 "$REPO_DIR"/deploy/bot/pdg-health.timer    /etc/systemd/system/ 2>/dev/null || true

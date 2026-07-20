@@ -108,6 +108,30 @@ def serve(listen="127.0.0.1", port=7894):
         threading.Thread(target=_handle, args=(c,), daemon=True).start()
 
 
+MITM_CONFIG = "/etc/privdns-gateway/mitm.json"
+# 插件名 → 接管域名(bot 与服务共识; 与 mitm_hijack.txt / 渲染器同源)
+PLUGIN_DOMAINS = {"wloc": ["gs-loc.apple.com"]}
+
+
+def load_from_config(path=None):
+    """按 mitm.json 里启用的插件登记。返回已加载插件名列表。"""
+    import json
+    clear()
+    try:
+        cfg = json.load(open(path or MITM_CONFIG, encoding="utf-8"))
+    except OSError:
+        return []
+    loaded = []
+    w = cfg.get("wloc") or {}
+    if w.get("enabled"):
+        import mitm_wloc
+        register(mitm_wloc.WLOCPlugin(float(w.get("lat", 0)), float(w.get("lon", 0)),
+                                      int(w.get("accuracy", 50))))
+        loaded.append("wloc")
+    return loaded
+
+
 if __name__ == "__main__":
     import sys
+    load_from_config()
     serve(port=int(sys.argv[1]) if len(sys.argv) > 1 else 7894)
