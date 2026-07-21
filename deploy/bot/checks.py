@@ -24,6 +24,16 @@ def _core():
 def _core_svc():
     return "mihomo" if _core() == "mihomo" else "sing-box"
 
+def _platform():
+    """手机平台: ios / android(读不到默认 android)。用于跳过平台不相关的检查。"""
+    try:
+        p = open("/etc/privdns-gateway/platform", encoding="utf-8").read().strip()
+        if p in ("ios", "android"):
+            return p
+    except OSError:
+        pass
+    return "android"
+
 def _run(cmd, t=10):
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=t)
@@ -163,6 +173,8 @@ def check_nft():
 def check_gms():
     """GMS/FCM 推送端口(5228-5230)是否完整启用。只读、不触发迁移: 老装第一次 pdg update
     跑在旧脚本里, 迁移要等下一次 root 管理类命令; 没落地前用 warn 提示(不 fail, 自定义防火墙用户合法缺席)。"""
+    if _platform() == "ios":
+        return None                              # iOS 不用 GMS/FCM 推送(苹果走 APNs), 该检查不适用
     if _core() == "mihomo":
         # mihomo: 5228-5230 由 nft prerouting REDIRECT 到 redir 端口 + sniffer 处理, 不在 input accept
         _, pre, _ = _run(["nft", "list", "chain", "inet", "pdg", "prerouting"])
@@ -439,7 +451,9 @@ def check_deep_upstreams():
     return (level, "DNS 上游探测", " ; ".join(parts))
 
 def check_mitm():
-    """MITM 插件(Feature B / iOS): 启用时 pdg-mitm 应 active + CA 就位。未启用 = info。"""
+    """MITM 插件(Feature B / iOS): 启用时 pdg-mitm 应 active + CA 就位。未启用 = info。安卓不适用。"""
+    if _platform() != "ios":
+        return None                              # MITM/WLOC 仅 iOS, 安卓不显示此项
     try:
         cfg = json.load(open("/etc/privdns-gateway/mitm.json"))
     except Exception:  # noqa: BLE001
@@ -461,4 +475,4 @@ DEEP = [check_deep_dot_handshake, check_deep_probe81, check_deep_dns_cn,
         check_deep_clash, check_deep_upstreams, check_deep_hijack_note]  # pdg doctor --deep 追加
 
 def run(funcs=None):
-    return [f() for f in (funcs or ALL)]
+    return [r for f in (funcs or ALL) if (r := f()) is not None]   # 平台不相关的 check 返回 None → 跳过不显示

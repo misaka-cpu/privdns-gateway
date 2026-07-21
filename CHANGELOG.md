@@ -2,6 +2,10 @@
 
 本项目按语义化 `v1.x` tag 正式发布;以下按版本/日期记录主要变化,完整提交见 git 历史。
 
+## 2026-07-21 — v1.5.3(doctor 按手机平台跳过不相关检查)
+
+- **改**:`pdg doctor` / 自检按装机平台(iOS / Android)跳过不相关项——**安卓不再显示「MITM 插件」**(WLOC 仅 iOS),**iOS 不再显示「GMS 推送」**(5228-5230 是 Google/安卓推送,苹果走 APNs)。检查函数返回 `None` 即跳过,`checks.run()` 统一过滤。
+
 ## 2026-07-21 — v1.5.2(修从 v1.4.x 升级漏装 bot 模块 + README/WLOC 文案)
 
 - **修**:旧版 `pdg update` 安装列表没有 `sb2mihomo.py` / `mitm_*.py`,从 v1.4.x **首次升级时(自更新时序滞后)这些新模块没装上** → `switch-core` 到 mihomo 报 `ModuleNotFoundError`、WLOC 也用不了。新增幂等迁移 `migrate_deploy_botfiles`(经 `pdg __migrate` 用新脚本跑),把 `deploy/bot/*.py` 全量部署到 `/opt/pdg-bot`,自愈首次升级 + 未来新模块。
