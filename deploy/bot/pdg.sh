@@ -640,6 +640,7 @@ cmd_rollback(){
   systemctl daemon-reload
   nft -f /etc/nftables.conf 2>/dev/null || true
   systemctl restart mosdns "$(_pdg_core_svc)" pdg-bot pdg-probe81 2>/dev/null || true
+  systemctl is-enabled pdg-mitm >/dev/null 2>&1 && { systemctl reset-failed pdg-mitm 2>/dev/null; systemctl restart pdg-mitm 2>/dev/null; }   # iOS/WLOC: 清 start-limit + 一并恢复 MITM 服务
   systemctl restart systemd-journald 2>/dev/null || true   # journald CanReload=no: 还原封顶需 restart 才生效
   echo "✅ 已回滚并重启服务"
 }
@@ -757,6 +758,7 @@ cmd_update(){
   systemctl daemon-reload
   systemctl enable --now pdg-health.timer >/dev/null 2>&1 || true   # 老装升级时补上健康自检
   systemctl restart pdg-bot pdg-probe81 2>/dev/null || true
+  systemctl is-enabled pdg-mitm >/dev/null 2>&1 && { systemctl reset-failed pdg-mitm 2>/dev/null; systemctl restart pdg-mitm 2>/dev/null; }   # iOS/WLOC: 清 start-limit + 载新插件代码, 否则 doctor 判 pdg-mitm 未运行而误回滚
   sleep 2
 
   # token 是否已配置(未配则 pdg-bot 不在跑属正常, 不据此回滚)

@@ -2,6 +2,10 @@
 
 本项目按语义化 `v1.x` tag 正式发布;以下按版本/日期记录主要变化,完整提交见 git 历史。
 
+## 2026-07-21 — v1.5.1(修 `pdg update` 在 WLOC 启用时误回滚)
+
+- **修**:iOS/WLOC 启用后,`pdg update` / `pdg rollback` 未重启 `pdg-mitm`,更新校验门的 doctor 判「pdg-mitm 未运行」→ 误判失败并回滚(且频繁 WLOC 切换可能已把 pdg-mitm 撞进 systemd start-limit 失败态)。现两处都 `reset-failed` + 按需重启 `pdg-mitm`。
+
 ## 2026-07-21 — v1.5.0(可选 mihomo 双核 + 一键切换内核 + 平台选择 + iOS 位置改写 WLOC)
 
 本版把「流量内核」做成**可选双核**,并新增 iOS **网络定位改写(WLOC)**。
