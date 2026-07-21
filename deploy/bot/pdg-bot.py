@@ -2960,6 +2960,13 @@ def handle_text(chat, text, mid=None):
         ok, msg = set_dot_domain(text); send_plain(chat, msg if ok else ("❌ " + msg)); return
     if act == "restore":
         send_plain(chat, "请把备份 <code>.tar.gz</code> 作为「文件」发来, 而不是文字。/cancel 取消。"); state[chat] = "restore"; return
+    # 裸发「名称 纬度,经度」: 当作加 WLOC 地点(iOS), 即使没先点「➕ 添加地点」也能加(状态因重启丢了也不怕)
+    mw = re.match(r"^\s*(\S+)\s+(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$", text)
+    if mw and _platform() == "ios":
+        name, lat, lon = mw.group(1), float(mw.group(2)), float(mw.group(3))
+        if -90 <= lat <= 90 and -180 <= lon <= 180:
+            ok, msg = wloc_add(name, lat, lon)
+            send_plain(chat, msg if ok else ("❌ " + msg)); return
     # 裸发一个像域名的文本: 当作想设 DoT 域名, 给一键按钮 (省得先点菜单进状态)
     if re.match(r"^(?=.{1,253}$)([a-z0-9-]+\.)+[a-z]{2,}$", text.lower()):
         d = text.lower()
