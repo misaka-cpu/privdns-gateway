@@ -148,13 +148,14 @@ sudo pdg uninstall [--purge]   # 卸载(--purge 连配置删)
 
 | 层 | 用什么 | 说明 |
 |---|---|---|
-| DNS | **mosdns v5** | 国内直连 / 代理域名 A 劫持到本机 + AAAA/HTTPS 置空 / 按来源 IP 分支 / ECS 分治 / 缓存。DoT(853) |
-| 流量 | **sing-box 1.12** | `direct` 监听 + `sniff_override_destination`(**不用 tproxy**);多出口 urltest 故障切换;clash_api 测速/流量 |
-| 管理 | **Telegram bot**(纯标准库) | 出口/分流/规则集/测速/流量/备份恢复/iOS下发/自定义域名,改 sing-box 前 `check`+回滚 |
-| 证书 | **certbot standalone** | Let's Encrypt,自动续期(已处理 80 口被 sing-box 占的坑) |
-| 防火墙 | **nftables** | 对全网只留 SSH;DNS/数据/探测口只放行内网卡来源段 |
+| DNS | **mosdns v5** | 国内直连 / 代理域名 A 劫持到本机 + AAAA/HTTPS 置空 / 按来源 IP 分支 / ECS 分治 / 缓存;DoT(853);可选 GFWList 劫持模式 |
+| 流量(双核可切) | **sing-box 1.12** 或 **mihomo** | sing-box:`direct` 监听 + `sniff_override_destination`(不用 tproxy);mihomo:nft REDIRECT 入站 + redir 监听 + SNI 嗅探,内核可持续更新。多出口 urltest 故障切换;clash_api 测速/流量。**`pdg switch-core` 无损互切**(出口/分流/证书全不动) |
+| 管理 | **Telegram bot**(纯标准库) | 出口 / 分流 / 规则集 / 测速 / 流量 / 备份恢复 / iOS 描述文件 / 自定义域名 / **WLOC 位置改写**,改配置前 `check` + 回滚 |
+| 位置改写 | **pdg-mitm**(可选,iOS) | 自签 CA + TLS 终止 + forward+patch 改写 `gs-loc` 网络定位(见上文「iOS 位置改写 WLOC」) |
+| 证书 | **certbot standalone** | Let's Encrypt,自动续期(已处理 80 口被内核占的坑) |
+| 防火墙 | **nftables** | 对全网只留 SSH;DNS / 数据 / 探测口只放行内网卡来源段;mihomo 用 REDIRECT 入站(同样限内网卡) |
 
-> ⚠️ sing-box **必须 1.12.x** —— 1.13 移除了 `sniff_override_destination`,本网关会失效,install.sh 已固定版本。想让内核能持续更新到最新,装机时用 `PDG_CORE=mihomo`(mihomo 无此版本天花板,见上文「选择流量内核」)。
+> ⚠️ 用 **sing-box** 内核时**必须 1.12.x** —— 1.13 移除了 `sniff_override_destination` 会失效(install.sh 已固定版本)。想让内核持续更新到最新,装机选 `PDG_CORE=mihomo` 或事后 `pdg switch-core mihomo`(mihomo 无此版本天花板,见上文「选择流量内核」)。
 
 ## 文档
 

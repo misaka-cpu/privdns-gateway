@@ -2687,9 +2687,9 @@ def handle_cb(chat, mid, data):
         w = _wloc_state(); on = bool(w.get("enabled")); loc = _wloc_active(w)
         cur = f"<b>{w['active']}</b>({loc['lat']}, {loc['lon']})" if loc else "未设"
         edit(chat, mid, f"🍏 <b>位置改写 (WLOC)</b>\n状态: <b>{'🟢 开启' if on else '关闭'}</b>　当前: {cur}　地点: {len(w['locations'])} 个\n"
-             "把 iPhone 网络定位改写到设定城市(任意城市, 含跨国, 东京实测✅)。\n"
-             "⚠️ 生效条件:手机<b>内网卡在用 + 控制中心关 WiFi</b>,并装+信任本网关 CA(「📱 客户端 → iOS 描述文件」内含)。\n"
-             "⏳ <b>iOS 26 缓存重</b>:切城市后手机会滞后,去「定位服务」关开一次或重启才刷新;切到差很远的地方会先转圈再稳。",
+             "把 iPhone 网络定位改写到设定城市(国内 / 跨国均可)。\n"
+             "<b>3 步生效</b>:① 手机用内网卡 + <b>控制中心</b>关 WiFi(不是「设置」里关)　② 装并信任本网关 CA(在「📱 客户端 → iOS 描述文件」)　③ <b>切城市后</b>去 设置→隐私→定位服务 关掉再打开(或重启)刷新。\n"
+             "⏳ <b>等待</b>:国内城市互切约 1 分钟内;跨国要几分钟(会先「转圈」再稳,可开关飞行模式 15 秒催一下)。iOS 26 缓存重,不做第 ③ 步会一直显示旧位置。",
              {"inline_keyboard": [
                  [{"text": "🟢 已开启" if on else "✅ 开启", "callback_data": "wloc:on"},
                   {"text": "关闭", "callback_data": "wloc:off"}],

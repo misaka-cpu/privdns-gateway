@@ -2,6 +2,11 @@
 
 本项目按语义化 `v1.x` tag 正式发布;以下按版本/日期记录主要变化,完整提交见 git 历史。
 
+## 2026-07-21 — v1.5.2(修从 v1.4.x 升级漏装 bot 模块 + README/WLOC 文案)
+
+- **修**:旧版 `pdg update` 安装列表没有 `sb2mihomo.py` / `mitm_*.py`,从 v1.4.x **首次升级时(自更新时序滞后)这些新模块没装上** → `switch-core` 到 mihomo 报 `ModuleNotFoundError`、WLOC 也用不了。新增幂等迁移 `migrate_deploy_botfiles`(经 `pdg __migrate` 用新脚本跑),把 `deploy/bot/*.py` 全量部署到 `/opt/pdg-bot`,自愈首次升级 + 未来新模块。
+- **文档**:README「组成」更新为**双核(sing-box / mihomo)+ WLOC**;bot WLOC 文案改成清晰的「3 步生效 + 等待时间」。
+
 ## 2026-07-21 — v1.5.1(修 `pdg update` 在 WLOC 启用时误回滚)
 
 - **修**:iOS/WLOC 启用后,`pdg update` / `pdg rollback` 未重启 `pdg-mitm`,更新校验门的 doctor 判「pdg-mitm 未运行」→ 误判失败并回滚(且频繁 WLOC 切换可能已把 pdg-mitm 撞进 systemd start-limit 失败态)。现两处都 `reset-failed` + 按需重启 `pdg-mitm`。

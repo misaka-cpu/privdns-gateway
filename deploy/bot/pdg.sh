@@ -923,10 +923,24 @@ migrate_mihomo_safepaths(){
   systemctl daemon-reload; systemctl restart mihomo 2>/dev/null || true
 }
 
+# 老装升级: 确保所有 bot 模块(.py)都部署到 /opt/pdg-bot。修「旧版 cmd_update 安装列表缺新模块
+# (如 sb2mihomo/mitm_*)、首次升级时序滞后漏装」→ switch-core/WLOC 渲染报 ModuleNotFoundError。
+# pdg-bot.py 由主安装装成 bot.py, 此处跳过。幂等。
+migrate_deploy_botfiles(){
+  [[ -d "$REPO_DIR/deploy/bot" ]] || return 0
+  local f base
+  for f in "$REPO_DIR"/deploy/bot/*.py; do
+    base=$(basename "$f")
+    [[ "$base" == "pdg-bot.py" ]] && continue
+    install -m755 "$f" /opt/pdg-bot/ 2>/dev/null || true
+  done
+}
+
 run_all_migrations(){
   migrate_botenv || true; migrate_firewall_to_pdg || true; migrate_mosdns_concurrent || true
   migrate_mosdns_unlock || true; migrate_singbox_gms || true; migrate_fw_gms || true
   migrate_mosdns_ratelimit || true; migrate_lowmem || true; migrate_mihomo_safepaths || true
+  migrate_deploy_botfiles || true
 }
 
 # 内核切换: sing-box <-> mihomo。出口/分流/证书/DoT/mosdns 全不动(model 共用), 只换内核二进制 +
