@@ -249,7 +249,7 @@ def singbox_to_mihomo(sb, *, redir_port=7893, controller="127.0.0.1:9090",
     if mitm_domains:
         proxies.append({"name": "MITM-OUT", "type": "socks5",
                         "server": "127.0.0.1", "port": mitm_port, "udp": False})
-        mitm_rules = [f"DOMAIN,{d},MITM-OUT" for d in mitm_domains]
+        mitm_rules = [f"DOMAIN-SUFFIX,{d},MITM-OUT" for d in mitm_domains]
         i = 0
         while i < len(rules) and rules[i].startswith("IP-CIDR") and rules[i].endswith("REJECT,no-resolve"):
             i += 1

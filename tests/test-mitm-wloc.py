@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Apple WLOC 插件回归: protobuf 编解码往返 + 坐标改写(含负坐标)+ 插件 HTTP 处理。
+"""Apple WLOC 插件回归: protobuf 编解码往返 + patch_response 只改坐标保结构 + handle(mock 转发)。
 
-⚠️ 测的是编解码逻辑与坐标映射; gs-loc 头部的确切字节需真 iPhone 抓包核对(阶段5校准)。
+handle 走 forward+patch(转发手机原请求给真 gs-loc、拿真响应、只 patch 坐标),
+故端到端用 mock 的 _forward;真机链路由 .200 集成测试覆盖。
 """
 import socket
 import sys
@@ -48,28 +49,49 @@ def main():
     body = b"\x99\x99garbage-header" + mitm_wloc.build_request(macs)[len(mitm_wloc._header()):]
     assert mitm_wloc.parse_request(body) == macs; ok("头部不符时扫描回退仍解析出 BSSID")
 
-    # 插件 HTTP 处理: 喂一个 POST 请求, 读回 200 + 改写响应
-    a, b = socket.socketpair()
-    a.settimeout(5); b.settimeout(5)
-    rb = mitm_wloc.build_request(macs)
-    b.sendall(b"POST /clls/wloc HTTP/1.1\r\nHost: gs-loc.apple.com\r\nContent-Length: "
-              + str(len(rb)).encode() + b"\r\n\r\n" + rb)
-    plugin = mitm_wloc.WLOCPlugin(lat, lon)
-    t = threading.Thread(target=plugin.handle, args=(a, "gs-loc.apple.com", 443)); t.start()
-    resp_raw = b""
-    while b"\r\n\r\n" not in resp_raw:
-        resp_raw += b.recv(4096)
-    head, _, body2 = resp_raw.partition(b"\r\n\r\n")
-    clen = int([l.split(b":")[1].strip() for l in head.split(b"\r\n")
-                if l.lower().startswith(b"content-length:")][0])
-    while len(body2) < clen:
-        body2 += b.recv(4096)
-    t.join(5)
-    assert b"200 OK" in head; ok("插件返回 HTTP 200")
-    pr = mitm_wloc.parse_response(body2)
+    # patch_response: 合成"Apple 真响应"(头部前缀 + entries + 顶层非坐标字段), 只改坐标、保结构
+    prefix = b"\x00\x01\x00\x05zh_CN\x00\x00"
+    def _entry(mac, la, lo, ac):
+        loc = (mitm_wloc._f_varint(1, int(la * 1e8)) + mitm_wloc._f_varint(2, int(lo * 1e8))
+               + mitm_wloc._f_varint(3, ac))
+        return mitm_wloc._f_bytes(2, mitm_wloc._f_bytes(1, mac.encode()) + mitm_wloc._f_bytes(2, loc))
+    real = prefix + _entry(macs[0], 30.1, 120.1, 40) + _entry(macs[1], 31.2, 121.4, 65) \
+        + mitm_wloc._f_varint(5, 99)               # 顶层 numberOfResults 之类, 不该被动
+    patched = mitm_wloc.patch_response(real, lat, lon)
+    assert patched.startswith(prefix); ok("patch_response 保留头部前缀")
+    pr = mitm_wloc.parse_response(patched)
     assert set(pr) == set(macs) and all(approx(pr[m][0], lat) and approx(pr[m][1], lon) for m in macs)
-    ok("插件端到端: POST gs-loc 请求 → 改写坐标响应")
-    a.close(); b.close()
+    assert {pr[m][2] for m in macs} == {40, 65}; ok("patch_response 只改经纬度, 保 BSSID/精度")
+    top = {fn: v for fn, wt, v in mitm_wloc._fields(mitm_wloc._split_resp(patched)[1])}
+    assert top.get(5) == 99; ok("patch_response 保留顶层非坐标字段")
+
+    # 插件 handle: mock _forward 返回上面的"真响应", 验证 handle 转发→patch→回 200
+    orig_forward = mitm_wloc._forward
+    mitm_wloc._forward = lambda host, head, body: (b"application/x-protobuf", real)
+    try:
+        a, b = socket.socketpair()
+        a.settimeout(5); b.settimeout(5)
+        rb = mitm_wloc.build_request(macs)
+        b.sendall(b"POST /clls/wloc HTTP/1.1\r\nHost: gs-loc.apple.com\r\nContent-Length: "
+                  + str(len(rb)).encode() + b"\r\n\r\n" + rb)
+        plugin = mitm_wloc.WLOCPlugin(lat, lon)
+        t = threading.Thread(target=plugin.handle, args=(a, "gs-loc.apple.com", 443)); t.start()
+        resp_raw = b""
+        while b"\r\n\r\n" not in resp_raw:
+            resp_raw += b.recv(4096)
+        rhead, _, body2 = resp_raw.partition(b"\r\n\r\n")
+        clen = int([l.split(b":")[1].strip() for l in rhead.split(b"\r\n")
+                    if l.lower().startswith(b"content-length:")][0])
+        while len(body2) < clen:
+            body2 += b.recv(4096)
+        t.join(5)
+        assert b"200 OK" in rhead; ok("插件返回 HTTP 200")
+        pr2 = mitm_wloc.parse_response(body2)
+        assert set(pr2) == set(macs) and all(approx(pr2[m][0], lat) and approx(pr2[m][1], lon) for m in macs)
+        ok("插件端到端(mock 转发): 真响应 → patch 坐标 → 回给手机")
+        a.close(); b.close()
+    finally:
+        mitm_wloc._forward = orig_forward
 
     print(f"\n通过 {pass_n} 项断言")
 

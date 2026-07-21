@@ -198,6 +198,8 @@ OPS_BACK = {"inline_keyboard": [[{"text": "⬅️ 返回运维", "callback_data"
                                [{"text": "🏠 主菜单", "callback_data": "menu"}]]}
 DNS_BACK = {"inline_keyboard": [[{"text": "⬅️ 返回 DNS 上游", "callback_data": "dnsup"}],
                                [{"text": "🏠 主菜单", "callback_data": "menu"}]]}
+WLOC_BACK = {"inline_keyboard": [[{"text": "⬅️ 返回 WLOC", "callback_data": "wloc:menu"}],
+                                [{"text": "🏠 主菜单", "callback_data": "menu"}]]}
 
 def _back_rows(kb):
     return [row[:] for row in kb["inline_keyboard"]]
@@ -425,7 +427,7 @@ def _mitm_domains():
 
 # ── MITM 插件(Feature B / iOS): WLOC 位置改写 ──
 MITM_CONFIG = "/etc/privdns-gateway/mitm.json"
-MITM_PLUGIN_DOMAINS = {"wloc": ["gs-loc.apple.com"]}   # 插件 → 接管域名(与 mitm_server.PLUGIN_DOMAINS 同源)
+MITM_PLUGIN_DOMAINS = {"wloc": ["gs-loc.apple.com", "gs-loc-cn.apple.com"]}   # 插件 → 接管域名(与 mitm_server.PLUGIN_DOMAINS 同源)
 
 def _mitm_config():
     try:
@@ -469,31 +471,101 @@ def _mitm_sync():
     return ok, msg
 
 def _wloc_state():
-    w = _mitm_config().get("wloc") or {}
+    """归一化 WLOC 配置(迁移老单坐标格式)→ {enabled, accuracy, active, locations:[{name,lat,lon}]}。"""
+    w = dict(_mitm_config().get("wloc") or {})
+    locs = w.get("locations")
+    if locs is None:                              # 迁移老格式 {lat,lon} → 一个"默认"地点
+        locs = [{"name": "默认", "lat": w["lat"], "lon": w["lon"]}] if "lat" in w and "lon" in w else []
+    w["locations"] = locs
+    w.setdefault("accuracy", 50)
+    w.setdefault("enabled", False)
+    if w.get("active") not in [l["name"] for l in locs]:
+        w["active"] = locs[0]["name"] if locs else None
     return w
 
-def set_wloc(on, lat=None, lon=None):
-    """开/关 WLOC 位置改写(仅 iOS)。lat/lon 给出即更新坐标。"""
+def _wloc_active(w=None):
+    w = w or _wloc_state()
+    for l in w.get("locations", []):
+        if l["name"] == w.get("active"):
+            return l
+    return None
+
+def _wloc_save(w):
+    cfg = _mitm_config()
+    cfg["wloc"] = {"enabled": bool(w.get("enabled")), "accuracy": w.get("accuracy", 50),
+                   "active": w.get("active"), "locations": w.get("locations", [])}
+    _save_mitm_config(cfg)
+
+def wloc_add(name, lat, lon):
+    """加/改一个命名地点(不自动启用; 无激活项时设为激活)。"""
+    if _platform() != "ios":
+        return False, "位置改写(WLOC)仅 iOS 平台可用。"
+    name = (name or "").strip()
+    if not name:
+        return False, "地点名不能为空"
+    w = _wloc_state()
+    w["locations"] = [l for l in w["locations"] if l["name"] != name]
+    w["locations"].append({"name": name, "lat": lat, "lon": lon})
+    if not w.get("active"):
+        w["active"] = name
+    _wloc_save(w)
+    return True, f"✅ 已添加地点 <b>{name}</b>({lat}, {lon})。到「📍 地点/切换」点它即切换。"
+
+def wloc_del(name):
+    w = _wloc_state()
+    if not any(l["name"] == name for l in w["locations"]):
+        return False, "没有这个地点"
+    w["locations"] = [l for l in w["locations"] if l["name"] != name]
+    if w.get("active") == name:
+        w["active"] = w["locations"][0]["name"] if w["locations"] else None
+        if not w["active"]:
+            w["enabled"] = False
+    _wloc_save(w)
+    ok, msg = _mitm_sync()
+    return (True, f"✅ 已删除 <b>{name}</b>") if ok else (False, msg)
+
+def wloc_switch(name):
+    """切换激活地点(启用中则热重载坐标)。"""
+    w = _wloc_state()
+    if not any(l["name"] == name for l in w["locations"]):
+        return False, "没有这个地点"
+    w["active"] = name
+    _wloc_save(w)
+    if w.get("enabled"):
+        ok, msg = _mitm_sync()
+        if not ok:
+            return False, msg
+    loc = _wloc_active(w)
+    tail = "" if w.get("enabled") else "\n(WLOC 未开启, 点「开启」才生效)"
+    return True, f"✅ 已切到 <b>{name}</b>({loc['lat']}, {loc['lon']})" + tail
+
+def wloc_enable(on):
+    """开/关 WLOC(开启需已有激活地点)。"""
     if _platform() != "ios":
         return False, "位置改写(WLOC)仅 iOS 平台可用(安卓需 root, 且走 Google 定位, 不支持)。"
-    cfg = _mitm_config()
-    w = cfg.setdefault("wloc", {})
-    if lat is not None:
-        w["lat"] = lat
-    if lon is not None:
-        w["lon"] = lon
-    w.setdefault("accuracy", 50)
-    if on and ("lat" not in w or "lon" not in w):
-        return False, "请先设定坐标: 发「纬度,经度」如 35.6812,139.7671"
+    w = _wloc_state()
+    if on and not _wloc_active(w):
+        return False, "请先「➕ 添加地点」设一个坐标再开启。"
     w["enabled"] = bool(on)
-    _save_mitm_config(cfg)
+    _wloc_save(w)
     ok, msg = _mitm_sync()
     if not ok:
         return False, msg
     if on:
-        return True, (f"✅ 位置改写已开启 → ({w['lat']}, {w['lon']})\n"
-                      "⚠️ iPhone 需装并信任本网关 CA(在「📱 客户端 → iOS 描述文件」里已内含)才生效。")
+        loc = _wloc_active(w)
+        return True, (f"✅ 位置改写已开启 → <b>{w['active']}</b>({loc['lat']}, {loc['lon']})\n"
+                      "⚠️ 需 iPhone 装并信任本网关 CA;手机「内网卡 + 控制中心关 WiFi」时才生效。"
+                      "iOS 26 缓存重, 切换后去「定位服务」关开或重启才刷新。")
     return True, "✅ 位置改写已关闭。"
+
+def set_wloc(on, lat=None, lon=None):
+    """兼容旧接口: 给了 lat/lon 就存成「默认」地点并激活, 再开/关。"""
+    if _platform() != "ios":
+        return False, "位置改写(WLOC)仅 iOS 平台可用(安卓需 root, 且走 Google 定位, 不支持)。"
+    if lat is not None and lon is not None:
+        wloc_add("默认", lat, lon)
+        wloc_switch("默认")
+    return wloc_enable(on)
 
 def _render_mihomo_file():
     """从当前 model(SB)渲染出 mihomo 配置并落盘。返回渲染 meta(dropped/unknown)。"""
@@ -2609,23 +2681,59 @@ def handle_cb(chat, mid, data):
                                   [{"text": "🏠 主菜单", "callback_data": "menu"}]]}); return
     if data in ("tfo:on", "tfo:off"):
         ok, msg = set_tfo(data == "tfo:on"); edit(chat, mid, msg if ok else ("❌ " + msg), OPS_BACK); return
-    if data == "wloc":
+    if data in ("wloc", "wloc:menu"):
         if _platform() != "ios":
             edit(chat, mid, "位置改写(WLOC)仅 iOS 平台可用。", OPS_BACK); return
-        w = _wloc_state(); on = bool(w.get("enabled"))
-        coord = f"({w['lat']}, {w['lon']})" if "lat" in w and "lon" in w else "未设"
-        edit(chat, mid, f"🍏 <b>位置改写 (WLOC)</b>\n当前: <b>{'开启' if on else '关闭'}</b>　坐标: <b>{coord}</b>\n"
-             "把 iPhone 定位改写到设定坐标(MITM 截 gs-loc.apple.com)。\n"
-             "⚠️ 需在「📱 客户端 → iOS 描述文件」装并<b>信任本网关 CA</b>(设置→通用→VPN与设备管理 装描述文件, 再到 关于→证书信任设置 开启完全信任)才生效。",
-             {"inline_keyboard": [[{"text": "开启", "callback_data": "wloc:on"}, {"text": "关闭", "callback_data": "wloc:off"}],
-                                  [{"text": "📍 设坐标", "callback_data": "wloc:coord"}],
-                                  [{"text": "⬅️ 返回运维", "callback_data": "nav:ops"}],
-                                  [{"text": "🏠 主菜单", "callback_data": "menu"}]]}); return
-    if data == "wloc:coord":
-        state[chat] = "wloc_coord"
-        send(chat, "发「<b>纬度,经度</b>」如 <code>35.6812,139.7671</code>(小数;北纬东经为正)。/cancel 取消。", BACK); return
+        w = _wloc_state(); on = bool(w.get("enabled")); loc = _wloc_active(w)
+        cur = f"<b>{w['active']}</b>({loc['lat']}, {loc['lon']})" if loc else "未设"
+        edit(chat, mid, f"🍏 <b>位置改写 (WLOC)</b>\n状态: <b>{'🟢 开启' if on else '关闭'}</b>　当前: {cur}　地点: {len(w['locations'])} 个\n"
+             "把 iPhone 网络定位改写到设定城市(任意城市, 含跨国, 东京实测✅)。\n"
+             "⚠️ 生效条件:手机<b>内网卡在用 + 控制中心关 WiFi</b>,并装+信任本网关 CA(「📱 客户端 → iOS 描述文件」内含)。\n"
+             "⏳ <b>iOS 26 缓存重</b>:切城市后手机会滞后,去「定位服务」关开一次或重启才刷新;切到差很远的地方会先转圈再稳。",
+             {"inline_keyboard": [
+                 [{"text": "🟢 已开启" if on else "✅ 开启", "callback_data": "wloc:on"},
+                  {"text": "关闭", "callback_data": "wloc:off"}],
+                 [{"text": "📍 地点 / 切换", "callback_data": "wloc:list"}],
+                 [{"text": "➕ 添加地点", "callback_data": "wloc:add"},
+                  {"text": "🗑 删除地点", "callback_data": "wloc:del"}],
+                 [{"text": "⬅️ 返回运维", "callback_data": "nav:ops"}],
+                 [{"text": "🏠 主菜单", "callback_data": "menu"}]]}); return
+    if data == "wloc:list":
+        w = _wloc_state()
+        if not w["locations"]:
+            edit(chat, mid, "还没有地点。点「➕ 添加地点」。", WLOC_BACK); return
+        kb = [[{"text": ("✅ " if l["name"] == w["active"] else "○ ")
+                + f"{l['name']} ({l['lat']}, {l['lon']})", "callback_data": f"wloc:sw:{i}"}]
+              for i, l in enumerate(w["locations"])]
+        kb.append([{"text": "⬅️ 返回 WLOC", "callback_data": "wloc:menu"}])
+        edit(chat, mid, "点一个地点即切换到它(开启中会热切换):", {"inline_keyboard": kb}); return
+    if data == "wloc:add":
+        state[chat] = "wloc_add"
+        send(chat, "发「<b>名称 纬度,经度</b>」如 <code>上海 31.2304,121.4737</code>(小数;北纬东经为正)。/cancel 取消。", BACK); return
+    if data == "wloc:del":
+        w = _wloc_state()
+        if not w["locations"]:
+            edit(chat, mid, "没有可删的地点。", WLOC_BACK); return
+        kb = [[{"text": f"🗑 {l['name']} ({l['lat']}, {l['lon']})", "callback_data": f"wloc:rm:{i}"}]
+              for i, l in enumerate(w["locations"])]
+        kb.append([{"text": "⬅️ 返回 WLOC", "callback_data": "wloc:menu"}])
+        edit(chat, mid, "点一个删除:", {"inline_keyboard": kb}); return
+    if data.startswith("wloc:sw:"):
+        w = _wloc_state(); i = int(data.rsplit(":", 1)[1])
+        if 0 <= i < len(w["locations"]):
+            ok, msg = wloc_switch(w["locations"][i]["name"])
+            edit(chat, mid, msg if ok else ("❌ " + msg),
+                 {"inline_keyboard": [[{"text": "📍 地点列表", "callback_data": "wloc:list"}],
+                                      [{"text": "⬅️ 返回 WLOC", "callback_data": "wloc:menu"}]]})
+        return
+    if data.startswith("wloc:rm:"):
+        w = _wloc_state(); i = int(data.rsplit(":", 1)[1])
+        if 0 <= i < len(w["locations"]):
+            ok, msg = wloc_del(w["locations"][i]["name"])
+            edit(chat, mid, msg if ok else ("❌ " + msg), WLOC_BACK)
+        return
     if data in ("wloc:on", "wloc:off"):
-        ok, msg = set_wloc(data == "wloc:on"); edit(chat, mid, msg if ok else ("❌ " + msg), OPS_BACK); return
+        ok, msg = wloc_enable(data == "wloc:on"); edit(chat, mid, msg if ok else ("❌ " + msg), WLOC_BACK); return
     if data == "switchcore":
         cur = _core_backend(); tgt = "mihomo" if cur == "singbox" else "singbox"
         extra = ("mihomo 活跃维护、内核可持续更新(摆脱 sing-box 1.12 版本天花板)。\n" if tgt == "mihomo"
@@ -2838,17 +2946,14 @@ def handle_text(chat, text, mid=None):
         if len(p) < 2:
             send_plain(chat, "格式: remote|local 地址1 [地址2 …]"); return
         ok, msg = set_mosdns_upstream(p[0].lower(), p[1:]); send_plain(chat, msg if ok else ("❌ " + msg)); return
-    if act == "wloc_coord":
-        m = re.match(r"^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$", text)
+    if act == "wloc_add":
+        m = re.match(r"^\s*(\S+)\s+(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$", text)
         if not m:
-            send_plain(chat, "格式: 纬度,经度  如 35.6812,139.7671"); return
-        lat, lon = float(m.group(1)), float(m.group(2))
+            send_plain(chat, "格式: <b>名称 纬度,经度</b>  如 <code>上海 31.2304,121.4737</code>"); return
+        name, lat, lon = m.group(1), float(m.group(2)), float(m.group(3))
         if not (-90 <= lat <= 90 and -180 <= lon <= 180):
             send_plain(chat, "坐标超范围(纬度 -90~90, 经度 -180~180)"); return
-        cur_on = bool(_wloc_state().get("enabled"))
-        ok, msg = set_wloc(cur_on, lat=lat, lon=lon)
-        if ok and not cur_on:
-            msg = f"✅ 坐标已设为 ({lat}, {lon})。到「🍏 位置改写」点开启生效。"
+        ok, msg = wloc_add(name, lat, lon)
         send_plain(chat, msg if ok else ("❌ " + msg)); return
     if act == "set_dot":
         send_plain(chat, "正在校验域名并签发证书(约 30-60 秒, 期间代理短暂中断)…")

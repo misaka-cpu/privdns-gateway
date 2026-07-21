@@ -235,7 +235,7 @@ def check_mosdns_ratelimit():
     #    会被误判为 ok。故用 step.start() < i_cache 校验, 而非只看首个 !$client_limiter 的位置。
     blk = _internal_seq_block(conf)
     i_cache = blk.find("$lazy_cache")
-    step = re.search(r'matches:\s*"?!\$client_limiter"?\s*\n\s*exec:\s*reject\s+5\b', blk)
+    step = re.search(r'matches:\s*"?!\$client_limiter"?[ \t]*(?:#[^\n]*)?\n\s*exec:\s*reject\s+5\b', blk)
     if not step or (i_cache >= 0 and step.start() >= i_cache):
         return _RL_WARN
     return ("ok", "限流", "单客户端 QPS 兜底已就位(rate_limiter qps200/burst400, reject 5, 缓存前)")

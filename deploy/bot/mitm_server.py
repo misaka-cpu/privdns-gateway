@@ -72,19 +72,34 @@ def _socks5_target(conn):
     return host, port
 
 
+def _log(msg):
+    import sys
+    import time
+    sys.stderr.write("[pdg-mitm %s] %s\n" % (time.strftime("%H:%M:%S"), msg))
+    sys.stderr.flush()
+
+
 def _handle(conn):
+    host = "?"
     try:
         conn.settimeout(30)                  # 防卡死连接长期占线程(本机 mihomo 连入, 30s 足够)
         host, port = _socks5_target(conn)
         plugin = _match(host)
         if plugin is None:
+            _log("非接管连接 host=%s → 关闭" % host)
             conn.close()
             return
         conn.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")   # socks5 成功应答
         crt, key = mitm_ca.leaf_cert(host)
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(crt, key)
-        tls = ctx.wrap_socket(conn, server_side=True)
+        try:
+            tls = ctx.wrap_socket(conn, server_side=True)
+        except Exception as e:               # noqa: BLE001  握手失败 = 证书 pinning 或 CA 未信任
+            _log("TLS 握手失败 host=%s(pinning 或未信任 CA?): %s" % (host, e))
+            conn.close()
+            return
+        _log("TLS 已终止 host=%s → 插件 %s" % (host, type(plugin).__name__))
         try:
             plugin.handle(tls, host, port)
         finally:
@@ -92,7 +107,8 @@ def _handle(conn):
                 tls.close()
             except Exception:  # noqa: BLE001
                 pass
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        _log("连接异常 host=%s: %s" % (host, e))
         try:
             conn.close()
         except Exception:  # noqa: BLE001
@@ -111,11 +127,24 @@ def serve(listen="127.0.0.1", port=7894):
 
 MITM_CONFIG = "/etc/privdns-gateway/mitm.json"
 # 插件名 → 接管域名(bot 与服务共识; 与 mitm_hijack.txt / 渲染器同源)
-PLUGIN_DOMAINS = {"wloc": ["gs-loc.apple.com"]}
+PLUGIN_DOMAINS = {"wloc": ["gs-loc.apple.com", "gs-loc-cn.apple.com"]}
+
+
+def _wloc_active(w):
+    """取 WLOC 激活地点坐标; 兼容老单坐标格式 {lat,lon}。返回 {lat,lon} 或 None。"""
+    locs = w.get("locations")
+    if locs:
+        for loc in locs:
+            if loc.get("name") == w.get("active"):
+                return loc
+        return locs[0]
+    if "lat" in w and "lon" in w:                 # 老格式(单坐标)
+        return {"lat": w["lat"], "lon": w["lon"]}
+    return None
 
 
 def load_from_config(path=None):
-    """按 mitm.json 里启用的插件登记。返回已加载插件名列表。"""
+    """按 mitm.json 里启用的插件登记(WLOC 用激活地点坐标)。返回已加载插件名列表。"""
     import json
     clear()
     try:
@@ -124,9 +153,10 @@ def load_from_config(path=None):
         return []
     loaded = []
     w = cfg.get("wloc") or {}
-    if w.get("enabled"):
+    loc = _wloc_active(w)
+    if w.get("enabled") and loc:
         import mitm_wloc
-        register(mitm_wloc.WLOCPlugin(float(w.get("lat", 0)), float(w.get("lon", 0)),
+        register(mitm_wloc.WLOCPlugin(float(loc["lat"]), float(loc["lon"]),
                                       int(w.get("accuracy", 50))))
         loaded.append("wloc")
     return loaded
