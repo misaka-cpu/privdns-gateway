@@ -613,6 +613,7 @@ cmd_snapshot(){
 
 cmd_rollback(){
   need_root rollback; _lock
+  local pre_core; pre_core="$(_pdg_core)"   # 回滚前正在运行的内核(跨内核回滚要据此停旧核)
   local snaps; mapfile -t snaps < <(ls -1dt "$SNAP_DIR"/*/ 2>/dev/null)
   [[ ${#snaps[@]} -gt 0 ]] || { echo "没有快照(先 pdg snapshot)"; return 1; }
   echo "可用快照(新→旧):"; local i=0; for s in "${snaps[@]}"; do echo "  [$i] $(basename "$s")"; i=$((i+1)); done
@@ -642,8 +643,10 @@ cmd_rollback(){
     fi
     panel_sanitized=1
   fi
-  # 内核配置校验: 按当前后端 (mihomo / sing-box) 校验快照里对应配置
-  if [[ "$(_pdg_core)" == mihomo ]]; then
+  # 内核配置校验: 按**快照记录的** backend(而非当前) 校验快照里对应内核配置
+  local snap_core; snap_core="$(cat "$tree/etc/privdns-gateway/backend" 2>/dev/null)"
+  [[ "$snap_core" == mihomo || "$snap_core" == singbox ]] || snap_core="$(_pdg_core)"
+  if [[ "$snap_core" == mihomo ]]; then
     [[ -f "$tree/etc/mihomo/config.yaml" ]] && { mihomo -t -d "$tree/etc/mihomo" -f "$tree/etc/mihomo/config.yaml" >/dev/null 2>&1 || { echo "❌ 快照的 mihomo 配置 check 失败, 中止"; rm -rf "$tmp"; return 1; }; }
   elif [[ -f "$tree/etc/sing-box/config.json" ]]; then
     if ! sed "s#/etc/sing-box/rs/#$tree/etc/sing-box/rs/#g" "$tree/etc/sing-box/config.json" > "$tmp/sb.chk"; then
@@ -661,7 +664,20 @@ cmd_rollback(){
   (( panel_sanitized == 1 )) && c_g "  已净化回滚出的面板临时态 → 关闭"
   systemctl daemon-reload
   nft -f /etc/nftables.conf 2>/dev/null || true
-  systemctl restart mosdns "$(_pdg_core_svc)" pdg-bot pdg-probe81 2>/dev/null || true
+  local new_svc; new_svc="$(_pdg_core_svc)"   # 已是快照恢复后的 backend 对应内核
+  if [[ "$(_pdg_core)" != "$pre_core" ]]; then
+    # 跨内核回滚: 旧核 disable+stop, 快照核 enable+start(重生 unit 保正确), 免重启双起
+    local old_svc; old_svc="$([[ "$pre_core" == mihomo ]] && echo mihomo || echo sing-box)"
+    # shellcheck source=/dev/null
+    source "$REPO_DIR/lib/units.sh" 2>/dev/null || true
+    if [[ "$new_svc" == mihomo ]]; then pdg_write_unit pdg_unit_mihomo /etc/systemd/system/mihomo.service
+    else pdg_write_unit pdg_unit_singbox /etc/systemd/system/sing-box.service; fi
+    systemctl daemon-reload
+    _core_kernel_activate "$new_svc" "$old_svc" || c_y "  跨内核回滚未完全达标(目标 $new_svc / 旧核 $old_svc), 请 pdg doctor 复查"
+    systemctl restart mosdns pdg-bot pdg-probe81 2>/dev/null || true
+  else
+    systemctl restart mosdns "$new_svc" pdg-bot pdg-probe81 2>/dev/null || true
+  fi
   systemctl is-enabled pdg-mitm >/dev/null 2>&1 && { systemctl reset-failed pdg-mitm 2>/dev/null; systemctl restart pdg-mitm 2>/dev/null; }   # iOS/WLOC: 清 start-limit + 一并恢复 MITM 服务
   systemctl restart systemd-journald 2>/dev/null || true   # journald CanReload=no: 还原封顶需 restart 才生效
   echo "✅ 已回滚并重启服务"
@@ -978,6 +994,32 @@ _switchcore_nft(){   # $1=target 渲染并应用对应内核的 nft(用当前 SS
   nft -f /etc/nftables.conf
 }
 
+# 内核切换的 enable/disable 收尾 + 状态核验(单一职责, 便于打桩测试)。
+# 目标: 目标核 enable --now 且 active+enabled; 旧核 disable --now 且 inactive+非 enabled
+# (旧核只 stop 不 disable = 仍自启, 重启会双起 → 冲突)。任一不满足返回非 0。
+# $1=目标核 svc  $2=旧核 svc。
+_core_kernel_activate(){
+  local tgt="$1" old="$2"
+  systemctl reset-failed "$tgt" 2>/dev/null
+  systemctl enable --now "$tgt" >/dev/null 2>&1 || { echo "  enable/start $tgt 失败"; return 1; }
+  systemctl disable --now "$old" >/dev/null 2>&1 || true   # 旧核停用+关自启; 下面核验兜底
+  sleep 2
+  [[ "$(systemctl is-active  "$tgt" 2>/dev/null)" == active  ]] || { echo "  $tgt 未 active";  return 1; }
+  [[ "$(systemctl is-enabled "$tgt" 2>/dev/null)" == enabled ]] || { echo "  $tgt 未 enabled"; return 1; }
+  [[ "$(systemctl is-active  "$old" 2>/dev/null)" != active  ]] || { echo "  旧核 $old 仍 active"; return 1; }
+  [[ "$(systemctl is-enabled "$old" 2>/dev/null)" == enabled ]] && { echo "  旧核 $old 仍 enabled(重启会双起)"; return 1; }
+  return 0
+}
+
+# 切换失败回退: 目标核 disable+stop, 旧核 enable --now 恢复原态。
+# $1=目标核 svc  $2=旧核 svc。
+_core_kernel_restore(){
+  local tgt="$1" old="$2"
+  systemctl disable --now "$tgt" >/dev/null 2>&1 || true
+  systemctl reset-failed "$old" 2>/dev/null
+  systemctl enable --now "$old" >/dev/null 2>&1 || true
+}
+
 cmd_switch_core(){
   need_root switch-core; _lock
   local target="${1:-}" cur march plat
@@ -991,6 +1033,8 @@ cmd_switch_core(){
   plat="$(_pdg_platform)"
   # shellcheck source=/dev/null
   source "$REPO_DIR/lib/versions.sh" 2>/dev/null || { echo "❌ 读不到 versions.sh"; return 1; }
+  # shellcheck source=/dev/null
+  source "$REPO_DIR/lib/units.sh"   2>/dev/null || { echo "❌ 读不到 units.sh"; return 1; }
   cp /etc/nftables.conf /etc/nftables.conf.scbak 2>/dev/null
 
   if [[ "$target" == mihomo ]]; then
@@ -1008,35 +1052,18 @@ cmd_switch_core(){
        || ! mihomo -t -d /etc/mihomo -f /etc/mihomo/config.yaml >/dev/null 2>&1; then
       printf 'singbox\n' > /etc/privdns-gateway/backend; echo "❌ 渲染/校验 mihomo 配置失败(或有出口 mihomo 无法转换), 已回滚标记, 未切换"; return 1
     fi
-    cat > /etc/systemd/system/mihomo.service <<'EOF'
-[Unit]
-Description=mihomo (PrivDNS Gateway core)
-After=network-online.target mosdns.service
-Wants=network-online.target
-[Service]
-ExecStart=/usr/local/bin/mihomo -d /etc/mihomo -f /etc/mihomo/config.yaml
-Restart=on-failure
-RestartSec=3
-LimitNOFILE=1048576
-[Install]
-WantedBy=multi-user.target
-EOF
-    [[ "$plat" == ios ]] && cat > /etc/systemd/system/pdg-mitm.service <<'EOF'
-[Unit]
-Description=pdg-mitm
-After=network-online.target
-[Service]
-ExecStart=/usr/bin/python3 /opt/pdg-bot/mitm_server.py 7894
-Restart=on-failure
-RestartSec=3
-[Install]
-WantedBy=multi-user.target
-EOF
+    pdg_write_unit pdg_unit_mihomo /etc/systemd/system/mihomo.service   # 与装机同源(含 SAFE_PATHS)
+    [[ "$plat" == ios ]] && pdg_write_unit pdg_unit_pdg_mitm /etc/systemd/system/pdg-mitm.service
     systemctl daemon-reload
     _switchcore_nft mihomo || { printf 'singbox\n' > /etc/privdns-gateway/backend; [[ -f /etc/nftables.conf.scbak ]] && { cp /etc/nftables.conf.scbak /etc/nftables.conf; nft -f /etc/nftables.conf; }; echo "❌ nft 应用失败, 已回滚"; return 1; }
-    systemctl stop sing-box 2>/dev/null
-    systemctl reset-failed mihomo 2>/dev/null; systemctl enable --now mihomo >/dev/null 2>&1
-    [[ "$plat" == ios ]] && { systemctl enable --now pdg-mitm >/dev/null 2>&1 || true; }
+    if ! _core_kernel_activate mihomo sing-box; then
+      c_y "mihomo 启动/自启核验失败 → 回滚到 sing-box"
+      printf 'singbox\n' > /etc/privdns-gateway/backend
+      [[ -f /etc/nftables.conf.scbak ]] && { cp /etc/nftables.conf.scbak /etc/nftables.conf; nft -f /etc/nftables.conf 2>/dev/null; }
+      _core_kernel_restore mihomo sing-box; rm -f /etc/nftables.conf.scbak
+      echo "❌ 切换失败, 已回滚到 sing-box 内核。"; return 1
+    fi
+    [[ "$plat" == ios ]] && { systemctl reset-failed pdg-mitm 2>/dev/null; systemctl enable --now pdg-mitm >/dev/null 2>&1 || true; }
   else
     if ! sing-box version 2>/dev/null | grep -q "version $SINGBOX_VER"; then
       c_g "下载 sing-box $SINGBOX_VER…"; local t; t=$(mktemp -d)
@@ -1049,40 +1076,23 @@ EOF
     if ! sing-box check -c /etc/sing-box/config.json >/dev/null 2>&1; then
       printf 'mihomo\n' > /etc/privdns-gateway/backend; echo "❌ sing-box 配置校验失败, 已回滚, 未切换"; return 1
     fi
-    cat > /etc/systemd/system/sing-box.service <<'EOF'
-[Unit]
-Description=sing-box
-After=network-online.target
-Wants=network-online.target
-[Service]
-ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
-Restart=on-failure
-RestartSec=3
-LimitNOFILE=1048576
-[Install]
-WantedBy=multi-user.target
-EOF
+    pdg_write_unit pdg_unit_singbox /etc/systemd/system/sing-box.service
     systemctl daemon-reload
     _switchcore_nft singbox || { printf 'mihomo\n' > /etc/privdns-gateway/backend; [[ -f /etc/nftables.conf.scbak ]] && { cp /etc/nftables.conf.scbak /etc/nftables.conf; nft -f /etc/nftables.conf; }; echo "❌ nft 应用失败, 已回滚"; return 1; }
-    systemctl stop mihomo pdg-mitm 2>/dev/null
-    systemctl reset-failed sing-box 2>/dev/null; systemctl enable --now sing-box >/dev/null 2>&1
+    if ! _core_kernel_activate sing-box mihomo; then
+      c_y "sing-box 启动/自启核验失败 → 回滚到 mihomo"
+      printf 'mihomo\n' > /etc/privdns-gateway/backend
+      [[ -f /etc/nftables.conf.scbak ]] && { cp /etc/nftables.conf.scbak /etc/nftables.conf; nft -f /etc/nftables.conf 2>/dev/null; }
+      _core_kernel_restore sing-box mihomo; rm -f /etc/nftables.conf.scbak
+      echo "❌ 切换失败, 已回滚到 mihomo 内核。"; return 1
+    fi
+    systemctl stop pdg-mitm 2>/dev/null   # sing-box 暂无 MITM 路由(Item 6 将改为 WLOC 感知)
   fi
 
-  sleep 2
-  local svc; svc="$(_pdg_core_svc)"
-  if [[ "$(systemctl is-active "$svc" 2>/dev/null)" == active ]]; then
-    rm -f /etc/nftables.conf.scbak
-    echo "✅ 已切换到 $target 内核(出口/分流/证书/DoT 未动)。"
-    return 0
-  fi
-  # 回滚
-  c_y "$svc 启动失败 → 回滚到 $cur …"
-  printf '%s\n' "$cur" > /etc/privdns-gateway/backend
-  [[ -f /etc/nftables.conf.scbak ]] && { cp /etc/nftables.conf.scbak /etc/nftables.conf; nft -f /etc/nftables.conf 2>/dev/null; rm -f /etc/nftables.conf.scbak; }
-  systemctl stop "$svc" 2>/dev/null
-  systemctl reset-failed "$(_pdg_core_svc)" 2>/dev/null; systemctl start "$(_pdg_core_svc)" 2>/dev/null
-  echo "❌ 切换失败, 已回滚到 $cur 内核。"
-  return 1
+  # 走到这里 = 目标核已 active+enabled 且旧核已 inactive+disabled(activate 已核验)。
+  rm -f /etc/nftables.conf.scbak
+  echo "✅ 已切换到 $target 内核(出口/分流/证书/DoT 未动)。"
+  return 0
 }
 
 # 切换劫持模式: all(非CN全劫持) | gfw(只劫持 GFWList 真被墙域名, 非墙海外直连)。换 hijack_set 加载的域名文件。

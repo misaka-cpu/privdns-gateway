@@ -82,6 +82,9 @@ jobs:
       - name: "低内存模式回归 (fixture meminfo 解析/渲染/迁移幂等)"
         run: bash tests/test-lowmem.sh
 
+      - name: "switch-core 内核切换纪律回归 (假 systemctl+重启模拟: 只起一个内核/跨核回滚/unit 无漂移)"
+        run: bash tests/test-switch-core.sh
+
       - name: "GMS 推送端口迁移回归 (fw/sing-box 补 5228-5230, 自定义跳过, 失败回滚)"
         run: bash tests/test-gms-migration.sh
 

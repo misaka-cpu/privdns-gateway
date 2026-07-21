@@ -72,6 +72,8 @@ fi
 # ── 版本 + 钉死 SHA256(供应链校验)──
 # shellcheck source=lib/versions.sh
 source "$REPO_DIR/lib/versions.sh"
+# shellcheck source=lib/units.sh
+source "$REPO_DIR/lib/units.sh"   # systemd unit 单一事实源(与 switch-core 共用, 免漂移)
 
 # ── 事务性安装: 失败自动回滚(只撤本次新装的, 不误伤既有可用部署)──
 INSTALL_OK=0; ROLLBACK_DONE=0; FORCED_REINSTALL=0
@@ -342,50 +344,14 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
 if [[ "$CORE" == mihomo ]]; then
-  cat > /etc/systemd/system/mihomo.service <<'EOF'
-[Unit]
-Description=mihomo (PrivDNS Gateway core)
-After=network-online.target mosdns.service
-Wants=network-online.target
-[Service]
-ExecStart=/usr/local/bin/mihomo -d /etc/mihomo -f /etc/mihomo/config.yaml
-Environment=SAFE_PATHS=/etc/sing-box/ui/dist
-Restart=on-failure
-RestartSec=3
-LimitNOFILE=1048576
-[Install]
-WantedBy=multi-user.target
-EOF
+  pdg_write_unit pdg_unit_mihomo  /etc/systemd/system/mihomo.service
 else
-  cat > /etc/systemd/system/sing-box.service <<'EOF'
-[Unit]
-Description=sing-box
-After=network-online.target
-Wants=network-online.target
-[Service]
-ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
-Restart=on-failure
-RestartSec=3
-LimitNOFILE=1048576
-[Install]
-WantedBy=multi-user.target
-EOF
+  pdg_write_unit pdg_unit_singbox /etc/systemd/system/sing-box.service
 fi
 
 # pdg-mitm: MITM 插件服务(Feature B, 仅 iOS)。按 /etc/privdns-gateway/mitm.json 加载启用的插件。
 if [[ "$PLATFORM" == ios ]]; then
-  cat > /etc/systemd/system/pdg-mitm.service <<'EOF'
-[Unit]
-Description=pdg-mitm (PrivDNS Gateway MITM plugins)
-After=network-online.target
-Wants=network-online.target
-[Service]
-ExecStart=/usr/bin/python3 /opt/pdg-bot/mitm_server.py 7894
-Restart=on-failure
-RestartSec=3
-[Install]
-WantedBy=multi-user.target
-EOF
+  pdg_write_unit pdg_unit_pdg_mitm /etc/systemd/system/pdg-mitm.service
 fi
 
 # ── 6. DoT 证书 ──
