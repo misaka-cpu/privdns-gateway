@@ -168,6 +168,7 @@ sudo pdg uninstall [--purge]   # 卸载(--purge 连配置删)
 - [docs/TROUBLESHOOTING-PLAYBOOK.md](docs/TROUBLESHOOTING-PLAYBOOK.md) — 排障手册(症状 → 查 → 修)
 - [docs/production-notes.md](docs/production-notes.md) — 实战记录与踩坑(sing-box 版本坑、QUIC 自环、ECS、安全加固等)
 - [docs/design-mitm-plugins.md](docs/design-mitm-plugins.md) — iOS 位置改写 (WLOC) 设计、forward+patch 原理与配方
+- [docs/RELEASE-CHECKLIST.md](docs/RELEASE-CHECKLIST.md) — 发版前检查清单(装机 / 升级 / 切核 / WLOC 集成自测)
 - [CHANGELOG.md](CHANGELOG.md) — 更新日志
 
 ## 免责声明
