@@ -158,6 +158,18 @@ def main():
     assert cfg3["secret"] == "S3" and cfg3["external-ui"] == "/etc/mihomo/ui"
     assert cfg3["external-ui-url"] == "https://x/ui.zip"
 
+    # ── mixed 入站(TG 代理 :8445)→ mihomo listeners + IN-NAME 路由(pin 到出口/final)──
+    sb_tg = {**SB,
+             "inbounds": [{"type": "direct", "tag": "in-https", "listen_port": 443},
+                          {"type": "mixed", "tag": "tg-proxy", "listen": "0.0.0.0", "listen_port": 8445}],
+             "route": {**SB["route"], "rules": SB["route"]["rules"] + [{"inbound": ["tg-proxy"], "outbound": "vm1"}]}}
+    cfg4, _ = sb2mihomo.singbox_to_mihomo(sb_tg)
+    assert cfg4["listeners"] == [{"name": "tg-proxy", "type": "mixed", "port": 8445, "listen": "0.0.0.0"}]
+    assert "IN-NAME,tg-proxy,vm1" in cfg4["rules"]                    # pin 到 route 里的出口
+    assert all(l["name"] != "in-https" for l in cfg4["listeners"])    # direct 入站不渲染成 listener(靠 nft REDIRECT)
+    sb_tg2 = {**SB, "inbounds": [{"type": "mixed", "tag": "tg-proxy", "listen_port": 8445}]}
+    assert "IN-NAME,tg-proxy,DIRECT" in sb2mihomo.singbox_to_mihomo(sb_tg2)[0]["rules"]   # 无 inbound 规则 → 跟 final(jp=direct)
+
     # ── JSON 即合法 YAML: 必须能 json.dumps(mihomo 只吃 YAML, JSON 是其子集) ──
     json.dumps(cfg)
 

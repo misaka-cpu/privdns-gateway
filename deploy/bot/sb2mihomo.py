@@ -207,6 +207,26 @@ def _rules_from_route(sb, direct_tags, rulesets):
     return rules, dropped
 
 
+def _mixed_listeners(sb, direct_tags):
+    """sing-box 的 mixed 入站(如 tg-proxy :8445)→ mihomo listeners + IN-NAME 路由规则。
+    direct 入站(80/443/5228-5230)不在此列——它们靠 nft REDIRECT→redir-port 覆盖。
+    每个 mixed 入站按 route 里 `inbound:[tag]→出口` 定 pin(没有则跟 route.final)。
+    返回 (listeners, in_rules)。"""
+    route = sb.get("route", {})
+    final = route.get("final")
+    listeners, in_rules = [], []
+    for i in sb.get("inbounds", []):
+        if i.get("type") != "mixed" or not i.get("listen_port"):
+            continue
+        tag = i.get("tag") or "mixed-in"
+        listeners.append({"name": tag, "type": "mixed",
+                          "port": i["listen_port"], "listen": i.get("listen", "0.0.0.0")})
+        exit_tag = next((r["outbound"] for r in route.get("rules", [])
+                         if tag in (r.get("inbound") or []) and r.get("outbound")), None) or final
+        in_rules.append(f"IN-NAME,{tag},{_map_target(exit_tag, direct_tags) if exit_tag else 'DIRECT'}")
+    return listeners, in_rules
+
+
 def singbox_to_mihomo(sb, *, redir_port=7893, controller="127.0.0.1:9090",
                       secret=None, external_ui=None, external_ui_url=None,
                       tls_ports=None, http_ports=None, rulesets=None,
@@ -244,16 +264,21 @@ def singbox_to_mihomo(sb, *, redir_port=7893, controller="127.0.0.1:9090",
 
     rules, dropped = _rules_from_route(sb, direct_tags, rulesets)
 
+    # mixed 入站(TG 代理 :8445 等)→ mihomo listeners + IN-NAME 路由(pin 到其出口/final)。
+    listeners, in_rules = _mixed_listeners(sb, direct_tags)
+
+    # 规则插入点: 开头的 IP-CIDR REJECT(反自环)之后; 顺序 = reject → IN-NAME(入站 pin) → MITM → 其余。
+    i = 0
+    while i < len(rules) and rules[i].startswith("IP-CIDR") and rules[i].endswith("REJECT,no-resolve"):
+        i += 1
+    if in_rules:
+        rules = rules[:i] + in_rules + rules[i:]; i += len(in_rules)
+
     # MITM(Feature B / iOS): 接管域名路由到本地 MITM 服务(socks5 出站, 由它终止 TLS 交插件)。
-    # 规则插在开头的 IP-CIDR REJECT(反自环)之后、普通域名规则之前, 优先级最高。
     if mitm_domains:
         proxies.append({"name": "MITM-OUT", "type": "socks5",
                         "server": "127.0.0.1", "port": mitm_port, "udp": False})
-        mitm_rules = [f"DOMAIN-SUFFIX,{d},MITM-OUT" for d in mitm_domains]
-        i = 0
-        while i < len(rules) and rules[i].startswith("IP-CIDR") and rules[i].endswith("REJECT,no-resolve"):
-            i += 1
-        rules = rules[:i] + mitm_rules + rules[i:]
+        rules = rules[:i] + [f"DOMAIN-SUFFIX,{d},MITM-OUT" for d in mitm_domains] + rules[i:]
 
     tls_ports = tls_ports if tls_ports is not None else DEFAULT_TLS_PORTS
     http_ports = http_ports if http_ports is not None else DEFAULT_HTTP_PORTS
@@ -278,6 +303,8 @@ def singbox_to_mihomo(sb, *, redir_port=7893, controller="127.0.0.1:9090",
         "proxies": proxies,
         "proxy-groups": groups,
     }
+    if listeners:
+        cfg["listeners"] = listeners
     if secret:
         cfg["secret"] = secret
     if external_ui:
