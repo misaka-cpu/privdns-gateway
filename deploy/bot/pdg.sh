@@ -61,6 +61,29 @@ _journald_set_key(){
   return 0
 }
 
+# 原子 upsert: 只更新 profile.env 里的 key=val 这一行, 其余键/注释/未知项原样保留。
+# 语义与 pdg-bot.py 的 _profile_set 一致(去前导空白后以 key= 开头才算命中; #key= 注释不算)。
+# 临时文件 + mv 原子替换: 失败不留半截/空文件。返回非 0 表示写入失败。
+_profile_set(){
+  local key="$1" val="$2" tmp found=0 line stripped
+  mkdir -p "$(dirname "$PROFILE_ENV")" 2>/dev/null || true
+  tmp="$(mktemp "${PROFILE_ENV}.XXXXXX" 2>/dev/null)" || return 1
+  {
+    if [[ -f "$PROFILE_ENV" ]]; then
+      while IFS= read -r line || [[ -n "$line" ]]; do
+        stripped="${line#"${line%%[![:space:]]*}"}"
+        if [[ "$stripped" == "${key}="* ]]; then
+          printf '%s=%s\n' "$key" "$val"; found=1
+        else
+          printf '%s\n' "$line"
+        fi
+      done < "$PROFILE_ENV"
+    fi
+    [[ "$found" == 1 ]] || printf '%s=%s\n' "$key" "$val"
+  } > "$tmp" || { rm -f "$tmp" 2>/dev/null; return 1; }
+  mv -f "$tmp" "$PROFILE_ENV" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+}
+
 # 解析并持久化内存模式, 回显 1(低内存)/0(标准)。显式 1/0 优先; auto 时 profile 已有沿用, 否则按内存检测。
 pdg_lowmem_resolve(){
   local want="${PDG_LOWMEM:-auto}" cur res mt; cur="$(_profile_val)"
@@ -70,8 +93,7 @@ pdg_lowmem_resolve(){
     *) if [[ "$cur" == 0 || "$cur" == 1 ]]; then res="$cur"
        else mt="$(_mem_total_kb)"; if [[ -n "$mt" && "$mt" -le "$LOWMEM_THRESHOLD_KB" ]]; then res=1; else res=0; fi; fi;;
   esac
-  mkdir -p "$(dirname "$PROFILE_ENV")" 2>/dev/null || true
-  printf 'PDG_LOWMEM=%s\n' "$res" > "$PROFILE_ENV" 2>/dev/null || true
+  _profile_set PDG_LOWMEM "$res" || true   # 原子 upsert, 不整覆盖(保留 HIJACK_MODE/PLATFORM/TFO 等)
   echo "$res"
 }
 

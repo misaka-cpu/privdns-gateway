@@ -44,6 +44,36 @@ eq "$(resolve "$WORK/mem512" "$WORK/pf.env" auto)" 0 "profile 已定=0, auto 沿
 # 但显式仍可覆盖已定 profile
 eq "$(resolve "$WORK/mem512" "$WORK/pf.env" 1)" 1 "显式=1 覆盖已定 profile"
 
+# ── A2. profile.env 原子 upsert: 只改 PDG_LOWMEM, 其它键/注释/未知项一律保留 ────
+# (旧实现用 > 整覆盖, 会把 PDG_HIJACK_MODE/PLATFORM/TFO/未来键全抹掉)
+{ printf '# pdg profile\n'; printf 'PDG_HIJACK_MODE=gfw\n'; printf 'PDG_PLATFORM=ios\n';
+  printf 'PDG_TFO=1\n'; printf 'PDG_LOWMEM=0\n'; printf 'PDG_FUTURE_KEY=xyz\n'; } > "$WORK/pmix.env"
+resolve "$WORK/mem512" "$WORK/pmix.env" 1 >/dev/null       # 显式=1 → 只把 PDG_LOWMEM 改成 1
+eq "$(sed -n 's/^PDG_LOWMEM=//p' "$WORK/pmix.env")" 1 "upsert: PDG_LOWMEM 被更新为 1"
+for kv in 'PDG_HIJACK_MODE=gfw' 'PDG_PLATFORM=ios' 'PDG_TFO=1' 'PDG_FUTURE_KEY=xyz'; do
+  grep -qxF "$kv" "$WORK/pmix.env" && ok "upsert 保留 $kv" || bad "upsert 丢了 $kv"
+done
+grep -qxF '# pdg profile' "$WORK/pmix.env" && ok "upsert 保留注释行" || bad "upsert 丢了注释行"
+[[ "$(grep -c '^PDG_LOWMEM=' "$WORK/pmix.env")" == 1 ]] && ok "PDG_LOWMEM 不重复(命中替换非追加)" || bad "PDG_LOWMEM 出现重复"
+# 多跑幂等: auto 沿用=1, key 数量不变(5), 无增删
+resolve "$WORK/mem512" "$WORK/pmix.env" auto >/dev/null
+[[ "$(grep -c '=' "$WORK/pmix.env")" == 5 ]] && ok "多跑后仍是 5 个 key(无增删)" || bad "多跑改变了 key 数量"
+# key 不存在 → 追加(不破坏其它)
+printf 'PDG_PLATFORM=android\n' > "$WORK/pnew.env"
+PDG_PROFILE="$WORK/pnew.env" bash -c "source '$WORK/harness.sh'; _profile_set PDG_LOWMEM 1"
+grep -qxF 'PDG_PLATFORM=android' "$WORK/pnew.env" && grep -qxF 'PDG_LOWMEM=1' "$WORK/pnew.env" \
+  && ok "key 不存在 → 追加且不破坏其它" || bad "追加破坏了其它键"
+# 写入失败(目录只读)→ 原 profile 不被破坏(无半截/空文件); 需非 root
+if [[ "$(id -u)" != 0 ]]; then
+  mkdir -p "$WORK/rop"; printf 'PDG_LOWMEM=0\nPDG_PLATFORM=android\n' > "$WORK/rop/profile.env"
+  before="$(cat "$WORK/rop/profile.env")"; chmod 0555 "$WORK/rop"
+  PDG_PROFILE="$WORK/rop/profile.env" bash -c "source '$WORK/harness.sh'; _profile_set PDG_LOWMEM 1" 2>/dev/null
+  chmod 0755 "$WORK/rop"
+  [[ "$(cat "$WORK/rop/profile.env")" == "$before" ]] && ok "写入失败: 原 profile 不被破坏(无半截/空文件)" || bad "写入失败破坏了 profile"
+else
+  ok "写入失败测试(需非 root, 已跳过)"
+fi
+
 # helper 值
 eq "$(bash -c "source '$WORK/harness.sh'; pdg_cache_size 1")" 2048 "低内存 cache=2048"
 eq "$(bash -c "source '$WORK/harness.sh'; pdg_cache_size 0")" 8192 "标准 cache=8192"
