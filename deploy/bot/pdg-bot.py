@@ -560,7 +560,8 @@ def wloc_enable(on):
     if on:
         loc = _wloc_active(w)
         return True, (f"✅ 位置改写已开启 → <b>{w['active']}</b>({loc['lat']}, {loc['lon']})\n"
-                      "⚠️ 需 iPhone 装并信任本网关 CA;手机「内网卡 + 控制中心关 WiFi」时才生效。"
+                      "⚠️ iPhone 须先装「🔐 WLOC-CA 描述文件」并在「证书信任设置」信任本网关 CA;"
+                      "手机「内网卡 + 控制中心关 WiFi」时才生效。"
                       "iOS 26 缓存重, 切换后去「定位服务」关开或重启才刷新。")
     return True, "✅ 位置改写已关闭。"
 
@@ -2215,9 +2216,11 @@ def _mitm_ca_der():
     except Exception:  # noqa: BLE001
         return b""
 
-def _ios_profile(ssids=()):
-    """ssids 非空时在 OnDemandRules 最前插一条「命中这些 SSID 的 Wi-Fi 强制直连」;
-    MITM 插件启用时(iOS)再附一个根 CA payload 让设备信任本网关 CA(WLOC 等 MITM 才生效)。
+def _ios_profile(ssids=(), with_ca=False):
+    """普通 DoT 描述文件。ssids 非空时在 OnDemandRules 最前插一条「命中这些 SSID 强制直连」。
+    with_ca=True(仅「WLOC-CA 描述文件」入口)才附根 CA payload, 让设备先信任本网关 CA、
+    再开 WLOC —— 普通描述文件**默认不带 CA**(不再随 WLOC 开启态偷偷带上)。
+    CA 生成/读取失败时**抛错**, 绝不静默产出无 CA 的『成功』描述文件。
     用 plistlib 插入, SSID 含 &<> 等也不会破 XML。"""
     if not os.path.exists(IOS_TMPL):
         raise FileNotFoundError("缺少模板 " + IOS_TMPL)
@@ -2226,7 +2229,11 @@ def _ios_profile(ssids=()):
             .replace("__JP_IP__", _server_ip())
             .replace("__UUID1__", str(uuid.uuid4()).upper())
             .replace("__UUID2__", str(uuid.uuid4()).upper())).encode()
-    der = _mitm_ca_der() if _mitm_enabled_domains() else b""
+    der = b""
+    if with_ca:
+        der = _mitm_ca_der()
+        if not der:
+            raise RuntimeError("MITM 根 CA 生成/读取失败, 未产出证书 —— 请检查 openssl 后重试(未生成描述文件)。")
     if not ssids and not der:
         return raw
     p = plistlib.loads(raw)
@@ -2631,11 +2638,14 @@ def handle_cb(chat, mid, data):
         edit(chat, mid, "「其余国际」默认走哪个出口/组：", kb_pick("fin", exit_tags(load()), EXIT_BACK)); return
     if data == "ios":
         state[chat] = "ios_ssid"
+        wl = ("\n🔐 <b>要用 WLOC(位置改写)?</b> 别装普通版 —— 点「WLOC-CA 版」拿<b>含根 CA</b> 的描述文件, "
+              "装上并<b>信任 CA</b> 后再去开启 WLOC。" if _platform() == "ios" else "")
         edit(chat, mid, "📱 <b>生成 iOS 描述文件</b>\n"
              "Wi-Fi/蜂窝下是否启用私密 DNS 都由 <code>:81</code> 探测自动判定(网络能走到网关才启用)。\n"
              "若有想<b>强制直连</b>的 Wi-Fi(如公司网、探测误判的酒店网), 发它的名字(SSID, 多个则每行一个)再生成;"
-             "不需要就点「直接生成」。/cancel 取消。",
-             {"inline_keyboard": [[{"text": "⏭ 直接生成", "callback_data": "iosgen"}],
+             "不需要就点「直接生成」。普通版<b>不含 CA</b>。/cancel 取消。" + wl,
+             {"inline_keyboard": [[{"text": "⏭ 直接生成(无CA)", "callback_data": "iosgen"}],
+                                  [{"text": "🔐 WLOC-CA 版(先装这个再开WLOC)", "callback_data": "iosgenca"}],
                                   [{"text": "⬅️ 返回客户端", "callback_data": "nav:client"}],
                                   [{"text": "🏠 主菜单", "callback_data": "menu"}]]}); return
     if data == "iosgen":
@@ -2643,10 +2653,24 @@ def handle_cb(chat, mid, data):
         edit(chat, mid, "正在生成 iOS 描述文件…", BACK)
         try:
             send_document(chat, "PrivDNS-Gateway.mobileconfig", _ios_profile(),
-                          f"📱 iOS/iPadOS 私密DNS 描述文件\nDoT: {_dot_host()}\n"
+                          f"📱 iOS/iPadOS 私密DNS 描述文件(不含 CA)\nDoT: {_dot_host()}\n"
                           "装法: 存到「文件」App → 点开 → 设置→通用→「已下载描述文件」→ 安装。\n"
                           "Wi-Fi/蜂窝均靠服务器 :81 探测激活, 安装时已自动配好。")
             edit(chat, mid, "✅ 描述文件已发送(见上一条)。", MENU)
+        except Exception as e:  # noqa: BLE001
+            edit(chat, mid, f"生成失败: {e}", MENU)
+        return
+    if data == "iosgenca":
+        state.pop(chat, None)
+        edit(chat, mid, "正在生成 WLOC-CA 描述文件(含根 CA)…", BACK)
+        try:
+            # with_ca=True 会顺带 ensure_ca() 生成根 CA 并打进描述文件; 生成失败会抛错(不产出无 CA 的假成功件)
+            send_document(chat, "PrivDNS-Gateway-WLOC-CA.mobileconfig", _ios_profile(with_ca=True),
+                          f"🔐 iOS WLOC-CA 描述文件(DoT + 根 CA)\nDoT: {_dot_host()}\n"
+                          "正确顺序: ① 先在 WLOC 菜单加好定位地点 → ② 装这个描述文件(设置→通用→VPN与设备管理 安装)"
+                          " → ③ 设置→通用→关于本机→证书信任设置, <b>为本网关 CA 打开完全信任</b>"
+                          " → ④ 回 WLOC 菜单点「开启」。")
+            edit(chat, mid, "✅ WLOC-CA 描述文件已发送(见上一条)。装好并<b>信任 CA</b> 后再开启 WLOC。", MENU)
         except Exception as e:  # noqa: BLE001
             edit(chat, mid, f"生成失败: {e}", MENU)
         return
@@ -2701,7 +2725,7 @@ def handle_cb(chat, mid, data):
         cur = f"<b>{w['active']}</b>({loc['lat']}, {loc['lon']})" if loc else "未设"
         gate = "" if _core_backend() == "mihomo" else "\n⚠️ 当前内核为 sing-box, WLOC 仅 mihomo 支持 —— 先「🔀 切换内核」到 mihomo 再开启。"
         edit(chat, mid, f"🍏 <b>位置改写 (WLOC)</b>\n状态: <b>{'🟢 开启' if on else '关闭'}</b>　当前: {cur}　地点: {len(w['locations'])} 个{gate}\n"
-             "把 iPhone 网络定位改写到设定城市(国内 / 跨国均可)。需先装并信任本网关 CA(在「📱 客户端 → iOS 描述文件」)。\n"
+             "把 iPhone 网络定位改写到设定城市(国内 / 跨国均可)。<b>开启前</b>先在「📱 客户端 → iOS 描述文件 → 🔐 WLOC-CA 版」拿到含 CA 的描述文件, 装上并到「证书信任设置」<b>信任本网关 CA</b>。\n"
              "<b>手机端操作</b>(全程用内网卡):\n"
              "① <b>控制中心</b>关 WiFi(把图标点灰,<b>不是「设置」里关</b>——设置里关会连 Wi-Fi 定位扫描一起关掉)\n"
              "② 关定位服务:设置 → 隐私与安全性 → 定位服务 → 关\n"
