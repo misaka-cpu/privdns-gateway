@@ -133,6 +133,9 @@ jobs:
       - name: "MITM CA 骨架回归 (自签 CA + 叶子证书验链/SAN/EKU/缓存)"
         run: python3 tests/test-mitm-ca.py
 
+      - name: "MITM CA 并发回归 (24 线程+跨进程同域签发: 0 异常/cert-key 匹配/无残留)"
+        run: python3 tests/test-mitm-ca-concurrent.py
+
       - name: "MITM 服务回归 (socks5→CA叶子终止TLS→插件; 客户端CA验链; 非接管兜底关闭)"
         run: python3 tests/test-mitm-server.py
 
