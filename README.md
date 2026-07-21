@@ -113,6 +113,37 @@ sudo pdg uninstall [--purge]   # 卸载(--purge 连配置删)
 
 > 分工:`pdg` 管**生命周期**(装/更新/卸载/token/状态);**出口 / 分流 / DNS 上游**等运行时配置都在 Telegram bot 里。
 
+## 📍 iOS 位置改写 (WLOC,可选)
+
+把 iPhone 的**网络定位**改写到设定城市 —— **手机不用装任何 App**,靠系统 DoT + 一次性信任网关 CA,在 Telegram bot 里管多地点、一键切换。原理:网关截 `gs-loc.apple.com` 定位查询、转发给真 Apple 拿回真响应、只把坐标改成设定点(格式 100% 保真,iOS 才接受)。
+
+> ✅ 适用:今日水印相机 / 小红书同城 / 室内打卡这类**走网络定位**的场景。
+> ❌ 不适用:连续 GPS 的导航 / 打车 / 定位游戏(那类要电脑侧 GPS 级虚拟定位工具);户外 GPS 信号强时也会盖过它。
+
+### 一次性设置
+1. 装机时平台选 **iOS**(`PDG_PLATFORM=ios`)→ 自动装 `pdg-mitm` 服务。
+2. bot「📱 客户端 → iOS 描述文件」装到 iPhone(描述文件已内含网关 CA)。
+3. **iPhone 手动信任 CA**(缺这步定位不会变):设置 → 通用 → VPN与设备管理 → 装描述文件;再 设置 → 通用 → 关于 → **证书信任设置** → 对「PrivDNS Gateway MITM CA」**开启完全信任**。
+
+### 日常使用
+1. bot「🛠 运维 → 🍏 位置改写」→「➕ 添加地点」发「`名称 纬度,经度`」(如 `上海 31.2304,121.4737`)→「📍 地点/切换」点城市 →「✅ 开启」。多地点随时增删,开启中热切换。
+2. 手机进入生效状态:**内网卡在用 + 控制中心关 WiFi**(⚠️ 是控制中心把 WiFi 图标点灰,**不是设置里关 WiFi** —— 设置里关会连 Wi-Fi 定位扫描一起关掉、就没东西可改了)。
+3. **强制刷新定位**:设置 → 隐私与安全性 → 定位服务 → 关掉 → 等 3 秒 → 打开(或重启手机)。
+4. 打开 Apple 地图 / 今日水印相机看。
+
+### 大概等待时间
+| 场景 | 操作 | 等待 |
+|---|---|---|
+| 首次开启 / 从真实位置切到假位置 | 定位服务关开一次 | ~1 分钟 |
+| **国内城市之间**切换(如 上海→北京) | 定位服务关开一次 | **几十秒 ~ 1 分钟** |
+| **跨国**切换(如 上海→东京) | 飞行模式 ON ~15 秒 → OFF,耐心等 | **数分钟**(iOS 反作弊+缓存,会先"转圈"再稳) |
+
+### 注意
+- **iOS 26 缓存极重**:切城市后不做"定位服务关开 / 重启",会一直显示旧位置。
+- **别在中↔日之间反复横跳**:会把 iOS 弄进"不信 Wi-Fi 定位、退回真实 GPS"的状态,连累之后的国内切换也变慢;真进了这状态,飞行模式 ON→OFF 几次 + 耐心等可恢复。
+- **别收紧精度**:过度精确的假定位会触发 iOS 反作弊、直接退回真实定位(项目已默认不动精度)。
+- 原理 / 踩坑详见 [docs/design-mitm-plugins.md](docs/design-mitm-plugins.md)。
+
 ## 组成
 
 | 层 | 用什么 | 说明 |
@@ -130,6 +161,7 @@ sudo pdg uninstall [--purge]   # 卸载(--purge 连配置删)
 - [docs/INSTALL.md](docs/INSTALL.md) — 安装细节 / DNS 配置 / 端口 / 版本注意
 - [docs/TROUBLESHOOTING-PLAYBOOK.md](docs/TROUBLESHOOTING-PLAYBOOK.md) — 排障手册(症状 → 查 → 修)
 - [docs/production-notes.md](docs/production-notes.md) — 实战记录与踩坑(sing-box 版本坑、QUIC 自环、ECS、安全加固等)
+- [docs/design-mitm-plugins.md](docs/design-mitm-plugins.md) — iOS 位置改写 (WLOC) 设计、forward+patch 原理与配方
 - [CHANGELOG.md](CHANGELOG.md) — 更新日志
 
 ## 免责声明
