@@ -221,7 +221,9 @@ def _split_resp(body):
 
 
 def _patch_pb(data, lat_e8, lon_e8):
-    """递归重编码: location 子消息(含 field1+field2 varint)里 field1/2 换成目标坐标; 其余原样。"""
+    """递归重编码: location 子消息(含 field1+field2 varint)里 field1/2 换成目标坐标; 其余原样。
+    ⚠️ 只动经纬度、**不碰 field3(精度)**——实测收紧精度会触发 iOS 反作弊(过度精确+瞬移)、
+    判为伪造并退回真实定位, 适得其反。"""
     flds = _try_fields(data)
     if flds is None:
         return data
@@ -417,6 +419,7 @@ class WLOCPlugin:
             tls.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
             return
         rctype, rbody = fwd
+        # 只改坐标, 保留 Apple 原本精度: 收紧精度会触发 iOS 反作弊(过度精确+瞬移)→ 退回真实定位, 实测适得其反。
         patched = patch_response(rbody, self.lat, self.lon)
         sys.stderr.write("[pdg-wloc] %s <= %s | req=%d resp=%d patched=%d %s → (%s, %s)\n"
                          % (host, reqline, len(body), len(rbody), len(patched),

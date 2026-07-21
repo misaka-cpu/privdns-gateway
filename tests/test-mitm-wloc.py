@@ -61,7 +61,7 @@ def main():
     assert patched.startswith(prefix); ok("patch_response 保留头部前缀")
     pr = mitm_wloc.parse_response(patched)
     assert set(pr) == set(macs) and all(approx(pr[m][0], lat) and approx(pr[m][1], lon) for m in macs)
-    assert {pr[m][2] for m in macs} == {40, 65}; ok("patch_response 只改经纬度, 保 BSSID/精度")
+    assert {pr[m][2] for m in macs} == {40, 65}; ok("patch_response 只改经纬度, 保 BSSID/精度不变")
     top = {fn: v for fn, wt, v in mitm_wloc._fields(mitm_wloc._split_resp(patched)[1])}
     assert top.get(5) == 99; ok("patch_response 保留顶层非坐标字段")
 
