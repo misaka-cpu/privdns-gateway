@@ -2,6 +2,10 @@
 
 本项目按语义化 `v1.x` tag 正式发布;以下按版本/日期记录主要变化,完整提交见 git 历史。
 
+## 2026-07-22 — v1.5.7(修 mihomo 下测出口对 direct 出口(jp)报"不通")
+
+- **修**:mihomo 内核下「测出口」对 `direct` 出口(如 jp 直出)报「超时/不通」—— sb2mihomo 把 direct 出口映射成 mihomo 内建 `DIRECT`,clash_api 里没有该 tag 名 → `/proxies/jp/delay` 返 404。现测出口在 mihomo 后端把 direct 出口映射到 `DIRECT` 再查(显示仍用原名);回归进 test-panel。
+
 ## 2026-07-22 — v1.5.6(WLOC MITM 代码质量 + 文案微调)
 
 - **改**:`_forward` 转发用 try/finally 兜 socket,异常路径不再泄漏 fd;TLS 上下文提到模块级复用(不每次转发重建、少重复加载 CA);`_dns_a` 加边界防越界(畸形响应返 None 不崩)。

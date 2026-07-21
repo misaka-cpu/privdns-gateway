@@ -404,4 +404,20 @@ for token in ('"panel:on:10"', '"panel:on:30"', '"panel:on:0"'):
 assert "_panel_publish(chat, res" in src and "_panel_startup_cleanup()" in src, "缺安全发链接 / 启动兜底调用"
 print("[OK]   运维菜单 + 时长按钮 + 回调接线 + 启动兜底(含清残留放行)")
 
+# ── test_exits: mihomo 下 direct 出口(jp)映射到内建 DIRECT 查延迟(修 "❌ jp 超时/不通") ──
+_qpaths = []
+bot.clash_up = lambda: True
+bot.clash_get = lambda path: (_qpaths.append(path) or {"delay": 9})
+bot.load = lambda: {"outbounds": [{"tag": "jp", "type": "direct"},
+                                  {"tag": "hk", "type": "shadowsocks", "server": "1.1.1.1", "server_port": 8388}]}
+bot._core_backend = lambda: "mihomo"
+out = bot.test_exits()
+assert "/proxies/DIRECT/delay" in " ".join(_qpaths), "mihomo 下 direct 出口(jp)应查内建 DIRECT"
+assert "/proxies/hk/delay" in " ".join(_qpaths), "代理出口名不变"
+assert "<b>jp</b>" in out and "<b>hk</b>" in out, "显示仍用原出口名"
+_qpaths.clear(); bot._core_backend = lambda: "singbox"
+bot.test_exits()
+assert "/proxies/jp/delay" in " ".join(_qpaths), "singbox 后端 jp 用原名(不映射)"
+print("[OK]   测出口: mihomo direct→DIRECT 映射, singbox 用原名")
+
 print("panel regression OK")

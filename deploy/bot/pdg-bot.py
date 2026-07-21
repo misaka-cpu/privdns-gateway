@@ -1741,9 +1741,12 @@ def test_exits():
     tags = concrete_tags(c)   # 只测具体出口(代理+jp直出); urltest 组的 clash 延迟接口偶尔抽风, 不测它
     if not tags:
         return "(无出口)"
+    # mihomo: direct 出口(如 jp)被 sb2mihomo 映射成内建 DIRECT, clash 里没有该 tag 名 → 查 DIRECT。
+    direct_set = ({o["tag"] for o in c["outbounds"] if o.get("type") == "direct"}
+                  if _core_backend() == "mihomo" else set())
     lines = []
     for t in tags:
-        q = urllib.parse.quote(t, safe="")
+        q = urllib.parse.quote("DIRECT" if t in direct_set else t, safe="")
         try:
             d = clash_get(f"/proxies/{q}/delay?timeout=5000&url=" + urllib.parse.quote(DELAY_URL))
             lines.append(f"✅ <b>{t}</b>  {d['delay']}ms")
