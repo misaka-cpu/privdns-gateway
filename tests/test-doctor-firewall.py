@@ -63,6 +63,46 @@ checks._run = lambda cmd: (0, "chain input {\n ip saddr 172.22.0.0/16 tcp dport 
 st, _, msg = checks.check_nft()
 assert st == "ok", (st, msg)
 
+# ── check_redirect: mihomo 代理入口(80/443 REDIRECT)必须在, 缺了判 fail ──
+# 回归 .200 事故: iOS GMS 清理迁移把整条 redirect 删掉, 代理链路断了好几天, 而当时
+# doctor 全绿 —— 因为防火墙那项只查"敏感端口有没有对全网开放", 规则消失反而更"干净"。
+PRE_OK_IOS = ("chain prerouting {\n type nat hook prerouting priority dstnat; policy accept;\n"
+              " ip saddr 172.22.0.0/16 tcp dport { 80, 443 } redirect to :7893\n}")
+PRE_OK_ANDROID = ("chain prerouting {\n type nat hook prerouting priority dstnat; policy accept;\n"
+                  " ip saddr 172.22.0.0/16 tcp dport { 80, 443, 5228-5230 } redirect to :7893\n}")
+PRE_EMPTY = "chain prerouting {\n type nat hook prerouting priority dstnat; policy accept;\n}"
+
+checks._mihomo_redir_port = lambda: 7893
+# 隔离宿主机: check_redirect 兜底会读 NFT_CONF, 真机上那份文件的内容不该影响断言
+checks.NFT_CONF = "/nonexistent/pdg-test-nftables.conf"
+
+def redir_case(core, pre):
+    checks._core = lambda: core
+    checks._run = lambda cmd: (0, pre, "")
+    return checks.check_redirect()
+
+st, _, msg = redir_case("mihomo", PRE_OK_IOS)
+assert st == "ok" and "7893" in msg, (st, msg)
+
+st, _, msg = redir_case("mihomo", PRE_OK_ANDROID)          # 安卓形态(含 GMS)同样算就位
+assert st == "ok", (st, msg)
+
+st, _, msg = redir_case("mihomo", PRE_EMPTY)               # .200 当时的样子
+assert st == "fail" and "80/443" in msg, (st, msg)
+
+# 目标端口与 mihomo 实际 redir-port 不一致 → 也算断
+st, _, msg = redir_case("mihomo",
+    "chain prerouting {\n ip saddr 172.22.0.0/16 tcp dport { 80, 443 } redirect to :7891\n}")
+assert st == "fail", (st, msg)
+
+# 只 redirect 了 80 没有 443 → 不算就位
+st, _, msg = redir_case("mihomo",
+    "chain prerouting {\n ip saddr 172.22.0.0/16 tcp dport { 80 } redirect to :7893\n}")
+assert st == "fail", (st, msg)
+
+# sing-box 后端没有这条 REDIRECT(走入站/tproxy) → 返回 None 跳过, 不得误报
+assert redir_case("singbox", PRE_EMPTY) is None
+
 # ── check_gms: sing-box 三入站 + 防火墙内网放行 → ok; 任一缺失 → warn(不 fail) ──
 import json, tempfile
 

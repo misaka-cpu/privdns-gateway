@@ -8,6 +8,7 @@ MOSDNS_CONF = "/etc/mosdns/config.yaml"
 DOT_DOMAIN_FILE = "/opt/pdg-bot/dot-domain"
 BACKEND_MARKER = "/etc/privdns-gateway/backend"
 MIHOMO_CFG = "/etc/mihomo/config.yaml"
+NFT_CONF = "/etc/nftables.conf"
 # 面板 UI 在 /etc/sing-box/ui/dist, 不在 mihomo 工作目录下 → SAFE_PATHS 放行, 否则 `mihomo -t` 拒。
 os.environ.setdefault("SAFE_PATHS", "/etc/sing-box/ui/dist")
 
@@ -190,6 +191,76 @@ def check_nft():
     if leaked:
         return ("fail", "防火墙", "这些口对全网开放(应只限内网卡): " + ", ".join(sorted(leaked)))
     return ("ok", "防火墙", "53/80/81/443/853/5228-5230/7893/8445 仅限内网卡来源")
+
+def _mihomo_redir_port():
+    """mihomo 的 redir-port(装机固定 7893; 读不到按它兜底)。"""
+    try:
+        txt = open(MIHOMO_CFG, encoding="utf-8").read()
+    except OSError:
+        return 7893
+    m = re.search(r'["\']?redir-port["\']?\s*:\s*(\d+)', txt)
+    return int(m.group(1)) if m else 7893
+
+
+def _dport_covers(portset, want):
+    """端口集字符串(可含区间, 如 80, 443, 5228-5230)是否覆盖 want。不枚举, 免 1-65535 撑爆。"""
+    for tok in portset.split(","):
+        tok = tok.strip()
+        if tok.isdigit() and int(tok) == want:
+            return True
+        if re.match(r"^\d+-\d+$", tok):
+            a, b = (int(x) for x in tok.split("-"))
+            if a <= want <= b:
+                return True
+    return False
+
+
+def check_redirect():
+    """mihomo 模式: 内网卡来源的 80/443 必须 REDIRECT 到 mihomo 的 redir 口, 否则代理链路是断的。
+
+    专门补的一项: 这条规则曾被 iOS GMS 清理迁移整行删掉, 而 doctor 一路全绿 —— 防火墙那项
+    只查"敏感端口有没有对全网开放", 规则整条消失反而更"干净", 于是线上代理断了好几天没人发现。
+    sing-box 模式没有这条 REDIRECT(走各自入站)→ 返回 None 跳过, 不误报。"""
+    if _core() != "mihomo":
+        return None
+    port = _mihomo_redir_port()
+
+    def _sources():
+        """惰性: 先看本项目自己的链, 命中就不必再整份 dump ruleset; 最后退回 on-disk 配置。"""
+        for cmd in (["nft", "list", "chain", "inet", "pdg", "prerouting"],
+                    ["nft", "list", "ruleset"]):          # 规则被挪到别的表时的兜底
+            _, out, _ = _run(cmd)
+            if out:
+                yield out
+        try:
+            yield open(NFT_CONF, encoding="utf-8").read()
+        except OSError:
+            pass
+
+    def _present(text):
+        for ln in text.splitlines():
+            s = ln.strip()
+            if "redirect" not in s or "saddr" not in s:
+                continue                        # 必须是"限内网来源"的 redirect 才算原装形态
+            m = re.search(r"dport\s*\{?\s*([0-9,\-\s]+)", s)
+            if not m or not re.search(r"redirect to :?%d(\D|$)" % port, s):
+                continue
+            if _dport_covers(m.group(1), 80) and _dport_covers(m.group(1), 443):
+                return True
+        return False
+
+    seen = False
+    for out in _sources():
+        seen = True
+        if _present(out):
+            return ("ok", "代理入口", "内网卡 80/443 已 REDIRECT → mihomo :%d" % port)
+    if not seen:
+        return ("warn", "代理入口", "读不到 nftables, 无法确认 80/443 是否 REDIRECT 到 mihomo。")
+    return ("fail", "代理入口",
+            "内网卡 80/443 未 REDIRECT 到 mihomo :%d —— 代理链路不通(规则可能被误删)。"
+            "修复: nft add rule inet pdg prerouting ip saddr <内网段> tcp dport { 80, 443 } "
+            "redirect to :%d, 并写回 /etc/nftables.conf。" % (port, port))
+
 
 def check_gms():
     """GMS/FCM 推送端口(5228-5230)是否完整启用。只读、不触发迁移: 老装第一次 pdg update
@@ -555,7 +626,7 @@ def check_mitm():
     return ("ok", "MITM 插件", "pdg-mitm active + CA + mitm_hijack + mihomo MITM 路由 就位")
 
 ALL = [check_platform, check_services, check_singbox_version, check_dot_arecord, check_dot_domain_sync,
-       check_internal_cidr, check_nft, check_gms, check_mosdns_ratelimit, check_mem,
+       check_internal_cidr, check_nft, check_redirect, check_gms, check_mosdns_ratelimit, check_mem,
        check_cert, check_dns, check_singbox_config, check_mitm_structure, check_mitm]
 ALERT = [check_services, check_dns, check_cert]  # healthcheck 用的轻量子集(运行期故障)
 DEEP = [check_deep_dot_handshake, check_deep_probe81, check_deep_dns_cn,
