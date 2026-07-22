@@ -34,8 +34,12 @@ S
 chmod 755 /usr/local/bin/sing-box
 
 # ── 造发布源: 真 git 仓库, 两个 tag(v9.9.8 当前 / v9.9.9 新版) ────────────────
+# 连 origin 都是真的(本地裸仓库): pdg update 里的 `git fetch --tags origin main` 照跑不误,
+# 于是"取 tag"这段也在覆盖范围内, 且全程离线 —— 不打桩、不碰 GitHub。
 REPO=/opt/privdns-gateway
-git -C "$REPO" init -q 2>/dev/null
+ORIGIN=/tmp/e2e-origin.git
+rm -rf "$REPO/.git" "$ORIGIN"            # e2e_seed_install 拷进来的是开发机/CI 的 .git, 弃用
+git -C "$REPO" init -q -b main
 git -C "$REPO" config user.email t@t; git -C "$REPO" config user.name t
 git -C "$REPO" config commit.gpgsign false
 git -C "$REPO" add -A >/dev/null 2>&1
@@ -46,10 +50,13 @@ echo "# NEWVERSION-MARKER" >> "$REPO/deploy/bot/checks.py"
 git -C "$REPO" add -A >/dev/null 2>&1
 git -C "$REPO" commit -qm newver >/dev/null 2>&1
 git -C "$REPO" tag v9.9.9
+git clone -q --bare "$REPO" "$ORIGIN"
+git -C "$REPO" remote add origin "$ORIGIN"
+git -C "$REPO" tag -d v9.9.9 >/dev/null  # 本地先没有新 tag → 逼 update 真去 origin 取
 git -C "$REPO" checkout -q v9.9.8
-# pdg_fetch_release_tags 会去 fetch origin —— 本地仓库没有 origin, 打桩掉
-sed -i 's|^pdg_fetch_release_tags(){|pdg_fetch_release_tags(){ return 0; }\n_orig_fetch_tags(){|' /usr/local/bin/pdg
-ok "发布源就位: 本地 git 仓库带 v9.9.8/v9.9.9 两个 tag"
+{ [[ "$(git -C "$REPO" describe --tags)" == v9.9.8 ]] && [[ -z "$(git -C "$REPO" tag -l v9.9.9)" ]]; } \
+  && ok "发布源就位: 工作仓库停在 v9.9.8, 新 tag v9.9.9 只在 origin 上(要靠 fetch 才拿得到)" \
+  || bad "发布源没造对: $(git -C "$REPO" describe --tags), tags=$(git -C "$REPO" tag -l)"
 
 # ── 1. 正常更新: 应装上新版文件并显示成功 ════════════════════════════════════
 echo; echo "── 1. 正常更新 ──"
