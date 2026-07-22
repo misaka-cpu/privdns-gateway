@@ -25,6 +25,8 @@ import json
 # 可作出口的代理协议(与 pdg-bot.py 的 PROXY_TYPES 对齐)
 PROXY_TYPES = ("shadowsocks", "vmess", "trojan", "vless", "hysteria", "hysteria2",
                "tuic", "anytls", "shadowtls", "socks", "http")
+# 不是代理、但也不该被当成"转换失败"的出站: sing-box 内建动作与组类型(组另行渲染)。
+NON_PROXY_TYPES = ("direct", "block", "dns", "urltest", "selector")
 
 # 默认劫持端口 → 嗅探类型(原始 dport, 非 redir 端口)
 DEFAULT_TLS_PORTS = [443, 5228, 5229, 5230]
@@ -273,7 +275,15 @@ def singbox_to_mihomo(sb, *, redir_port=7893, controller="127.0.0.1:9090",
     # TCP Fast Open: sing-box tcp_fast_open → mihomo tfo, 仅 TCP 类协议(QUIC 的 hy2/tuic 无意义)
     tfo_types = {"ss", "vmess", "trojan", "vless", "http", "socks5", "anytls"}
     for o in sb.get("outbounds", []):
-        if o.get("type") in PROXY_TYPES:
+        t = o.get("type")
+        # 既不是可转协议、也不是内建/组类型 → 必须记成"转不了"。
+        # 以前这类出站(wireguard / ssh 等)被**静默跳过**: 不进 proxies 也不进 unknown_proxies,
+        # 于是"有出口无法转换"的守卫压根不触发; 而指向它的分流规则照样渲染出去, 最终由
+        # mihomo 报 `proxy [X] not found` 拒绝整份配置 —— 用户只看到内核的报错, 既不知道是
+        # 哪个出口的问题, 也永远切不过去。
+        if t not in PROXY_TYPES and t not in NON_PROXY_TYPES:
+            unknown.append(o.get("tag")); continue
+        if t in PROXY_TYPES:
             p = convert_proxy(o)
             if p is None:
                 unknown.append(o.get("tag"))

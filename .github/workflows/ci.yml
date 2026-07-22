@@ -206,3 +206,13 @@ jobs:
         run: bash tests/test-outbound-schema.sh
       - name: 劫持形态 (真起 mosdns 验证 all=排除式劫持 / gfw=白名单放行)
         run: bash tests/test-hijack-shape.sh
+
+      # ── 端到端(namespace+overlayfs 沙盒, 真实绝对路径 + 真内核/真 mosdns) ──
+      # 单测都在函数级别打桩, 跨组件的接缝没人看着; 这几条查出过 GMS 重复插入、backend
+      # 标记从不落地、分流规则不进 mosdns、不可转换出站被静默丢弃等接缝 bug。
+      - name: E2E 老装升级 (v1.4.x 现场跑真实 pdg __migrate, 三场景 + 幂等)
+        run: bash tests/e2e-migrate.sh
+      - name: E2E 加落地+分流 (真 parse_link/apply_sb → 真 mihomo -t → 真 mosdns 解析)
+        run: bash tests/e2e-exit-rule.sh
+      - name: E2E 内核切换 (两内核真二进制真切换 + 不可转换出口必须点名拒绝)
+        run: bash tests/e2e-switch-core.sh

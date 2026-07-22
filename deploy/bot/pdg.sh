@@ -901,7 +901,7 @@ _update_core_binary(){
       || { c_y "  下载失败(版本与发布不一致, 不能当作已更新)"; rm -rf "$tmp"; return 1; }
     pdg_verify_sha256 "$tmp/sb.tgz" "${PDG_SHA256[singbox-$march]:-}" "sing-box $ver ($march)" \
       || { c_y "  SHA 校验失败 → 判为更新失败(不降级成警告后继续)"; rm -rf "$tmp"; return 1; }
-    tar -xzf "$tmp/sb.tgz" -C "$tmp" || { c_y "  解压失败"; rm -rf "$tmp"; return 1; }
+    tar --no-same-owner -xzf "$tmp/sb.tgz" -C "$tmp" || { c_y "  解压失败"; rm -rf "$tmp"; return 1; }
     cp -f "$tmp"/sing-box-*/sing-box "$tmp/sing-box" 2>/dev/null \
       || { c_y "  解压产物缺失"; rm -rf "$tmp"; return 1; }
     [[ -s "$tmp/sing-box" ]] || { c_y "  解压产物为空"; rm -rf "$tmp"; return 1; }
@@ -1384,7 +1384,9 @@ migrate_ios_gms_cleanup(){
   [[ "$(_pdg_platform)" == ios ]] || return 0
   local sb="${1:-/etc/sing-box/config.json}" nf="${2:-/etc/nftables.conf}"
   # 1) sing-box canonical model: 删 in-gms-* 入站
-  if [[ -f "$sb" ]] && grep -q '"in-gms-5228"' "$sb" && command -v sing-box >/dev/null 2>&1; then
+  # 不再硬要求 sing-box 二进制: mihomo-only 机器上根本没有它, 整步会被静默跳过 → 残留
+  # 永远清不掉(例如从 Android 备份恢复之后)。校验改用**当前内核**, 见下。
+  if [[ -f "$sb" ]] && grep -q '"in-gms-5228"' "$sb"; then
     local bak; bak="$sb.preiosgms.$(date +%s)"
     if cp -a "$sb" "$bak" 2>/dev/null && cmp -s "$sb" "$bak"; then
       if python3 - "$sb" <<'PY'
@@ -1394,12 +1396,23 @@ c["inbounds"] = [i for i in c.get("inbounds", []) if i.get("tag") not in ("in-gm
 json.dump(c, open(f, "w"), ensure_ascii=False, indent=2)
 PY
       then
-        if sing-box check -c "$sb" >/dev/null 2>&1; then
+        # 用当前内核校验: mihomo 机上 canonical model 是渲染源, 得重渲染再 -t;
+        # 两个内核都不可用时, JSON 解析通过即接受(model 本身不被直接执行)。
+        local _vok=0
+        if [[ "$(_pdg_core)" == mihomo ]] && command -v mihomo >/dev/null 2>&1; then
+          if ( cd /opt/pdg-bot && python3 -c 'import bot; bot._render_mihomo_file()' ) >/dev/null 2>&1 \
+             && mihomo -t -d /etc/mihomo -f /etc/mihomo/config.yaml >/dev/null 2>&1; then _vok=1; fi
+        elif command -v sing-box >/dev/null 2>&1; then
+          sing-box check -c "$sb" >/dev/null 2>&1 && _vok=1
+        else
+          _vok=1
+        fi
+        if [[ "$_vok" == 1 ]]; then
           systemctl restart "$(_pdg_core_svc)" 2>/dev/null; sleep 1
           if [[ "$(systemctl is-active "$(_pdg_core_svc)" 2>/dev/null)" == active ]]; then
             rm -f "$bak"; c_g "  iOS: 已移除 sing-box GMS 入站(in-gms-5228/5229/5230)。"
           else c_y "  内核重启失败 → 还原。"; cp -a "$bak" "$sb"; systemctl restart "$(_pdg_core_svc)" 2>/dev/null; fi
-        else c_y "  sing-box check 失败 → 还原。"; cp -a "$bak" "$sb"; fi
+        else c_y "  内核校验未过 → 还原。"; cp -a "$bak" "$sb"; fi
       else c_y "  生成失败 → 还原。"; cp -a "$bak" "$sb"; fi
     else rm -f "$bak" 2>/dev/null; fi
   fi
@@ -1646,7 +1659,7 @@ SCPY
       c_g "下载 sing-box $SINGBOX_VER…"; local t; t=$(mktemp -d)
       if ! curl -fsSL "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VER}/sing-box-${SINGBOX_VER}-linux-${march}.tar.gz" -o "$t/sb.tgz" \
          || ! pdg_verify_sha256 "$t/sb.tgz" "${PDG_SHA256[singbox-$march]:-}" "sing-box $SINGBOX_VER" \
-         || ! tar -xzf "$t/sb.tgz" -C "$t"; then rm -rf "$t"; echo "❌ sing-box 下载/校验失败, 未切换"; return 1; fi
+         || ! tar --no-same-owner -xzf "$t/sb.tgz" -C "$t"; then rm -rf "$t"; echo "❌ sing-box 下载/校验失败, 未切换"; return 1; fi
       install -m755 "$t"/sing-box-*/sing-box /usr/local/bin/sing-box; rm -rf "$t"
     fi
     printf 'singbox\n' > /etc/privdns-gateway/backend

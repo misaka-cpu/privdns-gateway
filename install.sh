@@ -305,7 +305,7 @@ else
     curl -fsSL "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VER}/sing-box-${SINGBOX_VER}-linux-${MARCH}.tar.gz" -o "$t/sb.tgz"
     pdg_verify_sha256 "$t/sb.tgz" "${PDG_SHA256[singbox-$MARCH]:-}" "sing-box $SINGBOX_VER ($MARCH)" \
       || { rm -rf "$t"; die "sing-box 二进制校验未通过 → 拒绝安装(供应链异常, 或版本与 lib/versions.sh 不符)"; }
-    tar -xzf "$t/sb.tgz" -C "$t"
+    tar --no-same-owner -xzf "$t/sb.tgz" -C "$t"
     _stash_bin /usr/local/bin/sing-box || die "备份既有 sing-box 失败 → 中止(不在无法回退的前提下覆盖二进制)。"
     install -m755 "$t"/sing-box-*/sing-box /usr/local/bin/sing-box
     # shellcheck disable=SC2034  # 保留为"装成功了吗"的标记并保持 trap 前初始化;

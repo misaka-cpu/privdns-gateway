@@ -173,6 +173,26 @@ def main():
     # ── JSON 即合法 YAML: 必须能 json.dumps(mihomo 只吃 YAML, JSON 是其子集) ──
     json.dumps(cfg)
 
+
+    # ── 不可转换的出站必须记入 unknown_proxies, 不能被静默丢弃 ──
+    # 端到端发现: wireguard/ssh 这类不在 PROXY_TYPES 里的出站, 既不进 proxies 也不进
+    # unknown_proxies → "有出口无法转换"的守卫压根不触发; 而指向它的分流规则照样渲染,
+    # 最终由 mihomo 报 `proxy [X] not found` 拒绝整份配置 —— 用户既不知道是哪个出口,
+    # 也永远切不过去。(已用真 mihomo -t 验证其返回 1。)
+    _sb = {"outbounds": [
+        {"type": "direct", "tag": "direct"},
+        {"type": "block", "tag": "blk"},
+        {"type": "shadowsocks", "tag": "ok-ss", "server": "1.2.3.4", "server_port": 1,
+         "method": "aes-128-gcm", "password": "p"},
+        {"type": "urltest", "tag": "auto", "outbounds": ["ok-ss"]},
+        {"type": "wireguard", "tag": "wg-1", "server": "w", "server_port": 1,
+         "private_key": "a", "peer_public_key": "b", "local_address": ["10.0.0.2/32"]},
+        {"type": "ssh", "tag": "ssh-1", "server": "s", "server_port": 22, "user": "u"},
+    ], "route": {"rules": [{"domain_suffix": ["x.test"], "outbound": "wg-1"}], "final": "direct"}}
+    _c, _m = sb2mihomo.singbox_to_mihomo(_sb, redir_port=7893)
+    assert set(_m["unknown_proxies"]) == {"wg-1", "ssh-1"}, _m["unknown_proxies"]
+    assert not ({"direct", "blk", "auto"} & set(_m["unknown_proxies"])), _m["unknown_proxies"]
+
     print("[OK] sb2mihomo 渲染层全部断言通过")
 
 
