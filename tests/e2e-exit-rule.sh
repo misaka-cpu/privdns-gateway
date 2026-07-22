@@ -24,6 +24,7 @@ printf 'mihomo\n'  > /etc/privdns-gateway/backend
 printf 'android\n' > /etc/privdns-gateway/platform
 
 e2e_fetch_mihomo || e2e_skip "取不到 mihomo 二进制(无网络?)"
+e2e_fetch_mosdns || e2e_skip "取不到 mosdns 二进制"
 echo "内核: $(mihomo -v 2>&1 | head -1)"
 
 # ══ 1. 协议矩阵: 每种协议都要能 parse_link → apply_sb → 真 mihomo -t 通过 ══════

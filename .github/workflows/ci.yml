@@ -207,12 +207,30 @@ jobs:
       - name: 劫持形态 (真起 mosdns 验证 all=排除式劫持 / gfw=白名单放行)
         run: bash tests/test-hijack-shape.sh
 
-      # ── 端到端(namespace+overlayfs 沙盒, 真实绝对路径 + 真内核/真 mosdns) ──
-      # 单测都在函数级别打桩, 跨组件的接缝没人看着; 这几条查出过 GMS 重复插入、backend
-      # 标记从不落地、分流规则不进 mosdns、不可转换出站被静默丢弃等接缝 bug。
+  e2e:
+    # 端到端: 在真实绝对路径上跑真正的 migrate / switch-core / bot 代码, 配合真内核与真 mosdns。
+    # 单测都在函数级别打桩, 跨组件的接缝没人看着 —— 这几条查出过 GMS 重复插入、backend 标记
+    # 从不落地、分流规则不进 mosdns、不可转换出站被静默丢弃等接缝 bug。
+    #
+    # 为什么用容器而不是 runner 上的 unshare: ubuntu-24.04 runner 用 AppArmor 禁掉了非特权
+    # 用户命名空间, unshare -rm 不可用, 脚本会整条跳过(CI 绿但零覆盖)。容器本身就是一次性
+    # 隔离环境且以 root 运行, 直接置 PDG_E2E_ISOLATED=1 跑同一份测试主体。
+    runs-on: ubuntu-latest
+    container:
+      image: debian:12
+    steps:
+      - uses: actions/checkout@v5
+      - name: 装依赖
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            bash curl ca-certificates python3 tar gzip unzip dnsutils git coreutils >/dev/null
       - name: E2E 老装升级 (v1.4.x 现场跑真实 pdg __migrate, 三场景 + 幂等)
+        env: { PDG_E2E_ISOLATED: "1" }
         run: bash tests/e2e-migrate.sh
       - name: E2E 加落地+分流 (真 parse_link/apply_sb → 真 mihomo -t → 真 mosdns 解析)
+        env: { PDG_E2E_ISOLATED: "1" }
         run: bash tests/e2e-exit-rule.sh
       - name: E2E 内核切换 (两内核真二进制真切换 + 不可转换出口必须点名拒绝)
+        env: { PDG_E2E_ISOLATED: "1" }
         run: bash tests/e2e-switch-core.sh
