@@ -74,6 +74,8 @@ fi
 source "$REPO_DIR/lib/versions.sh"
 # shellcheck source=lib/units.sh
 source "$REPO_DIR/lib/units.sh"   # systemd unit 单一事实源(与 switch-core 共用, 免漂移)
+# shellcheck source=lib/mosdns.sh
+source "$REPO_DIR/lib/mosdns.sh" # mosdns 劫持形态单一事实源(与 hijack-mode/迁移共用)
 
 # ── 事务性安装: 失败自动回滚(只撤本次新装的, 不误伤既有可用部署)──
 INSTALL_OK=0; ROLLBACK_DONE=0; FORCED_REINSTALL=0
@@ -446,6 +448,10 @@ render(){ sed -e "s|__SERVER_IP__|$SERVER_IP|g" -e "s|__INTERNAL_CIDR__|$INTERNA
               -e "s|__HIJACK_SET_FILE__|$HIJACK_SET_FILE|g" "$1"; }
 
 render "$REPO_DIR/deploy/mosdns/config.yaml"          > /etc/mosdns/config.yaml
+# 模板自带 gfw 那道劫持门; all 模式要去掉它 —— all 的语义是"不是国内就劫持"(排除式),
+# 留着门会退化成"只劫持 geosite 策展分类里的域名"。
+_mosdns_hijack_shape "$HIJACK_MODE" /etc/mosdns/config.yaml "$HIJACK_SET_FILE" >/dev/null \
+  || die "mosdns 劫持形态渲染失败"
 render "$REPO_DIR/deploy/singbox/config.json.tmpl"    > /etc/sing-box/config.json   # 始终是 bot 的数据模型(mihomo 模式下也由它渲染)
 # iOS: 模板含 GMS(in-gms-5228/5229/5230)入站, iOS 走 APNs 不需要 → 删掉, 让 canonical model 从一开始就无 GMS。
 if [[ "$PLATFORM" == ios ]]; then

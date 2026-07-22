@@ -145,6 +145,9 @@ jobs:
       - name: "分流规则→mosdns 劫持同步回归 (指到出口的域名必须被 mosdns 劫持, 否则规则是死的)"
         run: python3 tests/test-rule-hijack-sync.py
 
+      - name: "劫持形态回归 (all=排除式/gfw=白名单, 双向幂等, 老形态补插件, 真起 mosdns 验证解析)"
+        run: bash tests/test-hijack-shape.sh
+
       - name: "CLI/report/bot 杂项回归 (rollback 校验/inet pdg/菜单 exec)"
         run: python3 tests/test-maintenance-polish.py
 

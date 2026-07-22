@@ -1427,11 +1427,36 @@ if hj not in s:                      # 按实际路径判幂等, 不靠硬编码
 print("changed" if changed else "nochange")
 MIGPY
   ); then
-    c_y "  mosdns 用户劫持表迁移失败(hijack_set 形态不认识?), 跳过。"; return 0
+    c_y "  mosdns 配置里没有可识别的 hijack_set(自定义形态), 用户劫持表未并入; 劫持表本身已就绪。"; return 0
   fi
   if [[ "$out" == changed ]]; then
     systemctl restart mosdns 2>/dev/null || true
     c_g "  已建用户劫持表并回填显式出口域名(修: 指到出口的域名此前不被 mosdns 劫持)。"
+  fi
+}
+
+# 把已有机器的 mosdns 劫持形态归一到"与 PDG_HIJACK_MODE 一致"。两类机器都要修:
+#   · 老形态(无 hijack_set, 排除式): 补上 hijack_set 插件, 获得 gfw 能力; all 语义不变。
+#   · 新形态(有劫持门)但模式是 all: 去掉那道门 —— 它把 all 悄悄退化成了"只劫持 geosite
+#     策展分类里的域名", 用户指到出口的任意域名照样直连(issue #1)。
+migrate_mosdns_hijack_shape(){
+  local mc=/etc/mosdns/config.yaml mode file out
+  [[ -f "$mc" ]] || return 0
+  # shellcheck source=/dev/null
+  source "$REPO_DIR/lib/mosdns.sh" 2>/dev/null || return 0
+  mode="$(sed -n 's/^PDG_HIJACK_MODE=//p' /etc/privdns-gateway/profile.env 2>/dev/null | tail -1)"
+  [[ "$mode" == gfw || "$mode" == all ]] || mode=all
+  [[ "$mode" == gfw ]] && file=geosite_gfw.txt || file="geosite_geolocation-!cn.txt"
+  # gfw 模式但劫持集文件不在 → 别把门装上(会把所有海外域名放行), 维持现状交人工
+  if [[ "$mode" == gfw && ! -s "/etc/mosdns/rules/$file" ]]; then
+    c_y "  gfw 模式但缺 /etc/mosdns/rules/$file, 劫持形态未动。"; return 0
+  fi
+  if ! out=$(_mosdns_hijack_shape "$mode" "$mc" "$file"); then
+    c_y "  mosdns 劫持形态是自定义的, 未动(不猜着改)。"; return 0
+  fi
+  if [[ "$out" == changed ]]; then
+    systemctl restart mosdns 2>/dev/null || true
+    c_g "  已归一 mosdns 劫持形态 → $mode(all=不是国内就劫持; gfw=只劫持劫持集内域名)。"
   fi
 }
 
@@ -1441,6 +1466,7 @@ run_all_migrations(){
   migrate_mosdns_unlock || true; migrate_singbox_gms || true; migrate_fw_gms || true
   migrate_mosdns_ratelimit || true; migrate_lowmem || true; migrate_mihomo_safepaths || true
   migrate_deploy_botfiles || true
+  migrate_mosdns_hijack_shape || true
   migrate_custom_hijack || true
   migrate_mosdns_mitm || true; migrate_pdg_mitm_service || true
   migrate_android_cleanup || true; migrate_ios_gms_cleanup || true   # 平台隔离清理(各自平台内幂等)
@@ -1597,19 +1623,18 @@ SCPY
 # 切换劫持模式: all(非CN全劫持) | gfw(只劫持 GFWList 真被墙域名, 非墙海外直连)。换 hijack_set 加载的域名文件。
 cmd_hijack_mode(){
   need_root hijack-mode
+  # shellcheck source=/dev/null
+  source "$REPO_DIR/lib/mosdns.sh" 2>/dev/null || { echo "❌ 读不到 lib/mosdns.sh"; return 1; }
   local mode="${1:-}" file
   if [[ "$mode" != all && "$mode" != gfw ]]; then
     echo "用法: pdg hijack-mode <all|gfw>"
-    echo "  all = geosite 判为非CN的域名劫持进代理(默认)"
-    echo "        注意: 依据是 geosite 的 geolocation-!cn **策展分类**, 不是\"所有非CN域名\";"
-    echo "        不在任何 geosite 分类里的域名(如个人域名)不会被它劫持 —— 在 bot 里把域名"
-    echo "        指到出口即可, 那会自动写进 custom_hijack.txt 并重启 mosdns。"
-    echo "  gfw = 只劫持 GFWList 真被墙域名; 非墙海外域名直连(修 SSH/直连走域名被劫持)。前提: 内网卡 SIM 能直达一般互联网"
+    echo "  all = 不是国内域名就劫持进代理(默认, 排除式)"
+    echo "  gfw = 只劫持 hijack_set 里的域名(GFWList + 你在 bot 里指到出口的域名);"
+    echo "        其余海外域名返真实 IP 直连(修 SSH/直连走域名被劫持)。前提: 内网卡 SIM 能直达一般互联网"
     echo "  当前: $(cat /etc/privdns-gateway/profile.env 2>/dev/null | sed -n 's/^PDG_HIJACK_MODE=//p' | tail -1 || echo '?')"
     return 1
   fi
-  grep -q 'tag: hijack_set' /etc/mosdns/config.yaml 2>/dev/null \
-    || { echo "❌ 当前 mosdns 配置无 hijack_set(旧版装机)。先 sudo pdg update 到 v1.4.2+ 再切。"; return 1; }
+  [[ -f /etc/mosdns/config.yaml ]] || { echo "❌ 找不到 /etc/mosdns/config.yaml"; return 1; }
   if [[ "$mode" == gfw ]]; then
     file="geosite_gfw.txt"
     if [[ ! -s /etc/mosdns/rules/geosite_gfw.txt ]]; then
@@ -1620,12 +1645,20 @@ cmd_hijack_mode(){
     file="geosite_geolocation-!cn.txt"
   fi
   cp /etc/mosdns/config.yaml /etc/mosdns/config.yaml.hjbak
-  # geosite_gfw.txt / geosite_geolocation-!cn.txt 仅 hijack_set 引用, 故全局替换安全
-  sed -i -E "s#/etc/mosdns/rules/geosite_(gfw|geolocation-!cn)\.txt#/etc/mosdns/rules/$file#g" /etc/mosdns/config.yaml
-  systemctl restart mosdns; sleep 1.5
-  if [[ "$(systemctl is-active mosdns 2>/dev/null)" != active ]]; then
-    c_y "mosdns 重启失败 → 还原"; cp /etc/mosdns/config.yaml.hjbak /etc/mosdns/config.yaml
-    systemctl restart mosdns; rm -f /etc/mosdns/config.yaml.hjbak; return 1
+  # 用归一化器改形态(all=去掉劫持门/排除式, gfw=装上劫持门/白名单式), 而不是只换文件名 ——
+  # 只换文件名在旧形态机器上一个字都改不到, 却照样打印"✅ 劫持模式 → xxx"(空转报成功)。
+  local shape
+  if ! shape=$(_mosdns_hijack_shape "$mode" /etc/mosdns/config.yaml "$file"); then
+    c_y "mosdns 配置是自定义形态, 未改动(不猜着改)。"; rm -f /etc/mosdns/config.yaml.hjbak; return 1
+  fi
+  if [[ "$shape" == changed ]]; then
+    systemctl restart mosdns; sleep 1.5
+    if [[ "$(systemctl is-active mosdns 2>/dev/null)" != active ]]; then
+      c_y "mosdns 重启失败 → 还原"; cp /etc/mosdns/config.yaml.hjbak /etc/mosdns/config.yaml
+      systemctl restart mosdns; rm -f /etc/mosdns/config.yaml.hjbak; return 1
+    fi
+  else
+    echo "  (配置已是 $mode 形态, 无需改动)"
   fi
   rm -f /etc/mosdns/config.yaml.hjbak
   install -d -m700 /etc/privdns-gateway
