@@ -2,6 +2,17 @@
 
 本项目按语义化 `v1.x` tag 正式发布;以下按版本/日期记录主要变化,完整提交见 git 历史。
 
+## 2026-07-22 — v1.5.9(更新/回滚/安装回滚健壮性 + WLOC 严格预签 + Mihomo 诊断)
+
+- **iOS GMS 清理**:迁移改为只从 nft **端口集**精确移除 5228-5230,保留整条 `{ 80, 443 } redirect`。旧实现按行删含 5228 的 redirect,而 mihomo 模板把三者写在同一条上,于是把 80/443 的代理入口一并删掉(线上已出现过);自定义形态识别不了就还原不动,交 doctor 提示。
+- **`pdg update`**:关键步骤(git reset / 必需文件安装 / `__migrate` / 内核更新 / `daemon-reload`)失败即立刻回滚并返回非 0,不再吞掉失败照报「✅ 已更新」造成新旧混部;仅 iOS 组件、健康服务、certbot 钩子等可选文件保持容错。
+- **内核热切**:确认新内核重启后稳定运行才删旧核备份 `.prev`(旧实现 check 一过就删,新核起不来便无核可退);配置 check 或重启不稳定都还原旧核并返回非 0。快照纳入两内核二进制,回滚不依赖联网重下。
+- **跨内核回滚**:内核激活失败计入未恢复项 → 返回非 0 并打印「未完全回滚」+ 失败项,不再只 warn 后照报「✅ 已回滚」。
+- **`install.sh` 回滚**:修 `MIHOMO_INSTALLED` 未初始化导致回滚在 `set -u` 下二次崩溃 —— 它会掩盖最初真正的安装错误,并让其后的 nftables / systemd-resolved / resolv.conf 还原全部没跑。状态变量在注册 EXIT trap 前全部初始化,判断一律带 `:-` 兜底,三项系统级还原各自独立(单项失败不中断后续),结束时明确输出「已回滚」或列出未恢复项;覆盖装前已有的内核二进制时还原原件而不是删掉。
+- **WLOC**:叶子证书预签严格化(`prewarm(strict=True)` + 核对返回张数),少签一张即整体回滚,不再出现「证书没签出来却显示已启用」。
+- **诊断**:`pdg report` / `pdg log` 的内核版本与日志按当前后端取(mihomo 机上不再固定去问 sing-box);doctor 敏感端口检查纳入 mihomo redir 口 7893(对全网开放判 fail,限内网来源放行)。
+- **文案**:README 与 Bot 的 WLOC「手机端(全程用内网卡)」统一为同一套三步。
+
 ## 2026-07-22 — v1.5.8(健壮性修复一批 + Android/iOS 平台隔离 + README/文案重写)
 
 - **健壮性修复**:MITM 叶子证书并发签发竞态(进程内 + 跨进程锁、随机序列号);`sb2mihomo` Hysteria v1 单独转 `type:hysteria`(不再误塞 hysteria2);`pdg update` 更新前快照失败即中止 + 按快照路径/Git SHA 精确回滚;WLOC 启停/切换/删除事务化(全量校验 + 失败回滚,不留脏态);`switch-core` 统一 systemd unit 生成 + 切核 enable/disable 纪律 + 跨内核回滚;CI mosdns 渲染补 `__HIJACK_SET_FILE__` 占位符 + fixture;`profile.env` 原子按键写(不再整覆盖丢 `PDG_TFO`/`PDG_HIJACK_MODE` 等);v1.4.x→WLOC 升级迁移(补 `force_hijack` 结构,幂等可回滚)。
