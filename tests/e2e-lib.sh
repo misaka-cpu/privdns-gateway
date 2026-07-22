@@ -21,6 +21,13 @@ bad(){ echo "[FAIL] $1"; E2E_FAIL=$((E2E_FAIL+1)); }
 e2e_summary(){ echo "────────────────────────────────────────"; echo "通过 $E2E_PASS, 失败 $E2E_FAIL"; [[ "$E2E_FAIL" == 0 ]]; }
 e2e_skip(){ echo "[SKIP] $1"; echo "────────────────────────────────────────"; echo "通过 0, 失败 0(已跳过)"; exit 0; }
 
+# 沙盒里的仓库文件未必归当前 uid(CI 容器 job: 工作区归 runner uid, 容器内是 root),
+# git 会以 "dubious ownership" 拒绝一切操作 —— update 那条 e2e 连 tag 都读不到。
+# safe.directory 属"受保护配置": 经 -c / GIT_CONFIG_* 环境变量设置会被 git 故意忽略,
+# 只认 system/global。所以写沙盒里的 /etc/gitconfig —— 本地是 overlay, CI 是一次性容器,
+# 两边都碰不到开发机的真实配置。
+_e2e_git_safe(){ grep -q 'directory = \*' /etc/gitconfig 2>/dev/null || printf '[safe]\n\tdirectory = *\n' >> /etc/gitconfig 2>/dev/null || true; }
+
 # 重入 namespace: 外层建 overlay 目录并 unshare, 内层挂载
 e2e_enter(){
   # 已经身处一次性隔离环境且是 root(CI 的容器 job) → 直接跑, 不必再自建 namespace。
@@ -30,6 +37,7 @@ e2e_enter(){
     mkdir -p /var/lib/privdns-gateway /etc/mosdns/rules /etc/sing-box /etc/mihomo \
              /etc/privdns-gateway /etc/systemd/system /etc/systemd/journald.conf.d 2>/dev/null || true
     [[ -e /etc/nftables.conf ]] || : > /etc/nftables.conf
+    _e2e_git_safe
     return 0
   fi
   if [[ "${PDG_E2E_INNER:-}" == 1 ]]; then
@@ -43,6 +51,7 @@ e2e_enter(){
     mount -t overlay overlay -o "lowerdir=/var/lib,upperdir=$E2E_OVL/vu,workdir=$E2E_OVL/vw" /var/lib \
       2>/dev/null || mount -t tmpfs tmpfs /var/lib 2>/dev/null || true
     mkdir -p /var/lib/privdns-gateway 2>/dev/null || true
+    _e2e_git_safe
     return 0
   fi
   unshare -rm true 2>/dev/null || e2e_skip "本环境不支持 unshare -rm(需用户+挂载命名空间)"
