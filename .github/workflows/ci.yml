@@ -234,10 +234,10 @@ jobs:
       - name: E2E 内核切换 (两内核真二进制真切换 + 不可转换出口必须点名拒绝)
         env: { PDG_E2E_ISOLATED: "1" }
         run: bash tests/e2e-switch-core.sh
-      - name: E2E 全新安装 (真跑 install.sh: 落地全套 / 拒绝重装 / 失败回滚干净)
+      - name: "E2E 全新安装 (真跑 install.sh: 落地全套 / 拒绝重装 / 失败回滚干净)"
         env: { PDG_E2E_ISOLATED: "1" }
         run: bash tests/e2e-install.sh
-      - name: E2E 更新全流程 (真 git 仓库两个 tag: 更新成功 / doctor失败回滚 / 快照回滚)
+      - name: "E2E 更新全流程 (真 git 仓库两个 tag: 更新成功 / doctor失败回滚 / 快照回滚)"
         env: { PDG_E2E_ISOLATED: "1" }
         run: bash tests/e2e-update.sh
       - name: E2E WLOC (真事务开关 + 真坐标改写 + 平台门控)
