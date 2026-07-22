@@ -1217,12 +1217,22 @@ migrate_platform_marker(){
   if [[ -z "$plat" ]]; then
     if [[ -f "$mu" ]] || grep -q '"wloc"' "$mj" 2>/dev/null; then plat=ios; fi
   fi
-  # 3) 仍无法确定 → 安全回退 android(不写死"已确认", status/doctor 会提示标记缺失回退)
-  [[ -n "$plat" ]] || plat=android
+  # 3) 仍无法确定 → 安全回退 android, 但**标记为推测**。v1.4.x 把 probe81/描述文件装给所有
+  #    机器, 它们的存在证明不了平台; 贸然按 android 做破坏性清理会把真 iPhone 部署的 iOS
+  #    组件删掉。打上 .guessed 后: 破坏性清理一律不做, doctor 持续提示, 等人工确认。
+  local guessed=0
+  [[ -n "$plat" ]] || { plat=android; guessed=1; }
   mkdir -p "$(dirname "$pf")" 2>/dev/null || true
   local t; t="$(mktemp "$(dirname "$pf")/.platform.XXXXXX" 2>/dev/null)" || return 0
-  printf '%s\n' "$plat" > "$t" && mv -f "$t" "$pf" \
-    && c_g "补平台标记: $plat(据现有证据)。" || rm -f "$t" 2>/dev/null
+  if printf '%s\n' "$plat" > "$t" && mv -f "$t" "$pf"; then
+    if [[ "$guessed" == 1 ]]; then
+      : > "$(dirname "$pf")/platform.guessed" 2>/dev/null || true
+      c_y "补平台标记: android(**推测**, 无确凿证据)。若这台服务 iPhone, 请运行: sudo pdg platform ios"
+    else
+      rm -f "$(dirname "$pf")/platform.guessed" 2>/dev/null || true
+      c_g "补平台标记: $plat(据现有证据)。"
+    fi
+  else rm -f "$t" 2>/dev/null; fi
 }
 
 # 老装(v1.4.x, WLOC 之前)迁移: 给 mosdns 补 MITM 接管结构 —— force_hijack domain_set +
@@ -1314,6 +1324,14 @@ migrate_pdg_mitm_service(){
 # CA / WLOC 地点数据不永久删 —— 留作休眠(Android 上 _mitm_enabled_domains 恒空, 本就不生效)。
 migrate_android_cleanup(){
   [[ "$(_pdg_platform)" == android ]] || return 0
+  # 推测出来的 android 不做破坏性清理: 万一这台其实服务 iPhone, 一删就把描述文件/probe81/
+  # MITM 组件全没了, 而且 doctor 之后还会一路判绿(它已经认为自己是 Android 机)。
+  local _gf; _gf="$(dirname "${PDG_PLATFORM_FILE:-/etc/privdns-gateway/platform}")/platform.guessed"
+  if [[ -e "$_gf" ]]; then
+    c_y "  平台是推测的 android(无确凿证据) → 跳过 iOS 组件清理。"
+    c_y "  确认后运行: sudo pdg platform android(或 ios), 再重跑。"
+    return 0
+  fi
   # 有启用中的 WLOC → 先安全休眠: 清运行时接管 + enabled=false(保留地点/CA 数据)
   if grep -q '"enabled": *true' /etc/privdns-gateway/mitm.json 2>/dev/null; then
     : > /etc/mosdns/rules/mitm_hijack.txt 2>/dev/null || true
@@ -1621,6 +1639,23 @@ SCPY
 }
 
 # 切换劫持模式: all(非CN全劫持) | gfw(只劫持 GFWList 真被墙域名, 非墙海外直连)。换 hijack_set 加载的域名文件。
+# 人工确认手机平台。装机时会写标记; 只有老装(v1.4.x 无平台概念)推断不出来才需要手工定。
+cmd_platform(){
+  need_root platform
+  local p="${1:-}" cur; cur="$(_pdg_platform)"
+  if [[ "$p" != ios && "$p" != android ]]; then
+    echo "用法: pdg platform <ios|android>"
+    echo "  当前: $cur$( [[ -e /etc/privdns-gateway/platform.guessed ]] && echo "  ⚠️ 推测值, 未确认" )"
+    echo "  确认后才会执行该平台的组件清理(推测状态下一律不做破坏性清理)。"
+    return 1
+  fi
+  install -d -m700 /etc/privdns-gateway
+  printf '%s\n' "$p" > /etc/privdns-gateway/platform
+  rm -f /etc/privdns-gateway/platform.guessed
+  c_g "平台已确认: $cur → $p"
+  run_all_migrations        # 让平台相关的部署/清理按确认后的平台立刻落地
+}
+
 cmd_hijack_mode(){
   need_root hijack-mode
   # shellcheck source=/dev/null
@@ -1696,8 +1731,9 @@ case "${1:-menu}" in
   ios)           cmd_ios;;
   report)        shift || true; cmd_report "$@";;
   detect-cidr|cidr) shift || true; cmd_detect_cidr "${1:-}";;
+  platform)      shift || true; cmd_platform "${1:-}";;
   hijack-mode)   shift || true; cmd_hijack_mode "${1:-}";;
   switch-core)   shift || true; cmd_switch_core "${1:-}";;
   uninstall|rm)  shift || true; cmd_uninstall "${1:-}";;
-  *) echo "用法: pdg [menu|status|doctor [--json|--deep]|update [--dry-run]|snapshot|rollback [n]|token|restart|log [n]|traffic|ios(仅 iOS)|report [--redact-ip|--full]|detect-cidr|hijack-mode <all|gfw>|switch-core <mihomo|singbox>|migrate-fw|uninstall [--purge]]";;
+  *) echo "用法: pdg [menu|status|doctor [--json|--deep]|update [--dry-run]|snapshot|rollback [n]|token|restart|log [n]|traffic|ios(仅 iOS)|report [--redact-ip|--full]|detect-cidr|platform <ios|android>|hijack-mode <all|gfw>|switch-core <mihomo|singbox>|migrate-fw|uninstall [--purge]]";;
 esac

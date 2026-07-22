@@ -2432,6 +2432,20 @@ def _machine_id(sb_path, mos_path):
         pass
     return ip, cidr, certdir
 
+def _platform_sanitize_model(cfg):
+    """把 model 按**本机平台**净化。备份可能来自另一平台, 或是本机平台清理**之前**的旧档 ——
+    恢复不做这一步的话, iOS 机会被带回 GMS 5228-5230 入站(iOS 走 APNs, 根本用不到),
+    而且要等下一次 root 管理命令触发迁移才清掉。返回是否改动。"""
+    if _platform() != "ios":
+        return False   # Android 缺 GMS 入站由 migrate_singbox_gms 补, 不在这里加
+    ib = cfg.get("inbounds") or []
+    keep = [i for i in ib if i.get("tag") not in ("in-gms-5228", "in-gms-5229", "in-gms-5230")]
+    if len(keep) == len(ib):
+        return False
+    cfg["inbounds"] = keep
+    return True
+
+
 def restore_from(data):
     try:
         tar = tarfile.open(fileobj=io.BytesIO(data), mode="r:gz")
@@ -2466,7 +2480,9 @@ def restore_from(data):
                     open(f, "w").write(s)
         # 面板是临时运行态，不随备份恢复。只净化本项目受管形态，自定义 clash_api 保持原样。
         cfg = json.load(open(newsb))
-        if _panel_sanitize_config(cfg):
+        _dirty = _panel_sanitize_config(cfg)
+        _dirty = _platform_sanitize_model(cfg) or _dirty   # 平台净化要赶在校验/落盘之前
+        if _dirty:
             json.dump(cfg, open(newsb, "w"), ensure_ascii=False, indent=2)
         # 校验前把 rule_set 的绝对路径临时指向解包出来的 rs/ —— 否则 check 会去找真实位置
         # (备份里带着这些 rs 文件, 但此刻还没恢复到 /etc/sing-box/rs/, 直接 check 会 "no such file")。

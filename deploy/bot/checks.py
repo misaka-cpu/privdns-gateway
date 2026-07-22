@@ -91,6 +91,11 @@ def check_platform():
     except OSError:
         p = ""
     if p in ("ios", "android"):
+        # 标记是"推测"出来的(老装无平台概念, 且机器上的 iOS 组件证明不了平台): 持续提示到人工确认。
+        # 推测状态下破坏性的平台清理一律不做, 免得把真 iPhone 部署的 iOS 组件删掉。
+        if os.path.exists("/etc/privdns-gateway/platform.guessed"):
+            return ("warn", "平台", p + "(**推测**, 未确认) → 平台相关清理暂缓; "
+                    "确认后运行: sudo pdg platform ios  或  sudo pdg platform android")
         return ("ok", "平台", p)
     return ("warn", "平台", "平台标记缺失/非法 → 当前按 Android 安全回退(非已确认); 运行 sudo pdg 触发迁移落定")
 

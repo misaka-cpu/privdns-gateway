@@ -108,6 +108,35 @@ def main():
     assert any("custom_hijack" in k for k in bot.RESTORE_MAP), "恢复映射未含用户劫持表"
     ok("备份/恢复: 含用户劫持表")
 
+    # ── 恢复备份必须按本机平台净化 model ──
+    # .200 现场: 在 bot 里恢复了一份清理**之前**的旧备份, GMS 入站被带回来, doctor 随即报残留。
+    # 恢复不做这一步的话, 得等下一次 root 管理命令触发迁移才清掉。
+    GMS = [{"tag": "in-https", "listen_port": 443},
+           {"tag": "in-gms-5228", "listen_port": 5228},
+           {"tag": "in-gms-5229", "listen_port": 5229},
+           {"tag": "in-gms-5230", "listen_port": 5230}]
+    _op = bot._platform
+    try:
+        bot._platform = lambda: "ios"
+        c = {"inbounds": list(GMS)}
+        assert bot._platform_sanitize_model(c) is True
+        assert [i["tag"] for i in c["inbounds"]] == ["in-https"], c
+        ok("恢复净化: iOS 上剥掉备份带来的 GMS 入站")
+        assert bot._platform_sanitize_model(c) is False
+        ok("恢复净化: 幂等(已干净则不改)")
+        bot._platform = lambda: "android"
+        c2 = {"inbounds": list(GMS)}
+        assert bot._platform_sanitize_model(c2) is False
+        assert len(c2["inbounds"]) == 4
+        ok("恢复净化: Android 不动 GMS 入站(它需要 5228-5230)")
+    finally:
+        bot._platform = _op
+    # 净化必须发生在校验/落盘之前
+    src = (ROOT / "deploy/bot/pdg-bot.py").read_text(encoding="utf-8")
+    body = src[src.index("def restore_from("):]
+    assert body.index("_platform_sanitize_model") < body.index("sing-box\", \"check"), "净化晚于校验"
+    ok("恢复净化: 排在配置校验之前")
+
     print(f"\n通过 {pass_n} 项断言")
 
 

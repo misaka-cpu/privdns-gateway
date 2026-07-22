@@ -21,7 +21,7 @@ eval "$(xt migrate_platform_marker)"
 c_g(){ :; }; c_y(){ :; }
 mk_marker(){ PDG_PLATFORM_FILE="$WORK/platform" PROFILE_ENV="$WORK/profile.env" \
              PDG_MITM_JSON="$WORK/mitm.json" PDG_MITM_UNIT="$WORK/pdg-mitm.service" migrate_platform_marker; }
-reset_ev(){ rm -f "$WORK/platform" "$WORK/profile.env" "$WORK/mitm.json" "$WORK/pdg-mitm.service"; }
+reset_ev(){ rm -f "$WORK/platform" "$WORK/profile.env" "$WORK/mitm.json" "$WORK/pdg-mitm.service" "$WORK/platform.guessed"; }
 
 reset_ev; printf 'ios\n' > "$WORK/platform"; mk_marker
 [[ "$(cat "$WORK/platform")" == ios ]] && ok "标记已合法(ios) → 幂等不改" || bad "误改了合法标记"
@@ -42,6 +42,30 @@ _pdg_platform(){ echo android; }
 [[ "$(_pdg_svcs)" == "mosdns sing-box pdg-bot" ]] && ok "Android 服务集不含 pdg-probe81" || bad "Android 服务集错: $(_pdg_svcs)"
 _pdg_platform(){ echo ios; }
 [[ "$(_pdg_svcs)" == *pdg-probe81* ]] && ok "iOS 服务集含 pdg-probe81" || bad "iOS 服务集缺 pdg-probe81"
+
+# ── A2. 推测出来的 android 必须打 .guessed, 且不做破坏性 iOS 清理(v1.4.x 老装保护) ──
+# v1.4.x 无平台概念, 且把 probe81/描述文件装给**所有**机器 —— 它们的存在证明不了平台。
+# 之前直接回退 android 并照常清理, 会把真 iPhone 部署的 iOS 组件删光, 而且之后 doctor 全绿。
+reset_ev; mk_marker
+{ [[ "$(cat "$WORK/platform")" == android ]] && [[ -e "$WORK/platform.guessed" ]]; } \
+  && ok "无任何证据 → 回退 android 并打 .guessed(推测)" || bad "A2: 未标记为推测"
+reset_ev; printf 'PDG_PLATFORM=android\n' > "$WORK/profile.env"; mk_marker
+{ [[ "$(cat "$WORK/platform")" == android ]] && [[ ! -e "$WORK/platform.guessed" ]]; } \
+  && ok "有确凿证据(profile.env) → 不打 .guessed" || bad "A2b: 确凿证据也被当成推测"
+
+# 推测状态下 migrate_android_cleanup 必须跳过破坏性清理
+eval "$(xt migrate_android_cleanup)"
+c_y(){ echo "$*"; }        # 本段要断言提示文案(文件顶部把 c_y 打桩成静默了)
+reset_ev; mk_marker                     # → android + .guessed
+mkdir -p "$WORK/optbot"; : > "$WORK/optbot/probe81.py"
+_pdg_platform(){ echo android; }
+out=$(PDG_PLATFORM_FILE="$WORK/platform" migrate_android_cleanup 2>&1)
+{ grep -q '跳过 iOS 组件清理' <<<"$out" && [[ -e "$WORK/optbot/probe81.py" ]]; } \
+  && ok "推测的 android → 跳过 iOS 组件清理(不冒删 iPhone 部署的风险)" || bad "A2c: out=$out"
+rm -f "$WORK/platform.guessed"
+out=$(PDG_PLATFORM_FILE="$WORK/platform" migrate_android_cleanup 2>&1)
+grep -q '跳过 iOS 组件清理' <<<"$out" && bad "A2d: 已确认仍跳过清理" || ok "确认后的 android → 正常执行清理"
+c_y(){ :; }                # 恢复静默, 不干扰后续用例
 
 # ── B. GMS 迁移仅 Android(iOS 跳过)──────────────────────────────────────────
 eval "$(xt migrate_singbox_gms)"; eval "$(xt migrate_fw_gms)"
