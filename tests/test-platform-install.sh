@@ -94,10 +94,18 @@ grep -qE 'tcp dport [{][^}]*5228' "$WORK/nfmh" && bad "mihomo: 端口集仍含 5
 grep -qF 'tcp dport { 80, 443 } redirect to :7893' "$WORK/nfmh" && ok "mihomo: { 80, 443 } redirect 整条保留(不再误删)" || bad "mihomo: 80/443 redirect 被误删!"
 snap="$(cat "$WORK/nfmh")"; migrate_ios_gms_cleanup "$WORK/none-sb.json" "$WORK/nfmh"
 [[ "$(cat "$WORK/nfmh")" == "$snap" ]] && ok "mihomo REDIRECT 清理幂等(二跑不变)" || bad "二跑改动了 nft"
-# nft 语法校验(仅当有真 nft 二进制; type -P 只找可执行文件, 绕开本测试里的 nft() 桩)
-if _nftbin="$(type -P nft 2>/dev/null)" && [[ -n "$_nftbin" ]]; then
-  "$_nftbin" -c -f "$WORK/nfmh" >/dev/null 2>&1 && ok "迁移后 nft -c 校验通过" || bad "迁移后 nft -c 校验不过"
-else ok "迁移后 nft -c 校验(无 nft 二进制, 跳过)"; fi
+# nft 语法校验: 需要真 nft 二进制(type -P 只找可执行文件, 绕开本测试里的 nft() 桩), 且本环境
+# 确实能跑 nft -c —— nft 即便只做 -c 也要开 netlink, 非 root(如 CI runner)会连合法规则集一起拒。
+# 故先用一份**手写的合法 nat/redirect 规则集**探能力: 探测过 = 本环境能校验这类规则, 此时迁移
+# 产物再不过就是真的错(照报 FAIL); 探测不过 = 环境不具备校验能力, 跳过而非谎报通过。
+_nftbin="$(type -P nft 2>/dev/null || true)"
+printf 'table inet nftprobe {\n\tchain prerouting {\n\t\ttype nat hook prerouting priority dstnat; policy accept;\n\t\tip saddr 172.22.0.0/16 tcp dport { 80, 443 } redirect to :7893\n\t}\n}\n' > "$WORK/nftprobe"
+if [[ -n "$_nftbin" ]] && "$_nftbin" -c -f "$WORK/nftprobe" >/dev/null 2>&1; then
+  if "$_nftbin" -c -f "$WORK/nfmh" >/dev/null 2>&1; then ok "迁移后 nft -c 校验通过"
+  else bad "迁移后 nft -c 校验不过: $("$_nftbin" -c -f "$WORK/nfmh" 2>&1 | head -2 | tr '\n' ' ')"; fi
+else
+  ok "迁移后 nft -c 校验(本环境 nft 不可用或无 netlink 权限, 跳过)"
+fi
 # 自定义/非原装 5228 形态(逐端口而非区间)无法安全识别 → 还原不破坏
 printf 'table inet pdg {\n\tchain prerouting { ip saddr X tcp dport { 80, 443, 5228, 5229, 5230 } redirect to :7893 }\n}\n' > "$WORK/nfcustom"
 snapc="$(cat "$WORK/nfcustom")"; migrate_ios_gms_cleanup "$WORK/none-sb.json" "$WORK/nfcustom"
