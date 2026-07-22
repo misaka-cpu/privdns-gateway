@@ -700,7 +700,8 @@ cmd_rollback(){
   [[ -x "$tree/usr/local/bin/$snap_svc" ]] && snap_kbin="$tree/usr/local/bin/$snap_svc"
   if [[ -z "$snap_kbin" ]] \
      && { [[ -f "$tree/etc/mihomo/config.yaml" ]] || [[ -f "$tree/etc/sing-box/config.json" ]]; }; then
-    c_y "  快照不含 $snap_svc 二进制(旧版快照)→ 退回用当前内核校验旧配置; 新核若不认旧配置会报错。"
+    c_y "  快照不含 $snap_svc 二进制(v1.5.8 及更早的快照)→ 只能用当前内核校验旧配置。"
+    c_y "  若下面报\"快照配置 check 失败\", 很可能是新内核不认旧配置(而非快照本身坏), 需手工降内核后再回滚。"
   fi
   if [[ "$snap_core" == mihomo ]]; then
     [[ -f "$tree/etc/mihomo/config.yaml" ]] && { "${snap_kbin:-mihomo}" -t -d "$tree/etc/mihomo" -f "$tree/etc/mihomo/config.yaml" >/dev/null 2>&1 || { echo "❌ 快照的 mihomo 配置 check 失败, 中止"; rm -rf "$tmp"; return 1; }; }
@@ -770,11 +771,18 @@ _core_config_check(){
   fi
 }
 
-# 内核活性 + 稳定判定: 起得来, 且短暂观察后仍在跑(过滤"起来即崩"的新内核)。
+# 内核活性 + 稳定判定: 起得来, 且持续观察若干次仍在跑。
+# 只抽两次 is-active 挡不住"起来即崩": systemd 会把它反复拉起, 每次抽样都可能正好撞上
+# 刚起来的那一瞬。故再比对 NRestarts —— 观察窗口内重启计数涨了就是崩溃循环。
 _core_kernel_stable(){
-  local svc="$1"
-  [[ "$(systemctl is-active "$svc" 2>/dev/null)" == active ]] || return 1
-  sleep 1
+  local svc="$1" i n="${PDG_STABLE_SAMPLES:-3}" r0 r1
+  r0="$(systemctl show -p NRestarts --value "$svc" 2>/dev/null)"; r0="${r0:-0}"
+  for ((i = 0; i < n; i++)); do
+    [[ "$(systemctl is-active "$svc" 2>/dev/null)" == active ]] || return 1
+    sleep 1
+  done
+  r1="$(systemctl show -p NRestarts --value "$svc" 2>/dev/null)"; r1="${r1:-0}"
+  [[ "$r0" == "$r1" ]] || { c_y "  $svc 在观察窗口内重启了($r0→$r1), 判为不稳定"; return 1; }
   [[ "$(systemctl is-active "$svc" 2>/dev/null)" == active ]]
 }
 
@@ -992,6 +1000,10 @@ cmd_update(){
   # 并要求输出是**非空的 JSON 数组**; 任何一环不成立都按"无法确认更新结果"回滚。
   # (未配 token 时把"服务: 未运行: pdg-bot"这单一项排除, 避免误判)
   local j rcd=0 summary nfail
+  if ! command -v python3 >/dev/null 2>&1; then   # 与"自检输出坏"区分开, 免得排错走偏
+    c_y "python3 不可用, 无法运行/判读自检 → 回滚到更新前快照…"
+    cmd_rollback --dir "$snap_dir" --git "$pre_sha"; return 1
+  fi
   j=$(python3 /opt/pdg-bot/doctor.py --json 2>/dev/null) || rcd=$?
   if [[ "$rcd" != 0 ]]; then
     c_y "自检命令执行失败(exit $rcd), 无法确认更新结果, 回滚到更新前快照…"

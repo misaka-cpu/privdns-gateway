@@ -9,6 +9,7 @@ DOT_DOMAIN_FILE = "/opt/pdg-bot/dot-domain"
 BACKEND_MARKER = "/etc/privdns-gateway/backend"
 MIHOMO_CFG = "/etc/mihomo/config.yaml"
 NFT_CONF = "/etc/nftables.conf"
+REPO_DIR = "/opt/privdns-gateway"   # 已装仓库(比对部署文件是否与当前发布同版本)
 # 面板 UI 在 /etc/sing-box/ui/dist, 不在 mihomo 工作目录下 → SAFE_PATHS 放行, 否则 `mihomo -t` 拒。
 os.environ.setdefault("SAFE_PATHS", "/etc/sing-box/ui/dist")
 
@@ -191,6 +192,19 @@ def check_nft():
     if leaked:
         return ("fail", "防火墙", "这些口对全网开放(应只限内网卡): " + ", ".join(sorted(leaked)))
     return ("ok", "防火墙", "53/80/81/443/853/5228-5230/7893/8445 仅限内网卡来源")
+
+def _filesha(path):
+    """文件 SHA256(读不到返回空串)。用于比对部署文件与仓库文件是否同一版本。"""
+    import hashlib
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return ""
+
 
 def _mihomo_redir_port():
     """mihomo 的 redir-port(装机固定 7893; 读不到按它兜底)。"""
@@ -608,6 +622,22 @@ def check_mitm():
     if miss:
         return ("fail", "MITM 插件", "已启用但缺 iOS 组件: " + ", ".join(miss)
                 + "; 运行 sudo pdg update 重新部署。")
+    # 版本一致性: 仓库在本机可读时, 逐个比对部署文件与仓库文件。装到一半失败会把上一版留在
+    # 原地, 只看"文件在不在"发现不了这种新旧混装。仓库不可用则跳过这一层(不误报)。
+    drift = []
+    for dst, src in (("mitm_ca.py", "deploy/bot/mitm_ca.py"),
+                     ("mitm_server.py", "deploy/bot/mitm_server.py"),
+                     ("mitm_wloc.py", "deploy/bot/mitm_wloc.py"),
+                     ("probe81.py", "deploy/ios/probe81.py"),
+                     ("pdg-dot.mobileconfig.tmpl", "deploy/ios/pdg-dot-ondemand.mobileconfig.tmpl")):
+        sp = os.path.join(REPO_DIR, src)
+        if not os.path.isfile(sp):
+            continue
+        if _filesha(os.path.join("/opt/pdg-bot", dst)) != _filesha(sp):
+            drift.append(dst)
+    if drift:
+        return ("fail", "MITM 插件", "已启用但这些组件与当前发布不一致(疑似新旧混装): "
+                + ", ".join(drift) + "; 运行 sudo pdg update 重新部署。")
     if _run(["systemctl", "is-active", "pdg-mitm"])[1].strip() != "active":
         return ("fail", "MITM 插件", "已启用(" + ",".join(enabled) + ")但 pdg-mitm 未运行")
     if not os.path.isfile("/etc/privdns-gateway/ca/ca.crt"):

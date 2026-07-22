@@ -106,6 +106,14 @@ out=$(sh_run "" "_stash_bin '$SB/$BIN'; echo rc=\$?")
 { grep -q 'rc=1' <<<"$out" && [[ "$(sha "$SB/$BIN.pdg-preinstall")" == "$STALE" ]]; } \
   && ok "1d: 已有残留 .pdg-preinstall → 非0 且不被当前文件覆盖" || bad "1d: out=$out"
 
+# 1g. 残留备份与当前文件**内容一致** → 认定是上次装成功后没清掉的, 自动清理并继续
+mk_sandbox; printf 'SAME\n' > "$SB/$BIN"; printf 'SAME\n' > "$SB/$BIN.pdg-preinstall"
+OLD=$(sha "$SB/$BIN")
+out=$(sh_run "" "_stash_bin '$SB/$BIN'; echo rc=\$?")
+{ grep -q 'rc=0' <<<"$out" && [[ "$(sha "$SB/$BIN")" == "$OLD" ]] && [[ -e "$SB/$BIN.pdg-preinstall" ]]; } \
+  && ok "1g: 残留备份与当前文件一致 → 视为上次遗留, 清理后正常建账继续" \
+  || bad "1g: out=$out"
+
 # 1e. 目标不存在 → 返回 0 且不生成备份
 mk_sandbox
 out=$(sh_run "" "_stash_bin '$SB/usr/local/bin/absent'; echo rc=\$?")

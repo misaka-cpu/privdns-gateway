@@ -27,6 +27,13 @@ BIN="$WORK/bin"; export PDG_CORE_BINDIR="$BIN"
 systemctl(){
   if [[ "${1:-}" == is-active ]]; then
     if grep -q NEWKERNEL "$BIN/${2:-}" 2>/dev/null; then echo "${NEW_ACTIVE:-active}"; else echo active; fi
+  elif [[ "${1:-}" == show ]]; then
+    # 模拟 NRestarts: RESTART_LOOP=1 时每问一次就涨一次(起来即崩的样子)。
+    # 必须用文件计数 —— $(systemctl show …) 在子 shell 里跑, 变量自增回传不到父 shell。
+    if [[ -n "${RESTART_LOOP:-}" ]]; then
+      local n; n=$(( $(cat "$WORK/nrestarts" 2>/dev/null || echo 0) + 1 ))
+      echo "$n" > "$WORK/nrestarts"; echo "$n"
+    else echo 0; fi
   fi
   return 0
 }
@@ -104,6 +111,16 @@ for svc in mihomo sing-box; do
   [[ "$rc" != 0 ]] && ok "$svc: 还原 mv 失败 → _core_restore_prev 返回非0(服务 active 不算数)" \
     || bad "G($svc): rc=$rc out=$out"
   rm -f "$BIN/$svc.prev"
+done
+
+# ── H. 起来即崩: is-active 每次都答 active, 但观察窗口内 NRestarts 在涨 → 必须判不稳定 ──
+for svc in mihomo sing-box; do
+  setup "$svc" 0; NEW_ACTIVE=active; RESTART_LOOP=1; : > "$WORK/nrestarts"
+  rc=0; out=$(_core_swap_verify "$svc" "$WORK/new-$svc" "$BIN" vTEST 2>&1) || rc=$?
+  unset RESTART_LOOP; rm -f "$WORK/nrestarts"
+  { [[ "$rc" != 0 ]] && [[ "$(cursha "$svc")" == "$OLDSHA" ]] && ! grep -q '已装并重启' <<<"$out"; } \
+    && ok "$svc: 崩溃循环(NRestarts 上涨)被判不稳定 → 还原旧核 + 非0" \
+    || bad "H($svc): rc=$rc sha=$(cursha "$svc")"
 done
 
 # ── D. 快照含内核二进制, 且回滚能按内容还原(网络无关) ──
