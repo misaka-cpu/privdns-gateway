@@ -16,6 +16,12 @@ e2e_enter "$@"
 command -v openssl >/dev/null 2>&1 || e2e_skip "无 openssl(自签证书要用)"
 e2e_stub_system
 
+# 装机会改写 /etc/resolv.conf。容器里那是宿主 bind-mount 进来的, overlay/命名空间都挡不住,
+# 写进去之后同一个 job 里后面的 e2e 就没 DNS 了 → 退出时把内容写回。
+E2E_RESOLV_SAVE="$(cat /etc/resolv.conf 2>/dev/null)"
+restore_resolv(){ [[ -n "$E2E_RESOLV_SAVE" ]] && printf '%s\n' "$E2E_RESOLV_SAVE" > /etc/resolv.conf 2>/dev/null; :; }
+trap restore_resolv EXIT
+
 # ── 打桩外部世界 ────────────────────────────────────────────────────────────
 mkdir -p /usr/local/sbin
 for c in apt-get dpkg certbot vnstat; do
@@ -148,5 +154,28 @@ done
 [[ -z "$left" ]] && ok "回滚后本次安装的文件/目录已清除" || bad "回滚后残留:$left"
 [[ -z "$(find /usr/local/bin -name '*.pdg-preinstall' 2>/dev/null)" ]] \
   && ok "回滚后不残留 .pdg-preinstall 备份" || bad "有备份残留"
+
+# ══ 4. /etc/resolv.conf 删不掉(LXC/Docker 把它 bind-mount 进来)═══════════════
+# 这类环境里 `rm -f /etc/resolv.conf` 返 EBUSY, 在 set -e 下会把整场安装打断转入回滚,
+# 而屏幕上只看得到"安装失败 → 回滚", 真原因被埋掉。删不掉就原地覆盖内容即可。
+echo; echo "── 4. resolv.conf 不可删(容器/LXC 现场) ──"
+reset_box; e2e_stub_system
+locked=0
+if ! rm -f /etc/resolv.conf 2>/dev/null; then
+  locked=1                                        # CI 容器里本来就是 bind mount
+elif { printf 'nameserver 9.9.9.9\n' > /tmp/rc-orig
+       : > /etc/resolv.conf; mount --bind /tmp/rc-orig /etc/resolv.conf; } 2>/dev/null; then
+  locked=1
+fi
+if [[ "$locked" == 1 ]]; then
+  out=$(run_install ""); rc=$?
+  [[ "$rc" == 0 ]] && ok "resolv.conf 删不掉 → 安装照常完成(不再被 set -e 打断)" \
+    || bad "resolv.conf 不可删就装不上 rc=$rc: $(tail -6 <<<"$out")"
+  grep -q '127.0.0.1' /etc/resolv.conf 2>/dev/null \
+    && ok "内容原地写入成功(网关自身指向本机 mosdns)" || bad "resolv.conf 未更新: $(cat /etc/resolv.conf 2>/dev/null)"
+else
+  printf '%s\n' "$E2E_RESOLV_SAVE" > /etc/resolv.conf 2>/dev/null
+  echo "[SKIP] 本环境造不出不可删的 resolv.conf(不允许 bind mount)"
+fi
 
 e2e_summary

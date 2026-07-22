@@ -234,8 +234,15 @@ rollback(){
     systemctl enable --now systemd-resolved 2>/dev/null || failed+=("systemd-resolved 恢复")
   fi
   if [[ -e /etc/resolv.conf.pdg-orig ]]; then
-    rm -f /etc/resolv.conf
-    mv /etc/resolv.conf.pdg-orig /etc/resolv.conf 2>/dev/null || failed+=("resolv.conf 还原")
+    # 同装机那侧: bind-mount 的 resolv.conf 删不掉也 mv 不上去, 但内容能原地写回。
+    # 退化路径丢的是"原来是个符号链接"这一属性, 内容(上游 DNS)是对的 —— 比整条还原失败强。
+    if rm -f /etc/resolv.conf 2>/dev/null && mv /etc/resolv.conf.pdg-orig /etc/resolv.conf 2>/dev/null; then
+      :
+    elif cat /etc/resolv.conf.pdg-orig > /etc/resolv.conf 2>/dev/null; then
+      rm -f /etc/resolv.conf.pdg-orig 2>/dev/null
+    else
+      failed+=("resolv.conf 还原")
+    fi
   fi
   if [[ ${#failed[@]} -eq 0 ]]; then
     c_y "已回滚到安装前状态。修正问题后可重跑 install.sh。"
@@ -556,10 +563,19 @@ c_g "启动服务…"
 # 释放 53 口: systemd-resolved 的 stub 占 127.0.0.53:53, 会和 mosdns 0.0.0.0:53 冲突
 # 先备份原 resolv.conf(含符号链接), 供 uninstall 恢复
 [[ -e /etc/resolv.conf.pdg-orig ]] || cp -a /etc/resolv.conf /etc/resolv.conf.pdg-orig 2>/dev/null || true
+# LXC/Docker 之类的环境把 /etc/resolv.conf **bind-mount** 进来: 删不掉(EBUSY), 但能原地写。
+# 直接 `rm -f` 会被 set -e 判成致命错误, 整场安装在这里中止并转入回滚 —— 而回滚打印的是
+# "安装失败", 真原因(删不掉 resolv.conf)反倒看不见。删不掉就原地覆盖内容即可。
+# 连写都写不进去(只读挂载)也不该中止: 那只影响**网关自己**解析用哪个上游, 转发链路照常。
+_write_resolv(){
+  rm -f /etc/resolv.conf 2>/dev/null || true    # 常见是指向 resolved stub 的符号链接, 删掉才落得下实文件
+  printf '%s\n' "$@" > /etc/resolv.conf 2>/dev/null \
+    || c_y "写不了 /etc/resolv.conf(只读挂载?), 本机自身 DNS 维持原样; 转发不受影响。"
+}
 if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
   systemctl disable --now systemd-resolved 2>/dev/null && RESOLVED_DISABLED=1 || true
 fi
-rm -f /etc/resolv.conf; printf 'nameserver 1.1.1.1\n' > /etc/resolv.conf
+_write_resolv "nameserver 1.1.1.1"
 systemctl daemon-reload
 systemctl restart systemd-journald
 systemctl enable --now mosdns "$CORE_SVC" >/dev/null 2>&1 || true
@@ -573,7 +589,7 @@ if [[ -n "$BOT_TOKEN" && -n "$ALLOWED_IDS" ]]; then
 else
   systemctl enable pdg-bot >/dev/null 2>&1 || true   # 开机自启; 现在没 token 暂不启动, 用 pdg-set-token 设置后启用
 fi
-printf 'nameserver 127.0.0.1\nnameserver 1.1.1.1\n' > /etc/resolv.conf
+_write_resolv "nameserver 127.0.0.1" "nameserver 1.1.1.1"
 
 # ── 9. 防火墙 ──
 c_g "应用防火墙…"
