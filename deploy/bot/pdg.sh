@@ -1519,10 +1519,30 @@ cmd_switch_core(){
     fi
     install -d -m700 /etc/mihomo
     printf 'mihomo\n' > /etc/privdns-gateway/backend      # 先切标记, 让渲染/迁移按 mihomo 走
-    # 渲染前先拦: 有出口 mihomo 无法无损转换(unknown_proxies)→ 拒绝切换, 免得切过去出口凭空少一个
-    if ! ( cd /opt/pdg-bot && python3 -c 'import bot,sys; m=bot._render_mihomo_file(); sys.exit(3 if (m and m.get("unknown_proxies")) else 0)' ) 2>/dev/null \
-       || ! mihomo -t -d /etc/mihomo -f /etc/mihomo/config.yaml >/dev/null 2>&1; then
-      printf 'singbox\n' > /etc/privdns-gateway/backend; echo "❌ 渲染/校验 mihomo 配置失败(或有出口 mihomo 无法转换), 已回滚标记, 未切换"; return 1
+    # 渲染前先拦: 有出口 mihomo 无法无损转换(unknown_proxies)→ 拒绝切换, 免得切过去出口凭空少一个。
+    # 必须把**真实原因**带出来: 旧实现 python 的 stderr 直接 2>/dev/null 丢掉, 三种完全不同的失败
+    # (渲染抛异常 / 有出口转不了 / mihomo -t 不过)挤在同一句话里, 用户只看到"渲染/校验失败"而无从下手。
+    local why
+    if ! why=$(cd /opt/pdg-bot && python3 - <<'SCPY' 2>&1
+import sys
+sys.path.insert(0, "/opt/pdg-bot")
+import bot
+try:
+    meta = bot._render_mihomo_file()
+except Exception as e:
+    print("渲染 mihomo 配置失败: %s: %s" % (type(e).__name__, e)); sys.exit(1)
+bad = (meta or {}).get("unknown_proxies") or []
+if bad:
+    print("这些出口 mihomo 无法转换(切过去会凭空丢失): " + ", ".join(str(x) for x in bad)); sys.exit(1)
+SCPY
+    ); then
+      printf 'singbox\n' > /etc/privdns-gateway/backend
+      echo "❌ 未切换(已回滚标记): ${why:-渲染 mihomo 配置失败(无输出)}"; return 1
+    fi
+    if ! why=$(mihomo -t -d /etc/mihomo -f /etc/mihomo/config.yaml 2>&1); then
+      printf 'singbox\n' > /etc/privdns-gateway/backend
+      echo "❌ 未切换(已回滚标记): mihomo 配置校验失败:"
+      printf '%s\n' "$why" | tail -c 400 | sed 's/^/    /'; return 1
     fi
     pdg_write_unit pdg_unit_mihomo /etc/systemd/system/mihomo.service   # 与装机同源(含 SAFE_PATHS)
     [[ "$plat" == ios ]] && pdg_write_unit pdg_unit_pdg_mitm /etc/systemd/system/pdg-mitm.service
@@ -1533,7 +1553,9 @@ cmd_switch_core(){
       printf 'singbox\n' > /etc/privdns-gateway/backend
       [[ -f /etc/nftables.conf.scbak ]] && { cp /etc/nftables.conf.scbak /etc/nftables.conf; nft -f /etc/nftables.conf 2>/dev/null; }
       _core_kernel_restore mihomo sing-box; rm -f /etc/nftables.conf.scbak
-      echo "❌ 切换失败, 已回滚到 sing-box 内核。"; return 1
+      echo "❌ 切换失败, 已回滚到 sing-box 内核。mihomo 最近日志:"
+      journalctl -u mihomo -n 15 --no-pager -o cat 2>/dev/null | sed 's/^/    /'
+      return 1
     fi
     [[ "$plat" == ios ]] && { systemctl reset-failed pdg-mitm 2>/dev/null; systemctl enable --now pdg-mitm >/dev/null 2>&1 || true; }
   else
@@ -1545,8 +1567,11 @@ cmd_switch_core(){
       install -m755 "$t"/sing-box-*/sing-box /usr/local/bin/sing-box; rm -rf "$t"
     fi
     printf 'singbox\n' > /etc/privdns-gateway/backend
-    if ! sing-box check -c /etc/sing-box/config.json >/dev/null 2>&1; then
-      printf 'mihomo\n' > /etc/privdns-gateway/backend; echo "❌ sing-box 配置校验失败, 已回滚, 未切换"; return 1
+    local why
+    if ! why=$(sing-box check -c /etc/sing-box/config.json 2>&1); then
+      printf 'mihomo\n' > /etc/privdns-gateway/backend
+      echo "❌ 未切换(已回滚标记): sing-box 配置校验失败:"
+      printf '%s\n' "$why" | tail -c 400 | sed 's/^/    /'; return 1
     fi
     pdg_write_unit pdg_unit_singbox /etc/systemd/system/sing-box.service
     systemctl daemon-reload
@@ -1556,7 +1581,9 @@ cmd_switch_core(){
       printf 'mihomo\n' > /etc/privdns-gateway/backend
       [[ -f /etc/nftables.conf.scbak ]] && { cp /etc/nftables.conf.scbak /etc/nftables.conf; nft -f /etc/nftables.conf 2>/dev/null; }
       _core_kernel_restore sing-box mihomo; rm -f /etc/nftables.conf.scbak
-      echo "❌ 切换失败, 已回滚到 mihomo 内核。"; return 1
+      echo "❌ 切换失败, 已回滚到 mihomo 内核。sing-box 最近日志:"
+      journalctl -u sing-box -n 15 --no-pager -o cat 2>/dev/null | sed 's/^/    /'
+      return 1
     fi
     systemctl stop pdg-mitm 2>/dev/null   # sing-box 暂无 MITM 路由(Item 6 将改为 WLOC 感知)
   fi

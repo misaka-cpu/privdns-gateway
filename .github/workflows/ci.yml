@@ -85,6 +85,9 @@ jobs:
       - name: "switch-core 内核切换纪律回归 (假 systemctl+重启模拟: 只起一个内核/跨核回滚/unit 无漂移)"
         run: bash tests/test-switch-core.sh
 
+      - name: "switch-core 失败诊断回归 (转不了的出口逐个列名/内核真实报错/日志线索, 不再一句话糊过去)"
+        run: bash tests/test-switch-core-diag.sh
+
       - name: "平台隔离安装/迁移矩阵 (marker 证据回退/GMS 仅安卓/iOS GMS 清理/服务集按平台)"
         run: bash tests/test-platform-install.sh
 
