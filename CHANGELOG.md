@@ -2,6 +2,13 @@
 
 本项目按语义化 `v1.x` tag 正式发布;以下按版本/日期记录主要变化,完整提交见 git 历史。
 
+## 2026-07-22 — v1.5.8(健壮性修复一批 + Android/iOS 平台隔离 + README/文案重写)
+
+- **健壮性修复**:MITM 叶子证书并发签发竞态(进程内 + 跨进程锁、随机序列号);`sb2mihomo` Hysteria v1 单独转 `type:hysteria`(不再误塞 hysteria2);`pdg update` 更新前快照失败即中止 + 按快照路径/Git SHA 精确回滚;WLOC 启停/切换/删除事务化(全量校验 + 失败回滚,不留脏态);`switch-core` 统一 systemd unit 生成 + 切核 enable/disable 纪律 + 跨内核回滚;CI mosdns 渲染补 `__HIJACK_SET_FILE__` 占位符 + fixture;`profile.env` 原子按键写(不再整覆盖丢 `PDG_TFO`/`PDG_HIJACK_MODE` 等);v1.4.x→WLOC 升级迁移(补 `force_hijack` 结构,幂等可回滚)。
+- **平台隔离**:统一平台判定源 + 缺失回退提示;Bot 客户端菜单/状态/WLOC 按平台与内核门控(Android 不显示、不调用、不运行 iOS 功能;iOS 才有描述文件/WLOC/`pdg-probe81`);安装/更新按平台部署;GMS 5228–5230 仅 Android,iOS 精确清理;`sudo pdg ios` 仅 iOS。
+- **TFO**:`PDG_TFO` 持久化在更新/重装后保留。
+- **文案**:README 按结构重写(架构图含两内核、去宣传/绝对化措辞);`pdg update`/Bot 更新页明确「安装当前发布版指定并校验过的内核版本」;故障组、内核切换、WLOC 首次顺序文案统一。
+
 ## 2026-07-22 — v1.5.7(修 mihomo 下测出口对 direct 出口(jp)报"不通")
 
 - **修**:mihomo 内核下「测出口」对 `direct` 出口(如 jp 直出)报「超时/不通」—— sb2mihomo 把 direct 出口映射成 mihomo 内建 `DIRECT`,clash_api 里没有该 tag 名 → `/proxies/jp/delay` 返 404。现测出口在 mihomo 后端把 direct 出口映射到 `DIRECT` 再查(显示仍用原名);回归进 test-panel。
