@@ -220,6 +220,16 @@ grep -qE '^PDG_LOWMEM=[01]$' /etc/privdns-gateway/profile.env \
   && ok "PDG_LOWMEM 已写入" || bad "6e: 缺 PDG_LOWMEM"
 grep -q '^PDG_PLATFORM=android$' /etc/privdns-gateway/profile.env \
   && ok "PDG_PLATFORM 已写入" || bad "6f: 缺 PDG_PLATFORM"
+# 5.2/T7: 内网卡段的**唯一真源**。装机把同一个值渲染进 nft 与 mosdns, 真源必须与它们逐字相同 ——
+# 三处任一落后, 表现分别是"手机来源不被放行 / 分流劫持全失效 / 救援服务绑到不存在的地址上"。
+_cidr_src="$(sed -n 's/^PDG_INTERNAL_CIDR=//p' /etc/privdns-gateway/profile.env | tail -1)"
+_cidr_nft="$(grep -oE 'ip saddr [0-9.]+/[0-9]+' /etc/nftables.conf | head -1 | awk '{print $3}')"
+_cidr_mos="$(grep -oE '"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+"' /etc/mosdns/config.yaml | head -1 | tr -d '"')"
+[[ -n "$_cidr_src" ]] \
+  && ok "6g: profile.env 写入了内网卡段真源($_cidr_src)" || bad "6g: 缺 PDG_INTERNAL_CIDR"
+[[ "$_cidr_src" == "$_cidr_nft" && "$_cidr_src" == "$_cidr_mos" ]] \
+  && ok "6h: 真源与 nft/mosdns 三处逐字一致" \
+  || bad "6h: 三处不一致 src=$_cidr_src nft=$_cidr_nft mosdns=$_cidr_mos"
 MOS_SHA="$(sha256sum /etc/mosdns/config.yaml | cut -d' ' -f1)"
 grep -q 'geosite_gfw.txt' /etc/mosdns/config.yaml \
   && ok "mosdns 是 gfw 形态(装机选的模式真的生效了)" || bad "6g: mosdns 不是 gfw 形态"

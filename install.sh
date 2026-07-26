@@ -614,10 +614,15 @@ install -d -m700 /etc/privdns-gateway
 # 读不到就按默认 all 把 mosdns 形态改回去 —— 装机时选的 gfw 悄悄没了。
 _prof_tmp="$(mktemp /etc/privdns-gateway/.profile.env.XXXXXX)" || die "创建 profile.env 临时文件失败"
 {
-  printf 'PDG_LOWMEM=%s\nPDG_HIJACK_MODE=%s\nPDG_PLATFORM=%s\n' "$LOWMEM" "$HIJACK_MODE" "$PLATFORM"
+  # PDG_INTERNAL_CIDR 是内网卡来源段的**唯一真源**(5.2/T7): nft、mosdns、救援服务的监听
+  # 地址、doctor 全都从它读或由它渲染。以前只把这个值渲染进 nft 与 mosdns 两份配置, 读回时
+  # 又从 mosdns 里正则抠 —— 于是"当前网段是多少"这件事没有权威答案, 而 mosdns 配置恰恰是
+  # 救援场景里可能已经损坏的那一份。
+  printf 'PDG_LOWMEM=%s\nPDG_HIJACK_MODE=%s\nPDG_PLATFORM=%s\nPDG_INTERNAL_CIDR=%s\n' \
+    "$LOWMEM" "$HIJACK_MODE" "$PLATFORM" "$INTERNAL_CIDR"
   if [[ -f /etc/privdns-gateway/profile.env ]]; then
     # grep -v 在"旧文件只有受管键"时没有输出 → 返回 1, 不能让它把整段判成失败
-    grep -vE '^[[:space:]]*(PDG_LOWMEM|PDG_HIJACK_MODE|PDG_PLATFORM)=' \
+    grep -vE '^[[:space:]]*(PDG_LOWMEM|PDG_HIJACK_MODE|PDG_PLATFORM|PDG_INTERNAL_CIDR)=' \
       /etc/privdns-gateway/profile.env || true
   fi
 } > "$_prof_tmp" || { rm -f "$_prof_tmp"; die "写 profile.env 失败(磁盘满/只读?)"; }
@@ -627,6 +632,10 @@ mv -f "$_prof_tmp" /etc/privdns-gateway/profile.env \
 rm -f /etc/privdns-gateway/profile.env.new          # 清掉历史版本留下的半成品
 grep -q "^PDG_HIJACK_MODE=$HIJACK_MODE$" /etc/privdns-gateway/profile.env \
   || die "profile.env 未写入预期的 PDG_HIJACK_MODE"
+# 真源必须**确实**落盘: 渲染进 nft/mosdns 的值与 profile.env 记的值不是同一个来源的话,
+# 救援服务会绑到一个防火墙没放行的地址上, 而且没人看得出为什么。
+grep -q "^PDG_INTERNAL_CIDR=$INTERNAL_CIDR$" /etc/privdns-gateway/profile.env \
+  || die "profile.env 未写入预期的 PDG_INTERNAL_CIDR"
 printf '%s\n' "$PLATFORM" > /etc/privdns-gateway/platform
 
 render(){ sed -e "s|__SERVER_IP__|$SERVER_IP|g" -e "s|__INTERNAL_CIDR__|$INTERNAL_CIDR|g" \

@@ -1888,10 +1888,48 @@ migrate_backend_marker(){
     && c_g "  补内核标记: $core(据现场证据; 老装此前一直靠默认值兜底)。"
 }
 
+# 5.2/T7: 把内网卡来源段写进 profile.env, 让它成为**唯一真源**。
+# 老机器上这个值只存在于两份渲染产物里(nft 的 ip saddr、mosdns 的 npn_clients.ips), 读回时
+# 各处自己抠 —— 没有权威答案。救援服务要用它决定监听地址, 所以必须先有真源。
+#
+# **保守推断**: 两份产物都读得到且完全一致才写入。不一致 = 现网本来就处于半套状态(上次改段
+# 只改了一处), 这时候挑一个写进真源, 等于用猜测把不一致固化下来 —— 宁可停手让人来看。
+migrate_cidr_single_source(){
+  local prof=/etc/privdns-gateway/profile.env
+  [[ -f "$prof" ]] || return 0                       # 还没装完(装机自己会写)
+  grep -qE '^[[:space:]]*PDG_INTERNAL_CIDR=' "$prof" && return 0     # 已有真源: 幂等
+  local nftv mosv
+  nftv="$(grep -oE 'ip saddr [0-9.]+/[0-9]+' /etc/nftables.conf 2>/dev/null | head -1 | awk '{print $3}')"
+  mosv="$(grep -oE 'ips:[[:space:]]*\[[[:space:]]*"[0-9./]+"' /etc/mosdns/config.yaml 2>/dev/null \
+          | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+')"
+  if [[ -z "$nftv" && -z "$mosv" ]]; then
+    c_y "⚠️ 迁移: nft 与 mosdns 里都读不到内网卡段 → 未写入 PDG_INTERNAL_CIDR。"
+    c_y "   请运行 sudo pdg detect-cidr 重新识别。"
+    return 0
+  fi
+  if [[ -z "$nftv" || -z "$mosv" || "$nftv" != "$mosv" ]]; then
+    c_y "⚠️ 迁移: 内网卡段在两处不一致(nft=${nftv:-读不到} mosdns=${mosv:-读不到})"
+    c_y "   → **未写入**真源, 也未改动任何配置。这说明现网本来就是半套状态,"
+    c_y "   请运行 sudo pdg detect-cidr 统一后再迁移。"
+    return 0
+  fi
+  # 走与装机同款的原子替换; 失败必须看得见(半个 .tmp 留在盘上比不写更糟)
+  local t
+  t="$(mktemp /etc/privdns-gateway/.profile.env.XXXXXX)" || { c_y "⚠️ 迁移: 建临时文件失败, 未写入真源"; return 0; }
+  { printf 'PDG_INTERNAL_CIDR=%s\n' "$nftv"; cat "$prof"; } > "$t" 2>/dev/null \
+    || { rm -f "$t"; c_y "⚠️ 迁移: 写 profile.env 失败, 未改动"; return 0; }
+  chmod 600 "$t"
+  mv -f "$t" "$prof" || { rm -f "$t"; c_y "⚠️ 迁移: 落盘 profile.env 失败, 未改动"; return 0; }
+  grep -q "^PDG_INTERNAL_CIDR=$nftv$" "$prof" \
+    || { c_y "⚠️ 迁移: 真源复核未通过"; return 0; }
+  c_g "✅ 迁移: 内网卡段真源已写入 profile.env ($nftv)"
+}
+
 run_all_migrations(){
   local rc=0
   migrate_platform_marker || true          # 先统一平台判定源(后续平台相关迁移据此走)
   migrate_backend_marker || true           # 再把内核标记落地(别再靠默认值兜底)
+  migrate_cidr_single_source || true       # 先立真源: 后续 nft/mosdns/救援都从它读
   migrate_botenv || true; migrate_firewall_to_pdg || true; migrate_mosdns_concurrent || true
   migrate_mosdns_unlock || true; migrate_fw_gms || true
   migrate_mosdns_ratelimit || true; migrate_lowmem || true; migrate_mihomo_safepaths || true
