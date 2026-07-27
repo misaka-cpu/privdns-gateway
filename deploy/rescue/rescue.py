@@ -27,6 +27,7 @@ import socket
 import ssl
 import subprocess
 import sys
+import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -624,9 +625,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if (form.get("confirm") or [""])[0] != "yes":
             self._send(400, page("400", "<p>没有勾选确认, 未执行任何操作。</p>"))
             return
+        # 同一时刻只放一个恢复进核心: 重复点击/刷新重放/并发请求都会堆在 pdgtx 的 flock 上,
+        # 把请求线程一个个占死。这里非阻塞地抢一把进程内的锁, 抢不到立刻 409 —— 不排队。
+        if not self.server.recover_gate.acquire(blocking=False):
+            self._send(409, page("409", "<p class=warn>恢复正在执行, 请勿重复操作。"
+                                        "完成后刷新 <a href=/tx>事务列表</a> 查看结果。</p>"))
+            return
         self.log_message("recover %s", txid)
         try:
-            res = tx.recover(txid)
+            # trigger_source 由服务端**硬编码**: 从请求里接这个值等于让客户端自己决定审计里
+            # 写什么, 那条记录也就没有取证价值了。
+            res = tx.recover(txid, trigger_source="rescue")
         except Exception as e:  # noqa: BLE001
             name = type(e).__name__
             if name == "TxBusy":
@@ -639,7 +648,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._send(500, page("500", "<p class=bad>恢复过程出错(%s), "
                                             "请用 SSH 查看事务目录。</p>" % html.escape(name)))
             return
-        self._send(200, recover_result_page(txid, res))
+        finally:
+            # 恢复已经跑完(或已抛出)才放锁。浏览器中途断开只影响下面这次写响应, 不影响上面
+            # 已经完成的恢复 —— 服务端不会因为对端消失就把恢复做一半。
+            self.server.recover_gate.release()
+        try:
+            self._send(200, recover_result_page(txid, res))
+        except OSError:
+            # 对端早就走了: 恢复与审计都已完成, 这里没什么可补救的, 也不该把线程炸掉
+            self.log_message("recover %s: 客户端已断开, 结果未能送达", txid)
 
     def do_HEAD(self):
         self.do_GET()
@@ -724,6 +741,7 @@ class Server(http.server.ThreadingHTTPServer):
         self.token_path = token_path
         self.sessions = Sessions()
         self.rate = RateLimit()
+        self.recover_gate = threading.Lock()      # 恢复的并发闸门(非阻塞获取, 抢不到即 409)
         if fd is not None:                      # systemd socket activation: 直接接管那个 fd
             http.server.HTTPServer.__init__(self, addr, Handler, bind_and_activate=False)
             self.socket.close()          # TCPServer 自建的那个不用了, 别泄漏 fd

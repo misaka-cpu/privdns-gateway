@@ -211,6 +211,9 @@ jobs:
       - name: "救援平面 recover (枚举 txid/确认/CSRF/锁忙/漂移不覆盖/如实报告)"
         run: python3 tests/test-rescue-recover.py
 
+      - name: "恢复触发来源审计 (旧签名兼容/rescue 与 cli 各记各的/参数伪造无效/并发只跑一个)"
+        run: python3 tests/test-tx-recover-source.py
+
       - name: "迁移时机 (普通命令不暗中迁移; migrate 先锁先快照)"
         run: bash tests/test-migration-timing.sh
 

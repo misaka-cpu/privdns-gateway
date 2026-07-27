@@ -1635,13 +1635,32 @@ def _gc(root=None):
             shutil.rmtree(p, ignore_errors=True)
 
 
-def recover(txid, root=None, force=False):
+# 恢复的**触发来源**(谁按下的恢复), 与事务的 source(谁最初创建了这笔事务)是两回事:
+#   source        = bot / cli / scheduler …  —— 这笔事务当初由谁发起, 事后不许被改写;
+#   trigger_source= cli / rescue / legacy —— 这次恢复由谁触发。
+# 分开记的理由很实际: 出事后要能回答"这台机器上那次恢复是人在救援页点的, 还是 SSH 上敲的"。
+# 只列**真有调用方**的来源: 不给还不存在的自动恢复入口预留名字 —— 预留出来的枚举值
+# 迟早会被当成"已经支持自动恢复"来引用。将来真加了自动路径, 那时再加。
+TRIGGERS = ("cli", "rescue", "legacy")
+
+
+def _norm_trigger(v):
+    """None(旧调用)→ legacy; 不在枚举里的 → unknown。**绝不回落成 cli** —— 那等于让来路不明
+    的调用冒充人在终端上的操作。"""
+    if v is None:
+        return "legacy"
+    return v if v in TRIGGERS else "unknown"
+
+
+def recover(txid, root=None, force=False, *, trigger_source=None):
     """把一笔中断的事务还原回 before-image。
 
     漂移保护: 逐个目标比对"当前内容"与"本事务应用过的内容 / before-image"。两者都不是 →
     说明事务之外有人动过这个文件(很可能是运维手工救过场), 默认**停手并报告冲突** —— 拿旧
     备份盖掉别人的修复, 比不恢复更糟。force 只在命令行显式二次确认时可用, 不给 Telegram。"""
     root = root or TX_ROOT
+    trig = _norm_trigger(trigger_source)
+    t_start = time.time()
     d = os.path.join(root, txid)
     m = load_meta(d)
     if not m:
@@ -1721,15 +1740,31 @@ def recover(txid, root=None, force=False):
         if not failed:
             for sub in ("candidate", "before"):
                 shutil.rmtree(os.path.join(d, sub), ignore_errors=True)
-        _audit_rec({"ts": time.time(), "txid": txid, "source": m.get("source"),
-                    "op": "recover:" + str(m.get("op")), "mode": "repair", "state": m["state"],
-                    "targets": m.get("targets", []), "services": m.get("services", []),
-                    "error": "", "rollback_complete": not failed,
-                    "restored": restored, "failed": [redact(x) for x in failed],
-                    "schema_version": SCHEMA_VERSION})
+        # 审计由**核心统一写**: 调用方(救援页/CLI)不再各写一条, 免得同一次恢复在日志里
+        # 出现两条口径不同的记录。只记结构化标量与逻辑名, 不记文件内容、before-image 内容、
+        # 凭据、异常正文, 也不记任何调用方可控的自由字符串。
+        audit_warning = ""
+        try:
+            _audit_rec({"ts": time.time(), "event": "recover", "txid": txid,
+                        "source": m.get("source"),          # 原事务由谁创建(不被覆盖)
+                        "trigger_source": trig,             # 这次恢复由谁触发
+                        "op": "recover:" + str(m.get("op")), "mode": "repair",
+                        "state": m["state"], "started_at": t_start, "ended_at": time.time(),
+                        "targets": m.get("targets", []), "services": m.get("services", []),
+                        "error": "", "error_class": m.get("error_class", "") or "",
+                        "rollback_complete": not failed,
+                        "restored_count": len(restored), "failed_count": len(failed),
+                        "restored": restored, "failed": [redact(x) for x in failed],
+                        "schema_version": SCHEMA_VERSION})
+        except Exception as e:  # noqa: BLE001
+            # 恢复本身已经做完了 —— 审计写不进去不能反过来把它判成失败, 但必须让调用方看见
+            audit_warning = "审计写入失败(%s): 本次恢复的结果未能落进审计日志" % type(e).__name__
         _gc(root)
-        return {"ok": not failed, "state": m["state"], "restored": restored,
-                "failed": [redact(x) for x in failed], "dir": d}
+        out = {"ok": not failed, "state": m["state"], "restored": restored,
+               "failed": [redact(x) for x in failed], "trigger_source": trig, "dir": d}
+        if audit_warning:
+            out["audit_warning"] = audit_warning
+        return out
 
 
 # ── CLI(供 Bash 侧调用; 一笔事务 = 一次 apply 进程, 锁在其内全程持有)────────────
@@ -1860,7 +1895,7 @@ def _cli_show(a):
 
 
 def _cli_recover(a):
-    r = recover(a.tx, force=a.force)
+    r = recover(a.tx, force=a.force, trigger_source="cli")
     print(json.dumps(r, ensure_ascii=False))
     return 0 if r.get("ok") else 1
 
