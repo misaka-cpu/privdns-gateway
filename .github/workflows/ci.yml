@@ -205,6 +205,9 @@ jobs:
       - name: "救援平面凭据与认证 (凭据不重建/CSRF/限速锁定/会话上限/轮换即失效)"
         run: python3 tests/test-rescue-auth.py
 
+      - name: "救援平面 socket 交接与抗畸形请求 (fd3 接管/四类不自洽拒启动/打不崩)"
+        run: python3 tests/test-rescue-socket.py
+
       - name: "迁移时机 (普通命令不暗中迁移; migrate 先锁先快照)"
         run: bash tests/test-migration-timing.sh
 

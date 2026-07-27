@@ -61,14 +61,73 @@ def profile_set(text, cidr, key="PDG_INTERNAL_CIDR"):
     return "".join(out), changed
 
 
+def _split_comment(line):
+    """把一行拆成 (代码部分, 注释部分)。nft 的注释是 # 到行尾, 但引号里的 # 不算。"""
+    q = None
+    for i, ch in enumerate(line):
+        if q:
+            if ch == q:
+                q = None
+        elif ch in "\"'":
+            q = ch
+        elif ch == "#":
+            return line[:i], line[i:]
+    return line, ""
+
+
+_STR_RE = re.compile(r"\"[^\"]*\"|'[^']*'")
+
+
 def nft_replace(text, new, old):
-    """把旧段的每一处换成新段。找不到 → (None, 0), 调用方必须中止。"""
+    """把旧段的每一处换成新段。找不到 → (None, 0), 调用方必须中止。
+
+    只替换**完整的 CIDR token**, 且只在代码部分:
+      · 注释里提到旧网段是人写给人看的说明, 改掉它等于篡改别人的文档;
+      · 引号里的字符串同理(可能是 comment "…" 或别的字面量);
+      · 边界要卡死 —— 旧段 10.9.0.0/16 不能命中 110.9.0.0/16(前缀)或 10.9.0.0/160(后缀),
+        朴素的 str.replace 会把这两种都改坏, 而改坏的是防火墙。
+    """
     if not old:
         return None, 0
-    n = text.count(old)
+    rex = re.compile(r"(?<![0-9A-Za-z_.:/-])" + re.escape(old) + r"(?![0-9A-Za-z_./])")
+    out, n = [], 0
+    for line in text.splitlines(True):
+        code, comment = _split_comment(line)
+        # 代码部分里的字符串也要保护: 先挖走, 替换完再放回去
+        strings = []
+
+        def _stash(m):
+            strings.append(m.group(0))
+            return "\x00%d\x00" % (len(strings) - 1)
+
+        stashed = _STR_RE.sub(_stash, code)
+        stashed, cnt = rex.subn(new, stashed)
+        n += cnt
+        for i, sv in enumerate(strings):
+            stashed = stashed.replace("\x00%d\x00" % i, sv)
+        out.append(stashed + comment)
     if n == 0:
         return None, 0
-    return text.replace(old, new), n
+    return "".join(out), n
+
+
+_SADDR_RE = re.compile(r"\bip\s+saddr\s+([0-9]{1,3}(?:\.[0-9]{1,3}){3}/[0-9]{1,2})\b")
+
+
+def nft_current(text):
+    """现网 nft 里**真规则**用的内网卡段(第一处)。读不到返回 ""。
+
+    为什么不能直接 grep: 本项目渲染出的 nft 头部注释里也写着同一个段("REDIRECT 只匹配
+    ip saddr <段>"), 而注释是不参与替换的。拿注释里的值当"当前值", 改过一次段之后就会读到
+    已经过时的那个, 于是下一次 detect-cidr 拿它去找替换位置 —— 真规则里根本没有, 直接判成
+    "自定义形态"而拒绝执行。只认代码部分, 与 nft_replace 同一套口径。"""
+    for line in text.splitlines():
+        code, _comment = _split_comment(line)
+        code = _STR_RE.sub("", code)          # 字符串里的也不算
+        m = _SADDR_RE.search(code)
+        if m:
+            return m.group(1)
+    return ""
 
 
 _MOS_RE = re.compile(r'(ips:\s*\[\s*")([0-9./]+)("\s*\])')
@@ -83,6 +142,15 @@ def mosdns_replace(text, new):
 
 
 def main(argv):
+    if len(argv) < 2:
+        print(__doc__.strip().splitlines()[-2], file=sys.stderr)
+        return 3
+    if argv[1] == "current":                  # 读现网真规则里的当前段(供 bash 侧用)
+        cur = nft_current(sys.stdin.buffer.read().decode("utf-8", "surrogateescape"))
+        if not cur:
+            return 2
+        print(cur)
+        return 0
     if len(argv) < 3:
         print(__doc__.strip().splitlines()[-2], file=sys.stderr)
         return 3

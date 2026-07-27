@@ -623,6 +623,7 @@ class Server(http.server.ThreadingHTTPServer):
         self.rate = RateLimit()
         if fd is not None:                      # systemd socket activation: 直接接管那个 fd
             http.server.HTTPServer.__init__(self, addr, Handler, bind_and_activate=False)
+            self.socket.close()          # TCPServer 自建的那个不用了, 别泄漏 fd
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM, fileno=fd)
             self.server_address = self.socket.getsockname()
         else:
@@ -644,16 +645,48 @@ class Server(http.server.ThreadingHTTPServer):
             self.sessions.drop_all()
 
 
+SD_LISTEN_FDS_START = 3
+
+
 def systemd_fd():
-    """systemd 传进来的监听 fd(socket activation)。没有则返回 None。"""
-    try:
-        if int(os.environ.get("LISTEN_PID", "0")) != os.getpid():
-            return None
-        if int(os.environ.get("LISTEN_FDS", "0")) < 1:
-            return None
-    except ValueError:
+    """systemd 传进来的监听 fd(socket activation)。
+
+    两个环境变量**都不存在** → 返回 None, 走自行绑定(手动运行/测试的正常路径)。
+    存在但不自洽 → **拒绝启动**, 不退回自行绑定: 那意味着 systemd 本来要把监听口交给我们, 而
+    现在情况不对 —— 此时自己再 bind 一个, 机器上就会有两个"救援入口", 一个由 systemd 持有、
+    一个是我们自己的, 用户连上哪个全看运气, 出事根本查不清。"""
+    pid_s, fds_s = os.environ.get("LISTEN_PID"), os.environ.get("LISTEN_FDS")
+    if pid_s is None and fds_s is None:
         return None
-    return 3                                    # SD_LISTEN_FDS_START
+    if pid_s is None or fds_s is None:
+        raise StartupRefused("LISTEN_PID 与 LISTEN_FDS 只给了一个, 无法确认 socket 交接")
+    try:
+        pid, n = int(pid_s), int(fds_s)
+    except ValueError:
+        raise StartupRefused("LISTEN_PID/LISTEN_FDS 不是数字(%r/%r)" % (pid_s[:16], fds_s[:16]))
+    if pid != os.getpid():
+        raise StartupRefused("LISTEN_PID=%d 不是本进程(%d) —— 这些 fd 不是给我们的" % (pid, os.getpid()))
+    if n != 1:
+        raise StartupRefused("期望恰好 1 个监听 fd, LISTEN_FDS=%d" % n)
+    fd = SD_LISTEN_FDS_START
+    try:
+        st = os.fstat(fd)
+    except OSError as e:
+        raise StartupRefused("拿不到交接过来的 fd %d(%s)" % (fd, type(e).__name__))
+    import stat as _stat
+    if not _stat.S_ISSOCK(st.st_mode):
+        raise StartupRefused("fd %d 不是 socket, 拒绝当监听口使用" % fd)
+    # 还要确认它**已经在监听**: 交接过来一个没 listen 的 socket, accept 会一直失败
+    try:
+        probe = socket.fromfd(fd, socket.AF_INET, socket.SOCK_STREAM)   # dup, 用完即关
+        try:
+            if not probe.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN):
+                raise StartupRefused("fd %d 不是处于监听状态的 socket" % fd)
+        finally:
+            probe.close()
+    except OSError as e:
+        raise StartupRefused("检查 fd %d 失败(%s)" % (fd, type(e).__name__))
+    return fd
 
 
 def main():
@@ -669,7 +702,11 @@ def main():
     except (OSError, ssl.SSLError) as e:
         sys.stderr.write("[rescue] 拒绝启动: 证书/私钥不可用(%s)\n" % type(e).__name__)
         return 2
-    fd = systemd_fd()
+    try:
+        fd = systemd_fd()
+    except StartupRefused as e:
+        sys.stderr.write("[rescue] 拒绝启动: %s\n" % e)
+        return 2
     srv = Server((bind, port), token, ctx, fd=fd, token_path=C.paths()["PDG_RESCUE_TOKEN"])
     sys.stderr.write("[rescue] 监听 https://%s:%d/ (%s)\n"
                      % (bind, port, "socket activation" if fd else "自行绑定"))

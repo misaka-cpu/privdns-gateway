@@ -167,10 +167,64 @@ if n == 2 and nout.count(NEW) == 2 and "myown" in nout:
     ok("候选(nft): 旧段的每一处都替换, 用户自定义表原样保留")
 else:
     bad("nft 候选不对: n=%s" % n)
+# nft 候选的**边界**: 朴素 str.replace 会把 110.9.0.0/16 与 10.9.0.0/160 一起改坏, 而改坏的
+# 是防火墙; 注释与引号里的字面量是人写给人看的说明, 改掉等于篡改别人的文档。
+_tricky = (
+    "    ip saddr 10.9.0.0/16 tcp dport { 53 } accept    # 老段 10.9.0.0/16 的说明\n"
+    "    ip saddr 110.9.0.0/16 accept\n"
+    "    ip saddr 10.9.0.0/160 accept\n"
+    '    ip saddr 10.9.0.0/16 udp dport 53 accept comment "keep 10.9.0.0/16 here"\n'
+    "# 纯注释行: 10.9.0.0/16\n"
+    "    ip saddr 10.9.0.0/8 accept\n"
+)
+_t_out, _t_n = gen.nft_replace(_tricky, "172.22.0.0/16", "10.9.0.0/16")
+_lines = _t_out.splitlines()
+if _t_n == 2:
+    ok("候选(nft): 只替换 2 处完整旧段(相似段/注释/字符串都不算)")
+else:
+    bad("替换次数不对: %d\n%s" % (_t_n, _t_out))
+if "110.9.0.0/16" in _t_out and "10.9.0.0/160" in _t_out and "10.9.0.0/8" in _t_out:
+    ok("候选(nft): 前缀相似/后缀相似/不同掩码的段都没被误改")
+else:
+    bad("相似段被误改了:\n%s" % _t_out)
+if "# 老段 10.9.0.0/16 的说明" in _t_out and "# 纯注释行: 10.9.0.0/16" in _t_out:
+    ok("候选(nft): 注释里的旧段原样保留")
+else:
+    bad("注释被改了:\n%s" % _t_out)
+if 'comment "keep 10.9.0.0/16 here"' in _t_out:
+    ok("候选(nft): 引号字符串里的旧段原样保留")
+else:
+    bad("字符串被改了:\n%s" % _t_out)
+if _lines[0].startswith("    ip saddr 172.22.0.0/16") and "172.22.0.0/16 udp" in _lines[3]:
+    ok("候选(nft): 两条真规则里的完整旧段都换成了新段")
+else:
+    bad("真规则没换对:\n%s" % _t_out)
+
 if gen.nft_replace(NFT_BASE, NEW, "10.1.2.0/24") == (None, 0):
     ok("候选(nft): 找不到旧段时返回失败(不猜位置插入)")
 else:
     bad("nft 找不到旧段却生成了候选")
+# 现网"当前段"也只能从**真规则**里读: 本项目渲染出的 nft 头部注释里同样写着这个段, 而注释不
+# 参与替换 —— 拿注释里的旧值当当前值, 改过一次之后就会去找一个真规则里根本不存在的段, 于是
+# 把正常的 nft 判成"自定义形态"而拒绝执行(e2e-cli-ops 的幂等用例真踩到过)。
+_cur_txt = ("# 安全要点: REDIRECT 只匹配 `ip saddr 127.0.0.0/8`(旧段, 注释没跟着改)\n"
+            "table inet pdg {\n"
+            "    chain input {\n"
+            "        ip saddr 10.44.0.0/16 tcp dport { 53 } accept\n"
+            "    }\n}\n")
+if gen.nft_current(_cur_txt) == "10.44.0.0/16":
+    ok("nft_current: 只认真规则里的段, 不被过时注释带偏")
+else:
+    bad("nft_current 读到了注释里的值: %r" % gen.nft_current(_cur_txt))
+if gen.nft_current('table inet pdg { chain c { comment "ip saddr 10.9.0.0/16" } }\n') == "":
+    ok("nft_current: 字符串里的段不算")
+else:
+    bad("nft_current 把字符串里的当成了当前段")
+if gen.nft_current("# 只有注释: ip saddr 10.9.0.0/16\n") == "":
+    ok("nft_current: 只有注释时返回空(调用方据此判'读不到')")
+else:
+    bad("只有注释却返回了值")
+
 mout, mn = gen.mosdns_replace(MOS_BASE, NEW)
 if mn == 1 and NEW in mout and OLD not in mout:
     ok("候选(mosdns): 只换 ips 那一个值")
@@ -450,6 +504,65 @@ else:
     bad("落盘失败却没回滚: %r" % res)
 if res.get("state") == "ROLLED_BACK":
     unchanged(paths, before, "落盘失败回滚后")
+box.clean()
+
+# ── 13b. mosdns 证书缺失: 候选校验必须拒绝, 且现网逐字节不动 ────────────────
+# 真机上 mosdns 的 dot_server 插件要读 DoT 证书; 证书没了 mosdns 本来就起不来。此时
+# detect-cidr 必须**当场拒绝**并说清是证书问题, 而不是降级校验后照样落盘 —— 那样只会把一台
+# "DNS 已经坏了"的机器再改一遍配置, 排查时谁也说不清是哪一步弄坏的。
+MOS_WITH_DOT = (
+    "log:\n  level: error\n"
+    "plugins:\n"
+    "  - tag: npn_clients\n"
+    "    type: ip_set\n"
+    '    args: { ips: ["172.22.0.0/16"] }\n'
+    "  - tag: main_sequence\n"
+    "    type: sequence\n"
+    "    args:\n"
+    "      - exec: reject 3\n"
+    "  - tag: dot_server\n"
+    "    type: udp_server\n"
+    "    args: {entry: main_sequence, listen: \"127.0.0.1:0\"}\n"
+)
+box = Box()
+box.up("mosdns")
+_b, _p = seed(box)
+# 用带 dot_server 的配置覆盖, 并把证书路径指向一个**不存在**的文件
+mos_path = _p["mosdns_conf"]
+cert_dir = os.path.join(box.root, "etc/mosdns/certs")
+with open(mos_path, "w", encoding="utf-8") as f:
+    f.write(MOS_WITH_DOT.replace(
+        'args: {entry: main_sequence, listen: "127.0.0.1:0"}',
+        'args: {entry: main_sequence, listen: "127.0.0.1:0", '
+        'cert: "%s/fullchain.pem", key: "%s/privkey.pem"}' % (cert_dir, cert_dir))
+        .replace("udp_server", "tcp_server"))
+before = {t: open(p2, "rb").read() for t, p2 in _p.items()}
+if not os.path.exists(os.path.join(cert_dir, "fullchain.pem")):
+    ok("前提: DoT 证书确实不存在")
+else:
+    bad("证书居然在")
+res, _m, _t = run_tx(box)
+if res.get("state") != "COMMITTED":
+    ok("mosdns 证书缺失: 事务未提交(%s)" % res.get("state"))
+else:
+    bad("证书缺失却提交了: %r" % res)
+err = str(res.get("error") or "")
+if "cert" in err or "证书" in err or "fullchain" in err:
+    ok("mosdns 证书缺失: 错误信息点名了证书")
+else:
+    bad("错误没说清是证书问题: %r" % err[:200])
+unchanged(_p, before, "mosdns 证书缺失")
+# 不许留下 COMMITTED 的事务记录
+txroot = os.path.join(box.root, "var/lib/privdns-gateway/tx")
+committed = []
+for d in (os.listdir(txroot) if os.path.isdir(txroot) else []):
+    mp = os.path.join(txroot, d, "meta.json")
+    if os.path.isfile(mp) and '"state": "COMMITTED"' in open(mp, encoding="utf-8").read():
+        committed.append(d)
+if not committed:
+    ok("mosdns 证书缺失: 没有产生 COMMITTED 事务")
+else:
+    bad("产生了 COMMITTED 事务: %s" % committed)
 box.clean()
 
 # ── 14. 迁移函数本身: 成功 / 不一致 / 幂等(真跑, 不做字符串断言) ────────────

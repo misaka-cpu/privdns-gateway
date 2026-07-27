@@ -1159,7 +1159,15 @@ cmd_detect_cidr(){
   # 三处现状: 真源(profile.env) / 防火墙 / mosdns。旧版只比 nft 一处, 于是"真源落后但 nft 已新"
   # 这种半套状态会被当成"无需改动"放过去。
   cur_src="$(sed -n 's/^[[:space:]]*PDG_INTERNAL_CIDR=//p' /etc/privdns-gateway/profile.env 2>/dev/null | tail -1)"
-  cur_nft="$(grep -oE 'ip saddr [0-9.]+/[0-9]+' /etc/nftables.conf 2>/dev/null | head -1 | awk '{print $3}')"
+  # 当前段只认**真规则**里的值: 本项目渲染出的 nft 头部注释里也写着同一个段, 而注释不参与
+  # 替换 —— 改过一次之后拿注释里的旧值去找替换位置, 真规则里根本没有, 就会被判成"自定义形态"
+  # 而拒绝执行(这条是 e2e-cli-ops 的幂等用例真抓出来的)。判据与候选生成器同一份。
+  local _gen_c
+  if _gen_c="$(_pdg_module cidrgen.py)"; then
+    cur_nft="$(python3 "$_gen_c" current < /etc/nftables.conf 2>/dev/null || true)"
+  else
+    cur_nft=""
+  fi
   cur_mos="$(grep -oE 'ips:[[:space:]]*\[[[:space:]]*"[0-9./]+"' /etc/mosdns/config.yaml 2>/dev/null \
              | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+')"
   echo "  检测到内网卡段: $det"
