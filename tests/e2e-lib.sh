@@ -143,6 +143,39 @@ e2e_run_exit_hooks(){
   return "$rc"
 }
 
+# ── 负控用的字节码缓存隔离 ──────────────────────────────────────────────────
+# 负控要在同一秒内"把源码改坏 → 跑 → 恢复 → 再跑"。CPython 默认的 __pycache__ 用**秒级
+# 时间戳 + 文件长度**判定源码是否变过: 同一秒内改成等长内容, 判据完全命中旧记录, 于是跑的
+# 是上一版字节码 —— 负控"通过"了, 而它验的其实是没被改过的旧代码。真踩过一次: 恢复源码后
+# 测试仍然失败, 因为读的是负控那一版的 .pyc。
+#
+# 解法不是"记得手动清缓存", 而是让每次负控子进程都用**本实例独有且为空**的缓存目录:
+#   e2e_pycache_isolate      建目录 + 导出 PYTHONPYCACHEPREFIX + 注册退出清理(只删这一个目录)
+#   e2e_pycache_reset        清空它(每跑一次负控调一次, 保证"空")
+E2E_PYCACHE_DIR=""
+
+e2e_pycache_isolate(){
+  [[ -n "$E2E_PYCACHE_DIR" ]] && return 0                  # 幂等
+  E2E_PYCACHE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/e2e-pycache.XXXXXX")" || return 1
+  export PYTHONPYCACHEPREFIX="$E2E_PYCACHE_DIR"
+  e2e_add_exit_hook e2e_pycache_cleanup
+  return 0
+}
+
+e2e_pycache_reset(){
+  [[ -n "$E2E_PYCACHE_DIR" && -d "$E2E_PYCACHE_DIR" ]] || return 0
+  # 只删本实例这一个目录的内容, 再原样建回来 —— 不碰仓库里的 __pycache__, 不用宽泛 find
+  rm -rf -- "$E2E_PYCACHE_DIR"
+  mkdir -p -- "$E2E_PYCACHE_DIR"
+}
+
+e2e_pycache_cleanup(){
+  [[ -n "$E2E_PYCACHE_DIR" ]] && rm -rf -- "$E2E_PYCACHE_DIR"
+  E2E_PYCACHE_DIR=""
+  unset PYTHONPYCACHEPREFIX
+  return 0
+}
+
 # ── 事务硬门探针的生命周期 ──────────────────────────────────────────────────
 # 旧实现 `setsid python3 /tmp/e2e-tx-probe.py … &` 既不记 PID 也不清理: 每个 E2E 都留一个
 # PPID=1 的孤儿(e2e-install.sh 里多次 e2e_stub_system 就留多个), 它们还持有已删除的 overlay

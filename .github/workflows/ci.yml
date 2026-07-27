@@ -106,6 +106,9 @@ jobs:
       - name: "E2E 探针生命周期回归(重复启动/退出/信号/并发/临时目录清理)"
         run: bash tests/test-e2e-probe-lifecycle.sh
 
+      - name: "负控字节码缓存隔离(同一秒改坏/恢复源码不得读到陈旧 .pyc)"
+        run: python3 tests/test-pycache-isolation.py
+
       - name: "GMS 推送端口迁移回归 (fw/sing-box 补 5228-5230, 自定义跳过, 失败回滚)"
         run: bash tests/test-gms-migration.sh
 
