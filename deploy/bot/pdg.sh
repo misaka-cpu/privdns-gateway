@@ -1004,17 +1004,19 @@ cmd_update(){
   fi
   c_g "→ 已切到发布 $tgt"
   c_g "刷新代码(配置/出口/token/证书均不动)…"
+  # 运行模块清单的单一事实源(与 install.sh 共用)。读不到就别装 —— 宁可这次不更新, 也不要
+  # 按一份残缺的清单装出新旧混装。
+  # shellcheck source=lib/modules.sh
+  source "$REPO_DIR/lib/modules.sh" 2>/dev/null \
+    || { c_y "读不到 lib/modules.sh(运行模块清单), 回滚到更新前快照…"
+         cmd_rollback --dir "$snap_dir" --git "$pre_sha"; return 1; }
   # 必需文件: 任一装失败即立即回滚(拒绝新旧混部)。`! A || ! B` 在首个失败处短路。
   if   ! install -m755 "$REPO_DIR"/deploy/bot/pdg-bot.py           /opt/pdg-bot/bot.py \
     || ! install -m755 "$REPO_DIR"/deploy/bot/parse-geosite.py     /opt/pdg-bot/ \
     || ! install -m755 "$REPO_DIR"/deploy/bot/update-rules.sh      /opt/pdg-bot/ \
     || ! install -m755 "$REPO_DIR"/deploy/bot/scheduled-update.sh  /opt/pdg-bot/ \
     || ! install -m755 "$REPO_DIR"/deploy/bot/healthcheck.py       /opt/pdg-bot/ \
-    || ! install -m755 "$REPO_DIR"/deploy/bot/checks.py            /opt/pdg-bot/ \
-    || ! install -m755 "$REPO_DIR"/deploy/bot/pdgtx.py             /opt/pdg-bot/ \
-    || ! install -m755 "$REPO_DIR"/deploy/bot/doctor.py            /opt/pdg-bot/ \
-    || ! install -m755 "$REPO_DIR"/deploy/bot/report.py           /opt/pdg-bot/ \
-    || ! install -m755 "$REPO_DIR"/deploy/bot/sb2mihomo.py        /opt/pdg-bot/ \
+    || ! pdg_install_runtime_modules "$REPO_DIR" /opt/pdg-bot \
     || ! install -m755 "$REPO_DIR"/deploy/cert/proxy-gateway-open-cert-http.sh   /usr/local/bin/ \
     || ! install -m755 "$REPO_DIR"/deploy/cert/proxy-gateway-restore-firewall.sh /usr/local/bin/ \
     || ! install -m755 "$REPO_DIR"/deploy/bot/pdg-set-token.sh     /usr/local/bin/pdg-set-token \
@@ -1478,6 +1480,11 @@ migrate_deploy_units(){
 
 migrate_deploy_botfiles(){
   [[ -d "$REPO_DIR/deploy/bot" ]] || return 0
+  # shellcheck source=lib/modules.sh
+  source "$REPO_DIR/lib/modules.sh" 2>/dev/null || return 0
+  # 运行模块走 lib/modules.sh 这份**单一事实源** —— 与 install.sh、cmd_update 同一份清单,
+  # 于是不会再出现"装机装了、升级漏了"那类缺口(它不报错, 只让整块能力静默降级)。
+  pdg_install_runtime_modules "$REPO_DIR" /opt/pdg-bot 2>/dev/null || true
   local f base plat; plat="$(_pdg_platform)"
   for f in "$REPO_DIR"/deploy/bot/*.py; do
     base=$(basename "$f")

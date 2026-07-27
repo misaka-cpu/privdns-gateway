@@ -244,6 +244,12 @@ jobs:
       - name: "紧急默认出口 (只改 route.final/三目标同事务/原值不被覆盖/stale 拒绝)"
         run: python3 tests/test-emergency-exit.py
 
+      - name: "运行模块安装闭包 (真实入口传递依赖 vs 安装真源, 含动态导入点)"
+        run: python3 tests/test-install-closure.py
+
+      - name: "clean-root 安装产物自足 (移出仓库/隔离解释器/无源码兜底)"
+        run: python3 tests/test-clean-root.py
+
       - name: "迁移时机 (普通命令不暗中迁移; migrate 先锁先快照)"
         run: bash tests/test-migration-timing.sh
 

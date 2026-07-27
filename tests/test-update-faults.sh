@@ -17,6 +17,22 @@ bad(){ echo "[FAIL] $1"; nfail=$((nfail+1)); }
 sed -n '/^cmd_update(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh" > "$WORK/upd.sh"
 
 mkdir -p "$WORK/repo/.git"          # 让 [[ -d $REPO_DIR/.git ]] 为真, 跳过 clone
+# cmd_update 会 source 运行模块清单(lib/modules.sh)。桩仓库里给一份**同名同函数**的替身:
+# 真的那份会去校验源文件存在, 而这里的"仓库"是空的。替身同时提供 FAIL_MODULES 故障注入 ——
+# "运行模块装不上"必须和其它必需文件一样触发回滚, 否则会留下新旧混装。
+mkdir -p "$WORK/repo/lib"
+# 名字取自**真实**清单(source 它拿到 PDG_RUNTIME_MODULES), 于是逐模块的 FAIL_INSTALL 注入
+# 照旧有效 —— 桩内调的是被打桩的 install。
+( source "$ROOT/lib/modules.sh"
+  echo 'pdg_install_runtime_modules(){'
+  echo '  [[ -n "${FAIL_MODULES:-}" ]] && return 1'
+  while read -r _src _name _mode; do
+    [[ -n "$_src" ]] || continue
+    echo "  install -m$_mode \"\$1/$_src\" \"\${2:-/opt/pdg-bot}/$_name\" || return 1"
+  done <<< "$PDG_RUNTIME_MODULES"
+  echo '  return 0'
+  echo '}'
+) > "$WORK/repo/lib/modules.sh"
 
 cat > "$WORK/harness.sh" <<'EOF'
 REPO_DIR="$WORK/repo"; REPO_URL="file:///dev/null"; ENVF="$WORK/none.env"
@@ -95,6 +111,7 @@ assert_fail_rollback "必需文件(bot.py)安装失败" "FAIL_INSTALL=/opt/pdg-b
 assert_fail_rollback "必需文件(report.py)安装失败" "FAIL_INSTALL=report.py"
 assert_fail_rollback "必需文件(pdg 主脚本)安装失败" "FAIL_INSTALL=/usr/local/bin/pdg"
 assert_fail_rollback "__migrate 迁移非0"       "MIGRATE_RC=1"
+assert_fail_rollback "运行模块安装失败"         "FAIL_MODULES=1"
 assert_fail_rollback "内核二进制更新失败"       "FAIL_CORE=1"
 assert_fail_rollback "daemon-reload 失败"      "FAIL_RELOAD=1"
 # ── doctor 校验门: 命令失败/输出不可信一律回滚, 绝不跳过后报成功 ──

@@ -92,7 +92,9 @@ source "$REPO_DIR/lib/versions.sh"
 # shellcheck source=lib/units.sh
 source "$REPO_DIR/lib/units.sh"   # systemd unit 单一事实源(与 pdg 迁移共用, 免漂移)
 # shellcheck source=lib/mosdns.sh
-source "$REPO_DIR/lib/mosdns.sh" # mosdns 劫持形态单一事实源(与 hijack-mode/迁移共用)
+source "$REPO_DIR/lib/mosdns.sh"
+# shellcheck source=lib/modules.sh
+source "$REPO_DIR/lib/modules.sh"  # 运行模块单一事实源(与 pdg update 共用) # mosdns 劫持形态单一事实源(与 hijack-mode/迁移共用)
 # shellcheck source=lib/cidr.sh
 source "$REPO_DIR/lib/cidr.sh"   # 内网卡段校验 + 抓包/手输并行(与 pdg detect-cidr 共用)
 
@@ -542,13 +544,11 @@ install -m755 "$REPO_DIR"/deploy/bot/parse-geosite.py     /opt/pdg-bot/
 install -m755 "$REPO_DIR"/deploy/bot/update-rules.sh      /opt/pdg-bot/
 install -m755 "$REPO_DIR"/deploy/bot/scheduled-update.sh  /opt/pdg-bot/
 install -m755 "$REPO_DIR"/deploy/bot/healthcheck.py      /opt/pdg-bot/
-install -m755 "$REPO_DIR"/deploy/bot/checks.py           /opt/pdg-bot/
-install -m755 "$REPO_DIR"/deploy/bot/nftscan.py          /opt/pdg-bot/
-install -m755 "$REPO_DIR"/deploy/bot/pdgtx.py            /opt/pdg-bot/
-install -m755 "$REPO_DIR"/deploy/bot/nftmerge.py         /opt/pdg-bot/
-install -m755 "$REPO_DIR"/deploy/bot/doctor.py           /opt/pdg-bot/
-install -m755 "$REPO_DIR"/deploy/bot/report.py           /opt/pdg-bot/
-install -m755 "$REPO_DIR"/deploy/bot/sb2mihomo.py        /opt/pdg-bot/
+# ── 运行模块: 走 lib/modules.sh 这份**单一事实源** ────────────────────────
+# 全新安装与 pdg update 读同一份清单, 于是不可能出现"装机装了、升级漏了"这种缺口。
+# 少装一个的后果不是报错, 是整块能力静默降级(救援页标"旧核心不支持"), 见 lib/modules.sh。
+pdg_install_runtime_modules "$REPO_DIR" /opt/pdg-bot \
+  || die "运行模块安装失败, 未继续(避免新旧混装)。"
 # iOS 专属组件(MITM 模块 / :81 探测 / 描述文件模板)只在 iOS 平台安装; Android 不装。
 if [[ "$PLATFORM" == ios ]]; then
   install -m755 "$REPO_DIR"/deploy/bot/mitm_ca.py          /opt/pdg-bot/
