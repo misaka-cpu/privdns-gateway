@@ -3286,8 +3286,11 @@ def _restore_commit(tmp):
             n_del = sum(1 for v in plan.values() if v is None)
             restored.append("规则集 %d 个(删除 %d 个)" % (len(plan) - n_del, n_del))
         t.derive("mihomo_cfg", _mihomo_derive)
-        t.service("restart:mihomo")
-        t.service("restart:mosdns")
+        # 服务动作由**本次真正落盘的目标**推导, 与救援平面共用同一份映射(pdgtx.actions_for_targets)
+        # —— 两处各写一套 if/else 迟早会漂移成"同样的恢复, 一边重启一边不重启"。
+        # mihomo_cfg 是派生目标, 显式计入(derive 的产物不在 staged 列表里)。
+        for _a in tx.actions_for_targets(list(t.targets) + ["mihomo_cfg"]):
+            t.service(_a)
         res = t.commit()
     except tx.TxBusy:
         return False, BUSY_MSG

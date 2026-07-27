@@ -430,8 +430,41 @@ def restore_managed(snap_id, *, expect_digest="", trigger_source="legacy"):
         if not restorable:
             out["error"] = "这份快照里没有可事务恢复的受管配置"
             return out
+        # 先算出**内容确实变了**的目标: 服务动作只能由它推导, 不能按"快照里有什么"推 ——
+        # 只换了一份元数据却把 DNS 和内核一起重启, 既是无谓的中断, 也会让"那两个本来就坏着"
+        # 变成一次安全恢复失败的理由。
+        changed, unchanged_t = {}, []
+        for member, target in sorted(restorable.items()):
+            with open(os.path.join(stage, member), "rb") as f:
+                data = f.read()
+            try:
+                path, _m, _sec, _v = pdgtx.resolve_target(target)
+            except Exception as e:  # noqa: BLE001
+                # 本模块的成员映射与 pdgtx 白名单对不上 = 两份定义漂移了。这不是"跳过一个文件"
+                # 那么轻的事: 谁也不知道还有多少目标错了, 所以整个恢复 fail-closed。
+                out["error"] = ("目标 %s 不在事务白名单里(%s) —— 恢复映射与事务核心不一致, "
+                                "拒绝执行" % (target, type(e).__name__))
+                return out
+            cur, _st = pdgtx._read_target(path)
+            if cur is not None and cur == data:
+                unchanged_t.append(target)
+                continue
+            changed[target] = data
+        out["unchanged"] = unchanged_t
+        if not changed:
+            # 一个字节都不用动: 不开事务、不发服务动作、也不写审计(什么都没发生)
+            out["ok"] = True
+            out["state"] = "NO_CHANGE"
+            return out
+        try:
+            planned = pdgtx.actions_for_targets(changed)
+        except Exception as e:  # noqa: BLE001
+            # 未知目标 / 没有明确动作语义的目标: fail-closed, 现网一个字节都不碰
+            out["error"] = pdgtx.redact(str(e))
+            return out
         t = pdgtx.Tx(source="rescue", op="config_restore", mode="repair")
         out["txid"] = t.txid
+        out["planned_actions"] = list(planned)
         # 审计的补充维度: 全是标量与计数, 没有文件内容、没有凭据、没有调用方自由串。
         # 由核心随事务那**一条**记录一起写, 救援页不再另写。
         t.audit_extra = {"trigger_source": trigger_source, "snapshot": snap_id,
@@ -439,25 +472,26 @@ def restore_managed(snap_id, *, expect_digest="", trigger_source="legacy"):
                          "snapshot_format": snap_format(members),
                          "excluded_count": len(out["excluded"])}
         try:
-            for member, target in sorted(restorable.items()):
+            for target, data in sorted(changed.items()):
                 try:
                     _cur, sha = t.read_for_update(target)
                 except Exception as e:  # noqa: BLE001
                     out["skipped"].append("%s(%s)" % (target, type(e).__name__))
                     continue
-                with open(os.path.join(stage, member), "rb") as f:
-                    data = f.read()
                 t.stage(target, data, expect=sha)
                 out["restored"].append(target)
             t.audit_extra["restored_count"] = len(out["restored"])
             t.audit_extra["skipped_count"] = len(out["skipped"])
+            t.audit_extra["unchanged_count"] = len(unchanged_t)
+            t.audit_extra["changed_targets"] = sorted(out["restored"])
+            t.audit_extra["planned_actions"] = list(planned)
             if not out["restored"]:
                 out["error"] = "没有可落盘的目标"
                 t.abort_unstarted("没有可落盘的目标")
                 return out
-            # 受管配置换了就得让内核与 DNS 真的用上它 —— 观察期会盯着这两个
-            t.service("restart:mihomo")
-            t.service("restart:mosdns")
+            # 动作由**实际落盘的目标**推导(read_for_update 失败被跳过的不算数)
+            for a in pdgtx.actions_for_targets(out["restored"]):
+                t.service(a)
             res = t.commit()
         except pdgtx.TxBusy:
             out["error"] = "已有配置操作正在执行, 本次未做任何改动"
@@ -473,6 +507,7 @@ def restore_managed(snap_id, *, expect_digest="", trigger_source="legacy"):
         out["state"] = res.get("state", "")
         out["ok"] = out["state"] == pdgtx.COMMITTED
         out["failed"] = [pdgtx.redact(str(x)) for x in (res.get("rollback_failed_items") or [])]
+        out["executed_actions"] = list(t.meta.get("executed_actions", []))
         if res.get("error"):
             out["error"] = pdgtx.redact(str(res["error"]))
         return out

@@ -217,6 +217,9 @@ jobs:
       - name: "救援平面配置恢复 (只换受管配置/快照边界/摘要复核/nonce 一次性/失败全回滚)"
         run: python3 tests/test-rescue-cfgrestore.py
 
+      - name: "恢复的服务动作推导 (按变化目标推导/映射唯一/未知即拒/顺序固定)"
+        run: python3 tests/test-restore-actions.py
+
       - name: "迁移时机 (普通命令不暗中迁移; migrate 先锁先快照)"
         run: bash tests/test-migration-timing.sh
 

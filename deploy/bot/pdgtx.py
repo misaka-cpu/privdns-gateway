@@ -139,6 +139,67 @@ _ACTIONS = tuple(["restart:" + u for u in _SERVICE_UNITS] +
                  ["daemon-reload", "nft:apply", "sysctl:apply"])
 
 
+# ── 目标 → 服务动作(**唯一**一份)────────────────────────────────────────────
+# 恢复类操作以前固定发 restart:mihomo + restart:mosdns, 于是"只换了一份规则集元数据"也要把
+# DNS 和内核一起重启一遍: 无谓的服务中断, 而且只要那两个里有一个本来就坏着, 一次本可以安全
+# 完成的元数据恢复就失败了。动作必须从**这次真正变了的目标**推出来。
+#
+# 判据按真实依赖, 不按名字猜:
+#   · rs_meta 是 bot 的标签/计数元数据, 内核读的是 ruleset:* 里的**内容** → 自己不触发重启;
+#   · profile_env / dot_marker 是持久化意图与续期提示, 不被运行中的服务直接读 → 无动作;
+#   · 证书与 mitm_hijack 由 mosdns 读(DoT 与劫持表) → mosdns;
+#   · nftables_conf 只需要重新应用防火墙, 不该顺手重启 mihomo/mosdns;
+#   · unit:* 改的是 systemd 单元文件 → daemon-reload。
+_TARGET_ACTIONS = {
+    "model": ("restart:mihomo",),
+    "mihomo_cfg": ("restart:mihomo",),
+    "mosdns_conf": ("restart:mosdns",),
+    "mitm_hijack": ("restart:mosdns",),
+    "cert_fullchain": ("restart:mosdns",),
+    "cert_privkey": ("restart:mosdns",),
+    "nftables_conf": ("nft:apply",),
+    "sysctl_tfo": ("sysctl:apply",),
+    "rs_meta": (),
+    "profile_env": (),
+    "dot_marker": (),
+}
+_PREFIX_ACTIONS = (("mosdns_rule:", ("restart:mosdns",)),
+                   ("ruleset:", ("restart:mihomo",)),
+                   ("unit:", ("daemon-reload",)))
+# 动作取决于"要开还是要关"、通用推导给不出答案的目标: 必须由调用方显式声明。
+# mitm_json 就是这一类 —— WLOC 打开时要 start:pdg-mitm, 关闭时要 stop:pdg-mitm, 光看文件
+# 本身推不出来。这里 fail-closed, 不许猜(猜错就是把用户刚关掉的 MITM 又拉起来)。
+EXPLICIT_ONLY = frozenset({"mitm_json"})
+# 固定执行顺序(可测试): 先把防火墙/内核参数落到位, 再 reload 单元, 最后重启服务(DNS 先于内核)。
+_ACTION_ORDER = ("nft:apply", "sysctl:apply", "daemon-reload",
+                 "restart:mosdns", "restart:mihomo", "restart:pdg-mitm")
+
+
+def actions_for_targets(names):
+    """一组**确实变了的**目标 → 去重、定序的服务动作。
+
+    未知目标或"没有明确动作语义"的目标一律抛 TxError(fail-closed)—— 默认把所有服务重启一遍
+    只会把问题盖住: 出事时谁也说不清那次重启到底是不是必要的。"""
+    want = set()
+    for n in sorted(set(names)):
+        resolve_target(n)          # 名字合法性用**白名单本身**判(ruleset:../x 之流在这里就出局)
+        if n in EXPLICIT_ONLY:
+            raise TxError("目标 %s 的服务动作取决于目标状态, 必须由调用方显式声明" % n)
+        if n in _TARGET_ACTIONS:
+            want.update(_TARGET_ACTIONS[n])
+            continue
+        for pfx, acts in _PREFIX_ACTIONS:
+            if n.startswith(pfx):
+                want.update(acts)
+                break
+        else:
+            raise TxError("不知道目标 %s 变更后该做什么服务动作, 拒绝执行" % n)
+    unknown = want - set(_ACTION_ORDER)
+    if unknown:
+        raise TxError("动作表里出现了未排序的动作: %s" % ", ".join(sorted(unknown)))
+    return tuple(a for a in _ACTION_ORDER if a in want)
+
+
 def expected_states(actions):
     """本笔事务对各 unit 的**期望终态**, 只由显式动作决定(没写动作的 unit 不在其中)。"""
     exp = {}
@@ -1263,6 +1324,7 @@ class Tx:
         t["applied_sha"] = _sha(t["data"])
 
     def _do_actions(self):
+        done = self.meta.setdefault("executed_actions", [])
         for a in self.actions:
             if a == "daemon-reload":
                 rc, out = _run(["systemctl", "daemon-reload"], timeout=60)
@@ -1303,6 +1365,7 @@ class Tx:
                 rc, out = _run(["systemctl", "restart", unit], timeout=120)
             if rc != 0:
                 return "%s 失败: %s" % (a, redact(out)[-200:])
+            done.append(a)          # 实际执行成功的动作: 审计要能区分"计划了"与"真做了"
         return ""
 
     def _observe(self, services, base, exp=None, relax=()):
@@ -1551,6 +1614,7 @@ def _audit(tx):
            "services": tx.meta.get("services", []), "error": tx.meta.get("error", ""),
            "error_class": tx.meta.get("error_class", ""),
            "rollback_complete": tx.meta.get("rollback_complete"),
+           "executed_actions": tx.meta.get("executed_actions", []),
            "warnings": tx.meta.get("warnings", []), "schema_version": SCHEMA_VERSION}
     rec.update(_sanitize_extra(getattr(tx, "audit_extra", None)))
     try:

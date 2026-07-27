@@ -528,7 +528,8 @@ def snapshot_confirm_page(snap_id, csrf, nonce, sessions=None):
     digest = cr.snapshot_digest(snap_id)
     p = cr.snapshot_path(snap_id)
     made = time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(p))) if p else "?"
-    rows = _row("快照 ID", snap_id) + _row("创建时间", made) + _row("结构版本", fmt) \
+    rows = _row("快照 ID", snap_id) + _row("创建时间", made) \
+        + _row("结构版本", "%s(兼容性识别结果, 非快照自带声明)" % fmt) \
         + _row("内容摘要", digest[:16] + "…") + _row("来源", "本机 pdg snapshot")
     tgt = "".join("<li>%s → <code>%s</code></li>" % (html.escape(m), html.escape(t))
                   for m, t in sorted(restorable.items())) or "<li class=muted>没有</li>"
@@ -538,6 +539,12 @@ def snapshot_confirm_page(snap_id, csrf, nonce, sessions=None):
                if t not in set(restorable.values())]
     miss = "".join("<li><code>%s</code></li>" % html.escape(t) for t in missing) \
         or "<li class=muted>没有</li>"
+    try:
+        acts = cr.pdgtx.actions_for_targets(sorted(set(restorable.values()))) if restorable else ()
+        acts_txt = "、".join(acts) if acts else "无(纯配置/元数据, 不重启任何服务)"
+    except Exception:  # noqa: BLE001
+        acts_txt = "无法确定 —— 恢复会被拒绝"
+    rows += _row("将执行的服务动作", acts_txt)
     form = ""
     if fmt != "v1.6":
         form = ("<p class=bad>这份快照的结构(%s)无法安全映射成当前的受管配置目标, "
