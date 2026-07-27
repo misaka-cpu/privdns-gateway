@@ -103,7 +103,10 @@ assert "run_all_migrations" not in "\n".join(
 assert "migrate)       cmd_migrate;;" in pdg, "必须提供显式的事务化迁移命令 pdg migrate"
 
 # P2-2: snapshot 包含 journald drop-in(正确+历史错路径), rollback 重启 journald
-snapshot = block_after(pdg, "cmd_snapshot()", window=2600)   # cand 扩到含已装脚本 + 全部 unit 后更长
+# 同 cmd_rollback: 按语法边界取整个函数, 不用字符窗口。原来那个 2600 的窗口其实**已经**
+# 盖不住函数了(cmd_snapshot 现有 2670 字符), 只是四条断言的目标碰巧都还落在前 2600 字符里 ——
+# 再往前半部分加 70 个字符就会在代码没坏的情况下变红。
+snapshot = top_level_bash_func(pdg, "cmd_snapshot")
 assert "etc/systemd/journald.conf.d/50-pdg.conf" in snapshot, "snapshot must include journald drop-in (correct path)"
 assert "etc/systemd/system/journald.conf.d/50-pdg.conf" in snapshot, "snapshot should also capture legacy wrong-path file"
 # journald 的 CanReload=no: 还原封顶必须 restart 才生效。要求**恰好一次** —— 多来一次是
@@ -148,7 +151,9 @@ assert '_pdg_apply_snapshot_tree "$tree" "$members" /' in rollback, (
 assert "_migrate_mosdns_cache" in pdg and "_migrate_journald_cap" in pdg, (
     "mosdns cache and journald cap must be separate functions so one's failure doesn't skip the other"
 )
-mig_low = block_after(pdg, "migrate_lowmem(){", window=500)
+# 这里方向相反: 原窗口 500 比函数本身(464 字符)还长, 于是越界读进了后面那个函数 ——
+# 断言本该只在 migrate_lowmem 里成立, 却可能被邻居的内容满足。按边界取正好收紧这一点。
+mig_low = top_level_bash_func(pdg, "migrate_lowmem")
 assert "_migrate_mosdns_cache" in mig_low and "|| true" in mig_low and "_migrate_journald_cap" in mig_low, (
     "migrate_lowmem must call mosdns cache with || true then always run journald cap"
 )
