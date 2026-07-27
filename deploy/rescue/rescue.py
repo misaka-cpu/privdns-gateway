@@ -38,7 +38,8 @@ except ImportError:                                   # 仓库内直跑(开发/�
         os.path.abspath(__file__))), "bot"))
     import rescue_const as C
 
-SESSION_TTL = int(os.environ.get("PDG_RESCUE_SESSION_TTL", "1800"))     # 30 分钟
+SESSION_TTL = int(os.environ.get("PDG_RESCUE_SESSION_TTL", "1800"))        # 空闲 30 分钟
+SESSION_ABSOLUTE = int(os.environ.get("PDG_RESCUE_SESSION_MAX", "7200"))  # 绝对上限 2 小时
 MAX_BODY = 8 * 1024                                    # 请求体上限: 救援页没有大表单
 AUDIT_TAIL = 30                                        # 审计只回最近这么多条
 
@@ -215,28 +216,91 @@ def sysinfo():
 
 # ── 会话(本提交只做最小可用: 随机 id + TTL; CSRF/限速在下一提交)──────────────
 class Sessions:
-    def __init__(self, ttl=SESSION_TTL):
-        self.ttl = ttl
-        self._s = {}
+    """会话: 滑动过期 + 绝对上限, 每个会话自带一个 CSRF token。
+
+    只放内存 —— 救援服务重启(或 Token 轮换)后所有会话立即失效, 这正是想要的语义: 凭据换了
+    就不该还有人拿着旧会话在里面点按钮。"""
+
+    def __init__(self, ttl=SESSION_TTL, absolute=SESSION_ABSOLUTE):
+        self.ttl, self.absolute = ttl, absolute
+        self._s = {}                        # sid -> {"exp","born","csrf"}
 
     def new(self):
         sid = secrets.token_urlsafe(24)
-        self._s[sid] = time.time() + self.ttl
+        now = time.time()
+        self._s[sid] = {"exp": now + self.ttl, "born": now,
+                        "csrf": secrets.token_urlsafe(24)}
         return sid
 
-    def valid(self, sid):
+    def get(self, sid):
         if not sid:
-            return False
-        exp = self._s.get(sid)
-        if exp is None:
-            return False
-        if time.time() > exp:
-            self._s.pop(sid, None)
-            return False
-        return True
+            return None
+        rec = self._s.get(sid)
+        if rec is None:
+            return None
+        now = time.time()
+        if now > rec["exp"] or now - rec["born"] > self.absolute:
+            self._s.pop(sid, None)          # 空闲超时 / 到达绝对上限, 两条都要收
+            return None
+        rec["exp"] = now + self.ttl          # 滑动续期(但 born 不动, 绝对上限照样封顶)
+        return rec
+
+    def valid(self, sid):
+        return self.get(sid) is not None
+
+    def csrf(self, sid):
+        rec = self.get(sid)
+        return rec["csrf"] if rec else ""
 
     def drop(self, sid):
         self._s.pop(sid, None)
+
+    def drop_all(self):
+        self._s.clear()
+
+
+class RateLimit:
+    """登录失败限速 + 锁定。按来源地址计, 只放内存(重启即清)。
+
+    没有它, 一个能连到私网段的设备就可以离线暴力 Token; 有了它, 攻击者每分钟只有几次机会,
+    而合法用户从 SSH 拿一次 Token 就能一次进去。"""
+
+    def __init__(self, burst=5, burst_window=60, lock_after=10, lock_window=600, lock_for=900):
+        self.burst, self.burst_window = burst, burst_window
+        self.lock_after, self.lock_window, self.lock_for = lock_after, lock_window, lock_for
+        self._fail = {}                      # ip -> [ts, ...]
+        self._locked = {}                    # ip -> until
+
+    def _prune(self, ip, now):
+        keep = [t for t in self._fail.get(ip, []) if now - t <= self.lock_window]
+        if keep:
+            self._fail[ip] = keep
+        else:
+            self._fail.pop(ip, None)
+        return keep
+
+    def blocked(self, ip):
+        """返回还需等待的秒数(0 = 放行)。"""
+        now = time.time()
+        until = self._locked.get(ip)
+        if until and now < until:
+            return int(until - now) + 1
+        if until:
+            self._locked.pop(ip, None)
+        recent = [t for t in self._prune(ip, now) if now - t <= self.burst_window]
+        if len(recent) >= self.burst:
+            return int(self.burst_window - (now - recent[-self.burst])) + 1
+        return 0
+
+    def fail(self, ip):
+        now = time.time()
+        self._fail.setdefault(ip, []).append(now)
+        if len(self._prune(ip, now)) >= self.lock_after:
+            self._locked[ip] = now + self.lock_for
+
+    def ok(self, ip):
+        self._fail.pop(ip, None)
+        self._locked.pop(ip, None)
 
 
 # ── 页面(纯文本 HTML: 无 JS、无外部字体/CDN/图片)──────────────────────────────
@@ -257,14 +321,15 @@ def page(title, body):
             % (html.escape(title), CSS, body)).encode("utf-8")
 
 
-def login_page(msg=""):
+def login_page(msg="", csrf=""):
     warn = "<p class=bad>%s</p>" % html.escape(msg) if msg else ""
     return page("PDG 救援", "<h1>PrivDNS Gateway 救援平面</h1>%s"
                 "<form method=post action=/login>"
+                "<input type=hidden name=csrf value='%s'>"
                 "<label>救援 Token<br><input type=password name=token autocomplete=off></label>"
                 "<br><button type=submit>进入</button></form>"
                 "<p class=muted>Token 由 <code>sudo pdg rescue url</code> 在本机显示。"
-                "页面不加载任何外部资源。</p>" % warn)
+                "页面不加载任何外部资源。</p>" % (warn, html.escape(csrf)))
 
 
 def _row(k, v, cls=""):
@@ -400,6 +465,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(body)
 
+    def _issue_csrf(self):
+        cur = self._cookie("pdgcsrf")
+        return cur if cur else secrets.token_urlsafe(24)
+
     def _sid(self):
         raw = self.headers.get("Cookie") or ""
         m = re.search(r"(?:^|;\s*)pdgsid=([A-Za-z0-9_-]+)", raw)
@@ -421,7 +490,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
         if not self._authed():
-            self._send(401 if path != "/" else 200, login_page())
+            csrf = self._issue_csrf()
+            self._send(401 if path != "/" else 200, login_page("", csrf),
+                       cookie="pdgcsrf=%s; Path=/; Max-Age=600; Secure; SameSite=Strict" % csrf)
             return
         if path == "/":
             self._send(200, status_page())
@@ -444,24 +515,60 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_HEAD(self):
         self.do_GET()
 
+    def _client(self):
+        try:
+            return self.client_address[0]
+        except Exception:  # noqa: BLE001
+            return "?"
+
+    def _cookie(self, name):
+        raw = self.headers.get("Cookie") or ""
+        m = re.search(r"(?:^|;\s*)%s=([A-Za-z0-9_-]+)" % re.escape(name), raw)
+        return m.group(1) if m else ""
+
     def do_POST(self):
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
         if path != "/login":
             # 本提交只有只读页面; 写操作在后续提交接入, 现在一律拒绝(而不是 404 装作没有)
             self._send(405, page("405", "<p>本版本的救援平面只提供只读页面。</p>"))
             return
+        ip = self._client()
+        wait = self.server.rate.blocked(ip)
+        if wait:
+            # 429 + Retry-After: 明确告诉合法用户要等多久, 同时把暴力尝试的速率压下来
+            body = login_page("尝试过于频繁, 请 %d 秒后再试。" % wait)
+            self.send_response(429)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Retry-After", str(wait))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            return
         raw = self._body()
         if raw is None:
             self._send(413, login_page("请求体过大。"))
             return
         import urllib.parse
-        got = urllib.parse.parse_qs(raw.decode("utf-8", "replace")).get("token", [""])[0]
+        form = urllib.parse.parse_qs(raw.decode("utf-8", "replace"))
+        # CSRF(双提交 cookie): 表单里的值必须与 GET / 时下发的 cookie 一致。配合 SameSite=Strict,
+        # 跨站页面既拿不到这个 cookie 也带不上它 —— 别人的网页无法替用户提交登录/后续写操作。
+        want = self._cookie("pdgcsrf")
+        got_csrf = form.get("csrf", [""])[0]
+        if not want or not hmac.compare_digest(got_csrf, want):
+            self._send(403, login_page("表单已过期, 请重新打开页面再试。", self._issue_csrf()))
+            return
+        self.server.refresh_token()      # rotate 之后不必重启服务
+        got = form.get("token", [""])[0]
         # 常数时间比对: 逐字符早退会把"对了几位"泄漏成时间差
         if not hmac.compare_digest(got, self.server.token):
-            self._send(401, login_page("Token 不正确。"))
+            self.server.rate.fail(ip)
+            self.log_message("login failed from %s", ip)
+            self._send(401, login_page("Token 不正确。", want))
             return
+        self.server.rate.ok(ip)
         sid = self.server.sessions.new()
-        self._send(303 if False else 200, status_page(),
+        self._send(200, status_page(),
                    cookie="pdgsid=%s; Path=/; Max-Age=%d; HttpOnly; Secure; SameSite=Strict"
                           % (sid, SESSION_TTL))
 
@@ -470,9 +577,11 @@ class Server(http.server.ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, addr, token, ctx, fd=None):
+    def __init__(self, addr, token, ctx, fd=None, token_path=None):
         self.token = token
+        self.token_path = token_path
         self.sessions = Sessions()
+        self.rate = RateLimit()
         if fd is not None:                      # systemd socket activation: 直接接管那个 fd
             http.server.HTTPServer.__init__(self, addr, Handler, bind_and_activate=False)
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM, fileno=fd)
@@ -480,6 +589,20 @@ class Server(http.server.ThreadingHTTPServer):
         else:
             http.server.HTTPServer.__init__(self, addr, Handler)
         self.socket = ctx.wrap_socket(self.socket, server_side=True)
+
+    def refresh_token(self):
+        """Token 文件变了就换掉并清空所有会话 —— 轮换的语义就是"旧的立刻不算数",
+        包括别人手里已经登录的那一个。读不到就保持现状(不因为一次读失败把自己锁死)。"""
+        if not self.token_path:
+            return
+        try:
+            with open(self.token_path, encoding="utf-8") as f:
+                cur = f.read().strip()
+        except OSError:
+            return
+        if len(cur) >= 16 and cur != self.token:
+            self.token = cur
+            self.sessions.drop_all()
 
 
 def systemd_fd():
@@ -508,7 +631,7 @@ def main():
         sys.stderr.write("[rescue] 拒绝启动: 证书/私钥不可用(%s)\n" % type(e).__name__)
         return 2
     fd = systemd_fd()
-    srv = Server((bind, port), token, ctx, fd=fd)
+    srv = Server((bind, port), token, ctx, fd=fd, token_path=C.paths()["PDG_RESCUE_TOKEN"])
     sys.stderr.write("[rescue] 监听 https://%s:%d/ (%s)\n"
                      % (bind, port, "socket activation" if fd else "自行绑定"))
     try:
