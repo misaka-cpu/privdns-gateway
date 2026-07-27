@@ -12,7 +12,8 @@ import 它。于是"改了 model 就必须在**同一笔事务**里重渲 mihomo
 运行中的内核却纹丝不动。
 
 设计约束(刻意的):
-  · 本模块**只依赖标准库 + sb2mihomo**(pdgtx 是软依赖, 只为拿 TxRefused 这个异常类型);
+  · 本模块**只依赖标准库 + sb2mihomo**(pdgtx 是软依赖, 只在边界映射异常类型时用到,
+    **不用来决定错误安不安全** —— 判废异常自带安全的 str);
   · 绝不 import pdg-bot, 也**绝不读 bot 的可变全局** —— 路径一律由调用方显式传进来。
     bot 侧的 RS_META / MITM_HIJACK_FILE 是测试会 monkeypatch 的入口, 若这里另存一份常量
     别名, patch 了 bot 的那份不会传导过来, 测试就会在"看着改了、其实没改"的状态下变绿;
@@ -37,14 +38,47 @@ _MRS_BEHAVIOR_BYTE = {0: "domain", 1: "ipcidr"}
 os.environ.setdefault("SAFE_PATHS", "/etc/sing-box/ui/dist")
 
 
-def _refused_cls():
-    """判废用 pdgtx.TxRefused —— 事务对普通异常只报类型名(怕正文带出凭据), 而"哪个出口被丢了"
-    这种信息必须**点名**才有用。事务核心不可用时退回 RuntimeError, 不因此渲染不了。"""
-    try:
-        import pdgtx
-        return pdgtx.TxRefused
-    except Exception:  # noqa: BLE001
-        return RuntimeError
+class RenderRefused(Exception):
+    """渲染判废 —— **默认字符串里没有任何用户值**。
+
+    为什么要自己定义而不是借 pdgtx.TxRefused: 原来的做法是"有 pdgtx 就用它的异常类, 没有就
+    退回 RuntimeError", 于是**安全性取决于 pdgtx 在不在** —— 没有它时, 出口 tag 与规则集名
+    会原样进异常正文, 而那两样都是用户可以随便起名的字段。安全不能是可选项。
+
+    所以: 原始标识只放在结构化的 .items 里, str()/repr() 只给固定 code、类别与**计数**。
+    要展示具体名字的调用方, 在自己的边界上用 detail(redact=…) 明确要一次 —— 拿得到脱敏函数
+    就脱敏后展示, 拿不到就只能看到安全默认串。"""
+
+    # 固定错误码: 供调用方分类, 不随文案变化
+    UNKNOWN_PROXIES = "RENDER_REFUSED_UNKNOWN_PROXIES"
+    DROPPED_RULES = "RENDER_REFUSED_DROPPED_RULES"
+    _PHRASE = {
+        UNKNOWN_PROXIES: ("有出口 mihomo 无法转换(会被静默丢弃)", "个出口无法转换"),
+        DROPPED_RULES: ("有规则/规则集无法进入 mihomo 运行配置(会被静默丢弃)", "条规则被丢弃"),
+    }
+
+    def __init__(self, code, items):
+        self.code = code
+        self.items = tuple(items)
+        super().__init__(self.safe_message())
+
+    def safe_message(self):
+        """不含任何用户值: 只有错误码与计数。"""
+        return "%s: %d %s(具体名字需脱敏后才展示)" % (
+            self.code, len(self.items), self._PHRASE.get(self.code, ("", "项"))[1])
+
+    def detail(self, redact=None):
+        """给**有能力脱敏**的调用方拼可读详情。redact 为 None 时不展示任何原始值。"""
+        if redact is None:
+            return self.safe_message()
+        return "%s: %s" % (self._PHRASE.get(self.code, ("渲染判废", ""))[0],
+                           ", ".join(redact(str(x)) for x in self.items))
+
+    def __str__(self):
+        return self.safe_message()
+
+    def __repr__(self):
+        return "RenderRefused(code=%r, count=%d)" % (self.code, len(self.items))
 
 
 # ── .mrs 的 behavior 识别(zstd 二进制头)──────────────────────────────────
@@ -249,19 +283,30 @@ def fmt_dropped(dropped):
 
 
 def check_meta(meta):
-    """渲染 meta 里的"会被静默丢弃"一律判废并**点名**。
+    """渲染 meta 里的"会被静默丢弃"一律判废。
 
-    用 TxRefused 而不是 ValueError: 事务对普通异常只报类型名(怕异常正文带出凭据), 而这两条
-    恰恰必须点名是哪个出口/哪条规则被丢了, 否则用户根本不知道该改什么。"""
-    refused = _refused_cls()
+    抛 RenderRefused: 它的 str() 只有错误码与计数, 具体名字放在 .items 里, 由调用方在自己的
+    边界上决定要不要(以及怎么)展示 —— 用户确实需要知道是哪个出口/哪条规则被丢了, 但那必须
+    经过脱敏, 而不是靠"反正 pdgtx 在, 上层会 redact"这种默契。"""
     bad = (meta or {}).get("unknown_proxies")
     if bad:
-        raise refused("有出口 mihomo 无法转换(会被静默丢弃): %s"
-                      % ", ".join(str(x) for x in bad))
+        raise RenderRefused(RenderRefused.UNKNOWN_PROXIES, [str(x) for x in bad])
     dropped = (meta or {}).get("dropped")
     if dropped:
-        raise refused("有规则/规则集无法进入 mihomo 运行配置(会被静默丢弃): %s"
-                      % fmt_dropped(dropped))
+        raise RenderRefused(RenderRefused.DROPPED_RULES, _dropped_items(dropped))
+
+
+def _dropped_items(dropped):
+    """dropped 条目 → 安全标识列表(与 fmt_dropped 的取值口径一致)。"""
+    out = []
+    for d in dropped or []:
+        if isinstance(d, dict) and d.get("rule_set"):
+            out.append(str(d["rule_set"]))
+        elif isinstance(d, dict):
+            out.append(",".join("%s=%s" % (k, v) for k, v in list(d.items())[:2]) or "未知规则")
+        else:
+            out.append(str(d))
+    return out
 
 
 def derive_bytes(staged, *, rulesets, mitm_domains, tls_ports):
@@ -291,7 +336,25 @@ def deriver_from_paths(*, rs_meta_path, mitm_hijack_file, platform_file):
             except Exception:  # noqa: BLE001
                 meta = {}
         plat = read_platform(platform_file)
-        return derive_bytes(staged, rulesets=rulesets_arg(meta),
-                            mitm_domains=read_mitm_domains(mitm_hijack_file, plat),
-                            tls_ports=[443] if plat == "ios" else None)
+        try:
+            return derive_bytes(staged, rulesets=rulesets_arg(meta),
+                                mitm_domains=read_mitm_domains(mitm_hijack_file, plat),
+                                tls_ports=[443] if plat == "ios" else None)
+        except RenderRefused as e:
+            # 边界映射: 事务层认 TxRefused, 于是配置恢复/救援能给出可解释的拒绝而不是 500。
+            # 拿得到脱敏函数就脱敏后点名; 拿不到就只抛安全默认串 —— 绝不退回一个带原始值的
+            # 通用异常(安全不取决于 pdgtx 在不在)。
+            tx = _tx_mod()
+            if tx is None:
+                raise
+            raise tx.TxRefused(e.detail(redact=tx.redact)) from None
     return _derive
+
+
+def _tx_mod():
+    """事务核心: 可用且带 redact 才返回。只用来做**边界映射**, 不用来决定错误安不安全。"""
+    try:
+        import pdgtx
+    except Exception:  # noqa: BLE001
+        return None
+    return pdgtx if hasattr(pdgtx, "TxRefused") and hasattr(pdgtx, "redact") else None

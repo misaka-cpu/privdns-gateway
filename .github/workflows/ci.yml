@@ -235,6 +235,9 @@ jobs:
       - name: "rule_set 数组形态 (字符串逐字节不变/数组按序展开/非法形态 fail-closed)"
         run: python3 tests/test-ruleset-array.py
 
+      - name: "渲染判废默认安全 (pdgtx 缺失/损坏/旧版时 str/repr/审计均不含用户值)"
+        run: python3 tests/test-render-refusal.py
+
       - name: "迁移时机 (普通命令不暗中迁移; migrate 先锁先快照)"
         run: bash tests/test-migration-timing.sh
 
