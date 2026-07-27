@@ -43,35 +43,78 @@ CSRF_TTL = int(os.environ.get("PDG_RESCUE_CSRF_TTL", "600"))            # CSRF c
 SESSION_TTL = int(os.environ.get("PDG_RESCUE_SESSION_TTL", "1800"))        # 空闲 30 分钟
 SESSION_ABSOLUTE = int(os.environ.get("PDG_RESCUE_SESSION_MAX", "7200"))  # 绝对上限 2 小时
 MAX_BODY = 8 * 1024                                    # 请求体上限: 救援页没有大表单
+OP_CONFIG = "config"                                   # 确认票的操作维度
+OP_BREAKGLASS = "full_breakglass_restore"              # 与结果/审计里的 operation 同名
 AUDIT_TAIL = 30                                        # 审计只回最近这么多条
 
 
 # ── 事务核心: 有就用, 没有也要能开页面(它可能正是坏掉的那一个) ────────────────
+# pdgtx.py 与 cfgrestore.py **属于业务恢复范围**(有意不列入救援保护清单): 一次完整恢复本来
+# 就该把它们换成快照里的版本。于是"恢复完之后它们是旧版"是**正常结果**, 不是故障。
+#
+# 但"import 得进来"不等于"能用": 旧版本往往少几个函数, 直接调用的下场是 AttributeError 一路
+# 冒到 HTTP 层 —— 用户在最需要一个能打开的页面的时刻拿到 500 堆栈。所以这里按**接口齐全**
+# 判定: 不齐全一律当作不可用, 页面显示"旧核心不支持"并禁用对应按钮, 而状态页与紧急完整恢复
+# 照常可用(它们不依赖这两个模块)。
+CFGRESTORE_API = ("snapshot_ids", "snapshot_digest", "list_members", "snap_format",
+                  "classify", "restore_managed", "MEMBER_TARGET")
+PDGTX_API = ("pending_recovery", "list_tx", "leftover_materials", "recover", "redact", "TX_ROOT")
+BREAKGLASS_API = ("run", "_protected_paths", "snap_api")
+DEGRADED = "旧核心不支持"          # 页面上统一的说法, 各处不要各写一句
+
+
+def _mod(name, api):
+    try:
+        m = __import__(name)
+    except Exception:  # noqa: BLE001
+        return None                       # 缺失 / 语法错误 / import 期异常
+    return m if all(hasattr(m, n) for n in api) else None      # 版本不兼容
+
+
 def _cfgrestore():
     """受管配置恢复的共享实现。它只依赖 pdgtx, **不导入 bot / Telegram 交互层** ——
-    救援平面要能在 Bot 起不来时照样工作。"""
-    try:
-        import cfgrestore
-        return cfgrestore
-    except Exception:  # noqa: BLE001
+    救援平面要能在 Bot 起不来时照样工作。
+
+    事务核心不可用时它一并算作不可用: 配置恢复整个建立在 pdgtx 事务之上, 而旧版 pdgtx 往往
+    "import 得进来但少函数" —— cfgrestore 于是能加载, 却会在**事务跑到一半**时 AttributeError。
+    与其半途炸在落盘中间, 不如在按钮上就说清"旧核心不支持"。"""
+    if _pdgtx() is None:
         return None
+    return _mod("cfgrestore", CFGRESTORE_API)
 
 
 def _breakglass():
     """紧急完整恢复。与配置恢复分开加载: 它不可用时配置恢复照样能用。"""
-    try:
-        import breakglass
-        return breakglass
-    except Exception:  # noqa: BLE001
-        return None
+    return _mod("breakglass", BREAKGLASS_API)
 
 
 def _pdgtx():
-    try:
-        import pdgtx
-        return pdgtx
-    except Exception:  # noqa: BLE001
-        return None
+    return _mod("pdgtx", PDGTX_API)
+
+
+def _forget_business_modules():
+    """把业务恢复范围内的模块从 import 缓存里丢掉, 下次访问按**盘上现在那一份**重新判定。
+
+    Python 一个模块只 import 一次。完整恢复把 cfgrestore.py / pdgtx.py 换成旧版之后, 不丢缓存
+    的话页面会拿着内存里那份旧对象继续显示"一切正常", 而盘上早已是另一回事 —— 要到下次重启
+    才暴露。"恢复后重新做能力检测"要真的重新检测, 就得先忘掉。
+    breakglass 与 rescue 自身在保护清单里, 不会被换, 不必忘。"""
+    for m in ("cfgrestore", "pdgtx"):
+        sys.modules.pop(m, None)
+
+
+def caps():
+    """三个模块此刻到底能不能用 —— 页面据此决定"正常显示"还是"禁用 + 旧核心不支持"。"""
+    return {"pdgtx": _pdgtx() is not None,
+            "cfgrestore": _cfgrestore() is not None,
+            "breakglass": _breakglass() is not None}
+
+
+def _ct_eq(a, b):
+    """恒定时间比较。转字节再比: hmac.compare_digest 对 str 只接受 ASCII, 而确认框里的内容
+    完全可能是用户随手粘进来的中文 —— 那不该变成一个 500, 它只是"输错了"。"""
+    return hmac.compare_digest(str(a).encode("utf-8", "replace"),
+                               str(b).encode("utf-8", "replace"))
 
 
 def _redact(s):
@@ -177,8 +220,28 @@ def tx_overview():
             "leftover": _safe(tx.leftover_materials)}
 
 
+def _fsroot():
+    """沙箱根。事务核心可用时以它为准, 不可用时读同一个环境变量 —— **不能**在这里退回写死的
+    绝对路径: 那样一来"pdgtx 坏了"就变成"顺便还换了一套路径", 而降级恰恰是最需要它去对地方
+    的时刻(真机上 FSROOT 是空串, 两条路径本来就重合, 所以这不影响生产行为)。"""
+    tx = _pdgtx()
+    return getattr(tx, "FSROOT", None) if tx is not None else os.environ.get("PDG_TX_FSROOT", "")
+
+
+def _snap_dir():
+    return os.environ.get("PDG_SNAP_DIR", (_fsroot() or "") + "/var/lib/privdns-gateway/backups")
+
+
+def _audit_file():
+    tx = _pdgtx()
+    if tx is not None:
+        return os.path.join(tx.TX_ROOT, "index.jsonl")
+    root = os.environ.get("PDG_TX_ROOT", (_fsroot() or "") + "/var/lib/privdns-gateway/tx")
+    return os.path.join(root, "index.jsonl")
+
+
 def snapshots():
-    d = "/var/lib/privdns-gateway/backups"
+    d = _snap_dir()
     out = []
     try:
         names = sorted(os.listdir(d), reverse=True)
@@ -196,9 +259,7 @@ def snapshots():
 
 
 def audit_tail(n=AUDIT_TAIL):
-    tx = _pdgtx()
-    path = getattr(tx, "AUDIT", None) if tx else None
-    path = path or "/var/lib/privdns-gateway/tx/index.jsonl"
+    path = _audit_file()
     try:
         with open(path, encoding="utf-8") as f:
             lines = f.readlines()[-n:]
@@ -210,8 +271,21 @@ def audit_tail(n=AUDIT_TAIL):
             rec = json.loads(ln)
         except ValueError:
             continue
-        out.append({k: rec.get(k) for k in ("ts", "txid", "source", "op", "state", "error")})
+        out.append({k: rec.get(k) for k in ("ts", "txid", "source", "op", "state", "error",
+                                            "snapshot", "pre_rescue_snapshot")})
     return out
+
+
+def last_breakglass():
+    """审计里最近一次紧急完整恢复(没有则 None)。
+
+    为什么要从审计里读: pre-rescue 快照 ID 是"把机器换回去"的唯一凭据, 它不能只活在那一次的
+    结果页里 —— 用户关掉页面、或者救援服务重启之后, 那个 ID 就找不回来了。审计是重启后还在
+    的那一份, 而且它的读取路径不依赖 pdgtx(见 audit_tail 的兜底路径)。"""
+    for rec in reversed(audit_tail(200)):
+        if rec.get("op") == OP_BREAKGLASS:
+            return rec
+    return None
 
 
 def sysinfo():
@@ -233,6 +307,23 @@ def sysinfo():
         info["load"] = None
     info["cidr"] = C.internal_cidr() or "未写入"
     return info
+
+
+def _snap_facts(api, snap_id):
+    """快照的三个事实: 成员、结构版本、内容摘要。确认页与执行时**各算一次**并比对 ——
+    "确认的是这一份、执行的是另一份"是这里最不该发生的事, 而快照文件是可以在两次请求之间
+    被换掉的(定时任务、另一个会话、手工 scp)。返回 (members, fmt, digest, err)。"""
+    members, err = api.list_members(snap_id)
+    if err:
+        return [], "", "", err
+    return members, api.snap_format(members), api.snapshot_digest(snap_id), ""
+
+
+def _snap_api():
+    """快照读取接口。cfgrestore 坏了也要能做完整恢复 —— 所以走 breakglass 那个单一决策点,
+    它在 cfgrestore 不可用时会退到自带的最小实现(校验强度一致)。"""
+    bg = _breakglass()
+    return bg.snap_api(_cfgrestore()) if bg is not None else _cfgrestore()
 
 
 # ── 会话(本提交只做最小可用: 随机 id + TTL; CSRF/限速在下一提交)──────────────
@@ -288,28 +379,31 @@ class Nonces:
 
     def __init__(self, ttl=900):
         self.ttl = ttl
-        self._n = {}                      # nonce -> (sid, snap, digest, exp)
+        self._n = {}                      # nonce -> (sid, snap, digest, op, fmt, exp)
 
-    def issue(self, sid, snap, digest, op="config"):
+    def issue(self, sid, snap, digest, op="config", fmt=""):
         n = secrets.token_urlsafe(18)
-        self._n[n] = (sid, snap, digest, op, time.time() + self.ttl)
+        self._n[n] = (sid, snap, digest, op, fmt, time.time() + self.ttl)
         # 顺手清过期的, 免得长期运行的服务里越积越多
         for k, v in list(self._n.items()):
-            if v[4] < time.time():
+            if v[5] < time.time():
                 self._n.pop(k, None)
         return n
 
-    def consume(self, n, sid, snap, digest, op="config"):
-        """一次性核销。会话/快照/摘要/**操作类型**四项全对才算数, 且不提示是哪一项不对。
-        op 维度是必须的: 否则"恢复受管配置"的确认票能被拿去执行整机完整恢复。"""
+    def consume(self, n, sid, snap, digest, op="config", fmt=""):
+        """一次性核销。会话/快照/摘要/操作类型/**快照结构版本**五项全对才算数, 且不提示是
+        哪一项不对。
+        op 维度: 否则"恢复受管配置"的确认票能被拿去执行整机完整恢复。
+        fmt 维度: 旧结构(legacy-dnsdist)要走更强的确认, 而**票据本身**就得区分开 —— 否则在
+        v1.6 页面上拿到的票, 换个快照就能绕过旧结构那道更强的门。"""
         rec = self._n.pop(n, None)
         if not rec:
             return False
-        s_, sn_, dg_, op_, exp = rec
+        s_, sn_, dg_, op_, fmt_, exp = rec
         if time.time() > exp:
             return False
-        return (hmac.compare_digest(s_, sid) and hmac.compare_digest(sn_, snap)
-                and hmac.compare_digest(dg_, digest) and hmac.compare_digest(op_, op))
+        return (_ct_eq(s_, sid) and _ct_eq(sn_, snap) and _ct_eq(dg_, digest)
+                and _ct_eq(op_, op) and _ct_eq(fmt_, fmt))
 
 
 class RateLimit:
@@ -398,25 +492,64 @@ def status_page():
     sys_rows = "".join(_row(k, v) for k, v in (
         ("内网卡段", info["cidr"]), ("磁盘可用", "%s MB" % info["disk_free_mb"]),
         ("运行时长", "%s 小时" % info["uptime_h"]), ("负载", info["load"])))
+    cap = caps()
     if not tx["available"]:
-        txline = "<p class=bad>事务核心不可用(pdgtx 导入失败)—— 恢复类操作不可用, 请用 SSH 处理。</p>"
+        txline = ("<p class=bad>事务核心不可用 —— 「事务 recover」与「恢复受管配置」已禁用(%s)。"
+                  "状态页与紧急完整恢复不受影响。<a href=/tx>详情</a></p>" % DEGRADED)
     elif tx["pending"]:
         txline = ("<p class=bad>有 %d 笔未完成的事务, 写操作会被拒绝。"
                   "<a href=/tx>查看</a></p>" % len(tx["pending"]))
     else:
         txline = "<p class=ok>没有未完成的事务。<a href=/tx>查看历史</a></p>"
+    # 能力一览: 哪些还能用、哪些"旧核心不支持"。降级是可以接受的状态, 但必须是**看得见**的。
+    cap_rows = "".join(
+        _row(label, "可用" if cap[k] else DEGRADED, "ok" if cap[k] else "bad")
+        for k, label in (("pdgtx", "事务核心(recover)"),
+                         ("cfgrestore", "恢复受管配置"),
+                         ("breakglass", "紧急完整恢复")))
+    last = last_breakglass()
+    if last:
+        pre = last.get("pre_rescue_snapshot") or ""
+        cap_rows += _row("上次完整恢复", "%s · %s" % (
+            time.strftime("%m-%d %H:%M", time.localtime(last.get("ts") or 0)),
+            str(last.get("state") or "")))
+        # pre-rescue ID 是"换回去"的唯一凭据 —— 结果页关掉了、服务重启了, 它都得还在
+        cap_rows += _row("可用于换回的 pre-rescue 快照",
+                         ("<a href='/breakglass/%s'>%s</a>" % (html.escape(pre), html.escape(pre)))
+                         if pre else "(无)")
     return page("PDG 救援 · 状态",
                 "<h1>状态总览</h1><h2>服务</h2><table>%s</table>"
                 "<h2>系统</h2><table>%s</table><h2>配置事务</h2>%s"
+                "<h2>恢复能力</h2><table>%s</table>"
                 "<h2>其它</h2><p><a href=/snapshots>快照列表</a> · "
                 "<a href=/audit>审计(脱敏)</a> · <a href=/logout>退出</a></p>"
-                % (rows, sys_rows, txline))
+                % (rows, sys_rows, txline, cap_rows))
+
+
+def degraded_page(what, snap_id="", why="事务核心不可用"):
+    """某个功能因为"旧核心不支持"而不可用时的页面。
+
+    要点是**不报错**: 用户走到这里通常是刚做完一次完整恢复, 机器正处在半旧不新的状态 ——
+    这时候一个 500 或者堆栈只会让人以为救援平面也挂了。所以说清三件事: 为什么不可用、
+    什么仍然可用、下一步怎么走。"""
+    more = ("<p><a href='/breakglass/%s'>用这份快照做紧急完整恢复</a>(仍然可用)</p>"
+            % html.escape(snap_id)) if snap_id else ""
+    return page("PDG 救援 · %s" % what,
+                "<h1>%s</h1>"
+                "<p class=bad>%s: %s(缺失、损坏或版本不兼容), 本功能已禁用。</p>"
+                "<p class=muted>这通常是刚做过一次紧急完整恢复的正常结果: "
+                "<code>pdgtx.py</code> 与 <code>cfgrestore.py</code> 属于业务恢复范围, "
+                "会被快照里的版本覆盖。</p>"
+                "<h2>仍然可用</h2>"
+                "<ul><li>状态总览与审计</li><li>紧急完整恢复(可再选 pre-rescue 快照换回来)</li></ul>"
+                "%s<p><a href=/>返回状态</a> · <a href=/snapshots>快照列表</a></p>"
+                % (html.escape(what), DEGRADED, html.escape(why), more))
 
 
 def tx_page():
     t = tx_overview()
     if not t["available"]:
-        return page("PDG 救援 · 事务", "<h1>配置事务</h1><p class=bad>事务核心不可用。</p>")
+        return degraded_page("配置事务", why="事务核心不可用")
     def _tbl(items, empty):
         if not items:
             return "<p class=muted>%s</p>" % empty
@@ -508,12 +641,19 @@ def snapshots_page():
     if not snaps:
         body = "<p class=muted>没有快照。</p>"
     else:
+        can_cfg = _cfgrestore() is not None
+        def _act(name):
+            # 配置恢复不可用时**禁用**这个入口(纯文字, 不是链接), 但完整恢复照常给路 ——
+            # 那是降级状态下把机器换回去的唯一办法。
+            if can_cfg:
+                return "<a href='/snapshot/%s'>查看可恢复的配置</a>" % html.escape(name)
+            return ("<span class=muted>%s</span> · <a href='/breakglass/%s'>紧急完整恢复</a>"
+                    % (DEGRADED, html.escape(name)))
         body = "<table><tr><th>快照</th><th>大小</th><th>时间</th><th></th></tr>" + "".join(
-            "<tr><td>%s</td><td>%.1f MB</td><td>%s</td>"
-            "<td><a href='/snapshot/%s'>查看可恢复的配置</a></td></tr>" % (
+            "<tr><td>%s</td><td>%.1f MB</td><td>%s</td><td>%s</td></tr>" % (
                 html.escape(s["name"]), s["size"] / 1048576.0,
                 time.strftime("%Y-%m-%d %H:%M", time.localtime(s["mtime"])),
-                html.escape(s["name"]))
+                _act(s["name"]))
             for s in snaps) + "</table>"
     return page("PDG 救援 · 快照",
                 "<h1>快照</h1>%s"
@@ -584,45 +724,63 @@ def snapshot_confirm_page(snap_id, csrf, nonce, sessions=None):
                 % (html.escape(snap_id), rows, tgt, miss, exc, form, html.escape(snap_id)))
 
 
-def breakglass_confirm_page(snap_id, csrf, nonce):
+# 旧结构快照的确认前缀。用户必须完整打出 `LEGACY-<末6位>` —— 比"末 6 位"多打 7 个字符,
+# 目的不是防碰撞, 是让手指停一下: 旧结构恢复完可能连服务都起不来, 那不该和普通回滚一样顺手。
+LEGACY_FMT = "legacy-dnsdist"
+LEGACY_PREFIX = "LEGACY-"
+
+
+def _expected_confirm(snap_id, fmt):
+    """该输入什么。v1.6 = 末 6 位; 旧结构 = LEGACY-<末6位>。单一来源, 页面与校验共用。"""
+    return (LEGACY_PREFIX if fmt == LEGACY_FMT else "") + (snap_id or "")[-6:]
+
+
+def breakglass_confirm_page(snap_id, csrf, nonce, api=None, fmt="", digest="", err=""):
     """紧急完整恢复的确认页 —— 与配置恢复**分开**, 用词、票据、按钮都不共用。"""
-    cr = _cfgrestore()
     bg = _breakglass()
-    if cr is None or bg is None or snap_id not in cr.snapshot_ids():
+    if bg is None:
         return None
-    members, err = cr.list_members(snap_id)
+    api = api or _snap_api()
+    if api is None or snap_id not in api.snapshot_ids():
+        return None
     if err:
         return page("PDG 救援 · 紧急完整恢复",
                     "<h1>紧急完整恢复</h1><p class=bad>%s</p>"
                     "<p><a href=/snapshots>返回</a></p>" % html.escape(err))
-    fmt = cr.snap_format(members)
-    digest = cr.snapshot_digest(snap_id)
-    p = cr.snapshot_path(snap_id)
+    p = api.snapshot_path(snap_id)
     made = time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(p))) if p else "?"
     rows = _row("快照 ID", snap_id) + _row("创建时间", made) + _row("来源", "本机 pdg snapshot") \
         + _row("结构版本", "%s(兼容性识别结果, 非快照自带声明)" % fmt) \
         + _row("内容摘要", digest[:16] + "…")
     protected = "".join("<li><code>%s</code></li>" % html.escape(os.path.basename(x))
                         for x in bg._protected_paths())
-    tail6 = snap_id[-6:]
-    form = ""
+    hidden = ("<input type=hidden name=csrf value='%s'>"
+              "<input type=hidden name=snapshot value='%s'>"
+              "<input type=hidden name=digest value='%s'>"
+              "<input type=hidden name=nonce value='%s'>"
+              % (csrf, html.escape(snap_id), html.escape(digest), nonce))
     legacy_note = ""
-    if fmt == "legacy-dnsdist":
+    if fmt == LEGACY_FMT:
         legacy_note = ("<p class=bad>这是**旧结构**快照: 允许用于紧急完整恢复, 但恢复后"
                        "**不保证当前服务能启动** —— 恢复完请立刻在本页确认 mihomo/mosdns 状态, "
                        "必要时用 pre-rescue 快照回来。救援入口的保护对旧结构同样生效。</p>")
-    if fmt not in ("v1.6", "legacy-dnsdist"):
-        form = ("<p class=bad>快照结构无法识别(%s), 拒绝执行。</p>" % html.escape(fmt))
+    if fmt not in ("v1.6", LEGACY_FMT):
+        # unknown / 歧义结构: 不给表单, 也不给票 —— 连"手滑点一下"的机会都不留
+        form = "<p class=bad>快照结构无法识别(%s), 拒绝执行。</p>" % html.escape(fmt)
+    elif fmt == LEGACY_FMT:
+        # 旧结构走**更强**的确认: 勾选 + 更长的固定格式 + 专属票据(票绑着 fmt, 见 Nonces)
+        form = ("<form method=post action=/breakglass/restore>%s"
+                "<label><input type=checkbox name=legacy_ack value=yes> "
+                "我理解该旧快照恢复后可能无法启动当前 mihomo/mosdns</label><br>"
+                "<label>请手工输入 <code>%s%s</code> 以确认: "
+                "<input name=confirm_text autocomplete=off></label>"
+                "<br><button type=submit>执行紧急完整恢复(旧结构)</button></form>"
+                % (hidden, LEGACY_PREFIX, html.escape(snap_id[-6:])))
     else:
-        form = ("<form method=post action=/breakglass/restore>"
-                "<input type=hidden name=csrf value='%s'>"
-                "<input type=hidden name=snapshot value='%s'>"
-                "<input type=hidden name=digest value='%s'>"
-                "<input type=hidden name=nonce value='%s'>"
+        form = ("<form method=post action=/breakglass/restore>%s"
                 "<label>请手工输入快照 ID 的末 6 位以确认: "
                 "<input name=confirm_text autocomplete=off></label>"
-                "<br><button type=submit>执行紧急完整恢复</button></form>"
-                % (csrf, html.escape(snap_id), html.escape(digest), nonce))
+                "<br><button type=submit>执行紧急完整恢复</button></form>" % hidden)
     return page("PDG 救援 · 紧急完整恢复",
                 "<h1>紧急完整恢复</h1><table>%s</table>"
                 "<h2>会恢复什么</h2>"
@@ -632,12 +790,19 @@ def breakglass_confirm_page(snap_id, csrf, nonce):
                 "<h2>会保留什么</h2>"
                 "<p>完整恢复覆盖 PDG 业务运行环境, 但保留当前救援入口, 避免恢复过程中失联。</p>"
                 "<ul>%s</ul>"
+                "<h2>对救援功能自身的影响</h2>"
+                "<p>事务核心(<code>pdgtx.py</code>)与配置恢复模块(<code>cfgrestore.py</code>)"
+                "**属于业务恢复范围**, 会被这份快照里的版本覆盖 —— 这是有意的, 它们不在保护清单里。</p>"
+                "<ul><li>换成旧版之后,「恢复受管配置」与「事务 recover」可能不可用: "
+                "届时页面会标注「%s」并禁用对应按钮, 不会报错页;</li>"
+                "<li>**状态页与本页(紧急完整恢复)仍然保留** —— 它们不依赖这两个模块, "
+                "救援服务重启后也能进到降级状态页, pre-rescue 快照 ID 仍可查。</li></ul>"
                 "<h2>与「恢复受管配置」的区别</h2>%s"
                 "<p class=bad>这个操作**没有 pdgtx 的二次自动回滚**。失败时只能靠本次操作前自动"
                 "创建的 pre-rescue 快照, 或 SSH 手工处理。只想换配置请回到 "
                 "<a href='/snapshot/%s'>恢复受管配置</a>。</p>%s"
                 "<p><a href=/snapshots>返回快照列表</a></p>"
-                % (rows, protected, legacy_note, html.escape(snap_id), form))
+                % (rows, protected, DEGRADED, legacy_note, html.escape(snap_id), form))
 
 
 def breakglass_result_page(res):
@@ -824,28 +989,36 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send(200, snapshots_page())
         elif path.startswith("/breakglass/"):
             snap = path[len("/breakglass/"):]
-            cr = _cfgrestore()
-            if cr is None or snap not in cr.snapshot_ids():
+            # 完整恢复是最后一道门: cfgrestore 坏了也必须走得进来(_snap_api 会退到自带实现)
+            api = _snap_api()
+            if api is None or snap not in api.snapshot_ids():
                 self._send(404, page("404", "<p>没有这份快照。</p>"))
                 return
             sid = self._sid()
-            # **独立**的一次性票: op 维度是 breakglass, 配置恢复的票拿到这里不算数
-            body = breakglass_confirm_page(snap, self.server.sessions.csrf(sid),
-                                           self.server.nonces.issue(sid, snap,
-                                                                    cr.snapshot_digest(snap),
-                                                                    "breakglass"))
+            _m, fmt, digest, err = _snap_facts(api, snap)
+            # **独立**的一次性票: op 维度是完整恢复, 且绑着快照结构版本 —— 配置恢复的票、
+            # 或者在 v1.6 快照页上拿到的票, 都到不了旧结构这道更强的门后面
+            nonce = "" if (err or fmt not in ("v1.6", LEGACY_FMT)) else \
+                self.server.nonces.issue(sid, snap, digest, OP_BREAKGLASS, fmt)
+            body = breakglass_confirm_page(snap, self.server.sessions.csrf(sid), nonce,
+                                           api=api, fmt=fmt, digest=digest, err=err)
             self._send(200, body) if body else self._send(404, page("404", "<p>没有这份快照。</p>"))
         elif path.startswith("/snapshot/"):
             snap = path[len("/snapshot/"):]
             cr = _cfgrestore()
-            if cr is None or snap not in cr.snapshot_ids():
+            if cr is None:
+                # 模块缺失/语法错/版本不兼容: 明说"旧核心不支持"并指向仍然可用的完整恢复,
+                # 而不是丢一个 404 让人以为快照没了
+                self._send(200, degraded_page("恢复受管配置", snap,
+                                              why="配置恢复模块不可用"))
+                return
+            if snap not in cr.snapshot_ids():
                 self._send(404, page("404", "<p>没有这份快照。</p>"))
                 return
             sid = self._sid()
-            body = snapshot_confirm_page(snap, self.server.sessions.csrf(sid),
-                                         self.server.nonces.issue(sid, snap,
-                                                                  cr.snapshot_digest(snap),
-                                                                  "config"))
+            _m, fmt, digest, err = _snap_facts(cr, snap)
+            nonce = "" if err else self.server.nonces.issue(sid, snap, digest, OP_CONFIG, fmt)
+            body = snapshot_confirm_page(snap, self.server.sessions.csrf(sid), nonce)
             self._send(200, body) if body else self._send(404, page("404", "<p>没有这份快照。</p>"))
         elif path == "/audit":
             self._send(200, audit_page())
@@ -949,7 +1122,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if (form.get("confirm") or [""])[0] != "yes":
             self._send(400, page("400", "<p>没有勾选确认, 未执行任何操作。</p>"))
             return
-        if not self.server.nonces.consume(nonce, self._sid(), snap, digest, "config"):
+        _m, fmt, digest_now, err = _snap_facts(cr, snap)
+        if err or not digest_now or not _ct_eq(digest_now, digest):
+            self._send(409, page("409", "<p class=bad>快照内容在确认之后发生了变化, 未执行任何"
+                                        "操作。请回到快照页重新确认。</p>"))
+            return
+        if not self.server.nonces.consume(nonce, self._sid(), snap, digest, OP_CONFIG, fmt):
             # 一次性票据: 刷新/双击/重放拿到的是这条, 而不是又跑一遍恢复
             self._send(409, page("409", "<p class=warn>这个确认已经用过或已失效(重复提交?)。"
                                         "请回到 <a href=/snapshots>快照列表</a> 重新确认。</p>"))
@@ -985,24 +1163,50 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not self._csrf_ok(form):
             self._send(403, page("403", "<p>表单已过期或来源不可信, 未执行任何操作。</p>"))
             return
-        cr = _cfgrestore()
         bg = _breakglass()
-        if cr is None or bg is None:
+        if bg is None:
             self._send(503, page("503", "<p class=bad>完整恢复模块不可用, 请用 SSH 处理。</p>"))
             return
+        # cfgrestore 可能正是上一次完整恢复换旧的那一个 —— 完整恢复不能因此做不了
+        api = _snap_api()
+        cr = _cfgrestore()
         snap = (form.get("snapshot") or [""])[0]
         digest = (form.get("digest") or [""])[0]
         nonce = (form.get("nonce") or [""])[0]
         typed = (form.get("confirm_text") or [""])[0].strip()
-        if snap not in cr.snapshot_ids():
+        acked = "yes" in (form.get("legacy_ack") or [])
+        if api is None or snap not in api.snapshot_ids():
             self._send(404, page("404", "<p>没有这份快照。</p>"))
             return
-        # 手工输入末 6 位: 让"点错了"和"真的要做"分开 —— 勾选框太容易顺手点过去
-        if not typed or not hmac.compare_digest(typed, snap[-6:]):
-            self._send(400, page("400", "<p>确认字符不正确, 未执行任何操作。"
-                                        "请手工输入快照 ID 的末 6 位。</p>"))
+        # 重新读盘: 确认页发出去之后, 快照文件可能被换过(定时任务/另一个会话/手工 scp)。
+        # 摘要、成员、结构版本任一变化都中止 —— 否则用户确认的是 A, 执行的是 B。
+        _members, fmt, digest_now, err = _snap_facts(api, snap)
+        if err:
+            self._send(409, page("409", "<p class=bad>快照现在读不出来(%s), 未执行任何操作。</p>"
+                                 % html.escape(err)))
             return
-        if not self.server.nonces.consume(nonce, self._sid(), snap, digest, "breakglass"):
+        if fmt not in ("v1.6", LEGACY_FMT):
+            self._send(400, page("400", "<p class=bad>快照结构无法识别(%s), 拒绝执行。</p>"
+                                 % html.escape(fmt)))
+            return
+        if not digest_now or not _ct_eq(digest_now, digest):
+            self._send(409, page("409", "<p class=bad>快照内容在确认之后发生了变化, 未执行任何"
+                                        "操作。请回到快照页重新确认。</p>"))
+            return
+        # 旧结构走更强的确认: 勾选 + 更长的固定格式。缺一不可, 且分别给出明确原因。
+        if fmt == LEGACY_FMT and not acked:
+            self._send(400, page("400", "<p>未勾选旧结构风险确认, 未执行任何操作。</p>"))
+            return
+        # 手工输入: 让"点错了"和"真的要做"分开 —— 勾选框太容易顺手点过去。
+        # 错误响应**不回显**用户输入, 也不回显期望值: 回显等于把确认字符从页面搬到了错误页,
+        # 而错误页是最容易被截图、被缓存、被转发的那一个。
+        if not typed or not _ct_eq(typed, _expected_confirm(snap, fmt)):
+            self._send(400, page("400", "<p>确认字符不正确, 未执行任何操作。"
+                                        "请返回确认页, 按页面上的提示重新输入。</p>"))
+            return
+        # 票据绑着 fmt: v1.6 的票用不到旧结构上, 反之亦然
+        if not self.server.nonces.consume(nonce, self._sid(), snap, digest,
+                                          OP_BREAKGLASS, fmt):
             self._send(409, page("409", "<p class=warn>这个确认已经用过或已失效(重复提交?)。"
                                         "请回到快照页重新确认。</p>"))
             return
@@ -1018,6 +1222,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         finally:
             self.server.recover_gate.release()
+            # 恢复很可能刚把 pdgtx.py / cfgrestore.py 换成了旧版。丢掉 import 缓存, 让**下一个
+            # 请求**按盘上现在那份重新判定能力 —— 放在结果算完之后, 本次恢复与它的审计不受影响。
+            _forget_business_modules()
         try:
             self._send(200, breakglass_result_page(res))
         except OSError:

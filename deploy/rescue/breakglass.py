@@ -17,24 +17,194 @@
 复原被覆盖的救援文件 → 补回救援端口放行 → 生成**受控的结构化结果** → 写唯一一条脱敏审计。
 """
 import fcntl
+import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, "/opt/pdg-bot")
-import pdgtx  # noqa: E402
 import rescue_const as C  # noqa: E402
 
 PDG_BIN = "/usr/local/bin/pdg"          # 固定绝对路径, 不查 PATH
 MAX_CAPTURE = 64 * 1024                 # 子进程输出上限: 只留末尾摘要, 不让它撑爆内存
 RESTORE_TIMEOUT = int(os.environ.get("PDG_BREAKGLASS_TIMEOUT", "1800"))
 MIN_FREE_MB = 200                       # 低于这个可用空间不开始(解包 + pre-rescue 快照要地方)
+FB_MAX_MEMBERS = 20000                  # 兜底读清单时的成员上限(与 cfgrestore 的硬上限同值)
+
+
+# ── 事务核心与配置恢复模块: 一律**软依赖** ──────────────────────────────────
+# pdgtx.py / cfgrestore.py **不在**救援保护清单里 —— 这是有意的: 它们属于业务恢复范围,
+# 完整恢复本来就该把它们换成快照里的版本。但这意味着一次完整恢复完全可能把它们换成旧版或
+# 损坏版, 而"再做一次完整恢复"恰恰是从那种状态里爬出来的唯一出路。
+# 顶层 `import pdgtx` 会让**本模块整个导不进来**, 于是最后那扇门也锁上了。所以: 用到时软取,
+# 取不到就用自带兜底 —— 兜底只覆盖 break-glass 真正需要的那几件事, 且校验强度不打折。
+_TX_API = ("FSROOT", "LOCKFILE", "AUDIT", "_sha", "redact", "audit_event", "pending_recovery")
+_SNAP_API = ("snapshot_ids", "snapshot_path", "snapshot_digest", "list_members", "snap_format")
+
+
+class Busy(Exception):
+    """已有配置操作正在执行。本地定义 —— 不能依赖 pdgtx 还在(它可能正是坏掉的那个)。"""
+
+
+def _tx():
+    """事务核心: 可用且**接口齐全**才返回。旧版本 import 得进来但少函数, 直接调用的下场是
+    AttributeError 冒到 HTTP 层变成 500 堆栈 —— 而用户此刻最需要的是一个能打开的页面。"""
+    try:
+        import pdgtx
+    except Exception:  # noqa: BLE001
+        return None
+    return pdgtx if all(hasattr(pdgtx, n) for n in _TX_API) else None
+
+
+def _fsroot():
+    tx = _tx()
+    return tx.FSROOT if tx is not None else os.environ.get("PDG_TX_FSROOT", "")
+
+
+def _lockfile():
+    tx = _tx()
+    if tx is not None:
+        return tx.LOCKFILE
+    return os.environ.get("PDG_LOCKFILE", _fsroot() + "/run/privdns-gateway.lock")
+
+
+def _audit_file():
+    tx = _tx()
+    if tx is not None:
+        return tx.AUDIT
+    root = os.environ.get("PDG_TX_ROOT", _fsroot() + "/var/lib/privdns-gateway/tx")
+    return os.path.join(root, "index.jsonl")
+
+
+_REDACT_FALLBACK = ((r"\b\d{8,10}:[A-Za-z0-9_-]{30,}\b", "<token>"),
+                    (r"\b[0-9a-fA-F]{32,}\b", "<hex>"),
+                    (r"(?i)(password|secret|token|uuid|psk)\s*[:=]\s*\S+", r"\1=<redacted>"))
+
+
+def _redact(s):
+    """脱敏。事务核心不可用时用本地兜底 —— 宁可粗一点, 也不让凭据进结果页与审计。"""
+    tx = _tx()
+    if tx is not None:
+        try:
+            return tx.redact(s)
+        except Exception:  # noqa: BLE001
+            pass
+    out = str(s)
+    for rex, rep in _REDACT_FALLBACK:
+        out = re.sub(rex, rep, out)
+    return out
+
+
+def _sha(data):
+    tx = _tx()
+    if tx is not None:
+        try:
+            return tx._sha(data)
+        except Exception:  # noqa: BLE001
+            pass
+    return hashlib.sha256(data).hexdigest()
+
+
+_SNAP_ID_RE = re.compile(r"^[0-9]{8}-[0-9]{6}$")        # pdg snapshot 的 %Y%m%d-%H%M%S
+
+
+class _SnapFallback:
+    """cfgrestore 不可用时的最小快照读取实现。
+
+    只做 break-glass 真正需要的五件事, 而且**校验强度与 cfgrestore 完全一致**: 同一套 ID 正则、
+    同样的 realpath / 软链 / 越界检查。降级路径比正常路径松, 等于给攻击者留了一条"先把
+    cfgrestore 弄坏再走兜底"的路 —— 那比没有兜底更糟。"""
+
+    def _dir(self):
+        return os.environ.get("PDG_SNAP_DIR", _fsroot() + "/var/lib/privdns-gateway/backups")
+
+    def snapshot_ids(self):
+        d = self._dir()
+        try:
+            names = sorted(os.listdir(d), reverse=True)
+        except OSError:
+            return []
+        return [n for n in names
+                if _SNAP_ID_RE.match(n) and os.path.isfile(os.path.join(d, n, "snap.tar.gz"))]
+
+    def snapshot_path(self, snap_id):
+        if not _SNAP_ID_RE.match(snap_id or "") or snap_id not in self.snapshot_ids():
+            return None
+        d = self._dir()
+        p = os.path.join(d, snap_id, "snap.tar.gz")
+        real = os.path.realpath(p)
+        if os.path.realpath(d) != os.path.dirname(os.path.dirname(real)):
+            return None
+        if os.path.islink(p) or not os.path.isfile(real):
+            return None
+        return real
+
+    def snapshot_digest(self, snap_id):
+        p = self.snapshot_path(snap_id)
+        if not p:
+            return ""
+        h = hashlib.sha256()
+        try:
+            with open(p, "rb") as f:
+                for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                    h.update(chunk)
+        except OSError:
+            return ""
+        return h.hexdigest()
+
+    def list_members(self, snap_id):
+        p = self.snapshot_path(snap_id)
+        if not p:
+            return [], "快照不存在或不可用"
+        try:
+            with tarfile.open(p, "r:gz") as tar:
+                names, n = [], 0
+                while True:
+                    m = tar.next()
+                    if m is None:
+                        break
+                    n += 1
+                    if n > FB_MAX_MEMBERS:
+                        return [], "快照成员过多(>%d), 拒绝处理" % FB_MAX_MEMBERS
+                    if m.isfile():
+                        names.append(m.name)
+            return names, ""
+        except (tarfile.TarError, OSError) as e:
+            return [], "快照读取失败(%s)" % type(e).__name__
+
+    def snap_format(self, members):
+        has = set(members)
+        if any(n.startswith("etc/mihomo/") for n in has) or "etc/sing-box/config.json" in has:
+            return "v1.6"
+        if any(n.startswith("etc/dnsdist/") for n in has):
+            return "legacy-dnsdist"
+        return "unknown"
+
+
+def snap_api(cr=None):
+    """快照读取接口: 有**接口齐全**的 cfgrestore 就用它, 否则用自带兜底。
+
+    单一决策点 —— 让"cfgrestore 到底能不能用"只判一次, 免得各调用点各判一套, 有的走兜底
+    有的直接 AttributeError。"""
+    for cand in (cr, _import_cfgrestore()):
+        if cand is not None and all(hasattr(cand, n) for n in _SNAP_API):
+            return cand
+    return _SnapFallback()
+
+
+def _import_cfgrestore():
+    try:
+        import cfgrestore
+        return cfgrestore
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _protected_members():
@@ -45,7 +215,7 @@ def _protected_members():
 
 def _protected_paths():
     """受保护成员 → 本机绝对路径(跟随沙箱根)。仅用于**校验**"它们确实没被动过"。"""
-    root = pdgtx.FSROOT
+    root = _fsroot()
     return tuple(os.path.join(root, m) for m in _protected_members())
 
 
@@ -61,7 +231,7 @@ class _Witness:
         for p in paths:
             try:
                 with open(p, "rb") as f:
-                    self.marks[p] = pdgtx._sha(f.read())
+                    self.marks[p] = _sha(f.read())
             except OSError:
                 self.marks[p] = None            # 当时就不存在
 
@@ -70,7 +240,7 @@ class _Witness:
         for p, want in self.marks.items():
             try:
                 with open(p, "rb") as f:
-                    cur = pdgtx._sha(f.read())
+                    cur = _sha(f.read())
             except OSError:
                 cur = None
             if cur != want:
@@ -83,7 +253,7 @@ class _Witness:
 def _tail(text, n=2000):
     """只留末尾摘要并脱敏 —— 子进程输出既可能很大, 也可能带着配置片段。"""
     t = (text or "")[-n:]
-    return pdgtx.redact(t)
+    return _redact(t)
 
 
 def _free_mb(path):
@@ -165,7 +335,7 @@ class _GlobalLock:
         self.f = None
 
     def __enter__(self):
-        path = pdgtx.LOCKFILE
+        path = _lockfile()
         os.makedirs(os.path.dirname(path) or "/", exist_ok=True)
         self.f = open(path, "w")
         try:
@@ -173,7 +343,7 @@ class _GlobalLock:
         except OSError:
             self.f.close()
             self.f = None
-            raise pdgtx.TxBusy("已有配置操作正在执行")
+            raise Busy("已有配置操作正在执行")
         return self
 
     def __exit__(self, *exc):
@@ -202,9 +372,7 @@ def _snapshot_ids(cr):
 
 def run(snapshot_id, *, expect_digest="", trigger_source="rescue", cfgrestore=None):
     """执行一次紧急完整恢复。返回受控结构化结果(不抛异常给 HTTP 层)。"""
-    cr = cfgrestore
-    if cr is None:
-        import cfgrestore as cr  # noqa: F811
+    cr = snap_api(cfgrestore)
     t0 = time.time()
     res = _result(snapshot_id)
     if snapshot_id not in _snapshot_ids(cr):
@@ -214,7 +382,7 @@ def run(snapshot_id, *, expect_digest="", trigger_source="rescue", cfgrestore=No
     try:
         lock = _GlobalLock()
         lock.__enter__()
-    except pdgtx.TxBusy:
+    except Busy:
         res.update(final_state="BUSY", error_class="BUSY", detail="已有配置操作正在执行")
         return res
     try:
@@ -246,8 +414,11 @@ def run(snapshot_id, *, expect_digest="", trigger_source="rescue", cfgrestore=No
             res.update(final_state="REFUSED", error_class="UNKNOWN_FORMAT",
                        detail="快照结构无法识别(%s), 拒绝执行" % fmt)
             return res
+        _t = _tx()
         try:
-            pend = pdgtx.pending_recovery()
+            pend = _t.pending_recovery() if _t is not None else []
+            if _t is None:
+                res["audit_warning"] = "事务核心不可用, 未能确认是否有未完成事务"
         except Exception:  # noqa: BLE001
             pend = []
             res["audit_warning"] = "读不到事务目录, 未能确认是否有未完成事务"
@@ -255,7 +426,7 @@ def run(snapshot_id, *, expect_digest="", trigger_source="rescue", cfgrestore=No
             res.update(final_state="REFUSED", error_class="PENDING_TX",
                        detail="有 %d 笔未完成的配置事务, 请先逐笔处理" % len(pend))
             return res
-        if _free_mb(pdgtx.FSROOT + "/var/lib") < MIN_FREE_MB:
+        if _free_mb(_fsroot() + "/var/lib") < MIN_FREE_MB:
             res.update(final_state="REFUSED", error_class="NO_SPACE",
                        detail="可用磁盘不足 %d MB, 拒绝执行" % MIN_FREE_MB)
             return res
@@ -357,15 +528,37 @@ def _svc_state(unit):
 
 
 def _audit(res, t0, trigger_source):
-    """唯一一条审计, 走 5.1 的受控入口(原子写 + 轮转 + 脱敏)。只记标量与计数。"""
-    pdgtx.audit_event(
-        "rescue", "full_breakglass_restore", res.get("final_state") or "UNKNOWN",
-        {"event": "full_breakglass_restore", "trigger_source": trigger_source,
-         "snapshot": res.get("snapshot_id", ""),
-         "pre_rescue_snapshot": res.get("pre_rescue_snapshot_id", ""),
-         "started_at": t0, "ended_at": time.time(),
-         "restored_count": len(res.get("restored") or []),
-         "failed_count": len(res.get("failed") or []),
-         "protected_count": len(res.get("protected") or []),
-         "error_class": res.get("error_class", ""),
-         "audit_warning": res.get("audit_warning", "")})
+    """唯一一条审计, 优先走 5.1 的受控入口(原子写 + 轮转 + 脱敏)。只记标量与计数。
+
+    事务核心不可用时**照写不误**: 这条审计恰恰是"刚刚把 pdgtx 换成了旧版"这件事的唯一记录,
+    因为它没了就不写, 等于让最需要留痕的那一次操作变成无声无息。"""
+    state = res.get("final_state") or "UNKNOWN"
+    extra = {"event": "full_breakglass_restore", "trigger_source": trigger_source,
+             "snapshot": res.get("snapshot_id", ""),
+             "pre_rescue_snapshot": res.get("pre_rescue_snapshot_id", ""),
+             "started_at": t0, "ended_at": time.time(),
+             "restored_count": len(res.get("restored") or []),
+             "failed_count": len(res.get("failed") or []),
+             "protected_count": len(res.get("protected") or []),
+             "error_class": res.get("error_class", ""),
+             "audit_warning": res.get("audit_warning", "")}
+    tx = _tx()
+    if tx is not None:
+        tx.audit_event("rescue", "full_breakglass_restore", state, extra)
+        return
+    _audit_fallback(state, extra)
+
+
+def _audit_fallback(state, extra):
+    """事务核心不在时的审计兜底: 键名与 pdgtx.audit_event 同构(读取端只有一套解析),
+    值一律过本地脱敏并截断。没有轮转 —— 降级路径追加一行, 不去碰别人的轮转逻辑。"""
+    rec = {"ts": time.time(), "txid": None, "source": "rescue",
+           "op": "full_breakglass_restore", "mode": "hotpath", "state": state,
+           "targets": [], "services": [], "error": "", "error_class": "",
+           "rollback_complete": None, "warnings": [], "degraded_audit": True}
+    for k, v in sorted(extra.items()):
+        rec[k] = v if isinstance(v, (int, float, bool)) or v is None else _redact(str(v))[:120]
+    path = _audit_file()
+    os.makedirs(os.path.dirname(path) or "/", exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False, sort_keys=True) + "\n")

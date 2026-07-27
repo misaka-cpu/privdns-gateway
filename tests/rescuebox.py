@@ -47,11 +47,34 @@ def _reap_all():
 atexit.register(_reap_all)
 
 
+PDG_BOT_MODULES = ("pdgtx.py", "cfgrestore.py", "rescue_const.py", "rescue_nft.py")
+RESCUE_MODULES = ("rescue.py", "rescue_cred.py", "breakglass.py")
+
+
+def make_install(work, override=None, name="optpdgbot"):
+    """造一个"装好的" /opt/pdg-bot 目录: 救援平面 + 事务核心 + 配置恢复模块并排放着。
+
+    override 里给的内容会**覆盖**对应文件 —— 这正是真机上一次完整恢复之后的样子: 救援平面
+    在保护清单里没被动, 而 pdgtx.py / cfgrestore.py 属于业务恢复范围, 已经换成快照里那份
+    (可能是旧版, 可能压根跑不起来)。
+    """
+    d = tempfile.mkdtemp(prefix=name + ".", dir=work)
+    for f in PDG_BOT_MODULES:
+        shutil.copy2(os.path.join(ROOT, "deploy/bot", f), os.path.join(d, f))
+    for f in RESCUE_MODULES:
+        shutil.copy2(os.path.join(ROOT, "deploy/rescue", f), os.path.join(d, f))
+    shutil.copy2(os.path.join(ROOT, "lib/rescue.sh"), os.path.join(d, "rescue.sh"))
+    for fname, body in (override or {}).items():
+        with open(os.path.join(d, fname), "w", encoding="utf-8") as f:
+            f.write(body)
+    return d
+
+
 class Inst:
     """一个跑起来的救援服务实例(绑 127.0.0.1, 端口临时分配)。"""
 
     def __init__(self, work, token=TOKEN, cert=True, cidr="127.0.0.0/8",
-                 with_pdgtx=True, port=None, extra_env=None):
+                 with_pdgtx=True, port=None, extra_env=None, install_dir=None):
         self.work = work
         self.port = port or free_port()
         self.dir = tempfile.mkdtemp(prefix="inst.", dir=work)
@@ -74,6 +97,9 @@ class Inst:
                 f.write(token + "\n")
         self.token = token
         self.with_pdgtx = with_pdgtx
+        # 从某个"装好的 /opt/pdg-bot"目录起服务(见 make_install)。用来模拟真机: 完整恢复
+        # 之后盘上的 pdgtx.py / cfgrestore.py 可能已经是旧版或坏版, 而救援平面自己没被动。
+        self.install_dir = install_dir
         self.extra_env = dict(extra_env or {})     # 事务沙箱路径等, 由用例注入
         self.proc = None
         self.err = ""
@@ -95,7 +121,9 @@ class Inst:
     def start(self, wait=8.0):
         env = self.env()
         script = RESCUE
-        if not self.with_pdgtx:
+        if self.install_dir:
+            script = os.path.join(self.install_dir, "rescue.py")
+        elif not self.with_pdgtx:
             # 造一个"只有救援服务本体, 没有事务核心"的安装目录 —— 真机上 pdgtx.py 丢失/损坏
             # 就是这个样子。rescue_const 与它并排放着, 所以不会回落到仓库的 deploy/bot
             # (那里有 pdgtx, 一回落场景就没了)。

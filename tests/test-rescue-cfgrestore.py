@@ -515,11 +515,20 @@ if _m and "breakglass" not in _m.group(0) and "rollback" not in _m.group(0):
     ok("配置恢复的 HTTP 处理器里没有任何通往完整恢复的分支")
 else:
     bad("配置恢复处理器引用了完整恢复")
-# 完整恢复只能由**用户显式访问那个页面**触发: 它有自己的路由与票据
-if "/breakglass/restore" in rs_src and 'consume(nonce, self._sid(), snap, digest, "breakglass")' in rs_src:
-    ok("完整恢复是独立路由 + 独立一次性票据(与配置恢复不共用)")
+# 完整恢复只能由**用户显式访问那个页面**触发: 它有自己的路由与票据。
+# 票据的操作维度已提成常量(OP_CONFIG / OP_BREAKGLASS), 所以这里查的是"两个处理器各用各的
+# 常量、且两个常量不同值" —— 比原来匹配一句字面量更难被无意改坏。
+_bg_h = re.search(r"def _post_breakglass\(self\):.*?(?=\n    def )", rs_src, re.S)
+_cfg_h = re.search(r"def _post_cfg_restore\(self\):.*?(?=\n    def )", rs_src, re.S)
+_ops = dict(re.findall(r'^(OP_[A-Z]+) = "([^"]+)"', rs_src, re.M))
+if ("/breakglass/restore" in rs_src
+        and _bg_h and "OP_BREAKGLASS" in _bg_h.group(0) and "OP_CONFIG" not in _bg_h.group(0)
+        and _cfg_h and "OP_CONFIG" in _cfg_h.group(0) and "OP_BREAKGLASS" not in _cfg_h.group(0)
+        and _ops.get("OP_BREAKGLASS") and _ops.get("OP_CONFIG")
+        and _ops["OP_BREAKGLASS"] != _ops["OP_CONFIG"]):
+    ok("完整恢复是独立路由 + 独立一次性票据(两个处理器各用各的 op 常量, 取值不同)")
 else:
-    bad("完整恢复没有独立票据")
+    bad("完整恢复没有独立票据(bg=%s cfg=%s ops=%s)" % (bool(_bg_h), bool(_cfg_h), _ops))
 
 shutil.rmtree(work, ignore_errors=True)
 print("─" * 40)
