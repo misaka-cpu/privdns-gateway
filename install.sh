@@ -638,10 +638,38 @@ grep -q "^PDG_INTERNAL_CIDR=$INTERNAL_CIDR$" /etc/privdns-gateway/profile.env \
   || die "profile.env 未写入预期的 PDG_INTERNAL_CIDR"
 printf '%s\n' "$PLATFORM" > /etc/privdns-gateway/platform
 
+# 救援平面的端口/路径常量来自 lib/rescue.sh(单一事实源, 不在这里另写字面量)。
+# shellcheck source=lib/rescue.sh
+source "$REPO_DIR/lib/rescue.sh"
+# 绑定地址: **必须**是本机上落在内网卡段内的那个地址。绝不用 0.0.0.0/:: —— 救援入口开到公网
+# 上就是把恢复按钮交给任何人。找不到就让它空着, 由 preflight 拒绝启动并说明原因。
+RESCUE_BIND="$(python3 - "$INTERNAL_CIDR" <<'PYBIND'
+import ipaddress, socket, subprocess, sys
+try:
+    net = ipaddress.ip_network(sys.argv[1], strict=False)
+except Exception:
+    sys.exit(0)
+out = subprocess.run(["ip", "-4", "-o", "addr", "show"], capture_output=True, text=True).stdout
+for line in out.splitlines():
+    parts = line.split()
+    for i, tok in enumerate(parts):
+        if tok == "inet" and i + 1 < len(parts):
+            try:
+                ip = ipaddress.ip_address(parts[i + 1].split("/")[0])
+            except ValueError:
+                continue
+            if ip in net:
+                print(ip); sys.exit(0)
+PYBIND
+)"
+[[ -n "$RESCUE_BIND" ]] || c_y "没找到落在 $INTERNAL_CIDR 内的本机地址 —— 救援平面装上但暂不可用, 内网卡就绪后跑 sudo pdg rescue enable。"
+
 render(){ sed -e "s|__SERVER_IP__|$SERVER_IP|g" -e "s|__INTERNAL_CIDR__|$INTERNAL_CIDR|g" \
               -e "s|__CERT_DIR__|$CERT_DIR|g"   -e "s|__SSH_PORT__|$SSH_PORT|g" \
               -e "s|__MOSDNS_CACHE__|$MOSDNS_CACHE|g" -e "s|__JOURNALD_MAXUSE__|$JOURNALD_MAXUSE|g" \
-              -e "s|__HIJACK_SET_FILE__|$HIJACK_SET_FILE|g" "$1"; }
+              -e "s|__HIJACK_SET_FILE__|$HIJACK_SET_FILE|g" \
+              -e "s|__RESCUE_PORT__|$PDG_RESCUE_PORT|g" \
+              -e "s|__RESCUE_BIND__|$RESCUE_BIND|g" "$1"; }
 
 render "$REPO_DIR/deploy/mosdns/config.yaml"          > /etc/mosdns/config.yaml
 # 模板自带 gfw 那道劫持门; all 模式要去掉它 —— all 的语义是"不是国内就劫持"(排除式),
@@ -784,6 +812,28 @@ systemctl enable --now mosdns "$CORE_SVC" >/dev/null 2>&1 || true
 # pdg-probe81 / pdg-mitm 仅 iOS: Android 不启 :81 探测、不起 MITM 服务。
 [[ "$PLATFORM" == ios ]] && { systemctl enable --now pdg-probe81 >/dev/null 2>&1 || true
                              systemctl enable --now pdg-mitm >/dev/null 2>&1 || true; }
+# ── 救援平面: 凭据 + unit + 默认启用 ──────────────────────────────────────
+# 默认启用是已拍板的方案(T5): 它存在的意义就是"别的都不通时还能进去", 而需要它的那一刻
+# 用户往往已经进不去 SSH 了 —— 那时候再让他去开是开不了的。
+install -d -m700 "$PDG_RESCUE_DIR"
+# ensure: 缺什么补什么, **已有的一律不动** —— 更新时绝不重生成 token 或证书。
+if python3 /opt/pdg-bot/rescue_cred.py ensure "${RESCUE_BIND:-}" >/dev/null 2>&1; then
+  c_g "救援平面凭据就绪(token + 自签证书)。"
+else
+  c_y "救援平面凭据生成失败 —— 服务暂不可用, 修好后跑 sudo pdg rescue enable。"
+fi
+# unit 用模板渲染(端口/绑定地址来自 lib/rescue.sh 与上面探到的内网地址)
+render "$REPO_DIR/deploy/rescue/pdg-rescue.socket"  > /etc/systemd/system/pdg-rescue.socket
+render "$REPO_DIR/deploy/rescue/pdg-rescue.service" > /etc/systemd/system/pdg-rescue.service
+chmod 644 /etc/systemd/system/pdg-rescue.socket /etc/systemd/system/pdg-rescue.service
+systemctl daemon-reload
+if [[ -n "$RESCUE_BIND" ]]; then
+  systemctl enable --now pdg-rescue.socket >/dev/null 2>&1 \
+    && c_g "救援平面已启用: https://$RESCUE_BIND:$PDG_RESCUE_PORT/(仅内网卡可达)" \
+    || c_y "救援平面 socket 起不来, 装完可用 sudo pdg rescue status 查。"
+else
+  systemctl enable pdg-rescue.socket >/dev/null 2>&1 || true   # 开机自启, 现在还没地址可绑
+fi
 systemctl enable --now pdg-rules-update.timer >/dev/null 2>&1 || true
 systemctl enable --now pdg-health.timer >/dev/null 2>&1 || true
 if [[ -n "$BOT_TOKEN" && -n "$ALLOWED_IDS" ]]; then

@@ -250,6 +250,9 @@ jobs:
       - name: "clean-root 安装产物自足 (移出仓库/隔离解释器/无源码兜底)"
         run: python3 tests/test-clean-root.py
 
+      - name: "救援平面生命周期 (只绑内网/放行幂等且受源约束/停用不被升级开回/卸载无残留)"
+        run: bash tests/test-rescue-lifecycle.sh
+
       - name: "迁移时机 (普通命令不暗中迁移; migrate 先锁先快照)"
         run: bash tests/test-migration-timing.sh
 

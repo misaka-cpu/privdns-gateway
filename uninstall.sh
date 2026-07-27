@@ -30,6 +30,11 @@ else
   echo "警告: 找不到 lib/singbox.sh, 无法判定 sing-box 归属 → 一律保留(不删)。"
 fi
 
+# 救援平面: socket + service 一起停用并删掉。它是最后一道门, 但既然是卸载, 门本身也要带走
+# —— 留一个监听在内网上的 HTTPS 服务、外加一条救援端口放行, 比不卸载更糟。
+systemctl disable --now pdg-rescue.socket pdg-rescue.service 2>/dev/null || true
+systemctl reset-failed pdg-rescue.socket pdg-rescue.service 2>/dev/null || true
+rm -f /etc/systemd/system/pdg-rescue.socket /etc/systemd/system/pdg-rescue.service
 systemctl disable --now pdg-bot pdg-probe81 mosdns mihomo pdg-mitm pdg-rules-update.timer pdg-health.timer 2>/dev/null || true
 [[ "$SB_OWNED" == 1 ]] && systemctl disable --now sing-box 2>/dev/null || true
 rm -f /etc/systemd/system/{pdg-bot,pdg-probe81,mosdns,mihomo,pdg-mitm,pdg-rules-update,pdg-health}.service \

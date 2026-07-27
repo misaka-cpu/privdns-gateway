@@ -1496,6 +1496,31 @@ migrate_deploy_botfiles(){
   done
 }
 
+# 老机首次获得救援平面: 装 unit + 备好凭据, 并按"默认启用"拍板方案开起来。
+# **但用户主动停用过就不许开回来** —— 升级把用户关掉的东西又打开, 是最招人恨的一类行为。
+# 幂等: 已经装好且没被停用的机器上, 这里什么都不做。
+migrate_rescue_plane(){
+  _rescue_load 2>/dev/null || return 0
+  [[ -f /opt/pdg-bot/rescue.py ]] || return 0        # 运行模块还没装到位(10a-1 负责), 下轮再说
+  if [[ -e "$(_rescue_optout)" ]]; then
+    return 0                                         # 用户明确关过 —— 尊重它, 一个字都不改
+  fi
+  local bind; bind="$(_rescue_bind_addr || true)"
+  if [[ -z "$bind" ]]; then
+    _rescue_socket_present || c_y "  救援平面: 内网卡段内没有本机地址, 暂不启用(pdg rescue enable 可重试)。"
+    return 0
+  fi
+  # 已装且已启用 → 幂等退出(不重生成凭据、不重启)
+  if _rescue_socket_present && systemctl is-enabled "$PDG_RESCUE_SOCKET_UNIT" >/dev/null 2>&1; then
+    return 0
+  fi
+  c_g "  首次启用救援平面(默认开; 之后可 pdg rescue disable)…"
+  _rescue_enable >/dev/null 2>&1 \
+    && c_g "  ✅ 救援平面已启用: https://$bind:$PDG_RESCUE_PORT/" \
+    || c_y "  救援平面启用失败, 现网未受影响; 可跑 sudo pdg rescue status 查。"
+  return 0
+}
+
 # 统一平台判定源: 确保 /etc/privdns-gateway/platform 存在且合法(canonical)。幂等。
 # 缺失/非法时按证据回退: profile.env 的 PDG_PLATFORM → 明确 iOS 证据(pdg-mitm unit / WLOC 配置) → android。
 # 仍无法确定=android, 但 status/doctor 会另行提示"标记缺失回退"(见 _pdg_platform_present / check_platform)。
@@ -2041,6 +2066,7 @@ migrate_cidr_single_source(){
 run_all_migrations(){
   local rc=0
   migrate_platform_marker || true          # 先统一平台判定源(后续平台相关迁移据此走)
+  migrate_rescue_plane || true             # 老机首次获得救援平面(用户停用过则不动)
   migrate_backend_marker || true           # 再把内核标记落地(别再靠默认值兜底)
   migrate_cidr_single_source || true       # 先立真源: 后续 nft/mosdns/救援都从它读
   migrate_botenv || true; migrate_firewall_to_pdg || true; migrate_mosdns_concurrent || true
@@ -2398,6 +2424,182 @@ _plat_verify(){
 # 切平台: 全局锁 + 快照 + 就地备份, 任一步失败恢复原平台与原配置并返回非 0。
 # 以前这里只写个标记就 run_all_migrations 并恒返回 0: Android→iOS 缺 probe81/描述文件模板,
 # iOS→Android 的 nft 里 GMS 5228-5230 回不来、mihomo 配置里 MITM-OUT 还留着, 而命令还说"已确认"。
+UNIT_DIR="${PDG_UNIT_DIR:-/etc/systemd/system}"
+
+_rescue_write_units(){
+  local bind="$1" src="$REPO_DIR/deploy/rescue"
+  [[ -d "$src" ]] || src=/opt/pdg-bot        # 仓库不在时用装好的那份(10a-1 已装 rescue.py 等)
+  [[ -f "$src/pdg-rescue.socket" ]] || return 1
+  sed -e "s|__RESCUE_BIND__|$bind|g" -e "s|__RESCUE_PORT__|$PDG_RESCUE_PORT|g" \
+      "$src/pdg-rescue.socket" > "$UNIT_DIR/$PDG_RESCUE_SOCKET_UNIT" || return 1
+  sed -e "s|__RESCUE_BIND__|$bind|g" -e "s|__RESCUE_PORT__|$PDG_RESCUE_PORT|g" \
+      "$src/pdg-rescue.service" > "$UNIT_DIR/$PDG_RESCUE_SERVICE_UNIT" || return 1
+  chmod 644 "$UNIT_DIR/$PDG_RESCUE_SOCKET_UNIT" "$UNIT_DIR/$PDG_RESCUE_SERVICE_UNIT"
+}
+
+# 运行中的规则里有没有救援端口的放行(只认**带内网来源约束**的那条)
+_rescue_nft_has(){
+  local cidr; cidr="$(pdg_internal_cidr 2>/dev/null || true)"
+  [[ -n "$cidr" ]] || return 1
+  nft list chain inet pdg input 2>/dev/null \
+    | grep -qE "ip saddr ${cidr//./\\.}.*dport.*\b$PDG_RESCUE_PORT\b"
+}
+
+# 放行: 只改 /etc/nftables.conf 里**本项目管理区**的那一行, 候选先过 nft -c 再应用。
+# 幂等 —— 已经有了就什么都不做, 于是重复 enable 不会堆出第二条规则。
+_rescue_nft_open(){
+  local cidr cand; cidr="$(pdg_internal_cidr 2>/dev/null || true)"
+  [[ -n "$cidr" ]] || return 1
+  grep -qE "ip saddr .*dport $PDG_RESCUE_PORT accept" /etc/nftables.conf 2>/dev/null && {
+    nft -f /etc/nftables.conf >/dev/null 2>&1 || true; return 0; }
+  cand="$(_pdg_mktemp_dir)/nft.cand" || return 1
+  python3 /opt/pdg-bot/rescue_nft.py "$cidr" "$PDG_RESCUE_PORT" \
+    < /etc/nftables.conf > "$cand" 2>/dev/null || return 1
+  nft -c -f "$cand" >/dev/null 2>&1 || return 1      # 候选先校验, 再动现网
+  cp -a /etc/nftables.conf /etc/nftables.conf.pdg-rescue-bak 2>/dev/null || true
+  mv -f "$cand" /etc/nftables.conf || return 1
+  nft -f /etc/nftables.conf >/dev/null 2>&1 || {
+    mv -f /etc/nftables.conf.pdg-rescue-bak /etc/nftables.conf 2>/dev/null
+    nft -f /etc/nftables.conf >/dev/null 2>&1; return 1; }
+  rm -f /etc/nftables.conf.pdg-rescue-bak
+  return 0
+}
+
+# 撤销: 删掉那一行再重新应用。disable/uninstall 之后不许还留着可用的入口。
+_rescue_nft_close(){
+  [[ -f /etc/nftables.conf ]] || return 0
+  grep -qE "dport $PDG_RESCUE_PORT accept" /etc/nftables.conf 2>/dev/null || return 0
+  local cand; cand="$(_pdg_mktemp_dir)/nft.cand" || return 1
+  grep -vE "ip saddr .*dport $PDG_RESCUE_PORT accept" /etc/nftables.conf > "$cand" || return 1
+  nft -c -f "$cand" >/dev/null 2>&1 || return 1
+  mv -f "$cand" /etc/nftables.conf || return 1
+  nft -f /etc/nftables.conf >/dev/null 2>&1 || return 1
+  return 0
+}
+
+# ── 救援平面的生命周期 ────────────────────────────────────────────────────
+# 只有 enable / disable / status / fingerprint / rotate-token / rotate-cert 六个动作 ——
+# 都是既有设计里就有的, 不自行加新命令。
+_rescue_load(){
+  # shellcheck source=lib/rescue.sh
+  source "$REPO_DIR/lib/rescue.sh" 2>/dev/null || source /opt/pdg-bot/rescue.sh 2>/dev/null \
+    || { echo "❌ 读不到救援常量(lib/rescue.sh)"; return 1; }
+}
+
+# 本机上落在内网卡段内的地址。找不到返回空 —— 绝不退回 0.0.0.0: 把恢复入口开到公网上,
+# 等于把"换默认出口""完整恢复"这些按钮交给任何人。
+_rescue_bind_addr(){
+  local cidr; cidr="$(pdg_internal_cidr 2>/dev/null || true)"
+  [[ -n "$cidr" ]] || return 1
+  python3 - "$cidr" <<'PYB'
+import ipaddress, subprocess, sys
+try:
+    net = ipaddress.ip_network(sys.argv[1], strict=False)
+except Exception:
+    sys.exit(1)
+out = subprocess.run(["ip", "-4", "-o", "addr", "show"], capture_output=True, text=True).stdout
+for line in out.splitlines():
+    parts = line.split()
+    for i, tok in enumerate(parts):
+        if tok == "inet" and i + 1 < len(parts):
+            try:
+                ip = ipaddress.ip_address(parts[i + 1].split("/")[0])
+            except ValueError:
+                continue
+            if ip in net:
+                print(ip); sys.exit(0)
+sys.exit(1)
+PYB
+}
+
+# 用户是否**主动**禁用过。存在这个标记 = 别再自作主张把它开回来(升级尤其不许)。
+_rescue_optout(){ echo "${PDG_RESCUE_DIR:-/etc/privdns-gateway/rescue}/disabled"; }
+
+_rescue_socket_present(){ [[ -f "$UNIT_DIR/$PDG_RESCUE_SOCKET_UNIT" ]]; }
+
+cmd_rescue(){
+  need_root rescue
+  _rescue_load || return 1
+  local act="${1:-status}"
+  case "$act" in
+    enable)   _rescue_enable;;
+    disable)  _rescue_disable;;
+    status)   _rescue_status;;
+    fingerprint) python3 /opt/pdg-bot/rescue_cred.py fingerprint;;
+    rotate-token) python3 /opt/pdg-bot/rescue_cred.py rotate-token;;
+    rotate-cert)  python3 /opt/pdg-bot/rescue_cred.py rotate-cert "$(_rescue_bind_addr || true)";;
+    *) echo "用法: pdg rescue <enable|disable|status|fingerprint|rotate-token|rotate-cert>"
+       return 1;;
+  esac
+}
+
+_rescue_enable(){
+  _lock
+  local bind; bind="$(_rescue_bind_addr || true)"
+  if [[ -z "$bind" ]]; then
+    echo "❌ 找不到落在内网卡段内的本机地址 —— 拒绝启用。"
+    echo "   救援入口只能绑内网地址; 绑 0.0.0.0 等于把恢复按钮开给公网。"
+    echo "   先确认内网卡就绪(pdg detect-cidr 可重新识别), 再重试。"
+    return 1
+  fi
+  # 回滚台账: 出错时把 unit / 启用状态 / 标记恢复回操作前
+  local had_sock=0 was_enabled=0 had_optout=0
+  _rescue_socket_present && had_sock=1
+  systemctl is-enabled "$PDG_RESCUE_SOCKET_UNIT" >/dev/null 2>&1 && was_enabled=1
+  [[ -e "$(_rescue_optout)" ]] && had_optout=1
+  _rescue_rollback(){
+    (( had_optout == 1 )) && : > "$(_rescue_optout)" || rm -f "$(_rescue_optout)" 2>/dev/null
+    (( was_enabled == 0 )) && systemctl disable --now "$PDG_RESCUE_SOCKET_UNIT" >/dev/null 2>&1
+    (( had_sock == 0 )) && rm -f "$UNIT_DIR/$PDG_RESCUE_SOCKET_UNIT" "$UNIT_DIR/$PDG_RESCUE_SERVICE_UNIT"
+    systemctl daemon-reload 2>/dev/null || true
+  }
+  python3 /opt/pdg-bot/rescue_cred.py ensure "$bind" >/dev/null 2>&1 \
+    || { echo "❌ 凭据准备失败, 未改动任何状态。"; return 1; }
+  _rescue_write_units "$bind" || { echo "❌ unit 渲染失败, 未启用。"; _rescue_rollback; return 1; }
+  systemctl daemon-reload || { echo "❌ daemon-reload 失败"; _rescue_rollback; return 1; }
+  _rescue_nft_open || { echo "❌ 防火墙放行失败(候选未通过 nft -c 或应用失败), 已回滚。"
+                        _rescue_rollback; return 1; }
+  if ! systemctl enable --now "$PDG_RESCUE_SOCKET_UNIT" >/dev/null 2>&1; then
+    echo "❌ socket 起不来, 回滚到操作前。"; _rescue_rollback; return 1
+  fi
+  rm -f "$(_rescue_optout)" 2>/dev/null          # 用户明确开了 → 清掉"我要关着"的标记
+  c_g "✅ 救援平面已启用: https://$bind:$PDG_RESCUE_PORT/(仅内网卡可达)"
+  echo "   证书指纹(首次访问请核对): $(python3 /opt/pdg-bot/rescue_cred.py fingerprint 2>/dev/null || echo '读取失败')"
+}
+
+_rescue_disable(){
+  _lock
+  systemctl disable --now "$PDG_RESCUE_SERVICE_UNIT" >/dev/null 2>&1
+  systemctl disable --now "$PDG_RESCUE_SOCKET_UNIT" >/dev/null 2>&1
+  systemctl reset-failed "$PDG_RESCUE_SOCKET_UNIT" "$PDG_RESCUE_SERVICE_UNIT" >/dev/null 2>&1
+  _rescue_nft_close || c_y "  防火墙放行没能撤掉, 请 pdg rescue status 复查。"
+  install -d -m700 "$PDG_RESCUE_DIR" 2>/dev/null
+  : > "$(_rescue_optout)"                        # 记住这是**用户的选择**: 升级不许把它开回来
+  chmod 600 "$(_rescue_optout)" 2>/dev/null
+  c_g "✅ 救援平面已停用(凭据保留; 再次 pdg rescue enable 即可恢复, 指纹不变)。"
+}
+
+_rescue_status(){
+  local bind sock svc fp
+  bind="$(_rescue_bind_addr || true)"
+  sock="$(systemctl is-active "$PDG_RESCUE_SOCKET_UNIT" 2>/dev/null || true)"
+  svc="$(systemctl is-active "$PDG_RESCUE_SERVICE_UNIT" 2>/dev/null || true)"
+  echo "== 救援平面 =="
+  printf "  %-14s %s\n" "socket unit"  "$(_rescue_socket_present && echo 已安装 || echo 缺失)"
+  printf "  %-14s %s\n" "socket 状态"  "${sock:-unknown} / $(systemctl is-enabled "$PDG_RESCUE_SOCKET_UNIT" 2>/dev/null || echo disabled)"
+  printf "  %-14s %s\n" "service 状态" "${svc:-inactive}"
+  printf "  %-14s %s\n" "监听地址"     "${bind:+https://$bind:$PDG_RESCUE_PORT/}${bind:-（内网卡段内无本机地址）}"
+  printf "  %-14s %s\n" "防火墙放行"   "$(_rescue_nft_has && echo "有(仅内网来源)" || echo 无)"
+  # 凭据只报"齐不齐"与指纹, **绝不打印 token 或私钥**
+  for f in "$PDG_RESCUE_TOKEN" "$PDG_RESCUE_CERT" "$PDG_RESCUE_KEY"; do
+    printf "  %-14s %s\n" "$(basename "$f")" "$([[ -s "$f" ]] && echo "在($(stat -c %a "$f" 2>/dev/null))" || echo 缺失)"
+  done
+  fp="$(python3 /opt/pdg-bot/rescue_cred.py fingerprint 2>/dev/null || true)"
+  printf "  %-14s %s\n" "证书指纹" "${fp:-读取失败}"
+  [[ -e "$(_rescue_optout)" ]] && echo "  ⚠️ 已被手动停用(升级不会自动开回来; pdg rescue enable 可再开)"
+  return 0
+}
+
 cmd_platform(){
   need_root platform
   local p="${1:-}" cur; cur="$(_pdg_platform)"
@@ -2699,5 +2901,6 @@ case "${1:-menu}" in
   platform)      shift || true; cmd_platform "${1:-}";;
   hijack-mode)   shift || true; cmd_hijack_mode "${1:-}";;
   uninstall|rm)  shift || true; cmd_uninstall "${1:-}";;
-  *) echo "用法: pdg [menu|status|doctor [--json|--deep]|update [--dry-run]|snapshot|rollback [n]|token|restart|log [n]|traffic|ios(仅 iOS)|report [--redact-ip|--full]|detect-cidr|platform <ios|android>|hijack-mode <all|gfw>|migrate|migrate-fw|tx <list|show|recover|abort>|uninstall [--purge]]";;
+  rescue)        cmd_rescue "$2";;
+  *) echo "用法: pdg [menu|status|doctor [--json|--deep]|update [--dry-run]|snapshot|rollback [n]|token|restart|log [n]|traffic|ios(仅 iOS)|report [--redact-ip|--full]|detect-cidr|platform <ios|android>|hijack-mode <all|gfw>|migrate|migrate-fw|tx <list|show|recover|abort>|rescue <enable|disable|status|fingerprint|rotate-token|rotate-cert>|uninstall [--purge]]";;
 esac
