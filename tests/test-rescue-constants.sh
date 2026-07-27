@@ -70,6 +70,28 @@ else
   printf '       %s\n' "${hits[@]:0:5}"
 fi
 
+# ── 4b. unit 模板必须用占位符, 不许写死端口/地址 ──
+_unit_bad=0
+for f in "$ROOT"/deploy/rescue/pdg-rescue.socket "$ROOT"/deploy/rescue/pdg-rescue.service; do
+  [[ -f "$f" ]] || { bad "缺少 unit 模板: $f"; _unit_bad=1; continue; }
+  grep -qE "\b$PORT\b" "$f" && { bad "unit 里写死了端口: $f"; _unit_bad=1; }
+done
+grep -q "__RESCUE_PORT__" "$ROOT/deploy/rescue/pdg-rescue.socket" \
+  || { bad "socket unit 没有 __RESCUE_PORT__ 占位符"; _unit_bad=1; }
+grep -q "__RESCUE_BIND__" "$ROOT/deploy/rescue/pdg-rescue.socket" \
+  || { bad "socket unit 没有 __RESCUE_BIND__ 占位符"; _unit_bad=1; }
+(( _unit_bad == 0 )) && ok "unit 模板用占位符注入端口/地址, 没有字面量"
+# 救援 unit 不许依赖会挂掉的东西(它存在的前提就是那些东西挂了)
+_dep_bad=0
+for w in "network-online.target" "mihomo.service" "mosdns.service" "pdg-bot.service" "tailscaled"; do
+  grep -E "^(After|Requires|Wants|BindsTo)=" "$ROOT/deploy/rescue/pdg-rescue.service" \
+    | grep -qF "$w" && { bad "救援 unit 依赖了 $w"; _dep_bad=1; }
+done
+(( _dep_bad == 0 )) && ok "救援 unit 不依赖 network-online / mihomo / mosdns / pdg-bot / tailscale"
+grep -q "^RestrictAddressFamilies=.*AF_NETLINK" "$ROOT/deploy/rescue/pdg-rescue.service" \
+  && ok "硬化放行 AF_NETLINK(否则恢复类操作调 nft 会被封死)" \
+  || bad "RestrictAddressFamilies 缺 AF_NETLINK"
+
 # ── 5. 路径常量齐全且形态合理 ──
 _bad_path=0
 for v in PDG_RESCUE_DIR PDG_RESCUE_CERT PDG_RESCUE_KEY PDG_RESCUE_TOKEN PDG_RESCUE_STATE PDG_PROFILE_ENV; do

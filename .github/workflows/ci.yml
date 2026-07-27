@@ -199,6 +199,9 @@ jobs:
       - name: "救援常量单一事实源 (端口/路径两侧一致, 全仓无字面量)"
         run: bash tests/test-rescue-constants.sh
 
+      - name: "救援平面只读骨架 (真起 HTTPS: 前提缺失拒启动/未认证 401/无外部资源/路径穿越)"
+        run: python3 tests/test-rescue-server.py
+
       - name: "迁移时机 (普通命令不暗中迁移; migrate 先锁先快照)"
         run: bash tests/test-migration-timing.sh
 

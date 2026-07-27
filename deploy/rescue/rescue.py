@@ -1,0 +1,524 @@
+#!/usr/bin/env python3
+"""PrivDNS Gateway 独立救援平面(5.2)—— 只读骨架。
+
+它存在的理由: mihomo 挂了、mosdns 挂了、Bot 连不上、公网出口不通、事务停在 APPLYING 的时候,
+手机端仍然要有一个能打开的页面看清"现在到底是什么状态"。所以这个服务:
+  · 只用 Python 标准库(没有 Flask/FastAPI/Node —— 为一个保命页引入依赖与它的目的自相矛盾);
+  · 不 import bot/checks 那些会去读 config.json 的模块(模型损坏正是它要面对的场景);
+  · unit 不依赖 mihomo/mosdns/pdg-bot/tailscaled, 也不等 network-online;
+  · 绑定**确认过的私网地址**, 不是 0.0.0.0 —— nft 本身可能就是坏的那一环。
+
+本提交只做只读: 状态总览 / 事务列表与详情 / 快照列表 / 脱敏审计尾部。写操作(recover、恢复
+快照、重启服务、紧急默认出口)在后续提交接入, 一律走 pdgtx 或既有受控接口。
+
+启动前提缺一不可 —— 任何一项不满足就**拒绝启动并说明原因**, 绝不降级成"先跑起来再说":
+  · 内网卡段真源(profile.env 的 PDG_INTERNAL_CIDR)可读, 且本机确实有一个落在段内的地址;
+  · 自签证书与私钥存在;
+  · 救援 Token 存在且非空。
+"""
+import html
+import hmac
+import http.server
+import json
+import os
+import re
+import secrets
+import socket
+import ssl
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, "/opt/pdg-bot")
+try:
+    import rescue_const as C
+except ImportError:                                   # 仓库内直跑(开发/测试)
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "bot"))
+    import rescue_const as C
+
+SESSION_TTL = int(os.environ.get("PDG_RESCUE_SESSION_TTL", "1800"))     # 30 分钟
+MAX_BODY = 8 * 1024                                    # 请求体上限: 救援页没有大表单
+AUDIT_TAIL = 30                                        # 审计只回最近这么多条
+
+
+# ── 事务核心: 有就用, 没有也要能开页面(它可能正是坏掉的那一个) ────────────────
+def _pdgtx():
+    try:
+        import pdgtx
+        return pdgtx
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _redact(s):
+    tx = _pdgtx()
+    if tx is not None:
+        try:
+            return tx.redact(s)
+        except Exception:  # noqa: BLE001
+            pass
+    # 事务核心不可用时的兜底脱敏 —— 宁可粗一点, 也不让凭据进页面
+    out = str(s)
+    for rex, rep in ((r"\b\d{8,10}:[A-Za-z0-9_-]{30,}\b", "<token>"),
+                     (r"\b[0-9a-fA-F]{32,}\b", "<hex>"),
+                     (r"(?i)(password|secret|token|uuid|psk)\s*[:=]\s*\S+", r"\1=<redacted>")):
+        out = re.sub(rex, rep, out)
+    return out
+
+
+def _run(cmd, timeout=5):
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           universal_newlines=True, timeout=timeout)
+        return p.returncode, (p.stdout or "").strip()
+    except (OSError, subprocess.SubprocessError):
+        return 127, ""
+
+
+# ── 启动前提 ────────────────────────────────────────────────────────────────
+class StartupRefused(Exception):
+    """前提不满足 —— 拒绝启动。猜一个监听地址/跳过认证, 都是把恢复入口开在错误的地方。"""
+
+
+def local_addr_in(cidr):
+    """本机落在该段内的第一个地址。找不到返回 None(调用方据此拒绝启动)。"""
+    import ipaddress
+    try:
+        net = ipaddress.ip_network(cidr, strict=False)
+    except Exception:  # noqa: BLE001
+        return None
+    _rc, out = _run(["ip", "-4", "-o", "addr"])
+    for a in re.findall(r"inet ([0-9.]+)/", out):
+        try:
+            if ipaddress.ip_address(a) in net:
+                return a
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+def preflight():
+    """返回 (bind_addr, port, cert, key, token)。任何一项不成立就抛 StartupRefused。"""
+    port = C.port()
+    paths = C.paths()
+    cidr = C.internal_cidr()
+    if not cidr:
+        raise StartupRefused(
+            "读不到内网卡段真源(%s 的 PDG_INTERNAL_CIDR)。救援服务靠它决定监听地址, "
+            "绝不回落到 0.0.0.0 —— 那会把恢复入口暴露到公网。请先运行 sudo pdg detect-cidr。"
+            % paths["PDG_PROFILE_ENV"])
+    bind = os.environ.get("PDG_RESCUE_BIND") or local_addr_in(cidr)
+    if not bind:
+        raise StartupRefused(
+            "本机没有落在内网卡段 %s 内的地址, 无从确定监听地址(内网卡可能没起来)。" % cidr)
+    for k, what in (("PDG_RESCUE_CERT", "自签证书"), ("PDG_RESCUE_KEY", "私钥")):
+        if not os.path.isfile(paths[k]):
+            raise StartupRefused("%s 不存在(%s)。用 sudo pdg rescue rotate --cert 生成。"
+                                 % (what, paths[k]))
+    try:
+        with open(paths["PDG_RESCUE_TOKEN"], encoding="utf-8") as f:
+            token = f.read().strip()
+    except OSError as e:
+        raise StartupRefused("读不到救援 Token(%s: %s)。用 sudo pdg rescue rotate --token 生成。"
+                             % (paths["PDG_RESCUE_TOKEN"], type(e).__name__))
+    if len(token) < 16:
+        raise StartupRefused("救援 Token 太短或为空, 拒绝以弱凭据启动。")
+    return bind, port, paths["PDG_RESCUE_CERT"], paths["PDG_RESCUE_KEY"], token
+
+
+# ── 只读数据源(全部容忍失败: 它们坏掉正是我们要显示的信息)────────────────────
+UNITS = ("mosdns", "mihomo", "pdg-bot", "pdg-mitm", "pdg-probe81")
+
+
+def svc_states():
+    out = {}
+    for u in UNITS:
+        rc, s = _run(["systemctl", "is-active", u])
+        out[u] = s or ("未知" if rc == 127 else "inactive")
+    return out
+
+
+def tx_overview():
+    tx = _pdgtx()
+    if tx is None:
+        return {"available": False, "pending": [], "recent": [], "leftover": []}
+    def _safe(fn, *a):
+        try:
+            return fn(*a)
+        except Exception:  # noqa: BLE001
+            return []
+    return {"available": True,
+            "pending": _safe(tx.pending_recovery),
+            "recent": _safe(tx.list_tx, None, 10),
+            "leftover": _safe(tx.leftover_materials)}
+
+
+def snapshots():
+    d = "/var/lib/privdns-gateway/backups"
+    out = []
+    try:
+        names = sorted(os.listdir(d), reverse=True)
+    except OSError:
+        return out
+    for n in names:
+        f = os.path.join(d, n, "snap.tar.gz")
+        if os.path.isfile(f):
+            try:
+                st = os.stat(f)
+                out.append({"name": n, "size": st.st_size, "mtime": st.st_mtime})
+            except OSError:
+                continue
+    return out
+
+
+def audit_tail(n=AUDIT_TAIL):
+    tx = _pdgtx()
+    path = getattr(tx, "AUDIT", None) if tx else None
+    path = path or "/var/lib/privdns-gateway/tx/index.jsonl"
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.readlines()[-n:]
+    except OSError:
+        return []
+    out = []
+    for ln in lines:
+        try:
+            rec = json.loads(ln)
+        except ValueError:
+            continue
+        out.append({k: rec.get(k) for k in ("ts", "txid", "source", "op", "state", "error")})
+    return out
+
+
+def sysinfo():
+    info = {}
+    try:
+        st = os.statvfs("/")
+        info["disk_free_mb"] = st.f_bavail * st.f_frsize // (1024 * 1024)
+    except OSError:
+        info["disk_free_mb"] = None
+    try:
+        with open("/proc/uptime") as f:
+            info["uptime_h"] = round(float(f.read().split()[0]) / 3600, 1)
+    except OSError:
+        info["uptime_h"] = None
+    try:
+        with open("/proc/loadavg") as f:
+            info["load"] = f.read().split()[0]
+    except OSError:
+        info["load"] = None
+    info["cidr"] = C.internal_cidr() or "未写入"
+    return info
+
+
+# ── 会话(本提交只做最小可用: 随机 id + TTL; CSRF/限速在下一提交)──────────────
+class Sessions:
+    def __init__(self, ttl=SESSION_TTL):
+        self.ttl = ttl
+        self._s = {}
+
+    def new(self):
+        sid = secrets.token_urlsafe(24)
+        self._s[sid] = time.time() + self.ttl
+        return sid
+
+    def valid(self, sid):
+        if not sid:
+            return False
+        exp = self._s.get(sid)
+        if exp is None:
+            return False
+        if time.time() > exp:
+            self._s.pop(sid, None)
+            return False
+        return True
+
+    def drop(self, sid):
+        self._s.pop(sid, None)
+
+
+# ── 页面(纯文本 HTML: 无 JS、无外部字体/CDN/图片)──────────────────────────────
+CSS = """body{font:14px/1.5 system-ui,sans-serif;margin:0;padding:1rem;background:#111;color:#ddd}
+h1{font-size:1.1rem;margin:0 0 .8rem}h2{font-size:.95rem;margin:1.2rem 0 .4rem;color:#8bd}
+table{border-collapse:collapse;width:100%;margin:.3rem 0}td,th{padding:.25rem .4rem;
+border-bottom:1px solid #333;text-align:left;vertical-align:top;word-break:break-all}
+.ok{color:#7c7}.bad{color:#f77}.warn{color:#fc6}form{margin:1rem 0}
+input{padding:.4rem;width:100%;max-width:26rem;background:#222;color:#eee;border:1px solid #444}
+button{padding:.4rem .9rem;margin-top:.5rem;background:#345;color:#eee;border:1px solid #567}
+a{color:#8bd}.muted{color:#888;font-size:.85rem}"""
+
+
+def page(title, body):
+    return ("<!doctype html><html lang=zh><head><meta charset=utf-8>"
+            "<meta name=viewport content='width=device-width,initial-scale=1'>"
+            "<title>%s</title><style>%s</style></head><body>%s</body></html>"
+            % (html.escape(title), CSS, body)).encode("utf-8")
+
+
+def login_page(msg=""):
+    warn = "<p class=bad>%s</p>" % html.escape(msg) if msg else ""
+    return page("PDG 救援", "<h1>PrivDNS Gateway 救援平面</h1>%s"
+                "<form method=post action=/login>"
+                "<label>救援 Token<br><input type=password name=token autocomplete=off></label>"
+                "<br><button type=submit>进入</button></form>"
+                "<p class=muted>Token 由 <code>sudo pdg rescue url</code> 在本机显示。"
+                "页面不加载任何外部资源。</p>" % warn)
+
+
+def _row(k, v, cls=""):
+    return "<tr><th>%s</th><td class='%s'>%s</td></tr>" % (
+        html.escape(str(k)), cls, html.escape(str(v)))
+
+
+def status_page():
+    svc = svc_states()
+    info = sysinfo()
+    tx = tx_overview()
+    rows = "".join(_row(u, s, "ok" if s == "active" else "bad") for u, s in svc.items())
+    sys_rows = "".join(_row(k, v) for k, v in (
+        ("内网卡段", info["cidr"]), ("磁盘可用", "%s MB" % info["disk_free_mb"]),
+        ("运行时长", "%s 小时" % info["uptime_h"]), ("负载", info["load"])))
+    if not tx["available"]:
+        txline = "<p class=bad>事务核心不可用(pdgtx 导入失败)—— 恢复类操作不可用, 请用 SSH 处理。</p>"
+    elif tx["pending"]:
+        txline = ("<p class=bad>有 %d 笔未完成的事务, 写操作会被拒绝。"
+                  "<a href=/tx>查看</a></p>" % len(tx["pending"]))
+    else:
+        txline = "<p class=ok>没有未完成的事务。<a href=/tx>查看历史</a></p>"
+    return page("PDG 救援 · 状态",
+                "<h1>状态总览</h1><h2>服务</h2><table>%s</table>"
+                "<h2>系统</h2><table>%s</table><h2>配置事务</h2>%s"
+                "<h2>其它</h2><p><a href=/snapshots>快照列表</a> · "
+                "<a href=/audit>审计(脱敏)</a> · <a href=/logout>退出</a></p>"
+                % (rows, sys_rows, txline))
+
+
+def tx_page():
+    t = tx_overview()
+    if not t["available"]:
+        return page("PDG 救援 · 事务", "<h1>配置事务</h1><p class=bad>事务核心不可用。</p>")
+    def _tbl(items, empty):
+        if not items:
+            return "<p class=muted>%s</p>" % empty
+        rows = "".join(
+            "<tr><td><a href='/tx/%s'>%s</a></td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
+                html.escape(str(m.get("txid"))), html.escape(str(m.get("txid"))),
+                html.escape(str(m.get("state"))), html.escape(str(m.get("op"))),
+                html.escape(_redact(str(m.get("error") or ""))[:80])) for m in items)
+        return "<table><tr><th>txid</th><th>状态</th><th>操作</th><th>错误</th></tr>%s</table>" % rows
+    return page("PDG 救援 · 事务",
+                "<h1>配置事务</h1><h2>未完成(需要处理)</h2>%s<h2>最近</h2>%s"
+                "<h2>已收尾但仍留着材料</h2>%s<p><a href=/>返回</a></p>"
+                % (_tbl(t["pending"], "没有未完成的事务"),
+                   _tbl(t["recent"], "暂无记录"),
+                   _tbl(t["leftover"], "没有残留材料")))
+
+
+_TXID_RE = re.compile(r"^[0-9A-Za-z._-]{1,64}$")
+
+
+def tx_detail_page(txid):
+    """只接受**枚举里出现过的** txid: 参数直接当目录名用是路径穿越的经典入口。"""
+    t = tx_overview()
+    if not t["available"]:
+        return None
+    known = {str(m.get("txid")) for m in (t["pending"] + t["recent"] + t["leftover"])}
+    if not _TXID_RE.match(txid) or txid not in known:
+        return None
+    tx = _pdgtx()
+    try:
+        m = tx.load_meta(os.path.join(tx.TX_ROOT, txid)) or {}
+    except Exception:  # noqa: BLE001
+        return None
+    show = ("txid", "state", "op", "source", "mode", "started_at", "ended_at",
+            "targets", "services", "rollback_complete")
+    rows = "".join(_row(k, _redact(str(m.get(k)))) for k in show if k in m)
+    err = _redact(str(m.get("error") or ""))
+    if err:
+        rows += _row("错误", err, "bad")
+    return page("PDG 救援 · 事务 %s" % txid,
+                "<h1>事务 %s</h1><table>%s</table><p><a href=/tx>返回列表</a></p>"
+                % (html.escape(txid), rows))
+
+
+def snapshots_page():
+    snaps = snapshots()
+    if not snaps:
+        body = "<p class=muted>没有快照。</p>"
+    else:
+        body = "<table><tr><th>快照</th><th>大小</th><th>时间</th></tr>" + "".join(
+            "<tr><td>%s</td><td>%.1f MB</td><td>%s</td></tr>" % (
+                html.escape(s["name"]), s["size"] / 1048576.0,
+                time.strftime("%Y-%m-%d %H:%M", time.localtime(s["mtime"])))
+            for s in snaps) + "</table>"
+    return page("PDG 救援 · 快照",
+                "<h1>快照</h1>%s<p class=muted>恢复操作在后续版本接入。</p>"
+                "<p><a href=/>返回</a></p>" % body)
+
+
+def audit_page():
+    recs = audit_tail()
+    if not recs:
+        body = "<p class=muted>暂无审计记录。</p>"
+    else:
+        body = "<table><tr><th>时间</th><th>操作</th><th>状态</th><th>来源</th></tr>" + "".join(
+            "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
+                time.strftime("%m-%d %H:%M", time.localtime(r.get("ts") or 0)),
+                html.escape(_redact(str(r.get("op")))),
+                html.escape(str(r.get("state"))), html.escape(str(r.get("source"))))
+            for r in reversed(recs)) + "</table>"
+    return page("PDG 救援 · 审计", "<h1>审计(最近 %d 条, 已脱敏)</h1>%s<p><a href=/>返回</a></p>"
+                % (AUDIT_TAIL, body))
+
+
+# ── HTTP ────────────────────────────────────────────────────────────────────
+class Handler(http.server.BaseHTTPRequestHandler):
+    server_version = "pdg-rescue"
+    sys_version = ""
+    protocol_version = "HTTP/1.1"
+
+    # -- 基础设施 --
+    def log_message(self, fmt, *args):
+        """只记方法与路径, 不记查询串/请求体/凭据。"""
+        sys.stderr.write("[rescue] %s\n" % _redact(fmt % args))
+
+    def _send(self, code, body=b"", ctype="text/html; charset=utf-8", cookie=None):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Content-Security-Policy",
+                         "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'")
+        if cookie:
+            self.send_header("Set-Cookie", cookie)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _sid(self):
+        raw = self.headers.get("Cookie") or ""
+        m = re.search(r"(?:^|;\s*)pdgsid=([A-Za-z0-9_-]+)", raw)
+        return m.group(1) if m else ""
+
+    def _authed(self):
+        return self.server.sessions.valid(self._sid())
+
+    def _body(self):
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return None
+        if n > MAX_BODY:
+            return None
+        return self.rfile.read(n) if n > 0 else b""
+
+    # -- 路由 --
+    def do_GET(self):
+        path = self.path.split("?", 1)[0].rstrip("/") or "/"
+        if not self._authed():
+            self._send(401 if path != "/" else 200, login_page())
+            return
+        if path == "/":
+            self._send(200, status_page())
+        elif path == "/tx":
+            self._send(200, tx_page())
+        elif path.startswith("/tx/"):
+            body = tx_detail_page(path[4:])
+            self._send(200, body) if body else self._send(404, page("404", "<p>没有这笔事务。</p>"))
+        elif path == "/snapshots":
+            self._send(200, snapshots_page())
+        elif path == "/audit":
+            self._send(200, audit_page())
+        elif path == "/logout":
+            self.server.sessions.drop(self._sid())
+            self._send(200, login_page("已退出。"),
+                       cookie="pdgsid=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict")
+        else:
+            self._send(404, page("404", "<p>没有这个页面。</p>"))
+
+    def do_HEAD(self):
+        self.do_GET()
+
+    def do_POST(self):
+        path = self.path.split("?", 1)[0].rstrip("/") or "/"
+        if path != "/login":
+            # 本提交只有只读页面; 写操作在后续提交接入, 现在一律拒绝(而不是 404 装作没有)
+            self._send(405, page("405", "<p>本版本的救援平面只提供只读页面。</p>"))
+            return
+        raw = self._body()
+        if raw is None:
+            self._send(413, login_page("请求体过大。"))
+            return
+        import urllib.parse
+        got = urllib.parse.parse_qs(raw.decode("utf-8", "replace")).get("token", [""])[0]
+        # 常数时间比对: 逐字符早退会把"对了几位"泄漏成时间差
+        if not hmac.compare_digest(got, self.server.token):
+            self._send(401, login_page("Token 不正确。"))
+            return
+        sid = self.server.sessions.new()
+        self._send(303 if False else 200, status_page(),
+                   cookie="pdgsid=%s; Path=/; Max-Age=%d; HttpOnly; Secure; SameSite=Strict"
+                          % (sid, SESSION_TTL))
+
+
+class Server(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, addr, token, ctx, fd=None):
+        self.token = token
+        self.sessions = Sessions()
+        if fd is not None:                      # systemd socket activation: 直接接管那个 fd
+            http.server.HTTPServer.__init__(self, addr, Handler, bind_and_activate=False)
+            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM, fileno=fd)
+            self.server_address = self.socket.getsockname()
+        else:
+            http.server.HTTPServer.__init__(self, addr, Handler)
+        self.socket = ctx.wrap_socket(self.socket, server_side=True)
+
+
+def systemd_fd():
+    """systemd 传进来的监听 fd(socket activation)。没有则返回 None。"""
+    try:
+        if int(os.environ.get("LISTEN_PID", "0")) != os.getpid():
+            return None
+        if int(os.environ.get("LISTEN_FDS", "0")) < 1:
+            return None
+    except ValueError:
+        return None
+    return 3                                    # SD_LISTEN_FDS_START
+
+
+def main():
+    try:
+        bind, port, cert, key, token = preflight()
+    except StartupRefused as e:
+        sys.stderr.write("[rescue] 拒绝启动: %s\n" % e)
+        return 2
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    try:
+        ctx.load_cert_chain(cert, key)
+    except (OSError, ssl.SSLError) as e:
+        sys.stderr.write("[rescue] 拒绝启动: 证书/私钥不可用(%s)\n" % type(e).__name__)
+        return 2
+    fd = systemd_fd()
+    srv = Server((bind, port), token, ctx, fd=fd)
+    sys.stderr.write("[rescue] 监听 https://%s:%d/ (%s)\n"
+                     % (bind, port, "socket activation" if fd else "自行绑定"))
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        srv.server_close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,14 @@
+[Unit]
+Description=PrivDNS Gateway 救援平面监听口 (private only)
+# 不写 After=network-online.target: 救援平面存在的意义就是公网不通时也能进 ——
+# 等 network-online 会让它在最需要的时候起不来。FreeBind 让地址还没起来时也能绑。
+
+[Socket]
+ListenStream=__RESCUE_BIND__:__RESCUE_PORT__
+FreeBind=true
+# socket 常驻(由 systemd 持有), 服务按需拉起: 空闲时几乎不占内存(低内存机器友好),
+# 而且救援服务自己崩了监听口也还在, 下次连接会把它重新拉起来。
+Accept=no
+
+[Install]
+WantedBy=sockets.target

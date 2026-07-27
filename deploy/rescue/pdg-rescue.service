@@ -1,0 +1,33 @@
+[Unit]
+Description=PrivDNS Gateway 救援平面 (只读状态 / 事务查看; 私网 HTTPS)
+# **不依赖** mihomo/mosdns/pdg-bot/tailscaled, 也不等 network-online:
+# 它们全挂了正是要用它的时候。
+Requires=pdg-rescue.socket
+After=pdg-rescue.socket
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/pdg-bot/rescue.py
+Restart=always
+RestartSec=2
+StartLimitIntervalSec=0
+# 硬化。RestrictAddressFamilies 必须含 AF_NETLINK: 后续提交里恢复类操作会调 nft(子进程也在
+# 本 unit 的 cgroup 里, 限制一样管到它); AF_UNIX 给 systemctl。为形式上的加固把恢复功能封死
+# 是本末倒置 —— 具体放行项由 tests/test-rescue-hardening 真跑验证。
+ProtectSystem=strict
+ReadWritePaths=/var/lib/privdns-gateway /run /etc/privdns-gateway /etc/mosdns /etc/mihomo /etc/sing-box /etc/systemd/system /etc/nftables.conf /etc/sysctl.d
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+MemoryMax=64M
+TasksMax=16
+
+[Install]
+WantedBy=multi-user.target
