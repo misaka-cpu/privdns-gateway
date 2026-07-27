@@ -208,6 +208,33 @@ def _map_target(tag, direct_tags):
     return tag
 
 
+def _rule_set_names(value):
+    """route rule 的 rule_set → 规则集名列表; 返回 (names, err), err 非空即 fail-closed。
+
+    sing-box 的合法形态是字符串**或字符串数组**。本项目自己只写字符串, 但从备份恢复、或用户
+    从别处导入的 model 完全可能带数组 —— 原实现直接当标量用, 数组会一路 TypeError 冒到调用方,
+    渲染整个失败(而报出来的只是个 TypeError, 看不出是哪条规则)。
+
+    只报**安全标识**: 规则集名是本项目生成的 rs_<hash> 或用户给的标签, 不含订阅 URL/凭据;
+    形态不合法时只报类型名与个数, 绝不把原值放进结果 —— 那可能是一个装着任意内容的对象。"""
+    if isinstance(value, str):
+        vals = [value]
+    elif isinstance(value, list):
+        vals = value
+    else:
+        return None, "(rule_set 形态不合法: %s)" % type(value).__name__
+    if not vals:
+        return None, "(rule_set 为空)"
+    names = []
+    for v in vals:
+        if not isinstance(v, str):
+            return None, "(rule_set 数组里有非字符串: %s)" % type(v).__name__
+        if not v.strip():
+            return None, "(rule_set 含空名)"
+        names.append(v)
+    return names, ""
+
+
 def _rules_from_route(sb, direct_tags, rulesets):
     rules = []
     dropped = []
@@ -222,12 +249,23 @@ def _rules_from_route(sb, direct_tags, rulesets):
             dropped.append(r)
             continue
         target = _map_target(out, direct_tags)
-        if r.get("rule_set"):
-            name = r["rule_set"]
-            if rulesets is not None and name in rulesets:
-                rules.append(f"RULE-SET,{name},{target}")
-            else:
-                dropped.append({"rule_set": name, "outbound": out})
+        if "rule_set" in r:
+            names, err = _rule_set_names(r["rule_set"])
+            if err:
+                # fail-closed: 形态不认识就整条不译, 交上层点名报错。绝不把 Python 的
+                # list/dict 直接 str() 写进 mihomo 配置 —— 那会渲染出一条永不命中的规则,
+                # 而用户以为分流已经生效。
+                dropped.append({"rule_set": err, "outbound": out})
+                continue
+            # 数组按**原始顺序**逐个展开成 RULE-SET, 目标相同。
+            # 等价性: sing-box 里同一字段的多个值是 OR(命中任一即用该 outbound); mihomo 是
+            # 首条命中即止, 连续几条指向同一 target 的 RULE-SET 合起来正是这个并集。所以不
+            # 排序、不去重 —— 顺序变了就不再是同一条语义。
+            for name in names:
+                if rulesets is not None and name in rulesets:
+                    rules.append(f"RULE-SET,{name},{target}")
+                else:
+                    dropped.append({"rule_set": name, "outbound": out})
             continue
         for d in r.get("domain_suffix", []):
             rules.append(f"DOMAIN-SUFFIX,{d},{target}")
