@@ -21,6 +21,7 @@ import 它。于是"改了 model 就必须在**同一笔事务**里重渲 mihomo
 """
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -39,15 +40,18 @@ os.environ.setdefault("SAFE_PATHS", "/etc/sing-box/ui/dist")
 
 
 class RenderRefused(Exception):
-    """渲染判废 —— **默认字符串里没有任何用户值**。
+    """渲染判废 —— 原始标识**根本不作为属性存在**, 拿不到也就打印不出来。
 
-    为什么要自己定义而不是借 pdgtx.TxRefused: 原来的做法是"有 pdgtx 就用它的异常类, 没有就
-    退回 RuntimeError", 于是**安全性取决于 pdgtx 在不在** —— 没有它时, 出口 tag 与规则集名
-    会原样进异常正文, 而那两样都是用户可以随便起名的字段。安全不能是可选项。
+    为什么自己定义而不是借 pdgtx.TxRefused: 原来是"有 pdgtx 就用它的异常类, 没有就退回
+    RuntimeError", 于是**安全性取决于 pdgtx 在不在** —— 没有它时出口 tag 与规则集名会原样
+    进异常正文。安全不能是可选项。
 
-    所以: 原始标识只放在结构化的 .items 里, str()/repr() 只给固定 code、类别与**计数**。
-    要展示具体名字的调用方, 在自己的边界上用 detail(redact=…) 明确要一次 —— 拿得到脱敏函数
-    就脱敏后展示, 拿不到就只能看到安全默认串。"""
+    为什么原始列表连属性都不留: 上一版把它放在公开的 .items 上, 只靠"调用方记得别打印"来
+    保证安全。那种约定迟早会被下一个调用方破坏, 而且 vars(exc) / 调试器 / 结构化日志会把
+    整个 __dict__ 倒出来, 一次就够了。现在原始值只活在构造时的闭包里:
+      · str() / repr() / args / vars() 只有错误码与计数;
+      · 要可读详情只有 detail() 一条路, 而它**自己**做统一脱敏 —— 不依赖调用方记得脱敏,
+        也不因为 pdgtx 导不进来就退回打印原值。"""
 
     # 固定错误码: 供调用方分类, 不随文案变化
     UNKNOWN_PROXIES = "RENDER_REFUSED_UNKNOWN_PROXIES"
@@ -59,26 +63,62 @@ class RenderRefused(Exception):
 
     def __init__(self, code, items):
         self.code = code
-        self.items = tuple(items)
+        self.count = len(list(items))
+        # 原始标识**只**进这个闭包: 不是 self 的属性, 于是 vars()/__dict__/调试器都倒不出来。
+        frozen = tuple(str(x) for x in items)
+
+        def _render():
+            return ", ".join(_safe_ident(x) for x in frozen)
+        self._render_idents = _render
         super().__init__(self.safe_message())
 
     def safe_message(self):
         """不含任何用户值: 只有错误码与计数。"""
-        return "%s: %d %s(具体名字需脱敏后才展示)" % (
-            self.code, len(self.items), self._PHRASE.get(self.code, ("", "项"))[1])
+        return "%s: %d %s(详情见 detail())" % (
+            self.code, self.count, self._PHRASE.get(self.code, ("", "项"))[1])
 
-    def detail(self, redact=None):
-        """给**有能力脱敏**的调用方拼可读详情。redact 为 None 时不展示任何原始值。"""
-        if redact is None:
+    def detail(self):
+        """**唯一**的可读详情出口: 短语 + 统一脱敏后的标识。
+
+        脱敏在这里做完, 调用方不需要(也无法)自己决定 —— 依赖"每个调用方都记得 redact"正是
+        上一版的问题。脱敏本身出任何岔子就退化成 safe_message(), 绝不因为出错而把原值放出去。"""
+        try:
+            idents = self._render_idents()
+        except Exception:  # noqa: BLE001
             return self.safe_message()
-        return "%s: %s" % (self._PHRASE.get(self.code, ("渲染判废", ""))[0],
-                           ", ".join(redact(str(x)) for x in self.items))
+        if not idents:
+            return self.safe_message()
+        return "%s: %s" % (self._PHRASE.get(self.code, ("渲染判废", ""))[0], idents)
 
     def __str__(self):
         return self.safe_message()
 
     def __repr__(self):
-        return "RenderRefused(code=%r, count=%d)" % (self.code, len(self.items))
+        return "RenderRefused(code=%r, count=%d)" % (self.code, self.count)
+
+
+# 统一脱敏: **本地兜底永远跑**, pdgtx 的规则(如果导得进来)再叠一层。
+# 顺序很重要 —— 先本地后 pdgtx, 于是"pdgtx 不在"只是少一层, 不会变成一层都没有。
+_IDENT_FALLBACK = ((r"\b\d{8,10}:[A-Za-z0-9_-]{30,}\b", "<token>"),
+                   (r"\b[0-9a-fA-F]{32,}\b", "<hex>"),
+                   (r"(?i)(password|secret|token|uuid|psk)\s*[:=]\s*\S+", r"\1=<redacted>"))
+_IDENT_MAX = 64                      # 标识超长一律截断: 再长也不是标签, 是有人把正文塞进来了
+
+
+def _safe_ident(value):
+    """把一个标识变成可以展示的形式。任何一步出错都退化成 <标识>, 不把原值放出去。"""
+    try:
+        out = str(value)
+        for rex, rep in _IDENT_FALLBACK:
+            out = re.sub(rex, rep, out)
+        tx = _tx_mod()
+        if tx is not None:
+            out = tx.redact(out)
+        out = out.replace("\n", " ").replace("\r", " ")
+        return out[:_IDENT_MAX] + ("…" if len(out) > _IDENT_MAX else "")
+    except Exception:  # noqa: BLE001
+        return "<标识>"
+
 
 
 # ── .mrs 的 behavior 识别(zstd 二进制头)──────────────────────────────────
@@ -285,9 +325,9 @@ def fmt_dropped(dropped):
 def check_meta(meta):
     """渲染 meta 里的"会被静默丢弃"一律判废。
 
-    抛 RenderRefused: 它的 str() 只有错误码与计数, 具体名字放在 .items 里, 由调用方在自己的
-    边界上决定要不要(以及怎么)展示 —— 用户确实需要知道是哪个出口/哪条规则被丢了, 但那必须
-    经过脱敏, 而不是靠"反正 pdgtx 在, 上层会 redact"这种默契。"""
+    抛 RenderRefused: 它的 str() 只有错误码与计数, 原始标识连属性都不留(只在闭包里), 要可读
+    详情只有 detail() 一条路 —— 而它自己做完统一脱敏。用户确实需要知道是哪个出口/哪条规则被
+    丢了, 但那必须经过脱敏, 而不是靠"反正 pdgtx 在, 上层会 redact"这种默契。"""
     bad = (meta or {}).get("unknown_proxies")
     if bad:
         raise RenderRefused(RenderRefused.UNKNOWN_PROXIES, [str(x) for x in bad])
@@ -342,12 +382,12 @@ def deriver_from_paths(*, rs_meta_path, mitm_hijack_file, platform_file):
                                 tls_ports=[443] if plat == "ios" else None)
         except RenderRefused as e:
             # 边界映射: 事务层认 TxRefused, 于是配置恢复/救援能给出可解释的拒绝而不是 500。
-            # 拿得到脱敏函数就脱敏后点名; 拿不到就只抛安全默认串 —— 绝不退回一个带原始值的
-            # 通用异常(安全不取决于 pdgtx 在不在)。
+            # 详情一律取 detail()(它自己脱敏); 事务核心不在就把 RenderRefused 原样抛出去 ——
+            # 它的 str() 本来就是安全的, 不需要谁来兜底。
             tx = _tx_mod()
             if tx is None:
                 raise
-            raise tx.TxRefused(e.detail(redact=tx.redact)) from None
+            raise tx.TxRefused(e.detail()) from None
     return _derive
 
 

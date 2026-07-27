@@ -1054,8 +1054,8 @@ def _mihomo_derive(staged):
     except mihomorender.RenderRefused as e:
         # 边界映射(bot 侧): 用 TxRefused 而不是让 RenderRefused 直接冒上去 —— 事务对普通异常
         # 只报类型名, 而这两条恰恰必须**点名**是哪个出口/哪条规则被丢了, 否则用户不知道该改
-        # 什么。名字经 tx.redact 脱敏后才拼进文案; 共享模块自己那份 str() 里从来没有它们。
-        raise _pdgtx().TxRefused(e.detail(redact=_pdgtx().redact)) from None
+        # 什么。detail() 自己做完统一脱敏, 这里不需要(也无法)再传脱敏函数进去。
+        raise _pdgtx().TxRefused(e.detail()) from None
     return data
 
 
