@@ -1814,6 +1814,11 @@ def _cli_apply(a):
     tx.state, tx.meta = PREPARING, m
     tx.derivers, tx.warnings = [], list(m.get("warnings", []))
     tx.actions = list(m.get("staged_actions", []))
+    # 只读依赖: CLI 侧的 stage 不记录 watch(bash 调用方一次只 stage 具体文件, 没有派生依赖),
+    # 但落盘前的前置条件复核会遍历它 —— 不初始化就是 AttributeError, 整笔事务在**已经写完
+    # before-image、正要动生产文件**的位置炸掉。meta 里有就按 meta 恢复, 没有就是空。
+    tx.watches = dict(m.get("watches", {}))
+    tx._read_sha = {}
     tx.targets = {}
     for s in m.get("staged", []):
         path, mode, secret, validators = resolve_target(s["target"])

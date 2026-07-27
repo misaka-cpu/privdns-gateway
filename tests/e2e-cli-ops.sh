@@ -237,17 +237,19 @@ S
 chmod 755 /usr/local/bin/tcpdump
 detect(){ printf 'y\n' | pdg detect-cidr 1 2>&1; }
 
-# 7a. 快照失败 → 一个字节都不许改(注入: 让 tar 失败, 快照就打不出包)
+# 7a. 回退手段: 5.2 起写入阶段是一笔 pdgtx 事务, 回退靠 before-image + 自动回滚 + 崩溃后
+# `pdg tx recover`, 不再自己打整机快照(cmd_snapshot 会先拿走同一把 flock, 子进程里的事务
+# 反而拿不到锁)。所以这里验的是**事务确实留下了可恢复的材料**, 而不是"tar 坏了就中止"。
 reset_cidr
-cp "$(command -v tar)" /usr/local/bin/tar.real 2>/dev/null || cp /bin/tar /usr/local/bin/tar.real
-printf '#!/bin/sh\nexit 1\n' > /usr/local/bin/tar; chmod 755 /usr/local/bin/tar
 out=$(detect); rc=$?
-rm -f /usr/local/bin/tar   # 还原成系统自带的 tar
-{ [[ "$rc" != 0 ]] && grep -q '快照失败' <<<"$out"; } \
-  && ok "快照失败 → 明确中止并返回非 0" || bad "7a: rc=$rc: $(tail -4 <<<"$out")"
-{ [[ "$(sha256sum /etc/nftables.conf | cut -d' ' -f1)" == "$NFT_SHA0" ]] \
-  && [[ "$(sha256sum /etc/mosdns/config.yaml | cut -d' ' -f1)" == "$MOS_SHA0" ]]; } \
-  && ok "快照失败后两份配置逐字节未变" || bad "7b: 配置被改了"
+{ [[ "$rc" == 0 ]] && grep -q '事务' <<<"$out"; } \
+  && ok "成功路径明确说明走的是配置事务" || bad "7a: rc=$rc: $(tail -4 <<<"$out")"
+_txdir="$(ls -1dt /var/lib/privdns-gateway/tx/*/ 2>/dev/null | head -1)"
+{ [[ -n "$_txdir" ]] && grep -q '"op": "detect-cidr"' "$_txdir/meta.json" 2>/dev/null \
+  && grep -q '"state": "COMMITTED"' "$_txdir/meta.json" 2>/dev/null; } \
+  && ok "事务留下了 COMMITTED 的 detect-cidr 记录(可查、可审计)" \
+  || bad "7b: 没找到本次事务记录: ${_txdir:-无}"
+reset_cidr
 
 # 7b. mosdns 是自定义形态(没有可替换的 ips)→ sed 不命中必须报错而不是报成功
 reset_cidr
@@ -271,8 +273,8 @@ printf '#!/bin/sh\n[ "$1" = "-c" ] && exit 1\nexec /usr/local/bin/nft.real "$@"\
 chmod 755 /usr/local/bin/nft
 out=$(detect); rc=$?
 cp -f /usr/local/bin/nft.real /usr/local/bin/nft
-{ [[ "$rc" != 0 ]] && grep -q 'nft -c' <<<"$out"; } \
-  && ok "nft 校验失败 → 非 0 并说明" || bad "7e: rc=$rc: $(tail -4 <<<"$out")"
+{ [[ "$rc" != 0 ]] && grep -qE 'nft -c|nft_check' <<<"$out"; } \
+  && ok "nft 校验失败 → 非 0 并说明是哪个校验门" || bad "7e: rc=$rc: $(tail -4 <<<"$out")"
 { [[ "$(sha256sum /etc/nftables.conf | cut -d' ' -f1)" == "$NFT_SHA0" ]] \
   && [[ "$(sha256sum /etc/mosdns/config.yaml | cut -d' ' -f1)" == "$MOS_SHA0" ]]; } \
   && ok "nft 校验失败后两份配置都逐字节未变" || bad "7f: 配置被改了"
@@ -291,8 +293,11 @@ e2e_svc_heal mosdns
 # 7e. 成功路径: 落盘 + 三处复核
 reset_cidr
 out=$(detect); rc=$?
-{ [[ "$rc" == 0 ]] && grep -q '三处一致' <<<"$out"; } \
-  && ok "成功路径: 落盘 + 复核 nft/mosdns/自检三处一致" || bad "7i: rc=$rc: $(tail -4 <<<"$out")"
+{ [[ "$rc" == 0 ]] && grep -qE '同一笔事务落盘' <<<"$out"; } \
+  && ok "成功路径: 真源/防火墙/mosdns 同一笔事务落盘" || bad "7i: rc=$rc: $(tail -4 <<<"$out")"
+grep -q "^PDG_INTERNAL_CIDR=10.44.0.0/16$" /etc/privdns-gateway/profile.env \
+  && ok "成功路径: 真源(profile.env)也在同一笔事务里更新了" \
+  || bad "7i2: 真源没更新: $(sed -n 's/^PDG_INTERNAL_CIDR=//p' /etc/privdns-gateway/profile.env)"
 grep -q '10.44.0.0/16' /etc/nftables.conf && ok "新网段写进了防火墙" || bad "7j: 防火墙里没有新网段"
 grep -q '10.44.0.0/16' /etc/mosdns/config.yaml && ok "新网段写进了 mosdns" || bad "7k: mosdns 里没有新网段"
 
@@ -300,8 +305,8 @@ grep -q '10.44.0.0/16' /etc/mosdns/config.yaml && ok "新网段写进了 mosdns"
 NFT_SHA1="$(sha256sum /etc/nftables.conf | cut -d' ' -f1)"
 MOS_SHA1="$(sha256sum /etc/mosdns/config.yaml | cut -d' ' -f1)"
 out=$(detect); rc=$?
-{ [[ "$rc" == 0 ]] && grep -q '与当前一致' <<<"$out"; } \
-  && ok "再跑一次: 与当前一致 → 直接返回" || bad "7l: rc=$rc: $(tail -3 <<<"$out")"
+{ [[ "$rc" == 0 ]] && grep -qE '无需修改' <<<"$out"; } \
+  && ok "再跑一次: 三处均已一致 → 明确返回无需修改" || bad "7l: rc=$rc: $(tail -3 <<<"$out")"
 { [[ "$(sha256sum /etc/nftables.conf | cut -d' ' -f1)" == "$NFT_SHA1" ]] \
   && [[ "$(sha256sum /etc/mosdns/config.yaml | cut -d' ' -f1)" == "$MOS_SHA1" ]]; } \
   && ok "幂等: 第二次没有改动任何配置" || bad "7m: 第二次改了配置"

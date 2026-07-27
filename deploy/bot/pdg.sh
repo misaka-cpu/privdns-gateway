@@ -1138,7 +1138,7 @@ cmd_report(){ need_root report; python3 /opt/pdg-bot/report.py "$@"; }
 # 抓包识别内网卡来源段, 检测到与现配不符时可一键写回 mosdns+nftables 并重启(装完随时跑, 比装机时从容)。
 cmd_detect_cidr(){
   need_root detect-cidr
-  local dur="${1:-30}" sip det cur
+  local dur="${1:-30}" sip det cur_src cur_nft cur_mos
   # shellcheck source=/dev/null
   source "$REPO_DIR/lib/cidr.sh" 2>/dev/null || { echo "❌ 读不到 lib/cidr.sh"; return 1; }
   sip=$(grep -oE '"[0-9.]+/32"' /etc/sing-box/config.json 2>/dev/null | tr -d '"' | grep -v '^127' | head -1 | cut -d/ -f1)
@@ -1150,71 +1150,114 @@ cmd_detect_cidr(){
   if ! pdg_cidr_valid "$det"; then
     c_y "「$det」不是合法网段(形如 172.22.0.0/16), 未改动。"; return 1
   fi
-  cur=$(grep -oE 'ip saddr [0-9./]+' /etc/nftables.conf 2>/dev/null | head -1 | awk '{print $3}')
+  # 私网判定放在**动手之前**: 公网段一旦进 nft, REDIRECT 与放行就对全网生效 —— 那不是配置
+  # 不当, 是把网关变成开放中继。判据与候选生成器同一份(cidrgen.valid_cidr), 不在两处各写一套。
+  local _vw
+  if ! _vw="$(_pdg_cidrgen_check "$det")"; then
+    c_y "❌ 「$det」不能用作内网卡段: ${_vw:-判定失败} → 未改动任何文件。"; return 1
+  fi
+  # 三处现状: 真源(profile.env) / 防火墙 / mosdns。旧版只比 nft 一处, 于是"真源落后但 nft 已新"
+  # 这种半套状态会被当成"无需改动"放过去。
+  cur_src="$(sed -n 's/^[[:space:]]*PDG_INTERNAL_CIDR=//p' /etc/privdns-gateway/profile.env 2>/dev/null | tail -1)"
+  cur_nft="$(grep -oE 'ip saddr [0-9.]+/[0-9]+' /etc/nftables.conf 2>/dev/null | head -1 | awk '{print $3}')"
+  cur_mos="$(grep -oE 'ips:[[:space:]]*\[[[:space:]]*"[0-9./]+"' /etc/mosdns/config.yaml 2>/dev/null \
+             | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+')"
   echo "  检测到内网卡段: $det"
-  echo "  当前配置:       ${cur:-未知}"
-  [[ "$det" == "$cur" ]] && { c_g "✅ 与当前一致, 无需改动。"; return 0; }
-  read -rp "把内网卡段 ${cur:-?} → $det 并应用(写 mosdns+nftables 并重启)? [y/N]: " yn
+  echo "  当前真源:       ${cur_src:-未写入}"
+  echo "  当前防火墙:     ${cur_nft:-未知}"
+  echo "  当前 mosdns:    ${cur_mos:-未知}"
+  if [[ "$det" == "$cur_src" && "$det" == "$cur_nft" && "$det" == "$cur_mos" ]]; then
+    c_g "✅ 三处均已是 $det, 无需修改。"; return 0
+  fi
+  [[ -z "$cur_nft" ]] && { c_y "❌ nftables 配置里读不到当前内网卡段(自定义形态?) → 未改动任何文件。"; return 1; }
+  read -rp "把内网卡段改成 $det 并应用(真源+防火墙+mosdns 一笔事务)? [y/N]: " yn
   [[ "$yn" == [yY] ]] || { echo "已取消, 未改动。"; return 0; }
-  _lock
-  # 快照必须成立, 且要记住**这一次**的目录 —— 旧写法 `cmd_snapshot || true` 把失败吞掉,
-  # 后面出事再 `cmd_rollback 0` 按序号回滚, 回到的可能是上周某次无关快照(index 0 是"最新一份",
-  # 而这次根本没留下快照)。宁可一个字节都不改。
-  c_g "先留快照…"
-  # 与 cmd_update 同口径: 用 cmd_snapshot 自己回报的 _PDG_SNAP_CREATED 记住**本次**那一份,
-  # 不按 index 猜(index 0 是"最新一份", 这次没留成时它指向的是上一次的无关快照)。
-  local snap_dir
-  if ! cmd_snapshot >/dev/null 2>&1 || [[ -z "$_PDG_SNAP_CREATED" || ! -f "$_PDG_SNAP_CREATED/snap.tar.gz" ]]; then
-    c_y "❌ 快照失败 → 未改动任何文件(拒绝在没有回退手段的前提下改内网卡段)。"; return 1
-  fi
-  snap_dir="$_PDG_SNAP_CREATED"
-  # 本次事务的精确备份(回滚只用它, 不用模糊的 index)
-  local wd; wd="$(mktemp -d)" || { echo "❌ 无法创建临时目录"; return 1; }
-  cp -a /etc/nftables.conf "$wd/nftables.conf" 2>/dev/null
-  cp -a /etc/mosdns/config.yaml "$wd/config.yaml" 2>/dev/null
-  local newnft="$wd/nftables.new" newmos="$wd/mosdns.new"
-  cp -a /etc/nftables.conf "$newnft" 2>/dev/null || { rm -rf "$wd"; echo "❌ 读不到 /etc/nftables.conf"; return 1; }
-  cp -a /etc/mosdns/config.yaml "$newmos" 2>/dev/null || { rm -rf "$wd"; echo "❌ 读不到 mosdns 配置"; return 1; }
-  _dc_restore(){   # 只用本次备份还原, 不碰别的快照
-    [[ -e "$wd/nftables.conf" ]] && cp -a "$wd/nftables.conf" /etc/nftables.conf
-    [[ -e "$wd/config.yaml" ]] && cp -a "$wd/config.yaml" /etc/mosdns/config.yaml
-    nft -f /etc/nftables.conf 2>/dev/null || true
-    systemctl restart mosdns >/dev/null 2>&1 || true
-    c_y "已用本次事务的备份还原(快照留在 $snap_dir, 必要时 sudo pdg rollback --dir $snap_dir)。"
-  }
-  # 改**临时文件**, 并复核新网段真的写进去了 —— sed 没命中时旧写法一声不吭继续往下走,
-  # 最后还打印"✅ 已更新", 而两份配置一个字都没变。
-  [[ -n "$cur" ]] && sed -i "s#${cur//./\\.}#$det#g" "$newnft"
-  sed -i -E "s#(ips:[[:space:]]*\[[[:space:]]*\")[0-9./]+(\")#\1$det\2#" "$newmos"
-  if ! grep -qF "$det" "$newnft"; then
-    rm -rf "$wd"; c_y "❌ nftables 配置里没找到可替换的内网卡段(自定义形态?) → 未改动任何文件。"; return 1
-  fi
-  if ! grep -qE "ips:[[:space:]]*\[[[:space:]]*\"${det//./\\.}\"" "$newmos"; then
-    rm -rf "$wd"; c_y "❌ mosdns 配置里的 ips 段未能替换(自定义形态?) → 未改动任何文件。"; return 1
-  fi
-  if ! nft -c -f "$newnft" >/dev/null 2>&1; then
-    rm -rf "$wd"; c_y "❌ 新防火墙配置校验(nft -c)未过 → 未改动任何文件。"; return 1
-  fi
-  # 校验都过了才落盘
-  cp -a "$newnft" /etc/nftables.conf && cp -a "$newmos" /etc/mosdns/config.yaml || {
-    _dc_restore; rm -rf "$wd"; c_y "❌ 落盘失败, 已还原。"; return 1; }
-  if ! nft -f /etc/nftables.conf; then _dc_restore; rm -rf "$wd"; c_y "❌ 应用防火墙失败, 已还原。"; return 1; fi
-  systemctl reset-failed mosdns >/dev/null 2>&1 || true
-  if ! systemctl restart mosdns || ! _core_kernel_stable mosdns; then
-    _dc_restore; rm -rf "$wd"
-    c_y "❌ mosdns 未能稳定运行, 已还原。近期日志:"
-    journalctl -u mosdns -n 12 --no-pager -o cat 2>/dev/null | sed 's/^/    /'
+  _pdg_cidr_transact "$det" "$cur_nft"
+}
+
+# 候选生成器的私网/形态判定(单一判据, 与落盘时用的是同一份代码)。
+# 通过 → 返回 0; 不通过 → 打印原因并返回非 0。
+_pdg_cidrgen_check(){
+  local m
+  m="$(_pdg_module cidrgen.py)" || { echo "找不到 cidrgen.py"; return 1; }
+  python3 - "$m" "$1" <<'PYCHK'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("cidrgen", sys.argv[1])
+g = importlib.util.module_from_spec(spec); spec.loader.exec_module(g)
+ok, why = g.valid_cidr(sys.argv[2])
+print(why)
+sys.exit(0 if ok else 1)
+PYCHK
+}
+
+# 找一个已安装的模块(仓库副本优先, 其次 /opt/pdg-bot)。找不到返回非 0。
+_pdg_module(){
+  local n="$1" f
+  for f in "$REPO_DIR/deploy/bot/$n" "/opt/pdg-bot/$n"; do
+    [[ -f "$f" ]] && { printf '%s\n' "$f"; return 0; }
+  done
+  return 1
+}
+
+# 内网卡段变更 = **一笔 pdgtx 事务**。三个目标同一个候选值生成, 一起校验、一起落盘、一起观察,
+# 任一步失败整体回滚到 before-image。旧版是"自己打快照 + cp -a 备份 + sed 改临时文件 + 手写
+# _dc_restore 还原": 落盘落一半、nft 应用失败、mosdns 起不来这三种情况各走各的还原分支, 而
+# 还原本身没有复核 —— 于是"改动已应用但复核不一致"只能靠一句提示让人自己去 doctor。
+_pdg_cidr_transact(){
+  local det="$1" cur_nft="$2" txm txid rc=0 wd
+  txm="$(_pdg_module pdgtx.py)" || { c_y "❌ 找不到 pdgtx.py(事务核心缺失), 未改动任何文件。"; return 1; }
+  local gen; gen="$(_pdg_module cidrgen.py)" || { c_y "❌ 找不到 cidrgen.py, 未改动任何文件。"; return 1; }
+  # 未完成事务先收尾 —— 此刻现网可能停在别人的中间态, 再叠一笔只会让两笔都说不清
+  local pend; pend="$(python3 "$txm" pending 2>/dev/null)"
+  if [[ -n "$pend" ]]; then
+    c_y "⛔ 有未完成的配置事务, 本次拒绝执行(未改动任何文件):"
+    printf '%s\n' "$pend" | sed 's/^/    /'
+    c_y "   请先 sudo pdg tx show <id> 查看, 再 sudo pdg tx recover <id> 收尾。"
     return 1
   fi
-  # 成功后三处复核一致: 防火墙文件 / mosdns 配置 / doctor 读到的内网段
-  local dc_ok=1 seen
-  grep -qF "$det" /etc/nftables.conf || { c_y "⚠️ 复核: nftables 里没有 $det"; dc_ok=0; }
-  grep -qF "$det" /etc/mosdns/config.yaml || { c_y "⚠️ 复核: mosdns 配置里没有 $det"; dc_ok=0; }
-  seen="$(python3 -c 'import sys; sys.path.insert(0,"/opt/pdg-bot"); import checks; print(checks._internal_cidr())' 2>/dev/null)"
-  [[ "$seen" == "$det" ]] || { c_y "⚠️ 复核: 自检读到的内网段是「${seen:-空}」, 与 $det 不一致"; dc_ok=0; }
-  rm -rf "$wd"
-  [[ "$dc_ok" == 1 ]] || { c_y "❌ 改动已应用但复核不一致 → 请运行 sudo pdg doctor 检查。"; return 1; }
-  c_g "✅ 内网卡段已更新为 $det, mosdns 已重启, 防火墙/mosdns/自检三处一致。"
+  wd="$(mktemp -d)" || { c_y "❌ 无法创建临时目录"; return 1; }
+  txid="$(python3 "$txm" new --source cli --op detect-cidr 2>"$wd/err")" || {
+    c_y "❌ 无法开始配置事务: $(tr -d '\n' < "$wd/err")"; rm -rf "$wd"; return 1; }
+  # 逐个目标: read 拿"候选所依据的那一份"的 sha → 生成候选 → stage --expect <sha>。
+  # 前置条件用的是 read 到的 sha, 所以事务开始后有人改了同一个文件, 落盘阶段会当场撞出来。
+  local t kind arg
+  for t in profile_env:profile:"" nftables_conf:nft:"$cur_nft" mosdns_conf:mosdns:""; do
+    local tgt="${t%%:*}" rest="${t#*:}"
+    kind="${rest%%:*}"; arg="${rest#*:}"
+    python3 "$txm" read --target "$tgt" > "$wd/$tgt.raw" 2>"$wd/err" || {
+      c_y "❌ 读不到目标 $tgt: $(tr -d '\n' < "$wd/err") → 未改动任何文件。"; rc=1; break; }
+    local sha; sha="$(head -1 "$wd/$tgt.raw")"
+    tail -n +2 "$wd/$tgt.raw" > "$wd/$tgt.cur"
+    if ! python3 "$gen" "$kind" "$det" "$arg" < "$wd/$tgt.cur" > "$wd/$tgt.new" 2>"$wd/err"; then
+      c_y "❌ 生成候选失败($tgt): $(tr -d '\n' < "$wd/err") → 未改动任何文件。"; rc=1; break
+    fi
+    python3 "$txm" stage --tx "$txid" --target "$tgt" --file "$wd/$tgt.new" --expect "$sha" 2>"$wd/err" || {
+      c_y "❌ 暂存候选失败($tgt): $(tr -d '\n' < "$wd/err") → 未改动任何文件。"; rc=1; break; }
+  done
+  if [[ "$rc" != 0 ]]; then
+    python3 "$txm" abort "$txid" >/dev/null 2>&1 || true    # 候选阶段放弃: 现网一个字节没动过
+    rm -rf "$wd"; return 1
+  fi
+  python3 "$txm" service --tx "$txid" --action nft:apply >/dev/null 2>&1
+  python3 "$txm" service --tx "$txid" --action restart:mosdns >/dev/null 2>&1
+  local out
+  out="$(python3 "$txm" apply --tx "$txid" 2>"$wd/err")"; rc=$?
+  if [[ "$rc" == 0 ]]; then
+    c_g "✅ 内网卡段已更新为 $det(真源 / 防火墙 / mosdns 同一笔事务落盘, 已重启并观察通过)。"
+    rm -rf "$wd"; return 0
+  fi
+  case "$rc" in
+    4) c_y "⛔ 已有配置操作在执行(锁被占用), 本次未改动任何文件。";;
+    # REFUSED 涵盖多种"拒绝执行": 锁文件不可用、操作前硬门就是坏的、前置条件已失效。
+    # 一律照抄核心给出的原因 —— 自己编一句"锁不可用"会把"mosdns 操作前就没在跑"说成锁的问题。
+    5) c_y "⛔ 拒绝执行(未改动任何文件):"
+       [[ -s "$wd/err" ]] && sed 's/^/    /' "$wd/err";;
+    *) c_y "❌ 内网卡段变更失败, 已按 before-image 回滚:"
+       [[ -s "$wd/err" ]] && sed 's/^/    /' "$wd/err"
+       [[ -n "$out" ]] && printf '%s\n' "$out" | sed 's/^/    /'
+       c_y "   如显示回滚不完整(ROLLBACK_FAILED), 用 sudo pdg tx show $txid 查看后再 recover。";;
+  esac
+  rm -rf "$wd"; return 1
 }
 
 cmd_ios(){

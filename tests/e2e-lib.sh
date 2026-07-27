@@ -407,7 +407,17 @@ e2e_seed_mosdns(){
   . "$E2E_ROOT/lib/mosdns.sh"
   local setf; [[ "$mode" == gfw ]] && setf=geosite_gfw.txt || setf='geosite_geolocation-!cn.txt'
   _mosdns_hijack_shape "$mode" /etc/mosdns/config.yaml "$setf" >/dev/null
-  printf 'PDG_LOWMEM=0\nPDG_HIJACK_MODE=%s\n' "$mode" > /etc/privdns-gateway/profile.env
+  printf 'PDG_LOWMEM=0\nPDG_HIJACK_MODE=%s\nPDG_INTERNAL_CIDR=%s\n' \
+    "$mode" "$E2E_CIDR" > /etc/privdns-gateway/profile.env
+  # DoT 证书: 真机装完一定有(install.sh 签发或生成自签), mosdns 的 dot_server 插件初始化要读它。
+  # 沙盒缺它 → 任何"拿真 mosdns 校验候选配置"的事务都会失败, 那是夹具不够真实, 不是产品问题。
+  if [[ ! -s /etc/mosdns/certs/fullchain.pem ]] && command -v openssl >/dev/null 2>&1; then
+    install -d -m700 /etc/mosdns/certs
+    openssl req -x509 -newkey rsa:2048 -nodes -keyout /etc/mosdns/certs/privkey.pem \
+      -out /etc/mosdns/certs/fullchain.pem -days 3650 -subj "/CN=e2e.example" >/dev/null 2>&1 || true
+    chmod 644 /etc/mosdns/certs/fullchain.pem 2>/dev/null || true
+    chmod 600 /etc/mosdns/certs/privkey.pem 2>/dev/null || true
+  fi
 }
 
 # 渲染真实防火墙配置(switch-core 要从中提取 SSH 端口)。$1=内核(singbox|mihomo)
