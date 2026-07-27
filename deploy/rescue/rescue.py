@@ -45,6 +45,8 @@ SESSION_ABSOLUTE = int(os.environ.get("PDG_RESCUE_SESSION_MAX", "7200"))  # 绝�
 MAX_BODY = 8 * 1024                                    # 请求体上限: 救援页没有大表单
 OP_CONFIG = "config"                                   # 确认票的操作维度
 OP_BREAKGLASS = "full_breakglass_restore"              # 与结果/审计里的 operation 同名
+OP_EMERGENCY = "emergency_default_exit"                # 紧急默认出口(启用/恢复共用票据维度)
+EMERGENCY_API = ("enable", "restore", "status", "candidates")
 AUDIT_TAIL = 30                                        # 审计只回最近这么多条
 
 
@@ -92,6 +94,49 @@ def _pdgtx():
     return _mod("pdgtx", PDGTX_API)
 
 
+def _emergency():
+    """紧急默认出口。与配置恢复一样属于"要事务才能做"的写操作, 事务核心不可用时它也不可用。"""
+    if _pdgtx() is None:
+        return None
+    return _mod("emergency", EMERGENCY_API)
+
+
+def _tx_paths():
+    """渲染派生要用的三个路径。跟随事务沙箱根 —— 真机上 FSROOT 是空串, 与写死绝对路径一致。"""
+    root = _fsroot() or ""
+    return {"rs_meta_path": root + "/opt/pdg-bot/rulesets.json",
+            "mitm_hijack_file": root + "/etc/mosdns/rules/mitm_hijack.txt",
+            "platform_file": root + "/etc/privdns-gateway/platform"}
+
+
+def _emergency_digest(stt):
+    """把"页面看到的那个状态"压成一个摘要, 供票据绑定。状态读不到时给一个固定串 ——
+    那种情况下页面本来就不给表单, 票也签不出有效的操作。"""
+    import hashlib
+    if not stt:
+        return "no-state"
+    key = json.dumps({k: stt.get(k) for k in ("active", "stale", "current_final",
+                                              "emergency_final", "original_final",
+                                              "original_present", "candidates")},
+                     ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+def _emergency_status():
+    """页面用的状态。**纯读**: GET 不写任何文件。读不到就当未启用。"""
+    em = _emergency()
+    if em is None:
+        return None
+    try:
+        tx = _pdgtx()
+        model_raw, _st = tx._read_target(tx.FSROOT + "/etc/sing-box/config.json")
+        state_raw, _st2 = tx._read_target(
+            tx.FSROOT + "/var/lib/privdns-gateway/rescue-state.json")
+        return em.status(json.loads((model_raw or b"{}").decode("utf-8")), state_raw)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _forget_business_modules():
     """把业务恢复范围内的模块从 import 缓存里丢掉, 下次访问按**盘上现在那一份**重新判定。
 
@@ -99,7 +144,7 @@ def _forget_business_modules():
     的话页面会拿着内存里那份旧对象继续显示"一切正常", 而盘上早已是另一回事 —— 要到下次重启
     才暴露。"恢复后重新做能力检测"要真的重新检测, 就得先忘掉。
     breakglass 与 rescue 自身在保护清单里, 不会被换, 不必忘。"""
-    for m in ("cfgrestore", "pdgtx"):
+    for m in ("cfgrestore", "pdgtx", "emergency", "mihomorender"):
         sys.modules.pop(m, None)
 
 
@@ -107,7 +152,8 @@ def caps():
     """三个模块此刻到底能不能用 —— 页面据此决定"正常显示"还是"禁用 + 旧核心不支持"。"""
     return {"pdgtx": _pdgtx() is not None,
             "cfgrestore": _cfgrestore() is not None,
-            "breakglass": _breakglass() is not None}
+            "breakglass": _breakglass() is not None,
+            "emergency": _emergency() is not None}
 
 
 def _ct_eq(a, b):
@@ -506,6 +552,7 @@ def status_page():
         _row(label, "可用" if cap[k] else DEGRADED, "ok" if cap[k] else "bad")
         for k, label in (("pdgtx", "事务核心(recover)"),
                          ("cfgrestore", "恢复受管配置"),
+                         ("emergency", "紧急默认出口"),
                          ("breakglass", "紧急完整恢复")))
     last = last_breakglass()
     if last:
@@ -521,9 +568,98 @@ def status_page():
                 "<h1>状态总览</h1><h2>服务</h2><table>%s</table>"
                 "<h2>系统</h2><table>%s</table><h2>配置事务</h2>%s"
                 "<h2>恢复能力</h2><table>%s</table>"
-                "<h2>其它</h2><p><a href=/snapshots>快照列表</a> · "
+                "<h2>其它</h2><p><a href=/emergency>紧急默认出口</a> · "
+                "<a href=/snapshots>快照列表</a> · "
                 "<a href=/audit>审计(脱敏)</a> · <a href=/logout>退出</a></p>"
                 % (rows, sys_rows, txline, cap_rows))
+
+
+# 这句话必须原样出现在页面上。用户看到"紧急默认出口"很容易理解成"全部流量强制走这一个",
+# 于是在排障时得出完全错误的结论(比如以为某个域名也走了这条链路)。实际只换 route.final。
+EMERGENCY_SCOPE = ("紧急默认出口只修改 route.final。已有高优先级规则仍会命中各自出口, "
+                   "这不是全局强制单出口。")
+
+
+def emergency_page(csrf, nonce, msg="", cls="warn"):
+    """紧急默认出口页。GET 纯读 —— 状态只看不写。"""
+    em = _emergency()
+    if em is None:
+        return degraded_page("紧急默认出口", why="事务核心或紧急出口模块不可用")
+    stt = _emergency_status()
+    if stt is None:
+        return degraded_page("紧急默认出口", why="读不到当前数据模型")
+    cur = stt["current_final"]
+    if stt["stale"]:
+        state_txt, state_cls = "已过期(stale)", "bad"
+    elif stt["active"]:
+        state_txt, state_cls = "启用中", "warn"
+    else:
+        state_txt, state_cls = "未启用", "ok"
+    rows = _row("紧急模式状态", state_txt, state_cls) \
+        + _row("当前 route.final", cur if cur is not None else "(未设置)")
+    if stt["active"]:
+        rows += _row("启用前的原出口",
+                     (stt["original_final"] if stt["original_present"] else "(原本没有 route.final)")) \
+            + _row("当前紧急出口", stt["emergency_final"]) \
+            + _row("启用时间", time.strftime("%Y-%m-%d %H:%M",
+                                             time.localtime(stt["enabled_at"] or 0)))
+    note = ""
+    if stt["stale"]:
+        note = ("<p class=bad>当前默认出口已经不是记录里的紧急出口了 —— 这期间有别的入口"
+                "(Bot / CLI / 配置恢复 / 完整恢复)改过配置。一键恢复**已停用**: 拿旧记录覆盖"
+                "过去会把你后来的修改抹掉。要继续用紧急出口, 请在下面**重新选一次** ——"
+                "那时会以当前值作为新的原值。</p>")
+    elif stt["active"] and not stt["original_available"]:
+        note = ("<p class=bad>启用前的原出口 <code>%s</code> 现在已经不存在了, 恢复无法进行。"
+                "状态会保留 —— 把它加回来, 或直接选一个出口作为新的默认。</p>"
+                % html.escape(str(stt["original_final"])))
+    opts = "".join("<option value='%s'>%s</option>" % (html.escape(t), html.escape(t))
+                   for t in stt["candidates"])
+    hidden = ("<input type=hidden name=csrf value='%s'>"
+              "<input type=hidden name=nonce value='%s'>" % (csrf, nonce))
+    forms = ""
+    if stt["candidates"]:
+        forms = ("<form method=post action=/emergency/enable>%s"
+                 "<label>把默认出口(route.final)换成: <select name=tag>%s</select></label>"
+                 "<br><button type=submit>%s</button></form>"
+                 % (hidden, opts, "切换紧急出口" if stt["active"] else "启用紧急默认出口"))
+    else:
+        forms = "<p class=bad>当前模型里没有可用的出口, 无法设置。</p>"
+    if stt["active"] and not stt["stale"] and stt["original_available"]:
+        forms += ("<form method=post action=/emergency/restore>%s"
+                  "<br><button type=submit>一键恢复到启用前</button></form>" % hidden)
+    return page("PDG 救援 · 紧急默认出口",
+                "<h1>紧急默认出口</h1>"
+                "<p class=warn>%s</p>"
+                "<table>%s</table>%s"
+                "<h2>会改什么</h2>"
+                "<ul><li>只改数据模型里的 <code>route.final</code>, 以及由它派生的 mihomo 配置;</li>"
+                "<li>分流规则、优先级、规则集**一个字都不动**;</li>"
+                "<li>model / mihomo 配置 / 救援状态在**同一笔事务**里落盘, 失败一起回滚;</li>"
+                "<li>只重启内核(mihomo); mosdns、Bot、救援服务都不动。</li></ul>"
+                "%s%s<p><a href=/>返回状态</a></p>"
+                % (html.escape(EMERGENCY_SCOPE), rows, note, forms,
+                   ("<p class=%s>%s</p>" % (cls, html.escape(msg))) if msg else ""))
+
+
+def emergency_result_page(res, action):
+    rows = _row("操作", action) + _row("事务", res.get("txid") or "(无)") \
+        + _row("结果", res.get("state") or "", "ok" if res.get("ok") else "bad")
+    if res.get("changed"):
+        rows += _row("本次改动的目标", "、".join(res["changed"]))
+    if res.get("executed_actions"):
+        rows += _row("执行的服务动作", "、".join(res["executed_actions"]) or "(无)")
+    if res.get("note"):
+        rows += _row("说明", res["note"])
+    if res.get("error"):
+        rows += _row("错误", res["error"], "bad")
+    tail = ("<p class=ok>已生效。</p>" if res.get("ok")
+            else "<p class=bad>未生效 —— 事务已回滚到操作前, 现网配置没有半套状态。</p>")
+    return page("PDG 救援 · 紧急默认出口结果",
+                "<h1>紧急默认出口 · %s</h1><table>%s</table>%s"
+                "<p class=muted>%s</p>"
+                "<p><a href=/emergency>返回</a> · <a href=/>状态总览</a></p>"
+                % (html.escape(action), rows, tail, html.escape(EMERGENCY_SCOPE)))
 
 
 def degraded_page(what, snap_id="", why="事务核心不可用"):
@@ -1020,6 +1156,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             nonce = "" if err else self.server.nonces.issue(sid, snap, digest, OP_CONFIG, fmt)
             body = snapshot_confirm_page(snap, self.server.sessions.csrf(sid), nonce)
             self._send(200, body) if body else self._send(404, page("404", "<p>没有这份快照。</p>"))
+        elif path == "/emergency":
+            sid = self._sid()
+            stt = _emergency_status()
+            # 票绑当前**模型摘要**: 页面发出去之后模型被改过, 这张票就作废 —— 避免"看着 A
+            # 的候选列表按下去, 落到 B 上"。fmt 维度复用成"当前 final", 同样参与绑定。
+            digest = _emergency_digest(stt)
+            nonce = self.server.nonces.issue(sid, "emergency", digest, OP_EMERGENCY,
+                                             str((stt or {}).get("current_final")))
+            self._send(200, emergency_page(self.server.sessions.csrf(sid), nonce))
         elif path == "/audit":
             self._send(200, audit_page())
         elif path == "/logout":
@@ -1230,6 +1375,63 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except OSError:
             self.log_message("breakglass %s: 客户端已断开, 结果未能送达", snap)
 
+    def _post_emergency(self, action):
+        """紧急默认出口的启用/恢复。两者共用一套门: 会话 + CSRF + 与模型摘要绑定的一次性票。"""
+        if not self._authed():
+            self._send(401, login_page("请先登录。", self._issue_csrf()))
+            return
+        form = self._read_form()
+        if form is None:
+            self._send(413, page("413", "<p>请求体过大。</p>"))
+            return
+        if not self._csrf_ok(form):
+            self._send(403, page("403", "<p>表单已过期或来源不可信, 未执行任何操作。</p>"))
+            return
+        em = _emergency()
+        if em is None:
+            self._send(200, degraded_page("紧急默认出口", why="事务核心或紧急出口模块不可用"))
+            return
+        stt = _emergency_status()
+        if stt is None:
+            self._send(200, degraded_page("紧急默认出口", why="读不到当前数据模型"))
+            return
+        nonce = (form.get("nonce") or [""])[0]
+        # 票绑当前模型摘要与当前 final: 页面发出去之后模型被改过, 这张票就不该还能用
+        if not self.server.nonces.consume(nonce, self._sid(), "emergency",
+                                          _emergency_digest(stt), OP_EMERGENCY,
+                                          str(stt.get("current_final"))):
+            self._send(409, page("409", "<p class=warn>这个确认已经用过或已失效"
+                                        "(重复提交? 或配置在此期间变过)。请回到"
+                                        " <a href=/emergency>紧急默认出口</a> 重新确认。</p>"))
+            return
+        if action == "enable":
+            tag = (form.get("tag") or [""])[0]
+            # **重新枚举**核对: HTTP 传什么进来都不算数, 只认当前模型里真实存在的出口
+            if tag not in (stt.get("candidates") or []):
+                self._send(400, page("400", "<p>这个出口不在当前模型里, 未执行任何操作。</p>"))
+                return
+        if not self.server.recover_gate.acquire(blocking=False):
+            self._send(409, page("409", "<p class=warn>已有恢复操作正在执行, 请勿重复操作。</p>"))
+            return
+        self.log_message("emergency %s", action)
+        try:
+            if action == "enable":
+                res = em.enable(tag, paths=_tx_paths(), trigger_source="rescue")
+            else:
+                res = em.restore(paths=_tx_paths(), trigger_source="rescue")
+        except Exception as e:  # noqa: BLE001
+            self._send(500, page("500", "<p class=bad>紧急默认出口操作出错(%s), 请用 SSH 查看。</p>"
+                                 % html.escape(type(e).__name__)))
+            return
+        finally:
+            self.server.recover_gate.release()
+        code = 200 if res.get("ok") else (409 if res.get("busy") else 200)
+        try:
+            self._send(code, emergency_result_page(
+                res, "启用/切换" if action == "enable" else "一键恢复"))
+        except OSError:
+            self.log_message("emergency %s: 客户端已断开, 结果未能送达", action)
+
     def do_HEAD(self):
         self.do_GET()
 
@@ -1261,6 +1463,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         if path == "/breakglass/restore":
             self._post_breakglass()
+            return
+        if path in ("/emergency/enable", "/emergency/restore"):
+            self._post_emergency(path.rsplit("/", 1)[1])
             return
         if path != "/login":
             # 白名单之外的写路径一律明确拒绝(而不是 404 装作没有)

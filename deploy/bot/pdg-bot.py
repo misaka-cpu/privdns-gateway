@@ -1145,8 +1145,9 @@ def proxy_outbounds(c):
     return [o for o in c["outbounds"] if o.get("type") in PROXY_TYPES]
 
 def exit_tags(c):
-    """可作分流目标/默认出口的全部出口 (含 direct 与 urltest 故障组)。"""
-    return [o["tag"] for o in c["outbounds"] if o.get("type") in PROXY_TYPES + ("direct", "urltest")]
+    """可作分流目标/默认出口的全部出口 (含 direct 与 urltest 故障组)。实现在 mihomorender ——
+    救援侧的紧急默认出口要按**同一套**判据列候选, 两边各写一份迟早漂移。"""
+    return mihomorender.exit_tags(c)
 
 def concrete_tags(c):
     """具体出口 (可作故障组成员; 排除 urltest 组自身, 防嵌套环)。"""

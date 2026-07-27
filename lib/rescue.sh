@@ -54,7 +54,8 @@ opt/pdg-bot/breakglass.py
 opt/pdg-bot/rescue_nft.py
 opt/pdg-bot/rescue.sh
 etc/systemd/system/pdg-rescue.service
-etc/systemd/system/pdg-rescue.socket"
+etc/systemd/system/pdg-rescue.socket
+var/lib/privdns-gateway/rescue-state.json"
 
 # 逐行输出受保护成员(供 bash 侧过滤 tar 成员清单用)
 pdg_rescue_protected(){ printf '%s\n' "$PDG_RESCUE_PROTECTED_MEMBERS"; }

@@ -51,7 +51,7 @@ atexit.register(_reap_all)
 # sb2mihomo 渲染 —— 装机清单(10a)也要带上这两个, 否则真机上"恢复受管配置"会因为 import
 # 失败而整个降级。这里的清单就是那份清单的镜像。
 PDG_BOT_MODULES = ("pdgtx.py", "cfgrestore.py", "rescue_const.py", "rescue_nft.py",
-                   "mihomorender.py", "sb2mihomo.py")
+                   "mihomorender.py", "sb2mihomo.py", "emergency.py")
 RESCUE_MODULES = ("rescue.py", "rescue_cred.py", "breakglass.py")
 
 

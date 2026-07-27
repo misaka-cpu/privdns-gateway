@@ -241,6 +241,9 @@ jobs:
       - name: "混合规则 AND 语义 (跨字段 AND/同字段 OR/不支持组合拒绝/真 mihomo -t)"
         run: python3 tests/test-rule-mixed.py
 
+      - name: "紧急默认出口 (只改 route.final/三目标同事务/原值不被覆盖/stale 拒绝)"
+        run: python3 tests/test-emergency-exit.py
+
       - name: "迁移时机 (普通命令不暗中迁移; migrate 先锁先快照)"
         run: bash tests/test-migration-timing.sh
 

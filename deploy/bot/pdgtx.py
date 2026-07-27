@@ -115,6 +115,9 @@ _STATIC = {
     "dot_marker":     ("/opt/pdg-bot/dot-domain", 0o644, False, ("hostname_line",)),
     "cert_fullchain": ("/etc/mosdns/certs/fullchain.pem", 0o644, False, ("pem_cert",)),
     "cert_privkey":   ("/etc/mosdns/certs/privkey.pem", 0o600, True, ("pem_key",)),
+    # 救援平面的运行状态(紧急默认出口的原值等)。放 /var/lib 而不是 /etc: 它是运行态不是配置。
+    # 0600 —— 里面有出口 tag; 它们不是凭据, 但也没有任何理由让别的用户读到。
+    "rescue_state":   ("/var/lib/privdns-gateway/rescue-state.json", 0o600, False, ("json_any",)),
 }
 _MOSDNS_RULE_RE = re.compile(r"^[A-Za-z0-9_!.-]+\.txt$")
 _RULESET_RE = re.compile(r"^[A-Za-z0-9_.-]+\.(json|mrs)$")
@@ -162,6 +165,9 @@ _TARGET_ACTIONS = {
     "rs_meta": (),
     "profile_env": (),
     "dot_marker": (),
+    # 纯运行状态: 改它本身不牵动任何服务。真正要重启内核的是同一笔事务里的 model/mihomo_cfg,
+    # 由它们各自的动作推导 —— 不能因为"顺手记了个状态"就多重启一次。
+    "rescue_state": (),
 }
 _PREFIX_ACTIONS = (("mosdns_rule:", ("restart:mosdns",)),
                    ("ruleset:", ("restart:mihomo",)),

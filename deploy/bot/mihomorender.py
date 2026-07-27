@@ -242,6 +242,18 @@ def rulesets_arg(meta):
     return out
 
 
+def exit_tags(model):
+    """可作分流目标 / 默认出口的全部出口(含 direct 与 urltest 故障组)。
+
+    判据与 bot 的 exit_tags 同源(都建立在 sb2mihomo.PROXY_TYPES 上)—— 救援侧要按**同一套**
+    语义列候选, 否则页面上能选的和 bot 认的会漂移。selector / block / dns 不在其中: 前者不是
+    本项目的形态, 后两者根本不是出口。"""
+    import sb2mihomo
+    allow = sb2mihomo.PROXY_TYPES + ("direct", "urltest")
+    return [o["tag"] for o in (model or {}).get("outbounds", [])
+            if isinstance(o, dict) and o.get("type") in allow and o.get("tag")]
+
+
 def panel_args(model):
     """把 model 的 experimental.clash_api(面板状态)透传给渲染器 —— mihomo 原生 clash API,
     面板开关/secret/external_ui 语义与 sing-box 一致, 无需另建状态。"""
