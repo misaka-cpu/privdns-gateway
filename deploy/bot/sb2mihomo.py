@@ -235,6 +235,78 @@ def _rule_set_names(value):
     return names, ""
 
 
+# 本路径**当前实际支持**的匹配字段(有序 —— 决定 AND 里条件组的输出顺序, 顺序稳定才可测)。
+# 这是一次盘点的结果, 不是愿望清单: 只有这四个字段有对应的 mihomo 规则前缀。
+_MATCH_FIELDS = (("rule_set", "RULE-SET"), ("domain_suffix", "DOMAIN-SUFFIX"),
+                 ("domain", "DOMAIN"), ("domain_keyword", "DOMAIN-KEYWORD"))
+# 不是"匹配条件"的键: action 在上面的 reject 分支处理, outbound 是目标本身。
+_NON_COND_KEYS = frozenset({"action", "outbound"})
+# inbound 由 _mixed_listeners 单独译成 IN-NAME(见那个函数)。它**单独出现**时本路径不产规则,
+# 这是既有行为; 但和别的条件混在一条规则里就没法在这里表达了 —— 那时 fail-closed。
+_ELSEWHERE_KEYS = frozenset({"inbound"})
+
+
+def _cond_values(field, raw):
+    """取一个匹配字段的值列表(同字段多值 = OR 组)。返回 (values, err)。"""
+    if field == "rule_set":
+        return _rule_set_names(raw)
+    vals = [raw] if isinstance(raw, str) else raw
+    if not isinstance(vals, list) or not vals:
+        return None, "(%s 形态不合法: %s)" % (field, type(raw).__name__)
+    for v in vals:
+        if not isinstance(v, str):
+            return None, "(%s 里有非字符串: %s)" % (field, type(v).__name__)
+        if not v.strip():
+            return None, "(%s 含空值)" % field
+    return list(vals), ""
+
+
+def _rule_condition_groups(r):
+    """一条 sing-box route 规则 → (条件组列表, err)。
+
+    条件组 = **同一字段**的多个值(它们之间是 OR); 组与组之间是 **AND** —— 这正是 sing-box
+    的规则语义。原实现遇到 rule_set 就 continue, 把同一条规则里的其它条件全丢了; 而把混合
+    条件摊平成多条顶层 mihomo 规则同样不行 —— 顶层规则之间是 OR, 那会**扩大**命中范围。
+
+    认不出的字段一律 fail-closed 并点名: 静默忽略的后果是"规则看着加了却没按预期生效"。"""
+    groups = []
+    for field, prefix in _MATCH_FIELDS:
+        if field not in r:
+            continue
+        vals, err = _cond_values(field, r[field])
+        if err:
+            return None, err
+        groups.append((prefix, vals))
+    extra = sorted(set(r) - _NON_COND_KEYS - _ELSEWHERE_KEYS
+                   - {f for f, _ in _MATCH_FIELDS})
+    if extra:
+        return None, "(本转换器不支持的条件字段: %s)" % ", ".join(extra)
+    elsewhere = sorted(set(r) & _ELSEWHERE_KEYS)
+    if elsewhere:
+        # inbound 只在**单独出现**时才由 _mixed_listeners 负责(译成 IN-NAME)。它和域名等
+        # 条件混在同一条规则里就是一个 AND, 而本路径表达不了"入口 + 域名" —— 若只译域名那
+        # 一半, 命中范围会从"该入口的这些域名"扩大成"所有入口的这些域名"。
+        if groups:
+            return None, "(本转换器无法表达 %s 与其它条件的组合)" % ", ".join(elsewhere)
+        return [], ""
+    if not groups:
+        return None, "(规则没有可翻译的匹配条件)"
+    return groups, ""
+
+
+def _logic_rule(groups, target):
+    """多个条件组 → 一条 mihomo 逻辑规则(外层 AND, 同字段多值时内层 OR)。
+
+    形态取自钉死版 mihomo 的实测:
+      AND,((OR,((RULE-SET,a),(RULE-SET,b))),(DOMAIN-SUFFIX,x)),TARGET
+    顺序由 _MATCH_FIELDS 与各字段的原始值序决定 —— 稳定可测, 不排序也不去重。"""
+    parts = []
+    for prefix, vals in groups:
+        atoms = ["(%s,%s)" % (prefix, v) for v in vals]
+        parts.append(atoms[0] if len(atoms) == 1 else "(OR,(%s))" % ",".join(atoms))
+    return "AND,(%s),%s" % (",".join(parts), target)
+
+
 def _rules_from_route(sb, direct_tags, rulesets):
     rules = []
     dropped = []
@@ -249,30 +321,33 @@ def _rules_from_route(sb, direct_tags, rulesets):
             dropped.append(r)
             continue
         target = _map_target(out, direct_tags)
-        if "rule_set" in r:
-            names, err = _rule_set_names(r["rule_set"])
-            if err:
-                # fail-closed: 形态不认识就整条不译, 交上层点名报错。绝不把 Python 的
-                # list/dict 直接 str() 写进 mihomo 配置 —— 那会渲染出一条永不命中的规则,
-                # 而用户以为分流已经生效。
-                dropped.append({"rule_set": err, "outbound": out})
-                continue
-            # 数组按**原始顺序**逐个展开成 RULE-SET, 目标相同。
-            # 等价性: sing-box 里同一字段的多个值是 OR(命中任一即用该 outbound); mihomo 是
-            # 首条命中即止, 连续几条指向同一 target 的 RULE-SET 合起来正是这个并集。所以不
-            # 排序、不去重 —— 顺序变了就不再是同一条语义。
-            for name in names:
-                if rulesets is not None and name in rulesets:
-                    rules.append(f"RULE-SET,{name},{target}")
-                else:
-                    dropped.append({"rule_set": name, "outbound": out})
+        groups, err = _rule_condition_groups(r)
+        if err:
+            # fail-closed: 形态或字段不认识就整条不译, 交上层点名报错。绝不把认不出的东西
+            # 近似成一条"差不多"的规则 —— 那会渲染出一条永不命中(或命中过宽)的规则, 而
+            # 用户以为分流已经生效。
+            dropped.append({"rule_set": err, "outbound": out})
             continue
-        for d in r.get("domain_suffix", []):
-            rules.append(f"DOMAIN-SUFFIX,{d},{target}")
-        for d in r.get("domain", []):
-            rules.append(f"DOMAIN,{d},{target}")
-        for kw in r.get("domain_keyword", []):
-            rules.append(f"DOMAIN-KEYWORD,{kw},{target}")
+        if not groups:
+            continue                      # 纯 inbound 规则, 由 _mixed_listeners 负责
+        # 规则集必须真的存在才译得出。多条件组时缺一个就整条不译 —— 少一个 AND 条件就是
+        # **扩大**命中范围, 比不译更危险。
+        missing = [v for prefix, vals in groups if prefix == "RULE-SET"
+                   for v in vals if rulesets is None or v not in rulesets]
+        if missing and len(groups) > 1:
+            dropped.append({"rule_set": missing[0], "outbound": out})
+            continue
+        if len(groups) == 1:
+            # 单条件组: 沿用原来的扁平输出 —— 同字段多值时顶层多条规则之间正是 OR, 语义相同,
+            # 而且现有普通配置的产出逐字节不变。
+            prefix, vals = groups[0]
+            for v in vals:
+                if prefix == "RULE-SET" and v in missing:
+                    dropped.append({"rule_set": v, "outbound": out})
+                else:
+                    rules.append(f"{prefix},{v},{target}")
+            continue
+        rules.append(_logic_rule(groups, target))
     final = sb.get("route", {}).get("final")
     rules.append(f"MATCH,{_map_target(final, direct_tags) if final else 'DIRECT'}")
     return rules, dropped

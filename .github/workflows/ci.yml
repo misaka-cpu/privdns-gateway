@@ -238,6 +238,9 @@ jobs:
       - name: "渲染判废默认安全 (pdgtx 缺失/损坏/旧版时 str/repr/审计均不含用户值)"
         run: python3 tests/test-render-refusal.py
 
+      - name: "混合规则 AND 语义 (跨字段 AND/同字段 OR/不支持组合拒绝/真 mihomo -t)"
+        run: python3 tests/test-rule-mixed.py
+
       - name: "迁移时机 (普通命令不暗中迁移; migrate 先锁先快照)"
         run: bash tests/test-migration-timing.sh
 
