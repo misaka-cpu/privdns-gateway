@@ -226,6 +226,9 @@ jobs:
       - name: "旧结构强确认与降级边界 (LEGACY- 双条件/票绑结构版本/旧核心不支持不报500)"
         run: python3 tests/test-rescue-legacy-confirm.py
 
+      - name: "渲染链特征基线 (mrs/zstd behavior 真值表 + rulesets 分类 + 逐字节锚点)"
+        run: python3 tests/test-render-characterize.py
+
       - name: "迁移时机 (普通命令不暗中迁移; migrate 先锁先快照)"
         run: bash tests/test-migration-timing.sh
 
