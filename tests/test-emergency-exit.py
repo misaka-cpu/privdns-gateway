@@ -322,6 +322,32 @@ open(sp, "w").write(json.dumps({"schema_version": 99, "active": True,
 eq("未知 schema_version → 当作未启用", em.status(read_model(box),
                                                 open(sp, "rb").read())["active"], False)
 
+# ══ 8b. 旧状态文件里的 enable_txid 兼容忽略 ═══════════════════════════════
+print()
+print("── 8b. 旧字段兼容 ──")
+open(sp, "w").write(json.dumps({"schema_version": 1, "active": True,
+                                "original_present": True, "original_final": "jp",
+                                "emergency_final": "hk", "enabled_at": 111,
+                                "enable_txid": "老版本写下的 txid",
+                                "route_digest": "abc", "last_state": "active"}))
+_m = read_model(box)
+_m["route"]["final"] = "hk"
+open(os.path.join(box.root, "etc/sing-box/config.json"), "w").write(json.dumps(_m))
+stt = em.status(read_model(box), open(sp, "rb").read())
+if stt["active"] and not stt["stale"] and stt["original_final"] == "jp":
+    ok("旧状态文件(带 enable_txid)照常读得懂, 多出来的键被忽略")
+else:
+    bad("旧状态读不对: %r" % stt)
+res = em.restore(paths=paths_for(box))
+if res["state"] == "COMMITTED" and read_model(box)["route"]["final"] == "jp":
+    ok("从旧状态文件恢复成功")
+else:
+    bad("旧状态恢复失败: %r" % res)
+if "enable_txid" not in json.dumps(read_state(box)):
+    ok("重写后的状态里不再有 enable_txid(恒为空的字段已删除)")
+else:
+    bad("状态里仍有 enable_txid")
+
 # ══ 9. 审计 ═══════════════════════════════════════════════════════════════
 print()
 print("── 9. 审计 ──")
@@ -413,6 +439,10 @@ else:
             break
     else:
         ok("页面显示当前 final / 状态 / 可选出口")
+    if "候选仅表示配置存在" in body and "不保证当前网络可达" in body:
+        ok("页面写明「候选仅表示配置存在, 不保证当前网络可达」")
+    else:
+        bad("页面缺少可达性说明")
     if "block" not in _re.sub(r"<[^>]+>", " ", body):
         ok("候选里不含 block 之类的内部出站")
     else:
@@ -488,6 +518,15 @@ else:
         ok("HTTP 恢复后 route.final 精确还原")
     else:
         bad("恢复后 final=%r" % m["route"]["final"])
+    # 紧急出口整个来回之后, 既有规则译出来的 mihomo 规则**逐条不变**
+    import sb2mihomo as _sb  # noqa: E402
+    _cfg, _mt = _sb.singbox_to_mihomo(m, redir_port=7893, rulesets={
+        "rs_x": {"url": "https://ex.test/x.list", "behavior": "classical", "format": "text"}})
+    _want = ["DOMAIN-SUFFIX,keep.test,hk", "RULE-SET,rs_x,jp", "MATCH,jp"]
+    if [r for r in _cfg["rules"] if not r.startswith("IN-NAME")] == _want:
+        ok("紧急出口来回之后, 既有规则的译文逐条不变")
+    else:
+        bad("规则译文变了: %r" % _cfg["rules"])
     # 哨兵不得进入页面
     leaks = [p for p in ("/", "/emergency", "/audit")
              if SENTINEL in inst.req("GET", p, cookie=cookie)[1]]
@@ -504,6 +543,13 @@ else:
 inst.stop()
 shutil.rmtree(work, ignore_errors=True)
 hbox.clean()
+
+# 页面上不做可达性探测 —— 用户打开它时往往正处在网络不通的状态
+_emsrc = open(os.path.join(ROOT, "deploy/bot/emergency.py"), encoding="utf-8").read()
+if not any(k in _emsrc for k in ("urlopen", "requests.", "create_connection", "generate_204")):
+    ok("紧急出口实现里没有任何外网探测")
+else:
+    bad("引入了外网探测")
 
 print("─" * 40)
 print("通过 %d, 失败 %d" % (PASS[0], FAIL[0]))

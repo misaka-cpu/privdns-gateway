@@ -239,6 +239,10 @@ def _rule_set_names(value):
 # 这是一次盘点的结果, 不是愿望清单: 只有这四个字段有对应的 mihomo 规则前缀。
 _MATCH_FIELDS = (("rule_set", "RULE-SET"), ("domain_suffix", "DOMAIN-SUFFIX"),
                  ("domain", "DOMAIN"), ("domain_keyword", "DOMAIN-KEYWORD"))
+# reject 分支额外认 ip_cidr —— 那是它**本来就支持**的字段(见下面的 REJECT 处理)。IP-CIDR 带
+# no-resolve: 不为了一条阻断规则去解析域名, 这是既有行为, 逻辑规则里也照带(实测钉死版接受)。
+_REJECT_FIELDS = (("ip_cidr", "IP-CIDR"),) + _MATCH_FIELDS
+_ATOM_SUFFIX = {"IP-CIDR": "no-resolve"}
 # 不是"匹配条件"的键: action 在上面的 reject 分支处理, outbound 是目标本身。
 _NON_COND_KEYS = frozenset({"action", "outbound"})
 # inbound 由 _mixed_listeners 单独译成 IN-NAME(见那个函数)。它**单独出现**时本路径不产规则,
@@ -261,7 +265,7 @@ def _cond_values(field, raw):
     return list(vals), ""
 
 
-def _rule_condition_groups(r):
+def _rule_condition_groups(r, fields=_MATCH_FIELDS):
     """一条 sing-box route 规则 → (条件组列表, err)。
 
     条件组 = **同一字段**的多个值(它们之间是 OR); 组与组之间是 **AND** —— 这正是 sing-box
@@ -270,7 +274,7 @@ def _rule_condition_groups(r):
 
     认不出的字段一律 fail-closed 并点名: 静默忽略的后果是"规则看着加了却没按预期生效"。"""
     groups = []
-    for field, prefix in _MATCH_FIELDS:
+    for field, prefix in fields:
         if field not in r:
             continue
         vals, err = _cond_values(field, r[field])
@@ -278,7 +282,7 @@ def _rule_condition_groups(r):
             return None, err
         groups.append((prefix, vals))
     extra = sorted(set(r) - _NON_COND_KEYS - _ELSEWHERE_KEYS
-                   - {f for f, _ in _MATCH_FIELDS})
+                   - {f for f, _ in fields})
     if extra:
         return None, "(本转换器不支持的条件字段: %s)" % ", ".join(extra)
     elsewhere = sorted(set(r) & _ELSEWHERE_KEYS)
@@ -294,15 +298,28 @@ def _rule_condition_groups(r):
     return groups, ""
 
 
+def _atom(prefix, value):
+    """一个条件原子。IP-CIDR 带 no-resolve(实测钉死版 mihomo 在逻辑规则里也认这个参数)。"""
+    suf = _ATOM_SUFFIX.get(prefix)
+    return "(%s,%s%s)" % (prefix, value, ("," + suf) if suf else "")
+
+
+def _flat_rule(prefix, value, target):
+    """单条件组时的扁平规则。后缀跟在 target **之后** —— 与逻辑规则里的位置不同, 这是
+    mihomo 的既有语法, 也是本项目现网那条 reject 规则逐字节的样子。"""
+    suf = _ATOM_SUFFIX.get(prefix)
+    return "%s,%s,%s%s" % (prefix, value, target, ("," + suf) if suf else "")
+
+
 def _logic_rule(groups, target):
     """多个条件组 → 一条 mihomo 逻辑规则(外层 AND, 同字段多值时内层 OR)。
 
     形态取自钉死版 mihomo 的实测:
       AND,((OR,((RULE-SET,a),(RULE-SET,b))),(DOMAIN-SUFFIX,x)),TARGET
-    顺序由 _MATCH_FIELDS 与各字段的原始值序决定 —— 稳定可测, 不排序也不去重。"""
+    顺序由字段表与各字段的原始值序决定 —— 稳定可测, 不排序也不去重。"""
     parts = []
     for prefix, vals in groups:
-        atoms = ["(%s,%s)" % (prefix, v) for v in vals]
+        atoms = [_atom(prefix, v) for v in vals]
         parts.append(atoms[0] if len(atoms) == 1 else "(OR,(%s))" % ",".join(atoms))
     return "AND,(%s),%s" % (",".join(parts), target)
 
@@ -313,12 +330,33 @@ def _rules_from_route(sb, direct_tags, rulesets):
     for r in sb.get("route", {}).get("rules", []):
         action = r.get("action")
         if action == "reject":
-            for cidr in r.get("ip_cidr", []):
-                rules.append(f"IP-CIDR,{cidr},REJECT,no-resolve")
+            # 阻断规则同样走条件组。原实现读完 ip_cidr 就 continue, 同规则里的 domain_suffix
+            # 等条件被整个丢掉 —— 那会**扩大拒绝范围**(本该"这个网段且这个域名才拒"变成
+            # "这个网段一律拒"), 比普通分流的误差危险得多: 用户看到的是连不上, 而不是走错出口。
+            groups, err = _rule_condition_groups(r, _REJECT_FIELDS)
+            if err:
+                dropped.append({"rule_set": err, "outbound": "REJECT"})
+                continue
+            if not groups:
+                # 纯 inbound 的 reject 本路径表达不了; 什么条件都没有的 reject 更是"拒绝一切",
+                # 绝不能猜。两者都点名丢弃。
+                dropped.append({"rule_set": "(reject 规则没有可翻译的匹配条件)",
+                                "outbound": "REJECT"})
+                continue
+            if len(groups) == 1:
+                prefix, vals = groups[0]
+                for v in vals:
+                    rules.append(_flat_rule(prefix, v, "REJECT"))
+            else:
+                rules.append(_logic_rule(groups, "REJECT"))
             continue
         out = r.get("outbound")
         if not out:
-            dropped.append(r)
+            # 没有 outbound 也没有 action: 这条规则没有目标, 译不出来。**只记安全描述**,
+            # 不把整条原始规则塞进 dropped —— 那里面可能有任意用户值, 而 dropped 会进
+            # 判废信息与审计。
+            dropped.append({"rule_set": "(规则没有 outbound, 无法确定目标)",
+                            "outbound": "(无)"})
             continue
         target = _map_target(out, direct_tags)
         groups, err = _rule_condition_groups(r)

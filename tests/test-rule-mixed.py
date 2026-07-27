@@ -148,6 +148,59 @@ if not body and dropped and dropped[0].get("rule_set") == "rs_missing":
 else:
     bad("缺规则集处理不对: body=%r dropped=%r" % (body, dropped))
 
+# ══ 4b. action=reject 同样走条件组 ═════════════════════════════════════════
+print()
+print("── 4b. reject 的 AND/OR ──")
+
+
+def convert_reject(rule):
+    sb = {"log": {}, "inbounds": [], "outbounds": BASE_OUT,
+          "route": {"rules": [rule], "final": "direct"}}
+    cfg, meta = sb2mihomo.singbox_to_mihomo(sb, redir_port=7893, rulesets=RULESETS)
+    return ([r for r in cfg.get("rules", []) if not r.startswith("MATCH,")],
+            (meta or {}).get("dropped") or [])
+
+
+# 现网那条(模板里就是这个形态)必须逐字节不变 —— 含 no-resolve 且跟在 REJECT 之后
+eq("reject + 单个 ip_cidr: 与现网逐字节一致",
+   convert_reject({"action": "reject", "ip_cidr": ["1.2.3.0/24"]})[0],
+   ["IP-CIDR,1.2.3.0/24,REJECT,no-resolve"])
+eq("reject + 多个 ip_cidr(同字段 OR → 顶层多条)",
+   convert_reject({"action": "reject", "ip_cidr": ["1.2.3.0/24", "10.0.0.0/8"]})[0],
+   ["IP-CIDR,1.2.3.0/24,REJECT,no-resolve", "IP-CIDR,10.0.0.0/8,REJECT,no-resolve"])
+# 混合条件: 原实现读完 ip_cidr 就 continue, domain_suffix 被丢 → **扩大拒绝范围**
+eq("reject + ip_cidr + domain_suffix → AND(不再丢条件, 不再扩大拒绝范围)",
+   convert_reject({"action": "reject", "ip_cidr": ["1.2.3.0/24"],
+                   "domain_suffix": ["ad.test"]})[0],
+   ["AND,((IP-CIDR,1.2.3.0/24,no-resolve),(DOMAIN-SUFFIX,ad.test)),REJECT"])
+eq("reject: 同字段多值在 AND 内层是 OR, no-resolve 逐个带上",
+   convert_reject({"action": "reject", "ip_cidr": ["1.2.3.0/24", "10.0.0.0/8"],
+                   "domain_suffix": ["ad.test"]})[0],
+   ["AND,((OR,((IP-CIDR,1.2.3.0/24,no-resolve),(IP-CIDR,10.0.0.0/8,no-resolve))),"
+    "(DOMAIN-SUFFIX,ad.test)),REJECT"])
+eq("reject + rule_set + domain_keyword(三组)",
+   convert_reject({"action": "reject", "ip_cidr": ["1.2.3.0/24"], "rule_set": "rs_a",
+                   "domain_keyword": ["kw"]})[0],
+   ["AND,((IP-CIDR,1.2.3.0/24,no-resolve),(RULE-SET,rs_a),(DOMAIN-KEYWORD,kw)),REJECT"])
+for label, rule in (("network", {"action": "reject", "ip_cidr": ["1.2.3.0/24"],
+                                 "network": ["udp"]}),
+                    ("invert", {"action": "reject", "ip_cidr": ["1.2.3.0/24"], "invert": True}),
+                    ("port", {"action": "reject", "port": [53]}),
+                    ("什么条件都没有", {"action": "reject"})):
+    body, dropped = convert_reject(rule)
+    if body:
+        bad("reject/%s: 竟然产出了规则(拒绝范围可能被扩大): %r" % (label, body))
+    elif not dropped:
+        bad("reject/%s: 静默忽略" % label)
+    else:
+        ok("reject/%s → 拒绝转换并点名(%s)" % (label, dropped[0]["rule_set"]))
+# 没有 outbound 也没有 action 的规则: dropped 里只放安全描述, 不塞整条原始规则
+_b, _d = convert({"domain_suffix": ["x.test"], "server": "SECRET-" + "z" * 20})
+if _d and "SECRET" not in json.dumps(_d, ensure_ascii=False):
+    ok("无目标的规则: dropped 只记安全描述, 不把原始规则倒进去")
+else:
+    bad("dropped 泄漏了原始规则: %r" % _d)
+
 # ══ 5. 参考匹配模型: 验 AND/OR 拓扑(不代替 mihomo -t)══════════════════════
 print()
 print("── 5. 参考匹配模型(真值表)──")
@@ -266,6 +319,9 @@ else:
               {"domain": ["x.test"], "domain_keyword": ["kw"], "outbound": "direct"},
               {"rule_set": ["rs_a", "rs_b"], "outbound": "ss1"},
               {"domain_suffix": ["plain.test"], "outbound": "ss1"},
+              {"action": "reject", "ip_cidr": ["9.9.9.0/24"]},
+              {"action": "reject", "ip_cidr": ["8.8.8.0/24", "7.7.7.0/24"],
+               "domain_suffix": ["ad.test"]},
           ], "final": "direct"}}
     cfg, meta = sb2mihomo.singbox_to_mihomo(SB, redir_port=7893, rulesets=RULESETS)
     rc, out = mihomo_check(cfg)
@@ -278,10 +334,14 @@ else:
     else:
         bad("有条目被丢: %r" % meta["dropped"])
     logic = [r for r in cfg["rules"] if r.startswith("AND,")]
-    if len(logic) == 3:
-        ok("生成了 3 条逻辑规则(其余保持扁平)")
+    if len(logic) == 4:
+        ok("生成了 4 条逻辑规则(含一条 reject 的 AND; 其余保持扁平)")
     else:
         bad("逻辑规则条数不对: %r" % logic)
+    if "IP-CIDR,9.9.9.0/24,REJECT,no-resolve" in cfg["rules"]:
+        ok("单条件 reject 仍是扁平形态且带 no-resolve")
+    else:
+        bad("单条件 reject 形态变了")
 
 print("─" * 40)
 print("通过 %d, 失败 %d" % (PASS[0], FAIL[0]))

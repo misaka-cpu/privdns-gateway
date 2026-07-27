@@ -50,9 +50,13 @@ def _sha_of(obj):
 
 
 def blank_state():
+    # 刻意**没有** enable_txid: txid 要到 stage 之后才定, 想写进状态就得再改一次状态文件,
+    # 与"三个目标一笔事务"冲突。留一个恒为空的字段只会让人以为"没记录" —— 追溯以 pdgtx 的
+    # 审计为准(那里有 txid)。旧状态文件里带着这个键也不要紧: 下面按本表的键逐个取, 多出来的
+    # 一律忽略。
     return {"schema_version": SCHEMA_VERSION, "active": False, "original_present": False,
             "original_final": "", "emergency_final": "", "enabled_at": 0,
-            "enable_txid": "", "route_digest": "", "last_state": "inactive"}
+            "route_digest": "", "last_state": "inactive"}
 
 
 def parse_state(raw):
@@ -208,7 +212,7 @@ def enable(tag, *, paths, trigger_source="rescue"):
             "original_final": base_final or "", "emergency_final": tag,
             "enabled_at": st["enabled_at"] if (st["active"] and st["enabled_at"])
             else int(time.time()),
-            "enable_txid": "", "route_digest": _sha_of(model.get("route") or {})[:16],
+            "route_digest": _sha_of(model.get("route") or {})[:16],
             "last_state": "active"})
         return new_model, new_state, ""
 

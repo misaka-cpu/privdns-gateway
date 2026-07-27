@@ -578,6 +578,10 @@ def status_page():
 # 于是在排障时得出完全错误的结论(比如以为某个域名也走了这条链路)。实际只换 route.final。
 EMERGENCY_SCOPE = ("紧急默认出口只修改 route.final。已有高优先级规则仍会命中各自出口, "
                    "这不是全局强制单出口。")
+# 候选是从**当前模型**枚举出来的, 只说明"这个出口配置在那儿"。这里刻意**不做**任何公网可达性
+# 探测: 用户打开这个页面时往往正处在网络不通的状态, 探测只会把本来就慢的页面拖住, 还可能把
+# "探不通"误判成"这个出口不能选" —— 而那恰恰可能是他唯一能用的那个。
+EMERGENCY_REACH = "候选仅表示配置存在, 不保证当前网络可达。"
 
 
 def emergency_page(csrf, nonce, msg="", cls="warn"):
@@ -631,6 +635,7 @@ def emergency_page(csrf, nonce, msg="", cls="warn"):
     return page("PDG 救援 · 紧急默认出口",
                 "<h1>紧急默认出口</h1>"
                 "<p class=warn>%s</p>"
+                "<p class=muted>%s</p>"
                 "<table>%s</table>%s"
                 "<h2>会改什么</h2>"
                 "<ul><li>只改数据模型里的 <code>route.final</code>, 以及由它派生的 mihomo 配置;</li>"
@@ -638,8 +643,8 @@ def emergency_page(csrf, nonce, msg="", cls="warn"):
                 "<li>model / mihomo 配置 / 救援状态在**同一笔事务**里落盘, 失败一起回滚;</li>"
                 "<li>只重启内核(mihomo); mosdns、Bot、救援服务都不动。</li></ul>"
                 "%s%s<p><a href=/>返回状态</a></p>"
-                % (html.escape(EMERGENCY_SCOPE), rows, note, forms,
-                   ("<p class=%s>%s</p>" % (cls, html.escape(msg))) if msg else ""))
+                % (html.escape(EMERGENCY_SCOPE), html.escape(EMERGENCY_REACH), rows, note,
+                   forms, ("<p class=%s>%s</p>" % (cls, html.escape(msg))) if msg else ""))
 
 
 def emergency_result_page(res, action):
