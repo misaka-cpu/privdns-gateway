@@ -153,7 +153,7 @@ else:
     ok("未知 txid 与路径穿越一律 404, 不返回任何文件内容")
 
 # ── 5. 写路径白名单: 名单外一律 405; 名单内(recover)缺 CSRF 一律 403 ─────────
-for p_ in ("/snapshot/restore", "/service/restart", "/minimal/enter", "/anything"):
+for p_ in ("/service/restart", "/minimal/enter", "/anything", "/tx/abort"):
     st, _b, _sc, _h = inst.req("POST", p_, body="x=1", cookie=cookie)
     if st != 405:
         bad("白名单外的写路径 %s 返回 %s(应为 405)" % (p_, st))

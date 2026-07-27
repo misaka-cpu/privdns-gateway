@@ -47,6 +47,16 @@ AUDIT_TAIL = 30                                        # 审计只回最近这�
 
 
 # ── 事务核心: 有就用, 没有也要能开页面(它可能正是坏掉的那一个) ────────────────
+def _cfgrestore():
+    """受管配置恢复的共享实现。它只依赖 pdgtx, **不导入 bot / Telegram 交互层** ——
+    救援平面要能在 Bot 起不来时照样工作。"""
+    try:
+        import cfgrestore
+        return cfgrestore
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _pdgtx():
     try:
         import pdgtx
@@ -261,6 +271,37 @@ class Sessions:
         self._s.clear()
 
 
+class Nonces:
+    """一次性确认 nonce: 与会话、快照 ID、快照摘要三者绑定。
+
+    只有 CSRF 的话, 刷新/双击/重放同一个表单会重复执行一次危险操作 —— 而"重复执行一次配置
+    恢复"意味着又一轮落盘与重启。nonce 用掉即废, 于是双击的第二下拿到的是明确的"已执行过"。"""
+
+    def __init__(self, ttl=900):
+        self.ttl = ttl
+        self._n = {}                      # nonce -> (sid, snap, digest, exp)
+
+    def issue(self, sid, snap, digest):
+        n = secrets.token_urlsafe(18)
+        self._n[n] = (sid, snap, digest, time.time() + self.ttl)
+        # 顺手清过期的, 免得长期运行的服务里越积越多
+        for k, v in list(self._n.items()):
+            if v[3] < time.time():
+                self._n.pop(k, None)
+        return n
+
+    def consume(self, n, sid, snap, digest):
+        """一次性核销。任何一项对不上都不算数, 且**不给出是哪一项不对**。"""
+        rec = self._n.pop(n, None)
+        if not rec:
+            return False
+        s_, sn_, dg_, exp = rec
+        if time.time() > exp:
+            return False
+        return (hmac.compare_digest(s_, sid) and hmac.compare_digest(sn_, snap)
+                and hmac.compare_digest(dg_, digest))
+
+
 class RateLimit:
     """登录失败限速 + 锁定。按来源地址计, 只放内存(重启即清)。
 
@@ -457,14 +498,97 @@ def snapshots_page():
     if not snaps:
         body = "<p class=muted>没有快照。</p>"
     else:
-        body = "<table><tr><th>快照</th><th>大小</th><th>时间</th></tr>" + "".join(
-            "<tr><td>%s</td><td>%.1f MB</td><td>%s</td></tr>" % (
+        body = "<table><tr><th>快照</th><th>大小</th><th>时间</th><th></th></tr>" + "".join(
+            "<tr><td>%s</td><td>%.1f MB</td><td>%s</td>"
+            "<td><a href='/snapshot/%s'>查看可恢复的配置</a></td></tr>" % (
                 html.escape(s["name"]), s["size"] / 1048576.0,
-                time.strftime("%Y-%m-%d %H:%M", time.localtime(s["mtime"])))
+                time.strftime("%Y-%m-%d %H:%M", time.localtime(s["mtime"])),
+                html.escape(s["name"]))
             for s in snaps) + "</table>"
     return page("PDG 救援 · 快照",
-                "<h1>快照</h1>%s<p class=muted>恢复操作在后续版本接入。</p>"
+                "<h1>快照</h1>%s"
+                "<p class=muted>本页只提供**受管配置**的事务恢复(可回滚)。"
+                "二进制、Bot 程序、平台/内核标记与凭据不在其中。</p>"
                 "<p><a href=/>返回</a></p>" % body)
+
+
+def snapshot_confirm_page(snap_id, csrf, nonce, sessions=None):
+    """确认页: 在动手之前把"会换什么、不会换什么"摊开说清楚。"""
+    cr = _cfgrestore()
+    if cr is None:
+        return None
+    if snap_id not in cr.snapshot_ids():
+        return None
+    members, err = cr.list_members(snap_id)
+    if err:
+        return page("PDG 救援 · 快照", "<h1>快照 %s</h1><p class=bad>%s</p>"
+                    "<p><a href=/snapshots>返回</a></p>" % (html.escape(snap_id), html.escape(err)))
+    restorable, excluded, unknown = cr.classify(members)
+    fmt = cr.snap_format(members)
+    digest = cr.snapshot_digest(snap_id)
+    p = cr.snapshot_path(snap_id)
+    made = time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(p))) if p else "?"
+    rows = _row("快照 ID", snap_id) + _row("创建时间", made) + _row("结构版本", fmt) \
+        + _row("内容摘要", digest[:16] + "…") + _row("来源", "本机 pdg snapshot")
+    tgt = "".join("<li>%s → <code>%s</code></li>" % (html.escape(m), html.escape(t))
+                  for m, t in sorted(restorable.items())) or "<li class=muted>没有</li>"
+    exc = "".join("<li>%s <span class=muted>(%s)</span></li>" % (html.escape(n), html.escape(k))
+                  for n, k in (excluded + unknown)) or "<li class=muted>没有</li>"
+    missing = [t for t in sorted(set(cr.MEMBER_TARGET.values()))
+               if t not in set(restorable.values())]
+    miss = "".join("<li><code>%s</code></li>" % html.escape(t) for t in missing) \
+        or "<li class=muted>没有</li>"
+    form = ""
+    if fmt != "v1.6":
+        form = ("<p class=bad>这份快照的结构(%s)无法安全映射成当前的受管配置目标, "
+                "只能使用紧急完整恢复。本页不做结构转换。</p>" % html.escape(fmt))
+    elif not restorable:
+        form = "<p class=bad>这份快照里没有可事务恢复的受管配置。</p>"
+    else:
+        form = ("<form method=post action=/snapshot/restore>"
+                "<input type=hidden name=csrf value='%s'>"
+                "<input type=hidden name=snapshot value='%s'>"
+                "<input type=hidden name=digest value='%s'>"
+                "<input type=hidden name=nonce value='%s'>"
+                "<label><input type=checkbox name=confirm value=yes> "
+                "我确认只恢复上面列出的受管配置</label>"
+                "<br><button type=submit>恢复受管配置</button></form>"
+                % (csrf, html.escape(snap_id), html.escape(digest), nonce))
+    return page("PDG 救援 · 快照 %s" % snap_id,
+                "<h1>快照 %s</h1><table>%s</table>"
+                "<h2>可以事务恢复的配置</h2><ul>%s</ul>"
+                "<h2>缺失的目标(本次跳过)</h2><ul>%s</ul>"
+                "<h2>明确不恢复</h2><ul>%s</ul>"
+                "<p class=warn>本操作只换受管配置, 走 pdgtx 事务(有 before-image, 失败自动回滚)。"
+                "二进制、Bot 程序、平台/内核标记、凭据一律不动。</p>%s"
+                "<p><a href=/snapshots>返回快照列表</a></p>"
+                % (html.escape(snap_id), rows, tgt, miss, exc, form))
+
+
+def cfg_restore_result_page(res):
+    rows = _row("快照", res.get("snapshot", "")) + _row("事务", res.get("txid", "")) \
+        + _row("结果状态", res.get("state", ""), "ok" if res.get("ok") else "bad")
+    if res.get("restored"):
+        rows += _row("已恢复的目标", "、".join(str(x) for x in res["restored"]))
+    if res.get("skipped"):
+        rows += _row("跳过", "、".join(_redact(str(x)) for x in res["skipped"]), "warn")
+    if res.get("excluded"):
+        rows += _row("未恢复(不在受管范围)", "%d 项" % len(res["excluded"]))
+    if res.get("failed"):
+        rows += _row("未能还原", "、".join(_redact(str(x)) for x in res["failed"]), "bad")
+    if res.get("error"):
+        rows += _row("说明", _redact(str(res["error"])), "bad")
+    if res.get("state") == "ROLLBACK_FAILED":
+        tail = ("<p class=bad>回滚没有完成, 现网可能处于中间状态 —— 材料保留在事务目录, "
+                "请用 SSH 处理。</p>")
+    elif res.get("ok"):
+        tail = "<p class=ok>受管配置已恢复并通过观察期。</p>"
+    else:
+        tail = ("<p class=warn>未做改动或已完整回滚。本操作**不会**自动改用完整快照恢复 —— "
+                "确需整机恢复时请在 SSH 上显式执行。</p>")
+    return page("PDG 救援 · 配置恢复结果",
+                "<h1>配置恢复结果</h1><table>%s</table>%s"
+                "<p><a href=/snapshots>返回快照</a> · <a href=/>返回状态</a></p>" % (rows, tail))
 
 
 def audit_page():
@@ -581,6 +705,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send(200, body) if body else self._send(404, page("404", "<p>没有这笔事务。</p>"))
         elif path == "/snapshots":
             self._send(200, snapshots_page())
+        elif path.startswith("/snapshot/"):
+            snap = path[len("/snapshot/"):]
+            cr = _cfgrestore()
+            if cr is None or snap not in cr.snapshot_ids():
+                self._send(404, page("404", "<p>没有这份快照。</p>"))
+                return
+            sid = self._sid()
+            body = snapshot_confirm_page(snap, self.server.sessions.csrf(sid),
+                                         self.server.nonces.issue(sid, snap,
+                                                                  cr.snapshot_digest(snap)))
+            self._send(200, body) if body else self._send(404, page("404", "<p>没有这份快照。</p>"))
         elif path == "/audit":
             self._send(200, audit_page())
         elif path == "/logout":
@@ -658,6 +793,54 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # 对端早就走了: 恢复与审计都已完成, 这里没什么可补救的, 也不该把线程炸掉
             self.log_message("recover %s: 客户端已断开, 结果未能送达", txid)
 
+    def _post_cfg_restore(self):
+        """恢复受管配置(pdgtx 事务)。**不做完整快照恢复**, 失败也不自动降级成完整恢复。"""
+        if not self._authed():
+            self._send(401, login_page("请先登录。", self._issue_csrf()))
+            return
+        form = self._read_form()
+        if form is None:
+            self._send(413, page("413", "<p>请求体过大。</p>"))
+            return
+        if not self._csrf_ok(form):
+            self._send(403, page("403", "<p>表单已过期或来源不可信, 未执行任何操作。</p>"))
+            return
+        cr = _cfgrestore()
+        if cr is None:
+            self._send(503, page("503", "<p class=bad>配置恢复模块不可用, 请用 SSH 处理。</p>"))
+            return
+        snap = (form.get("snapshot") or [""])[0]
+        digest = (form.get("digest") or [""])[0]
+        nonce = (form.get("nonce") or [""])[0]
+        if snap not in cr.snapshot_ids():          # 只认服务端索引里的逻辑 ID
+            self._send(404, page("404", "<p>没有这份快照。</p>"))
+            return
+        if (form.get("confirm") or [""])[0] != "yes":
+            self._send(400, page("400", "<p>没有勾选确认, 未执行任何操作。</p>"))
+            return
+        if not self.server.nonces.consume(nonce, self._sid(), snap, digest):
+            # 一次性票据: 刷新/双击/重放拿到的是这条, 而不是又跑一遍恢复
+            self._send(409, page("409", "<p class=warn>这个确认已经用过或已失效(重复提交?)。"
+                                        "请回到 <a href=/snapshots>快照列表</a> 重新确认。</p>"))
+            return
+        if not self.server.recover_gate.acquire(blocking=False):
+            self._send(409, page("409", "<p class=warn>恢复正在执行, 请勿重复操作。</p>"))
+            return
+        self.log_message("config_restore %s", snap)
+        try:
+            res = cr.restore_managed(snap, expect_digest=digest, trigger_source="rescue")
+        except Exception as e:  # noqa: BLE001
+            self._send(500, page("500", "<p class=bad>配置恢复过程出错(%s), 请用 SSH 查看。</p>"
+                                 % html.escape(type(e).__name__)))
+            return
+        finally:
+            self.server.recover_gate.release()
+        code = 200 if res.get("ok") else (409 if res.get("busy") else 200)
+        try:
+            self._send(code, cfg_restore_result_page(res))
+        except OSError:
+            self.log_message("config_restore %s: 客户端已断开, 结果未能送达", snap)
+
     def do_HEAD(self):
         self.do_GET()
 
@@ -683,6 +866,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
         if path == "/tx/recover":
             self._post_recover()
+            return
+        if path == "/snapshot/restore":
+            self._post_cfg_restore()
             return
         if path != "/login":
             # 白名单之外的写路径一律明确拒绝(而不是 404 装作没有)
@@ -742,6 +928,7 @@ class Server(http.server.ThreadingHTTPServer):
         self.sessions = Sessions()
         self.rate = RateLimit()
         self.recover_gate = threading.Lock()      # 恢复的并发闸门(非阻塞获取, 抢不到即 409)
+        self.nonces = Nonces()                    # 危险操作的一次性确认票
         if fd is not None:                      # systemd socket activation: 直接接管那个 fd
             http.server.HTTPServer.__init__(self, addr, Handler, bind_and_activate=False)
             self.socket.close()          # TCPServer 自建的那个不用了, 别泄漏 fd

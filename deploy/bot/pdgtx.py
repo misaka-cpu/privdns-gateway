@@ -876,6 +876,7 @@ class Tx:
         self.state = PREPARING
         self.targets = {}          # name -> {"path","data"(bytes|None),"expect","validators"}
         self.watches = {}          # 只读依赖: name -> {"path","sha256","absent","optional"}
+        self.audit_extra = {}      # 调用方补充的**非敏感标量**维度, 并进同一条审计记录
         self._read_sha = {}        # read_for_update 记下的"候选所依据的源内容" sha
         self.derivers = []         # (target, fn)
         self.actions = []
@@ -1522,6 +1523,28 @@ def audit_event(source, op, result, extra=None):
     _audit_write(rec)
 
 
+# 一笔事务只写**一条**审计。调用方需要补充维度(如"这次恢复用的是哪份快照")时, 通过
+# Tx.audit_extra 挂进来 —— 而不是自己再写一条: 同一次操作在日志里出现两条口径不同的记录,
+# 事后没人说得清以哪条为准。
+_AUDIT_EXTRA_OK = re.compile(r"^[A-Za-z0-9_]{1,32}$")
+
+
+def _sanitize_extra(extra):
+    """只收**非敏感的结构化标量**: 布尔、整数、短字符串(过脱敏)。列表只收字符串元素并截断。
+    键名限定 [A-Za-z0-9_] —— 调用方可控的自由结构不许原样进审计。"""
+    out = {}
+    for k, v in (extra or {}).items():
+        if not isinstance(k, str) or not _AUDIT_EXTRA_OK.match(k):
+            continue
+        if isinstance(v, bool) or isinstance(v, int):
+            out[k] = v
+        elif isinstance(v, str):
+            out[k] = redact(v)[:120]
+        elif isinstance(v, (list, tuple)):
+            out[k] = [redact(str(x))[:60] for x in list(v)[:10]]
+    return out
+
+
 def _audit(tx):
     rec = {"ts": time.time(), "txid": tx.txid, "source": tx.source, "op": tx.op,
            "mode": tx.mode, "state": tx.state, "targets": sorted(tx.targets),
@@ -1529,6 +1552,7 @@ def _audit(tx):
            "error_class": tx.meta.get("error_class", ""),
            "rollback_complete": tx.meta.get("rollback_complete"),
            "warnings": tx.meta.get("warnings", []), "schema_version": SCHEMA_VERSION}
+    rec.update(_sanitize_extra(getattr(tx, "audit_extra", None)))
     try:
         _audit_write(rec)
     except OSError:
@@ -1853,6 +1877,7 @@ def _cli_apply(a):
     # 但落盘前的前置条件复核会遍历它 —— 不初始化就是 AttributeError, 整笔事务在**已经写完
     # before-image、正要动生产文件**的位置炸掉。meta 里有就按 meta 恢复, 没有就是空。
     tx.watches = dict(m.get("watches", {}))
+    tx.audit_extra = {}
     tx._read_sha = {}
     tx.targets = {}
     for s in m.get("staged", []):

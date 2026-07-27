@@ -13,6 +13,7 @@ import socket
 import ssl
 import subprocess
 import sys
+import atexit
 import tempfile
 import time
 
@@ -28,6 +29,22 @@ def free_port():
     p = s.getsockname()[1]
     s.close()
     return p
+
+
+_LIVE = []
+
+
+def _reap_all():
+    """进程退出时收掉所有还活着的实例。测试里每处都写 try/finally 迟早会漏一处, 而漏掉的
+    后果是一台机器上堆着一串监听着端口的救援服务 —— 探针泄漏那一课已经上过了。"""
+    for inst in list(_LIVE):
+        try:
+            inst.stop()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+atexit.register(_reap_all)
 
 
 class Inst:
@@ -60,6 +77,7 @@ class Inst:
         self.extra_env = dict(extra_env or {})     # 事务沙箱路径等, 由用例注入
         self.proc = None
         self.err = ""
+        _LIVE.append(self)      # 兜底: 测试中途抛异常也不该把服务进程留在机器上
 
     def env(self):
         e = dict(os.environ)
@@ -144,6 +162,8 @@ class Inst:
         return st, jar
 
     def stop(self):
+        if self in _LIVE:
+            _LIVE.remove(self)
         if self.proc and self.proc.poll() is None:
             self.proc.send_signal(signal.SIGTERM)
             try:

@@ -3020,188 +3020,23 @@ def _ios_profile(ssids=()):
 
 # ── 配置备份 / 恢复 ──
 BACKUP_FILES = [SB, MOSDNS_CONF, MOSDNS_DIRECT, MOSDNS_HIJACK, RS_META]
-RESTORE_MAP = {
-    "etc/sing-box/config.json": SB,
-    "etc/mosdns/config.yaml": MOSDNS_CONF,
-    "etc/mosdns/rules/custom_direct.txt": MOSDNS_DIRECT,
-    "etc/mosdns/rules/custom_hijack.txt": MOSDNS_HIJACK,
-    "opt/pdg-bot/rulesets.json": RS_META,
-}
-# 备份包是**外部输入**(bot 从 Telegram 收文件, 谁都能发一个) → 解包必须按白名单来。
-RESTORE_RS_PREFIX = RS_DIR.lstrip("/") + "/"
-# 受管规则集的文件名白名单: 与 pdgtx 的 ruleset:<name> 目标同形(只认单个文件名 + 当前支持的
-# 两种扩展名)。历史遗留的 .srs 是 sing-box 二进制格式, mihomo 读不了 → 明确拒绝, 不隐式转换。
-_RS_LEAF_RE = re.compile(r"^[A-Za-z0-9_.-]+\.(json|mrs)$")
-# 备份里的路径是**导出那台机器**上的路径, 只可能是生产规范目录; 而镜像沙箱(用例/E2E)把整棵树
-# 挪了根, 所以也接受本机 RS_DIR。两者都是精确相等, 不做 endswith —— 否则
-# /evil/etc/sing-box/rs/foo.json 会被当成合法。
-_RS_DIR_CANON = "/etc/sing-box/rs"          # etc/sing-box/rs/ 下的规则集
+# 受管配置的解包/白名单/限额/成员映射搬进了 cfgrestore —— Bot(收 Telegram 备份包)与救援平面
+# (从本机快照恢复)做的是同一件事, 两边各写一份的下场是: 白名单一处加了新目标另一处没加, 于是
+# "恢复成功"的机器少一份配置。这里保留原来的模块级名字, 老调用与既有测试不受影响。
+import cfgrestore                                        # noqa: E402
 
-def _restore_limit(name, default, lo, hi):
-    """解包限额: 可用 bot.env 里的 PDG_RESTORE_* 调整, 但**只在安全区间内**。
+cfgrestore.reload_limits()      # 限额读环境, bot 每次以新环境重新导入时都要刷一遍
 
-    写死上限的代价很实在 —— 规则集多一点的机器备份就恢复不了, 用户除了改代码没别的办法。
-    但也不能随便调: 一个 0 或者天文数字就把这道防线关掉了, 那正是它要挡的东西。故越界一律
-    夹回区间, 写成非数字就用默认值(不让一个笔误把恢复功能整个搞瘫), 两种情况都写一行日志。"""
-    raw = os.environ.get(name, "")
-    if not str(raw).strip():
-        return default
-    try:
-        v = int(str(raw).strip())
-    except (TypeError, ValueError):
-        print("[restore] %s=%r 不是整数, 用默认值 %d" % (name, raw, default), file=sys.stderr)
-        return default
-    c = max(lo, min(hi, v))
-    if c != v:
-        print("[restore] %s=%d 超出安全区间 [%d, %d], 按 %d 生效" % (name, v, lo, hi, c),
-              file=sys.stderr)
-    return c
+RESTORE_MAP = cfgrestore.RESTORE_MAP
+RESTORE_RS_PREFIX = cfgrestore.RESTORE_RS_PREFIX
+RESTORE_MAX_MEMBERS = cfgrestore.MAX_MEMBERS
+RESTORE_MAX_FILE_BYTES = cfgrestore.MAX_FILE_BYTES
+RESTORE_MAX_TOTAL_BYTES = cfgrestore.MAX_TOTAL_BYTES
+_RS_LEAF_RE = cfgrestore._RS_LEAF_RE
+_RS_DIR_CANON = cfgrestore._RS_DIR_CANON
+_restore_member_allowed = cfgrestore.member_allowed
+_safe_extract = cfgrestore.safe_extract
 
-
-def _fs_free(path):
-    """path 所在文件系统的可用字节(路径还不存在就往上找存在的祖先); 问不出来返回 0。"""
-    p = os.path.abspath(path or "/")
-    while True:
-        try:
-            return shutil.disk_usage(p).free
-        except OSError:
-            up = os.path.dirname(p)
-            if up == p:
-                return 0
-            p = up
-
-
-def _restore_total_ceiling():
-    """总量上限能调到多高。
-
-    拍一个 2GiB 的常数有两头不对: 盘大的机器调不上去(超大备份还是得改代码), 盘小的机器
-    却能配到 2GiB 把根分区写满。真正该守的是"别把盘写满" —— 天花板取可用空间的一半。
-    问不出磁盘信息(容器里的怪文件系统)就退回保守常数, 不借机放开。"""
-    free = _fs_free(RS_DIR)
-    if not free:
-        return 2 * 1024 * 1024 * 1024
-    return max(64 * 1024 * 1024, free // 2)
-
-
-RESTORE_MAX_MEMBERS = _restore_limit(                 # 成员数量上限
-    "PDG_RESTORE_MAX_MEMBERS", 512, 16, 20000)
-RESTORE_MAX_FILE_BYTES = _restore_limit(              # 单文件上限
-    "PDG_RESTORE_MAX_FILE_BYTES", 8 * 1024 * 1024, 64 * 1024, 512 * 1024 * 1024)
-RESTORE_MAX_TOTAL_BYTES = _restore_limit(             # 解出总量上限(压缩炸弹)
-    "PDG_RESTORE_MAX_TOTAL_BYTES", 64 * 1024 * 1024, 1024 * 1024, _restore_total_ceiling())
-# 单文件上限比总量还大是自相矛盾的配置 —— 照那么算任何文件都过不了, 恢复直接不可用
-RESTORE_MAX_TOTAL_BYTES = max(RESTORE_MAX_TOTAL_BYTES, RESTORE_MAX_FILE_BYTES)
-
-
-def _restore_member_allowed(name):
-    """成员是否在恢复白名单内: RESTORE_MAP 的键, 或 rs/ 下的规则集文件。"""
-    if name in RESTORE_MAP:
-        return True
-    if name.startswith(RESTORE_RS_PREFIX):
-        rest = name[len(RESTORE_RS_PREFIX):]
-        return bool(rest) and "/" not in rest        # 只收 rs/ 下一层, 不收子目录
-    return False
-
-
-def _safe_extract(tar, dest):
-    """安全解包: 只落地白名单内的**普通文件**, 任何可疑成员一律**拒绝整个备份**。
-
-    设计要点(备份包是外部输入, bot 从 Telegram 收文件, 谁都能发一个):
-      · **流式遍历**(逐个 next()), 不用 getmembers() —— 后者会先把整份成员表读进内存,
-        一个成员表巨大的包在检查开始前就已经把内存吃掉了。
-      · 先看**原始成员名**再做任何规范化: 绝不用 lstrip("./") 之类去"洗白" —— 那会把
-        `/etc/...` 洗成 `etc/...`、把 `../../etc/x` 洗成看似合法的相对路径, 等于自己把
-        逃逸路径改成合法路径再放行。
-      · 可疑成员**拒整包**而不是跳过: 一个包里既有正常配置又混着符号链接/越界路径, 说明它
-        本就不可信; 跳过坏成员、留下好成员会让用户以为"恢复成功了"。
-      · 数量、单文件声明大小、累计声明大小、**实际读取字节数**四道限额都要卡 —— tar 头里的
-        size 是攻击者写的, 只信它挡不住"声明 1KB 实则源源不断"的解压炸弹。
-    """
-    root = os.path.realpath(dest)
-    declared_total = 0
-    written_total = 0
-    seen = 0
-    seen_names = set()      # 规范化后的成员名(判重用; written 记的是落地路径, 不是名字)
-    written = []          # 本次已落地的文件: 一旦判拒整包, 连它们也要清掉
-    try:
-        _safe_extract_loop(tar, root, written)
-    except Exception:
-        # "拒绝整个备份"要名副其实: 已经写下去的成员也不能留(调用方虽然会删临时目录,
-        # 但契约本身不该依赖调用方善后)。
-        for p_ in reversed(written):
-            try:
-                os.remove(p_)
-            except OSError:
-                pass
-        raise
-
-
-def _safe_extract_loop(tar, root, written):
-    """_safe_extract 的主体; 单独一层好让上面在判拒时统一清理已落地的成员。"""
-    declared_total = 0
-    written_total = 0
-    seen = 0
-    seen_names = set()      # 规范化后的成员名(判重用; written 记的是落地路径, 不是名字)
-    while True:
-        m = tar.next()
-        if m is None:
-            break
-        seen += 1
-        if seen > RESTORE_MAX_MEMBERS:
-            raise ValueError("备份成员过多(>%d), 拒绝整个备份" % RESTORE_MAX_MEMBERS)
-        raw = m.name                       # **原始**成员名, 未经任何规范化
-        # 1) 先按原始名判危险形态 —— 绝对路径 / 含 .. / 盘符式绝对路径
-        if raw.startswith("/") or raw.startswith("\\"):
-            raise ValueError("备份含绝对路径成员, 拒绝整个备份: %s" % raw)
-        if any(seg == ".." for seg in raw.replace("\\", "/").split("/")):
-            raise ValueError("备份含 `..` 路径成员, 拒绝整个备份: %s" % raw)
-        # 2) 类型: 只收普通文件与目录; 链接/设备/FIFO 一律拒整包
-        if m.issym() or m.islnk():
-            raise ValueError("备份含链接成员(可用于写穿解压目录), 拒绝整个备份: %s" % raw)
-        if m.ischr() or m.isblk() or m.isfifo() or m.isdev():
-            raise ValueError("备份含设备/FIFO 成员, 拒绝整个备份: %s" % raw)
-        if m.isdir():
-            continue                       # 需要的目录在写文件时自建, 不按成员落地
-        if not m.isreg():
-            raise ValueError("备份含非普通文件成员, 拒绝整个备份: %s" % raw)
-        # 3) 到这里 raw 已确认是"不以 / 开头、不含 .." 的相对路径, 只去掉无害的 ./ 前缀
-        name = raw[2:] if raw.startswith("./") else raw
-        # 同一个成员名出现两次: tar 允许, 但"后一个覆盖前一个"是含糊语义 —— 攻击者可以先放一份
-        # 干净的过校验、再放一份真正落地的。整包拒绝, 不猜。
-        if name in seen_names:
-            raise ValueError("备份里同一个成员出现了两次, 拒绝整个备份: %s" % raw)
-        seen_names.add(name)
-        if not _restore_member_allowed(name):
-            raise ValueError("备份含白名单之外的成员, 拒绝整个备份: %s" % raw)
-        # 4) 限额: 声明值先卡一道(便宜), 实际读取再卡一道(声明值是攻击者写的, 不可信)
-        if m.size > RESTORE_MAX_FILE_BYTES:
-            raise ValueError("备份内文件过大(%s, >%d 字节), 拒绝整个备份" % (raw, RESTORE_MAX_FILE_BYTES))
-        declared_total += m.size
-        if declared_total > RESTORE_MAX_TOTAL_BYTES:
-            raise ValueError("备份声明总量过大(>%d 字节), 拒绝整个备份" % RESTORE_MAX_TOTAL_BYTES)
-        target = os.path.realpath(os.path.join(root, name))
-        # resolve 之后必须仍在解压根内(挡住经既存符号链接的写穿)
-        if target != root and not target.startswith(root + os.sep):
-            raise ValueError("备份成员越界, 拒绝整个备份: %s" % raw)
-        os.makedirs(os.path.dirname(target), exist_ok=True)
-        src = tar.extractfile(m)
-        if src is None:
-            raise ValueError("备份成员无法读取, 拒绝整个备份: %s" % raw)
-        # 落地前再确认目标不是符号链接(TOCTOU 兜底), 并且不跟随既有链接写入
-        if os.path.islink(target):
-            raise ValueError("备份成员目标是符号链接, 拒绝整个备份: %s" % raw)
-        with open(target, "wb") as out:
-            while True:
-                chunk = src.read(64 * 1024)
-                if not chunk:
-                    break
-                written_total += len(chunk)
-                if written_total > RESTORE_MAX_TOTAL_BYTES:
-                    raise ValueError("备份实际解出量超限(>%d 字节), 拒绝整个备份"
-                                     % RESTORE_MAX_TOTAL_BYTES)
-                out.write(chunk)
-        os.chmod(target, 0o600)
-        written.append(target)
 
 def backup_blob():
     buf = io.BytesIO()

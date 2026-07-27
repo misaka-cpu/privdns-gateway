@@ -214,6 +214,9 @@ jobs:
       - name: "恢复触发来源审计 (旧签名兼容/rescue 与 cli 各记各的/参数伪造无效/并发只跑一个)"
         run: python3 tests/test-tx-recover-source.py
 
+      - name: "救援平面配置恢复 (只换受管配置/快照边界/摘要复核/nonce 一次性/失败全回滚)"
+        run: python3 tests/test-rescue-cfgrestore.py
+
       - name: "迁移时机 (普通命令不暗中迁移; migrate 先锁先快照)"
         run: bash tests/test-migration-timing.sh
 
