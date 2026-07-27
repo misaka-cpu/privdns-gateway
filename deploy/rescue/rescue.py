@@ -38,6 +38,7 @@ except ImportError:                                   # 仓库内直跑(开发/�
         os.path.abspath(__file__))), "bot"))
     import rescue_const as C
 
+CSRF_TTL = int(os.environ.get("PDG_RESCUE_CSRF_TTL", "600"))            # CSRF cookie 存活
 SESSION_TTL = int(os.environ.get("PDG_RESCUE_SESSION_TTL", "1800"))        # 空闲 30 分钟
 SESSION_ABSOLUTE = int(os.environ.get("PDG_RESCUE_SESSION_MAX", "7200"))  # 绝对上限 2 小时
 MAX_BODY = 8 * 1024                                    # 请求体上限: 救援页没有大表单
@@ -439,6 +440,21 @@ def audit_page():
 
 
 # ── HTTP ────────────────────────────────────────────────────────────────────
+def _cookie_attrs(name, value, max_age):
+    """所有 cookie 走同一个构造口。
+
+    HttpOnly: 本项目的表单是**服务端渲染**的隐藏域, 页面里没有一行 JS 需要读这个 cookie ——
+    那就不该让脚本读得到。双提交模式常被写成"JS 读 cookie 再塞进请求头", 那种写法才必须去掉
+    HttpOnly; 我们不是。Secure/SameSite=Strict/Path=/ 同理固定; **不设 Domain** —— 留空即
+    host-only, 写了反而会把 cookie 扩散到子域。"""
+    return "%s=%s; Path=/; Max-Age=%d; HttpOnly; Secure; SameSite=Strict" % (name, value, max_age)
+
+
+def _cookie_clear(name):
+    """删除 cookie: 名称与 Path 必须与设置时**完全一致**, 否则浏览器删的是另一个。"""
+    return "%s=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict" % name
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     server_version = "pdg-rescue"
     sys_version = ""
@@ -449,7 +465,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         """只记方法与路径, 不记查询串/请求体/凭据。"""
         sys.stderr.write("[rescue] %s\n" % _redact(fmt % args))
 
-    def _send(self, code, body=b"", ctype="text/html; charset=utf-8", cookie=None):
+    def _send(self, code, body=b"", ctype="text/html; charset=utf-8", cookie=None,
+              extra_headers=()):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
@@ -459,15 +476,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Content-Security-Policy",
                          "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'")
-        if cookie:
-            self.send_header("Set-Cookie", cookie)
+        for c in ([cookie] if isinstance(cookie, str) else (cookie or [])):
+            if c:
+                self.send_header("Set-Cookie", c)
+        for k, v in extra_headers:
+            self.send_header(k, v)
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
 
     def _issue_csrf(self):
+        """沿用已有 cookie, 没有才新发 —— 刷新页面不该让上一个表单立刻失效。"""
         cur = self._cookie("pdgcsrf")
         return cur if cur else secrets.token_urlsafe(24)
+
+    def _csrf_ok(self, form):
+        """双提交 + 会话绑定, 四种情况全拒: 缺失 / 不同 / 过期(cookie 已不存在) / 跨会话。
+
+        已登录时还要求表单值等于**该会话**自己的 CSRF token: 只比 cookie 与表单的话, 攻击者
+        若能诱导受害者带上自己那一份 cookie+token(cookie tossing 之类), 双提交就成了摆设。"""
+        cookie_v = self._cookie("pdgcsrf")
+        form_v = form.get("csrf", [""])[0]
+        if not cookie_v or not form_v or not hmac.compare_digest(form_v, cookie_v):
+            return False
+        rec = self.server.sessions.get(self._sid())
+        if rec is not None:
+            return hmac.compare_digest(form_v, rec["csrf"])
+        return True
 
     def _sid(self):
         raw = self.headers.get("Cookie") or ""
@@ -492,7 +527,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not self._authed():
             csrf = self._issue_csrf()
             self._send(401 if path != "/" else 200, login_page("", csrf),
-                       cookie="pdgcsrf=%s; Path=/; Max-Age=600; Secure; SameSite=Strict" % csrf)
+                       cookie=_cookie_attrs("pdgcsrf", csrf, CSRF_TTL))
             return
         if path == "/":
             self._send(200, status_page())
@@ -507,8 +542,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send(200, audit_page())
         elif path == "/logout":
             self.server.sessions.drop(self._sid())
+            # 会话没了, 与它绑定的 CSRF token 也不该再留在浏览器里
             self._send(200, login_page("已退出。"),
-                       cookie="pdgsid=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict")
+                       cookie=[_cookie_clear("pdgsid"), _cookie_clear("pdgcsrf")])
         else:
             self._send(404, page("404", "<p>没有这个页面。</p>"))
 
@@ -553,10 +589,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         form = urllib.parse.parse_qs(raw.decode("utf-8", "replace"))
         # CSRF(双提交 cookie): 表单里的值必须与 GET / 时下发的 cookie 一致。配合 SameSite=Strict,
         # 跨站页面既拿不到这个 cookie 也带不上它 —— 别人的网页无法替用户提交登录/后续写操作。
-        want = self._cookie("pdgcsrf")
-        got_csrf = form.get("csrf", [""])[0]
-        if not want or not hmac.compare_digest(got_csrf, want):
-            self._send(403, login_page("表单已过期, 请重新打开页面再试。", self._issue_csrf()))
+        if not self._csrf_ok(form):
+            # 换发一个新的 —— 旧的要么不存在要么已不可信, 让用户拿新表单重来
+            fresh = secrets.token_urlsafe(24)
+            self._send(403, login_page("表单已过期, 请重新打开页面再试。", fresh),
+                       cookie=_cookie_attrs("pdgcsrf", fresh, CSRF_TTL))
             return
         self.server.refresh_token()      # rotate 之后不必重启服务
         got = form.get("token", [""])[0]
@@ -564,13 +601,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not hmac.compare_digest(got, self.server.token):
             self.server.rate.fail(ip)
             self.log_message("login failed from %s", ip)
-            self._send(401, login_page("Token 不正确。", want))
+            self._send(401, login_page("Token 不正确。", self._cookie("pdgcsrf")))
             return
         self.server.rate.ok(ip)
         sid = self.server.sessions.new()
+        # 登录成功 = 权限升级, CSRF token 一并轮换成与新会话绑定的那一个(会话固定攻击里,
+        # 攻击者预置的旧 token 在这一刻失效)
         self._send(200, status_page(),
-                   cookie="pdgsid=%s; Path=/; Max-Age=%d; HttpOnly; Secure; SameSite=Strict"
-                          % (sid, SESSION_TTL))
+                   cookie=[_cookie_attrs("pdgsid", sid, SESSION_TTL),
+                           _cookie_attrs("pdgcsrf", self.server.sessions.csrf(sid), SESSION_TTL)])
 
 
 class Server(http.server.ThreadingHTTPServer):

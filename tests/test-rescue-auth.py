@@ -188,6 +188,85 @@ else:
     bad("已登录会话被限速误伤: %s" % st3)
 inst.stop()
 
+# ── 6f. CSRF cookie 的属性与生命周期(真读 Set-Cookie 头, 不看源码)────────────
+inst_c = Inst(work)
+if not inst_c.start():
+    bad("CSRF 实例起不来: %r" % (inst_c.err or "")[:200])
+else:
+    _st, _b, sc_get, _h = inst_c.req("GET", "/")
+    csrf_set = [c for c in sc_get.split("\n") if "pdgcsrf=" in c]
+    sc_one = csrf_set[0] if csrf_set else sc_get
+    missing = [a for a in ("HttpOnly", "Secure", "SameSite=Strict", "Path=/")
+               if a not in sc_one]
+    if not missing:
+        ok("CSRF cookie 带 HttpOnly / Secure / SameSite=Strict / Path=/")
+    else:
+        bad("CSRF cookie 缺属性 %s: %r" % (missing, sc_one))
+    if "Domain=" not in sc_one:
+        ok("CSRF cookie 不设 Domain(host-only, 不扩散到子域)")
+    else:
+        bad("CSRF cookie 设了 Domain: %r" % sc_one)
+
+    # 登录成功要轮换 CSRF, 并且新值与会话绑定
+    c0, h0 = inst_c.csrf()
+    st_l, _b, sc_login, _h = inst_c.req("POST", "/login", body="csrf=%s&token=%s" % (h0 or c0, TOKEN),
+                                        cookie="pdgcsrf=" + c0)
+    new_csrf = re.search(r"pdgcsrf=([A-Za-z0-9_-]+)", sc_login)
+    if st_l == 200 and new_csrf and new_csrf.group(1) != c0:
+        ok("登录成功: CSRF token 被轮换(挡住会话固定里预置的旧值)")
+    else:
+        bad("登录后没轮换 CSRF: %r" % sc_login)
+    sid_m = re.search(r"pdgsid=([A-Za-z0-9_-]+)", sc_login)
+    jar = "pdgsid=%s; pdgcsrf=%s" % (sid_m.group(1), new_csrf.group(1))
+    for attr in ("HttpOnly", "Secure", "SameSite=Strict", "Path=/"):
+        if attr not in sc_login:
+            bad("登录下发的 cookie 缺 %s" % attr)
+            break
+    else:
+        ok("登录下发的两个 cookie 属性齐全")
+
+    # 跨会话: 拿另一个会话的 CSRF 值来提交 → 拒绝
+    st_b, jar_b = inst_c.login()
+    other_csrf = re.search(r"pdgcsrf=([A-Za-z0-9_-]+)", jar_b)
+    cross = "pdgsid=%s; pdgcsrf=%s" % (sid_m.group(1), other_csrf.group(1))
+    st_x, _b, _sc, _h = inst_c.req("POST", "/login",
+                                   body="csrf=%s&token=%s" % (other_csrf.group(1), TOKEN),
+                                   cookie=cross)
+    if st_x == 403:
+        ok("跨会话 CSRF token → 403(双提交之外还要与本会话绑定)")
+    else:
+        bad("跨会话 token 被接受了: %s" % st_x)
+
+    # 过期/缺失: cookie 没了就必须拒绝, 并换发一个新的
+    st_m, _b, sc_m, _h = inst_c.req("POST", "/login", body="csrf=%s&token=%s" % (new_csrf.group(1), TOKEN))
+    if st_m == 403 and "pdgcsrf=" in sc_m and "Max-Age=0" not in sc_m:
+        ok("CSRF cookie 缺失 → 403 且换发新 token")
+    else:
+        bad("cookie 缺失时的处理不对: st=%s sc=%r" % (st_m, sc_m[:80]))
+
+    # 退出: 两个 cookie 都按同名同 Path 删除
+    _st, _b, sc_out, _h = inst_c.req("GET", "/logout", cookie=jar)
+    cleared = [c for c in sc_out.split("\n")]
+    both = all(any(n in c and "Max-Age=0" in c and "Path=/" in c for c in cleared)
+               for n in ("pdgsid=", "pdgcsrf="))
+    if both:
+        ok("退出登录: pdgsid 与 pdgcsrf 都以同名同 Path 清除")
+    else:
+        bad("退出时没清干净: %r" % sc_out)
+
+    # CSRF token 不进 URL / 日志 / 错误正文(隐藏域除外 —— 那是表单本身)
+    err_body = inst_c.req("POST", "/login", body="csrf=bogus&token=x")[1]
+    visible = re.sub(r"<input type=hidden name=csrf value='[^']*'>", "", err_body)
+    if new_csrf.group(1) not in visible and c0 not in visible:
+        ok("错误响应正文里不出现 CSRF token(只在隐藏域里)")
+    else:
+        bad("错误正文泄漏了 CSRF token")
+inst_c.stop()
+if new_csrf.group(1) not in (inst_c.err or "") and "csrf=" not in (inst_c.err or ""):
+    ok("服务端日志不含 CSRF token, 也不含查询串")
+else:
+    bad("日志里出现了 CSRF token")
+
 # ── 7. 会话: 空闲超时 / 绝对上限 ────────────────────────────────────────────
 inst2 = Inst(work)
 inst2_env = inst2.env

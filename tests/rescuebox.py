@@ -125,11 +125,21 @@ class Inst:
         return (m.group(1) if m else ""), (hidden.group(1) if hidden else "")
 
     def login(self, token=None):
+        """像浏览器那样走完整流程, 返回 (状态码, 登录后应该带的 Cookie 串)。
+
+        登录成功时服务端会**轮换** CSRF cookie 并绑定到新会话, 所以返回的 cookie 串里两个都带
+        —— 只带 pdgsid 的话, 后续写操作的 CSRF 校验会因为"cookie 没了"而失败。"""
         c, hidden = self.csrf()
         body = "csrf=%s&token=%s" % (hidden or c, token if token is not None else self.token)
         st, _b, sc, _h = self.req("POST", "/login", body=body, cookie="pdgcsrf=" + c)
-        m = re.search(r"pdgsid=([A-Za-z0-9_-]+)", sc)
-        return st, ("pdgsid=" + m.group(1)) if m else ""
+        sid = re.search(r"pdgsid=([A-Za-z0-9_-]+)", sc)
+        newcsrf = re.search(r"pdgcsrf=([A-Za-z0-9_-]+)", sc)
+        if not sid:
+            return st, ""
+        jar = "pdgsid=" + sid.group(1)
+        if newcsrf and newcsrf.group(1):
+            jar += "; pdgcsrf=" + newcsrf.group(1)
+        return st, jar
 
     def stop(self):
         if self.proc and self.proc.poll() is None:
@@ -145,5 +155,3 @@ class Inst:
             except Exception:  # noqa: BLE001
                 pass
             self.proc.stdout.close()
-
-
