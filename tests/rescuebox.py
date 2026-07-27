@@ -34,7 +34,7 @@ class Inst:
     """一个跑起来的救援服务实例(绑 127.0.0.1, 端口临时分配)。"""
 
     def __init__(self, work, token=TOKEN, cert=True, cidr="127.0.0.0/8",
-                 with_pdgtx=True, port=None):
+                 with_pdgtx=True, port=None, extra_env=None):
         self.work = work
         self.port = port or free_port()
         self.dir = tempfile.mkdtemp(prefix="inst.", dir=work)
@@ -57,6 +57,7 @@ class Inst:
                 f.write(token + "\n")
         self.token = token
         self.with_pdgtx = with_pdgtx
+        self.extra_env = dict(extra_env or {})     # 事务沙箱路径等, 由用例注入
         self.proc = None
         self.err = ""
 
@@ -67,6 +68,7 @@ class Inst:
                   "PDG_RESCUE_TOKEN": self.tokenf, "PDG_PROFILE_ENV": self.profile,
                   "PDG_RESCUE_BIND": "127.0.0.1",
                   "PYTHONPYCACHEPREFIX": os.path.join(self.work, "pycache")})
+        e.update(self.extra_env)
         if not self.with_pdgtx:
             # 让 import pdgtx 必然失败: 只保留一个不含 pdgtx 的搜索路径
             e["PDG_RESCUE_NO_PDGTX"] = "1"

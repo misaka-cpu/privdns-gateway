@@ -385,7 +385,7 @@ def tx_page():
 _TXID_RE = re.compile(r"^[0-9A-Za-z._-]{1,64}$")
 
 
-def tx_detail_page(txid):
+def tx_detail_page(txid, csrf=""):
     """只接受**枚举里出现过的** txid: 参数直接当目录名用是路径穿越的经典入口。"""
     t = tx_overview()
     if not t["available"]:
@@ -404,9 +404,51 @@ def tx_detail_page(txid):
     err = _redact(str(m.get("error") or ""))
     if err:
         rows += _row("错误", err, "bad")
+    form = ""
+    if m.get("state") in getattr(tx, "NEEDS_RECOVERY", ()):
+        # 只有**未完成**的事务才给恢复入口。表单里 txid 是隐藏域, 服务端仍会重新枚举校验 ——
+        # 页面上的值一律当作不可信输入。不提供 --force: 覆盖别人的人工修复必须去 SSH 上显式做。
+        form = ("<h2>恢复</h2>"
+                "<p class=warn>把这笔事务改过的文件按 before-image 还原到操作前。"
+                "事务之外有人改过同一个文件时会**停手并报告冲突**, 不会覆盖。</p>"
+                "<form method=post action=/tx/recover>"
+                "<input type=hidden name=csrf value='%s'>"
+                "<input type=hidden name=txid value='%s'>"
+                "<label><input type=checkbox name=confirm value=yes> 我确认要恢复这笔事务</label>"
+                "<br><button type=submit>执行恢复</button></form>" % (csrf, html.escape(txid)))
     return page("PDG 救援 · 事务 %s" % txid,
-                "<h1>事务 %s</h1><table>%s</table><p><a href=/tx>返回列表</a></p>"
-                % (html.escape(txid), rows))
+                "<h1>事务 %s</h1><table>%s</table>%s<p><a href=/tx>返回列表</a></p>"
+                % (html.escape(txid), rows, form))
+
+
+def recover_result_page(txid, res):
+    """恢复结果。**如实呈现**: 回滚不完整就写明 ROLLBACK_FAILED 与未完成项, 不粉饰成"已完成"。"""
+    state = str(res.get("state") or "")
+    okk = bool(res.get("ok"))
+    rows = _row("事务", txid) + _row("结果状态", state, "ok" if okk else "bad")
+    if res.get("restored"):
+        rows += _row("已还原", "、".join(str(x) for x in res["restored"]))
+    if res.get("failed"):
+        rows += _row("未能还原", "、".join(_redact(str(x)) for x in res["failed"]), "bad")
+    if res.get("conflicts"):
+        rows += _row("事务之外被改过(未覆盖)", "、".join(str(x) for x in res["conflicts"]), "warn")
+    if res.get("error"):
+        rows += _row("说明", _redact(str(res["error"])), "bad")
+    tail = ""
+    if state == "ROLLBACK_FAILED" or (res.get("failed") and not okk):
+        tail = ("<p class=bad>回滚没有完成。现网可能处于中间状态, 材料已保留在事务目录 —— "
+                "请用 SSH 登录后 <code>sudo pdg tx show %s</code> 查看再处理。</p>"
+                % html.escape(txid))
+    elif res.get("conflicts"):
+        tail = ("<p class=warn>这些目标在事务之外被改过, 本次**没有覆盖**它们。"
+                "确认要用 before-image 盖掉时, 请在 SSH 上执行 "
+                "<code>sudo pdg tx recover %s --force</code>(救援页不提供强制覆盖)。</p>"
+                % html.escape(txid))
+    elif okk:
+        tail = "<p class=ok>已按 before-image 还原完成。</p>"
+    return page("PDG 救援 · 恢复结果",
+                "<h1>恢复结果</h1><table>%s</table>%s"
+                "<p><a href=/tx>返回事务列表</a> · <a href=/>返回状态</a></p>" % (rows, tail))
 
 
 def snapshots_page():
@@ -534,7 +576,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif path == "/tx":
             self._send(200, tx_page())
         elif path.startswith("/tx/"):
-            body = tx_detail_page(path[4:])
+            body = tx_detail_page(path[4:], self.server.sessions.csrf(self._sid()))
             self._send(200, body) if body else self._send(404, page("404", "<p>没有这笔事务。</p>"))
         elif path == "/snapshots":
             self._send(200, snapshots_page())
@@ -547,6 +589,57 @@ class Handler(http.server.BaseHTTPRequestHandler):
                        cookie=[_cookie_clear("pdgsid"), _cookie_clear("pdgcsrf")])
         else:
             self._send(404, page("404", "<p>没有这个页面。</p>"))
+
+    def _post_recover(self):
+        """把一笔中断的事务按 before-image 还原。
+
+        纪律: 必须已登录; CSRF 必须与本会话绑定; txid **只能是本次枚举出来的未完成事务**
+        (页面上的值一律当不可信输入重新校验); 必须勾了确认; 不提供 --force。
+        恢复本身的锁、漂移保护、材料校验、审计全在 pdgtx.recover 里 —— 救援页不重写一套。"""
+        if not self._authed():
+            self._send(401, login_page("请先登录。", self._issue_csrf()))
+            return
+        form = self._read_form()
+        if form is None:
+            self._send(413, page("413", "<p>请求体过大。</p>"))
+            return
+        if not self._csrf_ok(form):
+            self._send(403, page("403", "<p>表单已过期或来源不可信, 未执行任何操作。</p>"))
+            return
+        tx = _pdgtx()
+        if tx is None:
+            self._send(503, page("503", "<p class=bad>事务核心不可用, 恢复功能无法执行。"
+                                        "请用 SSH 处理。</p>"))
+            return
+        txid = (form.get("txid") or [""])[0]
+        try:
+            pend = {str(m.get("txid")) for m in tx.pending_recovery()}
+        except Exception:  # noqa: BLE001
+            self._send(503, page("503", "<p class=bad>读不到事务目录, 未执行任何操作。</p>"))
+            return
+        if not _TXID_RE.match(txid or "") or txid not in pend:
+            # 不在"未完成"名单里就没有恢复的意义 —— 也堵住了拿路径当参数的那条路
+            self._send(404, page("404", "<p>没有这笔待恢复的事务(可能已经处理过了)。</p>"))
+            return
+        if (form.get("confirm") or [""])[0] != "yes":
+            self._send(400, page("400", "<p>没有勾选确认, 未执行任何操作。</p>"))
+            return
+        self.log_message("recover %s", txid)
+        try:
+            res = tx.recover(txid)
+        except Exception as e:  # noqa: BLE001
+            name = type(e).__name__
+            if name == "TxBusy":
+                self._send(409, page("409", "<p class=warn>已有配置操作正在执行, "
+                                            "本次未做任何改动, 请稍后再试。</p>"))
+            elif name == "TxRefused":
+                self._send(409, page("409", "<p class=bad>拒绝执行(未做任何改动): %s</p>"
+                                     % html.escape(_redact(str(e)))))
+            else:
+                self._send(500, page("500", "<p class=bad>恢复过程出错(%s), "
+                                            "请用 SSH 查看事务目录。</p>" % html.escape(name)))
+            return
+        self._send(200, recover_result_page(txid, res))
 
     def do_HEAD(self):
         self.do_GET()
@@ -562,11 +655,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
         m = re.search(r"(?:^|;\s*)%s=([A-Za-z0-9_-]+)" % re.escape(name), raw)
         return m.group(1) if m else ""
 
+    def _read_form(self):
+        raw = self._body()
+        if raw is None:
+            return None
+        import urllib.parse
+        return urllib.parse.parse_qs(raw.decode("utf-8", "replace"))
+
     def do_POST(self):
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
+        if path == "/tx/recover":
+            self._post_recover()
+            return
         if path != "/login":
-            # 本提交只有只读页面; 写操作在后续提交接入, 现在一律拒绝(而不是 404 装作没有)
-            self._send(405, page("405", "<p>本版本的救援平面只提供只读页面。</p>"))
+            # 白名单之外的写路径一律明确拒绝(而不是 404 装作没有)
+            self._send(405, page("405", "<p>这个操作不在救援平面的白名单里。</p>"))
             return
         ip = self._client()
         wait = self.server.rate.blocked(ip)

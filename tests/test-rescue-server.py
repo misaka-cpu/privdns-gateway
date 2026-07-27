@@ -152,12 +152,19 @@ for evil in ("/tx/../../etc/passwd", "/tx/..%2f..%2fetc%2fpasswd", "/tx/does-not
 else:
     ok("未知 txid 与路径穿越一律 404, 不返回任何文件内容")
 
-# ── 5. 只读: 任何写操作都被拒绝 ─────────────────────────────────────────────
-st, _b, _sc, _h = inst.req("POST", "/tx/recover", body="txid=x", cookie=cookie)
-if st == 405:
-    ok("本版本的写操作端点一律 405(明确拒绝, 不装作 404)")
+# ── 5. 写路径白名单: 名单外一律 405; 名单内(recover)缺 CSRF 一律 403 ─────────
+for p_ in ("/snapshot/restore", "/service/restart", "/minimal/enter", "/anything"):
+    st, _b, _sc, _h = inst.req("POST", p_, body="x=1", cookie=cookie)
+    if st != 405:
+        bad("白名单外的写路径 %s 返回 %s(应为 405)" % (p_, st))
+        break
 else:
-    bad("写操作返回 %s" % st)
+    ok("白名单外的写路径一律 405(明确拒绝, 不装作 404)")
+st, _b, _sc, _h = inst.req("POST", "/tx/recover", body="txid=x&confirm=yes", cookie=cookie)
+if st == 403:
+    ok("白名单内的 recover 缺 CSRF → 403(不执行任何操作)")
+else:
+    bad("recover 缺 CSRF 返回 %s" % st)
 
 # ── 6. 请求体上限 ───────────────────────────────────────────────────────────
 _c2, _h2 = inst.csrf()
