@@ -220,6 +220,9 @@ jobs:
       - name: "恢复的服务动作推导 (按变化目标推导/映射唯一/未知即拒/顺序固定)"
         run: python3 tests/test-restore-actions.py
 
+      - name: "救援平面紧急完整恢复 (救援入口自保/pre-rescue 强制/结构化结果/不自动降级)"
+        run: python3 tests/test-rescue-breakglass.py
+
       - name: "迁移时机 (普通命令不暗中迁移; migrate 先锁先快照)"
         run: bash tests/test-migration-timing.sh
 

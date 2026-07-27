@@ -495,13 +495,31 @@ else:
     bad("哨兵泄漏到审计/日志")
 box.clean()
 
-# ── 12. 不自动降级成完整 Bash 恢复 ─────────────────────────────────────────
-src = open(os.path.join(ROOT, "deploy/rescue/rescue.py"), encoding="utf-8").read() \
-    + open(os.path.join(ROOT, "deploy/bot/cfgrestore.py"), encoding="utf-8").read()
-if "rollback --dir" not in src and "pdg rollback" not in src:
-    ok("实现里没有任何调用 Bash 完整恢复的路径")
+# ── 12. 配置恢复路径不得触达完整恢复 ───────────────────────────────────────
+# 完整恢复自 commit 8 起是**独立入口**(deploy/rescue/breakglass.py), 所以不能再拿"全仓没有
+# pdg rollback 字样"当判据 —— 那既会误伤结果页里给用户的 SSH 指引, 也验不出真正要防的事情:
+# **配置恢复失败之后不会自己走到完整恢复**。改为逐条核对这条边界。
+cr_src = open(os.path.join(ROOT, "deploy/bot/cfgrestore.py"), encoding="utf-8").read()
+# 判"是不是真的会走到完整恢复", 而不是"有没有 rollback 这个词" —— pdgtx 的
+# rollback_failed_items 是回滚结果字段, 与调用 pdg rollback 是两回事。
+_calls_rollback = ("pdg rollback" in cr_src or '"rollback"' in cr_src
+                   or "'rollback'" in cr_src or "rollback --dir" in cr_src)
+_imports_bg = bool(re.search(r"^\s*(import|from)\s+breakglass", cr_src, re.M))
+if not _calls_rollback and not _imports_bg:
+    ok("配置恢复实现里既不调用 pdg rollback, 也不引用完整恢复模块")
 else:
-    bad("出现了 pdg rollback 调用")
+    bad("cfgrestore 会触达完整恢复(调用=%s 引用=%s)" % (_calls_rollback, _imports_bg))
+rs_src = open(os.path.join(ROOT, "deploy/rescue/rescue.py"), encoding="utf-8").read()
+_m = re.search(r"def _post_cfg_restore\(self\):.*?(?=\n    def )", rs_src, re.S)
+if _m and "breakglass" not in _m.group(0) and "rollback" not in _m.group(0):
+    ok("配置恢复的 HTTP 处理器里没有任何通往完整恢复的分支")
+else:
+    bad("配置恢复处理器引用了完整恢复")
+# 完整恢复只能由**用户显式访问那个页面**触发: 它有自己的路由与票据
+if "/breakglass/restore" in rs_src and 'consume(nonce, self._sid(), snap, digest, "breakglass")' in rs_src:
+    ok("完整恢复是独立路由 + 独立一次性票据(与配置恢复不共用)")
+else:
+    bad("完整恢复没有独立票据")
 
 shutil.rmtree(work, ignore_errors=True)
 print("─" * 40)

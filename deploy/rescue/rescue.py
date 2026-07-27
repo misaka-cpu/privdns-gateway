@@ -57,6 +57,15 @@ def _cfgrestore():
         return None
 
 
+def _breakglass():
+    """紧急完整恢复。与配置恢复分开加载: 它不可用时配置恢复照样能用。"""
+    try:
+        import breakglass
+        return breakglass
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _pdgtx():
     try:
         import pdgtx
@@ -281,25 +290,26 @@ class Nonces:
         self.ttl = ttl
         self._n = {}                      # nonce -> (sid, snap, digest, exp)
 
-    def issue(self, sid, snap, digest):
+    def issue(self, sid, snap, digest, op="config"):
         n = secrets.token_urlsafe(18)
-        self._n[n] = (sid, snap, digest, time.time() + self.ttl)
+        self._n[n] = (sid, snap, digest, op, time.time() + self.ttl)
         # 顺手清过期的, 免得长期运行的服务里越积越多
         for k, v in list(self._n.items()):
-            if v[3] < time.time():
+            if v[4] < time.time():
                 self._n.pop(k, None)
         return n
 
-    def consume(self, n, sid, snap, digest):
-        """一次性核销。任何一项对不上都不算数, 且**不给出是哪一项不对**。"""
+    def consume(self, n, sid, snap, digest, op="config"):
+        """一次性核销。会话/快照/摘要/**操作类型**四项全对才算数, 且不提示是哪一项不对。
+        op 维度是必须的: 否则"恢复受管配置"的确认票能被拿去执行整机完整恢复。"""
         rec = self._n.pop(n, None)
         if not rec:
             return False
-        s_, sn_, dg_, exp = rec
+        s_, sn_, dg_, op_, exp = rec
         if time.time() > exp:
             return False
         return (hmac.compare_digest(s_, sid) and hmac.compare_digest(sn_, snap)
-                and hmac.compare_digest(dg_, digest))
+                and hmac.compare_digest(dg_, digest) and hmac.compare_digest(op_, op))
 
 
 class RateLimit:
@@ -568,8 +578,101 @@ def snapshot_confirm_page(snap_id, csrf, nonce, sessions=None):
                 "<h2>明确不恢复</h2><ul>%s</ul>"
                 "<p class=warn>本操作只换受管配置, 走 pdgtx 事务(有 before-image, 失败自动回滚)。"
                 "二进制、Bot 程序、平台/内核标记、凭据一律不动。</p>%s"
+                "<p class=muted>需要连二进制与 Bot 程序一起换回去? "
+                "<a href='/breakglass/%s'>紧急完整恢复</a>(独立操作, 风险更高)</p>"
                 "<p><a href=/snapshots>返回快照列表</a></p>"
-                % (html.escape(snap_id), rows, tgt, miss, exc, form))
+                % (html.escape(snap_id), rows, tgt, miss, exc, form, html.escape(snap_id)))
+
+
+def breakglass_confirm_page(snap_id, csrf, nonce):
+    """紧急完整恢复的确认页 —— 与配置恢复**分开**, 用词、票据、按钮都不共用。"""
+    cr = _cfgrestore()
+    bg = _breakglass()
+    if cr is None or bg is None or snap_id not in cr.snapshot_ids():
+        return None
+    members, err = cr.list_members(snap_id)
+    if err:
+        return page("PDG 救援 · 紧急完整恢复",
+                    "<h1>紧急完整恢复</h1><p class=bad>%s</p>"
+                    "<p><a href=/snapshots>返回</a></p>" % html.escape(err))
+    fmt = cr.snap_format(members)
+    digest = cr.snapshot_digest(snap_id)
+    p = cr.snapshot_path(snap_id)
+    made = time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(p))) if p else "?"
+    rows = _row("快照 ID", snap_id) + _row("创建时间", made) + _row("来源", "本机 pdg snapshot") \
+        + _row("结构版本", "%s(兼容性识别结果, 非快照自带声明)" % fmt) \
+        + _row("内容摘要", digest[:16] + "…")
+    protected = "".join("<li><code>%s</code></li>" % html.escape(os.path.basename(x))
+                        for x in bg._protected_paths())
+    tail6 = snap_id[-6:]
+    form = ""
+    if fmt not in ("v1.6", "legacy-dnsdist"):
+        form = ("<p class=bad>快照结构无法识别(%s), 拒绝执行。</p>" % html.escape(fmt))
+    else:
+        form = ("<form method=post action=/breakglass/restore>"
+                "<input type=hidden name=csrf value='%s'>"
+                "<input type=hidden name=snapshot value='%s'>"
+                "<input type=hidden name=digest value='%s'>"
+                "<input type=hidden name=nonce value='%s'>"
+                "<label>请手工输入快照 ID 的末 6 位以确认: "
+                "<input name=confirm_text autocomplete=off></label>"
+                "<br><button type=submit>执行紧急完整恢复</button></form>"
+                % (csrf, html.escape(snap_id), html.escape(digest), nonce))
+    return page("PDG 救援 · 紧急完整恢复",
+                "<h1>紧急完整恢复</h1><table>%s</table>"
+                "<h2>会恢复什么</h2>"
+                "<ul><li>mihomo / mosdns 的二进制与配置</li><li>Bot 程序与 bot.env</li>"
+                "<li>平台与内核标记(platform / backend)</li><li>WLOC / MITM 配置</li>"
+                "<li>快照正式覆盖的其它项目文件与 unit</li></ul>"
+                "<h2>会保留什么</h2>"
+                "<p>完整恢复覆盖 PDG 业务运行环境, 但保留当前救援入口, 避免恢复过程中失联。</p>"
+                "<ul>%s</ul>"
+                "<h2>与「恢复受管配置」的区别</h2>"
+                "<p class=bad>这个操作**没有 pdgtx 的二次自动回滚**。失败时只能靠本次操作前自动"
+                "创建的 pre-rescue 快照, 或 SSH 手工处理。只想换配置请回到 "
+                "<a href='/snapshot/%s'>恢复受管配置</a>。</p>%s"
+                "<p><a href=/snapshots>返回快照列表</a></p>"
+                % (rows, protected, html.escape(snap_id), form))
+
+
+def breakglass_result_page(res):
+    """结果页: 字段全部 HTML 转义, 只呈现受控结构化结果。"""
+    v = res.get("validation") or {}
+    rows = _row("操作", res.get("operation", "")) + _row("快照", res.get("snapshot_id", "")) \
+        + _row("操作前快照(pre-rescue)", res.get("pre_rescue_snapshot_id", "") or "(无)") \
+        + _row("最终状态", res.get("final_state", ""),
+               "ok" if res.get("final_state") == "RESTORED" else "bad")
+    if res.get("error_class"):
+        rows += _row("错误类别", res["error_class"], "bad")
+    if res.get("failed"):
+        rows += _row("失败项", "、".join(str(x) for x in res["failed"]), "bad")
+    if res.get("protected"):
+        rows += _row("已保护的救援文件", "%d 项" % len(res["protected"]))
+    for k, label in (("rescue_files_reprotected", "恢复后复原的救援文件"),
+                     ("rescue_port_before", "恢复前救援端口放行"),
+                     ("rescue_port_after", "恢复后救援端口放行"),
+                     ("rescue_port_reopened", "救援端口已补回"),
+                     ("rescue_service_untouched", "救援服务未被停止/重启"),
+                     ("kernel", "mihomo"), ("dns", "mosdns")):
+        if k in v:
+            val = v[k]
+            val = "、".join(str(x) for x in val) if isinstance(val, list) else str(val)
+            rows += _row(label, val or "(无)")
+    if res.get("audit_warning"):
+        rows += _row("审计告警", res["audit_warning"], "warn")
+    if res.get("detail"):
+        rows += _row("恢复输出摘要(已脱敏)", res["detail"][-800:])
+    if res.get("final_state") == "RESTORED":
+        tail = "<p class=ok>完整恢复完成, 救援入口保持可用。</p>"
+    else:
+        tail = ("<p class=bad>这次恢复**没有**自动二次回滚。证据已保留 —— 下一步可以用操作前的"
+                "pre-rescue 快照 <code>%s</code> 再恢复一次, 或用 SSH 登录后 "
+                "<code>sudo pdg rollback --dir /var/lib/privdns-gateway/backups/%s</code> 处理。</p>"
+                % (html.escape(res.get("pre_rescue_snapshot_id", "") or "(无)"),
+                   html.escape(res.get("pre_rescue_snapshot_id", "") or "<id>")))
+    return page("PDG 救援 · 完整恢复结果",
+                "<h1>紧急完整恢复结果</h1><table>%s</table>%s"
+                "<p><a href=/>返回状态</a> · <a href=/snapshots>返回快照</a></p>" % (rows, tail))
 
 
 def cfg_restore_result_page(res):
@@ -712,6 +815,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send(200, body) if body else self._send(404, page("404", "<p>没有这笔事务。</p>"))
         elif path == "/snapshots":
             self._send(200, snapshots_page())
+        elif path.startswith("/breakglass/"):
+            snap = path[len("/breakglass/"):]
+            cr = _cfgrestore()
+            if cr is None or snap not in cr.snapshot_ids():
+                self._send(404, page("404", "<p>没有这份快照。</p>"))
+                return
+            sid = self._sid()
+            # **独立**的一次性票: op 维度是 breakglass, 配置恢复的票拿到这里不算数
+            body = breakglass_confirm_page(snap, self.server.sessions.csrf(sid),
+                                           self.server.nonces.issue(sid, snap,
+                                                                    cr.snapshot_digest(snap),
+                                                                    "breakglass"))
+            self._send(200, body) if body else self._send(404, page("404", "<p>没有这份快照。</p>"))
         elif path.startswith("/snapshot/"):
             snap = path[len("/snapshot/"):]
             cr = _cfgrestore()
@@ -721,7 +837,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             sid = self._sid()
             body = snapshot_confirm_page(snap, self.server.sessions.csrf(sid),
                                          self.server.nonces.issue(sid, snap,
-                                                                  cr.snapshot_digest(snap)))
+                                                                  cr.snapshot_digest(snap),
+                                                                  "config"))
             self._send(200, body) if body else self._send(404, page("404", "<p>没有这份快照。</p>"))
         elif path == "/audit":
             self._send(200, audit_page())
@@ -825,7 +942,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if (form.get("confirm") or [""])[0] != "yes":
             self._send(400, page("400", "<p>没有勾选确认, 未执行任何操作。</p>"))
             return
-        if not self.server.nonces.consume(nonce, self._sid(), snap, digest):
+        if not self.server.nonces.consume(nonce, self._sid(), snap, digest, "config"):
             # 一次性票据: 刷新/双击/重放拿到的是这条, 而不是又跑一遍恢复
             self._send(409, page("409", "<p class=warn>这个确认已经用过或已失效(重复提交?)。"
                                         "请回到 <a href=/snapshots>快照列表</a> 重新确认。</p>"))
@@ -847,6 +964,57 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send(code, cfg_restore_result_page(res))
         except OSError:
             self.log_message("config_restore %s: 客户端已断开, 结果未能送达", snap)
+
+    def _post_breakglass(self):
+        """紧急完整恢复。与配置恢复完全分开的入口、票据与按钮 —— 配置恢复失败**不会**自动
+        走到这里, 只有用户明确来点这个页面才会执行。"""
+        if not self._authed():
+            self._send(401, login_page("请先登录。", self._issue_csrf()))
+            return
+        form = self._read_form()
+        if form is None:
+            self._send(413, page("413", "<p>请求体过大。</p>"))
+            return
+        if not self._csrf_ok(form):
+            self._send(403, page("403", "<p>表单已过期或来源不可信, 未执行任何操作。</p>"))
+            return
+        cr = _cfgrestore()
+        bg = _breakglass()
+        if cr is None or bg is None:
+            self._send(503, page("503", "<p class=bad>完整恢复模块不可用, 请用 SSH 处理。</p>"))
+            return
+        snap = (form.get("snapshot") or [""])[0]
+        digest = (form.get("digest") or [""])[0]
+        nonce = (form.get("nonce") or [""])[0]
+        typed = (form.get("confirm_text") or [""])[0].strip()
+        if snap not in cr.snapshot_ids():
+            self._send(404, page("404", "<p>没有这份快照。</p>"))
+            return
+        # 手工输入末 6 位: 让"点错了"和"真的要做"分开 —— 勾选框太容易顺手点过去
+        if not typed or not hmac.compare_digest(typed, snap[-6:]):
+            self._send(400, page("400", "<p>确认字符不正确, 未执行任何操作。"
+                                        "请手工输入快照 ID 的末 6 位。</p>"))
+            return
+        if not self.server.nonces.consume(nonce, self._sid(), snap, digest, "breakglass"):
+            self._send(409, page("409", "<p class=warn>这个确认已经用过或已失效(重复提交?)。"
+                                        "请回到快照页重新确认。</p>"))
+            return
+        if not self.server.recover_gate.acquire(blocking=False):
+            self._send(409, page("409", "<p class=warn>已有恢复操作正在执行, 请勿重复操作。</p>"))
+            return
+        self.log_message("breakglass %s", snap)
+        try:
+            res = bg.run(snap, expect_digest=digest, trigger_source="rescue", cfgrestore=cr)
+        except Exception as e:  # noqa: BLE001
+            self._send(500, page("500", "<p class=bad>完整恢复过程出错(%s), 请用 SSH 查看。</p>"
+                                 % html.escape(type(e).__name__)))
+            return
+        finally:
+            self.server.recover_gate.release()
+        try:
+            self._send(200, breakglass_result_page(res))
+        except OSError:
+            self.log_message("breakglass %s: 客户端已断开, 结果未能送达", snap)
 
     def do_HEAD(self):
         self.do_GET()
@@ -876,6 +1044,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         if path == "/snapshot/restore":
             self._post_cfg_restore()
+            return
+        if path == "/breakglass/restore":
+            self._post_breakglass()
             return
         if path != "/login":
             # 白名单之外的写路径一律明确拒绝(而不是 404 装作没有)
