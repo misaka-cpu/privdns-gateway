@@ -38,6 +38,27 @@ PDG_RESCUE_SERVICE_UNIT="pdg-rescue.service"
 PDG_PROFILE_ENV="${PDG_PROFILE_ENV:-/etc/privdns-gateway/profile.env}"
 PDG_CIDR_KEY="PDG_INTERNAL_CIDR"
 
+# 救援平面的**固定**受保护成员(相对快照根的路径)。完整恢复时这些一律**事前排除** ——
+# 不是"先覆盖再补回来": 补回来的那一瞬之前, 盘上已经是旧凭据/旧代码了, 而恢复正是用户最怕
+# 失联的时刻。清单只含救援平面自身: 普通 Bot 代码、bot.env、mihomo/mosdns、platform/backend、
+# WLOC 都**不在**其中(它们本来就该被完整恢复换掉)。
+# 这份清单不接受 HTTP、快照 manifest、环境变量或命令行的任何扩展 —— 谁都不能往里加一项,
+# 否则"完整恢复"就能被人指定成"什么都不恢复"。
+PDG_RESCUE_PROTECTED_MEMBERS="etc/privdns-gateway/rescue/token
+etc/privdns-gateway/rescue/cert.pem
+etc/privdns-gateway/rescue/key.pem
+opt/pdg-bot/rescue.py
+opt/pdg-bot/rescue_const.py
+opt/pdg-bot/rescue_cred.py
+opt/pdg-bot/breakglass.py
+opt/pdg-bot/rescue_nft.py
+opt/pdg-bot/rescue.sh
+etc/systemd/system/pdg-rescue.service
+etc/systemd/system/pdg-rescue.socket"
+
+# 逐行输出受保护成员(供 bash 侧过滤 tar 成员清单用)
+pdg_rescue_protected(){ printf '%s\n' "$PDG_RESCUE_PROTECTED_MEMBERS"; }
+
 # profile.env 里读一个键。读不到 → 返回 1 且不打印(调用方据此判断"没有", 而不是拿到空串当成"有")。
 pdg_profile_get(){
   local k="$1" f="${2:-$PDG_PROFILE_ENV}" v

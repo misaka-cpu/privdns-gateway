@@ -33,6 +33,13 @@ sys.path.insert(0, os.path.join(ROOT, "deploy", "rescue"))
 from rescuebox import Inst, TOKEN  # noqa: E402
 from txbox import Box  # noqa: E402
 
+import importlib.util as _iu_top  # noqa: E402
+
+_spec_c = _iu_top.spec_from_file_location("rc_port", os.path.join(ROOT, "deploy/bot/rescue_const.py"))
+_C = _iu_top.module_from_spec(_spec_c)
+_spec_c.loader.exec_module(_C)
+RPORT = _C.port()                      # 端口从单一常量源取, 测试里不写死(守卫会盯着)
+
 PASS = [0]
 FAIL = [0]
 SENTINEL = "S3CRET-SENTINEL-breakglass-55"
@@ -61,9 +68,13 @@ def mos(size=1024):
 
 
 # 假的 pdg: snapshot 打一个真 tar; rollback 真的把快照内容覆盖到沙箱根。
+# 假的 pdg: 与真实现同构 —— snapshot 打真 tar; rollback 支持 --preserve-rescue:
+# 受保护成员**事前排除**(既不解到生产, 也从 staging 删掉), nft 候选在 staging 里注入救援放行,
+# 全程只执行一次 `nft -f`。
 PDG_STUB = r'''#!/bin/bash
 set -uo pipefail
 ROOT="__ROOT__"
+REPO="__REPO__"
 case "${1:-}" in
   snapshot)
     [[ -n "${PDG_STUB_SNAPFAIL:-}" ]] && { echo "快照打包失败"; exit 1; }
@@ -75,15 +86,48 @@ case "${1:-}" in
     echo "✅ 快照: $d/snap.tar.gz"
     exit 0;;
   rollback)
-    [[ "${2:-}" == "--dir" ]] || { echo "用法错"; exit 2; }
-    dir="${3:-}"
+    preserve=0; dir=""
+    shift
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --dir) dir="${2:-}"; shift 2;;
+        --preserve-rescue) preserve=1; shift;;
+        *) shift;;
+      esac
+    done
     [[ -f "$dir/snap.tar.gz" ]] || { echo "快照文件缺失"; exit 1; }
     [[ -n "${PDG_STUB_FAIL:-}" ]] && { echo "注入: 恢复失败"; exit 1; }
-    tar xzf "$dir/snap.tar.gz" -C "$ROOT" 2>/dev/null || { echo "解包失败"; exit 1; }
-    # 与真实实现同构: 恢复末尾用**快照里的** nft 配置重新应用防火墙
+    tmp="$(mktemp -d)"; tree="$tmp/tree"; mkdir -p "$tree"
+    tar tzf "$dir/snap.tar.gz" > "$tmp/members" || { echo "清单读取失败"; exit 1; }
+    tar xzf "$dir/snap.tar.gz" -C "$tree" || { echo "解包失败"; exit 1; }
+    if (( preserve == 1 )); then
+      source "$REPO/lib/rescue.sh" || { echo "读不到保护清单"; exit 1; }
+      : > "$tmp/kept"
+      while IFS= read -r m; do
+        [[ -n "$m" ]] || continue
+        prot=0
+        while IFS= read -r pm; do
+          [[ -n "$pm" ]] || continue
+          [[ "$m" == "$pm" ]] && { prot=1; break; }
+        done < <(pdg_rescue_protected)
+        if (( prot == 1 )); then rm -f -- "$tree/$m"; else printf '%s\n' "$m" >> "$tmp/kept"; fi
+      done < "$tmp/members"
+      mv -f "$tmp/kept" "$tmp/members"
+      if [[ -f "$tree/etc/nftables.conf" ]]; then
+        cidr="$(sed -n 's/^PDG_INTERNAL_CIDR=//p' "$ROOT/etc/privdns-gateway/profile.env" | tail -1)"
+        python3 "$REPO/deploy/bot/rescue_nft.py" "$cidr" "$PDG_RESCUE_PORT" \
+          < "$tree/etc/nftables.conf" > "$tmp/nft.cand" || { echo "候选注入失败"; exit 1; }
+        nft -c -f "$tmp/nft.cand" >/dev/null 2>&1 || { echo "候选校验失败"; exit 1; }
+        mv -f "$tmp/nft.cand" "$tree/etc/nftables.conf"
+      fi
+    fi
+    [[ -n "${PDG_STUB_APPLYFAIL:-}" ]] && { echo "注入: 第 N 个文件落盘失败"; exit 1; }
+    ( cd "$tree" && tar --no-recursion -cf - -T "$tmp/members" 2>/dev/null ) \
+      | tar xpf - -C "$ROOT" 2>/dev/null || { echo "落盘失败"; exit 1; }
     if [[ -f "$ROOT/etc/nftables.conf" ]]; then nft -f "$ROOT/etc/nftables.conf" >/dev/null 2>&1; fi
     systemctl restart mosdns >/dev/null 2>&1
     systemctl restart mihomo >/dev/null 2>&1
+    rm -rf "$tmp"
     echo "✅ 已回滚并重启服务"
     exit 0;;
 esac
@@ -93,7 +137,7 @@ echo "未知子命令"; exit 2
 NFT_WITH_RESCUE = ("table inet pdg\ndelete table inet pdg\ntable inet pdg {\n"
                    "    chain input {\n        type filter hook input priority 0; policy drop;\n"
                    "        ip saddr 127.0.0.0/8 tcp dport { 53 } accept\n"
-                   "        ip saddr 127.0.0.0/8 tcp dport 8446 accept\n    }\n}\n")
+                   "        ip saddr 127.0.0.0/8 tcp dport %d accept\n    }\n}\n" % RPORT)
 NFT_OLD = ("table inet pdg\ndelete table inet pdg\ntable inet pdg {\n"
            "    chain input {\n        type filter hook input priority 0; policy drop;\n"
            "        ip saddr 127.0.0.0/8 tcp dport { 53 } accept\n    }\n}\n")
@@ -133,8 +177,8 @@ def make_box():
         "etc/privdns-gateway/rescue/key.pem": "CURRENT-KEY\n",
         "opt/pdg-bot/rescue.py": "# 当前救援服务代码\n",
         "opt/pdg-bot/rescue_const.py": "# 当前常量读取器\n",
-        "opt/pdg-bot/rescue.sh": "PDG_RESCUE_PORT=8446\n",
-        "etc/systemd/system/pdg-rescue.socket": "[Socket]\nListenStream=127.0.0.1:8446\n",
+        "opt/pdg-bot/rescue.sh": "PDG_RESCUE_PORT=%d\n" % RPORT,
+        "etc/systemd/system/pdg-rescue.socket": "[Socket]\nListenStream=127.0.0.1:%d\n" % RPORT,
         "etc/systemd/system/pdg-rescue.service": "[Service]\nExecStart=/usr/bin/python3 x\n",
     }
     for rel, data in files.items():
@@ -143,7 +187,7 @@ def make_box():
         with open(p, "w", encoding="utf-8") as f:
             f.write(data)
         os.chmod(p, 0o600 if "rescue/" in rel else 0o644)
-    box._write("pdg", PDG_STUB.replace("__ROOT__", box.root))
+    box._write("pdg", PDG_STUB.replace("__ROOT__", box.root).replace("__REPO__", ROOT))
     return box, files
 
 
@@ -269,7 +313,7 @@ if not broke:
 else:
     bad("救援平面被旧快照覆盖了: %r" % broke)
 nft_now = open(os.path.join(box.root, "nft-state.txt"), encoding="utf-8").read()
-if "8446 accept" in nft_now:
+if "%d accept" % RPORT in nft_now:
     ok("救援端口放行在恢复后仍然存在(旧 nft 快照没能永久切断它)")
 else:
     bad("救援端口被旧 nft 切断了:\n%s" % nft_now[-200:])
@@ -309,7 +353,155 @@ if SENTINEL not in aud_txt:
     ok("审计里不含哨兵")
 else:
     bad("审计泄漏哨兵")
+# ── 1b. 事前排除的证据: 只执行一次 nft -f, 且候选自带救援规则 ─────────────
+import importlib.util as _iu  # noqa: E402
+
+_spec_rc = _iu.spec_from_file_location("rc_check", os.path.join(ROOT, "deploy/bot/rescue_const.py"))
+_rc = _iu.module_from_spec(_spec_rc); _spec_rc.loader.exec_module(_rc)
+_want_prot = list(_rc.protected_members())
+if res.get("protected") and list(res["protected"]) == _want_prot:
+    ok("结果里列出的逻辑保护项与 lib/rescue.sh 的清单完全一致(%d 项)" % len(_want_prot))
+else:
+    bad("保护项清单不对: 结果=%r 期望=%r" % (res.get("protected"), _want_prot))
+if all(any(k in x for x in (res.get("protected") or []))
+       for k in ("token", "cert.pem", "key.pem", "rescue.py", "pdg-rescue.service")):
+    ok("保护项覆盖 Token / 证书 / 私钥 / 服务代码 / unit")
+else:
+    bad("保护项缺关键条目: %r" % res.get("protected"))
+_aud = audit_recs(box)
+if _aud and _aud[-1].get("protected_count") == len(_want_prot):
+    ok("审计记录了保护项数量(%d), 且不含路径内容" % _aud[-1]["protected_count"])
+else:
+    bad("审计的 protected_count 不对: %r" % (_aud[-1].get("protected_count") if _aud else None))
+
+nft_calls = [ln for ln in (open(box.calls, encoding="utf-8").read().splitlines()
+                           if os.path.exists(box.calls) else []) if ln.startswith("nft -f")]
+if len(nft_calls) == 1:
+    ok("整个恢复过程只执行了**一次** nft -f(候选已含救援放行, 不需要补第二次)")
+else:
+    bad("nft -f 执行了 %d 次: %r" % (len(nft_calls), nft_calls))
+if res.get("validation", {}).get("protected_intact") is True:
+    ok("校验: 受保护文件全程未被动过(protected_intact)")
+else:
+    bad("protected_intact 不为真: %r" % res.get("validation"))
+if "insert" not in (open(box.calls, encoding="utf-8").read() if os.path.exists(box.calls) else ""):
+    ok("没有『先应用旧配置再 insert 一条』的补救调用")
+else:
+    bad("出现了事后 insert 的补救")
+disk_nft = read(box, "etc/nftables.conf") or ""
+if "pdgrescue" in disk_nft and str(RPORT) in disk_nft:
+    ok("落盘的 nftables.conf 里就带着救援放行(不是靠运行态补的)")
+else:
+    bad("落盘配置没有救援放行")
+
 box.clean()
+
+# ── 1c. 候选含 flush ruleset 时救援规则仍然存在 ───────────────────────────
+box2, cur2 = make_box()
+sid2 = make_snapshot(box2, snap_id="20250505-050505", items={
+    "etc/nftables.conf": "flush ruleset\n" + NFT_OLD,
+    "etc/sing-box/config.json": MODEL,
+    "usr/local/bin/mihomo": "OLD-BINARY\n"})
+cr2, bg2 = load_mods(box2)
+r2 = bg2.run(sid2, expect_digest=cr2.snapshot_digest(sid2), cfgrestore=cr2)
+state2 = open(os.path.join(box2.root, "nft-state.txt"), encoding="utf-8").read()
+if r2.get("final_state") == "RESTORED" and "pdgrescue" in state2:
+    ok("候选含 flush ruleset: 事务结束时救援规则仍然存在")
+else:
+    bad("flush 之后救援规则没了: state=%r" % r2.get("final_state"))
+if state2.index("pdgrescue") > state2.index("flush ruleset"):
+    ok("救援表声明在 flush 之后(同一次 transaction 内一定生效)")
+else:
+    bad("救援表在 flush 之前")
+box2.clean()
+
+# ── 1d. nft -c 失败 → 磁盘与运行态都不变 ──────────────────────────────────
+box3, cur3 = make_box()
+sid3 = make_snapshot(box3, snap_id="20250606-060606")
+box3._write("nft", '#!/bin/bash\necho "nft $*" >> %s\n'
+            'case "$1" in\n  -c) exit 1;;\n  -f) exit 0;;\n  list) exit 0;;\nesac\nexit 0\n'
+            % box3.calls)
+nft_before = read(box3, "etc/nftables.conf")
+cr3, bg3 = load_mods(box3)
+r3 = bg3.run(sid3, expect_digest=cr3.snapshot_digest(sid3), cfgrestore=cr3)
+if r3.get("final_state") != "RESTORED":
+    ok("nft 候选校验失败: 完整恢复未报成功(%s)" % r3.get("final_state"))
+else:
+    bad("候选校验失败却报成功")
+if read(box3, "etc/nftables.conf") == nft_before:
+    ok("nft 候选校验失败: 磁盘上的防火墙配置逐字节未变")
+else:
+    bad("校验失败却改了磁盘")
+if read(box3, "usr/local/bin/mihomo") == "CURRENT-BINARY\n":
+    ok("nft 候选校验失败: 业务文件也没被落盘(在动手之前中止)")
+else:
+    bad("校验失败却落了盘")
+box3.clean()
+
+# ── 1e. 各故障注入点: 受保护文件始终逐字节不变 ────────────────────────────
+for label, envkey in (("解包/落盘中途失败", "PDG_STUB_APPLYFAIL"),
+                      ("恢复整体失败", "PDG_STUB_FAIL")):
+    boxf, curf = make_box()
+    sidf = make_snapshot(boxf, snap_id="20250707-070707")
+    crf, bgf = load_mods(boxf)
+    os.environ[envkey] = "1"
+    rf = bgf.run(sidf, expect_digest=crf.snapshot_digest(sidf), cfgrestore=crf)
+    os.environ.pop(envkey, None)
+    broke = [k for k in ("etc/privdns-gateway/rescue/token", "etc/privdns-gateway/rescue/key.pem",
+                         "opt/pdg-bot/rescue.py", "etc/systemd/system/pdg-rescue.socket")
+             if read(boxf, k) != curf[k]]
+    if not broke and rf.get("final_state") != "RESTORED":
+        ok("%s: 救援文件逐字节不变, 且如实报失败" % label)
+    else:
+        bad("%s: 救援文件被动了 %r 或误报成功(%s)" % (label, broke, rf.get("final_state")))
+    boxf.clean()
+
+# ── 1f. 快照里没有救援文件时, 当前文件不能被删 ────────────────────────────
+box4, cur4 = make_box()
+sid4 = make_snapshot(box4, snap_id="20250808-080808", old_rescue=False)
+cr4, bg4 = load_mods(box4)
+r4 = bg4.run(sid4, expect_digest=cr4.snapshot_digest(sid4), cfgrestore=cr4)
+missing = [k for k in ("etc/privdns-gateway/rescue/token", "opt/pdg-bot/rescue.py")
+           if read(box4, k) != cur4[k]]
+if r4.get("final_state") == "RESTORED" and not missing:
+    ok("快照里没有救援文件: 当前文件既不被删也不被改")
+else:
+    bad("缺救援文件的快照弄坏了当前平面: %r" % missing)
+box4.clean()
+
+# ── 1g. pdg 不支持保护模式 → Web 直接拒绝 ────────────────────────────────
+box5, cur5 = make_box()
+sid5 = make_snapshot(box5, snap_id="20250909-090909")
+# 老版本的 pdg: snapshot 是能用的(真机上就是这样), 只是**没有** --preserve-rescue。
+# 这样才验得出"保护模式检查"本身, 而不是被 pre-rescue 快照失败顺带挡住。
+box5._write("pdg", PDG_STUB.replace("__ROOT__", box5.root).replace("__REPO__", ROOT)
+            .replace("--preserve-rescue) preserve=1; shift;;", "--nothing) shift;;"))
+cr5, bg5 = load_mods(box5)
+r5 = bg5.run(sid5, expect_digest=cr5.snapshot_digest(sid5), cfgrestore=cr5)
+if r5.get("final_state") == "REFUSED" and r5.get("error_class") == "NO_PRESERVE_MODE":
+    ok("已安装的 pdg 不支持保护模式 → Web 完整恢复被拒绝")
+else:
+    bad("无保护模式却允许执行: %r" % r5.get("final_state"))
+if read(box5, "usr/local/bin/mihomo") == "CURRENT-BINARY\n":
+    ok("无保护模式: 现网逐字节未变")
+else:
+    bad("现网被改了")
+box5.clean()
+
+# ── 1h. 普通 CLI 不带保护模式时历史行为不变 ──────────────────────────────
+import subprocess as _sp  # noqa: E402
+
+_pdg_src = open(os.path.join(ROOT, "deploy/bot/pdg.sh"), encoding="utf-8").read()
+if "--preserve-rescue) preserve=1" in _pdg_src and "local idx=\"\" dir=\"\" git_ref=\"\" target preserve=0" in _pdg_src:
+    ok("Bash: 保护模式是固定开关, 默认关闭(普通 CLI 语义不变)")
+else:
+    bad("保护模式的默认值/开关形态不对")
+# 判**参数解析**里有没有任意排除, 而不是判注释里提没提这个词
+_case_branches = re.findall(r"^\s*(--[a-z-]+)\)", _pdg_src, re.M)
+if "--exclude" not in _case_branches and "--skip" not in _case_branches:
+    ok("Bash: 参数解析里没有任意 --exclude/--skip(只有固定的 --preserve-rescue)")
+else:
+    bad("出现了任意排除参数: %r" % _case_branches)
 
 # ── 2. pre-rescue 快照失败 → 拒绝执行, 现网不变 ───────────────────────────
 box, cur = make_box()

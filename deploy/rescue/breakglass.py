@@ -37,75 +37,47 @@ RESTORE_TIMEOUT = int(os.environ.get("PDG_BREAKGLASS_TIMEOUT", "1800"))
 MIN_FREE_MB = 200                       # 低于这个可用空间不开始(解包 + pre-rescue 快照要地方)
 
 
+def _protected_members():
+    """固定的受保护**成员名**(相对快照根)。单一来源是 lib/rescue.sh —— bash 侧的
+    --preserve-rescue 读的是同一份, 不存在"两边各保护一半"的可能。"""
+    return C.protected_members()
+
+
 def _protected_paths():
-    """**固定**的受保护路径白名单: 救援控制平面自身。
-
-    绝不由请求决定 —— 那等于让调用方指定"这次恢复不要覆盖哪些文件"。清单只含:
-    救援服务代码与启动所需的最小 helper、凭据、unit。事务核心 pdgtx 与配置恢复 helper
-    cfgrestore **不在其中**: 它们是业务侧的恢复目标, 保护它们等于让回滚回不干净; 它们缺失
-    时救援服务照样能起来(状态页可用, 恢复类功能会如实说明不可用)。"""
-    p = C.paths()
-    here = os.path.dirname(os.path.abspath(__file__))
-    out = [p["PDG_RESCUE_TOKEN"], p["PDG_RESCUE_CERT"], p["PDG_RESCUE_KEY"]]
-    # 跟随事务核心的沙箱根: 用例与 E2E 把整棵树挪了根, 写死绝对路径会让"保护"保护到宿主上
-    # 的另一份文件去, 而沙箱里的那份照样被覆盖(第一版就是这样漏的)。
-    installed = pdgtx.FSROOT + "/opt/pdg-bot"
-    for name in ("rescue.py", "rescue_const.py", "rescue.sh"):
-        out.append(os.path.join(installed, name))
-        out.append(os.path.join(here, name))
-    unit_dir = os.environ.get("PDG_UNIT_DIR", pdgtx.FSROOT + "/etc/systemd/system")
-    out.append(os.path.join(unit_dir, "pdg-rescue.socket"))
-    out.append(os.path.join(unit_dir, "pdg-rescue.service"))
-    seen, uniq = set(), []
-    for x in out:
-        r = os.path.realpath(x) if os.path.exists(x) else x
-        if r not in seen:
-            seen.add(r)
-            uniq.append(x)
-    return tuple(uniq)
+    """受保护成员 → 本机绝对路径(跟随沙箱根)。仅用于**校验**"它们确实没被动过"。"""
+    root = pdgtx.FSROOT
+    return tuple(os.path.join(root, m) for m in _protected_members())
 
 
-class _Guard:
-    """把受保护文件抄一份到 0700 的保管区, 恢复完再逐项比对复原。"""
+class _Witness:
+    """受保护文件的**见证者**: 只记指纹, 不做备份恢复。
+
+    保护本身由 Bash 侧的 --preserve-rescue **事前排除**完成 —— 那才是"从未被覆盖"。这里的
+    职责是事后如实回答"到底有没有被动过": 如果指纹变了, 说明保护漏了, 那是必须报出来的缺陷,
+    而不是悄悄补回来了事(补回来的那一瞬之前, 盘上已经是旧凭据了)。"""
 
     def __init__(self, paths):
-        self.dir = tempfile.mkdtemp(prefix="pdg-rescue-guard.")
-        os.chmod(self.dir, 0o700)
-        self.saved = {}                 # path -> (副本路径 or None(当时不存在), mode, uid, gid)
-        for i, p in enumerate(paths):
-            if not os.path.isfile(p):
-                self.saved[p] = (None, None, None, None)
-                continue
-            st = os.stat(p)
-            cp = os.path.join(self.dir, "%03d" % i)
-            shutil.copy2(p, cp)
-            os.chmod(cp, 0o600)
-            self.saved[p] = (cp, st.st_mode & 0o777, st.st_uid, st.st_gid)
-
-    def restore_changed(self):
-        """返回 (被复原的路径列表, 失败项列表)。只动**内容确实变了或被删了**的。"""
-        fixed, failed = [], []
-        for p, (cp, mode, uid, gid) in self.saved.items():
+        self.marks = {}
+        for p in paths:
             try:
-                if cp is None:
-                    continue            # 操作前本来就没有: 不去创造它
-                cur = None
-                if os.path.isfile(p):
-                    with open(p, "rb") as f:
-                        cur = f.read()
-                with open(cp, "rb") as f:
-                    want = f.read()
-                if cur == want:
-                    continue
-                os.makedirs(os.path.dirname(p), mode=0o700, exist_ok=True)
-                pdgtx.atomic_write(p, want, mode or 0o600, uid, gid)
-                fixed.append(os.path.basename(p))
-            except Exception as e:  # noqa: BLE001
-                failed.append("%s(%s)" % (os.path.basename(p), type(e).__name__))
-        return fixed, failed
+                with open(p, "rb") as f:
+                    self.marks[p] = pdgtx._sha(f.read())
+            except OSError:
+                self.marks[p] = None            # 当时就不存在
 
-    def close(self):
-        shutil.rmtree(self.dir, ignore_errors=True)
+    def violations(self):
+        out = []
+        for p, want in self.marks.items():
+            try:
+                with open(p, "rb") as f:
+                    cur = pdgtx._sha(f.read())
+            except OSError:
+                cur = None
+            if cur != want:
+                out.append(os.path.basename(p))
+            elif want is None and os.path.exists(p):
+                out.append(os.path.basename(p))
+        return out
 
 
 def _tail(text, n=2000):
@@ -245,7 +217,6 @@ def run(snapshot_id, *, expect_digest="", trigger_source="rescue", cfgrestore=No
     except pdgtx.TxBusy:
         res.update(final_state="BUSY", error_class="BUSY", detail="已有配置操作正在执行")
         return res
-    guard = None
     try:
         # ── 锁内复核: 路径、摘要、pending、磁盘 ──────────────────────────────
         path = cr.snapshot_path(snapshot_id)
@@ -288,6 +259,13 @@ def run(snapshot_id, *, expect_digest="", trigger_source="rescue", cfgrestore=No
             res.update(final_state="REFUSED", error_class="NO_SPACE",
                        detail="可用磁盘不足 %d MB, 拒绝执行" % MIN_FREE_MB)
             return res
+        # 保护模式是**前置条件**: 装的 pdg 不支持它就别开始 —— 连 pre-rescue 快照都不该打,
+        # 那只会在拒绝之前白占一份磁盘。
+        if not _supports_preserve():
+            res.update(final_state="REFUSED", error_class="NO_PRESERVE_MODE",
+                       detail="已安装的 pdg 不支持 --preserve-rescue, 拒绝从 Web 执行完整恢复"
+                              "(否则救援入口会被旧快照覆盖)。请用 SSH 处理。")
+            return res
 
         # ── pre-rescue 快照: 失败即拒绝(Web 第一版不提供强制跳过)──────────────
         rc, out = _run([_pdg_path(), "snapshot"], timeout=900, env=_child_env())
@@ -301,35 +279,33 @@ def run(snapshot_id, *, expect_digest="", trigger_source="rescue", cfgrestore=No
             return res
         res["pre_rescue_snapshot_id"] = pre_id
 
-        # ── 保护救援控制平面 ────────────────────────────────────────────────
+        # ── 救援平面: **事前排除**(由 Bash 侧的固定保护模式做), 这里只做见证与校验 ──
         protected = _protected_paths()
-        guard = _Guard(protected)
-        res["protected"] = [os.path.basename(p) for p in protected]
+        witness = _Witness(protected)
+        res["protected"] = list(_protected_members())
         port_before = _rescue_port_open()
 
-        # ── 固定 argv 调用受控 Bash 恢复 ────────────────────────────────────
+        # ── 固定 argv 调用受控 Bash 恢复(带固定保护模式)────────────────────
         snap_dir = os.path.dirname(path)
-        rc, out = _run([_pdg_path(), "rollback", "--dir", snap_dir],
+        rc, out = _run([_pdg_path(), "rollback", "--dir", snap_dir, "--preserve-rescue"],
                        timeout=RESTORE_TIMEOUT, env=_child_env())
         res["detail"] = _tail(out)
 
-        # ── 复原被覆盖的救援文件 + 补回端口放行 ─────────────────────────────
-        fixed, gfailed = guard.restore_changed()
+        # ── 校验: 受保护文件必须**从未被动过**; 动了就是缺陷, 如实报告 ──────
+        violations = witness.violations()
+        res["validation"]["protected_intact"] = not violations
+        if violations:
+            res["failed"].append("受保护的救援文件被改动了: " + "、".join(violations))
+            res["error_class"] = res["error_class"] or "PROTECTION_VIOLATED"
         res["restored"] = ["(见 pdg rollback 输出摘要)"] if rc == 0 else []
-        if fixed:
-            res["skipped"] = []
-        res["validation"]["rescue_files_reprotected"] = fixed
-        if gfailed:
-            res["failed"] += ["救援文件复原失败: " + x for x in gfailed]
         port_after = _rescue_port_open()
         res["validation"]["rescue_port_before"] = port_before
         res["validation"]["rescue_port_after"] = port_after
+        res["validation"]["nft_applies"] = _count_nft_applies(out)
         if port_before and port_after is False:
-            cidr = C.internal_cidr()
-            good, why = _reopen_rescue_port(cidr)
-            res["validation"]["rescue_port_reopened"] = good
-            if not good:
-                res["failed"].append("救援端口放行未能补回(%s)" % why)
+            # 到这一步还没有放行, 说明候选注入失败了 —— 报出来, 不再"事后补一条"掩盖它
+            res["failed"].append("恢复后运行态缺少救援端口放行(候选注入未生效)")
+            res["error_class"] = res["error_class"] or "RESCUE_PORT_LOST"
         # 救援服务不该被这次恢复停掉/重启
         res["validation"]["rescue_service_untouched"] = _rescue_untouched(out)
         res["validation"]["kernel"] = _svc_state("mihomo")
@@ -346,13 +322,27 @@ def run(snapshot_id, *, expect_digest="", trigger_source="rescue", cfgrestore=No
             res["failed"].append("pdg rollback 退出码 %d" % rc)
         return res
     finally:
-        if guard is not None:
-            guard.close()
         try:
             _audit(res, t0, trigger_source)
         except Exception as e:  # noqa: BLE001
             res["audit_warning"] = "审计写入失败(%s)" % type(e).__name__
         lock.__exit__()
+
+
+def _supports_preserve():
+    """已安装的 pdg 支不支持固定保护模式。不支持就**不允许**从 Web 执行完整恢复 ——
+    那等于让用户点一个会把自己锁在门外的按钮。"""
+    p = _pdg_path()
+    try:
+        with open(p, encoding="utf-8", errors="replace") as f:
+            return "--preserve-rescue" in f.read()
+    except OSError:
+        return False
+
+
+def _count_nft_applies(out):
+    """恢复过程里真正执行了几次 `nft -f`。期望恰好 1 次(候选已含救援放行, 不需要补第二次)。"""
+    return len(re.findall(r"\bnft -f\b", out or ""))
 
 
 def _rescue_untouched(out):

@@ -606,6 +606,11 @@ def breakglass_confirm_page(snap_id, csrf, nonce):
                         for x in bg._protected_paths())
     tail6 = snap_id[-6:]
     form = ""
+    legacy_note = ""
+    if fmt == "legacy-dnsdist":
+        legacy_note = ("<p class=bad>这是**旧结构**快照: 允许用于紧急完整恢复, 但恢复后"
+                       "**不保证当前服务能启动** —— 恢复完请立刻在本页确认 mihomo/mosdns 状态, "
+                       "必要时用 pre-rescue 快照回来。救援入口的保护对旧结构同样生效。</p>")
     if fmt not in ("v1.6", "legacy-dnsdist"):
         form = ("<p class=bad>快照结构无法识别(%s), 拒绝执行。</p>" % html.escape(fmt))
     else:
@@ -627,12 +632,12 @@ def breakglass_confirm_page(snap_id, csrf, nonce):
                 "<h2>会保留什么</h2>"
                 "<p>完整恢复覆盖 PDG 业务运行环境, 但保留当前救援入口, 避免恢复过程中失联。</p>"
                 "<ul>%s</ul>"
-                "<h2>与「恢复受管配置」的区别</h2>"
+                "<h2>与「恢复受管配置」的区别</h2>%s"
                 "<p class=bad>这个操作**没有 pdgtx 的二次自动回滚**。失败时只能靠本次操作前自动"
                 "创建的 pre-rescue 快照, 或 SSH 手工处理。只想换配置请回到 "
                 "<a href='/snapshot/%s'>恢复受管配置</a>。</p>%s"
                 "<p><a href=/snapshots>返回快照列表</a></p>"
-                % (rows, protected, html.escape(snap_id), form))
+                % (rows, protected, legacy_note, html.escape(snap_id), form))
 
 
 def breakglass_result_page(res):
@@ -647,8 +652,10 @@ def breakglass_result_page(res):
     if res.get("failed"):
         rows += _row("失败项", "、".join(str(x) for x in res["failed"]), "bad")
     if res.get("protected"):
-        rows += _row("已保护的救援文件", "%d 项" % len(res["protected"]))
-    for k, label in (("rescue_files_reprotected", "恢复后复原的救援文件"),
+        rows += _row("全程保护(未被覆盖)", "%d 项: %s" % (
+            len(res["protected"]), "、".join(os.path.basename(x) for x in res["protected"])))
+    for k, label in (("protected_intact", "受保护文件全程未被改动"),
+                     ("nft_applies", "防火墙应用次数(期望 1)"),
                      ("rescue_port_before", "恢复前救援端口放行"),
                      ("rescue_port_after", "恢复后救援端口放行"),
                      ("rescue_port_reopened", "救援端口已补回"),

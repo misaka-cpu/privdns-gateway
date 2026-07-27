@@ -76,6 +76,20 @@ def paths(path=None):
         "PDG_RESCUE_TOKEN", "PDG_RESCUE_STATE", "PDG_PROFILE_ENV")}
 
 
+def protected_members(path=None):
+    """救援平面的固定受保护成员(相对快照根)。与 bash 侧读的是**同一份** lib/rescue.sh。
+
+    读不到就抛错 —— 宁可让完整恢复拒绝执行, 也不能拿一个空清单去"保护"(那等于没保护)。"""
+    text = open(path or _source_path(), encoding="utf-8").read()
+    m = re.search(r'PDG_RESCUE_PROTECTED_MEMBERS="([^"]*)"', text)
+    if not m:
+        raise RuntimeError("lib/rescue.sh 里没有 PDG_RESCUE_PROTECTED_MEMBERS")
+    items = tuple(x.strip() for x in m.group(1).splitlines() if x.strip())
+    if not items:
+        raise RuntimeError("受保护成员清单为空, 拒绝以空清单执行完整恢复")
+    return items
+
+
 def internal_cidr(profile=None):
     """内网卡来源段 —— 唯一真源是 profile.env 的 PDG_INTERNAL_CIDR。
 

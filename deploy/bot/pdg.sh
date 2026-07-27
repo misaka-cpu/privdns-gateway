@@ -687,11 +687,15 @@ cmd_snapshot(){
 cmd_rollback(){
   need_root rollback; _lock
   # 参数: <序号>(默认0) | --dir <快照目录>(精确指定, 供 update 用) | --git <ref>(回滚后把 REPO_DIR 复位到该提交)
-  local idx="" dir="" git_ref="" target
+  local idx="" dir="" git_ref="" target preserve=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --dir) dir="${2:-}"; shift 2 || { echo "--dir 缺参数"; return 1; };;
       --git) git_ref="${2:-}"; shift 2 || { echo "--git 缺参数"; return 1; };;
+      # 救援平面内部固定模式: **事前排除**救援自身的文件, 并让恢复出来的 nft 候选自带救援
+      # 放行。只有这一个固定开关 —— 不提供 `--exclude <path>` 之类的任意排除, 否则"完整恢复"
+      # 可以被指定成"什么都不恢复"。普通 CLI 不传它时行为与历史完全一致。
+      --preserve-rescue) preserve=1; shift;;
       *) idx="$1"; shift;;
     esac
   done
@@ -722,6 +726,32 @@ cmd_rollback(){
   if ! tar xzf "$f" -C "$tree" 2>/dev/null; then
     echo "❌ 快照解包失败, 中止"; rm -rf "$tmp"; return 1
   fi
+  if (( preserve == 1 )); then
+    # **事前排除**: 受保护成员既不进落盘清单, 也从 staging 里删掉 —— 于是生产上的救援文件
+    # 从头到尾没有被覆盖过, 不存在"先覆盖再补回来"的那一瞬。
+    # shellcheck source=lib/rescue.sh
+    if ! source "$REPO_DIR/lib/rescue.sh" 2>/dev/null && ! source /opt/pdg-bot/rescue.sh 2>/dev/null; then
+      echo "❌ 读不到救援保护清单(lib/rescue.sh), 拒绝在无保护的情况下执行完整恢复"
+      rm -rf "$tmp"; return 1
+    fi
+    local _prot _kept="$tmp/members.kept"
+    : > "$_kept"
+    while IFS= read -r _m; do
+      [[ -n "$_m" ]] || continue
+      _prot=0
+      while IFS= read -r _p; do
+        [[ -n "$_p" ]] || continue
+        [[ "$_m" == "$_p" || "$_m" == "$_p/" ]] && { _prot=1; break; }
+      done < <(pdg_rescue_protected)
+      if (( _prot == 1 )); then
+        rm -f -- "$tree/$_m" 2>/dev/null || true      # staging 里也不留, 免得被后续步骤用到
+        echo "  保留当前救援平面文件(不恢复): $_m"
+      else
+        printf '%s\n' "$_m" >> "$_kept"
+      fi
+    done < "$members"
+    mv -f "$_kept" "$members"
+  fi
   if _sb_panel_managed_on "$tree/etc/sing-box/config.json"; then
     if ! _sb_sanitize_panel "$tree/etc/sing-box/config.json"; then
       echo "❌ 快照面板临时态净化失败, 中止"; rm -rf "$tmp"; return 1
@@ -736,6 +766,30 @@ cmd_rollback(){
   if [[ -f "$tree/etc/mihomo/config.yaml" ]]; then
     "${snap_mbin:-mihomo}" -t -d "$tree/etc/mihomo" -f "$tree/etc/mihomo/config.yaml" >/dev/null 2>&1 \
       || { echo "❌ 快照的 mihomo 配置 check 失败, 中止"; rm -rf "$tmp"; return 1; }
+  fi
+  # 保护模式下: 在**staging 里**就把救援放行注入候选, 于是落盘的那份从一开始就带着它,
+  # 后面只需要既有的那一次 `nft -f`。绝不做"先应用旧配置再补一条" —— 两次 apply 之间就是
+  # 救援入口真实消失的窗口, 而完整恢复正是最需要它的时刻。
+  if (( preserve == 1 )) && [[ -f "$tree/etc/nftables.conf" ]]; then
+    local _rn _cidr _cand="$tmp/nft.cand"
+    _rn="$(_pdg_module rescue_nft.py)" || { echo "❌ 找不到 rescue_nft.py, 拒绝在无救援放行的情况下恢复防火墙"; rm -rf "$tmp"; return 1; }
+    _cidr="$(pdg_internal_cidr 2>/dev/null || true)"
+    [[ -n "$_cidr" ]] || _cidr="$(grep -oE 'ip saddr [0-9.]+/[0-9]+' /etc/nftables.conf 2>/dev/null | head -1 | awk '{print $3}')"
+    if [[ -z "$_cidr" ]]; then
+      echo "❌ 读不到内网卡段, 无法生成带救援放行的防火墙候选 → 中止(不改动现网)"
+      rm -rf "$tmp"; return 1
+    fi
+    if [[ -z "${PDG_RESCUE_PORT:-}" ]]; then
+      echo "❌ 读不到救援端口常量(lib/rescue.sh), 拒绝生成防火墙候选"; rm -rf "$tmp"; return 1
+    fi
+    if ! python3 "$_rn" "$_cidr" "$PDG_RESCUE_PORT" < "$tree/etc/nftables.conf" > "$_cand"; then
+      echo "❌ 生成带救援放行的防火墙候选失败 → 中止(不改动现网)"; rm -rf "$tmp"; return 1
+    fi
+    if ! nft -c -f "$_cand" >/dev/null 2>&1; then
+      echo "❌ 带救援放行的防火墙候选校验(nft -c)未过 → 中止(磁盘与内核都未改动)"
+      rm -rf "$tmp"; return 1
+    fi
+    mv -f "$_cand" "$tree/etc/nftables.conf" || { echo "❌ 写回候选失败, 中止"; rm -rf "$tmp"; return 1; }
   fi
   [[ -f "$tree/etc/nftables.conf" ]] && { nft -c -f "$tree/etc/nftables.conf" >/dev/null 2>&1 || { echo "❌ 快照的 nftables 语法错, 中止"; rm -rf "$tmp"; return 1; }; }
   echo "回滚到 $(basename "$target") …"
@@ -772,6 +826,7 @@ cmd_rollback(){
     c_y "  mihomo 起核核验未达标, 请 pdg doctor 复查"
     unrestored+=("内核激活(mihomo)")
   fi
+  # 明确列出要重启的 unit, 绝不用 `pdg-*` 之类的通配 —— 那会把救援服务一起重启掉。
   systemctl restart mosdns pdg-bot pdg-probe81 2>/dev/null || true
   systemctl is-enabled pdg-mitm >/dev/null 2>&1 && { systemctl reset-failed pdg-mitm 2>/dev/null; systemctl restart pdg-mitm 2>/dev/null; }   # iOS/WLOC: 清 start-limit + 一并恢复 MITM 服务
   systemctl restart systemd-journald 2>/dev/null || true   # journald CanReload=no: 还原封顶需 restart 才生效
