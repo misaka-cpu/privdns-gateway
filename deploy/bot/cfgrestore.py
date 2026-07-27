@@ -19,6 +19,7 @@ import tarfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, "/opt/pdg-bot")
+import mihomorender  # noqa: E402
 import pdgtx  # noqa: E402
 
 
@@ -381,7 +382,7 @@ def restore_managed(snap_id, *, expect_digest="", trigger_source="legacy"):
     repair 语义: 允许"操作前就坏的硬门"保持原状, 但候选本身的语法/安全校验一条不放宽, 原来
     正常、恢复后异常的硬门照样触发回滚。
     """
-    out = {"ok": False, "snapshot": snap_id, "state": "", "restored": [], "skipped": [],
+    out = {"ok": False, "snapshot": snap_id, "state": "", "restored": [], "derived": [], "skipped": [],
            "excluded": [], "failed": [], "error": "", "txid": ""}
     p = snapshot_path(snap_id)
     if not p:
@@ -489,8 +490,19 @@ def restore_managed(snap_id, *, expect_digest="", trigger_source="legacy"):
                 out["error"] = "没有可落盘的目标"
                 t.abort_unstarted("没有可落盘的目标")
                 return out
+            # model 换了就必须在**同一笔事务**里重渲内核配置。
+            # 快照里带的是 config.json(数据模型), 而 mihomo 跑的是 /etc/mihomo/config.yaml ——
+            # 只换 model 再 restart:mihomo, 内核重启后加载的仍是旧的那一份: 恢复"成功"了, 运行
+            # 中的内核纹丝不动。派生走 mihomorender(与 bot 的 tx_apply 同一份实现), 渲染失败
+            # 或有出口/规则会被静默丢弃时判废, model 与 mihomo_cfg 一起回滚。
+            if "model" in out["restored"]:
+                t.derive("mihomo_cfg", mihomorender.deriver_from_paths(
+                    rs_meta_path=pdgtx.FSROOT + "/opt/pdg-bot/rulesets.json",
+                    mitm_hijack_file=pdgtx.FSROOT + "/etc/mosdns/rules/mitm_hijack.txt",
+                    platform_file=pdgtx.FSROOT + "/etc/privdns-gateway/platform"))
+                out["derived"] = ["mihomo_cfg"]
             # 动作由**实际落盘的目标**推导(read_for_update 失败被跳过的不算数)
-            for a in pdgtx.actions_for_targets(out["restored"]):
+            for a in pdgtx.actions_for_targets(out["restored"] + out.get("derived", [])):
                 t.service(a)
             res = t.commit()
         except pdgtx.TxBusy:

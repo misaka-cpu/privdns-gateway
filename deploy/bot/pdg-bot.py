@@ -28,8 +28,9 @@ RS_DIR = "/etc/sing-box/rs"
 MIHOMO_DIR = "/etc/mihomo"
 MIHOMO_CFG = MIHOMO_DIR + "/config.yaml"
 MIHOMO_BIN = "mihomo"
-MIHOMO_REDIR = 7893
-MITM_PORT = 7894                                  # MITM 服务(socks5)监听; mihomo 把接管域名路由到这
+import mihomorender                              # 渲染链的共享实现(救援/恢复也用同一份)
+MIHOMO_REDIR = mihomorender.MIHOMO_REDIR
+MITM_PORT = mihomorender.MITM_PORT                # MITM 服务(socks5)监听; mihomo 把接管域名路由到这
 MITM_HIJACK_FILE = "/etc/mosdns/rules/mitm_hijack.txt"   # 接管域名(mosdns 强制劫持集, 与 mihomo 路由同源)
 # mihomo 有路径安全限制: external-ui 等文件路径须在工作目录(-d)下或 SAFE_PATHS 白名单内。
 # 观测面板 UI 在 /etc/sing-box/ui/dist(与 sing-box 共用), 不在 /etc/mihomo 下 → 用 SAFE_PATHS 放行,
@@ -431,17 +432,8 @@ def _ios_only(chat, mid=None):
     return False
 
 def _panel_render_args(model):
-    """把 model 的 experimental.clash_api(面板状态)透传给渲染器 —— mihomo 原生 clash API,
-    面板开关/secret/external_ui 语义与 sing-box 一致, 无需另建状态。"""
-    api = (model.get("experimental", {}) or {}).get("clash_api", {}) or {}
-    if not isinstance(api, dict):
-        api = {}
-    return {
-        "controller": api.get("external_controller") or "127.0.0.1:9090",
-        "secret": api.get("secret"),
-        "external_ui": api.get("external_ui"),
-        "external_ui_url": api.get("external_ui_download_url"),
-    }
+    """把 model 的 experimental.clash_api(面板状态)透传给渲染器。实现在 mihomorender。"""
+    return mihomorender.panel_args(model)
 
 def _write_mihomo(cfg):
     os.makedirs(MIHOMO_DIR, exist_ok=True)
@@ -452,52 +444,25 @@ def _write_mihomo(cfg):
     os.replace(t, MIHOMO_CFG)
 
 def _mihomo_rulesets(meta=None):
-    """从 RS_META 构造 mihomo rule-providers 入参: rule-provider 指向原始 url, mihomo 原生抓取解析。
-    收文本/yaml/mrs 类。历史遗留的 sing-box 二进制 .srs mihomo 读不了 → 跳过, 于是渲染器会把
-    它记进 meta['dropped'], 由 _mihomo_derive/迁移据此判失败并点名(不再静默丢弃)。"""
-    out = {}
+    """从 RS_META 构造 mihomo rule-providers 入参。
+
+    读盘留在 bot 侧(读的是 **bot 自己的 RS_META**, 测试 monkeypatch 的正是它); 分类与
+    .mrs behavior 判定走 mihomorender 的共享实现, 免得 bot / 恢复 / 救援三条路各有一份。"""
     try:
         meta = _rs_meta() if meta is None else meta
     except Exception:  # noqa: BLE001
-        return out
-    for name, info in meta.items():
-        low = str(info.get("url", "")).lower().split("?", 1)[0]
-        if low.endswith(".srs") or str(info.get("format", "")) == "binary":
-            continue
-        if low.endswith((".yaml", ".yml")):
-            behavior, fmt = "classical", "yaml"
-        elif low.endswith(".mrs") or str(info.get("format", "")) == "mrs":
-            # .mrs 是编译后的二进制。元数据里没记 behavior(老机器上的旧条目就没有)时, 从本地
-            # 已下好的文件二进制头认一次; 认得出就用, 认不出**不能猜** —— 猜错的后果是"规则看着
-            # 加了却永不命中"。仍认不出的一律不渲染, 让它进 dropped 由上层点名报错。
-            bh = str(info.get("behavior", ""))
-            if bh not in MRS_BEHAVIORS:
-                bh = _mrs_behavior_of_file(info.get("path") or "") or ""
-            if bh not in MRS_BEHAVIORS:
-                continue
-            behavior, fmt = bh, "mrs"
-        else:                                          # Surge/Clash .list/.txt: DOMAIN/-SUFFIX/-KEYWORD/IP-CIDR 混合
-            behavior, fmt = "classical", "text"
-        out[name] = {"url": info.get("url", ""), "behavior": behavior, "format": fmt}
-    return out
+        return {}
+    return mihomorender.rulesets_arg(meta)
 
 def _mitm_domains():
-    """接管域名列表(仅 iOS 平台且有插件启用时非空)。读 mosdns mitm_hijack.txt(去 domain: 前缀), 与 mosdns 强制劫持同源。"""
-    if _platform() != "ios":
-        return []
-    out = []
-    try:
-        for line in open(MITM_HIJACK_FILE, encoding="utf-8"):
-            line = line.strip()
-            if line and not line.startswith("#"):
-                out.append(line.replace("domain:", "").strip())
-    except OSError:
-        pass
-    return out
+    """接管域名列表(仅 iOS 平台且有插件启用时非空)。路径用 **bot 自己的 MITM_HIJACK_FILE**
+    (测试 monkeypatch 的是它), 解析走共享实现。"""
+    return mihomorender.read_mitm_domains(MITM_HIJACK_FILE, _platform())
 
 # ── MITM 插件(Feature B / iOS): WLOC 位置改写 ──
 MITM_CONFIG = "/etc/privdns-gateway/mitm.json"
 MITM_PLUGIN_DOMAINS = {"wloc": ["gs-loc.apple.com", "gs-loc-cn.apple.com"]}   # 插件 → 接管域名(与 mitm_server.PLUGIN_DOMAINS 同源)
+
 
 def _mitm_config():
     try:
@@ -1034,15 +999,12 @@ def _render_mihomo_bytes(model, rs_meta=None, mitm_domains=None):
     一起落盘 —— 否则"model 写进去了、渲染失败"就会留下两份不一致的配置。
 
     mitm_domains: 显式给出接管域名(WLOC 事务用**候选** mitm.json 推出来的那一份)。不给就读
-    生产的 mitm_hijack.txt —— 那是"这次不改 MITM"的路径才成立的默认值。"""
-    import sb2mihomo
-    tls_ports = [443] if _platform() == "ios" else None
-    cfg, meta = sb2mihomo.singbox_to_mihomo(
-        model, redir_port=MIHOMO_REDIR, rulesets=_mihomo_rulesets(rs_meta),
+    生产的 mitm_hijack.txt —— 那是"这次不改 MITM"的路径才成立的默认值。
+    渲染本体在 mihomorender(与恢复/救援共用); 这里只负责把 bot 当前的环境读好传进去。"""
+    return mihomorender.render_bytes(
+        model, rulesets=_mihomo_rulesets(rs_meta),
         mitm_domains=_mitm_domains() if mitm_domains is None else mitm_domains,
-        mitm_port=MITM_PORT, tls_ports=tls_ports,
-        **_panel_render_args(model))
-    return json.dumps(cfg, ensure_ascii=False, indent=2).encode("utf-8"), meta
+        tls_ports=[443] if _platform() == "ios" else None)
 
 
 def _render_mihomo_file():
@@ -1059,16 +1021,8 @@ def _render_mihomo_file():
     return meta
 
 def _fmt_dropped(dropped):
-    """把渲染器丢弃的规则说人话: 规则集报名字, 其余报它长什么样(供用户定位)。"""
-    out = []
-    for d in dropped or []:
-        if isinstance(d, dict) and d.get("rule_set"):
-            out.append(str(d["rule_set"]))
-        elif isinstance(d, dict):
-            out.append(",".join(f"{k}={v}" for k, v in list(d.items())[:2]) or "未知规则")
-        else:
-            out.append(str(d))
-    return ", ".join(out[:8]) + ("…" if len(out) > 8 else "")
+    """把渲染器丢弃的规则说人话。实现在 mihomorender。"""
+    return mihomorender.fmt_dropped(dropped)
 
 
 def busy_msg():
@@ -1087,24 +1041,15 @@ def _model_bytes(c):
 def _mihomo_derive(staged):
     """由**候选** model(+候选 rs_meta)派生 mihomo 配置。dropped / 无法转换的出口一律判失败。
 
-    tx_apply 与恢复备份共用这一份 —— 判据只有一处, 免得两条路一个拦一个不拦。"""
+    tx_apply 与恢复备份共用这一份 —— 判据只有一处, 免得两条路一个拦一个不拦。
+    判废逻辑本体在 mihomorender.check_meta, 与配置恢复/救援侧同源。"""
     model = json.loads(staged["model"].decode("utf-8"))
     # 规则集元数据如果也在本次候选里, 渲染必须按**候选**来 —— 读现网旧文件会让新增的规则集
     # "翻译不了"被丢掉, 或者已删的又冒出来。
     staged_meta = staged.get("rs_meta")
     data, meta = _render_mihomo_bytes(
         model, rs_meta=json.loads(staged_meta.decode("utf-8")) if staged_meta else None)
-    # 用 TxRefused 而不是 ValueError: 事务对普通异常只报类型名(怕异常正文带出凭据), 而这两条
-    # 恰恰必须**点名**是哪个出口/哪条规则被丢了, 否则用户根本不知道该改什么。
-    refused = _pdgtx().TxRefused
-    bad = (meta or {}).get("unknown_proxies")
-    if bad:
-        raise refused("有出口 mihomo 无法转换(会被静默丢弃): %s"
-                      % ", ".join(str(x) for x in bad))
-    dropped = (meta or {}).get("dropped")
-    if dropped:
-        raise refused("有规则/规则集无法进入 mihomo 运行配置(会被静默丢弃): %s"
-                      % _fmt_dropped(dropped))
+    mihomorender.check_meta(meta)
     return data
 
 
@@ -2176,106 +2121,27 @@ def _build_source(url, path):
 
 # mihomo 的 .mrs 只有这两种 behavior —— classical 连它自己的 convert-ruleset 都会崩,
 # 收下等于配出一份内核加载不了的规则集。
-MRS_BEHAVIORS = ("domain", "ipcidr")
-_MRS_BEHAVIOR_BYTE = {0: "domain", 1: "ipcidr"}
-
-
-def _zstd_head_mod(data, n):
-    """用 python 的 zstd 实现解出头部(没有任何可用实现则返回 b'')。
-
-    3.14 起标准库自带 compression.zstd; 之前的版本(Debian 12 是 3.11)可能装了 pyzstd /
-    zstandard。有模块就不必依赖外部命令。"""
-    try:
-        from compression import zstd as _cz          # python >= 3.14
-        return _cz.decompress(data)[:n]
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        import pyzstd
-        return pyzstd.decompress(data)[:n]
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        import zstandard
-        return zstandard.ZstdDecompressor().decompressobj().decompress(data)[:n]
-    except Exception:  # noqa: BLE001
-        return b""
-
-
-def _zstd_head_cli(data, n):
-    """调 zstd 命令解出头部。只读前 n 字节就掐掉 —— 大规则集解出来可能几十 MB,
-    为了 5 个字节没必要全解。"""
-    if not shutil.which("zstd"):
-        return b""
-    fd, tmp = tempfile.mkstemp(prefix="pdgmrs")
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(data)
-        p = subprocess.Popen(["zstd", "-dcq", tmp], stdout=subprocess.PIPE,
-                             stderr=subprocess.DEVNULL)
-        try:
-            return p.stdout.read(n) or b""
-        finally:
-            p.stdout.close()
-            p.kill()
-            p.wait(timeout=10)
-    except (OSError, subprocess.SubprocessError):
-        return b""
-    finally:
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
-
-
-def _mrs_head(data, n=8):
-    """取 .mrs 解压后的头部若干字节(取不到返回 b'')。
-
-    MRS 是 zstd 压缩的二进制: 解压后为 b"MRS" + 版本(1B) + behavior(1B) + …。
-    依次: python zstd 模块 → zstd 命令 → 在原始字节里找 b"MRS"。最后那条只对小文件有效 ——
-    真实的大规则集头部落在 Huffman 压缩的字面量块里, 盲扫根本找不到(所以装机依赖里带了
-    zstd; 见 _mrs_unreadable_hint)。三条都不成立就老实说不知道, 绝不猜。"""
-    if not isinstance(data, (bytes, bytearray)):
-        return b""
-    data = bytes(data)
-    if data[:3] == b"MRS":                       # 未压缩(防御性: 万一以后不再压)
-        return data[:n]
-    if data[:4] != b"\x28\xb5\x2f\xfd":          # 连 zstd 帧头都不是 → 不是 .mrs
-        return b""
-    for head in (_zstd_head_mod(data, n), _zstd_head_cli(data, n)):
-        if head[:3] == b"MRS":
-            return head
-    i = data.find(b"MRS", 0, 65536)
-    return data[i:i + n] if i >= 0 else b""
+MRS_BEHAVIORS = mihomorender.MRS_BEHAVIORS
 
 
 def _mrs_unreadable_hint():
     """认不出类型时的下一步。本机没 zstd 就直说 —— 装上它这类文件就能自动识别,
     否则用户只会以为"这个源就是要手填", 一直填下去。"""
-    if shutil.which("zstd") or _zstd_head_mod(b"", 1) != b"":
+    if shutil.which("zstd") or mihomorender._zstd_head_mod(b"", 1) != b"":
         return ""
     return ("\n提示: 本机没有 <code>zstd</code>, 大一点的 .mrs 就读不出类型了。"
             "装上即可自动识别: <code>sudo apt-get install -y zstd</code>")
 
 
 def mrs_behavior(data):
-    """从 .mrs 二进制里**认**出 behavior(domain/ipcidr); 认不出返回 None。
-
-    认不出就返回 None, 由调用方要求用户显式声明 —— 猜错的后果是"规则看着加了却永不命中",
-    比直接拒绝难查得多。版本号不是 1 也一律不认: 布局可能已经变了。"""
-    h = _mrs_head(data)
-    if len(h) < 5 or h[:3] != b"MRS" or h[3] != 1:
-        return None
-    return _MRS_BEHAVIOR_BYTE.get(h[4])
+    """从 .mrs 二进制里认出 behavior(domain/ipcidr); 认不出返回 None。实现在 mihomorender ——
+    救援与恢复侧也要用同一份判据, 不能只长在 bot 里。"""
+    return mihomorender.mrs_behavior(data)
 
 
 def _mrs_behavior_of_file(path):
     """本地已下好的 .mrs 里认 behavior(读不到/认不出返回 None)。"""
-    try:
-        with open(path, "rb") as f:
-            return mrs_behavior(f.read(1 << 20))
-    except OSError:
-        return None
+    return mihomorender.mrs_behavior_of_file(path)
 
 
 def add_ruleset(url, target, label="", behavior=""):

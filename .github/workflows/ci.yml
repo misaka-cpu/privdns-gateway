@@ -229,6 +229,9 @@ jobs:
       - name: "渲染链特征基线 (mrs/zstd behavior 真值表 + rulesets 分类 + 逐字节锚点)"
         run: python3 tests/test-render-characterize.py
 
+      - name: "共享渲染模块独立性 (bot 损坏/缺席/禁 import 时仍出候选 + monkeypatch 点仍生效)"
+        run: python3 tests/test-render-shared.py
+
       - name: "迁移时机 (普通命令不暗中迁移; migrate 先锁先快照)"
         run: bash tests/test-migration-timing.sh
 
