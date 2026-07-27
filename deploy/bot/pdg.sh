@@ -1502,7 +1502,9 @@ migrate_deploy_botfiles(){
 migrate_rescue_plane(){
   _rescue_load 2>/dev/null || return 0
   [[ -f /opt/pdg-bot/rescue.py ]] || return 0        # 运行模块还没装到位(10a-1 负责), 下轮再说
-  if [[ -e "$(_rescue_optout)" ]]; then
+  _rescue_intent_migrate                             # 早期标记文件 → profile.env
+  local intent; intent="$(_rescue_intent)"
+  if [[ "$intent" == 0 ]]; then
     return 0                                         # 用户明确关过 —— 尊重它, 一个字都不改
   fi
   local bind; bind="$(_rescue_bind_addr || true)"
@@ -1510,11 +1512,20 @@ migrate_rescue_plane(){
     _rescue_socket_present || c_y "  救援平面: 内网卡段内没有本机地址, 暂不启用(pdg rescue enable 可重试)。"
     return 0
   fi
-  # 已装且已启用 → 幂等退出(不重生成凭据、不重启)
-  if _rescue_socket_present && systemctl is-enabled "$PDG_RESCUE_SOCKET_UNIT" >/dev/null 2>&1; then
+  # 已装、已启用**且真的在跑** → 幂等退出(不重生成凭据、不重启)。
+  # 只看 is-enabled 是不够的: 服务崩掉之后它仍然是 enabled, 那种情况恰恰是要救回来的 ——
+  # "用户关的"与"自己挂的"必须分开处置, 前者不许动, 后者要恢复。
+  if _rescue_socket_present \
+     && systemctl is-enabled "$PDG_RESCUE_SOCKET_UNIT" >/dev/null 2>&1 \
+     && systemctl is-active "$PDG_RESCUE_SOCKET_UNIT" >/dev/null 2>&1; then
+    [[ -n "$intent" ]] || _rescue_intent_set 1       # 老机器补记意图(此前只有 unit 没有键)
     return 0
   fi
-  c_g "  首次启用救援平面(默认开; 之后可 pdg rescue disable)…"
+  if [[ "$intent" == 1 ]]; then
+    c_g "  救援平面意图为启用但当前没起来, 恢复中…"    # 服务崩了 ≠ 用户关了, 这种要救回来
+  else
+    c_g "  首次启用救援平面(默认开; 之后可 pdg rescue disable)…"
+  fi
   _rescue_enable >/dev/null 2>&1 \
     && c_g "  ✅ 救援平面已启用: https://$bind:$PDG_RESCUE_PORT/" \
     || c_y "  救援平面启用失败, 现网未受影响; 可跑 sudo pdg rescue status 查。"
@@ -2437,12 +2448,17 @@ _rescue_write_units(){
   chmod 644 "$UNIT_DIR/$PDG_RESCUE_SOCKET_UNIT" "$UNIT_DIR/$PDG_RESCUE_SERVICE_UNIT"
 }
 
-# 运行中的规则里有没有救援端口的放行(只认**带内网来源约束**的那条)
+# 配置里有没有**我们自己注入的**救援放行。判据交给 rescue_nft.py(它认自己的独立表),
+# 不在这里按端口猜 —— 按端口猜会把用户自己写的同端口规则也算成我们的。
 _rescue_nft_has(){
-  local cidr; cidr="$(pdg_internal_cidr 2>/dev/null || true)"
-  [[ -n "$cidr" ]] || return 1
-  nft list chain inet pdg input 2>/dev/null \
-    | grep -qE "ip saddr ${cidr//./\\.}.*dport.*\b$PDG_RESCUE_PORT\b"
+  [[ -f /etc/nftables.conf ]] || return 1
+  python3 - /etc/nftables.conf "$PDG_RESCUE_PORT" <<'PYH'
+import sys
+sys.path.insert(0, "/opt/pdg-bot")
+import rescue_nft
+txt = open(sys.argv[1], encoding="utf-8", errors="surrogateescape").read()
+sys.exit(0 if rescue_nft.has_rescue_rule(txt, int(sys.argv[2])) else 1)
+PYH
 }
 
 # 放行: 只改 /etc/nftables.conf 里**本项目管理区**的那一行, 候选先过 nft -c 再应用。
@@ -2450,8 +2466,7 @@ _rescue_nft_has(){
 _rescue_nft_open(){
   local cidr cand; cidr="$(pdg_internal_cidr 2>/dev/null || true)"
   [[ -n "$cidr" ]] || return 1
-  grep -qE "ip saddr .*dport $PDG_RESCUE_PORT accept" /etc/nftables.conf 2>/dev/null && {
-    nft -f /etc/nftables.conf >/dev/null 2>&1 || true; return 0; }
+  _rescue_nft_has && { nft -f /etc/nftables.conf >/dev/null 2>&1 || true; return 0; }
   cand="$(_pdg_mktemp_dir)/nft.cand" || return 1
   python3 /opt/pdg-bot/rescue_nft.py "$cidr" "$PDG_RESCUE_PORT" \
     < /etc/nftables.conf > "$cand" 2>/dev/null || return 1
@@ -2465,12 +2480,13 @@ _rescue_nft_open(){
   return 0
 }
 
-# 撤销: 删掉那一行再重新应用。disable/uninstall 之后不许还留着可用的入口。
+# 撤销: 只摘掉**我们自己注入的那个独立表**(rescue_nft.py --strip 靠 BANNER 定界), 再重新应用。
+# 绝不按端口去删行 —— 用户完全可能自己写了一条同端口的放行, 那是他的规则, 删掉就是越权。
 _rescue_nft_close(){
   [[ -f /etc/nftables.conf ]] || return 0
-  grep -qE "dport $PDG_RESCUE_PORT accept" /etc/nftables.conf 2>/dev/null || return 0
+  _rescue_nft_has || return 0
   local cand; cand="$(_pdg_mktemp_dir)/nft.cand" || return 1
-  grep -vE "ip saddr .*dport $PDG_RESCUE_PORT accept" /etc/nftables.conf > "$cand" || return 1
+  python3 /opt/pdg-bot/rescue_nft.py --strip < /etc/nftables.conf > "$cand" || return 1
   nft -c -f "$cand" >/dev/null 2>&1 || return 1
   mv -f "$cand" /etc/nftables.conf || return 1
   nft -f /etc/nftables.conf >/dev/null 2>&1 || return 1
@@ -2512,23 +2528,107 @@ sys.exit(1)
 PYB
 }
 
-# 用户是否**主动**禁用过。存在这个标记 = 别再自作主张把它开回来(升级尤其不许)。
+# ── 启用意图的**单一真源**: profile.env 里的 PDG_RESCUE_ENABLED ──────────
+# 为什么不能只看 systemctl is-active: 那分不清"用户关的"和"服务崩了"。前者升级时必须尊重,
+# 后者升级时应当把它救回来 —— 判错任何一个方向都很糟(要么擅自打开用户关掉的入口, 要么让
+# 一台本该有救援的机器一直没有)。所以意图单独记, 且用项目既有的 profile.env 原子 upsert。
+#
+# 四种状态:
+#   (键不存在)  从未部署过 —— 首次部署按"默认启用"处理;
+#   1           用户/装机明确启用;
+#   0           **用户主动禁用** —— 普通更新与重复安装一律不得开回来;
+#   运行态       socket 是否 active 由 systemctl 单独查, 与意图无关(服务崩了意图仍是 1)。
+RESCUE_INTENT_KEY="PDG_RESCUE_ENABLED"
+
+_rescue_intent(){        # 回显 1 / 0 / 空(从未部署)
+  [[ -f "$PROFILE_ENV" ]] || return 0
+  sed -n "s/^[[:space:]]*${RESCUE_INTENT_KEY}=//p" "$PROFILE_ENV" | tail -1
+}
+
+_rescue_intent_set(){    # $1=1|0。原子写(_profile_set 走临时文件 + mv), 调用方已持锁。
+  _profile_set "$RESCUE_INTENT_KEY" "$1"
+}
+
+# 兼容 10a-2 早期版本落下的标记文件: 读得到就当作"用户禁用", 并顺手迁进 profile.env。
 _rescue_optout(){ echo "${PDG_RESCUE_DIR:-/etc/privdns-gateway/rescue}/disabled"; }
+_rescue_intent_migrate(){
+  [[ -e "$(_rescue_optout)" ]] || return 0
+  [[ -z "$(_rescue_intent)" ]] && _rescue_intent_set 0
+  rm -f "$(_rescue_optout)" 2>/dev/null
+}
 
 _rescue_socket_present(){ [[ -f "$UNIT_DIR/$PDG_RESCUE_SOCKET_UNIT" ]]; }
+
+# 轮换凭据。**沿用 rescue_cred.py 既定的轮换范围**(token 只换 token, cert 连私钥一起重签),
+# 这里只负责把它包成一次可回滚的受控操作: 先留 before-image, 换完验证, 出事按原样放回去。
+# 换 token 会让所有已登录会话立即失效; 换证书会改指纹 —— 后者必须明确提示, 否则用户下次访问
+# 看到"证书变了"会以为被中间人了。
+_rescue_rotate(){
+  local what="${1:-token}"
+  case "$what" in token|cert) :;; *) echo "用法: pdg rescue rotate [token|cert]"; return 1;; esac
+  _lock
+  local bak; bak="$(_pdg_mktemp_dir)" || { echo "❌ 无法创建临时目录"; return 1; }
+  chmod 700 "$bak"
+  # before-image: 三个凭据一起留底 —— 只留被换的那个, 出事时另外两个与它的配对关系就断了
+  local f
+  for f in "$PDG_RESCUE_TOKEN" "$PDG_RESCUE_CERT" "$PDG_RESCUE_KEY"; do
+    [[ -e "$f" ]] && { cp -a "$f" "$bak/$(basename "$f")" || { echo "❌ 备份失败, 未轮换。"
+                       rm -rf "$bak"; return 1; }; }
+  done
+  local fp_old; fp_old="$(python3 /opt/pdg-bot/rescue_cred.py fingerprint 2>/dev/null || true)"
+  local rc=0
+  if [[ "$what" == token ]]; then
+    python3 /opt/pdg-bot/rescue_cred.py rotate-token >/dev/null 2>&1 || rc=1
+  else
+    python3 /opt/pdg-bot/rescue_cred.py rotate-cert "$(_rescue_bind_addr || true)" >/dev/null 2>&1 || rc=1
+  fi
+  # 验证: 换完三个文件都得在、权限对、证书读得出指纹
+  if (( rc == 0 )); then
+    for f in "$PDG_RESCUE_TOKEN" "$PDG_RESCUE_CERT" "$PDG_RESCUE_KEY"; do
+      [[ -s "$f" ]] || rc=1
+    done
+    [[ "$(stat -c %a "$PDG_RESCUE_KEY" 2>/dev/null)" == 600 ]] || rc=1
+    [[ "$(stat -c %a "$PDG_RESCUE_TOKEN" 2>/dev/null)" == 600 ]] || rc=1
+    python3 /opt/pdg-bot/rescue_cred.py fingerprint >/dev/null 2>&1 || rc=1
+  fi
+  if (( rc != 0 )); then
+    for f in "$PDG_RESCUE_TOKEN" "$PDG_RESCUE_CERT" "$PDG_RESCUE_KEY"; do
+      [[ -e "$bak/$(basename "$f")" ]] && cp -a "$bak/$(basename "$f")" "$f"
+    done
+    rm -rf "$bak"
+    echo "❌ 轮换失败, 已恢复原凭据(指纹与 token 均未改变)。"
+    return 1
+  fi
+  rm -rf "$bak"
+  # 服务在跑就重启一次, 让新凭据生效并确认它还能起来
+  if systemctl is-active "$PDG_RESCUE_SOCKET_UNIT" >/dev/null 2>&1; then
+    systemctl restart "$PDG_RESCUE_SERVICE_UNIT" >/dev/null 2>&1 || true
+  fi
+  local fp_new; fp_new="$(python3 /opt/pdg-bot/rescue_cred.py fingerprint 2>/dev/null || true)"
+  if [[ "$what" == token ]]; then
+    c_g "✅ 救援 Token 已轮换 —— 所有已登录会话立即失效, 请用 pdg rescue status 之外的渠道重新取。"
+    [[ "$fp_new" == "$fp_old" ]] && echo "   证书指纹未变(仍是: $fp_new)"
+  else
+    c_g "✅ 救援证书已重签。"
+    c_y "   ⚠️ 指纹已改变: $fp_old → $fp_new"
+    c_y "   下次访问浏览器会提示证书变化 —— 那是预期的, 请按新指纹核对。"
+  fi
+}
 
 cmd_rescue(){
   need_root rescue
   _rescue_load || return 1
-  local act="${1:-status}"
+  local act="${1:-status}"; shift 2>/dev/null || true
+  set -- "$act" "${1:-}"
   case "$act" in
     enable)   _rescue_enable;;
     disable)  _rescue_disable;;
     status)   _rescue_status;;
     fingerprint) python3 /opt/pdg-bot/rescue_cred.py fingerprint;;
-    rotate-token) python3 /opt/pdg-bot/rescue_cred.py rotate-token;;
-    rotate-cert)  python3 /opt/pdg-bot/rescue_cred.py rotate-cert "$(_rescue_bind_addr || true)";;
-    *) echo "用法: pdg rescue <enable|disable|status|fingerprint|rotate-token|rotate-cert>"
+    rotate)       _rescue_rotate "${2:-token}";;
+    rotate-token) _rescue_rotate token;;
+    rotate-cert)  _rescue_rotate cert;;
+    *) echo "用法: pdg rescue <enable|disable|status|fingerprint|rotate [token|cert]>"
        return 1;;
   esac
 }
@@ -2543,16 +2643,33 @@ _rescue_enable(){
     return 1
   fi
   # 回滚台账: 出错时把 unit / 启用状态 / 标记恢复回操作前
-  local had_sock=0 was_enabled=0 had_optout=0
+  local had_sock=0 was_enabled=0 had_optout=0 had_fw=0
   _rescue_socket_present && had_sock=1
   systemctl is-enabled "$PDG_RESCUE_SOCKET_UNIT" >/dev/null 2>&1 && was_enabled=1
   [[ -e "$(_rescue_optout)" ]] && had_optout=1
+  _rescue_nft_has && had_fw=1        # 操作前就有放行 → 回滚时别把它撤了(重复 enable 的情形)
   _rescue_rollback(){
     (( had_optout == 1 )) && : > "$(_rescue_optout)" || rm -f "$(_rescue_optout)" 2>/dev/null
     (( was_enabled == 0 )) && systemctl disable --now "$PDG_RESCUE_SOCKET_UNIT" >/dev/null 2>&1
     (( had_sock == 0 )) && rm -f "$UNIT_DIR/$PDG_RESCUE_SOCKET_UNIT" "$UNIT_DIR/$PDG_RESCUE_SERVICE_UNIT"
+    # 放行也要撤 —— 否则回滚完成后盘上留着一条孤儿 accept: 端口开着、后面没有任何监听,
+    # 而 status/doctor 读配置会报"防火墙已放行", 与"服务不存在"自相矛盾, 下一个人无从判断
+    # 到底哪一半是真的。操作前本来就有放行(重复 enable 的情形)则保持原样, 不误撤。
+    (( had_fw == 0 )) && _rescue_nft_close >/dev/null 2>&1
     systemctl daemon-reload 2>/dev/null || true
   }
+  # 运行模块得先齐 —— 缺一个的后果不是报错, 是救援页把整块能力标成"旧核心不支持"。
+  # 装机由 10a-1 的清单负责, 这里只是在**开门之前**再确认一次。
+  local _miss=""
+  for _m in rescue.py rescue_cred.py rescue_const.py breakglass.py cfgrestore.py \
+            emergency.py mihomorender.py sb2mihomo.py pdgtx.py rescue_nft.py; do
+    [[ -f "/opt/pdg-bot/$_m" ]] || _miss="$_miss $_m"
+  done
+  if [[ -n "$_miss" ]]; then
+    echo "❌ 运行模块不完整(缺:$_miss) —— 拒绝启用。"
+    echo "   先跑 sudo pdg update 把模块补齐, 否则救援页开着也是半残的。"
+    return 1
+  fi
   python3 /opt/pdg-bot/rescue_cred.py ensure "$bind" >/dev/null 2>&1 \
     || { echo "❌ 凭据准备失败, 未改动任何状态。"; return 1; }
   _rescue_write_units "$bind" || { echo "❌ unit 渲染失败, 未启用。"; _rescue_rollback; return 1; }
@@ -2562,7 +2679,20 @@ _rescue_enable(){
   if ! systemctl enable --now "$PDG_RESCUE_SOCKET_UNIT" >/dev/null 2>&1; then
     echo "❌ socket 起不来, 回滚到操作前。"; _rescue_rollback; return 1
   fi
-  rm -f "$(_rescue_optout)" 2>/dev/null          # 用户明确开了 → 清掉"我要关着"的标记
+  _rescue_intent_set 1 || { echo "❌ 意图写入失败, 回滚。"; _rescue_rollback; return 1; }
+  rm -f "$(_rescue_optout)" 2>/dev/null          # 清掉早期版本的标记文件
+  # 收尾一致性核对: 意图 / unit / socket / 监听配置 / 项目 nft 规则必须彼此对得上。
+  # 只要有一项对不上就当作没启用成功 —— "看着开了其实没开"比明确失败难查得多。
+  local _bad=""
+  [[ "$(_rescue_intent)" == 1 ]]                     || _bad="$_bad 意图"
+  _rescue_socket_present                             || _bad="$_bad unit"
+  systemctl is-enabled "$PDG_RESCUE_SOCKET_UNIT" >/dev/null 2>&1 || _bad="$_bad socket-enabled"
+  grep -q "ListenStream=$bind:$PDG_RESCUE_PORT" "$UNIT_DIR/$PDG_RESCUE_SOCKET_UNIT" 2>/dev/null \
+                                                     || _bad="$_bad 监听配置"
+  _rescue_nft_has                                    || _bad="$_bad 防火墙"
+  if [[ -n "$_bad" ]]; then
+    echo "❌ 启用后自检不一致(${_bad# }) → 回滚到操作前。"; _rescue_rollback; return 1
+  fi
   c_g "✅ 救援平面已启用: https://$bind:$PDG_RESCUE_PORT/(仅内网卡可达)"
   echo "   证书指纹(首次访问请核对): $(python3 /opt/pdg-bot/rescue_cred.py fingerprint 2>/dev/null || echo '读取失败')"
 }
@@ -2573,9 +2703,16 @@ _rescue_disable(){
   systemctl disable --now "$PDG_RESCUE_SOCKET_UNIT" >/dev/null 2>&1
   systemctl reset-failed "$PDG_RESCUE_SOCKET_UNIT" "$PDG_RESCUE_SERVICE_UNIT" >/dev/null 2>&1
   _rescue_nft_close || c_y "  防火墙放行没能撤掉, 请 pdg rescue status 复查。"
-  install -d -m700 "$PDG_RESCUE_DIR" 2>/dev/null
-  : > "$(_rescue_optout)"                        # 记住这是**用户的选择**: 升级不许把它开回来
-  chmod 600 "$(_rescue_optout)" 2>/dev/null
+  _rescue_intent_set 0 || { c_y "  ⚠️ 意图未能写入 profile.env —— 升级时可能被当成「从未部署」而重新开启, 请手工复查。"; }
+  rm -f "$(_rescue_optout)" 2>/dev/null          # 早期版本的标记文件不再使用
+  # 校验: 停用之后不该还有可用入口
+  local _left=""
+  systemctl is-active "$PDG_RESCUE_SOCKET_UNIT" >/dev/null 2>&1 && _left="$_left socket仍active"
+  _rescue_nft_has && _left="$_left 防火墙放行仍在"
+  if [[ -n "$_left" ]]; then
+    c_y "  ⚠️ 停用后仍有残留(${_left# }) —— 请 pdg rescue status 复查, 不要当成已停用。"
+    return 1
+  fi
   c_g "✅ 救援平面已停用(凭据保留; 再次 pdg rescue enable 即可恢复, 指纹不变)。"
 }
 
@@ -2585,6 +2722,12 @@ _rescue_status(){
   sock="$(systemctl is-active "$PDG_RESCUE_SOCKET_UNIT" 2>/dev/null || true)"
   svc="$(systemctl is-active "$PDG_RESCUE_SERVICE_UNIT" 2>/dev/null || true)"
   echo "== 救援平面 =="
+  local intent; intent="$(_rescue_intent)"
+  case "$intent" in
+    1) printf "  %-14s %s\n" "用户意图" "enabled";;
+    0) printf "  %-14s %s\n" "用户意图" "disabled(主动停用; 升级不会开回来)";;
+    *) printf "  %-14s %s\n" "用户意图" "未记录(从未部署过 —— 下次 pdg update 会按默认启用)";;
+  esac
   printf "  %-14s %s\n" "socket unit"  "$(_rescue_socket_present && echo 已安装 || echo 缺失)"
   printf "  %-14s %s\n" "socket 状态"  "${sock:-unknown} / $(systemctl is-enabled "$PDG_RESCUE_SOCKET_UNIT" 2>/dev/null || echo disabled)"
   printf "  %-14s %s\n" "service 状态" "${svc:-inactive}"
@@ -2596,7 +2739,28 @@ _rescue_status(){
   done
   fp="$(python3 /opt/pdg-bot/rescue_cred.py fingerprint 2>/dev/null || true)"
   printf "  %-14s %s\n" "证书指纹" "${fp:-读取失败}"
-  [[ -e "$(_rescue_optout)" ]] && echo "  ⚠️ 已被手动停用(升级不会自动开回来; pdg rescue enable 可再开)"
+  # 渲染出来的监听地址与当前内网段是否还对得上 —— detect-cidr 换过段之后它会过期
+  local cidr rendered
+  cidr="$(pdg_internal_cidr 2>/dev/null || true)"
+  rendered="$(sed -n 's/^ListenStream=//p' "$UNIT_DIR/$PDG_RESCUE_SOCKET_UNIT" 2>/dev/null | tail -1)"
+  printf "  %-14s %s\n" "渲染监听" "${rendered:-（unit 未安装）}"
+  if [[ -n "$rendered" && -n "$bind" ]]; then
+    [[ "$rendered" == "$bind:$PDG_RESCUE_PORT" ]] \
+      && printf "  %-14s %s\n" "地址一致性" "与当前内网段($cidr)一致" \
+      || printf "  %-14s %s\n" "地址一致性" "⚠️ 与当前内网段($cidr)不一致, 建议重跑 pdg rescue enable"
+  fi
+  if grep -qE 'ListenStream=(0\.0\.0\.0|\[?::\]?):' "$UNIT_DIR/$PDG_RESCUE_SOCKET_UNIT" 2>/dev/null; then
+    printf "  %-14s %s\n" "通配监听" "⚠️ 检出通配地址 —— 这是严重问题, 请立刻 pdg rescue disable"
+  else
+    printf "  %-14s %s\n" "通配监听" "无(只绑内网地址)"
+  fi
+  # 运行模块是否完整: 缺一个救援页就会有整块能力标成"旧核心不支持"
+  local _miss_mods=""
+  for f in rescue.py rescue_cred.py rescue_const.py breakglass.py cfgrestore.py \
+           emergency.py mihomorender.py sb2mihomo.py pdgtx.py rescue_nft.py; do
+    [[ -f "/opt/pdg-bot/$f" ]] || _miss_mods="$_miss_mods $f"
+  done
+  printf "  %-14s %s\n" "运行模块" "$([[ -z "$_miss_mods" ]] && echo 完整 || echo "缺:$_miss_mods")"
   return 0
 }
 

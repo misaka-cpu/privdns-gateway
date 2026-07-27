@@ -65,7 +65,14 @@ def has_rescue_rule(text, port):
 
 
 def main(argv):
-    """用法: rescue_nft.py <内网卡段> <端口> < 候选内容 > 注入后的候选"""
+    """用法: rescue_nft.py <内网卡段> <端口> < 候选内容 > 注入后的候选
+             rescue_nft.py --strip            < 候选内容 > 移除救援块后的候选"""
+    if len(argv) >= 2 and argv[1] == "--strip":
+        # 只摘掉**我们自己注入的那个独立表**(靠 BANNER 定界)。绝不按端口去删行 ——
+        # 用户完全可能自己写了一条同端口的放行, 那是他的规则, 与我们无关。
+        txt = sys.stdin.buffer.read().decode("utf-8", "surrogateescape")
+        sys.stdout.buffer.write(strip_ours(txt).encode("utf-8", "surrogateescape"))
+        return 0
     if len(argv) < 3:
         print(__doc__.strip().splitlines()[0], file=sys.stderr)
         return 2

@@ -30,11 +30,31 @@ else
   echo "警告: 找不到 lib/singbox.sh, 无法判定 sing-box 归属 → 一律保留(不删)。"
 fi
 
-# 救援平面: socket + service 一起停用并删掉。它是最后一道门, 但既然是卸载, 门本身也要带走
-# —— 留一个监听在内网上的 HTTPS 服务、外加一条救援端口放行, 比不卸载更糟。
+# nft 可执行位置先解析出来(救援清理与后面删 inet pdg 共用)。只看 PATH 的话, /usr/sbin 未导出
+# 的机器上会当成"没装 nft"整条跳过 —— 磁盘上的配置还原了, 内核里的表还在, 卸载完端口仍被
+# policy drop 挡着, 而用户从配置文件上完全看不出为什么。
+_UN_NFT=""
+for _l in "$_UN_HERE/lib/nftbin.sh" /opt/privdns-gateway/lib/nftbin.sh; do
+  [[ -f "$_l" ]] || continue
+  # shellcheck source=lib/nftbin.sh
+  source "$_l" && _UN_NFT="$(pdg_nft_bin || true)"
+  break
+done
+[[ -n "$_UN_NFT" ]] || _UN_NFT="$(command -v nft 2>/dev/null || true)"   # 判据文件缺失时的兜底
+
+# 救援平面: socket + service 一起停用, 连同凭据、状态、运行文件与那条独立放行规则一起带走。
+# 它是最后一道门, 但既然是卸载, 门本身也要带走 —— 留一个 token + TLS 私钥在盘上、外加一条
+# 内网放行, 而服务已经没了, 比不卸载更糟。清理清单与"完整恢复要保护谁"共用同一份真源。
 systemctl disable --now pdg-rescue.socket pdg-rescue.service 2>/dev/null || true
 systemctl reset-failed pdg-rescue.socket pdg-rescue.service 2>/dev/null || true
-rm -f /etc/systemd/system/pdg-rescue.socket /etc/systemd/system/pdg-rescue.service
+_RESCUE_RESIDUE=""
+if [[ -f "$_UN_HERE/lib/rescue.sh" ]]; then
+  # shellcheck source=lib/rescue.sh
+  source "$_UN_HERE/lib/rescue.sh"
+  PDG_RESCUE_REPO="$_UN_HERE" _RESCUE_RESIDUE="$(pdg_rescue_cleanup "" "$_UN_NFT")" || true
+else
+  _RESCUE_RESIDUE="找不到 lib/rescue.sh, 救援平面(凭据/状态/放行规则)未清理"
+fi
 systemctl disable --now pdg-bot pdg-probe81 mosdns mihomo pdg-mitm pdg-rules-update.timer pdg-health.timer 2>/dev/null || true
 [[ "$SB_OWNED" == 1 ]] && systemctl disable --now sing-box 2>/dev/null || true
 rm -f /etc/systemd/system/{pdg-bot,pdg-probe81,mosdns,mihomo,pdg-mitm,pdg-rules-update,pdg-health}.service \
@@ -45,17 +65,7 @@ systemctl daemon-reload
 systemctl restart systemd-journald 2>/dev/null || true   # journald CanReload=no, 必须 restart 才会松开封顶
 
 # 防火墙: 删本项目独立表 inet pdg(不碰 Docker/fail2ban 等其它表); 有备份则还原 /etc/nftables.conf
-# nft 的位置走共用判据(lib/nftbin.sh): 只看 PATH 的话, /usr/sbin 未导出的机器上会当成"没装
-# nft"整条跳过 —— 磁盘上的配置还原了, 内核里的 inet pdg 表还在, 卸载完端口仍被 policy drop
-# 挡着, 而用户从配置文件上完全看不出为什么。
-_UN_NFT=""
-for _l in "$_UN_HERE/lib/nftbin.sh" /opt/privdns-gateway/lib/nftbin.sh; do
-  [[ -f "$_l" ]] || continue
-  # shellcheck source=lib/nftbin.sh
-  source "$_l" && _UN_NFT="$(pdg_nft_bin || true)"
-  break
-done
-[[ -n "$_UN_NFT" ]] || _UN_NFT="$(command -v nft 2>/dev/null || true)"   # 判据文件缺失时的兜底
+# (nft 位置已在上面按 lib/nftbin.sh 的共用判据解析成 $_UN_NFT)
 [[ -n "$_UN_NFT" ]] && "$_UN_NFT" delete table inet pdg 2>/dev/null || true
 if [[ -e /etc/nftables.conf.pdg-orig ]]; then
   mv -f /etc/nftables.conf.pdg-orig /etc/nftables.conf
@@ -90,6 +100,14 @@ if [[ -n "$RESOLV_WARN" ]]; then
   echo "已停止并移除 systemd 单元、防火墙表(inet pdg); DNS 未能完全还原(见上)。"
 else
   echo "已停止并移除 systemd 单元、防火墙表(inet pdg)、并尽量还原 DNS。"
+fi
+# 救援平面没清干净就必须逐条报出来: 残留的是仍然有效的 token 与 TLS 私钥。宁可让用户看见
+# 一段刺眼的清单, 也不能让卸载在有残留的情况下只丢一句"已完成"。
+if [[ -n "$_RESCUE_RESIDUE" ]]; then
+  echo "⚠️  救援平面未能完全清除, 以下项目仍留在机器上(含凭据, 请手工删除):"
+  printf '%s\n' "$_RESCUE_RESIDUE" | sed 's/^/    /'
+else
+  echo "救援平面已完全移除(unit、凭据、状态、运行文件与 ${PDG_RESCUE_PORT} 放行规则)。"
 fi
 echo "保留: /etc/mosdns /etc/sing-box /etc/mihomo /opt/pdg-bot 与 Let's Encrypt 证书。"
 # 归属证明不了 → 全保留。但不能只丢一句"已保留": 用户手工改过 unit 的情况下也会走到这里,

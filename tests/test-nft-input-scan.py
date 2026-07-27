@@ -561,10 +561,25 @@ table inet filter {
                 return fh.read()
 
         # 12a. uninstall.sh 的防火墙段(真实代码行, 只是 _UN_HERE 指到影子仓库)
+        #
+        # 取块从 `_UN_NFT=""` 起、到还原 /etc/nftables.conf 那个 if 的 `fi` 止 —— 解析 nft 位置
+        # 与用它删表之间隔着救援平面清理(那段也要 nft), 只截"删表"一小段的话, 解析代码被留在
+        # 窗口外, 于是测的是"没解析当然删不掉", 而不是生产代码到底行不行。锚点用两端的语义标记,
+        # 不用行数: 中间再插东西也不会让这条断言变成假红或假绿。
         un_lines = (ROOT / "uninstall.sh").read_text(encoding="utf-8").split("\n")
-        bi = next(i for i, ln in enumerate(un_lines) if "删本项目独立表 inet pdg" in ln)
-        bj = next(i for i in range(bi, len(un_lines)) if un_lines[i] == "fi")
+
+        def anchor(pred, what, start=0):
+            for i in range(start, len(un_lines)):
+                if pred(un_lines[i]):
+                    return i
+            raise AssertionError("uninstall.sh 里找不到锚点「%s」—— 要么它被删了(那正是本条要"
+                                 "抓的回归), 要么改了写法需要同步这里" % what)
+
+        bi = anchor(lambda ln: ln.startswith('_UN_NFT=""'), '_UN_NFT="" 位置解析')
+        bj = anchor(lambda ln: ln == "fi", "还原段收尾 fi",
+                    anchor(lambda ln: "nftables.conf.pdg-orig" in ln, "还原 nftables.conf", bi))
         block = "\n".join(un_lines[bi:bj + 1])
+        assert "delete table inet pdg" in block and "pdg_nft_bin" in block, "取块没覆盖删表与位置解析"
         assert "command -v nft >/dev/null" not in block, "uninstall 又退回只看 PATH 了: %s" % block
         open(log, "w").close()
         r = subprocess.run(["bash", "-c", '_UN_HERE=%r\n%s' % (repo, block)],

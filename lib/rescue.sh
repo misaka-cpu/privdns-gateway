@@ -33,6 +33,11 @@ PDG_RESCUE_STATE="${PDG_RESCUE_STATE:-/var/lib/privdns-gateway/rescue-state.json
 PDG_RESCUE_SOCKET_UNIT="pdg-rescue.socket"
 PDG_RESCUE_SERVICE_UNIT="pdg-rescue.service"
 
+# 救援放行所在的**独立** nft 表名。python 侧的真源是 rescue_nft.py 的 TABLE(那个模块刻意
+# 零依赖 —— 它要在"完整恢复"最脆弱的时刻跑, 不能再去 import 常量解析器), 两处由守卫测试
+# 逐字比对。这里之所以也要有一份: 卸载得把这张表从磁盘配置与内核里摘掉。
+PDG_RESCUE_TABLE="pdgrescue"
+
 # 内网卡来源段的**唯一真源**(5.2/T7)。nft、mosdns、救援绑定、doctor 全部读它或由它渲染。
 # 老机器在迁移写入之前可能没有这个键 —— 调用方必须处理"读不到"的情况, 不许猜。
 PDG_PROFILE_ENV="${PDG_PROFILE_ENV:-/etc/privdns-gateway/profile.env}"
@@ -59,6 +64,59 @@ var/lib/privdns-gateway/rescue-state.json"
 
 # 逐行输出受保护成员(供 bash 侧过滤 tar 成员清单用)
 pdg_rescue_protected(){ printf '%s\n' "$PDG_RESCUE_PROTECTED_MEMBERS"; }
+
+# 卸载时拆掉救援平面在盘上的全部形态。$1=根前缀(测试注入, 真实卸载传空), $2=nft 可执行(可空)。
+#
+# 为什么必须清干净、而且清不掉要**明说**: 卸载完还留着的是一把仍然有效的 token 与 TLS 私钥,
+# 外加一条内网放行规则 —— 服务没了、门却还开着一条缝, 比不卸载更糟。所以任何一项删不掉都
+# 逐条打印到 stdout 并返回非 0, 由调用方原样报给用户; 绝不吞掉错误假装"已完成"。
+#
+# 删什么不另列清单, 直接复用 PDG_RESCUE_PROTECTED_MEMBERS —— 那张表的定义就是"救援平面自身
+# 由哪些文件构成"(完整恢复时要事前排除的正是它们)。两处共用一份真源, 以后加了新成员, 恢复
+# 保护与卸载清理同时跟上, 不会一边记得一边忘。
+pdg_rescue_cleanup(){
+  local root="${1:-}" nftbin="${2:-}" residue=() m target conf
+  conf="$root/etc/nftables.conf"
+
+  # 1) 磁盘配置里我们注入的独立表: 用 rescue_nft.py 靠 BANNER 定界整块摘掉。
+  #    **绝不按端口 grep -v 删行** —— 用户完全可能自己写过一条同端口放行, 那是他的规则。
+  #    删除动作发生在清运行文件之前, 否则要用的 rescue_nft.py 已经被自己删掉了。
+  if [[ -f "$conf" ]] && grep -q "table inet $PDG_RESCUE_TABLE" "$conf" 2>/dev/null; then
+    local nftpy=""
+    for m in "$root/opt/pdg-bot/rescue_nft.py" "${PDG_RESCUE_REPO:-}/deploy/bot/rescue_nft.py"; do
+      [[ "$m" == /deploy/* ]] && continue
+      [[ -f "$m" ]] && { nftpy="$m"; break; }
+    done
+    if [[ -n "$nftpy" ]] && python3 "$nftpy" --strip < "$conf" > "$conf.pdg-un" 2>/dev/null \
+       && mv -f "$conf.pdg-un" "$conf"; then :
+    else
+      rm -f "$conf.pdg-un" 2>/dev/null
+      residue+=("$conf 里的 table inet $PDG_RESCUE_TABLE —— 请手工删掉该块后 nft -f 重载")
+    fi
+  fi
+
+  # 2) 内核里那张表。磁盘清了内核没清的话, 规则此刻仍然生效, 而用户从配置文件上完全看不出
+  #    为什么 —— 与 uninstall 处理 inet pdg 是同一个道理。
+  [[ -n "$nftbin" ]] || nftbin="$(command -v nft 2>/dev/null || true)"
+  if [[ -z "$root" && -n "$nftbin" ]]; then
+    "$nftbin" delete table inet "$PDG_RESCUE_TABLE" 2>/dev/null || true   # 本来就没有 → 不算残留
+  fi
+
+  # 3) 凭据、状态、unit、运行文件 —— 逐条删并逐条复核
+  while read -r m; do
+    [[ -n "$m" ]] || continue
+    target="$root/$m"
+    rm -f "$target" 2>/dev/null
+    [[ -e "$target" ]] && residue+=("$target")
+  done < <(pdg_rescue_protected)
+  rmdir "$root$PDG_RESCUE_DIR" 2>/dev/null || true   # 空了才收走; 用户往里放过别的东西就留着
+
+  if ((${#residue[@]})); then
+    printf '%s\n' "${residue[@]}"
+    return 1
+  fi
+  return 0
+}
 
 # profile.env 里读一个键。读不到 → 返回 1 且不打印(调用方据此判断"没有", 而不是拿到空串当成"有")。
 pdg_profile_get(){
