@@ -783,7 +783,20 @@ import json, os, sys
 sys.path.insert(0, "$REPO_DIR/deploy/bot")
 import sb2mihomo
 model = json.load(open("/etc/sing-box/config.json"))   # config.json 仍是核无关的数据模型
-cfg, _ = sb2mihomo.singbox_to_mihomo(model, redir_port=7893)
+# WLOC/MITM 的接管域名要一起带上。这些域名的真源是 /etc/mosdns/rules/mitm_hijack.txt(重装
+# 会保留它), 但派生出来的 mihomo 配置里那条 MITM-OUT 出站与 gs-loc 路由是**渲染时**加的 ——
+# 渲染时不传, 重装完 doctor 立刻报"mihomo 缺 MITM-OUT 出站或 gs-loc 路由", WLOC 静默失效
+# (.200 实机重装后就是这样)。域名文件为空 = WLOC 休眠, 那时本来就不该有这条出站。
+_mitm = []
+try:
+    with open("/etc/mosdns/rules/mitm_hijack.txt", encoding="utf-8") as _fh:
+        for _l in _fh:
+            _l = _l.strip()
+            if _l and not _l.startswith("#"):
+                _mitm.append(_l.split(":", 1)[1] if _l.startswith("domain:") else _l)
+except OSError:
+    pass
+cfg, _ = sb2mihomo.singbox_to_mihomo(model, redir_port=7893, mitm_domains=_mitm or None)
 with open("/etc/mihomo/config.yaml", "w") as f:
     json.dump(cfg, f, ensure_ascii=False, indent=2)   # JSON 即合法 YAML
 os.chmod("/etc/mihomo/config.yaml", 0o600)

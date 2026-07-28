@@ -186,6 +186,36 @@ if "PDG_PLATFORM" in inst and "/etc/privdns-gateway/platform" in inst:
 else:
     bad("平台标记来源不清")
 
+# ── 5. 重装后派生配置要与 WLOC 状态一致 ────────────────────────────────────
+print()
+print("── 5. 重装后的 mihomo 派生配置 ──")
+# 接管域名的真源是 mitm_hijack.txt(重装保留), 但 MITM-OUT 出站与 gs-loc 路由是**渲染时**
+# 加进 mihomo 配置的。渲染不传域名, 重装完 doctor 立刻报 "mihomo 缺 MITM-OUT" —— 域名还在,
+# WLOC 却已经不工作了(.200 实机重装后就是这样)。
+sys.path.insert(0, os.path.join(ROOT, "deploy", "bot"))
+import sb2mihomo  # noqa: E402
+
+MODEL = {"log": {}, "inbounds": [], "outbounds": [{"type": "direct", "tag": "direct"}],
+         "route": {"rules": [], "final": "direct"}}
+cfg_off, _ = sb2mihomo.singbox_to_mihomo(MODEL, redir_port=7893, mitm_domains=None)
+cfg_on, _ = sb2mihomo.singbox_to_mihomo(MODEL, redir_port=7893,
+                                        mitm_domains=["gs-loc.apple.com"])
+if not any(p.get("name") == "MITM-OUT" for p in cfg_off.get("proxies", [])):
+    ok("没有接管域名(WLOC 休眠)→ 派生配置里不该有 MITM-OUT")
+else:
+    bad("休眠状态也渲染了 MITM-OUT")
+if any(p.get("name") == "MITM-OUT" for p in cfg_on.get("proxies", [])) and \
+        any("MITM-OUT" in r and "gs-loc" in r for r in cfg_on.get("rules", [])):
+    ok("有接管域名 → 派生配置带 MITM-OUT 出站与 gs-loc 路由")
+else:
+    bad("传了域名却没渲染出 MITM-OUT/路由")
+seg3 = between(inst, "# WLOC/MITM 的接管域名要一起带上", "render \"$REPO_DIR/deploy/bot/pdg-bot.service\"",
+               "重装时的 mihomo 渲染")
+if seg3 and "mitm_hijack.txt" in seg3 and "mitm_domains=" in seg3:
+    ok("装机/重装的渲染读 mitm_hijack.txt 并把域名传进去(重装不再让 WLOC 静默失效)")
+elif seg3:
+    bad("渲染仍未带上接管域名")
+
 print("─" * 40)
 print("通过 %d, 失败 %d" % (PASS[0], FAIL[0]))
 if PASS[0] + FAIL[0] == 0:
