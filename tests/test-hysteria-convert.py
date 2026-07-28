@@ -102,11 +102,24 @@ json.dumps(cfg)  # JSON 即合法 YAML
 
 
 def _find_mihomo():
-    for c in (os.environ.get("MIHOMO_BIN"), shutil.which("mihomo"),
-              str(Path(tempfile.gettempdir()) / "mihomo")):
-        if c and os.path.exists(c) and os.access(c, os.X_OK):
-            return c
-    return _download_mihomo()
+    """定位钉死版内核: 一律走共享 helper(tests/mihomobin.py), 不在这里另写一套。
+
+    老写法认 MIHOMO_BIN、PATH、/tmp/mihomo 三处, 且**不核版本** —— 机器上随便一版 mihomo
+    都能让这条断言变绿, 而它的全部意义就是"钉死版认不认这份配置"。"""
+    sys.path.insert(0, str(ROOT / "tests"))
+    import mihomobin
+    try:
+        return mihomobin.find()[0]
+    except mihomobin.MihomoWrongVersion as e:
+        raise AssertionError("mihomo 版本不符, 不接受用别的版本顶替: %s" % e) from None
+    except mihomobin.MihomoMissing:
+        if mihomobin.strict_mode():
+            raise AssertionError(
+                "严格模式(CI/全量入口)下缺钉死版 mihomo —— 先跑 tests/prepare-mihomo.sh") from None
+    got = _download_mihomo()          # 单跑且本机没有: 允许现下一份(仍逐字节校验 SHA256)
+    if got and mihomobin.version_of(got) != mihomobin.pinned_version():
+        raise AssertionError("下载到的 mihomo 不是钉死版")
+    return got
 
 
 def _download_mihomo():
@@ -144,6 +157,6 @@ if mihomo:
         assert r.returncode == 0, "mihomo -t 拒绝了 v1+v2 渲染:\n" + (r.stdout + r.stderr)[-500:]
     ok(f"真 mihomo -t 接受 v1+v2 混合渲染({os.path.basename(mihomo)})")
 else:
-    print("[SKIP] 无 mihomo 二进制且无法下载(环境缺失), 跳过真 -t schema 校验")
+    print("[SKIP] 本机无钉死版 mihomo 且下载不到(环境缺失) —— 真 -t 校验未执行, 不是通过")
 
 print(f"────────────────────────────────────────\n通过 {pass_n}")

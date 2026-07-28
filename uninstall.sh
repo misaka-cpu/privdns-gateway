@@ -42,9 +42,12 @@ for _l in "$_UN_HERE/lib/nftbin.sh" /opt/privdns-gateway/lib/nftbin.sh; do
 done
 [[ -n "$_UN_NFT" ]] || _UN_NFT="$(command -v nft 2>/dev/null || true)"   # 判据文件缺失时的兜底
 
-# 救援平面: socket + service 一起停用, 连同凭据、状态、运行文件与那条独立放行规则一起带走。
-# 它是最后一道门, 但既然是卸载, 门本身也要带走 —— 留一个 token + TLS 私钥在盘上、外加一条
-# 内网放行, 而服务已经没了, 比不卸载更糟。清理清单与"完整恢复要保护谁"共用同一份真源。
+# 救援平面 + 全部运行模块: 停用 unit, 再把凭据、状态、运行模块与那条独立放行规则一起带走。
+# 救援是最后一道门, 但既然是卸载, 门本身也要带走 —— 留一个 token + TLS 私钥在盘上、外加
+# 一条内网放行, 而服务已经没了, 比不卸载更糟。
+# 删哪些走 pdg_project_members(= lib/modules.sh 的运行模块真源 + 救援 unit/凭据/状态),
+# **不是**"完整恢复受保护成员"那份清单 —— 那份只是恢复旧快照时要保住的最小通道, 拿它当
+# 卸载清单会把 pdgtx.py/checks.py 这些留在盘上。
 systemctl disable --now pdg-rescue.socket pdg-rescue.service 2>/dev/null || true
 systemctl reset-failed pdg-rescue.socket pdg-rescue.service 2>/dev/null || true
 _RESCUE_RESIDUE=""
@@ -109,7 +112,8 @@ if [[ -n "$_RESCUE_RESIDUE" ]]; then
 else
   echo "救援平面已完全移除(unit、凭据、状态、运行文件与 ${PDG_RESCUE_PORT} 放行规则)。"
 fi
-echo "保留: /etc/mosdns /etc/sing-box /etc/mihomo /opt/pdg-bot 与 Let's Encrypt 证书。"
+echo "保留: /etc/mosdns /etc/sing-box /etc/mihomo 与 Let's Encrypt 证书(配置与数据, 重装可复用)。"
+echo "已删除: /opt/pdg-bot 下本项目安装的全部运行模块(清单见 lib/modules.sh)。"
 # 归属证明不了 → 全保留。但不能只丢一句"已保留": 用户手工改过 unit 的情况下也会走到这里,
 # 机器上从此挂着一个没人管的 sing-box。逐条列出留了什么、为什么判不出来、怎么自己清。
 _sb_report_kept(){   # $1=with-config(--purge 时连配置目录一起列)

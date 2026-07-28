@@ -41,6 +41,11 @@ def bad(m):
     FAIL[0] += 1
 
 
+def skip(m):
+    """环境限制导致某项没跑成 —— 与 PASS 严格区分, 不计入通过数。"""
+    print("[SKIP] " + m)
+
+
 def eq(label, got, want):
     if got == want:
         ok(label)
@@ -48,7 +53,8 @@ def eq(label, got, want):
         bad("%s\n        实得: %r\n        期望: %r" % (label, got, want))
 
 
-MIHOMO = shutil.which("mihomo") or os.environ.get("PDG_TEST_MIHOMO", "")
+sys.path.insert(0, os.path.join(ROOT, "tests"))
+import mihomobin  # noqa: E402  钉死版内核的唯一定位入口(版本核对在它里面, 这里不重复写)
 
 
 def make_model(final="jp", with_final=True):
@@ -389,8 +395,9 @@ box3.clean()
 # ══ 10. 真 mihomo -t ══════════════════════════════════════════════════════
 print()
 print("── 10. 钉死版 mihomo -t ──")
+MIHOMO = mihomobin.require(ok, bad, skip)
 if not MIHOMO:
-    bad("找不到 mihomo(装钉死版或设 PDG_TEST_MIHOMO) —— 不接受跳过")
+    pass
 else:
     box4 = make_box()
     em4 = load_em(box4)

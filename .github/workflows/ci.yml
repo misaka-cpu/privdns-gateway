@@ -13,6 +13,9 @@ permissions:
 jobs:
   lint:
     runs-on: ubuntu-latest
+    env:
+      # 严格模式: 缺钉死版内核 = 失败。开发者本机单跑时不设它, 那时缺二进制记 [SKIP]。
+      PDG_TEST_STRICT: "1"
     steps:
       - uses: actions/checkout@v5
 
@@ -237,6 +240,11 @@ jobs:
 
       - name: "渲染判废默认安全 (pdgtx 缺失/损坏/旧版时 str/repr/审计均不含用户值)"
         run: python3 tests/test-render-refusal.py
+
+      # 需要真内核的测试共用这一份: 下一次、按 lib/versions.sh 的 SHA256 校验一次, 放到
+      # tests/.bin/。CI 上必须**严格模式** —— 缺二进制要判失败, 不许把关键校验变成绿灯跳过。
+      - name: "准备钉死版 mihomo (SHA256 校验, 供需要真内核的测试共用)"
+        run: bash tests/prepare-mihomo.sh
 
       - name: "混合规则 AND 语义 (跨字段 AND/同字段 OR/不支持组合拒绝/真 mihomo -t)"
         run: python3 tests/test-rule-mixed.py

@@ -43,6 +43,15 @@ PDG_RESCUE_TABLE="pdgrescue"
 PDG_PROFILE_ENV="${PDG_PROFILE_ENV:-/etc/privdns-gateway/profile.env}"
 PDG_CIDR_KEY="PDG_INTERNAL_CIDR"
 
+# 救援平面**自己跑起来**需要的模块闭包(安装清单的子集)。enable 开门之前与 status 都用它,
+# 两处不再各写一份 —— 手写名单漏一个的表现不是报错, 是救援页把整块能力标成"旧核心不支持",
+# 而用户此刻正指望它。名单由 tests/test-install-closure.py 从真实入口重算闭包逐项比对:
+#   闭包(rescue.py, breakglass.py, rescue_cred.py) ∪ {rescue_nft.py}
+# 末项是 pdg.sh 自己开关防火墙用的注入器 —— 它不在 python 侧闭包里, 但没有它 enable/disable
+# 就动不了放行。nftscan.py 曾被手写名单漏掉: breakglass 与 pdgtx 靠它找 nft 可执行文件,
+# 缺了之后"防火墙自救"这条路会在最需要的时候找不到 nft。
+PDG_RESCUE_CLOSURE="rescue.py rescue_const.py rescue_cred.py breakglass.py cfgrestore.py emergency.py mihomorender.py sb2mihomo.py pdgtx.py nftscan.py rescue_nft.py"
+
 # 救援平面的**固定**受保护成员(相对快照根的路径)。完整恢复时这些一律**事前排除** ——
 # 不是"先覆盖再补回来": 补回来的那一瞬之前, 盘上已经是旧凭据/旧代码了, 而恢复正是用户最怕
 # 失联的时刻。清单只含救援平面自身: 普通 Bot 代码、bot.env、mihomo/mosdns、platform/backend、
@@ -65,15 +74,46 @@ var/lib/privdns-gateway/rescue-state.json"
 # 逐行输出受保护成员(供 bash 侧过滤 tar 成员清单用)
 pdg_rescue_protected(){ printf '%s\n' "$PDG_RESCUE_PROTECTED_MEMBERS"; }
 
+# 项目安装成员全集(相对根的路径): 卸载要一个不剩地收走的东西。
+#
+# 这**不是**上面那份受保护成员清单。两者语义完全不同, 合成一份的话必然把一方拖坏:
+#   · 受保护成员 = 完整恢复旧快照时必须保持可用的**最小救援通道**。它刻意不含 pdgtx.py、
+#     cfgrestore.py 这些业务模块 —— 旧快照本来就该把业务核心换成旧的, 救援页随后按能力
+#     检测优雅降级("旧核心不支持"), 那是设计, 不是缺陷。往里加业务模块等于让"完整恢复"
+#     恢复不了业务代码。
+#   · 安装成员全集 = 我们往机器上放过的一切。卸载漏一项, 留下的是仍然有效的 token 与私钥。
+# 关系: 保护集 ⊂ 安装全集; 安装全集不反过来决定保护范围。
+#
+# 模块部分**直接读 10a-1 的运行模块真源**(lib/modules.sh), 不在这里抄第二份 —— 抄的那份
+# 迟早漏掉新模块, 而漏掉的表现只是"卸载完还留着几个 .py", 没人会注意到。
+pdg_project_members(){
+  local mod="${PDG_MODULES_LIB:-}" d name
+  if [[ -z "$mod" ]]; then
+    for d in "$(dirname "${BASH_SOURCE[0]}")/modules.sh" /opt/privdns-gateway/lib/modules.sh; do
+      [[ -f "$d" ]] && { mod="$d"; break; }
+    done
+  fi
+  [[ -n "$mod" && -f "$mod" ]] || return 1     # 读不到真源 → 返回 1, 让调用方报出来, 不猜
+  # shellcheck source=lib/modules.sh
+  source "$mod" || return 1
+  while read -r _ name _; do
+    [[ -n "$name" ]] || continue
+    printf '%s/%s\n' "${PDG_RUNTIME_DIR#/}" "$name"
+  done < <(pdg_runtime_modules)
+  printf '%s\n' "${PDG_RESCUE_TOKEN#/}" "${PDG_RESCUE_CERT#/}" "${PDG_RESCUE_KEY#/}" \
+                "${PDG_RESCUE_STATE#/}" \
+                "etc/systemd/system/$PDG_RESCUE_SOCKET_UNIT" \
+                "etc/systemd/system/$PDG_RESCUE_SERVICE_UNIT"
+}
+
 # 卸载时拆掉救援平面在盘上的全部形态。$1=根前缀(测试注入, 真实卸载传空), $2=nft 可执行(可空)。
 #
 # 为什么必须清干净、而且清不掉要**明说**: 卸载完还留着的是一把仍然有效的 token 与 TLS 私钥,
 # 外加一条内网放行规则 —— 服务没了、门却还开着一条缝, 比不卸载更糟。所以任何一项删不掉都
 # 逐条打印到 stdout 并返回非 0, 由调用方原样报给用户; 绝不吞掉错误假装"已完成"。
 #
-# 删什么不另列清单, 直接复用 PDG_RESCUE_PROTECTED_MEMBERS —— 那张表的定义就是"救援平面自身
-# 由哪些文件构成"(完整恢复时要事前排除的正是它们)。两处共用一份真源, 以后加了新成员, 恢复
-# 保护与卸载清理同时跟上, 不会一边记得一边忘。
+# 删什么走 pdg_project_members(安装全集), **不是**受保护成员清单 —— 后者只是"恢复旧快照时
+# 要保住的最小通道", 拿它当卸载清单会把 pdgtx.py/checks.py 这些留在盘上。
 pdg_rescue_cleanup(){
   local root="${1:-}" nftbin="${2:-}" residue=() m target conf
   conf="$root/etc/nftables.conf"
@@ -102,13 +142,18 @@ pdg_rescue_cleanup(){
     "$nftbin" delete table inet "$PDG_RESCUE_TABLE" 2>/dev/null || true   # 本来就没有 → 不算残留
   fi
 
-  # 3) 凭据、状态、unit、运行文件 —— 逐条删并逐条复核
-  while read -r m; do
-    [[ -n "$m" ]] || continue
-    target="$root/$m"
-    rm -f "$target" 2>/dev/null
-    [[ -e "$target" ]] && residue+=("$target")
-  done < <(pdg_rescue_protected)
+  # 3) 凭据、状态、unit、全部运行模块 —— 逐条删并逐条复核
+  local members
+  if members="$(pdg_project_members)"; then
+    while read -r m; do
+      [[ -n "$m" ]] || continue
+      target="$root/$m"
+      rm -f "$target" 2>/dev/null
+      [[ -e "$target" ]] && residue+=("$target")
+    done <<< "$members"
+  else
+    residue+=("读不到运行模块真源(lib/modules.sh) —— 未删除任何运行模块与凭据, 请手工清理 ${root:-/}opt/pdg-bot 与 $root$PDG_RESCUE_DIR")
+  fi
   rmdir "$root$PDG_RESCUE_DIR" 2>/dev/null || true   # 空了才收走; 用户往里放过别的东西就留着
 
   if ((${#residue[@]})); then

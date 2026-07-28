@@ -271,6 +271,7 @@ mkdir -p "$UBOX/etc/systemd/system" "$UBOX/opt/pdg-bot" "$UBOX/etc/privdns-gatew
 cp -a "$BOX/etc/systemd/system/pdg-rescue.socket" "$BOX/etc/systemd/system/pdg-rescue.service" \
       "$UBOX/etc/systemd/system/" 2>/dev/null
 cp -a "$BOX/opt/pdg-bot/." "$UBOX/opt/pdg-bot/" 2>/dev/null
+printf 'USERFILE' > "$UBOX/opt/pdg-bot/my-hook.sh"      # 用户自己放的东西, 卸载不许碰
 printf '%s' "$SECRET_SENTINEL" > "$UBOX/etc/privdns-gateway/rescue/token"
 printf 'KEYMATERIAL-%s' "$SECRET_SENTINEL" > "$UBOX/etc/privdns-gateway/rescue/key.pem"
 printf 'CERT' > "$UBOX/etc/privdns-gateway/rescue/cert.pem"
@@ -301,8 +302,19 @@ if grep -q 'table inet mine' "$UBOX/etc/nftables.conf" \
    && grep -qE "tcp dport $RP accept" "$UBOX/etc/nftables.conf"; then
   ok "用户自己写的同端口规则**原样保留**(靠 BANNER 定界, 不按端口删行)"
 else bad "卸载把用户自己的同端口规则删掉了"; fi
-if [[ -e "$UBOX/opt/pdg-bot/pdgtx.py" && -e "$UBOX/opt/pdg-bot/checks.py" ]]; then
-  ok "只删救援平面自身, Bot 其它模块不动"; else bad "把非救援模块也删了"; fi
+# 装的模块要一个不剩地收走 —— 清单读 10a-1 真源, 不在测试里另抄一份
+gone_miss=()
+while read -r _ name _; do
+  [[ -n "$name" ]] || continue
+  [[ -e "$UBOX/opt/pdg-bot/$name" ]] && gone_miss+=("$name")
+done < <(bash -c "source '$ROOT/lib/modules.sh'; pdg_runtime_modules")
+if ((${#gone_miss[@]}==0)); then
+  ok "真源里的运行模块**逐项**删净(含 pdgtx/checks 等业务模块, 不只救援那几个)"
+else bad "这些模块没删掉: ${gone_miss[*]}"; fi
+# 但用户自己放进来的东西一个字节都不许动
+if [[ -e "$UBOX/opt/pdg-bot/my-hook.sh" && "$(cat "$UBOX/opt/pdg-bot/my-hook.sh")" == "USERFILE" ]]; then
+  ok "用户自己放在 /opt/pdg-bot 的文件原样保留(只删我们装的那些)"
+else bad "把用户自己的文件删了"; fi
 
 # 删不掉时必须**逐条报出来**而不是假装完成
 rm -rf "$UBOX"; mkdir -p "$UBOX/etc/privdns-gateway/rescue"
@@ -549,11 +561,111 @@ exit 0
 S
 chmod 755 "$BIN/systemctl"
 
-# ══ 15. 沙盒边界声明(10b 硬门)═══════════════════════════════════════════════
-echo; echo "── 15. 沙盒边界 ──"
-skip "真 systemd socket activation / Accept=no 按需拉起 / FreeBind / 崩溃后 socket 仍监听 —— 10b"
-skip "ProtectSystem=strict / ReadWritePaths / RestrictAddressFamilies(含 AF_NETLINK)硬化 —— 10b"
-skip "真实 nft 对候选 -c 校验、真实应用与失败回滚、真实无重复规则 —— 10b"
+# ══ 16. socket activation 状态模型 ═════════════════════════════════════════
+echo; echo "── 16. socket activation 状态 ──"
+# Accept=no 的 socket activation 下, "socket 在监听 + service inactive" 是**健康**状态:
+# 已布防, 等着请求。把它判成"服务挂了"的后果是每次 update 都重跑一遍 enable —— 凭据被重新
+# 生成、证书指纹变掉, 用户下次访问看到指纹不一致, 只能怀疑自己遇上了中间人。
+run 'cmd_rescue enable' >/dev/null
+echo 0 > "$STATE/pdg-rescue.service.ac"        # service 闲着(正常)
+echo 1 > "$STATE/pdg-rescue.socket.ac"; echo 1 > "$STATE/pdg-rescue.socket.en"
+
+snap_all(){ find "$BOX" -type f -printf '%p %s %T@\n' 2>/dev/null | sort; }
+before="$(snap_all)"; tok0="$(sha256sum "$BOX/etc/privdns-gateway/rescue/token" | awk '{print $1}')"
+fp0="$(run 'cmd_rescue fingerprint' | tail -1)"
+run 'migrate_rescue_plane' >/dev/null
+if [[ "$(snap_all)" == "$before" ]]; then
+  ok "socket active + service inactive → 迁移**零改动**(没有一个文件被动过)"
+else
+  bad "迁移动了文件: $(diff <(echo "$before") <(snap_all) | head -3 | tr '\n' ' ')"; fi
+if [[ "$(sha256sum "$BOX/etc/privdns-gateway/rescue/token" | awk '{print $1}')" == "$tok0" \
+   && "$(run 'cmd_rescue fingerprint' | tail -1)" == "$fp0" ]]; then
+  ok "凭据与证书指纹一字未变(否则用户下次访问会以为遇上中间人)"
+else bad "迁移把凭据/指纹换了"; fi
+st="$(run 'cmd_rescue status')"
+if grep -q '待按需拉起' <<<"$st"; then
+  ok "status 把正常 inactive 说成「待按需拉起」, 不是「服务挂了」"
+else bad "status 文案把闲置说成故障: $(grep 'service' <<<"$st")"; fi
+
+# service 正在服务 → 同样健康
+echo 1 > "$STATE/pdg-rescue.service.ac"
+st="$(run 'cmd_rescue status')"
+if grep -q '正在服务请求' <<<"$st"; then ok "service active → 显示正在服务请求"
+else bad "service active 文案不对"; fi
+before="$(snap_all)"; run 'migrate_rescue_plane' >/dev/null
+if [[ "$(snap_all)" == "$before" ]]; then ok "socket + service 都 active → 迁移仍零改动"
+else bad "迁移动了文件"; fi
+
+# service failed → 必须单独点名, 且 status 本身只读
+cat > "$BIN/systemctl" <<'S'
+#!/bin/bash
+D="$PDG_TEST_STATE"; mkdir -p "$D"
+v="$1"; shift; now=0; [[ "${1:-}" == "--now" ]] && { now=1; shift; }
+case "$v" in
+  daemon-reload|reset-failed|preset) exit 0;;
+  enable)  for u in "$@"; do echo 1 > "$D/$u.en"; [[ "$now" == 1 ]] && echo 1 > "$D/$u.ac"; done; exit 0;;
+  disable) for u in "$@"; do echo 0 > "$D/$u.en"; [[ "$now" == 1 ]] && echo 0 > "$D/$u.ac"; done; exit 0;;
+  start|restart) for u in "$@"; do echo 1 > "$D/$u.ac"; done; exit 0;;
+  stop) for u in "$@"; do echo 0 > "$D/$u.ac"; done; exit 0;;
+  is-active)  s="$(cat "$D/$1.ac" 2>/dev/null)"
+              case "$s" in 1) echo active; exit 0;; failed) echo failed; exit 3;; *) echo inactive; exit 3;; esac;;
+  is-enabled) [[ "$(cat "$D/$1.en" 2>/dev/null)" == 1 ]] && { echo enabled; exit 0; }; echo disabled; exit 1;;
+esac
+exit 0
+S
+chmod 755 "$BIN/systemctl"
+echo failed > "$STATE/pdg-rescue.service.ac"
+before="$(snap_all)"
+st="$(run 'cmd_rescue status')"
+if grep -q 'failed' <<<"$st" && grep -q '需要处理' <<<"$st"; then
+  ok "service failed → status 点名异常(与正常 inactive 分开说)"
+else bad "failed 没被单独点名: $(grep 'service' <<<"$st")"; fi
+if ! grep -q '待按需拉起' <<<"$st"; then
+  ok "failed 时不再显示「待按需拉起」(两种状态不混为一谈)"; else bad "failed 被说成待拉起"; fi
+if [[ "$(snap_all)" == "$before" ]]; then ok "status 只读: 看一眼状态不写任何文件"
+else bad "status 动了文件"; fi
+
+# socket inactive(真挂了)→ enable 能修回来
+echo 0 > "$STATE/pdg-rescue.socket.ac"; echo 1 > "$STATE/pdg-rescue.service.ac"
+run 'cmd_rescue enable' >/dev/null
+if [[ "$(cat "$STATE/pdg-rescue.socket.ac" 2>/dev/null)" == 1 ]]; then
+  ok "socket inactive(异常)→ enable 修复回 active"; else bad "enable 没修回来"; fi
+
+# 放行被别人清掉 → 迁移要察觉并修回来(不是只看 unit 就宣布幂等)。
+# 现场必须自己搭干净: 前面小节留下的 conf 里有**用户自己写的**同端口放行, 拿它当底噪的话
+# 下面两条断言量到的都是用户那一行, 与我们的规则在不在毫无关系 —— 那种绿是假的。
+cat > "$BOX/etc/nftables.conf" <<'C'
+table inet pdg
+delete table inet pdg
+table inet pdg {
+    chain input {
+        type filter hook input priority 0; policy drop;
+        iif "lo" accept
+    }
+}
+C
+run 'cmd_rescue enable' >/dev/null
+if [[ "$(grep -cE "dport $RP accept" "$BOX/etc/nftables.conf")" == 1 ]]; then
+  ok "(前提)干净现场上 enable 出恰好一条放行"; else bad "(前提)现场没搭好"; fi
+python3 "$ROOT/deploy/bot/rescue_nft.py" --strip < "$BOX/etc/nftables.conf" > "$BOX/etc/nftables.conf.t" \
+  && mv -f "$BOX/etc/nftables.conf.t" "$BOX/etc/nftables.conf"
+if ! grep -qE "dport $RP accept" "$BOX/etc/nftables.conf"; then
+  ok "(前提)放行已被外力清掉"; else bad "(前提)没能清掉放行, 下条断言无意义"; fi
+run 'migrate_rescue_plane' >/dev/null
+if grep -qE "dport $RP accept" "$BOX/etc/nftables.conf"; then
+  ok "放行被清掉 → 迁移察觉不一致并修回来(判据含 nft, 不只看 unit)"
+else bad "迁移没把放行修回来"; fi
+
+# ══ 17. 沙盒边界声明(10b 硬门)═══════════════════════════════════════════════
+echo; echo "── 17. 沙盒边界 ──"
+DOC="docs/rescue-plane-acceptance.md"     # 硬门的正式登记在文档里, 这里只是引用
+skip "真 systemd socket activation / Accept=no 按需拉起 / FreeBind / 崩溃后 socket 仍监听 → $DOC 第二节"
+skip "ProtectSystem=strict / ReadWritePaths / RestrictAddressFamilies(含 AF_NETLINK)硬化 → $DOC 第二节"
+skip "真实 nft 对候选 -c 校验、真实应用与失败回滚、真实无重复规则 → $DOC 第二节"
+skip "大快照耗时 / MemoryMax=64M / 浏览器断线 / TimeoutStopSec / 跨版本矩阵 → $DOC 第三节(10c)"
+if [[ -f "$ROOT/$DOC" ]] && grep -q "AF_NETLINK" "$ROOT/$DOC" && grep -q "MemoryMax" "$ROOT/$DOC"; then
+  ok "10b/10c 硬门登记在 $DOC(测试只引用它, 不作为唯一记录)"
+else bad "找不到正式验收文档或它缺硬门条目"; fi
 echo "  (以上为**桩行为验证**, 不能记作真 systemd/nft 已验收)"
 
 echo "────────────────────────────────────────"

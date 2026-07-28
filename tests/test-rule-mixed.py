@@ -45,6 +45,11 @@ def bad(m):
     FAIL[0] += 1
 
 
+def skip(m):
+    """环境限制导致某项没跑成 —— 与 PASS 严格区分, 不计入通过数。"""
+    print("[SKIP] " + m)
+
+
 def eq(label, got, want):
     if got == want:
         ok(label)
@@ -282,7 +287,9 @@ else:
 # ══ 6. 真 mihomo -t ════════════════════════════════════════════════════════
 print()
 print("── 6. 钉死版 mihomo -t ──")
-MIHOMO = shutil.which("mihomo") or os.environ.get("PDG_TEST_MIHOMO", "")
+sys.path.insert(0, os.path.join(ROOT, "tests"))
+import mihomobin  # noqa: E402  钉死版内核的唯一定位入口(版本核对在它里面, 这里不重复写)
+MIHOMO = mihomobin.require(ok, bad, skip)
 
 
 def mihomo_check(cfg):
@@ -297,20 +304,7 @@ def mihomo_check(cfg):
         shutil.rmtree(d, ignore_errors=True)
 
 
-if not MIHOMO:
-    bad("找不到 mihomo(装钉死版或设 PDG_TEST_MIHOMO) —— 语法必须由真内核校验, 不接受跳过")
-else:
-    ver = subprocess.run([MIHOMO, "-v"], capture_output=True, text=True).stdout.strip()
-    sys.path.insert(0, os.path.join(ROOT, "tests"))
-    pinned = ""
-    for line in open(os.path.join(ROOT, "lib", "versions.sh"), encoding="utf-8"):
-        m = re.match(r'^MIHOMO_VER="?([^"\n]+)"?', line.strip())
-        if m:
-            pinned = m.group(1)
-    if pinned and pinned.lstrip("v") in ver:
-        ok("用的是项目钉死版本 mihomo(%s)" % pinned)
-    else:
-        bad("mihomo 版本与钉死版不符: %r(钉死 %s)" % (ver, pinned))
+if MIHOMO:
     SB = {"log": {}, "inbounds": [], "outbounds": BASE_OUT,
           "route": {"rules": [
               {"rule_set": "rs_a", "domain_suffix": ["ex.test"], "outbound": "ss1"},

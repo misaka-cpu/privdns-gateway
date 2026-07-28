@@ -1512,12 +1512,17 @@ migrate_rescue_plane(){
     _rescue_socket_present || c_y "  救援平面: 内网卡段内没有本机地址, 暂不启用(pdg rescue enable 可重试)。"
     return 0
   fi
-  # 已装、已启用**且真的在跑** → 幂等退出(不重生成凭据、不重启)。
-  # 只看 is-enabled 是不够的: 服务崩掉之后它仍然是 enabled, 那种情况恰恰是要救回来的 ——
-  # "用户关的"与"自己挂的"必须分开处置, 前者不许动, 后者要恢复。
+  # 已布防 → 幂等退出(不重生成凭据、不重启、不动任何文件)。
+  #
+  # 判据是 **socket** 在监听 + unit 在盘上 + 放行还在, 不看 service: socket activation
+  # (Accept=no)下 service 平时就该是 inactive —— 那是"已布防、等待请求", 不是挂了。拿
+  # service 当判据的话, 每次 update 都会认定它没起来而重跑一遍 enable, 于是凭据被重新生成、
+  # 证书指纹变掉, 用户下次访问看到指纹不一致, 只能怀疑自己遇上了中间人。
+  # 只看 is-enabled 同样不够: 服务崩掉之后它仍然是 enabled, 那种情况恰恰是要救回来的。
   if _rescue_socket_present \
      && systemctl is-enabled "$PDG_RESCUE_SOCKET_UNIT" >/dev/null 2>&1 \
-     && systemctl is-active "$PDG_RESCUE_SOCKET_UNIT" >/dev/null 2>&1; then
+     && systemctl is-active "$PDG_RESCUE_SOCKET_UNIT" >/dev/null 2>&1 \
+     && _rescue_nft_has; then
     [[ -n "$intent" ]] || _rescue_intent_set 1       # 老机器补记意图(此前只有 unit 没有键)
     return 0
   fi
@@ -2659,10 +2664,10 @@ _rescue_enable(){
     systemctl daemon-reload 2>/dev/null || true
   }
   # 运行模块得先齐 —— 缺一个的后果不是报错, 是救援页把整块能力标成"旧核心不支持"。
-  # 装机由 10a-1 的清单负责, 这里只是在**开门之前**再确认一次。
+  # 装机由 10a-1 的清单负责, 这里只是在**开门之前**再确认一次。名单读 PDG_RESCUE_CLOSURE
+  # (救援平面自身的模块闭包), 不在这里手写第二份。
   local _miss=""
-  for _m in rescue.py rescue_cred.py rescue_const.py breakglass.py cfgrestore.py \
-            emergency.py mihomorender.py sb2mihomo.py pdgtx.py rescue_nft.py; do
+  for _m in $PDG_RESCUE_CLOSURE; do
     [[ -f "/opt/pdg-bot/$_m" ]] || _miss="$_miss $_m"
   done
   if [[ -n "$_miss" ]]; then
@@ -2730,7 +2735,15 @@ _rescue_status(){
   esac
   printf "  %-14s %s\n" "socket unit"  "$(_rescue_socket_present && echo 已安装 || echo 缺失)"
   printf "  %-14s %s\n" "socket 状态"  "${sock:-unknown} / $(systemctl is-enabled "$PDG_RESCUE_SOCKET_UNIT" 2>/dev/null || echo disabled)"
-  printf "  %-14s %s\n" "service 状态" "${svc:-inactive}"
+  # socket activation(Accept=no)下 service 平时就是 inactive: socket 在监听, 有请求才拉起
+  # 它。把这种正常状态显示成"服务未运行", 会让人以为救援平面坏了而去反复重启 —— 真正该
+  # 报的是 failed(起过并且失败了), 那和"闲着"完全是两回事, 必须分开说。
+  case "$svc" in
+    active)   printf "  %-14s %s\n" "service 状态" "active(正在服务请求)";;
+    failed)   printf "  %-14s %s\n" "service 状态" "❌ failed(上次拉起失败 —— 需要处理; journalctl -u $PDG_RESCUE_SERVICE_UNIT 看原因)";;
+    ""|inactive) printf "  %-14s %s\n" "service 状态" "inactive(正常: 待按需拉起, socket 收到连接才启动)";;
+    *)        printf "  %-14s %s\n" "service 状态" "$svc";;
+  esac
   printf "  %-14s %s\n" "监听地址"     "${bind:+https://$bind:$PDG_RESCUE_PORT/}${bind:-（内网卡段内无本机地址）}"
   printf "  %-14s %s\n" "防火墙放行"   "$(_rescue_nft_has && echo "有(仅内网来源)" || echo 无)"
   # 凭据只报"齐不齐"与指纹, **绝不打印 token 或私钥**
@@ -2756,8 +2769,7 @@ _rescue_status(){
   fi
   # 运行模块是否完整: 缺一个救援页就会有整块能力标成"旧核心不支持"
   local _miss_mods=""
-  for f in rescue.py rescue_cred.py rescue_const.py breakglass.py cfgrestore.py \
-           emergency.py mihomorender.py sb2mihomo.py pdgtx.py rescue_nft.py; do
+  for f in $PDG_RESCUE_CLOSURE; do
     [[ -f "/opt/pdg-bot/$f" ]] || _miss_mods="$_miss_mods $f"
   done
   printf "  %-14s %s\n" "运行模块" "$([[ -z "$_miss_mods" ]] && echo 完整 || echo "缺:$_miss_mods")"
