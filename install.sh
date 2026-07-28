@@ -928,6 +928,22 @@ _write_resolv "nameserver 127.0.0.1" "nameserver 1.1.1.1"
 # ── 9. 防火墙 ──
 c_g "应用防火墙…"
 systemctl enable nftables >/dev/null 2>&1 || true
+# 救援平面已启用的机器: 渲染出来的这份配置里**没有**那条带标记的救援放行(模板不含它,
+# 它是 enable 时注入的)。直接应用等于把门关上 —— socket 还在监听、防火墙已经不放行, 而
+# 下一次 pdg update 的迁移会发现不一致、试图修复、失败之后把整次更新回滚(.200 实机实测)。
+# 所以: 启用中就在应用之前把规则补回候选, 一次应用到位, 不留无放行的窗口。
+if [[ "$(pdg_profile_get PDG_RESCUE_ENABLED 2>/dev/null || echo)" == 1 && -n "$RESCUE_BIND" ]]; then
+  _rc_cand="$(mktemp)"
+  if python3 "$REPO_DIR/deploy/bot/rescue_nft.py" "$INTERNAL_CIDR" "$PDG_RESCUE_PORT" \
+       "$RESCUE_BIND" < /etc/nftables.conf > "$_rc_cand" 2>/dev/null \
+     && nft -c -f "$_rc_cand" >/dev/null 2>&1; then
+    cat "$_rc_cand" > /etc/nftables.conf
+    c_g "救援放行已随防火墙一起应用(救援平面处于启用状态)"
+  else
+    c_y "⚠️ 救援放行没能注入防火墙候选 —— 装完请跑 sudo pdg rescue enable 复查。"
+  fi
+  rm -f "$_rc_cand"
+fi
 nft -f /etc/nftables.conf
 
 # ── 提交点前: 确认核心服务"持续"起来了 ──

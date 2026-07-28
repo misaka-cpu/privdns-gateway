@@ -163,7 +163,10 @@ else:
 def between(text, a, b, what):
     """取两个锚点之间的段落。锚点没了就是**回归本身**, 报明确原因而不是抛 ValueError ——
     崩在 index() 上虽然也是非 0, 但它指向的位置是错的。"""
-    i, j = text.find(a), text.find(b)
+    i = text.find(a)
+    j = text.find(b, i + 1) if i >= 0 else -1     # 结束锚点必须在起点**之后**找:
+    # 同一个字符串在文件更早处也可能出现(nft -f /etc/nftables.conf 在回滚路径里就有一处),
+    # 从头找会得到 j < i, 于是这段被判成"锚点丢了"——一个纯粹由取法造成的假红。
     if i < 0 or j < 0 or j <= i:
         bad("install.sh 里找不到「%s」那段(锚点 %r/%r)—— 保留逻辑可能被改掉了" % (what, a[:12], b[:12]))
         return ""
@@ -215,6 +218,26 @@ if seg3 and "mitm_hijack.txt" in seg3 and "mitm_domains=" in seg3:
     ok("装机/重装的渲染读 mitm_hijack.txt 并把域名传进去(重装不再让 WLOC 静默失效)")
 elif seg3:
     bad("渲染仍未带上接管域名")
+
+# ── 6. 重装不得把救援放行渲染没了 ──────────────────────────────────────────
+print()
+print("── 6. 重装后的防火墙 ──")
+# 模板里没有那条带标记的救援放行(它是 enable 时注入的)。重装重渲染防火墙后直接应用, 等于
+# socket 还在监听、防火墙已经不放行 —— 而下一次 update 的迁移会去修、修不成就把整次更新
+# 回滚(.200 实机上完整发生过一遍)。
+seg4 = between(inst, "# 救援平面已启用的机器", "nft -f /etc/nftables.conf", "重装时补回救援放行")
+if seg4 and "rescue_nft.py" in seg4 and "PDG_RESCUE_ENABLED" in seg4:
+    ok("启用中的机器: 应用防火墙前先把救援放行补回候选")
+elif seg4:
+    bad("重装仍会把救援放行渲染没")
+if seg4 and "nft -c -f" in seg4:
+    ok("补回后的候选先过 nft -c 再落盘(不拿没校验的配置去应用)")
+elif seg4:
+    bad("补回路径没有校验门")
+if seg4 and ("pdg rescue enable" in seg4 or "复查" in seg4):
+    ok("注入失败时明确提示去复查, 不假装成功")
+elif seg4:
+    bad("失败路径静默")
 
 print("─" * 40)
 print("通过 %d, 失败 %d" % (PASS[0], FAIL[0]))
