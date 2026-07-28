@@ -135,8 +135,16 @@ if ! grep -qE 'ListenStream=(0\.0\.0\.0|::|\[::\]):' "$sock" 2>/dev/null; then
 else bad "绑了通配地址"; fi
 if [[ "$(cat "$STATE/pdg-rescue.socket.en" 2>/dev/null)" == 1 ]]; then
   ok "socket 已 enable"; else bad "socket 没 enable"; fi
-n=$(grep -cE "dport $RP accept" "$BOX/etc/nftables.conf")
-if [[ "$n" == 1 ]]; then ok "救援端口放行恰好一条"; else bad "救援端口规则 $n 条"; fi
+# 我们的放行有**两处形态**, 都是有意的(10b 在真 nft 上验出来的):
+#   · 独立表 inet pdgrescue —— 让恢复旧防火墙时它不被顺手删掉;
+#   · 每条 policy drop 的 input 基链里补一行带标记的放行 —— 因为独立表的 accept **盖不过**
+#     另一张表的 policy drop(同一 hook 上多条基链会挨个走, accept 只终止本链)。
+# 所以这里分别数, 而不是笼统数"含 dport 的行": 后者既分不清两种形态, 也会把用户自己写的
+# 同端口规则算进来。
+blk=$(grep -c '^# ==== PrivDNS Gateway 救援入口' "$BOX/etc/nftables.conf")
+inl=$(grep -c 'pdg-rescue(自动补入' "$BOX/etc/nftables.conf")
+if [[ "$blk" == 1 && "$inl" == 1 ]]; then ok "独立表 1 块 + drop 链里补入 1 行(各自恰好一份)"
+else bad "形态不对: 独立表 $blk 块 / 补入 $inl 行"; fi
 if grep -qE "ip saddr 10\.7\.0\.0/16.*dport $RP accept" "$BOX/etc/nftables.conf"; then
   ok "救援端口放行带内网来源约束"; else bad "救援端口放行没有来源约束: $(grep "$RP" "$BOX/etc/nftables.conf")"; fi
 miss=""
@@ -157,8 +165,10 @@ fp_before="$(run 'cmd_rescue fingerprint' | tail -1)"
 # ══ 2. 重复 enable 幂等 ═════════════════════════════════════════════════════
 echo; echo "── 2. 重复 enable ──"
 run 'cmd_rescue enable' >/dev/null
-n=$(grep -cE "dport $RP accept" "$BOX/etc/nftables.conf")
-if [[ "$n" == 1 ]]; then ok "重复 enable 不产生第二条救援端口规则"; else bad "重复后 $n 条"; fi
+blk=$(grep -c '^# ==== PrivDNS Gateway 救援入口' "$BOX/etc/nftables.conf")
+inl=$(grep -c 'pdg-rescue(自动补入' "$BOX/etc/nftables.conf")
+if [[ "$blk" == 1 && "$inl" == 1 ]]; then ok "重复 enable 不堆: 仍是 1 块 + 1 行"
+else bad "重复后成了 $blk 块 / $inl 行"; fi
 sha_now="$(sha256sum 2>/dev/null "$BOX/etc/privdns-gateway/rescue/token" "$BOX/etc/privdns-gateway/rescue/cert.pem" \
            "$BOX/etc/privdns-gateway/rescue/key.pem" | awk '{print $1}' | tr '\n' ' ')"
 if [[ -n "${sha_before// /}" && "$sha_now" == "$sha_before" ]]; then
@@ -224,7 +234,9 @@ if [[ -n "$fp_before" && "$fp_after" == "$fp_before" ]]; then
 if grep -q '^PDG_RESCUE_ENABLED=1$' "$BOX/etc/privdns-gateway/profile.env"; then
   ok "用户明确再开 → 意图回到 enabled"; else bad "意图没更新"; fi
 n=$(grep -cE "dport $RP accept" "$BOX/etc/nftables.conf")
-if [[ "$n" == 1 ]]; then ok "再 enable 后救援端口仍恰好一条"; else bad "$n 条"; fi
+if [[ "$(grep -c '^# ==== PrivDNS Gateway 救援入口' "$BOX/etc/nftables.conf")" == 1 \
+   && "$(grep -c 'pdg-rescue(自动补入' "$BOX/etc/nftables.conf")" == 1 ]]; then
+  ok "再 enable 后仍是 1 块 + 1 行"; else bad "$n 条"; fi
 
 # ══ 7. 迁移幂等 ═════════════════════════════════════════════════════════════
 echo; echo "── 7. 迁移幂等 ──"
@@ -645,8 +657,10 @@ table inet pdg {
 }
 C
 run 'cmd_rescue enable' >/dev/null
-if [[ "$(grep -cE "dport $RP accept" "$BOX/etc/nftables.conf")" == 1 ]]; then
-  ok "(前提)干净现场上 enable 出恰好一条放行"; else bad "(前提)现场没搭好"; fi
+# 这份现场是 policy drop 的 input 链, 所以 enable 会产出两处形态: 独立表 + 链内补入行。
+if [[ "$(grep -c '^# ==== PrivDNS Gateway 救援入口' "$BOX/etc/nftables.conf")" == 1 \
+   && "$(grep -c 'pdg-rescue(自动补入' "$BOX/etc/nftables.conf")" == 1 ]]; then
+  ok "(前提)干净现场上 enable 出 1 块独立表 + 1 行链内放行"; else bad "(前提)现场没搭好"; fi
 python3 "$ROOT/deploy/bot/rescue_nft.py" --strip < "$BOX/etc/nftables.conf" > "$BOX/etc/nftables.conf.t" \
   && mv -f "$BOX/etc/nftables.conf.t" "$BOX/etc/nftables.conf"
 if ! grep -qE "dport $RP accept" "$BOX/etc/nftables.conf"; then
@@ -659,9 +673,11 @@ else bad "迁移没把放行修回来"; fi
 # ══ 17. 沙盒边界声明(10b 硬门)═══════════════════════════════════════════════
 echo; echo "── 17. 沙盒边界 ──"
 DOC="docs/rescue-plane-acceptance.md"     # 硬门的正式登记在文档里, 这里只是引用
-skip "真 systemd socket activation / Accept=no 按需拉起 / FreeBind / 崩溃后 socket 仍监听 → $DOC 第二节"
-skip "ProtectSystem=strict / ReadWritePaths / RestrictAddressFamilies(含 AF_NETLINK)硬化 → $DOC 第二节"
-skip "真实 nft 对候选 -c 校验、真实应用与失败回滚、真实无重复规则 → $DOC 第二节"
+# 10b 那批已经在真 systemd/nft 上验过了(tests/e2e-rescue-10b.sh, 需 root)。这里仍标 SKIP:
+# 本文件跑在桩上, 不能把别处的验收算成自己的绿。
+skip "真 systemd socket activation / FreeBind / 崩溃后仍可拉起 → 见 tests/e2e-rescue-10b.sh(已验收)"
+skip "ProtectSystem / ReadWritePaths / RestrictAddressFamilies 硬化 → 见 tests/e2e-rescue-10b.sh(已验收)"
+skip "真实 nft 校验/应用/来源约束/旧快照恢复后仍可达 → 见 tests/e2e-rescue-10b.sh(已验收)"
 skip "大快照耗时 / MemoryMax=64M / 浏览器断线 / TimeoutStopSec / 跨版本矩阵 → $DOC 第三节(10c)"
 if [[ -f "$ROOT/$DOC" ]] && grep -q "AF_NETLINK" "$ROOT/$DOC" && grep -q "MemoryMax" "$ROOT/$DOC"; then
   ok "10b/10c 硬门登记在 $DOC(测试只引用它, 不作为唯一记录)"

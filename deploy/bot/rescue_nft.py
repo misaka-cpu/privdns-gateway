@@ -36,10 +36,45 @@ def rule_block(cidr, port):
 
 _OURS_RE = re.compile(r"^# ==== PrivDNS Gateway 救援入口.*?^\}\n", re.S | re.M)
 
+# 补进别人链里的那一行, 用行尾标记认领。只认这个标记, 于是"我们加的"与"用户自己写的同端口
+# 放行"始终分得开 —— 撤销时绝不会误删后者。
+_MARK = "# pdg-rescue(自动补入; 撤销救援时由 --strip 一并移除)"
+_INLINE_RE = re.compile(r"^.*%s\n" % re.escape(_MARK), re.M)
+
+# `type filter hook input <优先级>; policy drop;` 这一行 —— 后面紧跟的就是链里第一条规则的位置
+_DROP_INPUT_RE = re.compile(
+    r"^(?P<indent>[ \t]*)(?P<decl>type\s+filter\s+hook\s+input\b[^\n]*policy\s+drop\s*;)[ \t]*$",
+    re.M)
+
 
 def strip_ours(text):
-    """去掉我们自己上一次注入的块(幂等: 反复注入不会越堆越多)。"""
-    return _OURS_RE.sub("", text or "")
+    """去掉我们自己上一次注入的东西(幂等: 反复注入不会越堆越多)。
+
+    两部分都要摘: 独立表整块, 以及补进别人 input 链里的那些行。"""
+    return _INLINE_RE.sub("", _OURS_RE.sub("", text or ""))
+
+
+def _patch_drop_chains(text, cidr, port):
+    """给候选里**每个 policy drop 的 input 基链**补一条救援放行, 返回 (新文本, 补了几处)。
+
+    为什么光有独立表不够 —— 这是 10b 在真 nftables 上验出来的:
+    同一个 hook 上注册多个 base chain 时, 数据包会**挨个走一遍**; 某条链里的 `accept` 只终止
+    **本链**, 后面优先级的链照样能把它丢掉。于是恢复一份 5.2 之前的旧防火墙(inet pdg 是
+    policy drop 且没有救援放行)之后, 独立表 inet pdgrescue 里的 accept 完全不管用 ——
+    真机实测: 内网来源连救援口直接超时, 救援门在最需要它的时刻是关着的。
+    (对照: 同一份规则下 SSH 口回的是 Connection refused 而不是超时, 说明确实是被 drop 掉的。)
+
+    所以除了独立表, 还要往每条会丢包的 input 链里补一行。插在链首(紧跟 type 声明), 不解析
+    链里其余结构 —— 别人的规则一个字节都不动, 只是多一条更靠前的放行。
+    """
+    n = [0]
+
+    def _ins(m):
+        n[0] += 1
+        return "%s%s\n%s    ip saddr %s tcp dport %d accept   %s" % (
+            m.group("indent"), m.group("decl"), m.group("indent"), cidr, port, _MARK)
+
+    return _DROP_INPUT_RE.sub(_ins, text), n[0]
 
 
 def ensure_rescue_rule(text, cidr, port):
@@ -52,7 +87,8 @@ def ensure_rescue_rule(text, cidr, port):
     base = strip_ours(text or "")
     if base and not base.endswith("\n"):
         base += "\n"
-    out = base + rule_block(cidr, port)
+    base, _patched = _patch_drop_chains(base, cidr, port)   # 先补别人的 drop 链
+    out = base + rule_block(cidr, port)                     # 再追加自己的独立表
     return out, out != (text or "")
 
 

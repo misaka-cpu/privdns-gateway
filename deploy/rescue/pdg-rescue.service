@@ -4,17 +4,27 @@ Description=PrivDNS Gateway 救援平面 (只读状态 / 事务查看; 私网 HT
 # 它们全挂了正是要用它的时候。
 Requires=pdg-rescue.socket
 After=pdg-rescue.socket
+# 重启不设速率上限。这个键属于 [Unit] —— 写在 [Service] 里 systemd 会当成未知键忽略
+# (252 上原样报 "Unknown key 'StartLimitIntervalSec' in section [Service]"), 于是默认的
+# 10 秒 5 次仍然生效: 救援服务连着起不来几次就被判 failed 而**不再拉起**, 偏偏那正是需要它的
+# 时刻。放对位置由 tests/e2e-rescue-10b.sh 用 systemctl show 核实际生效值。
+StartLimitIntervalSec=0
 
 [Service]
 ExecStart=/usr/bin/python3 /opt/pdg-bot/rescue.py
 Restart=always
 RestartSec=2
-StartLimitIntervalSec=0
-# 硬化。RestrictAddressFamilies 必须含 AF_NETLINK: 后续提交里恢复类操作会调 nft(子进程也在
-# 本 unit 的 cgroup 里, 限制一样管到它); AF_UNIX 给 systemctl。为形式上的加固把恢复功能封死
-# 是本末倒置 —— 具体放行项由 tests/test-rescue-hardening 真跑验证。
+# 硬化。RestrictAddressFamilies 必须含 AF_NETLINK: 恢复类操作会调 nft(子进程也在本 unit 的
+# cgroup 里, 限制一样管到它); AF_UNIX 给 systemctl。为形式上的加固把恢复功能封死是本末倒置
+# —— 具体放行项由 tests/e2e-rescue-10b.sh 在真 systemd 下逐条真跑验证。
 ProtectSystem=strict
-ReadWritePaths=/var/lib/privdns-gateway /run /etc/privdns-gateway /etc/mosdns /etc/mihomo /etc/sing-box /etc/systemd/system /etc/nftables.conf /etc/sysctl.d
+# 每一项都带 `-` 前缀: 路径不存在时**忽略**, 而不是整个服务起不来。
+# 不带前缀的后果是致命的 —— systemd 建挂载命名空间时遇到缺失路径直接 226/NAMESPACE:
+#   pdg-rescue.service: Failed to set up mount namespacing: /etc/mihomo: No such file or directory
+# 而"某个目录不存在"在真机上太常见了: v1.6 起纯 mihomo 装机根本没有 /etc/sing-box, 换内核
+# 之后没有 /etc/mosdns, 全新机器上还没有 /etc/nftables.conf。于是救援平面会在**配置最乱的
+# 那台机器上**恰好起不来 —— 那正是它唯一被需要的场合。缺目录本来也写不了, 忽略它没有损失。
+ReadWritePaths=-/var/lib/privdns-gateway -/run -/etc/privdns-gateway -/etc/mosdns -/etc/mihomo -/etc/sing-box -/etc/systemd/system -/etc/nftables.conf -/etc/sysctl.d
 ProtectHome=yes
 PrivateTmp=yes
 NoNewPrivileges=yes

@@ -252,6 +252,12 @@ jobs:
       - name: "紧急默认出口 (只改 route.final/三目标同事务/原值不被覆盖/stale 拒绝)"
         run: python3 tests/test-emergency-exit.py
 
+      # 10b 硬门: 需要真 systemd(PID 1) + 真 nft + root。runner 上三者齐备就真跑;
+      # 缺任何一样脚本自己 [SKIP] 并说明 —— 但**跳过不等于验收**, 正式记录在
+      # docs/rescue-plane-acceptance.md, 那里只写真跑过的结论。
+      - name: "救援平面 10b 硬门 (真 socket activation/硬化/真 nft; 环境不足则 SKIP)"
+        run: sudo -E bash tests/e2e-rescue-10b.sh
+
       - name: "运行模块安装闭包 (真实入口传递依赖 vs 安装真源, 含动态导入点)"
         run: python3 tests/test-install-closure.py
 

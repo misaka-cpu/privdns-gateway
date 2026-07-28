@@ -38,29 +38,53 @@
 
 ---
 
-## 二、10b 硬门(**尚未验收**)
+## 二、10b 硬门(**已验收 · 2026-07-28**)
 
-需要真 systemd 与真 nftables 的机器。沙盒里的桩只能证明"我们的代码按预期调用了它们",
-证明不了"systemd/nft 真的那样做"。以下每一条在跑通之前,都不许记作已验证。
+跑法:`sudo bash tests/e2e-rescue-10b.sh`(48 条断言全绿)。
+环境:Debian 12 / Linux 6.1.0-35-cloud-amd64 / **systemd 252** / **nftables v1.0.6**,
+真 PID 1 的 systemd,真内核 nft。隔离靠两个 netns + veth(客户端与网关分处两侧,流量真的过
+网卡进 input 钩子)、`/run/systemd/system` 下的易失 unit、`/run` 下的沙盒目录;
+脚本自带守卫复核宿主的 `/etc/privdns-gateway`、`/opt/pdg-bot` 与内核表全程未被改动。
+unit 正文与生产渲染逐字节一致,沙盒差异只走 drop-in。
+
+**这一轮抓到三个真缺陷**(都已修,各自有负控):
+
+1. `ReadWritePaths` 没带 `-` 前缀 → 目录不存在时整个服务 `226/NAMESPACE` 起不来。
+   纯 mihomo 装机没有 `/etc/sing-box`、换内核后没有 `/etc/mosdns`、新机器没有
+   `/etc/nftables.conf` —— 救援平面偏偏会在**配置最乱的那台机器上**起不来。
+2. `StartLimitIntervalSec=0` 写在 `[Service]`,systemd 当未知键**静默忽略**
+   (252 原话:`Unknown key 'StartLimitIntervalSec' in section [Service]`),默认 10 秒 5 次
+   仍然生效 —— 连崩几次就被判 failed 而不再拉起。已挪到 `[Unit]`,并用 `systemctl show`
+   核实际生效值。
+3. **独立表的 `accept` 盖不过另一张表的 `policy drop`**。nftables 同一 hook 上的多条基链会
+   挨个走完,`accept` 只终止本链。于是恢复一份 5.2 之前的旧防火墙(`inet pdg` 里没有救援
+   放行)之后,救援口**实测不可达** —— "恢复整份旧防火墙不会顺手切断救援入口"这个核心承诺
+   当时是假的。现在除独立表外,还往每条 `policy drop` 的 input 基链链首补一条带标记的放行,
+   幂等且可按标记精确撤销(不碰用户自己写的同端口规则)。
 
 ### systemd socket activation
-- [ ] 真 socket activation:socket 常驻监听,service 由连接触发
-- [ ] `Accept=no` 语义下按需拉起(一个 service 实例处理后续连接,不是每连接一个)
-- [ ] 空闲时 service 就是 `inactive` —— 这是健康态,监控与文案都按此判
-- [ ] `FreeBind=true`:绑定地址在网卡起来之前也能 listen
-- [ ] service 崩溃后 socket 仍在监听,下一次连接能重新拉起
-- [ ] `enable` / `disable` / `update` / `uninstall` 在真 systemd 上的行为与沙盒一致
+- [x] 真 socket activation:socket 常驻监听,service 由连接触发(`ss` 在 netns 里看得见监听口)
+- [x] `Accept=no` 语义下按需拉起:第二次连接由**同一个 PID** 处理,且没有 `pdg-rescue@N` 实例单元
+- [x] 空闲时 service 就是 `inactive` —— 首次连接前实测 inactive,这是健康态
+- [x] `FreeBind=true`:把地址从网卡删掉后 socket 照样 start 成功,地址补回来即可服务
+- [x] service 崩溃(`kill -9`)后 socket 仍 active,下一次连接由**新 PID** 服务
+- [x] `enable` / `disable --now` 在真 systemd 上的行为:disable 后监听口真的消失、连不进来
 
-### 服务硬化
-- [ ] `ProtectSystem=strict` 下服务仍能读写它该读写的东西
-- [ ] `ReadWritePaths` 覆盖到位(凭据目录、状态文件、事务暂存)
-- [ ] `RestrictAddressFamilies` 含 `AF_NETLINK` —— 少了它 nft 相关子进程会被拦
-- [ ] 硬化生效后 `nft` / `systemctl` 子进程仍可正常执行
+### 服务硬化(探针属性从生产 unit 逐行抓取后交给 `systemd-run`,不是手抄)
+- [x] `ProtectSystem=strict`:往 `/usr` 写被真内核拒绝
+- [x] `ReadWritePaths` 里的路径照常可写(硬化没把该写的地方一起封死)
+- [x] `RestrictAddressFamilies` 含 `AF_NETLINK`(能开),`AF_PACKET` 被拒(白名单确实生效)
+- [x] 硬化下 `nft` 与 `systemctl` 子进程仍可执行
+- [x] 生效值核对:`MemoryMax=67108864`、`TasksMax=16`、`StartLimitIntervalUSec=0`
 
 ### nftables
-- [ ] 真实 `nft -c` 对候选内容的校验(桩里恒真)
-- [ ] 真实应用、失败回滚、反复 enable 不产生重复规则
-- [ ] 私网地址上的真实绑定与来源约束(内网可达、其它来源不可达)
+- [x] 真实 `nft -c`:生产模板渲染出的整份配置通过;坏候选被拒
+- [x] 真实应用与失败回滚:校验失败后现网 ruleset 逐字节未变
+- [x] 反复注入不重复:内核规则数不变,**候选文本**里也只有一块一行(文件不会越堆越长)
+- [x] 私网绑定与来源约束:内网来源连得通、非内网来源被拦。
+      **先证前提再下结论** —— 撤掉 default-drop 后同一来源立刻连通,证明拦它的是防火墙
+      而不是路由(第一版正是因为删地址连带清掉了回程路由,"拦住"过一次假绿)
+- [x] 恢复旧快照后救援口仍可达(见上文第 3 条缺陷),补入行仍带来源约束、幂等、可精确撤销
 
 ---
 
