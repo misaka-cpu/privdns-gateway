@@ -2493,7 +2493,12 @@ print(rescue_nft.count_rules(open(sys.argv[1], encoding="utf-8", errors="surroga
                              int(sys.argv[2])))
 PYC
 }
-_rescue_nft_count_kernel(){ nft list table inet pdg 2>/dev/null | grep -c 'comment "pdg-rescue"'; }
+_rescue_nft_count_kernel(){
+  # grep -c 计数为 0 时退出码是 1 —— 调用处若写了 `|| echo ?`, 就会在数字后面再打一个 "?",
+  # 事故现场读到 "0 ?" 只会更慌。这里把退出码吞掉, 只输出数字。
+  local n; n="$(nft list table inet pdg 2>/dev/null | grep -c 'comment "pdg-rescue"' || true)"
+  printf '%s' "${n:-0}"
+}
 
 # 旧版独立表 inet pdgrescue 的清理(幂等)。0=没有或已清掉; 1=同名但形态不是我们生成的 → 不动它。
 # 为什么必须清: 它挂在 input hook 上, doctor 会判成冲突, 于是启用救援平面的机器每次
@@ -2896,7 +2901,10 @@ _rescue_status(){
     *) printf "  %-14s %s\n" "用户意图" "未记录(从未部署过 —— 下次 pdg update 会按默认启用)";;
   esac
   printf "  %-14s %s\n" "socket unit"  "$(_rescue_socket_present && echo 已安装 || echo 缺失)"
-  printf "  %-14s %s\n" "socket 状态"  "${sock:-unknown} / $(systemctl is-enabled "$PDG_RESCUE_SOCKET_UNIT" 2>/dev/null || echo disabled)"
+  # is-enabled 失败时**自己也会打印** "disabled", 再 `|| echo disabled` 就成了两行 ——
+  # 命令替换把换行原样带进 printf, status 里凭空多出一行孤零零的 disabled。
+  local sock_en; sock_en="$(systemctl is-enabled "$PDG_RESCUE_SOCKET_UNIT" 2>/dev/null | head -1)"
+  printf "  %-14s %s\n" "socket 状态"  "${sock:-unknown} / ${sock_en:-disabled}"
   # socket activation(Accept=no)下 service 平时就是 inactive: socket 在监听, 有请求才拉起
   # 它。把这种正常状态显示成"服务未运行", 会让人以为救援平面坏了而去反复重启 —— 真正该
   # 报的是 failed(起过并且失败了), 那和"闲着"完全是两回事, 必须分开说。
@@ -2924,8 +2932,8 @@ _rescue_status(){
   else
     printf "  %-14s %s\n" "监听地址"   "（未配置 —— 不能启用; sudo pdg rescue bind <IPv4>）"
   fi
-  printf "  %-14s %s\n" "nft 磁盘规则" "$(_rescue_nft_count_disk 2>/dev/null || echo ?) 条(带 pdg-rescue 标记)"
-  printf "  %-14s %s\n" "nft 内核规则" "$(_rescue_nft_count_kernel 2>/dev/null || echo ?) 条"
+  printf "  %-14s %s\n" "nft 磁盘规则" "$(_rescue_nft_count_disk 2>/dev/null || printf ?) 条(带 pdg-rescue 标记)"
+  printf "  %-14s %s\n" "nft 内核规则" "$(_rescue_nft_count_kernel 2>/dev/null || printf ?) 条"
   printf "  %-14s %s\n" "应用层来源校验" "已启用(只认内核给的 peer 地址, 不看 X-Forwarded-For)"
   if nft list tables 2>/dev/null | grep -q "inet pdgrescue" \
      || grep -q "table inet pdgrescue" /etc/nftables.conf 2>/dev/null; then

@@ -198,6 +198,11 @@ for kw in "socket unit" "socket 状态" "service 状态" "监听地址" "来源�
   grep -q "$kw" <<<"$st" || { bad "status 缺少: $kw"; break; }
 done
 grep -q "证书指纹" <<<"$st" && ok "status 分项报告 unit/socket/监听/防火墙/凭据(不只看 is-active)"
+# 每行都必须是 "  <项目>  <值>" 的形状: 命令替换把多行结果带进 printf 会凭空多出孤行
+# (实机上就出现过多打一行 disabled、内核规则数后面跟个 "?"), 事故现场读到这种输出只会更慌。
+stray="$(grep -vE '^(==|  \S)' <<<"$st" | grep -v '^$' | head -3)"
+if [[ -z "$stray" ]]; then ok "status 没有孤行/游离字符(每行都是「项目 值」)"
+else bad "status 出现孤行: $(tr '\n' '|' <<<"$stray")"; fi
 # 秘密泄漏用哨兵判, 不用"看起来像 base64"这种启发式: 把哨兵塞进 token 与私钥, 再看它有没有
 # 从任何一个出口漏出来 —— status、fingerprint、以及审计/事务日志。
 tok_bak="$(cat "$BOX/etc/privdns-gateway/rescue/token")"
