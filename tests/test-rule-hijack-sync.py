@@ -16,6 +16,8 @@ custom_direct.txt, 所以"设直连"一直是好的 —— 正是这个不对称
 import importlib.util
 import json
 import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -120,10 +122,34 @@ def main():
     assert "custom_hijack.txt" in seg, "mosdns 模板的 hijack_set 未纳入 custom_hijack.txt"
     ok("mosdns 模板: hijack_set 纳入 custom_hijack.txt")
 
-    # ── install.sh 要建这个文件 ──
+    # ── install.sh 要保证这个文件存在 ──
+    # 不按字符串找 "custom_hijack.txt": 装机那段现在是"存在就保留、不存在才建"的循环, 文件名
+    # 由变量拼出来。真正要验的是**跑完之后文件在不在**, 所以把那段真跑一遍(路径指到沙盒)。
     inst = (ROOT / "install.sh").read_text(encoding="utf-8")
-    assert "custom_hijack.txt" in inst, "install.sh 未创建 custom_hijack.txt"
-    ok("install.sh: 创建 custom_hijack.txt")
+    i = inst.index("_kept_rules=(); _new_rules=()")
+    j = inst.index("(( ${#_new_rules[@]} ))")
+    j = inst.index("\n", j)
+    blk = inst[i:j]
+    import tempfile as _tf
+    box = _tf.mkdtemp(prefix="ruleinit.")
+    try:
+        os.makedirs(os.path.join(box, "etc/mosdns/rules"), exist_ok=True)
+        script = ("source %s/lib/preserve.sh\nc_g(){ :; }\n" % ROOT) + \
+                 blk.replace("/etc/mosdns/rules", os.path.join(box, "etc/mosdns/rules"))
+        r = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+        made = sorted(os.listdir(os.path.join(box, "etc/mosdns/rules")))
+        assert r.returncode == 0, (r.returncode, r.stderr[:200])
+        assert "custom_hijack.txt" in made, made
+        ok("install.sh 跑完之后 custom_hijack.txt 确实存在(真跑那段, 不是找字符串)")
+        # 已有内容的不许被清掉
+        f = os.path.join(box, "etc/mosdns/rules/custom_hijack.txt")
+        with open(f, "w", encoding="utf-8") as fh:
+            fh.write("kept.example\n")
+        subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+        assert open(f, encoding="utf-8").read() == "kept.example\n", "重跑把用户域名清空了"
+        ok("重跑装机不会清掉已有的劫持域名")
+    finally:
+        shutil.rmtree(box, ignore_errors=True)
 
     # ── 老装迁移: 把文件补进已有 config.yaml 的 hijack_set, 并回填已有出口域名 ──
     pdg = (ROOT / "deploy/bot/pdg.sh").read_text(encoding="utf-8")
