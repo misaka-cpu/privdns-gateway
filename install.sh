@@ -578,10 +578,17 @@ fi
 chown -R root:root /opt/privdns-gateway 2>/dev/null || true
 git config --system --get-all safe.directory 2>/dev/null | grep -qx '/opt/privdns-gateway' \
   || git config --system --add safe.directory /opt/privdns-gateway 2>/dev/null || true
-: > /etc/mosdns/rules/custom_direct.txt
-: > /etc/mosdns/rules/custom_hijack.txt   # bot 指到出口的域名(必须被 mosdns 劫持才会进代理)
-: > /etc/mosdns/rules/unlock.txt          # WDA 解锁域名集(空=休眠; bot『🔓 解锁走 WDA』填充)
-: > /etc/mosdns/rules/mitm_hijack.txt     # MITM 接管域名集(空=休眠; iOS 启用 MITM 插件时填充)
+# 规则集: **存在就保留**。重装的语义是"重新部署程序", 不是"把用户填的域名清空" ——
+# 这四个文件是 bot 指到出口的域名、WDA 解锁域名、以及 WLOC/MITM 的接管域名, 清掉之后
+# 分流与 WLOC 会静默退化, 而用户以为只是重装了一下程序(.200 实机上就这么丢过 WLOC 域名)。
+# shellcheck source=lib/preserve.sh
+source "$REPO_DIR/lib/preserve.sh"
+_kept_rules=(); _new_rules=()
+for _rf in custom_direct custom_hijack unlock mitm_hijack; do
+  if pdg_keep_or_init "/etc/mosdns/rules/$_rf.txt"; then _kept_rules+=("$_rf"); else _new_rules+=("$_rf"); fi
+done
+(( ${#_kept_rules[@]} )) && c_g "保留已有规则集: ${_kept_rules[*]}"
+(( ${#_new_rules[@]} ))  && echo "新建空规则集: ${_new_rules[*]}"
 
 # 内存模式(克制版): PDG_LOWMEM=auto(默认)|1|0; MemTotal ≤ 1300MiB 判低内存。持久化到 profile.env。
 # 只调确认安全的项: mosdns cache(8192/2048)+ journald 上限(50M/20M)。不动 sysctl/swap/MemoryMax。
@@ -723,7 +730,16 @@ render "$REPO_DIR/deploy/mosdns/config.yaml"          > /etc/mosdns/config.yaml
 # 留着门会退化成"只劫持 geosite 策展分类里的域名"。
 _mosdns_hijack_shape "$HIJACK_MODE" /etc/mosdns/config.yaml "$HIJACK_SET_FILE" >/dev/null \
   || die "mosdns 劫持形态渲染失败"
-render "$REPO_DIR/deploy/singbox/config.json.tmpl"    > /etc/sing-box/config.json   # 始终是 bot 的数据模型(mihomo 模式下也由它渲染)
+# 数据模型(出口 / 分流 / 默认出口的唯一数据源): 已有且有效 → **保留**, 绝不拿模板盖回去。
+# 拿模板覆盖等于把用户所有出口与规则换成默认值, 而它恰恰是最难重建的那份数据。
+if pdg_model_ok /etc/sing-box/config.json; then
+  c_g "保留已有数据模型 /etc/sing-box/config.json($(python3 -c "import json;print(len(json.load(open('/etc/sing-box/config.json'))['outbounds']))" 2>/dev/null || echo '?') 个出口, 出口/分流不动)"
+elif [[ -e /etc/sing-box/config.json ]]; then
+  die "已有 /etc/sing-box/config.json 解析不出出口 —— 拒绝用模板覆盖它(那会把你的出口与分流换成默认值)。
+   先修好或移走它再重装: cp -a /etc/sing-box/config.json /root/config.json.bak && rm /etc/sing-box/config.json"
+else
+  render "$REPO_DIR/deploy/singbox/config.json.tmpl"  > /etc/sing-box/config.json   # 全新安装才渲染
+fi
 # iOS: 模板含 GMS(in-gms-5228/5229/5230)入站, iOS 走 APNs 不需要 → 删掉, 让 canonical model 从一开始就无 GMS。
 if [[ "$PLATFORM" == ios ]]; then
   python3 - /etc/sing-box/config.json <<'PY'
@@ -777,7 +793,13 @@ chmod 644 /etc/systemd/system/pdg-bot.service        # 不再含 token (token �
 
 # token / 允许 id 写入受限的 bot.env (目录 700 / 文件 600), 不进 unit 也不进版本库
 install -d -m700 /etc/privdns-gateway
-( umask 077; printf 'PDG_BOT_TOKEN=%s\nPDG_BOT_ALLOWED=%s\n' "$BOT_TOKEN" "$ALLOWED_IDS" > /etc/privdns-gateway/bot.env )
+# 已有 token 就保留 —— 重装不该把 Telegram 凭据清掉(非交互重装时 BOT_TOKEN 往往是空的,
+# 旧写法会拿空值把它覆盖, 管理 bot 就此失联)。显式传了新 token 才更新。
+if [[ -z "${BOT_TOKEN:-}" ]] && pdg_bot_env_ok /etc/privdns-gateway/bot.env; then
+  c_g "保留已有 bot.env(Telegram token 与允许 id 不动)"
+else
+  ( umask 077; printf 'PDG_BOT_TOKEN=%s\nPDG_BOT_ALLOWED=%s\n' "$BOT_TOKEN" "$ALLOWED_IDS" > /etc/privdns-gateway/bot.env )
+fi
 chmod 600 /etc/privdns-gateway/bot.env
 install -m644 "$REPO_DIR"/deploy/bot/pdg-rules-update.service /etc/systemd/system/
 install -m644 "$REPO_DIR"/deploy/bot/pdg-rules-update.timer   /etc/systemd/system/
