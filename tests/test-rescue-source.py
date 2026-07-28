@@ -182,6 +182,47 @@ if "PDG_RESCUE_BIND" in src and "local_addr_in(cidr)" not in src:
 else:
     bad("rescue.py 里还留着从来源段推导的回落")
 
+# ── 4. install.sh 的监听地址决策 ────────────────────────────────────────────
+print()
+print("── 4. 装机时怎么定监听地址 ──")
+inst = open(os.path.join(ROOT, "install.sh"), encoding="utf-8").read()
+blk = inst[inst.index("RESCUE_BIND=\"${PDG_RESCUE_BIND:-}\""):inst.index("render(){ sed -e")]
+if "PDG_RESCUE_BIND" in blk and "pdg_rescue_bind " in blk:
+    ok("显式值(环境变量 / 已有 profile.env)优先")
+else:
+    bad("装机没有先看显式值")
+if "== 1 ))" in blk:
+    ok("来源段内**恰好一个**本机地址才自动决定")
+else:
+    bad("装机仍在从来源段里随便挑一个")
+if "$NONINT" in blk and "保持停用" in blk:
+    ok("非交互且含糊时: 保持停用并给出候选与设置方法(不猜)")
+else:
+    bad("非交互路径会猜一个地址")
+if "read -r -p" in blk and "暂不设置" in blk:
+    ok("交互安装列出候选让人选, 且允许暂不设置")
+else:
+    bad("交互路径没有让人选")
+# 只看**代码行**: 注释里必然要写"绝不用 0.0.0.0"来解释为什么, 按整段文本扫会把解释判成违规
+# 也要排除**提示文案**里的 0.0.0.0 —— 拒绝信息本来就要写清楚"禁止 0.0.0.0",
+# 把这句话当成违规, 只会逼人把错误信息写得含糊。真正要抓的是**赋值**给 bind 的通配地址。
+code = "\n".join(l for l in blk.splitlines()
+                 if not l.lstrip().startswith("#") and "c_y " not in l and "echo " not in l)
+if "0.0.0.0" not in code:
+    ok("装机路径的代码里没有任何通配地址回退")
+else:
+    bad("装机代码出现了通配地址: %r" % [l for l in code.splitlines() if "0.0.0.0" in l][:1])
+if "pdg_rescue_bind_is_global" in inst and "PDG_RESCUE_BIND=%s" in inst:
+    ok("全局地址给出警告, 且决定值会落盘到 profile.env(下次不再猜)")
+else:
+    bad("缺全局地址警告或未落盘")
+# 装机只在拿到地址后才启用救援平面
+tail = inst[inst.index("rescue_cred.py ensure"):]
+if 'if [[ -n "$RESCUE_BIND" ]]; then' in tail:
+    ok("拿不到监听地址时装上但**不启用**(不会开出一个没人能连的门)")
+else:
+    bad("没有'地址未定则不启用'的门")
+
 print("─" * 40)
 print("通过 %d, 失败 %d" % (PASS[0], FAIL[0]))
 if PASS[0] + FAIL[0] == 0:

@@ -641,15 +641,28 @@ printf '%s\n' "$PLATFORM" > /etc/privdns-gateway/platform
 # 救援平面的端口/路径常量来自 lib/rescue.sh(单一事实源, 不在这里另写字面量)。
 # shellcheck source=lib/rescue.sh
 source "$REPO_DIR/lib/rescue.sh"
-# 绑定地址: **必须**是本机上落在内网卡段内的那个地址。绝不用 0.0.0.0/:: —— 救援入口开到公网
-# 上就是把恢复按钮交给任何人。找不到就让它空着, 由 preflight 拒绝启动并说明原因。
-RESCUE_BIND="$(python3 - "$INTERNAL_CIDR" <<'PYBIND'
-import ipaddress, socket, subprocess, sys
+# 监听地址与来源段是**两件事**(5.2/10b 实机结论):
+#   INTERNAL_CIDR = 允许连进来的客户端网段(运营商内网卡);
+#   RESCUE_BIND   = 救援 socket 绑的本机地址。
+# 真实网关上后者往往不在前者里 —— 早期版本"从来源段里挑一个本机地址"在那种机器上要么什么
+# 都挑不到(救援平面装了也用不了), 要么挑中一个恰好落在段内的**别的**接口地址(实机上就捡到过
+# 一个测试用的 veth 地址, 于是监听开在了一个没人能连的地方)。所以: 显式值优先, 唯一候选才
+# 自动决定, 含糊时**问人**, 非交互就留空并保持停用。绝不用 0.0.0.0/::。
+RESCUE_BIND="${PDG_RESCUE_BIND:-}"
+[[ -z "$RESCUE_BIND" ]] && RESCUE_BIND="$(pdg_rescue_bind 2>/dev/null || true)"   # 已有配置沿用
+if [[ -n "$RESCUE_BIND" ]] && ! pdg_rescue_bind_valid "$RESCUE_BIND"; then
+  c_y "PDG_RESCUE_BIND=$RESCUE_BIND 不是合法的 IPv4 监听地址(禁止主机名/0.0.0.0/广播/组播), 忽略。"
+  RESCUE_BIND=""
+fi
+if [[ -z "$RESCUE_BIND" ]]; then
+  mapfile -t _rb_in < <(python3 - "$INTERNAL_CIDR" <<'PYBIND'
+import ipaddress, subprocess, sys
 try:
     net = ipaddress.ip_network(sys.argv[1], strict=False)
 except Exception:
     sys.exit(0)
-out = subprocess.run(["ip", "-4", "-o", "addr", "show"], capture_output=True, text=True).stdout
+out = subprocess.run(["ip", "-4", "-o", "addr", "show", "scope", "global"],
+                     capture_output=True, text=True).stdout
 for line in out.splitlines():
     parts = line.split()
     for i, tok in enumerate(parts):
@@ -659,10 +672,44 @@ for line in out.splitlines():
             except ValueError:
                 continue
             if ip in net:
-                print(ip); sys.exit(0)
+                print(ip)
 PYBIND
-)"
-[[ -n "$RESCUE_BIND" ]] || c_y "没找到落在 $INTERNAL_CIDR 内的本机地址 —— 救援平面装上但暂不可用, 内网卡就绪后跑 sudo pdg rescue enable。"
+)
+  if (( ${#_rb_in[@]} == 1 )); then
+    RESCUE_BIND="${_rb_in[0]}"          # 来源段内**恰好一个**本机地址 → 沿用旧的安全路径
+  else
+    mapfile -t _rb_all < <(ip -4 -o addr show scope global 2>/dev/null | awk '{split($4,a,"/"); print $2" "a[1]}')
+    if [[ -n "$NONINT" ]]; then
+      c_y "未指定救援监听地址(PDG_RESCUE_BIND), 且来源段 $INTERNAL_CIDR 内有 ${#_rb_in[@]} 个本机地址 —— 不猜。"
+      c_y "  救援平面照常装上但**保持停用**。本机可选地址:"
+      printf '     %s\n' "${_rb_all[@]}"
+      c_y "  设好即可启用: sudo pdg rescue bind <IPv4>"
+    else
+      echo
+      c_y "救援平面要绑在哪个本机地址上?(它与来源段 $INTERNAL_CIDR 是两件事: 来源段管谁能连)"
+      local_i=1
+      for _l in "${_rb_all[@]}"; do echo "   $local_i) $_l"; local_i=$((local_i+1)); done
+      echo "   0) 暂不设置(装上但停用, 之后用 sudo pdg rescue bind <IPv4>)"
+      read -r -p "选择 [0-$(( ${#_rb_all[@]} ))]: " _pick || _pick=0
+      if [[ "$_pick" =~ ^[0-9]+$ ]] && (( _pick >= 1 && _pick <= ${#_rb_all[@]} )); then
+        RESCUE_BIND="$(awk '{print $2}' <<<"${_rb_all[$((_pick-1))]}")"
+      fi
+    fi
+  fi
+fi
+if [[ -n "$RESCUE_BIND" ]]; then
+  pdg_rescue_bind_is_global "$RESCUE_BIND" \
+    && c_y "⚠️ 救援监听地址 $RESCUE_BIND 是全局可路由地址: 端口会暴露在该地址上, 由 nft 来源约束与应用层来源校验两层兜底。"
+  # 落盘到真源。不落的话 pdg / 救援服务下次读不到, 又会退回"从来源段猜"的老路 ——
+  # 装机时渲染进 unit 的地址与后续读到的地址必须是同一个, 否则没人看得出为什么连不上。
+  _rb_tmp="$(mktemp /etc/privdns-gateway/.profile.env.XXXXXX)" || die "创建 profile.env 临时文件失败"
+  { printf 'PDG_RESCUE_BIND=%s\n' "$RESCUE_BIND"
+    grep -vE '^[[:space:]]*PDG_RESCUE_BIND=' /etc/privdns-gateway/profile.env 2>/dev/null || true
+  } > "$_rb_tmp" || { rm -f "$_rb_tmp"; die "写 PDG_RESCUE_BIND 失败"; }
+  chmod 600 "$_rb_tmp"; mv -f "$_rb_tmp" /etc/privdns-gateway/profile.env || die "落盘 PDG_RESCUE_BIND 失败"
+  grep -q "^PDG_RESCUE_BIND=$RESCUE_BIND$" /etc/privdns-gateway/profile.env \
+    || die "profile.env 未写入预期的 PDG_RESCUE_BIND"
+fi
 
 render(){ sed -e "s|__SERVER_IP__|$SERVER_IP|g" -e "s|__INTERNAL_CIDR__|$INTERNAL_CIDR|g" \
               -e "s|__CERT_DIR__|$CERT_DIR|g"   -e "s|__SSH_PORT__|$SSH_PORT|g" \
