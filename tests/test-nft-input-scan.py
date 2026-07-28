@@ -575,10 +575,14 @@ table inet filter {
             raise AssertionError("uninstall.sh 里找不到锚点「%s」—— 要么它被删了(那正是本条要"
                                  "抓的回归), 要么改了写法需要同步这里" % what)
 
+        # 只取**两段**: nft 位置解析, 以及删内核表那一行。中间那段清理会真的读写
+        # /etc/nftables.conf —— 在这里整段执行等于让测试去动宿主的现网配置。
         bi = anchor(lambda ln: ln.startswith('_UN_NFT=""'), '_UN_NFT="" 位置解析')
-        bj = anchor(lambda ln: ln == "fi", "还原段收尾 fi",
-                    anchor(lambda ln: "nftables.conf.pdg-orig" in ln, "还原 nftables.conf", bi))
-        block = "\n".join(un_lines[bi:bj + 1])
+        bj = anchor(lambda ln: ln.startswith('[[ -n "$_UN_NFT" ]] || _UN_NFT='),
+                    "nft 位置解析的兜底行", bi)
+        dk = anchor(lambda ln: "delete table inet pdg" in ln and "_UN_NFT" in ln,
+                    "删内核 inet pdg 表那一行", bj)
+        block = "\n".join(un_lines[bi:bj + 1] + [un_lines[dk]])
         assert "delete table inet pdg" in block and "pdg_nft_bin" in block, "取块没覆盖删表与位置解析"
         assert "command -v nft >/dev/null" not in block, "uninstall 又退回只看 PATH 了: %s" % block
         open(log, "w").close()
