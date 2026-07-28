@@ -111,7 +111,7 @@ N
   echo '_pdg_mktemp_dir(){ mktemp -d; }'
   for fn in _profile_set _rescue_load _rescue_bind_addr _rescue_bind_candidates \
             _rescue_bind_from_cidr _rescue_set_bind _rescue_listen_addr \
-            _rescue_intent _rescue_intent_set \
+            _rescue_refresh_units _rescue_intent _rescue_intent_set \
             _rescue_optout _rescue_intent_migrate _rescue_socket_present \
             _rescue_write_units _rescue_nft_has _rescue_nft_has_kernel \
             _rescue_nft_count_disk _rescue_nft_count_kernel _rescue_nft_drop_legacy \
@@ -879,6 +879,28 @@ for probe in "bind 10.9.8.7" "rotate cert" "rotate token" "status"; do
   if [[ "$got" == "$want" ]]; then ok "pdg rescue $probe → 参数原样送达($got)"
   else bad "pdg rescue $probe 参数丢了: 期望 '$want' 实得 '$got'"; fi
 done
+
+# ══ 16d. unit 模板改了, 迁移要把它刷到盘上 ═════════════════════════════════
+echo; echo "── 16d. unit 刷新 ──"
+# pdg update 只装运行模块, 不重渲染已安装的 unit —— 于是 unit 模板里的修复(硬化项、
+# TimeoutStopSec、监听形态)永远到不了已经装好的机器: 改了等于没改。.200 实机上就是这样,
+# TimeoutStopSec 一直是 systemd 默认的 90 秒。
+run 'cmd_rescue enable' >/dev/null
+U="$BOX/etc/systemd/system/pdg-rescue.socket"
+# 把盘上的 unit 改旧(模拟"机器上装的是旧模板")
+sed -i '/^FreeBind=/d' "$U"
+if ! grep -q "^FreeBind=true" "$U"; then ok "(前提)盘上的 unit 已被改成缺少 FreeBind 的旧形态"
+else bad "(前提)没造出旧 unit"; fi
+run 'migrate_rescue_plane' >/dev/null
+if grep -q "^FreeBind=true" "$U"; then
+  ok "迁移把 unit 重新渲染到最新模板(否则 unit 层面的修复永远到不了已装机器)"
+else bad "迁移没有刷新 unit: $(grep -c . "$U") 行, 仍缺 FreeBind"; fi
+# 内容没变时不许瞎重启 —— 每次 update 都重启 socket 会平白打断可能正在服务的连接
+: > "$STATE/systemctl.log"
+run 'migrate_rescue_plane' >/dev/null
+if ! grep -qE '^restart .*pdg-rescue\.socket' "$STATE/systemctl.log"; then
+  ok "unit 没变化时迁移不重启 socket(不平白打断在用的连接)"
+else bad "内容没变也重启了: $(tr '\n' '|' < "$STATE/systemctl.log" | cut -c1-80)"; fi
 
 # ══ 17. 沙盒边界声明(10b 硬门)═══════════════════════════════════════════════
 echo; echo "── 17. 沙盒边界 ──"

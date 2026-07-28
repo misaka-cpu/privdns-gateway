@@ -1527,6 +1527,11 @@ migrate_rescue_plane(){
   # service 当判据的话, 每次 update 都会认定它没起来而重跑一遍 enable, 于是凭据被重新生成、
   # 证书指纹变掉, 用户下次访问看到指纹不一致, 只能怀疑自己遇上了中间人。
   # 只看 is-enabled 同样不够: 服务崩掉之后它仍然是 enabled, 那种情况恰恰是要救回来的。
+  # unit 模板改了就要刷到盘上。update 只装运行模块、不碰已安装的 unit —— 于是 unit 层面的
+  # 修复(硬化项、TimeoutStopSec、监听形态)永远到不了已经装好的机器, 改了等于没改
+  # (.200 实机上 TimeoutStopSec 一直停在 systemd 默认的 90 秒)。
+  # 只有**内容真的不同**才重写并重启 socket: 每次 update 都重启会平白打断在用的连接。
+  _rescue_refresh_units "$bind"
   if _rescue_socket_present \
      && systemctl is-enabled "$PDG_RESCUE_SOCKET_UNIT" >/dev/null 2>&1 \
      && systemctl is-active "$PDG_RESCUE_SOCKET_UNIT" >/dev/null 2>&1 \
@@ -2887,6 +2892,28 @@ _rescue_set_bind(){
   fi
   _rescue_enable >/dev/null 2>&1 || true
   return 1
+}
+
+# 盘上的 unit 与当前模板渲染结果不一致时重写(内容相同则一个字节都不动)。
+# 返回 0 = 有更新并已重启 socket; 1 = 无需更新/不适用。
+_rescue_refresh_units(){
+  local bind="${1:-}"; [[ -n "$bind" ]] || return 1
+  _rescue_socket_present || return 1                 # 没装过就不是"刷新"的事
+  local tmp; tmp="$(_pdg_mktemp_dir)" || return 1
+  local dst="$UNIT_DIR" changed=0 u
+  UNIT_DIR="$tmp" _rescue_write_units "$bind" >/dev/null 2>&1 || { rm -rf "$tmp"; return 1; }
+  for u in "$PDG_RESCUE_SOCKET_UNIT" "$PDG_RESCUE_SERVICE_UNIT"; do
+    if ! cmp -s "$tmp/$u" "$dst/$u" 2>/dev/null; then
+      cp -f "$tmp/$u" "$dst/$u" && changed=1
+    fi
+  done
+  rm -rf "$tmp"
+  (( changed == 1 )) || return 1
+  c_g "  救援 unit 已按新模板刷新(硬化项/停止期限等修复会在这里落到已装机器上)"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl is-active "$PDG_RESCUE_SOCKET_UNIT" >/dev/null 2>&1 \
+    && systemctl restart "$PDG_RESCUE_SOCKET_UNIT" >/dev/null 2>&1
+  return 0
 }
 
 # **真实**在监听的地址(不是 unit 文件里写的那个)。核对切换是否生效必须看这个 ——
