@@ -845,6 +845,29 @@ S
 chmod 755 "$BIN/systemctl"
 run 'cmd_rescue enable' >/dev/null
 
+# ══ 16c. CLI 分发把参数原样交给 cmd_rescue ═════════════════════════════════
+echo; echo "── 16c. CLI 参数传递 ──"
+# 前面所有小节都是直接调 cmd_rescue, **绕过了命令行分发那一行**。实机上就在这里翻了车:
+# 分发写成 `cmd_rescue "$2"` 只传子命令, 于是 `pdg rescue bind 1.2.3.4` 拿不到地址,
+# 而 `pdg rescue rotate cert` 更糟 —— 参数丢了以后默认成 token, 用户要求换证书, 实际换的
+# 是 token(会话全断、指纹却没变)。这里跑**真正的 pdg.sh 分发行**, 只把 cmd_rescue 换成回显。
+DISP="$WORK/disp.sh"
+python3 - "$ROOT/deploy/bot/pdg.sh" "$DISP" <<'PY'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+t = open(src, encoding="utf-8").read()
+i = t.rindex("\ncase ")            # 文件末尾的命令分发
+stub = ('\nneed_root(){ :; }\n_rescue_load(){ :; }\n'
+        'cmd_rescue(){ echo "RESCUE-ARGS:$*"; exit 0; }\n')
+open(dst, "w", encoding="utf-8").write(t[:i] + stub + t[i:])
+PY
+for probe in "bind 10.9.8.7" "rotate cert" "rotate token" "status"; do
+  got="$(bash "$DISP" rescue $probe 2>&1 | grep '^RESCUE-ARGS:' | head -1)"
+  want="RESCUE-ARGS:$probe"
+  if [[ "$got" == "$want" ]]; then ok "pdg rescue $probe → 参数原样送达($got)"
+  else bad "pdg rescue $probe 参数丢了: 期望 '$want' 实得 '$got'"; fi
+done
+
 # ══ 17. 沙盒边界声明(10b 硬门)═══════════════════════════════════════════════
 echo; echo "── 17. 沙盒边界 ──"
 DOC="docs/rescue-plane-acceptance.md"     # 硬门的正式登记在文档里, 这里只是引用

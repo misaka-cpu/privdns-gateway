@@ -3272,6 +3272,9 @@ case "${1:-menu}" in
   platform)      shift || true; cmd_platform "${1:-}";;
   hijack-mode)   shift || true; cmd_hijack_mode "${1:-}";;
   uninstall|rm)  shift || true; cmd_uninstall "${1:-}";;
-  rescue)        cmd_rescue "$2";;
+  # 必须 shift + "$@": 只传 "$2" 会把子命令后面的参数全丢掉 —— `pdg rescue bind 1.2.3.4`
+  # 拿不到地址, 而 `pdg rescue rotate cert` 会因为参数丢失退化成默认的 token 轮换:
+  # 用户要求换证书, 实际换掉的是 token(会话全断, 指纹却没变)。
+  rescue)        shift || true; cmd_rescue "$@";;
   *) echo "用法: pdg [menu|status|doctor [--json|--deep]|update [--dry-run]|snapshot|rollback [n]|token|restart|log [n]|traffic|ios(仅 iOS)|report [--redact-ip|--full]|detect-cidr|platform <ios|android>|hijack-mode <all|gfw>|migrate|migrate-fw|tx <list|show|recover|abort>|rescue <enable|disable|status|fingerprint|bind <IPv4>|rotate-token|rotate-cert>|uninstall [--purge]]";;
 esac
