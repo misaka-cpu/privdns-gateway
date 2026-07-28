@@ -155,28 +155,44 @@ pdg_rescue_cleanup(){
   local root="${1:-}" nftbin="${2:-}" residue=() m target conf
   conf="$root/etc/nftables.conf"
 
-  # 1) 磁盘配置里我们注入的独立表: 用 rescue_nft.py 靠 BANNER 定界整块摘掉。
-  #    **绝不按端口 grep -v 删行** —— 用户完全可能自己写过一条同端口放行, 那是他的规则。
-  #    删除动作发生在清运行文件之前, 否则要用的 rescue_nft.py 已经被自己删掉了。
-  if [[ -f "$conf" ]] && grep -q "table inet $PDG_RESCUE_TABLE" "$conf" 2>/dev/null; then
-    local nftpy=""
-    for m in "$root/opt/pdg-bot/rescue_nft.py" "${PDG_RESCUE_REPO:-}/deploy/bot/rescue_nft.py"; do
-      [[ "$m" == /deploy/* ]] && continue
-      [[ -f "$m" ]] && { nftpy="$m"; break; }
-    done
+  # 1) 磁盘配置里**我们注入的一切**: 链内标记规则 + (老机器上可能还有的)旧独立表。
+  #    条件绝不能只看旧表在不在 —— 新形态下根本没有旧表, 那样写等于卸载完全不碰配置,
+  #    链内规则连同放行一起留在盘上(这条正是接手复核时抓到的)。
+  #    删除靠标记精确定位, **绝不按端口 grep -v 删行**: 用户完全可能自己写过同端口放行。
+  #    这一步必须发生在清运行文件之前, 否则要用的 rescue_nft.py 已经被自己删掉了。
+  local nftpy=""
+  for m in "$root/opt/pdg-bot/rescue_nft.py" "${PDG_RESCUE_REPO:-}/deploy/bot/rescue_nft.py"; do
+    [[ "$m" == /deploy/* ]] && continue
+    [[ -f "$m" ]] && { nftpy="$m"; break; }
+  done
+  local had_ours=0
+  if [[ -f "$conf" ]]; then
+    grep -q 'comment "pdg-rescue"' "$conf" 2>/dev/null && had_ours=1
+    grep -q "table inet $PDG_RESCUE_TABLE" "$conf" 2>/dev/null && had_ours=1
+  fi
+  if (( had_ours == 1 )); then
     if [[ -n "$nftpy" ]] && python3 "$nftpy" --strip < "$conf" > "$conf.pdg-un" 2>/dev/null \
-       && mv -f "$conf.pdg-un" "$conf"; then :
+       && mv -f "$conf.pdg-un" "$conf"; then
+      :
     else
       rm -f "$conf.pdg-un" 2>/dev/null
-      residue+=("$conf 里的 table inet $PDG_RESCUE_TABLE —— 请手工删掉该块后 nft -f 重载")
+      residue+=("$conf 里本项目注入的救援放行 —— 请手工删掉带 pdg-rescue 标记的规则后 nft -f 重载")
     fi
   fi
 
-  # 2) 内核里那张表。磁盘清了内核没清的话, 规则此刻仍然生效, 而用户从配置文件上完全看不出
-  #    为什么 —— 与 uninstall 处理 inet pdg 是同一个道理。
+  # 2) 内核。磁盘清了内核没清的话规则此刻仍然生效, 而用户从配置文件上完全看不出为什么。
+  #    链内规则跟着整份配置重新应用即可(模板里 delete+重建 inet pdg, 内核随之收敛);
+  #    旧独立表不在配置里, 得单独删。
   [[ -n "$nftbin" ]] || nftbin="$(command -v nft 2>/dev/null || true)"
   if [[ -z "$root" && -n "$nftbin" ]]; then
+    if (( had_ours == 1 )) && [[ -f "$conf" ]]; then
+      "$nftbin" -f "$conf" 2>/dev/null \
+        || residue+=("内核里的救援放行未能撤销(nft -f $conf 失败)—— 请手工重载防火墙")
+    fi
     "$nftbin" delete table inet "$PDG_RESCUE_TABLE" 2>/dev/null || true   # 本来就没有 → 不算残留
+    if "$nftbin" list table inet pdg 2>/dev/null | grep -q 'comment "pdg-rescue"'; then
+      residue+=("内核 inet pdg 链里仍有带 pdg-rescue 标记的规则")
+    fi
   fi
 
   # 3) 凭据、状态、unit、全部运行模块 —— 逐条删并逐条复核

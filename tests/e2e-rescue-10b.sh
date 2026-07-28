@@ -456,6 +456,49 @@ if [[ "$(grep -c 'comment "pdg-rescue"' "$BOX/old-strip.conf")" == 0 ]] \
    && diff "$BOX/old-snap.conf" "$BOX/old-strip.conf" >/dev/null; then
   ok "--strip 之后逐字节回到旧快照原样(补入的行与独立表都摘净, 别人的规则没动)"
 else bad "strip 之后与原文不一致: $(diff "$BOX/old-snap.conf" "$BOX/old-strip.conf" | head -3 | tr '\n' ' ')"; fi
+# 旧独立表的真迁移: 先在**真内核**里造一张完整签名的旧表, 再走一次注入 → 必须消失
+cat > "$BOX/legacy.conf" <<L
+table inet pdgrescue
+delete table inet pdgrescue
+table inet pdgrescue {
+    chain input {
+        type filter hook input priority -10; policy accept;
+        ip saddr $CIDR tcp dport $RP accept
+    }
+}
+L
+NFTNS -f "$BOX/legacy.conf" 2>/dev/null
+if [[ -n "$(NFTNS list tables 2>/dev/null | grep pdgrescue)" ]]; then
+  ok "(前提)真内核里已存在旧独立表"; else bad "(前提)旧表没造出来"; fi
+# 迁移 = 生成新候选(strip 掉旧块)+ 应用 + 删掉内核里的旧表对象
+{ printf '# ==== PrivDNS Gateway 救援入口(独立表, 由救援平面维护; 完整恢复时自动保留) ====\n'
+  printf '# 与 table inet pdg 分开, 是为了让恢复整份旧防火墙不会顺手切断救援入口。\n'
+  cat "$BOX/legacy.conf"; cat "$BOX/etc/nftables.conf"; } > "$BOX/withlegacy.conf"
+python3 "$BOX/opt/pdg-bot/rescue_nft.py" "$CIDR" "$RP" "$GW_IP" \
+  < "$BOX/withlegacy.conf" > "$BOX/migrated.conf" 2>/dev/null
+if [[ "$(grep -c 'table inet pdgrescue' "$BOX/migrated.conf")" == 0 \
+   && "$(grep -c 'comment "pdg-rescue"' "$BOX/migrated.conf")" == 1 ]]; then
+  ok "迁移后的候选: 旧块已删、链内规则恰好一条"
+else bad "迁移候选形态不对: 旧表 $(grep -c 'table inet pdgrescue' "$BOX/migrated.conf") / 新规则 $(grep -c 'comment "pdg-rescue"' "$BOX/migrated.conf")"; fi
+NFTNS -f "$BOX/migrated.conf" 2>/dev/null
+NFTNS delete table inet pdgrescue 2>/dev/null      # 生产里由 _rescue_nft_drop_legacy 做
+if [[ -z "$(NFTNS list tables 2>/dev/null | grep pdgrescue)" ]]; then
+  ok "真内核里的旧独立表已删除(只删配置不删内核对象, 规则仍会生效)"
+else bad "内核里旧表还在"; fi
+# 同名但**形态不符**的表: fail-closed, 不许擅自删
+cat > "$BOX/foreign.conf" <<'L'
+table inet pdgrescue {
+    chain mine {
+        type filter hook forward priority 0; policy accept;
+        ip saddr 10.0.0.0/8 accept
+    }
+}
+L
+if ! python3 "$BOX/opt/pdg-bot/rescue_nft.py" "$CIDR" "$RP" "$GW_IP" \
+     < "$BOX/foreign.conf" > /dev/null 2>&1; then
+  ok "同名但非项目形态的表 → 注入 fail-closed(不擅自改别人的表)"
+else bad "把别人的同名表当成自己的处理了"; fi
+
 NFTNS -f "$BOX/cand1.conf" 2>/dev/null      # 恢复现场
 
 echo

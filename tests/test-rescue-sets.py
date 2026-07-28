@@ -341,6 +341,48 @@ if ci.count("prepare-mihomo.sh") == 1:
 else:
     bad("CI 里准备了 %d 次" % ci.count("prepare-mihomo.sh"))
 
+# ── 7. doctor 不给旧独立表开白名单 ─────────────────────────────────────────
+print()
+print("── 7. doctor 的 input 链冲突守卫 ──")
+# 旧独立表在迁移完成之前**仍然应该被报冲突** —— 那正是"这台机器还没迁完"的信号。
+# 给它开白名单等于把一个真实故障态改成静默, 而且会让 doctor 少管一类问题(用户自己建的
+# input 链)。这里直接跑判据函数, 不看源码字样。
+import importlib.util  # noqa: E402
+
+spec = importlib.util.spec_from_file_location("checks_mod",
+                                              os.path.join(ROOT, "deploy/bot/checks.py"))
+checks = importlib.util.module_from_spec(spec)
+sys.modules["checks_mod"] = checks
+sys.path.insert(0, os.path.join(ROOT, "deploy/bot"))
+spec.loader.exec_module(checks)
+import nftscan  # noqa: E402
+
+RPORT = subprocess.run(["bash", "-c", "source %s/lib/rescue.sh; echo $PDG_RESCUE_PORT" % ROOT],
+                       capture_output=True, text=True).stdout.strip()
+LEGACY_CONF = ("table inet pdg {\n"
+               "    chain input { type filter hook input priority 0; policy drop; }\n"
+               "}\n"
+               "table inet pdgrescue {\n"
+               "    chain input { type filter hook input priority -10; policy accept;\n"
+               "        ip saddr 10.0.0.0/8 tcp dport %s accept\n"
+               "    }\n"
+               "}\n" % RPORT)
+found = nftscan.scan_text(LEGACY_CONF, "")
+if found and any("pdgrescue" in x for x in found):
+    ok("扫描判据把遗留的 inet pdgrescue 认成 input 链冲突(未被放行)")
+else:
+    bad("遗留独立表没有被判为冲突: %r" % found)
+real = checks.nftscan.scan
+try:
+    checks.nftscan.scan = lambda *a, **k: (found, True)
+    st, name, msg = checks.check_nft_input_chains()
+finally:
+    checks.nftscan.scan = real
+if st == "fail" and "pdgrescue" in msg:
+    ok("doctor 对遗留独立表判 fail 并点名(没有白名单)")
+else:
+    bad("doctor 放过了遗留独立表: st=%s msg=%s" % (st, msg[:80]))
+
 print("─" * 40)
 print("通过 %d, 失败 %d" % (PASS[0], FAIL[0]))
 if PASS[0] + FAIL[0] == 0:

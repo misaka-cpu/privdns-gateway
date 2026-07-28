@@ -229,6 +229,13 @@ if ! grep -qE "dport $RP accept" "$BOX/etc/nftables.conf"; then
   ok "disable 后救援端口放行已撤销"; else bad "放行仍在"; fi
 if [[ -s "$BOX/etc/privdns-gateway/rescue/token" ]]; then
   ok "凭据保留(再开时指纹不变, 用户不用重新核对)"; else bad "凭据被删了"; fi
+# **内核侧**也必须干净。只删磁盘不管内核, 是这个平面上出现过的真实缺陷: 增量 nft -f 删不掉
+# 已经不在文件里的对象, 于是配置上看不出放行、规则却还在跑。桩把"应用过的配置"记在
+# applied.conf 里, 它就是这里的内核视图。
+kern="$(cat "$STATE/applied.conf" 2>/dev/null || echo)"
+if [[ "$(grep -c 'comment "pdg-rescue"' <<<"$kern")" == 0 ]]; then
+  ok "disable 后**内核侧**也没有项目规则(不是只把磁盘擦干净)"
+else bad "内核里仍有 $(grep -c 'comment "pdg-rescue"' <<<"$kern") 条项目规则"; fi
 if grep -q '^PDG_RESCUE_ENABLED=0$' "$BOX/etc/privdns-gateway/profile.env"; then
   ok "意图真源记下 disabled(profile.env, 原子 upsert)"; else bad "意图没写进 profile.env"; fi
 
@@ -334,9 +341,29 @@ printf '%s' "$SECRET_SENTINEL" > "$UBOX/etc/privdns-gateway/rescue/token"
 printf 'KEYMATERIAL-%s' "$SECRET_SENTINEL" > "$UBOX/etc/privdns-gateway/rescue/key.pem"
 printf 'CERT' > "$UBOX/etc/privdns-gateway/rescue/cert.pem"
 printf '{}' > "$UBOX/var/lib/privdns-gateway/rescue-state.json"
-# 现网配置 = 用户自己写的同端口规则 + 我们注入的独立表
-{ printf 'table inet mine {\n    chain input {\n        tcp dport %s accept\n    }\n}\n' "$RP"
-  python3 "$ROOT/deploy/bot/rescue_nft.py" 10.7.0.0/16 "$RP" </dev/null; } > "$UBOX/etc/nftables.conf"
+# 现网配置 = 项目表(policy drop, 内含我们注入的链内规则) + 用户自己写的同端口规则。
+# 注意注入要传**三个**参数(来源段/端口/监听地址): 旧的两参数调用现在会失败, 于是配置里
+# 根本没有我们的规则 —— 那样"卸载后无残留"这条断言就变成了假绿(它其实什么都没验)。
+cat > "$UBOX/etc/nftables.conf.base" <<C
+table inet pdg
+delete table inet pdg
+table inet pdg {
+    chain input {
+        type filter hook input priority 0; policy drop;
+        iif "lo" accept
+    }
+}
+table inet mine {
+    chain input {
+        type filter hook input priority 10; policy accept;
+        tcp dport $RP accept comment "my own"
+    }
+}
+C
+python3 "$ROOT/deploy/bot/rescue_nft.py" 10.7.0.0/16 "$RP" 10.7.0.5 \
+  < "$UBOX/etc/nftables.conf.base" > "$UBOX/etc/nftables.conf"
+if [[ "$(grep -c 'comment "pdg-rescue"' "$UBOX/etc/nftables.conf")" == 1 ]]; then
+  ok "(前提)卸载现场里确实有一条我们的链内规则"; else bad "(前提)现场没造出救援规则"; fi
 
 TBL="$(bash -c "source '$ROOT/lib/rescue.sh'; printf %s \"\$PDG_RESCUE_TABLE\"")"
 if resid="$(bash -c "source '$ROOT/lib/rescue.sh'; pdg_rescue_cleanup '$UBOX' ''")"; then rc=0; else rc=1; fi
@@ -354,11 +381,13 @@ if ((${#left[@]}==0)); then ok "unit / 凭据 / 私钥 / 状态 / 救援运行�
 else bad "卸载后仍残留: ${left[*]}"; fi
 if ! grep -rqF "$SECRET_SENTINEL" "$UBOX" 2>/dev/null; then
   ok "盘上再也搜不到 token/私钥的任何字节"; else bad "卸载后仍能搜到凭据内容"; fi
+if [[ "$(grep -c 'comment "pdg-rescue"' "$UBOX/etc/nftables.conf")" == 0 ]]; then
+  ok "卸载后磁盘上没有项目链内规则"; else bad "链内规则还留在 nftables.conf 里"; fi
 if ! grep -q "table inet $TBL" "$UBOX/etc/nftables.conf"; then
-  ok "我们注入的独立表已从 nftables.conf 摘除"; else bad "救援表仍在配置里"; fi
+  ok "配置里也没有旧独立表"; else bad "旧独立表仍在配置里"; fi
 if grep -q 'table inet mine' "$UBOX/etc/nftables.conf" \
-   && grep -qE "tcp dport $RP accept" "$UBOX/etc/nftables.conf"; then
-  ok "用户自己写的同端口规则**原样保留**(靠 BANNER 定界, 不按端口删行)"
+   && grep -q 'comment "my own"' "$UBOX/etc/nftables.conf"; then
+  ok "用户自己写的同端口规则**原样保留**(按标记精确删, 不按端口删行)"
 else bad "卸载把用户自己的同端口规则删掉了"; fi
 # 装的模块要一个不剩地收走 —— 清单读 10a-1 真源, 不在测试里另抄一份
 gone_miss=()
@@ -715,6 +744,101 @@ run 'migrate_rescue_plane' >/dev/null
 if grep -qE "dport $RP accept" "$BOX/etc/nftables.conf"; then
   ok "放行被清掉 → 迁移察觉不一致并修回来(判据含 nft, 不只看 unit)"
 else bad "迁移没把放行修回来"; fi
+
+# ══ 16b. pdg rescue bind: 幂等、校验与失败回滚 ═════════════════════════════
+echo; echo "── 16b. bind 修改 ──"
+run 'cmd_rescue enable' >/dev/null
+b0="$(sed -n 's/^PDG_RESCUE_BIND=//p' "$BOX/etc/privdns-gateway/profile.env" | tail -1)"
+u0="$(sha256sum "$BOX/etc/systemd/system/pdg-rescue.socket" | cut -d' ' -f1)"
+n0="$(sha256sum "$BOX/etc/nftables.conf" | cut -d' ' -f1)"
+out="$(run 'cmd_rescue bind '"$b0")"
+if grep -q '无变化' <<<"$out" \
+   && [[ "$(sha256sum "$BOX/etc/systemd/system/pdg-rescue.socket" | cut -d' ' -f1)" == "$u0" ]] \
+   && [[ "$(sha256sum "$BOX/etc/nftables.conf" | cut -d' ' -f1)" == "$n0" ]]; then
+  ok "重复设置同一地址 → 幂等(unit 与防火墙逐字节未动)"
+else bad "同址重设不幂等: $(head -1 <<<"$out")"; fi
+for badip in 0.0.0.0 255.255.255.255 224.0.0.1 gateway.local 999.1.1.1 ""; do
+  out="$(run "cmd_rescue bind $badip")"
+  if grep -qE '不是合法的 IPv4 监听地址|用法' <<<"$out" \
+     && [[ "$(sed -n 's/^PDG_RESCUE_BIND=//p' "$BOX/etc/privdns-gateway/profile.env" | tail -1)" == "$b0" ]]; then
+    :
+  else bad "非法地址 ${badip:-(空)} 被接受了: $(head -1 <<<"$out")"; break; fi
+done
+[[ "$(sed -n 's/^PDG_RESCUE_BIND=//p' "$BOX/etc/privdns-gateway/profile.env" | tail -1)" == "$b0" ]] \
+  && ok "0.0.0.0 / 广播 / 组播 / 主机名 / 非法八位组 / 空值全部拒绝, 且旧值未被改动"
+
+# 切到另一个地址(沙盒里让它成为本机地址)
+cat > "$BIN/ip" <<'S'
+#!/bin/bash
+[[ "$*" == *"addr show"* ]] && { echo "2: eth0    inet 10.7.0.5/16 brd 10.7.255.255 scope global eth0"
+                                 echo "3: eth1    inet 10.7.0.6/16 brd 10.7.255.255 scope global eth1"; }
+exit 0
+S
+chmod 755 "$BIN/ip"
+out="$(run 'cmd_rescue bind 10.7.0.6')"
+if grep -q '已切到 10.7.0.6' <<<"$out" \
+   && grep -q 'ListenStream=10.7.0.6:'"$RP" "$BOX/etc/systemd/system/pdg-rescue.socket" \
+   && grep -q 'ip daddr 10.7.0.6 ' "$BOX/etc/nftables.conf"; then
+  ok "切换成功: unit 监听与 nft 规则的目的地址一起换到新值"
+else bad "切换没生效: $(head -2 <<<"$out")"; fi
+if [[ "$(grep -c 'comment "pdg-rescue"' "$BOX/etc/nftables.conf")" == 1 ]]; then
+  ok "切换后旧规则被撤、新规则恰好一条(不是新旧并存)"
+else bad "切换后有 $(grep -c 'comment "pdg-rescue"' "$BOX/etc/nftables.conf") 条规则"; fi
+
+# 失败回滚: 让 socket 起不来, bind / profile / unit / nft / 意图都要回到操作前
+b1="$(sed -n 's/^PDG_RESCUE_BIND=//p' "$BOX/etc/privdns-gateway/profile.env" | tail -1)"
+u1="$(sha256sum "$BOX/etc/systemd/system/pdg-rescue.socket" | cut -d' ' -f1)"
+n1="$(sha256sum "$BOX/etc/nftables.conf" | cut -d' ' -f1)"
+i1="$(grep '^PDG_RESCUE_ENABLED=' "$BOX/etc/privdns-gateway/profile.env")"
+cat > "$BIN/systemctl" <<'S'
+#!/bin/bash
+D="$PDG_TEST_STATE"; mkdir -p "$D"
+v="$1"; shift; now=0; [[ "${1:-}" == "--now" ]] && { now=1; shift; }
+case "$v" in
+  daemon-reload|reset-failed|preset) exit 0;;
+  enable)  [[ "$*" == *pdg-rescue.socket* ]] && exit 1
+           for u in "$@"; do echo 1 > "$D/$u.en"; [[ "$now" == 1 ]] && echo 1 > "$D/$u.ac"; done; exit 0;;
+  disable) for u in "$@"; do echo 0 > "$D/$u.en"; [[ "$now" == 1 ]] && echo 0 > "$D/$u.ac"; done; exit 0;;
+  start|restart) for u in "$@"; do echo 1 > "$D/$u.ac"; done; exit 0;;
+  stop) for u in "$@"; do echo 0 > "$D/$u.ac"; done; exit 0;;
+  is-active)  [[ "$(cat "$D/$1.ac" 2>/dev/null)" == 1 ]] && { echo active; exit 0; }; echo inactive; exit 3;;
+  is-enabled) [[ "$(cat "$D/$1.en" 2>/dev/null)" == 1 ]] && { echo enabled; exit 0; }; echo disabled; exit 1;;
+esac
+exit 0
+S
+chmod 755 "$BIN/systemctl"
+out="$(run 'cmd_rescue bind 10.7.0.5')"
+if grep -q '回退' <<<"$out"; then ok "切换失败 → 明确说明回退"; else bad "失败没说回退: $(head -2 <<<"$out")"; fi
+if [[ "$(sed -n 's/^PDG_RESCUE_BIND=//p' "$BOX/etc/privdns-gateway/profile.env" | tail -1)" == "$b1" ]]; then
+  ok "回退后 profile 里的 bind 是操作前的值"; else bad "bind 没退回: 现为 $(sed -n 's/^PDG_RESCUE_BIND=//p' "$BOX/etc/privdns-gateway/profile.env" | tail -1)"; fi
+if [[ "$(grep '^PDG_RESCUE_ENABLED=' "$BOX/etc/privdns-gateway/profile.env")" == "$i1" ]]; then
+  ok "回退后意图状态未变"; else bad "意图被改了"; fi
+if [[ "$(grep -c 'comment "pdg-rescue"' "$BOX/etc/nftables.conf")" == 1 ]] \
+   && grep -q "ip daddr $b1 " "$BOX/etc/nftables.conf"; then
+  ok "回退后 nft 规则仍指向旧地址且恰好一条"; else bad "nft 没退回"; fi
+if [[ "$(sha256sum "$BOX/etc/systemd/system/pdg-rescue.socket" | cut -d' ' -f1)" == "$u1" ]]; then
+  ok "回退后 unit 逐字节回到操作前(监听地址没停在切换目标上)"
+else bad "unit 没退回: $(grep ListenStream "$BOX/etc/systemd/system/pdg-rescue.socket")"; fi
+if [[ "$(sha256sum "$BOX/etc/nftables.conf" | cut -d' ' -f1)" == "$n1" ]]; then
+  ok "回退后 nftables.conf 逐字节回到操作前"; else bad "nftables.conf 没退回"; fi
+# 复原桩
+cat > "$BIN/systemctl" <<'S'
+#!/bin/bash
+D="$PDG_TEST_STATE"; mkdir -p "$D"
+v="$1"; shift; now=0; [[ "${1:-}" == "--now" ]] && { now=1; shift; }
+case "$v" in
+  daemon-reload|reset-failed|preset) exit 0;;
+  enable)  for u in "$@"; do echo 1 > "$D/$u.en"; [[ "$now" == 1 ]] && echo 1 > "$D/$u.ac"; done; exit 0;;
+  disable) for u in "$@"; do echo 0 > "$D/$u.en"; [[ "$now" == 1 ]] && echo 0 > "$D/$u.ac"; done; exit 0;;
+  start|restart) for u in "$@"; do echo 1 > "$D/$u.ac"; done; exit 0;;
+  stop) for u in "$@"; do echo 0 > "$D/$u.ac"; done; exit 0;;
+  is-active)  [[ "$(cat "$D/$1.ac" 2>/dev/null)" == 1 ]] && { echo active; exit 0; }; echo inactive; exit 3;;
+  is-enabled) [[ "$(cat "$D/$1.en" 2>/dev/null)" == 1 ]] && { echo enabled; exit 0; }; echo disabled; exit 1;;
+esac
+exit 0
+S
+chmod 755 "$BIN/systemctl"
+run 'cmd_rescue enable' >/dev/null
 
 # ══ 17. 沙盒边界声明(10b 硬门)═══════════════════════════════════════════════
 echo; echo "── 17. 沙盒边界 ──"

@@ -2861,8 +2861,16 @@ _rescue_set_bind(){
     return 0
   fi
   c_y "❌ 切换到 $newbind 失败, 回退到 ${old:-未配置}。"
+  # 回退不只是把 profile 写回去: 失败之前 unit 与 nft 规则已经指向新地址了, 光改配置会留下
+  # 一个"配置说 A、防火墙放行 B、socket 监听 B"的三方不一致 —— 而且 B 是个起不来的地址,
+  # 等于把入口悄悄关掉。所以 unit 与防火墙都要按旧值重做一遍。
   if [[ -n "$old" ]]; then
     _profile_set "$RESCUE_BIND_KEY" "$old"
+    _rescue_write_units "$old" >/dev/null 2>&1 || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    _rescue_nft_close >/dev/null 2>&1 || true      # 先撤掉指向新地址的那条
+    _rescue_nft_open  >/dev/null 2>&1 \
+      || c_y "  ⚠️ 防火墙未能退回旧地址, 请跑 sudo pdg rescue status 复查。"
   else
     # 本来就没配过 → 把键抹掉(而不是留一个空值: 空值会被 pdg_rescue_bind 当成"配了"而后
     # 在校验处再失败一次, 报错位置离真正原因更远)
