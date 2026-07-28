@@ -24,6 +24,7 @@ import ipaddress
 import os
 import re
 import secrets
+import signal
 import socket
 import ssl
 import subprocess
@@ -1049,6 +1050,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _send(self, code, body=b"", ctype="text/html; charset=utf-8", cookie=None,
               extra_headers=()):
+        """发响应。客户端提前断开只影响**这一次响应**, 不影响已经做完的事情。
+
+        这条边界很实在: 完整恢复要跑十几秒, 用户等不及关掉标签页是常事。若断线冒出
+        BrokenPipe 并被当成"操作失败", 事务结果就会被一次网络事件改写 —— 而事务此刻早已
+        COMMITTED, 文件也已经落盘。所以这里把发送失败吞掉并只记一行, 绝不向上抛。"""
+        try:
+            self._send_inner(code, body, ctype, cookie, extra_headers)
+        except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError) as e:
+            self.server.disconnects += 1
+            sys.stderr.write("[rescue] 客户端提前断开, 响应未发出(%s); "
+                             "已完成的操作不受影响\n" % type(e).__name__)
+
+    def _send_inner(self, code, body=b"", ctype="text/html; charset=utf-8", cookie=None,
+                    extra_headers=()):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
@@ -1450,8 +1465,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
         import urllib.parse
         return urllib.parse.parse_qs(raw.decode("utf-8", "replace"))
 
+    # 会真正落盘的写路径。draining 期间这些一律拒新的, 读路径照常 —— 停机时还能看状态,
+    # 但不会再开一笔新事务。
+    _WRITE_PATHS = ("/tx/recover", "/snapshot/restore", "/breakglass/restore",
+                    "/emergency/enable", "/emergency/restore")
+
     def do_POST(self):
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
+        if path in self._WRITE_PATHS:
+            if self.server.draining.is_set():
+                self._send(503, page("服务正在停止",
+                                     "<p>救援服务正在停止(收到停止信号), 已不再接受新的写操作。</p>"
+                                     "<p>在途的操作会跑完再退出。稍后服务会被 socket 重新拉起, "
+                                     "那时再试。</p>"), extra_headers=(("Retry-After", "10"),))
+                return
+            self.server.write_begin()
+            try:
+                self._dispatch_write(path)
+            finally:
+                self.server.write_end()
+            return
+        self._dispatch_read(path)
+
+    def _dispatch_write(self, path):
         if path == "/tx/recover":
             self._post_recover()
             return
@@ -1464,6 +1500,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path in ("/emergency/enable", "/emergency/restore"):
             self._post_emergency(path.rsplit("/", 1)[1])
             return
+        self._send(405, page("405", "<p>这个操作不在救援平面的白名单里。</p>"))
+
+    def _dispatch_read(self, path):
         if path != "/login":
             # 白名单之外的写路径一律明确拒绝(而不是 404 装作没有)
             self._send(405, page("405", "<p>这个操作不在救援平面的白名单里。</p>"))
@@ -1575,6 +1614,10 @@ class SourceGuard:
             return False
 
 
+class Draining(Exception):
+    """收到 SIGTERM 之后到进程退出之间的窗口 —— 只拒新的写操作, 读照常。"""
+
+
 class BlockedSource(OSError):
     """来源不在允许网段 —— 继承 OSError, socketserver 会当成"这次 accept 不算", 干净跳过。"""
 
@@ -1602,6 +1645,34 @@ class Server(http.server.ThreadingHTTPServer):
         self.ctx = ctx
         self.guard = guard or SourceGuard(None)
         self.rejected = 0                        # 被来源拦下的连接数(status 用, 不含地址)
+        self.disconnects = 0                     # 客户端提前断开的次数(只做计数, 不含地址)
+        self.draining = threading.Event()        # 收到 SIGTERM: 不再接受新的写操作
+        self.inflight = threading.Semaphore(1)   # 在途写操作(与 pdgtx 的全局锁是两件事)
+        self._inflight_n = 0
+        self._inflight_lock = threading.Lock()
+
+    def write_begin(self):
+        """一笔写操作开始。draining 期间直接拒绝 —— 停机中再放新事务进来, 等于自找"停到一半
+        又开了一笔"的局面。"""
+        if self.draining.is_set():
+            raise Draining("服务正在停止")
+        with self._inflight_lock:
+            self._inflight_n += 1
+
+    def write_end(self):
+        with self._inflight_lock:
+            self._inflight_n = max(0, self._inflight_n - 1)
+
+    def wait_inflight(self, timeout):
+        """等在途写操作收尾。返回 True=都结束了。"""
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            with self._inflight_lock:
+                if self._inflight_n == 0:
+                    return True
+            time.sleep(0.2)
+        with self._inflight_lock:
+            return self._inflight_n == 0
 
     def get_request(self):
         """accept 之后**第一件事**就是判来源 —— 早于 TLS 握手, 更早于读 body/token/session。
@@ -1729,6 +1800,23 @@ def main():
     srv = Server((bind or "127.0.0.1", port), token, ctx, fd=fd,
                  token_path=C.paths()["PDG_RESCUE_TOKEN"],
                  guard=guard)
+
+    # SIGTERM: 停止收新的写操作 → 等在途事务收尾 → 再退。
+    #
+    # 没有这段的话, systemd 一 stop 就把进程打断: 正在落盘的恢复停在 APPLYING, 现网处在
+    # "新配置写了一半"的状态。pdgtx 的 pending/recover 是兜底(下一次写操作会 fail-closed
+    # 并要求先 recover), 但能干净收尾就不该让用户走那条路。
+    # 等待上限比 unit 的 TimeoutStopSec 略小 —— 超过它 systemd 会 SIGKILL, 那时留下 pending
+    # 反而是对的: 与其硬拖, 不如把"没做完"这件事如实留在事务目录里。
+    def _drain(signum, _frame):
+        srv.draining.set()
+        done = srv.wait_inflight(110)
+        sys.stderr.write("[rescue] 收到信号 %d: 已停止接受新的写操作, 在途事务%s\n"
+                         % (signum, "已收尾" if done else "仍未结束(交给 pdgtx 的 pending 兜底)"))
+        threading.Thread(target=srv.shutdown, daemon=True).start()
+
+    for _sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(_sig, _drain)
     sys.stderr.write("[rescue] 监听 https://%s:%d/ (%s)\n"
                      % (bind, port, "socket activation" if fd else "自行绑定"))
     try:

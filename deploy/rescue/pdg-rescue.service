@@ -14,6 +14,12 @@ StartLimitIntervalSec=0
 ExecStart=/usr/bin/python3 /opt/pdg-bot/rescue.py
 Restart=always
 RestartSec=2
+# 停止时给正在落盘的恢复留出收尾时间。默认 90 秒对"停一个空闲服务"绰绰有余, 但这里停的
+# 可能是一笔正在写生产文件的事务 —— 时间给少了 systemd 会 SIGKILL, 留下半应用的现场;
+# 给太多则停机/重启会被一直拖着。120 秒是按本项目快照规模的实测恢复耗时定的。
+# 进程收到 SIGTERM 后会停止接受新的写操作、等在途事务收尾再退出(见 rescue.py 的 _drain)。
+TimeoutStopSec=120
+KillMode=mixed
 # 硬化。RestrictAddressFamilies 必须含 AF_NETLINK: 恢复类操作会调 nft(子进程也在本 unit 的
 # cgroup 里, 限制一样管到它); AF_UNIX 给 systemctl。为形式上的加固把恢复功能封死是本末倒置
 # —— 具体放行项由 tests/e2e-rescue-10b.sh 在真 systemd 下逐条真跑验证。

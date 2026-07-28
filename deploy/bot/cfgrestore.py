@@ -232,12 +232,20 @@ def _safe_extract_loop(tar, root, written, unmanaged="reject", skipped=None):
         # 落地前再确认目标不是符号链接(TOCTOU 兜底), 并且不跟随既有链接写入
         if os.path.islink(target):
             raise ValueError("备份成员目标是符号链接, 拒绝整个备份: %s" % raw)
+        this_file = 0
         with open(target, "wb") as out:
             while True:
                 chunk = src.read(64 * 1024)
                 if not chunk:
                     break
+                this_file += len(chunk)
                 written_total += len(chunk)
+                # 单成员也要按**实际读到的字节**卡一道。只卡总量的话, 一个声明 1KB 的成员可以
+                # 一直吐到把总量吃光 —— 报出来的会是"总量超限", 而真正越界的是这一个成员,
+                # 排查时看不出是谁干的。
+                if this_file > MAX_FILE_BYTES:
+                    raise ValueError("备份内文件实际解出量超限(%s, >%d 字节), 拒绝整个备份"
+                                     % (raw, MAX_FILE_BYTES))
                 if written_total > MAX_TOTAL_BYTES:
                     raise ValueError("备份实际解出量超限(>%d 字节), 拒绝整个备份"
                                      % MAX_TOTAL_BYTES)
