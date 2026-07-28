@@ -2780,6 +2780,10 @@ _rescue_enable(){
   systemctl daemon-reload || { echo "❌ daemon-reload 失败"; _rescue_rollback; return 1; }
   _rescue_nft_open || { echo "❌ 防火墙放行失败(候选未通过 nft -c 或应用失败), 已回滚。"
                         _rescue_rollback; return 1; }
+  # socket 已经在跑时 `enable --now` **不会**重新读 unit —— 换了监听地址却不重启, systemd
+  # 仍绑在旧地址上, 而 nft 只放行新地址: 门就此不可达, 命令还报成功(.200 实机上正是如此)。
+  systemctl is-active "$PDG_RESCUE_SOCKET_UNIT" >/dev/null 2>&1 \
+    && systemctl restart "$PDG_RESCUE_SOCKET_UNIT" >/dev/null 2>&1
   if ! systemctl enable --now "$PDG_RESCUE_SOCKET_UNIT" >/dev/null 2>&1; then
     echo "❌ socket 起不来, 回滚到操作前。"; _rescue_rollback; return 1
   fi
@@ -2885,8 +2889,13 @@ _rescue_set_bind(){
   return 1
 }
 
-# unit 里当前渲染的监听地址(拿来核对"真的换过去了")
-_rescue_listen_addr(){ sed -n 's/^ListenStream=//p' "$UNIT_DIR/$PDG_RESCUE_SOCKET_UNIT" 2>/dev/null | tail -1; }
+# **真实**在监听的地址(不是 unit 文件里写的那个)。核对切换是否生效必须看这个 ——
+# 看文件只能证明"我们写对了", 证明不了"systemd 照做了"。
+_rescue_listen_addr(){
+  local a; a="$(ss -ltn 2>/dev/null | awk '{print $4}' | grep ":$PDG_RESCUE_PORT\$" | head -1)"
+  [[ -n "$a" ]] && { printf '%s' "$a"; return 0; }
+  sed -n 's/^ListenStream=//p' "$UNIT_DIR/$PDG_RESCUE_SOCKET_UNIT" 2>/dev/null | tail -1   # 没有 ss 时的兜底
+}
 
 _rescue_status(){
   local bind sock svc fp

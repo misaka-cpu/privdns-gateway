@@ -44,6 +44,7 @@ export PATH="$BIN:$PATH"
 cat > "$BIN/systemctl" <<'S'
 #!/bin/bash
 D="$PDG_TEST_STATE"; mkdir -p "$D"
+echo "$*" >> "$D/systemctl.log"
 v="$1"; shift; now=0; [[ "${1:-}" == "--now" ]] && { now=1; shift; }
 case "$v" in
   daemon-reload|reset-failed|preset) exit 0;;
@@ -640,6 +641,7 @@ else bad "启动失败却把放行规则留在了配置里"; fi
 cat > "$BIN/systemctl" <<'S'
 #!/bin/bash
 D="$PDG_TEST_STATE"; mkdir -p "$D"
+echo "$*" >> "$D/systemctl.log"
 v="$1"; shift; now=0; [[ "${1:-}" == "--now" ]] && { now=1; shift; }
 case "$v" in
   daemon-reload|reset-failed|preset) exit 0;;
@@ -693,6 +695,7 @@ else bad "迁移动了文件"; fi
 cat > "$BIN/systemctl" <<'S'
 #!/bin/bash
 D="$PDG_TEST_STATE"; mkdir -p "$D"
+echo "$*" >> "$D/systemctl.log"
 v="$1"; shift; now=0; [[ "${1:-}" == "--now" ]] && { now=1; shift; }
 case "$v" in
   daemon-reload|reset-failed|preset) exit 0;;
@@ -786,6 +789,14 @@ if grep -q '已切到 10.7.0.6' <<<"$out" \
    && grep -q 'ip daddr 10.7.0.6 ' "$BOX/etc/nftables.conf"; then
   ok "切换成功: unit 监听与 nft 规则的目的地址一起换到新值"
 else bad "切换没生效: $(head -2 <<<"$out")"; fi
+# 换地址**必须真的重启 socket**: unit 改了但 socket 不重启, systemd 仍监听旧地址, 而 nft
+# 已经只放行新地址 —— 门在实机上就此不可达, 命令却报成功(.200 上正是这么翻的车)。
+: > "$STATE/systemctl.log"
+run 'cmd_rescue bind 10.7.0.5' >/dev/null
+if grep -qE '^(restart|stop) .*pdg-rescue\.socket' "$STATE/systemctl.log"; then
+  ok "换 bind 时真的重启了 socket(不是只改 unit 文件)"
+else bad "没有重启 socket: $(tr '\n' '|' < "$STATE/systemctl.log" | cut -c1-90)"; fi
+run 'cmd_rescue bind 10.7.0.6' >/dev/null
 if [[ "$(grep -c 'comment "pdg-rescue"' "$BOX/etc/nftables.conf")" == 1 ]]; then
   ok "切换后旧规则被撤、新规则恰好一条(不是新旧并存)"
 else bad "切换后有 $(grep -c 'comment "pdg-rescue"' "$BOX/etc/nftables.conf") 条规则"; fi
@@ -830,6 +841,7 @@ if [[ "$(sha256sum "$BOX/etc/nftables.conf" | cut -d' ' -f1)" == "$n1" ]]; then
 cat > "$BIN/systemctl" <<'S'
 #!/bin/bash
 D="$PDG_TEST_STATE"; mkdir -p "$D"
+echo "$*" >> "$D/systemctl.log"
 v="$1"; shift; now=0; [[ "${1:-}" == "--now" ]] && { now=1; shift; }
 case "$v" in
   daemon-reload|reset-failed|preset) exit 0;;
