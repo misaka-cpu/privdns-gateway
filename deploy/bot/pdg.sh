@@ -1509,8 +1509,16 @@ migrate_rescue_plane(){
   fi
   local bind; bind="$(_rescue_bind_addr || true)"
   if [[ -z "$bind" ]]; then
-    _rescue_socket_present || c_y "  救援平面: 内网卡段内没有本机地址, 暂不启用(pdg rescue enable 可重试)。"
-    return 0
+    # 非交互更新**不猜**监听地址: 猜错就是把恢复入口开到不该开的网上。保持停用并说清怎么配。
+    local auto; auto="$(_rescue_bind_from_cidr 2>/dev/null || true)"
+    if [[ -n "$auto" ]] && pdg_rescue_bind_valid "$auto"; then
+      _profile_set "$RESCUE_BIND_KEY" "$auto" && bind="$auto"
+      c_g "  救援平面: 按来源段内唯一的本机地址确定监听地址 $bind"
+    else
+      c_y "  救援平面: 未配置监听地址(PDG_RESCUE_BIND), 保持停用。"
+      c_y "     设置后即可启用: sudo pdg rescue bind <IPv4>(候选: $(_rescue_bind_candidates | awk '{print $2}' | tr '\n' ' '))"
+      return 0
+    fi
   fi
   # 已布防 → 幂等退出(不重生成凭据、不重启、不动任何文件)。
   #
@@ -2457,23 +2465,64 @@ _rescue_write_units(){
 # 不在这里按端口猜 —— 按端口猜会把用户自己写的同端口规则也算成我们的。
 _rescue_nft_has(){
   [[ -f /etc/nftables.conf ]] || return 1
-  python3 - /etc/nftables.conf "$PDG_RESCUE_PORT" <<'PYH'
+  local bind; bind="$(_rescue_bind_addr || true)"
+  python3 - /etc/nftables.conf "$PDG_RESCUE_PORT" "${bind:-}" <<'PYH'
 import sys
 sys.path.insert(0, "/opt/pdg-bot")
 import rescue_nft
 txt = open(sys.argv[1], encoding="utf-8", errors="surrogateescape").read()
-sys.exit(0 if rescue_nft.has_rescue_rule(txt, int(sys.argv[2])) else 1)
+sys.exit(0 if rescue_nft.has_rescue_rule(txt, int(sys.argv[2]), sys.argv[3] or None) else 1)
 PYH
 }
 
-# 放行: 只改 /etc/nftables.conf 里**本项目管理区**的那一行, 候选先过 nft -c 再应用。
-# 幂等 —— 已经有了就什么都不做, 于是重复 enable 不会堆出第二条规则。
+# 内核里有没有(数的是我们标记过的那条, 不是"含救援端口的任意行")
+_rescue_nft_has_kernel(){
+  local bind; bind="$(_rescue_bind_addr || true)"
+  [[ -n "$bind" ]] || return 1
+  nft list table inet pdg 2>/dev/null | grep -q "comment \"pdg-rescue\"" || return 1
+  nft list table inet pdg 2>/dev/null | grep "comment \"pdg-rescue\"" | grep -q "$bind"
+}
+
+# 我们的规则在磁盘/内核里各有几条(盯"恰好一条")
+_rescue_nft_count_disk(){
+  python3 - /etc/nftables.conf "$PDG_RESCUE_PORT" <<'PYC'
+import sys
+sys.path.insert(0, "/opt/pdg-bot")
+import rescue_nft
+print(rescue_nft.count_rules(open(sys.argv[1], encoding="utf-8", errors="surrogateescape").read(),
+                             int(sys.argv[2])))
+PYC
+}
+_rescue_nft_count_kernel(){ nft list table inet pdg 2>/dev/null | grep -c 'comment "pdg-rescue"'; }
+
+# 旧版独立表 inet pdgrescue 的清理(幂等)。0=没有或已清掉; 1=同名但形态不是我们生成的 → 不动它。
+# 为什么必须清: 它挂在 input hook 上, doctor 会判成冲突, 于是启用救援平面的机器每次
+# pdg update 的更新后自检都失败并整次回滚(.200 实机实测)。而它本来也不起作用 ——
+# 同一 hook 上多条基链挨个走, 它的 accept 盖不过 inet pdg 的 policy drop。
+_rescue_nft_drop_legacy(){
+  local rc=0
+  if [[ -f /etc/nftables.conf ]]; then
+    python3 /opt/pdg-bot/rescue_nft.py --legacy-check < /etc/nftables.conf >/dev/null 2>&1
+    rc=$?
+    if (( rc == 2 )); then
+      c_y "  ⚠️ 配置里有一张 inet pdgrescue, 但形态与本项目生成的不一致 —— 不擅自删除, 请自行确认。"
+      return 1
+    fi
+  fi
+  nft list tables 2>/dev/null | grep -q "inet pdgrescue" && nft delete table inet pdgrescue 2>/dev/null
+  return 0
+}
+
+# 放行: 只往项目自己的 inet pdg input 链首插一条带标记的规则, 候选先过 nft -c 再整份应用。
+# 整份应用(模板里带 `delete table inet pdg` 再重建)保证**磁盘与内核一致** —— 增量 nft -f
+# 删不掉已经不在文件里的东西, 那正是旧实现留下孤儿表的原因。
 _rescue_nft_open(){
-  local cidr cand; cidr="$(pdg_internal_cidr 2>/dev/null || true)"
-  [[ -n "$cidr" ]] || return 1
-  _rescue_nft_has && { nft -f /etc/nftables.conf >/dev/null 2>&1 || true; return 0; }
+  local cidr bind cand
+  cidr="$(pdg_internal_cidr 2>/dev/null || true)"; [[ -n "$cidr" ]] || return 1
+  bind="$(_rescue_bind_addr || true)";            [[ -n "$bind" ]] || return 1
+  _rescue_nft_drop_legacy || return 1
   cand="$(_pdg_mktemp_dir)/nft.cand" || return 1
-  python3 /opt/pdg-bot/rescue_nft.py "$cidr" "$PDG_RESCUE_PORT" \
+  python3 /opt/pdg-bot/rescue_nft.py "$cidr" "$PDG_RESCUE_PORT" "$bind" \
     < /etc/nftables.conf > "$cand" 2>/dev/null || return 1
   nft -c -f "$cand" >/dev/null 2>&1 || return 1      # 候选先校验, 再动现网
   cp -a /etc/nftables.conf /etc/nftables.conf.pdg-rescue-bak 2>/dev/null || true
@@ -2482,19 +2531,26 @@ _rescue_nft_open(){
     mv -f /etc/nftables.conf.pdg-rescue-bak /etc/nftables.conf 2>/dev/null
     nft -f /etc/nftables.conf >/dev/null 2>&1; return 1; }
   rm -f /etc/nftables.conf.pdg-rescue-bak
+  # 磁盘与内核都必须**恰好一条**; 对不上就回滚, 不留"看着开了实际不通"或重复规则
+  [[ "$(_rescue_nft_count_disk)" == 1 && "$(_rescue_nft_count_kernel)" == 1 ]] || return 1
   return 0
 }
 
-# 撤销: 只摘掉**我们自己注入的那个独立表**(rescue_nft.py --strip 靠 BANNER 定界), 再重新应用。
-# 绝不按端口去删行 —— 用户完全可能自己写了一条同端口的放行, 那是他的规则, 删掉就是越权。
+# 撤销: 精确摘掉带标记的那条(rescue_nft.py --strip), 再整份重新应用 —— 磁盘与内核同时干净。
+# 绝不按端口去删行: 用户完全可能自己写过一条同端口放行, 那是他的规则。
 _rescue_nft_close(){
   [[ -f /etc/nftables.conf ]] || return 0
-  _rescue_nft_has || return 0
-  local cand; cand="$(_pdg_mktemp_dir)/nft.cand" || return 1
+  local cand bak; cand="$(_pdg_mktemp_dir)/nft.cand" || return 1
+  bak=/etc/nftables.conf.pdg-rescue-bak
   python3 /opt/pdg-bot/rescue_nft.py --strip < /etc/nftables.conf > "$cand" || return 1
   nft -c -f "$cand" >/dev/null 2>&1 || return 1
+  cp -a /etc/nftables.conf "$bak" 2>/dev/null || true
   mv -f "$cand" /etc/nftables.conf || return 1
-  nft -f /etc/nftables.conf >/dev/null 2>&1 || return 1
+  nft -f /etc/nftables.conf >/dev/null 2>&1 || {
+    mv -f "$bak" /etc/nftables.conf 2>/dev/null; nft -f /etc/nftables.conf >/dev/null 2>&1; return 1; }
+  _rescue_nft_drop_legacy || true                  # 顺手带走旧独立表(内核对象)
+  rm -f "$bak"
+  [[ "$(_rescue_nft_count_disk)" == 0 && "$(_rescue_nft_count_kernel)" == 0 ]] || return 1
   return 0
 }
 
@@ -2509,7 +2565,26 @@ _rescue_load(){
 
 # 本机上落在内网卡段内的地址。找不到返回空 —— 绝不退回 0.0.0.0: 把恢复入口开到公网上,
 # 等于把"换默认出口""完整恢复"这些按钮交给任何人。
+# 监听地址 = profile.env 里的 PDG_RESCUE_BIND, **不再从来源段推导**。
+# 那个假设在真实网关上不成立: 来源段是客户端所在的运营商内网, 而网关自己的地址在另一张网上,
+# 于是"在来源段里找一个本机地址"什么也找不到, 救援平面在它唯一被需要的拓扑上根本起不来
+# (.200 实机实测)。读不到就返回 1, 由调用方给出配置指引 —— 绝不回落到 0.0.0.0。
 _rescue_bind_addr(){
+  local v; v="$(pdg_rescue_bind 2>/dev/null || true)"
+  [[ -n "$v" ]] || return 1
+  pdg_rescue_bind_valid "$v" || return 1
+  printf '%s\n' "$v"
+}
+
+# 本机所有 IPv4(供"没配 bind 时列给用户选"用; 绝不替用户选)
+_rescue_bind_candidates(){
+  ip -4 -o addr show scope global 2>/dev/null \
+    | awk '{split($4,a,"/"); print $2, a[1]}'
+}
+
+# 来源段内恰好一个本机地址 → 沿用旧的安全路径并落盘(老机器平滑迁移)。
+# 有零个或多个都返回非 0: 多个的时候猜错就是把恢复入口开在错误的网上。
+_rescue_bind_from_cidr(){
   local cidr; cidr="$(pdg_internal_cidr 2>/dev/null || true)"
   [[ -n "$cidr" ]] || return 1
   python3 - "$cidr" <<'PYB'
@@ -2518,7 +2593,9 @@ try:
     net = ipaddress.ip_network(sys.argv[1], strict=False)
 except Exception:
     sys.exit(1)
-out = subprocess.run(["ip", "-4", "-o", "addr", "show"], capture_output=True, text=True).stdout
+out = subprocess.run(["ip", "-4", "-o", "addr", "show", "scope", "global"],
+                     capture_output=True, text=True).stdout
+hits = []
 for line in out.splitlines():
     parts = line.split()
     for i, tok in enumerate(parts):
@@ -2528,8 +2605,8 @@ for line in out.splitlines():
             except ValueError:
                 continue
             if ip in net:
-                print(ip); sys.exit(0)
-sys.exit(1)
+                hits.append(str(ip))
+sys.exit(1) if len(hits) != 1 else print(hits[0])
 PYB
 }
 
@@ -2544,6 +2621,7 @@ PYB
 #   0           **用户主动禁用** —— 普通更新与重复安装一律不得开回来;
 #   运行态       socket 是否 active 由 systemctl 单独查, 与意图无关(服务崩了意图仍是 1)。
 RESCUE_INTENT_KEY="PDG_RESCUE_ENABLED"
+RESCUE_BIND_KEY="PDG_RESCUE_BIND"
 
 _rescue_intent(){        # 回显 1 / 0 / 空(从未部署)
   [[ -f "$PROFILE_ENV" ]] || return 0
@@ -2633,7 +2711,8 @@ cmd_rescue(){
     rotate)       _rescue_rotate "${2:-token}";;
     rotate-token) _rescue_rotate token;;
     rotate-cert)  _rescue_rotate cert;;
-    *) echo "用法: pdg rescue <enable|disable|status|fingerprint|rotate [token|cert]>"
+    bind)         _rescue_set_bind "${2:-}";;
+    *) echo "用法: pdg rescue <enable|disable|status|fingerprint|bind <IPv4>|rotate [token|cert]>"
        return 1;;
   esac
 }
@@ -2642,10 +2721,25 @@ _rescue_enable(){
   _lock
   local bind; bind="$(_rescue_bind_addr || true)"
   if [[ -z "$bind" ]]; then
-    echo "❌ 找不到落在内网卡段内的本机地址 —— 拒绝启用。"
-    echo "   救援入口只能绑内网地址; 绑 0.0.0.0 等于把恢复按钮开给公网。"
-    echo "   先确认内网卡就绪(pdg detect-cidr 可重新识别), 再重试。"
+    # 没配监听地址时先试老路径: 来源段内**恰好一个**本机地址 → 沿用并落盘(老机器平滑迁移)。
+    # 有多个就不猜 —— 猜错等于把恢复入口开在错误的那张网上。
+    local auto; auto="$(_rescue_bind_from_cidr 2>/dev/null || true)"
+    if [[ -n "$auto" ]] && pdg_rescue_bind_valid "$auto"; then
+      _profile_set "$RESCUE_BIND_KEY" "$auto" && bind="$auto"
+      c_g "  已按来源段内唯一的本机地址确定监听地址: $bind(可用 pdg rescue bind 改)"
+    fi
+  fi
+  if [[ -z "$bind" ]]; then
+    echo "❌ 没有配置监听地址(PDG_RESCUE_BIND)—— 拒绝启用。"
+    echo "   它与来源段是两件事: 来源段($(pdg_internal_cidr 2>/dev/null || echo 未设))管「谁可以连」,"
+    echo "   监听地址管「绑在本机哪个地址上」; 真实网关上后者往往不在前者里。绝不回落 0.0.0.0。"
+    echo "   本机可选地址:"; _rescue_bind_candidates | sed 's/^/     /'
+    echo "   设置: sudo pdg rescue bind <IPv4>"
     return 1
+  fi
+  if pdg_rescue_bind_is_global "$bind"; then
+    c_y "  ⚠️ 监听地址 $bind 是全局可路由地址 —— 端口会暴露在该地址上, 靠 nft 来源约束与"
+    c_y "     应用层来源校验两层兜底。确认这是你要的。"
   fi
   # 回滚台账: 出错时把 unit / 启用状态 / 标记恢复回操作前
   local had_sock=0 was_enabled=0 had_optout=0 had_fw=0
@@ -2721,6 +2815,66 @@ _rescue_disable(){
   c_g "✅ 救援平面已停用(凭据保留; 再次 pdg rescue enable 即可恢复, 指纹不变)。"
 }
 
+# pdg rescue bind <IPv4> —— 设定救援 socket 真正绑的本机地址。
+#
+# 与来源段是两件事: 来源段管"谁可以连", 这里管"连到哪个地址"。真实网关上后者往往不在前者
+# 里面(.200 就是), 所以必须显式配置, 不许从来源段猜。
+# 已启用时这是**一笔可回滚的操作**: 渲染新 unit → 生成新候选 → 校验 → 重启 socket → 验证
+# 新监听与来源约束, 任一步失败就把 bind / unit / socket / nft 全部退回操作前。
+_rescue_set_bind(){
+  _lock
+  local newbind="${1:-}"
+  if [[ -z "$newbind" ]]; then
+    echo "用法: pdg rescue bind <IPv4>"
+    echo "本机可选地址:"; _rescue_bind_candidates | sed 's/^/  /'
+    echo "当前值: $(pdg_rescue_bind 2>/dev/null || echo '(未配置)')"
+    return 1
+  fi
+  if ! pdg_rescue_bind_valid "$newbind"; then
+    echo "❌ 不是合法的 IPv4 监听地址: $newbind"
+    echo "   只收 IPv4 字面量; 主机名、0.0.0.0、广播与组播一律拒绝 —— 猜错就是把恢复入口开错地方。"
+    return 1
+  fi
+  local old; old="$(pdg_rescue_bind 2>/dev/null || true)"
+  if [[ "$old" == "$newbind" ]]; then
+    echo "✅ 监听地址已是 $newbind(无变化)"; return 0
+  fi
+  if ! _rescue_bind_candidates | awk '{print $2}' | grep -qx "$newbind"; then
+    c_y "  ⚠️ $newbind 目前不是本机地址 —— FreeBind 允许先绑上, 但地址不回来就没人连得进来。"
+  fi
+  pdg_rescue_bind_is_global "$newbind" && c_y "  ⚠️ $newbind 是全局可路由地址: 端口会暴露在该地址上, 只靠 nft 来源约束与应用层来源校验兜底。"
+
+  local was_enabled=0
+  systemctl is-enabled "$PDG_RESCUE_SOCKET_UNIT" >/dev/null 2>&1 && was_enabled=1
+  _profile_set "$RESCUE_BIND_KEY" "$newbind" || { echo "❌ 写入 profile.env 失败"; return 1; }
+
+  if (( was_enabled == 0 )); then
+    # 停用状态: 只更新配置与候选 unit, **不开端口**
+    _rescue_write_units "$newbind" >/dev/null 2>&1 || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    echo "✅ 监听地址已设为 $newbind(当前处于停用状态, 未开放端口; pdg rescue enable 生效)"
+    return 0
+  fi
+  # 启用状态: 整体重做一次, 失败退回
+  if _rescue_enable >/dev/null 2>&1 && [[ "$(_rescue_listen_addr)" == "$newbind:$PDG_RESCUE_PORT" ]]; then
+    echo "✅ 监听地址已切到 $newbind, socket 正在该地址上监听。"
+    return 0
+  fi
+  c_y "❌ 切换到 $newbind 失败, 回退到 ${old:-未配置}。"
+  if [[ -n "$old" ]]; then
+    _profile_set "$RESCUE_BIND_KEY" "$old"
+  else
+    # 本来就没配过 → 把键抹掉(而不是留一个空值: 空值会被 pdg_rescue_bind 当成"配了"而后
+    # 在校验处再失败一次, 报错位置离真正原因更远)
+    sed -i "/^${RESCUE_BIND_KEY}=/d" "$PROFILE_ENV" 2>/dev/null || true
+  fi
+  _rescue_enable >/dev/null 2>&1 || true
+  return 1
+}
+
+# unit 里当前渲染的监听地址(拿来核对"真的换过去了")
+_rescue_listen_addr(){ sed -n 's/^ListenStream=//p' "$UNIT_DIR/$PDG_RESCUE_SOCKET_UNIT" 2>/dev/null | tail -1; }
+
 _rescue_status(){
   local bind sock svc fp
   bind="$(_rescue_bind_addr || true)"
@@ -2744,8 +2898,33 @@ _rescue_status(){
     ""|inactive) printf "  %-14s %s\n" "service 状态" "inactive(正常: 待按需拉起, socket 收到连接才启动)";;
     *)        printf "  %-14s %s\n" "service 状态" "$svc";;
   esac
-  printf "  %-14s %s\n" "监听地址"     "${bind:+https://$bind:$PDG_RESCUE_PORT/}${bind:-（内网卡段内无本机地址）}"
-  printf "  %-14s %s\n" "防火墙放行"   "$(_rescue_nft_has && echo "有(仅内网来源)" || echo 无)"
+  local cidr_now; cidr_now="$(pdg_internal_cidr 2>/dev/null || echo '(未设)')"
+  printf "  %-14s %s\n" "来源段"       "$cidr_now(允许连进来的客户端网段)"
+  if [[ -n "$bind" ]]; then
+    printf "  %-14s %s\n" "监听地址"   "$bind → https://$bind:$PDG_RESCUE_PORT/"
+    if _rescue_bind_candidates | awk '{print $2}' | grep -qx "$bind"; then
+      printf "  %-14s %s\n" "地址在本机" "是"
+    else
+      printf "  %-14s %s\n" "地址在本机" "⚠️ 否(FreeBind 能绑上, 但地址不回来就没人连得进)"
+    fi
+    if pdg_rescue_bind_is_global "$bind"; then
+      printf "  %-14s %s\n" "地址属性"  "⚠️ 全局可路由 —— 端口暴露在该地址上, 靠 nft 来源约束 + 应用层来源校验两层兜底"
+    else
+      printf "  %-14s %s\n" "地址属性"  "私网/本地(不在公网上)"
+    fi
+    printf "  %-14s %s\n" "socket 监听" "$(ss -ltn 2>/dev/null | grep -q "$bind:$PDG_RESCUE_PORT" && echo "在 $bind:$PDG_RESCUE_PORT 上" || echo 无)"
+  else
+    printf "  %-14s %s\n" "监听地址"   "（未配置 —— 不能启用; sudo pdg rescue bind <IPv4>）"
+  fi
+  printf "  %-14s %s\n" "nft 磁盘规则" "$(_rescue_nft_count_disk 2>/dev/null || echo ?) 条(带 pdg-rescue 标记)"
+  printf "  %-14s %s\n" "nft 内核规则" "$(_rescue_nft_count_kernel 2>/dev/null || echo ?) 条"
+  printf "  %-14s %s\n" "应用层来源校验" "已启用(只认内核给的 peer 地址, 不看 X-Forwarded-For)"
+  if nft list tables 2>/dev/null | grep -q "inet pdgrescue" \
+     || grep -q "table inet pdgrescue" /etc/nftables.conf 2>/dev/null; then
+    printf "  %-14s %s\n" "遗留独立表"  "⚠️ 检出 inet pdgrescue —— 旧设计残留, 会被 doctor 判冲突; 跑一次 pdg rescue enable/disable 清掉"
+  else
+    printf "  %-14s %s\n" "遗留独立表"  "无"
+  fi
   # 凭据只报"齐不齐"与指纹, **绝不打印 token 或私钥**
   for f in "$PDG_RESCUE_TOKEN" "$PDG_RESCUE_CERT" "$PDG_RESCUE_KEY"; do
     printf "  %-14s %s\n" "$(basename "$f")" "$([[ -s "$f" ]] && echo "在($(stat -c %a "$f" 2>/dev/null))" || echo 缺失)"
@@ -3078,5 +3257,5 @@ case "${1:-menu}" in
   hijack-mode)   shift || true; cmd_hijack_mode "${1:-}";;
   uninstall|rm)  shift || true; cmd_uninstall "${1:-}";;
   rescue)        cmd_rescue "$2";;
-  *) echo "用法: pdg [menu|status|doctor [--json|--deep]|update [--dry-run]|snapshot|rollback [n]|token|restart|log [n]|traffic|ios(仅 iOS)|report [--redact-ip|--full]|detect-cidr|platform <ios|android>|hijack-mode <all|gfw>|migrate|migrate-fw|tx <list|show|recover|abort>|rescue <enable|disable|status|fingerprint|rotate-token|rotate-cert>|uninstall [--purge]]";;
+  *) echo "用法: pdg [menu|status|doctor [--json|--deep]|update [--dry-run]|snapshot|rollback [n]|token|restart|log [n]|traffic|ios(仅 iOS)|report [--redact-ip|--full]|detect-cidr|platform <ios|android>|hijack-mode <all|gfw>|migrate|migrate-fw|tx <list|show|recover|abort>|rescue <enable|disable|status|fingerprint|bind <IPv4>|rotate-token|rotate-cert>|uninstall [--purge]]";;
 esac

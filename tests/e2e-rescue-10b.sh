@@ -90,7 +90,8 @@ ip netns exec "$NSC" ip link set cli0 up
 ip netns exec "$NS" ip route add 192.168.77.0/24 dev gw0
 ip netns exec "$NSC" ip route add "$GW_IP/32" dev cli0 2>/dev/null
 mkdir -p "$BOX/etc/privdns-gateway/rescue" "$BOX/var/lib/privdns-gateway" "$BOX/opt/pdg-bot" "$BOX/run"
-printf 'PDG_INTERNAL_CIDR=%s\n' "$CIDR" > "$BOX/etc/privdns-gateway/profile.env"
+{ printf 'PDG_INTERNAL_CIDR=%s\n' "$CIDR"
+  printf 'PDG_RESCUE_BIND=%s\n' "$GW_IP"; } > "$BOX/etc/privdns-gateway/profile.env"
 
 # 运行模块: 走**生产安装函数**, 不在测试里另抄一份清单
 # shellcheck source=lib/modules.sh
@@ -334,7 +335,7 @@ if [[ "$(NFTNS list ruleset 2>/dev/null | sha256sum | awk '{print $1}')" == "$ba
 else bad "现网被坏候选动了"; fi
 
 # 注入独立救援表: 真校验 → 真应用 → 幂等
-inj(){ python3 "$BOX/opt/pdg-bot/rescue_nft.py" "$CIDR" "$RP" < "$1" > "$2"; }
+inj(){ python3 "$BOX/opt/pdg-bot/rescue_nft.py" "$CIDR" "$RP" "$GW_IP" < "$1" > "$2"; }
 inj "$BOX/etc/nftables.conf" "$BOX/cand1.conf"
 if NFTNS -c -f "$BOX/cand1.conf" 2>/dev/null && NFTNS -f "$BOX/cand1.conf" 2>/dev/null; then
   ok "注入救援独立表的候选通过真校验并成功应用"
@@ -348,44 +349,80 @@ else bad "内核规则数从 $n1 变成 $n2"; fi
 # 内核计数不够: 候选里带着 `delete table` 再重建, 所以就算文本堆了两份, 内核里也只会剩一条。
 # 真正会失控的是**文件** —— 每跑一次 enable 就多一段, /etc/nftables.conf 无限增长, 而任何
 # 内核层面的断言都看不出来。所以这里数候选文本里的块数。
-b1="$(grep -c '^# ==== PrivDNS Gateway 救援入口' "$BOX/cand1.conf")"
-b2="$(grep -c '^# ==== PrivDNS Gateway 救援入口' "$BOX/cand2.conf")"
+b1="$(grep -c 'comment "pdg-rescue"' "$BOX/cand1.conf")"
+b2="$(grep -c 'comment "pdg-rescue"' "$BOX/cand2.conf")"
 if [[ "$b1" == 1 && "$b2" == 1 ]]; then
-  ok "候选文本里也只有一段救援块(反复注入不会让配置文件越堆越长)"
-else bad "候选里救援块堆到了 $b1/$b2 段"; fi
-if [[ -n "$(NFTNS list table inet "$PDG_RESCUE_TABLE" 2>/dev/null)" ]]; then
-  ok "救援放行在**独立表** inet $PDG_RESCUE_TABLE 里(恢复旧防火墙不会顺手切断它)"
-else bad "独立表不在"; fi
+  ok "候选文本里也只有一条救援规则(反复注入不会让配置文件越堆越长)"
+else bad "候选里救援规则堆到了 $b1/$b2 条"; fi
+if [[ "$(grep -c 'table inet pdgrescue' "$BOX/cand2.conf")" == 0 ]]; then
+  ok "候选里**没有**独立表(旧设计已废弃)"; else bad "候选里又出现独立表"; fi
+# 先取变量再判 —— `nft list ... | grep -q` 在 pipefail 下会因 SIGPIPE 判失败(命中即退出),
+# 报出"内核里没有规则"这种指错地方的假红。这个坑本文件前面已经踩过一次。
+ktbl="$(NFTNS list table inet pdg 2>/dev/null)"
+if [[ "$ktbl" == *'comment "pdg-rescue"'* ]]; then
+  ok "救援放行落在项目自己的 inet pdg input 链里(内核实测)"
+else bad "内核里没有链内救援规则"; fi
+kline="$(grep 'comment "pdg-rescue"' <<<"$ktbl" | head -1)"
+if [[ "$kline" == *"ip saddr $CIDR"* && "$kline" == *"ip daddr $GW_IP"* && "$kline" == *"dport $RP"* ]]; then
+  ok "内核里的规则四要素齐全(来源段 + 目的地址 + 端口 + 标记)"
+else bad "内核规则形态不对: $kline"; fi
+kpos="$(grep -n 'comment "pdg-rescue"' <<<"$ktbl" | head -1 | cut -d: -f1)"
+kdrop="$(grep -n 'policy drop' <<<"$ktbl" | head -1 | cut -d: -f1)"
+if [[ -n "$kpos" && -n "$kdrop" && "$kpos" -gt "$kdrop" ]]; then
+  ok "规则在 input 链内、位于链首(policy drop 声明之后即链体第一条)"
+else bad "规则位置可疑: rule@$kpos drop@$kdrop"; fi
+if [[ -z "$(NFTNS list tables 2>/dev/null | grep pdgrescue)" ]]; then
+  ok "内核里没有独立表(不再制造 doctor 判为冲突的第二条 input 基链)"
+else bad "内核里仍有独立表"; fi
 
 echo
-echo "── 6. 私网绑定与来源约束(真包真拦)──"
-# 顺序是**先证前提、再下结论**。反过来写过一版, 结果"非内网来源连不上"这条绿得毫无意义:
-# 第 3 节删地址时把手工加的回程路由一并带走了(内核会清掉该设备上与被删地址相关的路由),
-# 于是包根本回不来 —— 拦住它的是路由, 不是防火墙, 而断言照样报绿。
+echo "── 6. 双层来源防护(真包真拦)──"
+# 现在有两层独立机制: nft 的来源约束, 以及救援服务在 accept 之后、TLS 握手之前的来源校验。
+# 顺序仍是**先证前提、再下结论**: 撤掉 default-drop 之后允许来源必须立刻可用, 否则下面
+# 关于"谁被拦"的结论就没有意义(第一版正是因为删地址连带清掉回程路由而假绿过一次)。
 ip netns exec "$NS" ip route replace 192.168.77.0/24 dev gw0
 systemctl restart "$PDG_RESCUE_SOCKET_UNIT" >/dev/null 2>&1; sleep 0.5
-NFTNS delete table inet pdg 2>/dev/null            # 先撤掉 default-drop
-out_pre="$(probe "$CLI_BAD" 8)"
+NFTNS delete table inet pdg 2>/dev/null
+out_pre="$(probe "$CLI_OK" 8)"
 if grep -q "^HTTP/" <<<"$out_pre"; then
-  ok "(前提)没有 default-drop 时, 那个来源连得通 —— 路由/服务都正常, 下面拦不拦只取决于防火墙"
-else
-  bad "(前提)撤掉防火墙也连不通($(head -1 <<<"$out_pre" | cut -c1-60)) —— 这时候再测来源约束毫无意义"
-fi
-NFTNS -f "$BOX/cand1.conf" 2>/dev/null             # 把真防火墙装回去
+  ok "(前提)没有 default-drop 时允许来源连得通 —— 路由与服务都正常"
+else bad "(前提)撤掉防火墙允许来源也连不通($(head -1 <<<"$out_pre" | cut -c1-50))"; fi
+# 防火墙**完全不在**的情况下, 非允许来源必须仍被应用层挡住 —— 这正是绑在可路由地址上时
+# 唯一的兜底: nft 被清空 / 写错 / 恢复成旧版本, 门也不能就此敞开。
+out_app="$(probe "$CLI_BAD" 8)"
+if ! grep -q "^HTTP/" <<<"$out_app"; then
+  ok "nft 完全不在时, 非允许来源仍被**应用层**拒绝($(head -1 <<<"$out_app" | cut -c1-46))"
+else bad "没有 nft 时非允许来源直接进来了 —— 第二层形同虚设"; fi
+if ! grep -qiE "救援 Token|状态总览|Traceback" <<<"$out_app"; then
+  ok "被拒的来源拿不到登录页 / 状态页 / 堆栈(拒绝发生在读 body 与鉴权之前)"
+else bad "泄漏了页面内容: $(head -2 <<<"$out_app")"; fi
+NFTNS -f "$BOX/cand1.conf" 2>/dev/null             # 防火墙装回去
 out_ok="$(probe "$CLI_OK" 8)"
-if grep -q "^HTTP/" <<<"$out_ok"; then ok "内网来源($CLI_OK)在 default-drop 的真防火墙下连得通"
-else bad "内网来源连不通: $(head -2 <<<"$out_ok")"; fi
+if grep -q "^HTTP/" <<<"$out_ok"; then ok "两层都在时, 允许来源($CLI_OK)照常可用"
+else bad "允许来源连不通: $(head -2 <<<"$out_ok")"; fi
 out_bad="$(probe "$CLI_BAD" 5)"
 if ! grep -q "^HTTP/" <<<"$out_bad"; then
-  ok "非内网来源($CLI_BAD)被真 nft 拦下($(head -1 <<<"$out_bad" | cut -c1-40)) —— 前提已证, 只能是防火墙"
-else bad "非内网来源也能进 —— 来源约束没生效"; fi
-# 再撤一次防火墙, 同一来源应立刻恢复连通: 排除"刚好这一次连不上"
-NFTNS delete table inet pdg 2>/dev/null
-out_again="$(probe "$CLI_BAD" 8)"
-if grep -q "^HTTP/" <<<"$out_again"; then
-  ok "撤掉防火墙又立刻通 → 拦与不拦跟着规则走, 不是环境抖动"
-else bad "第二次撤掉后连不通, 结论不稳: $(head -1 <<<"$out_again")"; fi
-NFTNS -f "$BOX/cand1.conf" 2>/dev/null
+  ok "两层都在时, 非允许来源($CLI_BAD)进不来($(head -1 <<<"$out_bad" | cut -c1-40))"
+else bad "非允许来源进来了"; fi
+# 伪造 HTTP 头不能改变判定(判据只用内核给的 peer 地址)
+out_xff="$(ip netns exec "$NSC" python3 - "$GW_IP" "$RP" "$CLI_BAD" <<'PY' 2>&1
+import socket, ssl, sys
+host, port, src = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+s = socket.socket(); s.settimeout(6); s.bind((src, 0))
+try:
+    s.connect((host, port))
+    c = ctx.wrap_socket(s, server_hostname=host)
+    c.sendall(b"GET / HTTP/1.0\r\nHost: pdg\r\nX-Forwarded-For: 172.22.0.9\r\n"
+              b"Forwarded: for=172.22.0.9\r\n\r\n")
+    print(c.recv(200).decode("utf-8", "replace")[:120])
+except Exception as e:
+    print("PROBE-ERR %s" % type(e).__name__)
+PY
+)"
+if ! grep -q "^HTTP/" <<<"$out_xff"; then
+  ok "伪造 X-Forwarded-For / Forwarded 不改变判定(只认内核给的 peer 地址)"
+else bad "伪造头骗过了来源校验: $(head -1 <<<"$out_xff")"; fi
 
 echo
 echo "── 6b. 恢复旧快照之后, 救援门还在不在 ──"
@@ -397,7 +434,7 @@ grep -v "tcp dport $RP accept" "$BOX/etc/nftables.conf" > "$BOX/old-snap.conf"  
 if ! grep -q "dport $RP accept" "$BOX/old-snap.conf"; then
   ok "(前提)旧快照里确实没有救援放行, 且 input 仍是 policy drop"
 else bad "(前提)旧快照没造干净"; fi
-python3 "$BOX/opt/pdg-bot/rescue_nft.py" "$CIDR" "$RP" < "$BOX/old-snap.conf" > "$BOX/old-cand.conf"
+python3 "$BOX/opt/pdg-bot/rescue_nft.py" "$CIDR" "$RP" "$GW_IP" < "$BOX/old-snap.conf" > "$BOX/old-cand.conf"
 NFTNS -f "$BOX/old-cand.conf" 2>&1 | sed 's/^/    /'
 systemctl restart "$PDG_RESCUE_SOCKET_UNIT" >/dev/null 2>&1; sleep 0.5
 out_old="$(probe "$CLI_OK" 8)"
@@ -409,14 +446,14 @@ if ! grep -q "^HTTP/" <<<"$out_oldbad"; then
   ok "补进旧链的那条放行**仍带来源约束**(非内网来源照样拦)"
 else bad "补规则把门开给了任意来源"; fi
 # 幂等 + 可撤销: 反复注入不堆, strip 之后只摘我们标记过的那一行
-python3 "$BOX/opt/pdg-bot/rescue_nft.py" "$CIDR" "$RP" < "$BOX/old-cand.conf" > "$BOX/old-cand2.conf"
-m1="$(grep -c 'pdg-rescue(自动补入' "$BOX/old-cand.conf")"
-m2="$(grep -c 'pdg-rescue(自动补入' "$BOX/old-cand2.conf")"
-if [[ "$m1" == 1 && "$m2" == 1 ]]; then ok "补入的行也是幂等的(两次注入仍只有 1 行)"
-else bad "补入行堆到了 $m1/$m2"; fi
+python3 "$BOX/opt/pdg-bot/rescue_nft.py" "$CIDR" "$RP" "$GW_IP" < "$BOX/old-cand.conf" > "$BOX/old-cand2.conf"
+m1="$(grep -c 'comment "pdg-rescue"' "$BOX/old-cand.conf")"
+m2="$(grep -c 'comment "pdg-rescue"' "$BOX/old-cand2.conf")"
+if [[ "$m1" == 1 && "$m2" == 1 ]]; then ok "注入是幂等的(两次注入仍只有 1 条)"
+else bad "规则堆到了 $m1/$m2"; fi
 python3 "$BOX/opt/pdg-bot/rescue_nft.py" --strip < "$BOX/old-cand2.conf" > "$BOX/old-strip.conf"
-if [[ "$(grep -c 'pdg-rescue(自动补入' "$BOX/old-strip.conf")" == 0 ]] \
-   && diff <(grep -v 'pdg-rescue(自动补入' "$BOX/old-snap.conf") "$BOX/old-strip.conf" >/dev/null; then
+if [[ "$(grep -c 'comment "pdg-rescue"' "$BOX/old-strip.conf")" == 0 ]] \
+   && diff "$BOX/old-snap.conf" "$BOX/old-strip.conf" >/dev/null; then
   ok "--strip 之后逐字节回到旧快照原样(补入的行与独立表都摘净, 别人的规则没动)"
 else bad "strip 之后与原文不一致: $(diff "$BOX/old-snap.conf" "$BOX/old-strip.conf" | head -3 | tr '\n' ' ')"; fi
 NFTNS -f "$BOX/cand1.conf" 2>/dev/null      # 恢复现场

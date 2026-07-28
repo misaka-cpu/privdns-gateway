@@ -33,15 +33,52 @@ PDG_RESCUE_STATE="${PDG_RESCUE_STATE:-/var/lib/privdns-gateway/rescue-state.json
 PDG_RESCUE_SOCKET_UNIT="pdg-rescue.socket"
 PDG_RESCUE_SERVICE_UNIT="pdg-rescue.service"
 
-# 救援放行所在的**独立** nft 表名。python 侧的真源是 rescue_nft.py 的 TABLE(那个模块刻意
-# 零依赖 —— 它要在"完整恢复"最脆弱的时刻跑, 不能再去 import 常量解析器), 两处由守卫测试
-# 逐字比对。这里之所以也要有一份: 卸载得把这张表从磁盘配置与内核里摘掉。
+# **已废弃**的旧独立表名, 只用于识别与清理(生产路径不再创建它)。
+# 废弃原因: 同一 hook 上注册多条 base chain 时数据包挨个走完, 某条链里的 accept 只终止本链,
+# `inet pdg` 的 policy drop 照样丢包 —— 10b 真 nft 实测过救援口因此不可达; 而且项目自己的
+# doctor 一直把"pdg 之外挂 input hook 的表"判成冲突, 于是启用救援平面的机器每次 pdg update
+# 的更新后自检都失败并整次回滚(.200 实机实测)。现在改成往 inet pdg 的 input 链里加一条
+# 带标记的规则, 这个常量只剩迁移与卸载时"把旧表摘掉"这一个用途。
 PDG_RESCUE_TABLE="pdgrescue"
 
-# 内网卡来源段的**唯一真源**(5.2/T7)。nft、mosdns、救援绑定、doctor 全部读它或由它渲染。
+# 内网卡来源段的**唯一真源**(5.2/T7)。nft、mosdns、doctor 全部读它或由它渲染。
 # 老机器在迁移写入之前可能没有这个键 —— 调用方必须处理"读不到"的情况, 不许猜。
 PDG_PROFILE_ENV="${PDG_PROFILE_ENV:-/etc/privdns-gateway/profile.env}"
 PDG_CIDR_KEY="PDG_INTERNAL_CIDR"
+
+# 监听地址的真源。**与来源段是两件事** —— 这一条是 .200 实机验出来的:
+#   PDG_INTERNAL_CIDR = 允许访问救援页的**客户端来源**段(如运营商内网卡 172.22.0.0/16);
+#   PDG_RESCUE_BIND   = 救援 socket 真正绑的**本机地址**(如 177.0.142.200)。
+# 真实网关上客户端从内网段拨进来, 而网关自己的地址在另一张网上 —— 旧代码"从来源段里挑一个
+# 本机地址"在那台机器上找不到任何地址, 于是救援平面**在它唯一被需要的拓扑上根本起不来**。
+# 绝不从来源段推导监听地址。
+PDG_RESCUE_BIND_KEY="PDG_RESCUE_BIND"
+
+# 监听地址校验: 本轮只收 IPv4 字面量。空 / 主机名 / 0.0.0.0 / 广播 / 组播一律拒绝 ——
+# 猜错的代价是把恢复入口开到不该开的地方, 所以宁可拒绝也不回退。
+pdg_rescue_bind_valid(){
+  local ip="${1:-}"
+  [[ -n "$ip" ]] || return 1
+  [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  local a="${BASH_REMATCH[1]}" b="${BASH_REMATCH[2]}" c="${BASH_REMATCH[3]}" d="${BASH_REMATCH[4]}"
+  local o; for o in "$a" "$b" "$c" "$d"; do (( 10#$o <= 255 )) || return 1; done
+  [[ "$ip" == "0.0.0.0" || "$ip" == "255.255.255.255" ]] && return 1
+  (( 10#$a >= 224 )) && return 1                                   # 组播 224/4 与保留 240/4
+  (( 10#$a == 0 )) && return 1
+  return 0
+}
+
+# 是不是**全局可路由**地址(用于安全提示)。允许显式配置全局地址(真实网关就是这种),
+# 但 status / doctor / 装机提示必须把这件事说出来。
+pdg_rescue_bind_is_global(){
+  local ip="${1:-}"
+  pdg_rescue_bind_valid "$ip" || return 1
+  local a b; a="${ip%%.*}"; b="${ip#*.}"; b="${b%%.*}"
+  case "$ip" in 10.*|127.*|169.254.*|192.168.*) return 1;; esac
+  (( 10#$a == 172 && 10#$b >= 16 && 10#$b <= 31 )) && return 1     # 172.16/12
+  (( 10#$a == 100 && 10#$b >= 64 && 10#$b <= 127 )) && return 1    # CGNAT 100.64/10
+  return 0
+}
 
 # 救援平面**自己跑起来**需要的模块闭包(安装清单的子集)。enable 开门之前与 status 都用它,
 # 两处不再各写一份 —— 手写名单漏一个的表现不是报错, 是救援页把整块能力标成"旧核心不支持",
@@ -176,3 +213,6 @@ pdg_profile_get(){
 # 内网卡来源段(唯一真源)。读不到返回 1 —— 绝不回落成 0.0.0.0/0 之类的"宽松默认":
 # 救援服务拿它决定监听地址, 猜错就是把恢复入口暴露到公网。
 pdg_internal_cidr(){ pdg_profile_get "$PDG_CIDR_KEY" "$@"; }
+
+# 救援 socket 要绑的本机地址(读不到返回 1 且不打印 —— 调用方据此判"没配")
+pdg_rescue_bind(){ pdg_profile_get "$PDG_RESCUE_BIND_KEY" "$@"; }

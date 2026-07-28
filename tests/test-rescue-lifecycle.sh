@@ -105,11 +105,16 @@ N
   echo 'export PDG_PROFILE_ENV="'"$BOX"'/etc/privdns-gateway/profile.env"'
   echo 'PROFILE_ENV="'"$BOX"'/etc/privdns-gateway/profile.env"'
   echo 'RESCUE_INTENT_KEY="PDG_RESCUE_ENABLED"'
+  echo 'RESCUE_BIND_KEY="PDG_RESCUE_BIND"'
   echo 'c_g(){ echo "$*"; }; c_y(){ echo "$*"; }; need_root(){ :; }; _lock(){ :; }'
   echo '_pdg_mktemp_dir(){ mktemp -d; }'
-  for fn in _profile_set _rescue_load _rescue_bind_addr _rescue_intent _rescue_intent_set \
+  for fn in _profile_set _rescue_load _rescue_bind_addr _rescue_bind_candidates \
+            _rescue_bind_from_cidr _rescue_set_bind _rescue_listen_addr \
+            _rescue_intent _rescue_intent_set \
             _rescue_optout _rescue_intent_migrate _rescue_socket_present \
-            _rescue_write_units _rescue_nft_has _rescue_nft_open _rescue_nft_close \
+            _rescue_write_units _rescue_nft_has _rescue_nft_has_kernel \
+            _rescue_nft_count_disk _rescue_nft_count_kernel _rescue_nft_drop_legacy \
+            _rescue_nft_open _rescue_nft_close \
             _rescue_rotate cmd_rescue _rescue_enable _rescue_disable _rescue_status \
             migrate_rescue_plane; do
     sed -n "/^${fn}(){/,/^}/p" "$ROOT/deploy/bot/pdg.sh"
@@ -141,10 +146,22 @@ if [[ "$(cat "$STATE/pdg-rescue.socket.en" 2>/dev/null)" == 1 ]]; then
 #     另一张表的 policy drop(同一 hook 上多条基链会挨个走, accept 只终止本链)。
 # 所以这里分别数, 而不是笼统数"含 dport 的行": 后者既分不清两种形态, 也会把用户自己写的
 # 同端口规则算进来。
-blk=$(grep -c '^# ==== PrivDNS Gateway 救援入口' "$BOX/etc/nftables.conf")
-inl=$(grep -c 'pdg-rescue(自动补入' "$BOX/etc/nftables.conf")
-if [[ "$blk" == 1 && "$inl" == 1 ]]; then ok "独立表 1 块 + drop 链里补入 1 行(各自恰好一份)"
-else bad "形态不对: 独立表 $blk 块 / 补入 $inl 行"; fi
+# 形态: **项目自己 inet pdg 链内**一条带标记的规则。独立表设计已废弃 —— 它的 accept 盖不过
+# 同 hook 上另一条链的 policy drop(10b 真 nft 实测), 而且会被 doctor 判成 input 链冲突,
+# 导致启用救援平面的机器每次 update 自检失败并整次回滚。
+inl=$(grep -c 'comment "pdg-rescue"' "$BOX/etc/nftables.conf")
+tbl=$(grep -c 'table inet pdgrescue' "$BOX/etc/nftables.conf")
+if [[ "$inl" == 1 && "$tbl" == 0 ]]; then ok "链内恰好 1 条带标记规则, 且**不再**创建独立表"
+else bad "形态不对: 链内 $inl 条 / 独立表 $tbl 处"; fi
+if grep -q 'ip saddr 10\.7\.0\.0/16 ip daddr 10\.7\.0\.5 tcp dport '"$RP"' accept comment "pdg-rescue"' "$BOX/etc/nftables.conf"; then
+  ok "规则四要素齐全: 来源段 + 目的地址 + 端口 + 标记"
+else bad "规则形态不对: $(grep pdg-rescue "$BOX/etc/nftables.conf" | head -1)"; fi
+if [[ "$(grep -n 'comment "pdg-rescue"' "$BOX/etc/nftables.conf" | cut -d: -f1)" -lt \
+      "$(grep -n 'policy drop' "$BOX/etc/nftables.conf" | head -1 | cut -d: -f1)" ]] \
+   || [[ "$(awk '/comment "pdg-rescue"/{print NR; exit}' "$BOX/etc/nftables.conf")" -gt \
+         "$(awk '/policy drop/{print NR; exit}' "$BOX/etc/nftables.conf")" ]]; then
+  ok "规则落在 input 链首(在链尾的 drop 之前 —— 位置错了等于没放行)"
+else bad "规则位置不对"; fi
 if grep -qE "ip saddr 10\.7\.0\.0/16.*dport $RP accept" "$BOX/etc/nftables.conf"; then
   ok "救援端口放行带内网来源约束"; else bad "救援端口放行没有来源约束: $(grep "$RP" "$BOX/etc/nftables.conf")"; fi
 miss=""
@@ -165,10 +182,9 @@ fp_before="$(run 'cmd_rescue fingerprint' | tail -1)"
 # ══ 2. 重复 enable 幂等 ═════════════════════════════════════════════════════
 echo; echo "── 2. 重复 enable ──"
 run 'cmd_rescue enable' >/dev/null
-blk=$(grep -c '^# ==== PrivDNS Gateway 救援入口' "$BOX/etc/nftables.conf")
-inl=$(grep -c 'pdg-rescue(自动补入' "$BOX/etc/nftables.conf")
-if [[ "$blk" == 1 && "$inl" == 1 ]]; then ok "重复 enable 不堆: 仍是 1 块 + 1 行"
-else bad "重复后成了 $blk 块 / $inl 行"; fi
+inl=$(grep -c 'comment "pdg-rescue"' "$BOX/etc/nftables.conf")
+if [[ "$inl" == 1 ]]; then ok "重复 enable 不堆: 链内仍恰好 1 条"
+else bad "重复后成了 $inl 条"; fi
 sha_now="$(sha256sum 2>/dev/null "$BOX/etc/privdns-gateway/rescue/token" "$BOX/etc/privdns-gateway/rescue/cert.pem" \
            "$BOX/etc/privdns-gateway/rescue/key.pem" | awk '{print $1}' | tr '\n' ' ')"
 if [[ -n "${sha_before// /}" && "$sha_now" == "$sha_before" ]]; then
@@ -178,7 +194,7 @@ else bad "凭据比对不成立(before=$sha_before now=$sha_now)"; fi
 # ══ 3. status ═══════════════════════════════════════════════════════════════
 echo; echo "── 3. status ──"
 st="$(run 'cmd_rescue status')"
-for kw in "socket unit" "socket 状态" "service 状态" "监听地址" "防火墙放行" "证书指纹"; do
+for kw in "socket unit" "socket 状态" "service 状态" "监听地址" "来源段" "nft 磁盘规则" "nft 内核规则" "应用层来源校验" "遗留独立表" "证书指纹"; do
   grep -q "$kw" <<<"$st" || { bad "status 缺少: $kw"; break; }
 done
 grep -q "证书指纹" <<<"$st" && ok "status 分项报告 unit/socket/监听/防火墙/凭据(不只看 is-active)"
@@ -233,10 +249,8 @@ if [[ -n "$fp_before" && "$fp_after" == "$fp_before" ]]; then
   ok "证书指纹前后一致(只比对哈希, 不输出秘密)"; else bad "指纹变了: $fp_before → $fp_after"; fi
 if grep -q '^PDG_RESCUE_ENABLED=1$' "$BOX/etc/privdns-gateway/profile.env"; then
   ok "用户明确再开 → 意图回到 enabled"; else bad "意图没更新"; fi
-n=$(grep -cE "dport $RP accept" "$BOX/etc/nftables.conf")
-if [[ "$(grep -c '^# ==== PrivDNS Gateway 救援入口' "$BOX/etc/nftables.conf")" == 1 \
-   && "$(grep -c 'pdg-rescue(自动补入' "$BOX/etc/nftables.conf")" == 1 ]]; then
-  ok "再 enable 后仍是 1 块 + 1 行"; else bad "$n 条"; fi
+if [[ "$(grep -c 'comment "pdg-rescue"' "$BOX/etc/nftables.conf")" == 1 ]]; then
+  ok "再 enable 后链内仍恰好 1 条"; else bad "$(grep -c 'comment "pdg-rescue"' "$BOX/etc/nftables.conf") 条"; fi
 
 # ══ 7. 迁移幂等 ═════════════════════════════════════════════════════════════
 echo; echo "── 7. 迁移幂等 ──"
@@ -246,23 +260,55 @@ after="$(sha256sum "$BOX/etc/nftables.conf" "$BOX/etc/systemd/system/pdg-rescue.
 if [[ "$before" == "$after" ]]; then
   ok "已启用的机器上再迁移: 防火墙与 unit 逐字节不变"; else bad "迁移动了东西"; fi
 
-# ══ 8. 拿不到内网地址时拒绝启用 ═════════════════════════════════════════════
-echo; echo "── 8. 没有内网地址 ──"
+# ══ 8. 没配监听地址 → 拒绝启用(绝不回落通配)═══════════════════════════════
+echo; echo "── 8. 没配 bind ──"
+run 'cmd_rescue disable' >/dev/null
+cp "$BOX/etc/privdns-gateway/profile.env" "$WORK/profile.bak"
+sed -i '/^PDG_RESCUE_BIND=/d' "$BOX/etc/privdns-gateway/profile.env"
+# 同时让"来源段内唯一本机地址"这条老路径也走不通(否则它会自动补一个, 那是另一条用例)
 cat > "$BIN/ip" <<'S'
 #!/bin/bash
+[[ "$*" == *"addr show"* ]] && { echo "2: eth0    inet 192.0.2.7/24 brd 192.0.2.255 scope global eth0"
+                                 echo "3: eth1    inet 198.51.100.9/24 brd 198.51.100.255 scope global eth1"; }
 exit 0
 S
 chmod 755 "$BIN/ip"
 out="$(run 'cmd_rescue enable')"
-if grep -q '拒绝启用' <<<"$out" && grep -q '0.0.0.0' <<<"$out"; then
-  ok "找不到内网地址 → 拒绝启用并说明为什么不退回通配"; else bad "没有正确拒绝: $out"; fi
-# 复原地址桩 —— 后面的用例还要用它(不复原的话它们全会被"没有内网地址"挡掉, 变成假红)
+if grep -q '没有配置监听地址' <<<"$out"; then ok "没配 bind → 明确拒绝启用并说明来源段与监听地址是两件事"
+else bad "没有正确拒绝: $(head -2 <<<"$out")"; fi
+if grep -q 'sudo pdg rescue bind' <<<"$out"; then ok "拒绝时给出具体怎么配"; else bad "没给指引"; fi
+if grep -qE '本机可选地址' <<<"$out" && grep -q '192.0.2.7' <<<"$out"; then
+  ok "列出本机候选地址供人选(**不替人选**, 尤其不默认挑全局地址)"; else bad "没列候选"; fi
+# disable 不删 unit(凭据与 unit 都留着, 再开即用), 所以这里看的是**内容**: 不许出现通配监听
+# 只看**盘上与运行态**, 不 grep 提示文案 —— 拒绝信息里本来就写着"绝不回落 0.0.0.0",
+# 拿文案当证据会把正确的解释判成违规(第一版就这么假红了一次)。
+if ! grep -qE 'ListenStream=(0\.0\.0\.0|\[?::\]?):' "$BOX/etc/systemd/system/pdg-rescue.socket" 2>/dev/null \
+   && [[ "$(cat "$STATE/pdg-rescue.socket.en" 2>/dev/null)" != 1 ]]; then
+  ok "绝不回落通配地址, 也没有把 socket 悄悄开起来"; else bad "出现了通配或半启用"; fi
+
+# 多个候选时不猜: 来源段内有两个本机地址 → 老路径也必须放弃自动决定
+cat > "$BIN/ip" <<'S'
+#!/bin/bash
+[[ "$*" == *"addr show"* ]] && { echo "2: eth0    inet 10.7.0.5/16 brd 10.7.255.255 scope global eth0"
+                                 echo "3: eth1    inet 10.7.9.9/16 brd 10.7.255.255 scope global eth1"; }
+exit 0
+S
+chmod 755 "$BIN/ip"
+out="$(run 'cmd_rescue enable')"
+if grep -q '没有配置监听地址' <<<"$out"; then
+  ok "来源段内有多个本机地址 → **不猜**, 仍然要求显式配置"; else bad "多候选时自动挑了一个"; fi
+
+# 恢复现场: 唯一地址 + 显式 bind
 cat > "$BIN/ip" <<'S'
 #!/bin/bash
 [[ "$*" == *"addr show"* ]] && echo "2: eth0    inet 10.7.0.5/16 brd 10.7.255.255 scope global eth0"
 exit 0
 S
 chmod 755 "$BIN/ip"
+out="$(run 'cmd_rescue enable')"
+if grep -q '已启用' <<<"$out" && grep -q '^PDG_RESCUE_BIND=10.7.0.5$' "$BOX/etc/privdns-gateway/profile.env"; then
+  ok "来源段内**恰好一个**本机地址 → 沿用旧安全路径并持久化(老机器平滑迁移)"
+else bad "唯一地址迁移失败: $(head -2 <<<"$out")"; fi
 
 # ══ 9. 卸载清理 ═════════════════════════════════════════════════════════════
 echo; echo "── 9. 卸载 ──"
@@ -352,10 +398,11 @@ fi
 rm -rf "$UBOX"
 
 # 常量漂移: bash 侧表名与 rescue_nft.py 的 TABLE 必须逐字一致
-p_tbl="$(sed -n 's/^TABLE = "\(.*\)"/\1/p' "$ROOT/deploy/bot/rescue_nft.py")"
-if [[ -n "$TBL" && "$TBL" == "$p_tbl" ]]; then
-  ok "表名单一形态: lib/rescue.sh 与 rescue_nft.py 一致($TBL)"
-else bad "表名漂移: bash=$TBL python=$p_tbl"; fi
+# 独立表已废弃: 生产路径不许再生成它, 只保留识别/清理用的常量
+if ! grep -q "def rule_block" "$ROOT/deploy/bot/rescue_nft.py" \
+   && grep -q "LEGACY_TABLE" "$ROOT/deploy/bot/rescue_nft.py"; then
+  ok "生产路径不再创建独立表(只保留旧表的识别与清理)"
+else bad "rescue_nft.py 里还留着生成独立表的代码"; fi
 
 # ══ 10. unit 双路径渲染: install.sh 与 pdg rescue enable 必须逐字节一致 ═════
 echo; echo "── 10. unit 渲染双路径 ──"
@@ -658,9 +705,8 @@ table inet pdg {
 C
 run 'cmd_rescue enable' >/dev/null
 # 这份现场是 policy drop 的 input 链, 所以 enable 会产出两处形态: 独立表 + 链内补入行。
-if [[ "$(grep -c '^# ==== PrivDNS Gateway 救援入口' "$BOX/etc/nftables.conf")" == 1 \
-   && "$(grep -c 'pdg-rescue(自动补入' "$BOX/etc/nftables.conf")" == 1 ]]; then
-  ok "(前提)干净现场上 enable 出 1 块独立表 + 1 行链内放行"; else bad "(前提)现场没搭好"; fi
+if [[ "$(grep -c 'comment \"pdg-rescue\"' "$BOX/etc/nftables.conf")" == 1 ]]; then
+  ok "(前提)干净现场上 enable 出链内恰好 1 条放行"; else bad "(前提)现场没搭好"; fi
 python3 "$ROOT/deploy/bot/rescue_nft.py" --strip < "$BOX/etc/nftables.conf" > "$BOX/etc/nftables.conf.t" \
   && mv -f "$BOX/etc/nftables.conf.t" "$BOX/etc/nftables.conf"
 if ! grep -qE "dport $RP accept" "$BOX/etc/nftables.conf"; then

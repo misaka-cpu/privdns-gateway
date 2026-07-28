@@ -105,6 +105,26 @@ def internal_cidr(profile=None):
     return m[-1].strip() if m else None
 
 
+def profile_value(key, profile=None):
+    """从 profile.env 读一个键(读不到返回 None)。
+
+    与 internal_cidr 同一套读法, 只是键名可变 —— 监听地址(PDG_RESCUE_BIND)与来源段
+    (PDG_INTERNAL_CIDR)是两个不同的键, 各读各的, 谁也别从对方推导出来。"""
+    f = profile or get("PDG_PROFILE_ENV")
+    try:
+        with open(f, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        return None
+    m = re.findall(r"^[ \t]*%s=[\"']?([^\"'\n]+)" % re.escape(key), text, re.M)
+    return m[-1].strip() if m else None
+
+
+def rescue_bind(profile=None):
+    """救援 socket 要绑的本机地址。**不从来源段推导** —— 见 lib/rescue.sh 的说明。"""
+    return profile_value("PDG_RESCUE_BIND", profile)
+
+
 if __name__ == "__main__":
     import sys
     print(port() if "--port" in sys.argv else _source_path())

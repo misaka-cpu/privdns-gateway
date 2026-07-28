@@ -115,7 +115,8 @@ case "${1:-}" in
       mv -f "$tmp/kept" "$tmp/members"
       if [[ -f "$tree/etc/nftables.conf" ]]; then
         cidr="$(sed -n 's/^PDG_INTERNAL_CIDR=//p' "$ROOT/etc/privdns-gateway/profile.env" | tail -1)"
-        python3 "$REPO/deploy/bot/rescue_nft.py" "$cidr" "$PDG_RESCUE_PORT" \
+        bind="$(sed -n 's/^PDG_RESCUE_BIND=//p' "$ROOT/etc/privdns-gateway/profile.env" | tail -1)"
+        python3 "$REPO/deploy/bot/rescue_nft.py" "$cidr" "$PDG_RESCUE_PORT" "$bind" \
           < "$tree/etc/nftables.conf" > "$tmp/nft.cand" || { echo "候选注入失败"; exit 1; }
         nft -c -f "$tmp/nft.cand" >/dev/null 2>&1 || { echo "候选校验失败"; exit 1; }
         mv -f "$tmp/nft.cand" "$tree/etc/nftables.conf"
@@ -247,6 +248,7 @@ def load_mods(box):
     os.makedirs(os.path.dirname(os.environ["PDG_PROFILE_ENV"]), exist_ok=True)
     with open(os.environ["PDG_PROFILE_ENV"], "w") as f:
         f.write("PDG_INTERNAL_CIDR=127.0.0.0/8\n")
+        f.write("PDG_RESCUE_BIND=127.0.0.1\n")
     for m in ("pdgtx", "cfgrestore", "breakglass", "rescue_const"):
         sys.modules.pop(m, None)
     out = {}
@@ -389,10 +391,16 @@ if "insert" not in (open(box.calls, encoding="utf-8").read() if os.path.exists(b
 else:
     bad("出现了事后 insert 的补救")
 disk_nft = read(box, "etc/nftables.conf") or ""
-if "pdgrescue" in disk_nft and str(RPORT) in disk_nft:
+# 形态是**项目自己 inet pdg 链里的一条带标记规则**, 不再是独立表 —— 独立表的 accept 盖不过
+# 同 hook 上另一条链的 policy drop(10b 真 nft 实测), 而且它会被 doctor 判成 input 链冲突。
+if 'comment "pdg-rescue"' in disk_nft and str(RPORT) in disk_nft:
     ok("落盘的 nftables.conf 里就带着救援放行(不是靠运行态补的)")
 else:
     bad("落盘配置没有救援放行")
+if "pdgrescue" not in disk_nft:
+    ok("恢复过程**不再**创建独立表 inet pdgrescue")
+else:
+    bad("又出现了独立表: %r" % [l for l in disk_nft.splitlines() if "pdgrescue" in l][:2])
 
 box.clean()
 
@@ -405,14 +413,18 @@ sid2 = make_snapshot(box2, snap_id="20250505-050505", items={
 cr2, bg2 = load_mods(box2)
 r2 = bg2.run(sid2, expect_digest=cr2.snapshot_digest(sid2), cfgrestore=cr2)
 state2 = open(os.path.join(box2.root, "nft-state.txt"), encoding="utf-8").read()
-if r2.get("final_state") == "RESTORED" and "pdgrescue" in state2:
+if r2.get("final_state") == "RESTORED" and 'comment "pdg-rescue"' in state2:
     ok("候选含 flush ruleset: 事务结束时救援规则仍然存在")
 else:
     bad("flush 之后救援规则没了: state=%r" % r2.get("final_state"))
-if state2.index("pdgrescue") > state2.index("flush ruleset"):
-    ok("救援表声明在 flush 之后(同一次 transaction 内一定生效)")
+if state2.index('comment "pdg-rescue"') > state2.index("flush ruleset"):
+    ok("救援规则在 flush 之后(同一次 transaction 内一定生效)")
 else:
-    bad("救援表在 flush 之前")
+    bad("救援规则在 flush 之前")
+if "pdgrescue" not in state2:
+    ok("flush 场景同样不创建独立表")
+else:
+    bad("flush 场景创建了独立表")
 box2.clean()
 
 # ── 1d. nft -c 失败 → 磁盘与运行态都不变 ──────────────────────────────────

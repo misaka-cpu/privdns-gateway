@@ -20,6 +20,7 @@ import html
 import hmac
 import http.server
 import json
+import ipaddress
 import os
 import re
 import secrets
@@ -193,23 +194,6 @@ class StartupRefused(Exception):
     """前提不满足 —— 拒绝启动。猜一个监听地址/跳过认证, 都是把恢复入口开在错误的地方。"""
 
 
-def local_addr_in(cidr):
-    """本机落在该段内的第一个地址。找不到返回 None(调用方据此拒绝启动)。"""
-    import ipaddress
-    try:
-        net = ipaddress.ip_network(cidr, strict=False)
-    except Exception:  # noqa: BLE001
-        return None
-    _rc, out = _run(["ip", "-4", "-o", "addr"])
-    for a in re.findall(r"inet ([0-9.]+)/", out):
-        try:
-            if ipaddress.ip_address(a) in net:
-                return a
-        except Exception:  # noqa: BLE001
-            continue
-    return None
-
-
 def preflight():
     """返回 (bind_addr, port, cert, key, token)。任何一项不成立就抛 StartupRefused。"""
     port = C.port()
@@ -220,10 +204,18 @@ def preflight():
             "读不到内网卡段真源(%s 的 PDG_INTERNAL_CIDR)。救援服务靠它决定监听地址, "
             "绝不回落到 0.0.0.0 —— 那会把恢复入口暴露到公网。请先运行 sudo pdg detect-cidr。"
             % paths["PDG_PROFILE_ENV"])
-    bind = os.environ.get("PDG_RESCUE_BIND") or local_addr_in(cidr)
-    if not bind:
-        raise StartupRefused(
-            "本机没有落在内网卡段 %s 内的地址, 无从确定监听地址(内网卡可能没起来)。" % cidr)
+    # 监听地址与来源段是**两件事**: 来源段管"谁可以连", 这里管"绑在本机哪个地址上"。
+    # 真实网关上后者往往不在前者里(.200 实机), 所以只读 PDG_RESCUE_BIND, 不从来源段推导。
+    #
+    # 缺这个值该不该拒绝启动, 取决于**谁在绑**:
+    #   · systemd socket activation: 监听 socket 已经绑好递过来了, 这个值只是显示用 ——
+    #     因为一个配置键缺失就拒绝启动, 等于让救援门在最需要的时候自己关上;
+    #   · 自己 bind(调试/无 systemd): 没有值就无处可绑, 必须拒绝, 绝不回落 0.0.0.0。
+    # 判断放到 main 里(那时才知道有没有 fd), 这里只负责取值与校验格式。
+    bind = os.environ.get("PDG_RESCUE_BIND") or C.rescue_bind()
+    if bind and not _valid_bind(bind):
+        raise StartupRefused("PDG_RESCUE_BIND=%r 不是合法的 IPv4 监听地址(禁止主机名 / "
+                             "0.0.0.0 / 广播 / 组播)。" % bind[:40])
     for k, what in (("PDG_RESCUE_CERT", "自签证书"), ("PDG_RESCUE_KEY", "私钥")):
         if not os.path.isfile(paths[k]):
             raise StartupRefused("%s 不存在(%s)。用 sudo pdg rescue rotate --cert 生成。"
@@ -236,7 +228,7 @@ def preflight():
                              % (paths["PDG_RESCUE_TOKEN"], type(e).__name__))
     if len(token) < 16:
         raise StartupRefused("救援 Token 太短或为空, 拒绝以弱凭据启动。")
-    return bind, port, paths["PDG_RESCUE_CERT"], paths["PDG_RESCUE_KEY"], token
+    return bind, port, paths["PDG_RESCUE_CERT"], paths["PDG_RESCUE_KEY"], token, cidr
 
 
 # ── 只读数据源(全部容忍失败: 它们坏掉正是我们要显示的信息)────────────────────
@@ -1520,11 +1512,78 @@ class Handler(http.server.BaseHTTPRequestHandler):
                            _cookie_attrs("pdgcsrf", self.server.sessions.csrf(sid), SESSION_TTL)])
 
 
+def _valid_bind(v):
+    """监听地址只收 IPv4 字面量。主机名 / 0.0.0.0 / 广播 / 组播一律不收。"""
+    try:
+        ip = ipaddress.ip_address(v)
+    except ValueError:
+        return False
+    if ip.version != 4:
+        return False
+    return not (ip.is_unspecified or ip.is_multicast or ip.is_reserved
+                or str(ip) == "255.255.255.255")
+
+
+def _peer_ip(addr):
+    """从 accept 拿到的 peer 地址里取出规范化的 IP。
+
+    IPv4-mapped IPv6(::ffff:1.2.3.4)必须先规范成 1.2.3.4 再判 —— 不然同一个来源换个协议
+    栈写法就绕过了整条判断。"""
+    try:
+        ip = ipaddress.ip_address(addr[0])
+    except (ValueError, IndexError, TypeError):
+        return None
+    if ip.version == 6 and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    return ip
+
+
+class SourceGuard:
+    """第二层来源限制: 只放行来自 PDG_INTERNAL_CIDR 的客户端。
+
+    为什么 nft 之外还要一层: 真实网关必须把 socket 绑在一个可能全局可路由的地址上
+    (来源段是客户端所在的运营商内网, 网关自己的地址在另一张网上)。那样一来, 防火墙一旦被
+    清空、写错或恢复成旧版本, 这个恢复入口就直接暴露在公网。两层独立机制里任何一层还在,
+    门就还是关的。
+
+    判据只用**内核给的 peer 地址**。X-Forwarded-For / Forwarded 这类头一律不看 ——
+    它们由客户端随便填, 拿它做访问控制等于没有访问控制。
+
+    CIDR 解析不了 → fail-closed(谁都不放行), 绝不退化成"不限制来源"。
+    """
+
+    def __init__(self, cidr):
+        self.raw = cidr
+        try:
+            self.net = ipaddress.ip_network(cidr, strict=False)
+        except (ValueError, TypeError):
+            self.net = None                      # 无效 → 全部拒绝
+
+    def allows(self, addr):
+        # 顺序有讲究: **先**判来源段能不能解析。解析不了就谁都不放行, 连回环也不例外 ——
+        # 否则"配置坏掉"这件事会悄悄变成"限制放宽了", 而那正是最不该在恢复入口上发生的事。
+        if self.net is None:
+            return False
+        ip = _peer_ip(addr)
+        if ip is None:
+            return False
+        if ip.is_loopback:
+            return True                          # 本机自检/受控测试
+        try:
+            return ip in self.net
+        except TypeError:                        # v4 网段 vs v6 地址
+            return False
+
+
+class BlockedSource(OSError):
+    """来源不在允许网段 —— 继承 OSError, socketserver 会当成"这次 accept 不算", 干净跳过。"""
+
+
 class Server(http.server.ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, addr, token, ctx, fd=None, token_path=None):
+    def __init__(self, addr, token, ctx, fd=None, token_path=None, guard=None):
         self.token = token
         self.token_path = token_path
         self.sessions = Sessions()
@@ -1538,7 +1597,45 @@ class Server(http.server.ThreadingHTTPServer):
             self.server_address = self.socket.getsockname()
         else:
             http.server.HTTPServer.__init__(self, addr, Handler)
-        self.socket = ctx.wrap_socket(self.socket, server_side=True)
+        # **不**在这里 wrap 监听 socket: 那样握手会发生在 accept 内部, 非法来源也能把我们
+        # 拖进一次 TLS 协商(拿到证书、消耗 CPU)。改成每连接 wrap, 于是来源检查排在握手之前。
+        self.ctx = ctx
+        self.guard = guard or SourceGuard(None)
+        self.rejected = 0                        # 被来源拦下的连接数(status 用, 不含地址)
+
+    def get_request(self):
+        """accept 之后**第一件事**就是判来源 —— 早于 TLS 握手, 更早于读 body/token/session。
+        非法来源直接关掉连接: 拿不到登录页、拿不到证书、也分不出"token 对不对"。"""
+        sock, addr = self.socket.accept()
+        # systemd 交过来的监听 fd 可能是非阻塞的, accept 出来的连接会继承这一属性; 非阻塞
+        # socket 上做 TLS 握手会立刻抛 SSLWantRead, 表现成客户端"握手超时"。以前 wrap 的是
+        # 监听 socket, 这个属性由 SSLSocket.accept() 内部处理掉了, 换成逐连接 wrap 就露出来了。
+        sock.setblocking(True)
+        if not self.guard.allows(addr):
+            self.rejected += 1
+            try:
+                sock.close()
+            finally:
+                raise BlockedSource("来源不在允许网段内")
+        # 握手就发生在 accept 循环里(逐连接 wrap 与旧的"wrap 监听 socket"在这点上一样),
+        # 所以必须给它一个超时: 一个连上就走的探测连接会让 do_handshake 一直等 ClientHello,
+        # 整个服务在那期间**谁都服务不了**。超时后连接直接丢弃, 不当成错误。
+        sock.settimeout(15)
+        try:
+            ssock = self.ctx.wrap_socket(sock, server_side=True)
+        except (ssl.SSLError, OSError) as e:
+            try:
+                sock.close()
+            finally:
+                raise BlockedSource("TLS 握手未完成: %s" % type(e).__name__)
+        ssock.settimeout(None)
+        return ssock, addr
+
+    def handle_error(self, request, client_address):
+        """被来源拦下不是错误, 不该打印堆栈(也不该给攻击者留下可区分的日志噪音)。"""
+        if sys.exc_info()[0] is BlockedSource:
+            return
+        super().handle_error(request, client_address)
 
     def refresh_token(self):
         """Token 文件变了就换掉并清空所有会话 —— 轮换的语义就是"旧的立刻不算数",
@@ -1601,7 +1698,7 @@ def systemd_fd():
 
 def main():
     try:
-        bind, port, cert, key, token = preflight()
+        bind, port, cert, key, token, cidr = preflight()
     except StartupRefused as e:
         sys.stderr.write("[rescue] 拒绝启动: %s\n" % e)
         return 2
@@ -1617,7 +1714,21 @@ def main():
     except StartupRefused as e:
         sys.stderr.write("[rescue] 拒绝启动: %s\n" % e)
         return 2
-    srv = Server((bind, port), token, ctx, fd=fd, token_path=C.paths()["PDG_RESCUE_TOKEN"])
+    if fd is None and not bind:
+        sys.stderr.write("[rescue] 拒绝启动: 没有 systemd 交接的监听 fd, 也没有配置 "
+                         "PDG_RESCUE_BIND —— 无处可绑, 且绝不回落到 0.0.0.0。"
+                         "请运行 sudo pdg rescue bind <IPv4>。\n")
+        return 2
+    # 第二层来源限制在这里装上。CIDR 解析不了 → SourceGuard 谁都不放行(fail-closed),
+    # 服务绝不以"无来源限制"的形态跑起来。
+    guard = SourceGuard(cidr)
+    if guard.net is None:
+        sys.stderr.write("[rescue] 拒绝启动: PDG_INTERNAL_CIDR=%r 解析不了 —— "
+                         "不以无来源限制的形态启动。\n" % (cidr or "")[:40])
+        return 2
+    srv = Server((bind or "127.0.0.1", port), token, ctx, fd=fd,
+                 token_path=C.paths()["PDG_RESCUE_TOKEN"],
+                 guard=guard)
     sys.stderr.write("[rescue] 监听 https://%s:%d/ (%s)\n"
                      % (bind, port, "socket activation" if fd else "自行绑定"))
     try:
