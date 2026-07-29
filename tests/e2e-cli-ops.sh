@@ -28,11 +28,6 @@ e2e_seed_nft
 printf 'mihomo\n' > /etc/privdns-gateway/backend
 printf 'android\n' > /etc/privdns-gateway/platform
 e2e_fetch_mihomo || e2e_skip "取不到 mihomo 二进制"
-# §7 的 detect-cidr 会走一笔真事务, 候选校验要拿**真 mosdns** 解析新配置 —— 没有它,
-# 事务在校验门就 REFUSED, 7a/7b/7e/7i/7j/7k/7l 全部失败。这条以前一直没写:
-# 单独跑必失败, 只有在同一个容器里先跑过 e2e-install.sh(它会装 mosdns)时才碰巧变绿。
-# CI 的矩阵是一个脚本一个干净容器, 所以那里从来没绿过。
-e2e_fetch_mosdns || e2e_skip "取不到 mosdns 二进制(§7 的候选校验要拿真 mosdns 解析配置)"
 
 # unit 用**真实形态**(带 ExecStart=…/usr/local/bin/<svc>): 幂等迁移是按 unit 内容判断要不要
 # 补 SAFE_PATHS 的, 拿 ExecStart=/bin/true 这种占位 unit 当现场, 那条迁移每次都会重跑一遍并
@@ -227,6 +222,17 @@ git -C /opt/privdns-gateway tag -f v9.9.9 >/dev/null 2>&1
 rm -rf /tmp/e2e-empty-origin.git /tmp/e2e-cli-origin.git
 
 # ══ 7. detect-cidr 事务化 ══════════════════════════════════════════════════
+# detect-cidr 走一笔真事务, 候选校验要拿**真 mosdns** 解析新配置。取二进制放在这里而不是
+# 脚本开头 —— 前面几节(装机/迁移/update dry-run)中途会把 /usr/local/bin 下的内核清掉,
+# 开头取一次到这儿就没了。
+#
+# 这条以前根本没写。于是单独跑必然 7a/7b/7e/7i/7j/7k/7l 全红(事务在校验门 REFUSED),
+# 只有在同一个容器里先跑过 e2e-install.sh 时才碰巧变绿 —— 而 CI 的矩阵是一个脚本一个
+# 干净容器, 那里从来没绿过。先前误判成"需要 CAP_NET_ADMIN、只有 privileged 能跑",
+# 实测 privileged 与否毫无区别(单独跑都是 38/8), 差别只在前一个脚本留没留下 mosdns。
+e2e_fetch_mosdns || e2e_skip "取不到 mosdns 二进制(§7 的候选校验要拿真 mosdns 解析配置)"
+mosdns version >/dev/null 2>&1 \
+  || { echo "[FAIL] §7 前提: mosdns 取到了却跑不起来"; exit 1; }
 echo; echo "── 7. detect-cidr ──"
 cp /etc/nftables.conf /tmp/pristine.nft
 cp /etc/mosdns/config.yaml /tmp/pristine.mos
