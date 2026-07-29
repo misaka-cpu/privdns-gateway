@@ -60,6 +60,20 @@ if len(dirs) >= 3:
 else:
     bad("源目录只有 %r —— 靠 basename 猜目录是不行的" % dirs)
 
+# mode 不是随便填的: 被当程序跑的 755, 只被读/source/import 的 644。
+# 下面这两项是**数据**, 不该有执行位:
+#   · rescue.sh —— 被 source 的常量单一事实源, 从不执行;
+#   · pdg-dot.mobileconfig.tmpl —— 发给手机的描述文件模板。
+# 这是测试里的期望表, 不是第二份部署清单 —— 部署仍然只有 lib/modules.sh 一处。
+# 仓库里所有文件的 git mode 都是 100644, 所以拿 git 的可执行位当判据是行不通的。
+_DATA_FILES = {"rescue.sh", "pdg-dot.mobileconfig.tmpl"}
+_want = {r[1]: ("644" if r[1] in _DATA_FILES else "755") for r in rows}
+_mode_bad = [(r[1], r[2], _want[r[1]]) for r in rows if r[2] != _want[r[1]]]
+if not _mode_bad:
+    ok("mode 与文件类型一致(.py/.sh=755, 数据文件=644)")
+else:
+    bad("mode 不对: %s" % "、".join("%s 是 %s 应为 %s" % t for t in _mode_bad))
+
 missing_src = [r[0] for r in rows if not os.path.exists(os.path.join(ROOT, r[0]))]
 if not missing_src:
     ok("每一项的仓库源路径都真实存在")
