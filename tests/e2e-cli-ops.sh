@@ -175,7 +175,11 @@ printf 'PDG_PLATFORM=android\n' > /etc/privdns-gateway/profile.env
 # 可能已经把 /etc/resolv.conf 指到本机 mosdns, 那时解析 github.com 必然失败)。
 rm -rf /tmp/e2e-cli-origin.git
 git init -q --bare /tmp/e2e-cli-origin.git
-( cd /opt/privdns-gateway
+# `cd` 必须带 `|| exit` —— 目录不在时子 shell **不会**自己退出, 后面 git init / git add -A /
+# git commit / remote set-url / tag 会原地落在当时的工作目录上。而跑测试时那通常就是
+# 开发者的真仓库: 本机上它真的往仓库里塞了一个 "base" 提交、把 user.name 改成 t、
+# 把 origin 换成 /tmp 里的裸库、还打了个 v9.9.9 标签。一个静默失败的 cd 能干这么多事。
+( cd /opt/privdns-gateway || { echo "[FAIL] /opt/privdns-gateway 不存在, 拒绝在当前目录执行 git 操作"; exit 1; }
   git init -q -b main 2>/dev/null; git config user.email t@t; git config user.name t
   git config commit.gpgsign false
   git add -A >/dev/null 2>&1; git commit -qm base >/dev/null 2>&1
