@@ -87,8 +87,30 @@ pdg_legacy_modules(){ printf '%s\n' "$PDG_LEGACY_MODULES"; }
 # 把清单里的模块装到目标目录。$1=仓库根, $2=目标目录(默认 /opt/pdg-bot)。
 # 任一项失败即返回非 0 —— 调用方据此走各自的回滚, 绝不留新旧混装。
 # $3=平台(默认取 $PDG_PLATFORM)。install 与 update 传同一个值, 于是同步范围必然一致。
+# 部署**之前**先把整份清单校验一遍。原先只判"源文件存在" —— 一份写坏的清单会被照单执行:
+# 两个源映射到同一个目标名(后者静默覆盖前者, 而谁赢取决于清单顺序);
+# mode 写成 7777 之类的非法值(install 会失败, 但那时前面的文件已经落地了);
+# 目标名带 `../`(install -m755 src "$dest/../../etc/passwd" 会真的写出去)。
+# 全部在动手前判掉, 一条不合格就整份拒绝 —— 半装比不装更糟。
+pdg_validate_modules(){
+  local plat="${1:-}" repo="${2:-}" src name mode seen="" why=""
+  while read -r src name mode; do
+    [[ -n "$src" ]] || continue
+    [[ "$src" == *".."* || "$src" == /* ]] && { why="源路径逃出仓库: $src"; break; }
+    [[ "$name" == *"/"* || "$name" == *".."* ]] && { why="目标名不是单个文件名: $name"; break; }
+    [[ "$mode" =~ ^[0-7]{3}$ ]] || { why="mode 非法(只接受三位八进制): $name=$mode"; break; }
+    case " $seen " in *" $name "*) why="目标名重复: $name"; break;; esac
+    seen="$seen $name"
+    [[ -z "$repo" || -f "$repo/$src" ]] || { why="运行模块缺失: $src"; break; }
+  done < <(pdg_platform_modules "$plat")
+  [[ -z "$why" ]] && return 0
+  echo "运行模块清单不合法: $why" >&2
+  return 1
+}
+
 pdg_install_runtime_modules(){
   local repo="$1" dest="${2:-$PDG_RUNTIME_DIR}" plat="${3:-${PDG_PLATFORM:-}}" src name mode
+  pdg_validate_modules "$plat" "$repo" || return 1
   install -d -m755 "$dest" || return 1
   while read -r src name mode; do
     [[ -n "$src" ]] || continue

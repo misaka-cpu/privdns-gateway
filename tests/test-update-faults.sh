@@ -144,11 +144,25 @@ assert_fail_rollback(){ # 故障路径: rc非0 + 有 ROLLBACK + 无"✅ 已更�
   if [[ "$env" == *FAIL_TARGET=* || "$env" == *FAIL_NTH=* || "$env" == *FAIL_INSTALL=* ]] \
      && [[ ! -s /tmp/e2e-inject-hit ]]; then
     bad "$desc: 故障注入**未命中**(受管目标共 $(wc -l < /tmp/e2e-inject-count 2>/dev/null || echo 0) 个) —— 这条没测到任何东西"
+    # 结构化结果: 让外层守卫能区分"updater 正常失败"/"注入未命中"/"测试环境损坏",
+    # 而不是都看成一个非零退出码。
+    echo "RESULT=injection-not-hit" >> "${PDG_FAULT_RESULT:-/dev/null}"
     return
   fi
   { [[ "$rc" != 0 ]] && grep -q ROLLBACK_CALLED <<<"$out" && ! grep -q '✅ 已更新' <<<"$out"; } \
     && ok "$desc → 回滚 + 非0 + 不谎报成功" || bad "$desc: rc=$rc out=$out"
 }
+
+# 受控的"故意打空"自检场景: 指定一个**不存在**的受管目标名, 真跑一次 harness。
+# fake install 不会产生命中记录 → 上面那条守卫必须让整套判失败。外层 false-green 守卫
+# 靠它做行为验证, 而不是 grep 本文件里有没有某个字符串。
+if [[ -n "${PDG_FAULT_SELFTEST:-}" ]]; then
+  assert_fail_rollback "自检: 指定不存在的受管目标(应报未命中)" "PLATFORM=ios FAIL_TARGET=__no_such_target__"
+  echo "────────────────────────────────────────"
+  echo "通过 $pass, 失败 $nfail"
+  [[ "$nfail" == 0 ]]
+  exit $?
+fi
 
 assert_success ""
 assert_fail_rollback "git reset 失败"        "FAIL_RESET=1"
