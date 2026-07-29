@@ -209,6 +209,63 @@ if 'exit "$_UNINSTALL_FAILED"' in un:
 else:
     bad("卸载总是返回 0")
 
+# ── 项目自己写的注释头不许被当成残留 ──────────────────────────────────────
+# `.200` 实测撞出来的: 卸载其实干净了, 但 strip 之后 BANNER 那行注释还在, 而残留检查是拿
+# 正则扫全文的 —— 注释里那句 "table inet pdg" 被当成了一张真表。于是一次成功的卸载报
+# "磁盘上仍有 table inet pdg" 并以非 0 退出。任何拿退出码判断的自动化都会认为卸载失败。
+sys.path.insert(0, os.path.join(ROOT, "deploy", "bot"))
+import importlib.util as _ilu
+_spec = _ilu.spec_from_file_location("nftpurge_t", os.path.join(ROOT, "deploy/bot/nftpurge.py"))
+_np = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(_np)
+BANNER = "# ==== PrivDNS Gateway 管理区(table inet pdg): 由 pdg 自动维护, 勿手改 ===="
+_only_comment = "#!/usr/sbin/nft -f\n\nflush ruleset\n\n" + BANNER + "\n\ntable inet usercheck {\n\tchain sentinel {\n\t}\n}\n"
+if not _np.has_project_table(_only_comment):
+    ok("只剩项目注释头时判为**干净**(注释里的字面量不是表)")
+else:
+    bad("注释里的 table inet pdg 被当成残留 —— 成功的卸载会被判失败")
+_full = ("#!/usr/sbin/nft -f\n\nflush ruleset\n\n" + BANNER + "\n"
+         "table inet pdg\ndelete table inet pdg\n\n"
+         "table inet pdg {\n\tchain input {\n\t\ttype filter hook input priority filter; policy drop;\n"
+         "\t\tip saddr 10.0.0.0/8 tcp dport 8446 accept comment \"pdg-rescue\"\n\t}\n}\n\n"
+         "table inet usercheck {\n\tchain sentinel {\n"
+         "\t\tip saddr 10.99.0.0/16 tcp dport 8446 accept comment \"user-own-8446\"\n\t}\n}\n")
+_stripped = _np.strip_project(_full)
+if "user-own-8446" in _stripped and "usercheck" in _stripped:
+    ok("摘块后用户自建表与用户的 8446 规则原样保留")
+else:
+    bad("把用户自建表也摘掉了")
+if BANNER not in _stripped:
+    ok("项目自己写的注释头随块一起摘掉(它也是项目痕迹)")
+else:
+    bad("留下了项目的注释头 —— 下一步的残留检查会被它绊住")
+if not _np.has_project_table(_stripped):
+    ok("摘完之后 --check 判为干净(卸载可以如实报成功)")
+else:
+    bad("摘完仍判有残留")
+
+# ── 卸载文案不能超出它实际做的事 ────────────────────────────────────────────
+# `.200` 实测: 卸载完 /opt/pdg-bot 里还剩 bot.py / mitm_*.py / probe81.py 等 10 个程序文件,
+# 而收尾文案说的是"已删除 /opt/pdg-bot 下本项目安装的全部运行模块"。
+# lib/modules.sh 的 PDG_RUNTIME_MODULES 是**事务与救援闭包**那 17 个模块的真源, install.sh
+# 另有一路装了 Bot 本体与 MITM 组件, 它们不在这份清单里。清单本身没错, 错的是拿它当"全部"。
+_mod = open(os.path.join(ROOT, "lib/modules.sh"), encoding="utf-8").read()
+_listed = set(re.findall(r"^\S+ (\S+) \d{3}$", _mod, re.M))
+_inst = open(os.path.join(ROOT, "install.sh"), encoding="utf-8").read()
+_deployed = set(re.findall(r"/opt/pdg-bot/([A-Za-z0-9_.-]+\.(?:py|sh|tmpl))", _inst))
+_drift = sorted(_deployed - _listed)
+if _drift:
+    ok("已知集合差(install 装了但不在 modules.sh 清单里): %d 个" % len(_drift))
+else:
+    ok("install 装进 /opt/pdg-bot 的文件都在 modules.sh 清单里")
+# 只看**非注释行** —— 注释里为了说明问题会引用旧文案, 拿它判红就是自己踩自己刚修的坑。
+_code_lines = "\n".join(l for l in un.split("\n") if not l.lstrip().startswith("#"))
+if "全部运行模块" not in _code_lines:
+    ok("收尾文案没有把清单内的模块说成「全部」")
+else:
+    bad("文案称删除了「全部运行模块」, 但 install 另有 %d 个文件不在该清单内: %s"
+        % (len(_drift), "、".join(_drift[:6])))
+
 print("─" * 40)
 print("通过 %d, 失败 %d, 跳过 %d" % (PASS[0], FAIL[0], SKIP[0]))
 if PASS[0] + FAIL[0] == 0:

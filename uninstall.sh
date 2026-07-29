@@ -55,6 +55,8 @@ _RESCUE_RESIDUE=""
 if [[ -f "$_UN_HERE/lib/rescue.sh" ]]; then
   # shellcheck source=lib/rescue.sh
   source "$_UN_HERE/lib/rescue.sh"
+  # shellcheck disable=SC2034  # 前缀赋值是给 pdg_rescue_cleanup 的环境变量, shellcheck
+  # 看不进函数体所以判它"未使用"。CI 的 shellcheck 是阻断步骤, 这条告警会让整条流水线红。
   PDG_RESCUE_REPO="$_UN_HERE" _RESCUE_RESIDUE="$(pdg_rescue_cleanup "" "$_UN_NFT")" || true
 else
   _RESCUE_RESIDUE="找不到 lib/rescue.sh, 救援平面(凭据/状态/放行规则)未清理"
@@ -155,7 +157,16 @@ else
   echo "救援平面已完全移除(unit、凭据、状态、运行文件与 ${PDG_RESCUE_PORT} 放行规则)。"
 fi
 echo "保留: /etc/mosdns /etc/sing-box /etc/mihomo 与 Let's Encrypt 证书(配置与数据, 重装可复用)。"
-echo "已删除: /opt/pdg-bot 下本项目安装的全部运行模块(清单见 lib/modules.sh)。"
+echo "已删除: /opt/pdg-bot 下的事务与救援运行模块(清单见 lib/modules.sh 的 PDG_RUNTIME_MODULES)。"
+# 说"全部"是不准的: install.sh 另有一路把 Bot 本体(bot.py)、MITM 组件、探测脚本等装进同一个
+# 目录, 它们不在那份清单里, 卸载也不会删。`.200` 实测卸载完那里还剩 10 个项目程序文件, 而
+# 文案说的是"全部运行模块" —— 用户据此以为盘上干净了, 其实没有。这里如实列出剩了什么。
+if [[ -d /opt/pdg-bot ]]; then
+  _left="$(find /opt/pdg-bot -maxdepth 1 -type f \( -name '*.py' -o -name '*.sh' -o -name '*.tmpl' \) -printf '%f ' 2>/dev/null)"
+  if [[ -n "$_left" ]]; then
+    echo "保留(不在上述清单内, 需要清干净请用 --purge): /opt/pdg-bot 下 $_left"
+  fi
+fi
 # 归属证明不了 → 全保留。但不能只丢一句"已保留": 用户手工改过 unit 的情况下也会走到这里,
 # 机器上从此挂着一个没人管的 sing-box。逐条列出留了什么、为什么判不出来、怎么自己清。
 _sb_report_kept(){   # $1=with-config(--purge 时连配置目录一起列)

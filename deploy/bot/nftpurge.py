@@ -33,8 +33,23 @@ class Unrecognized(Exception):
     """配置里有 table inet pdg, 但形态不是我们生成的 —— 拒绝猜, 交给人处理。"""
 
 
+# 本项目写进配置的那行注释头(见 nftmerge.BANNER)。它自己就含着 "table inet pdg" 五个字 ——
+# 摘块时必须连它一起摘, 否则下面的残留检查会被自家的注释绊住。
+BANNER_RE = re.compile(r"^#[ \t]*=+[^\n]*PrivDNS Gateway[^\n]*\n", re.M)
+
+
+def _decomment(text):
+    """去掉 `#` 注释后的文本 —— 判"有没有表"只能看真语句。
+
+    nft 配置里 `#` 到行尾都是注释, 而项目自己的注释头里恰好写着 `table inet pdg`。拿正则
+    扫全文的话, 一次**干净的**卸载会因为那行注释被判成"仍有残留"并以非 0 退出, 任何按退出码
+    判断的自动化都会认为卸载失败(`.200` 上就是这么撞出来的)。
+    """
+    return "\n".join(l.split("#", 1)[0] for l in (text or "").split("\n"))
+
+
 def has_project_table(text):
-    return bool(re.search(r"\btable\s+inet\s+%s\b" % TABLE, text or ""))
+    return bool(re.search(r"\btable\s+inet\s+%s\b" % TABLE, _decomment(text)))
 
 
 def strip_project(text):
@@ -48,7 +63,7 @@ def strip_project(text):
         return t
     out, n = _MANAGED_RE.subn("", t)
     if n:
-        return out
+        return BANNER_RE.sub("", out)
     # 退一步: 只有定义块(没有声明+delete 那两行)的老形态也认, 但必须**恰好**一个块,
     # 且块里出现过项目自己的特征(hook input + policy drop, 或 redirect 到 mihomo 的 redir 口)。
     blocks = _BLOCK_RE.findall(t)
@@ -56,7 +71,7 @@ def strip_project(text):
         out = _BLOCK_RE.sub("", t, count=1)
         out = _DECL_RE.sub("", out)
         out = _DEL_RE.sub("", out)
-        return out
+        return BANNER_RE.sub("", out)
     raise Unrecognized(
         "配置里有 table inet %s, 但形态与本项目生成的不一致(%d 个定义块)—— "
         "拒绝擅自删除, 请自行确认后处理" % (TABLE, len(blocks)))
