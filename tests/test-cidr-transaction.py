@@ -72,6 +72,13 @@ MOS_BASE = (
     "      - matches: client_ip $npn_clients\n"
     "        exec: reject 3\n"
     "      - exec: reject 3\n"
+    # 必须带一个真的 server 插件。少了它这份配置根本不提供 DNS, 而事务的 mosdns_probe
+    # 在启动探针前要先把监听地址挪到 127.0.0.1 的随机高端口 —— 一个**没有任何监听项**的
+    # 候选让它无从下手, 于是按设计拒绝"在生产端口上做探针", 整笔事务 REFUSED。
+    # 本地跑不到这条分支(没有 netns 权限, 探针提前返回), CI 上有权限就撞上了。
+    "  - tag: udp_server\n"
+    "    type: udp_server\n"
+    '    args: {entry: main_sequence, listen: "127.0.0.1:0"}\n'
 )
 PROF_BASE = ("PDG_LOWMEM=0\nPDG_HIJACK_MODE=gfw\nPDG_PLATFORM=ios\n"
              "PDG_INTERNAL_CIDR=172.22.0.0/16\nPDG_TFO=1\n# 用户自己加的注释\nMY_OWN_KEY=keep-me\n")
