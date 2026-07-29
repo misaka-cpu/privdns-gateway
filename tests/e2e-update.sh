@@ -136,4 +136,99 @@ out=$(bash /usr/local/bin/pdg rollback 0 2>&1); rc=$?
   && ! grep -q 'after-snapshot' /etc/privdns-gateway/profile.env; } \
   && ok "配置被换回快照时刻的内容(快照后的改动已消失)" || bad "配置没回到快照状态"
 
+# ══ 静态文件全集在 update 后逐项同步 ═══════════════════════════════════════
+# 这条以前没有。11 个项目静态文件曾经只在 install.sh 里各写一行装, 不在任何清单里 ——
+# `pdg update` 从来不同步它们, Bot 本体永远停在装机那一版。真源统一之后必须有东西盯着。
+echo; echo "── 静态文件同步 ──"
+# shellcheck source=lib/modules.sh
+source "$E2E_ROOT/lib/modules.sh"
+PLAT="$(cat /etc/privdns-gateway/platform 2>/dev/null || echo android)"
+# 先把每一项都写成"旧版哨兵", 再跑一次 update, 逐项比对是否等于仓库当前版本。
+_stale=0
+while read -r src name _mode; do
+  [[ -n "$src" ]] || continue
+  [[ -f "/opt/pdg-bot/$name" ]] || continue
+  printf '#PDG-STALE-SENTINEL\n' > "/opt/pdg-bot/$name"
+  _stale=$((_stale+1))
+done < <(pdg_platform_modules "$PLAT")
+[[ "$_stale" -gt 0 ]] && ok "写入旧版哨兵: $_stale 项" || bad "一个静态文件都没找到, 前提不成立"
+
+git -C "$REPO" tag -d v9.9.9 >/dev/null 2>&1 || true
+git -C "$REPO" checkout -q v9.9.8 2>/dev/null || true
+out=$(bash /usr/local/bin/pdg update 2>&1); rc=$?
+_diff=0; _missing=0
+while read -r src name _mode; do
+  [[ -n "$src" ]] || continue
+  if [[ ! -f "/opt/pdg-bot/$name" ]]; then _missing=$((_missing+1)); continue; fi
+  if ! cmp -s "$REPO/$src" "/opt/pdg-bot/$name"; then
+    _diff=$((_diff+1)); echo "    不同步: $name"
+  fi
+done < <(pdg_platform_modules "$PLAT")
+{ [[ "$rc" == 0 ]] && [[ "$_diff" == 0 ]] && [[ "$_missing" == 0 ]]; } \
+  && ok "update 后静态文件逐项等于仓库版本(0 项不同步, 0 项缺失)" \
+  || bad "update 后仍有 $_diff 项不同步 / $_missing 项缺失 (rc=$rc)"
+# mode 也要对
+_modebad=0
+while read -r _src name mode; do
+  [[ -n "$name" && -f "/opt/pdg-bot/$name" ]] || continue
+  [[ "$(stat -c %a "/opt/pdg-bot/$name")" == "$mode" ]] || { _modebad=$((_modebad+1)); echo "    mode 不符: $name"; }
+done < <(pdg_platform_modules "$PLAT")
+[[ "$_modebad" == 0 ]] && ok "update 后 mode 与真源声明一致" || bad "$_modebad 项 mode 不符"
+
+# ══ 用户数据与运行状态跨 update 不变 ═══════════════════════════════════════
+echo; echo "── 用户数据保持 ──"
+printf 'PDG_BOT_TOKEN=123456:USERTOKEN\n' > /etc/privdns-gateway/bot.env
+printf '{"user":{"label":"我的"}}\n' > /opt/pdg-bot/rulesets.json
+printf 'dot.user.example\n' > /opt/pdg-bot/dot-domain
+_B=$(sha256sum /etc/privdns-gateway/bot.env | cut -d' ' -f1)
+_R=$(sha256sum /opt/pdg-bot/rulesets.json | cut -d' ' -f1)
+_D=$(sha256sum /opt/pdg-bot/dot-domain | cut -d' ' -f1)
+_P=$(sha256sum /etc/privdns-gateway/platform | cut -d' ' -f1)
+git -C "$REPO" tag -d v9.9.9 >/dev/null 2>&1 || true
+git -C "$REPO" checkout -q v9.9.8 2>/dev/null || true
+bash /usr/local/bin/pdg update >/dev/null 2>&1
+{ [[ "$(sha256sum /etc/privdns-gateway/bot.env | cut -d' ' -f1)" == "$_B" ]] \
+  && [[ "$(sha256sum /opt/pdg-bot/rulesets.json | cut -d' ' -f1)" == "$_R" ]] \
+  && [[ "$(sha256sum /opt/pdg-bot/dot-domain | cut -d' ' -f1)" == "$_D" ]] \
+  && [[ "$(sha256sum /etc/privdns-gateway/platform | cut -d' ' -f1)" == "$_P" ]]; } \
+  && ok "bot.env / rulesets.json / dot-domain / platform 跨 update 逐字节不变" \
+  || bad "用户数据被 update 改动了"
+
+# ══ 已是最新时零改动 ═══════════════════════════════════════════════════════
+echo; echo "── 幂等 ──"
+_before="$(find /opt/pdg-bot -type f -exec sha256sum {} + 2>/dev/null | sort | sha256sum)"
+out=$(bash /usr/local/bin/pdg update 2>&1); rc=$?
+_after="$(find /opt/pdg-bot -type f -exec sha256sum {} + 2>/dev/null | sort | sha256sum)"
+# cmd_update 没有"已是最新就早退"这条路径: 它每次都 reset 到最新 tag 再重装一遍。
+# 判据分两件事, 不要混:
+#   1) **文件不漂移** —— 无论这次是成功提交还是自检失败回滚, /opt/pdg-bot 都必须逐字节不变;
+#   2) 若返回非 0, 必须明说是回滚, 不许静默。
+# (本沙箱里前面几节故意扰动过服务态, doctor 判失败并回滚是正确行为, 不该被算成"不幂等"。)
+[[ "$_before" == "$_after" ]] \
+  && ok "已在最新 tag 上重复 update: /opt/pdg-bot 逐字节不变(无论提交还是回滚)" \
+  || bad "重复 update 造成了文件漂移"
+if [[ "$rc" == 0 ]]; then
+  ok "重复 update 成功提交"
+else
+  grep -qE '已回滚|回滚到' <<<"$out" \
+    && ok "重复 update 自检未过 → 明确回滚并返回非 0(不谎报成功)" \
+    || bad "返回非 0 却没说明回滚: $(tail -2 <<<"$out")"
+fi
+
+# ══ 未发布分支: 找不到对应 release 必须失败并保持现网 ══════════════════════
+# 这是**设计语义**, 不是缺陷: `pdg update` 只跟随发布 tag, 不跟 main、不跟任意 commit。
+echo; echo "── 未发布分支边界 ──"
+_snap="$(find /opt/pdg-bot -type f -exec sha256sum {} + 2>/dev/null | sort | sha256sum)"
+_cfg="$(sha256sum /etc/mosdns/config.yaml | cut -d' ' -f1)"
+git -C "$REPO" tag -l 'v*' | xargs -r git -C "$REPO" tag -d >/dev/null 2>&1
+( cd "$ORIGIN" || { echo "[FAIL] ORIGIN 不存在"; exit 1; }
+  git tag -l 'v*' | xargs -r git tag -d >/dev/null 2>&1 ) || true
+out=$(bash /usr/local/bin/pdg update 2>&1); rc=$?
+{ [[ "$rc" != 0 ]] && grep -qE '没有发布 tag|没有任何发布 tag|无法确定目标版本' <<<"$out"; } \
+  && ok "没有任何发布 tag → 明确失败, 不猜一个 commit 装上去" \
+  || bad "未发布状态下 update 竟然 rc=$rc: $(tail -2 <<<"$out")"
+{ [[ "$(find /opt/pdg-bot -type f -exec sha256sum {} + 2>/dev/null | sort | sha256sum)" == "$_snap" ]] \
+  && [[ "$(sha256sum /etc/mosdns/config.yaml | cut -d' ' -f1)" == "$_cfg" ]]; } \
+  && ok "失败后现网一个字节都没动" || bad "失败却改了现网"
+
 e2e_summary

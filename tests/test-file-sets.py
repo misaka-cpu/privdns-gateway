@@ -97,12 +97,17 @@ pdg = open(os.path.join(ROOT, "deploy/bot/pdg.sh"), encoding="utf-8").read()
 resc = open(os.path.join(ROOT, "lib/rescue.sh"), encoding="utf-8").read()
 
 # install.sh 里不许再出现"手写一行装进 /opt/pdg-bot"。注释行不算 —— 说明问题时会引用旧写法。
-inst_code = "\n".join(l for l in inst.split("\n") if not l.lstrip().startswith("#"))
-handwritten = re.findall(r"install -m\d+ [^\n]*?/opt/pdg-bot[^\n]*", inst_code)
-if not handwritten:
-    ok("install.sh 不再手写任何 /opt/pdg-bot 的部署行")
+# install.sh **和** pdg.sh(update 路径)两边都要查。第一版只扫了 install.sh, 结果 cmd_update
+# 里那份一模一样的手写清单原封不动地留着 —— 两份名单只要有一处忘了改就是新旧混装。
+_hand = []
+for _name, _txt in (("install.sh", inst), ("deploy/bot/pdg.sh", pdg)):
+    _code = "\n".join(l for l in _txt.split("\n") if not l.lstrip().startswith("#"))
+    for _m in re.findall(r"install -m\d+ [^\n]*?/opt/pdg-bot[^\n]*", _code):
+        _hand.append("%s: %s" % (_name, _m.strip()[:80]))
+if not _hand:
+    ok("install.sh 与 pdg.sh 都不再手写 /opt/pdg-bot 的部署行")
 else:
-    bad("install.sh 仍手写了 %d 行: %s" % (len(handwritten), handwritten[0][:90]))
+    bad("仍有 %d 行手写部署: %s" % (len(_hand), _hand[0]))
 
 if "pdg_install_runtime_modules" in inst and "pdg_install_runtime_modules" in pdg:
     ok("install 与 update 走同一个安装函数")
