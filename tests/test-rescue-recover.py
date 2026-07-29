@@ -14,6 +14,7 @@
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -81,12 +82,18 @@ t.commit()
 '''
 
 
+STUCK_MODE = 0o640          # 与 mosdns 配置的规范默认值不同, 便于分辨还原来源
+
+
 def make_stuck(box, content=None):
     """返回 (txid, mosdns 路径)。事务停在 APPLYING, 现网是新内容, before-image 是旧内容。"""
     p = box.root + "/etc/mosdns/config.yaml"
     os.makedirs(os.path.dirname(p), exist_ok=True)
     with open(p, "w", encoding="utf-8") as f:
         f.write(content if content is not None else ORIG_CFG)
+    # 故意给一个**不等于目标默认值**的权限位: recover 必须照 before-image 里记下的那个还原,
+    # 而不是拿目标的规范默认值顶上。区分不开这两者的话, "恢复"会顺手改掉现网权限。
+    os.chmod(p, STUCK_MODE)
     box.up("mosdns")
     env = dict(os.environ, **box.env)
     env["PYTHONPYCACHEPREFIX"] = os.path.join(work, "pycache")
@@ -219,6 +226,11 @@ if after.decode("utf-8") == ORIG_CFG:
     ok("正常恢复: 现网逐字节回到 before-image")
 else:
     bad("现网没还原: %r" % after[:40])
+mode_now = stat.S_IMODE(os.stat(mos_path).st_mode)
+if mode_now == STUCK_MODE:
+    ok("正常恢复: 权限位按 before-image 还原(0%o)" % mode_now)
+else:
+    bad("权限位没还原: 期望 0%o, 实际 0%o —— 恢复顺手改了现网权限" % (STUCK_MODE, mode_now))
 meta = json.load(open(os.path.join(box.env["PDG_TX_ROOT"], txid, "meta.json"), encoding="utf-8"))
 if meta.get("state") == "ROLLED_BACK" and meta.get("rollback_complete") is True:
     ok("正常恢复: 事务状态转 ROLLED_BACK 且标记完成")
