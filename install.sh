@@ -575,7 +575,9 @@ git config --system --get-all safe.directory 2>/dev/null | grep -qx '/opt/privdn
 # shellcheck source=lib/preserve.sh
 source "$REPO_DIR/lib/preserve.sh"
 _kept_rules=(); _new_rules=()
-for _rf in custom_direct custom_hijack unlock mitm_hijack; do
+# ruleset_hijack: 启用中的规则集所需的劫持域名(与 custom_hijack 一起构成"明确代理集")。
+# 目前是预留的空文件槽位 —— explicit_proxy 域名集要求文件存在, 缺了 mosdns 起不来。
+for _rf in custom_direct custom_hijack ruleset_hijack unlock mitm_hijack; do
   if pdg_keep_or_init "/etc/mosdns/rules/$_rf.txt"; then _kept_rules+=("$_rf"); else _new_rules+=("$_rf"); fi
 done
 (( ${#_kept_rules[@]} )) && c_g "保留已有规则集: ${_kept_rules[*]}"

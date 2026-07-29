@@ -77,7 +77,7 @@ fi
 if [[ -n "${MD:-}" ]] && command -v dig >/dev/null; then
   mkdir -p "$WORK/rules"; for f in geosite_cn geosite_apple custom_direct custom_hijack unlock; do : > "$WORK/rules/$f.txt"; done
   echo "example.com" > "$WORK/rules/geosite_geolocation-!cn.txt"   # 劫持集: example.com 及子域被劫持到本机(黑洞), 限流实测不依赖外网
-  : > "$WORK/rules/mitm_hijack.txt"
+  : > "$WORK/rules/mitm_hijack.txt"; : > "$WORK/rules/ruleset_hijack.txt"
   sed -e "s|__SERVER_IP__|10.0.0.9|g" -e "s|__INTERNAL_CIDR__|127.0.0.0/8|g" \
       -e "s|__CERT_DIR__|$WORK/certs|g" -e "s|__MOSDNS_CACHE__|8192|g" \
       -e "s|__HIJACK_SET_FILE__|geosite_geolocation-!cn.txt|g" \

@@ -503,7 +503,7 @@ e2e_seed_install(){
 # 渲染 mosdns 配置 + 规则文件。$1=劫持模式(all|gfw)
 e2e_seed_mosdns(){
   local mode="${1:-all}" f
-  for f in geosite_cn geosite_apple custom_direct custom_hijack unlock mitm_hijack \
+  for f in geosite_cn geosite_apple custom_direct custom_hijack ruleset_hijack unlock mitm_hijack \
            geosite_gfw 'geosite_geolocation-!cn'; do : > "/etc/mosdns/rules/$f.txt"; done
   printf 'domain:baidu.com\n' > /etc/mosdns/rules/geosite_cn.txt
   printf 'domain:blocked.test\n' > /etc/mosdns/rules/geosite_gfw.txt

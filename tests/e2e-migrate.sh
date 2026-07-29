@@ -118,4 +118,113 @@ bash /usr/local/bin/pdg __migrate >/dev/null 2>&1
 { [[ "$(gate)" == 2 ]] && grep -q 'geosite_gfw.txt' /etc/mosdns/config.yaml; } \
   && ok "gfw 模式: 劫持门保留且指向 gfw 劫持集(迁移不把它当 all 拆掉)" || bad "gfw 门=$(gate)"
 
+
+# ══ 场景四: v1.7.0 机器 → 明确代理必须先于 geosite_cn 判断 ═══════════════════
+# v1.7.0 及更早, 用户在 bot 里点名指到出口的域名只在 hijack_set 那道门被查, 而那道门排在
+# geosite_cn **之后**。上游 geosite 一旦把某域名归进 CN, DNS 就先返真实地址, 流量根本不进
+# 内核 —— 规则在、doctor 绿、就是不生效。这里跑真的 `pdg __migrate`, 验的是"老机器升上来
+# 之后这件事被修好了, 而用户自己的东西一样没动"。
+echo; echo "── 场景四: v1.7.0 机器升级(明确代理优先级)──"
+# 迁移走 pdgtx: 候选要过 mosdns 强校验(**真启动 mosdns**)。拿不到二进制这条就没得验。
+e2e_fetch_mosdns || e2e_skip "取不到 mosdns 二进制(明确代理迁移的候选校验要真启动它)"
+
+seed_v170_box(){
+  e2e_seed_mosdns all
+  # 退回 v1.7.0 形态: 摘掉本次新增的域名集 / 序列 / 判断
+  python3 "$E2E_ROOT/tests/helpers/strip-explicit-proxy.py" /etc/mosdns/config.yaml \
+    || bad "退回 v1.7.0 形态失败"
+  # 用户自己改过的 DNS 上游(bot『🌐 DNS 上游』写的)—— 迁移必须原样保留
+  sed -i 's#udp://223.5.5.5:53#udp://180.76.76.76:53#' /etc/mosdns/config.yaml
+  # 用户自己的规则/劫持表; 老机器上**没有** ruleset_hijack.txt(迁移要负责补出来)
+  printf '# pdg-bot 显式出口域名劫持表\ndomain:perfops2.byte-test.example\n' > /etc/mosdns/rules/custom_hijack.txt
+  printf 'domain:direct.example\n' > /etc/mosdns/rules/custom_direct.txt
+  rm -f /etc/mosdns/rules/ruleset_hijack.txt
+  printf 'android\n' > /etc/privdns-gateway/platform
+  printf 'mihomo\n'  > /etc/privdns-gateway/backend
+  rm -f /etc/privdns-gateway/platform.guessed
+}
+epline(){ grep -n 'qname \$explicit_proxy' /etc/mosdns/config.yaml | head -1 | cut -d: -f1; }
+cnline(){ grep -n 'qname \$geosite_cn'     /etc/mosdns/config.yaml | head -1 | cut -d: -f1; }
+fhline(){ grep -n 'qname \$force_hijack'   /etc/mosdns/config.yaml | head -1 | cut -d: -f1; }
+
+seed_v170_box
+grep -q explicit_proxy /etc/mosdns/config.yaml && bad "前置: 没退回 v1.7.0 形态"
+bash /usr/local/bin/pdg __migrate >/tmp/mig4.log 2>&1
+rc=$?
+[[ "$rc" == 0 ]] && ok "v1.7.0 迁移整体成功(exit 0)" || bad "迁移退出码 $rc: $(tail -5 /tmp/mig4.log)"
+
+{ grep -q '^  - tag: explicit_proxy$' /etc/mosdns/config.yaml \
+  && grep -q '^  - tag: explicit_proxy_seq$' /etc/mosdns/config.yaml \
+  && [[ -n "$(epline)" ]]; } \
+  && ok "补齐: 明确代理域名集 + 劫持序列 + internal_sequence 判断" \
+  || bad "补齐失败: $(tail -5 /tmp/mig4.log)"
+EP="$(epline)"; CN="$(cnline)"; FH="$(fhline)"
+{ [[ -n "$EP" && -n "$CN" && -n "$FH" ]] && [[ "$FH" -lt "$EP" ]] && [[ "$EP" -lt "$CN" ]]; } \
+  && ok "执行顺序: force_hijack($FH) → explicit_proxy($EP) → geosite_cn($CN)" \
+  || bad "顺序不对: force_hijack=$FH explicit_proxy=$EP geosite_cn=$CN"
+[[ -f /etc/mosdns/rules/ruleset_hijack.txt ]] \
+  && ok "补出 ruleset_hijack.txt(域名集要求文件存在, 缺了 mosdns 起不来)" \
+  || bad "没补 ruleset_hijack.txt"
+sed -n '/- tag: explicit_proxy$/,/^  - tag: /p' /etc/mosdns/config.yaml > /tmp/ep_set.txt
+{ grep -q 'custom_hijack.txt' /tmp/ep_set.txt && grep -q 'ruleset_hijack.txt' /tmp/ep_set.txt; } \
+  && ok "明确代理集含 custom_hijack.txt + ruleset_hijack.txt" || bad "明确代理集文件不全"
+sed -n '/- tag: explicit_proxy_seq$/,/^  - tag: /p' /etc/mosdns/config.yaml > /tmp/ep_seq.txt
+grep -q "black_hole $E2E_SIP" /tmp/ep_seq.txt \
+  && ok "A 记录劫持到本机网关地址 $E2E_SIP" || bad "劫持目标不是 $E2E_SIP"
+{ grep -q 'qtype 28' /tmp/ep_seq.txt && grep -q 'qtype 65' /tmp/ep_seq.txt; } \
+  && ok "AAAA / HTTPS(65) 抑制就位" || bad "序列缺 AAAA/HTTPS 抑制"
+# 普通代理域名不得被送进 MITM: 两条劫持序列必须分开, 且 mitm_hijack.txt 仍是空的
+{ grep -q 'goto force_hijack_seq' /etc/mosdns/config.yaml && ! grep -q 'mitm_hijack' /tmp/ep_set.txt; } \
+  && ok "明确代理集不含 mitm_hijack.txt(不会误送 pdg-mitm)" || bad "明确代理与 MITM 接管混在一起了"
+[[ ! -s /etc/mosdns/rules/mitm_hijack.txt ]] \
+  && ok "mitm_hijack.txt 仍为空(迁移没往里写普通代理域名)" || bad "mitm_hijack.txt 被写入了内容"
+
+# 用户自己的东西一样都不能动
+grep -q 'udp://180.76.76.76:53' /etc/mosdns/config.yaml \
+  && ok "保留: 用户自己改过的 DNS 上游" || bad "用户 DNS 上游被覆盖了"
+grep -q 'perfops2.byte-test.example' /etc/mosdns/rules/custom_hijack.txt \
+  && ok "保留: 用户的出口劫持表" || bad "custom_hijack.txt 被动了"
+grep -q 'direct.example' /etc/mosdns/rules/custom_direct.txt \
+  && ok "保留: 用户的直连表" || bad "custom_direct.txt 被动了"
+{ grep -q 'client_limiter' /etc/mosdns/config.yaml && grep -q 'unlock.txt' /etc/mosdns/config.yaml \
+  && grep -q 'geosite_geolocation-!cn.txt' /etc/mosdns/config.yaml; } \
+  && ok "保留: 限流 / 解锁支 / 劫持集(all 模式形态未退化)" || bad "既有形态被改坏"
+[[ "$(grep -c '!qname \$hijack_set' /etc/mosdns/config.yaml)" == 0 ]] \
+  && ok "all 模式仍是排除式(没有被顺手装上劫持门)" || bad "all 模式被装了劫持门"
+
+# 幂等 + 没有留下未完事务
+cp /etc/mosdns/config.yaml /tmp/m4
+bash /usr/local/bin/pdg __migrate >/tmp/mig5.log 2>&1
+cmp -s /tmp/m4 /etc/mosdns/config.yaml && ok "二跑幂等(mosdns 配置逐字节不变)" || bad "二跑改动了 mosdns 配置"
+[[ -z "$(python3 /opt/pdg-bot/pdgtx.py pending 2>/dev/null)" ]] \
+  && ok "没有遗留未完成事务" || bad "留下了 pending 事务"
+
+# doctor 要认这台机器已经修好了
+python3 /opt/pdg-bot/doctor.py --json > /tmp/doc4.json 2>/dev/null
+python3 "$E2E_ROOT/tests/helpers/doctor-explicit-proxy.py" /tmp/doc4.json ok \
+  && ok "doctor: 明确代理优先级判 ok" || bad "doctor 没判 ok: $(cat /tmp/doc4.json 2>/dev/null | head -c 200)"
+
+# ══ 场景五: 自定义形态 → fail-closed, 现网不动, doctor 点名 ═══════════════════
+echo; echo "── 场景五: 认不出的自定义 mosdns 形态 ──"
+seed_v170_box
+# 把迁移赖以定位的锚点拆掉 = "高度自定义、无法安全识别"
+python3 "$E2E_ROOT/tests/helpers/break-mosdns-anchor.py" /etc/mosdns/config.yaml || bad "构造自定义形态失败"
+# 先跑一遍让**与本次无关**的迁移(如内存模式决定的 cache size)各自落定 —— 否则"配置有没有
+# 被改"会被别人的正常改动淹掉, 断言就成了对整条迁移链的模糊判断。
+bash /usr/local/bin/pdg __migrate >/tmp/mig6a.log 2>&1
+grep -q explicit_proxy /etc/mosdns/config.yaml \
+  && bad "自定义形态: 竟然把明确代理插进去了(该 fail-closed)" \
+  || ok "自定义形态: 一次都没往认不出的配置里插东西(fail-closed)"
+cp /etc/mosdns/config.yaml /tmp/m5
+bash /usr/local/bin/pdg __migrate >/tmp/mig6.log 2>&1
+cmp -s /tmp/m5 /etc/mosdns/config.yaml \
+  && ok "自定义形态: 现网配置逐字节未被改(不猜着改)" \
+  || bad "自定义形态下配置被改了: $(diff -u /tmp/m5 /etc/mosdns/config.yaml | head -20 | tr '\n' '|')"
+grep -q '自定义形态' /tmp/mig6.log && ok "自定义形态: 迁移明确说明未迁移" || bad "迁移日志没说明"
+[[ -z "$(python3 /opt/pdg-bot/pdgtx.py pending 2>/dev/null)" ]] \
+  && ok "自定义形态: 没开事务, 也没留 pending" || bad "自定义形态下留了 pending 事务"
+python3 /opt/pdg-bot/doctor.py --json > /tmp/doc5.json 2>/dev/null
+python3 "$E2E_ROOT/tests/helpers/doctor-explicit-proxy.py" /tmp/doc5.json warn \
+  && ok "doctor: 点名这台机器未迁移(warn)" || bad "doctor 没点名: $(cat /tmp/doc5.json 2>/dev/null | head -c 200)"
+
 e2e_summary

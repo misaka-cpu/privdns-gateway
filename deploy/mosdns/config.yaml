@@ -43,6 +43,17 @@ plugins:
   - tag: force_hijack
     type: domain_set
     args: { files: ["/etc/mosdns/rules/mitm_hijack.txt"] }
+  # 明确代理集: 用户在 bot 里**点名**指到某个出口的域名(custom_hijack.txt), 以及启用中的
+  # 规则集所需的劫持域名(ruleset_hijack.txt, 目前是预留的空文件槽位)。
+  #
+  # 为什么必须单独成集、且排在 geosite_cn 之前: hijack_set 那道门在 CN 判断**之后**才查,
+  # 于是只要上游 geosite 把某个域名归进 CN, 用户明确加的出口规则就永远走不到 —— DNS 先返回
+  # 了真实地址, 流量根本不进 mihomo, 内核里那条 route 规则成了死规则。`.200` 上的实例是上游
+  # 把整个 byte-test.com 归入 CN, 于是 perfops2.byte-test.com → hk 完全不生效。
+  # 用户点名指定的出口, 优先级必须高于上游的分类猜测。
+  - tag: explicit_proxy
+    type: domain_set
+    args: { files: ["/etc/mosdns/rules/custom_hijack.txt","/etc/mosdns/rules/ruleset_hijack.txt"] }
   - tag: ecs_china
     type: ecs_handler
     args: {forward: false, send: true, preset: "139.226.48.0", mask4: 24, mask6: 48}
@@ -75,6 +86,20 @@ plugins:
       - exec: jump has_resp
       - matches: qtype 1
         exec: black_hole __SERVER_IP__
+  # 明确代理域名的劫持序列(经 goto 进入, 不返回): 抑制 AAAA/HTTPS + A 劫持到网关。
+  # 与 force_hijack_seq 的 DNS 行为相同, 但**分开两个序列**: force_hijack 那条服务于 MITM
+  # 接管(mihomo 会把它们路由去 pdg-mitm 终止 TLS), 这条只是让流量进 mihomo, 出口由数据模型
+  # 里的真实规则决定。合成一条会让人误以为普通代理域名也该写进 mitm_hijack.txt。
+  - tag: explicit_proxy_seq
+    type: sequence
+    args:
+      - matches: qtype 28
+        exec: reject 0
+      - matches: qtype 65
+        exec: reject 0
+      - exec: jump has_resp
+      - matches: qtype 1
+        exec: black_hole __SERVER_IP__
   - tag: internal_sequence
     type: sequence
     args:
@@ -85,6 +110,11 @@ plugins:
       # MITM 接管域名: 强制劫持(在 CN 判断之前, 即使 Apple/国内域名也劫持; goto 不返回)
       - matches: qname $force_hijack
         exec: goto force_hijack_seq
+      # 用户点名指到出口的域名 / 启用规则集所需的劫持域名: 在 CN 判断**之前**就劫持。
+      # 排在 geosite_cn 后面的话, 上游一旦把它归进 CN 就直接返真实地址, 用户明确加的出口
+      # 规则永远走不到(goto 不返回)。
+      - matches: qname $explicit_proxy
+        exec: goto explicit_proxy_seq
       - matches: qname $geosite_cn
         exec: $ecs_china
       - matches: qname $geosite_cn

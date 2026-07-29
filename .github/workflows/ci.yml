@@ -282,6 +282,10 @@ jobs:
       - name: "跨版本快照矩阵 (清单取自各版本 cmd_snapshot; unknown/legacy/特征冲突 fail-closed)"
         run: python3 tests/test-snapshot-matrix.py
 
+      # 基准取的是 `git show v1.7.0:` 的真实产物 —— 所以这条也吃 fetch-depth: 0。
+      - name: "明确代理优先级 (v1.7.0 模板幂等补齐/顺序自检/fail-closed + 事务回滚 + doctor 点名)"
+        run: python3 tests/test-mosdns-explicit-proxy.py
+
       - name: "救援来源过滤 (握手前按内核 peer 地址判; 不信 X-Forwarded-For)"
         run: python3 tests/test-rescue-source.py
 
@@ -394,6 +398,11 @@ jobs:
         run: bash tests/functional-test.sh
       - name: DNS 层 (真起 mosdns 验证 A 劫持 / AAAA·HTTPS 置空 / 国内直连 / 按来源门控)
         run: bash tests/dns-policy-test.sh
+      # 负控: 把"明确代理优先于 geosite_cn"那道判断从渲染产物里删掉, 上一条必须变红 ——
+      # 而且要**恰好**是那几条红、对照断言仍绿。否则那批断言的绿说明不了任何事。
+      - name: "DNS 分流负控 (删掉明确代理判断后, 对应断言必须变红且只有它们变红)"
+        timeout-minutes: 15
+        run: bash tests/test-explicit-proxy-nc.sh
       - name: DNS 限流 (rate_limiter 迁移幂等 + 真起 mosdns 验证超限 REFUSED + doctor)
         run: bash tests/test-mosdns-ratelimit.sh
       - name: 出站 schema (锁定版 sing-box check 各协议 parse_link 输出)

@@ -70,14 +70,17 @@ echo "qq.com" > "$WORK/rules/geosite_cn.txt"
 echo "domain:unlktest.example" > "$WORK/rules/unlock.txt"
 echo "example.com" > "$WORK/rules/geosite_geolocation-!cn.txt"   # 劫持集(all 模式=geolocation-!cn): 代理域名在集内 → 被劫持
 : > "$WORK/rules/mitm_hijack.txt"                                # MITM 接管域名(force_hijack): 本测试无, 留空
+: > "$WORK/rules/ruleset_hijack.txt"                             # 规则集所需劫持域名(explicit_proxy 的第二个文件)
+echo "blocked.example" > "$WORK/rules/geosite_gfw.txt"           # gfw 模式的劫持集(只含真被墙域名)
 
 # ── 渲染真实 config.yaml → 测试版(上游指 mock, 端口换高位, 去掉 DoT server 省证书)──
 MOCK_UP="{addr: \"udp://127.0.0.1:$MOCKP\"}"
-render_conf(){   # $1=内网段  $2=local 上游内联(默认=单 mock; 故障转移测试传 好+坏)
+render_conf(){   # $1=内网段  $2=local 上游内联(默认=单 mock; 故障转移测试传 好+坏)  $3=劫持集文件(默认 all 模式)
   local local_ups="${2:-$MOCK_UP}"
+  local hijack_file="${3:-geosite_geolocation-!cn.txt}"
   # 按上游里的特征 IP 区分 remote(1.1.1.1)/local(223.5.5.5) 整行替换(兼容 concurrent: 前缀)。
   sed -e "s/__SERVER_IP__/$SERVER_IP/g" -e "s#__INTERNAL_CIDR__#$1#g" -e "s#__CERT_DIR__#$WORK#g" \
-      -e "s#__MOSDNS_CACHE__#8192#g" -e "s#__HIJACK_SET_FILE__#geosite_geolocation-!cn.txt#g" \
+      -e "s#__MOSDNS_CACHE__#8192#g" -e "s#__HIJACK_SET_FILE__#$hijack_file#g" \
       "$ROOT/deploy/mosdns/config.yaml" \
     | sed -e "s#^\([[:space:]]*\)args: {.*1\.1\.1\.1.*}#\1args: { concurrent: 2, upstreams: [ $MOCK_UP ] }#" \
           -e "s#^\([[:space:]]*\)args: {.*223\.5\.5\.5.*}#\1args: { concurrent: 2, upstreams: [ $local_ups ] }#" \
@@ -86,6 +89,16 @@ render_conf(){   # $1=内网段  $2=local 上游内联(默认=单 mock; 故障�
           -e "s#0.0.0.0:53#127.0.0.1:$DNSP#g" \
           -e "/- tag: dot_server/,\$d" \
       > "$WORK/config.yaml"
+  if [[ "${PDG_NC_DROP_EXPLICIT_GATE:-0}" == 1 ]]; then
+    grep -q 'qname \$explicit_proxy' "$WORK/config.yaml" \
+      || fail "负控失效: 渲染产物里本来就没有 explicit_proxy 判断(删了个不存在的东西=空跑)"
+    sed -i '/matches: qname \$explicit_proxy/,+1d' "$WORK/config.yaml"
+    grep -q 'qname \$explicit_proxy' "$WORK/config.yaml" \
+      && fail "负控失效: 判断没被删掉"
+    grep -q 'tag: explicit_proxy_seq' "$WORK/config.yaml" \
+      || fail "负控过头: 连序列插件都删了(要删的只是那道判断)"
+    echo "[NC] 已从渲染产物里删除「明确代理优先于 geosite_cn」判断(序列插件保留)"
+  fi
   # 通用断言: 渲染后不得残留任何 __XXX__ 占位符(漏渲染=mosdns 加载失败/规则错位)
   local leftover; leftover="$(grep -oE '__[A-Z_]+__' "$WORK/config.yaml" | sort -u | tr '\n' ' ')"
   [[ -z "$leftover" ]] || fail "渲染后残留占位符: $leftover"
@@ -143,6 +156,62 @@ for i in $(seq 1 8); do
 done
 [[ "$down" -eq 0 ]] && ok "上游故障转移: 坏上游在列时 8/8 国内查询仍成功" \
   || ko "上游故障转移: $down/8 失败(concurrent 没生效 → 退回随机选 1 不转移?)"
+
+# ── 5. 明确代理优先级: 用户点名指到出口的域名, 必须先于 geosite_cn 判断 ─────────
+#
+# 现场故障(`.200`): 上游 geosite 把**整个 byte-test.com 归进 CN**, 而 hijack_set 那道门排在
+# CN 判断之后 —— 于是 bot 里加的 `perfops2.byte-test.com → hk` 从没生效过: DNS 先返了真实
+# 地址, 流量根本不进 mihomo, 内核里那条 route 规则永远匹配不到。doctor 全绿, 规则也确实在。
+#
+# 这里用的 byte-test.com / perfops2 只是**复刻那次现场的测试夹具**, 项目默认规则里没有、
+# 也不该有它们(字节跳动国内/海外业务不是靠域名后缀能自动分的)。
+note "种明确代理相关规则(byte-test.com 整站被上游判 CN, 只有 perfops2 被点名指到出口)…"
+{ echo "qq.com"; echo "byte-test.com"; echo "example.cn"; } > "$WORK/rules/geosite_cn.txt"
+{ echo "# pdg-bot 显式出口域名劫持表"
+  echo "domain:perfops2.byte-test.com"
+  echo "domain:mixed.example.cn"; } > "$WORK/rules/custom_hijack.txt"
+echo "domain:rs.example.cn"   > "$WORK/rules/ruleset_hijack.txt"
+echo "mixed.example.cn"       > "$WORK/rules/custom_direct.txt"    # 同时在直连表: 谁赢?
+echo "domain:wloc.example.cn" > "$WORK/rules/mitm_hijack.txt"      # WLOC/MITM 接管
+: > "$WORK/rules/unlock.txt"
+render_conf "127.0.0.0/8"; start_mosdns
+
+expect_eq      "明确代理: 被上游判 CN 的点名域名 A → 仍劫持到网关"  "$(q perfops2.byte-test.com A)" "$SERVER_IP"
+expect_empty   "明确代理: AAAA → 置空(mock 本会回 AAAA)"           "$(q perfops2.byte-test.com AAAA)"
+expect_empty   "明确代理: HTTPS(65) → 置空"                        "$(q perfops2.byte-test.com TYPE65)"
+# 兄弟域名必须不受影响 —— 这是"定向规则"而不是"把整个 zone 劫了"的分界线。
+expect_eq      "同 zone 未点名的兄弟域名 A → 仍走直连上游"          "$(q perfops.byte-test.com A)"  "$UPSTREAM_IP"
+expect_eq      "规则集劫持表(ruleset_hijack)里的 CN 域名 A → 进网关" "$(q rs.example.cn A)"          "$SERVER_IP"
+expect_empty   "规则集劫持表: AAAA → 置空"                          "$(q rs.example.cn AAAA)"
+expect_eq      "普通 geosite_cn 域名 A → 真实地址(不退化)"          "$(q www.qq.com A)"             "$UPSTREAM_IP"
+expect_nonempty "普通 geosite_cn 域名 AAAA → 不被置空"              "$(q www.qq.com AAAA)"
+expect_eq      "WLOC/MITM force_hijack 仍高于 geosite_cn"           "$(q wloc.example.cn A)"        "$SERVER_IP"
+# 直连表 + 劫持表同时有 → 劫持赢。所以 bot 把域名改判直连时**必须**同时清掉旧劫持记录,
+# 否则"设为直连"会静默失效。下一条就是清掉之后的对照。
+expect_eq      "既在直连表又在劫持表 → 劫持赢(故改直连必须清旧记录)" "$(q mixed.example.cn A)"      "$SERVER_IP"
+note "模拟 bot「改判直连」: 从 custom_hijack 移除该域名后重载…"
+{ echo "# pdg-bot 显式出口域名劫持表"; echo "domain:perfops2.byte-test.com"; } > "$WORK/rules/custom_hijack.txt"
+start_mosdns
+expect_eq      "清除旧劫持记录后 → 真的回到直连"                    "$(q mixed.example.cn A)"       "$UPSTREAM_IP"
+expect_eq      "清除后: 另一条点名规则不受牵连"                     "$(q perfops2.byte-test.com A)" "$SERVER_IP"
+
+# ── 6. gfw 模式: 劫持集只含真被墙域名, 明确代理仍须优先 ────────────────────────
+note "渲染(gfw 模式: 劫持集=geosite_gfw.txt)并重起 mosdns…"
+render_conf "127.0.0.0/8" "" "geosite_gfw.txt"; start_mosdns
+expect_eq      "gfw 模式: 点名的 CN 域名 A → 仍劫持到网关"          "$(q perfops2.byte-test.com A)" "$SERVER_IP"
+expect_empty   "gfw 模式: 点名域名 AAAA → 置空"                     "$(q perfops2.byte-test.com AAAA)"
+expect_eq      "gfw 模式: 被墙域名 A → 劫持到网关"                  "$(q blocked.example A)"        "$SERVER_IP"
+expect_eq      "gfw 模式: 非墙海外域名 A → 真实地址(SSH/直连不被劫)" "$(q example.com A)"           "$UPSTREAM_IP"
+expect_nonempty "gfw 模式: 非墙海外域名 AAAA → 不被置空"            "$(q example.com AAAA)"
+expect_eq      "gfw 模式: 普通国内域名 A → 直连上游"                "$(q www.qq.com A)"             "$UPSTREAM_IP"
+expect_eq      "gfw 模式: WLOC/MITM 仍最高优先级"                   "$(q wloc.example.cn A)"        "$SERVER_IP"
+
+# ── 7. all 模式复核(第 4a 段已验非CN劫持; 这里确认换回 all 后明确代理依旧成立)──
+note "渲染(all 模式: 劫持集=geolocation-!cn)并重起 mosdns…"
+render_conf "127.0.0.0/8"; start_mosdns
+expect_eq      "all 模式: 点名的 CN 域名 A → 劫持到网关"            "$(q perfops2.byte-test.com A)" "$SERVER_IP"
+expect_eq      "all 模式: 非CN 域名 A → 劫持到网关(原语义不变)"     "$(q example.com A)"            "$SERVER_IP"
+expect_empty   "all 模式: 非CN 域名 AAAA → 置空(原语义不变)"        "$(q example.com AAAA)"
 
 echo "────────────────────────────────────────"
 echo "通过 $pass, 失败 $nfail"

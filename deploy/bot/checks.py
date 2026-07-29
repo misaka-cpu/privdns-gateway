@@ -536,6 +536,47 @@ def check_mosdns_ratelimit():
         return _RL_WARN
     return ("ok", "限流", "单客户端 QPS 兜底已就位(rate_limiter qps200/burst400, reject 5, 缓存前)")
 
+# ── 明确代理优先级(点名的出口域名必须先于 geosite_cn 判断)────────────────────
+_EP_FILES = ("/etc/mosdns/rules/custom_hijack.txt", "/etc/mosdns/rules/ruleset_hijack.txt")
+
+def check_mosdns_explicit_proxy():
+    """bot 里**点名**指到某个出口的域名(custom_hijack.txt)、以及启用规则集所需的劫持域名
+    (ruleset_hijack.txt), 在 internal_sequence 里必须排在 geosite_cn **之前**。
+
+    为什么单独检: 排在后面时 doctor 的其他项全绿 —— 内核里那条出口规则确实存在, mosdns 也在
+    跑, 只是上游 geosite 一旦把域名归进 CN, DNS 就先返真实地址, 流量根本不进 mihomo, 那条
+    规则永远匹配不到。除了显式比一次顺序, 没有别的地方看得出来。
+
+    缺插件 → warn 并**点名这台机器的配置未迁移**(老装未更新, 或自定义形态被迁移 fail-closed
+    地拒绝了 —— 两种都属合法缺席, 不 fail); 插件在但顺序反了 → fail(本项目的渲染/迁移都不会
+    产出这种配置, 出现即为真故障)。只读。"""
+    conf = _mos()
+    if not conf:
+        return ("warn", "明确代理优先级", "读不到 mosdns 配置")
+    blk = _internal_seq_block(conf)
+    gi = blk.find("qname $explicit_proxy")
+    ci = blk.find("qname $geosite_cn")
+    has_set = re.search(r"-\s*tag:\s*explicit_proxy\s*\n\s*type:\s*domain_set", conf)
+    has_seq = re.search(r"-\s*tag:\s*explicit_proxy_seq\s*\n\s*type:\s*sequence", conf)
+    if not has_set or not has_seq or gi < 0:
+        return ("warn", "明确代理优先级",
+                "这台机器的 /etc/mosdns/config.yaml **未迁移**(缺 explicit_proxy 域名集/序列/判断)"
+                ": bot 里点名指到出口的域名, 一旦被上游 geosite 归进 CN 就会返真实地址、不进 "
+                "mihomo, 内核里那条出口规则不会生效。跑 sudo pdg update 触发迁移; 若因配置是"
+                "自定义形态而被拒绝(不猜着改), 需手动在 internal_sequence 的 geosite_cn 判断"
+                "**之前**加 'qname $explicit_proxy → goto explicit_proxy_seq'。")
+    if ci >= 0 and gi > ci:
+        return ("fail", "明确代理优先级",
+                "explicit_proxy 判断排在 geosite_cn **之后** —— 点名指到出口的域名会被判直连, "
+                "内核规则形同虚设。把该判断移到 geosite_cn 之前。")
+    missing = [f for f in _EP_FILES if f not in conf]
+    if missing:
+        return ("warn", "明确代理优先级",
+                "explicit_proxy 域名集缺文件: " + ", ".join(missing))
+    return ("ok", "明确代理优先级",
+            "点名的出口域名先于 geosite_cn 判断(custom_hijack + ruleset_hijack)")
+
+
 PROFILE_ENV = "/etc/privdns-gateway/profile.env"
 
 def check_mem():
@@ -912,7 +953,7 @@ def check_transactions():
 
 ALL = [check_platform, check_services, check_bot_credentials, check_core_version, check_dot_arecord, check_dot_domain_sync,
        check_internal_cidr, check_cidr_drift, check_nft, check_nft_input_chains, check_redirect, check_gms,
-       check_mosdns_ratelimit, check_mem,
+       check_mosdns_ratelimit, check_mosdns_explicit_proxy, check_mem,
        check_cert, check_dns, check_core_config, check_rulesets, check_mitm_structure, check_mitm,
        check_transactions]
 ALERT = [check_services, check_dns, check_cert]  # healthcheck 用的轻量子集(运行期故障)

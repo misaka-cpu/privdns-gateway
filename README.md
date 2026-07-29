@@ -184,7 +184,7 @@ ssh <你的网关> sudo pdg rescue fingerprint
 
 | 层 | 组件 | 说明 |
 |---|---|---|
-| DNS | mosdns v5 | 国内直连；代理域名 A 记录劫持到本机、AAAA / HTTPS 置空；按来源 IP 分支；ECS 处理；缓存；DoT（853）；可选 GFWList 劫持模式 |
+| DNS | mosdns v5 | 按来源 IP 分支；判断顺序为 WLOC/MITM 接管 → **你点名指到出口的域名** → 国内直连 → 自动海外判断；代理域名 A 记录劫持到本机、AAAA / HTTPS 置空；ECS 处理；缓存；DoT（853）；可选 GFWList 劫持模式 |
 | 流量 | mihomo（clash.meta） | nft REDIRECT 入站 + redir 监听 + SNI 嗅探。多出口故障切换；提供 clash_api（观测面板）。改配置前先校验，失败回滚 |
 | 管理 | Telegram Bot（Python 标准库） | 出口、分流、规则集、测速、流量、备份恢复、iOS 描述文件、自定义域名、WLOC；改配置前先校验，失败回滚 |
 | 位置改写 | pdg-mitm（可选，iOS） | 自签 CA + 终止 TLS + 转发并替换 `gs-loc` 响应坐标 |
@@ -192,6 +192,20 @@ ssh <你的网关> sudo pdg rescue fingerprint
 | 防火墙 | nftables | 对全网只放行 SSH；DNS、数据、探测端口只放行内网卡来源段；mihomo 用 REDIRECT 入站，同样限内网卡来源 |
 
 内核版本由 `pdg update` 随 PrivDNS Gateway 发布版指定并逐字节校验（SHA256）后安装。
+
+**你点名的规则优先于自动判断。** 在 Bot 里把某个域名指到出口后，mosdns 会在「这个域名算不算
+国内」之前就先按你的规则劫持它。上游的 geosite 分类是策展结果，会把整个二级域（含它下面本
+该走代理的子域）归进国内；判断排在后面时，DNS 先返回了真实地址，流量根本不进 mihomo，内核
+里那条出口规则永远匹配不到 —— 规则在、`pdg doctor` 也绿，就是不生效。这一层只决定「进不进
+mihomo」，**具体走哪个出口仍由数据模型里的真实规则决定**，与 iOS 的 MITM 接管（`pdg-mitm`）
+是两条独立的链路，普通代理域名不会被送去终止 TLS。
+
+管到这件事的两个文件：
+
+- `/etc/mosdns/rules/custom_hijack.txt` —— Bot 里「域名 → 出口」写入，改判直连或删规则时移出。
+- `/etc/mosdns/rules/ruleset_hijack.txt` —— 规则集需要额外劫持的域名。**目前项目不会自动往里
+  写**：规则集下发的是 mihomo 的 `.mrs`，里面的域名清单不在网关这一侧展开。它是给管理员手动
+  补的槽位（写 `domain:example.com` 一行一个，然后 `sudo pdg restart`），优先级与上面那份相同。
 
 **配置写入统一走事务。** 出口、分流、规则集、DNS 上游、防火墙、TFO、证书、WLOC 开关、备份恢复
 等所有会改动生产配置的操作，都在一笔配置事务里完成：候选先校验，再原子落盘，然后按目标状态

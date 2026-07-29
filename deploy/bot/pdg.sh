@@ -1601,13 +1601,13 @@ migrate_mosdns_mitm(){
 import sys
 f, sip, rdir = sys.argv[1], sys.argv[2], sys.argv[3]
 s = open(f).read()
-# 1. force_hijack domain_set(锚点: ecs_china 定义行之前)
+# 1. force_hijack domain_set(锚点: 明确代理集之前; 没有它就退回 ecs_china —— 老配置的原锚点)
+anchor_ds = '  - tag: explicit_proxy\n' if '  - tag: explicit_proxy\n' in s else '  - tag: ecs_china'
 ds = ('  - tag: force_hijack\n'
       '    type: domain_set\n'
-      '    args: { files: ["%s/mitm_hijack.txt"] }\n'
-      '  - tag: ecs_china') % rdir
-assert s.count('  - tag: ecs_china') == 1, 'ecs_china 锚点不唯一'
-s = s.replace('  - tag: ecs_china', ds, 1)
+      '    args: { files: ["%s/mitm_hijack.txt"] }\n' % rdir) + anchor_ds
+assert s.count(anchor_ds) == 1, '锚点不唯一: %r' % anchor_ds
+s = s.replace(anchor_ds, ds, 1)
 # 2. force_hijack_seq(锚点: internal_sequence 定义行之前); black_hole 用真实网关 IP
 seq = ('  - tag: force_hijack_seq\n'
        '    type: sequence\n'
@@ -1620,10 +1620,18 @@ seq = ('  - tag: force_hijack_seq\n'
        '      - matches: qtype 1\n'
        '        exec: black_hole %s\n'
        '  - tag: internal_sequence') % sip
-assert s.count('  - tag: internal_sequence') == 1, 'internal_sequence 锚点不唯一'
-s = s.replace('  - tag: internal_sequence', seq, 1)
-# 3. 优先级规则(锚点: 第一个 geosite_cn 匹配之前, 即 CN 判定前强制接管)
-anchor = '      - matches: qname $geosite_cn'
+# 锚点同上: 有明确代理序列就排在它之前, 让插件定义顺序与模板一致(功能上按 tag 引用, 与顺序无关)
+anchor_seq = ('  - tag: explicit_proxy_seq\n' if '  - tag: explicit_proxy_seq\n' in s
+              else '  - tag: internal_sequence')
+seq = seq.replace('  - tag: internal_sequence', anchor_seq)
+assert s.count(anchor_seq) == 1, '锚点不唯一: %r' % anchor_seq
+s = s.replace(anchor_seq, seq, 1)
+# 3. 优先级规则。锚点是"第一道会抢先给出答案的判断":
+#    有明确代理判断时必须排在**它**之前(MITM 接管是最高优先级, 而它已经在 CN 判定之前);
+#    没有(老配置)就仍用第一个 geosite_cn —— 原语义不变。
+anchor = '      - matches: qname $explicit_proxy'
+if anchor not in s:
+    anchor = '      - matches: qname $geosite_cn'
 rule = ('      - matches: qname $force_hijack\n'
         '        exec: goto force_hijack_seq\n' + anchor)
 i = s.find(anchor)
@@ -2019,6 +2027,60 @@ migrate_mosdns_hijack_shape(){
   fi
 }
 
+# 明确代理优先于 geosite_cn(v1.7.0 → 之后)。
+#
+# v1.7.0 及更早, 用户在 bot 里点名指到出口的域名只在 hijack_set 那道门被查, 而那道门排在
+# geosite_cn **之后**。上游 geosite 一旦把域名归进 CN(实例: 整个 byte-test.com), DNS 就先
+# 返真实地址, 流量根本不进 mihomo —— 内核里那条 route 规则成了死规则, 而 doctor 看不出问题:
+# 规则确实在, 只是永远匹配不到。
+#
+# 走 **pdgtx 事务**而不是直接改文件: 候选要过 mosdns 探针(真启动 mosdns 解析它), 失败就整笔
+# 回滚、现网一个字节不动; 服务重启失败同样回滚。不另写一套手工事务。
+migrate_mosdns_explicit_proxy(){
+  local mc=/etc/mosdns/config.yaml wd txm sip out rc=0
+  [[ -f "$mc" ]] || return 0
+  # shellcheck source=/dev/null
+  source "$REPO_DIR/lib/mosdns.sh" 2>/dev/null || return 0
+  # 已经齐了 → 什么都不做(幂等), 连事务都不开
+  if grep -q "tag: explicit_proxy$" "$mc" && grep -q 'qname \$explicit_proxy' "$mc"; then
+    return 0
+  fi
+  txm="$(_pdg_module pdgtx.py)" || { c_y "  找不到 pdgtx.py, 明确代理优先级未迁移。"; return 0; }
+  local pend; pend="$(python3 "$txm" pending 2>/dev/null)"
+  if [[ -n "$pend" ]]; then
+    c_y "  有未完成的配置事务, 明确代理优先级本次不迁移(未改动任何文件)。"; return 0
+  fi
+  sip="$(sed -n 's/^PDG_SERVER_IP=//p' /etc/privdns-gateway/profile.env 2>/dev/null | tail -1)"
+  wd="$(mktemp -d)" || return 0
+  # 先在**副本**上试改: 形态不认识就到此为止, 现网从未被碰过。
+  cp "$mc" "$wd/cand.yaml" || { rm -rf "$wd"; return 0; }
+  if ! out=$(_mosdns_explicit_proxy "$wd/cand.yaml" "$sip" 2>"$wd/err"); then
+    c_y "  mosdns 配置是自定义形态, 明确代理优先级未迁移(不猜着改): $(tr -d '\n' < "$wd/err" | head -c 120)"
+    c_y "  → sudo pdg doctor 会继续点名这一项。"
+    rm -rf "$wd"; return 0
+  fi
+  [[ "$out" == changed ]] || { rm -rf "$wd"; return 0; }
+  : > /etc/mosdns/rules/ruleset_hijack.txt 2>/dev/null || true   # 域名集要求文件存在
+  local txid; txid="$(python3 "$txm" new --source cli --op mosdns-explicit-proxy 2>"$wd/err")" || {
+    c_y "  开不了配置事务, 明确代理优先级未迁移。"; rm -rf "$wd"; return 0; }
+  python3 "$txm" read --target mosdns_conf > "$wd/raw" 2>"$wd/err" || rc=1
+  if [[ "$rc" == 0 ]]; then
+    local sha; sha="$(head -1 "$wd/raw")"
+    python3 "$txm" stage --tx "$txid" --target mosdns_conf --file "$wd/cand.yaml" --expect "$sha" 2>"$wd/err" || rc=1
+  fi
+  if [[ "$rc" != 0 ]]; then
+    python3 "$txm" abort "$txid" >/dev/null 2>&1 || true
+    c_y "  候选暂存失败, 明确代理优先级未迁移(现网未改动)。"; rm -rf "$wd"; return 0
+  fi
+  python3 "$txm" service --tx "$txid" --action restart:mosdns >/dev/null 2>&1
+  if python3 "$txm" apply --tx "$txid" >/dev/null 2>"$wd/err"; then
+    c_g "  已把「用户点名指到出口的域名」提到 geosite_cn 之前(显式代理优先)。"
+  else
+    c_y "  明确代理优先级迁移未通过校验/健康门, 已回滚: $(tr -d '\n' < "$wd/err" | head -c 120)"
+  fi
+  rm -rf "$wd"
+}
+
 # 老装(v1.4.x)从来没有 backend 标记。据现场证据把它落地(unit 文件存在才算数, 免得 is-active
 # 的异常输出误导), 让"这台机器此刻跑的是哪个核"成为显式状态而非默认值。
 # v1.6.0 起唯一内核是 mihomo, 本函数仍有用: 它跑在 migrate_drop_singbox **之前**, 于是万一
@@ -2088,6 +2150,7 @@ run_all_migrations(){
   migrate_mosdns_ratelimit || true; migrate_lowmem || true; migrate_mihomo_safepaths || true
   migrate_deploy_botfiles || true; migrate_deploy_units || true
   migrate_mosdns_hijack_shape || true
+  migrate_mosdns_explicit_proxy || true
   migrate_custom_hijack || true
   migrate_mosdns_mitm || true; migrate_pdg_mitm_service || true
   migrate_android_cleanup || true

@@ -27,7 +27,7 @@ eval "$(sed -n '/^migrate_mosdns_mitm(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh")"
 # ── 规则 fixture(都在 $WORK/rules, 迁移从 geosite_cn 路径推导目录)──
 mkdir -p "$WORK/rules"
 echo "qq.com" > "$WORK/rules/geosite_cn.txt"
-: > "$WORK/rules/geosite_apple.txt"; : > "$WORK/rules/custom_direct.txt"; : > "$WORK/rules/custom_hijack.txt"; : > "$WORK/rules/unlock.txt"
+: > "$WORK/rules/geosite_apple.txt"; : > "$WORK/rules/custom_direct.txt"; : > "$WORK/rules/custom_hijack.txt"; : > "$WORK/rules/ruleset_hijack.txt"; : > "$WORK/rules/unlock.txt"
 echo "example.com" > "$WORK/rules/geosite_geolocation-!cn.txt"
 # (mitm_hijack.txt 故意不建: 迁移应自动补)
 
@@ -49,7 +49,7 @@ s = re.sub(r'  - tag: force_hijack_seq\n(?:.*\n)*?      - matches: qtype 1\n    
 s = re.sub(r'      # MITM 接管域名[^\n]*\n      - matches: qname \$force_hijack\n        exec: goto force_hijack_seq\n', '', s)
 open(sys.argv[2], 'w').write(s)
 PY
-grep -q 'force_hijack' "$WORK/v14.yaml" && bad "v1.4.x fixture 构造失败(仍含 force_hijack)" || ok "构造 v1.4.x fixture(无 force_hijack)"
+grep -vE '^[[:space:]]*#' "$WORK/v14.yaml" | grep -q 'force_hijack' && bad "v1.4.x fixture 构造失败(仍含 force_hijack)" || ok "构造 v1.4.x fixture(无 force_hijack)"
 
 start_mosdns(){   # 起 mosdns 加载 $1, 成功返回0
   "$MD" start -c "$1" -d "$WORK" > "$WORK/mos.out" 2>&1 & PIDS+=($!)
@@ -107,15 +107,25 @@ snap="$(cat "$WORK/custom.yaml")"
 migrate_mosdns_mitm "$WORK/custom.yaml"
 [[ "$(cat "$WORK/custom.yaml")" == "$snap" ]] && ok "自定义配置(无锚点)→ 跳过不动" || bad "误改了自定义配置"
 
-# ── D. 失败还原: 锚点不唯一(两个 ecs_china)→ 生成失败, 原样还原 ──────────────
-# 用 v1.4.x fixture 复制一份并制造重复 ecs_china(python assert count==1 会失败)
-sed '0,/  - tag: ecs_china/s//  - tag: ecs_china\n    type: ecs_handler\n    args: {}\n  - tag: ecs_china/' "$WORK/v14.yaml" > "$WORK/dup.yaml"
-[[ "$(grep -c '  - tag: ecs_china' "$WORK/dup.yaml")" == 2 ]] || bad "构造重复 ecs_china 失败"
-snap="$(cat "$WORK/dup.yaml")"
-migrate_mosdns_mitm "$WORK/dup.yaml"
-[[ "$(cat "$WORK/dup.yaml")" == "$snap" ]] && ok "生成失败(锚点不唯一)→ 配置原样还原(不留半截)" || bad "失败未还原"
-grep -q 'tag: force_hijack$' "$WORK/dup.yaml" && bad "失败却注入了 force_hijack" || ok "失败: 未注入 force_hijack"
-ls "$WORK"/dup.yaml.premitm.* >/dev/null 2>&1 && rm -f "$WORK"/dup.yaml.premitm.*   # 清备份
+# ── D. 失败还原: 锚点不唯一 → 生成失败, 原样还原 ─────────────────────────────
+# 锚点有两条分支: 配置里有明确代理集时用它, 老配置(没有)退回 ecs_china。两条都要验 ——
+# 只验一条的话, 另一条分支上"锚点不唯一"会静静地把配置改成半截。
+dup_case(){   # $1=用例名 $2=被复制的锚点行 $3=源文件
+  local out="$WORK/dup.yaml"
+  awk -v a="$2" 'BEGIN{done=0} {print} $0==a && !done{print "    type: ecs_handler"; print "    args: {}"; print a; done=1}' "$3" > "$out"
+  [[ "$(grep -c -- "^$2$" "$out")" == 2 ]] || { bad "$1: 构造重复锚点失败"; return; }
+  local snap; snap="$(cat "$out")"
+  migrate_mosdns_mitm "$out"
+  [[ "$(cat "$out")" == "$snap" ]] && ok "$1: 锚点不唯一 → 原样还原(不留半截)" || bad "$1: 失败未还原"
+  grep -q 'tag: force_hijack$' "$out" && bad "$1: 失败却注入了 force_hijack" || ok "$1: 未注入 force_hijack"
+  rm -f "$WORK"/dup.yaml.premitm.* 2>/dev/null
+}
+# D1: 有明确代理集 → 锚点是 explicit_proxy
+dup_case "锚点=explicit_proxy" "  - tag: explicit_proxy" "$WORK/v14.yaml"
+# D2: 老配置(摘掉明确代理集)→ 锚点退回 ecs_china
+cp "$WORK/v14.yaml" "$WORK/v14-old.yaml"
+python3 "$ROOT/tests/helpers/strip-explicit-proxy.py" "$WORK/v14-old.yaml" || bad "构造老配置失败"
+dup_case "锚点=ecs_china(老配置)" "  - tag: ecs_china" "$WORK/v14-old.yaml"
 
 echo "────────────────────────────────────────"
 echo "通过 $pass, 失败 $nfail"
