@@ -19,7 +19,22 @@ E2E_PASS=0; E2E_FAIL=0
 ok(){ echo "[OK]   $1"; E2E_PASS=$((E2E_PASS+1)); }
 bad(){ echo "[FAIL] $1"; E2E_FAIL=$((E2E_FAIL+1)); }
 e2e_summary(){ echo "────────────────────────────────────────"; echo "通过 $E2E_PASS, 失败 $E2E_FAIL"; [[ "$E2E_FAIL" == 0 ]]; }
-e2e_skip(){ echo "[SKIP] $1"; echo "────────────────────────────────────────"; echo "通过 0, 失败 0(已跳过)"; exit 0; }
+# 缺能力时怎么办, 取决于**在哪跑**:
+#   · 开发者本机偶尔没网、拉不到内核 → 记 [SKIP] 并退 0 是合理的, 否则没法干活;
+#   · CI 或 PDG_TEST_STRICT=1 → 必须 FAIL。这里跳过的都是"取不到真二进制"这类前提,
+#     跳过之后整条用例一个断言都不跑, 退 0 就是零断言假绿 —— 而 CI 上没人会去看
+#     "通过 0, 失败 0" 这行字, 只会看到一个绿勾。
+e2e_skip(){
+  echo "[SKIP] $1"
+  echo "────────────────────────────────────────"
+  if [[ -n "${PDG_TEST_STRICT:-}" && "${PDG_TEST_STRICT}" != "0" ]] || [[ "${CI:-}" == "true" ]]; then
+    echo "严格模式(PDG_TEST_STRICT/CI): 缺必需前提 → 判失败, 不拿 SKIP 冒充通过"
+    echo "通过 0, 失败 1(前提缺失)"
+    exit 1
+  fi
+  echo "通过 0, 失败 0(已跳过)"
+  exit 0
+}
 
 # 沙盒里的仓库文件未必归当前 uid(CI 容器 job: 工作区归 runner uid, 容器内是 root),
 # git 会以 "dubious ownership" 拒绝一切操作 —— update 那条 e2e 连 tag 都读不到。

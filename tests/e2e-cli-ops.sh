@@ -28,6 +28,11 @@ e2e_seed_nft
 printf 'mihomo\n' > /etc/privdns-gateway/backend
 printf 'android\n' > /etc/privdns-gateway/platform
 e2e_fetch_mihomo || e2e_skip "取不到 mihomo 二进制"
+# §7 的 detect-cidr 会走一笔真事务, 候选校验要拿**真 mosdns** 解析新配置 —— 没有它,
+# 事务在校验门就 REFUSED, 7a/7b/7e/7i/7j/7k/7l 全部失败。这条以前一直没写:
+# 单独跑必失败, 只有在同一个容器里先跑过 e2e-install.sh(它会装 mosdns)时才碰巧变绿。
+# CI 的矩阵是一个脚本一个干净容器, 所以那里从来没绿过。
+e2e_fetch_mosdns || e2e_skip "取不到 mosdns 二进制(§7 的候选校验要拿真 mosdns 解析配置)"
 
 # unit 用**真实形态**(带 ExecStart=…/usr/local/bin/<svc>): 幂等迁移是按 unit 内容判断要不要
 # 补 SAFE_PATHS 的, 拿 ExecStart=/bin/true 这种占位 unit 当现场, 那条迁移每次都会重跑一遍并
