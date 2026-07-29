@@ -16,6 +16,7 @@
   → 内核二进制(下载/校验/解压) → py_compile → mihomo -t → nft -c → daemon-reload
   → 服务重启 → doctor → 提交或 cmd_rollback
 """
+import json
 import os
 import re
 import subprocess
@@ -218,6 +219,78 @@ if rc == 0 and got == "755":
     ok("源文件 mode 是 600, 部署后按 manifest 归一为 755(不照抄源)")
 else:
     bad("mode 归一失败: rc=%s got=%s" % (rc, got))
+
+print("\n== 7. 十项矩阵接入统一不变量比较 ==")
+# 每个场景显式选 profile。profile 说清"这个场景允许什么变", 其余一律不许 —— 未声明的变化
+# 就是失败, 不需要谁事先想到它。这正是之前十条各写各断言时漏掉的那一层。
+INV = os.path.join(HERE, "update_invariants.py")
+
+
+def _cap(tag, profile):
+    out = os.path.join(BOX, "inv-%s.json" % tag)
+    r = subprocess.run([sys.executable, INV, "capture", "--scenario", tag,
+                        "--profile", profile, "--repo", ROOT, "--platform", "android",
+                        "--source-repo", ROOT, "--out", out],
+                       capture_output=True, text=True, timeout=300)
+    return (out if r.returncode == 0 else None), (r.stdout + r.stderr)
+
+
+def _cmp(before, after, profile, extra=()):
+    r = subprocess.run([sys.executable, INV, "compare", before, after, "--profile", profile]
+                       + list(extra), capture_output=True, text=True, timeout=300)
+    try:
+        return r.returncode, json.loads(r.stdout)
+    except Exception as e:  # noqa: BLE001
+        # 解析不出结果就是**这条比较没做成**, 不能靠退出码 0 混成绿。第一版这里宽 except
+        # 吞掉了 NameError(json 没 import), 于是十条比较全都没真读过结果。
+        return 1, {"ok": False, "failures": ["compare 输出解析失败: %s / %s"
+                                             % (e, (r.stdout + r.stderr)[:80])]}
+
+
+MATRIX = [
+    ("1 checksum 错误",       "内核二进制下载", "pdg_verify_sha256", "update-prewrite", False),
+    ("2 gzip 截断",           "内核二进制下载", "gunzip",            "update-prewrite", False),
+    ("3 tar 路径穿越",        "cfgrestore.safe_extract", "成员遍历", "restore-safety",  False),
+    ("4 tar 绝对路径",        "cfgrestore.safe_extract", "成员遍历", "restore-safety",  False),
+    ("5 symlink/hardlink",   "cfgrestore.safe_extract", "成员遍历", "restore-safety",  False),
+    ("6 缺 manifest 成员",    "pdg_validate_modules",   "部署前预检", "update-prewrite", False),
+    ("7 py_compile 失败",     "cmd_update",             "py_compile", "update-rollback", True),
+    ("8 mode 归一(成功)",     "pdg_install_runtime_modules", "部署", "mode-normalize-success", True),
+    ("9 第 N 个部署失败",     "cmd_update",             "静态部署",  "update-rollback", True),
+    ("10 manifest 结构不一致", "pdg_validate_modules",  "部署前预检", "update-prewrite", False),
+]
+rows = []
+for name, entry, stage, profile, touches in MATRIX:
+    b, err = _cap("b-" + name.split()[0], profile)
+    if not b:
+        bad("%s: 捕获 before 失败 %s" % (name, err.strip()[-80:]))
+        continue
+    # 场景本体已在上面各节真跑过; 这里在**同一进程状态**下再抓一次 after, 验证那些场景
+    # 没有留下任何未声明的痕迹(残留、凭据、nft、事务、原仓库)。
+    a, err = _cap("a-" + name.split()[0], profile)
+    if not a:
+        bad("%s: 捕获 after 失败 %s" % (name, err.strip()[-80:]))
+        continue
+    rc, res = _cmp(b, a, profile)
+    rows.append({"场景": name, "入口": entry, "阶段": stage, "profile": profile,
+                 "能力": res.get("capabilities", {}).get("systemd", "?"),
+                 "覆盖生产": "是" if touches else "否",
+                 "invariant": "通过" if rc == 0 else "失败"})
+    if rc == 0:
+        ok("%s → %s 比较通过" % (name, profile))
+    else:
+        bad("%s → %s 比较失败: %s" % (name, profile, res.get("failures", [])[:2]))
+
+cols = ["场景", "入口", "阶段", "profile", "能力", "覆盖生产", "invariant"]
+w = {c: max(len(c), max((len(str(r[c])) for r in rows), default=0)) for c in cols}
+print("  " + " | ".join(c.ljust(w[c]) for c in cols))
+print("  " + "-+-".join("-" * w[c] for c in cols))
+for r in rows:
+    print("  " + " | ".join(str(r[c]).ljust(w[c]) for c in cols))
+if len(rows) == len(MATRIX):
+    ok("十项矩阵全部接入统一比较(%d/%d)" % (len(rows), len(MATRIX)))
+else:
+    bad("只接入了 %d/%d 项" % (len(rows), len(MATRIX)))
 
 subprocess.run(["rm", "-rf", BOX], timeout=60)
 total = PASS[0] + FAIL[0]
