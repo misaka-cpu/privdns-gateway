@@ -163,6 +163,25 @@ def cross_checks():
     assert bot._wda_on(model)
     ok("del_rule 碰 WDA 域名：报未找到，WDA 规则一个域名都没少")
 
+    # 同一个域名既在 WDA 规则里、又在用户自己的另一条出口规则里 —— .200 现网就是这样
+    # (netflix.com 同时出现在 WDA 的 jp 规则和用户的 hkt 规则里)。这时外层"有没有这个域名"
+    # 的判断会成立、mod 会真的跑起来, 内层跳过 WDA 规则的守卫才是唯一拦得住它的东西。
+    _reset_with_wda_on()
+    state["model"]["route"]["rules"].append(
+        {"domain_suffix": ["netflix.com", "own.example"], "outbound": "hkt"})
+    state["model"]["outbounds"].append(
+        {"type": "shadowsocks", "tag": "hkt", "server": "198.51.100.9",
+         "server_port": 8388, "method": "aes-128-gcm", "password": "x"})
+    success, message = bot.del_rule("netflix.com")
+    assert success, message
+    model = state["model"]
+    assert len(wda_inline_rules(model)) == 1, "WDA 规则里的 netflix.com 被一起抠掉了"
+    assert bot._wda_on(model)
+    hkt = [r for r in model["route"]["rules"] if r.get("outbound") == "hkt"]
+    assert hkt and "netflix.com" not in hkt[0]["domain_suffix"], "用户 hkt 规则里的该删掉"
+    assert "own.example" in hkt[0]["domain_suffix"]
+    ok("同名域名同时在 WDA 与用户规则里：只从用户规则删，WDA 规则不动")
+
     _reset_with_wda_on()
     bot.add_rule("example.test", "jp")
     success, message = bot.del_rules_bulk(["netflix.com", "example.test"])
