@@ -83,6 +83,93 @@ e2e_reset_box(){
   hash -r 2>/dev/null || true
 }
 
+# ── 一次性沙箱的硬门 ────────────────────────────────────────────────────────
+# 为什么需要它: `PDG_E2E_ISOLATED=1` + root 时脚本直接跑在当前容器根上, 而 CI 与本地都会把
+# 仓库以**可写**方式挂进去。于是一次失败的 `cd`、一个写错的 `rm -rf`、一句 `git reset`,
+# 打的就是开发者的真仓库 —— 这不是假设: 本分支上真的因此多出过一个 author 为 t<t@t> 的
+# "base" 提交、origin 被换成 /tmp 里的裸库、还打了个 v9.9.9 标签。
+#
+# `PDG_E2E_ISOLATED=1` 只是调用方的一句声明, 它不证明任何事, 因此不能再当作安全依据。
+# 真正的依据是: 目标路径经 realpath 解析后, 确实位于一个**本轮创建、带 nonce 标记**的
+# 一次性根之内。所有破坏性操作都必须先过 e2e_guard_path。
+E2E_NONCE=""          # 本轮随机串, 写进 marker; 换一轮就对不上
+E2E_SANDBOX=""        # 已验证的一次性根(realpath 后的绝对路径)
+
+e2e_sandbox_init(){
+  local root="$1"
+  [[ -n "$root" ]] || { echo "[FAIL] 沙箱根为空"; return 1; }
+  mkdir -p "$root" 2>/dev/null || { echo "[FAIL] 建不了沙箱根: $root"; return 1; }
+  E2E_NONCE="$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  [[ ${#E2E_NONCE} -ge 16 ]] || { echo "[FAIL] 取不到随机 nonce"; return 1; }
+  local rp; rp="$(realpath -e "$root" 2>/dev/null)" || { echo "[FAIL] realpath 失败: $root"; return 1; }
+  printf '%s %s\n' "$E2E_NONCE" "$$" > "$rp/.e2e-disposable" || return 1
+  chmod 600 "$rp/.e2e-disposable" || return 1
+  E2E_SANDBOX="$rp"
+  return 0
+}
+
+# 判一个路径能不能当破坏性操作的目标。任何一条不满足立即返回非 0 —— 在动手之前。
+e2e_guard_path(){
+  local p="$1" why=""
+  [[ -n "$p" ]]        || why="路径为空"
+  [[ "$p" == /* ]]     || why="${why:-不是绝对路径}"
+  local rp=""
+  if [[ -z "$why" ]]; then
+    # -m: 目标可以还不存在(比如要创建的子目录), 但它的解析结果必须落在沙箱内。
+    rp="$(realpath -m "$p" 2>/dev/null)" || why="realpath 失败"
+  fi
+  if [[ -z "$why" ]]; then
+    case "$rp" in
+      /) why="目标是根目录";;
+      /root|/home|/usr|/etc|/var|/opt|/boot) why="目标是系统目录 $rp";;
+    esac
+  fi
+  # 仓库本体、仓库父目录、CI 工作区一律不许当目标 —— 这正是那次事故打中的地方。
+  if [[ -z "$why" ]]; then
+    local repo; repo="$(realpath -m "${E2E_ROOT:-/nonexistent}" 2>/dev/null)"
+    local parent; parent="$(dirname "$repo")"
+    local ws; ws="$(realpath -m "${GITHUB_WORKSPACE:-/nonexistent}" 2>/dev/null)"
+    [[ "$rp" == "$repo" || "$rp" == "$repo"/* ]] && why="目标在源码仓库内: $rp"
+    [[ -z "$why" && "$rp" == "$parent" ]] && why="目标是仓库父目录: $rp"
+    [[ -z "$why" && -n "$ws" && "$ws" != /nonexistent && ( "$rp" == "$ws" || "$rp" == "$ws"/* ) ]] \
+      && why="目标在 GITHUB_WORKSPACE 内: $rp"
+  fi
+  # 必须落在**已验证**的一次性根内, 且该根的 marker 与本轮 nonce 相符。
+  if [[ -z "$why" ]]; then
+    [[ -n "$E2E_SANDBOX" ]] || why="沙箱未初始化(e2e_sandbox_init 没跑)"
+  fi
+  if [[ -z "$why" ]]; then
+    [[ "$rp" == "$E2E_SANDBOX" || "$rp" == "$E2E_SANDBOX"/* ]] || why="目标在沙箱之外: $rp"
+  fi
+  if [[ -z "$why" ]]; then
+    local m="$E2E_SANDBOX/.e2e-disposable"
+    [[ -f "$m" ]] || why="沙箱 marker 不存在"
+    [[ -z "$why" && "$(cut -d' ' -f1 "$m" 2>/dev/null)" == "$E2E_NONCE" ]] || why="${why:-marker nonce 不匹配}"
+  fi
+  [[ -z "$why" ]] && return 0
+  echo "[FAIL] 拒绝对 $p 执行破坏性操作: $why" >&2
+  return 1
+}
+
+# 唯一允许的递归删除入口 —— 判据只有这一份, 各脚本不得自己抄一遍。
+e2e_rm_rf(){
+  local p
+  for p in "$@"; do
+    e2e_guard_path "$p" || return 1
+    rm -rf -- "$p" || return 1
+  done
+  return 0
+}
+
+# 退出钩子沿用下面既有的 e2e_add_exit_hook(注册函数名、幂等、保持原退出码), 不另起一套。
+
+# 收尾: 只删自己建的一次性根, 且要再过一遍 realpath + marker + nonce —— 中途被换掉的话
+# 这一步会拒绝, 而不是照删。
+e2e_sandbox_cleanup(){
+  [[ -n "$E2E_SANDBOX" ]] || return 0
+  e2e_rm_rf "$E2E_SANDBOX" 2>/dev/null || true
+}
+
 # 重入 namespace: 外层建 overlay 目录并 unshare, 内层挂载
 e2e_enter(){
   # 已经身处一次性隔离环境且是 root(CI 的容器 job) → 直接跑, 不必再自建 namespace。
@@ -92,11 +179,16 @@ e2e_enter(){
     # 容器是一次性的, 但**同一个容器里顺序跑多个脚本**时它并不是一次性的: 前一个脚本留下的
     # /usr/local/bin/sing-box 会让下一个脚本的装机路径判成"机器上已有第三方 sing-box"而中止。
     # 进场先把现场清干净 —— 每个 E2E 都必须自带完整前提, 不许指望上一个脚本留下的状态。
+    # 容器由 CI 一次性创建, 但"一次性"这件事必须由本进程自己证明: 建一个带本轮 nonce 的
+    # 一次性根并记下来, 之后所有破坏性操作都要落在它之内(见 e2e_guard_path)。
+    e2e_sandbox_init "${E2E_DISPOSABLE:-/tmp/e2e-box.$$}" || exit 1
+    e2e_add_exit_hook e2e_sandbox_cleanup
     e2e_reset_box
     _e2e_git_safe
     return 0
   fi
   if [[ "${PDG_E2E_INNER:-}" == 1 ]]; then
+    e2e_sandbox_init "${E2E_OVL:-/tmp/e2e-inner.$$}" || exit 1
     mount -t overlay overlay -o "lowerdir=/etc,upperdir=$E2E_OVL/eu,workdir=$E2E_OVL/ew" /etc \
       || { echo "[SKIP] overlay /etc 挂不上"; exit 0; }
     mount -t overlay overlay -o "lowerdir=/usr/local/bin,upperdir=$E2E_OVL/bu,workdir=$E2E_OVL/bw" /usr/local/bin
@@ -112,6 +204,7 @@ e2e_enter(){
   fi
   unshare -rm true 2>/dev/null || e2e_skip "本环境不支持 unshare -rm(需用户+挂载命名空间)"
   E2E_OVL="$(mktemp -d)"
+  e2e_sandbox_init "$E2E_OVL" || exit 1
   # 宿主 /etc 里归真 root 的路径在 userns 里映射成 nobody, 改不动 → 先在 upperdir 里建好(归本人)
   mkdir -p "$E2E_OVL"/{eu,ew,bu,bw,ou,ow,vu,vw}
   mkdir -p "$E2E_OVL"/eu/{mosdns/rules,sing-box,mihomo,privdns-gateway,systemd/system,systemd/journald.conf.d}

@@ -288,6 +288,9 @@ jobs:
       - name: "卸载保留用户防火墙规则 (只摘项目管理块, 用户自加规则逐字节保留)"
         run: sudo -E python3 tests/test-uninstall-firewall.py
 
+      - name: "E2E 沙箱硬门 (破坏性操作只能落在带 nonce 的一次性根内; 真仓库不受影响)"
+        run: python3 tests/test-e2e-sandbox.py
+
       - name: "项目静态文件三集合 (install=update=uninstall; 平台切分; 用户数据不混入)"
         run: python3 tests/test-file-sets.py
 

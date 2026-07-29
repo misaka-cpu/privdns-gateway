@@ -207,7 +207,10 @@ out=$(pdg update --dry-run 2>&1); rc=$?
 # 远端能拉但一个发布 tag 都没有 → 同样要明说, 不能装作"已是最新"
 rm -rf /tmp/e2e-empty-origin.git
 git init -q --bare /tmp/e2e-empty-origin.git
-( cd /opt/privdns-gateway && git remote remove origin >/dev/null 2>&1
+# `&&` 只挡得住紧跟着的第一条 —— 后面两行照样在当时的工作目录执行, 与打坏真仓库的那个
+# 形态一模一样。整块统一用 `cd … || exit`。
+( cd /opt/privdns-gateway || { echo "[FAIL] /opt/privdns-gateway 不存在, 拒绝在当前目录执行 git 操作"; exit 1; }
+  git remote remove origin >/dev/null 2>&1
   git remote add origin /tmp/e2e-empty-origin.git
   git push -q origin HEAD:refs/heads/main >/dev/null 2>&1 ) || true
 git -C /opt/privdns-gateway tag -l 'v*' | xargs -r git -C /opt/privdns-gateway tag -d >/dev/null 2>&1
