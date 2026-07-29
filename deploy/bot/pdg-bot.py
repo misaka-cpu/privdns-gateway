@@ -1540,6 +1540,21 @@ def _is_wda_rule(rule, previous_domains=None):
                for expected in candidates)
 
 
+def _wda_rule_pred():
+    """返回一个"这条规则是 WDA 规则吗"的判据(unlock.txt 只读一次)。
+
+    为什么单域名增删也要认它: WDA 规则改成内联 domain_suffix 之后, 它在 model 里就是一条
+    普通的 `outbound=jp` 规则 —— add_rule 找"第一条 outbound 相同且没有 rule_set 的规则"
+    就会正好找到它, 把用户的域名 append 进去; del_rule / 删规则键盘同理会把 WDA 域名当成
+    用户自己加的规则去删。任何一次这样的改动都会让 WDA 规则不再等于 WDA_DOMAINS, 于是
+    _is_wda_rule 认不出它: 面板显示"落地出口", 关 WDA 只清空 unlock.txt 而 55 个域名继续
+    指向 jp —— 正是内联化本要消灭的半套状态。
+    (旧实现里 WDA 规则带 rule_set=unlock, 被 add_rule 的 `"rule_set" not in r` 天然挡住,
+     所以这几处以前不需要判。)"""
+    previous_domains = _read_unlock_domains()
+    return lambda r: _is_wda_rule(r, previous_domains)
+
+
 def _wda_on(c=None):
     c = c or load()
     previous_domains = _read_unlock_domains()
@@ -1611,7 +1626,11 @@ def set_wda_mode(on):
             c["route"]["rules"].insert(
                 idx, {"domain_suffix": list(WDA_DOMAINS), "outbound": "jp"})
 
-    files = {"mosdns_rule:unlock.txt": _unlock_text(domains)}
+    # 老机器上还躺着 v1.7.0 那份 /etc/sing-box/rs/unlock.json: model 已经不引用它, mihomo
+    # 也不会加载, 但它是这次改动留下的孤儿。None = 这笔事务里把它删掉; 文件本来就不在的机器
+    # 上是空操作(pdgtx 对 data=None 且 existed=False 什么都不做)。
+    files = {"mosdns_rule:unlock.txt": _unlock_text(domains),
+             "ruleset:unlock.json": None}
     ok, msg = tx_apply("wda_" + ("on" if on else "off"), model_mod=mod, files=files)
     if not ok:
         return False, msg
@@ -2533,9 +2552,10 @@ def add_rule(domain, target):
     if target not in exit_tags(c):
         return False, f"出口 {target} 不存在; 可选: {', '.join(exit_tags(c))} 或 direct"
 
+    is_wda = _wda_rule_pred()
     def mod(cc):
         for r in cc["route"]["rules"]:
-            if r.get("outbound") == target and "rule_set" not in r:
+            if r.get("outbound") == target and "rule_set" not in r and not is_wda(r):
                 r.setdefault("domain_suffix", [])
                 if domain not in r["domain_suffix"]:
                     r["domain_suffix"].append(domain)
@@ -2552,9 +2572,13 @@ def add_rule(domain, target):
 def del_rule(domain):
     domain = domain.strip().lstrip(".").lower(); removed = []
     c = load()
-    if any(domain in r.get(k, []) for r in c["route"]["rules"] for k in ("domain_suffix", "domain")):
+    is_wda = _wda_rule_pred()
+    if any(domain in r.get(k, []) for r in c["route"]["rules"] if not is_wda(r)
+           for k in ("domain_suffix", "domain")):
         def mod(cc):
             for r in cc["route"]["rules"]:
+                if is_wda(r):                     # WDA 规则整条由 set_wda_mode 管, 不在这里拆
+                    continue
                 for k in ("domain_suffix", "domain"):
                     if domain in r.get(k, []):
                         r[k] = [d for d in r[k] if d != domain]
@@ -2586,8 +2610,9 @@ def del_rule(domain):
 def deletable_domains():
     """可删的单域名规则: [(域名, 显示文字)]。含各出口的 domain(_suffix) 与自定义直连表。"""
     c = load(); items = []
+    is_wda = _wda_rule_pred()
     for r in c["route"]["rules"]:
-        if "outbound" not in r or r.get("rule_set"):
+        if "outbound" not in r or r.get("rule_set") or is_wda(r):
             continue
         for d in r.get("domain_suffix", []) + r.get("domain", []):
             items.append((d, f"{d} → {r['outbound']}"))
@@ -2600,8 +2625,11 @@ def del_rules_bulk(domains):
     domains = {d.strip().lower() for d in domains if d.strip()}
     if not domains:
         return False, "没勾选任何域名"
+    is_wda = _wda_rule_pred()
     def mod(cc):
         for r in cc["route"]["rules"]:
+            if is_wda(r):                         # 同 del_rule: 不从 WDA 规则里抠域名
+                continue
             for k in ("domain_suffix", "domain"):
                 if r.get(k):
                     r[k] = [d for d in r[k] if d not in domains]
