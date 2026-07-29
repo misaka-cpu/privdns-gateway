@@ -535,6 +535,43 @@ def main():
         bad("硬门里混进了公网检查")
     boxC.clean()
 
+
+    
+    # ── mosdns 探针必须认得本项目**自己渲染出来的**配置形态 ───────────────────────
+    # `.200` 上取回的真实生产配置里, listen 全部写在流式映射内(`args: {entry: …, listen: "0.0.0.0:53"}`),
+    # 一行开头的 `listen:` 一个都没有。而改写监听地址的正则带着 `^` 锚, 于是匹配 0 处、探针直接
+    # 拒绝 —— 任何以 mosdns_conf 为目标的事务(detect-cidr、hijack-mode、网段变更)在真机上
+    # 全部走不通。夹具用**仓库模板渲染**, 不手搓, 否则这条断言证明不了生产形态。
+    _tpl = open(os.path.join(ROOT, "deploy/mosdns/config.yaml"), encoding="utf-8").read()
+    for _k, _v in (("__SERVER_IP__", "203.0.113.1"), ("__INTERNAL_CIDR__", "172.22.0.0/16"),
+                   ("__CERT_DIR__", "/etc/mosdns/certs"), ("__SSH_PORT__", "22"),
+                   ("__MOSDNS_CACHE__", "1024"), ("__HIJACK_SET_FILE__", "hijack.txt")):
+        _tpl = _tpl.replace(_k, _v)
+    import importlib.util as _ilu
+    _sp = _ilu.spec_from_file_location("pdgtx_lr", os.path.join(ROOT, "deploy/bot/pdgtx.py"))
+    _pm = _ilu.module_from_spec(_sp)
+    _sp.loader.exec_module(_pm)
+    _patched, _n = _pm._rewrite_listen(_tpl.encode())
+    if _n == 3:
+        ok("监听改写认得项目模板的流式映射形态, 且只改写真正的监听项(3 处)")
+    else:
+        bad("项目自己渲染的 mosdns 配置改写了 %d 处(应为 3) → 0 则探针必拒, 多则连上游也被改" % _n)
+    # 只有上游、没有监听的配置必须判 0 —— 否则探针会跑在生产端口上。
+    _only_up = b"plugins:\n  - tag: fwd\n    args: { upstreams: [ {addr: \"udp://8.8.8.8:53\"} ] }\n"
+    if _pm._rewrite_listen(_only_up)[1] == 0:
+        ok("只有上游 addr、没有监听项的配置判为 0 处(探针不会落到生产端口)")
+    else:
+        bad("把上游 addr 当成了监听改写 —— 探针可能跑在生产端口上")
+    _pt = _patched.decode()
+    if "127.0.0.1:" in _pt and '"0.0.0.0:53"' not in _pt and '"0.0.0.0:853"' not in _pt:
+        ok("三个监听端口都被移到 127.0.0.1 随机高端口(不占生产端口)")
+    else:
+        bad("监听没被完整移走: %s" % [l for l in _pt.splitlines() if "listen" in l][:3])
+    if "https://1.1.1.1/dns-query" in _pt and "udp://8.8.8.8:53" in _pt:
+        ok("上游 addr 原样保留(只动监听, 不动上游)")
+    else:
+        bad("把上游 addr 也改写了 —— 探针会去连本地随机端口当上游")
+
     box.clean()
     print("\n通过 %d, 失败 %d" % (pass_n, fail_n))
     return 1 if fail_n else 0
@@ -542,3 +579,4 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+

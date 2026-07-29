@@ -665,7 +665,13 @@ def _v_systemd_unit(path, data, ctx):
 #   1) 首选 unshare -n: 独立网络命名空间里起 lo, 端口与生产完全隔离, 配置原样不动;
 #   2) 退而求其次: 把候选**副本**里本项目已知形态的监听地址改到 127.0.0.1 的随机高端口再起;
 #   3) 两条都不可用 → 拒绝应用(不拿结构检查冒充强校验)。
-_LISTEN_RE = re.compile(rb"(?m)^(\s*(?:addr|listen)\s*:\s*)([\"']?)([^\"'\s#]+)\2")
+# 键可以在行首(块式), 也可以在流式映射里跟在 `{` 或 `,` 后面 —— 本项目自己渲染的 mosdns
+# 配置用的正是后者(`args: {entry: main_sequence, listen: "0.0.0.0:53"}`)。原先带 `^` 锚,
+# 于是在**每一台真机上**都匹配 0 处, `_v_mosdns_probe` 一律拒绝, 以 mosdns_conf 为目标的
+# 事务(detect-cidr / hijack-mode / 网段变更)全都走不通。值的终止符也要包含 `,` 与 `}`,
+# 否则流式映射里会把后面的键一起吞掉。
+# 只动监听: `_sub` 里那道形态判断把 `udp://8.8.8.8:53`、`https://…` 这类上游 addr 原样放过。
+_LISTEN_RE = re.compile(rb"(?m)(^\s*|[{,]\s*)((?:addr|listen)\s*:\s*)([\"']?)([^\"'\s#,}]+)\3")
 NETNS_MARK = "PDGTX_NETNS_READY"      # 证明"已经进了命名空间, 马上要 exec mosdns"
 
 
@@ -778,14 +784,20 @@ def _rewrite_listen(data):
         used.append(p)
         return p
 
+    # 只数**真正被改写**的条数。正则会同时匹配到上游 addr(`udp://8.8.8.8:53` 之类),
+    # 它们被下面的形态判断原样放回 —— 拿 subn 的匹配数当"改写数", 一份只有上游、没有任何
+    # 监听项的配置也会满足 n>0, 于是探针就直接跑在生产端口上了。那正是这道门要挡的事。
+    hit = []
+
     def _sub(m):
-        val = m.group(3).decode()
+        val = m.group(4).decode()
         if not re.match(r"^([0-9.]*|\[?::\]?)?:\d+$", val) and not val.startswith(":"):
             return m.group(0)
-        return b"%s%s127.0.0.1:%d%s" % (m.group(1), m.group(2), _pick(), m.group(2))
+        hit.append(1)
+        return b"%s%s%s127.0.0.1:%d%s" % (m.group(1), m.group(2), m.group(3), _pick(), m.group(3))
 
-    out, n = _LISTEN_RE.subn(_sub, data)
-    return out, n
+    out, _matches = _LISTEN_RE.subn(_sub, data)
+    return out, len(hit)
 
 
 VALIDATORS = {
