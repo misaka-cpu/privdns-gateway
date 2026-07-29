@@ -249,6 +249,13 @@ jobs:
       - name: "准备钉死版 mihomo (SHA256 校验, 供需要真内核的测试共用)"
         run: bash tests/prepare-mihomo.sh
 
+      # 事务的 mosdns_probe 校验器会**真的启动 mosdns** 解析候选配置, 拿不到二进制整笔事务
+      # REFUSED。这条以前没有 —— 本地一直绿是因为开发机上有早前 E2E 留下的 mosdns, 而
+      # CI 的 lint job 里没有, 于是 test-cidr-transaction 一串失败。v1.7.0 发布前的
+      # 第一次真实 CI 就是栽在这里。
+      - name: "准备钉死版 mosdns (事务候选校验要真启动它; 版本与 SHA256 走 lib/versions.sh)"
+        run: sudo -E bash tests/prepare-mosdns.sh
+
       - name: "混合规则 AND 语义 (跨字段 AND/同字段 OR/不支持组合拒绝/真 mihomo -t)"
         run: python3 tests/test-rule-mixed.py
 

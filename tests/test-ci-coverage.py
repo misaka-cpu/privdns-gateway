@@ -34,6 +34,7 @@ def bad(m):
 HELPERS = {
     "rescuebox.py", "rescueform.py", "snapmatrix.py", "txbox.py", "mihomobin.py",
     "mock_dns.py", "mock_socks.py", "sni_client.py", "e2e-lib.sh", "prepare-mihomo.sh",
+    "prepare-mosdns.sh", "update_invariants.py",
 }
 
 if not os.path.exists(CI):
@@ -88,6 +89,12 @@ if "prepare-mihomo.sh" in ci:
     ok("workflow 会准备钉死版 Mihomo")
 else:
     bad("workflow 没有准备 Mihomo 的步骤")
+# mosdns 同样是硬前提: 事务的候选校验会真启动它。少了这一步, 需要真 mosdns 的用例会在
+# CI 上整片失败, 而本地因为有残留二进制照样全绿 —— v1.7.0 的第一次真实 CI 就是这么红的。
+if "prepare-mosdns.sh" in ci:
+    ok("workflow 会准备钉死版 mosdns")
+else:
+    bad("workflow 没有准备 mosdns 的步骤 —— 需要真 mosdns 的事务用例会在 CI 上失败")
 
 print("\n== 4. 需要 root/nft 的测试必须拿到 root ==")
 # 拿 root 有两条路: 容器 job 里本来就是 root, 或者在 runner 上 `sudo -E`(GitHub 的 ubuntu
