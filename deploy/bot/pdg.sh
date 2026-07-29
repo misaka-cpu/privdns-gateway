@@ -1011,10 +1011,12 @@ cmd_update(){
     || { c_y "读不到 lib/modules.sh(运行模块清单), 回滚到更新前快照…"
          cmd_rollback --dir "$snap_dir" --git "$pre_sha"; return 1; }
   # 必需文件: 任一装失败即立即回滚(拒绝新旧混部)。`! A || ! B` 在首个失败处短路。
-  # /opt/pdg-bot 下的项目静态文件**全部**走 lib/modules.sh 这一份真源(含平台专属那批)。
-  # 以前这里手写了 bot.py / parse-geosite.py / update-rules.sh / scheduled-update.sh /
-  # healthcheck.py 五行, 与 install.sh 里那份各写各的 —— 两边只要有一处忘了改就是新旧混装。
-  if   ! pdg_install_runtime_modules "$REPO_DIR" /opt/pdg-bot "$(_pdg_platform)" \
+  if   ! install -m755 "$REPO_DIR"/deploy/bot/pdg-bot.py           /opt/pdg-bot/bot.py \
+    || ! install -m755 "$REPO_DIR"/deploy/bot/parse-geosite.py     /opt/pdg-bot/ \
+    || ! install -m755 "$REPO_DIR"/deploy/bot/update-rules.sh      /opt/pdg-bot/ \
+    || ! install -m755 "$REPO_DIR"/deploy/bot/scheduled-update.sh  /opt/pdg-bot/ \
+    || ! install -m755 "$REPO_DIR"/deploy/bot/healthcheck.py       /opt/pdg-bot/ \
+    || ! pdg_install_runtime_modules "$REPO_DIR" /opt/pdg-bot \
     || ! install -m755 "$REPO_DIR"/deploy/cert/proxy-gateway-open-cert-http.sh   /usr/local/bin/ \
     || ! install -m755 "$REPO_DIR"/deploy/cert/proxy-gateway-restore-firewall.sh /usr/local/bin/ \
     || ! install -m755 "$REPO_DIR"/deploy/bot/pdg-set-token.sh     /usr/local/bin/pdg-set-token \
@@ -1025,7 +1027,15 @@ cmd_update(){
   # iOS 上这些**不是可选项**: probe81 与描述文件模板是 iOS 基础能力, WLOC 开着时 mitm 三件
   # 也是必需件。以前一律 `|| true`, 装失败就把上一版的旧文件留在原地 → 新旧混装, 而 doctor
   # 只看"文件在不在", 照样判绿。
-  # iOS 专属组件已并入上面那一次调用(pdg_platform_modules 按平台取), 不再单列。
+  if [[ "$(_pdg_platform)" == ios ]]; then
+    if   ! install -m755 "$REPO_DIR"/deploy/bot/mitm_ca.py          /opt/pdg-bot/ \
+      || ! install -m755 "$REPO_DIR"/deploy/bot/mitm_server.py      /opt/pdg-bot/ \
+      || ! install -m755 "$REPO_DIR"/deploy/bot/mitm_wloc.py        /opt/pdg-bot/ \
+      || ! install -m755 "$REPO_DIR"/deploy/ios/probe81.py          /opt/pdg-bot/ \
+      || ! install -m644 "$REPO_DIR"/deploy/ios/pdg-dot-ondemand.mobileconfig.tmpl /opt/pdg-bot/pdg-dot.mobileconfig.tmpl; then
+      c_y "iOS 平台组件安装失败, 回滚到更新前快照…"; cmd_rollback --dir "$snap_dir" --git "$pre_sha"; return 1
+    fi
+  fi
   install -m644 "$REPO_DIR"/deploy/bot/pdg-health.service  /etc/systemd/system/ 2>/dev/null || true
   install -m644 "$REPO_DIR"/deploy/bot/pdg-health.timer    /etc/systemd/system/ 2>/dev/null || true
   install -m755 "$REPO_DIR"/deploy/cert/99-reload-cert.deploy-hook.sh     /etc/letsencrypt/renewal-hooks/deploy/99-pdg-cert.sh 2>/dev/null || true
@@ -1474,11 +1484,16 @@ migrate_deploy_botfiles(){
   source "$REPO_DIR/lib/modules.sh" 2>/dev/null || return 0
   # 运行模块走 lib/modules.sh 这份**单一事实源** —— 与 install.sh、cmd_update 同一份清单,
   # 于是不会再出现"装机装了、升级漏了"那类缺口(它不报错, 只让整块能力静默降级)。
-  # 平台传进去, 于是 iOS 专属那批只在 iOS 上装, Android 既不装也不复活。
-  # 原来这里还跟着一个 `deploy/bot/*.py` 的 glob 兜底循环 —— 那是一份**隐式的第二名单**:
-  # 它会把仓库里任何新加的 .py 都装进 /opt/pdg-bot, 而那些文件不在真源里, 卸载不会删、
-  # update 的 mode 也无从对齐。真源既然已覆盖全集, glob 只剩风险, 去掉。
-  pdg_install_runtime_modules "$REPO_DIR" /opt/pdg-bot "$(_pdg_platform)" 2>/dev/null || true
+  pdg_install_runtime_modules "$REPO_DIR" /opt/pdg-bot 2>/dev/null || true
+  local f base plat; plat="$(_pdg_platform)"
+  for f in "$REPO_DIR"/deploy/bot/*.py; do
+    base=$(basename "$f")
+    [[ "$base" == "pdg-bot.py" ]] && continue
+    case "$base" in                                   # iOS 专属 MITM 模块: 仅 iOS 装, Android 不装/不复活
+      mitm_ca.py|mitm_server.py|mitm_wloc.py) [[ "$plat" == ios ]] || continue;;
+    esac
+    install -m755 "$f" /opt/pdg-bot/ 2>/dev/null || true
+  done
 }
 
 # 老机首次获得救援平面: 装 unit + 备好凭据, 并按"默认启用"拍板方案开起来。
