@@ -59,7 +59,11 @@ def _mos_cfg(size):
         "  - tag: main_sequence\n"
         "    type: sequence\n"
         "    args:\n"
-        "      - exec: reject 3\n" % size)
+        "      - exec: reject 3\n"
+        "  - tag: udp_server\n"
+        "    type: udp_server\n"
+        '    args: {entry: main_sequence, listen: "127.0.0.1:0"}\n'
+        % size)
 
 
 ORIG_CFG = _mos_cfg(1024)

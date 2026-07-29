@@ -83,7 +83,11 @@ def _mos_min(size=4096):
     return ("log:\n  level: error\nplugins:\n  - tag: npn_clients\n    type: ip_set\n"
             '    args: { ips: ["172.22.0.0/16"] }\n  - tag: cache\n    type: cache\n'
             "    args: { size: %d }\n  - tag: main_sequence\n    type: sequence\n"
-            "    args:\n      - exec: reject 3\n" % size).encode()
+            "    args:\n      - exec: reject 3\n"
+        "  - tag: udp_server\n"
+        "    type: udp_server\n"
+        '    args: {entry: main_sequence, listen: "127.0.0.1:0"}\n'
+            % size).encode()
 
 
 MODEL = (b'{"log": {}, "inbounds": [], "outbounds": [{"type": "direct", "tag": "direct"}], '
