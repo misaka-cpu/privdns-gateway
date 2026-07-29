@@ -514,7 +514,10 @@ def login_page(msg="", csrf=""):
                 "<input type=hidden name=csrf value='%s'>"
                 "<label>救援 Token<br><input type=password name=token autocomplete=off></label>"
                 "<br><button type=submit>进入</button></form>"
-                "<p class=muted>Token 由 <code>sudo pdg rescue url</code> 在本机显示。"
+                "<p class=warn>输 token 之前先核对证书指纹 —— 指纹要从 SSH 上 "
+            "<code>sudo pdg rescue fingerprint</code> 单独取, <b>不要</b>拿本页显示的那串"
+            "核对本页(伪造页面的人也能伪造页面上的指纹)。浏览器看不到完整 SHA-256 时不要输 token。</p>"
+            "<p class=muted>Token 由 <code>sudo pdg rescue url</code> 在本机显示。"
                 "页面不加载任何外部资源。</p>" % (warn, html.escape(csrf)))
 
 

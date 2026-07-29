@@ -149,7 +149,38 @@ Bot 在切换后会等最多 30 秒，看手机是否真的发来了新的 WLOC 
 
 多个地点可以随时增删，开启状态下可切换。原理与配置见 [docs/design-mitm-plugins.md](docs/design-mitm-plugins.md)。
 
-## 11. 项目组成
+## 11. 救援平面（网关自己出问题时的入口）
+
+代理挂了、DNS 不应答、Bot 起不来的时候，管理入口往往也一起没了。救援平面是为这种时刻准备的一个独立 HTTPS 页面：不依赖 mihomo / mosdns / Bot / tailscaled 中的任何一个，只监听内网地址，用来看状态、看事务、必要时恢复配置。
+
+```bash
+sudo pdg rescue status        # 是否启用、监听在哪、来源段、nft 规则、证书指纹
+sudo pdg rescue fingerprint   # 只打印证书的 SHA-256 指纹
+sudo pdg rescue enable        # 启用（默认关闭）
+sudo pdg rescue bind <IPv4>   # 指定监听地址
+sudo pdg rescue rotate token  # 换 token（已登录会话立即失效，证书指纹不变）
+sudo pdg rescue rotate cert   # 重签证书（指纹一定改变，需要重新核对）
+```
+
+### 先核对指纹，再输入 token
+
+页面用的是**自签证书**，浏览器一定会警告。自签证书本身不证明你连到的是自己那台机器 —— 它只保证这条连接被加密。能把"对面是我的网关"和"对面是别人"区分开的，只有**证书指纹**，而且指纹必须从另一条路拿到：
+
+```bash
+ssh <你的网关> sudo pdg rescue fingerprint
+```
+
+安装时把这串指纹存下来也可以。**不要**用页面上显示的那串指纹去核对页面自己 —— 中间人能同时伪造页面和页面上的指纹，自己给自己作证没有意义。
+
+- 浏览器里看不到完整的 SHA-256 指纹时，**不要**先输 token。换一个能看到证书详情的浏览器，或者改用 SSH。
+- `pdg rescue rotate cert` 之后指纹必然变化，浏览器会重新警告；那是预期的，但必须重新从 SSH 取一次新指纹再核对。
+- `pdg rescue rotate token` 不改变证书指纹，只让已登录的会话立即失效。
+- 监听地址是公网可路由地址时，端口的访问控制靠两层：nft 的来源网段限制，加上服务内按内核给出的对端地址做的校验（不看 `X-Forwarded-For`）。这两层限制的是"谁能连上来"，不替代指纹核对——指纹解决的是"这台机器是不是你的"。
+- token 和指纹不要放在同一条聊天记录里，也不建议截图转发。
+
+手机上的具体步骤见 [docs/rescue-plane-access.md](docs/rescue-plane-access.md)。
+
+## 12. 项目组成
 
 | 层 | 组件 | 说明 |
 |---|---|---|
@@ -174,17 +205,18 @@ Bot 在切换后会等最多 30 秒，看手机是否真的发来了新的 WLOC 
 - **观测面板前端资源（zashboard）**：固定版本 + SHA256 校验 + 暂存目录 + 原子替换，属于静态
   缓存资源，不是 DNS/分流生产配置，因此不纳入配置事务。
 
-## 12. 文档
+## 13. 文档
 
 - [docs/QUICKSTART.md](docs/QUICKSTART.md) — 新手图文教程
 - [docs/INSTALL.md](docs/INSTALL.md) — 安装细节 / DNS 配置 / 端口 / 版本说明
 - [docs/TROUBLESHOOTING-PLAYBOOK.md](docs/TROUBLESHOOTING-PLAYBOOK.md) — 排障手册（症状 → 排查 → 修复）
 - [docs/production-notes.md](docs/production-notes.md) — 实战记录与已知问题
 - [docs/design-mitm-plugins.md](docs/design-mitm-plugins.md) — iOS 位置改写（WLOC）设计与原理
+- [docs/rescue-plane-access.md](docs/rescue-plane-access.md) — 救援平面的手机端访问与指纹核对
 - [docs/RELEASE-CHECKLIST.md](docs/RELEASE-CHECKLIST.md) — 发版前检查清单
 - [CHANGELOG.md](CHANGELOG.md) — 更新日志
 
-## 13. 免责声明与 License
+## 14. 免责声明与 License
 
 本项目仅供学习与合法网络管理用途。请遵守你所在地的法律法规，使用者自行承担责任，作者不对使用后果负责。
 

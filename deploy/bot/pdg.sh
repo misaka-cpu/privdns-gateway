@@ -2723,6 +2723,10 @@ cmd_rescue(){
     rotate-cert)  _rescue_rotate cert;;
     bind)         _rescue_set_bind "${2:-}";;
     *) echo "用法: pdg rescue <enable|disable|status|fingerprint|bind <IPv4>|rotate [token|cert]>"
+       echo "  fingerprint  打印证书 SHA-256 指纹 —— 这是**独立渠道**, 手机上要拿它核对页面,"
+       echo "               反过来用页面上的指纹核对页面没有意义。"
+       echo "  rotate token 换 token, 已登录会话立即失效, 证书指纹不变"
+       echo "  rotate cert  重签证书, 指纹一定改变, 需要重新核对(见 docs/rescue-plane-access.md)"
        return 1;;
   esac
 }
@@ -2808,6 +2812,8 @@ _rescue_enable(){
   fi
   c_g "✅ 救援平面已启用: https://$bind:$PDG_RESCUE_PORT/(仅内网卡可达)"
   echo "   证书指纹(首次访问请核对): $(python3 /opt/pdg-bot/rescue_cred.py fingerprint 2>/dev/null || echo '读取失败')"
+  c_y "   ⚠️ 这串指纹要拿到**手机上**去比对浏览器里看到的证书 —— 那才是核对的意义所在。"
+  c_y "      不要用页面自己显示的指纹核对页面; 浏览器看不到完整 SHA-256 时不要输 token。"
 }
 
 _rescue_disable(){
@@ -2983,6 +2989,7 @@ _rescue_status(){
   done
   fp="$(python3 /opt/pdg-bot/rescue_cred.py fingerprint 2>/dev/null || true)"
   printf "  %-14s %s\n" "证书指纹" "${fp:-读取失败}"
+  printf "  %-14s %s\n" "" "(核对方式: 把这串带到手机上比对浏览器里的证书详情; 见 docs/rescue-plane-access.md)"
   # 渲染出来的监听地址与当前内网段是否还对得上 —— detect-cidr 换过段之后它会过期
   local cidr rendered
   cidr="$(pdg_internal_cidr 2>/dev/null || true)"
