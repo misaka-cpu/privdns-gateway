@@ -133,10 +133,18 @@ pdg_project_members(){
   [[ -n "$mod" && -f "$mod" ]] || return 1     # 读不到真源 → 返回 1, 让调用方报出来, 不猜
   # shellcheck source=lib/modules.sh
   source "$mod" || return 1
+  # 卸载不知道这台机器当初装的是哪个平台(profile.env 可能已经被删), 所以取**两个平台的
+  # 并集** —— 多列几个本来就不存在的文件是无害的(删不存在的文件不算失败), 少列一个则会把
+  # iOS 机器上的 MITM 组件永远留在盘上。
   while read -r _ name _; do
     [[ -n "$name" ]] || continue
     printf '%s/%s\n' "${PDG_RUNTIME_DIR#/}" "$name"
-  done < <(pdg_runtime_modules)
+  done < <(pdg_platform_modules ios)
+  # 旧版装过、现在不装的运行文件也要收走。
+  while read -r name; do
+    [[ -n "$name" ]] || continue
+    printf '%s/%s\n' "${PDG_RUNTIME_DIR#/}" "$name"
+  done < <(pdg_legacy_modules)
   printf '%s\n' "${PDG_RESCUE_TOKEN#/}" "${PDG_RESCUE_CERT#/}" "${PDG_RESCUE_KEY#/}" \
                 "${PDG_RESCUE_STATE#/}" \
                 "etc/systemd/system/$PDG_RESCUE_SOCKET_UNIT" \

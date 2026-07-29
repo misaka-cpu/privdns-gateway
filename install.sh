@@ -539,24 +539,15 @@ _dir_txn_record(){
 _dir_txn_record /etc/mosdns /etc/sing-box /etc/mihomo /opt/pdg-bot /etc/privdns-gateway \
   || die "目录备份失败, 未改动任何文件。"
 install -d /etc/mosdns/rules /etc/sing-box/rs /opt/pdg-bot "$CERT_DIR" /etc/letsencrypt/renewal-hooks/deploy /etc/systemd/journald.conf.d
-install -m755 "$REPO_DIR"/deploy/bot/pdg-bot.py            /opt/pdg-bot/bot.py
-install -m755 "$REPO_DIR"/deploy/bot/parse-geosite.py     /opt/pdg-bot/
-install -m755 "$REPO_DIR"/deploy/bot/update-rules.sh      /opt/pdg-bot/
-install -m755 "$REPO_DIR"/deploy/bot/scheduled-update.sh  /opt/pdg-bot/
-install -m755 "$REPO_DIR"/deploy/bot/healthcheck.py      /opt/pdg-bot/
-# ── 运行模块: 走 lib/modules.sh 这份**单一事实源** ────────────────────────
-# 全新安装与 pdg update 读同一份清单, 于是不可能出现"装机装了、升级漏了"这种缺口。
-# 少装一个的后果不是报错, 是整块能力静默降级(救援页标"旧核心不支持"), 见 lib/modules.sh。
-pdg_install_runtime_modules "$REPO_DIR" /opt/pdg-bot \
+# ── 项目静态文件: 全部走 lib/modules.sh 这份**单一事实源** ────────────────
+# 全新安装、`pdg update` 与 uninstall 读同一份清单, 于是不可能出现"装机装了、升级漏了、
+# 卸载没删"这种缺口。少装一个的后果不是报错, 是整块能力静默降级(救援页标"旧核心不支持")。
+#
+# 以前 bot.py / parse-geosite.py / update-rules.sh / scheduled-update.sh / healthcheck.py
+# 与五个 iOS 组件是在这里各写一行 `install -m755 …` 装的, 不在任何清单里 —— 于是 update
+# 永远不同步它们, 卸载也不删。平台专属那部分由 pdg_platform_modules 按 $PLATFORM 取。
+pdg_install_runtime_modules "$REPO_DIR" /opt/pdg-bot "$PLATFORM" \
   || die "运行模块安装失败, 未继续(避免新旧混装)。"
-# iOS 专属组件(MITM 模块 / :81 探测 / 描述文件模板)只在 iOS 平台安装; Android 不装。
-if [[ "$PLATFORM" == ios ]]; then
-  install -m755 "$REPO_DIR"/deploy/bot/mitm_ca.py          /opt/pdg-bot/
-  install -m755 "$REPO_DIR"/deploy/bot/mitm_server.py      /opt/pdg-bot/
-  install -m755 "$REPO_DIR"/deploy/bot/mitm_wloc.py        /opt/pdg-bot/
-  install -m755 "$REPO_DIR"/deploy/ios/probe81.py           /opt/pdg-bot/
-  install -m644 "$REPO_DIR"/deploy/ios/pdg-dot-ondemand.mobileconfig.tmpl /opt/pdg-bot/pdg-dot.mobileconfig.tmpl
-fi
 install -m755 "$REPO_DIR"/deploy/cert/proxy-gateway-open-cert-http.sh     /usr/local/bin/
 install -m755 "$REPO_DIR"/deploy/cert/proxy-gateway-restore-firewall.sh   /usr/local/bin/
 install -m755 "$REPO_DIR"/deploy/cert/99-reload-cert.deploy-hook.sh       /etc/letsencrypt/renewal-hooks/deploy/99-pdg-cert.sh
