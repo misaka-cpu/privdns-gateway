@@ -33,9 +33,12 @@ class Unrecognized(Exception):
     """配置里有 table inet pdg, 但形态不是我们生成的 —— 拒绝猜, 交给人处理。"""
 
 
-# 本项目写进配置的那行注释头(见 nftmerge.BANNER)。它自己就含着 "table inet pdg" 五个字 ——
-# 摘块时必须连它一起摘, 否则下面的残留检查会被自家的注释绊住。
-BANNER_RE = re.compile(r"^#[ \t]*=+[^\n]*PrivDNS Gateway[^\n]*\n", re.M)
+# 本项目写进配置的那行注释头 —— 必须与 nftmerge.BANNER **逐字相同**。
+# 第一版写成了宽松模式(任何 `#====` 开头且含 "PrivDNS Gateway" 的注释), 结果在 `.200` 上
+# 把用户自己那行 "# ==== 用户自建区(与 PrivDNS Gateway 无关, 卸载不得动它) ====" 一起删了。
+# 卸载删用户的注释是越权 —— 哪怕只是注释。只认自己写下的那一行, 别的一概不碰。
+BANNER = "# ==== PrivDNS Gateway 管理区(table inet %s): 由 pdg 自动维护, 勿手改 ====" % TABLE
+BANNER_RE = re.compile(r"^%s[ \t]*\n" % re.escape(BANNER), re.M)
 
 
 def _decomment(text):

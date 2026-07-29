@@ -243,6 +243,24 @@ if not _np.has_project_table(_stripped):
     ok("摘完之后 --check 判为干净(卸载可以如实报成功)")
 else:
     bad("摘完仍判有残留")
+# 用户自己的注释里提到 "PrivDNS Gateway" 是很自然的事(比如标注"这段与它无关")。
+# 第一版 BANNER_RE 写成了宽松模式, 在 `.200` 上真把用户那行注释删了 —— 卸载删用户的东西
+# 是越权, 哪怕只是一行注释。
+_uc = ("#!/usr/sbin/nft -f\n\nflush ruleset\n\n" + BANNER + "\n"
+       "table inet pdg\ndelete table inet pdg\n\n"
+       "table inet pdg {\n\tchain input {\n\t\ttype filter hook input priority filter; policy drop;\n\t}\n}\n\n"
+       "# ==== 用户自建区(与 PrivDNS Gateway 无关, 卸载不得动它) ====\n"
+       "table inet usercheck {\n\tchain sentinel {\n\t}\n}\n")
+_uo = _np.strip_project(_uc)
+if "用户自建区" in _uo and "卸载不得动它" in _uo:
+    ok("用户注释里提到 PrivDNS Gateway 也不会被卸载删掉")
+else:
+    bad("把用户自己的注释删了 —— 只该摘项目逐字写下的那一行")
+if BANNER not in _uo:
+    ok("项目自己那行注释头仍然被摘掉")
+else:
+    bad("项目注释头没摘掉")
+
 # 老版本卸载留下的孤儿注释头: 表已经没了, 再跑卸载也得能把它清掉。
 _orphan = "#!/usr/sbin/nft -f\n\nflush ruleset\n\n" + BANNER + "\n\ntable inet usercheck {\n\tchain sentinel {\n\t}\n}\n"
 _cleaned = _np.strip_project(_orphan)
