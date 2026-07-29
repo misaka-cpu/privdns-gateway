@@ -1,16 +1,52 @@
 #!/usr/bin/env python3
-"""把一份当前形态的 mosdns 配置退回 v1.7.0 形态(摘掉明确代理的域名集/序列/判断)。
+"""把一份 mosdns 配置退回"还没有明确代理优先级"的形态(= v1.7.0)。
 
-E2E 夹具用: 造一台"还没修过的 v1.7.0 机器"。摘不干净就报错 —— 夹具没造对而用例照跑,
-验的是别的东西。"""
-import re
+按行删, 不拿注释文案当锚点 —— 要处理的有两种来源: 仓库模板(带成段注释)和迁移写进去的
+(没有注释)。用注释定位的话, 对第二种就是空跑, 而调用方还以为夹具造好了。
+
+删三样: explicit_proxy 域名集块、explicit_proxy_seq 序列块、internal_sequence 里那道判断;
+每样连同紧挨在它上面的注释一起删。删不干净就报错退出。
+"""
 import sys
 
-f = sys.argv[1]
-s = open(f, encoding="utf-8").read()
-s = re.sub(r"  # 明确代理集:[\s\S]*?(?=  - tag: ecs_china\n)", "", s)
-s = re.sub(r"  # 明确代理域名的劫持序列[\s\S]*?(?=  - tag: internal_sequence\n)", "", s)
-s = re.sub(r"      # 用户点名指到出口的域名[\s\S]*?exec: goto explicit_proxy_seq\n", "", s)
-if "explicit_proxy" in s:
-    sys.exit("没退回到 v1.7.0 形态: 仍残留 explicit_proxy")
-open(f, "w", encoding="utf-8").write(s)
+
+def drop_block(lines, head_pred, end_pred):
+    """删掉第一个满足 head_pred 的行起、到 end_pred 为止的块, 连同紧邻其上的注释行。"""
+    for i, ln in enumerate(lines):
+        if not head_pred(ln):
+            continue
+        j = i + 1
+        while j < len(lines) and not end_pred(lines[j]):
+            j += 1
+        k = i
+        while k > 0 and lines[k - 1].lstrip().startswith("#"):
+            k -= 1
+        return lines[:k] + lines[j:], True
+    return lines, False
+
+
+def main():
+    f = sys.argv[1]
+    lines = open(f, encoding="utf-8").read().splitlines(keepends=True)
+
+    def top(l):
+        return l.startswith("  - tag: ")
+
+    # 1) 两个插件块: 各删到下一个顶层 "  - tag: " 为止
+    for tag in ("  - tag: explicit_proxy\n", "  - tag: explicit_proxy_seq\n"):
+        lines, _ = drop_block(lines, lambda l, t=tag: l == t, top)
+
+    # 2) internal_sequence 里的判断: "- matches: qname $explicit_proxy" 连同它下面那条 exec
+    lines, _ = drop_block(
+        lines,
+        lambda l: l.strip() == "- matches: qname $explicit_proxy",
+        lambda l: l.strip().startswith("- matches:") or l.startswith("  - tag: "))
+
+    out = "".join(lines)
+    if "explicit_proxy" in out:
+        sys.exit("没退回到 v1.7.0 形态: 仍残留 explicit_proxy")
+    open(f, "w", encoding="utf-8").write(out)
+
+
+if __name__ == "__main__":
+    main()

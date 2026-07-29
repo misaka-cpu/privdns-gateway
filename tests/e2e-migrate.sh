@@ -227,4 +227,39 @@ python3 /opt/pdg-bot/doctor.py --json > /tmp/doc5.json 2>/dev/null
 python3 "$E2E_ROOT/tests/helpers/doctor-explicit-proxy.py" /tmp/doc5.json warn \
   && ok "doctor: 点名这台机器未迁移(warn)" || bad "doctor 没点名: $(cat /tmp/doc5.json 2>/dev/null | head -c 200)"
 
+
+# ══ 场景六: 未完成事务 —— 该挡的挡, 不该挡的不许挡 ══════════════════════════
+# 线上两台机器上都躺着几笔定时 geosite 更新留下的 PREPARING(开了但从没应用过)。它们不改现网、
+# 也不挡任何写入, 但 `pdgtx pending` 会把它们打印出来。迁移若拿"输出非空"当判据, 就会在**恰恰
+# 最需要修的那些机器上**静默跳过: update 照样报成功, 分流照样不生效, 没有任何一处会报错。
+echo; echo "── 场景六: 陈旧 PREPARING 不挡迁移 / 真需收尾的事务要挡 ──"
+TXROOT=/var/lib/privdns-gateway/tx
+
+# 6a. 陈旧 PREPARING(3 天前, 从没应用过)→ 迁移照常进行
+seed_v170_box
+rm -rf "$TXROOT"; mkdir -p "$TXROOT"
+stale="$(python3 "$E2E_ROOT/tests/helpers/seed-stale-tx.py" "$TXROOT" PREPARING 3)"
+python3 /opt/pdg-bot/pdgtx.py pending 2>/dev/null | grep -q "$stale" \
+  && ok "前置: 陈旧 PREPARING 确实会出现在 pending 输出里(判据不能只看输出)" \
+  || bad "前置: 没造出陈旧 PREPARING"
+bash /usr/local/bin/pdg __migrate >/tmp/mig7.log 2>&1
+grep -q 'qname \$explicit_proxy' /etc/mosdns/config.yaml \
+  && ok "陈旧 PREPARING 在场: 迁移照常完成(没被无关事务挡住)" \
+  || bad "被陈旧 PREPARING 挡住了: $(grep -i 事务 /tmp/mig7.log | head -2)"
+
+# 6b. 真正需要收尾的事务(APPLYING)→ 必须挡住, 且现网一个字节不动
+seed_v170_box
+rm -rf "$TXROOT"; mkdir -p "$TXROOT"
+bash /usr/local/bin/pdg __migrate >/tmp/mig8a.log 2>&1   # 先让无关迁移落定
+python3 "$E2E_ROOT/tests/helpers/strip-explicit-proxy.py" /etc/mosdns/config.yaml || bad "6b 前置失败"
+applying="$(python3 "$E2E_ROOT/tests/helpers/seed-stale-tx.py" "$TXROOT" APPLYING 0)"
+cp /etc/mosdns/config.yaml /tmp/m6b
+bash /usr/local/bin/pdg __migrate >/tmp/mig8.log 2>&1
+grep -q 'qname \$explicit_proxy' /etc/mosdns/config.yaml \
+  && bad "APPLYING 事务在场却照样迁移了(该挡没挡)" \
+  || ok "APPLYING 事务在场: 迁移拒绝执行"
+cmp -s /tmp/m6b /etc/mosdns/config.yaml && ok "拒绝时现网配置逐字节未动" || bad "拒绝了却改了配置"
+grep -q "$applying" /tmp/mig8.log && ok "迁移日志点名了挡路的事务 id" || bad "没说明是哪笔事务挡的"
+rm -rf "$TXROOT"; mkdir -p "$TXROOT"
+
 e2e_summary

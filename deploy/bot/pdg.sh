@@ -2046,9 +2046,17 @@ migrate_mosdns_explicit_proxy(){
     return 0
   fi
   txm="$(_pdg_module pdgtx.py)" || { c_y "  找不到 pdgtx.py, 明确代理优先级未迁移。"; return 0; }
-  local pend; pend="$(python3 "$txm" pending 2>/dev/null)"
-  if [[ -n "$pend" ]]; then
-    c_y "  有未完成的配置事务, 明确代理优先级本次不迁移(未改动任何文件)。"; return 0
+  # 判据用 pdgtx 自己的**退出码**(非 0 = 有事务卡在需要人工收尾的状态), 不是输出是否为空:
+  # `pending` 还会顺带列出"开了但从没应用过"的陈旧 PREPARING —— 那类不挡任何写入, pdgtx 自己
+  # 也不把它算进 NEEDS_RECOVERY。拿输出非空当判据, 线上机器攒着的旧 geosite_update 就会把这次
+  # 迁移永远挡在门外, 而且是静默的: 更新照样报成功, 分流照样不生效。
+  local pend rcp=0
+  pend="$(python3 "$txm" pending 2>/dev/null)" || rcp=$?
+  if [[ "$rcp" != 0 ]]; then
+    c_y "  有需要收尾的配置事务, 明确代理优先级本次不迁移(未改动任何文件):"
+    printf '%s\n' "$pend" | sed 's/^/    /'
+    c_y "  → 先 sudo pdg tx recover <id> 收尾, 再跑一次 sudo pdg update。"
+    return 0
   fi
   sip="$(sed -n 's/^PDG_SERVER_IP=//p' /etc/privdns-gateway/profile.env 2>/dev/null | tail -1)"
   wd="$(mktemp -d)" || return 0
