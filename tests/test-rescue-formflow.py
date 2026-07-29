@@ -15,6 +15,7 @@ import shutil
 import ssl
 import sys
 import tempfile
+import time
 import urllib.parse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -269,6 +270,28 @@ try:
     bad("页面没有表单时客户端竟然没报错")
 except FormError:
     ok("页面缺表单时客户端提交前就失败, 不发注定被拒的请求")
+
+print("\n== 12. 提交后客户端就走人 ==")
+# 浏览器点完"恢复"就关掉标签页, 是真机上最常见的一种收尾。事务此刻早已在跑, 结果不该被
+# 一次网络事件改写。这条原本只在 `.200` 上真跑过, CI 里没有 —— 于是"断线被当成操作失败"
+# 这种改动能一路绿着合进来。
+strayed = os.path.join(box.root, "etc/mosdns/rules/custom_direct.txt")
+with open(strayed, "w", encoding="utf-8") as f:
+    f.write("domain:client-went-away.example\n")
+st, _ = cli.submit("/snapshot/" + SNAP, "/snapshot/restore", checks=("confirm",),
+                   drop_before_read=True)
+time.sleep(3)
+with open(strayed, encoding="utf-8") as f:
+    after = f.read()
+if after == want["etc/mosdns/rules/custom_direct.txt"]:
+    ok("客户端提前断开, 事务照样跑完并落盘(逐字节等于快照)")
+else:
+    bad("客户端断开后文件没恢复到快照内容")
+st, body = cli.request("GET", "/")
+if st == 200:
+    ok("写响应失败被吞掉, 服务进程存活且继续服务(st=200)")
+else:
+    bad("断线之后服务不可用了 st=%s" % st)
 
 inst.stop() if hasattr(inst, "stop") else None
 shutil.rmtree(work, ignore_errors=True)

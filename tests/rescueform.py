@@ -17,6 +17,7 @@ import hashlib
 import http.client
 import re
 import ssl
+import time
 import urllib.parse
 from html.parser import HTMLParser
 
@@ -101,7 +102,7 @@ class Client:
                             % (self.seen_fp[:11], self.expect_fp[:11]))
         return c
 
-    def request(self, method, path, body=None, drop_before_read=False):
+    def request(self, method, path, body=None, drop_before_read=False, hold=0.0):
         c = self._conn()
         hdr = {}
         if self.jar:
@@ -110,7 +111,12 @@ class Client:
             hdr["Content-Type"] = "application/x-www-form-urlencoded"
         c.request(method, path, body=body, headers=hdr)
         if drop_before_read:
-            c.sock.close()          # 收尾断线: 服务端正准备回写时把连接扯掉
+            # hold=0 是"中途断线": 请求刚发完就走人, 服务端还在跑事务。
+            # hold>0 用来把断线时刻推到事务快收尾处, 打服务端**准备回写**的那一刻。
+            # 等待放在客户端这边 —— 产品里不为制造时序加任何 sleep。
+            if hold:
+                time.sleep(hold)
+            c.sock.close()
             return 0, ""
         r = c.getresponse()
         data = r.read().decode("utf-8", "replace")
