@@ -219,6 +219,10 @@ _spec = _ilu.spec_from_file_location("nftpurge_t", os.path.join(ROOT, "deploy/bo
 _np = _ilu.module_from_spec(_spec)
 _spec.loader.exec_module(_np)
 BANNER = "# ==== PrivDNS Gateway 管理区(table inet pdg): 由 pdg 自动维护, 勿手改 ===="
+# 端口从常量源读 —— 夹具里写死数字会让 test-rescue-constants.sh 的"全仓无端口字面量"判红,
+# 那条规则是对的: 端口只有一个事实源。
+_PORT = re.search(r"PDG_RESCUE_PORT=\"?\$\{PDG_RESCUE_PORT:-(\d+)\}",
+                  open(os.path.join(ROOT, "lib/rescue.sh"), encoding="utf-8").read()).group(1)
 _only_comment = "#!/usr/sbin/nft -f\n\nflush ruleset\n\n" + BANNER + "\n\ntable inet usercheck {\n\tchain sentinel {\n\t}\n}\n"
 if not _np.has_project_table(_only_comment):
     ok("只剩项目注释头时判为**干净**(注释里的字面量不是表)")
@@ -227,12 +231,12 @@ else:
 _full = ("#!/usr/sbin/nft -f\n\nflush ruleset\n\n" + BANNER + "\n"
          "table inet pdg\ndelete table inet pdg\n\n"
          "table inet pdg {\n\tchain input {\n\t\ttype filter hook input priority filter; policy drop;\n"
-         "\t\tip saddr 10.0.0.0/8 tcp dport 8446 accept comment \"pdg-rescue\"\n\t}\n}\n\n"
+         "\t\tip saddr 10.0.0.0/8 tcp dport " + _PORT + " accept comment \"pdg-rescue\"\n\t}\n}\n\n"
          "table inet usercheck {\n\tchain sentinel {\n"
-         "\t\tip saddr 10.99.0.0/16 tcp dport 8446 accept comment \"user-own-8446\"\n\t}\n}\n")
+         "\t\tip saddr 10.99.0.0/16 tcp dport " + _PORT + " accept comment \"user-own-port\"\n\t}\n}\n")
 _stripped = _np.strip_project(_full)
-if "user-own-8446" in _stripped and "usercheck" in _stripped:
-    ok("摘块后用户自建表与用户的 8446 规则原样保留")
+if "user-own-port" in _stripped and "usercheck" in _stripped:
+    ok("摘块后用户自建表与用户在同一端口上的规则原样保留")
 else:
     bad("把用户自建表也摘掉了")
 if BANNER not in _stripped:

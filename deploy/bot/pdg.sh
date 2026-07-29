@@ -2989,7 +2989,7 @@ _rescue_status(){
   done
   fp="$(python3 /opt/pdg-bot/rescue_cred.py fingerprint 2>/dev/null || true)"
   printf "  %-14s %s\n" "证书指纹" "${fp:-读取失败}"
-  printf "  %-14s %s\n" "" "(核对方式: 把这串带到手机上比对浏览器里的证书详情; 见 docs/rescue-plane-access.md)"
+  printf "  %-14s %s\n" "指纹核对" "把上面这串带到手机上比对浏览器里的证书详情(见 docs/rescue-plane-access.md)"
   # 渲染出来的监听地址与当前内网段是否还对得上 —— detect-cidr 换过段之后它会过期
   local cidr rendered
   cidr="$(pdg_internal_cidr 2>/dev/null || true)"

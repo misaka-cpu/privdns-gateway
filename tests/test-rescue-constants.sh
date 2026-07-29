@@ -59,9 +59,11 @@ else
 fi
 
 # ── 4. 全仓不许出现端口字面量(单一事实源与本测试自身除外) ──
+# 排除 *.md: 这条规则管的是**代码**只能有一个事实源, 而面向用户的文档必须把端口写出来 ——
+# 让人在浏览器地址栏里输 `$PDG_RESCUE_PORT` 是没有意义的。代码与测试仍然一处字面量都不许有。
 # 本测试从不写死端口, 用的是 source 出来的 $PORT —— 所以它自己也在扫描范围内。
 mapfile -t hits < <(cd "$ROOT" && grep -rn --binary-files=without-match "\b$PORT\b" \
-  --exclude-dir=.git --exclude-dir=__pycache__ . 2>/dev/null \
+  --exclude-dir=.git --exclude-dir=__pycache__ --exclude="*.md" . 2>/dev/null \
   | grep -v "^./lib/rescue.sh:")
 if [[ ${#hits[@]} -eq 0 ]]; then
   ok "除 lib/rescue.sh 外, 全仓没有端口 $PORT 的字面量"
