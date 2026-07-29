@@ -384,6 +384,31 @@ else:
     bad("doctor 放过了遗留独立表: st=%s msg=%s" % (st, msg[:80]))
 
 print("─" * 40)
+
+# ── 注释里的标记不算规则 ─────────────────────────────────────────────────────
+# 这条防的是一个真出过事的错误类型: 拿 `grep -c pdg-rescue` 数规则, 会把配置里那行
+# "# 救援平面: …见 pdg-rescue.socket" 的注释算进去。uninstall 的残留检查曾因同类问题
+# 把一次干净的卸载判成失败; 而在 `.200` 上它让人连着几轮把 1/1 误读成 2/1。
+import sys as _sys
+_sys.path.insert(0, os.path.join(ROOT, "deploy", "bot"))
+import rescue_nft as _rn
+_PORT = int(re.search(r"PDG_RESCUE_PORT=\"?\$\{PDG_RESCUE_PORT:-(\d+)\}",
+                      open(os.path.join(ROOT, "lib/rescue.sh"), encoding="utf-8").read()).group(1))
+_conf = (
+    "table inet pdg {\n\tchain input {\n"
+    "\t\tip saddr 172.22.0.0/16 ip daddr 1.2.3.4 tcp dport %d accept comment \"pdg-rescue\"\n"
+    "\t\t# 救援平面: 只认内网卡来源, 且服务只绑内网地址(见 pdg-rescue.socket)\n"
+    "\t\tip saddr 172.22.0.0/16 tcp dport %d accept\n\t}\n}\n" % (_PORT, _PORT))
+_n = _rn.count_rules(_conf, _PORT)
+if _n == 1:
+    ok("规则计数只认真规则: 注释里的 pdg-rescue 字样与无标记的通用放行都不计入(得 %d)" % _n)
+else:
+    bad("计数把注释/无标记规则也算进去了: 得 %d, 应为 1" % _n)
+if _conf.count("pdg-rescue") == 2:
+    ok("前提: 该样本里 `grep -c pdg-rescue` 确实会数出 2 —— 朴素做法会误导")
+else:
+    bad("前提不成立, 这条防不住任何东西")
+
 print("通过 %d, 失败 %d" % (PASS[0], FAIL[0]))
 if PASS[0] + FAIL[0] == 0:
     print("零断言 —— 判失败")
