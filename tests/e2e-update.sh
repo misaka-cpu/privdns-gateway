@@ -231,4 +231,103 @@ out=$(bash /usr/local/bin/pdg update 2>&1); rc=$?
   && [[ "$(sha256sum /etc/mosdns/config.yaml | cut -d' ' -f1)" == "$_cfg" ]]; } \
   && ok "失败后现网一个字节都没动" || bad "失败却改了现网"
 
+# ══ py_compile 失败: 真抵达该阶段, 且必须精确回滚 ═════════════════════════
+# 选 report.py 作坏模块是有依据的: 它不被任何 migrate_* 触及, 也不被 doctor/checks/bot
+# import —— 于是坏内容能活过"部署 → __migrate → 内核二进制"三段, 真正撞到 py_compile 那道门。
+# 换成 nftscan.py / cidrgen.py 之类会在迁移里被调用的模块, 就会提前在 __migrate 失败,
+# 测的就不是 py_compile 了。
+echo; echo "── py_compile 失败与回滚 ──"
+source "$E2E_ROOT/lib/modules.sh"
+PLAT="$(cat /etc/privdns-gateway/platform 2>/dev/null || echo android)"
+
+_snapshot_state(){   # 输出: 每个受管成员的 "名字 sha mode uid:gid"
+  while read -r _s _n _m; do
+    [[ -n "$_n" ]] || continue
+    if [[ -f "/opt/pdg-bot/$_n" ]]; then
+      printf '%s %s %s %s\n' "$_n" "$(sha256sum "/opt/pdg-bot/$_n" | cut -d' ' -f1)" \
+             "$(stat -c%a "/opt/pdg-bot/$_n")" "$(stat -c%u:%g "/opt/pdg-bot/$_n")"
+    else printf '%s MISSING - -\n' "$_n"; fi
+  done < <(pdg_platform_modules "$PLAT")
+}
+
+# 操作前: 给两个文件设置**合法但不同于 manifest** 的 mode —— 一个普通数据文件、一个可执行脚本。
+# 回滚要恢复的是这两个原始值, 而不是 manifest 值, 更不是写死的 0644/0755。
+_norm=rescue.sh          # manifest 声明 644
+_exe=report.py           # manifest 声明 755
+chmod 640 "/opt/pdg-bot/$_norm"; chmod 700 "/opt/pdg-bot/$_exe"
+_pre_norm_mode=$(stat -c%a "/opt/pdg-bot/$_norm"); _pre_exe_mode=$(stat -c%a "/opt/pdg-bot/$_exe")
+_pre_norm_own=$(stat -c%u:%g "/opt/pdg-bot/$_norm"); _pre_exe_own=$(stat -c%u:%g "/opt/pdg-bot/$_exe")
+_pre_norm_sha=$(sha256sum "/opt/pdg-bot/$_norm" | cut -d' ' -f1)
+_pre_exe_sha=$(sha256sum "/opt/pdg-bot/$_exe" | cut -d' ' -f1)
+_before="$(_snapshot_state)"
+_pre_bot=$(sha256sum /etc/privdns-gateway/bot.env 2>/dev/null | cut -d' ' -f1)
+_pre_rs=$(sha256sum /opt/pdg-bot/rulesets.json 2>/dev/null | cut -d' ' -f1)
+_pre_mos=$(sha256sum /etc/mosdns/config.yaml | cut -d' ' -f1)
+{ [[ "$_pre_norm_mode" == 640 ]] && [[ "$_pre_exe_mode" == 700 ]]; } \
+  && ok "前提: 操作前 mode 已设为非 manifest 值($_norm=640, $_exe=700)" \
+  || bad "前提没设上: $_norm=$_pre_norm_mode $_exe=$_pre_exe_mode"
+
+# 造一个只坏了 report.py 的新 release
+git -C "$REPO" tag -d v9.9.9 >/dev/null 2>&1 || true
+git -C "$REPO" checkout -q v9.9.8 2>/dev/null || true
+( cd "$REPO" || { echo "[FAIL] REPO 不存在"; exit 1; }
+  printf 'def broken(:\n    pass\n' > deploy/bot/report.py
+  git add -A >/dev/null 2>&1
+  git -c user.email=t@t -c user.name=t commit -qm "bad release" >/dev/null 2>&1
+  git tag -f v9.9.10 >/dev/null 2>&1
+  git push -q -f origin HEAD:refs/heads/main --tags >/dev/null 2>&1 ) || true
+git -C "$REPO" reset -q --hard v9.9.8 2>/dev/null || true
+git -C "$REPO" tag -d v9.9.10 >/dev/null 2>&1 || true
+
+# HEAD 必须在**跑 update 的那一刻**取。第一版在夹具把仓库挪到 v9.9.8 之前就取了,
+# 于是回滚回到 v9.9.8 反而被判成"没恢复" —— 是取样点错了, 不是产品错。
+_pre_head=$(git -C "$REPO" rev-parse HEAD)
+out=$(bash /usr/local/bin/pdg update 2>&1); rc=$?
+
+# ── 抵达阶段的结构化证据(不靠 grep 日志里的 py_compile 字样) ──────────────
+grep -q '已切到发布 v9.9.10' <<<"$out" && ok "阶段: 发现并切到测试 release v9.9.10" || bad "没切到测试 release"
+grep -q '更新前留快照' <<<"$out" && ok "阶段: 更新前快照已创建" || bad "没留快照"
+{ ! grep -qE '必需文件安装失败|运行模块清单不合法' <<<"$out"; } \
+  && ok "阶段: manifest 校验与静态部署都通过了(没被前一阶段拦下)" || bad "在部署阶段就失败了, 没走到 py_compile"
+{ ! grep -q '迁移(__migrate)失败' <<<"$out"; } \
+  && ok "阶段: __migrate 通过(坏模块没被迁移提前执行)" || bad "__migrate 提前失败"
+grep -q 'Python 语法错误' <<<"$out" && ok "阶段: 非零来自 py_compile 这道门" || bad "失败点不是 py_compile: $(tail -3 <<<"$out")"
+# 独立复证: 直接对那份坏内容跑一次真 py_compile, 确认它确实编不过
+printf 'def broken(:\n    pass\n' > /tmp/badmod.py
+python3 -m py_compile /tmp/badmod.py 2>/dev/null \
+  && bad "坏模块居然能编译 —— 这条场景没构造成" || ok "独立复证: 该模块内容确实过不了真 py_compile"
+rm -f /tmp/badmod.py
+
+# ── 回滚验收 ──────────────────────────────────────────────────────────────
+[[ "$rc" != 0 ]] && ok "update 返回非 0" || bad "py_compile 失败却返回 0"
+{ ! grep -q '✅ 已更新' <<<"$out"; } && ok "没有显示已更新" || bad "谎报成功"
+grep -qE '回滚' <<<"$out" && ok "明确显示已回滚" || bad "没说回滚"
+[[ "$(git -C "$REPO" rev-parse HEAD)" == "$_pre_head" ]] \
+  && ok "git HEAD 恢复到更新前" || bad "git 状态没恢复"
+_after="$(_snapshot_state)"
+if [[ "$_before" == "$_after" ]]; then
+  ok "全部 $(wc -l <<<"$_before") 项受管成员的内容/mode/owner 逐项恢复"
+else
+  bad "受管成员没完全恢复:"; diff <(echo "$_before") <(echo "$_after") | head -4
+fi
+# NC9 的两条重点: 恢复的必须是**操作前的原始 mode**, 不是 manifest 值也不是写死值
+{ [[ "$(stat -c%a "/opt/pdg-bot/$_norm")" == "$_pre_norm_mode" ]] \
+  && [[ "$(sha256sum "/opt/pdg-bot/$_norm"|cut -d' ' -f1)" == "$_pre_norm_sha" ]] \
+  && [[ "$(stat -c%u:%g "/opt/pdg-bot/$_norm")" == "$_pre_norm_own" ]]; } \
+  && ok "普通文件 $_norm: 内容/mode($_pre_norm_mode, 非 manifest 的 644)/owner 全部恢复" \
+  || bad "$_norm 恢复不对: mode=$(stat -c%a "/opt/pdg-bot/$_norm") 期望 $_pre_norm_mode"
+{ [[ "$(stat -c%a "/opt/pdg-bot/$_exe")" == "$_pre_exe_mode" ]] \
+  && [[ "$(sha256sum "/opt/pdg-bot/$_exe"|cut -d' ' -f1)" == "$_pre_exe_sha" ]] \
+  && [[ "$(stat -c%u:%g "/opt/pdg-bot/$_exe")" == "$_pre_exe_own" ]]; } \
+  && ok "可执行脚本 $_exe: 内容/mode($_pre_exe_mode, 非 manifest 的 755)/owner 全部恢复" \
+  || bad "$_exe 恢复不对: mode=$(stat -c%a "/opt/pdg-bot/$_exe") 期望 $_pre_exe_mode"
+grep -q 'def broken(' "/opt/pdg-bot/$_exe" 2>/dev/null \
+  && bad "测试 release 的坏模块残留在盘上" || ok "坏模块未残留"
+{ [[ "$(sha256sum /etc/privdns-gateway/bot.env 2>/dev/null|cut -d' ' -f1)" == "$_pre_bot" ]] \
+  && [[ "$(sha256sum /opt/pdg-bot/rulesets.json 2>/dev/null|cut -d' ' -f1)" == "$_pre_rs" ]] \
+  && [[ "$(sha256sum /etc/mosdns/config.yaml|cut -d' ' -f1)" == "$_pre_mos" ]]; } \
+  && ok "用户数据与受管配置逐字节不变(bot.env/rulesets.json/mosdns)" || bad "用户数据被改动"
+[[ -z "$(ls -d /opt/pdg-bot/__pycache__ 2>/dev/null)" ]] \
+  && ok "无 __pycache__ 残留(py_compile 的产物已清)" || ok "存在 __pycache__(py_compile 产物, 非静态成员)"
+
 e2e_summary
