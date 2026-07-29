@@ -264,6 +264,7 @@ _txdir="$(ls -1dt /var/lib/privdns-gateway/tx/*/ 2>/dev/null | head -1)"
   && grep -q '"state": "COMMITTED"' "$_txdir/meta.json" 2>/dev/null; } \
   && ok "事务留下了 COMMITTED 的 detect-cidr 记录(可查、可审计)" \
   || bad "7b: 没找到本次事务记录: ${_txdir:-无}"
+_S7_TX=yes      # 场景标记: 事务真的提交过(见文件末尾的必需场景守卫)
 reset_cidr
 
 # 7b. mosdns 是自定义形态(没有可替换的 ips)→ sed 不命中必须报错而不是报成功
@@ -304,6 +305,7 @@ e2e_svc_heal mosdns
 { [[ "$(sha256sum /etc/nftables.conf | cut -d' ' -f1)" == "$NFT_SHA0" ]] \
   && [[ "$(sha256sum /etc/mosdns/config.yaml | cut -d' ' -f1)" == "$MOS_SHA0" ]]; } \
   && ok "mosdns 失败后用本次事务备份还原(两份配置回到原样)" || bad "7h: 没还原干净"
+_S7_ROLLBACK=yes   # 场景标记: 失败回滚真的走过
 
 # 7e. 成功路径: 落盘 + 三处复核
 reset_cidr
@@ -325,6 +327,19 @@ out=$(detect); rc=$?
 { [[ "$(sha256sum /etc/nftables.conf | cut -d' ' -f1)" == "$NFT_SHA1" ]] \
   && [[ "$(sha256sum /etc/mosdns/config.yaml | cut -d' ' -f1)" == "$MOS_SHA1" ]]; } \
   && ok "幂等: 第二次没有改动任何配置" || bad "7m: 第二次改了配置"
+_S7_CLEANUP=yes    # 场景标记: 收尾与幂等复核真的跑过
 
 rm -f /tmp/pristine.nft /tmp/pristine.mos /usr/local/bin/nft.real /usr/local/bin/tar.real
+
+# ── 必需场景守卫 ────────────────────────────────────────────────────────────
+# 光看总退出码是不够的: 把 §7 整段删掉或提前 return, 其余部分照样全绿, 退出码 0 —— 而
+# §7 恰恰是唯一真跑"改网段 → 事务 → 校验门 → 回滚 → 清理"那条链的地方。所以每个必需场景
+# 在跑完时留一个标记, 这里逐项核对; 少一个就判失败并点名是哪个场景没执行。
+_missing=""
+[[ -n "${_S7_TX:-}" ]]       || _missing="$_missing §7-事务提交"
+[[ -n "${_S7_ROLLBACK:-}" ]] || _missing="$_missing §7-失败回滚"
+[[ -n "${_S7_CLEANUP:-}" ]]  || _missing="$_missing §7-收尾清理"
+if [[ -n "${_missing// /}" ]]; then
+  bad "必需场景未执行:$_missing (整段被删/提前 return 时其余用例仍会全绿, 所以这里单独判)"
+fi
 e2e_summary
