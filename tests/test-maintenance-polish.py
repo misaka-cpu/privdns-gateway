@@ -16,6 +16,30 @@ def block_after(text: str, marker: str, window: int = 900) -> str:
     return text[start:start + window]
 
 
+def top_level_bash_func(text: str, name: str) -> str:
+    """取一个**顶格**定义的 bash 函数体: 从 `name(){` 那一行, 到与它配对的顶格 `}`。
+
+    为什么不用 block_after 的定长窗口: 窗口是按当时的函数长度估出来的, 函数一变长, 尾部的
+    真实代码就被顶出窗口, 于是断言在代码**明明没坏**的情况下变红(cmd_rollback 加了
+    --preserve-rescue 之后正是如此)。而"把窗口从 6200 调到 7800"只是把同一颗雷往后挪一格,
+    下次再有人往函数里加东西就再炸一次。
+
+    这里的边界是语法结构而不是字符数, 所以:
+      · 函数长到多少都不影响(往前半部分插多少内容都一样);
+      · 把调用挪到 cmd_rollback **外面**就一定找不到 —— 那正是应该判失败的情形;
+      · 抽不到声明或抽不到配对的收尾一律断言失败, 不会退化成"搜全文"而假绿。
+    """
+    lines = text.split("\n")
+    decl = f"{name}(){{"
+    try:
+        start = lines.index(decl)
+    except ValueError:
+        raise AssertionError(f"找不到顶格函数声明: {decl}") from None
+    end = next((i for i in range(start + 1, len(lines)) if lines[i] == "}"), None)
+    assert end is not None, f"{name} 没有配对的顶格收尾 }}, 抽取失败(拒绝退化成全文搜索)"
+    return "\n".join(lines[start:end + 1])
+
+
 send_plain = block_after(bot, "def send_plain")
 assert "p.pop(\"parse_mode\", None)" in send_plain, (
     "send_plain should retry without HTML parse_mode when Telegram rejects unescaped user/error text"
@@ -54,7 +78,9 @@ assert "临时观测/控制面板" in install_doc and "临时观测/控制面板
     "install and production docs should document the temporary panel boundary"
 )
 
-rollback = block_after(pdg, "cmd_rollback()", window=6200)   # harden + core-aware + 跨内核 + --dir/--git + 用快照自带内核校验旧配置后更大(实测约 5.7k)
+# 按语法边界取整个 cmd_rollback(不是定长窗口)——下面三条断言都只在这个函数体内找,
+# 于是"调用被挪出 cmd_rollback"必然判失败, 而"函数变长"不再误报。
+rollback = top_level_bash_func(pdg, "cmd_rollback")
 assert '[[ "$idx" =~ ^[0-9]+$ ]]' in rollback, "rollback index should reject non-numeric input"
 assert 'idx >= ${#snaps[@]}' in rollback, "rollback index should reject out-of-range input"
 
@@ -77,9 +103,17 @@ assert "run_all_migrations" not in "\n".join(
 assert "migrate)       cmd_migrate;;" in pdg, "必须提供显式的事务化迁移命令 pdg migrate"
 
 # P2-2: snapshot 包含 journald drop-in(正确+历史错路径), rollback 重启 journald
-snapshot = block_after(pdg, "cmd_snapshot()", window=2600)   # cand 扩到含已装脚本 + 全部 unit 后更长
+# 同 cmd_rollback: 按语法边界取整个函数, 不用字符窗口。原来那个 2600 的窗口其实**已经**
+# 盖不住函数了(cmd_snapshot 现有 2670 字符), 只是四条断言的目标碰巧都还落在前 2600 字符里 ——
+# 再往前半部分加 70 个字符就会在代码没坏的情况下变红。
+snapshot = top_level_bash_func(pdg, "cmd_snapshot")
 assert "etc/systemd/journald.conf.d/50-pdg.conf" in snapshot, "snapshot must include journald drop-in (correct path)"
 assert "etc/systemd/system/journald.conf.d/50-pdg.conf" in snapshot, "snapshot should also capture legacy wrong-path file"
+# journald 的 CanReload=no: 还原封顶必须 restart 才生效。要求**恰好一次** —— 多来一次是
+# 白重启一个正在收日志的服务, 一次都没有则还原不生效。
+assert rollback.count("systemctl restart systemd-journald") == 1, (
+    "cmd_rollback must restart journald exactly once (found %d)"
+    % rollback.count("systemctl restart systemd-journald"))
 assert "systemctl restart systemd-journald" in rollback, (
     "rollback must restart journald (CanReload=no) so restored cap takes effect"
 )
@@ -117,7 +151,9 @@ assert '_pdg_apply_snapshot_tree "$tree" "$members" /' in rollback, (
 assert "_migrate_mosdns_cache" in pdg and "_migrate_journald_cap" in pdg, (
     "mosdns cache and journald cap must be separate functions so one's failure doesn't skip the other"
 )
-mig_low = block_after(pdg, "migrate_lowmem(){", window=500)
+# 这里方向相反: 原窗口 500 比函数本身(464 字符)还长, 于是越界读进了后面那个函数 ——
+# 断言本该只在 migrate_lowmem 里成立, 却可能被邻居的内容满足。按边界取正好收紧这一点。
+mig_low = top_level_bash_func(pdg, "migrate_lowmem")
 assert "_migrate_mosdns_cache" in mig_low and "|| true" in mig_low and "_migrate_journald_cap" in mig_low, (
     "migrate_lowmem must call mosdns cache with || true then always run journald cap"
 )

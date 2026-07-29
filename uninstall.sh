@@ -17,6 +17,7 @@ SB_WHY="(未判定)"
 MODEL_OWNED=0
 MODEL_WHY="(未判定)"
 _UN_HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo .)"
+_UNINSTALL_FAILED=0
 if [[ -f "$_UN_HERE/lib/singbox.sh" ]]; then
   # shellcheck source=lib/singbox.sh
   source "$_UN_HERE/lib/singbox.sh"
@@ -30,6 +31,36 @@ else
   echo "警告: 找不到 lib/singbox.sh, 无法判定 sing-box 归属 → 一律保留(不删)。"
 fi
 
+# nft 可执行位置先解析出来(救援清理与后面删 inet pdg 共用)。只看 PATH 的话, /usr/sbin 未导出
+# 的机器上会当成"没装 nft"整条跳过 —— 磁盘上的配置还原了, 内核里的表还在, 卸载完端口仍被
+# policy drop 挡着, 而用户从配置文件上完全看不出为什么。
+_UN_NFT=""
+for _l in "$_UN_HERE/lib/nftbin.sh" /opt/privdns-gateway/lib/nftbin.sh; do
+  [[ -f "$_l" ]] || continue
+  # shellcheck source=lib/nftbin.sh
+  source "$_l" && _UN_NFT="$(pdg_nft_bin || true)"
+  break
+done
+[[ -n "$_UN_NFT" ]] || _UN_NFT="$(command -v nft 2>/dev/null || true)"   # 判据文件缺失时的兜底
+
+# 救援平面 + 全部运行模块: 停用 unit, 再把凭据、状态、运行模块与那条独立放行规则一起带走。
+# 救援是最后一道门, 但既然是卸载, 门本身也要带走 —— 留一个 token + TLS 私钥在盘上、外加
+# 一条内网放行, 而服务已经没了, 比不卸载更糟。
+# 删哪些走 pdg_project_members(= lib/modules.sh 的运行模块真源 + 救援 unit/凭据/状态),
+# **不是**"完整恢复受保护成员"那份清单 —— 那份只是恢复旧快照时要保住的最小通道, 拿它当
+# 卸载清单会把 pdgtx.py/checks.py 这些留在盘上。
+systemctl disable --now pdg-rescue.socket pdg-rescue.service 2>/dev/null || true
+systemctl reset-failed pdg-rescue.socket pdg-rescue.service 2>/dev/null || true
+_RESCUE_RESIDUE=""
+if [[ -f "$_UN_HERE/lib/rescue.sh" ]]; then
+  # shellcheck source=lib/rescue.sh
+  source "$_UN_HERE/lib/rescue.sh"
+  # shellcheck disable=SC2034  # 前缀赋值是给 pdg_rescue_cleanup 的环境变量, shellcheck
+  # 看不进函数体所以判它"未使用"。CI 的 shellcheck 是阻断步骤, 这条告警会让整条流水线红。
+  PDG_RESCUE_REPO="$_UN_HERE" _RESCUE_RESIDUE="$(pdg_rescue_cleanup "" "$_UN_NFT")" || true
+else
+  _RESCUE_RESIDUE="找不到 lib/rescue.sh, 救援平面(凭据/状态/放行规则)未清理"
+fi
 systemctl disable --now pdg-bot pdg-probe81 mosdns mihomo pdg-mitm pdg-rules-update.timer pdg-health.timer 2>/dev/null || true
 [[ "$SB_OWNED" == 1 ]] && systemctl disable --now sing-box 2>/dev/null || true
 rm -f /etc/systemd/system/{pdg-bot,pdg-probe81,mosdns,mihomo,pdg-mitm,pdg-rules-update,pdg-health}.service \
@@ -39,23 +70,50 @@ rm -f /etc/systemd/system/{pdg-bot,pdg-probe81,mosdns,mihomo,pdg-mitm,pdg-rules-
 systemctl daemon-reload
 systemctl restart systemd-journald 2>/dev/null || true   # journald CanReload=no, 必须 restart 才会松开封顶
 
-# 防火墙: 删本项目独立表 inet pdg(不碰 Docker/fail2ban 等其它表); 有备份则还原 /etc/nftables.conf
-# nft 的位置走共用判据(lib/nftbin.sh): 只看 PATH 的话, /usr/sbin 未导出的机器上会当成"没装
-# nft"整条跳过 —— 磁盘上的配置还原了, 内核里的 inet pdg 表还在, 卸载完端口仍被 policy drop
-# 挡着, 而用户从配置文件上完全看不出为什么。
-_UN_NFT=""
-for _l in "$_UN_HERE/lib/nftbin.sh" /opt/privdns-gateway/lib/nftbin.sh; do
-  [[ -f "$_l" ]] || continue
-  # shellcheck source=lib/nftbin.sh
-  source "$_l" && _UN_NFT="$(pdg_nft_bin || true)"
-  break
-done
-[[ -n "$_UN_NFT" ]] || _UN_NFT="$(command -v nft 2>/dev/null || true)"   # 判据文件缺失时的兜底
-[[ -n "$_UN_NFT" ]] && "$_UN_NFT" delete table inet pdg 2>/dev/null || true
-if [[ -e /etc/nftables.conf.pdg-orig ]]; then
-  mv -f /etc/nftables.conf.pdg-orig /etc/nftables.conf
-  [[ -n "$_UN_NFT" ]] && "$_UN_NFT" -f /etc/nftables.conf 2>/dev/null || true
+# 防火墙: 从**当前**配置里摘掉本项目的管理块, 而不是拿装机前的备份整份盖回去。
+#
+# 旧写法 `mv /etc/nftables.conf.pdg-orig /etc/nftables.conf` 等于"还原到装机前", 后果是用户
+# 装完 PDG 之后加的所有防火墙配置一并消失, 且毫无提示 —— WireGuard 转发、fail2ban 的表、
+# 自己写的放行, 卸载完才发现没了, 那时现网已经被覆盖。备份是**参考材料**, 不是能拿来覆盖
+# 现网的权威版本, 所以 .pdg-orig 现在只保留、不再自动套用。
+_NFT_RESIDUE=""
+if [[ -f /etc/nftables.conf ]]; then
+  _nb="/var/backups/pdg-uninstall-$(date +%Y%m%d-%H%M%S)"
+  install -d -m700 "$_nb" 2>/dev/null
+  if install -m600 /etc/nftables.conf "$_nb/nftables.conf" 2>/dev/null; then
+    echo "当前防火墙配置已备份: $_nb/nftables.conf"
+  else
+    _NFT_RESIDUE="备份当前 /etc/nftables.conf 失败 —— 未改动防火墙配置(拒绝在没有退路时动它)"
+  fi
+  if [[ -z "$_NFT_RESIDUE" ]]; then
+    _cand="$_nb/nftables.conf.candidate"
+    if python3 "$_UN_HERE/deploy/bot/nftpurge.py" --strip < /etc/nftables.conf > "$_cand" 2>"$_nb/err"; then
+      if [[ -n "$_UN_NFT" ]] && ! "$_UN_NFT" -c -f "$_cand" >/dev/null 2>&1; then
+        _NFT_RESIDUE="摘掉项目块后的候选没通过 nft -c —— 现网配置**一个字节未动**, 候选留在 $_cand"
+      else
+        cp -a "$_cand" /etc/nftables.conf 2>/dev/null \
+          || _NFT_RESIDUE="写回 /etc/nftables.conf 失败(磁盘满/只读?)"
+        [[ -n "$_UN_NFT" && -z "$_NFT_RESIDUE" ]] && { "$_UN_NFT" -f /etc/nftables.conf >/dev/null 2>&1 \
+          || _NFT_RESIDUE="新配置应用失败 —— 内核里可能仍有本项目规则, 备份见 $_nb/nftables.conf"; }
+      fi
+    else
+      _NFT_RESIDUE="$(head -1 "$_nb/err" 2>/dev/null || echo '识别不了本项目的防火墙块')"
+      _NFT_RESIDUE="$_NFT_RESIDUE —— 现网配置未改动, 备份见 $_nb/nftables.conf"
+    fi
+  fi
 fi
+# 内核对象: 配置里已经没有 inet pdg 了, 增量 nft -f 删不掉它, 要单独删
+[[ -n "$_UN_NFT" ]] && "$_UN_NFT" delete table inet pdg 2>/dev/null || true
+# 磁盘与内核都必须没有项目痕迹, 否则不许说"卸载完成"
+if [[ -z "$_NFT_RESIDUE" ]]; then
+  python3 "$_UN_HERE/deploy/bot/nftpurge.py" --check < /etc/nftables.conf >/dev/null 2>&1 \
+    || _NFT_RESIDUE="磁盘上仍有 table inet pdg"
+  if [[ -n "$_UN_NFT" ]] && "$_UN_NFT" list tables 2>/dev/null | grep -q "inet pdg$"; then
+    _NFT_RESIDUE="${_NFT_RESIDUE:+$_NFT_RESIDUE; }内核里仍有 table inet pdg"
+  fi
+fi
+[[ -e /etc/nftables.conf.pdg-orig ]] \
+  && echo "装机前的防火墙配置仍保留在 /etc/nftables.conf.pdg-orig(仅供人工参考, 不会自动套用)"
 # DNS: 还原 systemd-resolved 与 resolv.conf
 systemctl list-unit-files 2>/dev/null | grep -q '^systemd-resolved' && systemctl enable --now systemd-resolved 2>/dev/null || true
 RESOLV_WARN=""
@@ -86,7 +144,29 @@ if [[ -n "$RESOLV_WARN" ]]; then
 else
   echo "已停止并移除 systemd 单元、防火墙表(inet pdg)、并尽量还原 DNS。"
 fi
-echo "保留: /etc/mosdns /etc/sing-box /etc/mihomo /opt/pdg-bot 与 Let's Encrypt 证书。"
+# 救援平面没清干净就必须逐条报出来: 残留的是仍然有效的 token 与 TLS 私钥。宁可让用户看见
+# 一段刺眼的清单, 也不能让卸载在有残留的情况下只丢一句"已完成"。
+if [[ -n "$_NFT_RESIDUE" ]]; then
+  echo "⚠️  防火墙未能完全清理: $_NFT_RESIDUE"
+  _UNINSTALL_FAILED=1
+fi
+if [[ -n "$_RESCUE_RESIDUE" ]]; then
+  echo "⚠️  救援平面未能完全清除, 以下项目仍留在机器上(含凭据, 请手工删除):"
+  printf '%s\n' "$_RESCUE_RESIDUE" | sed 's/^/    /'
+else
+  echo "救援平面已完全移除(unit、凭据、状态、运行文件与 ${PDG_RESCUE_PORT} 放行规则)。"
+fi
+echo "保留: /etc/mosdns /etc/sing-box /etc/mihomo 与 Let's Encrypt 证书(配置与数据, 重装可复用)。"
+echo "已删除: /opt/pdg-bot 下的事务与救援运行模块(清单见 lib/modules.sh 的 PDG_RUNTIME_MODULES)。"
+# 说"全部"是不准的: install.sh 另有一路把 Bot 本体(bot.py)、MITM 组件、探测脚本等装进同一个
+# 目录, 它们不在那份清单里, 卸载也不会删。`.200` 实测卸载完那里还剩 10 个项目程序文件, 而
+# 文案说的是"全部运行模块" —— 用户据此以为盘上干净了, 其实没有。这里如实列出剩了什么。
+if [[ -d /opt/pdg-bot ]]; then
+  _left="$(find /opt/pdg-bot -maxdepth 1 -type f \( -name '*.py' -o -name '*.sh' -o -name '*.tmpl' \) -printf '%f ' 2>/dev/null)"
+  if [[ -n "$_left" ]]; then
+    echo "保留(不在上述清单内, 需要清干净请用 --purge): /opt/pdg-bot 下 $_left"
+  fi
+fi
 # 归属证明不了 → 全保留。但不能只丢一句"已保留": 用户手工改过 unit 的情况下也会走到这里,
 # 机器上从此挂着一个没人管的 sing-box。逐条列出留了什么、为什么判不出来、怎么自己清。
 _sb_report_kept(){   # $1=with-config(--purge 时连配置目录一起列)
@@ -128,3 +208,8 @@ if [[ "${1:-}" == "--purge" ]]; then
   rm -rf /opt/privdns-gateway /var/lib/privdns-gateway   # 仓库副本 + 快照 (放最后, 脚本已载入内存, 删它安全)
   echo "已 purge。证书目录 /etc/letsencrypt 仍保留(含账户), 如需彻底清除请手动 certbot delete。"
 fi
+
+# 有任何未清理项 → 非 0 退出。调用方(pdg uninstall / CI / 人)据此知道"这次没干净",
+# 而不是看到最后一行 echo 就以为完事了。
+[[ -n "$_RESCUE_RESIDUE" ]] && _UNINSTALL_FAILED=1
+exit "$_UNINSTALL_FAILED"

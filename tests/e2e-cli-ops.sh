@@ -175,7 +175,11 @@ printf 'PDG_PLATFORM=android\n' > /etc/privdns-gateway/profile.env
 # 可能已经把 /etc/resolv.conf 指到本机 mosdns, 那时解析 github.com 必然失败)。
 rm -rf /tmp/e2e-cli-origin.git
 git init -q --bare /tmp/e2e-cli-origin.git
-( cd /opt/privdns-gateway
+# `cd` 必须带 `|| exit` —— 目录不在时子 shell **不会**自己退出, 后面 git init / git add -A /
+# git commit / remote set-url / tag 会原地落在当时的工作目录上。而跑测试时那通常就是
+# 开发者的真仓库: 本机上它真的往仓库里塞了一个 "base" 提交、把 user.name 改成 t、
+# 把 origin 换成 /tmp 里的裸库、还打了个 v9.9.9 标签。一个静默失败的 cd 能干这么多事。
+( cd /opt/privdns-gateway || { echo "[FAIL] /opt/privdns-gateway 不存在, 拒绝在当前目录执行 git 操作"; exit 1; }
   git init -q -b main 2>/dev/null; git config user.email t@t; git config user.name t
   git config commit.gpgsign false
   git add -A >/dev/null 2>&1; git commit -qm base >/dev/null 2>&1
@@ -203,7 +207,10 @@ out=$(pdg update --dry-run 2>&1); rc=$?
 # 远端能拉但一个发布 tag 都没有 → 同样要明说, 不能装作"已是最新"
 rm -rf /tmp/e2e-empty-origin.git
 git init -q --bare /tmp/e2e-empty-origin.git
-( cd /opt/privdns-gateway && git remote remove origin >/dev/null 2>&1
+# `&&` 只挡得住紧跟着的第一条 —— 后面两行照样在当时的工作目录执行, 与打坏真仓库的那个
+# 形态一模一样。整块统一用 `cd … || exit`。
+( cd /opt/privdns-gateway || { echo "[FAIL] /opt/privdns-gateway 不存在, 拒绝在当前目录执行 git 操作"; exit 1; }
+  git remote remove origin >/dev/null 2>&1
   git remote add origin /tmp/e2e-empty-origin.git
   git push -q origin HEAD:refs/heads/main >/dev/null 2>&1 ) || true
 git -C /opt/privdns-gateway tag -l 'v*' | xargs -r git -C /opt/privdns-gateway tag -d >/dev/null 2>&1
@@ -222,6 +229,17 @@ git -C /opt/privdns-gateway tag -f v9.9.9 >/dev/null 2>&1
 rm -rf /tmp/e2e-empty-origin.git /tmp/e2e-cli-origin.git
 
 # ══ 7. detect-cidr 事务化 ══════════════════════════════════════════════════
+# detect-cidr 走一笔真事务, 候选校验要拿**真 mosdns** 解析新配置。取二进制放在这里而不是
+# 脚本开头 —— 前面几节(装机/迁移/update dry-run)中途会把 /usr/local/bin 下的内核清掉,
+# 开头取一次到这儿就没了。
+#
+# 这条以前根本没写。于是单独跑必然 7a/7b/7e/7i/7j/7k/7l 全红(事务在校验门 REFUSED),
+# 只有在同一个容器里先跑过 e2e-install.sh 时才碰巧变绿 —— 而 CI 的矩阵是一个脚本一个
+# 干净容器, 那里从来没绿过。先前误判成"需要 CAP_NET_ADMIN、只有 privileged 能跑",
+# 实测 privileged 与否毫无区别(单独跑都是 38/8), 差别只在前一个脚本留没留下 mosdns。
+e2e_fetch_mosdns || e2e_skip "取不到 mosdns 二进制(§7 的候选校验要拿真 mosdns 解析配置)"
+mosdns version >/dev/null 2>&1 \
+  || { echo "[FAIL] §7 前提: mosdns 取到了却跑不起来"; exit 1; }
 echo; echo "── 7. detect-cidr ──"
 cp /etc/nftables.conf /tmp/pristine.nft
 cp /etc/mosdns/config.yaml /tmp/pristine.mos
@@ -237,17 +255,20 @@ S
 chmod 755 /usr/local/bin/tcpdump
 detect(){ printf 'y\n' | pdg detect-cidr 1 2>&1; }
 
-# 7a. 快照失败 → 一个字节都不许改(注入: 让 tar 失败, 快照就打不出包)
+# 7a. 回退手段: 5.2 起写入阶段是一笔 pdgtx 事务, 回退靠 before-image + 自动回滚 + 崩溃后
+# `pdg tx recover`, 不再自己打整机快照(cmd_snapshot 会先拿走同一把 flock, 子进程里的事务
+# 反而拿不到锁)。所以这里验的是**事务确实留下了可恢复的材料**, 而不是"tar 坏了就中止"。
 reset_cidr
-cp "$(command -v tar)" /usr/local/bin/tar.real 2>/dev/null || cp /bin/tar /usr/local/bin/tar.real
-printf '#!/bin/sh\nexit 1\n' > /usr/local/bin/tar; chmod 755 /usr/local/bin/tar
 out=$(detect); rc=$?
-rm -f /usr/local/bin/tar   # 还原成系统自带的 tar
-{ [[ "$rc" != 0 ]] && grep -q '快照失败' <<<"$out"; } \
-  && ok "快照失败 → 明确中止并返回非 0" || bad "7a: rc=$rc: $(tail -4 <<<"$out")"
-{ [[ "$(sha256sum /etc/nftables.conf | cut -d' ' -f1)" == "$NFT_SHA0" ]] \
-  && [[ "$(sha256sum /etc/mosdns/config.yaml | cut -d' ' -f1)" == "$MOS_SHA0" ]]; } \
-  && ok "快照失败后两份配置逐字节未变" || bad "7b: 配置被改了"
+{ [[ "$rc" == 0 ]] && grep -q '事务' <<<"$out"; } \
+  && ok "成功路径明确说明走的是配置事务" || bad "7a: rc=$rc: $(tail -4 <<<"$out")"
+_txdir="$(ls -1dt /var/lib/privdns-gateway/tx/*/ 2>/dev/null | head -1)"
+{ [[ -n "$_txdir" ]] && grep -q '"op": "detect-cidr"' "$_txdir/meta.json" 2>/dev/null \
+  && grep -q '"state": "COMMITTED"' "$_txdir/meta.json" 2>/dev/null; } \
+  && ok "事务留下了 COMMITTED 的 detect-cidr 记录(可查、可审计)" \
+  || bad "7b: 没找到本次事务记录: ${_txdir:-无}"
+_S7_TX=yes      # 场景标记: 事务真的提交过(见文件末尾的必需场景守卫)
+reset_cidr
 
 # 7b. mosdns 是自定义形态(没有可替换的 ips)→ sed 不命中必须报错而不是报成功
 reset_cidr
@@ -271,8 +292,8 @@ printf '#!/bin/sh\n[ "$1" = "-c" ] && exit 1\nexec /usr/local/bin/nft.real "$@"\
 chmod 755 /usr/local/bin/nft
 out=$(detect); rc=$?
 cp -f /usr/local/bin/nft.real /usr/local/bin/nft
-{ [[ "$rc" != 0 ]] && grep -q 'nft -c' <<<"$out"; } \
-  && ok "nft 校验失败 → 非 0 并说明" || bad "7e: rc=$rc: $(tail -4 <<<"$out")"
+{ [[ "$rc" != 0 ]] && grep -qE 'nft -c|nft_check' <<<"$out"; } \
+  && ok "nft 校验失败 → 非 0 并说明是哪个校验门" || bad "7e: rc=$rc: $(tail -4 <<<"$out")"
 { [[ "$(sha256sum /etc/nftables.conf | cut -d' ' -f1)" == "$NFT_SHA0" ]] \
   && [[ "$(sha256sum /etc/mosdns/config.yaml | cut -d' ' -f1)" == "$MOS_SHA0" ]]; } \
   && ok "nft 校验失败后两份配置都逐字节未变" || bad "7f: 配置被改了"
@@ -287,12 +308,16 @@ e2e_svc_heal mosdns
 { [[ "$(sha256sum /etc/nftables.conf | cut -d' ' -f1)" == "$NFT_SHA0" ]] \
   && [[ "$(sha256sum /etc/mosdns/config.yaml | cut -d' ' -f1)" == "$MOS_SHA0" ]]; } \
   && ok "mosdns 失败后用本次事务备份还原(两份配置回到原样)" || bad "7h: 没还原干净"
+_S7_ROLLBACK=yes   # 场景标记: 失败回滚真的走过
 
 # 7e. 成功路径: 落盘 + 三处复核
 reset_cidr
 out=$(detect); rc=$?
-{ [[ "$rc" == 0 ]] && grep -q '三处一致' <<<"$out"; } \
-  && ok "成功路径: 落盘 + 复核 nft/mosdns/自检三处一致" || bad "7i: rc=$rc: $(tail -4 <<<"$out")"
+{ [[ "$rc" == 0 ]] && grep -qE '同一笔事务落盘' <<<"$out"; } \
+  && ok "成功路径: 真源/防火墙/mosdns 同一笔事务落盘" || bad "7i: rc=$rc: $(tail -4 <<<"$out")"
+grep -q "^PDG_INTERNAL_CIDR=10.44.0.0/16$" /etc/privdns-gateway/profile.env \
+  && ok "成功路径: 真源(profile.env)也在同一笔事务里更新了" \
+  || bad "7i2: 真源没更新: $(sed -n 's/^PDG_INTERNAL_CIDR=//p' /etc/privdns-gateway/profile.env)"
 grep -q '10.44.0.0/16' /etc/nftables.conf && ok "新网段写进了防火墙" || bad "7j: 防火墙里没有新网段"
 grep -q '10.44.0.0/16' /etc/mosdns/config.yaml && ok "新网段写进了 mosdns" || bad "7k: mosdns 里没有新网段"
 
@@ -300,11 +325,24 @@ grep -q '10.44.0.0/16' /etc/mosdns/config.yaml && ok "新网段写进了 mosdns"
 NFT_SHA1="$(sha256sum /etc/nftables.conf | cut -d' ' -f1)"
 MOS_SHA1="$(sha256sum /etc/mosdns/config.yaml | cut -d' ' -f1)"
 out=$(detect); rc=$?
-{ [[ "$rc" == 0 ]] && grep -q '与当前一致' <<<"$out"; } \
-  && ok "再跑一次: 与当前一致 → 直接返回" || bad "7l: rc=$rc: $(tail -3 <<<"$out")"
+{ [[ "$rc" == 0 ]] && grep -qE '无需修改' <<<"$out"; } \
+  && ok "再跑一次: 三处均已一致 → 明确返回无需修改" || bad "7l: rc=$rc: $(tail -3 <<<"$out")"
 { [[ "$(sha256sum /etc/nftables.conf | cut -d' ' -f1)" == "$NFT_SHA1" ]] \
   && [[ "$(sha256sum /etc/mosdns/config.yaml | cut -d' ' -f1)" == "$MOS_SHA1" ]]; } \
   && ok "幂等: 第二次没有改动任何配置" || bad "7m: 第二次改了配置"
+_S7_CLEANUP=yes    # 场景标记: 收尾与幂等复核真的跑过
 
 rm -f /tmp/pristine.nft /tmp/pristine.mos /usr/local/bin/nft.real /usr/local/bin/tar.real
+
+# ── 必需场景守卫 ────────────────────────────────────────────────────────────
+# 光看总退出码是不够的: 把 §7 整段删掉或提前 return, 其余部分照样全绿, 退出码 0 —— 而
+# §7 恰恰是唯一真跑"改网段 → 事务 → 校验门 → 回滚 → 清理"那条链的地方。所以每个必需场景
+# 在跑完时留一个标记, 这里逐项核对; 少一个就判失败并点名是哪个场景没执行。
+_missing=""
+[[ -n "${_S7_TX:-}" ]]       || _missing="$_missing §7-事务提交"
+[[ -n "${_S7_ROLLBACK:-}" ]] || _missing="$_missing §7-失败回滚"
+[[ -n "${_S7_CLEANUP:-}" ]]  || _missing="$_missing §7-收尾清理"
+if [[ -n "${_missing// /}" ]]; then
+  bad "必需场景未执行:$_missing (整段被删/提前 return 时其余用例仍会全绿, 所以这里单独判)"
+fi
 e2e_summary

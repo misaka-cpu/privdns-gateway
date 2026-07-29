@@ -687,11 +687,15 @@ cmd_snapshot(){
 cmd_rollback(){
   need_root rollback; _lock
   # 参数: <序号>(默认0) | --dir <快照目录>(精确指定, 供 update 用) | --git <ref>(回滚后把 REPO_DIR 复位到该提交)
-  local idx="" dir="" git_ref="" target
+  local idx="" dir="" git_ref="" target preserve=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --dir) dir="${2:-}"; shift 2 || { echo "--dir 缺参数"; return 1; };;
       --git) git_ref="${2:-}"; shift 2 || { echo "--git 缺参数"; return 1; };;
+      # 救援平面内部固定模式: **事前排除**救援自身的文件, 并让恢复出来的 nft 候选自带救援
+      # 放行。只有这一个固定开关 —— 不提供 `--exclude <path>` 之类的任意排除, 否则"完整恢复"
+      # 可以被指定成"什么都不恢复"。普通 CLI 不传它时行为与历史完全一致。
+      --preserve-rescue) preserve=1; shift;;
       *) idx="$1"; shift;;
     esac
   done
@@ -722,6 +726,32 @@ cmd_rollback(){
   if ! tar xzf "$f" -C "$tree" 2>/dev/null; then
     echo "❌ 快照解包失败, 中止"; rm -rf "$tmp"; return 1
   fi
+  if (( preserve == 1 )); then
+    # **事前排除**: 受保护成员既不进落盘清单, 也从 staging 里删掉 —— 于是生产上的救援文件
+    # 从头到尾没有被覆盖过, 不存在"先覆盖再补回来"的那一瞬。
+    # shellcheck source=lib/rescue.sh
+    if ! source "$REPO_DIR/lib/rescue.sh" 2>/dev/null && ! source /opt/pdg-bot/rescue.sh 2>/dev/null; then
+      echo "❌ 读不到救援保护清单(lib/rescue.sh), 拒绝在无保护的情况下执行完整恢复"
+      rm -rf "$tmp"; return 1
+    fi
+    local _prot _kept="$tmp/members.kept"
+    : > "$_kept"
+    while IFS= read -r _m; do
+      [[ -n "$_m" ]] || continue
+      _prot=0
+      while IFS= read -r _p; do
+        [[ -n "$_p" ]] || continue
+        [[ "$_m" == "$_p" || "$_m" == "$_p/" ]] && { _prot=1; break; }
+      done < <(pdg_rescue_protected)
+      if (( _prot == 1 )); then
+        rm -f -- "$tree/$_m" 2>/dev/null || true      # staging 里也不留, 免得被后续步骤用到
+        echo "  保留当前救援平面文件(不恢复): $_m"
+      else
+        printf '%s\n' "$_m" >> "$_kept"
+      fi
+    done < "$members"
+    mv -f "$_kept" "$members"
+  fi
   if _sb_panel_managed_on "$tree/etc/sing-box/config.json"; then
     if ! _sb_sanitize_panel "$tree/etc/sing-box/config.json"; then
       echo "❌ 快照面板临时态净化失败, 中止"; rm -rf "$tmp"; return 1
@@ -736,6 +766,30 @@ cmd_rollback(){
   if [[ -f "$tree/etc/mihomo/config.yaml" ]]; then
     "${snap_mbin:-mihomo}" -t -d "$tree/etc/mihomo" -f "$tree/etc/mihomo/config.yaml" >/dev/null 2>&1 \
       || { echo "❌ 快照的 mihomo 配置 check 失败, 中止"; rm -rf "$tmp"; return 1; }
+  fi
+  # 保护模式下: 在**staging 里**就把救援放行注入候选, 于是落盘的那份从一开始就带着它,
+  # 后面只需要既有的那一次 `nft -f`。绝不做"先应用旧配置再补一条" —— 两次 apply 之间就是
+  # 救援入口真实消失的窗口, 而完整恢复正是最需要它的时刻。
+  if (( preserve == 1 )) && [[ -f "$tree/etc/nftables.conf" ]]; then
+    local _rn _cidr _cand="$tmp/nft.cand"
+    _rn="$(_pdg_module rescue_nft.py)" || { echo "❌ 找不到 rescue_nft.py, 拒绝在无救援放行的情况下恢复防火墙"; rm -rf "$tmp"; return 1; }
+    _cidr="$(pdg_internal_cidr 2>/dev/null || true)"
+    [[ -n "$_cidr" ]] || _cidr="$(grep -oE 'ip saddr [0-9.]+/[0-9]+' /etc/nftables.conf 2>/dev/null | head -1 | awk '{print $3}')"
+    if [[ -z "$_cidr" ]]; then
+      echo "❌ 读不到内网卡段, 无法生成带救援放行的防火墙候选 → 中止(不改动现网)"
+      rm -rf "$tmp"; return 1
+    fi
+    if [[ -z "${PDG_RESCUE_PORT:-}" ]]; then
+      echo "❌ 读不到救援端口常量(lib/rescue.sh), 拒绝生成防火墙候选"; rm -rf "$tmp"; return 1
+    fi
+    if ! python3 "$_rn" "$_cidr" "$PDG_RESCUE_PORT" < "$tree/etc/nftables.conf" > "$_cand"; then
+      echo "❌ 生成带救援放行的防火墙候选失败 → 中止(不改动现网)"; rm -rf "$tmp"; return 1
+    fi
+    if ! nft -c -f "$_cand" >/dev/null 2>&1; then
+      echo "❌ 带救援放行的防火墙候选校验(nft -c)未过 → 中止(磁盘与内核都未改动)"
+      rm -rf "$tmp"; return 1
+    fi
+    mv -f "$_cand" "$tree/etc/nftables.conf" || { echo "❌ 写回候选失败, 中止"; rm -rf "$tmp"; return 1; }
   fi
   [[ -f "$tree/etc/nftables.conf" ]] && { nft -c -f "$tree/etc/nftables.conf" >/dev/null 2>&1 || { echo "❌ 快照的 nftables 语法错, 中止"; rm -rf "$tmp"; return 1; }; }
   echo "回滚到 $(basename "$target") …"
@@ -772,6 +826,7 @@ cmd_rollback(){
     c_y "  mihomo 起核核验未达标, 请 pdg doctor 复查"
     unrestored+=("内核激活(mihomo)")
   fi
+  # 明确列出要重启的 unit, 绝不用 `pdg-*` 之类的通配 —— 那会把救援服务一起重启掉。
   systemctl restart mosdns pdg-bot pdg-probe81 2>/dev/null || true
   systemctl is-enabled pdg-mitm >/dev/null 2>&1 && { systemctl reset-failed pdg-mitm 2>/dev/null; systemctl restart pdg-mitm 2>/dev/null; }   # iOS/WLOC: 清 start-limit + 一并恢复 MITM 服务
   systemctl restart systemd-journald 2>/dev/null || true   # journald CanReload=no: 还原封顶需 restart 才生效
@@ -949,17 +1004,17 @@ cmd_update(){
   fi
   c_g "→ 已切到发布 $tgt"
   c_g "刷新代码(配置/出口/token/证书均不动)…"
+  # 运行模块清单的单一事实源(与 install.sh 共用)。读不到就别装 —— 宁可这次不更新, 也不要
+  # 按一份残缺的清单装出新旧混装。
+  # shellcheck source=lib/modules.sh
+  source "$REPO_DIR/lib/modules.sh" 2>/dev/null \
+    || { c_y "读不到 lib/modules.sh(运行模块清单), 回滚到更新前快照…"
+         cmd_rollback --dir "$snap_dir" --git "$pre_sha"; return 1; }
   # 必需文件: 任一装失败即立即回滚(拒绝新旧混部)。`! A || ! B` 在首个失败处短路。
-  if   ! install -m755 "$REPO_DIR"/deploy/bot/pdg-bot.py           /opt/pdg-bot/bot.py \
-    || ! install -m755 "$REPO_DIR"/deploy/bot/parse-geosite.py     /opt/pdg-bot/ \
-    || ! install -m755 "$REPO_DIR"/deploy/bot/update-rules.sh      /opt/pdg-bot/ \
-    || ! install -m755 "$REPO_DIR"/deploy/bot/scheduled-update.sh  /opt/pdg-bot/ \
-    || ! install -m755 "$REPO_DIR"/deploy/bot/healthcheck.py       /opt/pdg-bot/ \
-    || ! install -m755 "$REPO_DIR"/deploy/bot/checks.py            /opt/pdg-bot/ \
-    || ! install -m755 "$REPO_DIR"/deploy/bot/pdgtx.py             /opt/pdg-bot/ \
-    || ! install -m755 "$REPO_DIR"/deploy/bot/doctor.py            /opt/pdg-bot/ \
-    || ! install -m755 "$REPO_DIR"/deploy/bot/report.py           /opt/pdg-bot/ \
-    || ! install -m755 "$REPO_DIR"/deploy/bot/sb2mihomo.py        /opt/pdg-bot/ \
+  # /opt/pdg-bot 下的项目静态文件**全部**走 lib/modules.sh 这一份 manifest(平台专属那批
+  # 由 pdg_platform_modules 按平台取)。以前这里手写了五行、iOS 组件另有一段, 与 install.sh
+  # 各写各的 —— 两边只要有一处忘了改就是新旧混装, 而那不会报错, 只会静默降级。
+  if   ! pdg_install_runtime_modules "$REPO_DIR" /opt/pdg-bot "$(_pdg_platform)" \
     || ! install -m755 "$REPO_DIR"/deploy/cert/proxy-gateway-open-cert-http.sh   /usr/local/bin/ \
     || ! install -m755 "$REPO_DIR"/deploy/cert/proxy-gateway-restore-firewall.sh /usr/local/bin/ \
     || ! install -m755 "$REPO_DIR"/deploy/bot/pdg-set-token.sh     /usr/local/bin/pdg-set-token \
@@ -970,15 +1025,7 @@ cmd_update(){
   # iOS 上这些**不是可选项**: probe81 与描述文件模板是 iOS 基础能力, WLOC 开着时 mitm 三件
   # 也是必需件。以前一律 `|| true`, 装失败就把上一版的旧文件留在原地 → 新旧混装, 而 doctor
   # 只看"文件在不在", 照样判绿。
-  if [[ "$(_pdg_platform)" == ios ]]; then
-    if   ! install -m755 "$REPO_DIR"/deploy/bot/mitm_ca.py          /opt/pdg-bot/ \
-      || ! install -m755 "$REPO_DIR"/deploy/bot/mitm_server.py      /opt/pdg-bot/ \
-      || ! install -m755 "$REPO_DIR"/deploy/bot/mitm_wloc.py        /opt/pdg-bot/ \
-      || ! install -m755 "$REPO_DIR"/deploy/ios/probe81.py          /opt/pdg-bot/ \
-      || ! install -m644 "$REPO_DIR"/deploy/ios/pdg-dot-ondemand.mobileconfig.tmpl /opt/pdg-bot/pdg-dot.mobileconfig.tmpl; then
-      c_y "iOS 平台组件安装失败, 回滚到更新前快照…"; cmd_rollback --dir "$snap_dir" --git "$pre_sha"; return 1
-    fi
-  fi
+  # iOS 专属组件已并入上面那一次调用(manifest 按平台取), 不再单列。
   install -m644 "$REPO_DIR"/deploy/bot/pdg-health.service  /etc/systemd/system/ 2>/dev/null || true
   install -m644 "$REPO_DIR"/deploy/bot/pdg-health.timer    /etc/systemd/system/ 2>/dev/null || true
   install -m755 "$REPO_DIR"/deploy/cert/99-reload-cert.deploy-hook.sh     /etc/letsencrypt/renewal-hooks/deploy/99-pdg-cert.sh 2>/dev/null || true
@@ -1138,7 +1185,7 @@ cmd_report(){ need_root report; python3 /opt/pdg-bot/report.py "$@"; }
 # 抓包识别内网卡来源段, 检测到与现配不符时可一键写回 mosdns+nftables 并重启(装完随时跑, 比装机时从容)。
 cmd_detect_cidr(){
   need_root detect-cidr
-  local dur="${1:-30}" sip det cur
+  local dur="${1:-30}" sip det cur_src cur_nft cur_mos
   # shellcheck source=/dev/null
   source "$REPO_DIR/lib/cidr.sh" 2>/dev/null || { echo "❌ 读不到 lib/cidr.sh"; return 1; }
   sip=$(grep -oE '"[0-9.]+/32"' /etc/sing-box/config.json 2>/dev/null | tr -d '"' | grep -v '^127' | head -1 | cut -d/ -f1)
@@ -1150,71 +1197,122 @@ cmd_detect_cidr(){
   if ! pdg_cidr_valid "$det"; then
     c_y "「$det」不是合法网段(形如 172.22.0.0/16), 未改动。"; return 1
   fi
-  cur=$(grep -oE 'ip saddr [0-9./]+' /etc/nftables.conf 2>/dev/null | head -1 | awk '{print $3}')
+  # 私网判定放在**动手之前**: 公网段一旦进 nft, REDIRECT 与放行就对全网生效 —— 那不是配置
+  # 不当, 是把网关变成开放中继。判据与候选生成器同一份(cidrgen.valid_cidr), 不在两处各写一套。
+  local _vw
+  if ! _vw="$(_pdg_cidrgen_check "$det")"; then
+    c_y "❌ 「$det」不能用作内网卡段: ${_vw:-判定失败} → 未改动任何文件。"; return 1
+  fi
+  # 三处现状: 真源(profile.env) / 防火墙 / mosdns。旧版只比 nft 一处, 于是"真源落后但 nft 已新"
+  # 这种半套状态会被当成"无需改动"放过去。
+  cur_src="$(sed -n 's/^[[:space:]]*PDG_INTERNAL_CIDR=//p' /etc/privdns-gateway/profile.env 2>/dev/null | tail -1)"
+  # 当前段只认**真规则**里的值: 本项目渲染出的 nft 头部注释里也写着同一个段, 而注释不参与
+  # 替换 —— 改过一次之后拿注释里的旧值去找替换位置, 真规则里根本没有, 就会被判成"自定义形态"
+  # 而拒绝执行(这条是 e2e-cli-ops 的幂等用例真抓出来的)。判据与候选生成器同一份。
+  local _gen_c
+  if _gen_c="$(_pdg_module cidrgen.py)"; then
+    cur_nft="$(python3 "$_gen_c" current < /etc/nftables.conf 2>/dev/null || true)"
+  else
+    cur_nft=""
+  fi
+  cur_mos="$(grep -oE 'ips:[[:space:]]*\[[[:space:]]*"[0-9./]+"' /etc/mosdns/config.yaml 2>/dev/null \
+             | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+')"
   echo "  检测到内网卡段: $det"
-  echo "  当前配置:       ${cur:-未知}"
-  [[ "$det" == "$cur" ]] && { c_g "✅ 与当前一致, 无需改动。"; return 0; }
-  read -rp "把内网卡段 ${cur:-?} → $det 并应用(写 mosdns+nftables 并重启)? [y/N]: " yn
+  echo "  当前真源:       ${cur_src:-未写入}"
+  echo "  当前防火墙:     ${cur_nft:-未知}"
+  echo "  当前 mosdns:    ${cur_mos:-未知}"
+  if [[ "$det" == "$cur_src" && "$det" == "$cur_nft" && "$det" == "$cur_mos" ]]; then
+    c_g "✅ 三处均已是 $det, 无需修改。"; return 0
+  fi
+  [[ -z "$cur_nft" ]] && { c_y "❌ nftables 配置里读不到当前内网卡段(自定义形态?) → 未改动任何文件。"; return 1; }
+  read -rp "把内网卡段改成 $det 并应用(真源+防火墙+mosdns 一笔事务)? [y/N]: " yn
   [[ "$yn" == [yY] ]] || { echo "已取消, 未改动。"; return 0; }
-  _lock
-  # 快照必须成立, 且要记住**这一次**的目录 —— 旧写法 `cmd_snapshot || true` 把失败吞掉,
-  # 后面出事再 `cmd_rollback 0` 按序号回滚, 回到的可能是上周某次无关快照(index 0 是"最新一份",
-  # 而这次根本没留下快照)。宁可一个字节都不改。
-  c_g "先留快照…"
-  # 与 cmd_update 同口径: 用 cmd_snapshot 自己回报的 _PDG_SNAP_CREATED 记住**本次**那一份,
-  # 不按 index 猜(index 0 是"最新一份", 这次没留成时它指向的是上一次的无关快照)。
-  local snap_dir
-  if ! cmd_snapshot >/dev/null 2>&1 || [[ -z "$_PDG_SNAP_CREATED" || ! -f "$_PDG_SNAP_CREATED/snap.tar.gz" ]]; then
-    c_y "❌ 快照失败 → 未改动任何文件(拒绝在没有回退手段的前提下改内网卡段)。"; return 1
-  fi
-  snap_dir="$_PDG_SNAP_CREATED"
-  # 本次事务的精确备份(回滚只用它, 不用模糊的 index)
-  local wd; wd="$(mktemp -d)" || { echo "❌ 无法创建临时目录"; return 1; }
-  cp -a /etc/nftables.conf "$wd/nftables.conf" 2>/dev/null
-  cp -a /etc/mosdns/config.yaml "$wd/config.yaml" 2>/dev/null
-  local newnft="$wd/nftables.new" newmos="$wd/mosdns.new"
-  cp -a /etc/nftables.conf "$newnft" 2>/dev/null || { rm -rf "$wd"; echo "❌ 读不到 /etc/nftables.conf"; return 1; }
-  cp -a /etc/mosdns/config.yaml "$newmos" 2>/dev/null || { rm -rf "$wd"; echo "❌ 读不到 mosdns 配置"; return 1; }
-  _dc_restore(){   # 只用本次备份还原, 不碰别的快照
-    [[ -e "$wd/nftables.conf" ]] && cp -a "$wd/nftables.conf" /etc/nftables.conf
-    [[ -e "$wd/config.yaml" ]] && cp -a "$wd/config.yaml" /etc/mosdns/config.yaml
-    nft -f /etc/nftables.conf 2>/dev/null || true
-    systemctl restart mosdns >/dev/null 2>&1 || true
-    c_y "已用本次事务的备份还原(快照留在 $snap_dir, 必要时 sudo pdg rollback --dir $snap_dir)。"
-  }
-  # 改**临时文件**, 并复核新网段真的写进去了 —— sed 没命中时旧写法一声不吭继续往下走,
-  # 最后还打印"✅ 已更新", 而两份配置一个字都没变。
-  [[ -n "$cur" ]] && sed -i "s#${cur//./\\.}#$det#g" "$newnft"
-  sed -i -E "s#(ips:[[:space:]]*\[[[:space:]]*\")[0-9./]+(\")#\1$det\2#" "$newmos"
-  if ! grep -qF "$det" "$newnft"; then
-    rm -rf "$wd"; c_y "❌ nftables 配置里没找到可替换的内网卡段(自定义形态?) → 未改动任何文件。"; return 1
-  fi
-  if ! grep -qE "ips:[[:space:]]*\[[[:space:]]*\"${det//./\\.}\"" "$newmos"; then
-    rm -rf "$wd"; c_y "❌ mosdns 配置里的 ips 段未能替换(自定义形态?) → 未改动任何文件。"; return 1
-  fi
-  if ! nft -c -f "$newnft" >/dev/null 2>&1; then
-    rm -rf "$wd"; c_y "❌ 新防火墙配置校验(nft -c)未过 → 未改动任何文件。"; return 1
-  fi
-  # 校验都过了才落盘
-  cp -a "$newnft" /etc/nftables.conf && cp -a "$newmos" /etc/mosdns/config.yaml || {
-    _dc_restore; rm -rf "$wd"; c_y "❌ 落盘失败, 已还原。"; return 1; }
-  if ! nft -f /etc/nftables.conf; then _dc_restore; rm -rf "$wd"; c_y "❌ 应用防火墙失败, 已还原。"; return 1; fi
-  systemctl reset-failed mosdns >/dev/null 2>&1 || true
-  if ! systemctl restart mosdns || ! _core_kernel_stable mosdns; then
-    _dc_restore; rm -rf "$wd"
-    c_y "❌ mosdns 未能稳定运行, 已还原。近期日志:"
-    journalctl -u mosdns -n 12 --no-pager -o cat 2>/dev/null | sed 's/^/    /'
+  _pdg_cidr_transact "$det" "$cur_nft"
+}
+
+# 候选生成器的私网/形态判定(单一判据, 与落盘时用的是同一份代码)。
+# 通过 → 返回 0; 不通过 → 打印原因并返回非 0。
+_pdg_cidrgen_check(){
+  local m
+  m="$(_pdg_module cidrgen.py)" || { echo "找不到 cidrgen.py"; return 1; }
+  python3 - "$m" "$1" <<'PYCHK'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("cidrgen", sys.argv[1])
+g = importlib.util.module_from_spec(spec); spec.loader.exec_module(g)
+ok, why = g.valid_cidr(sys.argv[2])
+print(why)
+sys.exit(0 if ok else 1)
+PYCHK
+}
+
+# 找一个已安装的模块(仓库副本优先, 其次 /opt/pdg-bot)。找不到返回非 0。
+_pdg_module(){
+  local n="$1" f
+  for f in "$REPO_DIR/deploy/bot/$n" "/opt/pdg-bot/$n"; do
+    [[ -f "$f" ]] && { printf '%s\n' "$f"; return 0; }
+  done
+  return 1
+}
+
+# 内网卡段变更 = **一笔 pdgtx 事务**。三个目标同一个候选值生成, 一起校验、一起落盘、一起观察,
+# 任一步失败整体回滚到 before-image。旧版是"自己打快照 + cp -a 备份 + sed 改临时文件 + 手写
+# _dc_restore 还原": 落盘落一半、nft 应用失败、mosdns 起不来这三种情况各走各的还原分支, 而
+# 还原本身没有复核 —— 于是"改动已应用但复核不一致"只能靠一句提示让人自己去 doctor。
+_pdg_cidr_transact(){
+  local det="$1" cur_nft="$2" txm txid rc=0 wd
+  txm="$(_pdg_module pdgtx.py)" || { c_y "❌ 找不到 pdgtx.py(事务核心缺失), 未改动任何文件。"; return 1; }
+  local gen; gen="$(_pdg_module cidrgen.py)" || { c_y "❌ 找不到 cidrgen.py, 未改动任何文件。"; return 1; }
+  # 未完成事务先收尾 —— 此刻现网可能停在别人的中间态, 再叠一笔只会让两笔都说不清
+  local pend; pend="$(python3 "$txm" pending 2>/dev/null)"
+  if [[ -n "$pend" ]]; then
+    c_y "⛔ 有未完成的配置事务, 本次拒绝执行(未改动任何文件):"
+    printf '%s\n' "$pend" | sed 's/^/    /'
+    c_y "   请先 sudo pdg tx show <id> 查看, 再 sudo pdg tx recover <id> 收尾。"
     return 1
   fi
-  # 成功后三处复核一致: 防火墙文件 / mosdns 配置 / doctor 读到的内网段
-  local dc_ok=1 seen
-  grep -qF "$det" /etc/nftables.conf || { c_y "⚠️ 复核: nftables 里没有 $det"; dc_ok=0; }
-  grep -qF "$det" /etc/mosdns/config.yaml || { c_y "⚠️ 复核: mosdns 配置里没有 $det"; dc_ok=0; }
-  seen="$(python3 -c 'import sys; sys.path.insert(0,"/opt/pdg-bot"); import checks; print(checks._internal_cidr())' 2>/dev/null)"
-  [[ "$seen" == "$det" ]] || { c_y "⚠️ 复核: 自检读到的内网段是「${seen:-空}」, 与 $det 不一致"; dc_ok=0; }
-  rm -rf "$wd"
-  [[ "$dc_ok" == 1 ]] || { c_y "❌ 改动已应用但复核不一致 → 请运行 sudo pdg doctor 检查。"; return 1; }
-  c_g "✅ 内网卡段已更新为 $det, mosdns 已重启, 防火墙/mosdns/自检三处一致。"
+  wd="$(mktemp -d)" || { c_y "❌ 无法创建临时目录"; return 1; }
+  txid="$(python3 "$txm" new --source cli --op detect-cidr 2>"$wd/err")" || {
+    c_y "❌ 无法开始配置事务: $(tr -d '\n' < "$wd/err")"; rm -rf "$wd"; return 1; }
+  # 逐个目标: read 拿"候选所依据的那一份"的 sha → 生成候选 → stage --expect <sha>。
+  # 前置条件用的是 read 到的 sha, 所以事务开始后有人改了同一个文件, 落盘阶段会当场撞出来。
+  local t kind arg
+  for t in profile_env:profile:"" nftables_conf:nft:"$cur_nft" mosdns_conf:mosdns:""; do
+    local tgt="${t%%:*}" rest="${t#*:}"
+    kind="${rest%%:*}"; arg="${rest#*:}"
+    python3 "$txm" read --target "$tgt" > "$wd/$tgt.raw" 2>"$wd/err" || {
+      c_y "❌ 读不到目标 $tgt: $(tr -d '\n' < "$wd/err") → 未改动任何文件。"; rc=1; break; }
+    local sha; sha="$(head -1 "$wd/$tgt.raw")"
+    tail -n +2 "$wd/$tgt.raw" > "$wd/$tgt.cur"
+    if ! python3 "$gen" "$kind" "$det" "$arg" < "$wd/$tgt.cur" > "$wd/$tgt.new" 2>"$wd/err"; then
+      c_y "❌ 生成候选失败($tgt): $(tr -d '\n' < "$wd/err") → 未改动任何文件。"; rc=1; break
+    fi
+    python3 "$txm" stage --tx "$txid" --target "$tgt" --file "$wd/$tgt.new" --expect "$sha" 2>"$wd/err" || {
+      c_y "❌ 暂存候选失败($tgt): $(tr -d '\n' < "$wd/err") → 未改动任何文件。"; rc=1; break; }
+  done
+  if [[ "$rc" != 0 ]]; then
+    python3 "$txm" abort "$txid" >/dev/null 2>&1 || true    # 候选阶段放弃: 现网一个字节没动过
+    rm -rf "$wd"; return 1
+  fi
+  python3 "$txm" service --tx "$txid" --action nft:apply >/dev/null 2>&1
+  python3 "$txm" service --tx "$txid" --action restart:mosdns >/dev/null 2>&1
+  local out
+  out="$(python3 "$txm" apply --tx "$txid" 2>"$wd/err")"; rc=$?
+  if [[ "$rc" == 0 ]]; then
+    c_g "✅ 内网卡段已更新为 $det(真源 / 防火墙 / mosdns 同一笔事务落盘, 已重启并观察通过)。"
+    rm -rf "$wd"; return 0
+  fi
+  case "$rc" in
+    4) c_y "⛔ 已有配置操作在执行(锁被占用), 本次未改动任何文件。";;
+    # REFUSED 涵盖多种"拒绝执行": 锁文件不可用、操作前硬门就是坏的、前置条件已失效。
+    # 一律照抄核心给出的原因 —— 自己编一句"锁不可用"会把"mosdns 操作前就没在跑"说成锁的问题。
+    5) c_y "⛔ 拒绝执行(未改动任何文件):"
+       [[ -s "$wd/err" ]] && sed 's/^/    /' "$wd/err";;
+    *) c_y "❌ 内网卡段变更失败, 已按 before-image 回滚:"
+       [[ -s "$wd/err" ]] && sed 's/^/    /' "$wd/err"
+       [[ -n "$out" ]] && printf '%s\n' "$out" | sed 's/^/    /'
+       c_y "   如显示回滚不完整(ROLLBACK_FAILED), 用 sudo pdg tx show $txid 查看后再 recover。";;
+  esac
+  rm -rf "$wd"; return 1
 }
 
 cmd_ios(){
@@ -1372,15 +1470,69 @@ migrate_deploy_units(){
 
 migrate_deploy_botfiles(){
   [[ -d "$REPO_DIR/deploy/bot" ]] || return 0
-  local f base plat; plat="$(_pdg_platform)"
-  for f in "$REPO_DIR"/deploy/bot/*.py; do
-    base=$(basename "$f")
-    [[ "$base" == "pdg-bot.py" ]] && continue
-    case "$base" in                                   # iOS 专属 MITM 模块: 仅 iOS 装, Android 不装/不复活
-      mitm_ca.py|mitm_server.py|mitm_wloc.py) [[ "$plat" == ios ]] || continue;;
-    esac
-    install -m755 "$f" /opt/pdg-bot/ 2>/dev/null || true
-  done
+  # shellcheck source=lib/modules.sh
+  source "$REPO_DIR/lib/modules.sh" 2>/dev/null || return 0
+  # 运行模块走 lib/modules.sh 这份**单一事实源** —— 与 install.sh、cmd_update 同一份清单,
+  # 于是不会再出现"装机装了、升级漏了"那类缺口(它不报错, 只让整块能力静默降级)。
+  # 与 install.sh、cmd_update 同一个函数、同一份 manifest。原先这后面还跟着一个
+  # `deploy/bot/*.py` 的 glob 兜底循环 —— 那是一份**隐式的第二名单**: 仓库里任何新加的 .py
+  # 都会被它装进 /opt/pdg-bot, 而那些文件不在 manifest 里, 卸载不会删、mode 也无从对齐。
+  # 失败要向上传播: 迁移装了一半就返回成功, 机器会停在新旧混装且没人知道。
+  pdg_install_runtime_modules "$REPO_DIR" /opt/pdg-bot "$(_pdg_platform)" || return 1
+}
+
+# 老机首次获得救援平面: 装 unit + 备好凭据, 并按"默认启用"拍板方案开起来。
+# **但用户主动停用过就不许开回来** —— 升级把用户关掉的东西又打开, 是最招人恨的一类行为。
+# 幂等: 已经装好且没被停用的机器上, 这里什么都不做。
+migrate_rescue_plane(){
+  _rescue_load 2>/dev/null || return 0
+  [[ -f /opt/pdg-bot/rescue.py ]] || return 0        # 运行模块还没装到位(10a-1 负责), 下轮再说
+  _rescue_intent_migrate                             # 早期标记文件 → profile.env
+  local intent; intent="$(_rescue_intent)"
+  if [[ "$intent" == 0 ]]; then
+    return 0                                         # 用户明确关过 —— 尊重它, 一个字都不改
+  fi
+  local bind; bind="$(_rescue_bind_addr || true)"
+  if [[ -z "$bind" ]]; then
+    # 非交互更新**不猜**监听地址: 猜错就是把恢复入口开到不该开的网上。保持停用并说清怎么配。
+    local auto; auto="$(_rescue_bind_from_cidr 2>/dev/null || true)"
+    if [[ -n "$auto" ]] && pdg_rescue_bind_valid "$auto"; then
+      _profile_set "$RESCUE_BIND_KEY" "$auto" && bind="$auto"
+      c_g "  救援平面: 按来源段内唯一的本机地址确定监听地址 $bind"
+    else
+      c_y "  救援平面: 未配置监听地址(PDG_RESCUE_BIND), 保持停用。"
+      c_y "     设置后即可启用: sudo pdg rescue bind <IPv4>(候选: $(_rescue_bind_candidates | awk '{print $2}' | tr '\n' ' '))"
+      return 0
+    fi
+  fi
+  # 已布防 → 幂等退出(不重生成凭据、不重启、不动任何文件)。
+  #
+  # 判据是 **socket** 在监听 + unit 在盘上 + 放行还在, 不看 service: socket activation
+  # (Accept=no)下 service 平时就该是 inactive —— 那是"已布防、等待请求", 不是挂了。拿
+  # service 当判据的话, 每次 update 都会认定它没起来而重跑一遍 enable, 于是凭据被重新生成、
+  # 证书指纹变掉, 用户下次访问看到指纹不一致, 只能怀疑自己遇上了中间人。
+  # 只看 is-enabled 同样不够: 服务崩掉之后它仍然是 enabled, 那种情况恰恰是要救回来的。
+  # unit 模板改了就要刷到盘上。update 只装运行模块、不碰已安装的 unit —— 于是 unit 层面的
+  # 修复(硬化项、TimeoutStopSec、监听形态)永远到不了已经装好的机器, 改了等于没改
+  # (.200 实机上 TimeoutStopSec 一直停在 systemd 默认的 90 秒)。
+  # 只有**内容真的不同**才重写并重启 socket: 每次 update 都重启会平白打断在用的连接。
+  _rescue_refresh_units "$bind"
+  if _rescue_socket_present \
+     && systemctl is-enabled "$PDG_RESCUE_SOCKET_UNIT" >/dev/null 2>&1 \
+     && systemctl is-active "$PDG_RESCUE_SOCKET_UNIT" >/dev/null 2>&1 \
+     && _rescue_nft_has; then
+    [[ -n "$intent" ]] || _rescue_intent_set 1       # 老机器补记意图(此前只有 unit 没有键)
+    return 0
+  fi
+  if [[ "$intent" == 1 ]]; then
+    c_g "  救援平面意图为启用但当前没起来, 恢复中…"    # 服务崩了 ≠ 用户关了, 这种要救回来
+  else
+    c_g "  首次启用救援平面(默认开; 之后可 pdg rescue disable)…"
+  fi
+  _rescue_enable >/dev/null 2>&1 \
+    && c_g "  ✅ 救援平面已启用: https://$bind:$PDG_RESCUE_PORT/" \
+    || c_y "  救援平面启用失败, 现网未受影响; 可跑 sudo pdg rescue status 查。"
+  return 0
 }
 
 # 统一平台判定源: 确保 /etc/privdns-gateway/platform 存在且合法(canonical)。幂等。
@@ -1888,10 +2040,49 @@ migrate_backend_marker(){
     && c_g "  补内核标记: $core(据现场证据; 老装此前一直靠默认值兜底)。"
 }
 
+# 5.2/T7: 把内网卡来源段写进 profile.env, 让它成为**唯一真源**。
+# 老机器上这个值只存在于两份渲染产物里(nft 的 ip saddr、mosdns 的 npn_clients.ips), 读回时
+# 各处自己抠 —— 没有权威答案。救援服务要用它决定监听地址, 所以必须先有真源。
+#
+# **保守推断**: 两份产物都读得到且完全一致才写入。不一致 = 现网本来就处于半套状态(上次改段
+# 只改了一处), 这时候挑一个写进真源, 等于用猜测把不一致固化下来 —— 宁可停手让人来看。
+migrate_cidr_single_source(){
+  local prof=/etc/privdns-gateway/profile.env
+  [[ -f "$prof" ]] || return 0                       # 还没装完(装机自己会写)
+  grep -qE '^[[:space:]]*PDG_INTERNAL_CIDR=' "$prof" && return 0     # 已有真源: 幂等
+  local nftv mosv
+  nftv="$(grep -oE 'ip saddr [0-9.]+/[0-9]+' /etc/nftables.conf 2>/dev/null | head -1 | awk '{print $3}')"
+  mosv="$(grep -oE 'ips:[[:space:]]*\[[[:space:]]*"[0-9./]+"' /etc/mosdns/config.yaml 2>/dev/null \
+          | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+')"
+  if [[ -z "$nftv" && -z "$mosv" ]]; then
+    c_y "⚠️ 迁移: nft 与 mosdns 里都读不到内网卡段 → 未写入 PDG_INTERNAL_CIDR。"
+    c_y "   请运行 sudo pdg detect-cidr 重新识别。"
+    return 0
+  fi
+  if [[ -z "$nftv" || -z "$mosv" || "$nftv" != "$mosv" ]]; then
+    c_y "⚠️ 迁移: 内网卡段在两处不一致(nft=${nftv:-读不到} mosdns=${mosv:-读不到})"
+    c_y "   → **未写入**真源, 也未改动任何配置。这说明现网本来就是半套状态,"
+    c_y "   请运行 sudo pdg detect-cidr 统一后再迁移。"
+    return 0
+  fi
+  # 走与装机同款的原子替换; 失败必须看得见(半个 .tmp 留在盘上比不写更糟)
+  local t
+  t="$(mktemp /etc/privdns-gateway/.profile.env.XXXXXX)" || { c_y "⚠️ 迁移: 建临时文件失败, 未写入真源"; return 0; }
+  { printf 'PDG_INTERNAL_CIDR=%s\n' "$nftv"; cat "$prof"; } > "$t" 2>/dev/null \
+    || { rm -f "$t"; c_y "⚠️ 迁移: 写 profile.env 失败, 未改动"; return 0; }
+  chmod 600 "$t"
+  mv -f "$t" "$prof" || { rm -f "$t"; c_y "⚠️ 迁移: 落盘 profile.env 失败, 未改动"; return 0; }
+  grep -q "^PDG_INTERNAL_CIDR=$nftv$" "$prof" \
+    || { c_y "⚠️ 迁移: 真源复核未通过"; return 0; }
+  c_g "✅ 迁移: 内网卡段真源已写入 profile.env ($nftv)"
+}
+
 run_all_migrations(){
   local rc=0
   migrate_platform_marker || true          # 先统一平台判定源(后续平台相关迁移据此走)
+  migrate_rescue_plane || true             # 老机首次获得救援平面(用户停用过则不动)
   migrate_backend_marker || true           # 再把内核标记落地(别再靠默认值兜底)
+  migrate_cidr_single_source || true       # 先立真源: 后续 nft/mosdns/救援都从它读
   migrate_botenv || true; migrate_firewall_to_pdg || true; migrate_mosdns_concurrent || true
   migrate_mosdns_unlock || true; migrate_fw_gms || true
   migrate_mosdns_ratelimit || true; migrate_lowmem || true; migrate_mihomo_safepaths || true
@@ -2247,6 +2438,567 @@ _plat_verify(){
 # 切平台: 全局锁 + 快照 + 就地备份, 任一步失败恢复原平台与原配置并返回非 0。
 # 以前这里只写个标记就 run_all_migrations 并恒返回 0: Android→iOS 缺 probe81/描述文件模板,
 # iOS→Android 的 nft 里 GMS 5228-5230 回不来、mihomo 配置里 MITM-OUT 还留着, 而命令还说"已确认"。
+UNIT_DIR="${PDG_UNIT_DIR:-/etc/systemd/system}"
+
+_rescue_write_units(){
+  local bind="$1" src="$REPO_DIR/deploy/rescue"
+  [[ -d "$src" ]] || src=/opt/pdg-bot        # 仓库不在时用装好的那份(10a-1 已装 rescue.py 等)
+  [[ -f "$src/pdg-rescue.socket" ]] || return 1
+  sed -e "s|__RESCUE_BIND__|$bind|g" -e "s|__RESCUE_PORT__|$PDG_RESCUE_PORT|g" \
+      "$src/pdg-rescue.socket" > "$UNIT_DIR/$PDG_RESCUE_SOCKET_UNIT" || return 1
+  sed -e "s|__RESCUE_BIND__|$bind|g" -e "s|__RESCUE_PORT__|$PDG_RESCUE_PORT|g" \
+      "$src/pdg-rescue.service" > "$UNIT_DIR/$PDG_RESCUE_SERVICE_UNIT" || return 1
+  chmod 644 "$UNIT_DIR/$PDG_RESCUE_SOCKET_UNIT" "$UNIT_DIR/$PDG_RESCUE_SERVICE_UNIT"
+}
+
+# 配置里有没有**我们自己注入的**救援放行。判据交给 rescue_nft.py(它认自己的独立表),
+# 不在这里按端口猜 —— 按端口猜会把用户自己写的同端口规则也算成我们的。
+_rescue_nft_has(){
+  [[ -f /etc/nftables.conf ]] || return 1
+  local bind; bind="$(_rescue_bind_addr || true)"
+  python3 - /etc/nftables.conf "$PDG_RESCUE_PORT" "${bind:-}" <<'PYH'
+import sys
+sys.path.insert(0, "/opt/pdg-bot")
+import rescue_nft
+txt = open(sys.argv[1], encoding="utf-8", errors="surrogateescape").read()
+sys.exit(0 if rescue_nft.has_rescue_rule(txt, int(sys.argv[2]), sys.argv[3] or None) else 1)
+PYH
+}
+
+# 内核里有没有(数的是我们标记过的那条, 不是"含救援端口的任意行")
+_rescue_nft_has_kernel(){
+  local bind; bind="$(_rescue_bind_addr || true)"
+  [[ -n "$bind" ]] || return 1
+  nft list table inet pdg 2>/dev/null | grep -q "comment \"pdg-rescue\"" || return 1
+  nft list table inet pdg 2>/dev/null | grep "comment \"pdg-rescue\"" | grep -q "$bind"
+}
+
+# 我们的规则在磁盘/内核里各有几条(盯"恰好一条")
+_rescue_nft_count_disk(){
+  python3 - /etc/nftables.conf "$PDG_RESCUE_PORT" <<'PYC'
+import sys
+sys.path.insert(0, "/opt/pdg-bot")
+import rescue_nft
+print(rescue_nft.count_rules(open(sys.argv[1], encoding="utf-8", errors="surrogateescape").read(),
+                             int(sys.argv[2])))
+PYC
+}
+_rescue_nft_count_kernel(){
+  # grep -c 计数为 0 时退出码是 1 —— 调用处若写了 `|| echo ?`, 就会在数字后面再打一个 "?",
+  # 事故现场读到 "0 ?" 只会更慌。这里把退出码吞掉, 只输出数字。
+  local n; n="$(nft list table inet pdg 2>/dev/null | grep -c 'comment "pdg-rescue"' || true)"
+  printf '%s' "${n:-0}"
+}
+
+# 旧版独立表 inet pdgrescue 的清理(幂等)。0=没有或已清掉; 1=同名但形态不是我们生成的 → 不动它。
+# 为什么必须清: 它挂在 input hook 上, doctor 会判成冲突, 于是启用救援平面的机器每次
+# pdg update 的更新后自检都失败并整次回滚(.200 实机实测)。而它本来也不起作用 ——
+# 同一 hook 上多条基链挨个走, 它的 accept 盖不过 inet pdg 的 policy drop。
+_rescue_nft_drop_legacy(){
+  local rc=0
+  if [[ -f /etc/nftables.conf ]]; then
+    python3 /opt/pdg-bot/rescue_nft.py --legacy-check < /etc/nftables.conf >/dev/null 2>&1
+    rc=$?
+    if (( rc == 2 )); then
+      c_y "  ⚠️ 配置里有一张 inet pdgrescue, 但形态与本项目生成的不一致 —— 不擅自删除, 请自行确认。"
+      return 1
+    fi
+  fi
+  nft list tables 2>/dev/null | grep -q "inet pdgrescue" && nft delete table inet pdgrescue 2>/dev/null
+  return 0
+}
+
+# 放行: 只往项目自己的 inet pdg input 链首插一条带标记的规则, 候选先过 nft -c 再整份应用。
+# 整份应用(模板里带 `delete table inet pdg` 再重建)保证**磁盘与内核一致** —— 增量 nft -f
+# 删不掉已经不在文件里的东西, 那正是旧实现留下孤儿表的原因。
+_rescue_nft_open(){
+  local cidr bind cand
+  cidr="$(pdg_internal_cidr 2>/dev/null || true)"; [[ -n "$cidr" ]] || return 1
+  bind="$(_rescue_bind_addr || true)";            [[ -n "$bind" ]] || return 1
+  _rescue_nft_drop_legacy || return 1
+  cand="$(_pdg_mktemp_dir)/nft.cand" || return 1
+  python3 /opt/pdg-bot/rescue_nft.py "$cidr" "$PDG_RESCUE_PORT" "$bind" \
+    < /etc/nftables.conf > "$cand" 2>/dev/null || return 1
+  nft -c -f "$cand" >/dev/null 2>&1 || return 1      # 候选先校验, 再动现网
+  cp -a /etc/nftables.conf /etc/nftables.conf.pdg-rescue-bak 2>/dev/null || true
+  mv -f "$cand" /etc/nftables.conf || return 1
+  nft -f /etc/nftables.conf >/dev/null 2>&1 || {
+    mv -f /etc/nftables.conf.pdg-rescue-bak /etc/nftables.conf 2>/dev/null
+    nft -f /etc/nftables.conf >/dev/null 2>&1; return 1; }
+  rm -f /etc/nftables.conf.pdg-rescue-bak
+  # 磁盘与内核都必须**恰好一条**; 对不上就回滚, 不留"看着开了实际不通"或重复规则
+  [[ "$(_rescue_nft_count_disk)" == 1 && "$(_rescue_nft_count_kernel)" == 1 ]] || return 1
+  return 0
+}
+
+# 撤销: 精确摘掉带标记的那条(rescue_nft.py --strip), 再整份重新应用 —— 磁盘与内核同时干净。
+# 绝不按端口去删行: 用户完全可能自己写过一条同端口放行, 那是他的规则。
+_rescue_nft_close(){
+  [[ -f /etc/nftables.conf ]] || return 0
+  local cand bak; cand="$(_pdg_mktemp_dir)/nft.cand" || return 1
+  bak=/etc/nftables.conf.pdg-rescue-bak
+  python3 /opt/pdg-bot/rescue_nft.py --strip < /etc/nftables.conf > "$cand" || return 1
+  nft -c -f "$cand" >/dev/null 2>&1 || return 1
+  cp -a /etc/nftables.conf "$bak" 2>/dev/null || true
+  mv -f "$cand" /etc/nftables.conf || return 1
+  nft -f /etc/nftables.conf >/dev/null 2>&1 || {
+    mv -f "$bak" /etc/nftables.conf 2>/dev/null; nft -f /etc/nftables.conf >/dev/null 2>&1; return 1; }
+  _rescue_nft_drop_legacy || true                  # 顺手带走旧独立表(内核对象)
+  rm -f "$bak"
+  [[ "$(_rescue_nft_count_disk)" == 0 && "$(_rescue_nft_count_kernel)" == 0 ]] || return 1
+  return 0
+}
+
+# ── 救援平面的生命周期 ────────────────────────────────────────────────────
+# 只有 enable / disable / status / fingerprint / rotate-token / rotate-cert 六个动作 ——
+# 都是既有设计里就有的, 不自行加新命令。
+_rescue_load(){
+  # shellcheck source=lib/rescue.sh
+  source "$REPO_DIR/lib/rescue.sh" 2>/dev/null || source /opt/pdg-bot/rescue.sh 2>/dev/null \
+    || { echo "❌ 读不到救援常量(lib/rescue.sh)"; return 1; }
+}
+
+# 本机上落在内网卡段内的地址。找不到返回空 —— 绝不退回 0.0.0.0: 把恢复入口开到公网上,
+# 等于把"换默认出口""完整恢复"这些按钮交给任何人。
+# 监听地址 = profile.env 里的 PDG_RESCUE_BIND, **不再从来源段推导**。
+# 那个假设在真实网关上不成立: 来源段是客户端所在的运营商内网, 而网关自己的地址在另一张网上,
+# 于是"在来源段里找一个本机地址"什么也找不到, 救援平面在它唯一被需要的拓扑上根本起不来
+# (.200 实机实测)。读不到就返回 1, 由调用方给出配置指引 —— 绝不回落到 0.0.0.0。
+_rescue_bind_addr(){
+  local v; v="$(pdg_rescue_bind 2>/dev/null || true)"
+  [[ -n "$v" ]] || return 1
+  pdg_rescue_bind_valid "$v" || return 1
+  printf '%s\n' "$v"
+}
+
+# 本机所有 IPv4(供"没配 bind 时列给用户选"用; 绝不替用户选)
+_rescue_bind_candidates(){
+  ip -4 -o addr show scope global 2>/dev/null \
+    | awk '{split($4,a,"/"); print $2, a[1]}'
+}
+
+# 来源段内恰好一个本机地址 → 沿用旧的安全路径并落盘(老机器平滑迁移)。
+# 有零个或多个都返回非 0: 多个的时候猜错就是把恢复入口开在错误的网上。
+_rescue_bind_from_cidr(){
+  local cidr; cidr="$(pdg_internal_cidr 2>/dev/null || true)"
+  [[ -n "$cidr" ]] || return 1
+  python3 - "$cidr" <<'PYB'
+import ipaddress, subprocess, sys
+try:
+    net = ipaddress.ip_network(sys.argv[1], strict=False)
+except Exception:
+    sys.exit(1)
+out = subprocess.run(["ip", "-4", "-o", "addr", "show", "scope", "global"],
+                     capture_output=True, text=True).stdout
+hits = []
+for line in out.splitlines():
+    parts = line.split()
+    for i, tok in enumerate(parts):
+        if tok == "inet" and i + 1 < len(parts):
+            try:
+                ip = ipaddress.ip_address(parts[i + 1].split("/")[0])
+            except ValueError:
+                continue
+            if ip in net:
+                hits.append(str(ip))
+sys.exit(1) if len(hits) != 1 else print(hits[0])
+PYB
+}
+
+# ── 启用意图的**单一真源**: profile.env 里的 PDG_RESCUE_ENABLED ──────────
+# 为什么不能只看 systemctl is-active: 那分不清"用户关的"和"服务崩了"。前者升级时必须尊重,
+# 后者升级时应当把它救回来 —— 判错任何一个方向都很糟(要么擅自打开用户关掉的入口, 要么让
+# 一台本该有救援的机器一直没有)。所以意图单独记, 且用项目既有的 profile.env 原子 upsert。
+#
+# 四种状态:
+#   (键不存在)  从未部署过 —— 首次部署按"默认启用"处理;
+#   1           用户/装机明确启用;
+#   0           **用户主动禁用** —— 普通更新与重复安装一律不得开回来;
+#   运行态       socket 是否 active 由 systemctl 单独查, 与意图无关(服务崩了意图仍是 1)。
+RESCUE_INTENT_KEY="PDG_RESCUE_ENABLED"
+RESCUE_BIND_KEY="PDG_RESCUE_BIND"
+
+_rescue_intent(){        # 回显 1 / 0 / 空(从未部署)
+  [[ -f "$PROFILE_ENV" ]] || return 0
+  sed -n "s/^[[:space:]]*${RESCUE_INTENT_KEY}=//p" "$PROFILE_ENV" | tail -1
+}
+
+_rescue_intent_set(){    # $1=1|0。原子写(_profile_set 走临时文件 + mv), 调用方已持锁。
+  _profile_set "$RESCUE_INTENT_KEY" "$1"
+}
+
+# 兼容 10a-2 早期版本落下的标记文件: 读得到就当作"用户禁用", 并顺手迁进 profile.env。
+_rescue_optout(){ echo "${PDG_RESCUE_DIR:-/etc/privdns-gateway/rescue}/disabled"; }
+_rescue_intent_migrate(){
+  [[ -e "$(_rescue_optout)" ]] || return 0
+  [[ -z "$(_rescue_intent)" ]] && _rescue_intent_set 0
+  rm -f "$(_rescue_optout)" 2>/dev/null
+}
+
+_rescue_socket_present(){ [[ -f "$UNIT_DIR/$PDG_RESCUE_SOCKET_UNIT" ]]; }
+
+# 轮换凭据。**沿用 rescue_cred.py 既定的轮换范围**(token 只换 token, cert 连私钥一起重签),
+# 这里只负责把它包成一次可回滚的受控操作: 先留 before-image, 换完验证, 出事按原样放回去。
+# 换 token 会让所有已登录会话立即失效; 换证书会改指纹 —— 后者必须明确提示, 否则用户下次访问
+# 看到"证书变了"会以为被中间人了。
+_rescue_rotate(){
+  local what="${1:-token}"
+  case "$what" in token|cert) :;; *) echo "用法: pdg rescue rotate [token|cert]"; return 1;; esac
+  _lock
+  local bak; bak="$(_pdg_mktemp_dir)" || { echo "❌ 无法创建临时目录"; return 1; }
+  chmod 700 "$bak"
+  # before-image: 三个凭据一起留底 —— 只留被换的那个, 出事时另外两个与它的配对关系就断了
+  local f
+  for f in "$PDG_RESCUE_TOKEN" "$PDG_RESCUE_CERT" "$PDG_RESCUE_KEY"; do
+    [[ -e "$f" ]] && { cp -a "$f" "$bak/$(basename "$f")" || { echo "❌ 备份失败, 未轮换。"
+                       rm -rf "$bak"; return 1; }; }
+  done
+  local fp_old; fp_old="$(python3 /opt/pdg-bot/rescue_cred.py fingerprint 2>/dev/null || true)"
+  local rc=0
+  if [[ "$what" == token ]]; then
+    python3 /opt/pdg-bot/rescue_cred.py rotate-token >/dev/null 2>&1 || rc=1
+  else
+    python3 /opt/pdg-bot/rescue_cred.py rotate-cert "$(_rescue_bind_addr || true)" >/dev/null 2>&1 || rc=1
+  fi
+  # 验证: 换完三个文件都得在、权限对、证书读得出指纹
+  if (( rc == 0 )); then
+    for f in "$PDG_RESCUE_TOKEN" "$PDG_RESCUE_CERT" "$PDG_RESCUE_KEY"; do
+      [[ -s "$f" ]] || rc=1
+    done
+    [[ "$(stat -c %a "$PDG_RESCUE_KEY" 2>/dev/null)" == 600 ]] || rc=1
+    [[ "$(stat -c %a "$PDG_RESCUE_TOKEN" 2>/dev/null)" == 600 ]] || rc=1
+    python3 /opt/pdg-bot/rescue_cred.py fingerprint >/dev/null 2>&1 || rc=1
+  fi
+  if (( rc != 0 )); then
+    for f in "$PDG_RESCUE_TOKEN" "$PDG_RESCUE_CERT" "$PDG_RESCUE_KEY"; do
+      [[ -e "$bak/$(basename "$f")" ]] && cp -a "$bak/$(basename "$f")" "$f"
+    done
+    rm -rf "$bak"
+    echo "❌ 轮换失败, 已恢复原凭据(指纹与 token 均未改变)。"
+    return 1
+  fi
+  rm -rf "$bak"
+  # 服务在跑就重启一次, 让新凭据生效并确认它还能起来
+  if systemctl is-active "$PDG_RESCUE_SOCKET_UNIT" >/dev/null 2>&1; then
+    systemctl restart "$PDG_RESCUE_SERVICE_UNIT" >/dev/null 2>&1 || true
+  fi
+  local fp_new; fp_new="$(python3 /opt/pdg-bot/rescue_cred.py fingerprint 2>/dev/null || true)"
+  if [[ "$what" == token ]]; then
+    c_g "✅ 救援 Token 已轮换 —— 所有已登录会话立即失效, 请用 pdg rescue status 之外的渠道重新取。"
+    [[ "$fp_new" == "$fp_old" ]] && echo "   证书指纹未变(仍是: $fp_new)"
+  else
+    c_g "✅ 救援证书已重签。"
+    c_y "   ⚠️ 指纹已改变: $fp_old → $fp_new"
+    c_y "   下次访问浏览器会提示证书变化 —— 那是预期的, 请按新指纹核对。"
+  fi
+}
+
+cmd_rescue(){
+  need_root rescue
+  _rescue_load || return 1
+  local act="${1:-status}"; shift 2>/dev/null || true
+  set -- "$act" "${1:-}"
+  case "$act" in
+    enable)   _rescue_enable;;
+    disable)  _rescue_disable;;
+    status)   _rescue_status;;
+    fingerprint) python3 /opt/pdg-bot/rescue_cred.py fingerprint;;
+    rotate)       _rescue_rotate "${2:-token}";;
+    rotate-token) _rescue_rotate token;;
+    rotate-cert)  _rescue_rotate cert;;
+    bind)         _rescue_set_bind "${2:-}";;
+    *) echo "用法: pdg rescue <enable|disable|status|fingerprint|bind <IPv4>|rotate [token|cert]>"
+       echo "  fingerprint  打印证书 SHA-256 指纹 —— 这是**独立渠道**, 手机上要拿它核对页面,"
+       echo "               反过来用页面上的指纹核对页面没有意义。"
+       echo "  rotate token 换 token, 已登录会话立即失效, 证书指纹不变"
+       echo "  rotate cert  重签证书, 指纹一定改变, 需要重新核对(见 docs/rescue-plane-access.md)"
+       return 1;;
+  esac
+}
+
+_rescue_enable(){
+  _lock
+  local bind; bind="$(_rescue_bind_addr || true)"
+  if [[ -z "$bind" ]]; then
+    # 没配监听地址时先试老路径: 来源段内**恰好一个**本机地址 → 沿用并落盘(老机器平滑迁移)。
+    # 有多个就不猜 —— 猜错等于把恢复入口开在错误的那张网上。
+    local auto; auto="$(_rescue_bind_from_cidr 2>/dev/null || true)"
+    if [[ -n "$auto" ]] && pdg_rescue_bind_valid "$auto"; then
+      _profile_set "$RESCUE_BIND_KEY" "$auto" && bind="$auto"
+      c_g "  已按来源段内唯一的本机地址确定监听地址: $bind(可用 pdg rescue bind 改)"
+    fi
+  fi
+  if [[ -z "$bind" ]]; then
+    echo "❌ 没有配置监听地址(PDG_RESCUE_BIND)—— 拒绝启用。"
+    echo "   它与来源段是两件事: 来源段($(pdg_internal_cidr 2>/dev/null || echo 未设))管「谁可以连」,"
+    echo "   监听地址管「绑在本机哪个地址上」; 真实网关上后者往往不在前者里。绝不回落 0.0.0.0。"
+    echo "   本机可选地址:"; _rescue_bind_candidates | sed 's/^/     /'
+    echo "   设置: sudo pdg rescue bind <IPv4>"
+    return 1
+  fi
+  if pdg_rescue_bind_is_global "$bind"; then
+    c_y "  ⚠️ 监听地址 $bind 是全局可路由地址 —— 端口会暴露在该地址上, 靠 nft 来源约束与"
+    c_y "     应用层来源校验两层兜底。确认这是你要的。"
+  fi
+  # 回滚台账: 出错时把 unit / 启用状态 / 标记恢复回操作前
+  local had_sock=0 was_enabled=0 had_optout=0 had_fw=0
+  _rescue_socket_present && had_sock=1
+  systemctl is-enabled "$PDG_RESCUE_SOCKET_UNIT" >/dev/null 2>&1 && was_enabled=1
+  [[ -e "$(_rescue_optout)" ]] && had_optout=1
+  _rescue_nft_has && had_fw=1        # 操作前就有放行 → 回滚时别把它撤了(重复 enable 的情形)
+  _rescue_rollback(){
+    (( had_optout == 1 )) && : > "$(_rescue_optout)" || rm -f "$(_rescue_optout)" 2>/dev/null
+    (( was_enabled == 0 )) && systemctl disable --now "$PDG_RESCUE_SOCKET_UNIT" >/dev/null 2>&1
+    (( had_sock == 0 )) && rm -f "$UNIT_DIR/$PDG_RESCUE_SOCKET_UNIT" "$UNIT_DIR/$PDG_RESCUE_SERVICE_UNIT"
+    # 放行也要撤 —— 否则回滚完成后盘上留着一条孤儿 accept: 端口开着、后面没有任何监听,
+    # 而 status/doctor 读配置会报"防火墙已放行", 与"服务不存在"自相矛盾, 下一个人无从判断
+    # 到底哪一半是真的。操作前本来就有放行(重复 enable 的情形)则保持原样, 不误撤。
+    (( had_fw == 0 )) && _rescue_nft_close >/dev/null 2>&1
+    systemctl daemon-reload 2>/dev/null || true
+  }
+  # 运行模块得先齐 —— 缺一个的后果不是报错, 是救援页把整块能力标成"旧核心不支持"。
+  # 装机由 10a-1 的清单负责, 这里只是在**开门之前**再确认一次。名单读 PDG_RESCUE_CLOSURE
+  # (救援平面自身的模块闭包), 不在这里手写第二份。
+  local _miss=""
+  for _m in $PDG_RESCUE_CLOSURE; do
+    [[ -f "/opt/pdg-bot/$_m" ]] || _miss="$_miss $_m"
+  done
+  if [[ -n "$_miss" ]]; then
+    echo "❌ 运行模块不完整(缺:$_miss) —— 拒绝启用。"
+    echo "   先跑 sudo pdg update 把模块补齐, 否则救援页开着也是半残的。"
+    return 1
+  fi
+  python3 /opt/pdg-bot/rescue_cred.py ensure "$bind" >/dev/null 2>&1 \
+    || { echo "❌ 凭据准备失败, 未改动任何状态。"; return 1; }
+  _rescue_write_units "$bind" || { echo "❌ unit 渲染失败, 未启用。"; _rescue_rollback; return 1; }
+  systemctl daemon-reload || { echo "❌ daemon-reload 失败"; _rescue_rollback; return 1; }
+  _rescue_nft_open || { echo "❌ 防火墙放行失败(候选未通过 nft -c 或应用失败), 已回滚。"
+                        _rescue_rollback; return 1; }
+  # socket 已经在跑时 `enable --now` **不会**重新读 unit —— 换了监听地址却不重启, systemd
+  # 仍绑在旧地址上, 而 nft 只放行新地址: 门就此不可达, 命令还报成功(.200 实机上正是如此)。
+  systemctl is-active "$PDG_RESCUE_SOCKET_UNIT" >/dev/null 2>&1 \
+    && systemctl restart "$PDG_RESCUE_SOCKET_UNIT" >/dev/null 2>&1
+  if ! systemctl enable --now "$PDG_RESCUE_SOCKET_UNIT" >/dev/null 2>&1; then
+    echo "❌ socket 起不来, 回滚到操作前。"; _rescue_rollback; return 1
+  fi
+  _rescue_intent_set 1 || { echo "❌ 意图写入失败, 回滚。"; _rescue_rollback; return 1; }
+  rm -f "$(_rescue_optout)" 2>/dev/null          # 清掉早期版本的标记文件
+  # 收尾一致性核对: 意图 / unit / socket / 监听配置 / 项目 nft 规则必须彼此对得上。
+  # 只要有一项对不上就当作没启用成功 —— "看着开了其实没开"比明确失败难查得多。
+  local _bad=""
+  [[ "$(_rescue_intent)" == 1 ]]                     || _bad="$_bad 意图"
+  _rescue_socket_present                             || _bad="$_bad unit"
+  systemctl is-enabled "$PDG_RESCUE_SOCKET_UNIT" >/dev/null 2>&1 || _bad="$_bad socket-enabled"
+  grep -q "ListenStream=$bind:$PDG_RESCUE_PORT" "$UNIT_DIR/$PDG_RESCUE_SOCKET_UNIT" 2>/dev/null \
+                                                     || _bad="$_bad 监听配置"
+  _rescue_nft_has                                    || _bad="$_bad 防火墙"
+  if [[ -n "$_bad" ]]; then
+    echo "❌ 启用后自检不一致(${_bad# }) → 回滚到操作前。"; _rescue_rollback; return 1
+  fi
+  c_g "✅ 救援平面已启用: https://$bind:$PDG_RESCUE_PORT/(仅内网卡可达)"
+  echo "   证书指纹(首次访问请核对): $(python3 /opt/pdg-bot/rescue_cred.py fingerprint 2>/dev/null || echo '读取失败')"
+  c_y "   ⚠️ 这串指纹要拿到**手机上**去比对浏览器里看到的证书 —— 那才是核对的意义所在。"
+  c_y "      不要用页面自己显示的指纹核对页面; 浏览器看不到完整 SHA-256 时不要输 token。"
+}
+
+_rescue_disable(){
+  _lock
+  systemctl disable --now "$PDG_RESCUE_SERVICE_UNIT" >/dev/null 2>&1
+  systemctl disable --now "$PDG_RESCUE_SOCKET_UNIT" >/dev/null 2>&1
+  systemctl reset-failed "$PDG_RESCUE_SOCKET_UNIT" "$PDG_RESCUE_SERVICE_UNIT" >/dev/null 2>&1
+  _rescue_nft_close || c_y "  防火墙放行没能撤掉, 请 pdg rescue status 复查。"
+  _rescue_intent_set 0 || { c_y "  ⚠️ 意图未能写入 profile.env —— 升级时可能被当成「从未部署」而重新开启, 请手工复查。"; }
+  rm -f "$(_rescue_optout)" 2>/dev/null          # 早期版本的标记文件不再使用
+  # 校验: 停用之后不该还有可用入口
+  local _left=""
+  systemctl is-active "$PDG_RESCUE_SOCKET_UNIT" >/dev/null 2>&1 && _left="$_left socket仍active"
+  _rescue_nft_has && _left="$_left 防火墙放行仍在"
+  if [[ -n "$_left" ]]; then
+    c_y "  ⚠️ 停用后仍有残留(${_left# }) —— 请 pdg rescue status 复查, 不要当成已停用。"
+    return 1
+  fi
+  c_g "✅ 救援平面已停用(凭据保留; 再次 pdg rescue enable 即可恢复, 指纹不变)。"
+}
+
+# pdg rescue bind <IPv4> —— 设定救援 socket 真正绑的本机地址。
+#
+# 与来源段是两件事: 来源段管"谁可以连", 这里管"连到哪个地址"。真实网关上后者往往不在前者
+# 里面(.200 就是), 所以必须显式配置, 不许从来源段猜。
+# 已启用时这是**一笔可回滚的操作**: 渲染新 unit → 生成新候选 → 校验 → 重启 socket → 验证
+# 新监听与来源约束, 任一步失败就把 bind / unit / socket / nft 全部退回操作前。
+_rescue_set_bind(){
+  _lock
+  local newbind="${1:-}"
+  if [[ -z "$newbind" ]]; then
+    echo "用法: pdg rescue bind <IPv4>"
+    echo "本机可选地址:"; _rescue_bind_candidates | sed 's/^/  /'
+    echo "当前值: $(pdg_rescue_bind 2>/dev/null || echo '(未配置)')"
+    return 1
+  fi
+  if ! pdg_rescue_bind_valid "$newbind"; then
+    echo "❌ 不是合法的 IPv4 监听地址: $newbind"
+    echo "   只收 IPv4 字面量; 主机名、0.0.0.0、广播与组播一律拒绝 —— 猜错就是把恢复入口开错地方。"
+    return 1
+  fi
+  local old; old="$(pdg_rescue_bind 2>/dev/null || true)"
+  if [[ "$old" == "$newbind" ]]; then
+    echo "✅ 监听地址已是 $newbind(无变化)"; return 0
+  fi
+  if ! _rescue_bind_candidates | awk '{print $2}' | grep -qx "$newbind"; then
+    c_y "  ⚠️ $newbind 目前不是本机地址 —— FreeBind 允许先绑上, 但地址不回来就没人连得进来。"
+  fi
+  pdg_rescue_bind_is_global "$newbind" && c_y "  ⚠️ $newbind 是全局可路由地址: 端口会暴露在该地址上, 只靠 nft 来源约束与应用层来源校验兜底。"
+
+  local was_enabled=0
+  systemctl is-enabled "$PDG_RESCUE_SOCKET_UNIT" >/dev/null 2>&1 && was_enabled=1
+  _profile_set "$RESCUE_BIND_KEY" "$newbind" || { echo "❌ 写入 profile.env 失败"; return 1; }
+
+  if (( was_enabled == 0 )); then
+    # 停用状态: 只更新配置与候选 unit, **不开端口**
+    _rescue_write_units "$newbind" >/dev/null 2>&1 || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    echo "✅ 监听地址已设为 $newbind(当前处于停用状态, 未开放端口; pdg rescue enable 生效)"
+    return 0
+  fi
+  # 启用状态: 整体重做一次, 失败退回
+  if _rescue_enable >/dev/null 2>&1 && [[ "$(_rescue_listen_addr)" == "$newbind:$PDG_RESCUE_PORT" ]]; then
+    echo "✅ 监听地址已切到 $newbind, socket 正在该地址上监听。"
+    return 0
+  fi
+  c_y "❌ 切换到 $newbind 失败, 回退到 ${old:-未配置}。"
+  # 回退不只是把 profile 写回去: 失败之前 unit 与 nft 规则已经指向新地址了, 光改配置会留下
+  # 一个"配置说 A、防火墙放行 B、socket 监听 B"的三方不一致 —— 而且 B 是个起不来的地址,
+  # 等于把入口悄悄关掉。所以 unit 与防火墙都要按旧值重做一遍。
+  if [[ -n "$old" ]]; then
+    _profile_set "$RESCUE_BIND_KEY" "$old"
+    _rescue_write_units "$old" >/dev/null 2>&1 || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    _rescue_nft_close >/dev/null 2>&1 || true      # 先撤掉指向新地址的那条
+    _rescue_nft_open  >/dev/null 2>&1 \
+      || c_y "  ⚠️ 防火墙未能退回旧地址, 请跑 sudo pdg rescue status 复查。"
+  else
+    # 本来就没配过 → 把键抹掉(而不是留一个空值: 空值会被 pdg_rescue_bind 当成"配了"而后
+    # 在校验处再失败一次, 报错位置离真正原因更远)
+    sed -i "/^${RESCUE_BIND_KEY}=/d" "$PROFILE_ENV" 2>/dev/null || true
+  fi
+  _rescue_enable >/dev/null 2>&1 || true
+  return 1
+}
+
+# 盘上的 unit 与当前模板渲染结果不一致时重写(内容相同则一个字节都不动)。
+# 返回 0 = 有更新并已重启 socket; 1 = 无需更新/不适用。
+_rescue_refresh_units(){
+  local bind="${1:-}"; [[ -n "$bind" ]] || return 1
+  _rescue_socket_present || return 1                 # 没装过就不是"刷新"的事
+  local tmp; tmp="$(_pdg_mktemp_dir)" || return 1
+  local dst="$UNIT_DIR" changed=0 u
+  UNIT_DIR="$tmp" _rescue_write_units "$bind" >/dev/null 2>&1 || { rm -rf "$tmp"; return 1; }
+  for u in "$PDG_RESCUE_SOCKET_UNIT" "$PDG_RESCUE_SERVICE_UNIT"; do
+    if ! cmp -s "$tmp/$u" "$dst/$u" 2>/dev/null; then
+      cp -f "$tmp/$u" "$dst/$u" && changed=1
+    fi
+  done
+  rm -rf "$tmp"
+  (( changed == 1 )) || return 1
+  c_g "  救援 unit 已按新模板刷新(硬化项/停止期限等修复会在这里落到已装机器上)"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl is-active "$PDG_RESCUE_SOCKET_UNIT" >/dev/null 2>&1 \
+    && systemctl restart "$PDG_RESCUE_SOCKET_UNIT" >/dev/null 2>&1
+  return 0
+}
+
+# **真实**在监听的地址(不是 unit 文件里写的那个)。核对切换是否生效必须看这个 ——
+# 看文件只能证明"我们写对了", 证明不了"systemd 照做了"。
+_rescue_listen_addr(){
+  local a; a="$(ss -ltn 2>/dev/null | awk '{print $4}' | grep ":$PDG_RESCUE_PORT\$" | head -1)"
+  [[ -n "$a" ]] && { printf '%s' "$a"; return 0; }
+  sed -n 's/^ListenStream=//p' "$UNIT_DIR/$PDG_RESCUE_SOCKET_UNIT" 2>/dev/null | tail -1   # 没有 ss 时的兜底
+}
+
+_rescue_status(){
+  local bind sock svc fp
+  bind="$(_rescue_bind_addr || true)"
+  sock="$(systemctl is-active "$PDG_RESCUE_SOCKET_UNIT" 2>/dev/null || true)"
+  svc="$(systemctl is-active "$PDG_RESCUE_SERVICE_UNIT" 2>/dev/null || true)"
+  echo "== 救援平面 =="
+  local intent; intent="$(_rescue_intent)"
+  case "$intent" in
+    1) printf "  %-14s %s\n" "用户意图" "enabled";;
+    0) printf "  %-14s %s\n" "用户意图" "disabled(主动停用; 升级不会开回来)";;
+    *) printf "  %-14s %s\n" "用户意图" "未记录(从未部署过 —— 下次 pdg update 会按默认启用)";;
+  esac
+  printf "  %-14s %s\n" "socket unit"  "$(_rescue_socket_present && echo 已安装 || echo 缺失)"
+  # is-enabled 失败时**自己也会打印** "disabled", 再 `|| echo disabled` 就成了两行 ——
+  # 命令替换把换行原样带进 printf, status 里凭空多出一行孤零零的 disabled。
+  local sock_en; sock_en="$(systemctl is-enabled "$PDG_RESCUE_SOCKET_UNIT" 2>/dev/null | head -1)"
+  printf "  %-14s %s\n" "socket 状态"  "${sock:-unknown} / ${sock_en:-disabled}"
+  # socket activation(Accept=no)下 service 平时就是 inactive: socket 在监听, 有请求才拉起
+  # 它。把这种正常状态显示成"服务未运行", 会让人以为救援平面坏了而去反复重启 —— 真正该
+  # 报的是 failed(起过并且失败了), 那和"闲着"完全是两回事, 必须分开说。
+  case "$svc" in
+    active)   printf "  %-14s %s\n" "service 状态" "active(正在服务请求)";;
+    failed)   printf "  %-14s %s\n" "service 状态" "❌ failed(上次拉起失败 —— 需要处理; journalctl -u $PDG_RESCUE_SERVICE_UNIT 看原因)";;
+    ""|inactive) printf "  %-14s %s\n" "service 状态" "inactive(正常: 待按需拉起, socket 收到连接才启动)";;
+    *)        printf "  %-14s %s\n" "service 状态" "$svc";;
+  esac
+  local cidr_now; cidr_now="$(pdg_internal_cidr 2>/dev/null || echo '(未设)')"
+  printf "  %-14s %s\n" "来源段"       "$cidr_now(允许连进来的客户端网段)"
+  if [[ -n "$bind" ]]; then
+    printf "  %-14s %s\n" "监听地址"   "$bind → https://$bind:$PDG_RESCUE_PORT/"
+    if _rescue_bind_candidates | awk '{print $2}' | grep -qx "$bind"; then
+      printf "  %-14s %s\n" "地址在本机" "是"
+    else
+      printf "  %-14s %s\n" "地址在本机" "⚠️ 否(FreeBind 能绑上, 但地址不回来就没人连得进)"
+    fi
+    if pdg_rescue_bind_is_global "$bind"; then
+      printf "  %-14s %s\n" "地址属性"  "⚠️ 全局可路由 —— 端口暴露在该地址上, 靠 nft 来源约束 + 应用层来源校验两层兜底"
+    else
+      printf "  %-14s %s\n" "地址属性"  "私网/本地(不在公网上)"
+    fi
+    printf "  %-14s %s\n" "socket 监听" "$(ss -ltn 2>/dev/null | grep -q "$bind:$PDG_RESCUE_PORT" && echo "在 $bind:$PDG_RESCUE_PORT 上" || echo 无)"
+  else
+    printf "  %-14s %s\n" "监听地址"   "（未配置 —— 不能启用; sudo pdg rescue bind <IPv4>）"
+  fi
+  printf "  %-14s %s\n" "nft 磁盘规则" "$(_rescue_nft_count_disk 2>/dev/null || printf ?) 条(带 pdg-rescue 标记)"
+  printf "  %-14s %s\n" "nft 内核规则" "$(_rescue_nft_count_kernel 2>/dev/null || printf ?) 条"
+  printf "  %-14s %s\n" "应用层来源校验" "已启用(只认内核给的 peer 地址, 不看 X-Forwarded-For)"
+  if nft list tables 2>/dev/null | grep -q "inet pdgrescue" \
+     || grep -q "table inet pdgrescue" /etc/nftables.conf 2>/dev/null; then
+    printf "  %-14s %s\n" "遗留独立表"  "⚠️ 检出 inet pdgrescue —— 旧设计残留, 会被 doctor 判冲突; 跑一次 pdg rescue enable/disable 清掉"
+  else
+    printf "  %-14s %s\n" "遗留独立表"  "无"
+  fi
+  # 凭据只报"齐不齐"与指纹, **绝不打印 token 或私钥**
+  for f in "$PDG_RESCUE_TOKEN" "$PDG_RESCUE_CERT" "$PDG_RESCUE_KEY"; do
+    printf "  %-14s %s\n" "$(basename "$f")" "$([[ -s "$f" ]] && echo "在($(stat -c %a "$f" 2>/dev/null))" || echo 缺失)"
+  done
+  fp="$(python3 /opt/pdg-bot/rescue_cred.py fingerprint 2>/dev/null || true)"
+  printf "  %-14s %s\n" "证书指纹" "${fp:-读取失败}"
+  printf "  %-14s %s\n" "指纹核对" "把上面这串带到手机上比对浏览器里的证书详情(见 docs/rescue-plane-access.md)"
+  # 渲染出来的监听地址与当前内网段是否还对得上 —— detect-cidr 换过段之后它会过期
+  local cidr rendered
+  cidr="$(pdg_internal_cidr 2>/dev/null || true)"
+  rendered="$(sed -n 's/^ListenStream=//p' "$UNIT_DIR/$PDG_RESCUE_SOCKET_UNIT" 2>/dev/null | tail -1)"
+  printf "  %-14s %s\n" "渲染监听" "${rendered:-（unit 未安装）}"
+  if [[ -n "$rendered" && -n "$bind" ]]; then
+    [[ "$rendered" == "$bind:$PDG_RESCUE_PORT" ]] \
+      && printf "  %-14s %s\n" "地址一致性" "与当前内网段($cidr)一致" \
+      || printf "  %-14s %s\n" "地址一致性" "⚠️ 与当前内网段($cidr)不一致, 建议重跑 pdg rescue enable"
+  fi
+  if grep -qE 'ListenStream=(0\.0\.0\.0|\[?::\]?):' "$UNIT_DIR/$PDG_RESCUE_SOCKET_UNIT" 2>/dev/null; then
+    printf "  %-14s %s\n" "通配监听" "⚠️ 检出通配地址 —— 这是严重问题, 请立刻 pdg rescue disable"
+  else
+    printf "  %-14s %s\n" "通配监听" "无(只绑内网地址)"
+  fi
+  # 运行模块是否完整: 缺一个救援页就会有整块能力标成"旧核心不支持"
+  local _miss_mods=""
+  for f in $PDG_RESCUE_CLOSURE; do
+    [[ -f "/opt/pdg-bot/$f" ]] || _miss_mods="$_miss_mods $f"
+  done
+  printf "  %-14s %s\n" "运行模块" "$([[ -z "$_miss_mods" ]] && echo 完整 || echo "缺:$_miss_mods")"
+  return 0
+}
+
 cmd_platform(){
   need_root platform
   local p="${1:-}" cur; cur="$(_pdg_platform)"
@@ -2548,5 +3300,9 @@ case "${1:-menu}" in
   platform)      shift || true; cmd_platform "${1:-}";;
   hijack-mode)   shift || true; cmd_hijack_mode "${1:-}";;
   uninstall|rm)  shift || true; cmd_uninstall "${1:-}";;
-  *) echo "用法: pdg [menu|status|doctor [--json|--deep]|update [--dry-run]|snapshot|rollback [n]|token|restart|log [n]|traffic|ios(仅 iOS)|report [--redact-ip|--full]|detect-cidr|platform <ios|android>|hijack-mode <all|gfw>|migrate|migrate-fw|tx <list|show|recover|abort>|uninstall [--purge]]";;
+  # 必须 shift + "$@": 只传 "$2" 会把子命令后面的参数全丢掉 —— `pdg rescue bind 1.2.3.4`
+  # 拿不到地址, 而 `pdg rescue rotate cert` 会因为参数丢失退化成默认的 token 轮换:
+  # 用户要求换证书, 实际换掉的是 token(会话全断, 指纹却没变)。
+  rescue)        shift || true; cmd_rescue "$@";;
+  *) echo "用法: pdg [menu|status|doctor [--json|--deep]|update [--dry-run]|snapshot|rollback [n]|token|restart|log [n]|traffic|ios(仅 iOS)|report [--redact-ip|--full]|detect-cidr|platform <ios|android>|hijack-mode <all|gfw>|migrate|migrate-fw|tx <list|show|recover|abort>|rescue <enable|disable|status|fingerprint|bind <IPv4>|rotate-token|rotate-cert>|uninstall [--purge]]";;
 esac

@@ -302,8 +302,16 @@ def serve_dir(d):
 
 
 def mihomo_bin():
-    """有真 mihomo 就用它做内核校验; 没有则返回 None(该断言跳过并说明)。"""
-    return shutil.which("mihomo")
+    """钉死版内核: 走共享 helper(tests/mihomobin.py), 版本核对在它里面。
+
+    以前直接 `shutil.which("mihomo")` —— 捡到机器上任意一版都算数, 而这条断言的意义正是
+    "钉死版认不认这份规则集"。找不到返回 None(该断言跳过并说明), 版本不符则抛错。"""
+    sys.path.insert(0, os.path.join(ROOT, "tests"))
+    import mihomobin
+    try:
+        return mihomobin.find()[0]
+    except mihomobin.MihomoMissing:
+        return None
 
 
 _ZSTD_MODS = ("compression.zstd", "pyzstd", "zstandard")

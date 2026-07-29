@@ -17,6 +17,51 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
+class PycacheIsolation:
+    """负控专用: 让每次"改坏源码 → 跑 → 恢复 → 再跑"都用**独有且为空**的字节码缓存。
+
+    CPython 默认的 __pycache__ 按**秒级 mtime + 文件长度**判定源码是否变过。负控恰恰在同一秒
+    内把源码改成等长内容, 判据完全命中旧记录 → 跑的是上一版字节码, 于是"负控通过"验的其实是
+    没被改过的旧代码; 恢复源码后同理会继续读坏版本。这不是理论风险, 是本项目真踩过的一次
+    假结果。
+
+    用法:
+        with PycacheIsolation(work_dir) as pc:
+            run_child(env=pc.env())      # 第一次
+            pc.reset()                   # 每次负控前清空, 保证"空"
+            run_child(env=pc.env())      # 改坏之后
+    退出时只删自己那一个目录, 不碰仓库里的 __pycache__。
+    """
+
+    def __init__(self, parent):
+        self.dir = tempfile.mkdtemp(prefix="pycache.", dir=parent)
+
+    def env(self, base=None):
+        e = dict(base if base is not None else os.environ)
+        e["PYTHONPYCACHEPREFIX"] = self.dir
+        return e
+
+    def reset(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+        os.makedirs(self.dir, exist_ok=True)
+
+    def files(self):
+        out = []
+        for root, _d, names in os.walk(self.dir):
+            out += [os.path.join(root, n) for n in names]
+        return out
+
+    def close(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+
 def load_tx(env):
     """按给定环境变量加载事务核心(模块级常量会读环境, 故每个沙箱重新导入一次)。"""
     for k, v in env.items():

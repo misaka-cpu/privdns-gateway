@@ -92,7 +92,9 @@ source "$REPO_DIR/lib/versions.sh"
 # shellcheck source=lib/units.sh
 source "$REPO_DIR/lib/units.sh"   # systemd unit 单一事实源(与 pdg 迁移共用, 免漂移)
 # shellcheck source=lib/mosdns.sh
-source "$REPO_DIR/lib/mosdns.sh" # mosdns 劫持形态单一事实源(与 hijack-mode/迁移共用)
+source "$REPO_DIR/lib/mosdns.sh"
+# shellcheck source=lib/modules.sh
+source "$REPO_DIR/lib/modules.sh"  # 运行模块单一事实源(与 pdg update 共用) # mosdns 劫持形态单一事实源(与 hijack-mode/迁移共用)
 # shellcheck source=lib/cidr.sh
 source "$REPO_DIR/lib/cidr.sh"   # 内网卡段校验 + 抓包/手输并行(与 pdg detect-cidr 共用)
 
@@ -537,26 +539,15 @@ _dir_txn_record(){
 _dir_txn_record /etc/mosdns /etc/sing-box /etc/mihomo /opt/pdg-bot /etc/privdns-gateway \
   || die "目录备份失败, 未改动任何文件。"
 install -d /etc/mosdns/rules /etc/sing-box/rs /opt/pdg-bot "$CERT_DIR" /etc/letsencrypt/renewal-hooks/deploy /etc/systemd/journald.conf.d
-install -m755 "$REPO_DIR"/deploy/bot/pdg-bot.py            /opt/pdg-bot/bot.py
-install -m755 "$REPO_DIR"/deploy/bot/parse-geosite.py     /opt/pdg-bot/
-install -m755 "$REPO_DIR"/deploy/bot/update-rules.sh      /opt/pdg-bot/
-install -m755 "$REPO_DIR"/deploy/bot/scheduled-update.sh  /opt/pdg-bot/
-install -m755 "$REPO_DIR"/deploy/bot/healthcheck.py      /opt/pdg-bot/
-install -m755 "$REPO_DIR"/deploy/bot/checks.py           /opt/pdg-bot/
-install -m755 "$REPO_DIR"/deploy/bot/nftscan.py          /opt/pdg-bot/
-install -m755 "$REPO_DIR"/deploy/bot/pdgtx.py            /opt/pdg-bot/
-install -m755 "$REPO_DIR"/deploy/bot/nftmerge.py         /opt/pdg-bot/
-install -m755 "$REPO_DIR"/deploy/bot/doctor.py           /opt/pdg-bot/
-install -m755 "$REPO_DIR"/deploy/bot/report.py           /opt/pdg-bot/
-install -m755 "$REPO_DIR"/deploy/bot/sb2mihomo.py        /opt/pdg-bot/
-# iOS 专属组件(MITM 模块 / :81 探测 / 描述文件模板)只在 iOS 平台安装; Android 不装。
-if [[ "$PLATFORM" == ios ]]; then
-  install -m755 "$REPO_DIR"/deploy/bot/mitm_ca.py          /opt/pdg-bot/
-  install -m755 "$REPO_DIR"/deploy/bot/mitm_server.py      /opt/pdg-bot/
-  install -m755 "$REPO_DIR"/deploy/bot/mitm_wloc.py        /opt/pdg-bot/
-  install -m755 "$REPO_DIR"/deploy/ios/probe81.py           /opt/pdg-bot/
-  install -m644 "$REPO_DIR"/deploy/ios/pdg-dot-ondemand.mobileconfig.tmpl /opt/pdg-bot/pdg-dot.mobileconfig.tmpl
-fi
+# ── 项目静态文件: 全部走 lib/modules.sh 这份**单一事实源** ────────────────
+# 全新安装、`pdg update` 与 uninstall 读同一份清单, 于是不可能出现"装机装了、升级漏了、
+# 卸载没删"这种缺口。少装一个的后果不是报错, 是整块能力静默降级(救援页标"旧核心不支持")。
+#
+# 以前 bot.py / parse-geosite.py / update-rules.sh / scheduled-update.sh / healthcheck.py
+# 与五个 iOS 组件是在这里各写一行 `install -m755 …` 装的, 不在任何清单里 —— 于是 update
+# 永远不同步它们, 卸载也不删。平台专属那部分由 pdg_platform_modules 按 $PLATFORM 取。
+pdg_install_runtime_modules "$REPO_DIR" /opt/pdg-bot "$PLATFORM" \
+  || die "运行模块安装失败, 未继续(避免新旧混装)。"
 install -m755 "$REPO_DIR"/deploy/cert/proxy-gateway-open-cert-http.sh     /usr/local/bin/
 install -m755 "$REPO_DIR"/deploy/cert/proxy-gateway-restore-firewall.sh   /usr/local/bin/
 install -m755 "$REPO_DIR"/deploy/cert/99-reload-cert.deploy-hook.sh       /etc/letsencrypt/renewal-hooks/deploy/99-pdg-cert.sh
@@ -578,10 +569,17 @@ fi
 chown -R root:root /opt/privdns-gateway 2>/dev/null || true
 git config --system --get-all safe.directory 2>/dev/null | grep -qx '/opt/privdns-gateway' \
   || git config --system --add safe.directory /opt/privdns-gateway 2>/dev/null || true
-: > /etc/mosdns/rules/custom_direct.txt
-: > /etc/mosdns/rules/custom_hijack.txt   # bot 指到出口的域名(必须被 mosdns 劫持才会进代理)
-: > /etc/mosdns/rules/unlock.txt          # WDA 解锁域名集(空=休眠; bot『🔓 解锁走 WDA』填充)
-: > /etc/mosdns/rules/mitm_hijack.txt     # MITM 接管域名集(空=休眠; iOS 启用 MITM 插件时填充)
+# 规则集: **存在就保留**。重装的语义是"重新部署程序", 不是"把用户填的域名清空" ——
+# 这四个文件是 bot 指到出口的域名、WDA 解锁域名、以及 WLOC/MITM 的接管域名, 清掉之后
+# 分流与 WLOC 会静默退化, 而用户以为只是重装了一下程序(.200 实机上就这么丢过 WLOC 域名)。
+# shellcheck source=lib/preserve.sh
+source "$REPO_DIR/lib/preserve.sh"
+_kept_rules=(); _new_rules=()
+for _rf in custom_direct custom_hijack unlock mitm_hijack; do
+  if pdg_keep_or_init "/etc/mosdns/rules/$_rf.txt"; then _kept_rules+=("$_rf"); else _new_rules+=("$_rf"); fi
+done
+(( ${#_kept_rules[@]} )) && c_g "保留已有规则集: ${_kept_rules[*]}"
+(( ${#_new_rules[@]} ))  && echo "新建空规则集: ${_new_rules[*]}"
 
 # 内存模式(克制版): PDG_LOWMEM=auto(默认)|1|0; MemTotal ≤ 1300MiB 判低内存。持久化到 profile.env。
 # 只调确认安全的项: mosdns cache(8192/2048)+ journald 上限(50M/20M)。不动 sysctl/swap/MemoryMax。
@@ -614,10 +612,15 @@ install -d -m700 /etc/privdns-gateway
 # 读不到就按默认 all 把 mosdns 形态改回去 —— 装机时选的 gfw 悄悄没了。
 _prof_tmp="$(mktemp /etc/privdns-gateway/.profile.env.XXXXXX)" || die "创建 profile.env 临时文件失败"
 {
-  printf 'PDG_LOWMEM=%s\nPDG_HIJACK_MODE=%s\nPDG_PLATFORM=%s\n' "$LOWMEM" "$HIJACK_MODE" "$PLATFORM"
+  # PDG_INTERNAL_CIDR 是内网卡来源段的**唯一真源**(5.2/T7): nft、mosdns、救援服务的监听
+  # 地址、doctor 全都从它读或由它渲染。以前只把这个值渲染进 nft 与 mosdns 两份配置, 读回时
+  # 又从 mosdns 里正则抠 —— 于是"当前网段是多少"这件事没有权威答案, 而 mosdns 配置恰恰是
+  # 救援场景里可能已经损坏的那一份。
+  printf 'PDG_LOWMEM=%s\nPDG_HIJACK_MODE=%s\nPDG_PLATFORM=%s\nPDG_INTERNAL_CIDR=%s\n' \
+    "$LOWMEM" "$HIJACK_MODE" "$PLATFORM" "$INTERNAL_CIDR"
   if [[ -f /etc/privdns-gateway/profile.env ]]; then
     # grep -v 在"旧文件只有受管键"时没有输出 → 返回 1, 不能让它把整段判成失败
-    grep -vE '^[[:space:]]*(PDG_LOWMEM|PDG_HIJACK_MODE|PDG_PLATFORM)=' \
+    grep -vE '^[[:space:]]*(PDG_LOWMEM|PDG_HIJACK_MODE|PDG_PLATFORM|PDG_INTERNAL_CIDR)=' \
       /etc/privdns-gateway/profile.env || true
   fi
 } > "$_prof_tmp" || { rm -f "$_prof_tmp"; die "写 profile.env 失败(磁盘满/只读?)"; }
@@ -627,19 +630,107 @@ mv -f "$_prof_tmp" /etc/privdns-gateway/profile.env \
 rm -f /etc/privdns-gateway/profile.env.new          # 清掉历史版本留下的半成品
 grep -q "^PDG_HIJACK_MODE=$HIJACK_MODE$" /etc/privdns-gateway/profile.env \
   || die "profile.env 未写入预期的 PDG_HIJACK_MODE"
+# 真源必须**确实**落盘: 渲染进 nft/mosdns 的值与 profile.env 记的值不是同一个来源的话,
+# 救援服务会绑到一个防火墙没放行的地址上, 而且没人看得出为什么。
+grep -q "^PDG_INTERNAL_CIDR=$INTERNAL_CIDR$" /etc/privdns-gateway/profile.env \
+  || die "profile.env 未写入预期的 PDG_INTERNAL_CIDR"
 printf '%s\n' "$PLATFORM" > /etc/privdns-gateway/platform
+
+# 救援平面的端口/路径常量来自 lib/rescue.sh(单一事实源, 不在这里另写字面量)。
+# shellcheck source=lib/rescue.sh
+source "$REPO_DIR/lib/rescue.sh"
+# 监听地址与来源段是**两件事**(5.2/10b 实机结论):
+#   INTERNAL_CIDR = 允许连进来的客户端网段(运营商内网卡);
+#   RESCUE_BIND   = 救援 socket 绑的本机地址。
+# 真实网关上后者往往不在前者里 —— 早期版本"从来源段里挑一个本机地址"在那种机器上要么什么
+# 都挑不到(救援平面装了也用不了), 要么挑中一个恰好落在段内的**别的**接口地址(实机上就捡到过
+# 一个测试用的 veth 地址, 于是监听开在了一个没人能连的地方)。所以: 显式值优先, 唯一候选才
+# 自动决定, 含糊时**问人**, 非交互就留空并保持停用。绝不用 0.0.0.0/::。
+RESCUE_BIND="${PDG_RESCUE_BIND:-}"
+[[ -z "$RESCUE_BIND" ]] && RESCUE_BIND="$(pdg_rescue_bind 2>/dev/null || true)"   # 已有配置沿用
+if [[ -n "$RESCUE_BIND" ]] && ! pdg_rescue_bind_valid "$RESCUE_BIND"; then
+  c_y "PDG_RESCUE_BIND=$RESCUE_BIND 不是合法的 IPv4 监听地址(禁止主机名/0.0.0.0/广播/组播), 忽略。"
+  RESCUE_BIND=""
+fi
+if [[ -z "$RESCUE_BIND" ]]; then
+  mapfile -t _rb_in < <(python3 - "$INTERNAL_CIDR" <<'PYBIND'
+import ipaddress, subprocess, sys
+try:
+    net = ipaddress.ip_network(sys.argv[1], strict=False)
+except Exception:
+    sys.exit(0)
+out = subprocess.run(["ip", "-4", "-o", "addr", "show", "scope", "global"],
+                     capture_output=True, text=True).stdout
+for line in out.splitlines():
+    parts = line.split()
+    for i, tok in enumerate(parts):
+        if tok == "inet" and i + 1 < len(parts):
+            try:
+                ip = ipaddress.ip_address(parts[i + 1].split("/")[0])
+            except ValueError:
+                continue
+            if ip in net:
+                print(ip)
+PYBIND
+)
+  if (( ${#_rb_in[@]} == 1 )); then
+    RESCUE_BIND="${_rb_in[0]}"          # 来源段内**恰好一个**本机地址 → 沿用旧的安全路径
+  else
+    mapfile -t _rb_all < <(ip -4 -o addr show scope global 2>/dev/null | awk '{split($4,a,"/"); print $2" "a[1]}')
+    if [[ -n "$NONINT" ]]; then
+      c_y "未指定救援监听地址(PDG_RESCUE_BIND), 且来源段 $INTERNAL_CIDR 内有 ${#_rb_in[@]} 个本机地址 —— 不猜。"
+      c_y "  救援平面照常装上但**保持停用**。本机可选地址:"
+      printf '     %s\n' "${_rb_all[@]}"
+      c_y "  设好即可启用: sudo pdg rescue bind <IPv4>"
+    else
+      echo
+      c_y "救援平面要绑在哪个本机地址上?(它与来源段 $INTERNAL_CIDR 是两件事: 来源段管谁能连)"
+      local_i=1
+      for _l in "${_rb_all[@]}"; do echo "   $local_i) $_l"; local_i=$((local_i+1)); done
+      echo "   0) 暂不设置(装上但停用, 之后用 sudo pdg rescue bind <IPv4>)"
+      read -r -p "选择 [0-$(( ${#_rb_all[@]} ))]: " _pick || _pick=0
+      if [[ "$_pick" =~ ^[0-9]+$ ]] && (( _pick >= 1 && _pick <= ${#_rb_all[@]} )); then
+        RESCUE_BIND="$(awk '{print $2}' <<<"${_rb_all[$((_pick-1))]}")"
+      fi
+    fi
+  fi
+fi
+if [[ -n "$RESCUE_BIND" ]]; then
+  pdg_rescue_bind_is_global "$RESCUE_BIND" \
+    && c_y "⚠️ 救援监听地址 $RESCUE_BIND 是全局可路由地址: 端口会暴露在该地址上, 由 nft 来源约束与应用层来源校验两层兜底。"
+  # 落盘到真源。不落的话 pdg / 救援服务下次读不到, 又会退回"从来源段猜"的老路 ——
+  # 装机时渲染进 unit 的地址与后续读到的地址必须是同一个, 否则没人看得出为什么连不上。
+  _rb_tmp="$(mktemp /etc/privdns-gateway/.profile.env.XXXXXX)" || die "创建 profile.env 临时文件失败"
+  { printf 'PDG_RESCUE_BIND=%s\n' "$RESCUE_BIND"
+    grep -vE '^[[:space:]]*PDG_RESCUE_BIND=' /etc/privdns-gateway/profile.env 2>/dev/null || true
+  } > "$_rb_tmp" || { rm -f "$_rb_tmp"; die "写 PDG_RESCUE_BIND 失败"; }
+  chmod 600 "$_rb_tmp"; mv -f "$_rb_tmp" /etc/privdns-gateway/profile.env || die "落盘 PDG_RESCUE_BIND 失败"
+  grep -q "^PDG_RESCUE_BIND=$RESCUE_BIND$" /etc/privdns-gateway/profile.env \
+    || die "profile.env 未写入预期的 PDG_RESCUE_BIND"
+fi
 
 render(){ sed -e "s|__SERVER_IP__|$SERVER_IP|g" -e "s|__INTERNAL_CIDR__|$INTERNAL_CIDR|g" \
               -e "s|__CERT_DIR__|$CERT_DIR|g"   -e "s|__SSH_PORT__|$SSH_PORT|g" \
               -e "s|__MOSDNS_CACHE__|$MOSDNS_CACHE|g" -e "s|__JOURNALD_MAXUSE__|$JOURNALD_MAXUSE|g" \
-              -e "s|__HIJACK_SET_FILE__|$HIJACK_SET_FILE|g" "$1"; }
+              -e "s|__HIJACK_SET_FILE__|$HIJACK_SET_FILE|g" \
+              -e "s|__RESCUE_PORT__|$PDG_RESCUE_PORT|g" \
+              -e "s|__RESCUE_BIND__|$RESCUE_BIND|g" "$1"; }
 
 render "$REPO_DIR/deploy/mosdns/config.yaml"          > /etc/mosdns/config.yaml
 # 模板自带 gfw 那道劫持门; all 模式要去掉它 —— all 的语义是"不是国内就劫持"(排除式),
 # 留着门会退化成"只劫持 geosite 策展分类里的域名"。
 _mosdns_hijack_shape "$HIJACK_MODE" /etc/mosdns/config.yaml "$HIJACK_SET_FILE" >/dev/null \
   || die "mosdns 劫持形态渲染失败"
-render "$REPO_DIR/deploy/singbox/config.json.tmpl"    > /etc/sing-box/config.json   # 始终是 bot 的数据模型(mihomo 模式下也由它渲染)
+# 数据模型(出口 / 分流 / 默认出口的唯一数据源): 已有且有效 → **保留**, 绝不拿模板盖回去。
+# 拿模板覆盖等于把用户所有出口与规则换成默认值, 而它恰恰是最难重建的那份数据。
+if pdg_model_ok /etc/sing-box/config.json; then
+  c_g "保留已有数据模型 /etc/sing-box/config.json($(python3 -c "import json;print(len(json.load(open('/etc/sing-box/config.json'))['outbounds']))" 2>/dev/null || echo '?') 个出口, 出口/分流不动)"
+elif [[ -e /etc/sing-box/config.json ]]; then
+  die "已有 /etc/sing-box/config.json 解析不出出口 —— 拒绝用模板覆盖它(那会把你的出口与分流换成默认值)。
+   先修好或移走它再重装: cp -a /etc/sing-box/config.json /root/config.json.bak && rm /etc/sing-box/config.json"
+else
+  render "$REPO_DIR/deploy/singbox/config.json.tmpl"  > /etc/sing-box/config.json   # 全新安装才渲染
+fi
 # iOS: 模板含 GMS(in-gms-5228/5229/5230)入站, iOS 走 APNs 不需要 → 删掉, 让 canonical model 从一开始就无 GMS。
 if [[ "$PLATFORM" == ios ]]; then
   python3 - /etc/sing-box/config.json <<'PY'
@@ -683,7 +774,20 @@ import json, os, sys
 sys.path.insert(0, "$REPO_DIR/deploy/bot")
 import sb2mihomo
 model = json.load(open("/etc/sing-box/config.json"))   # config.json 仍是核无关的数据模型
-cfg, _ = sb2mihomo.singbox_to_mihomo(model, redir_port=7893)
+# WLOC/MITM 的接管域名要一起带上。这些域名的真源是 /etc/mosdns/rules/mitm_hijack.txt(重装
+# 会保留它), 但派生出来的 mihomo 配置里那条 MITM-OUT 出站与 gs-loc 路由是**渲染时**加的 ——
+# 渲染时不传, 重装完 doctor 立刻报"mihomo 缺 MITM-OUT 出站或 gs-loc 路由", WLOC 静默失效
+# (.200 实机重装后就是这样)。域名文件为空 = WLOC 休眠, 那时本来就不该有这条出站。
+_mitm = []
+try:
+    with open("/etc/mosdns/rules/mitm_hijack.txt", encoding="utf-8") as _fh:
+        for _l in _fh:
+            _l = _l.strip()
+            if _l and not _l.startswith("#"):
+                _mitm.append(_l.split(":", 1)[1] if _l.startswith("domain:") else _l)
+except OSError:
+    pass
+cfg, _ = sb2mihomo.singbox_to_mihomo(model, redir_port=7893, mitm_domains=_mitm or None)
 with open("/etc/mihomo/config.yaml", "w") as f:
     json.dump(cfg, f, ensure_ascii=False, indent=2)   # JSON 即合法 YAML
 os.chmod("/etc/mihomo/config.yaml", 0o600)
@@ -693,7 +797,13 @@ chmod 644 /etc/systemd/system/pdg-bot.service        # 不再含 token (token �
 
 # token / 允许 id 写入受限的 bot.env (目录 700 / 文件 600), 不进 unit 也不进版本库
 install -d -m700 /etc/privdns-gateway
-( umask 077; printf 'PDG_BOT_TOKEN=%s\nPDG_BOT_ALLOWED=%s\n' "$BOT_TOKEN" "$ALLOWED_IDS" > /etc/privdns-gateway/bot.env )
+# 已有 token 就保留 —— 重装不该把 Telegram 凭据清掉(非交互重装时 BOT_TOKEN 往往是空的,
+# 旧写法会拿空值把它覆盖, 管理 bot 就此失联)。显式传了新 token 才更新。
+if [[ -z "${BOT_TOKEN:-}" ]] && pdg_bot_env_ok /etc/privdns-gateway/bot.env; then
+  c_g "保留已有 bot.env(Telegram token 与允许 id 不动)"
+else
+  ( umask 077; printf 'PDG_BOT_TOKEN=%s\nPDG_BOT_ALLOWED=%s\n' "$BOT_TOKEN" "$ALLOWED_IDS" > /etc/privdns-gateway/bot.env )
+fi
 chmod 600 /etc/privdns-gateway/bot.env
 install -m644 "$REPO_DIR"/deploy/bot/pdg-rules-update.service /etc/systemd/system/
 install -m644 "$REPO_DIR"/deploy/bot/pdg-rules-update.timer   /etc/systemd/system/
@@ -775,6 +885,28 @@ systemctl enable --now mosdns "$CORE_SVC" >/dev/null 2>&1 || true
 # pdg-probe81 / pdg-mitm 仅 iOS: Android 不启 :81 探测、不起 MITM 服务。
 [[ "$PLATFORM" == ios ]] && { systemctl enable --now pdg-probe81 >/dev/null 2>&1 || true
                              systemctl enable --now pdg-mitm >/dev/null 2>&1 || true; }
+# ── 救援平面: 凭据 + unit + 默认启用 ──────────────────────────────────────
+# 默认启用是已拍板的方案(T5): 它存在的意义就是"别的都不通时还能进去", 而需要它的那一刻
+# 用户往往已经进不去 SSH 了 —— 那时候再让他去开是开不了的。
+install -d -m700 "$PDG_RESCUE_DIR"
+# ensure: 缺什么补什么, **已有的一律不动** —— 更新时绝不重生成 token 或证书。
+if python3 /opt/pdg-bot/rescue_cred.py ensure "${RESCUE_BIND:-}" >/dev/null 2>&1; then
+  c_g "救援平面凭据就绪(token + 自签证书)。"
+else
+  c_y "救援平面凭据生成失败 —— 服务暂不可用, 修好后跑 sudo pdg rescue enable。"
+fi
+# unit 用模板渲染(端口/绑定地址来自 lib/rescue.sh 与上面探到的内网地址)
+render "$REPO_DIR/deploy/rescue/pdg-rescue.socket"  > /etc/systemd/system/pdg-rescue.socket
+render "$REPO_DIR/deploy/rescue/pdg-rescue.service" > /etc/systemd/system/pdg-rescue.service
+chmod 644 /etc/systemd/system/pdg-rescue.socket /etc/systemd/system/pdg-rescue.service
+systemctl daemon-reload
+if [[ -n "$RESCUE_BIND" ]]; then
+  systemctl enable --now pdg-rescue.socket >/dev/null 2>&1 \
+    && c_g "救援平面已启用: https://$RESCUE_BIND:$PDG_RESCUE_PORT/(仅内网卡可达)" \
+    || c_y "救援平面 socket 起不来, 装完可用 sudo pdg rescue status 查。"
+else
+  systemctl enable pdg-rescue.socket >/dev/null 2>&1 || true   # 开机自启, 现在还没地址可绑
+fi
 systemctl enable --now pdg-rules-update.timer >/dev/null 2>&1 || true
 systemctl enable --now pdg-health.timer >/dev/null 2>&1 || true
 if [[ -n "$BOT_TOKEN" && -n "$ALLOWED_IDS" ]]; then
@@ -787,6 +919,22 @@ _write_resolv "nameserver 127.0.0.1" "nameserver 1.1.1.1"
 # ── 9. 防火墙 ──
 c_g "应用防火墙…"
 systemctl enable nftables >/dev/null 2>&1 || true
+# 救援平面已启用的机器: 渲染出来的这份配置里**没有**那条带标记的救援放行(模板不含它,
+# 它是 enable 时注入的)。直接应用等于把门关上 —— socket 还在监听、防火墙已经不放行, 而
+# 下一次 pdg update 的迁移会发现不一致、试图修复、失败之后把整次更新回滚(.200 实机实测)。
+# 所以: 启用中就在应用之前把规则补回候选, 一次应用到位, 不留无放行的窗口。
+if [[ "$(pdg_profile_get PDG_RESCUE_ENABLED 2>/dev/null || echo)" == 1 && -n "$RESCUE_BIND" ]]; then
+  _rc_cand="$(mktemp)"
+  if python3 "$REPO_DIR/deploy/bot/rescue_nft.py" "$INTERNAL_CIDR" "$PDG_RESCUE_PORT" \
+       "$RESCUE_BIND" < /etc/nftables.conf > "$_rc_cand" 2>/dev/null \
+     && nft -c -f "$_rc_cand" >/dev/null 2>&1; then
+    cat "$_rc_cand" > /etc/nftables.conf
+    c_g "救援放行已随防火墙一起应用(救援平面处于启用状态)"
+  else
+    c_y "⚠️ 救援放行没能注入防火墙候选 —— 装完请跑 sudo pdg rescue enable 复查。"
+  fi
+  rm -f "$_rc_cand"
+fi
 nft -f /etc/nftables.conf
 
 # ── 提交点前: 确认核心服务"持续"起来了 ──

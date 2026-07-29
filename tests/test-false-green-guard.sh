@@ -125,6 +125,42 @@ if git -C "$ROOT" show HEAD~0:tests/e2e-config-transaction.sh > "$OLDF" 2>/dev/n
     || bad "负控失败: 扫描连已知有问题的写法都认不出来"
 fi
 
+# ── 故障注入必须真命中, 且遍历必须真的覆盖 manifest 全集 ────────────────────
+# 上一轮的教训: test-update-faults.sh 的注入按 `install … /opt/pdg-bot/` 这种**命令行字面
+# 形态**匹配。生产侧改成显式目标名之后注入全部打空, 而测试照样全绿 —— 五条"iOS 组件装失败
+# 必须回滚"一条都没真跑过。所以守卫要盯两件事: 注入命中要有记录, 命中数要覆盖 manifest 全集。
+echo; echo "── 故障注入命中率(行为验证, 不是字符串检查) ──"
+# 主要证据是**真跑一次**: 让 test-update-faults.sh 进入受控的"故意打空"自检场景 ——
+# 指定一个不存在的受管目标名, fake install 不会产生命中记录, 于是它必须判自己失败。
+# 靠 grep 某个字符串在不在文件里, 只能证明那行字还在, 证明不了守卫真的会拦。
+_u="$ROOT/tests/test-update-faults.sh"
+_res="$(mktemp)"
+if PDG_FAULT_SELFTEST=1 PDG_FAULT_RESULT="$_res" timeout 600 bash "$_u" >/dev/null 2>&1; then
+  bad "「故意打空」的自检场景竟然返回 0 —— 注入未命中被当成了通过"
+else
+  ok "「故意打空」的自检场景返回非 0(注入未命中 → 判失败)"
+fi
+# 必须是 injection-not-hit, 不能是命令不存在/文件不存在/环境损坏之类的其它非零。
+if grep -q 'RESULT=injection-not-hit' "$_res" 2>/dev/null; then
+  ok "失败原因是结构化的 injection-not-hit(不是命令缺失或环境损坏)"
+else
+  bad "拿不到 injection-not-hit 标记, 非零可能来自别的异常: $(head -c 120 "$_res" 2>/dev/null)"
+fi
+rm -f "$_res"
+# 辅助(降级为次要证据): 遍历必须真的覆盖 manifest 全集的首尾。
+_n=$(bash -c 'source "'"$ROOT"'/lib/modules.sh"; pdg_platform_modules ios | grep -c .')
+grep -qE "FAIL_NTH=1\"" "$_u" && grep -qE "FAIL_NTH=$_n\"" "$_u" \
+  && ok "辅助: 头(#1)与尾(#$_n)都有注入用例, 覆盖 manifest 全集" \
+  || bad "没有覆盖 manifest 首尾(全集 $_n 项)"
+
+echo; echo "── 部署断言必须是行为而非源码字面 ──"
+_pi="$ROOT/tests/test-platform-install.sh"
+grep -qE "grep -q 'mitm_ca\.py\|" "$_pi" \
+  && bad "test-platform-install 仍靠 grep 某一行安装源码证明部署" \
+  || ok "test-platform-install 不再用源码字面证明部署"
+grep -q 'pdg_install_runtime_modules "\$ROOT"' "$_pi" \
+  && ok "改为真跑部署函数并核对内容/mode/幂等" || bad "没有真跑部署"
+
 echo "────────────────────────────────────────"
 echo "通过 $pass, 失败 $nfail"
 [[ "$nfail" == 0 ]]

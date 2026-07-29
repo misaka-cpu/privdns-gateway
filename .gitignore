@@ -22,3 +22,6 @@ config/pdg.local.conf
 *.pem
 *.key
 tls/
+
+# 测试用钉死版内核(prepare-mihomo.sh 下载并校验 SHA256 后放这儿, 不入库)
+tests/.bin/

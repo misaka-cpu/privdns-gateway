@@ -19,7 +19,22 @@ E2E_PASS=0; E2E_FAIL=0
 ok(){ echo "[OK]   $1"; E2E_PASS=$((E2E_PASS+1)); }
 bad(){ echo "[FAIL] $1"; E2E_FAIL=$((E2E_FAIL+1)); }
 e2e_summary(){ echo "────────────────────────────────────────"; echo "通过 $E2E_PASS, 失败 $E2E_FAIL"; [[ "$E2E_FAIL" == 0 ]]; }
-e2e_skip(){ echo "[SKIP] $1"; echo "────────────────────────────────────────"; echo "通过 0, 失败 0(已跳过)"; exit 0; }
+# 缺能力时怎么办, 取决于**在哪跑**:
+#   · 开发者本机偶尔没网、拉不到内核 → 记 [SKIP] 并退 0 是合理的, 否则没法干活;
+#   · CI 或 PDG_TEST_STRICT=1 → 必须 FAIL。这里跳过的都是"取不到真二进制"这类前提,
+#     跳过之后整条用例一个断言都不跑, 退 0 就是零断言假绿 —— 而 CI 上没人会去看
+#     "通过 0, 失败 0" 这行字, 只会看到一个绿勾。
+e2e_skip(){
+  echo "[SKIP] $1"
+  echo "────────────────────────────────────────"
+  if [[ -n "${PDG_TEST_STRICT:-}" && "${PDG_TEST_STRICT}" != "0" ]] || [[ "${CI:-}" == "true" ]]; then
+    echo "严格模式(PDG_TEST_STRICT/CI): 缺必需前提 → 判失败, 不拿 SKIP 冒充通过"
+    echo "通过 0, 失败 1(前提缺失)"
+    exit 1
+  fi
+  echo "通过 0, 失败 0(已跳过)"
+  exit 0
+}
 
 # 沙盒里的仓库文件未必归当前 uid(CI 容器 job: 工作区归 runner uid, 容器内是 root),
 # git 会以 "dubious ownership" 拒绝一切操作 —— update 那条 e2e 连 tag 都读不到。
@@ -68,6 +83,93 @@ e2e_reset_box(){
   hash -r 2>/dev/null || true
 }
 
+# ── 一次性沙箱的硬门 ────────────────────────────────────────────────────────
+# 为什么需要它: `PDG_E2E_ISOLATED=1` + root 时脚本直接跑在当前容器根上, 而 CI 与本地都会把
+# 仓库以**可写**方式挂进去。于是一次失败的 `cd`、一个写错的 `rm -rf`、一句 `git reset`,
+# 打的就是开发者的真仓库 —— 这不是假设: 本分支上真的因此多出过一个 author 为 t<t@t> 的
+# "base" 提交、origin 被换成 /tmp 里的裸库、还打了个 v9.9.9 标签。
+#
+# `PDG_E2E_ISOLATED=1` 只是调用方的一句声明, 它不证明任何事, 因此不能再当作安全依据。
+# 真正的依据是: 目标路径经 realpath 解析后, 确实位于一个**本轮创建、带 nonce 标记**的
+# 一次性根之内。所有破坏性操作都必须先过 e2e_guard_path。
+E2E_NONCE=""          # 本轮随机串, 写进 marker; 换一轮就对不上
+E2E_SANDBOX=""        # 已验证的一次性根(realpath 后的绝对路径)
+
+e2e_sandbox_init(){
+  local root="$1"
+  [[ -n "$root" ]] || { echo "[FAIL] 沙箱根为空"; return 1; }
+  mkdir -p "$root" 2>/dev/null || { echo "[FAIL] 建不了沙箱根: $root"; return 1; }
+  E2E_NONCE="$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  [[ ${#E2E_NONCE} -ge 16 ]] || { echo "[FAIL] 取不到随机 nonce"; return 1; }
+  local rp; rp="$(realpath -e "$root" 2>/dev/null)" || { echo "[FAIL] realpath 失败: $root"; return 1; }
+  printf '%s %s\n' "$E2E_NONCE" "$$" > "$rp/.e2e-disposable" || return 1
+  chmod 600 "$rp/.e2e-disposable" || return 1
+  E2E_SANDBOX="$rp"
+  return 0
+}
+
+# 判一个路径能不能当破坏性操作的目标。任何一条不满足立即返回非 0 —— 在动手之前。
+e2e_guard_path(){
+  local p="$1" why=""
+  [[ -n "$p" ]]        || why="路径为空"
+  [[ "$p" == /* ]]     || why="${why:-不是绝对路径}"
+  local rp=""
+  if [[ -z "$why" ]]; then
+    # -m: 目标可以还不存在(比如要创建的子目录), 但它的解析结果必须落在沙箱内。
+    rp="$(realpath -m "$p" 2>/dev/null)" || why="realpath 失败"
+  fi
+  if [[ -z "$why" ]]; then
+    case "$rp" in
+      /) why="目标是根目录";;
+      /root|/home|/usr|/etc|/var|/opt|/boot) why="目标是系统目录 $rp";;
+    esac
+  fi
+  # 仓库本体、仓库父目录、CI 工作区一律不许当目标 —— 这正是那次事故打中的地方。
+  if [[ -z "$why" ]]; then
+    local repo; repo="$(realpath -m "${E2E_ROOT:-/nonexistent}" 2>/dev/null)"
+    local parent; parent="$(dirname "$repo")"
+    local ws; ws="$(realpath -m "${GITHUB_WORKSPACE:-/nonexistent}" 2>/dev/null)"
+    [[ "$rp" == "$repo" || "$rp" == "$repo"/* ]] && why="目标在源码仓库内: $rp"
+    [[ -z "$why" && "$rp" == "$parent" ]] && why="目标是仓库父目录: $rp"
+    [[ -z "$why" && -n "$ws" && "$ws" != /nonexistent && ( "$rp" == "$ws" || "$rp" == "$ws"/* ) ]] \
+      && why="目标在 GITHUB_WORKSPACE 内: $rp"
+  fi
+  # 必须落在**已验证**的一次性根内, 且该根的 marker 与本轮 nonce 相符。
+  if [[ -z "$why" ]]; then
+    [[ -n "$E2E_SANDBOX" ]] || why="沙箱未初始化(e2e_sandbox_init 没跑)"
+  fi
+  if [[ -z "$why" ]]; then
+    [[ "$rp" == "$E2E_SANDBOX" || "$rp" == "$E2E_SANDBOX"/* ]] || why="目标在沙箱之外: $rp"
+  fi
+  if [[ -z "$why" ]]; then
+    local m="$E2E_SANDBOX/.e2e-disposable"
+    [[ -f "$m" ]] || why="沙箱 marker 不存在"
+    [[ -z "$why" && "$(cut -d' ' -f1 "$m" 2>/dev/null)" == "$E2E_NONCE" ]] || why="${why:-marker nonce 不匹配}"
+  fi
+  [[ -z "$why" ]] && return 0
+  echo "[FAIL] 拒绝对 $p 执行破坏性操作: $why" >&2
+  return 1
+}
+
+# 唯一允许的递归删除入口 —— 判据只有这一份, 各脚本不得自己抄一遍。
+e2e_rm_rf(){
+  local p
+  for p in "$@"; do
+    e2e_guard_path "$p" || return 1
+    rm -rf -- "$p" || return 1
+  done
+  return 0
+}
+
+# 退出钩子沿用下面既有的 e2e_add_exit_hook(注册函数名、幂等、保持原退出码), 不另起一套。
+
+# 收尾: 只删自己建的一次性根, 且要再过一遍 realpath + marker + nonce —— 中途被换掉的话
+# 这一步会拒绝, 而不是照删。
+e2e_sandbox_cleanup(){
+  [[ -n "$E2E_SANDBOX" ]] || return 0
+  e2e_rm_rf "$E2E_SANDBOX" 2>/dev/null || true
+}
+
 # 重入 namespace: 外层建 overlay 目录并 unshare, 内层挂载
 e2e_enter(){
   # 已经身处一次性隔离环境且是 root(CI 的容器 job) → 直接跑, 不必再自建 namespace。
@@ -77,11 +179,16 @@ e2e_enter(){
     # 容器是一次性的, 但**同一个容器里顺序跑多个脚本**时它并不是一次性的: 前一个脚本留下的
     # /usr/local/bin/sing-box 会让下一个脚本的装机路径判成"机器上已有第三方 sing-box"而中止。
     # 进场先把现场清干净 —— 每个 E2E 都必须自带完整前提, 不许指望上一个脚本留下的状态。
+    # 容器由 CI 一次性创建, 但"一次性"这件事必须由本进程自己证明: 建一个带本轮 nonce 的
+    # 一次性根并记下来, 之后所有破坏性操作都要落在它之内(见 e2e_guard_path)。
+    e2e_sandbox_init "${E2E_DISPOSABLE:-/tmp/e2e-box.$$}" || exit 1
+    e2e_add_exit_hook e2e_sandbox_cleanup
     e2e_reset_box
     _e2e_git_safe
     return 0
   fi
   if [[ "${PDG_E2E_INNER:-}" == 1 ]]; then
+    e2e_sandbox_init "${E2E_OVL:-/tmp/e2e-inner.$$}" || exit 1
     mount -t overlay overlay -o "lowerdir=/etc,upperdir=$E2E_OVL/eu,workdir=$E2E_OVL/ew" /etc \
       || { echo "[SKIP] overlay /etc 挂不上"; exit 0; }
     mount -t overlay overlay -o "lowerdir=/usr/local/bin,upperdir=$E2E_OVL/bu,workdir=$E2E_OVL/bw" /usr/local/bin
@@ -97,6 +204,7 @@ e2e_enter(){
   fi
   unshare -rm true 2>/dev/null || e2e_skip "本环境不支持 unshare -rm(需用户+挂载命名空间)"
   E2E_OVL="$(mktemp -d)"
+  e2e_sandbox_init "$E2E_OVL" || exit 1
   # 宿主 /etc 里归真 root 的路径在 userns 里映射成 nobody, 改不动 → 先在 upperdir 里建好(归本人)
   mkdir -p "$E2E_OVL"/{eu,ew,bu,bw,ou,ow,vu,vw}
   mkdir -p "$E2E_OVL"/eu/{mosdns/rules,sing-box,mihomo,privdns-gateway,systemd/system,systemd/journald.conf.d}
@@ -141,6 +249,39 @@ e2e_run_exit_hooks(){
     declare -F "$fn" >/dev/null && { "$fn" || true; }          # 清理失败不掩盖原始失败
   done
   return "$rc"
+}
+
+# ── 负控用的字节码缓存隔离 ──────────────────────────────────────────────────
+# 负控要在同一秒内"把源码改坏 → 跑 → 恢复 → 再跑"。CPython 默认的 __pycache__ 用**秒级
+# 时间戳 + 文件长度**判定源码是否变过: 同一秒内改成等长内容, 判据完全命中旧记录, 于是跑的
+# 是上一版字节码 —— 负控"通过"了, 而它验的其实是没被改过的旧代码。真踩过一次: 恢复源码后
+# 测试仍然失败, 因为读的是负控那一版的 .pyc。
+#
+# 解法不是"记得手动清缓存", 而是让每次负控子进程都用**本实例独有且为空**的缓存目录:
+#   e2e_pycache_isolate      建目录 + 导出 PYTHONPYCACHEPREFIX + 注册退出清理(只删这一个目录)
+#   e2e_pycache_reset        清空它(每跑一次负控调一次, 保证"空")
+E2E_PYCACHE_DIR=""
+
+e2e_pycache_isolate(){
+  [[ -n "$E2E_PYCACHE_DIR" ]] && return 0                  # 幂等
+  E2E_PYCACHE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/e2e-pycache.XXXXXX")" || return 1
+  export PYTHONPYCACHEPREFIX="$E2E_PYCACHE_DIR"
+  e2e_add_exit_hook e2e_pycache_cleanup
+  return 0
+}
+
+e2e_pycache_reset(){
+  [[ -n "$E2E_PYCACHE_DIR" && -d "$E2E_PYCACHE_DIR" ]] || return 0
+  # 只删本实例这一个目录的内容, 再原样建回来 —— 不碰仓库里的 __pycache__, 不用宽泛 find
+  rm -rf -- "$E2E_PYCACHE_DIR"
+  mkdir -p -- "$E2E_PYCACHE_DIR"
+}
+
+e2e_pycache_cleanup(){
+  [[ -n "$E2E_PYCACHE_DIR" ]] && rm -rf -- "$E2E_PYCACHE_DIR"
+  E2E_PYCACHE_DIR=""
+  unset PYTHONPYCACHEPREFIX
+  return 0
 }
 
 # ── 事务硬门探针的生命周期 ──────────────────────────────────────────────────
@@ -374,7 +515,17 @@ e2e_seed_mosdns(){
   . "$E2E_ROOT/lib/mosdns.sh"
   local setf; [[ "$mode" == gfw ]] && setf=geosite_gfw.txt || setf='geosite_geolocation-!cn.txt'
   _mosdns_hijack_shape "$mode" /etc/mosdns/config.yaml "$setf" >/dev/null
-  printf 'PDG_LOWMEM=0\nPDG_HIJACK_MODE=%s\n' "$mode" > /etc/privdns-gateway/profile.env
+  printf 'PDG_LOWMEM=0\nPDG_HIJACK_MODE=%s\nPDG_INTERNAL_CIDR=%s\n' \
+    "$mode" "$E2E_CIDR" > /etc/privdns-gateway/profile.env
+  # DoT 证书: 真机装完一定有(install.sh 签发或生成自签), mosdns 的 dot_server 插件初始化要读它。
+  # 沙盒缺它 → 任何"拿真 mosdns 校验候选配置"的事务都会失败, 那是夹具不够真实, 不是产品问题。
+  if [[ ! -s /etc/mosdns/certs/fullchain.pem ]] && command -v openssl >/dev/null 2>&1; then
+    install -d -m700 /etc/mosdns/certs
+    openssl req -x509 -newkey rsa:2048 -nodes -keyout /etc/mosdns/certs/privkey.pem \
+      -out /etc/mosdns/certs/fullchain.pem -days 3650 -subj "/CN=e2e.example" >/dev/null 2>&1 || true
+    chmod 644 /etc/mosdns/certs/fullchain.pem 2>/dev/null || true
+    chmod 600 /etc/mosdns/certs/privkey.pem 2>/dev/null || true
+  fi
 }
 
 # 渲染真实防火墙配置(switch-core 要从中提取 SSH 端口)。$1=内核(singbox|mihomo)

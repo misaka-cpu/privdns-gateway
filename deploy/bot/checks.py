@@ -12,6 +12,7 @@ DOT_DOMAIN_FILE = "/opt/pdg-bot/dot-domain"
 BACKEND_MARKER = "/etc/privdns-gateway/backend"
 MIHOMO_CFG = "/etc/mihomo/config.yaml"
 NFT_CONF = "/etc/nftables.conf"
+PROFILE_ENV = "/etc/privdns-gateway/profile.env"   # 内网卡段等持久化配置的**唯一真源**
 PLATFORM_FILE = "/etc/privdns-gateway/platform"
 PLATFORM_GUESSED = PLATFORM_FILE + ".guessed"   # 存在 = 平台是推测出来的, 没人确认过
 REPO_DIR = "/opt/privdns-gateway"   # 已装仓库(比对部署文件是否与当前发布同版本)
@@ -64,9 +65,36 @@ def _cert_path():
     m = re.search(r'cert:\s*"([^"]+)"', _mos())
     return m.group(1) if m else os.environ.get("PDG_CERT", "/etc/mosdns/certs/fullchain.pem")
 
-def _internal_cidr():
+def _profile(key):
+    """从 profile.env 读一个键(唯一真源)。读不到返回空串。"""
+    try:
+        with open(PROFILE_ENV, encoding="utf-8") as f:
+            m = re.findall(r"^[ \t]*%s=[\"']?([^\"'\n]+)" % re.escape(key), f.read(), re.M)
+        return m[-1].strip() if m else ""
+    except OSError:
+        return ""
+
+
+def _cidr_from_mosdns():
     m = re.search(r'ips:\s*\[\s*"([^"]+)"', _mos())
     return m.group(1) if m else ""
+
+
+def _cidr_from_nft():
+    _, out, _ = _run(["nft", "list", "chain", "inet", "pdg", "input"])
+    if not out:
+        _, out, _ = _run(["nft", "list", "chain", "inet", "filter", "input"])
+    m = re.search(r"ip saddr ([0-9.]+/[0-9]+)", out or "")
+    return m.group(1) if m else ""
+
+
+def _internal_cidr():
+    """内网卡来源段。**真源是 profile.env 的 PDG_INTERNAL_CIDR**(5.2/T7)。
+
+    回退到 mosdns 配置只为兼容"尚未迁移写入真源"的老机器 —— 迁移之后这条回退就不该再命中,
+    check_cidr_drift() 会把仍在回退的机器报出来。不能反过来以 mosdns 为准: 那份配置正是
+    救援场景里可能损坏的东西, 而这个值决定救援服务绑在哪个地址上。"""
+    return _profile("PDG_INTERNAL_CIDR") or _cidr_from_mosdns()
 
 def _cert_cn():
     _, out, _ = _run(["openssl", "x509", "-in", _cert_path(), "-noout", "-subject"])
@@ -261,6 +289,48 @@ def check_internal_cidr():
     if net.prefixlen < 12:
         return ("warn", "内网卡段", f"{c} 偏宽(/{net.prefixlen}), 建议收到内网卡精确 /16")
     return ("ok", "内网卡段", c)
+
+def check_cidr_drift():
+    """内网卡段的四方一致性: profile.env(真源) / nft / mosdns / 本机网卡。
+
+    为什么要单独查: 这四处必须同时改, 少改一处的表现各不相同但都难查 ——
+      · nft 落后 → 手机来源不被放行, DNS 直接不通;
+      · mosdns 落后 → 查询进得来却不被判成"内网客户端", 分流与劫持全失效;
+      · profile.env 落后 → 救援服务绑到一个已经不存在的地址上, 出事时才发现进不去;
+      · 网卡实际地址不在段内 → 段本身写错了, 上面三处一致也没用。
+    只**报告**, 不代为修改: 改它要写 nft+mosdns 并重启, 那是 `pdg detect-cidr` 的事。"""
+    src = _profile("PDG_INTERNAL_CIDR")
+    nftv = _cidr_from_nft()
+    mosv = _cidr_from_mosdns()
+    if not src:
+        if nftv or mosv:
+            return ("warn", "内网卡段真源",
+                    "profile.env 里没有 PDG_INTERNAL_CIDR(老装尚未迁移)。当前实际生效: "
+                    "nft=%s / mosdns=%s。请运行 <code>sudo pdg migrate</code> 写入真源。"
+                    % (nftv or "读不到", mosv or "读不到"))
+        return ("warn", "内网卡段真源", "profile.env 与 nft/mosdns 都读不到内网卡段")
+    diff = []
+    if nftv and nftv != src:
+        diff.append("nft=%s" % nftv)
+    if mosv and mosv != src:
+        diff.append("mosdns=%s" % mosv)
+    if diff:
+        return ("fail", "内网卡段真源",
+                "profile.env 记的是 %s, 但 %s —— 三处必须一致, 否则放行/分流/救援入口会各说各话。"
+                "请运行 <code>sudo pdg detect-cidr</code> 重新统一。" % (src, "、".join(diff)))
+    # 四方的最后一方: 本机是否真有一个落在这个段里的地址。没有不一定是错(手机不在线时该段
+    # 可能只在对端出现), 所以只提示, 不判失败。
+    try:
+        net = ipaddress.ip_network(src, strict=False)
+    except Exception:  # noqa: BLE001
+        return ("fail", "内网卡段真源", "%s 不是合法 CIDR" % src)
+    _, addrs, _ = _run(["ip", "-4", "-o", "addr"])
+    local = [ipaddress.ip_address(a) for a in re.findall(r"inet ([0-9.]+)/", addrs or "")]
+    if local and not any(a in net for a in local):
+        return ("ok", "内网卡段真源",
+                "%s(三处一致; 本机网卡地址不在该段内 —— 内网卡为对端下发时属正常)" % src)
+    return ("ok", "内网卡段真源", "%s(profile.env / nft / mosdns 三处一致)" % src)
+
 
 def platform_ports_text():
     """按当前平台列出应放行的端口。写死一串"53/80/81/443/853/5228-5230/7893/8445"会在 iOS 上
@@ -841,7 +911,7 @@ def check_transactions():
 
 
 ALL = [check_platform, check_services, check_bot_credentials, check_core_version, check_dot_arecord, check_dot_domain_sync,
-       check_internal_cidr, check_nft, check_nft_input_chains, check_redirect, check_gms,
+       check_internal_cidr, check_cidr_drift, check_nft, check_nft_input_chains, check_redirect, check_gms,
        check_mosdns_ratelimit, check_mem,
        check_cert, check_dns, check_core_config, check_rulesets, check_mitm_structure, check_mitm,
        check_transactions]
