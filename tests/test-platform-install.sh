@@ -576,8 +576,49 @@ grep -q '5228-5230' "$WORK/nfa" && ok "Android: _pdg_nft_strip_gms 空操作(保
 u="$ROOT/deploy/bot/pdg.sh"
 grep -q 'migrate_android_cleanup' "$u" && grep -q 'disable --now "\$u"' "$u" && ok "存在 Android 残留清理(停用+删 pdg-probe81/pdg-mitm unit)" || bad "缺 Android 清理逻辑"
 grep -q 'CA/地点数据保留为休眠' "$u" && ok "Android 清理保留 CA/地点数据(不永久删)" || bad "未保留用户数据"
-grep -q 'migrate_deploy_botfiles' "$u" && grep -q 'mitm_ca.py|mitm_server.py|mitm_wloc.py) \[\[ "\$plat" == ios \]\] || continue' "$u" \
-  && ok "migrate_deploy_botfiles: Android 不部署 iOS MITM 模块" || bad "botfiles 未按平台部署"
+# ── D2. 按平台部署: 真跑一次部署, 不再用"源码里出现某一行"当证据 ──────────────
+# 原先这条 grep 的是 pdg.sh 里一行具体的 case 分支。判据一旦长在源码字面上, 换个等价写法
+# 就红, 而真把 iOS 组件装到 Android 上却不一定被发现 —— 证明力和脆弱度正好反着。
+# shellcheck source=lib/modules.sh
+source "$ROOT/lib/modules.sh"
+_pi_tmp="$(mktemp -d)"
+for _plat in android ios; do
+  rm -rf "${_pi_tmp:?}/$_plat"; mkdir -p "$_pi_tmp/$_plat"
+  if pdg_install_runtime_modules "$ROOT" "$_pi_tmp/$_plat" "$_plat" >/dev/null 2>&1; then
+    ok "按平台部署($_plat): 部署函数返回 0"
+  else
+    bad "按平台部署($_plat): 部署函数失败"
+  fi
+done
+_ios_only="$(comm -13 <(ls "$_pi_tmp/android" | sort) <(ls "$_pi_tmp/ios" | sort) | tr '\n' ' ')"
+_leaked=""
+for _f in mitm_ca.py mitm_server.py mitm_wloc.py probe81.py pdg-dot.mobileconfig.tmpl; do
+  [[ -e "$_pi_tmp/android/$_f" ]] && _leaked="$_leaked $_f"
+  [[ -e "$_pi_tmp/ios/$_f" ]] || _leaked="$_leaked 缺:$_f"
+done
+[[ -z "$_leaked" ]] \
+  && ok "Android 不装 iOS 五件套, iOS 五件套齐全(仅 iOS: $_ios_only)" \
+  || bad "平台部署有偏差:$_leaked"
+# 内容与 mode 都要对 —— 只看"文件在不在"挡不住装了个旧版或权限错的。
+_bad=0
+while read -r _src _name _mode; do
+  [[ -n "$_src" ]] || continue
+  cmp -s "$ROOT/$_src" "$_pi_tmp/ios/$_name" || { _bad=$((_bad+1)); echo "    内容不符: $_name"; }
+  [[ "$(stat -c%a "$_pi_tmp/ios/$_name")" == "$_mode" ]] || { _bad=$((_bad+1)); echo "    mode 不符: $_name"; }
+done < <(pdg_platform_modules ios)
+[[ "$_bad" == 0 ]] && ok "部署内容逐字节等于仓库源, mode 与 manifest 一致" || bad "$_bad 处内容/mode 不符"
+# 幂等: 再跑一遍不该有任何变化
+_h1="$(find "$_pi_tmp/ios" -type f -exec sha256sum {} + | sed "s|$_pi_tmp||" | sort | sha256sum)"
+pdg_install_runtime_modules "$ROOT" "$_pi_tmp/ios" ios >/dev/null 2>&1
+_h2="$(find "$_pi_tmp/ios" -type f -exec sha256sum {} + | sed "s|$_pi_tmp||" | sort | sha256sum)"
+[[ "$_h1" == "$_h2" ]] && ok "重复部署幂等(内容与 mode 均不变)" || bad "重复部署产生了变化"
+# 用户持久数据不能被静态部署覆盖
+printf '{"mine":1}\n' > "$_pi_tmp/ios/rulesets.json"
+printf 'user.example\n' > "$_pi_tmp/ios/dot-domain"
+pdg_install_runtime_modules "$ROOT" "$_pi_tmp/ios" ios >/dev/null 2>&1
+{ grep -q '"mine"' "$_pi_tmp/ios/rulesets.json" && grep -q user.example "$_pi_tmp/ios/dot-domain"; } \
+  && ok "用户持久数据(rulesets.json / dot-domain)不被静态部署覆盖" || bad "用户数据被覆盖了"
+rm -rf "${_pi_tmp:?}"
 
 echo "────────────────────────────────────────"
 echo "通过 $pass, 失败 $nfail"

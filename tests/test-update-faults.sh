@@ -23,13 +23,23 @@ mkdir -p "$WORK/repo/.git"          # 让 [[ -d $REPO_DIR/.git ]] 为真, 跳过
 mkdir -p "$WORK/repo/lib"
 # 名字取自**真实**清单(source 它拿到 PDG_RUNTIME_MODULES), 于是逐模块的 FAIL_INSTALL 注入
 # 照旧有效 —— 桩内调的是被打桩的 install。
+# 桩必须**按平台**展开, 与真实 pdg_platform_modules 同构。只展开 PDG_RUNTIME_MODULES 的话,
+# `PLATFORM=ios` 下 iOS 那五件根本不会被 install 碰到 —— 于是"iOS 组件装失败必须回滚"那几条
+# 注入永远打空, 而测试照样全绿(注入未命中守卫就是为抓这个加的)。
 ( source "$ROOT/lib/modules.sh"
   echo 'pdg_install_runtime_modules(){'
   echo '  [[ -n "${FAIL_MODULES:-}" ]] && return 1'
+  echo '  local _plat="${3:-${PDG_PLATFORM:-}}"'
   while read -r _src _name _mode; do
     [[ -n "$_src" ]] || continue
     echo "  install -m$_mode \"\$1/$_src\" \"\${2:-/opt/pdg-bot}/$_name\" || return 1"
   done <<< "$PDG_RUNTIME_MODULES"
+  echo '  if [[ "$_plat" == ios ]]; then'
+  while read -r _src _name _mode; do
+    [[ -n "$_src" ]] || continue
+    echo "    install -m$_mode \"\$1/$_src\" \"\${2:-/opt/pdg-bot}/$_name\" || return 1"
+  done <<< "$PDG_IOS_MODULES"
+  echo '  fi'
   echo '  return 0'
   echo '}'
 ) > "$WORK/repo/lib/modules.sh"
@@ -54,8 +64,35 @@ git(){
     *)         return 0;;
   esac
 }
-# 必需文件安装: FAIL_INSTALL 命中目标子串则失败
-install(){ local last="${*: -1}"; [[ -n "${FAIL_INSTALL:-}" && "$*" == *"${FAIL_INSTALL}"* ]] && return 1; return 0; }
+# 必需文件安装的故障注入。判据是**受管目标的 basename 或序号**, 不是命令行的字面形态 ——
+# 把 `install … /opt/pdg-bot/` 换成 `install … /opt/pdg-bot/<name>` 这种等价改写, 旧的
+# 子串匹配就静默失效, 于是"iOS 组件装失败必须回滚"那五条一条都不会真跑, 而测试照样全绿。
+#
+# FAIL_TARGET=<basename>  命中该目标名时失败
+# FAIL_NTH=<n>            第 n 个落在受管目录下的目标失败(1 起)
+# 命中与否写进 /tmp/e2e-inject-hit, 由 assert_fail_rollback 复核 —— 没命中就判测试自己失败。
+PDG_MANAGED_DIR=/opt/pdg-bot
+: > /tmp/e2e-inject-hit
+install(){
+  local last="${*: -1}" base n
+  base="$(basename -- "$last")"
+  case "$last" in
+    "$PDG_MANAGED_DIR"/*|"$PDG_MANAGED_DIR")
+      n=$(( $(wc -l < /tmp/e2e-inject-count 2>/dev/null || echo 0) + 1 ))
+      echo "$n $base" >> /tmp/e2e-inject-count
+      if [[ -n "${FAIL_TARGET:-}" && "$base" == "${FAIL_TARGET}" ]]; then
+        echo "hit target=$base" >> /tmp/e2e-inject-hit; return 1
+      fi
+      if [[ -n "${FAIL_NTH:-}" && "$n" == "${FAIL_NTH}" ]]; then
+        echo "hit nth=$n base=$base" >> /tmp/e2e-inject-hit; return 1
+      fi;;
+  esac
+  # 兼容既有用例仍在用的整路径子串形态(/usr/local/bin/pdg 之类的非受管目标)
+  if [[ -n "${FAIL_INSTALL:-}" && "$*" == *"${FAIL_INSTALL}"* ]]; then
+    echo "hit substr=${FAIL_INSTALL}" >> /tmp/e2e-inject-hit; return 1
+  fi
+  return 0
+}
 # __migrate 经 `bash /usr/local/bin/pdg __migrate` 调用 → 拦 bash 函数
 bash(){ [[ "$*" == *__migrate* ]] && return "${MIGRATE_RC:-0}"; command bash "$@"; }
 _update_core_binary(){ [[ -n "${FAIL_CORE:-}" ]] && return 1; return 0; }
@@ -100,7 +137,15 @@ assert_success(){ # 正常路径: rc0 + 有"✅ 已更新" + 无 ROLLBACK
     && ok "正常路径: 走到 ✅ 已更新, 未回滚" || bad "happy: rc=$rc out=$out"
 }
 assert_fail_rollback(){ # 故障路径: rc非0 + 有 ROLLBACK + 无"✅ 已更新"
-  local desc="$1" env="$2" r; r=$(run "$env"); local rc="${r%%|*}" out="${r#*|}"
+  local desc="$1" env="$2" r
+  : > /tmp/e2e-inject-hit; : > /tmp/e2e-inject-count
+  r=$(run "$env"); local rc="${r%%|*}" out="${r#*|}"
+  # 注入没命中就说明这条根本没测到东西 —— 判测试自己失败, 不是判产品通过。
+  if [[ "$env" == *FAIL_TARGET=* || "$env" == *FAIL_NTH=* || "$env" == *FAIL_INSTALL=* ]] \
+     && [[ ! -s /tmp/e2e-inject-hit ]]; then
+    bad "$desc: 故障注入**未命中**(受管目标共 $(wc -l < /tmp/e2e-inject-count 2>/dev/null || echo 0) 个) —— 这条没测到任何东西"
+    return
+  fi
   { [[ "$rc" != 0 ]] && grep -q ROLLBACK_CALLED <<<"$out" && ! grep -q '✅ 已更新' <<<"$out"; } \
     && ok "$desc → 回滚 + 非0 + 不谎报成功" || bad "$desc: rc=$rc out=$out"
 }
@@ -138,13 +183,18 @@ r=$(run "DOCTOR_OUT=warn"); rc="${r%%|*}"; out="${r#*|}"
   && ok "仅 warn: 正常完成 + 警告被解析展示" || bad "warn 路径: rc=$rc out=$out"
 
 # ══ iOS 平台组件: 在 iOS 上是必需件, 装失败必须回滚(不能 ||true 后留旧版混装) ══
-for f in mitm_ca.py mitm_server.py mitm_wloc.py probe81.py pdg-dot-ondemand.mobileconfig.tmpl; do
-  assert_fail_rollback "iOS: $f 安装失败" "PLATFORM=ios FAIL_INSTALL=$f"
+# 按**受管目标名**注入(mobileconfig 在目标侧是改名后的 pdg-dot.mobileconfig.tmpl)
+for f in mitm_ca.py mitm_server.py mitm_wloc.py probe81.py pdg-dot.mobileconfig.tmpl; do
+  assert_fail_rollback "iOS: $f 安装失败" "PLATFORM=ios FAIL_TARGET=$f"
 done
+# 第一个 / 中间 / 最后一个受管目标各失败一次 —— 覆盖遍历的头、中、尾
+assert_fail_rollback "受管目标 #1 安装失败"  "PLATFORM=ios FAIL_NTH=1"
+assert_fail_rollback "受管目标 #12 安装失败" "PLATFORM=ios FAIL_NTH=12"
+assert_fail_rollback "受管目标 #27 安装失败" "PLATFORM=ios FAIL_NTH=27"
 
 # Android: 这五个文件根本不该被安装 → 即使注入同名失败也不影响更新
-for f in mitm_ca.py probe81.py pdg-dot-ondemand.mobileconfig.tmpl; do
-  r=$(run "PLATFORM=android FAIL_INSTALL=$f"); rc="${r%%|*}"; out="${r#*|}"
+for f in mitm_ca.py probe81.py pdg-dot.mobileconfig.tmpl; do
+  r=$(run "PLATFORM=android FAIL_TARGET=$f"); rc="${r%%|*}"; out="${r#*|}"
   { [[ "$rc" == 0 ]] && grep -q '✅ 已更新' <<<"$out"; } \
     && ok "Android: 不安装 iOS 文件 $f(注入其失败也不影响更新)" || bad "Android/$f: rc=$rc out=$out"
 done
