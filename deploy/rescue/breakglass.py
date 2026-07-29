@@ -180,10 +180,16 @@ class _SnapFallback:
             return [], "快照读取失败(%s)" % type(e).__name__
 
     def snap_format(self, members):
+        # 与 cfgrestore.snap_format 判据必须一致 —— 这是 cfgrestore 不可用时的兜底, 两边
+        # 判得不一样等于"救援平面越降级越宽松"。tests/test-snapshot-matrix.py 逐样本比对两者。
         has = set(members)
-        if any(n.startswith("etc/mihomo/") for n in has) or "etc/sing-box/config.json" in has:
+        v16 = any(n.startswith("etc/mihomo/") for n in has) or "etc/sing-box/config.json" in has
+        legacy = any(n.startswith("etc/dnsdist/") for n in has)
+        if v16 and legacy:
+            return "ambiguous:v1.6+legacy-dnsdist"
+        if v16:
             return "v1.6"
-        if any(n.startswith("etc/dnsdist/") for n in has):
+        if legacy:
             return "legacy-dnsdist"
         return "unknown"
 

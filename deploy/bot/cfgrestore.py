@@ -369,14 +369,28 @@ def list_members(snap_id):
         return [], "快照读取失败(%s)" % type(e).__name__
 
 
+# 结构识别的两个固定取值。歧义前缀单独拎出来: 各道门都用 `fmt not in (...)` 判, 只要不是
+# 这两个已知值就一律拒 —— 新增一种歧义不需要再改每一处门。
+LEGACY_FMT = "legacy-dnsdist"
+AMBIGUOUS = "ambiguous"
+
+
 def snap_format(members):
     """快照的结构版本。**只做识别, 不做转换** —— 旧结构无法安全映射时如实说明"只能走紧急完整
     恢复", 不在恢复途中顺手迁移(那等于把一次未经批准的迁移混进恢复里)。"""
     has = set(members)
-    if any(n.startswith("etc/mihomo/") for n in has) or "etc/sing-box/config.json" in has:
+    v16 = any(n.startswith("etc/mihomo/") for n in has) or "etc/sing-box/config.json" in has
+    legacy = any(n.startswith("etc/dnsdist/") for n in has)
+    # 两套特征同时出现时**不能**按"先匹配到哪条算哪条"来判。原先是顺序 if, 于是一份既有
+    # etc/dnsdist/ 又有 etc/sing-box/config.json 的包会被判成 v1.6 —— 受管恢复照放, 旧结构
+    # 那句"不保证服务能起来"的警告也不再出现。歧义时唯一安全的答案是"我不知道", 并把冲突的
+    # 特征点出来, 让人自己判断这包到底是什么。
+    if v16 and legacy:
+        return "%s:v1.6+%s" % (AMBIGUOUS, LEGACY_FMT)
+    if v16:
         return "v1.6"                       # 当前格式: 数据模型 + mihomo 配置
-    if any(n.startswith("etc/dnsdist/") for n in has):
-        return "legacy-dnsdist"             # 远古结构, 映射不过来
+    if legacy:
+        return LEGACY_FMT                   # 远古结构, 映射不过来
     return "unknown"
 
 
