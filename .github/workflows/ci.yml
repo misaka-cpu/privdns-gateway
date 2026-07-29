@@ -264,6 +264,33 @@ jobs:
       - name: "运行模块安装闭包 (真实入口传递依赖 vs 安装真源, 含动态导入点)"
         run: python3 tests/test-install-closure.py
 
+      # 以下六条此前**从未进过 CI** —— 其中四条是 5.2 这一路新写的。本地跑得好好的, 远端
+      # 一次没跑过。tests/test-ci-coverage.py 现在会盯着这件事: 有测试文件没出现在本文件里
+      # 就判红, 免得"写了用例"和"用例真的在跑"再次被当成一回事。
+      - name: "跨版本快照矩阵 (清单取自各版本 cmd_snapshot; unknown/legacy/特征冲突 fail-closed)"
+        run: python3 tests/test-snapshot-matrix.py
+
+      - name: "救援来源过滤 (握手前按内核 peer 地址判; 不信 X-Forwarded-For)"
+        run: python3 tests/test-rescue-source.py
+
+      - name: "救援资源边界与中断 (成员/单文件/总量上限; 断线与信号下的事务收尾)"
+        timeout-minutes: 12
+        run: python3 tests/test-rescue-interrupt.py
+
+      - name: "Mihomo 渲染与钉死版本 (缺二进制在严格模式下判失败, 不 SKIP 冒充通过)"
+        run: python3 tests/test-rescue-sets.py
+
+      - name: "重装保留用户数据 (FORCE_REINSTALL 不重置 bot.env/模型/规则集)"
+        run: python3 tests/test-reinstall-preserve.py
+
+      # 需要真 nft(netlink): 用 sudo -E 跑, 与上面的 e2e-rescue-10b.sh 同一套路。非 root 下
+      # 那两条会 SKIP, 而 CI 里不允许拿 SKIP 冒充通过。
+      - name: "卸载保留用户防火墙规则 (只摘项目管理块, 用户自加规则逐字节保留)"
+        run: sudo -E python3 tests/test-uninstall-firewall.py
+
+      - name: "CI 覆盖守卫 (每个测试文件都必须真的被本 workflow 调用)"
+        run: python3 tests/test-ci-coverage.py
+
       - name: "clean-root 安装产物自足 (移出仓库/隔离解释器/无源码兜底)"
         run: python3 tests/test-clean-root.py
 
