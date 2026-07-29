@@ -148,7 +148,10 @@ def sample_legacy(dst):
     """3. legacy-dnsdist: 用仓库最早那版真实的 deploy/dnsdist/dnsdist.conf。"""
     conf = hist("5024109", "deploy/dnsdist/dnsdist.conf")
     if conf is None:
-        return None
+        # 取不到就明说。返回 None 的话调用方会照常往下走, 直到某处撞 FileNotFoundError ——
+        # CI 上浅克隆拿不到这个提交时就是这么报的, 错误信息离真正的原因隔了三层。
+        raise SystemExit("取不到 5024109:deploy/dnsdist/dnsdist.conf —— "
+                         "仓库历史不完整(CI 上要 fetch-depth: 0)")
     rels = [("etc/dnsdist/dnsdist.conf", conf),
             ("etc/mosdns/config.yaml", _mos_min())]      # 那个年代 mosdns 已经并存
     write_tar(dst, rels)

@@ -18,6 +18,11 @@ jobs:
       PDG_TEST_STRICT: "1"
     steps:
       - uses: actions/checkout@v5
+        with:
+          # 跨版本快照矩阵要从**仓库最早那个提交**取真实的 deploy/dnsdist/dnsdist.conf,
+          # 各版本 cmd_snapshot 的清单也靠历史对象解析。默认浅克隆拿不到, 于是 legacy 样本
+          # 造不出来、后面的用例撞 FileNotFoundError。e2e job 早就因同样原因设了 0。
+          fetch-depth: 0
       # 事务的 mosdns_probe 校验器会**真的启动 mosdns** 解析候选配置, 拿不到二进制整笔事务
       # REFUSED。这条以前没有 —— 本地一直绿是因为开发机上有早前 E2E 留下的 mosdns, 而
       # CI 的 lint job 里没有, 于是 test-cidr-transaction 一串失败。v1.7.0 发布前的
