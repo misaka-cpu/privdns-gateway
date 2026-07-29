@@ -243,6 +243,13 @@ if not _np.has_project_table(_stripped):
     ok("摘完之后 --check 判为干净(卸载可以如实报成功)")
 else:
     bad("摘完仍判有残留")
+# 老版本卸载留下的孤儿注释头: 表已经没了, 再跑卸载也得能把它清掉。
+_orphan = "#!/usr/sbin/nft -f\n\nflush ruleset\n\n" + BANNER + "\n\ntable inet usercheck {\n\tchain sentinel {\n\t}\n}\n"
+_cleaned = _np.strip_project(_orphan)
+if BANNER not in _cleaned and "usercheck" in _cleaned:
+    ok("表已不在、只剩孤儿注释头时, 再跑一次卸载也能把它清掉")
+else:
+    bad("孤儿注释头清不掉(提前返回把它跳过了)")
 
 # ── 卸载文案不能超出它实际做的事 ────────────────────────────────────────────
 # `.200` 实测: 卸载完 /opt/pdg-bot 里还剩 bot.py / mitm_*.py / probe81.py 等 10 个程序文件,

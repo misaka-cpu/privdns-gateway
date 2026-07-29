@@ -59,6 +59,10 @@ def strip_project(text):
     找到了但形态对不上 → Unrecognized: 那可能是用户自己建的同名表, 删掉就是越权。
     """
     t = text or ""
+    # 注释头无条件摘 —— 它是项目写进去的, 卸载就该带走。放在提前返回**之前**: 早先版本
+    # 摘块时不摘它, 那些机器上留下的孤儿注释头, 之后再怎么跑卸载也清不掉(没有表了,
+    # 函数在这里就返回了)。
+    t = BANNER_RE.sub("", t)
     if not has_project_table(t):
         return t
     out, n = _MANAGED_RE.subn("", t)
