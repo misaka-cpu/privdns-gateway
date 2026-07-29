@@ -1493,7 +1493,7 @@ def set_mosdns_upstream(which, addrs):
 # WDA 模式: 这些域名 → jp 直出 + 经 mosdns 用解锁 DNS(22.22.22.22)解析到中继(从本机授权 IP 出)。
 # 落地模式: 不加规则, 这些域名回落到各自现有分流出口(hk/tw 等)。
 # mosdns 侧的 unlock 支(unlock_upstream + geosite_unlock)是常驻的(install/迁移装好), 平时休眠;
-# 本函数只在 WDA 模式把域名清单写进 mosdns 的 unlock.txt 与 sing-box 的 rule_set, 并加 sing-box 路由规则。
+# 本函数只在 WDA 模式把域名清单写进 mosdns 的 unlock.txt 与 model 内联域名规则。
 MOSDNS_RULES = "/etc/mosdns/rules"
 UNLOCK_DNS = "22.22.22.22"   # 解锁服务(WDA)的 DNS; 与 mosdns unlock_upstream 一致。换厂商需同步两处。
 WDA_DOMAINS = [
@@ -1514,9 +1514,36 @@ WDA_DOMAINS = [
     "steampowered.com", "steamcommunity.com", "steamstatic.com", "play.google.com", "android.com",
 ]
 
+def _read_unlock_domains():
+    """现网 unlock.txt 是上一版 WDA 内联规则的精确清单, 用于跨版本替换旧规则。"""
+    try:
+        return [line.strip()[len("domain:"):]
+                for line in open(os.path.join(MOSDNS_RULES, "unlock.txt"), encoding="utf-8")
+                if line.strip().startswith("domain:") and line.strip()[len("domain:"):]]
+    except OSError:
+        return []
+
+
+def _is_wda_rule(rule, previous_domains=None):
+    """识别当前/上一版内联 WDA 规则及老装遗留的 rule_set=unlock 规则。"""
+    if rule.get("outbound") != "jp":
+        return False
+    if rule.get("rule_set") == "unlock":
+        return True
+    domains = rule.get("domain_suffix")
+    if not isinstance(domains, list):
+        return False
+    candidates = [WDA_DOMAINS]
+    if previous_domains:
+        candidates.append(previous_domains)
+    return any(len(domains) == len(expected) and set(domains) == set(expected)
+               for expected in candidates)
+
+
 def _wda_on(c=None):
     c = c or load()
-    return any(r.get("rule_set") == "unlock" and r.get("outbound") == "jp"
+    previous_domains = _read_unlock_domains()
+    return any(_is_wda_rule(r, previous_domains)
                for r in c.get("route", {}).get("rules", []))
 
 def _server_ip():
@@ -1556,7 +1583,7 @@ def _unlock_precheck(domains):
 
 
 def set_wda_mode(on):
-    """WDA 解锁 ↔ 落地出口。mosdns 解锁清单、sing-box 规则集文件与 model 现在是**一笔事务**:
+    """WDA 解锁 ↔ 落地出口。mosdns 解锁清单与 model 内联域名规则现在是**一笔事务**:
     以前三处分三步写, 任何一步失败都可能留下"内核撤了规则、mosdns 还在走解锁 DNS"的半套状态。"""
     if on and not _wda_authorized():             # 没授权就开 = 拿不到中继, 反而更糟 → 先拦住
         ip = _server_ip()
@@ -1569,20 +1596,22 @@ def set_wda_mode(on):
     if not okp:
         return False, errp
 
+    previous_domains = _read_unlock_domains()
+
     def mod(c):
         c["route"].setdefault("rule_set", [])
         c["route"]["rule_set"] = [r for r in c["route"]["rule_set"] if r.get("tag") != "unlock"]
-        c["route"]["rules"] = [r for r in c["route"]["rules"] if r.get("rule_set") != "unlock"]
+        # 同时收掉老装的 rule_set=unlock 与新版内联规则, 让开/关/重复开启都幂等。
+        c["route"]["rules"] = [
+            r for r in c["route"]["rules"]
+            if not _is_wda_rule(r, previous_domains)
+        ]
         if on:
-            c["route"]["rule_set"].append({"tag": "unlock", "type": "local", "format": "source",
-                                           "path": os.path.join(RS_DIR, "unlock.json")})
             idx = 1 if c["route"]["rules"] and c["route"]["rules"][0].get("action") == "reject" else 0
-            c["route"]["rules"].insert(idx, {"rule_set": "unlock", "outbound": "jp"})
+            c["route"]["rules"].insert(
+                idx, {"domain_suffix": list(WDA_DOMAINS), "outbound": "jp"})
 
     files = {"mosdns_rule:unlock.txt": _unlock_text(domains)}
-    if on:
-        files["ruleset:unlock.json"] = json.dumps(
-            {"version": 1, "rules": [{"domain_suffix": WDA_DOMAINS}]}, ensure_ascii=False).encode()
     ok, msg = tx_apply("wda_" + ("on" if on else "off"), model_mod=mod, files=files)
     if not ok:
         return False, msg

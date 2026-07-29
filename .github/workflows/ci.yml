@@ -163,6 +163,9 @@ jobs:
       - name: "bot 导航回归 (操作结果不刷一级菜单)"
         run: python3 tests/test-bot-nav.py
 
+      - name: "WDA mihomo 切换回归 (内联域名规则/开关幂等/老 rule_set 迁移)"
+        run: python3 tests/test-wda-mihomo.py
+
       - name: "bot 凭据保护/后台执行器/BUSY 锁回归"
         run: python3 tests/test-bot-credential.py
 
