@@ -211,6 +211,19 @@ mihomo」，**具体走哪个出口仍由数据模型里的真实规则决定**�
 
   这一层只在 `gfw` 模式下看得出差别：`all` 模式"不是国内就劫持"本来就把规则集的域名兜住了。
 
+**网关上还跑着别的服务？** 本项目的 `table inet pdg` 是 `policy drop`，而 nftables 里同一 hook 上
+每条 base chain 都会执行——你写在别处的 `accept` 会被它架空（端口看着开着、实际不通）。所以额外的
+放行要写进这个目录：
+
+```bash
+echo 'tcp dport 80 accept' | sudo tee /etc/privdns-gateway/nft-input.d/10-web.conf
+sudo nft -c -f /etc/nftables.conf && sudo systemctl reload nftables
+```
+
+它被 `include` 进 `pdg` 的 input chain 末尾（`policy drop` 之前），**且不受 `pdg update` 影响**——
+`pdg` 那张表每次更新都按模板重建，手加在里面的规则会丢，加在这个目录的不会。写错语法会让整份防火墙
+加载失败，改完先用 `nft -c` 校验。
+
 **跑 Docker 的机器**：Debian 自带的 `/etc/nftables.conf` 开头有一行 `flush ruleset`，它会在每次
 `systemctl reload nftables` 时把 Docker（以及 fail2ban、libvirt、k8s）建在内核里的表整个冲掉——
 这跟本项目无关，是那台机器上本来就有的隐患。装机检测到这种组合时，会把那一行**注释掉**（保留原

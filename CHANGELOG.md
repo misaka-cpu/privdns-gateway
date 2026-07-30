@@ -2,6 +2,28 @@
 
 本项目按语义化 `v1.x` tag 正式发布;以下按版本/日期记录主要变化,完整提交见 git 历史。
 
+## 2026-07-30 — v1.7.7(网关上还跑着别的服务时, 终于有地方放自定义放行规则)
+
+用户报障续: 他那台机器内核里 `inet filter` 的 input 链有 `tcp dport 80 accept`, 装机因此中止 ——
+这次**拦得对**(本项目的 `table inet pdg` 是 `policy drop`, 不放行公网 80, 装上去他那条会被架空)。
+错的是给的建议: "把需要的放行并入 `table inet pdg` 的 input chain" —— 那张表每次装机/迁移都按模板
+重建, 手加进去的规则下次就没了, **建议本身行不通**。
+
+- **新增 `/etc/privdns-gateway/nft-input.d/`**:放这里的 `*.conf` 会被 include 进 `pdg` 的 input
+  chain 末尾(`policy drop` 之前), 且不受 `pdg update` 影响。装机建目录并附说明; 老机器 `pdg update`
+  时补上 include 点(幂等、`nft -c` 先校验、失败还原; pdg 表里没有 input chain 这类认不出的形态一律
+  不动)。用 glob 而不是单文件 include —— 实测单文件缺失会让整份 `nftables.conf` 加载失败, 那等于把
+  人锁在门外; 空目录则照常加载。
+- **`pdg doctor` 新增「自定义放行」**:目录里有 `.conf` 但配置里没有 include 行时判 **fail** —— 那是
+  最坏的一种, 用户以为规则生效了, 实际一条都没进内核, 而且哪儿都不报错。
+- **装机冲突报错给出可执行的两条路**:挪进上面那个目录, 或者确认不需要就删掉; 不再给那条行不通的
+  建议。
+- **`nftscan` 报错贴出具体规则**:以前只说"1 条规则", 用户不知道是哪条、也就无从判断怎么办。
+- **本项目已放行的那几条不再算冲突**:外来 input 链如果只有 `iif lo accept` /
+  `ct state established,related accept` / `icmp accept` 这类我们自己也放行的规则, 装上去不会架空
+  任何东西。发行版自带的骨架基本就是这几条。带端口的放行不在此列 —— 扫描发生在问 SSH 端口之前,
+  这里无从判断那个端口是不是我们也会放行的那个, 判错的代价不对称。
+
 ## 2026-07-30 — v1.7.6(全新 Debian 13 / Docker 主机装得上了)
 
 用户报: 全新 Debian 13 首次装机中止在"`flush ruleset` 会冲掉只存在于运行中的表 —— `table ip nat`、

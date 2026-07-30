@@ -186,7 +186,13 @@ case "$_nft_rc" in
 $(printf '%s\n' "$_nft_conflict" | sed 's/^/    /')
   本项目的 table inet pdg 是 policy drop, 而同一 hook 上每条 base chain 都会执行 ——
   上面这些表里的放行会被架空(端口看着开着、实际不通), 比直接报错更难查。
-  请把需要的放行并入 table inet pdg 的 input chain(或把那些链改挂到非 input hook), 再重跑。" ;;
+  怎么办(二选一):
+    A. 那些放行还需要 → 把规则挪到本项目的自定义放行目录, 装完不会被更新覆盖:
+         sudo mkdir -p /etc/privdns-gateway/nft-input.d
+         echo 'tcp dport 80 accept' | sudo tee /etc/privdns-gateway/nft-input.d/10-mine.conf
+       然后从上面那些链里删掉它们, 再重跑本脚本。
+       (以前这里让你「并入 table inet pdg」—— 那个建议行不通: 那张表每次更新都按模板重建。)
+    B. 已经不需要了 → 直接从那些链里删掉, 再重跑。" ;;
   1) : ;;   # 确认无冲突 → 继续
   2) # 读不到运行中的 ruleset。机器上压根没有 nft = 还没装 nftables, 没有现网规则可冲突,
      # 照常继续(本脚本随后会装 nftables); nft 在却读不到 = 权限/内核异常, 不能盲目往下写规则。
@@ -752,6 +758,25 @@ pdg_sbmodel_mark_owned || die "写数据模型归属标记失败(磁盘满/只�
 printf '%s\n' "$CORE" > /etc/privdns-gateway/backend
 # 防火墙: **合并**而不是整文件覆盖 —— 用户的 VPN/NAT/转发/开放端口原样保留(与迁移同一实现)。
 # iOS 的 GMS 剥离在**渲染出来的块上**做, 不在合并结果上做: 后者会拿正则去扫用户自己的规则行。
+# 用户自定义放行的落点。本项目的 table inet pdg 每次更新都按模板重建, 手加在里面的规则会
+# 被冲掉 —— 以前报错时让人"并入 table inet pdg 的 input chain", 那个建议其实行不通。
+# 这个目录不受更新影响, 模板里用 glob include 它(空目录也能加载)。
+install -d -m755 /etc/privdns-gateway/nft-input.d
+[[ -e /etc/privdns-gateway/nft-input.d/README ]] || cat > /etc/privdns-gateway/nft-input.d/README <<'RDM'
+把你自己的 nftables input 放行规则放进本目录, 文件名以 .conf 结尾, 一行一条, 例如:
+
+    # /etc/privdns-gateway/nft-input.d/10-web.conf
+    tcp dport 80 accept
+    tcp dport 443 accept
+
+这些规则会被 include 进 `table inet pdg` 的 input chain 末尾(在 policy drop 之前),
+因此**不会**被本项目的 policy drop 架空。本目录不受 `pdg update` 影响。
+
+注意:
+  · 只写规则本身, 不要写 table/chain 声明;
+  · 写错语法会让整份防火墙加载失败, 改完用 `sudo nft -c -f /etc/nftables.conf` 先校验;
+  · 本文件叫 README(不是 .conf), 不会被 include。
+RDM
 _nft_block="$(mktemp)"; _nft_merged="$(mktemp)"
 render "$REPO_DIR/deploy/firewall/nftables-mihomo.conf" > "$_nft_block"
 if [[ "$PLATFORM" == ios ]]; then

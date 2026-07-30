@@ -627,6 +627,37 @@ def check_ruleset_hijack():
     return ("ok", "规则集劫持表", "%d 个规则集的域名已同步(gfw 模式下也能命中)" % drivable)
 
 
+NFT_EXTRA_DIR = "/etc/privdns-gateway/nft-input.d"
+
+def check_nft_extra():
+    """用户自定义放行的 include 点是否就位。
+
+    本项目的 `table inet pdg` 每次装机/迁移都按模板重建 —— 手加在里面的规则会被冲掉。所以
+    模板末尾 glob include 这个目录, 它不受更新影响。**目录里有 .conf 但配置里没有 include 行**
+    是最坏的一种: 用户以为规则生效了, 实际一条都没进内核, 而且哪儿都不报错。"""
+    import glob as _glob
+    confs = sorted(_glob.glob(os.path.join(NFT_EXTRA_DIR, "*.conf")))
+    try:
+        with open("/etc/nftables.conf", encoding="utf-8") as f:
+            has_inc = "nft-input.d/*.conf" in f.read()
+    except OSError:
+        return None                       # 读不到防火墙配置, 别在这里瞎报(另有检查管它)
+    if confs and not has_inc:
+        return ("fail", "自定义放行",
+                "%s 里有 %d 个 .conf, 但 /etc/nftables.conf 没有 include 它们 —— "
+                "这些规则一条都没进内核, 而且哪儿都不报错。跑 sudo pdg update 补上 include 点。"
+                % (NFT_EXTRA_DIR, len(confs)))
+    if not has_inc:
+        return ("warn", "自定义放行",
+                "防火墙里没有自定义放行的 include 点(老装尚未迁移)。需要额外放行端口时, "
+                "跑一次 sudo pdg update 补上, 之后把规则写进 %s/*.conf。" % NFT_EXTRA_DIR)
+    if not confs:
+        return ("ok", "自定义放行", "include 点就位(%s/*.conf, 目前为空)" % NFT_EXTRA_DIR)
+    return ("ok", "自定义放行",
+            "include 点就位, 已加载 %d 个自定义规则文件: %s"
+            % (len(confs), "、".join(os.path.basename(c) for c in confs[:3])))
+
+
 def check_mem():
     """显示当前内存模式 + mosdns cache size(只读, 不写 profile)。始终 ok, 仅信息展示。"""
     mode = None
@@ -1001,7 +1032,8 @@ def check_transactions():
 
 ALL = [check_platform, check_services, check_bot_credentials, check_core_version, check_dot_arecord, check_dot_domain_sync,
        check_internal_cidr, check_cidr_drift, check_nft, check_nft_input_chains, check_redirect, check_gms,
-       check_mosdns_ratelimit, check_mosdns_explicit_proxy, check_ruleset_hijack, check_mem,
+       check_mosdns_ratelimit, check_mosdns_explicit_proxy, check_ruleset_hijack,
+       check_nft_extra, check_mem,
        check_cert, check_dns, check_core_config, check_rulesets, check_mitm_structure, check_mitm,
        check_transactions]
 ALERT = [check_services, check_dns, check_cert]  # healthcheck 用的轻量子集(运行期故障)

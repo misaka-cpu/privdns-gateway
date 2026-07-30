@@ -418,4 +418,59 @@ PY
 rm -f /opt/pdg-bot/rulesets.json /etc/sing-box/rs/rs_demo.json /etc/sing-box/rs/rs_bin.mrs \
       /tmp/rsh1 /tmp/mrssrc.txt /tmp/rsmeta-bad.json
 
+
+# ══ 场景九: 老机器补上自定义放行的 include 点 ═════════════════════════════════
+# v1.7.6 及更早的 table inet pdg 里没有 include 点。以前 nftscan 撞冲突时让人"并入
+# table inet pdg 的 input chain" —— 那张表每次装机/迁移都按模板重建, 手加进去的规则下次就
+# 没了, 等于建议本身行不通。迁移要给老机器补上这个不受更新影响的落点。
+echo; echo "── 场景九: 自定义放行 include 点 ──"
+seed_v170_box
+cat > /etc/nftables.conf <<'NFTC'
+#!/usr/sbin/nft -f
+table inet pdg
+delete table inet pdg
+table inet pdg {
+    chain input {
+        type filter hook input priority 0; policy drop;
+        iif "lo" accept
+        ct state established,related accept
+        tcp dport { 22 } accept
+        ip protocol icmp accept
+    }
+}
+NFTC
+rm -rf /etc/privdns-gateway/nft-input.d
+bash /usr/local/bin/pdg __migrate >/tmp/mig13.log 2>&1
+[[ -d /etc/privdns-gateway/nft-input.d ]] \
+  && ok "补出自定义放行目录" || bad "没建目录"
+grep -qF 'include "/etc/privdns-gateway/nft-input.d/*.conf"' /etc/nftables.conf \
+  && ok "补上 include 点" || bad "没补 include: $(grep -i include /tmp/mig13.log | head -1)"
+python3 - <<'PY' && ok "include 点插在 pdg 的 input chain 内、policy drop 之后的末尾" || bad "位置不对"
+import re, sys
+lines = open("/etc/nftables.conf", encoding="utf-8").read().split("\n")
+i = next((k for k, l in enumerate(lines) if re.match(r"^table\s+inet\s+pdg\s*\{", l)), None)
+depth, cs, ce = 0, None, None
+for k in range(i, len(lines)):
+    depth += lines[k].count("{") - lines[k].count("}")
+    if cs is None and re.search(r"^\s*chain\s+input\s*\{", lines[k]): cs, cd = k, depth
+    elif cs is not None and depth < cd: ce = k; break
+body = lines[cs:ce]
+sys.exit(0 if any("nft-input.d" in l for l in body) and "nft-input.d" in body[-1] else 1)
+PY
+# 幂等
+cp /etc/nftables.conf /tmp/nft1
+bash /usr/local/bin/pdg __migrate >/dev/null 2>&1
+cmp -s /tmp/nft1 /etc/nftables.conf && ok "二跑幂等(不重复插入)" || bad "二跑又插了一遍"
+[[ "$(grep -c 'nft-input\.d' /etc/nftables.conf)" == 1 ]] \
+  && ok "include 只有一份" || bad "include 重复了 $(grep -c 'nft-input\.d' /etc/nftables.conf) 次"
+
+# 认不出的自定义防火墙形态 → 不猜着改
+seed_v170_box
+printf '#!/usr/sbin/nft -f\ntable inet pdg {\n  chain weird {\n    type filter hook forward priority 0;\n  }\n}\n' > /etc/nftables.conf
+cp /etc/nftables.conf /tmp/nft2
+bash /usr/local/bin/pdg __migrate >/tmp/mig14.log 2>&1
+cmp -s /tmp/nft2 /etc/nftables.conf \
+  && ok "pdg 表里没有 input chain → 不动防火墙(不猜着改)" || bad "改了认不出的配置"
+rm -f /tmp/nft1 /tmp/nft2
+
 e2e_summary

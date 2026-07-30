@@ -17,6 +17,7 @@
 PDG_USER_DATA="etc/privdns-gateway/bot.env
 etc/privdns-gateway/profile.env
 etc/privdns-gateway/platform
+etc/privdns-gateway/nft-input.d
 etc/privdns-gateway/backend
 etc/sing-box/config.json
 etc/mosdns/rules/custom_direct.txt

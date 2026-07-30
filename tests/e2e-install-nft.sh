@@ -58,7 +58,19 @@ case "$1" in
       [ -f "$2" ] && python3 - "$2" "$STATE" <<'PY'
 import re, sys
 new_f, state_f = sys.argv[1], sys.argv[2]
-new = open(new_f).read()
+raw = open(new_f).read()
+# 展开 include "glob" —— 真 nft 会做。桩不做的话, "自定义规则有没有进内核"那条断言
+# 根本验不到东西(永远看不到规则, 也就永远是同一个结论)。
+import glob as _g
+_out = []
+for _l in raw.split("\n"):
+    _m = re.match(r'^\s*include\s+"([^"]+)"\s*$', _l)
+    if _m:
+        for _f in sorted(_g.glob(_m.group(1))):
+            _out.append(open(_f).read().rstrip("\n"))
+        continue
+    _out.append(_l)
+new = "\n".join(_out)
 flush = any(re.match(r"^\s*flush\s+ruleset\s*$", l) for l in new.split("\n"))
 def tables(txt):
     """→ [(名字, 块文本)]; 只收顶层 table 块。"""
@@ -657,6 +669,78 @@ grep -q 'nft list table ip nat' <<<"$out" \
   && ok "5b 给了查看内容的命令" || bad "5b 没给排查命令"
 [[ "$(sha256sum /etc/nftables.conf | cut -d' ' -f1)" == "$CONF_SHA" ]] \
   && ok "5b 中止后 /etc/nftables.conf 逐字节未变" || bad "5b 原文件被改写了"
+
+
+# ══ 6. 自定义放行 include 点: 用户的规则活得过更新 ═══════════════════════════
+# 报障那位用户的实际卡点: 他内核里 `inet filter` 的 input 链有 `tcp dport 80 accept`。
+# 这道门拦得对(我们的 pdg 链是 policy drop, 不放行公网 80, 装上去他那条会被架空), 但以前给
+# 的建议是"并入 table inet pdg 的 input chain" —— 那张表每次装机/迁移都按模板重建, 手加进去
+# 的规则下次就没了, 等于**建议本身行不通**。
+echo; echo "── 6. 自定义放行目录 ──"
+reset_box
+seed_clean
+out="$(run_install "")"; rc=$?
+[[ "$rc" == 0 ]] && ok "6 装机成功" || bad "6 装机失败(rc=$rc)"
+[[ -d /etc/privdns-gateway/nft-input.d ]] \
+  && ok "6 装机建出了自定义放行目录" || bad "6 没建目录"
+[[ -e /etc/privdns-gateway/nft-input.d/README ]] \
+  && ok "6 目录里有说明文件" || bad "6 没有说明"
+[[ "$(ls /etc/privdns-gateway/nft-input.d/*.conf 2>/dev/null | wc -l)" == 0 ]] \
+  && ok "6 说明文件不叫 .conf(不会被 include 进去当规则)" || bad "6 说明文件会被当成规则"
+grep -qF 'include "/etc/privdns-gateway/nft-input.d/*.conf"' /etc/nftables.conf \
+  && ok "6 防火墙配置里有 include 点" || bad "6 配置里没有 include"
+# include 点必须在 pdg 表的 input chain 里, 而不是随便哪儿
+python3 - <<'PY' && ok "6 include 点在 table inet pdg 的 input chain 内" || bad "6 include 点位置不对"
+import re, sys
+lines = open("/etc/nftables.conf", encoding="utf-8").read().split("\n")
+i = next((k for k, l in enumerate(lines) if re.match(r"^table\s+inet\s+pdg\s*\{", l)), None)
+if i is None: sys.exit(1)
+depth, cs, ce = 0, None, None
+for k in range(i, len(lines)):
+    depth += lines[k].count("{") - lines[k].count("}")
+    if cs is None and re.search(r"^\s*chain\s+input\s*\{", lines[k]): cs, cd = k, depth
+    elif cs is not None and depth < cd: ce = k; break
+sys.exit(0 if cs is not None and ce is not None
+         and any("nft-input.d" in l for l in lines[cs:ce]) else 1)
+PY
+
+# 用户放一条规则进去 → 应用之后内核里要有它
+printf 'tcp dport 9443 accept\n' > /etc/privdns-gateway/nft-input.d/10-mine.conf
+if "$(command -v nft)" -f /etc/nftables.conf >/dev/null 2>&1; then
+  grep -qF 'tcp dport 9443 accept' "$NFT_STATE" \
+    && ok "6 自定义规则被 include 进运行 ruleset" || bad "6 自定义规则没生效"
+else
+  bad "6 应用带自定义规则的配置失败"
+fi
+
+# 关键: 再跑一次装机(模拟更新重建 pdg 表)——自定义规则必须还在。
+# 覆盖重装要显式 PDG_FORCE_REINSTALL=1: install.sh 本来就拒绝在已有部署上重装(那是对的)。
+out="$(run_install "PDG_FORCE_REINSTALL=1")"; rc=$?
+[[ "$rc" == 0 ]] && ok "6 重跑装机成功" || bad "6 重跑失败(rc=$rc): $(tail -6 <<<"$out" | tr '\n' '|')"
+[[ -f /etc/privdns-gateway/nft-input.d/10-mine.conf ]] \
+  && ok "6 **重建 pdg 表之后, 用户的自定义规则文件仍在**" || bad "6 自定义规则被更新冲掉了"
+grep -qF 'include "/etc/privdns-gateway/nft-input.d/*.conf"' /etc/nftables.conf \
+  && ok "6 重建之后 include 点也还在" || bad "6 重建把 include 点弄丢了"
+
+# doctor 要认这件事
+python3 /opt/pdg-bot/doctor.py --json > /tmp/doc-nft.json 2>/dev/null
+python3 - <<'PY' && ok "6 doctor: 自定义放行判 ok 并报出文件数" || bad "6 doctor 判定不对: $(head -c 200 /tmp/doc-nft.json)"
+import json, sys
+d = json.load(open("/tmp/doc-nft.json"))
+hit = [x for x in d if x.get("check") == "自定义放行"]
+sys.exit(0 if hit and hit[0]["level"] == "ok" and "10-mine.conf" in hit[0]["detail"] else 1)
+PY
+
+# 最坏的一种: 目录里有规则, 配置里却没 include —— 用户以为生效了, 其实一条没进内核
+sed -i '/nft-input\.d/d' /etc/nftables.conf
+python3 /opt/pdg-bot/doctor.py --json > /tmp/doc-nft2.json 2>/dev/null
+python3 - <<'PY' && ok "6 有规则但没 include → doctor 判 fail(这种最容易被忽略)" || bad "6 doctor 没抓到"
+import json, sys
+d = json.load(open("/tmp/doc-nft2.json"))
+hit = [x for x in d if x.get("check") == "自定义放行"]
+sys.exit(0 if hit and hit[0]["level"] == "fail" else 1)
+PY
+rm -f /etc/privdns-gateway/nft-input.d/10-mine.conf /tmp/doc-nft.json /tmp/doc-nft2.json
 
 rm -f "$NFT_STATE"
 e2e_summary

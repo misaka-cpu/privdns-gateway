@@ -353,6 +353,7 @@ _fw_is_stock(){
     "^ip saddr ${cre} udp dport [{] (53|443)(, (53|443))* [}] accept$"
     "^ip saddr ${cre} udp dport (53|443) accept$"
     "^ip saddr ${cre} udp dport 443 reject$"
+    '^include "/etc/privdns-gateway/nft-input\\.d/\\*\\.conf"$'
     '^ip protocol icmp accept$'
     '^ip6 nexthdr icmpv6 accept$'
     '^[}]$'
@@ -2166,6 +2167,64 @@ PY
   rm -rf "$wd"
 }
 
+# 用户自定义放行的 include 点(v1.7.6 → 之后)。
+#
+# 以前 nftscan 撞上冲突时的建议是"把需要的放行并入 table inet pdg 的 input chain" —— 那个
+# 建议其实**行不通**: 那张表每次装机/迁移都按模板重建, 手加进去的规则下次就没了。现在模板
+# 末尾 glob include 一个不受更新影响的目录, 本函数给老机器补上它。
+#
+# 用 glob 而不是单文件: 目录空着也能加载。单文件 include 一旦缺文件, 整份 nftables.conf 就
+# 加载失败 —— 那等于把人锁在门外。
+migrate_nft_extra(){
+  local f=/etc/nftables.conf d=/etc/privdns-gateway/nft-input.d
+  local inc='        include "/etc/privdns-gateway/nft-input.d/*.conf"'
+  [[ -f "$f" ]] || return 0
+  install -d -m755 "$d" 2>/dev/null || true
+  grep -q 'nft-input\.d/\*\.conf' "$f" && return 0          # 已有 → 幂等
+  grep -q '^table inet pdg {' "$f" || return 0                # 还没装 pdg 表 → 轮不到它
+  local wd; wd="$(mktemp -d)" || return 0
+  if ! python3 - "$f" "$wd/cand.conf" "$inc" <<'PY'; then
+import re, sys
+f, out, inc = sys.argv[1], sys.argv[2], sys.argv[3]
+lines = open(f, encoding="utf-8").read().split("\n")
+# 只认本项目自己那张表里的 input chain, 且只插在它的**末尾**(policy drop 之前的最后一条),
+# 这样用户的放行不会绕过我们对 QUIC 的 reject, 也不会被 policy drop 架空。
+i = next((k for k, l in enumerate(lines) if re.match(r"^table\s+inet\s+pdg\s*\{", l)), None)
+if i is None:
+    raise SystemExit("找不到 table inet pdg")
+depth, chain_start, chain_end = 0, None, None
+for k in range(i, len(lines)):
+    depth += lines[k].count("{") - lines[k].count("}")
+    if chain_start is None and re.search(r"^\s*chain\s+input\s*\{", lines[k]):
+        chain_start, cd = k, depth
+    elif chain_start is not None and depth < cd:
+        chain_end = k
+        break
+    if depth <= 0 and k > i:
+        break
+if chain_start is None or chain_end is None:
+    raise SystemExit("pdg 表里找不到闭合的 input chain")
+lines[chain_end:chain_end] = [inc]
+open(out, "w", encoding="utf-8").write("\n".join(lines))
+PY
+    c_y "  防火墙是自定义形态, 未加自定义放行 include 点(不猜着改)。"; rm -rf "$wd"; return 0
+  fi
+  local nft; nft="$(_pdg_nft_bin)"
+  if [[ -n "$nft" && -x "$nft" ]] && ! "$nft" -c -f "$wd/cand.conf" >/dev/null 2>&1; then
+    c_y "  加 include 点后 nft -c 未过, 未改动防火墙。"; rm -rf "$wd"; return 0
+  fi
+  local bak; bak="$f.preinclude.$(date +%s)"
+  cp -a "$f" "$bak" 2>/dev/null || { rm -rf "$wd"; return 0; }
+  if cat "$wd/cand.conf" > "$f" 2>/dev/null; then
+    if [[ -n "$nft" && -x "$nft" ]] && ! "$nft" -f "$f" >/dev/null 2>&1; then
+      c_y "  应用带 include 点的防火墙失败 → 已还原。"; cp -a "$bak" "$f"; "$nft" -f "$f" >/dev/null 2>&1 || true
+    else
+      c_g "  已加自定义放行 include 点: $d/*.conf(放这里的规则不会被更新覆盖)。"
+    fi
+  fi
+  rm -f "$bak"; rm -rf "$wd"
+}
+
 # 老装(v1.4.x)从来没有 backend 标记。据现场证据把它落地(unit 文件存在才算数, 免得 is-active
 # 的异常输出误导), 让"这台机器此刻跑的是哪个核"成为显式状态而非默认值。
 # v1.6.0 起唯一内核是 mihomo, 本函数仍有用: 它跑在 migrate_drop_singbox **之前**, 于是万一
@@ -2237,6 +2296,7 @@ run_all_migrations(){
   migrate_mosdns_hijack_shape || true
   migrate_mosdns_explicit_proxy || true
   migrate_ruleset_hijack || true
+  migrate_nft_extra || true
   migrate_custom_hijack || true
   migrate_mosdns_mitm || true; migrate_pdg_mitm_service || true
   migrate_android_cleanup || true
