@@ -39,24 +39,64 @@ if ! command -v mihomo >/dev/null 2>&1; then
     "$MIHOMO_VER" > /usr/local/bin/mihomo; chmod 755 /usr/local/bin/mihomo
 fi
 
-# 带**真状态**的 nft 桩: `nft -f` 装载, `nft list ruleset` 回显当前已加载规则
+# 带**真状态**的 nft 桩: `nft -f` 装载, `nft list …` 回显当前已加载规则。
+#
+# `-f` 必须区分**有没有 flush ruleset** —— 这正是本轮修复的判据所在:
+#   · 文件里 flush 生效  → 整份 ruleset 被替换(文件外的表就此消失);
+#   · 没有(或被注释掉)  → 按表合并(文件里声明的表被替换, 其余原样留着)。
+# 桩要是一律 `cat FILE > STATE`, "Docker 的表有没有活下来"这个断言就永远成立, 等于没验。
 NFT_STATE=/tmp/e2e-nft-ruleset
 cat > /usr/local/bin/nft <<'S'
 #!/bin/sh
 STATE=/tmp/e2e-nft-ruleset
 case "$1" in
   -c) exit 0 ;;
-  -f) [ -f "$2" ] && cat "$2" > "$STATE"; exit 0 ;;
-  -j) exit 1 ;;                 # 桩不实现 JSON 输出 → 合并侧走文本兜底(真机上老 nft 也这样)
+  -j) exit 1 ;;                 # 桩不实现 JSON → 合并侧走文本兜底(老 nft 也这样)
+  -f) # 场景 4 会造一个"没有 python3"的 PATH 来验扫描器跑不起来时的行为 —— 那时桩退回
+      # 最朴素的整份替换。那一节验的不是 flush 语义, 退化不影响它的判据。
+      command -v python3 >/dev/null 2>&1 || { [ -f "$2" ] && cat "$2" > "$STATE"; exit 0; }
+      [ -f "$2" ] && python3 - "$2" "$STATE" <<'PY'
+import re, sys
+new_f, state_f = sys.argv[1], sys.argv[2]
+new = open(new_f).read()
+flush = any(re.match(r"^\s*flush\s+ruleset\s*$", l) for l in new.split("\n"))
+def tables(txt):
+    """→ [(名字, 块文本)]; 只收顶层 table 块。"""
+    out, cur, buf, depth = [], None, [], 0
+    for l in txt.split("\n"):
+        st = l.split("#", 1)[0].strip()
+        m = re.match(r"^table\s+(\S+)\s+(\S+)", st)
+        if m and cur is None:
+            cur, buf, depth = "%s %s" % (m.group(1), m.group(2)), [l], l.count("{") - l.count("}")
+            if depth <= 0 and "{" not in l:      # 只是声明行, 不是块
+                cur, buf = None, []
+            continue
+        if cur is None:
+            continue
+        buf.append(l); depth += l.count("{") - l.count("}")
+        if depth <= 0:
+            out.append((cur, "\n".join(buf))); cur, buf = None, []
+    return out
+new_t = tables(new)
+if flush:
+    keep = []
+else:
+    names = {n for n, _ in new_t}
+    try:
+        old = open(state_f).read()
+    except OSError:
+        old = ""
+    keep = [(n, b) for n, b in tables(old) if n not in names]
+open(state_f, "w").write("\n".join(b for _, b in keep + new_t) + "\n")
+PY
+      exit 0 ;;
   list)
     case "$2" in
-      tables) grep -oE '^table [a-z0-9]+ [A-Za-z0-9_.-]+' "$STATE" 2>/dev/null \
-                | sed 's/ *{$//'; exit 0 ;;
-      table)  # list table <family> <name>: 只回那一张表的块
-        awk -v f="$3" -v n="$4" '
-          $1=="table" && $2==f && $3==n {p=1}
-          p {print}
-          p && /^}/ {exit}' "$STATE" 2>/dev/null; exit 0 ;;
+      tables) grep -oE '^table [a-z0-9]+ [A-Za-z0-9_.-]+' "$STATE" 2>/dev/null | sed 's/ *{$//'; exit 0 ;;
+      table)  awk -v f="$3" -v n="$4" '
+                $1=="table" && $2==f && $3==n {p=1}
+                p {print}
+                p && /^}/ {exit}' "$STATE" 2>/dev/null; exit 0 ;;
       *) cat "$STATE" 2>/dev/null; exit 0 ;;
     esac ;;
   delete) exit 0 ;;
@@ -201,7 +241,11 @@ run_install_nopy(){   # 用"没有 python3"的 PATH 跑装机
       bash "$E2E_ROOT/install.sh" 2>&1
 }
 
-reset_all(){ reset_box; rm -rf /opt/privdns-gateway; }
+# 换现场必须连**内核状态**一起换 —— 只重置 /etc/nftables.conf 是不够的。
+# nft 桩以前是"整份替换", 上一节装成功就顺带把内核状态洗干净了, 于是这个耦合看不出来;
+# 桩改成按 flush 语义合并之后(没有 flush 就保留文件外的表), 上一节的表会活到下一节,
+# 把"干净现场"污染成"有冲突现场"。清空它, 各节才真的互不影响。
+reset_all(){ reset_box; rm -rf /opt/privdns-gateway; : > "${NFT_STATE:-/tmp/e2e-nft-ruleset}"; }
 
 seed_conflict(){ cat > /etc/nftables.conf <<'NFT'
 #!/usr/sbin/nft -f
@@ -444,8 +488,9 @@ grep -q 'table inet filter' /etc/nftables.conf \
 grep -q '什么都不会丢' <<<"$out" \
   && ok "5 如实告知了那两张空表会被 flush 掉但不丢东西" || bad "5 没有告知空表的处置"
 
-# ── 5b. 同样的文件, 但内核里那张表**有规则**(Docker 那种)→ 必须仍然中止 ──
-echo "── 5b. 同现场但运行中的表有真规则 ──"
+# ── 5c. Docker 主机: 内核里那张表有真规则, 但文件里的表是空的 → 自动注释掉 flush, 一把装上 ──
+# 这是"算不算真修好"的分界: 只改错误信息, 每个跑 Docker 的用户还得自己先动手改防火墙文件。
+echo "── 5c. Docker 主机(文件表为空)→ 应自动处理并装成功 ──"
 reset_box
 cat > /etc/nftables.conf <<'CONF'
 #!/usr/sbin/nft -f
@@ -455,6 +500,86 @@ flush ruleset
 table inet filter {
         chain input {
                 type filter hook input priority filter;
+        }
+}
+CONF
+cat > "$NFT_STATE" <<'STATE'
+table inet filter {
+	chain input {
+		type filter hook input priority filter; policy accept;
+	}
+}
+table ip nat {
+	chain DOCKER {
+		policy accept;
+	}
+	chain POSTROUTING {
+		type nat hook postrouting priority srcnat; policy accept;
+		oifname "docker0" masquerade
+	}
+}
+STATE
+out="$(run_install "")"; rc=$?
+[[ "$rc" == 0 ]] && ok "5c Docker 主机一把装上(不必人工改防火墙文件)"   || bad "5c 仍失败(rc=$rc): $(grep -E '冲突位置|无法安全合并' <<<"$out" | head -1)"
+grep -qE '^# flush ruleset' /etc/nftables.conf   && ok "5c flush ruleset 被注释掉(原行留痕)" || bad "5c flush 没被处理"
+grep -q '由 pdg 注释掉' /etc/nftables.conf   && ok "5c 文件里写清了是谁改的、怎么还原" || bad "5c 注释没有自我说明"
+grep -q 'table inet pdg' /etc/nftables.conf   && ok "5c pdg 管理区已合并" || bad "5c pdg 表没进去"
+grep -q '注释掉' <<<"$out" && ok "5c 终端上如实告知了这次改动" || bad "5c 终端没提这件事"
+grep -qF 'table ip nat' "$NFT_STATE"   && ok "5c 运行中 Docker 的 NAT 表还在(没被冲掉)" || bad "5c Docker 的表被冲掉了"
+grep -q 'PDG_KEEP_FLUSH' <<<"$out" && ok "5c 给了关掉这个行为的开关" || bad "5c 没给开关"
+
+# ── 5d. 同现场但设了 PDG_KEEP_FLUSH=1 → 用户说别动就别动, 保持中止 ──
+echo "── 5d. PDG_KEEP_FLUSH=1 ──"
+reset_box
+cat > /etc/nftables.conf <<'CONF'
+#!/usr/sbin/nft -f
+
+flush ruleset
+
+table inet filter {
+        chain input {
+                type filter hook input priority filter;
+        }
+}
+CONF
+cat > "$NFT_STATE" <<'STATE'
+table inet filter {
+	chain input {
+		type filter hook input priority filter; policy accept;
+	}
+}
+table ip nat {
+	chain POSTROUTING {
+		type nat hook postrouting priority srcnat; policy accept;
+		oifname "docker0" masquerade
+	}
+}
+STATE
+CONF_SHA="$(sha256sum /etc/nftables.conf | cut -d' ' -f1)"
+out="$(run_install "PDG_KEEP_FLUSH=1")"; rc=$?
+[[ "$rc" != 0 ]] && ok "5d 设了 PDG_KEEP_FLUSH=1 → 保持中止" || bad "5d 设了开关还是自动改了"
+[[ "$(sha256sum /etc/nftables.conf | cut -d' ' -f1)" == "$CONF_SHA" ]]   && ok "5d 中止后配置逐字节未变" || bad "5d 配置被改了"
+
+# ── 5b. 运行中的表有规则, **而且文件里的表也有规则** → 去掉 flush 会让它每次 reload 累积,
+#        两条路都走不通 → 必须中止, 让人自己权衡。
+echo "── 5b. 运行表有规则 + 文件表也有规则 → 只能中止 ──"
+reset_box
+cat > /etc/nftables.conf <<'CONF'
+#!/usr/sbin/nft -f
+
+flush ruleset
+
+table inet filter {
+        chain input {
+                type filter hook input priority filter;
+        }
+}
+# 文件里另有一张**带规则**的表(不挂 input hook, 免得撞上另一道扫描门)。
+# 去掉 flush 之后, 它会在每次 reload 时把规则再加一遍 —— 所以这一局不能自动处理。
+table ip myforward {
+        chain fwd {
+                type filter hook forward priority filter; policy accept;
+                ip saddr 10.8.0.0/24 accept
         }
 }
 CONF

@@ -18,6 +18,7 @@ filter` —— Debian 上 iptables 默认是 iptables-nft, 任何东西碰一下
       都没有 → 惰性, 放行并如实告知; 读不出来 → 当成有内容(fail-closed)。
 """
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -55,6 +56,18 @@ table inet filter {
         }
         chain output {
                 type filter hook output priority filter;
+        }
+}
+"""
+
+RULED_CONF = """#!/usr/sbin/nft -f
+
+flush ruleset
+
+table inet filter {
+        chain input {
+                type filter hook input priority filter; policy drop;
+                tcp dport 22 accept
         }
 }
 """
@@ -124,7 +137,7 @@ def make_nft(d, tables, bodies, json_ok=True):
     return path
 
 
-def run_merge(d, tables, bodies, json_ok=True, conf=STOCK_CONF):
+def run_merge(d, tables, bodies, json_ok=True, conf=STOCK_CONF, extra_env=None):
     make_nft(d, tables, bodies, json_ok)
     cf = os.path.join(d, "nftables.conf")
     bf = os.path.join(d, "block.conf")
@@ -133,7 +146,12 @@ def run_merge(d, tables, bodies, json_ok=True, conf=STOCK_CONF):
         f.write(conf)
     with open(bf, "w") as f:
         f.write(BLOCK)
+    # 上一轮的产物必须先删掉 —— 否则这一轮"中止、什么都没写"会读到旧文件, 判据就废了。
+    if os.path.exists(of):
+        os.unlink(of)
     env = dict(os.environ, PATH=d + os.pathsep + os.environ["PATH"])
+    env.pop("PDG_KEEP_FLUSH", None)
+    env.update(extra_env or {})
     p = subprocess.run([sys.executable, MERGE, bf, cf, of],
                        capture_output=True, text=True, timeout=120, env=env)
     out = ""
@@ -143,78 +161,128 @@ def run_merge(d, tables, bodies, json_ok=True, conf=STOCK_CONF):
     return p.returncode, (p.stdout + p.stderr), out
 
 
+def flush_live(merged):
+    """产物里的 flush ruleset 还生效吗(注释掉的不算)。"""
+    for ln in merged.split("\n"):
+        if re.match(r"^\s*flush\s+ruleset\s*$", ln):
+            return True
+    return False
+
+
+def preserved(name, rc, merged):
+    """核心不变量: 运行中、文件里没有、可能有内容的表, 绝不能因为我们被冲掉。
+
+    两条达成路径都算合格 ——
+      · rc=0 且产物里的 flush 已经不生效(注释掉了)→ 那张表活下来了;
+      · rc=3 且没写出产物 → 什么都没动, 用户自己处置。
+    不可接受的只有一种: rc=0 而产物里 flush 仍然生效。"""
+    if rc == 3 and not merged:
+        ok(name + ": 中止且未改动任何文件")
+        return
+    if rc == 0 and not flush_live(merged):
+        ok(name + ": 放行, 且产物里的 flush 已失效 → 那张表不会被冲掉")
+        return
+    bad("%s: 危险组合(rc=%d, flush 仍生效=%s)" % (name, rc, flush_live(merged)))
+
+
 def main():
     d = tempfile.mkdtemp(prefix="nftflush.")
     try:
-        # ── 1. 用户现场: 空的 ip nat / ip filter → 必须放行 ──
+        # ── 1. 全新 Debian 13(iptables-nft 的空壳)→ 放行, 且不做多余改动 ──
         rc, msg, merged = run_merge(d, ["inet filter", "ip nat", "ip filter"],
                                     {"ip nat": EMPTY_NAT, "ip filter": EMPTY_FILTER})
-        if rc == 0:
-            ok("全新 Debian 13 现场(空的 ip nat / ip filter)→ 合并放行")
-        else:
-            bad("仍被拒(rc=%d): %s" % (rc, msg.strip().splitlines()[:1]))
+        ok("全新 Debian 13 现场(空壳 ip nat / ip filter)→ 放行") if rc == 0 \
+            else bad("空壳现场仍被拒(rc=%d)" % rc)
         if "table inet pdg" in merged and "table inet filter" in merged:
-            ok("合并结果里用户的表与 pdg 管理区都在")
+            ok("用户的表与 pdg 管理区都在")
         else:
             bad("合并结果不完整")
-        if "什么都不会丢" in msg and "ip nat" in msg:
-            ok("如实告知了这些空表会被 flush 掉但不丢东西")
+        if flush_live(merged):
+            ok("空壳现场: flush 原样保留(表是空的, 冲掉也不丢, 不必多改一行)")
         else:
-            bad("没有告知空表的处置: %r" % msg[:120])
+            bad("空壳现场把 flush 也动了 —— 多余的改动")
+        if "什么都不会丢" in msg:
+            ok("如实告知了空壳表的处置")
+        else:
+            bad("没告知空壳表的处置")
 
-        # ── 2. Docker 那种(表里有规则)→ 必须继续拒 ──
-        rc, msg, _ = run_merge(d, ["inet filter", "ip nat"], {"ip nat": DOCKER_NAT})
-        if rc == 3 and "有规则" in msg:
-            ok("表里有真规则(Docker/fail2ban)→ 仍然拒, 并说明原因")
+        # ── 2. Docker 主机, 文件里的表是空的 → 注释掉 flush, 装机继续 ──
+        # 这是"算不算真修好"的分界: 只改错误信息, Docker 用户还得自己动手改防火墙文件。
+        rc, msg, merged = run_merge(d, ["inet filter", "ip nat"], {"ip nat": DOCKER_NAT})
+        preserved("Docker 主机(文件表为空)", rc, merged)
+        ok("Docker 主机能一把装上(rc=0)") if rc == 0 else bad("Docker 主机仍要人工干预(rc=%d)" % rc)
+        if merged.count("# flush ruleset") == 1:
+            ok("原行被注释掉而不是删掉(留痕可还原)")
         else:
-            bad("有规则的表竟被放行(rc=%d)" % rc)
-        if "nft list table ip nat" in msg:
-            ok("给出了查看内容的命令")
+            bad("flush 行处理得不对")
+        if "由 pdg 注释掉" in merged and "要恢复原样" in merged:
+            ok("文件里写清了是谁改的、为什么、怎么还原")
         else:
-            bad("没给排查命令")
-        # 认出是 Docker 时, 建议必须是"去掉 flush ruleset" —— 把 Docker 的动态规则抄进
-        # 静态文件是错的, 容器一起停就对不上了。老文案两条并列给, 用户很容易选错那条。
-        if "Docker" in msg and "动态" in msg and "flush ruleset" in msg:
-            ok("认出 Docker → 建议去掉 flush ruleset, 并说明为什么不能抄进文件")
+            bad("注释没有自我说明")
+        if "已把" in msg and "注释掉" in msg and "PDG_KEEP_FLUSH=1" in msg:
+            ok("终端如实告知, 并给了关掉这个行为的开关")
         else:
-            bad("没给 Docker 专属建议: %r" % msg[-300:])
+            bad("终端没说清: %r" % msg[-160:])
+        if "Docker" in msg:
+            ok("点名了那张表看着像谁在管")
+        else:
+            bad("没点名归属")
+
+        # ── 3. 文件里的表**有规则** → 去掉 flush 会累积, 只能中止 ──
+        rc, msg, merged = run_merge(d, ["inet filter", "ip nat"], {"ip nat": DOCKER_NAT},
+                                    conf=RULED_CONF)
+        preserved("文件表有规则", rc, merged)
+        if "重复累积" in msg:
+            ok("说明了为什么这次不能自动处理")
+        else:
+            bad("没解释为什么没自动处理")
+        if "Docker" in msg and "动态" in msg:
+            ok("认出 Docker → 给的是「去掉 flush」而不是「抄进文件」")
+        else:
+            bad("没给 Docker 专属建议: %r" % msg[-200:])
         if "sed -i '/^flush ruleset$/d'" in msg:
             ok("给了可直接粘贴的命令")
         else:
             bad("没给可执行命令")
         if "抄进" in msg and "是错的" in msg:
-            ok("明确指出「写进 /etc/nftables.conf」对 Docker 是错的做法")
+            ok("明确否定了「写进 nftables.conf」这条错路")
         else:
             bad("没否定错误做法")
-
-        # ── 2b. 认不出归属的第三方表 → 退回通用建议(两条路都给)──
-        rc, msg, _ = run_merge(d, ["inet filter", "ip nat"], {"ip nat": UNKNOWN_RULED})
-        if rc == 3 and "Docker 的规则是" not in msg and "常见来源" in msg:
-            ok("认不出归属的表 → 给通用建议, 不瞎认成 Docker")
+        if "nft list table ip nat" in msg:
+            ok("给了查看表内容的命令")
         else:
-            bad("对未知表给错了建议(rc=%d)" % rc)
+            bad("没给排查命令")
 
-        # ── 3. 策略不是 accept → 必须继续拒 ──
-        rc, _, _ = run_merge(d, ["inet filter", "ip nat"], {"ip nat": DROP_TABLE})
-        ok("policy drop 的表 → 仍然拒") if rc == 3 else bad("policy drop 被放行(rc=%d)" % rc)
+        # ── 4. 认不出归属的第三方表 → 通用建议, 不瞎认成 Docker ──
+        rc, msg, merged = run_merge(d, ["inet filter", "ip nat"], {"ip nat": UNKNOWN_RULED},
+                                    conf=RULED_CONF)
+        preserved("未知归属的表", rc, merged)
+        if "Docker 的规则是" not in msg and "常见来源" in msg:
+            ok("认不出归属 → 给通用建议, 不瞎认")
+        else:
+            bad("对未知表给错了建议")
 
-        # ── 4. 读不出那张表 → fail-closed ──
-        rc, _, _ = run_merge(d, ["inet filter", "ip nat"], {})
-        ok("读不出表内容 → fail-closed 拒绝(判不了就别赌)") if rc == 3 \
-            else bad("读不出却放行了(rc=%d)" % rc)
+        # ── 5. policy drop / 读不出 / 文本兜底: 不变量都必须成立 ──
+        for nm, bodies, jsn in (("policy drop 的表", {"ip nat": DROP_TABLE}, True),
+                                ("读不出内容的表", {}, True),
+                                ("文本兜底: 有规则", {"ip nat": RULED_TEXT}, False)):
+            rc, _, merged = run_merge(d, ["inet filter", "ip nat"], bodies,
+                                      json_ok=jsn, conf=RULED_CONF)
+            preserved(nm, rc, merged)
+        rc, _, merged = run_merge(d, ["inet filter", "ip nat"], {"ip nat": EMPTY_TEXT},
+                                  json_ok=False)
+        ok("文本兜底: 空壳表照常放行") if rc == 0 else bad("文本兜底把空壳拒了(rc=%d)" % rc)
 
-        # ── 5. 老 nft 没有 -j: 文本兜底也要能分辨 ──
-        rc, _, _ = run_merge(d, ["inet filter", "ip nat"], {"ip nat": EMPTY_TEXT}, json_ok=False)
-        ok("没有 -j 的老 nft: 空表走文本兜底 → 放行") if rc == 0 \
-            else bad("文本兜底把空表拒了(rc=%d)" % rc)
-        rc, _, _ = run_merge(d, ["inet filter", "ip nat"], {"ip nat": RULED_TEXT}, json_ok=False)
-        ok("没有 -j 的老 nft: 有规则的表 → 仍然拒") if rc == 3 \
-            else bad("文本兜底放行了有规则的表(rc=%d)" % rc)
+        # ── 6. PDG_KEEP_FLUSH=1: 用户说了别动, 就别动 ──
+        rc, _, merged = run_merge(d, ["inet filter", "ip nat"], {"ip nat": DOCKER_NAT},
+                                  extra_env={"PDG_KEEP_FLUSH": "1"})
+        preserved("PDG_KEEP_FLUSH=1", rc, merged)
+        ok("设了 KEEP_FLUSH → 保持中止") if rc == 3 else bad("设了 KEEP_FLUSH 却自动改了(rc=%d)" % rc)
 
-        # ── 6. 没有 flush ruleset 的文件, 这道门根本不该介入 ──
+        # ── 7. 文件里没有 flush ruleset → 这道门根本不该介入 ──
         rc, _, _ = run_merge(d, ["inet filter", "ip nat"], {"ip nat": DOCKER_NAT},
                              conf=STOCK_CONF.replace("flush ruleset\n", ""))
-        ok("文件里没有 flush ruleset → 不因运行中的表拒绝") if rc == 0 \
+        ok("文件里没有 flush → 不因运行中的表拒绝") if rc == 0 \
             else bad("没有 flush 却被拒(rc=%d)" % rc)
     finally:
         shutil.rmtree(d, ignore_errors=True)

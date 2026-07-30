@@ -10,6 +10,7 @@
 退出码: 0=已写出合并结果; 2=pdg 块括号不配平;
         3=文件里的 flush ruleset 会冲掉只存在于运行中的表; 1=其它错误。
 """
+import os
 import re
 import subprocess
 import sys
@@ -79,6 +80,43 @@ def _owner_of(chains):
                 c.startswith(marks[0].upper().split("-")[0]) for c in up if marks[0][0].isupper()):
             return name
     return None
+
+
+# 去掉 `flush ruleset` 之后, 这份文件还能不能反复 `nft -f` 而不出问题。
+#
+# 那行的作用是让重复应用幂等。去掉它, 文件里**带规则**的表会在每次 reload 时把规则再加一遍
+# (nftables 的 table 块是叠加的), 越攒越多。所以只有当文件里除 pdg 之外的表**都是空的**
+# (只有链声明与 policy accept, 没有规则)时, 去掉才是无害的 —— 那正是发行版自带的那份骨架。
+#
+# 本项目自己的块不依赖那行 flush: 模板是 `table inet pdg` + `delete table inet pdg` +
+# 表体, 先声明再删, 每次只重建自己这一张。
+def _file_tables_are_empty(lines):
+    cur, depth = None, 0
+    for raw in lines:
+        ln = raw.split("#", 1)[0].strip()
+        if not ln:
+            continue
+        m = other_table.match(ln)
+        if m and cur is None and depth == 0:
+            parts = ln.split()
+            cur = "%s %s" % (parts[1], parts[2].rstrip("{")) if len(parts) >= 3 else None
+            depth = ln.count("{") - ln.count("}")
+            continue
+        if cur is None:
+            continue
+        depth += ln.count("{") - ln.count("}")
+        body = ln.strip("{}").strip()
+        if body and cur != "inet pdg":
+            if re.match(r"^chain\s+\S+$", body):
+                pass
+            elif re.match(r"^type\s+\w+\s+hook\s+\w+\s+priority\s+[^;]+;"
+                          r"(\s*policy\s+accept\s*;)?$", body):
+                pass
+            else:
+                return False, cur              # 有规则(或 policy 非 accept)→ 去掉 flush 会累积
+        if depth <= 0:
+            cur, depth = None, 0
+    return True, None
 
 
 # 一张"只存在于运行中"的表被 flush 掉, 到底会不会真丢东西。
@@ -197,6 +235,36 @@ if flush_ln:
               file=sys.stderr)
         for t in inert[:5]:
             print("    table %s" % t, file=sys.stderr)
+    # 真会丢东西, 但如果文件里除 pdg 外的表都是空的, 那么**去掉那行 flush 就两全**:
+    # 运行中的表(Docker 等)不再被冲, 文件重复应用也不会累积规则。这一步是装机能否在
+    # Docker 主机上自动跑通的关键 —— 否则每个用 Docker 的人都得先手工改一遍防火墙文件。
+    # PDG_KEEP_FLUSH=1 可以关掉这个行为(保持中止, 由人自己处置)。
+    if lost and os.environ.get("PDG_KEEP_FLUSH", "") not in ("1", "yes", "true"):
+        empty_ok, culprit = _file_tables_are_empty(rest_lines)
+        if empty_ok:
+            note = ("  # ↑ 由 pdg 注释掉: 这行会把只存在于运行中的表(%s)一并冲掉。"
+                    % "、".join(lost[:3]))
+            keep[flush_ln - 1] = "# " + keep[flush_ln - 1].strip() + note
+            keep.insert(flush_ln, "#   本文件里除 pdg 外的表都是空的, 去掉它不会造成规则累积;")
+            keep.insert(flush_ln + 1, "#   pdg 自己的表用 `delete table inet pdg` 重建, 不依赖它。")
+            keep.insert(flush_ln + 2, "#   要恢复原样: 删掉本行与上下两行的注释即可。")
+            print("注意: 已把 %s 第 %d 行的 `flush ruleset` **注释掉**(原行保留在文件里)。"
+                  % (target_f, flush_ln), file=sys.stderr)
+            print("  原因: 它会把这些只存在于运行中的表一并冲掉 —— %s。"
+                  % "、".join(lost[:3]), file=sys.stderr)
+            for t in lost[:3]:
+                o = _owner_of(probed[t][1])
+                if o:
+                    print("        table %s 看链名像是 %s 在管。" % (t, o), file=sys.stderr)
+            print("  这行本来就会在每次 `systemctl reload nftables` 时冲掉它们, 与本项目无关;",
+                  file=sys.stderr)
+            print("  本文件里除 pdg 外的表都是空的, 去掉它不会让规则累积。", file=sys.stderr)
+            print("  不想让我们动它: 设 PDG_KEEP_FLUSH=1 重跑, 本次改动会被拒绝而不是自动处理。",
+                  file=sys.stderr)
+            lost = []
+        else:
+            print("提示: 本可以注释掉 `flush ruleset` 来两全, 但文件里的 `table %s` 有规则 ——"
+                  " 去掉那行会让它在每次 reload 时重复累积, 所以没动。" % culprit, file=sys.stderr)
     if lost:
         print("冲突位置: %s 第 %d 行 `flush ruleset` —— 这些**只存在于运行中**的表不在文件里, "
               "而且里面**有规则**(或策略不是 accept), 应用后会被一起冲掉:"
