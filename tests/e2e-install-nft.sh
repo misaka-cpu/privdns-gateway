@@ -47,7 +47,18 @@ STATE=/tmp/e2e-nft-ruleset
 case "$1" in
   -c) exit 0 ;;
   -f) [ -f "$2" ] && cat "$2" > "$STATE"; exit 0 ;;
-  list) cat "$STATE" 2>/dev/null; exit 0 ;;
+  -j) exit 1 ;;                 # 桩不实现 JSON 输出 → 合并侧走文本兜底(真机上老 nft 也这样)
+  list)
+    case "$2" in
+      tables) grep -oE '^table [a-z0-9]+ [A-Za-z0-9_.-]+' "$STATE" 2>/dev/null \
+                | sed 's/ *{$//'; exit 0 ;;
+      table)  # list table <family> <name>: 只回那一张表的块
+        awk -v f="$3" -v n="$4" '
+          $1=="table" && $2==f && $3==n {p=1}
+          p {print}
+          p && /^}/ {exit}' "$STATE" 2>/dev/null; exit 0 ;;
+      *) cat "$STATE" 2>/dev/null; exit 0 ;;
+    esac ;;
   delete) exit 0 ;;
 esac
 exit 0
@@ -364,6 +375,111 @@ out=$(env PDG_NONINTERACTIVE=1 PDG_SKIP_CERT=1 PDG_TAG_BOOTSTRAPPED=1 \
   && ok "扫描器文件缺失 → 中止并说明仓库不完整" || bad "4e: rc=$rc: $(tail -3 <<<"$out")"
 rm -rf /tmp/repo-noscan
 rm -f /usr/local/bin/py3-real /tmp/notexec; rm -rf "$NOPY_BIN"
+
+
+# ══ 5. 全新 Debian 13: 文件是发行版自带的, 内核里还有 iptables-nft 建出来的空表 ═══
+# 用户现场(2026-07-30 报): /etc/nftables.conf 就是 nftables 包自带那份 —— `flush ruleset`
+# 加一个空的 `table inet filter`; 而内核里另有 `table ip nat` / `table ip filter`。Debian 上
+# iptables 默认是 iptables-nft, 任何东西碰一下 iptables(cloud-init、包的 postinst、甚至
+# 一句 `iptables -L`)就会把这两张空表建出来。装机因此中止在"flush 会冲掉运行中的表"。
+#
+# 那两张表一条规则都没有, 冲掉什么也不丢, iptables-nft 下次用到自己重建 —— 拦它等于
+# **全新机器装不上**。真该拦的是里面有规则的(Docker / fail2ban), 下面 5b 验那一半。
+echo; echo "── 5. 全新 Debian 13(文件里没有、内核里有的空表)──"
+reset_box
+cat > /etc/nftables.conf <<'CONF'
+#!/usr/sbin/nft -f
+
+flush ruleset
+
+table inet filter {
+        chain input {
+                type filter hook input priority filter;
+        }
+        chain forward {
+                type filter hook forward priority filter;
+        }
+        chain output {
+                type filter hook output priority filter;
+        }
+}
+CONF
+# 内核现状: 文件里那张 + iptables-nft 按需建出来的两张空表
+cat > "$NFT_STATE" <<'STATE'
+table inet filter {
+	chain input {
+		type filter hook input priority filter; policy accept;
+	}
+	chain forward {
+		type filter hook forward priority filter; policy accept;
+	}
+	chain output {
+		type filter hook output priority filter; policy accept;
+	}
+}
+table ip filter {
+	chain INPUT {
+		type filter hook input priority filter; policy accept;
+	}
+	chain FORWARD {
+		type filter hook forward priority filter; policy accept;
+	}
+}
+table ip nat {
+	chain PREROUTING {
+		type nat hook prerouting priority dstnat; policy accept;
+	}
+	chain POSTROUTING {
+		type nat hook postrouting priority srcnat; policy accept;
+	}
+}
+STATE
+out="$(run_install "")"; rc=$?
+[[ "$rc" == 0 ]] && ok "5 全新 Debian 13 现场装机成功" \
+  || bad "5 装机失败(rc=$rc): $(grep -E '冲突位置|无法安全合并|安装失败' <<<"$out" | head -2 | tr '\n' ' ')"
+grep -q 'table inet pdg' /etc/nftables.conf \
+  && ok "5 pdg 管理区已合并进配置文件" || bad "5 配置里没有 pdg 表"
+grep -q 'table inet filter' /etc/nftables.conf \
+  && ok "5 发行版自带的 inet filter 逐字节保留" || bad "5 把发行版自带的表弄丢了"
+grep -q '什么都不会丢' <<<"$out" \
+  && ok "5 如实告知了那两张空表会被 flush 掉但不丢东西" || bad "5 没有告知空表的处置"
+
+# ── 5b. 同样的文件, 但内核里那张表**有规则**(Docker 那种)→ 必须仍然中止 ──
+echo "── 5b. 同现场但运行中的表有真规则 ──"
+reset_box
+cat > /etc/nftables.conf <<'CONF'
+#!/usr/sbin/nft -f
+
+flush ruleset
+
+table inet filter {
+        chain input {
+                type filter hook input priority filter;
+        }
+}
+CONF
+CONF_SHA="$(sha256sum /etc/nftables.conf | cut -d' ' -f1)"
+cat > "$NFT_STATE" <<'STATE'
+table inet filter {
+	chain input {
+		type filter hook input priority filter; policy accept;
+	}
+}
+table ip nat {
+	chain POSTROUTING {
+		type nat hook postrouting priority srcnat; policy accept;
+		oifname "docker0" masquerade
+	}
+}
+STATE
+out="$(run_install "")"; rc=$?
+[[ "$rc" != 0 ]] && ok "5b 运行中的表有真规则 → 装机中止(不静默冲掉 Docker 的规则)" \
+  || bad "5b 竟然装成功了, Docker 的 NAT 规则会被 flush 掉"
+grep -q '有规则' <<<"$out" && ok "5b 说明了原因(表里有规则)" || bad "5b 没说清原因"
+grep -q 'nft list table ip nat' <<<"$out" \
+  && ok "5b 给了查看内容的命令" || bad "5b 没给排查命令"
+[[ "$(sha256sum /etc/nftables.conf | cut -d' ' -f1)" == "$CONF_SHA" ]] \
+  && ok "5b 中止后 /etc/nftables.conf 逐字节未变" || bad "5b 原文件被改写了"
 
 rm -f "$NFT_STATE"
 e2e_summary

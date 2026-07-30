@@ -61,6 +61,64 @@ while i < n:
         continue
     keep.append(ln); i += 1
 
+# 一张"只存在于运行中"的表被 flush 掉, 到底会不会真丢东西。
+#
+# 判据与 nftscan.py 的"空骨架不算冲突"同源: 没有任何规则、也没有 policy drop 的表是**惰性**的。
+# Debian 上 iptables 默认是 iptables-nft, 任何东西碰一下 iptables(cloud-init、包的 postinst、
+# 甚至一句 `iptables -L`)就会在内核里建出空的 `table ip filter` / `table ip nat` —— 链在、
+# 策略 accept、一条规则都没有。全新 Debian 13 装完就长这样。冲掉它什么也没丢, iptables-nft
+# 下次用到时自己重建。而 Docker / fail2ban 那种真往里塞了规则的, 冲掉就是真丢, 必须拦。
+#
+# 读不出来 → 当成有内容(fail-closed): 判不了就别赌。
+def _table_is_inert(family, name):
+    txt = None
+    for args in (["nft", "-j", "list", "table", family, name],
+                 ["nft", "list", "table", family, name]):
+        try:
+            p = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                               universal_newlines=True, timeout=15)
+        except (OSError, subprocess.SubprocessError):
+            return False
+        if p.returncode == 0 and p.stdout.strip():
+            txt = p.stdout
+            if args[1] == "-j":
+                try:
+                    import json
+                    objs = json.loads(txt).get("nftables") or []
+                except Exception:  # noqa: BLE001
+                    continue                       # JSON 版不可用 → 退到文本版再判
+                for o in objs:
+                    if not isinstance(o, dict):
+                        continue
+                    if "rule" in o:
+                        return False               # 有规则 → 冲掉就是真丢
+                    ch = o.get("chain")
+                    if isinstance(ch, dict) and str(ch.get("policy", "accept")) != "accept":
+                        return False               # policy drop/其它 → 不是惰性的
+                    if "set" in o or "map" in o or "element" in o:
+                        return False
+                return True
+            break
+    if txt is None:
+        return False
+    # 文本兜底: 去注释后, 表体里除了 table/chain 声明、type…hook…policy accept 与括号,
+    # 再有别的内容就当作"有规则"。policy 非 accept 同样算。
+    for raw in txt.split("\n"):
+        ln = raw.split("#", 1)[0].strip()
+        if not ln or ln in ("{", "}"):
+            continue
+        if re.match(r"^table\s+\S+\s+\S+\s*\{?$", ln):
+            continue
+        if re.match(r"^chain\s+\S+\s*\{?$", ln):
+            continue
+        if re.match(r"^type\s+\w+\s+hook\s+\w+\s+priority\s+[^;]+;\s*(policy\s+accept\s*;)?\s*\}?$", ln):
+            continue
+        if re.match(r"^type\s+\w+\s+hook\s+\w+\s+priority\s+[^;]+;\s*policy\s+\w+\s*;", ln):
+            return False                           # policy 不是 accept
+        return False
+    return True
+
+
 # 文件顶上的 `flush ruleset` 会在应用时清掉**全部**运行中的表。但文件里写着的那些表随后
 # 又会被同一份文件重建 —— 真正会消失的只有"只存在于运行时、不在文件里"的表(Docker、
 # fail2ban、k8s 这类自己往内核里塞规则的)。
@@ -93,11 +151,23 @@ if flush_ln:
         live = []                             # 读不到运行 ruleset: flush 本就是文件自带的,
                                               # 我们没让情况变糟 → 不因此拒绝合并
     lost = [t for t in live if t not in in_file]
+    # 惰性的(没规则、没 policy drop)不算损失: 见 _table_is_inert。全新 Debian 13 上
+    # iptables-nft 建出来的空 ip filter / ip nat 正属此类, 早先一律拒等于新机器装不上。
+    inert = [t for t in lost if _table_is_inert(*t.split(None, 1))]
+    lost = [t for t in lost if t not in inert]
+    if inert:
+        print("提示: 这些只存在于运行中的表是空的(没有规则, 策略 accept), 应用时会被 "
+              "`flush ruleset` 一并清掉, 但**什么都不会丢** —— iptables-nft 之类下次用到会自己重建:",
+              file=sys.stderr)
+        for t in inert[:5]:
+            print("    table %s" % t, file=sys.stderr)
     if lost:
         print("冲突位置: %s 第 %d 行 `flush ruleset` —— 这些**只存在于运行中**的表不在文件里, "
-              "应用后会被一起冲掉:" % (target_f, flush_ln), file=sys.stderr)
+              "而且里面**有规则**(或策略不是 accept), 应用后会被一起冲掉:"
+              % (target_f, flush_ln), file=sys.stderr)
         for t in lost[:5]:
-            print("    table %s" % t, file=sys.stderr)
+            print("    table %s   (看内容: nft list table %s)" % (t, t), file=sys.stderr)
+        print("  常见来源: Docker / fail2ban / k8s 这类自己往内核塞规则的程序。", file=sys.stderr)
         print("  请先把它们写进 /etc/nftables.conf(或去掉那行 flush ruleset)再重试。", file=sys.stderr)
         sys.exit(3)
 
