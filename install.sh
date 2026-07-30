@@ -182,7 +182,42 @@ _nft_err="$(mktemp)" || die "无法创建临时文件"
 _nft_conflict="$(python3 "$_NFTSCAN" /etc/nftables.conf 2>"$_nft_err")" || _nft_rc=$?
 _nft_stderr="$(head -c 2000 "$_nft_err" 2>/dev/null)"; rm -f "$_nft_err"
 case "$_nft_rc" in
-  0) die "检测到与本项目不兼容的 nftables input 链 → 中止安装(未改动任何文件)。
+  0) # 先试着**自动搬**: 问题不是"他有自己的 input 链", 而是本项目的 policy drop 架空了
+     # 他的 accept。把那些 accept 复制一份进我们的自定义放行目录, 他的流量就通了 —— 他自己
+     # 那张表一个字节都不用改(原链留着只是冗余)。搬不动的(drop/limit/jump, 或引用了他表内的
+     # set)照旧中止并点名。PDG_NO_ADOPT_RULES=1 可以关掉这个行为。
+     _adopt="/etc/privdns-gateway/nft-input.d/00-adopted-from-existing-firewall.conf"
+     if [[ "${PDG_NO_ADOPT_RULES:-}" != 1 ]]; then
+       _ex_err="$(mktemp)"; _ex_rc=0
+       _ex_rules="$(python3 "$_NFTSCAN" --extract-accepts /etc/nftables.conf 2>"$_ex_err")" || _ex_rc=$?
+       if [[ "$_ex_rc" == 0 && -n "$_ex_rules" ]]; then
+         # 在一张**试验表**里验一遍: 引用了对方表内 set/链的规则在我们表里不合法, 必须现在挡住,
+         # 而不是等到落盘后整份防火墙加载失败。
+         _try="$(mktemp)"
+         { echo "table inet pdgadoptcheck {"; echo "  chain input {"
+           echo "    type filter hook input priority 0; policy drop;"
+           printf '    %s\n' "$_ex_rules"; echo "  }"; echo "}"; } > "$_try"
+         _nft_exe0="$(python3 "$_NFTSCAN" --nft-path 2>/dev/null || true)"
+         if [[ -z "$_nft_exe0" || ! -x "$_nft_exe0" ]] || "$_nft_exe0" -c -f "$_try" >/dev/null 2>&1; then
+           install -d -m755 /etc/privdns-gateway/nft-input.d
+           { echo "# 由 install.sh 自动搬运: 装机时你的 input 链里有这些放行, 而本项目的"
+             echo "# table inet pdg 是 policy drop —— 同一 hook 上每条 base chain 都会执行,"
+             echo "# 不把它们也放进我们的链, 你的端口会看着开着、实际不通。"
+             echo "# 你原来那张表没有被改动; 那边的同名规则现在是冗余的, 确认无误后可以自行删掉。"
+             printf '%s\n' "$_ex_rules"; } > "$_adopt"
+           chmod 644 "$_adopt"
+           c_g "[*] 已把你 input 链里的 $(printf '%s\n' "$_ex_rules" | wc -l) 条放行搬进 $_adopt"
+           c_y "    (你自己的防火墙文件未被改动; 那边的同名规则现在是冗余的, 可自行删除)"
+           printf '%s\n' "$_ex_rules" | sed 's/^/      /'
+           rm -f "$_try" "$_ex_err"; _nft_rc=1                # 已化解 → 按"无冲突"继续
+         else
+           rm -f "$_try"
+         fi
+       fi
+       [[ "${_nft_rc}" == 1 ]] || _ex_stuck="$(head -c 1200 "$_ex_err" 2>/dev/null)"
+       rm -f "$_ex_err"
+     fi
+     [[ "$_nft_rc" == 1 ]] || die "检测到与本项目不兼容的 nftables input 链 → 中止安装(未改动任何文件)。
 $(printf '%s\n' "$_nft_conflict" | sed 's/^/    /')
   本项目的 table inet pdg 是 policy drop, 而同一 hook 上每条 base chain 都会执行 ——
   上面这些表里的放行会被架空(端口看着开着、实际不通), 比直接报错更难查。
@@ -192,7 +227,10 @@ $(printf '%s\n' "$_nft_conflict" | sed 's/^/    /')
          echo 'tcp dport 80 accept' | sudo tee /etc/privdns-gateway/nft-input.d/10-mine.conf
        然后从上面那些链里删掉它们, 再重跑本脚本。
        (以前这里让你「并入 table inet pdg」—— 那个建议行不通: 那张表每次更新都按模板重建。)
-    B. 已经不需要了 → 直接从那些链里删掉, 再重跑。" ;;
+    B. 已经不需要了 → 直接从那些链里删掉, 再重跑。
+${_ex_stuck:+
+  自动搬运没能全部完成, 这几条只能你自己定夺:
+$(printf '%s\n' "$_ex_stuck" | sed 's/^/    /')}" ;;
   1) : ;;   # 确认无冲突 → 继续
   2) # 读不到运行中的 ruleset。机器上压根没有 nft = 还没装 nftables, 没有现网规则可冲突,
      # 照常继续(本脚本随后会装 nftables); nft 在却读不到 = 权限/内核异常, 不能盲目往下写规则。

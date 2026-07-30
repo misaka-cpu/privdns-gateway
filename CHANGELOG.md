@@ -9,6 +9,13 @@
 错的是给的建议: "把需要的放行并入 `table inet pdg` 的 input chain" —— 那张表每次装机/迁移都按模板
 重建, 手加进去的规则下次就没了, **建议本身行不通**。
 
+- **装机自动搬运你已有的放行规则**:这不是 80 端口的问题 —— 实测 80 / 443 / WireGuard 51820 /
+  node_exporter 9100 / 甚至 SSH 22, 只要外来 input 链里有一条我们不放行的规则就会拦。关键认识是:
+  问题不在"你有自己的 input 链", 而在本项目的 `policy drop` 架空了你的 `accept`。所以装机现在把那些
+  `accept` **复制**一份进下面那个目录 —— 你自己那张表一个字节都不用改(原规则留着只是冗余)。
+  搬不动的照旧中止并逐条点名: `drop`/`reject`(搬过去等于给你加限制)、`limit`/`log`/`jump`(复制一份会把
+  原来的语义绕过去)、以及引用了你表内 set/链的规则(先在一张试验表里 `nft -c` 验过才落盘)。
+  `PDG_NO_ADOPT_RULES=1` 关掉这个行为。
 - **新增 `/etc/privdns-gateway/nft-input.d/`**:放这里的 `*.conf` 会被 include 进 `pdg` 的 input
   chain 末尾(`policy drop` 之前), 且不受 `pdg update` 影响。装机建目录并附说明; 老机器 `pdg update`
   时补上 include 点(幂等、`nft -c` 先校验、失败还原; pdg 表里没有 input chain 这类认不出的形态一律

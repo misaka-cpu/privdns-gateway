@@ -70,6 +70,59 @@ def _pdg_covers(raw):
     return any(p.match(ln) for p in _COVERED)
 
 
+# ── 把外来 input 链里的放行搬进本项目的自定义放行目录 ────────────────────────
+# 为什么这么做: 问题从来不是"用户有自己的 input 链", 而是本项目的 policy drop 架空了他的
+# accept。把那些 accept **复制**一份进我们的链, 他的流量就通了 —— 他原来那条链留着不动也
+# 无妨, 只是变成冗余。这样我们一个字节都不用改他的表。
+#
+# 只搬**判决为 accept** 的规则:
+#   · drop / reject 不搬 —— 那会给他加限制, 是改变行为而不是保持行为;
+#   · limit / log 不搬 —— 我们的链里再来一条无限制的 accept, 等于把他的限速/日志绕过去了;
+#   · jump / goto 不搬 —— 目标链在他自己的表里, 搬过来根本不合法。
+# 剩下引用了他表内 set/map 的规则, 由调用方用 `nft -c` 在一张试验表里验一遍挡住。
+_VERDICT_ACCEPT = re.compile(r"\baccept\s*$")
+_UNMOVABLE = re.compile(r"\b(limit|log|jump|goto|queue|dup|fwd)\b")
+
+
+def extract_accepts(conf_txt, live_txt):
+    """→ (可搬的规则行, 搬不动的 [(规则, 原因)])。只看外来 input base chain。"""
+    movable, stuck = [], []
+    for txt in (conf_txt or "", live_txt or ""):
+        cur, depth, chain_depth = None, 0, None
+        for raw in txt.split("\n"):
+            ln = _strip_noise(raw)
+            m = _TBL_OPEN.match(ln)
+            if m and cur is None:
+                cur, depth = "%s %s" % (m.group(1), m.group(2)), 0
+            if cur is None:
+                continue
+            depth += ln.count("{") - ln.count("}")
+            if _HOOK_IN.search(ln) and cur != OURS:
+                chain_depth = depth
+                continue
+            if chain_depth is None:
+                if depth <= 0:
+                    cur = None
+                continue
+            if depth < chain_depth:
+                chain_depth = None
+                if depth <= 0:
+                    cur = None
+                continue
+            body = raw.split("#", 1)[0].strip()
+            if not body or body in ("{", "}"):
+                continue
+            if _pdg_covers(raw):
+                continue                       # 我们的链本来就有, 不必重复搬
+            if not _VERDICT_ACCEPT.search(body):
+                stuck.append((body, "判决不是 accept(搬过去会改变行为)"))
+            elif _UNMOVABLE.search(body):
+                stuck.append((body, "带 limit/log/jump 之类, 复制一份会把原来的语义绕过去"))
+            elif body not in movable:
+                movable.append(body)
+    return movable, stuck
+
+
 def _describe(src, table, n_rules, policy_drop, samples):
     """冲突描述。**把具体规则贴出来** —— 只说"1 条规则"的话, 用户既不知道是哪条、也就无从
     判断该并进 pdg 还是改挂别的 hook; 远程协助时同样只能靠猜。"""
@@ -193,6 +246,31 @@ def main(argv):
             print(exe)
             return 0
         return 1
+    # --extract-accepts: 把外来 input 链里可以安全搬走的 accept 规则打印出来(每行一条)。
+    # 装机据此把它们复制进 /etc/privdns-gateway/nft-input.d/, 用户的放行就不再被我们的
+    # policy drop 架空 —— 而他自己那张表一个字节都不用改。
+    # 退出码: 0=有可搬的(已打印) 1=没有可搬的 2=有搬不动的(原因打到 stderr)/读不到 ruleset。
+    if "--extract-accepts" in argv[1:]:
+        rest = [a for a in argv[1:] if a != "--extract-accepts"]
+        conf = rest[0] if rest else NFT_CONF
+        try:
+            with open(conf, encoding="utf-8") as f:
+                conf_txt = f.read()
+        except OSError:
+            conf_txt = ""
+        live_txt, readable = live_ruleset()
+        if not readable:
+            print("读不到运行 ruleset, 无法判断要搬哪些规则", file=sys.stderr)
+            return 2
+        movable, stuck = extract_accepts(conf_txt, live_txt)
+        for body, why in stuck:
+            print("%s\t%s" % (body, why), file=sys.stderr)
+        if stuck:
+            return 2
+        if not movable:
+            return 1
+        print("\n".join(movable))
+        return 0
     conf = argv[1] if len(argv) > 1 else NFT_CONF
     found, readable = scan(conf)
     if found:

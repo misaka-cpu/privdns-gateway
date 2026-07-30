@@ -212,8 +212,14 @@ mihomo」，**具体走哪个出口仍由数据模型里的真实规则决定**�
   这一层只在 `gfw` 模式下看得出差别：`all` 模式"不是国内就劫持"本来就把规则集的域名兜住了。
 
 **网关上还跑着别的服务？** 本项目的 `table inet pdg` 是 `policy drop`，而 nftables 里同一 hook 上
-每条 base chain 都会执行——你写在别处的 `accept` 会被它架空（端口看着开着、实际不通）。所以额外的
-放行要写进这个目录：
+每条 base chain 都会执行——你写在别处的 `accept` 会被它架空（端口看着开着、实际不通）。
+
+**装机会自动处理**：检测到你的 input 链里有放行规则时，会把那些 `accept` 复制一份进下面这个目录，
+**你自己的防火墙文件一个字节都不改**（原来那些规则留着，只是变成冗余，确认无误后可自行删除）。
+带 `drop`/`limit`/`jump` 的规则搬过去会改变行为，那种只会中止并逐条点名，交给你处理。
+`PDG_NO_ADOPT_RULES=1` 可以关掉自动搬运。
+
+要自己加放行也写进这个目录：
 
 ```bash
 echo 'tcp dport 80 accept' | sudo tee /etc/privdns-gateway/nft-input.d/10-web.conf

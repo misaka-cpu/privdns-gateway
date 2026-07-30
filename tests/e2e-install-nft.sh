@@ -169,8 +169,11 @@ grep -q 'table inet pdg' /etc/nftables.conf && ok "pdg 管理区已合并进来"
 grep -qF 'table ip mynat' "$NFT_STATE" \
   && ok "运行中的 ruleset 里也还有用户的表(真的加载了合并结果)" || bad "1f: 运行规则丢了用户表"
 
-# ══ 2. 存在其它 input base chain → 安装前中止, 现场一个字节都不动 ═══════════
-echo; echo "── 2. 已有自定义 input base chain ──"
+# ══ 2. 化解不了的 input 链冲突 → 安装前中止, 现场一个字节都不动 ═══════════
+# 纯 accept 的现场现在会被自动搬进 nft-input.d 并照常装上(场景 7 守着那条路)。这里要验的是
+# **化解不了时什么都不动**, 所以夹具里带一条 `drop` —— 那种规则不能自动搬(搬过去等于给用户
+# 加限制, 是改变行为而不是保持行为)。
+echo; echo "── 2. 已有自定义 input base chain(含搬不动的规则)──"
 reset_box
 cat > /etc/nftables.conf <<'NFT'
 #!/usr/sbin/nft -f
@@ -181,6 +184,7 @@ table inet myfilter {
         ct state established,related accept
         tcp dport { 9443, 9444 } accept
         udp dport 51820 accept
+        tcp dport 23 drop
     }
 }
 NFT
@@ -188,7 +192,7 @@ nft -f /etc/nftables.conf
 CONF_SHA="$(sha256sum /etc/nftables.conf | cut -d' ' -f1)"
 RULESET_SHA="$(sha256sum "$NFT_STATE" | cut -d' ' -f1)"
 out=$(run_install ""); rc=$?
-[[ "$rc" != 0 ]] && ok "冲突现场 → 安装中止(返回非 0)" || bad "2: 竟然装成功了: $(tail -4 <<<"$out")"
+[[ "$rc" != 0 ]] && ok "化解不了的冲突 → 安装中止(返回非 0)" || bad "2: 竟然装成功了: $(tail -4 <<<"$out")"
 grep -qE 'input|中止安装' <<<"$out" && ok "说明了原因(input 链冲突)" || bad "2b: 没说清原因: $(tail -4 <<<"$out")"
 grep -q 'myfilter' <<<"$out" && ok "点名了冲突的表(myfilter)" || bad "2c: 没点名冲突表"
 [[ "$(sha256sum /etc/nftables.conf | cut -d' ' -f1)" == "$CONF_SHA" ]] \
@@ -259,12 +263,16 @@ run_install_nopy(){   # 用"没有 python3"的 PATH 跑装机
 # 把"干净现场"污染成"有冲突现场"。清空它, 各节才真的互不影响。
 reset_all(){ reset_box; rm -rf /opt/privdns-gateway; : > "${NFT_STATE:-/tmp/e2e-nft-ruleset}"; }
 
+# 化解不了的冲突现场。带一条 `drop` —— 那种规则不能被自动搬进本项目的链(搬过去等于给用户
+# 加限制, 是改变行为), 所以装机只能中止。纯 accept 的现场现在会被自动搬走并照常装上(场景 7),
+# 那条路另有用例守着; 这里要验的是**化解不了时一个字节都不动现场**。
 seed_conflict(){ cat > /etc/nftables.conf <<'NFT'
 #!/usr/sbin/nft -f
 table inet myfilter {
     chain input {
         type filter hook input priority 0; policy drop;
         tcp dport { 9443 } accept
+        tcp dport 23 drop
     }
 }
 NFT
@@ -365,10 +373,14 @@ for code in 0 1 2; do
   reset_all; seed_clean
   CONF_SHA="$(sha256sum /etc/nftables.conf | cut -d' ' -f1)"
   RULESET_SHA="$(sha256sum "$NFT_STATE" | cut -d' ' -f1)"
+  # 本节验的是"扫描器回 0/1/2 时 install 怎么做"这条既有语义。装机在冲突时还会再调一次
+  # `nftscan.py --extract-accepts` 试着自动搬规则 —— 那条路另有场景 7 守着; 这里让它明确回 2
+  # (搬不动), 否则桩的通配会把注入的那行文字当成"可搬的规则"喂进去, 本节就变成在验别的东西。
   put_py_stub <<S
 #!/bin/sh
 case "\$1 \$2" in
   */nftscan.py\ --nft-path) ;;                 # 放行: 这是问"nft 在哪", 不是扫描
+  */nftscan.py\ --extract-accepts) echo "注入: 本节不验自动搬运" >&2; exit 2 ;;
   */nftscan.py*) echo "注入: 模拟退出 $code"; exit $code ;;
 esac
 exec /usr/local/bin/py3-real "\$@"
@@ -741,6 +753,125 @@ hit = [x for x in d if x.get("check") == "自定义放行"]
 sys.exit(0 if hit and hit[0]["level"] == "fail" else 1)
 PY
 rm -f /etc/privdns-gateway/nft-input.d/10-mine.conf /tmp/doc-nft.json /tmp/doc-nft2.json
+
+
+# ══ 7. 自动搬运: 用户 input 链里的放行, 装机自己搬进 nft-input.d ══════════════
+# 报障那位用户的实际卡点是 `tcp dport 80 accept`, 但跟端口无关 —— 80/443/WireGuard/
+# node_exporter 甚至 SSH, 只要外来 input 链里有一条我们不放行的规则就会拦。让每个在网关上
+# 还跑着别的服务的人都先手工改三步防火墙, 不现实。
+#
+# 关键认识: 问题不是"他有自己的 input 链", 而是本项目的 policy drop 架空了他的 accept。
+# 把那些 accept **复制**一份进我们的链, 他的流量就通 —— 他自己那张表一个字节都不用改。
+echo; echo "── 7. 装机自动搬运外来放行规则 ──"
+reset_box
+cat > /etc/nftables.conf <<'CONF'
+#!/usr/sbin/nft -f
+table inet filter {
+        chain input {
+                type filter hook input priority filter; policy accept;
+                iif "lo" accept
+                ct state established,related accept
+                tcp dport 80 accept
+                udp dport 51820 accept
+        }
+}
+CONF
+cat > "$NFT_STATE" <<'STATE'
+table inet filter {
+	chain input {
+		type filter hook input priority filter; policy accept;
+		iif "lo" accept
+		ct state established,related accept
+		tcp dport 80 accept
+		udp dport 51820 accept
+	}
+}
+STATE
+CONF_SHA="$(sha256sum /etc/nftables.conf | cut -d' ' -f1)"
+out="$(run_install "")"; rc=$?
+ADOPT=/etc/privdns-gateway/nft-input.d/00-adopted-from-existing-firewall.conf
+[[ "$rc" == 0 ]] && ok "7 有自定义放行的机器一把装上(不必先手工改防火墙)" \
+  || bad "7 仍被拦(rc=$rc): $(grep -E '不兼容|中止' <<<"$out" | head -1)"
+[[ -f "$ADOPT" ]] && ok "7 生成了自动搬运文件" || bad "7 没生成搬运文件"
+grep -q '^tcp dport 80 accept$' "$ADOPT" 2>/dev/null \
+  && ok "7 搬到了 tcp dport 80" || bad "7 没搬 80"
+grep -q '^udp dport 51820 accept$' "$ADOPT" 2>/dev/null \
+  && ok "7 搬到了 udp dport 51820(跟端口无关, 都能搬)" || bad "7 没搬 51820"
+grep -q 'iif "lo"' "$ADOPT" 2>/dev/null \
+  && bad "7 把我们本来就放行的也搬了(冗余)" || ok "7 我们已放行的那几条不重复搬"
+grep -q '你原来那张表没有被改动' "$ADOPT" 2>/dev/null \
+  && ok "7 文件里写清了来历与后续处理" || bad "7 搬运文件没有自我说明"
+grep -q '已把你 input 链里的' <<<"$out" \
+  && ok "7 终端上如实告知搬了哪些" || bad "7 终端没说"
+
+# 用户自己那张表不许被动过 —— 我们只在自己的目录里加文件
+python3 - <<'PY' && ok "7 用户的 inet filter 表逐字节未变(只在我们自己的目录加文件)" || bad "7 动了用户的表"
+import re, sys
+txt = open("/etc/nftables.conf", encoding="utf-8").read()
+m = re.search(r"table inet filter \{.*?\n\}", txt, re.S)
+sys.exit(0 if m and "tcp dport 80 accept" in m.group(0)
+         and "udp dport 51820 accept" in m.group(0) else 1)
+PY
+# 真正的判据: 应用之后内核里我们的链也放行了 80
+grep -qF 'tcp dport 80 accept' "$NFT_STATE" \
+  && ok "7 运行 ruleset 里能看到被搬过来的放行" || bad "7 搬过来的规则没进内核"
+
+# ── 7b. 搬不动的(drop / limit)→ 照旧中止并点名, 不硬来 ──
+echo "── 7b. 有搬不动的规则 ──"
+reset_box
+cat > /etc/nftables.conf <<'CONF'
+#!/usr/sbin/nft -f
+table inet filter {
+        chain input {
+                type filter hook input priority filter; policy accept;
+                tcp dport 80 accept
+                tcp dport 23 drop
+        }
+}
+CONF
+cat > "$NFT_STATE" <<'STATE'
+table inet filter {
+	chain input {
+		type filter hook input priority filter; policy accept;
+		tcp dport 80 accept
+		tcp dport 23 drop
+	}
+}
+STATE
+CONF_SHA2="$(sha256sum /etc/nftables.conf | cut -d' ' -f1)"
+out="$(run_install "")"; rc=$?
+[[ "$rc" != 0 ]] && ok "7b 有 drop 规则 → 中止(搬过去会改变行为)" || bad "7b 竟然装成功了"
+grep -q '判决不是 accept' <<<"$out" \
+  && ok "7b 点名了搬不动的那条与原因" || bad "7b 没点名: $(tail -4 <<<"$out")"
+[[ "$(sha256sum /etc/nftables.conf | cut -d' ' -f1)" == "$CONF_SHA2" ]] \
+  && ok "7b 中止后用户配置逐字节未变" || bad "7b 改了用户配置"
+[[ -f /etc/privdns-gateway/nft-input.d/00-adopted-from-existing-firewall.conf ]] \
+  && bad "7b 中止了却留下了半截搬运文件" || ok "7b 中止时不留半截文件"
+
+# ── 7c. PDG_NO_ADOPT_RULES=1 → 用户说别搬就别搬 ──
+echo "── 7c. PDG_NO_ADOPT_RULES=1 ──"
+reset_box
+cat > /etc/nftables.conf <<'CONF'
+#!/usr/sbin/nft -f
+table inet filter {
+        chain input {
+                type filter hook input priority filter; policy accept;
+                tcp dport 80 accept
+        }
+}
+CONF
+cat > "$NFT_STATE" <<'STATE'
+table inet filter {
+	chain input {
+		type filter hook input priority filter; policy accept;
+		tcp dport 80 accept
+	}
+}
+STATE
+out="$(run_install "PDG_NO_ADOPT_RULES=1")"; rc=$?
+[[ "$rc" != 0 ]] && ok "7c 设了 PDG_NO_ADOPT_RULES=1 → 保持中止" || bad "7c 设了开关还是搬了"
+[[ -f /etc/privdns-gateway/nft-input.d/00-adopted-from-existing-firewall.conf ]] \
+  && bad "7c 设了开关却仍生成了搬运文件" || ok "7c 没生成搬运文件"
 
 rm -f "$NFT_STATE"
 e2e_summary
