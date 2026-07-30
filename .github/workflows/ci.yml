@@ -202,6 +202,9 @@ jobs:
       - name: "iOS 描述文件生命周期 (稳定身份 / 三档判定 / 事务原子性)"
         run: python3 tests/test-ios-profile-lifecycle.py
 
+      - name: "iOS 描述文件交互 (Bot/CLI 同一份记录 + 不声称设备状态 + Android 全拒)"
+        run: python3 tests/test-ios-profile-ux.py
+
       - name: "自检防火墙端口回归"
         run: python3 tests/test-doctor-firewall.py
 

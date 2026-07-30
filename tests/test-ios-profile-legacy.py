@@ -185,8 +185,8 @@ else:
 pdg_sh = open(os.path.join(ROOT, "deploy/bot/pdg.sh"), encoding="utf-8").read()
 m = re.search(r"^cmd_ios\(\)\{.*?^\}", pdg_sh, re.S | re.M)
 cli = m.group(0) if m else ""
-if "iosprofile.py" in cli and "__UUID" not in cli:
-    ok("CLI 不再自己拼占位符, 改调 iosprofile.py(与 Bot 同一份实现)")
+if "iosstate.py" in cli and "__UUID" not in cli and "random/uuid" not in cli:
+    ok("CLI 不再自己拼占位符/自取随机 UUID, 改调 iosstate.py(与 Bot 同一份实现与记录)")
 else:
     bad("CLI 仍在自己生成描述文件")
 if "python3 -m http.server" in cli and "nft insert rule" in cli:
@@ -221,8 +221,8 @@ if p.stdout.strip().startswith("RAISED"):
 else:
     bad("Android 上竟然生成了 iOS 描述文件: %r" % p.stdout.strip())
 
-if "iOS 描述文件仅 iOS 平台可用" in cli:
-    ok("现状: CLI cmd_ios 在 Android 上明确拒绝")
+if "ic_gate || return 1" in cli and "iOS 描述文件仅 iOS 平台可用" in pdg_sh:
+    ok("CLI cmd_ios 第一件事就是过平台门控(门控本体在 ic_gate 里)")
 else:
     bad("CLI 缺少平台门控")
 

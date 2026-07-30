@@ -1316,13 +1316,11 @@ _pdg_cidr_transact(){
   rm -rf "$wd"; return 1
 }
 
-cmd_ios(){
-  need_root ios
-  # 平台门控: Android 直接拒绝 —— 不装 qrencode、不临时改 nft、不开 8443。
+ic_gate(){
+  # iOS 专属命令的统一平台门控。Android 上一律拒绝: 不装 qrencode、不临时改 nft、不开 8443,
+  # 也不读写任何生命周期记录。
   if [[ "$(_pdg_platform)" != ios ]]; then
     echo "❌ iOS 描述文件仅 iOS 平台可用(本机为 Android)。"
-    # 推测态下不能把"本机是 Android"当成事实说 —— 没人确认过。v1.4.x 升上来的 iPhone
-    # 机器正落在这里, 一句干巴巴的拒绝会让人以为功能没了, 其实只差一条确认命令。
     if [[ -e /etc/privdns-gateway/platform.guessed ]]; then
       echo "   ⚠️ 这个 android 是**推测**的(老装升级时无确凿证据), 没人确认过。"
       echo "   若本网关服务的是 iPhone: sudo pdg platform ios   (确认后本功能立即可用)"
@@ -1331,28 +1329,97 @@ cmd_ios(){
     fi
     return 1
   fi
-  local TMPL=/opt/pdg-bot/pdg-dot.mobileconfig.tmpl
+  return 0
+}
+
+# iOS 生命周期子命令。这几个都不开临时下载端口 —— 它们只是看记录/取文件。
+cmd_ios_state(){
+  need_root ios
+  ic_gate || return 1
+  local st; st="$(_pdg_module iosstate.py)" || { echo "❌ 找不到 iosstate.py, 先跑 pdg update"; return 1; }
+  local sub="${1:-status}"; shift || true
+  case "$sub" in
+    status)
+      local HOST IP
+      HOST="$(_ios_dot_host)"; IP="$(_ios_server_ip)"
+      if [[ -n "$HOST" && -n "$IP" ]]; then
+        python3 "$st" status --dot-host "$HOST" --server-ip "$IP" --template "$IOS_TMPL" \
+          --wloc-config /etc/privdns-gateway/mitm.json --ca-crt /etc/privdns-gateway/ca/ca.crt
+      else
+        # 读不到当前网关配置就只报记录, 不硬猜一个判定结果。
+        echo "⚠️ 读不到当前 DoT 主机名 / 网关地址, 只显示已生成的记录:"
+        python3 "$st" status
+      fi;;
+    diff|ack|recover) python3 "$st" "$sub";;
+    previous)
+      local out=/opt/pdg-bot/PrivDNS-Gateway-prev.mobileconfig
+      python3 "$st" previous --out "$out" && echo "已写到 $out"
+      ;;
+    *) echo "用法: pdg ios {status|diff|previous|ack|recover}"; return 2;;
+  esac
+}
+
+IOS_TMPL=/opt/pdg-bot/pdg-dot.mobileconfig.tmpl
+
+_ios_dot_host(){
+  local CERT=/etc/mosdns/certs/fullchain.pem
+  [[ -f /etc/dnsdist/certs/fullchain.pem ]] && CERT=/etc/dnsdist/certs/fullchain.pem
+  openssl x509 -in "$CERT" -noout -subject 2>/dev/null \
+    | grep -oE 'CN *= *[A-Za-z0-9.*-]+' | sed 's/.*= *//'
+}
+
+_ios_server_ip(){
+  local ip
+  ip=$(grep -oE '"[0-9.]+/32"' /etc/sing-box/config.json 2>/dev/null | tr -d '"' \
+       | grep -v '^127' | head -1 | cut -d/ -f1)
+  [[ -n "$ip" ]] || ip=$(curl -fsSL --max-time 6 https://api.ipify.org)
+  printf '%s' "$ip"
+}
+
+cmd_ios(){
+  need_root ios
+  # 平台门控: Android 直接拒绝 —— 不装 qrencode、不临时改 nft、不开 8443。
+  ic_gate || return 1
+  # 子命令(只看记录/取文件, 不开端口)。无参数 = 生成并临时提供下载。
+  case "${1:-}" in
+    status|diff|previous|ack|recover) cmd_ios_state "$@"; return $?;;
+  esac
+  local TMPL="$IOS_TMPL"
   [[ -f "$TMPL" ]] || { echo "缺少 $TMPL, 先装好 PrivDNS Gateway"; return 1; }
   command -v qrencode >/dev/null || { c_g "装 qrencode…"; apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq qrencode; }
   # 取 DoT 主机名(证书 CN)/ 公网 IP / 内网卡段
-  local CERT=/etc/mosdns/certs/fullchain.pem; [[ -f /etc/dnsdist/certs/fullchain.pem ]] && CERT=/etc/dnsdist/certs/fullchain.pem
   local HOST IP CIDR
-  HOST=$(openssl x509 -in "$CERT" -noout -subject 2>/dev/null | grep -oE 'CN *= *[A-Za-z0-9.*-]+' | sed 's/.*= *//')
-  IP=$(grep -oE '"[0-9.]+/32"' /etc/sing-box/config.json 2>/dev/null | tr -d '"' | grep -v '^127' | head -1 | cut -d/ -f1)
-  [[ -n "$IP" ]] || IP=$(curl -fsSL --max-time 6 https://api.ipify.org)
+  HOST="$(_ios_dot_host)"
+  IP="$(_ios_server_ip)"
   CIDR=$(grep -oE 'ip saddr [0-9./]+' /etc/nftables.conf 2>/dev/null | head -1 | awk '{print $3}')
   [[ -n "$HOST" && -n "$IP" && -n "$CIDR" ]] || { echo "信息不全 (HOST=$HOST IP=$IP CIDR=$CIDR)"; return 1; }
 
-  # 生成走 iosprofile.py —— 和 Bot 的「📱 iOS 描述文件」是同一份实现。以前这里是四个占位符
-  # 的 sed 替换, 结果是: WLOC 开着也不附根证书、不支持强制直连 SSID, 于是"用命令行生成的
-  # 描述文件"和"用 bot 生成的"内容不一样, 而两处都没提示过这件事。
-  local GEN; GEN="$(_pdg_module iosprofile.py)" || { echo "❌ 找不到 iosprofile.py, 先跑 pdg update"; return 1; }
+  # 生成走 iosstate.py(内部再调 iosprofile.py)—— 和 Bot 的「📱 iOS 描述文件」是同一份实现,
+  # 同一份记录。以前这里是四个占位符的 sed 替换: 每次现取随机 UUID, WLOC 开着也不附根证书,
+  # 不支持强制直连 SSID。于是"用命令行生成的"和"用 bot 生成的"内容不一样、身份也不一样,
+  # 而两处都没提示过这件事 —— 用户手机上就这么一份一份堆起来。
+  local ST; ST="$(_pdg_module iosstate.py)" || { echo "❌ 找不到 iosstate.py, 先跑 pdg update"; return 1; }
+  local LEGACY=() ans=""
+  if [[ ! -s /etc/privdns-gateway/ios-profile.json ]]; then
+    # 服务器没有任何办法知道这台网关以前有没有发过旧版(随机身份)描述文件, 而用户知道。
+    # 与其猜, 不如问 —— 猜错的代价是用户手机上悄悄多出一个永远不会被更新的描述文件。
+    echo
+    c_y "首次启用受管描述文件。以前在这台网关上装过 PrivDNS Gateway 的 iOS 描述文件吗?"
+    echo "  装过 → 旧版每次都是随机身份, iOS 会把新的当成**另一个**描述文件, 需要先手工删掉旧的。"
+    if [[ -n "${PDG_IOS_LEGACY:-}" ]]; then
+      ans="$PDG_IOS_LEGACY"          # 非交互场景(装机脚本 / 测试)显式给出, 不在这里卡住
+    else
+      printf "装过请输入 y, 没装过按回车: "
+      read -r -t 120 ans || ans=""
+    fi
+    [[ "$ans" == [yY]* ]] && LEGACY=(--legacy)
+  fi
   local PORT=8443 TOK WWW URL
   TOK=$(openssl rand -hex 6)
   WWW=$(mktemp -d)
-  if ! python3 "$GEN" render --dot-host "$HOST" --server-ip "$IP" --template "$TMPL" \
+  if ! python3 "$ST" generate --dot-host "$HOST" --server-ip "$IP" --template "$TMPL" \
         --wloc-config /etc/privdns-gateway/mitm.json --ca-crt /etc/privdns-gateway/ca/ca.crt \
-        > "$WWW/$TOK.mobileconfig"; then
+        --out "$WWW/$TOK.mobileconfig" "${LEGACY[@]}"; then
     rm -rf "$WWW"; echo "❌ 生成描述文件失败, 未开放任何临时端口。"; return 1
   fi
   URL="http://$IP:$PORT/$TOK.mobileconfig"
@@ -1395,6 +1462,7 @@ menu(){
     echo "  8) 日志"
     echo "  9) 流量 (vnstat)"
     [[ "$(_pdg_platform)" == ios ]] && echo " 10) iOS 描述文件"   # iOS 专属: Android 不显示
+    [[ "$(_pdg_platform)" == ios ]] && echo " 14) iOS 描述文件状态"
     echo " 11) 诊断报告 (脱敏)"
     echo " 12) 识别内网卡段"
     echo " 13) 卸载"
@@ -1413,6 +1481,7 @@ menu(){
       8) cmd_log 60;;
       9) cmd_traffic;;
       10) cmd_ios;;
+      14) cmd_ios_state status;;
       11) cmd_report;;
       12) cmd_detect_cidr;;
       13) read -rp "卸载: 留空取消 / yes 仅卸载 / purge 连配置一起删: " x
@@ -3523,7 +3592,7 @@ case "${1:-menu}" in
   restart)       cmd_restart;;
   log|logs)      shift || true; cmd_log "${1:-40}";;
   traffic|tr)    cmd_traffic;;
-  ios)           cmd_ios;;
+  ios)           shift || true; cmd_ios "$@";;
   report)        shift || true; cmd_report "$@";;
   detect-cidr|cidr) shift || true; cmd_detect_cidr "${1:-}";;
   platform)      shift || true; cmd_platform "${1:-}";;
@@ -3533,5 +3602,5 @@ case "${1:-menu}" in
   # 拿不到地址, 而 `pdg rescue rotate cert` 会因为参数丢失退化成默认的 token 轮换:
   # 用户要求换证书, 实际换掉的是 token(会话全断, 指纹却没变)。
   rescue)        shift || true; cmd_rescue "$@";;
-  *) echo "用法: pdg [menu|status|doctor [--json|--deep]|update [--dry-run]|snapshot|rollback [n]|token|restart|log [n]|traffic|ios(仅 iOS)|report [--redact-ip|--full]|detect-cidr|platform <ios|android>|hijack-mode <all|gfw>|migrate|migrate-fw|tx <list|show|recover|abort>|rescue <enable|disable|status|fingerprint|bind <IPv4>|rotate-token|rotate-cert>|uninstall [--purge]]";;
+  *) echo "用法: pdg [menu|status|doctor [--json|--deep]|update [--dry-run]|snapshot|rollback [n]|token|restart|log [n]|traffic|ios [status|diff|previous|ack|recover](仅 iOS)|report [--redact-ip|--full]|detect-cidr|platform <ios|android>|hijack-mode <all|gfw>|migrate|migrate-fw|tx <list|show|recover|abort>|rescue <enable|disable|status|fingerprint|bind <IPv4>|rotate-token|rotate-cert>|uninstall [--purge]]";;
 esac

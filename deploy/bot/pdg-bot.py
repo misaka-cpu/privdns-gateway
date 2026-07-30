@@ -3100,19 +3100,134 @@ def _mitm_ca_der():
     return iosprofile.ca_der_from_pem(pem)
 
 def _ios_profile(ssids=(), ids=None):
-    """iOS DoT 描述文件。ssids 非空时在 OnDemandRules 最前插一条「命中这些 SSID 强制直连」;
-    WLOC(MITM 插件)启用时附上根 CA payload, 让设备信任本网关 CA(先开 WLOC 再重新生成即含 CA)。
-    ids 省略时用随机身份(旧行为); 受管生命周期会传入从 instance_id 派生的稳定身份。"""
+    """**不碰生命周期状态**的渲染入口: 平台门控 + 本机数据源 + 可选身份 → 文件字节。
+
+    受管生成走 _ios_generate(它会记 revision / current / previous)。这一个留给"只要文件、
+    不该改状态"的调用方, 也是 Bot↔CLI 逐字节一致那条回归的 Bot 侧入口 —— 因为身份可以显式
+    传入, 才谈得上"同样输入产出同样字节"。
+    """
     if _platform() != "ios":         # 最底层门控: 即便某路径绕过按钮/回调, 也生成不了 iOS 描述文件
         raise RuntimeError("iOS 描述文件仅 iOS 平台可用(本机为 Android)。" + _platform_unconfirmed())
-    der = b""
-    if _mitm_enabled_domains():
-        der = _mitm_ca_der()
-        if not der:
-            raise iosprofile.ProfileError(
-                "WLOC 已启用但读不到根 CA 证书, 拒绝生成描述文件 —— "
-                "不含 CA 的描述文件装上去会让被劫持的站点全部证书报错。")
+    _, der = _ios_ca()
     return iosprofile.render(_dot_host(), _server_ip(), ssids, der, ids, IOS_TMPL)
+
+# ── iOS 描述文件: 受管生命周期 ──
+import iosstate                                             # noqa: E402
+
+# 服务器**不知道**手机上此刻装的是什么 —— 本项目不是 MDM。所以下面所有文案只讲"我们生成/
+# 发送了什么", 绝不出现"已安装""设备已是最新版""更新已在手机生效""已替换手机上的旧文件"。
+IOS_UNKNOWN = "ℹ️ 服务器无法确认 iPhone 上此刻装的是哪一版, 以上只反映本机的生成/发送记录。"
+
+
+def _ios_ca():
+    """(WLOC 是否启用, 根 CA 的 DER)。启用却读不到 CA 时抛错, 不返回空 —— 见 _mitm_ca_der。"""
+    enabled = bool(_mitm_enabled_domains())
+    if not enabled:
+        return False, b""
+    der = _mitm_ca_der()
+    if not der:
+        raise iosprofile.ProfileError(
+            "WLOC 已启用但读不到根 CA 证书, 拒绝生成描述文件 —— "
+            "不含 CA 的描述文件装上去会让被劫持的站点全部证书报错。")
+    return True, der
+
+
+def _ios_generate(ssids=(), legacy=False):
+    if _platform() != "ios":
+        raise RuntimeError("iOS 描述文件仅 iOS 平台可用(本机为 Android)。" + _platform_unconfirmed())
+    enabled, der = _ios_ca()
+    return iosstate.generate(_dot_host(), _server_ip(), ssids, der, enabled,
+                             IOS_TMPL, legacy_seen=legacy)
+
+
+def _ios_inputs(ssids=()):
+    enabled, der = _ios_ca()
+    return iosstate.make_inputs(_dot_host(), _server_ip(), ssids, enabled, der, IOS_TMPL)
+
+
+def _ios_status_text():
+    """iOS 描述文件页的正文。没有元数据 = 还没启用受管生命周期。"""
+    meta = iosstate.load()
+    if not meta or not meta.get("current"):
+        return ("📱 <b>iOS 描述文件</b>\n\n"
+                "本网关还没有生成过受管描述文件。生成之后, 后续每次更新都是<b>同一份</b>"
+                "描述文件的新版本 —— iPhone 上不会越堆越多。\n\n" + IOS_UNKNOWN)
+    cur = meta["current"]
+    ssids = cur["inputs"].get("ssids") or []
+    try:
+        lv, why = iosstate.classify(meta, _ios_inputs(ssids),
+                                    iosstate.read_artifact("current"))
+    except Exception as e:  # noqa: BLE001
+        lv, why = iosstate.REQUIRED, ["读取当前网关配置失败: %s" % e]
+    lines = ["📱 <b>iOS 描述文件</b>", "",
+             "当前版本: <b>第 %d 版</b>(生成于 %s)" % (cur["revision"], cur["generated_at"]),
+             "上次发送: %s" % (cur.get("sent_at") or "尚未通过本机发送过"),
+             "DoT: <code>%s</code>" % cur["inputs"]["dot_host"]]
+    if ssids:
+        lines.append("强制直连 Wi-Fi: %s" % ", ".join(ssids))
+    if cur["inputs"].get("wloc_enabled"):
+        lines.append("含根证书: 是(指纹 %s…)" % cur["inputs"]["wloc_ca_sha256"][:16])
+    lines += ["", "状态: <b>%s</b>" % iosstate.LEVEL_LABEL[lv]]
+    lines += ["• " + r for r in why]
+    if meta.get("previous"):
+        lines.append("上一版: 第 %d 版(可对比 / 可单独取回)" % meta["previous"]["revision"])
+    lines += ["", IOS_UNKNOWN]
+    return "\n".join(lines)
+
+
+def _ios_kb():
+    meta = None
+    try:
+        meta = iosstate.load()
+    except Exception:  # noqa: BLE001
+        pass
+    rows = [[{"text": "📄 生成 / 更新描述文件", "callback_data": "iosgen"}],
+            [{"text": "📶 强制直连 Wi-Fi…", "callback_data": "ios_ssid"}]]
+    if meta and meta.get("migration_pending"):
+        rows.insert(0, [{"text": "✅ 旧描述文件我已删除", "callback_data": "iosack"}])
+    if meta and meta.get("previous"):
+        rows.append([{"text": "🔍 与上一版对比", "callback_data": "iosdiff"},
+                     {"text": "⏪ 取回上一版", "callback_data": "iosprev"}])
+    rows += [[{"text": "⬅️ 返回客户端", "callback_data": "nav:client"}],
+             [{"text": "🏠 主菜单", "callback_data": "menu"}]]
+    return {"inline_keyboard": rows}
+
+
+IOS_INSTALL_HOWTO = ("装法: 存到「文件」App → 点开 → 设置 → 通用 → 「已下载描述文件」→ 安装。\n"
+                     "Wi-Fi/蜂窝是否启用私密 DNS 由服务器 :81 探测自动判定。")
+
+
+def _ios_val(v):
+    """差异里的取值展示。CA 只给指纹前缀 —— 证书正文不进任何输出。"""
+    if isinstance(v, bool):
+        return "是" if v else "否"
+    if v in (None, "", []):
+        return "(无)"
+    if isinstance(v, (list, tuple)):
+        return _esc(", ".join(str(x) for x in v))[:200]
+    s = str(v)
+    return _esc(s if len(s) <= 24 else s[:16] + "…")
+
+
+def _ios_send(chat, ssids=(), legacy=False):
+    """生成并发送, 返回给用户看的一段话。发送成功才记 sent_at —— 记的是"我们发了",
+    不是"手机上装了"。"""
+    meta, lv, why, data, changed = _ios_generate(ssids, legacy)
+    cur = meta["current"]
+    cap = ["📱 iOS/iPadOS 私密DNS 描述文件(第 %d 版)" % cur["revision"],
+           "DoT: %s" % cur["inputs"]["dot_host"]]
+    if meta.get("migration_pending"):
+        cap.append("⚠️ 安装前请先在 iPhone 上删除旧的「PrivDNS Gateway」描述文件 —— "
+                   "旧版用的是随机身份, 不删的话这份会作为**另一个**描述文件并存。")
+    cap.append(IOS_INSTALL_HOWTO)
+    send_document(chat, "PrivDNS-Gateway.mobileconfig", data, "\n".join(cap))
+    try:
+        meta = iosstate.mark_sent()
+    except Exception:  # noqa: BLE001
+        pass                      # 记不上发送时间不影响用户已经拿到文件, 不要因此报失败
+    head = ("✅ 已生成第 %d 版并发送。" % cur["revision"] if changed
+            else "✅ 已重新发送第 %d 版(网关配置没有变化, 内容与上次完全相同)。" % cur["revision"])
+    return head + "\n" + "\n".join("• " + r for r in why) + "\n\n" + IOS_UNKNOWN
 
 # ── 配置备份 / 恢复 ──
 BACKUP_FILES = [SB, MOSDNS_CONF, MOSDNS_DIRECT, MOSDNS_HIJACK, RS_META]
@@ -3580,7 +3695,9 @@ def handle_cb(chat, mid, data):
     # 30 秒后监听把菜单原地改成一句"尚未收到请求", 正看着的界面就没了。
     wloc_invalidate_watch(chat, mid)
     # iOS 专属功能的统一后端门控(不只隐藏按钮): 旧 TG 消息里的 iOS 描述文件 / WLOC 按钮被点也拒绝。
-    if (data in ("ios", "iosgen") or data == "wloc" or data.startswith("wloc:")) \
+    if (data in ("ios", "ios_ssid", "iosgen", "iosgen:legacy", "iosgen:fresh",
+                 "iosdiff", "iosprev", "iosack")
+            or data == "wloc" or data.startswith("wloc:")) \
        and not _ios_only(chat, mid):
         return
     if data in ("menu", "status") or data.startswith("nav:"):
@@ -3734,25 +3851,82 @@ def handle_cb(chat, mid, data):
     if data == "setfinal":
         edit(chat, mid, "「其余国际」默认走哪个出口/组：", kb_pick("fin", exit_tags(load()), EXIT_BACK)); return
     if data == "ios":
-        state[chat] = "ios_ssid"
-        edit(chat, mid, "📱 <b>生成 iOS 描述文件</b>\n"
-             "Wi-Fi/蜂窝下是否启用私密 DNS 都由 <code>:81</code> 探测自动判定(网络能走到网关才启用)。\n"
-             "若有想<b>强制直连</b>的 Wi-Fi(如公司网、探测误判的酒店网), 发它的名字(SSID, 多个则每行一个)再生成;"
-             "不需要就点「直接生成」。/cancel 取消。",
-             {"inline_keyboard": [[{"text": "⏭ 直接生成", "callback_data": "iosgen"}],
-                                  [{"text": "⬅️ 返回客户端", "callback_data": "nav:client"}],
-                                  [{"text": "🏠 主菜单", "callback_data": "menu"}]]}); return
-    if data == "iosgen":
         state.pop(chat, None)
+        try:
+            edit(chat, mid, _ios_status_text(), _ios_kb())
+        except Exception as e:  # noqa: BLE001
+            edit(chat, mid, "读取描述文件记录失败: %s" % e, MENU)
+        return
+    if data == "ios_ssid":
+        state[chat] = "ios_ssid"
+        edit(chat, mid, "📶 <b>强制直连的 Wi-Fi</b>\n"
+             "Wi-Fi/蜂窝下是否启用私密 DNS 都由 <code>:81</code> 探测自动判定(网络能走到网关才启用)。\n"
+             "若有想<b>强制直连</b>的 Wi-Fi(如公司网、探测误判的酒店网), 发它的名字(SSID, 多个则每行一个);"
+             "发 <code>-</code> 表示清空名单。/cancel 取消。",
+             {"inline_keyboard": [[{"text": "⬅️ 返回", "callback_data": "ios"}],
+                                  [{"text": "🏠 主菜单", "callback_data": "menu"}]]}); return
+    if data in ("iosgen", "iosgen:legacy", "iosgen:fresh"):
+        state.pop(chat, None)
+        # 第一次启用受管生命周期时必须问一句: 这台网关以前有没有发过旧版(随机身份)描述文件。
+        # 服务器没有任何办法知道这件事, 而用户知道 —— 与其猜, 不如问。猜错的代价是用户手机上
+        # 悄悄多出一个永远不会被更新的描述文件。
+        if data == "iosgen" and not (iosstate.load() or {}).get("current"):
+            edit(chat, mid, "📱 <b>首次启用受管描述文件</b>\n\n"
+                 "在这台网关上, 你<b>以前</b>装过 PrivDNS Gateway 的 iOS 描述文件吗?\n\n"
+                 "• 装过 → 旧版每次生成都是随机身份, iOS 会把新的当成<b>另一个</b>描述文件。"
+                 "所以要先在 iPhone 上手工删掉旧的那份;\n"
+                 "• 没装过 → 直接生成即可。\n\n" + IOS_UNKNOWN,
+                 {"inline_keyboard": [
+                     [{"text": "装过, 我会先删掉旧的", "callback_data": "iosgen:legacy"}],
+                     [{"text": "没装过", "callback_data": "iosgen:fresh"}],
+                     [{"text": "⬅️ 返回", "callback_data": "ios"}]]}); return
         edit(chat, mid, "正在生成 iOS 描述文件…", BACK)
         try:
-            send_document(chat, "PrivDNS-Gateway.mobileconfig", _ios_profile(),
-                          f"📱 iOS/iPadOS 私密DNS 描述文件\nDoT: {_dot_host()}\n"
-                          "装法: 存到「文件」App → 点开 → 设置→通用→「已下载描述文件」→ 安装。\n"
-                          "Wi-Fi/蜂窝均靠服务器 :81 探测激活, 安装时已自动配好。")
-            edit(chat, mid, "✅ 描述文件已发送(见上一条)。", MENU)
+            msg = _ios_send(chat, (), data == "iosgen:legacy")
+            edit(chat, mid, msg, _ios_kb())
         except Exception as e:  # noqa: BLE001
             edit(chat, mid, f"生成失败: {e}", MENU)
+        return
+    if data == "iosdiff":
+        try:
+            meta = iosstate.load() or {}
+            prev, cur = meta.get("previous"), meta.get("current")
+            if not (prev and cur):
+                edit(chat, mid, "还没有上一版可对比。", _ios_kb()); return
+            d = iosstate.diff_fields(prev["inputs"], cur["inputs"])
+            lines = ["🔍 <b>第 %d 版 → 第 %d 版</b>" % (prev["revision"], cur["revision"]), ""]
+            for k, lv, ov, nv in d:
+                lines.append("• <b>%s</b>(%s)\n  %s → %s"
+                             % (iosstate.FIELD_LABEL.get(k, k), iosstate.LEVEL_LABEL[lv],
+                                _ios_val(ov), _ios_val(nv)))
+            if not d:
+                lines.append("两版的语义输入相同。")
+            lines += ["", IOS_UNKNOWN]
+            edit(chat, mid, "\n".join(lines), _ios_kb())
+        except Exception as e:  # noqa: BLE001
+            edit(chat, mid, "对比失败: %s" % e, MENU)
+        return
+    if data == "iosprev":
+        try:
+            meta = iosstate.load() or {}
+            blob = iosstate.read_artifact("previous")
+            if not (meta.get("previous") and blob):
+                edit(chat, mid, "上一版的文件已不在服务器上, 无法取回。", _ios_kb()); return
+            send_document(chat, "PrivDNS-Gateway-prev.mobileconfig", blob,
+                          "⏪ 上一版(第 %d 版)。这只是把旧文件再给你一次 —— 服务器记录的当前版本"
+                          "不会因此回退。\n%s" % (meta["previous"]["revision"], IOS_INSTALL_HOWTO))
+            edit(chat, mid, "✅ 上一版已发送(见上一条)。\n\n" + IOS_UNKNOWN, _ios_kb())
+        except Exception as e:  # noqa: BLE001
+            edit(chat, mid, "取回失败: %s" % e, MENU)
+        return
+    if data == "iosack":
+        try:
+            iosstate.ack_migration()
+            edit(chat, mid, "✅ 已关闭迁移提示。\n\n"
+                 "记录的是「你告诉我们旧描述文件已删除」, 服务器本身无从核实这件事。\n\n"
+                 + _ios_status_text(), _ios_kb())
+        except Exception as e:  # noqa: BLE001
+            edit(chat, mid, "操作失败: %s" % e, MENU)
         return
     if data == "backup":
         edit(chat, mid, "正在打包配置…", OPS_BACK)
@@ -4005,9 +4179,9 @@ def handle_text(chat, text, mid=None):
             if not _ios_only(chat):
                 return
             try:
-                send_document(chat, "PrivDNS-Gateway.mobileconfig", _ios_profile(), "📱 iOS 私密DNS 描述文件"); send_plain(chat, "✅ 已发送")
+                send(chat, _ios_status_text(), _ios_kb())
             except Exception as e:  # noqa: BLE001
-                send_plain(chat, f"生成失败: {e}")
+                send_plain(chat, f"读取描述文件记录失败: {e}")
             return
         if cmd == "/backup":
             send_document(chat, "pdg-backup-" + time.strftime("%Y%m%d-%H%M") + ".tar.gz", backup_blob(), "💾 配置备份"); return
@@ -4097,11 +4271,10 @@ def handle_text(chat, text, mid=None):
             send_plain(chat, "此功能仅 iOS 平台可用(本机为 Android)。" + _platform_unconfirmed()); return
         ssids = [] if text.strip() == "-" else [l.strip()[:32] for l in text.splitlines() if l.strip()][:8]
         try:
-            send_document(chat, "PrivDNS-Gateway.mobileconfig", _ios_profile(ssids),
-                          f"📱 iOS/iPadOS 私密DNS 描述文件\nDoT: {_dot_host()}\n"
-                          + (("强制直连 Wi-Fi: " + ", ".join(ssids) + "\n") if ssids else "")
-                          + "装法: 存到「文件」App → 点开 → 设置→通用→「已下载描述文件」→ 安装。")
-            send_plain(chat, "✅ 已生成" + (f", {len(ssids)} 个 Wi-Fi 设为强制直连" if ssids else ""))
+            # 老机器第一次走到这里也要问一句"以前装过吗" —— 但文本流里没有按钮可点, 所以
+            # 先把 SSID 收下、生成受管版本, 迁移提示由 _ios_send 的说明和状态页承担。
+            legacy = not (iosstate.load() or {}).get("current")
+            send_plain(chat, _ios_send(chat, ssids, legacy))
         except Exception as e:  # noqa: BLE001
             send_plain(chat, f"生成失败: {e}")
         return

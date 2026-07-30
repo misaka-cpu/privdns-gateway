@@ -466,6 +466,33 @@ def recover(meta_path=None, art_root=None):
     return out
 
 
+def status_lines(meta, inputs=None, artifact=None):
+    """状态展示的**唯一**文案来源(Bot 与 CLI 共用措辞)。
+
+    只讲"我们生成/发送了什么"。服务器无从知道 iPhone 上此刻是什么, 所以这里永远不会出现
+    "已安装""设备已是最新版""更新已在手机生效""已替换手机上的旧描述文件"。
+    """
+    out = []
+    if not meta or not meta.get("current"):
+        return ["还没有生成过受管描述文件。"]
+    cur = meta["current"]
+    out.append("当前版本: 第 %d 版(生成于 %s)" % (cur["revision"], cur["generated_at"]))
+    out.append("上次发送: %s" % (cur.get("sent_at") or "尚未通过本机发送过"))
+    out.append("DoT 主机名: %s" % cur["inputs"]["dot_host"])
+    out.append("网关地址: %s" % ", ".join(cur["inputs"]["server_addresses"]))
+    if cur["inputs"].get("ssids"):
+        out.append("强制直连 Wi-Fi: %s" % ", ".join(cur["inputs"]["ssids"]))
+    if cur["inputs"].get("wloc_enabled"):
+        out.append("含根证书: 是(指纹 %s…)" % cur["inputs"]["wloc_ca_sha256"][:16])
+    if meta.get("previous"):
+        out.append("上一版: 第 %d 版" % meta["previous"]["revision"])
+    if inputs is not None:
+        lv, why = classify(meta, inputs, artifact)
+        out.append("状态: %s" % LEVEL_LABEL[lv])
+        out += ["  · " + r for r in why]
+    return out
+
+
 def clear(meta_path=None, art_root=None):
     """放弃受管身份(卸载 / 用户明确要求重来)。删掉之后再生成就是**另一个身份**, 手机上
     那份旧的会变成孤儿 —— 调用方必须先把这句话讲清楚。"""
@@ -482,3 +509,117 @@ def clear(meta_path=None, art_root=None):
         os.unlink(meta_path or META)
     except OSError:
         pass
+
+
+# ── 命令行(供 pdg.sh 调用)───────────────────────────────────────────────
+def _val(v):
+    if isinstance(v, bool):
+        return "是" if v else "否"
+    if v in (None, "", []):
+        return "(无)"
+    if isinstance(v, (list, tuple)):
+        return ", ".join(str(x) for x in v)
+    s = str(v)
+    return s if len(s) <= 24 else s[:16] + "…"
+
+
+UNKNOWN = ("提示: 服务器无法确认 iPhone 上此刻装的是哪一版, 以上只反映本机的生成/发送记录。")
+
+
+def main(argv=None):
+    import argparse
+    argv = list(sys.argv[1:] if argv is None else argv)
+    ap = argparse.ArgumentParser(prog="iosstate.py")
+    sub = ap.add_subparsers(dest="cmd")
+
+    def common(p):
+        p.add_argument("--dot-host")
+        p.add_argument("--server-ip", action="append")
+        p.add_argument("--ssid", action="append", default=[])
+        p.add_argument("--wloc-config")
+        p.add_argument("--ca-crt")
+        p.add_argument("--template")
+
+    g = sub.add_parser("generate", help="生成/更新受管描述文件")
+    common(g)
+    g.add_argument("--out", required=True, help="把产物另存一份到这里(供临时下载用)")
+    g.add_argument("--legacy", action="store_true",
+                   help="这台网关以前发过旧版(随机身份)描述文件")
+    s = sub.add_parser("status", help="只看状态, 不生成")
+    common(s)
+    sub.add_parser("diff", help="current ↔ previous 的字段级差异")
+    sub.add_parser("ack", help="用户自述旧描述文件已删除, 关掉迁移提示")
+    pv = sub.add_parser("previous", help="取出上一版产物")
+    pv.add_argument("--out", required=True)
+    sub.add_parser("recover", help="清理中断残留并检查产物与记录是否一致")
+
+    a = ap.parse_args(argv)
+    if not a.cmd:
+        ap.print_help(sys.stderr)
+        return 2
+
+    def _inputs():
+        der = iosprofile.ca_der_for(iosprofile.wloc_enabled(a.wloc_config), a.ca_crt) \
+            if a.wloc_config else b""
+        return make_inputs(a.dot_host, a.server_ip, a.ssid, bool(der), der, a.template), der
+
+    try:
+        if a.cmd == "generate":
+            der = iosprofile.ca_der_for(iosprofile.wloc_enabled(a.wloc_config), a.ca_crt) \
+                if a.wloc_config else b""
+            meta, lv, why, data, changed = generate(
+                a.dot_host, a.server_ip, a.ssid, der, bool(der), a.template,
+                legacy_seen=a.legacy)
+            pdgtx.atomic_write(a.out, data, mode=0o644)
+            print("\n".join(status_lines(meta)))
+            print("本次: %s" % ("生成了第 %d 版" % meta["current"]["revision"] if changed
+                              else "网关配置没有变化, 内容与上次完全相同"))
+            for r in why:
+                print("  · " + r)
+            if meta.get("migration_pending"):
+                print("\n⚠️ 安装前请先在 iPhone 上删除旧的「PrivDNS Gateway」描述文件 —— "
+                      "旧版是随机身份, 不删的话这份会作为**另一个**描述文件并存。")
+            print("\n" + UNKNOWN)
+        elif a.cmd == "status":
+            meta = load()
+            inputs = None
+            if a.dot_host and a.server_ip:
+                inputs, _ = _inputs()
+            print("\n".join(status_lines(meta, inputs, read_artifact("current"))))
+            print("\n" + UNKNOWN)
+        elif a.cmd == "diff":
+            meta = load() or {}
+            prev, cur = meta.get("previous"), meta.get("current")
+            if not (prev and cur):
+                print("还没有上一版可对比。")
+                return 0
+            print("第 %d 版 → 第 %d 版" % (prev["revision"], cur["revision"]))
+            d = diff_fields(prev["inputs"], cur["inputs"])
+            for k, lv, ov, nv in d:
+                print("  · %s(%s): %s → %s"
+                      % (FIELD_LABEL.get(k, k), LEVEL_LABEL[lv], _val(ov), _val(nv)))
+            if not d:
+                print("  两版的语义输入相同。")
+        elif a.cmd == "ack":
+            ack_migration()
+            print("已关闭迁移提示。记录的是「你告诉我们旧描述文件已删除」, 服务器无从核实。")
+        elif a.cmd == "previous":
+            blob = read_artifact("previous")
+            meta = load() or {}
+            if not (meta.get("previous") and blob):
+                sys.stderr.write("上一版的文件已不在服务器上, 无法取回。\n")
+                return 4
+            pdgtx.atomic_write(a.out, blob, mode=0o644)
+            print("已取出第 %d 版。这只是把旧文件再给你一次 —— 记录的当前版本不会回退。"
+                  % meta["previous"]["revision"])
+        elif a.cmd == "recover":
+            msgs = recover()
+            print("\n".join(msgs) if msgs else "没有需要清理的残留, 产物与记录一致。")
+    except (StateError, iosprofile.ProfileError) as e:
+        sys.stderr.write("%s\n" % e)
+        return 3
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
