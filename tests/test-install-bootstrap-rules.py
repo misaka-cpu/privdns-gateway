@@ -89,6 +89,70 @@ try:
 finally:
     box.clean()
 
+# ── 1b. 崩溃重启循环的机器必须修得动 ─────────────────────────────────────────
+# 真 Debian 13 容器实测: mosdns 缺一个规则文件就 FATAL, systemd(Restart=on-failure)让它在
+# activating(auto-restart) 上无限摆动。事务的"过渡状态"门原先把这也当成过渡, 于是 normal 和
+# repair **两种模式都拒** —— 要修就得写规则文件, 写规则文件要开事务, 事务又因为它在
+# activating 而拒绝。越坏越修不了, 那台机器谁也救不回来。
+#
+# 崩溃重启循环其实是稳定事实("它没在跑"), 回滚目标也明确; 真正的启动中(SubState=start)才该等。
+print()
+print("── 1b. 崩溃重启循环(activating/auto-restart)──")
+box3 = Box(healthy=False)
+try:
+    box3.crash_loop("mosdns")
+    tx3 = load_tx(box3.env)
+    try:
+        t = tx3.Tx(source="test", op="geosite_update", mode="normal")
+        t.stage("mosdns_rule:geosite_cn.txt", b"domain:a.cn\n")
+        t.service("restart:mosdns")
+        t.commit()
+        bad("normal 竟然放行了 —— 那道硬门形同虚设")
+    except tx3.TxRefused as e:
+        if "过渡状态" in str(e):
+            bad("normal 仍卡在过渡状态门(而不是硬门), 说明崩溃循环还是被当成了过渡")
+        else:
+            ok("normal: 按硬门拒, 理由准确(不再是过渡状态): %s" % str(e)[:40])
+    except Exception as e:  # noqa: BLE001
+        bad("normal 抛了别的异常: %s" % type(e).__name__)
+
+    box4 = Box(healthy=False)
+    try:
+        box4.crash_loop("mosdns")
+        tx4 = load_tx(box4.env)
+        t = tx4.Tx(source="test", op="geosite_update", mode="repair")
+        t.stage("mosdns_rule:geosite_cn.txt", b"domain:a.cn\n")
+        t.service("restart:mosdns")
+        t.commit()
+        if box4.read("/etc/mosdns/rules/geosite_cn.txt") == b"domain:a.cn\n":
+            ok("repair: 崩溃重启循环的机器修得动了(规则文件真的写进去)")
+        else:
+            bad("repair 提交了但文件没写进去")
+    except Exception as e:  # noqa: BLE001
+        bad("repair 仍然救不了崩溃循环: %s %s" % (type(e).__name__, str(e)[:70]))
+    finally:
+        box4.clean()
+
+    # 反方向: 真在启动中(SubState=start)必须照旧拒 —— 这道门是拆不得的, 只是分清了两种处境
+    box5 = Box(healthy=False)
+    try:
+        box5.starting_up("mosdns")
+        tx5 = load_tx(box5.env)
+        t = tx5.Tx(source="test", op="geosite_update", mode="repair")
+        t.stage("mosdns_rule:geosite_cn.txt", b"domain:a.cn\n")
+        t.service("restart:mosdns")
+        t.commit()
+        bad("真在启动中也放行了 —— 那道门被拆掉了, 快照可能拍在半空中")
+    except Exception as e:  # noqa: BLE001
+        if "过渡状态" in str(e):
+            ok("真在启动中(SubState=start)照旧拒(门没拆, 只是分清了两种处境)")
+        else:
+            bad("启动中被拒的理由不对: %s %s" % (type(e).__name__, str(e)[:60]))
+    finally:
+        box5.clean()
+finally:
+    box3.clean()
+
 # ── 2. update-rules.sh 真的把模式透传下去 ────────────────────────────────────
 print()
 print("── 2. update-rules.sh 的模式透传 ──")

@@ -407,6 +407,33 @@ def _svc_active(unit):
     return out.strip() == "active"
 
 
+def _settle_activating(unit, max_polls=12, interval=None):
+    """`activating` 到底是"正在起来"还是"崩了在等下次重试"—— 只有 SubState 分得清。
+
+    systemd 把两种完全不同的处境都记成 ActiveState=activating:
+      · SubState=start / start-pre / start-post → 真的在启动中, 等一会儿就有结果, 这时拍快照
+        确实说不清稳定目标, 该拒;
+      · SubState=auto-restart                   → 它**已经死了**, 正在 RestartSec 里等下一次
+        重试。崩溃重启循环会永远停在这上面, 拒到天荒地老。
+
+    而后者恰恰是最需要动手修的时候: mosdns 缺一个规则文件就 FATAL, 于是它一直崩; 要修就得写
+    规则文件, 写规则文件又要开事务, 事务却因为"它在 activating"而拒绝 —— 越坏越修不了。
+    这种情况下"操作前的稳定状态"其实一点也不含糊: 它没在跑。回滚目标同样明确。
+
+    返回一个可用于 before-image 的稳定 ActiveState; 判不出来就原样返回 activating(照旧拒)。"""
+    interval = _stable_interval(interval)
+    for _ in range(max_polls):
+        st = (_svc_prop(unit, "ActiveState") or "").strip()
+        sub = (_svc_prop(unit, "SubState") or "").strip()
+        if st != "activating":
+            return st or "activating"      # 自己settle了(起来了或者彻底 failed)
+        if sub != "auto-restart":
+            time.sleep(interval)           # 真在启动中 → 给它时间
+            continue
+        return "failed"                    # 崩溃重启循环 = 稳定的"没在跑"
+    return "activating"
+
+
 def _stable_interval(interval):
     if interval is not None:
         return interval
@@ -1305,6 +1332,10 @@ class Tx:
             if not st:
                 raise TxRefused("%s 的 ActiveState 是空的, 无法判定操作前状态 —— "
                                 "拒绝在没有完整回退材料的前提下改动现网" % u)
+            if st == "activating":
+                # 崩溃重启循环(SubState=auto-restart)不是过渡, 是稳定的"没在跑" —— 而且正是
+                # 最该动手修的时候。真在启动中的才等。见 _settle_activating。
+                st = _settle_activating(u)
             if st in ("activating", "deactivating", "reloading"):
                 # 过渡态下拍的快照不代表任何稳定目标: 回滚该把它起来还是停下都说不清。
                 raise TxRefused("%s 正处于 %s(过渡状态), 现在无法确定操作前的稳定状态 —— "

@@ -194,6 +194,13 @@ case "$1" in
                  echo "$n";;
       UnitFileState) cat "$S/$U.ufs" 2>/dev/null || echo enabled;;
       LoadState) echo loaded;;
+      SubState)
+        # ActiveState=activating 有两种截然不同的处境, 只有 SubState 分得清:
+        # start/start-pre(真在启动) vs auto-restart(崩了在等下次重试)。桩必须能表达,
+        # 否则"崩溃重启循环能不能被修好"这条根本验不到。
+        if [[ -f "$S/$U.sub" ]]; then cat "$S/$U.sub"
+        elif [[ -f "$S/$U.active" ]]; then echo running
+        else echo dead; fi;;
       ActiveState)
         M=$(cat "$S/__as_mode" 2>/dev/null || echo normal)
         case "$M" in
@@ -209,7 +216,7 @@ case "$1" in
     esac; exit 0;;
   restart|start)
     for f in %s; do [[ "$2" == "$f" ]] && { echo "$1 refused"; exit 1; }; done
-    touch "$S/$2.active"; rm -f "$S/$2.state"; %s
+    touch "$S/$2.active"; rm -f "$S/$2.state" "$S/$2.sub"; %s
     exit 0;;
   stop)
     [[ -f "$S/$2.nostop" ]] && { echo "stop refused"; exit 1; }
@@ -245,6 +252,28 @@ exit 0
         """直接摆一个 ActiveState(failed / activating / deactivating …), 用来验"不许冒充 inactive"。"""
         with open(os.path.join(self.state, unit + ".state"), "w") as f:
             f.write(state + "\n")
+
+    def crash_loop(self, unit):
+        """把 unit 摆成崩溃重启循环: ActiveState=activating + SubState=auto-restart。
+
+        真机上 mosdns 缺一个规则文件就 FATAL, systemd(Restart=on-failure)于是让它在
+        activating(auto-restart) 与 failed 之间无限摆动 —— 这是**稳定的"没在跑"**, 不是过渡。
+        容器实测: 老实现在这里两种模式都拒, 那台机器谁也修不了。"""
+        with open(os.path.join(self.state, unit + ".state"), "w") as f:
+            f.write("activating\n")
+        with open(os.path.join(self.state, unit + ".sub"), "w") as f:
+            f.write("auto-restart\n")
+        try:
+            os.unlink(os.path.join(self.state, unit + ".active"))
+        except OSError:
+            pass
+
+    def starting_up(self, unit):
+        """真在启动中: activating + SubState=start —— 这种必须照旧拒(等它有结果)。"""
+        with open(os.path.join(self.state, unit + ".state"), "w") as f:
+            f.write("activating\n")
+        with open(os.path.join(self.state, unit + ".sub"), "w") as f:
+            f.write("start\n")
 
     def active_state_mode(self, mode):
         """ActiveState 查询的行为: normal / fail(命令失败) / empty(成功但空输出) / 字面状态。
