@@ -560,9 +560,8 @@ out="$(run_install "PDG_KEEP_FLUSH=1")"; rc=$?
 [[ "$rc" != 0 ]] && ok "5d 设了 PDG_KEEP_FLUSH=1 → 保持中止" || bad "5d 设了开关还是自动改了"
 [[ "$(sha256sum /etc/nftables.conf | cut -d' ' -f1)" == "$CONF_SHA" ]]   && ok "5d 中止后配置逐字节未变" || bad "5d 配置被改了"
 
-# ── 5b. 运行中的表有规则, **而且文件里的表也有规则** → 去掉 flush 会让它每次 reload 累积,
-#        两条路都走不通 → 必须中止, 让人自己权衡。
-echo "── 5b. 运行表有规则 + 文件表也有规则 → 只能中止 ──"
+# ── 5e. 边界: Docker 在跑, 用户自己的表也有规则 → 给那张表补自重建, 照样一把装上 ──
+echo "── 5e. Docker + 用户自己的表有规则 ──"
 reset_box
 cat > /etc/nftables.conf <<'CONF'
 #!/usr/sbin/nft -f
@@ -574,8 +573,6 @@ table inet filter {
                 type filter hook input priority filter;
         }
 }
-# 文件里另有一张**带规则**的表(不挂 input hook, 免得撞上另一道扫描门)。
-# 去掉 flush 之后, 它会在每次 reload 时把规则再加一遍 —— 所以这一局不能自动处理。
 table ip myforward {
         chain fwd {
                 type filter hook forward priority filter; policy accept;
@@ -583,11 +580,16 @@ table ip myforward {
         }
 }
 CONF
-CONF_SHA="$(sha256sum /etc/nftables.conf | cut -d' ' -f1)"
 cat > "$NFT_STATE" <<'STATE'
 table inet filter {
 	chain input {
 		type filter hook input priority filter; policy accept;
+	}
+}
+table ip myforward {
+	chain fwd {
+		type filter hook forward priority filter; policy accept;
+		ip saddr 10.8.0.0/24 accept
 	}
 }
 table ip nat {
@@ -598,9 +600,59 @@ table ip nat {
 }
 STATE
 out="$(run_install "")"; rc=$?
-[[ "$rc" != 0 ]] && ok "5b 运行中的表有真规则 → 装机中止(不静默冲掉 Docker 的规则)" \
+[[ "$rc" == 0 ]] && ok "5e Docker + 用户带规则的表 → 照样一把装上" \
+  || bad "5e 仍失败(rc=$rc): $(grep -E '冲突位置|无法安全合并' <<<"$out" | head -1)"
+grep -q 'delete table ip myforward' /etc/nftables.conf \
+  && ok "5e 用户的表被补成自重建形态" || bad "5e 没给用户的表加自重建"
+grep -qF 'table ip nat' "$NFT_STATE" \
+  && ok "5e Docker 的 NAT 表还在" || bad "5e Docker 的表被冲掉了"
+grep -qF 'ip saddr 10.8.0.0/24 accept' "$NFT_STATE" \
+  && ok "5e 用户自己的转发规则也还在" || bad "5e 用户规则丢了"
+# 重复应用不许累积 —— 自重建就是为了这个
+"$(command -v nft)" -f /etc/nftables.conf >/dev/null 2>&1
+"$(command -v nft)" -f /etc/nftables.conf >/dev/null 2>&1
+[[ "$(grep -c 'ip saddr 10.8.0.0/24 accept' "$NFT_STATE")" == 1 ]] \
+  && ok "5e 反复应用配置不会让规则累积(自重建生效)" \
+  || bad "5e 规则累积到 $(grep -c 'ip saddr 10.8.0.0/24 accept' "$NFT_STATE") 条"
+
+# ── 5b. 那张表**和别人共管**(内核里有它没声明的链)→ delete 会误伤, 只能中止 ──
+echo "── 5b. 共管的表 → 只能中止 ──"
+reset_box
+cat > /etc/nftables.conf <<'CONF'
+#!/usr/sbin/nft -f
+
+flush ruleset
+
+table ip filter {
+        chain FORWARD {
+                type filter hook forward priority filter; policy accept;
+                ip saddr 10.8.0.0/24 accept
+        }
+}
+CONF
+CONF_SHA="$(sha256sum /etc/nftables.conf | cut -d' ' -f1)"
+cat > "$NFT_STATE" <<'STATE'
+table ip filter {
+	chain FORWARD {
+		type filter hook forward priority filter; policy accept;
+		ip saddr 10.8.0.0/24 accept
+	}
+	chain DOCKER-USER {
+		policy accept;
+		ip saddr 172.17.0.0/16 accept
+	}
+}
+table ip nat {
+	chain POSTROUTING {
+		type nat hook postrouting priority srcnat; policy accept;
+		oifname "docker0" masquerade
+	}
+}
+STATE
+out="$(run_install "")"; rc=$?
+[[ "$rc" != 0 ]] && ok "5b 共管的表 → 装机中止(加 delete 会误伤 Docker 那部分)" \
   || bad "5b 竟然装成功了, Docker 的 NAT 规则会被 flush 掉"
-grep -q '有规则' <<<"$out" && ok "5b 说明了原因(表里有规则)" || bad "5b 没说清原因"
+grep -q '共管' <<<"$out" && ok "5b 说明了原因(表是共管的)" || bad "5b 没说清原因"
 grep -q 'nft list table ip nat' <<<"$out" \
   && ok "5b 给了查看内容的命令" || bad "5b 没给排查命令"
 [[ "$(sha256sum /etc/nftables.conf | cut -d' ' -f1)" == "$CONF_SHA" ]] \

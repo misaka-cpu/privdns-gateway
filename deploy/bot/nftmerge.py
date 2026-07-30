@@ -90,6 +90,81 @@ def _owner_of(chains):
 #
 # 本项目自己的块不依赖那行 flush: 模板是 `table inet pdg` + `delete table inet pdg` +
 # 表体, 先声明再删, 每次只重建自己这一张。
+def _file_table_blocks(lines):
+    """文件里的顶层 table 块 → [(名字, 起始行下标, 结束行下标, 有没有规则, 链名集合)]。
+
+    解析不确定就返回 None(调用方据此 fail-closed) —— 宁可让人自己动手, 也不要在猜的基础上
+    往别人的防火墙文件里插 `delete table`。"""
+    out, cur, start, depth, has_rule, chains = [], None, 0, 0, False, set()
+    for i, raw in enumerate(lines):
+        ln = raw.split("#", 1)[0].strip()
+        if not ln:
+            continue
+        if cur is None:
+            m = other_table.match(ln)
+            if not m:
+                continue
+            parts = ln.split()
+            if len(parts) < 3:
+                continue
+            if "{" not in ln:
+                continue                      # 只是声明行(table X / delete table X), 不是块
+            cur = "%s %s" % (parts[1], parts[2].rstrip("{"))
+            start, depth, has_rule, chains = i, ln.count("{") - ln.count("}"), False, set()
+            continue
+        depth += ln.count("{") - ln.count("}")
+        body = ln.strip("{}").strip()
+        if body:
+            mc = re.match(r"^chain\s+(\S+)$", body)
+            if mc:
+                chains.add(mc.group(1))
+            elif re.match(r"^type\s+\w+\s+hook\s+\w+\s+priority\s+[^;]+;"
+                          r"(\s*policy\s+\w+\s*;)?$", body):
+                pass
+            else:
+                has_rule = True
+        if depth <= 0:
+            out.append((cur, start, i, has_rule, chains))
+            cur, depth = None, 0
+    if cur is not None:
+        return None                           # 括号没闭合 → 解析不可信
+    return out
+
+
+def _make_tables_self_rebuilding(lines, probed):
+    """给文件里**带规则**的表加上 `table X` + `delete table X`, 让它们各自幂等。
+
+    这样去掉全局 flush 之后, 重复 `nft -f` 也不会让规则累积 —— 每张表只重建自己, 文件外的
+    表(Docker 等)原样留着。与本项目自己那块用的是同一个写法。
+
+    有一种情况不能这么干: 那张表**别人也在往里加东西**(内核里的链比文件里声明的多), 比如
+    用户写了 `table ip filter { chain INPUT … }` 而 Docker 又往 ip filter 里加了 DOCKER-USER。
+    `delete table ip filter` 会把 Docker 那部分一起删掉。这时返回 None, 交由调用方中止。
+
+    返回 (新行列表, 处理过的表名) 或 (None, 冲突表名)。"""
+    blocks = _file_table_blocks(lines)
+    if blocks is None:
+        return None, None
+    todo = [b for b in blocks if b[3] and b[0] != "inet pdg"]
+    for name, _s, _e, _hr, file_chains in todo:
+        fam_name = name.split(None, 1)
+        if len(fam_name) != 2:
+            return None, name
+        live_inert, live_chains = probed.get(name) or _table_probe(*fam_name)
+        if live_chains - file_chains:         # 内核里有文件没声明的链 = 这张表是共管的
+            return None, name
+    out, done = list(lines), []
+    for name, start, _e, _hr, _c in sorted(todo, key=lambda b: -b[1]):
+        prev = out[start - 1].strip() if start > 0 else ""
+        if prev == "delete table %s" % name:
+            continue                          # 已经是自重建形态
+        out[start:start] = ["# ↓ 由 pdg 补上: 让这张表自己重建, 去掉全局 flush 后也不会累积规则",
+                            "table %s" % name,
+                            "delete table %s" % name]
+        done.append(name)
+    return out, done
+
+
 def _file_tables_are_empty(lines):
     cur, depth = None, 0
     for raw in lines:
@@ -241,11 +316,27 @@ if flush_ln:
     # PDG_KEEP_FLUSH=1 可以关掉这个行为(保持中止, 由人自己处置)。
     if lost and os.environ.get("PDG_KEEP_FLUSH", "") not in ("1", "yes", "true"):
         empty_ok, culprit = _file_tables_are_empty(rest_lines)
+        rebuilt = []
+        if not empty_ok:
+            # 文件里的表有规则也不必立刻投降: 给它们各自加上 declare+delete, 让每张表自己
+            # 重建 —— 全局 flush 的幂等效果就有了替代, 而文件外的表不再被牵连。
+            newlines, info = _make_tables_self_rebuilding(rest_lines, probed)
+            if newlines is not None:
+                keep = newlines
+                rest_lines = newlines
+                flush_ln = next((k + 1 for k, ln in enumerate(rest_lines)
+                                 if re.match(r"^\s*flush\s+ruleset\s*$", ln)), flush_ln)
+                rebuilt, empty_ok = info, True
+            else:
+                culprit = info or culprit
         if empty_ok:
             note = ("  # ↑ 由 pdg 注释掉: 这行会把只存在于运行中的表(%s)一并冲掉。"
                     % "、".join(lost[:3]))
             keep[flush_ln - 1] = "# " + keep[flush_ln - 1].strip() + note
-            keep.insert(flush_ln, "#   本文件里除 pdg 外的表都是空的, 去掉它不会造成规则累积;")
+            keep.insert(flush_ln,
+                        ("#   你自己的表已补上 `table X`+`delete table X`(各自重建), 因此不会累积;"
+                         if rebuilt else
+                         "#   本文件里除 pdg 外的表都是空的, 去掉它不会造成规则累积;"))
             keep.insert(flush_ln + 1, "#   pdg 自己的表用 `delete table inet pdg` 重建, 不依赖它。")
             keep.insert(flush_ln + 2, "#   要恢复原样: 删掉本行与上下两行的注释即可。")
             print("注意: 已把 %s 第 %d 行的 `flush ruleset` **注释掉**(原行保留在文件里)。"
@@ -258,13 +349,19 @@ if flush_ln:
                     print("        table %s 看链名像是 %s 在管。" % (t, o), file=sys.stderr)
             print("  这行本来就会在每次 `systemctl reload nftables` 时冲掉它们, 与本项目无关;",
                   file=sys.stderr)
-            print("  本文件里除 pdg 外的表都是空的, 去掉它不会让规则累积。", file=sys.stderr)
+            if rebuilt:
+                print("  同时给你自己的表补上了 `table X` + `delete table X`(每张表自己重建), "
+                      "所以去掉全局 flush 之后重复应用也不会让规则累积: %s。"
+                      % "、".join(rebuilt[:3]), file=sys.stderr)
+            else:
+                print("  本文件里除 pdg 外的表都是空的, 去掉它不会让规则累积。", file=sys.stderr)
             print("  不想让我们动它: 设 PDG_KEEP_FLUSH=1 重跑, 本次改动会被拒绝而不是自动处理。",
                   file=sys.stderr)
             lost = []
         else:
-            print("提示: 本可以注释掉 `flush ruleset` 来两全, 但文件里的 `table %s` 有规则 ——"
-                  " 去掉那行会让它在每次 reload 时重复累积, 所以没动。" % culprit, file=sys.stderr)
+            print("提示: 本可以注释掉 `flush ruleset` 来两全, 但 `table %s` 在内核里还有"
+                  "文件没声明的链 —— 它是和别人(Docker 之类)共管的, 给它加 `delete table` 会"
+                  "把别人那部分一起删掉, 所以没动。" % culprit, file=sys.stderr)
     if lost:
         print("冲突位置: %s 第 %d 行 `flush ruleset` —— 这些**只存在于运行中**的表不在文件里, "
               "而且里面**有规则**(或策略不是 accept), 应用后会被一起冲掉:"

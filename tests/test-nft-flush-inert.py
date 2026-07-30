@@ -72,6 +72,44 @@ table inet filter {
 }
 """
 
+# 边界现场: 用户自己在 nftables.conf 里写了**带规则**的表(不挂 input hook, 免得撞上另一道门)
+OWN_RULED_CONF = """#!/usr/sbin/nft -f
+
+flush ruleset
+
+table inet filter {
+        chain input {
+                type filter hook input priority filter;
+        }
+}
+table ip myforward {
+        chain fwd {
+                type filter hook forward priority filter; policy accept;
+                ip saddr 10.8.0.0/24 accept
+        }
+}
+"""
+
+# 共管: 文件写了 ip filter, 内核里那张表还有文件没声明的链(Docker 加的)
+SHARED_CONF = """#!/usr/sbin/nft -f
+
+flush ruleset
+
+table ip filter {
+        chain FORWARD {
+                type filter hook forward priority filter; policy accept;
+                ip saddr 10.8.0.0/24 accept
+        }
+}
+"""
+MYFWD = """{"nftables":[{"table":{"family":"ip","name":"myforward"}},
+{"chain":{"family":"ip","table":"myforward","name":"fwd","policy":"accept"}},
+{"rule":{"family":"ip","table":"myforward","chain":"fwd","expr":[{"accept":null}]}}]}"""
+SHARED_FILTER = """{"nftables":[{"table":{"family":"ip","name":"filter"}},
+{"chain":{"family":"ip","table":"filter","name":"FORWARD","policy":"accept"}},
+{"chain":{"family":"ip","table":"filter","name":"DOCKER-USER","policy":"accept"}},
+{"rule":{"family":"ip","table":"filter","chain":"DOCKER-USER","expr":[{"accept":null}]}}]}"""
+
 BLOCK = """#!/usr/sbin/nft -f
 table inet pdg {
         chain input { type filter hook input priority 0; policy drop; }
@@ -228,18 +266,21 @@ def main():
         else:
             bad("没点名归属")
 
-        # ── 3. 文件里的表**有规则** → 去掉 flush 会累积, 只能中止 ──
-        rc, msg, merged = run_merge(d, ["inet filter", "ip nat"], {"ip nat": DOCKER_NAT},
-                                    conf=RULED_CONF)
-        preserved("文件表有规则", rc, merged)
-        if "重复累积" in msg:
-            ok("说明了为什么这次不能自动处理")
+        # ── 3. 真正走不通的那一局: 文件写的表**和别人共管**(内核里有它没声明的链)──
+        # 自重建那条路在这里不能走 —— `delete table ip filter` 会把 Docker 加进去的
+        # DOCKER-USER 一并删掉。只能中止, 并给出正确的建议。
+        rc, msg, merged = run_merge(d, ["ip filter", "ip nat"],
+                                    {"ip nat": DOCKER_NAT, "ip filter": SHARED_FILTER},
+                                    conf=SHARED_CONF)
+        preserved("共管表 + Docker", rc, merged)
+        if "共管" in msg:
+            ok("说明了为什么这一局不能自动处理(表是共管的)")
         else:
-            bad("没解释为什么没自动处理")
+            bad("没解释为什么没自动处理: %r" % msg[-200:])
         if "Docker" in msg and "动态" in msg:
             ok("认出 Docker → 给的是「去掉 flush」而不是「抄进文件」")
         else:
-            bad("没给 Docker 专属建议: %r" % msg[-200:])
+            bad("没给 Docker 专属建议")
         if "sed -i '/^flush ruleset$/d'" in msg:
             ok("给了可直接粘贴的命令")
         else:
@@ -253,10 +294,11 @@ def main():
         else:
             bad("没给排查命令")
 
-        # ── 4. 认不出归属的第三方表 → 通用建议, 不瞎认成 Docker ──
-        rc, msg, merged = run_merge(d, ["inet filter", "ip nat"], {"ip nat": UNKNOWN_RULED},
-                                    conf=RULED_CONF)
-        preserved("未知归属的表", rc, merged)
+        # ── 4. 同样走不通, 但那张表认不出归属 → 通用建议, 不瞎认成 Docker ──
+        rc, msg, merged = run_merge(d, ["ip filter", "ip nat"],
+                                    {"ip nat": UNKNOWN_RULED, "ip filter": SHARED_FILTER},
+                                    conf=SHARED_CONF)
+        preserved("共管表 + 未知归属", rc, merged)
         if "Docker 的规则是" not in msg and "常见来源" in msg:
             ok("认不出归属 → 给通用建议, 不瞎认")
         else:
@@ -266,12 +308,42 @@ def main():
         for nm, bodies, jsn in (("policy drop 的表", {"ip nat": DROP_TABLE}, True),
                                 ("读不出内容的表", {}, True),
                                 ("文本兜底: 有规则", {"ip nat": RULED_TEXT}, False)):
-            rc, _, merged = run_merge(d, ["inet filter", "ip nat"], bodies,
-                                      json_ok=jsn, conf=RULED_CONF)
+            b = dict(bodies); b.setdefault("ip filter", SHARED_FILTER)
+            rc, _, merged = run_merge(d, ["ip filter", "ip nat"], b,
+                                      json_ok=jsn, conf=SHARED_CONF)
             preserved(nm, rc, merged)
         rc, _, merged = run_merge(d, ["inet filter", "ip nat"], {"ip nat": EMPTY_TEXT},
                                   json_ok=False)
         ok("文本兜底: 空壳表照常放行") if rc == 0 else bad("文本兜底把空壳拒了(rc=%d)" % rc)
+
+        # ── 8. 边界: Docker 在跑, 而且用户自己的表也有规则 ──
+        # 全局 flush 的幂等效果可以按表复现(declare + delete, 与本项目自己那块同一个写法),
+        # 所以这一局也能自动跑通, 不必让用户二选一。
+        rc, msg, merged = run_merge(d, ["inet filter", "ip nat", "ip myforward"],
+                                    {"ip nat": DOCKER_NAT, "ip myforward": MYFWD},
+                                    conf=OWN_RULED_CONF)
+        preserved("Docker + 用户自己的表有规则", rc, merged)
+        ok("这一局也能一把装上(rc=0)") if rc == 0 else bad("边界仍要人工干预(rc=%d)" % rc)
+        if "delete table ip myforward" in merged and "table ip myforward\n" in merged:
+            ok("用户带规则的表被补成自重建形态(declare + delete)")
+        else:
+            bad("没给用户的表加自重建")
+        if merged.index("delete table ip myforward") < merged.index("table ip myforward {"):
+            ok("declare/delete 插在表体之前(顺序对, 否则 nft 会报错)")
+        else:
+            bad("declare/delete 插错位置")
+        if "由 pdg 补上" in merged:
+            ok("补的那几行有自我说明")
+        else:
+            bad("补的行没说明来历")
+        if "各自重建" in merged and "都是空的" not in merged:
+            ok("文件里的说明写的是这一局真正的理由(自重建, 不是「表都是空的」)")
+        else:
+            bad("文件说明与实际路径对不上")
+        if "补上了" in msg and "myforward" in msg:
+            ok("终端也说清了给哪张表补了什么")
+        else:
+            bad("终端没说清: %r" % msg[-200:])
 
         # ── 6. PDG_KEEP_FLUSH=1: 用户说了别动, 就别动 ──
         rc, _, merged = run_merge(d, ["inet filter", "ip nat"], {"ip nat": DOCKER_NAT},
