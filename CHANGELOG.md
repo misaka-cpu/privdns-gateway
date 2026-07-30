@@ -2,6 +2,28 @@
 
 本项目按语义化 `v1.x` tag 正式发布;以下按版本/日期记录主要变化,完整提交见 git 历史。
 
+## 2026-07-30 — v1.7.6(全新 Debian 13 / Docker 主机装得上了)
+
+用户报: 全新 Debian 13 首次装机中止在"`flush ruleset` 会冲掉只存在于运行中的表 —— `table ip nat`、
+`table ip filter`"。
+
+- **空壳表不再拦装机**:那两张 `ip` 表是 iptables-nft 建的 —— Debian 上 `iptables` 默认走 nft 后端,
+  cloud-init、包的 postinst、甚至一句 `iptables -L` 都会把它们建出来, 链在、策略 accept、一条规则
+  都没有。冲掉什么也不丢, iptables-nft 下次用到自己重建。拦它等于**全新机器装不上**。判据改成与
+  `nftscan.py` 同源(那边早就按"空骨架不算冲突"处理了): 有规则、或策略不是 accept 才算真会丢。
+- **Docker 主机自动跑通**:表里真有规则(Docker / fail2ban / libvirt / k8s)时, 不再要求用户先自己
+  动手改防火墙文件 —— 装机会把 `flush ruleset` **注释掉**(保留原文, 并在文件里写清是谁改的、
+  为什么、怎么还原), 必要时给你自己带规则的表补上 `table X` + `delete table X`, 让每张表各自重建,
+  去掉全局 flush 之后重复应用也不会累积规则。本项目自己的块从来就是这个写法, 不依赖那行 flush。
+- **仍会中止的一种**:那张表**和别人共管** —— 内核里有文件没声明的链(你写了
+  `table ip filter { chain FORWARD }`, 而 Docker 又往 `ip filter` 里加了 `DOCKER-USER`)。给它加
+  `delete table` 会把别人那部分一起删掉, 没有安全的自动解法, 报错会点名是哪张表。解析不确定同样
+  fail-closed。
+- **`PDG_KEEP_FLUSH=1`**:不希望我们动 `/etc/nftables.conf` 时设它, 遇到冲突会中止并给出手工做法。
+- 报错文案按归属分流: 认出 Docker 这类**动态**规则时, 只给"去掉 flush ruleset"并附可粘贴的命令 ——
+  把它们抄进 `/etc/nftables.conf` 是错的做法(随容器起停不断变, 下次就对不上), 老文案两条并列给,
+  用户很容易选错那条。
+
 ## 2026-07-30 — v1.7.4(规则集在 gfw 模式下不再是死规则)
 
 - **规则集的域名自动进 mosdns 劫持表**:此前规则集只写 mihomo 那一侧, 而流量能不能到 mihomo 由

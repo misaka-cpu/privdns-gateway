@@ -189,7 +189,7 @@ ssh <你的网关> sudo pdg rescue fingerprint
 | 管理 | Telegram Bot（Python 标准库） | 出口、分流、规则集、测速、流量、备份恢复、iOS 描述文件、自定义域名、WLOC；改配置前先校验，失败回滚 |
 | 位置改写 | pdg-mitm（可选，iOS） | 自签 CA + 终止 TLS + 转发并替换 `gs-loc` 响应坐标 |
 | 证书 | certbot standalone | Let's Encrypt，自动续期 |
-| 防火墙 | nftables | 对全网只放行 SSH；DNS、数据、探测端口只放行内网卡来源段；mihomo 用 REDIRECT 入站，同样限内网卡来源 |
+| 防火墙 | nftables | 对全网只放行 SSH；DNS、数据、探测端口只放行内网卡来源段；mihomo 用 REDIRECT 入站，同样限内网卡来源。只用独立的 `table inet pdg`，`/etc/nftables.conf` 里你自己的表逐字节保留 |
 
 内核版本由 `pdg update` 随 PrivDNS Gateway 发布版指定并逐字节校验（SHA256）后安装。
 
@@ -210,6 +210,13 @@ mihomo」，**具体走哪个出口仍由数据模型里的真实规则决定**�
   手写过内容的文件（表头不是自动生成的那行）更新时不会被覆盖。
 
   这一层只在 `gfw` 模式下看得出差别：`all` 模式"不是国内就劫持"本来就把规则集的域名兜住了。
+
+**跑 Docker 的机器**：Debian 自带的 `/etc/nftables.conf` 开头有一行 `flush ruleset`，它会在每次
+`systemctl reload nftables` 时把 Docker（以及 fail2ban、libvirt、k8s）建在内核里的表整个冲掉——
+这跟本项目无关，是那台机器上本来就有的隐患。装机检测到这种组合时，会把那一行**注释掉**（保留原
+文并写清怎么还原），必要时给你自己的表补上 `table X` + `delete table X`，让每张表各自重建——
+去掉全局 flush 之后重复应用也不会累积规则。不希望我们动这个文件：`PDG_KEEP_FLUSH=1 bash install.sh`，
+那时遇到冲突会中止并告诉你怎么手工处理。
 
 **配置写入统一走事务。** 出口、分流、规则集、DNS 上游、防火墙、TFO、证书、WLOC 开关、备份恢复
 等所有会改动生产配置的操作，都在一笔配置事务里完成：候选先校验，再原子落盘，然后按目标状态
