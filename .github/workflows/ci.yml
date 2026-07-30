@@ -397,6 +397,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      # dns-policy-test.sh 自己会把 mosdns 下到它的临时目录, 但负控脚本判前提用的是
+      # `command -v mosdns` —— 装到 PATH 上才算数。**必须紧跟在 checkout 之后**: 放在失败的
+      # 那一步后面就永远不会执行(v1.7.0 发布前踩过一次)。顺带让两次 dns-policy 复用同一份
+      # 二进制, 不必各下一遍。
+      - name: "准备钉死版 mosdns (负控脚本按 PATH 判前提; 版本与 SHA256 走 lib/versions.sh)"
+        run: sudo -E bash tests/prepare-mosdns.sh
       - name: 流量层 (真起 sing-box 验证按 SNI 分到不同出口 + final 兜底)
         run: bash tests/functional-test.sh
       - name: DNS 层 (真起 mosdns 验证 A 劫持 / AAAA·HTTPS 置空 / 国内直连 / 按来源门控)
