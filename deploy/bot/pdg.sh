@@ -2182,6 +2182,14 @@ migrate_nft_extra(){
   install -d -m755 "$d" 2>/dev/null || true
   grep -q 'nft-input\.d/\*\.conf' "$f" && return 0          # 已有 → 幂等
   grep -q '^table inet pdg {' "$f" || return 0                # 还没装 pdg 表 → 轮不到它
+  # 本项目的约定: 现场有 input 链冲突、**或读不到运行 ruleset**时, 一个字节都不动防火墙
+  # (见 e2e-custom-nft)。那种机器上别的迁移已经决定不碰这个文件, 这里再插一行就把那条保证
+  # 破坏了。判据复用 nftscan, 不另写一套 —— 只有它明确回"1=确认无冲突"才动手,
+  # 0(有冲突) / 2(读不到) / 其它(脚本自己出错)一律不动。
+  local scan rcs=0; scan="$(_pdg_module nftscan.py)" || scan=""
+  [[ -n "$scan" ]] || return 0
+  python3 "$scan" "$f" >/dev/null 2>&1 || rcs=$?
+  [[ "$rcs" == 1 ]] || return 0
   local wd; wd="$(mktemp -d)" || return 0
   if ! python3 - "$f" "$wd/cand.conf" "$inc" <<'PY'; then
 import re, sys
