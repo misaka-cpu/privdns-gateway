@@ -59,6 +59,7 @@ deploy/bot/healthcheck.py healthcheck.py 755"
 # 格式完全一致, 同样表达改名与跨目录:
 #   deploy/ios/pdg-dot-ondemand.mobileconfig.tmpl → /opt/pdg-bot/pdg-dot.mobileconfig.tmpl
 PDG_IOS_MODULES="deploy/bot/iosprofile.py iosprofile.py 755
+deploy/bot/iosstate.py iosstate.py 755
 deploy/bot/mitm_ca.py mitm_ca.py 755
 deploy/bot/mitm_server.py mitm_server.py 755
 deploy/bot/mitm_wloc.py mitm_wloc.py 755

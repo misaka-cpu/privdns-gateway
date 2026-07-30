@@ -91,6 +91,16 @@ def norm_addrs(addrs):
     return out
 
 
+def reject_key_material(raw, what="CA 证书"):
+    """见到任何私钥标记就拒。调用点不止一处是**故意**的: PEM 解析是一道门, 最终字节是另一道,
+    直接传进来的 DER 又是一道。私钥外泄没有"下一次再修"的机会, 所以宁可查三遍。"""
+    b = bytes(raw or b"")
+    for mark in _KEY_MARKERS:
+        if mark in b:
+            raise ProfileError("%s 里含私钥, 拒绝生成描述文件。描述文件只能包含公开证书, "
+                               "请检查证书路径是否误指向了 key 文件。" % what)
+
+
 def ca_der_from_pem(pem):
     """PEM → DER, 但**先当成不可信输入检查一遍**。
 
@@ -101,10 +111,7 @@ def ca_der_from_pem(pem):
     if not pem:
         return b""
     raw = pem.encode() if isinstance(pem, str) else bytes(pem)
-    for mark in _KEY_MARKERS:
-        if mark in raw:
-            raise ProfileError("CA 文件里含私钥, 拒绝生成描述文件。"
-                               "描述文件只能包含公开证书, 请检查 CA 证书路径是否误指向了 key 文件。")
+    reject_key_material(raw, "CA 文件")
     text = raw.decode("utf-8", "replace")
     blocks = re.findall(r"-----BEGIN ([A-Z0-9 ]+)-----(.*?)-----END \1-----", text, re.S)
     if not blocks:
@@ -199,6 +206,8 @@ def render(dot_host, server_addresses, ssids=(), ca_der=b"", ids=None, template=
     的模板原文, 于是同一台网关会吐出两种不同格式(还夹着模板里那段解释部署细节的 XML 注释)。
     受管生命周期要拿"字节是否相同"当证据, 就不能容忍"取决于走哪条分支"的格式。
     """
+    if ca_der:
+        reject_key_material(ca_der, "传入的根证书")
     ids = dict(ids or random_ids())
     u_root = _check_uuid(ids.get("root"), "顶层 PayloadUUID")
     u_dns = _check_uuid(ids.get("dns"), "DNS payload UUID")

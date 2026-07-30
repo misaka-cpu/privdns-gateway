@@ -85,7 +85,7 @@ common = [l.split()[1] for l in sh(SRC + "pdg_platform_modules") if l.strip()]
 ios = [l.split()[1] for l in sh(SRC + "pdg_platform_modules ios") if l.strip()]
 android = [l.split()[1] for l in sh(SRC + "pdg_platform_modules android") if l.strip()]
 ios_only = sorted(set(ios) - set(common))
-if android == common and len(ios_only) == 6:
+if android == common and len(ios_only) == 7:
     ok("Android = 通用集(%d 项); iOS 另加 %d 项: %s"
        % (len(common), len(ios_only), "、".join(ios_only)))
 else:

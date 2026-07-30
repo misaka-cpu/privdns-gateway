@@ -930,7 +930,7 @@ def check_mitm():
             "/opt/pdg-bot/probe81.py", "/opt/pdg-bot/pdg-dot.mobileconfig.tmpl",
             # 缺它 ⇒ 描述文件根本生成不出来(Bot 与 CLI 都走这一份), 而 WLOC 开着时
             # 用户恰恰**必须**重新生成一份带根证书的描述文件。
-            "/opt/pdg-bot/iosprofile.py"]
+            "/opt/pdg-bot/iosprofile.py", "/opt/pdg-bot/iosstate.py"]
     miss = [os.path.basename(p) for p in need if not os.path.isfile(p)]
     if miss:
         return ("fail", "MITM 插件", "已启用但缺 iOS 组件: " + ", ".join(miss)
@@ -942,6 +942,7 @@ def check_mitm():
                      ("mitm_server.py", "deploy/bot/mitm_server.py"),
                      ("mitm_wloc.py", "deploy/bot/mitm_wloc.py"),
                      ("iosprofile.py", "deploy/bot/iosprofile.py"),
+                     ("iosstate.py", "deploy/bot/iosstate.py"),
                      ("probe81.py", "deploy/ios/probe81.py"),
                      ("pdg-dot.mobileconfig.tmpl", "deploy/ios/pdg-dot-ondemand.mobileconfig.tmpl")):
         sp = os.path.join(REPO_DIR, src)

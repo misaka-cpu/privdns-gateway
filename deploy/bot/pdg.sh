@@ -1709,7 +1709,7 @@ PY
     fi
   done
   for f in /opt/pdg-bot/probe81.py /opt/pdg-bot/mitm_ca.py /opt/pdg-bot/mitm_server.py /opt/pdg-bot/mitm_wloc.py \
-           /opt/pdg-bot/iosprofile.py \
+           /opt/pdg-bot/iosprofile.py /opt/pdg-bot/iosstate.py \
            /opt/pdg-bot/pdg-dot.mobileconfig.tmpl /opt/pdg-bot/pdg-mitm.mobileconfig.tmpl; do
     [[ -f "$f" ]] && { rm -f "$f"; removed=1; }
   done
@@ -2594,6 +2594,7 @@ _PLAT_IOS_REQUIRED=(
   "deploy/ios/probe81.py|/opt/pdg-bot/probe81.py|755"
   "deploy/ios/pdg-dot-ondemand.mobileconfig.tmpl|/opt/pdg-bot/pdg-dot.mobileconfig.tmpl|644"
   "deploy/bot/iosprofile.py|/opt/pdg-bot/iosprofile.py|755"
+  "deploy/bot/iosstate.py|/opt/pdg-bot/iosstate.py|755"
   "deploy/bot/mitm_ca.py|/opt/pdg-bot/mitm_ca.py|755"
   "deploy/bot/mitm_server.py|/opt/pdg-bot/mitm_server.py|755"
   "deploy/bot/mitm_wloc.py|/opt/pdg-bot/mitm_wloc.py|755"
@@ -2644,7 +2645,7 @@ _plat_verify(){
     [[ "$(systemctl is-active pdg-mitm 2>/dev/null)" == active ]] || miss+=("pdg-mitm(未运行)")
   else
     for f in /opt/pdg-bot/probe81.py /opt/pdg-bot/pdg-dot.mobileconfig.tmpl \
-             /opt/pdg-bot/iosprofile.py \
+             /opt/pdg-bot/iosprofile.py /opt/pdg-bot/iosstate.py \
              /opt/pdg-bot/mitm_ca.py /opt/pdg-bot/mitm_server.py /opt/pdg-bot/mitm_wloc.py \
              /etc/systemd/system/pdg-probe81.service /etc/systemd/system/pdg-mitm.service; do
       [[ -e "$f" ]] && extra+=("$f")
@@ -3254,6 +3255,7 @@ cmd_platform(){
     /opt/pdg-bot/probe81.py
     /opt/pdg-bot/pdg-dot.mobileconfig.tmpl
     /opt/pdg-bot/iosprofile.py
+    /opt/pdg-bot/iosstate.py
     /opt/pdg-bot/mitm_ca.py
     /opt/pdg-bot/mitm_server.py
     /opt/pdg-bot/mitm_wloc.py
