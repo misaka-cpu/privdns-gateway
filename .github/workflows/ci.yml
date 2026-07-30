@@ -289,6 +289,12 @@ jobs:
       - name: "明确代理优先级 (v1.7.0 模板幂等补齐/顺序自检/fail-closed + 事务回滚 + doctor 点名)"
         run: python3 tests/test-mosdns-explicit-proxy.py
 
+      # 全新 Debian 13 装不上的第二个报障: 装机时 mosdns 还没起、53/853 还没人听, 事务的
+      # normal 模式把这当成"组件坏了"直接拒写 geosite; 规则文件因此一个都没落盘, mosdns 缺
+      # domain_set 文件起不来, 整场安装失败回滚。装机侧要用 repair 模式, 且文件先建空的。
+      - name: "装机引导规则库 (repair 模式写得进 / normal 门不拆 / 空文件 mosdns 能起)"
+        run: python3 tests/test-install-bootstrap-rules.py
+
       # 全新 Debian 13 装不上那个报障: iptables-nft 建出来的空 ip filter/ip nat 被
       # flush 门当成"会丢的表"拦掉。判据要能分辨空表与真有规则的表, 两个方向都得守住。
       - name: "nft flush 门 (空表放行 / Docker 有规则仍拒 / 读不出 fail-closed)"

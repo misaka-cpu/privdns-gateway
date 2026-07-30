@@ -923,8 +923,20 @@ else
 fi
 
 # ── 7. geosite 规则库 (此时 DNS 仍可用) ──
+# 先把 geosite 文件建成空文件: mosdns 的 domain_set 要求文件**存在**, 缺一个就 FATAL 起不来。
+# 下载失败(没网/被墙/源站抽风)本该只是"分类规则暂时是空的", 不该让整场安装失败回滚 ——
+# 装完还能用 bot『更新规则库』补上。
+for _gf in geosite_cn geosite_apple geosite_gfw 'geosite_geolocation-!cn'; do
+  [[ -s "/etc/mosdns/rules/$_gf.txt" ]] || : > "/etc/mosdns/rules/$_gf.txt"
+done
 c_g "下载并解析 geosite 规则库…"
-bash /opt/pdg-bot/update-rules.sh || c_y "geosite 下载失败, 装好后可在 bot『更新规则库』重试"
+# PDG_TX_MODE=repair: 装机时 mosdns 还没起、53/853 还没人听 —— 那不是"组件坏了"而是"还没装完",
+# normal 模式的前置硬门会把这次写入直接拒掉(实测: 全新机器因此装不上)。repair 允许降级基线,
+# 但"操作前好、操作后坏"照旧整笔回滚。
+if PDG_TX_MODE=repair bash /opt/pdg-bot/update-rules.sh; then :; else
+  c_y "geosite 下载失败, 已用空规则库继续安装(网关能起来, 但分类规则是空的)。"
+  c_y "  影响: 国内域名暂时不会被识别为直连 —— 装完请在 bot『更新规则库』重试一次。"
+fi
 
 # ── 8. 启动 ──
 c_g "启动服务…"

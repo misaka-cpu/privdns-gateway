@@ -26,7 +26,12 @@ for m in /opt/privdns-gateway/deploy/bot/pdgtx.py /opt/pdg-bot/pdgtx.py; do
 done
 [[ -n "$TX" ]] || { echo "找不到事务核心 pdgtx.py, 拒绝直接改现网规则库"; exit 1; }
 
-ID="$(python3 "$TX" new --source scheduler --op geosite_update)"
+# 事务模式。normal 有一道前置硬门: "操作前这些组件就是坏的 → 拒绝在坏掉的东西上做普通变更"。
+# 那道门对**日常更新**是对的, 但对**全新安装**是错的 —— 那时 mosdns 还没起、53/853 还没人听,
+# 不是"坏了", 是"还没装完"。装机因此拿不到 geosite 文件, mosdns 又因为 domain_set 缺文件起不来,
+# 整场安装失败回滚。装机侧传 PDG_TX_MODE=repair: 允许降级基线, 但"操作前好、操作后坏"照旧回滚。
+TXMODE="${PDG_TX_MODE:-normal}"
+ID="$(python3 "$TX" new --source scheduler --op geosite_update --mode "$TXMODE")"
 for f in "${files[@]}"; do
   python3 "$TX" stage --tx "$ID" --target "mosdns_rule:$(basename "$f")" --file "$f"
 done

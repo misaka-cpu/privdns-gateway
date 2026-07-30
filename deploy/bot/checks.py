@@ -627,6 +627,41 @@ def check_ruleset_hijack():
     return ("ok", "规则集劫持表", "%d 个规则集的域名已同步(gfw 模式下也能命中)" % drivable)
 
 
+GEOSITE_DIR = "/etc/mosdns/rules"
+_GEOSITE_FILES = ("geosite_cn.txt", "geosite_apple.txt", "geosite_gfw.txt",
+                  "geosite_geolocation-!cn.txt")
+
+def check_geosite_db():
+    """geosite 规则库是不是空的。
+
+    装机时 geosite 下载失败(没网/源站抽风/被墙)会退化成空规则库 —— 网关照常起来, 只是
+    "哪些域名算国内"这件事没有依据了。这个降级只在装机那一刻打了一行黄字, 之后再没人提;
+    而症状("怎么什么都走代理"/"国内网站变慢")跟规则库空了对不上号, 用户很难自己想到这。
+
+    只读: 看文件在不在、有没有内容。缺文件比空文件更要紧 —— mosdns 的 domain_set 缺文件
+    直接 FATAL, 那台机器下次重启就起不来了。"""
+    d = GEOSITE_DIR
+    if not os.path.isdir(d):
+        return None                       # 没装 mosdns → 这项不适用
+    missing = [f for f in _GEOSITE_FILES if not os.path.exists(os.path.join(d, f))]
+    if missing:
+        return ("fail", "geosite 规则库",
+                "缺文件: %s —— mosdns 启动时读不到会直接退出(下次重启就起不来)。"
+                "在 bot「更新规则库」跑一次即可补齐。" % "、".join(missing))
+    empty = [f for f in _GEOSITE_FILES if os.path.getsize(os.path.join(d, f)) == 0]
+    if len(empty) == len(_GEOSITE_FILES):
+        return ("warn", "geosite 规则库",
+                "全是空的 —— 多半是装机时下载失败。网关能用, 但国内域名不会被识别为直连, "
+                "等于全都当境外处理。在 bot「更新规则库」跑一次就好。")
+    if empty:
+        return ("warn", "geosite 规则库",
+                "这几个是空的: %s。对应类别的分流暂时没有依据, "
+                "在 bot「更新规则库」跑一次重新拉取。" % "、".join(empty))
+    n = sum(1 for f in _GEOSITE_FILES
+            for _ in open(os.path.join(d, f), encoding="utf-8", errors="replace"))
+    return ("ok", "geosite 规则库", "%d 条规则, 4 个类别齐全" % n)
+
+
 NFT_EXTRA_DIR = "/etc/privdns-gateway/nft-input.d"
 
 def check_nft_extra():
@@ -1033,7 +1068,7 @@ def check_transactions():
 ALL = [check_platform, check_services, check_bot_credentials, check_core_version, check_dot_arecord, check_dot_domain_sync,
        check_internal_cidr, check_cidr_drift, check_nft, check_nft_input_chains, check_redirect, check_gms,
        check_mosdns_ratelimit, check_mosdns_explicit_proxy, check_ruleset_hijack,
-       check_nft_extra, check_mem,
+       check_nft_extra, check_geosite_db, check_mem,
        check_cert, check_dns, check_core_config, check_rulesets, check_mitm_structure, check_mitm,
        check_transactions]
 ALERT = [check_services, check_dns, check_cert]  # healthcheck 用的轻量子集(运行期故障)

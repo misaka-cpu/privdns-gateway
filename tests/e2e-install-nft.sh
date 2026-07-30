@@ -874,4 +874,99 @@ out="$(run_install "PDG_NO_ADOPT_RULES=1")"; rc=$?
   && bad "7c 设了开关却仍生成了搬运文件" || ok "7c 没生成搬运文件"
 
 rm -f "$NFT_STATE"
+# ══ 8. 全新安装时 geosite 拿不到 → 只是"分类为空", 不该整场安装失败回滚 ═══════
+# 用户现场(2026-07-30, 全新 Debian 13, v1.7.7): 装机走到"下载并解析 geosite 规则库"这步,
+# 事务回了
+#     REFUSED: 操作前这些硬门就是坏的: svc:mosdns, dns:127.0.0.1:53, port:853
+# —— normal 模式那道"操作前组件就是坏的就别动它"的前置门。日常更新时它是对的; 但装机时
+# mosdns 本来就还没起、53/853 本来就还没人听, 那不是"坏了"而是"还没装完"。于是规则文件一个
+# 都没落盘, mosdns 的 domain_set 缺文件直接 FATAL, 重启 7 次后装机判定失败并回滚。
+#
+# 两处都要治: 装机侧用 repair 模式开事务; 同时先把 geosite 文件建成空的 —— 下载失败(没网、
+# 源站抽风、被墙)本就该退化成"分类规则暂时是空的", 而不是"这台机器装不上"。
+echo; echo "── 8. 装机时 geosite 下载失败 ──"
+reset_box
+seed_clean
+# 只掐 geosite 那个下载, 其余 curl 照常(装机还要靠它拿别的东西)
+REAL_CURL="$(command -v curl)"
+cat > /usr/local/bin/curl <<S
+#!/bin/sh
+for a in "\$@"; do
+  case "\$a" in *geosite.dat*) echo "curl: (6) could not resolve host" >&2; exit 6 ;; esac
+done
+exec "$REAL_CURL" "\$@"
+S
+chmod 755 /usr/local/bin/curl
+out="$(run_install "")"; rc=$?
+[[ "$rc" == 0 ]] && ok "8 geosite 下载失败, 装机仍然成功(不再整场回滚)" \
+  || bad "8 装机失败(rc=$rc): $(grep -E 'REFUSED|安装失败|未能持续' <<<"$out" | head -2 | tr '\n' ' ')"
+grep -qE 'geosite 下载失败' <<<"$out" \
+  && ok "8 如实告知下载失败" || bad "8 没告知下载失败"
+grep -q '分类规则是空的' <<<"$out" \
+  && ok "8 说清了影响(分类规则为空)而不是含糊带过" || bad "8 没说清影响"
+grep -q '更新规则库' <<<"$out" \
+  && ok "8 给了补救办法" || bad "8 没给补救办法"
+
+# 判据本身: mosdns 配置里点名的每个规则文件都必须存在 —— 缺一个 mosdns 就 FATAL 起不来,
+# 这正是用户那台机器起不来的直接原因。
+python3 - <<'PY' && ok "8 config.yaml 里点名的规则文件全都存在(mosdns 能起来)" || bad "8 仍有规则文件缺失"
+import os, re, sys
+try:
+    cfg = open("/etc/mosdns/config.yaml", encoding="utf-8").read()
+except OSError as e:
+    print("读不到 config.yaml:", e); sys.exit(1)
+want = sorted(set(re.findall(r"(/etc/mosdns/rules/[^\s\"']+\.txt)", cfg)))
+if not want:
+    print("配置里一个规则文件都没点名 —— 断言无从成立"); sys.exit(1)
+missing = [f for f in want if not os.path.exists(f)]
+print("点名 %d 个, 缺 %d 个: %s" % (len(want), len(missing), missing[:5]))
+sys.exit(1 if missing else 0)
+PY
+# 且确实是空的(证明上面那条不是靠"下载其实成功了"蒙混过关)
+[[ -f /etc/mosdns/rules/geosite_cn.txt && ! -s /etc/mosdns/rules/geosite_cn.txt ]] \
+  && ok "8 geosite_cn.txt 存在且为空(确认走的就是下载失败这条路)" \
+  || bad "8 geosite_cn.txt 不是『存在且为空』, 这一节没验到下载失败的场景"
+rm -f /usr/local/bin/curl
+
+# ── 8b. 下载成功、但事务被那道前置硬门拒掉 ── 用户现场就是这一半 ──
+# 直接跑真的 update-rules.sh, 不看源码字面量: 装机现场的特征是 mosdns 还没起、53/853 还没人
+# 听 —— 硬门基线本来就是坏的。normal 模式必须拒(这道门对日常更新是对的, 不能拆),
+# 装机侧的 repair 模式必须能写进去。
+echo "── 8b. 下载成功但事务被拒 ──"
+cat > /usr/local/bin/curl <<'S'
+#!/bin/sh
+o=""; while [ $# -gt 0 ]; do case "$1" in -o) o="$2"; shift;; esac; shift; done
+[ -n "$o" ] && echo dummy > "$o"
+exit 0
+S
+chmod 755 /usr/local/bin/curl
+cat > /opt/pdg-bot/parse-geosite.py <<'S'
+import sys, os
+os.makedirs(sys.argv[2], exist_ok=True)
+for n in ("geosite_cn", "geosite_apple"):
+    open(os.path.join(sys.argv[2], n + ".txt"), "w").write("domain:e2e-%s.test\n" % n)
+S
+: > /etc/mosdns/rules/geosite_cn.txt          # 回到"规则库是空的"
+# 造出装机现场的基线: mosdns 还没起来。装完的沙箱里硬门是好的 —— 不先弄成降级状态,
+# 这一节就什么都验不到(照样通过, 等于没验)。
+e2e_svc_fail mosdns
+systemctl is-active --quiet mosdns \
+  && bad "8b 基线没能弄成降级状态, 本节前提不成立" \
+  || ok "8b 前提成立: mosdns 未运行(与装机现场一致)"
+out8b="$(bash /opt/pdg-bot/update-rules.sh 2>&1)"; rc8b=$?
+[[ "$rc8b" != 0 ]] && ok "8b 日常更新(normal): 硬门坏着就拒 —— 那道门没被拆掉" \
+  || bad "8b normal 模式竟然放行了, 前置硬门形同虚设"
+grep -q '操作前这些硬门就是坏的' <<<"$out8b" \
+  && ok "8b 拒绝理由正是用户报的那条" || bad "8b 拒绝理由不对: $(head -2 <<<"$out8b")"
+[[ -s /etc/mosdns/rules/geosite_cn.txt ]] \
+  && bad "8b 被拒了却把文件写进去了" || ok "8b 被拒时旧规则库原样不动"
+
+out8c="$(PDG_TX_MODE=repair bash /opt/pdg-bot/update-rules.sh 2>&1)"; rc8c=$?
+[[ "$rc8c" == 0 ]] && ok "8b 装机模式(repair): 同样的基线下写得进去" \
+  || bad "8b repair 模式也失败(rc=$rc8c): $(head -3 <<<"$out8c" | tr '\n' ' ')"
+grep -q 'domain:e2e-geosite_cn.test' /etc/mosdns/rules/geosite_cn.txt 2>/dev/null \
+  && ok "8b 规则真的落到了 /etc/mosdns/rules(装机因此拿得到规则库)" \
+  || bad "8b 文件没落盘: $(head -c 120 /etc/mosdns/rules/geosite_cn.txt 2>&1)"
+rm -f /usr/local/bin/curl
+
 e2e_summary
