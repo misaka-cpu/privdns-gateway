@@ -2034,31 +2034,40 @@ migrate_mosdns_hijack_shape(){
 # 返真实地址, 流量根本不进 mihomo —— 内核里那条 route 规则成了死规则, 而 doctor 看不出问题:
 # 规则确实在, 只是永远匹配不到。
 #
-# 走 **pdgtx 事务**而不是直接改文件: 候选要过 mosdns 探针(真启动 mosdns 解析它), 失败就整笔
-# 回滚、现网一个字节不动; 服务重启失败同样回滚。不另写一套手工事务。
+# **CLI 侧的精确事务, 不用 Python pdgtx** —— 与 migrate_ios_gms_cleanup 同一条理由: 本函数经
+# `pdg __migrate` 跑, 而 cmd_update 是**持着 /run/privdns-gateway.lock 的父进程**在调它;
+# pdgtx 抢的是同一把 flock, 于是必然 BUSY。第一版正是这么写的, 结果 .200 更新到 v1.7.1 之后
+# 迁移被"已有配置操作正在执行"挡掉并回滚, 而 update 照样报成功 —— 只有 doctor 那条告警露了馅。
+# "释放锁 / 跳过锁 / 信任调用方已锁"三种绕法都会把并发保护弄没, 所以按这里的规矩自己来:
+# 候选先行(形态不认识就压根不碰现网)→ 备份 → 落盘 → 重启 → 复核 → 失败按备份完整还原。
 migrate_mosdns_explicit_proxy(){
-  local mc=/etc/mosdns/config.yaml wd txm sip out rc=0
+  local mc=/etc/mosdns/config.yaml wd sip out bak
   [[ -f "$mc" ]] || return 0
   # shellcheck source=/dev/null
   source "$REPO_DIR/lib/mosdns.sh" 2>/dev/null || return 0
-  # 已经齐了 → 什么都不做(幂等), 连事务都不开
+  # 已经齐了 → 什么都不做(幂等)
   if grep -q "tag: explicit_proxy$" "$mc" && grep -q 'qname \$explicit_proxy' "$mc"; then
     return 0
   fi
-  txm="$(_pdg_module pdgtx.py)" || { c_y "  找不到 pdgtx.py, 明确代理优先级未迁移。"; return 0; }
-  # 判据用 pdgtx 自己的**退出码**(非 0 = 有事务卡在需要人工收尾的状态), 不是输出是否为空:
-  # `pending` 还会顺带列出"开了但从没应用过"的陈旧 PREPARING —— 那类不挡任何写入, pdgtx 自己
-  # 也不把它算进 NEEDS_RECOVERY。拿输出非空当判据, 线上机器攒着的旧 geosite_update 就会把这次
-  # 迁移永远挡在门外, 而且是静默的: 更新照样报成功, 分流照样不生效。
-  local pend rcp=0
-  pend="$(python3 "$txm" pending 2>/dev/null)" || rcp=$?
-  if [[ "$rcp" != 0 ]]; then
-    c_y "  有需要收尾的配置事务, 明确代理优先级本次不迁移(未改动任何文件):"
-    printf '%s\n' "$pend" | sed 's/^/    /'
-    c_y "  → 先 sudo pdg tx recover <id> 收尾, 再跑一次 sudo pdg update。"
-    return 0
+  # 有事务卡在需要人工收尾的状态时不动手。判据用 pdgtx 的**退出码**(只读, 不取锁):
+  # `pending` 的输出里还包含"开了但从没应用过"的陈旧 PREPARING —— 那类不挡任何写入,
+  # 拿输出非空当判据的话, 线上机器攒着的旧 geosite_update 会把迁移永远挡在门外。
+  local txm; txm="$(_pdg_module pdgtx.py)" || txm=""
+  if [[ -n "$txm" ]]; then
+    local pend rcp=0
+    pend="$(python3 "$txm" pending 2>/dev/null)" || rcp=$?
+    if [[ "$rcp" != 0 ]]; then
+      c_y "  有需要收尾的配置事务, 明确代理优先级本次不迁移(未改动任何文件):"
+      printf '%s\n' "$pend" | sed 's/^/    /'
+      c_y "  → 先 sudo pdg tx recover <id> 收尾, 再跑一次 sudo pdg update。"
+      return 0
+    fi
   fi
   sip="$(sed -n 's/^PDG_SERVER_IP=//p' /etc/privdns-gateway/profile.env 2>/dev/null | tail -1)"
+  [[ -n "$sip" ]] || sip="$(grep -oE 'black_hole [0-9.]+' "$mc" | head -1 | awk '{print $2}')"
+  if [[ -z "$sip" ]]; then
+    c_y "  取不到网关 IP(未渲染?), 明确代理优先级未迁移(交 doctor 点名)。"; return 0
+  fi
   wd="$(mktemp -d)" || return 0
   # 先在**副本**上试改: 形态不认识就到此为止, 现网从未被碰过。
   cp "$mc" "$wd/cand.yaml" || { rm -rf "$wd"; return 0; }
@@ -2068,27 +2077,31 @@ migrate_mosdns_explicit_proxy(){
     rm -rf "$wd"; return 0
   fi
   [[ "$out" == changed ]] || { rm -rf "$wd"; return 0; }
-  : > /etc/mosdns/rules/ruleset_hijack.txt 2>/dev/null || true   # 域名集要求文件存在
-  local txid; txid="$(python3 "$txm" new --source cli --op mosdns-explicit-proxy 2>"$wd/err")" || {
-    c_y "  开不了配置事务, 明确代理优先级未迁移。"; rm -rf "$wd"; return 0; }
-  python3 "$txm" read --target mosdns_conf > "$wd/raw" 2>"$wd/err" || rc=1
-  if [[ "$rc" == 0 ]]; then
-    local sha; sha="$(head -1 "$wd/raw")"
-    python3 "$txm" stage --tx "$txid" --target mosdns_conf --file "$wd/cand.yaml" --expect "$sha" 2>"$wd/err" || rc=1
+  # 域名集要求文件存在, 缺了 mosdns 起不来 —— 必须在落盘之前建好
+  [[ -e /etc/mosdns/rules/ruleset_hijack.txt ]] || : > /etc/mosdns/rules/ruleset_hijack.txt
+  bak="$mc.preexplicit.$(date +%s)"
+  if ! cp -a "$mc" "$bak" 2>/dev/null || ! cmp -s "$mc" "$bak"; then
+    c_y "  备份失败(磁盘满?), 中止、不动现网。"; rm -f "$bak" 2>/dev/null; rm -rf "$wd"; return 0
   fi
-  if [[ "$rc" != 0 ]]; then
-    python3 "$txm" abort "$txid" >/dev/null 2>&1 || true
-    c_y "  候选暂存失败, 明确代理优先级未迁移(现网未改动)。"; rm -rf "$wd"; return 0
+  if ! cat "$wd/cand.yaml" > "$mc" 2>/dev/null; then
+    c_y "  写入失败, 还原。"; cp -a "$bak" "$mc" 2>/dev/null; rm -f "$bak"; rm -rf "$wd"; return 0
   fi
-  python3 "$txm" service --tx "$txid" --action restart:mosdns >/dev/null 2>&1
-  if python3 "$txm" apply --tx "$txid" >/dev/null 2>"$wd/err"; then
-    c_g "  已把「用户点名指到出口的域名」提到 geosite_cn 之前(显式代理优先)。"
+  # 校验: 装了 mosdns 服务就真重启一遍确认能加载; 没有服务的环境只留新配置(与 MITM 迁移同规矩)
+  if command -v mosdns >/dev/null 2>&1 && systemctl list-units --all 2>/dev/null | grep -q mosdns.service; then
+    systemctl restart mosdns 2>/dev/null; sleep 1
+    if [[ "$(systemctl is-active mosdns 2>/dev/null)" == active ]]; then
+      c_g "  已把「用户点名指到出口的域名」提到 geosite_cn 之前(显式代理优先)。"
+      rm -f "$bak"
+    else
+      c_y "  ⚠️ 新配置起不来 mosdns → 已还原到迁移前。"
+      cp -a "$bak" "$mc" 2>/dev/null; systemctl restart mosdns 2>/dev/null; rm -f "$bak"
+    fi
   else
-    c_y "  明确代理优先级迁移未通过校验/健康门, 已回滚: $(tr -d '\n' < "$wd/err" | head -c 120)"
+    c_g "  已把「用户点名指到出口的域名」提到 geosite_cn 之前(未起 mosdns 校验: 本机无 mosdns 服务)。"
+    rm -f "$bak"
   fi
   rm -rf "$wd"
 }
-
 # 老装(v1.4.x)从来没有 backend 标记。据现场证据把它落地(unit 文件存在才算数, 免得 is-active
 # 的异常输出误导), 让"这台机器此刻跑的是哪个核"成为显式状态而非默认值。
 # v1.6.0 起唯一内核是 mihomo, 本函数仍有用: 它跑在 migrate_drop_singbox **之前**, 于是万一

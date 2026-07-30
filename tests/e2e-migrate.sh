@@ -262,4 +262,46 @@ cmp -s /tmp/m6b /etc/mosdns/config.yaml && ok "拒绝时现网配置逐字节未
 grep -q "$applying" /tmp/mig8.log && ok "迁移日志点名了挡路的事务 id" || bad "没说明是哪笔事务挡的"
 rm -rf "$TXROOT"; mkdir -p "$TXROOT"
 
+
+# ══ 场景七: 迁移必须能在**持锁的父进程**下完成 ═══════════════════════════════
+# 真实调用链是 cmd_update(持着 /run/privdns-gateway.lock)→ 子进程 `pdg __migrate` → 各迁移。
+# `__migrate` 自己不取锁, 所以迁移照跑; 但迁移里若去开 Python pdgtx 事务, 抢的是**同一把
+# flock**, 必然拿到 "BUSY: 已有配置操作正在执行" —— 事务回滚, update 照样报成功, 只有 doctor
+# 那条告警露馅。v1.7.1 发布当天 .200 就是这么被挡掉的。
+#
+# 上面几个场景都直接跑 `pdg __migrate`, 没有外层锁持有者, 于是全绿也漏掉了它。这里补上:
+# 另起一个进程按住锁, 再跑迁移, 结果必须与不持锁时一致。
+echo; echo "── 场景七: 有人按着 pdg 锁时, 迁移仍要完成 ──"
+seed_v170_box
+LOCKF="${PDG_LOCKFILE:-/run/privdns-gateway.lock}"
+mkdir -p "$(dirname "$LOCKF")"
+# 按住锁的旁观进程: 与 cmd_update 持锁的效果相同
+flock "$LOCKF" -c 'sleep 120' &
+HOLDER=$!
+sleep 1
+# 确认锁真的被按住了(否则这一条就是空跑)
+if flock -n "$LOCKF" -c true 2>/dev/null; then
+  bad "场景七前置: 锁没被按住, 用例失去意义"
+else
+  ok "前置: 锁确实被占着(等同 cmd_update 持锁时的处境)"
+fi
+bash /usr/local/bin/pdg __migrate >/tmp/mig9.log 2>&1
+kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null || true
+
+grep -q 'qname \$explicit_proxy' /etc/mosdns/config.yaml \
+  && ok "持锁时迁移照样完成(没有去抢同一把 flock)" \
+  || bad "被锁挡住了: $(grep -iE 'BUSY|事务|锁' /tmp/mig9.log | head -2)"
+grep -qi 'BUSY' /tmp/mig9.log && bad "迁移日志里出现了 BUSY(说明还在走 pdgtx 事务)" \
+  || ok "迁移日志里没有 BUSY"
+EP="$(epline)"; CN="$(cnline)"
+{ [[ -n "$EP" && -n "$CN" ]] && [[ "$EP" -lt "$CN" ]]; } \
+  && ok "持锁时迁出来的顺序同样正确(explicit_proxy $EP < geosite_cn $CN)" \
+  || bad "顺序不对: explicit_proxy=$EP geosite_cn=$CN"
+cp /etc/mosdns/config.yaml /tmp/m7
+bash /usr/local/bin/pdg __migrate >/dev/null 2>&1
+cmp -s /tmp/m7 /etc/mosdns/config.yaml && ok "持锁迁移后仍然幂等" || bad "二跑又改了配置"
+ls /etc/mosdns/config.yaml.preexplicit.* >/dev/null 2>&1 \
+  && bad "成功后没清掉迁移备份: $(ls /etc/mosdns/config.yaml.preexplicit.* | head -1)" \
+  || ok "成功后迁移备份已清理"
+
 e2e_summary
