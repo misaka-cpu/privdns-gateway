@@ -12,7 +12,9 @@
 import ast
 import os
 import re
+import shutil
 import subprocess
+import tempfile
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -112,11 +114,58 @@ else:
 
 # 平台无关的模块**不许**依赖 iOS 专属模块: 那种依赖在 Android 机器上是 ImportError,
 # 而且只在真正走到那条路径时才炸 —— 装机、update、doctor 全看不出来。
-leak = sorted(m for m in INSTALLED if m in LOCAL and (closure([m]) & IOS_INSTALLED))
-if not leak:
-    ok("平台无关模块没有一个依赖 iOS 专属模块(Android 上不会 ImportError)")
+#
+# 比对必须按**仓库里的模块名**来。清单里存的是安装后的名字, 而 pdg-bot.py 装成 bot.py ——
+# 拿安装名去 LOCAL 里找会直接找不到, 于是 bot 本体被静默跳过。第一版就是这么漏的:
+# pdg-bot.py 在顶层 import 了 iosprofile, Android 机器上的 bot 根本起不来, 而这条守卫全绿。
+SRC_OF = {e[1][:-3]: os.path.basename(e[0])[:-3] for e in entries if e[1].endswith(".py")}
+_common_src = sorted({SRC_OF.get(m, m) for m in INSTALLED} & set(LOCAL))
+if len(_common_src) == len([e for e in entries if e[1].endswith(".py")]):
+    ok("清单里每个 .py 都能对回仓库源文件(改名项也算得上, 共 %d 个)" % len(_common_src))
 else:
-    bad("这些平台无关模块拉进了 iOS 专属模块: %s" % ", ".join(leak))
+    bad("有清单项对不回仓库源文件: %r"
+        % sorted({SRC_OF.get(m, m) for m in INSTALLED} - set(LOCAL)))
+# 判据是**真的在一台 Android 形态的机器上把每个模块 import 一遍**, 不是看源码里有没有那行
+# import。二者会给出不同答案: 用 try/except ImportError 包起来的可选依赖, 静态看是"依赖了",
+# 运行起来却完全正常。而我们真正在乎的只有一件事 —— Android 机器上这些模块 import 得起来。
+_and_root = tempfile.mkdtemp(prefix="closure-android-")
+try:
+    _r = subprocess.run(
+        ["bash", "-c", 'set -eu; source "%s/lib/modules.sh"; '
+                       'pdg_install_runtime_modules "%s" "%s" android' % (ROOT, ROOT, _and_root)],
+        capture_output=True, text=True, timeout=300)
+    if _r.returncode != 0:
+        bad("装不出 Android 形态的运行目录: %s" % (_r.stderr or "")[-200:])
+    else:
+        _mods = sorted(f[:-3] for f in os.listdir(_and_root) if f.endswith(".py"))
+        # 结论必须带标记再取: 有些模块 import 时自己会往 stdout 打东西(用法说明之类),
+        # 直接读 stdout 会把那些行当成"import 失败"。
+        # 每个模块单独 try, 且连 SystemExit 一起接住 —— 我们只关心 ImportError 这一类。
+        _code = ("import sys\n"
+                 "sys.path.insert(0, %r)\n"
+                 "bad=[]\n"
+                 "for m in %r:\n"
+                 "    try:\n"
+                 "        __import__(m)\n"
+                 "    except ImportError as e:\n"
+                 "        bad.append('%%s: %%s' %% (m, e))\n"
+                 "    except BaseException:\n"
+                 "        pass\n"
+                 "sys.stderr.write('__RESULT__' + '|'.join(bad) + '\\n')\n" % (_and_root, _mods))
+        _p = subprocess.run([sys.executable, "-I", "-c", _code], capture_output=True,
+                            text=True, timeout=300, cwd=_and_root,
+                            env={"PATH": os.environ.get("PATH", ""), "HOME": _and_root,
+                                 "PDG_BOT_TOKEN": "x"})
+        _marks = [l[len("__RESULT__"):] for l in (_p.stderr or "").splitlines()
+                  if l.startswith("__RESULT__")]
+        _broken = _marks[-1] if _marks else "(没拿到结论标记)"
+        if _p.returncode == 0 and _marks and not _broken:
+            ok("Android 形态下 %d 个运行模块逐个 import 全部成功(含 bot 本体)" % len(_mods))
+        else:
+            bad("Android 上这些模块 import 不起来: %s%s"
+                % (_broken, (_p.stderr or "")[-300:] if _p.returncode else ""))
+finally:
+    shutil.rmtree(_and_root, ignore_errors=True)
 
 # 反向: 清单里不该有仓库里根本不存在的东西
 ghost = [e for e in entries if not os.path.exists(os.path.join(ROOT, e[0]))]

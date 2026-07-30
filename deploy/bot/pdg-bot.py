@@ -3083,9 +3083,25 @@ def set_dot_domain(domain):
                   + _renew)
 
 # ── iOS 描述文件 ──
-# 生成实现在 iosprofile 里 —— Bot 与 CLI(`pdg ios`)共用同一份。以前两边各写一套, CLI 那套
-# 既不支持 SSID 排除也不附 WLOC 根证书, 同一台网关走两条路拿到的文件内容不一样。
-import iosprofile                                          # noqa: E402
+# 生成实现在 iosprofile 里、生命周期在 iosstate 里 —— Bot 与 CLI(`pdg ios`)共用同一份。
+# 以前两边各写一套, CLI 那套既不支持 SSID 排除也不附 WLOC 根证书, 同一台网关走两条路拿到的
+# 文件内容不一样。
+#
+# ⚠️ 这两个是**按平台安装**的 iOS 专属组件: Android 机器上 /opt/pdg-bot 里根本没有它们。
+# 所以这里必须容错 —— 在模块顶层硬 import 会让 bot 在每一台 Android 网关上直接起不来
+# (`_activate_mihomo_core` 里的 `import bot` 也会跟着炸, 表现为"迁移到 mihomo 失败")。
+try:
+    import iosprofile                                      # noqa: E402
+    import iosstate                                        # noqa: E402
+except ImportError:                                        # Android: 本机没装 iOS 组件
+    iosprofile = iosstate = None
+
+
+def _ios_mods():
+    """用到 iOS 组件之前先确认它们在。平台门控之外的第二道: iOS 机器上组件被删/没装齐时,
+    要给一句能照着做的话, 而不是让调用方吃一个 ModuleNotFoundError 堆栈。"""
+    if iosprofile is None or iosstate is None:
+        raise RuntimeError("缺少 iOS 组件(iosprofile / iosstate)—— 请先跑 sudo pdg update 补齐。")
 
 def _mitm_ca_der():
     """根 CA 证书的 DER 字节(供 iOS 描述文件的 root 证书 payload)。
@@ -3097,6 +3113,7 @@ def _mitm_ca_der():
     pem = _mitm_ca_pem()
     if not pem:
         return b""
+    _ios_mods()
     return iosprofile.ca_der_from_pem(pem)
 
 def _ios_profile(ssids=(), ids=None):
@@ -3112,8 +3129,6 @@ def _ios_profile(ssids=(), ids=None):
     return iosprofile.render(_dot_host(), _server_ip(), ssids, der, ids, IOS_TMPL)
 
 # ── iOS 描述文件: 受管生命周期 ──
-import iosstate                                             # noqa: E402
-
 # 服务器**不知道**手机上此刻装的是什么 —— 本项目不是 MDM。所以下面所有文案只讲"我们生成/
 # 发送了什么", 绝不出现"已安装""设备已是最新版""更新已在手机生效""已替换手机上的旧文件"。
 IOS_UNKNOWN = "ℹ️ 服务器无法确认 iPhone 上此刻装的是哪一版, 以上只反映本机的生成/发送记录。"
@@ -3121,6 +3136,7 @@ IOS_UNKNOWN = "ℹ️ 服务器无法确认 iPhone 上此刻装的是哪一版, 
 
 def _ios_ca():
     """(WLOC 是否启用, 根 CA 的 DER)。启用却读不到 CA 时抛错, 不返回空 —— 见 _mitm_ca_der。"""
+    _ios_mods()
     enabled = bool(_mitm_enabled_domains())
     if not enabled:
         return False, b""
@@ -3147,6 +3163,7 @@ def _ios_inputs(ssids=()):
 
 def _ios_status_text():
     """iOS 描述文件页的正文。没有元数据 = 还没启用受管生命周期。"""
+    _ios_mods()
     meta = iosstate.load()
     if not meta or not meta.get("current"):
         return ("📱 <b>iOS 描述文件</b>\n\n"
@@ -3178,6 +3195,7 @@ def _ios_status_text():
 def _ios_kb():
     meta = None
     try:
+        _ios_mods()
         meta = iosstate.load()
     except Exception:  # noqa: BLE001
         pass
@@ -3870,6 +3888,10 @@ def handle_cb(chat, mid, data):
                                   [{"text": "🏠 主菜单", "callback_data": "menu"}]]}); return
     if data in ("iosgen", "iosgen:legacy", "iosgen:fresh"):
         state.pop(chat, None)
+        try:
+            _ios_mods()
+        except RuntimeError as e:
+            edit(chat, mid, str(e), MENU); return
         # 第一次启用受管生命周期时必须问一句: 这台网关以前有没有发过旧版(随机身份)描述文件。
         # 服务器没有任何办法知道这件事, 而用户知道 —— 与其猜, 不如问。猜错的代价是用户手机上
         # 悄悄多出一个永远不会被更新的描述文件。
@@ -3892,6 +3914,7 @@ def handle_cb(chat, mid, data):
         return
     if data == "iosdiff":
         try:
+            _ios_mods()
             meta = iosstate.load() or {}
             prev, cur = meta.get("previous"), meta.get("current")
             if not (prev and cur):
@@ -3911,6 +3934,7 @@ def handle_cb(chat, mid, data):
         return
     if data == "iosprev":
         try:
+            _ios_mods()
             meta = iosstate.load() or {}
             blob = iosstate.read_artifact("previous")
             if not (meta.get("previous") and blob):
@@ -3924,6 +3948,7 @@ def handle_cb(chat, mid, data):
         return
     if data == "iosack":
         try:
+            _ios_mods()
             iosstate.ack_migration()
             edit(chat, mid, "✅ 已关闭迁移提示。\n\n"
                  "记录的是「你告诉我们旧描述文件已删除」, 服务器本身无从核实这件事。\n\n"
@@ -4276,6 +4301,7 @@ def handle_text(chat, text, mid=None):
         try:
             # 老机器第一次走到这里也要问一句"以前装过吗" —— 但文本流里没有按钮可点, 所以
             # 先把 SSID 收下、生成受管版本, 迁移提示由 _ios_send 的说明和状态页承担。
+            _ios_mods()
             legacy = not (iosstate.load() or {}).get("current")
             send_plain(chat, _ios_send(chat, ssids, legacy))
         except Exception as e:  # noqa: BLE001
