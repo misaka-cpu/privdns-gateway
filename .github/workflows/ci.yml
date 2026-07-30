@@ -289,6 +289,11 @@ jobs:
       - name: "明确代理优先级 (v1.7.0 模板幂等补齐/顺序自检/fail-closed + 事务回滚 + doctor 点名)"
         run: python3 tests/test-mosdns-explicit-proxy.py
 
+      # 全新 Debian 13 装不上那个报障: iptables-nft 建出来的空 ip filter/ip nat 被
+      # flush 门当成"会丢的表"拦掉。判据要能分辨空表与真有规则的表, 两个方向都得守住。
+      - name: "nft flush 门 (空表放行 / Docker 有规则仍拒 / 读不出 fail-closed)"
+        run: python3 tests/test-nft-flush-inert.py
+
       - name: "救援来源过滤 (握手前按内核 peer 地址判; 不信 X-Forwarded-For)"
         run: python3 tests/test-rescue-source.py
 
