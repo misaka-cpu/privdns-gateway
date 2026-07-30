@@ -39,6 +39,49 @@ def _strip_noise(line):
     return _QUOTED.sub('""', line).split("#", 1)[0]
 
 
+
+# 本项目 input 链已经放行的东西(见 deploy/firewall/nftables-mihomo.conf):
+#     iif "lo" accept / ct state established,related accept / ip protocol icmp accept
+#     ip6 nexthdr icmpv6 accept
+# 外来 input 链里如果**只有这些**, 装上去不会架空任何东西 —— 我们的链原样放行同样的流量。
+# 发行版自带的 nftables.conf 骨架基本就是这几条, 拦它等于绝大多数机器都装不上。
+#
+# 判据只认**精确形态**, 不做语义推理: 判错的代价是不对称的 ——
+#   误判为"安全"→ 用户的放行被静默架空, 端口看着开着实际不通(这道门存在的全部理由);
+#   误判为"冲突"→ 装不上, 烦人但安全。
+# 所以宁可漏放几种写法, 也不要靠猜。带端口的放行(tcp dport …)一律不在此列: 扫描发生在
+# install.sh 问 SSH 端口**之前**, 这里无从判断那个端口是不是我们也会放行的那个。
+_COVERED = tuple(re.compile(r"^" + pat + r"$") for pat in (
+    r'iif(name)?\s+"?lo"?\s+(counter\s+)?accept',
+    r"ct\s+state\s+established\s*,\s*related\s+(counter\s+)?accept",
+    r"ct\s+state\s+\{\s*established\s*,\s*related\s*\}\s+(counter\s+)?accept",
+    r"ct\s+state\s+vmap\s+\{\s*established\s*:\s*accept\s*,\s*related\s*:\s*accept"
+    r"(\s*,\s*invalid\s*:\s*drop)?\s*\}",
+    r"ip\s+protocol\s+icmp\s+(counter\s+)?accept",
+    r"ip6\s+nexthdr\s+(icmpv6|ipv6-icmp)\s+(counter\s+)?accept",
+    r"meta\s+l4proto\s+(icmpv6|ipv6-icmp)\s+(counter\s+)?accept",
+))
+
+
+def _pdg_covers(raw):
+    """这条外来规则是不是本项目 input 链已经放行的同一类流量。"""
+    ln = raw.split("#", 1)[0].strip().rstrip(";").strip()
+    ln = re.sub(r"\s+", " ", ln)
+    return any(p.match(ln) for p in _COVERED)
+
+
+def _describe(src, table, n_rules, policy_drop, samples):
+    """冲突描述。**把具体规则贴出来** —— 只说"1 条规则"的话, 用户既不知道是哪条、也就无从
+    判断该并进 pdg 还是改挂别的 hook; 远程协助时同样只能靠猜。"""
+    why = "policy drop" if policy_drop else "%d 条规则" % n_rules
+    item = "%s: 表 `%s` 有挂 hook input 的 base chain(%s)" % (src, table, why)
+    if samples:
+        item += "\n      " + "\n      ".join(samples)
+        if n_rules > len(samples):
+            item += "\n      …(共 %d 条, 只列前 %d 条)" % (n_rules, len(samples))
+    return item
+
+
 def scan_text(conf_txt, live_txt):
     """扫描配置文本与运行 ruleset 文本, 返回冲突描述列表(每源一条, 已去重)。
 
@@ -53,6 +96,7 @@ def scan_text(conf_txt, live_txt):
         cur, depth, opened = None, 0, False
         chain_depth = None          # 正处在某条 foreign input chain 里
         chain_rules = 0
+        chain_samples = []          # 具体是哪几条 —— 只报个数字, 用户没法判断该怎么办
         chain_policy_drop = False
         for raw in txt.split("\n"):
             ln = _strip_noise(raw)
@@ -67,23 +111,25 @@ def scan_text(conf_txt, live_txt):
             if _HOOK_IN.search(ln) and cur != OURS:
                 chain_depth = depth                     # 从下一行起是链体
                 chain_rules = 0
+                chain_samples = []
                 chain_policy_drop = bool(_POLICY_DROP.search(ln))
             elif chain_depth is not None:
                 if depth < chain_depth:                 # 链结束: 结账
                     if chain_rules or chain_policy_drop:
-                        why = "policy drop" if chain_policy_drop else "%d 条规则" % chain_rules
-                        item = ("%s: 表 `%s` 有挂 hook input 的 base chain(%s)"
-                                % (src, cur, why))
+                        item = _describe(src, cur, chain_rules, chain_policy_drop, chain_samples)
                         if item not in seen:
                             seen.add(item); found.append(item)
                     chain_depth = None
                 elif ln.strip().strip("{}").strip():     # 非空、非纯括号 = 一条规则
+                    if _pdg_covers(raw):
+                        continue                        # 我们的链原样放行同样的流量 → 不算架空
                     chain_rules += 1
+                    if len(chain_samples) < 3:
+                        chain_samples.append(raw.strip()[:90])
             if opened and depth <= 0:
                 cur, opened = None, False
         if chain_depth is not None and (chain_rules or chain_policy_drop):   # 文本到头还没闭合
-            why = "policy drop" if chain_policy_drop else "%d 条规则" % chain_rules
-            item = "%s: 表 `%s` 有挂 hook input 的 base chain(%s)" % (src, cur, why)
+            item = _describe(src, cur, chain_rules, chain_policy_drop, chain_samples)
             if item not in seen:
                 seen.add(item); found.append(item)
     return found

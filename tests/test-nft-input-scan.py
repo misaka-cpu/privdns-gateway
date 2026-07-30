@@ -346,6 +346,46 @@ table inet filter {
         NFT_OK = "#!/bin/sh\nexit 0\n"                       # 读得到, 内存里没规则
         NFT_DENY = "#!/bin/sh\necho denied >&2\nexit 1\n"    # 读不到
 
+        # ── 发行版自带的 input 链: 只有本项目也放行的那几条 → 不该拦住装机 ──
+        # 用户报障(2026-07-30, 全新 Debian 13): 内核里 inet filter 的 input 链有 1 条规则,
+        # 装机因此中止。而本项目自己的 input 链里就有 iif lo / established,related / icmp ——
+        # 外来链只有这些的话, 装上去不会架空任何东西, 拦它等于绝大多数机器都装不上。
+        STOCK_LIVE = ("#!/bin/sh\n/bin/cat <<'R'\n"
+                      "table inet filter {\n"
+                      "\tchain input {\n"
+                      "\t\ttype filter hook input priority filter; policy accept;\n"
+                      "\t\tiif \"lo\" accept\n"
+                      "\t\tct state established,related accept\n"
+                      "\t\tip protocol icmp accept\n"
+                      "\t\tip6 nexthdr ipv6-icmp accept\n"
+                      "\t}\n}\nR\nexit 0\n")
+        # 先自证桩真的吐得出内容 —— 否则"无冲突"可能只是因为扫描器什么都没读到(假绿)
+        with open(nft, "w") as fh:
+            fh.write(STOCK_LIVE)
+        os.chmod(nft, 0o755)
+        probe = subprocess.run([nft, "list", "ruleset"], capture_output=True, text=True)
+        assert "hook input" in probe.stdout, ("nft 桩没吐出 ruleset, 后面的判据全不可信", probe)
+        ok("前置: nft 桩确实吐得出运行 ruleset(不靠空输出蒙混)")
+
+        r = run("#!/usr/sbin/nft -f\n", STOCK_LIVE)
+        assert r.returncode == 1, ("发行版骨架被误判成冲突", r.returncode, r.stdout)
+        ok("发行版自带的 input 链(只有本项目也放行的那几条)→ 不算冲突")
+
+        # 多一条我们不放行的端口 → 必须仍判冲突, **并把那条规则贴出来**
+        CUSTOM_LIVE = STOCK_LIVE.replace("\t\tip protocol icmp accept\n",
+                                         "\t\tip protocol icmp accept\n\t\ttcp dport 9443 accept\n")
+        r = run("#!/usr/sbin/nft -f\n", CUSTOM_LIVE)
+        assert r.returncode == 0, ("自定义端口放行竟被放过", r.returncode, r.stdout)
+        ok("外来链多一条自定义端口放行 → 仍判冲突")
+        assert "tcp dport 9443 accept" in r.stdout, ("没贴出具体规则", r.stdout)
+        ok("报错里贴出了具体是哪条规则(只报个数字用户没法判断怎么办)")
+
+        # 外来链自己是 policy drop → 与规则无关, 一律冲突
+        DROP_LIVE = STOCK_LIVE.replace("policy accept;", "policy drop;")
+        r = run("#!/usr/sbin/nft -f\n", DROP_LIVE)
+        assert r.returncode == 0 and "policy drop" in r.stdout, (r.returncode, r.stdout)
+        ok("外来链 policy drop → 仍判冲突(它会把我们要放行的端口丢掉)")
+
         r = run(CONF_FOREIGN, NFT_OK)
         assert r.returncode == 0 and "inet filter" in r.stdout, (r.returncode, r.stdout)
         ok("CLI: 有冲突 → 退出 0 并打印冲突表")
