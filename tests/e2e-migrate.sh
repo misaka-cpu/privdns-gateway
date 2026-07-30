@@ -139,6 +139,9 @@ seed_v170_box(){
   printf '# pdg-bot 显式出口域名劫持表\ndomain:perfops2.byte-test.example\n' > /etc/mosdns/rules/custom_hijack.txt
   printf 'domain:direct.example\n' > /etc/mosdns/rules/custom_direct.txt
   rm -f /etc/mosdns/rules/ruleset_hijack.txt
+  # 另一台机器上管理员自己往 ruleset_hijack.txt 里写了 174 条 —— 迁移只该在它**不存在**时
+  # 建空文件。第一版写成了无条件 `: > file`, 于是 .200 更新时那 174 条被清成 0 字节
+  # (而且是在事务失败回滚**之前**清的, 回滚也救不回来)。ADMIN_RS 用例覆盖这条。
   printf 'android\n' > /etc/privdns-gateway/platform
   printf 'mihomo\n'  > /etc/privdns-gateway/backend
   rm -f /etc/privdns-gateway/platform.guessed
@@ -165,6 +168,16 @@ EP="$(epline)"; CN="$(cnline)"; FH="$(fhline)"
 [[ -f /etc/mosdns/rules/ruleset_hijack.txt ]] \
   && ok "补出 ruleset_hijack.txt(域名集要求文件存在, 缺了 mosdns 起不来)" \
   || bad "没补 ruleset_hijack.txt"
+# 管理员已经写过内容的机器: 迁移一个字节都不许动
+seed_v170_box
+printf 'domain:admin-kept.example\ndomain:admin-kept2.example\n' > /etc/mosdns/rules/ruleset_hijack.txt
+RSH_BEFORE="$(sha256sum /etc/mosdns/rules/ruleset_hijack.txt | cut -d" " -f1)"
+bash /usr/local/bin/pdg __migrate >/tmp/mig4b.log 2>&1
+[[ "$(sha256sum /etc/mosdns/rules/ruleset_hijack.txt | cut -d" " -f1)" == "$RSH_BEFORE" ]] \
+  && ok "已有内容的 ruleset_hijack.txt 逐字节保留(不许无条件清空)" \
+  || bad "管理员写的 ruleset_hijack.txt 被迁移清掉了($(wc -l < /etc/mosdns/rules/ruleset_hijack.txt) 行)"
+grep -q 'qname \$explicit_proxy' /etc/mosdns/config.yaml \
+  && ok "保留内容的同时迁移照常完成" || bad "这次迁移没完成"
 sed -n '/- tag: explicit_proxy$/,/^  - tag: /p' /etc/mosdns/config.yaml > /tmp/ep_set.txt
 { grep -q 'custom_hijack.txt' /tmp/ep_set.txt && grep -q 'ruleset_hijack.txt' /tmp/ep_set.txt; } \
   && ok "明确代理集含 custom_hijack.txt + ruleset_hijack.txt" || bad "明确代理集文件不全"
