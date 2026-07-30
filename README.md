@@ -84,6 +84,12 @@ sudo ./install.sh
 - Android：系统「设置 → 网络 → 私密 DNS」选「指定的 DNS 服务提供商主机名」，填 DoT 域名（例如 `dot.example.com`）。
 - iOS：在 Bot「📱 客户端 → iOS 描述文件」生成并安装描述文件；不使用 Bot 时，`sudo pdg ios`（仅 iOS 平台可用）会在终端打出二维码，手机走内网卡扫码后在 Safari 里安装。Wi-Fi 与蜂窝是否启用私密 DNS 由 `:81` 探测自动判定（能连到网关才启用），生成时还可指定强制直连的 Wi-Fi 名单（SSID）。
 
+  描述文件是**受管**的：网关有一个永久身份，后续每次更新都是同一份描述文件的新版本，iPhone 上不会越堆越多。界面会告诉你当前是第几版、上次什么时候发送的、以及相对当前网关配置是「无需更新 / 建议更新 / 必须更新」，也能看当前版与上一版的字段级差异。
+
+  首次启用时会问一句「以前在这台网关上装过描述文件吗」——**旧版本每次生成都是随机身份**，iOS 会把新的当成另一个描述文件并存，所以答"装过"的话请先在 iPhone 上删掉旧的那份再安装。
+
+  服务器不是 MDM，**无法确认手机上此刻装的是哪一版**，界面上所有信息都只反映网关这边的生成/发送记录。细节见 [docs/ios-profile-lifecycle.md](docs/ios-profile-lifecycle.md)。
+
 ## 8. Telegram Bot 使用
 
 给 Bot 发 `/start` 进入菜单，常用功能：
@@ -111,7 +117,10 @@ sudo pdg token      # 设置 / 更换 Bot token
 sudo pdg restart    # 重启服务
 sudo pdg log [n]    # 查看日志
 sudo pdg traffic    # 网卡流量（vnstat）
-sudo pdg ios        # 仅 iOS：在终端打出 iOS 描述文件二维码
+sudo pdg ios        # 仅 iOS：生成/更新描述文件并在终端打出二维码
+sudo pdg ios status # 仅 iOS：当前第几版 / 上次发送 / 是否需要重新安装
+sudo pdg ios diff   # 仅 iOS：当前版与上一版的字段级差异
+sudo pdg ios previous  # 仅 iOS：取出上一版（不改当前版本）
 sudo pdg report     # 脱敏诊断报告；--redact-ip 连 IP/域名一起隐藏；--full 不脱敏
 sudo pdg detect-cidr           # 重新识别内网卡来源段，与现配不符可写回并重启
 sudo pdg hijack-mode <all|gfw>          # 切换劫持模式
