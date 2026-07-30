@@ -442,6 +442,7 @@ jobs:
         script:
           - e2e-migrate.sh
           - e2e-exit-rule.sh
+          - e2e-bot-splitting.sh
           - e2e-drop-singbox.sh
           - e2e-custom-nft.sh
           - e2e-cross-version-rollback.sh

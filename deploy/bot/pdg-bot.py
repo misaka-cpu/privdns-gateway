@@ -3139,6 +3139,53 @@ def restore_from(data):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+
+def _reapply_explicit_proxy(mos_bytes, cur_bytes):
+    """恢复 v1.7.0 及更早的备份时, 把「明确代理优先于 geosite_cn」这层重新补回候选里。
+
+    备份里的 mosdns 配置是**原样**写回去的。一份 v1.7.0 时代的备份没有 explicit_proxy,
+    恢复之后用户点名指到出口的域名就又会被上游 geosite 抢先判成直连 —— 而恢复本身报的是
+    "✅ 已恢复", 没有任何一处报错, 只有事后跑 doctor 才看得出来。这正是 v1.7.1 要消灭的
+    那类静默退化, 不能在恢复这条路上又漏回去。
+
+    补的动作复用 lib/mosdns.sh 里那一份编辑器(单一真源, 不在 Python 里另写一遍)。备份是
+    自定义形态、编辑器认不出时**不猜着改**: 保留备份原样, 但把这件事写进恢复结果里告诉用户。
+    返回 (候选内容, 给用户的提示或 None)。
+    """
+    if b"qname $explicit_proxy" in mos_bytes:
+        return mos_bytes, None
+    if cur_bytes and b"qname $explicit_proxy" not in cur_bytes:
+        return mos_bytes, None          # 现网本来就没有 → 这次恢复没造成退化, 交给迁移/doctor
+    sip = ""
+    m = re.search(rb"black_hole ([0-9.]+)", mos_bytes)
+    if m:
+        sip = m.group(1).decode()
+    d = tempfile.mkdtemp(prefix="pdgep")
+    try:
+        cand = os.path.join(d, "config.yaml")
+        with open(cand, "wb") as f:
+            f.write(mos_bytes)
+        r = subprocess.run(
+            ["bash", "-c",
+             'set -uo pipefail; source "$1"/lib/mosdns.sh; _mosdns_explicit_proxy "$2" "$3"',
+             "_", PDG_REPO, cand, sip],
+            capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            return mos_bytes, ("⚠️ 备份里的 mosdns 配置是自定义形态, 没能补上「明确代理优先于国内判定」"
+                               "这一层(未擅自改动)。你点名指到出口的域名可能会被判直连 —— "
+                               "跑 <code>sudo pdg doctor</code> 看「明确代理优先级」那一项。")
+        with open(cand, "rb") as f:
+            out = f.read()
+        if out == mos_bytes:
+            return mos_bytes, None
+        return out, "ℹ️ 备份来自旧版本, 已顺带补回「明确代理优先于国内判定」的分流层。"
+    except Exception:  # noqa: BLE001
+        return mos_bytes, ("⚠️ 没能复核备份里的分流优先级(未擅自改动)。"
+                           "跑 <code>sudo pdg doctor</code> 看「明确代理优先级」那一项。")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def _restore_commit(tmp):
     """把解包出来的内容组装成候选并提交一笔事务。返回 (ok, msg)。"""
     newsb = os.path.join(tmp, "etc/sing-box/config.json")
@@ -3187,6 +3234,9 @@ def _restore_commit(tmp):
         restored = ["config.json"]
         mos_new = _subbed(newmos) if os.path.exists(newmos) else None
         if mos_new is not None:
+            mos_new, ep_note = _reapply_explicit_proxy(mos_new, cur_mos)
+            if ep_note:
+                notes.append(ep_note)
             t.stage("mosdns_conf", mos_new, expect=mos_sha)
             restored.append("mosdns/config.yaml")
         # 可选文件: **备份里有才恢复**, 缺了就保持现网(绝不擅自清空)
