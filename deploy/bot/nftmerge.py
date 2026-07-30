@@ -61,6 +61,26 @@ while i < n:
         continue
     keep.append(ln); i += 1
 
+# 这张表是谁在管 —— 决定给什么建议。把 Docker 的动态规则"写进 /etc/nftables.conf"是**错的**:
+# 它随容器起停不断变, 冻进静态文件下次就对不上。这类只能去掉那行 flush ruleset。
+_OWNERS = (
+    ("Docker",   ("DOCKER", "DOCKER-USER", "DOCKER-ISOLATION-STAGE-1",
+                  "DOCKER-ISOLATION-STAGE-2", "DOCKER-INGRESS")),
+    ("fail2ban", ("f2b-sshd", "f2b-SSH")),
+    ("libvirt",  ("LIBVIRT_INP", "LIBVIRT_OUT", "LIBVIRT_FWO", "LIBVIRT_FWI", "LIBVIRT_PRT")),
+    ("Kubernetes/CNI", ("KUBE-SERVICES", "KUBE-NODEPORTS", "KUBE-FIREWALL", "cali-INPUT")),
+)
+
+
+def _owner_of(chains):
+    up = {c.upper() for c in chains}
+    for name, marks in _OWNERS:
+        if any(m.upper() in up for m in marks) or any(
+                c.startswith(marks[0].upper().split("-")[0]) for c in up if marks[0][0].isupper()):
+            return name
+    return None
+
+
 # 一张"只存在于运行中"的表被 flush 掉, 到底会不会真丢东西。
 #
 # 判据与 nftscan.py 的"空骨架不算冲突"同源: 没有任何规则、也没有 policy drop 的表是**惰性**的。
@@ -70,7 +90,9 @@ while i < n:
 # 下次用到时自己重建。而 Docker / fail2ban 那种真往里塞了规则的, 冲掉就是真丢, 必须拦。
 #
 # 读不出来 → 当成有内容(fail-closed): 判不了就别赌。
-def _table_is_inert(family, name):
+def _table_probe(family, name):
+    """返回 (是否惰性, 链名集合)。链名用来判断这张表是谁在管(见 _owner_of)。"""
+    chains = set()
     txt = None
     for args in (["nft", "-j", "list", "table", family, name],
                  ["nft", "list", "table", family, name]):
@@ -87,36 +109,44 @@ def _table_is_inert(family, name):
                     objs = json.loads(txt).get("nftables") or []
                 except Exception:  # noqa: BLE001
                     continue                       # JSON 版不可用 → 退到文本版再判
+                inert = True
                 for o in objs:
                     if not isinstance(o, dict):
                         continue
-                    if "rule" in o:
-                        return False               # 有规则 → 冲掉就是真丢
                     ch = o.get("chain")
-                    if isinstance(ch, dict) and str(ch.get("policy", "accept")) != "accept":
-                        return False               # policy drop/其它 → 不是惰性的
+                    if isinstance(ch, dict):
+                        if ch.get("name"):
+                            chains.add(str(ch["name"]))
+                        if str(ch.get("policy", "accept")) != "accept":
+                            inert = False          # policy drop/其它 → 不是惰性的
+                    if "rule" in o:
+                        inert = False              # 有规则 → 冲掉就是真丢
+                        r = o.get("rule")
+                        if isinstance(r, dict) and r.get("chain"):
+                            chains.add(str(r["chain"]))
                     if "set" in o or "map" in o or "element" in o:
-                        return False
-                return True
+                        inert = False
+                return inert, chains
             break
     if txt is None:
-        return False
+        return False, chains
     # 文本兜底: 去注释后, 表体里除了 table/chain 声明、type…hook…policy accept 与括号,
     # 再有别的内容就当作"有规则"。policy 非 accept 同样算。
+    inert = True
     for raw in txt.split("\n"):
         ln = raw.split("#", 1)[0].strip()
         if not ln or ln in ("{", "}"):
             continue
         if re.match(r"^table\s+\S+\s+\S+\s*\{?$", ln):
             continue
-        if re.match(r"^chain\s+\S+\s*\{?$", ln):
+        mc = re.match(r"^chain\s+(\S+)\s*\{?$", ln)
+        if mc:
+            chains.add(mc.group(1))
             continue
         if re.match(r"^type\s+\w+\s+hook\s+\w+\s+priority\s+[^;]+;\s*(policy\s+accept\s*;)?\s*\}?$", ln):
             continue
-        if re.match(r"^type\s+\w+\s+hook\s+\w+\s+priority\s+[^;]+;\s*policy\s+\w+\s*;", ln):
-            return False                           # policy 不是 accept
-        return False
-    return True
+        inert = False                              # 规则 / policy 非 accept
+    return inert, chains
 
 
 # 文件顶上的 `flush ruleset` 会在应用时清掉**全部**运行中的表。但文件里写着的那些表随后
@@ -153,8 +183,14 @@ if flush_ln:
     lost = [t for t in live if t not in in_file]
     # 惰性的(没规则、没 policy drop)不算损失: 见 _table_is_inert。全新 Debian 13 上
     # iptables-nft 建出来的空 ip filter / ip nat 正属此类, 早先一律拒等于新机器装不上。
-    inert = [t for t in lost if _table_is_inert(*t.split(None, 1))]
+    probed = {t: _table_probe(*t.split(None, 1)) for t in lost}
+    inert = [t for t in lost if probed[t][0]]
     lost = [t for t in lost if t not in inert]
+    owners = {}
+    for t in lost:
+        o = _owner_of(probed[t][1])
+        if o:
+            owners.setdefault(o, []).append(t)
     if inert:
         print("提示: 这些只存在于运行中的表是空的(没有规则, 策略 accept), 应用时会被 "
               "`flush ruleset` 一并清掉, 但**什么都不会丢** —— iptables-nft 之类下次用到会自己重建:",
@@ -166,9 +202,23 @@ if flush_ln:
               "而且里面**有规则**(或策略不是 accept), 应用后会被一起冲掉:"
               % (target_f, flush_ln), file=sys.stderr)
         for t in lost[:5]:
-            print("    table %s   (看内容: nft list table %s)" % (t, t), file=sys.stderr)
-        print("  常见来源: Docker / fail2ban / k8s 这类自己往内核塞规则的程序。", file=sys.stderr)
-        print("  请先把它们写进 /etc/nftables.conf(或去掉那行 flush ruleset)再重试。", file=sys.stderr)
+            o = _owner_of(probed[t][1])
+            print("    table %s%s   (看内容: nft list table %s)"
+                  % (t, ("   ← 看链名像是 %s 在管" % o) if o else "", t), file=sys.stderr)
+        if owners:
+            print("  %s 的规则是**动态**的(随容器/服务起停不断变), 把它们抄进 "
+                  "/etc/nftables.conf 是错的 —— 下次就对不上了。" % "、".join(sorted(owners)),
+                  file=sys.stderr)
+            print("  这种情况请**去掉 `flush ruleset` 那一行**:", file=sys.stderr)
+            print("      sudo sed -i '/^flush ruleset$/d' %s" % target_f, file=sys.stderr)
+            print("  那行本来就会在每次 `systemctl reload nftables` 时把这些表冲掉 —— "
+                  "去掉它对你有好处, 与本项目无关。", file=sys.stderr)
+        else:
+            print("  常见来源: Docker / fail2ban / k8s 这类自己往内核塞规则的程序。", file=sys.stderr)
+            print("  请先把它们写进 %s, 或者去掉 `flush ruleset` 那一行:" % target_f, file=sys.stderr)
+            print("      sudo sed -i '/^flush ruleset$/d' %s" % target_f, file=sys.stderr)
+        print("  改完重跑即可; 本项目自己的规则在独立的 table inet pdg 里, 不依赖那行 flush。",
+              file=sys.stderr)
         sys.exit(3)
 
 if first_hit is None:                         # 现网没有 pdg 区 → 追加到末尾

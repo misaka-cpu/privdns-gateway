@@ -74,7 +74,12 @@ EMPTY_FILTER = """{"nftables":[{"table":{"family":"ip","name":"filter"}},
 # Docker 那种: 真往里塞了规则
 DOCKER_NAT = """{"nftables":[{"table":{"family":"ip","name":"nat"}},
 {"chain":{"family":"ip","table":"nat","name":"DOCKER","policy":"accept"}},
+{"chain":{"family":"ip","table":"nat","name":"POSTROUTING","type":"nat","hook":"postrouting","policy":"accept"}},
 {"rule":{"family":"ip","table":"nat","chain":"POSTROUTING","expr":[{"masquerade":null}]}}]}"""
+# 谁都认不出来的第三方表: 建议要退回通用版(可以写进文件, 也可以去掉 flush)
+UNKNOWN_RULED = """{"nftables":[{"table":{"family":"ip","name":"nat"}},
+{"chain":{"family":"ip","table":"nat","name":"MYCHAIN","policy":"accept"}},
+{"rule":{"family":"ip","table":"nat","chain":"MYCHAIN","expr":[{"accept":null}]}}]}"""
 DROP_TABLE = """{"nftables":[{"table":{"family":"ip","name":"nat"}},
 {"chain":{"family":"ip","table":"nat","name":"INPUT","type":"filter","hook":"input","policy":"drop"}}]}"""
 # 文本兜底(没有 -j 的老 nft)
@@ -167,6 +172,27 @@ def main():
             ok("给出了查看内容的命令")
         else:
             bad("没给排查命令")
+        # 认出是 Docker 时, 建议必须是"去掉 flush ruleset" —— 把 Docker 的动态规则抄进
+        # 静态文件是错的, 容器一起停就对不上了。老文案两条并列给, 用户很容易选错那条。
+        if "Docker" in msg and "动态" in msg and "flush ruleset" in msg:
+            ok("认出 Docker → 建议去掉 flush ruleset, 并说明为什么不能抄进文件")
+        else:
+            bad("没给 Docker 专属建议: %r" % msg[-300:])
+        if "sed -i '/^flush ruleset$/d'" in msg:
+            ok("给了可直接粘贴的命令")
+        else:
+            bad("没给可执行命令")
+        if "抄进" in msg and "是错的" in msg:
+            ok("明确指出「写进 /etc/nftables.conf」对 Docker 是错的做法")
+        else:
+            bad("没否定错误做法")
+
+        # ── 2b. 认不出归属的第三方表 → 退回通用建议(两条路都给)──
+        rc, msg, _ = run_merge(d, ["inet filter", "ip nat"], {"ip nat": UNKNOWN_RULED})
+        if rc == 3 and "Docker 的规则是" not in msg and "常见来源" in msg:
+            ok("认不出归属的表 → 给通用建议, 不瞎认成 Docker")
+        else:
+            bad("对未知表给错了建议(rc=%d)" % rc)
 
         # ── 3. 策略不是 accept → 必须继续拒 ──
         rc, _, _ = run_merge(d, ["inet filter", "ip nat"], {"ip nat": DROP_TABLE})
