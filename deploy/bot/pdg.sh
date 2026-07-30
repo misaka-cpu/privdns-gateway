@@ -1343,12 +1343,18 @@ cmd_ios(){
   CIDR=$(grep -oE 'ip saddr [0-9./]+' /etc/nftables.conf 2>/dev/null | head -1 | awk '{print $3}')
   [[ -n "$HOST" && -n "$IP" && -n "$CIDR" ]] || { echo "信息不全 (HOST=$HOST IP=$IP CIDR=$CIDR)"; return 1; }
 
-  local PORT=8443 TOK U1 U2 WWW URL
+  # 生成走 iosprofile.py —— 和 Bot 的「📱 iOS 描述文件」是同一份实现。以前这里是四个占位符
+  # 的 sed 替换, 结果是: WLOC 开着也不附根证书、不支持强制直连 SSID, 于是"用命令行生成的
+  # 描述文件"和"用 bot 生成的"内容不一样, 而两处都没提示过这件事。
+  local GEN; GEN="$(_pdg_module iosprofile.py)" || { echo "❌ 找不到 iosprofile.py, 先跑 pdg update"; return 1; }
+  local PORT=8443 TOK WWW URL
   TOK=$(openssl rand -hex 6)
-  U1=$(cat /proc/sys/kernel/random/uuid | tr a-z A-Z); U2=$(cat /proc/sys/kernel/random/uuid | tr a-z A-Z)
   WWW=$(mktemp -d)
-  sed -e "s/__DOT_HOST__/$HOST/g" -e "s/__JP_IP__/$IP/g" -e "s/__UUID1__/$U1/g" -e "s/__UUID2__/$U2/g" \
-      "$TMPL" > "$WWW/$TOK.mobileconfig"
+  if ! python3 "$GEN" render --dot-host "$HOST" --server-ip "$IP" --template "$TMPL" \
+        --wloc-config /etc/privdns-gateway/mitm.json --ca-crt /etc/privdns-gateway/ca/ca.crt \
+        > "$WWW/$TOK.mobileconfig"; then
+    rm -rf "$WWW"; echo "❌ 生成描述文件失败, 未开放任何临时端口。"; return 1
+  fi
   URL="http://$IP:$PORT/$TOK.mobileconfig"
 
   local SRV=""
@@ -1703,6 +1709,7 @@ PY
     fi
   done
   for f in /opt/pdg-bot/probe81.py /opt/pdg-bot/mitm_ca.py /opt/pdg-bot/mitm_server.py /opt/pdg-bot/mitm_wloc.py \
+           /opt/pdg-bot/iosprofile.py \
            /opt/pdg-bot/pdg-dot.mobileconfig.tmpl /opt/pdg-bot/pdg-mitm.mobileconfig.tmpl; do
     [[ -f "$f" ]] && { rm -f "$f"; removed=1; }
   done
@@ -2586,6 +2593,7 @@ _plat_write_profile(){
 _PLAT_IOS_REQUIRED=(
   "deploy/ios/probe81.py|/opt/pdg-bot/probe81.py|755"
   "deploy/ios/pdg-dot-ondemand.mobileconfig.tmpl|/opt/pdg-bot/pdg-dot.mobileconfig.tmpl|644"
+  "deploy/bot/iosprofile.py|/opt/pdg-bot/iosprofile.py|755"
   "deploy/bot/mitm_ca.py|/opt/pdg-bot/mitm_ca.py|755"
   "deploy/bot/mitm_server.py|/opt/pdg-bot/mitm_server.py|755"
   "deploy/bot/mitm_wloc.py|/opt/pdg-bot/mitm_wloc.py|755"
@@ -2636,6 +2644,7 @@ _plat_verify(){
     [[ "$(systemctl is-active pdg-mitm 2>/dev/null)" == active ]] || miss+=("pdg-mitm(未运行)")
   else
     for f in /opt/pdg-bot/probe81.py /opt/pdg-bot/pdg-dot.mobileconfig.tmpl \
+             /opt/pdg-bot/iosprofile.py \
              /opt/pdg-bot/mitm_ca.py /opt/pdg-bot/mitm_server.py /opt/pdg-bot/mitm_wloc.py \
              /etc/systemd/system/pdg-probe81.service /etc/systemd/system/pdg-mitm.service; do
       [[ -e "$f" ]] && extra+=("$f")
@@ -3244,6 +3253,7 @@ cmd_platform(){
   local _PLAT_FILES=(
     /opt/pdg-bot/probe81.py
     /opt/pdg-bot/pdg-dot.mobileconfig.tmpl
+    /opt/pdg-bot/iosprofile.py
     /opt/pdg-bot/mitm_ca.py
     /opt/pdg-bot/mitm_server.py
     /opt/pdg-bot/mitm_wloc.py

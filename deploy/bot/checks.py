@@ -927,7 +927,10 @@ def check_mitm():
     # WLOC 开着就说明这几个组件是必需件: 更新时若某个装失败(旧实现 ||true 会静默跳过),
     # 目标位置留着上一版文件 —— 光看"服务 active"发现不了新旧混装, 这里按文件在不在直接判死。
     need = ["/opt/pdg-bot/mitm_ca.py", "/opt/pdg-bot/mitm_server.py", "/opt/pdg-bot/mitm_wloc.py",
-            "/opt/pdg-bot/probe81.py", "/opt/pdg-bot/pdg-dot.mobileconfig.tmpl"]
+            "/opt/pdg-bot/probe81.py", "/opt/pdg-bot/pdg-dot.mobileconfig.tmpl",
+            # 缺它 ⇒ 描述文件根本生成不出来(Bot 与 CLI 都走这一份), 而 WLOC 开着时
+            # 用户恰恰**必须**重新生成一份带根证书的描述文件。
+            "/opt/pdg-bot/iosprofile.py"]
     miss = [os.path.basename(p) for p in need if not os.path.isfile(p)]
     if miss:
         return ("fail", "MITM 插件", "已启用但缺 iOS 组件: " + ", ".join(miss)
@@ -938,6 +941,7 @@ def check_mitm():
     for dst, src in (("mitm_ca.py", "deploy/bot/mitm_ca.py"),
                      ("mitm_server.py", "deploy/bot/mitm_server.py"),
                      ("mitm_wloc.py", "deploy/bot/mitm_wloc.py"),
+                     ("iosprofile.py", "deploy/bot/iosprofile.py"),
                      ("probe81.py", "deploy/ios/probe81.py"),
                      ("pdg-dot.mobileconfig.tmpl", "deploy/ios/pdg-dot-ondemand.mobileconfig.tmpl")):
         sp = os.path.join(REPO_DIR, src)

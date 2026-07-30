@@ -196,6 +196,9 @@ jobs:
       - name: "iOS 描述文件现状特征化 (随机身份 / Bot 与 CLI 的分歧)"
         run: python3 tests/test-ios-profile-legacy.py
 
+      - name: "iOS 描述文件统一生成器 (Bot 与 CLI 逐字节一致 + 私钥零外泄)"
+        run: python3 tests/test-ios-profile-shared.py
+
       - name: "自检防火墙端口回归"
         run: python3 tests/test-doctor-firewall.py
 

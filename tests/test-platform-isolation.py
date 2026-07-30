@@ -109,6 +109,18 @@ def main():
     bot._platform = lambda: "ios"
     bot.IOS_TMPL = str(ROOT / "deploy/ios/pdg-dot-ondemand.mobileconfig.tmpl")
     bot._server_ip = lambda: "203.0.113.10"
+    # 上面为了验 Android 门控写过一份 enabled 的 mitm.json。切到 iOS 之后它就**生效**了,
+    # 而这台沙箱里根本没有 CA —— 现在这种情形要拒绝生成, 不能像以前那样悄悄发一份不含
+    # 根证书的描述文件(装到手机上表现为被接管的站点全部证书报错, 而没有任何提示)。
+    refused = ""
+    try:
+        bot._ios_profile()
+    except Exception as e:  # noqa: BLE001
+        refused = str(e)
+    assert "拒绝生成" in refused and "CA" in refused, "WLOC 开着却没有 CA 时应拒绝: %r" % refused
+    ok("iOS: WLOC 已启用但读不到 CA → 拒绝生成(不再静默发出不含根证书的描述文件)")
+
+    json.dump({"wloc": {"enabled": False}}, open(bot.MITM_CONFIG, "w"))
     prof = bot._ios_profile()
     assert prof and b"PayloadContent" in prof, "iOS _ios_profile() 应正常生成"
     _, opskb = bot._nav("ops")

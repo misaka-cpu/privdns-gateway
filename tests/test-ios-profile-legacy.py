@@ -6,8 +6,11 @@
   · Bot 与 CLI 各写一套: SSID 排除与 WLOC CA 只有 Bot 有;
   · 模板占位符只有四个, 其中两个就是那对随机 UUID。
 
-这些断言在 5.4 落地后会**故意反过来**(见 test-ios-profile-lifecycle.py): 那时同样的输入必须
-产出逐字节相同的文件。留着这个文件是为了让"改了什么"有据可查, 而不是靠记忆。
+这些断言在 5.4 推进过程中会**逐条被故意翻转** —— 翻转出现在本文件的 diff 里, 那就是"这次
+改动改掉了哪一条现状"的证据。已经翻转的:
+  · CLI 自己拼占位符 → 改调 iosprofile.py(收敛由 test-ios-profile-shared.py 逐字节验证)。
+仍然成立的(受管生命周期启用后才会变):
+  · 未启用受管生命周期时, Bot 每次生成仍是随机身份。
 """
 import os
 import plistlib
@@ -175,18 +178,17 @@ if outs and not [x for x in plistlib.loads(outs[0])["PayloadContent"]
 else:
     bad("WLOC 关闭却带了 CA")
 
-# ── 4. CLI 侧: 只做四个占位符替换, 没有 SSID / CA ──────────────────────────
+# ── 4. CLI 侧 ──────────────────────────────────────────────────────────────
+# v1.7.8 这里是 `sed` 换四个占位符, 既不支持 SSID 排除也不附 WLOC 根证书。收敛到统一生成器
+# 之后这两条断言翻转了(收敛本身由 test-ios-profile-shared.py 逐字节验证), 留下的是临时下载
+# 通道那部分 —— 那是 CLI 独有的, 不该被这次重构动到。
 pdg_sh = open(os.path.join(ROOT, "deploy/bot/pdg.sh"), encoding="utf-8").read()
 m = re.search(r"^cmd_ios\(\)\{.*?^\}", pdg_sh, re.S | re.M)
 cli = m.group(0) if m else ""
-if "random/uuid" in cli and cli.count("__UUID") >= 2:
-    ok("现状(CLI): cmd_ios 用 /proc/sys/kernel/random/uuid 现取两个随机 UUID")
+if "iosprofile.py" in cli and "__UUID" not in cli:
+    ok("CLI 不再自己拼占位符, 改调 iosprofile.py(与 Bot 同一份实现)")
 else:
-    bad("CLI 的 UUID 来源与预期不符")
-if "SSIDMatch" not in cli and "security.root" not in cli:
-    ok("现状(CLI): 不支持 SSID 排除, 也不附 WLOC CA —— 与 Bot 生成的内容不同")
-else:
-    bad("CLI 竟然有 SSID/CA 逻辑")
+    bad("CLI 仍在自己生成描述文件")
 if "python3 -m http.server" in cli and "nft insert rule" in cli:
     ok("现状(CLI): 临时 HTTP + 临时 nft 放行, 退出时 nft -f 还原")
 else:

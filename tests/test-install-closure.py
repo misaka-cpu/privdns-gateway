@@ -93,11 +93,30 @@ else:
     ok("运行模块真源可解析(%d 项)" % len(entries))
 
 INSTALLED = {e[1][:-3] for e in entries if e[1].endswith(".py")}
-missing = sorted(NEED - INSTALLED)
+
+# iOS 专属清单也算"装了" —— 但只在 iOS 机器上。这两份不能合并: 合了之后 Android 会装上
+# 一批它永远用不到的 iOS 组件, 卸载又要去删一堆本就不存在的文件。
+mi = re.search(r'PDG_IOS_MODULES="([^"]*)"', man_txt, re.S)
+ios_entries = [ln.split() for ln in mi.group(1).splitlines() if ln.strip()] if mi else []
+IOS_INSTALLED = {e[1][:-3] for e in ios_entries if e[1].endswith(".py")}
+if mi:
+    ok("iOS 专属真源可解析(%d 项)" % len(ios_entries))
+else:
+    bad("lib/modules.sh 里找不到 PDG_IOS_MODULES")
+
+missing = sorted(NEED - INSTALLED - IOS_INSTALLED)
 if not missing:
     ok("清单覆盖全部 %d 个入口依赖(逐个算传递闭包比对)" % len(NEED))
 else:
     bad("清单漏装: %s —— 少一个就是整块能力静默降级" % ", ".join(missing))
+
+# 平台无关的模块**不许**依赖 iOS 专属模块: 那种依赖在 Android 机器上是 ImportError,
+# 而且只在真正走到那条路径时才炸 —— 装机、update、doctor 全看不出来。
+leak = sorted(m for m in INSTALLED if m in LOCAL and (closure([m]) & IOS_INSTALLED))
+if not leak:
+    ok("平台无关模块没有一个依赖 iOS 专属模块(Android 上不会 ImportError)")
+else:
+    bad("这些平台无关模块拉进了 iOS 专属模块: %s" % ", ".join(leak))
 
 # 反向: 清单里不该有仓库里根本不存在的东西
 ghost = [e for e in entries if not os.path.exists(os.path.join(ROOT, e[0]))]

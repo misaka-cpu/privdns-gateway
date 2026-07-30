@@ -11,7 +11,7 @@ UI 原地编辑消息(editMessageText), 不刷屏。改 sing-box 前备份, chec
 注: 模块可被 import (供定时任务调用 refresh_rulesets), 此时无需 token。
 """
 from __future__ import annotations
-import base64, contextlib, fcntl, hashlib, http.client, io, json, os, plistlib, re, shutil, socket, subprocess, sys, tarfile, tempfile, threading, time, uuid
+import base64, contextlib, fcntl, hashlib, http.client, io, json, os, re, shutil, socket, subprocess, sys, tarfile, tempfile, threading, time, uuid
 import concurrent.futures
 import urllib.parse, urllib.request, urllib.error
 from collections import Counter
@@ -3083,48 +3083,36 @@ def set_dot_domain(domain):
                   + _renew)
 
 # ── iOS 描述文件 ──
+# 生成实现在 iosprofile 里 —— Bot 与 CLI(`pdg ios`)共用同一份。以前两边各写一套, CLI 那套
+# 既不支持 SSID 排除也不附 WLOC 根证书, 同一台网关走两条路拿到的文件内容不一样。
+import iosprofile                                          # noqa: E402
+
 def _mitm_ca_der():
-    """根 CA 证书的 DER 字节(供 iOS 描述文件的 root 证书 payload)。"""
+    """根 CA 证书的 DER 字节(供 iOS 描述文件的 root 证书 payload)。
+
+    解析与"私钥绝不进描述文件"的拦截都在 iosprofile 里做。以前这里是宽容解析: 解不开就
+    悄悄返回 b"" —— 于是 WLOC 开着、CA 却坏了的时候, 用户拿到的是一份**不含根证书**的
+    描述文件, 装上去表现为"全站证书报错", 而没有任何一处告诉他 CA 坏了。现在直接拒绝生成。
+    """
     pem = _mitm_ca_pem()
     if not pem:
         return b""
-    body = "".join(l for l in pem.splitlines() if "CERTIFICATE" not in l)
-    try:
-        return base64.b64decode(body)
-    except Exception:  # noqa: BLE001
-        return b""
+    return iosprofile.ca_der_from_pem(pem)
 
-def _ios_profile(ssids=()):
+def _ios_profile(ssids=(), ids=None):
     """iOS DoT 描述文件。ssids 非空时在 OnDemandRules 最前插一条「命中这些 SSID 强制直连」;
     WLOC(MITM 插件)启用时附上根 CA payload, 让设备信任本网关 CA(先开 WLOC 再重新生成即含 CA)。
-    用 plistlib 插入, SSID 含 &<> 等也不会破 XML。"""
+    ids 省略时用随机身份(旧行为); 受管生命周期会传入从 instance_id 派生的稳定身份。"""
     if _platform() != "ios":         # 最底层门控: 即便某路径绕过按钮/回调, 也生成不了 iOS 描述文件
         raise RuntimeError("iOS 描述文件仅 iOS 平台可用(本机为 Android)。" + _platform_unconfirmed())
-    if not os.path.exists(IOS_TMPL):
-        raise FileNotFoundError("缺少模板 " + IOS_TMPL)
-    t = open(IOS_TMPL).read()
-    raw = (t.replace("__DOT_HOST__", _dot_host())
-            .replace("__JP_IP__", _server_ip())
-            .replace("__UUID1__", str(uuid.uuid4()).upper())
-            .replace("__UUID2__", str(uuid.uuid4()).upper())).encode()
-    der = _mitm_ca_der() if _mitm_enabled_domains() else b""
-    if not ssids and not der:
-        return raw
-    p = plistlib.loads(raw)
-    if ssids:
-        p["PayloadContent"][0]["OnDemandRules"].insert(
-            0, {"InterfaceTypeMatch": "WiFi", "SSIDMatch": list(ssids), "Action": "Disconnect"})
-    if der:
-        p["PayloadContent"].append({
-            "PayloadType": "com.apple.security.root",
-            "PayloadVersion": 1,
-            "PayloadIdentifier": "com.privdns.mitm.ca",
-            "PayloadUUID": str(uuid.uuid4()).upper(),
-            "PayloadDisplayName": "PrivDNS Gateway MITM CA",
-            "PayloadContent": der,
-            "PayloadCertificateFileName": "pdg-mitm-ca.crt",
-        })
-    return plistlib.dumps(p)
+    der = b""
+    if _mitm_enabled_domains():
+        der = _mitm_ca_der()
+        if not der:
+            raise iosprofile.ProfileError(
+                "WLOC 已启用但读不到根 CA 证书, 拒绝生成描述文件 —— "
+                "不含 CA 的描述文件装上去会让被劫持的站点全部证书报错。")
+    return iosprofile.render(_dot_host(), _server_ip(), ssids, der, ids, IOS_TMPL)
 
 # ── 配置备份 / 恢复 ──
 BACKUP_FILES = [SB, MOSDNS_CONF, MOSDNS_DIRECT, MOSDNS_HIJACK, RS_META]
