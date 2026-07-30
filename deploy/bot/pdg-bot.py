@@ -2273,12 +2273,18 @@ def add_ruleset(url, target, label="", behavior=""):
         m[name]["label"] = label.strip()[:40]
     # model / 规则集文件 / 元数据 一次提交: 渲染派生时读的是**这份 staged 元数据**, 所以
     # 不再需要"元数据必须先落地"那种取巧, 也不会出现"文件在、元数据不在"的中间态。
-    ok, msg = tx_apply("ruleset_add", model_mod=mod, files={
-        "ruleset:" + os.path.basename(path): data,
-        "rs_meta": json.dumps(m, ensure_ascii=False, indent=2).encode("utf-8")})
+    rs_files = {"ruleset:" + os.path.basename(path): data,
+                "rs_meta": json.dumps(m, ensure_ascii=False, indent=2).encode("utf-8")}
+    # 派生的劫持表必须和规则集**同一笔事务**: 分两步写, 中间失败就会留下"规则集在、DNS 侧
+    # 不劫持"的半套 —— 那正是这个功能要消灭的状态。派生读的是候选文件, 所以先把它写到临时
+    # 位置再算(下面 _staged_meta_path 负责)。
+    hj, undrivable = _ruleset_hijack_file(m, {name: data})
+    rs_files.update(hj)
+    ok, msg = tx_apply("ruleset_add", model_mod=mod, files=rs_files)
     if ok:
         cntdesc = f"{count} 条" if count is not None else "mihomo .mrs"
-        return True, f"规则集已添加 → {target}（{cntdesc}，{label.strip() or name}）" + warn
+        return True, (f"规则集已添加 → {target}（{cntdesc}，{label.strip() or name}）" + warn
+                      + _undrivable_note(undrivable))
     return False, msg
 
 def set_ruleset_label(name, label):
@@ -2317,6 +2323,7 @@ def del_ruleset(name):
             files["ruleset:" + os.path.basename(p_)] = None      # None = 本次要删掉它
     m2 = dict(m); m2.pop(name, None)
     files["rs_meta"] = json.dumps(m2, ensure_ascii=False, indent=2).encode("utf-8")
+    files.update(_ruleset_hijack_file(m2)[0])      # 删掉之后重算, 不留死域名
     ok, msg = tx_apply("ruleset_del", model_mod=mod, files=files)
     return (True, f"已删除规则集 {label}") if ok else (False, msg)
 
@@ -2336,6 +2343,7 @@ def refresh_rulesets():
     if not m:
         return 0, []
     files, failed, n = {}, [], 0
+    blobs = {}                 # 本批下下来的候选内容: 劫持表按它算, 不按磁盘上的旧档
     tmpd = tempfile.mkdtemp(prefix="pdgrs-cand.")
     try:
         for name, info in m.items():
@@ -2363,16 +2371,26 @@ def refresh_rulesets():
                     with open(tmp, "rb") as f:
                         data = f.read()
                 files["ruleset:" + leaf] = data
+                blobs[name] = data
                 n += 1
             except Exception as e:  # noqa: BLE001
                 failed.append("%s(%s: %s)" % (info.get("label") or name, type(e).__name__, e))
         if n == 0:
             return 0, failed
         files["rs_meta"] = json.dumps(m, ensure_ascii=False, indent=2).encode("utf-8")
+        hj, undrivable = _ruleset_hijack_file(m, blobs)
+        files.update(hj)                           # 派生劫持表与规则集同一笔提交
+        # .mrs 派生不了要说, 但**不能算进 failed**: 那个列表的语义是"这些源没刷新成功",
+        # 而它们其实刷新得好好的。混进去会让定时任务(scheduled-update.sh 按 failed 退出)
+        # 在任何装了 .mrs 规则集的机器上**每次都报失败**。只进事务 warnings。
+        warns = list(failed)
+        if undrivable:
+            warns.append(".mrs 规则集无法派生劫持表(gfw 模式下不会命中): "
+                         + "、".join(str(x) for x in undrivable[:4]))
         # model 不变, 但仍走一遍派生渲染: 规则集进不了 mihomo 运行配置(dropped)这类问题要在
         # **候选阶段**就被挡下, 与 _mihomo_derive 同一判据; 文件真坏则由重启观察期兜住。
         ok, msg = tx_apply("rulesets_refresh", model_mod=lambda c: None, files=files,
-                           services=("mihomo",), warnings=failed)
+                           services=("mihomo",), warnings=warns)
         if not ok:
             return 0, failed + ["整批未更新(全部保留上一份好档): " + msg]
         return n, failed
@@ -2535,6 +2553,90 @@ def start_update():
         return r.returncode == 0
     except Exception:  # noqa: BLE001
         return False
+
+# ── 规则集派生的劫持表 ────────────────────────────────────────────────────────
+# 为什么需要它: 规则集只写 mihomo 那一侧(rule-providers + RULE-SET 规则), 而流量能不能到
+# mihomo 由 mosdns 决定。all 模式下"不是国内就劫持"顺带把规则集的域名兜住了, 看不出问题;
+# gfw 模式下劫持集只有被墙域名 —— 规则集里的域名拿到真实 IP, 手机直连, 那条 RULE-SET 规则
+# 永远匹配不到。规则加了、UI 说成功了、doctor 也绿, 就是不生效。
+#
+# 文本/YAML 类规则集在本项目里落盘成 sing-box source JSON(domain / domain_suffix /
+# domain_keyword / ip_cidr 四个数组), 域名清单是现成的, 直接派生即可:
+#   domain          → full:x     (精确)
+#   domain_suffix   → domain:x   (含子域)
+#   domain_keyword  → keyword:x
+#   ip_cidr         → 跳过        (DNS 这一层没法按 IP 劫持)
+# .mrs 是 mihomo 的二进制格式, 域名清单在网关侧展不开 —— **派生不了**, 只能如实告诉用户。
+RULESET_HIJACK_MAX = 200000        # 上限: 超了就截断并明说, 不静默丢
+
+def _ruleset_domain_lines(info, blob=None):
+    """一个规则集条目 → mosdns 域名行列表。返回 (行, 能不能派生)。
+
+    blob: 本次事务的**候选内容**。加规则集/刷新时文件还没落盘, 必须按候选算 —— 按磁盘上
+    那份旧文件算出来的劫持表, 和同一笔事务里要落盘的规则集对不上。"""
+    path = info.get("path") or ""
+    if str(info.get("format", "")) in ("mrs", "binary") or path.endswith((".mrs", ".srs")):
+        return [], False
+    try:
+        if blob is None:
+            with open(path, "rb") as f:
+                blob = f.read()
+        src = json.loads(blob.decode("utf-8"))
+    except Exception:  # noqa: BLE001
+        return [], False
+    out = []
+    for rule in src.get("rules") or []:
+        if not isinstance(rule, dict):
+            continue
+        for key, pfx in (("domain", "full:"), ("domain_suffix", "domain:"),
+                         ("domain_keyword", "keyword:")):
+            for d in rule.get(key) or []:
+                d = str(d).strip().lstrip(".").lower()
+                # 只收 mosdns 认得的形态; 认不出的宁可不写, 也不要让整份文件加载失败
+                if d and re.match(r"^[a-z0-9_.*-]+$", d):
+                    out.append(pfx + d)
+    return out, True
+
+
+def ruleset_hijack_text(meta, blobs=None):
+    """启用中的规则集 → ruleset_hijack.txt 内容。返回 (bytes, 派生不了的规则集显示名列表)。
+
+    blobs: {规则集名: 本次事务的候选内容}, 没给的按磁盘上那份算。
+    纯函数(除了读规则集文件本身), 不落盘 —— 调用方把它放进同一笔事务。"""
+    lines, undrivable = [], []
+    for name, info in sorted((meta or {}).items()):
+        got, ok = _ruleset_domain_lines(info or {}, (blobs or {}).get(name))
+        if not ok:
+            undrivable.append((info or {}).get("label") or name)
+            continue
+        lines += got
+    lines = sorted(set(lines))
+    note = ""
+    if len(lines) > RULESET_HIJACK_MAX:
+        note = "# 超过 %d 条, 已截断(其余域名在 gfw 模式下不会被劫持)\n" % RULESET_HIJACK_MAX
+        lines = lines[:RULESET_HIJACK_MAX]
+    head = ("# pdg 规则集派生劫持表 —— 由启用中的规则集自动生成, 手改会在下次刷新时被覆盖。\n"
+            "# 作用: 让规则集里的域名在 gfw 模式下也能被劫持到网关, 否则那些 RULE-SET 规则\n"
+            "# 永远匹配不到(all 模式下靠兜底劫持, 看不出差别)。\n") + note
+    return (head + "".join(l + "\n" for l in lines)).encode("utf-8"), undrivable
+
+
+def _ruleset_hijack_file(meta, blobs=None):
+    """给事务用的 {目标: 内容} 片段。"""
+    data, undrivable = ruleset_hijack_text(meta, blobs)
+    return {"mosdns_rule:ruleset_hijack.txt": data}, undrivable
+
+
+def _undrivable_note(undrivable):
+    """.mrs 派生不了这件事要如实说 —— 否则用户以为规则集在 gfw 模式下也自动生效了。"""
+    if not undrivable:
+        return ""
+    return ("\n⚠️ 这些是 mihomo 的 .mrs 二进制规则集, 域名清单在网关侧展不开, "
+            "<b>无法自动派生劫持表</b>: " + "、".join(str(x) for x in undrivable[:4])
+            + ("…" if len(undrivable) > 4 else "")
+            + "\ngfw 模式下它们的规则不会命中(all 模式不受影响)。需要的话把域名手动写进 "
+              "<code>/etc/mosdns/rules/ruleset_hijack.txt</code>。")
+
 
 # ── 单条规则增删 ──
 def add_rule(domain, target):
@@ -3265,6 +3367,19 @@ def _restore_commit(tmp):
                 t.stage("ruleset:" + leaf, blob)
             n_del = sum(1 for v in plan.values() if v is None)
             restored.append("规则集 %d 个(删除 %d 个)" % (len(plan) - n_del, n_del))
+            # 规则集换了, 派生的劫持表也得跟着重算 —— 否则恢复完 gfw 模式下那些 RULE-SET
+            # 规则又变成死的。按**本次要落盘的候选**算, 不是磁盘上的旧档。
+            rs_blobs = {}
+            for nm, inf in (bak_meta or {}).items():
+                leaf_ = os.path.basename(str((inf or {}).get("path") or ""))
+                if leaf_ and plan.get(leaf_) is not None:
+                    rs_blobs[nm] = plan[leaf_]
+            hj_data, hj_undrivable = ruleset_hijack_text(bak_meta, rs_blobs)
+            t.stage("mosdns_rule:ruleset_hijack.txt", hj_data)
+            restored.append("ruleset_hijack.txt")
+            if hj_undrivable:
+                notes.append("ℹ️ .mrs 规则集无法派生劫持表, gfw 模式下不会命中: "
+                             + "、".join(str(x) for x in hj_undrivable[:4]))
         t.derive("mihomo_cfg", _mihomo_derive)
         # 服务动作由**本次真正落盘的目标**推导, 与救援平面共用同一份映射(pdgtx.actions_for_targets)
         # —— 两处各写一套 if/else 迟早会漂移成"同样的恢复, 一边重启一边不重启"。

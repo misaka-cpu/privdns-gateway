@@ -2112,6 +2112,60 @@ migrate_mosdns_explicit_proxy(){
   fi
   rm -rf "$wd"
 }
+# 规则集派生劫持表(v1.7.3 → 之后)。
+#
+# 规则集此前只写 mihomo 那一侧: all 模式下"不是国内就劫持"顺带把它们的域名兜住了, gfw 模式
+# 下劫持集只有被墙域名 —— 规则集里的域名拿到真实 IP、手机直连, 那条 RULE-SET 规则永远匹配
+# 不到。规则加了、UI 说成功了、doctor 也绿, 就是不生效。
+#
+# 老机器上这个文件要么是空的, 要么是管理员手填的。这里按**现有规则集**重算一次, 之后
+# add/del/refresh/恢复 都会在各自的事务里保持它同步。
+# 内容全由 bot 侧那一份纯函数产出(单一真源), 这里只负责调用与落盘校验。
+migrate_ruleset_hijack(){
+  local f=/etc/mosdns/rules/ruleset_hijack.txt meta=/opt/pdg-bot/rulesets.json
+  [[ -f /etc/mosdns/config.yaml ]] || return 0
+  grep -q 'qname \$explicit_proxy' /etc/mosdns/config.yaml || return 0   # 还没有明确代理层 → 轮不到它
+  [[ -s "$meta" ]] || return 0                                            # 没有规则集 → 无从派生
+  # 已经是派生产物且与当前规则集一致 → 幂等退出
+  local wd; wd="$(mktemp -d)" || return 0
+  if ! python3 - "$meta" "$wd/new.txt" <<'PY' 2>"$wd/err"; then
+import json, sys
+sys.path.insert(0, "/opt/pdg-bot")
+import bot
+meta = json.load(open(sys.argv[1], encoding="utf-8"))
+data, _undrivable = bot.ruleset_hijack_text(meta)
+open(sys.argv[2], "wb").write(data)
+PY
+    c_y "  规则集劫持表未派生(读不出规则集元数据), 保持原样。"; rm -rf "$wd"; return 0
+  fi
+  if [[ -f "$f" ]] && cmp -s "$f" "$wd/new.txt"; then rm -rf "$wd"; return 0; fi   # 幂等
+  # 管理员手填过(不是派生产物)→ 不覆盖, 交给他自己决定
+  if [[ -s "$f" ]] && ! head -1 "$f" | grep -q '规则集派生劫持表'; then
+    c_y "  /etc/mosdns/rules/ruleset_hijack.txt 是手填的, 未覆盖。"
+    c_y "  → 想改用自动派生: 清空它再跑一次 sudo pdg update。"
+    rm -rf "$wd"; return 0
+  fi
+  local bak; bak="$f.pre-derive.$(date +%s)"
+  [[ -f "$f" ]] && { cp -a "$f" "$bak" 2>/dev/null || { rm -rf "$wd"; return 0; }; }
+  if ! cat "$wd/new.txt" > "$f" 2>/dev/null; then
+    c_y "  规则集劫持表写入失败, 还原。"; [[ -f "$bak" ]] && cp -a "$bak" "$f"
+    rm -f "$bak"; rm -rf "$wd"; return 0
+  fi
+  if command -v mosdns >/dev/null 2>&1 && [[ -e /etc/systemd/system/mosdns.service ]]; then
+    systemctl restart mosdns 2>/dev/null; sleep 1
+    if [[ "$(systemctl is-active mosdns 2>/dev/null)" == active ]]; then
+      c_g "  已按现有规则集生成劫持表($(grep -vc '^#' "$f" 2>/dev/null) 条; gfw 模式下规则集才会生效)。"
+      rm -f "$bak"
+    else
+      c_y "  ⚠️ 新劫持表起不来 mosdns → 已还原。"
+      [[ -f "$bak" ]] && cp -a "$bak" "$f"; systemctl restart mosdns 2>/dev/null; rm -f "$bak"
+    fi
+  else
+    c_g "  已按现有规则集生成劫持表(未起 mosdns 校验: 本机无 mosdns 服务)。"; rm -f "$bak"
+  fi
+  rm -rf "$wd"
+}
+
 # 老装(v1.4.x)从来没有 backend 标记。据现场证据把它落地(unit 文件存在才算数, 免得 is-active
 # 的异常输出误导), 让"这台机器此刻跑的是哪个核"成为显式状态而非默认值。
 # v1.6.0 起唯一内核是 mihomo, 本函数仍有用: 它跑在 migrate_drop_singbox **之前**, 于是万一
@@ -2182,6 +2236,7 @@ run_all_migrations(){
   migrate_deploy_botfiles || true; migrate_deploy_units || true
   migrate_mosdns_hijack_shape || true
   migrate_mosdns_explicit_proxy || true
+  migrate_ruleset_hijack || true
   migrate_custom_hijack || true
   migrate_mosdns_mitm || true; migrate_pdg_mitm_service || true
   migrate_android_cleanup || true

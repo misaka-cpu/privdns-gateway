@@ -462,27 +462,40 @@ print((m.group(1).split(',')[0].strip().strip(chr(39))) if m else '')")"
   grep -q "rule-providers" /etc/mihomo/config.yaml \
     && ok "8e mihomo 有 rule-providers 段" || bad "8e 缺 rule-providers"
   mihomo_sane "8e"
-  # 规则集里的域名**不会**被自动写进 mosdns 劫持表。在 all 模式下这看不出来 —— 非 CN 域名
-  # 本来就全劫持; 在 gfw 模式下就露馅了: 域名不在 gfw 集里 → DNS 返真实地址 → 流量不进
-  # mihomo → 那条 RULE-SET 规则永远匹配不到。这正是 ruleset_hijack.txt 存在的理由, 而目前
-  # 项目不会自动往里写。下面把两种模式都验出来, 并证明手填之后就能生效。
+  # 加规则集时, 域名要**自动**写进 mosdns 的派生劫持表。gfw 模式是判据所在: all 模式下
+  # "不是国内就劫持"顺带兜住了, 看不出差别; gfw 模式下劫持集只有被墙域名, 派生表不写就等于
+  # 规则集里的域名拿真实 IP、手机直连, 那条 RULE-SET 规则永远匹配不到。
+  grep -q "^domain:rsdemo.example$" /etc/mosdns/rules/ruleset_hijack.txt \
+    && ok "8e 规则集的域名自动进了派生劫持表" \
+    || bad "8e 派生劫持表里没有它: $(head -5 /etc/mosdns/rules/ruleset_hijack.txt | tr '\n' '|')"
+  grep -q "规则集派生劫持表" /etc/mosdns/rules/ruleset_hijack.txt \
+    && ok "8e 派生表带了来源说明(手改会被覆盖)" || bad "8e 派生表没有表头"
   reload
   [[ "$(q rsdemo.example)" == "$E2E_SIP" ]] \
-    && ok "8e all 模式: 规则集域名被劫持(靠 all 的兜底, 不是靠规则集本身)" \
-    || bad "8e all 模式下规则集域名没被劫持 → $(q rsdemo.example)"
+    && ok "8e all 模式: 规则集域名进网关" || bad "8e all 模式 → $(q rsdemo.example)"
   bash /usr/local/bin/pdg hijack-mode gfw >/dev/null 2>&1; reload
-  if [[ "$(q rsdemo.example)" == "$UP" ]]; then
-    ok "8e gfw 模式: 规则集域名**不被劫持** → 那条 RULE-SET 规则实际不生效(已知缺口)"
-    echo "  [缺口] 规则集只写 mihomo 侧, 不写 mosdns 劫持表。gfw 模式下需要管理员把域名手填进"
-    echo "         /etc/mosdns/rules/ruleset_hijack.txt, 否则规则看着加了却永不命中。"
-  else
-    echo "  [变化] gfw 模式下规则集域名已被劫持 → $(q rsdemo.example)(若已实现自动派生, 请更新本断言)"
-  fi
-  echo "domain:rsdemo.example" > /etc/mosdns/rules/ruleset_hijack.txt; reload
   [[ "$(q rsdemo.example)" == "$E2E_SIP" ]] \
-    && ok "8e gfw 模式: 手填 ruleset_hijack.txt 之后规则集域名进网关(缺口有解法)" \
-    || bad "8e 手填之后仍不劫持 → $(q rsdemo.example)"
-  : > /etc/mosdns/rules/ruleset_hijack.txt
+    && ok "8e **gfw 模式: 规则集域名同样进网关(本轮修的就是这个)**" \
+    || bad "8e gfw 模式下规则集仍是死规则 → $(q rsdemo.example)"
+  [[ "$(q rsdemo2.example)" == "$E2E_SIP" ]] \
+    && ok "8e gfw 模式: 同一规则集的第二个域名也进网关" || bad "8e 第二个域名 → $(q rsdemo2.example)"
+  [[ "$(q notinrs.example)" == "$UP" ]] \
+    && ok "8e 不在规则集里的海外域名仍走真实解析(没有殃及无辜)" || bad "8e → $(q notinrs.example)"
+  # 删掉规则集 → 派生表要跟着收回, 不留死域名
+  botpy > /tmp/e2e-bs8f.out 2>&1 <<'PY'
+import sys
+sys.path.insert(0, "/opt/pdg-bot")
+import bot
+name = sorted(bot._rs_meta().keys())[0]
+okk, msg = bot.del_ruleset(name)
+print("DEL_RS", okk, str(msg)[:60])
+PY
+  grep -q "^DEL_RS True" /tmp/e2e-bs8f.out && ok "8e 删除规则集成功" || bad "8e $(grep DEL_RS /tmp/e2e-bs8f.out)"
+  grep -q "rsdemo.example" /etc/mosdns/rules/ruleset_hijack.txt \
+    && bad "8e 删了规则集, 派生表里还留着它的域名" || ok "8e 删除后派生表同步收回"
+  reload
+  [[ "$(q rsdemo.example)" == "$UP" ]] \
+    && ok "8e 删除后该域名回到真实解析" || bad "8e 删除后仍被劫持 → $(q rsdemo.example)"
   bash /usr/local/bin/pdg hijack-mode all >/dev/null 2>&1; reload
 else
   bad "8e 规则集加入失败: $(grep ADD_RS /tmp/e2e-bs8e.out)"

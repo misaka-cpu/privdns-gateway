@@ -579,6 +579,53 @@ def check_mosdns_explicit_proxy():
 
 PROFILE_ENV = "/etc/privdns-gateway/profile.env"
 
+def check_ruleset_hijack():
+    """规则集派生的劫持表是否与启用中的规则集同步。
+
+    规则集只写 mihomo 那一侧; 流量能不能到 mihomo 由 mosdns 决定。all 模式下"不是国内就
+    劫持"顺带兜住了, gfw 模式下就露馅: 规则集里的域名拿到真实 IP、手机直连, 那条 RULE-SET
+    规则永远匹配不到 —— 规则在、UI 说成功、其它检查全绿, 就是不生效。
+
+    只读: 按当前 rulesets.json 重算一遍, 与磁盘上的文件比。不一致 → gfw 模式判 warn
+    (all 模式只提示: 那边不影响命中)。.mrs 派生不了, 单独点名。"""
+    import json as _json
+    meta_path = "/opt/pdg-bot/rulesets.json"
+    f = "/etc/mosdns/rules/ruleset_hijack.txt"
+    try:
+        with open(meta_path, encoding="utf-8") as fh:
+            meta = _json.load(fh)
+    except Exception:  # noqa: BLE001
+        return None                      # 没有规则集 → 这项不适用, 不显示
+    if not meta:
+        return None
+    mode = (_profile("PDG_HIJACK_MODE") or "all").strip() or "all"
+    try:
+        sys.path.insert(0, "/opt/pdg-bot")
+        import importlib
+        bot = importlib.import_module("bot")
+        want, undrivable = bot.ruleset_hijack_text(meta)
+    except Exception as e:  # noqa: BLE001
+        return ("warn", "规则集劫持表", "算不出应有内容(%s), 无法核对" % type(e).__name__)
+    try:
+        with open(f, "rb") as fh:
+            have = fh.read()
+    except OSError:
+        have = None
+    drivable = len(meta) - len(undrivable)
+    if have != want and drivable:
+        lvl = "fail" if mode == "gfw" else "warn"
+        return (lvl, "规则集劫持表",
+                "与启用中的规则集不同步(%s 模式): 规则集里的域名在 gfw 模式下不会被劫持到网关, "
+                "那些 RULE-SET 规则不会命中。跑 sudo pdg update 或在 bot 里刷新一次规则集即可重算。"
+                % mode)
+    if undrivable:
+        return ("warn", "规则集劫持表",
+                "%d 个 .mrs 规则集派生不出域名(二进制格式在网关侧展不开): %s。gfw 模式下它们"
+                "不会命中; 需要的话把域名手写进 %s。"
+                % (len(undrivable), "、".join(str(x) for x in undrivable[:3]), f))
+    return ("ok", "规则集劫持表", "%d 个规则集的域名已同步(gfw 模式下也能命中)" % drivable)
+
+
 def check_mem():
     """显示当前内存模式 + mosdns cache size(只读, 不写 profile)。始终 ok, 仅信息展示。"""
     mode = None
@@ -953,7 +1000,7 @@ def check_transactions():
 
 ALL = [check_platform, check_services, check_bot_credentials, check_core_version, check_dot_arecord, check_dot_domain_sync,
        check_internal_cidr, check_cidr_drift, check_nft, check_nft_input_chains, check_redirect, check_gms,
-       check_mosdns_ratelimit, check_mosdns_explicit_proxy, check_mem,
+       check_mosdns_ratelimit, check_mosdns_explicit_proxy, check_ruleset_hijack, check_mem,
        check_cert, check_dns, check_core_config, check_rulesets, check_mitm_structure, check_mitm,
        check_transactions]
 ALERT = [check_services, check_dns, check_cert]  # healthcheck 用的轻量子集(运行期故障)

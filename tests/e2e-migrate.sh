@@ -329,4 +329,65 @@ ls /etc/mosdns/config.yaml.preexplicit.* >/dev/null 2>&1 \
   && bad "成功后没清掉迁移备份: $(ls /etc/mosdns/config.yaml.preexplicit.* | head -1)" \
   || ok "成功后迁移备份已清理"
 
+
+# ══ 场景八: 老机器上按现有规则集补出派生劫持表 ═════════════════════════════════
+# 规则集此前只写 mihomo 那一侧。all 模式下"不是国内就劫持"顺带兜住了, gfw 模式下劫持集只有
+# 被墙域名 —— 规则集里的域名拿真实 IP、手机直连, 那条 RULE-SET 规则永远匹配不到。老机器上
+# ruleset_hijack.txt 是空的, 更新时要按现有规则集重算一次。
+echo; echo "── 场景八: 规则集派生劫持表 ──"
+seed_v170_box
+mkdir -p /etc/sing-box/rs
+cat > /etc/sing-box/rs/rs_demo.json <<'RSJSON'
+{"version": 1, "rules": [{"domain_suffix": ["derived.example", "derived2.example"],
+                          "domain": ["exact.example"], "ip_cidr": ["203.0.113.0/24"]}]}
+RSJSON
+cat > /opt/pdg-bot/rulesets.json <<'RSMETA'
+{"rs_demo": {"url": "http://example.invalid/demo.list", "outbound": "jp",
+             "format": "source", "path": "/etc/sing-box/rs/rs_demo.json", "label": "演示集"}}
+RSMETA
+: > /etc/mosdns/rules/ruleset_hijack.txt
+bash /usr/local/bin/pdg __migrate >/tmp/mig10.log 2>&1
+
+grep -q '^domain:derived.example$'  /etc/mosdns/rules/ruleset_hijack.txt \
+  && ok "按规则集派生: domain_suffix → domain:" || bad "缺 domain:derived.example"
+grep -q '^domain:derived2.example$' /etc/mosdns/rules/ruleset_hijack.txt \
+  && ok "同一规则集的多个域名都派生了" || bad "缺第二个域名"
+grep -q '^full:exact.example$' /etc/mosdns/rules/ruleset_hijack.txt \
+  && ok "domain → full:(精确匹配)" || bad "缺 full:exact.example"
+grep -q '203.0.113' /etc/mosdns/rules/ruleset_hijack.txt \
+  && bad "IP 段被写进了域名表(DNS 这一层劫不了 IP)" || ok "ip_cidr 被正确跳过"
+grep -q '规则集派生劫持表' /etc/mosdns/rules/ruleset_hijack.txt \
+  && ok "带表头说明(手改会被覆盖)" || bad "没有表头"
+
+# 幂等: 二跑内容一字不变
+cp /etc/mosdns/rules/ruleset_hijack.txt /tmp/rsh1
+bash /usr/local/bin/pdg __migrate >/dev/null 2>&1
+cmp -s /tmp/rsh1 /etc/mosdns/rules/ruleset_hijack.txt && ok "二跑幂等(派生表逐字节不变)" || bad "二跑改了派生表"
+
+# 管理员手填过的不许覆盖 —— 那是他自己维护的数据
+printf 'domain:handwritten.example\n' > /etc/mosdns/rules/ruleset_hijack.txt
+bash /usr/local/bin/pdg __migrate >/tmp/mig11.log 2>&1
+grep -q '^domain:handwritten.example$' /etc/mosdns/rules/ruleset_hijack.txt \
+  && ok "手填的内容没被覆盖" || bad "把管理员手填的内容冲掉了"
+grep -q '手填的, 未覆盖' /tmp/mig11.log && ok "并且明确告诉了用户为什么没动" || bad "没说明"
+
+# .mrs 派生不了 —— 要如实说, 不能让人以为自动了
+cat > /opt/pdg-bot/rulesets.json <<'RSMETA2'
+{"rs_bin": {"url": "http://example.invalid/geo.mrs", "outbound": "jp",
+            "format": "mrs", "behavior": "domain",
+            "path": "/etc/sing-box/rs/rs_bin.mrs", "label": "二进制集"}}
+RSMETA2
+: > /etc/mosdns/rules/ruleset_hijack.txt
+bash /usr/local/bin/pdg __migrate >/dev/null 2>&1
+[[ "$(grep -vc '^#' /etc/mosdns/rules/ruleset_hijack.txt)" == 0 ]] \
+  && ok ".mrs 规则集: 派生表为空(展不开二进制, 不瞎猜)" || bad ".mrs 竟然派生出了域名"
+python3 /opt/pdg-bot/doctor.py --json > /tmp/doc8.json 2>/dev/null
+python3 - <<'PY' && ok "doctor: 点名 .mrs 派生不了" || bad "doctor 没点名 .mrs: $(head -c 160 /tmp/doc8.json)"
+import json, sys
+d = json.load(open("/tmp/doc8.json"))
+hit = [x for x in d if x.get("check") == "规则集劫持表"]
+sys.exit(0 if hit and hit[0]["level"] == "warn" and ".mrs" in hit[0]["detail"] else 1)
+PY
+rm -f /opt/pdg-bot/rulesets.json /etc/sing-box/rs/rs_demo.json /tmp/rsh1
+
 e2e_summary
