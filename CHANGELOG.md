@@ -9,8 +9,13 @@
   被墙域名 —— 规则集里的域名拿到真实 IP、手机直连, 那条 `RULE-SET` 规则永远匹配不到。规则加了、
   UI 说成功了、`pdg doctor` 也绿, 就是不生效。现在加/删/刷新规则集与恢复备份时, 都会在**同一笔
   事务**里按启用中的规则集重算 `ruleset_hijack.txt`; 老机器 `pdg update` 时补算一次。
-- **`.mrs` 派生不了, 会明说**:mihomo 原生二进制规则集的域名清单在网关侧展不开。Bot 的回复与
-  `pdg doctor` 都会点名是哪几个, 并告诉你 `gfw` 模式下它们不会命中 —— 不再让人以为自动了。
+- **`.mrs` 也能派生**:它是 mihomo 的二进制格式(succinct trie + zstd), 自己解析等于把内核的数据
+  结构抄一遍; 但内核自带的 `convert-ruleset <behavior> mrs <in> <out>` 正好是反方向 —— 输入
+  `.mrs`, 输出文本域名清单(实测 8.9KB / 1042 条约 12ms)。用它就不必另写解码器, 也不会与内核
+  版本漂移。`+.x.com` → `domain:x.com`、`x.com` → `full:x.com`、`*.x.com` 放宽成 `domain:x.com`
+  (多劫持一点只是让流量进 mihomo, 出口仍由 mihomo 的规则决定)。`ipcidr` 类型本来就没有域名,
+  跳过而不是报错。只有真读不出来的(文件损坏、类型认不出、缺 mihomo 二进制)才由 Bot 与
+  `pdg doctor` 点名。
 - **手写过的 `ruleset_hijack.txt` 不会被覆盖**:表头不是自动生成的那行就当作管理员自己维护的数据,
   迁移只提示、不动手。
 - `pdg doctor` 新增「规则集劫持表」一项:与启用中的规则集不同步时, `gfw` 模式判 fail、`all` 模式判 warn。
