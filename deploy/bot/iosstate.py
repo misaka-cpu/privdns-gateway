@@ -232,13 +232,18 @@ def classify(meta, inputs, artifact=None):
         if LEVEL_ORDER[lv] > LEVEL_ORDER[level]:
             level = lv
         reasons.append("%s 已变化" % FIELD_LABEL.get(k, k))
+    # 产物对不上记录有三种来路: 被改动过、快照回滚后产物与记录错位(产物不在快照范围内)、
+    # 生成中途崩溃。三种的处理是同一个: 按记录**确定性重建**。所以这里不判"必须更新" ——
+    # 记录里那一版才是真的, 而它能被逐字节复原。但也不能当没事: 用户可能在这期间恰好装过
+    # 那份对不上的文件, 而服务器无从知道。于是给"建议更新"并把话说清楚。
     if artifact is None:
-        if level == NONE:
-            reasons.append("当前产物文件缺失, 已按记录重建")
+        reasons.append("服务器上的产物文件缺失, 已按记录重建")
     elif meta["current"].get("sha256") and \
             hashlib.sha256(artifact).hexdigest() != meta["current"]["sha256"]:
-        level = REQUIRED
-        reasons.append("当前产物文件与记录不一致(可能被改动过)")
+        if LEVEL_ORDER[RECOMMENDED] > LEVEL_ORDER[level]:
+            level = RECOMMENDED
+        reasons.append("服务器上的产物文件与记录不一致, 已按记录重建; "
+                       "若你在此期间装过, 建议重新安装一次")
     if level == NONE and not reasons:
         reasons.append("网关配置与已生成版本一致")
     return level, reasons

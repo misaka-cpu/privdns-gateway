@@ -30,6 +30,7 @@ MEMBER_TARGET = {
     "etc/mosdns/rules/custom_direct.txt": "mosdns_rule:custom_direct.txt",
     "etc/mosdns/rules/custom_hijack.txt": "mosdns_rule:custom_hijack.txt",
     "opt/pdg-bot/rulesets.json": "rs_meta",
+    "etc/privdns-gateway/ios-profile.json": "ios_profile",
 }
 # 兼容 bot 里既有的名字(它只用来判成员是否在白名单内)
 RESTORE_MAP = MEMBER_TARGET

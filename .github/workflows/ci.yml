@@ -205,6 +205,9 @@ jobs:
       - name: "iOS 描述文件交互 (Bot/CLI 同一份记录 + 不声称设备状态 + Android 全拒)"
         run: python3 tests/test-ios-profile-ux.py
 
+      - name: "iOS 描述文件身份持久性 (update/快照/备份恢复/平台来回切都不丢身份)"
+        run: python3 tests/test-ios-profile-persist.py
+
       - name: "自检防火墙端口回归"
         run: python3 tests/test-doctor-firewall.py
 

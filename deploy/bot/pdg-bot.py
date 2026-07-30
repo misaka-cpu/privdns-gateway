@@ -3230,7 +3230,10 @@ def _ios_send(chat, ssids=(), legacy=False):
     return head + "\n" + "\n".join("• " + r for r in why) + "\n\n" + IOS_UNKNOWN
 
 # ── 配置备份 / 恢复 ──
-BACKUP_FILES = [SB, MOSDNS_CONF, MOSDNS_DIRECT, MOSDNS_HIJACK, RS_META]
+IOS_META = "/etc/privdns-gateway/ios-profile.json"   # iOS 描述文件身份/修订记录(用户持久数据)
+# iOS 记录一并进备份: 它丢了不会报错, 只会在下次生成时悄悄换成另一个身份 —— 那时用户手机上
+# 那份描述文件已经再也收不到更新了。文件不存在(Android / 还没启用)时 backup_blob 自动跳过。
+BACKUP_FILES = [SB, MOSDNS_CONF, MOSDNS_DIRECT, MOSDNS_HIJACK, RS_META, IOS_META]
 # 受管配置的解包/白名单/限额/成员映射搬进了 cfgrestore —— Bot(收 Telegram 备份包)与救援平面
 # (从本机快照恢复)做的是同一件事, 两边各写一份的下场是: 白名单一处加了新目标另一处没加, 于是
 # "恢复成功"的机器少一份配置。这里保留原来的模块级名字, 老调用与既有测试不受影响。

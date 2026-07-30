@@ -110,6 +110,10 @@ _STATIC = {
     "profile_env":    ("/etc/privdns-gateway/profile.env", 0o600, False, ("kv_env",)),
     "nftables_conf":  ("/etc/nftables.conf", 0o644, False, ("nft_check",)),
     "mitm_json":      ("/etc/privdns-gateway/mitm.json", 0o600, False, ("json_any",)),
+    # iOS 描述文件的身份与修订记录。它是**用户持久数据**: 丢了会在下次生成时造出第二个身份,
+    # 用户手机上那份描述文件从此再也无法被更新, 而界面上什么都不会报错。所以它必须能跟着
+    # 备份/快照一起恢复 —— 恢复走事务, 事务只认白名单里的目标, 于是这一行是必需的。
+    "ios_profile":    ("/etc/privdns-gateway/ios-profile.json", 0o600, False, ("json_any",)),
     "mitm_hijack":    ("/etc/mosdns/rules/mitm_hijack.txt", 0o644, False, ("mosdns_lines",)),
     "sysctl_tfo":     ("/etc/sysctl.d/99-pdg-tfo.conf", 0o644, False, ("kv_env",)),
     "dot_marker":     ("/opt/pdg-bot/dot-domain", 0o644, False, ("hostname_line",)),
@@ -168,6 +172,9 @@ _TARGET_ACTIONS = {
     # 纯运行状态: 改它本身不牵动任何服务。真正要重启内核的是同一笔事务里的 model/mihomo_cfg,
     # 由它们各自的动作推导 —— 不能因为"顺手记了个状态"就多重启一次。
     "rescue_state": (),
+    # iOS 描述文件的身份/修订记录。没有任何运行中的服务读它 —— 它只在用户点"生成描述文件"
+    # 时被读写。恢复它不该顺手重启 DNS 或内核。
+    "ios_profile": (),
 }
 _PREFIX_ACTIONS = (("mosdns_rule:", ("restart:mosdns",)),
                    ("ruleset:", ("restart:mihomo",)),

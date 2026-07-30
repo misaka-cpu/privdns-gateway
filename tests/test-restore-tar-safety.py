@@ -277,7 +277,11 @@ def main():
         bot.MOSDNS_HIJACK = os.path.join(base, "etc/mosdns/rules/custom_hijack.txt")
         bot.RS_META = os.path.join(base, "opt/pdg-bot/rulesets.json")
         bot.RS_DIR = os.path.join(base, "etc/sing-box/rs")
-        bot.BACKUP_FILES = [bot.SB, bot.MOSDNS_CONF, bot.MOSDNS_DIRECT, bot.MOSDNS_HIJACK, bot.RS_META]
+        os.makedirs(os.path.join(base, "etc/privdns-gateway"), exist_ok=True)
+        bot.IOS_META = os.path.join(base, "etc/privdns-gateway/ios-profile.json")
+        json.dump({"schema": 1, "instance_id": "x"}, open(bot.IOS_META, "w"))
+        bot.BACKUP_FILES = [bot.SB, bot.MOSDNS_CONF, bot.MOSDNS_DIRECT, bot.MOSDNS_HIJACK,
+                            bot.RS_META, bot.IOS_META]
         json.dump({"outbounds": [], "route": {"rules": []}}, open(bot.SB, "w"))
         for p in (bot.MOSDNS_CONF, bot.MOSDNS_DIRECT, bot.MOSDNS_HIJACK):
             open(p, "w").write("x\n")

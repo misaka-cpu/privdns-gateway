@@ -229,10 +229,18 @@ with open(bx.s.art_path("current", bx.art), "ab") as f:
 lv, why = bx.s.classify(bx.read_meta(), bx.s.make_inputs("dot.example.com", "203.0.113.10",
                                                         (), False, b"", TMPL),
                         bx.s.read_artifact("current", bx.art))
-if lv == "required" and any("不一致" in r for r in why):
-    ok("产物被改动过 → 必须更新(%s)" % why[-1])
+# 产物对不上记录不判"必须更新": 记录里那一版才是真的, 而且能逐字节复原。但要说清楚
+# "你可能刚好装过那份对不上的" —— 服务器无从知道这件事, 所以给建议更新而不是装作没事。
+if lv == "recommended" and any("不一致" in r and "重新安装" in r for r in why):
+    ok("产物被改动过 → 建议更新, 并说明可按记录重建: %s" % why[-1][:40])
 else:
-    bad("产物被篡改却没被发现: %s %s" % (lv, why))
+    bad("产物被篡改后的判定不对: %s %s" % (lv, why))
+fixed = bx.gen()
+if bx.s.read_artifact("current", bx.art) == fixed[3] and \
+        bx.read_meta()["current"]["revision"] == rev:
+    ok("再生成一次即按记录复原产物, revision 仍然不变")
+else:
+    bad("复原失败或 revision 变了")
 
 # ── 5. 迁移 ────────────────────────────────────────────────────────────────
 bx = Box()
