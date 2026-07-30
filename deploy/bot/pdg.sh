@@ -1641,7 +1641,12 @@ open(f, 'w').write(s)
 PY
   then c_y "  生成失败 → 还原。"; cp -a "$bak" "$f"; return 0; fi
   # 校验: 若装了 mosdns 就真起一遍确认可加载, 否则只留新配置(测试环境无 mosdns)
-  if command -v mosdns >/dev/null 2>&1 && systemctl list-units --all 2>/dev/null | grep -q mosdns.service; then
+  # 判据用 unit 文件是否存在, **不要** `systemctl list-units --all | grep -q`:
+  # 本文件开头 set -o pipefail, 而 grep -q 命中即关管道 → systemctl 拿到 SIGPIPE 退 141
+  # → 整条管道非 0 → 条件为假。输出短时 systemctl 先写完才被关, 于是它是**按机器上装了
+  # 多少 unit 决定成败的竞态**: 开发机上判真, .200 上判假。v1.7.2 在 .200 上就是这么
+  # 打出"本机无 mosdns 服务"、跳过校验直接报成功的。
+  if command -v mosdns >/dev/null 2>&1 && [[ -e /etc/systemd/system/mosdns.service ]]; then
     systemctl restart mosdns 2>/dev/null; sleep 1
     if [[ "$(systemctl is-active mosdns 2>/dev/null)" == active ]]; then
       c_g "  ✅ 已补 force_hijack(MITM 接管结构)。"
@@ -2087,7 +2092,12 @@ migrate_mosdns_explicit_proxy(){
     c_y "  写入失败, 还原。"; cp -a "$bak" "$mc" 2>/dev/null; rm -f "$bak"; rm -rf "$wd"; return 0
   fi
   # 校验: 装了 mosdns 服务就真重启一遍确认能加载; 没有服务的环境只留新配置(与 MITM 迁移同规矩)
-  if command -v mosdns >/dev/null 2>&1 && systemctl list-units --all 2>/dev/null | grep -q mosdns.service; then
+  # 判据用 unit 文件是否存在, **不要** `systemctl list-units --all | grep -q`:
+  # 本文件开头 set -o pipefail, 而 grep -q 命中即关管道 → systemctl 拿到 SIGPIPE 退 141
+  # → 整条管道非 0 → 条件为假。输出短时 systemctl 先写完才被关, 于是它是**按机器上装了
+  # 多少 unit 决定成败的竞态**: 开发机上判真, .200 上判假。v1.7.2 在 .200 上就是这么
+  # 打出"本机无 mosdns 服务"、跳过校验直接报成功的。
+  if command -v mosdns >/dev/null 2>&1 && [[ -e /etc/systemd/system/mosdns.service ]]; then
     systemctl restart mosdns 2>/dev/null; sleep 1
     if [[ "$(systemctl is-active mosdns 2>/dev/null)" == active ]]; then
       c_g "  已把「用户点名指到出口的域名」提到 geosite_cn 之前(显式代理优先)。"

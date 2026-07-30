@@ -145,6 +145,11 @@ seed_v170_box(){
   printf 'android\n' > /etc/privdns-gateway/platform
   printf 'mihomo\n'  > /etc/privdns-gateway/backend
   rm -f /etc/privdns-gateway/platform.guessed
+  # 真机上 mosdns 是有 unit 的 —— 迁移正是靠它决定"要不要真起一遍校验新配置"。沙箱缺了这个
+  # 文件, 迁移就走"本机无 mosdns 服务"那条分支, 于是校验那段代码在 e2e 里从没被跑到过。
+  [[ -e /etc/systemd/system/mosdns.service ]] || \
+    printf '[Unit]\nDescription=mosdns (e2e)\n[Service]\nExecStart=/usr/local/bin/mosdns start\n' \
+      > /etc/systemd/system/mosdns.service
 }
 epline(){ grep -n 'qname \$explicit_proxy' /etc/mosdns/config.yaml | head -1 | cut -d: -f1; }
 cnline(){ grep -n 'qname \$geosite_cn'     /etc/mosdns/config.yaml | head -1 | cut -d: -f1; }
@@ -168,6 +173,13 @@ EP="$(epline)"; CN="$(cnline)"; FH="$(fhline)"
 [[ -f /etc/mosdns/rules/ruleset_hijack.txt ]] \
   && ok "补出 ruleset_hijack.txt(域名集要求文件存在, 缺了 mosdns 起不来)" \
   || bad "没补 ruleset_hijack.txt"
+# 机器上装着 mosdns 服务时, 迁移必须**真起一遍**确认新配置能加载 —— 不能只写文件就报成功。
+# v1.7.2 在 .200 上正是打出"未起 mosdns 校验: 本机无 mosdns 服务"然后直接报成功的: 判据
+# 写成了 `systemctl list-units --all | grep -q`, 在 set -o pipefail 下是个按 unit 数量
+# 决定成败的竞态。
+grep -q '未起 mosdns 校验' /tmp/mig4.log \
+  && bad "装着 mosdns 服务却跳过了校验(判据又变成竞态了?)" \
+  || ok "有 mosdns 服务时确实做了启动校验, 没走「本机无 mosdns 服务」那条"
 # 管理员已经写过内容的机器: 迁移一个字节都不许动
 seed_v170_box
 printf 'domain:admin-kept.example\ndomain:admin-kept2.example\n' > /etc/mosdns/rules/ruleset_hijack.txt
