@@ -371,23 +371,51 @@ grep -q '^domain:handwritten.example$' /etc/mosdns/rules/ruleset_hijack.txt \
   && ok "手填的内容没被覆盖" || bad "把管理员手填的内容冲掉了"
 grep -q '手填的, 未覆盖' /tmp/mig11.log && ok "并且明确告诉了用户为什么没动" || bad "没说明"
 
-# .mrs 派生不了 —— 要如实说, 不能让人以为自动了
-cat > /opt/pdg-bot/rulesets.json <<'RSMETA2'
+# .mrs: 用内核自己反向导出域名清单 —— 造一份**真的** .mrs(由 mihomo 从文本转出来)
+printf 'mrsdomain.example\n+.mrssuffix.example\n' > /tmp/mrssrc.txt
+if mihomo convert-ruleset domain text /tmp/mrssrc.txt /etc/sing-box/rs/rs_bin.mrs >/dev/null 2>&1 \
+   && [[ -s /etc/sing-box/rs/rs_bin.mrs ]]; then
+  ok "造出一份真 .mrs(内核 convert-ruleset 生成)"
+  cat > /opt/pdg-bot/rulesets.json <<'RSMETA2'
 {"rs_bin": {"url": "http://example.invalid/geo.mrs", "outbound": "jp",
             "format": "mrs", "behavior": "domain",
             "path": "/etc/sing-box/rs/rs_bin.mrs", "label": "二进制集"}}
 RSMETA2
-: > /etc/mosdns/rules/ruleset_hijack.txt
-bash /usr/local/bin/pdg __migrate >/dev/null 2>&1
-[[ "$(grep -vc '^#' /etc/mosdns/rules/ruleset_hijack.txt)" == 0 ]] \
-  && ok ".mrs 规则集: 派生表为空(展不开二进制, 不瞎猜)" || bad ".mrs 竟然派生出了域名"
-python3 /opt/pdg-bot/doctor.py --json > /tmp/doc8.json 2>/dev/null
-python3 - <<'PY' && ok "doctor: 点名 .mrs 派生不了" || bad "doctor 没点名 .mrs: $(head -c 160 /tmp/doc8.json)"
+  : > /etc/mosdns/rules/ruleset_hijack.txt
+  bash /usr/local/bin/pdg __migrate >/tmp/mig12.log 2>&1
+  grep -q '^full:mrsdomain.example$' /etc/mosdns/rules/ruleset_hijack.txt \
+    && ok ".mrs: 精确域名派生成 full:" || bad ".mrs 没派生出 full:mrsdomain.example"
+  grep -q '^domain:mrssuffix.example$' /etc/mosdns/rules/ruleset_hijack.txt \
+    && ok ".mrs: +. 后缀域名派生成 domain:" || bad ".mrs 没派生出 domain:mrssuffix.example"
+  python3 /opt/pdg-bot/doctor.py --json > /tmp/doc8.json 2>/dev/null
+  python3 - <<'PY' && ok "doctor: .mrs 也判已同步" || bad "doctor: $(head -c 200 /tmp/doc8.json)"
 import json, sys
 d = json.load(open("/tmp/doc8.json"))
 hit = [x for x in d if x.get("check") == "规则集劫持表"]
-sys.exit(0 if hit and hit[0]["level"] == "warn" and ".mrs" in hit[0]["detail"] else 1)
+sys.exit(0 if hit and hit[0]["level"] == "ok" else 1)
 PY
-rm -f /opt/pdg-bot/rulesets.json /etc/sing-box/rs/rs_demo.json /tmp/rsh1
+else
+  bad "造不出 .mrs(内核不支持 convert-ruleset?), .mrs 派生这条没验到"
+fi
+# 坏档 / 类型认不出的 .mrs → 必须点名, 不能装作派生成功
+printf 'not an mrs at all\n' > /etc/sing-box/rs/rs_bin.mrs
+python3 - <<'PY' > /tmp/rsmeta-bad.json
+import json
+json.dump({"rs_bin": {"url": "http://example.invalid/geo.mrs", "outbound": "jp",
+                      "format": "mrs", "path": "/etc/sing-box/rs/rs_bin.mrs",
+                      "label": "坏档"}}, open("/tmp/rsmeta-bad.json", "w"))
+PY
+cp /tmp/rsmeta-bad.json /opt/pdg-bot/rulesets.json
+: > /etc/mosdns/rules/ruleset_hijack.txt
+bash /usr/local/bin/pdg __migrate >/dev/null 2>&1
+python3 /opt/pdg-bot/doctor.py --json > /tmp/doc8b.json 2>/dev/null
+python3 - <<'PY' && ok "坏 .mrs → doctor 点名读不出域名" || bad "坏 .mrs 没被点名: $(head -c 200 /tmp/doc8b.json)"
+import json, sys
+d = json.load(open("/tmp/doc8b.json"))
+hit = [x for x in d if x.get("check") == "规则集劫持表"]
+sys.exit(0 if hit and hit[0]["level"] == "warn" and "读不出域名" in hit[0]["detail"] else 1)
+PY
+rm -f /opt/pdg-bot/rulesets.json /etc/sing-box/rs/rs_demo.json /etc/sing-box/rs/rs_bin.mrs \
+      /tmp/rsh1 /tmp/mrssrc.txt /tmp/rsmeta-bad.json
 
 e2e_summary

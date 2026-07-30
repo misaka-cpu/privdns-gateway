@@ -496,6 +496,38 @@ PY
   reload
   [[ "$(q rsdemo.example)" == "$UP" ]] \
     && ok "8e 删除后该域名回到真实解析" || bad "8e 删除后仍被劫持 → $(q rsdemo.example)"
+  # 8g. .mrs 规则集: 内核自己能把它反向导出成域名清单, 所以 gfw 模式下同样要能命中
+  printf 'mrsonly.example\n+.mrssuf.example\n' > /tmp/e2e-mrs-src.txt
+  if mihomo convert-ruleset domain text /tmp/e2e-mrs-src.txt /etc/sing-box/rs/rs_mrs.mrs >/dev/null 2>&1; then
+    ok "8g 造出真 .mrs 规则集"
+    botpy > /tmp/e2e-bs8g.out 2>&1 <<'PY'
+import json, os, sys
+sys.path.insert(0, "/opt/pdg-bot")
+import bot
+m = dict(bot._rs_meta())
+m["rs_mrs"] = {"url": "http://example.invalid/geo.mrs", "outbound": "jp", "format": "mrs",
+               "behavior": "domain", "path": "/etc/sing-box/rs/rs_mrs.mrs", "label": "二进制集"}
+hj, und = bot._ruleset_hijack_file(m)
+okk, msg = bot.tx_apply("rs_mrs_test", files=dict(
+    hj, **{"rs_meta": json.dumps(m, ensure_ascii=False).encode()}))
+print("MRS_TX", okk, str(msg)[:60])
+print("MRS_UNDRIVABLE", und)
+PY
+    grep -q "^MRS_TX True" /tmp/e2e-bs8g.out && ok "8g .mrs 规则集提交成功" \
+      || bad "8g $(grep MRS_TX /tmp/e2e-bs8g.out)"
+    grep -q "^MRS_UNDRIVABLE \[\]" /tmp/e2e-bs8g.out \
+      && ok "8g .mrs 不再被算作「派生不了」" || bad "8g $(grep MRS_UNDRIVABLE /tmp/e2e-bs8g.out)"
+    reload
+    [[ "$(q mrsonly.example)" == "$E2E_SIP" ]] \
+      && ok "8g **gfw 模式: .mrs 里的精确域名进网关**" || bad "8g → $(q mrsonly.example)"
+    [[ "$(q deep.mrssuf.example)" == "$E2E_SIP" ]] \
+      && ok "8g gfw 模式: .mrs 里 +. 后缀域名的子域也进网关" || bad "8g → $(q deep.mrssuf.example)"
+    [[ "$(q notinmrs.example)" == "$UP" ]] \
+      && ok "8g 不在 .mrs 里的海外域名仍走真实解析" || bad "8g → $(q notinmrs.example)"
+  else
+    bad "8g 内核造不出 .mrs, 这条没验到"
+  fi
+  rm -f /tmp/e2e-mrs-src.txt
   bash /usr/local/bin/pdg hijack-mode all >/dev/null 2>&1; reload
 else
   bad "8e 规则集加入失败: $(grep ADD_RS /tmp/e2e-bs8e.out)"

@@ -2385,7 +2385,7 @@ def refresh_rulesets():
         # 在任何装了 .mrs 规则集的机器上**每次都报失败**。只进事务 warnings。
         warns = list(failed)
         if undrivable:
-            warns.append(".mrs 规则集无法派生劫持表(gfw 模式下不会命中): "
+            warns.append("读不出域名, 没能生成劫持表(gfw 模式下不会命中): "
                          + "、".join(str(x) for x in undrivable[:4]))
         # model 不变, 但仍走一遍派生渲染: 规则集进不了 mihomo 运行配置(dropped)这类问题要在
         # **候选阶段**就被挡下, 与 _mihomo_derive 同一判据; 文件真坏则由重启观察期兜住。
@@ -2569,14 +2569,87 @@ def start_update():
 # .mrs 是 mihomo 的二进制格式, 域名清单在网关侧展不开 —— **派生不了**, 只能如实告诉用户。
 RULESET_HIJACK_MAX = 200000        # 上限: 超了就截断并明说, 不静默丢
 
+# mihomo 文本规则集的域名写法 → mosdns 域名集写法。
+#   +.x.com  = x.com 及其子域            → domain:x.com
+#   .x.com   = 同上(等价写法)             → domain:x.com
+#   *.x.com  = 只匹配一级子域, mosdns 没有等价写法 → 放宽成 domain:x.com
+#              放宽的方向是安全的: 多劫持一点只是让流量进 mihomo, 出口仍由 mihomo 的规则决定
+#   x.com    = 精确匹配                   → full:x.com
+def _mihomo_domain_to_mosdns(line):
+    d = line.strip().lower()
+    if not d or d.startswith("#"):
+        return None
+    if d.startswith("+."):
+        d, pfx = d[2:], "domain:"
+    elif d.startswith("*."):
+        d, pfx = d[2:], "domain:"
+    elif d.startswith("."):
+        d, pfx = d[1:], "domain:"
+    else:
+        pfx = "full:"
+    d = d.strip(".")
+    if not d or not re.match(r"^[a-z0-9_.*-]+$", d):
+        return None
+    return pfx + d
+
+
+def _mrs_domains(blob, behavior, timeout=60):
+    """用 mihomo 自己把 .mrs 反向导出成域名清单。返回 (mosdns 行, 成不成)。
+
+    .mrs 是 mihomo 的二进制规则集(succinct trie + zstd), 自己解析等于把内核的数据结构抄一遍;
+    但内核带的 `convert-ruleset <behavior> mrs <in> <out>` 正好是反方向 —— 输入 .mrs, 输出
+    文本域名清单(实测 8.9KB / 1042 条约 12ms)。用它就不必另写一套解码, 也不会跟内核版本漂移。
+
+    behavior=ipcidr 的 .mrs 里本来就没有域名(导出的是 CIDR), 那不算"派生失败" —— 与文本
+    规则集里的 ip_cidr 一样跳过就好, 否则会天天报一个永远修不好的告警。
+    """
+    exe = shutil.which(MIHOMO_BIN) or "/usr/local/bin/mihomo"
+    if not os.access(exe, os.X_OK):
+        return [], False
+    d = tempfile.mkdtemp(prefix="pdgmrs.")
+    try:
+        src, dst = os.path.join(d, "in.mrs"), os.path.join(d, "out.txt")
+        with open(src, "wb") as f:
+            f.write(blob)
+        r = subprocess.run([exe, "convert-ruleset", behavior, "mrs", src, dst],
+                           capture_output=True, timeout=timeout)
+        if r.returncode != 0 or not os.path.exists(dst):
+            return [], False
+        with open(dst, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except Exception:  # noqa: BLE001
+        return [], False
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    if behavior != "domain":
+        return [], True              # ipcidr: 没有域名可派生, 但这不是失败
+    out = []
+    for ln in text.splitlines():
+        got = _mihomo_domain_to_mosdns(ln)
+        if got:
+            out.append(got)
+    return out, True
+
+
 def _ruleset_domain_lines(info, blob=None):
     """一个规则集条目 → mosdns 域名行列表。返回 (行, 能不能派生)。
 
     blob: 本次事务的**候选内容**。加规则集/刷新时文件还没落盘, 必须按候选算 —— 按磁盘上
     那份旧文件算出来的劫持表, 和同一笔事务里要落盘的规则集对不上。"""
     path = info.get("path") or ""
-    if str(info.get("format", "")) in ("mrs", "binary") or path.endswith((".mrs", ".srs")):
-        return [], False
+    if path.endswith(".srs"):
+        return [], False             # sing-box 二进制, mihomo 读不了, 早已在入口被拒
+    if str(info.get("format", "")) in ("mrs", "binary") or path.endswith(".mrs"):
+        if blob is None:
+            try:
+                with open(path, "rb") as f:
+                    blob = f.read()
+            except OSError:
+                return [], False
+        bh = str(info.get("behavior") or "") or (mrs_behavior(blob) or "")
+        if bh not in MRS_BEHAVIORS:
+            return [], False         # 类型都认不出, 不猜
+        return _mrs_domains(blob, bh)
     try:
         if blob is None:
             with open(path, "rb") as f:
@@ -2628,14 +2701,17 @@ def _ruleset_hijack_file(meta, blobs=None):
 
 
 def _undrivable_note(undrivable):
-    """.mrs 派生不了这件事要如实说 —— 否则用户以为规则集在 gfw 模式下也自动生效了。"""
+    """读不出域名的规则集要如实说 —— 否则用户以为 gfw 模式下也自动生效了。
+
+    正常的 .mrs 现在能靠 mihomo 自己反向导出(见 _mrs_domains), 所以进这个名单的只剩真出问题
+    的: 文件坏了、behavior 认不出、或者机器上没有 mihomo 二进制。"""
     if not undrivable:
         return ""
-    return ("\n⚠️ 这些是 mihomo 的 .mrs 二进制规则集, 域名清单在网关侧展不开, "
-            "<b>无法自动派生劫持表</b>: " + "、".join(str(x) for x in undrivable[:4])
+    return ("\n⚠️ 这些规则集读不出域名(文件损坏 / 类型认不出 / 缺 mihomo 二进制), "
+            "<b>没能生成劫持表</b>: " + "、".join(str(x) for x in undrivable[:4])
             + ("…" if len(undrivable) > 4 else "")
-            + "\ngfw 模式下它们的规则不会命中(all 模式不受影响)。需要的话把域名手动写进 "
-              "<code>/etc/mosdns/rules/ruleset_hijack.txt</code>。")
+            + "\ngfw 模式下它们的规则不会命中(all 模式不受影响)。跑 <code>sudo pdg doctor</code> "
+              "看「规则集劫持表」那一项。")
 
 
 # ── 单条规则增删 ──

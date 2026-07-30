@@ -620,8 +620,9 @@ def check_ruleset_hijack():
                 % mode)
     if undrivable:
         return ("warn", "规则集劫持表",
-                "%d 个 .mrs 规则集派生不出域名(二进制格式在网关侧展不开): %s。gfw 模式下它们"
-                "不会命中; 需要的话把域名手写进 %s。"
+                "%d 个规则集读不出域名(文件损坏 / 类型认不出 / 缺 mihomo 二进制): %s。"
+                "gfw 模式下它们的规则不会命中; 重新添加或刷新一次这些规则集试试, "
+                "实在不行把域名手写进 %s。"
                 % (len(undrivable), "、".join(str(x) for x in undrivable[:3]), f))
     return ("ok", "规则集劫持表", "%d 个规则集的域名已同步(gfw 模式下也能命中)" % drivable)
 
