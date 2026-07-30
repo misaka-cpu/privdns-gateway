@@ -3929,11 +3929,24 @@ def handle_cb(chat, mid, data):
         edit(chat, mid, f"✅ 已重启并确认运行: {_core_svc()} + mosdns", OPS_BACK); return
     if data == "updgeo":
         edit(chat, mid, "正在更新 geosite + 规则集…", OPS_BACK)
-        r = sh(["/bin/bash", UPDATE_SCRIPT]); n, rs_failed = refresh_rulesets()
+        r = sh(["/bin/bash", UPDATE_SCRIPT])
+        # 死锁解开: mosdns 缺规则文件就起不来, 而"操作前组件坏了就别动它"那道门又因此拒绝写入
+        # 规则文件 —— 越坏越修不了。用户点这个按钮就是在要求修, 那就按修复类操作重试一次
+        # (repair 只放宽**基线**, "操作前好、操作后坏"照旧整笔回滚)。
+        repaired = False
+        if r.returncode != 0 and "操作前这些硬门就是坏的" in (r.stdout + r.stderr):
+            env = dict(os.environ, PDG_TX_MODE="repair")
+            r = subprocess.run(["/bin/bash", UPDATE_SCRIPT], capture_output=True,
+                               text=True, timeout=180, env=env)
+            repaired = r.returncode == 0
+        n, rs_failed = refresh_rulesets()
         if r.returncode != 0:
             edit(chat, mid, "geosite 更新失败:\n" + (r.stdout + r.stderr)[-300:], OPS_BACK); return
         # 规则集刷新失败必须说出来 —— 否则用户以为规则库是新的, 实际有几条还停在旧版
         msg = f"✅ geosite 已更新; 规则集刷新 {n} 个"
+        if repaired:
+            msg = (f"✅ geosite 已更新; 规则集刷新 {n} 个\n"
+                   "（当时 mosdns 没在运行，按修复模式重跑了一次；建议再看一眼 <b>诊断</b>）")
         if rs_failed:
             msg = (f"⚠️ geosite 已更新; 规则集刷新 {n} 个, 但这些没刷上(仍用上一份好档):\n· "
                    + "\n· ".join(str(x)[:120] for x in rs_failed[:5]))

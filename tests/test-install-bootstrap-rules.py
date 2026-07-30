@@ -64,7 +64,8 @@ try:
         t.commit()
         bad("normal 模式竟然在降级基线上提交了(那道门形同虚设)")
     except tx.TxRefused as e:
-        ok("normal 模式: 降级基线上被拒(%s)" % str(e)[:48])
+        REFUSAL = str(e)
+        ok("normal 模式: 降级基线上被拒(%s)" % REFUSAL[:48])
     except Exception as e:  # noqa: BLE001
         bad("normal 模式抛了别的异常: %s" % type(e).__name__)
 
@@ -210,6 +211,32 @@ else:
             bad("缺文件时 mosdns 竟然没死(rc=%r): %s" % (rc, log[:200]))
     finally:
         shutil.rmtree(d, ignore_errors=True)
+
+# ── 4b. bot 的「更新规则库」必须能解开这个死锁 ─────────────────────────────────
+# 缺规则文件 → mosdns 起不来 → 硬门坏 → normal 模式拒绝写规则文件 → 越坏越修不了。
+# doctor 让用户去点「更新规则库」, 那这个按钮就必须真的修得动。
+print()
+print("── 4b. bot「更新规则库」能不能修得动 ──")
+botsrc = (ROOT / "deploy/bot/pdg-bot.py").read_text(encoding="utf-8")
+branch = botsrc.split('if data == "updgeo":', 1)[-1].split('if data.startswith("delx:")', 1)[0]
+trig = re.search(r'if r\.returncode != 0 and "([^"]+)" in \(r\.stdout \+ r\.stderr\)', branch)
+if not trig:
+    bad("bot 没有按拒绝理由重试的分支 —— 那个按钮修不动这种机器")
+elif "REFUSAL" not in dir() and not globals().get("REFUSAL"):
+    bad("拿不到 pdgtx 的真实拒绝文案, 无从核对 bot 的触发条件")
+elif trig.group(1) in globals()["REFUSAL"]:
+    ok("bot 重试的触发词确实出现在 pdgtx 真实抛出的拒绝里(不是猜的字面量)")
+else:
+    bad("bot 等的是 %r, 但 pdgtx 实际说的是 %r —— 永远触发不了"
+        % (trig.group(1), globals()["REFUSAL"][:60]))
+if re.search(r'PDG_TX_MODE="repair"', branch):
+    ok("重试时用 repair 模式")
+else:
+    bad("重试没用 repair 模式")
+if "当时 mosdns 没在运行" in branch and "诊断" in branch:
+    ok("并如实告诉用户走的是修复模式, 让他再看一眼诊断")
+else:
+    bad("修复模式重试后没如实告知")
 
 # ── 5. 降级之后要有人一直提醒(装机那一行黄字滚过去就没了)────────────────────
 print()
