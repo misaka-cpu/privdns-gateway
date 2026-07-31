@@ -229,26 +229,31 @@ if _p.returncode == 0 and os.path.isfile(os.path.join(IOSROOT, "iosstate.py")):
 else:
     bad("iOS 形态安装失败: %s" % (_p.stderr or "")[-300:])
 purge_pyc(IOSROOT)
+# 探针跑在**另一个进程**里, 所以它自己的沙箱只能自己收 —— 父进程的 finally 管不到它。
+# 这类"每跑一次多一个 /tmp 目录"的泄漏不会让测试变红, 只会在几百次之后变成磁盘问题。
 IOS_PROBE = "\n".join([
-    "import json, os, sys, tempfile",
+    "import json, os, shutil, sys, tempfile",
     "root = tempfile.mkdtemp(prefix='cleanroot-fs.')",
-    "os.makedirs(root + '/etc/privdns-gateway'); os.makedirs(root + '/run')",
-    "os.environ['PDG_TX_FSROOT'] = root",
-    "os.environ['PDG_LOCKFILE'] = root + '/run/privdns-gateway.lock'",
-    "import iosstate, iosprofile",
-    "tmpl = os.path.join(%r, 'pdg-dot.mobileconfig.tmpl')" % IOSROOT,
-    "meta = root + '/etc/privdns-gateway/ios-profile.json'",
-    "art = root + '/var/lib/privdns-gateway/ios-profile'",
-    "m, lv, why, data, ch = iosstate.generate('dot.example.com', '203.0.113.10', (), b'',",
-    "                                         False, tmpl, meta, art, True, False)",
-    "st, detail = iosstate.artifact_health(m, 'current', art)",
-    "blob = iosstate.verified_artifact(m, 'current', art)",
-    "print('GEN:' + json.dumps({'rev': m['current']['revision'], 'health': st,",
-    "                           'bytes': len(blob), 'same': blob == data}))",
-    "outs = [n + '=' + (getattr(sys.modules[n], '__file__', '') or '')",
-    "        for n in ('iosstate', 'iosprofile', 'pdgtx')",
-    "        if not (getattr(sys.modules[n], '__file__', '') or '').startswith(%r)]" % IOSROOT,
-    "print('OUTSIDE:' + json.dumps(outs, ensure_ascii=False))",
+    "try:",
+    "    os.makedirs(root + '/etc/privdns-gateway'); os.makedirs(root + '/run')",
+    "    os.environ['PDG_TX_FSROOT'] = root",
+    "    os.environ['PDG_LOCKFILE'] = root + '/run/privdns-gateway.lock'",
+    "    import iosstate, iosprofile",
+    "    tmpl = os.path.join(%r, 'pdg-dot.mobileconfig.tmpl')" % IOSROOT,
+    "    meta = root + '/etc/privdns-gateway/ios-profile.json'",
+    "    art = root + '/var/lib/privdns-gateway/ios-profile'",
+    "    m, lv, why, data, ch = iosstate.generate('dot.example.com', '203.0.113.10', (), b'',",
+    "                                             False, tmpl, meta, art, True, False)",
+    "    st, detail = iosstate.artifact_health(m, 'current', art)",
+    "    blob = iosstate.verified_artifact(m, 'current', art)",
+    "    print('GEN:' + json.dumps({'rev': m['current']['revision'], 'health': st,",
+    "                               'bytes': len(blob), 'same': blob == data}))",
+    "    outs = [n + '=' + (getattr(sys.modules[n], '__file__', '') or '')",
+    "            for n in ('iosstate', 'iosprofile', 'pdgtx')",
+    "            if not (getattr(sys.modules[n], '__file__', '') or '').startswith(%r)]" % IOSROOT,
+    "    print('OUTSIDE:' + json.dumps(outs, ensure_ascii=False))",
+    "finally:",
+    "    shutil.rmtree(root, ignore_errors=True)",
 ])
 rc, out = run_isolated(IOSROOT, IOS_PROBE)
 if rc != 0:
