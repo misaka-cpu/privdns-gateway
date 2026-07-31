@@ -26,6 +26,7 @@ import fcntl
 import hashlib
 import json
 import os
+import plistlib
 import re
 import shutil
 import socket
@@ -113,7 +114,16 @@ _STATIC = {
     # iOS 描述文件的身份与修订记录。它是**用户持久数据**: 丢了会在下次生成时造出第二个身份,
     # 用户手机上那份描述文件从此再也无法被更新, 而界面上什么都不会报错。所以它必须能跟着
     # 备份/快照一起恢复 —— 恢复走事务, 事务只认白名单里的目标, 于是这一行是必需的。
-    "ios_profile":    ("/etc/privdns-gateway/ios-profile.json", 0o600, False, ("json_any",)),
+    # iOS 描述文件生命周期的三件套。名字必须分得清: 一个含义模糊的目标只恢复 metadata,
+    # 恢复出来的机器就会是"记录说第 2 版、盘上躺着第 3 版"这种自相矛盾的状态。
+    # state 是身份与修订记录(用户持久数据); current/previous 是发给手机的产物本身 ——
+    # previous 那一版用的 CA 只在产物里有正文, 元数据里只有指纹, 所以它**丢了就没了**,
+    # 必须跟着备份走。
+    "ios_profile_state":    ("/etc/privdns-gateway/ios-profile.json", 0o600, False, ("json_any",)),
+    "ios_profile_current":  ("/var/lib/privdns-gateway/ios-profile/current.mobileconfig",
+                             0o644, False, ("mobileconfig",)),
+    "ios_profile_previous": ("/var/lib/privdns-gateway/ios-profile/previous.mobileconfig",
+                             0o644, False, ("mobileconfig",)),
     "mitm_hijack":    ("/etc/mosdns/rules/mitm_hijack.txt", 0o644, False, ("mosdns_lines",)),
     "sysctl_tfo":     ("/etc/sysctl.d/99-pdg-tfo.conf", 0o644, False, ("kv_env",)),
     "dot_marker":     ("/opt/pdg-bot/dot-domain", 0o644, False, ("hostname_line",)),
@@ -174,7 +184,12 @@ _TARGET_ACTIONS = {
     "rescue_state": (),
     # iOS 描述文件的身份/修订记录。没有任何运行中的服务读它 —— 它只在用户点"生成描述文件"
     # 时被读写。恢复它不该顺手重启 DNS 或内核。
-    "ios_profile": (),
+    # 纯记录与纯产物: 没有任何运行中的服务读它们。动作**显式写成空**而不是不写 ——
+    # actions_for_targets 对没登记的目标是 fail-closed, 靠"遗漏"表达"不需要动作"会在
+    # 恢复时变成一次拒绝, 而那看起来像是恢复功能坏了。
+    "ios_profile_state": (),
+    "ios_profile_current": (),
+    "ios_profile_previous": (),
 }
 _PREFIX_ACTIONS = (("mosdns_rule:", ("restart:mosdns",)),
                    ("ruleset:", ("restart:mihomo",)),
@@ -685,6 +700,28 @@ def _v_pem_key(path, data, ctx):
         shutil.rmtree(d, ignore_errors=True)
 
 
+def _v_mobileconfig(path, data, ctx):
+    """iOS 描述文件产物。只做**结构**校验, 不判它属于哪一版 —— 那是 iosstate 的事
+    (它有元数据可比对, 事务核心没有)。这里挡住的是"恢复出来的根本不是一份描述文件"。"""
+    if b"PRIVATE KEY" in data:
+        return False, "描述文件里出现私钥标记"
+    try:
+        doc = plistlib.loads(data)
+    except Exception as e:  # noqa: BLE001
+        return False, "不是合法 plist: %s" % type(e).__name__
+    if not isinstance(doc, dict) or doc.get("PayloadType") != "Configuration":
+        return False, "顶层不是 Configuration 描述文件"
+    if doc.get("PayloadVersion") != 1:
+        return False, "PayloadVersion 必须是 Apple 规定的 1"
+    if not str(doc.get("PayloadIdentifier") or "").strip() \
+            or not str(doc.get("PayloadUUID") or "").strip():
+        return False, "缺 PayloadIdentifier / PayloadUUID"
+    if not [x for x in (doc.get("PayloadContent") or []) if isinstance(x, dict)
+            and x.get("PayloadType") == "com.apple.dnsSettings.managed"]:
+        return False, "没有 DNS payload"
+    return True, ""
+
+
 def _v_systemd_unit(path, data, ctx):
     text = data.decode("utf-8", "replace")
     if "[Unit]" not in text or not ("[Service]" in text or "[Timer]" in text):
@@ -839,6 +876,7 @@ VALIDATORS = {
     "nft_check": _v_nft_check, "mosdns_lines": _v_mosdns_lines, "mosdns_probe": _v_mosdns_probe,
     "ruleset_format": _v_ruleset_format, "kv_env": _v_kv_env, "hostname_line": _v_hostname_line,
     "pem_cert": _v_pem_cert, "pem_key": _v_pem_key, "systemd_unit": _v_systemd_unit,
+    "mobileconfig": _v_mobileconfig,
 }
 # 只做行级格式校验的目标: 报告里要标出来, 不能说成完整配置强校验
 LINE_LEVEL_ONLY = ("mosdns_lines", "kv_env", "hostname_line")

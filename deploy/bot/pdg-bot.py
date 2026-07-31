@@ -3172,8 +3172,7 @@ def _ios_status_text():
     cur = meta["current"]
     ssids = cur["inputs"].get("ssids") or []
     try:
-        lv, why = iosstate.classify(meta, _ios_inputs(ssids),
-                                    iosstate.read_artifact("current"))
+        lv, why = iosstate.classify(meta, _ios_inputs(ssids))
     except Exception as e:  # noqa: BLE001
         lv, why = iosstate.REQUIRED, ["读取当前网关配置失败: %s" % e]
     lines = ["📱 <b>iOS 描述文件</b>", "",
@@ -3184,10 +3183,17 @@ def _ios_status_text():
         lines.append("强制直连 Wi-Fi: %s" % ", ".join(ssids))
     if cur["inputs"].get("wloc_enabled"):
         lines.append("含根证书: 是(指纹 %s…)" % cur["inputs"]["wloc_ca_sha256"][:16])
-    lines += ["", "状态: <b>%s</b>" % iosstate.LEVEL_LABEL[lv]]
+    lines += ["", "配置变化: <b>%s</b>" % iosstate.LEVEL_LABEL[lv]]
     lines += ["• " + r for r in why]
     if meta.get("previous"):
         lines.append("上一版: 第 %d 版(可对比 / 可单独取回)" % meta["previous"]["revision"])
+    # 服务端产物健康是**另一件事**: 上面那行说的是手机上那份要不要换, 这里说的是服务器上
+    # 这个文件能不能发。混成一句会让用户去动手机, 而真正坏掉的服务端文件被温和地盖过去。
+    health = iosstate.health_summary(meta, None)
+    if health:
+        lines.append("")
+        for which, state, detail in health:
+            lines.append("%s(%s)" % (iosstate.HEALTH_LABEL[state], _esc(detail)))
     lines += ["", IOS_UNKNOWN]
     return "\n".join(lines)
 
@@ -3231,6 +3237,9 @@ def _ios_send(chat, ssids=(), legacy=False):
     """生成并发送, 返回给用户看的一段话。发送成功才记 sent_at —— 记的是"我们发了",
     不是"手机上装了"。"""
     meta, lv, why, data, changed = _ios_generate(ssids, legacy)
+    # 发出去的必须是**盘上那一份并且校验通过**的字节, 不是 generate 手里的内存副本:
+    # 两者理应相同, 而"理应相同"正是这类问题最爱藏身的地方。
+    data = iosstate.verified_artifact(meta, "current")
     cur = meta["current"]
     cap = ["📱 iOS/iPadOS 私密DNS 描述文件(第 %d 版)" % cur["revision"],
            "DoT: %s" % cur["inputs"]["dot_host"]]
@@ -3249,9 +3258,14 @@ def _ios_send(chat, ssids=(), legacy=False):
 
 # ── 配置备份 / 恢复 ──
 IOS_META = "/etc/privdns-gateway/ios-profile.json"   # iOS 描述文件身份/修订记录(用户持久数据)
-# iOS 记录一并进备份: 它丢了不会报错, 只会在下次生成时悄悄换成另一个身份 —— 那时用户手机上
-# 那份描述文件已经再也收不到更新了。文件不存在(Android / 还没启用)时 backup_blob 自动跳过。
-BACKUP_FILES = [SB, MOSDNS_CONF, MOSDNS_DIRECT, MOSDNS_HIJACK, RS_META, IOS_META]
+IOS_ART_DIR = "/var/lib/privdns-gateway/ios-profile"
+IOS_CURRENT = IOS_ART_DIR + "/current.mobileconfig"
+IOS_PREVIOUS = IOS_ART_DIR + "/previous.mobileconfig"
+# 记录**和产物**一起进备份。只带记录是不够的: 恢复回来会变成"记录说第 2 版、盘上躺着第 3 版";
+# 更要命的是 previous —— 那一版用的根证书只在产物里有正文, 元数据里只有指纹, 所以它丢了就
+# 真的没了, 谁也重建不出来。文件不存在(Android / 还没启用)时 backup_blob 自动跳过。
+BACKUP_FILES = [SB, MOSDNS_CONF, MOSDNS_DIRECT, MOSDNS_HIJACK, RS_META,
+                IOS_META, IOS_CURRENT, IOS_PREVIOUS]
 # 受管配置的解包/白名单/限额/成员映射搬进了 cfgrestore —— Bot(收 Telegram 备份包)与救援平面
 # (从本机快照恢复)做的是同一件事, 两边各写一份的下场是: 白名单一处加了新目标另一处没加, 于是
 # "恢复成功"的机器少一份配置。这里保留原来的模块级名字, 老调用与既有测试不受影响。
@@ -3488,6 +3502,51 @@ def _reapply_explicit_proxy(mos_bytes, cur_bytes):
         shutil.rmtree(d, ignore_errors=True)
 
 
+
+def _stage_ios_profile(t, tmp):
+    """把备份里的 iOS 描述文件生命周期挂进这笔事务。返回 (恢复了什么, 提示或 None)。
+
+    旧格式备份(只有记录、没有产物)必须被**认出来**并如实说明, 不能伪装成完整恢复:
+      · previous 那一版用的根证书只在产物里有正文, 元数据里只有指纹 —— 它丢了就真的没了,
+        谁也重建不出来。所以记录里的 previous 一并清掉, 不留一个点开就报错的"上一版";
+      · current 保留记录。它**有可能**按记录逐字节复原(条件见 iosstate.repair_current),
+        但那是恢复之后另做的事, 这里不越权替用户决定。
+    """
+    state_src = os.path.join(tmp, "etc/privdns-gateway/ios-profile.json")
+    if not os.path.isfile(state_src):
+        return None, None                       # 备份里没有 → 不动现网的任何一份
+    try:
+        with open(state_src, "rb") as f:
+            raw = f.read()
+        state = json.loads(raw.decode("utf-8"))
+    except Exception:  # noqa: BLE001
+        return None, "⚠️ 备份里的 iOS 描述文件记录无法解析, 已跳过(现网那份未被改动)"
+    cur_src = os.path.join(tmp, "var/lib/privdns-gateway/ios-profile/current.mobileconfig")
+    prev_src = os.path.join(tmp, "var/lib/privdns-gateway/ios-profile/previous.mobileconfig")
+    have_cur, have_prev = os.path.isfile(cur_src), os.path.isfile(prev_src)
+    note = None
+    if state.get("previous") and not have_prev:
+        state = dict(state, previous=None)
+        raw = json.dumps(state, ensure_ascii=False, indent=2,
+                         sort_keys=True).encode("utf-8") + b"\n"
+        note = ("ℹ️ 这份备份是旧格式(只带记录、不带描述文件本体): 上一版已标记为不可用 —— "
+                "它用的根证书只在文件里有正文, 无法重建。")
+    if state.get("current") and not have_cur:
+        note = ((note + " ") if note else "ℹ️ 这份备份是旧格式(只带记录、不带描述文件本体): ") + \
+               "当前版本的文件不在备份里, 请到「📱 iOS 描述文件」页确认服务端状态。"
+    t.stage("ios_profile_state", raw)
+    what = ["身份/修订记录"]
+    if have_cur:
+        with open(cur_src, "rb") as f:
+            t.stage("ios_profile_current", f.read())
+        what.append("当前版本")
+    if have_prev:
+        with open(prev_src, "rb") as f:
+            t.stage("ios_profile_previous", f.read())
+        what.append("上一版")
+    return "iOS 描述文件(" + " + ".join(what) + ")", note
+
+
 def _restore_commit(tmp):
     """把解包出来的内容组装成候选并提交一笔事务。返回 (ok, msg)。"""
     newsb = os.path.join(tmp, "etc/sing-box/config.json")
@@ -3580,6 +3639,14 @@ def _restore_commit(tmp):
             if hj_undrivable:
                 notes.append("ℹ️ .mrs 规则集无法派生劫持表, gfw 模式下不会命中: "
                              + "、".join(str(x) for x in hj_undrivable[:4]))
+        # iOS 描述文件三件套(记录 + 两份产物)进**同一笔**事务: 要么整组换过去, 要么一个都
+        # 不动。分开恢复会造出"记录说第 2 版、盘上躺着第 3 版"这种自相矛盾的状态, 而那之后
+        # 每一次判定都建立在一个不成立的前提上 —— 界面上却什么都不会报错。
+        ios_done, ios_note = _stage_ios_profile(t, tmp)
+        if ios_done:
+            restored.append(ios_done)
+        if ios_note:
+            notes.append(ios_note)
         t.derive("mihomo_cfg", _mihomo_derive)
         # 服务动作由**本次真正落盘的目标**推导, 与救援平面共用同一份映射(pdgtx.actions_for_targets)
         # —— 两处各写一套 if/else 迟早会漂移成"同样的恢复, 一边重启一边不重启"。
@@ -3919,6 +3986,11 @@ def handle_cb(chat, mid, data):
             prev, cur = meta.get("previous"), meta.get("current")
             if not (prev and cur):
                 edit(chat, mid, "还没有上一版可对比。", _ios_kb()); return
+            for _w in ("current", "previous"):
+                _st, _dt = iosstate.artifact_health(meta, _w, None)
+                if _st != iosstate.HEALTHY:
+                    edit(chat, mid, "%s\n%s" % (iosstate.HEALTH_LABEL[_st], _esc(_dt)),
+                         _ios_kb()); return
             d = iosstate.diff_fields(prev["inputs"], cur["inputs"])
             lines = ["🔍 <b>第 %d 版 → 第 %d 版</b>" % (prev["revision"], cur["revision"]), ""]
             for k, lv, ov, nv in d:
@@ -3936,9 +4008,9 @@ def handle_cb(chat, mid, data):
         try:
             _ios_mods()
             meta = iosstate.load() or {}
-            blob = iosstate.read_artifact("previous")
-            if not (meta.get("previous") and blob):
-                edit(chat, mid, "上一版的文件已不在服务器上, 无法取回。", _ios_kb()); return
+            if not meta.get("previous"):
+                edit(chat, mid, "还没有上一版。", _ios_kb()); return
+            blob = iosstate.verified_artifact(meta, "previous")
             send_document(chat, "PrivDNS-Gateway-prev.mobileconfig", blob,
                           "⏪ 上一版(第 %d 版)。这只是把旧文件再给你一次 —— 服务器记录的当前版本"
                           "不会因此回退。\n%s" % (meta["previous"]["revision"], IOS_INSTALL_HOWTO))

@@ -122,13 +122,17 @@ old_meta = open(meta2, "rb").read()
 st2.generate("dot.v2.example", "203.0.113.10", (), b"", False, TMPL, meta2, art2, True, False)
 with open(meta2, "wb") as f:                      # 模拟"记录被回滚, 产物还是新的"
     f.write(old_meta)
+# 错位先被**如实检出**(不是"建议更新"那种关于手机的措辞), 然后按记录逐字节复原。
+st_before, detail = st2.artifact_health(json.load(open(meta2, encoding="utf-8")), "current", art2)
 m, lv, why, data, changed = st2.generate("dot.example.com", "203.0.113.10", (), b"", False,
                                          TMPL, meta2, art2, True, False)
-if lv == "recommended" and any("重建" in r for r in why) and m["current"]["revision"] == 1 \
-        and st2.read_artifact("current", art2) == data:
-    ok("回滚造成的产物/记录错位 → 按记录重建并给「建议更新」, 不谎称被篡改")
+st_after, _ = st2.artifact_health(m, "current", art2)
+if st_before == "state_mismatch" and lv == "none" and st_after == "healthy" \
+        and m["current"]["revision"] == 1 and st2.read_artifact("current", art2) == data:
+    ok("回滚错位: 先判 state_mismatch(与配置变化等级无关), 再按记录逐字节复原, revision 不变")
 else:
-    bad("回滚错位的处理不对: lv=%s rev=%s why=%s" % (lv, m["current"].get("revision"), why))
+    bad("回滚错位的处理不对: 前=%s 后=%s lv=%s rev=%s" % (st_before, st_after, lv,
+                                                        m["current"].get("revision")))
 
 # ── 3. Bot 备份 → 恢复 ────────────────────────────────────────────────────
 # Bot 从 Telegram 收备份包、救援平面从本机快照恢复, 两条路共用 cfgrestore 的成员白名单。
@@ -236,6 +240,63 @@ if not changed and m["instance_id"] == id3 and m["current"]["revision"] == 1:
     ok("切回 iOS 后再生成: 同一身份、同一版本, 不是「又发一个新的」")
 else:
     bad("切回来之后生成不对: changed=%s rev=%s" % (changed, m["current"].get("revision")))
+
+# ── 4b. 平台来回切: **产物**也不许变, 而且 Android 上不许因为它们冒出 iOS 界面 ──────
+root5, st5 = box()
+meta5 = root5 + "/etc/privdns-gateway/ios-profile.json"
+art5 = root5 + "/var/lib/privdns-gateway/ios-profile"
+st5.generate("dot.v2.example", "203.0.113.10", (), b"", False, TMPL, meta5, art5, True, False)
+trio_before = tuple(open(p, "rb").read() for p in
+                    (meta5, art5 + "/current.mobileconfig", art5 + "/previous.mobileconfig"))
+os.makedirs(root5 + "/opt/pdg-bot", exist_ok=True)
+sh("source lib/modules.sh; pdg_install_runtime_modules '%s' '%s/opt/pdg-bot' ios" % (ROOT, root5))
+_ios_only = set(l.split()[1] for l in
+                sh("source lib/modules.sh; pdg_platform_modules ios").stdout.splitlines() if l.strip()) \
+    - set(l.split()[1] for l in
+          sh("source lib/modules.sh; pdg_platform_modules android").stdout.splitlines() if l.strip())
+for f in _ios_only:                                  # Android 清理: 只删 iOS 专属程序文件
+    try:
+        os.unlink(root5 + "/opt/pdg-bot/" + f)
+    except OSError:
+        pass
+sh("source lib/modules.sh; pdg_install_runtime_modules '%s' '%s/opt/pdg-bot' ios" % (ROOT, root5))
+trio_after = tuple(open(p, "rb").read() for p in
+                   (meta5, art5 + "/current.mobileconfig", art5 + "/previous.mobileconfig"))
+if trio_after == trio_before:
+    ok("iOS → Android → iOS 切一圈: 记录**和两份产物**都逐字节没动")
+else:
+    bad("平台来回切之后产物变了")
+for which in ("current", "previous"):
+    _st, _d = st5.artifact_health(json.load(open(meta5, encoding="utf-8")), which, art5)
+    if _st == "healthy":
+        ok("切回 iOS 后 %s 仍然健康(%s)" % (which, _d))
+    else:
+        bad("切回来之后 %s 不健康: %s %s" % (which, _st, _d))
+
+# Android 上这些持久文件**不该**让 iOS 界面/告警冒出来: 它们只是躺在盘上的用户数据。
+sys.path.insert(0, BOTDIR)
+for _m in ("checks",):
+    sys.modules.pop(_m, None)
+import importlib.util as _u2  # noqa: E402
+_sp = _u2.spec_from_file_location("pdg_bot_plat", os.path.join(BOTDIR, "pdg-bot.py"))
+_b2 = _u2.module_from_spec(_sp)
+_sp.loader.exec_module(_b2)
+_b2._platform = lambda: "android"
+_b2._dot_host = lambda: "dot.example.com"
+_title, _kb = _b2._nav("client")
+_cbs = [b.get("callback_data") for row in _kb["inline_keyboard"] for b in row]
+if "ios" not in _cbs and "描述文件" not in _title:
+    ok("Android: 盘上留着记录与产物, 客户端菜单里照样没有 iOS 入口")
+else:
+    bad("Android 因为这些文件冒出了 iOS 入口: %r" % _cbs)
+import checks  # noqa: E402
+checks._platform = lambda: "android"
+checks.MITM_CONFIG = root5 + "/etc/privdns-gateway/mitm.json"
+_res = checks.check_mitm_plugins() if hasattr(checks, "check_mitm_plugins") else ("info", "", "")
+if _res[0] in ("info", "ok"):
+    ok("Android: doctor 的 MITM 检查不因这些文件报警(%s)" % _res[0])
+else:
+    bad("Android doctor 报警了: %r" % (_res,))
 
 # ── 5. 只有明确放弃身份的动作才会删掉记录 ────────────────────────────────
 root4, st4 = box()

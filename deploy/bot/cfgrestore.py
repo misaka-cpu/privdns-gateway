@@ -30,7 +30,10 @@ MEMBER_TARGET = {
     "etc/mosdns/rules/custom_direct.txt": "mosdns_rule:custom_direct.txt",
     "etc/mosdns/rules/custom_hijack.txt": "mosdns_rule:custom_hijack.txt",
     "opt/pdg-bot/rulesets.json": "rs_meta",
-    "etc/privdns-gateway/ios-profile.json": "ios_profile",
+    # iOS 描述文件生命周期三件套。缺任何一件, 恢复出来的都是自相矛盾的状态。
+    "etc/privdns-gateway/ios-profile.json": "ios_profile_state",
+    "var/lib/privdns-gateway/ios-profile/current.mobileconfig": "ios_profile_current",
+    "var/lib/privdns-gateway/ios-profile/previous.mobileconfig": "ios_profile_previous",
 }
 # 兼容 bot 里既有的名字(它只用来判成员是否在白名单内)
 RESTORE_MAP = MEMBER_TARGET

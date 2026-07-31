@@ -214,6 +214,60 @@ else:
     else:
         bad("sys.path 里有仓库路径: %r" % (repo_paths or paths))
 
+# ══ 3b. iOS 形态: 描述文件生命周期也要能在 clean-root 里独立跑起来 ═════════
+# 上面那一轮装的是通用集, 里面根本没有 iosstate/iosprofile。iOS 机器上真正要跑的是这一套,
+# 而它还要读安装目录里的描述文件模板 —— 模板取不到时若回落到仓库, 真机上仓库不在就崩了。
+print()
+print("── 3b. clean-root (iOS 形态) ──")
+IOSROOT = tempfile.mkdtemp(prefix="cleanroot-ios.")
+_p = subprocess.run(
+    ["bash", "-c", 'set -euo pipefail\nsource "%s/lib/modules.sh"\n'
+                   'pdg_install_runtime_modules "%s" "%s" ios\n' % (ROOT, ROOT, IOSROOT)],
+    capture_output=True, text=True, timeout=300)
+if _p.returncode == 0 and os.path.isfile(os.path.join(IOSROOT, "iosstate.py")):
+    ok("iOS 形态安装成功(多出 iosprofile / iosstate / 描述文件模板)")
+else:
+    bad("iOS 形态安装失败: %s" % (_p.stderr or "")[-300:])
+purge_pyc(IOSROOT)
+IOS_PROBE = "\n".join([
+    "import json, os, sys, tempfile",
+    "root = tempfile.mkdtemp(prefix='cleanroot-fs.')",
+    "os.makedirs(root + '/etc/privdns-gateway'); os.makedirs(root + '/run')",
+    "os.environ['PDG_TX_FSROOT'] = root",
+    "os.environ['PDG_LOCKFILE'] = root + '/run/privdns-gateway.lock'",
+    "import iosstate, iosprofile",
+    "tmpl = os.path.join(%r, 'pdg-dot.mobileconfig.tmpl')" % IOSROOT,
+    "meta = root + '/etc/privdns-gateway/ios-profile.json'",
+    "art = root + '/var/lib/privdns-gateway/ios-profile'",
+    "m, lv, why, data, ch = iosstate.generate('dot.example.com', '203.0.113.10', (), b'',",
+    "                                         False, tmpl, meta, art, True, False)",
+    "st, detail = iosstate.artifact_health(m, 'current', art)",
+    "blob = iosstate.verified_artifact(m, 'current', art)",
+    "print('GEN:' + json.dumps({'rev': m['current']['revision'], 'health': st,",
+    "                           'bytes': len(blob), 'same': blob == data}))",
+    "outs = [n + '=' + (getattr(sys.modules[n], '__file__', '') or '')",
+    "        for n in ('iosstate', 'iosprofile', 'pdgtx')",
+    "        if not (getattr(sys.modules[n], '__file__', '') or '').startswith(%r)]" % IOSROOT,
+    "print('OUTSIDE:' + json.dumps(outs, ensure_ascii=False))",
+])
+rc, out = run_isolated(IOSROOT, IOS_PROBE)
+if rc != 0:
+    bad("iOS clean-root 探针失败 rc=%s:\n%s" % (rc, out[-600:]))
+else:
+    gen = [l for l in out.splitlines() if l.startswith("GEN:")]
+    info = json.loads(gen[0][4:]) if gen else {}
+    if info.get("rev") == 1 and info.get("health") == "healthy" and info.get("same"):
+        ok("clean-root 里生成 + 完整性校验 + 取回全通(第 %d 版, %d 字节)"
+           % (info["rev"], info["bytes"]))
+    else:
+        bad("clean-root 里的生成结果不对: %r" % info)
+    outside = [l for l in out.splitlines() if l.startswith("OUTSIDE:")]
+    if outside and json.loads(outside[0][len("OUTSIDE:"):]) == []:
+        ok("iosstate / iosprofile / pdgtx 全部来自安装根, 没有仓库源码兜底")
+    else:
+        bad("有模块来自安装根之外: %s" % (outside[0][:300] if outside else "?"))
+shutil.rmtree(IOSROOT, ignore_errors=True)
+
 # 两个 CLI 脚本从**已安装路径**验证: 能被解释器加载、且加载到的是安装根里那一份
 for _cli in ("nftmerge.py", "doctor.py"):
     rc_c, out_c = run_isolated(FRESH, textwrap.dedent('''

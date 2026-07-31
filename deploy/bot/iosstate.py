@@ -212,12 +212,126 @@ def read_artifact(which, root=None):
         return None
 
 
-# ── 三档判定 ────────────────────────────────────────────────────────────────
-def classify(meta, inputs, artifact=None):
-    """(等级, [理由]) —— Bot 与 CLI 唯一的判定入口。
+# ── 服务端产物健康状态 ──────────────────────────────────────────────────────
+# 这和"配置变化等级"是**两件事**, 必须分开表达:
+#   · 配置变化等级说的是"网关配置变了, 手机上那份可能该换了" —— 关于设备;
+#   · 产物健康状态说的是"服务器上这个文件能不能用" —— 关于服务端。
+# 把后者混进前者(比如把"文件对不上"说成"建议更新")会同时坏两件事: 用户以为该去动手机,
+# 而真正坏掉的服务端文件反倒被一句温和的提示盖过去了。
+HEALTHY, MISSING, CORRUPT, STATE_MISMATCH = "healthy", "missing", "corrupt", "state_mismatch"
+HEALTH_LABEL = {
+    HEALTHY: "✅ 服务端描述文件完整",
+    MISSING: "⚠️ 服务端描述文件缺失, 需要先修复后才能发送",
+    CORRUPT: "❌ 描述文件与生命周期记录不一致, 已拒绝发送",
+    STATE_MISMATCH: "❌ 描述文件与生命周期记录不一致, 已拒绝发送",
+}
 
-    artifact 是当前产物字节(None = 读不到)。产物本身**不参与** digest: 它可以由元数据 +
-    当前配置确定性重建, 所以"文件不见了"先尝试重建, 重建得出同样的字节就不算变化。
+
+class IntegrityError(StateError):
+    """产物不可用。继承 StateError, 于是既有的调用方照旧接得住。"""
+
+
+def _slot(meta, which):
+    return (meta or {}).get("current" if which == "current" else "previous")
+
+
+def artifact_health(meta, which="current", root=None):
+    """(状态, 说明)。**只看服务端**: 文件在不在、是不是普通文件、内容有没有被动过、
+    身份对不对、是不是另一版串过来的。任何一项不成立都不许当成"手机需要更新"。"""
+    rec = _slot(meta, which)
+    name = "当前版本" if which == "current" else "上一版"
+    if not rec:
+        return MISSING, "记录里没有%s" % name
+    path = art_path(which, root)
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return MISSING, "%s产物文件不在服务器上(%s)" % (name, path)
+    # 软链/硬链都不认: 那意味着"发出去的字节"取决于链接指向哪儿, 而不是我们写下的那份。
+    if stat.S_ISLNK(st.st_mode):
+        return CORRUPT, "%s产物是符号链接, 拒绝使用" % name
+    if not stat.S_ISREG(st.st_mode):
+        return CORRUPT, "%s产物不是普通文件, 拒绝使用" % name
+    if st.st_nlink != 1:
+        return CORRUPT, "%s产物存在硬链接(nlink=%d), 拒绝使用" % (name, st.st_nlink)
+    # 组/其它可写 = 别人能改这份文件, 那"它与记录一致"就只是**此刻**成立。描述文件本身是
+    # 公开内容, 可读没问题; 可写不行。属主同理: 不是 root(或当前有效用户)写下的, 就不该
+    # 由我们担保。两者都能靠 repair_current 按记录重写来纠正。
+    if st.st_mode & 0o022:
+        return CORRUPT, "%s产物可被其它用户写入(mode %o), 拒绝使用" % (name, st.st_mode & 0o777)
+    if st.st_uid not in (0, os.geteuid()):
+        return CORRUPT, "%s产物的属主(uid %d)不对, 拒绝使用" % (name, st.st_uid)
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError as e:
+        return CORRUPT, "%s产物读不出来: %s" % (name, e.strerror)
+    if not data:
+        return CORRUPT, "%s产物是空文件" % name
+    try:
+        iosprofile.reject_key_material(data, "%s产物" % name)
+        p = iosprofile.validate(data)
+    except iosprofile.ProfileError as e:
+        return CORRUPT, "%s产物不是一份合法的描述文件: %s" % (name, e)
+    # 身份必须是本网关的。不是的话, 这份文件根本不该被当成"我们的某一版"。
+    try:
+        ids = derive_ids((meta or {}).get("instance_id"))
+    except StateError as e:
+        return STATE_MISMATCH, str(e)
+    dns = [x for x in p["PayloadContent"]
+           if x.get("PayloadType") == "com.apple.dnsSettings.managed"][0]
+    if p.get("PayloadUUID") != ids["root"] or dns.get("PayloadUUID") != ids["dns"]:
+        return STATE_MISMATCH, "%s产物的身份与本网关不符(不是这台机器生成的)" % name
+    want = rec.get("sha256")
+    got = hashlib.sha256(data).hexdigest()
+    if want and got != want:
+        other = _slot(meta, "previous" if which == "current" else "current") or {}
+        if other.get("sha256") == got:
+            return STATE_MISMATCH, ("%s的位置上放着的是第 %s 版的文件(串位了)"
+                                    % (name, other.get("revision")))
+        return STATE_MISMATCH, "%s产物与记录的 sha256 不符(内容被动过)" % name
+    # CA 也要对得上: 指纹在元数据里, 正文只在产物里 —— 两边一致才谈得上"这就是那一版"。
+    inp = rec.get("inputs") or {}
+    cas = [x for x in p["PayloadContent"] if x.get("PayloadType") == "com.apple.security.root"]
+    if bool(cas) != bool(inp.get("wloc_enabled")):
+        return STATE_MISMATCH, "%s产物是否含根证书与记录不符" % name
+    if cas:
+        if hashlib.sha256(cas[0]["PayloadContent"]).hexdigest() != inp.get("wloc_ca_sha256"):
+            return STATE_MISMATCH, "%s产物里的根证书指纹与记录不符" % name
+    return HEALTHY, "%s产物与记录一致(第 %s 版)" % (name, rec.get("revision"))
+
+
+def verified_artifact(meta, which="current", root=None):
+    """**所有**读取/发送入口的唯一出口。校验不过就抛, 绝不退而求其次发一份旧的。
+
+    "先看看有没有, 有就发" 是这类功能最容易写成的样子, 也是最坏的样子: 用户拿到一份与
+    服务器记录对不上的描述文件, 而两边都以为一切正常。
+    """
+    state, detail = artifact_health(meta, which, root)
+    if state != HEALTHY:
+        raise IntegrityError("%s —— %s" % (HEALTH_LABEL[state], detail))
+    with open(art_path(which, root), "rb") as f:
+        return f.read()
+
+
+def health_summary(meta, root=None):
+    """两个槽位各一行, 供状态页/恢复报告直接用。"""
+    out = []
+    for which in ("current", "previous"):
+        if which == "previous" and not (meta or {}).get("previous"):
+            continue
+        state, detail = artifact_health(meta, which, root)
+        out.append((which, state, detail))
+    return out
+
+
+# ── 三档判定 ────────────────────────────────────────────────────────────────
+def classify(meta, inputs):
+    """(等级, [理由]) —— **只回答一个问题**: 网关当前的语义配置相对已生成的那一版变了没有。
+
+    刻意不接收产物字节: 服务端文件坏没坏是另一件事(见 artifact_health), 混进来会让用户
+    以为要去动手机, 而真正坏掉的服务端文件反被一句温和提示盖过去。签名里少一个参数, 这条
+    界限就不是靠自觉维持的。
     """
     if not meta:
         return REQUIRED, ["还没有生成过受管描述文件"]
@@ -232,18 +346,6 @@ def classify(meta, inputs, artifact=None):
         if LEVEL_ORDER[lv] > LEVEL_ORDER[level]:
             level = lv
         reasons.append("%s 已变化" % FIELD_LABEL.get(k, k))
-    # 产物对不上记录有三种来路: 被改动过、快照回滚后产物与记录错位(产物不在快照范围内)、
-    # 生成中途崩溃。三种的处理是同一个: 按记录**确定性重建**。所以这里不判"必须更新" ——
-    # 记录里那一版才是真的, 而它能被逐字节复原。但也不能当没事: 用户可能在这期间恰好装过
-    # 那份对不上的文件, 而服务器无从知道。于是给"建议更新"并把话说清楚。
-    if artifact is None:
-        reasons.append("服务器上的产物文件缺失, 已按记录重建")
-    elif meta["current"].get("sha256") and \
-            hashlib.sha256(artifact).hexdigest() != meta["current"]["sha256"]:
-        if LEVEL_ORDER[RECOMMENDED] > LEVEL_ORDER[level]:
-            level = RECOMMENDED
-        reasons.append("服务器上的产物文件与记录不一致, 已按记录重建; "
-                       "若你在此期间装过, 建议重新安装一次")
     if level == NONE and not reasons:
         reasons.append("网关配置与已生成版本一致")
     return level, reasons
@@ -385,44 +487,94 @@ def generate(dot_host, server_addresses, ssids=(), ca_der=b"", wloc_enabled=Fals
 
     cur = meta.get("current")
     same = bool(cur) and cur.get("digest") == digest_of(inputs)
-    on_disk = read_artifact("current", ar)
     # 判定必须在改写之前算: 它回答的是"相对**上一次生成的那一版**要不要重新装"。
     # 写完再算就是拿新记录跟它自己比, 永远得到"无需更新" —— 那正好把这个功能的意义抹掉。
-    level, reasons = classify(meta, inputs, on_disk)
-    if same and on_disk == data:
+    level, reasons = classify(meta, inputs)
+
+    if same:
+        # 语义输入没变 ⇒ 这次点"生成"要的是**那一版**, 不是新版本。
+        state, detail = artifact_health(meta, "current", ar)
+        if state == HEALTHY:
+            return meta, level, reasons, data, False
+        # 产物不可用 → 只能在"能逐字节复原"的前提下修, 修不了就 fail-closed。
+        meta = repair_current(ca_der, template, mp, ar, lock)
+        reasons = list(reasons) + ["%s(%s), 已按记录逐字节复原" % (HEALTH_LABEL[state], detail)]
         return meta, level, reasons, data, False
 
+    cur_state = artifact_health(meta, "current", ar)[0] if cur else None
     with _Txn(lock=lock) as tx:
         os.makedirs(ar, mode=0o700, exist_ok=True)
         _cleanup_candidates(ar)
         new = dict(meta)
-        if same:
-            # 语义没变, 只是产物文件丢了/被改了 —— 按记录重建, revision 不动。
-            tx.write(art_path("current", ar), data, 0o644)
-            new["current"] = dict(cur, sha256=sha)
-        else:
-            if cur and on_disk is not None:
-                tx.write(art_path("previous", ar), on_disk, 0o644)
-                new["previous"] = dict(cur)
-            elif cur:
-                # 上一版的产物文件已经不在盘上了。那就不要在记录里假装还留着一份可回退的
-                # 版本 —— 用户点「发送上一版」时拿不到文件, 比一开始就说没有更糟。
-                tx.remove(art_path("previous", ar))
-                new["previous"] = None
-            tx.write(art_path("current", ar), data, 0o644)
-            new["current"] = {
-                "revision": (cur or {}).get("revision", 0) + 1,
-                "digest": digest_of(inputs),
-                "inputs": inputs,
-                "sha256": sha,
-                "generated_at": _stamp(),
-                "sent_at": None,
-            }
+        if cur and cur_state == HEALTHY:
+            tx.write(art_path("previous", ar), read_artifact("current", ar), 0o644)
+            new["previous"] = dict(cur)
+        elif cur:
+            # 现有 current 已经不可信, 就不能把它当成"上一版"存起来 —— 那等于把一份对不上
+            # 记录的文件正式登记成历史。也不要在记录里假装还留着可回退的版本。
+            tx.remove(art_path("previous", ar))
+            new["previous"] = None
+            reasons = list(reasons) + ["原当前版本产物不可用(%s), 未留作上一版" % cur_state]
+        tx.write(art_path("current", ar), data, 0o644)
+        new["current"] = {
+            "revision": (cur or {}).get("revision", 0) + 1,
+            "digest": digest_of(inputs),
+            "inputs": inputs,
+            "sha256": sha,
+            "generated_at": _stamp(),
+            "sent_at": None,
+        }
         tx.write(mp, json.dumps(new, ensure_ascii=False, indent=2,
                                 sort_keys=True).encode("utf-8") + b"\n", 0o600)
         meta = new
-
+    verified_artifact(meta, "current", ar)     # 写完立刻自证: 落盘的就是记录说的那一份
     return meta, level, reasons, data, True
+
+
+def repair_current(ca_der=b"", template=None, meta_path=None, art_root=None, lock=True):
+    """按记录**逐字节复原** current。复原不了就拒绝 —— 不猜、不新建身份、不推进 revision。
+
+    允许复原的全部条件(缺一不可):
+      · 元数据完整可读;
+      · 记录里有 current, 且带 inputs 与 sha256;
+      · 手上这张公开 CA 的指纹与记录里那一版一致(记录里只有指纹, 正文只在产物里 ——
+        指纹对不上就说明手上的不是那一版用的证书, 拿它渲染出来的是**另一份文件**);
+      · 用记录里的 inputs + 稳定身份重新渲染, 结果的 sha256 与记录**精确相等**。
+    然后才写盘, 且: revision 不变、previous 一个字节不动、写完复核。
+    """
+    mp = meta_path or META
+    ar = art_root or ART_DIR
+    meta = load(mp)
+    if not meta or not meta.get("current"):
+        raise IntegrityError("没有可复原的记录 —— 请重新生成一份描述文件。")
+    rec = meta["current"]
+    inp = rec.get("inputs")
+    want = rec.get("sha256")
+    if not inp or not want:
+        raise IntegrityError("记录里缺 inputs 或 sha256, 无法确定性复原, 已拒绝。")
+    have = hashlib.sha256(ca_der).hexdigest() if ca_der else ""
+    if have != (inp.get("wloc_ca_sha256") or ""):
+        raise IntegrityError(
+            "第 %s 版用的根证书指纹与当前手上的不一致, 无法复原那一版 —— "
+            "拿现在的证书渲染出来的是另一份文件。请从备份恢复, 或重新生成一版新的。"
+            % rec.get("revision"))
+    ids = derive_ids(meta["instance_id"])
+    data = iosprofile.render(inp["dot_host"], inp["server_addresses"], inp.get("ssids") or (),
+                             ca_der, ids, template)
+    got = hashlib.sha256(data).hexdigest()
+    if got != want:
+        raise IntegrityError(
+            "重新渲染的结果与第 %s 版的记录对不上(可能模板已随版本更新), 无法逐字节复原, "
+            "已拒绝。请从备份恢复, 或重新生成一版新的。" % rec.get("revision"))
+    prev_before = read_artifact("previous", ar)
+    with _Txn(lock=lock) as tx:
+        os.makedirs(ar, mode=0o700, exist_ok=True)
+        _cleanup_candidates(ar)
+        tx.write(art_path("current", ar), data, 0o644)
+    if read_artifact("previous", ar) != prev_before:
+        raise IntegrityError("复原过程动到了上一版产物, 这不该发生。")
+    verified_artifact(meta, "current", ar)
+    return meta
 
 
 def _update_meta(fn, meta_path=None, lock=True):
@@ -462,16 +614,12 @@ def recover(meta_path=None, art_root=None):
     meta = load(meta_path)
     if not meta or not meta.get("current"):
         return out
-    cur = read_artifact("current", ar)
-    if cur is None:
-        out.append("当前产物文件缺失(可按记录重建)")
-    elif meta["current"].get("sha256") and \
-            hashlib.sha256(cur).hexdigest() != meta["current"]["sha256"]:
-        out.append("当前产物文件与记录不一致(可能被改动过)")
+    for which, state, detail in health_summary(meta, ar):
+        out.append("%s: %s" % (HEALTH_LABEL[state], detail))
     return out
 
 
-def status_lines(meta, inputs=None, artifact=None):
+def status_lines(meta, inputs=None, art_root=None):
     """状态展示的**唯一**文案来源(Bot 与 CLI 共用措辞)。
 
     只讲"我们生成/发送了什么"。服务器无从知道 iPhone 上此刻是什么, 所以这里永远不会出现
@@ -492,9 +640,13 @@ def status_lines(meta, inputs=None, artifact=None):
     if meta.get("previous"):
         out.append("上一版: 第 %d 版" % meta["previous"]["revision"])
     if inputs is not None:
-        lv, why = classify(meta, inputs, artifact)
-        out.append("状态: %s" % LEVEL_LABEL[lv])
+        lv, why = classify(meta, inputs)
+        out.append("配置变化: %s" % LEVEL_LABEL[lv])
         out += ["  · " + r for r in why]
+    # 服务端产物健康**单独一行**, 不和上面那条混为一谈: 一个说的是手机上那份要不要换,
+    # 另一个说的是服务器上这个文件能不能发。
+    for which, state, detail in health_summary(meta, art_root):
+        out.append("%s: %s" % (HEALTH_LABEL[state], detail))
     return out
 
 
@@ -557,6 +709,8 @@ def main(argv=None):
     pv = sub.add_parser("previous", help="取出上一版产物")
     pv.add_argument("--out", required=True)
     sub.add_parser("recover", help="清理中断残留并检查产物与记录是否一致")
+    rp = sub.add_parser("repair", help="按记录逐字节复原 current(复原不了就拒绝)")
+    common(rp)
 
     a = ap.parse_args(argv)
     if not a.cmd:
@@ -575,7 +729,9 @@ def main(argv=None):
             meta, lv, why, data, changed = generate(
                 a.dot_host, a.server_ip, a.ssid, der, bool(der), a.template,
                 legacy_seen=a.legacy)
-            pdgtx.atomic_write(a.out, data, mode=0o644)
+            # 落到临时下载目录的那一份也必须过校验器 —— 二维码/临时 HTTP 是最终交到手机
+            # 手里的那条路, 不能比 Bot 那条松。
+            pdgtx.atomic_write(a.out, verified_artifact(meta, "current"), mode=0o644)
             print("\n".join(status_lines(meta)))
             print("本次: %s" % ("生成了第 %d 版" % meta["current"]["revision"] if changed
                               else "网关配置没有变化, 内容与上次完全相同"))
@@ -590,7 +746,7 @@ def main(argv=None):
             inputs = None
             if a.dot_host and a.server_ip:
                 inputs, _ = _inputs()
-            print("\n".join(status_lines(meta, inputs, read_artifact("current"))))
+            print("\n".join(status_lines(meta, inputs)))
             print("\n" + UNKNOWN)
         elif a.cmd == "diff":
             meta = load() or {}
@@ -598,6 +754,13 @@ def main(argv=None):
             if not (prev and cur):
                 print("还没有上一版可对比。")
                 return 0
+            # 差异读的是**元数据里的 inputs**, 但只要还打算把这两版当成"服务器上有的东西"
+            # 展示, 就该先确认它们真的在、真的对得上。对不上时给结论而不是拿旧数字糊过去。
+            for which in ("current", "previous"):
+                st, detail = artifact_health(meta, which, None)
+                if st != HEALTHY:
+                    sys.stderr.write("%s —— %s\n" % (HEALTH_LABEL[st], detail))
+                    return 4
             print("第 %d 版 → 第 %d 版" % (prev["revision"], cur["revision"]))
             d = diff_fields(prev["inputs"], cur["inputs"])
             for k, lv, ov, nv in d:
@@ -609,17 +772,23 @@ def main(argv=None):
             ack_migration()
             print("已关闭迁移提示。记录的是「你告诉我们旧描述文件已删除」, 服务器无从核实。")
         elif a.cmd == "previous":
-            blob = read_artifact("previous")
             meta = load() or {}
-            if not (meta.get("previous") and blob):
-                sys.stderr.write("上一版的文件已不在服务器上, 无法取回。\n")
+            if not meta.get("previous"):
+                sys.stderr.write("还没有上一版。\n")
                 return 4
+            blob = verified_artifact(meta, "previous")
             pdgtx.atomic_write(a.out, blob, mode=0o644)
             print("已取出第 %d 版。这只是把旧文件再给你一次 —— 记录的当前版本不会回退。"
                   % meta["previous"]["revision"])
         elif a.cmd == "recover":
             msgs = recover()
             print("\n".join(msgs) if msgs else "没有需要清理的残留, 产物与记录一致。")
+        elif a.cmd == "repair":
+            der = iosprofile.ca_der_for(iosprofile.wloc_enabled(a.wloc_config), a.ca_crt) \
+                if a.wloc_config else b""
+            meta = repair_current(der, a.template)
+            print("已按记录逐字节复原第 %d 版(revision 未变, 上一版未动)。"
+                  % meta["current"]["revision"])
     except (StateError, iosprofile.ProfileError) as e:
         sys.stderr.write("%s\n" % e)
         return 3

@@ -226,15 +226,19 @@ else:
 
 with open(bx.s.art_path("current", bx.art), "ab") as f:
     f.write(b"<!-- tampered -->")
-lv, why = bx.s.classify(bx.read_meta(), bx.s.make_inputs("dot.example.com", "203.0.113.10",
-                                                        (), False, b"", TMPL),
-                        bx.s.read_artifact("current", bx.art))
-# 产物对不上记录不判"必须更新": 记录里那一版才是真的, 而且能逐字节复原。但要说清楚
-# "你可能刚好装过那份对不上的" —— 服务器无从知道这件事, 所以给建议更新而不是装作没事。
-if lv == "recommended" and any("不一致" in r and "重新安装" in r for r in why):
-    ok("产物被改动过 → 建议更新, 并说明可按记录重建: %s" % why[-1][:40])
+inputs = bx.s.make_inputs("dot.example.com", "203.0.113.10", (), False, b"", TMPL)
+lv, why = bx.s.classify(bx.read_meta(), inputs)
+# 产物坏了是**服务端**的事, 不是"手机该更新了"。配置变化等级必须一点都不受它影响 ——
+# 两者混在一起时, 用户会去动手机, 而真正坏掉的服务端文件被一句温和提示盖了过去。
+if lv == "none":
+    ok("产物被改动过, 配置变化等级仍是「%s」(两件事互不污染)" % bx.s.LEVEL_LABEL[lv])
 else:
-    bad("产物被篡改后的判定不对: %s %s" % (lv, why))
+    bad("产物损坏污染了配置变化等级: %s %s" % (lv, why))
+st, detail = bx.s.artifact_health(bx.read_meta(), "current", bx.art)
+if st == "state_mismatch":
+    ok("同一时刻产物健康状态单独给出: %s(%s)" % (st, detail))
+else:
+    bad("产物健康状态不对: %s" % st)
 fixed = bx.gen()
 if bx.s.read_artifact("current", bx.art) == fixed[3] and \
         bx.read_meta()["current"]["revision"] == rev:
@@ -259,8 +263,7 @@ before_id = bx.read_meta()["instance_id"]
 bx.s.ack_migration(bx.meta)
 meta2 = bx.read_meta()
 lv2, why2 = bx.s.classify(meta2, bx.s.make_inputs("dot.example.com", "203.0.113.10",
-                                                  (), False, b"", TMPL),
-                          bx.s.read_artifact("current", bx.art))
+                                                  (), False, b"", TMPL))
 if not meta2["migration_pending"] and lv2 == "none" and meta2["instance_id"] == before_id:
     ok("用户确认已按说明处理 → 迁移提示关闭, 身份不变")
 else:

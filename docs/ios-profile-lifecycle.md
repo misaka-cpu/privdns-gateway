@@ -59,21 +59,58 @@ v1.7.8 及以前,每次生成描述文件都现取两个随机 UUID:
 `ondemand_core` 取自模板本身:升级换了模板能被识别成一次必须更新,而不是让用户拿着一份
 规则骨架已经过时的描述文件继续用。
 
-## 4. 三档更新判定
+## 4. 两个互不相干的状态
 
-分级表集中在 `iosstate.FIELD_LEVELS` 一处,Bot 与 CLI 都读它,不各写一份。
+这两件事必须分开表达。混成一句的后果很实在:用户以为该去动手机,而真正坏掉的**服务端文件**
+反倒被一句温和的提示盖了过去。
+
+### 4.1 配置变化等级 —— 关于设备
+
+只回答一个问题:网关当前的语义配置相对已生成的那一版变了没有。分级表集中在
+`iosstate.FIELD_LEVELS` 一处,Bot 与 CLI 都读它。`classify()` 的签名里**不接收产物字节**
+——这条界限不是靠自觉维持的。
 
 | 等级 | 触发 | 说明 |
 |---|---|---|
 | `none` 无需更新 | 规范化输入与当前版本一致 | 重新发送即可 |
-| `recommended` 建议更新 | `ssids`(强制直连名单);服务器上的产物与记录对不上 | 核心连接仍可用 |
+| `recommended` 建议更新 | `ssids`(强制直连名单) | 核心连接仍可用 |
 | `required` 必须更新 | `dot_host`、`server_addresses`、`dns_protocol`、`probe_url`、`ondemand_core`、`wloc_enabled`、`wloc_ca_sha256`、`schema`;还没生成过;迁移未完成 | 不更新会连不上或信任链不对 |
 
-**产物对不上记录为什么只是"建议"**:这种错位最常见的来路是快照回滚(产物不在快照范围内,
-回滚后记录退回旧版而产物还是新的),其次是生成中途崩溃,最后才是被人改过。三种情况的处理
-是同一个——按记录**确定性重建**,因为记录里那一版才是真的、而且能逐字节复原。判"必须更新"
-会把一次正常的回滚变成假警报;完全不提示又忽略了"用户可能刚好装过那份对不上的文件"。所以
-给"建议更新",并把这句话直接写进理由里。
+### 4.2 产物健康状态 —— 关于服务端
+
+`iosstate.artifact_health(meta, which)` 单独给出,current 与 previous 各判各的:
+
+| 状态 | 含义 | 用户看到的 |
+|---|---|---|
+| `healthy` | 文件在、是普通文件、内容与记录逐字节相符、身份与 CA 指纹都对得上 | ✅ 服务端描述文件完整 |
+| `missing` | 文件不在服务器上 | ⚠️ 服务端描述文件缺失,需要先修复后才能发送 |
+| `corrupt` | 软链/硬链/空文件/读不出来/不是合法描述文件/组或其它可写/属主不对/含私钥 | ❌ 描述文件与生命周期记录不一致,已拒绝发送 |
+| `state_mismatch` | 是一份好文件,但**不是记录说的那一份**:sha 不符、身份不是本网关、CA 指纹不符,或干脆是另一个 revision 串位过来的 | ❌ 描述文件与生命周期记录不一致,已拒绝发送 |
+
+两条都不声称知道手机上的安装状态。
+
+## 4.3 发送前一律 fail-closed
+
+下面这些入口读取或发送文件之前**必须**走同一个 `iosstate.verified_artifact()`:
+CLI 取 current / 取 previous、Bot 发 current / 发 previous、临时 HTTP 下载与二维码那一份、
+diff、status。校验不过就抛,绝不退而求其次发一份旧的——"先看看有没有,有就发"是这类功能最
+容易写成的样子,也是最坏的样子:用户拿到一份与服务器记录对不上的描述文件,而两边都以为一切
+正常。
+
+## 4.4 自动修复的边界
+
+`current` 缺失或损坏时,**只有**下面几条全部成立才允许按记录复原(`iosstate.repair_current`):
+
+- 元数据完整可读,记录里有 `current` 且带 `inputs` 与 `sha256`;
+- 手上这张公开 CA 的**指纹与记录里那一版一致**(元数据里只有指纹,证书正文只在产物里——
+  指纹对不上就说明手上的不是那一版用的证书,拿它渲染出来的是另一份文件);
+- 用记录里的 `inputs` + 稳定身份重新渲染,结果的 sha256 与记录**精确相等**。
+
+然后才写盘,且:**revision 不变、previous 一个字节不动、写完复核**。任何一条不成立就拒绝,
+不猜、不新建身份、不推进 revision。
+
+**`previous` 永远不重建。** 那一版用的根证书只在产物里有正文,服务器上早就没有了——凭当前的
+证书"重建"出来的是另一份文件。丢了只有两条路:从备份恢复,或者如实显示"上一版不可用"。
 
 ## 5. current / previous
 
@@ -122,11 +159,28 @@ WLOC 已启用但 CA 缺失/损坏/误指向 key 文件,一律**拒绝生成**�
 
 ## 8. 文件位置与备份语义
 
-| 路径 | 内容 | 备份语义 |
-|---|---|---|
-| `/etc/privdns-gateway/ios-profile.json` | 身份 + revision + digest + 时间戳 | 在快照 `etc/` 范围内;也在 Bot 备份包与 `cfgrestore` 恢复白名单里(pdgtx 目标 `ios_profile`) |
-| `/var/lib/privdns-gateway/ios-profile/current.mobileconfig` | 当前产物 | 不进备份:可由元数据 + 当前配置**确定性重建** |
-| `/var/lib/privdns-gateway/ios-profile/previous.mobileconfig` | 上一版产物 | 同上 |
+| 路径 | 内容 | pdgtx 目标 | 备份语义 |
+|---|---|---|---|
+| `/etc/privdns-gateway/ios-profile.json` | 身份 + revision + digest + 时间戳 | `ios_profile_state`(0600) | 进 CLI 快照、Bot 备份与恢复白名单 |
+| `/var/lib/privdns-gateway/ios-profile/current.mobileconfig` | 当前产物 | `ios_profile_current`(0644) | 同上 |
+| `/var/lib/privdns-gateway/ios-profile/previous.mobileconfig` | 上一版产物 | `ios_profile_previous`(0644) | 同上 |
+
+三个目标的动作映射**显式写成空**,不是"没登记"——`actions_for_targets` 对没登记的目标是
+fail-closed,靠遗漏表达"不需要动作"会在恢复时变成一次拒绝,而那看起来像是恢复功能坏了。
+
+产物必须跟着备份走,不能靠"反正能重建":**previous 那一版用的根证书只在产物里有正文**,
+元数据里只有指纹。它丢了就是真的没了。为此 `cmd_snapshot` 的候选集与 `cmd_rollback` 的越界
+守卫都放行了 `var/lib/privdns-gateway/ios-profile` 这**一个子树**(不是整个 `var/lib`——
+放宽到那一层等于让一份构造出来的快照可以往 tx 记录、备份包所在的地方写文件)。
+
+### 恢复的原子性与旧格式备份
+
+记录 + 两份产物挂在**同一笔** pdgtx 事务里(`_stage_ios_profile`),要么整组换过去,要么
+一个都不动:绝不出现"记录说第 2 版、盘上躺着第 3 版"。任一目标落盘失败,三件一起回到操作前。
+
+5.4 早期(以及更老)的备份里只有记录、没有产物。这种包被**认出来**并如实说明,不伪装成完整
+恢复:记录里的 `previous` 一并清掉(不留一个点开就报错的"上一版"),`current` 保留记录但
+产物需要另行修复——能不能修由 4.4 那几条决定,这里不越权替用户决定。
 
 元数据是**用户持久数据**:普通 update、强制重装、平台来回切都不得动它;只有
 `uninstall --purge` 或 `iosstate.clear()` 会放弃身份。`tests/test-ios-profile-persist.py`
@@ -153,6 +207,7 @@ pdg ios diff            # current ↔ previous 的字段级差异
 pdg ios previous        # 取出上一版产物(不改当前版本)
 pdg ios ack             # 用户自述旧描述文件已删除, 关掉迁移提示
 pdg ios recover         # 清理中断残留, 检查产物与记录是否一致
+pdg ios repair          # 按记录逐字节复原 current(复原不了就拒绝)
 ```
 
 Bot:「📱 客户端」→「📱 iOS 描述文件」。Android 平台上这些入口既不显示,后端也逐个拒绝
@@ -166,4 +221,6 @@ Bot:「📱 客户端」→「📱 iOS 描述文件」。Android 平台上这些
 | `tests/test-ios-profile-shared.py` | Bot 与 CLI **真的跑两条路**再逐字节比对;私钥零外泄 |
 | `tests/test-ios-profile-lifecycle.py` | 稳定身份、三档判定、current/previous、事务原子性 |
 | `tests/test-ios-profile-ux.py` | 两个界面同一份记录、禁用词表、Android 全拒 |
-| `tests/test-ios-profile-persist.py` | update / 快照回滚 / 备份恢复 / 平台来回切都不丢身份 |
+| `tests/test-ios-profile-persist.py` | update / 快照回滚 / 备份恢复 / 平台来回切都不丢身份与产物 |
+| `tests/test-ios-profile-integrity.py` | 六种人为损坏必须检出;两个状态互不污染;修复边界 |
+| `tests/test-ios-profile-restore.py` | 快照与备份逐字节恢复(CA A→B→C)、旧格式备份、失败整组回滚、软链/硬链/权限 |

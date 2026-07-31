@@ -280,8 +280,13 @@ def main():
         os.makedirs(os.path.join(base, "etc/privdns-gateway"), exist_ok=True)
         bot.IOS_META = os.path.join(base, "etc/privdns-gateway/ios-profile.json")
         json.dump({"schema": 1, "instance_id": "x"}, open(bot.IOS_META, "w"))
+        os.makedirs(os.path.join(base, "var/lib/privdns-gateway/ios-profile"), exist_ok=True)
+        bot.IOS_CURRENT = os.path.join(base, "var/lib/privdns-gateway/ios-profile/current.mobileconfig")
+        bot.IOS_PREVIOUS = os.path.join(base, "var/lib/privdns-gateway/ios-profile/previous.mobileconfig")
+        for _p in (bot.IOS_CURRENT, bot.IOS_PREVIOUS):
+            open(_p, "w").write("<plist/>\n")
         bot.BACKUP_FILES = [bot.SB, bot.MOSDNS_CONF, bot.MOSDNS_DIRECT, bot.MOSDNS_HIJACK,
-                            bot.RS_META, bot.IOS_META]
+                            bot.RS_META, bot.IOS_META, bot.IOS_CURRENT, bot.IOS_PREVIOUS]
         json.dump({"outbounds": [], "route": {"rules": []}}, open(bot.SB, "w"))
         for p in (bot.MOSDNS_CONF, bot.MOSDNS_DIRECT, bot.MOSDNS_HIJACK):
             open(p, "w").write("x\n")

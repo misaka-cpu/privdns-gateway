@@ -139,7 +139,23 @@ for p in 'usr/local/bin/pdg' 'usr/local/bin/pdg-set-token' 'etc/systemd/system/m
   grep -q "$p" "$u" || bad "D4: 快照 cand 缺 $p"
 done
 grep -q "etc/systemd/system/mihomo.service etc/systemd/system/sing-box.service" "$u" && ok "cmd_snapshot cand: 覆盖已装脚本 + 内核/mitm/probe/health 全部 unit + cert hook" || bad "D4 汇总"
-grep -q 'usr/local/bin)(/|$)' "$u" && ok "回滚越界守卫放行 usr/local/bin(否则装的脚本进不了快照)" || bad "D5: 守卫未放行 usr/local/bin"
+# D5 越界守卫: 拿真实的那条正则去跑样本, 而不是 grep 一段字面量 —— 字面量只能证明"那行字
+# 还在", 证明不了它放行/拦住的到底是什么。守卫的前缀集必须与 cmd_snapshot 的候选集对齐:
+# 装的脚本(usr/local/bin)、iOS 描述文件产物(var/lib 下那一个子树)要能进快照; 别的一律不行。
+_guard="$(sed -n "s/.*grep -Evq '\(\^([^']*)\)'.*/\1/p" "$u" | head -1)"
+[[ -n "$_guard" ]] || _guard="$(grep -oE "\^\(etc\|[^']*\)\(/\|\\$\)" "$u" | head -1)"
+_chk(){ printf '%s\n' "$1" | grep -Evq "$_guard"; }   # 返回 0 = 会被守卫判越界
+for _good in 'etc/mosdns/config.yaml' 'opt/pdg-bot/bot.py' 'usr/local/bin/pdg' \
+             'var/lib/privdns-gateway/ios-profile/current.mobileconfig' \
+             'var/lib/privdns-gateway/ios-profile/previous.mobileconfig'; do
+  _chk "$_good" && bad "D5: 守卫误拦了应进快照的 $_good"
+done
+ok "回滚越界守卫放行 etc/opt/usr-local-bin 与 iOS 描述文件产物(真跑正则, 非字面量)"
+for _bad in 'var/lib/privdns-gateway/tx/abc/before' 'var/lib/privdns-gateway/backups/x.tar.gz' \
+            'var/lib/other/thing' 'var/log/syslog' 'root/.ssh/authorized_keys'; do
+  _chk "$_bad" || bad "D5: 守卫放行了不该进快照的 $_bad"
+done
+ok "守卫仍然拦住 tx 记录/备份包/其它 var 路径(没有放宽成整个 var/lib)"
 
 echo "────────────────────────────────────────"
 echo "通过 $pass, 失败 $nfail"

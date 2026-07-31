@@ -646,7 +646,10 @@ cmd_snapshot(){
   # 整机配置 + 防火墙 + bot.env(含 token)+ service + journald 封顶(含历史错路径)(相对 / 打包, 回滚 -C / 解开)
   # 含: 已安装脚本(pdg / pdg-set-token / cert hook)+ 全部 pdg unit —— 升级会改它们, 回滚要一并还原。
   # 只打包"存在的"路径 —— 历史错路径可能已被迁移清掉, 无条件列进去会让 tar 报 Cannot stat 并返 2。
+  # var/lib/.../ios-profile 是唯一进快照的 /var/lib 成员: iOS 描述文件产物。它不是缓存 ——
+  # previous 那一版用的根证书只在产物里有正文(元数据里只有指纹), 不打包就永远回不来了。
   local cand=(etc/mosdns etc/sing-box etc/mihomo opt/pdg-bot etc/privdns-gateway etc/nftables.conf
+              var/lib/privdns-gateway/ios-profile
               etc/systemd/system/pdg-bot.service etc/systemd/journald.conf.d/50-pdg.conf
               etc/systemd/system/journald.conf.d/50-pdg.conf
               etc/systemd/system/mihomo.service etc/systemd/system/sing-box.service
@@ -721,7 +724,11 @@ cmd_rollback(){
   if ! mkdir -p "$tree" || ! tar tzf "$f" > "$members" 2>/dev/null || [[ ! -s "$members" ]]; then
     echo "❌ 快照目录或成员清单读取失败, 中止"; rm -rf "$tmp"; return 1
   fi
-  if grep -Eq '(^/|(^|/)\.\.(/|$))' "$members" || grep -Evq '^(etc|opt|usr/local/bin)(/|$)' "$members"; then
+  # 越界守卫的前缀集必须与 cmd_snapshot 的候选集对齐。放行 var/lib 下的**那一个子树**而不是
+  # 整个 var/lib: 快照里本来就不该有 tx 记录、救援运行态、备份包这些东西, 放宽到 var/lib
+  # 等于让一份构造出来的快照可以往那里写任意文件。
+  if grep -Eq '(^/|(^|/)\.\.(/|$))' "$members" \
+     || grep -Evq '^(etc|opt|usr/local/bin|var/lib/privdns-gateway/ios-profile)(/|$)' "$members"; then
     echo "❌ 快照含越界路径, 中止"; rm -rf "$tmp"; return 1
   fi
   if ! tar xzf "$f" -C "$tree" 2>/dev/null; then

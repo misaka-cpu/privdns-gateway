@@ -208,6 +208,12 @@ jobs:
       - name: "iOS 描述文件身份持久性 (update/快照/备份恢复/平台来回切都不丢身份)"
         run: python3 tests/test-ios-profile-persist.py
 
+      - name: "iOS 描述文件产物完整性 (缺失/损坏/串位必须检出, 发送前一律 fail-closed)"
+        run: python3 tests/test-ios-profile-integrity.py
+
+      - name: "iOS 描述文件恢复闭环 (快照/备份逐字节恢复 + 旧格式备份 + 失败整组回滚)"
+        run: python3 tests/test-ios-profile-restore.py
+
       - name: "自检防火墙端口回归"
         run: python3 tests/test-doctor-firewall.py
 
