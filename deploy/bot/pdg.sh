@@ -3590,30 +3590,35 @@ cmd_tx(){
 # 现在迁移只有两个入口, 都在锁与快照之后: cmd_update 装好新脚本后调用的 `pdg __migrate`,
 # 以及用户显式运行的 `sudo pdg migrate`(先上锁、先快照, 并记一笔审计)。
 
+# 收参数的分支一律 `shift || true` + "$@" —— 只传第一个参数会把后面的全丢掉, 而且丢得**没有
+# 报错**。这个坑踩过两次: `pdg rescue bind 1.2.3.4` 拿不到地址、`pdg rescue rotate cert` 退化成
+# 默认的 token 轮换(用户要求换证书, 实际换掉的是 token: 会话全断、指纹没变); 后来又是
+# `pdg rollback --dir <快照目录> --git <ref>` 只递进去一个 `--dir`, 报"--dir 缺参数",
+# 而 cmd_update 走内部直调不过这里, 所以内部路径一直是好的、故障只出现在用户手打的那条命令上。
+# 默认值(rollback 的序号 0、log 的 40 行)由各自的函数兜底, 不在这里替它们塞 ——
+# 分发器一塞, "有没有给参数"这件事在函数里就再也分辨不出来了。
+# tests/test-cli-dispatch.py 把这段 case 抽出来逐条跑, 不是靠这条注释守着。
 case "${1:-menu}" in
   menu|"")       menu;;
   __migrate)     need_root __migrate; run_all_migrations;;   # 内部: cmd_update 装好新脚本后据此跑"新版"迁移
   migrate)       cmd_migrate;;
   tx)            shift || true; cmd_tx "$@";;
   status|st)     cmd_status;;
-  doctor|dr)     shift || true; cmd_doctor "${1:-}";;
-  update|up)     shift || true; cmd_update "${1:-}";;
+  doctor|dr)     shift || true; cmd_doctor "$@";;
+  update|up)     shift || true; cmd_update "$@";;
   migrate-fw)    need_root migrate-fw; migrate_firewall_to_pdg;;
   snapshot|snap) cmd_snapshot;;
-  rollback)      shift || true; cmd_rollback "${1:-0}";;
+  rollback)      shift || true; cmd_rollback "$@";;
   token)         cmd_token;;
   restart)       cmd_restart;;
-  log|logs)      shift || true; cmd_log "${1:-40}";;
+  log|logs)      shift || true; cmd_log "$@";;
   traffic|tr)    cmd_traffic;;
   ios)           shift || true; cmd_ios "$@";;
   report)        shift || true; cmd_report "$@";;
-  detect-cidr|cidr) shift || true; cmd_detect_cidr "${1:-}";;
-  platform)      shift || true; cmd_platform "${1:-}";;
-  hijack-mode)   shift || true; cmd_hijack_mode "${1:-}";;
-  uninstall|rm)  shift || true; cmd_uninstall "${1:-}";;
-  # 必须 shift + "$@": 只传 "$2" 会把子命令后面的参数全丢掉 —— `pdg rescue bind 1.2.3.4`
-  # 拿不到地址, 而 `pdg rescue rotate cert` 会因为参数丢失退化成默认的 token 轮换:
-  # 用户要求换证书, 实际换掉的是 token(会话全断, 指纹却没变)。
+  detect-cidr|cidr) shift || true; cmd_detect_cidr "$@";;
+  platform)      shift || true; cmd_platform "$@";;
+  hijack-mode)   shift || true; cmd_hijack_mode "$@";;
+  uninstall|rm)  shift || true; cmd_uninstall "$@";;
   rescue)        shift || true; cmd_rescue "$@";;
   *) echo "用法: pdg [menu|status|doctor [--json|--deep]|update [--dry-run]|snapshot|rollback [n]|token|restart|log [n]|traffic|ios [status|diff|previous|ack|recover|repair](仅 iOS)|report [--redact-ip|--full]|detect-cidr|platform <ios|android>|hijack-mode <all|gfw>|migrate|migrate-fw|tx <list|show|recover|abort>|rescue <enable|disable|status|fingerprint|bind <IPv4>|rotate-token|rotate-cert>|uninstall [--purge]]";;
 esac

@@ -370,6 +370,9 @@ jobs:
       - name: "CLI/report/bot 杂项回归 (rollback 校验/inet pdg/菜单 exec)"
         run: python3 tests/test-maintenance-polish.py
 
+      - name: "顶层分发器参数传递 (每个子命令都把参数原样交出去; rollback --dir/--git 真跑一遍)"
+        run: python3 tests/test-cli-dispatch.py
+
       - name: "sb2mihomo 渲染层回归 (sing-box 配置→mihomo 各协议/组/规则映射)"
         run: python3 tests/test-sb2mihomo.py
 
