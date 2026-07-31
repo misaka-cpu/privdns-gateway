@@ -7,6 +7,7 @@
   2. **Android 一律看不到也用不了**。不只是隐藏按钮 —— 旧消息里的按钮被点、命令被打,
      后端也要拒, 并且不产生任何文件、不写任何记录。
 """
+import hashlib
 import importlib.util as u
 import json
 import os
@@ -385,34 +386,42 @@ if "ic_gate || return 1" in pdg and pdg.count("ic_gate || return 1") >= 2:
 else:
     bad("有 iOS 命令没走门控")
 
-# ── 9. 每个子命令都必须真的被分发到只读路径 ───────────────────────────────
-# 漏一个的后果不是报错, 是**静默退化**: `pdg ios repair` 落到默认分支 = 生成 + 装 qrencode +
-# 开临时 8443 + 起 HTTP 服务。用户以为在修一个文件, 实际上在生产机上开了个下载口。
+# ── 9. 每个子命令都必须落到它该去的那条路 ─────────────────────────────────
+# 两个方向的错都很贵, 而且都不报错:
+#   · 只读子命令掉进默认分支 = 生成 + 装 qrencode + 开临时 8443 + 起 HTTP 服务。用户以为在
+#     修一个文件, 实际上在生产机上开了个下载口;
+#   · `previous` 只把文件写到服务器上而**不开下载通道** = 手机根本拿不到它, 可命令还在说
+#     "已取出上一版" —— 看起来能用, 实际上只有 Telegram Bot 那条路能取回上一版。
 # 子命令清单从 iosstate.py 自己的 argparse 取 —— 写死一份就等于"以后新增的照样漏"。
 _help = subprocess.run([sys.executable, str(ROOT / "deploy/bot/iosstate.py"), "--help"],
                        capture_output=True, text=True, timeout=120).stdout
 _m = re.search(r"\{([a-z,]+)\}", _help)
 SUBS = [x for x in (_m.group(1).split(",") if _m else []) if x and x != "generate"]
 if len(SUBS) >= 5:
-    ok("从 iosstate.py 的 argparse 取到 %d 个只读子命令: %s" % (len(SUBS), ", ".join(SUBS)))
+    ok("从 iosstate.py 的 argparse 取到 %d 个 generate 之外的子命令: %s" % (len(SUBS), ", ".join(SUBS)))
 else:
     bad("取不到子命令清单: %r" % _help[:200])
 
-# 真的把 cmd_ios / ic_gate 抽出来跑一遍, 只把它依赖的外部动作换成桩。
+# 真的把 cmd_ios / cmd_ios_previous / ic_gate 抽出来跑一遍, 只把它依赖的外部动作换成桩。
 HARNESS = r"""
 set -u
-grep -E '^IOS_TMPL='             deploy/bot/pdg.sh >  /tmp/iosdisp.$$
-sed -n '/^ic_gate()/,/^}/p'      deploy/bot/pdg.sh >> /tmp/iosdisp.$$
-sed -n '/^cmd_ios_state()/,/^}/p' deploy/bot/pdg.sh >> /tmp/iosdisp.$$
-sed -n '/^cmd_ios()/,/^}/p'      deploy/bot/pdg.sh >> /tmp/iosdisp.$$
+grep -E '^IOS_TMPL='                 deploy/bot/pdg.sh >  /tmp/iosdisp.$$
+sed -n '/^ic_gate()/,/^}/p'          deploy/bot/pdg.sh >> /tmp/iosdisp.$$
+sed -n '/^cmd_ios_state()/,/^}/p'    deploy/bot/pdg.sh >> /tmp/iosdisp.$$
+sed -n '/^cmd_ios_previous()/,/^}/p' deploy/bot/pdg.sh >> /tmp/iosdisp.$$
+sed -n '/^cmd_ios()/,/^}/p'          deploy/bot/pdg.sh >> /tmp/iosdisp.$$
 need_root(){ :; }
 _pdg_platform(){ echo ios; }
 _pdg_module(){ echo /nonexistent/$1; }
 _ios_dot_host(){ echo dot.example.com; }
 _ios_server_ip(){ echo 203.0.113.10; }
+_ios_internal_cidr(){ echo 172.22.0.0/16; }
 c_g(){ echo "$*"; }; c_y(){ echo "$*"; }
+PDG_IOS_LEGACY=n                   # 首次生成的那句问话在非交互场景下显式给出, 不卡住
 # 只读路径的落点: 换成一句可识别的输出, 于是"走到了哪条分支"是**可观察**的
 python3(){ shift; echo "READONLY:${1:-none}"; }   # 调用形态是 python3 <模块> <子命令> …
+# 临时下载通道的落点: 同样给一句可识别的输出 —— "有没有给手机开取件的路"因此也是可观察的
+_ios_offer_download(){ echo "CHANNEL:$1"; }
 # 生成路径上那些会真动机器的动作: 一旦被走到就立刻暴露
 apt-get(){ echo "DANGER:apt-get $*"; return 1; }
 qrencode(){ echo "DANGER:qrencode"; return 1; }
@@ -421,21 +430,39 @@ mktemp(){ echo /tmp/iosdisp-www.$$; }
 # shellcheck source=/dev/null
 . /tmp/iosdisp.$$
 rm -f /tmp/iosdisp.$$
-cmd_ios "$1" 2>&1 | head -3
+IOS_TMPL="$2"
+cmd_ios ${1:+"$1"} 2>&1 | head -8
 """
-# 判据必须是**正向**的: "真的走到了只读分支"。第一版写成"没出现危险标记"就假绿了 ——
-# 没被分发的子命令在抽出的函数里因未定义变量提前退出, 同样不产生危险标记。
+
+
+def dispatch(sub=""):
+    r = subprocess.run(["bash", "-c", HARNESS, "_", sub, TMPL], capture_output=True,
+                       text=True, cwd=str(ROOT), timeout=120)
+    return (r.stdout or "") + (r.stderr or "")
+
+
+# 判据必须是**正向**的: "真的走到了只读分支"/"真的走到了下载通道"。第一版写成"没出现危险
+# 标记"就假绿了 —— 没被分发的子命令在抽出的函数里因未定义变量提前退出, 同样不产生危险标记。
+# previous 与其余五个的判据在这里是**反着的**: 它必须开通道, 它们必须不开。
 _leaks = []
 for sub in SUBS:
-    r = subprocess.run(["bash", "-c", HARNESS, "_", sub], capture_output=True, text=True,
-                       cwd=str(ROOT), timeout=120)
-    out = (r.stdout or "") + (r.stderr or "")
-    if ("READONLY:" + sub) not in out or "DANGER:" in out:
+    out = dispatch(sub)
+    want_channel = sub == "previous"
+    if ("READONLY:" + sub) not in out or "DANGER:" in out \
+            or (("CHANNEL:" in out) != want_channel):
         _leaks.append("%s → %s" % (sub, (out.strip().splitlines() or ["(无输出)"])[0][:70]))
 if not _leaks:
-    ok("%d 个子命令全部分发到只读路径, 没有一个掉进「生成并开下载口」的默认分支" % len(SUBS))
+    ok("%d 个子命令各就各位: previous 取到字节后开临时下载通道, 其余 %d 个只读且不开端口"
+       % (len(SUBS), len(SUBS) - 1))
 else:
-    bad("这些子命令掉进了默认分支(会装包/开端口/改 nft): %s" % "; ".join(_leaks))
+    bad("这些子命令落错了地方(掉进默认分支, 或该开/不该开下载通道): %s" % "; ".join(_leaks))
+
+# 手机取件只有一条路: `pdg ios`(当前版)与 `pdg ios previous`(上一版)必须是同一条。
+_cur = dispatch("")
+if "CHANNEL:" in _cur and "READONLY:generate" in _cur:
+    ok("`pdg ios`(当前版)也走同一个 _ios_offer_download —— 两条路共用一处实现")
+else:
+    bad("当前版没走共用通道: %r" % _cur.strip()[:150])
 
 _usage = re.search(r'echo "用法: pdg ios \{([^}]*)\}"', pdg)
 _listed = set((_usage.group(1).split("|") if _usage else []))
@@ -443,6 +470,138 @@ if _listed == set(SUBS):
     ok("用法提示里列的子命令与实际支持的一致")
 else:
     bad("用法提示与实际不符: 提示 %r 实际 %r" % (sorted(_listed), sorted(SUBS)))
+
+# ── 10. 那条临时下载通道: 一处实现, 并且真的跑一遍 ─────────────────────────
+# 复制一份的代价不是"多几行", 是**两份会分头长歪**: 加固(令牌、放行范围、超时)只改到一边,
+# 另一边照旧, 而两边看起来都在正常工作。
+_OFFER = re.search(r"^_ios_offer_download\(\)\{.*?^\}", pdg, re.S | re.M)
+_OFFER = _OFFER.group(0) if _OFFER else ""
+_dup = [lbl for pat, lbl in (("python3 -m http.server", "临时 HTTP"),
+                             ("nft insert rule", "临时 nft 放行"),
+                             ("qrencode -t", "终端二维码"))
+        if pdg.count(pat) != 1 or pat not in _OFFER]
+if not _OFFER:
+    bad("抽不到 _ios_offer_download —— 下载通道没有被收成一个函数")
+elif _dup:
+    bad("下载通道不是一处实现(这几样在别处还有一份, 或不在通道函数里): %s" % "、".join(_dup))
+else:
+    ok("临时 HTTP / nft 放行 / 二维码全仓各只有一处, 都在 _ios_offer_download 里")
+
+# 真的把这个函数跑起来。会真动机器的三样(nft / qrencode / 起 HTTP 的 timeout)换成**真文件**
+# 桩 —— 函数里是 `exec timeout …`, exec 只认可执行文件, shell 函数在这里换不掉它。
+CH = tempfile.mkdtemp(prefix="ioschan-")
+TMPS.append(CH)
+CHBIN = os.path.join(CH, "bin")
+os.makedirs(CHBIN)
+CHLOG = os.path.join(CH, "log")
+CHREADY = os.path.join(CH, "ready")
+CHSRC = os.path.join(CH, "prev.mobileconfig")
+with open(CHSRC, "wb") as f:
+    f.write(b"<?xml version=\"1.0\"?><plist><dict><key>prev</key></dict></plist>\n")
+CHSHA = hashlib.sha256(open(CHSRC, "rb").read()).hexdigest()
+
+for _name, _body in (
+        ("nft", '#!/bin/sh\necho "nft $*" >> "$PDG_TEST_LOG"\n'),
+        ("qrencode", '#!/bin/sh\necho "qrencode $*" >> "$PDG_TEST_LOG"\n'),
+        # timeout 记下自己被怎么调起来、服务目录里到底是什么, 然后变成一个可被 kill 的长命
+        # 进程 —— "按回车即收"到底收没收干净, 靠它活着还是死了来判。
+        ("timeout", '#!/bin/sh\n'
+                    '{ echo "timeout-args=$*"\n'
+                    '  echo "serve-cwd=$PWD"\n'
+                    '  echo "serve-files=$(ls)"\n'
+                    '  echo "serve-sha=$(sha256sum -- *.mobileconfig | awk \'{print $1}\')"\n'
+                    '  echo "serve-pid=$$"\n'
+                    '} >> "$PDG_TEST_LOG"\n'
+                    ': > "$PDG_TEST_READY"\n'
+                    'exec sleep 30\n')):
+    _p = os.path.join(CHBIN, _name)
+    with open(_p, "w", encoding="utf-8") as f:
+        f.write(_body)
+    os.chmod(_p, 0o755)
+
+HARNESS_CH = r"""
+set -u
+sed -n '/^_ios_offer_download()/,/^}/p' deploy/bot/pdg.sh > "$CH_DIR/fn.sh"
+grep -q 'http.server' "$CH_DIR/fn.sh" || { echo "EXTRACT-FAIL"; exit 9; }
+c_g(){ echo "$*"; }; c_y(){ echo "$*"; }
+# shellcheck source=/dev/null
+. "$CH_DIR/fn.sh"
+# 桩里的 HTTP 一起来就 touch ready, 这里的"回车"随之到达 —— 不靠 sleep 猜时序。
+_ios_offer_download "$CH_SRC" 203.0.113.10 172.22.0.0/16 "这一份是**上一版**" \
+  < <(n=0; while [ ! -e "$PDG_TEST_READY" ]; do sleep 0.05
+        n=$((n+1)); [ "$n" -gt 200 ] && break; done)
+echo "RC=$?"
+"""
+_chenv = dict(os.environ, PATH=CHBIN + os.pathsep + os.environ.get("PATH", ""),
+              PDG_TEST_LOG=CHLOG, PDG_TEST_READY=CHREADY, CH_DIR=CH, CH_SRC=CHSRC)
+_r = subprocess.run(["bash", "-c", HARNESS_CH], capture_output=True, text=True,
+                    cwd=str(ROOT), timeout=180, env=_chenv)
+_chout = (_r.stdout or "") + (_r.stderr or "")
+_chlog = open(CHLOG, encoding="utf-8").read() if os.path.exists(CHLOG) else ""
+
+
+def _lv(key):
+    m = re.search(r"^%s=(.*)$" % re.escape(key), _chlog, re.M)
+    return m.group(1).strip() if m else ""
+
+
+if _lv("timeout-args") == "600 python3 -m http.server 8443 --bind 0.0.0.0":
+    ok("下载通道真的起了 HTTP:8443, 并自带 10 分钟硬超时(没人管也会自己收)")
+else:
+    bad("HTTP 没按预期起: timeout-args=%r\n%s" % (_lv("timeout-args"), _chout[:300]))
+
+_tok = re.match(r"^([0-9a-f]{12})\.mobileconfig$", _lv("serve-files"))
+_url = "http://203.0.113.10:8443/%s.mobileconfig" % (_tok.group(1) if _tok else "?")
+if _tok and _lv("serve-sha") == CHSHA and _url in _chout:
+    ok("服务目录里只有那一份产物且逐字节相同, 路径是一次性随机名(同网段猜不到)")
+else:
+    bad("服务的内容/路径不对: files=%r sha=%r" % (_lv("serve-files"), _lv("serve-sha")))
+
+_nft = re.findall(r"^nft (.*)$", _chlog, re.M)
+_ins = [i for i, x in enumerate(_nft)
+        if x == "insert rule inet pdg input ip saddr 172.22.0.0/16 tcp dport 8443 accept"]
+_res = [i for i, x in enumerate(_nft) if x == "-f /etc/nftables.conf"]
+if _ins and _res and _res[-1] > _ins[0]:
+    ok("放行只对内网卡段开 8443, 收尾时 nft -f 原样还原")
+else:
+    bad("nft 动作不对: %r" % (_nft,))
+
+if ("qrencode -o /opt/pdg-bot/ios-qr.png " + _url) in _chlog \
+        and ("qrencode -t ANSIUTF8 " + _url) in _chlog:
+    ok("二维码(终端 + PNG)指向的就是这一次的临时链接")
+else:
+    bad("二维码不对: %r" % [x for x in _chlog.splitlines() if x.startswith("qrencode")])
+
+if _lv("serve-cwd") and not os.path.exists(_lv("serve-cwd")):
+    ok("收尾时临时目录连同那份产物一起删掉了, 服务器上不留副本")
+else:
+    bad("临时目录还在: %r" % _lv("serve-cwd"))
+
+_pid = int(_lv("serve-pid") or 0)
+_alive = True
+for _ in range(60):
+    try:
+        os.kill(_pid, 0)
+    except OSError:
+        _alive = False
+        break
+    except ValueError:
+        break
+    subprocess.run(["sleep", "0.05"], timeout=10)
+if _pid and not _alive:
+    ok("按回车即收: HTTP 进程当场就没了, 不是留着等 10 分钟超时")
+else:
+    bad("退出后 HTTP 进程还活着(pid=%s) —— 端口会一直开到超时" % _pid)
+    if _pid:
+        try:
+            os.kill(_pid, 9)
+        except OSError:
+            pass
+
+if "RC=0" in _chout and "这一份是**上一版**" in _chout:
+    ok("通道把调用方给的附注原样带给用户, 正常收尾返回 0")
+else:
+    bad("通道收尾不对: %r" % _chout[-300:])
 
 print("─" * 40)
 print("通过 %d, 失败 %d" % (PASS[0], FAIL[0]))

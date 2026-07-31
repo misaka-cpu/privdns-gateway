@@ -62,9 +62,14 @@ fi
 # 排除 *.md: 这条规则管的是**代码**只能有一个事实源, 而面向用户的文档必须把端口写出来 ——
 # 让人在浏览器地址栏里输 `$PDG_RESCUE_PORT` 是没有意义的。代码与测试仍然一处字面量都不许有。
 # 本测试从不写死端口, 用的是 source 出来的 $PORT —— 所以它自己也在扫描范围内。
-mapfile -t hits < <(cd "$ROOT" && grep -rn --binary-files=without-match "\b$PORT\b" \
-  --exclude-dir=.git --exclude-dir=__pycache__ --exclude="*.md" . 2>/dev/null \
-  | grep -v "^./lib/rescue.sh:")
+# 扫**被 git 跟踪的文件**, 不是扫目录里躺着什么。判据本意是"本仓库的代码里只有一处事实
+# 源" —— 而目录里可能还有 git worktree(`.claude/worktrees/*` 各带一份完整检出)、构建产物、
+# 临时目录。按目录扫会把它们算进来, 红得毫无意义, 而且红的原因与被测对象无关。
+# 2026-07-31 就红过一次: 两个 worktree 里的 lib/rescue.sh 副本被数成了"字面量散落 5 处"。
+mapfile -t hits < <(cd "$ROOT" && git ls-files -z 2>/dev/null \
+  | grep -zZv -e '\.md$' \
+  | xargs -0r grep -n --binary-files=without-match "\b$PORT\b" /dev/null 2>/dev/null \
+  | grep -v "^lib/rescue.sh:")
 if [[ ${#hits[@]} -eq 0 ]]; then
   ok "除 lib/rescue.sh 外, 全仓没有端口 $PORT 的字面量"
 else

@@ -207,13 +207,26 @@ fail-closed,靠遗漏表达"不需要动作"会在恢复时变成一次拒绝,�
 
 ```
 pdg ios                 # 生成/更新并临时提供下载(二维码)
+pdg ios previous        # 取回上一版并临时提供下载(二维码);记录的当前版本不回退
 pdg ios status          # 当前版本 / 上次发送 / 三档判定
 pdg ios diff            # current ↔ previous 的字段级差异
-pdg ios previous        # 取出上一版产物(不改当前版本)
 pdg ios ack             # 用户自述旧描述文件已删除, 关掉迁移提示
 pdg ios recover         # 清理中断残留, 检查产物与记录是否一致
 pdg ios repair          # 按记录逐字节复原 current(复原不了就拒绝)
 ```
+
+上面两条会开临时下载通道,其余四条只读、**不开任何端口**。
+
+**临时下载通道**(`deploy/bot/pdg.sh` 的 `_ios_offer_download`,两条命令共用一处实现):
+二维码 → 临时 HTTP `:8443` → 只对内网卡段的临时 nft 放行 → 按回车或 10 分钟后一起撤掉,
+临时目录连同那份产物一起删。文件名带一次性随机串,同网段的别的设备猜不到这一次的路径。
+文件是先落到临时目录再由通道下发的,服务器上不留副本。
+
+`pdg ios previous` 交出去的字节同样先过 `iosstate.verified_artifact()`:与记录对不上就
+拿不到文件,**也就没有端口会被打开**——通道只服务于已经确认过的那一份产物,和 Bot 一样严。
+5.4 早期它只把文件写到 `/opt/pdg-bot/PrivDNS-Gateway-prev.mobileconfig`:服务器上有了,
+手机却没有任何办法拿到它,而命令输出照样说"已取出上一版"——于是"取回上一版"实际上只有
+Telegram Bot 那条路能用。
 
 Bot:「📱 客户端」→「📱 iOS 描述文件」。Android 平台上这些入口既不显示,后端也逐个拒绝
 (旧消息里的按钮被点、`/ios` 被打都拒),并且不产生任何文件、不写任何记录。
@@ -225,7 +238,7 @@ Bot:「📱 客户端」→「📱 iOS 描述文件」。Android 平台上这些
 | `tests/test-ios-profile-legacy.py` | v1.7.8 现状的特征化快照;翻转出现在它的 diff 里 |
 | `tests/test-ios-profile-shared.py` | Bot 与 CLI **真的跑两条路**再逐字节比对;私钥零外泄 |
 | `tests/test-ios-profile-lifecycle.py` | 稳定身份、三档判定、current/previous、事务原子性 |
-| `tests/test-ios-profile-ux.py` | 两个界面同一份记录、禁用词表、Android 全拒 |
+| `tests/test-ios-profile-ux.py` | 两个界面同一份记录、禁用词表、Android 全拒、子命令各落各的路(previous 开通道,只读的不开端口)、通道真跑一遍 |
 | `tests/test-ios-profile-persist.py` | update / 快照回滚 / 备份恢复 / 平台来回切都不丢身份与产物 |
 | `tests/test-ios-profile-integrity.py` | 六种人为损坏必须检出;两个状态互不污染;修复边界 |
 | `tests/test-ios-profile-restore.py` | 快照与备份逐字节恢复(CA A→B→C)、旧格式备份、失败整组回滚、软链/硬链/权限 |
