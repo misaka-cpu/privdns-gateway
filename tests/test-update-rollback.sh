@@ -29,7 +29,12 @@ mksnap A OLD; sleep 1; mksnap B NEW    # B 更新(mtime 更晚 → ls -t 里 ind
 
 # ── 沙箱 REPO_DIR: 两提交的 git 仓库 ─────────────────────────────────────────
 REPO="$WORK/repo"; mkdir -p "$REPO"
-( cd "$REPO" && git init -q && git config user.email t@t && git config user.name t \
+# 这里的 `&&` 链本身是安全的(cd 失败会短路), 但守卫盯的是另一件事: $WORK 将来被改成别的
+# 地方时, "在一次性库里动 ref"这个前提必须仍然成立, 而不是靠读代码去确认。
+# shellcheck source=tests/repoguard.sh
+source "$(dirname "${BASH_SOURCE[0]}")/repoguard.sh"
+( cd "$REPO" && git init -q && E2E_ROOT="$ROOT" e2e_guard_repo . \
+  && git config user.email t@t && git config user.name t \
   && echo v1 > f && git add f && git commit -qm c1 && echo v2 > f && git add f && git commit -qm c2 )
 GOOD_REF=$(git -C "$REPO" rev-parse HEAD~1)   # 第一提交
 HEAD_REF=$(git -C "$REPO" rev-parse HEAD)

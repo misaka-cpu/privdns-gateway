@@ -15,6 +15,11 @@
 #     e2e_summary
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ref 守卫单独放一个文件: test-update-rollback.sh 这类**不走 e2e harness** 的用例也要用,
+# 而整个 source 本文件会连 ok()/bad() 一起覆盖掉它自己的计数器(这个坑踩过)。
+# shellcheck source=tests/repoguard.sh
+source "$(dirname "${BASH_SOURCE[0]}")/repoguard.sh"
+
 E2E_PASS=0; E2E_FAIL=0
 ok(){ echo "[OK]   $1"; E2E_PASS=$((E2E_PASS+1)); }
 bad(){ echo "[FAIL] $1"; E2E_FAIL=$((E2E_FAIL+1)); }

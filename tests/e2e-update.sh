@@ -58,6 +58,7 @@ REPO=/opt/privdns-gateway
 ORIGIN=/tmp/e2e-origin.git
 rm -rf "$REPO/.git" "$ORIGIN"            # e2e_seed_install 拷进来的是开发机/CI 的 .git, 弃用
 git -C "$REPO" init -q -b main
+e2e_guard_repo "$REPO" || exit 1     # 刚 init 出来的一次性库才准动 ref
 git -C "$REPO" config user.email t@t; git -C "$REPO" config user.name t
 git -C "$REPO" config commit.gpgsign false
 git -C "$REPO" add -A >/dev/null 2>&1
@@ -222,6 +223,7 @@ _snap="$(find /opt/pdg-bot -type f -exec sha256sum {} + 2>/dev/null | sort | sha
 _cfg="$(sha256sum /etc/mosdns/config.yaml | cut -d' ' -f1)"
 git -C "$REPO" tag -l 'v*' | xargs -r git -C "$REPO" tag -d >/dev/null 2>&1
 ( cd "$ORIGIN" || { echo "[FAIL] ORIGIN 不存在"; exit 1; }
+  e2e_guard_repo . || exit 1
   git tag -l 'v*' | xargs -r git tag -d >/dev/null 2>&1 ) || true
 out=$(bash /usr/local/bin/pdg update 2>&1); rc=$?
 { [[ "$rc" != 0 ]] && grep -qE '没有发布 tag|没有任何发布 tag|无法确定目标版本' <<<"$out"; } \
