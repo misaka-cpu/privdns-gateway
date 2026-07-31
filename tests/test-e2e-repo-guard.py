@@ -105,8 +105,19 @@ CALL = ('source "%s"\nE2E_ROOT=%%r\ne2e_guard_repo %%r\n' % LIB) % (ROOT, "%s")
 # 每条都带上**必须由哪道门给出的理由**。只断言"被拒了"是不够的: 这几道门互为兜底,
 # 拆掉任何一道另一道都会补位, 于是负控咬不住 —— 而每道门存在的意义正是它那句话本身
 # (比如"不是 git 仓库"要告诉你 git 会向上找到别的仓库, 这是最容易被忽略的一种)。
+# ROOT 自己可能就是个 linked worktree —— 本仓库的 .claude/worktrees/* 正是, 而这套用例
+# 也会在那里面跑。那时"拒绝源码仓库"会先被**自持**那道门(ref 库不属于这个目录自己)拦下,
+# 而不是"与源码仓库共用"那道。两句都是对的, 哪句先开口取决于仓库是怎么检出的 —— 所以期望
+# 值要按实际形态算出来, 不能写死一句。写死的下场就是在 worktree 里一片假红, 而假红的原因
+# 与被测对象无关: 这正是今天已经栽过三次的那类毛病。
+_cd = subprocess.run(["git", "-C", ROOT, "rev-parse", "--git-common-dir"],
+                     capture_output=True, text=True, timeout=60).stdout.strip()
+_root_is_worktree = os.path.realpath(os.path.join(ROOT, _cd)) != \
+    os.path.realpath(os.path.join(ROOT, ".git"))
+ROOT_WHY = "ref 库不属于这个目录自己" if _root_is_worktree else "共用同一个 ref 库"
+
 for label, target, want_ok, want_why in (
-        ("源码仓库本体", ROOT, False, "共用同一个 ref 库"),
+        ("源码仓库本体", ROOT, False, ROOT_WHY),
         ("一次性 /tmp 仓库", fresh, True, None),
         ("根本不是仓库的目录", plain, False, "不是 git 仓库"),
         ("不存在的目录", os.path.join(plain, "nope"), False, "目录不存在")):
