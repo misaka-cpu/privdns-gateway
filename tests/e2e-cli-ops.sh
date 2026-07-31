@@ -180,7 +180,13 @@ git init -q --bare /tmp/e2e-cli-origin.git
 # 开发者的真仓库: 本机上它真的往仓库里塞了一个 "base" 提交、把 user.name 改成 t、
 # 把 origin 换成 /tmp 里的裸库、还打了个 v9.9.9 标签。一个静默失败的 cd 能干这么多事。
 ( cd /opt/privdns-gateway || { echo "[FAIL] /opt/privdns-gateway 不存在, 拒绝在当前目录执行 git 操作"; exit 1; }
-  git init -q -b main 2>/dev/null; git config user.email t@t; git config user.name t
+  # 目录存在**证明不了**这个仓库可以随便动: worktree 的路径也存在, 而它的 ref 与主仓库共享。
+  # 2026-07-31 丢掉全部 tag 与 remote-tracking 就是从下面这几条开始的。
+  # 守卫放在 init 之后: init 之前这里可能还不是仓库(会假拒); 而 `git init` 落在 worktree
+  # 上并不会把它从共享 ref 库里摘出来 —— 那种情况守卫照样拦得住。
+  git init -q -b main 2>/dev/null
+  e2e_guard_repo . || exit 1
+  git config user.email t@t; git config user.name t
   git config commit.gpgsign false
   git add -A >/dev/null 2>&1; git commit -qm base >/dev/null 2>&1
   git remote remove origin >/dev/null 2>&1
@@ -213,6 +219,7 @@ git init -q --bare /tmp/e2e-empty-origin.git
   git remote remove origin >/dev/null 2>&1
   git remote add origin /tmp/e2e-empty-origin.git
   git push -q origin HEAD:refs/heads/main >/dev/null 2>&1 ) || true
+e2e_guard_repo /opt/privdns-gateway || exit 1
 git -C /opt/privdns-gateway tag -l 'v*' | xargs -r git -C /opt/privdns-gateway tag -d >/dev/null 2>&1
 BEFORE="$(hash_state)"
 out=$(pdg update --dry-run 2>&1); rc=$?

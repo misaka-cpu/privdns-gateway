@@ -25,3 +25,7 @@ tls/
 
 # 测试用钉死版内核(prepare-mihomo.sh 下载并校验 SHA256 后放这儿, 不入库)
 tests/.bin/
+
+# Claude Code 的 worktree 挂在这里。它们是**独立的 git 检出**, 绝不能进版本库 ——
+# `git add -A` 会把它们当成嵌入仓库收进去, 而克隆方拿到的是三个空目录。
+.claude/

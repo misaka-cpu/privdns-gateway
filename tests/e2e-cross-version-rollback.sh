@@ -72,6 +72,7 @@ REPO=/opt/privdns-gateway
 ORIGIN=/tmp/e2e-xver-origin.git
 rm -rf "$REPO/.git" "$ORIGIN"
 git -C "$REPO" init -q -b main
+e2e_guard_repo "$REPO" || exit 1     # 刚 init 出来的一次性库才准动 ref
 git -C "$REPO" config user.email t@t; git -C "$REPO" config user.name t
 git -C "$REPO" config commit.gpgsign false
 # 第一个提交 = v1.5.12 的全部代码(更新器就来自它)
