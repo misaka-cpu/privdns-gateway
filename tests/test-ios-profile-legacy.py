@@ -8,7 +8,8 @@
 
 这些断言在 5.4 推进过程中会**逐条被故意翻转** —— 翻转出现在本文件的 diff 里, 那就是"这次
 改动改掉了哪一条现状"的证据。已经翻转的:
-  · CLI 自己拼占位符 → 改调 iosprofile.py(收敛由 test-ios-profile-shared.py 逐字节验证)。
+  · CLI 自己拼占位符 → 改调 iosprofile.py(收敛由 test-ios-profile-shared.py 逐字节验证);
+  · 临时下载通道内联在 cmd_ios 里 → 抽成 _ios_offer_download, 与「取回上一版」共用。
 仍然成立的(受管生命周期启用后才会变):
   · 未启用受管生命周期时, Bot 每次生成仍是随机身份。
 """
@@ -180,17 +181,21 @@ else:
 
 # ── 4. CLI 侧 ──────────────────────────────────────────────────────────────
 # v1.7.8 这里是 `sed` 换四个占位符, 既不支持 SSID 排除也不附 WLOC 根证书。收敛到统一生成器
-# 之后这两条断言翻转了(收敛本身由 test-ios-profile-shared.py 逐字节验证), 留下的是临时下载
-# 通道那部分 —— 那是 CLI 独有的, 不该被这次重构动到。
+# 之后这两条断言翻转了(收敛本身由 test-ios-profile-shared.py 逐字节验证)。临时下载通道
+# 曾经**内联在 cmd_ios 里**, 也是 CLI 独有的一份; 现在它被抽成 _ios_offer_download, 由
+# 「生成当前版」和「取回上一版」共用 —— 后者以前只把文件写到服务器上, 手机拿不到。
 pdg_sh = open(os.path.join(ROOT, "deploy/bot/pdg.sh"), encoding="utf-8").read()
 m = re.search(r"^cmd_ios\(\)\{.*?^\}", pdg_sh, re.S | re.M)
 cli = m.group(0) if m else ""
+m = re.search(r"^_ios_offer_download\(\)\{.*?^\}", pdg_sh, re.S | re.M)
+chan = m.group(0) if m else ""
 if "iosstate.py" in cli and "__UUID" not in cli and "random/uuid" not in cli:
     ok("CLI 不再自己拼占位符/自取随机 UUID, 改调 iosstate.py(与 Bot 同一份实现与记录)")
 else:
     bad("CLI 仍在自己生成描述文件")
-if "python3 -m http.server" in cli and "nft insert rule" in cli:
-    ok("现状(CLI): 临时 HTTP + 临时 nft 放行, 退出时 nft -f 还原")
+if "python3 -m http.server" in chan and "nft insert rule" in chan \
+        and "python3 -m http.server" not in cli and "_ios_offer_download" in cli:
+    ok("现状(CLI): 临时 HTTP + 临时 nft 放行搬进 _ios_offer_download, cmd_ios 调它而不是自带一份")
 else:
     bad("CLI 的临时下载通道形态变了")
 

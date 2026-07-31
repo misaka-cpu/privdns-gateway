@@ -120,7 +120,7 @@ sudo pdg traffic    # 网卡流量（vnstat）
 sudo pdg ios        # 仅 iOS：生成/更新描述文件并在终端打出二维码
 sudo pdg ios status # 仅 iOS：当前第几版 / 上次发送 / 是否需要重新安装
 sudo pdg ios diff   # 仅 iOS：当前版与上一版的字段级差异
-sudo pdg ios previous  # 仅 iOS：取出上一版（不改当前版本）
+sudo pdg ios previous  # 仅 iOS：取回上一版并打出二维码（只是把旧文件再给你一次，当前版本不回退）
 sudo pdg report     # 脱敏诊断报告；--redact-ip 连 IP/域名一起隐藏；--full 不脱敏
 sudo pdg detect-cidr           # 重新识别内网卡来源段，与现配不符可写回并重启
 sudo pdg hijack-mode <all|gfw>          # 切换劫持模式
