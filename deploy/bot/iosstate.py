@@ -784,6 +784,18 @@ def main(argv=None):
             msgs = recover()
             print("\n".join(msgs) if msgs else "没有需要清理的残留, 产物与记录一致。")
         elif a.cmd == "repair":
+            # 已经好的就不动它。照旧重写一遍虽然是幂等的, 但对外说"已复原"是不准确的 ——
+            # 用户据此会以为刚才真出过问题。
+            meta = load()
+            if not meta or not meta.get("current"):
+                sys.stderr.write("还没有生成过受管描述文件, 没有可复原的对象。\n")
+                return 4
+            st, detail = artifact_health(meta, "current")
+            if st == HEALTHY:
+                print("%s: %s" % (HEALTH_LABEL[st], detail))
+                print("无需修复。")
+                return 0
+            print("%s: %s" % (HEALTH_LABEL[st], detail))
             der = iosprofile.ca_der_for(iosprofile.wloc_enabled(a.wloc_config), a.ca_crt) \
                 if a.wloc_config else b""
             meta = repair_current(der, a.template)

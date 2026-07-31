@@ -252,6 +252,28 @@ else:
     else:
         bad("revision 被推进了")
 
+# `pdg ios repair` 在文件本就正常时必须说"无需修复", 而不是"已复原" —— 后者会让用户以为
+# 刚才真出过问题。文件坏了才动手, 且动手前先把坏在哪说出来。
+ST = os.path.join(BOTDIR, "iosstate.py")
+# 这一段不带 WLOC: repair 的 CA 参数由 --wloc-config/--ca-crt 决定, 不传就等于"手上没有证书"。
+# 用一个本来就没有 CA 的版本, 才是在验"正常/缺失"这两种情形本身, 而不是又一次验指纹那道门。
+b = Box()
+b.gen()
+env = dict(os.environ, PDG_TX_FSROOT=b.root, PDG_LOCKFILE=b.root + "/run/privdns-gateway.lock")
+r = subprocess.run([sys.executable, ST, "repair", "--template", TMPL],
+                   capture_output=True, text=True, timeout=180, env=env)
+if r.returncode == 0 and "无需修复" in r.stdout and "已按记录" not in r.stdout:
+    ok("产物正常时 `repair` 只报「无需修复」, 不谎称复原过")
+else:
+    bad("正常时的 repair 输出不对: rc=%d %r" % (r.returncode, r.stdout[:150]))
+_drop_current(b)
+r = subprocess.run([sys.executable, ST, "repair", "--template", TMPL],
+                   capture_output=True, text=True, timeout=180, env=env)
+if r.returncode == 0 and "已按记录" in r.stdout and "缺失" in r.stdout:
+    ok("产物真的缺失时: 先说清坏在哪, 再复原")
+else:
+    bad("缺失时的 repair 输出不对: rc=%d %r %r" % (r.returncode, r.stdout[:150], r.stderr[-150:]))
+
 print()
 print("══ 四、previous 不许猜着重建 ══")
 b = Box()
