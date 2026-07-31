@@ -1339,7 +1339,8 @@ ic_gate(){
   return 0
 }
 
-# iOS 生命周期子命令。这几个都不开临时下载端口 —— 它们只是看记录/取文件。
+# iOS 生命周期的只读子命令。这几个**不开**临时下载端口 —— 它们只是看记录。
+# (取回上一版要把文件送到手机上, 因此不在这里, 见 cmd_ios_previous。)
 cmd_ios_state(){
   need_root ios
   ic_gate || return 1
@@ -1364,10 +1365,6 @@ cmd_ios_state(){
       python3 "$st" repair --template "$IOS_TMPL" \
         --wloc-config /etc/privdns-gateway/mitm.json --ca-crt /etc/privdns-gateway/ca/ca.crt
       ;;
-    previous)
-      local out=/opt/pdg-bot/PrivDNS-Gateway-prev.mobileconfig
-      python3 "$st" previous --out "$out" && echo "已写到 $out"
-      ;;
     *) echo "用法: pdg ios {status|diff|previous|ack|recover|repair}"; return 2;;
   esac
 }
@@ -1389,22 +1386,92 @@ _ios_server_ip(){
   printf '%s' "$ip"
 }
 
+_ios_internal_cidr(){
+  grep -oE 'ip saddr [0-9./]+' /etc/nftables.conf 2>/dev/null | head -1 | awk '{print $3}'
+}
+
+# 给一份**已经生成好**的描述文件开一条临时下载通道, 用完就收:
+#   二维码 → 临时 HTTP :8443 → 只对内网卡段的临时 nft 放行 → 回车或 10 分钟后一起撤掉。
+# 当前版(cmd_ios)和上一版(cmd_ios_previous)共用这一处 —— 手机取件只有这一条路, 于是加固
+# (一次性路径、放行范围、超时、收尾)只有一个地方要改, 不存在"改了一边、另一边照旧"。
+# 用法: _ios_offer_download <文件> <网关IP> <内网卡段> [附注行…]
+_ios_offer_download(){
+  local SRC="$1" IP="$2" CIDR="$3"; shift 3
+  [[ -s "$SRC" ]] || { echo "❌ 没有可下发的文件, 未开放任何临时端口。"; return 1; }
+  command -v qrencode >/dev/null || { c_g "装 qrencode…"; apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq qrencode; }
+  local PORT=8443 TOK WWW URL SRV="" note
+  TOK=$(openssl rand -hex 6)
+  WWW=$(mktemp -d)
+  # 文件名带一次性随机串: 同一网段里的别的设备猜不到这一次的路径。
+  if ! install -m 0644 "$SRC" "$WWW/$TOK.mobileconfig"; then
+    rm -rf "$WWW"; echo "❌ 准备临时下载目录失败, 未开放任何临时端口。"; return 1
+  fi
+  URL="http://$IP:$PORT/$TOK.mobileconfig"
+
+  trap 'kill "$SRV" 2>/dev/null; nft -f /etc/nftables.conf 2>/dev/null; rm -rf "$WWW"; trap - INT TERM' INT TERM
+  nft insert rule inet pdg input ip saddr "$CIDR" tcp dport "$PORT" accept 2>/dev/null
+  # exec: 让下面那个 kill 直接打在 timeout 上(它再转发给 python3)。少了它被杀的只是外层
+  # 子 shell, 端口会一直开到 10 分钟超时为止 —— 与"按回车即收"不符。
+  ( cd "$WWW" && exec timeout 600 python3 -m http.server "$PORT" --bind 0.0.0.0 >/dev/null 2>&1 ) &
+  SRV=$!
+  qrencode -o /opt/pdg-bot/ios-qr.png "$URL" 2>/dev/null || true
+  echo
+  c_g "用手机(走【内网卡/蜂窝】, 关 WiFi)扫下面二维码 → Safari 打开 → 安装描述文件:"
+  echo; qrencode -t ANSIUTF8 "$URL"; echo
+  echo "  链接: $URL"
+  for note in "$@"; do echo "  $note"; done
+  echo "  (二维码 PNG 已存 /opt/pdg-bot/ios-qr.png)"
+  c_y "装好后按回车收尾(10 分钟自动收)…"
+  read -t 600 -r _ || true
+  kill "$SRV" 2>/dev/null
+  nft -f /etc/nftables.conf 2>/dev/null   # 撤掉临时放行
+  rm -rf "$WWW"
+  trap - INT TERM
+  echo "已关闭临时下载服务。"
+}
+
+# 取回上一版: 走的是与 `pdg ios` **同一条**临时下载通道。以前这里只把文件写到服务器上的
+# /opt/pdg-bot/, 手机没有任何办法拿到它, 命令却照样说"已取出" —— 于是"取回上一版"实际上
+# 只有 Telegram Bot 那条路能用, 而文档和输出都不像是这么回事。
+cmd_ios_previous(){
+  need_root ios
+  ic_gate || return 1
+  local st; st="$(_pdg_module iosstate.py)" || { echo "❌ 找不到 iosstate.py, 先跑 pdg update"; return 1; }
+  local IP CIDR
+  IP="$(_ios_server_ip)"
+  CIDR="$(_ios_internal_cidr)"
+  [[ -n "$IP" && -n "$CIDR" ]] || { echo "信息不全 (IP=$IP CIDR=$CIDR), 未开放任何临时端口。"; return 1; }
+  local STAGE OUT rc
+  STAGE=$(mktemp -d); OUT="$STAGE/PrivDNS-Gateway-prev.mobileconfig"
+  # 取字节这一步在 iosstate.py 里过 verified_artifact(): 与记录对不上就拿不到文件, 也就
+  # 不会有端口被打开 —— 通道只服务于已经确认过的那一份产物, 和 Bot 那条路一样严。
+  if ! python3 "$st" previous --out "$OUT"; then
+    rm -rf "$STAGE"; echo "❌ 取不出上一版, 未开放任何临时端口。"; return 1
+  fi
+  _ios_offer_download "$OUT" "$IP" "$CIDR" \
+    "这一份是**上一版**: 只是把旧文件再给你一次, 记录的当前版本不会回退。"
+  rc=$?
+  rm -rf "$STAGE"
+  return $rc
+}
+
 cmd_ios(){
   need_root ios
   # 平台门控: Android 直接拒绝 —— 不装 qrencode、不临时改 nft、不开 8443。
   ic_gate || return 1
-  # 子命令(只看记录/取文件, 不开端口)。无参数 = 生成并临时提供下载。
+  # 子命令。只看记录的那几个不开端口; previous 要把文件送到手机上, 走与本函数同一条通道。
+  # 无参数 = 生成并临时提供下载。
   case "${1:-}" in
-    status|diff|previous|ack|recover|repair) cmd_ios_state "$@"; return $?;;
+    status|diff|ack|recover|repair) cmd_ios_state "$@"; return $?;;
+    previous) shift; cmd_ios_previous "$@"; return $?;;
   esac
   local TMPL="$IOS_TMPL"
   [[ -f "$TMPL" ]] || { echo "缺少 $TMPL, 先装好 PrivDNS Gateway"; return 1; }
-  command -v qrencode >/dev/null || { c_g "装 qrencode…"; apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq qrencode; }
   # 取 DoT 主机名(证书 CN)/ 公网 IP / 内网卡段
   local HOST IP CIDR
   HOST="$(_ios_dot_host)"
   IP="$(_ios_server_ip)"
-  CIDR=$(grep -oE 'ip saddr [0-9./]+' /etc/nftables.conf 2>/dev/null | head -1 | awk '{print $3}')
+  CIDR="$(_ios_internal_cidr)"
   [[ -n "$HOST" && -n "$IP" && -n "$CIDR" ]] || { echo "信息不全 (HOST=$HOST IP=$IP CIDR=$CIDR)"; return 1; }
 
   # 生成走 iosstate.py(内部再调 iosprofile.py)—— 和 Bot 的「📱 iOS 描述文件」是同一份实现,
@@ -1427,33 +1494,17 @@ cmd_ios(){
     fi
     [[ "$ans" == [yY]* ]] && LEGACY=(--legacy)
   fi
-  local PORT=8443 TOK WWW URL
-  TOK=$(openssl rand -hex 6)
-  WWW=$(mktemp -d)
+  local STAGE OUT rc
+  STAGE=$(mktemp -d); OUT="$STAGE/PrivDNS-Gateway.mobileconfig"
   if ! python3 "$ST" generate --dot-host "$HOST" --server-ip "$IP" --template "$TMPL" \
         --wloc-config /etc/privdns-gateway/mitm.json --ca-crt /etc/privdns-gateway/ca/ca.crt \
-        --out "$WWW/$TOK.mobileconfig" "${LEGACY[@]}"; then
-    rm -rf "$WWW"; echo "❌ 生成描述文件失败, 未开放任何临时端口。"; return 1
+        --out "$OUT" "${LEGACY[@]}"; then
+    rm -rf "$STAGE"; echo "❌ 生成描述文件失败, 未开放任何临时端口。"; return 1
   fi
-  URL="http://$IP:$PORT/$TOK.mobileconfig"
-
-  local SRV=""
-  trap 'kill "$SRV" 2>/dev/null; nft -f /etc/nftables.conf 2>/dev/null; rm -rf "$WWW"; trap - INT TERM' INT TERM
-  nft insert rule inet pdg input ip saddr "$CIDR" tcp dport "$PORT" accept 2>/dev/null
-  ( cd "$WWW" && timeout 600 python3 -m http.server "$PORT" --bind 0.0.0.0 >/dev/null 2>&1 ) &
-  SRV=$!
-  qrencode -o /opt/pdg-bot/ios-qr.png "$URL" 2>/dev/null || true
-  echo
-  c_g "用手机(走【内网卡/蜂窝】, 关 WiFi)扫下面二维码 → Safari 打开 → 安装描述文件:"
-  echo; qrencode -t ANSIUTF8 "$URL"; echo
-  echo "  链接: $URL"
-  echo "  DoT:  $HOST   (PNG 已存 /opt/pdg-bot/ios-qr.png)"
-  c_y "装好后按回车收尾(10 分钟自动收)…"
-  read -t 600 -r _ || true
-  kill "$SRV" 2>/dev/null
-  nft -f /etc/nftables.conf 2>/dev/null   # 撤掉临时放行
-  rm -rf "$WWW"
-  echo "已关闭临时下载服务。"
+  _ios_offer_download "$OUT" "$IP" "$CIDR" "DoT:  $HOST"
+  rc=$?
+  rm -rf "$STAGE"
+  return $rc
 }
 
 cmd_uninstall(){

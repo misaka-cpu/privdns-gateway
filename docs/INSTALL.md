@@ -116,7 +116,7 @@ sudo PDG_NONINTERACTIVE=1 \
 | 81 | tcp | 仅内网卡段 | **仅 iOS**：OnDemand 探测端点（`pdg-probe81`，任意 GET 返回 HTTP 200；Android 平台不安装、不开放） |
 | 5228-5230 | tcp | 仅内网卡段 | **仅 Android**：GMS/FCM 推送(mtalk.google.com 原生端口,经 mihomo 嗅探分流)；iOS 走 APNs，装机即剥掉这一段 |
 | 9090 | tcp | 仅 127.0.0.1 | mihomo clash_api(bot 用,不对外) |
-| 8443 | tcp | 临时·仅内网卡 | `pdg ios` 下发描述文件时短开,用完自动关 |
+| 8443 | tcp | 临时·仅内网卡 | `pdg ios` / `pdg ios previous` 下发描述文件时短开,用完自动关 |
 
 Bot 的“临时观测/控制面板”开启期间，9090 会临时监听 `0.0.0.0`，但 nftables 只允许安装时识别的内网卡段访问；面板可查看流量/连接并断开连接，持久规则和出口配置仍通过 Bot/CLI 修改。关闭、到时或 Bot 重启后会收回到 `127.0.0.1`。
 
