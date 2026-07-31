@@ -140,6 +140,26 @@ def make_inputs(dot_host, server_addresses, ssids=(), wloc_enabled=False, ca_der
     }
 
 
+def effective_ssids(meta, ssids):
+    """`None` = 调用方没指定 → **沿用记录里的**; 传了列表(哪怕是空的)= 明确设置。
+
+    SSID 名单参与 digest, 就等于它是受管配置的一部分。把"没传"当成"用户要清空"会同时坏两
+    件事: 状态页永远挂着一条谁也没做过的「建议更新」(每次都拿空名单跟记录比), 而下一次
+    普通生成会把用户配好的强制直连名单**悄悄抹掉**并推进一个版本。
+    """
+    if ssids is not None:
+        return list(ssids)
+    cur = (meta or {}).get("current") or {}
+    return list((cur.get("inputs") or {}).get("ssids") or ())
+
+
+def effective_inputs(meta, dot_host, server_addresses, ssids, wloc_enabled, ca_der,
+                     template=None):
+    """按"沿用"语义算出这一刻的规范化输入。status / 判定 / 生成共用它, 于是三处不会各算各的。"""
+    return make_inputs(dot_host, server_addresses, effective_ssids(meta, ssids),
+                       wloc_enabled, ca_der, template)
+
+
 def digest_of(inputs):
     return "sha256:" + hashlib.sha256(
         json.dumps(inputs, sort_keys=True, ensure_ascii=False,
@@ -462,7 +482,7 @@ def _cleanup_candidates(root=None):
     return n
 
 
-def generate(dot_host, server_addresses, ssids=(), ca_der=b"", wloc_enabled=False,
+def generate(dot_host, server_addresses, ssids=None, ca_der=b"", wloc_enabled=False,
              template=None, meta_path=None, art_root=None, lock=True, legacy_seen=False):
     """生成(或确认无需生成)受管描述文件。返回 (meta, level, reasons, data, changed)。
 
@@ -471,8 +491,10 @@ def generate(dot_host, server_addresses, ssids=(), ca_der=b"", wloc_enabled=Fals
     """
     mp = meta_path or META
     ar = art_root or ART_DIR
-    inputs = make_inputs(dot_host, server_addresses, ssids, wloc_enabled, ca_der, template)
     meta = load(mp)
+    # ssids=None ⇒ 沿用记录里的名单。必须在 load 之后算 —— 它要读记录。
+    inputs = effective_inputs(meta, dot_host, server_addresses, ssids, wloc_enabled,
+                              ca_der, template)
     fresh = meta is None
     if fresh:
         meta = _blank()
@@ -692,7 +714,10 @@ def main(argv=None):
     def common(p):
         p.add_argument("--dot-host")
         p.add_argument("--server-ip", action="append")
-        p.add_argument("--ssid", action="append", default=[])
+        # 默认 None = "没指定, 沿用记录里的"; --clear-ssid 才是明确清空。
+        # 用 default=[] 的话, 任何一次不带 --ssid 的调用都等于"把名单清掉"。
+        p.add_argument("--ssid", action="append", default=None)
+        p.add_argument("--clear-ssid", action="store_true", help="明确清空强制直连名单")
         p.add_argument("--wloc-config")
         p.add_argument("--ca-crt")
         p.add_argument("--template")
@@ -717,17 +742,21 @@ def main(argv=None):
         ap.print_help(sys.stderr)
         return 2
 
+    def _ssids():
+        return [] if getattr(a, "clear_ssid", False) else a.ssid
+
     def _inputs():
         der = iosprofile.ca_der_for(iosprofile.wloc_enabled(a.wloc_config), a.ca_crt) \
             if a.wloc_config else b""
-        return make_inputs(a.dot_host, a.server_ip, a.ssid, bool(der), der, a.template), der
+        return effective_inputs(load(), a.dot_host, a.server_ip, _ssids(), bool(der), der,
+                                a.template), der
 
     try:
         if a.cmd == "generate":
             der = iosprofile.ca_der_for(iosprofile.wloc_enabled(a.wloc_config), a.ca_crt) \
                 if a.wloc_config else b""
             meta, lv, why, data, changed = generate(
-                a.dot_host, a.server_ip, a.ssid, der, bool(der), a.template,
+                a.dot_host, a.server_ip, _ssids(), der, bool(der), a.template,
                 legacy_seen=a.legacy)
             # 落到临时下载目录的那一份也必须过校验器 —— 二维码/临时 HTTP 是最终交到手机
             # 手里的那条路, 不能比 Bot 那条松。

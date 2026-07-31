@@ -209,6 +209,36 @@ if meta["current"]["inputs"]["dot_host"] == "dot.new.example":
 else:
     bad("取回上一版把当前版本改回去了")
 
+# ── 4b. Bot 的「生成/更新」按钮不许清掉已配好的 SSID ──────────────────────
+setup()
+bot._dot_host = lambda: "dot.new.example"
+bot.handle_cb(1, 2, "ios_ssid")            # 进入 SSID 输入流程(真的走回调)
+bot.handle_text(1, "Home\nOffice")          # 再真的走文本处理
+meta = json.load(open(META, encoding="utf-8"))
+if meta["current"]["inputs"]["ssids"] == ["Home", "Office"]:
+    ok("通过 Bot 文本流程配好强制直连名单: %s" % ", ".join(meta["current"]["inputs"]["ssids"]))
+else:
+    bad("SSID 没配上: %r" % meta["current"]["inputs"].get("ssids"))
+rev_before = meta["current"]["revision"]
+setup()
+bot._dot_host = lambda: "dot.new.example"
+bot.handle_cb(1, 2, "iosgen")               # 再点一次「生成/更新描述文件」
+meta = json.load(open(META, encoding="utf-8"))
+if meta["current"]["inputs"]["ssids"] == ["Home", "Office"] \
+        and meta["current"]["revision"] == rev_before:
+    ok("再点「生成/更新」→ 名单沿用, revision 不变(没有把用户配的东西悄悄抹掉)")
+else:
+    bad("按钮把 SSID 清掉了: ssids=%r rev=%s→%s"
+        % (meta["current"]["inputs"].get("ssids"), rev_before, meta["current"]["revision"]))
+setup()
+bot._dot_host = lambda: "dot.new.example"
+bot.handle_cb(1, 2, "ios")
+txt, _ = EDITS[-1]
+if "无需更新" in txt:
+    ok("状态页也不再冒出幻影「建议更新」")
+else:
+    bad("状态页出现了谁也没做过的变化: %r" % txt[:160])
+
 # ── 5. CA 只显示指纹 ──────────────────────────────────────────────────────
 CA_DIR = tempfile.mkdtemp(prefix="iosux-ca-")
 TMPS.append(CA_DIR)

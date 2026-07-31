@@ -3148,7 +3148,7 @@ def _ios_ca():
     return True, der
 
 
-def _ios_generate(ssids=(), legacy=False):
+def _ios_generate(ssids=None, legacy=False):   # ssids=None ⇒ 沿用记录里的名单
     if _platform() != "ios":
         raise RuntimeError("iOS 描述文件仅 iOS 平台可用(本机为 Android)。" + _platform_unconfirmed())
     enabled, der = _ios_ca()
@@ -3156,9 +3156,10 @@ def _ios_generate(ssids=(), legacy=False):
                              IOS_TMPL, legacy_seen=legacy)
 
 
-def _ios_inputs(ssids=()):
+def _ios_inputs(meta, ssids=None):
     enabled, der = _ios_ca()
-    return iosstate.make_inputs(_dot_host(), _server_ip(), ssids, enabled, der, IOS_TMPL)
+    return iosstate.effective_inputs(meta, _dot_host(), _server_ip(), ssids, enabled,
+                                     der, IOS_TMPL)
 
 
 def _ios_status_text():
@@ -3172,7 +3173,7 @@ def _ios_status_text():
     cur = meta["current"]
     ssids = cur["inputs"].get("ssids") or []
     try:
-        lv, why = iosstate.classify(meta, _ios_inputs(ssids))
+        lv, why = iosstate.classify(meta, _ios_inputs(meta))
     except Exception as e:  # noqa: BLE001
         lv, why = iosstate.REQUIRED, ["读取当前网关配置失败: %s" % e]
     lines = ["📱 <b>iOS 描述文件</b>", "",
@@ -3233,7 +3234,7 @@ def _ios_val(v):
     return _esc(s if len(s) <= 24 else s[:16] + "…")
 
 
-def _ios_send(chat, ssids=(), legacy=False):
+def _ios_send(chat, ssids=None, legacy=False):
     """生成并发送, 返回给用户看的一段话。发送成功才记 sent_at —— 记的是"我们发了",
     不是"手机上装了"。"""
     meta, lv, why, data, changed = _ios_generate(ssids, legacy)
@@ -3974,7 +3975,8 @@ def handle_cb(chat, mid, data):
                      [{"text": "⬅️ 返回", "callback_data": "ios"}]]}); return
         edit(chat, mid, "正在生成 iOS 描述文件…", BACK)
         try:
-            msg = _ios_send(chat, (), data == "iosgen:legacy")
+            # 不传 SSID = 沿用已配好的强制直连名单。传 () 会把它当成"用户要清空"。
+            msg = _ios_send(chat, None, data == "iosgen:legacy")
             edit(chat, mid, msg, _ios_kb())
         except Exception as e:  # noqa: BLE001
             edit(chat, mid, f"生成失败: {e}", MENU)

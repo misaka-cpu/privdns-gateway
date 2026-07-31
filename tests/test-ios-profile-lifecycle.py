@@ -187,6 +187,36 @@ if "BEGIN CERTIFICATE" not in raw_meta and "PRIVATE" not in raw_meta \
 else:
     bad("元数据里出现了证书正文或私钥")
 
+# ── 2b. SSID 是**配置**, 不是每次都要重报的参数 ────────────────────────────
+# SSID 名单进了 digest, 就等于成了受管配置的一部分。那么"调用方没传"必须解释成"沿用",
+# 不能解释成"用户要清空" —— 后者的下场是: 状态页永远挂着一条谁也没做过的「建议更新」,
+# 而下一次普通生成会把用户配好的强制直连名单**悄悄抹掉**并推进一个版本。
+bx = Box()
+bx.gen()
+bx.gen(ssids=("Home", "Office"))
+rev_ssid = bx.read_meta()["current"]["revision"]
+inputs_plain = bx.s.make_inputs("dot.example.com", "203.0.113.10", (), False, b"", TMPL)
+lv, why = bx.s.classify(bx.read_meta(), bx.s.effective_inputs(
+    bx.read_meta(), "dot.example.com", "203.0.113.10", None, False, b"", TMPL))
+if lv == bx.s.NONE:
+    ok("设过 SSID 之后, 不指定 SSID 的判定仍是「无需更新」(没有幻影提示)")
+else:
+    bad("冒出了谁也没做过的变化: %s %s" % (lv, why))
+meta, lv, why, data, ch = bx.gen(ssids=None)
+if not ch and meta["current"]["revision"] == rev_ssid \
+        and meta["current"]["inputs"]["ssids"] == ["Home", "Office"]:
+    ok("不指定 SSID 的再次生成 → 沿用记录里的名单, revision 不变")
+else:
+    bad("SSID 被悄悄清掉了: rev=%s ssids=%r changed=%s"
+        % (meta["current"].get("revision"), meta["current"]["inputs"].get("ssids"), ch))
+meta, lv, why, data, ch = bx.gen(ssids=())
+if ch and meta["current"]["inputs"]["ssids"] == [] and lv == "recommended":
+    ok("明确传空列表 → 确实清空, 判「建议更新」, revision 前进到 %d"
+       % meta["current"]["revision"])
+else:
+    bad("明确清空没生效: ssids=%r lv=%s changed=%s"
+        % (meta["current"]["inputs"].get("ssids"), lv, ch))
+
 # ── 3. current / previous ─────────────────────────────────────────────────
 bx = Box()
 bx.gen()
