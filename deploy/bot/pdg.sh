@@ -1358,11 +1358,17 @@ cmd_ios_state(){
         python3 "$st" status
       fi;;
     diff|ack|recover) python3 "$st" "$sub";;
+    repair)
+      # 按记录逐字节复原 current。要带上 WLOC 配置与 CA —— 那一版用的根证书指纹对不上就
+      # 复原不了(拿现在的证书渲染出来的是另一份文件), 缺参数会让它误报"模板变了"。
+      python3 "$st" repair --template "$IOS_TMPL" \
+        --wloc-config /etc/privdns-gateway/mitm.json --ca-crt /etc/privdns-gateway/ca/ca.crt
+      ;;
     previous)
       local out=/opt/pdg-bot/PrivDNS-Gateway-prev.mobileconfig
       python3 "$st" previous --out "$out" && echo "已写到 $out"
       ;;
-    *) echo "用法: pdg ios {status|diff|previous|ack|recover}"; return 2;;
+    *) echo "用法: pdg ios {status|diff|previous|ack|recover|repair}"; return 2;;
   esac
 }
 
@@ -1389,7 +1395,7 @@ cmd_ios(){
   ic_gate || return 1
   # 子命令(只看记录/取文件, 不开端口)。无参数 = 生成并临时提供下载。
   case "${1:-}" in
-    status|diff|previous|ack|recover) cmd_ios_state "$@"; return $?;;
+    status|diff|previous|ack|recover|repair) cmd_ios_state "$@"; return $?;;
   esac
   local TMPL="$IOS_TMPL"
   [[ -f "$TMPL" ]] || { echo "缺少 $TMPL, 先装好 PrivDNS Gateway"; return 1; }
@@ -3609,5 +3615,5 @@ case "${1:-menu}" in
   # 拿不到地址, 而 `pdg rescue rotate cert` 会因为参数丢失退化成默认的 token 轮换:
   # 用户要求换证书, 实际换掉的是 token(会话全断, 指纹却没变)。
   rescue)        shift || true; cmd_rescue "$@";;
-  *) echo "用法: pdg [menu|status|doctor [--json|--deep]|update [--dry-run]|snapshot|rollback [n]|token|restart|log [n]|traffic|ios [status|diff|previous|ack|recover](仅 iOS)|report [--redact-ip|--full]|detect-cidr|platform <ios|android>|hijack-mode <all|gfw>|migrate|migrate-fw|tx <list|show|recover|abort>|rescue <enable|disable|status|fingerprint|bind <IPv4>|rotate-token|rotate-cert>|uninstall [--purge]]";;
+  *) echo "用法: pdg [menu|status|doctor [--json|--deep]|update [--dry-run]|snapshot|rollback [n]|token|restart|log [n]|traffic|ios [status|diff|previous|ack|recover|repair](仅 iOS)|report [--redact-ip|--full]|detect-cidr|platform <ios|android>|hijack-mode <all|gfw>|migrate|migrate-fw|tx <list|show|recover|abort>|rescue <enable|disable|status|fingerprint|bind <IPv4>|rotate-token|rotate-cert>|uninstall [--purge]]";;
 esac

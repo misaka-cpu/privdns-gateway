@@ -10,6 +10,7 @@
 import importlib.util as u
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -353,6 +354,65 @@ if "ic_gate || return 1" in pdg and pdg.count("ic_gate || return 1") >= 2:
     ok("cmd_ios 与 cmd_ios_state 都在门控之后才做事")
 else:
     bad("有 iOS 命令没走门控")
+
+# ── 9. 每个子命令都必须真的被分发到只读路径 ───────────────────────────────
+# 漏一个的后果不是报错, 是**静默退化**: `pdg ios repair` 落到默认分支 = 生成 + 装 qrencode +
+# 开临时 8443 + 起 HTTP 服务。用户以为在修一个文件, 实际上在生产机上开了个下载口。
+# 子命令清单从 iosstate.py 自己的 argparse 取 —— 写死一份就等于"以后新增的照样漏"。
+_help = subprocess.run([sys.executable, str(ROOT / "deploy/bot/iosstate.py"), "--help"],
+                       capture_output=True, text=True, timeout=120).stdout
+_m = re.search(r"\{([a-z,]+)\}", _help)
+SUBS = [x for x in (_m.group(1).split(",") if _m else []) if x and x != "generate"]
+if len(SUBS) >= 5:
+    ok("从 iosstate.py 的 argparse 取到 %d 个只读子命令: %s" % (len(SUBS), ", ".join(SUBS)))
+else:
+    bad("取不到子命令清单: %r" % _help[:200])
+
+# 真的把 cmd_ios / ic_gate 抽出来跑一遍, 只把它依赖的外部动作换成桩。
+HARNESS = r"""
+set -u
+grep -E '^IOS_TMPL='             deploy/bot/pdg.sh >  /tmp/iosdisp.$$
+sed -n '/^ic_gate()/,/^}/p'      deploy/bot/pdg.sh >> /tmp/iosdisp.$$
+sed -n '/^cmd_ios_state()/,/^}/p' deploy/bot/pdg.sh >> /tmp/iosdisp.$$
+sed -n '/^cmd_ios()/,/^}/p'      deploy/bot/pdg.sh >> /tmp/iosdisp.$$
+need_root(){ :; }
+_pdg_platform(){ echo ios; }
+_pdg_module(){ echo /nonexistent/$1; }
+_ios_dot_host(){ echo dot.example.com; }
+_ios_server_ip(){ echo 203.0.113.10; }
+c_g(){ echo "$*"; }; c_y(){ echo "$*"; }
+# 只读路径的落点: 换成一句可识别的输出, 于是"走到了哪条分支"是**可观察**的
+python3(){ shift; echo "READONLY:${1:-none}"; }   # 调用形态是 python3 <模块> <子命令> …
+# 生成路径上那些会真动机器的动作: 一旦被走到就立刻暴露
+apt-get(){ echo "DANGER:apt-get $*"; return 1; }
+qrencode(){ echo "DANGER:qrencode"; return 1; }
+nft(){ echo "DANGER:nft $*"; return 1; }
+mktemp(){ echo /tmp/iosdisp-www.$$; }
+# shellcheck source=/dev/null
+. /tmp/iosdisp.$$
+rm -f /tmp/iosdisp.$$
+cmd_ios "$1" 2>&1 | head -3
+"""
+# 判据必须是**正向**的: "真的走到了只读分支"。第一版写成"没出现危险标记"就假绿了 ——
+# 没被分发的子命令在抽出的函数里因未定义变量提前退出, 同样不产生危险标记。
+_leaks = []
+for sub in SUBS:
+    r = subprocess.run(["bash", "-c", HARNESS, "_", sub], capture_output=True, text=True,
+                       cwd=str(ROOT), timeout=120)
+    out = (r.stdout or "") + (r.stderr or "")
+    if ("READONLY:" + sub) not in out or "DANGER:" in out:
+        _leaks.append("%s → %s" % (sub, (out.strip().splitlines() or ["(无输出)"])[0][:70]))
+if not _leaks:
+    ok("%d 个子命令全部分发到只读路径, 没有一个掉进「生成并开下载口」的默认分支" % len(SUBS))
+else:
+    bad("这些子命令掉进了默认分支(会装包/开端口/改 nft): %s" % "; ".join(_leaks))
+
+_usage = re.search(r'echo "用法: pdg ios \{([^}]*)\}"', pdg)
+_listed = set((_usage.group(1).split("|") if _usage else []))
+if _listed == set(SUBS):
+    ok("用法提示里列的子命令与实际支持的一致")
+else:
+    bad("用法提示与实际不符: 提示 %r 实际 %r" % (sorted(_listed), sorted(SUBS)))
 
 print("─" * 40)
 print("通过 %d, 失败 %d" % (PASS[0], FAIL[0]))
