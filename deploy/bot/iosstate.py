@@ -769,11 +769,34 @@ _DNS_KEYS = frozenset(("PayloadType", "PayloadVersion", "PayloadIdentifier", "Pa
 _DNSSET_KEYS = frozenset(("DNSProtocol", "ServerName", "ServerAddresses"))
 _CA_KEYS = frozenset(("PayloadType", "PayloadVersion", "PayloadIdentifier", "PayloadUUID",
                       "PayloadDisplayName", "PayloadContent", "PayloadCertificateFileName"))
-# 按需规则允许的几种形态(模板里那三条 + SSID 强制直连那一条)
-_RULE_KEYSETS = (frozenset(("InterfaceTypeMatch", "Action", "URLStringProbe")),
-                 frozenset(("InterfaceTypeMatch", "Action")),
-                 frozenset(("InterfaceTypeMatch", "SSIDMatch", "Action")),
-                 frozenset(("Action",)))
+# 一条 current / previous 记录**恰好**有这几个字段。少一个的代价很具体: generated_at 没了
+# 照样能"恢复成功", 然后状态页一读就 KeyError —— 用户看到一个打不开的页面, 而那份记录正是
+# 恢复操作自己写进去的。多一个则说明这份记录不是本版本写的, 而我们没有能力判断它是什么意思。
+# 不补默认值、不静默修复、不推进 revision: 这三样都是在替用户猜。
+_RECORD_KEYS = frozenset(("revision", "digest", "inputs", "sha256",
+                          "generated_at", "sent_at"))
+
+# ── schema 1 的按需规则契约 ────────────────────────────────────────────────
+# 只限制键名是不够的: ondemand_core 取自备份自己, 于是"同时改产物和记录再把摘要配平"就能
+# 过。多一条 {"Action": "Connect"} 的后果很具体 —— 探测还没跑, DoT 就被无条件启用。
+#
+# 所以 schema 1 对应**一套固定语义**, 这里是它的唯一出处(与 deploy/ios/*.tmpl 的骨架一致;
+# tests/test-ios-profile-backup-trust.py 有一条漂移守卫: 现渲染的四种标准组合必须全部通过,
+# 于是模板改了而这里没跟上会先红)。将来渲染语义有意变化 ⇒ 升 SCHEMA 或按 schema 分派另一个
+# 校验器, **不**靠放宽未知规则来兼容未来版本。
+_PROBE = "<probe>"
+_SCHEMA1_ONDEMAND_CORE = [
+    {"InterfaceTypeMatch": "WiFi", "Action": "Connect", "URLStringProbe": _PROBE},
+    {"InterfaceTypeMatch": "WiFi", "Action": "Disconnect"},
+    {"InterfaceTypeMatch": "Cellular", "Action": "Connect", "URLStringProbe": _PROBE},
+    {"Action": "Disconnect"},
+]
+
+
+def _ssid_rule(ssids):
+    """SSID 强制直连那一条。只允许出现在最前面, 且只在名单非空时出现 ——
+    OnDemand 是"第一条命中的说了算", 排在探测规则之后就永远轮不到。"""
+    return {"InterfaceTypeMatch": "WiFi", "SSIDMatch": list(ssids), "Action": "Disconnect"}
 # 记录里 inputs 的字段与类型。多一个少一个都拒: 少了会让后面的比对静默跳过, 多了说明这份
 # 记录不是本版本写出来的, 而我们没有能力判断多出来的那个字段意味着什么。
 _INPUT_TYPES = (("schema", int), ("dot_host", str), ("server_addresses", list),
@@ -798,6 +821,7 @@ def _check_record(rec, name):
     gate = "记录格式"
     if not isinstance(rec, dict):
         _refuse(gate, "%s 那一栏不是一条记录" % name)
+    _keys_exact("%s 记录" % name, rec, _RECORD_KEYS)
     rev = rec.get("revision")
     if not isinstance(rev, int) or isinstance(rev, bool) or rev < 1:
         _refuse(gate, "%s 的 revision 不是正整数(%r)" % (name, rev))
@@ -806,9 +830,13 @@ def _check_record(rec, name):
                 % (name, rec.get("digest")))
     if not isinstance(rec.get("sha256"), str) or not _HEX64.match(rec.get("sha256") or ""):
         _refuse(gate, "%s 的 sha256 不是 64 位十六进制" % name)
-    for k in ("generated_at", "sent_at"):
-        if rec.get(k) is not None and not isinstance(rec.get(k), str):
-            _refuse(gate, "%s 的 %s 类型不对" % (name, k))
+    # generated_at 必须有值: 状态页直接读它, 没有就崩。sent_at 允许是 null("还没发过")。
+    if not isinstance(rec.get("generated_at"), str) or not rec["generated_at"].strip():
+        _refuse(gate, "%s 的 generated_at 必须是非空字符串(实际 %r)"
+                % (name, rec.get("generated_at")))
+    if rec.get("sent_at") is not None and not isinstance(rec.get("sent_at"), str):
+        _refuse(gate, "%s 的 sent_at 只能是 null 或字符串(实际 %r)"
+                % (name, type(rec.get("sent_at")).__name__))
     inp = rec.get("inputs")
     if not isinstance(inp, dict):
         _refuse(gate, "%s 缺 inputs" % name)
@@ -830,6 +858,11 @@ def _check_record(rec, name):
                 % (name, inp["wloc_enabled"], "有" if inp["wloc_ca_sha256"] else "没有"))
     if inp["wloc_ca_sha256"] and not _HEX64.match(inp["wloc_ca_sha256"]):
         _refuse(gate, "%s 的 inputs.wloc_ca_sha256 不是 64 位十六进制" % name)
+    # 记录里的骨架本身也必须是 schema 1 的那一套 —— 不能只跟产物互相配平。
+    if inp["ondemand_core"] != _SCHEMA1_ONDEMAND_CORE:
+        _refuse("按需规则", "%s 记录里的 ondemand_core 不是 schema %d 的固定骨架 —— "
+                "它是判断「这份产物是不是我们生成的」的基准, 不能由备份自己说了算"
+                % (name, SCHEMA))
     # digest 是"配置有没有变"的唯一依据, 三档判定全靠它。只看格式是不够的 —— 伪造一串
     # 合法形态的 digest 就能让"必须更新"变成"无需更新"。按 inputs 重新算一遍核对。
     if rec["digest"] != digest_of(inp):
@@ -883,22 +916,48 @@ def _check_meta(raw):
     return meta
 
 
-def _ondemand_of(rules, ssids):
-    """把产物里的 OnDemandRules 还原成"与 SSID 无关的骨架", 好跟记录里的 ondemand_core 比。
+def _check_ondemand(rules, inp, name):
+    """产物里的 OnDemandRules 必须**恰好**是 schema 1 那一套。
 
-    比的是**这份备份自己记的** ondemand_core, 不是本机模板算出来的 —— 否则跨版本恢复
-    (备份是旧模板渲染的)会被自己人挡在门外, 而那恰恰是恢复最该管用的场合。
+    判据不是"跟这份备份自己记的骨架对得上" —— 那两边都是攻击者可以改的。judge 的基准是
+    _SCHEMA1_ONDEMAND_CORE 这个常量:
+
+      · SSID 名单非空 ⇒ 最前面**恰好**多那一条规范化的 Wi-Fi Disconnect 规则, 别处不许再有;
+      · SSID 名单为空 ⇒ 任何位置都不许出现 SSIDMatch;
+      · 其余规则逐条、按顺序与 schema 1 的骨架完全一致(Action、InterfaceTypeMatch、
+        URLStringProbe 出现在哪一条, 都算在内);
+      · 产物里真实的探测地址必须等于记录里的 probe_url。
     """
-    rules = [dict(r) for r in rules if isinstance(r, dict)]
+    gate = "按需规则"
+    for i, r in enumerate(rules):
+        if not isinstance(r, dict):
+            _refuse(gate, "%s的按需规则第 %d 条不是一个字典" % (name, i + 1))
+    rules = [dict(r) for r in rules]
+    ssids = inp["ssids"]
     if ssids:
-        want = {"InterfaceTypeMatch": "WiFi", "SSIDMatch": list(ssids), "Action": "Disconnect"}
+        want = _ssid_rule(ssids)
         if not rules or rules[0] != want:
-            return None
+            _refuse(gate, "%s里 SSID 强制直连那一条不在最前面, 或者内容与记录的名单不符 —— "
+                    "OnDemand 是第一条命中的说了算, 排在探测规则之后就永远轮不到" % name)
         rules = rules[1:]
-    for r in rules:
-        if "URLStringProbe" in r:
-            r["URLStringProbe"] = "<probe>"
-    return rules
+    stray = [i + 1 for i, r in enumerate(rules) if "SSIDMatch" in r]
+    if stray:
+        _refuse(gate, "%s里出现了记录中没有的 SSID 规则(第 %s 条) —— 记录里的名单是空的"
+                % (name, "、".join(str(x) for x in stray)))
+    if len(rules) != len(_SCHEMA1_ONDEMAND_CORE):
+        _refuse(gate, "%s的按需规则有 %d 条, schema %d 的骨架是 %d 条 —— 多出来或少掉的那些"
+                "会改变什么时候启用 DoT" % (name, len(rules), SCHEMA,
+                                            len(_SCHEMA1_ONDEMAND_CORE)))
+    for i, (got, want) in enumerate(zip(rules, _SCHEMA1_ONDEMAND_CORE)):
+        probe = got.pop("URLStringProbe", None) if "URLStringProbe" in got else None
+        if probe is not None:
+            if probe != inp["probe_url"]:
+                _refuse(gate, "%s的第 %d 条按需规则里的探测地址与记录不符" % (name, i + 1))
+            got["URLStringProbe"] = _PROBE
+        if got != want:
+            _refuse(gate, "%s的第 %d 条按需规则与 schema %d 的固定骨架不符(顺序、Action、"
+                    "InterfaceTypeMatch、探测地址有无, 任何一项对不上都算)"
+                    % (name, i + 1, SCHEMA))
 
 
 def _check_artifact(meta, which, data, ids):
@@ -973,12 +1032,6 @@ def _check_artifact(meta, which, data, ids):
             _refuse("根证书", str(e))
     s = dns.get("DNSSettings") or {}
     _keys_exact("%s的 DNSSettings" % name, s, _DNSSET_KEYS)
-    for r in (dns.get("OnDemandRules") or []):
-        if not isinstance(r, dict):
-            _refuse("字段白名单", "%s的按需规则里有非字典项" % name)
-        if frozenset(r) not in _RULE_KEYSETS:
-            _refuse("字段白名单", "%s的按需规则里有本项目不会写的形态(字段: %s)"
-                    % (name, "、".join(sorted(r)) or "空"))
     if s.get("ServerName") != inp["dot_host"]:
         _refuse("语义一致", "%s里的 ServerName(%r)与记录的 dot_host(%r)不符"
                 % (name, s.get("ServerName"), inp["dot_host"]))
@@ -986,16 +1039,7 @@ def _check_artifact(meta, which, data, ids):
         _refuse("语义一致", "%s里的 ServerAddresses 与记录不符" % name)
     if s.get("DNSProtocol") != inp["dns_protocol"]:
         _refuse("语义一致", "%s里的 DNSProtocol 与记录不符" % name)
-    rules = dns.get("OnDemandRules") or []
-    for r in rules:
-        if isinstance(r, dict) and "URLStringProbe" in r \
-                and r["URLStringProbe"] != inp["probe_url"]:
-            _refuse("语义一致", "%s里的探测地址与记录不符" % name)
-    core = _ondemand_of(rules, inp["ssids"])
-    if core is None:
-        _refuse("语义一致", "%s里的 SSID 强制直连名单与记录不符" % name)
-    if core != inp["ondemand_core"]:
-        _refuse("语义一致", "%s里的按需规则骨架与记录不符" % name)
+    _check_ondemand(dns.get("OnDemandRules") or [], inp, name)
 
 
 def validate_restore_set(raw, cur=None, prev=None):

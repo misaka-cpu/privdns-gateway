@@ -539,6 +539,143 @@ refuse_case("openssl 不可用时不许把结构判据当成强校验",
             env={"PATH": "/nonexistent-for-openssl-probe"})
 
 print()
+print("══ 五之四、记录字段必须是精确的那一套 ══")
+# 记录的字段集合以前只查 inputs 那一层, 记录本身多一个少一个都放行。少一个的代价很具体:
+# generated_at 没了照样能"恢复成功", 然后状态页一读就 KeyError —— 用户看到的是一个打不开的
+# 页面, 而机器上那份记录是恢复操作自己写进去的。
+
+
+def rec_case(title, mutate, words):
+    def _fix(m):
+        mutate(m["current"])
+    refuse_case(title, dict(good, **{ARC_META: rewrite_meta(good[ARC_META], _fix)}), words)
+
+
+def _add_unknown(r):
+    r["retired_at"] = "2026-01-01T00:00:00Z"
+
+
+def _drop_generated(r):
+    r.pop("generated_at", None)
+
+
+def _drop_sent(r):
+    r.pop("sent_at", None)
+
+
+def _null_generated(r):
+    r["generated_at"] = None
+
+
+def _bad_type_generated(r):
+    r["generated_at"] = 1735689600
+
+
+def _empty_generated(r):
+    r["generated_at"] = ""
+
+
+def _bad_type_sent(r):
+    r["sent_at"] = 0
+
+
+rec_case("记录多了一个未知字段", _add_unknown, ["retired_at", "字段", "current"])
+rec_case("记录少了 generated_at", _drop_generated, ["generated_at", "字段", "current"])
+rec_case("记录少了 sent_at", _drop_sent, ["sent_at", "字段", "current"])
+rec_case("generated_at 是 null", _null_generated, ["generated_at"])
+rec_case("generated_at 是整数", _bad_type_generated, ["generated_at"])
+rec_case("generated_at 是空串", _empty_generated, ["generated_at"])
+rec_case("sent_at 是整数", _bad_type_sent, ["sent_at"])
+
+# 缺 generated_at 必须在**恢复之前**被挡住, 而不是恢复完了让状态页去崩。
+_v = victim()
+_m = json.loads(good[ARC_META].decode("utf-8"))
+del _m["current"]["generated_at"]
+try:
+    _v.s.status_lines(_m, None, _v.art)
+    bad("缺 generated_at 的记录竟然能画出状态页 —— 那这条用例的前提不成立")
+except KeyError as e:
+    ok("缺 generated_at 的记录一进状态页就 KeyError(%s) —— 所以必须在恢复前拦下" % e)
+except Exception as e:  # noqa: BLE001
+    ok("缺 generated_at 的记录在状态页上直接出错(%s)" % type(e).__name__)
+
+print()
+print("══ 五之五、schema 1 的按需规则语义是固定的 ══")
+# _RULE_KEYSETS 只管键名, ondemand_core 又取自备份自己 —— 于是"同时改产物和记录再配平摘要"
+# 就能过。多一条 {"Action":"Connect"} 的后果是: 探测还没跑, DoT 就被无条件启用。
+IDS = _S0.derive_ids(good_meta["instance_id"])
+
+
+def rules_case(title, mutate, words):
+    doc = plistlib.loads(good[ARC_CUR])
+    dns = doc["PayloadContent"][0]
+    mutate(dns["OnDemandRules"])
+    data = plistlib.dumps(doc)
+
+    def _fix(m):
+        core = []
+        for r in dns["OnDemandRules"]:
+            r = dict(r)
+            if "URLStringProbe" in r:
+                r["URLStringProbe"] = "<probe>"
+            core.append(r)
+        m["current"]["inputs"]["ondemand_core"] = core     # 记录与产物完全配平
+        m["current"]["sha256"] = hashlib.sha256(data).hexdigest()
+    refuse_case(title, dict(good, **{ARC_META: rewrite_meta(good[ARC_META], _fix),
+                                     ARC_CUR: data}), words)
+
+
+rules_case("多插一条无条件 Connect(探测还没跑就启用 DoT)",
+           lambda rs: rs.insert(0, {"Action": "Connect"}),
+           ["按需规则", "schema", "骨架"])
+rules_case("末尾多一条无条件 Connect",
+           lambda rs: rs.append({"Action": "Connect"}),
+           ["按需规则", "schema", "骨架"])
+
+
+def _flip_action(rs):
+    rs[1]["Action"] = "Connect"                     # WiFi 兜底从 Disconnect 变成 Connect
+
+
+def _flip_iface(rs):
+    rs[0]["InterfaceTypeMatch"] = "Cellular"        # 探测规则的网络类型被换掉
+
+
+def _reorder(rs):
+    rs[0], rs[1] = rs[1], rs[0]                     # 探测规则被排到兜底之后 → 永远轮不到
+
+
+def _drop_probe(rs):
+    rs[0].pop("URLStringProbe", None)
+    rs[0]["Action"] = "Connect"                     # 去掉探测 = 无条件启用
+
+
+rules_case("WiFi 兜底的 Action 被改成 Connect", _flip_action, ["按需规则", "schema", "骨架"])
+rules_case("探测规则的 InterfaceTypeMatch 被换成 Cellular", _flip_iface,
+           ["按需规则", "schema", "骨架"])
+rules_case("schema 1 的固定顺序被调换", _reorder, ["按需规则", "schema", "骨架", "顺序"])
+rules_case("探测 URL 被摘掉(等于无条件启用)", _drop_probe, ["按需规则", "schema", "骨架"])
+
+
+# 记录里的 ondemand_core 本身就不符合 schema 1(产物老实, 记录说谎)
+def _lie_core(m):
+    m["current"]["inputs"]["ondemand_core"] = [{"Action": "Connect"}]
+
+
+refuse_case("记录里的 ondemand_core 本身不符合 schema 1",
+            dict(good, **{ARC_META: rewrite_meta(good[ARC_META], _lie_core)}),
+            ["按需规则", "schema", "骨架"])
+
+# SSID 名单为空时不许出现 SSIDMatch 规则(即便记录也配平)
+def _sneak_ssid(rs):
+    rs.insert(0, {"InterfaceTypeMatch": "WiFi", "SSIDMatch": ["Evil"],
+                  "Action": "Disconnect"})
+
+
+rules_case("SSID 名单为空却塞了一条 SSIDMatch 规则", _sneak_ssid,
+           ["SSID", "按需规则", "schema"])
+
+print()
 print("══ 五之三、白名单必须跟得上渲染器(否则正常备份会被自己人挡住)══")
 # 字段白名单是钉死在当前 schema 上的一张表。它和 iosprofile.render 是两处定义, 会漂移。
 # 这条守卫拿**现渲染**的产物过一遍联合校验: 模板或渲染器改了字段而白名单没跟上, 这里先红,
