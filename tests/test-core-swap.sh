@@ -19,9 +19,13 @@ bad(){ echo "[FAIL] $1"; nfail=$((nfail+1)); }
 xt(){ sed -n "/^$1(){/,/^}/p" "$ROOT/deploy/bot/pdg.sh"; }
 eval "$(xt _core_bindir)"; eval "$(xt _core_config_check)"; eval "$(xt _core_kernel_stable)"
 eval "$(xt _pdg_sha)"; eval "$(xt _core_stash_kernel)"; eval "$(xt _core_restore_prev)"; eval "$(xt _core_swap_verify)"; eval "$(xt _pdg_apply_snapshot_tree)"
-# 落盘之后要对 iOS 产物子树做缺失项对账(见 pdg.sh), 一并抽进来 —— 少抽一个就变成
-# "command not found" 导致的假红, 而不是真的回滚失败。
-eval "$(xt _pdg_mktemp_dir)"; eval "$(xt _pdg_reconcile_ios_profile)"
+eval "$(xt _pdg_mktemp_dir)"
+# 落盘要先给 iOS 生命周期拍完整底片, 那套 helper 全在 pdg.sh 里。按前缀自动抽 —— 写死
+# 名字的话, 生产那边多加一个 helper 就变成 "command not found" 的假红(已经发生过两次)。
+eval "$(sed -n '/^_PDG_IOS_[A-Z_]*=/p' "$ROOT/deploy/bot/pdg.sh")"
+for _f in $(grep -oE '^_pdg_ios_[a-z_]+\(\)' "$ROOT/deploy/bot/pdg.sh" | tr -d '()'); do
+  eval "$(sed -n "/^$_f(){/,/^}/p" "$ROOT/deploy/bot/pdg.sh")"
+done
 
 c_g(){ echo "$*"; }; c_y(){ echo "$*"; }
 sleep(){ :; }

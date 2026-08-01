@@ -590,57 +590,137 @@ _pdg_mktemp_dir(){
   printf '%s\n' "$d"
 }
 
+# ── iOS 生命周期这一组的整组落盘 ───────────────────────────────────────────
 # 快照落盘只**覆盖**成员: 快照里没有的文件原样留在盘上。对绝大多数目标这是对的 —— 回滚不该
-# 顺手删掉用户后来加的东西。iOS 产物目录是例外, 因为那两份文件不是各自独立的配置, 而是与
-# ios-profile.json 里的记录**一一对应的一组**:
+# 顺手删掉用户后来加的东西。iOS 生命周期是例外, 因为 ios-profile.json 与 current/previous
+# 不是三份独立配置, 而是**一一对应的一组**:
 #     rev1 打快照(那时还没有 previous) → 生成 rev2(previous 出现) → 回滚到 rev1
 # 记录回到"没有上一版", 盘上却躺着一份 previous.mobileconfig。它属于一个已经不存在的版本,
 # 没有任何记录能解释它是什么; 备份会把它一起打包, 下一次恢复就把这份自相矛盾的东西搬到另
 # 一台机器上 —— 全程不报任何错。
 #
-# 所以对**这一棵子树**做缺失项对账, 而且只对它: 不放大到整个 /var/lib, 那里还有事务记录、
-# 救援运行态、备份包, 它们跟快照没有关系, 删它们是另一回事。
-# 做法不是"删了再说": 先留底片, 删完复核, 任何一步不成立就把删掉的原样放回去并整体报失败
-# —— "删了一半"比不删更难收拾。
-_pdg_reconcile_ios_profile(){
-  local tree="$1" members="$2" dest="$3"
-  local sub="var/lib/privdns-gateway/ios-profile"
-  local dir="${dest%/}/$sub"
-  # 快照里根本没有这棵子树(5.4 之前的快照)⇒ 它对这里没有发言权, 一个字节都不动。
-  grep -qE "^$sub(/|\$)" "$members" || return 0
+# 所以这一组按"整组替换"来做, 而且**只对这一组**: /etc/privdns-gateway 下的其它文件、
+# /var/lib/privdns-gateway 下的事务记录、救援运行态、备份包一律不碰。
+#
+# 顺序上有一条硬要求: **底片必须在 tar 覆盖之前拍完**。tar 是先覆盖再对账的, 等对账失败时
+# ios-profile.json 与 current.mobileconfig 早已被旧快照盖掉 —— 那时候只把删掉的孤儿放回去,
+# 留下的是"记录来自旧快照、产物新旧混着"的半回滚状态, 比不回滚更难查。
+_PDG_IOS_STATE_REL="etc/privdns-gateway/ios-profile.json"
+_PDG_IOS_ART_REL="var/lib/privdns-gateway/ios-profile"
+
+# 快照里有没有这一组成员。没有(5.4 之前的快照)⇒ 它对这组文件没有发言权, 一个字节都不动。
+_pdg_ios_group_in_members(){
+  grep -qE "^($_PDG_IOS_ART_REL(/|\$)|$_PDG_IOS_STATE_REL\$)" "$1"
+}
+
+# 把这一组现在的样子逐项列出来(相对路径, NUL 分隔): 记录 + 整棵产物子树。
+_pdg_ios_group_rels(){
+  local dest="$1" f
+  local dir="${dest%/}/$_PDG_IOS_ART_REL"
+  printf '%s\0' "$_PDG_IOS_STATE_REL"
   [[ -d "$dir" ]] || return 0
-  local bak=""; bak="$(_pdg_mktemp_dir)" || return 1
-  local orphans=() f rel rc=0
   while IFS= read -r -d '' f; do
-    rel="$sub/${f#"$dir"/}"
-    grep -qxF -- "$rel" "$members" && continue      # 快照里有 ⇒ 刚刚已被覆盖, 不动
-    if ! mkdir -p -- "$(dirname -- "$bak/$rel")" 2>/dev/null \
-       || ! cp -a -- "$f" "$bak/$rel" 2>/dev/null || ! cmp -s -- "$f" "$bak/$rel"; then
-      rc=1; break                                   # 底片留不下就一个都不删
-    fi
-    if ! rm -f -- "$f" 2>/dev/null || [[ -e "$f" ]]; then rc=1; break; fi
-    orphans+=("$rel")
+    printf '%s\0' "$_PDG_IOS_ART_REL/${f#"$dir"/}"
   done < <(find "$dir" -mindepth 1 ! -type d -print0 2>/dev/null)
-  if (( rc == 0 )); then                            # 复核: 剩下的每一份都必须在清单里
+}
+
+# 拍一张**完整底片**: 存在/缺失 + 内容 + mode + uid + gid。任何一项拍不下就整体失败 ——
+# 没有底片就没有退路, 那种情况下宁可不落盘。
+_pdg_ios_capture(){
+  local dest="$1" bak="$2" rel f st
+  mkdir -p -- "$bak/files" 2>/dev/null || return 1
+  : > "$bak/manifest" 2>/dev/null || return 1
+  : > "$bak/names" 2>/dev/null || return 1
+  while IFS= read -r -d '' rel; do
+    f="${dest%/}/$rel"
+    printf '%s\n' "$rel" >> "$bak/names" || return 1
+    if [[ -e "$f" || -L "$f" ]]; then
+      # 软链/特殊文件在这一组里说不清"操作前是什么", 也不该被当成产物 —— 拒绝落盘。
+      [[ -f "$f" && ! -L "$f" ]] || return 1
+      st="$(stat -c '%a %u %g' -- "$f" 2>/dev/null)" || return 1
+      [[ -n "$st" ]] || return 1
+      mkdir -p -- "$(dirname -- "$bak/files/$rel")" 2>/dev/null || return 1
+      cp -a -- "$f" "$bak/files/$rel" 2>/dev/null || return 1
+      cmp -s -- "$f" "$bak/files/$rel" 2>/dev/null || return 1
+      printf 'F %s %s\n' "$st" "$rel" >> "$bak/manifest" || return 1
+    else
+      printf 'A - - - %s\n' "$rel" >> "$bak/manifest" || return 1
+    fi
+  done < <(_pdg_ios_group_rels "$dest")
+  [[ -s "$bak/manifest" ]] || return 1
+  return 0
+}
+
+# 按底片把整组退回操作前, 然后**逐项复核**内容/存在性/mode/uid/gid。
+# 未恢复项打到 stdout(每行一条), 调用方连同原始错误一起报给用户 —— 退回本身失败的时候,
+# 人必须知道盘上现在到底是什么。
+_pdg_ios_rollback(){
+  local dest="$1" bak="$2" kind mode uid gid rel f rc=0
+  local dir="${dest%/}/$_PDG_IOS_ART_REL"
+  if [[ ! -s "$bak/manifest" ]]; then
+    echo "底片清单缺失, 无法退回"; return 1
+  fi
+  while read -r kind mode uid gid rel; do
+    [[ -n "$rel" ]] || continue
+    f="${dest%/}/$rel"
+    if [[ "$kind" == F ]]; then
+      mkdir -p -- "$(dirname -- "$f")" 2>/dev/null
+      if ! cp -a -- "$bak/files/$rel" "$f" 2>/dev/null; then
+        echo "$rel(写不回去)"; rc=1; continue
+      fi
+      chmod -- "$mode" "$f" 2>/dev/null || { echo "$rel(权限没改回去)"; rc=1; }
+      if [[ "$(stat -c '%u %g' -- "$f" 2>/dev/null)" != "$uid $gid" ]]; then
+        chown -- "$uid:$gid" "$f" 2>/dev/null || { echo "$rel(属主没改回去)"; rc=1; }
+      fi
+    else
+      rm -f -- "$f" 2>/dev/null || true
+    fi
+  done < "$bak/manifest"
+  # 底片里没有、盘上却有的: 这次落盘新造出来的, 清掉才叫"回到操作前"
+  if [[ -d "$dir" ]]; then
     while IFS= read -r -d '' f; do
-      rel="$sub/${f#"$dir"/}"
-      grep -qxF -- "$rel" "$members" || { rc=1; break; }
+      rel="$_PDG_IOS_ART_REL/${f#"$dir"/}"
+      grep -qxF -- "$rel" "$bak/names" && continue
+      rm -f -- "$f" 2>/dev/null || true
     done < <(find "$dir" -mindepth 1 ! -type d -print0 2>/dev/null)
   fi
-  if (( rc != 0 )); then
-    local r2=0 x
-    for x in ${orphans[@]+"${orphans[@]}"}; do
-      cp -a -- "$bak/$x" "${dest%/}/$x" 2>/dev/null || r2=1
-    done
-    rm -rf -- "$bak"
-    if (( r2 == 0 )); then
-      echo "❌ iOS 产物目录对账失败, 已把删掉的文件原样放回(现网停在回滚前的产物上)"
+  # 复核: 该在的内容/权限/属主都对, 该没有的确实没有, 且没有多出来的
+  while read -r kind mode uid gid rel; do
+    [[ -n "$rel" ]] || continue
+    f="${dest%/}/$rel"
+    if [[ "$kind" == F ]]; then
+      cmp -s -- "$bak/files/$rel" "$f" 2>/dev/null || { echo "$rel(内容与操作前不符)"; rc=1; }
+      [[ "$(stat -c '%a %u %g' -- "$f" 2>/dev/null)" == "$mode $uid $gid" ]] \
+        || { echo "$rel(mode/属主与操作前不符)"; rc=1; }
     else
-      echo "❌ iOS 产物目录对账失败, 且回退未完全成功, 请立即检查 $dir"
+      [[ -e "$f" ]] && { echo "$rel(操作前不存在, 现在还在)"; rc=1; }
     fi
-    return 1
+  done < "$bak/manifest"
+  if [[ -d "$dir" ]]; then
+    while IFS= read -r -d '' f; do
+      rel="$_PDG_IOS_ART_REL/${f#"$dir"/}"
+      grep -qxF -- "$rel" "$bak/names" || { echo "$rel(操作前没有这一份)"; rc=1; }
+    done < <(find "$dir" -mindepth 1 ! -type d -print0 2>/dev/null)
   fi
-  rm -rf -- "$bak"
+  return $rc
+}
+
+# 删掉快照里没有的那些(孤儿)。不再自己做备份/回退 —— 底片由 _pdg_apply_snapshot_tree
+# 在动手之前统一拍好, 这里只负责"删干净并复核", 失败交给调用方整组退回。
+_pdg_reconcile_ios_profile(){
+  local members="$1" dest="$2"
+  local dir="${dest%/}/$_PDG_IOS_ART_REL" f rel
+  [[ -d "$dir" ]] || return 0
+  while IFS= read -r -d '' f; do
+    rel="$_PDG_IOS_ART_REL/${f#"$dir"/}"
+    grep -qxF -- "$rel" "$members" && continue      # 快照里有 ⇒ 刚刚已被覆盖, 不动
+    rm -f -- "$f" 2>/dev/null || return 1
+    [[ -e "$f" ]] && return 1                       # rm 谎报成功(只读挂载/被 LSM 拦下)
+  done < <(find "$dir" -mindepth 1 ! -type d -print0 2>/dev/null)
+  while IFS= read -r -d '' f; do                    # 复核: 剩下的每一份都必须在清单里
+    rel="$_PDG_IOS_ART_REL/${f#"$dir"/}"
+    grep -qxF -- "$rel" "$members" || return 1
+  done < <(find "$dir" -mindepth 1 ! -type d -print0 2>/dev/null)
   return 0
 }
 
@@ -648,13 +728,40 @@ _pdg_reconcile_ios_profile(){
 _pdg_apply_snapshot_tree(){
   local tree="$1" members="$2" dest="$3"
   [[ -d "$tree" && -s "$members" && -d "$dest" ]] || return 1
-  (
-    set -o pipefail
-    tar --no-recursion -cf - -C "$tree" -T "$members" 2>/dev/null \
-      | tar xpf - -C "$dest" 2>/dev/null
-  ) || return 1
-  # 覆盖完再对账。反过来(先删再写)的话, 写到一半失败就同时留下"删过的"和"写了一半的"。
-  _pdg_reconcile_ios_profile "$tree" "$members" "$dest"
+  local guard=0 bak="" why="" left=""
+  if _pdg_ios_group_in_members "$members"; then
+    guard=1
+    if ! bak="$(_pdg_mktemp_dir)"; then
+      echo "❌ 建不出 iOS 生命周期的底片目录 → 拒绝落盘(没有底片就没有退路)"; return 1
+    fi
+    if ! _pdg_ios_capture "$dest" "$bak"; then
+      echo "❌ 拍不下 iOS 生命周期的完整底片(记录 + 产物子树) → 拒绝落盘, 现网未被改动"
+      rm -rf -- "$bak"; return 1
+    fi
+  fi
+  if ! ( set -o pipefail
+         tar --no-recursion -cf - -C "$tree" -T "$members" 2>/dev/null \
+           | tar xpf - -C "$dest" 2>/dev/null ); then
+    why="快照落盘(tar)失败"
+  elif (( guard == 1 )) && ! _pdg_reconcile_ios_profile "$members" "$dest"; then
+    why="iOS 产物目录对账失败"
+  fi
+  if [[ -n "$why" ]]; then
+    if (( guard == 1 )); then
+      if left="$(_pdg_ios_rollback "$dest" "$bak")"; then
+        echo "❌ $why —— iOS 生命周期(记录 + 产物子树)已整组退回操作前"
+      else
+        echo "❌ $why —— 而且退回没有完全成功, 请立即检查:"
+        printf '%s\n' "$left" | sed 's/^/   未恢复: /'
+      fi
+      rm -rf -- "$bak"
+    else
+      echo "❌ $why"
+    fi
+    return 1
+  fi
+  [[ -n "$bak" ]] && rm -rf -- "$bak"
+  return 0
 }
 
 # 面板临时态净化(与 bot backup_blob/restore_from 对称): 快照/回滚不持久化面板的公网监听+密钥+UI。

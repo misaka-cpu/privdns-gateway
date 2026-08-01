@@ -100,11 +100,18 @@ CA_A = iosprofile.ca_der_from_pem(open(mkca("PDG CA A"), encoding="utf-8").read(
 CA_B = iosprofile.ca_der_from_pem(open(mkca("PDG CA B"), encoding="utf-8").read())
 
 # 生产函数原样抽出来跑(与 test-core-swap.sh 同一手法): 测的是 pdg.sh 里那一份, 不是复制品。
-FNS = ("_pdg_mktemp_dir", "_pdg_reconcile_ios_profile", "_pdg_apply_snapshot_tree")
+FNS = ("_pdg_mktemp_dir", "_pdg_ios_group_in_members", "_pdg_ios_group_rels",
+       "_pdg_ios_capture", "_pdg_ios_rollback", "_pdg_reconcile_ios_profile",
+       "_pdg_apply_snapshot_tree")
+# 这两条相对路径也是生产定义的一部分, 一并抽 —— 少抽一个就是 "unbound variable" 的假红。
+CONSTS = ("_PDG_IOS_STATE_REL", "_PDG_IOS_ART_REL")
 
 
 def _harness():
     out = []
+    for c in CONSTS:
+        p = subprocess.run(["sed", "-n", "/^%s=/p" % c, PDG], capture_output=True, text=True)
+        out.append(p.stdout)
     for fn in FNS:
         p = subprocess.run(["sed", "-n", "/^%s(){/,/^}/p" % fn, PDG],
                            capture_output=True, text=True)
@@ -113,9 +120,12 @@ def _harness():
 
 
 HARNESS = _harness()
-for fn in ("_pdg_mktemp_dir", "_pdg_apply_snapshot_tree"):
+for fn in FNS:
     if "%s(){" % fn not in HARNESS:
         bad("抽不到生产函数 %s —— 这个测试就没有在测生产代码" % fn)
+for c in CONSTS:
+    if "%s=" % c not in HARNESS:
+        bad("抽不到生产常量 %s" % c)
 
 
 def snapshot(box):
@@ -314,88 +324,241 @@ print()
 print("══ 四、快照里根本没有这棵子树时不许乱删 ══")
 b3 = Box()
 b3.gen(ca=CA_A)
-d = tempfile.mkdtemp(prefix="iossnap-old-")
-TMPS.append(d)
-subprocess.run(["tar", "czf", d + "/snap.tar.gz", "-C", b3.root, "etc/privdns-gateway"],
-               check=True, capture_output=True)      # 5.4 之前的快照: 只有 etc
+# 真正的 5.4 之前快照: 那时 ios-profile.json 这个文件还不存在, 产物目录也不存在。
+old = tempfile.mkdtemp(prefix="iossnap-old-")
+TMPS.append(old)
+os.makedirs(old + "/etc/privdns-gateway", exist_ok=True)
+with open(old + "/etc/privdns-gateway/platform", "w") as f:
+    f.write("ios\n")
+subprocess.run(["tar", "czf", old + "/snap.tar.gz", "-C", old, "etc/privdns-gateway"],
+               check=True, capture_output=True)
 before = listing(b3)
-r = rollback(b3, d + "/snap.tar.gz")
-if r.returncode == 0 and listing(b3) == before:
-    ok("旧快照(不含 ios-profile)不对这棵子树发表意见, 产物原样保留: %r" % before)
+meta_before = b3.rd("etc/privdns-gateway/ios-profile.json")
+r = rollback(b3, old + "/snap.tar.gz")
+if r.returncode == 0 and listing(b3) == before \
+        and b3.rd("etc/privdns-gateway/ios-profile.json") == meta_before:
+    ok("旧快照(整组成员一个都没有)不对这一组发表意见, 记录与产物原样保留: %r" % before)
 else:
-    bad("旧快照把产物删了或落盘失败: rc=%d %r" % (r.returncode, listing(b3)))
+    bad("旧快照把这一组动了或落盘失败: rc=%d %r" % (r.returncode, listing(b3)))
+
+# 反过来: 快照里有记录、没有产物 —— 那是"当时就没有产物", 整组替换就该把产物清掉,
+# 而不是留下一份没有记录能解释的文件。这是有意选的语义, 钉在这里。
+b3b = Box()
+b3b.gen(ca=CA_A)
+half = tempfile.mkdtemp(prefix="iossnap-half-")
+TMPS.append(half)
+os.makedirs(half + "/etc/privdns-gateway", exist_ok=True)
+shutil.copy2(b3b.meta, half + "/etc/privdns-gateway/ios-profile.json")
+subprocess.run(["tar", "czf", half + "/snap.tar.gz", "-C", half,
+                "etc/privdns-gateway/ios-profile.json"], check=True, capture_output=True)
+r = rollback(b3b, half + "/snap.tar.gz")
+if r.returncode == 0 and listing(b3b) == []:
+    ok("快照里有记录、没有产物 → 整组替换, 产物被清空(不留没人解释得了的文件)")
+else:
+    bad("记录/产物半组快照处理不对: rc=%d %r" % (r.returncode, listing(b3b)))
 
 print()
-print("══ 五、删不掉就整体退回去, 不留「删了一半」 ══")
-b4 = Box()
-b4.gen(ca=CA_A)
-snap4 = snapshot(b4)
-b4.gen(host="dot.v2.example", ca=CA_B)
-with open(b4.p(SUB + "/stray.mobileconfig"), "wb") as f:
-    f.write(b"stray\n")
-prev_before = b4.rd(SUB + "/previous.mobileconfig")
-stray_before = b4.rd(SUB + "/stray.mobileconfig")
-st_before = {rel: os.stat(b4.p(rel)).st_mode & 0o7777
-             for rel in (SUB + "/previous.mobileconfig", SUB + "/stray.mobileconfig")}
-# 注入: 第二次 rm 失败(第一份已经删掉了) —— 必须把删掉的那份放回去并报失败
-fault = r'''
+print("══ 五、任何一步失败, 整组(记录 + 产物子树)都要精确回到操作前 ══")
+# 这一节盯的是**整组**, 不只是孤儿文件。tar 是先覆盖再对账的: 等对账失败时,
+# ios-profile.json 和 current.mobileconfig 早就被旧快照盖掉了。只把删掉的孤儿放回去
+# 等于留下"记录是旧快照的、产物是新旧混着的"这种半回滚状态 —— 比不回滚更难查。
+STATE_REL = "etc/privdns-gateway/ios-profile.json"
+
+
+def group_state(box):
+    """这一组的完整状态: 记录 + 整棵产物子树, 内容 + 存在性 + mode + uid + gid。"""
+    out = {}
+    rels = [STATE_REL]
+    art = box.p(SUB)
+    for base, _d, files in os.walk(art):
+        for f in files:
+            rels.append(SUB + "/" + os.path.relpath(os.path.join(base, f), art))
+    for rel in sorted(set(rels)):
+        f = box.p(rel)
+        try:
+            st = os.stat(f)
+            with open(f, "rb") as fh:
+                out[rel] = (fh.read(), st.st_mode & 0o7777, st.st_uid, st.st_gid)
+        except OSError:
+            out[rel] = None
+    return out
+
+
+def diff_state(before, after):
+    keys = sorted(set(before) | set(after))
+    return [k for k in keys if before.get(k) != after.get(k)]
+
+
+def fault_case(title, fault, expect_rollback=True, expect_words=()):
+    """造 rev1 快照 → 走到 rev2 + 一个孤儿 → 注入故障回滚 → 整组必须回到操作前。"""
+    box = Box()
+    box.gen(ca=CA_A)
+    snap = snapshot(box)
+    box.gen(host="dot.v2.example", ca=CA_B)
+    with open(box.p(SUB + "/stray.mobileconfig"), "wb") as f:
+        f.write(b"stray\n")
+    os.chmod(box.p(SUB + "/stray.mobileconfig"), 0o640)
+    before = group_state(box)
+    r = rollback(box, snap, fault)
+    if r.returncode != 0:
+        ok("%s: 落盘整体报失败(rc=%d)" % (title, r.returncode))
+    else:
+        bad("%s: 出了故障却报成功" % title)
+    blob = (r.stdout or "") + (r.stderr or "")
+    if expect_rollback:
+        d = diff_state(before, group_state(box))
+        if not d:
+            ok("%s: 记录 + 整棵产物子树逐项回到操作前(内容/存在性/mode/uid/gid)" % title)
+        else:
+            bad("%s: 留下了半回滚状态, 这些项与操作前不一致: %r" % (title, d))
+    else:
+        # 退回本身被打断: 不要求盘面复原, 但必须**同时**报出原始错误与未恢复项
+        hit = [w for w in expect_words if w in blob]
+        if len(hit) == len(expect_words):
+            ok("%s: 原始错误与未恢复项一起报了出来(%s)"
+               % (title, " / ".join(w[:12] for w in expect_words)))
+        else:
+            bad("%s: 没有同时报出原始错误和未恢复项: %r" % (title, blob[-300:]))
+    return box
+
+
+# 1) 删除第二个孤儿失败(第一份已经删掉了)
+fault_case("删第二个孤儿时 rm 失败", r'''
 _pdg_rm_calls=0
 rm(){
   case "$*" in
-    *ios-profile*)
+    */ios-profile/*)
       _pdg_rm_calls=$((_pdg_rm_calls+1))
       if [[ $_pdg_rm_calls -ge 2 ]]; then return 1; fi;;
   esac
   command rm "$@"
 }
-'''
-r = rollback(b4, snap4, fault)
-if r.returncode != 0:
-    ok("删除失败 → 落盘整体报失败(rc=%d)" % r.returncode)
-else:
-    bad("删除失败却报成功")
-if b4.rd(SUB + "/previous.mobileconfig") == prev_before \
-        and b4.rd(SUB + "/stray.mobileconfig") == stray_before:
-    ok("被删掉的那些逐字节放回去了(没有留下删了一半的目录)")
-else:
-    bad("留下了删一半的状态: %r" % listing(b4))
-st_after = {}
-for rel in st_before:
-    try:
-        st_after[rel] = os.stat(b4.p(rel)).st_mode & 0o7777
-    except OSError:
-        st_after[rel] = None
-if st_after == st_before:
-    ok("放回去的文件权限位不变: %r" % st_after)
-else:
-    bad("权限没还原: %r → %r" % (st_before, st_after))
+''')
 
-print()
-print("══ 六、rm 谎报成功也不许当成删掉了 ══")
-b5 = Box()
-b5.gen(ca=CA_A)
-snap5 = snapshot(b5)
-b5.gen(host="dot.v2.example", ca=CA_B)
-prev5 = b5.rd(SUB + "/previous.mobileconfig")
-# 注入: rm 对这棵子树里的文件一律返回成功却什么都不删(只读挂载、被别的进程持有、
-# 被 LSM 拦下都长这样)。落盘不许因为"rm 说成功了"就认为目录已经对齐。
-liar = r'''
+# 2) rm 谎报成功(只读挂载 / 被 LSM 拦下都长这样)
+fault_case("rm 报成功但文件仍在", r'''
 rm(){
   case "$*" in
-    *ios-profile/*) return 0;;
+    */ios-profile/*.mobileconfig) return 0;;
   esac
   command rm "$@"
 }
-'''
-r = rollback(b5, snap5, liar)
+''')
+
+# 3) tar 已经把 current 覆盖掉之后才失败
+fault_case("tar 覆盖完 current 之后失败", r'''
+tar(){
+  case "$*" in
+    *xpf*) command tar "$@"; return 1;;
+  esac
+  command tar "$@"
+}
+''')
+
+# 4) 退回时写不回 metadata —— 不能假装回滚成功
+fault_case("退回 metadata 时写回失败", r'''
+rm(){ case "$*" in */ios-profile/*) return 1;; esac; command rm "$@"; }
+cp(){
+  local last="${!#}"
+  case "$last" in
+    */files/*) command cp "$@"; return;;          # 拍底片那一次照常
+    *ios-profile.json) return 1;;                 # 往生产写回记录 → 失败
+  esac
+  command cp "$@"
+}
+''', expect_rollback=False,
+    expect_words=("对账失败", "未恢复", "ios-profile.json"))
+
+# 5) 退回时写不回 current
+fault_case("退回 current 时写回失败", r'''
+rm(){ case "$*" in */ios-profile/*) return 1;; esac; command rm "$@"; }
+cp(){
+  local last="${!#}"
+  case "$last" in
+    */files/*) command cp "$@"; return;;
+    *current.mobileconfig) return 1;;
+  esac
+  command cp "$@"
+}
+''', expect_rollback=False,
+    expect_words=("对账失败", "未恢复", "current.mobileconfig"))
+
+# 6) 权限恢复失败 —— 内容对了不等于回到了操作前
+fault_case("退回时 chmod 失败", r'''
+rm(){ case "$*" in */ios-profile/*) return 1;; esac; command rm "$@"; }
+chmod(){ case "$*" in *ios-profile*) return 1;; esac; command chmod "$@"; }
+''', expect_rollback=False,
+    expect_words=("对账失败", "未恢复"))
+
+# 7) 属主复核对不上(非 root 改不动属主, 所以让 stat 谎报一个不同的 uid)
+fault_case("属主对不上而 chown 改不动", r'''
+rm(){ case "$*" in */ios-profile/*) return 1;; esac; command rm "$@"; }
+stat(){
+  case "$*" in
+    *%a\ %u\ %g*) command stat "$@" | awk '{print $1, $2+1, $3}'; return 0;;
+  esac
+  command stat "$@"
+}
+''', expect_rollback=False,
+    expect_words=("对账失败", "未恢复"))
+
+print()
+print("══ 六、拍不下完整底片就不许落盘 ══")
+b6 = Box()
+b6.gen(ca=CA_A)
+snap6 = snapshot(b6)
+b6.gen(host="dot.v2.example", ca=CA_B)
+before6 = group_state(b6)
+r = rollback(b6, snap6, r'''
+_pdg_mktemp_dir(){ return 1; }
+''')
 if r.returncode != 0:
-    ok("rm 报了成功但文件还在 → 落盘整体报失败(rc=%d)" % r.returncode)
+    ok("建不出底片目录 → 拒绝落盘(rc=%d)" % r.returncode)
 else:
-    bad("信了 rm 的话: 目录里还留着 %r 却报成功" % listing(b5))
-if b5.rd(SUB + "/previous.mobileconfig") == prev5:
-    ok("那份没删成的文件原样还在(没有被「当成删过」而丢失记录)")
+    bad("没有底片也照样落盘了")
+if not diff_state(before6, group_state(b6)):
+    ok("现网这一组一个字节都没动")
 else:
-    bad("文件内容被动过: %r" % b5.rd(SUB + "/previous.mobileconfig"))
+    bad("没有底片却已经动了现网: %r" % diff_state(before6, group_state(b6)))
+
+b7 = Box()
+b7.gen(ca=CA_A)
+snap7 = snapshot(b7)
+b7.gen(host="dot.v2.example", ca=CA_B)
+before7 = group_state(b7)
+r = rollback(b7, snap7, r'''
+cp(){ case "$*" in *ios-profile*) return 1;; esac; command cp "$@"; }
+''')
+if r.returncode != 0 and not diff_state(before7, group_state(b7)):
+    ok("底片拍不全(cp 失败) → 拒绝落盘且现网未动")
+else:
+    bad("底片不全却落了盘: rc=%d 差异=%r"
+        % (r.returncode, diff_state(before7, group_state(b7))))
+
+print()
+print("══ 七、底片不许留下描述文件副本 ══")
+b8 = Box()
+b8.gen(ca=CA_A)
+snap8 = snapshot(b8)
+b8.gen(host="dot.v2.example", ca=CA_B)
+tmp_before = set(os.listdir("/tmp"))
+rollback(b8, snap8)
+leaked = []
+for name in sorted(set(os.listdir("/tmp")) - tmp_before):
+    # 只看 `mktemp -d` 的默认形态(tmp.XXXXXXXX)—— 底片目录就是它建的。测试自己的 staging
+    # 树(iossnap-*)不算, 那是本用例造出来喂给生产函数的输入, 由测试自己清理。
+    if not name.startswith("tmp."):
+        continue
+    pth = os.path.join("/tmp", name)
+    if not os.path.isdir(pth):
+        continue
+    for base, _d, files in os.walk(pth):
+        leaked += [os.path.join(base, f) for f in files if f.endswith(".mobileconfig")
+                   or f.endswith("ios-profile.json")]
+if not leaked:
+    ok("成功路径跑完, /tmp 下没有留下描述文件或记录的副本")
+else:
+    bad("底片没清干净, 留下了: %r" % leaked[:4])
 
 print()
 print("断言 %d 项: 通过 %d, 失败 %d" % (PASS[0] + FAIL[0], PASS[0], FAIL[0]))
