@@ -28,6 +28,7 @@ import json
 import os
 import plistlib
 import re
+import subprocess
 import sys
 import uuid
 
@@ -42,6 +43,11 @@ ID_DNS = "com.privdns.gateway.dot"
 ID_CA = "com.privdns.mitm.ca"
 CA_DISPLAY = "PrivDNS Gateway MITM CA"
 CA_FILENAME = "pdg-mitm-ca.crt"
+
+# 本项目**只会**写出这两种 payload。mobileconfig 能装的远不止 DNS —— VPN、代理、WebClip、
+# 甚至 MDM 注册都在里面, 一份"多带了几格"的描述文件在 iOS 上看起来和正常的没两样。凡是从外
+# 部拿回来的描述文件(恢复备份)都要按这份白名单卡, 多一种就拒。
+ALLOWED_PAYLOAD_TYPES = ("com.apple.dnsSettings.managed", "com.apple.security.root")
 
 _UUID_RE = re.compile(r"^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$")
 # 私钥的各种写法。DER 里不会有这些字面量, 出现即说明有人把 key 文件当成 cert 传进来了。
@@ -99,6 +105,59 @@ def reject_key_material(raw, what="CA 证书"):
         if mark in b:
             raise ProfileError("%s 里含私钥, 拒绝生成描述文件。描述文件只能包含公开证书, "
                                "请检查证书路径是否误指向了 key 文件。" % what)
+
+
+def _der_first_child_tag(der):
+    """外层 SEQUENCE 里第一个元素的 tag; 解不开返回 None。
+
+    只解到这一层就够分辨了, 不需要一个 ASN.1 库:
+      · X.509 Certificate ::= SEQUENCE { tbsCertificate SEQUENCE, ... } → 第一个是 0x30;
+      · PKCS#8 / PKCS#1 RSA / SEC1 EC 私钥统统是 SEQUENCE { version INTEGER, ... } → 0x02。
+    """
+    b = bytes(der or b"")
+    if len(b) < 3 or b[0] != 0x30:
+        return None
+    n = b[1]
+    hdr = 2 if n < 0x80 else 2 + (n & 0x7F)
+    if n >= 0x80 and (n & 0x7F) in (0, 5, 6, 7):        # 不定长 / 荒唐的长度
+        return None
+    return b[hdr] if len(b) > hdr else None
+
+
+def assert_public_cert_der(der, what="根证书"):
+    """这段 DER **必须**是一张真的 X.509 公钥证书。
+
+    为什么不能只扫 "PRIVATE KEY" 字面量: 描述文件里的 PayloadContent 是 base64 过的二进制,
+    一把 DER 私钥塞进去之后, 文件里根本不会出现那几个字。所以这里换成结构判据 + openssl:
+    先看外层 SEQUENCE 的第一个元素是不是 SEQUENCE(证书)还是 INTEGER(各种私钥格式的
+    version 字段), 再交给 openssl 认一遍。没有 openssl 的机器退回结构判据 —— 那也依然
+    挡得住私钥, 只是不再保证"是一张能用的证书"; 绝不因为少了 openssl 就整个放行。
+
+    openssl 走 stdin, **不落盘**: 待检内容有可能正是一把私钥, 我们不该把它写到临时文件里。
+    """
+    b = bytes(der or b"")
+    if not b:
+        raise ProfileError("%s是空的, 拒绝。" % what)
+    reject_key_material(b, what)
+    tag = _der_first_child_tag(b)
+    if tag is None:
+        raise ProfileError("%s不是合法 DER 结构, 拒绝。" % what)
+    if tag == 0x02:
+        raise ProfileError("%s看着像一把私钥(DER 里第一个字段是整数版本号), 而不是公钥证书 "
+                           "—— 拒绝。描述文件只能带公开证书。" % what)
+    if tag != 0x30:
+        raise ProfileError("%s不是 X.509 证书结构, 拒绝。" % what)
+    try:
+        p = subprocess.run(["openssl", "x509", "-inform", "DER", "-noout"],
+                           input=b, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=15)
+    except FileNotFoundError:
+        return                                   # 没装 openssl: 结构判据已经过了, 不假装强校验
+    except (OSError, subprocess.SubprocessError):
+        raise ProfileError("没能校验%s(openssl 没跑起来), 拒绝。" % what)
+    if p.returncode != 0:
+        raise ProfileError("openssl 不认这张%s —— 它不是一张有效的 X.509 公钥证书, 拒绝。"
+                           % what)
 
 
 def ca_der_from_pem(pem):

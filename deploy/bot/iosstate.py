@@ -24,6 +24,7 @@ MDM, 服务器没有任何渠道能知道这件事。所以这里记录的一律
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import sys
@@ -724,6 +725,239 @@ def _recover_locked(meta_path=None, art_root=None):
     for which, state, detail in health_summary(meta, ar):
         out.append("%s: %s" % (HEALTH_LABEL[state], detail))
     return out
+
+
+# ── 从备份恢复: 三件套联合校验 ──────────────────────────────────────────────
+# 恢复是这套生命周期里唯一一个"内容不是我们自己算出来的"入口 —— 记录、current、previous
+# 三份都来自包外。过去这里只做了一件事: 把记录 json.loads 一下。于是之后每一次判定、每一次
+# 发送, 前提都是"记录说的那一版就是盘上那一份", 而这个前提恰恰是这里应该证明、却没证明的。
+#
+# 这里挡两类东西, 性质不同, 别混着说:
+#   · **不自洽的一组**: 记录说第 2 版而盘上是第 3 版、current/previous 串位、记录里没有
+#     previous 却带着一份 previous 文件。不需要有人使坏就会出现(半程失败、旧快照回滚),
+#     危害是从此每一次判定都跑在一个不成立的前提上, 界面却一切正常。
+#   · **不是这个项目会生成的东西**: mobileconfig 能装的远不止 DNS(VPN、代理、WebClip、
+#     MDM 注册都在里面)。恢复完成之后,「📱 iOS 描述文件」页就是一个可信入口, 用户点
+#     「发送」拿到什么就装什么。所以只放行本项目自己会写的 payload, 根证书那一格必须是
+#     真的 X.509 公钥证书(见 iosprofile.assert_public_cert_der)。
+#
+# 说清楚**不**保证什么: 恢复的是用户自己给的配置, 我们不去审"这个 DoT 域名该不该信" ——
+# 那和"恢复备份"这件事本身矛盾。挡的是"这一组自相矛盾"和"这里面有描述文件不该有的东西"。
+class RestoreRefused(StateError):
+    """备份里的生命周期三件套不成立。消息里点名是哪一道门。"""
+
+
+_HEX64 = re.compile(r"^[0-9a-f]{64}$")
+# 记录里 inputs 的字段与类型。多一个少一个都拒: 少了会让后面的比对静默跳过, 多了说明这份
+# 记录不是本版本写出来的, 而我们没有能力判断多出来的那个字段意味着什么。
+_INPUT_TYPES = (("schema", int), ("dot_host", str), ("server_addresses", list),
+                ("dns_protocol", str), ("probe_url", str), ("ondemand_core", list),
+                ("ssids", list), ("wloc_enabled", bool), ("wloc_ca_sha256", str))
+
+def _refuse(gate, why):
+    raise RestoreRefused("备份里的 iOS 描述文件没通过「%s」这道门: %s" % (gate, why))
+
+
+def _check_record(rec, name):
+    gate = "记录格式"
+    if not isinstance(rec, dict):
+        _refuse(gate, "%s 那一栏不是一条记录" % name)
+    rev = rec.get("revision")
+    if not isinstance(rev, int) or isinstance(rev, bool) or rev < 1:
+        _refuse(gate, "%s 的 revision 不是正整数(%r)" % (name, rev))
+    if not isinstance(rec.get("digest"), str) or not rec["digest"].startswith("sha256:"):
+        _refuse(gate, "%s 的 digest 不是 sha256: 开头的字符串" % name)
+    if not isinstance(rec.get("sha256"), str) or not _HEX64.match(rec.get("sha256") or ""):
+        _refuse(gate, "%s 的 sha256 不是 64 位十六进制" % name)
+    for k in ("generated_at", "sent_at"):
+        if rec.get(k) is not None and not isinstance(rec.get(k), str):
+            _refuse(gate, "%s 的 %s 类型不对" % (name, k))
+    inp = rec.get("inputs")
+    if not isinstance(inp, dict):
+        _refuse(gate, "%s 缺 inputs" % name)
+    want = {k for k, _ in _INPUT_TYPES}
+    if set(inp) != want:
+        _refuse(gate, "%s 的 inputs 字段与本版本对不上(多/少: %s)"
+                % (name, "、".join(sorted(set(inp) ^ want)) or "?"))
+    for k, ty in _INPUT_TYPES:
+        v = inp[k]
+        if ty is bool:
+            if not isinstance(v, bool):
+                _refuse(gate, "%s 的 inputs.%s 不是布尔" % (name, k))
+        elif isinstance(v, bool) or not isinstance(v, ty):
+            _refuse(gate, "%s 的 inputs.%s 类型不对(%r)" % (name, k, type(v).__name__))
+    if inp["schema"] != SCHEMA:
+        _refuse(gate, "%s 的 inputs.schema=%r, 本版本只认 %d" % (name, inp["schema"], SCHEMA))
+    if inp["wloc_enabled"] != bool(inp["wloc_ca_sha256"]):
+        _refuse(gate, "%s 的 inputs 自相矛盾: wloc_enabled=%r 而根证书指纹%s"
+                % (name, inp["wloc_enabled"], "有" if inp["wloc_ca_sha256"] else "没有"))
+    if inp["wloc_ca_sha256"] and not _HEX64.match(inp["wloc_ca_sha256"]):
+        _refuse(gate, "%s 的 inputs.wloc_ca_sha256 不是 64 位十六进制" % name)
+
+
+def _check_meta(raw):
+    """记录本身。用词与 load() 保持一致的判据, 但这里是**包外内容**, 一律 fail-closed。"""
+    gate = "记录格式"
+    try:
+        meta = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None                              # 解不开 → 交给调用方按"没有可用记录"处理
+    if not isinstance(meta, dict):
+        _refuse(gate, "记录不是一个 JSON 对象")
+    if meta.get("schema") != SCHEMA:
+        _refuse(gate, "格式版本不认识(schema=%r)" % meta.get("schema"))
+    if not isinstance(meta.get("instance_id"), str) or not meta["instance_id"]:
+        _refuse(gate, "没有身份标识")
+    try:
+        derive_ids(meta["instance_id"])
+    except Exception:  # noqa: BLE001
+        _refuse(gate, "身份标识不合法")
+    if not isinstance(meta.get("migration_pending"), bool):
+        _refuse(gate, "migration_pending 不是布尔")
+    if meta.get("created_at") is not None and not isinstance(meta.get("created_at"), str):
+        _refuse(gate, "created_at 类型不对")
+    if set(meta) != set(_blank()):
+        _refuse(gate, "记录的字段与本版本对不上(多/少: %s)"
+                % "、".join(sorted(set(meta) ^ set(_blank()))))
+    for which, name in (("current", "current"), ("previous", "previous")):
+        if meta.get(which) is not None:
+            _check_record(meta[which], name)
+    if meta.get("previous") and not meta.get("current"):
+        _refuse("三件配套", "记录里有上一版却没有当前版本 —— 这一组不成立")
+    if meta.get("previous") and meta.get("current") \
+            and meta["previous"]["revision"] >= meta["current"]["revision"]:
+        _refuse("三件配套", "上一版的 revision(%d)不小于当前版本(%d)"
+                % (meta["previous"]["revision"], meta["current"]["revision"]))
+    return meta
+
+
+def _ondemand_of(rules, ssids):
+    """把产物里的 OnDemandRules 还原成"与 SSID 无关的骨架", 好跟记录里的 ondemand_core 比。
+
+    比的是**这份备份自己记的** ondemand_core, 不是本机模板算出来的 —— 否则跨版本恢复
+    (备份是旧模板渲染的)会被自己人挡在门外, 而那恰恰是恢复最该管用的场合。
+    """
+    rules = [dict(r) for r in rules if isinstance(r, dict)]
+    if ssids:
+        want = {"InterfaceTypeMatch": "WiFi", "SSIDMatch": list(ssids), "Action": "Disconnect"}
+        if not rules or rules[0] != want:
+            return None
+        rules = rules[1:]
+    for r in rules:
+        if "URLStringProbe" in r:
+            r["URLStringProbe"] = "<probe>"
+    return rules
+
+
+def _check_artifact(meta, which, data, ids):
+    """一份产物对上它自己那条记录。每道门单独命名 —— 出事时要知道是哪一条不成立。"""
+    name = "当前版本" if which == "current" else "上一版"
+    rec = meta[which]
+    inp = rec["inputs"]
+    if not data:
+        _refuse("三件配套", "%s是空文件" % name)
+    iosprofile.reject_key_material(data, "备份里的%s产物" % name)
+    got = hashlib.sha256(data).hexdigest()
+    if got != rec["sha256"]:
+        other = meta.get("previous" if which == "current" else "current") or {}
+        if other.get("sha256") == got:
+            _refuse("内容指纹", "%s的位置上放着的是第 %s 版的文件(current/previous 串位)"
+                    % (name, other.get("revision")))
+        _refuse("内容指纹", "%s的内容与记录里的 sha256 对不上(第 %s 版)"
+                % (name, rec["revision"]))
+    try:
+        p = iosprofile.validate(data)
+    except iosprofile.ProfileError as e:
+        _refuse("描述文件结构", "%s不是一份合法的描述文件: %s" % (name, e))
+    items = [x for x in (p.get("PayloadContent") or []) if isinstance(x, dict)]
+    extra = sorted({str(x.get("PayloadType")) for x in items} - set(iosprofile.ALLOWED_PAYLOAD_TYPES))
+    if extra:
+        _refuse("payload 白名单", "%s里有本项目不会生成的 payload: %s —— 恢复之后它会从"
+                "「📱 iOS 描述文件」页发给用户安装, 拒绝。" % (name, "、".join(extra)))
+    if len(items) != len(p.get("PayloadContent") or []):
+        _refuse("payload 白名单", "%s的 PayloadContent 里有非字典项" % name)
+    if p.get("PayloadUUID") != ids["root"] \
+            or p.get("PayloadIdentifier") != iosprofile.ID_ROOT + "." + ids["root"]:
+        _refuse("身份", "%s不是这台网关(instance_id)生成的 —— 顶层身份对不上" % name)
+    dns = [x for x in items if x.get("PayloadType") == "com.apple.dnsSettings.managed"][0]
+    if dns.get("PayloadUUID") != ids["dns"] \
+            or dns.get("PayloadIdentifier") != iosprofile.ID_DNS + "." + ids["dns"]:
+        _refuse("身份", "%s的 DNS payload 不是这台网关(instance_id)派生的身份" % name)
+    cas = [x for x in items if x.get("PayloadType") == "com.apple.security.root"]
+    if bool(cas) != bool(inp["wloc_enabled"]):
+        _refuse("根证书", "%s是否含根证书与记录不符(记录说%s)"
+                % (name, "有" if inp["wloc_enabled"] else "没有"))
+    if cas:
+        body = cas[0].get("PayloadContent")
+        if not isinstance(body, (bytes, bytearray)):
+            _refuse("根证书", "%s的根证书那一格不是二进制内容" % name)
+        if hashlib.sha256(bytes(body)).hexdigest() != inp["wloc_ca_sha256"]:
+            _refuse("根证书", "%s里的根证书指纹与记录不符 —— 那不是这一版用的那张证书" % name)
+        if cas[0].get("PayloadUUID") != ids["ca"]:
+            _refuse("身份", "%s的根证书 payload UUID 不是这台网关派生的" % name)
+        try:
+            iosprofile.assert_public_cert_der(bytes(body), "%s里的根证书" % name)
+        except iosprofile.ProfileError as e:
+            _refuse("根证书", str(e))
+    s = dns.get("DNSSettings") or {}
+    if s.get("ServerName") != inp["dot_host"]:
+        _refuse("语义一致", "%s里的 ServerName(%r)与记录的 dot_host(%r)不符"
+                % (name, s.get("ServerName"), inp["dot_host"]))
+    if list(s.get("ServerAddresses") or []) != list(inp["server_addresses"]):
+        _refuse("语义一致", "%s里的 ServerAddresses 与记录不符" % name)
+    if s.get("DNSProtocol") != inp["dns_protocol"]:
+        _refuse("语义一致", "%s里的 DNSProtocol 与记录不符" % name)
+    rules = dns.get("OnDemandRules") or []
+    for r in rules:
+        if isinstance(r, dict) and "URLStringProbe" in r \
+                and r["URLStringProbe"] != inp["probe_url"]:
+            _refuse("语义一致", "%s里的探测地址与记录不符" % name)
+    core = _ondemand_of(rules, inp["ssids"])
+    if core is None:
+        _refuse("语义一致", "%s里的 SSID 强制直连名单与记录不符" % name)
+    if core != inp["ondemand_core"]:
+        _refuse("语义一致", "%s里的按需规则骨架与记录不符" % name)
+
+
+def validate_restore_set(raw, cur=None, prev=None):
+    """备份里的三件套 → (记录字节, current 字节或 None, previous 字节或 None, 提示或 None)。
+
+    不通过就抛 RestoreRefused, **一个字节都不写**。记录解不开时返回 (None, ...) 让调用方
+    按既有口径处理(跳过 iOS 这一组, 不动现网)。
+    """
+    meta = _check_meta(raw)
+    if meta is None:
+        return None, None, None, None
+    want = {w for w in ("current", "previous") if meta.get(w)}
+    have = {w for w, d in (("current", cur), ("previous", prev)) if d is not None}
+    if want and not have:
+        # 旧格式备份(只带记录、不带产物)。既有口径: 如实说明, 不假装完整恢复。previous 那一版
+        # 用的根证书只在产物里有正文, 元数据里只有指纹 —— 它丢了就真的没了, 谁也重建不出来。
+        note = ""
+        if meta.get("previous"):
+            meta = dict(meta, previous=None)
+            note = ("ℹ️ 这份备份是旧格式(只带记录、不带描述文件本体): 上一版已标记为不可用 —— "
+                    "它用的根证书只在文件里有正文, 无法重建。")
+        if meta.get("current"):
+            note = ((note + " ") if note else "ℹ️ 这份备份是旧格式(只带记录、不带描述文件本体): ") \
+                + "当前版本的文件不在备份里, 请到「📱 iOS 描述文件」页确认服务端状态。"
+        raw_out = json.dumps(meta, ensure_ascii=False, indent=2,
+                             sort_keys=True).encode("utf-8") + b"\n"
+        return raw_out, None, None, (note or None)
+    if have - want:
+        _refuse("三件配套", "包里带着记录里没有的%s产物 —— 这一组自相矛盾, 不能只按其中一半"
+                "恢复(常见成因: 旧快照回滚留下的孤儿文件)"
+                % "、".join("上一版" if w == "previous" else "当前版本" for w in sorted(have - want)))
+    if want - have:
+        _refuse("三件配套", "记录里有%s, 包里却缺这一份产物 —— 恢复回去就是"
+                "「记录说有、盘上没有」"
+                % "、".join("上一版" if w == "previous" else "当前版本" for w in sorted(want - have)))
+    ids = derive_ids(meta["instance_id"])
+    if "current" in want:
+        _check_artifact(meta, "current", cur, ids)
+    if "previous" in want:
+        _check_artifact(meta, "previous", prev, ids)
+    return raw, cur, prev, None
 
 
 def status_lines(meta, inputs=None, art_root=None):

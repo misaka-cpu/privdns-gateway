@@ -3509,10 +3509,21 @@ def _reapply_explicit_proxy(mos_bytes, cur_bytes):
 
 
 
+class _IosRestoreRefused(Exception):
+    """备份里的 iOS 三件套没通过联合校验。整笔恢复就此打住(理由见 _stage_ios_profile)。"""
+
+
 def _stage_ios_profile(t, tmp):
     """把备份里的 iOS 描述文件生命周期挂进这笔事务。返回 (恢复了什么, 提示或 None)。
 
-    旧格式备份(只有记录、没有产物)必须被**认出来**并如实说明, 不能伪装成完整恢复:
+    三份文件(记录 + current + previous)必须当成**一组**校验后再挂, 校验在 iosstate
+    (validate_restore_set) —— 那里有元数据语义, 这里只负责取文件和把结论翻译成消息。
+    不通过就抛 _IosRestoreRefused: **整笔恢复**失败, 而不是"跳过 iOS 那部分继续恢复"。
+    理由是这三份和 config.json 来自同一个包 —— 这个包的 iOS 那一组要么自相矛盾、要么带着
+    本项目不会生成的 payload, 那就没有理由单独相信它的网关配置部分; 而"成功了但少恢复了
+    一样东西"留下的机器状态, 用户不会知道。
+
+    旧格式备份(只有记录、没有产物)仍按既有口径处理: 认出来、如实说明, 不伪装成完整恢复。
       · previous 那一版用的根证书只在产物里有正文, 元数据里只有指纹 —— 它丢了就真的没了,
         谁也重建不出来。所以记录里的 previous 一并清掉, 不留一个点开就报错的"上一版";
       · current 保留记录。它**有可能**按记录逐字节复原(条件见 iosstate.repair_current),
@@ -3521,34 +3532,36 @@ def _stage_ios_profile(t, tmp):
     state_src = os.path.join(tmp, "etc/privdns-gateway/ios-profile.json")
     if not os.path.isfile(state_src):
         return None, None                       # 备份里没有 → 不动现网的任何一份
+    if iosstate is None:                        # Android: 根本没有这套模块
+        return None, "⚠️ 本平台不带 iOS 描述文件功能, 备份里的那一组已跳过(现网未被改动)"
+
+    def _rd(p):
+        if not os.path.isfile(p):
+            return None
+        with open(p, "rb") as f:
+            return f.read()
+
     try:
-        with open(state_src, "rb") as f:
-            raw = f.read()
-        state = json.loads(raw.decode("utf-8"))
-    except Exception:  # noqa: BLE001
+        raw = _rd(state_src)
+        cur = _rd(os.path.join(tmp, "var/lib/privdns-gateway/ios-profile/current.mobileconfig"))
+        prev = _rd(os.path.join(tmp, "var/lib/privdns-gateway/ios-profile/previous.mobileconfig"))
+    except OSError as e:
+        raise _IosRestoreRefused("读不到备份里的 iOS 描述文件(%s)" % e.strerror)
+    try:
+        raw, cur, prev, note = iosstate.validate_restore_set(raw, cur, prev)
+    except iosstate.RestoreRefused as e:
+        raise _IosRestoreRefused(str(e))
+    except iosstate.StateError as e:
+        raise _IosRestoreRefused(str(e))
+    if raw is None:
         return None, "⚠️ 备份里的 iOS 描述文件记录无法解析, 已跳过(现网那份未被改动)"
-    cur_src = os.path.join(tmp, "var/lib/privdns-gateway/ios-profile/current.mobileconfig")
-    prev_src = os.path.join(tmp, "var/lib/privdns-gateway/ios-profile/previous.mobileconfig")
-    have_cur, have_prev = os.path.isfile(cur_src), os.path.isfile(prev_src)
-    note = None
-    if state.get("previous") and not have_prev:
-        state = dict(state, previous=None)
-        raw = json.dumps(state, ensure_ascii=False, indent=2,
-                         sort_keys=True).encode("utf-8") + b"\n"
-        note = ("ℹ️ 这份备份是旧格式(只带记录、不带描述文件本体): 上一版已标记为不可用 —— "
-                "它用的根证书只在文件里有正文, 无法重建。")
-    if state.get("current") and not have_cur:
-        note = ((note + " ") if note else "ℹ️ 这份备份是旧格式(只带记录、不带描述文件本体): ") + \
-               "当前版本的文件不在备份里, 请到「📱 iOS 描述文件」页确认服务端状态。"
     t.stage("ios_profile_state", raw)
     what = ["身份/修订记录"]
-    if have_cur:
-        with open(cur_src, "rb") as f:
-            t.stage("ios_profile_current", f.read())
+    if cur is not None:
+        t.stage("ios_profile_current", cur)
         what.append("当前版本")
-    if have_prev:
-        with open(prev_src, "rb") as f:
-            t.stage("ios_profile_previous", f.read())
+    if prev is not None:
+        t.stage("ios_profile_previous", prev)
         what.append("上一版")
     return "iOS 描述文件(" + " + ".join(what) + ")", note
 
@@ -3660,6 +3673,11 @@ def _restore_commit(tmp):
         for _a in tx.actions_for_targets(list(t.targets) + ["mihomo_cfg"]):
             t.service(_a)
         res = t.commit()
+    except _IosRestoreRefused as e:
+        # 点名是哪一道门 —— 不通过时用户唯一能做的判断是"这份备份能不能用", 一句
+        # "恢复失败" 帮不了他。现网一个字节都没被改(事务还没提交)。
+        return False, ("⛔ 已拒绝恢复这份备份, 现网配置一个字节都没有改动。\n%s"
+                       % tx.redact(str(e)))
     except tx.TxBusy:
         return False, BUSY_MSG
     except tx.TxRefused as e:

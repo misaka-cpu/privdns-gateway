@@ -220,6 +220,9 @@ jobs:
       - name: "iOS 描述文件并发 (整段读-改-写一把锁 + 标记发送认版本, 不丢更新)"
         run: python3 tests/test-ios-profile-concurrency.py
 
+      - name: "iOS 备份恢复联合校验 (三件套当一组验 + 只放行本项目会生成的 payload)"
+        run: python3 tests/test-ios-profile-backup-trust.py
+
       - name: "自检防火墙端口回归"
         run: python3 tests/test-doctor-firewall.py
 
