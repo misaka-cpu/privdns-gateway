@@ -16,8 +16,10 @@
 import os
 import plistlib
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -156,7 +158,27 @@ if outs:
 else:
     bad("SSID 用例生成失败: %s" % err)
 
-FAKE_DER = b"\x30\x82\x01\x0a\xfake-ca-der-bytes"
+# 必须是一张**真的** DER 证书: 根证书那一格现在要过完整的 X.509 强校验(见
+# iosprofile.assert_public_cert_der), 拿几个字节冒充 DER 会在 render 里就被拒 ——
+# 那样测出来的是"强校验生效了", 而这一节要特征化的是 v1.7.8 的身份行为。
+TMPS = []
+
+
+def _real_der():
+    d = tempfile.mkdtemp(prefix="ioslegacy-ca-")
+    TMPS.append(d)
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                    "-keyout", d + "/k.pem", "-out", d + "/c.pem", "-days", "1",
+                    "-subj", "/CN=PDG legacy fixture"], check=True,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["openssl", "x509", "-in", d + "/c.pem", "-outform", "DER",
+                    "-out", d + "/c.der"], check=True,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    with open(d + "/c.der", "rb") as f:
+        return f.read()
+
+
+FAKE_DER = _real_der()
 outs, err = bot_profile(wloc="['x.example']", der=FAKE_DER)
 if outs:
     p0 = plistlib.loads(outs[0])
@@ -233,4 +255,6 @@ else:
 
 print("─" * 40)
 print("通过 %d, 失败 %d" % (PASS[0], FAIL[0]))
+for _d in TMPS:
+    shutil.rmtree(_d, ignore_errors=True)
 sys.exit(1 if FAIL[0] else 0)

@@ -232,6 +232,9 @@ jobs:
       - name: "iOS 恢复计划三入口共用 (Bot/救援平面/CLI 回滚同一份判据, 缺失即删除)"
         run: python3 tests/test-ios-profile-restore-plan.py
 
+      - name: "iOS 根证书必须恰好是一张 DER (证书后拼私钥/垃圾字节一律拒, 四条可信路径同一道门)"
+        run: python3 tests/test-ios-ca-der-exact.py
+
       - name: "自检防火墙端口回归"
         run: python3 tests/test-doctor-firewall.py
 

@@ -132,16 +132,26 @@ def _der_first_child_tag(der):
 
 
 def assert_public_cert_der(der, what="根证书"):
-    """这段 DER **必须**是一张真的 X.509 公钥证书。
+    """这段 DER **必须恰好**是一张真的 X.509 公钥证书 —— 不多一个字节。
 
     为什么不能只扫 "PRIVATE KEY" 字面量: 描述文件里的 PayloadContent 是 base64 过的二进制,
-    一把 DER 私钥塞进去之后, 文件里根本不会出现那几个字。所以这里换成结构判据 + openssl:
-    先看外层 SEQUENCE 的第一个元素是不是 SEQUENCE(证书)还是 INTEGER(各种私钥格式的
-    version 字段), 再交给 openssl 认一遍。**openssl 不可用时 fail-closed**: 本项目的安装
-    本来就依赖它(签证书、建 MITM CA 都要), 而结构判据只认得出"这不是私钥", 认不出"这是一
-    张有效证书" —— 拿它冒充强校验等于在恢复路径上悄悄降级。
+    一把 DER 私钥塞进去之后, 文件里根本不会出现那几个字。
 
-    openssl 走 stdin, **不落盘**: 待检内容有可能正是一把私钥, 我们不该把它写到临时文件里。
+    为什么"能解析出一张证书"也不够: `openssl x509 -inform DER` 解析完开头那张证书就收工,
+    **后面剩下的字节直接忽略**。于是 `证书DER + 私钥DER` 拼在一起照样退出码 0 —— 而那一格
+    的内容会原样落进要发到用户 iPhone 上的 .mobileconfig, 等于让一把完整可用的私钥搭着
+    公开文件出门, 全程没有任何一处报错。
+
+    所以判据是"**全部字节恰好组成这一张证书**": 让 openssl 把它重新编码成规范 DER, 要求
+    输出与输入逐字节相同。X.509 证书本来就是 DER, 合法的那张会原样往返; 多一个字节就说明
+    后面还跟着别的东西。
+
+    两条纪律:
+      · openssl 走 stdin/stdout, **不落盘** —— 待检内容有可能正是一把私钥;
+      · 拒绝消息里绝不带待检字节(不打印正文、不打印 base64、不打印长度以外的任何内容)。
+
+    **openssl 不可用时 fail-closed**: 本项目的安装本来就依赖它(签证书、建 MITM CA 都要),
+    而结构判据只认得出"这不是私钥", 认不出"这是一张有效证书"。
     """
     b = bytes(der or b"")
     if not b:
@@ -156,22 +166,24 @@ def assert_public_cert_der(der, what="根证书"):
     if tag != 0x30:
         raise ProfileError("%s不是 X.509 证书结构, 拒绝。" % what)
     try:
-        p = subprocess.run(["openssl", "x509", "-inform", "DER", "-noout"],
-                           input=b, stdout=subprocess.DEVNULL,
+        p = subprocess.run(["openssl", "x509", "-inform", "DER", "-outform", "DER"],
+                           input=b, stdout=subprocess.PIPE,
                            stderr=subprocess.DEVNULL, timeout=15)
     except FileNotFoundError:
-        # 本项目的安装本来就依赖 openssl(签证书、建 MITM CA 都用它)。找不到它时**不能**
-        # 把上面那点结构判据冒充成完整 X.509 校验 —— 结构判据只认得出"这不是私钥", 认不出
-        # "这是一张有效证书"。如实说强校验不可用, 然后拒。
         raise ProfileError("强校验不可用: 机器上找不到 openssl, 无法确认%s是不是一张有效的 "
                            "X.509 公钥证书 —— 本次拒绝(结构判据不能冒充强校验)。"
                            "请先装回 openssl 再重试。" % what)
     except (OSError, subprocess.SubprocessError):
         raise ProfileError("强校验不可用: openssl 没能跑起来, 无法确认%s是不是一张有效的 "
                            "X.509 公钥证书 —— 本次拒绝。" % what)
-    if p.returncode != 0:
+    if p.returncode != 0 or not p.stdout:
         raise ProfileError("openssl 不认这张%s —— 它不是一张有效的 X.509 公钥证书, 拒绝。"
                            % what)
+    if p.stdout != b:
+        # 只报长度差, 不报内容 —— 多出来的那段很可能正是一把私钥。
+        raise ProfileError("%s后面还有额外数据: 这段内容不是单一的一张 DER 证书(证书本身 "
+                           "%d 字节, 实际给了 %d 字节)。拒绝 —— 多出来的部分会跟着描述文件"
+                           "一起发出去。" % (what, len(p.stdout), len(b)))
 
 
 def ca_der_from_pem(pem):
@@ -200,6 +212,9 @@ def ca_der_from_pem(pem):
         raise ProfileError("CA 证书 base64 解不开, 拒绝生成描述文件(可能已损坏)。")
     if not der or der[0] != 0x30:
         raise ProfileError("CA 证书不是合法 DER 结构, 拒绝生成描述文件(可能已损坏)。")
+    # 走同一道强校验: base64 里塞的可以是"证书 + 私钥"拼接, 那样解出来的 DER 开头仍是一张
+    # 合法证书, 而私钥会跟着描述文件出门。
+    assert_public_cert_der(der, "CA 证书")
     return der
 
 
@@ -380,8 +395,12 @@ def validate(data, expect_ca=None):
     for c in cas:
         _check_uuid(c.get("PayloadUUID"), "CA payload UUID")
         body = c.get("PayloadContent")
-        if not isinstance(body, bytes) or not body or body[0] != 0x30:
+        if not isinstance(body, bytes) or not body:
             raise ProfileError("根证书 payload 内容不是 DER 证书")
+        # 强校验放在这里, 于是"让产物进入可信状态"的每一条路都被同一道门覆盖:
+        # render(生成)→ validate、artifact_health / verified_artifact(健康与发送)→ validate、
+        # 恢复的联合校验也会再点名一次。四条路一份判据, 不各写各的。
+        assert_public_cert_der(body, "根证书 payload")
     return p
 
 
