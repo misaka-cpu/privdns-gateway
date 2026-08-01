@@ -226,6 +226,9 @@ jobs:
       - name: "iOS 快照精确回滚 (回滚不留孤儿产物 + 备份按记录而不是按盘上有什么打包)"
         run: python3 tests/test-ios-profile-snapshot-exact.py
 
+      - name: "iOS 首次启用不许猜 (发 SSID 也要先问装没装过, 没回答就一个字节都不写)"
+        run: python3 tests/test-ios-profile-firsttime.py
+
       - name: "自检防火墙端口回归"
         run: python3 tests/test-doctor-firewall.py
 

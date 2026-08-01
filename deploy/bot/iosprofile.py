@@ -40,6 +40,13 @@ CA_CRT = "/etc/privdns-gateway/ca/ca.crt"
 # 的新版本"; 不同网关不同 ⇒ 两台网关的描述文件不会互相顶掉(有人同时用两台)。
 ID_ROOT = "com.privdns.gateway"
 ID_DNS = "com.privdns.gateway.dot"
+# 根证书 payload 的 identifier **固定**, 只有它的 UUID 随 instance_id 派生。这是有意的:
+# Apple 的匹配语义里 profile 的身份是**顶层**的 identifier + UUID, payload 的 identifier
+# 只要求在这份 profile 内部唯一, 不跨 profile 生效。两台网关的顶层 identifier 已经不同
+# ⇒ 是两份不同的描述文件, 各带各的根证书, 谁也顶不掉谁。改成派生形式换不来任何隔离, 代价
+# 却是实打实的: 它参与渲染字节, 一改, 所有已存在版本的 sha256 全部对不上, 而语义输入没变
+# ⇒ digest 不变 ⇒ 判定仍说"无需更新", 于是 repair_current 永久拒绝复原, 用户也不会收到
+# 任何该更新的提示。详见 docs/ios-profile-lifecycle.md §2。
 ID_CA = "com.privdns.mitm.ca"
 CA_DISPLAY = "PrivDNS Gateway MITM CA"
 CA_FILENAME = "pdg-mitm-ca.crt"

@@ -3221,6 +3221,30 @@ def _ios_kb():
 IOS_INSTALL_HOWTO = ("装法: 存到「文件」App → 点开 → 设置 → 通用 → 「已下载描述文件」→ 安装。\n"
                      "Wi-Fi/蜂窝是否启用私密 DNS 由服务器 :81 探测自动判定。")
 
+# 首次启用时收下的 SSID 名单, 等用户回答"以前装过吗"之后才用。放在这里而不是塞进 state:
+# state 是"下一条文字给谁处理", 这个是"已经收到、还没能用上的输入", 两件事。
+ios_first_ssids = {}
+
+
+def _ios_first_time_ask():
+    """首次启用受管描述文件之前必须问的那一句, 和它的按钮。
+
+    服务器**没有任何渠道**知道这台机器以前有没有发过旧版(随机身份)描述文件 —— 本项目不是
+    MDM。用户知道。所以问, 而不是猜: 猜"装过"会让用户白跑一趟去删一个不存在的东西, 猜
+    "没装过"会让手机上悄悄多出一个永远不会被更新的描述文件, 而且哪一头都不会报错。
+    """
+    return ("📱 <b>首次启用受管描述文件</b>\n\n"
+            "在这台网关上, 你<b>以前</b>装过 PrivDNS Gateway 的 iOS 描述文件吗?\n"
+            "(服务器无从得知这件事, 只能问你)\n\n"
+            "• 装过 → 旧版每次生成都是随机身份, iOS 会把新的当成<b>另一个</b>描述文件。"
+            "所以要先在 iPhone 上手工删掉旧的那份;\n"
+            "• 从未装过 → 直接生成即可。\n\n" + IOS_UNKNOWN,
+            {"inline_keyboard": [
+                [{"text": "装过, 我会先删掉旧的", "callback_data": "iosgen:legacy"}],
+                [{"text": "从未装过", "callback_data": "iosgen:fresh"}],
+                [{"text": "❌ 取消(先不生成)", "callback_data": "iosgen:cancel"}],
+                [{"text": "⬅️ 返回", "callback_data": "ios"}]]})
+
 
 def _ios_val(v):
     """差异里的取值展示。CA 只给指纹前缀 —— 证书正文不进任何输出。"""
@@ -3848,12 +3872,14 @@ def handle_cb(chat, mid, data):
     wloc_invalidate_watch(chat, mid)
     # iOS 专属功能的统一后端门控(不只隐藏按钮): 旧 TG 消息里的 iOS 描述文件 / WLOC 按钮被点也拒绝。
     if (data in ("ios", "ios_ssid", "iosgen", "iosgen:legacy", "iosgen:fresh",
-                 "iosdiff", "iosprev", "iosack")
+                 "iosgen:cancel", "iosdiff", "iosprev", "iosack")
             or data == "wloc" or data.startswith("wloc:")) \
        and not _ios_only(chat, mid):
+        ios_first_ssids.pop(chat, None)   # 平台不对 ⇒ 这段流程作废, 别把输入留到下一次
         return
     if data in ("menu", "status") or data.startswith("nav:"):
         state.pop(chat, None); del_sel.pop(chat, None)   # 返回/切页 = 放弃进行中的输入流程和勾选, 免得下一条文字被旧状态误吃
+        ios_first_ssids.pop(chat, None)                  # 首次流程收下的 SSID 一并作废
     if data in ("menu", "status"):
         edit(chat, mid, status_text(), MENU); return
     if data.startswith("nav:"):
@@ -4004,6 +4030,7 @@ def handle_cb(chat, mid, data):
         edit(chat, mid, "「其余国际」默认走哪个出口/组：", kb_pick("fin", exit_tags(load()), EXIT_BACK)); return
     if data == "ios":
         state.pop(chat, None)
+        ios_first_ssids.pop(chat, None)   # 退回这一页 = 放弃刚才那一轮首次流程
         try:
             edit(chat, mid, _ios_status_text(), _ios_kb())
         except Exception as e:  # noqa: BLE001
@@ -4017,6 +4044,16 @@ def handle_cb(chat, mid, data):
              "发 <code>-</code> 表示清空名单。/cancel 取消。",
              {"inline_keyboard": [[{"text": "⬅️ 返回", "callback_data": "ios"}],
                                   [{"text": "🏠 主菜单", "callback_data": "menu"}]]}); return
+    if data == "iosgen:cancel":
+        # 取消 = 这一轮首次流程作废: 收下的 SSID 丢掉, 什么都不写(不建记录、不落产物、
+        # 不占身份)。用户回到 iOS 页, 可以重新来一次。
+        ios_first_ssids.pop(chat, None)
+        state.pop(chat, None)
+        try:
+            edit(chat, mid, "已取消, 没有生成任何描述文件。\n\n" + _ios_status_text(), _ios_kb())
+        except Exception as e:  # noqa: BLE001
+            edit(chat, mid, "已取消, 没有生成任何描述文件。(%s)" % e, MENU)
+        return
     if data in ("iosgen", "iosgen:legacy", "iosgen:fresh"):
         state.pop(chat, None)
         try:
@@ -4027,19 +4064,12 @@ def handle_cb(chat, mid, data):
         # 服务器没有任何办法知道这件事, 而用户知道 —— 与其猜, 不如问。猜错的代价是用户手机上
         # 悄悄多出一个永远不会被更新的描述文件。
         if data == "iosgen" and not (iosstate.load() or {}).get("current"):
-            edit(chat, mid, "📱 <b>首次启用受管描述文件</b>\n\n"
-                 "在这台网关上, 你<b>以前</b>装过 PrivDNS Gateway 的 iOS 描述文件吗?\n\n"
-                 "• 装过 → 旧版每次生成都是随机身份, iOS 会把新的当成<b>另一个</b>描述文件。"
-                 "所以要先在 iPhone 上手工删掉旧的那份;\n"
-                 "• 没装过 → 直接生成即可。\n\n" + IOS_UNKNOWN,
-                 {"inline_keyboard": [
-                     [{"text": "装过, 我会先删掉旧的", "callback_data": "iosgen:legacy"}],
-                     [{"text": "没装过", "callback_data": "iosgen:fresh"}],
-                     [{"text": "⬅️ 返回", "callback_data": "ios"}]]}); return
+            edit(chat, mid, *_ios_first_time_ask()); return
         edit(chat, mid, "正在生成 iOS 描述文件…", BACK)
         try:
-            # 不传 SSID = 沿用已配好的强制直连名单。传 () 会把它当成"用户要清空"。
-            msg = _ios_send(chat, None, data == "iosgen:legacy")
+            # 首次流程里先收下的 SSID 名单在这里兑现(用完即弃)。没有暂存就传 None =
+            # 沿用已配好的名单; 传 () 会被当成"用户要清空"。
+            msg = _ios_send(chat, ios_first_ssids.pop(chat, None), data == "iosgen:legacy")
             edit(chat, mid, msg, _ios_kb())
         except Exception as e:  # noqa: BLE001
             edit(chat, mid, f"生成失败: {e}", MENU)
@@ -4306,9 +4336,12 @@ def handle_cb(chat, mid, data):
 def handle_text(chat, text, mid=None):
     text = text.strip()
     if text == "/cancel":
-        state.pop(chat, None); send_plain(chat, "已取消"); return
+        # 首次流程收下的 SSID 一并作废 —— 取消之后再生成, 不该莫名其妙带上上次输的东西。
+        state.pop(chat, None); ios_first_ssids.pop(chat, None)
+        send_plain(chat, "已取消"); return
     if text in ("/start", "/menu", "/status"):
-        state.pop(chat, None); send(chat, status_text()); return
+        state.pop(chat, None); ios_first_ssids.pop(chat, None)
+        send(chat, status_text()); return
     if text.startswith("/"):
         cmd = text.split()[0]
         if cmd == "/test":
@@ -4440,14 +4473,25 @@ def handle_text(chat, text, mid=None):
         send_plain(chat, msg if ok else ("❌ " + msg)); return
     if act == "ios_ssid":
         if _platform() != "ios":         # 已清 state(act 用 pop 取出); Android 直接拒绝, 不生成文件
+            ios_first_ssids.pop(chat, None)
             send_plain(chat, "此功能仅 iOS 平台可用(本机为 Android)。" + _platform_unconfirmed()); return
         ssids = [] if text.strip() == "-" else [l.strip()[:32] for l in text.splitlines() if l.strip()][:8]
         try:
-            # 老机器第一次走到这里也要问一句"以前装过吗" —— 但文本流里没有按钮可点, 所以
-            # 先把 SSID 收下、生成受管版本, 迁移提示由 _ios_send 的说明和状态页承担。
             _ios_mods()
-            legacy = not (iosstate.load() or {}).get("current")
-            send_plain(chat, _ios_send(chat, ssids, legacy))
+            # 首次启用(记录里还没有 current)⇒ **先问再生成**。以前这里从"没有 current"直接
+            # 推断成"以前装过"(legacy=True) —— 那是在猜一件服务器没有渠道知道的事:
+            #   · 猜"装过"而其实没装 ⇒ 用户白跑一趟去删一个不存在的描述文件, 状态页还一直
+            #     挂着迁移提示;
+            #   · 猜"没装过"而其实装过 ⇒ 旧那份是随机身份, iOS 把新的当成**另一个**描述文件
+            #     并存, 手机上悄悄多出一个永远不会被更新的配置。
+            # 两头都不报错, 所以只能问。SSID 先收下暂存, 得到回答之前一个字节都不写。
+            if not (iosstate.load() or {}).get("current"):
+                ios_first_ssids[chat] = ssids
+                txt, kb = _ios_first_time_ask()
+                send(chat, ("已记下强制直连名单: %s\n\n" % (", ".join(ssids) if ssids else "(清空)"))
+                     + txt, kb)
+                return
+            send_plain(chat, _ios_send(chat, ssids, False))
         except Exception as e:  # noqa: BLE001
             send_plain(chat, f"生成失败: {e}")
         return
