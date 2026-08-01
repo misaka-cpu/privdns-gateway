@@ -212,12 +212,28 @@ def load(path=None):
     if not isinstance(meta, dict) or meta.get("schema") != SCHEMA:
         raise StateError("iOS 描述文件记录 %s 的格式版本不认识(schema=%r), 拒绝继续。"
                          % (p, (meta or {}).get("schema") if isinstance(meta, dict) else None))
-    if not meta.get("instance_id"):
+    # 身份与时间走**同一份**判据(与恢复的联合校验共用 valid_instance_id / valid_stamp 和
+    # _check_record): 本地这份记录一样可能被手工改坏、被半截恢复写坏。放行的下场是
+    # status_lines 拿着一条缺字段的记录直接 KeyError —— 用户看到的是一个打不开的页面,
+    # 而那份记录还是我们自己写进去的。fail-closed 让人先去看看那个文件出了什么事。
+    if meta.get("instance_id") in (None, ""):
         raise StateError("iOS 描述文件记录 %s 里没有身份标识, 拒绝继续。" % p)
-    try:
-        derive_ids(meta["instance_id"])
-    except Exception:  # noqa: BLE001
-        raise StateError("iOS 描述文件记录 %s 里的身份标识不合法, 拒绝继续。" % p)
+    if not valid_instance_id(meta.get("instance_id")):
+        raise StateError("iOS 描述文件记录 %s 里的身份标识不是规范小写的 UUID4, 拒绝继续。"
+                         "不自动重建: 重建会生成一个新身份, 而你手机上那份描述文件将永远"
+                         "无法再被更新。" % p)
+    if not valid_stamp(meta.get("created_at")):
+        raise StateError("iOS 描述文件记录 %s 的 created_at 不是 YYYY-MM-DDTHH:MM:SSZ "
+                         "形式的真实 UTC 时刻, 拒绝继续。" % p)
+    for which in ("current", "previous"):
+        if meta.get(which) is None:
+            continue
+        try:
+            _check_record(meta[which], which)
+        except RestoreRefused as e:
+            raise StateError("iOS 描述文件记录 %s 里的 %s 记录不可用: %s 请先修复或删除该"
+                             "文件(删除等于放弃现有身份, 之后必须手工删掉手机上的旧描述"
+                             "文件)。" % (p, which, e))
     return meta
 
 
@@ -749,6 +765,34 @@ class RestoreRefused(StateError):
 
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+# 本项目写下的 instance_id 是 uuid4 的规范小写字符串; 时间一律是 _stamp() 那个 UTC 格式。
+# 两者都只认"本项目会写出来的那一种形态" —— uuid5 什么字符串都收得下, 时间字段"是不是
+# 字符串"也拦不住 2026-02-30T99:99:99Z。
+_UUID_CANON = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+_STAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+
+
+def valid_instance_id(v):
+    """是不是本项目生成的那种身份: 规范小写的 UUID **version 4**。"""
+    if not isinstance(v, str) or not _UUID_CANON.match(v):
+        return False
+    try:
+        u = uuid.UUID(v)
+    except ValueError:
+        return False
+    return u.version == 4 and str(u) == v
+
+
+def valid_stamp(v):
+    """是不是 _stamp() 那种真实存在的 UTC 时刻。正则只管长相, 还要真能解析成一个日期
+    —— 2026-02-30T99:99:99Z 长相完全合格。"""
+    if not isinstance(v, str) or not _STAMP_RE.match(v):
+        return False
+    try:
+        time.strptime(v, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return False
+    return True
 
 # ── 当前 schema 下, 一份产物**允许**长什么样 ────────────────────────────────
 # 这是白名单, 不是黑名单: 多一个字段、少一个字段、不认识的字段, 一律拒。
@@ -831,12 +875,14 @@ def _check_record(rec, name):
     if not isinstance(rec.get("sha256"), str) or not _HEX64.match(rec.get("sha256") or ""):
         _refuse(gate, "%s 的 sha256 不是 64 位十六进制" % name)
     # generated_at 必须有值: 状态页直接读它, 没有就崩。sent_at 允许是 null("还没发过")。
-    if not isinstance(rec.get("generated_at"), str) or not rec["generated_at"].strip():
-        _refuse(gate, "%s 的 generated_at 必须是非空字符串(实际 %r)"
-                % (name, rec.get("generated_at")))
-    if rec.get("sent_at") is not None and not isinstance(rec.get("sent_at"), str):
-        _refuse(gate, "%s 的 sent_at 只能是 null 或字符串(实际 %r)"
-                % (name, type(rec.get("sent_at")).__name__))
+    # 两者都必须是 _stamp() 那种**真实存在**的 UTC 时刻 —— 只判"是不是字符串"连
+    # 2026-02-30T99:99:99Z 都拦不住。
+    if not valid_stamp(rec.get("generated_at")):
+        _refuse("时间格式", "%s 的 generated_at 不是 YYYY-MM-DDTHH:MM:SSZ 形式的真实 UTC "
+                "时刻(实际 %r)" % (name, rec.get("generated_at")))
+    if rec.get("sent_at") is not None and not valid_stamp(rec.get("sent_at")):
+        _refuse("时间格式", "%s 的 sent_at 只能是 null 或 YYYY-MM-DDTHH:MM:SSZ 形式的真实 "
+                "UTC 时刻(实际 %r)" % (name, rec.get("sent_at")))
     inp = rec.get("inputs")
     if not isinstance(inp, dict):
         _refuse(gate, "%s 缺 inputs" % name)
@@ -891,16 +937,15 @@ def _check_meta(raw):
         _refuse(gate, "记录不是一个 JSON 对象")
     if meta.get("schema") != SCHEMA:
         _refuse(gate, "格式版本不认识(schema=%r)" % meta.get("schema"))
-    if not isinstance(meta.get("instance_id"), str) or not meta["instance_id"]:
-        _refuse(gate, "没有身份标识")
-    try:
-        derive_ids(meta["instance_id"])
-    except Exception:  # noqa: BLE001
-        _refuse(gate, "身份标识不合法")
+    # instance_id 必须是本项目写下的那种身份: 规范小写的 UUID **version 4**。
+    # 光靠"uuid5 收不收得下这个字符串"证明不了任何事 —— 它什么字符串都收。
+    if not valid_instance_id(meta.get("instance_id")):
+        _refuse("身份", "instance_id 不是规范小写的 UUID4(本项目写下的身份都是那种形态)")
     if not isinstance(meta.get("migration_pending"), bool):
         _refuse(gate, "migration_pending 不是布尔")
-    if meta.get("created_at") is not None and not isinstance(meta.get("created_at"), str):
-        _refuse(gate, "created_at 类型不对")
+    if not valid_stamp(meta.get("created_at")):
+        _refuse("时间格式", "created_at 不是 YYYY-MM-DDTHH:MM:SSZ 形式的真实 UTC 时刻"
+                "(实际 %r)" % (meta.get("created_at"),))
     if set(meta) != set(_blank()):
         _refuse(gate, "记录的字段与本版本对不上(多/少: %s)"
                 % "、".join(sorted(set(meta) ^ set(_blank()))))
