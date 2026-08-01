@@ -120,6 +120,16 @@ def ondemand_core(template=None):
     return out
 
 
+def probe_url_for(server_addresses):
+    """探测地址的**唯一**公式。
+
+    schema 1 没有"单独配置探测 URL"这个入口 —— 它由第一个规范化服务器地址推导。生成
+    (make_inputs)与校验(_check_inputs_canonical)共用这一份, 否则校验那边就得再抄一遍公式,
+    而两份公式迟早会漂移成"备份说什么就是什么"。
+    """
+    return "http://%s:81/probe" % iosprofile.norm_addrs(server_addresses)[0]
+
+
 def make_inputs(dot_host, server_addresses, ssids=(), wloc_enabled=False, ca_der=b"",
                 template=None):
     """把一次生成的**语义输入**规范化。只有这里出现的字段参与 digest。
@@ -132,7 +142,7 @@ def make_inputs(dot_host, server_addresses, ssids=(), wloc_enabled=False, ca_der
         "dot_host": iosprofile.norm_host(dot_host),
         "server_addresses": iosprofile.norm_addrs(server_addresses),
         "dns_protocol": "TLS",
-        "probe_url": "http://%s:81/probe" % iosprofile.norm_addrs(server_addresses)[0],
+        "probe_url": probe_url_for(server_addresses),
         "ondemand_core": ondemand_core(template),
         "ssids": iosprofile.norm_ssids(ssids),
         "wloc_enabled": bool(wloc_enabled),
@@ -305,36 +315,21 @@ def artifact_health(meta, which="current", root=None):
         return CORRUPT, "%s产物读不出来: %s" % (name, e.strerror)
     if not data:
         return CORRUPT, "%s产物是空文件" % name
+    # 结构层: 不是一份合法描述文件 = 这个**文件**坏了 → corrupt。
     try:
         iosprofile.reject_key_material(data, "%s产物" % name)
-        p = iosprofile.validate(data)
+        iosprofile.validate(data)
     except iosprofile.ProfileError as e:
         return CORRUPT, "%s产物不是一份合法的描述文件: %s" % (name, e)
-    # 身份必须是本网关的。不是的话, 这份文件根本不该被当成"我们的某一版"。
+    # 内容层: 走**同一份** schema 1 严格契约(记录 + 产物), 与恢复的联合校验、写后复核
+    # 共用一处实现。恢复严一点、健康宽一点的下场很具体: 一份恢复会被拒的产物, 只要已经
+    # 落在盘上就照样判 healthy, 于是 verified_artifact 把它发到用户手机上。
     try:
-        ids = derive_ids((meta or {}).get("instance_id"))
+        strict_artifact_check(meta, which, data)
     except StateError as e:
         return STATE_MISMATCH, str(e)
-    dns = [x for x in p["PayloadContent"]
-           if x.get("PayloadType") == "com.apple.dnsSettings.managed"][0]
-    if p.get("PayloadUUID") != ids["root"] or dns.get("PayloadUUID") != ids["dns"]:
-        return STATE_MISMATCH, "%s产物的身份与本网关不符(不是这台机器生成的)" % name
-    want = rec.get("sha256")
-    got = hashlib.sha256(data).hexdigest()
-    if want and got != want:
-        other = _slot(meta, "previous" if which == "current" else "current") or {}
-        if other.get("sha256") == got:
-            return STATE_MISMATCH, ("%s的位置上放着的是第 %s 版的文件(串位了)"
-                                    % (name, other.get("revision")))
-        return STATE_MISMATCH, "%s产物与记录的 sha256 不符(内容被动过)" % name
-    # CA 也要对得上: 指纹在元数据里, 正文只在产物里 —— 两边一致才谈得上"这就是那一版"。
-    inp = rec.get("inputs") or {}
-    cas = [x for x in p["PayloadContent"] if x.get("PayloadType") == "com.apple.security.root"]
-    if bool(cas) != bool(inp.get("wloc_enabled")):
-        return STATE_MISMATCH, "%s产物是否含根证书与记录不符" % name
-    if cas:
-        if hashlib.sha256(cas[0]["PayloadContent"]).hexdigest() != inp.get("wloc_ca_sha256"):
-            return STATE_MISMATCH, "%s产物里的根证书指纹与记录不符" % name
+    except iosprofile.ProfileError as e:
+        return CORRUPT, "%s产物不是一份合法的描述文件: %s" % (name, e)
     return HEALTHY, "%s产物与记录一致(第 %s 版)" % (name, rec.get("revision"))
 
 
@@ -861,6 +856,46 @@ def _keys_exact(what, got, want):
         _refuse("字段白名单", "%s 少了本项目一定会写的字段: %s" % (what, "、".join(miss)))
 
 
+def _canon(fn, value, field, name):
+    """value 必须**等于**规范化函数作用在它自己身上的结果。
+
+    这是"输入是不是本项目生成器可能产出的形式"的判据。只查外层类型是不够的:
+    ["B", 7, "A", "A", ""] 是个 list, 里面却有整数、空项、重复和乱序 —— 规范化之后是
+    ["7","A","B"], 跟原值差着十万八千里, 而生成器永远写不出前者。
+    """
+    try:
+        got = fn(value)
+    except Exception:  # noqa: BLE001
+        _refuse("输入规范", "%s 的 inputs.%s 不是本项目能接受的值" % (name, field))
+    if got != value:
+        _refuse("输入规范", "%s 的 inputs.%s 不是规范形式 —— 本项目的生成器写不出这个值"
+                "(空白/空项/重复/未排序/被隐式转成字符串的非字符串, 都会落到这里)"
+                % (name, field))
+
+
+def _check_inputs_canonical(inp, name):
+    """schema 1 下, 记录里的输入必须是**本项目生成器可能产出的**规范形式。
+
+    集中在这一处: 恢复的联合校验、artifact_health、写后复核走的都是它, 不各写一套。
+    """
+    _canon(iosprofile.norm_host, inp["dot_host"], "dot_host", name)
+    _canon(iosprofile.norm_addrs, inp["server_addresses"], "server_addresses", name)
+    _canon(iosprofile.norm_ssids, inp["ssids"], "ssids", name)
+    if inp["dns_protocol"] != "TLS":
+        _refuse("输入规范", "%s 的 inputs.dns_protocol 只能是 TLS(实际 %r)"
+                % (name, inp["dns_protocol"]))
+    # 探测地址没有独立配置入口, 必须由第一个规范化服务器地址推导。不这么验的话, 把
+    # inputs.probe_url 和产物里两条 URLStringProbe 一起改成攻击者的地址就自洽了 ——
+    # 而那意味着手机每次判断要不要启用 DoT 都先去打对方的服务器。
+    try:
+        want = probe_url_for(inp["server_addresses"])
+    except Exception:  # noqa: BLE001
+        _refuse("输入规范", "%s 的 inputs.server_addresses 推导不出探测地址" % name)
+    if inp["probe_url"] != want:
+        _refuse("输入规范", "%s 的 inputs.probe_url 不是由第一个服务器地址推导出来的 —— "
+                "schema %d 没有单独配置探测地址的入口" % (name, SCHEMA))
+
+
 def _check_record(rec, name):
     gate = "记录格式"
     if not isinstance(rec, dict):
@@ -904,6 +939,7 @@ def _check_record(rec, name):
                 % (name, inp["wloc_enabled"], "有" if inp["wloc_ca_sha256"] else "没有"))
     if inp["wloc_ca_sha256"] and not _HEX64.match(inp["wloc_ca_sha256"]):
         _refuse(gate, "%s 的 inputs.wloc_ca_sha256 不是 64 位十六进制" % name)
+    _check_inputs_canonical(inp, name)
     # 记录里的骨架本身也必须是 schema 1 的那一套 —— 不能只跟产物互相配平。
     if inp["ondemand_core"] != _SCHEMA1_ONDEMAND_CORE:
         _refuse("按需规则", "%s 记录里的 ondemand_core 不是 schema %d 的固定骨架 —— "
@@ -1085,6 +1121,29 @@ def _check_artifact(meta, which, data, ids):
     if s.get("DNSProtocol") != inp["dns_protocol"]:
         _refuse("语义一致", "%s里的 DNSProtocol 与记录不符" % name)
     _check_ondemand(dns.get("OnDemandRules") or [], inp, name)
+
+
+def strict_artifact_check(meta, which, data):
+    """schema 1 的「记录 + 产物」严格契约 —— **唯一**一处实现。
+
+    共用它的路径: 备份恢复的联合校验、artifact_health()、verified_artifact()(经
+    artifact_health)、生成的写后复核、repair_current() 完成后的复核。分开写的下场很具体:
+    恢复那边拒掉的东西, 只要已经躺在盘上就照样判 healthy, 然后被发到用户手机上。
+
+    失败一律抛 StateError 的子类(RestoreRefused), 调用方按自己的口径翻译, 不在这里
+    决定是 corrupt 还是 state_mismatch。消息只报字段名与门名, 不带证书正文、私钥、
+    完整 mobileconfig 或 base64。
+    """
+    meta = meta or {}
+    if not valid_instance_id(meta.get("instance_id")):
+        _refuse("身份", "instance_id 不是规范小写的 UUID4(本项目写下的身份都是那种形态)")
+    if not valid_stamp(meta.get("created_at")):
+        _refuse("时间格式", "created_at 不是 YYYY-MM-DDTHH:MM:SSZ 形式的真实 UTC 时刻")
+    rec = meta.get(which)
+    if not isinstance(rec, dict):
+        _refuse("记录格式", "%s 那一栏不是一条记录" % which)
+    _check_record(rec, which)
+    _check_artifact(meta, which, data, derive_ids(meta["instance_id"]))
 
 
 def validate_restore_set(raw, cur=None, prev=None):

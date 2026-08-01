@@ -50,6 +50,13 @@ ID_DNS = "com.privdns.gateway.dot"
 ID_CA = "com.privdns.mitm.ca"
 CA_DISPLAY = "PrivDNS Gateway MITM CA"
 CA_FILENAME = "pdg-mitm-ca.crt"
+# 顶层与 DNS payload 的显示名。这是用户在 iPhone 的「设置 → 通用 → VPN 与设备管理」里
+# **唯一**看得见的东西 —— 一份改成 "Trusted Corporate MDM" 的描述文件, 在界面上和真的
+# 没有任何区别。所以它是固定值, 由这里定义: render() 按它写、validate() 按它验, 模板里
+# 那两行只是同一个字符串的可读副本(tests/test-ios-profile-schema-contract.py 会把三处
+# 钉在一起)。
+ROOT_DISPLAY = "PrivDNS Gateway"
+DNS_DISPLAY = "PrivDNS Gateway (DoT)"
 
 # 本项目**只会**写出这两种 payload。mobileconfig 能装的远不止 DNS —— VPN、代理、WebClip、
 # 甚至 MDM 注册都在里面, 一份"多带了几格"的描述文件在 iOS 上看起来和正常的没两样。凡是从外
@@ -316,6 +323,9 @@ def render(dot_host, server_addresses, ssids=(), ca_der=b"", ids=None, template=
     dns = (p.get("PayloadContent") or [None])[0]
     if not isinstance(dns, dict) or dns.get("PayloadType") != "com.apple.dnsSettings.managed":
         raise ProfileError("描述文件模板的 DNS payload 结构不对, 拒绝生成。")
+    # 显示名以常量为准, 不以模板为准: 校验器验的是常量, 两边必须是同一个来源。
+    p["PayloadDisplayName"] = ROOT_DISPLAY
+    dns["PayloadDisplayName"] = DNS_DISPLAY
     if len(addrs) > 1:
         dns["DNSSettings"]["ServerAddresses"] = list(addrs)
     if ssids:
@@ -361,6 +371,9 @@ def validate(data, expect_ca=None):
     _check_uuid(p.get("PayloadUUID"), "顶层 PayloadUUID")
     if not str(p.get("PayloadIdentifier") or "").startswith(ID_ROOT + "."):
         raise ProfileError("顶层 PayloadIdentifier 前缀不对: %r" % p.get("PayloadIdentifier"))
+    if p.get("PayloadDisplayName") != ROOT_DISPLAY:
+        raise ProfileError("顶层 PayloadDisplayName 不是本项目固定的那个 —— 它是用户在"
+                           "iPhone 上唯一看得见的名字, 改了就等于换了一份东西的门面。")
     items = p.get("PayloadContent") or []
     dns = [x for x in items if isinstance(x, dict)
            and x.get("PayloadType") == "com.apple.dnsSettings.managed"]
@@ -369,6 +382,8 @@ def validate(data, expect_ca=None):
     d = dns[0]
     if d.get("PayloadVersion") != 1:
         raise ProfileError("DNS payload 的 PayloadVersion 必须是 1")
+    if d.get("PayloadDisplayName") != DNS_DISPLAY:
+        raise ProfileError("DNS payload 的 PayloadDisplayName 不是本项目固定的那个。")
     _check_uuid(d.get("PayloadUUID"), "DNS payload UUID")
     s = d.get("DNSSettings") or {}
     if s.get("DNSProtocol") != "TLS":
