@@ -235,6 +235,9 @@ jobs:
       - name: "iOS 根证书必须恰好是一张 DER (证书后拼私钥/垃圾字节一律拒, 四条可信路径同一道门)"
         run: python3 tests/test-ios-ca-der-exact.py
 
+      - name: "iOS schema 1 可信契约 (输入必须是规范形式 + 固定显示名 + 身份与时间; 恢复/健康/发送同一份判据)"
+        run: python3 tests/test-ios-profile-schema-contract.py
+
       - name: "自检防火墙端口回归"
         run: python3 tests/test-doctor-firewall.py
 
