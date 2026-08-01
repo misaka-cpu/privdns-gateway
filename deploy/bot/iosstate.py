@@ -222,28 +222,17 @@ def load(path=None):
     if not isinstance(meta, dict) or meta.get("schema") != SCHEMA:
         raise StateError("iOS 描述文件记录 %s 的格式版本不认识(schema=%r), 拒绝继续。"
                          % (p, (meta or {}).get("schema") if isinstance(meta, dict) else None))
-    # 身份与时间走**同一份**判据(与恢复的联合校验共用 valid_instance_id / valid_stamp 和
-    # _check_record): 本地这份记录一样可能被手工改坏、被半截恢复写坏。放行的下场是
-    # status_lines 拿着一条缺字段的记录直接 KeyError —— 用户看到的是一个打不开的页面,
-    # 而那份记录还是我们自己写进去的。fail-closed 让人先去看看那个文件出了什么事。
-    if meta.get("instance_id") in (None, ""):
-        raise StateError("iOS 描述文件记录 %s 里没有身份标识, 拒绝继续。" % p)
-    if not valid_instance_id(meta.get("instance_id")):
-        raise StateError("iOS 描述文件记录 %s 里的身份标识不是规范小写的 UUID4, 拒绝继续。"
-                         "不自动重建: 重建会生成一个新身份, 而你手机上那份描述文件将永远"
-                         "无法再被更新。" % p)
-    if not valid_stamp(meta.get("created_at")):
-        raise StateError("iOS 描述文件记录 %s 的 created_at 不是 YYYY-MM-DDTHH:MM:SSZ "
-                         "形式的真实 UTC 时刻, 拒绝继续。" % p)
-    for which in ("current", "previous"):
-        if meta.get(which) is None:
-            continue
-        try:
-            _check_record(meta[which], which)
-        except RestoreRefused as e:
-            raise StateError("iOS 描述文件记录 %s 里的 %s 记录不可用: %s 请先修复或删除该"
-                             "文件(删除等于放弃现有身份, 之后必须手工删掉手机上的旧描述"
-                             "文件)。" % (p, which, e))
+    # 走**同一份**完整契约(_check_meta_object): 本地这份记录一样可能被手工改坏、被半截
+    # 恢复写坏。放行的下场是 status_lines 拿着一条缺字段的记录直接 KeyError —— 用户看到
+    # 的是一个打不开的页面, 而那份记录还是我们自己写进去的。
+    # 判据只有一份, 这里只把门名与原因换成本机的说法。
+    try:
+        _check_meta_object(meta)
+    except RestoreRefused as e:
+        raise StateError("iOS 描述文件记录 %s 没通过「%s」这道门: %s\n"
+                         "**不自动重建**: 重建会生成一个新身份, 而你手机上那份描述文件将"
+                         "永远无法再被更新。请先修复或删除该文件(删除等于放弃现有身份, "
+                         "之后必须手工删掉手机上的旧描述文件)。" % (p, e.gate, e.why))
     return meta
 
 
@@ -755,7 +744,17 @@ def _recover_locked(meta_path=None, art_root=None):
 # 说清楚**不**保证什么: 恢复的是用户自己给的配置, 我们不去审"这个 DoT 域名该不该信" ——
 # 那和"恢复备份"这件事本身矛盾。挡的是"这一组自相矛盾"和"这里面有描述文件不该有的东西"。
 class RestoreRefused(StateError):
-    """备份里的生命周期三件套不成立。消息里点名是哪一道门。"""
+    """生命周期这一组不成立。消息里点名是哪一道门。
+
+    带着 gate / why 两个属性: 同一份判据在"外部恢复"和"本地状态"两条路上要说不同的话
+    (一句"备份里的…"对着本机文件是错的), 但**判据不许有两份**。调用方按需要重新组织
+    措辞, 行为完全一致。
+    """
+
+    def __init__(self, gate, why):
+        self.gate = gate
+        self.why = why
+        StateError.__init__(self, "备份里的 iOS 描述文件没通过「%s」这道门: %s" % (gate, why))
 
 
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
@@ -843,7 +842,7 @@ _INPUT_TYPES = (("schema", int), ("dot_host", str), ("server_addresses", list),
                 ("ssids", list), ("wloc_enabled", bool), ("wloc_ca_sha256", str))
 
 def _refuse(gate, why):
-    raise RestoreRefused("备份里的 iOS 描述文件没通过「%s」这道门: %s" % (gate, why))
+    raise RestoreRefused(gate, why)
 
 
 def _keys_exact(what, got, want):
@@ -952,8 +951,52 @@ def _check_record(rec, name):
                 "拿它做更新判定会得出相反的结论" % name)
 
 
+def _check_meta_object(meta):
+    """一份**完整**的生命周期记录该长什么样 —— 唯一实现。
+
+    共用它的入口: load()(本地状态)、_check_meta()(外部恢复的 UTF-8/JSON 解析之后)、
+    strict_artifact_check()(健康检查与发送)。分成几份各查一部分的下场很具体: 顶层多一个
+    未知字段、缺 migration_pending、previous.revision 不小于 current 这些样本, 恢复那边
+    拒得干干净净, 本地却 load 成功、artifact_health 判 healthy、verified_artifact 照样把
+    字节交出去 —— 一份从恢复入口进不来的记录, 只要已经躺在盘上就全程畅通。
+
+    **整份**记录都要过关, 不只是被选中的那个槽位: current 好好的而 previous 是一串字符串,
+    这份记录依然是坏的, 而下一次 previous 相关的操作(对比、取回、生成时顶下去)会踩到它。
+    """
+    gate = "记录格式"
+    if not isinstance(meta, dict):
+        _refuse(gate, "记录不是一个 JSON 对象 —— 格式版本无法识别")
+    if meta.get("schema") != SCHEMA:
+        _refuse(gate, "格式版本不认识(schema=%r)" % meta.get("schema"))
+    # instance_id 必须是本项目写下的那种身份: 规范小写的 UUID **version 4**。
+    # 光靠"uuid5 收不收得下这个字符串"证明不了任何事 —— 它什么字符串都收。
+    if meta.get("instance_id") in (None, ""):
+        _refuse("身份", "没有身份标识")
+    if not valid_instance_id(meta.get("instance_id")):
+        _refuse("身份", "instance_id 不是规范小写的 UUID4(本项目写下的身份都是那种形态)")
+    if set(meta) != set(_blank()):
+        _refuse(gate, "顶层字段与本版本对不上(多/少: %s)"
+                % "、".join(sorted(set(meta) ^ set(_blank()))))
+    if not isinstance(meta.get("migration_pending"), bool):
+        _refuse(gate, "migration_pending 必须是布尔(实际 %r)"
+                % type(meta.get("migration_pending")).__name__)
+    if not valid_stamp(meta.get("created_at")):
+        _refuse("时间格式", "created_at 不是 YYYY-MM-DDTHH:MM:SSZ 形式的真实 UTC 时刻"
+                "(实际 %r)" % (meta.get("created_at"),))
+    for which in ("current", "previous"):
+        if meta.get(which) is not None:
+            _check_record(meta[which], which)
+    if meta.get("previous") is not None and meta.get("current") is None:
+        _refuse("三件配套", "记录里有上一版(previous)却没有当前版本(current) —— 这一组不成立")
+    if meta.get("previous") and meta.get("current") \
+            and meta["previous"]["revision"] >= meta["current"]["revision"]:
+        _refuse("三件配套", "上一版的 revision(%d)必须严格小于当前版本(%d)"
+                % (meta["previous"]["revision"], meta["current"]["revision"]))
+    return meta
+
+
 def _check_meta(raw):
-    """记录本身。用词与 load() 保持一致的判据, 但这里是**包外内容**, 一律 fail-closed。"""
+    """外部恢复入口: 先把字节解成对象, 再走那份完整契约。"""
     gate = "记录格式"
     # 文件在、但读不出来 ⇒ 整笔拒, 不是"跳过这一组"。
     # 只有"归档里根本没有这个文件"才解释得成"这份备份不含 iOS 生命周期" —— 那由调用方在
@@ -969,32 +1012,7 @@ def _check_meta(raw):
     except ValueError:
         _refuse(gate, "记录不是合法 JSON(已损坏) —— 备份里有这个文件却解析不了, "
                       "整笔恢复已中止")
-    if not isinstance(meta, dict):
-        _refuse(gate, "记录不是一个 JSON 对象")
-    if meta.get("schema") != SCHEMA:
-        _refuse(gate, "格式版本不认识(schema=%r)" % meta.get("schema"))
-    # instance_id 必须是本项目写下的那种身份: 规范小写的 UUID **version 4**。
-    # 光靠"uuid5 收不收得下这个字符串"证明不了任何事 —— 它什么字符串都收。
-    if not valid_instance_id(meta.get("instance_id")):
-        _refuse("身份", "instance_id 不是规范小写的 UUID4(本项目写下的身份都是那种形态)")
-    if not isinstance(meta.get("migration_pending"), bool):
-        _refuse(gate, "migration_pending 不是布尔")
-    if not valid_stamp(meta.get("created_at")):
-        _refuse("时间格式", "created_at 不是 YYYY-MM-DDTHH:MM:SSZ 形式的真实 UTC 时刻"
-                "(实际 %r)" % (meta.get("created_at"),))
-    if set(meta) != set(_blank()):
-        _refuse(gate, "记录的字段与本版本对不上(多/少: %s)"
-                % "、".join(sorted(set(meta) ^ set(_blank()))))
-    for which, name in (("current", "current"), ("previous", "previous")):
-        if meta.get(which) is not None:
-            _check_record(meta[which], name)
-    if meta.get("previous") and not meta.get("current"):
-        _refuse("三件配套", "记录里有上一版却没有当前版本 —— 这一组不成立")
-    if meta.get("previous") and meta.get("current") \
-            and meta["previous"]["revision"] >= meta["current"]["revision"]:
-        _refuse("三件配套", "上一版的 revision(%d)不小于当前版本(%d)"
-                % (meta["previous"]["revision"], meta["current"]["revision"]))
-    return meta
+    return _check_meta_object(meta)
 
 
 def _check_ondemand(rules, inp, name):
@@ -1135,14 +1153,10 @@ def strict_artifact_check(meta, which, data):
     完整 mobileconfig 或 base64。
     """
     meta = meta or {}
-    if not valid_instance_id(meta.get("instance_id")):
-        _refuse("身份", "instance_id 不是规范小写的 UUID4(本项目写下的身份都是那种形态)")
-    if not valid_stamp(meta.get("created_at")):
-        _refuse("时间格式", "created_at 不是 YYYY-MM-DDTHH:MM:SSZ 形式的真实 UTC 时刻")
-    rec = meta.get(which)
-    if not isinstance(rec, dict):
-        _refuse("记录格式", "%s 那一栏不是一条记录" % which)
-    _check_record(rec, which)
+    # **整份**记录都要过契约, 不只是被选中的那个槽位 —— 见 _check_meta_object。
+    _check_meta_object(meta)
+    if meta.get(which) is None:
+        _refuse("记录格式", "记录里没有 %s" % which)
     _check_artifact(meta, which, data, derive_ids(meta["instance_id"]))
 
 
