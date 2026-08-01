@@ -21,6 +21,7 @@ MDM, 服务器没有任何渠道能知道这件事。所以这里记录的一律
 
 文件位置与备份语义见 docs/ios-profile-lifecycle.md。
 """
+import errno
 import hashlib
 import json
 import os
@@ -271,68 +272,98 @@ def _slot(meta, which):
     return (meta or {}).get("current" if which == "current" else "previous")
 
 
-def artifact_health(meta, which="current", root=None):
-    """(状态, 说明)。**只看服务端**: 文件在不在、是不是普通文件、内容有没有被动过、
-    身份对不对、是不是另一版串过来的。任何一项不成立都不许当成"手机需要更新"。"""
+def _read_artifact_checked(meta, which, root):
+    """磁盘检查 + 读取 + 内容校验, **只读一次**。返回 (状态, 说明, 字节或 None)。
+
+    为什么必须收成一个实现: 原来是 artifact_health() 打开文件读到字节 A、校验通过, 然后
+    verified_artifact() **再按路径打开一次**读到字节 B 并返回。两次打开之间把文件换掉
+    (os.replace 一下就够), 发出去的就是没有被任何人看过的 B —— 而两边都以为一切正常。
+
+    所以: 一次 os.open(带 O_NOFOLLOW), 之后全部判据都落在**这个 fd** 上 —— fstat 看类型/
+    硬链接/权限/属主, read 取内容, 校验也校验这份内存里的字节。路径在这中间被换掉不影响
+    已经打开的 fd(它指着旧 inode), 于是"校验的"和"返回的"必然是同一份。
+    lstat(path) 之后再按路径重新打开, 中间那一瞬就是这条缝本身。
+    """
     rec = _slot(meta, which)
     name = "当前版本" if which == "current" else "上一版"
     if not rec:
-        return MISSING, "记录里没有%s" % name
+        return MISSING, "记录里没有%s" % name, None
     path = art_path(which, root)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
     try:
-        st = os.lstat(path)
-    except OSError:
-        return MISSING, "%s产物文件不在服务器上(%s)" % (name, path)
-    # 软链/硬链都不认: 那意味着"发出去的字节"取决于链接指向哪儿, 而不是我们写下的那份。
-    if stat.S_ISLNK(st.st_mode):
-        return CORRUPT, "%s产物是符号链接, 拒绝使用" % name
-    if not stat.S_ISREG(st.st_mode):
-        return CORRUPT, "%s产物不是普通文件, 拒绝使用" % name
-    if st.st_nlink != 1:
-        return CORRUPT, "%s产物存在硬链接(nlink=%d), 拒绝使用" % (name, st.st_nlink)
-    # 组/其它可写 = 别人能改这份文件, 那"它与记录一致"就只是**此刻**成立。描述文件本身是
-    # 公开内容, 可读没问题; 可写不行。属主同理: 不是 root(或当前有效用户)写下的, 就不该
-    # 由我们担保。两者都能靠 repair_current 按记录重写来纠正。
-    if st.st_mode & 0o022:
-        return CORRUPT, "%s产物可被其它用户写入(mode %o), 拒绝使用" % (name, st.st_mode & 0o777)
-    if st.st_uid not in (0, os.geteuid()):
-        return CORRUPT, "%s产物的属主(uid %d)不对, 拒绝使用" % (name, st.st_uid)
-    try:
-        with open(path, "rb") as f:
-            data = f.read()
+        fd = os.open(path, flags)
     except OSError as e:
-        return CORRUPT, "%s产物读不出来: %s" % (name, e.strerror)
+        # O_NOFOLLOW 下最后一段是符号链接会给 ELOOP。软链不认: 那意味着"发出去的字节"
+        # 取决于链接指向哪儿, 而不是我们写下的那份。
+        if e.errno == errno.ELOOP:
+            return CORRUPT, "%s产物是符号链接, 拒绝使用" % name, None
+        if e.errno == errno.ENOENT:
+            return MISSING, "%s产物文件不在服务器上(%s)" % (name, path), None
+        return CORRUPT, "%s产物打不开: %s" % (name, e.strerror), None
+    try:
+        try:
+            st = os.fstat(fd)
+        except OSError as e:
+            return CORRUPT, "%s产物读不出来: %s" % (name, e.strerror), None
+        if not stat.S_ISREG(st.st_mode):
+            return CORRUPT, "%s产物不是普通文件, 拒绝使用" % name, None
+        if st.st_nlink != 1:
+            return CORRUPT, "%s产物存在硬链接(nlink=%d), 拒绝使用" % (name, st.st_nlink), None
+        # 组/其它可写 = 别人能改这份文件, 那"它与记录一致"就只是**此刻**成立。描述文件本身
+        # 是公开内容, 可读没问题; 可写不行。属主同理: 不是 root(或当前有效用户)写下的, 就
+        # 不该由我们担保。两者都能靠 repair_current 按记录重写来纠正。
+        if st.st_mode & 0o022:
+            return (CORRUPT, "%s产物可被其它用户写入(mode %o), 拒绝使用"
+                    % (name, st.st_mode & 0o777), None)
+        if st.st_uid not in (0, os.geteuid()):
+            return CORRUPT, "%s产物的属主(uid %d)不对, 拒绝使用" % (name, st.st_uid), None
+        try:
+            with os.fdopen(os.dup(fd), "rb") as f:
+                data = f.read()
+        except OSError as e:
+            return CORRUPT, "%s产物读不出来: %s" % (name, e.strerror), None
+    finally:
+        os.close(fd)
     if not data:
-        return CORRUPT, "%s产物是空文件" % name
+        return CORRUPT, "%s产物是空文件" % name, None
     # 结构层: 不是一份合法描述文件 = 这个**文件**坏了 → corrupt。
     try:
         iosprofile.reject_key_material(data, "%s产物" % name)
         iosprofile.validate(data)
     except iosprofile.ProfileError as e:
-        return CORRUPT, "%s产物不是一份合法的描述文件: %s" % (name, e)
+        return CORRUPT, "%s产物不是一份合法的描述文件: %s" % (name, e), None
     # 内容层: 走**同一份** schema 1 严格契约(记录 + 产物), 与恢复的联合校验、写后复核
     # 共用一处实现。恢复严一点、健康宽一点的下场很具体: 一份恢复会被拒的产物, 只要已经
     # 落在盘上就照样判 healthy, 于是 verified_artifact 把它发到用户手机上。
     try:
         strict_artifact_check(meta, which, data)
     except StateError as e:
-        return STATE_MISMATCH, str(e)
+        return STATE_MISMATCH, str(e), None
     except iosprofile.ProfileError as e:
-        return CORRUPT, "%s产物不是一份合法的描述文件: %s" % (name, e)
-    return HEALTHY, "%s产物与记录一致(第 %s 版)" % (name, rec.get("revision"))
+        return CORRUPT, "%s产物不是一份合法的描述文件: %s" % (name, e), None
+    return HEALTHY, "%s产物与记录一致(第 %s 版)" % (name, rec.get("revision")), data
+
+
+def artifact_health(meta, which="current", root=None):
+    """(状态, 说明)。**只看服务端**: 文件在不在、是不是普通文件、内容有没有被动过、
+    身份对不对、是不是另一版串过来的。任何一项不成立都不许当成"手机需要更新"。"""
+    state, detail, _data = _read_artifact_checked(meta, which, root)
+    return state, detail
 
 
 def verified_artifact(meta, which="current", root=None):
     """**所有**读取/发送入口的唯一出口。校验不过就抛, 绝不退而求其次发一份旧的。
 
+    返回的就是刚刚校验过的**那一份内存字节**, 不再按路径打开第二次 —— 否则校验的和发出去
+    的可以是两份东西(见 _read_artifact_checked)。
+
     "先看看有没有, 有就发" 是这类功能最容易写成的样子, 也是最坏的样子: 用户拿到一份与
     服务器记录对不上的描述文件, 而两边都以为一切正常。
     """
-    state, detail = artifact_health(meta, which, root)
+    state, detail, data = _read_artifact_checked(meta, which, root)
     if state != HEALTHY:
         raise IntegrityError("%s —— %s" % (HEALTH_LABEL[state], detail))
-    with open(art_path(which, root), "rb") as f:
-        return f.read()
+    return data
 
 
 def health_summary(meta, root=None):
