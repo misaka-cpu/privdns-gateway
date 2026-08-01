@@ -238,6 +238,9 @@ jobs:
       - name: "iOS schema 1 可信契约 (输入必须是规范形式 + 固定显示名 + 身份与时间; 恢复/健康/发送同一份判据)"
         run: python3 tests/test-ios-profile-schema-contract.py
 
+      - name: "iOS 元数据契约四入口一致 (load/恢复/健康/发送同一份完整判据 + 校验的字节就是返回的字节)"
+        run: python3 tests/test-ios-profile-meta-contract.py
+
       - name: "自检防火墙端口回归"
         run: python3 tests/test-doctor-firewall.py
 
