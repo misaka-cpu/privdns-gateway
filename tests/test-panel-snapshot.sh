@@ -20,6 +20,9 @@ eval "$(sed -n '/^_pdg_mktemp_dir(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh")"
 eval "$(sed -n '/^_sb_write_sanitized(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh")"
 eval "$(sed -n '/^_sb_sanitize_panel(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh")"
 eval "$(sed -n '/^_pdg_apply_snapshot_tree(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh")"
+# 落盘之后要对 iOS 产物子树做缺失项对账(见 pdg.sh), 一并抽进来 —— 少抽一个就变成
+# "command not found" 导致的假红, 而不是真的落盘失败。
+eval "$(sed -n '/^_pdg_reconcile_ios_profile(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh")"
 
 SECRET="SEKRET_LEAK_zzz"
 mkjson(){ printf '%s' "$1" > "$2"; }
