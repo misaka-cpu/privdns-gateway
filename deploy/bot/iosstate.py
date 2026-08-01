@@ -1060,10 +1060,24 @@ def plan_restore(raw, cur=None, prev=None):
     """这一组的恢复计划。返回 (plan, 提示) 或抛 RestoreRefused。
 
     plan = {"state": bytes, "current": bytes|DELETE, "previous": bytes|DELETE}
-    raw 为 None(归档里根本没有记录文件)⇒ 返回 (None, None): 这份包不含这一组, 一个字节都
-    不碰。这是**唯一**能解释成"不恢复这一组"的情形。
+
+    "这份包含不含生命周期组"只有三种答案, 三个入口共用这一处判定:
+
+      · state / current / previous **三件全无** ⇒ 归档确实不含这一组, 返回 (None, None),
+        一个字节都不碰;
+      · state 不在、但 current 或 previous 任一在 ⇒ 这一组**坏了**。不是"没带这一组" ——
+        照"没带"处理的话, 现网的旧记录原地不动、归档里的孤立产物却被覆盖上去, 恢复完就是
+        "记录说第 N 版、盘上是别人的第 M 版", 而且返回成功。整笔拒;
+      · state 在 ⇒ 进严格联合校验与恢复计划。
     """
     if raw is None:
+        have = [n for n, d in (("current.mobileconfig", cur),
+                               ("previous.mobileconfig", prev)) if d is not None]
+        if have:
+            _refuse("三件配套", "归档里有 %s, 却没有 ios-profile.json 这份记录 —— 没有记录就"
+                    "没有任何东西能解释这些产物是哪一版; 把它们覆盖上去只会造出"
+                    "「现网旧记录 + 来路不明的产物」。整笔拒绝, 现网未被改动。"
+                    % "、".join(have))
         return None, None
     raw2, cur2, prev2, note = validate_restore_set(raw, cur, prev)
     return {"state": raw2,

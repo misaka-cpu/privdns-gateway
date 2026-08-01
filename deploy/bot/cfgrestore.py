@@ -48,6 +48,9 @@ MEMBER_TARGET = {
 }
 # 兼容 bot 里既有的名字(它只用来判成员是否在白名单内)
 RESTORE_MAP = MEMBER_TARGET
+# 生命周期这一组的三个成员名, 从上面那张表推导, 不另写一份。
+IOS_MEMBERS = tuple(sorted(k for k, v in MEMBER_TARGET.items()
+                           if v.startswith(IOS_TARGET_PREFIX)))
 
 # 备份包是**外部输入**(bot 从 Telegram 收文件, 谁都能发一个) → 解包必须按白名单来。
 RESTORE_RS_PREFIX = "etc/sing-box/rs/"
@@ -498,7 +501,9 @@ def restore_managed(snap_id, *, expect_digest="", trigger_source="legacy"):
         out["unchanged"] = unchanged_t
         # 这一组的恢复计划: 与 Bot、CLI 回滚走同一份判据(iosstate.plan_restore)。
         ios_plan, ios_note = None, None
-        if IOS_STATE_MEMBER in members:
+        # 只要这一组里**任何一件**出现在快照里就得走联合校验。只看状态文件在不在的话,
+        # 一份"只有产物、没有记录"的快照会被当成"不含这一组"放过去(见 plan_restore)。
+        if any(m in members for m in IOS_MEMBERS):
             if iosstate is None:
                 out["error"] = ("这份快照里带着 iOS 描述文件生命周期, 但本机没有校验它所需的"
                                 "模块(iosstate) —— 无法确认那一组是否可信, 整笔受管恢复已中止, "

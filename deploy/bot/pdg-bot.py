@@ -3595,8 +3595,11 @@ def _stage_ios_profile(t, tmp):
     旧格式备份(只有记录、没有产物)仍按既有口径处理: 认出来、如实说明, 不伪装成完整恢复。
     previous 那一版用的根证书只在产物里有正文, 元数据里只有指纹 —— 它丢了就真的没了。
     """
-    if not os.path.isfile(os.path.join(tmp, "etc/privdns-gateway/ios-profile.json")):
-        return None, None                       # 备份里没有 → 不动现网的任何一份
+    # "这份包含不含这一组"由 iosstate.plan_restore 统一判(三件全无才算不含; 只有产物、没有
+    # 记录 = 这一组坏了)。这里只负责先看看**有没有必要**把 iosstate 拉进来。
+    if not any(os.path.isfile(os.path.join(tmp, q.lstrip("/")))
+               for q in (IOS_META, IOS_CURRENT, IOS_PREVIOUS)):
+        return None, None                       # 三件全无 → 不动现网的任何一份
     if iosstate is None:                        # Android: 根本没有这套模块
         raise _IosRestoreRefused(
             "这份备份里带着 iOS 描述文件生命周期, 但本机是 Android 平台, 没有校验它所需的"

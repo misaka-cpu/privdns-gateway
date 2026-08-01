@@ -497,6 +497,76 @@ else:
     bad("CLI 回滚碰了不该碰的: rc=%d" % r.returncode)
 
 print()
+print("══ 六之二、有产物却没有记录 = 这一组坏了, 不是「没带这一组」 ══")
+# 判"这份包含不含生命周期组"以前只看 ios-profile.json 在不在。于是一份"只有产物、没有记录"
+# 的归档被当成"不含这一组"放过去: 现网的旧记录原地不动, 归档里的孤立产物却被覆盖上去 ——
+# 恢复完变成"记录说第 N 版、盘上是别人的第 M 版", 而且返回成功。
+# 正确的语义是三选一: 三件全无 ⇒ no-op; 有记录 ⇒ 严格校验; 只有产物 ⇒ 这一组坏了, 整笔拒。
+orphan_dir = tempfile.mkdtemp(prefix="iosplan-orphan-")
+TMPS.append(orphan_dir)
+for rel in BASE_MEMBERS:
+    os.makedirs(os.path.dirname(os.path.join(orphan_dir, rel)), exist_ok=True)
+    shutil.copy2(src.p(rel), os.path.join(orphan_dir, rel))
+# 网关配置写成**可分辨**的一份: "整笔拒绝"要连它一起不恢复, 内容一样的话这条断言测不出东西
+with open(os.path.join(orphan_dir, "etc/sing-box/config.json"), "w") as _f:
+    json.dump({"outbounds": [{"tag": "orphan-marker"}], "route": {"rules": []}}, _f)
+_donor = victim_rev2()
+for rel in (ARC_CUR, ARC_PREV):
+    os.makedirs(os.path.dirname(os.path.join(orphan_dir, rel)), exist_ok=True)
+    shutil.copy2(_donor.p(rel), os.path.join(orphan_dir, rel))
+
+for combo, label in ((["current"], "只有 current"),
+                     (["previous"], "只有 previous"),
+                     (["current", "previous"], "两份产物都有")):
+    members = list(BASE_MEMBERS)
+    if "current" in combo:
+        members.append(ARC_CUR)
+    if "previous" in combo:
+        members.append(ARC_PREV)
+    ob = pack(orphan_dir, members)          # 注意: 没有 ARC_META
+    for who, run in (("Bot", bot_restore), ("救援平面", rescue_restore)):
+        v = victim_rev2()
+        before, sb_before = v.group(), v.rd("etc/sing-box/config.json")
+        st_before = {k: os.stat(v.p(k)).st_mode & 0o7777 for k in before}
+        res = run(v, ob)
+        msg = res.get("msg") or ""
+        if not res["ok"] and ("没有记录" in msg or "生命周期" in msg or "配套" in msg):
+            ok("%s / %s: 整笔拒且点名(%s)" % (label, who, msg.splitlines()[-1][:60]))
+        else:
+            bad("%s / %s: 没被拒或不是这道门: ok=%s %r" % (label, who, res["ok"], msg[:160]))
+        if v.group() == before:
+            ok("%s / %s: 这一组逐字节未动" % (label, who))
+        else:
+            now = v.group()
+            diff = sorted(set(now) ^ set(before)) or \
+                [k for k in before if now.get(k) != before.get(k)]
+            bad("%s / %s: 这一组被改了(差异 %r)" % (label, who, diff))
+        if v.rd("etc/sing-box/config.json") == sb_before:
+            ok("%s / %s: 网关配置也没被恢复(整笔拒绝)" % (label, who))
+        else:
+            bad("%s / %s: 这一组被跳过了, 网关配置却换掉了 —— 一份坏掉的备份被放过去了"
+                % (label, who))
+        st_after = {k: (os.stat(v.p(k)).st_mode & 0o7777 if os.path.exists(v.p(k)) else None)
+                    for k in before}
+        if st_after == st_before:
+            ok("%s / %s: mode 也没变" % (label, who))
+        else:
+            bad("%s / %s: mode 变了 %r → %r" % (label, who, st_before, st_after))
+    v = victim_rev2()
+    before = v.group()
+    r = cli_rollback(v, ob)
+    out = (r.stdout or "") + (r.stderr or "")
+    if r.returncode != 0:
+        ok("%s / CLI: 覆盖之前返回非 0(%s)" % (label, out.strip().splitlines()[-1][:60] if out.strip() else ""))
+    else:
+        bad("%s / CLI: 返回 0 —— 孤立产物被落到了盘上" % label)
+    if v.group() == before:
+        ok("%s / CLI: 现网这一组逐字节未动" % label)
+    else:
+        bad("%s / CLI: 现网被改了, 留下「旧记录 + 归档孤立产物」: %r"
+            % (label, sorted(set(v.group()) ^ set(before))))
+
+print()
 print("══ 七、删除目标也要有并发前置条件 ══")
 # 读到落盘之间有人改了现网的 previous → 这笔恢复必须拒, 而不是照删。
 race = r'''
