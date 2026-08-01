@@ -198,14 +198,67 @@ fail-closed,靠遗漏表达"不需要动作"会在恢复时变成一次拒绝,�
 守卫都放行了 `var/lib/privdns-gateway/ios-profile` 这**一个子树**(不是整个 `var/lib`——
 放宽到那一层等于让一份构造出来的快照可以往 tx 记录、备份包所在的地方写文件)。
 
-### 恢复的原子性与旧格式备份
+### 恢复:一份计划,三个入口
 
-记录 + 两份产物挂在**同一笔** pdgtx 事务里(`_stage_ios_profile`),要么整组换过去,要么
-一个都不动:绝不出现"记录说第 2 版、盘上躺着第 3 版"。任一目标落盘失败,三件一起回到操作前。
+有三条路能把这一组换掉,它们必须得出**同一个结果**:
+
+| 入口 | 实现 |
+|---|---|
+| Bot 收 Telegram 备份包 | `pdg-bot.py::_stage_ios_profile` |
+| 救援平面从本机快照恢复受管配置 | `cfgrestore.restore_managed` |
+| CLI `pdg rollback` | `pdg.sh::_pdg_ios_verify_tree` + `_pdg_apply_snapshot_tree` |
+
+判据与"要把这一组变成什么样子"都在 `iosstate`:`plan_from_tree()` 出一份**目标状态**——
+`state` / `current` / `previous` 各自是"目标字节"或 `DELETE`;`stage_plan()` 把它挂进一笔
+pdgtx 事务。三个入口共用这一份,不各写各的。
+
+**"缺失"要表达成删除,不是"别动它"**。归档里没有 `previous`,意思是"备份那一刻没有上一版",
+不是"保留现网那份"。按后者理解的话,一份 rev1 的备份恢复到 rev2 的机器上就变成"记录说
+rev1、盘上还躺着 rev2 的 previous"——恢复完就自相矛盾,而下一次备份会把它一起打包传下去。
+删除目标同样带 expect sha:从读到落盘之间被别人改过就整笔拒,不会把并发写入悄悄抹掉。
+
+唯一能解释成"这份包不含这一组、一个字节都不碰"的情形是**归档里根本没有 `ios-profile.json`
+这个文件**。文件在而读不出来(JSON 坏、不是 UTF-8、schema 不认识)一律整笔拒——只跳过 iOS
+那一组、照常换掉网关配置,结果是两边从此对不上,而界面什么都不说。
+
+记录 + 两份产物挂在**同一笔** pdgtx 事务里,要么整组换过去,要么一个都不动:绝不出现
+"记录说第 2 版、盘上躺着第 3 版"。任一目标落盘失败,三件一起回到操作前。
+
+CLI 回滚还多一层:落盘对这一组是**整组替换**,所以动手之前先拍一张完整底片(记录 + 整棵
+产物子树,存在/缺失 + 内容 + mode + uid + gid),拍不下就禁止落盘。tar 覆盖失败、孤儿删除
+失败、删完复核失败,任何一条都把整组退回操作前再逐项复核;退回本身失败时,原始错误与未恢复
+项一起报出来。只保护这一组——`/etc/privdns-gateway` 下的其它文件、`/var/lib/privdns-gateway`
+下的事务记录、救援运行态、备份包一个字节都不碰。
+
+平台隔离:`cfgrestore` 对 `iosstate` 是**可选导入**(Android 上根本没装这个模块)。真遇到
+"Android 机器 + 快照里带着这一组"时 fail-closed,而不是静默绕过——那说明这份快照不是这台
+机器的,或者平台标记不对,两种都该让人先看一眼。没有为此往 Android 上多装任何 iOS 组件。
 
 5.4 早期(以及更老)的备份里只有记录、没有产物。这种包被**认出来**并如实说明,不伪装成完整
 恢复:记录里的 `previous` 一并清掉(不留一个点开就报错的"上一版"),`current` 保留记录但
-产物需要另行修复——能不能修由 4.4 那几条决定,这里不越权替用户决定。
+产物需要另行修复——能不能修由 4.4 那几条决定,这里不越权替用户决定。现网原有的
+`current` / `previous` 会被删掉,不留"碰巧存在的文件"冒充备份带回来的产物。
+
+### 从包外拿回来的产物:只认本项目会写出来的那一份
+
+恢复是这套生命周期里唯一一个"内容不是我们自己算出来的"入口。只比"记录与产物一致"是不够的
+——一致的可以是**两边都错**(同时改元数据与产物、再把 sha256 配平)。所以判据落在"这是不是
+本项目会写出来的那份东西"上:
+
+- `digest` 必须是精确的 `sha256:<64 位小写十六进制>`,并按记录自己的 `inputs` **重新算一遍**
+  核对。它是三档更新判定的唯一依据,伪造它就能让"必须更新"变成"无需更新";
+- 顶层 / DNS payload / `DNSSettings` / `OnDemandRules` / 根证书 payload 全部走**字段白名单**,
+  多一个、少一个、不认识的一律拒。一份 mobileconfig 的语义几乎全在字段上:
+  `PayloadRemovalDisallowed` 一个键就能让用户在手机上删不掉它。跨版本兼容**不靠**放行未知
+  字段——那等于承认我们不知道自己在往用户手机上装什么;将来渲染结构有意变化时升 `schema`
+  或加显式的版本化校验;
+- 根证书那一格整格核对:`PayloadType`、`PayloadVersion`、固定的 `PayloadIdentifier`、派生的
+  `PayloadUUID`、证书文件名、显示名、DER 指纹,以及它是不是一张真的 X.509 公钥证书。
+  **openssl 不可用时 fail-closed 并点名"强校验不可用"**:本项目的安装本来就依赖它,而结构
+  判据只认得出"这不是私钥",认不出"这是一张有效证书"。
+
+白名单与渲染器是两处定义,会漂移。`tests/test-ios-profile-backup-trust.py` 有一条守卫:拿
+**现渲染**的产物过一遍联合校验,必须正好合规——模板或渲染器改了字段而白名单没跟上,那里先红。
 
 元数据是**用户持久数据**:普通 update、强制重装、平台来回切都不得动它;只有
 `uninstall --purge` 或 `iosstate.clear()` 会放弃身份。`tests/test-ios-profile-persist.py`
@@ -262,3 +315,6 @@ Bot:「📱 客户端」→「📱 iOS 描述文件」。Android 平台上这些
 | `tests/test-ios-profile-persist.py` | update / 快照回滚 / 备份恢复 / 平台来回切都不丢身份与产物 |
 | `tests/test-ios-profile-integrity.py` | 六种人为损坏必须检出;两个状态互不污染;修复边界 |
 | `tests/test-ios-profile-restore.py` | 快照与备份逐字节恢复(CA A→B→C)、旧格式备份、失败整组回滚、软链/硬链/权限 |
+| `tests/test-ios-profile-backup-trust.py` | 从包外拿回来的产物:三件套联合校验、payload 与字段白名单、digest 自洽、根证书整格核对、openssl 缺失 fail-closed |
+| `tests/test-ios-profile-snapshot-exact.py` | 快照回滚精确到整组:完整底片、任一步失败都退回操作前、备份按记录而不是按盘上有什么打包 |
+| `tests/test-ios-profile-restore-plan.py` | Bot / 救援平面 / CLI 回滚共用同一份恢复计划;缺失即删除、删除带并发前置条件、Android 隔离 |

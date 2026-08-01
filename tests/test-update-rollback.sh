@@ -63,6 +63,9 @@ nft(){ return 0; }
 # 覆写落盘: 不碰真 /, 把被应用快照的判别标记抄到沙箱, 供断言"回滚到了哪份"
 APPLIED="$WORK/applied_snapid"
 _pdg_apply_snapshot_tree(){ cat "\$1/etc/privdns-gateway/snapid" > "\$APPLIED" 2>/dev/null; return 0; }
+# 覆盖生产文件之前的 iOS 联合校验(见 pdg.sh _pdg_ios_verify_tree)。这些快照里根本没有
+# iOS 生命周期成员, 生产里它会直接 return 0 —— 这里打桩只是因为本壳没抽那一批函数。
+_pdg_ios_verify_tree(){ return 0; }
 EOF
 
 run(){ bash -c "source '$WORK/harness.sh'; source '$WORK/rollback.sh'; cmd_rollback $1" 2>&1; }

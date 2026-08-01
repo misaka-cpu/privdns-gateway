@@ -139,9 +139,9 @@ for d in ("deploy/bot", "deploy/rescue"):
             LOCAL[f[:-3]] = os.path.join(ROOT, d, f)
 
 
-def imports_of(path):
+def _names(node):
     out = set()
-    for n in ast.walk(ast.parse(open(path, encoding="utf-8").read())):
+    for n in ast.walk(node):
         if isinstance(n, ast.Import):
             out |= {a.name.split(".")[0] for a in n.names}
         elif isinstance(n, ast.ImportFrom) and n.module:
@@ -153,13 +153,58 @@ def imports_of(path):
     return {x for x in out if x in LOCAL}
 
 
-seen, stack = set(), ["rescue", "breakglass", "rescue_cred"]
+def imports_of(path):
+    """(必需的, 可选的)。
+
+    可选 = 写在 `try: import X / except: X = None` 里的那种。它们**不进闭包**: 救援平面
+    没有它们照样跑得起来, 缺了只会让某一条路径 fail-closed。平台相关的模块只能这么导入 ——
+    把 iosstate 并进闭包等于往 Android 机器上装 iOS 组件, 那正是平台隔离要挡的事。
+    但"可选"不能变成藏东西的地方: 下面会逐个确认它确实是平台相关模块。
+    """
+    tree = ast.parse(open(path, encoding="utf-8").read())
+    optional = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Try) and n.handlers:
+            for h in n.handlers:
+                # 处理分支必须把名字置空(X = None), 否则那不是"可选", 是"忘了处理"
+                for a in ast.walk(h):
+                    if isinstance(a, ast.Assign) and isinstance(a.value, ast.Constant) \
+                            and a.value.value is None:
+                        for t in a.targets:
+                            if isinstance(t, ast.Name):
+                                optional.add(t.id)
+            optional |= (_names(ast.Module(body=n.body, type_ignores=[])) & optional) \
+                or (_names(ast.Module(body=n.body, type_ignores=[]))
+                    & {x for x in optional})
+    hard = _names(tree) - optional
+    return hard, optional & _names(tree)
+
+
+seen, optional_seen, stack = set(), set(), ["rescue", "breakglass", "rescue_cred"]
 while stack:
     cur = stack.pop()
     if cur in seen:
         continue
     seen.add(cur)
-    stack += list(imports_of(LOCAL[cur]) - seen)
+    hard, opt = imports_of(LOCAL[cur])
+    optional_seen |= opt
+    stack += list(hard - seen)
+optional_seen -= seen
+# 可选导入必须是**平台相关**模块(PDG_IOS_MODULES 里的那批)。运行时模块藏进 try/except
+# 会让救援平面在缺件时静默降级, 那种"可选"不许存在。
+# PDG_IOS_MODULES 定义在 lib/modules.sh(rescue.sh 只在函数里按需 source 它), 直接读真源。
+_ios_raw = subprocess.run(
+    ["bash", "-c", "source %s/lib/modules.sh; printf '%%s\\n' \"$PDG_IOS_MODULES\"" % ROOT],
+    capture_output=True, text=True, cwd=ROOT).stdout
+_ios_names = {os.path.basename(l.split()[1])[:-3] for l in _ios_raw.splitlines()
+              if l.strip() and len(l.split()) > 1 and l.split()[1].endswith(".py")}
+if not _ios_names:
+    bad("读不到 PDG_IOS_MODULES —— 「可选导入必须是平台模块」那条判据会退化成永远通过")
+for m in sorted(optional_seen):
+    if m in _ios_names:
+        ok("可选导入 %s 是平台相关模块(不进闭包, 缺件时 fail-closed 而不是降级)" % m)
+    else:
+        bad("%s 被写成可选导入, 但它不是平台相关模块 —— 救援平面缺了它会静默降级" % m)
 # rescue_nft 不在 python 闭包里(它是 pdg.sh 开关防火墙用的注入器), 但少了它 enable/disable
 # 就动不了放行 —— 所以闭包按"救援平面跑得起来"算, 要把它算进去。
 want_closure = sorted(m + ".py" for m in seen) + ["rescue_nft.py"]
