@@ -3249,13 +3249,18 @@ def _ios_send(chat, ssids=None, legacy=False):
                    "旧版用的是随机身份, 不删的话这份会作为**另一个**描述文件并存。")
     cap.append(IOS_INSTALL_HOWTO)
     send_document(chat, "PrivDNS-Gateway.mobileconfig", data, "\n".join(cap))
+    # 标记必须点名**刚发出去的那一版**。无条件给"此刻的 current"盖章的话, 发送期间别人生成了
+    # 新版本, 章就盖到新版头上 —— 记录说它发过了, 而它其实从没出过门。
+    note = ""
     try:
-        meta = iosstate.mark_sent()
+        st, _ = iosstate.mark_sent(cur["revision"], cur["sha256"])
+        if st == iosstate.SENT_SUPERSEDED:
+            note = "\nℹ️ 期间服务器上又生成了新版本, 因此没有把这次发送记到当前版本名下。"
     except Exception:  # noqa: BLE001
         pass                      # 记不上发送时间不影响用户已经拿到文件, 不要因此报失败
     head = ("✅ 已生成第 %d 版并发送。" % cur["revision"] if changed
             else "✅ 已重新发送第 %d 版(网关配置没有变化, 内容与上次完全相同)。" % cur["revision"])
-    return head + "\n" + "\n".join("• " + r for r in why) + "\n\n" + IOS_UNKNOWN
+    return head + note + "\n" + "\n".join("• " + r for r in why) + "\n\n" + IOS_UNKNOWN
 
 # ── 配置备份 / 恢复 ──
 IOS_META = "/etc/privdns-gateway/ios-profile.json"   # iOS 描述文件身份/修订记录(用户持久数据)

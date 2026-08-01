@@ -217,6 +217,9 @@ jobs:
       - name: "iOS 描述文件恢复闭环 (快照/备份逐字节恢复 + 旧格式备份 + 失败整组回滚)"
         run: python3 tests/test-ios-profile-restore.py
 
+      - name: "iOS 描述文件并发 (整段读-改-写一把锁 + 标记发送认版本, 不丢更新)"
+        run: python3 tests/test-ios-profile-concurrency.py
+
       - name: "自检防火墙端口回归"
         run: python3 tests/test-doctor-firewall.py
 

@@ -372,6 +372,41 @@ def classify(meta, inputs):
 
 
 # ── 写事务 ──────────────────────────────────────────────────────────────────
+class _LifecycleLock:
+    """整段读-改-写共用的**一把**锁。
+
+    原来每个写操作是"锁外读 → 锁外算 → 锁内写": 两个进程能同时读到同一版记录, 各自算出
+    "下一版 = 第 N+1 版", 再一前一后落盘 —— 后写的把先写的整个盖掉, 而两边都收到成功。
+    丢的是用户刚做的那次配置变更, 而且 revision 连号, 事后从记录上看不出中间少了一版。
+
+    所以锁必须从**读记录之前**一直持到**写后复核之后**。内部函数一律写成 `_*_locked`,
+    由这里统一持锁后调用; 它们内部的 `_Txn` 传 `lock=False` —— 同一进程用不同 fd 再
+    flock 一次同一个文件会把自己挡住(LOCK_NB 直接 EWOULDBLOCK), 那是自死锁。
+    """
+
+    def __init__(self, enabled=True, what="本次操作"):
+        self.enabled = enabled
+        self.what = what
+        self._lk = None
+
+    def __enter__(self):
+        if self.enabled:
+            self._lk = pdgtx._Lock()
+            try:
+                self._lk.__enter__()
+            except pdgtx.TxBusy:
+                raise StateError("已有配置操作正在执行, %s已跳过(避免并发写坏记录)。" % self.what)
+            except pdgtx.TxRefused as e:
+                raise StateError(str(e))
+        return self
+
+    def __exit__(self, *exc):
+        if self._lk:
+            self._lk.__exit__(None, None, None)
+            self._lk = None
+        return False
+
+
 class _Txn:
     """最小文件事务: 精确 before-image → 落盘 → 复核 → 失败逐项还原并再复核。
 
@@ -489,6 +524,14 @@ def generate(dot_host, server_addresses, ssids=None, ca_der=b"", wloc_enabled=Fa
     输入没变时**不产生新 revision**: 产物逐字节相同, previous 不被顶掉。这正是"点一下重新
     生成"应有的样子 —— 重新拿一份文件, 而不是制造一次版本变更。
     """
+    with _LifecycleLock(lock, "本次生成"):
+        return _generate_locked(dot_host, server_addresses, ssids, ca_der, wloc_enabled,
+                                template, meta_path, art_root, legacy_seen)
+
+
+def _generate_locked(dot_host, server_addresses, ssids, ca_der, wloc_enabled,
+                     template, meta_path, art_root, legacy_seen):
+    """**必须在持锁状态下调用。** 读记录 → 算候选 → 落盘 → 写后复核, 整段在同一把锁里。"""
     mp = meta_path or META
     ar = art_root or ART_DIR
     meta = load(mp)
@@ -519,12 +562,12 @@ def generate(dot_host, server_addresses, ssids=None, ca_der=b"", wloc_enabled=Fa
         if state == HEALTHY:
             return meta, level, reasons, data, False
         # 产物不可用 → 只能在"能逐字节复原"的前提下修, 修不了就 fail-closed。
-        meta = repair_current(ca_der, template, mp, ar, lock)
+        meta = _repair_current_locked(ca_der, template, mp, ar)
         reasons = list(reasons) + ["%s(%s), 已按记录逐字节复原" % (HEALTH_LABEL[state], detail)]
         return meta, level, reasons, data, False
 
     cur_state = artifact_health(meta, "current", ar)[0] if cur else None
-    with _Txn(lock=lock) as tx:
+    with _Txn(lock=False) as tx:            # 锁已由 _generate_locked 的调用方持有
         os.makedirs(ar, mode=0o700, exist_ok=True)
         _cleanup_candidates(ar)
         new = dict(meta)
@@ -564,6 +607,12 @@ def repair_current(ca_der=b"", template=None, meta_path=None, art_root=None, loc
       · 用记录里的 inputs + 稳定身份重新渲染, 结果的 sha256 与记录**精确相等**。
     然后才写盘, 且: revision 不变、previous 一个字节不动、写完复核。
     """
+    with _LifecycleLock(lock, "本次复原"):
+        return _repair_current_locked(ca_der, template, meta_path, art_root)
+
+
+def _repair_current_locked(ca_der=b"", template=None, meta_path=None, art_root=None):
+    """**必须在持锁状态下调用。**"""
     mp = meta_path or META
     ar = art_root or ART_DIR
     meta = load(mp)
@@ -589,7 +638,7 @@ def repair_current(ca_der=b"", template=None, meta_path=None, art_root=None, loc
             "重新渲染的结果与第 %s 版的记录对不上(可能模板已随版本更新), 无法逐字节复原, "
             "已拒绝。请从备份恢复, 或重新生成一版新的。" % rec.get("revision"))
     prev_before = read_artifact("previous", ar)
-    with _Txn(lock=lock) as tx:
+    with _Txn(lock=False) as tx:            # 锁已由调用方持有
         os.makedirs(ar, mode=0o700, exist_ok=True)
         _cleanup_candidates(ar)
         tx.write(art_path("current", ar), data, 0o644)
@@ -599,25 +648,51 @@ def repair_current(ca_der=b"", template=None, meta_path=None, art_root=None, loc
     return meta
 
 
-def _update_meta(fn, meta_path=None, lock=True):
+def _update_meta(fn, meta_path=None, lock=True, what="本次修改"):
+    with _LifecycleLock(lock, what):
+        return _update_meta_locked(fn, meta_path)
+
+
+def _update_meta_locked(fn, meta_path=None):
+    """**必须在持锁状态下调用。** 读与写在同一把锁里, 否则两个改记录的操作会互相覆盖。"""
     mp = meta_path or META
     meta = load(mp)
     if not meta:
         raise StateError("还没有受管描述文件记录。")
-    with _Txn(lock=lock) as tx:
+    with _Txn(lock=False) as tx:
         new = fn(dict(meta))
         tx.write(mp, json.dumps(new, ensure_ascii=False, indent=2,
                                 sort_keys=True).encode("utf-8") + b"\n", 0o600)
     return new
 
 
-def mark_sent(meta_path=None, lock=True):
-    """记录"我们把 current 发出去了"。注意措辞: 发出去 ≠ 装上了。"""
-    def f(m):
-        if m.get("current"):
+SENT_MARKED, SENT_SUPERSEDED = "marked", "superseded"
+
+
+def mark_sent(expect_revision, expect_sha256, meta_path=None, lock=True):
+    """记录"我们把**这一版**发出去了"。注意措辞: 发出去 ≠ 装上了。
+
+    必须点名发的是哪一版。原来它无条件给"此刻的 current"盖章 —— 于是发送第 1 版的过程中
+    别人生成了第 2 版, 章就盖到第 2 版头上: 记录说第 2 版发过了, 而它其实从没出过门。
+    之后用户看到"上次发送"是个时间, 会以为手机上那份就是第 2 版。
+
+    返回 (状态, meta):
+      · SENT_MARKED     —— 发的正是当前版, 已盖章;
+      · SENT_SUPERSEDED —— 期间 current 已经变了, **不盖章**(旧版的送达与新版无关)。
+    两者都不抛异常, 也都不回传路径或文件内容 —— 调用方只需要知道该怎么对用户说。
+    """
+    with _LifecycleLock(lock, "本次标记"):
+        mp = meta_path or META
+        meta = load(mp)
+        cur = (meta or {}).get("current") or {}
+        if not meta or not cur:
+            return SENT_SUPERSEDED, meta
+        if cur.get("revision") != expect_revision or cur.get("sha256") != expect_sha256:
+            return SENT_SUPERSEDED, meta
+        def f(m):
             m["current"] = dict(m["current"], sent_at=_stamp())
-        return m
-    return _update_meta(f, meta_path, lock)
+            return m
+        return SENT_MARKED, _update_meta_locked(f, mp)
 
 
 def ack_migration(meta_path=None, lock=True):
@@ -626,8 +701,18 @@ def ack_migration(meta_path=None, lock=True):
     return _update_meta(lambda m: dict(m, migration_pending=False), meta_path, lock)
 
 
-def recover(meta_path=None, art_root=None):
-    """崩溃残留清理 + 产物与元数据的一致性检查。返回人话说明的列表。"""
+def recover(meta_path=None, art_root=None, lock=True):
+    """崩溃残留清理 + 产物与元数据的一致性检查。返回人话说明的列表。
+
+    **也要拿同一把锁**: `.cand` / `.pdgtx.*` 不只是"崩溃残留", 正在提交的事务此刻手里
+    拿的就是这种文件。无锁清理会把一笔进行中的提交的候选删掉 —— 那笔事务随后要么失败,
+    要么落下半成品, 而 recover 这边还会报"已清理 N 个残留", 看上去像做了件好事。
+    """
+    with _LifecycleLock(lock, "本次清理"):
+        return _recover_locked(meta_path, art_root)
+
+
+def _recover_locked(meta_path=None, art_root=None):
     ar = art_root or ART_DIR
     out = []
     n = _cleanup_candidates(ar)
