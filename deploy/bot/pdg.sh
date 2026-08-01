@@ -707,7 +707,7 @@ _pdg_ios_rollback(){
 
 # 删掉快照里没有的那些(孤儿)。不再自己做备份/回退 —— 底片由 _pdg_apply_snapshot_tree
 # 在动手之前统一拍好, 这里只负责"删干净并复核", 失败交给调用方整组退回。
-_pdg_reconcile_ios_profile(){
+_pdg_ios_reconcile(){
   local members="$1" dest="$2"
   local dir="${dest%/}/$_PDG_IOS_ART_REL" f rel
   [[ -d "$dir" ]] || return 0
@@ -721,6 +721,26 @@ _pdg_reconcile_ios_profile(){
     rel="$_PDG_IOS_ART_REL/${f#"$dir"/}"
     grep -qxF -- "$rel" "$members" || return 1
   done < <(find "$dir" -mindepth 1 ! -type d -print0 2>/dev/null)
+  return 0
+}
+
+# 覆盖任何生产文件**之前**, 对解包出来的临时树做联合校验 —— 与 Bot 备份恢复、救援平面
+# 受管恢复走的是同一份判据(iosstate.plan_restore)。
+# 不能靠"这是本机快照所以一定可信": 快照可能损坏、被替换、或者上一次只恢复了一半; 而这一组
+# 恢复完之后就是「📱 iOS 描述文件」页发给用户安装的东西。
+_pdg_ios_verify_tree(){
+  local tree="$1" members="$2" mod="" out=""
+  _pdg_ios_group_in_members "$members" || return 0    # 快照里没有这一组 ⇒ 无话可说
+  if ! mod="$(_pdg_module iosstate.py)"; then
+    echo "❌ 快照里带着 iOS 描述文件生命周期, 但找不到校验它的 iosstate.py —— 中止(现网未改动)"
+    return 1
+  fi
+  if ! out="$(python3 "$mod" verify-restore --tree "$tree" 2>&1)"; then
+    echo "❌ 快照里的 iOS 描述文件没通过联合校验, 已中止(现网一个字节都没改):"
+    printf '%s\n' "$out" | sed 's/^/   /'
+    return 1
+  fi
+  printf '%s\n' "$out" | sed 's/^/  /'
   return 0
 }
 
@@ -743,7 +763,7 @@ _pdg_apply_snapshot_tree(){
          tar --no-recursion -cf - -C "$tree" -T "$members" 2>/dev/null \
            | tar xpf - -C "$dest" 2>/dev/null ); then
     why="快照落盘(tar)失败"
-  elif (( guard == 1 )) && ! _pdg_reconcile_ios_profile "$members" "$dest"; then
+  elif (( guard == 1 )) && ! _pdg_ios_reconcile "$members" "$dest"; then
     why="iOS 产物目录对账失败"
   fi
   if [[ -n "$why" ]]; then
@@ -963,6 +983,10 @@ cmd_rollback(){
     mv -f "$_cand" "$tree/etc/nftables.conf" || { echo "❌ 写回候选失败, 中止"; rm -rf "$tmp"; return 1; }
   fi
   [[ -f "$tree/etc/nftables.conf" ]] && { nft -c -f "$tree/etc/nftables.conf" >/dev/null 2>&1 || { echo "❌ 快照的 nftables 语法错, 中止"; rm -rf "$tmp"; return 1; }; }
+  # 覆盖生产文件之前先过联合校验(见 _pdg_ios_verify_tree)。不过就中止, 现网零改动。
+  if ! _pdg_ios_verify_tree "$tree" "$members"; then
+    rm -rf "$tmp"; return 1
+  fi
   echo "回滚到 $(basename "$target") …"
   if ! _pdg_apply_snapshot_tree "$tree" "$members" /; then
     echo "❌ 快照落盘失败, 系统可能已部分恢复, 请立即检查"; rm -rf "$tmp"; return 1

@@ -395,12 +395,27 @@ else:
 # 子命令清单从 iosstate.py 自己的 argparse 取 —— 写死一份就等于"以后新增的照样漏"。
 _help = subprocess.run([sys.executable, str(ROOT / "deploy/bot/iosstate.py"), "--help"],
                        capture_output=True, text=True, timeout=120).stdout
-_m = re.search(r"\{([a-z,]+)\}", _help)
-SUBS = [x for x in (_m.group(1).split(",") if _m else []) if x and x != "generate"]
+_m = re.search(r"\{([a-z,\-]+)\}", _help)
+ALL_SUBS = [x for x in (_m.group(1).split(",") if _m else []) if x]
+# `pdg ios` **不**暴露的内部子命令: cmd_rollback 在覆盖生产文件之前直接调它并传 --tree,
+# 不走 cmd_ios 的分派。列在这里而不是悄悄跳过 —— 下面那条守卫会确认它确实是这个身份。
+INTERNAL_SUBS = {"verify-restore"}
+SUBS = [x for x in ALL_SUBS if x != "generate" and x not in INTERNAL_SUBS]
 if len(SUBS) >= 5:
     ok("从 iosstate.py 的 argparse 取到 %d 个 generate 之外的子命令: %s" % (len(SUBS), ", ".join(SUBS)))
 else:
     bad("取不到子命令清单: %r" % _help[:200])
+_pdgsrc = open(ROOT / "deploy/bot/pdg.sh", encoding="utf-8").read()
+_disp = re.search(r"^cmd_ios_state\(\)\{.*?^\}", _pdgsrc, re.S | re.M)
+for _s in sorted(INTERNAL_SUBS):
+    if _s not in ALL_SUBS:
+        bad("内部子命令 %s 已经不存在了, 这份豁免清单该清理" % _s)
+    elif _disp and _s in _disp.group(0):
+        bad("%s 被 cmd_ios_state 分派了, 它不该被当成内部子命令豁免" % _s)
+    elif _s not in _pdgsrc:
+        bad("内部子命令 %s 在 pdg.sh 里根本没被调用 —— 它是死代码还是漏接了?" % _s)
+    else:
+        ok("内部子命令 %s 确实不走 `pdg ios` 分派, 由别处(cmd_rollback)直接调用" % _s)
 
 # 真的把 cmd_ios / cmd_ios_previous / ic_gate 抽出来跑一遍, 只把它依赖的外部动作换成桩。
 HARNESS = r"""

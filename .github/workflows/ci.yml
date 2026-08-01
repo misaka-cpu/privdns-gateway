@@ -229,6 +229,9 @@ jobs:
       - name: "iOS 首次启用不许猜 (发 SSID 也要先问装没装过, 没回答就一个字节都不写)"
         run: python3 tests/test-ios-profile-firsttime.py
 
+      - name: "iOS 恢复计划三入口共用 (Bot/救援平面/CLI 回滚同一份判据, 缺失即删除)"
+        run: python3 tests/test-ios-profile-restore-plan.py
+
       - name: "自检防火墙端口回归"
         run: python3 tests/test-doctor-firewall.py
 

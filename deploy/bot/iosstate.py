@@ -1039,6 +1039,97 @@ def validate_restore_set(raw, cur=None, prev=None):
     return raw, cur, prev, None
 
 
+# ── 恢复计划: Bot / 救援平面 / CLI 回滚共用的**同一份**判断 ──────────────────
+# 三个入口过去各写各的: Bot 只 stage 归档里存在的文件, 救援平面把三个成员当成三份独立配置
+# 逐个映射, CLI 回滚干脆不校验。于是同一份备份在三条路上恢复出三种结果, 而且都不报错。
+#
+# 这里给出**目标状态**而不是"要写哪些文件": 归档里没有 previous, 不等于"别动现网的
+# previous" —— 恰恰相反, 它等于"那一刻没有上一版", 现网那份必须删掉。把"缺失"表达成删除
+# 目标, 才谈得上"恢复完之后盘面就是备份那一刻的样子"。
+DELETE = "\x00delete"          # 目标状态 = 删掉它。不能用 None: None 表示"这次不碰"
+
+REL_STATE = "etc/privdns-gateway/ios-profile.json"
+REL_CUR = "var/lib/privdns-gateway/ios-profile/current.mobileconfig"
+REL_PREV = "var/lib/privdns-gateway/ios-profile/previous.mobileconfig"
+PLAN_TARGETS = (("state", "ios_profile_state"),
+                ("current", "ios_profile_current"),
+                ("previous", "ios_profile_previous"))
+
+
+def plan_restore(raw, cur=None, prev=None):
+    """这一组的恢复计划。返回 (plan, 提示) 或抛 RestoreRefused。
+
+    plan = {"state": bytes, "current": bytes|DELETE, "previous": bytes|DELETE}
+    raw 为 None(归档里根本没有记录文件)⇒ 返回 (None, None): 这份包不含这一组, 一个字节都
+    不碰。这是**唯一**能解释成"不恢复这一组"的情形。
+    """
+    if raw is None:
+        return None, None
+    raw2, cur2, prev2, note = validate_restore_set(raw, cur, prev)
+    return {"state": raw2,
+            "current": cur2 if cur2 is not None else DELETE,
+            "previous": prev2 if prev2 is not None else DELETE}, note
+
+
+def plan_from_tree(root):
+    """从解包出来的目录树里取这一组, 出计划。三个入口都走它, 于是判据只有一份。"""
+    def _rd(rel):
+        f = os.path.join(root, rel)
+        if not os.path.isfile(f):
+            return None
+        with open(f, "rb") as fh:
+            return fh.read()
+    return plan_restore(_rd(REL_STATE), _rd(REL_CUR), _rd(REL_PREV))
+
+
+def stage_plan(tx, plan):
+    """把计划挂进一笔 pdgtx 事务, 返回实际进了事务的目标名。
+
+    删除也带 expect sha: 从读到落盘之间别人改了这份文件, 事务必须拒绝而不是照删 ——
+    否则一次恢复会把并发写入的东西悄悄抹掉。
+    """
+    staged = []
+    for which, target in PLAN_TARGETS:
+        want = plan[which]
+        cur, sha = tx.read_for_update(target)
+        if want is DELETE or want == DELETE:
+            if cur is None:
+                continue                        # 本来就没有, 不必进事务
+            tx.stage(target, None, expect=sha)
+        else:
+            if cur == want:
+                continue                        # 一个字节都不用动
+            tx.stage(target, want, expect=sha)
+        staged.append(target)
+    return staged
+
+
+def plan_has_work(plan):
+    """这份计划相对现网有没有实际改动。用来判断"一个字节都不用动", 不开事务。"""
+    if not plan:
+        return False
+    for which, target in PLAN_TARGETS:
+        path, _m, _s, _v = pdgtx.resolve_target(target)
+        cur, _st = pdgtx._read_target(path)
+        want = plan[which]
+        if want == DELETE:
+            if cur is not None:
+                return True
+        elif cur != want:
+            return True
+    return False
+
+
+def plan_summary(plan):
+    """给用户看的一句话: 这次会把这一组换成什么样子。"""
+    if not plan:
+        return ""
+    parts = ["身份/修订记录"]
+    parts.append("当前版本" if plan["current"] != DELETE else "删除当前版本")
+    parts.append("上一版" if plan["previous"] != DELETE else "删除上一版")
+    return "iOS 描述文件(" + " + ".join(parts) + ")"
+
+
 def status_lines(meta, inputs=None, art_root=None):
     """状态展示的**唯一**文案来源(Bot 与 CLI 共用措辞)。
 
@@ -1134,6 +1225,9 @@ def main(argv=None):
     sub.add_parser("recover", help="清理中断残留并检查产物与记录是否一致")
     rp = sub.add_parser("repair", help="按记录逐字节复原 current(复原不了就拒绝)")
     common(rp)
+    vr = sub.add_parser("verify-restore",
+                        help="对解包出来的目录树做恢复前的联合校验(CLI 回滚用)")
+    vr.add_argument("--tree", required=True, help="已解包的快照根目录")
 
     a = ap.parse_args(argv)
     if not a.cmd:
@@ -1168,6 +1262,16 @@ def main(argv=None):
                 print("\n⚠️ 安装前请先在 iPhone 上删除旧的「PrivDNS Gateway」描述文件 —— "
                       "旧版是随机身份, 不删的话这份会作为**另一个**描述文件并存。")
             print("\n" + UNKNOWN)
+        elif a.cmd == "verify-restore":
+            # CLI 回滚在**覆盖生产文件之前**调它。与 Bot、救援平面走同一份 plan_restore ——
+            # "这是本机快照所以一定可信"不成立: 快照可能损坏、被换掉、或者只恢复了一半。
+            plan, note = plan_from_tree(a.tree)
+            if plan is None:
+                print("快照里没有 iOS 生命周期记录, 这一组不做改动。")
+            else:
+                print(plan_summary(plan))
+                if note:
+                    print(note)
         elif a.cmd == "status":
             meta = load()
             inputs = None

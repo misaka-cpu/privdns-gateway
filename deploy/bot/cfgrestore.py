@@ -21,6 +21,17 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, "/opt/pdg-bot")
 import mihomorender  # noqa: E402
 import pdgtx  # noqa: E402
+try:
+    # iOS 生命周期这一组要按**一组**校验并出恢复计划(见 iosstate.plan_restore)。这个模块
+    # 只装在 iOS 平台上 —— Android 上导不进来是正常的, 那种机器的快照里本来就不该有这一组。
+    # 真遇到"Android 机器 + 快照里带着这一组"时**不许静默绕过**: 那说明这份快照不是这台
+    # 机器的, 或者平台标记不对, 两种情况都该让人先看一眼。见 restore_managed 里的 fail-closed。
+    import iosstate  # noqa: E402
+except Exception:  # noqa: BLE001
+    iosstate = None
+
+IOS_STATE_MEMBER = "etc/privdns-gateway/ios-profile.json"
+IOS_TARGET_PREFIX = "ios_profile_"
 
 
 # 成员路径(tar 里的相对路径)→ pdgtx 的**逻辑目标名**。生产路径由 pdgtx 解析, 不在这里写死。
@@ -447,6 +458,13 @@ def restore_managed(snap_id, *, expect_digest="", trigger_source="legacy"):
                 landed.append(os.path.relpath(os.path.join(root_, fn), stage))
         members = landed + list(skipped_members)
         restorable, excluded, unknown = classify(members)
+        # iOS 生命周期这一组**不走逐成员映射**: 它是一组, 不是三份独立配置。逐个映射会让
+        # "快照里没有 previous" 变成"别动现网的 previous", 于是一份 rev1 的快照恢复出
+        # "记录说 rev1、盘上还躺着 rev2 的 previous" —— 恢复完就自相矛盾, 而且不报错。
+        ios_names = [n for n in restorable
+                     if restorable[n].startswith(IOS_TARGET_PREFIX)]
+        for n in ios_names:
+            restorable.pop(n, None)
         out["excluded"] = [n for n, _k in excluded] + [n for n, _k in unknown]
         out["format"] = snap_format(members)
         if out["format"] not in ("v1.6",):
@@ -478,7 +496,28 @@ def restore_managed(snap_id, *, expect_digest="", trigger_source="legacy"):
                 continue
             changed[target] = data
         out["unchanged"] = unchanged_t
-        if not changed:
+        # 这一组的恢复计划: 与 Bot、CLI 回滚走同一份判据(iosstate.plan_restore)。
+        ios_plan, ios_note = None, None
+        if IOS_STATE_MEMBER in members:
+            if iosstate is None:
+                out["error"] = ("这份快照里带着 iOS 描述文件生命周期, 但本机没有校验它所需的"
+                                "模块(iosstate) —— 无法确认那一组是否可信, 整笔受管恢复已中止, "
+                                "现网未做任何改动。")
+                return out
+            try:
+                ios_plan, ios_note = iosstate.plan_from_tree(stage)
+            except iosstate.StateError as e:
+                out["error"] = ("快照里的 iOS 描述文件没通过联合校验, 整笔受管恢复已中止, "
+                                "现网未做任何改动。\n%s" % pdgtx.redact(str(e)))
+                return out
+            except Exception as e:  # noqa: BLE001
+                out["error"] = ("校验快照里的 iOS 描述文件时出错(%s), 整笔受管恢复已中止。"
+                                % type(e).__name__)
+                return out
+        if ios_note:
+            out["ios_note"] = ios_note
+        ios_work = bool(ios_plan) and iosstate.plan_has_work(ios_plan)
+        if not changed and not ios_work:
             # 一个字节都不用动: 不开事务、不发服务动作、也不写审计(什么都没发生)
             out["ok"] = True
             out["state"] = "NO_CHANGE"
@@ -507,6 +546,10 @@ def restore_managed(snap_id, *, expect_digest="", trigger_source="legacy"):
                     continue
                 t.stage(target, data, expect=sha)
                 out["restored"].append(target)
+            if ios_work:
+                # 三个目标一起进这笔事务 —— 一起提交、一起回滚。删除目标也带 expect sha,
+                # 从读到落盘之间被别人改过就整笔拒, 不会把并发写入悄悄抹掉。
+                out["restored"] += iosstate.stage_plan(t, ios_plan)
             t.audit_extra["restored_count"] = len(out["restored"])
             t.audit_extra["skipped_count"] = len(out["skipped"])
             t.audit_extra["unchanged_count"] = len(unchanged_t)

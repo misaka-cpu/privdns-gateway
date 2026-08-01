@@ -100,9 +100,12 @@ CA_A = iosprofile.ca_der_from_pem(open(mkca("PDG CA A"), encoding="utf-8").read(
 CA_B = iosprofile.ca_der_from_pem(open(mkca("PDG CA B"), encoding="utf-8").read())
 
 # 生产函数原样抽出来跑(与 test-core-swap.sh 同一手法): 测的是 pdg.sh 里那一份, 不是复制品。
-FNS = ("_pdg_mktemp_dir", "_pdg_ios_group_in_members", "_pdg_ios_group_rels",
-       "_pdg_ios_capture", "_pdg_ios_rollback", "_pdg_reconcile_ios_profile",
-       "_pdg_apply_snapshot_tree")
+# iOS 那一批按 `_pdg_ios_*` 前缀自动抽 —— 写死名字的话, 生产多加一个 helper 就变成
+# command not found 的假红(这一轮已经踩过两次)。
+FNS = ("_pdg_mktemp_dir", "_pdg_apply_snapshot_tree")
+IOS_FNS = subprocess.run(
+    ["bash", "-c", "grep -oE '^_pdg_ios_[a-z_]+\\(\\)' %s | tr -d '()'" % PDG],
+    capture_output=True, text=True).stdout.split()
 # 这两条相对路径也是生产定义的一部分, 一并抽 —— 少抽一个就是 "unbound variable" 的假红。
 CONSTS = ("_PDG_IOS_STATE_REL", "_PDG_IOS_ART_REL")
 
@@ -112,7 +115,7 @@ def _harness():
     for c in CONSTS:
         p = subprocess.run(["sed", "-n", "/^%s=/p" % c, PDG], capture_output=True, text=True)
         out.append(p.stdout)
-    for fn in FNS:
+    for fn in list(FNS) + IOS_FNS:
         p = subprocess.run(["sed", "-n", "/^%s(){/,/^}/p" % fn, PDG],
                            capture_output=True, text=True)
         out.append(p.stdout)
@@ -120,7 +123,8 @@ def _harness():
 
 
 HARNESS = _harness()
-for fn in FNS:
+for fn in list(FNS) + ["_pdg_ios_capture", "_pdg_ios_rollback", "_pdg_ios_reconcile",
+                       "_pdg_ios_group_in_members", "_pdg_ios_verify_tree"]:
     if "%s(){" % fn not in HARNESS:
         bad("抽不到生产函数 %s —— 这个测试就没有在测生产代码" % fn)
 for c in CONSTS:

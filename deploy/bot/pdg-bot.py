@@ -3580,52 +3580,39 @@ class _IosRestoreRefused(Exception):
 def _stage_ios_profile(t, tmp):
     """把备份里的 iOS 描述文件生命周期挂进这笔事务。返回 (恢复了什么, 提示或 None)。
 
-    三份文件(记录 + current + previous)必须当成**一组**校验后再挂, 校验在 iosstate
-    (validate_restore_set) —— 那里有元数据语义, 这里只负责取文件和把结论翻译成消息。
+    判据与"要把这一组变成什么样子"都在 iosstate(plan_from_tree / stage_plan)—— 救援平面
+    和 CLI 回滚走的是**同一份**。这里只负责把结论翻译成给用户看的话。
+
+    关键是"缺失也要表达成删除": 归档里没有 previous, 不等于"别动现网那份", 恰恰等于"备份
+    那一刻没有上一版"。只 stage 归档里存在的文件, 会把一份 rev1 的备份恢复成"记录说 rev1、
+    盘上还躺着 rev2 的 previous" —— 恢复完就是一个自相矛盾的状态, 而且不报错。
+
     不通过就抛 _IosRestoreRefused: **整笔恢复**失败, 而不是"跳过 iOS 那部分继续恢复"。
     理由是这三份和 config.json 来自同一个包 —— 这个包的 iOS 那一组要么自相矛盾、要么带着
     本项目不会生成的 payload, 那就没有理由单独相信它的网关配置部分; 而"成功了但少恢复了
     一样东西"留下的机器状态, 用户不会知道。
 
     旧格式备份(只有记录、没有产物)仍按既有口径处理: 认出来、如实说明, 不伪装成完整恢复。
-      · previous 那一版用的根证书只在产物里有正文, 元数据里只有指纹 —— 它丢了就真的没了,
-        谁也重建不出来。所以记录里的 previous 一并清掉, 不留一个点开就报错的"上一版";
-      · current 保留记录。它**有可能**按记录逐字节复原(条件见 iosstate.repair_current),
-        但那是恢复之后另做的事, 这里不越权替用户决定。
+    previous 那一版用的根证书只在产物里有正文, 元数据里只有指纹 —— 它丢了就真的没了。
     """
-    state_src = os.path.join(tmp, "etc/privdns-gateway/ios-profile.json")
-    if not os.path.isfile(state_src):
+    if not os.path.isfile(os.path.join(tmp, "etc/privdns-gateway/ios-profile.json")):
         return None, None                       # 备份里没有 → 不动现网的任何一份
     if iosstate is None:                        # Android: 根本没有这套模块
-        return None, "⚠️ 本平台不带 iOS 描述文件功能, 备份里的那一组已跳过(现网未被改动)"
-
-    def _rd(p):
-        if not os.path.isfile(p):
-            return None
-        with open(p, "rb") as f:
-            return f.read()
-
+        raise _IosRestoreRefused(
+            "这份备份里带着 iOS 描述文件生命周期, 但本机是 Android 平台, 没有校验它所需的"
+            "模块 —— 无法确认那一组是否可信, 整笔恢复已中止(现网未被改动)。")
     try:
-        raw = _rd(state_src)
-        cur = _rd(os.path.join(tmp, "var/lib/privdns-gateway/ios-profile/current.mobileconfig"))
-        prev = _rd(os.path.join(tmp, "var/lib/privdns-gateway/ios-profile/previous.mobileconfig"))
-    except OSError as e:
-        raise _IosRestoreRefused("读不到备份里的 iOS 描述文件(%s)" % e.strerror)
-    try:
-        raw, cur, prev, note = iosstate.validate_restore_set(raw, cur, prev)
-    except iosstate.RestoreRefused as e:
-        raise _IosRestoreRefused(str(e))
+        plan, note = iosstate.plan_from_tree(tmp)
     except iosstate.StateError as e:
         raise _IosRestoreRefused(str(e))
-    t.stage("ios_profile_state", raw)
-    what = ["身份/修订记录"]
-    if cur is not None:
-        t.stage("ios_profile_current", cur)
-        what.append("当前版本")
-    if prev is not None:
-        t.stage("ios_profile_previous", prev)
-        what.append("上一版")
-    return "iOS 描述文件(" + " + ".join(what) + ")", note
+    except OSError as e:
+        raise _IosRestoreRefused("读不到备份里的 iOS 描述文件(%s)" % e.strerror)
+    if plan is None:
+        return None, None
+    staged = iosstate.stage_plan(t, plan)
+    if not staged:
+        return None, note                       # 与现网完全一致, 一个字节都不用动
+    return iosstate.plan_summary(plan), note
 
 
 def _restore_commit(tmp):
