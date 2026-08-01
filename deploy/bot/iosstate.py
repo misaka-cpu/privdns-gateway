@@ -748,6 +748,32 @@ class RestoreRefused(StateError):
 
 
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
+_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+# ── 当前 schema 下, 一份产物**允许**长什么样 ────────────────────────────────
+# 这是白名单, 不是黑名单: 多一个字段、少一个字段、不认识的字段, 一律拒。
+#
+# 为什么不能靠"放宽未知字段"来做跨版本兼容: 一份 mobileconfig 的语义几乎全在字段上。
+# PayloadRemovalDisallowed 一个键就能让用户在手机上删不掉这份描述文件;
+# SupplementalMatchDomains 一个键就能改变哪些域名走这条 DNS。放行"暂时不认识的字段"等于
+# 承认我们不知道自己在往用户手机上装什么。将来渲染结构有意变化时升 SCHEMA 或加显式的版本
+# 化校验 —— 在那之前只认这一套。
+#
+# 这份表必须与 iosprofile.render 的输出保持一致。tests/test-ios-profile-backup-trust.py
+# 里有一条守卫: 拿当前渲染器现render 的产物过一遍这里, 必须**正好**合规 —— 于是模板或渲染器
+# 改了而这里没跟上, 测试就红。
+_TOP_KEYS = frozenset(("PayloadContent", "PayloadDisplayName", "PayloadIdentifier",
+                       "PayloadUUID", "PayloadType", "PayloadVersion"))
+_DNS_KEYS = frozenset(("PayloadType", "PayloadVersion", "PayloadIdentifier", "PayloadUUID",
+                       "PayloadDisplayName", "DNSSettings", "OnDemandRules"))
+_DNSSET_KEYS = frozenset(("DNSProtocol", "ServerName", "ServerAddresses"))
+_CA_KEYS = frozenset(("PayloadType", "PayloadVersion", "PayloadIdentifier", "PayloadUUID",
+                      "PayloadDisplayName", "PayloadContent", "PayloadCertificateFileName"))
+# 按需规则允许的几种形态(模板里那三条 + SSID 强制直连那一条)
+_RULE_KEYSETS = (frozenset(("InterfaceTypeMatch", "Action", "URLStringProbe")),
+                 frozenset(("InterfaceTypeMatch", "Action")),
+                 frozenset(("InterfaceTypeMatch", "SSIDMatch", "Action")),
+                 frozenset(("Action",)))
 # 记录里 inputs 的字段与类型。多一个少一个都拒: 少了会让后面的比对静默跳过, 多了说明这份
 # 记录不是本版本写出来的, 而我们没有能力判断多出来的那个字段意味着什么。
 _INPUT_TYPES = (("schema", int), ("dot_host", str), ("server_addresses", list),
@@ -758,6 +784,16 @@ def _refuse(gate, why):
     raise RestoreRefused("备份里的 iOS 描述文件没通过「%s」这道门: %s" % (gate, why))
 
 
+def _keys_exact(what, got, want):
+    """字段集合必须**正好**是 want。多的、少的都点名报出来。"""
+    extra = sorted(set(got) - set(want))
+    if extra:
+        _refuse("字段白名单", "%s 多了本项目不会写的字段: %s" % (what, "、".join(extra)))
+    miss = sorted(set(want) - set(got))
+    if miss:
+        _refuse("字段白名单", "%s 少了本项目一定会写的字段: %s" % (what, "、".join(miss)))
+
+
 def _check_record(rec, name):
     gate = "记录格式"
     if not isinstance(rec, dict):
@@ -765,8 +801,9 @@ def _check_record(rec, name):
     rev = rec.get("revision")
     if not isinstance(rev, int) or isinstance(rev, bool) or rev < 1:
         _refuse(gate, "%s 的 revision 不是正整数(%r)" % (name, rev))
-    if not isinstance(rec.get("digest"), str) or not rec["digest"].startswith("sha256:"):
-        _refuse(gate, "%s 的 digest 不是 sha256: 开头的字符串" % name)
+    if not isinstance(rec.get("digest"), str) or not _DIGEST_RE.match(rec["digest"]):
+        _refuse(gate, "%s 的 digest 不是 sha256:<64 位小写十六进制>(实际 %r)"
+                % (name, rec.get("digest")))
     if not isinstance(rec.get("sha256"), str) or not _HEX64.match(rec.get("sha256") or ""):
         _refuse(gate, "%s 的 sha256 不是 64 位十六进制" % name)
     for k in ("generated_at", "sent_at"):
@@ -793,15 +830,30 @@ def _check_record(rec, name):
                 % (name, inp["wloc_enabled"], "有" if inp["wloc_ca_sha256"] else "没有"))
     if inp["wloc_ca_sha256"] and not _HEX64.match(inp["wloc_ca_sha256"]):
         _refuse(gate, "%s 的 inputs.wloc_ca_sha256 不是 64 位十六进制" % name)
+    # digest 是"配置有没有变"的唯一依据, 三档判定全靠它。只看格式是不够的 —— 伪造一串
+    # 合法形态的 digest 就能让"必须更新"变成"无需更新"。按 inputs 重新算一遍核对。
+    if rec["digest"] != digest_of(inp):
+        _refuse("digest 自洽", "%s 的 digest 与它自己的 inputs 对不上 —— 记录被改过, "
+                "拿它做更新判定会得出相反的结论" % name)
 
 
 def _check_meta(raw):
     """记录本身。用词与 load() 保持一致的判据, 但这里是**包外内容**, 一律 fail-closed。"""
     gate = "记录格式"
+    # 文件在、但读不出来 ⇒ 整笔拒, 不是"跳过这一组"。
+    # 只有"归档里根本没有这个文件"才解释得成"这份备份不含 iOS 生命周期" —— 那由调用方在
+    # 取文件时判断。一份记录损坏的备份如果只跳过 iOS 那一组、照常换掉网关配置, 结果是两边
+    # 从此对不上, 而界面上什么都不会说。
     try:
-        meta = json.loads(raw.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError):
-        return None                              # 解不开 → 交给调用方按"没有可用记录"处理
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        _refuse(gate, "记录不是 UTF-8 文本(已损坏) —— 备份里有这个文件却读不出来, "
+                      "不能当成「这份备份不含 iOS 生命周期」")
+    try:
+        meta = json.loads(text)
+    except ValueError:
+        _refuse(gate, "记录不是合法 JSON(已损坏) —— 备份里有这个文件却解析不了, "
+                      "整笔恢复已中止")
     if not isinstance(meta, dict):
         _refuse(gate, "记录不是一个 JSON 对象")
     if meta.get("schema") != SCHEMA:
@@ -876,10 +928,13 @@ def _check_artifact(meta, which, data, ids):
                 "「📱 iOS 描述文件」页发给用户安装, 拒绝。" % (name, "、".join(extra)))
     if len(items) != len(p.get("PayloadContent") or []):
         _refuse("payload 白名单", "%s的 PayloadContent 里有非字典项" % name)
+    # 字段白名单: 多一个、少一个、不认识的一律拒(为什么不放宽, 见 _TOP_KEYS 上面那段)
+    _keys_exact("%s的顶层" % name, p, _TOP_KEYS)
     if p.get("PayloadUUID") != ids["root"] \
             or p.get("PayloadIdentifier") != iosprofile.ID_ROOT + "." + ids["root"]:
         _refuse("身份", "%s不是这台网关(instance_id)生成的 —— 顶层身份对不上" % name)
     dns = [x for x in items if x.get("PayloadType") == "com.apple.dnsSettings.managed"][0]
+    _keys_exact("%s的 DNS payload" % name, dns, _DNS_KEYS)
     if dns.get("PayloadUUID") != ids["dns"] \
             or dns.get("PayloadIdentifier") != iosprofile.ID_DNS + "." + ids["dns"]:
         _refuse("身份", "%s的 DNS payload 不是这台网关(instance_id)派生的身份" % name)
@@ -888,18 +943,42 @@ def _check_artifact(meta, which, data, ids):
         _refuse("根证书", "%s是否含根证书与记录不符(记录说%s)"
                 % (name, "有" if inp["wloc_enabled"] else "没有"))
     if cas:
-        body = cas[0].get("PayloadContent")
+        ca = cas[0]
+        # 根证书那一格要**整格**核对: 类型、版本、固定 identifier、派生 UUID、证书文件名、
+        # DER 指纹、以及它到底是不是一张真的 X.509 公钥证书。少查一样, 手机上信任的那张根
+        # 证书就可能不是我们记录的那张 —— 而这一格的后果是"这台设备信任谁"。
+        _keys_exact("%s的根证书 payload" % name, ca, _CA_KEYS)
+        if ca.get("PayloadVersion") != 1:
+            _refuse("根证书", "%s的根证书 payload 的 PayloadVersion 不是 Apple 规定的 1(实际 %r)"
+                    % (name, ca.get("PayloadVersion")))
+        if ca.get("PayloadIdentifier") != iosprofile.ID_CA:
+            _refuse("根证书", "%s的根证书 payload 的 PayloadIdentifier 不是本项目固定的 %s"
+                    "(实际 %r)" % (name, iosprofile.ID_CA, ca.get("PayloadIdentifier")))
+        if ca.get("PayloadCertificateFileName") != iosprofile.CA_FILENAME:
+            _refuse("根证书", "%s的根证书 payload 的证书文件名不是本项目固定的 %s(实际 %r)"
+                    % (name, iosprofile.CA_FILENAME, ca.get("PayloadCertificateFileName")))
+        if ca.get("PayloadDisplayName") != iosprofile.CA_DISPLAY:
+            _refuse("根证书", "%s的根证书 payload 的显示名不是本项目写的那个(实际 %r)"
+                    % (name, ca.get("PayloadDisplayName")))
+        body = ca.get("PayloadContent")
         if not isinstance(body, (bytes, bytearray)):
             _refuse("根证书", "%s的根证书那一格不是二进制内容" % name)
         if hashlib.sha256(bytes(body)).hexdigest() != inp["wloc_ca_sha256"]:
             _refuse("根证书", "%s里的根证书指纹与记录不符 —— 那不是这一版用的那张证书" % name)
-        if cas[0].get("PayloadUUID") != ids["ca"]:
+        if ca.get("PayloadUUID") != ids["ca"]:
             _refuse("身份", "%s的根证书 payload UUID 不是这台网关派生的" % name)
         try:
             iosprofile.assert_public_cert_der(bytes(body), "%s里的根证书" % name)
         except iosprofile.ProfileError as e:
             _refuse("根证书", str(e))
     s = dns.get("DNSSettings") or {}
+    _keys_exact("%s的 DNSSettings" % name, s, _DNSSET_KEYS)
+    for r in (dns.get("OnDemandRules") or []):
+        if not isinstance(r, dict):
+            _refuse("字段白名单", "%s的按需规则里有非字典项" % name)
+        if frozenset(r) not in _RULE_KEYSETS:
+            _refuse("字段白名单", "%s的按需规则里有本项目不会写的形态(字段: %s)"
+                    % (name, "、".join(sorted(r)) or "空"))
     if s.get("ServerName") != inp["dot_host"]:
         _refuse("语义一致", "%s里的 ServerName(%r)与记录的 dot_host(%r)不符"
                 % (name, s.get("ServerName"), inp["dot_host"]))

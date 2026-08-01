@@ -3617,8 +3617,6 @@ def _stage_ios_profile(t, tmp):
         raise _IosRestoreRefused(str(e))
     except iosstate.StateError as e:
         raise _IosRestoreRefused(str(e))
-    if raw is None:
-        return None, "⚠️ 备份里的 iOS 描述文件记录无法解析, 已跳过(现网那份未被改动)"
     t.stage("ios_profile_state", raw)
     what = ["身份/修订记录"]
     if cur is not None:

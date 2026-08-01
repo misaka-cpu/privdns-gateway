@@ -217,13 +217,15 @@ print("RESULT " + json.dumps({"ok": bool(okv), "msg": msg}, ensure_ascii=False))
 '''
 
 
-def run_restore(box, blob, inject=""):
+def run_restore(box, blob, inject="", env=None):
     with open(box.root + "/backup.tar.gz", "wb") as f:
         f.write(blob)
     code = RUNNER % {"botdir": BOTDIR, "bot": BOT, "root": box.root,
                      "blobfile": box.root + "/backup.tar.gz", "inject": inject}
+    e = dict(os.environ)
+    e.update(env or {})
     p = subprocess.run([sys.executable, "-c", code], capture_output=True,
-                       text=True, timeout=600)
+                       text=True, timeout=600, env=e)
     for line in reversed((p.stdout or "").splitlines()):
         if line.startswith("RESULT "):
             return json.loads(line[7:])
@@ -239,11 +241,11 @@ def victim():
     return v
 
 
-def refuse_case(title, members, expect_words, expect_note=None):
+def refuse_case(title, members, expect_words, expect_note=None, env=None):
     """恢复必须被拒, 现网三件套一个字节都不许动, 而且要点名是哪一道门。"""
     v = victim()
     before, before_st = v.trio(), v.stats()
-    res = run_restore(v, pack(members))
+    res = run_restore(v, pack(members), env=env)
     if res["ok"]:
         bad("%s: 竟然恢复成功了 —— %s" % (title, res["msg"].splitlines()[0][:90]))
     else:
@@ -266,6 +268,18 @@ def resha(meta_raw, which, data):
     """改完产物, 把记录里的 sha256 配平 —— 攻击者当然会这么干, 所以不能只靠 sha 这一道。"""
     meta = json.loads(meta_raw.decode("utf-8"))
     meta[which]["sha256"] = hashlib.sha256(data).hexdigest()
+    return json.dumps(meta, ensure_ascii=False, indent=2,
+                      sort_keys=True).encode("utf-8") + b"\n"
+
+
+def rewrite_meta(meta_raw, fn):
+    """改记录, 并把 digest 按新的 inputs 重算 —— 一个会做功课的攻击者当然会重算,
+    所以后面的门不能靠"他忘了改 digest"来生效。"""
+    meta = json.loads(meta_raw.decode("utf-8"))
+    fn(meta)
+    for w in ("current", "previous"):
+        if meta.get(w) and meta[w].get("inputs"):
+            meta[w]["digest"] = _S0.digest_of(meta[w]["inputs"])
     return json.dumps(meta, ensure_ascii=False, indent=2,
                       sort_keys=True).encode("utf-8") + b"\n"
 
@@ -328,11 +342,10 @@ for kind in ("ec", "rsa", "pkcs8"):
     forged = plistlib.dumps(doc)
     if b"PRIVATE KEY" in forged:
         bad("%s: 构造的样本里出现了 PRIVATE KEY 字面量, 这条用例就没意义了" % kind)
-    meta2 = json.loads(good[ARC_META].decode("utf-8"))
-    meta2["current"]["inputs"]["wloc_ca_sha256"] = hashlib.sha256(key_der).hexdigest()
-    meta2["current"]["sha256"] = hashlib.sha256(forged).hexdigest()
-    raw2 = json.dumps(meta2, ensure_ascii=False, indent=2,
-                      sort_keys=True).encode("utf-8") + b"\n"
+    def _fix(m):
+        m["current"]["inputs"]["wloc_ca_sha256"] = hashlib.sha256(key_der).hexdigest()
+        m["current"]["sha256"] = hashlib.sha256(forged).hexdigest()
+    raw2 = rewrite_meta(good[ARC_META], _fix)     # digest 也一并重算, 直逼根证书那道门
     refuse_case("DER %s 私钥冒充根证书" % kind,
                 dict(good, **{ARC_META: raw2, ARC_CUR: forged}),
                 ["根证书", "私钥", "证书"])
@@ -427,6 +440,122 @@ refuse_case("记录里 revision 类型不对",
             dict(good, **{ARC_META: json.dumps(badmeta, ensure_ascii=False, indent=2,
                                                sort_keys=True).encode("utf-8") + b"\n"}),
             ["revision", "记录", "格式"])
+
+print()
+print("══ 五之二、伪造得「看起来自洽」的一组也不许放行 ══")
+# 这几条的共同点: 攻击者同时改元数据与产物, 再把 sha256 配平。只比"两边一致"是拦不住的
+# —— 一致的可以是**两边都错**。所以判据必须落在"这是不是本项目会写出来的那份东西"上。
+
+# 1) 记录文件在, 但 JSON 坏了。以前这里返回"没有可用记录"→ 跳过 iOS 这一组、继续恢复其它
+#    配置: 于是一份记录损坏的备份能把网关配置换掉, 而生命周期留在原地, 两边从此对不上。
+#    只有"归档里根本没有这个文件"才解释得成"这份备份不含这一组"。
+refuse_case("记录文件在但 JSON 坏了",
+            dict(good, **{ARC_META: b'{"schema": 1, "instance_id": '}),
+            ["解析", "损坏", "记录"])
+refuse_case("记录文件在但不是 UTF-8",
+            dict(good, **{ARC_META: b"\xff\xfe\x00{"}),
+            ["解析", "损坏", "记录", "UTF-8"])
+bad_schema = json.loads(good[ARC_META].decode("utf-8"))
+bad_schema["schema"] = 99
+refuse_case("记录的 schema 不认识",
+            dict(good, **{ARC_META: json.dumps(bad_schema, ensure_ascii=False, indent=2,
+                                               sort_keys=True).encode("utf-8") + b"\n"}),
+            ["schema", "格式版本"])
+
+# 2) digest 只被检查了"以 sha256: 开头"。它是判"配置有没有变"的唯一依据, 伪造它等于让
+#    整套三档判定失效 —— 必须按 inputs 重新算一遍核对。
+for label, forged in (("乱写一串", "sha256:" + "0" * 64),
+                      ("长度不对", "sha256:" + "ab" * 20),
+                      ("大写十六进制", "sha256:" + "A" * 64)):
+    bd = json.loads(good[ARC_META].decode("utf-8"))
+    bd["current"]["digest"] = forged
+    refuse_case("digest 伪造(%s)" % label,
+                dict(good, **{ARC_META: json.dumps(bd, ensure_ascii=False, indent=2,
+                                                   sort_keys=True).encode("utf-8") + b"\n"}),
+                ["digest"])
+
+# 3) 顶层多一个本项目不会写的键。PayloadRemovalDisallowed=true 的后果很具体: 描述文件装到
+#    手机上之后**用户自己删不掉**。
+doc = plistlib.loads(good[ARC_CUR])
+doc["PayloadRemovalDisallowed"] = True
+locked = plistlib.dumps(doc)
+refuse_case("顶层多了 PayloadRemovalDisallowed(装上就删不掉)",
+            dict(good, **{ARC_META: resha(good[ARC_META], "current", locked),
+                          ARC_CUR: locked}),
+            ["顶层", "字段", "PayloadRemovalDisallowed"])
+
+doc = plistlib.loads(good[ARC_CUR])
+del doc["PayloadDisplayName"]
+missing = plistlib.dumps(doc)
+refuse_case("顶层少了一个本项目一定会写的键",
+            dict(good, **{ARC_META: resha(good[ARC_META], "current", missing),
+                          ARC_CUR: missing}),
+            ["顶层", "字段", "PayloadDisplayName"])
+
+doc = plistlib.loads(good[ARC_CUR])
+doc["PayloadContent"][0]["PayloadOrganization"] = "Evil Inc"
+dnsextra = plistlib.dumps(doc)
+refuse_case("DNS payload 多了一个未知字段",
+            dict(good, **{ARC_META: resha(good[ARC_META], "current", dnsextra),
+                          ARC_CUR: dnsextra}),
+            ["DNS", "字段", "PayloadOrganization"])
+
+doc = plistlib.loads(good[ARC_CUR])
+doc["PayloadContent"][0]["DNSSettings"]["SupplementalMatchDomains"] = ["bank.example"]
+dnssetextra = plistlib.dumps(doc)
+refuse_case("DNSSettings 多了一个未知字段",
+            dict(good, **{ARC_META: resha(good[ARC_META], "current", dnssetextra),
+                          ARC_CUR: dnssetextra}),
+            ["DNSSettings", "字段", "SupplementalMatchDomains"])
+
+doc = plistlib.loads(good[ARC_CUR])
+doc["PayloadContent"][0]["OnDemandRules"][0]["DNSDomainMatch"] = ["x.example"]
+ruleextra = plistlib.dumps(doc)
+refuse_case("按需规则里多了一个未知字段",
+            dict(good, **{ARC_META: resha(good[ARC_META], "current", ruleextra),
+                          ARC_CUR: ruleextra}),
+            ["按需规则", "字段", "DNSDomainMatch"])
+
+# 4) 根证书 payload 的固定 identifier 被改掉。identifier + UUID 是 iOS 认这一格的依据,
+#    改了它, 这一格在手机上就不再是"我们那一格"。
+for key, val, words in (("PayloadIdentifier", "com.evil.ca", ["identifier", "Identifier", "根证书"]),
+                        ("PayloadCertificateFileName", "evil.crt", ["证书文件名", "根证书"]),
+                        ("PayloadVersion", 2, ["PayloadVersion", "根证书"]),
+                        ("PayloadType", "com.apple.security.pkcs1", ["payload", "根证书"])):
+    doc = plistlib.loads(good[ARC_CUR])
+    for x in doc["PayloadContent"]:
+        if x.get("PayloadType") == "com.apple.security.root":
+            x[key] = val
+    forged = plistlib.dumps(doc)
+    refuse_case("根证书 payload 的 %s 被改成 %r" % (key, val),
+                dict(good, **{ARC_META: resha(good[ARC_META], "current", forged),
+                              ARC_CUR: forged}),
+                words)
+
+# 5) 没有 openssl / openssl 跑不起来: 不能把结构判据冒充完整 X.509 校验。安装本来就依赖它。
+refuse_case("openssl 不可用时不许把结构判据当成强校验",
+            dict(good),
+            ["强校验", "openssl", "OpenSSL"],
+            env={"PATH": "/nonexistent-for-openssl-probe"})
+
+print()
+print("══ 五之三、白名单必须跟得上渲染器(否则正常备份会被自己人挡住)══")
+# 字段白名单是钉死在当前 schema 上的一张表。它和 iosprofile.render 是两处定义, 会漂移。
+# 这条守卫拿**现渲染**的产物过一遍联合校验: 模板或渲染器改了字段而白名单没跟上, 这里先红,
+# 而不是等某个用户恢复备份时才发现"自己生成的文件自己不认"。
+for label, ca, ssids in (("带根证书", CA_A, []),
+                         ("不带根证书", b"", []),
+                         ("带 SSID 强制直连名单", b"", ["Home", "Office"]),
+                         ("根证书 + SSID 都有", CA_B, ["Cafe"])):
+    probe = Box()
+    probe.s.generate("dot.probe.example", "203.0.113.10", ssids, ca, bool(ca), TMPL,
+                     probe.meta, probe.art, True, False)
+    p_meta, p_cur, _p_prev = probe.trio()
+    try:
+        probe.s.validate_restore_set(p_meta, p_cur, None)
+        ok("现渲染的产物(%s)正好合规 —— 白名单与渲染器没有漂移" % label)
+    except Exception as e:  # noqa: BLE001
+        bad("自己生成的产物(%s)过不了自己的校验: %s" % (label, str(e)[:160]))
 
 print()
 print("══ 六、写到一半失败 → 三件套连权限一起回到操作前 ══")

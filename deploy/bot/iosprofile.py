@@ -137,8 +137,9 @@ def assert_public_cert_der(der, what="根证书"):
     为什么不能只扫 "PRIVATE KEY" 字面量: 描述文件里的 PayloadContent 是 base64 过的二进制,
     一把 DER 私钥塞进去之后, 文件里根本不会出现那几个字。所以这里换成结构判据 + openssl:
     先看外层 SEQUENCE 的第一个元素是不是 SEQUENCE(证书)还是 INTEGER(各种私钥格式的
-    version 字段), 再交给 openssl 认一遍。没有 openssl 的机器退回结构判据 —— 那也依然
-    挡得住私钥, 只是不再保证"是一张能用的证书"; 绝不因为少了 openssl 就整个放行。
+    version 字段), 再交给 openssl 认一遍。**openssl 不可用时 fail-closed**: 本项目的安装
+    本来就依赖它(签证书、建 MITM CA 都要), 而结构判据只认得出"这不是私钥", 认不出"这是一
+    张有效证书" —— 拿它冒充强校验等于在恢复路径上悄悄降级。
 
     openssl 走 stdin, **不落盘**: 待检内容有可能正是一把私钥, 我们不该把它写到临时文件里。
     """
@@ -159,9 +160,15 @@ def assert_public_cert_der(der, what="根证书"):
                            input=b, stdout=subprocess.DEVNULL,
                            stderr=subprocess.DEVNULL, timeout=15)
     except FileNotFoundError:
-        return                                   # 没装 openssl: 结构判据已经过了, 不假装强校验
+        # 本项目的安装本来就依赖 openssl(签证书、建 MITM CA 都用它)。找不到它时**不能**
+        # 把上面那点结构判据冒充成完整 X.509 校验 —— 结构判据只认得出"这不是私钥", 认不出
+        # "这是一张有效证书"。如实说强校验不可用, 然后拒。
+        raise ProfileError("强校验不可用: 机器上找不到 openssl, 无法确认%s是不是一张有效的 "
+                           "X.509 公钥证书 —— 本次拒绝(结构判据不能冒充强校验)。"
+                           "请先装回 openssl 再重试。" % what)
     except (OSError, subprocess.SubprocessError):
-        raise ProfileError("没能校验%s(openssl 没跑起来), 拒绝。" % what)
+        raise ProfileError("强校验不可用: openssl 没能跑起来, 无法确认%s是不是一张有效的 "
+                           "X.509 公钥证书 —— 本次拒绝。" % what)
     if p.returncode != 0:
         raise ProfileError("openssl 不认这张%s —— 它不是一张有效的 X.509 公钥证书, 拒绝。"
                            % what)
