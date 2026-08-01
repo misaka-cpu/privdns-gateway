@@ -3290,10 +3290,50 @@ _restore_member_allowed = cfgrestore.member_allowed
 _safe_extract = cfgrestore.safe_extract
 
 
+def _ios_backup_members():
+    """iOS 三件套进不进包, 由**记录**说了算, 不是由盘上有没有文件说了算。
+
+    "文件在就打包"会把一份孤儿 previous(回滚到旧快照留下的、记录里已经没有的那一版)一起
+    装进去 —— 恢复到下一台机器上就是"记录说没有上一版、盘上却躺着一份"。同理, 一份与记录
+    对不上的 current 打进备份, 等于把损坏状态固化成"备份里的样子"。
+
+    所以这里 fail-closed 并说清是哪种状态: 备份是安全网, 递给用户一张破了洞的网、还正好
+    在他觉得自己安全的那一刻, 比直接告诉他"先修" 要糟得多。想原样留档当前(含损坏)状态,
+    `pdg snapshot` 就是干这个的 —— 它按字节打包, 不做任何判断。
+    """
+    if iosstate is None or not os.path.exists(IOS_META):
+        return []                                # Android / 还没启用受管生命周期
+    meta = iosstate.load(IOS_META)               # 记录坏了直接抛(既有措辞)
+    if not meta:
+        return []
+    out = [IOS_META]
+    for which, path, name in (("current", IOS_CURRENT, "当前版本"),
+                              ("previous", IOS_PREVIOUS, "上一版")):
+        if meta.get(which):
+            try:
+                iosstate.verified_artifact(meta, which, IOS_ART_DIR)
+            except iosstate.StateError as e:
+                raise RuntimeError(
+                    "iOS 描述文件的%s与记录对不上, 已中止备份(现网未被改动)。\n%s\n"
+                    "把它打进备份等于把这个状态固化下来。先跑 <code>sudo pdg ios recover</code> "
+                    "看看是哪一份出了问题; 想原样留档当前状态请用 <code>sudo pdg snapshot</code>。"
+                    % (name, e))
+            out.append(path)
+        elif os.path.exists(path):
+            raise RuntimeError(
+                "iOS 描述文件记录里没有%s, 盘上却躺着一份 %s —— 多半是回滚到旧快照留下的孤儿。\n"
+                "已中止备份(现网未被改动): 把它打进包里, 恢复到下一台机器上就是一份自相矛盾的"
+                "记录。先跑 <code>sudo pdg ios recover</code> 看看情况; 想原样留档当前状态请用 "
+                "<code>sudo pdg snapshot</code>。" % (name, os.path.basename(path)))
+    return out
+
+
 def backup_blob():
+    ios_trio = (IOS_META, IOS_CURRENT, IOS_PREVIOUS)
+    ios = _ios_backup_members()                  # 先决定(会 fail-closed), 再开包
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        for p in BACKUP_FILES:
+        for p in [x for x in BACKUP_FILES if x not in ios_trio] + ios:
             if os.path.exists(p):
                 if p == SB:
                     cfg = json.load(open(p))
@@ -4309,7 +4349,14 @@ def handle_text(chat, text, mid=None):
                 send_plain(chat, f"读取描述文件记录失败: {e}")
             return
         if cmd == "/backup":
-            send_document(chat, "pdg-backup-" + time.strftime("%Y%m%d-%H%M") + ".tar.gz", backup_blob(), "💾 配置备份"); return
+            # backup_blob 会在"记录与盘上对不上"时 fail-closed(见 _ios_backup_members),
+            # 那条消息正是用户唯一能据以行动的东西, 不能让它变成一次静默失败。
+            try:
+                send_document(chat, "pdg-backup-" + time.strftime("%Y%m%d-%H%M") + ".tar.gz",
+                              backup_blob(), "💾 配置备份")
+            except Exception as e:  # noqa: BLE001
+                send_plain(chat, "备份失败: %s" % e)
+            return
         if cmd == "/restore":
             state[chat] = "restore"; send(chat, "把备份 .tar.gz 作为文件发来。/cancel 取消。", BACK); return
         if cmd == "/setdot":

@@ -223,6 +223,9 @@ jobs:
       - name: "iOS 备份恢复联合校验 (三件套当一组验 + 只放行本项目会生成的 payload)"
         run: python3 tests/test-ios-profile-backup-trust.py
 
+      - name: "iOS 快照精确回滚 (回滚不留孤儿产物 + 备份按记录而不是按盘上有什么打包)"
+        run: python3 tests/test-ios-profile-snapshot-exact.py
+
       - name: "自检防火墙端口回归"
         run: python3 tests/test-doctor-firewall.py
 

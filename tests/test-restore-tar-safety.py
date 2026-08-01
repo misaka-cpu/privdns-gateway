@@ -279,12 +279,20 @@ def main():
         bot.RS_DIR = os.path.join(base, "etc/sing-box/rs")
         os.makedirs(os.path.join(base, "etc/privdns-gateway"), exist_ok=True)
         bot.IOS_META = os.path.join(base, "etc/privdns-gateway/ios-profile.json")
-        json.dump({"schema": 1, "instance_id": "x"}, open(bot.IOS_META, "w"))
-        os.makedirs(os.path.join(base, "var/lib/privdns-gateway/ios-profile"), exist_ok=True)
-        bot.IOS_CURRENT = os.path.join(base, "var/lib/privdns-gateway/ios-profile/current.mobileconfig")
-        bot.IOS_PREVIOUS = os.path.join(base, "var/lib/privdns-gateway/ios-profile/previous.mobileconfig")
-        for _p in (bot.IOS_CURRENT, bot.IOS_PREVIOUS):
-            open(_p, "w").write("<plist/>\n")
+        bot.IOS_ART_DIR = os.path.join(base, "var/lib/privdns-gateway/ios-profile")
+        bot.IOS_CURRENT = os.path.join(bot.IOS_ART_DIR, "current.mobileconfig")
+        bot.IOS_PREVIOUS = os.path.join(bot.IOS_ART_DIR, "previous.mobileconfig")
+        # 造一条**真的**生命周期(rev1 → rev2, 于是 current + previous 都在)。手写一份
+        # 假记录 + 空产物是不行的: backup_blob 现在按记录 + verified_artifact 决定打包,
+        # 对不上就 fail-closed —— 那正是另一条用例要的行为, 不该在这里被当成"白名单脱节"。
+        _tmpl = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                             "deploy/ios/pdg-dot-ondemand.mobileconfig.tmpl")
+        # lock=False: 这条用例跑在非 root 下, 拿不到 /run 的锁; 生命周期的并发语义由
+        # test-ios-profile-concurrency.py 负责, 这里只需要一份自洽的三件套。
+        bot.iosstate.generate("dot.a.example", "203.0.113.10", (), b"", False, _tmpl,
+                              bot.IOS_META, bot.IOS_ART_DIR, False, False)
+        bot.iosstate.generate("dot.b.example", "203.0.113.10", (), b"", False, _tmpl,
+                              bot.IOS_META, bot.IOS_ART_DIR, False, False)
         bot.BACKUP_FILES = [bot.SB, bot.MOSDNS_CONF, bot.MOSDNS_DIRECT, bot.MOSDNS_HIJACK,
                             bot.RS_META, bot.IOS_META, bot.IOS_CURRENT, bot.IOS_PREVIOUS]
         json.dump({"outbounds": [], "route": {"rules": []}}, open(bot.SB, "w"))

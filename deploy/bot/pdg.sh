@@ -590,6 +590,60 @@ _pdg_mktemp_dir(){
   printf '%s\n' "$d"
 }
 
+# 快照落盘只**覆盖**成员: 快照里没有的文件原样留在盘上。对绝大多数目标这是对的 —— 回滚不该
+# 顺手删掉用户后来加的东西。iOS 产物目录是例外, 因为那两份文件不是各自独立的配置, 而是与
+# ios-profile.json 里的记录**一一对应的一组**:
+#     rev1 打快照(那时还没有 previous) → 生成 rev2(previous 出现) → 回滚到 rev1
+# 记录回到"没有上一版", 盘上却躺着一份 previous.mobileconfig。它属于一个已经不存在的版本,
+# 没有任何记录能解释它是什么; 备份会把它一起打包, 下一次恢复就把这份自相矛盾的东西搬到另
+# 一台机器上 —— 全程不报任何错。
+#
+# 所以对**这一棵子树**做缺失项对账, 而且只对它: 不放大到整个 /var/lib, 那里还有事务记录、
+# 救援运行态、备份包, 它们跟快照没有关系, 删它们是另一回事。
+# 做法不是"删了再说": 先留底片, 删完复核, 任何一步不成立就把删掉的原样放回去并整体报失败
+# —— "删了一半"比不删更难收拾。
+_pdg_reconcile_ios_profile(){
+  local tree="$1" members="$2" dest="$3"
+  local sub="var/lib/privdns-gateway/ios-profile"
+  local dir="${dest%/}/$sub"
+  # 快照里根本没有这棵子树(5.4 之前的快照)⇒ 它对这里没有发言权, 一个字节都不动。
+  grep -qE "^$sub(/|\$)" "$members" || return 0
+  [[ -d "$dir" ]] || return 0
+  local bak=""; bak="$(_pdg_mktemp_dir)" || return 1
+  local orphans=() f rel rc=0
+  while IFS= read -r -d '' f; do
+    rel="$sub/${f#"$dir"/}"
+    grep -qxF -- "$rel" "$members" && continue      # 快照里有 ⇒ 刚刚已被覆盖, 不动
+    if ! mkdir -p -- "$(dirname -- "$bak/$rel")" 2>/dev/null \
+       || ! cp -a -- "$f" "$bak/$rel" 2>/dev/null || ! cmp -s -- "$f" "$bak/$rel"; then
+      rc=1; break                                   # 底片留不下就一个都不删
+    fi
+    if ! rm -f -- "$f" 2>/dev/null || [[ -e "$f" ]]; then rc=1; break; fi
+    orphans+=("$rel")
+  done < <(find "$dir" -mindepth 1 ! -type d -print0 2>/dev/null)
+  if (( rc == 0 )); then                            # 复核: 剩下的每一份都必须在清单里
+    while IFS= read -r -d '' f; do
+      rel="$sub/${f#"$dir"/}"
+      grep -qxF -- "$rel" "$members" || { rc=1; break; }
+    done < <(find "$dir" -mindepth 1 ! -type d -print0 2>/dev/null)
+  fi
+  if (( rc != 0 )); then
+    local r2=0 x
+    for x in ${orphans[@]+"${orphans[@]}"}; do
+      cp -a -- "$bak/$x" "${dest%/}/$x" 2>/dev/null || r2=1
+    done
+    rm -rf -- "$bak"
+    if (( r2 == 0 )); then
+      echo "❌ iOS 产物目录对账失败, 已把删掉的文件原样放回(现网停在回滚前的产物上)"
+    else
+      echo "❌ iOS 产物目录对账失败, 且回退未完全成功, 请立即检查 $dir"
+    fi
+    return 1
+  fi
+  rm -rf -- "$bak"
+  return 0
+}
+
 # 按原归档成员清单把已验证临时树落到目标根；不递归顶层隐式父目录，避免误改 /etc、/opt 元数据。
 _pdg_apply_snapshot_tree(){
   local tree="$1" members="$2" dest="$3"
@@ -598,7 +652,9 @@ _pdg_apply_snapshot_tree(){
     set -o pipefail
     tar --no-recursion -cf - -C "$tree" -T "$members" 2>/dev/null \
       | tar xpf - -C "$dest" 2>/dev/null
-  )
+  ) || return 1
+  # 覆盖完再对账。反过来(先删再写)的话, 写到一半失败就同时留下"删过的"和"写了一半的"。
+  _pdg_reconcile_ios_profile "$tree" "$members" "$dest"
 }
 
 # 面板临时态净化(与 bot backup_blob/restore_from 对称): 快照/回滚不持久化面板的公网监听+密钥+UI。

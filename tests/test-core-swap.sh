@@ -19,6 +19,9 @@ bad(){ echo "[FAIL] $1"; nfail=$((nfail+1)); }
 xt(){ sed -n "/^$1(){/,/^}/p" "$ROOT/deploy/bot/pdg.sh"; }
 eval "$(xt _core_bindir)"; eval "$(xt _core_config_check)"; eval "$(xt _core_kernel_stable)"
 eval "$(xt _pdg_sha)"; eval "$(xt _core_stash_kernel)"; eval "$(xt _core_restore_prev)"; eval "$(xt _core_swap_verify)"; eval "$(xt _pdg_apply_snapshot_tree)"
+# 落盘之后要对 iOS 产物子树做缺失项对账(见 pdg.sh), 一并抽进来 —— 少抽一个就变成
+# "command not found" 导致的假红, 而不是真的回滚失败。
+eval "$(xt _pdg_mktemp_dir)"; eval "$(xt _pdg_reconcile_ios_profile)"
 
 c_g(){ echo "$*"; }; c_y(){ echo "$*"; }
 sleep(){ :; }
