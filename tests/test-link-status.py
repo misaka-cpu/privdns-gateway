@@ -8,6 +8,7 @@
 只读纪律这一节尤其要紧: `pdg link status` 是给"出事了想看看"的人用的, 它自己再去写文件、
 抢锁、开事务, 就会在最不该添乱的时候添乱。
 """
+import json
 import os
 import re
 import shutil
@@ -293,34 +294,74 @@ def main():
     (ok if blocked else bad)("前提成立: 这把锁被占用时, 走事务的写路径会 TxBusy")
     # 用子进程 + 超时跑: 万一它真去抢锁, 会**快速判红**而不是把整个测试挂死等到超时。
     t0 = time.time()
-    probe = subprocess.run(
-        [sys.executable, "-c",
-         "import sys; sys.path.insert(0, %r); import linkstat as L; "
-         "print(len(L.collect(platform='android')))" % str(ROOT / "deploy/bot")],
-        capture_output=True, text=True, timeout=60,
-        env=dict(os.environ, PDG_LOCKFILE=lockp))
+    try:
+        probe = subprocess.run(
+            [sys.executable, "-c",
+             "import sys; sys.path.insert(0, %r); import linkstat as L; "
+             "print(len(L.collect(platform='android')))" % str(ROOT / "deploy/bot")],
+            capture_output=True, text=True, timeout=60,
+            env=dict(os.environ, PDG_LOCKFILE=lockp))
+        good = probe.returncode == 0 and probe.stdout.strip().isdigit()
+        detail = "rc=%d" % probe.returncode
+    except subprocess.TimeoutExpired:
+        good, detail = False, "60s 没返回 —— 卡在这把锁上了"
     dt = time.time() - t0
-    (ok if probe.returncode == 0 and probe.stdout.strip().isdigit() else bad)(
-        "同样条件下 collect() 照常完成 —— 它不去抢这把锁(rc=%d)" % probe.returncode)
+    (ok if good else bad)(
+        "同样条件下 collect() 照常完成 —— 它不去抢这把锁(%s)" % detail)
     try:
         fcntl.flock(held, fcntl.LOCK_UN); held.close()
     except OSError:
         pass
     (ok if dt < 60 else bad)("采集在 %.1fs 内完成(没有卡在锁上)" % dt)
 
-    # 事务与状态文件: 采集前后不许多出任何东西
-    txroot = os.environ.get("PDG_TX_ROOT", "/var/lib/privdns-gateway/tx")
-    before = set(os.listdir(txroot)) if os.path.isdir(txroot) else set()
-    L.collect(platform="android")
-    after = set(os.listdir(txroot)) if os.path.isdir(txroot) else set()
-    (ok if before == after else bad)("采集不产生事务记录(%d → %d)" % (len(before), len(after)))
+    # 事务与状态文件: 采集前后不许多出任何东西。
+    #
+    # 直接在开发机上 listdir("/var/lib/privdns-gateway") 是**空转**的 —— 这台机器上它
+    # 根本不存在, 比的是空集对空集; 真去写的实现会撞 PermissionError 而不是被判据抓住,
+    # 换成 root 跑就漏了。所以进 mount namespace, 拿 tmpfs 把 /var/lib 和 /run 铺成真实
+    # 可写的目录, 再看采集前后多出什么 —— 这样"没写"是证出来的, 不是写不进去。
+    probe_src = r"""
+import json, os, sys
+sys.path.insert(0, %r)
+os.makedirs("/var/lib/privdns-gateway/tx", exist_ok=True)
+def walk():
+    seen = []
+    for root in ("/var/lib/privdns-gateway", "/run"):
+        for dp, dn, fn in os.walk(root):
+            for x in dn + fn:
+                seen.append(os.path.join(dp, x))
+    return sorted(seen)
+before = walk()
+import linkstat as L
+L.collect(platform="android")
+L.collect(platform="ios")
+print(json.dumps({"new": sorted(set(walk()) - set(before))}))
+""" % str(ROOT / "deploy/bot")
+    probe_py = os.path.join(tempfile.mkdtemp(prefix="nsprobe.", dir=d), "probe.py")
+    with open(probe_py, "w", encoding="utf-8") as fh:
+        fh.write(probe_src)
+    ns = subprocess.run(
+        ["unshare", "-rm", "--", "sh", "-c",
+         "mount -t tmpfs none /var/lib && mount -t tmpfs none /run && exec \"$1\" \"$2\"",
+         "sh", sys.executable, probe_py],
+        capture_output=True, text=True, timeout=180)
+    if ns.returncode != 0:
+        skip("进不去 mount namespace(%s), 写入探针未跑"
+             % (ns.stderr.strip().splitlines() or ["?"])[-1][:70])
+    else:
+        made = json.loads(ns.stdout.strip().splitlines()[-1])["new"]
+        (ok if not made else bad)(
+            "namespace 里 /var/lib/privdns-gateway 与 /run 可写, 采集后仍无新文件: 多出 %s"
+            % (made or "无"))
 
-    varlib = "/var/lib/privdns-gateway"
-    b2 = set(os.listdir(varlib)) if os.path.isdir(varlib) else set()
-    L.collect(platform="android")
-    a2 = set(os.listdir(varlib)) if os.path.isdir(varlib) else set()
-    (ok if b2 == a2 else bad)("采集不在 /var/lib/privdns-gateway 下新建东西: 多出 %s"
-                              % (sorted(a2 - b2) or "无"))
+    # 同一个 namespace 的反向前提: 往那两个目录写是**能成功**的(否则上一条不成立)
+    ns2 = subprocess.run(
+        ["unshare", "-rm", "--", "sh", "-c",
+         "mount -t tmpfs none /var/lib && mkdir -p /var/lib/privdns-gateway && "
+         "echo x > /var/lib/privdns-gateway/probe && echo WRITABLE"],
+        capture_output=True, text=True, timeout=60)
+    (ok if "WRITABLE" in ns2.stdout else bad)(
+        "前提成立: 那个 namespace 里确实写得进去(否则上一条是空转)")
 
     print()
     print("── 8. 受管文件的内容/mode/uid/gid/mtime 一律不变 ──")
