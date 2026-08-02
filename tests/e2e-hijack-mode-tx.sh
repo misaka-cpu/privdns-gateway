@@ -34,6 +34,15 @@ e2e_seed_mosdns all
 e2e_seed_singbox_model
 e2e_seed_nft mihomo
 e2e_seed_cert || e2e_skip "无 openssl, 造不出占位证书"
+# mosdns_conf 的候选校验器(mosdns_probe)会**真启动 mosdns** 解析候选配置 —— 拿不到二进制
+# 整笔事务就 REFUSED。开发机上往往有早前 E2E 留下的一份, 于是本地全绿而 CI 全红(v1.7.0
+# 就栽过同一个坑, CHANGELOG 里记着)。这里显式取, 取不到就明说跳过, 不假装通过。
+e2e_fetch_mosdns || true
+# 取完还要**确认真的能用**: helper 返回 0 只说明它没报错, 而 pdgtx 的 _mosdns_bin() 是
+# `shutil.which("mosdns") or <FSROOT>/usr/local/bin/mosdns` —— 两条路都摸不到就直接跳过,
+# 不要让"候选校验一律 REFUSED"以一堆看不懂的红出现。
+command -v mosdns >/dev/null 2>&1 || [[ -x /usr/local/bin/mosdns ]] \
+  || e2e_skip "拿不到可用的 mosdns 二进制(本用例的候选校验要真启动它解析配置)"
 printf 'android\n' > /etc/privdns-gateway/platform
 printf 'mihomo\n'  > /etc/privdns-gateway/backend
 mkdir -p /var/lib/privdns-gateway /run
@@ -83,7 +92,10 @@ _n0=$(ntx); _r0=$(restarts)
 out=$(pdg hijack-mode gfw 2>&1); rc=$?
 [[ "$rc" == 0 ]] && ok "切到 gfw 返回 0" || bad "1: rc=$rc: $(tail -3 <<<"$out")"
 [[ "$(cur_mode)" == gfw ]] && ok "profile.env 记为 gfw" || bad "1b: 模式是 $(cur_mode)"
-grep -q 'hijack_set' "$MC" && ok "mosdns 装上了劫持门(形态真的改了)" || bad "1c: mosdns 形态没变"
+# 判据要落在**劫持门**上, 不是 hijack_set 插件 —— 那个插件种子配置里本来就有(e2e_seed_mosdns
+# 跑过一次 _mosdns_hijack_shape), 查它等于什么都没查, 候选被拒时照样绿。
+grep -q '!qname \$hijack_set' "$MC" && ok "mosdns 装上了劫持门(gfw 形态真的落盘了)" \
+  || bad "1c: 劫持门没落盘(形态没变)"
 _n1=$(ntx)
 if [[ "$((_n1-_n0))" == 1 ]]; then ok "正好产生 1 笔事务"; else bad "1d: 事务数 $_n0→$_n1"; fi
 TX1="$(newest_tx)"
