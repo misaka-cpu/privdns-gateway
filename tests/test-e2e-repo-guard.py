@@ -226,8 +226,18 @@ print("══ 四、每一处会动 ref/config 的 git 调用都必须自带守�
 MUT = {"config", "add", "commit", "tag", "remote", "push", "checkout", "reset", "branch",
        "update-ref", "fetch", "switch", "restore", "stash", "am", "rebase", "merge",
        "cherry-pick", "revert", "gc", "prune", "replace", "notes", "worktree"}
-READONLY_FORM = (re.compile(r"^tag\s+-l\b"), re.compile(r"^remote\s+(-v|show)\b"),
-                 re.compile(r"^config\s+--get\b"), re.compile(r"^branch\s+(-l|--list)\b"))
+# 这些子命令名虽然在 MUT 里, 但带上这些参数就是**纯查询**。漏收一个的后果是假阳性 ——
+# 拦下一条无害的只读调用, 吵但安全; 反过来把某个写形态误收进来才是真漏, 所以只准逐个列举
+# 明确的只读形态, 不准写成"带 -- 开头的都算只读"。
+READONLY_FORM = (
+    re.compile(r"^tag\s+(-l|--list|--points-at|--contains|--no-contains"
+               r"|--merged|--no-merged|-n\d*)\b"),
+    re.compile(r"^remote\s+(-v|show|get-url)\b"),
+    re.compile(r"^config\s+(--get\S*|--list|-l)\b"),
+    re.compile(r"^branch\s+(-l|--list|--show-current|--contains|--points-at)\b"),
+    re.compile(r"^stash\s+(list|show)\b"),
+    re.compile(r"^notes\s+(list|show)\b"),
+)
 # `git` 前面不能紧跟标识符字符 —— 否则 `e2e_git . tag -d` 自己会被算成裸调用。
 RAW_GIT = re.compile(r"(?<![\w.-])git\s+(?:-C\s+\S+\s+)?(?:-c\s+\S+\s+)*(?=[a-z])")
 # 出现在 grep 模式 / 断言标题里的 "git …" 是**字符串**, 不是调用。
