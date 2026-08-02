@@ -162,6 +162,67 @@ def main():
         skip("错域名证书签发失败: %s" % err)
 
     print()
+    print("── 3b. 采集器的分支判定(不是只测 _cert_not_after) ──")
+    # 上一节验的是"能不能读出到期时间"; 这一节验**采集器据此给了什么 code** ——
+    # 少了这一节, 把 _l5_tls 里的过期/临期分支整个删掉, 上一节照样全绿。
+    import types
+    _orig_cert_path = checks._cert_path
+    _orig_dot_file = checks._dot_file
+    for name, days, want in (("正常", 365, set()),
+                             ("临期", 7, {"L5_CERT_EXPIRING"}),
+                             ("已过期", -5, {"L5_CERT_EXPIRED"})):
+        sub = tempfile.mkdtemp(prefix="b.", dir=d)
+        crt = (gen_cert(sub, "dot.example", days)[0] if days >= 0
+               else gen_expired_cert(sub, "dot.example")[0])
+        if not crt:
+            skip("%s 证书没造出来, 分支判定未验" % name); continue
+        checks._cert_path = lambda _c=crt: _c
+        checks._dot_file = lambda: "dot.example"
+        try:
+            codes = {f["code"] for f in L._l5_tls({"platform": "android"})}
+        finally:
+            checks._cert_path, checks._dot_file = _orig_cert_path, _orig_dot_file
+        got = codes & {"L5_CERT_EXPIRING", "L5_CERT_EXPIRED"}
+        (ok if got == want else bad)(
+            "%s 证书 → 采集器给出 %s(期望 %s)" % (name, sorted(got) or "无", sorted(want) or "无"))
+    # 主机名不匹配也要由采集器判出来
+    sub = tempfile.mkdtemp(prefix="b2.", dir=d)
+    crt = gen_cert(sub, "wrong.example", 365)[0]
+    if crt:
+        checks._cert_path = lambda _c=crt: _c
+        checks._dot_file = lambda: "dot.example"
+        try:
+            codes = {f["code"] for f in L._l5_tls({"platform": "android"})}
+        finally:
+            checks._cert_path, checks._dot_file = _orig_cert_path, _orig_dot_file
+        (ok if "L5_CERT_CN_MISMATCH" in codes else bad)(
+            "CN 不符 → 采集器给出 L5_CERT_CN_MISMATCH(实得 %s)" % sorted(codes))
+
+    print()
+    print("── 3c. nft 那层必须真读内核, 不能只读磁盘 ──")
+    # 把"读内核"这一步换成读不到, 采集器就该判 L8_NFT_DRIFT。若它只读磁盘, 这里会照常 PASS。
+    _orig_run = checks._run
+    def _fake_run(cmd, t=10):
+        if cmd[:2] == ["nft", "list"] and "table" in cmd:
+            return 1, "", "no kernel table"
+        return _orig_run(cmd, t)
+    checks._run = _fake_run
+    try:
+        codes = {f["code"] for f in L._l8_services({"platform": "android"})}
+    finally:
+        checks._run = _orig_run
+    (ok if "L8_NFT_DRIFT" in codes else bad)(
+        "内核里读不到 inet pdg → L8_NFT_DRIFT(实得 %s)" % sorted(codes))
+
+    print()
+    print("── 3d. 模块进了单一真源, 两平台都装 ──")
+    mods = (ROOT / "lib/modules.sh").read_text(encoding="utf-8")
+    rt = mods.split("PDG_RUNTIME_MODULES=")[1].split("PDG_IOS_MODULES=")[0] \
+        if "PDG_RUNTIME_MODULES=" in mods else ""
+    (ok if "linkstat.py" in rt else bad)(
+        "linkstat.py 在 PDG_RUNTIME_MODULES 里(install/update/uninstall 同一份清单)")
+
+    print()
     print("── 4. 输出里没有私钥与敏感哨兵 ──")
     SENT = "123456789:AAHlinkSENTINELtoken0000000000000000"
     findings = L.collect(platform="android")
@@ -220,10 +281,17 @@ def main():
     except Exception as e:  # noqa: BLE001
         skip("装载 pdgtx 失败(%s), 锁有效性未证" % type(e).__name__)
     (ok if blocked else bad)("前提成立: 这把锁被占用时, 走事务的写路径会 TxBusy")
+    # 用子进程 + 超时跑: 万一它真去抢锁, 会**快速判红**而不是把整个测试挂死等到超时。
     t0 = time.time()
-    fs2 = L.collect(platform="android")
+    probe = subprocess.run(
+        [sys.executable, "-c",
+         "import sys; sys.path.insert(0, %r); import linkstat as L; "
+         "print(len(L.collect(platform='android')))" % str(ROOT / "deploy/bot")],
+        capture_output=True, text=True, timeout=60,
+        env=dict(os.environ, PDG_LOCKFILE=lockp))
     dt = time.time() - t0
-    (ok if fs2 else bad)("同样条件下 collect() 照常完成 —— 它不去抢这把锁")
+    (ok if probe.returncode == 0 and probe.stdout.strip().isdigit() else bad)(
+        "同样条件下 collect() 照常完成 —— 它不去抢这把锁(rc=%d)" % probe.returncode)
     try:
         fcntl.flock(held, fcntl.LOCK_UN); held.close()
     except OSError:
