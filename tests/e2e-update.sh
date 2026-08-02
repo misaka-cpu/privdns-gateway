@@ -59,20 +59,20 @@ ORIGIN=/tmp/e2e-origin.git
 rm -rf "$REPO/.git" "$ORIGIN"            # e2e_seed_install 拷进来的是开发机/CI 的 .git, 弃用
 git -C "$REPO" init -q -b main
 e2e_guard_repo "$REPO" || exit 1     # 刚 init 出来的一次性库才准动 ref
-git -C "$REPO" config user.email t@t; git -C "$REPO" config user.name t
-git -C "$REPO" config commit.gpgsign false
-git -C "$REPO" add -A >/dev/null 2>&1
-git -C "$REPO" commit -qm base >/dev/null 2>&1
-git -C "$REPO" tag v9.9.8
+e2e_git "$REPO" config user.email t@t; e2e_git "$REPO" config user.name t
+e2e_git "$REPO" config commit.gpgsign false
+e2e_git "$REPO" add -A >/dev/null 2>&1
+e2e_git "$REPO" commit -qm base >/dev/null 2>&1
+e2e_git "$REPO" tag v9.9.8
 # 新版本: 往 bot 模块里塞个可辨识标记, 用来验证"文件真的被换成了新版"
 echo "# NEWVERSION-MARKER" >> "$REPO/deploy/bot/checks.py"
-git -C "$REPO" add -A >/dev/null 2>&1
-git -C "$REPO" commit -qm newver >/dev/null 2>&1
-git -C "$REPO" tag v9.9.9
+e2e_git "$REPO" add -A >/dev/null 2>&1
+e2e_git "$REPO" commit -qm newver >/dev/null 2>&1
+e2e_git "$REPO" tag v9.9.9
 git clone -q --bare "$REPO" "$ORIGIN"
-git -C "$REPO" remote add origin "$ORIGIN"
-git -C "$REPO" tag -d v9.9.9 >/dev/null  # 本地先没有新 tag → 逼 update 真去 origin 取
-git -C "$REPO" checkout -q v9.9.8
+e2e_git "$REPO" remote add origin "$ORIGIN"
+e2e_git "$REPO" tag -d v9.9.9 >/dev/null  # 本地先没有新 tag → 逼 update 真去 origin 取
+e2e_git "$REPO" checkout -q v9.9.8
 { [[ "$(git -C "$REPO" describe --tags)" == v9.9.8 ]] && [[ -z "$(git -C "$REPO" tag -l v9.9.9)" ]]; } \
   && ok "发布源就位: 工作仓库停在 v9.9.8, 新 tag v9.9.9 只在 origin 上(要靠 fetch 才拿得到)" \
   || bad "发布源没造对: $(git -C "$REPO" describe --tags), tags=$(git -C "$REPO" tag -l)"
@@ -100,7 +100,7 @@ grep -q '出口/分流/证书/DoT 不动' <<<"$out" \
 
 # ── 2. doctor 判失败 → 必须回滚且不显示成功 ═════════════════════════════════
 echo; echo "── 2. doctor 报 fail → 回滚 ──"
-git -C "$REPO" checkout -q v9.9.8                     # 退回旧版, 好再更新一次
+e2e_git "$REPO" checkout -q v9.9.8                     # 退回旧版, 好再更新一次
 rm -rf /opt/pdg-bot; mkdir -p /opt/pdg-bot
 for f in "$E2E_ROOT"/deploy/bot/*.py; do install -m755 "$f" /opt/pdg-bot/; done
 install -m755 "$E2E_ROOT/deploy/bot/pdg-bot.py" /opt/pdg-bot/bot.py
@@ -154,8 +154,8 @@ while read -r src name _mode; do
 done < <(pdg_platform_modules "$PLAT")
 [[ "$_stale" -gt 0 ]] && ok "写入旧版哨兵: $_stale 项" || bad "一个静态文件都没找到, 前提不成立"
 
-git -C "$REPO" tag -d v9.9.9 >/dev/null 2>&1 || true
-git -C "$REPO" checkout -q v9.9.8 2>/dev/null || true
+e2e_git "$REPO" tag -d v9.9.9 >/dev/null 2>&1 || true
+e2e_git "$REPO" checkout -q v9.9.8 2>/dev/null || true
 out=$(bash /usr/local/bin/pdg update 2>&1); rc=$?
 _diff=0; _missing=0
 while read -r src name _mode; do
@@ -185,8 +185,8 @@ _B=$(sha256sum /etc/privdns-gateway/bot.env | cut -d' ' -f1)
 _R=$(sha256sum /opt/pdg-bot/rulesets.json | cut -d' ' -f1)
 _D=$(sha256sum /opt/pdg-bot/dot-domain | cut -d' ' -f1)
 _P=$(sha256sum /etc/privdns-gateway/platform | cut -d' ' -f1)
-git -C "$REPO" tag -d v9.9.9 >/dev/null 2>&1 || true
-git -C "$REPO" checkout -q v9.9.8 2>/dev/null || true
+e2e_git "$REPO" tag -d v9.9.9 >/dev/null 2>&1 || true
+e2e_git "$REPO" checkout -q v9.9.8 2>/dev/null || true
 bash /usr/local/bin/pdg update >/dev/null 2>&1
 { [[ "$(sha256sum /etc/privdns-gateway/bot.env | cut -d' ' -f1)" == "$_B" ]] \
   && [[ "$(sha256sum /opt/pdg-bot/rulesets.json | cut -d' ' -f1)" == "$_R" ]] \
@@ -221,10 +221,12 @@ fi
 echo; echo "── 未发布分支边界 ──"
 _snap="$(find /opt/pdg-bot -type f -exec sha256sum {} + 2>/dev/null | sort | sha256sum)"
 _cfg="$(sha256sum /etc/mosdns/config.yaml | cut -d' ' -f1)"
-git -C "$REPO" tag -l 'v*' | xargs -r git -C "$REPO" tag -d >/dev/null 2>&1
+# xargs 起的是子进程, 调不到 e2e_git 这个 shell 函数 —— 用数组接住再一次删完。
+mapfile -t _vt < <(git -C "$REPO" tag -l 'v*')
+[[ ${#_vt[@]} -gt 0 ]] && { e2e_git "$REPO" tag -d "${_vt[@]}" >/dev/null 2>&1 || exit 1; }
 ( cd "$ORIGIN" || { echo "[FAIL] ORIGIN 不存在"; exit 1; }
-  e2e_guard_repo . || exit 1
-  git tag -l 'v*' | xargs -r git tag -d >/dev/null 2>&1 ) || true
+  mapfile -t _vo < <(git tag -l 'v*')
+  [[ ${#_vo[@]} -gt 0 ]] && { e2e_git . tag -d "${_vo[@]}" >/dev/null 2>&1 || exit 1; } ) || true
 out=$(bash /usr/local/bin/pdg update 2>&1); rc=$?
 { [[ "$rc" != 0 ]] && grep -qE '没有发布 tag|没有任何发布 tag|无法确定目标版本' <<<"$out"; } \
   && ok "没有任何发布 tag → 明确失败, 不猜一个 commit 装上去" \
@@ -270,16 +272,16 @@ _pre_mos=$(sha256sum /etc/mosdns/config.yaml | cut -d' ' -f1)
   || bad "前提没设上: $_norm=$_pre_norm_mode $_exe=$_pre_exe_mode"
 
 # 造一个只坏了 report.py 的新 release
-git -C "$REPO" tag -d v9.9.9 >/dev/null 2>&1 || true
-git -C "$REPO" checkout -q v9.9.8 2>/dev/null || true
+e2e_git "$REPO" tag -d v9.9.9 >/dev/null 2>&1 || true
+e2e_git "$REPO" checkout -q v9.9.8 2>/dev/null || true
 ( cd "$REPO" || { echo "[FAIL] REPO 不存在"; exit 1; }
   printf 'def broken(:\n    pass\n' > deploy/bot/report.py
-  git add -A >/dev/null 2>&1
-  git -c user.email=t@t -c user.name=t commit -qm "bad release" >/dev/null 2>&1
-  git tag -f v9.9.10 >/dev/null 2>&1
-  git push -q -f origin HEAD:refs/heads/main --tags >/dev/null 2>&1 ) || true
-git -C "$REPO" reset -q --hard v9.9.8 2>/dev/null || true
-git -C "$REPO" tag -d v9.9.10 >/dev/null 2>&1 || true
+  e2e_git . add -A >/dev/null 2>&1
+  e2e_git . -c user.email=t@t -c user.name=t commit -qm "bad release" >/dev/null 2>&1
+  e2e_git . tag -f v9.9.10 >/dev/null 2>&1
+  e2e_git . push -q -f origin HEAD:refs/heads/main --tags >/dev/null 2>&1 ) || true
+e2e_git "$REPO" reset -q --hard v9.9.8 2>/dev/null || true
+e2e_git "$REPO" tag -d v9.9.10 >/dev/null 2>&1 || true
 
 # HEAD 必须在**跑 update 的那一刻**取。第一版在夹具把仓库挪到 v9.9.8 之前就取了,
 # 于是回滚回到 v9.9.8 反而被判成"没恢复" —— 是取样点错了, 不是产品错。

@@ -184,16 +184,15 @@ git init -q --bare /tmp/e2e-cli-origin.git
   # 2026-07-31 丢掉全部 tag 与 remote-tracking 就是从下面这几条开始的。
   # 守卫放在 init 之后: init 之前这里可能还不是仓库(会假拒); 而 `git init` 落在 worktree
   # 上并不会把它从共享 ref 库里摘出来 —— 那种情况守卫照样拦得住。
-  git init -q -b main 2>/dev/null
-  e2e_guard_repo . || exit 1
-  git config user.email t@t; git config user.name t
-  git config commit.gpgsign false
-  git add -A >/dev/null 2>&1; git commit -qm base >/dev/null 2>&1
-  git remote remove origin >/dev/null 2>&1
-  git remote add origin /tmp/e2e-cli-origin.git
-  git push -q origin HEAD:refs/heads/main >/dev/null 2>&1
-  git tag -f v9.9.9 >/dev/null 2>&1
-  git push -q origin --tags >/dev/null 2>&1 ) || true
+  git init -q -b main 2>/dev/null            # e2e_git 豁免: 还不是仓库时守卫会假拒
+  e2e_git . config user.email t@t || exit 1; e2e_git . config user.name t || exit 1
+  e2e_git . config commit.gpgsign false || exit 1
+  e2e_git . add -A >/dev/null 2>&1; e2e_git . commit -qm base >/dev/null 2>&1
+  e2e_git . remote remove origin >/dev/null 2>&1
+  e2e_git . remote add origin /tmp/e2e-cli-origin.git || exit 1
+  e2e_git . push -q origin HEAD:refs/heads/main >/dev/null 2>&1
+  e2e_git . tag -f v9.9.9 >/dev/null 2>&1
+  e2e_git . push -q origin --tags >/dev/null 2>&1 ) || true
 BEFORE="$(hash_state)"
 out=$(pdg update --dry-run 2>&1); rc=$?
 [[ "$rc" == 0 ]] && ok "dry-run 正常返回 0" || bad "6: rc=$rc: $(tail -3 <<<"$out")"
@@ -202,8 +201,10 @@ out=$(pdg update --dry-run 2>&1); rc=$?
 grep -qE '当前:.*最新发布:' <<<"$out" && ok "dry-run 报出当前/最新版本" || bad "6c: $(tail -3 <<<"$out")"
 
 # 远端拉不到 tag(remote 不可用)→ 必须返回非 0 并说明, 而不是"最新发布: (无 tag)" + 0
-git -C /opt/privdns-gateway remote remove origin >/dev/null 2>&1
-git -C /opt/privdns-gateway remote add origin /nonexistent/repo.git >/dev/null 2>&1
+# 改 remote 就是改 config, 而 config 与主仓库共享 —— 这两行以前一条守卫都没有, 是 2026-08-02
+# 把开发者 origin 改指到 /tmp 裸库的入口。走 e2e_git 之后守卫与动作绑成一件事, 漏不掉。
+e2e_git /opt/privdns-gateway remote remove origin >/dev/null 2>&1
+e2e_git /opt/privdns-gateway remote add origin /nonexistent/repo.git >/dev/null 2>&1 || exit 1
 BEFORE="$(hash_state)"
 out=$(pdg update --dry-run 2>&1); rc=$?
 { [[ "$rc" != 0 ]] && grep -qE '拉取远端 tag 失败|无法判断' <<<"$out"; } \
@@ -213,14 +214,14 @@ out=$(pdg update --dry-run 2>&1); rc=$?
 # 远端能拉但一个发布 tag 都没有 → 同样要明说, 不能装作"已是最新"
 rm -rf /tmp/e2e-empty-origin.git
 git init -q --bare /tmp/e2e-empty-origin.git
-# `&&` 只挡得住紧跟着的第一条 —— 后面两行照样在当时的工作目录执行, 与打坏真仓库的那个
-# 形态一模一样。整块统一用 `cd … || exit`。
-( cd /opt/privdns-gateway || { echo "[FAIL] /opt/privdns-gateway 不存在, 拒绝在当前目录执行 git 操作"; exit 1; }
-  git remote remove origin >/dev/null 2>&1
-  git remote add origin /tmp/e2e-empty-origin.git
-  git push -q origin HEAD:refs/heads/main >/dev/null 2>&1 ) || true
-e2e_guard_repo /opt/privdns-gateway || exit 1
-git -C /opt/privdns-gateway tag -l 'v*' | xargs -r git -C /opt/privdns-gateway tag -d >/dev/null 2>&1
+# 以前这里是 `( cd /opt/privdns-gateway || exit; git remote add …; git push … )`, 守卫写在
+# 整块**之后** —— 先改后守, 守卫报不报警都已经晚了。改成每条动作自带守卫。
+e2e_git /opt/privdns-gateway remote remove origin >/dev/null 2>&1
+e2e_git /opt/privdns-gateway remote add origin /tmp/e2e-empty-origin.git || exit 1
+e2e_git /opt/privdns-gateway push -q origin HEAD:refs/heads/main >/dev/null 2>&1
+# xargs 调不了 shell 函数 —— 用数组接住再一次删完, 免得管道右边又变成一条裸 git 改动。
+mapfile -t _vtags < <(e2e_git /opt/privdns-gateway tag -l 'v*') || exit 1
+[[ ${#_vtags[@]} -gt 0 ]] && { e2e_git /opt/privdns-gateway tag -d "${_vtags[@]}" >/dev/null 2>&1 || exit 1; }
 BEFORE="$(hash_state)"
 out=$(pdg update --dry-run 2>&1); rc=$?
 { [[ "$rc" != 0 ]] && grep -q 'tag' <<<"$out"; } \
@@ -232,7 +233,7 @@ out=$(pdg update --dry-run 2>&1); rc=$?
 { [[ "$rc" != 0 ]] && grep -qE 'git 仓库|无法查看' <<<"$out"; } \
   && ok "仓库不可用 → 返回非 0 并说明" || bad "6h: rc=$rc: $(tail -3 <<<"$out")"
 mv /opt/privdns-gateway/.git-hidden /opt/privdns-gateway/.git
-git -C /opt/privdns-gateway tag -f v9.9.9 >/dev/null 2>&1
+e2e_git /opt/privdns-gateway tag -f v9.9.9 >/dev/null 2>&1 || exit 1
 rm -rf /tmp/e2e-empty-origin.git /tmp/e2e-cli-origin.git
 
 # ══ 7. detect-cidr 事务化 ══════════════════════════════════════════════════

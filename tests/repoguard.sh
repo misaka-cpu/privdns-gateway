@@ -64,3 +64,19 @@ e2e_guard_repo(){
   echo "[FAIL] 拒绝对 $dir 执行会改动 ref/config 的 git 操作: $why" >&2
   return 1
 }
+
+# 守卫 + 执行, 一次调用。用法: e2e_git <仓库目录> <git 子命令…>
+#
+# 为什么要有这个而不是"记得在前面调一次 e2e_guard_repo": 守卫写对了不等于守卫跑到了。
+# 2026-08-02 origin 被改指到 /tmp/e2e-empty-origin.git, 不是判据不够 —— 是 e2e-cli-ops
+# 里那两行 `git -C … remote add origin` **前面一条守卫都没有**, 而同一个文件里另一处把
+# 守卫写在了三行改动**之后**(先改后守, 守了也白守)。这种"漏调用/调用晚了"靠读代码发现不了,
+# 只能让守卫和动作绑成一件事: 走这个函数就不存在"忘了守"的形态。
+#
+# 只做 ref/config 会被改的那些操作; 只读查询(rev-parse/log/status…)不必绕这里, 绕了反而
+# 会在"目标故意不是仓库"的用例里假失败。
+e2e_git(){
+  local dir="${1:-.}"; shift
+  e2e_guard_repo "$dir" || return 1
+  git -C "$dir" "$@"
+}

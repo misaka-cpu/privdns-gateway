@@ -73,25 +73,25 @@ ORIGIN=/tmp/e2e-xver-origin.git
 rm -rf "$REPO/.git" "$ORIGIN"
 git -C "$REPO" init -q -b main
 e2e_guard_repo "$REPO" || exit 1     # 刚 init 出来的一次性库才准动 ref
-git -C "$REPO" config user.email t@t; git -C "$REPO" config user.name t
-git -C "$REPO" config commit.gpgsign false
+e2e_git "$REPO" config user.email t@t; e2e_git "$REPO" config user.name t
+e2e_git "$REPO" config commit.gpgsign false
 # 第一个提交 = v1.5.12 的全部代码(更新器就来自它)
 rm -rf "${REPO:?}"/* 2>/dev/null || true
 git -C "$E2E_ROOT" archive "$OLD_TAG" | tar -x -C "$REPO"
-git -C "$REPO" add -A >/dev/null 2>&1
-git -C "$REPO" commit -qm "$OLD_TAG" >/dev/null 2>&1
-git -C "$REPO" tag "$OLD_TAG"
+e2e_git "$REPO" add -A >/dev/null 2>&1
+e2e_git "$REPO" commit -qm "$OLD_TAG" >/dev/null 2>&1
+e2e_git "$REPO" tag "$OLD_TAG"
 OLD_SHA="$(git -C "$REPO" rev-parse HEAD)"
 # 第二个提交 = 当前工作树(被测代码)
 rm -rf "${REPO:?}"/* 2>/dev/null || true
 tar -C "$E2E_ROOT" --exclude=.git -cf - . | tar -x -C "$REPO"
-git -C "$REPO" add -A >/dev/null 2>&1
-git -C "$REPO" commit -qm "vNEXT(current)" >/dev/null 2>&1
-git -C "$REPO" tag v9.9.9
+e2e_git "$REPO" add -A >/dev/null 2>&1
+e2e_git "$REPO" commit -qm "vNEXT(current)" >/dev/null 2>&1
+e2e_git "$REPO" tag v9.9.9
 git clone -q --bare "$REPO" "$ORIGIN"
-git -C "$REPO" remote add origin "$ORIGIN"
-git -C "$REPO" tag -d v9.9.9 >/dev/null            # 逼更新器真去 origin 取新 tag
-git -C "$REPO" checkout -q "$OLD_TAG"
+e2e_git "$REPO" remote add origin "$ORIGIN"
+e2e_git "$REPO" tag -d v9.9.9 >/dev/null            # 逼更新器真去 origin 取新 tag
+e2e_git "$REPO" checkout -q "$OLD_TAG"
 # 装上**旧版**更新器 —— 这是本用例的关键: 跑的是 v1.5.12 的 cmd_update/cmd_rollback
 install -m755 "$REPO/deploy/bot/pdg.sh" /usr/local/bin/pdg
 for f in "$REPO"/deploy/bot/*.py; do install -m755 "$f" /opt/pdg-bot/; done

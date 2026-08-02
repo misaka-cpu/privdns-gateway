@@ -34,8 +34,8 @@ REPO="$WORK/repo"; mkdir -p "$REPO"
 # shellcheck source=tests/repoguard.sh
 source "$(dirname "${BASH_SOURCE[0]}")/repoguard.sh"
 ( cd "$REPO" && git init -q && E2E_ROOT="$ROOT" e2e_guard_repo . \
-  && git config user.email t@t && git config user.name t \
-  && echo v1 > f && git add f && git commit -qm c1 && echo v2 > f && git add f && git commit -qm c2 )
+  && e2e_git . config user.email t@t && e2e_git . config user.name t \
+  && echo v1 > f && e2e_git . add f && e2e_git . commit -qm c1 && echo v2 > f && e2e_git . add f && e2e_git . commit -qm c2 )
 GOOD_REF=$(git -C "$REPO" rev-parse HEAD~1)   # 第一提交
 HEAD_REF=$(git -C "$REPO" rev-parse HEAD)
 
@@ -81,7 +81,7 @@ rm -f "$WORK/applied_snapid"; out=$(run "0")
   && ok "无 --dir → 默认 index0 仍回滚到最近 B" || bad "A2: applied=$(cat "$WORK/applied_snapid" 2>/dev/null) out=$out"
 
 # ── B. --git 复位仓库 ────────────────────────────────────────────────────────
-git -C "$REPO" reset --hard -q "$HEAD_REF"
+e2e_git "$REPO" reset --hard -q "$HEAD_REF"
 out=$(run "--dir '$SNAP/A' --git '$GOOD_REF'")
 [[ "$(git -C "$REPO" rev-parse HEAD)" == "$GOOD_REF" ]] \
   && echo "$out" | grep -q '已回滚并重启服务' && ok "--git: REPO_DIR 复位到指定提交 + 报完全回滚" || bad "B: HEAD=$(git -C "$REPO" rev-parse HEAD) out=$out"

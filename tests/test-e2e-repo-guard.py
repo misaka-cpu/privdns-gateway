@@ -174,21 +174,86 @@ else:
             % (", ".join(diff), {k: before[k] for k in diff}, {k: after[k] for k in diff}))
 
 print()
-print("══ 三、每个会动 ref 的脚本都必须过这道门 ══")
-DANGEROUS = re.compile(r"git\s+(?:-C\s+\S+\s+)?(?:tag\s+-[df]|tag\s+--delete|remote\s+remove|"
-                       r"remote\s+add|commit\b|update-ref\s+-d|push\b)")
-missing = []
-for fn in sorted(os.listdir(HERE)):
-    if not fn.endswith(".sh") or fn == "e2e-lib.sh":
-        continue
-    txt = open(os.path.join(HERE, fn), encoding="utf-8").read()
-    code = "\n".join(l for l in txt.split("\n") if not l.lstrip().startswith("#"))
-    if DANGEROUS.search(code) and "e2e_guard_repo" not in code:
-        missing.append(fn)
-if not missing:
-    ok("所有会动 ref 的 e2e 脚本都调了 e2e_guard_repo")
+print("══ 三、e2e_git: 守卫与动作绑成一件事 ══")
+# 守卫写对了不等于守卫跑到了。e2e_git 把两者合成一次调用, 于是"忘了守""守晚了"这两种形态
+# 在语法上就不存在。这里验它确实先守后跑, 且拒绝时**一条 git 都没执行**。
+_wt2 = tempfile.mkdtemp(prefix="repoguard-e2egit-")
+TMPS.append(_wt2)
+_wtdir2 = os.path.join(_wt2, "w")
+_made2 = subprocess.run(["git", "-C", ROOT, "worktree", "add", "-q", "--detach", _wtdir2, "HEAD"],
+                        capture_output=True, text=True, timeout=180)
+if _made2.returncode != 0:
+    bad("造不出 worktree, e2e_git 的判据没验到: %s" % _made2.stderr[-160:])
 else:
-    bad("这些脚本会动 ref 却没过守卫: %s" % ", ".join(missing))
+    _before_remote = git(["config", "--get", "remote.origin.url"], ROOT, check=False)
+    rc, out = sh('source "%s"\nE2E_ROOT=%r\ne2e_git %r remote add e2eprobe /tmp/nope.git\n'
+                 % (LIB, ROOT, _wtdir2))
+    _after_remote = git(["config", "--get", "remote.origin.url"], ROOT, check=False)
+    _probe = git(["config", "--get", "remote.e2eprobe.url"], ROOT, check=False)
+    if rc != 0 and "ref 库" in out:
+        ok("e2e_git 打在 worktree 上 → 先被守卫拒掉(rc=%d)" % rc)
+    else:
+        bad("e2e_git 没拦住 worktree —— 守卫没跑在动作前面: rc=%d %s" % (rc, out.strip()[:150]))
+    if not _probe and _after_remote == _before_remote:
+        ok("被拒时上游仓库的 remote **一条都没写进去**(不是先写后报错)")
+    else:
+        bad("守卫拒了但 git 还是执行了: remote.e2eprobe.url=%r, origin %r→%r"
+            % (_probe, _before_remote, _after_remote))
+    # 正例: 一次性的独立仓库要放行, 否则守卫会把所有 e2e 卡死
+    _solo = os.path.join(_wt2, "solo")
+    os.makedirs(_solo, exist_ok=True)
+    git(["init", "-q"], _solo)
+    rc, out = sh('source "%s"\nE2E_ROOT=%r\ne2e_git %r remote add origin /tmp/x.git\n'
+                 % (LIB, ROOT, _solo))
+    if rc == 0 and git(["config", "--get", "remote.origin.url"], _solo, check=False) == "/tmp/x.git":
+        ok("e2e_git 对一次性独立仓库放行, 且动作真的执行了")
+    else:
+        bad("e2e_git 把正常仓库也拒了(守卫过紧, 会把 e2e 全卡死): rc=%d %s" % (rc, out.strip()[:150]))
+    subprocess.run(["git", "-C", ROOT, "worktree", "remove", "--force", _wtdir2],
+                   capture_output=True, timeout=180)
+
+print()
+print("══ 四、每一处会动 ref/config 的 git 调用都必须自带守卫 ══")
+# 这一节以前是**文件级**判据: 文件里出现危险 git 调用、且文件里任何地方出现过 e2e_guard_repo
+# 就算过。e2e-cli-ops.sh 恰好两个条件都满足 —— 而它有两条 `git -C … remote add origin` 前面
+# 一条守卫都没有, 另一处更是把守卫写在三行改动**之后**(先改后守, 守了也白守)。2026-08-02
+# 开发者仓库的 origin 被改指到 /tmp 裸库, 就是从那里出去的。判据本身没错, 错在它只数文件、
+# 不看调用点 —— 于是"这个文件里有守卫"被当成了"这一行被守住了"。
+#
+# 现在按**每一次调用**判: 会写 ref/config/index 的 git 一律要写成 e2e_git。只读查询
+# (rev-parse/describe/tag -l/archive…)不受限 —— 逼它们绕守卫只会让"目标故意不是仓库"的
+# 用例假失败。`git init`/`git clone` 也不受限: 仓库还不存在时守卫必然假拒。
+MUT = {"config", "add", "commit", "tag", "remote", "push", "checkout", "reset", "branch",
+       "update-ref", "fetch", "switch", "restore", "stash", "am", "rebase", "merge",
+       "cherry-pick", "revert", "gc", "prune", "replace", "notes", "worktree"}
+READONLY_FORM = (re.compile(r"^tag\s+-l\b"), re.compile(r"^remote\s+(-v|show)\b"),
+                 re.compile(r"^config\s+--get\b"), re.compile(r"^branch\s+(-l|--list)\b"))
+# `git` 前面不能紧跟标识符字符 —— 否则 `e2e_git . tag -d` 自己会被算成裸调用。
+RAW_GIT = re.compile(r"(?<![\w.-])git\s+(?:-C\s+\S+\s+)?(?:-c\s+\S+\s+)*(?=[a-z])")
+# 出现在 grep 模式 / 断言标题里的 "git …" 是**字符串**, 不是调用。
+QUOTED = re.compile(r"\b(grep|rg|assert_\w+|echo|printf)\b")
+offenders = []
+for fn in sorted(os.listdir(HERE)):
+    if not fn.endswith(".sh") or fn == "repoguard.sh":   # repoguard.sh 自己就是守卫的实现
+        continue
+    for lineno, line in enumerate(open(os.path.join(HERE, fn), encoding="utf-8"), 1):
+        if line.lstrip().startswith("#"):
+            continue
+        code = line.split("#")[0]
+        for m in RAW_GIT.finditer(code):
+            rest = code[m.end():]
+            sub = (rest.split() or [""])[0]
+            if sub not in MUT or any(p.match(rest) for p in READONLY_FORM):
+                continue
+            if QUOTED.search(code[:m.start()]):
+                continue
+            offenders.append("%s:%d  %s" % (fn, lineno, line.strip()[:76]))
+if not offenders:
+    ok("tests/ 下每一处会动 ref/config 的 git 调用都走 e2e_git(逐调用点核对, 不是逐文件)")
+else:
+    bad("这些调用点会动 ref/config 却没走 e2e_git —— 守卫漏掉它们就是事故那天的形态:\n       "
+        + "\n       ".join(offenders[:12])
+        + ("\n       …共 %d 处" % len(offenders) if len(offenders) > 12 else ""))
 
 print("─" * 40)
 print("通过 %d, 失败 %d" % (PASS[0], FAIL[0]))
