@@ -902,6 +902,8 @@ cmd_snapshot(){
   # 只打包"存在的"路径 —— 历史错路径可能已被迁移清掉, 无条件列进去会让 tar 报 Cannot stat 并返 2。
   # var/lib/.../ios-profile 是唯一进快照的 /var/lib 成员: iOS 描述文件产物。它不是缓存 ——
   # previous 那一版用的根证书只在产物里有正文(元数据里只有指纹), 不打包就永远回不来了。
+  # 清单里的 etc/sing-box 与 usr/local/bin/sing-box 是**跨版本回滚要用到**的: 少了它们,
+  # 把旧机器恢复到更早版本就会缺内核。v2.0 清理前提见 docs/ROADMAP.md。
   local cand=(etc/mosdns etc/sing-box etc/mihomo opt/pdg-bot etc/privdns-gateway etc/nftables.conf
               var/lib/privdns-gateway/ios-profile
               etc/systemd/system/pdg-bot.service etc/systemd/journald.conf.d/50-pdg.conf
@@ -2935,6 +2937,8 @@ SCPY
 # 走 __migrate 时自动执行。幂等: 已是纯 mihomo(无 sing-box 服务/二进制)直接返回 0。
 # 失败(unknown_proxies / 渲染 / 校验 / 起核)返回非 0 → run_all_migrations 传出 → cmd_update 回滚到
 # 更新前快照(用户仍留在旧 sing-box 版, 数据无损), 而不是把机器留在半迁移态。
+# v2.0 清理候选(见 docs/ROADMAP.md): 仍有从 v1.5.x 及更早直接升上来的机器, 删掉这段迁移
+# 会让那些机器升级后同时躺着两个内核。
 migrate_drop_singbox(){
   local cur; cur="$(cat /etc/privdns-gateway/backend 2>/dev/null)"
   if [[ "$cur" == mihomo ]] && [[ ! -e /etc/systemd/system/sing-box.service ]] && [[ ! -e /usr/local/bin/sing-box ]]; then

@@ -117,6 +117,33 @@ if not notroot:
 else:
     bad("这些测试需要 root 却没有 root: %s" % "、".join(notroot))
 
+print()
+print("== 5. 静态守卫不许顶替真实行为测试 ==")
+# tests/test-release-flow.sh 只核对源码里的标识符, 不跑任何流程。它一度在 CI 里挂着
+# "发布链路回归"的名字, 于是"发布链路有覆盖"这句话名不副实 —— 只要标识符还在, 链路真坏了
+# 也照绿。名字已经改成"静态守卫", 但光改名挡不住下一次: 有人把下面两支真实 E2E 从
+# workflow 里摘掉(嫌慢), 静态守卫仍然绿, 覆盖就又空了。所以这条盯的是**它们还在不在**。
+BEHAVIOURAL = ("e2e-update.sh", "e2e-upgrade-from-release.sh")
+missing = [t for t in BEHAVIOURAL if t not in ci]
+if not missing:
+    ok("发布链路的两支真实行为 E2E 都还接在 workflow 里(%s)" % "、".join(BEHAVIOURAL))
+else:
+    bad("真实行为 E2E 从 workflow 里消失了: %s —— 只剩静态守卫的话, "
+        "「发布链路有覆盖」就是假的" % "、".join(missing))
+_rf_path = os.path.join(HERE, "test-release-flow.sh")     # HERE 是 str, 不是 Path
+_rf = open(_rf_path, encoding="utf-8").read() if os.path.exists(_rf_path) else ""
+if not _rf:
+    bad("找不到 test-release-flow.sh, 无法核对它的自我描述")
+elif "静态守卫" in _rf and "不是端到端" in _rf:
+    ok("静态守卫自己写明了「不是端到端」, 并指向真实行为测试")
+else:
+    bad("test-release-flow.sh 没把自己说清楚(必须写明它是静态守卫、不是端到端)")
+for _name in ("发布链路静态守卫", "e2e-update"):
+    if _name in ci:
+        ok("CI step 名称如实: 含「%s」" % _name)
+    else:
+        bad("CI step 名称里找不到「%s」—— 别把 grep 测试描述成端到端验证" % _name)
+
 total = PASS[0] + FAIL[0]
 print("\n断言 %d 项: 通过 %d, 失败 %d" % (total, PASS[0], FAIL[0]))
 if total == 0:

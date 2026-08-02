@@ -147,7 +147,9 @@ jobs:
       - name: "内核版本精确匹配 (v1.19.1 不得匹配 v1.19.10; 读不到版本不跳过安装)"
         run: bash tests/test-version-match.sh
 
-      - name: "发布链路回归 (tag-only 安装/更新 + 文档版本)"
+      # 这是**静态守卫**(只核对源码里的标识符), 不是端到端。真实行为覆盖在
+      # e2e-update.sh 与 e2e-upgrade-from-release.sh —— 名字必须说实话。
+      - name: "发布链路静态守卫 (源码标识符核对; 真实行为见 e2e-update / e2e-upgrade-from-release)"
         run: bash tests/test-release-flow.sh
 
       - name: "更新快照+精确回滚回归 (--dir 精确目标/--git 复位/部分失败不谎报/快照覆盖脚本)"
