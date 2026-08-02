@@ -821,10 +821,81 @@ SNAP_DIR="/var/lib/privdns-gateway/backups"
 
 # 供 cmd_update 读取"本次刚创建的快照目录"(精确回滚目标, 不靠 index 0 猜)。
 _PDG_SNAP_CREATED=""
+# ── 快照来源元数据 ───────────────────────────────────────────────────────────
+# 光有时间戳目录名回答不了"这份快照是谁拍的": 手动拍的、更新前自动拍的、平台切换前拍的、
+# 显式迁移前拍的、救援完整恢复前拍的 —— 出事时想回到"那次操作之前"却分不出是哪一次。
+#
+# 只写固定枚举 + 版本信息。不写 token / 证书正文 / 私钥 / 配置正文 / URL / 命令参数 ——
+# 快照目录是 0700, 但这份元数据将来会被列出来给人看, 值必须是**闭集**里的东西。
+_SNAP_SOURCES=" cli rescue bot scheduler "
+_SNAP_OPS=" snapshot update platform migrate pre-full-restore "
+_SNAP_META_SCHEMA=1
+
+# 写元数据。临时文件 + 原子替换; 失败返回非 0(调用方据此把整份快照作废)。
+_snap_meta_write(){
+  local d="$1" id="$2" src="$3" op="$4" tmp commit desc
+  [[ "$_SNAP_SOURCES" == *" $src "* ]] || { echo "内部错误: 未知快照来源 $src" >&2; return 1; }
+  [[ "$_SNAP_OPS"     == *" $op "*  ]] || { echo "内部错误: 未知快照操作 $op"  >&2; return 1; }
+  commit="$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null)"
+  desc="$(git -C "$REPO_DIR" describe --tags 2>/dev/null)"
+  # 只留标签/哈希会用到的字符: 仓库里理论上不会有别的, 但这份文件要展示给人看, 不放行任意串。
+  commit="$(printf '%s' "${commit:-unknown}" | tr -cd 'A-Za-z0-9._-' | cut -c1-64)"
+  desc="$(printf '%s' "${desc:-unknown}"     | tr -cd 'A-Za-z0-9._-' | cut -c1-64)"
+  tmp="$(mktemp "$d/.snapshot.json.XXXXXX" 2>/dev/null)" || return 1
+  {
+    printf '{\n'
+    printf '  "schema_version": %s,\n' "$_SNAP_META_SCHEMA"
+    printf '  "snapshot_id": "%s",\n'  "$id"
+    printf '  "created_at": "%s",\n'   "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf '  "source": "%s",\n'       "$src"
+    printf '  "op": "%s",\n'           "$op"
+    printf '  "git_commit": "%s",\n'   "${commit:-unknown}"
+    printf '  "git_describe": "%s"\n'  "${desc:-unknown}"
+    printf '}\n'
+  } > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+  chmod 600 "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$d/snapshot.json" 2>/dev/null || { rm -f "$tmp"; return 1; }
+}
+
+# 读来源, 供列表展示。老快照没有这个文件 —— 那是**正常的跨版本形态**, 显示"未知"而不是报错。
+# 元数据坏了也只当未知: 绝不 eval / source 它, 也不因为它坏了就挡住回滚。
+_snap_meta_label(){
+  local d="$1" j="$1/snapshot.json"
+  [[ -f "$j" ]] || { echo "来源未知(旧快照)"; return 0; }
+  python3 - "$j" 2>/dev/null <<'PY' || echo "来源未知(元数据无法解析)"
+import json, re, sys
+try:
+    m = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    raise SystemExit(1)
+ok = re.compile(r"^[A-Za-z0-9._:+-]{0,64}$")
+src, op = str(m.get("source", "")), str(m.get("op", ""))
+ver = str(m.get("git_describe", ""))
+if not (ok.match(src) and ok.match(op) and ok.match(ver)) or not src or not op:
+    raise SystemExit(1)
+print("%s/%s  %s" % (src, op, ver or "-"))
+PY
+}
+
 cmd_snapshot(){
   need_root snapshot; _lock
   _PDG_SNAP_CREATED=""
+  local src=cli op=snapshot
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --source) src="${2:-}"; shift 2 || { echo "--source 缺参数"; return 1; };;
+      --op)     op="${2:-}";  shift 2 || { echo "--op 缺参数"; return 1; };;
+      *) shift;;                      # 旧调用方可能带别的参数, 忽略即可(向后兼容)
+    esac
+  done
   local ts d; ts=$(date +%Y%m%d-%H%M%S); d="$SNAP_DIR/$ts"
+  # 目录名是秒级的, 同一秒内拍第二份会**撞名**。以前撞了就直接覆盖(悄悄弄丢前一份);
+  # 现在元数据写失败要 rm -rf 这个目录, 撞名就会把**别人那一份**删掉 —— 所以宁可等一秒
+  # 换个名字, 也不复用。ID 形态必须保持 %Y%m%d-%H%M%S: 救援侧 cfgrestore 按这个正则认。
+  if [[ -e "$d" ]]; then
+    sleep 1; ts=$(date +%Y%m%d-%H%M%S); d="$SNAP_DIR/$ts"
+    [[ -e "$d" ]] && { c_y "❌ 同名快照目录已存在($ts), 为避免覆盖已有快照, 本次未创建。"; return 1; }
+  fi
   install -d -m700 "$d"
   # 整机配置 + 防火墙 + bot.env(含 token)+ service + journald 封顶(含历史错路径)(相对 / 打包, 回滚 -C / 解开)
   # 含: 已安装脚本(pdg / pdg-set-token / cert hook)+ 全部 pdg unit —— 升级会改它们, 回滚要一并还原。
@@ -866,8 +937,13 @@ cmd_snapshot(){
     c_y "❌ 快照打包失败"; rm -f "$d/snap.tar.gz"; rmdir "$d" 2>/dev/null; return 1
   fi
   chmod 600 "$d/snap.tar.gz"
+  # 元数据写不成 → 整份作废。留下"有归档、没来源"的新格式快照比没有更糟: 列表会把它显示成
+  # 旧快照, 而它其实是本次刚拍的, 于是"这份到底是哪次操作之前的"永远说不清了。
+  if ! _snap_meta_write "$d" "$ts" "$src" "$op"; then
+    c_y "❌ 快照元数据写入失败 → 本次快照作废(未留下半份)"; rm -rf "$d"; return 1
+  fi
   _PDG_SNAP_CREATED="$d"
-  echo "✅ 快照: $d/snap.tar.gz"
+  echo "✅ 快照: $d/snap.tar.gz ($src/$op)"
   ls -1dt "$SNAP_DIR"/*/ 2>/dev/null | tail -n +11 | xargs -r rm -rf   # 只留最近 10 份
 }
 
@@ -891,7 +967,11 @@ cmd_rollback(){
   else
     local snaps; mapfile -t snaps < <(ls -1dt "$SNAP_DIR"/*/ 2>/dev/null)
     [[ ${#snaps[@]} -gt 0 ]] || { echo "没有快照(先 pdg snapshot)"; return 1; }
-    echo "可用快照(新→旧):"; local i=0; for s in "${snaps[@]}"; do echo "  [$i] $(basename "$s")"; i=$((i+1)); done
+    echo "可用快照(新→旧):"; local i=0
+    for s in "${snaps[@]}"; do
+      # 时间来自目录名(%Y%m%d-%H%M%S), 来源来自 snapshot.json; 老快照没有那个文件 → "来源未知"。
+      echo "  [$i] $(basename "$s")  $(_snap_meta_label "${s%/}")"; i=$((i+1))
+    done
     idx="${idx:-0}"
     [[ "$idx" =~ ^[0-9]+$ ]] || { echo "无效序号 $idx"; return 1; }
     idx=$((10#$idx))
@@ -1180,7 +1260,7 @@ cmd_update(){
   command -v git >/dev/null || { apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git; }
   _lock   # 取锁(嵌套的 cmd_snapshot 不会重复锁)
   c_g "更新前留快照…"
-  if ! cmd_snapshot >/dev/null 2>&1 || [[ -z "$_PDG_SNAP_CREATED" || ! -f "$_PDG_SNAP_CREATED/snap.tar.gz" ]]; then
+  if ! cmd_snapshot --source cli --op update >/dev/null 2>&1 || [[ -z "$_PDG_SNAP_CREATED" || ! -f "$_PDG_SNAP_CREATED/snap.tar.gz" ]]; then
     c_y "❌ 更新前快照失败, 中止更新(拒绝在无法回滚的前提下继续)。"; return 1
   fi
   local snap_dir="$_PDG_SNAP_CREATED"                                    # 精确回滚目标(不靠 index 0 猜)
@@ -1725,7 +1805,7 @@ menu(){
       1) cmd_status;;
       2) cmd_doctor;;
       3) cmd_update && exec /usr/local/bin/pdg menu;;
-      4) cmd_snapshot;;
+      4) cmd_snapshot --source cli --op snapshot;;
       5) read -rp "回滚到第几个快照(默认 0=最近, 回车确认): " i; cmd_rollback "${i:-0}";;
       6) cmd_token;;
       7) cmd_restart;;
@@ -3558,7 +3638,7 @@ cmd_platform(){
   _lock
   c_g "切换平台: $cur → $p"
   # 1) 先留快照。拿不到就别开始 —— 后面要改 nft、删/装 unit、重渲内核, 没有回退手段不能动手。
-  cmd_snapshot >/dev/null 2>&1 || { echo "❌ 快照失败 → 中止切换(未改动任何东西)"; return 1; }
+  cmd_snapshot --source cli --op platform >/dev/null 2>&1 || { echo "❌ 快照失败 → 中止切换(未改动任何东西)"; return 1; }
   # 2) 就地备份直接会被改写的几样(快照是整体回退, 这些用于精确还原)
   local wd; wd="$(mktemp -d)" || { echo "❌ 无法创建临时目录"; return 1; }
   local f
@@ -3842,7 +3922,7 @@ _pdg_hijack_transact(){
 cmd_migrate(){
   need_root migrate; _lock
   c_g "迁移前留快照…"
-  if ! cmd_snapshot >/dev/null 2>&1 || [[ -z "$_PDG_SNAP_CREATED" ]]; then
+  if ! cmd_snapshot --source cli --op migrate >/dev/null 2>&1 || [[ -z "$_PDG_SNAP_CREATED" ]]; then
     c_y "❌ 快照失败, 拒绝在无法回滚的前提下迁移。"; return 1
   fi
   local snap="$_PDG_SNAP_CREATED" rc=0
@@ -3917,7 +3997,7 @@ case "${1:-menu}" in
   doctor|dr)     shift || true; cmd_doctor "$@";;
   update|up)     shift || true; cmd_update "$@";;
   migrate-fw)    need_root migrate-fw; migrate_firewall_to_pdg;;
-  snapshot|snap) cmd_snapshot;;
+  snapshot|snap) shift || true; cmd_snapshot "$@";;
   rollback)      shift || true; cmd_rollback "$@";;
   token)         cmd_token;;
   restart)       cmd_restart;;

@@ -445,7 +445,10 @@ def run(snapshot_id, *, expect_digest="", trigger_source="rescue", cfgrestore=No
             return res
 
         # ── pre-rescue 快照: 失败即拒绝(Web 第一版不提供强制跳过)──────────────
-        rc, out = _run([_pdg_path(), "snapshot"], timeout=900, env=_child_env())
+        # 标上来源: 这份快照是"完整恢复之前"的那一份, 与手动/更新前拍的要分得开。
+        # 固定 argv, 值来自本模块的常量 —— 旧版 pdg 不认这两个参数也无妨, 它会忽略多余位置参数。
+        rc, out = _run([_pdg_path(), "snapshot", "--source", "rescue", "--op", "pre-full-restore"],
+                       timeout=900, env=_child_env())
         pre_id = ""
         m = re.search(r"backups/([0-9]{8}-[0-9]{6})/snap\.tar\.gz", out or "")
         if m:
