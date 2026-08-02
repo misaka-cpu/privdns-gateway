@@ -3798,6 +3798,29 @@ cmd_platform(){
   return 0
 }
 
+# SIM/APN 链路诊断。6.1A 只有 `status` 一个子命令: **服务器准备状态**, 纯只读。
+#
+# 它不取全局配置写锁, 也不开事务 —— 这是有意的。这条命令是给"出事了想看看"的人用的,
+# 它自己再去抢锁就会在最不该添乱的时候添乱: 读一次状态却挡住 pdg update 或定时的规则库
+# 刷新, 代价远大于收益。cmd_detect_cidr 那种要写配置的才需要锁。
+#
+# 退出码由 linkstat.exit_code() 定: 服务器准备状态里有 FAIL → 2; 只有 WARN/NOT_OBSERVED/
+# SKIP → 0; 模型损坏或没跑完 → 3。NOT_OBSERVED **不算故障**, 所以不影响退出码。
+cmd_link(){
+  local sub="${1:-status}"
+  case "$sub" in
+    status) shift || true;;
+    -h|--help|help)
+      echo "用法: pdg link status [--json]"
+      echo "  只报告**服务器准备状态**(只读, 不改任何东西)。"
+      echo "  手机/SIM 那条链路本轮还观测不到, 会明确显示为「未观察到」。"
+      return 0;;
+    *) echo "用法: pdg link status [--json]"; return 1;;
+  esac
+  local m; m="$(_pdg_module linkstat.py)" || { echo "❌ 找不到 linkstat.py"; return 1; }
+  python3 "$m" "$@"
+}
+
 cmd_hijack_mode(){
   need_root hijack-mode
   # shellcheck source=/dev/null
@@ -4012,7 +4035,8 @@ case "${1:-menu}" in
   detect-cidr|cidr) shift || true; cmd_detect_cidr "$@";;
   platform)      shift || true; cmd_platform "$@";;
   hijack-mode)   shift || true; cmd_hijack_mode "$@";;
+  link)          shift || true; cmd_link "$@";;
   uninstall|rm)  shift || true; cmd_uninstall "$@";;
   rescue)        shift || true; cmd_rescue "$@";;
-  *) echo "用法: pdg [menu|status|doctor [--json|--deep]|update [--dry-run]|snapshot|rollback [n]|token|restart|log [n]|traffic|ios [status|diff|previous|ack|recover|repair](仅 iOS)|report [--redact-ip|--full]|detect-cidr|platform <ios|android>|hijack-mode <all|gfw>|migrate|migrate-fw|tx <list|show|recover|abort>|rescue <enable|disable|status|fingerprint|bind <IPv4>|rotate-token|rotate-cert>|uninstall [--purge]]";;
+  *) echo "用法: pdg [menu|status|doctor [--json|--deep]|update [--dry-run]|snapshot|rollback [n]|token|restart|log [n]|traffic|ios [status|diff|previous|ack|recover|repair](仅 iOS)|report [--redact-ip|--full]|detect-cidr|platform <ios|android>|hijack-mode <all|gfw>|link status|migrate|migrate-fw|tx <list|show|recover|abort>|rescue <enable|disable|status|fingerprint|bind <IPv4>|rotate-token|rotate-cert>|uninstall [--purge]]";;
 esac

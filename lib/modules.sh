@@ -30,6 +30,7 @@ deploy/bot/checks.py checks.py 755
 deploy/bot/doctor.py doctor.py 755
 deploy/bot/report.py report.py 755
 deploy/bot/nftscan.py nftscan.py 755
+deploy/bot/linkstat.py linkstat.py 755
 deploy/bot/nftmerge.py nftmerge.py 755
 deploy/bot/sb2mihomo.py sb2mihomo.py 755
 deploy/bot/mihomorender.py mihomorender.py 755

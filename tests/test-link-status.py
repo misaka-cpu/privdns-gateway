@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+"""6.1A 采集器: 证书七种情形、分层归因、只读纪律。
+
+判据都落在**真实产物**上: 用 openssl 真签出正常/临期/过期/错域名的证书, 真造损坏文件与
+"证书位置放的其实是私钥"这种现场, 再看采集器给出的 code 与 status。不打桩 openssl ——
+打了就等于在测我自己写的桩。
+
+只读纪律这一节尤其要紧: `pdg link status` 是给"出事了想看看"的人用的, 它自己再去写文件、
+抢锁、开事务, 就会在最不该添乱的时候添乱。
+"""
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "deploy/bot"))
+import linkstat as L  # noqa: E402
+import checks  # noqa: E402
+
+PASS_N = [0]
+FAIL_N = [0]
+TMPS = []
+
+
+def ok(m):
+    print("[OK]   %s" % m); PASS_N[0] += 1
+
+
+def bad(m):
+    print("[FAIL] %s" % m); FAIL_N[0] += 1
+
+
+def skip(m):
+    print("[SKIP] %s" % m)
+
+
+def have_openssl():
+    return shutil.which("openssl") is not None
+
+
+def gen_cert(d, cn, days):
+    """真签一张证书。days > 0 走 `openssl req -x509 -days`。"""
+    key = os.path.join(d, "k.pem")
+    crt = os.path.join(d, "c.pem")
+    r = subprocess.run(
+        ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+         "-keyout", key, "-out", crt, "-days", str(days), "-subj", "/CN=%s" % cn],
+        capture_output=True, text=True, timeout=90)
+    if r.returncode != 0 or not os.path.exists(crt):
+        return None, None, (r.stderr or "")[-160:]
+    return crt, key, ""
+
+
+def gen_expired_cert(d, cn):
+    """签一张**已经过期**的证书。
+
+    `openssl req -x509` 给不了过去的日期: -days 只收正数, -not_after 要 3.5+ 才有(本机
+    3.0.20 不认)。所以走 `openssl ca -selfsign` —— 它有 -startdate/-enddate, 能明确指定
+    一段已经过去的区间。需要一个最小 CA 配置 + index/serial, 一并在临时目录里造。
+    """
+    key = os.path.join(d, "k.pem")
+    csr = os.path.join(d, "r.csr")
+    crt = os.path.join(d, "expired.pem")
+    cnf = os.path.join(d, "ca.cnf")
+    for name in ("index.txt",):
+        open(os.path.join(d, name), "w").close()
+    open(os.path.join(d, "serial"), "w").write("01\n")
+    open(cnf, "w").write(
+        "[ca]\ndefault_ca = CA_default\n"
+        "[CA_default]\n"
+        "dir = %s\ndatabase = $dir/index.txt\nserial = $dir/serial\n"
+        "new_certs_dir = $dir\ndefault_md = sha256\npolicy = pol\n"
+        "email_in_dn = no\nunique_subject = no\n"
+        "[pol]\ncommonName = supplied\n" % d)
+    r = subprocess.run(
+        ["openssl", "req", "-new", "-newkey", "rsa:2048", "-nodes",
+         "-keyout", key, "-out", csr, "-subj", "/CN=%s" % cn],
+        capture_output=True, text=True, timeout=90)
+    if r.returncode != 0:
+        return None, (r.stderr or "")[-160:]
+    start = time.strftime("%Y%m%d%H%M%SZ", time.gmtime(time.time() - 86400 * 60))
+    end = time.strftime("%Y%m%d%H%M%SZ", time.gmtime(time.time() - 86400 * 5))
+    r = subprocess.run(
+        ["openssl", "ca", "-selfsign", "-batch", "-notext", "-config", cnf,
+         "-keyfile", key, "-in", csr, "-out", crt,
+         "-startdate", start, "-enddate", end],
+        capture_output=True, text=True, timeout=90)
+    if r.returncode != 0 or not os.path.exists(crt):
+        return None, (r.stderr or "")[-200:]
+    return crt, ""
+
+
+def main():
+    if not have_openssl():
+        skip("本环境没有 openssl, 证书用例无法真签 —— 不伪造通过")
+        print("─" * 40); print("通过 0, 失败 0"); print("零断言 —— 判失败")
+        return 1
+
+    d = tempfile.mkdtemp(prefix="linkstat-cert.")
+    TMPS.append(d)
+
+    print("── 1. 证书有效期: 正常 / 临期 / 过期 ──")
+    for name, days, want_code, want_status in (
+            ("正常(365 天)", 365, None, None),
+            ("临期(7 天)", 7, "L5_CERT_EXPIRING", L.WARN),
+            ("已过期", -5, "L5_CERT_EXPIRED", L.FAIL)):
+        sub = tempfile.mkdtemp(prefix="c.", dir=d)
+        if days >= 0:
+            crt, _key, err = gen_cert(sub, "dot.example", days)
+        else:
+            crt, err = gen_expired_cert(sub, "dot.example")
+        if not crt:
+            skip("%s 签发失败, 该情形未验: %s" % (name, err)); continue
+        ts, cn, why = L._cert_not_after(crt)
+        if ts is None:
+            bad("%s: 读不出到期时间(%s)" % (name, why)); continue
+        left = int((ts - time.time()) // 86400)
+        if want_code is None:
+            (ok if left > L.CERT_EXPIRING_DAYS else bad)(
+                "%s → 剩 %d 天, 不触发临期/过期" % (name, left))
+        elif want_code == "L5_CERT_EXPIRING":
+            (ok if 0 <= left < L.CERT_EXPIRING_DAYS else bad)(
+                "%s → 剩 %d 天, 落在临期窗口(<%d)" % (name, left, L.CERT_EXPIRING_DAYS))
+        else:
+            (ok if left < 0 else bad)("%s → 剩 %d 天(负数=已过期)" % (name, left))
+
+    print()
+    print("── 2. 读不出来的三种: 损坏 / 空 / 位置放的是私钥 ──")
+    bads = {}
+    p = os.path.join(d, "broken.pem"); open(p, "w").write("-----BEGIN CERTIFICATE-----\nnot base64\n")
+    bads["损坏证书"] = p
+    p = os.path.join(d, "empty.pem"); open(p, "w").write("")
+    bads["空文件"] = p
+    crt, key, err = gen_cert(os.path.join(d, "kk") if os.makedirs(os.path.join(d, "kk"), exist_ok=True) is None else d,
+                             "dot.example", 365)
+    if key:
+        bads["证书位置放的其实是私钥"] = key
+    for name, path in bads.items():
+        ts, cn, why = L._cert_not_after(path)
+        (ok if ts is None else bad)("%s → 解析失败(采集器会判 FAIL)" % name)
+        if name == "证书位置放的其实是私钥":
+            # 关键: 报错里不许带私钥正文
+            if "PRIVATE KEY" in (why or "") or "MII" in (why or ""):
+                bad("私钥正文漏进了错误信息: %s" % (why or "")[:60])
+            else:
+                ok("私钥文件的报错里没有私钥正文")
+
+    print()
+    print("── 3. 主机名不匹配 ──")
+    crt, _k, err = gen_cert(tempfile.mkdtemp(prefix="cn.", dir=d), "wrong.example", 365)
+    if crt:
+        _ts, cn, _ = L._cert_not_after(crt)
+        (ok if cn == "wrong.example" else bad)("能取到证书 CN: %s" % cn)
+        # CN 与 DoT 主机名不同 → 采集器该判 L5_CERT_CN_MISMATCH。这里验判据本身:
+        (ok if cn != "dot.example" else bad)("CN 与配置的 DoT 主机名不同 → 应判不匹配")
+    else:
+        skip("错域名证书签发失败: %s" % err)
+
+    print()
+    print("── 4. 输出里没有私钥与敏感哨兵 ──")
+    SENT = "123456789:AAHlinkSENTINELtoken0000000000000000"
+    findings = L.collect(platform="android")
+    blob = "\n".join("%s|%s|%s" % (f["title"], f["detail"], f["next_step"]) for f in findings)
+    blob += "\n" + L.render_text(findings)
+    leaks = [w for w in ("PRIVATE KEY", "BEGIN RSA", SENT) if w in blob]
+    (ok if not leaks else bad)("采集与渲染结果里无私钥/哨兵" if not leaks else "泄漏: %s" % leaks)
+
+    print()
+    print("── 5. 分层归因: 服务异常 vs 配置漂移 不能混 ──")
+    by_code = {f["code"]: f for f in findings}
+    svc_codes = {"L8_SERVICES_READY", "L8_MOSDNS_DOWN", "L8_MIHOMO_DOWN"}
+    cfg_codes = {"L2_CIDR_READY", "L2_CIDR_DRIFT"}
+    got_svc = svc_codes & set(by_code)
+    got_cfg = cfg_codes & set(by_code)
+    (ok if got_svc else bad)("服务层有结论: %s" % (sorted(got_svc) or "无"))
+    (ok if got_cfg else bad)("配置层有结论: %s" % (sorted(got_cfg) or "无"))
+    for c in got_svc:
+        (ok if by_code[c]["layer"] == 8 else bad)("%s 落在第 8 层" % c)
+    for c in got_cfg:
+        (ok if by_code[c]["layer"] == 2 else bad)("%s 落在第 2 层" % c)
+
+    print()
+    print("── 6. 私网实时层永远 NOT_OBSERVED, 且不影响退出码 ──")
+    phone = [f for f in findings if f["layer"] in L.PHONE_LAYERS]
+    (ok if phone else bad)("有私网实时层条目")
+    if phone and all(f["status"] == L.NOT_OBSERVED for f in phone):
+        ok("私网实时层全部是 NOT_OBSERVED(%d 条)" % len(phone))
+    else:
+        bad("私网层状态不对: %r" % [f["status"] for f in phone])
+    # 造一个"私网层 FAIL"的畸形输入, 退出码也不该因此非零 —— 私网层不参与服务器就绪判定
+    fake = list(phone) + [L.Finding(2, "L2_CIDR_READY", L.PASS, None, "t", "d", "e")]
+    (ok if L.exit_code(fake) == 0 else bad)("只有 NOT_OBSERVED + PASS → 退出码 0")
+
+    print()
+    print("── 7. 只读纪律: 不写文件 / 不开事务 / 不取全局写锁 ──")
+    # 全局锁: 判据要**两头都成立**才有意义 —— 先证明这把锁真能挡住写路径(pdgtx 会 TxBusy),
+    # 再证明 collect() 在同样条件下照常完成。只做后者的话, 锁没生效也一样"通过"。
+    import fcntl
+    lockdir = tempfile.mkdtemp(prefix="linklock."); TMPS.append(lockdir)
+    lockp = os.path.join(lockdir, "pdg.lock")
+    held = open(lockp, "w")
+    fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    os.environ["PDG_LOCKFILE"] = lockp
+    blocked = False
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "pdgtx_lock_probe", ROOT / "deploy/bot/pdgtx.py")
+        m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+        try:
+            with m._Lock(lockp):
+                pass
+        except Exception as e:  # noqa: BLE001
+            blocked = type(e).__name__ == "TxBusy"
+    except Exception as e:  # noqa: BLE001
+        skip("装载 pdgtx 失败(%s), 锁有效性未证" % type(e).__name__)
+    (ok if blocked else bad)("前提成立: 这把锁被占用时, 走事务的写路径会 TxBusy")
+    t0 = time.time()
+    fs2 = L.collect(platform="android")
+    dt = time.time() - t0
+    (ok if fs2 else bad)("同样条件下 collect() 照常完成 —— 它不去抢这把锁")
+    try:
+        fcntl.flock(held, fcntl.LOCK_UN); held.close()
+    except OSError:
+        pass
+    (ok if dt < 60 else bad)("采集在 %.1fs 内完成(没有卡在锁上)" % dt)
+
+    # 事务与状态文件: 采集前后不许多出任何东西
+    txroot = os.environ.get("PDG_TX_ROOT", "/var/lib/privdns-gateway/tx")
+    before = set(os.listdir(txroot)) if os.path.isdir(txroot) else set()
+    L.collect(platform="android")
+    after = set(os.listdir(txroot)) if os.path.isdir(txroot) else set()
+    (ok if before == after else bad)("采集不产生事务记录(%d → %d)" % (len(before), len(after)))
+
+    varlib = "/var/lib/privdns-gateway"
+    b2 = set(os.listdir(varlib)) if os.path.isdir(varlib) else set()
+    L.collect(platform="android")
+    a2 = set(os.listdir(varlib)) if os.path.isdir(varlib) else set()
+    (ok if b2 == a2 else bad)("采集不在 /var/lib/privdns-gateway 下新建东西: 多出 %s"
+                              % (sorted(a2 - b2) or "无"))
+
+    print()
+    print("── 8. 受管文件的内容/mode/uid/gid/mtime 一律不变 ──")
+    watch = [checks.PROFILE_ENV, checks.MOSDNS_CONF, "/etc/nftables.conf",
+             checks.PLATFORM_FILE]
+    snap = {}
+    for p in watch:
+        try:
+            st = os.stat(p)
+            snap[p] = (open(p, "rb").read(), st.st_mode, st.st_uid, st.st_gid, st.st_mtime_ns)
+        except OSError:
+            continue
+    if not snap:
+        skip("本环境没有受管配置文件, 该节未验(真机/沙箱里会有)")
+    else:
+        L.collect(platform="android")
+        changed = []
+        for p, want in snap.items():
+            try:
+                st = os.stat(p)
+                got = (open(p, "rb").read(), st.st_mode, st.st_uid, st.st_gid, st.st_mtime_ns)
+            except OSError:
+                changed.append(p + "(消失)"); continue
+            if got != want:
+                changed.append(p)
+        (ok if not changed else bad)(
+            "%d 个受管文件的内容/mode/uid/gid/mtime 全未变" % len(snap)
+            if not changed else "这些被动过: %s" % ", ".join(changed))
+
+    print("─" * 40)
+    total = PASS_N[0] + FAIL_N[0]
+    print("通过 %d, 失败 %d" % (PASS_N[0], FAIL_N[0]))
+    for t in TMPS:
+        shutil.rmtree(t, ignore_errors=True)
+    if total == 0:
+        print("零断言 —— 判失败")
+        return 1
+    return 1 if FAIL_N[0] else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -215,7 +215,10 @@ def _cert_not_after(path):
     rc, out, err = checks._run(
         ["openssl", "x509", "-in", path, "-noout", "-enddate", "-subject"], t=12)
     if rc != 0 or "notAfter=" not in (out or ""):
-        return None, "", (err or out or "").strip()[:120]
+        # openssl 的报错常是多行(还带一行十六进制错误码)。原样塞进 detail 会把版面撑乱,
+        # 而诊断输出的可读性本身就是它的价值之一。压成一行再截断。
+        why = re.sub(r"\s+", " ", (err or out or "")).strip()
+        return None, "", why[:110]
     m = re.search(r"notAfter=(.+)", out)
     cn = ""
     mc = re.search(r"CN\s*=\s*([A-Za-z0-9.*-]+)", out)
