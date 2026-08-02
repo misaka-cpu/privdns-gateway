@@ -392,13 +392,26 @@ class Kernel:
                 pass
         finally:
             sock.close()
-        # 内核的原话: `[TCP] 1.2.3.4:5678 --> host:443 match DomainSuffix(x) using DIRECT`
-        pat = re.compile(re.escape(host) + r":443 match (\S+) using (\S+)\s*$")
+        # 内核用**两种**句式说同一件事, 取决于这一拨拨没拨通 —— 而判定(命中哪条规则、判给
+        # 哪个出口)两种都带全了:
+        #   拨通:   `[TCP] 1.2.3.4:5678 --> host:443 match DomainSuffix(x) using hkt`
+        #   拨不通: `[TCP] dial hkt (match DomainSuffix/x) 1.2.3.4:5678 --> host:443 error: …`
+        # 本用例断的是"内核把它判给了谁", 与出口通不通无关 —— 出口地址本来就是 TEST-NET-2
+        # 的文档保留段(198.51.100.0/24), 永远拨不通。只认第一种句式就变成了看拨号快慢的
+        # 抛硬币: 有网时那个地址是黑洞、拨号挂住, 于是先打出 match 行; 无网时拨号立刻失败,
+        # 只剩 error 行。开发机(有网)全绿而 CI(容器无出网)红两条, 差别就在这里。
+        ok_pat = re.compile(re.escape(host) + r":443 match (\S+) using (\S+)\s*$")
+        err_pat = re.compile(r"dial (\S+) \(match ([^)]+)\).*?" + re.escape(host) + r":443 error:")
         for _ in range(40):
             for line in self.lines[mark:]:
-                m = pat.search(line)
+                m = ok_pat.search(line)
                 if m:
                     return m.group(1), m.group(2)
+                m = err_pat.search(line)
+                if m:
+                    # `DomainSuffix/netflix.com` → `DomainSuffix(netflix.com)`, 与另一种句式同形
+                    kind, _, val = m.group(2).partition("/")
+                    return ("%s(%s)" % (kind, val) if val else kind), m.group(1)
             time.sleep(0.25)
         return None, None
 
