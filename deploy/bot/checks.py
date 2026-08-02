@@ -17,6 +17,10 @@ PLATFORM_FILE = "/etc/privdns-gateway/platform"
 PLATFORM_GUESSED = PLATFORM_FILE + ".guessed"   # 存在 = 平台是推测出来的, 没人确认过
 REPO_DIR = "/opt/privdns-gateway"   # 已装仓库(比对部署文件是否与当前发布同版本)
 RS_META = "/opt/pdg-bot/rulesets.json"   # 规则集元数据(与 bot 同源)
+MOSDNS_RULES_DIR = "/etc/mosdns/rules"
+UNLOCK_FILE = MOSDNS_RULES_DIR + "/unlock.txt"                # WDA 解锁清单(= 自动生成那批域名的真源)
+MITM_HIJACK_FILE = MOSDNS_RULES_DIR + "/mitm_hijack.txt"      # MITM 接管域名
+CUSTOM_DIRECT_FILE = MOSDNS_RULES_DIR + "/custom_direct.txt"  # 用户判直连的域名(DNS 侧就返真实 IP)
 # 面板 UI 在 /etc/sing-box/ui/dist, 不在 mihomo 工作目录下 → SAFE_PATHS 放行, 否则 `mihomo -t` 拒。
 os.environ.setdefault("SAFE_PATHS", "/etc/sing-box/ui/dist")
 
@@ -908,8 +912,8 @@ def check_mitm_structure():
         return ("warn", "MITM结构", "force_hijack 优先级规则缺失或顺序错(应在 geosite_cn 之前强制接管)")
     if "tag: force_hijack_seq" not in conf:
         return ("warn", "MITM结构", "缺 force_hijack_seq(接管域名的 AAAA/HTTPS 抑制 + A 劫持序列)")
-    if not os.path.isfile("/etc/mosdns/rules/mitm_hijack.txt"):
-        return ("warn", "MITM结构", "缺 /etc/mosdns/rules/mitm_hijack.txt(接管域名集文件)")
+    if not os.path.isfile(MITM_HIJACK_FILE):
+        return ("warn", "MITM结构", "缺 " + MITM_HIJACK_FILE + "(接管域名集文件)")
     return ("ok", "MITM结构", "force_hijack + force_hijack_seq + 优先级规则 + mitm_hijack.txt 就位")
 
 def check_mitm():
@@ -959,7 +963,7 @@ def check_mitm():
         return ("fail", "MITM 插件", "缺 CA 证书 /etc/privdns-gateway/ca/ca.crt")
     # 接管域名集应含 gs-loc 两域名(mosdns 强制劫持源)
     try:
-        hij = open("/etc/mosdns/rules/mitm_hijack.txt").read()
+        hij = open(MITM_HIJACK_FILE).read()
     except OSError:
         hij = ""
     if not all(d in hij for d in GS_LOC):
@@ -1000,6 +1004,212 @@ def check_rulesets():
                                   "且会挡住 `pdg update`: " + "、".join(stale[:6])
                                   + "。请在 bot「📑 分流管理」里删掉它们, 换成 .list/.txt/.yaml/.mrs。")
     return ("ok", "规则集", "%d 个, 格式均可被 mihomo 加载" % len(meta))
+
+
+# ── 分流优先级: 自动生成的规则不许静默压过用户点名的域名规则 ──────────────────
+# 内核自上而下第一条命中即止, 所以规则表的**顺序就是优先级**。本项目会自动往规则表里塞两批
+# 规则: WDA 解锁(unlock.txt 那批, 目标是 jp 直出 → 渲染成 DIRECT)与 MITM 接管(mitm_hijack.txt
+# 那批 → MITM-OUT)。它们排在用户点名规则前面时, 用户那条规则就成了死规则 —— 配置里两条都在,
+# 面板、`测域名`、`pdg doctor` 以前全都看不出来, 只有把 clash_api /rules 拉出来数才发现
+# (.200 现场: netflix.com 点名指到 hkt, 实际一直走直连)。
+#
+# 判据落在**渲染出来的内核配置**上, 而不是数据模型: 那才是内核真正拿去求值的东西, 也与用户
+# 自查时看到的 /rules 一致; 模型对了而渲染没跟上(比如恢复了旧配置忘了重渲)同样能被这里逮住。
+_DOMAIN_KINDS = ("DOMAIN-SUFFIX", "DOMAIN", "DOMAIN-KEYWORD")
+
+
+def _domain_list(path):
+    """读 mosdns 的域名清单(去 domain: 前缀)。读不到 = 空。"""
+    out = []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    out.append(line.replace("domain:", "").strip())
+    except OSError:
+        pass
+    return [d for d in out if d]
+
+
+def _rendered_domain_rules(rules):
+    """渲染出来的规则表 → [(下标, 类型, 域名, 目标)], 只取按域名匹配的那几类。
+
+    逻辑规则(AND,…)与 RULE-SET 不在其中: 前者要展开条件树、后者要读 provider 内容才知道命中
+    什么, 猜不得 —— 认不出的一律不参与判断, 宁可漏报也不误报。"""
+    out = []
+    for i, rule in enumerate(rules):
+        if not isinstance(rule, str):
+            continue
+        parts = rule.split(",")
+        if len(parts) < 3 or parts[0] not in _DOMAIN_KINDS:
+            continue
+        out.append((i, parts[0], parts[1].strip(), parts[2].strip()))
+    return out
+
+
+def _covers(kind, value, other_kind, other_value):
+    """(kind,value) 这条规则是否**吃掉**了 (other_kind,other_value) 能命中的全部域名。
+
+    只在能完整覆盖时才算数 —— 部分重叠(如 DOMAIN,a.com 之于 DOMAIN-SUFFIX,a.com)不报,
+    那条规则对其它子域仍然有效, 报出来只会变成噪声。"""
+    if kind == "DOMAIN-SUFFIX":
+        if other_kind in ("DOMAIN", "DOMAIN-SUFFIX"):
+            return other_value == value or other_value.endswith("." + value)
+        return False
+    if kind == "DOMAIN":
+        return other_kind == "DOMAIN" and other_value == value
+    if kind == "DOMAIN-KEYWORD":
+        # 关键词在对方的域名里 ⇒ 对方能命中的每一个主机名都含这个关键词 ⇒ 全被吃掉
+        return other_kind in ("DOMAIN", "DOMAIN-SUFFIX") and value in other_value
+    return False
+
+
+def _auto_batches(dom_rules, unlock, mitm):
+    """哪些规则是**自动生成**的 → {下标: 批次名}。按位置认, 不按域名文本认。
+
+    为什么不能只看域名在不在 unlock.txt 里: 用户点名 netflix.com 时, 他那条规则与 WDA 自动
+    那条**逐字节只差目标**, 单看域名分不出谁是谁 —— 于是"用户规则被自动规则压过"和"自动规则
+    被用户规则接管"这两件相反的事会被判成同一件(第一版就是这么把现场那条漏掉的)。
+
+    位置判据来自渲染方式本身:
+      · MITM 接管那批的目标是 MITM-OUT —— 这个出站名是渲染器造出来的, 别处不会有;
+      · WDA 那批由 model 里**一条** domain_suffix 规则展开, 因此是一段**连续**、同目标、
+        域名都在 unlock.txt 里的 DOMAIN-SUFFIX。取覆盖最多的那一段: 用户自己那条同名规则
+        是孤立的一两条, 不会被算成批次。"""
+    auto = {}
+    for i, _kind, value, target in dom_rules:
+        if target == "MITM-OUT" and (not mitm or value in mitm):
+            auto[i] = "MITM 接管"
+    best, run = [], []
+    for i, kind, value, target in dom_rules:
+        member = kind == "DOMAIN-SUFFIX" and value in unlock and i not in auto
+        if member and run and i == run[-1][0] + 1 and target == run[-1][1]:
+            run.append((i, target))
+        else:
+            run = [(i, target)] if member else []
+        if len(run) > len(best):
+            best = list(run)
+    if len(best) >= 2:            # 一两条孤立规则不是"批次", 不猜
+        for i, _target in best:
+            auto[i] = "WDA 解锁"
+    return auto
+
+
+def rule_precedence_scan(cfg=None):
+    """扫一遍内核规则表, 找出"永远轮不到"的域名规则。只读, 不改任何东西。
+
+    返回 dict:
+      auto    [(域名, 本该去的出口, 实际被谁截走, 截走它的批次名)] —— 被自动规则压过的用户规则
+      user    [(域名, 本该去的出口, 实际去向)]                     —— 被用户自己另一条规则压过
+      wda     {"count": WDA 批量域名数, "target": 它们的去向, "taken": [(域名, 出口)]}
+      error   读不出规则表时的说明(此时其余字段为空)
+
+    bot 面板与 doctor 用的是同一份扫描 —— 两处各写一份判据迟早会一个说有问题一个说没有。"""
+    res = {"auto": [], "user": [], "wda": {}, "error": ""}
+    if cfg is None:
+        if not os.path.exists(MIHOMO_CFG):
+            return res
+        try:
+            cfg = json.load(open(MIHOMO_CFG, encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            res["error"] = "读不到 mihomo 规则表(不是本项目渲染出来的形态?)"
+            return res
+    rules = cfg.get("rules") if isinstance(cfg, dict) else None
+    if not isinstance(rules, list):
+        res["error"] = "mihomo 配置里没有 rules 列表"
+        return res
+
+    unlock = set(_domain_list(UNLOCK_FILE))
+    mitm = set(_domain_list(MITM_HIJACK_FILE))
+    direct = set(_domain_list(CUSTOM_DIRECT_FILE))
+    dom_rules = _rendered_domain_rules(rules)
+    auto = _auto_batches(dom_rules, unlock, mitm)
+
+    taken = []                             # WDA 域名被用户点名规则接管(修好之后的正常形态)
+    for idx, kind, value, target in dom_rules:
+        for jdx, jkind, jvalue, jtarget in dom_rules:
+            if jdx >= idx or not _covers(jkind, jvalue, kind, value):
+                continue
+            # **第一条**覆盖它的规则就定了这个域名的去向, 后面的一概不看 —— 哪怕后面还有一条
+            # 目标不同的。跳过同目标那条去找"目标不同"的会凭空造出一条不存在的冲突: 真正生效的
+            # 是最靠前那条, 它的目标与本条相同时, 结果与用户期望一致, 没什么好报的。
+            if jtarget != target:
+                victim, culprit = auto.get(idx, ""), auto.get(jdx, "")
+                if victim and not culprit:
+                    if victim == "WDA 解锁":
+                        taken.append((value, jtarget))
+                elif culprit and not victim:
+                    res["auto"].append((value, target, jtarget, culprit))
+                elif not culprit and not victim:
+                    res["user"].append((value, target, jtarget))
+            break
+
+    if unlock:
+        batch = [t for i, _k, _v, t in dom_rules if auto.get(i) == "WDA 解锁"]
+        res["wda"] = {
+            "count": len(batch),
+            "target": batch[0] if batch else "(未渲染)",
+            "taken": sorted(set(taken)),
+            "direct_list": sorted(unlock & direct),
+        }
+    return res
+
+
+def check_rule_precedence():
+    """用户点名的域名规则有没有被自动生成的规则(WDA 解锁 / MITM 接管)静默压过。
+
+    压过 = 那条规则永远轮不到, 但配置里它还在 —— 用户看到的是"规则加了却不生效", 而以前
+    整套自检没有一项会提这件事。同时把"WDA 正在把哪一批域名判成什么"如实说出来: 那批 DIRECT
+    是自动加的, 用户没写过, 至少得看得见。"""
+    scan = rule_precedence_scan()
+    if scan["error"]:
+        return ("warn", "分流优先级", scan["error"] + " —— 无法核对用户规则是否被自动规则压过")
+    wda = scan.get("wda") or {}
+    notes = []
+    if wda.get("count"):
+        where = "直连(本机直出)" if wda["target"] == "DIRECT" else "出口 " + str(wda["target"])
+        notes.append("WDA 解锁自动把 %d 个域名判给%s" % (wda["count"], where))
+        if wda.get("taken"):
+            notes.append("其中 %d 个按你自己的规则走: %s"
+                         % (len(wda["taken"]),
+                            "、".join("%s→%s" % (d, t) for d, t in wda["taken"][:4])
+                            + ("…" if len(wda["taken"]) > 4 else "")))
+        if wda.get("direct_list"):
+            notes.append("另有 %d 个在直连表里(DNS 直接返真实地址, 流量不进网关, WDA 对它们不生效): %s"
+                         % (len(wda["direct_list"]), "、".join(wda["direct_list"][:4])
+                            + ("…" if len(wda["direct_list"]) > 4 else "")))
+    if scan["auto"]:
+        items = "; ".join("%s 本该走 %s, 实际被「%s」判给 %s" % (d, want, batch, got)
+                          for d, want, got, batch in scan["auto"][:5])
+        more = "…等 %d 条" % len(scan["auto"]) if len(scan["auto"]) > 5 else ""
+        # 两批自动规则的处置**不一样**, 不能给一句通用建议:
+        #   · WDA 那批本就该排在点名规则之后 —— 出现在这里说明是老顺序, 下一次 model 写入
+        #     会自愈, 也可以立刻关一次再开 🔓 WDA;
+        #   · MITM 接管那批**故意**排在最前(iOS 的 WLOC 要先终止 TLS 才改得了坐标), 它不会
+        #     给点名规则让路 —— 要么删掉那条规则, 要么关掉 WLOC。说反了会让人白等自愈。
+        how = []
+        if any(b == "WDA 解锁" for *_x, b in scan["auto"]):
+            how.append("WDA 这批: 在 bot 里改一次这几个域名的规则, 或关一次再开 🔓 WDA "
+                       "—— 新版把自动规则排在点名规则之后")
+        if any(b == "MITM 接管" for *_x, b in scan["auto"]):
+            how.append("MITM 接管这批是**故意**排在最前的(WLOC 要先接管 TLS), 不会给点名规则"
+                       "让路 —— 要么删掉那条规则, 要么关掉 WLOC")
+        return ("warn", "分流优先级",
+                "有 %d 条你点名的域名规则永远轮不到 —— 自动生成的规则排在它前面: %s%s。"
+                "内核自上而下第一条命中即止, 所以配置里两条都在也没用。→ %s。"
+                % (len(scan["auto"]), items, more, "; ".join(how))
+                + ("　[" + "; ".join(notes) + "]" if notes else ""))
+    if scan["user"]:
+        items = "; ".join("%s 本该走 %s, 实际走 %s" % (d, want, got)
+                          for d, want, got in scan["user"][:5])
+        return ("warn", "分流优先级",
+                "有 %d 条域名规则被你自己**更靠前**的另一条规则盖住了(不是自动规则): %s。"
+                "删掉其中一条即可。" % (len(scan["user"]), items)
+                + ("　[" + "; ".join(notes) + "]" if notes else ""))
+    if notes:
+        return ("ok", "分流优先级", "; ".join(notes) + "; 没有被压过的点名规则")
+    return ("ok", "分流优先级", "没有被自动规则压过的点名域名规则")
 
 
 def check_nft_input_chains():
@@ -1074,8 +1284,8 @@ ALL = [check_platform, check_services, check_bot_credentials, check_core_version
        check_internal_cidr, check_cidr_drift, check_nft, check_nft_input_chains, check_redirect, check_gms,
        check_mosdns_ratelimit, check_mosdns_explicit_proxy, check_ruleset_hijack,
        check_nft_extra, check_geosite_db, check_mem,
-       check_cert, check_dns, check_core_config, check_rulesets, check_mitm_structure, check_mitm,
-       check_transactions]
+       check_cert, check_dns, check_core_config, check_rulesets, check_rule_precedence,
+       check_mitm_structure, check_mitm, check_transactions]
 ALERT = [check_services, check_dns, check_cert]  # healthcheck 用的轻量子集(运行期故障)
 DEEP = [check_deep_dot_handshake, check_deep_probe81, check_deep_dns_cn,
         check_deep_clash, check_deep_upstreams, check_deep_hijack_note]  # pdg doctor --deep 追加

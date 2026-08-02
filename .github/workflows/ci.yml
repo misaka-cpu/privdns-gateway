@@ -315,6 +315,11 @@ jobs:
       - name: "混合规则 AND 语义 (跨字段 AND/同字段 OR/不支持组合拒绝/真 mihomo -t)"
         run: python3 tests/test-rule-mixed.py
 
+      # 断言的是**真内核的判定**: 把渲染出来的配置交给钉死版 mihomo 跑起来, 从它自己的匹配
+      # 日志与 clash_api /rules 读出"这个域名去了哪个出口" —— 与 .200 现场同一种取证方式。
+      - name: "分流优先级 (点名规则不被 WDA/MITM 自动规则压过; 真内核判定 + doctor 可见)"
+        run: python3 tests/test-rule-precedence.py
+
       - name: "紧急默认出口 (只改 route.final/三目标同事务/原值不被覆盖/stale 拒绝)"
         run: python3 tests/test-emergency-exit.py
 

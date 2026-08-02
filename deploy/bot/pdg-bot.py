@@ -1089,6 +1089,10 @@ def tx_apply(op, model_mod=None, files=None, services=(), tfo_intent=None, mode=
             intent = _tfo_intent(c) if tfo_intent is None else tfo_intent
             model_mod(c)
             _tfo_apply(c, intent)                 # 加/改出口不冲掉 TFO 状态(语义与旧实现一致)
+            # 自动生成的 WDA 批量规则必须排在用户点名域名规则之后 —— 顺序就是优先级, 排在
+            # 前面就等于把用户那条规则静默作废。放在这里(而不是只放在 set_wda_mode 里)是为了
+            # 让现网已经是坏顺序的老机器在下一次写入时自愈, 不必让用户先知道要重开一次 WDA。
+            _wda_rule_reorder(c)
             t.stage("model", _model_bytes(c))
             svc.add("mihomo")
 
@@ -1561,6 +1565,56 @@ def _wda_on(c=None):
     return any(_is_wda_rule(r, previous_domains)
                for r in c.get("route", {}).get("rules", []))
 
+
+# ── 分流优先级: 点名规则 > 自动批量(WDA) > 规则集 / 默认出口 ──────────────────
+# 内核自上而下第一条命中即止, 所以 route.rules 的**顺序就是优先级**。WDA 那 55 个域名是
+# 自动生成的批量意图, 而用户在 bot 里一个个点名指到出口的规则是具体意图 —— 具体的必须排在
+# 批量的前面, 否则用户那条规则永远轮不到, 而配置里两条都在、面板与「测域名」也都说得通,
+# 只有把内核的求值顺序拉出来看才发现(.200 现场: netflix.com 明明指到 hkt, 实际走直连,
+# 因为 WDA 的出口 jp 是 direct 型出站, 渲染出来是 DOMAIN-SUFFIX,netflix.com,DIRECT)。
+def _is_pinned_domain_rule(r):
+    """用户点名的域名规则: 有出口, 且靠域名(而不是规则集/入口/IP)匹配。
+
+    规则集不算"点名": 那是成千上万个域名的批量清单, 和 WDA 同属批量意图, 让它继续排在
+    WDA 之后(WDA 开了却因为某个大清单而整体失效, 是另一种同样难查的静默失败)。"""
+    return bool(r.get("outbound")) and any(
+        r.get(k) for k in ("domain", "domain_suffix", "domain_keyword"))
+
+
+def _wda_insert_idx(rules):
+    """WDA 自动规则该插在 route.rules 的哪个位置: **最后一条用户点名域名规则之后**。
+
+    传进来的 rules 必须已经不含 WDA 规则本身(否则它会把自己算成"用户点名规则")。
+    一条点名规则都没有时退回原来的位置(reject 之后)—— 那时它前面本来也没有谁会被压过。"""
+    idx = 1 if rules and rules[0].get("action") == "reject" else 0
+    for i, r in enumerate(rules):
+        if _is_pinned_domain_rule(r):
+            idx = i + 1
+    return idx
+
+
+def _wda_rule_reorder(c):
+    """把 WDA 自动规则移到所有用户点名域名规则之后(幂等; 动过返回 True)。
+
+    tx_apply 在每一次 model 写入时都会跑一遍 —— 于是现网已经是坏顺序的老机器(WDA 是在用户
+    加规则之后开的)不需要用户知道要"重开一次 WDA", 下一次改任何配置就顺手修正了。
+    只搬 WDA 那一条, 其余规则的相对顺序逐条不变。"""
+    rules = (c.get("route") or {}).get("rules")
+    if not isinstance(rules, list) or not rules:
+        return False
+    is_wda = _wda_rule_pred()
+    wda = [r for r in rules if is_wda(r)]
+    if not wda:
+        return False
+    rest = [r for r in rules if not is_wda(r)]
+    idx = _wda_insert_idx(rest)
+    new = rest[:idx] + wda + rest[idx:]
+    if new == rules:
+        return False
+    c["route"]["rules"] = new
+    return True
+
+
 def _server_ip():
     """本机公网 IP(从 sing-box 的 reject 规则取); 用于提示去解锁服务后台授权哪个 IP。"""
     try:
@@ -1597,6 +1651,38 @@ def _unlock_precheck(domains):
     return True, ""
 
 
+def _wda_precedence_note():
+    """WDA 与用户点名规则的实际关系, 说给用户听(读的是**渲染出来的内核规则表**)。
+
+    为什么不在这里自己算一遍: 判据只有一处 —— checks.rule_precedence_scan 是 doctor 用的
+    那一份, bot 面板再写一份迟早会出现"面板说没事、doctor 说有事"。取不到就什么都不说
+    (自检模块缺席/老版本), 绝不让一句提示把 WDA 开关本身弄失败。"""
+    try:
+        import checks
+        scan = checks.rule_precedence_scan()
+    except Exception:  # noqa: BLE001
+        return ""
+    lines = []
+    wda = scan.get("wda") or {}
+    if wda.get("taken"):
+        lines.append("• 其中 %d 个域名按你自己的规则走: %s —— 想让它们走 WDA 就把这几条规则删掉。"
+                     % (len(wda["taken"]),
+                        "、".join("<code>%s</code>→%s" % (d, t) for d, t in wda["taken"][:5])
+                        + ("…" if len(wda["taken"]) > 5 else "")))
+    if wda.get("direct_list"):
+        lines.append("• 另有 %d 个在直连表里(DNS 直接返真实地址, 流量不进网关), WDA 对它们不生效: %s"
+                     % (len(wda["direct_list"]),
+                        "、".join("<code>%s</code>" % d for d in wda["direct_list"][:5])
+                        + ("…" if len(wda["direct_list"]) > 5 else "")))
+    if scan.get("auto"):
+        lines.append("• ⚠️ 有 %d 条点名规则被自动规则压在下面, 永远轮不到: %s —— 跑 "
+                     "<code>sudo pdg doctor</code> 看「分流优先级」。"
+                     % (len(scan["auto"]),
+                        "、".join("<code>%s</code>" % d for d, _w, _g, _b in scan["auto"][:5])
+                        + ("…" if len(scan["auto"]) > 5 else "")))
+    return ("\n" + "\n".join(lines)) if lines else ""
+
+
 def set_wda_mode(on):
     """WDA 解锁 ↔ 落地出口。mosdns 解锁清单与 model 内联域名规则现在是**一笔事务**:
     以前三处分三步写, 任何一步失败都可能留下"内核撤了规则、mosdns 还在走解锁 DNS"的半套状态。"""
@@ -1622,9 +1708,12 @@ def set_wda_mode(on):
             if not _is_wda_rule(r, previous_domains)
         ]
         if on:
-            idx = 1 if c["route"]["rules"] and c["route"]["rules"][0].get("action") == "reject" else 0
+            # 插在**所有用户点名域名规则之后** —— 以前一律插在 reject 之后, 于是开一次 WDA
+            # 就把用户先前配好的每一条点名规则整个盖住(内核第一条命中即止), 而两条规则在
+            # 配置里都在, 谁也看不出问题。见 _wda_insert_idx。
             c["route"]["rules"].insert(
-                idx, {"domain_suffix": list(WDA_DOMAINS), "outbound": "jp"})
+                _wda_insert_idx(c["route"]["rules"]),
+                {"domain_suffix": list(WDA_DOMAINS), "outbound": "jp"})
 
     # 老机器上还躺着 v1.7.0 那份 /etc/sing-box/rs/unlock.json: model 已经不引用它, mihomo
     # 也不会加载, 但它是这次改动留下的孤儿。None = 这笔事务里把它删掉; 文件本来就不在的机器
@@ -1635,8 +1724,11 @@ def set_wda_mode(on):
     if not ok:
         return False, msg
     if on:
+        # 点名规则优先于 WDA 这批自动规则(见 _wda_insert_idx), 所以要在这里把"哪几个域名其实
+        # 不走 WDA"说清楚 —— 否则用户看到"55 个域名走 WDA"就以为 netflix 也在里面。
         return True, ("✅ 已切到【🔓 WDA 解锁】: %d 个域名走 WDA(jp 直出 + 22.22.22.22 中继)。\n"
-                      "其余流量照常分流。哪个服务在 WDA 下不灵, 切回【落地出口】即可。") % len(WDA_DOMAINS)
+                      "其余流量照常分流。哪个服务在 WDA 下不灵, 切回【落地出口】即可。"
+                      % len(WDA_DOMAINS)) + _wda_precedence_note()
     return True, "✅ 已切到【🛬 落地出口】: 解锁域名回落各自出口(hk/tw), mosdns 解锁清单已清空。"
 
 
@@ -4135,7 +4227,8 @@ def handle_cb(chat, mid, data):
              f"<b>流媒体/服务解锁</b>: 当前 <b>{mode}</b>\n"
              "• 🛬 落地出口: 解锁服务走各自落地(hk/tw)\n"
              "• 🔓 WDA: WDA 能解锁的整体走 WDA(jp 直出 + 解锁 DNS)\n"
-             f"  ⚠️ 开 WDA 前先去解锁服务后台授权本机 IP <code>{_server_ip()}</code>(没授权点 🔓 会被拦下)\n\n"
+             f"  ⚠️ 开 WDA 前先去解锁服务后台授权本机 IP <code>{_server_ip()}</code>(没授权点 🔓 会被拦下)"
+             + _wda_precedence_note() + "\n\n"
              "改上游: 发「<b>remote 地址…</b>」或「<b>local 地址…</b>」(空格分隔多个)\n/cancel 取消。",
              {"inline_keyboard": [
                  [{"text": "🛬 解锁走落地出口", "callback_data": "wda:off"},
