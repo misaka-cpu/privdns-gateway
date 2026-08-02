@@ -204,7 +204,7 @@ done
 # 第一个 / 中间 / 最后一个受管目标各失败一次 —— 覆盖遍历的头、中、尾
 assert_fail_rollback "受管目标 #1 安装失败"  "PLATFORM=ios FAIL_NTH=1"
 assert_fail_rollback "受管目标 #12 安装失败" "PLATFORM=ios FAIL_NTH=12"
-assert_fail_rollback "受管目标 #29 安装失败" "PLATFORM=ios FAIL_NTH=29"   # 清单末项(iOS 全集 29 条)
+assert_fail_rollback "受管目标 #30 安装失败" "PLATFORM=ios FAIL_NTH=30"   # 清单末项(iOS 全集 30 条)
 
 # Android: 这五个文件根本不该被安装 → 即使注入同名失败也不影响更新
 for f in mitm_ca.py probe81.py pdg-dot.mobileconfig.tmpl; do
