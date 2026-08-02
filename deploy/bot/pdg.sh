@@ -3737,30 +3737,102 @@ cmd_hijack_mode(){
   else
     file="geosite_geolocation-!cn.txt"
   fi
-  cp /etc/mosdns/config.yaml /etc/mosdns/config.yaml.hjbak
-  # 用归一化器改形态(all=去掉劫持门/排除式, gfw=装上劫持门/白名单式), 而不是只换文件名 ——
-  # 只换文件名在旧形态机器上一个字都改不到, 却照样打印"✅ 劫持模式 → xxx"(空转报成功)。
-  local shape
-  if ! shape=$(_mosdns_hijack_shape "$mode" /etc/mosdns/config.yaml "$file"); then
-    c_y "mosdns 配置是自定义形态, 未改动(不猜着改)。"; rm -f /etc/mosdns/config.yaml.hjbak; return 1
+  _pdg_hijack_transact "$mode" "$file"
+}
+
+# 劫持模式的两个目标 —— mosdns 配置与真源 profile.env —— 整笔走配置事务。
+#
+# 以前是就地改写 + `.hjbak` 局部还原 + `sed -i` 写 profile.env。三个毛病:
+#   · 不上任何锁: `pdg snapshot` 在锁被占用时会被拦下, 这条却照写不误 —— 而 bot 与
+#     pdg-rules-update.timer 都会对 mosdns_conf 开事务, 撞上就是两边互相盖;
+#   · 不留事务记录: 没有 before-image、没有审计、事后 recover 不到;
+#   · mosdns 与 profile.env 各写各的: mosdns 成了而 profile 没成时, 盘上的形态与真源
+#     记录从此对不上, 而下一次迁移会按那个错的真源再归一一次。
+#
+# 锁的用法有个坑: 这里**不能**调 pdg.sh 的 `_lock`。它与事务核心那把是同一个文件, shell
+# 先 flock 住, 子进程 python 再去 flock 同一个文件必然拿不到 → 每次都 TxBusy。
+# cmd_detect_cidr 同样只靠事务核心那把锁, 这里照它。
+_pdg_hijack_transact(){
+  local mode="$1" file="$2" txm txid rc=0 wd shape
+  txm="$(_pdg_module pdgtx.py)" || { c_y "❌ 找不到 pdgtx.py(事务核心缺失), 未改动任何文件。"; return 1; }
+  local pend; pend="$(python3 "$txm" pending 2>/dev/null)"
+  if [[ -n "$pend" ]]; then
+    c_y "⛔ 有未完成的配置事务, 本次拒绝执行(未改动任何文件):"
+    printf '%s\n' "$pend" | sed 's/^/    /'
+    c_y "   请先 sudo pdg tx show <id> 查看, 再 sudo pdg tx recover <id> 收尾。"
+    return 1
   fi
-  if [[ "$shape" == changed ]]; then
-    systemctl restart mosdns; sleep 1.5
-    if [[ "$(systemctl is-active mosdns 2>/dev/null)" != active ]]; then
-      c_y "mosdns 重启失败 → 还原"; cp /etc/mosdns/config.yaml.hjbak /etc/mosdns/config.yaml
-      systemctl restart mosdns; rm -f /etc/mosdns/config.yaml.hjbak; return 1
-    fi
-  else
+  wd="$(mktemp -d)" || { c_y "❌ 无法创建临时目录"; return 1; }
+
+  # ── 候选一: mosdns。在**临时副本**上跑归一化器, 绝不碰生产路径。 ──
+  python3 "$txm" read --target mosdns_conf > "$wd/mos.raw" 2>"$wd/err" || {
+    c_y "❌ 读不到 mosdns 配置: $(tr -d '\n' < "$wd/err") → 未改动任何文件。"; rm -rf "$wd"; return 1; }
+  local mos_sha; mos_sha="$(head -1 "$wd/mos.raw")"
+  tail -n +2 "$wd/mos.raw" > "$wd/mos.new"
+  if ! shape=$(_mosdns_hijack_shape "$mode" "$wd/mos.new" "$file"); then
+    c_y "mosdns 配置是自定义形态, 未改动(不猜着改)。"; rm -rf "$wd"; return 1
+  fi
+
+  # ── 候选二: profile.env。在子 shell 里把 PROFILE_ENV 指到临时副本, 复用 _profile_set。 ──
+  python3 "$txm" read --target profile_env > "$wd/prof.raw" 2>"$wd/err" || {
+    c_y "❌ 读不到 profile.env: $(tr -d '\n' < "$wd/err") → 未改动任何文件。"; rm -rf "$wd"; return 1; }
+  local prof_sha; prof_sha="$(head -1 "$wd/prof.raw")"
+  tail -n +2 "$wd/prof.raw" > "$wd/prof.cur"
+  cp "$wd/prof.cur" "$wd/prof.new"
+  ( PROFILE_ENV="$wd/prof.new"; _profile_set PDG_HIJACK_MODE "$mode" ) || {
+    c_y "❌ 生成 profile.env 候选失败 → 未改动任何文件。"; rm -rf "$wd"; return 1; }
+
+  # ── 幂等: 两个候选都与现网一致就什么都不做。不开事务 —— 开了就会留下 PREPARING。 ──
+  local mos_changed=0 prof_changed=0
+  [[ "$shape" == changed ]] && mos_changed=1
+  cmp -s "$wd/prof.cur" "$wd/prof.new" || prof_changed=1
+  if [[ "$mos_changed" == 0 && "$prof_changed" == 0 ]]; then
     echo "  (配置已是 $mode 形态, 无需改动)"
+    c_g "✅ 劫持模式 → $mode(无变化)"; rm -rf "$wd"; return 0
   fi
-  rm -f /etc/mosdns/config.yaml.hjbak
-  install -d -m700 /etc/privdns-gateway
-  if grep -q '^PDG_HIJACK_MODE=' /etc/privdns-gateway/profile.env 2>/dev/null; then
-    sed -i "s/^PDG_HIJACK_MODE=.*/PDG_HIJACK_MODE=$mode/" /etc/privdns-gateway/profile.env
-  else
-    echo "PDG_HIJACK_MODE=$mode" >> /etc/privdns-gateway/profile.env
+
+  txid="$(python3 "$txm" new --source cli --op hijack-mode 2>"$wd/err")" || {
+    c_y "❌ 无法开始配置事务: $(tr -d '\n' < "$wd/err")"; rm -rf "$wd"; return 1; }
+  # expect 用 read 时拿到的 sha: 生成候选期间有人改了同一个文件, 落盘阶段会当场撞出来,
+  # 而不是把别人的修改静默盖掉。"-" = 读的时候它就不存在。
+  local t
+  for t in "mosdns_conf:$wd/mos.new:$mos_sha" "profile_env:$wd/prof.new:$prof_sha"; do
+    # 分成四条 local: 同一条 `local a=… b=$a` 里后者取不到前者的值(bash 语义), 在 set -u
+    # 下会直接炸成 unbound variable, 把整个 stage 循环打断。
+    local tgt; tgt="${t%%:*}"
+    local rest; rest="${t#*:}"
+    local cand; cand="${rest%%:*}"
+    local exp; exp="${rest#*:}"
+    python3 "$txm" stage --tx "$txid" --target "$tgt" --file "$cand" --expect "$exp" 2>"$wd/err" || {
+      c_y "❌ 暂存候选失败($tgt): $(tr -d '\n' < "$wd/err") → 未改动任何文件。"; rc=1; break; }
+  done
+  if [[ "$rc" != 0 ]]; then
+    python3 "$txm" abort "$txid" >/dev/null 2>&1 || true   # 候选阶段放弃: 现网一字节没动
+    rm -rf "$wd"; return 1
   fi
-  echo "✅ 劫持模式 → $mode"
+  # 只有 mosdns 真的变了才重启它 —— 光改真源记录不该顺手打断 DNS。
+  [[ "$mos_changed" == 1 ]] && python3 "$txm" service --tx "$txid" --action restart:mosdns >/dev/null 2>&1
+  local out
+  out="$(python3 "$txm" apply --tx "$txid" 2>"$wd/err")"; rc=$?
+  if [[ "$rc" == 0 ]]; then
+    [[ "$mos_changed" == 1 ]] || echo "  (mosdns 形态已是 $mode, 本次只更新真源记录)"
+    c_g "✅ 劫持模式 → $mode(mosdns 与真源同一笔事务落盘)"
+    rm -rf "$wd"; return 0
+  fi
+  # 失败后顺手收掉这笔事务。abort 自己守着门: 只接受 PREPARING/VALIDATED(现网还没被碰过),
+  # 已经动过现网的状态它会拒绝并保留原状 —— 所以这里无条件调是安全的, 既不会把
+  # ROLLED_BACK/ROLLBACK_FAILED 抹成 ABORTED, 也不会让"被拒绝"的尝试堆一地 PREPARING。
+  python3 "$txm" abort "$txid" >/dev/null 2>&1 || true
+  case "$rc" in
+    4) c_y "⛔ 已有配置操作在执行(锁被占用), 本次未改动任何文件。";;
+    5) c_y "⛔ 拒绝执行(未改动任何文件):"
+       [[ -s "$wd/err" ]] && sed 's/^/    /' "$wd/err";;
+    *) c_y "❌ 劫持模式切换失败, 已按 before-image 回滚:"
+       [[ -s "$wd/err" ]] && sed 's/^/    /' "$wd/err"
+       [[ -n "$out" ]] && printf '%s\n' "$out" | sed 's/^/    /'
+       c_y "   如显示回滚不完整(ROLLBACK_FAILED), 用 sudo pdg tx show $txid 查看后再 recover。";;
+  esac
+  rm -rf "$wd"; return 1
 }
 
 # 显式迁移: 先上锁、先快照, 再跑幂等迁移, 并记一笔审计(source=cli, op=migrate)。
