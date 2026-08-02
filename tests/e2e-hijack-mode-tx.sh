@@ -10,6 +10,11 @@
 #   · mosdns 先覆盖现网再重启检查, profile.env 用 sed -i/>> 且完全没有回滚 ——
 #     于是"mosdns 成了、profile 没成"这种半状态没有任何东西兜得住。
 #
+# 给将来做负控的人留一句: pdg.sh 里 `_pdg_cidr_transact` 与 `_pdg_hijack_transact` 的
+# apply 收尾**逐字节相同**。想改坏 hijack 这一条来验负控时, 锚点必须带上它独有的上下文
+# (如 `mos_changed` 那一行), 否则一次性替换会命中前者 —— 被测函数根本没被改坏, 测试照绿,
+# 看起来像"判据抓不住", 其实是负控空转。这个坑本轮真踩过一次。
+#
 # 锁的用法有个坑值得写下来: 本命令**不能**调 pdg.sh 自己的 `_lock`。那个锁与 pdgtx 的
 # 是同一个文件(都是 $PDG_LOCKFILE), shell 先 flock 住再让子进程 python 去 flock 同一个
 # 文件, 子进程必然拿不到 → 每次都 TxBusy。cmd_detect_cidr 就是因此刻意不上 shell 锁, 只
