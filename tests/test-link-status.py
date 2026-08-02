@@ -201,18 +201,28 @@ def main():
     print()
     print("── 3c. nft 那层必须真读内核, 不能只读磁盘 ──")
     # 把"读内核"这一步换成读不到, 采集器就该判 L8_NFT_DRIFT。若它只读磁盘, 这里会照常 PASS。
+    # 两头都要证:
+    #   a) 采集器**真的发出过**向内核要 ruleset 的那条命令(只读磁盘的实现发不出);
+    #   b) 那条命令失败时状态是 FAIL —— L8_NFT_DRIFT 这个 code 在 PASS 分支里也用,
+    #      只查 code 在不在会放过"改成读磁盘所以两边永远相同"这种实现。
     _orig_run = checks._run
+    seen = []
     def _fake_run(cmd, t=10):
+        seen.append(list(cmd))
         if cmd[:2] == ["nft", "list"] and "table" in cmd:
             return 1, "", "no kernel table"
         return _orig_run(cmd, t)
     checks._run = _fake_run
     try:
-        codes = {f["code"] for f in L._l8_services({"platform": "android"})}
+        nftf = [f for f in L._l8_services({"platform": "android"}) if f["code"] == "L8_NFT_DRIFT"]
     finally:
         checks._run = _orig_run
-    (ok if "L8_NFT_DRIFT" in codes else bad)(
-        "内核里读不到 inet pdg → L8_NFT_DRIFT(实得 %s)" % sorted(codes))
+    kern_q = [c for c in seen if c[:2] == ["nft", "list"] and "table" in c and "pdg" in c]
+    (ok if kern_q else bad)(
+        "采集器向内核查了 ruleset(实发命令: %s)" % (kern_q[0] if kern_q else "一条都没有"))
+    (ok if nftf and nftf[0]["status"] == L.FAIL else bad)(
+        "内核读不到 inet pdg → L8_NFT_DRIFT/FAIL(实得 %s)"
+        % [(f["status"], f["code"]) for f in nftf])
 
     print()
     print("── 3d. 模块进了单一真源, 两平台都装 ──")
