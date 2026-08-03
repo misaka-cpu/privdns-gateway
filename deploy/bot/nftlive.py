@@ -30,15 +30,22 @@ TABLE_FAMILY = "inet"
 TABLE_NAME = "pdg"
 DISK_CONF = "/etc/nftables.conf"
 
-# 手机链路必需的入站放行端口(来源必须限定在内网卡段):
-#   53  DNS      853 DoT      81 链路诊断的 HTTP 探测入口(6.1B 起两平台公共)
-#   7893 mihomo redir 入口    8445 救援平面
-# 少任何一个, 手机那条路就有一段不通, 而用户只会看到"连不上"。
-# 取自 deploy/firewall/nftables-mihomo.conf 的 input 链(唯一真源), 不是凭印象列的:
-#   ip saddr <CIDR> tcp dport { 53, 81, 853, 7893, 8445 } accept
-#   53 DNS · 81 链路诊断 HTTP 探测(6.1B 起两平台公共) · 853 DoT
-#   7893 mihomo redir 的落点(80/443 在 prerouting 被改写到这里) · 8445 救援平面
-REQUIRED_INTERNAL_TCP = (53, 81, 853, 7893, 8445)
+# **手机链路核心**的入站放行端口(来源必须限定在内网卡段)。少任何一个, 手机那条路就有一段
+# 不通, 而用户只会看到"连不上" —— 所以它们是创建手机链路测试会话的硬门。
+#   53   DNS(mosdns)
+#   81   链路诊断的 HTTP 探测入口(6.1B 起 Android/iOS 公共)
+#   853  DoT
+#   7893 mihomo 的 redir 落点 —— 80/443 在 prerouting 被改写到这里
+#
+# 模板那一行是 `tcp dport { 53, 81, 853, 7893, 8445 } accept`, 但 **8445 不在这份清单里**:
+# 查过真源(lib/rescue.sh:19 与 CHANGELOG)—— 8445 是 **Telegram SOCKS5**(mihomo 的 mixed
+# 监听, TG 内置代理填 网关IP:8445), 救援平面是 **8446**(PDG_RESCUE_PORT 默认值, 模板里
+# 单独一行 `tcp dport __RESCUE_PORT__ accept`)。我上一轮把 8445 注成"救援平面", 是错的。
+# TG SOCKS5 与救援平面都是可选功能: 它们不通不会让"HTTP 探测到没到达网关"这个结论失真,
+# 因此由 doctor 点名即可, 不该挡住基础链路测试。
+REQUIRED_INTERNAL_TCP = (53, 81, 853, 7893)
+# 可选功能占用的端口: doctor 关心, 但不进链路硬门。
+OPTIONAL_INTERNAL_TCP = {8445: "Telegram SOCKS5", 8446: "救援平面", 9090: "内核状态接口"}
 # UDP 53 单独列: 手机的普通 DNS 查询走 UDP, 少了它整条链路第一步就断。以前 doctor 只查
 # "敏感端口有没有对全网开放", 根本不看必需规则在不在 —— 于是把 udp 53 写成 tcp 53 这种
 # 错误两套检查都发现不了(测试里那一格就是这么红的)。
