@@ -183,7 +183,7 @@ def capture(args):
 
     members = manifest_members(repo, plat)
     snap["manifest"] = {"count": len(members), "names": sorted(m["name"] for m in members)}
-    expect = {"android": 24, "ios": 30}.get(plat)
+    expect = {"android": 25, "ios": 31}.get(plat)
     if expect is not None and len(members) != expect:
         raise SystemExit("manifest 数量漂移: %s 平台应为 %d 项, 实得 %d" % (plat, expect, len(members)))
 

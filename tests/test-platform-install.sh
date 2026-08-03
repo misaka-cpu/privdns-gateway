@@ -574,7 +574,7 @@ grep -q '5228-5230' "$WORK/nfa" && ok "Android: _pdg_nft_strip_gms 空操作(保
 # ── D. migrate_android_cleanup: 删 iOS 残留 unit/文件, 保留 CA/地点数据 ──────────
 # 该函数用绝对路径(/etc/systemd/system, /opt/pdg-bot) → 沙箱难注入; 用静态断言核对关键行为。
 u="$ROOT/deploy/bot/pdg.sh"
-grep -q 'migrate_android_cleanup' "$u" && grep -q 'disable --now "\$u"' "$u" && ok "存在 Android 残留清理(停用+删 pdg-mitm unit; probe81 已是公共件不在此列)" || bad "缺 Android 清理逻辑"
+grep -q 'migrate_android_cleanup' "$u" && grep -q 'disable --now pdg-mitm' "$u" && ok "存在 Android 残留清理(停用+删 pdg-mitm unit; probe81 已是公共件不在此列)" || bad "缺 Android 清理逻辑"
 grep -q 'CA/地点数据保留为休眠' "$u" && ok "Android 清理保留 CA/地点数据(不永久删)" || bad "未保留用户数据"
 # ── D2. 按平台部署: 真跑一次部署, 不再用"源码里出现某一行"当证据 ──────────────
 # 原先这条 grep 的是 pdg.sh 里一行具体的 case 分支。判据一旦长在源码字面上, 换个等价写法

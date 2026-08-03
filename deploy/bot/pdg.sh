@@ -2131,11 +2131,12 @@ PY
   local removed=0 u f
   # pdg-probe81 **不再**在这里清理: 它已是 Android/iOS 公共组件, 删掉会让 Android
   # 装完又被迁移抹掉, 平台来回切也不幂等。只清真正的 iOS 专属件。
-  for u in pdg-mitm; do
-    if [[ -f /etc/systemd/system/$u.service ]]; then
-      systemctl disable --now "$u" 2>/dev/null; rm -f "/etc/systemd/system/$u.service"; removed=1
-    fi
-  done
+  # 现在只剩 pdg-mitm 一个(probe81 已转公共件), 就别硬套循环了: 单元素 for 会触发
+  # SC2043, 而且读的人会以为这里还有别的 unit 要清。
+  if [[ -f /etc/systemd/system/pdg-mitm.service ]]; then
+    systemctl disable --now pdg-mitm 2>/dev/null
+    rm -f /etc/systemd/system/pdg-mitm.service; removed=1
+  fi
   for f in /opt/pdg-bot/mitm_ca.py /opt/pdg-bot/mitm_server.py /opt/pdg-bot/mitm_wloc.py \
            /opt/pdg-bot/iosprofile.py /opt/pdg-bot/iosstate.py \
            /opt/pdg-bot/pdg-dot.mobileconfig.tmpl /opt/pdg-bot/pdg-mitm.mobileconfig.tmpl; do
@@ -3700,11 +3701,10 @@ cmd_platform(){
   # 只取第一行并在空值时兜底: systemctl 这些子命令是"既打印状态又用退出码表态", 拿
   # `cmd || echo disabled` 兜底会打印两遍, 多出来的那行会被下面的 read 当成新记录读走。
   local _psvc _pstate _pen _pac; _pstate=""
-  for _psvc in pdg-mitm; do
-    _pen="$(systemctl is-enabled "$_psvc" 2>/dev/null | head -1)"
-    _pac="$(systemctl is-active  "$_psvc" 2>/dev/null | head -1)"
-    _pstate="$_pstate$_psvc|${_pen:-disabled}|${_pac:-inactive}"$'\n'
-  done
+  _psvc=pdg-mitm
+  _pen="$(systemctl is-enabled "$_psvc" 2>/dev/null | head -1)"
+  _pac="$(systemctl is-active  "$_psvc" 2>/dev/null | head -1)"
+  _pstate="$_psvc|${_pen:-disabled}|${_pac:-inactive}"$'\n'
   _plat_rollback(){
     local g
     for g in platform profile.env mitm.json nftables.conf config.yaml mitm_hijack.txt; do
@@ -3833,16 +3833,22 @@ cmd_platform(){
 cmd_link(){
   local sub="${1:-status}"
   case "$sub" in
-    status) shift || true;;
+    status) shift || true
+      local m; m="$(_pdg_module linkstat.py)" || { echo "❌ 找不到 linkstat.py"; return 1; }
+      python3 "$m" "$@"; return $?;;
+    session) shift || true
+      # 会话是**运行时状态**(/run/pdg-probe81/), 不是受管配置: 既不进 pdgtx, 也不取
+      # 全局配置写锁 —— 上锁只会让它和真正的配置写路径互相挡道。
+      local m; m="$(_pdg_module linksess.py)" || { echo "❌ 找不到 linksess.py"; return 1; }
+      python3 "$m" "$@"; return $?;;
     -h|--help|help)
       echo "用法: pdg link status [--json]"
-      echo "  只报告**服务器准备状态**(只读, 不改任何东西)。"
-      echo "  手机/SIM 那条链路本轮还观测不到, 会明确显示为「未观察到」。"
+      echo "      pdg link session <start|status|stop> [--json]"
+      echo "  status  只报告**服务器准备状态**(只读, 不改任何东西)。"
+      echo "  session 建一次性 token 的手机协助会话, 观察 HTTP 与 DNS 两类证据。"
       return 0;;
-    *) echo "用法: pdg link status [--json]"; return 1;;
+    *) echo "用法: pdg link <status|session> …"; return 1;;
   esac
-  local m; m="$(_pdg_module linkstat.py)" || { echo "❌ 找不到 linkstat.py"; return 1; }
-  python3 "$m" "$@"
 }
 
 cmd_hijack_mode(){
@@ -4062,5 +4068,5 @@ case "${1:-menu}" in
   link)          shift || true; cmd_link "$@";;
   uninstall|rm)  shift || true; cmd_uninstall "$@";;
   rescue)        shift || true; cmd_rescue "$@";;
-  *) echo "用法: pdg [menu|status|doctor [--json|--deep]|update [--dry-run]|snapshot|rollback [n]|token|restart|log [n]|traffic|ios [status|diff|previous|ack|recover|repair](仅 iOS)|report [--redact-ip|--full]|detect-cidr|platform <ios|android>|hijack-mode <all|gfw>|link status|migrate|migrate-fw|tx <list|show|recover|abort>|rescue <enable|disable|status|fingerprint|bind <IPv4>|rotate-token|rotate-cert>|uninstall [--purge]]";;
+  *) echo "用法: pdg [menu|status|doctor [--json|--deep]|update [--dry-run]|snapshot|rollback [n]|token|restart|log [n]|traffic|ios [status|diff|previous|ack|recover|repair](仅 iOS)|report [--redact-ip|--full]|detect-cidr|platform <ios|android>|hijack-mode <all|gfw>|link status|link session <start|status|stop>|migrate|migrate-fw|tx <list|show|recover|abort>|rescue <enable|disable|status|fingerprint|bind <IPv4>|rotate-token|rotate-cert>|uninstall [--purge]]";;
 esac

@@ -135,6 +135,9 @@ jobs:
       - name: "probe81 转公共组件 (install/update/迁移/平台切换/doctor/卸载 全链路)"
         run: python3 tests/test-probe81-platform.py
 
+      - name: "链路会话: token/TTL/单次消费/限流/隐私 + root↔DynamicUser 文件交接"
+        run: python3 tests/test-link-session.py
+
       # 夹具自己漏资源, 会以"产品偶发失败"的样子冒出来 —— 判据落在真实线程/端口/目录上。
       - name: "txbox 探针生命周期 (clean 后线程必须退出/端口必须释放/50 个 Box 回到基线)"
         run: python3 tests/test-txbox-probes.py
