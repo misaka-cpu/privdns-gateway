@@ -44,7 +44,11 @@ def bad(m):
 OVERREACH = ("SIM 正常", "APN 正常", "SIM/APN 正常", "DoT 正常", "DoT 已通",
              "手机网络正常", "移动网络正常", "链路完全正常", "链路正常",
              "整体联网正常", "手机已连通", "运营商私网正常")
-_NEG = re.compile(r"[不没未无][^。;；\n]{0,14}$")
+# 否定与被否定的词之间**不能有句读**(。;；换行) —— 这是"同一句话里被否掉"的判据。
+# 回看窗口放宽到 40 字: 一句话可以一次否掉一串("不能证明 DoT、SIM/APN 或整体联网正常"),
+# 14 字够不到那个"不", 会把正确写法判成越界。窗口再宽也仍受"中间无句读"约束, 隔壁
+# 句子的否定词借不过来 —— 下面 6 节有负控盯着这一点。
+_NEG = re.compile(r"[不没未无][^。;；\n]{0,40}$")
 
 
 def scan(text, where):
@@ -52,7 +56,7 @@ def scan(text, where):
     bare = []
     for w in OVERREACH:
         for m in re.finditer(re.escape(w), text):
-            lead = text[max(0, m.start() - 16):m.start()]
+            lead = text[max(0, m.start() - 48):m.start()]
             if not _NEG.search(lead):
                 bare.append((w, text[max(0, m.start() - 16):m.end() + 6]))
     (ok if not bare else bad)(
@@ -145,6 +149,29 @@ for label, txt, need in (
     (ok if not miss else bad)("%s 保留了拒绝 mosdns API 的完整理由(缺 %s)" % (label, miss))
 (ok if "不等于「手机显示的位置已经变了」" in readme else bad)(
     "README 仍保留「网关改写响应 ≠ 手机显示的位置已改变」的边界")
+
+print()
+print("── 4d. 放宽后的否定判据仍然抓得住裸用 ──")
+# 上面把回看窗口从 14 放宽到 40, 必须证明它没被放成筛子。
+_probe = [
+    ("这只证明请求到达网关，不代表 DoT、SIM/APN 或整体联网正常。", True,  "同句列表否定"),
+    ("HTTP 请求已到达。DoT 正常。", False, "隔壁句子的否定借不过来"),
+    ("SIM/APN 正常，可以放心使用。", False, "裸用"),
+    ("链路已通，整体联网正常。", False, "裸用(前面无否定)"),
+    ("本版本无法判断 DoT 正常与否。", True,  "同句否定"),
+]
+for _txt, _should_pass, _why in _probe:
+    _bare = []
+    for _w in OVERREACH:
+        for _m in re.finditer(re.escape(_w), _txt):
+            _lead = _txt[max(0, _m.start() - 48):_m.start()]
+            if not _NEG.search(_lead):
+                _bare.append(_w)
+    _passed = not _bare
+    (ok if _passed == _should_pass else bad)(
+        "%s: %r 判为%s(期望%s)" % (_why, _txt[:22],
+                                  "合规" if _passed else "越界",
+                                  "合规" if _should_pass else "越界"))
 
 print()
 print("── 5. NOT_OBSERVED 既不是故障, 也不影响退出码 ──")

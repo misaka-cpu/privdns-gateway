@@ -239,12 +239,16 @@ def _nav(key):
              {"text": "🗑 删规则集", "callback_data": "del_rs"}],
             [{"text": "✏️ 改规则集名", "callback_data": "edit_rs"}, {"text": "🔎 测域名(查走哪)", "callback_data": "testdom"}]]),
         # 客户端接入按平台分岔: Android 只给私密DNS 主机名; iOS 只给描述文件按钮。公共项(DoT 域名 / TG 出口)两平台都留。
+        # 「手机链路测试」两平台都有: 它验的是"手机经内网卡到不到得了网关", 与 iOS 描述文件
+        # 或 Android 私密 DNS 都无关 —— 哪个平台连不上都要能查。
         "client": ((f"📱 <b>客户端接入</b>\nDoT 域名：<code>{_dot_host()}</code>\n请生成并安装 iOS 描述文件。", [
             [{"text": "📱 iOS 描述文件", "callback_data": "ios"}],
+            [{"text": "📡 手机链路测试", "callback_data": "linktest"}],
             [{"text": "🌐 DoT 自定义域名", "callback_data": "setdot"}],
             [{"text": "✈️ Telegram 出口", "callback_data": "tgexit"}]])
             if _platform() == "ios" else
             (f"📱 <b>客户端接入</b>\nAndroid 私密 DNS：<code>{_dot_host()}</code>", [
+            [{"text": "📡 手机链路测试", "callback_data": "linktest"}],
             [{"text": "🌐 DoT 自定义域名", "callback_data": "setdot"}],
             [{"text": "✈️ Telegram 出口", "callback_data": "tgexit"}]])),
         "ops": ("🛠 <b>运维</b> — 选一项:", [
@@ -3946,6 +3950,164 @@ def kb_pick_named(prefix, items, back=BACK):
     return {"inline_keyboard": rows}
 
 # ── 回调 (原地编辑) ──
+# ── 📡 手机链路测试 (6.1C) ───────────────────────────────────────────────────
+# 只把 6.1B 已经做完的东西接到手机能点的地方: 会话协议、来源判定、状态模型全部复用
+# linksess / linkstat。这里**不**产生任何新的判据 —— 一旦 Bot 自己算一套, 它和 CLI 迟早
+# 说不一样的话, 而用户只看得到 Bot 那一份。
+#
+# 能证明的只有两件事: 网关观察到本次会话的 HTTP 请求; 该请求来源在不在配置的内网卡段。
+# 推不出 DoT / SIM/APN / 移动网络 / 整体联网 / 分流出口是否正常, 也不能断定请求一定来自
+# 用户本人的手机(任何拿到那条链接的人都能打开它)。
+LINK_INTRO = (
+    "📡 <b>手机链路测试</b>\n\n"
+    "这项测试只确认手机能否通过内网卡访问网关，以及请求来源是否位于配置的内网卡段。"
+    "它不能证明 DoT、SIM/APN 或整体联网正常。")
+LINK_START_HINT = ("请关闭普通 Wi-Fi，保留内网卡，然后打开测试页。"
+                   "链接 5 分钟内有效，只能使用一次。")
+LINK_WAITING = "尚未收到本次测试请求。"
+LINK_INSIDE = ("✅ 网关已收到本次 HTTP 测试请求。\n"
+               "请求来源位于配置的内网卡段。\n"
+               "这只证明 HTTP 测试请求到达网关，不代表 DoT、SIM/APN 或整体联网正常。")
+LINK_OUTSIDE = ("⚠️ 网关已收到请求，但来源不在配置的内网卡段。\n"
+                "请确认已关闭普通 Wi-Fi，并使用项目对应的内网卡。")
+LINK_EXPIRED = "⌛ 本次测试已过期，请重新开始。"
+
+# 结果页的键盘。带 token 的 URL 按钮**只在等待中的那一屏**出现, 出结果/取消/过期后一律撤掉。
+LINK_BACK = {"inline_keyboard": [
+    [{"text": "🔄 查看结果", "callback_data": "linktest:check"}],
+    [{"text": "🩺 返回自检", "callback_data": "doctor"}],
+    [{"text": "🏠 主菜单", "callback_data": "menu"}]]}
+LINK_DONE_KB = {"inline_keyboard": [
+    [{"text": "📡 再测一次", "callback_data": "linktest"}],
+    [{"text": "🩺 返回自检", "callback_data": "doctor"}],
+    [{"text": "🏠 主菜单", "callback_data": "menu"}]]}
+
+_linktest_waiters: dict[int, float] = {}     # chat -> 该会话的 expires_at(有界, 防重复点击)
+_linktest_lock = threading.Lock()
+
+
+def linkstat_collect(platform="both"):
+    """服务器准备状态。单独包一层是为了让测试能换掉它, 而不必去桩 linkstat 内部。"""
+    import linkstat
+    return linkstat.collect(platform=platform)
+
+
+def _link_server_blockers():
+    """服务器侧的 FAIL 项。有就不建会话 —— 让用户拿着一条注定失败的链接去手机上折腾,
+    只会把"服务器没起来"误诊成"手机有问题"。"""
+    try:
+        fs = linkstat_collect(platform=_platform())
+    except Exception:  # noqa: BLE001
+        return []                      # 采集不了就不当成阻塞项(它自己会在自检里报)
+    import linkstat
+    return [f for f in fs
+            if f.get("status") == linkstat.FAIL and not linkstat.is_phone_evidence(f)]
+
+
+def linktest_result_text():
+    """当前会话的结论。**自动等待与手动查看共用这一个函数** —— 两套写法迟早说不一样的话。
+
+    返回 (文案, 是否已终结)。终结 = 出了结果/过期/没会话, 后台不必再等。
+    """
+    import linksess
+    st = linksess.status()
+    sess = st.get("session")
+    reason = st.get("reason")
+    if sess is None:
+        if reason == linksess.R_STATE_CORRUPT:
+            return ("⛔ 会话状态文件已损坏，本次测试无法继续。\n"
+                    "为避免给出错误结论，这里不会自动新建会话；请重新开始测试。", True)
+        if reason == linksess.R_STATE_UNWRITABLE:
+            return ("⛔ 会话目录不可写（/run 出问题？），无法建立测试会话。\n"
+                    "请在服务器上检查后重试；普通的 DNS 与代理不受影响。", True)
+        return ("当前没有进行中的测试。点「📡 手机链路测试」重新开始。", True)
+    if not st.get("active"):
+        return (LINK_EXPIRED, True)
+    if sess.get("state") == "rate_limited" or (
+            sess.get("invalid_attempts", 0) >= sess.get("max_invalid_attempts", 3)):
+        return ("⛔ 无效尝试次数过多，本次测试已停止接受请求。\n"
+                "请重新开始一次测试。", True)
+    if not sess.get("http_consumed"):
+        left = sess.get("remaining_secs", 0)
+        return ("%s\n\n链接还有约 %d 秒有效。做完后点「🔄 查看结果」。"
+                % (LINK_WAITING, left), False)
+    src = sess.get("source") or {}
+    inside = src.get("inside_internal_cidr")
+    seg = src.get("ipv4_16") or "未记录"
+    if inside is True:
+        return ("%s\n\n（来源网段 %s）" % (LINK_INSIDE, seg), True)
+    if inside is False:
+        return ("%s\n\n（来源网段 %s）" % (LINK_OUTSIDE, seg), True)
+    return ("✅ 网关已收到本次 HTTP 测试请求。\n"
+            "但服务器上没有配置内网卡来源段，无法判断这次请求是不是来自内网卡。\n"
+            "这只证明 HTTP 测试请求到达网关，不代表 DoT、SIM/APN 或整体联网正常。"
+            "\n\n（来源网段 %s）" % seg, True)
+
+
+def _linktest_watch(chat, mid, expires_at):
+    """有界、非阻塞地等结果。Bot 重启后这个等待就没了 —— 用户仍可用「🔄 查看结果」从
+    /run 里读未过期的会话, 所以这里不做任何持久化。"""
+    import linksess
+    try:
+        while time.time() < expires_at + 1:
+            txt, done = linktest_result_text()
+            if done:
+                edit_only(chat, mid, txt, LINK_DONE_KB)
+                return
+            time.sleep(2)
+        edit_only(chat, mid, LINK_EXPIRED, LINK_DONE_KB)
+    finally:
+        with _linktest_lock:
+            _linktest_waiters.pop(chat, None)
+
+
+def linktest_start(chat, mid):
+    import linksess
+    blockers = _link_server_blockers()
+    if blockers:
+        lines = "\n".join("• %s：%s" % (f["title"], f["detail"]) for f in blockers[:5])
+        edit(chat, mid,
+             "⛔ 服务器侧还没准备好，先修好这些再测手机：\n\n%s\n\n"
+             "这时候发测试链接只会把服务器的问题误诊成手机的问题，所以本次没有创建测试会话。"
+             % lines, LINK_DONE_KB)
+        return
+    # 重复点击: 已有等待中的会话就直接给现状, 不再建一个把上一个顶掉
+    with _linktest_lock:
+        busy_until = _linktest_waiters.get(chat, 0)
+    if busy_until > time.time():
+        txt, _done = linktest_result_text()
+        edit(chat, mid, "本次测试还在进行中。\n\n" + txt, LINK_BACK)
+        return
+    okk, payload = linksess.start_session()
+    if not okk:
+        edit(chat, mid, "⛔ %s\n\n本次没有创建测试会话；普通的 DNS 与代理不受影响。"
+             % payload.get("error", "会话建立失败"), LINK_DONE_KB)
+        return
+    # token 原文**只**出现在这个一次性按钮的 url 里, 正文与 callback data 都不带它
+    kb = {"inline_keyboard": [
+        [{"text": "🌐 打开测试页", "url": payload["step1_url"]}],
+        [{"text": "🔄 查看结果", "callback_data": "linktest:check"},
+         {"text": "✖️ 取消测试", "callback_data": "linktest:cancel"}],
+        [{"text": "🩺 返回自检", "callback_data": "doctor"}],
+        [{"text": "🏠 主菜单", "callback_data": "menu"}]]}
+    edit(chat, mid, "%s\n\n%s\n\n%s" % (LINK_INTRO, LINK_START_HINT, LINK_WAITING), kb)
+    with _linktest_lock:
+        _linktest_waiters[chat] = payload["expires_at"]
+    try:
+        _EXEC.submit(_linktest_watch, chat, mid, payload["expires_at"])
+    except Exception:  # noqa: BLE001   执行器满/已关 → 撤掉占用, 用户仍可手动查看
+        with _linktest_lock:
+            _linktest_waiters.pop(chat, None)
+
+
+def linktest_cancel(chat, mid):
+    import linksess
+    linksess.clear_state()
+    with _linktest_lock:
+        _linktest_waiters.pop(chat, None)
+    edit(chat, mid, "已取消本次测试，测试链接立即失效。", LINK_DONE_KB)
+
+
 def handle_cb(chat, mid, data):
     # 用户对这条消息做了新操作 → 还挂在它上面的 WLOC 监听立即作废。否则用户点了「返回菜单」,
     # 30 秒后监听把菜单原地改成一句"尚未收到请求", 正看着的界面就没了。
@@ -3973,6 +4135,19 @@ def handle_cb(chat, mid, data):
         domain = data[9:]
         edit(chat, mid, f"正在为 <code>{domain}</code> 校验 A 记录并签证书(约 30-60 秒, 代理短暂中断)…", BACK)
         ok, msg = set_dot_domain(domain); edit(chat, mid, (msg if ok else "❌ " + msg), MENU); return
+    if data == "linktest":
+        edit(chat, mid, LINK_INTRO, {"inline_keyboard": [
+            [{"text": "▶️ 开始测试", "callback_data": "linktest:start"}],
+            [{"text": "🔄 查看结果", "callback_data": "linktest:check"}],
+            [{"text": "🩺 返回自检", "callback_data": "doctor"}],
+            [{"text": "🏠 主菜单", "callback_data": "menu"}]]}); return
+    if data == "linktest:start":
+        linktest_start(chat, mid); return
+    if data == "linktest:check":
+        txt, done = linktest_result_text()
+        edit(chat, mid, txt, LINK_DONE_KB if done else LINK_BACK); return
+    if data == "linktest:cancel":
+        linktest_cancel(chat, mid); return
     if data == "test":
         edit(chat, mid, "测试中…", BACK); edit(chat, mid, test_exits(), BACK); return
     if data == "doctor":

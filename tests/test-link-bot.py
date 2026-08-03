@@ -48,7 +48,8 @@ ROOTFS = tempfile.mkdtemp(prefix="linkbot-")
 RUNDIR = os.path.join(ROOTFS, "run", "pdg-probe81")
 os.makedirs(RUNDIR, exist_ok=True)
 os.makedirs(os.path.join(ROOTFS, "etc", "privdns-gateway"), exist_ok=True)
-os.environ["PDG_LINK_RUNTIME"] = RUNDIR
+os.environ["PDG_LINK_RUNTIME"] = RUNDIR          # linkstat 用这个
+os.environ["PDG_PROBE81_RUNTIME_DIR"] = RUNDIR   # linksess 用的是这个(名字不同)
 os.environ["PDG_TX_FSROOT"] = ROOTFS
 os.environ["PDG_LOCKFILE"] = os.path.join(ROOTFS, "run", "privdns-gateway.lock")
 os.environ.setdefault("PDG_BOT_ALLOWED", "1")
@@ -70,6 +71,7 @@ POSTS = []      # (method, payload) —— 直连 Telegram API 的调用
 LOGS = []
 SHELL = []      # 被执行的外部命令
 LOCKED = []     # 取过全局配置锁的次数
+SUBMITS = []    # 提交给后台执行器的任务(用假执行器收集)
 
 
 def setup(platform="android", server_ready=True):
@@ -106,6 +108,20 @@ def setup(platform="android", server_ready=True):
                                   evidence_source="test"))
         return base
     bot.linkstat_collect = fake_collect     # 若实现改用别的名字, 下面的断言会指出来
+
+    # 后台等待器换成**可控的假执行器**: 真线程会和断言抢着编辑消息, 让结果随调度摆动。
+    # 同时这也让"有没有重复提交后台任务"变得可数 —— 这正是要验的东西之一。
+    SUBMITS.clear()
+
+    class _FakeExec:
+        def submit(self, fn, *a, **kw):
+            SUBMITS.append((fn, a, kw))
+            return None
+    bot._EXEC = _FakeExec()
+    # 进程内的等待表: 每格用例都从"没有进行中的测试"开始, 否则上一格的残留会让这一格
+    # 走进"本次测试还在进行中"的分支, 看上去像功能坏了。
+    if hasattr(bot, "_linktest_waiters"):
+        bot._linktest_waiters.clear()
     S.clear_state()
 
 
@@ -228,14 +244,17 @@ try:
 except Exception as e:  # noqa: BLE001
     bad("linktest:start 跑不起来: %s: %s" % (type(e).__name__, e))
 
-# 重复点击不许建出第二个会话
+# 重复点击不许建出第二个会话, 也不许堆出第二个后台等待任务
 setup()
 bot.handle_cb(1, 2, "linktest:start")
 first = json.loads(state_blob() or "{}").get("session_id")
-bot.handle_cb(1, 2, "linktest:start")
+n1 = len(SUBMITS)
+bot.handle_cb(1, 2, "linktest:start")      # 故意不 setup: 这一格验的就是"撞上进行中的会话"
 second = json.loads(state_blob() or "{}").get("session_id")
 (ok if first and first == second else bad)(
     "重复点击复用同一个会话, 不产生互相竞争的两份(%s → %s)" % (first, second))
+(ok if len(SUBMITS) == n1 == 1 else bad)(
+    "重复点击不堆第二个后台等待任务(实得 %d 个)" % len(SUBMITS))
 
 # ═══ 4. 只读: 不取配置锁 / 不开事务 / 不动服务 ═════════════════════════════
 print()
@@ -474,6 +493,81 @@ seg = BOTSRC
 (ok if not re.search(r'"http://%s:81/probe\?t=', seg) else bad)("Bot 里没有自己拼探测 URL")
 (ok if not re.search(r"def .*inside_internal_cidr", seg) else bad)("Bot 里没有自己判来源网段")
 (ok if "linksess" in seg else bad)("Bot 复用 linksess 模块")
+
+# ═══ 14. 后台等待: 异常也必须把占用释放掉 ═══════════════════════════════════
+print()
+print("══ 14. 后台占用的释放 ══")
+S.clear_state()
+setup()
+bot.handle_cb(1, 2, "linktest:start")
+(ok if len(SUBMITS) == 1 else bad)("开始测试提交了一个后台等待任务(实得 %d)" % len(SUBMITS))
+(ok if bot._linktest_waiters.get(1) else bad)("等待中的 chat 被登记(用于挡重复点击)")
+# 让等待器在跑的过程中炸掉 —— 占用必须照样释放, 否则这个 chat 从此再也测不了
+fn, args, _kw = SUBMITS[0]
+_orig = bot.linktest_result_text
+bot.linktest_result_text = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+try:
+    fn(*args)
+except Exception:  # noqa: BLE001
+    pass
+finally:
+    bot.linktest_result_text = _orig
+(ok if not bot._linktest_waiters.get(1) else bad)(
+    "后台等待器抛异常后, chat 的占用仍被释放(不然这个人再也点不动)")
+setup()
+bot.handle_cb(1, 2, "linktest:start")
+(ok if json.loads(state_blob() or "{}").get("session_id") else bad)(
+    "释放之后同一个 chat 能重新开始测试")
+
+# ═══ 15. 自动等待与手动查看是同一个结论函数 ═════════════════════════════════
+print()
+print("══ 15. 自动 = 手动(同源)══")
+S.clear_state()
+setup()
+bot.handle_cb(1, 2, "linktest:start")
+tok = token_from_last_kb()
+S._profile = lambda k: "127.0.0.0/8" if k == "PDG_INTERNAL_CIDR" else ""
+if tok:
+    S.consume(tok, "127.0.0.1")
+EDITS.clear()
+bot.handle_cb(1, 2, "linktest:check")          # 手动
+manual = EDITS[-1][0] if EDITS else ""
+EDITS.clear()
+fn, args, _kw = SUBMITS[0]
+fn(*args)                                       # 自动(同步跑一遍等待器)
+auto = EDITS[-1][0] if EDITS else ""
+(ok if manual and manual == auto else bad)(
+    "自动等待与手动查看给出**逐字相同**的结论(手动 %r / 自动 %r)"
+    % (manual[:34], auto[:34]))
+# 换一个"不该有结论"的状态再比一次 —— 相同不能只在一个分支上成立
+S.clear_state()
+setup()
+bot.handle_cb(1, 2, "linktest:start")
+EDITS.clear()
+bot.handle_cb(1, 2, "linktest:check")
+m2 = EDITS[-1][0] if EDITS else ""
+t2, done2 = bot.linktest_result_text()
+(ok if m2.startswith(t2.split("\n")[0]) and not done2 else bad)(
+    "等待中的分支也同源, 且不判为终结")
+
+# ═══ 16. 两个平台的证据语义一致 ═════════════════════════════════════════════
+print()
+print("══ 16. Android / iOS 语义一致 ══")
+texts = {}
+for plat in ("android", "ios"):
+    S.clear_state()
+    setup(platform=plat)
+    bot.handle_cb(1, 2, "linktest:start")
+    tok = token_from_last_kb()
+    S._profile = lambda k: "127.0.0.0/8" if k == "PDG_INTERNAL_CIDR" else ""
+    if tok:
+        S.consume(tok, "127.0.0.1")
+    EDITS.clear()
+    bot.handle_cb(1, 2, "linktest:check")
+    texts[plat] = EDITS[-1][0] if EDITS else ""
+(ok if texts["android"] and texts["android"] == texts["ios"] else bad)(
+    "同一种证据在两个平台上给出同一句结论(android %r / ios %r)"
+    % (texts["android"][:30], texts["ios"][:30]))
 
 print("──────────────────────────────────────────────")
 print("通过 %d, 失败 %d" % (PASS[0], FAIL[0]))
