@@ -149,6 +149,11 @@ jobs:
       - name: "手机侧证据的结论上限 (越界结论闸门 + NOT_OBSERVED 不是故障)"
         run: python3 tests/test-link-copy-boundary.py
 
+      # 6.1C 把会话接进 Bot。判据不在"功能跑得通", 而在接的过程中有没有把 6.1B 的克制
+      # 弄丢: token 只在一次性按钮里、结论不越界、状态机只有一份、整条路只读。
+      - name: "Bot 手机链路测试 (token 只在按钮/结论上限/只读/并发与故障释放)"
+        run: python3 tests/test-link-bot.py
+
       # 夹具自己漏资源, 会以"产品偶发失败"的样子冒出来 —— 判据落在真实线程/端口/目录上。
       - name: "txbox 探针生命周期 (clean 后线程必须退出/端口必须释放/50 个 Box 回到基线)"
         run: python3 tests/test-txbox-probes.py
