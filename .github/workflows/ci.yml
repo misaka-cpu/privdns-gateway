@@ -132,6 +132,9 @@ jobs:
       - name: "链路诊断平台隔离 (Android 不要求 probe81 / iOS 检查它 / 文案不串台)"
         run: python3 tests/test-link-platform.py
 
+      - name: "probe81 转公共组件 (install/update/迁移/平台切换/doctor/卸载 全链路)"
+        run: python3 tests/test-probe81-platform.py
+
       # 夹具自己漏资源, 会以"产品偶发失败"的样子冒出来 —— 判据落在真实线程/端口/目录上。
       - name: "txbox 探针生命周期 (clean 后线程必须退出/端口必须释放/50 个 Box 回到基线)"
         run: python3 tests/test-txbox-probes.py

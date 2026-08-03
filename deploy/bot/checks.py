@@ -215,16 +215,14 @@ def bot_credentials():
 
 
 def expected_services():
-    """按平台的必需服务集。pdg-probe81 是 iOS 专属(:81 探测), Android 不含。
-    pdg-mitm 由 check_mitm 单独按启用态判定, 不列入必需集。
+    """必需服务集。pdg-probe81 是 Android/iOS **公共**组件(:81 探测 + 链路会话入口),
+    两平台都必需。pdg-mitm 由 check_mitm 单独按启用态判定, 不列入必需集。
     未配 bot 凭据时 pdg-bot 不在必需集里 —— 它本来就不该启动。
     CLI/status/report/healthcheck 统一取此。"""
     svc = _core_svc()
-    names = ["mosdns", svc]
+    names = ["mosdns", svc, "pdg-probe81"]
     if bot_credentials() == "ready":
         names.append("pdg-bot")
-    if _platform() == "ios":
-        names.append("pdg-probe81")
     return names
 
 def check_services():
@@ -337,13 +335,11 @@ def check_cidr_drift():
 
 
 def platform_ports_text():
-    """按当前平台列出应放行的端口。写死一串"53/80/81/443/853/5228-5230/7893/8445"会在 iOS 上
-    声称 GMS 5228-5230 已就位(iOS 走 APNs, 装机就把它剥掉了), 在 Android 上又提 :81
-    (那是 iOS 专属的 OnDemand 探测端点, Android 根本不装 pdg-probe81)。"""
+    """按当前平台列出应放行的端口。写死一串会在 iOS 上声称 GMS 5228-5230 已就位
+    (iOS 走 APNs, 装机就把它剥掉了)。81 两平台都列 —— pdg-probe81 已是公共组件,
+    nft 模板里 81 本来也只有一份、对 __INTERNAL_CIDR__ 放行, 无平台分叉。"""
     ios = _platform() == "ios"
-    ports = ["53", "80"]
-    if ios:
-        ports.append("81(仅 iOS)")
+    ports = ["53", "80", "81"]
     ports += ["443", "853"]
     if not ios:
         ports.append("5228-5230(仅 Android)")
@@ -755,13 +751,16 @@ def check_deep_dot_handshake():
     return ("ok", "DoT 握手(853)", f"TLS 握手成功, CN={cn}")
 
 def check_deep_probe81():
-    if _platform() != "ios":
-        return None                              # :81 探测是 iOS 专属, Android 不显示也不请求
+    """:81 探测端点。两平台都查 —— pdg-probe81 已是公共组件。
+
+    iOS 靠它做 OnDemand 探测(URLStringProbe 只认 200), Android 靠它做链路诊断的
+    HTTP 会话入口。这里请求的是 `/`: 会话路径 `/probe?t=…` 需要 token, 拿它做
+    健康检查会把无效尝试计数打满。"""
     rc, out, _ = _run(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
-                       "--max-time", "5", "http://127.0.0.1:81/probe"])
+                       "--max-time", "5", "http://127.0.0.1:81/"])
     code = out.strip()
-    return ("ok", "iOS 探测(:81)", "返回 200 ✓") if code == "200" \
-        else ("fail", "iOS 探测(:81)", f"返回 {code or '无响应'}(iOS 需要 200)")
+    return ("ok", ":81 探测端点", "返回 200 ✓") if code == "200" \
+        else ("fail", ":81 探测端点", f"返回 {code or '无响应'}(需要 200)")
 
 def check_deep_dns_cn():
     # 本机源(127.0.0.1)不在内网卡段 → 走 remote_upstream; 国内域名应得真实 IP(非本机)

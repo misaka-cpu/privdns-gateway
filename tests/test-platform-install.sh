@@ -5,7 +5,7 @@
 #   B. GMS 防火墙端口迁移: Android 补 5228-5230, iOS 跳过(sing-box 侧已随内核退役)。
 #   C. migrate_ios_gms_cleanup: 删 in-gms-* 入站 + nft 移除 5228-5230(iOS)。
 #   D. migrate_android_cleanup: 删 iOS 专属 unit/文件, 保留 CA/地点数据为休眠。
-#   E. _pdg_svcs: Android 无 pdg-probe81, iOS 有。
+#   E. _pdg_svcs: 两平台都含 pdg-probe81(6.1B 起它是公共件)。
 # ─────────────────────────────────────────────────────────────────────────────
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -61,7 +61,7 @@ reset_ev; mk_marker
 # ── E. _pdg_svcs(平台服务集)──────────────────────────────────────────────────
 use_fn _pdg_svcs; _pdg_core_svc(){ echo sing-box; }
 _pdg_platform(){ echo android; }
-[[ "$(_pdg_svcs)" == "mosdns sing-box pdg-bot" ]] && ok "Android 服务集不含 pdg-probe81" || bad "Android 服务集错: $(_pdg_svcs)"
+[[ "$(_pdg_svcs)" == "mosdns sing-box pdg-bot pdg-probe81" ]] && ok "Android 服务集也含 pdg-probe81(公共件)" || bad "Android 服务集错: $(_pdg_svcs)"
 _pdg_platform(){ echo ios; }
 [[ "$(_pdg_svcs)" == *pdg-probe81* ]] && ok "iOS 服务集含 pdg-probe81" || bad "iOS 服务集缺 pdg-probe81"
 
@@ -574,7 +574,7 @@ grep -q '5228-5230' "$WORK/nfa" && ok "Android: _pdg_nft_strip_gms 空操作(保
 # ── D. migrate_android_cleanup: 删 iOS 残留 unit/文件, 保留 CA/地点数据 ──────────
 # 该函数用绝对路径(/etc/systemd/system, /opt/pdg-bot) → 沙箱难注入; 用静态断言核对关键行为。
 u="$ROOT/deploy/bot/pdg.sh"
-grep -q 'migrate_android_cleanup' "$u" && grep -q 'disable --now "\$u"' "$u" && ok "存在 Android 残留清理(停用+删 pdg-probe81/pdg-mitm unit)" || bad "缺 Android 清理逻辑"
+grep -q 'migrate_android_cleanup' "$u" && grep -q 'disable --now "\$u"' "$u" && ok "存在 Android 残留清理(停用+删 pdg-mitm unit; probe81 已是公共件不在此列)" || bad "缺 Android 清理逻辑"
 grep -q 'CA/地点数据保留为休眠' "$u" && ok "Android 清理保留 CA/地点数据(不永久删)" || bad "未保留用户数据"
 # ── D2. 按平台部署: 真跑一次部署, 不再用"源码里出现某一行"当证据 ──────────────
 # 原先这条 grep 的是 pdg.sh 里一行具体的 case 分支。判据一旦长在源码字面上, 换个等价写法
@@ -592,12 +592,17 @@ for _plat in android ios; do
 done
 _ios_only="$(comm -13 <(ls "$_pi_tmp/android" | sort) <(ls "$_pi_tmp/ios" | sort) | tr '\n' ' ')"
 _leaked=""
-for _f in mitm_ca.py mitm_server.py mitm_wloc.py probe81.py pdg-dot.mobileconfig.tmpl; do
+# 6.1B: probe81.py 已从"iOS 五件套"里挪出去 —— 它现在两平台都装, 所以既要确认它
+# 不在 iOS 专属清单里, 也要确认**两边都有**(否则 Android 会缺掉公共件)。
+for _f in mitm_ca.py mitm_server.py mitm_wloc.py pdg-dot.mobileconfig.tmpl; do
   [[ -e "$_pi_tmp/android/$_f" ]] && _leaked="$_leaked $_f"
   [[ -e "$_pi_tmp/ios/$_f" ]] || _leaked="$_leaked 缺:$_f"
 done
+for _p in android ios; do
+  [[ -e "$_pi_tmp/$_p/probe81.py" ]] || _leaked="$_leaked 缺公共件:$_p/probe81.py"
+done
 [[ -z "$_leaked" ]] \
-  && ok "Android 不装 iOS 五件套, iOS 五件套齐全(仅 iOS: $_ios_only)" \
+  && ok "Android 不装 iOS 四件套, iOS 齐全, probe81 两平台都有(仅 iOS: $_ios_only)" \
   || bad "平台部署有偏差:$_leaked"
 # 内容与 mode 都要对 —— 只看"文件在不在"挡不住装了个旧版或权限错的。
 _bad=0

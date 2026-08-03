@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""6.1A 的平台隔离: Android 不许被要求有 probe81, iOS 不许看到 Android 专属步骤。
+"""链路诊断的平台隔离: iOS 不许看到 Android 专属步骤, 反之亦然。
 
-这条容易被写反, 所以判据说清楚: `pdg-probe81` / 端口 81 / probe81.py 是 **iOS 专属**
-(lib/modules.sh 的 PDG_IOS_MODULES 里列着, nft 模板里 81 也只对内网卡段开)。Android 上
-它根本不装、不监听、也不放行 —— 那不是"缺失", 而是**不适用**。把它判成 FAIL 会让 Android
-用户去修一个本来就不该存在的东西。
+历史: 6.1A 时 `pdg-probe81` / 端口 81 / probe81.py 是 **iOS 专属**, 这支测试原本守着
+"Android 不装 = 正确"。6.1B 把它改成 Android/iOS **公共组件**(两平台都装、都起, nft
+模板里 81 本来就只有一份、对内网卡段放行)。所以本文件里凡涉及 probe81 归属的判据都
+按新事实翻了面 —— 翻面, 不是删除。
+
+仍然成立的部分: 平台专属的东西(iOS 的描述文件/OnDemand、Android 的 GMS 5228-5230)
+不许串台。
 """
 import os
 import sys
@@ -30,16 +33,19 @@ def by_layer(fs, layer):
     return [f for f in fs if f["layer"] == layer]
 
 
-print("── 1. 事实核对: probe81 确实是 iOS 专属 ──")
+print("── 1. 事实核对: probe81 是 Android/iOS 公共组件(6.1B 起) ──")
 mods = (ROOT / "lib/modules.sh").read_text(encoding="utf-8")
 ios_block = mods.split("PDG_IOS_MODULES=")[1] if "PDG_IOS_MODULES=" in mods else ""
 rt_block = mods.split("PDG_RUNTIME_MODULES=")[1].split("PDG_IOS_MODULES=")[0] \
     if "PDG_RUNTIME_MODULES=" in mods else ""
-if "probe81.py" in ios_block and "probe81.py" not in rt_block:
-    ok("probe81.py 只在 PDG_IOS_MODULES 里, 不在通用运行模块里")
+# 6.1A 时这里断言的是"只在 PDG_IOS_MODULES 里"。6.1B 把 probe81 变成公共件之后,
+# 那条断言的**事实前提**没了 —— 翻面而不是删掉: 现在要求它在通用运行模块里, 且不许
+# 同时留在 iOS 块(留着会让 iOS 装两遍)。
+if "probe81.py" in rt_block and "probe81.py" not in ios_block:
+    ok("probe81.py 在 PDG_RUNTIME_MODULES 里, 且没重复留在 iOS 块")
 else:
-    bad("probe81.py 的归属不对(iOS 块=%s, 通用块=%s)"
-        % ("probe81.py" in ios_block, "probe81.py" in rt_block))
+    bad("probe81.py 的归属不对(通用块=%s, iOS 块=%s)"
+        % ("probe81.py" in rt_block, "probe81.py" in ios_block))
 
 print()
 print("── 2. Android: 第 3 层必须 SKIP, 不能报缺失 ──")

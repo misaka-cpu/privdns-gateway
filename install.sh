@@ -874,8 +874,10 @@ install -m644 "$REPO_DIR"/deploy/bot/pdg-rules-update.service /etc/systemd/syste
 install -m644 "$REPO_DIR"/deploy/bot/pdg-rules-update.timer   /etc/systemd/system/
 install -m644 "$REPO_DIR"/deploy/bot/pdg-health.service       /etc/systemd/system/
 install -m644 "$REPO_DIR"/deploy/bot/pdg-health.timer         /etc/systemd/system/
-# pdg-probe81(:81 探测)是 iOS 专属, 仅 iOS 装 unit; Android 不装、不起、不开 81。
-[[ "$PLATFORM" == ios ]] && install -m644 "$REPO_DIR"/deploy/ios/pdg-probe81.service /etc/systemd/system/
+# pdg-probe81(:81 探测)是 Android/iOS **公共**组件: iOS 用它做 OnDemand 探测, 两平台
+# 都用它做链路诊断的 HTTP 会话入口。nft 模板里 81 本来就只对 __INTERNAL_CIDR__ 放行,
+# 两平台一致, 所以这里无条件装。
+install -m644 "$REPO_DIR"/deploy/ios/pdg-probe81.service /etc/systemd/system/
 render "$REPO_DIR/deploy/firewall/journald-50-pdg.conf" > /etc/systemd/journald.conf.d/50-pdg.conf; chmod 644 /etc/systemd/journald.conf.d/50-pdg.conf
 
 cat > /etc/systemd/system/mosdns.service <<'EOF'
@@ -959,9 +961,9 @@ _write_resolv "nameserver 1.1.1.1"
 systemctl daemon-reload
 systemctl restart systemd-journald
 systemctl enable --now mosdns "$CORE_SVC" >/dev/null 2>&1 || true
-# pdg-probe81 / pdg-mitm 仅 iOS: Android 不启 :81 探测、不起 MITM 服务。
-[[ "$PLATFORM" == ios ]] && { systemctl enable --now pdg-probe81 >/dev/null 2>&1 || true
-                             systemctl enable --now pdg-mitm >/dev/null 2>&1 || true; }
+# pdg-probe81 两平台都起; pdg-mitm 仍是 iOS 专属。
+systemctl enable --now pdg-probe81 >/dev/null 2>&1 || true
+[[ "$PLATFORM" == ios ]] && { systemctl enable --now pdg-mitm >/dev/null 2>&1 || true; }
 # ── 救援平面: 凭据 + unit + 默认启用 ──────────────────────────────────────
 # 默认启用是已拍板的方案(T5): 它存在的意义就是"别的都不通时还能进去", 而需要它的那一刻
 # 用户往往已经进不去 SSH 了 —— 那时候再让他去开是开不了的。
@@ -1018,8 +1020,8 @@ nft -f /etc/nftables.conf
 # systemd 默认 Type=simple, `systemctl start` 返 0 只代表 exec 成功, 进程可能随即崩溃。
 # 单看一次 active 有竞态(起来又崩) → 要求连续 3 次保持 active 才算稳(flapping 的 failed/activating 会打断)。
 c_g "校验核心服务(需连续保持 active, 防起来又崩)…"
-# 按平台的必需服务: pdg-probe81 仅 iOS(Android 不装/不起, 不纳入门槛, 否则 Android 装机误判失败回滚)。
-PLAT_SVCS=(mosdns "$CORE_SVC"); [[ "$PLATFORM" == ios ]] && PLAT_SVCS+=(pdg-probe81)
+# 必需服务两平台一致: pdg-probe81 现在是公共组件, 起不来就是真故障, 该拦。
+PLAT_SVCS=(mosdns "$CORE_SVC" pdg-probe81)
 svc_ok=0; streak=0
 for _ in $(seq 1 20); do
   allact=1

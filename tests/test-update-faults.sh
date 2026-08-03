@@ -198,16 +198,22 @@ r=$(run "DOCTOR_OUT=warn"); rc="${r%%|*}"; out="${r#*|}"
 
 # ══ iOS 平台组件: 在 iOS 上是必需件, 装失败必须回滚(不能 ||true 后留旧版混装) ══
 # 按**受管目标名**注入(mobileconfig 在目标侧是改名后的 pdg-dot.mobileconfig.tmpl)
-for f in mitm_ca.py mitm_server.py mitm_wloc.py probe81.py pdg-dot.mobileconfig.tmpl; do
+for f in mitm_ca.py mitm_server.py mitm_wloc.py pdg-dot.mobileconfig.tmpl; do
   assert_fail_rollback "iOS: $f 安装失败" "PLATFORM=ios FAIL_TARGET=$f"
+done
+# probe81.py 是**公共件**(6.1B): 两平台都装, 所以两平台装失败都必须回滚 ——
+# 放进上面的 iOS 循环会漏掉 Android 那一半。
+for p in ios android; do
+  assert_fail_rollback "$p: probe81.py(公共件)安装失败" "PLATFORM=$p FAIL_TARGET=probe81.py"
 done
 # 第一个 / 中间 / 最后一个受管目标各失败一次 —— 覆盖遍历的头、中、尾
 assert_fail_rollback "受管目标 #1 安装失败"  "PLATFORM=ios FAIL_NTH=1"
 assert_fail_rollback "受管目标 #12 安装失败" "PLATFORM=ios FAIL_NTH=12"
 assert_fail_rollback "受管目标 #30 安装失败" "PLATFORM=ios FAIL_NTH=30"   # 清单末项(iOS 全集 30 条)
 
-# Android: 这五个文件根本不该被安装 → 即使注入同名失败也不影响更新
-for f in mitm_ca.py probe81.py pdg-dot.mobileconfig.tmpl; do
+# Android: 这几个 iOS 专属文件根本不该被安装 → 即使注入同名失败也不影响更新。
+# probe81.py 不在此列了 —— 它现在 Android 也装, 装失败必须回滚(见上面的公共件循环)。
+for f in mitm_ca.py pdg-dot.mobileconfig.tmpl; do
   r=$(run "PLATFORM=android FAIL_TARGET=$f"); rc="${r%%|*}"; out="${r#*|}"
   { [[ "$rc" == 0 ]] && grep -q '✅ 已更新' <<<"$out"; } \
     && ok "Android: 不安装 iOS 文件 $f(注入其失败也不影响更新)" || bad "Android/$f: rc=$rc out=$out"

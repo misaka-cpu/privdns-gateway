@@ -31,6 +31,7 @@ deploy/bot/doctor.py doctor.py 755
 deploy/bot/report.py report.py 755
 deploy/bot/nftscan.py nftscan.py 755
 deploy/bot/linkstat.py linkstat.py 755
+deploy/ios/probe81.py probe81.py 755
 deploy/bot/nftmerge.py nftmerge.py 755
 deploy/bot/sb2mihomo.py sb2mihomo.py 755
 deploy/bot/mihomorender.py mihomorender.py 755
@@ -64,7 +65,6 @@ deploy/bot/iosstate.py iosstate.py 755
 deploy/bot/mitm_ca.py mitm_ca.py 755
 deploy/bot/mitm_server.py mitm_server.py 755
 deploy/bot/mitm_wloc.py mitm_wloc.py 755
-deploy/ios/probe81.py probe81.py 755
 deploy/ios/pdg-dot-ondemand.mobileconfig.tmpl pdg-dot.mobileconfig.tmpl 644"
 
 # 早期版本装过、现在不再安装的运行文件(只有目标名, 没有源)。卸载要一并收走 —— 老机器上

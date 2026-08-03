@@ -164,9 +164,10 @@ def main():
     got = required_svcs("android", "", "")
     if "pdg-bot" in got:
         bad("未配凭据时 CLI 仍把 pdg-bot 列为必需服务: %s" % got)
-    if got != ["mosdns", "mihomo"]:
+    # 6.1B: pdg-probe81 是公共件, 两平台都在必需集里(与凭据无关)。
+    if got != ["mosdns", "mihomo", "pdg-probe81"]:
         bad("未配凭据的 Android 必需服务集不对: %s" % got)
-    ok("CLI 必需服务集(unset/Android): mosdns + mihomo, 不含 pdg-bot")
+    ok("CLI 必需服务集(unset/Android): mosdns + mihomo + pdg-probe81, 不含 pdg-bot")
 
     got = required_svcs("ios", "", "")
     if "pdg-bot" in got or "pdg-probe81" not in got:
