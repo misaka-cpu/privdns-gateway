@@ -3753,6 +3753,10 @@ cmd_platform(){
   _plat_write_profile "$p" || { c_y "profile.env 写入失败"; _plat_rollback; rm -rf "$wd"; return 1; }
 
   # 4) 按目标平台部署 / 清理组件
+  # 先保证**公共件**就位: pdg-probe81 两平台都必需, 而 _pdg_required_svcs 下面就要
+  # 校验它。6.1B 之前装的机器盘上根本没有这个 unit —— 不先补上, `pdg platform` 会因
+  # "服务未稳定运行"整体回滚, 而用户什么都没做错。这一步幂等, 已就位则空转。
+  migrate_probe81_public || true
   if [[ "$p" == ios ]]; then
     if ! _plat_deploy_ios; then
       echo "❌ iOS 组件部署失败(描述文件模板 / MITM 模块 / pdg-mitm 服务)"
