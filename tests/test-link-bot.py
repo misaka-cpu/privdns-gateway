@@ -229,13 +229,21 @@ try:
         (ok if tok not in state_blob() else bad)("token 原文没落进状态文件")
         cbs = " ".join(str(c) for c in kb_cbs(EDITS[-1][1] if EDITS else None))
         (ok if tok not in cbs else bad)("token 没进 callback data")
-    # 链接预览必须关
-    kbmsg = [p for m, p in POSTS if m in ("sendMessage", "editMessageText")]
-    prev_off = all(p.get("disable_web_page_preview") for p in kbmsg) if kbmsg else None
-    if prev_off is None:
-        (ok if True else bad)("(消息经 edit/send 包装, 预览由包装层关闭)")
-    else:
-        (ok if prev_off else bad)("发 URL 的消息关掉了链接预览")
+    # 链接预览必须关。上一版这里是空断言("消息经包装层, 由包装层关闭")—— 包装层到底关没关
+    # 一个字都没验。改成直接调真的 send/edit, 看送给 Telegram 的 payload。
+    import importlib.util as _u
+    _sp = _u.spec_from_file_location("pdg_bot_raw", str(ROOT / "deploy/bot/pdg-bot.py"))
+    _raw = _u.module_from_spec(_sp)
+    _sp.loader.exec_module(_raw)
+    _P = []
+    _raw.post = lambda method, payload=None, **kw: (_P.append((method, payload))
+                                                    or {"ok": True})
+    _raw.send(1, "带链接的消息", {"inline_keyboard": [[{"text": "x", "url": "http://a/b"}]]})
+    _raw.edit(1, 2, "带链接的消息", {"inline_keyboard": [[{"text": "x", "url": "http://a/b"}]]})
+    (ok if _P else bad)("能观察到真实发给 Telegram 的 payload(前提成立)")
+    (ok if _P and all(pl.get("disable_web_page_preview") for _m, pl in _P) else bad)(
+        "send/edit 都关掉了链接预览(实得 %s)"
+        % [pl.get("disable_web_page_preview") for _m, pl in _P])
     body = all_text()
     (ok if "请关闭普通 Wi-Fi" in body or "请关闭普通 Wi‑Fi" in body else bad)(
         "开始提示让用户关掉普通 Wi-Fi")
