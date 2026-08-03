@@ -200,6 +200,53 @@ def main():
             "CN 不符 → 采集器给出 L5_CERT_CN_MISMATCH(实得 %s)" % sorted(codes))
 
     print()
+    print("── 3e. 同一个根因不许报两遍, 但独立的握手故障不许被吞 ──")
+    # 背景: CN 不符时曾经同时冒出 L5_CERT_CN_MISMATCH 和 L5_TLS_HANDSHAKE_FAILED。
+    # 两条都属实, 可对用户是同一件事说了两遍 —— 而且通用那条没有任何可执行信息。
+    # 规则: 有更具体的证书 FAIL 时, 通用条目不单独出现; 没有时, 它必须照常出现。
+    def l5_with(crt, dot):
+        checks._cert_path = lambda _c=crt: _c
+        checks._dot_file = lambda _d=dot: _d
+        try:
+            return L._l5_tls({"platform": "android"})
+        finally:
+            checks._cert_path, checks._dot_file = _orig_cert_path, _orig_dot_file
+
+    sub = tempfile.mkdtemp(prefix="c1.", dir=d)
+    crt_bad_cn = gen_cert(sub, "wrong.example", 365)[0]
+    if crt_bad_cn:
+        fs5 = l5_with(crt_bad_cn, "dot.example")
+        codes = [f["code"] for f in fs5 if f["status"] == L.FAIL]
+        (ok if "L5_CERT_CN_MISMATCH" in codes else bad)(
+            "CN 不符时保留了更具体的 L5_CERT_CN_MISMATCH")
+        (ok if "L5_TLS_HANDSHAKE_FAILED" not in codes else bad)(
+            "同时不再冒出通用的 L5_TLS_HANDSHAKE_FAILED(实得 %s)" % codes)
+        (ok if len(codes) == 1 else bad)(
+            "第 5 层只给出 1 条 FAIL, 不是同一根因两条(实得 %d 条: %s)" % (len(codes), codes))
+        # 不是吞掉 —— 观察到的握手现象要留在那条具体结论的证据里
+        mm = [f for f in fs5 if f["code"] == "L5_CERT_CN_MISMATCH"]
+        (ok if mm and "853" in mm[0]["evidence_source"] else bad)(
+            "握手现象并进了具体结论的证据, 没有丢失(evidence=%s)"
+            % (mm[0]["evidence_source"] if mm else "?"))
+
+    # 反面: 证书本身没问题时, 独立的握手/端口故障必须照常报出来
+    sub = tempfile.mkdtemp(prefix="c2.", dir=d)
+    crt_ok = gen_cert(sub, "dot.example", 365)[0]
+    if crt_ok:
+        codes = [f["code"] for f in l5_with(crt_ok, "dot.example") if f["status"] == L.FAIL]
+        (ok if "L5_TLS_HANDSHAKE_FAILED" in codes else bad)(
+            "证书没毛病时, 独立的握手故障照常报出(实得 %s)" % codes)
+
+    # 边界: 临期是 WARN 不是 FAIL —— 它解释不了握手为什么不通, 通用条目仍须出现
+    sub = tempfile.mkdtemp(prefix="c3.", dir=d)
+    crt_soon = gen_cert(sub, "dot.example", 7)[0]
+    if crt_soon:
+        fs5 = l5_with(crt_soon, "dot.example")
+        cs = [f["code"] for f in fs5]
+        (ok if "L5_CERT_EXPIRING" in cs and "L5_TLS_HANDSHAKE_FAILED" in cs else bad)(
+            "临期(WARN)不算「更具体的原因」, 握手故障仍单独报出(实得 %s)" % cs)
+
+    print()
     print("── 3c. nft 那层必须真读内核, 不能只读磁盘 ──")
     # 把"读内核"这一步换成读不到, 采集器就该判 L8_NFT_DRIFT。若它只读磁盘, 这里会照常 PASS。
     # 两头都要证:

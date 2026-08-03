@@ -270,16 +270,32 @@ def _l5_tls(ctx):
                 next_step="让证书 CN 与 DoT 主机名一致后重启 mosdns。",
                 blocks_downstream=True))
 
-    rc, hs, _ = checks._run(
+    rc, hs, hs_err = checks._run(
         ["openssl", "s_client", "-connect", "127.0.0.1:853", "-servername", dot or "localhost"],
         t=14)
     if "BEGIN CERTIFICATE" not in (hs or "") and "Verify return code" not in (hs or ""):
-        out.append(Finding(
-            5, "L5_TLS_HANDSHAKE_FAILED", FAIL, SECURITY, "DoT TLS 握手",
-            "本机 853 的 TLS 握手没完成。",
-            evidence_source="本机 openssl s_client 127.0.0.1:853",
-            next_step="systemctl status mosdns; 检查证书与私钥是否配对。",
-            blocks_downstream=True))
+        # 握手没成。**为什么**没成决定了该不该单独记一条 —— 上面若已经查出具体的证书
+        # 故障(过期 / 读不出 / CN 不符), 再加一条通用的"握手失败"就是同一个根因写两遍,
+        # 而且通用那条不带任何可执行信息, 只会让人多修一遍。
+        blob = (hs or "") + (hs_err or "")
+        connect_level = bool(re.search(
+            r"connect:|Connection refused|No route to host|unable to connect|"
+            r"Network is unreachable", blob))
+        specific = [f for f in out if f["status"] == FAIL]
+        if specific:
+            # 不是吞掉: 观察到的现象并进那条具体结论的证据里, 归因链仍然完整。
+            # 真正独立的故障(证书没毛病却握不上手)走 else 分支, 照常单独报。
+            specific[0]["evidence_source"] += (
+                " + 本机 853 %s" % ("连不上(端口层, 见第 4 层)" if connect_level
+                                    else "TLS 握手未完成"))
+        else:
+            out.append(Finding(
+                5, "L5_TLS_HANDSHAKE_FAILED", FAIL, SECURITY, "DoT TLS 握手",
+                "本机 853 连不上, TLS 握手无从谈起(根因在第 4 层的监听)。" if connect_level
+                else "本机 853 的 TLS 握手没完成。",
+                evidence_source="本机 openssl s_client 127.0.0.1:853",
+                next_step="systemctl status mosdns; 检查证书与私钥是否配对。",
+                blocks_downstream=True))
     elif not any(f["status"] == FAIL for f in out):
         out.append(Finding(
             5, "L5_TLS_READY", PASS, None, "DoT TLS 握手",
