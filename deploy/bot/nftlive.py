@@ -33,7 +33,11 @@ TABLE_NAME = "pdg"
 #   53  DNS      853 DoT      81 链路诊断的 HTTP 探测入口(6.1B 起两平台公共)
 #   7893 mihomo redir 入口    8445 救援平面
 # 少任何一个, 手机那条路就有一段不通, 而用户只会看到"连不上"。
-REQUIRED_INTERNAL_TCP = (53, 81, 853)
+# 取自 deploy/firewall/nftables-mihomo.conf 的 input 链(唯一真源), 不是凭印象列的:
+#   ip saddr <CIDR> tcp dport { 53, 81, 853, 7893, 8445 } accept
+#   53 DNS · 81 链路诊断 HTTP 探测(6.1B 起两平台公共) · 853 DoT
+#   7893 mihomo redir 的落点(80/443 在 prerouting 被改写到这里) · 8445 救援平面
+REQUIRED_INTERNAL_TCP = (53, 81, 853, 7893, 8445)
 # UDP 53 单独列: 手机的普通 DNS 查询走 UDP, 少了它整条链路第一步就断。以前 doctor 只查
 # "敏感端口有没有对全网开放", 根本不看必需规则在不在 —— 于是把 udp 53 写成 tcp 53 这种
 # 错误两套检查都发现不了(测试里那一格就是这么红的)。
@@ -263,6 +267,45 @@ def audit_kernel(obj, cidr, platform="android", family=TABLE_FAMILY, table=TABLE
     if mis_u:
         a.fail("udp %s 的放行规则顺序错: 排在无条件 drop 之后"
                % ", ".join(str(p) for p in sorted(mis_u)))
+
+    # ── prerouting 的 REDIRECT: 手机的 80/443 靠它进 mihomo ──────────────────
+    # 模板: ip saddr <CIDR> tcp dport { 80, 443, 5228-5230 } redirect to :7893
+    # iOS 装机时 install.sh 会把 5228-5230 摘掉(走 APNs 不需要 GMS), 所以 5228-5230
+    # **按平台判**: Android 必需, iOS 不要求也不禁止。80/443 两平台都必需 —— 少了它们
+    # 手机的网页流量根本进不了内核, 而 input 链看起来一切正常。
+    pre_meta = _chain_meta(obj, "prerouting")
+    if not pre_meta:
+        a.fail("内核里没有 prerouting 链 —— 手机的 80/443 无法改写进 mihomo")
+    else:
+        if pre_meta.get("hook") != "prerouting":
+            a.fail("prerouting 链的 hook 不是 prerouting(实得 %r)" % pre_meta.get("hook"))
+        if pre_meta.get("type") != "nat":
+            a.fail("prerouting 链的 type 不是 nat(实得 %r)" % pre_meta.get("type"))
+        pre = _rules_of(obj, "prerouting")
+        want_r = {80, 443} | ({5228, 5229, 5230} if platform != "ios" else set())
+        got_r, badsrc_r = set(), set()
+        for ex in pre:
+            proto, ports = _dports(ex)
+            if proto != "tcp" or not ports:
+                continue
+            hit = ports & want_r
+            if not hit:
+                continue
+            if _verdict(ex) != "redirect":
+                a.fail("端口 %s 在 prerouting 里不是 redirect(实得 %s)"
+                       % (", ".join(str(p) for p in sorted(hit)), _verdict(ex)))
+                continue
+            if _saddr_prefix(ex) != cidr:
+                badsrc_r |= hit
+                continue
+            got_r |= hit
+        miss_r = want_r - got_r - badsrc_r
+        if miss_r:
+            a.fail("prerouting 缺少必需的 redirect: tcp %s → mihomo(来源应限 %s)"
+                   % (", ".join(str(p) for p in sorted(miss_r)), cidr))
+        if badsrc_r:
+            a.fail("prerouting 里 tcp %s 的来源网段不是配置的内网卡段(%s)"
+                   % (", ".join(str(p) for p in sorted(badsrc_r)), cidr))
 
     # 敏感端口不得对全网放行(这条与 doctor 原有判据同语义, 现在两边共用)
     leaked = set()

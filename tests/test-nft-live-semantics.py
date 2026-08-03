@@ -64,7 +64,7 @@ table inet pdg {
     iif "lo" accept
     ct state established,related accept
     tcp dport { 22 } accept
-    ip saddr %s tcp dport { 53, 81, 853 } accept
+    ip saddr %s tcp dport { 53, 81, 853, 7893, 8445 } accept
     ip saddr %s udp dport { 53 } accept
     ip saddr %s udp dport 443 reject
     ip protocol icmp accept
@@ -88,7 +88,9 @@ def _saddr(cidr):
 
 def kernel_json(*, cidr=CIDR, drop_81=False, wrong_cidr=None, verdict_flip=False,
                 after_drop=False, wrong_proto=False, policy="drop", hook="input",
-                table="pdg", chain="input"):
+                table="pdg", chain="input", platform="android", no_prerouting=False,
+                no_redirect=False, no_gms=False, wrong_redirect_src=None,
+                redirect_verdict_flip=False):
     rules = [
         [{"match": {"op": "==", "left": {"meta": {"key": "iif"}}, "right": "lo"}},
          {"accept": None}],
@@ -97,7 +99,7 @@ def kernel_json(*, cidr=CIDR, drop_81=False, wrong_cidr=None, verdict_flip=False
         [_match("tcp", "dport", 22), {"accept": None}],
     ]
     seg = wrong_cidr or cidr
-    ports = [53, 853] if drop_81 else [53, 81, 853]
+    ports = [53, 853, 7893, 8445] if drop_81 else [53, 81, 853, 7893, 8445]
     tcp_rule = [_saddr(seg), _match("tcp", "dport", {"set": ports}),
                 {"drop": None} if verdict_flip else {"accept": None}]
     udp_rule = [_saddr(seg),
@@ -117,6 +119,21 @@ def kernel_json(*, cidr=CIDR, drop_81=False, wrong_cidr=None, verdict_flip=False
     for i, ex in enumerate(rules):
         objs.append({"rule": {"family": "inet", "table": table, "chain": chain,
                               "handle": 100 + i, "expr": ex}})
+    # prerouting: 手机的 80/443(Android 还有 GMS 5228-5230)靠它改写进 mihomo。
+    # 照 deploy/firewall/nftables-mihomo.conf 建模, 不是凭印象。
+    if not no_prerouting:
+        objs.append({"chain": {"family": "inet", "table": table, "name": "prerouting",
+                               "type": "nat", "hook": "prerouting", "prio": -100,
+                               "policy": "accept"}})
+        rports = ([80, 443] if (platform == "ios" or no_gms)
+                  else [80, 443, {"range": [5228, 5230]}])
+        if not no_redirect:
+            rex = [_saddr(wrong_redirect_src or seg),
+                   _match("tcp", "dport", {"set": rports}),
+                   ({"accept": None} if redirect_verdict_flip
+                    else {"redirect": {"port": 7893}})]
+            objs.append({"rule": {"family": "inet", "table": table, "chain": "prerouting",
+                                  "handle": 200, "expr": rex}})
     return {"nftables": objs}
 
 
@@ -126,7 +143,7 @@ KERNEL_TEXT = """table inet pdg {
 		iif "lo" accept
 		ct state established,related accept
 		tcp dport 22 accept
-		ip saddr %s tcp dport { 53, 81, 853 } accept
+		ip saddr %s tcp dport { 53, 81, 853, 7893, 8445 } accept
 		ip saddr %s udp dport 53 accept
 		ip saddr %s udp dport 443 reject with icmp port-unreachable
 		ip protocol icmp accept
@@ -209,6 +226,12 @@ neg = [
     ("policy 不是 drop", kernel_json(policy="accept"), "policy"),
     ("hook 错误", kernel_json(hook="forward"), "hook"),
     ("表名错误", kernel_json(table="wrongtbl"), "表"),
+    ("prerouting 链缺失", kernel_json(no_prerouting=True), "prerouting"),
+    ("80/443 重定向缺失", kernel_json(no_redirect=True), "redirect"),
+    ("重定向来源网段错", kernel_json(wrong_redirect_src="192.168.0.0/16"), "来源"),
+    ("重定向 verdict 错(accept 而非 redirect)", kernel_json(redirect_verdict_flip=True),
+     "redirect"),
+    ("Android 少了 GMS 5228-5230", kernel_json(no_gms=True), "5228"),
 ]
 for label, kj, want in neg:
     r = nftlive.audit_kernel(kj, cidr=CIDR, platform="android")
@@ -222,6 +245,13 @@ print("══ 4. 非规则行 ══")
 (ok if not nftlive.audit_kernel({"nftables": [{"table": {"family": "inet", "name": "pdg"}}]},
                                 cidr=CIDR, platform="android").ok else bad)(
     "只有 table 声明、没有链和规则 → 判失败(不是「没有问题」)")
+
+# iOS 装机时 install.sh 把 GMS 5228-5230 摘掉(走 APNs 不需要), 所以 iOS 上缺它不算故障;
+# 同一份内核放到 Android 上则必须判缺 —— 平台判据不能串台。
+r_ios = nftlive.audit_kernel(kernel_json(platform="ios"), cidr=CIDR, platform="ios")
+(ok if r_ios.ok else bad)("iOS 上没有 GMS 重定向属正常(实得 %s)" % r_ios.problems)
+r_and = nftlive.audit_kernel(kernel_json(platform="ios"), cidr=CIDR, platform="android")
+(ok if not r_and.ok else bad)("同一份内核在 Android 上判缺 GMS(平台判据不串台)")
 
 print("──────────────────────────────────────────────")
 print("通过 %d, 失败 %d" % (PASS[0], FAIL[0]))
