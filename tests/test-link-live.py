@@ -39,11 +39,18 @@ def bad(m):
     print("[FAIL] %s" % m); FAIL_N[0] += 1
 
 
+# 本次会话的判断基准。会话记录里存的是**建会话那一刻**的网段快照(见 linksess.new_session),
+# 所以这里记下 fresh() 最后写进 profile 的值, 让直接调 new_session 的用例用同一个 ——
+# 填错了会把"来源在段内"验成"段外", 而那看起来像产品坏了。
+CIDR_NOW = ["127.0.0.0/8"]
+
+
 def fresh(cidr="127.0.0.0/8"):
     d = tempfile.mkdtemp(prefix="linklive."); TMPS.append(d)
     os.environ["PDG_PROBE81_RUNTIME_DIR"] = d
     os.environ["PDG_PROFILE_ENV"] = os.path.join(d, "profile.env")
     open(os.environ["PDG_PROFILE_ENV"], "w").write("PDG_INTERNAL_CIDR=%s\n" % cidr)
+    CIDR_NOW[0] = cidr
     return d
 
 
@@ -72,7 +79,7 @@ def main():
     # 这一格原本没人覆盖 —— 负控"证据没变却返回 PASS"因此抓不住。会话存在只说明
     # 我们在等, 不说明观察到了任何东西。
     fresh()
-    tok1b, rec1b = S.new_session(probe_domain="p.probe.example")
+    tok1b, rec1b = S.new_session(CIDR_NOW[0], probe_domain="p.probe.example")
     S.write_state(rec1b)
     fs = L.collect(platform="android")
     l1 = layer(fs, 1)
@@ -101,7 +108,7 @@ def main():
     print()
     print("── 2. 真跑一次会话: HTTP 证据出现 ──")
     fresh()
-    tok, rec = S.new_session(probe_domain="abc.probe.dot.example")
+    tok, rec = S.new_session(CIDR_NOW[0], probe_domain="abc.probe.dot.example")
     S.write_state(rec)
     srv = HTTPServer(("127.0.0.1", 0), probe81.H)
     port = srv.server_address[1]
@@ -180,7 +187,7 @@ def main():
     print()
     print("── 5. 会话过期 → STALE ──")
     fresh()
-    tok5, rec5 = S.new_session()
+    tok5, rec5 = S.new_session(CIDR_NOW[0])
     rec5["http_consumed_at"] = rec5["created_at"] + 1
     rec5["state"] = "http_seen"
     rec5["source"] = {"ipv4_16": "127.0.0.0/16", "inside_internal_cidr": True}
@@ -198,7 +205,7 @@ def main():
     print()
     print("── 6. 来源在内网段之外 → WARN, 不是 FAIL ──")
     fresh(cidr="10.99.0.0/16")          # 127.0.0.1 落在段外
-    tok6, rec6 = S.new_session(); S.write_state(rec6)
+    tok6, rec6 = S.new_session(CIDR_NOW[0]); S.write_state(rec6)
     srv = HTTPServer(("127.0.0.1", 0), probe81.H)
     port = srv.server_address[1]
     th = threading.Thread(target=srv.serve_forever, daemon=True); th.start()
@@ -228,7 +235,7 @@ def main():
     # 之前只验了"已观察"那一类, 另外三类写成什么样都能通过。
     def _l1_detail(**kw):
         fresh(**kw)
-        tok, rec = S.new_session()
+        tok, rec = S.new_session(CIDR_NOW[0])
         for k, v in _st.items():
             rec[k] = v
         S.write_state(rec)
@@ -292,7 +299,7 @@ def main():
     print()
     print("── 9. session status --json 的 schema 稳定 ──")
     fresh()
-    tok9, rec9 = S.new_session(probe_domain="x.probe.example"); S.write_state(rec9)
+    tok9, rec9 = S.new_session(CIDR_NOW[0], probe_domain="x.probe.example"); S.write_state(rec9)
     r = subprocess.run([sys.executable, str(ROOT / "deploy/bot/linksess.py"),
                         "status", "--json"], capture_output=True, text=True, timeout=60,
                        env=dict(os.environ))

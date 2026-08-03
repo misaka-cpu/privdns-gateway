@@ -65,7 +65,7 @@ def main():
     os.environ["PDG_PROBE81_RUNTIME_DIR"] = rt
 
     # ── root 建会话(相当于 `pdg link session start`)────────────────────
-    tok, rec = S.new_session()
+    tok, rec = S.new_session("10.20.0.0/16")
     okw = S.write_state(rec)
     out("OK" if okw else "FAIL", "root 能在 0700 的 RuntimeDirectory 里建会话")
     st = os.stat(S._state_path())

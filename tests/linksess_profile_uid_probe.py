@@ -182,6 +182,79 @@ def main():
     out("OK" if "172.22.5.9" not in blob else "FAIL", "完整 peer IP 没进状态文件")
     out("OK" if token not in blob else "FAIL", "token 原文没进状态文件")
 
+    # ── 会话快照语义: 建完之后改 profile.env, 本次结论不受影响 ────────────────
+    with open(profile, "w", encoding="utf-8") as f:
+        f.write("PDG_INTERNAL_CIDR=10.99.0.0/16\n")      # 换成一个**不含** 172.22.5.9 的段
+        f.write("PDG_RESCUE_TOKEN=%s\n" % SENTINEL)
+    os.chmod(profile, 0o600); os.chown(profile, 0, 0)
+    rec2, why2 = S.read_state()
+    out("OK" if rec2 and rec2.get("internal_cidr") == "172.22.0.0/16" else "FAIL",
+        "改了 profile 之后, 本次会话仍按建立时的网段判断(快照=%r)"
+        % (rec2 or {}).get("internal_cidr"))
+    out("OK" if (rec2 or {}).get("source", {}).get("inside_internal_cidr") is True else "FAIL",
+        "已经出过的结论不会被回改")
+
+    # 新建一笔 → 用新网段
+    okk2, p2 = S.start_session()
+    out("OK" if okk2 else "FAIL", "改完之后能建新会话")
+    rec3, _ = S.read_state()
+    out("OK" if rec3 and rec3.get("internal_cidr") == "10.99.0.0/16" else "FAIL",
+        "新会话用的是改后的网段(实得 %r)" % (rec3 or {}).get("internal_cidr"))
+
+    # ── 前置条件不满足 → 不建半份会话 ────────────────────────────────────────
+    for label, body in (("缺 PDG_INTERNAL_CIDR", "PDG_RESCUE_TOKEN=%s\n" % SENTINEL),
+                        ("非法 CIDR", "PDG_INTERNAL_CIDR=不是网段\n"),
+                        ("公网段(会变成开放中继)", "PDG_INTERNAL_CIDR=1.2.3.0/24\n"),
+                        ("全网 /0", "PDG_INTERNAL_CIDR=0.0.0.0/0\n")):
+        with open(profile, "w", encoding="utf-8") as f:
+            f.write(body)
+        os.chmod(profile, 0o600); os.chown(profile, 0, 0)
+        S.clear_state()
+        okx, px = S.start_session()
+        no_url = "step1_url" not in px
+        out("OK" if (not okx and no_url and S.read_state()[0] is None) else "FAIL",
+            "%s → 不建会话、不给 URL(ok=%s reason=%s)" % (label, okx, px.get("reason")))
+        out("OK" if SENTINEL not in str(px) else "FAIL",
+            "%s 的错误信息里没有其它敏感项" % label)
+
+    # ── 旧 schema 状态 → fail-closed, 不静默补字段 ──────────────────────────
+    with open(profile, "w", encoding="utf-8") as f:
+        f.write("PDG_INTERNAL_CIDR=172.22.0.0/16\n")
+    os.chmod(profile, 0o600); os.chown(profile, 0, 0)
+    S.clear_state()
+    okk4, _p4 = S.start_session()
+    rec4, _ = S.read_state()
+    if okk4 and rec4:
+        rec4["schema_version"] = 1
+        rec4.pop("internal_cidr", None)          # 旧版本就是没有这个字段
+        S.write_state(rec4)
+        r5, why5 = S.read_state()
+        out("OK" if r5 is None and why5 == S.R_STATE_CORRUPT else "FAIL",
+            "旧 schema 状态 fail-closed(实得 %s)" % why5)
+    else:
+        out("FAIL", "旧 schema 用例的前置会话没建出来")
+
+    # ── consume() 这条路不许碰 profile.env(陷阱式判据, 不靠"看起来没读")───────
+    with open(profile, "w", encoding="utf-8") as f:
+        f.write("PDG_INTERNAL_CIDR=172.22.0.0/16\n")
+    os.chmod(profile, 0o600); os.chown(profile, 0, 0)
+    S.clear_state()
+    okk6, p6 = S.start_session()
+    m6 = _re.search(r"[?&]t=([A-Za-z0-9_-]+)", p6.get("step1_url", ""))
+    tok6 = m6.group(1) if m6 else ""
+    touched = []
+    real_profile = S._profile
+    S._profile = lambda k: (touched.append(k), real_profile(k))[1]
+    try:
+        S.consume(tok6, "172.22.7.7")
+    finally:
+        S._profile = real_profile
+    out("OK" if not touched else "FAIL",
+        "consume() 全程没有读 profile.env(实得读了 %r)" % (touched,))
+    r6, _ = S.read_state()
+    out("OK" if (r6 or {}).get("source", {}).get("inside_internal_cidr") is True else "FAIL",
+        "而结论照样产得出来(证明它靠的是会话快照)")
+
     import shutil
     shutil.rmtree(box, ignore_errors=True)
     return 0

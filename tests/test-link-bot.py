@@ -50,6 +50,12 @@ os.makedirs(RUNDIR, exist_ok=True)
 os.makedirs(os.path.join(ROOTFS, "etc", "privdns-gateway"), exist_ok=True)
 os.environ["PDG_LINK_RUNTIME"] = RUNDIR          # linkstat 用这个
 os.environ["PDG_PROBE81_RUNTIME_DIR"] = RUNDIR   # linksess 用的是这个(名字不同)
+# 建会话要有判断基准: root 侧从 profile.env 读出内网段并快照进会话。缺了就 fail-closed
+# (那是 .153 真机 P0 之后定的规矩), 所以沙箱也得把它摆好。
+PROFILE = os.path.join(ROOTFS, "etc", "privdns-gateway", "profile.env")
+with open(PROFILE, "w", encoding="utf-8") as _f:
+    _f.write("PDG_INTERNAL_CIDR=127.0.0.0/8\n")
+os.environ["PDG_PROFILE_ENV"] = PROFILE
 os.environ["PDG_TX_FSROOT"] = ROOTFS
 os.environ["PDG_LOCKFILE"] = os.path.join(ROOTFS, "run", "privdns-gateway.lock")
 os.environ.setdefault("PDG_BOT_ALLOWED", "1")
@@ -122,6 +128,11 @@ def setup(platform="android", server_ready=True):
     # 走进"本次测试还在进行中"的分支, 看上去像功能坏了。
     if hasattr(bot, "_linktest_waiters"):
         bot._linktest_waiters.clear()
+    # 判断基准也复位: 会话记录里存的是**建会话那一刻**的网段快照, 上一格留下的基准会让
+    # 这一格把"段内"验成"段外"—— 那看起来像产品坏了。要验段外的用例在 setup() 之后
+    # 自己改 profile 再建会话。
+    with open(PROFILE, "w", encoding="utf-8") as _pf:
+        _pf.write("PDG_INTERNAL_CIDR=127.0.0.0/8\n")
     S.clear_state()
 
 
@@ -300,10 +311,9 @@ bot.handle_cb(1, 2, "linktest:check")
 # 段内
 S.clear_state()
 setup()
-os.environ["PDG_INTERNAL_CIDR_TEST"] = "127.0.0.0/8"
+open(PROFILE, "w").write("PDG_INTERNAL_CIDR=127.0.0.0/8\n")   # 段内基准
 bot.handle_cb(1, 2, "linktest:start")
 tok = token_from_last_kb()
-S._profile = lambda k: "127.0.0.0/8" if k == "PDG_INTERNAL_CIDR" else ""
 acc, why, _rec = S.consume(tok, "127.0.0.1") if tok else (False, "NO_TOKEN", None)
 EDITS.clear()
 bot.handle_cb(1, 2, "linktest:check")
@@ -318,9 +328,9 @@ kb = EDITS[-1][1] if EDITS else None
 # 段外
 S.clear_state()
 setup()
+open(PROFILE, "w").write("PDG_INTERNAL_CIDR=10.99.0.0/16\n")  # 段外基准: 127.0.0.1 不在其中
 bot.handle_cb(1, 2, "linktest:start")
 tok = token_from_last_kb()
-S._profile = lambda k: "10.99.0.0/16" if k == "PDG_INTERNAL_CIDR" else ""
 if tok: S.consume(tok, "127.0.0.1")
 EDITS.clear()
 bot.handle_cb(1, 2, "linktest:check")
@@ -382,7 +392,6 @@ CASES.append(("SESSION_EXPIRED", mutate(_expire, "SESSION_EXPIRED")))
 setup()
 bot.handle_cb(1, 2, "linktest:start")
 tok = token_from_last_kb()
-S._profile = lambda k: "127.0.0.0/8" if k == "PDG_INTERNAL_CIDR" else ""
 if tok:
     S.consume(tok, "127.0.0.1")
     S.consume(tok, "127.0.0.1")      # 第二次 = TOKEN_REUSED
@@ -450,7 +459,6 @@ S.clear_state()
 setup()
 bot.handle_cb(1, 2, "linktest:start")
 tok = token_from_last_kb()
-S._profile = lambda k: "127.0.0.0/8" if k == "PDG_INTERNAL_CIDR" else ""
 if tok: S.consume(tok, "127.0.0.1")
 # 模拟重启: 清掉进程内的一切后台/等待痕迹
 for attr in ("_linktest_waiters", "_linktest_msgs"):
@@ -534,7 +542,6 @@ S.clear_state()
 setup()
 bot.handle_cb(1, 2, "linktest:start")
 tok = token_from_last_kb()
-S._profile = lambda k: "127.0.0.0/8" if k == "PDG_INTERNAL_CIDR" else ""
 if tok:
     S.consume(tok, "127.0.0.1")
 EDITS.clear()
@@ -567,7 +574,6 @@ for plat in ("android", "ios"):
     setup(platform=plat)
     bot.handle_cb(1, 2, "linktest:start")
     tok = token_from_last_kb()
-    S._profile = lambda k: "127.0.0.0/8" if k == "PDG_INTERNAL_CIDR" else ""
     if tok:
         S.consume(tok, "127.0.0.1")
     EDITS.clear()

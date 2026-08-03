@@ -31,7 +31,10 @@ import secrets
 import sys
 import time
 
-SCHEMA_VERSION = 1
+# 2: 会话记录新增必填字段 internal_cidr(见 new_session 的说明)。旧状态没有这个字段,
+# 而"缺了就从 profile.env 补"恰恰是这次要根除的东西 —— 所以升版号让 read_state 直接
+# fail-closed。会话本来只有 300 秒寿命, 升级后最多让人重开一次测试。
+SCHEMA_VERSION = 2
 RUNTIME_DIR = "/run/pdg-probe81"
 STATE_NAME = "session.json"
 STATE_MAX_BYTES = 4096
@@ -52,9 +55,12 @@ R_RATE_LIMITED = "RATE_LIMITED"
 R_TOKEN_INVALID = "TOKEN_INVALID"
 R_STATE_CORRUPT = "STATE_CORRUPT"
 R_STATE_UNWRITABLE = "STATE_UNWRITABLE"
+# 建会话前置条件不满足: profile.env 没有 PDG_INTERNAL_CIDR, 或它不是合法私网段。
+# 不建半份会话 —— 没有判断基准的会话只会给出"无法判断", 白让人跑一趟手机。
+R_NO_INTERNAL_CIDR = "NO_INTERNAL_CIDR"
 
 REASONS = (R_OK, R_NO_SESSION, R_SESSION_EXPIRED, R_TOKEN_REUSED, R_RATE_LIMITED,
-           R_TOKEN_INVALID, R_STATE_CORRUPT, R_STATE_UNWRITABLE)
+           R_TOKEN_INVALID, R_STATE_CORRUPT, R_STATE_UNWRITABLE, R_NO_INTERNAL_CIDR)
 
 
 def _runtime_dir():
@@ -92,8 +98,13 @@ def ipv4_16(addr):
     return "%s.%s.0.0/16" % (a, b)
 
 
-def inside_internal_cidr(addr, cidr=None):
-    cidr = cidr if cidr is not None else _profile("PDG_INTERNAL_CIDR")
+def inside_internal_cidr(addr, cidr):
+    """peer 地址在不在给定网段里。**cidr 必须由调用方给**, 这里不去读 profile.env。
+
+    以前它在 cidr 为空时回落到 _profile("PDG_INTERNAL_CIDR")。真机上 probe81 以
+    DynamicUser 跑, 读不到 0600 root:root 的 profile.env —— _profile() 把 PermissionError
+    静默吞成空串, 于是这里恒返回 None, "来源在不在内网卡段"这条证据永远产不出来。
+    判断基准现在由 root 侧在建会话时快照进会话记录(见 new_session)。"""
     if not cidr:
         return None
     try:
@@ -163,7 +174,9 @@ def read_state():
         return None, R_STATE_CORRUPT
     if not isinstance(rec, dict) or rec.get("schema_version") != SCHEMA_VERSION:
         return None, R_STATE_CORRUPT
-    for k in ("session_id", "token_sha256", "created_at", "expires_at", "state"):
+    # internal_cidr 与其它几个一样是必填。缺了不猜、不从 profile 补 —— 那正是 P0 的来源。
+    for k in ("session_id", "token_sha256", "created_at", "expires_at", "state",
+              "internal_cidr"):
         if k not in rec:
             return None, R_STATE_CORRUPT
     # 动态 UID 换过之后不许误读上一任留下的会话。RuntimeDirectory 停服即销毁, 正常
@@ -191,8 +204,14 @@ def _expired(rec, now=None):
     return (now if now is not None else _now()) >= rec.get("expires_at", 0)
 
 
-def new_session(probe_domain=None, metrics_baseline=None):
+def new_session(internal_cidr, probe_domain=None, metrics_baseline=None):
     """建一次新会话。同时最多 1 个 —— 直接覆盖旧的, 旧 token 当场失效。
+
+    `internal_cidr` 是**本次会话的判断基准快照**, 由 root 侧从 profile.env 读出并规范化后
+    传进来(见 start_session)。为什么要快照而不是每次现读:
+      · probe81 以 DynamicUser 跑, 根本读不到 0600 root:root 的 profile.env;
+      · 快照还带来一条明确语义 —— 会话建立之后即使有人改了 profile.env, **本次**测试仍按
+        建立时的网段判断; 想用新网段就重开一次测试。诊断过程中判据不该在脚下变。
 
     返回 (token, rec)。token **只在这里**以原文形式存在, 之后一律只留 sha256。
     """
@@ -211,6 +230,7 @@ def new_session(probe_domain=None, metrics_baseline=None):
         "invalid_attempts": 0,
         "max_invalid_attempts": MAX_INVALID_ATTEMPTS,
         "probe_domain": probe_domain,
+        "internal_cidr": internal_cidr,     # 本次会话的判断基准(快照, 见上)
         "source": None,
         "metrics_baseline": metrics_baseline,
         "owner_uid": uid,
@@ -254,7 +274,9 @@ def consume(token, client_ip, now=None):
     rec["state"] = "http_seen"
     rec["source"] = {
         "ipv4_16": ipv4_16(client_ip),
-        "inside_internal_cidr": inside_internal_cidr(client_ip),
+        # 用**建会话时快照下来的**网段, 不现读 profile.env: 动态用户读不到它, 而且
+        # 诊断过程中判据不该变。
+        "inside_internal_cidr": inside_internal_cidr(client_ip, rec.get("internal_cidr")),
     }
     if not write_state(rec):
         # 状态写不下去: 会话功能降级, 但**不能**把这当成失败往上抛 ——
@@ -353,6 +375,24 @@ def start_session():
     payload["step1_url"] 里带 token 原文 —— 这是**唯一**允许出现原文的地方, 调用方只准把
     它放进一次性的按钮, 不许写进正文、日志或状态。
     """
+    # 判断基准: 从 profile.env 这个唯一真源读, 用 cidrgen 这个唯一校验器验, 再规范化。
+    # 三样都不另起一套 —— 多一套解析器就是多一种"两边说法不一致"的可能。
+    # cidrgen 只在这里(root 侧)导入: 模块顶层要保持纯标准库, 否则 DynamicUser 那个
+    # probe81 进程也会被拖着一起加载。
+    raw = _profile("PDG_INTERNAL_CIDR")
+    if not raw:
+        return False, {"error": "profile.env 里没有 PDG_INTERNAL_CIDR",
+                       "reason": R_NO_INTERNAL_CIDR}
+    try:
+        import cidrgen
+        okc, why = cidrgen.valid_cidr(raw)
+    except Exception:  # noqa: BLE001
+        return False, {"error": "读不到 CIDR 校验器(cidrgen)", "reason": R_NO_INTERNAL_CIDR}
+    if not okc:
+        return False, {"error": "PDG_INTERNAL_CIDR 不可用: %s" % why,
+                       "reason": R_NO_INTERNAL_CIDR}
+    cidr = str(ipaddress.ip_network(raw, strict=False))      # 规范化后再快照
+
     baseline = None
     try:
         import linkmetrics
@@ -360,7 +400,7 @@ def start_session():
     except Exception:  # noqa: BLE001
         baseline = None
     domain = make_probe_domain()
-    token, rec = new_session(probe_domain=domain, metrics_baseline=baseline)
+    token, rec = new_session(cidr, probe_domain=domain, metrics_baseline=baseline)
     if not write_state(rec):
         return False, {"error": "会话状态写不下去(%s 不可写?)" % _runtime_dir(),
                        "reason": R_STATE_UNWRITABLE}

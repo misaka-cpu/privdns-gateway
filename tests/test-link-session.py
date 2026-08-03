@@ -58,13 +58,13 @@ def main():
 
     print("── 1. token 强度与形状 ──")
     d = fresh_dir()
-    tok, rec = S.new_session()
+    tok, rec = S.new_session("10.20.0.0/16")
     (ok if len(tok) == 43 else bad)("token 长度 43(token_urlsafe(32))：实得 %d" % len(tok))
     # urlsafe base64: 每字符 6 bit, 43 字符 → 258 bit 编码空间, 熵是 32 字节 = 256 bit
     (ok if S.TOKEN_BYTES * 8 >= 128 else bad)(
         "token 熵 %d bit ≥ 128" % (S.TOKEN_BYTES * 8))
     (ok if S.TOKEN_RE.match(tok) else bad)("token 落在允许的字符集里")
-    toks = {S.new_session()[0] for _ in range(200)}
+    toks = {S.new_session("10.20.0.0/16")[0] for _ in range(200)}
     (ok if len(toks) == 200 else bad)("200 次生成无重复(实得 %d 个不同)" % len(toks))
 
     print()
@@ -82,7 +82,7 @@ def main():
     (ok if abs((rec["expires_at"] - rec["created_at"]) - 300) < 1 else bad)(
         "会话记录里的有效期确实是 300s")
     d = fresh_dir()
-    tok3, rec3 = S.new_session(); S.write_state(rec3)
+    tok3, rec3 = S.new_session("10.20.0.0/16"); S.write_state(rec3)
     acc, why, _ = S.consume(tok3, "10.20.30.40", now=rec3["expires_at"] + 1)
     (ok if not acc and why == S.R_SESSION_EXPIRED else bad)(
         "过期后消费 → 拒绝 + SESSION_EXPIRED(实得 %s/%s)" % (acc, why))
@@ -93,7 +93,7 @@ def main():
     print()
     print("── 4. 单次消费 ──")
     d = fresh_dir()
-    tok4, rec4 = S.new_session(); S.write_state(rec4)
+    tok4, rec4 = S.new_session("10.20.0.0/16"); S.write_state(rec4)
     a1, w1, _ = S.consume(tok4, "10.20.30.40")
     a2, w2, _ = S.consume(tok4, "10.20.30.40")
     (ok if a1 and w1 == S.R_OK else bad)("第一次消费成功(%s/%s)" % (a1, w1))
@@ -107,7 +107,7 @@ def main():
     print()
     print("── 5. 无效尝试最多 3 次 ──")
     d = fresh_dir()
-    tok5, rec5 = S.new_session(); S.write_state(rec5)
+    tok5, rec5 = S.new_session("10.20.0.0/16"); S.write_state(rec5)
     wrong = "A" * 43
     results = [S.consume(wrong, "10.20.30.40")[1] for _ in range(5)]
     n_invalid = results.count(S.R_TOKEN_INVALID)
@@ -129,8 +129,8 @@ def main():
     print()
     print("── 7. 同时最多 1 个会话, 新的让旧的失效 ──")
     d = fresh_dir()
-    told, recold = S.new_session(); S.write_state(recold)
-    tnew, recnew = S.new_session(); S.write_state(recnew)
+    told, recold = S.new_session("10.20.0.0/16"); S.write_state(recold)
+    tnew, recnew = S.new_session("10.20.0.0/16"); S.write_state(recnew)
     a_old, w_old, _ = S.consume(told, "10.20.30.40")
     (ok if not a_old else bad)("旧 token 在新会话建立后失效(实得 %s/%s)" % (a_old, w_old))
     a_new, w_new, _ = S.consume(tnew, "10.20.30.40")
@@ -141,7 +141,7 @@ def main():
     d = fresh_dir()
     os.environ["PDG_PROFILE_ENV"] = os.path.join(d, "profile.env")
     open(os.environ["PDG_PROFILE_ENV"], "w").write("PDG_INTERNAL_CIDR=10.20.0.0/16\n")
-    tok8, rec8 = S.new_session(); S.write_state(rec8)
+    tok8, rec8 = S.new_session("10.20.0.0/16"); S.write_state(rec8)
     S.consume(tok8, "10.20.33.44")
     raw = open(S._state_path(), encoding="utf-8").read()
     (ok if "10.20.33.44" not in raw else bad)("状态里搜不到完整 IP")
@@ -155,7 +155,7 @@ def main():
     d = fresh_dir()
     os.environ["PDG_PROFILE_ENV"] = os.path.join(d, "profile.env")
     open(os.environ["PDG_PROFILE_ENV"], "w").write("PDG_INTERNAL_CIDR=10.20.0.0/16\n")
-    tok8b, rec8b = S.new_session(); S.write_state(rec8b)
+    tok8b, rec8b = S.new_session("10.20.0.0/16"); S.write_state(rec8b)
     S.consume(tok8b, "192.168.9.9")
     r8b, _ = S.read_state()
     (ok if r8b["source"]["inside_internal_cidr"] is False else bad)(
@@ -186,7 +186,7 @@ def main():
         "状态文件是符号链接 → 拒绝(实得 %s)" % why9)
     # 硬链接(nlink>1)同理
     d = fresh_dir()
-    tokh, rech = S.new_session(); S.write_state(rech)
+    tokh, rech = S.new_session("10.20.0.0/16"); S.write_state(rech)
     os.link(S._state_path(), os.path.join(d, "hard.json"))
     rec9, why9 = S.read_state()
     (ok if rec9 is None and why9 == S.R_STATE_CORRUPT else bad)(
@@ -195,7 +195,7 @@ def main():
     print()
     print("── 10. 动态 UID 换过之后不误读旧会话 ──")
     d = fresh_dir()
-    tok10, rec10 = S.new_session()
+    tok10, rec10 = S.new_session("10.20.0.0/16")
     rec10["owner_uid"] = (os.stat(d).st_uid + 4242)      # 冒充"上一任动态 UID"
     S.write_state(rec10)
     r10, w10 = S.read_state()
@@ -206,7 +206,7 @@ def main():
     print("── 11. HTTP 入口: 只认精确路径与恰好一个 t ──")
     d = fresh_dir()
     import probe81
-    tok11, rec11 = S.new_session(); S.write_state(rec11)
+    tok11, rec11 = S.new_session("10.20.0.0/16"); S.write_state(rec11)
     srv = HTTPServer(("127.0.0.1", 0), probe81.H)
     port = srv.server_address[1]
     th = threading.Thread(target=srv.serve_forever, daemon=True); th.start()
@@ -256,7 +256,7 @@ def main():
     d = fresh_dir()
     os.environ["PDG_PROFILE_ENV"] = os.path.join(d, "profile.env")
     open(os.environ["PDG_PROFILE_ENV"], "w").write("PDG_INTERNAL_CIDR=10.20.0.0/16\n")
-    tok12, rec12 = S.new_session(); S.write_state(rec12)
+    tok12, rec12 = S.new_session("10.20.0.0/16"); S.write_state(rec12)
     srv = HTTPServer(("127.0.0.1", 0), probe81.H)
     port = srv.server_address[1]
     th = threading.Thread(target=srv.serve_forever, daemon=True); th.start()
@@ -279,7 +279,7 @@ def main():
     print()
     print("── 13. 状态写不下去时, 普通探测照样 200 ──")
     d = fresh_dir()
-    tok13, rec13 = S.new_session(); S.write_state(rec13)
+    tok13, rec13 = S.new_session("10.20.0.0/16"); S.write_state(rec13)
     os.chmod(d, 0o500)          # 目录只读 → 原子替换写不进去
     try:
         srv = HTTPServer(("127.0.0.1", 0), probe81.H)
@@ -328,7 +328,7 @@ def main():
     os.environ["PDG_LOCKFILE"] = lockp
     d = fresh_dir()
     t0 = time.time()
-    tok14, rec14 = S.new_session(); S.write_state(rec14)
+    tok14, rec14 = S.new_session("10.20.0.0/16"); S.write_state(rec14)
     a14, w14, _ = S.consume(tok14, "10.20.1.1")
     dt = time.time() - t0
     fcntl.flock(held, fcntl.LOCK_UN); held.close()
@@ -343,7 +343,13 @@ def main():
     # 那一份 —— 到时候 CLI 说会话有效、Bot 说没有, 谁也说不清哪个对。判据落在行为上:
     # 子进程跑 CLI 与本进程直接调 API, 必须产出同一种东西。
     d14b = fresh_dir()
-    env = dict(os.environ, PDG_PROBE81_RUNTIME_DIR=d14b)
+    # start_session 现在要求 profile.env 里有合法的 PDG_INTERNAL_CIDR —— 那是本次会话的
+    # 判断基准, 缺了就该 fail-closed(见 test-link-profile-uid)。这里把基准摆好。
+    prof14b = os.path.join(d14b, "profile.env")
+    with open(prof14b, "w", encoding="utf-8") as _f:
+        _f.write("PDG_INTERNAL_CIDR=10.20.0.0/16\n")
+    env = dict(os.environ, PDG_PROBE81_RUNTIME_DIR=d14b, PDG_PROFILE_ENV=prof14b)
+    os.environ["PDG_PROFILE_ENV"] = prof14b
     r = subprocess.run([sys.executable, str(ROOT / "deploy/bot/linksess.py"),
                         "start", "--json"], capture_output=True, text=True, env=env)
     cli = json.loads(r.stdout) if r.returncode == 0 and r.stdout.strip() else {}
@@ -382,6 +388,7 @@ def main():
     (ok if cli_state and set(cli_state) == set(api_state) else bad)(
         "两条路写出的状态文件字段完全一致")
     S.clear_state()
+    os.environ.pop("PDG_PROFILE_ENV", None)
 
     print()
     print("── 15. root 与 DynamicUser 的文件交接(真的换 UID 跑) ──")

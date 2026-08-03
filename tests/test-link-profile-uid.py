@@ -58,13 +58,16 @@ r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
 seen_skip = False
 for line in (r.stdout or "").splitlines():
     if line.startswith("[OK]"):
-        ok(line[7:].strip())
+        ok(line.split("] ", 1)[-1].strip())
     elif line.startswith("[FAIL]"):
-        bad(line[7:].strip())
+        bad(line.split("] ", 1)[-1].strip())
     elif line.startswith("[SKIP]"):
         seen_skip = True
-        (bad if STRICT else print)("[SKIP] " + line[7:].strip()
-                                   if not STRICT else line[7:].strip() + " —— 严格模式判失败")
+        msg = line.split("] ", 1)[-1].strip()
+        if STRICT:
+            bad(msg + " —— 严格模式判失败")
+        else:
+            print("[SKIP] " + msg)
     elif line.startswith("[PROBE]"):
         print("  " + line)
 if r.returncode != 0 and not FAIL[0]:
