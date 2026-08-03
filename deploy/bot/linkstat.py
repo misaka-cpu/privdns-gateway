@@ -76,7 +76,15 @@ CODES = (
     "L6_DOT_PROBE_WINDOW_OBSERVED", "L6_DOT_PROBE_NOT_OBSERVED",
     "L6_DOT_METRICS_UNAVAILABLE",
     "L7_REDIRECT_READY", "L7_REDIRECT_RULE_MISSING",
-    "L8_SERVICES_READY", "L8_MOSDNS_DOWN", "L8_MIHOMO_DOWN", "L8_NFT_DRIFT",
+    "L8_SERVICES_READY", "L8_MOSDNS_DOWN", "L8_MIHOMO_DOWN",
+    # 第 8 层的防火墙判据。L8_NFT_DRIFT 是旧的"磁盘/内核逐条文本相等" —— 它把 nft 自己的
+    # 规范化(单元素集合折叠、reject 默认值展开、协议名别名)当成漂移, `.153` 上一台完全
+    # 健康的机器因此被判 FAIL、Bot 拒绝创建手机测试会话。**生产路径不再产出它**;
+    # 留在闭集里只是不回收已发布的 code(读到旧 JSON 的东西不该炸)。
+    "L8_NFT_DRIFT",
+    "L8_FIREWALL_READY", "L8_FIREWALL_CONFIG_INVALID",
+    "L8_FIREWALL_KERNEL_UNREADABLE", "L8_FIREWALL_RULE_MISSING",
+    "L8_FIREWALL_RULE_UNSAFE", "L8_FIREWALL_RULE_ORDER_INVALID",
     "COLLECTOR_ERROR",          # 单项采集器自己抛了 —— 报出来, 但不拖垮整份结果
 )
 
@@ -471,14 +479,61 @@ def _l8_services(ctx):
             8, "L8_SERVICES_READY", PASS, None, "核心服务",
             "mosdns / mihomo 均在运行%s" % extra, evidence_source="systemctl is-active"))
 
-    # nft: 磁盘配置与内核运行态是否一致 —— 只读磁盘会漏掉"改了文件但没 apply"这种最常见的漂移
-    rc_k, kern, _ = checks._run(["nft", "list", "table", "inet", "pdg"], t=15)
-    if rc_k != 0 or not (kern or "").strip():
+    # ── 防火墙运行状态 ────────────────────────────────────────────────────
+    # 分成两件互不冒充的事:
+    #   1) 磁盘配置有效 —— 只读的 `nft -c -f`, 不加载、不改内核;
+    #   2) 内核里项目运行必需的规则确实生效 —— `nft -j` 读 live kernel, 交给 nftlive 按
+    #      JSON 表达式做**语义**判断(doctor 与这里共用同一个核心, 不各写一套)。
+    #
+    # 以前这里拿磁盘文本与内核文本做集合比对。nft 输出时会自己规范化写法, 于是四条完全
+    # 等价的规则被判成"磁盘有、内核没有" —— `.153` 上一台健康机器常年 FAIL, 而 doctor
+    # 同时报 0 失败 0 警告。文本近似不是判据。
+    #
+    # "磁盘每条规则都在内核里逐条生效"仍然**没做**: 要可靠比对得先把候选配置规范化, 而
+    # 实测 nftables v1.0.6 的 `nft -c -j -f` 输出 0 字节 —— 只有真正加载才吐得出规范形态。
+    # 加载到宿主机、或为每次自检建 netns, 都越过了 linkstat 只读无副作用的边界。所以这里
+    # 明确只证"配置有效 + 必需规则安全生效", 全量逐条审计移交后续阶段, 不用文本近似冒充。
+    import nftlive
+    cfg_ok, cfg_why = nftlive.check_disk_config()
+    if not cfg_ok:
         out.append(Finding(
-            8, "L8_NFT_DRIFT", FAIL, FORWARDING, "防火墙磁盘/内核一致性",
-            "内核里读不到 inet pdg 表(规则没加载?)", evidence_source="nft list table inet pdg",
-            next_step="sudo nft -f /etc/nftables.conf 后复查。", blocks_downstream=True))
+            8, "L8_FIREWALL_CONFIG_INVALID", FAIL, FORWARDING, "防火墙运行状态",
+            "磁盘上的防火墙配置无效: %s" % cfg_why,
+            evidence_source="nft -c -f /etc/nftables.conf",
+            next_step="修好 /etc/nftables.conf 后复查。", blocks_downstream=True))
         return out
+    kobj, kwhy = nftlive.read_kernel()
+    if kobj is None:
+        out.append(Finding(
+            8, "L8_FIREWALL_KERNEL_UNREADABLE", FAIL, FORWARDING, "防火墙运行状态",
+            "读不到当前内核的防火墙规则: %s" % kwhy,
+            evidence_source="nft -j list table inet pdg",
+            next_step="在服务器上确认 nft 可用、规则已加载后复查。", blocks_downstream=True))
+        return out
+    audit = nftlive.audit_kernel(
+        kobj, cidr=(ctx.get("cidr") or checks._profile("PDG_INTERNAL_CIDR")),
+        # 平台从 ctx 取: 这个采集器的签名只有 ctx, 直接写 platform 是 NameError ——
+        # 而 collect() 会把整层的异常收成 COLLECTOR_ERROR, 于是"防火墙这一层没有结论",
+        # 看起来像检查不存在。
+        platform=(ctx.get("platform") if ctx.get("platform") in ("ios", "android")
+                  else "android"))
+    if audit.ok:
+        out.append(Finding(
+            8, "L8_FIREWALL_READY", PASS, None, "防火墙运行状态",
+            "防火墙配置有效，手机链路所需规则已在内核中生效。",
+            evidence_source="nft -c -f + nft -j list table inet pdg"))
+    else:
+        joined = "; ".join(audit.problems)
+        code = ("L8_FIREWALL_RULE_ORDER_INVALID" if "排在" in joined or "顺序" in joined
+                else "L8_FIREWALL_RULE_UNSAFE" if ("全网" in joined or "来源" in joined)
+                else "L8_FIREWALL_RULE_MISSING")
+        out.append(Finding(
+            8, code, FAIL, FORWARDING, "防火墙运行状态",
+            "内核里的防火墙规则不满足手机链路要求: %s" % "; ".join(audit.problems[:3]),
+            evidence_source="nft -j list table inet pdg",
+            next_step="核对 /etc/nftables.conf 并让它在内核中生效后复查。",
+            blocks_downstream=True))
+    return out
     try:
         disk = open("/etc/nftables.conf", encoding="utf-8").read()
     except OSError as e:
@@ -504,26 +559,6 @@ def _l8_services(ctx):
     return out
 
 
-def _nft_rule_set(text):
-    """把 nft 文本归一成"规则行集合", 用于磁盘/内核比对。
-
-    只取真正的规则行: 表/链声明、大括号、注释、include 都不算。归一化掉多余空白与行尾注释,
-    否则内核输出里的 `# handle 5` 会让每一条都判成不一致。
-    """
-    out = set()
-    for ln in (text or "").splitlines():
-        s = ln.strip()
-        if not s or s.startswith("#") or s.startswith("include"):
-            continue
-        if s.startswith("table ") or s.startswith("chain ") or s in ("{", "}", "};"):
-            continue
-        if s.startswith("type ") or s.startswith("delete table"):
-            continue
-        s = re.sub(r"#.*$", "", s).strip()
-        s = re.sub(r"\s+", " ", s)
-        if s and s not in ("{", "}"):
-            out.add(s)
-    return out
 
 
 COLLECTORS = (

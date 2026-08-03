@@ -171,10 +171,15 @@ def fake_open(path, *a, **k):
     return _real_open(path, *a, **k)
 
 
-import builtins  # noqa: E402
-linkstat_open = builtins.open
 L.open = fake_open
 checks.open = fake_open
+
+# nftlive 自己走 subprocess(不经 checks._run), 而这台开发机 PATH 里没有 nft。
+# 这支测试要验的是**调用链语义**, nftlive 与 nft 的交互由 test-nft-live-semantics 覆盖,
+# 所以这里把它的两个入口换成夹具: 磁盘有效 + 内核就是上面那份 JSON。
+import nftlive  # noqa: E402
+nftlive.check_disk_config = lambda *a, **k: (True, "")
+nftlive.read_kernel = lambda *a, **k: (KERNEL_JSON, "")
 
 print("══ 1. 同一份健康状态: doctor 怎么说 ══")
 try:

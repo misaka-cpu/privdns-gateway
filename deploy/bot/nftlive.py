@@ -28,6 +28,7 @@ import subprocess
 
 TABLE_FAMILY = "inet"
 TABLE_NAME = "pdg"
+DISK_CONF = "/etc/nftables.conf"
 
 # 手机链路必需的入站放行端口(来源必须限定在内网卡段):
 #   53  DNS      853 DoT      81 链路诊断的 HTTP 探测入口(6.1B 起两平台公共)
@@ -318,6 +319,38 @@ def audit_kernel(obj, cidr, platform="android", family=TABLE_FAMILY, table=TABLE
         a.fail("这些端口对全网放行(应只限内网卡来源): %s"
                % ", ".join(str(p) for p in sorted(leaked)))
     return a
+
+
+def check_disk_config(path=DISK_CONF, runner=None):
+    """磁盘配置有效性 —— **只读**的 `nft -c -f`, 不加载、不改内核。
+
+    实测(nftables v1.0.6): `nft -c -f` 只做语法/语义校验, 校验后内核里不会多出任何表;
+    而 `nft -c -j -f` **不输出任何内容**(0 字节), 所以拿不到"候选配置的规范化形态" ——
+    这正是本模块不做"磁盘逐条 vs 内核逐条"的原因: 要取规范形态就得真加载, 那越过了
+    linkstat 只读、无副作用的边界。
+
+    返回 (ok, 原因)。读不到、语法错、nft 不可用一律 fail-closed。
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            f.read(1)
+    except OSError as e:
+        return False, "读不到 %s(%s)" % (path, type(e).__name__)
+    cmd = ["nft", "-c", "-f", path]
+    try:
+        if runner is not None:
+            rc, out, err = runner(cmd)
+        else:
+            pr = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            rc, out, err = pr.returncode, pr.stdout, pr.stderr
+    except Exception as e:  # noqa: BLE001
+        return False, "nft 无法执行(%s)" % type(e).__name__
+    if rc != 0:
+        msg = (err or out or "").strip().splitlines()
+        # 只回第一行, 且不回显规则内容 —— 用户自定义规则可能含敏感信息
+        head = msg[0][:120] if msg else "nft -c 返回 %d" % rc
+        return False, head
+    return True, ""
 
 
 def audit_live(cidr, platform="android", runner=None):
