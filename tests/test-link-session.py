@@ -337,6 +337,53 @@ def main():
         "全局写锁被占用时, 会话照常建立与消费(%.2fs)" % dt)
 
     print()
+    print("── 14b. start_session(): CLI 与直接调用是同一份实现 ──")
+    # 6.1C 要在 Bot 里建会话。若 Bot 自己照抄一遍"取基线→造域名→new_session→落盘→拼 URL",
+    # 两份实现会随时间分叉(token 长度 / TTL / URL 形状 / 写盘时机), 而用户只看得到 Bot
+    # 那一份 —— 到时候 CLI 说会话有效、Bot 说没有, 谁也说不清哪个对。判据落在行为上:
+    # 子进程跑 CLI 与本进程直接调 API, 必须产出同一种东西。
+    d14b = fresh_dir()
+    env = dict(os.environ, PDG_PROBE81_RUNTIME_DIR=d14b)
+    r = subprocess.run([sys.executable, str(ROOT / "deploy/bot/linksess.py"),
+                        "start", "--json"], capture_output=True, text=True, env=env)
+    cli = json.loads(r.stdout) if r.returncode == 0 and r.stdout.strip() else {}
+    cli_state = {}
+    try:
+        with open(os.path.join(d14b, S.STATE_NAME), encoding="utf-8") as f:
+            cli_state = json.load(f)
+    except Exception:  # noqa: BLE001
+        pass
+    okk, api = S.start_session()
+    api_state = {}
+    try:
+        with open(os.path.join(d14b, S.STATE_NAME), encoding="utf-8") as f:
+            api_state = json.load(f)
+    except Exception:  # noqa: BLE001
+        pass
+    (ok if cli and okk else bad)("CLI 与直接调用都建出了会话(cli rc=%d)" % r.returncode)
+    need = {"step1_url", "session_id", "ttl_secs", "expires_at"}
+    (ok if need <= set(cli) and need <= set(api) else bad)(
+        "两条路给出同一组字段(cli 缺 %s / api 缺 %s)"
+        % (sorted(need - set(cli)), sorted(need - set(api))))
+    (ok if cli.get("ttl_secs") == api.get("ttl_secs") == S.TTL_SECS else bad)(
+        "TTL 同源(%s / %s / %s)" % (cli.get("ttl_secs"), api.get("ttl_secs"), S.TTL_SECS))
+    rx = re.compile(r"^http://[^/]+:81/probe\?t=([A-Za-z0-9_-]+)$")
+    m1, m2 = rx.match(cli.get("step1_url") or ""), rx.match(api.get("step1_url") or "")
+    (ok if m1 and m2 else bad)("两条路的 URL 形状一致")
+    (ok if m1 and m2 and S.TOKEN_RE.match(m1.group(1)) and S.TOKEN_RE.match(m2.group(1))
+     else bad)("两条路给出的 token 都合法")
+    (ok if m1 and m2 and m1.group(1) != m2.group(1) else bad)(
+        "两次建会话的 token 不同(不是写死的)")
+    (ok if m2 and api_state.get("token_sha256")
+        == hashlib.sha256(m2.group(1).encode()).hexdigest() else bad)(
+        "URL 里的 token 与落盘摘要对得上")
+    (ok if m2 and m2.group(1) not in json.dumps(api_state) else bad)(
+        "token 原文没进状态文件")
+    (ok if cli_state and set(cli_state) == set(api_state) else bad)(
+        "两条路写出的状态文件字段完全一致")
+    S.clear_state()
+
+    print()
     print("── 15. root 与 DynamicUser 的文件交接(真的换 UID 跑) ──")
     # 这条判据的全部意义在于**两个不同的 UID**。同一个 uid 下怎么测都是空转, 所以
     # 要么已经是 root, 要么借 sudo -n 拿到 root; 都拿不到就明确 SKIP, 不伪装成通过。

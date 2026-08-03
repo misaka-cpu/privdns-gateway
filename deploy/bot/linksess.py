@@ -341,6 +341,40 @@ _TWO_STEP = """请在**手机上**依次做两步(用要诊断的那张 SIM 卡,
 做完后回来跑: pdg link session status"""
 
 
+def start_session():
+    """建一次会话并给出第 1 步的 URL —— **CLI 与 Bot 唯一的入口**。
+
+    以前这套动作(取 metrics 基线 → 造探测域名 → new_session → 落盘 → 拼 URL)散在 CLI 的
+    main() 里, Bot 要用就得照抄一遍。照抄的代价不是重复代码, 是**两份会随时间分叉**:
+    token 长度、TTL、URL 形状、写盘时机任何一处改了, 另一边不会跟着改, 而用户只看得到
+    Bot 那一份 —— 到时候 CLI 说会话有效、Bot 说没有, 谁也说不清哪个对。
+
+    返回 (ok, payload)。ok=False 时 payload["error"] 是给人看的原因。
+    payload["step1_url"] 里带 token 原文 —— 这是**唯一**允许出现原文的地方, 调用方只准把
+    它放进一次性的按钮, 不许写进正文、日志或状态。
+    """
+    baseline = None
+    try:
+        import linkmetrics
+        baseline = linkmetrics.snapshot()
+    except Exception:  # noqa: BLE001
+        baseline = None
+    domain = make_probe_domain()
+    token, rec = new_session(probe_domain=domain, metrics_baseline=baseline)
+    if not write_state(rec):
+        return False, {"error": "会话状态写不下去(%s 不可写?)" % _runtime_dir(),
+                       "reason": R_STATE_UNWRITABLE}
+    ip = _server_ip() or "<网关IP>"
+    return True, {
+        "session_id": rec["session_id"],
+        "expires_at": rec["expires_at"],
+        "ttl_secs": rec["ttl_secs"],
+        "probe_domain": domain,
+        "step1_url": "http://%s:81/probe?t=%s" % (ip, token),
+        "step2_url": "http://%s/" % domain if domain else "(DoT 域名未配置, 第 2 步不可用)",
+    }
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     as_json = "--json" in argv
@@ -348,34 +382,23 @@ def main(argv=None):
     sub = argv[0] if argv else "status"
 
     if sub == "start":
-        baseline = None
-        try:
-            import linkmetrics
-            baseline = linkmetrics.snapshot()
-        except Exception:  # noqa: BLE001
-            baseline = None
-        domain = make_probe_domain()
-        token, rec = new_session(probe_domain=domain, metrics_baseline=baseline)
-        if not write_state(rec):
-            print("会话状态写不下去(%s 不可写?) —— 会话未建立。" % _runtime_dir(),
-                  file=sys.stderr)
+        okk, p = start_session()
+        if not okk:
+            print("%s —— 会话未建立。" % p["error"], file=sys.stderr)
             print("普通的 :81 探测与 DoT 都不受影响。", file=sys.stderr)
             return 1
-        ip = _server_ip() or "<网关IP>"
-        url1 = "http://%s:81/probe?t=%s" % (ip, token)
-        url2 = "http://%s/" % domain if domain else "(DoT 域名未配置, 第 2 步不可用)"
         if as_json:
             print(json.dumps({"schema_version": SCHEMA_VERSION, "ok": True,
-                              "session_id": rec["session_id"],
-                              "expires_at": rec["expires_at"],
-                              "ttl_secs": rec["ttl_secs"],
-                              "step1_url": url1, "step2_url": url2,
-                              "probe_domain": domain},
+                              "session_id": p["session_id"],
+                              "expires_at": p["expires_at"],
+                              "ttl_secs": p["ttl_secs"],
+                              "step1_url": p["step1_url"], "step2_url": p["step2_url"],
+                              "probe_domain": p["probe_domain"]},
                              ensure_ascii=False, indent=1))
         else:
             print("已建立链路诊断会话 %s(%d 秒内有效, 同时只允许一个)。\n"
-                  % (rec["session_id"], rec["ttl_secs"]))
-            print(_TWO_STEP % (url1, url2))
+                  % (p["session_id"], p["ttl_secs"]))
+            print(_TWO_STEP % (p["step1_url"], p["step2_url"]))
         return 0
 
     if sub == "stop":
