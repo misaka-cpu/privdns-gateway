@@ -112,21 +112,64 @@ checks = (ROOT / "deploy/bot/checks.py").read_text(encoding="utf-8")
 scan(checks, "checks.py")
 
 print()
+print("── 4b. 内部实现术语不进用户面前的字 ──")
+# 拒绝 mosdns metrics 的技术论证是**给维护者看的**: 用户在自检里读到"本机 SSRF""缓存投喂
+# 端点", 既看不懂也无从处置, 只会觉得网关坏了。论证留在 README 与 docs/ROADMAP.md, 用户
+# 侧只给结论与下一步。
+JARGON = ("SSRF", "缓存投喂", "上游端口", "load_dump", "pprof",
+          "metrics 接口", "缓存导出", "反向代理")
+for label, path in (("linkstat 用户可见文案", "deploy/bot/linkstat.py"),
+                    ("linksess 两步说明", "deploy/bot/linksess.py")):
+    txt = (ROOT / path).read_text(encoding="utf-8")
+    # 只看**字符串字面量**: 同一批词出现在注释里是允许的(那正是留给维护者的线索)。
+    import ast as _ast
+    lits = []
+    for n in _ast.walk(_ast.parse(txt)):
+        if isinstance(n, _ast.Constant) and isinstance(n.value, str):
+            lits.append(n.value)
+    body = "\n".join(lits)
+    hit = sorted({w for w in JARGON if w in body})
+    (ok if not hit else bad)("%s: 不含内部实现术语(实得 %s)" % (label, hit))
+
+print()
+print("── 4c. 但论证必须在 README / ROADMAP 里留全 ──")
+# 反方向: 简化用户文案不等于把理由删掉。谁要是把这段论证一并清掉, 下一个人就会以为
+# "开 metrics 就行", 白白把用户的浏览域名摊开。
+readme = (ROOT / "README.md").read_text(encoding="utf-8")
+roadmap = (ROOT / "docs/ROADMAP.md").read_text(encoding="utf-8")
+for label, txt, need in (
+        ("README", readme, ("metrics", "缓存导出", "明文查询域名")),
+        ("ROADMAP", roadmap, ("load_dump", "SSRF", "反向代理", "明文查询域名",
+                              "不更换 mosdns 版本"))):
+    miss = [w for w in need if w not in txt]
+    (ok if not miss else bad)("%s 保留了拒绝 mosdns API 的完整理由(缺 %s)" % (label, miss))
+(ok if "不等于「手机显示的位置已经变了」" in readme else bad)(
+    "README 仍保留「网关改写响应 ≠ 手机显示的位置已改变」的边界")
+
+print()
 print("── 5. NOT_OBSERVED 既不是故障, 也不影响退出码 ──")
-nf = [F(6.5, "L6_DOT_METRICS_UNAVAILABLE", L.NOT_OBSERVED, "手机 DoT 查询到达",
-        "当前版本无法安全取得手机 DoT 查询证据。")]
+nf = [F(6.5, "L6_DOT_METRICS_UNAVAILABLE", L.NOT_OBSERVED, "手机 DoT 查询证据",
+        "当前版本暂不采集这项证据，因此无法判断手机的 DoT 查询是否到达；"
+        "这不代表正常，也不代表故障。")]
 (ok if L.exit_code(nf) == 0 else bad)(
     "只有 NOT_OBSERVED 时退出码 0(实得 %d)" % L.exit_code(nf))
 mark = L._MARK[L.NOT_OBSERVED]
 (ok if mark not in ("🔴", "🟡") else bad)(
     "NOT_OBSERVED 的标记不是故障色(实得 %s)" % mark)
 rendered = L.render_text(nf)
-(ok if "无法安全取得" in rendered else bad)("渲染里保留了「无法安全取得」的说明")
+(ok if "暂不采集这项证据" in rendered else bad)("渲染里保留了「暂不采集这项证据」的说明")
 # 只看第 6.5 层**自己那一行**。整段末尾的免责句里有"也不代表发生故障"—— 那是否定语境,
 # 把它算进来就成了假红(第一版判据正是这么写错的)。
-line65 = [l for l in rendered.splitlines() if "手机 DoT 查询到达" in l]
-(ok if line65 and not re.search(r"(失败|故障|错误)", line65[0]) else bad)(
-    "第 6.5 层那一行不含失败/故障/错误(实得 %s)" % (line65[0][:60] if line65 else "无"))
+line65 = [l for l in rendered.splitlines() if "手机 DoT 查询证据" in l]
+# "也不代表故障"是**否定**语境, 恰恰是我们要的写法。判据因此不能是"整行不许出现故障",
+# 而是"每次出现都得跟在否定后面" —— 与本文件的越界扫描同一把尺子。
+_bare_fail = []
+for _m in re.finditer(r"(失败|故障|错误)", line65[0] if line65 else ""):
+    _lead = line65[0][max(0, _m.start() - 10):_m.start()]
+    if not re.search(r"[不没未无][^，。;；]{0,8}$", _lead):
+        _bare_fail.append(line65[0][max(0, _m.start() - 10):_m.end() + 4])
+(ok if line65 and not _bare_fail else bad)(
+    "第 6.5 层那一行没把它写成失败/故障/错误(裸用 %s)" % (_bare_fail or "无"))
 
 print("──────────────────────────────────────────────")
 print("通过 %d, 失败 %d" % (pass_n, fail_n))

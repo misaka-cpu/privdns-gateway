@@ -145,13 +145,21 @@ print("── 6. CLI 的两步说明不许承诺收集不到的证据 ──")
 sess = (ROOT / "deploy/bot/linksess.py").read_text(encoding="utf-8")
 two = sess.split("_TWO_STEP = ")[1].split('"""')[1] if "_TWO_STEP = " in sess else ""
 if not api_on:
-    (ok if "无法安全取得第 2 步的证据" in two else bad)(
-        "阶段 3 未实施时, 两步说明必须明说第 2 步的证据当前无法安全取得")
-    (ok if "明文查询域名" in two else bad)(
-        "并说明为什么取不到(同一端口会暴露含明文域名的缓存导出)")
+    (ok if "暂不采集第 2 步的证据" in two else bad)(
+        "阶段 3 未实施时, 两步说明必须明说第 2 步的证据当前暂不采集")
+    (ok if "不代表正常" in two and "不代表故障" in two else bad)(
+        "并明说这既不代表正常也不代表故障(否则用户会去修一个不存在的问题)")
+    # 技术论证移到 README / ROADMAP: 用户面前摆一串内部名词, 既看不懂也无从处置。
+    (ok if "路线图" in two or "ROADMAP" in two else bad)(
+        "指向项目路线图, 让想深究的人找得到理由")
     (ok if "诊断依据是 DNS 查询计数" not in two else bad)(
         "不许说「诊断依据是 DNS 查询计数」—— 那个计数根本没启用")
-    (ok if "6.2" in two else bad)("指明了这一半留到 6.2")
+    # 版本号从用户文案里撤到 docs/ROADMAP.md: CLI 只说"后续版本"并指路。事实本身仍要
+    # 有人钉着 —— 钉在文档上, 而不是逼着每处文案都写版本号。
+    (ok if "后续版本" in two and ("路线图" in two or "ROADMAP" in two) else bad)(
+        "指明这一半留到后续版本, 并指向项目路线图")
+    _rm = (ROOT / "docs/ROADMAP.md").read_text(encoding="utf-8")
+    (ok if "6.2" in _rm else bad)("ROADMAP 里写明了移交 6.2")
 else:
     (ok if "还收集不到第 2 步的证据" not in two else bad)(
         "阶段 3 若已实施, 反过来要把这句免责删掉")

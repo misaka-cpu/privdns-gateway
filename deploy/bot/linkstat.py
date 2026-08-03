@@ -419,13 +419,15 @@ def _l6_dns(_ctx):
             next_step="systemctl status mosdns; sudo pdg doctor --deep",
             blocks_downstream=True))
     out.append(Finding(
-        6.5, "L6_DOT_METRICS_UNAVAILABLE", NOT_OBSERVED, None, "手机 DoT 查询到达",
-        "当前版本无法安全取得手机 DoT 查询证据。开启 mosdns v5.3.4 的 metrics 接口会在"
-        "同一个监听端口上连带暴露 DNS 缓存导出(内含明文查询域名)与缓存投喂端点; "
-        "绑定回环挡不住本机 SSRF, 在前面加一层反向代理也保护不了仍可直接访问的上游端口。"
-        "因此本版本不采集这一层, 该能力移交 6.2 重新设计(见 docs/ROADMAP.md)。",
+        6.5, "L6_DOT_METRICS_UNAVAILABLE", NOT_OBSERVED, None, "手机 DoT 查询证据",
+        # 这里只留结论。为什么不采集(接口暴露面、缓存导出、投喂端点、本机 SSRF、反向代理
+        # 隔离不了上游端口)是给维护者看的论证, 放在 README 与 docs/ROADMAP.md ——
+        # 用户在自检里看到一串内部实现名词, 既看不懂也无从处置。
+        "当前版本暂不采集这项证据，因此无法判断手机的 DoT 查询是否到达；"
+        "这不代表正常，也不代表故障。",
         evidence_source="none(本版本不采集 DNS 侧证据)",
-        next_step="服务器侧无需处理; 这一层的能力移交 6.2 重新设计。"))
+        next_step="可先完成 HTTP 链路测试；DNS 实时证据将在后续版本重新设计。"
+                  "技术原因见项目路线图。"))
     return out
 
 

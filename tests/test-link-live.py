@@ -255,14 +255,27 @@ def main():
         "第 6.5 层 NOT_OBSERVED(实得 %s)" % [(f["status"], f["code"]) for f in l65])
     (ok if l65 and l65[0]["code"] == "L6_DOT_METRICS_UNAVAILABLE" else bad)(
         "code 是 L6_DOT_METRICS_UNAVAILABLE(说清为什么没有)")
-    (ok if l65 and "6.2" in l65[0]["detail"] else bad)("文案里点明了延后到 6.2")
+    # 「延后到 6.2」这个事实现在钉在 docs/ROADMAP.md —— 用户侧只说"后续版本"并指路,
+    # 版本号写进自检文案对用户没有意义, 改版本时还会到处漏改。
+    _ns = (l65[0]["next_step"] or "") if l65 else ""
+    (ok if "后续版本" in _ns and "路线图" in _ns else bad)(
+        "下一步指出「后续版本重新设计」并指向项目路线图(实得 %s)" % _ns[:44])
+    _rm = (ROOT / "docs/ROADMAP.md").read_text(encoding="utf-8")
+    (ok if "移交 **6.2**" in _rm or "移交 6.2" in _rm else bad)(
+        "ROADMAP 里写明了移交 6.2(事实钉在文档而不是自检文案里)")
     d65 = l65[0]["detail"] if l65 else ""
-    (ok if "无法安全取得" in d65 else bad)(
-        "第 6.5 层明说「当前版本无法安全取得」, 不能读成通过(实得 %s)" % d65[:44])
-    (ok if all(k in d65 for k in ("明文查询域名", "回环")) else bad)(
-        "并给出拒绝的理由(同端口暴露明文域名 / 回环不构成缓解)")
-    (ok if not any(w in d65 for w in ("正常", "已确认")) else bad)(
-        "第 6.5 层不出现任何肯定性结论词")
+    (ok if "暂不采集这项证据" in d65 else bad)(
+        "第 6.5 层明说「当前版本暂不采集这项证据」(实得 %s)" % d65[:44])
+    (ok if "不代表正常" in d65 and "不代表故障" in d65 else bad)(
+        "并明说既不代表正常也不代表故障 —— 两个方向都不许被读者补全")
+    (ok if l65 and l65[0]["title"] == "手机 DoT 查询证据" else bad)(
+        "标题是「手机 DoT 查询证据」(实得 %s)" % (l65[0]["title"] if l65 else "无"))
+    (ok if l65 and "后续版本重新设计" in (l65[0]["next_step"] or "") else bad)(
+        "下一步给的是「先做 HTTP 链路测试 / DNS 证据后续重新设计」")
+    # 内部实现术语一律不进用户面前的字
+    JARGON = ("SSRF", "缓存投喂", "上游端口", "metrics", "缓存导出", "反向代理")
+    hit = [w for w in JARGON if w in d65 or w in (l65[0]["next_step"] or "")]
+    (ok if not hit else bad)("第 6.5 层不摆内部实现术语(实得 %s)" % hit)
     # HTTP 有证据而 DNS 没有 —— 不许因此断言 Private DNS 一定关着
     txt = L.render_text(fs)
     (ok if "一定" not in txt.split("手机/SIM")[1] else bad)(

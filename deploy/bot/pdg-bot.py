@@ -739,7 +739,7 @@ def wloc_add_gen(name, lat, lon):
         return False, busy_msg(), 0
     if st["hot"]:
         return True, (f"✅ 当前目标坐标已更新：<b>{name}</b>（{lat}, {lon}）\n"
-                      "位置已切换，网关服务无需重启，也不用再去列表里点一次。\n\n"
+                      "网关目标地点已切换，网关服务无需重启，也不用再去列表里点一次。\n\n"
                       "现在请关闭 iPhone 定位服务，等待 2 秒后重新开启。"), st["gen"]
     if st["was_active"] or st["first"]:
         return True, (f"✅ 已保存当前目标 <b>{name}</b>（{lat}, {lon}）\n"
@@ -823,7 +823,7 @@ def wloc_switch_gen(name):
         return True, (f"✅ 已选中 <b>{name}</b>（{loc['lat']}, {loc['lon']}）\n"
                       "WLOC 未开启，这个地点还不会生效 —— 点「✅ 开启」后才会改写定位。"), w["generation"]
     return True, (f"✅ 网关目标已切换：<b>{name}</b>（{loc['lat']}, {loc['lon']}）\n"
-                  "位置已切换，网关服务无需重启。\n\n"
+                  "网关目标地点已切换，网关服务无需重启。\n\n"
                   "现在请关闭 iPhone 定位服务，等待 2 秒后重新开启。"), w["generation"]
 
 def wloc_switch(name):
@@ -4262,7 +4262,7 @@ def handle_cb(chat, mid, data):
              "<b>切换地点的推荐顺序（全程用内网卡）：</b>\n"
              "① 控制中心把 Wi-Fi 点灰（不是在设置里关 Wi-Fi）\n"
              "② 在 Bot「📍 地点 / 切换」里点目标地点\n"
-             "③ 等 Bot 显示「位置已切换，网关服务无需重启」\n"
+             "③ 等 Bot 显示「网关目标地点已切换，网关服务无需重启」\n"
              "④ 设置 → 隐私与安全性 → 定位服务：关闭，等 2 秒后重新开启\n"
              "⑤ 打开目标 App\n"
              "⑥ iOS 26 如果一直没有发起新的 WLOC 请求，可能仍需重启手机\n\n"
