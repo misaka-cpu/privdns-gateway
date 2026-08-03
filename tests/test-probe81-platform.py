@@ -57,7 +57,7 @@ def _extract(src, fn):
 
 # ── 1. systemd unit: 会话状态的落点 ────────────────────────────────────────
 print("── 1. pdg-probe81.service 具备写会话状态的条件 ──")
-unit = text("deploy/ios/pdg-probe81.service")
+unit = text("deploy/bot/pdg-probe81.service")
 for key, want, why in (
         ("DynamicUser", "true", "不许改成 root 常驻"),
         ("RuntimeDirectory", "pdg-probe81", "会话状态的唯一落点"),

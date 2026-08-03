@@ -45,7 +45,7 @@ PY
 J
   # v1.4.x 把 iOS 组件装给所有机器 → 它们证明不了平台
   install -m644 "$E2E_ROOT/deploy/ios/pdg-dot-ondemand.mobileconfig.tmpl" /opt/pdg-bot/pdg-dot.mobileconfig.tmpl
-  install -m755 "$E2E_ROOT/deploy/ios/probe81.py" /opt/pdg-bot/probe81.py
+  install -m755 "$E2E_ROOT/deploy/bot/probe81.py" /opt/pdg-bot/probe81.py
   : > /etc/systemd/system/pdg-probe81.service
   [[ -n "${1:-}" ]] && printf '%s\n' "$1" > /etc/privdns-gateway/platform
   return 0

@@ -62,14 +62,14 @@ for rel in ("README.md", "docs/design-mitm-plugins.md"):
 ok("README / 设计文档都点明了 locationd 缓存不归网关清")
 
 # ── 2. :81 返回 200 ─────────────────────────────────────────────────────────
-probe = text("deploy/ios/probe81.py")
+probe = text("deploy/bot/probe81.py")
 if "send_response(200)" not in probe:
     bad("probe81.py 的实现不是返回 200(不要按文档去改实现!)")
 if "send_response(204)" in probe:
     bad("probe81.py 改成 204 了 —— iOS 的 URLStringProbe 不认 204")
 ok("实现仍返回 HTTP 200(iOS URLStringProbe 只认 200)")
 
-unit = text("deploy/ios/pdg-probe81.service")
+unit = text("deploy/bot/pdg-probe81.service")
 if "204" in unit:
     bad("pdg-probe81.service 的描述里仍写 204")
 if "200" not in unit:

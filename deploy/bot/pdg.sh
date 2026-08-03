@@ -2085,11 +2085,11 @@ migrate_pdg_mitm_service(){
 # expected_services 已经把它列为必需 → doctor 直接判红。
 # 幂等: unit 内容一致且已 enabled 就什么都不做。
 migrate_probe81_public(){
-  [[ -f "$REPO_DIR/deploy/ios/pdg-probe81.service" ]] || return 0
+  [[ -f "$REPO_DIR/deploy/bot/pdg-probe81.service" ]] || return 0
   [[ -f /opt/pdg-bot/probe81.py ]] || return 0        # 程序还没就位 → 下轮 botfiles 迁移后再补
   local src=/etc/systemd/system/pdg-probe81.service changed=0
-  if ! cmp -s "$REPO_DIR/deploy/ios/pdg-probe81.service" "$src"; then
-    install -m644 "$REPO_DIR/deploy/ios/pdg-probe81.service" "$src" 2>/dev/null || {
+  if ! cmp -s "$REPO_DIR/deploy/bot/pdg-probe81.service" "$src"; then
+    install -m644 "$REPO_DIR/deploy/bot/pdg-probe81.service" "$src" 2>/dev/null || {
       c_y "  写入 pdg-probe81.service 失败(保留原状)"; return 0; }
     changed=1
   fi

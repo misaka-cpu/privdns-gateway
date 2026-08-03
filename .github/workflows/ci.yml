@@ -76,7 +76,7 @@ jobs:
             systemd-analyze verify \
               deploy/bot/pdg-bot.service deploy/bot/pdg-health.service \
               deploy/bot/pdg-rules-update.service deploy/bot/pdg-health.timer \
-              deploy/bot/pdg-rules-update.timer deploy/ios/pdg-probe81.service || true
+              deploy/bot/pdg-rules-update.timer deploy/bot/pdg-probe81.service || true
             echo "(CI 环境缺二进制/路径, 上面的告警多为预期; 重点看指令拼写/语法错)"
           else
             echo "systemd-analyze 不可用, 跳过"

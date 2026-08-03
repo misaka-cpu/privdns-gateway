@@ -28,7 +28,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "deploy/bot"))
-sys.path.insert(0, str(ROOT / "deploy/ios"))
+sys.path.insert(0, str(ROOT / "deploy/bot"))
 
 PASS_N = [0]
 FAIL_N = [0]
@@ -246,7 +246,7 @@ def main():
 
     print()
     print("── 12. 不读也不信任 X-Forwarded-For ──")
-    p81 = (ROOT / "deploy/ios/probe81.py").read_text(encoding="utf-8")
+    p81 = (ROOT / "deploy/bot/probe81.py").read_text(encoding="utf-8")
     (ok if "X-Forwarded-For" not in p81.replace("**不读也不信任 X-Forwarded-For**", "")
         .replace("不读也不信任 X-Forwarded-For", "") else bad)(
         "probe81.py 里除注释外不出现 X-Forwarded-For")

@@ -241,8 +241,8 @@ snapshot_state(){
 }
 # 注入: 让指定源文件"装不上"(改成不可读, install 必失败)。真实失败, 不是打桩返回值。
 for target in deploy/bot/mitm_server.py deploy/bot/mitm_ca.py deploy/bot/mitm_wloc.py \
-              deploy/ios/probe81.py deploy/ios/pdg-dot-ondemand.mobileconfig.tmpl \
-              deploy/ios/pdg-probe81.service; do
+              deploy/bot/probe81.py deploy/ios/pdg-dot-ondemand.mobileconfig.tmpl \
+              deploy/bot/pdg-probe81.service; do
   BEFORE="$(snapshot_state)"
   mv "/opt/privdns-gateway/$target" "/opt/privdns-gateway/$target.hidden"
   out=$(pdg platform ios 2>&1); rc=$?

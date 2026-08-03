@@ -32,7 +32,7 @@ deploy/bot/report.py report.py 755
 deploy/bot/nftscan.py nftscan.py 755
 deploy/bot/linkstat.py linkstat.py 755
 deploy/bot/linksess.py linksess.py 755
-deploy/ios/probe81.py probe81.py 755
+deploy/bot/probe81.py probe81.py 755
 deploy/bot/nftmerge.py nftmerge.py 755
 deploy/bot/sb2mihomo.py sb2mihomo.py 755
 deploy/bot/mihomorender.py mihomorender.py 755

@@ -946,7 +946,7 @@ def check_mitm():
                      ("mitm_wloc.py", "deploy/bot/mitm_wloc.py"),
                      ("iosprofile.py", "deploy/bot/iosprofile.py"),
                      ("iosstate.py", "deploy/bot/iosstate.py"),
-                     ("probe81.py", "deploy/ios/probe81.py"),
+                     ("probe81.py", "deploy/bot/probe81.py"),
                      ("pdg-dot.mobileconfig.tmpl", "deploy/ios/pdg-dot-ondemand.mobileconfig.tmpl")):
         sp = os.path.join(REPO_DIR, src)
         if not os.path.isfile(sp):

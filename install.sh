@@ -877,7 +877,7 @@ install -m644 "$REPO_DIR"/deploy/bot/pdg-health.timer         /etc/systemd/syste
 # pdg-probe81(:81 探测)是 Android/iOS **公共**组件: iOS 用它做 OnDemand 探测, 两平台
 # 都用它做链路诊断的 HTTP 会话入口。nft 模板里 81 本来就只对 __INTERNAL_CIDR__ 放行,
 # 两平台一致, 所以这里无条件装。
-install -m644 "$REPO_DIR"/deploy/ios/pdg-probe81.service /etc/systemd/system/
+install -m644 "$REPO_DIR"/deploy/bot/pdg-probe81.service /etc/systemd/system/
 render "$REPO_DIR/deploy/firewall/journald-50-pdg.conf" > /etc/systemd/journald.conf.d/50-pdg.conf; chmod 644 /etc/systemd/journald.conf.d/50-pdg.conf
 
 cat > /etc/systemd/system/mosdns.service <<'EOF'

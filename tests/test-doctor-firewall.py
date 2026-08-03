@@ -168,18 +168,21 @@ checks._run = lambda cmd: (0, "chain input {\n ip saddr 172.22.0.0/16 tcp dport 
 open(checks.PLATFORM_FILE, "w").write("android")
 _t = checks.platform_ports_text()
 assert "5228-5230" in _t and "仅 Android" in _t, _t
-assert "81" not in _t.replace("8445", ""), "Android 不该提 iOS 专属的 :81: " + _t
+# 6.1B: probe81 已是公共件, 两平台都监听并放行 81 —— Android 也该列出来。
+assert "81" in _t.replace("8445", ""), "Android 也该提 :81(公共件): " + _t
 assert "8445" in _t, "8445(TG SOCKS5)两平台共用"
 _st, _, _detail = checks.check_nft()
 assert _st == "ok" and "5228-5230" in _detail and "仅 Android" in _detail, (_st, _detail)
-print("[OK]   Android: 端口文案含 5228-5230(仅 Android), 不提 :81")
+print("[OK]   Android: 端口文案含 5228-5230(仅 Android), 也含 :81(公共件)")
 
 open(checks.PLATFORM_FILE, "w").write("ios")
 _t = checks.platform_ports_text()
-assert "81(仅 iOS)" in _t, _t
+# 6.1B: 81 不再是 iOS 专属, 文案里也不该再写"(仅 iOS)"。
+assert "81" in _t.replace("8445", "") and "81(仅 iOS)" not in _t, _t
 assert "5228" not in _t, "iOS 上不得声称 GMS 5228-5230 已就位: " + _t
 assert "8445" in _t, "8445(TG SOCKS5)两平台共用"
 _st, _, _detail = checks.check_nft()
-assert _st == "ok" and "5228" not in _detail and "81(仅 iOS)" in _detail, (_st, _detail)
-print("[OK]   iOS: 端口文案含 81(仅 iOS), 不含 5228-5230")
+assert _st == "ok" and "5228" not in _detail \
+    and "81" in _detail.replace("8445", "") and "81(仅 iOS)" not in _detail, (_st, _detail)
+print("[OK]   iOS: 端口文案含 81(不再标「仅 iOS」), 不含 5228-5230")
 print("platform port text regression OK")

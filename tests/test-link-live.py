@@ -23,7 +23,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "deploy/bot"))
-sys.path.insert(0, str(ROOT / "deploy/ios"))
+sys.path.insert(0, str(ROOT / "deploy/bot"))
 
 PASS_N = [0]
 FAIL_N = [0]

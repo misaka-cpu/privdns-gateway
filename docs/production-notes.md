@@ -140,7 +140,7 @@ gvt2.com / gvt3.com / android.com`，`systemctl restart dnsdist` 生效。
 - 脚本：`deploy/cert/{proxy-gateway-open-cert-http.sh, proxy-gateway-restore-firewall.sh, 99-reload-cert.deploy-hook.sh}`。
 
 ### iOS OnDemand :81 探测端点（双卡区分）
-- `deploy/ios/probe81.py`（:81 任意 GET→**200**，systemd `pdg-probe81.service`，DynamicUser+CAP_NET_BIND_SERVICE）。
+- `deploy/bot/probe81.py`（:81 任意 GET→**200**，systemd `pdg-probe81.service`，DynamicUser+CAP_NET_BIND_SERVICE）。
   （本文早期几处写成 204，是记录笔误：iOS 的 `URLStringProbe` 只认 **200**，实现从来返回 200。）
 - nftables 把 81 加进内网卡放行集：`ip saddr 172.22.0.0/16 tcp dport { 80, 81, 443 }`；81 **不在**无差别集 `{22,53,853,8111}` 里，
   policy drop 兜底 → **普通卡探不通、内网卡探得通**，iOS OnDemand 据此只在内网卡(蜂窝)激活 DoT。
