@@ -508,6 +508,10 @@ seg = BOTSRC
 (ok if "TTL_SECS = " not in seg else bad)("Bot 里没有自己定义 TTL")
 (ok if not re.search(r'"http://%s:81/probe\?t=', seg) else bad)("Bot 里没有自己拼探测 URL")
 (ok if not re.search(r"def .*inside_internal_cidr", seg) else bad)("Bot 里没有自己判来源网段")
+# 判断基准由 root 侧在建会话时快照进会话记录(见 linksess.start_session)。Bot 自己再解析
+# 一遍 CIDR 就是第二套真源 —— 两边迟早说不一样, 而用户只看得到 Bot 那份。
+(ok if "ip_network(" not in seg and "import ipaddress" not in seg else bad)(
+    "Bot 里没有自己解析 CIDR(ip_network / import ipaddress 一次都没有)")
 (ok if "linksess" in seg else bad)("Bot 复用 linksess 模块")
 
 # ═══ 14. 后台等待: 异常也必须把占用释放掉 ═══════════════════════════════════

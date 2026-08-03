@@ -231,6 +231,19 @@ def main():
         r5, why5 = S.read_state()
         out("OK" if r5 is None and why5 == S.R_STATE_CORRUPT else "FAIL",
             "旧 schema 状态 fail-closed(实得 %s)" % why5)
+        # 再单独验版本号这一道: 上面那格同时缺字段, 两道守卫都会拦, 于是"版本检查还在不在"
+        # 其实没被验到。这一格字段齐全, 只把版本号改回 1 —— 只有版本检查能拦住它。
+        S.clear_state()
+        okk5b, _p5b = S.start_session()
+        r5b, _ = S.read_state()
+        if okk5b and r5b:
+            r5b["schema_version"] = 1          # 字段一个不少, 只有版本不对
+            S.write_state(r5b)
+            r5c, why5c = S.read_state()
+            out("OK" if r5c is None and why5c == S.R_STATE_CORRUPT else "FAIL",
+                "只有版本号不对(字段齐全)也 fail-closed(实得 %s)" % why5c)
+        else:
+            out("FAIL", "版本号用例的前置会话没建出来")
     else:
         out("FAIL", "旧 schema 用例的前置会话没建出来")
 

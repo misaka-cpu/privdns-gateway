@@ -154,6 +154,12 @@ jobs:
       - name: "Bot 手机链路测试 (token 只在按钮/结论上限/只读/并发与故障释放)"
         run: python3 tests/test-link-bot.py
 
+      # .153 真机 P0: probe81 以 DynamicUser 跑, 读不到 0600 root 的 profile.env, 于是
+      # "来源在不在内网卡段"这条证据永远产不出来。判据只能落在**真的换 UID**上 —— 同一个
+      # uid 下怎么测都是空转。CI 是 root 容器, 严格模式下 SKIP 判失败。
+      - name: "链路会话跨 UID 边界 (真 setuid: 会话快照网段 / 不读 profile.env / schema fail-closed)"
+        run: python3 tests/test-link-profile-uid.py
+
       # 夹具自己漏资源, 会以"产品偶发失败"的样子冒出来 —— 判据落在真实线程/端口/目录上。
       - name: "txbox 探针生命周期 (clean 后线程必须退出/端口必须释放/50 个 Box 回到基线)"
         run: python3 tests/test-txbox-probes.py
