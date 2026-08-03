@@ -176,7 +176,7 @@ mkdir -p /opt/pdg-bot /etc/systemd/system /etc/privdns-gateway
 : > /etc/systemd/system/pdg-mitm.service
 echo android > /etc/privdns-gateway/platform
 c_g(){ :; }; c_y(){ :; }; c_r(){ :; }
-systemctl(){ echo "systemctl $*" >> /tmp/sysctl.log; return 0; }
+systemctl(){ echo "systemctl $*" >> /opt/sysctl.log; return 0; }
 _pdg_platform(){ echo android; }
 _profile_set(){ :; }
 PDG_PLATFORM_FILE=/etc/privdns-gateway/platform
@@ -187,7 +187,7 @@ for f in /opt/pdg-bot/probe81.py /etc/systemd/system/pdg-probe81.service \
          /opt/pdg-bot/mitm_ca.py /etc/systemd/system/pdg-mitm.service; do
   [ -e "$f" ] && echo "ALIVE $f" || echo "GONE  $f"
 done
-echo "--SYSCTL--"; cat /tmp/sysctl.log 2>/dev/null || true
+echo "--SYSCTL--"; cat /opt/sysctl.log 2>/dev/null || true
 """ % _extract(pdgsh, "migrate_android_cleanup")
 _sc = tempfile.mkdtemp(prefix="p81ns.")
 _scp = os.path.join(_sc, "run.sh")

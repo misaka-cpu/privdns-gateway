@@ -67,6 +67,37 @@ def main():
         "没有会话时不产出来源证据")
 
     print()
+    print("── 1b. 会话建了但手机还没来: 仍是 NOT_OBSERVED ──")
+    # 这一格原本没人覆盖 —— 负控"证据没变却返回 PASS"因此抓不住。会话存在只说明
+    # 我们在等, 不说明观察到了任何东西。
+    fresh()
+    tok1b, rec1b = S.new_session(probe_domain="p.probe.example")
+    S.write_state(rec1b)
+    fs = L.collect(platform="android")
+    l1 = layer(fs, 1)
+    (ok if l1 and l1[0]["status"] == L.NOT_OBSERVED
+        and l1[0]["code"] == "L1_NOT_OBSERVED" else bad)(
+        "会话进行中但未消费 → NOT_OBSERVED(实得 %s)"
+        % [(f["status"], f["code"]) for f in l1])
+    # observed_at 在 6.1A 的语义里是**采集时刻**(Finding 构造时兜底成 now), 不是
+    # "观察到手机的时刻", 所以它区分不了这两种情形。真正的判据是用户读到的那句话。
+    (ok if l1 and "还没有观察到" in l1[0]["detail"] else bad)(
+        "文案明说还没观察到(实得 %r)" % (l1[0]["detail"] if l1 else None))
+    (ok if l1 and "观察到一次" not in l1[0]["detail"] else bad)(
+        "没有声称观察到过任何一次探测")
+    (ok if not any(f["code"].startswith("L2_SOURCE") for f in fs) else bad)(
+        "也没有来源证据(手机还没来过)")
+    # 过期但从未被消费 → STALE, 但绝不是 PASS
+    rec1b["expires_at"] = rec1b["created_at"] - 1
+    S.write_state(rec1b)
+    l1 = layer(L.collect(platform="android"), 1)
+    (ok if l1 and l1[0]["status"] == L.STALE else bad)(
+        "会话过期且从未被消费 → STALE(实得 %s)"
+        % [(f["status"], f["code"]) for f in l1])
+    (ok if l1 and l1[0]["status"] != L.PASS else bad)(
+        "**绝不是 PASS** —— 没观察到就是没观察到")
+
+    print()
     print("── 2. 真跑一次会话: HTTP 证据出现 ──")
     fresh()
     tok, rec = S.new_session(probe_domain="abc.probe.dot.example")
