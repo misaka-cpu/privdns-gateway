@@ -739,7 +739,7 @@ def wloc_add_gen(name, lat, lon):
         return False, busy_msg(), 0
     if st["hot"]:
         return True, (f"✅ 当前目标坐标已更新：<b>{name}</b>（{lat}, {lon}）\n"
-                      "WLOC 已热加载，无需重启网关服务，也不用再去列表里点一次。\n\n"
+                      "位置已切换，网关服务无需重启，也不用再去列表里点一次。\n\n"
                       "现在请关闭 iPhone 定位服务，等待 2 秒后重新开启。"), st["gen"]
     if st["was_active"] or st["first"]:
         return True, (f"✅ 已保存当前目标 <b>{name}</b>（{lat}, {lon}）\n"
@@ -823,7 +823,7 @@ def wloc_switch_gen(name):
         return True, (f"✅ 已选中 <b>{name}</b>（{loc['lat']}, {loc['lon']}）\n"
                       "WLOC 未开启，这个地点还不会生效 —— 点「✅ 开启」后才会改写定位。"), w["generation"]
     return True, (f"✅ 网关目标已切换：<b>{name}</b>（{loc['lat']}, {loc['lon']}）\n"
-                  "WLOC 已热加载，无需重启网关服务。\n\n"
+                  "位置已切换，网关服务无需重启。\n\n"
                   "现在请关闭 iPhone 定位服务，等待 2 秒后重新开启。"), w["generation"]
 
 def wloc_switch(name):
@@ -1675,7 +1675,7 @@ def _wda_precedence_note():
                         "、".join("<code>%s</code>" % d for d in wda["direct_list"][:5])
                         + ("…" if len(wda["direct_list"]) > 5 else "")))
     if scan.get("auto"):
-        lines.append("• ⚠️ 有 %d 条点名规则被自动规则压在下面, 永远轮不到: %s —— 跑 "
+        lines.append("• ⚠️ 有 %d 条用户指定的域名规则被系统自动规则抢先匹配, 当前无法生效: %s —— 跑 "
                      "<code>sudo pdg doctor</code> 看「分流优先级」。"
                      % (len(scan["auto"]),
                         "、".join("<code>%s</code>" % d for d, _w, _g, _b in scan["auto"][:5])
@@ -2803,7 +2803,7 @@ def _undrivable_note(undrivable):
             "<b>没能生成劫持表</b>: " + "、".join(str(x) for x in undrivable[:4])
             + ("…" if len(undrivable) > 4 else "")
             + "\ngfw 模式下它们的规则不会命中(all 模式不受影响)。跑 <code>sudo pdg doctor</code> "
-              "看「规则集劫持表」那一项。")
+              "看「规则集生效状态」那一项。")
 
 
 # ── 单条规则增删 ──
@@ -3650,8 +3650,8 @@ def _reapply_explicit_proxy(mos_bytes, cur_bytes):
             capture_output=True, text=True, timeout=60)
         if r.returncode != 0:
             return mos_bytes, ("⚠️ 备份里的 mosdns 配置是自定义形态, 没能补上「明确代理优先于国内判定」"
-                               "这一层(未擅自改动)。你点名指到出口的域名可能会被判直连 —— "
-                               "跑 <code>sudo pdg doctor</code> 看「明确代理优先级」那一项。")
+                               "这一层(未擅自改动)。你指定要走出口的域名可能会被判直连 —— "
+                               "跑 <code>sudo pdg doctor</code> 看「指定域名优先级」那一项。")
         with open(cand, "rb") as f:
             out = f.read()
         if out == mos_bytes:
@@ -3659,7 +3659,7 @@ def _reapply_explicit_proxy(mos_bytes, cur_bytes):
         return out, "ℹ️ 备份来自旧版本, 已顺带补回「明确代理优先于国内判定」的分流层。"
     except Exception:  # noqa: BLE001
         return mos_bytes, ("⚠️ 没能复核备份里的分流优先级(未擅自改动)。"
-                           "跑 <code>sudo pdg doctor</code> 看「明确代理优先级」那一项。")
+                           "跑 <code>sudo pdg doctor</code> 看「指定域名优先级」那一项。")
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -4262,7 +4262,7 @@ def handle_cb(chat, mid, data):
              "<b>切换地点的推荐顺序（全程用内网卡）：</b>\n"
              "① 控制中心把 Wi-Fi 点灰（不是在设置里关 Wi-Fi）\n"
              "② 在 Bot「📍 地点 / 切换」里点目标地点\n"
-             "③ 等 Bot 显示「WLOC 已热加载」\n"
+             "③ 等 Bot 显示「位置已切换，网关服务无需重启」\n"
              "④ 设置 → 隐私与安全性 → 定位服务：关闭，等 2 秒后重新开启\n"
              "⑤ 打开目标 App\n"
              "⑥ iOS 26 如果一直没有发起新的 WLOC 请求，可能仍需重启手机\n\n"

@@ -104,7 +104,7 @@ bash /usr/local/bin/pdg __migrate >/tmp/mig3.log 2>&1
 { [[ -e /opt/pdg-bot/probe81.py ]] && [[ -e /etc/systemd/system/pdg-probe81.service ]]; } \
   && ok "iOS: iOS 组件保留" || bad "iOS 组件被误删"
 [[ ! -e /etc/privdns-gateway/platform.guessed ]] && ok "iOS: 已确认平台不打推测标记" || bad "已确认平台仍被当成推测"
-[[ -e /etc/systemd/system/pdg-mitm.service ]] && ok "iOS: 补上 pdg-mitm 服务(MITM 插件宿主)" || bad "缺 pdg-mitm unit"
+[[ -e /etc/systemd/system/pdg-mitm.service ]] && ok "iOS: 补上 pdg-mitm 服务(WLOC 服务宿主)" || bad "缺 pdg-mitm unit"
 cp /etc/sing-box/config.json /tmp/s2
 bash /usr/local/bin/pdg __migrate >/dev/null 2>&1
 cmp -s /tmp/s2 /etc/sing-box/config.json && ok "iOS: 二跑幂等" || bad "iOS 二跑改动了 model"
@@ -124,7 +124,7 @@ bash /usr/local/bin/pdg __migrate >/dev/null 2>&1
 # geosite_cn **之后**。上游 geosite 一旦把某域名归进 CN, DNS 就先返真实地址, 流量根本不进
 # 内核 —— 规则在、doctor 绿、就是不生效。这里跑真的 `pdg __migrate`, 验的是"老机器升上来
 # 之后这件事被修好了, 而用户自己的东西一样没动"。
-echo; echo "── 场景四: v1.7.0 机器升级(明确代理优先级)──"
+echo; echo "── 场景四: v1.7.0 机器升级(指定域名优先级)──"
 # 迁移走 pdgtx: 候选要过 mosdns 强校验(**真启动 mosdns**)。拿不到二进制这条就没得验。
 e2e_fetch_mosdns || e2e_skip "取不到 mosdns 二进制(明确代理迁移的候选校验要真启动它)"
 
@@ -227,7 +227,7 @@ cmp -s /tmp/m4 /etc/mosdns/config.yaml && ok "二跑幂等(mosdns 配置逐字�
 # doctor 要认这台机器已经修好了
 python3 /opt/pdg-bot/doctor.py --json > /tmp/doc4.json 2>/dev/null
 python3 "$E2E_ROOT/tests/helpers/doctor-explicit-proxy.py" /tmp/doc4.json ok \
-  && ok "doctor: 明确代理优先级判 ok" || bad "doctor 没判 ok: $(cat /tmp/doc4.json 2>/dev/null | head -c 200)"
+  && ok "doctor: 指定域名优先级判 ok" || bad "doctor 没判 ok: $(cat /tmp/doc4.json 2>/dev/null | head -c 200)"
 
 # ══ 场景五: 自定义形态 → fail-closed, 现网不动, doctor 点名 ═══════════════════
 echo; echo "── 场景五: 认不出的自定义 mosdns 形态 ──"
@@ -391,7 +391,7 @@ RSMETA2
   python3 - <<'PY' && ok "doctor: .mrs 也判已同步" || bad "doctor: $(head -c 200 /tmp/doc8.json)"
 import json, sys
 d = json.load(open("/tmp/doc8.json"))
-hit = [x for x in d if x.get("check") == "规则集劫持表"]
+hit = [x for x in d if x.get("check") == "规则集生效状态"]
 sys.exit(0 if hit and hit[0]["level"] == "ok" else 1)
 PY
 else
@@ -412,7 +412,7 @@ python3 /opt/pdg-bot/doctor.py --json > /tmp/doc8b.json 2>/dev/null
 python3 - <<'PY' && ok "坏 .mrs → doctor 点名读不出域名" || bad "坏 .mrs 没被点名: $(head -c 200 /tmp/doc8b.json)"
 import json, sys
 d = json.load(open("/tmp/doc8b.json"))
-hit = [x for x in d if x.get("check") == "规则集劫持表"]
+hit = [x for x in d if x.get("check") == "规则集生效状态"]
 sys.exit(0 if hit and hit[0]["level"] == "warn" and "读不出域名" in hit[0]["detail"] else 1)
 PY
 rm -f /opt/pdg-bot/rulesets.json /etc/sing-box/rs/rs_demo.json /etc/sing-box/rs/rs_bin.mrs \

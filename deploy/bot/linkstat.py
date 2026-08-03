@@ -171,16 +171,16 @@ def _l1_private_traffic(_ctx):
         return Finding(
             1, "L1_HTTP_PROBE_STALE" if expired else "L1_NOT_OBSERVED",
             STALE if expired else NOT_OBSERVED, None, "手机 HTTP 探测到达",
-            "会话已过期, 期间没有观察到手机访问 :81。" if expired
-            else "会话进行中, 还没有观察到手机访问 :81。",
+            "会话已过期, 期间服务器没有观察到本次会话的 HTTP 请求。" if expired
+            else "会话进行中, 服务器还没有观察到本次会话的 HTTP 请求。",
             evidence_source="pdg-probe81 会话状态",
             observed_at=None,
             next_step="在手机上打开 `pdg link session start` 给出的第 1 步链接。")
     return Finding(
         1, "L1_HTTP_PROBE_STALE" if expired else "L1_HTTP_PROBE_OBSERVED",
         STALE if expired else PASS, None, "手机 HTTP 探测到达",
-        "观察到一次来自手机的 :81 探测(会话 %s)。这证明手机的网络能到达网关, "
-        "**不**证明 SIM/APN 正常, 也不证明 DNS 走通了。" % rec.get("session_id"),
+        "服务器观察到本次会话的 HTTP 请求(会话 %s)。这只说明该请求到达了网关的 :81, "
+        "不能据此判断 SIM/APN、DoT 或手机整体联网是否正常。" % rec.get("session_id"),
         evidence_source="pdg-probe81 内核 peer 地址(不读 X-Forwarded-For)",
         observed_at=consumed,
         freshness_secs=int(time.time() - consumed))
@@ -204,20 +204,21 @@ def _l2_source_evidence(_ctx):
         return Finding(
             2, "L2_SOURCE_INSIDE_CIDR", STALE if expired else PASS, None,
             "手机来源网段",
-            "那次探测的来源落在 PDG_INTERNAL_CIDR 里(网段 %s)。" % pre,
+            "该请求来自配置的内网卡来源段(网段 %s)。这只说明来源网段一致, "
+            "不代表 DoT 或手机整体联网正常。" % pre,
             evidence_source="pdg-probe81 内核 peer 地址 → 仅保留 /16",
             observed_at=rec.get("http_consumed_at"))
     if inside is False:
         return Finding(
             2, "L2_SOURCE_OUTSIDE_CIDR", WARN, NETWORK_PRIVATE, "手机来源网段",
-            "那次探测的来源(网段 %s)**不在** PDG_INTERNAL_CIDR 里 —— 手机这次很可能"
-            "没走目标 SIM 的私网。" % pre,
+            "该请求**不是**来自配置的内网卡来源段(网段 %s)。" % pre,
             evidence_source="pdg-probe81 内核 peer 地址 → 仅保留 /16",
             observed_at=rec.get("http_consumed_at"),
             next_step="确认手机用的是要诊断的那张 SIM, 且已关闭 Wi-Fi。")
     return Finding(
         2, "L2_SOURCE_INSIDE_CIDR", NOT_OBSERVED, None, "手机来源网段",
-        "记到了来源网段 %s, 但 profile.env 里没有 PDG_INTERNAL_CIDR, 无法判断归属。" % pre,
+        "记到了来源网段 %s, 但 profile.env 里没有 PDG_INTERNAL_CIDR, "
+        "无法判断它是不是配置的内网卡来源段。" % pre,
         evidence_source="pdg-probe81 内核 peer 地址 → 仅保留 /16")
 
 
@@ -419,11 +420,12 @@ def _l6_dns(_ctx):
             blocks_downstream=True))
     out.append(Finding(
         6.5, "L6_DOT_METRICS_UNAVAILABLE", NOT_OBSERVED, None, "手机 DoT 查询到达",
-        "没有 DNS 侧证据: 专用 probe 计数器未启用。6.1B 在安全审查中停止了这一步 —— "
-        "官方 mosdns v5.3.4 的 API 一旦打开, 同一个端口上还会暴露 DNS 缓存导出与投喂"
-        "接口(见 tests/test-link-dns-evidence.py), 那会泄露普通浏览域名。留到 6.2。",
-        evidence_source="none(6.1A 无实时观测)",
-        next_step="要验证需要 6.1B 的一次性协助会话。"))
+        "当前版本无法安全取得手机 DoT 查询证据。开启 mosdns v5.3.4 的 metrics 接口会在"
+        "同一个监听端口上连带暴露 DNS 缓存导出(内含明文查询域名)与缓存投喂端点; "
+        "绑定回环挡不住本机 SSRF, 在前面加一层反向代理也保护不了仍可直接访问的上游端口。"
+        "因此本版本不采集这一层, 该能力移交 6.2 重新设计(见 docs/ROADMAP.md)。",
+        evidence_source="none(本版本不采集 DNS 侧证据)",
+        next_step="服务器侧无需处理; 这一层的能力移交 6.2 重新设计。"))
     return out
 
 
@@ -565,8 +567,9 @@ _PHONE_NOTE = ("当前仅检查服务器准备状态, 尚未观察手机的实�
 # 会话里真的观察到东西之后, 上面那句就不再成立了(它说的是"尚未观察")。但**能说的
 # 上限**没变: 观察到的是"手机的网络到达了 :81", 不是 SIM/APN 正常, 更不是 DNS 走通。
 _PHONE_NOTE_OBSERVED = (
-    "以上是本次会话时间窗内观察到的证据。HTTP 证据只说明手机的网络到达了网关的 :81; "
-    "它不证明 SIM/APN 正常, 不证明手机采用了这次 DNS 响应, 也不证明最终走了哪个上游。")
+    "以上是本次会话时间窗内观察到的证据。HTTP 证据只说明服务器观察到本次会话的 HTTP 请求, "
+    "来源段只说明该请求来自配置的内网卡来源段; 本版本无法观察手机是否真的发出了 DoT 查询。"
+    "因此不能据此判断 SIM/APN、DoT 或手机整体联网是否正常。")
 
 
 def render_text(findings):

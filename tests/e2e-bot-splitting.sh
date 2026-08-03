@@ -587,7 +587,7 @@ python3 "$E2E_ROOT/tests/helpers/doctor-explicit-proxy.py" /tmp/e2e-doc9.json ok
 echo; echo "── 7. doctor ──"
 python3 /opt/pdg-bot/doctor.py --json > /tmp/e2e-doc.json 2>/dev/null
 python3 "$E2E_ROOT/tests/helpers/doctor-explicit-proxy.py" /tmp/e2e-doc.json ok \
-  && ok "doctor: 明确代理优先级 = ok" || bad "doctor 判定不对: $(head -c 200 /tmp/e2e-doc.json)"
+  && ok "doctor: 指定域名优先级 = ok" || bad "doctor 判定不对: $(head -c 200 /tmp/e2e-doc.json)"
 
 e2e_mosdns_stop
 e2e_summary

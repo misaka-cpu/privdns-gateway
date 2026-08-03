@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import urllib.request
 from http.server import HTTPServer
 from pathlib import Path
@@ -146,8 +147,12 @@ def main():
         (ok if not bare else bad)(
             "禁语「%s」每次出现都紧跟否定(裸用 %d 处: %s)"
             % (banned, len(bare), bare[:1]))
-    (ok if "不证明 SIM/APN 正常" in phone_seg else bad)(
-        "明说了 HTTP 证据不证明 SIM/APN 正常")
+    # 免责句的**内容**要求: 必须同时点到 SIM/APN、DoT 与整体联网三者, 缺一就会被读者
+    # 补成"那另外两个应该没问题"。只钉"不证明 SIM/APN"会放过"但 DoT 是通的"这种写法。
+    disclaim = [ln for ln in phone_seg.splitlines() if "不能据此判断" in ln]
+    (ok if disclaim and all(k in " ".join(disclaim) for k in ("SIM/APN", "DoT", "整体联网"))
+     else bad)("免责句同时否掉 SIM/APN、DoT、整体联网(实得 %s)"
+               % (" ".join(disclaim)[:60] or "无"))
     (ok if "尚未观察手机的实时链路" not in phone_seg else bad)(
         "观察到证据之后, 不再说「尚未观察」")
 
@@ -206,8 +211,42 @@ def main():
     src = [f for f in fs if f["code"] == "L2_SOURCE_OUTSIDE_CIDR"]
     (ok if src and src[0]["status"] == L.WARN else bad)(
         "段外来源是 WARN(实得 %s)" % [(f["status"], f["code"]) for f in src])
-    (ok if src and "很可能" in src[0]["detail"] else bad)(
-        "文案是「很可能没走目标 SIM」而不是断言")
+    # 这一条比原来更严: 不是"把断言改成推测", 而是**根本不推测 SIM**。来源段能证明的
+    # 只有"这次请求是不是来自配置的那个段", 手机为什么不在段内(换了网、Wi-Fi 没关、
+    # APN 不对…)服务器一概不知道。推测写进判据就会被当成结论。
+    d6 = src[0]["detail"] if src else ""
+    (ok if src and "内网卡来源段" in d6 else bad)(
+        "段外文案陈述的是「不是来自配置的内网卡来源段」(实得 %s)" % d6[:48])
+    (ok if src and not any(w in d6 for w in ("SIM", "APN", "很可能", "应该"))
+     else bad)("段外文案不对 SIM/APN 做任何推测(实得 %s)" % d6[:48])
+    (ok if src and src[0]["next_step"] and "SIM" in src[0]["next_step"] else bad)(
+        "把「检查是不是那张 SIM」放在下一步建议里, 而不是写成判据")
+
+    print()
+    print("── 6b. 四类手机侧状态的文案各说各的, 不能混 ──")
+    # 已观察 / 未观察 / 过期 / 段外: 用户看到的第一句话必须能区分这四种处境。
+    # 之前只验了"已观察"那一类, 另外三类写成什么样都能通过。
+    def _l1_detail(**kw):
+        fresh(**kw)
+        tok, rec = S.new_session()
+        for k, v in _st.items():
+            rec[k] = v
+        S.write_state(rec)
+        return (layer(L.collect(platform="android"), 1) or [{}])[0].get("detail", "")
+
+    _st = {}
+    d_pending = _l1_detail()
+    (ok if "会话进行中" in d_pending and "还没有观察到" in d_pending else bad)(
+        "未观察: 说「会话进行中, 服务器还没有观察到」(实得 %s)" % d_pending[:44])
+
+    _st = {"expires_at": time.time() - 1}
+    d_exp = _l1_detail()
+    (ok if "已过期" in d_exp and "没有观察到" in d_exp else bad)(
+        "过期: 说「会话已过期, 期间没有观察到」(实得 %s)" % d_exp[:44])
+
+    for name, d in (("未观察", d_pending), ("过期", d_exp)):
+        (ok if "服务器观察到本次会话的 HTTP 请求" not in d else bad)(
+            "%s 的文案不能出现「服务器观察到本次会话的 HTTP 请求」" % name)
 
     print()
     print("── 7. 第 6.5 层: 阶段 3 停了, 只能 NOT_OBSERVED ──")
@@ -217,6 +256,13 @@ def main():
     (ok if l65 and l65[0]["code"] == "L6_DOT_METRICS_UNAVAILABLE" else bad)(
         "code 是 L6_DOT_METRICS_UNAVAILABLE(说清为什么没有)")
     (ok if l65 and "6.2" in l65[0]["detail"] else bad)("文案里点明了延后到 6.2")
+    d65 = l65[0]["detail"] if l65 else ""
+    (ok if "无法安全取得" in d65 else bad)(
+        "第 6.5 层明说「当前版本无法安全取得」, 不能读成通过(实得 %s)" % d65[:44])
+    (ok if all(k in d65 for k in ("明文查询域名", "回环")) else bad)(
+        "并给出拒绝的理由(同端口暴露明文域名 / 回环不构成缓解)")
+    (ok if not any(w in d65 for w in ("正常", "已确认")) else bad)(
+        "第 6.5 层不出现任何肯定性结论词")
     # HTTP 有证据而 DNS 没有 —— 不许因此断言 Private DNS 一定关着
     txt = L.render_text(fs)
     (ok if "一定" not in txt.split("手机/SIM")[1] else bad)(

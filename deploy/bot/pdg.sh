@@ -2076,7 +2076,7 @@ migrate_pdg_mitm_service(){
   pdg_write_unit pdg_unit_pdg_mitm /etc/systemd/system/pdg-mitm.service
   systemctl daemon-reload 2>/dev/null || true
   systemctl reset-failed pdg-mitm 2>/dev/null; systemctl enable --now pdg-mitm >/dev/null 2>&1 || true
-  c_g "  ✅ 已补 iOS pdg-mitm 服务(MITM 插件宿主)。"
+  c_g "  ✅ 已补 iOS pdg-mitm 服务(WLOC 服务宿主)。"
 }
 
 # 老装迁移: pdg-probe81 从 iOS 专属改成 Android/iOS 公共组件(6.1B)。
@@ -2499,7 +2499,7 @@ migrate_mosdns_explicit_proxy(){
     local pend rcp=0
     pend="$(python3 "$txm" pending 2>/dev/null)" || rcp=$?
     if [[ "$rcp" != 0 ]]; then
-      c_y "  有需要收尾的配置事务, 明确代理优先级本次不迁移(未改动任何文件):"
+      c_y "  有需要收尾的配置事务, 指定域名优先级本次不迁移(未改动任何文件):"
       printf '%s\n' "$pend" | sed 's/^/    /'
       c_y "  → 先 sudo pdg tx recover <id> 收尾, 再跑一次 sudo pdg update。"
       return 0
@@ -2508,14 +2508,14 @@ migrate_mosdns_explicit_proxy(){
   sip="$(sed -n 's/^PDG_SERVER_IP=//p' /etc/privdns-gateway/profile.env 2>/dev/null | tail -1)"
   [[ -n "$sip" ]] || sip="$(grep -oE 'black_hole [0-9.]+' "$mc" | head -1 | awk '{print $2}')"
   if [[ -z "$sip" ]]; then
-    c_y "  取不到网关 IP(未渲染?), 明确代理优先级未迁移(交 doctor 点名)。"; return 0
+    c_y "  取不到网关 IP(未渲染?), 指定域名优先级未迁移(交 doctor 报出)。"; return 0
   fi
   wd="$(mktemp -d)" || return 0
   # 先在**副本**上试改: 形态不认识就到此为止, 现网从未被碰过。
   cp "$mc" "$wd/cand.yaml" || { rm -rf "$wd"; return 0; }
   if ! out=$(_mosdns_explicit_proxy "$wd/cand.yaml" "$sip" 2>"$wd/err"); then
-    c_y "  mosdns 配置是自定义形态, 明确代理优先级未迁移(不猜着改): $(tr -d '\n' < "$wd/err" | head -c 120)"
-    c_y "  → sudo pdg doctor 会继续点名这一项。"
+    c_y "  mosdns 配置是自定义形态, 指定域名优先级未迁移(不猜着改): $(tr -d '\n' < "$wd/err" | head -c 120)"
+    c_y "  → sudo pdg doctor 会继续报出这一项。"
     rm -rf "$wd"; return 0
   fi
   [[ "$out" == changed ]] || { rm -rf "$wd"; return 0; }
@@ -2537,14 +2537,14 @@ migrate_mosdns_explicit_proxy(){
   if command -v mosdns >/dev/null 2>&1 && [[ -e /etc/systemd/system/mosdns.service ]]; then
     systemctl restart mosdns 2>/dev/null; sleep 1
     if [[ "$(systemctl is-active mosdns 2>/dev/null)" == active ]]; then
-      c_g "  已把「用户点名指到出口的域名」提到 geosite_cn 之前(显式代理优先)。"
+      c_g "  已把「用户指定要走出口的域名」提到 geosite_cn 之前(用户规则优先)。"
       rm -f "$bak"
     else
       c_y "  ⚠️ 新配置起不来 mosdns → 已还原到迁移前。"
       cp -a "$bak" "$mc" 2>/dev/null; systemctl restart mosdns 2>/dev/null; rm -f "$bak"
     fi
   else
-    c_g "  已把「用户点名指到出口的域名」提到 geosite_cn 之前(未起 mosdns 校验: 本机无 mosdns 服务)。"
+    c_g "  已把「用户指定要走出口的域名」提到 geosite_cn 之前(未起 mosdns 校验: 本机无 mosdns 服务)。"
     rm -f "$bak"
   fi
   rm -rf "$wd"
@@ -2573,7 +2573,7 @@ meta = json.load(open(sys.argv[1], encoding="utf-8"))
 data, _undrivable = bot.ruleset_hijack_text(meta)
 open(sys.argv[2], "wb").write(data)
 PY
-    c_y "  规则集劫持表未派生(读不出规则集元数据), 保持原样。"; rm -rf "$wd"; return 0
+    c_y "  规则集生效状态未派生(读不出规则集元数据), 保持原样。"; rm -rf "$wd"; return 0
   fi
   if [[ -f "$f" ]] && cmp -s "$f" "$wd/new.txt"; then rm -rf "$wd"; return 0; fi   # 幂等
   # 管理员手填过(不是派生产物)→ 不覆盖, 交给他自己决定
@@ -2585,7 +2585,7 @@ PY
   local bak; bak="$f.pre-derive.$(date +%s)"
   [[ -f "$f" ]] && { cp -a "$f" "$bak" 2>/dev/null || { rm -rf "$wd"; return 0; }; }
   if ! cat "$wd/new.txt" > "$f" 2>/dev/null; then
-    c_y "  规则集劫持表写入失败, 还原。"; [[ -f "$bak" ]] && cp -a "$bak" "$f"
+    c_y "  规则集生效状态写入失败, 还原。"; [[ -f "$bak" ]] && cp -a "$bak" "$f"
     rm -f "$bak"; rm -rf "$wd"; return 0
   fi
   if command -v mosdns >/dev/null 2>&1 && [[ -e /etc/systemd/system/mosdns.service ]]; then
@@ -2724,7 +2724,7 @@ migrate_cidr_single_source(){
   mv -f "$t" "$prof" || { rm -f "$t"; c_y "⚠️ 迁移: 落盘 profile.env 失败, 未改动"; return 0; }
   grep -q "^PDG_INTERNAL_CIDR=$nftv$" "$prof" \
     || { c_y "⚠️ 迁移: 真源复核未通过"; return 0; }
-  c_g "✅ 迁移: 内网卡段真源已写入 profile.env ($nftv)"
+  c_g "✅ 迁移: 内网卡段一致性基准已写入 profile.env ($nftv)"
 }
 
 run_all_migrations(){
@@ -2776,7 +2776,7 @@ _pdg_nft_foreign_input_chains(){
     return $?
   done
   # 判据脚本都不在 → 不能假装现场干净(那正是这道门要挡的事), 按"无法确认"处理
-  echo "找不到 nftscan.py(判据脚本缺失), 无法确认 input 链冲突"
+  echo "找不到 nftscan.py(判据脚本缺失), 无法确认防火墙链冲突"
   return 2
 }
 
@@ -2819,7 +2819,7 @@ _switchcore_nft(){   # $1=target(mihomo)  渲染并应用 mihomo nft(用当前 S
     return 1
   fi
   if [[ "$_frc2" == 2 ]]; then     # 读不到运行 ruleset: 不能假装干净就往下写规则
-    echo "无法确认 input 链冲突 → 未改动防火墙:"
+    echo "无法确认防火墙链冲突 → 未改动防火墙:"
     printf '%s\n' "$_fic2" | sed 's/^/    /'
     return 1
   fi

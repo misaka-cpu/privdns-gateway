@@ -144,6 +144,11 @@ jobs:
       - name: "链路会话证据接进 linkstat (NOT_OBSERVED/PASS/STALE 语义与退出码隔离)"
         run: python3 tests/test-link-live.py
 
+      # 逐处钉字面量管不住"下一处新写的文案"。这道闸门从用户真正看到的输出入手, 统一扫
+      # 越界结论(SIM/APN/DoT/整体联网正常), 并守住 NOT_OBSERVED 不被写成故障。
+      - name: "手机侧证据的结论上限 (越界结论闸门 + NOT_OBSERVED 不是故障)"
+        run: python3 tests/test-link-copy-boundary.py
+
       # 夹具自己漏资源, 会以"产品偶发失败"的样子冒出来 —— 判据落在真实线程/端口/目录上。
       - name: "txbox 探针生命周期 (clean 后线程必须退出/端口必须释放/50 个 Box 回到基线)"
         run: python3 tests/test-txbox-probes.py

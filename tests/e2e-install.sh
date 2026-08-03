@@ -226,7 +226,7 @@ _cidr_src="$(sed -n 's/^PDG_INTERNAL_CIDR=//p' /etc/privdns-gateway/profile.env 
 _cidr_nft="$(grep -oE 'ip saddr [0-9.]+/[0-9]+' /etc/nftables.conf | head -1 | awk '{print $3}')"
 _cidr_mos="$(grep -oE '"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+"' /etc/mosdns/config.yaml | head -1 | tr -d '"')"
 [[ -n "$_cidr_src" ]] \
-  && ok "6g: profile.env 写入了内网卡段真源($_cidr_src)" || bad "6g: 缺 PDG_INTERNAL_CIDR"
+  && ok "6g: profile.env 写入了内网卡段一致性基准($_cidr_src)" || bad "6g: 缺 PDG_INTERNAL_CIDR"
 [[ "$_cidr_src" == "$_cidr_nft" && "$_cidr_src" == "$_cidr_mos" ]] \
   && ok "6h: 真源与 nft/mosdns 三处逐字一致" \
   || bad "6h: 三处不一致 src=$_cidr_src nft=$_cidr_nft mosdns=$_cidr_mos"

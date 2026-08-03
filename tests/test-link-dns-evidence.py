@@ -145,8 +145,10 @@ print("── 6. CLI 的两步说明不许承诺收集不到的证据 ──")
 sess = (ROOT / "deploy/bot/linksess.py").read_text(encoding="utf-8")
 two = sess.split("_TWO_STEP = ")[1].split('"""')[1] if "_TWO_STEP = " in sess else ""
 if not api_on:
-    (ok if "还收集不到第 2 步的证据" in two else bad)(
-        "阶段 3 未实施时, 两步说明必须明说第 2 步收不到证据")
+    (ok if "无法安全取得第 2 步的证据" in two else bad)(
+        "阶段 3 未实施时, 两步说明必须明说第 2 步的证据当前无法安全取得")
+    (ok if "明文查询域名" in two else bad)(
+        "并说明为什么取不到(同一端口会暴露含明文域名的缓存导出)")
     (ok if "诊断依据是 DNS 查询计数" not in two else bad)(
         "不许说「诊断依据是 DNS 查询计数」—— 那个计数根本没启用")
     (ok if "6.2" in two else bad)("指明了这一半留到 6.2")
