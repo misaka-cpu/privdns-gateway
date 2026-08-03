@@ -44,8 +44,15 @@ DISK_CONF = "/etc/nftables.conf"
 # TG SOCKS5 与救援平面都是可选功能: 它们不通不会让"HTTP 探测到没到达网关"这个结论失真,
 # 因此由 doctor 点名即可, 不该挡住基础链路测试。
 REQUIRED_INTERNAL_TCP = (53, 81, 853, 7893)
-# 可选功能占用的端口: doctor 关心, 但不进链路硬门。
-OPTIONAL_INTERNAL_TCP = {8445: "Telegram SOCKS5", 8446: "救援平面", 9090: "内核状态接口"}
+# doctor 关心、但**不进链路硬门**的入站端口。名字要说清这层意思 —— 上一版叫
+# OPTIONAL_INTERNAL_TCP, 读起来像"这些端口可有可无", 而实际含义是"缺了要报, 但不该拦住
+# 手机链路测试"。8445 在标准安装里是恒定渲染的, 缺了确实该 FAIL, 只是不该挡会话。
+#
+# 8446(救援平面)**不在这里**: 它的端口是动态的(rescue_const.port()), 且只有配了
+# PDG_RESCUE_BIND 才启用 —— 写死进固定集合会让"救援关着"的机器被误报缺规则。
+# 9090 也不在这里: 它默认绑 127.0.0.1(mihomorender 的 external_controller), 走回环,
+# 根本不需要 nft input 放行, 放进来就是凭空要求一条不存在的规则。
+DOCTOR_ONLY_INTERNAL_TCP = {8445: "Telegram SOCKS5"}
 # UDP 53 单独列: 手机的普通 DNS 查询走 UDP, 少了它整条链路第一步就断。以前 doctor 只查
 # "敏感端口有没有对全网开放", 根本不看必需规则在不在 —— 于是把 udp 53 写成 tcp 53 这种
 # 错误两套检查都发现不了(测试里那一格就是这么红的)。
@@ -55,16 +62,34 @@ SENSITIVE_PORTS = frozenset({53, 80, 81, 443, 853, 5228, 5229, 5230, 7893, 8445}
 
 
 class Audit(object):
-    """判定结果。ok=True 表示必需不变量都成立; problems 逐条说清缺什么。"""
+    """判定结果 —— 同一份事实, 两个调用方按**范围**各取所需。
+
+    分两档, 因为"防火墙有问题"和"手机链路做不了测试"不是一回事:
+
+      problems(link_required)  少了它手机主链路就有一段不通 → linkstat 判 FAIL 并挡住
+                               创建测试会话; doctor 也报。
+      doctor_issues            专项功能的规则不对(TG SOCKS5、Android GMS 推送…)。
+                               doctor 该点名, 但**不该挡住基础 HTTP 链路测试** —— 那次测试
+                               本来就只证明"HTTP 请求到没到达网关", 从不声称 Google Play
+                               或推送正常, 所以拿 GMS 去挡它是拿不相干的事阻断诊断。
+
+    ok 只看 link_required: 调用方要展示专项问题就读 doctor_issues, 不用再解析一遍规则。
+    """
 
     def __init__(self):
         self.ok = True
         self.problems = []
+        self.doctor_issues = []
         self.details = []
 
     def fail(self, msg):
+        """链路硬门失败。"""
         self.ok = False
         self.problems.append(msg)
+
+    def doctor_fail(self, msg):
+        """专项功能失败: doctor 展示, 但不影响 ok, 因而不挡手机链路测试。"""
+        self.doctor_issues.append(msg)
 
     def note(self, msg):
         self.details.append(msg)
@@ -290,7 +315,10 @@ def audit_kernel(obj, cidr, platform="android", family=TABLE_FAMILY, table=TABLE
         if pre_meta.get("type") != "nat":
             a.fail("prerouting 链的 type 不是 nat(实得 %r)" % pre_meta.get("type"))
         pre = _rules_of(obj, "prerouting")
-        want_r = {80, 443} | ({5228, 5229, 5230} if platform != "ios" else set())
+        # 80/443 是链路硬门; GMS 5228-5230 只在 Android 上算**专项**(见下)。两者都要扫,
+        # 所以先合起来找, 出结论时再按范围分开。
+        gms_want = {5228, 5229, 5230} if platform != "ios" else set()
+        want_r = {80, 443} | gms_want
         got_r, badsrc_r = set(), set()
         for ex in pre:
             proto, ports = _dports(ex)
@@ -308,12 +336,24 @@ def audit_kernel(obj, cidr, platform="android", family=TABLE_FAMILY, table=TABLE
                 continue
             got_r |= hit
         miss_r = want_r - got_r - badsrc_r
-        if miss_r:
+        # 80/443 少了 = 手机网页流量进不了 mihomo → 硬门。
+        miss_core = miss_r - gms_want
+        if miss_core:
             a.fail("prerouting 缺少必需的 redirect: tcp %s → mihomo(来源应限 %s)"
-                   % (", ".join(str(p) for p in sorted(miss_r)), cidr))
-        if badsrc_r:
+                   % (", ".join(str(p) for p in sorted(miss_core)), cidr))
+        # GMS 少了 = Google Play 推送不走网关 —— 该报, 但**不挡**基础 HTTP 链路测试:
+        # 那次测试只证明"HTTP 请求到没到达网关", 从不声称推送或 Play 正常。
+        miss_gms = miss_r & gms_want
+        if miss_gms:
+            a.doctor_fail("prerouting 缺少 Android GMS 推送的 redirect: tcp %s → mihomo"
+                          % ", ".join(str(p) for p in sorted(miss_gms)))
+        bad_core = badsrc_r - gms_want
+        if bad_core:
             a.fail("prerouting 里 tcp %s 的来源网段不是配置的内网卡段(%s)"
-                   % (", ".join(str(p) for p in sorted(badsrc_r)), cidr))
+                   % (", ".join(str(p) for p in sorted(bad_core)), cidr))
+        bad_gms = badsrc_r & gms_want
+        if bad_gms:
+            a.doctor_fail("Android GMS 的 redirect 来源网段不是配置的内网卡段(%s)" % cidr)
 
     # 敏感端口不得对全网放行(这条与 doctor 原有判据同语义, 现在两边共用)
     leaked = set()
