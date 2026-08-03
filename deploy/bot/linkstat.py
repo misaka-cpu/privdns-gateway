@@ -62,13 +62,19 @@ CATEGORIES = (NETWORK_PRIVATE, DNS, FORWARDING, DEPENDENCY, SECURITY, RESOURCE)
 # 服务器分不清的结论(如 TCP853_TIMEOUT / DOT_QUERY_NOT_SEEN)一律不预留 —— 提前放进闭集
 # 会让人以为已经能观测到, 而它们要到 6.1B 有了会话证据才谈得上。
 CODES = (
-    "L1_NOT_OBSERVED",
+    "L1_NOT_OBSERVED", "L1_HTTP_PROBE_OBSERVED", "L1_HTTP_PROBE_STALE",
     "L2_CIDR_READY", "L2_CIDR_DRIFT",
+    "L2_SOURCE_INSIDE_CIDR", "L2_SOURCE_OUTSIDE_CIDR",
     "L3_SERVER_PROBE_READY", "L3_PLATFORM_NA",
     "L4_DOT_LISTENER_READY", "L4_DOT_LISTENER_MISSING",
     "L5_TLS_READY", "L5_TLS_HANDSHAKE_FAILED", "L5_CERT_CN_MISMATCH",
     "L5_CERT_EXPIRING", "L5_CERT_EXPIRED",
     "L6_LOCAL_DNS_READY", "L6_LOCAL_DNS_FAILED", "L6_PHONE_QUERY_NOT_OBSERVED",
+    # 6.1B 的 DNS 时间窗证据。WINDOW_OBSERVED / PROBE_NOT_OBSERVED 目前**产不出来** ——
+    # 阶段 3 因 mosdns API 的安全问题停止(见 tests/test-link-dns-evidence.py)。留在
+    # 闭集里是因为模型契约已定, 但当前唯一会出现的是 METRICS_UNAVAILABLE。
+    "L6_DOT_PROBE_WINDOW_OBSERVED", "L6_DOT_PROBE_NOT_OBSERVED",
+    "L6_DOT_METRICS_UNAVAILABLE",
     "L7_REDIRECT_READY", "L7_REDIRECT_RULE_MISSING",
     "L8_SERVICES_READY", "L8_MOSDNS_DOWN", "L8_MIHOMO_DOWN", "L8_NFT_DRIFT",
     "COLLECTOR_ERROR",          # 单项采集器自己抛了 —— 报出来, 但不拖垮整份结果
@@ -77,6 +83,19 @@ CODES = (
 # 哪些层属于"手机/SIM 实时证据"。它们在 6.1A 永远拿不到真实观测, 单独成段展示,
 # 免得和"服务器准备好了"混在一起被读成"整条链路正常"。
 PHONE_LAYERS = (1, 6.5)
+
+# 手机侧证据不全都落在 PHONE_LAYERS 上: 6.1B 把"这次探测的来源在不在 PDG_INTERNAL_CIDR"
+# 挂在第 2 层, 而第 2 层同时还有服务器侧的三方一致性判定 —— 那条必须留在服务器段、
+# 也必须继续影响退出码。所以归属按 **code** 再补一层, 而不是给 Finding 加第 13 个字段
+# (12 字段是已定的模型契约)。
+PHONE_CODES = frozenset((
+    "L2_SOURCE_INSIDE_CIDR", "L2_SOURCE_OUTSIDE_CIDR",
+))
+
+
+def is_phone_evidence(f):
+    """这条是不是手机侧证据 —— 决定它渲染进哪一段, 以及算不算进退出码。"""
+    return f["layer"] in PHONE_LAYERS or f["code"] in PHONE_CODES
 
 CERT_EXPIRING_DAYS = 14
 
@@ -116,14 +135,90 @@ class Finding(dict):
 # ── 采集器 ───────────────────────────────────────────────────────────────────
 # 每个采集器返回 Finding 或 Finding 列表; 抛异常由 collect() 兜住, 不影响其它层。
 
+
+# ── 6.1B: 手机协助会话的证据 ─────────────────────────────────────────────
+def _session():
+    """读当前会话。拿不到就返回 None —— 会话模块缺失/无会话/状态损坏都当"没有"。
+
+    这里**只读**, 不建也不改会话: `pdg link status` 是只读命令, 6.1A 定下的规矩
+    在 6.1B 不放宽。
+    """
+    try:
+        import linksess
+        rec, why = linksess.read_state()
+        return (rec, why, linksess)
+    except Exception:  # noqa: BLE001
+        return (None, "NO_SESSION", None)
+
+
 def _l1_private_traffic(_ctx):
+    """手机的 HTTP 探测流量到没到过 :81。
+
+    有会话且已被消费 → 这是**真的观察到了**(内核 peer 地址, 不是推断);
+    会话过期 → STALE(观察过, 但那是上一次的事了);
+    没有会话 → NOT_OBSERVED, 而不是 FAIL —— 没做诊断不等于坏了。
+    """
+    rec, _why, mod = _session()
+    if rec is None:
+        return Finding(
+            1, "L1_NOT_OBSERVED", NOT_OBSERVED, None, "手机 HTTP 探测到达",
+            "当前没有诊断会话, 所以没有观察。这不代表链路有问题。",
+            evidence_source="none(无会话)",
+            next_step="要验证手机那条路: pdg link session start")
+    consumed = rec.get("http_consumed_at")
+    expired = time.time() >= rec.get("expires_at", 0)
+    if consumed is None:
+        return Finding(
+            1, "L1_HTTP_PROBE_STALE" if expired else "L1_NOT_OBSERVED",
+            STALE if expired else NOT_OBSERVED, None, "手机 HTTP 探测到达",
+            "会话已过期, 期间没有观察到手机访问 :81。" if expired
+            else "会话进行中, 还没有观察到手机访问 :81。",
+            evidence_source="pdg-probe81 会话状态",
+            observed_at=None,
+            next_step="在手机上打开 `pdg link session start` 给出的第 1 步链接。")
     return Finding(
-        1, "L1_NOT_OBSERVED", NOT_OBSERVED, None,
-        "私网流量到达",
-        "6.1A 只看服务器准备状态, 还没有实时观测手机链路的能力。",
-        evidence_source="none(6.1A 无实时观测)",
-        next_step="要验证手机那条路, 需要 6.1B 的一次性协助会话。",
-    )
+        1, "L1_HTTP_PROBE_STALE" if expired else "L1_HTTP_PROBE_OBSERVED",
+        STALE if expired else PASS, None, "手机 HTTP 探测到达",
+        "观察到一次来自手机的 :81 探测(会话 %s)。这证明手机的网络能到达网关, "
+        "**不**证明 SIM/APN 正常, 也不证明 DNS 走通了。" % rec.get("session_id"),
+        evidence_source="pdg-probe81 内核 peer 地址(不读 X-Forwarded-For)",
+        observed_at=consumed,
+        freshness_secs=int(time.time() - consumed))
+
+
+def _l2_source_evidence(_ctx):
+    """会话里记下的实际来源, 命中没命中 PDG_INTERNAL_CIDR。
+
+    只有 /16 前缀与一个布尔 —— 完整 IP 从来没落过盘(见 linksess.py)。
+    这条**永不判 FAIL**: 手机连在别的网络上不是服务器故障, 判 FAIL 会污染
+    `pdg link status` 的服务器准备状态退出码。
+    """
+    rec, _why, _m = _session()
+    if rec is None or not rec.get("source"):
+        return None
+    src = rec["source"]
+    inside = src.get("inside_internal_cidr")
+    pre = src.get("ipv4_16") or "未记录"
+    expired = time.time() >= rec.get("expires_at", 0)
+    if inside is True:
+        return Finding(
+            2, "L2_SOURCE_INSIDE_CIDR", STALE if expired else PASS, None,
+            "手机来源网段",
+            "那次探测的来源落在 PDG_INTERNAL_CIDR 里(网段 %s)。" % pre,
+            evidence_source="pdg-probe81 内核 peer 地址 → 仅保留 /16",
+            observed_at=rec.get("http_consumed_at"))
+    if inside is False:
+        return Finding(
+            2, "L2_SOURCE_OUTSIDE_CIDR", WARN, NETWORK_PRIVATE, "手机来源网段",
+            "那次探测的来源(网段 %s)**不在** PDG_INTERNAL_CIDR 里 —— 手机这次很可能"
+            "没走目标 SIM 的私网。" % pre,
+            evidence_source="pdg-probe81 内核 peer 地址 → 仅保留 /16",
+            observed_at=rec.get("http_consumed_at"),
+            next_step="确认手机用的是要诊断的那张 SIM, 且已关闭 Wi-Fi。")
+    return Finding(
+        2, "L2_SOURCE_INSIDE_CIDR", NOT_OBSERVED, None, "手机来源网段",
+        "记到了来源网段 %s, 但 profile.env 里没有 PDG_INTERNAL_CIDR, 无法判断归属。" % pre,
+        evidence_source="pdg-probe81 内核 peer 地址 → 仅保留 /16")
 
 
 def _l2_cidr(ctx):
@@ -323,8 +418,10 @@ def _l6_dns(_ctx):
             next_step="systemctl status mosdns; sudo pdg doctor --deep",
             blocks_downstream=True))
     out.append(Finding(
-        6.5, "L6_PHONE_QUERY_NOT_OBSERVED", NOT_OBSERVED, None, "手机 DoT 查询到达",
-        "没有观察到来自手机的 DoT 查询 —— 6.1A 不具备这个观测能力。",
+        6.5, "L6_DOT_METRICS_UNAVAILABLE", NOT_OBSERVED, None, "手机 DoT 查询到达",
+        "没有 DNS 侧证据: 专用 probe 计数器未启用。6.1B 在安全审查中停止了这一步 —— "
+        "官方 mosdns v5.3.4 的 API 一旦打开, 同一个端口上还会暴露 DNS 缓存导出与投喂"
+        "接口(见 tests/test-link-dns-evidence.py), 那会泄露普通浏览域名。留到 6.2。",
         evidence_source="none(6.1A 无实时观测)",
         next_step="要验证需要 6.1B 的一次性协助会话。"))
     return out
@@ -428,6 +525,7 @@ def _nft_rule_set(text):
 COLLECTORS = (
     ("L1", _l1_private_traffic),
     ("L2", _l2_cidr),
+    ("L2", _l2_source_evidence),      # 会话里的实际来源(仅 /16 + 布尔)
     ("L3", _l3_probe),
     ("L4", _l4_dot_listener),
     ("L5", _l5_tls),
@@ -464,10 +562,16 @@ _MARK = {PASS: "🟢", WARN: "🟡", FAIL: "🔴", NOT_OBSERVED: "⚪", STALE: "
 _PHONE_NOTE = ("当前仅检查服务器准备状态, 尚未观察手机的实时链路; "
                "这不代表 SIM/APN 正常, 也不代表发生故障。")
 
+# 会话里真的观察到东西之后, 上面那句就不再成立了(它说的是"尚未观察")。但**能说的
+# 上限**没变: 观察到的是"手机的网络到达了 :81", 不是 SIM/APN 正常, 更不是 DNS 走通。
+_PHONE_NOTE_OBSERVED = (
+    "以上是本次会话时间窗内观察到的证据。HTTP 证据只说明手机的网络到达了网关的 :81; "
+    "它不证明 SIM/APN 正常, 不证明手机采用了这次 DNS 响应, 也不证明最终走了哪个上游。")
+
 
 def render_text(findings):
-    server = [f for f in findings if f["layer"] not in PHONE_LAYERS]
-    phone = [f for f in findings if f["layer"] in PHONE_LAYERS]
+    server = [f for f in findings if not is_phone_evidence(f)]
+    phone = [f for f in findings if is_phone_evidence(f)]
     lines = ["━━ 服务器准备状态 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"]
     for f in sorted(server, key=lambda x: x["layer"]):
         lines.append("  %s %-16s %s" % (_MARK[f["status"]], f["title"], f["detail"]))
@@ -477,7 +581,8 @@ def render_text(findings):
     lines.append("━━ 手机/SIM 实时证据 ━━━━━━━━━━━━━━━━━━━━━━━━━━")
     for f in sorted(phone, key=lambda x: x["layer"]):
         lines.append("  %s %-16s %s" % (_MARK[f["status"]], f["title"], f["detail"]))
-    lines.append("     %s" % _PHONE_NOTE)
+    observed = any(f["status"] in (PASS, STALE) for f in phone)
+    lines.append("     %s" % (_PHONE_NOTE_OBSERVED if observed else _PHONE_NOTE))
     return "\n".join(lines)
 
 
@@ -492,7 +597,7 @@ def exit_code(findings):
         for f in findings:
             if f["status"] not in STATUSES:
                 return 3
-            if f["status"] == FAIL and f["layer"] not in PHONE_LAYERS:
+            if f["status"] == FAIL and not is_phone_evidence(f):
                 return 2
         return 0
     except Exception:  # noqa: BLE001

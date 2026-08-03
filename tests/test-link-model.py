@@ -145,13 +145,38 @@ print("── 7. 文案红线: 不许声称服务器无法证明的事 ──")
 FORBIDDEN = ("SIM 正常", "APN 正常", "手机已连通", "DoT 查询已从手机到达",
              "运营商私网正常", "已确认 APN")
 src = (ROOT / "deploy/bot/linkstat.py").read_text(encoding="utf-8")
-# 只看会输出给用户的字面量, 不看注释里为了说明"不许说"而引用的那几句
-out_text = "\n".join(re.findall(r'"([^"]{4,})"', src))
-hit = [p for p in FORBIDDEN if p in out_text]
-if not hit:
-    ok("模块里没有这些字样: %s" % "、".join(FORBIDDEN))
+# 只看会输出给用户的字面量, 不看注释里为了说明"不许说"而引用的那几句。
+#
+# 原来这里用 re.findall(r'"([^"]{4,})"', src) 抽字面量 —— 那是错的: 正则按出现顺序
+# 两两配对引号, 文件里的 """ 文档串会把整个配对**错位**, 于是真正的字面量被当成
+# "两对之间的空隙"而漏掉。实测往 _l1 的 detail 里塞一句"已确认 SIM/APN 正常"这条
+# 判据抓不到。改用 AST 取真正的字符串常量, 并跳过模块/函数的文档串(那里为了说明
+# "不许说什么"必然会引用这些词)。
+import ast as _ast
+_tree = _ast.parse(src)
+_docs = set()
+for _n in _ast.walk(_tree):
+    if isinstance(_n, (_ast.Module, _ast.FunctionDef, _ast.AsyncFunctionDef, _ast.ClassDef)):
+        _d = _ast.get_docstring(_n, clean=False)
+        if _d:
+            _docs.add(_d)
+out_text = "\n".join(
+    n.value for n in _ast.walk(_tree)
+    if isinstance(n, _ast.Constant) and isinstance(n.value, str)
+    and n.value not in _docs)
+# 判据不是"这几个字不许出现", 而是"不许**作为结论**出现" —— 6.1B 的免责声明里就有
+# 「它不证明 SIM/APN 正常」这种合法的否定用法, 一刀切会把正确的话也判红。所以逐次
+# 命中都要求紧邻一个否定词; "已确认 SIM/APN 正常" 照样会被抓住。
+bare = []
+for pat in FORBIDDEN:
+    for m in re.finditer(re.escape(pat), out_text):
+        lead = out_text[max(0, m.start() - 12):m.start()]
+        if not re.search(r"[不没未][^。;；]{0,10}$", lead):
+            bare.append("%s → …%s…" % (pat, out_text[max(0, m.start() - 10):m.end() + 4]))
+if not bare:
+    ok("这些说法都没有作为结论出现: %s" % "、".join(FORBIDDEN))
 else:
-    bad("出现了无法证明的说法: %s" % "、".join(hit))
+    bad("出现了无法证明的说法: %s" % "; ".join(bare[:2]))
 # 朴素子串匹配分不清"断言"与"否定": 任务书要求的免责声明本身就含"这不代表 SIM/APN 正常"。
 # 所以判据是——**禁语只准出现在那句免责声明里**, 别处一个都不许。先把它整句摘掉再查。
 rendered = L.render_text(nobs + [mk()])

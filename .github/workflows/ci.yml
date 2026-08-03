@@ -138,6 +138,12 @@ jobs:
       - name: "链路会话: token/TTL/单次消费/限流/隐私 + root↔DynamicUser 文件交接"
         run: python3 tests/test-link-session.py
 
+      - name: "mosdns DNS 证据闸门 (API 暴露面: 阶段 3 因缓存导出/投喂端点停止)"
+        run: python3 tests/test-link-dns-evidence.py
+
+      - name: "链路会话证据接进 linkstat (NOT_OBSERVED/PASS/STALE 语义与退出码隔离)"
+        run: python3 tests/test-link-live.py
+
       # 夹具自己漏资源, 会以"产品偶发失败"的样子冒出来 —— 判据落在真实线程/端口/目录上。
       - name: "txbox 探针生命周期 (clean 后线程必须退出/端口必须释放/50 个 Box 回到基线)"
         run: python3 tests/test-txbox-probes.py
