@@ -77,11 +77,11 @@ CODES = (
     "L6_DOT_METRICS_UNAVAILABLE",
     "L7_REDIRECT_READY", "L7_REDIRECT_RULE_MISSING",
     "L8_SERVICES_READY", "L8_MOSDNS_DOWN", "L8_MIHOMO_DOWN",
-    # 第 8 层的防火墙判据。L8_NFT_DRIFT 是旧的"磁盘/内核逐条文本相等" —— 它把 nft 自己的
-    # 规范化(单元素集合折叠、reject 默认值展开、协议名别名)当成漂移, `.153` 上一台完全
-    # 健康的机器因此被判 FAIL、Bot 拒绝创建手机测试会话。**生产路径不再产出它**;
-    # 留在闭集里只是不回收已发布的 code(读到旧 JSON 的东西不该炸)。
-    "L8_NFT_DRIFT",
+    # 第 8 层的防火墙判据。旧的 L8_NFT_DRIFT(磁盘/内核逐条文本相等)已**整个删掉**:
+    # 它把 nft 自己的规范化(单元素集合折叠、reject 默认值展开、协议名别名)当成漂移,
+    # `.153` 上一台完全健康的机器因此被判 FAIL、Bot 拒绝创建手机测试会话。
+    # 查过了: 它引入于 745e5f8(6.1A), 包含它的 tag 数为 0, linkstat.py 在 origin/main 与
+    # v1.8.0 里都不存在 —— 从未进过正式版本, 没有兼容债务, 所以不留无调用的死常量。
     "L8_FIREWALL_READY", "L8_FIREWALL_CONFIG_INVALID",
     "L8_FIREWALL_KERNEL_UNREADABLE", "L8_FIREWALL_RULE_MISSING",
     "L8_FIREWALL_RULE_UNSAFE", "L8_FIREWALL_RULE_ORDER_INVALID",
@@ -534,32 +534,6 @@ def _l8_services(ctx):
             next_step="核对 /etc/nftables.conf 并让它在内核中生效后复查。",
             blocks_downstream=True))
     return out
-    try:
-        disk = open("/etc/nftables.conf", encoding="utf-8").read()
-    except OSError as e:
-        out.append(Finding(
-            8, "L8_NFT_DRIFT", WARN, FORWARDING, "防火墙磁盘/内核一致性",
-            "读不到 /etc/nftables.conf(%s) —— 无法比对磁盘与内核。" % type(e).__name__,
-            evidence_source="/etc/nftables.conf"))
-        return out
-    kn = _nft_rule_set(kern)
-    dn = _nft_rule_set(disk)
-    missing = dn - kn
-    if missing:
-        out.append(Finding(
-            8, "L8_NFT_DRIFT", FAIL, FORWARDING, "防火墙磁盘/内核一致性",
-            "磁盘上有 %d 条规则没在内核里生效(例: %s)"
-            % (len(missing), sorted(missing)[0][:70]),
-            evidence_source="/etc/nftables.conf vs nft list table inet pdg",
-            next_step="sudo nft -f /etc/nftables.conf 让内核与磁盘一致。"))
-    else:
-        out.append(Finding(
-            8, "L8_NFT_DRIFT", PASS, None, "防火墙磁盘/内核一致性",
-            "磁盘上的规则都能在内核里找到。", evidence_source="/etc/nftables.conf vs nft list"))
-    return out
-
-
-
 
 COLLECTORS = (
     ("L1", _l1_private_traffic),
