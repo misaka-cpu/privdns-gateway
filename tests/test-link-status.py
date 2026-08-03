@@ -247,30 +247,84 @@ def main():
             "临期(WARN)不算「更具体的原因」, 握手故障仍单独报出(实得 %s)" % cs)
 
     print()
-    print("── 3c. nft 那层必须真读内核, 不能只读磁盘 ──")
-    # 把"读内核"这一步换成读不到, 采集器就该判 L8_NFT_DRIFT。若它只读磁盘, 这里会照常 PASS。
-    # 两头都要证:
-    #   a) 采集器**真的发出过**向内核要 ruleset 的那条命令(只读磁盘的实现发不出);
-    #   b) 那条命令失败时状态是 FAIL —— L8_NFT_DRIFT 这个 code 在 PASS 分支里也用,
-    #      只查 code 在不在会放过"改成读磁盘所以两边永远相同"这种实现。
-    _orig_run = checks._run
-    seen = []
-    def _fake_run(cmd, t=10):
-        seen.append(list(cmd))
-        if cmd[:2] == ["nft", "list"] and "table" in cmd:
-            return 1, "", "no kernel table"
-        return _orig_run(cmd, t)
-    checks._run = _fake_run
+    print("── 3c. 防火墙那层: 真读内核, 读不到就 fail-closed ──")
+    # 旧契约是"磁盘/内核逐条文本相等 → L8_NFT_DRIFT"。那套判据把 nft 自己的规范化当成漂移,
+    # 已整个删除(见 nftlive 与 linkstat 的说明)。新契约同样要求**真读内核**, 但判据换成
+    # 语义: 读不到内核规则 → L8_FIREWALL_KERNEL_UNREADABLE/FAIL, 绝不因为"只读磁盘所以
+    # 两边永远相同"而蒙混过关。
+    import nftlive
+    _orig_read = nftlive.read_kernel
+    _orig_disk = nftlive.check_disk_config
+    called = []
+    nftlive.check_disk_config = lambda *a, **k: (True, "")
+    nftlive.read_kernel = lambda *a, **k: (called.append("read_kernel"), (None, "内核读不到"))[1]
     try:
-        nftf = [f for f in L._l8_services({"platform": "android"}) if f["code"] == "L8_NFT_DRIFT"]
+        fw = [f for f in L._l8_services({"platform": "android"}) if "防火墙" in f["title"]]
     finally:
-        checks._run = _orig_run
-    kern_q = [c for c in seen if c[:2] == ["nft", "list"] and "table" in c and "pdg" in c]
-    (ok if kern_q else bad)(
-        "采集器向内核查了 ruleset(实发命令: %s)" % (kern_q[0] if kern_q else "一条都没有"))
-    (ok if nftf and nftf[0]["status"] == L.FAIL else bad)(
-        "内核读不到 inet pdg → L8_NFT_DRIFT/FAIL(实得 %s)"
-        % [(f["status"], f["code"]) for f in nftf])
+        nftlive.read_kernel = _orig_read
+        nftlive.check_disk_config = _orig_disk
+    (ok if called else bad)("采集器真的去读了内核规则(而不是只看磁盘)")
+    (ok if fw and fw[0]["status"] == L.FAIL else bad)(
+        "读不到内核 → FAIL(实得 %s)" % [(f["status"], f["code"]) for f in fw])
+    (ok if fw and fw[0]["code"] == "L8_FIREWALL_KERNEL_UNREADABLE" else bad)(
+        "code 为 L8_FIREWALL_KERNEL_UNREADABLE(实得 %s)"
+        % [f["code"] for f in fw])
+    (ok if fw and fw[0]["title"] == "防火墙运行状态" else bad)(
+        "标题为「防火墙运行状态」(实得 %r)" % (fw[0]["title"] if fw else None))
+    (ok if "L8_NFT_DRIFT" not in L.CODES else bad)("L8_NFT_DRIFT 已不在 CODES 闭集")
+
+    # 健康的内核 → PASS/L8_FIREWALL_READY, 且四种规范化差异不再制造失败
+    _KJ = {"nftables": [
+        {"table": {"family": "inet", "name": "pdg"}},
+        {"chain": {"family": "inet", "table": "pdg", "name": "prerouting", "type": "nat",
+                   "hook": "prerouting", "prio": -100, "policy": "accept"}},
+        {"rule": {"family": "inet", "table": "pdg", "chain": "prerouting", "handle": 1,
+                  "expr": [{"match": {"op": "==", "left": {"payload": {
+                      "protocol": "ip", "field": "saddr"}},
+                      "right": {"prefix": {"addr": "10.20.0.0", "len": 16}}}},
+                      {"match": {"op": "==", "left": {"payload": {
+                          "protocol": "tcp", "field": "dport"}},
+                          "right": {"set": [80, 443]}}},
+                      {"redirect": {"port": 7893}}]}},
+        {"chain": {"family": "inet", "table": "pdg", "name": "input", "type": "filter",
+                   "hook": "input", "prio": 0, "policy": "drop"}},
+        {"rule": {"family": "inet", "table": "pdg", "chain": "input", "handle": 2,
+                  "expr": [{"match": {"op": "==", "left": {"payload": {
+                      "protocol": "ip", "field": "saddr"}},
+                      "right": {"prefix": {"addr": "10.20.0.0", "len": 16}}}},
+                      {"match": {"op": "==", "left": {"payload": {
+                          "protocol": "tcp", "field": "dport"}},
+                          "right": {"set": [53, 81, 853, 7893]}}},
+                      {"accept": None}]}},
+        {"rule": {"family": "inet", "table": "pdg", "chain": "input", "handle": 3,
+                  "expr": [{"match": {"op": "==", "left": {"payload": {
+                      "protocol": "ip", "field": "saddr"}},
+                      "right": {"prefix": {"addr": "10.20.0.0", "len": 16}}}},
+                      {"match": {"op": "==", "left": {"payload": {
+                          "protocol": "udp", "field": "dport"}}, "right": 53}},
+                      {"accept": None}]}},
+    ]}
+    nftlive.check_disk_config = lambda *a, **k: (True, "")
+    nftlive.read_kernel = lambda *a, **k: (_KJ, "")
+    _orig_prof = checks._profile
+    checks._profile = lambda k: "10.20.0.0/16" if k == "PDG_INTERNAL_CIDR" else _orig_prof(k)
+    try:
+        fw2 = [f for f in L._l8_services({"platform": "android", "cidr": "10.20.0.0/16"})
+               if "防火墙" in f["title"]]
+    finally:
+        nftlive.read_kernel = _orig_read
+        nftlive.check_disk_config = _orig_disk
+        checks._profile = _orig_prof
+    (ok if fw2 and fw2[0]["status"] == L.PASS else bad)(
+        "健康内核 → PASS(实得 %s)" % [(f["status"], f["code"]) for f in fw2])
+    (ok if fw2 and fw2[0]["code"] == "L8_FIREWALL_READY" else bad)(
+        "code 为 L8_FIREWALL_READY(实得 %s)" % [f["code"] for f in fw2])
+    (ok if fw2 and fw2[0]["detail"] == "防火墙配置有效，手机链路所需规则已在内核中生效。"
+     else bad)("成功正文与契约一致(实得 %r)" % (fw2[0]["detail"] if fw2 else None))
+    # doctor-only 端口(8445 TG SOCKS5)缺失: 上面那份内核就没有它, 仍判 PASS —— 它不该
+    # 阻止基础链路测试。
+    (ok if fw2 and fw2[0]["status"] == L.PASS else bad)(
+        "内核里没有 8445(TG SOCKS5)也不阻止基础链路测试")
 
     print()
     print("── 3d. 模块进了单一真源, 两平台都装 ──")

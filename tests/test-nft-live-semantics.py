@@ -152,22 +152,28 @@ KERNEL_TEXT = """table inet pdg {
 }
 """ % (CIDR, CIDR, CIDR)
 
-# ═══ 1. 复现: 现有文本比对把四条等价写法判成漂移 ═════════════════════════
-print("══ 1. 修改前: 文本比对的假漂移 ══")
+# ═══ 1. 那四种等价写法确实存在, 且旧判据已被彻底移除 ═════════════════════
+# 本节原先直接调 linkstat._nft_rule_set 复现假漂移。那个私有函数连同整段文本比对逻辑
+# 已经删掉(它正是 `.153` 假漂移的来源), 所以判据改成两件事:
+#   a) 夹具里确实含这四种 nft 规范化差异 —— 否则下面的"语义判据仍判通过"是空转;
+#   b) 生产代码里再也没有那套文本比对 —— 防回归。
+print("══ 1. 四种规范化差异存在, 且旧的文本判据已彻底移除 ══")
 import linkstat as L  # noqa: E402
 
-dn = L._nft_rule_set(DISK)
-kn = L._nft_rule_set(KERNEL_TEXT)
-missing = sorted(dn - kn)
-EXPECT = ["ip saddr %s udp dport 443 reject" % CIDR,
-          "ip saddr %s udp dport { 53 } accept" % CIDR,
-          "ip6 nexthdr icmpv6 accept",
-          "tcp dport { 22 } accept"]
-(ok if len(missing) == 4 else bad)(
-    "文本比对报出 4 条「磁盘有、内核无」(实得 %d 条)" % len(missing))
-for e in EXPECT:
-    (ok if e in missing else bad)("被误判的等价写法: %s" % e)
-(ok if not missing or True else bad)("(以上四条在内核里其实都在, 只是 nft 换了写法)")
+PAIRS = [("tcp dport { 22 } accept", "tcp dport 22 accept", "单元素集合折叠"),
+         ("udp dport { 53 } accept", "udp dport 53 accept", "单元素集合折叠"),
+         ("udp dport 443 reject", "reject with icmp port-unreachable", "reject 默认类型展开"),
+         ("ip6 nexthdr icmpv6", "ip6 nexthdr ipv6-icmp", "协议名别名")]
+for disk_form, kern_form, why in PAIRS:
+    (ok if disk_form in DISK and kern_form in KERNEL_TEXT else bad)(
+        "夹具含这对等价写法(%s): 磁盘 %r / 内核 %r" % (why, disk_form, kern_form))
+
+(ok if not hasattr(L, "_nft_rule_set") else bad)(
+    "linkstat 里不再有 _nft_rule_set(那套文本比对已删除)")
+_src = (ROOT / "deploy/bot/linkstat.py").read_text(encoding="utf-8")
+for gone in ("磁盘上有 %d 条规则没在内核里生效", "磁盘/内核一致性", "磁盘上的规则都能在内核里找到"):
+    (ok if gone not in _src else bad)("旧漂移文案已不存在: %r" % gone)
+(ok if "L8_NFT_DRIFT" not in L.CODES else bad)("L8_NFT_DRIFT 不在 CODES 闭集里")
 
 # ═══ 2. 语义判据: 同一份夹具必须判通过 ═══════════════════════════════════
 print()
@@ -231,7 +237,6 @@ neg = [
     ("重定向来源网段错", kernel_json(wrong_redirect_src="192.168.0.0/16"), "来源"),
     ("重定向 verdict 错(accept 而非 redirect)", kernel_json(redirect_verdict_flip=True),
      "redirect"),
-    ("Android 少了 GMS 5228-5230", kernel_json(no_gms=True), "5228"),
 ]
 for label, kj, want in neg:
     r = nftlive.audit_kernel(kj, cidr=CIDR, platform="android")
@@ -246,12 +251,26 @@ print("══ 4. 非规则行 ══")
                                 cidr=CIDR, platform="android").ok else bad)(
     "只有 table 声明、没有链和规则 → 判失败(不是「没有问题」)")
 
-# iOS 装机时 install.sh 把 GMS 5228-5230 摘掉(走 APNs 不需要), 所以 iOS 上缺它不算故障;
-# 同一份内核放到 Android 上则必须判缺 —— 平台判据不能串台。
+# ── GMS 的范围: doctor 点名, 但不挡基础链路测试 ──────────────────────────────
+# iOS 装机时 install.sh 把 5228-5230 摘掉(走 APNs 不需要), 所以 iOS 上缺它连报都不该报;
+# Android 上缺了要报, 但**不是硬门** —— 那次链路测试只证明"HTTP 请求到没到达网关",
+# 从不声称 Google Play 或推送正常, 拿 GMS 挡它是用不相干的事阻断诊断。
 r_ios = nftlive.audit_kernel(kernel_json(platform="ios"), cidr=CIDR, platform="ios")
-(ok if r_ios.ok else bad)("iOS 上没有 GMS 重定向属正常(实得 %s)" % r_ios.problems)
-r_and = nftlive.audit_kernel(kernel_json(platform="ios"), cidr=CIDR, platform="android")
-(ok if not r_and.ok else bad)("同一份内核在 Android 上判缺 GMS(平台判据不串台)")
+(ok if r_ios.ok and not r_ios.doctor_issues else bad)(
+    "iOS 上没有 GMS 重定向: 既不判失败也不点名(实得 %s / %s)"
+    % (r_ios.problems, r_ios.doctor_issues))
+r_and = nftlive.audit_kernel(kernel_json(no_gms=True), cidr=CIDR, platform="android")
+(ok if r_and.ok else bad)(
+    "Android 缺 GMS **不是**链路硬门(ok=%s, 硬门问题=%s)" % (r_and.ok, r_and.problems))
+(ok if any("5228" in m for m in r_and.doctor_issues) else bad)(
+    "但 doctor 要点名(实得 %s)" % r_and.doctor_issues)
+r_cross = nftlive.audit_kernel(kernel_json(platform="ios"), cidr=CIDR, platform="android")
+(ok if any("5228" in m for m in r_cross.doctor_issues) else bad)(
+    "同一份内核放到 Android 上会被点名缺 GMS(平台判据不串台)")
+# 反方向: 核心 80/443 少了仍必须是硬门 —— 别把"降级 GMS"做成"重定向都不查了"
+r_core = nftlive.audit_kernel(kernel_json(no_redirect=True), cidr=CIDR, platform="android")
+(ok if not r_core.ok and any("80" in p for p in r_core.problems) else bad)(
+    "核心 80/443 重定向缺失仍是硬门(实得 ok=%s %s)" % (r_core.ok, r_core.problems))
 
 print("──────────────────────────────────────────────")
 print("通过 %d, 失败 %d" % (PASS[0], FAIL[0]))
