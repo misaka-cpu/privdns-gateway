@@ -135,6 +135,12 @@ jobs:
       - name: "probe81 转公共组件 (install/update/迁移/平台切换/doctor/卸载 全链路)"
         run: python3 tests/test-probe81-platform.py
 
+      # .153 真机: 运行模块与 CLI 同步到新版本、$REPO_DIR 却还停在旧 commit 时, 迁移在第一行
+      # 守卫静默 return 0 —— unit 没装出来, 整条链路却收到"成功"。probe81 已是两平台公共
+      # 必需件, 模板缺失现在是硬失败。
+      - name: "probe81 迁移 fail-closed (缺 unit 模板必须非零且零写入; 失败逐层传播)"
+        run: python3 tests/test-probe81-migrate-failclosed.py
+
       - name: "链路会话: token/TTL/单次消费/限流/隐私 + root↔DynamicUser 文件交接"
         run: python3 tests/test-link-session.py
 

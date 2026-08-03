@@ -2085,20 +2085,41 @@ migrate_pdg_mitm_service(){
 # expected_services 已经把它列为必需 → doctor 直接判红。
 # 幂等: unit 内容一致且已 enabled 就什么都不做。
 migrate_probe81_public(){
-  [[ -f "$REPO_DIR/deploy/bot/pdg-probe81.service" ]] || return 0
-  [[ -f /opt/pdg-bot/probe81.py ]] || return 0        # 程序还没就位 → 下轮 botfiles 迁移后再补
+  # probe81 自 6.1B 起是 **Android/iOS 公共必需**服务(链路诊断的 HTTP 会话入口)。
+  # 所以"模板不在就跳过"这条前提已经不成立了 —— 它现在是硬失败。
+  #
+  # 这一条是 `.153` 真机验收换来的: 当时运行模块与 CLI 同步到了新版本, 但 $REPO_DIR
+  # 还停在旧 commit(里面没有这个 unit 模板), 于是本函数在第一行 `|| return 0` 静默返回,
+  # `pdg __migrate` rc=0、更新一路绿灯, 而 unit 根本没被装出来。整块能力就这么无声缺席,
+  # 只有事后手工看 systemctl 才发现。**模板缺失 = 部署源不完整**, 必须让调用方知道。
+  local tmpl="$REPO_DIR/deploy/bot/pdg-probe81.service"
+  if [[ ! -f "$tmpl" ]]; then
+    c_y "  ❌ 当前部署源缺少 pdg-probe81 unit 模板($tmpl)。"
+    c_y "     probe81 是两个平台都必需的组件, 这里不做任何改动 —— 请确认部署源(仓库)已经"
+    c_y "     切到目标版本再重跑迁移。"
+    return 1
+  fi
+  # 程序还没就位是**另一回事**: botfiles 迁移会在同一轮里补上它, 下一次调用就能装。
+  # 这条保持跳过语义(返回 0), 但只在模板确实存在时才轮得到。
+  [[ -f /opt/pdg-bot/probe81.py ]] || return 0
   local src=/etc/systemd/system/pdg-probe81.service changed=0
-  if ! cmp -s "$REPO_DIR/deploy/bot/pdg-probe81.service" "$src"; then
-    install -m644 "$REPO_DIR/deploy/bot/pdg-probe81.service" "$src" 2>/dev/null || {
-      c_y "  写入 pdg-probe81.service 失败(保留原状)"; return 0; }
+  if ! cmp -s "$tmpl" "$src"; then
+    install -m644 "$tmpl" "$src" 2>/dev/null || {
+      c_y "  ❌ 写入 pdg-probe81.service 失败(保留原状)。"; return 1; }
     changed=1
   fi
-  [[ "$changed" == 1 ]] && systemctl daemon-reload 2>/dev/null
+  if [[ "$changed" == 1 ]]; then
+    systemctl daemon-reload 2>/dev/null || {
+      c_y "  ❌ daemon-reload 失败, pdg-probe81 可能未生效。"; return 1; }
+  fi
   if [[ "$(systemctl is-enabled pdg-probe81 2>/dev/null | head -1)" != enabled ]]; then
     systemctl reset-failed pdg-probe81 >/dev/null 2>&1 || true
-    systemctl enable --now pdg-probe81 >/dev/null 2>&1 \
-      && c_g "  ✅ 已补 pdg-probe81 服务(:81 探测端点, Android/iOS 公共)。" \
-      || c_y "  ⚠️ pdg-probe81 未能启用 —— 链路诊断的 HTTP 会话入口不可用(其余功能不受影响)。"
+    if systemctl enable --now pdg-probe81 >/dev/null 2>&1; then
+      c_g "  ✅ 已补 pdg-probe81 服务(:81 探测端点, Android/iOS 公共)。"
+    else
+      c_y "  ❌ pdg-probe81 未能启用 —— 链路诊断的 HTTP 会话入口不可用。"
+      return 1
+    fi
   elif [[ "$changed" == 1 ]]; then
     systemctl restart pdg-probe81 >/dev/null 2>&1 || true
   fi
@@ -2743,7 +2764,9 @@ run_all_migrations(){
   migrate_nft_extra || true
   migrate_custom_hijack || true
   migrate_mosdns_mitm || true; migrate_pdg_mitm_service || true
-  migrate_probe81_public || true   # 补公共件 unit; 必须在 android_cleanup 之前
+  # 失败必须传出去: 缺 unit 模板 = 部署源不完整, 装不出这个公共必需服务。以前是 `|| true`,
+  # 于是 `.153` 上"迁移没跑"被整条链路当成成功(见 migrate_probe81_public 里的说明)。
+  migrate_probe81_public || rc=1   # 补公共件 unit; 必须在 android_cleanup 之前
   migrate_android_cleanup || true
   # iOS GMS 清理**失败必须传出**: 它会动 model + 内核配置 + 防火墙三样, 失败即现网可能与
   # 期望形态不一致(它自己会完整回滚, 但回滚不完整时更要让上层知道)。以前是 `|| true`,
@@ -3817,8 +3840,15 @@ cmd_platform(){
     echo "❌ iOS GMS 残留清理失败(详见上方), 平台切换回退"
     _plat_rollback; rm -rf "$wd"; return 1
   fi
+  # probe81 是两个平台**都必需**的公共件(链路诊断的 HTTP 会话入口)。切完平台如果它没就位,
+  # 那台机器就少了一整块能力, 而后面那句"平台已确认"会把这件事盖过去。与 GMS 同样待遇:
+  # 在删回滚材料之前单独跑一次并传播失败(幂等, 下面的 run_all_migrations 再跑就是空转)。
+  if ! migrate_probe81_public; then
+    echo "❌ pdg-probe81 公共件迁移失败(详见上方), 平台切换回退"
+    _plat_rollback; rm -rf "$wd"; return 1
+  fi
   rm -rf "$wd"
-  run_all_migrations || true                    # 其余平台无关的幂等迁移照常跑(GMS 那步已单独跑过)
+  run_all_migrations || true                    # 其余平台无关的幂等迁移照常跑(上面两步已单独跑过)
   c_g "平台已确认: $cur → $p"
   if [[ -x /opt/pdg-bot/doctor.py ]] || [[ -f /opt/pdg-bot/doctor.py ]]; then
     python3 /opt/pdg-bot/doctor.py || c_y "自检有未通过项(见上), 平台切换本身已完成。"

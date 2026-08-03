@@ -229,6 +229,43 @@ upd = re.search(r"if ! bash /usr/local/bin/pdg __migrate; then.*?fi", PDGSH, re.
     "cmd_update 里 __migrate 失败会走回滚")
 (ok if upd and "return 1" in upd.group(0) else bad)("并且不谎报更新完成")
 
+# ═══ 10b. run_all_migrations 真的把非零传出来(行为级, 不是读源码)═════════
+print()
+print("══ 10b. run_all_migrations 的 rc(真跑)══")
+_ra_body = extract("run_all_migrations")
+_probe = subprocess.run(
+    ["bash", "-c", "set -u\n"
+     # 把这一轮里除 probe81 外的迁移全桩成成功, 只让 probe81 失败 —— 判据是"这一个失败
+     # 能不能把整体 rc 顶成非零", 不是别的迁移的事。
+     + "\n".join("%s(){ return 0; }" % f for f in re.findall(r"^\s*(migrate_[a-z0-9_]+)",
+                                                             _ra_body, re.M))
+     + "\nmigrate_probe81_public(){ return 1; }\n"
+     + 'c_y(){ :; }; c_g(){ :; }\n'
+     + _ra_body + "\nrun_all_migrations; echo RC=$?"],
+    capture_output=True, text=True, timeout=60)
+_m = re.search(r"RC=(\d+)", _probe.stdout)
+(ok if _m and _m.group(1) != "0" else bad)(
+    "只有 probe81 失败时 run_all_migrations 返回非零(实得 %s)"
+    % (_m.group(1) if _m else _probe.stderr[-120:]))
+
+print()
+print("══ 10c. __migrate 与平台切换这两层 ══")
+# 要钉的是 case 分派那一行, 不是 cmd_update 里那句含 "__migrate" 的错误提示 ——
+# 宽松正则会先命中后者, 于是断言变成假绿(这一类错误本轮已经犯过三次)。
+_disp = re.search(r"^\s*__migrate\)\s+need_root[^\n]*", PDGSH, re.M)
+(ok if _disp else bad)("找到了 `__migrate` 的 case 分派行")
+(ok if _disp and "run_all_migrations" in _disp.group(0) else bad)(
+    "它直接调 run_all_migrations(rc 就是 CLI 的退出码, 实得 %r)"
+    % (_disp.group(0).strip() if _disp else None))
+(ok if _disp and "|| true" not in _disp.group(0) and "|| :" not in _disp.group(0)
+ else bad)("分派行没有吞掉非零")
+_cp = extract("cmd_platform")
+_cpm = re.search(r"if ! migrate_probe81_public; then.*?fi", _cp, re.S)
+(ok if _cpm else bad)("平台切换里单独跑了 probe81 迁移并判失败")
+(ok if _cpm and "_plat_rollback" in _cpm.group(0) else bad)(
+    "失败时走 _plat_rollback(不留半切换状态)")
+(ok if _cpm and "return 1" in _cpm.group(0) else bad)("并且返回非零")
+
 # ═══ 11. doctor 仍把 probe81 当两平台必需 ════════════════════════════════
 print()
 print("══ 11. doctor 的必需服务集 ══")
