@@ -3971,6 +3971,11 @@ LINK_INSIDE = ("✅ 网关已收到本次 HTTP 测试请求。\n"
 LINK_OUTSIDE = ("⚠️ 网关已收到请求，但来源不在配置的内网卡段。\n"
                 "请确认已关闭普通 Wi-Fi，并使用项目对应的内网卡。")
 LINK_EXPIRED = "⌛ 本次测试已过期，请重新开始。"
+# 会话状态写不下去。给用户的话里不放 /run、不放问号猜测、也不承诺"DNS 与代理不受
+# 影响"—— 写不了 /run 的机器上那句话根本没法保证, 而用户拿它当结论就不会去查。
+# 具体路径留在服务器端日志里(见 linktest_start), 那儿才有人能据此排查。
+LINK_UNWRITABLE = ("⛔ 无法保存本次测试状态，因此测试未启动。\n"
+                   "请运行 sudo pdg doctor 检查网关状态。")
 
 # 结果页的键盘。带 token 的 URL 按钮**只在等待中的那一屏**出现, 出结果/取消/过期后一律撤掉。
 LINK_BACK = {"inline_keyboard": [
@@ -4018,8 +4023,7 @@ def linktest_result_text():
             return ("⛔ 会话状态文件已损坏，本次测试无法继续。\n"
                     "为避免给出错误结论，这里不会自动新建会话；请重新开始测试。", True)
         if reason == linksess.R_STATE_UNWRITABLE:
-            return ("⛔ 会话目录不可写（/run 出问题？），无法建立测试会话。\n"
-                    "请在服务器上检查后重试；普通的 DNS 与代理不受影响。", True)
+            return (LINK_UNWRITABLE, True)
         return ("当前没有进行中的测试。点「📡 手机链路测试」重新开始。", True)
     if not st.get("active"):
         return (LINK_EXPIRED, True)
@@ -4080,8 +4084,10 @@ def linktest_start(chat, mid):
         return
     okk, payload = linksess.start_session()
     if not okk:
-        edit(chat, mid, "⛔ %s\n\n本次没有创建测试会话；普通的 DNS 与代理不受影响。"
-             % payload.get("error", "会话建立失败"), LINK_DONE_KB)
+        # 技术细节(含具体路径)只进服务器端日志: 那里有人能据此排查, 而且不含 token ——
+        # payload 里带 token 原文的只有 step1_url, 失败时根本没有它。
+        print("linktest: 会话未建立:", payload.get("error", ""), flush=True)
+        edit(chat, mid, LINK_UNWRITABLE, LINK_DONE_KB)
         return
     # token 原文**只**出现在这个一次性按钮的 url 里, 正文与 callback data 都不带它
     kb = {"inline_keyboard": [

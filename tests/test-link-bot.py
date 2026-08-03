@@ -577,6 +577,71 @@ for plat in ("android", "ios"):
     "同一种证据在两个平台上给出同一句结论(android %r / ios %r)"
     % (texts["android"][:30], texts["ios"][:30]))
 
+# ═══ 17. 状态写不下去: 说人话, 不摊内部细节, 也不做保证 ═════════════════════
+print()
+print("══ 17. STATE_UNWRITABLE ══")
+# 让运行目录**不可写**且与 uid 无关: 指到一个"父级是普通文件"的路径, root 也建不出来。
+_blocker = os.path.join(ROOTFS, "blocker")
+with open(_blocker, "w") as _f:
+    _f.write("x")
+_bad_dir = os.path.join(_blocker, "nope")
+_saved_rt = os.environ["PDG_PROBE81_RUNTIME_DIR"]
+os.environ["PDG_PROBE81_RUNTIME_DIR"] = _bad_dir
+try:
+    setup()
+    # 前提: 这种状态下 linksess 确实报 STATE_UNWRITABLE, 而不是别的原因
+    _okk, _pl = S.start_session()
+    (ok if not _okk and _pl.get("reason") == S.R_STATE_UNWRITABLE else bad)(
+        "前提成立: 写不下去时 reason 仍是 STATE_UNWRITABLE(实得 %s)" % _pl.get("reason"))
+    EDITS.clear()
+    bot.handle_cb(1, 2, "linktest:start")
+    body = all_text()
+    (ok if "无法保存本次测试状态，因此测试未启动。" in body else bad)(
+        "第一句是「无法保存本次测试状态，因此测试未启动。」(实得 %s)" % body[:46])
+    (ok if "请运行 sudo pdg doctor 检查网关状态。" in body else bad)(
+        "第二句给出可执行的下一步(sudo pdg doctor)")
+    (ok if "/run" not in body else bad)("不向用户显示 /run 这类内部目录")
+    (ok if "？" not in body and "?" not in body else bad)(
+        "不向用户抛问号猜测(「出问题?」那种)")
+    (ok if "不受影响" not in body else bad)(
+        "不声称 DNS / 代理必然不受影响 —— 写不了运行目录的机器上保证不了这件事")
+    (ok if S.read_state()[0] is None else bad)("写不下去时确实没有会话被建立")
+    # 技术日志里带的是路径, 不可能带 token: 失败时 payload 只有 error/reason,
+    # 带 token 原文的 step1_url 压根没生成。
+    (ok if "step1_url" not in _pl else bad)(
+        "失败的 payload 里没有 step1_url(也就没有 token 原文): %s" % sorted(_pl))
+    (ok if not any(S.TOKEN_RE.match(str(v)) for v in _pl.values()) else bad)(
+        "失败的 payload 里没有任何形似 token 的值")
+    kb = EDITS[-1][1] if EDITS else None
+    (ok if not kb_urls(kb) else bad)("没有发出带 token 的测试链接")
+
+    # 「查看结果」在这种机器上读到的是"没有会话"—— 那也是准确的(确实一个都没建成)。
+    # 它不许顺手泄露内部路径或做保证。
+    _txt, _done = bot.linktest_result_text()
+    (ok if "当前没有进行中的测试" in _txt and _done else bad)(
+        "写不下去时「查看结果」如实说没有进行中的测试(实得 %s)" % _txt[:34])
+    (ok if "/run" not in _txt and "不受影响" not in _txt else bad)(
+        "这一句同样不摊内部细节、不做保证")
+
+    # linktest_result_text 里那条 STATE_UNWRITABLE 分支: read_state() 从不产出这个
+    # reason(只有 consume/start_session 会), 所以正常路径到不了它。分支按要求保留不动,
+    # 但它的文案必须与开始测试那条**逐字一致** —— 否则哪天 status() 真开始返回这个
+    # reason, 用户就会在两个入口看到两套说法。
+    _real_status = S.status
+    S.status = lambda now=None: {"schema_version": S.SCHEMA_VERSION, "active": False,
+                                 "reason": S.R_STATE_UNWRITABLE, "session": None}
+    try:
+        _t2, _d2 = bot.linktest_result_text()
+    finally:
+        S.status = _real_status
+    (ok if "无法保存本次测试状态，因此测试未启动。" in _t2
+        and "请运行 sudo pdg doctor 检查网关状态。" in _t2 and _d2 else bad)(
+        "该分支给出的是同一句话且判为终结(实得 %s)" % _t2[:40])
+    (ok if "/run" not in _t2 and "不受影响" not in _t2 and "?" not in _t2 else bad)(
+        "该分支也不摊内部细节、不做保证、不抛问号")
+finally:
+    os.environ["PDG_PROBE81_RUNTIME_DIR"] = _saved_rt
+
 print("──────────────────────────────────────────────")
 print("通过 %d, 失败 %d" % (PASS[0], FAIL[0]))
 shutil.rmtree(ROOTFS, ignore_errors=True)

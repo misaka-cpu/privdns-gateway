@@ -101,6 +101,20 @@ nc 12 "重复点击创建多个会话" \
 assert o in s, 'anchor'; io.open(p,'w',encoding='utf-8').write(s.replace(o,n,1))" \
 tests/test-link-bot.py
 
+# 锚点里不放 \n: 经 bash 单引号 → python 字符串两层转义后对不上, 改坏器不命中 ——
+# 那样"负控"什么也证明不了(第一版就是这么废掉的)。
+nc 13 "把「普通 DNS 与代理不受影响」加回 STATE_UNWRITABLE 文案" \
+"$(rd); o='\"请运行 sudo pdg doctor 检查网关状态。\")'; \
+n='\"请运行 sudo pdg doctor 检查网关状态。普通的 DNS 与代理不受影响。\")'; \
+assert o in s, 'anchor'; io.open(p,'w',encoding='utf-8').write(s.replace(o,n,1))" \
+tests/test-link-bot.py
+
+nc 14 "把 /run 路径塞回 STATE_UNWRITABLE 文案" \
+"$(rd); o='                   \"请运行 sudo pdg doctor 检查网关状态。\")'; \
+n='                   \"请检查 /run 是否可写。\")'; \
+assert o in s, 'anchor'; io.open(p,'w',encoding='utf-8').write(s.replace(o,n,1))" \
+tests/test-link-bot.py
+
 echo "────────────────"
 echo "负控 通过 $PASS, 失败 $FAIL"
 echo "── 还原核对 ──"; sha256sum -c "$B/sha.txt"

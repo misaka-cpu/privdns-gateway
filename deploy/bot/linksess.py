@@ -384,8 +384,10 @@ def main(argv=None):
     if sub == "start":
         okk, p = start_session()
         if not okk:
+            # 这是**服务器上的技术输出**, 保留具体路径(有人能据此排查); 但不做
+            # "DNS/代理不受影响"这种保证 —— 写不了运行目录的机器上没法保证它。
             print("%s —— 会话未建立。" % p["error"], file=sys.stderr)
-            print("普通的 :81 探测与 DoT 都不受影响。", file=sys.stderr)
+            print("请运行 sudo pdg doctor 检查网关状态。", file=sys.stderr)
             return 1
         if as_json:
             print(json.dumps({"schema_version": SCHEMA_VERSION, "ok": True,
