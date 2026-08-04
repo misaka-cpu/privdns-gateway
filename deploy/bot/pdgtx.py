@@ -104,6 +104,9 @@ class TxError(Exception):
 # 每项: 逻辑名 → (相对路径, mode, 是否含凭据, 默认校验器)
 # 动态名(mosdns_rule:x / ruleset:x / unit:x)另有正则约束, 见 resolve_target。
 _STATIC = {
+    # 路径名是历史包袱: v1.6 起这**不是** sing-box 的配置, 而是本项目的数据模型(出口/分流/
+    # final/面板), mihomo 的运行配置由它渲染而来。改路径要连着备份白名单、恢复映射、快照
+    # 候选集、越界守卫前缀一起动 —— 列为 v2.0 清理候选, 见 docs/ROADMAP.md。
     "model":          ("/etc/sing-box/config.json", 0o600, True, ("json_model",)),
     "mihomo_cfg":     ("/etc/mihomo/config.yaml", 0o600, True, ("mihomo_check",)),
     "mosdns_conf":    ("/etc/mosdns/config.yaml", 0o644, False, ("mosdns_probe",)),

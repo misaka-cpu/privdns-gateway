@@ -121,6 +121,10 @@ jobs:
       - name: "E2E 探针生命周期回归(重复启动/退出/信号/并发/临时目录清理)"
         run: bash tests/test-e2e-probe-lifecycle.sh
 
+      # 夹具自己漏资源, 会以"产品偶发失败"的样子冒出来 —— 判据落在真实线程/端口/目录上。
+      - name: "txbox 探针生命周期 (clean 后线程必须退出/端口必须释放/50 个 Box 回到基线)"
+        run: python3 tests/test-txbox-probes.py
+
       - name: "负控字节码缓存隔离(同一秒改坏/恢复源码不得读到陈旧 .pyc)"
         run: python3 tests/test-pycache-isolation.py
 
@@ -147,7 +151,9 @@ jobs:
       - name: "内核版本精确匹配 (v1.19.1 不得匹配 v1.19.10; 读不到版本不跳过安装)"
         run: bash tests/test-version-match.sh
 
-      - name: "发布链路回归 (tag-only 安装/更新 + 文档版本)"
+      # 这是**静态守卫**(只核对源码里的标识符), 不是端到端。真实行为覆盖在
+      # e2e-update.sh 与 e2e-upgrade-from-release.sh —— 名字必须说实话。
+      - name: "发布链路静态守卫 (源码标识符核对; 真实行为见 e2e-update / e2e-upgrade-from-release)"
         run: bash tests/test-release-flow.sh
 
       - name: "更新快照+精确回滚回归 (--dir 精确目标/--git 复位/部分失败不谎报/快照覆盖脚本)"
@@ -525,6 +531,8 @@ jobs:
           - e2e-upgrade-from-release.sh
           - e2e-wloc.sh
           - e2e-cli-ops.sh
+          - e2e-hijack-mode-tx.sh
+          - e2e-snapshot-meta.sh
           - e2e-config-transaction.sh
           - e2e-config-transaction-recovery.sh
           # v1.8.1 修的那条: v1.7.8 的更新器持着全局锁, 新版迁移在首次启用救援平面时
@@ -614,6 +622,6 @@ jobs:
             e2e-migrate.sh e2e-exit-rule.sh e2e-drop-singbox.sh e2e-custom-nft.sh
             e2e-cross-version-rollback.sh e2e-install.sh e2e-install-nft.sh
             e2e-platform-switch.sh e2e-update.sh e2e-upgrade-from-release.sh e2e-wloc.sh e2e-cli-ops.sh
-            e2e-rescue-migration-lock.sh
+            e2e-rescue-migration-lock.sh e2e-hijack-mode-tx.sh e2e-snapshot-meta.sh
             e2e-config-transaction.sh e2e-config-transaction-recovery.sh
         run: bash tests/e2e-serial-hermetic.sh

@@ -852,16 +852,89 @@ SNAP_DIR="/var/lib/privdns-gateway/backups"
 
 # 供 cmd_update 读取"本次刚创建的快照目录"(精确回滚目标, 不靠 index 0 猜)。
 _PDG_SNAP_CREATED=""
+# ── 快照来源元数据 ───────────────────────────────────────────────────────────
+# 光有时间戳目录名回答不了"这份快照是谁拍的": 手动拍的、更新前自动拍的、平台切换前拍的、
+# 显式迁移前拍的、救援完整恢复前拍的 —— 出事时想回到"那次操作之前"却分不出是哪一次。
+#
+# 只写固定枚举 + 版本信息。不写 token / 证书正文 / 私钥 / 配置正文 / URL / 命令参数 ——
+# 快照目录是 0700, 但这份元数据将来会被列出来给人看, 值必须是**闭集**里的东西。
+_SNAP_SOURCES=" cli rescue bot scheduler "
+_SNAP_OPS=" snapshot update platform migrate pre-full-restore "
+_SNAP_META_SCHEMA=1
+
+# 写元数据。临时文件 + 原子替换; 失败返回非 0(调用方据此把整份快照作废)。
+_snap_meta_write(){
+  local d="$1" id="$2" src="$3" op="$4" tmp commit desc
+  [[ "$_SNAP_SOURCES" == *" $src "* ]] || { echo "内部错误: 未知快照来源 $src" >&2; return 1; }
+  [[ "$_SNAP_OPS"     == *" $op "*  ]] || { echo "内部错误: 未知快照操作 $op"  >&2; return 1; }
+  commit="$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null)"
+  desc="$(git -C "$REPO_DIR" describe --tags 2>/dev/null)"
+  # 只留标签/哈希会用到的字符: 仓库里理论上不会有别的, 但这份文件要展示给人看, 不放行任意串。
+  commit="$(printf '%s' "${commit:-unknown}" | tr -cd 'A-Za-z0-9._-' | cut -c1-64)"
+  desc="$(printf '%s' "${desc:-unknown}"     | tr -cd 'A-Za-z0-9._-' | cut -c1-64)"
+  tmp="$(mktemp "$d/.snapshot.json.XXXXXX" 2>/dev/null)" || return 1
+  {
+    printf '{\n'
+    printf '  "schema_version": %s,\n' "$_SNAP_META_SCHEMA"
+    printf '  "snapshot_id": "%s",\n'  "$id"
+    printf '  "created_at": "%s",\n'   "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf '  "source": "%s",\n'       "$src"
+    printf '  "op": "%s",\n'           "$op"
+    printf '  "git_commit": "%s",\n'   "${commit:-unknown}"
+    printf '  "git_describe": "%s"\n'  "${desc:-unknown}"
+    printf '}\n'
+  } > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+  chmod 600 "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$d/snapshot.json" 2>/dev/null || { rm -f "$tmp"; return 1; }
+}
+
+# 读来源, 供列表展示。老快照没有这个文件 —— 那是**正常的跨版本形态**, 显示"未知"而不是报错。
+# 元数据坏了也只当未知: 绝不 eval / source 它, 也不因为它坏了就挡住回滚。
+_snap_meta_label(){
+  local d="$1" j="$1/snapshot.json"
+  [[ -f "$j" ]] || { echo "来源未知(旧快照)"; return 0; }
+  python3 - "$j" 2>/dev/null <<'PY' || echo "来源未知(元数据无法解析)"
+import json, re, sys
+try:
+    m = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    raise SystemExit(1)
+ok = re.compile(r"^[A-Za-z0-9._:+-]{0,64}$")
+src, op = str(m.get("source", "")), str(m.get("op", ""))
+ver = str(m.get("git_describe", ""))
+if not (ok.match(src) and ok.match(op) and ok.match(ver)) or not src or not op:
+    raise SystemExit(1)
+print("%s/%s  %s" % (src, op, ver or "-"))
+PY
+}
+
 cmd_snapshot(){
   need_root snapshot; _lock
   _PDG_SNAP_CREATED=""
+  local src=cli op=snapshot
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --source) src="${2:-}"; shift 2 || { echo "--source 缺参数"; return 1; };;
+      --op)     op="${2:-}";  shift 2 || { echo "--op 缺参数"; return 1; };;
+      *) shift;;                      # 旧调用方可能带别的参数, 忽略即可(向后兼容)
+    esac
+  done
   local ts d; ts=$(date +%Y%m%d-%H%M%S); d="$SNAP_DIR/$ts"
+  # 目录名是秒级的, 同一秒内拍第二份会**撞名**。以前撞了就直接覆盖(悄悄弄丢前一份);
+  # 现在元数据写失败要 rm -rf 这个目录, 撞名就会把**别人那一份**删掉 —— 所以宁可等一秒
+  # 换个名字, 也不复用。ID 形态必须保持 %Y%m%d-%H%M%S: 救援侧 cfgrestore 按这个正则认。
+  if [[ -e "$d" ]]; then
+    sleep 1; ts=$(date +%Y%m%d-%H%M%S); d="$SNAP_DIR/$ts"
+    [[ -e "$d" ]] && { c_y "❌ 同名快照目录已存在($ts), 为避免覆盖已有快照, 本次未创建。"; return 1; }
+  fi
   install -d -m700 "$d"
   # 整机配置 + 防火墙 + bot.env(含 token)+ service + journald 封顶(含历史错路径)(相对 / 打包, 回滚 -C / 解开)
   # 含: 已安装脚本(pdg / pdg-set-token / cert hook)+ 全部 pdg unit —— 升级会改它们, 回滚要一并还原。
   # 只打包"存在的"路径 —— 历史错路径可能已被迁移清掉, 无条件列进去会让 tar 报 Cannot stat 并返 2。
   # var/lib/.../ios-profile 是唯一进快照的 /var/lib 成员: iOS 描述文件产物。它不是缓存 ——
   # previous 那一版用的根证书只在产物里有正文(元数据里只有指纹), 不打包就永远回不来了。
+  # 清单里的 etc/sing-box 与 usr/local/bin/sing-box 是**跨版本回滚要用到**的: 少了它们,
+  # 把旧机器恢复到更早版本就会缺内核。v2.0 清理前提见 docs/ROADMAP.md。
   local cand=(etc/mosdns etc/sing-box etc/mihomo opt/pdg-bot etc/privdns-gateway etc/nftables.conf
               var/lib/privdns-gateway/ios-profile
               etc/systemd/system/pdg-bot.service etc/systemd/journald.conf.d/50-pdg.conf
@@ -897,8 +970,13 @@ cmd_snapshot(){
     c_y "❌ 快照打包失败"; rm -f "$d/snap.tar.gz"; rmdir "$d" 2>/dev/null; return 1
   fi
   chmod 600 "$d/snap.tar.gz"
+  # 元数据写不成 → 整份作废。留下"有归档、没来源"的新格式快照比没有更糟: 列表会把它显示成
+  # 旧快照, 而它其实是本次刚拍的, 于是"这份到底是哪次操作之前的"永远说不清了。
+  if ! _snap_meta_write "$d" "$ts" "$src" "$op"; then
+    c_y "❌ 快照元数据写入失败 → 本次快照作废(未留下半份)"; rm -rf "$d"; return 1
+  fi
   _PDG_SNAP_CREATED="$d"
-  echo "✅ 快照: $d/snap.tar.gz"
+  echo "✅ 快照: $d/snap.tar.gz ($src/$op)"
   ls -1dt "$SNAP_DIR"/*/ 2>/dev/null | tail -n +11 | xargs -r rm -rf   # 只留最近 10 份
 }
 
@@ -922,7 +1000,11 @@ cmd_rollback(){
   else
     local snaps; mapfile -t snaps < <(ls -1dt "$SNAP_DIR"/*/ 2>/dev/null)
     [[ ${#snaps[@]} -gt 0 ]] || { echo "没有快照(先 pdg snapshot)"; return 1; }
-    echo "可用快照(新→旧):"; local i=0; for s in "${snaps[@]}"; do echo "  [$i] $(basename "$s")"; i=$((i+1)); done
+    echo "可用快照(新→旧):"; local i=0
+    for s in "${snaps[@]}"; do
+      # 时间来自目录名(%Y%m%d-%H%M%S), 来源来自 snapshot.json; 老快照没有那个文件 → "来源未知"。
+      echo "  [$i] $(basename "$s")  $(_snap_meta_label "${s%/}")"; i=$((i+1))
+    done
     idx="${idx:-0}"
     [[ "$idx" =~ ^[0-9]+$ ]] || { echo "无效序号 $idx"; return 1; }
     idx=$((10#$idx))
@@ -1211,7 +1293,7 @@ cmd_update(){
   command -v git >/dev/null || { apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git; }
   _lock   # 取锁(嵌套的 cmd_snapshot 不会重复锁)
   c_g "更新前留快照…"
-  if ! cmd_snapshot >/dev/null 2>&1 || [[ -z "$_PDG_SNAP_CREATED" || ! -f "$_PDG_SNAP_CREATED/snap.tar.gz" ]]; then
+  if ! cmd_snapshot --source cli --op update >/dev/null 2>&1 || [[ -z "$_PDG_SNAP_CREATED" || ! -f "$_PDG_SNAP_CREATED/snap.tar.gz" ]]; then
     c_y "❌ 更新前快照失败, 中止更新(拒绝在无法回滚的前提下继续)。"; return 1
   fi
   local snap_dir="$_PDG_SNAP_CREATED"                                    # 精确回滚目标(不靠 index 0 猜)
@@ -1756,7 +1838,7 @@ menu(){
       1) cmd_status;;
       2) cmd_doctor;;
       3) cmd_update && exec /usr/local/bin/pdg menu;;
-      4) cmd_snapshot;;
+      4) cmd_snapshot --source cli --op snapshot;;
       5) read -rp "回滚到第几个快照(默认 0=最近, 回车确认): " i; cmd_rollback "${i:-0}";;
       6) cmd_token;;
       7) cmd_restart;;
@@ -2886,6 +2968,8 @@ SCPY
 # 走 __migrate 时自动执行。幂等: 已是纯 mihomo(无 sing-box 服务/二进制)直接返回 0。
 # 失败(unknown_proxies / 渲染 / 校验 / 起核)返回非 0 → run_all_migrations 传出 → cmd_update 回滚到
 # 更新前快照(用户仍留在旧 sing-box 版, 数据无损), 而不是把机器留在半迁移态。
+# v2.0 清理候选(见 docs/ROADMAP.md): 仍有从 v1.5.x 及更早直接升上来的机器, 删掉这段迁移
+# 会让那些机器升级后同时躺着两个内核。
 migrate_drop_singbox(){
   local cur; cur="$(cat /etc/privdns-gateway/backend 2>/dev/null)"
   if [[ "$cur" == mihomo ]] && [[ ! -e /etc/systemd/system/sing-box.service ]] && [[ ! -e /usr/local/bin/sing-box ]]; then
@@ -3589,7 +3673,7 @@ cmd_platform(){
   _lock
   c_g "切换平台: $cur → $p"
   # 1) 先留快照。拿不到就别开始 —— 后面要改 nft、删/装 unit、重渲内核, 没有回退手段不能动手。
-  cmd_snapshot >/dev/null 2>&1 || { echo "❌ 快照失败 → 中止切换(未改动任何东西)"; return 1; }
+  cmd_snapshot --source cli --op platform >/dev/null 2>&1 || { echo "❌ 快照失败 → 中止切换(未改动任何东西)"; return 1; }
   # 2) 就地备份直接会被改写的几样(快照是整体回退, 这些用于精确还原)
   local wd; wd="$(mktemp -d)" || { echo "❌ 无法创建临时目录"; return 1; }
   local f
@@ -3768,30 +3852,102 @@ cmd_hijack_mode(){
   else
     file="geosite_geolocation-!cn.txt"
   fi
-  cp /etc/mosdns/config.yaml /etc/mosdns/config.yaml.hjbak
-  # 用归一化器改形态(all=去掉劫持门/排除式, gfw=装上劫持门/白名单式), 而不是只换文件名 ——
-  # 只换文件名在旧形态机器上一个字都改不到, 却照样打印"✅ 劫持模式 → xxx"(空转报成功)。
-  local shape
-  if ! shape=$(_mosdns_hijack_shape "$mode" /etc/mosdns/config.yaml "$file"); then
-    c_y "mosdns 配置是自定义形态, 未改动(不猜着改)。"; rm -f /etc/mosdns/config.yaml.hjbak; return 1
+  _pdg_hijack_transact "$mode" "$file"
+}
+
+# 劫持模式的两个目标 —— mosdns 配置与真源 profile.env —— 整笔走配置事务。
+#
+# 以前是就地改写 + `.hjbak` 局部还原 + `sed -i` 写 profile.env。三个毛病:
+#   · 不上任何锁: `pdg snapshot` 在锁被占用时会被拦下, 这条却照写不误 —— 而 bot 与
+#     pdg-rules-update.timer 都会对 mosdns_conf 开事务, 撞上就是两边互相盖;
+#   · 不留事务记录: 没有 before-image、没有审计、事后 recover 不到;
+#   · mosdns 与 profile.env 各写各的: mosdns 成了而 profile 没成时, 盘上的形态与真源
+#     记录从此对不上, 而下一次迁移会按那个错的真源再归一一次。
+#
+# 锁的用法有个坑: 这里**不能**调 pdg.sh 的 `_lock`。它与事务核心那把是同一个文件, shell
+# 先 flock 住, 子进程 python 再去 flock 同一个文件必然拿不到 → 每次都 TxBusy。
+# cmd_detect_cidr 同样只靠事务核心那把锁, 这里照它。
+_pdg_hijack_transact(){
+  local mode="$1" file="$2" txm txid rc=0 wd shape
+  txm="$(_pdg_module pdgtx.py)" || { c_y "❌ 找不到 pdgtx.py(事务核心缺失), 未改动任何文件。"; return 1; }
+  local pend; pend="$(python3 "$txm" pending 2>/dev/null)"
+  if [[ -n "$pend" ]]; then
+    c_y "⛔ 有未完成的配置事务, 本次拒绝执行(未改动任何文件):"
+    printf '%s\n' "$pend" | sed 's/^/    /'
+    c_y "   请先 sudo pdg tx show <id> 查看, 再 sudo pdg tx recover <id> 收尾。"
+    return 1
   fi
-  if [[ "$shape" == changed ]]; then
-    systemctl restart mosdns; sleep 1.5
-    if [[ "$(systemctl is-active mosdns 2>/dev/null)" != active ]]; then
-      c_y "mosdns 重启失败 → 还原"; cp /etc/mosdns/config.yaml.hjbak /etc/mosdns/config.yaml
-      systemctl restart mosdns; rm -f /etc/mosdns/config.yaml.hjbak; return 1
-    fi
-  else
+  wd="$(mktemp -d)" || { c_y "❌ 无法创建临时目录"; return 1; }
+
+  # ── 候选一: mosdns。在**临时副本**上跑归一化器, 绝不碰生产路径。 ──
+  python3 "$txm" read --target mosdns_conf > "$wd/mos.raw" 2>"$wd/err" || {
+    c_y "❌ 读不到 mosdns 配置: $(tr -d '\n' < "$wd/err") → 未改动任何文件。"; rm -rf "$wd"; return 1; }
+  local mos_sha; mos_sha="$(head -1 "$wd/mos.raw")"
+  tail -n +2 "$wd/mos.raw" > "$wd/mos.new"
+  if ! shape=$(_mosdns_hijack_shape "$mode" "$wd/mos.new" "$file"); then
+    c_y "mosdns 配置是自定义形态, 未改动(不猜着改)。"; rm -rf "$wd"; return 1
+  fi
+
+  # ── 候选二: profile.env。在子 shell 里把 PROFILE_ENV 指到临时副本, 复用 _profile_set。 ──
+  python3 "$txm" read --target profile_env > "$wd/prof.raw" 2>"$wd/err" || {
+    c_y "❌ 读不到 profile.env: $(tr -d '\n' < "$wd/err") → 未改动任何文件。"; rm -rf "$wd"; return 1; }
+  local prof_sha; prof_sha="$(head -1 "$wd/prof.raw")"
+  tail -n +2 "$wd/prof.raw" > "$wd/prof.cur"
+  cp "$wd/prof.cur" "$wd/prof.new"
+  ( PROFILE_ENV="$wd/prof.new"; _profile_set PDG_HIJACK_MODE "$mode" ) || {
+    c_y "❌ 生成 profile.env 候选失败 → 未改动任何文件。"; rm -rf "$wd"; return 1; }
+
+  # ── 幂等: 两个候选都与现网一致就什么都不做。不开事务 —— 开了就会留下 PREPARING。 ──
+  local mos_changed=0 prof_changed=0
+  [[ "$shape" == changed ]] && mos_changed=1
+  cmp -s "$wd/prof.cur" "$wd/prof.new" || prof_changed=1
+  if [[ "$mos_changed" == 0 && "$prof_changed" == 0 ]]; then
     echo "  (配置已是 $mode 形态, 无需改动)"
+    c_g "✅ 劫持模式 → $mode(无变化)"; rm -rf "$wd"; return 0
   fi
-  rm -f /etc/mosdns/config.yaml.hjbak
-  install -d -m700 /etc/privdns-gateway
-  if grep -q '^PDG_HIJACK_MODE=' /etc/privdns-gateway/profile.env 2>/dev/null; then
-    sed -i "s/^PDG_HIJACK_MODE=.*/PDG_HIJACK_MODE=$mode/" /etc/privdns-gateway/profile.env
-  else
-    echo "PDG_HIJACK_MODE=$mode" >> /etc/privdns-gateway/profile.env
+
+  txid="$(python3 "$txm" new --source cli --op hijack-mode 2>"$wd/err")" || {
+    c_y "❌ 无法开始配置事务: $(tr -d '\n' < "$wd/err")"; rm -rf "$wd"; return 1; }
+  # expect 用 read 时拿到的 sha: 生成候选期间有人改了同一个文件, 落盘阶段会当场撞出来,
+  # 而不是把别人的修改静默盖掉。"-" = 读的时候它就不存在。
+  local t
+  for t in "mosdns_conf:$wd/mos.new:$mos_sha" "profile_env:$wd/prof.new:$prof_sha"; do
+    # 分成四条 local: 同一条 `local a=… b=$a` 里后者取不到前者的值(bash 语义), 在 set -u
+    # 下会直接炸成 unbound variable, 把整个 stage 循环打断。
+    local tgt; tgt="${t%%:*}"
+    local rest; rest="${t#*:}"
+    local cand; cand="${rest%%:*}"
+    local exp; exp="${rest#*:}"
+    python3 "$txm" stage --tx "$txid" --target "$tgt" --file "$cand" --expect "$exp" 2>"$wd/err" || {
+      c_y "❌ 暂存候选失败($tgt): $(tr -d '\n' < "$wd/err") → 未改动任何文件。"; rc=1; break; }
+  done
+  if [[ "$rc" != 0 ]]; then
+    python3 "$txm" abort "$txid" >/dev/null 2>&1 || true   # 候选阶段放弃: 现网一字节没动
+    rm -rf "$wd"; return 1
   fi
-  echo "✅ 劫持模式 → $mode"
+  # 只有 mosdns 真的变了才重启它 —— 光改真源记录不该顺手打断 DNS。
+  [[ "$mos_changed" == 1 ]] && python3 "$txm" service --tx "$txid" --action restart:mosdns >/dev/null 2>&1
+  local out
+  out="$(python3 "$txm" apply --tx "$txid" 2>"$wd/err")"; rc=$?
+  if [[ "$rc" == 0 ]]; then
+    [[ "$mos_changed" == 1 ]] || echo "  (mosdns 形态已是 $mode, 本次只更新真源记录)"
+    c_g "✅ 劫持模式 → $mode(mosdns 与真源同一笔事务落盘)"
+    rm -rf "$wd"; return 0
+  fi
+  # 失败后顺手收掉这笔事务。abort 自己守着门: 只接受 PREPARING/VALIDATED(现网还没被碰过),
+  # 已经动过现网的状态它会拒绝并保留原状 —— 所以这里无条件调是安全的, 既不会把
+  # ROLLED_BACK/ROLLBACK_FAILED 抹成 ABORTED, 也不会让"被拒绝"的尝试堆一地 PREPARING。
+  python3 "$txm" abort "$txid" >/dev/null 2>&1 || true
+  case "$rc" in
+    4) c_y "⛔ 已有配置操作在执行(锁被占用), 本次未改动任何文件。";;
+    5) c_y "⛔ 拒绝执行(未改动任何文件):"
+       [[ -s "$wd/err" ]] && sed 's/^/    /' "$wd/err";;
+    *) c_y "❌ 劫持模式切换失败, 已按 before-image 回滚:"
+       [[ -s "$wd/err" ]] && sed 's/^/    /' "$wd/err"
+       [[ -n "$out" ]] && printf '%s\n' "$out" | sed 's/^/    /'
+       c_y "   如显示回滚不完整(ROLLBACK_FAILED), 用 sudo pdg tx show $txid 查看后再 recover。";;
+  esac
+  rm -rf "$wd"; return 1
 }
 
 # 显式迁移: 先上锁、先快照, 再跑幂等迁移, 并记一笔审计(source=cli, op=migrate)。
@@ -3801,7 +3957,7 @@ cmd_hijack_mode(){
 cmd_migrate(){
   need_root migrate; _lock
   c_g "迁移前留快照…"
-  if ! cmd_snapshot >/dev/null 2>&1 || [[ -z "$_PDG_SNAP_CREATED" ]]; then
+  if ! cmd_snapshot --source cli --op migrate >/dev/null 2>&1 || [[ -z "$_PDG_SNAP_CREATED" ]]; then
     c_y "❌ 快照失败, 拒绝在无法回滚的前提下迁移。"; return 1
   fi
   local snap="$_PDG_SNAP_CREATED" rc=0
@@ -3881,7 +4037,7 @@ case "${1:-menu}" in
   doctor|dr)     shift || true; cmd_doctor "$@";;
   update|up)     shift || true; cmd_update "$@";;
   migrate-fw)    need_root migrate-fw; migrate_firewall_to_pdg;;
-  snapshot|snap) cmd_snapshot;;
+  snapshot|snap) shift || true; cmd_snapshot "$@";;
   rollback)      shift || true; cmd_rollback "$@";;
   token)         cmd_token;;
   restart)       cmd_restart;;

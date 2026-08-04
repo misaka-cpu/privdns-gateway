@@ -94,6 +94,13 @@ class Box:
         # 硬门探针的真实落点: 一个真 UDP DNS 应答器 + 一个真 TCP 监听。
         # 判据没有被关掉 —— 把它们停掉, 健康检查就会真的判失败(见"退化"用例)。
         self._probes = []
+        # 探针线程的句柄与停止信号。以前两样都没有: `clean()` 只关 socket, 而在 Linux 上
+        # 关闭 fd **不会**唤醒另一个线程里阻塞的 recvfrom()/accept() —— 那个线程会一直挂着,
+        # 连带把监听端口也一直占着(实测: 建 30 个 Box 后进程里 91 个线程, 等多久都不减,
+        # clean() 之后 TCP 端口仍然能连上)。现在改成: 短超时 + 停止事件 + 有上限的 join。
+        self._probe_threads = []
+        self._probe_started = 0             # 起了几个探针 —— 与登记数对不上就是漏登记了
+        self._stop = threading.Event()
         self.dns_port = self._start_dns() if healthy else 1
         self.redir_port = self._start_tcp() if healthy else 1
         self.dot_port = self._start_tcp() if healthy else 1
@@ -113,18 +120,31 @@ class Box:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
+        # 短超时是**唯一**能让阻塞中的 recvfrom 定期回来看停止事件的办法 —— 关 fd 不行。
+        # 0.2s 对 DNS 应答的实时性毫无影响(应答仍是收到就回), 只影响退出的最坏延迟。
+        s.settimeout(0.2)
         self._probes.append(s)
+        stop = self._stop
+
         def loop():
-            while True:
+            while not stop.is_set():
                 try:
                     data, addr = s.recvfrom(512)
-                except OSError:
+                except socket.timeout:      # 超时只是"这一轮没人问", 回去看停止事件
+                    continue
+                except OSError:             # socket 被关了 / 出错 → 收工
                     return
                 try:
                     s.sendto(data[:2] + b"\x81\x83" + data[4:12], addr)   # 回一个 NXDOMAIN
+                except socket.timeout:
+                    continue
                 except OSError:
                     return
-        threading.Thread(target=loop, daemon=True).start()
+
+        t = threading.Thread(target=loop, daemon=True, name="pdgtx-box-dns:%d" % port)
+        t.start()
+        self._probe_started += 1
+        self._probe_threads.append(t)
         # **就绪同步**: 线程起来之前(或解释器忙得没调度到它时)事务的 DNS 硬门会拿不到应答,
         # 于是"基线好、观察期坏"被误判成本次操作造成的退化 —— 那是沙箱的锅, 不是判据的锅。
         # 这里先自己问一次, 确认应答器真的在服务了再把端口交出去; 判据本身一行没改。
@@ -149,23 +169,61 @@ class Box:
         s = socket.socket()
         s.bind(("127.0.0.1", 0)); s.listen(8)
         port = s.getsockname()[1]
+        s.settimeout(0.2)                   # 同上: 让 accept 能定期回来看停止事件
         self._probes.append(s)
+        stop = self._stop
+
         def loop():
-            while True:
+            while not stop.is_set():
                 try:
-                    c, _ = s.accept(); c.close()
+                    c, _ = s.accept()
+                except socket.timeout:
+                    continue
                 except OSError:
                     return
-        threading.Thread(target=loop, daemon=True).start()
+                c.close()
+
+        t = threading.Thread(target=loop, daemon=True, name="pdgtx-box-tcp:%d" % port)
+        t.start()
+        self._probe_started += 1
+        self._probe_threads.append(t)
         return port
 
+    JOIN_TIMEOUT = 8.0                      # 单个探针线程最多等这么久
+
     def stop_probes(self):
+        """停掉全部探针并**确认它们真的退出了**。可重复调用。
+
+        顺序有讲究: 先置停止事件, 再关 socket。反过来的话线程可能正卡在 recvfrom 里,
+        关 fd 唤不醒它, 而它下一轮才会看到事件 —— 两种顺序最终都能退, 但先置事件退得更快。
+
+        超时仍活着就**抛异常**, 不静默忽略: 那正是这个夹具以前的毛病 —— 悄悄漏着, 谁也
+        不知道进程里堆了多少线程和端口。"""
+        missing = self._probe_started - len(self._probe_threads)
+        self._stop.set()
+        # **先 join, 后关 socket**。反过来写的话线程会因为"在已关闭的 socket 上 recvfrom"
+        # 抛 OSError 而退出 —— 看着也能停, 但停止事件就成了摆设: 哪天有人把它删了,
+        # 一样绿。顺序改过来之后, join 窗口里 socket 还开着, 能停下来的只有那个事件。
+        # 附带好处: 不再出现"线程正在 sendto 而主线程把 socket 关了"那种半路报错。
+        stuck = []
+        for t in self._probe_threads:
+            t.join(timeout=self.JOIN_TIMEOUT)
+            if t.is_alive():
+                stuck.append(t.name)
+        self._probe_threads = []
         for s in self._probes:
             try:
                 s.close()
             except OSError:
                 pass
         self._probes = []
+        if stuck:
+            raise RuntimeError("探针线程在 %.0f 秒内没退出: %s"
+                               % (self.JOIN_TIMEOUT, ", ".join(stuck)))
+        if missing > 0:
+            raise RuntimeError("有 %d 个探针起来了却没被登记 —— 它们不会被 join, "
+                               "端口也不会被关" % missing)
+        self._probe_started = 0
 
     def _write(self, name, body):
         p = os.path.join(self.bin, name)
@@ -315,5 +373,8 @@ exit 0
             return None
 
     def clean(self):
-        self.stop_probes()
-        shutil.rmtree(self.root, ignore_errors=True)
+        # 临时目录放 finally: 探针没停干净要如实抛出来, 但不能因此再漏一个目录。
+        try:
+            self.stop_probes()
+        finally:
+            shutil.rmtree(self.root, ignore_errors=True)

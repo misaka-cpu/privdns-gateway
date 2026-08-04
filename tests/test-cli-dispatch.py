@@ -211,6 +211,9 @@ RB = "\n".join([
     "SNAP_DIR=%s" % SNAPS,
     "need_root(){ :; }",
     "_lock(){ :; }",
+    # cmd_rollback 列快照时会调它读来源(老快照没有元数据 → 显示"来源未知")。
+    # 夹具必须把真实依赖一起带上, 否则这里只会得到一串 command not found。
+    bash_func("_snap_meta_label"),
     bash_func("cmd_rollback"),
     DISPATCH,
 ]) + "\n"
