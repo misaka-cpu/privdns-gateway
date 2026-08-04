@@ -153,7 +153,14 @@ elif m:
     bad("中断后沙箱残留: %s" % m.group(1))
 else:
     bad("拿不到沙箱路径: %s" % out.strip()[:80])
-if os.path.exists(os.path.join(ROOT, "install.sh")) and os.path.isdir(os.path.join(ROOT, ".git")):
+# `.git` 在 **git worktree** 里是一个指向真 gitdir 的**文件**, 不是目录。只认目录的话,
+# 任何在 worktree 里跑的人都会看到"原仓库受损"这条假警报 —— 而热修分支正是在 worktree 里
+# 开发的。判据换成"仓库还认得出自己": 存在(文件或目录)且 git 能解析出 gitdir。
+_git = os.path.join(ROOT, ".git")
+_repo_ok = os.path.exists(_git) and subprocess.run(
+    ["git", "-C", ROOT, "rev-parse", "--git-dir"],
+    capture_output=True, text=True).returncode == 0
+if os.path.exists(os.path.join(ROOT, "install.sh")) and _repo_ok:
     ok("中断路径没有碰到原仓库")
 else:
     bad("原仓库受损")

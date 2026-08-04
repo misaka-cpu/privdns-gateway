@@ -207,6 +207,9 @@ jobs:
       - name: "update 关键步骤故障注入 (git reset/必需文件/迁移/内核/daemon-reload 失败均回滚且不谎报成功)"
         run: bash tests/test-update-faults.sh
 
+      - name: "全局锁继承八格 (父锁复用/独立取锁/BUSY/环境变量伪造/错文件/inode 变更/并发/释放)"
+        run: bash tests/test-lock-inherit.sh
+
       - name: "内核热切回归 (check/重启不稳定均还原旧核; 稳定后才删 .prev; 快照含内核二进制)"
         run: bash tests/test-core-swap.sh
 
@@ -589,6 +592,10 @@ jobs:
           - e2e-snapshot-meta.sh
           - e2e-config-transaction.sh
           - e2e-config-transaction-recovery.sh
+          # v1.8.1 修的那条: v1.7.8 的更新器持着全局锁, 新版迁移在首次启用救援平面时
+          # 撞上这把锁 → __migrate 退出 → 整次更新回滚。它只在"旧脚本装新版"这条路上
+          # 出现, 而且 --dry-run 复现不了(不跑迁移), 所以必须在 CI 里真跑一遍五种救援状态。
+          - e2e-rescue-migration-lock.sh
     name: "E2E ${{ matrix.script }}"
     steps:
       - name: "先装 git(必须在 checkout 之前)"
@@ -614,6 +621,37 @@ jobs:
 
   # 串行 hermetic 守卫: 就算将来有人把这些脚本又塞回同一个环境顺序跑, 也必须全绿。
   # 这条专门盯"脚本之间互相踩"的回归 —— 矩阵拆开只是让 CI 不受影响, 并不能保证脚本本身干净。
+  # 救援平面首次启用那条路径必须**两个平台都真跑一遍**。上面的矩阵是"一个脚本一个 job",
+  # 传不进平台参数, 而这支脚本默认 android —— 只跑矩阵的话 iOS 侧等于没覆盖。
+  # 分歧是实打实的: iOS 装机会摘掉 GMS 重定向, migrate_ios_gms_cleanup / migrate_drop_singbox
+  # 也只在 iOS 上动内核配置, 迁移路径与 Android 并不相同。
+  e2e-rescue-lock-ios:
+    runs-on: ubuntu-latest
+    container:
+      image: debian:12
+    name: "E2E e2e-rescue-migration-lock.sh (iOS)"
+    steps:
+      - name: "先装 git(必须在 checkout 之前)"
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git ca-certificates >/dev/null
+      # fetch-depth: 0 —— 这支要取**真的** v1.7.8 代码当更新器; 浅克隆没有 tag, 用例会静默
+      # skip(CI 绿但零覆盖), 正是本项目最怕的假绿。
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: 装依赖
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            bash curl ca-certificates python3 tar gzip unzip dnsutils git coreutils openssl \
+            iproute2 psmisc procps >/dev/null
+      - name: "跑 e2e-rescue-migration-lock.sh (iOS)"
+        env:
+          PDG_E2E_ISOLATED: "1"
+          PDG_E2E_PLATFORM: "ios"
+        run: bash tests/e2e-rescue-migration-lock.sh
+
   e2e-serial:
     runs-on: ubuntu-latest
     container:
@@ -641,6 +679,6 @@ jobs:
             e2e-migrate.sh e2e-exit-rule.sh e2e-drop-singbox.sh e2e-custom-nft.sh
             e2e-cross-version-rollback.sh e2e-install.sh e2e-install-nft.sh
             e2e-platform-switch.sh e2e-update.sh e2e-upgrade-from-release.sh e2e-wloc.sh e2e-cli-ops.sh
-            e2e-hijack-mode-tx.sh e2e-snapshot-meta.sh
+            e2e-rescue-migration-lock.sh e2e-hijack-mode-tx.sh e2e-snapshot-meta.sh
             e2e-config-transaction.sh e2e-config-transaction-recovery.sh
         run: bash tests/e2e-serial-hermetic.sh
