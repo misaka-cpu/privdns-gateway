@@ -294,8 +294,20 @@ jobs:
       - name: "iOS 元数据契约四入口一致 (load/恢复/健康/发送同一份完整判据 + 校验的字节就是返回的字节)"
         run: python3 tests/test-ios-profile-meta-contract.py
 
-      - name: "自检防火墙端口回归"
+      - name: "自检防火墙端口回归 (泄露判据/缺 7893/代理入口/GMS 分档/端口文案按平台)"
         run: python3 tests/test-doctor-firewall.py
+
+      # 6.1C: doctor 与 linkstat 曾对同一台健康机器给出相反结论 —— doctor 报 0 失败,
+      # linkstat 判 FAIL 并拦住手机测试会话。根因是两套各自为政的文本近似判据。这三支
+      # 盯的就是"只有一份判据, 并且分档不串":
+      - name: "nft 语义判据 (nft 自身规范化不算漂移: 集合折叠/reject 默认展开/协议别名)"
+        run: python3 tests/test-nft-live-semantics.py
+
+      - name: "nft 调用链 (doctor 与 linkstat 对同一状态结论一致, 不拦住建会话)"
+        run: python3 tests/test-nft-callchain.py
+
+      - name: "nft 条件与故障矩阵 (15 格条件 × 20 格故障 × 三条链路; 专项故障不进链路硬门)"
+        run: python3 tests/test-nft-matrix.py
 
       - name: "nft input 链冲突判据 (单一来源 + 读不到≠没有 + platform 守卫不靠 PATH 找 nft)"
         run: python3 tests/test-nft-input-scan.py
