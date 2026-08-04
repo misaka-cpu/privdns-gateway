@@ -516,16 +516,20 @@ def _l8_services(ctx):
         # 而 collect() 会把整层的异常收成 COLLECTOR_ERROR, 于是"防火墙这一层没有结论",
         # 看起来像检查不存在。
         platform=(ctx.get("platform") if ctx.get("platform") in ("ios", "android")
-                  else "android"))
+                  else "android"),
+        # 改写目标口取自 mihomo 配置(与 doctor 同一个读法), 不在这里再写一次 7893。
+        redir_port=checks._mihomo_redir_port())
     if audit.ok:
         out.append(Finding(
             8, "L8_FIREWALL_READY", PASS, None, "防火墙运行状态",
             "防火墙配置有效，手机链路所需规则已在内核中生效。",
             evidence_source="nft -c -f + nft -j list table inet pdg"))
     else:
-        joined = "; ".join(audit.problems)
-        code = ("L8_FIREWALL_RULE_ORDER_INVALID" if "排在" in joined or "顺序" in joined
-                else "L8_FIREWALL_RULE_UNSAFE" if ("全网" in joined or "来源" in joined)
+        # reason code 按 kind 选, 不按文案关键字 —— 靠"排在""来源"这类词分类, 改一次措辞
+        # 就会静默错档, 而 code 是闭集契约, 外部靠它判断该怎么处理。
+        kinds = {p.kind for p in audit.problems}
+        code = ("L8_FIREWALL_RULE_ORDER_INVALID" if "order" in kinds
+                else "L8_FIREWALL_RULE_UNSAFE" if kinds & {"source", "leak", "verdict"}
                 else "L8_FIREWALL_RULE_MISSING")
         out.append(Finding(
             8, code, FAIL, FORWARDING, "防火墙运行状态",
