@@ -544,6 +544,47 @@ expect("F13 redirect 到 :1080", c, ok_=False, kinds=["redirect"], l8=L.FAIL, bl
 c = Cell(kernel(src=OTHER_CIDR, redirect_src=OTHER_CIDR))
 expect("F14 来源网段写错", c, ok_=False, kinds=["redirect", "source"], l8=L.FAIL,
        code="L8_FIREWALL_RULE_UNSAFE", blocked=True, doctor={"防火墙": "fail"})
+# 14b. **只有 input 链的 TCP 必需端口**来源写错 —— 其余都对
+# F14 把 TCP / UDP / prerouting 三处来源一起改错, 于是任意一处的检查还在, 整格就仍然红;
+# 单独关掉 TCP 那道检查是看不出来的(负控 NC07 正是这么暴露出来的)。这一格把故障隔离到
+# TCP 那一处, 让每道来源检查各自有人盯着。
+_kk = kernel("android")
+for _r in _kk["nftables"]:
+    _ru = _r.get("rule")
+    if not _ru or _ru.get("chain") != "input":
+        continue
+    _p, _ports = nftlive._dports(_ru["expr"])
+    if _p == "tcp" and (_ports & set(nftlive.REQUIRED_INTERNAL_TCP)):
+        for _e in _ru["expr"]:
+            _pl = (_e.get("match", {}).get("left", {}) or {}).get("payload", {}) or {}
+            if _pl.get("field") == "saddr":
+                _e["match"]["right"] = {"prefix": {"addr": "192.168.99.0", "len": 24}}
+c = Cell(_kk)
+expect("14b 仅 TCP 必需端口来源写错", c, ok_=False, kinds=["source"], l8=L.FAIL,
+       code="L8_FIREWALL_RULE_UNSAFE", blocked=True, doctor={"防火墙": "fail"})
+(ok if any("53" in str(p) and "来源" in str(p) for p in c.audit.problems) else bad)(
+    "[14b] 点名的是 TCP 那几个口的来源(实得 %s)" % [str(p)[:40] for p in c.audit.problems])
+
+# 14c. 仅 UDP 53 来源写错
+_kk = kernel("android")
+for _r in _kk["nftables"]:
+    _ru = _r.get("rule")
+    if not _ru or _ru.get("chain") != "input":
+        continue
+    _p, _ports = nftlive._dports(_ru["expr"])
+    if _p == "udp" and 53 in _ports:
+        for _e in _ru["expr"]:
+            _pl = (_e.get("match", {}).get("left", {}) or {}).get("payload", {}) or {}
+            if _pl.get("field") == "saddr":
+                _e["match"]["right"] = {"prefix": {"addr": "192.168.99.0", "len": 24}}
+expect("14c 仅 UDP 53 来源写错", Cell(_kk), ok_=False, kinds=["source"], l8=L.FAIL,
+       blocked=True, doctor={"防火墙": "fail"})
+
+# 14d. 仅 prerouting 来源写错
+expect("14d 仅 prerouting 来源写错", Cell(kernel("android", redirect_src=OTHER_CIDR)),
+       ok_=False, kinds=["redirect"], l8=L.FAIL, blocked=True,
+       doctor={"代理入口": "fail"})
+
 # 15. 来源放宽为全网
 c = Cell(kernel(world_open=nftlive.REQUIRED_INTERNAL_TCP))
 expect("F15 敏感端口对全网开放", c, ok_=False, l8=L.FAIL, code="L8_FIREWALL_RULE_UNSAFE",
@@ -673,6 +714,35 @@ for _fname in ("check_nft", "check_redirect"):
                  and _re2.search(r"\b(53|81|853|7893|8445|5228|5229|5230)\b", x)}
     (ok if not _strports else bad)(
         "%s 的字符串里也没有硬编码端口(实得 %s)" % (_fname, sorted(_strports)[:2]))
+
+# 缓存只在**一轮之内**共享, 不能跨轮。Bot 是长驻进程, `checks.run()` 每轮开头必须清掉
+# 上一轮的判定 —— 不清的话第二次 doctor 拿的是旧结论, 机器已经修好了还在报故障(反过来
+# 更糟: 机器刚坏却还在报绿)。判据落在**真跑两轮 run()**上, 不是看源码里有没有那行。
+_seq = [kernel("android"), kernel("android", tcp=[53, 853, 7893])]   # 第二轮缺 TCP 81
+_states = []
+_orig_run2, _orig_plat2 = checks._run, checks._platform
+_orig_redir2, _orig_cidr2 = checks._mihomo_redir_port, checks._internal_cidr
+checks._platform = lambda: "android"
+checks._mihomo_redir_port = lambda: REDIR
+checks._internal_cidr = lambda: CIDR
+try:
+    for _k in _seq:
+        def _r(cmd, t=10, _k=_k):
+            if cmd[:1] == ["nft"]:
+                if "-c" in cmd:
+                    return 0, "", ""
+                if "-j" in cmd:
+                    return 0, json.dumps(_k), ""
+            return 0, "", ""
+        checks._run = _r
+        _states.append(checks.run([checks.check_nft])[0][0])
+finally:
+    checks._run, checks._platform = _orig_run2, _orig_plat2
+    checks._mihomo_redir_port, checks._internal_cidr = _orig_redir2, _orig_cidr2
+    checks._nft_view_reset()
+(ok if _states == ["ok", "fail"] else bad)(
+    "checks.run() 每轮重新判定, 不复用上一轮的审计缓存(两轮实得 %s, 期望 ['ok','fail'])"
+    % _states)
 
 # 落盘证据: 跑完整轮之后, 沙箱里除了我们自己写的那两份, 一个新文件都没有
 _before = set(os.listdir(BOX))
