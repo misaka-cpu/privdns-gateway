@@ -33,7 +33,7 @@
 set -uo pipefail
 E2E_ROOT="${E2E_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 
-CASES="bind-set bind-auto enabled-broken disabled no-bind"
+CASES="bind-set bind-auto enabled-broken disabled no-bind post-fault"
 
 # ── 没指定 case: 逐个跑, 每个都是全新沙箱(状态绝不串场) ──────────────────────
 if [[ -z "${PDG_RESCUE_CASE:-}" ]]; then
@@ -74,6 +74,10 @@ _prev_sha="$(git -C "$E2E_ROOT" rev-parse "$PREV^{commit}")"
 [[ "$_head_sha" != "$_prev_sha" ]] \
   || e2e_skip "$PREV 就指着 HEAD —— 那是从本版升到本版, 拒绝当成有效用例"
 
+# /tmp **不在** overlay 里 —— 上一轮留下的假 systemd 状态(/tmp/e2e-svc/*.fail 之类)会原样
+# 带进这一轮: post-fault 那格把 pdg-bot 标成"起来就崩", 下一格就会莫名其妙地更新失败, 而
+# 失败原因与被测对象毫无关系。每格进场先把这些清干净。
+rm -rf /tmp/e2e-svc /tmp/e2e-nft-ruleset /tmp/e2e-calls.log /tmp/rml-*.log /tmp/mig9* 2>/dev/null || true
 e2e_stub_system
 # e2e_stub_system 的 nft 桩对什么都回 0 且不留状态 —— 而救援放行的收尾判据是"磁盘与内核都
 # **恰好一条**", 无状态的桩会让内核侧永远数出 0, 于是启用必然自我回滚, 测出来的是桩的病。
@@ -159,20 +163,40 @@ e2e_git "$REPO" checkout -q "$PREV"
 # 模块闭包完整性, 于是首次启用必然失败, 测出来的是夹具的病不是产品的病。
 install -m755 "$REPO/deploy/bot/pdg.sh" /usr/local/bin/pdg
 rm -rf /opt/pdg-bot; mkdir -p /opt/pdg-bot
-# shellcheck source=/dev/null
-. "$REPO/lib/modules.sh"
-while read -r _src _name _mode; do
-  [[ -n "$_src" ]] || continue
-  install -m"${_mode:-755}" "$REPO/$_src" "/opt/pdg-bot/$_name" 2>/dev/null || true
-done < <(pdg_platform_modules "$PLAT")
+# lib/modules.sh 是 v1.7.x 才有的东西。更老的版本(v1.6.3 / v1.5.9)按目录铺文件, 这里就
+# 照它们当年的做法铺 —— 硬要用新清单去装老版本, 得到的是一台现实中不存在的机器。
+if [[ -f "$REPO/lib/modules.sh" ]] && grep -q 'pdg_platform_modules' "$REPO/lib/modules.sh"; then
+  # shellcheck source=/dev/null
+  . "$REPO/lib/modules.sh"
+  while read -r _src _name _mode; do
+    [[ -n "$_src" ]] || continue
+    install -m"${_mode:-755}" "$REPO/$_src" "/opt/pdg-bot/$_name" 2>/dev/null || true
+  done < <(pdg_platform_modules "$PLAT")
+  _seed_how="按 $PREV 自己的模块清单"
+else
+  for _f in "$REPO"/deploy/bot/*.py "$REPO"/deploy/rescue/*.py; do
+    [[ -e "$_f" ]] && install -m755 "$_f" /opt/pdg-bot/ 2>/dev/null || true
+  done
+  _seed_how="按 $PREV 当年的目录铺法(那时还没有模块清单)"
+fi
 [[ -f "$REPO/lib/rescue.sh" ]] && install -m644 "$REPO/lib/rescue.sh" /opt/pdg-bot/rescue.sh
 install -m755 "$REPO/deploy/bot/pdg-bot.py" /opt/pdg-bot/bot.py
-# 夹具自证: 救援闭包真的齐了。缺一个的话下面"首次启用"那格测的就不是锁, 而是缺模块。
-. "$REPO/lib/rescue.sh" 2>/dev/null || true
-_rmiss=""
-for _m in ${PDG_RESCUE_CLOSURE:-}; do [[ -f "/opt/pdg-bot/$_m" ]] || _rmiss="$_rmiss $_m"; done
-[[ -z "$_rmiss" ]] && ok "$PREV 的救援模块闭包已按其清单装齐(现场与真机同形)" \
-  || bad "救援模块缺:$_rmiss —— 夹具不真实, 后面的启用断言无效"
+
+# 救援平面是 v1.7.0 才有的。更老的机器上 /opt/pdg-bot/rescue.py 不存在, 而
+# migrate_rescue_plane 的第一道守卫就是"运行模块还没装到位就下轮再说" —— 它排在
+# migrate_deploy_botfiles **之前**, 所以这一轮更新只把模块补齐, 救援平面要等下一次更新才启用。
+# 这是既定行为, 不是本次修复的回归; 夹具据此调整预期, 而不是假装它会启用。
+RESCUE_CAPABLE=0
+[[ -f /opt/pdg-bot/rescue.py ]] && RESCUE_CAPABLE=1
+if (( RESCUE_CAPABLE == 1 )); then
+  . "$REPO/lib/rescue.sh" 2>/dev/null || true
+  _rmiss=""
+  for _m in ${PDG_RESCUE_CLOSURE:-}; do [[ -f "/opt/pdg-bot/$_m" ]] || _rmiss="$_rmiss $_m"; done
+  [[ -z "$_rmiss" ]] && ok "$PREV 的救援模块闭包已装齐($_seed_how, 现场与真机同形)" \
+    || bad "救援模块缺:$_rmiss —— 夹具不真实, 后面的启用断言无效"
+else
+  ok "$PREV 早于救援平面(v1.7.0), 机器上没有 rescue.py —— 本轮只补模块, 启用留到下次更新"
+fi
 
 # 现场自证 —— 这四条不成立的话, 后面所有断言都在测别的东西
 { [[ "$(git -C "$REPO" describe --tags)" == "$PREV" ]]; } \
@@ -199,6 +223,7 @@ _prof_del PDG_RESCUE_BIND
 
 EXPECT_ENABLE=0     # 本 case 是否应当走到"启用/恢复救援平面"
 EXPECT_ON=0         # 升完之后救援平面是否应当处于启用态
+# 老于 v1.7.0 的来源: 这一轮到不了启用那一步(见上), 预期整体降为"不启用"
 case "$CASE" in
   bind-set)
     # 最贴近用户报障的那一格: 有合法 bind, 从未记录过启用意图 → 首次启用
@@ -225,27 +250,88 @@ case "$CASE" in
     # 没有可用监听地址 —— 保守保持停用, 并说清怎么配
     _stub_ip
     EXPECT_ENABLE=0; EXPECT_ON=0;;
+  post-fault)
+    # 迁移**成功之后**才出故障 —— 更新必须精确回滚到更新前那个提交与那份快照, 而不是
+    # 停在"迁移已经跑过、代码却是旧的"这种半路状态。
+    #
+    # 故障点必须挑一个**只在迁移之后**才被触碰的东西。`mihomo -t` 看着合适, 其实不行:
+    # iOS 上 migrate_ios_gms_cleanup / migrate_drop_singbox 自己也会跑 `mihomo -t`, 桩一失败
+    # 就在迁移当中先炸, 于是测出来的是"迁移失败回滚"而不是"更新后校验失败回滚" —— 两件事,
+    # 断言会错档(这一版就是这么先红的)。改用 pdg-bot 起不来: 它在校验门的最后一段, 迁移
+    # 全程不依赖它, 两个平台行为一致。
+    _stub_ip "$BINDADDR"
+    _prof_set PDG_RESCUE_BIND "$BINDADDR"
+    printf 'PDG_BOT_TOKEN=x\nPDG_BOT_ALLOWED=1\n' > /etc/privdns-gateway/bot.env
+    e2e_svc_crash pdg-bot          # restart 返回 0, 服务随即又变回 inactive
+    EXPECT_ENABLE=0; EXPECT_ON=0;;
   *) echo "未知 case: $CASE"; exit 2;;
 esac
+if (( RESCUE_CAPABLE == 0 )); then EXPECT_ENABLE=0; EXPECT_ON=0; fi
 
 # ── 升级前的现场底片 ────────────────────────────────────────────────────────
+# 升级**前**的救援意图。判"有没有被升级重新开启"必须与它比 —— 拿一个常量比的话,
+# enabled-broken 这种"进场就已经是 1"的格子会被误判成"升级把它打开了"。
+INTENT_BEFORE="$(sed -n 's/^[[:space:]]*PDG_RESCUE_ENABLED=//p' "$PROF" | tail -1)"
 _ud(){ sha256sum /etc/privdns-gateway/bot.env /etc/privdns-gateway/profile.env \
         /opt/pdg-bot/rulesets.json /etc/privdns-gateway/platform \
         /etc/mosdns/rules/custom_direct.txt /etc/mosdns/rules/custom_hijack.txt 2>/dev/null; }
 UD_BEFORE="$(_ud)"
 _rescue_fp(){ python3 /opt/pdg-bot/rescue_cred.py fingerprint 2>/dev/null || echo "(无)"; }
-_rescue_tok(){ sha256sum /etc/privdns-gateway/rescue/token 2>/dev/null | awk '{print $1}'; }
-FP_BEFORE="$(_rescue_fp)"; TOK_BEFORE="$(_rescue_tok)"
+# 三份凭据各自的摘要 —— 只看指纹不够: 换 token 不改指纹, 而 token 一换所有已登录会话立即失效。
+# 路径从 lib/rescue.sh 读, 不在这里再写一遍。
+. "$E2E_ROOT/lib/rescue.sh" 2>/dev/null || true
+_rescue_dig(){ sha256sum "${PDG_RESCUE_TOKEN:-/nonexistent}" "${PDG_RESCUE_CERT:-/nonexistent}" \
+                 "${PDG_RESCUE_KEY:-/nonexistent}" 2>/dev/null; }
+_rescue_tok(){ sha256sum "${PDG_RESCUE_TOKEN:-/nonexistent}" 2>/dev/null | awk '{print $1}'; }
+FP_BEFORE="$(_rescue_fp)"; TOK_BEFORE="$(_rescue_tok)"; DIG_BEFORE="$(_rescue_dig)"
 NR_BEFORE="$(systemctl show -p NRestarts --value mosdns 2>/dev/null || echo 0)"
 cp /etc/nftables.conf /tmp/nft-before.conf 2>/dev/null || true
 # /tmp 不在 overlay 里, 宿主上本来就可能有别人留下的 pdg-* —— 残留判据只看**本轮新增的**,
 # 否则这条恒红, 而恒红与恒绿一样没有信息量。
 TMP_BEFORE="$(ls -d /tmp/pdg-* /tmp/pdgtx-* 2>/dev/null | sort)"
+_pre_sha="$(git -C "$REPO" rev-parse HEAD)"     # 精确回滚目标: 更新前那个提交
 
 echo
 echo "── 跑 $PREV 的 pdg update(目标: 当前工作树) ──"
 out=$(bash /usr/local/bin/pdg update 2>&1); rc=$?
 printf '%s\n' "$out" > /tmp/rml-out.txt
+
+_intent(){ sed -n 's/^[[:space:]]*PDG_RESCUE_ENABLED=//p' "$PROF" | tail -1; }
+
+# ═══ 0f. post-fault: 迁移成功之后出故障 → 精确回滚 ══════════════════════════
+if [[ "$CASE" == post-fault ]]; then
+  [[ "$rc" != 0 ]] && ok "更新后校验失败 → update 返回非零(rc=$rc)" \
+    || bad "校验失败却报成功(rc=0)"
+  grep -q 'pdg-bot 更新后起不来' <<<"$out" \
+    && ok "故障点如实点名(pdg-bot 更新后起不来)" || bad "没说清失败在哪: $(tail -4 <<<"$out")"
+  grep -q '迁移(__migrate)失败' <<<"$out" \
+    && bad "失败发生在迁移阶段, 这一格要验的是**迁移之后**的故障" \
+    || ok "迁移这一步是过了的(故障确实发生在它之后)"
+  grep -qE '✅ 已更新' <<<"$out" && bad "回滚了却打印了「✅ 已更新」" || ok "没有谎报更新成功"
+  grep -qE '回滚到更新前快照|失败, 回滚|已回滚' <<<"$out" \
+    && ok "触发了回滚(文案: $(grep -oE '[^ ]*回滚[^,。]*' <<<"$out" | head -1))" || bad "没有回滚"
+  _now="$(git -C "$REPO" rev-parse HEAD)"
+  [[ "$_now" == "$_pre_sha" ]] \
+    && ok "仓库精确复位到更新前那个提交(${_now:0:8}), 而不是只回到旧 tag 附近" \
+    || bad "复位到了 ${_now:0:8}, 期望 ${_pre_sha:0:8}"
+  [[ "$(git -C "$REPO" describe --tags 2>/dev/null)" == "$PREV" ]] \
+    && ok "describe 回到 $PREV" || bad "describe=$(git -C "$REPO" describe --tags 2>/dev/null)"
+  [[ "$(_intent)" == "$INTENT_BEFORE" ]] \
+    && ok "回滚后救援意图与更新前一致('$INTENT_BEFORE')" \
+    || bad "回滚后意图变了: '$INTENT_BEFORE' → '$(_intent)'"
+  [[ "$(_ud)" == "$UD_BEFORE" ]] && ok "回滚后用户数据逐字节回到更新前" \
+    || { bad "回滚后用户数据与更新前不一致"; diff <(printf '%s\n' "$UD_BEFORE") <(_ud); }
+  if [[ "$FP_BEFORE" != "(无)" ]]; then
+    [[ "$(_rescue_fp)" == "$FP_BEFORE" ]] && ok "回滚后救援证书指纹不变" || bad "指纹变了"
+  fi
+  _held="$(fuser /run/privdns-gateway.lock 2>/dev/null | tr -d ' ')"
+  [[ -z "$_held" ]] && ok "回滚后锁文件上没有残留持有者" || bad "还有进程持着锁: $_held"
+  _new_tmp="$(comm -13 <(printf '%s\n' "$TMP_BEFORE") \
+                       <(ls -d /tmp/pdg-* /tmp/pdgtx-* 2>/dev/null | sort) | grep -c . || true)"
+  [[ "${_new_tmp:-0}" == 0 ]] && ok "回滚后没有新增临时目录残留" || bad "新增 $_new_tmp 个残留"
+  e2e_summary
+  exit $?
+fi
 
 # ═══ 1. 更新本身 ════════════════════════════════════════════════════════════
 [[ "$rc" == 0 ]] && ok "update 返回 0" || bad "update rc=$rc: $(tail -8 <<<"$out")"
@@ -268,7 +354,6 @@ _sha="$(git -C "$REPO" rev-parse HEAD 2>/dev/null)"
   && ok "仓库切到了 $NEW_TAG(${_sha:0:8})" || bad "仓库停在 $_desc(${_sha:0:8}) —— 说明回滚了"
 
 # ═══ 3. 救援平面的最终状态 ══════════════════════════════════════════════════
-_intent(){ sed -n 's/^[[:space:]]*PDG_RESCUE_ENABLED=//p' "$PROF" | tail -1; }
 _sock_unit=/etc/systemd/system/pdg-rescue.socket
 if (( EXPECT_ENABLE == 1 )); then
   grep -qE '首次启用救援平面|救援平面意图为启用但当前没起来' <<<"$out" \
@@ -285,24 +370,52 @@ if (( EXPECT_ON == 1 )); then
     && ok "监听配置已写入 unit($(sed -n 's/^ListenStream=//p' "$_sock_unit" | head -1))" \
     || bad "unit 里没有 ListenStream"
 else
-  [[ "$(_intent)" != 1 ]] && ok "救援平面保持停用(意图 '$(_intent)')" \
+  [[ "$(_intent)" == "$INTENT_BEFORE" ]] \
+    && ok "救援意图未被升级改动(升级前 '$INTENT_BEFORE' → 升级后 '$(_intent)')" \
+    || bad "升级动了救援意图: '$INTENT_BEFORE' → '$(_intent)'"
+  { [[ "$INTENT_BEFORE" == 1 ]] || [[ "$(_intent)" != 1 ]]; } \
+    && ok "升级没有把停用的救援平面重新打开" \
     || bad "被升级重新开启了 —— 用户的停用意图被覆盖"
   [[ ! -f "$_sock_unit" ]] && ok "没有落下 socket unit" || bad "不该启用却装了 socket unit"
 fi
 case "$CASE" in
   bind-auto)
-    grep -q "^PDG_RESCUE_BIND=$BINDADDR" "$PROF" \
-      && ok "来源段内唯一本机地址被认定并落盘($BINDADDR)" \
-      || bad "没有落盘 bind: $(grep PDG_RESCUE_BIND "$PROF" || echo 无)";;
+    # 只有救援迁移真的跑过, 才谈得上"自动认定并落盘"。老于 v1.7.0 的来源这一轮根本到不了
+    # 那一步(见上), 这时去要求落盘就是在要求一件既定行为之外的事。
+    if (( RESCUE_CAPABLE == 1 )); then
+      grep -q "^PDG_RESCUE_BIND=$BINDADDR" "$PROF" \
+        && ok "来源段内唯一本机地址被认定并落盘($BINDADDR)" \
+        || bad "没有落盘 bind: $(grep PDG_RESCUE_BIND "$PROF" || echo 无)"
+    else
+      grep -q "^PDG_RESCUE_BIND=" "$PROF" \
+        && bad "救援迁移这轮没跑, 却凭空写了 bind" \
+        || ok "救援迁移这轮不跑, 也就没有去猜监听地址(留给下次更新)"
+    fi;;
   disabled)
     grep -qE '首次启用救援平面' <<<"$out" \
       && bad "用户已明确停用, 却仍走了首次启用" || ok "尊重停用意图, 没走首次启用";;
   no-bind)
-    grep -q '未配置监听地址' <<<"$out" \
-      && ok "明确提示未配置监听地址" || bad "没给出原因: $(grep -n '救援' <<<"$out" | head -3)"
-    grep -q 'pdg rescue bind' <<<"$out" \
-      && ok "提示了怎么配(pdg rescue bind <IPv4>)" || bad "没告诉用户怎么配";;
+    if (( RESCUE_CAPABLE == 1 )); then
+      grep -q '未配置监听地址' <<<"$out" \
+        && ok "明确提示未配置监听地址" || bad "没给出原因: $(grep -n '救援' <<<"$out" | head -3)"
+      grep -q 'pdg rescue bind' <<<"$out" \
+        && ok "提示了怎么配(pdg rescue bind <IPv4>)" || bad "没告诉用户怎么配"
+    else
+      grep -q '未配置监听地址' <<<"$out" \
+        && bad "救援迁移这轮不该跑, 却打印了监听地址提示" \
+        || ok "救援迁移这轮不跑, 也就没有那条监听地址提示(留给下次更新)"
+    fi;;
 esac
+# 老于 v1.7.0 的来源: 本轮的正事是**把救援模块补齐**, 好让下一次更新能启用。
+# 这条要正着断言, 不能只靠"没报错"就当过 —— 模块没补上的话下次更新照样启用不了。
+if (( RESCUE_CAPABLE == 0 )); then
+  [[ -f /opt/pdg-bot/rescue.py ]] \
+    && ok "本轮把 rescue.py 补到位了(下次更新即可启用救援平面)" \
+    || bad "救援模块没补上 —— 下次更新照样启不了"
+  [[ ! -f "$_sock_unit" ]] \
+    && ok "本轮没有启用救援平面(既定行为: 模块刚补齐, 留到下轮)" \
+    || bad "模块这轮才补齐, 却已经把救援平面开起来了"
+fi
 
 # ═══ 4. 用户数据与凭据 ══════════════════════════════════════════════════════
 [[ "$(_ud)" == "$UD_BEFORE" ]] \
@@ -324,6 +437,19 @@ if [[ -n "$TOK_BEFORE" ]]; then
   [[ "$(_rescue_tok)" == "$TOK_BEFORE" ]] \
     && ok "救援 token 未被意外轮换" || bad "token 被换了"
 fi
+if [[ -n "$DIG_BEFORE" ]]; then
+  [[ "$(_rescue_dig)" == "$DIG_BEFORE" ]] \
+    && ok "救援 token / 证书 / 私钥三份摘要全部不变" \
+    || { bad "救援凭据被动了"; diff <(printf '%s\n' "$DIG_BEFORE") <(_rescue_dig); }
+fi
+# 残留: netns / veth / 后台探针 —— 这几样一旦漏掉, 下一次跑会拿到上一次的现场
+_ns="$(ip netns list 2>/dev/null | grep -c 'pdg' || true)"
+[[ "${_ns:-0}" == 0 ]] && ok "没有 pdg 相关 netns 残留" || bad "残留 netns: $(ip netns list|grep pdg|head -2)"
+_veth="$(ip -o link show 2>/dev/null | grep -c 'pdg.*@' || true)"
+[[ "${_veth:-0}" == 0 ]] && ok "没有 veth 残留" || bad "残留 veth $_veth 个"
+# 用完整路径匹配 —— 只写 "rescue.py" 会把本脚本自己的命令行也算进去(它的路径里就有 rescue)
+_probe="$(pgrep -fc '/opt/pdg-bot/(probe81|rescue)\.py' 2>/dev/null || true)"
+[[ "${_probe:-0}" == 0 ]] && ok "没有后台探针进程残留" || bad "残留探针进程 $_probe 个"
 
 # ═══ 5. 服务 / 防火墙 / 事务 / 残留 ═════════════════════════════════════════
 for u in mosdns mihomo; do
