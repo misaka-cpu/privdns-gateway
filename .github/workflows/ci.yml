@@ -556,6 +556,37 @@ jobs:
 
   # 串行 hermetic 守卫: 就算将来有人把这些脚本又塞回同一个环境顺序跑, 也必须全绿。
   # 这条专门盯"脚本之间互相踩"的回归 —— 矩阵拆开只是让 CI 不受影响, 并不能保证脚本本身干净。
+  # 救援平面首次启用那条路径必须**两个平台都真跑一遍**。上面的矩阵是"一个脚本一个 job",
+  # 传不进平台参数, 而这支脚本默认 android —— 只跑矩阵的话 iOS 侧等于没覆盖。
+  # 分歧是实打实的: iOS 装机会摘掉 GMS 重定向, migrate_ios_gms_cleanup / migrate_drop_singbox
+  # 也只在 iOS 上动内核配置, 迁移路径与 Android 并不相同。
+  e2e-rescue-lock-ios:
+    runs-on: ubuntu-latest
+    container:
+      image: debian:12
+    name: "E2E e2e-rescue-migration-lock.sh (iOS)"
+    steps:
+      - name: "先装 git(必须在 checkout 之前)"
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git ca-certificates >/dev/null
+      # fetch-depth: 0 —— 这支要取**真的** v1.7.8 代码当更新器; 浅克隆没有 tag, 用例会静默
+      # skip(CI 绿但零覆盖), 正是本项目最怕的假绿。
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: 装依赖
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            bash curl ca-certificates python3 tar gzip unzip dnsutils git coreutils openssl \
+            iproute2 psmisc procps >/dev/null
+      - name: "跑 e2e-rescue-migration-lock.sh (iOS)"
+        env:
+          PDG_E2E_ISOLATED: "1"
+          PDG_E2E_PLATFORM: "ios"
+        run: bash tests/e2e-rescue-migration-lock.sh
+
   e2e-serial:
     runs-on: ubuntu-latest
     container:
