@@ -60,11 +60,18 @@ NFTCONF = os.path.join(BOX, "nftables.conf")
 _io.open(NFTCONF, "w", encoding="utf-8").write("# 合成夹具, 内容不参与语义判定\n")
 
 import checks        # noqa: E402
+import rescue_const  # noqa: E402
 import linkstat as L  # noqa: E402
 import nftlive       # noqa: E402
 
 checks.PROFILE_ENV = PROFILE
 checks.NFT_CONF = NFTCONF
+
+# 救援口从 lib/rescue.sh 读 —— 全仓只准有一处端口字面量(tests/test-rescue-constants.sh
+# 专门盯这条)。写死一个数字在这里, 用户改过端口的机器上测的就是别人的端口。
+RESCUE_PORT = rescue_const.port()
+ALT_PORT = RESCUE_PORT + 1000          # "换个端口也要认得出来"用的对照值
+
 
 
 # ── 内核 JSON 生成器 ────────────────────────────────────────────────────────
@@ -347,14 +354,14 @@ c_off = Cell(kernel("ios", gms=False), platform="ios")
 expect("5/6 iOS WLOC 两态", c_off, ok_=True, kinds=[], dkinds=[], l8=L.PASS, blocked=False,
        doctor={"防火墙": "ok", "代理入口": "ok"})
 
-# 7. rescue 关闭且无 8446 —— 不许误报
+# 7. rescue 关闭且无救援放行 —— 不许误报
 c = Cell(kernel("android"))
 _txt = json.dumps(c.kern)
-(ok if "8446" not in _txt else bad)("[7 rescue 关] 夹具里确实没有 8446")
-expect("7 rescue 关, 无 8446", c, ok_=True, kinds=[], dkinds=[], l8=L.PASS, blocked=False,
+(ok if str(RESCUE_PORT) not in _txt else bad)("[7 rescue 关] 夹具里确实没有救援口")
+expect("7 rescue 关, 无救援放行", c, ok_=True, kinds=[], dkinds=[], l8=L.PASS, blocked=False,
        doctor={"防火墙": "ok"})
-(ok if 8446 not in set(nftlive.REQUIRED_INTERNAL_TCP) | set(nftlive.DOCTOR_ONLY_INTERNAL_TCP)
- else bad)("[7 rescue 关] 8446 不在 nftlive 的任何固定端口集合里")
+(ok if RESCUE_PORT not in set(nftlive.REQUIRED_INTERNAL_TCP) | set(nftlive.DOCTOR_ONLY_INTERNAL_TCP)
+ else bad)("[7 rescue 关] 救援口(%d)不在 nftlive 的任何固定端口集合里" % RESCUE_PORT)
 
 
 def rescue_cell(bind, port, conf_text):
@@ -391,25 +398,26 @@ def _rescue_line(port, bind="10.77.0.9"):
     import rescue_nft
     return rescue_nft.rule_line(CIDR, bind, port) + "\n"
 
-r = rescue_cell("", 8446, _BASE_CONF % "")
+r = rescue_cell("", RESCUE_PORT, _BASE_CONF % "")
 (ok if r is None else bad)("[7 rescue 关] 救援未启用 → doctor 整项不显示(实得 %r)" % (r,))
 
-# 8. rescue 开启且动态 8446 正确
-r = rescue_cell("10.77.0.9", 8446, _BASE_CONF % _rescue_line(8446))
-(ok if r and r[0] == "ok" else bad)("[8 rescue 开, 8446 就位] doctor ok(实得 %r)" % (r,))
-# 端口是**动态**的: 换成 9446 也要照样认出来, 而不是死盯 8446
-r = rescue_cell("10.77.0.9", 9446, _BASE_CONF % _rescue_line(9446))
-(ok if r and r[0] == "ok" else bad)("[8 rescue 开, 自定义端口 9446] doctor ok(实得 %r)" % (r,))
-r = rescue_cell("10.77.0.9", 9446, _BASE_CONF % _rescue_line(8446))
+# 8. rescue 开启且动态端口正确
+r = rescue_cell("10.77.0.9", RESCUE_PORT, _BASE_CONF % _rescue_line(RESCUE_PORT))
+(ok if r and r[0] == "ok" else bad)("[8 rescue 开, 救援口就位] doctor ok(实得 %r)" % (r,))
+# 端口是**动态**的: 换一个也要照样认出来, 而不是死盯默认值
+r = rescue_cell("10.77.0.9", ALT_PORT, _BASE_CONF % _rescue_line(ALT_PORT))
+(ok if r and r[0] == "ok" else bad)("[8 rescue 开, 自定义端口 %d] doctor ok(实得 %r)" % (ALT_PORT, r))
+r = rescue_cell("10.77.0.9", ALT_PORT, _BASE_CONF % _rescue_line(RESCUE_PORT))
 (ok if r and r[0] == "fail" else bad)(
-    "[8 rescue 开] 配置里是 8446 而实际端口是 9446 → fail(不是死盯 8446 就报绿, 实得 %r)" % (r,))
+    "[8 rescue 开] 配置里是 %d 而实际端口是 %d → fail(不是死盯默认值就报绿, 实得 %r)"
+    % (RESCUE_PORT, ALT_PORT, r))
 
-# 9. rescue 开启但 8446 缺失 → doctor 点名; linkstat 不受影响
-r = rescue_cell("10.77.0.9", 8446, _BASE_CONF % "")
-(ok if r and r[0] == "fail" and "8446" in r[2] else bad)(
-    "[9 rescue 开, 缺 8446] doctor 点名(实得 %r)" % (r,))
+# 9. rescue 开启但放行缺失 → doctor 点名; linkstat 不受影响
+r = rescue_cell("10.77.0.9", RESCUE_PORT, _BASE_CONF % "")
+(ok if r and r[0] == "fail" and str(RESCUE_PORT) in r[2] else bad)(
+    "[9 rescue 开, 缺放行] doctor 点名(实得 %r)" % (r,))
 c = Cell(kernel("android"))
-expect("9 rescue 缺口不挡链路", c, ok_=True, l8=L.PASS, blocked=False)
+expect("9 rescue 缺放行不挡链路", c, ok_=True, l8=L.PASS, blocked=False)
 
 # 10. 8445 正常
 c = Cell(kernel("android", socks=True))

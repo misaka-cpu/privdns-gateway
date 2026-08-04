@@ -1260,10 +1260,10 @@ def check_nft_input_chains():
 def check_rescue_firewall():
     """救援平面的防火墙放行 —— 端口是**动态**的, 所以它不在 nftlive 的固定端口集合里。
 
-    为什么必须单独一项, 而不是往 nftlive 的必需端口里加个 8446:
+    为什么必须单独一项, 而不是往 nftlive 的必需端口里加那个救援口:
       · 救援平面默认**是关的**(profile.env 里没有 PDG_RESCUE_BIND 就没启用)。写进固定集合
         会让每台没开救援的机器都被报"缺规则" —— `.153` 就是这种机器;
-      · 端口取自 lib/rescue.sh 的 PDG_RESCUE_PORT(默认 8446), 用户可以改, 硬编码 8446 会在
+      · 端口取自 lib/rescue.sh 的 PDG_RESCUE_PORT(有默认值), 用户可以改, 把它硬编码进代码会在
         改过的机器上查错端口, 报一个不存在的故障, 同时放过真正的那个;
       · 它与 8445(Telegram SOCKS5)是两码事 —— 上一轮把 8445 当成救援平面, 这里不再混。
 

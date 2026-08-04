@@ -149,6 +149,13 @@ def nc(num, title, breaker, gates):
     restore()
 
 
+def _rescue_port():
+    """救援口只从 lib/rescue.sh 取 —— 这份文件里也不许出现第二个端口字面量。"""
+    sys.path.insert(0, os.path.join(ROOT, "deploy/bot"))
+    import rescue_const
+    return rescue_const.port()
+
+
 M = "tests/test-nft-matrix.py"
 D = "tests/test-doctor-firewall.py"
 S = "tests/test-nft-live-semantics.py"
@@ -312,15 +319,16 @@ def b12():
 
 nc(12, "8445 升级为硬门 / doctor 不再点名 TG SOCKS5", b12, [M, D])
 
-# ══ 13. 8446 被写死进固定端口集合 ═══════════════════════════════════════════
+# ══ 13. 动态救援口被写死进固定端口集合 ═══════════════════════════════════════════
 def b13():
     s = read("deploy/bot/nftlive.py")
     s = sub(s, "REQUIRED_INTERNAL_TCP = (53, 81, 853, 7893)",
-            "REQUIRED_INTERNAL_TCP = (53, 81, 853, 7893, 8446)", "把动态救援口写死进固定集合")
+            "REQUIRED_INTERNAL_TCP = (53, 81, 853, 7893, %d)" % _rescue_port(),
+            "把动态救援口写死进固定集合")
     write("deploy/bot/nftlive.py", s)
 
 
-nc(13, "8446 写死进固定端口集合(救援关闭时误报)", b13, [M, D])
+nc(13, "动态救援口写死进固定端口集合(救援关闭时误报)", b13, [M, D])
 
 # ══ 14. 9090 被要求 nft input 放行 ══════════════════════════════════════════
 def b14():

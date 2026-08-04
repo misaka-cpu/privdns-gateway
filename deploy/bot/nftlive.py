@@ -42,7 +42,7 @@ NFT_BIN = "nft"
 #
 # 模板那一行是 `tcp dport { 53, 81, 853, 7893, 8445 } accept`, 但 **8445 不在这份清单里**:
 # 查过真源(lib/rescue.sh:19 与 CHANGELOG)—— 8445 是 **Telegram SOCKS5**(mihomo 的 mixed
-# 监听, TG 内置代理填 网关IP:8445), 救援平面是 **8446**(PDG_RESCUE_PORT 默认值, 模板里
+# 监听, TG 内置代理填 网关IP:8445), 救援平面走 **PDG_RESCUE_PORT**(模板里
 # 单独一行 `tcp dport __RESCUE_PORT__ accept`)。我上一轮把 8445 注成"救援平面", 是错的。
 # TG SOCKS5 与救援平面都是可选功能: 它们不通不会让"HTTP 探测到没到达网关"这个结论失真,
 # 因此由 doctor 点名即可, 不该挡住基础链路测试。
@@ -51,7 +51,7 @@ REQUIRED_INTERNAL_TCP = (53, 81, 853, 7893)
 # OPTIONAL_INTERNAL_TCP, 读起来像"这些端口可有可无", 而实际含义是"缺了要报, 但不该拦住
 # 手机链路测试"。8445 在标准安装里是恒定渲染的, 缺了确实该 FAIL, 只是不该挡会话。
 #
-# 8446(救援平面)**不在这里**: 它的端口是动态的(rescue_const.port()), 且只有配了
+# 救援平面(PDG_RESCUE_PORT)**不在这里**: 它的端口是动态的(rescue_const.port()), 且只有配了
 # PDG_RESCUE_BIND 才启用 —— 写死进固定集合会让"救援关着"的机器被误报缺规则。
 # 9090 也不在这里: 它默认绑 127.0.0.1(mihomorender 的 external_controller), 走回环,
 # 根本不需要 nft input 放行, 放进来就是凭空要求一条不存在的规则。
