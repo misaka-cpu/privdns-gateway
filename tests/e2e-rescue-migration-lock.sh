@@ -339,9 +339,11 @@ if (( EXPECT_ON == 1 )); then
                  || bad "救援启用了但磁盘 nft 里没有放行"
 import sys
 sys.path.insert(0, "/opt/pdg-bot")
-import rescue_nft
+import rescue_const, rescue_nft
+# 端口读常量, 不写字面量 —— lib/rescue.sh 是唯一事实源, 测试里再抄一份就是第二份
+# (tests/test-rescue-constants.sh 专门盯这条, 抄了会当场红)。
 txt = open("/etc/nftables.conf", encoding="utf-8", errors="surrogateescape").read()
-sys.exit(0 if rescue_nft.has_rescue_rule(txt, 8446, "$BINDADDR") else 1)
+sys.exit(0 if rescue_nft.has_rescue_rule(txt, rescue_const.port(), "$BINDADDR") else 1)
 PY
 else
   python3 - <<PY && bad "没启用救援却在防火墙里留了放行" \
