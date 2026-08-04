@@ -512,11 +512,26 @@ PS
   grep -q '已有 pdg 操作在运行' /tmp/rml-child.log \
     && bad "子迁移仍报 BUSY —— 锁继承没生效" || ok "子迁移没有报 BUSY"
 
-  # 反面: 另一个进程持锁, 独立跑 __migrate(不继承 fd)必须 BUSY
-  ( exec 9>"${PDG_LOCKFILE:-/run/privdns-gateway.lock}"; flock -n 9 && sleep 6 ) &
-  _holder=$!; sleep 0.5
+  # 反面: 另一个进程持锁, 独立跑 __migrate(不继承 fd)必须 BUSY。
+  #
+  # 持锁进程必须**能确定地松手**。原来写的是 `( … && sleep 6 ) & … kill $!`: kill 打在子 shell
+  # 上, 那个 sleep 会活下来继续攥着 fd 9。本地跑不出问题 —— namespace 模式每个 case 都有一份
+  # 新的 /run tmpfs; 但 CI 走容器模式, 六个 case **共用同一个 /run**, 于是这条泄漏的 sleep 把
+  # 锁一直按到下一个 case, 下一格的 `pdg update` 当场 BUSY。改成盯标记文件: 删掉标记 = 松手,
+  # wait 回来就一定放干净了(与 tests/test-lock-inherit.sh 同一套写法)。
+  _LK="${PDG_LOCKFILE:-/run/privdns-gateway.lock}"
+  : > /tmp/rml-holding
+  ( exec 9>"$_LK"; flock -n 9 || exit 1; : > /tmp/rml-held
+    while [[ -e /tmp/rml-holding ]]; do sleep 0.05; done ) &
+  _holder=$!
+  for _i in $(seq 1 60); do [[ -e /tmp/rml-held ]] && break; sleep 0.05; done
+  [[ -e /tmp/rml-held ]] && ok "前置: 第三方确实按住了锁" || bad "造不出'第三方持锁'的现场"
   _o=$(setsid bash -c 'exec 9<&-; bash /usr/local/bin/pdg __migrate' 2>&1); _orc=$?
-  kill "$_holder" 2>/dev/null; wait "$_holder" 2>/dev/null
+  rm -f /tmp/rml-holding; wait "$_holder" 2>/dev/null; rm -f /tmp/rml-held
+  # 松手之后锁必须真的可再取 —— 这一条就是上面那个泄漏的直接探针
+  ( exec 9>"$_LK"; flock -n 9 ) \
+    && ok "探针收尾后锁已彻底释放(没有留下攥着 fd 的后台进程)" \
+    || bad "锁没被放干净 —— 下一个用例会被它挡住"
   { [[ "$_orc" != 0 ]] && grep -q '已有 pdg 操作在运行' <<<"$_o"; } \
     && ok "别的进程持锁时, 独立 __migrate 仍被挡住并报 BUSY(并发保护没被拆掉)" \
     || bad "独立 __migrate 竟然拿到了锁(rc=$_orc): $(tail -3 <<<"$_o")"

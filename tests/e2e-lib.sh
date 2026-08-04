@@ -51,7 +51,8 @@ _e2e_git_safe(){ grep -q 'directory = \*' /etc/gitconfig 2>/dev/null || printf '
 # 把机器清回"什么都没装过"的状态。namespace 模式下 overlay 本来就干净, 这里主要给容器模式
 # (CI 里多个脚本共用一个容器)用: 二进制、unit、归属/后端标记、快照、仓库副本、服务桩一个不留。
 e2e_reset_box(){
-  systemctl disable --now pdg-bot pdg-probe81 pdg-mitm mosdns mihomo sing-box >/dev/null 2>&1 || true
+  systemctl disable --now pdg-bot pdg-probe81 pdg-mitm mosdns mihomo sing-box \
+                          pdg-rescue.socket pdg-rescue.service >/dev/null 2>&1 || true
   # sing-box 是**必须**清掉的那个: 装机会把来源不明的 sing-box 判成第三方冲突而中止,
   # 跨版本回滚用例正好留一份在这。mihomo / mosdns 反过来要**留着** —— 它们是从网上下的
   # 真内核(几十 MB), 每个脚本重下一遍既慢又会在没网时把用例整条 skip 掉(假绿)。
@@ -59,7 +60,13 @@ e2e_reset_box(){
         /usr/local/bin/pdg /usr/local/bin/pdg-set-token \
         /usr/local/bin/proxy-gateway-open-cert-http.sh \
         /usr/local/bin/proxy-gateway-restore-firewall.sh 2>/dev/null || true
+  # 救援平面那两个 unit 一定要在这里删掉。容器模式下多个脚本共用一个 /etc: 前一个脚本
+  # (或前一个 case)把救援平面开起来, 留下的 socket unit 会被后面那个当成"机器上本来就有",
+  # 于是"不该启用却装了 socket unit"这类断言凭空转红, 而红的原因与被测对象毫无关系。
+  # namespace 模式每次都是新 overlay, 所以这个洞一直没露头, 只有 CI 的容器模式会踩到。
   rm -f /etc/systemd/system/{pdg-bot,pdg-probe81,pdg-mitm,mosdns,mihomo,sing-box,pdg-rules-update,pdg-health}.service \
+        /etc/systemd/system/pdg-rescue.socket /etc/systemd/system/pdg-rescue.service \
+        /run/systemd/system/pdg-rescue.socket /run/systemd/system/pdg-rescue.service \
         /etc/systemd/system/{pdg-rules-update,pdg-health}.timer \
         /etc/systemd/journald.conf.d/50-pdg.conf 2>/dev/null || true
   rm -rf /etc/privdns-gateway /etc/mosdns /etc/mihomo /etc/sing-box /opt/pdg-bot \
