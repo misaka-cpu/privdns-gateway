@@ -67,8 +67,10 @@ if not _m:
 DISPATCH = _m.group(0)
 
 ARM = re.compile(r"^\s*(?P<pat>[^)]*?)\)\s*(?P<body>.*?);;")
-# 命令位上出现但不是"被分发的目标"的东西
-NOT_A_TARGET = {"shift", "true", "false", "echo", "need_root", "return", "exit", ":"}
+# 命令位上出现但不是"被分发的目标"的东西。
+# _lock 与 need_root 同类: 都是执行前的门(权限 / 全局互斥), 不是这条命令要干的事。
+# __migrate 从 v1.8.1 起显式上锁 —— 更新子进程复用父进程继承来的那把, 用户手打时自己去取。
+NOT_A_TARGET = {"shift", "true", "false", "echo", "need_root", "_lock", "return", "exit", ":"}
 
 arms = []          # [(names, body, primary, shifts)]
 unparsed = []
@@ -116,6 +118,7 @@ HARNESS = [
     "_recv(){ local n=\"$1\"; shift; printf 'CALL %s' \"$n\"; "
     "local a; for a in \"$@\"; do printf ' [%s]' \"$a\"; done; printf '\\n'; }",
     "need_root(){ :; }",
+    "_lock(){ :; }",          # 门, 不是分发目标 —— 与 need_root 同样桩掉
 ]
 HARNESS += ["%s(){ _recv %s \"$@\"; }" % (s, s) for s in STUBS]
 HARNESS.append(DISPATCH)

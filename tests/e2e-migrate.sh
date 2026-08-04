@@ -288,33 +288,39 @@ grep -q "$applying" /tmp/mig8.log && ok "迁移日志点名了挡路的事务 id
 rm -rf "$TXROOT"; mkdir -p "$TXROOT"
 
 
-# ══ 场景七: 迁移必须能在**持锁的父进程**下完成 ═══════════════════════════════
+# ══ 场景七: 迁移在**持锁的父进程**下完成; 与旁人持锁时被挡住 ═════════════════
 # 真实调用链是 cmd_update(持着 /run/privdns-gateway.lock)→ 子进程 `pdg __migrate` → 各迁移。
-# `__migrate` 自己不取锁, 所以迁移照跑; 但迁移里若去开 Python pdgtx 事务, 抢的是**同一把
-# flock**, 必然拿到 "BUSY: 已有配置操作正在执行" —— 事务回滚, update 照样报成功, 只有 doctor
-# 那条告警露馅。v1.7.1 发布当天 .200 就是这么被挡掉的。
+# 迁移里若去开 Python pdgtx 事务, 抢的是**同一把 flock**, 必然拿到 "BUSY: 已有配置操作正在
+# 执行" —— 事务回滚, update 照样报成功, 只有 doctor 那条告警露馅。v1.7.1 发布当天 .200 就是
+# 这么被挡掉的。
 #
-# 上面几个场景都直接跑 `pdg __migrate`, 没有外层锁持有者, 于是全绿也漏掉了它。这里补上:
-# 另起一个进程按住锁, 再跑迁移, 结果必须与不持锁时一致。
-echo; echo "── 场景七: 有人按着 pdg 锁时, 迁移仍要完成 ──"
+# 这个场景原来用"另起一个进程按住锁"来近似 cmd_update 的处境。那时 `__migrate` 自己完全
+# 不取锁, 两者看起来等价 —— 但它们从来就不是一回事:
+#   · cmd_update 的子进程**继承**父进程那个已经持锁的 fd, 用的是同一把锁;
+#   · 旁人按住锁时, `__migrate` 是个**毫无关系的第三方**, 它去改 unit/nft/mosdns/profile
+#     恰恰是全局锁要拦的那种并发写。
+# v1.8.1 把这件事分清楚了(_lock 认继承来的 fd, 认不出就老实去抢), 所以这里也分成两格:
+# 7a 按真实形态构造(父进程持锁并把 fd 传下去), 7b 验反面。
+echo; echo "── 场景七a: cmd_update 那样持锁并传下 fd 时, 迁移照常完成 ──"
 seed_v170_box
 LOCKF="${PDG_LOCKFILE:-/run/privdns-gateway.lock}"
 mkdir -p "$(dirname "$LOCKF")"
-# 按住锁的旁观进程: 与 cmd_update 持锁的效果相同
-flock "$LOCKF" -c 'sleep 120' &
-HOLDER=$!
-sleep 1
-# 确认锁真的被按住了(否则这一条就是空跑)
-if flock -n "$LOCKF" -c true 2>/dev/null; then
-  bad "场景七前置: 锁没被按住, 用例失去意义"
-else
-  ok "前置: 锁确实被占着(等同 cmd_update 持锁时的处境)"
-fi
-bash /usr/local/bin/pdg __migrate >/tmp/mig9.log 2>&1
-kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null || true
+cat > /tmp/mig9-parent.sh <<'MP'
+set -u
+exec 9>"${LOCKF}"
+flock -n 9 || { echo "PARENT-LOCK-FAILED"; exit 9; }
+bash /usr/local/bin/pdg __migrate; echo "CHILD-RC=$?"
+MP
+LOCKF="$LOCKF" bash /tmp/mig9-parent.sh >/tmp/mig9.log 2>&1
+grep -q 'PARENT-LOCK-FAILED' /tmp/mig9.log \
+  && bad "场景七a 前置: 父进程没拿到锁, 用例失去意义" \
+  || ok "前置: 父进程持锁并把 fd 9 传给了子迁移(与 cmd_update 同形)"
+grep -q 'CHILD-RC=0' /tmp/mig9.log \
+  && ok "子迁移复用了继承来的那把锁, 返回 0" \
+  || bad "子迁移没跑通: $(grep -iE 'BUSY|锁|CHILD-RC' /tmp/mig9.log | head -2)"
 
 grep -q 'qname \$explicit_proxy' /etc/mosdns/config.yaml \
-  && ok "持锁时迁移照样完成(没有去抢同一把 flock)" \
+  && ok "持锁时迁移照样完成(复用同一把锁, 没有去抢第二把)" \
   || bad "被锁挡住了: $(grep -iE 'BUSY|事务|锁' /tmp/mig9.log | head -2)"
 grep -qi 'BUSY' /tmp/mig9.log && bad "迁移日志里出现了 BUSY(说明还在走 pdgtx 事务)" \
   || ok "迁移日志里没有 BUSY"
@@ -328,6 +334,32 @@ cmp -s /tmp/m7 /etc/mosdns/config.yaml && ok "持锁迁移后仍然幂等" || ba
 ls /etc/mosdns/config.yaml.preexplicit.* >/dev/null 2>&1 \
   && bad "成功后没清掉迁移备份: $(ls /etc/mosdns/config.yaml.preexplicit.* | head -1)" \
   || ok "成功后迁移备份已清理"
+
+echo; echo "── 场景七b: 与迁移毫无关系的第三方按着锁时, 迁移必须被挡住且一字未改 ──"
+# 这一格是七a 的反面, 也是全局锁存在的理由: 别人正在写配置时, 迁移去改 unit/nft/mosdns/
+# profile 就是并发写。它必须报 BUSY 并**一个字节都不动**, 而不是"反正我是迁移我先上"。
+seed_v170_box
+cp /etc/mosdns/config.yaml /tmp/m7b
+: > "$LOCKF"
+( exec 9>"$LOCKF"; flock -n 9 || exit 1; : > /tmp/mig9b.held
+  while [[ -e /tmp/mig9b.holding ]]; do sleep 0.05; done ) &
+HOLDER=$!
+: > /tmp/mig9b.holding
+# 上面两句顺序反了会立刻松手 —— 先建标记再起后台会有竞态, 所以这里等它报到
+for _i in $(seq 1 60); do [[ -e /tmp/mig9b.held ]] && break; sleep 0.05; done
+if [[ -e /tmp/mig9b.held ]] && ! flock -n "$LOCKF" -c true 2>/dev/null; then
+  ok "前置: 第三方确实按住了锁"
+else
+  bad "场景七b 前置: 锁没被按住, 用例失去意义"
+fi
+setsid bash -c 'exec 9<&-; bash /usr/local/bin/pdg __migrate' >/tmp/mig9b.log 2>&1; RC9B=$?
+rm -f /tmp/mig9b.holding; wait "$HOLDER" 2>/dev/null || true; rm -f /tmp/mig9b.held
+[[ "$RC9B" != 0 ]] && ok "第三方持锁时独立迁移返回非零(rc=$RC9B)" \
+  || bad "竟然拿到了锁并跑完了(rc=$RC9B)"
+grep -q '已有 pdg 操作在运行' /tmp/mig9b.log \
+  && ok "明确告知有别的 pdg 操作在跑" || bad "没说清为什么退出: $(head -2 /tmp/mig9b.log)"
+cmp -s /tmp/m7b /etc/mosdns/config.yaml \
+  && ok "被挡住时现网配置逐字节未动" || bad "挡住了却还是改了配置"
 
 
 # ══ 场景八: 老机器上按现有规则集补出派生劫持表 ═════════════════════════════════

@@ -90,9 +90,40 @@ _pdg_nft_strip_gms(){
 # 串行化"会写配置/重启服务"的操作(update/rollback/snapshot), 防 bot 更新按钮与命令行并发。
 # 嵌套调用(update→snapshot)只锁一次。read-only 操作(status/doctor/report/log)不加锁。
 LOCK="${PDG_LOCKFILE:-/run/privdns-gateway.lock}"
+# 每个进程启动时无条件清空。**绝不接受从环境继承的"我已持锁"** —— PDG_LOCKED 只是本进程
+# 内部的备忘(避免 update→snapshot 这种嵌套调用重复上锁), 不是凭据。任何人都能
+# `PDG_LOCKED=1 pdg update`, 那样一句 export 就能把并发保护整个绕过去。
 PDG_LOCKED=""
+
+# fd 9 上是不是**父进程传下来的、已经持有的那把锁**?
+#
+# 为什么需要这个: cmd_update 全程持锁, 中途要用**刚装好的新脚本**跑一次迁移
+# (`bash /usr/local/bin/pdg __migrate`)。子进程里再走一遍 `exec 9>"$LOCK"` 是**重新 open**,
+# 得到一个新的 open file description —— 它并不持有那把锁, 于是 flock 撞上父进程自己, 迁移
+# 当场 exit 1, 更新回滚。v1.7.8 → v1.8.0 首次启用救援平面的用户踩的就是这条。
+#
+# 判据必须是"这个 fd 确实就是那把锁", 三步缺一不可:
+#   1. fd 9 得是打开的 —— 但"fd 号存在"什么都不说明, 它可能是任何东西;
+#   2. 它指向的必须**就是 $LOCK 这个文件本身**。比路径字符串不算数: /proc 里的路径可以是
+#      符号链接、可以被 bind mount 换掉、文件也可能被删了重建。只有设备号 + inode 说了算;
+#   3. 在这个 fd 上**真跑一次非阻塞 flock**。同一个 OFD 已经持锁时它直接成功; 锁在别人手里
+#      时它失败。这一步才是凭据 —— 前两步只是防止认错文件, 不能代替它。
+# 三步全过才算数。任何一步不过就当没有继承, 老老实实自己去开、自己去抢。
+_lock_inherited(){
+  [[ -e "/proc/$$/fd/9" ]] || return 1
+  local a b
+  a="$(stat -Lc '%d:%i' "/proc/$$/fd/9" 2>/dev/null)" || return 1
+  b="$(stat -Lc '%d:%i' "$LOCK" 2>/dev/null)" || return 1
+  [[ -n "$a" && "$a" == "$b" ]] || return 1
+  flock -n 9 2>/dev/null || return 1
+  return 0
+}
+
 _lock(){
   [[ -n "$PDG_LOCKED" ]] && return 0
+  # 先看有没有继承来的锁(更新子进程走这条), 有就复用同一把 —— 父进程仍然持着它, 期间
+  # 任何**没有继承 fd** 的第三方(另一个 CLI、Bot、pdgtx)照样抢不到。
+  if _lock_inherited; then PDG_LOCKED=1; return 0; fi
   # 打不开锁文件 → **拒绝执行**(fail-closed)。以前这里 `|| return 0` 继续往下写: 而
   # /run 出问题往往正意味着系统不正常, 恰恰是最不该让两个进程同时改配置的时候。
   if ! exec 9>"$LOCK" 2>/dev/null; then
@@ -3838,7 +3869,12 @@ cmd_tx(){
 # tests/test-cli-dispatch.py 把这段 case 抽出来逐条跑, 不是靠这条注释守着。
 case "${1:-menu}" in
   menu|"")       menu;;
-  __migrate)     need_root __migrate; run_all_migrations;;   # 内部: cmd_update 装好新脚本后据此跑"新版"迁移
+  # 内部: cmd_update 装好新脚本后据此跑"新版"迁移。
+  # **显式上锁**, 不靠"反正下游某个函数会锁"。迁移会改 unit / nft / mosdns / profile,
+  # 这期间必须独占。两种来路都要照顾到, 而 _lock 自己分得清:
+  #   · 由 cmd_update 调起 → 继承父进程那把锁, 复用同一个 OFD(不重开、不重抢);
+  #   · 用户手打 sudo pdg __migrate → 没有可继承的 fd, 自己去取, 取不到就 BUSY 退出。
+  __migrate)     need_root __migrate; _lock; run_all_migrations;;
   migrate)       cmd_migrate;;
   tx)            shift || true; cmd_tx "$@";;
   status|st)     cmd_status;;

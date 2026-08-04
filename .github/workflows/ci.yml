@@ -156,6 +156,9 @@ jobs:
       - name: "update 关键步骤故障注入 (git reset/必需文件/迁移/内核/daemon-reload 失败均回滚且不谎报成功)"
         run: bash tests/test-update-faults.sh
 
+      - name: "全局锁继承八格 (父锁复用/独立取锁/BUSY/环境变量伪造/错文件/inode 变更/并发/释放)"
+        run: bash tests/test-lock-inherit.sh
+
       - name: "内核热切回归 (check/重启不稳定均还原旧核; 稳定后才删 .prev; 快照含内核二进制)"
         run: bash tests/test-core-swap.sh
 
@@ -524,6 +527,10 @@ jobs:
           - e2e-cli-ops.sh
           - e2e-config-transaction.sh
           - e2e-config-transaction-recovery.sh
+          # v1.8.1 修的那条: v1.7.8 的更新器持着全局锁, 新版迁移在首次启用救援平面时
+          # 撞上这把锁 → __migrate 退出 → 整次更新回滚。它只在"旧脚本装新版"这条路上
+          # 出现, 而且 --dry-run 复现不了(不跑迁移), 所以必须在 CI 里真跑一遍五种救援状态。
+          - e2e-rescue-migration-lock.sh
     name: "E2E ${{ matrix.script }}"
     steps:
       - name: "先装 git(必须在 checkout 之前)"
@@ -575,6 +582,7 @@ jobs:
           PDG_SERIAL_SCRIPTS: >-
             e2e-migrate.sh e2e-exit-rule.sh e2e-drop-singbox.sh e2e-custom-nft.sh
             e2e-cross-version-rollback.sh e2e-install.sh e2e-install-nft.sh
-            e2e-platform-switch.sh e2e-update.sh e2e-upgrade-from-release.sh e2e-wloc.sh e2e-cli-ops.sh
+            e2e-platform-switch.sh e2e-update.sh e2e-upgrade-from-release.sh e2e-wloc.sh e2e-cli-ops.sh \
+            e2e-rescue-migration-lock.sh
             e2e-config-transaction.sh e2e-config-transaction-recovery.sh
         run: bash tests/e2e-serial-hermetic.sh
