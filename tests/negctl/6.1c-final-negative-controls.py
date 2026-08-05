@@ -396,6 +396,38 @@ def b18():
 nc(18, "nftlive.py 从安装清单或 CI 覆盖中消失", b18,
    ["tests/test-install-closure.py", "tests/test-ci-coverage.py"])
 
+R = "tests/test-rescue-intent-matrix.py"
+
+# ══ 19. 启用判据改回"只要有 bind 就算启用" ═════════════════════════════════
+# 这正是本轮修掉的那个: bind 是监听地址配置, `pdg rescue disable` 保留它是既定行为。
+# 拿它当开关用, 一台停用过救援平面的机器就会被判成"已启用却没放行" → doctor fail →
+# `pdg update` 的更新后自检门整次回滚。
+def b19():
+    s = read("deploy/bot/checks.py")
+    s = sub(s, "    if intent is None:\n"
+               "        # 从未部署: 首次启用归 migrate_rescue_plane 管, 这里不猜、不显示。",
+            "    intent = \"1\" if bind else None      # ← 改回从 bind 推\n"
+            "    if intent is None:\n"
+            "        # 从未部署: 首次启用归 migrate_rescue_plane 管, 这里不猜、不显示。",
+            "启用判据改回从 bind 推")
+    write("deploy/bot/checks.py", s)
+
+
+nc(19, "启用判据改回「只要有 bind 就算启用」", b19, [R])
+
+# ══ 20. intent=0 时直接跳过全部检查 ════════════════════════════════════════
+# 反方向: 图省事把"已停用"当成"不用看了"。那样"停用了但放行还在"这种暴露面就没人发现了。
+def b20():
+    s = read("deploy/bot/checks.py")
+    s = sub(s, '    if intent == "0":\n        if leftover:',
+            '    if intent == "0":\n        return None          # ← 停用就整项跳过\n'
+            '    if intent == "0":\n        if leftover:',
+            "intent=0 时跳过全部检查")
+    write("deploy/bot/checks.py", s)
+
+
+nc(20, "intent=0 时直接跳过全部检查(漏掉残留放行)", b20, [R])
+
 print("\n" + "═" * 66)
 for num, title, red, det in RESULTS:
     mark = "✅" if red else "❌"
