@@ -364,13 +364,19 @@ expect("7 rescue 关, 无救援放行", c, ok_=True, kinds=[], dkinds=[], l8=L.P
  else bad)("[7 rescue 关] 救援口(%d)不在 nftlive 的任何固定端口集合里" % RESCUE_PORT)
 
 
-def rescue_cell(bind, port, conf_text):
-    """救援那一项走它自己的检查(动态端口 + 启用状态), 与 nftlive 无关。"""
+def rescue_cell(bind, port, conf_text, intent=None):
+    """救援那一项走它自己的检查(动态端口 + 启用状态), 与 nftlive 无关。
+
+    intent 必须显式给 —— 启用与否只看 PDG_RESCUE_ENABLED, 不从 bind 推(bind 是监听地址
+    配置, disable 会保留它)。以前这里只设 bind 就叫"rescue 开启", 那是照着旧的错判据写的。
+    """
     import rescue_const
     import rescue_nft  # noqa: F401  仅确认可导入
-    _b, _p = rescue_const.rescue_bind, rescue_const.port
+    _b, _p, _pv = rescue_const.rescue_bind, rescue_const.port, rescue_const.profile_value
     rescue_const.rescue_bind = lambda *a, **k: bind
     rescue_const.port = lambda *a, **k: port
+    rescue_const.profile_value = lambda k, profile=None: (
+        intent if k == "PDG_RESCUE_ENABLED" else _pv(k, profile))
     path = os.path.join(BOX, "nft-rescue.conf")
     _io.open(path, "w", encoding="utf-8").write(conf_text)
     _c = checks.NFT_CONF
@@ -379,6 +385,7 @@ def rescue_cell(bind, port, conf_text):
         return checks.check_rescue_firewall()
     finally:
         rescue_const.rescue_bind, rescue_const.port = _b, _p
+        rescue_const.profile_value = _pv
         checks.NFT_CONF = _c
 
 
@@ -398,22 +405,22 @@ def _rescue_line(port, bind="10.77.0.9"):
     import rescue_nft
     return rescue_nft.rule_line(CIDR, bind, port) + "\n"
 
-r = rescue_cell("", RESCUE_PORT, _BASE_CONF % "")
+r = rescue_cell("", RESCUE_PORT, _BASE_CONF % "", intent="0")
 (ok if r is None else bad)("[7 rescue 关] 救援未启用 → doctor 整项不显示(实得 %r)" % (r,))
 
 # 8. rescue 开启且动态端口正确
-r = rescue_cell("10.77.0.9", RESCUE_PORT, _BASE_CONF % _rescue_line(RESCUE_PORT))
+r = rescue_cell("10.77.0.9", RESCUE_PORT, _BASE_CONF % _rescue_line(RESCUE_PORT), intent="1")
 (ok if r and r[0] == "ok" else bad)("[8 rescue 开, 救援口就位] doctor ok(实得 %r)" % (r,))
 # 端口是**动态**的: 换一个也要照样认出来, 而不是死盯默认值
-r = rescue_cell("10.77.0.9", ALT_PORT, _BASE_CONF % _rescue_line(ALT_PORT))
+r = rescue_cell("10.77.0.9", ALT_PORT, _BASE_CONF % _rescue_line(ALT_PORT), intent="1")
 (ok if r and r[0] == "ok" else bad)("[8 rescue 开, 自定义端口 %d] doctor ok(实得 %r)" % (ALT_PORT, r))
-r = rescue_cell("10.77.0.9", ALT_PORT, _BASE_CONF % _rescue_line(RESCUE_PORT))
+r = rescue_cell("10.77.0.9", ALT_PORT, _BASE_CONF % _rescue_line(RESCUE_PORT), intent="1")
 (ok if r and r[0] == "fail" else bad)(
     "[8 rescue 开] 配置里是 %d 而实际端口是 %d → fail(不是死盯默认值就报绿, 实得 %r)"
     % (RESCUE_PORT, ALT_PORT, r))
 
 # 9. rescue 开启但放行缺失 → doctor 点名; linkstat 不受影响
-r = rescue_cell("10.77.0.9", RESCUE_PORT, _BASE_CONF % "")
+r = rescue_cell("10.77.0.9", RESCUE_PORT, _BASE_CONF % "", intent="1")
 (ok if r and r[0] == "fail" and str(RESCUE_PORT) in r[2] else bad)(
     "[9 rescue 开, 缺放行] doctor 点名(实得 %r)" % (r,))
 c = Cell(kernel("android"))

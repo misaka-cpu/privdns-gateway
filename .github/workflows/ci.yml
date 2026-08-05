@@ -308,6 +308,11 @@ jobs:
       - name: "沙箱 nft 桩契约 (状态派生而非常量/表不在非零/空输入仍 fail-closed/双平台不串台)"
         run: python3 tests/test-nftjson-stub.py
 
+      # bind 是监听地址配置, `pdg rescue disable` 保留它是既定行为。拿它当"启没启用"用,
+      # 停用过救援平面的机器会被判成"已启用却没放行" → doctor fail → 更新整次回滚。
+      - name: "救援启用判据状态矩阵 (只看 PDG_RESCUE_ENABLED/停用后残留仍要发现/值损坏 fail-closed)"
+        run: python3 tests/test-rescue-intent-matrix.py
+
       - name: "nft 语义判据 (nft 自身规范化不算漂移: 集合折叠/reject 默认展开/协议别名)"
         run: python3 tests/test-nft-live-semantics.py
 
