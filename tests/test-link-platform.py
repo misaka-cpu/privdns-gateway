@@ -48,27 +48,56 @@ else:
         % ("probe81.py" in rt_block, "probe81.py" in ios_block))
 
 print()
-print("── 2. Android: 第 3 层必须 SKIP, 不能报缺失 ──")
-fa = L.collect(platform="android")
-l3 = by_layer(fa, 3)
-if len(l3) == 1 and l3[0]["status"] == L.SKIP and l3[0]["code"] == "L3_PLATFORM_NA":
-    ok("Android 的第 3 层是 SKIP / L3_PLATFORM_NA")
+print("── 2. 第 3 层: probe81 已是两平台公共件, 判据不再按平台分岔 ──")
+# 契约变更备案(勿改回去): 6.1A 时 probe81 是 iOS 专属, 所以第 3 层在 Android 上 SKIP。
+# **6.1B 把它转成了 Android/iOS 公共组件** —— 手机链路测试的 HTTP 探测端点两平台都用它。
+# 旧断言("Android 第 3 层必须 SKIP / L3_PLATFORM_NA")因此不再成立, 而且它在 `.153` 真机上
+# 直接造成了误导: 同一台机器 probe81 active、:81 在听、nft 有放行、curl 200、doctor 报绿,
+# linkstat 却说"Android 不安装 pdg-probe81, 也不监听/放行 81"。判据现在两平台同形。
+_orig_run = L.checks._run
+
+
+def _with_probe(code):
+    """把 curl 探测端点这一步换成给定的 HTTP 码, 其余命令交回真实现。"""
+    def _r(cmd, t=10):
+        if cmd and cmd[0] == "curl":
+            return (0, code, "")
+        return _orig_run(cmd, t)
+    return _r
+
+
+for _plat in ("android", "ios"):
+    L.checks._run = _with_probe("200")
+    try:
+        _l3 = by_layer(L.collect(platform=_plat), 3)
+    finally:
+        L.checks._run = _orig_run
+    if len(_l3) == 1 and _l3[0]["status"] == L.PASS and _l3[0]["code"] == "L3_SERVER_PROBE_READY":
+        ok("%s: 端点返回 200 → PASS / L3_SERVER_PROBE_READY" % _plat)
+    else:
+        bad("%s 第 3 层不对: %r" % (_plat, [(f["status"], f["code"]) for f in _l3]))
+
+for _plat in ("android", "ios"):
+    L.checks._run = _with_probe("000")
+    try:
+        _l3 = by_layer(L.collect(platform=_plat), 3)
+    finally:
+        L.checks._run = _orig_run
+    if _l3 and _l3[0]["status"] == L.FAIL:
+        ok("%s: 端点不通 → FAIL(两平台同一判据, 不再有平台豁免)" % _plat)
+    else:
+        bad("%s 端点不通却没判 FAIL: %r" % (_plat, [(f["status"], f["code"]) for f in _l3]))
+
+# 标题不再自称 iOS 专属
+L.checks._run = _with_probe("200")
+try:
+    _t3 = by_layer(L.collect(platform="android"), 3)[0]["title"]
+finally:
+    L.checks._run = _orig_run
+if "iOS" not in _t3:
+    ok("第 3 层标题不再自称 iOS 专属(实得 %r)" % _t3)
 else:
-    bad("Android 第 3 层不对: %r" % [(f["status"], f["code"]) for f in l3])
-if l3 and l3[0]["platform"] == "android":
-    ok("该条目标注 platform=android")
-else:
-    bad("平台标注不对: %r" % (l3[0]["platform"] if l3 else None))
-# 最要紧的一条: Android 不许因为没有 probe81 而出现任何 FAIL
-android_fails = [f["code"] for f in fa if f["status"] == L.FAIL and f["layer"] == 3]
-if not android_fails:
-    ok("**Android 不会因为没有 probe81 而判 FAIL**")
-else:
-    bad("Android 竟然因 probe81 判了 FAIL: %r" % android_fails)
-if L.exit_code([f for f in fa if f["layer"] == 3]) == 0:
-    ok("Android 的第 3 层不影响退出码")
-else:
-    bad("Android 第 3 层拖累了退出码")
+    bad("标题仍写着 iOS: %r" % _t3)
 
 print()
 print("── 3. iOS: 第 3 层要真去检查服务器就绪 ──")
@@ -78,10 +107,11 @@ if len(l3i) == 1 and l3i[0]["code"] in ("L3_SERVER_PROBE_READY",):
     ok("iOS 的第 3 层给出 L3_SERVER_PROBE_READY(PASS 或 FAIL 取决于本机是否真起了)")
 else:
     bad("iOS 第 3 层不对: %r" % [(f["status"], f["code"]) for f in l3i])
-if l3i and l3i[0]["platform"] == "ios":
-    ok("该条目标注 platform=ios")
+# 这一层 6.1B 起两平台公用, 所以不再标 platform=ios —— 标了反而会让渲染按平台过滤掉它
+if l3i and l3i[0]["platform"] == "both":
+    ok("该条目标注 platform=both(probe81 已是两平台公共件)")
 else:
-    bad("平台标注不对")
+    bad("平台标注不对: %r" % (l3i[0]["platform"] if l3i else None))
 if l3i and l3i[0]["status"] != L.SKIP:
     ok("iOS 不跳过这一层(它是 iOS 的真实依赖)")
 else:
@@ -95,6 +125,7 @@ if l3i and l3i[0]["status"] == L.PASS:
 
 print()
 print("── 4. 文案不串台 ──")
+fa = L.collect(platform="android")
 ta = L.render_text(fa)
 ti = L.render_text(fi)
 # Android 的输出里不该出现 iOS 专属名词的"要求"语气; iOS 的输出里不该出现 GMS

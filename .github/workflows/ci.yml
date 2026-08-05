@@ -313,6 +313,11 @@ jobs:
       - name: "救援启用判据状态矩阵 (只看 PDG_RESCUE_ENABLED/停用后残留仍要发现/值损坏 fail-closed)"
         run: python3 tests/test-rescue-intent-matrix.py
 
+      # `.153` 真机一天内撞到三次同一形状: 读不到必需的值时塞个占位符继续走, 下游拿着必然
+      # 不成立的东西干活, 界面却一切正常。占位符比"不知道"更糟 —— 它看起来像个答案。
+      - name: "缺值必须如实说 (PDG_SERVER_IP fail-closed / DoT 域名不吞成 ? / probe81 两平台公共)"
+        run: python3 tests/test-missing-value-honesty.py
+
       - name: "nft 语义判据 (nft 自身规范化不算漂移: 集合折叠/reject 默认展开/协议别名)"
         run: python3 tests/test-nft-live-semantics.py
 

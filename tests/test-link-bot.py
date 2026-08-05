@@ -54,7 +54,7 @@ os.environ["PDG_PROBE81_RUNTIME_DIR"] = RUNDIR   # linksess 用的是这个(名�
 # (那是 .153 真机 P0 之后定的规矩), 所以沙箱也得把它摆好。
 PROFILE = os.path.join(ROOTFS, "etc", "privdns-gateway", "profile.env")
 with open(PROFILE, "w", encoding="utf-8") as _f:
-    _f.write("PDG_INTERNAL_CIDR=127.0.0.0/8\n")
+    _f.write("PDG_INTERNAL_CIDR=127.0.0.0/8\nPDG_SERVER_IP=127.0.0.1\n")
 os.environ["PDG_PROFILE_ENV"] = PROFILE
 os.environ["PDG_TX_FSROOT"] = ROOTFS
 os.environ["PDG_LOCKFILE"] = os.path.join(ROOTFS, "run", "privdns-gateway.lock")
@@ -132,7 +132,7 @@ def setup(platform="android", server_ready=True):
     # 这一格把"段内"验成"段外"—— 那看起来像产品坏了。要验段外的用例在 setup() 之后
     # 自己改 profile 再建会话。
     with open(PROFILE, "w", encoding="utf-8") as _pf:
-        _pf.write("PDG_INTERNAL_CIDR=127.0.0.0/8\n")
+        _pf.write("PDG_INTERNAL_CIDR=127.0.0.0/8\nPDG_SERVER_IP=127.0.0.1\n")
     S.clear_state()
 
 
@@ -311,7 +311,7 @@ bot.handle_cb(1, 2, "linktest:check")
 # 段内
 S.clear_state()
 setup()
-open(PROFILE, "w").write("PDG_INTERNAL_CIDR=127.0.0.0/8\n")   # 段内基准
+open(PROFILE, "w").write("PDG_INTERNAL_CIDR=127.0.0.0/8\nPDG_SERVER_IP=127.0.0.1\n")   # 段内基准
 bot.handle_cb(1, 2, "linktest:start")
 tok = token_from_last_kb()
 acc, why, _rec = S.consume(tok, "127.0.0.1") if tok else (False, "NO_TOKEN", None)
@@ -328,7 +328,7 @@ kb = EDITS[-1][1] if EDITS else None
 # 段外
 S.clear_state()
 setup()
-open(PROFILE, "w").write("PDG_INTERNAL_CIDR=10.99.0.0/16\n")  # 段外基准: 127.0.0.1 不在其中
+open(PROFILE, "w").write("PDG_INTERNAL_CIDR=10.99.0.0/16\nPDG_SERVER_IP=10.99.0.1\n")  # 段外基准: 127.0.0.1 不在其中
 bot.handle_cb(1, 2, "linktest:start")
 tok = token_from_last_kb()
 if tok: S.consume(tok, "127.0.0.1")

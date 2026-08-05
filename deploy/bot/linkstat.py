@@ -282,11 +282,12 @@ def _l3_probe(ctx):
             3, "L3_SERVER_PROBE_READY", PASS, None, "探测端点(:81)",
             "本机 127.0.0.1:81 返回 200 —— 服务端就绪。"
             "这**不**代表手机经运营商私网连得上它。",
-            evidence_source="本机 curl 127.0.0.1:81", platform="ios")
+            evidence_source="本机 curl 127.0.0.1:81")
     return Finding(
         3, "L3_SERVER_PROBE_READY", FAIL, DEPENDENCY, "探测端点(:81)",
-        "本机 127.0.0.1:81 返回 %s(iOS OnDemand 需要 200)" % (code or "无响应"),
-        evidence_source="本机 curl 127.0.0.1:81", platform="ios",
+        "本机 127.0.0.1:81 返回 %s(手机链路测试的 HTTP 探测端点需要 200)"
+        % (code or "无响应"),
+        evidence_source="本机 curl 127.0.0.1:81",
         next_step="systemctl status pdg-probe81 查看服务。")
 
 

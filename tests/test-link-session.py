@@ -140,7 +140,7 @@ def main():
     print("── 8. 来源只落 /16 与布尔, 不落完整 IP ──")
     d = fresh_dir()
     os.environ["PDG_PROFILE_ENV"] = os.path.join(d, "profile.env")
-    open(os.environ["PDG_PROFILE_ENV"], "w").write("PDG_INTERNAL_CIDR=10.20.0.0/16\n")
+    open(os.environ["PDG_PROFILE_ENV"], "w").write("PDG_INTERNAL_CIDR=10.20.0.0/16\nPDG_SERVER_IP=10.20.0.1\n")
     tok8, rec8 = S.new_session("10.20.0.0/16"); S.write_state(rec8)
     S.consume(tok8, "10.20.33.44")
     raw = open(S._state_path(), encoding="utf-8").read()
@@ -154,7 +154,7 @@ def main():
     # 段外来源
     d = fresh_dir()
     os.environ["PDG_PROFILE_ENV"] = os.path.join(d, "profile.env")
-    open(os.environ["PDG_PROFILE_ENV"], "w").write("PDG_INTERNAL_CIDR=10.20.0.0/16\n")
+    open(os.environ["PDG_PROFILE_ENV"], "w").write("PDG_INTERNAL_CIDR=10.20.0.0/16\nPDG_SERVER_IP=10.20.0.1\n")
     tok8b, rec8b = S.new_session("10.20.0.0/16"); S.write_state(rec8b)
     S.consume(tok8b, "192.168.9.9")
     r8b, _ = S.read_state()
@@ -255,7 +255,7 @@ def main():
     # 真发一个伪造头, 看它有没有被采信
     d = fresh_dir()
     os.environ["PDG_PROFILE_ENV"] = os.path.join(d, "profile.env")
-    open(os.environ["PDG_PROFILE_ENV"], "w").write("PDG_INTERNAL_CIDR=10.20.0.0/16\n")
+    open(os.environ["PDG_PROFILE_ENV"], "w").write("PDG_INTERNAL_CIDR=10.20.0.0/16\nPDG_SERVER_IP=10.20.0.1\n")
     tok12, rec12 = S.new_session("10.20.0.0/16"); S.write_state(rec12)
     srv = HTTPServer(("127.0.0.1", 0), probe81.H)
     port = srv.server_address[1]
@@ -347,7 +347,7 @@ def main():
     # 判断基准, 缺了就该 fail-closed(见 test-link-profile-uid)。这里把基准摆好。
     prof14b = os.path.join(d14b, "profile.env")
     with open(prof14b, "w", encoding="utf-8") as _f:
-        _f.write("PDG_INTERNAL_CIDR=10.20.0.0/16\n")
+        _f.write("PDG_INTERNAL_CIDR=10.20.0.0/16\nPDG_SERVER_IP=10.20.0.1\n")
     env = dict(os.environ, PDG_PROBE81_RUNTIME_DIR=d14b, PDG_PROFILE_ENV=prof14b)
     os.environ["PDG_PROFILE_ENV"] = prof14b
     r = subprocess.run([sys.executable, str(ROOT / "deploy/bot/linksess.py"),

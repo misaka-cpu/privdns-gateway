@@ -112,6 +112,7 @@ def main():
     profile = os.path.join(etc, "profile.env")
     with open(profile, "w", encoding="utf-8") as f:
         f.write("PDG_INTERNAL_CIDR=172.22.0.0/16\n")
+        f.write("PDG_SERVER_IP=172.22.0.1\n")     # 第 1 步链接的必需材料
         f.write("PDG_RESCUE_TOKEN=%s\n" % SENTINEL)     # 模拟同文件里的其它敏感项
     os.chmod(profile, 0o600)               # 与真机一致: root 独占
     os.chown(profile, 0, 0)
@@ -185,6 +186,7 @@ def main():
     # ── 会话快照语义: 建完之后改 profile.env, 本次结论不受影响 ────────────────
     with open(profile, "w", encoding="utf-8") as f:
         f.write("PDG_INTERNAL_CIDR=10.99.0.0/16\n")      # 换成一个**不含** 172.22.5.9 的段
+        f.write("PDG_SERVER_IP=10.99.0.1\n")     # 第 1 步链接的必需材料
         f.write("PDG_RESCUE_TOKEN=%s\n" % SENTINEL)
     os.chmod(profile, 0o600); os.chown(profile, 0, 0)
     rec2, why2 = S.read_state()
@@ -220,6 +222,7 @@ def main():
     # ── 旧 schema 状态 → fail-closed, 不静默补字段 ──────────────────────────
     with open(profile, "w", encoding="utf-8") as f:
         f.write("PDG_INTERNAL_CIDR=172.22.0.0/16\n")
+        f.write("PDG_SERVER_IP=172.22.0.1\n")     # 第 1 步链接的必需材料
     os.chmod(profile, 0o600); os.chown(profile, 0, 0)
     S.clear_state()
     okk4, _p4 = S.start_session()
@@ -250,6 +253,7 @@ def main():
     # ── consume() 这条路不许碰 profile.env(陷阱式判据, 不靠"看起来没读")───────
     with open(profile, "w", encoding="utf-8") as f:
         f.write("PDG_INTERNAL_CIDR=172.22.0.0/16\n")
+        f.write("PDG_SERVER_IP=172.22.0.1\n")     # 第 1 步链接的必需材料
     os.chmod(profile, 0o600); os.chown(profile, 0, 0)
     S.clear_state()
     okk6, p6 = S.start_session()
