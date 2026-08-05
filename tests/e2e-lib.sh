@@ -444,11 +444,37 @@ case "$verb" in
 esac
 exit 0
 S
+  # 有状态的 nft 桩。以前这里是 `echo …; exit 0` —— 对 `nft -j list table inet pdg` 什么都
+  # 不返回, 而 nftlive 读的正是那个。它按设计 fail-closed(读不到内核 = 不知道现在放行了
+  # 什么, 绝不当成没问题), 于是更新后自检判红、整次 update 回滚: 测出来的是桩的病, 而排查
+  # 时最顺手的"修法"恰恰是最坏的 —— 把 fail-closed 降成 WARN。所以桩得做真。
+  #
+  #   -f FILE            装载: 把内容记成当前"内核状态"
+  #   list …             文本查询: 回放状态(去掉注释 —— 真 nft 不会把配置注释吐回来)
+  #   -j list table F T  JSON 查询: 由**当前状态**转换而来, 见 tests/nftjson.py
+  #                      表不在就非零退出, 绝不返回一个"看着健康"的空壳
+  #   -c                 只校验, 不改状态
+  # 转换逻辑只此一份(nftjson.py), 不在各个 e2e 脚本里各抄一遍。
+  cp "$E2E_ROOT/tests/nftjson.py" /usr/local/bin/pdg-nftjson.py 2>/dev/null || true
   cat > /usr/local/bin/nft <<'S'
 #!/bin/sh
+STATE=/tmp/e2e-nft-ruleset
 echo "nft $*" >> /tmp/e2e-calls.log
+if [ "$1" = "-j" ]; then
+  # -j list table <family> <name>
+  fam="$4"; tab="$5"
+  [ -s "$STATE" ] || { echo "Error: No such file or directory" >&2; exit 1; }
+  exec python3 /usr/local/bin/pdg-nftjson.py "${fam:-inet}" "${tab:-pdg}" < "$STATE"
+fi
+case "$1" in
+  -c) exit 0 ;;
+  -f) [ -f "$2" ] && cat "$2" > "$STATE"; exit 0 ;;
+  list) sed -e 's/#.*$//' "$STATE" 2>/dev/null | grep -v '^[[:space:]]*$'; exit 0 ;;
+  delete) : > "$STATE"; exit 0 ;;
+esac
 exit 0
 S
+  : > /tmp/e2e-nft-ruleset
   chmod 755 /usr/local/bin/systemctl /usr/local/bin/nft
   : > /tmp/e2e-calls.log
 }
@@ -545,6 +571,9 @@ e2e_seed_mosdns(){
 e2e_seed_nft(){
   sed -e "s|__SSH_PORT__|22|g" -e "s|__INTERNAL_CIDR__|$E2E_CIDR|g" -e "s|__SERVER_IP__|$E2E_SIP|g" \
       "$E2E_ROOT/deploy/firewall/nftables-mihomo.conf" > /etc/nftables.conf
+  # 真机上装完会 `nft -f` 应用一次, 内核里于是有这份规则。桩的"内核状态"同步过去,
+  # 否则磁盘有、内核空, doctor 会如实判"读不到内核规则"——那是夹具不像真的。
+  cp /etc/nftables.conf /tmp/e2e-nft-ruleset 2>/dev/null || true
 }
 
 e2e_seed_singbox_model(){
