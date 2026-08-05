@@ -79,32 +79,13 @@ _prev_sha="$(git -C "$E2E_ROOT" rev-parse "$PREV^{commit}")"
 # 失败原因与被测对象毫无关系。每格进场先把这些清干净。
 rm -rf /tmp/e2e-svc /tmp/e2e-nft-ruleset /tmp/e2e-calls.log /tmp/rml-*.log /tmp/mig9* 2>/dev/null || true
 e2e_stub_system
-# e2e_stub_system 的 nft 桩对什么都回 0 且不留状态 —— 而救援放行的收尾判据是"磁盘与内核都
-# **恰好一条**", 无状态的桩会让内核侧永远数出 0, 于是启用必然自我回滚, 测出来的是桩的病。
-# 换成有状态的那一版(与 e2e-custom-nft.sh 同形): -f 装载写进状态文件, list 读回来。
-cat > /usr/local/bin/nft <<'S'
-#!/bin/sh
-STATE=/tmp/e2e-nft-ruleset
-echo "nft $*" >> /tmp/e2e-calls.log
-case "$1" in
-  -c) exit 0 ;;
-  -f) [ -f "$2" ] && cat "$2" > "$STATE"; exit 0 ;;
-  # 真 nft 打印的是**内核里的规则**, 不会把配置文件里的注释原样吐回来。桩必须照做:
-  # 生产模板里有一行 `# 你自己的放行规则放这里(… 如 \`tcp dport 80 accept\`)`, 原样回显
-  # 会让 doctor 的文本判据把这句说明当成"80 对全网开放"而判红 —— 那是桩不像真的, 不是
-  # 防火墙有问题。(顺带记一笔: 这也说明按文本认规则本身就脆, 见报告 P2。)
-  list) sed -e 's/#.*$//' "$STATE" 2>/dev/null | grep -v '^[[:space:]]*$'; exit 0 ;;
-  delete) exit 0 ;;
-esac
-exit 0
-S
-chmod 755 /usr/local/bin/nft
-: > /tmp/e2e-nft-ruleset
+# 共享桩(e2e-lib.sh)现在是**状态派生**的: -f 装载、list 回放、-j 由当前状态转成 JSON。
+# 这里原本自带一份私有桩, 理由是共享桩没状态 —— 那个理由已经不成立了, 而且它不认 `-j`,
+# 留着反而会盖住共享桩, 让更新后自检读不到内核。删掉, 只用共享的那一份。
 e2e_seed_install
 e2e_seed_mosdns all
 e2e_seed_singbox_model
 e2e_seed_nft mihomo
-cp /etc/nftables.conf /tmp/e2e-nft-ruleset      # 磁盘与"内核"起点一致
 printf '%s\n' "$PLAT" > /etc/privdns-gateway/platform
 printf 'mihomo\n'     > /etc/privdns-gateway/backend
 mkdir -p /var/lib/privdns-gateway
