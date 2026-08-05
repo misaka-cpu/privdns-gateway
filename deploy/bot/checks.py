@@ -1257,40 +1257,90 @@ def check_nft_input_chains():
     return ("ok", "防火墙链冲突", "只有 table inet pdg 挂在 hook input 上")
 
 
+# 救援启用意图的键名。与 lib/rescue.sh 的 RESCUE_INTENT_KEY 同名 —— 那边是唯一事实源,
+# 这里只是引用它的名字, 不另定义一份取值语义。
+RESCUE_INTENT_KEY = "PDG_RESCUE_ENABLED"
+
+
+def _valid_ipv4(v):
+    """点分四段且每段 0-255。只做形态校验 —— 它不是第二份"能不能启用"的判据,
+    只是把"意图说要开、地址却明显不成立"这种情况和"地址没配"区分开。"""
+    parts = (v or "").split(".")
+    if len(parts) != 4:
+        return False
+    for p in parts:
+        if not p.isdigit() or not 0 <= int(p) <= 255 or (len(p) > 1 and p[0] == "0"):
+            return False
+    return True
+
+
 def check_rescue_firewall():
     """救援平面的防火墙放行 —— 端口是**动态**的, 所以它不在 nftlive 的固定端口集合里。
 
     为什么必须单独一项, 而不是往 nftlive 的必需端口里加那个救援口:
-      · 救援平面默认**是关的**(profile.env 里没有 PDG_RESCUE_BIND 就没启用)。写进固定集合
-        会让每台没开救援的机器都被报"缺规则" —— `.153` 就是这种机器;
-      · 端口取自 lib/rescue.sh 的 PDG_RESCUE_PORT(有默认值), 用户可以改, 把它硬编码进代码会在
-        改过的机器上查错端口, 报一个不存在的故障, 同时放过真正的那个;
-      · 它与 8445(Telegram SOCKS5)是两码事 —— 上一轮把 8445 当成救援平面, 这里不再混。
+      · 救援平面默认**是关的**。写进固定集合会让每台没开救援的机器都被报"缺规则";
+      · 端口取自 lib/rescue.sh 的 PDG_RESCUE_PORT(有默认值), 用户可以改, 把它硬编码进代码
+        会在改过的机器上查错端口, 报一个不存在的故障, 同时放过真正的那个;
+      · 它与 Telegram SOCKS5 那个口是两码事 —— 早先混过一次, 这里不再混。
 
-    救援关着 → 返回 None(整项不显示), 而不是"正常": 没启用的功能不该在报告里占一行。"""
+    **启用与否只看 PDG_RESCUE_ENABLED, 不从 bind 推。** `pdg rescue disable` 只撤放行 + 把
+    意图写成 0, 它**不清 PDG_RESCUE_BIND** —— 监听地址是配置, 留着下次好直接开。拿"有没有
+    bind"当"启没启用"用, 一台停用过的机器会被判成"已启用却没放行", doctor fail, 而
+    `pdg update` 的更新后自检门据此**整次回滚**: 机器完全正常, 用户却更新不了。
+
+    停用之后也不是什么都不看: 意图是 0 却仍有带 pdg-rescue 标记的放行, 说明端口还开着 ——
+    那是暴露面, 必须报出来, 不能因为"反正已经停用了"就放过。
+    """
     try:
         import rescue_const
         import rescue_nft
     except Exception:  # noqa: BLE001
         return None                      # 老机器还没有救援平面: 不显示这一项
-    # 先看启不启用, 再去读端口。反过来的话, 一台没开救援、又恰好读不到 lib/rescue.sh 的机器
-    # 会平白多出一条警告 —— 它根本没在用这个功能。
     try:
+        intent = rescue_const.profile_value(RESCUE_INTENT_KEY)
         bind = rescue_const.rescue_bind()
-    except Exception:  # noqa: BLE001
-        return None
-    if not bind:
-        return None                      # 未启用
-    try:
         port = rescue_const.port()
-    except Exception as e:  # noqa: BLE001
-        return ("warn", "救援平面放行", "救援平面已启用, 但读不到它的端口常量(%s), "
-                "无法确认放行是否就位" % type(e).__name__)
+    except Exception:  # noqa: BLE001
+        # 常量源(lib/rescue.sh / profile.env)读不到 —— 这时连"用没用这个功能"都判断不了。
+        # 不显示这一项: 报一条"读不到常量"的警告只会在没装救援平面的机器上平白刷屏。
+        return None
     try:
         with open(NFT_CONF, encoding="utf-8") as f:
             txt = f.read()
     except OSError:
-        return ("warn", "救援平面放行", "读不到 %s, 无法确认救援放行是否就位" % NFT_CONF)
+        if intent == "1":
+            return ("warn", "救援平面放行",
+                    "读不到 %s, 无法确认救援放行是否就位" % NFT_CONF)
+        return None
+    # 带 pdg-rescue 标记的放行有几条 —— 停用/未部署时用它发现残留, 不看端口对不对
+    leftover = rescue_nft.count_rules(txt)
+
+    if intent is None:
+        # 从未部署: 首次启用归 migrate_rescue_plane 管, 这里不猜、不显示。
+        # 但**有残留规则**是另一回事: 没有任何启用记录, 端口却开着, 必须如实说。
+        if leftover:
+            return ("fail", "救援平面放行",
+                    "没有启用记录(profile.env 里没有 %s), 防火墙里却有 %d 条救援放行 —— "
+                    "端口开着而没人管它。跑 <code>sudo pdg rescue status</code> 查清来历。"
+                    % (RESCUE_INTENT_KEY, leftover))
+        return None
+    if intent == "0":
+        if leftover:
+            return ("fail", "救援平面放行",
+                    "救援平面已停用, 但防火墙里仍有 %d 条救援放行 —— 端口还开着, 属暴露面。"
+                    "跑一次 <code>sudo pdg rescue disable</code> 把它撤干净。" % leftover)
+        return None                      # disable 之后的正常样子: 不显示
+    if intent != "1":
+        return ("fail", "救援平面放行",
+                "%s 的取值损坏(实得 %r, 只接受 0 或 1)—— 无法判断救援平面该开还是该关, "
+                "拒绝猜。请用 <code>sudo pdg rescue enable</code> 或 "
+                "<code>disable</code> 重新写入。" % (RESCUE_INTENT_KEY, intent))
+    # ── 以下是 intent == "1" ────────────────────────────────────────────────
+    if not bind or not _valid_ipv4(bind):
+        return ("fail", "救援平面放行",
+                "救援平面意图为启用, 但监听地址%s —— 开不起来。"
+                "跑 <code>sudo pdg rescue bind &lt;IPv4&gt;</code> 设置。"
+                % ("不合法(%r)" % bind if bind else "没有配置"))
     if rescue_nft.has_rescue_rule(txt, port, bind):
         return ("ok", "救援平面放行", "救援平面已启用, 防火墙放行就位(%s:%d)" % (bind, port))
     return ("fail", "救援平面放行",

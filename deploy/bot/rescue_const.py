@@ -116,7 +116,11 @@ def profile_value(key, profile=None):
             text = fh.read()
     except OSError:
         return None
-    m = re.findall(r"^[ \t]*%s=[\"']?([^\"'\n]+)" % re.escape(key), text, re.M)
+    # `+` 改 `*`: 键写着但值是空的(`PDG_RESCUE_ENABLED=`)也要能读出来 —— 返回 ""。
+    # 用 `+` 的话空值匹配不上, 于是"键存在但值损坏"和"键根本不存在"在调用方眼里一模一样,
+    # 而这两件事该走的分支完全不同(前者要 fail-closed 点名损坏, 后者是"从未部署"不显示)。
+    # bash 侧的 _rescue_intent 用 sed 一直是分得清的, python 侧不该比它更迟钝。
+    m = re.findall(r"^[ \t]*%s=[\"']?([^\"'\n]*)" % re.escape(key), text, re.M)
     return m[-1].strip() if m else None
 
 
