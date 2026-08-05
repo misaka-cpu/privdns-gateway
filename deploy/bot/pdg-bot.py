@@ -3998,11 +3998,11 @@ LINK_UNWRITABLE = ("⛔ 无法保存本次测试状态，因此测试未启动�
 # 结果页的键盘。带 token 的 URL 按钮**只在等待中的那一屏**出现, 出结果/取消/过期后一律撤掉。
 LINK_BACK = {"inline_keyboard": [
     [{"text": "🔄 查看结果", "callback_data": "linktest:check"}],
-    [{"text": "🩺 返回自检", "callback_data": "doctor"}],
+    [{"text": "⬅️ 返回客户端", "callback_data": "nav:client"}],
     [{"text": "🏠 主菜单", "callback_data": "menu"}]]}
 LINK_DONE_KB = {"inline_keyboard": [
     [{"text": "📡 再测一次", "callback_data": "linktest"}],
-    [{"text": "🩺 返回自检", "callback_data": "doctor"}],
+    [{"text": "⬅️ 返回客户端", "callback_data": "nav:client"}],
     [{"text": "🏠 主菜单", "callback_data": "menu"}]]}
 
 _linktest_waiters: dict[int, float] = {}     # chat -> 该会话的 expires_at(有界, 防重复点击)
@@ -4112,7 +4112,7 @@ def linktest_start(chat, mid):
         [{"text": "🌐 打开测试页", "url": payload["step1_url"]}],
         [{"text": "🔄 查看结果", "callback_data": "linktest:check"},
          {"text": "✖️ 取消测试", "callback_data": "linktest:cancel"}],
-        [{"text": "🩺 返回自检", "callback_data": "doctor"}],
+        [{"text": "⬅️ 返回客户端", "callback_data": "nav:client"}],
         [{"text": "🏠 主菜单", "callback_data": "menu"}]]}
     edit(chat, mid, "%s\n\n%s\n\n%s" % (LINK_INTRO, LINK_START_HINT, LINK_WAITING), kb)
     with _linktest_lock:
@@ -4163,7 +4163,7 @@ def handle_cb(chat, mid, data):
         edit(chat, mid, LINK_INTRO, {"inline_keyboard": [
             [{"text": "▶️ 开始测试", "callback_data": "linktest:start"}],
             [{"text": "🔄 查看结果", "callback_data": "linktest:check"}],
-            [{"text": "🩺 返回自检", "callback_data": "doctor"}],
+            [{"text": "⬅️ 返回客户端", "callback_data": "nav:client"}],
             [{"text": "🏠 主菜单", "callback_data": "menu"}]]}); return
     if data == "linktest:start":
         linktest_start(chat, mid); return
