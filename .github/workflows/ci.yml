@@ -318,6 +318,11 @@ jobs:
       - name: "缺值必须如实说 (PDG_SERVER_IP fail-closed / DoT 域名不吞成 ? / probe81 两平台公共)"
         run: python3 tests/test-missing-value-honesty.py
 
+      # 盘上是新代码、跑着的是旧的 —— 从版本号和文件内容看都"已升级", 只有进程还是旧的。
+      # 两天里手工部署踩了两次(菜单缺项 / RuntimeDirectory 没生效)。
+      - name: "换过模块必须重启用它们的服务 (内容变才转/try-restart/失败不转)"
+        run: bash tests/test-deploy-restart.sh
+
       - name: "nft 语义判据 (nft 自身规范化不算漂移: 集合折叠/reject 默认展开/协议别名)"
         run: python3 tests/test-nft-live-semantics.py
 

@@ -33,6 +33,7 @@ TOUCHED = [
     "deploy/bot/linksess.py",
     "deploy/bot/pdg-bot.py",
     "deploy/bot/probe81.py",
+    "deploy/bot/pdg.sh",
     "lib/modules.sh",
     ".github/workflows/ci.yml",
 ]
@@ -473,6 +474,18 @@ def b23():
 
 
 nc(23, "linkstat 第 3 层退回 iOS 专属平台门", b23, [H, "tests/test-link-platform.py"])
+
+# ══ 24. 换过模块却不重启用它们的服务 ═══════════════════════════════════════
+# 两天里手工部署踩了两次: 盘上是新代码、跑着的是旧的。从版本号、文件内容看都"已升级",
+# 只有那个进程还是旧的 —— 属于最难查的一类静默故障。
+def b24():
+    s = read("deploy/bot/pdg.sh")
+    s = sub(s, "  systemctl try-restart $_svcs >/dev/null 2>&1 || true",
+            "  : # 改坏器: 装完不重启", "迁移末尾的 try-restart")
+    write("deploy/bot/pdg.sh", s)
+
+
+nc(24, "换过运行模块却不重启用它们的服务", b24, ["tests/test-deploy-restart.sh"])
 
 print("\n" + "═" * 66)
 for num, title, red, det in RESULTS:
