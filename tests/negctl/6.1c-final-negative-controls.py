@@ -428,6 +428,52 @@ def b20():
 
 nc(20, "intent=0 时直接跳过全部检查(漏掉残留放行)", b20, [R])
 
+H = "tests/test-missing-value-honesty.py"
+
+# ══ 21. start_session 退回"拿占位符顶上" ═══════════════════════════════════
+# `.153` 上就是这么卡住的: PDG_SERVER_IP 缺失 → 拼出 http://<网关IP>:81/... 给用户,
+# 而且会话已经写盘、token 已经发出 —— 一个必然点不通的链接, 界面看不出任何异常。
+def b21():
+    s = read("deploy/bot/linksess.py")
+    s = sub(s, "    ip = _server_ip()\n    if not ip:",
+            "    ip = _server_ip() or \"<网关IP>\"\n    if False:",
+            "start_session 的 PDG_SERVER_IP fail-closed")
+    write("deploy/bot/linksess.py", s)
+
+
+nc(21, "start_session 退回占位符兜底(缺 PDG_SERVER_IP 也发链接)", b21,
+   [H, "tests/test-link-session.py"])
+
+# ══ 22. _dot_host 退回写死路径 + 吞成 "?" ══════════════════════════════════
+# 用户拿着 "?" 去配 Android 私密 DNS, 必然配不上; 而正确的解析就在隔壁 checks._cert_path()。
+def b22():
+    s = read("deploy/bot/pdg-bot.py")
+    s = sub(s, "            import checks\n            cert = checks._cert_path()",
+            "            cert = CERT", "复用 checks._cert_path()")
+    s = sub(s, '            _DOT_HOST = "(读不到 DoT 域名: 证书 %s 不可读)" % cert',
+            '            _DOT_HOST = "?"', "读不到时如实说")
+    write("deploy/bot/pdg-bot.py", s)
+
+
+nc(22, "_dot_host 退回写死路径并把读不到吞成 \"?\"", b22, [H])
+
+# ══ 23. linkstat 第 3 层退回 iOS 专属平台门 ════════════════════════════════
+# probe81 6.1B 起是两平台公共件。退回去就会出现"同一台机器 doctor 报绿、linkstat 说不装"。
+def b23():
+    s = read("deploy/bot/linkstat.py")
+    s = sub(s, "def _l3_probe(ctx):\n",
+            'def _l3_probe(ctx):\n'
+            '    if ctx["platform"] != "ios":\n'
+            '        return Finding(\n'
+            '            3, "L3_PLATFORM_NA", SKIP, None, "iOS 探测端点(:81)",\n'
+            '            "Android 不安装 pdg-probe81, 也不监听/放行 81 —— 该层不适用本平台。",\n'
+            '            evidence_source="/etc/privdns-gateway/platform", platform="android")\n',
+            "第 3 层的平台门")
+    write("deploy/bot/linkstat.py", s)
+
+
+nc(23, "linkstat 第 3 层退回 iOS 专属平台门", b23, [H, "tests/test-link-platform.py"])
+
 print("\n" + "═" * 66)
 for num, title, red, det in RESULTS:
     mark = "✅" if red else "❌"
