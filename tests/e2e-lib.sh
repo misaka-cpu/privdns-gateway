@@ -72,9 +72,13 @@ e2e_reset_box(){
   rm -rf /etc/privdns-gateway /etc/mosdns /etc/mihomo /etc/sing-box /opt/pdg-bot \
          /opt/privdns-gateway /var/lib/privdns-gateway 2>/dev/null || true
   rm -f /etc/nftables.conf.pdg-orig /etc/resolv.conf.pdg-orig 2>/dev/null || true
-  rm -rf /tmp/e2e-svc /tmp/e2e-nft-ruleset /tmp/e2e-calls.log /tmp/e2e-inject \
-         /tmp/e2e-origin.git /tmp/e2e-xver-origin.git /tmp/e2e-cli-origin.git \
-         /tmp/e2e-empty-origin.git 2>/dev/null || true
+  # 桩的状态、假规则集、调用日志、各脚本造的裸库 —— 全在 $E2E_TMP 里。
+  # 这里仍按名字逐个清而不是 rm -rf "$E2E_TMP": 进场重置发生在脚本**中途**(容器模式下
+  # 每个 case 前都会调), 那时探针脚本、pycache 目录等本轮的东西正放在同一个目录里,
+  # 一锅端会把它们一起删掉。整个目录的清理归退出钩子。
+  rm -rf "$E2E_TMP/e2e-svc" "$E2E_TMP/e2e-nft-ruleset" "$E2E_TMP/e2e-calls.log" \
+         "$E2E_TMP/e2e-inject" "$E2E_TMP/e2e-origin.git" "$E2E_TMP/e2e-xver-origin.git" \
+         "$E2E_TMP/e2e-cli-origin.git" "$E2E_TMP/e2e-empty-origin.git" 2>/dev/null || true
   # 前一个脚本装的**桩命令**同样是"上一个脚本留下的状态": e2e-install 会留一个假 curl
   # (下载什么都写 "stub" 几个字节), 下一个脚本想取真内核时就只能拿到一个坏档而整条 skip。
   # 每个脚本都会自己造它需要的桩(e2e_stub_system / 各自的 setup), 进场清掉是安全的。
@@ -88,7 +92,8 @@ e2e_reset_box(){
     rm -f /usr/local/bin/mosdns 2>/dev/null || true      # 小于 1MB = 桩, 不是真 mosdns
   fi
   mkdir -p /var/lib/privdns-gateway /etc/mosdns/rules /etc/sing-box /etc/mihomo \
-           /etc/privdns-gateway /etc/systemd/system /etc/systemd/journald.conf.d /tmp/e2e-svc 2>/dev/null || true
+           /etc/privdns-gateway /etc/systemd/system /etc/systemd/journald.conf.d \
+           "$E2E_TMP/e2e-svc" 2>/dev/null || true
   : > /etc/nftables.conf
   # 清 bash 的命令哈希: 上面刚跑过 mihomo(能力探测)又把它删了, 不清的话后续 `command -v mihomo`
   # 仍会命中缓存里的旧路径, 于是"没有就造个桩"的分支被跳过, 装机改走下载 → 撞上假 curl → SHA 失败。
@@ -175,11 +180,74 @@ e2e_rm_rf(){
 
 # 退出钩子沿用下面既有的 e2e_add_exit_hook(注册函数名、幂等、保持原退出码), 不另起一套。
 
+# ── 留现场开关 ──────────────────────────────────────────────────────────────
+# 用例红了的时候, 最想看的恰恰是它刚建的那堆临时物。清理做得越干净, 排查越没东西可看,
+# 所以给一个明确的口子: PDG_KEEP_TMP=1(或任意非空非 0 值)时一个都不清, 并把路径打出来。
+# 默认清 —— "默认留着, 想清再说"那种设计就是 /tmp 里堆一天几十个目录的由来。
+e2e_keep_tmp(){ [[ -n "${PDG_KEEP_TMP:-}" && "${PDG_KEEP_TMP}" != "0" ]]; }
+
+# 撤掉**指向本轮 $E2E_TMP** 的桩命令。只认里面真的写着本轮路径的那些, 别人的桩不碰。
+#
+# 为什么必须在删沙箱之前做: 容器模式下多个脚本顺序跑, /usr/local/bin 是共用的。前一个脚本
+# 退出时把自己的沙箱删了, 桩却还留在 PATH 上 —— 下一个脚本进场 e2e_reset_box 第一句就是
+# `systemctl disable --now …`, 调到的正是那个旧桩, 而它头一件事是 `mkdir -p "$D"`,
+# 于是刚删掉的目录又被建回来。实测: e2e-serial-hermetic 跑完 3 支, /tmp 里剩下前两支的
+# 沙箱根, 每个里面孤零零一个 tmp/e2e-svc。
+e2e_stub_uninstall(){
+  [[ -n "$E2E_TMP" ]] || return 0
+  local f
+  for f in /usr/local/bin/systemctl /usr/local/bin/nft; do
+    [[ -f "$f" ]] && grep -qF -- "$E2E_TMP" "$f" 2>/dev/null && rm -f "$f"
+  done
+  return 0
+}
+
 # 收尾: 只删自己建的一次性根, 且要再过一遍 realpath + marker + nonce —— 中途被换掉的话
 # 这一步会拒绝, 而不是照删。
 e2e_sandbox_cleanup(){
   [[ -n "$E2E_SANDBOX" ]] || return 0
+  if e2e_keep_tmp; then
+    echo "[PDG_KEEP_TMP] 保留沙箱: $E2E_SANDBOX" >&2
+    return 0
+  fi
+  e2e_stub_uninstall
   e2e_rm_rf "$E2E_SANDBOX" 2>/dev/null || true
+}
+
+# ── 本轮的临时物 ────────────────────────────────────────────────────────────
+# 各脚本的中间文件(命令输出、桩的状态目录、假 nft 规则集…)以前一律写死 /tmp/e2e-* 之类:
+#   · 跑完没人清 —— 一天下来 /tmp 里堆一批;
+#   · 写死路径 = 同时跑的两个脚本共用同一份状态, 互相踩(桩的 svcstate 尤其致命)。
+# 现在统一落进本轮自己的 $E2E_TMP, 随一次性根一起消失。TMPDIR 也指过去, 于是脚本里的
+# `mktemp` 和子进程(python 的 tempfile)不必逐个改也会落在里面。
+#
+# **不按前缀扫 /tmp 删**: 并发跑测试时那删的是别人正在用的沙箱, 症状还是"另一支测试莫名
+# 其妙红了"。只清本轮登记的这一个根, 是唯一安全的依据。
+E2E_TMP=""
+
+e2e_tmp_init(){
+  [[ -n "$E2E_TMP" && -d "$E2E_TMP" ]] && return 0            # 幂等
+  if [[ -n "$E2E_SANDBOX" ]]; then
+    E2E_TMP="$E2E_SANDBOX/tmp"                                # 随一次性根一起被清
+  else
+    # 没走 e2e_enter 的脚本(如 e2e-rescue-10b.sh)也要能用, 那就自己建自己清。
+    E2E_TMP="$(mktemp -d "${TMPDIR:-/tmp}/e2e-tmp.XXXXXX")" || return 1
+    e2e_add_exit_hook e2e_tmp_cleanup
+  fi
+  mkdir -p "$E2E_TMP" || return 1
+  export E2E_TMP
+  export TMPDIR="$E2E_TMP"
+  return 0
+}
+
+e2e_tmp_cleanup(){
+  [[ -n "$E2E_TMP" ]] || return 0
+  if e2e_keep_tmp; then
+    echo "[PDG_KEEP_TMP] 保留临时目录: $E2E_TMP" >&2
+    return 0
+  fi
+  rm -rf -- "$E2E_TMP"
+  return 0
 }
 
 # 重入 namespace: 外层建 overlay 目录并 unshare, 内层挂载
@@ -195,12 +263,14 @@ e2e_enter(){
     # 一次性根并记下来, 之后所有破坏性操作都要落在它之内(见 e2e_guard_path)。
     e2e_sandbox_init "${E2E_DISPOSABLE:-/tmp/e2e-box.$$}" || exit 1
     e2e_add_exit_hook e2e_sandbox_cleanup
+    e2e_tmp_init || exit 1                 # e2e_reset_box 已经要用 $E2E_TMP, 必须先于它
     e2e_reset_box
     _e2e_git_safe
     return 0
   fi
   if [[ "${PDG_E2E_INNER:-}" == 1 ]]; then
     e2e_sandbox_init "${E2E_OVL:-/tmp/e2e-inner.$$}" || exit 1
+    e2e_tmp_init || exit 1
     mount -t overlay overlay -o "lowerdir=/etc,upperdir=$E2E_OVL/eu,workdir=$E2E_OVL/ew" /etc \
       || { echo "[SKIP] overlay /etc 挂不上"; exit 0; }
     mount -t overlay overlay -o "lowerdir=/usr/local/bin,upperdir=$E2E_OVL/bu,workdir=$E2E_OVL/bw" /usr/local/bin
@@ -224,8 +294,13 @@ e2e_enter(){
   local rc=0
   PDG_E2E_INNER=1 E2E_OVL="$E2E_OVL" E2E_ROOT="$E2E_ROOT" \
     unshare -rm bash "$0" "$@" || rc=$?
-  # overlay 的 workdir 归 namespace 内的 root, 外层删不掉 → 再进一次 namespace 清理
-  unshare -rm bash -c 'rm -rf "$1"' _ "$E2E_OVL" 2>/dev/null || rm -rf "$E2E_OVL" 2>/dev/null
+  # overlay 的 workdir 归 namespace 内的 root, 外层删不掉 → 再进一次 namespace 清理。
+  # 内层的 $E2E_TMP 就在这个根里面, 所以这一句同时是它的清理; 留现场时两个一起留。
+  if e2e_keep_tmp; then
+    echo "[PDG_KEEP_TMP] 保留沙箱: $E2E_OVL(临时物在 $E2E_OVL/tmp)" >&2
+  else
+    unshare -rm bash -c 'rm -rf "$1"' _ "$E2E_OVL" 2>/dev/null || rm -rf "$E2E_OVL" 2>/dev/null
+  fi
   exit "$rc"
 }
 
@@ -393,18 +468,23 @@ PY
 }
 
 e2e_stub_system(){
-  mkdir -p /tmp/e2e-svc
+  e2e_tmp_init || return 1
+  mkdir -p "$E2E_TMP/e2e-svc"
   e2e_tx_probes || echo "[!] 事务硬门探针没起来, 相关用例会如实失败"
   # 真机上做变更时 mosdns/mihomo 本来就在跑; 沙箱的假 systemd 默认全 inactive, 会让事务的
   # 基线门(操作前组件必须是好的)正确地拒掉一切普通变更。这里把它们置为 active, 让沙箱与
   # 真机同形态 —— 判据没动, 只是把"现场"补齐。
-  printf 1 > /tmp/e2e-svc/mosdns.ac; printf 1 > /tmp/e2e-svc/mihomo.ac
+  printf 1 > "$E2E_TMP/e2e-svc/mosdns.ac"; printf 1 > "$E2E_TMP/e2e-svc/mihomo.ac"
   # 有状态的假 systemd: 记录每个 unit 的 active/enabled。切核纪律(旧核必须真的 inactive
   # 且 disabled)只有靠状态机才验得出来 —— 无脑回 active 的桩会把 activate 判成失败。
-  cat > /usr/local/bin/systemctl <<'S'
-#!/bin/sh
-D=/tmp/e2e-svc; mkdir -p "$D"
-echo "systemctl $*" >> /tmp/e2e-calls.log
+  #
+  # 路径由**生成的头两行**注入: 桩正文用 <<'S'(不展开)才不会被里面成堆的 $1/$@ 咬到,
+  # 所以 $E2E_TMP 只能这样带进去。写死 /tmp/e2e-svc 是老样子, 那让并发跑的两个脚本共用
+  # 同一份 svcstate, 而且跑完谁也不清。
+  { printf '#!/bin/sh\nD=%s/e2e-svc\nCALLS=%s/e2e-calls.log\n' "$E2E_TMP" "$E2E_TMP"
+    cat <<'S'
+mkdir -p "$D"
+echo "systemctl $*" >> "$CALLS"
 verb="$1"; shift
 now=0; [ "$1" = "--now" ] && { now=1; shift; }
 case "$verb" in
@@ -444,6 +524,7 @@ case "$verb" in
 esac
 exit 0
 S
+  } > /usr/local/bin/systemctl
   # 有状态的 nft 桩。以前这里是 `echo …; exit 0` —— 对 `nft -j list table inet pdg` 什么都
   # 不返回, 而 nftlive 读的正是那个。它按设计 fail-closed(读不到内核 = 不知道现在放行了
   # 什么, 绝不当成没问题), 于是更新后自检判红、整次 update 回滚: 测出来的是桩的病, 而排查
@@ -456,10 +537,9 @@ S
   #   -c                 只校验, 不改状态
   # 转换逻辑只此一份(nftjson.py), 不在各个 e2e 脚本里各抄一遍。
   cp "$E2E_ROOT/tests/nftjson.py" /usr/local/bin/pdg-nftjson.py 2>/dev/null || true
-  cat > /usr/local/bin/nft <<'S'
-#!/bin/sh
-STATE=/tmp/e2e-nft-ruleset
-echo "nft $*" >> /tmp/e2e-calls.log
+  { printf '#!/bin/sh\nSTATE=%s/e2e-nft-ruleset\nCALLS=%s/e2e-calls.log\n' "$E2E_TMP" "$E2E_TMP"
+    cat <<'S'
+echo "nft $*" >> "$CALLS"
 if [ "$1" = "-j" ]; then
   # -j list table <family> <name>
   fam="$4"; tab="$5"
@@ -474,19 +554,20 @@ case "$1" in
 esac
 exit 0
 S
-  : > /tmp/e2e-nft-ruleset
+  } > /usr/local/bin/nft
+  : > "$E2E_TMP/e2e-nft-ruleset"
   chmod 755 /usr/local/bin/systemctl /usr/local/bin/nft
-  : > /tmp/e2e-calls.log
+  : > "$E2E_TMP/e2e-calls.log"
 }
 
 # 把某 unit 置为"当前不在跑"(供故障注入)。注意: 之后任何 restart 都会把它拉回 active,
 # 要模拟"启动后立刻崩溃"请用 e2e_svc_crash。
-e2e_svc_fail(){ mkdir -p /tmp/e2e-svc; echo 0 > "/tmp/e2e-svc/$1.ac"; }
+e2e_svc_fail(){ mkdir -p "$E2E_TMP/e2e-svc"; echo 0 > "$E2E_TMP/e2e-svc/$1.ac"; }
 
 # "起得来但立刻崩": restart 返回 0, 但服务随即变回 inactive —— 真实现场里最常见的失败形态,
 # 也正是"只看 systemctl 返回值"这种写法看不出来的那种。
-e2e_svc_crash(){ mkdir -p /tmp/e2e-svc; : > "/tmp/e2e-svc/$1.fail"; echo 0 > "/tmp/e2e-svc/$1.ac"; }
-e2e_svc_heal(){ rm -f "/tmp/e2e-svc/$1.fail"; echo 1 > "/tmp/e2e-svc/$1.ac"; }
+e2e_svc_crash(){ mkdir -p "$E2E_TMP/e2e-svc"; : > "$E2E_TMP/e2e-svc/$1.fail"; echo 0 > "$E2E_TMP/e2e-svc/$1.ac"; }
+e2e_svc_heal(){ rm -f "$E2E_TMP/e2e-svc/$1.fail"; echo 1 > "$E2E_TMP/e2e-svc/$1.ac"; }
 
 # PATH 上那个 mihomo 是不是**真内核**: 正反两份配置都要判对。串行跑时它很可能是上一个脚本
 # 留下的桩(`-t` 恒 0), 拿它当内核用, "配置不合法就不许重启"这类用例会静默失效。
@@ -509,8 +590,8 @@ e2e_fetch_mihomo(){
   . "$E2E_ROOT/lib/versions.sh"
   curl -fsSL --retry 2 -m 120 \
     "https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VER}/mihomo-linux-amd64-${MIHOMO_VER}.gz" \
-    -o /tmp/m.gz 2>/dev/null || return 1
-  gunzip -c /tmp/m.gz > /usr/local/bin/mihomo 2>/dev/null || return 1
+    -o "$E2E_TMP/m.gz" 2>/dev/null || return 1
+  gunzip -c "$E2E_TMP/m.gz" > /usr/local/bin/mihomo 2>/dev/null || return 1
   chmod 755 /usr/local/bin/mihomo
 }
 e2e_fetch_mosdns(){
@@ -519,9 +600,9 @@ e2e_fetch_mosdns(){
   . "$E2E_ROOT/lib/versions.sh"
   curl -fsSL --retry 2 -m 120 \
     "https://github.com/IrineSistiana/mosdns/releases/download/${MOSDNS_VER}/mosdns-linux-amd64.zip" \
-    -o /tmp/mos.zip 2>/dev/null || return 1
-  (cd /tmp && unzip -qo mos.zip mosdns) 2>/dev/null || return 1
-  install -m755 /tmp/mosdns /usr/local/bin/mosdns 2>/dev/null || return 1
+    -o "$E2E_TMP/mos.zip" 2>/dev/null || return 1
+  (cd "$E2E_TMP" && unzip -qo mos.zip mosdns) 2>/dev/null || return 1
+  install -m755 "$E2E_TMP/mosdns" /usr/local/bin/mosdns 2>/dev/null || return 1
 }
 
 # ── 造现场 ──────────────────────────────────────────────────────────────────
@@ -573,7 +654,7 @@ e2e_seed_nft(){
       "$E2E_ROOT/deploy/firewall/nftables-mihomo.conf" > /etc/nftables.conf
   # 真机上装完会 `nft -f` 应用一次, 内核里于是有这份规则。桩的"内核状态"同步过去,
   # 否则磁盘有、内核空, doctor 会如实判"读不到内核规则"——那是夹具不像真的。
-  cp /etc/nftables.conf /tmp/e2e-nft-ruleset 2>/dev/null || true
+  cp /etc/nftables.conf "$E2E_TMP/e2e-nft-ruleset" 2>/dev/null || true
 }
 
 e2e_seed_singbox_model(){
@@ -595,19 +676,20 @@ e2e_seed_cert(){
 
 # 起真 mosdns 在 127.0.0.1:15353(上游指向死端口, 保证快速失败且不外连)
 e2e_mosdns_start(){
-  local cfg=/tmp/e2e-mos.yaml
+  e2e_tmp_init || return 1
+  local cfg="$E2E_TMP/e2e-mos.yaml"
   sed -e 's#0.0.0.0:53#127.0.0.1:15353#g' \
       -e 's#^\([[:space:]]*\)args: {.*1\.1\.1\.1.*}#\1args: { concurrent: 1, upstreams: [ {addr: "udp://127.0.0.1:15999"} ] }#' \
       -e 's#^\([[:space:]]*\)args: {.*223\.5\.5\.5.*}#\1args: { concurrent: 1, upstreams: [ {addr: "udp://127.0.0.1:15999"} ] }#' \
       -e 's#^\([[:space:]]*\)args: {.*22\.22\.22\.22.*}#\1args: { concurrent: 1, upstreams: [ {addr: "udp://127.0.0.1:15999"} ] }#' \
       -e '/- tag: dot_server/,$d' /etc/mosdns/config.yaml > "$cfg"
-  mosdns start -c "$cfg" -d /tmp >/tmp/e2e-mos.log 2>&1 &
-  echo $! > /tmp/e2e-mos.pid
+  mosdns start -c "$cfg" -d "$E2E_TMP" >"$E2E_TMP/e2e-mos.log" 2>&1 &
+  echo $! > "$E2E_TMP/e2e-mos.pid"
   local _i; for _i in $(seq 1 50); do
     dig +short +time=1 +tries=1 @127.0.0.1 -p 15353 probe.ready A >/dev/null 2>&1 && return 0
     sleep 0.1
   done
   return 0
 }
-e2e_mosdns_stop(){ [[ -f /tmp/e2e-mos.pid ]] && kill "$(cat /tmp/e2e-mos.pid)" 2>/dev/null; rm -f /tmp/e2e-mos.pid; sleep 0.2; }
+e2e_mosdns_stop(){ [[ -f "$E2E_TMP/e2e-mos.pid" ]] && kill "$(cat "$E2E_TMP/e2e-mos.pid")" 2>/dev/null; rm -f "$E2E_TMP/e2e-mos.pid"; sleep 0.2; }
 e2e_q(){ dig +short +time=2 +tries=1 @127.0.0.1 -p 15353 "$1" A 2>/dev/null | head -1; }

@@ -9,12 +9,15 @@ import importlib.util
 import os
 import shutil
 import socket
+import sys
 import tempfile
 import threading
 import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "tests"))
+import tmpguard  # noqa: E402
 
 
 class PycacheIsolation:
@@ -77,13 +80,16 @@ class Box:
     """一次性沙箱: 假文件树 + 假 systemctl/nft/mihomo/mosdns/sysctl。"""
 
     def __init__(self, svc_fail=None, restart_crash=False, healthy=True):
-        self.root = tempfile.mkdtemp(prefix="pdgtx-box.")
+        # 走 tmpguard: 用例忘了 clean()、或者在中途抛异常, 目录仍会在进程退出时被清掉。
+        # 它只是兜底 —— 探针线程和端口还是要靠 clean() 才收得回来, 所以该调还得调
+        # (推荐 `with Box() as b:`)。
+        self.root = tmpguard.mkdtemp(prefix="pdgtx-box.")
         self.bin = os.path.join(self.root, "stub-bin")
         os.makedirs(self.bin)
         self.calls = os.path.join(self.root, "calls.log")
         self.state = os.path.join(self.root, "svcstate")
         os.makedirs(self.state)
-        self._systemctl(svc_fail or [], restart_crash)
+        self._systemctl(self._check_units(svc_fail), restart_crash)
         self._simple("nft", 0)
         self._simple("mihomo", 0)
         self._simple("sysctl", 0)
@@ -224,6 +230,27 @@ class Box:
             raise RuntimeError("有 %d 个探针起来了却没被登记 —— 它们不会被 join, "
                                "端口也不会被关" % missing)
         self._probe_started = 0
+
+    @staticmethod
+    def _check_units(svc_fail):
+        """svc_fail 只收**单元名的列表**; 形状不对当场抛, 不静默退化成"一个都没配"。
+
+        传字符串不会报错, 但 _systemctl 里的 " ".join 会把它按字符拆开, fail 列表就成了
+        `/ t m p / f o r m f l o w` 这种谁也匹配不上的东西 —— 桩看着配上了, 其实没有任何
+        服务会失败, 用例照样全绿。两支用例真这么写过(把 `Inst(work, ...)` 的第一个位置参数
+        抄了过来, 而 Box 自己建根目录、根本不收路径)。
+        """
+        if svc_fail is None:
+            return []
+        if isinstance(svc_fail, (str, bytes)):
+            raise TypeError("svc_fail 要的是单元名列表(如 [\"mosdns\"]), 不是字符串: %r"
+                            % (svc_fail,))
+        units = list(svc_fail)
+        for u in units:
+            # 带空白的名字会被桩里的 `for f in %s` 拆成两个词, 同样谁也匹配不上。
+            if not isinstance(u, str) or u.split() != [u]:
+                raise TypeError("svc_fail 的成员要是不含空白的单元名: %r" % (u,))
+        return units
 
     def _write(self, name, body):
         p = os.path.join(self.bin, name)
@@ -377,4 +404,13 @@ exit 0
         try:
             self.stop_probes()
         finally:
-            shutil.rmtree(self.root, ignore_errors=True)
+            tmpguard.cleanup(self.root)      # 同时销号, 循环里建几十个也不会攒着
+
+    # `with Box() as b:` —— 用例中途断言失败/抛异常时探针和目录照样收得回来。
+    # 老写法(建完在末尾手工 clean())在异常路径上一定漏, 三支用例就是这么漏的。
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.clean()
+        return False
