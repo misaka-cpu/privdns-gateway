@@ -199,7 +199,12 @@ try:
     kb = EDITS[-1][1] if EDITS else None
     cbs = kb_cbs(kb)
     (ok if any(c.startswith("linktest:start") for c in cbs) else bad)("有「开始测试」")
-    (ok if "doctor" in cbs else bad)("有「返回自检」")
+    # 契约变更备案(2026-08-05): 原来这里断言的是「返回自检」(callback_data=doctor)。
+    # 真机上用出来那是**导航错误** —— 入口只挂在「📱 客户端接入」下, 自检那边从来不提
+    # 链路测试, 于是用户从客户端进来、退出却被送去自检。退出键改成指回来处 nav:client。
+    # 这条断言跟着改成新契约, 不是删掉它变绿; 四屏一致由 test-link-nav.py 全面盯。
+    (ok if "nav:client" in cbs else bad)("退出键指回入口所在的「客户端接入」")
+    (ok if "doctor" not in cbs else bad)("不再把人送去自检(那不是这项测试的来处)")
     (ok if "menu" in cbs else bad)("有「主菜单」")
 except Exception as e:  # noqa: BLE001
     bad("linktest 入口页跑不起来: %s: %s" % (type(e).__name__, e))

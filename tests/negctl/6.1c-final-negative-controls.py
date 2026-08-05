@@ -487,6 +487,17 @@ def b24():
 
 nc(24, "换过运行模块却不重启用它们的服务", b24, ["tests/test-deploy-restart.sh"])
 
+# ══ 25. 链路测试的退出键又指回自检 ═══════════════════════════════════════════
+# 按钮不会报错、文案与去处也一致 —— 只有真去点的人才发现自己被送到了别处。
+def b25():
+    s = read("deploy/bot/pdg-bot.py")
+    s = s.replace('{"text": "\u2b05\ufe0f \u8fd4\u56de\u5ba2\u6237\u7aef", "callback_data": "nav:client"}',
+                  '{"text": "\U0001fa7a \u8fd4\u56de\u81ea\u68c0", "callback_data": "doctor"}')
+    write("deploy/bot/pdg-bot.py", s)
+
+
+nc(25, "链路测试退出键又指回自检(不是来处)", b25, ["tests/test-link-nav.py"])
+
 print("\n" + "═" * 66)
 for num, title, red, det in RESULTS:
     mark = "✅" if red else "❌"

@@ -323,6 +323,11 @@ jobs:
       - name: "换过模块必须重启用它们的服务 (内容变才转/try-restart/失败不转)"
         run: bash tests/test-deploy-restart.sh
 
+      # 链路测试那几屏的退出键必须指回它自己的来处(入口挂在「客户端接入」下)。
+      # 真机上用出来的: 从「📱 客户端」进去, 退出被送到「🩺 自检」那条不相干的支路。
+      - name: "链路测试退出键指回入口菜单 (四屏一致/不回自检/保留主菜单)"
+        run: python3 tests/test-link-nav.py
+
       - name: "nft 语义判据 (nft 自身规范化不算漂移: 集合折叠/reject 默认展开/协议别名)"
         run: python3 tests/test-nft-live-semantics.py
 
