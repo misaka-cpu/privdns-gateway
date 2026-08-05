@@ -25,7 +25,9 @@ import checks  # noqa: E402
 
 PASS_N = [0]
 FAIL_N = [0]
+SKIP_N = [0]
 TMPS = []
+STRICT = os.environ.get("PDG_TEST_STRICT") == "1"
 
 
 def ok(m):
@@ -37,7 +39,40 @@ def bad(m):
 
 
 def skip(m):
-    print("[SKIP] %s" % m)
+    # 跳过要计数。以前它只打印不计, 于是汇总里看不见 —— 一条被跳过的判据和一条通过的
+    # 判据在"通过 N, 失败 0"里长得一模一样, 正是本项目最防的那种假绿。
+    print("[SKIP] %s" % m); SKIP_N[0] += 1
+
+
+def skip_or_fail(m):
+    """环境不具备某项能力时的处置。
+
+    平时(开发机)记 SKIP 并说清没验到; **CI 里(PDG_TEST_STRICT=1)判失败** ——
+    CI 的职责就是把这些能力备齐, 在那儿丢掉覆盖不能悄悄过去。
+    """
+    if STRICT:
+        bad(m + " —— 严格模式(CI)下不接受丢覆盖")
+    else:
+        skip(m + " —— 未验收, 不是通过")
+
+
+def userns_available():
+    """这台机器能不能开非特权用户命名空间。返回 (能不能, 说明)。
+
+    Ubuntu 24.04 起 AppArmor 默认禁掉非特权 userns
+    (kernel.apparmor_restrict_unprivileged_userns=1), GitHub 的 ubuntu runner 就是
+    这个状态 —— `unshare -rm` 会在写 /proc/self/uid_map 时 EPERM。
+    """
+    if shutil.which("unshare") is None:
+        return False, "没有 unshare 命令"
+    try:
+        p = subprocess.run(["unshare", "-rm", "--", "sh", "-c", "echo NS_OK"],
+                           capture_output=True, text=True, timeout=30)
+    except Exception as e:  # noqa: BLE001
+        return False, "%s: %s" % (type(e).__name__, e)
+    if p.returncode == 0 and "NS_OK" in p.stdout:
+        return True, ""
+    return False, (p.stderr.strip().splitlines() or ["?"])[-1][:70]
 
 
 def have_openssl():
@@ -441,28 +476,37 @@ print(json.dumps({"new": sorted(set(walk()) - set(before))}))
     probe_py = os.path.join(tempfile.mkdtemp(prefix="nsprobe.", dir=d), "probe.py")
     with open(probe_py, "w", encoding="utf-8") as fh:
         fh.write(probe_src)
-    ns = subprocess.run(
-        ["unshare", "-rm", "--", "sh", "-c",
-         "mount -t tmpfs none /var/lib && mount -t tmpfs none /run && exec \"$1\" \"$2\"",
-         "sh", sys.executable, probe_py],
-        capture_output=True, text=True, timeout=180)
-    if ns.returncode != 0:
-        skip("进不去 mount namespace(%s), 写入探针未跑"
-             % (ns.stderr.strip().splitlines() or ["?"])[-1][:70])
+    # 先问这台机器有没有这个能力。以前不问, 直接跑两条 unshare: 探针那条自己 skip 掉了,
+    # **反向前提那条却照旧判红** —— 于是在任何禁掉非特权 userns 的机器上(Ubuntu 24.04
+    # 起的默认, GitHub 的 ubuntu runner 就是)这支测试必红, 而红的原因与被测代码无关。
+    # 分支第一次推上远端时就是栽在这里(run 30998574178 的 lint job)。
+    ns_ok, why = userns_available()
+    if not ns_ok:
+        skip_or_fail("环境不提供非特权用户命名空间(%s): 写入探针与它的反向前提都没跑" % why)
     else:
-        made = json.loads(ns.stdout.strip().splitlines()[-1])["new"]
-        (ok if not made else bad)(
-            "namespace 里 /var/lib/privdns-gateway 与 /run 可写, 采集后仍无新文件: 多出 %s"
-            % (made or "无"))
+        ns = subprocess.run(
+            ["unshare", "-rm", "--", "sh", "-c",
+             "mount -t tmpfs none /var/lib && mount -t tmpfs none /run && exec \"$1\" \"$2\"",
+             "sh", sys.executable, probe_py],
+            capture_output=True, text=True, timeout=180)
+        if ns.returncode != 0:
+            # 能开 namespace 却跑不起来 = 真问题, 不是环境不具备, 照旧判红。
+            bad("namespace 开得出来但探针跑挂了: %s"
+                % (ns.stderr.strip().splitlines() or ["?"])[-1][:90])
+        else:
+            made = json.loads(ns.stdout.strip().splitlines()[-1])["new"]
+            (ok if not made else bad)(
+                "namespace 里 /var/lib/privdns-gateway 与 /run 可写, 采集后仍无新文件: 多出 %s"
+                % (made or "无"))
 
-    # 同一个 namespace 的反向前提: 往那两个目录写是**能成功**的(否则上一条不成立)
-    ns2 = subprocess.run(
-        ["unshare", "-rm", "--", "sh", "-c",
-         "mount -t tmpfs none /var/lib && mkdir -p /var/lib/privdns-gateway && "
-         "echo x > /var/lib/privdns-gateway/probe && echo WRITABLE"],
-        capture_output=True, text=True, timeout=60)
-    (ok if "WRITABLE" in ns2.stdout else bad)(
-        "前提成立: 那个 namespace 里确实写得进去(否则上一条是空转)")
+        # 同一个 namespace 的反向前提: 往那两个目录写是**能成功**的(否则上一条是空转)
+        ns2 = subprocess.run(
+            ["unshare", "-rm", "--", "sh", "-c",
+             "mount -t tmpfs none /var/lib && mkdir -p /var/lib/privdns-gateway && "
+             "echo x > /var/lib/privdns-gateway/probe && echo WRITABLE"],
+            capture_output=True, text=True, timeout=60)
+        (ok if "WRITABLE" in ns2.stdout else bad)(
+            "前提成立: 那个 namespace 里确实写得进去(否则上一条是空转)")
 
     print()
     print("── 8. 受管文件的内容/mode/uid/gid/mtime 一律不变 ──")
@@ -494,7 +538,10 @@ print(json.dumps({"new": sorted(set(walk()) - set(before))}))
 
     print("─" * 40)
     total = PASS_N[0] + FAIL_N[0]
-    print("通过 %d, 失败 %d" % (PASS_N[0], FAIL_N[0]))
+    # 跳过必须出现在汇总里 —— "通过 44, 失败 0" 与 "通过 43, 失败 0, 跳过 1" 是两回事。
+    print("通过 %d, 失败 %d, 跳过 %d%s"
+          % (PASS_N[0], FAIL_N[0], SKIP_N[0],
+             "(环境不具备 —— 未验收, 不是通过)" if SKIP_N[0] else ""))
     for t in TMPS:
         shutil.rmtree(t, ignore_errors=True)
     if total == 0:
