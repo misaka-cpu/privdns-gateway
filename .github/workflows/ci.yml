@@ -186,6 +186,11 @@ jobs:
       - name: "负控字节码缓存隔离(同一秒改坏/恢复源码不得读到陈旧 .pyc)"
         run: python3 tests/test-pycache-isolation.py
 
+      # 判法是"私有 TMPDIR 跑一遍, 跑完必须是空的" —— 不按前缀扫 /tmp 删(那删的是并发中
+      # 别人的沙箱)。同时盯失败路径(异常/非 0/SIGTERM)与 PDG_KEEP_TMP 留现场。
+      - name: "临时物卫生 (一支测试跑完不许留下自己建的临时目录; PDG_KEEP_TMP=1 才留现场)"
+        run: python3 tests/test-tmp-hygiene.py
+
       # 判据是**逐调用点**的: 只数"这个文件里有守卫"会放过"守卫写在动作之后"和"这两行前面
       # 根本没有守卫"—— 2026-08-02 开发者 origin 被改指到 /tmp 裸库正是后一种。
       - name: "e2e 不许碰共享 git ref 库 (复现 07-31 丢 tag/remote + 08-02 改坏 origin; 逐调用点核对)"
