@@ -1916,7 +1916,38 @@ migrate_deploy_botfiles(){
   # `deploy/bot/*.py` 的 glob 兜底循环 —— 那是一份**隐式的第二名单**: 仓库里任何新加的 .py
   # 都会被它装进 /opt/pdg-bot, 而那些文件不在 manifest 里, 卸载不会删、mode 也无从对齐。
   # 失败要向上传播: 迁移装了一半就返回成功, 机器会停在新旧混装且没人知道。
+  # 换过模块就要把用它们的服务转起来。**盘上是新代码、跑着的是旧的**本身就是一类静默故障:
+  # 两天里踩了两次 —— `.153` 装完没重启 pdg-bot, Telegram 菜单里根本没有那一项, 而版本号、
+  # 文件内容从哪儿看都"已经升级了"; jp2 装完没重启 pdg-probe81, 新 unit 的 RuntimeDirectory
+  # 没生效, /run/pdg-probe81 不存在, 建会话直接 STATE_UNWRITABLE。迁移自己知道有没有换过
+  # 文件, 就不该让人去记。
+  #
+  # 只在**内容真的不同**时重启: 每次迁移都重启会平白打断在用的连接(与救援平面 unit 刷新
+  # 那里同一条纪律)。
+  local _before _after
+  _before="$(_pdg_modules_digest /opt/pdg-bot)"
   pdg_install_runtime_modules "$REPO_DIR" /opt/pdg-bot "$(_pdg_platform)" || return 1
+  _after="$(_pdg_modules_digest /opt/pdg-bot)"
+  [[ "$_before" == "$_after" ]] && return 0
+
+  # try-restart 而不是 restart: 没装/没启用的服务直接跳过, 不报错 —— Android 上没有
+  # pdg-mitm, 早期机器上也可能还没有 pdg-probe81, 那些都不该让整条迁移失败。
+  local _svcs="pdg-bot pdg-probe81"
+  [[ "$(_pdg_platform)" == ios ]] && _svcs="$_svcs pdg-mitm"
+  # shellcheck disable=SC2086  # 有意按空白分词
+  systemctl try-restart $_svcs >/dev/null 2>&1 || true
+  c_g "  运行模块已更新 → 已重启:$(printf ' %s' $_svcs)"
+}
+
+# /opt/pdg-bot 下受管模块的整体摘要 —— 只用来判断"这次迁移有没有真的换过文件"。
+# 读不到就回显空串: 那会让前后两次比较不相等, 于是保守地重启一次(宁可多转一次,
+# 也不要留下"盘上新、跑着旧"的机器)。
+_pdg_modules_digest(){
+  local dir="${1:-/opt/pdg-bot}" f
+  for f in "$dir"/*.py; do
+    [[ -e "$f" ]] || continue
+    sha256sum "$f" 2>/dev/null
+  done | sort | sha256sum 2>/dev/null | cut -d" " -f1
 }
 
 # 老机首次获得救援平面: 装 unit + 备好凭据, 并按"默认启用"拍板方案开起来。
