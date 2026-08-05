@@ -17,8 +17,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "deploy/bot"))
 sys.path.insert(0, str(ROOT / "tests"))
 
-import nftjson   # noqa: E402
-import nftlive   # noqa: E402
+import nftjson       # noqa: E402
+import nftlive       # noqa: E402
+import rescue_const  # noqa: E402
 
 PASS = [0]
 FAIL = [0]
@@ -41,7 +42,8 @@ def render(**kw):
     """按生产模板渲染一份配置文本 —— 不手写夹具, 免得测的是我自己编的形态。"""
     t = (ROOT / "deploy/firewall/nftables-mihomo.conf").read_text(encoding="utf-8")
     t = (t.replace("__SSH_PORT__", "22").replace("__INTERNAL_CIDR__", kw.get("cidr", CIDR))
-          .replace("__SERVER_IP__", "203.0.113.1").replace("__RESCUE_PORT__", "8446"))
+          .replace("__SERVER_IP__", "203.0.113.1")
+          .replace("__RESCUE_PORT__", str(rescue_const.port())))
     return t
 
 

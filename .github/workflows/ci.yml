@@ -303,6 +303,11 @@ jobs:
       # 6.1C: doctor 与 linkstat 曾对同一台健康机器给出相反结论 —— doctor 报 0 失败,
       # linkstat 判 FAIL 并拦住手机测试会话。根因是两套各自为政的文本近似判据。这三支
       # 盯的就是"只有一份判据, 并且分档不串":
+      # 沙箱 nft 桩的契约。它以前对 `-j` 返回空, 于是 nftlive 按设计 fail-closed, 更新后
+      # 自检判红整次回滚 —— 而最顺手的"修法"恰恰是把 fail-closed 降成 WARN。桩得有人看着。
+      - name: "沙箱 nft 桩契约 (状态派生而非常量/表不在非零/空输入仍 fail-closed/双平台不串台)"
+        run: python3 tests/test-nftjson-stub.py
+
       - name: "nft 语义判据 (nft 自身规范化不算漂移: 集合折叠/reject 默认展开/协议别名)"
         run: python3 tests/test-nft-live-semantics.py
 
