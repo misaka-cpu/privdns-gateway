@@ -23,10 +23,15 @@ jobs:
           # 各版本 cmd_snapshot 的清单也靠历史对象解析。默认浅克隆拿不到, 于是 legacy 样本
           # 造不出来、后面的用例撞 FileNotFoundError。e2e job 早就因同样原因设了 0。
           fetch-depth: 0
-      # Ubuntu 24.04 起 AppArmor 默认禁掉非特权用户命名空间, 而好几支测试要用它把
-      # /var/lib 与 /run 铺成真实可写的目录, 才能把「采集器一个字节都不写」证成非空转。
+      # Ubuntu 24.04 起 AppArmor 默认禁掉非特权用户命名空间, 而 lint 里有三支测试要用它把
+      # /var/lib 与 /run 铺成真实可写的目录, 才能把「采集器一个字节都不写」证成非空转
+      # (test-link-status / test-probe81-platform / test-config-transaction-faults)。
       # 没有这个能力那条判据就没跑 —— 分支第一次推上远端时 lint 就栽在这儿。
-      # 这是 runner 本地的一次性设置, 不改被测代码。
+      #
+      # **只放在直接跑在 runner 上的 job 里。** e2e / e2e-serial / e2e-rescue-lock-ios 跑在
+      # debian:12 容器中、本身就是 root 且隔离(见 e2e job 顶上那段说明), 容器里没有 sudo ——
+      # 往那些 job 里加这步会让它们在第一步就整个挂掉。这个错误犯过一次: run 30999183512
+      # 里 20 个 E2E job 全红, 原因与被测代码无关。
       - name: "放开非特权用户命名空间 (多支测试靠它把只读纪律证成非空转)"
         run: |
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
@@ -565,14 +570,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      # Ubuntu 24.04 起 AppArmor 默认禁掉非特权用户命名空间, 而好几支测试要用它把
-      # /var/lib 与 /run 铺成真实可写的目录, 才能把「采集器一个字节都不写」证成非空转。
-      # 没有这个能力那条判据就没跑 —— 分支第一次推上远端时 lint 就栽在这儿。
-      # 这是 runner 本地的一次性设置, 不改被测代码。
-      - name: "放开非特权用户命名空间 (多支测试靠它把只读纪律证成非空转)"
-        run: |
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
-          unshare -rm -- sh -c 'echo userns OK'
       # dns-policy-test.sh 自己会把 mosdns 下到它的临时目录, 但负控脚本判前提用的是
       # `command -v mosdns` —— 装到 PATH 上才算数。**必须紧跟在 checkout 之后**: 放在失败的
       # 那一步后面就永远不会执行(v1.7.0 发布前踩过一次)。顺带让两次 dns-policy 复用同一份
@@ -651,14 +648,6 @@ jobs:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
-      # Ubuntu 24.04 起 AppArmor 默认禁掉非特权用户命名空间, 而好几支测试要用它把
-      # /var/lib 与 /run 铺成真实可写的目录, 才能把「采集器一个字节都不写」证成非空转。
-      # 没有这个能力那条判据就没跑 —— 分支第一次推上远端时 lint 就栽在这儿。
-      # 这是 runner 本地的一次性设置, 不改被测代码。
-      - name: "放开非特权用户命名空间 (多支测试靠它把只读纪律证成非空转)"
-        run: |
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
-          unshare -rm -- sh -c 'echo userns OK'
       - name: 装依赖
         run: |
           apt-get update -qq
@@ -689,14 +678,6 @@ jobs:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
-      # Ubuntu 24.04 起 AppArmor 默认禁掉非特权用户命名空间, 而好几支测试要用它把
-      # /var/lib 与 /run 铺成真实可写的目录, 才能把「采集器一个字节都不写」证成非空转。
-      # 没有这个能力那条判据就没跑 —— 分支第一次推上远端时 lint 就栽在这儿。
-      # 这是 runner 本地的一次性设置, 不改被测代码。
-      - name: "放开非特权用户命名空间 (多支测试靠它把只读纪律证成非空转)"
-        run: |
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
-          unshare -rm -- sh -c 'echo userns OK'
       - name: 装依赖
         run: |
           apt-get update -qq
@@ -724,14 +705,6 @@ jobs:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
-      # Ubuntu 24.04 起 AppArmor 默认禁掉非特权用户命名空间, 而好几支测试要用它把
-      # /var/lib 与 /run 铺成真实可写的目录, 才能把「采集器一个字节都不写」证成非空转。
-      # 没有这个能力那条判据就没跑 —— 分支第一次推上远端时 lint 就栽在这儿。
-      # 这是 runner 本地的一次性设置, 不改被测代码。
-      - name: "放开非特权用户命名空间 (多支测试靠它把只读纪律证成非空转)"
-        run: |
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
-          unshare -rm -- sh -c 'echo userns OK'
       - name: 装依赖
         run: |
           apt-get update -qq
