@@ -58,6 +58,7 @@ R_STATE_UNWRITABLE = "STATE_UNWRITABLE"
 # 建会话前置条件不满足: profile.env 没有 PDG_INTERNAL_CIDR, 或它不是合法私网段。
 # 不建半份会话 —— 没有判断基准的会话只会给出"无法判断", 白让人跑一趟手机。
 R_NO_INTERNAL_CIDR = "NO_INTERNAL_CIDR"
+R_NO_SERVER_IP = "NO_SERVER_IP"
 
 REASONS = (R_OK, R_NO_SESSION, R_SESSION_EXPIRED, R_TOKEN_REUSED, R_RATE_LIMITED,
            R_TOKEN_INVALID, R_STATE_CORRUPT, R_STATE_UNWRITABLE, R_NO_INTERNAL_CIDR)
@@ -393,6 +394,18 @@ def start_session():
                        "reason": R_NO_INTERNAL_CIDR}
     cidr = str(ipaddress.ip_network(raw, strict=False))      # 规范化后再快照
 
+    # 网关地址也是必需的**判断基准**, 与内网段同级: 第 1 步的链接就是
+    # `http://<网关IP>:81/probe?t=…`, 没有它拼出来的东西必然点不通。
+    # 这一步必须排在 new_session/write_state **之前** —— 否则用户拿到一个坏链接的同时
+    # 还占着一笔已经写盘的会话, "再测一次"会撞上它。以前这里是
+    # `ip = _server_ip() or "<网关IP>"`: 拿字面占位符顶上, 界面看不出任何异常。
+    ip = _server_ip()
+    if not ip:
+        return False, {"error": "profile.env 里没有 PDG_SERVER_IP —— 拼不出手机要打开的"
+                               "那个地址。跑 sudo pdg detect-cidr, 或用 pdg 的 profile "
+                               "写入网关 IP 后重试。",
+                       "reason": R_NO_SERVER_IP}
+
     baseline = None
     try:
         import linkmetrics
@@ -404,7 +417,6 @@ def start_session():
     if not write_state(rec):
         return False, {"error": "会话状态写不下去(%s 不可写?)" % _runtime_dir(),
                        "reason": R_STATE_UNWRITABLE}
-    ip = _server_ip() or "<网关IP>"
     return True, {
         "session_id": rec["session_id"],
         "expires_at": rec["expires_at"],

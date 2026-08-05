@@ -270,22 +270,21 @@ def _l2_cidr(ctx):
 
 
 def _l3_probe(ctx):
-    if ctx["platform"] != "ios":
-        return Finding(
-            3, "L3_PLATFORM_NA", SKIP, None, "iOS 探测端点(:81)",
-            "Android 不安装 pdg-probe81, 也不监听/放行 81 —— 该层不适用本平台。",
-            evidence_source="/etc/privdns-gateway/platform", platform="android")
+    # 6.1B 起 pdg-probe81 是 **Android/iOS 公共**组件 —— 手机链路测试的 HTTP 探测端点两
+    # 平台都要用它。这里以前按 iOS 专属跳过, 于是 Android 上报"不安装、不监听/放行 81",
+    # 而同一台机器上它 active、:81 在听、nft 有放行、doctor 报绿: 又是两套检查对同一台
+    # 机器给出相反说法(`.153` 实测撞到)。平台门去掉, 标题也不再叫"iOS 探测端点"。
     rc, out, _ = checks._run(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
                               "--max-time", "5", "http://127.0.0.1:81/probe"])
     code = (out or "").strip()
     if code == "200":
         return Finding(
-            3, "L3_SERVER_PROBE_READY", PASS, None, "iOS 探测端点(:81)",
+            3, "L3_SERVER_PROBE_READY", PASS, None, "探测端点(:81)",
             "本机 127.0.0.1:81 返回 200 —— 服务端就绪。"
             "这**不**代表手机经运营商私网连得上它。",
             evidence_source="本机 curl 127.0.0.1:81", platform="ios")
     return Finding(
-        3, "L3_SERVER_PROBE_READY", FAIL, DEPENDENCY, "iOS 探测端点(:81)",
+        3, "L3_SERVER_PROBE_READY", FAIL, DEPENDENCY, "探测端点(:81)",
         "本机 127.0.0.1:81 返回 %s(iOS OnDemand 需要 200)" % (code or "无响应"),
         evidence_source="本机 curl 127.0.0.1:81", platform="ios",
         next_step="systemctl status pdg-probe81 查看服务。")

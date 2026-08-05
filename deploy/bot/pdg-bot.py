@@ -3860,14 +3860,32 @@ def _restore_commit(tmp):
 _DOT_HOST = None
 
 def _dot_host():
+    """DoT 域名 —— 从**证书的 CN** 取, 证书路径复用 checks._cert_path()。
+
+    以前这里只认写死的默认路径 /etc/mosdns/certs/fullchain.pem, 读不到就把结果吞成 "?"。
+    两个毛病叠在一起:
+      · 证书未必在那儿。`.153` 上它在 /etc/dnsdist/certs/(早期 dnsdist 时代留下的路径),
+        mosdns 配置里明写着 `cert:` 指向哪 —— checks._cert_path() 正是从那里读的, doctor
+        因此一直找得对, 只有 Bot 找不到。同一件事两份实现, 一份对一份错;
+      · 找不到时给 "?"。用户照着 Bot 显示去配 Android 私密 DNS, 拿到的是一个问号 ——
+        必然配不上, 而 Bot 那边看不出任何异常。宁可说"读不到", 不许编一个看起来像答案的东西。
+    """
     global _DOT_HOST
     if _DOT_HOST is None:
         try:
-            out = sh(["openssl", "x509", "-in", CERT, "-noout", "-subject"]).stdout
-            m = re.search(r"CN\s*=\s*([A-Za-z0-9.*-]+)", out)
-            _DOT_HOST = m.group(1) if m else "?"
+            import checks
+            cert = checks._cert_path()
         except Exception:  # noqa: BLE001
-            _DOT_HOST = "?"
+            cert = CERT
+        try:
+            out = sh(["openssl", "x509", "-in", cert, "-noout", "-subject"]).stdout
+            m = re.search(r"CN\s*=\s*([A-Za-z0-9.*-]+)", out)
+            _DOT_HOST = m.group(1) if m else None
+        except Exception:  # noqa: BLE001
+            _DOT_HOST = None
+        if _DOT_HOST is None:
+            # 明说读不到, 并给出查的是哪个路径 —— 用户据此能自己看一眼
+            _DOT_HOST = "(读不到 DoT 域名: 证书 %s 不可读)" % cert
     return _DOT_HOST
 
 def _server_ip():

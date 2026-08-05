@@ -47,6 +47,33 @@ def bad(m):
 
 BOX = tempfile.mkdtemp(prefix="honesty.")
 
+
+def code_only(text):
+    """剥掉注释与 docstring —— 形态判据只能看**真正参与运算的代码**。
+
+    否则"删掉一句解释旧行为的注释"就能让判据变绿, 方向正好反了: 那些注释恰恰是解释
+    "以前错在哪"的, 应当留着。这个坑之前在端口字面量那条上踩过一次。
+    """
+    import io as _i, tokenize as _t
+    try:
+        toks = list(_t.generate_tokens(_i.StringIO(text).readline))
+    except Exception:
+        return text
+    out = []
+    prev = _t.NEWLINE          # **每个** token 都要更新它 —— 只在"有意义的 token"上更新
+    for tt, val, _s, _e, _l in toks:   # 会让 docstring 前看到的是 `:` 而不是 INDENT
+        if tt == _t.COMMENT:
+            continue
+        # 独立成句的字符串 = docstring: 它的前一个 token 是换行/缩进类
+        if tt == _t.STRING and prev in (_t.INDENT, _t.NEWLINE, _t.NL, _t.DEDENT,
+                                        _t.ENCODING):
+            prev = tt
+            continue
+        out.append(val)
+        prev = tt
+    return " ".join(out)
+
+
 # ═══ a) start_session: PDG_SERVER_IP 缺失必须 fail-closed ══════════════════
 print("── a) start_session 缺 PDG_SERVER_IP ──")
 import linksess  # noqa: E402
@@ -92,7 +119,7 @@ linksess.clear_state()
 
 # 源码形态: 不许再出现"拿占位符顶上"
 _src = io.open(str(ROOT / "deploy/bot/linksess.py"), encoding="utf-8").read()
-(ok if '_server_ip() or "<网关IP>"' not in _src else bad)(
+(ok if '_server_ip() or "<网关IP>"' not in code_only(_src) else bad)(
     "源码里没有 `_server_ip() or \"<网关IP>\"` 这种占位符兜底")
 
 # ═══ b) _dot_host: 证书路径要复用 checks 那份对的解析 ══════════════════════
@@ -102,9 +129,10 @@ _bsrc = io.open(str(ROOT / "deploy/bot/pdg-bot.py"), encoding="utf-8").read()
 _fn = re.search(r"\ndef _dot_host\(\):.*?\n(?=def )", _bsrc, re.S)
 (ok if _fn else bad)("抽到了 _dot_host")
 _body = _fn.group(0) if _fn else ""
-(ok if '"?"' not in _body else bad)(
-    "_dot_host 不再把读不到吞成 \"?\"(实得 %d 处)" % _body.count('"?"'))
-(ok if "_cert_path" in _body or "checks." in _body else bad)(
+_bcode = code_only(_body)
+(ok if '"?"' not in _bcode else bad)(
+    "_dot_host 不再把读不到吞成 \"?\"(代码里实得 %d 处)" % _bcode.count('"?"'))
+(ok if "_cert_path" in _bcode or "checks." in _bcode else bad)(
     "_dot_host 复用 checks 那份从 mosdns 配置读 cert: 的解析, 不各写一份")
 # checks 那份必须还在, 并且真的从配置里读
 _csrc = io.open(str(ROOT / "deploy/bot/checks.py"), encoding="utf-8").read()
@@ -138,9 +166,10 @@ _lsrc = io.open(str(ROOT / "deploy/bot/linkstat.py"), encoding="utf-8").read()
 _f3 = re.search(r"\ndef _l3_probe\(ctx\):.*?\n(?=def )", _lsrc, re.S)
 (ok if _f3 else bad)("抽到了 _l3_probe")
 _b3 = _f3.group(0) if _f3 else ""
-(ok if 'L3_PLATFORM_NA' not in _b3 else bad)(
+_b3code = code_only(_b3)
+(ok if 'L3_PLATFORM_NA' not in _b3code else bad)(
     "Android 不再走 L3_PLATFORM_NA 这条跳过分支")
-(ok if "iOS 探测端点" not in _b3 else bad)(
+(ok if "iOS 探测端点" not in _b3code else bad)(
     "标题不再叫「iOS 探测端点」—— 它两平台都有")
 
 # 行为: 同一份"探测端点返回 200"的现场, 两平台都应判 PASS
