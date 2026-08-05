@@ -574,7 +574,7 @@ box.clean()
 
 # ── 14. 迁移函数本身: 成功 / 不一致 / 幂等(真跑, 不做字符串断言) ────────────
 import re as _re  # noqa: E402
-import tempfile as _tf  # noqa: E402
+import tmpguard  # noqa: E402
 
 PDG = os.path.join(ROOT, "deploy/bot/pdg.sh")
 _src = open(PDG, encoding="utf-8").read()
@@ -582,7 +582,7 @@ _body = _re.search(r"^migrate_cidr_single_source\(\)\{.*?^\}", _src, _re.S | _re
 
 
 def run_mig(nft_text, mos_text, prof_text="PDG_LOWMEM=0\n"):
-    d = _tf.mkdtemp()
+    d = tmpguard.mkdtemp()      # run_mig 会被调很多次, 每次一个沙箱 —— 必须登记, 否则全留着
     os.makedirs(d + "/etc/privdns-gateway", exist_ok=True)
     os.makedirs(d + "/etc/mosdns", exist_ok=True)
     prof = d + "/etc/privdns-gateway/profile.env"

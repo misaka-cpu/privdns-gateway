@@ -17,6 +17,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -61,7 +62,7 @@ NFT_OK = ("table inet pdg\ndelete table inet pdg\ntable inet pdg {\n"
           "    chain input {\n        type filter hook input priority 0; policy drop;\n"
           "        ip saddr 172.22.0.0/16 tcp dport { 53 } accept\n    }\n}\n")
 
-work = tempfile.mkdtemp(prefix="restore-actions.")
+work = tmpguard.mkdtemp(prefix="restore-actions.")
 
 
 def load_cr(box):

@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "deploy/bot"))
@@ -189,7 +190,7 @@ for f in /opt/pdg-bot/probe81.py /etc/systemd/system/pdg-probe81.service \
 done
 echo "--SYSCTL--"; cat /opt/sysctl.log 2>/dev/null || true
 """ % _extract(pdgsh, "migrate_android_cleanup")
-_sc = tempfile.mkdtemp(prefix="p81ns.")
+_sc = tmpguard.mkdtemp(prefix="p81ns.")
 _scp = os.path.join(_sc, "run.sh")
 open(_scp, "w").write(_probe)
 _r = subprocess.run(
@@ -243,7 +244,7 @@ seg = m.group(0) if m else rep
 # ── 8. clean-root 安装闭包 ────────────────────────────────────────────────
 print()
 print("── 8. 两平台的 clean-root 导入闭包 ──")
-box = tempfile.mkdtemp(prefix="p81closure.")
+box = tmpguard.mkdtemp(prefix="p81closure.")
 for plat in ("android", "ios"):
     d = os.path.join(box, plat); os.makedirs(d, exist_ok=True)
     r = subprocess.run(["bash", "-c",

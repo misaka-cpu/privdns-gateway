@@ -11,6 +11,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -30,7 +31,7 @@ def bad(m):
     print("  ✗ %s" % m)
 
 
-BOX = tempfile.mkdtemp(prefix="invtest.")
+BOX = tmpguard.mkdtemp(prefix="invtest.")
 
 
 def capture(name, profile="update-prewrite", extra=(), platform="android"):

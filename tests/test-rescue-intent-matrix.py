@@ -25,6 +25,7 @@ import os
 import sys
 import tempfile
 from pathlib import Path
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "deploy/bot"))
@@ -50,7 +51,7 @@ import rescue_nft     # noqa: E402
 CIDR = "172.22.0.0/16"
 BIND = "172.22.0.9"
 PORT = rescue_const.port()
-BOX = tempfile.mkdtemp(prefix="rintent.")
+BOX = tmpguard.mkdtemp(prefix="rintent.")
 
 BASE = """table inet pdg {
     chain input {

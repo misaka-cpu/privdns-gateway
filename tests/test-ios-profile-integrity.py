@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -44,7 +45,7 @@ def bad(m):
 
 
 def mkca(name):
-    d = tempfile.mkdtemp(prefix="iosint-ca-")
+    d = tmpguard.mkdtemp(prefix="iosint-ca-")
     TMPS.append(d)
     subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
                     "-keyout", d + "/ca.key", "-out", d + "/ca.crt", "-days", "1",
@@ -57,7 +58,7 @@ class Box:
     """独立 FSROOT 沙箱: 元数据、产物、锁全在里面。"""
 
     def __init__(self):
-        self.root = tempfile.mkdtemp(prefix="iosint-")
+        self.root = tmpguard.mkdtemp(prefix="iosint-")
         TMPS.append(self.root)
         os.makedirs(self.root + "/etc/privdns-gateway", exist_ok=True)
         os.makedirs(self.root + "/run", exist_ok=True)

@@ -18,6 +18,7 @@ import sys
 import tempfile
 import types
 from pathlib import Path
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = Path(__file__).resolve().parents[1]
 BOTDIR = str(ROOT / "deploy" / "bot")
@@ -51,7 +52,7 @@ def check_wording(label, *texts):
     return not hit
 
 
-ROOTFS = tempfile.mkdtemp(prefix="iosux-")
+ROOTFS = tmpguard.mkdtemp(prefix="iosux-")
 TMPS.append(ROOTFS)
 os.makedirs(ROOTFS + "/etc/privdns-gateway", exist_ok=True)
 os.makedirs(ROOTFS + "/run", exist_ok=True)
@@ -241,7 +242,7 @@ else:
     bad("状态页出现了谁也没做过的变化: %r" % txt[:160])
 
 # ── 5. CA 只显示指纹 ──────────────────────────────────────────────────────
-CA_DIR = tempfile.mkdtemp(prefix="iosux-ca-")
+CA_DIR = tmpguard.mkdtemp(prefix="iosux-ca-")
 TMPS.append(CA_DIR)
 subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
                 "-keyout", CA_DIR + "/ca.key", "-out", CA_DIR + "/ca.crt", "-days", "1",
@@ -360,9 +361,9 @@ else:
 # ── 8. CLI 的平台门控 ─────────────────────────────────────────────────────
 sh = subprocess.run(
     ["bash", "-c",
-     "set -e; sed -n '/^ic_gate()/,/^}/p' deploy/bot/pdg.sh > /tmp/icg.$$;"
-     " . /tmp/icg.$$; _pdg_platform(){ echo android; };"
-     " ic_gate && echo ALLOWED || echo REFUSED; rm -f /tmp/icg.$$"],
+     "set -e; sed -n '/^ic_gate()/,/^}/p' deploy/bot/pdg.sh > ${TMPDIR:-/tmp}/icg.$$;"
+     " . ${TMPDIR:-/tmp}/icg.$$; _pdg_platform(){ echo android; };"
+     " ic_gate && echo ALLOWED || echo REFUSED; rm -f ${TMPDIR:-/tmp}/icg.$$"],
     capture_output=True, text=True, cwd=str(ROOT), timeout=120)
 if "REFUSED" in sh.stdout and "仅 iOS 平台可用" in sh.stdout:
     ok("CLI 的 iOS 门控在 android 上拒绝(真的跑了那个函数)")
@@ -371,9 +372,9 @@ else:
 
 sh = subprocess.run(
     ["bash", "-c",
-     "set -e; sed -n '/^ic_gate()/,/^}/p' deploy/bot/pdg.sh > /tmp/icg2.$$;"
-     " . /tmp/icg2.$$; _pdg_platform(){ echo ios; };"
-     " ic_gate && echo ALLOWED || echo REFUSED; rm -f /tmp/icg2.$$"],
+     "set -e; sed -n '/^ic_gate()/,/^}/p' deploy/bot/pdg.sh > ${TMPDIR:-/tmp}/icg2.$$;"
+     " . ${TMPDIR:-/tmp}/icg2.$$; _pdg_platform(){ echo ios; };"
+     " ic_gate && echo ALLOWED || echo REFUSED; rm -f ${TMPDIR:-/tmp}/icg2.$$"],
     capture_output=True, text=True, cwd=str(ROOT), timeout=120)
 if sh.stdout.strip() == "ALLOWED":
     ok("CLI 的 iOS 门控在 ios 上放行")
@@ -420,11 +421,11 @@ for _s in sorted(INTERNAL_SUBS):
 # 真的把 cmd_ios / cmd_ios_previous / ic_gate 抽出来跑一遍, 只把它依赖的外部动作换成桩。
 HARNESS = r"""
 set -u
-grep -E '^IOS_TMPL='                 deploy/bot/pdg.sh >  /tmp/iosdisp.$$
-sed -n '/^ic_gate()/,/^}/p'          deploy/bot/pdg.sh >> /tmp/iosdisp.$$
-sed -n '/^cmd_ios_state()/,/^}/p'    deploy/bot/pdg.sh >> /tmp/iosdisp.$$
-sed -n '/^cmd_ios_previous()/,/^}/p' deploy/bot/pdg.sh >> /tmp/iosdisp.$$
-sed -n '/^cmd_ios()/,/^}/p'          deploy/bot/pdg.sh >> /tmp/iosdisp.$$
+grep -E '^IOS_TMPL='                 deploy/bot/pdg.sh >  ${TMPDIR:-/tmp}/iosdisp.$$
+sed -n '/^ic_gate()/,/^}/p'          deploy/bot/pdg.sh >> ${TMPDIR:-/tmp}/iosdisp.$$
+sed -n '/^cmd_ios_state()/,/^}/p'    deploy/bot/pdg.sh >> ${TMPDIR:-/tmp}/iosdisp.$$
+sed -n '/^cmd_ios_previous()/,/^}/p' deploy/bot/pdg.sh >> ${TMPDIR:-/tmp}/iosdisp.$$
+sed -n '/^cmd_ios()/,/^}/p'          deploy/bot/pdg.sh >> ${TMPDIR:-/tmp}/iosdisp.$$
 need_root(){ :; }
 _pdg_platform(){ echo ios; }
 _pdg_module(){ echo /nonexistent/$1; }
@@ -441,10 +442,10 @@ _ios_offer_download(){ echo "CHANNEL:$1"; }
 apt-get(){ echo "DANGER:apt-get $*"; return 1; }
 qrencode(){ echo "DANGER:qrencode"; return 1; }
 nft(){ echo "DANGER:nft $*"; return 1; }
-mktemp(){ echo /tmp/iosdisp-www.$$; }
+mktemp(){ echo ${TMPDIR:-/tmp}/iosdisp-www.$$; }
 # shellcheck source=/dev/null
-. /tmp/iosdisp.$$
-rm -f /tmp/iosdisp.$$
+. ${TMPDIR:-/tmp}/iosdisp.$$
+rm -f ${TMPDIR:-/tmp}/iosdisp.$$
 IOS_TMPL="$2"
 cmd_ios ${1:+"$1"} 2>&1 | head -8
 """
@@ -504,7 +505,7 @@ else:
 
 # 真的把这个函数跑起来。会真动机器的三样(nft / qrencode / 起 HTTP 的 timeout)换成**真文件**
 # 桩 —— 函数里是 `exec timeout …`, exec 只认可执行文件, shell 函数在这里换不掉它。
-CH = tempfile.mkdtemp(prefix="ioschan-")
+CH = tmpguard.mkdtemp(prefix="ioschan-")
 TMPS.append(CH)
 CHBIN = os.path.join(CH, "bin")
 os.makedirs(CHBIN)

@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tests"))
@@ -424,7 +425,7 @@ import re as _re  # noqa: E402
 import urllib.parse as _up  # noqa: E402
 
 hbox = make_box()
-work = tempfile.mkdtemp(prefix="emerghttp.")
+work = tmpguard.mkdtemp(prefix="emerghttp.")
 # 把 box 的**整套**环境透传给救援进程 —— 少传一个(比如 PDG_TX_REDIR_PORT)事务的硬门就
 # 会打到真机上去探端口, 于是拒绝在"已损坏的组件"上做普通变更。
 inst = Inst(work, extra_env=dict(hbox.env, PDG_STABLE_SAMPLES="1",

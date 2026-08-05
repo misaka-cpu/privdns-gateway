@@ -20,6 +20,7 @@ import shutil
 import sys
 import tempfile
 from pathlib import Path
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "deploy/bot"))
@@ -66,7 +67,7 @@ def scan(text, where):
 
 
 print("── 1. pdg link status 的渲染全文 ──")
-_rt = tempfile.mkdtemp(prefix="linkcopy.")
+_rt = tmpguard.mkdtemp(prefix="linkcopy.")
 atexit.register(shutil.rmtree, _rt, True)   # 测试自己不许留残留
 os.environ.setdefault("PDG_LINK_RUNTIME", _rt)
 import linkstat as L  # noqa: E402

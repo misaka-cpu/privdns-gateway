@@ -22,6 +22,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -40,7 +41,7 @@ def bad(m):
     print("  ✗ %s" % m)
 
 
-BOX = tempfile.mkdtemp(prefix="relfault.")
+BOX = tmpguard.mkdtemp(prefix="relfault.")
 
 
 def sh(body, cwd=None):

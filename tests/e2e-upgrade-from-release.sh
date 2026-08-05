@@ -61,7 +61,7 @@ chmod 755 /usr/local/bin/mihomo
 
 # ── 发布源: 上一个 tag 的**真代码** + 当前工作树 ──────────────────────────────
 REPO=/opt/privdns-gateway
-ORIGIN=/tmp/e2e-upg-origin.git
+ORIGIN=$E2E_TMP/e2e-upg-origin.git
 rm -rf "$REPO/.git" "$ORIGIN"
 git -C "$REPO" init -q -b main
 e2e_guard_repo "$REPO" || exit 1
@@ -102,7 +102,7 @@ _ud(){ sha256sum /etc/privdns-gateway/bot.env /etc/privdns-gateway/profile.env \
         /opt/pdg-bot/rulesets.json /etc/privdns-gateway/platform \
         /etc/mosdns/rules/custom_direct.txt /etc/mosdns/rules/custom_hijack.txt 2>/dev/null; }
 UD_BEFORE="$(_ud)"
-cp /etc/mosdns/config.yaml /tmp/mos-before.yaml
+cp /etc/mosdns/config.yaml $E2E_TMP/mos-before.yaml
 
 echo; echo "── 跑 $PREV 的 pdg update(目标: 本版) ──"
 out=$(bash /usr/local/bin/pdg update 2>&1); rc=$?
@@ -149,21 +149,21 @@ fi
 # 判成数据损失, 而"只要没崩就算过"又会放过真把用户上游冲掉的迁移。
 _lost=""
 for _k in custom_direct.txt custom_hijack.txt geosite_cn.txt 'listen: "0.0.0.0:53"'; do
-  grep -qF "$_k" /tmp/mos-before.yaml || continue
+  grep -qF "$_k" $E2E_TMP/mos-before.yaml || continue
   grep -qF "$_k" /etc/mosdns/config.yaml || _lost="$_lost $_k"
 done
 [[ -z "$_lost" ]] \
   && ok "mosdns 受管配置: 用户上游/规则文件引用全部保留" \
   || bad "迁移把这些从 mosdns 配置里冲掉了:$_lost"
-_changed=$(diff /tmp/mos-before.yaml /etc/mosdns/config.yaml | grep -cE '^[<>]')
+_changed=$(diff $E2E_TMP/mos-before.yaml /etc/mosdns/config.yaml | grep -cE '^[<>]')
 if [[ "$_changed" == 0 ]]; then
   ok "mosdns 受管配置逐字节未变"
 else
   # 变了就把变的行摆出来, 并且只接受已知的受管旋钮
-  _unexpected=$(diff /tmp/mos-before.yaml /etc/mosdns/config.yaml | grep -E '^[<>]' \
+  _unexpected=$(diff $E2E_TMP/mos-before.yaml /etc/mosdns/config.yaml | grep -E '^[<>]' \
                 | grep -vE 'size: *[0-9]+' | head -5)
   [[ -z "$_unexpected" ]] \
-    && ok "mosdns 受管配置只动了受管旋钮 cache size($(grep -oE 'size: *[0-9]+' /tmp/mos-before.yaml | head -1) → $(grep -oE 'size: *[0-9]+' /etc/mosdns/config.yaml | head -1)), 属既定迁移" \
+    && ok "mosdns 受管配置只动了受管旋钮 cache size($(grep -oE 'size: *[0-9]+' $E2E_TMP/mos-before.yaml | head -1) → $(grep -oE 'size: *[0-9]+' /etc/mosdns/config.yaml | head -1)), 属既定迁移" \
     || bad "mosdns 配置里有受管旋钮之外的改动:
 $_unexpected"
 fi

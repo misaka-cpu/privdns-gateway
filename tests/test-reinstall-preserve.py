@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PASS = [0]
@@ -60,7 +61,7 @@ else:
 # ── 2. 保留判据 ────────────────────────────────────────────────────────────
 print()
 print("── 2. 存在就保留, 不存在才初始化 ──")
-work = tempfile.mkdtemp(prefix="pdgpreserve.")
+work = tmpguard.mkdtemp(prefix="pdgpreserve.")
 try:
     f = os.path.join(work, "custom_hijack.txt")
     with open(f, "w", encoding="utf-8") as fh:

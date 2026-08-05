@@ -31,6 +31,7 @@ import tarfile
 import tempfile
 import threading
 import time
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tests"))
@@ -74,7 +75,7 @@ cfgrestore.reload_limits()
 
 # ── 1. 解包的资源边界 ──────────────────────────────────────────────────────
 print("── 1. 解包有界 ──")
-WORK = tempfile.mkdtemp(prefix="pdgres.")
+WORK = tmpguard.mkdtemp(prefix="pdgres.")
 CLEANUP.append(lambda: shutil.rmtree(WORK, ignore_errors=True))
 
 

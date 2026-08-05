@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -165,7 +166,7 @@ TMPS = []
 
 
 def _real_der():
-    d = tempfile.mkdtemp(prefix="ioslegacy-ca-")
+    d = tmpguard.mkdtemp(prefix="ioslegacy-ca-")
     TMPS.append(d)
     subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
                     "-keyout", d + "/k.pem", "-out", d + "/c.pem", "-days", "1",

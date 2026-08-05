@@ -29,6 +29,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tests"))
@@ -213,7 +214,7 @@ if not os.access(MOSDNS, os.X_OK):
     else:
         print("[SKIP] " + msg)
 else:
-    d = tempfile.mkdtemp(prefix="bootrules.")
+    d = tmpguard.mkdtemp(prefix="bootrules.")
     try:
         rules = os.path.join(d, "rules")
         os.makedirs(rules)
@@ -309,7 +310,7 @@ spec = importlib.util.spec_from_file_location("pdgchecks", ROOT / "deploy/bot/ch
 checks = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(checks)
 
-d5 = tempfile.mkdtemp(prefix="geodb.")
+d5 = tmpguard.mkdtemp(prefix="geodb.")
 try:
     checks.GEOSITE_DIR = d5
     names = ("geosite_cn.txt", "geosite_apple.txt", "geosite_gfw.txt",

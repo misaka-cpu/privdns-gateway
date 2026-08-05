@@ -25,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -47,7 +48,7 @@ def bad(m):
 
 
 def newbox():
-    root = tempfile.mkdtemp(prefix="iosconc-")
+    root = tmpguard.mkdtemp(prefix="iosconc-")
     TMPS.append(root)
     for d in ("etc/privdns-gateway", "run", "var/lib/privdns-gateway"):
         os.makedirs(os.path.join(root, d), exist_ok=True)

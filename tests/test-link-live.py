@@ -21,6 +21,7 @@ import time
 import urllib.request
 from http.server import HTTPServer
 from pathlib import Path
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "deploy/bot"))
@@ -46,7 +47,7 @@ CIDR_NOW = ["127.0.0.0/8"]
 
 
 def fresh(cidr="127.0.0.0/8"):
-    d = tempfile.mkdtemp(prefix="linklive."); TMPS.append(d)
+    d = tmpguard.mkdtemp(prefix="linklive."); TMPS.append(d)
     os.environ["PDG_PROBE81_RUNTIME_DIR"] = d
     os.environ["PDG_PROFILE_ENV"] = os.path.join(d, "profile.env")
     open(os.environ["PDG_PROFILE_ENV"], "w").write("PDG_INTERNAL_CIDR=%s\n" % cidr)

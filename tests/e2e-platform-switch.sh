@@ -39,13 +39,12 @@ for u in pdg-bot mosdns; do
   printf '[Unit]\nDescription=%s\n[Service]\nExecStart=/usr/local/bin/%s\n' "$u" "$u" \
     > "/etc/systemd/system/$u.service"
 done
-for u in pdg-bot mosdns mihomo; do echo 1 > "/tmp/e2e-svc/$u.ac"; echo 1 > "/tmp/e2e-svc/$u.en"; done
+for u in pdg-bot mosdns mihomo; do echo 1 > "$E2E_TMP/e2e-svc/$u.ac"; echo 1 > "$E2E_TMP/e2e-svc/$u.en"; done
 e2e_fetch_mihomo || e2e_skip "取不到 mihomo 二进制"
 
 # nft 桩: 维护一份"已加载 ruleset", 好验证运行规则真的跟着变
-cat > /usr/local/bin/nft <<'S'
-#!/bin/sh
-STATE=/tmp/e2e-nft-ruleset
+{ printf '#!/bin/sh\nSTATE=%s\n' "$E2E_TMP/e2e-nft-ruleset"   # 引号 heredoc 不展开, 路径走头行
+  cat <<'S'
 case "$1" in
   -c) exit 0 ;;
   -f) [ -f "$2" ] && cat "$2" > "$STATE"; exit 0 ;;
@@ -54,11 +53,12 @@ case "$1" in
 esac
 exit 0
 S
+} > /usr/local/bin/nft
 chmod 755 /usr/local/bin/nft
 nft -f /etc/nftables.conf
 
 gms_in_nft(){ grep -qE 'tcp dport [{][^}]*5228' /etc/nftables.conf; }
-gms_in_ruleset(){ grep -qE 'tcp dport [{][^}]*5228' /tmp/e2e-nft-ruleset 2>/dev/null; }
+gms_in_ruleset(){ grep -qE 'tcp dport [{][^}]*5228' $E2E_TMP/e2e-nft-ruleset 2>/dev/null; }
 mitm_out_in_core(){ grep -q 'MITM-OUT' /etc/mihomo/config.yaml 2>/dev/null; }
 
 # ══ 1. Android → iOS: 组件必须真部署 ═══════════════════════════════════════
@@ -80,7 +80,7 @@ gms_in_nft && bad "1g: iOS 的防火墙里仍有 GMS 5228-5230" || ok "iOS: 防�
 
 # ══ 2. WLOC 开启后切回 Android: 安全休眠 + 运行时接管彻底撤掉 ═════════════
 echo; echo "── 2. WLOC 开启状态下切回 Android ──"
-python3 - > /tmp/plat-wloc-on.out 2>&1 <<'PY'
+python3 - > $E2E_TMP/plat-wloc-on.out 2>&1 <<'PY'
 import sys; sys.path.insert(0, "/opt/pdg-bot")
 import bot
 w = {"enabled": True, "accuracy": 50, "active": "大阪", "generation": 1,
@@ -88,7 +88,7 @@ w = {"enabled": True, "accuracy": 50, "active": "大阪", "generation": 1,
 okr, msg = bot._mitm_transact(w)
 print(("OK|" if okr else "FAIL|") + (msg or ""))
 PY
-grep -q '^OK|' /tmp/plat-wloc-on.out && ok "先把 WLOC 开起来(真实事务)" || bad "2: 开 WLOC 失败: $(cat /tmp/plat-wloc-on.out)"
+grep -q '^OK|' $E2E_TMP/plat-wloc-on.out && ok "先把 WLOC 开起来(真实事务)" || bad "2: 开 WLOC 失败: $(cat $E2E_TMP/plat-wloc-on.out)"
 mitm_out_in_core && ok "开启后 mihomo 配置里有 MITM-OUT(切换前的现场)" || bad "2b: MITM-OUT 没进内核配置"
 
 out=$(pdg platform android 2>&1); rc=$?
@@ -224,7 +224,7 @@ out=$(pdg platform ios 2>&1); rc=$?
   && ok "凭据只配一半 → 明确报配置错误并回滚" || bad "7i: rc=$rc: $(tail -3 <<<"$out")"
 e2e_svc_heal pdg-bot
 printf 'PDG_BOT_TOKEN=123456:AAaa\nPDG_BOT_ALLOWED=1\n' > /etc/privdns-gateway/bot.env
-echo 1 > /tmp/e2e-svc/pdg-bot.ac; echo 1 > /tmp/e2e-svc/pdg-bot.en
+echo 1 > $E2E_TMP/e2e-svc/pdg-bot.ac; echo 1 > $E2E_TMP/e2e-svc/pdg-bot.en
 pdg platform android >/dev/null 2>&1
 
 # ══ 8. iOS 组件部署失败必须整体失败并回滚 ══════════════════════════════════
@@ -275,5 +275,5 @@ done
 ok "成功路径七个必需文件全部就位"
 pdg platform android >/dev/null 2>&1
 
-rm -f /usr/local/bin/nft.real /tmp/e2e-nft-ruleset
+rm -f /usr/local/bin/nft.real $E2E_TMP/e2e-nft-ruleset
 e2e_summary

@@ -147,11 +147,13 @@ out=$(pdg rollback --dir "$OLD" 2>&1); rc=$?
 # ══ 6. 元数据损坏: 只显示未知, 不扩权、不执行 ══════════════════════════════
 echo; echo "── 6. 损坏的元数据 ──"
 BADD="$(newest)"
-printf 'not json at all $(touch /tmp/pwned) `id`\n' > "$BADD/snapshot.json"
+# 载荷里的路径必须与下面的断言是同一个 —— 用 %s 注入(单引号格式串保证 $( ) 原样落盘,
+# printf 自己不求值)。两边写成不同路径的话, 断言就永远成立, 等于没验。
+printf 'not json at all $(touch %s) `id`\n' "$E2E_TMP/pwned" > "$BADD/snapshot.json"
 chmod 644 "$BADD/snapshot.json"
-rm -f /tmp/pwned
+rm -f $E2E_TMP/pwned
 out=$(printf 'n\n' | pdg rollback 2>&1)
-[[ ! -e /tmp/pwned ]] && ok "坏元数据里的命令没有被执行" || bad "6: 元数据被当成代码跑了"
+[[ ! -e $E2E_TMP/pwned ]] && ok "坏元数据里的命令没有被执行" || bad "6: 元数据被当成代码跑了"
 grep -q '来源未知' <<<"$out" && ok "坏元数据显示为「来源未知」" || bad "6b: $(tail -3 <<<"$out")"
 [[ "$(stat -c '%a' "$BADD/snapshot.json")" == 644 ]] \
   && ok "读它不会顺手改权限(没有扩权)" || bad "6c: 权限被改成 $(stat -c '%a' "$BADD/snapshot.json")"

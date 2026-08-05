@@ -26,6 +26,12 @@ import time
 
 SCHEMA_VERSION = 1
 
+# E2E 的桩把状态写在**本轮自己的**临时目录里(e2e-lib.sh 的 $E2E_TMP), 不再是写死的 /tmp。
+# 这里只是"观察"那些文件, 所以跟着同一个变量走; 不在 E2E 里跑时退回 /tmp, 探测结果照旧。
+E2E_TMP = os.environ.get("E2E_TMP") or "/tmp"
+STUB_SVC_DIR = os.path.join(E2E_TMP, "e2e-svc")
+STUB_NFT_STATE = os.path.join(E2E_TMP, "e2e-nft-ruleset")
+
 # 每个 profile 说清"这个场景允许什么变"。未知 profile 直接失败 —— 不给默认值, 免得写错名字
 # 的场景悄悄退化成"什么都不查"。
 PROFILES = {
@@ -92,14 +98,14 @@ def detect_caps(root):
     sc = run(["sh", "-c", "command -v systemctl"])[1]
     if not sc:
         caps["systemd"] = "unavailable"
-    elif "/usr/local/bin/systemctl" in sc or os.path.exists("/tmp/e2e-svc"):
+    elif "/usr/local/bin/systemctl" in sc or os.path.exists(STUB_SVC_DIR):
         caps["systemd"] = "stub"          # E2E 的假 systemctl(见 e2e_stub_system)
     else:
         caps["systemd"] = "real" if run(["systemctl", "is-system-running"])[0] in (0, 1) else "stub"
     nf = run(["sh", "-c", "command -v nft"])[1]
     if not nf:
         caps["nft"] = "unavailable"
-    elif "/usr/local/bin/nft" in nf or os.path.exists("/tmp/e2e-nft-ruleset"):
+    elif "/usr/local/bin/nft" in nf or os.path.exists(STUB_NFT_STATE):
         caps["nft"] = "stub"
     else:
         caps["nft"] = "real" if run(["nft", "list", "tables"])[0] == 0 else "stub"
@@ -239,7 +245,7 @@ def capture(args):
             }
     elif caps["systemd"] == "stub":
         # 桩环境: 只记桩自己的状态文件摘要, **不产出看似真实的 systemctl 数值**。
-        d = "/tmp/e2e-svc"
+        d = STUB_SVC_DIR
         svc["stub_state"] = sorted(
             "%s=%s" % (f, (open(os.path.join(d, f)).read().strip() if os.path.isfile(
                 os.path.join(d, f)) else "?"))

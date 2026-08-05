@@ -65,11 +65,11 @@ printf '#!/bin/sh\ncase "$1" in version) echo "sing-box version 1.12.25";; check
 printf '#!/bin/sh\ncase "$1" in -v|version) echo "Mihomo Meta %s linux amd64";; -t) exit 0;; esac\nexit 0\n' \
   "$MIHOMO_VER" > /usr/local/bin/mihomo; chmod 755 /usr/local/bin/mihomo
 # 让假 systemd 认为 sing-box 正在跑(迁移前的真实状态)
-echo 1 > /tmp/e2e-svc/sing-box.ac; echo 1 > /tmp/e2e-svc/sing-box.en
+echo 1 > $E2E_TMP/e2e-svc/sing-box.ac; echo 1 > $E2E_TMP/e2e-svc/sing-box.en
 
 # ── 造发布源: v1.5.12(旧) 与 vNEXT(当前代码) 两个 tag ────────────────────────
 REPO=/opt/privdns-gateway
-ORIGIN=/tmp/e2e-xver-origin.git
+ORIGIN=$E2E_TMP/e2e-xver-origin.git
 rm -rf "$REPO/.git" "$ORIGIN"
 git -C "$REPO" init -q -b main
 e2e_guard_repo "$REPO" || exit 1     # 刚 init 出来的一次性库才准动 ref
@@ -102,7 +102,7 @@ install -m755 "$REPO/deploy/bot/pdg-bot.py" /opt/pdg-bot/bot.py
 # ── 注入: 迁移成功之后, 让校验门里的 doctor 判失败 ───────────────────────────
 # doctor.py 由更新器从**新版**仓库装到 /opt/pdg-bot, 故要在 update 跑起来后才生效 ——
 # 用 wrapper 覆盖 python3 太粗暴; 直接让新版 doctor.py 在被调用时返回失败即可。
-cat > /tmp/e2e-doctor-fail.py <<'P'
+cat > $E2E_TMP/e2e-doctor-fail.py <<'P'
 import sys
 print('[{"status":"fail","name":"注入","msg":"e2e 注入的自检失败"}]')
 sys.exit(1)
@@ -110,14 +110,15 @@ P
 # 更新器装完新版文件后才调 doctor(`python3 /opt/pdg-bot/doctor.py --json`), 所以不能预先改
 # doctor.py —— install 会把它覆盖回去。改为在 PATH 前面放一层 python3 包装: **只**拦 doctor.py
 # 这一次调用, 其余(py_compile / 迁移渲染 / checks 取内网段)一律透传给真 python3。
-INJ=/tmp/e2e-inject; rm -rf "$INJ"; mkdir -p "$INJ"
-cat > "$INJ/python3" <<'P'
-#!/bin/sh
+INJ=$E2E_TMP/e2e-inject; rm -rf "$INJ"; mkdir -p "$INJ"
+{ printf '#!/bin/sh\nFAKE=%s/e2e-doctor-fail.py\n' "$E2E_TMP"   # 引号 heredoc 不展开, 路径走头行
+  cat <<'P'
 for a in "$@"; do
-  case "$a" in */doctor.py|doctor.py) exec /usr/bin/python3 /tmp/e2e-doctor-fail.py ;; esac
+  case "$a" in */doctor.py|doctor.py) exec /usr/bin/python3 "$FAKE" ;; esac
 done
 exec /usr/bin/python3 "$@"
 P
+} > "$INJ/python3"
 chmod 755 "$INJ/python3"
 export PATH="$INJ:$PATH"
 python3 /opt/pdg-bot/doctor.py --json >/dev/null 2>&1 \

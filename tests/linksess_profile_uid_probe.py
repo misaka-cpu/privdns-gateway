@@ -28,6 +28,7 @@ import os
 import pwd
 import sys
 import tempfile
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "..", "deploy", "bot"))
@@ -100,7 +101,7 @@ def main():
     # 布局照真机来。这两个父目录的权限**本来就不一样**, 混成一个会把测试搭坏:
     #   /etc/privdns-gateway  0700 root:root  ← profile.env 在这儿, 动态用户连进都进不去
     #   /run/pdg-probe81      0700 <dynuid>   ← 会话在这儿, 父目录 /run 人人可穿过
-    box = tempfile.mkdtemp(prefix="profuid.")
+    box = tmpguard.mkdtemp(prefix="profuid.")
     os.chmod(box, 0o711)                   # 相当于 /: 可穿过, 不可列
     etc = os.path.join(box, "etc")
     os.makedirs(etc, mode=0o700)           # 相当于 /etc/privdns-gateway

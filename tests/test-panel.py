@@ -11,6 +11,7 @@ import tarfile
 import tempfile
 import zipfile
 from pathlib import Path
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = Path(__file__).resolve().parents[1]
 os.environ["PDG_VERSIONS_FILE"] = str(ROOT / "lib/versions.sh")
@@ -90,7 +91,7 @@ print("[OK]   读不到内网卡段 → 拒绝开启")
 # ── _ensure_zashboard: SHA256 不符 → 拒绝(供应链校验)────────────────────────
 bot._ensure_zashboard = _REAL_ENSURE        # 恢复真函数
 bot._fetch_bytes = lambda url: b"not-a-real-zashboard-zip"
-bot.UI_DIR = tempfile.mkdtemp(); bot.UI_DIST = os.path.join(bot.UI_DIR, "dist")
+bot.UI_DIR = tmpguard.mkdtemp(); bot.UI_DIST = os.path.join(bot.UI_DIR, "dist")
 ok, err = bot._ensure_zashboard()
 assert not ok and "SHA256" in err, ("SHA 不符应拒绝", ok, err)
 print("[OK]   zashboard SHA256 不符 → 拒绝安装")

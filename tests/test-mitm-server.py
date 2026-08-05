@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "deploy" / "bot"))
@@ -53,7 +54,7 @@ def socks5_connect(sock, host, port):
 def main():
     if subprocess.run(["openssl", "version"], capture_output=True).returncode != 0:
         print("[SKIP] 无 openssl"); return
-    tmp = tempfile.mkdtemp()
+    tmp = tmpguard.mkdtemp()
     mitm_ca.CA_DIR = os.path.join(tmp, "ca")
     ca_crt = mitm_ca.ensure_ca()
 

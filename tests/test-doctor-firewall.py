@@ -21,6 +21,7 @@ import os
 import sys
 import tempfile
 from pathlib import Path
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "deploy/bot"))
@@ -40,7 +41,7 @@ def bad(m):
 
 
 CIDR = "172.22.0.0/16"
-BOX = tempfile.mkdtemp(prefix="docfw.")
+BOX = tmpguard.mkdtemp(prefix="docfw.")
 PROFILE = os.path.join(BOX, "profile.env")
 io.open(PROFILE, "w", encoding="utf-8").write("PDG_INTERNAL_CIDR=%s\n" % CIDR)
 NFTCONF = os.path.join(BOX, "nftables.conf")

@@ -15,6 +15,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -119,7 +120,7 @@ PDG = os.path.join(ROOT, "deploy", "bot", "pdg.sh")
 
 def run_migration(nft_text, mos_text, profile_text="PDG_LOWMEM=0\n"):
     """在临时根下真跑迁移函数, 返回 (退出码, 输出, 迁移后的 profile.env 内容)。"""
-    d = tempfile.mkdtemp()
+    d = tmpguard.mkdtemp()
     os.makedirs(os.path.join(d, "etc/privdns-gateway"), exist_ok=True)
     os.makedirs(os.path.join(d, "etc/mosdns"), exist_ok=True)
     prof = os.path.join(d, "etc/privdns-gateway/profile.env")

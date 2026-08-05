@@ -19,6 +19,7 @@ import shutil
 import sys
 import tempfile
 from pathlib import Path
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = Path(__file__).resolve().parents[1]
 BOTDIR = str(ROOT / "deploy" / "bot")
@@ -54,7 +55,7 @@ def check_wording(label, *texts):
     return True
 
 
-ROOTFS = tempfile.mkdtemp(prefix="iosft-")
+ROOTFS = tmpguard.mkdtemp(prefix="iosft-")
 TMPS.append(ROOTFS)
 os.makedirs(ROOTFS + "/etc/privdns-gateway", exist_ok=True)
 os.makedirs(ROOTFS + "/run", exist_ok=True)

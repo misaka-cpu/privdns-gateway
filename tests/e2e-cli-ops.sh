@@ -39,7 +39,7 @@ for u in pdg-bot mosdns; do
   printf '[Unit]\nDescription=%s\n[Service]\nExecStart=/usr/local/bin/%s\n' "$u" "$u" \
     > "/etc/systemd/system/$u.service"
 done
-for u in pdg-bot mosdns mihomo; do echo 1 > "/tmp/e2e-svc/$u.ac"; echo 1 > "/tmp/e2e-svc/$u.en"; done
+for u in pdg-bot mosdns mihomo; do echo 1 > "$E2E_TMP/e2e-svc/$u.ac"; echo 1 > "$E2E_TMP/e2e-svc/$u.en"; done
 # 有效的 mihomo 配置(下面某些用例会故意写坏它)
 printf '{"log-level":"silent","mixed-port":17890,"proxies":[],"rules":["MATCH,DIRECT"]}\n' \
   > /etc/mihomo/config.yaml
@@ -77,9 +77,9 @@ printf 'proxies: [\n' > /etc/mihomo/config.yaml
 out=$(pdg restart 2>&1); rc=$?          # 第一次顺带让幂等迁移落定(它自己也会重启服务)
 { [[ "$rc" != 0 ]] && grep -q '校验' <<<"$out"; } \
   && ok "内核配置不合法 → 先报校验失败, 返回非 0" || bad "1f: rc=$rc: $(tail -3 <<<"$out")"
-CALLS_BEFORE="$(grep -c 'systemctl restart' /tmp/e2e-calls.log 2>/dev/null)"
+CALLS_BEFORE="$(grep -c 'systemctl restart' $E2E_TMP/e2e-calls.log 2>/dev/null)"
 out=$(pdg restart 2>&1); rc=$?
-CALLS_AFTER="$(grep -c 'systemctl restart' /tmp/e2e-calls.log 2>/dev/null)"
+CALLS_AFTER="$(grep -c 'systemctl restart' $E2E_TMP/e2e-calls.log 2>/dev/null)"
 { [[ "$rc" != 0 ]] && [[ "$CALLS_BEFORE" == "$CALLS_AFTER" ]]; } \
   && ok "校验没过时一个服务都没重启" || bad "1g: rc=$rc 重启计数 $CALLS_BEFORE→$CALLS_AFTER"
 printf '%s\n' "$GOOD_CFG" > /etc/mihomo/config.yaml
@@ -88,7 +88,7 @@ fi
 # ══ 2. restart: 未配 Bot 凭据时明确跳过 pdg-bot ═════════════════════════════
 echo; echo "── 2. 未配 Bot 凭据 ──"
 : > /etc/privdns-gateway/bot.env
-echo 0 > /tmp/e2e-svc/pdg-bot.ac                      # 没配凭据, bot 本来就不该在跑
+echo 0 > $E2E_TMP/e2e-svc/pdg-bot.ac                      # 没配凭据, bot 本来就不该在跑
 out=$(pdg restart 2>&1); rc=$?
 [[ "$rc" == 0 ]] && ok "未配凭据 + pdg-bot 未运行 → restart 仍返回 0" || bad "2: rc=$rc: $(tail -3 <<<"$out")"
 grep -q '未配置' <<<"$out" && ok "明确显示「未配置, 未启动」" || bad "2b: 没说明: $(tail -3 <<<"$out")"
@@ -98,13 +98,13 @@ printf 'PDG_BOT_TOKEN=123456:AAaa\n' > /etc/privdns-gateway/bot.env   # 只配�
 out=$(pdg restart 2>&1)
 grep -q '只配了一项' <<<"$out" && ok "只配一半 → 明确提示配置错误" || bad "2d: $(tail -3 <<<"$out")"
 printf 'PDG_BOT_TOKEN=123456:AAaa\nPDG_BOT_ALLOWED=1\n' > /etc/privdns-gateway/bot.env
-echo 1 > /tmp/e2e-svc/pdg-bot.ac
+echo 1 > $E2E_TMP/e2e-svc/pdg-bot.ac
 
 # ══ 3. restart: iOS 服务集 ═════════════════════════════════════════════════
 echo; echo "── 3. iOS 服务集 ──"
 printf 'ios\n' > /etc/privdns-gateway/platform
 printf '[Unit]\nDescription=probe81\n[Service]\nExecStart=/bin/true\n' > /etc/systemd/system/pdg-probe81.service
-echo 1 > /tmp/e2e-svc/pdg-probe81.ac; echo 1 > /tmp/e2e-svc/pdg-probe81.en
+echo 1 > $E2E_TMP/e2e-svc/pdg-probe81.ac; echo 1 > $E2E_TMP/e2e-svc/pdg-probe81.en
 out=$(pdg restart 2>&1); rc=$?
 { [[ "$rc" == 0 ]] && grep -q 'pdg-probe81' <<<"$out"; } \
   && ok "iOS: 重启清单含 pdg-probe81" || bad "3: $(tail -3 <<<"$out")"
@@ -115,7 +115,7 @@ out=$(pdg restart 2>&1); rc=$?
 e2e_svc_heal pdg-probe81
 # pdg-mitm 已启用时也要核验
 printf '[Unit]\nDescription=mitm\n[Service]\nExecStart=/bin/true\n' > /etc/systemd/system/pdg-mitm.service
-echo 1 > /tmp/e2e-svc/pdg-mitm.en; echo 1 > /tmp/e2e-svc/pdg-mitm.ac
+echo 1 > $E2E_TMP/e2e-svc/pdg-mitm.en; echo 1 > $E2E_TMP/e2e-svc/pdg-mitm.ac
 out=$(pdg restart 2>&1)
 grep -q 'pdg-mitm' <<<"$out" && ok "已启用的 pdg-mitm 也纳入核验" || bad "3c: $(tail -3 <<<"$out")"
 e2e_svc_crash pdg-mitm
@@ -123,7 +123,7 @@ out=$(pdg restart 2>&1); rc=$?
 [[ "$rc" != 0 ]] && ok "pdg-mitm 起不来 → 非 0" || bad "3d: 竟然返回 0: $(tail -3 <<<"$out")"
 e2e_svc_heal pdg-mitm
 rm -f /etc/systemd/system/pdg-mitm.service /etc/systemd/system/pdg-probe81.service
-rm -f /tmp/e2e-svc/pdg-mitm.* /tmp/e2e-svc/pdg-probe81.*
+rm -f $E2E_TMP/e2e-svc/pdg-mitm.* $E2E_TMP/e2e-svc/pdg-probe81.*
 printf 'android\n' > /etc/privdns-gateway/platform
 
 # ══ 4. status: 监听端口靠 ss(iproute2) ═════════════════════════════════════
@@ -173,8 +173,8 @@ hash_state(){
 printf 'PDG_PLATFORM=android\n' > /etc/privdns-gateway/profile.env
 # origin 指向**本地** bare 仓库: dry-run 会真的 fetch, 不该依赖外网(串行跑时前一个脚本
 # 可能已经把 /etc/resolv.conf 指到本机 mosdns, 那时解析 github.com 必然失败)。
-rm -rf /tmp/e2e-cli-origin.git
-git init -q --bare /tmp/e2e-cli-origin.git
+rm -rf $E2E_TMP/e2e-cli-origin.git
+git init -q --bare $E2E_TMP/e2e-cli-origin.git
 # `cd` 必须带 `|| exit` —— 目录不在时子 shell **不会**自己退出, 后面 git init / git add -A /
 # git commit / remote set-url / tag 会原地落在当时的工作目录上。而跑测试时那通常就是
 # 开发者的真仓库: 本机上它真的往仓库里塞了一个 "base" 提交、把 user.name 改成 t、
@@ -189,7 +189,7 @@ git init -q --bare /tmp/e2e-cli-origin.git
   e2e_git . config commit.gpgsign false || exit 1
   e2e_git . add -A >/dev/null 2>&1; e2e_git . commit -qm base >/dev/null 2>&1
   e2e_git . remote remove origin >/dev/null 2>&1
-  e2e_git . remote add origin /tmp/e2e-cli-origin.git || exit 1
+  e2e_git . remote add origin $E2E_TMP/e2e-cli-origin.git || exit 1
   e2e_git . push -q origin HEAD:refs/heads/main >/dev/null 2>&1
   e2e_git . tag -f v9.9.9 >/dev/null 2>&1
   e2e_git . push -q origin --tags >/dev/null 2>&1 ) || true
@@ -212,12 +212,12 @@ out=$(pdg update --dry-run 2>&1); rc=$?
 [[ "$(hash_state)" == "$BEFORE" ]] && ok "fetch 失败路径同样零修改" || bad "6e: 失败路径改了东西"
 
 # 远端能拉但一个发布 tag 都没有 → 同样要明说, 不能装作"已是最新"
-rm -rf /tmp/e2e-empty-origin.git
-git init -q --bare /tmp/e2e-empty-origin.git
+rm -rf $E2E_TMP/e2e-empty-origin.git
+git init -q --bare $E2E_TMP/e2e-empty-origin.git
 # 以前这里是 `( cd /opt/privdns-gateway || exit; git remote add …; git push … )`, 守卫写在
 # 整块**之后** —— 先改后守, 守卫报不报警都已经晚了。改成每条动作自带守卫。
 e2e_git /opt/privdns-gateway remote remove origin >/dev/null 2>&1
-e2e_git /opt/privdns-gateway remote add origin /tmp/e2e-empty-origin.git || exit 1
+e2e_git /opt/privdns-gateway remote add origin $E2E_TMP/e2e-empty-origin.git || exit 1
 e2e_git /opt/privdns-gateway push -q origin HEAD:refs/heads/main >/dev/null 2>&1
 # xargs 调不了 shell 函数 —— 用数组接住再一次删完, 免得管道右边又变成一条裸 git 改动。
 mapfile -t _vtags < <(e2e_git /opt/privdns-gateway tag -l 'v*') || exit 1
@@ -234,7 +234,7 @@ out=$(pdg update --dry-run 2>&1); rc=$?
   && ok "仓库不可用 → 返回非 0 并说明" || bad "6h: rc=$rc: $(tail -3 <<<"$out")"
 mv /opt/privdns-gateway/.git-hidden /opt/privdns-gateway/.git
 e2e_git /opt/privdns-gateway tag -f v9.9.9 >/dev/null 2>&1 || exit 1
-rm -rf /tmp/e2e-empty-origin.git /tmp/e2e-cli-origin.git
+rm -rf $E2E_TMP/e2e-empty-origin.git $E2E_TMP/e2e-cli-origin.git
 
 # ══ 7. detect-cidr 事务化 ══════════════════════════════════════════════════
 # detect-cidr 走一笔真事务, 候选校验要拿**真 mosdns** 解析新配置。取二进制放在这里而不是
@@ -249,11 +249,11 @@ e2e_fetch_mosdns || e2e_skip "取不到 mosdns 二进制(§7 的候选校验要�
 mosdns version >/dev/null 2>&1 \
   || { echo "[FAIL] §7 前提: mosdns 取到了却跑不起来"; exit 1; }
 echo; echo "── 7. detect-cidr ──"
-cp /etc/nftables.conf /tmp/pristine.nft
-cp /etc/mosdns/config.yaml /tmp/pristine.mos
+cp /etc/nftables.conf $E2E_TMP/pristine.nft
+cp /etc/mosdns/config.yaml $E2E_TMP/pristine.mos
 NFT_SHA0="$(sha256sum /etc/nftables.conf | cut -d' ' -f1)"
 MOS_SHA0="$(sha256sum /etc/mosdns/config.yaml | cut -d' ' -f1)"
-reset_cidr(){ cp /tmp/pristine.nft /etc/nftables.conf; cp /tmp/pristine.mos /etc/mosdns/config.yaml; }
+reset_cidr(){ cp $E2E_TMP/pristine.nft /etc/nftables.conf; cp $E2E_TMP/pristine.mos /etc/mosdns/config.yaml; }
 # 抓包桩: 固定报一个与当前不同的网段; 交互确认自动回 y
 cat > /usr/local/bin/tcpdump <<'S'
 #!/bin/sh
@@ -340,7 +340,7 @@ out=$(detect); rc=$?
   && ok "幂等: 第二次没有改动任何配置" || bad "7m: 第二次改了配置"
 _S7_CLEANUP=yes    # 场景标记: 收尾与幂等复核真的跑过
 
-rm -f /tmp/pristine.nft /tmp/pristine.mos /usr/local/bin/nft.real /usr/local/bin/tar.real
+rm -f $E2E_TMP/pristine.nft $E2E_TMP/pristine.mos /usr/local/bin/nft.real /usr/local/bin/tar.real
 
 # ── 必需场景守卫 ────────────────────────────────────────────────────────────
 # 光看总退出码是不够的: 把 §7 整段删掉或提前 return, 其余部分照样全绿, 退出码 0 —— 而

@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -45,7 +46,7 @@ def cred(*args, env=None, timeout=180):
     return p.returncode, (p.stdout or "").strip()
 
 
-work = tempfile.mkdtemp(prefix="rescue-auth.")
+work = tmpguard.mkdtemp(prefix="rescue-auth.")
 d = os.path.join(work, "rescue")
 os.makedirs(d)
 CENV = {"PDG_RESCUE_DIR": d, "PDG_RESCUE_CERT": os.path.join(d, "cert.pem"),

@@ -25,6 +25,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = Path(__file__).resolve().parents[1]
 BOTDIR = str(ROOT / "deploy" / "bot")
@@ -44,7 +45,7 @@ def bad(m):
 
 
 # ── 沙箱: 所有落盘都在临时根下, 不碰真机 ────────────────────────────────────
-ROOTFS = tempfile.mkdtemp(prefix="linkbot-")
+ROOTFS = tmpguard.mkdtemp(prefix="linkbot-")
 RUNDIR = os.path.join(ROOTFS, "run", "pdg-probe81")
 os.makedirs(RUNDIR, exist_ok=True)
 os.makedirs(os.path.join(ROOTFS, "etc", "privdns-gateway"), exist_ok=True)

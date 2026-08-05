@@ -18,6 +18,7 @@ import sys
 import tarfile
 import tempfile
 import urllib.parse
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -42,7 +43,7 @@ def bad(m):
     print("  ✗ %s" % m)
 
 
-work = tempfile.mkdtemp(prefix="snapmatrix.")
+work = tmpguard.mkdtemp(prefix="snapmatrix.")
 
 
 def fp_from_disk(pem):
@@ -56,7 +57,7 @@ def fp_from_disk(pem):
 
 def make_box():
     """现网: 一份合法的 mosdns + 数据模型, 服务都在。"""
-    box = Box(work)
+    box = Box()
     box.up("mosdns")
     box.up("mihomo")
     for rel, data in (("etc/sing-box/config.json", SM.MODEL),

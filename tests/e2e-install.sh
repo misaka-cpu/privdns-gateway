@@ -102,7 +102,7 @@ reset_box(){
          /opt/privdns-gateway \
          /usr/local/bin/pdg /usr/local/bin/pdg-set-token /etc/systemd/system/pdg-*.service \
          /etc/systemd/system/mosdns.service /etc/systemd/system/sing-box.service
-  rm -rf /tmp/e2e-svc; mkdir -p /tmp/e2e-svc
+  rm -rf $E2E_TMP/e2e-svc; mkdir -p $E2E_TMP/e2e-svc
 }
 
 # ══ 1. 全新安装应当成功并落地全套 ════════════════════════════════════════════
@@ -163,9 +163,9 @@ out=$(run_install ""); rc=$?
 echo; echo "── 3. 注入失败: 回滚路径 ──"
 reset_box
 # 让核心服务起不来 → 触发安装末尾的"服务未持续运行"判定 → 回滚
-cat > /usr/local/bin/systemctl <<'S'
-#!/bin/sh
-D=/tmp/e2e-svc; mkdir -p "$D"
+{ printf '#!/bin/sh\nD=%s/e2e-svc\n' "$E2E_TMP"   # 引号 heredoc 不展开, 路径从生成的头行注入
+  cat <<'S'
+mkdir -p "$D"
 verb="$1"; shift
 now=0; [ "$1" = "--now" ] && { now=1; shift; }
 case "$verb" in
@@ -180,6 +180,7 @@ case "$verb" in
 esac
 exit 0
 S
+} > /usr/local/bin/systemctl
 chmod 755 /usr/local/bin/systemctl
 out=$(run_install ""); rc=$?
 [[ "$rc" != 0 ]] && ok "核心服务起不来 → 安装返回非0" || bad "服务没起来却报成功"
@@ -323,8 +324,8 @@ reset_box; e2e_stub_system
 locked=0
 if ! rm -f /etc/resolv.conf 2>/dev/null; then
   locked=1                                        # CI 容器里本来就是 bind mount
-elif { printf 'nameserver 9.9.9.9\n' > /tmp/rc-orig
-       : > /etc/resolv.conf; mount --bind /tmp/rc-orig /etc/resolv.conf; } 2>/dev/null; then
+elif { printf 'nameserver 9.9.9.9\n' > $E2E_TMP/rc-orig
+       : > /etc/resolv.conf; mount --bind $E2E_TMP/rc-orig /etc/resolv.conf; } 2>/dev/null; then
   locked=1
 fi
 if [[ "$locked" == 1 ]]; then
@@ -346,8 +347,8 @@ reset_box; e2e_stub_system
 out=$(run_install ""); rc=$?
 [[ "$rc" == 0 ]] || bad "8: 准备现场的安装失败 rc=$rc"
 printf 'nameserver 9.9.9.9\n' > /etc/resolv.conf.pdg-orig      # 装机留下的备份(上游 DNS)
-printf 'nameserver 127.0.0.1\n' > /tmp/rc-now
-if mount --bind /tmp/rc-now /etc/resolv.conf 2>/dev/null; then
+printf 'nameserver 127.0.0.1\n' > $E2E_TMP/rc-now
+if mount --bind $E2E_TMP/rc-now /etc/resolv.conf 2>/dev/null; then
   out=$(bash "$E2E_ROOT/uninstall.sh" 2>&1); rc=$?
   grep -q 'nameserver 9.9.9.9' /etc/resolv.conf \
     && ok "bind-mount 的 resolv.conf: 内容被原地写回(上游 DNS 恢复)" \
@@ -361,8 +362,8 @@ if mount --bind /tmp/rc-now /etc/resolv.conf 2>/dev/null; then
   reset_box; e2e_stub_system
   out=$(run_install ""); rc=$?
   printf 'nameserver 9.9.9.9\n' > /etc/resolv.conf.pdg-orig
-  chmod 444 /tmp/rc-now
-  if mount --bind -o ro /tmp/rc-now /etc/resolv.conf 2>/dev/null \
+  chmod 444 $E2E_TMP/rc-now
+  if mount --bind -o ro $E2E_TMP/rc-now /etc/resolv.conf 2>/dev/null \
      && ! (printf x > /etc/resolv.conf) 2>/dev/null; then
     out=$(bash "$E2E_ROOT/uninstall.sh" 2>&1); rc=$?
     grep -qE '未能还原|⚠️' <<<"$out" \
@@ -376,7 +377,7 @@ if mount --bind /tmp/rc-now /etc/resolv.conf 2>/dev/null; then
     umount /etc/resolv.conf 2>/dev/null
     echo "[SKIP] 本环境造不出「连内容都写不进」的 resolv.conf"
   fi
-  chmod 644 /tmp/rc-now; rm -f /tmp/rc-now
+  chmod 644 $E2E_TMP/rc-now; rm -f $E2E_TMP/rc-now
 else
   echo "[SKIP] 本环境不允许 bind mount, 跳过卸载 resolv.conf 用例"
 fi

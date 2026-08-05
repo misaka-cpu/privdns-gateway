@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tests"))
@@ -101,7 +102,7 @@ def v170_template():
 BASE, BASE_SRC = v170_template()
 
 print("── A. 编辑器: 幂等补齐 / 顺序自检 / fail-closed ──")
-work = Path(tempfile.mkdtemp(prefix="explicit-proxy."))
+work = Path(tmpguard.mkdtemp(prefix="explicit-proxy."))
 try:
     # A0: 基准就是"有病的那一版" —— 先证明它确实没有这道判断, 否则后面全是空跑
     if b"explicit_proxy" not in BASE:
@@ -315,7 +316,7 @@ spec = importlib.util.spec_from_file_location("pdg_checks", ROOT / "deploy/bot/c
 checks = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(checks)
 
-cwork = Path(tempfile.mkdtemp(prefix="explicit-proxy-doctor."))
+cwork = Path(tmpguard.mkdtemp(prefix="explicit-proxy-doctor."))
 try:
     def with_conf(text):
         f = cwork / "config.yaml"

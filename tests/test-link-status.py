@@ -17,6 +17,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "deploy/bot"))
@@ -137,7 +138,7 @@ def main():
         print("─" * 40); print("通过 0, 失败 0"); print("零断言 —— 判失败")
         return 1
 
-    d = tempfile.mkdtemp(prefix="linkstat-cert.")
+    d = tmpguard.mkdtemp(prefix="linkstat-cert.")
     TMPS.append(d)
 
     print("── 1. 证书有效期: 正常 / 临期 / 过期 ──")
@@ -409,7 +410,7 @@ def main():
     # 全局锁: 判据要**两头都成立**才有意义 —— 先证明这把锁真能挡住写路径(pdgtx 会 TxBusy),
     # 再证明 collect() 在同样条件下照常完成。只做后者的话, 锁没生效也一样"通过"。
     import fcntl
-    lockdir = tempfile.mkdtemp(prefix="linklock."); TMPS.append(lockdir)
+    lockdir = tmpguard.mkdtemp(prefix="linklock."); TMPS.append(lockdir)
     lockp = os.path.join(lockdir, "pdg.lock")
     held = open(lockp, "w")
     fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)

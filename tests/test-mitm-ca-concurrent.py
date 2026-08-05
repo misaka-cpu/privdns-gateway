@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = Path(__file__).resolve().parents[1]
 BOT = ROOT / "deploy" / "bot"
@@ -46,7 +47,7 @@ def main():
     if run(["openssl", "version"]).returncode != 0:
         print("[SKIP] 无 openssl")
         return
-    tmp = tempfile.mkdtemp()
+    tmp = tmpguard.mkdtemp()
     mitm_ca.CA_DIR = os.path.join(tmp, "ca")     # 故意不预置 CA: 让 ensure_ca 也被并发压
 
     # ── A/B. 24 线程并发, 无预置 CA, 混合域名 ──────────────────────────────────

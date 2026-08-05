@@ -24,6 +24,7 @@ import tarfile
 import tempfile
 import threading
 import time
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -55,7 +56,7 @@ def bad(m):
     FAIL[0] += 1
 
 
-work = tempfile.mkdtemp(prefix="breakglass.")
+work = tmpguard.mkdtemp(prefix="breakglass.")
 
 MODEL = json.dumps({"log": {}, "inbounds": [], "outbounds": [
     {"type": "direct", "tag": "direct"}], "route": {"rules": [], "final": "direct"}})
@@ -97,7 +98,8 @@ case "${1:-}" in
     done
     [[ -f "$dir/snap.tar.gz" ]] || { echo "快照文件缺失"; exit 1; }
     [[ -n "${PDG_STUB_FAIL:-}" ]] && { echo "注入: 恢复失败"; exit 1; }
-    tmp="$(mktemp -d)"; tree="$tmp/tree"; mkdir -p "$tree"
+    tmp="$(mktemp -d)"; trap 'rm -rf -- "$tmp"' EXIT   # 桩也要自己清, 否则每跑一次留一个
+    tree="$tmp/tree"; mkdir -p "$tree"
     tar tzf "$dir/snap.tar.gz" > "$tmp/members" || { echo "清单读取失败"; exit 1; }
     tar xzf "$dir/snap.tar.gz" -C "$tree" || { echo "解包失败"; exit 1; }
     if (( preserve == 1 )); then

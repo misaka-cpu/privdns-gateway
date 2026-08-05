@@ -19,7 +19,7 @@ e2e_seed_mosdns all
 e2e_seed_singbox_model
 # 事务目录与本用例的临时产物不在 e2e 沙箱的 overlay 里(它们在 /var/lib 与 /tmp), 上一次
 # 跑剩的"未完成事务"会正确地挡住这一次 —— 那是产品行为, 但会让用例测不到自己想测的东西。
-rm -rf /var/lib/privdns-gateway/tx /tmp/tx-crash.out /tmp/tx-crash2.out /tmp/tx-race.out /tmp/tx-winner.txt
+rm -rf /var/lib/privdns-gateway/tx $E2E_TMP/tx-crash.out $E2E_TMP/tx-crash2.out $E2E_TMP/tx-race.out $E2E_TMP/tx-winner.txt
 printf 'mihomo\n' > /etc/privdns-gateway/backend
 printf 'android\n' > /etc/privdns-gateway/platform
 
@@ -33,7 +33,7 @@ BEFORE_SHA="$(sha256sum "$HIJ" | cut -d' ' -f1)"
 
 # ══ 1. 造一笔"应用到一半被 kill -9"的事务 ═════════════════════════════════
 echo "── 1. APPLYING 阶段被强杀 ──"
-python3 - "$TX" <<'PY' >/tmp/tx-crash.out 2>&1
+python3 - "$TX" <<'PY' >$E2E_TMP/tx-crash.out 2>&1
 import importlib.util, os, signal, sys
 spec = importlib.util.spec_from_file_location("pdgtx", sys.argv[1])
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
@@ -48,8 +48,8 @@ t = m.Tx("cli", "e2e_crash")
 t.stage("mosdns_rule:custom_hijack.txt", b"domain:half-applied.example\n")
 t.commit()
 PY
-CRASH_TX="$(head -1 /tmp/tx-crash.out | tr -d '\r')"
-[[ -n "$CRASH_TX" ]] && ok "造出一笔被强杀的事务: $CRASH_TX" || bad "没拿到事务 ID: $(cat /tmp/tx-crash.out)"
+CRASH_TX="$(head -1 $E2E_TMP/tx-crash.out | tr -d '\r')"
+[[ -n "$CRASH_TX" ]] && ok "造出一笔被强杀的事务: $CRASH_TX" || bad "没拿到事务 ID: $(cat $E2E_TMP/tx-crash.out)"
 grep -q 'half-applied' "$HIJ" && ok "现网确实停在改了一半的状态(文件已换, 服务动作没做完)" \
   || bad "文件没被改, 场景不成立"
 STATE="$(python3 "$TX" show "$CRASH_TX" | python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])')"
@@ -108,7 +108,7 @@ grep -q COMMITTED <<<"$out" && ok "恢复之后写操作恢复正常" || bad "�
 
 # ══ 5. 漂移保护 ═══════════════════════════════════════════════════════════
 echo; echo "── 5. 恢复时的漂移保护 ──"
-python3 - "$TX" <<'PY' >/tmp/tx-crash2.out 2>&1
+python3 - "$TX" <<'PY' >$E2E_TMP/tx-crash2.out 2>&1
 import importlib.util, os, signal, sys
 spec = importlib.util.spec_from_file_location("pdgtx", sys.argv[1])
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
@@ -120,7 +120,7 @@ t = m.Tx("cli", "e2e_crash2")
 t.stage("mosdns_rule:custom_hijack.txt", b"domain:half2.example\n")
 t.commit()
 PY
-CRASH2="$(head -1 /tmp/tx-crash2.out | tr -d '\r')"
+CRASH2="$(head -1 $E2E_TMP/tx-crash2.out | tr -d '\r')"
 printf 'domain:hand-fixed.example\n' > "$HIJ"        # 运维手工救场
 rout="$(pdg tx recover "$CRASH2" 2>&1)"
 { grep -q '"ok": false' <<<"$rout" && grep -q 'conflicts' <<<"$rout" \
@@ -134,7 +134,7 @@ rout="$(pdg tx recover "$CRASH2" --force 2>&1)"
 echo; echo "── 6. OBSERVING 阶段被强杀 ──"
 printf 'domain:before6.example\n' > "$HIJ"
 B6="$(sha256sum "$HIJ" | cut -d' ' -f1)"
-python3 - "$TX" <<'PY' >/tmp/tx-crash6.out 2>&1
+python3 - "$TX" <<'PY' >$E2E_TMP/tx-crash6.out 2>&1
 import importlib.util, os, signal, sys
 spec = importlib.util.spec_from_file_location("pdgtx", sys.argv[1])
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
@@ -147,7 +147,7 @@ t.stage("mosdns_rule:custom_hijack.txt", b"domain:observed.example\n")
 t.service("restart:mosdns")
 t.commit()
 PY
-C6="$(head -1 /tmp/tx-crash6.out | tr -d '\r')"
+C6="$(head -1 $E2E_TMP/tx-crash6.out | tr -d '\r')"
 S6="$(python3 "$TX" show "$C6" 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])' 2>/dev/null)"
 [[ "$S6" == OBSERVING ]] && ok "真 SIGKILL 于 OBSERVING: 事务停在 OBSERVING" || bad "状态是 $S6"
 grep -q observed.example "$HIJ" && ok "现网已是新内容(服务动作也做过了, 只差判定)" || bad "文件没落盘"

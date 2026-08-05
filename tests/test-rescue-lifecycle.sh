@@ -108,7 +108,9 @@ N
   echo 'RESCUE_INTENT_KEY="PDG_RESCUE_ENABLED"'
   echo 'RESCUE_BIND_KEY="PDG_RESCUE_BIND"'
   echo 'c_g(){ echo "$*"; }; c_y(){ echo "$*"; }; need_root(){ :; }; _lock(){ :; }'
-  echo '_pdg_mktemp_dir(){ mktemp -d; }'
+  # 落在 $WORK 里面: 沙箱一清, 它们跟着走。写成裸 `mktemp -d` 的话每调一次留一个目录
+  # (实测一趟 33 个), 而这个函数在 rollback/snapshot 路径上被反复调。
+  echo '_pdg_mktemp_dir(){ mktemp -d "'"$WORK"'/pdgmk.XXXXXX"; }'
   for fn in _profile_set _rescue_load _rescue_bind_addr _rescue_bind_candidates \
             _rescue_bind_from_cidr _rescue_set_bind _rescue_listen_addr \
             _rescue_refresh_units _rescue_intent _rescue_intent_set \

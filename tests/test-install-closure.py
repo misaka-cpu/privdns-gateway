@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import tempfile
 import sys
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PASS = [0]
@@ -128,7 +129,7 @@ else:
 # 判据是**真的在一台 Android 形态的机器上把每个模块 import 一遍**, 不是看源码里有没有那行
 # import。二者会给出不同答案: 用 try/except ImportError 包起来的可选依赖, 静态看是"依赖了",
 # 运行起来却完全正常。而我们真正在乎的只有一件事 —— Android 机器上这些模块 import 得起来。
-_and_root = tempfile.mkdtemp(prefix="closure-android-")
+_and_root = tmpguard.mkdtemp(prefix="closure-android-")
 try:
     _r = subprocess.run(
         ["bash", "-c", 'set -eu; source "%s/lib/modules.sh"; '

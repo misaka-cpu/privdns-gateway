@@ -26,6 +26,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "deploy", "bot"))
@@ -293,7 +294,7 @@ MIHOMO = mihomobin.require(ok, bad, skip)
 
 
 def mihomo_check(cfg):
-    d = tempfile.mkdtemp(prefix="mixedmihomo.")
+    d = tmpguard.mkdtemp(prefix="mixedmihomo.")
     try:
         f = os.path.join(d, "config.yaml")
         json.dump(cfg, open(f, "w", encoding="utf-8"), ensure_ascii=False, indent=2)

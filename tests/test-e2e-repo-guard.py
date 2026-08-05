@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -61,7 +62,7 @@ def git(args, cwd, check=True):
 
 def make_dev_repo():
     """造一个"开发者真仓库"的替身: 有提交、有 tag、有 remote-tracking, 外加一个 worktree。"""
-    base = tempfile.mkdtemp(prefix="repoguard-")
+    base = tmpguard.mkdtemp(prefix="repoguard-")
     TMPS.append(base)
     upstream = os.path.join(base, "upstream.git")
     dev = os.path.join(base, "dev")
@@ -95,10 +96,10 @@ def snapshot(dev):
 
 print("══ 一、判据本身: 只有一次性仓库才放行 ══")
 base, dev, wt = make_dev_repo()
-fresh = tempfile.mkdtemp(prefix="repoguard-fresh-")
+fresh = tmpguard.mkdtemp(prefix="repoguard-fresh-")
 TMPS.append(fresh)
 git(["init", "-q", fresh], fresh)
-plain = tempfile.mkdtemp(prefix="repoguard-plain-")
+plain = tmpguard.mkdtemp(prefix="repoguard-plain-")
 TMPS.append(plain)
 
 CALL = ('source "%s"\nE2E_ROOT=%%r\ne2e_guard_repo %%r\n' % LIB) % (ROOT, "%s")
@@ -134,7 +135,7 @@ for label, target, want_ok, want_why in (
         bad("%s 是被拒了, 但不是「%s」那道门开的口: %s" % (label, want_why, out.strip()[:110]))
 
 # worktree 那条单独造: 要用**本仓库自己的** worktree 才算数(共用 ref 库的正是它)
-_wt = tempfile.mkdtemp(prefix="repoguard-selfwt-")
+_wt = tmpguard.mkdtemp(prefix="repoguard-selfwt-")
 TMPS.append(_wt)
 _wtdir = os.path.join(_wt, "w")
 _made = subprocess.run(["git", "-C", ROOT, "worktree", "add", "-q", "--detach", _wtdir, "HEAD"],
@@ -177,7 +178,7 @@ print()
 print("══ 三、e2e_git: 守卫与动作绑成一件事 ══")
 # 守卫写对了不等于守卫跑到了。e2e_git 把两者合成一次调用, 于是"忘了守""守晚了"这两种形态
 # 在语法上就不存在。这里验它确实先守后跑, 且拒绝时**一条 git 都没执行**。
-_wt2 = tempfile.mkdtemp(prefix="repoguard-e2egit-")
+_wt2 = tmpguard.mkdtemp(prefix="repoguard-e2egit-")
 TMPS.append(_wt2)
 _wtdir2 = os.path.join(_wt2, "w")
 _made2 = subprocess.run(["git", "-C", ROOT, "worktree", "add", "-q", "--detach", _wtdir2, "HEAD"],

@@ -43,6 +43,7 @@ import threading
 import time
 import urllib.request
 from pathlib import Path
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "deploy" / "bot"))     # 供 pdg-bot 内部 `import sb2mihomo`
@@ -319,7 +320,7 @@ class Kernel:
         self.cfg.setdefault("listeners", []).append(
             {"name": "pdg-test-probe", "type": "mixed",
              "port": self.probe_port, "listen": "127.0.0.1"})
-        self.dir = tempfile.mkdtemp(prefix="pdgrule.")
+        self.dir = tmpguard.mkdtemp(prefix="pdgrule.")
         self.proc = None
         self.lines = []
 

@@ -24,7 +24,12 @@ import sys
 import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-BAK = tempfile.mkdtemp(prefix="negctl61c.")
+sys.path.insert(0, os.path.join(ROOT, "tests"))     # negctl 跑起来时 sys.path[0] 是 negctl/
+import tmpguard  # noqa: E402
+
+# 备份区: 负控要"改坏源码 → 跑 → 逐字节还原", 中途异常/被 Ctrl-C 也不能把备份留在 /tmp。
+# 还原本身走 TOUCHED 名单 + sha256 核对, 与这里的清理是两件事(见文件头的规矩)。
+BAK = tmpguard.mkdtemp(prefix="negctl61c.")
 
 TOUCHED = [
     "deploy/bot/nftlive.py",

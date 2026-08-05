@@ -17,6 +17,7 @@ import sys
 import tempfile
 import time
 import urllib.parse
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -53,14 +54,14 @@ MODEL_NEW = json.dumps({"log": {}, "inbounds": [], "outbounds": [
     {"type": "direct", "tag": "direct"}, {"type": "block", "tag": "block"}],
     "route": {"rules": [], "final": "direct"}})
 
-work = tempfile.mkdtemp(prefix="formflow.")
+work = tmpguard.mkdtemp(prefix="formflow.")
 
 
 def build():
     """造一个带现网配置与一份可恢复快照的沙箱, 并起真的救援服务。"""
     import io
     import tarfile
-    box = Box(work)
+    box = Box()
     box.up("mosdns")
     box.up("mihomo")
     live = {"etc/sing-box/config.json": MODEL_OLD,

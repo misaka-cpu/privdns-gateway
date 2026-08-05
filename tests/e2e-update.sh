@@ -55,7 +55,7 @@ SBU
 # 连 origin 都是真的(本地裸仓库): pdg update 里的 `git fetch --tags origin main` 照跑不误,
 # 于是"取 tag"这段也在覆盖范围内, 且全程离线 —— 不打桩、不碰 GitHub。
 REPO=/opt/privdns-gateway
-ORIGIN=/tmp/e2e-origin.git
+ORIGIN=$E2E_TMP/e2e-origin.git
 rm -rf "$REPO/.git" "$ORIGIN"            # e2e_seed_install 拷进来的是开发机/CI 的 .git, 弃用
 git -C "$REPO" init -q -b main
 e2e_guard_repo "$REPO" || exit 1     # 刚 init 出来的一次性库才准动 ref
@@ -115,7 +115,7 @@ grep -qE '自检发现|回滚' <<<"$out" && ok "明确说明是自检失败并�
   && ok "回滚把部署文件真的换回了更新前那份(按 sha 比对)" || bad "回滚后文件不是更新前的"
 grep -q 'NEWVERSION-MARKER' /opt/pdg-bot/checks.py \
   && bad "回滚后仍残留新版标记(说明没换回去)" || ok "回滚后无新版残留"
-rm -f /tmp/e2e-svc/mihomo.ac
+rm -f $E2E_TMP/e2e-svc/mihomo.ac
 
 # ── 3. --dry-run 只看不动 ════════════════════════════════════════════════════
 echo; echo "── 3. --dry-run ──"
@@ -297,10 +297,10 @@ grep -q '更新前留快照' <<<"$out" && ok "阶段: 更新前快照已创建" 
   && ok "阶段: __migrate 通过(坏模块没被迁移提前执行)" || bad "__migrate 提前失败"
 grep -q 'Python 语法错误' <<<"$out" && ok "阶段: 非零来自 py_compile 这道门" || bad "失败点不是 py_compile: $(tail -3 <<<"$out")"
 # 独立复证: 直接对那份坏内容跑一次真 py_compile, 确认它确实编不过
-printf 'def broken(:\n    pass\n' > /tmp/badmod.py
-python3 -m py_compile /tmp/badmod.py 2>/dev/null \
+printf 'def broken(:\n    pass\n' > $E2E_TMP/badmod.py
+python3 -m py_compile $E2E_TMP/badmod.py 2>/dev/null \
   && bad "坏模块居然能编译 —— 这条场景没构造成" || ok "独立复证: 该模块内容确实过不了真 py_compile"
-rm -f /tmp/badmod.py
+rm -f $E2E_TMP/badmod.py
 
 # ── 回滚验收 ──────────────────────────────────────────────────────────────
 [[ "$rc" != 0 ]] && ok "update 返回非 0" || bad "py_compile 失败却返回 0"

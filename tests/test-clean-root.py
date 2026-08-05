@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PASS = [0]
@@ -64,7 +65,7 @@ def purge_pyc(d):
 
 def run_isolated(dest, code, extra_env=None):
     """在 clean-root 里跑一段代码。cwd 移出仓库 + -I 隔离 + sys.path 只有安装目录。"""
-    outside = tempfile.mkdtemp(prefix="outside.")
+    outside = tmpguard.mkdtemp(prefix="outside.")
     try:
         # 只保留解释器自带的标准库路径, 再把安装目录放最前 —— 仓库、当前目录、user site
         # 一律不在搜索路径里。**不能**把 sys.path 清空成 [dest]: 那样连 hashlib 都 import 不了,
@@ -87,7 +88,7 @@ def run_isolated(dest, code, extra_env=None):
         shutil.rmtree(outside, ignore_errors=True)
 
 
-work = tempfile.mkdtemp(prefix="cleanroot.")
+work = tmpguard.mkdtemp(prefix="cleanroot.")
 FRESH = os.path.join(work, "fresh")          # 模拟全新安装
 UPD = os.path.join(work, "updated")          # 模拟 pdg update 后
 
@@ -219,7 +220,7 @@ else:
 # 而它还要读安装目录里的描述文件模板 —— 模板取不到时若回落到仓库, 真机上仓库不在就崩了。
 print()
 print("── 3b. clean-root (iOS 形态) ──")
-IOSROOT = tempfile.mkdtemp(prefix="cleanroot-ios.")
+IOSROOT = tmpguard.mkdtemp(prefix="cleanroot-ios.")
 _p = subprocess.run(
     ["bash", "-c", 'set -euo pipefail\nsource "%s/lib/modules.sh"\n'
                    'pdg_install_runtime_modules "%s" "%s" ios\n' % (ROOT, ROOT, IOSROOT)],
@@ -232,6 +233,9 @@ purge_pyc(IOSROOT)
 # 探针跑在**另一个进程**里, 所以它自己的沙箱只能自己收 —— 父进程的 finally 管不到它。
 # 这类"每跑一次多一个 /tmp 目录"的泄漏不会让测试变红, 只会在几百次之后变成磁盘问题。
 IOS_PROBE = "\n".join([
+    # 探针进程刻意跑在 clean-root 里(sys.path 只有安装根), 所以这里**不能**用 tmpguard ——
+    # 把仓库的 tests/ 塞进它的 sys.path 会削弱"没有仓库源码兜底"那条断言。它自己的
+    # try/finally 已经把沙箱收干净了, 而 tempfile 认 TMPDIR, 私有 TMPDIR 那道门照样看得见。
     "import json, os, shutil, sys, tempfile",
     "root = tempfile.mkdtemp(prefix='cleanroot-fs.')",
     "try:",

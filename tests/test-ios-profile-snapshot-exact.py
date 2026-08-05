@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -47,7 +48,7 @@ def bad(m):
 
 
 def mkca(name):
-    d = tempfile.mkdtemp(prefix="iossnap-ca-")
+    d = tmpguard.mkdtemp(prefix="iossnap-ca-")
     TMPS.append(d)
     subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
                     "-keyout", d + "/ca.key", "-out", d + "/ca.crt", "-days", "1",
@@ -58,7 +59,7 @@ def mkca(name):
 
 class Box:
     def __init__(self):
-        self.root = tempfile.mkdtemp(prefix="iossnap-")
+        self.root = tmpguard.mkdtemp(prefix="iossnap-")
         TMPS.append(self.root)
         for d in ("etc/privdns-gateway", "etc/sing-box", "etc/mosdns", "run",
                   "var/lib/privdns-gateway"):
@@ -134,7 +135,7 @@ for c in CONSTS:
 
 def snapshot(box):
     """按 cmd_snapshot 的形态打一份快照(相对 / 打包, 只带存在的候选)。"""
-    d = tempfile.mkdtemp(prefix="iossnap-snap-")
+    d = tmpguard.mkdtemp(prefix="iossnap-snap-")
     TMPS.append(d)
     items = [x for x in ("etc/privdns-gateway", SUB) if os.path.exists(box.p(x))]
     subprocess.run(["tar", "czf", d + "/snap.tar.gz", "-C", box.root] + items,
@@ -144,7 +145,7 @@ def snapshot(box):
 
 def rollback(box, snap, extra=""):
     """按 cmd_rollback 的做法回滚: 解到临时树 → 取成员清单 → 调生产的落盘函数。"""
-    tmp = tempfile.mkdtemp(prefix="iossnap-tree-")
+    tmp = tmpguard.mkdtemp(prefix="iossnap-tree-")
     TMPS.append(tmp)
     tree = os.path.join(tmp, "tree")
     os.makedirs(tree)
@@ -329,7 +330,7 @@ print("══ 四、快照里根本没有这棵子树时不许乱删 ══")
 b3 = Box()
 b3.gen(ca=CA_A)
 # 真正的 5.4 之前快照: 那时 ios-profile.json 这个文件还不存在, 产物目录也不存在。
-old = tempfile.mkdtemp(prefix="iossnap-old-")
+old = tmpguard.mkdtemp(prefix="iossnap-old-")
 TMPS.append(old)
 os.makedirs(old + "/etc/privdns-gateway", exist_ok=True)
 with open(old + "/etc/privdns-gateway/platform", "w") as f:
@@ -349,7 +350,7 @@ else:
 # 而不是留下一份没有记录能解释的文件。这是有意选的语义, 钉在这里。
 b3b = Box()
 b3b.gen(ca=CA_A)
-half = tempfile.mkdtemp(prefix="iossnap-half-")
+half = tmpguard.mkdtemp(prefix="iossnap-half-")
 TMPS.append(half)
 os.makedirs(half + "/etc/privdns-gateway", exist_ok=True)
 shutil.copy2(b3b.meta, half + "/etc/privdns-gateway/ios-profile.json")
@@ -545,22 +546,25 @@ b8 = Box()
 b8.gen(ca=CA_A)
 snap8 = snapshot(b8)
 b8.gen(host="dot.v2.example", ca=CA_B)
-tmp_before = set(os.listdir("/tmp"))
+# 观察生产的 `mktemp -d` 落在哪 —— 它认 TMPDIR, 所以看的也得是 TMPDIR。写死 /tmp 的话:
+# 在私有 TMPDIR 下跑就永远看不到底片(判据静默失效), 直接跑又会把并发进程新建的目录算进来。
+TMPROOT = os.environ.get("TMPDIR") or "/tmp"
+tmp_before = set(os.listdir(TMPROOT))
 rollback(b8, snap8)
 leaked = []
-for name in sorted(set(os.listdir("/tmp")) - tmp_before):
+for name in sorted(set(os.listdir(TMPROOT)) - tmp_before):
     # 只看 `mktemp -d` 的默认形态(tmp.XXXXXXXX)—— 底片目录就是它建的。测试自己的 staging
     # 树(iossnap-*)不算, 那是本用例造出来喂给生产函数的输入, 由测试自己清理。
     if not name.startswith("tmp."):
         continue
-    pth = os.path.join("/tmp", name)
+    pth = os.path.join(TMPROOT, name)
     if not os.path.isdir(pth):
         continue
     for base, _d, files in os.walk(pth):
         leaked += [os.path.join(base, f) for f in files if f.endswith(".mobileconfig")
                    or f.endswith("ios-profile.json")]
 if not leaked:
-    ok("成功路径跑完, /tmp 下没有留下描述文件或记录的副本")
+    ok("成功路径跑完, 临时区没有留下描述文件或记录的副本")
 else:
     bad("底片没清干净, 留下了: %r" % leaked[:4])
 

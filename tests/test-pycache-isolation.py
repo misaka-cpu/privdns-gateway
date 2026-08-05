@@ -16,6 +16,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -52,7 +53,7 @@ def run_child(work, env):
     return p.stdout.strip()
 
 
-work = tempfile.mkdtemp(prefix="pycache-iso.")
+work = tmpguard.mkdtemp(prefix="pycache-iso.")
 mod = os.path.join(work, "m.py")
 
 # ── 0. 前提: 改坏前后必须等长且 mtime 相同, 否则这条回归验的不是最坏情况 ──

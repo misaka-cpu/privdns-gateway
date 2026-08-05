@@ -30,7 +30,7 @@ echo "内核: $(mihomo -v 2>&1 | head -1)"
 # ══ 1. 协议矩阵: 每种协议都要能 parse_link → apply_sb → 真 mihomo -t 通过 ══════
 # 覆盖面直接对应"switch-core 说某出口 mihomo 无法转换"那类报障。
 echo; echo "── 1. 落地协议矩阵(真实 parse_link + apply_sb + 真 mihomo -t) ──"
-python3 - > /tmp/e2e-add.out 2>&1 <<'PY'
+python3 - > $E2E_TMP/e2e-add.out 2>&1 <<'PY'
 import base64, sys
 sys.path.insert(0, "/opt/pdg-bot")
 import bot
@@ -60,11 +60,11 @@ PY
 while IFS='|' read -r st name detail; do
   [[ "$st" == OK ]] && ok "落地 $name: 加入成功且真 mihomo -t 通过($detail)" \
                     || bad "落地 $name: $detail"
-done < /tmp/e2e-add.out
+done < $E2E_TMP/e2e-add.out
 
 # ══ 2. 分流规则: 内核规则 + mosdns 劫持表必须同步 ═════════════════════════════
 echo; echo "── 2. 加分流规则(真实 add_rule) ──"
-python3 - > /tmp/e2e-rule.out 2>&1 <<'PY'
+python3 - > $E2E_TMP/e2e-rule.out 2>&1 <<'PY'
 import sys; sys.path.insert(0, "/opt/pdg-bot")
 import bot
 for dom, tgt in (("ip.skk.moe", "e-ss"), ("cdn.example.test", "e-hy2")):
@@ -73,9 +73,9 @@ for dom, tgt in (("ip.skk.moe", "e-ss"), ("cdn.example.test", "e-hy2")):
 PY
 while IFS='|' read -r st dom tgt; do
   [[ "$st" == OK ]] && ok "分流 $dom → $tgt 写入成功" || bad "分流 $dom: $tgt"
-done < /tmp/e2e-rule.out
+done < $E2E_TMP/e2e-rule.out
 
-python3 - <<'PY' > /tmp/e2e-state.out
+python3 - <<'PY' > $E2E_TMP/e2e-state.out
 import json
 c = json.load(open("/etc/sing-box/config.json"))
 rules = {d: r.get("outbound") for r in c["route"]["rules"] for d in r.get("domain_suffix", [])}
@@ -84,8 +84,8 @@ print("KERNEL_RULE|%s" % rules.get("ip.skk.moe"))
 print("MIHOMO_PROXIES|%s" % ",".join(p["name"] for p in m.get("proxies", []) if p["name"].startswith("e-")))
 print("MIHOMO_RULE|%s" % ("yes" if any("ip.skk.moe" in r and "e-ss" in r for r in m.get("rules", [])) else "no"))
 PY
-grep -q 'KERNEL_RULE|e-ss' /tmp/e2e-state.out && ok "内核 route 规则: ip.skk.moe → e-ss" || bad "内核规则没写对"
-grep -q 'MIHOMO_RULE|yes' /tmp/e2e-state.out && ok "渲染进 mihomo: DOMAIN-SUFFIX 规则指向该出口" || bad "mihomo 规则缺失"
+grep -q 'KERNEL_RULE|e-ss' $E2E_TMP/e2e-state.out && ok "内核 route 规则: ip.skk.moe → e-ss" || bad "内核规则没写对"
+grep -q 'MIHOMO_RULE|yes' $E2E_TMP/e2e-state.out && ok "渲染进 mihomo: DOMAIN-SUFFIX 规则指向该出口" || bad "mihomo 规则缺失"
 n=$(grep -c '^domain:' /etc/mosdns/rules/custom_hijack.txt)
 [[ "$n" == 2 ]] && ok "mosdns 劫持表同步收录 2 个域名" || bad "劫持表有 $n 条"
 
@@ -105,7 +105,7 @@ python3 - <<'PY' >/dev/null 2>&1
 import sys; sys.path.insert(0, "/opt/pdg-bot")
 import bot; bot.del_rule("ip.skk.moe")
 PY
-python3 - <<'PY' > /tmp/e2e-del.out
+python3 - <<'PY' > $E2E_TMP/e2e-del.out
 import json
 c = json.load(open("/etc/sing-box/config.json"))
 left = sorted({d for r in c["route"]["rules"] for d in r.get("domain_suffix", [])})
@@ -113,8 +113,8 @@ hij = sorted(l.strip().replace("domain:", "") for l in open("/etc/mosdns/rules/c
              if l.startswith("domain:"))
 print("LEFT|%s" % ",".join(left)); print("HIJ|%s" % ",".join(hij))
 PY
-grep -q 'LEFT|cdn.example.test$' /tmp/e2e-del.out && ok "内核规则只剩另一条(精确删除)" || bad "内核删除不对: $(grep LEFT /tmp/e2e-del.out)"
-grep -q 'HIJ|cdn.example.test$'  /tmp/e2e-del.out && ok "劫持表同步只剩另一条(不残留死域名)" || bad "劫持表删除不对: $(grep HIJ /tmp/e2e-del.out)"
+grep -q 'LEFT|cdn.example.test$' $E2E_TMP/e2e-del.out && ok "内核规则只剩另一条(精确删除)" || bad "内核删除不对: $(grep LEFT $E2E_TMP/e2e-del.out)"
+grep -q 'HIJ|cdn.example.test$'  $E2E_TMP/e2e-del.out && ok "劫持表同步只剩另一条(不残留死域名)" || bad "劫持表删除不对: $(grep HIJ $E2E_TMP/e2e-del.out)"
 
 # ══ 5. 设直连: 必须写 custom_direct 且从劫持表移除 ═══════════════════════════
 echo; echo "── 5. 改判直连 ──"

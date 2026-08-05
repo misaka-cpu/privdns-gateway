@@ -26,6 +26,7 @@ import shutil
 import sys
 import tempfile
 from pathlib import Path
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "deploy/bot"))
@@ -128,7 +129,7 @@ KERNEL_JSON = {"nftables": [
                        {"reject": {"type": "icmp", "expr": "port-unreachable"}}]}},
 ]}
 
-BOX = tempfile.mkdtemp(prefix="nftcc.")
+BOX = tmpguard.mkdtemp(prefix="nftcc.")
 DISK_PATH = os.path.join(BOX, "nftables.conf")
 _io.open(DISK_PATH, "w", encoding="utf-8").write(DISK)
 PROFILE = os.path.join(BOX, "profile.env")

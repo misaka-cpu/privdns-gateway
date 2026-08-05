@@ -37,6 +37,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "deploy/bot"))
@@ -99,7 +100,7 @@ if not api_on:
         skip("没装钉定版 mosdns —— 端点清单未复核(现状安全由第 1 节保证)")
     else:
         # 现状虽然安全, 仍然把"为什么停"这件事复核一遍: 端点清单必须与文件头一致。
-        box = tempfile.mkdtemp(prefix="mosapi.")
+        box = tmpguard.mkdtemp(prefix="mosapi.")
         try:
             y = os.path.join(box, "c.yaml")
             open(y, "w").write(

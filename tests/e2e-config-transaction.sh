@@ -19,7 +19,7 @@ e2e_seed_mosdns all
 e2e_seed_singbox_model
 # 事务目录与本用例的临时产物不在 e2e 沙箱的 overlay 里(它们在 /var/lib 与 /tmp), 上一次
 # 跑剩的"未完成事务"会正确地挡住这一次 —— 那是产品行为, 但会让用例测不到自己想测的东西。
-rm -rf /var/lib/privdns-gateway/tx /tmp/tx-crash.out /tmp/tx-crash2.out /tmp/tx-race.out /tmp/tx-winner.txt
+rm -rf /var/lib/privdns-gateway/tx $E2E_TMP/tx-crash.out $E2E_TMP/tx-crash2.out $E2E_TMP/tx-race.out $E2E_TMP/tx-winner.txt
 printf 'mihomo\n' > /etc/privdns-gateway/backend
 printf 'android\n' > /etc/privdns-gateway/platform
 
@@ -31,16 +31,16 @@ export PDG_STABLE_SAMPLES=1
 
 # ══ 1. 三方并发: 只有一个拿到写锁 ═══════════════════════════════════════════
 echo "── 1. CLI / Bot / scheduler 并发抢锁 ──"
-rm -f /tmp/tx-winner.txt
+rm -f $E2E_TMP/tx-winner.txt
 RACE_PIDS=()
 for who in cli bot scheduler; do
-  ( python3 - "$TX" "$who" <<'PY' >>/tmp/tx-race.out 2>&1
+  ( python3 - "$TX" "$who" <<'PY' >>$E2E_TMP/tx-race.out 2>&1
 import importlib.util, os, sys, time
 spec = importlib.util.spec_from_file_location("pdgtx", sys.argv[1])
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 try:
     with m._Lock():
-        open("/tmp/tx-winner.txt", "a").write(sys.argv[2] + "\n")
+        open(os.environ["E2E_TMP"] + "/tx-winner.txt", "a").write(sys.argv[2] + "\n")
         time.sleep(1.5)
     print("WON " + sys.argv[2])
 except m.TxBusy:
@@ -51,19 +51,19 @@ PY
   sleep 0.1
 done
 wait "${RACE_PIDS[@]}"      # 只等这三个 —— 裸 wait 会连上面那个常驻探针一起等(永远不回来)
-won=$(grep -c '^WON' /tmp/tx-race.out); busy=$(grep -c '^BUSY' /tmp/tx-race.out)
-lines=$(wc -l < /tmp/tx-winner.txt)
+won=$(grep -c '^WON' $E2E_TMP/tx-race.out); busy=$(grep -c '^BUSY' $E2E_TMP/tx-race.out)
+lines=$(wc -l < $E2E_TMP/tx-winner.txt)
 { [[ "$won" == 1 && "$busy" == 2 && "$lines" == 1 ]]; } \
   && ok "三方并发: 1 个取得写锁, 2 个立即 BUSY(临界区只进去了一个)" \
   || bad "并发结果不对: won=$won busy=$busy 写入者=$lines"
-rm -f /tmp/tx-race.out
+rm -f $E2E_TMP/tx-race.out
 
 # ══ 2. 锁不可用 → fail-closed ══════════════════════════════════════════════
 echo; echo "── 2. 锁不可用(fail-closed) ──"
 # root 会无视目录权限位, 所以不能用"只读目录"造不可用; 用**父路径是个普通文件**(ENOTDIR),
 # 这对 root 一样打不开 —— 与现实里 /run 挂坏、被文件占位的形态一致。
-printf 'x' > /tmp/lockblocker
-BADLOCK=/tmp/lockblocker/sub/pdg.lock
+printf 'x' > $E2E_TMP/lockblocker
+BADLOCK=$E2E_TMP/lockblocker/sub/pdg.lock
 BEFORE_SHA="$(sha256sum /etc/mosdns/rules/custom_direct.txt 2>/dev/null | cut -d' ' -f1)"
 out=$(PDG_LOCKFILE="$BADLOCK" python3 - "$TX" <<'PY' 2>&1
 import importlib.util, sys
@@ -86,9 +86,9 @@ out=$(PDG_LOCKFILE="$BADLOCK" pdg snapshot 2>&1); rc=$?
 
 # ══ 3. mosdns 强校验的三条路径 ═════════════════════════════════════════════
 echo; echo "── 3. mosdns 候选强校验(netns / 高端口 / 都不可用) ──"
-BAD_CONF=/tmp/bad-mosdns.yaml
+BAD_CONF=$E2E_TMP/bad-mosdns.yaml
 printf 'log:\n  level: info\nplugins:\n  - tag: x\n    type: no_such_plugin_type\n' > "$BAD_CONF"
-GOOD_CONF=/tmp/good-mosdns.yaml
+GOOD_CONF=$E2E_TMP/good-mosdns.yaml
 # 好配置必须**带监听项**: 高端口探针要把监听地址改写到随机端口才能在不碰生产端口的前提下起来。
 # 用 plugins: [] 这种无监听夹具, 高端口那条路径永远走不通(改写 0 处 → 拒绝), 等于给自己
 # 造了一个在无 netns 环境里必红的假用例。
@@ -157,11 +157,11 @@ if command -v mosdns >/dev/null 2>&1; then
   # 两条都不可用: 直接把 mosdns 二进制藏起来(裁剪 PATH 会把 tail 之类也弄丢, 反而测不出东西)
   # 让探针**真的找不到 mosdns**: PATH 里放一个空目录在最前, 且把 FSROOT 指到没有
   # /usr/local/bin/mosdns 的空树(核心是 shutil.which + FSROOT 两条兜底, 两条都断才算没有)。
-  EMPTYBIN=/tmp/nomos-bin; rm -rf "$EMPTYBIN"; mkdir -p "$EMPTYBIN"
+  EMPTYBIN=$E2E_TMP/nomos-bin; rm -rf "$EMPTYBIN"; mkdir -p "$EMPTYBIN"
   for c in python3 bash sh grep sed cut head tail cat env; do
     src="$(command -v "$c" 2>/dev/null)"; [[ -n "$src" ]] && ln -sf "$src" "$EMPTYBIN/$c"
   done
-  r="$(PATH="$EMPTYBIN" PDG_TX_FSROOT=/tmp/nomos-root PDG_TX_MOSDNS_PROBE_MODE=auto \
+  r="$(PATH="$EMPTYBIN" PDG_TX_FSROOT=$E2E_TMP/nomos-root PDG_TX_MOSDNS_PROBE_MODE=auto \
         probe none "$GOOD_CONF")"
   grep -q '^PROBE|fail' <<<"$r" && ok "两种强校验都不可用 → 拒绝应用 mosdns 配置(不拿结构检查冒充)" \
     || bad "没有 mosdns 时竟然放行了: $r"
@@ -171,7 +171,7 @@ fi
 
 # ══ 4. 跨组件事务: model + mosdns 规则一起落盘 ═════════════════════════════
 echo; echo "── 4. 跨组件事务 ──"
-: > /tmp/e2e-calls.log
+: > $E2E_TMP/e2e-calls.log
 out=$(python3 - "$TX" <<'PY' 2>&1
 import importlib.util, json, sys
 spec = importlib.util.spec_from_file_location("pdgtx", sys.argv[1])
@@ -189,7 +189,7 @@ PY
 grep -q '"state": "COMMITTED"' <<<"$out" && ok "跨组件事务提交成功" || bad "提交失败: $(tail -2 <<<"$out")"
 grep -q 'tx.example' /etc/sing-box/config.json && ok "model 真的落盘" || bad "model 没落盘"
 grep -q 'tx.example' /etc/mosdns/rules/custom_hijack.txt && ok "mosdns 劫持表真的落盘" || bad "劫持表没落盘"
-grep -q 'restart mosdns' /tmp/e2e-calls.log && ok "声明的服务动作真的执行(mosdns 被重启)" || bad "服务没重启"
+grep -q 'restart mosdns' $E2E_TMP/e2e-calls.log && ok "声明的服务动作真的执行(mosdns 被重启)" || bad "服务没重启"
 
 # ══ 5. 观察期失败 → 逐字节回滚, 基础链路仍可用 ════════════════════════════
 echo; echo "── 5. 观察期失败回滚 ──"

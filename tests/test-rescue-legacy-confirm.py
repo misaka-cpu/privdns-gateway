@@ -25,6 +25,7 @@ import tarfile
 import tempfile
 import time
 import urllib.parse
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -54,7 +55,7 @@ def bad(m):
     FAIL[0] += 1
 
 
-work = tempfile.mkdtemp(prefix="legacyconf.")
+work = tmpguard.mkdtemp(prefix="legacyconf.")
 MODEL = json.dumps({"log": {}, "inbounds": [], "outbounds": [
     {"type": "direct", "tag": "direct"}], "route": {"rules": [], "final": "direct"}})
 

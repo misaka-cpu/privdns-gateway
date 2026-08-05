@@ -28,6 +28,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "deploy/bot"))
@@ -52,7 +53,7 @@ SSH = 22
 REDIR = 7893
 
 # ── 沙箱 ────────────────────────────────────────────────────────────────────
-BOX = tempfile.mkdtemp(prefix="nftmx.")
+BOX = tmpguard.mkdtemp(prefix="nftmx.")
 PROFILE = os.path.join(BOX, "profile.env")
 _io.open(PROFILE, "w", encoding="utf-8").write("PDG_INTERNAL_CIDR=%s\n" % CIDR)
 os.environ["PDG_PROFILE_ENV"] = PROFILE

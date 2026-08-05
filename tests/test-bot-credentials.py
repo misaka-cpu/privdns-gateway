@@ -13,6 +13,7 @@ import os
 import sys
 import tempfile
 from pathlib import Path
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "deploy" / "bot"))
@@ -43,7 +44,7 @@ def write_env(path, token=None, allowed=None):
 
 
 def main():
-    tmp = tempfile.mkdtemp()
+    tmp = tmpguard.mkdtemp()
     checks.BOT_ENV = os.path.join(tmp, "bot.env")
     checks.PLATFORM_FILE = os.path.join(tmp, "platform")
     with open(checks.PLATFORM_FILE, "w", encoding="utf-8") as f:
@@ -135,7 +136,7 @@ def main():
     # 没配 bot 的机器会因为"pdg-bot 未稳定运行"而切不了平台。
     import subprocess
     pdg_sh = str(ROOT / "deploy/bot/pdg.sh")
-    shim = tempfile.mkdtemp()
+    shim = tmpguard.mkdtemp()
     with open(os.path.join(shim, "checks_shim.py"), "w", encoding="utf-8") as f:
         f.write("import sys\nsys.path.insert(0, %r)\nimport checks\n"
                 "checks.BOT_ENV = sys.argv[1]\nprint(checks.bot_credentials())\n"

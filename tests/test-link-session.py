@@ -25,6 +25,7 @@ import threading
 import time
 from http.server import HTTPServer
 from pathlib import Path
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "deploy/bot"))
@@ -48,7 +49,7 @@ def skip(m):
 
 
 def fresh_dir():
-    d = tempfile.mkdtemp(prefix="linksess."); TMPS.append(d)
+    d = tmpguard.mkdtemp(prefix="linksess."); TMPS.append(d)
     os.environ["PDG_PROBE81_RUNTIME_DIR"] = d
     return d
 
@@ -322,7 +323,7 @@ def main():
         and isinstance(n.value, str)] else bad)("不引用全局锁文件名")
     # 行为验证: 占着全局锁时, 建会话/消费照常完成
     import fcntl
-    lockd = tempfile.mkdtemp(prefix="sesslock."); TMPS.append(lockd)
+    lockd = tmpguard.mkdtemp(prefix="sesslock."); TMPS.append(lockd)
     lockp = os.path.join(lockd, "pdg.lock")
     held = open(lockp, "w"); fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
     os.environ["PDG_LOCKFILE"] = lockp

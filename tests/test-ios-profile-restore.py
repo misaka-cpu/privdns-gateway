@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -39,7 +40,7 @@ def bad(m):
 
 
 def mkca(name):
-    d = tempfile.mkdtemp(prefix="iosrst-ca-")
+    d = tmpguard.mkdtemp(prefix="iosrst-ca-")
     TMPS.append(d)
     subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
                     "-keyout", d + "/ca.key", "-out", d + "/ca.crt", "-days", "1",
@@ -50,7 +51,7 @@ def mkca(name):
 
 class Box:
     def __init__(self):
-        self.root = tempfile.mkdtemp(prefix="iosrst-")
+        self.root = tmpguard.mkdtemp(prefix="iosrst-")
         TMPS.append(self.root)
         for d in ("etc/privdns-gateway", "run", "var/lib/privdns-gateway"):
             os.makedirs(os.path.join(self.root, d), exist_ok=True)
@@ -107,7 +108,7 @@ print("══ 一、CLI 快照 → 回滚 ══")
 b = Box()
 snapshot = life(b)
 # 快照按 cmd_snapshot 的候选路径打包(相对 /, 与生产同形)
-snapdir = tempfile.mkdtemp(prefix="iosrst-snap-")
+snapdir = tmpguard.mkdtemp(prefix="iosrst-snap-")
 TMPS.append(snapdir)
 subprocess.run(["bash", "-c",
                 "cd %s && tar czf %s/snap.tar.gz etc/privdns-gateway "

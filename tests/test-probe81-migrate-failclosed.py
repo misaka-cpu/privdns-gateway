@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = Path(__file__).resolve().parents[1]
 PASS = [0]
@@ -60,7 +61,7 @@ def run_case(*, template, unit_exists, unit_body="旧内容\n",
 
     夹具把 install / systemctl / cmp 换成留痕的桩 —— 这样"没写入"是被证明的, 不是被假设的。
     """
-    box = tempfile.mkdtemp(prefix="p81mig.")
+    box = tmpguard.mkdtemp(prefix="p81mig.")
     repo = os.path.join(box, "repo")
     os.makedirs(os.path.join(repo, "deploy", "bot"))
     if template:

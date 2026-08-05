@@ -19,6 +19,7 @@ import shutil
 import sys
 import tarfile
 import tempfile
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "deploy", "bot"))
@@ -71,7 +72,7 @@ def extract(data, dest):
 def run_case(label, build, must_raise=True):
     """解包到隔离目录; 断言**整个备份被拒**(而不是跳过坏成员), 解压根之外无写入, 根内不留
     链接/特殊文件。跳过坏成员会让用户以为"恢复成功了", 实际那份包本就不可信。"""
-    base = tempfile.mkdtemp(prefix="pdgsafe")
+    base = tmpguard.mkdtemp(prefix="pdgsafe")
     dest = os.path.join(base, "root")
     os.makedirs(dest)
     outside = os.path.join(base, "OUTSIDE")
@@ -147,7 +148,7 @@ def main():
     ok("设备文件与 FIFO 被拒")
 
     # ── 白名单之外的普通文件不得落地 ──
-    base = tempfile.mkdtemp(prefix="pdgsafe")
+    base = tmpguard.mkdtemp(prefix="pdgsafe")
     dest = os.path.join(base, "root")
     os.makedirs(dest)
     try:
@@ -182,7 +183,7 @@ def main():
         i.type = tarfile.LNKTYPE
         i.linkname = "../../../../../../etc/passwd"
         t.addfile(i)
-    base = tempfile.mkdtemp(prefix="pdgsafe")
+    base = tmpguard.mkdtemp(prefix="pdgsafe")
     dest = os.path.join(base, "root")
     os.makedirs(dest)
     try:
@@ -196,7 +197,7 @@ def main():
         shutil.rmtree(base, ignore_errors=True)
 
     # ── 体积 / 数量上限(压缩炸弹) ──
-    base = tempfile.mkdtemp(prefix="pdgsafe")
+    base = tmpguard.mkdtemp(prefix="pdgsafe")
     try:
         d1 = os.path.join(base, "r1")
         os.makedirs(d1)
@@ -220,7 +221,7 @@ def main():
         shutil.rmtree(base, ignore_errors=True)
 
     # ── 声明值撒谎: tar 头里的 size 是攻击者写的, 只卡声明值挡不住"声明小、实则源源不断" ──
-    base = tempfile.mkdtemp(prefix="pdgsafe")
+    base = tmpguard.mkdtemp(prefix="pdgsafe")
     dest = os.path.join(base, "root")
     os.makedirs(dest)
     try:
@@ -239,7 +240,7 @@ def main():
         shutil.rmtree(base, ignore_errors=True)
 
     # ── 合法备份仍能正常解出(保护不能把功能弄坏) ──
-    base = tempfile.mkdtemp(prefix="pdgsafe")
+    base = tmpguard.mkdtemp(prefix="pdgsafe")
     dest = os.path.join(base, "root")
     os.makedirs(dest)
     try:
@@ -266,7 +267,7 @@ def main():
     # _safe_extract 的白名单是硬编码的; 将来往 BACKUP_FILES 里加了文件却忘了同步白名单,
     # 那份文件会在恢复时被**静默跳过** —— 备份看着有、恢复回来却没有, 且没有任何报错。
     # 这条守卫把"备份写什么"与"恢复认什么"钉在一起。
-    base = tempfile.mkdtemp(prefix="pdgsync")
+    base = tmpguard.mkdtemp(prefix="pdgsync")
     try:
         os.makedirs(os.path.join(base, "etc/mosdns/rules"), exist_ok=True)
         os.makedirs(os.path.join(base, "opt/pdg-bot"), exist_ok=True)

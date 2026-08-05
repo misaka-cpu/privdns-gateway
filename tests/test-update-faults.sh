@@ -70,26 +70,26 @@ git(){
 #
 # FAIL_TARGET=<basename>  命中该目标名时失败
 # FAIL_NTH=<n>            第 n 个落在受管目录下的目标失败(1 起)
-# 命中与否写进 /tmp/e2e-inject-hit, 由 assert_fail_rollback 复核 —— 没命中就判测试自己失败。
+# 命中与否写进 $WORK/e2e-inject-hit, 由 assert_fail_rollback 复核 —— 没命中就判测试自己失败。
 PDG_MANAGED_DIR=/opt/pdg-bot
-: > /tmp/e2e-inject-hit
+: > "$WORK"/e2e-inject-hit
 install(){
   local last="${*: -1}" base n
   base="$(basename -- "$last")"
   case "$last" in
     "$PDG_MANAGED_DIR"/*|"$PDG_MANAGED_DIR")
-      n=$(( $(wc -l < /tmp/e2e-inject-count 2>/dev/null || echo 0) + 1 ))
-      echo "$n $base" >> /tmp/e2e-inject-count
+      n=$(( $(wc -l < "$WORK"/e2e-inject-count 2>/dev/null || echo 0) + 1 ))
+      echo "$n $base" >> "$WORK"/e2e-inject-count
       if [[ -n "${FAIL_TARGET:-}" && "$base" == "${FAIL_TARGET}" ]]; then
-        echo "hit target=$base" >> /tmp/e2e-inject-hit; return 1
+        echo "hit target=$base" >> "$WORK"/e2e-inject-hit; return 1
       fi
       if [[ -n "${FAIL_NTH:-}" && "$n" == "${FAIL_NTH}" ]]; then
-        echo "hit nth=$n base=$base" >> /tmp/e2e-inject-hit; return 1
+        echo "hit nth=$n base=$base" >> "$WORK"/e2e-inject-hit; return 1
       fi;;
   esac
   # 兼容既有用例仍在用的整路径子串形态(/usr/local/bin/pdg 之类的非受管目标)
   if [[ -n "${FAIL_INSTALL:-}" && "$*" == *"${FAIL_INSTALL}"* ]]; then
-    echo "hit substr=${FAIL_INSTALL}" >> /tmp/e2e-inject-hit; return 1
+    echo "hit substr=${FAIL_INSTALL}" >> "$WORK"/e2e-inject-hit; return 1
   fi
   return 0
 }
@@ -138,12 +138,12 @@ assert_success(){ # 正常路径: rc0 + 有"✅ 已更新" + 无 ROLLBACK
 }
 assert_fail_rollback(){ # 故障路径: rc非0 + 有 ROLLBACK + 无"✅ 已更新"
   local desc="$1" env="$2" r
-  : > /tmp/e2e-inject-hit; : > /tmp/e2e-inject-count
+  : > "$WORK"/e2e-inject-hit; : > "$WORK"/e2e-inject-count
   r=$(run "$env"); local rc="${r%%|*}" out="${r#*|}"
   # 注入没命中就说明这条根本没测到东西 —— 判测试自己失败, 不是判产品通过。
   if [[ "$env" == *FAIL_TARGET=* || "$env" == *FAIL_NTH=* || "$env" == *FAIL_INSTALL=* ]] \
-     && [[ ! -s /tmp/e2e-inject-hit ]]; then
-    bad "$desc: 故障注入**未命中**(受管目标共 $(wc -l < /tmp/e2e-inject-count 2>/dev/null || echo 0) 个) —— 这条没测到任何东西"
+     && [[ ! -s "$WORK"/e2e-inject-hit ]]; then
+    bad "$desc: 故障注入**未命中**(受管目标共 $(wc -l < "$WORK"/e2e-inject-count 2>/dev/null || echo 0) 个) —— 这条没测到任何东西"
     # 结构化结果: 让外层守卫能区分"updater 正常失败"/"注入未命中"/"测试环境损坏",
     # 而不是都看成一个非零退出码。
     echo "RESULT=injection-not-hit" >> "${PDG_FAULT_RESULT:-/dev/null}"

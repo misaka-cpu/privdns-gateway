@@ -11,6 +11,7 @@ import sys
 import tempfile
 import types
 from pathlib import Path
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "deploy" / "bot"))
@@ -73,7 +74,7 @@ def main():
     ok("Android: ios/iosgen/iosgenca/wloc:* 回调全被门控(send_document 从未调用)")
 
     # /ios 命令 + ios_ssid 文本状态(text handler)
-    tmp = tempfile.mkdtemp()
+    tmp = tmpguard.mkdtemp()
     bot.MITM_CONFIG = os.path.join(tmp, "mitm.json")
     bot.MITM_HIJACK_FILE = os.path.join(tmp, "mitm_hijack.txt")
     SENT_DOCS.clear()

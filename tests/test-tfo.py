@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "deploy" / "bot"))
@@ -56,7 +57,7 @@ def profile_set(key, val):
 
 
 def main():
-    tmp = tempfile.mkdtemp()
+    tmp = tmpguard.mkdtemp()
     bot.PROFILE_ENV = os.path.join(tmp, "profile.env")
 
     c = cfg()

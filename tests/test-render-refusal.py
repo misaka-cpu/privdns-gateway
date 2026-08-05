@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BOT_DIR = os.path.join(ROOT, "deploy", "bot")
@@ -57,7 +58,7 @@ META = {"rs_x": {"url": "https://%s.example/x.list" % SENTINEL,
 def run_with_pdgtx(state, code):
     """在独立子进程里跑 code, pdgtx 处于指定状态。
     'ok' 原样 / 'absent' 删掉 / 'broken' 语法错 / 'oldver' 能 import 但缺 redact 与异常类。"""
-    d = tempfile.mkdtemp(prefix="refusal.")
+    d = tmpguard.mkdtemp(prefix="refusal.")
     try:
         for f in os.listdir(BOT_DIR):
             if f.endswith(".py"):
@@ -235,7 +236,7 @@ spec = iu.spec_from_file_location("bot", os.path.join(BOT_DIR, "pdg-bot.py"))
 bot = iu.module_from_spec(spec)
 sys.modules["bot"] = bot
 spec.loader.exec_module(bot)
-work = tempfile.mkdtemp(prefix="refusalbot.")
+work = tmpguard.mkdtemp(prefix="refusalbot.")
 RS = os.path.join(work, "rulesets.json")
 json.dump({}, open(RS, "w"))
 bot.RS_META = RS

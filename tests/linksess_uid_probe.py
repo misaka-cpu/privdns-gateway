@@ -20,6 +20,7 @@ import os
 import pwd
 import sys
 import tempfile
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "..", "deploy", "bot"))
@@ -55,7 +56,7 @@ def main():
 
     import linksess as S
 
-    box = tempfile.mkdtemp(prefix="uidhand.")
+    box = tmpguard.mkdtemp(prefix="uidhand.")
     rt = os.path.join(box, "pdg-probe81")
     os.makedirs(rt)
     # systemd 的 RuntimeDirectory=... + RuntimeDirectoryMode=0700 就是这个形态
