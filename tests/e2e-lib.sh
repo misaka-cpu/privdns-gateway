@@ -428,19 +428,74 @@ case "$verb" in
       [ -z "$v" ] && { [ -f "/etc/systemd/system/${u}.service" ] && v=1 || v=0; }
       [ "$v" = 1 ] && { echo enabled; exit 0; }; echo disabled; exit 1;;
   show)
-      # show -p PROP --value UNIT。ActiveState 是"停稳"判据要看的东西(failed/activating 都不算
-      # inactive), 其余属性沿用原来的 0(NRestarts 那类数值)。
-      u=""; prop=""
+      # show [-p PROP]... [--value] UNIT
+      #
+      # 原来这里只认单个 -p、只答得出 ActiveState, 其余一律 `echo 0`。timer 判据要读
+      # SubState 与两个 NextElapse, 于是它们全成了 "0" —— doctor 按 fail-closed 判红,
+      # 整次 update 回滚。测出来的是桩的病, 而排查时最顺手的"修法"(把判据放宽)恰恰最坏。
+      # 所以桩要做真: **状态从当前 unit 状态派生**, 绝不无条件回答 active/waiting/finite,
+      # 否则 timer 死角那组测试会变成恒绿。
+      #
+      # 属性输出顺序**有意与命令行 -p 顺序不同**(按名字排序): 真 systemd 就是按自己的
+      # 规范顺序打印的, 谁回去按位取值立刻错位 —— 这个坑在真机上栽过一次。
+      u=""; props=""; want_value=0; nextp=0
       for a in "$@"; do
-        case "$a" in -p) ;; --value) ;; ActiveState|NRestarts|UnitFileState|LoadState) prop="$a";; *) u="$a";; esac
+        if [ "$nextp" = 1 ]; then props="$props $a"; nextp=0; continue; fi
+        case "$a" in
+          -p) nextp=1;;
+          --value) want_value=1;;
+          -*) ;;
+          *) u="$a";;
+        esac
       done
-      if [ "$prop" = ActiveState ]; then
-        v=$(cat "$D/${u}.ac" 2>/dev/null)
-        [ -z "$v" ] && { [ -f "/etc/systemd/system/${u}.service" ] && v=1 || v=0; }
-        [ "$v" = 1 ] && echo active || echo inactive
-        exit 0
-      fi
-      echo 0; exit 0;;
+      [ -n "$props" ] || props=" ActiveState"
+      _st(){ v=$(cat "$D/${u}.ac" 2>/dev/null)
+             [ -z "$v" ] && { [ -f "/etc/systemd/system/${u}" ] || [ -f "/etc/systemd/system/${u}.service" ] && v=1 || v=0; }
+             echo "$v"; }
+      _val(){
+        case "$1" in
+          ActiveState)
+            [ -f "$D/${u}.failed" ] && { echo failed; return; }
+            [ "$(_st)" = 1 ] && echo active || echo inactive;;
+          SubState)
+            # timer 的子状态从 .sub 记录取; 没记过就按 active 与否给默认值。
+            # elapsed = 已触发过但排不出下一次(死角); waiting = 正常等待; running = 正在触发。
+            v=$(cat "$D/${u}.sub" 2>/dev/null)
+            if [ -n "$v" ]; then echo "$v"
+            elif [ -f "$D/${u}.failed" ]; then echo failed
+            elif [ "$(_st)" = 1 ]; then case "$u" in *.timer) echo waiting;; *) echo running;; esac
+            else echo dead; fi;;
+          NextElapseUSecMonotonic)
+            # 只有 **active 且非 elapsed/failed 的 timer** 才有有限的下一次。
+            case "$u" in
+              *.timer)
+                sub=$(_val SubState)
+                if [ "$(_st)" = 1 ] && [ "$sub" != elapsed ] && [ "$sub" != failed ]; then
+                  cat "$D/${u}.next" 2>/dev/null || echo "1w 2d 3h 4min 5s"
+                else echo infinity; fi;;
+              *) echo infinity;;
+            esac;;
+          NextElapseUSecRealtime)
+            cat "$D/${u}.nextreal" 2>/dev/null || echo "";;
+          UnitFileState)
+            v=$(cat "$D/${u}.en" 2>/dev/null)
+            [ -z "$v" ] && { [ -f "/etc/systemd/system/${u}" ] || [ -f "/etc/systemd/system/${u}.service" ] && v=1 || v=0; }
+            [ "$v" = 1 ] && echo enabled || echo disabled;;
+          LoadState) echo loaded;;
+          Result)    [ -f "$D/${u}.failed" ] && echo failed || echo success;;
+          InvocationID) cat "$D/${u}.inv" 2>/dev/null || echo "";;
+          MainPID)   [ "$(_st)" = 1 ] && { cat "$D/${u}.pid" 2>/dev/null || echo 1234; } || echo 0;;
+          NRestarts) cat "$D/${u}.nr" 2>/dev/null || echo 0;;
+          Triggers)  case "$u" in *.timer) echo "${u%.timer}.service";; *) echo "";; esac;;
+          LastTriggerUSec) cat "$D/${u}.last" 2>/dev/null || echo "";;
+          *)         echo 0;;
+        esac
+      }
+      # 按名字排序输出 —— 有意不跟随 -p 的顺序
+      for k in $(for x in $props; do echo "$x"; done | sort); do
+        if [ "$want_value" = 1 ]; then _val "$k"; else echo "$k=$(_val "$k")"; fi
+      done
+      exit 0;;
 esac
 exit 0
 S
