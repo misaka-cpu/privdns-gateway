@@ -16,10 +16,12 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-BAK = tempfile.mkdtemp(prefix="negctl-timer.")
+sys.path.insert(0, os.path.join(ROOT, "tests"))
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清(PDG_KEEP_TMP=1 留现场)
+
+BAK = tmpguard.mkdtemp(prefix="negctl-timer.")
 
 TOUCHED = [
     "deploy/bot/pdg-health.timer",

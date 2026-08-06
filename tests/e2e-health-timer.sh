@@ -34,7 +34,12 @@ systemctl is-system-running >/dev/null 2>&1 || [[ -d /run/systemd/system ]] \
 SRC="$ROOT/deploy/bot/pdg-health.timer"
 [[ -f "$SRC" ]] || { bad "找不到 $SRC"; fin; exit $?; }
 
-HITS=/var/log/pdg-health-e2e.hits
+# 本轮所有临时物都落在这个一次性根里, 退出时随 cleanup 一起消失。
+# 不写死 /tmp: 并发跑测试时那是别人的地盘, 而且残留会被临时物卫生门抓住。
+# PDG_KEEP_TMP=1 时保留现场并把路径打到 stderr —— 调试失败用例要的就是这堆残骸。
+E2E_HT_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/e2e-health-timer.XXXXXX")"
+RC_FILE="$E2E_HT_ROOT/rc"
+HITS="$E2E_HT_ROOT/hits"
 UNIT=/etc/systemd/system/pdg-health.timer
 SVC=/etc/systemd/system/pdg-health.service
 SAVED=""
@@ -49,6 +54,11 @@ cleanup(){
   if [[ -n "$SAVED" ]]; then cp -a "$SAVED" "$UNIT"; rm -f "$SAVED"; else rm -f "$UNIT"; fi
   if [[ -n "$SAVED_SVC" ]]; then cp -a "$SAVED_SVC" "$SVC"; rm -f "$SAVED_SVC"; else rm -f "$SVC"; fi
   rm -f "$HITS"
+  if [[ -n "${PDG_KEEP_TMP:-}" && "${PDG_KEEP_TMP}" != 0 ]]; then
+    echo "[keep] 保留现场: $E2E_HT_ROOT" >&2
+  else
+    rm -rf "$E2E_HT_ROOT"
+  fi
   systemctl daemon-reload >/dev/null 2>&1
   [[ "$WAS_ACTIVE" == active ]] && systemctl start pdg-health.timer >/dev/null 2>&1
   return 0
@@ -252,11 +262,11 @@ else
   BADSRC="$(mktemp)"; cp -a "$UNIT" "$BADSRC"
   SAME="$(mktemp -d)"; mkdir -p "$SAME/deploy/bot"
   cp "$BADSRC" "$SAME/deploy/bot/pdg-health.timer"          # 仓库与盘上逐字节相同
-  ( export REPO_DIR="$SAME"; migrate_health_timer >/dev/null 2>&1; echo $? > /tmp/e2e-ht-rc ) || true
-  rc="$(cat /tmp/e2e-ht-rc 2>/dev/null || echo 9)"
+  ( export REPO_DIR="$SAME"; migrate_health_timer >/dev/null 2>&1; echo $? > "$RC_FILE" ) || true
+  rc="$(cat "$RC_FILE" 2>/dev/null || echo 9)"
   [[ "$rc" != 0 ]] && ok "内容相同但重新 arm 不成 → 返回非零($rc), 如实报失败" \
                    || bad "返回 0 —— 又把静默停摆当成正常放过去了"
-  rm -f "$BADSRC" /tmp/e2e-ht-rc; rm -rf "$SAME"
+  rm -f "$BADSRC" "$RC_FILE"; rm -rf "$SAME"
   rm -f /etc/systemd/system/pdg-health-virgin.service; systemctl daemon-reload
 fi
 
@@ -294,8 +304,8 @@ inject(){            # $1=场景名  $2=遮蔽定义
   local name="$1" shadow="$2" rc
   ( export REPO_DIR="$CHREPO"
     eval "$shadow"
-    migrate_health_timer >/dev/null 2>&1; echo $? > /tmp/e2e-ht-rc ) || true
-  rc="$(cat /tmp/e2e-ht-rc 2>/dev/null || echo 9)"
+    migrate_health_timer >/dev/null 2>&1; echo $? > "$RC_FILE" ) || true
+  rc="$(cat "$RC_FILE" 2>/dev/null || echo 9)"
   [[ "$rc" != 0 ]] && ok "$name → 返回非零($rc)" || bad "$name 却返回 0"
   [[ "$(sha256sum "$UNIT" | awk '{print $1}')" == "$BEFORE_SHA" ]] \
     && ok "$name → unit 逐字节回到原样" || bad "$name → unit 没还原"
@@ -311,8 +321,8 @@ inject(){            # $1=场景名  $2=遮蔽定义
 # 9a 候选不合法(真实场景: 仓库里那份文件被截断/写坏)
 BADREPO="$(mktemp -d)"; mkdir -p "$BADREPO/deploy/bot"
 printf '[Unit]\nDescription=坏候选\n' > "$BADREPO/deploy/bot/pdg-health.timer"
-( export REPO_DIR="$BADREPO"; migrate_health_timer >/dev/null 2>&1; echo $? > /tmp/e2e-ht-rc ) || true
-rc="$(cat /tmp/e2e-ht-rc 2>/dev/null || echo 9)"
+( export REPO_DIR="$BADREPO"; migrate_health_timer >/dev/null 2>&1; echo $? > "$RC_FILE" ) || true
+rc="$(cat "$RC_FILE" 2>/dev/null || echo 9)"
 [[ "$rc" != 0 ]] && ok "候选不合法 → 返回非零($rc)" || bad "候选不合法却返回 0"
 [[ "$(sha256sum "$UNIT" | awk '{print $1}')" == "$BEFORE_SHA" ]] \
   && ok "坏候选没有落盘" || bad "坏候选被装上去了"
@@ -323,7 +333,7 @@ inject "enable 失败"        'systemctl(){ [[ "$1" == enable ]] && return 1; co
 inject "restart 失败"       'systemctl(){ [[ "$1" == restart ]] && return 1; command systemctl "$@"; }'
 inject "restart 成功但仍无 NextElapse" '_pdg_timer_next_ok(){ return 1; }'
 
-rm -rf "$BADREPO" "$CHREPO" /tmp/e2e-ht-rc
+rm -rf "$BADREPO" "$CHREPO" "$RC_FILE"
 
 echo
 echo "── 10. unit 形态门: 两种被实测否定的写法不许出现 ──"
