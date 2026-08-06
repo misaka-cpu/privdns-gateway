@@ -249,6 +249,85 @@ def check_bot_credentials():
     return ("info", "Bot 凭据", "未配置(token 与允许 id 都为空)→ pdg-bot 不启动, 属正常禁用态。"
                                "需要用 Telegram 管理时运行 pdg-set-token 配置。")
 
+def check_health_timer():
+    """健康自检定时器**排不排得出下一次**。
+
+    jp2 上出过一次: is-enabled=enabled、is-active=active、is-failed 不 failed、
+    Result=success —— 常规三态全绿, 而 SubState=elapsed、NextElapse 两项都是空/infinity,
+    服务 8 天没跑过, doctor 一路判绿(那时它根本没有这一项)。所以判据不能只看三态,
+    必须看**下一次触发时间**。
+
+    只读: 不 restart / enable / reset-failed / daemon-reload —— 自检的职责是如实报告,
+    不是替用户按开关; 自动重启还会把问题掩盖掉, 下次照样静默停摆。
+    """
+    T = "pdg-health.timer"
+    NAME = "健康自检定时器"
+
+    def _get(args):
+        rc, out, _e = _run(["systemctl"] + args)
+        return out.strip() if rc == 0 else None
+
+    en = _get(["is-enabled", T])
+    if en is None:
+        return ("fail", NAME, "读不到 %s 的启用状态 —— 无法确认健康检查是否还在运行。" % T)
+    if en not in ("enabled", "enabled-runtime", "static", "indirect"):
+        # 用户显式停用过就不该当故障报; 但"根本没装"要说出来。
+        if en in ("disabled", "masked"):
+            return ("info", NAME, "已停用(%s)。健康检查不会自动运行。" % en)
+        return ("fail", NAME, "启用状态异常: %s" % en)
+
+    act = _get(["is-active", T])
+    if act is None:
+        return ("fail", NAME, "读不到 %s 的运行状态 —— 无法确认健康检查是否还在运行。" % T)
+
+    # 一次取齐; 任一属性读不出即 fail-closed(读不到 ≠ 没问题)。
+    # 解析 KEY=VALUE 而不是按位取 `--value` 的输出: systemd **按它自己的规范顺序**打印,
+    # 不是按 -p 传入的顺序。真机上就是这么错位的 —— NextElapseUSecRealtime 排在最前,
+    # 于是 ActiveState 拿到了时间串, doctor 把一台好机器判成红的。
+    vals = _get(["show", T, "-p", "ActiveState", "-p", "SubState",
+                 "-p", "NextElapseUSecMonotonic", "-p", "NextElapseUSecRealtime"])
+    if vals is None:
+        return ("fail", NAME, "读不到 %s 的 systemd 属性 —— 无法确认下一次运行时间。" % T)
+    props = {}
+    for line in vals.split("\n"):
+        if "=" in line:
+            k, _sep, v = line.partition("=")
+            props[k.strip()] = v.strip()
+    need = ("ActiveState", "SubState",
+            "NextElapseUSecMonotonic", "NextElapseUSecRealtime")
+    if not all(k in props for k in need):
+        return ("fail", NAME,
+                "%s 的 systemd 属性不完整(缺 %s)—— 无法确认下一次运行时间。"
+                % (T, ", ".join(k for k in need if k not in props)))
+    a_state = props["ActiveState"]; sub = props["SubState"]
+    nxt_mono = props["NextElapseUSecMonotonic"]; nxt_real = props["NextElapseUSecRealtime"]
+
+    if act != "active" or a_state != "active":
+        return ("fail", NAME,
+                "定时器已启用却没在运行(%s)。健康检查不会自动运行。"
+                % (a_state or act or "unknown"))
+
+    def _finite(v):
+        return bool(v) and v not in ("infinity", "n/a")
+
+    has_next = _finite(nxt_mono) or _finite(nxt_real)
+
+    # 正在跑的那一瞬: 下一次还没重新算出来, 不能据此报故障。
+    if sub in ("running", "elapsed-running") or not sub:
+        if sub == "running":
+            return ("ok", NAME, "健康检查正在运行。")
+
+    if sub == "elapsed" or not has_next:
+        return ("fail", NAME,
+                "健康检查定时器没有安排下一次运行。它看上去是启用且在运行的, 但不会再触发 —— "
+                "服务异常时你不会收到通知。跑 <code>sudo pdg __migrate</code> 让它重新排程。")
+
+    # 具体的绝对时间只进诊断日志: 机器是 UTC 而人按本地时区读, 摆出来容易看错四五个小时。
+    sys.stderr.write("health-timer: sub=%s next_mono=%s next_real=%s\n"
+                     % (sub, nxt_mono, nxt_real))
+    return ("ok", NAME, "已排定下一次运行。")
+
+
 def check_core_version():
     _, out, _ = _run(["mihomo", "-v"])
     m = re.search(r"v?(\d+\.\d+\.\d+)", out or "")
@@ -1280,7 +1359,7 @@ def check_transactions():
             "<code>sudo pdg tx recover &lt;id&gt;</code> 恢复。" % (len(pend), items))
 
 
-ALL = [check_platform, check_services, check_bot_credentials, check_core_version, check_dot_arecord, check_dot_domain_sync,
+ALL = [check_platform, check_services, check_bot_credentials, check_health_timer, check_core_version, check_dot_arecord, check_dot_domain_sync,
        check_internal_cidr, check_cidr_drift, check_nft, check_nft_input_chains, check_redirect, check_gms,
        check_mosdns_ratelimit, check_mosdns_explicit_proxy, check_ruleset_hijack,
        check_nft_extra, check_geosite_db, check_mem,
