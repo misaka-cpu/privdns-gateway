@@ -1906,6 +1906,97 @@ migrate_deploy_units(){
   return 0
 }
 
+# 健康自检定时器的部署状态机。
+#
+# 为什么单独一个函数而不是并进 migrate_deploy_units: timer 与 .service 不同, **换了文件
+# 还得让它重新排程**。`systemctl enable --now` 对一个已经 active 的 timer 什么都不做, 于是
+# 盘上是新调度、跑着的还是旧的 —— jp2 上那台 8 天没跑过健康自检, 正是这条缝。
+#
+# 判据不是"文件对不对", 而是**排不排得出下一次**: 同一份 unit 冷启是好的、重启一次就可能
+# 死在 elapsed+infinity。所以内容没变时也要看 NextElapse, 不对就重新 arm。
+_pdg_timer_next_ok(){                       # $1=unit 名; 有有限的下一次触发则 0
+  local m r
+  m="$(systemctl show "$1" -p NextElapseUSecMonotonic --value 2>/dev/null)"
+  r="$(systemctl show "$1" -p NextElapseUSecRealtime  --value 2>/dev/null)"
+  [[ -n "$m" && "$m" != infinity ]] && return 0
+  [[ -n "$r" && "$r" != infinity && "$r" != "n/a" ]] && return 0
+  return 1
+}
+
+migrate_health_timer(){
+  local src="$REPO_DIR/deploy/bot/pdg-health.timer"
+  local cur=/etc/systemd/system/pdg-health.timer
+  local T=pdg-health.timer
+  [[ -f "$src" ]] || return 0
+  command -v systemctl >/dev/null 2>&1 || return 0
+
+  # 候选先验证: 一份连 [Timer] 段都没有的文件装上去 = 把定时器彻底废掉。
+  if ! grep -q '^\[Timer\]' "$src" || ! grep -qE '^On(Active|UnitActive|Boot|Calendar)Sec=' "$src"; then
+    c_y "  健康自检定时器候选不合法(缺 [Timer] 或触发条件), 不安装"; return 1
+  fi
+
+  local en0 ac0
+  en0="$(systemctl is-enabled "$T" 2>/dev/null)"
+  ac0="$(systemctl is-active  "$T" 2>/dev/null)"
+
+  # ── 内容没变: 一个字节都不写, 只在状态确实不对时纠正 ──
+  if [[ -f "$cur" ]] && cmp -s "$src" "$cur"; then
+    local acted=0
+    if [[ "$en0" != enabled ]]; then
+      systemctl enable "$T" >/dev/null 2>&1 || { c_y "  启用 $T 失败"; return 1; }
+      acted=1
+    fi
+    if [[ "$ac0" != active ]] || ! _pdg_timer_next_ok "$T"; then
+      # active 但排不出下一次 = elapsed+infinity 那个死角, 内容相同也必须重新 arm
+      systemctl restart "$T" >/dev/null 2>&1 || { c_y "  重启 $T 失败"; return 1; }
+      _pdg_timer_next_ok "$T" || { c_y "  $T 重启后仍排不出下一次触发"; return 1; }
+      acted=1
+    fi
+    [[ "$acted" == 1 ]] && c_g "  健康自检定时器已重新排程"
+    return 0
+  fi
+
+  # ── 内容变了: 存 before-image → 原子安装 → reload → enable → 明确 restart → 验证 ──
+  local had=0 bak="" mode="" own=""
+  if [[ -f "$cur" ]]; then
+    had=1; bak="$(mktemp)" || { c_y "  无法创建备份"; return 1; }
+    cp -a "$cur" "$bak" || { c_y "  备份 $T 失败"; rm -f "$bak"; return 1; }
+    mode="$(stat -c%a "$cur" 2>/dev/null)"; own="$(stat -c%u:%g "$cur" 2>/dev/null)"
+  fi
+
+  _restore(){                               # 尽力回到原状; 回滚不完整要明说
+    local _rbad=0
+    if [[ "$had" == 1 ]]; then
+      cp -a "$bak" "$cur" 2>/dev/null || _rbad=1
+      [[ -n "$mode" ]] && { chmod "$mode" "$cur" 2>/dev/null || _rbad=1; }
+      [[ -n "$own"  ]] && { chown "$own"  "$cur" 2>/dev/null || _rbad=1; }
+    else
+      rm -f "$cur" 2>/dev/null || _rbad=1
+    fi
+    systemctl daemon-reload >/dev/null 2>&1 || _rbad=1
+    [[ "$en0" == enabled ]] && { systemctl enable "$T" >/dev/null 2>&1 || _rbad=1; }
+    [[ "$ac0" == active  ]] && { systemctl start  "$T" >/dev/null 2>&1 || _rbad=1; }
+    rm -f "$bak"
+    [[ "$_rbad" == 0 ]] || c_y "  ⚠️ 回滚 $T 不完整 —— 请手工核对 $cur 与 systemctl status $T"
+    return 0
+  }
+
+  if ! install -m644 "$src" "$cur" 2>/dev/null; then
+    c_y "  安装 $T 失败"; _restore; return 1; fi
+  if ! systemctl daemon-reload >/dev/null 2>&1; then
+    c_y "  daemon-reload 失败"; _restore; return 1; fi
+  if ! systemctl enable "$T" >/dev/null 2>&1; then
+    c_y "  启用 $T 失败"; _restore; return 1; fi
+  # 明确 restart 而不是 try-restart: timer 是必需件, "没装/没起"不该被悄悄跳过。
+  if ! systemctl restart "$T" >/dev/null 2>&1; then
+    c_y "  重启 $T 失败"; _restore; return 1; fi
+  if ! _pdg_timer_next_ok "$T"; then
+    c_y "  $T 换新 unit 后仍排不出下一次触发"; _restore; return 1; fi
+  rm -f "$bak"
+  c_g "  健康自检定时器已更新并重新排程"
+  return 0
+}
+
 migrate_deploy_botfiles(){
   [[ -d "$REPO_DIR/deploy/bot" ]] || return 0
   # shellcheck source=lib/modules.sh
@@ -2820,6 +2911,7 @@ run_all_migrations(){
   migrate_mosdns_unlock || true; migrate_fw_gms || true
   migrate_mosdns_ratelimit || true; migrate_lowmem || true; migrate_mihomo_safepaths || true
   migrate_deploy_botfiles || true; migrate_deploy_units || true
+  migrate_health_timer || rc=1   # 定时器排不出下一次 = 健康自检静默停摆, 必须让更新回滚
   migrate_mosdns_hijack_shape || true
   migrate_mosdns_explicit_proxy || true
   migrate_ruleset_hijack || true

@@ -1,10 +1,25 @@
 [Unit]
 Description=每 10 分钟跑一次 PrivDNS Gateway 健康自检
 
+# 调度必须**永远排得出下一次**。原来这里是 OnBootSec=2min + OnUnitActiveSec=10min:
+# 开机很久之后再重启一次 timer(升级重写 unit 就会), 开机点已在过去、而 OnUnitActiveSec
+# 不足以重新武装 ⇒ NextElapse=infinity, 永久停在 SubState=elapsed。而所有常规信号都说
+# 正常 —— enabled、active、不 failed、Result=success。jp2 上就这样静默停了 8 天。
+#
+# OnActiveSec 相对**本 timer 自己被激活的时刻**, 这个参照点任何时候都存在, 所以无论
+# 冷启、重启、还是升级重写后重启, 都必然排得出下一次。
+#
+# 不用 OnCalendar: 那会把相对调度换成墙钟调度(受时区/DST 影响, 且所有机器在整点齐射);
+# 更要紧的是**不能与 OnUnitActiveSec 并存** —— 容器实测两者叠加时 systemd 取最早的那个,
+# 墙钟槽与单调间隔交错, 实测间隔从 20/30 秒变成 20,10,21,9,21,9, 频率接近翻倍。
+# 也因此这里没有 Persistent= : 它只对 OnCalendar 生效, 留着是句空头承诺。
+#
+# Unit= 写明触发目标: 默认是"同名 .service", 靠约定成立。写出来之后, 谁改了文件名或
+# 加了别名都不会悄悄指错地方 —— 这条判据要读它。
 [Timer]
-OnBootSec=2min
+OnActiveSec=2min
 OnUnitActiveSec=10min
-Persistent=true
+Unit=pdg-health.service
 
 [Install]
 WantedBy=timers.target
