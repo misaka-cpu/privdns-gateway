@@ -325,4 +325,20 @@ inject "restart 成功但仍无 NextElapse" '_pdg_timer_next_ok(){ return 1; }'
 
 rm -rf "$BADREPO" "$CHREPO" /tmp/e2e-ht-rc
 
+echo
+echo "── 10. unit 形态门: 两种被实测否定的写法不许出现 ──"
+# 这两条是形态判据而不是行为判据, 因为它们的危害要么无可观测(惰性指令), 要么只在长时间
+# 窗口里才显形 —— 而两者都有实测依据, 不是凭感觉定的规矩。
+BODY="$(grep -vE '^[[:space:]]*#' "$SRC")"       # 剥掉注释, 免得解释性文字被当成配置
+if grep -q '^Persistent=' <<<"$BODY" && ! grep -q '^OnCalendar=' <<<"$BODY"; then
+  bad "unit 里有 Persistent= 却没有 OnCalendar= —— 它只对 OnCalendar 生效, 留着是句空头承诺(这次就是它误导了排查)"
+else
+  ok "没有惰性的 Persistent=(要么不写, 要么配 OnCalendar 一起写)"
+fi
+if grep -q '^OnCalendar=' <<<"$BODY" && grep -q '^OnUnitActiveSec=' <<<"$BODY"; then
+  bad "OnCalendar= 与 OnUnitActiveSec= 并存 —— 容器实测 systemd 取最早的那个, 墙钟槽与单调间隔交错, 间隔从 20/30 秒变成 20,10,21,9,21,9, 频率接近翻倍"
+else
+  ok "OnCalendar 与 OnUnitActiveSec 没有并存(实测叠加会交错双触发)"
+fi
+
 fin

@@ -346,6 +346,15 @@ jobs:
       - name: "链路测试退出键指回入口菜单 (四屏一致/不回自检/保留主菜单)"
         run: python3 tests/test-link-nav.py
 
+      # jp2 上定时器停摆 8 天而 doctor 一路判绿 —— 那时它根本没有这一项。
+      # 判据不能只看 enabled/active/failed 三态, 必须看有没有下一次触发时间。
+      - name: "健康自检定时器判据 (elapsed+infinity 必须 FAIL / 正在跑不误报 / 只读)"
+        run: python3 tests/test-health-timer-doctor.py
+
+      # 真 systemd: 死角复现、状态机、故障注入。容器里跑, 非 root 环境 SKIP(严格模式判失败)。
+      - name: "健康自检定时器 真 systemd (死角/状态机/6 种故障注入; 环境不足则 SKIP)"
+        run: sudo -E bash tests/e2e-health-timer.sh
+
       - name: "nft 语义判据 (nft 自身规范化不算漂移: 集合折叠/reject 默认展开/协议别名)"
         run: python3 tests/test-nft-live-semantics.py
 
