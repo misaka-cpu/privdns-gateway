@@ -292,35 +292,78 @@ finite && ok "新调度已 arm(有有限的下一次)" || bad "换了 unit 却�
 echo
 echo "── 9. 故障注入: 每一步失败都要非零 + 回到原状 ──"
 # root 下 chmod 000 挡不住 install(第一版就是这么假绿的), 改用**函数遮蔽**精准打到某一步。
-install -m644 "$SRC" "$UNIT"; systemctl daemon-reload
-systemctl enable --now pdg-health.timer >/dev/null 2>&1; sleep 1
-BEFORE_SHA="$(sha256sum "$UNIT" | awk '{print $1}')"
-BEFORE_EN="$(systemctl is-enabled pdg-health.timer 2>/dev/null)"
-BEFORE_AC="$(systemctl is-active  pdg-health.timer 2>/dev/null)"
 CHREPO="$(mktemp -d)"; mkdir -p "$CHREPO/deploy/bot"
 sed 's/OnActiveSec=2min/OnActiveSec=3min/' "$SRC" > "$CHREPO/deploy/bot/pdg-health.timer"   # 制造内容变化
 
+# 每一格都从**干净的 systemd 限速状态 + 明确核对过的健康前态**开始。
+#
+# 为什么非清不可: systemd 对每个 unit 有启动限速(默认 StartLimitIntervalSec=10s /
+# StartLimitBurst=5, 这个 unit 自己没写 StartLimit 所以取默认)。本节几格连着 stop/start
+# 同一个 unit, 到第三、四格就会撞上 `start-limit-hit` —— unit 掉进 failed, 于是产品
+# _restore 里那次 systemctl start(它没被遮蔽)真的失败, 断言就把 systemd 的限速记成了
+# "产品没还原状态"。systemd 252 上不显形, 255 上必红(GitHub runner 43/1, 同形环境 42/2,
+# journal 明写 Start request repeated too quickly / Failed with result 'start-limit-hit',
+# 而单独跑那一格是通过的)。
+#
+# 清理只出现在**准备阶段**。绝不能放进 migrate_health_timer、被测的 _restore、注入器,
+# 或断言失败后的补救里 —— 那等于测试替产品把状态收拾干净, 真实的回滚缺陷会被洗成绿的。
+# 也不用固定 sleep 去等限速窗口: 那既依赖 manager 的默认值, 又平白拉长 CI。
+case_setup(){        # $1=场景名(仅用于失败文案)
+  local who="${1:-准备阶段}" i
+  systemctl stop pdg-health.timer >/dev/null 2>&1 || true
+  # reset-failed 同时清掉 failed 状态与该 unit 的启动限速计数; 它失败就说明环境不对, 要报出来
+  systemctl reset-failed pdg-health.timer >/dev/null 2>&1 \
+    || { bad "$who 准备: reset-failed 失败"; return 1; }
+  install -m644 "$SRC" "$UNIT" 2>/dev/null || { bad "$who 准备: 装基线 unit 失败"; return 1; }
+  systemctl daemon-reload >/dev/null 2>&1  || { bad "$who 准备: daemon-reload 失败"; return 1; }
+  systemctl enable pdg-health.timer >/dev/null 2>&1 || { bad "$who 准备: enable 失败"; return 1; }
+  systemctl start  pdg-health.timer >/dev/null 2>&1 || { bad "$who 准备: start 失败"; return 1; }
+  # 正向确认前态, 不靠"应该就是健康的"。有界重试是等 systemd 把调度算出来, 与限速窗口无关。
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    [[ "$(systemctl is-active pdg-health.timer 2>/dev/null)" == active ]] && finite && break
+    sleep 0.5
+  done
+  [[ "$(systemctl is-enabled pdg-health.timer 2>/dev/null)" == enabled ]] \
+    || { bad "$who 准备: 前态不是 enabled"; return 1; }
+  [[ "$(systemctl is-active  pdg-health.timer 2>/dev/null)" == active ]] \
+    || { bad "$who 准备: 前态不是 active"; return 1; }
+  [[ "$(systemctl show -p SubState --value pdg-health.timer 2>/dev/null)" == waiting ]] \
+    || { bad "$who 准备: 前态 SubState 不是 waiting"; return 1; }
+  finite || { bad "$who 准备: 前态排不出下一次触发"; return 1; }
+  # 前态核对通过之后才取 before-image —— 取的是这一格真正的起点, 不是全局的旧快照
+  BEFORE_SHA="$(sha256sum "$UNIT" | awk '{print $1}')"
+  BEFORE_EN="$(systemctl is-enabled pdg-health.timer 2>/dev/null)"
+  BEFORE_AC="$(systemctl is-active  pdg-health.timer 2>/dev/null)"
+  BEFORE_MODE="$(stat -c%a "$UNIT" 2>/dev/null)"
+  BEFORE_OWN="$(stat -c%u:%g "$UNIT" 2>/dev/null)"
+  return 0
+}
+
 inject(){            # $1=场景名  $2=遮蔽定义
   local name="$1" shadow="$2" rc
+  case_setup "$name" || return 0        # 准备失败已计 FAIL, 不拿脏前态去跑这一格
   ( export REPO_DIR="$CHREPO"
     eval "$shadow"
     migrate_health_timer >/dev/null 2>&1; echo $? > "$RC_FILE" ) || true
   rc="$(cat "$RC_FILE" 2>/dev/null || echo 9)"
   [[ "$rc" != 0 ]] && ok "$name → 返回非零($rc)" || bad "$name 却返回 0"
-  [[ "$(sha256sum "$UNIT" | awk '{print $1}')" == "$BEFORE_SHA" ]] \
-    && ok "$name → unit 逐字节回到原样" || bad "$name → unit 没还原"
+  # 内容 + mode + uid:gid 一起核: 只比内容的话, 权限被改宽也算"还原了"
+  if [[ "$(sha256sum "$UNIT" | awk '{print $1}')" == "$BEFORE_SHA" \
+        && "$(stat -c%a "$UNIT" 2>/dev/null)" == "$BEFORE_MODE" \
+        && "$(stat -c%u:%g "$UNIT" 2>/dev/null)" == "$BEFORE_OWN" ]]; then
+    ok "$name → unit 逐字节回到原样"
+  else
+    bad "$name → unit 没还原(内容/mode/uid/gid 有一项不符)"
+  fi
   [[ "$(systemctl is-enabled pdg-health.timer 2>/dev/null)" == "$BEFORE_EN" \
      && "$(systemctl is-active pdg-health.timer 2>/dev/null)" == "$BEFORE_AC" ]] \
     && ok "$name → enabled/active 状态还原" || bad "$name → 状态没还原"
-  # 每一格之后回到基线, 免得上一格的残留影响下一格
-  install -m644 "$SRC" "$UNIT"; systemctl daemon-reload
-  systemctl enable --now pdg-health.timer >/dev/null 2>&1
-  systemctl restart pdg-health.timer >/dev/null 2>&1; sleep 1
 }
 
 # 9a 候选不合法(真实场景: 仓库里那份文件被截断/写坏)
 BADREPO="$(mktemp -d)"; mkdir -p "$BADREPO/deploy/bot"
 printf '[Unit]\nDescription=坏候选\n' > "$BADREPO/deploy/bot/pdg-health.timer"
+case_setup "候选不合法"
 ( export REPO_DIR="$BADREPO"; migrate_health_timer >/dev/null 2>&1; echo $? > "$RC_FILE" ) || true
 rc="$(cat "$RC_FILE" 2>/dev/null || echo 9)"
 [[ "$rc" != 0 ]] && ok "候选不合法 → 返回非零($rc)" || bad "候选不合法却返回 0"
