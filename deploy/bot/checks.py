@@ -279,13 +279,26 @@ def check_health_timer():
         return ("fail", NAME, "读不到 %s 的运行状态 —— 无法确认健康检查是否还在运行。" % T)
 
     # 一次取齐; 任一属性读不出即 fail-closed(读不到 ≠ 没问题)。
+    # 解析 KEY=VALUE 而不是按位取 `--value` 的输出: systemd **按它自己的规范顺序**打印,
+    # 不是按 -p 传入的顺序。真机上就是这么错位的 —— NextElapseUSecRealtime 排在最前,
+    # 于是 ActiveState 拿到了时间串, doctor 把一台好机器判成红的。
     vals = _get(["show", T, "-p", "ActiveState", "-p", "SubState",
-                 "-p", "NextElapseUSecMonotonic", "-p", "NextElapseUSecRealtime",
-                 "--value"])
+                 "-p", "NextElapseUSecMonotonic", "-p", "NextElapseUSecRealtime"])
     if vals is None:
         return ("fail", NAME, "读不到 %s 的 systemd 属性 —— 无法确认下一次运行时间。" % T)
-    parts = (vals.split("\n") + ["", "", "", ""])[:4]
-    a_state, sub, nxt_mono, nxt_real = [x.strip() for x in parts]
+    props = {}
+    for line in vals.split("\n"):
+        if "=" in line:
+            k, _sep, v = line.partition("=")
+            props[k.strip()] = v.strip()
+    need = ("ActiveState", "SubState",
+            "NextElapseUSecMonotonic", "NextElapseUSecRealtime")
+    if not all(k in props for k in need):
+        return ("fail", NAME,
+                "%s 的 systemd 属性不完整(缺 %s)—— 无法确认下一次运行时间。"
+                % (T, ", ".join(k for k in need if k not in props)))
+    a_state = props["ActiveState"]; sub = props["SubState"]
+    nxt_mono = props["NextElapseUSecMonotonic"]; nxt_real = props["NextElapseUSecRealtime"]
 
     if act != "active" or a_state != "active":
         return ("fail", NAME,

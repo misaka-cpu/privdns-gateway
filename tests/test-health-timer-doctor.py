@@ -44,17 +44,21 @@ def fake_systemctl(state):
             v = state.get(cmd[1])
             return (1, "", "") if v is None else (0, v + "\n", "")
         if cmd[1] == "show":
-            # 真调用是 `systemctl show <unit> -p A -p B --value` —— `-p` 与属性名是
-            # **两个独立参数**。第一版按 `-pA` 解析, 于是一个属性都取不到, 全落进
-            # fail-closed 分支: 那时"判 fail"是蒙对的, 不是判据在起作用。
+            # 真调用是 `systemctl show <unit> -p A -p B` —— `-p` 与属性名是两个独立参数。
+            #
+            # 两个关键的仿真点, 都是真机上栽过才补的:
+            #   · 第一版按 `-pA` 解析, 于是一个属性都取不到, 全落进 fail-closed 分支 ——
+            #     那时"判 fail"是蒙对的, 不是判据在起作用;
+            #   · systemd **按它自己的规范顺序**打印, 不是按 -p 传入的顺序。替身这里
+            #     **故意打乱顺序**: 谁要是回去按位取值, 立刻就会错位翻车。
             props = [cmd[i + 1] for i, a in enumerate(cmd)
                      if a == "-p" and i + 1 < len(cmd)]
             out = []
-            for p in props:
+            for p in sorted(props):                  # 有意与请求顺序不同
                 v = state.get(p)
                 if v is None:
                     return (1, "", "")
-                out.append(v)
+                out.append("%s=%s" % (p, v))
             return (0, "\n".join(out) + "\n", "")
         return (1, "", "")
     return _run
