@@ -255,6 +255,10 @@ jobs:
       - name: "自检防火墙端口回归"
         run: python3 tests/test-doctor-firewall.py
 
+      # 定时器停摆时所有常规信号都说正常, 只有 NextElapse 露馅 —— doctor 此前没有这一项。
+      - name: "健康自检定时器判据 (elapsed+infinity 必须 FAIL / 正在跑不误报 / 只读)"
+        run: python3 tests/test-health-timer-doctor.py
+
       - name: "nft input 链冲突判据 (单一来源 + 读不到≠没有 + platform 守卫不靠 PATH 找 nft)"
         run: python3 tests/test-nft-input-scan.py
 
@@ -339,6 +343,14 @@ jobs:
       # docs/rescue-plane-acceptance.md, 那里只写真跑过的结论。
       - name: "救援平面 10b 硬门 (真 socket activation/硬化/真 nft; 环境不足则 SKIP)"
         run: sudo -E bash tests/e2e-rescue-10b.sh
+
+      # 真 systemd: 死角复现、迁移状态机、故障注入。非 root 环境 SKIP(严格模式判失败)。
+      - name: "健康自检定时器 真 systemd (死角/状态机/6 种故障注入; 环境不足则 SKIP)"
+        run: sudo -E bash tests/e2e-health-timer.sh
+
+      # 共享 systemctl 桩的契约: 它坏了不会有人报警, 只会让上层测试悄悄变成恒绿。
+      - name: "共享 systemctl 桩契约 (多个 -p/KEY=VALUE/乱序/四种状态/故障注入)"
+        run: sudo -E env PDG_E2E_ISOLATED=1 bash tests/test-systemctl-stub.sh
 
       - name: "运行模块安装闭包 (真实入口传递依赖 vs 安装真源, 含动态导入点)"
         run: python3 tests/test-install-closure.py
