@@ -2,7 +2,7 @@
 
 本项目按语义化 `v1.x` tag 正式发布;以下按版本/日期记录主要变化,完整提交见 git 历史。
 
-## 待发布 — v1.8.2 候选(健康自检定时器可能再也不会运行)
+## 2026-08-07 — v1.8.2(健康自检定时器可能再也不会运行)
 
 `pdg-health.timer` 可能处在这样一种状态: `systemctl is-enabled` 说 enabled、`is-active`
 说 active、`is-failed` 不 failed、`Result=success` —— 一切看着正常, 但它**再也不会触发**。
