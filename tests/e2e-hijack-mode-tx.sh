@@ -64,7 +64,35 @@ fp(){ printf '%s|%s|%s||%s|%s|%s' \
         "$(sha256sum "$PE" 2>/dev/null | cut -d' ' -f1)" "$(stat -c '%a' "$PE" 2>/dev/null)" \
         "$(stat -c '%u:%g' "$PE" 2>/dev/null)"; }
 ntx(){ find "$TXR" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l; }
-newest_tx(){ find "$TXR" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort | tail -1; }
+# 事务目录名是 `%Y%m%dT%H%M%SZ-<uuid4 前 8 位>`(见 pdgtx.py 的 _new_txid)—— 时间戳只到秒,
+# 同秒的两笔靠随机后缀区分。所以**不能**按名字排序去猜"最新的那笔": 上一个小节的事务与本次
+# 的落在同一秒时, 谁排在后面纯看随机数。实测过一次: 第 10 节自己那笔是 ROLLBACK_FAILED(正确),
+# 而 `sort | tail -1` 选中了第 8/9 节留下的 ABORTED, 断言于是把别人的状态读成了本次的结果 ——
+# CI 上表现为约 6% 的随机红, 独立 job 与串行 job 都会中。
+#
+# 改成记差集: 被测命令调用前后各取一次目录集合, 新增的那一笔才是本次要断言的对象。
+# 顺带把"一次操作只应产生一笔事务"变成硬门 —— 0 笔或多笔都判红, 而不是默默挑一个。
+_tx_list(){ find "$TXR" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort; }
+tx_mark(){ _TX_BEFORE="$(_tx_list)"; }         # 在被测 CLI 调用**之前**打点
+tx_created(){                                  # $1=场景名; 打印本次新增的那一笔事务目录
+  local now new n
+  now="$(_tx_list)"
+  new="$(comm -13 <(printf '%s\n' "$_TX_BEFORE") <(printf '%s\n' "$now"))"
+  n="$(grep -c . <<<"$new")"
+  if [[ "$n" == 1 ]]; then printf '%s\n' "$new"; return 0; fi
+  if [[ "$n" == 0 ]]; then bad "$1: 本次操作没有产生任何事务(应恰好 1 笔)"; return 1; fi
+  bad "$1: 本次操作产生了 $n 笔事务(应恰好 1 笔): $(xargs -r -n1 basename <<<"$new" | tr '\n' ' ')"
+  return 1
+}
+tx_is_ours(){                                  # $1=事务目录 $2=场景名; 核对确实是本次 CLI 操作
+  local d="$1" nm="$2" src op tg
+  [[ -n "$d" ]] || return 1
+  src="$(tx_get "$d" source)"; op="$(tx_get "$d" op)"; tg="$(tx_get "$d" targets)"
+  [[ "$src" == cli ]]           || { bad "$nm: 新增事务 source=$src(应为 cli)"; return 1; }
+  [[ "$op" == hijack-mode ]]    || { bad "$nm: 新增事务 op=$op(应为 hijack-mode)"; return 1; }
+  grep -q mosdns_conf <<<"$tg"  || { bad "$nm: 新增事务 targets 不含 mosdns_conf: $tg"; return 1; }
+  return 0
+}
 tx_state(){ python3 -c "import json,sys;print(json.load(open(sys.argv[1]+'/meta.json')).get('state'))" "$1" 2>/dev/null; }
 tx_get(){ python3 -c "import json,sys;print(json.load(open(sys.argv[1]+'/meta.json')).get(sys.argv[2]))" "$1" "$2" 2>/dev/null; }
 cur_mode(){ sed -n 's/^PDG_HIJACK_MODE=//p' "$PE" 2>/dev/null | tail -1; }
@@ -89,7 +117,7 @@ echo "── 0. 前提 ──"
 # ══ 1. all → gfw: 一笔事务, 两个目标, 带 restart:mosdns ═════════════════════
 echo; echo "── 1. all → gfw 走事务 ──"
 _n0=$(ntx); _r0=$(restarts)
-out=$(pdg hijack-mode gfw 2>&1); rc=$?
+tx_mark; out=$(pdg hijack-mode gfw 2>&1); rc=$?
 [[ "$rc" == 0 ]] && ok "切到 gfw 返回 0" || bad "1: rc=$rc: $(tail -3 <<<"$out")"
 [[ "$(cur_mode)" == gfw ]] && ok "profile.env 记为 gfw" || bad "1b: 模式是 $(cur_mode)"
 # 判据要落在**劫持门**上, 不是 hijack_set 插件 —— 那个插件种子配置里本来就有(e2e_seed_mosdns
@@ -98,7 +126,9 @@ grep -q '!qname \$hijack_set' "$MC" && ok "mosdns 装上了劫持门(gfw 形态�
   || bad "1c: 劫持门没落盘(形态没变)"
 _n1=$(ntx)
 if [[ "$((_n1-_n0))" == 1 ]]; then ok "正好产生 1 笔事务"; else bad "1d: 事务数 $_n0→$_n1"; fi
-TX1="$(newest_tx)"
+_TXN1="$(tx_created "1")" || _TXN1=""
+tx_is_ours "$_TXN1" "1" || true
+TX1="$_TXN1"
 [[ "$(tx_state "$TX1")" == COMMITTED ]] && ok "事务状态 COMMITTED" || bad "1e: $(tx_state "$TX1")"
 [[ "$(tx_get "$TX1" source)" == cli ]] && ok "审计 source=cli" || bad "1f: source=$(tx_get "$TX1" source)"
 [[ "$(tx_get "$TX1" op)" == hijack-mode ]] && ok "审计 op=hijack-mode" || bad "1g: op=$(tx_get "$TX1" op)"
@@ -122,10 +152,12 @@ out=$(pdg hijack-mode gfw 2>&1); rc=$?
 
 # ══ 3. gfw → all ═══════════════════════════════════════════════════════════
 echo; echo "── 3. gfw → all ──"
-out=$(pdg hijack-mode all 2>&1); rc=$?
+tx_mark; out=$(pdg hijack-mode all 2>&1); rc=$?
 [[ "$rc" == 0 ]] && ok "切回 all 返回 0" || bad "3: rc=$rc: $(tail -3 <<<"$out")"
 [[ "$(cur_mode)" == all ]] && ok "profile.env 记为 all" || bad "3b: $(cur_mode)"
-[[ "$(tx_state "$(newest_tx)")" == COMMITTED ]] && ok "切回也是 COMMITTED" || bad "3c"
+_TXN3="$(tx_created "3")" || _TXN3=""
+tx_is_ours "$_TXN3" "3" || true
+[[ "$(tx_state "$_TXN3")" == COMMITTED ]] && ok "切回也是 COMMITTED" || bad "3c"
 
 # ══ 4. 全局锁被占用 ════════════════════════════════════════════════════════
 echo; echo "── 4. 全局锁被占用 ──"
@@ -177,11 +209,13 @@ echo "stub mosdns: refuse" >&2
 exit 1
 STUB
 chmod 755 /tmp/hm-bin/mosdns
-out=$(PATH="/tmp/hm-bin:$PATH" pdg hijack-mode gfw 2>&1); rc=$?
+tx_mark; out=$(PATH="/tmp/hm-bin:$PATH" pdg hijack-mode gfw 2>&1); rc=$?
 rm -rf /tmp/hm-bin
 if [[ "$rc" != 0 ]]; then ok "候选校验失败 → 返回非 0"; else bad "7: rc=0, 校验没拦住"; fi
 [[ "$(fp)" == "$_f" ]] && ok "现网两个文件逐字节未变" || bad "7b: 现网被改了"
-_st=$(tx_state "$(newest_tx)")
+_TXN7="$(tx_created "7")" || _TXN7=""
+tx_is_ours "$_TXN7" "7" || true
+_st=$(tx_state "$_TXN7")
 [[ "$_st" == ABORTED || "$_st" == COMMITTED || "$(ntx)" == "$_n0" ]] \
   && ok "没有停在中间态(最新事务: ${_st:-无新事务})" || bad "7c: 停在 $_st"
 
@@ -220,8 +254,10 @@ echo; echo "── 10. mosdns 重启后不稳定 ──"
 reset_all
 _f=$(fp)
 mkdir -p /tmp/e2e-svc; : > /tmp/e2e-svc/mosdns.fail
-out=$(pdg hijack-mode gfw 2>&1); rc=$?
-_TXB="$(newest_tx)"; _st=$(tx_state "$_TXB")
+tx_mark; out=$(pdg hijack-mode gfw 2>&1); rc=$?
+_TXN10="$(tx_created "10")" || _TXN10=""
+tx_is_ours "$_TXN10" "10" || true
+_TXB="$_TXN10"; _st=$(tx_state "$_TXB")
 e2e_svc_heal mosdns
 [[ "$rc" != 0 ]] && ok "服务重启后不稳定 → 返回非 0" || bad "10: 谎报成功"
 if [[ "$(fp)" == "$_f" ]]; then
@@ -316,7 +352,7 @@ if mount --bind /etc/privdns-gateway /etc/privdns-gateway 2>/dev/null; then
   } > /tmp/hm-stub2/python3
   chmod 755 /tmp/hm-stub2/python3
   _f=$(fp)
-  out=$(PATH="/tmp/hm-stub2:$PATH" pdg hijack-mode gfw 2>&1); rc=$?
+tx_mark;   out=$(PATH="/tmp/hm-stub2:$PATH" pdg hijack-mode gfw 2>&1); rc=$?
   # bind + remount,ro 会叠成两层, 单次 umount 清不掉 —— 残留的只读挂载会把**后面**的用例
   # 一起带偏(实测: 场景 10/11 的 rollback_failed_items 变成 profile_env(OSError), 看起来
   # 像产品在别处出错, 其实是这里没卸干净)。卸到不再是挂载点为止, 并复验可写。
@@ -331,7 +367,9 @@ if mount --bind /etc/privdns-gateway /etc/privdns-gateway 2>/dev/null; then
     bad "14-收尾: /etc/privdns-gateway 仍不可写, 后续用例会被污染"
   fi
   [[ "$rc" != 0 ]] && ok "第二个目标写不下去 → 返回非 0(不谎报成功)" || bad "14: rc=0: $(tail -2 <<<"$out")"
-  _st=$(tx_state "$(newest_tx)")
+_TXN14="$(tx_created "14")" || _TXN14=""
+tx_is_ours "$_TXN14" "14" || true
+  _st=$(tx_state "$_TXN14")
   # 判据落在**不许留半状态**上: 要么两个文件都回到操作前, 要么如实报 ROLLBACK_FAILED。
   # 没有第三种可接受的结果 —— "文件是半的、状态却说完整"正是这条要挡的。
   if [[ "$(fp)" == "$_f" ]]; then
