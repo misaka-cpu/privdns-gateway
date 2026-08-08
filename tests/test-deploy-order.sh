@@ -146,17 +146,67 @@ rm -rf "$C"
 
 echo
 echo "── D. 结论: 标准 bundle 部署不许再用 B 那个顺序 ──"
-# 这条守着交接文档: SOP 里必须写明"不要提前装模块", 否则下次换人照样踩。
-DOC=/home/codex/privdns-gateway-HANDOFF.md
-if [[ -f "$DOC" ]]; then
-  if grep -q "不要提前调用 pdg_install_runtime_modules\|不得提前调用 pdg_install_runtime_modules" "$DOC"; then
-    ok "交接文档已写明: bundle 部署不得提前装模块"
-  else
-    bad "交接文档没写这条 —— 下一个人还会按 B 的顺序做"
-  fi
+# 这条守着 SOP: 文档里必须写明正确顺序, 否则下次换人照样按 B 的顺序做。
+#
+# 判据来源必须是**仓库内受版本控制的文档** —— 早先这里指向开发机上的一个绝对路径
+# (/home/<user>/…-HANDOFF.md), 于是本地永远绿、CI runner 上永远红, 而红的原因和被测
+# 的部署顺序毫无关系。现在从脚本自身位置算仓库根, 不看 cwd、不看 HOME、不看用户名。
+SOP="$ROOT/docs/BRANCH-BUNDLE-DEPLOYMENT.md"
+if [[ ! -f "$SOP" ]]; then
+  bad "找不到仓库内的部署 SOP: docs/BRANCH-BUNDLE-DEPLOYMENT.md"
 else
-  bad "找不到交接文档 $DOC"
+  ok "SOP 在仓库内(随仓库走, 换机器/换账号都在)"
+  # 步骤按**语义标记**查, 不逐字钉整段措辞 —— 文案可以改, 这几件事不能少。
+  _miss=()
+  grep -q "git bundle create" "$SOP"                      || _miss+=("生成 bundle")
+  grep -qE "SHA256|sha256" "$SOP"                          || _miss+=("核对 SHA256")
+  grep -q "rev-parse" "$SOP"                               || _miss+=("核对解出的 ref")
+  grep -q "REPO_DIR" "$SOP"                                || _miss+=("同步完整 REPO_DIR")
+  grep -q "/usr/local/bin/pdg" "$SOP"                      || _miss+=("安装 CLI")
+  grep -q "pdg __migrate" "$SOP"                           || _miss+=("运行 pdg __migrate")
+  grep -qE "不要提前调用 pdg_install_runtime_modules|不得提前调用 pdg_install_runtime_modules" "$SOP" \
+                                                            || _miss+=("禁止提前装模块")
+  grep -qE "不得用普通 pdg update|不得用 pdg update" "$SOP" || _miss+=("功能分支不许用 pdg update")
+  [[ ${#_miss[@]} -eq 0 ]] && ok "SOP 十步的关键动作齐全" \
+    || bad "SOP 缺步骤: ${_miss[*]}"
+
+  # 顺序: 完整 REPO_DIR → CLI → __migrate。
+  # 按**编号步骤**比, 不按行号 —— 原理说明里会先提到 `pdg __migrate`("如果在它之前就
+  # 先装模块…"), 拿首次出现的行号比会把正确的文档判成写反了。
+  _step_of(){                       # $1=要找的标记 → 它所在的 "### N." 步骤号
+    awk -v pat="$1" '
+      /^### [0-9]+[a-z]*\./ { n = $2; sub(/[a-z]*\./, "", n) }
+      index($0, pat) > 0 && n != "" { print n; exit }
+    ' "$SOP"
+  }
+  _s_repo=$(_step_of "REPO_DIR"); _s_cli=$(_step_of "/usr/local/bin/pdg"); _s_mig=$(_step_of "pdg __migrate")
+  if [[ -n "$_s_repo" && -n "$_s_cli" && -n "$_s_mig" ]] \
+     && [[ "$_s_repo" -lt "$_s_cli" && "$_s_cli" -lt "$_s_mig" ]]; then
+    ok "SOP 顺序正确: 第 $_s_repo 步 REPO_DIR → 第 $_s_cli 步 CLI → 第 $_s_mig 步 __migrate"
+  else
+    bad "SOP 顺序不对: REPO_DIR=第${_s_repo:-?}步 CLI=第${_s_cli:-?}步 __migrate=第${_s_mig:-?}步(必须严格递增)"
+  fi
+
+  # "提前装模块"不许出现在 __migrate **之前**的步骤里。同样按步骤号比 —— 禁令那一步
+  # (以及它的补充说明)本来就排在 __migrate 后面, 按行号比会把正确的文档判红。
+  _bad_step=$(awk -v mig="$_s_mig" '
+    /^### [0-9]+[a-z]*\./ { n = $2; sub(/[a-z]*\./, "", n) }
+    /pdg_install_runtime_modules/ {
+      # `<=` 而不是 `<`: 把"先装模块"塞进 __migrate 那一步(或拆成 6/6b)同样是写反了,
+      # 用 `<` 会让它们算成同一步而放过去 —— 负控实测正是这么漏的。
+      if (n != "" && n + 0 <= mig + 0 && $0 !~ /不要提前|不得提前|不能提前|禁止/) { print n; exit }
+    }' "$SOP")
+  [[ -z "$_bad_step" ]] && ok "SOP 没有把「提前装运行模块」写进 __migrate 之前的步骤" \
+    || bad "SOP 第 $_bad_step 步(在 __migrate 之前)把提前装模块写成了正向动作"
 fi
+
+# 静态判据: 别再有人把判据指回宿主绝对路径。
+_hostref=$(grep -rlE "/home/[a-z][a-z0-9_-]*/privdns-gateway-HANDOFF\.md" "$ROOT/tests" 2>/dev/null | tr '\n' ' ')
+[[ -z "$_hostref" ]] && ok "tests/ 里没有指向宿主 HANDOFF 绝对路径的引用" \
+  || bad "这些测试仍读宿主绝对路径: $_hostref"
+_homeref=$(grep -nE "/home/[a-z][a-z0-9_-]*/" "$ROOT/tests/test-deploy-order.sh" | grep -v "^[0-9]*:#" | head -1)
+[[ -z "$_homeref" ]] && ok "本测试里没有任何用户主目录绝对路径" \
+  || bad "本测试仍有主目录绝对路径: $_homeref"
 
 echo "────────────────────────────────────────"
 echo "通过 $PASS, 失败 $FAIL"
