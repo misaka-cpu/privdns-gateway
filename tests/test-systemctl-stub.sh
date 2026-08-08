@@ -34,15 +34,85 @@ if [[ "${PDG_E2E_ISOLATED:-}" != 1 ]]; then
   fin; exit $?
 fi
 
+# ── 桩污染的前像: 必须在 source/装桩**之前**取 ────────────────────────────────
+# 隔离模式(PDG_E2E_ISOLATED=1)没有 user namespace, e2e-lib 的桩直接落在**真实**的
+# /usr/local/bin。而 /usr/local/bin 在 PATH 里排在 /usr/sbin 前面 —— 桩不清掉, 同一个
+# CI job 里后面每一步按 PATH 解析 nft/systemctl 的测试都会拿到它。
+# 实测过一次: 本脚本跑完后 `command -v nft` 从 /usr/sbin/nft(ELF, 26856 字节)翻到
+# /usr/local/bin/nft(53 字节 shell, 对任何输入 exit 0), 于是 test-uninstall-firewall.py
+# 的 `nft -c` 全部返回 0 —— 好候选"通过"是假绿, 坏候选没被拦才把这件事暴露出来。
+STUB_PATHS=(/usr/local/bin/systemctl /usr/local/bin/nft)
+declare -A PRE_KIND PRE_SHA PRE_MODE MADE_SHA
+PRE_BAK="$(mktemp -d)" || { t_bad "建不了 before-image 目录"; fin; exit $?; }
+_sha(){ sha256sum "$1" 2>/dev/null | awk '{print $1}'; }
+for _p in "${STUB_PATHS[@]}"; do
+  if [[ -e "$_p" ]]; then
+    # 运行前就有同名文件: 逐字节留底, 收尾时原样放回去 —— 绝不无条件删别人的东西
+    PRE_KIND[$_p]=exist
+    PRE_SHA[$_p]="$(_sha "$_p")"
+    PRE_MODE[$_p]="$(stat -c%a "$_p" 2>/dev/null)"
+    cp -a "$_p" "$PRE_BAK/$(basename "$_p")" \
+      || { t_bad "留不了 $_p 的 before-image, 拒绝覆盖(fail-closed)"; fin; exit $?; }
+  else
+    PRE_KIND[$_p]=absent
+  fi
+done
+# 真命令的运行前解析结果。不写死 /usr/sbin/nft: 不同发行版路径不同, 判据要跟它比。
+REAL_NFT_CMD="$(command -v nft 2>/dev/null || true)"
+REAL_NFT_RP="$(readlink -f "$REAL_NFT_CMD" 2>/dev/null || true)"
+REAL_NFT_SHA="$([[ -n "$REAL_NFT_RP" ]] && _sha "$REAL_NFT_RP" || true)"
+REAL_NFT_KIND="$([[ -n "$REAL_NFT_RP" ]] && file -b "$REAL_NFT_RP" 2>/dev/null | cut -c1-24 || true)"
+REAL_SCTL_CMD="$(command -v systemctl 2>/dev/null || true)"
+REAL_SCTL_RP="$(readlink -f "$REAL_SCTL_CMD" 2>/dev/null || true)"
+REAL_SCTL_SHA="$([[ -n "$REAL_SCTL_RP" ]] && _sha "$REAL_SCTL_RP" || true)"
+PRE_SVC_DIR="$([[ -d "$E2E_TMP/e2e-svc" ]] && echo exist || echo absent)"
+PRE_CALLS="$([[ -e "$E2E_TMP/e2e-calls.log" ]] && echo exist || echo absent)"
+
+CLEAN_FAIL=0
+stub_cleanup(){       # 幂等: 重复调用必须仍然成功
+  local _p _cur
+  for _p in "${STUB_PATHS[@]}"; do
+    case "${PRE_KIND[$_p]:-absent}" in
+      absent)
+        [[ -e "$_p" ]] || continue                       # 已经清过了
+        _cur="$(_sha "$_p")"
+        if [[ -n "${MADE_SHA[$_p]:-}" && "$_cur" == "${MADE_SHA[$_p]}" ]]; then
+          rm -f "$_p" || { echo "[!] 删不掉 $_p"; CLEAN_FAIL=1; }
+        else
+          # 内容不是我们造的那份 = 运行期间被第三方换过, 不属于本测试, 不许删
+          echo "[!] $_p 的内容已被第三方替换(现 ${_cur:0:16}…, 本轮桩 ${MADE_SHA[$_p]:0:16}…), 不删除"
+          CLEAN_FAIL=1
+        fi;;
+      exist)
+        cp -a "$PRE_BAK/$(basename "$_p")" "$_p" || { echo "[!] 还原不了 $_p"; CLEAN_FAIL=1; continue; }
+        [[ -n "${PRE_MODE[$_p]:-}" ]] && { chmod "${PRE_MODE[$_p]}" "$_p" || CLEAN_FAIL=1; }
+        [[ "$(_sha "$_p")" == "${PRE_SHA[$_p]}" ]] || { echo "[!] $_p 还原后与 before-image 不符"; CLEAN_FAIL=1; };;
+    esac
+  done
+  [[ "$PRE_SVC_DIR" == absent ]] && [[ -d "$E2E_TMP/e2e-svc" ]] && { rm -rf "$E2E_TMP/e2e-svc" || { echo "[!] 删不掉 $E2E_TMP/e2e-svc"; CLEAN_FAIL=1; }; }
+  [[ "$PRE_CALLS"   == absent ]] && [[ -e "$E2E_TMP/e2e-calls.log" ]] && { rm -f "$E2E_TMP/e2e-calls.log" || { echo "[!] 删不掉 $E2E_TMP/e2e-calls.log"; CLEAN_FAIL=1; }; }
+  rm -rf "$PRE_BAK" 2>/dev/null
+  return "$CLEAN_FAIL"
+}
+
 # shellcheck source=tests/e2e-lib.sh
 E2E_ROOT="$ROOT"; export E2E_ROOT
 source "$ROOT/tests/e2e-lib.sh" 2>/dev/null || { t_bad "source 不了 e2e-lib.sh"; fin; exit $?; }
+# 用 e2e_add_exit_hook 而不是 trap ... EXIT: e2e-lib 已经把 EXIT 挂给 e2e_run_exit_hooks
+# (事务探针靠它收尾), 再设一个裸 trap 会把它顶掉。异常退出走这条路。
+e2e_add_exit_hook stub_cleanup || { t_bad "注册不了退出清理"; fin; exit $?; }
 e2e_stub_system >/dev/null 2>&1 || true
+# 记下我们刚造出来的那份桩的哈希: 收尾只删"还是这份内容"的文件
+for _p in "${STUB_PATHS[@]}"; do
+  [[ "${PRE_KIND[$_p]}" == absent && -e "$_p" ]] && MADE_SHA[$_p]="$(_sha "$_p")"
+done
 SC=/usr/local/bin/systemctl
 [[ -x "$SC" ]] || { t_bad "e2e_stub_system 没有生成 systemctl 桩"; fin; exit $?; }
 t_ok "真桩已由 e2e_stub_system 生成($SC)"
 
 D="$E2E_TMP/e2e-svc"                 # 桩的状态目录(与桩内 D= 同一份)
+# 合并后统一用 6.1C 的 $E2E_TMP 约定 —— 桩自己也写在 $E2E_TMP 下(见 e2e-lib.sh 的
+# e2e_stub_system), 写死 /tmp 会让并发跑的两个脚本共用同一份状态。
 [[ -d "$D" ]] || mkdir -p "$D"
 U=stubtest.timer
 mk_unit(){ printf '[Unit]\nDescription=stub contract test\n[Timer]\nOnActiveSec=2min\n' \
@@ -163,4 +233,30 @@ UP="$(get -p NoSuchPropertyXyz --value)"
   && t_ok "未知属性不返回任何'看着健康'的值(实得 '$UP')" || t_bad "未知属性实得 '$UP'"
 
 rm -f "/etc/systemd/system/$U"; reset_state
+
+# ── 收尾: 显式清一次, 并在脚本内部把"确实恢复了"验掉 ──────────────────────────
+# EXIT hook 仍然留着管异常路径; 这里显式调用是为了让下面的正向断言能在本脚本里完成 ——
+# 桩没清干净这件事必须在这里被抓住, 而不是留给几十步之后的另一支测试。
+echo
+echo "── 收尾: 桩清理与命令解析恢复 ──"
+stub_cleanup && t_ok "清理返回 0" || t_bad "清理失败(见上面的 [!] 行)"
+NOW_NFT_CMD="$(command -v nft 2>/dev/null || true)"
+NOW_NFT_RP="$(readlink -f "$NOW_NFT_CMD" 2>/dev/null || true)"
+[[ "$NOW_NFT_CMD" == "$REAL_NFT_CMD" && "$NOW_NFT_RP" == "$REAL_NFT_RP" ]] \
+  && t_ok "nft 解析回到运行前($NOW_NFT_CMD)" || t_bad "nft 现解析到 '$NOW_NFT_CMD'(运行前 '$REAL_NFT_CMD')"
+[[ -n "$NOW_NFT_RP" && "$(_sha "$NOW_NFT_RP")" == "$REAL_NFT_SHA" ]] \
+  && t_ok "nft 内容与运行前逐字节一致" || t_bad "nft 内容与运行前不符"
+[[ "$(file -b "$NOW_NFT_RP" 2>/dev/null | cut -c1-24)" == "$REAL_NFT_KIND" ]] \
+  && t_ok "nft 类型与运行前一致($REAL_NFT_KIND)" || t_bad "nft 类型变了"
+NOW_SCTL_CMD="$(command -v systemctl 2>/dev/null || true)"
+NOW_SCTL_RP="$(readlink -f "$NOW_SCTL_CMD" 2>/dev/null || true)"
+[[ "$NOW_SCTL_CMD" == "$REAL_SCTL_CMD" && "$(_sha "$NOW_SCTL_RP")" == "$REAL_SCTL_SHA" ]] \
+  && t_ok "systemctl 解析与内容都回到运行前($NOW_SCTL_CMD)" || t_bad "systemctl 没恢复(现 '$NOW_SCTL_CMD')"
+_left=0
+for _p in "${STUB_PATHS[@]}"; do [[ "${PRE_KIND[$_p]}" == absent && -e "$_p" ]] && _left=$((_left+1)); done
+[[ "$_left" == 0 ]] && t_ok "本轮创建的桩全部消失" || t_bad "还剩 $_left 个本轮创建的桩"
+[[ "$PRE_SVC_DIR" == exist || ! -d "$E2E_TMP/e2e-svc" ]] && t_ok "e2e-svc 无本轮残留" || t_bad "$E2E_TMP/e2e-svc 还在"
+[[ "$PRE_CALLS" == exist || ! -e "$E2E_TMP/e2e-calls.log" ]] && t_ok "e2e-calls.log 无本轮残留" || t_bad "$E2E_TMP/e2e-calls.log 还在"
+stub_cleanup && t_ok "再清一次仍返回 0(幂等)" || t_bad "重复清理失败 —— 不幂等"
+
 fin

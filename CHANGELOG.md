@@ -2,6 +2,28 @@
 
 本项目按语义化 `v1.x` tag 正式发布;以下按版本/日期记录主要变化,完整提交见 git 历史。
 
+## 2026-08-07 — v1.8.2(健康自检定时器可能再也不会运行)
+
+`pdg-health.timer` 可能处在这样一种状态: `systemctl is-enabled` 说 enabled、`is-active`
+说 active、`is-failed` 不 failed、`Result=success` —— 一切看着正常, 但它**再也不会触发**。
+真机上曾这样静默停了 8 天, 期间服务异常也不会有 Telegram 通知。
+
+只有两个字段露馅: `SubState=elapsed` 与 `NextElapseUSecMonotonic=infinity`。
+
+- **定时器改用 `OnActiveSec=2min` + `OnUnitActiveSec=10min`**(去掉 `OnBootSec` 与
+  `Persistent=true`)。`OnActiveSec` 相对**定时器自己被激活的时刻**, 这个参照点任何时候
+  都在; 而 `OnBootSec` 在"开机很久之后才重启定时器"时那个点已经过去, 加上
+  `OnUnitActiveSec` 不足以重新武装, 两条都算不出下一次 ⇒ 永久停摆。`Persistent=true`
+  只对 `OnCalendar=` 生效, 这里留着是句空头承诺。检查频率不变, 仍是每 10 分钟。
+- **更新迁移会重新排程, 并验证真的排上了**。换过 unit 之后不只是 `enable --now`
+  (那对已经 active 的定时器什么都不做), 而是明确重启并确认存在有限的下一次触发时间;
+  确认不通过就返回失败让更新回滚。内容没变且状态正常时不写盘、不重启。
+- **`pdg doctor` 新增「健康自检定时器」检查**, 排不出下一次运行时报
+  「健康检查定时器没有安排下一次运行。」正在执行的那一瞬不会误报。检查是只读的, 不会
+  替你重启定时器 —— 自动重启只会把问题掩盖掉。
+
+用户配置、分流规则、凭据与证书不受影响。
+
 ## 2026-08-04 — v1.8.1(v1.7.8 → v1.8.0 更新时, 首次启用救援平面会让整次更新回滚)
 
 用户从 v1.7.8 更新, 停在这里:
