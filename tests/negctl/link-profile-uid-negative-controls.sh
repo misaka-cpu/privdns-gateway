@@ -103,6 +103,18 @@ nc 14 "改 TTL 掩盖问题" \
 "$(rl); o='TTL_SECS = 300'; n='TTL_SECS = 86400'; \
 assert o in s,'anchor'; io.open(p,'w',encoding='utf-8').write(s.replace(o,n,1))" tests/test-link-session.py
 
+# runner 自检: 人为塞一条无效负控, 证明脚本真的会返回非零。
+# 以前脚本最后一句是 sha256sum -c, 退出码就是它的 —— 有 NC ✗ 也照样 rc=0,
+# 于是"负控失效"这件事在 CI 里完全看不见。
+if [[ "${PDG_NC_SELFTEST:-}" == 1 ]]; then
+  echo "[SELFTEST] 人为记一条无效负控"; FAIL=$((FAIL+1))
+fi
+
 echo "────────────────"
 echo "负控 通过 $PASS, 失败 $FAIL"
-echo "── 还原核对 ──"; sha256sum -c "$B/sha.txt"
+echo "── 还原核对 ──"
+RC=0
+sha256sum -c "$B/sha.txt" || { echo "[FAIL] 还原核对不通过"; RC=1; }
+[[ "$FAIL" -eq 0 ]] || { echo "[FAIL] 有 $FAIL 条负控无效(改坏了却没转红, 或改坏器空转)"; RC=1; }
+[[ "$PASS" -gt 0 ]] || { echo "[FAIL] 零条有效负控"; RC=1; }
+exit "$RC"
