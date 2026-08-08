@@ -48,6 +48,28 @@ e2e_skip(){
 # 两边都碰不到开发机的真实配置。
 _e2e_git_safe(){ grep -q 'directory = \*' /etc/gitconfig 2>/dev/null || printf '[safe]\n\tdirectory = *\n' >> /etc/gitconfig 2>/dev/null || true; }
 
+# 删掉"遮住真程序的桩", 但**只删看起来确实是桩的那些**。
+# 与 e2e_stub_uninstall 的区别: 那个按"内容里写着本轮 $E2E_TMP"认, 只能认出自己造的;
+# 这个是**进场**清理, 要认出**别的脚本上一轮留下的**, 那些桩里没有本轮路径可比对。
+e2e_purge_shadow_stub(){
+  local n f sz
+  for n in "$@"; do
+    f="/usr/local/bin/$n"
+    if [[ -L "$f" ]]; then
+      # 指向 /usr/local/bin 内部 = 测试自己搭的还原链(restore_py 那种), 删。
+      # 指向别处的符号链接可能是用户的正经安装, 不碰。
+      [[ "$(readlink "$f")" == /usr/local/bin/* ]] && rm -f "$f" 2>/dev/null
+      continue
+    fi
+    [[ -f "$f" ]] || continue
+    sz="$(stat -c %s "$f" 2>/dev/null || echo 999999)"
+    [[ "$sz" -lt 4096 ]] || continue                  # 真程序是 ELF, 通常几十 KB 起
+    head -c 2 "$f" 2>/dev/null | grep -q '#!' || continue
+    rm -f "$f" 2>/dev/null || true
+  done
+  return 0
+}
+
 # 把机器清回"什么都没装过"的状态。namespace 模式下 overlay 本来就干净, 这里主要给容器模式
 # (CI 里多个脚本共用一个容器)用: 二进制、unit、归属/后端标记、快照、仓库副本、服务桩一个不留。
 e2e_reset_box(){
@@ -83,6 +105,18 @@ e2e_reset_box(){
   # (下载什么都写 "stub" 几个字节), 下一个脚本想取真内核时就只能拿到一个坏档而整条 skip。
   # 每个脚本都会自己造它需要的桩(e2e_stub_system / 各自的 setup), 进场清掉是安全的。
   rm -f /usr/local/bin/{systemctl,nft,curl,tcpdump,apt-get,dpkg,certbot,vnstat,ss,tar} 2>/dev/null || true
+  # `ip` / `python3` 不能跟着上面按名字删 —— 真机上它们很可能是用户自己装的真程序。
+  # 但它们**确实会**以桩的形态泄漏过来, 而且都不是"上一支正常退出就没事"那种:
+  #   · e2e-rescue-migration-lock.sh 造 `ip` 桩(伪造 `ip -4` 的地址列表), 且它**根本没有
+  #     任何清理** —— 每跑一次必留;
+  #   · e2e-install-nft.sh 用 restore_py 还原 `python3`, 但那只挂在两个正常路径上,
+  #     异常退出就留下一个指向 py3-real 的符号链接(py3-real 后来又被别处清掉 → 悬空)。
+  # 留着 `ip` 桩的后果不是"某支测试红一下": 它让装机把本机地址看成落在内网段里, 于是
+  # 救援平面被自动启用并写下 PDG_RESCUE_BIND, 而沙箱 nft 里没有对应放行 —— 下一支
+  # e2e-update.sh 的更新后自检就正确地判红并整次回滚。查起来完全指不到这里。
+  # 判据换成"看起来就是我们的桩": 指向 /usr/local/bin 内部的符号链接, 或者小于 4KiB 的
+  # 脚本(带 #! 开头)。真的 ip / python3 是 ELF, 两条都不沾。
+  e2e_purge_shadow_stub ip python3 py3-real
   # 真内核二进制留着(几十 MB, 每个脚本重下一遍既慢又会在没网时把用例整条 skip 成假绿);
   # 但**桩**版本要清 —— 拿 `-t` 恒 0 的假 mihomo 当内核, 配置校验类用例会静默失效。
   if command -v mihomo >/dev/null 2>&1 && ! e2e_mihomo_is_real; then
