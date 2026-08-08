@@ -65,8 +65,6 @@ REAL_NFT_KIND="$([[ -n "$REAL_NFT_RP" ]] && file -b "$REAL_NFT_RP" 2>/dev/null |
 REAL_SCTL_CMD="$(command -v systemctl 2>/dev/null || true)"
 REAL_SCTL_RP="$(readlink -f "$REAL_SCTL_CMD" 2>/dev/null || true)"
 REAL_SCTL_SHA="$([[ -n "$REAL_SCTL_RP" ]] && _sha "$REAL_SCTL_RP" || true)"
-PRE_SVC_DIR="$([[ -d "$E2E_TMP/e2e-svc" ]] && echo exist || echo absent)"
-PRE_CALLS="$([[ -e "$E2E_TMP/e2e-calls.log" ]] && echo exist || echo absent)"
 
 CLEAN_FAIL=0
 stub_cleanup(){       # 幂等: 重复调用必须仍然成功
@@ -89,6 +87,15 @@ stub_cleanup(){       # 幂等: 重复调用必须仍然成功
         [[ "$(_sha "$_p")" == "${PRE_SHA[$_p]}" ]] || { echo "[!] $_p 还原后与 before-image 不符"; CLEAN_FAIL=1; };;
     esac
   done
+  # before-image 不是闭集里的值 = 我们根本不知道运行前是什么样 —— 这时既不能删(可能删掉
+  # 本来就有的东西)也不能装作清干净了。**返回非零**, 别再谎报成功。
+  local _v
+  for _v in "$PRE_SVC_DIR" "$PRE_CALLS"; do
+    case "$_v" in
+      absent|exist) ;;
+      *) echo "[!] before-image 取值非法(${_v:-空}) —— 无法判断该不该清理"; CLEAN_FAIL=1;;
+    esac
+  done
   [[ "$PRE_SVC_DIR" == absent ]] && [[ -d "$E2E_TMP/e2e-svc" ]] && { rm -rf "$E2E_TMP/e2e-svc" || { echo "[!] 删不掉 $E2E_TMP/e2e-svc"; CLEAN_FAIL=1; }; }
   [[ "$PRE_CALLS"   == absent ]] && [[ -e "$E2E_TMP/e2e-calls.log" ]] && { rm -f "$E2E_TMP/e2e-calls.log" || { echo "[!] 删不掉 $E2E_TMP/e2e-calls.log"; CLEAN_FAIL=1; }; }
   rm -rf "$PRE_BAK" 2>/dev/null
@@ -98,6 +105,27 @@ stub_cleanup(){       # 幂等: 重复调用必须仍然成功
 # shellcheck source=tests/e2e-lib.sh
 E2E_ROOT="$ROOT"; export E2E_ROOT
 source "$ROOT/tests/e2e-lib.sh" 2>/dev/null || { t_bad "source 不了 e2e-lib.sh"; fin; exit $?; }
+
+# 这两条 before-image **必须**在 source 之后取: $E2E_TMP 由 e2e-lib 初始化, 之前它是未定义的,
+# 而本脚本开头是 `set -u` —— 于是 `$( [[ -d "$E2E_TMP/…" ]] … )` 里的子 shell 当场死掉,
+# 命令替换返回**空串**。空串既不是 absent 也不是 exist, 结果是:
+#   · stub_cleanup 里 `[[ "$PRE_SVC_DIR" == absent ]]` 恒假 → 真正的 rm 从不执行;
+#   · 收尾断言两边都不成立 → 必然判红;
+#   · 而 stub_cleanup 仍返回 0, 谎报"清理成功"。
+# 这个洞是合并 10f32911 时把写死的 /tmp 改成 $E2E_TMP 带进来的(main 上是字面路径, 不依赖它),
+# 合并后一直没跑过 CI, 所以直到最后才暴露。
+# 也**不给 $E2E_TMP 兜默认值**: 那会让 before-image 指向和实际清理不同的路径 —— 换一种假绿。
+PRE_SVC_DIR="$([[ -d "$E2E_TMP/e2e-svc" ]] && echo exist || echo absent)"
+PRE_CALLS="$([[ -e "$E2E_TMP/e2e-calls.log" ]] && echo exist || echo absent)"
+# 进入测试之前先把这两个值钉死在闭集里 —— 它们只要不是 absent/exist, 后面每一条与清理
+# 有关的判据都会静默失效, 而不是报错。
+for _v in PRE_SVC_DIR PRE_CALLS; do
+  case "${!_v}" in
+    absent|exist) ;;
+    *) t_bad "$_v 取值非法(${!_v:-空}) —— before-image 没取到, 清理判据会静默失效"; fin; exit $?;;
+  esac
+done
+t_ok "before-image 已在 \$E2E_TMP 就绪后采集(e2e-svc=$PRE_SVC_DIR calls=$PRE_CALLS)"
 # 用 e2e_add_exit_hook 而不是 trap ... EXIT: e2e-lib 已经把 EXIT 挂给 e2e_run_exit_hooks
 # (事务探针靠它收尾), 再设一个裸 trap 会把它顶掉。异常退出走这条路。
 e2e_add_exit_hook stub_cleanup || { t_bad "注册不了退出清理"; fin; exit $?; }
