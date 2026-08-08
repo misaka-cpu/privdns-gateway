@@ -13,18 +13,15 @@
 import hashlib
 import io
 import os
-import atexit
 import shutil
 import subprocess
 import sys
-import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(ROOT, "tests"))
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清(PDG_KEEP_TMP=1 留现场)
 
-# 候选(v1.8.1 线)上没有 tests/tmpguard.py —— 那是 6.1C 的全仓改造, 不该为了一支负控
-# 把它整套搬过来。用 tempfile + atexit: 建即注册, 正常退出与异常退出都清。
-BAK = tempfile.mkdtemp(prefix="negctl-timer.")
-atexit.register(lambda: shutil.rmtree(BAK, ignore_errors=True))
+BAK = tmpguard.mkdtemp(prefix="negctl-timer.")
 
 TOUCHED = [
     "deploy/bot/pdg-health.timer",

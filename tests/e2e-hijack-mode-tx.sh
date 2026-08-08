@@ -103,7 +103,7 @@ reset_all(){ pdg hijack-mode all >/dev/null 2>&1
 # `grep -c` 没匹配时**既打印 0 又返回 1** —— 写成 `grep -c … || echo 0` 会打出两行 "0",
 # 后面的数值比较就永远不成立(这条判据会假绿)。用 awk 数, 一行一个数。
 note_skip(){ echo "[SKIP] $1"; }   # 只打印, 不计入通过
-restarts(){ awk '/systemctl restart mosdns/{n++} END{print n+0}' /tmp/e2e-calls.log 2>/dev/null || echo 0; }
+restarts(){ awk '/systemctl restart mosdns/{n++} END{print n+0}' $E2E_TMP/e2e-calls.log 2>/dev/null || echo 0; }
 has_preparing(){ local d
   while IFS= read -r d; do
     [[ -n "$d" ]] || continue
@@ -181,7 +181,7 @@ rm -f /run/notadir
 
 # ══ 6. 自定义 mosdns 形态 → 拒绝, 不猜着改 ═════════════════════════════════
 echo; echo "── 6. 自定义 mosdns 形态 ──"
-cp "$MC" /tmp/hm-good.yaml
+cp "$MC" $E2E_TMP/hm-good.yaml
 # 造一个归一化器**认不出**的形态: 删掉 hijack_set 插件, 再把它用来定位的 force_hijack 改名。
 # 于是 gfw 既装不了插件也找不到锚点 → 判为自定义形态。比随手加一行注释可靠 —— 加注释
 # 归一化器照样能改, 那样测的就不是"拒绝", 而是"它没注意到"。
@@ -192,7 +192,7 @@ out=$(pdg hijack-mode gfw 2>&1); rc=$?
 [[ "$rc" != 0 ]] && ok "自定义形态 → 返回非 0" || bad "6: rc=$rc"
 [[ "$(fp)" == "$_f" ]] && ok "两个文件都没动(不猜着改)" || bad "6b: 文件被改了"
 [[ "$(ntx)" == "$_n0" ]] && ok "没有留下事务残留" || bad "6c: 多了 $(( $(ntx)-_n0 )) 笔"
-cp /tmp/hm-good.yaml "$MC"
+cp $E2E_TMP/hm-good.yaml "$MC"
 
 # ══ 7. mosdns 候选校验失败 → 拒绝, 现网不动 ════════════════════════════════
 echo; echo "── 7. 候选校验失败 ──"
@@ -202,15 +202,15 @@ _f=$(fp); _n0=$(ntx)
 # 验的是"校验失败时现网不动", 判据本身没被绕过。
 # 桩要放进 PATH 前置的新目录: /usr/local/bin/mosdns 若已被宿主机真 root 装过, 在
 # 用户命名空间里属 nobody, 覆盖不了。_mosdns_bin() 先 which 再回落固定路径, 所以 PATH 有效。
-mkdir -p /tmp/hm-bin
-cat > /tmp/hm-bin/mosdns <<'STUB'
+mkdir -p $E2E_TMP/hm-bin
+cat > $E2E_TMP/hm-bin/mosdns <<'STUB'
 #!/bin/sh
 echo "stub mosdns: refuse" >&2
 exit 1
 STUB
-chmod 755 /tmp/hm-bin/mosdns
-tx_mark; out=$(PATH="/tmp/hm-bin:$PATH" pdg hijack-mode gfw 2>&1); rc=$?
-rm -rf /tmp/hm-bin
+chmod 755 $E2E_TMP/hm-bin/mosdns
+tx_mark; out=$(PATH="$E2E_TMP/hm-bin:$PATH" pdg hijack-mode gfw 2>&1); rc=$?
+rm -rf $E2E_TMP/hm-bin
 if [[ "$rc" != 0 ]]; then ok "候选校验失败 → 返回非 0"; else bad "7: rc=0, 校验没拦住"; fi
 [[ "$(fp)" == "$_f" ]] && ok "现网两个文件逐字节未变" || bad "7b: 现网被改了"
 _TXN7="$(tx_created "7")" || _TXN7=""
@@ -225,26 +225,26 @@ reset_all
 # 在 read 与 stage 之间插一个"别人改了同一个文件": 用 PATH 上的 python3 包装, 第一次看到
 # `stage` 子命令时先动一下现网, 再 exec 真 python3。这样漂移的时机是确定的, 不靠抢跑。
 _realpy="$(command -v python3)"
-mkdir -p /tmp/hm-stub
-cat > /tmp/hm-stub/python3 <<STUB
+mkdir -p $E2E_TMP/hm-stub
+cat > $E2E_TMP/hm-stub/python3 <<STUB
 #!/bin/bash
-if [[ "\$*" == *" stage "* && ! -e /tmp/hm-drift-done ]]; then
-  : > /tmp/hm-drift-done
+if [[ "\$*" == *" stage "* && ! -e $E2E_TMP/hm-drift-done ]]; then
+  : > $E2E_TMP/hm-drift-done
   printf '\n# concurrent writer landed here\n' >> "$MC"
 fi
 exec "$_realpy" "\$@"
 STUB
-chmod 755 /tmp/hm-stub/python3
-rm -f /tmp/hm-drift-done
+chmod 755 $E2E_TMP/hm-stub/python3
+rm -f $E2E_TMP/hm-drift-done
 _before_drift=$(sha256sum "$PE" | cut -d' ' -f1)
-out=$(PATH="/tmp/hm-stub:$PATH" pdg hijack-mode gfw 2>&1); rc=$?
-rm -rf /tmp/hm-stub /tmp/hm-drift-done
+out=$(PATH="$E2E_TMP/hm-stub:$PATH" pdg hijack-mode gfw 2>&1); rc=$?
+rm -rf $E2E_TMP/hm-stub $E2E_TMP/hm-drift-done
 [[ "$rc" != 0 ]] && ok "前置 SHA 漂移 → 返回非 0(rc=$rc)" || bad "8: 竟然覆盖了别人的修改"
 grep -q 'concurrent writer landed here' "$MC" \
   && ok "并发写入者的内容还在(没被我们的候选盖掉)" || bad "8b: 别人的修改被覆盖了"
 [[ "$(sha256sum "$PE" | cut -d' ' -f1)" == "$_before_drift" ]] \
   && ok "profile.env 也没被单独写进去(没有半状态)" || bad "8c: profile.env 被改了"
-cp /tmp/hm-good.yaml "$MC"
+cp $E2E_TMP/hm-good.yaml "$MC"
 
 # ══ 10/11. 重启后不稳定 → 回滚; 回滚里也失败 → ROLLBACK_FAILED ════════════
 # 同一个注入验两个性质: 10 看文件有没有按 before-image 复原, 11 看状态说得实不实。
@@ -253,7 +253,7 @@ cp /tmp/hm-good.yaml "$MC"
 echo; echo "── 10. mosdns 重启后不稳定 ──"
 reset_all
 _f=$(fp)
-mkdir -p /tmp/e2e-svc; : > /tmp/e2e-svc/mosdns.fail
+mkdir -p $E2E_TMP/e2e-svc; : > $E2E_TMP/e2e-svc/mosdns.fail
 tx_mark; out=$(pdg hijack-mode gfw 2>&1); rc=$?
 _TXN10="$(tx_created "10")" || _TXN10=""
 tx_is_ours "$_TXN10" "10" || true
@@ -287,7 +287,7 @@ fi
 # ══ 12. gfw 缺 geosite_gfw.txt: 语义保留, 失败则两者都不变 ═════════════════
 echo; echo "── 12. gfw 缺劫持集文件 ──"
 reset_all
-cp /etc/mosdns/rules/geosite_gfw.txt /tmp/hm-gfw.bak
+cp /etc/mosdns/rules/geosite_gfw.txt $E2E_TMP/hm-gfw.bak
 : > /etc/mosdns/rules/geosite_gfw.txt
 cat > /opt/pdg-bot/update-rules.sh <<'STUB'
 #!/bin/sh
@@ -296,7 +296,7 @@ STUB
 chmod 755 /opt/pdg-bot/update-rules.sh
 _f=$(fp)
 out=$(pdg hijack-mode gfw 2>&1); rc=$?
-cp /tmp/hm-gfw.bak /etc/mosdns/rules/geosite_gfw.txt
+cp $E2E_TMP/hm-gfw.bak /etc/mosdns/rules/geosite_gfw.txt
 [[ "$rc" != 0 ]] && ok "劫持集生成失败 → 返回非 0" || bad "12: rc=0"
 [[ "$(fp)" == "$_f" ]] && ok "劫持模式与 profile 均未改变" || bad "12b: 文件被改了"
 
@@ -340,19 +340,19 @@ reset_all
 # 注入时机卡在 `apply` 之前(用 PATH 上的 python3 包装): 此前的 read/校验仍要能正常读到它。
 if mount --bind /etc/privdns-gateway /etc/privdns-gateway 2>/dev/null; then
   umount /etc/privdns-gateway 2>/dev/null
-  _realpy="$(command -v python3)"; mkdir -p /tmp/hm-stub2; rm -f /tmp/hm-ro-done
+  _realpy="$(command -v python3)"; mkdir -p $E2E_TMP/hm-stub2; rm -f $E2E_TMP/hm-ro-done
   {
     echo '#!/bin/bash'
-    echo 'if [[ "$*" == *" apply "* && ! -e /tmp/hm-ro-done ]]; then'
-    echo '  : > /tmp/hm-ro-done'
+    echo "if [[ \"\$*\" == *\" apply \"* && ! -e $E2E_TMP/hm-ro-done ]]; then"
+    echo "  : > $E2E_TMP/hm-ro-done"
     echo '  mount --bind /etc/privdns-gateway /etc/privdns-gateway 2>/dev/null'
     echo '  mount -o remount,ro,bind /etc/privdns-gateway 2>/dev/null'
     echo 'fi'
     echo "exec $_realpy \"\$@\""
-  } > /tmp/hm-stub2/python3
-  chmod 755 /tmp/hm-stub2/python3
+  } > $E2E_TMP/hm-stub2/python3
+  chmod 755 $E2E_TMP/hm-stub2/python3
   _f=$(fp)
-tx_mark;   out=$(PATH="/tmp/hm-stub2:$PATH" pdg hijack-mode gfw 2>&1); rc=$?
+tx_mark;   out=$(PATH="$E2E_TMP/hm-stub2:$PATH" pdg hijack-mode gfw 2>&1); rc=$?
   # bind + remount,ro 会叠成两层, 单次 umount 清不掉 —— 残留的只读挂载会把**后面**的用例
   # 一起带偏(实测: 场景 10/11 的 rollback_failed_items 变成 profile_env(OSError), 看起来
   # 像产品在别处出错, 其实是这里没卸干净)。卸到不再是挂载点为止, 并复验可写。
@@ -360,7 +360,7 @@ tx_mark;   out=$(PATH="/tmp/hm-stub2:$PATH" pdg hijack-mode gfw 2>&1); rc=$?
     umount /etc/privdns-gateway 2>/dev/null || umount -l /etc/privdns-gateway 2>/dev/null || break
     _u=$((_u+1))
   done
-  rm -rf /tmp/hm-stub2 /tmp/hm-ro-done
+  rm -rf $E2E_TMP/hm-stub2 $E2E_TMP/hm-ro-done
   if ( : > /etc/privdns-gateway/.wtest ) 2>/dev/null; then
     rm -f /etc/privdns-gateway/.wtest
   else
@@ -383,5 +383,5 @@ else
   note_skip "本环境不允许 bind mount(需 CAP_SYS_ADMIN), 「第一目标落盘后失败」未注入"
 fi
 
-rm -f /tmp/hm-good.yaml /tmp/hm-gfw.bak
+rm -f $E2E_TMP/hm-good.yaml $E2E_TMP/hm-gfw.bak
 e2e_summary

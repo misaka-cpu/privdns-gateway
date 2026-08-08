@@ -19,7 +19,7 @@ bad(){ echo "[FAIL] $1"; nfail=$((nfail+1)); }
 skip(){ echo "[SKIP] $1"; }          # 不计入 pass
 
 # 本测试专属的探针标记: 让 e2e-lib 把临时文件建在这个目录下, 于是"数进程"可以精确到本实例
-WORK="$(mktemp -d /tmp/e2e-probe-life.XXXXXX)"
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/e2e-probe-life.XXXXXX")"
 export TMPDIR="$WORK"                       # e2e-lib 的 mktemp 会落在这里
 # 这里**不能**直接 `trap ... EXIT`: source e2e-lib.sh 之后第一次 e2e_tx_probes 会通过
 # e2e_add_exit_hook 重设统一的 EXIT trap, 把这条顶掉 —— 于是每跑一次就留一个空的

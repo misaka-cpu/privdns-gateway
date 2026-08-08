@@ -184,12 +184,24 @@ def main():
         if cost > 1.0:
             bad(f"快路径耗时 {cost:.3f}s, 超过 1 秒")
         ok(f"快路径耗时 {cost * 1000:.1f} ms(<1s)")
-        for kw in ("热加载", "关闭 iPhone 定位服务"):
+        for kw in ("网关目标地点已切换", "网关服务无需重启", "关闭 iPhone 定位服务"):
             if kw not in msg:
                 bad(f"提示里没有「{kw}」: {msg}")
-        if "位置已" in msg or "定位已成功" in msg:
-            bad(f"文案把网关改写说成了手机位置已变化: {msg}")
-        ok("提示只说到「网关目标已切换 / 已热加载」, 不谎称手机位置已变")
+        # 主语必须自带。上一版写的是「位置已切换」, 靠上下文才知道是谁的位置 —— 用户扫一眼
+        # 只会读到"位置切好了"。现在把主语钉进这句话本身: 出现"已切换"的地方必须紧挨着
+        # "网关目标地点"。
+        import re as _re
+        for m in _re.finditer("已切换", msg):
+            lead = msg[max(0, m.start() - 8):m.start()]
+            if "网关目标地点" not in lead and "网关目标" not in lead:
+                bad(f"「已切换」前面没有「网关目标地点」, 主语不明: {msg}")
+        # 反方向: 不许声称手机那一侧已经生效
+        for claim in ("手机位置已", "iPhone 位置已", "iPhone 定位已", "定位已成功",
+                      "手机显示的位置已", "已定位到", "位置已生效",
+                      "App 已显示", "端到端已生效", "WLOC 已生效"):
+            if claim in msg:
+                bad(f"文案声称手机侧已生效(「{claim}」): {msg}")
+        ok("主语是「网关目标地点」, 且不声称 iPhone 位置/定位已经改变")
 
         # ── 热路径例外的代价: 必须留一条脱敏审计(与事务同一份日志/同一种格式) ──
         audit = os.path.join(tmp, "tx", "index.jsonl")
@@ -325,8 +337,8 @@ def main():
             bad(f"新坐标没存进去: {cur}")
         if SPY.transact or SPY.ca or SPY.sh:
             bad(f"改当前地点却动了服务: transact={SPY.transact} sh={SPY.sh}")
-        if "已更新" not in msg or "热加载" not in msg:
-            bad(f"没提示当前目标坐标已更新并热加载: {msg}")
+        if "已更新" not in msg or "网关服务无需重启" not in msg:
+            bad(f"没提示当前目标坐标已更新且无需重启网关服务: {msg}")
         if "地点/切换" in msg or "再点" in msg:
             bad(f"仍在让用户去列表重复点击: {msg}")
         ok("修改当前地点(WLOC 已开启): 视为热切换, generation +1, 不再让用户重复点击")

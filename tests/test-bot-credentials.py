@@ -13,6 +13,7 @@ import os
 import sys
 import tempfile
 from pathlib import Path
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "deploy" / "bot"))
@@ -43,7 +44,7 @@ def write_env(path, token=None, allowed=None):
 
 
 def main():
-    tmp = tempfile.mkdtemp()
+    tmp = tmpguard.mkdtemp()
     checks.BOT_ENV = os.path.join(tmp, "bot.env")
     checks.PLATFORM_FILE = os.path.join(tmp, "platform")
     with open(checks.PLATFORM_FILE, "w", encoding="utf-8") as f:
@@ -135,7 +136,7 @@ def main():
     # 没配 bot 的机器会因为"pdg-bot 未稳定运行"而切不了平台。
     import subprocess
     pdg_sh = str(ROOT / "deploy/bot/pdg.sh")
-    shim = tempfile.mkdtemp()
+    shim = tmpguard.mkdtemp()
     with open(os.path.join(shim, "checks_shim.py"), "w", encoding="utf-8") as f:
         f.write("import sys\nsys.path.insert(0, %r)\nimport checks\n"
                 "checks.BOT_ENV = sys.argv[1]\nprint(checks.bot_credentials())\n"
@@ -164,9 +165,10 @@ def main():
     got = required_svcs("android", "", "")
     if "pdg-bot" in got:
         bad("未配凭据时 CLI 仍把 pdg-bot 列为必需服务: %s" % got)
-    if got != ["mosdns", "mihomo"]:
+    # 6.1B: pdg-probe81 是公共件, 两平台都在必需集里(与凭据无关)。
+    if got != ["mosdns", "mihomo", "pdg-probe81"]:
         bad("未配凭据的 Android 必需服务集不对: %s" % got)
-    ok("CLI 必需服务集(unset/Android): mosdns + mihomo, 不含 pdg-bot")
+    ok("CLI 必需服务集(unset/Android): mosdns + mihomo + pdg-probe81, 不含 pdg-bot")
 
     got = required_svcs("ios", "", "")
     if "pdg-bot" in got or "pdg-probe81" not in got:

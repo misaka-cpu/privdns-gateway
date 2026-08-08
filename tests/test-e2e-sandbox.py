@@ -14,6 +14,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -44,7 +45,7 @@ def sh(body, env=None, cwd=None):
     return r.returncode, (r.stdout + r.stderr)
 
 
-BOX = tempfile.mkdtemp(prefix="sandboxtest.")
+BOX = tmpguard.mkdtemp(prefix="sandboxtest.")
 INIT = 'e2e_sandbox_init "%s/box" >/dev/null || exit 9\n' % BOX
 
 print("== 硬门: 目标路径 ==")

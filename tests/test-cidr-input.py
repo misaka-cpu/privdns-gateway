@@ -17,9 +17,13 @@ import subprocess
 import sys
 import time
 
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LIB = os.path.join(ROOT, "lib", "cidr.sh")
-BIN = "/tmp/pdg-cidr-test-bin"
+# 假 tcpdump 的存放处。以前是写死的 /tmp/pdg-cidr-test-bin: 跑完没人清, 而且两个人(或两支
+# 并发的用例)同时跑就会互相覆盖对方的桩 —— 那时"多久才抓到"由别人说了算, 竞速判据随机翻车。
+BIN = tmpguard.mkdtemp(prefix="pdg-cidr-bin.")
 
 pass_n = 0
 

@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "deploy" / "bot"))
@@ -23,7 +24,7 @@ def run(cmd):
 def main():
     if not run(["openssl", "version"]).returncode == 0:
         print("[SKIP] 无 openssl"); return
-    tmp = tempfile.mkdtemp()
+    tmp = tmpguard.mkdtemp()
     mitm_ca.CA_DIR = os.path.join(tmp, "ca")
 
     ca = mitm_ca.ensure_ca()

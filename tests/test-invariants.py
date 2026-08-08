@@ -11,6 +11,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -30,13 +31,13 @@ def bad(m):
     print("  ✗ %s" % m)
 
 
-BOX = tempfile.mkdtemp(prefix="invtest.")
+BOX = tmpguard.mkdtemp(prefix="invtest.")
 
 
-def capture(name, profile="update-prewrite", extra=()):
+def capture(name, profile="update-prewrite", extra=(), platform="android"):
     out = os.path.join(BOX, name + ".json")
     cmd = [sys.executable, INV, "capture", "--scenario", name, "--profile", profile,
-           "--repo", ROOT, "--platform", "android", "--source-repo", ROOT, "--out", out]
+           "--repo", ROOT, "--platform", platform, "--source-repo", ROOT, "--out", out]
     r = subprocess.run(cmd + list(extra), capture_output=True, text=True, timeout=300)
     return r.returncode, out, r.stdout + r.stderr
 
@@ -68,6 +69,14 @@ else:
     print("\n断言 1 项: 通过 0, 失败 1")
     sys.exit(1)
 snap = json.load(open(base, encoding="utf-8"))
+# iOS 也取一次: update_invariants 里 manifest 数量的钉值是**按平台分开**的, 而这支测试
+# 一直只捕 android, 于是 ios 那条从来没执行过 —— 它的钉值早就跟真实清单对不上了(27 vs 30)
+# 也没人发现。两个平台都捕, 这个洞才补上。
+rc_i, base_i, out_i = capture("base-ios", platform="ios")
+if rc_i == 0 and os.path.exists(base_i):
+    ok("iOS 平台也能捕获(manifest 数量钉值两个平台都真的核过)")
+else:
+    bad("iOS 捕获失败: %s" % out_i.strip()[-200:])
 need = ("schema_version", "scenario", "profile", "capture_time", "root", "platform",
         "capabilities", "git", "manifest", "static_files", "user_data", "credentials",
         "firewall", "services", "residue")
@@ -76,8 +85,8 @@ if not missing:
     ok("快照含全部 %d 个必需顶层字段" % len(need))
 else:
     bad("缺字段: %s" % "、".join(missing))
-if snap["manifest"]["count"] == 22 and len(snap["static_files"]) == 22:
-    ok("Android 平台记录 22 项静态成员(数量漂移会直接失败)")
+if snap["manifest"]["count"] == 26 and len(snap["static_files"]) == 26:
+    ok("Android 平台记录 26 项静态成员(数量漂移会直接失败)")
 else:
     bad("成员数不对: manifest=%d static=%d"
         % (snap["manifest"]["count"], len(snap["static_files"])))

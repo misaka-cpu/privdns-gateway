@@ -198,4 +198,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        # 沙箱目录有 tmpguard 兜底, 但探针线程和它占的三个端口只有 clean() 收得回来 ——
+        # 断言中途失败时更要收(以前这里从头到尾就没调过)。
+        BOX.clean()

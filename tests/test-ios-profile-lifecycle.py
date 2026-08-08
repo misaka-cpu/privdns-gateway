@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -37,7 +38,7 @@ class Box:
     """一个隔离沙箱: 自己的 FSROOT + 自己的锁文件 + 干净导入的 iosstate。"""
 
     def __init__(self):
-        self.root = tempfile.mkdtemp(prefix="iosstate-")
+        self.root = tmpguard.mkdtemp(prefix="iosstate-")
         BOXES.append(self.root)
         os.makedirs(self.root + "/etc/privdns-gateway", exist_ok=True)
         os.makedirs(self.root + "/run", exist_ok=True)
@@ -76,7 +77,7 @@ def expect_error(fn, want, label, exc=None):
     bad("%s 竟然通过了" % label)
 
 
-CA_DIR = tempfile.mkdtemp(prefix="iosstate-ca-")
+CA_DIR = tmpguard.mkdtemp(prefix="iosstate-ca-")
 BOXES.append(CA_DIR)
 subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
                 "-keyout", CA_DIR + "/ca.key", "-out", CA_DIR + "/ca.crt", "-days", "1",

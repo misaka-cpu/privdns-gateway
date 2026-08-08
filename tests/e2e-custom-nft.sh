@@ -33,10 +33,9 @@ printf '#!/bin/sh\ncase "$1" in -v|version) echo "Mihomo Meta %s linux amd64";; 
 #   nft -f FILE      → 把 FILE 内容装载为当前 ruleset(模拟真的生效)
 #   nft -c -f FILE   → 只校验, 不改状态
 #   nft list ruleset → 打印当前 ruleset
-NFT_STATE=/tmp/e2e-nft-ruleset
-cat > /usr/local/bin/nft <<'S'
-#!/bin/sh
-STATE=/tmp/e2e-nft-ruleset
+NFT_STATE=$E2E_TMP/e2e-nft-ruleset
+{ printf '#!/bin/sh\nSTATE=%s\n' "$NFT_STATE"      # 引号 heredoc 不展开, 路径从生成的头行注入
+  cat <<'S'
 case "$1" in
   -c) exit 0 ;;                                   # 只校验
   -f) [ -f "$2" ] && cat "$2" > "$STATE"; exit 0 ;;   # 装载
@@ -48,6 +47,7 @@ case "$1" in
 esac
 exit 0
 S
+} > /usr/local/bin/nft
 chmod 755 /usr/local/bin/nft
 
 seed_sb(){   # 造出"仍在跑 sing-box 的老机器"(unit 用老版真实形态 + 归属标记, 迁移才会走完整路径)
@@ -67,8 +67,8 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 SBU
   : > /etc/privdns-gateway/singbox.pdg-owned      # 可信归属标记: 确属本项目所装
-  echo 1 > /tmp/e2e-svc/sing-box.ac; echo 1 > /tmp/e2e-svc/sing-box.en
-  rm -f /tmp/e2e-svc/mihomo.ac /tmp/e2e-svc/mihomo.en
+  echo 1 > $E2E_TMP/e2e-svc/sing-box.ac; echo 1 > $E2E_TMP/e2e-svc/sing-box.en
+  rm -f $E2E_TMP/e2e-svc/mihomo.ac $E2E_TMP/e2e-svc/mihomo.en
 }
 
 svc_state(){ printf '%s/%s|%s/%s' \

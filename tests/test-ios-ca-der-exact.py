@@ -21,6 +21,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -43,7 +44,7 @@ def bad(m):
 
 
 def _tmp(prefix):
-    d = tempfile.mkdtemp(prefix=prefix)
+    d = tmpguard.mkdtemp(prefix=prefix)
     TMPS.append(d)
     return d
 

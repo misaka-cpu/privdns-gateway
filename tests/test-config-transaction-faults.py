@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tests"))
@@ -39,7 +40,7 @@ def _unwritable_lock_path(tmp):
 
 
 def main():
-    tmp = tempfile.mkdtemp(prefix="pdgtx-faults.")
+    tmp = tmpguard.mkdtemp(prefix="pdgtx-faults.")
     fsroot = os.path.join(tmp, "root")
     for d in ("/etc/mosdns/rules", "/etc/sing-box", "/var/lib/privdns-gateway", "/run"):
         os.makedirs(fsroot + d, exist_ok=True)
@@ -276,7 +277,7 @@ def main():
     # 场景: 事务核心在, 但准备阶段出错(第二个证书 stage 失败 / 没有 python3 / new 失败)。
     # 旧实现会 fall through 去逐个 cp —— 恰恰在最不该冒险的时刻绕过事务覆盖生产证书。
     import shutil as _sh
-    hookdir = tempfile.mkdtemp(prefix="pdgtx-hook.")
+    hookdir = tmpguard.mkdtemp(prefix="pdgtx-hook.")
     live = os.path.join(hookdir, "live"); os.makedirs(live)
     certdir = os.path.join(hookdir, "certs"); os.makedirs(certdir)
     binp = os.path.join(hookdir, "bin"); os.makedirs(binp)

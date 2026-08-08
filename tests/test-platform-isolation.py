@@ -11,6 +11,7 @@ import sys
 import tempfile
 import types
 from pathlib import Path
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "deploy" / "bot"))
@@ -73,7 +74,7 @@ def main():
     ok("Android: ios/iosgen/iosgenca/wloc:* 回调全被门控(send_document 从未调用)")
 
     # /ios 命令 + ios_ssid 文本状态(text handler)
-    tmp = tempfile.mkdtemp()
+    tmp = tmpguard.mkdtemp()
     bot.MITM_CONFIG = os.path.join(tmp, "mitm.json")
     bot.MITM_HIJACK_FILE = os.path.join(tmp, "mitm_hijack.txt")
     SENT_DOCS.clear()
@@ -131,11 +132,12 @@ def main():
     checks._run = lambda cmd, t=10: (0, "active", "")   # systemctl is-active → active
     checks._core_svc = lambda: "sing-box"
     checks._platform = lambda: "android"
-    assert "pdg-probe81" not in checks.expected_services(), "Android 必需服务不含 pdg-probe81"
-    assert checks.check_deep_probe81() is None, "Android deep doctor 不出现 :81 探测"
+    # 6.1B: probe81 成为公共件 —— 两平台都必需, deep doctor 两平台都查。
+    assert "pdg-probe81" in checks.expected_services(), "Android 必需服务也含 pdg-probe81"
+    assert checks.check_deep_probe81() is not None, "Android deep doctor 也查 :81 探测"
     checks._platform = lambda: "ios"
     assert "pdg-probe81" in checks.expected_services(), "iOS 必需服务含 pdg-probe81"
-    ok("checks: Android 服务集无 pdg-probe81 且 deep 无 :81; iOS 含 pdg-probe81")
+    ok("checks: 两平台的必需服务集都含 pdg-probe81, deep 也都查 :81")
 
     # check_platform: 标记明确=ok, 缺失=warn
     checks._platform = lambda: "android"   # (check_platform 自读文件, 与 _platform 桩无关)

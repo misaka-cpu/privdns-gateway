@@ -20,6 +20,7 @@ import tarfile
 import tempfile
 import threading
 import time
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -158,7 +159,7 @@ def unchanged(box, base, keys, label):
         bad("%s: 这些被改了 %s" % (label, diff))
 
 
-work = tempfile.mkdtemp(prefix="cfgrestore.")
+work = tmpguard.mkdtemp(prefix="cfgrestore.")
 NOT_MANAGED = ("etc/privdns-gateway/bot.env", "etc/privdns-gateway/platform",
                "etc/privdns-gateway/backend", "usr/local/bin/mihomo")
 

@@ -23,6 +23,7 @@ import sys
 import tempfile
 import types
 from pathlib import Path
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "deploy" / "bot"))
@@ -334,7 +335,7 @@ def no_zstd():
     没有才会退到外部命令。本地 Debian 12(3.11 且没装这些包)恰好两条路都没有, 于是"摘掉命令"
     看起来够用; 换到带这些模块的机器(CI runner 就是), 前提根本不成立, 这条负向用例便会失败 ——
     它测的是"认不出来", 而那台机器其实认得出来。前提要自己造齐, 不能靠跑测试的机器碰巧没装。"""
-    d = tempfile.mkdtemp(prefix="pdgnozstd")
+    d = tmpguard.mkdtemp(prefix="pdgnozstd")
     old = os.environ["PATH"]
     saved = {n: sys.modules.pop(n) for n in _ZSTD_MODS if n in sys.modules}   # 绕开 import 缓存
     blocker = _BlockZstdImport()
@@ -403,7 +404,7 @@ def ruleset_main():
     mrs_bytes = mrs_fix.read_bytes()
     ipcidr_bytes = ip_fix.read_bytes()
 
-    www = tempfile.mkdtemp(prefix="pdgwww")
+    www = tmpguard.mkdtemp(prefix="pdgwww")
     (Path(www) / "cn.yaml").write_bytes(YAML_PROVIDER)
     (Path(www) / "cn.list").write_bytes(SURGE_LIST)
     (Path(www) / "geo.mrs").write_bytes(mrs_bytes)

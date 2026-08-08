@@ -23,6 +23,19 @@ jobs:
           # 各版本 cmd_snapshot 的清单也靠历史对象解析。默认浅克隆拿不到, 于是 legacy 样本
           # 造不出来、后面的用例撞 FileNotFoundError。e2e job 早就因同样原因设了 0。
           fetch-depth: 0
+      # Ubuntu 24.04 起 AppArmor 默认禁掉非特权用户命名空间, 而 lint 里有三支测试要用它把
+      # /var/lib 与 /run 铺成真实可写的目录, 才能把「采集器一个字节都不写」证成非空转
+      # (test-link-status / test-probe81-platform / test-config-transaction-faults)。
+      # 没有这个能力那条判据就没跑 —— 分支第一次推上远端时 lint 就栽在这儿。
+      #
+      # **只放在直接跑在 runner 上的 job 里。** e2e / e2e-serial / e2e-rescue-lock-ios 跑在
+      # debian:12 容器中、本身就是 root 且隔离(见 e2e job 顶上那段说明), 容器里没有 sudo ——
+      # 往那些 job 里加这步会让它们在第一步就整个挂掉。这个错误犯过一次: run 30999183512
+      # 里 20 个 E2E job 全红, 原因与被测代码无关。
+      - name: "放开非特权用户命名空间 (多支测试靠它把只读纪律证成非空转)"
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          unshare -rm -- sh -c 'echo userns OK'
       # 事务的 mosdns_probe 校验器会**真的启动 mosdns** 解析候选配置, 拿不到二进制整笔事务
       # REFUSED。这条以前没有 —— 本地一直绿是因为开发机上有早前 E2E 留下的 mosdns, 而
       # CI 的 lint job 里没有, 于是 test-cidr-transaction 一串失败。v1.7.0 发布前的
@@ -76,7 +89,7 @@ jobs:
             systemd-analyze verify \
               deploy/bot/pdg-bot.service deploy/bot/pdg-health.service \
               deploy/bot/pdg-rules-update.service deploy/bot/pdg-health.timer \
-              deploy/bot/pdg-rules-update.timer deploy/ios/pdg-probe81.service || true
+              deploy/bot/pdg-rules-update.timer deploy/bot/pdg-probe81.service || true
             echo "(CI 环境缺二进制/路径, 上面的告警多为预期; 重点看指令拼写/语法错)"
           else
             echo "systemd-analyze 不可用, 跳过"
@@ -121,12 +134,65 @@ jobs:
       - name: "E2E 探针生命周期回归(重复启动/退出/信号/并发/临时目录清理)"
         run: bash tests/test-e2e-probe-lifecycle.sh
 
+      # 6.1A: 只读的链路准备状态。三支分别盯模型/采集器/平台隔离 —— 最怕的是"把不知道
+      # 说成知道", 所以 NOT_OBSERVED 与退出码的关系单独有断言。
+      - name: "链路诊断状态模型 (六状态闭集/未登记 code 拒绝/NOT_OBSERVED 不算故障/退出码)"
+        run: python3 tests/test-link-model.py
+
+      - name: "链路诊断采集器 (证书正常/临期/过期/错域名/损坏/误放私钥; 零写入零写锁)"
+        run: python3 tests/test-link-status.py
+
+      - name: "链路诊断平台隔离 (Android 不要求 probe81 / iOS 检查它 / 文案不串台)"
+        run: python3 tests/test-link-platform.py
+
+      - name: "probe81 转公共组件 (install/update/迁移/平台切换/doctor/卸载 全链路)"
+        run: python3 tests/test-probe81-platform.py
+
+      # .153 真机: 运行模块与 CLI 同步到新版本、$REPO_DIR 却还停在旧 commit 时, 迁移在第一行
+      # 守卫静默 return 0 —— unit 没装出来, 整条链路却收到"成功"。probe81 已是两平台公共
+      # 必需件, 模板缺失现在是硬失败。
+      - name: "probe81 迁移 fail-closed (缺 unit 模板必须非零且零写入; 失败逐层传播)"
+        run: python3 tests/test-probe81-migrate-failclosed.py
+
+      - name: "链路会话: token/TTL/单次消费/限流/隐私 + root↔DynamicUser 文件交接"
+        run: python3 tests/test-link-session.py
+
+      - name: "mosdns DNS 证据闸门 (API 暴露面: 阶段 3 因缓存导出/投喂端点停止)"
+        run: python3 tests/test-link-dns-evidence.py
+
+      - name: "链路会话证据接进 linkstat (NOT_OBSERVED/PASS/STALE 语义与退出码隔离)"
+        run: python3 tests/test-link-live.py
+
+      # 逐处钉字面量管不住"下一处新写的文案"。这道闸门从用户真正看到的输出入手, 统一扫
+      # 越界结论(SIM/APN/DoT/整体联网正常), 并守住 NOT_OBSERVED 不被写成故障。
+      - name: "手机侧证据的结论上限 (越界结论闸门 + NOT_OBSERVED 不是故障)"
+        run: python3 tests/test-link-copy-boundary.py
+
+      # 6.1C 把会话接进 Bot。判据不在"功能跑得通", 而在接的过程中有没有把 6.1B 的克制
+      # 弄丢: token 只在一次性按钮里、结论不越界、状态机只有一份、整条路只读。
+      - name: "Bot 手机链路测试 (token 只在按钮/结论上限/只读/并发与故障释放)"
+        run: python3 tests/test-link-bot.py
+
+      # .153 真机 P0: probe81 以 DynamicUser 跑, 读不到 0600 root 的 profile.env, 于是
+      # "来源在不在内网卡段"这条证据永远产不出来。判据只能落在**真的换 UID**上 —— 同一个
+      # uid 下怎么测都是空转。CI 是 root 容器, 严格模式下 SKIP 判失败。
+      - name: "链路会话跨 UID 边界 (真 setuid: 会话快照网段 / 不读 profile.env / schema fail-closed)"
+        run: python3 tests/test-link-profile-uid.py
+
       # 夹具自己漏资源, 会以"产品偶发失败"的样子冒出来 —— 判据落在真实线程/端口/目录上。
       - name: "txbox 探针生命周期 (clean 后线程必须退出/端口必须释放/50 个 Box 回到基线)"
         run: python3 tests/test-txbox-probes.py
 
       - name: "负控字节码缓存隔离(同一秒改坏/恢复源码不得读到陈旧 .pyc)"
         run: python3 tests/test-pycache-isolation.py
+
+      # 判法是"私有 TMPDIR 跑一遍, 跑完必须是空的" —— 不按前缀扫 /tmp 删(那删的是并发中
+      # 别人的沙箱)。同时盯失败路径(异常/非 0/SIGTERM)与 PDG_KEEP_TMP 留现场。
+      - name: "临时物卫生 (一支测试跑完不许留下自己建的临时目录; PDG_KEEP_TMP=1 才留现场)"
+        run: python3 tests/test-tmp-hygiene.py
+
+      - name: "E2E 影子桩生命周期 (ip/python3 桩不许活过进场与退出清理)"
+        run: bash tests/test-e2e-shadow-stub.sh
 
       # 判据是**逐调用点**的: 只数"这个文件里有守卫"会放过"守卫写在动作之后"和"这两行前面
       # 根本没有守卫"—— 2026-08-02 开发者 origin 被改指到 /tmp 裸库正是后一种。
@@ -252,12 +318,65 @@ jobs:
       - name: "iOS 元数据契约四入口一致 (load/恢复/健康/发送同一份完整判据 + 校验的字节就是返回的字节)"
         run: python3 tests/test-ios-profile-meta-contract.py
 
-      - name: "自检防火墙端口回归"
+      - name: "自检防火墙端口回归 (泄露判据/缺 7893/代理入口/GMS 分档/端口文案按平台)"
         run: python3 tests/test-doctor-firewall.py
 
-      # 定时器停摆时所有常规信号都说正常, 只有 NextElapse 露馅 —— doctor 此前没有这一项。
+      # 6.1C: doctor 与 linkstat 曾对同一台健康机器给出相反结论 —— doctor 报 0 失败,
+      # linkstat 判 FAIL 并拦住手机测试会话。根因是两套各自为政的文本近似判据。这三支
+      # 盯的就是"只有一份判据, 并且分档不串":
+      # 沙箱 nft 桩的契约。它以前对 `-j` 返回空, 于是 nftlive 按设计 fail-closed, 更新后
+      # 自检判红整次回滚 —— 而最顺手的"修法"恰恰是把 fail-closed 降成 WARN。桩得有人看着。
+      - name: "沙箱 nft 桩契约 (状态派生而非常量/表不在非零/空输入仍 fail-closed/双平台不串台)"
+        run: python3 tests/test-nftjson-stub.py
+
+      # bind 是监听地址配置, `pdg rescue disable` 保留它是既定行为。拿它当"启没启用"用,
+      # 停用过救援平面的机器会被判成"已启用却没放行" → doctor fail → 更新整次回滚。
+      - name: "救援启用判据状态矩阵 (只看 PDG_RESCUE_ENABLED/停用后残留仍要发现/值损坏 fail-closed)"
+        run: python3 tests/test-rescue-intent-matrix.py
+
+      # `.153` 真机一天内撞到三次同一形状: 读不到必需的值时塞个占位符继续走, 下游拿着必然
+      # 不成立的东西干活, 界面却一切正常。占位符比"不知道"更糟 —— 它看起来像个答案。
+      - name: "缺值必须如实说 (PDG_SERVER_IP fail-closed / DoT 域名不吞成 ? / probe81 两平台公共)"
+        run: python3 tests/test-missing-value-honesty.py
+
+      # 盘上是新代码、跑着的是旧的 —— 从版本号和文件内容看都"已升级", 只有进程还是旧的。
+      # 两天里手工部署踩了两次(菜单缺项 / RuntimeDirectory 没生效)。
+      - name: "换过模块必须重启用它们的服务 (内容变才转/try-restart/失败不转)"
+        run: bash tests/test-deploy-restart.sh
+
+      # 部署顺序三格行为矩阵: 直接 __migrate(装+重启)、提前装模块再迁移(判据被掏空)、
+      # cmd_update 迁移之后那段(无条件重启)。jp2 上"盘上新代码进程还是旧的"就出在中间那格。
+      - name: "部署顺序矩阵 (直接迁移 vs 提前装模块 vs cmd_update; SOP 守卫)"
+        run: bash tests/test-deploy-order.sh
+
+      # 链路测试那几屏的退出键必须指回它自己的来处(入口挂在「客户端接入」下)。
+      # 真机上用出来的: 从「📱 客户端」进去, 退出被送到「🩺 自检」那条不相干的支路。
+      - name: "链路测试退出键指回入口菜单 (四屏一致/不回自检/保留主菜单)"
+        run: python3 tests/test-link-nav.py
+
+      # jp2 上定时器停摆 8 天而 doctor 一路判绿 —— 那时它根本没有这一项。
+      # 判据不能只看 enabled/active/failed 三态, 必须看有没有下一次触发时间。
       - name: "健康自检定时器判据 (elapsed+infinity 必须 FAIL / 正在跑不误报 / 只读)"
         run: python3 tests/test-health-timer-doctor.py
+
+      # 真 systemd: 死角复现、状态机、故障注入。容器里跑, 非 root 环境 SKIP(严格模式判失败)。
+      - name: "健康自检定时器 真 systemd (死角/状态机/6 种故障注入; 环境不足则 SKIP)"
+        run: sudo -E bash tests/e2e-health-timer.sh
+
+      # 共享 systemctl 桩的契约。它是测试基础设施: 坏了不会有人报警, 只会让上层测试
+      # 悄悄变成恒绿。最危险的不是"答不出属性"(那会 fail-closed 判红, 看得见),
+      # 而是"无条件回答健康值" —— 那时 timer 死角那组测试永远是绿的。
+      - name: "共享 systemctl 桩契约 (多个 -p/KEY=VALUE/乱序/四种状态/故障注入)"
+        run: sudo -E env PDG_E2E_ISOLATED=1 bash tests/test-systemctl-stub.sh
+
+      - name: "nft 语义判据 (nft 自身规范化不算漂移: 集合折叠/reject 默认展开/协议别名)"
+        run: python3 tests/test-nft-live-semantics.py
+
+      - name: "nft 调用链 (doctor 与 linkstat 对同一状态结论一致, 不拦住建会话)"
+        run: python3 tests/test-nft-callchain.py
+
+      - name: "nft 条件与故障矩阵 (15 格条件 × 20 格故障 × 三条链路; 专项故障不进链路硬门)"
+        run: python3 tests/test-nft-matrix.py
 
       - name: "nft input 链冲突判据 (单一来源 + 读不到≠没有 + platform 守卫不靠 PATH 找 nft)"
         run: python3 tests/test-nft-input-scan.py

@@ -239,12 +239,16 @@ def _nav(key):
              {"text": "🗑 删规则集", "callback_data": "del_rs"}],
             [{"text": "✏️ 改规则集名", "callback_data": "edit_rs"}, {"text": "🔎 测域名(查走哪)", "callback_data": "testdom"}]]),
         # 客户端接入按平台分岔: Android 只给私密DNS 主机名; iOS 只给描述文件按钮。公共项(DoT 域名 / TG 出口)两平台都留。
+        # 「手机链路测试」两平台都有: 它验的是"手机经内网卡到不到得了网关", 与 iOS 描述文件
+        # 或 Android 私密 DNS 都无关 —— 哪个平台连不上都要能查。
         "client": ((f"📱 <b>客户端接入</b>\nDoT 域名：<code>{_dot_host()}</code>\n请生成并安装 iOS 描述文件。", [
             [{"text": "📱 iOS 描述文件", "callback_data": "ios"}],
+            [{"text": "📡 手机链路测试", "callback_data": "linktest"}],
             [{"text": "🌐 DoT 自定义域名", "callback_data": "setdot"}],
             [{"text": "✈️ Telegram 出口", "callback_data": "tgexit"}]])
             if _platform() == "ios" else
             (f"📱 <b>客户端接入</b>\nAndroid 私密 DNS：<code>{_dot_host()}</code>", [
+            [{"text": "📡 手机链路测试", "callback_data": "linktest"}],
             [{"text": "🌐 DoT 自定义域名", "callback_data": "setdot"}],
             [{"text": "✈️ Telegram 出口", "callback_data": "tgexit"}]])),
         "ops": ("🛠 <b>运维</b> — 选一项:", [
@@ -739,7 +743,7 @@ def wloc_add_gen(name, lat, lon):
         return False, busy_msg(), 0
     if st["hot"]:
         return True, (f"✅ 当前目标坐标已更新：<b>{name}</b>（{lat}, {lon}）\n"
-                      "WLOC 已热加载，无需重启网关服务，也不用再去列表里点一次。\n\n"
+                      "网关目标地点已切换，网关服务无需重启，也不用再去列表里点一次。\n\n"
                       "现在请关闭 iPhone 定位服务，等待 2 秒后重新开启。"), st["gen"]
     if st["was_active"] or st["first"]:
         return True, (f"✅ 已保存当前目标 <b>{name}</b>（{lat}, {lon}）\n"
@@ -823,7 +827,7 @@ def wloc_switch_gen(name):
         return True, (f"✅ 已选中 <b>{name}</b>（{loc['lat']}, {loc['lon']}）\n"
                       "WLOC 未开启，这个地点还不会生效 —— 点「✅ 开启」后才会改写定位。"), w["generation"]
     return True, (f"✅ 网关目标已切换：<b>{name}</b>（{loc['lat']}, {loc['lon']}）\n"
-                  "WLOC 已热加载，无需重启网关服务。\n\n"
+                  "网关目标地点已切换，网关服务无需重启。\n\n"
                   "现在请关闭 iPhone 定位服务，等待 2 秒后重新开启。"), w["generation"]
 
 def wloc_switch(name):
@@ -1675,7 +1679,7 @@ def _wda_precedence_note():
                         "、".join("<code>%s</code>" % d for d in wda["direct_list"][:5])
                         + ("…" if len(wda["direct_list"]) > 5 else "")))
     if scan.get("auto"):
-        lines.append("• ⚠️ 有 %d 条点名规则被自动规则压在下面, 永远轮不到: %s —— 跑 "
+        lines.append("• ⚠️ 有 %d 条用户指定的域名规则被系统自动规则抢先匹配, 当前无法生效: %s —— 跑 "
                      "<code>sudo pdg doctor</code> 看「分流优先级」。"
                      % (len(scan["auto"]),
                         "、".join("<code>%s</code>" % d for d, _w, _g, _b in scan["auto"][:5])
@@ -2803,7 +2807,7 @@ def _undrivable_note(undrivable):
             "<b>没能生成劫持表</b>: " + "、".join(str(x) for x in undrivable[:4])
             + ("…" if len(undrivable) > 4 else "")
             + "\ngfw 模式下它们的规则不会命中(all 模式不受影响)。跑 <code>sudo pdg doctor</code> "
-              "看「规则集劫持表」那一项。")
+              "看「规则集生效状态」那一项。")
 
 
 # ── 单条规则增删 ──
@@ -3650,8 +3654,8 @@ def _reapply_explicit_proxy(mos_bytes, cur_bytes):
             capture_output=True, text=True, timeout=60)
         if r.returncode != 0:
             return mos_bytes, ("⚠️ 备份里的 mosdns 配置是自定义形态, 没能补上「明确代理优先于国内判定」"
-                               "这一层(未擅自改动)。你点名指到出口的域名可能会被判直连 —— "
-                               "跑 <code>sudo pdg doctor</code> 看「明确代理优先级」那一项。")
+                               "这一层(未擅自改动)。你指定要走出口的域名可能会被判直连 —— "
+                               "跑 <code>sudo pdg doctor</code> 看「指定域名优先级」那一项。")
         with open(cand, "rb") as f:
             out = f.read()
         if out == mos_bytes:
@@ -3659,7 +3663,7 @@ def _reapply_explicit_proxy(mos_bytes, cur_bytes):
         return out, "ℹ️ 备份来自旧版本, 已顺带补回「明确代理优先于国内判定」的分流层。"
     except Exception:  # noqa: BLE001
         return mos_bytes, ("⚠️ 没能复核备份里的分流优先级(未擅自改动)。"
-                           "跑 <code>sudo pdg doctor</code> 看「明确代理优先级」那一项。")
+                           "跑 <code>sudo pdg doctor</code> 看「指定域名优先级」那一项。")
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -3856,14 +3860,32 @@ def _restore_commit(tmp):
 _DOT_HOST = None
 
 def _dot_host():
+    """DoT 域名 —— 从**证书的 CN** 取, 证书路径复用 checks._cert_path()。
+
+    以前这里只认写死的默认路径 /etc/mosdns/certs/fullchain.pem, 读不到就把结果吞成 "?"。
+    两个毛病叠在一起:
+      · 证书未必在那儿。`.153` 上它在 /etc/dnsdist/certs/(早期 dnsdist 时代留下的路径),
+        mosdns 配置里明写着 `cert:` 指向哪 —— checks._cert_path() 正是从那里读的, doctor
+        因此一直找得对, 只有 Bot 找不到。同一件事两份实现, 一份对一份错;
+      · 找不到时给 "?"。用户照着 Bot 显示去配 Android 私密 DNS, 拿到的是一个问号 ——
+        必然配不上, 而 Bot 那边看不出任何异常。宁可说"读不到", 不许编一个看起来像答案的东西。
+    """
     global _DOT_HOST
     if _DOT_HOST is None:
         try:
-            out = sh(["openssl", "x509", "-in", CERT, "-noout", "-subject"]).stdout
-            m = re.search(r"CN\s*=\s*([A-Za-z0-9.*-]+)", out)
-            _DOT_HOST = m.group(1) if m else "?"
+            import checks
+            cert = checks._cert_path()
         except Exception:  # noqa: BLE001
-            _DOT_HOST = "?"
+            cert = CERT
+        try:
+            out = sh(["openssl", "x509", "-in", cert, "-noout", "-subject"]).stdout
+            m = re.search(r"CN\s*=\s*([A-Za-z0-9.*-]+)", out)
+            _DOT_HOST = m.group(1) if m else None
+        except Exception:  # noqa: BLE001
+            _DOT_HOST = None
+        if _DOT_HOST is None:
+            # 明说读不到, 并给出查的是哪个路径 —— 用户据此能自己看一眼
+            _DOT_HOST = "(读不到 DoT 域名: 证书 %s 不可读)" % cert
     return _DOT_HOST
 
 def _server_ip():
@@ -3946,6 +3968,170 @@ def kb_pick_named(prefix, items, back=BACK):
     return {"inline_keyboard": rows}
 
 # ── 回调 (原地编辑) ──
+# ── 📡 手机链路测试 (6.1C) ───────────────────────────────────────────────────
+# 只把 6.1B 已经做完的东西接到手机能点的地方: 会话协议、来源判定、状态模型全部复用
+# linksess / linkstat。这里**不**产生任何新的判据 —— 一旦 Bot 自己算一套, 它和 CLI 迟早
+# 说不一样的话, 而用户只看得到 Bot 那一份。
+#
+# 能证明的只有两件事: 网关观察到本次会话的 HTTP 请求; 该请求来源在不在配置的内网卡段。
+# 推不出 DoT / SIM/APN / 移动网络 / 整体联网 / 分流出口是否正常, 也不能断定请求一定来自
+# 用户本人的手机(任何拿到那条链接的人都能打开它)。
+LINK_INTRO = (
+    "📡 <b>手机链路测试</b>\n\n"
+    "这项测试只确认手机能否通过内网卡访问网关，以及请求来源是否位于配置的内网卡段。"
+    "它不能证明 DoT、SIM/APN 或整体联网正常。")
+LINK_START_HINT = ("请关闭普通 Wi-Fi，保留内网卡，然后打开测试页。"
+                   "链接 5 分钟内有效，只能使用一次。")
+LINK_WAITING = "尚未收到本次测试请求。"
+LINK_INSIDE = ("✅ 网关已收到本次 HTTP 测试请求。\n"
+               "请求来源位于配置的内网卡段。\n"
+               "这只证明 HTTP 测试请求到达网关，不代表 DoT、SIM/APN 或整体联网正常。")
+LINK_OUTSIDE = ("⚠️ 网关已收到请求，但来源不在配置的内网卡段。\n"
+                "请确认已关闭普通 Wi-Fi，并使用项目对应的内网卡。")
+LINK_EXPIRED = "⌛ 本次测试已过期，请重新开始。"
+# 会话状态写不下去。给用户的话里不放 /run、不放问号猜测、也不承诺"DNS 与代理不受
+# 影响"—— 写不了 /run 的机器上那句话根本没法保证, 而用户拿它当结论就不会去查。
+# 具体路径留在服务器端日志里(见 linktest_start), 那儿才有人能据此排查。
+LINK_UNWRITABLE = ("⛔ 无法保存本次测试状态，因此测试未启动。\n"
+                   "请运行 sudo pdg doctor 检查网关状态。")
+
+# 结果页的键盘。带 token 的 URL 按钮**只在等待中的那一屏**出现, 出结果/取消/过期后一律撤掉。
+LINK_BACK = {"inline_keyboard": [
+    [{"text": "🔄 查看结果", "callback_data": "linktest:check"}],
+    [{"text": "⬅️ 返回客户端", "callback_data": "nav:client"}],
+    [{"text": "🏠 主菜单", "callback_data": "menu"}]]}
+LINK_DONE_KB = {"inline_keyboard": [
+    [{"text": "📡 再测一次", "callback_data": "linktest"}],
+    [{"text": "⬅️ 返回客户端", "callback_data": "nav:client"}],
+    [{"text": "🏠 主菜单", "callback_data": "menu"}]]}
+
+_linktest_waiters: dict[int, float] = {}     # chat -> 该会话的 expires_at(有界, 防重复点击)
+_linktest_lock = threading.Lock()
+
+
+def linkstat_collect(platform="both"):
+    """服务器准备状态。单独包一层是为了让测试能换掉它, 而不必去桩 linkstat 内部。"""
+    import linkstat
+    return linkstat.collect(platform=platform)
+
+
+def _link_server_blockers():
+    """服务器侧的 FAIL 项。有就不建会话 —— 让用户拿着一条注定失败的链接去手机上折腾,
+    只会把"服务器没起来"误诊成"手机有问题"。"""
+    try:
+        fs = linkstat_collect(platform=_platform())
+    except Exception:  # noqa: BLE001
+        return []                      # 采集不了就不当成阻塞项(它自己会在自检里报)
+    import linkstat
+    return [f for f in fs
+            if f.get("status") == linkstat.FAIL and not linkstat.is_phone_evidence(f)]
+
+
+def linktest_result_text():
+    """当前会话的结论。**自动等待与手动查看共用这一个函数** —— 两套写法迟早说不一样的话。
+
+    返回 (文案, 是否已终结)。终结 = 出了结果/过期/没会话, 后台不必再等。
+    """
+    import linksess
+    st = linksess.status()
+    sess = st.get("session")
+    reason = st.get("reason")
+    if sess is None:
+        if reason == linksess.R_STATE_CORRUPT:
+            return ("⛔ 会话状态文件已损坏，本次测试无法继续。\n"
+                    "为避免给出错误结论，这里不会自动新建会话；请重新开始测试。", True)
+        if reason == linksess.R_STATE_UNWRITABLE:
+            return (LINK_UNWRITABLE, True)
+        return ("当前没有进行中的测试。点「📡 手机链路测试」重新开始。", True)
+    if not st.get("active"):
+        return (LINK_EXPIRED, True)
+    if sess.get("state") == "rate_limited" or (
+            sess.get("invalid_attempts", 0) >= sess.get("max_invalid_attempts", 3)):
+        return ("⛔ 无效尝试次数过多，本次测试已停止接受请求。\n"
+                "请重新开始一次测试。", True)
+    if not sess.get("http_consumed"):
+        left = sess.get("remaining_secs", 0)
+        return ("%s\n\n链接还有约 %d 秒有效。做完后点「🔄 查看结果」。"
+                % (LINK_WAITING, left), False)
+    src = sess.get("source") or {}
+    inside = src.get("inside_internal_cidr")
+    seg = src.get("ipv4_16") or "未记录"
+    if inside is True:
+        return ("%s\n\n（来源网段 %s）" % (LINK_INSIDE, seg), True)
+    if inside is False:
+        return ("%s\n\n（来源网段 %s）" % (LINK_OUTSIDE, seg), True)
+    return ("✅ 网关已收到本次 HTTP 测试请求。\n"
+            "但服务器上没有配置内网卡来源段，无法判断这次请求是不是来自内网卡。\n"
+            "这只证明 HTTP 测试请求到达网关，不代表 DoT、SIM/APN 或整体联网正常。"
+            "\n\n（来源网段 %s）" % seg, True)
+
+
+def _linktest_watch(chat, mid, expires_at):
+    """有界、非阻塞地等结果。Bot 重启后这个等待就没了 —— 用户仍可用「🔄 查看结果」从
+    /run 里读未过期的会话, 所以这里不做任何持久化。"""
+    import linksess
+    try:
+        while time.time() < expires_at + 1:
+            txt, done = linktest_result_text()
+            if done:
+                edit_only(chat, mid, txt, LINK_DONE_KB)
+                return
+            time.sleep(2)
+        edit_only(chat, mid, LINK_EXPIRED, LINK_DONE_KB)
+    finally:
+        with _linktest_lock:
+            _linktest_waiters.pop(chat, None)
+
+
+def linktest_start(chat, mid):
+    import linksess
+    blockers = _link_server_blockers()
+    if blockers:
+        lines = "\n".join("• %s：%s" % (f["title"], f["detail"]) for f in blockers[:5])
+        edit(chat, mid,
+             "⛔ 服务器侧还没准备好，先修好这些再测手机：\n\n%s\n\n"
+             "这时候发测试链接只会把服务器的问题误诊成手机的问题，所以本次没有创建测试会话。"
+             % lines, LINK_DONE_KB)
+        return
+    # 重复点击: 已有等待中的会话就直接给现状, 不再建一个把上一个顶掉
+    with _linktest_lock:
+        busy_until = _linktest_waiters.get(chat, 0)
+    if busy_until > time.time():
+        txt, _done = linktest_result_text()
+        edit(chat, mid, "本次测试还在进行中。\n\n" + txt, LINK_BACK)
+        return
+    okk, payload = linksess.start_session()
+    if not okk:
+        # 技术细节(含具体路径)只进服务器端日志: 那里有人能据此排查, 而且不含 token ——
+        # payload 里带 token 原文的只有 step1_url, 失败时根本没有它。
+        print("linktest: 会话未建立:", payload.get("error", ""), flush=True)
+        edit(chat, mid, LINK_UNWRITABLE, LINK_DONE_KB)
+        return
+    # token 原文**只**出现在这个一次性按钮的 url 里, 正文与 callback data 都不带它
+    kb = {"inline_keyboard": [
+        [{"text": "🌐 打开测试页", "url": payload["step1_url"]}],
+        [{"text": "🔄 查看结果", "callback_data": "linktest:check"},
+         {"text": "✖️ 取消测试", "callback_data": "linktest:cancel"}],
+        [{"text": "⬅️ 返回客户端", "callback_data": "nav:client"}],
+        [{"text": "🏠 主菜单", "callback_data": "menu"}]]}
+    edit(chat, mid, "%s\n\n%s\n\n%s" % (LINK_INTRO, LINK_START_HINT, LINK_WAITING), kb)
+    with _linktest_lock:
+        _linktest_waiters[chat] = payload["expires_at"]
+    try:
+        _EXEC.submit(_linktest_watch, chat, mid, payload["expires_at"])
+    except Exception:  # noqa: BLE001   执行器满/已关 → 撤掉占用, 用户仍可手动查看
+        with _linktest_lock:
+            _linktest_waiters.pop(chat, None)
+
+
+def linktest_cancel(chat, mid):
+    import linksess
+    linksess.clear_state()
+    with _linktest_lock:
+        _linktest_waiters.pop(chat, None)
+    edit(chat, mid, "已取消本次测试，测试链接立即失效。", LINK_DONE_KB)
+
+
 def handle_cb(chat, mid, data):
     # 用户对这条消息做了新操作 → 还挂在它上面的 WLOC 监听立即作废。否则用户点了「返回菜单」,
     # 30 秒后监听把菜单原地改成一句"尚未收到请求", 正看着的界面就没了。
@@ -3973,6 +4159,19 @@ def handle_cb(chat, mid, data):
         domain = data[9:]
         edit(chat, mid, f"正在为 <code>{domain}</code> 校验 A 记录并签证书(约 30-60 秒, 代理短暂中断)…", BACK)
         ok, msg = set_dot_domain(domain); edit(chat, mid, (msg if ok else "❌ " + msg), MENU); return
+    if data == "linktest":
+        edit(chat, mid, LINK_INTRO, {"inline_keyboard": [
+            [{"text": "▶️ 开始测试", "callback_data": "linktest:start"}],
+            [{"text": "🔄 查看结果", "callback_data": "linktest:check"}],
+            [{"text": "⬅️ 返回客户端", "callback_data": "nav:client"}],
+            [{"text": "🏠 主菜单", "callback_data": "menu"}]]}); return
+    if data == "linktest:start":
+        linktest_start(chat, mid); return
+    if data == "linktest:check":
+        txt, done = linktest_result_text()
+        edit(chat, mid, txt, LINK_DONE_KB if done else LINK_BACK); return
+    if data == "linktest:cancel":
+        linktest_cancel(chat, mid); return
     if data == "test":
         edit(chat, mid, "测试中…", BACK); edit(chat, mid, test_exits(), BACK); return
     if data == "doctor":
@@ -4262,7 +4461,7 @@ def handle_cb(chat, mid, data):
              "<b>切换地点的推荐顺序（全程用内网卡）：</b>\n"
              "① 控制中心把 Wi-Fi 点灰（不是在设置里关 Wi-Fi）\n"
              "② 在 Bot「📍 地点 / 切换」里点目标地点\n"
-             "③ 等 Bot 显示「WLOC 已热加载」\n"
+             "③ 等 Bot 显示「网关目标地点已切换，网关服务无需重启」\n"
              "④ 设置 → 隐私与安全性 → 定位服务：关闭，等 2 秒后重新开启\n"
              "⑤ 打开目标 App\n"
              "⑥ iOS 26 如果一直没有发起新的 WLOC 请求，可能仍需重启手机\n\n"

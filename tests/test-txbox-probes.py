@@ -21,6 +21,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tests"))
+import tmpguard  # noqa: E402
 from txbox import Box, load_tx  # noqa: E402
 
 PASS = [0]
@@ -73,7 +74,12 @@ def port_open(port, kind="tcp"):
 
 
 def tmpdirs():
-    return [d for d in os.listdir("/tmp") if d.startswith("pdgtx-box.")]
+    """本进程还欠着几个沙箱目录 —— 问登记表, 不去扫 /tmp。
+
+    老写法是 `os.listdir("/tmp")` 里挑 pdgtx-box.* 前缀: 并发跑测试时隔壁进程(另一支 py
+    用例、正在跑的 E2E)也在建同前缀的目录, 于是这条断言会因为**别人的**沙箱而红, 而红的
+    原因和被测对象毫无关系。登记表只认本进程建的, 既精确又不受并发影响。"""
+    return tmpguard.registered()
 
 
 def main():

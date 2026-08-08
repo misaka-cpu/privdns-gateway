@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -51,7 +52,7 @@ def bad(m):
 
 
 def mkca(name):
-    d = tempfile.mkdtemp(prefix="iosplan-ca-")
+    d = tmpguard.mkdtemp(prefix="iosplan-ca-")
     TMPS.append(d)
     subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
                     "-keyout", d + "/ca.key", "-out", d + "/ca.crt", "-days", "1",
@@ -62,7 +63,7 @@ def mkca(name):
 
 class Box:
     def __init__(self):
-        self.root = tempfile.mkdtemp(prefix="iosplan-")
+        self.root = tmpguard.mkdtemp(prefix="iosplan-")
         TMPS.append(self.root)
         for d in ("etc/privdns-gateway", "etc/sing-box", "etc/mosdns/rules", "run",
                   "var/lib/privdns-gateway", "opt/pdg-bot"):
@@ -267,7 +268,7 @@ cli_rollback(){
 
 
 def cli_rollback(box, blob):
-    tmp = tempfile.mkdtemp(prefix="iosplan-tree-")
+    tmp = tmpguard.mkdtemp(prefix="iosplan-tree-")
     TMPS.append(tmp)
     tree = os.path.join(tmp, "tree")
     os.makedirs(tree)
@@ -395,7 +396,7 @@ em["current"]["sha256"] = hashlib.sha256(forged).hexdigest()
 em["current"]["digest"] = evil.s.digest_of(em["current"]["inputs"])
 evil_meta = (json.dumps(em, ensure_ascii=False, indent=2, sort_keys=True)
              .encode("utf-8") + b"\n")
-evil_dir = tempfile.mkdtemp(prefix="iosplan-evil-")
+evil_dir = tmpguard.mkdtemp(prefix="iosplan-evil-")
 TMPS.append(evil_dir)
 for rel, data in ((ARC_META, evil_meta), (ARC_CUR, forged)):
     os.makedirs(os.path.dirname(os.path.join(evil_dir, rel)), exist_ok=True)
@@ -444,7 +445,7 @@ else:
 
 print()
 print("══ 五、记录文件在但 JSON 坏了: 三个入口都整笔拒 ══")
-bj_dir = tempfile.mkdtemp(prefix="iosplan-bj-")
+bj_dir = tmpguard.mkdtemp(prefix="iosplan-bj-")
 TMPS.append(bj_dir)
 for rel in BASE_MEMBERS:
     os.makedirs(os.path.dirname(os.path.join(bj_dir, rel)), exist_ok=True)
@@ -502,7 +503,7 @@ print("══ 六之二、有产物却没有记录 = 这一组坏了, 不是「�
 # 的归档被当成"不含这一组"放过去: 现网的旧记录原地不动, 归档里的孤立产物却被覆盖上去 ——
 # 恢复完变成"记录说第 N 版、盘上是别人的第 M 版", 而且返回成功。
 # 正确的语义是三选一: 三件全无 ⇒ no-op; 有记录 ⇒ 严格校验; 只有产物 ⇒ 这一组坏了, 整笔拒。
-orphan_dir = tempfile.mkdtemp(prefix="iosplan-orphan-")
+orphan_dir = tmpguard.mkdtemp(prefix="iosplan-orphan-")
 TMPS.append(orphan_dir)
 for rel in BASE_MEMBERS:
     os.makedirs(os.path.dirname(os.path.join(orphan_dir, rel)), exist_ok=True)

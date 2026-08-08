@@ -74,37 +74,18 @@ _prev_sha="$(git -C "$E2E_ROOT" rev-parse "$PREV^{commit}")"
 [[ "$_head_sha" != "$_prev_sha" ]] \
   || e2e_skip "$PREV 就指着 HEAD —— 那是从本版升到本版, 拒绝当成有效用例"
 
-# /tmp **不在** overlay 里 —— 上一轮留下的假 systemd 状态(/tmp/e2e-svc/*.fail 之类)会原样
+# /tmp **不在** overlay 里 —— 上一轮留下的假 systemd 状态($E2E_TMP/e2e-svc/*.fail 之类)会原样
 # 带进这一轮: post-fault 那格把 pdg-bot 标成"起来就崩", 下一格就会莫名其妙地更新失败, 而
 # 失败原因与被测对象毫无关系。每格进场先把这些清干净。
-rm -rf /tmp/e2e-svc /tmp/e2e-nft-ruleset /tmp/e2e-calls.log /tmp/rml-*.log /tmp/mig9* 2>/dev/null || true
+rm -rf $E2E_TMP/e2e-svc $E2E_TMP/e2e-nft-ruleset $E2E_TMP/e2e-calls.log $E2E_TMP/rml-*.log $E2E_TMP/mig9* 2>/dev/null || true
 e2e_stub_system
-# e2e_stub_system 的 nft 桩对什么都回 0 且不留状态 —— 而救援放行的收尾判据是"磁盘与内核都
-# **恰好一条**", 无状态的桩会让内核侧永远数出 0, 于是启用必然自我回滚, 测出来的是桩的病。
-# 换成有状态的那一版(与 e2e-custom-nft.sh 同形): -f 装载写进状态文件, list 读回来。
-cat > /usr/local/bin/nft <<'S'
-#!/bin/sh
-STATE=/tmp/e2e-nft-ruleset
-echo "nft $*" >> /tmp/e2e-calls.log
-case "$1" in
-  -c) exit 0 ;;
-  -f) [ -f "$2" ] && cat "$2" > "$STATE"; exit 0 ;;
-  # 真 nft 打印的是**内核里的规则**, 不会把配置文件里的注释原样吐回来。桩必须照做:
-  # 生产模板里有一行 `# 你自己的放行规则放这里(… 如 \`tcp dport 80 accept\`)`, 原样回显
-  # 会让 doctor 的文本判据把这句说明当成"80 对全网开放"而判红 —— 那是桩不像真的, 不是
-  # 防火墙有问题。(顺带记一笔: 这也说明按文本认规则本身就脆, 见报告 P2。)
-  list) sed -e 's/#.*$//' "$STATE" 2>/dev/null | grep -v '^[[:space:]]*$'; exit 0 ;;
-  delete) exit 0 ;;
-esac
-exit 0
-S
-chmod 755 /usr/local/bin/nft
-: > /tmp/e2e-nft-ruleset
+# 共享桩(e2e-lib.sh)现在是**状态派生**的: -f 装载、list 回放、-j 由当前状态转成 JSON。
+# 这里原本自带一份私有桩, 理由是共享桩没状态 —— 那个理由已经不成立了, 而且它不认 `-j`,
+# 留着反而会盖住共享桩, 让更新后自检读不到内核。删掉, 只用共享的那一份。
 e2e_seed_install
 e2e_seed_mosdns all
 e2e_seed_singbox_model
 e2e_seed_nft mihomo
-cp /etc/nftables.conf /tmp/e2e-nft-ruleset      # 磁盘与"内核"起点一致
 printf '%s\n' "$PLAT" > /etc/privdns-gateway/platform
 printf 'mihomo\n'     > /etc/privdns-gateway/backend
 mkdir -p /var/lib/privdns-gateway
@@ -120,8 +101,13 @@ chmod 755 /usr/local/bin/mihomo
 
 # `ip -4 -o addr show scope global` 的桩: 救援平面靠它挑监听地址候选。沙箱里没有真网卡,
 # 不桩的话"来源段内恰好一个本机地址"这条路径根本走不到, bind-auto 那格就成了空测试。
+# 自己造的桩自己撤 —— 下一支进场那道兜底是保险, 不是分工(它连异常退出都要兜)。
+_rml_drop_ip_stub(){ e2e_purge_shadow_stub ip || true; }
+e2e_add_exit_hook _rml_drop_ip_stub
+
 _stub_ip(){                      # $@ = 要出现在 scope global 里的地址(可为空)
   { echo '#!/bin/sh'
+  echo "$E2E_STUB_MARK"   # 归属标记: 只有带这行的才会被 e2e_purge_shadow_stub 清掉
     echo 'if [ "$1" = "-4" ]; then'
     for a in "$@"; do echo "  echo '1: eth0    inet $a/16 brd 127.255.255.255 scope global eth0\\       valid_lft forever'"; done
     echo '  exit 0'
@@ -133,7 +119,7 @@ _stub_ip(){                      # $@ = 要出现在 scope global 里的地址(�
 
 # ── 发布源: v1.7.8 的真代码 + 当前工作树 ────────────────────────────────────
 REPO=/opt/privdns-gateway
-ORIGIN=/tmp/e2e-rml-origin.git
+ORIGIN=$E2E_TMP/e2e-rml-origin.git
 rm -rf "$REPO/.git" "$ORIGIN"
 git -C "$REPO" init -q -b main
 e2e_guard_repo "$REPO" || exit 1
@@ -285,16 +271,16 @@ _rescue_dig(){ sha256sum "${PDG_RESCUE_TOKEN:-/nonexistent}" "${PDG_RESCUE_CERT:
 _rescue_tok(){ sha256sum "${PDG_RESCUE_TOKEN:-/nonexistent}" 2>/dev/null | awk '{print $1}'; }
 FP_BEFORE="$(_rescue_fp)"; TOK_BEFORE="$(_rescue_tok)"; DIG_BEFORE="$(_rescue_dig)"
 NR_BEFORE="$(systemctl show -p NRestarts --value mosdns 2>/dev/null || echo 0)"
-cp /etc/nftables.conf /tmp/nft-before.conf 2>/dev/null || true
+cp /etc/nftables.conf $E2E_TMP/nft-before.conf 2>/dev/null || true
 # /tmp 不在 overlay 里, 宿主上本来就可能有别人留下的 pdg-* —— 残留判据只看**本轮新增的**,
 # 否则这条恒红, 而恒红与恒绿一样没有信息量。
-TMP_BEFORE="$(ls -d /tmp/pdg-* /tmp/pdgtx-* 2>/dev/null | sort)"
+TMP_BEFORE="$(ls -d $E2E_TMP/pdg-* $E2E_TMP/pdgtx-* 2>/dev/null | sort)"
 _pre_sha="$(git -C "$REPO" rev-parse HEAD)"     # 精确回滚目标: 更新前那个提交
 
 echo
 echo "── 跑 $PREV 的 pdg update(目标: 当前工作树) ──"
 out=$(bash /usr/local/bin/pdg update 2>&1); rc=$?
-printf '%s\n' "$out" > /tmp/rml-out.txt
+printf '%s\n' "$out" > $E2E_TMP/rml-out.txt
 
 _intent(){ sed -n 's/^[[:space:]]*PDG_RESCUE_ENABLED=//p' "$PROF" | tail -1; }
 
@@ -327,7 +313,7 @@ if [[ "$CASE" == post-fault ]]; then
   _held="$(fuser /run/privdns-gateway.lock 2>/dev/null | tr -d ' ')"
   [[ -z "$_held" ]] && ok "回滚后锁文件上没有残留持有者" || bad "还有进程持着锁: $_held"
   _new_tmp="$(comm -13 <(printf '%s\n' "$TMP_BEFORE") \
-                       <(ls -d /tmp/pdg-* /tmp/pdgtx-* 2>/dev/null | sort) | grep -c . || true)"
+                       <(ls -d $E2E_TMP/pdg-* $E2E_TMP/pdgtx-* 2>/dev/null | sort) | grep -c . || true)"
   [[ "${_new_tmp:-0}" == 0 ]] && ok "回滚后没有新增临时目录残留" || bad "新增 $_new_tmp 个残留"
   e2e_summary
   exit $?
@@ -484,7 +470,7 @@ fi
 _pend="$(python3 /opt/pdg-bot/pdgtx.py list 2>/dev/null | grep -cE 'APPLYING|OBSERVING|ROLLING_BACK|ROLLBACK_FAILED' || true)"
 [[ "${_pend:-0}" == 0 ]] && ok "没有未完成的配置事务" || bad "留下 $_pend 笔未完成事务"
 _new_tmp="$(comm -13 <(printf '%s\n' "$TMP_BEFORE") \
-                     <(ls -d /tmp/pdg-* /tmp/pdgtx-* 2>/dev/null | sort) | grep -c . || true)"
+                     <(ls -d $E2E_TMP/pdg-* $E2E_TMP/pdgtx-* 2>/dev/null | sort) | grep -c . || true)"
 [[ "${_new_tmp:-0}" == 0 ]] && ok "本轮没有新增临时目录残留" \
   || bad "新增 $_new_tmp 个临时目录残留"
 _held="$(fuser /run/privdns-gateway.lock 2>/dev/null | tr -d ' ')"
@@ -497,19 +483,21 @@ _held="$(fuser /run/privdns-gateway.lock 2>/dev/null | tr -d ' ')"
 #   · 修好之后: 子进程认出继承来的那把锁 → rc 0。
 # 同时验反面: **没有**继承 fd 的第三方进程仍然必须被挡住(BUSY), 否则就是把并发保护拆了。
 if [[ "$rc" == 0 ]]; then      # 只有升级成功时机器上才是新脚本, 否则这一节测的是旧脚本
-  cat > /tmp/rml-parent.sh <<'PS'
+  { printf 'CHILDLOG=%s/rml-child.log\n' "$E2E_TMP"    # 引号 heredoc 不展开, 路径走头行
+    cat <<'PS'
 set -u
 exec 9>"${PDG_LOCKFILE:-/run/privdns-gateway.lock}"
 flock -n 9 || { echo "PARENT-LOCK-FAILED"; exit 9; }
-bash /usr/local/bin/pdg __migrate >/tmp/rml-child.log 2>&1
+bash /usr/local/bin/pdg __migrate >"$CHILDLOG" 2>&1
 echo "CHILD-RC=$?"
 PS
-  _p="$(bash /tmp/rml-parent.sh 2>&1)"
+  } > $E2E_TMP/rml-parent.sh
+  _p="$(bash $E2E_TMP/rml-parent.sh 2>&1)"
   _crc="${_p##*CHILD-RC=}"
   [[ "$_crc" == 0 ]] \
     && ok "父进程持锁时, 继承同一 fd 的 __migrate 跑通(rc=0)" \
-    || bad "继承锁没被复用: __migrate rc=$_crc / $(tail -3 /tmp/rml-child.log)"
-  grep -q '已有 pdg 操作在运行' /tmp/rml-child.log \
+    || bad "继承锁没被复用: __migrate rc=$_crc / $(tail -3 $E2E_TMP/rml-child.log)"
+  grep -q '已有 pdg 操作在运行' $E2E_TMP/rml-child.log \
     && bad "子迁移仍报 BUSY —— 锁继承没生效" || ok "子迁移没有报 BUSY"
 
   # 反面: 另一个进程持锁, 独立跑 __migrate(不继承 fd)必须 BUSY。
@@ -520,14 +508,14 @@ PS
   # 锁一直按到下一个 case, 下一格的 `pdg update` 当场 BUSY。改成盯标记文件: 删掉标记 = 松手,
   # wait 回来就一定放干净了(与 tests/test-lock-inherit.sh 同一套写法)。
   _LK="${PDG_LOCKFILE:-/run/privdns-gateway.lock}"
-  : > /tmp/rml-holding
-  ( exec 9>"$_LK"; flock -n 9 || exit 1; : > /tmp/rml-held
-    while [[ -e /tmp/rml-holding ]]; do sleep 0.05; done ) &
+  : > $E2E_TMP/rml-holding
+  ( exec 9>"$_LK"; flock -n 9 || exit 1; : > $E2E_TMP/rml-held
+    while [[ -e $E2E_TMP/rml-holding ]]; do sleep 0.05; done ) &
   _holder=$!
-  for _i in $(seq 1 60); do [[ -e /tmp/rml-held ]] && break; sleep 0.05; done
-  [[ -e /tmp/rml-held ]] && ok "前置: 第三方确实按住了锁" || bad "造不出'第三方持锁'的现场"
+  for _i in $(seq 1 60); do [[ -e $E2E_TMP/rml-held ]] && break; sleep 0.05; done
+  [[ -e $E2E_TMP/rml-held ]] && ok "前置: 第三方确实按住了锁" || bad "造不出'第三方持锁'的现场"
   _o=$(setsid bash -c 'exec 9<&-; bash /usr/local/bin/pdg __migrate' 2>&1); _orc=$?
-  rm -f /tmp/rml-holding; wait "$_holder" 2>/dev/null; rm -f /tmp/rml-held
+  rm -f $E2E_TMP/rml-holding; wait "$_holder" 2>/dev/null; rm -f $E2E_TMP/rml-held
   # 松手之后锁必须真的可再取 —— 这一条就是上面那个泄漏的直接探针
   ( exec 9>"$_LK"; flock -n 9 ) \
     && ok "探针收尾后锁已彻底释放(没有留下攥着 fd 的后台进程)" \

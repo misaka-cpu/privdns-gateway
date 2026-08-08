@@ -8,6 +8,7 @@ import sys
 import tempfile
 import types
 from pathlib import Path
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "deploy" / "bot"))
@@ -20,7 +21,7 @@ def ok(m):
 
 
 def main():
-    tmp = tempfile.mkdtemp()
+    tmp = tmpguard.mkdtemp()
     bot.MITM_CONFIG = os.path.join(tmp, "mitm.json")
     bot.MITM_HIJACK_FILE = os.path.join(tmp, "mitm_hijack.txt")
     bot.apply_sb = lambda mod: (True, "")                 # 不起真核心
@@ -44,8 +45,10 @@ def main():
     bot._mitm_transact = _fake_transact
     # 5.1 起锁是 fail-closed 的: 锁文件打不开就拒绝写(以前会退化成仅进程内锁继续写)。
     # 单测跑在普通用户下, 给它一个可写的锁文件。
-    _lk = tempfile.NamedTemporaryFile(delete=False); _lk.close()
-    bot.LOCKFILE = _lk.name
+    # 建在上面那个一次性目录里, 跟着它一起消失。以前用 delete=False 的 NamedTemporaryFile,
+    # 谁也不删 —— 跑一次留一个 0 字节的 tmpXXXX 文件在 /tmp 里。
+    bot.LOCKFILE = os.path.join(tmp, "pdg.lock")
+    open(bot.LOCKFILE, "w").close()
 
     # ── 安卓平台: 拒绝 ──
     bot._platform = lambda: "android"

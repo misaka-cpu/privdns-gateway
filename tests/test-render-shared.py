@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BOT_DIR = os.path.join(ROOT, "deploy", "bot")
@@ -61,7 +62,7 @@ def run_isolated(code, *, bot_state, extra_env=None):
 
     必须开子进程: 同一个解释器里 sys.modules 早就缓存了正常的 bot, 那样测出来的
     "不依赖 bot"是假的。"""
-    d = tempfile.mkdtemp(prefix="sharedbot.")
+    d = tmpguard.mkdtemp(prefix="sharedbot.")
     try:
         for f in os.listdir(BOT_DIR):
             if f.endswith(".py"):
@@ -144,19 +145,25 @@ for label, state in (("pdg-bot.py 语法损坏", "broken"),
 # ══ 2. cfgrestore 的 deriver 在没有 bot 时仍能出候选 ═══════════════════════
 print()
 print("── 2. 配置恢复的 deriver 不依赖 bot ──")
+# 探针跑在**另一个进程**里, sys.path 被刻意收窄成"只有共享模块"(那正是本节要验的),
+# 所以它用不上 tmpguard —— 自带 try/finally 收自己的沙箱。以前这里一个 finally 都没有:
+# 四种 bot 状态各跑一次, 一趟就留四个目录, 而且不会让任何断言变红。
 DERIVE_CODE = '''
-import hashlib, json, os, sys, tempfile
+import hashlib, json, os, shutil, sys, tempfile
 import mihomorender as M
 d = tempfile.mkdtemp()
-open(os.path.join(d, "platform"), "w").write("android\\n")
-json.dump(json.loads(%r), open(os.path.join(d, "rulesets.json"), "w"))
-fn = M.deriver_from_paths(rs_meta_path=os.path.join(d, "rulesets.json"),
-                          mitm_hijack_file=os.path.join(d, "mitm_hijack.txt"),
-                          platform_file=os.path.join(d, "platform"))
-data = fn({"model": json.dumps(json.loads(%r)).encode()})
-print("SHA:" + hashlib.sha256(data).hexdigest())
-print("HASPROV:" + str("rs_yaml" in json.loads(data.decode())["rule-providers"]))
-print("LOADED_BOT:" + str(any(m in sys.modules for m in ("bot", "pdg_bot"))))
+try:
+    open(os.path.join(d, "platform"), "w").write("android\\n")
+    json.dump(json.loads(%r), open(os.path.join(d, "rulesets.json"), "w"))
+    fn = M.deriver_from_paths(rs_meta_path=os.path.join(d, "rulesets.json"),
+                              mitm_hijack_file=os.path.join(d, "mitm_hijack.txt"),
+                              platform_file=os.path.join(d, "platform"))
+    data = fn({"model": json.dumps(json.loads(%r)).encode()})
+    print("SHA:" + hashlib.sha256(data).hexdigest())
+    print("HASPROV:" + str("rs_yaml" in json.loads(data.decode())["rule-providers"]))
+    print("LOADED_BOT:" + str(any(m in sys.modules for m in ("bot", "pdg_bot"))))
+finally:
+    shutil.rmtree(d, ignore_errors=True)
 ''' % (json.dumps(META), json.dumps(MODEL))
 for label, state in (("bot 正常", "ok"), ("pdg-bot.py 语法损坏", "broken"),
                      ("pdg-bot.py 不存在", "absent"), ("禁止 import pdg-bot", "blocked")):
@@ -178,7 +185,7 @@ sys.modules["bot"] = bot
 spec.loader.exec_module(bot)
 import mihomorender as M  # noqa: E402
 
-work = tempfile.mkdtemp(prefix="sharedcmp.")
+work = tmpguard.mkdtemp(prefix="sharedcmp.")
 RS_PATH = os.path.join(work, "rulesets.json")
 json.dump(META, open(RS_PATH, "w"))
 bot.RS_META = RS_PATH

@@ -215,16 +215,14 @@ def bot_credentials():
 
 
 def expected_services():
-    """按平台的必需服务集。pdg-probe81 是 iOS 专属(:81 探测), Android 不含。
-    pdg-mitm 由 check_mitm 单独按启用态判定, 不列入必需集。
+    """必需服务集。pdg-probe81 是 Android/iOS **公共**组件(:81 探测 + 链路会话入口),
+    两平台都必需。pdg-mitm 由 check_mitm 单独按启用态判定, 不列入必需集。
     未配 bot 凭据时 pdg-bot 不在必需集里 —— 它本来就不该启动。
     CLI/status/report/healthcheck 统一取此。"""
     svc = _core_svc()
-    names = ["mosdns", svc]
+    names = ["mosdns", svc, "pdg-probe81"]
     if bot_credentials() == "ready":
         names.append("pdg-bot")
-    if _platform() == "ios":
-        names.append("pdg-probe81")
     return names
 
 def check_services():
@@ -387,18 +385,18 @@ def check_cidr_drift():
     mosv = _cidr_from_mosdns()
     if not src:
         if nftv or mosv:
-            return ("warn", "内网卡段真源",
+            return ("warn", "内网卡段一致性",
                     "profile.env 里没有 PDG_INTERNAL_CIDR(老装尚未迁移)。当前实际生效: "
                     "nft=%s / mosdns=%s。请运行 <code>sudo pdg migrate</code> 写入真源。"
                     % (nftv or "读不到", mosv or "读不到"))
-        return ("warn", "内网卡段真源", "profile.env 与 nft/mosdns 都读不到内网卡段")
+        return ("warn", "内网卡段一致性", "profile.env 与 nft/mosdns 都读不到内网卡段")
     diff = []
     if nftv and nftv != src:
         diff.append("nft=%s" % nftv)
     if mosv and mosv != src:
         diff.append("mosdns=%s" % mosv)
     if diff:
-        return ("fail", "内网卡段真源",
+        return ("fail", "内网卡段一致性",
                 "profile.env 记的是 %s, 但 %s —— 三处必须一致, 否则放行/分流/救援入口会各说各话。"
                 "请运行 <code>sudo pdg detect-cidr</code> 重新统一。" % (src, "、".join(diff)))
     # 四方的最后一方: 本机是否真有一个落在这个段里的地址。没有不一定是错(手机不在线时该段
@@ -406,56 +404,102 @@ def check_cidr_drift():
     try:
         net = ipaddress.ip_network(src, strict=False)
     except Exception:  # noqa: BLE001
-        return ("fail", "内网卡段真源", "%s 不是合法 CIDR" % src)
+        return ("fail", "内网卡段一致性", "%s 不是合法 CIDR" % src)
     _, addrs, _ = _run(["ip", "-4", "-o", "addr"])
     local = [ipaddress.ip_address(a) for a in re.findall(r"inet ([0-9.]+)/", addrs or "")]
     if local and not any(a in net for a in local):
-        return ("ok", "内网卡段真源",
+        return ("ok", "内网卡段一致性",
                 "%s(三处一致; 本机网卡地址不在该段内 —— 内网卡为对端下发时属正常)" % src)
-    return ("ok", "内网卡段真源", "%s(profile.env / nft / mosdns 三处一致)" % src)
+    return ("ok", "内网卡段一致性", "%s(profile.env / nft / mosdns 三处一致)" % src)
 
 
 def platform_ports_text():
-    """按当前平台列出应放行的端口。写死一串"53/80/81/443/853/5228-5230/7893/8445"会在 iOS 上
-    声称 GMS 5228-5230 已就位(iOS 走 APNs, 装机就把它剥掉了), 在 Android 上又提 :81
-    (那是 iOS 专属的 OnDemand 探测端点, Android 根本不装 pdg-probe81)。"""
+    """按当前平台列出应放行的端口。写死一串会在 iOS 上声称 GMS 5228-5230 已就位
+    (iOS 走 APNs, 装机就把它剥掉了)。81 两平台都列 —— pdg-probe81 已是公共组件,
+    nft 模板里 81 本来也只有一份、对 __INTERNAL_CIDR__ 放行, 无平台分叉。
+
+    端口从 nftlive 的常量推出来, doctor 这边不另存一份: 判据用一份端口表、展示用另一份,
+    迟早会出现"报告说 8445 已放行、判据根本没查它"这种两头对不上的事。"""
+    import nftlive
     ios = _platform() == "ios"
-    ports = ["53", "80"]
-    if ios:
-        ports.append("81(仅 iOS)")
-    ports += ["443", "853"]
+    ports = set(nftlive.REQUIRED_INTERNAL_TCP) | set(nftlive.REDIRECT_TCP) \
+        | set(nftlive.DOCTOR_ONLY_INTERNAL_TCP)
+    out = [str(p) for p in sorted(ports)]
     if not ios:
-        ports.append("5228-5230(仅 Android)")
-    ports += ["7893", "8445"]          # 8445 = Telegram SOCKS5, 两平台共用
-    return "/".join(ports)
+        lo, hi = min(nftlive.GMS_TCP), max(nftlive.GMS_TCP)
+        out.append("%d-%d(仅 Android)" % (lo, hi))
+    return "/".join(out)
+
+
+# ── 防火墙判定: 整轮 doctor 只做一次, 由 nftlive 统一判 ─────────────────────
+# 以前这里有三份各自为政的解析: check_nft 自己 grep `dport {…}` 找敏感端口、check_redirect
+# 自己找 `redirect to :7893`、check_gms 自己找含 5228 的行 —— 三份都是文本近似, 各自的口径
+# 还不一样(check_nft 只看"有没有对全网开放", 规则整条消失反而更"干净")。同一时期 linkstat
+# 又有第四份, 结论与 doctor 相反, `.153` 上一台健康机器被它挡住做不了链路测试。
+#
+# 现在只有一份: nftlive 按 `nft -j` 的表达式做语义判断。doctor 这边读一次真源(内网卡段、
+# 平台、mihomo 的 redir 口、nft 配置路径与二进制), 显式传进去, 判一次, 三个检查项各取
+# 自己那一档 —— 同一个根因只会出现在一个检查项里。
+_NFT_VIEW = None
+
+
+class _NftView(object):
+    """一轮 doctor 内共享的防火墙判定。calls 记录这轮实际发出的 nft 命令(供测试点数)。"""
+
+    def __init__(self, disk_ok, disk_why, audit, kern_why, calls):
+        self.disk_ok, self.disk_why = disk_ok, disk_why
+        self.audit, self.kern_why, self.calls = audit, kern_why, calls
+
+
+def _nft_view_reset():
+    """每轮 doctor 开始时清空 —— Bot 是长驻进程, 缓存跨轮复用等于拿旧状态糊弄用户。"""
+    global _NFT_VIEW
+    _NFT_VIEW = None
+
+
+def _nft_view():
+    global _NFT_VIEW
+    if _NFT_VIEW is not None:
+        return _NFT_VIEW
+    import nftlive
+    calls = []
+
+    def _runner(cmd):
+        calls.append(list(cmd))
+        return _run(cmd, 15)
+
+    disk_ok, disk_why = nftlive.check_disk_config(path=NFT_CONF, runner=_runner)
+    audit, kern_why = None, ""
+    if disk_ok:
+        obj, kern_why = nftlive.read_kernel(runner=_runner)
+        if obj is not None:
+            audit = nftlive.audit_kernel(
+                obj, cidr=_internal_cidr(), platform=_platform(),
+                redir_port=_mihomo_redir_port())
+    _NFT_VIEW = _NftView(disk_ok, disk_why, audit, kern_why, calls)
+    return _NFT_VIEW
 
 
 def check_nft():
-    # 兼容两种表名: 新版独立表 inet pdg; 旧装(尚未迁移)仍是 inet filter。
-    _, out, _ = _run(["nft", "list", "chain", "inet", "pdg", "input"])
-    if not out:
-        _, out, _ = _run(["nft", "list", "chain", "inet", "filter", "input"])
-    if not out:
-        return ("warn", "防火墙", "读不到 nftables")
-    leaked = set()
-    for ln in out.splitlines():
-        s = ln.strip()
-        if "saddr" in s or "accept" not in s:
-            continue  # 限定来源的行 / 非 accept 行, 跳过
-        m = re.search(r"dport\s*\{?\s*([0-9,\-\s]+)", s)   # 端口集可含区间(如 5228-5230)
-        if m:
-            # 7893 = mihomo redir 端口(nft prerouting REDIRECT 的目标): 只该由内网卡来源命中,
-            # 对全网 accept 等于把代理入口暴露成开放中继。sing-box 模式没这条规则 → 不出现即不报。
-            sens = {"53", "80", "81", "443", "853", "5228", "5229", "5230", "7893", "8445"}
-            for tok in m.group(1).split(","):
-                tok = tok.strip()
-                if tok.isdigit() and tok in sens:
-                    leaked.add(tok)
-                elif re.match(r"^\d+-\d+$", tok):          # 区间: 判敏感端口是否落在区间内, 不枚举(1-65535 也能报全)
-                    a, b = (int(x) for x in tok.split("-"))
-                    leaked |= {p for p in sens if a <= int(p) <= b}
-    if leaked:
-        return ("fail", "防火墙", "这些口对全网开放(应只限内网卡): " + ", ".join(sorted(leaked)))
+    """input 链本身: 表/链结构、必需放行、来源限定、顺序, 外加 doctor 专项端口(8445)。
+
+    prerouting 的 80/443 归 check_redirect、GMS 归 check_gms —— 判定是同一份, 只是各报各的。
+    """
+    v = _nft_view()
+    if not v.disk_ok:
+        return ("fail", "防火墙", "磁盘上的防火墙配置无效: %s" % v.disk_why)
+    if v.audit is None:
+        # 读不到内核 = 不知道现在到底放行了什么。这里必须 fail-closed: 上一版返回
+        # warn "读不到 nftables", 于是"防火墙被整个卸了"和"一切正常"在报告里同色。
+        return ("fail", "防火墙", "读不到内核里的防火墙规则(%s) —— 无法确认放行是否生效"
+                % (v.kern_why or "原因未知"))
+    core = v.audit.of_kind("table", "missing", "source", "order", "verdict", "leak")
+    if core:
+        return ("fail", "防火墙", "; ".join(core))
+    extra = v.audit.of_kind("socks")
+    if extra:
+        # 专项功能: 报出来, 但不是核心链路故障 —— 它不该让"手机能不能上网"这件事变红。
+        return ("warn", "防火墙", "; ".join(extra) + "(不影响手机基础链路)")
     return ("ok", "防火墙", platform_ports_text() + " 仅限内网卡来源")
 
 def _filesha(path):
@@ -481,61 +525,33 @@ def _mihomo_redir_port():
     return int(m.group(1)) if m else 7893
 
 
-def _dport_covers(portset, want):
-    """端口集字符串(可含区间, 如 80, 443, 5228-5230)是否覆盖 want。不枚举, 免 1-65535 撑爆。"""
-    for tok in portset.split(","):
-        tok = tok.strip()
-        if tok.isdigit() and int(tok) == want:
-            return True
-        if re.match(r"^\d+-\d+$", tok):
-            a, b = (int(x) for x in tok.split("-"))
-            if a <= want <= b:
-                return True
-    return False
-
-
 def check_redirect():
     """mihomo 模式: 内网卡来源的 80/443 必须 REDIRECT 到 mihomo 的 redir 口, 否则代理链路是断的。
 
     专门补的一项: 这条规则曾被 iOS GMS 清理迁移整行删掉, 而 doctor 一路全绿 —— 防火墙那项
-    只查"敏感端口有没有对全网开放", 规则整条消失反而更"干净", 于是线上代理断了好几天没人发现。"""
+    只查"敏感端口有没有对全网开放", 规则整条消失反而更"干净", 于是线上代理断了好几天没人发现。
+
+    判据来自与 check_nft / linkstat 同一份 nftlive 判定(kind="redirect"), 这里不再自己
+    grep `redirect to :7893` —— 那份文本近似认不出 `redirect to :7893` 与 nft 规范化后的
+    其它写法, 也认不出"改写目标是个没人监听的端口"。"""
     port = _mihomo_redir_port()
-
-    def _sources():
-        """惰性: 先看本项目自己的链, 命中就不必再整份 dump ruleset; 最后退回 on-disk 配置。"""
-        for cmd in (["nft", "list", "chain", "inet", "pdg", "prerouting"],
-                    ["nft", "list", "ruleset"]):          # 规则被挪到别的表时的兜底
-            _, out, _ = _run(cmd)
-            if out:
-                yield out
-        try:
-            yield open(NFT_CONF, encoding="utf-8").read()
-        except OSError:
-            pass
-
-    def _present(text):
-        for ln in text.splitlines():
-            s = ln.strip()
-            if "redirect" not in s or "saddr" not in s:
-                continue                        # 必须是"限内网来源"的 redirect 才算原装形态
-            m = re.search(r"dport\s*\{?\s*([0-9,\-\s]+)", s)
-            if not m or not re.search(r"redirect to :?%d(\D|$)" % port, s):
-                continue
-            if _dport_covers(m.group(1), 80) and _dport_covers(m.group(1), 443):
-                return True
-        return False
-
-    seen = False
-    for out in _sources():
-        seen = True
-        if _present(out):
-            return ("ok", "代理入口", "内网卡 80/443 已 REDIRECT → mihomo :%d" % port)
-    if not seen:
+    v = _nft_view()
+    if not v.disk_ok or v.audit is None:
+        # 读不到就说读不到, 不猜。核心故障由 check_nft 报, 这里不重复。
         return ("warn", "代理入口", "读不到 nftables, 无法确认 80/443 是否 REDIRECT 到 mihomo。")
-    return ("fail", "代理入口",
-            "内网卡 80/443 未 REDIRECT 到 mihomo :%d —— 代理链路不通(规则可能被误删)。"
-            "修复: nft add rule inet pdg prerouting ip saddr <内网段> tcp dport { 80, 443 } "
-            "redirect to :%d, 并写回 /etc/nftables.conf。" % (port, port))
+    if "prerouting" not in v.audit.evaluated:
+        # 表/链没到能查 prerouting 的地步 —— 那是 check_nft 的根因, 这里只说没结论。
+        bad = v.audit.of_kind("redirect")
+        if bad:
+            return ("fail", "代理入口", "; ".join(bad))
+        return ("warn", "代理入口", "读不到 prerouting 链, 无法确认 80/443 是否 REDIRECT。")
+    bad = v.audit.of_kind("redirect")
+    if bad:
+        return ("fail", "代理入口",
+                "; ".join(bad) + " —— 代理链路不通(规则可能被误删)。"
+                "修复: nft add rule inet pdg prerouting ip saddr <内网段> tcp dport "
+                "{ 80, 443 } redirect to :%d, 并写回 %s。" % (port, NFT_CONF))
+    return ("ok", "代理入口", "内网卡 80/443 已 REDIRECT → mihomo :%d" % port)
 
 
 def check_gms():
@@ -562,16 +578,18 @@ def check_gms():
             return ("warn", "GMS 残留", "iOS 不应有 GMS 5228-5230, 检出于 " + "、".join(residue)
                     + "; 运行 sudo pdg __migrate 清理(自定义防火墙形态需手动移除)。")
         return None
-    # mihomo(唯一内核): 5228-5230 由 nft prerouting REDIRECT 到 redir 端口 + sniffer 处理, 不在 input accept
-    _, pre, _ = _run(["nft", "list", "chain", "inet", "pdg", "prerouting"])
-    if not pre:
-        try:
-            pre = open("/etc/nftables.conf").read()
-        except OSError:
-            pre = ""
-    ok_mh = any("saddr" in ln and "5228" in ln and "redirect" in ln for ln in pre.splitlines())
-    return ("ok", "GMS 推送", "GMS/FCM 5228-5230 已启用(nft REDIRECT→mihomo 嗅探)") if ok_mh \
-        else ("warn", "GMS 推送", "5228-5230 未在 nft prerouting REDIRECT, 检查防火墙模板是否生效。")
+    # mihomo(唯一内核): 5228-5230 由 nft prerouting REDIRECT 到 redir 端口 + sniffer 处理,
+    # 不在 input accept。判据同样取自共享判定的 kind="gms" 那一档 —— 它在 nftlive 里被归为
+    # **doctor 专项**: 缺了要报, 但不参与 audit.ok, 因而不会挡住手机的基础 HTTP 链路测试
+    # (那次测试只证明"HTTP 请求到没到达网关", 从不声称 Google Play 推送正常)。
+    v = _nft_view()
+    if not v.disk_ok or v.audit is None or "gms" not in v.audit.evaluated:
+        return ("warn", "GMS 推送", "读不到 nft prerouting 链, 无法确认 5228-5230 是否已 REDIRECT。")
+    bad = v.audit.of_kind("gms")
+    if bad:
+        return ("warn", "GMS 推送", "; ".join(bad) + " —— 检查防火墙模板是否生效"
+                "(不影响手机基础链路)。")
+    return ("ok", "GMS 推送", "GMS/FCM 5228-5230 已启用(nft REDIRECT→mihomo 嗅探)")
 
 def _internal_seq_block(conf):
     """截取 mosdns config 里 internal_sequence 一段文本 (到下一个顶层 '  - tag:' 为止)。"""
@@ -635,29 +653,29 @@ def check_mosdns_explicit_proxy():
     产出这种配置, 出现即为真故障)。只读。"""
     conf = _mos()
     if not conf:
-        return ("warn", "明确代理优先级", "读不到 mosdns 配置")
+        return ("warn", "指定域名优先级", "读不到 mosdns 配置")
     blk = _internal_seq_block(conf)
     gi = blk.find("qname $explicit_proxy")
     ci = blk.find("qname $geosite_cn")
     has_set = re.search(r"-\s*tag:\s*explicit_proxy\s*\n\s*type:\s*domain_set", conf)
     has_seq = re.search(r"-\s*tag:\s*explicit_proxy_seq\s*\n\s*type:\s*sequence", conf)
     if not has_set or not has_seq or gi < 0:
-        return ("warn", "明确代理优先级",
+        return ("warn", "指定域名优先级",
                 "这台机器的 /etc/mosdns/config.yaml **未迁移**(缺 explicit_proxy 域名集/序列/判断)"
-                ": bot 里点名指到出口的域名, 一旦被上游 geosite 归进 CN 就会返真实地址、不进 "
+                ": bot 里用户指定要走出口的域名, 一旦被上游 geosite 归进 CN 就会返真实地址、不进 "
                 "mihomo, 内核里那条出口规则不会生效。跑 sudo pdg update 触发迁移; 若因配置是"
                 "自定义形态而被拒绝(不猜着改), 需手动在 internal_sequence 的 geosite_cn 判断"
                 "**之前**加 'qname $explicit_proxy → goto explicit_proxy_seq'。")
     if ci >= 0 and gi > ci:
-        return ("fail", "明确代理优先级",
-                "explicit_proxy 判断排在 geosite_cn **之后** —— 点名指到出口的域名会被判直连, "
+        return ("fail", "指定域名优先级",
+                "explicit_proxy 判断排在 geosite_cn **之后** —— 用户指定要走出口的域名会被判直连, "
                 "内核规则形同虚设。把该判断移到 geosite_cn 之前。")
     missing = [f for f in _EP_FILES if f not in conf]
     if missing:
-        return ("warn", "明确代理优先级",
+        return ("warn", "指定域名优先级",
                 "explicit_proxy 域名集缺文件: " + ", ".join(missing))
-    return ("ok", "明确代理优先级",
-            "点名的出口域名先于 geosite_cn 判断(custom_hijack + ruleset_hijack)")
+    return ("ok", "指定域名优先级",
+            "用户指定的域名规则先于 geosite_cn 判断(custom_hijack + ruleset_hijack)")
 
 
 PROFILE_ENV = "/etc/privdns-gateway/profile.env"
@@ -688,7 +706,7 @@ def check_ruleset_hijack():
         bot = importlib.import_module("bot")
         want, undrivable = bot.ruleset_hijack_text(meta)
     except Exception as e:  # noqa: BLE001
-        return ("warn", "规则集劫持表", "算不出应有内容(%s), 无法核对" % type(e).__name__)
+        return ("warn", "规则集生效状态", "算不出应有内容(%s), 无法核对" % type(e).__name__)
     try:
         with open(f, "rb") as fh:
             have = fh.read()
@@ -697,17 +715,17 @@ def check_ruleset_hijack():
     drivable = len(meta) - len(undrivable)
     if have != want and drivable:
         lvl = "fail" if mode == "gfw" else "warn"
-        return (lvl, "规则集劫持表",
+        return (lvl, "规则集生效状态",
                 "与启用中的规则集不同步(%s 模式): 规则集里的域名在 gfw 模式下不会被劫持到网关, "
                 "那些 RULE-SET 规则不会命中。跑 sudo pdg update 或在 bot 里刷新一次规则集即可重算。"
                 % mode)
     if undrivable:
-        return ("warn", "规则集劫持表",
+        return ("warn", "规则集生效状态",
                 "%d 个规则集读不出域名(文件损坏 / 类型认不出 / 缺 mihomo 二进制): %s。"
                 "gfw 模式下它们的规则不会命中; 重新添加或刷新一次这些规则集试试, "
                 "实在不行把域名手写进 %s。"
                 % (len(undrivable), "、".join(str(x) for x in undrivable[:3]), f))
-    return ("ok", "规则集劫持表", "%d 个规则集的域名已同步(gfw 模式下也能命中)" % drivable)
+    return ("ok", "规则集生效状态", "%d 个规则集的域名已同步(gfw 模式下也能命中)" % drivable)
 
 
 GEOSITE_DIR = "/etc/mosdns/rules"
@@ -770,9 +788,9 @@ def check_nft_extra():
                 "防火墙里没有自定义放行的 include 点(老装尚未迁移)。需要额外放行端口时, "
                 "跑一次 sudo pdg update 补上, 之后把规则写进 %s/*.conf。" % NFT_EXTRA_DIR)
     if not confs:
-        return ("ok", "自定义放行", "include 点就位(%s/*.conf, 目前为空)" % NFT_EXTRA_DIR)
+        return ("ok", "自定义放行", "自定义防火墙规则入口已启用(%s/*.conf, 目前为空)" % NFT_EXTRA_DIR)
     return ("ok", "自定义放行",
-            "include 点就位, 已加载 %d 个自定义规则文件: %s"
+            "自定义防火墙规则入口已启用, 已加载 %d 个自定义规则文件: %s"
             % (len(confs), "、".join(os.path.basename(c) for c in confs[:3])))
 
 
@@ -834,13 +852,16 @@ def check_deep_dot_handshake():
     return ("ok", "DoT 握手(853)", f"TLS 握手成功, CN={cn}")
 
 def check_deep_probe81():
-    if _platform() != "ios":
-        return None                              # :81 探测是 iOS 专属, Android 不显示也不请求
+    """:81 探测端点。两平台都查 —— pdg-probe81 已是公共组件。
+
+    iOS 靠它做 OnDemand 探测(URLStringProbe 只认 200), Android 靠它做链路诊断的
+    HTTP 会话入口。这里请求的是 `/`: 会话路径 `/probe?t=…` 需要 token, 拿它做
+    健康检查会把无效尝试计数打满。"""
     rc, out, _ = _run(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
-                       "--max-time", "5", "http://127.0.0.1:81/probe"])
+                       "--max-time", "5", "http://127.0.0.1:81/"])
     code = out.strip()
-    return ("ok", "iOS 探测(:81)", "返回 200 ✓") if code == "200" \
-        else ("fail", "iOS 探测(:81)", f"返回 {code or '无响应'}(iOS 需要 200)")
+    return ("ok", ":81 探测端点", "返回 200 ✓") if code == "200" \
+        else ("fail", ":81 探测端点", f"返回 {code or '无响应'}(需要 200)")
 
 def check_deep_dns_cn():
     # 本机源(127.0.0.1)不在内网卡段 → 走 remote_upstream; 国内域名应得真实 IP(非本机)
@@ -865,9 +886,9 @@ def check_deep_clash():
             req.add_header("Authorization", "Bearer " + sec)
         with urllib.request.urlopen(req, timeout=5) as r:
             n = len(json.load(r).get("proxies", {}))
-        return ("ok", "clash_api", f"127.0.0.1:9090 可读, {n} 个出站/组")
+        return ("ok", "内核状态接口", f"127.0.0.1:9090 可读, {n} 个出站/组")
     except Exception as e:  # noqa: BLE001
-        return ("warn", "clash_api", f"读不到 127.0.0.1:9090 ({e})")
+        return ("warn", "内核状态接口", f"读不到 127.0.0.1:9090 ({e})")
 
 def check_deep_hijack_note():
     c = _internal_cidr() or "内网卡段"
@@ -980,20 +1001,20 @@ def check_mitm_structure():
         return None
     conf = _mos()
     if not conf:
-        return ("info", "MITM结构", "读不到 mosdns 配置")
+        return ("info", "WLOC DNS 接管", "读不到 mosdns 配置")
     if "tag: internal_sequence" not in conf or "tag: ecs_china" not in conf:
-        return ("info", "MITM结构", "自定义 mosdns 配置, 跳过 force_hijack 检查")
+        return ("info", "WLOC DNS 接管", "自定义 mosdns 配置, 跳过 force_hijack 检查")
     if "tag: force_hijack" not in conf:
-        return ("warn", "MITM结构", "缺 force_hijack 接管结构(v1.4.x 升级迁移未跑到); 开 WLOC 前 sudo pdg __migrate")
+        return ("warn", "WLOC DNS 接管", "缺 force_hijack 接管结构(v1.4.x 升级迁移未跑到); 开 WLOC 前 sudo pdg __migrate")
     blk = _internal_seq_block(conf)
     i_fh, i_cn = blk.find("qname $force_hijack"), blk.find("qname $geosite_cn")
     if i_fh < 0 or (i_cn >= 0 and i_fh > i_cn):
-        return ("warn", "MITM结构", "force_hijack 优先级规则缺失或顺序错(应在 geosite_cn 之前强制接管)")
+        return ("warn", "WLOC DNS 接管", "force_hijack 优先级规则缺失或顺序错(应在 geosite_cn 之前强制接管)")
     if "tag: force_hijack_seq" not in conf:
-        return ("warn", "MITM结构", "缺 force_hijack_seq(接管域名的 AAAA/HTTPS 抑制 + A 劫持序列)")
+        return ("warn", "WLOC DNS 接管", "缺 force_hijack_seq(接管域名的 AAAA/HTTPS 抑制 + A 劫持序列)")
     if not os.path.isfile(MITM_HIJACK_FILE):
-        return ("warn", "MITM结构", "缺 " + MITM_HIJACK_FILE + "(接管域名集文件)")
-    return ("ok", "MITM结构", "force_hijack + force_hijack_seq + 优先级规则 + mitm_hijack.txt 就位")
+        return ("warn", "WLOC DNS 接管", "缺 " + MITM_HIJACK_FILE + "(接管域名集文件)")
+    return ("ok", "WLOC DNS 接管", "force_hijack + force_hijack_seq + 优先级规则 + mitm_hijack.txt 就位")
 
 def check_mitm():
     """MITM 插件(Feature B / iOS): 启用时应 pdg-mitm active + CA + mitm_hijack 含接管域名 +
@@ -1006,7 +1027,7 @@ def check_mitm():
         cfg = {}
     enabled = [k for k in ("wloc",) if (cfg.get(k) or {}).get("enabled")]
     if not enabled:
-        return ("info", "MITM 插件", "未启用")
+        return ("info", "WLOC 服务", "未启用")
     # WLOC 开着就说明这几个组件是必需件: 更新时若某个装失败(旧实现 ||true 会静默跳过),
     # 目标位置留着上一版文件 —— 光看"服务 active"发现不了新旧混装, 这里按文件在不在直接判死。
     need = ["/opt/pdg-bot/mitm_ca.py", "/opt/pdg-bot/mitm_server.py", "/opt/pdg-bot/mitm_wloc.py",
@@ -1016,7 +1037,7 @@ def check_mitm():
             "/opt/pdg-bot/iosprofile.py", "/opt/pdg-bot/iosstate.py"]
     miss = [os.path.basename(p) for p in need if not os.path.isfile(p)]
     if miss:
-        return ("fail", "MITM 插件", "已启用但缺 iOS 组件: " + ", ".join(miss)
+        return ("fail", "WLOC 服务", "已启用但缺 iOS 组件: " + ", ".join(miss)
                 + "; 运行 sudo pdg update 重新部署。")
     # 版本一致性: 仓库在本机可读时, 逐个比对部署文件与仓库文件。装到一半失败会把上一版留在
     # 原地, 只看"文件在不在"发现不了这种新旧混装。仓库不可用则跳过这一层(不误报)。
@@ -1026,7 +1047,7 @@ def check_mitm():
                      ("mitm_wloc.py", "deploy/bot/mitm_wloc.py"),
                      ("iosprofile.py", "deploy/bot/iosprofile.py"),
                      ("iosstate.py", "deploy/bot/iosstate.py"),
-                     ("probe81.py", "deploy/ios/probe81.py"),
+                     ("probe81.py", "deploy/bot/probe81.py"),
                      ("pdg-dot.mobileconfig.tmpl", "deploy/ios/pdg-dot-ondemand.mobileconfig.tmpl")):
         sp = os.path.join(REPO_DIR, src)
         if not os.path.isfile(sp):
@@ -1034,19 +1055,19 @@ def check_mitm():
         if _filesha(os.path.join("/opt/pdg-bot", dst)) != _filesha(sp):
             drift.append(dst)
     if drift:
-        return ("fail", "MITM 插件", "已启用但这些组件与当前发布不一致(疑似新旧混装): "
+        return ("fail", "WLOC 服务", "已启用但这些组件与当前发布不一致(疑似新旧混装): "
                 + ", ".join(drift) + "; 运行 sudo pdg update 重新部署。")
     if _run(["systemctl", "is-active", "pdg-mitm"])[1].strip() != "active":
-        return ("fail", "MITM 插件", "已启用(" + ",".join(enabled) + ")但 pdg-mitm 未运行")
+        return ("fail", "WLOC 服务", "已启用(" + ",".join(enabled) + ")但 pdg-mitm 未运行")
     if not os.path.isfile("/etc/privdns-gateway/ca/ca.crt"):
-        return ("fail", "MITM 插件", "缺 CA 证书 /etc/privdns-gateway/ca/ca.crt")
+        return ("fail", "WLOC 服务", "缺 CA 证书 /etc/privdns-gateway/ca/ca.crt")
     # 接管域名集应含 gs-loc 两域名(mosdns 强制劫持源)
     try:
         hij = open(MITM_HIJACK_FILE).read()
     except OSError:
         hij = ""
     if not all(d in hij for d in GS_LOC):
-        return ("fail", "MITM 插件", "mitm_hijack.txt 未含 gs-loc 接管域名(mosdns 未强制劫持, 重开一次 WLOC)")
+        return ("fail", "WLOC 服务", "mitm_hijack.txt 未含 gs-loc 接管域名(mosdns 未强制劫持, 重开一次 WLOC)")
     # MITM 路由(mihomo): 需 MITM-OUT 出站 + gs-loc → MITM-OUT 规则。
     try:
         mc = json.load(open(MIHOMO_CFG))
@@ -1055,8 +1076,8 @@ def check_mitm():
     except Exception:  # noqa: BLE001
         has_out = has_rule = False
     if not (has_out and has_rule):
-        return ("fail", "MITM 插件", "mihomo 缺 MITM-OUT 出站或 gs-loc 路由(重开一次 WLOC 重渲染内核)")
-    return ("ok", "MITM 插件", "pdg-mitm active + CA + mitm_hijack + mihomo MITM 路由 就位")
+        return ("fail", "WLOC 服务", "mihomo 缺 MITM-OUT 出站或 gs-loc 路由(重开一次 WLOC 重渲染内核)")
+    return ("ok", "WLOC 服务", "pdg-mitm active + CA + mitm_hijack + mihomo MITM 路由 就位")
 
 def check_rulesets():
     """规则集能否进入 mihomo 运行配置。
@@ -1243,7 +1264,7 @@ def check_rule_precedence():
     是自动加的, 用户没写过, 至少得看得见。"""
     scan = rule_precedence_scan()
     if scan["error"]:
-        return ("warn", "分流优先级", scan["error"] + " —— 无法核对用户规则是否被自动规则压过")
+        return ("warn", "分流优先级", scan["error"] + " —— 无法核对用户指定的域名规则是否被系统自动规则抢先匹配")
     wda = scan.get("wda") or {}
     notes = []
     if wda.get("count"):
@@ -1270,12 +1291,12 @@ def check_rule_precedence():
         how = []
         if any(b == "WDA 解锁" for *_x, b in scan["auto"]):
             how.append("WDA 这批: 在 bot 里改一次这几个域名的规则, 或关一次再开 🔓 WDA "
-                       "—— 新版把自动规则排在点名规则之后")
+                       "—— 新版把系统自动规则排在用户指定的域名规则之后")
         if any(b == "MITM 接管" for *_x, b in scan["auto"]):
-            how.append("MITM 接管这批是**故意**排在最前的(WLOC 要先接管 TLS), 不会给点名规则"
+            how.append("MITM 接管这批是**故意**排在最前的(WLOC 要先接管 TLS), 不会给用户指定的域名规则"
                        "让路 —— 要么删掉那条规则, 要么关掉 WLOC")
         return ("warn", "分流优先级",
-                "有 %d 条你点名的域名规则永远轮不到 —— 自动生成的规则排在它前面: %s%s。"
+                "有 %d 条用户指定的域名规则被系统自动规则抢先匹配, 当前无法生效 —— 自动生成的规则排在它前面: %s%s。"
                 "内核自上而下第一条命中即止, 所以配置里两条都在也没用。→ %s。"
                 % (len(scan["auto"]), items, more, "; ".join(how))
                 + ("　[" + "; ".join(notes) + "]" if notes else ""))
@@ -1283,12 +1304,13 @@ def check_rule_precedence():
         items = "; ".join("%s 本该走 %s, 实际走 %s" % (d, want, got)
                           for d, want, got in scan["user"][:5])
         return ("warn", "分流优先级",
-                "有 %d 条域名规则被你自己**更靠前**的另一条规则盖住了(不是自动规则): %s。"
+                "有 %d 条域名规则被你自己**更靠前**的另一条规则抢先匹配, 当前无法生效(不是自动规则): %s。"
                 "删掉其中一条即可。" % (len(scan["user"]), items)
                 + ("　[" + "; ".join(notes) + "]" if notes else ""))
     if notes:
-        return ("ok", "分流优先级", "; ".join(notes) + "; 没有被压过的点名规则")
-    return ("ok", "分流优先级", "没有被自动规则压过的点名域名规则")
+        return ("ok", "分流优先级",
+                "; ".join(notes) + "; 用户指定的域名规则均优先于系统自动规则")
+    return ("ok", "分流优先级", "用户指定的域名规则均优先于系统自动规则")
 
 
 def check_nft_input_chains():
@@ -1299,7 +1321,7 @@ def check_nft_input_chains():
     nftscan.py, 不另写一份。"""
     found, readable = nftscan.scan()
     if found:
-        return ("fail", "input 链冲突",
+        return ("fail", "防火墙链冲突",
                 "; ".join(found) + " —— PDG 的 input chain 是 policy drop, 同一 hook 上每条 "
                 "base chain 都会执行, 上述表里的放行会被架空(端口看着开着实际不通)。"
                 "请把需要的放行并入 table inet pdg 的 input chain, 或把那些链改挂到非 input hook。")
@@ -1309,9 +1331,101 @@ def check_nft_input_chains():
         how = ("请用 <code>sudo pdg doctor</code> 重跑以完整检查"
                if os.geteuid() != 0 else
                "本机 nftables 不可用或未加载(nft list ruleset 失败), 请先确认 nftables 正常")
-        return ("warn", "input 链冲突",
+        return ("warn", "防火墙链冲突",
                 "读不到运行中的 nftables ruleset, 仅据 " + NFT_CONF + " 判断: 未见冲突。" + how)
-    return ("ok", "input 链冲突", "只有 table inet pdg 挂在 hook input 上")
+    return ("ok", "防火墙链冲突", "只有 table inet pdg 挂在 hook input 上")
+
+
+# 救援启用意图的键名。与 lib/rescue.sh 的 RESCUE_INTENT_KEY 同名 —— 那边是唯一事实源,
+# 这里只是引用它的名字, 不另定义一份取值语义。
+RESCUE_INTENT_KEY = "PDG_RESCUE_ENABLED"
+
+
+def _valid_ipv4(v):
+    """点分四段且每段 0-255。只做形态校验 —— 它不是第二份"能不能启用"的判据,
+    只是把"意图说要开、地址却明显不成立"这种情况和"地址没配"区分开。"""
+    parts = (v or "").split(".")
+    if len(parts) != 4:
+        return False
+    for p in parts:
+        if not p.isdigit() or not 0 <= int(p) <= 255 or (len(p) > 1 and p[0] == "0"):
+            return False
+    return True
+
+
+def check_rescue_firewall():
+    """救援平面的防火墙放行 —— 端口是**动态**的, 所以它不在 nftlive 的固定端口集合里。
+
+    为什么必须单独一项, 而不是往 nftlive 的必需端口里加那个救援口:
+      · 救援平面默认**是关的**。写进固定集合会让每台没开救援的机器都被报"缺规则";
+      · 端口取自 lib/rescue.sh 的 PDG_RESCUE_PORT(有默认值), 用户可以改, 把它硬编码进代码
+        会在改过的机器上查错端口, 报一个不存在的故障, 同时放过真正的那个;
+      · 它与 Telegram SOCKS5 那个口是两码事 —— 早先混过一次, 这里不再混。
+
+    **启用与否只看 PDG_RESCUE_ENABLED, 不从 bind 推。** `pdg rescue disable` 只撤放行 + 把
+    意图写成 0, 它**不清 PDG_RESCUE_BIND** —— 监听地址是配置, 留着下次好直接开。拿"有没有
+    bind"当"启没启用"用, 一台停用过的机器会被判成"已启用却没放行", doctor fail, 而
+    `pdg update` 的更新后自检门据此**整次回滚**: 机器完全正常, 用户却更新不了。
+
+    停用之后也不是什么都不看: 意图是 0 却仍有带 pdg-rescue 标记的放行, 说明端口还开着 ——
+    那是暴露面, 必须报出来, 不能因为"反正已经停用了"就放过。
+    """
+    try:
+        import rescue_const
+        import rescue_nft
+    except Exception:  # noqa: BLE001
+        return None                      # 老机器还没有救援平面: 不显示这一项
+    try:
+        intent = rescue_const.profile_value(RESCUE_INTENT_KEY)
+        bind = rescue_const.rescue_bind()
+        port = rescue_const.port()
+    except Exception:  # noqa: BLE001
+        # 常量源(lib/rescue.sh / profile.env)读不到 —— 这时连"用没用这个功能"都判断不了。
+        # 不显示这一项: 报一条"读不到常量"的警告只会在没装救援平面的机器上平白刷屏。
+        return None
+    try:
+        with open(NFT_CONF, encoding="utf-8") as f:
+            txt = f.read()
+    except OSError:
+        if intent == "1":
+            return ("warn", "救援平面放行",
+                    "读不到 %s, 无法确认救援放行是否就位" % NFT_CONF)
+        return None
+    # 带 pdg-rescue 标记的放行有几条 —— 停用/未部署时用它发现残留, 不看端口对不对
+    leftover = rescue_nft.count_rules(txt)
+
+    if intent is None:
+        # 从未部署: 首次启用归 migrate_rescue_plane 管, 这里不猜、不显示。
+        # 但**有残留规则**是另一回事: 没有任何启用记录, 端口却开着, 必须如实说。
+        if leftover:
+            return ("fail", "救援平面放行",
+                    "没有启用记录(profile.env 里没有 %s), 防火墙里却有 %d 条救援放行 —— "
+                    "端口开着而没人管它。跑 <code>sudo pdg rescue status</code> 查清来历。"
+                    % (RESCUE_INTENT_KEY, leftover))
+        return None
+    if intent == "0":
+        if leftover:
+            return ("fail", "救援平面放行",
+                    "救援平面已停用, 但防火墙里仍有 %d 条救援放行 —— 端口还开着, 属暴露面。"
+                    "跑一次 <code>sudo pdg rescue disable</code> 把它撤干净。" % leftover)
+        return None                      # disable 之后的正常样子: 不显示
+    if intent != "1":
+        return ("fail", "救援平面放行",
+                "%s 的取值损坏(实得 %r, 只接受 0 或 1)—— 无法判断救援平面该开还是该关, "
+                "拒绝猜。请用 <code>sudo pdg rescue enable</code> 或 "
+                "<code>disable</code> 重新写入。" % (RESCUE_INTENT_KEY, intent))
+    # ── 以下是 intent == "1" ────────────────────────────────────────────────
+    if not bind or not _valid_ipv4(bind):
+        return ("fail", "救援平面放行",
+                "救援平面意图为启用, 但监听地址%s —— 开不起来。"
+                "跑 <code>sudo pdg rescue bind &lt;IPv4&gt;</code> 设置。"
+                % ("不合法(%r)" % bind if bind else "没有配置"))
+    if rescue_nft.has_rescue_rule(txt, port, bind):
+        return ("ok", "救援平面放行", "救援平面已启用, 防火墙放行就位(%s:%d)" % (bind, port))
+    return ("fail", "救援平面放行",
+            "救援平面已启用(绑 %s), 但 %s 里没有 tcp dport %d 的放行 —— 救援页面打不开。"
+            "跑 <code>sudo pdg rescue status</code> 复查, 或重开一次 pdg rescue enable。"
+            % (bind, NFT_CONF, port))
 
 
 def check_transactions():
@@ -1362,7 +1476,7 @@ def check_transactions():
 ALL = [check_platform, check_services, check_bot_credentials, check_health_timer, check_core_version, check_dot_arecord, check_dot_domain_sync,
        check_internal_cidr, check_cidr_drift, check_nft, check_nft_input_chains, check_redirect, check_gms,
        check_mosdns_ratelimit, check_mosdns_explicit_proxy, check_ruleset_hijack,
-       check_nft_extra, check_geosite_db, check_mem,
+       check_nft_extra, check_rescue_firewall, check_geosite_db, check_mem,
        check_cert, check_dns, check_core_config, check_rulesets, check_rule_precedence,
        check_mitm_structure, check_mitm, check_transactions]
 ALERT = [check_services, check_dns, check_cert]  # healthcheck 用的轻量子集(运行期故障)
@@ -1370,4 +1484,8 @@ DEEP = [check_deep_dot_handshake, check_deep_probe81, check_deep_dns_cn,
         check_deep_clash, check_deep_upstreams, check_deep_hijack_note]  # pdg doctor --deep 追加
 
 def run(funcs=None):
+    # 每轮开头清掉防火墙判定缓存: 缓存的作用是"这一轮里三个检查项共用同一次 nft 查询",
+    # 不是"这台机器的防火墙状态一辈子不变"。Bot 是长驻进程, 不清等于第二次 doctor 拿的是
+    # 上一次的旧结论。
+    _nft_view_reset()
     return [r for f in (funcs or ALL) if (r := f()) is not None]   # 平台不相关的 check 返回 None → 跳过不显示

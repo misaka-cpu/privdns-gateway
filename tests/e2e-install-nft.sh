@@ -45,10 +45,9 @@ fi
 #   · 文件里 flush 生效  → 整份 ruleset 被替换(文件外的表就此消失);
 #   · 没有(或被注释掉)  → 按表合并(文件里声明的表被替换, 其余原样留着)。
 # 桩要是一律 `cat FILE > STATE`, "Docker 的表有没有活下来"这个断言就永远成立, 等于没验。
-NFT_STATE=/tmp/e2e-nft-ruleset
-cat > /usr/local/bin/nft <<'S'
-#!/bin/sh
-STATE=/tmp/e2e-nft-ruleset
+NFT_STATE=$E2E_TMP/e2e-nft-ruleset
+{ printf '#!/bin/sh\nSTATE=%s\n' "$NFT_STATE"    # 引号 heredoc 不展开, 路径从生成的头行注入
+  cat <<'S'
 case "$1" in
   -c) exit 0 ;;
   -j) exit 1 ;;                 # 桩不实现 JSON → 合并侧走文本兜底(老 nft 也这样)
@@ -115,6 +114,7 @@ PY
 esac
 exit 0
 S
+} > /usr/local/bin/nft
 chmod 755 /usr/local/bin/nft
 
 run_install(){   # $1=额外 env
@@ -129,7 +129,7 @@ reset_box(){
   rm -rf /etc/mosdns /etc/sing-box /etc/mihomo /etc/privdns-gateway /opt/pdg-bot \
          /usr/local/bin/pdg /usr/local/bin/pdg-set-token /etc/systemd/system/pdg-*.service \
          /etc/systemd/system/mosdns.service /etc/nftables.conf.pdg-orig
-  rm -rf /tmp/e2e-svc; mkdir -p /tmp/e2e-svc
+  rm -rf $E2E_TMP/e2e-svc; mkdir -p $E2E_TMP/e2e-svc
 }
 
 # ══ 1. 只有 NAT / forward / VPN 表(不挂 input hook)→ 逐字节保留并安全合并 ═══
@@ -223,18 +223,24 @@ echo; echo "── 4. 扫描器退出码 ──"
 
 REAL_PY="$(readlink -f "$(command -v python3)")"
 cp -f "$REAL_PY" /usr/local/bin/py3-real 2>/dev/null || cp "$REAL_PY" /usr/local/bin/py3-real
-: > /tmp/notexec; chmod 644 /tmp/notexec
+: > $E2E_TMP/notexec; chmod 644 $E2E_TMP/notexec
 
 put_py_stub(){   # 写一个 python3 桩(先删: 上一步可能留下指向真解释器的符号链接, 直接写会写穿)
   rm -f /usr/local/bin/python3
   cat > /usr/local/bin/python3
+  # 归属标记插在 shebang 之后 —— 桩内容由调用方从 stdin 给, 所以只能事后插。
+  # 没有这行, 异常退出留下的桩在下一支进场时会被当成"用户的真 python3"而拒绝删除。
+  sed -i "1a $E2E_STUB_MARK" /usr/local/bin/python3
   chmod 755 /usr/local/bin/python3
 }
+# restore_py 只挂在两条正常路径上; 异常退出走这里(留下的是符号链接, 也要撤)。
+_nft_drop_py_stub(){ e2e_purge_shadow_stub python3 py3-real || true; }
+e2e_add_exit_hook _nft_drop_py_stub
 restore_py(){ rm -f /usr/local/bin/python3; ln -sf /usr/local/bin/py3-real /usr/local/bin/python3; }
 # 真实模拟"机器上没有 python3": 造一个 PATH 目录, 把系统各 bin 目录里的命令**除 python3**
 # 全部软链进来, 然后只用它当 PATH。比 bind mount 可靠(bind 到符号链接上 `command -v` 仍能
 # 找到), 也比"放个 exit 127 的桩"忠实 —— 后者是"python3 存在但坏了", 不是"没装"。
-NOPY_BIN=/tmp/nopy-bin
+NOPY_BIN=$E2E_TMP/nopy-bin
 build_nopy_path(){
   rm -rf "$NOPY_BIN"; mkdir -p "$NOPY_BIN"
   local d f b
@@ -261,7 +267,7 @@ run_install_nopy(){   # 用"没有 python3"的 PATH 跑装机
 # nft 桩以前是"整份替换", 上一节装成功就顺带把内核状态洗干净了, 于是这个耦合看不出来;
 # 桩改成按 flush 语义合并之后(没有 flush 就保留文件外的表), 上一节的表会活到下一节,
 # 把"干净现场"污染成"有冲突现场"。清空它, 各节才真的互不影响。
-reset_all(){ reset_box; rm -rf /opt/privdns-gateway; : > "${NFT_STATE:-/tmp/e2e-nft-ruleset}"; }
+reset_all(){ reset_box; rm -rf /opt/privdns-gateway; : > "${NFT_STATE:-$E2E_TMP/e2e-nft-ruleset}"; }
 
 # 化解不了的冲突现场。带一条 `drop` —— 那种规则不能被自动搬进本项目的链(搬过去等于给用户
 # 加限制, 是改变行为), 所以装机只能中止。纯 accept 的现场现在会被自动搬走并照常装上(场景 7),
@@ -304,15 +310,16 @@ reset_all; seed_conflict
 CONF_SHA="$(sha256sum /etc/nftables.conf | cut -d' ' -f1)"
 RULESET_SHA="$(sha256sum "$NFT_STATE" | cut -d' ' -f1)"
 # apt 桩: 被要求装 python3 时把真解释器放进那个 PATH 目录(等价于 apt 真的装好了)
-cat > /usr/local/bin/apt-get <<'S'
-#!/bin/sh
+{ printf '#!/bin/sh\nNOPY=%s\n' "$NOPY_BIN"       # 引号 heredoc 不展开, 路径从生成的头行注入
+  cat <<'S'
 for a in "$@"; do
   case "$a" in
-    python3|python3-minimal) ln -sf /usr/local/bin/py3-real /tmp/nopy-bin/python3 ;;
+    python3|python3-minimal) ln -sf /usr/local/bin/py3-real "$NOPY/python3" ;;
   esac
 done
 exit 0
 S
+} > /usr/local/bin/apt-get
 chmod 755 /usr/local/bin/apt-get
 ln -sf /usr/local/bin/apt-get "$NOPY_BIN/apt-get" 2>/dev/null || true
 if build_nopy_path; then
@@ -433,16 +440,16 @@ mv /usr/local/bin/nft-real /usr/local/bin/nft; rm -f /usr/local/sbin/nft
 
 # ── 4e. 扫描器文件缺失 → 同样中止(不是"没检查出问题") ──
 reset_all; seed_clean
-rm -rf /tmp/repo-noscan && cp -a "$E2E_ROOT" /tmp/repo-noscan
-rm -f /tmp/repo-noscan/deploy/bot/nftscan.py
+rm -rf $E2E_TMP/repo-noscan && cp -a "$E2E_ROOT" $E2E_TMP/repo-noscan
+rm -f $E2E_TMP/repo-noscan/deploy/bot/nftscan.py
 out=$(env PDG_NONINTERACTIVE=1 PDG_SKIP_CERT=1 PDG_TAG_BOOTSTRAPPED=1 \
       PDG_SERVER_IP=203.0.113.1 PDG_SSH_PORT=22 PDG_INTERNAL_CIDR=127.0.0.0/8 \
       PDG_DOT_DOMAIN=dot.e2e.test PDG_BOT_TOKEN=123456:AAaa PDG_ALLOWED=1 PDG_PLATFORM=android \
-      bash /tmp/repo-noscan/install.sh 2>&1); rc=$?
+      bash $E2E_TMP/repo-noscan/install.sh 2>&1); rc=$?
 { [[ "$rc" != 0 ]] && grep -q '缺少防火墙冲突扫描器' <<<"$out"; } \
   && ok "扫描器文件缺失 → 中止并说明仓库不完整" || bad "4e: rc=$rc: $(tail -3 <<<"$out")"
-rm -rf /tmp/repo-noscan
-rm -f /usr/local/bin/py3-real /tmp/notexec; rm -rf "$NOPY_BIN"
+rm -rf $E2E_TMP/repo-noscan
+rm -f /usr/local/bin/py3-real $E2E_TMP/notexec; rm -rf "$NOPY_BIN"
 
 
 # ══ 5. 全新 Debian 13: 文件是发行版自带的, 内核里还有 iptables-nft 建出来的空表 ═══
@@ -735,24 +742,24 @@ grep -qF 'include "/etc/privdns-gateway/nft-input.d/*.conf"' /etc/nftables.conf 
   && ok "6 重建之后 include 点也还在" || bad "6 重建把 include 点弄丢了"
 
 # doctor 要认这件事
-python3 /opt/pdg-bot/doctor.py --json > /tmp/doc-nft.json 2>/dev/null
-python3 - <<'PY' && ok "6 doctor: 自定义放行判 ok 并报出文件数" || bad "6 doctor 判定不对: $(head -c 200 /tmp/doc-nft.json)"
-import json, sys
-d = json.load(open("/tmp/doc-nft.json"))
+python3 /opt/pdg-bot/doctor.py --json > $E2E_TMP/doc-nft.json 2>/dev/null
+python3 - <<'PY' && ok "6 doctor: 自定义放行判 ok 并报出文件数" || bad "6 doctor 判定不对: $(head -c 200 $E2E_TMP/doc-nft.json)"
+import json, os, sys
+d = json.load(open(os.environ["E2E_TMP"] + "/doc-nft.json"))
 hit = [x for x in d if x.get("check") == "自定义放行"]
 sys.exit(0 if hit and hit[0]["level"] == "ok" and "10-mine.conf" in hit[0]["detail"] else 1)
 PY
 
 # 最坏的一种: 目录里有规则, 配置里却没 include —— 用户以为生效了, 其实一条没进内核
 sed -i '/nft-input\.d/d' /etc/nftables.conf
-python3 /opt/pdg-bot/doctor.py --json > /tmp/doc-nft2.json 2>/dev/null
+python3 /opt/pdg-bot/doctor.py --json > $E2E_TMP/doc-nft2.json 2>/dev/null
 python3 - <<'PY' && ok "6 有规则但没 include → doctor 判 fail(这种最容易被忽略)" || bad "6 doctor 没抓到"
-import json, sys
-d = json.load(open("/tmp/doc-nft2.json"))
+import json, os, sys
+d = json.load(open(os.environ["E2E_TMP"] + "/doc-nft2.json"))
 hit = [x for x in d if x.get("check") == "自定义放行"]
 sys.exit(0 if hit and hit[0]["level"] == "fail" else 1)
 PY
-rm -f /etc/privdns-gateway/nft-input.d/10-mine.conf /tmp/doc-nft.json /tmp/doc-nft2.json
+rm -f /etc/privdns-gateway/nft-input.d/10-mine.conf $E2E_TMP/doc-nft.json $E2E_TMP/doc-nft2.json
 
 
 # ══ 7. 自动搬运: 用户 input 链里的放行, 装机自己搬进 nft-input.d ══════════════

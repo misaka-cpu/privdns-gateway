@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -41,7 +42,7 @@ def bad(m):
     FAIL[0] += 1
 
 
-work = tempfile.mkdtemp(prefix="rescue-recover.")
+work = tmpguard.mkdtemp(prefix="rescue-recover.")
 
 # ── 造一笔停在 APPLYING 的事务 ──────────────────────────────────────────────
 # 候选必须是**合法的 mosdns 配置** —— 校验器会拿真 mosdns 解析它, 塞一段随便的文本只会在

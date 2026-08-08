@@ -30,6 +30,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -53,7 +54,7 @@ def bad(m):
 
 
 def mkca(name):
-    d = tempfile.mkdtemp(prefix="iostrust-ca-")
+    d = tmpguard.mkdtemp(prefix="iostrust-ca-")
     TMPS.append(d)
     subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
                     "-keyout", d + "/ca.key", "-out", d + "/ca.crt", "-days", "1",
@@ -65,7 +66,7 @@ def mkca(name):
 def der_private_key(kind):
     """一把**真的**私钥, 转成 DER。装进 PayloadContent 之后是 base64, 文件里连
     "PRIVATE KEY" 这几个字都不会出现 —— 靠扫字面量的那道门看不见它。"""
-    d = tempfile.mkdtemp(prefix="iostrust-key-")
+    d = tmpguard.mkdtemp(prefix="iostrust-key-")
     TMPS.append(d)
     if kind == "ec":
         subprocess.run(["openssl", "ecparam", "-name", "prime256v1", "-genkey",
@@ -92,7 +93,7 @@ class Box:
     """一个沙箱 root: 生命周期、事务、锁全在里面, 碰不到真机。"""
 
     def __init__(self):
-        self.root = tempfile.mkdtemp(prefix="iostrust-")
+        self.root = tmpguard.mkdtemp(prefix="iostrust-")
         TMPS.append(self.root)
         for d in ("etc/privdns-gateway", "etc/sing-box", "etc/mosdns", "run",
                   "var/lib/privdns-gateway"):

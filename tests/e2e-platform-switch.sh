@@ -39,13 +39,12 @@ for u in pdg-bot mosdns; do
   printf '[Unit]\nDescription=%s\n[Service]\nExecStart=/usr/local/bin/%s\n' "$u" "$u" \
     > "/etc/systemd/system/$u.service"
 done
-for u in pdg-bot mosdns mihomo; do echo 1 > "/tmp/e2e-svc/$u.ac"; echo 1 > "/tmp/e2e-svc/$u.en"; done
+for u in pdg-bot mosdns mihomo; do echo 1 > "$E2E_TMP/e2e-svc/$u.ac"; echo 1 > "$E2E_TMP/e2e-svc/$u.en"; done
 e2e_fetch_mihomo || e2e_skip "取不到 mihomo 二进制"
 
 # nft 桩: 维护一份"已加载 ruleset", 好验证运行规则真的跟着变
-cat > /usr/local/bin/nft <<'S'
-#!/bin/sh
-STATE=/tmp/e2e-nft-ruleset
+{ printf '#!/bin/sh\nSTATE=%s\n' "$E2E_TMP/e2e-nft-ruleset"   # 引号 heredoc 不展开, 路径走头行
+  cat <<'S'
 case "$1" in
   -c) exit 0 ;;
   -f) [ -f "$2" ] && cat "$2" > "$STATE"; exit 0 ;;
@@ -54,11 +53,12 @@ case "$1" in
 esac
 exit 0
 S
+} > /usr/local/bin/nft
 chmod 755 /usr/local/bin/nft
 nft -f /etc/nftables.conf
 
 gms_in_nft(){ grep -qE 'tcp dport [{][^}]*5228' /etc/nftables.conf; }
-gms_in_ruleset(){ grep -qE 'tcp dport [{][^}]*5228' /tmp/e2e-nft-ruleset 2>/dev/null; }
+gms_in_ruleset(){ grep -qE 'tcp dport [{][^}]*5228' $E2E_TMP/e2e-nft-ruleset 2>/dev/null; }
 mitm_out_in_core(){ grep -q 'MITM-OUT' /etc/mihomo/config.yaml 2>/dev/null; }
 
 # ══ 1. Android → iOS: 组件必须真部署 ═══════════════════════════════════════
@@ -80,7 +80,7 @@ gms_in_nft && bad "1g: iOS 的防火墙里仍有 GMS 5228-5230" || ok "iOS: 防�
 
 # ══ 2. WLOC 开启后切回 Android: 安全休眠 + 运行时接管彻底撤掉 ═════════════
 echo; echo "── 2. WLOC 开启状态下切回 Android ──"
-python3 - > /tmp/plat-wloc-on.out 2>&1 <<'PY'
+python3 - > $E2E_TMP/plat-wloc-on.out 2>&1 <<'PY'
 import sys; sys.path.insert(0, "/opt/pdg-bot")
 import bot
 w = {"enabled": True, "accuracy": 50, "active": "大阪", "generation": 1,
@@ -88,7 +88,7 @@ w = {"enabled": True, "accuracy": 50, "active": "大阪", "generation": 1,
 okr, msg = bot._mitm_transact(w)
 print(("OK|" if okr else "FAIL|") + (msg or ""))
 PY
-grep -q '^OK|' /tmp/plat-wloc-on.out && ok "先把 WLOC 开起来(真实事务)" || bad "2: 开 WLOC 失败: $(cat /tmp/plat-wloc-on.out)"
+grep -q '^OK|' $E2E_TMP/plat-wloc-on.out && ok "先把 WLOC 开起来(真实事务)" || bad "2: 开 WLOC 失败: $(cat $E2E_TMP/plat-wloc-on.out)"
 mitm_out_in_core && ok "开启后 mihomo 配置里有 MITM-OUT(切换前的现场)" || bad "2b: MITM-OUT 没进内核配置"
 
 out=$(pdg platform android 2>&1); rc=$?
@@ -112,12 +112,17 @@ mitm_out_in_core && bad "2h: mihomo 配置里仍残留 MITM-OUT" || ok "mihomo �
 echo; echo "── 3. Android 的 GMS 端口 ──"
 gms_in_nft && ok "Android: 防火墙配置里有 GMS 5228-5230" || bad "3: GMS 没恢复: $(grep -n 'dport' /etc/nftables.conf | head -3)"
 gms_in_ruleset && ok "Android: 运行中的 ruleset 也有 GMS(真的应用了)" || bad "3b: 运行规则里没有 GMS"
-for f in /etc/systemd/system/pdg-probe81.service /opt/pdg-bot/probe81.py \
-         /opt/pdg-bot/pdg-dot.mobileconfig.tmpl /opt/pdg-bot/mitm_server.py; do
-  [[ -e "$f" ]] && bad "3c: Android 上仍残留 $f" || ok "已移除 $(basename "$f")"
+# 6.1B: probe81 已是 Android/iOS 公共件 —— 切到 Android **不许**把它清掉, 否则
+# Android 少一个必需服务, 来回切平台也不幂等。只有真正 iOS 专属的才该被清。
+for f in /opt/pdg-bot/pdg-dot.mobileconfig.tmpl /opt/pdg-bot/mitm_server.py; do
+  [[ -e "$f" ]] && bad "3c: Android 上仍残留 iOS 专属件 $f" || ok "已移除 $(basename "$f")"
 done
-[[ "$(systemctl is-active pdg-probe81)" != active ]] \
-  && ok "pdg-probe81 已停用" || bad "3d: probe81 还在跑"
+for f in /etc/systemd/system/pdg-probe81.service /opt/pdg-bot/probe81.py; do
+  [[ -e "$f" ]] && ok "公共件 $(basename "$f") 仍在(切平台不该动它)" \
+    || bad "3c: 公共件 $f 被平台切换删掉了"
+done
+[[ "$(systemctl is-active pdg-probe81)" == active ]] \
+  && ok "pdg-probe81 在 Android 上照常运行" || bad "3d: 公共件 probe81 被停了"
 
 # ══ 4. 二次执行幂等 ════════════════════════════════════════════════════════
 echo; echo "── 4. 二跑幂等 ──"
@@ -149,15 +154,17 @@ grep -q '^PDG_PLATFORM=android$' /etc/privdns-gateway/profile.env \
   && ok "失败后防火墙配置逐字节未变" || bad "5d: 防火墙被改了"
 grep -q '已恢复到原平台' <<<"$out" && ok "回滚有明确提示" || bad "5e: 没有回滚提示: $(tail -3 <<<"$out")"
 # 平台专属文件必须一并回去 —— 否则平台标记明明回到 android, 盘上却留着半个 iOS 现场
-for f in /opt/pdg-bot/probe81.py /opt/pdg-bot/pdg-dot.mobileconfig.tmpl \
+for f in /opt/pdg-bot/pdg-dot.mobileconfig.tmpl \
          /opt/pdg-bot/mitm_ca.py /opt/pdg-bot/mitm_server.py /opt/pdg-bot/mitm_wloc.py \
-         /etc/systemd/system/pdg-probe81.service /etc/systemd/system/pdg-mitm.service; do
+         /etc/systemd/system/pdg-mitm.service; do
   [[ -e "$f" ]] && bad "5f: 回滚后仍残留 $f(半个 iOS 现场)" || ok "回滚已清除 $(basename "$f")"
 done
-[[ "$(systemctl is-active pdg-probe81)" != active ]] \
-  && ok "回滚后 pdg-probe81 未在运行" || bad "5g: probe81 还在跑"
-[[ "$(systemctl is-enabled pdg-probe81 2>/dev/null)" != enabled ]] \
-  && ok "回滚后 pdg-probe81 未标记开机启动(不留 unit 已删却仍 enabled 的现场)" || bad "5h: 仍 enabled"
+# 公共件不参与平台回滚: 它在 android 上本来就该有, 回滚把它删掉才是错的。
+for f in /opt/pdg-bot/probe81.py /etc/systemd/system/pdg-probe81.service; do
+  [[ -e "$f" ]] && ok "回滚保留了公共件 $(basename "$f")" || bad "5f: 回滚把公共件 $f 删了"
+done
+[[ "$(systemctl is-active pdg-probe81)" == active ]] \
+  && ok "回滚后 pdg-probe81 仍在运行(公共件)" || bad "5g: 公共件 probe81 被停了"
 [[ "$(systemctl is-active pdg-mitm)" != active ]] \
   && ok "回滚后 pdg-mitm 未在运行" || bad "5i: pdg-mitm 还在跑"
 
@@ -165,8 +172,8 @@ done
 echo; echo "── 6. iOS→Android 失败: 组件要恢复 ──"
 out=$(pdg platform ios 2>&1); rc=$?
 [[ "$rc" == 0 ]] && ok "先正常切到 iOS(准备现场)" || bad "6: 切 iOS 失败: $(tail -4 <<<"$out")"
-IOS_SHA="$(sha256sum /opt/pdg-bot/probe81.py /opt/pdg-bot/mitm_server.py \
-                     /etc/systemd/system/pdg-probe81.service | sha256sum)"
+IOS_SHA="$(sha256sum /opt/pdg-bot/mitm_server.py \
+                     /etc/systemd/system/pdg-mitm.service | sha256sum)"
 cp /usr/local/bin/nft /usr/local/bin/nft.real
 cat > /usr/local/bin/nft <<'S'
 #!/bin/sh
@@ -179,8 +186,8 @@ cp -f /usr/local/bin/nft.real /usr/local/bin/nft
 [[ "$rc" != 0 ]] && ok "切 Android 失败 → 返回非 0" || bad "6b: 竟然成功了"
 [[ "$(cat /etc/privdns-gateway/platform)" == ios ]] \
   && ok "失败后平台标记回到 ios" || bad "6c: 平台标记停在 $(cat /etc/privdns-gateway/platform)"
-[[ "$(sha256sum /opt/pdg-bot/probe81.py /opt/pdg-bot/mitm_server.py \
-                /etc/systemd/system/pdg-probe81.service | sha256sum)" == "$IOS_SHA" ]] \
+[[ "$(sha256sum /opt/pdg-bot/mitm_server.py \
+                /etc/systemd/system/pdg-mitm.service | sha256sum)" == "$IOS_SHA" ]] \
   && ok "被清理的 iOS 组件已逐字节放回" || bad "6d: iOS 组件没恢复"
 [[ "$(systemctl is-active pdg-probe81)" == active ]] \
   && ok "回滚后 pdg-probe81 恢复运行" || bad "6e: probe81 没起回来"
@@ -217,7 +224,7 @@ out=$(pdg platform ios 2>&1); rc=$?
   && ok "凭据只配一半 → 明确报配置错误并回滚" || bad "7i: rc=$rc: $(tail -3 <<<"$out")"
 e2e_svc_heal pdg-bot
 printf 'PDG_BOT_TOKEN=123456:AAaa\nPDG_BOT_ALLOWED=1\n' > /etc/privdns-gateway/bot.env
-echo 1 > /tmp/e2e-svc/pdg-bot.ac; echo 1 > /tmp/e2e-svc/pdg-bot.en
+echo 1 > $E2E_TMP/e2e-svc/pdg-bot.ac; echo 1 > $E2E_TMP/e2e-svc/pdg-bot.en
 pdg platform android >/dev/null 2>&1
 
 # ══ 8. iOS 组件部署失败必须整体失败并回滚 ══════════════════════════════════
@@ -240,9 +247,11 @@ snapshot_state(){
   } | sha256sum | cut -d' ' -f1
 }
 # 注入: 让指定源文件"装不上"(改成不可读, install 必失败)。真实失败, 不是打桩返回值。
+# 只注入**平台专属**件: probe81.py / pdg-probe81.service 自 6.1B 起是公共件, 不归
+# 平台切换管(它们装失败要在 install 与 `pdg update` 里拦, 见 test-update-faults 的
+# 公共件注入那一组)。放在这里注入只会测出「平台切换不管公共件」这个既定设计。
 for target in deploy/bot/mitm_server.py deploy/bot/mitm_ca.py deploy/bot/mitm_wloc.py \
-              deploy/ios/probe81.py deploy/ios/pdg-dot-ondemand.mobileconfig.tmpl \
-              deploy/ios/pdg-probe81.service; do
+              deploy/ios/pdg-dot-ondemand.mobileconfig.tmpl; do
   BEFORE="$(snapshot_state)"
   mv "/opt/privdns-gateway/$target" "/opt/privdns-gateway/$target.hidden"
   out=$(pdg platform ios 2>&1); rc=$?
@@ -266,5 +275,5 @@ done
 ok "成功路径七个必需文件全部就位"
 pdg platform android >/dev/null 2>&1
 
-rm -f /usr/local/bin/nft.real /tmp/e2e-nft-ruleset
+rm -f /usr/local/bin/nft.real $E2E_TMP/e2e-nft-ruleset
 e2e_summary

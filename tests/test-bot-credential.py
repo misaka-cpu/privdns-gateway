@@ -16,6 +16,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("pdg_bot", ROOT / "deploy/bot/pdg-bot.py")
@@ -177,7 +178,7 @@ print("[OK]   任务异常后 BUSY 释放")
 # 5.1 起 apply_sb 走统一事务: 校验在**候选**上做, 没过就根本不碰现网 —— 比旧的"写了再还原"
 # 更强。这里仍然断言两件事: 返回失败 + 现网 model 逐字节没变, 且异常正文不外泄。
 import json as _json
-_sbroot = tempfile.mkdtemp()
+_sbroot = tmpguard.mkdtemp()
 for _d in ("/etc/sing-box", "/etc/mihomo", "/run", "/var/lib/privdns-gateway"):
     os.makedirs(_sbroot + _d, exist_ok=True)
 os.environ["PDG_TX_FSROOT"] = _sbroot
@@ -224,7 +225,7 @@ bot.apply_sb = _REAL_APPLY_SB
 tmp = tempfile.NamedTemporaryFile(delete=False); tmp.close()
 bot.LOCKFILE = tmp.name
 # 事务核心用的是同一把锁: 沙箱根重建 + 锁指到同一个文件, 才能验"别人持锁 → BUSY"
-_lkroot = tempfile.mkdtemp()
+_lkroot = tmpguard.mkdtemp()
 for _d in ("/etc/sing-box", "/etc/mihomo", "/run", "/var/lib/privdns-gateway"):
     os.makedirs(_lkroot + _d, exist_ok=True)
 os.environ["PDG_TX_FSROOT"] = _lkroot

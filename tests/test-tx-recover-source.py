@@ -26,6 +26,7 @@ import sys
 import tempfile
 import threading
 import time
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -73,7 +74,7 @@ tx.Tx._do_actions = boom
 t.commit()
 '''
 
-work = tempfile.mkdtemp(prefix="trigger-src.")
+work = tmpguard.mkdtemp(prefix="trigger-src.")
 
 
 def make_stuck(box, src="bot"):

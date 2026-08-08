@@ -70,26 +70,26 @@ git(){
 #
 # FAIL_TARGET=<basename>  命中该目标名时失败
 # FAIL_NTH=<n>            第 n 个落在受管目录下的目标失败(1 起)
-# 命中与否写进 /tmp/e2e-inject-hit, 由 assert_fail_rollback 复核 —— 没命中就判测试自己失败。
+# 命中与否写进 $WORK/e2e-inject-hit, 由 assert_fail_rollback 复核 —— 没命中就判测试自己失败。
 PDG_MANAGED_DIR=/opt/pdg-bot
-: > /tmp/e2e-inject-hit
+: > "$WORK"/e2e-inject-hit
 install(){
   local last="${*: -1}" base n
   base="$(basename -- "$last")"
   case "$last" in
     "$PDG_MANAGED_DIR"/*|"$PDG_MANAGED_DIR")
-      n=$(( $(wc -l < /tmp/e2e-inject-count 2>/dev/null || echo 0) + 1 ))
-      echo "$n $base" >> /tmp/e2e-inject-count
+      n=$(( $(wc -l < "$WORK"/e2e-inject-count 2>/dev/null || echo 0) + 1 ))
+      echo "$n $base" >> "$WORK"/e2e-inject-count
       if [[ -n "${FAIL_TARGET:-}" && "$base" == "${FAIL_TARGET}" ]]; then
-        echo "hit target=$base" >> /tmp/e2e-inject-hit; return 1
+        echo "hit target=$base" >> "$WORK"/e2e-inject-hit; return 1
       fi
       if [[ -n "${FAIL_NTH:-}" && "$n" == "${FAIL_NTH}" ]]; then
-        echo "hit nth=$n base=$base" >> /tmp/e2e-inject-hit; return 1
+        echo "hit nth=$n base=$base" >> "$WORK"/e2e-inject-hit; return 1
       fi;;
   esac
   # 兼容既有用例仍在用的整路径子串形态(/usr/local/bin/pdg 之类的非受管目标)
   if [[ -n "${FAIL_INSTALL:-}" && "$*" == *"${FAIL_INSTALL}"* ]]; then
-    echo "hit substr=${FAIL_INSTALL}" >> /tmp/e2e-inject-hit; return 1
+    echo "hit substr=${FAIL_INSTALL}" >> "$WORK"/e2e-inject-hit; return 1
   fi
   return 0
 }
@@ -138,12 +138,12 @@ assert_success(){ # 正常路径: rc0 + 有"✅ 已更新" + 无 ROLLBACK
 }
 assert_fail_rollback(){ # 故障路径: rc非0 + 有 ROLLBACK + 无"✅ 已更新"
   local desc="$1" env="$2" r
-  : > /tmp/e2e-inject-hit; : > /tmp/e2e-inject-count
+  : > "$WORK"/e2e-inject-hit; : > "$WORK"/e2e-inject-count
   r=$(run "$env"); local rc="${r%%|*}" out="${r#*|}"
   # 注入没命中就说明这条根本没测到东西 —— 判测试自己失败, 不是判产品通过。
   if [[ "$env" == *FAIL_TARGET=* || "$env" == *FAIL_NTH=* || "$env" == *FAIL_INSTALL=* ]] \
-     && [[ ! -s /tmp/e2e-inject-hit ]]; then
-    bad "$desc: 故障注入**未命中**(受管目标共 $(wc -l < /tmp/e2e-inject-count 2>/dev/null || echo 0) 个) —— 这条没测到任何东西"
+     && [[ ! -s "$WORK"/e2e-inject-hit ]]; then
+    bad "$desc: 故障注入**未命中**(受管目标共 $(wc -l < "$WORK"/e2e-inject-count 2>/dev/null || echo 0) 个) —— 这条没测到任何东西"
     # 结构化结果: 让外层守卫能区分"updater 正常失败"/"注入未命中"/"测试环境损坏",
     # 而不是都看成一个非零退出码。
     echo "RESULT=injection-not-hit" >> "${PDG_FAULT_RESULT:-/dev/null}"
@@ -198,16 +198,22 @@ r=$(run "DOCTOR_OUT=warn"); rc="${r%%|*}"; out="${r#*|}"
 
 # ══ iOS 平台组件: 在 iOS 上是必需件, 装失败必须回滚(不能 ||true 后留旧版混装) ══
 # 按**受管目标名**注入(mobileconfig 在目标侧是改名后的 pdg-dot.mobileconfig.tmpl)
-for f in mitm_ca.py mitm_server.py mitm_wloc.py probe81.py pdg-dot.mobileconfig.tmpl; do
+for f in mitm_ca.py mitm_server.py mitm_wloc.py pdg-dot.mobileconfig.tmpl; do
   assert_fail_rollback "iOS: $f 安装失败" "PLATFORM=ios FAIL_TARGET=$f"
+done
+# probe81.py 是**公共件**(6.1B): 两平台都装, 所以两平台装失败都必须回滚 ——
+# 放进上面的 iOS 循环会漏掉 Android 那一半。
+for p in ios android; do
+  assert_fail_rollback "$p: probe81.py(公共件)安装失败" "PLATFORM=$p FAIL_TARGET=probe81.py"
 done
 # 第一个 / 中间 / 最后一个受管目标各失败一次 —— 覆盖遍历的头、中、尾
 assert_fail_rollback "受管目标 #1 安装失败"  "PLATFORM=ios FAIL_NTH=1"
 assert_fail_rollback "受管目标 #12 安装失败" "PLATFORM=ios FAIL_NTH=12"
-assert_fail_rollback "受管目标 #29 安装失败" "PLATFORM=ios FAIL_NTH=29"   # 清单末项(iOS 全集 29 条)
+assert_fail_rollback "受管目标 #32 安装失败" "PLATFORM=ios FAIL_NTH=32"   # 清单末项(iOS 全集 32 条; 6.1C 加了 nftlive.py)
 
-# Android: 这五个文件根本不该被安装 → 即使注入同名失败也不影响更新
-for f in mitm_ca.py probe81.py pdg-dot.mobileconfig.tmpl; do
+# Android: 这几个 iOS 专属文件根本不该被安装 → 即使注入同名失败也不影响更新。
+# probe81.py 不在此列了 —— 它现在 Android 也装, 装失败必须回滚(见上面的公共件循环)。
+for f in mitm_ca.py pdg-dot.mobileconfig.tmpl; do
   r=$(run "PLATFORM=android FAIL_TARGET=$f"); rc="${r%%|*}"; out="${r#*|}"
   { [[ "$rc" == 0 ]] && grep -q '✅ 已更新' <<<"$out"; } \
     && ok "Android: 不安装 iOS 文件 $f(注入其失败也不影响更新)" || bad "Android/$f: rc=$rc out=$out"

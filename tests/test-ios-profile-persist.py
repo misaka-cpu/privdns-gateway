@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -46,7 +47,7 @@ def sh(script, **kw):
 
 def box():
     """一个沙箱 FSROOT, 里面已经有一份受管记录。返回 (root, iosstate 模块)。"""
-    root = tempfile.mkdtemp(prefix="iospersist-")
+    root = tmpguard.mkdtemp(prefix="iospersist-")
     TMPS.append(root)
     os.makedirs(root + "/etc/privdns-gateway", exist_ok=True)
     os.makedirs(root + "/run", exist_ok=True)
@@ -103,7 +104,7 @@ else:
     bad("快照不含记录目录: %r" % cand[:8])
 
 # 真的打一次包再解开, 证明 tar 那条路上文件确实进得去也出得来
-snapdir = tempfile.mkdtemp(prefix="iossnap-")
+snapdir = tmpguard.mkdtemp(prefix="iossnap-")
 TMPS.append(snapdir)
 sh("tar czf %s/snap.tar.gz -C %s etc/privdns-gateway" % (snapdir, root))
 ident_before = ident(root)

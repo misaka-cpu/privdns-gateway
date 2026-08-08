@@ -12,6 +12,7 @@ import sys
 import tempfile
 import types
 from pathlib import Path
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "deploy" / "bot"))
@@ -23,7 +24,7 @@ def ok(m):
     global pass_n; print("[OK]  ", m); pass_n += 1
 
 
-TMP = tempfile.mkdtemp()
+TMP = tmpguard.mkdtemp()
 # 只把落盘重定向到临时目录(/opt/pdg-bot 在测试环境不存在), 其余行为不动
 report.os = types.SimpleNamespace(
     open=lambda p, *a, **k: os.open(os.path.join(TMP, os.path.basename(p)), *a, **k),

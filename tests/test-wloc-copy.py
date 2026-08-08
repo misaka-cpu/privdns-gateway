@@ -25,7 +25,7 @@ def ok(m):
 STEPS = [
     "控制中心把 Wi-Fi 点灰（不是在设置里关 Wi-Fi）",
     "在 Bot「📍 地点 / 切换」里点目标地点",
-    "等 Bot 显示「WLOC 已热加载」",
+    "等 Bot 显示「网关目标地点已切换，网关服务无需重启」",
     "设置 → 隐私与安全性 → 定位服务：关闭，等 2 秒后重新开启",
     "打开目标 App",
     "iOS 26 如果一直没有发起新的 WLOC 请求，可能仍需重启手机",
@@ -53,7 +53,7 @@ r_pos = [readme.index(it) for it in STEPS]
 b_pos = [bot.index(it) for it in STEPS]
 assert r_pos == sorted(r_pos), "README 步骤顺序与约定不符"
 assert b_pos == sorted(b_pos), "Bot 步骤顺序与约定不符"
-ok("README / Bot 步骤顺序一致(点灰 Wi-Fi → 选地点 → 等热加载 → 关开定位 → 开 App → iOS 26 兜底重启)")
+ok("README / Bot 步骤顺序一致(点灰 Wi-Fi → 选地点 → 等切换提示 → 关开定位 → 开 App → iOS 26 兜底重启)")
 
 # ── 兜底还原步骤两边都要有 ──
 assert FALLBACK in readme and FALLBACK in bot, "长期无法定位的兜底步骤缺失/被改写"

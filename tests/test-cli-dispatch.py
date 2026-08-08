@@ -25,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = Path(__file__).resolve().parents[1]
 PDG = ROOT / "deploy" / "bot" / "pdg.sh"
@@ -122,7 +123,7 @@ HARNESS = [
 ]
 HARNESS += ["%s(){ _recv %s \"$@\"; }" % (s, s) for s in STUBS]
 HARNESS.append(DISPATCH)
-_h = tempfile.mkdtemp(prefix="pdgdisp-")
+_h = tmpguard.mkdtemp(prefix="pdgdisp-")
 TMPS.append(_h)
 HPATH = os.path.join(_h, "dispatch.sh")
 open(HPATH, "w", encoding="utf-8").write("\n".join(HARNESS) + "\n")
@@ -196,7 +197,7 @@ for argv, want, label in (
 # 桩只证明参数递到了门口。这一段用真的 cmd_rollback: 造几个空快照目录, 让它走到
 # "快照文件缺失: <目录>/snap.tar.gz" 就返回 —— 那行输出正好把**它选中的目标**说出来了,
 # 于是"序号选的哪个""--dir 指的哪个"都是可观察的, 且全程不碰真实文件系统。
-SNAPS = tempfile.mkdtemp(prefix="pdgsnap-")
+SNAPS = tmpguard.mkdtemp(prefix="pdgsnap-")
 TMPS.append(SNAPS)
 DIRS = []
 for i in range(4):                       # 0 最新 → 3 最旧(mtime 显式拉开, 不靠创建顺序)

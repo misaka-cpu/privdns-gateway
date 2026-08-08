@@ -24,6 +24,7 @@ import os
 import shutil
 import sys
 import tempfile
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FIXTURES = os.path.join(ROOT, "tests", "fixtures")
@@ -60,7 +61,7 @@ def load_bot():
 
 
 bot = load_bot()
-work = tempfile.mkdtemp(prefix="charrender.")
+work = tmpguard.mkdtemp(prefix="charrender.")
 
 
 def fx(name):

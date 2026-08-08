@@ -12,6 +12,7 @@ import plistlib
 import subprocess
 import sys
 import tempfile
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -51,7 +52,7 @@ def expect_error(fn, want, label):
 
 
 # 一张真的自签 CA(用 openssl 现造), 不是拼出来的假 PEM —— 假 PEM 证明不了 DER 解析。
-CA_DIR = tempfile.mkdtemp(prefix="iosprof-ca-")
+CA_DIR = tmpguard.mkdtemp(prefix="iosprof-ca-")
 CA_CRT = os.path.join(CA_DIR, "ca.crt")
 CA_KEY = os.path.join(CA_DIR, "ca.key")
 subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",

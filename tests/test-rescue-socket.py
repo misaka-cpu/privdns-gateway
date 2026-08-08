@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -43,7 +44,7 @@ def bad(m):
     FAIL[0] += 1
 
 
-work = tempfile.mkdtemp(prefix="rescue-sock.")
+work = tmpguard.mkdtemp(prefix="rescue-sock.")
 
 
 def make_env(inst, **over):

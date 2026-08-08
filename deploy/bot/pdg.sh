@@ -23,17 +23,16 @@ _pdg_platform(){ local p; p=$(cat /etc/privdns-gateway/platform 2>/dev/null); [[
 # 平台标记是否明确(status/doctor 据此提示"缺失回退")
 _pdg_platform_present(){ local p; p=$(cat /etc/privdns-gateway/platform 2>/dev/null); [[ "$p" == ios || "$p" == android ]]; }
 # 展示用的服务集(status 逐个列状态): 恒含 pdg-bot —— 用户想看到它在不在跑, 哪怕没配凭据。
-# pdg-probe81 仍是 iOS 专属。
-_pdg_svcs(){ local s; s="mosdns $(_pdg_core_svc) pdg-bot"; [[ "$(_pdg_platform)" == ios ]] && s="$s pdg-probe81"; echo "$s"; }
+# pdg-probe81 已是 Android/iOS 公共组件, 两平台都列。
+_pdg_svcs(){ echo "mosdns $(_pdg_core_svc) pdg-bot pdg-probe81"; }
 
 # **必需**服务集(校验门用): 与 checks.expected_services() 同语义 —— bot.env 两项都空是合法的
 # "这台机器不用 Telegram 管理", pdg-bot 不运行属正常禁用态, 不该把它算成必须在跑的服务。
 # 以前平台切换直接用 _pdg_svcs 校验, 于是没配 bot 的机器 `pdg platform ios` 必然卡在
 # "pdg-bot 未稳定运行"并整体回滚 —— 而那台机器本来就没打算起 bot。
 _pdg_required_svcs(){
-  local s; s="mosdns $(_pdg_core_svc)"
+  local s; s="mosdns $(_pdg_core_svc) pdg-probe81"
   [[ "$(_pdg_bot_cred)" == ready ]] && s="$s pdg-bot"
-  [[ "$(_pdg_platform)" == ios ]] && s="$s pdg-probe81"
   echo "$s"
 }
 
@@ -300,7 +299,7 @@ cmd_status(){
   local s
   # shellcheck disable=SC2046  # _pdg_svcs 输出有意按空白分词
   local _cred; _cred="$(_pdg_bot_cred)"
-  for s in $(_pdg_svcs); do   # 按平台: pdg-probe81 仅 iOS
+  for s in $(_pdg_svcs); do   # 两平台一致(含公共件 pdg-probe81)
     local _st; _st="$(systemctl is-active "$s" 2>/dev/null)"
     if [[ "$s" == pdg-bot && "$_cred" != ready ]]; then
       # 合法禁用态不是故障: 两项都空 = 这台机器不用 Telegram 管理; 只配一半才是配置错误
@@ -1330,7 +1329,7 @@ cmd_update(){
     c_y "必需文件安装失败, 回滚到更新前快照…"; cmd_rollback --dir "$snap_dir" --git "$pre_sha"; return 1
   fi
   # iOS 专属组件按平台部署: Android 更新不把 iOS 文件装回来(migrate_android_cleanup 亦会清残留)。
-  # iOS 上这些**不是可选项**: probe81 与描述文件模板是 iOS 基础能力, WLOC 开着时 mitm 三件
+  # iOS 上这些**不是可选项**: 描述文件模板是 iOS 基础能力, WLOC 开着时 mitm 三件
   # 也是必需件。以前一律 `|| true`, 装失败就把上一版的旧文件留在原地 → 新旧混装, 而 doctor
   # 只看"文件在不在", 照样判绿。
   # iOS 专属组件已并入上面那一次调用(manifest 按平台取), 不再单列。
@@ -1452,8 +1451,7 @@ cmd_restart(){
   fi
   # 2) 要重启哪些: 平台必需服务 + 已启用的 pdg-mitm; 未配凭据的 pdg-bot 明确跳过
   local want=() s
-  for s in mosdns "$core"; do want+=("$s"); done
-  [[ "$(_pdg_platform)" == ios ]] && want+=(pdg-probe81)
+  for s in mosdns "$core" pdg-probe81; do want+=("$s"); done
   if [[ "$cred" == ready ]]; then
     want+=(pdg-bot)
   elif [[ "$cred" == partial ]]; then
@@ -2009,7 +2007,38 @@ migrate_deploy_botfiles(){
   # `deploy/bot/*.py` 的 glob 兜底循环 —— 那是一份**隐式的第二名单**: 仓库里任何新加的 .py
   # 都会被它装进 /opt/pdg-bot, 而那些文件不在 manifest 里, 卸载不会删、mode 也无从对齐。
   # 失败要向上传播: 迁移装了一半就返回成功, 机器会停在新旧混装且没人知道。
+  # 换过模块就要把用它们的服务转起来。**盘上是新代码、跑着的是旧的**本身就是一类静默故障:
+  # 两天里踩了两次 —— `.153` 装完没重启 pdg-bot, Telegram 菜单里根本没有那一项, 而版本号、
+  # 文件内容从哪儿看都"已经升级了"; jp2 装完没重启 pdg-probe81, 新 unit 的 RuntimeDirectory
+  # 没生效, /run/pdg-probe81 不存在, 建会话直接 STATE_UNWRITABLE。迁移自己知道有没有换过
+  # 文件, 就不该让人去记。
+  #
+  # 只在**内容真的不同**时重启: 每次迁移都重启会平白打断在用的连接(与救援平面 unit 刷新
+  # 那里同一条纪律)。
+  local _before _after
+  _before="$(_pdg_modules_digest /opt/pdg-bot)"
   pdg_install_runtime_modules "$REPO_DIR" /opt/pdg-bot "$(_pdg_platform)" || return 1
+  _after="$(_pdg_modules_digest /opt/pdg-bot)"
+  [[ "$_before" == "$_after" ]] && return 0
+
+  # try-restart 而不是 restart: 没装/没启用的服务直接跳过, 不报错 —— Android 上没有
+  # pdg-mitm, 早期机器上也可能还没有 pdg-probe81, 那些都不该让整条迁移失败。
+  local _svcs="pdg-bot pdg-probe81"
+  [[ "$(_pdg_platform)" == ios ]] && _svcs="$_svcs pdg-mitm"
+  # shellcheck disable=SC2086  # 有意按空白分词
+  systemctl try-restart $_svcs >/dev/null 2>&1 || true
+  c_g "  运行模块已更新 → 已重启:$(printf ' %s' $_svcs)"
+}
+
+# /opt/pdg-bot 下受管模块的整体摘要 —— 只用来判断"这次迁移有没有真的换过文件"。
+# 读不到就回显空串: 那会让前后两次比较不相等, 于是保守地重启一次(宁可多转一次,
+# 也不要留下"盘上新、跑着旧"的机器)。
+_pdg_modules_digest(){
+  local dir="${1:-/opt/pdg-bot}" f
+  for f in "$dir"/*.py; do
+    [[ -e "$f" ]] || continue
+    sha256sum "$f" 2>/dev/null
+  done | sort | sha256sum 2>/dev/null | cut -d" " -f1
 }
 
 # 老机首次获得救援平面: 装 unit + 备好凭据, 并按"默认启用"拍板方案开起来。
@@ -2200,7 +2229,54 @@ migrate_pdg_mitm_service(){
   pdg_write_unit pdg_unit_pdg_mitm /etc/systemd/system/pdg-mitm.service
   systemctl daemon-reload 2>/dev/null || true
   systemctl reset-failed pdg-mitm 2>/dev/null; systemctl enable --now pdg-mitm >/dev/null 2>&1 || true
-  c_g "  ✅ 已补 iOS pdg-mitm 服务(MITM 插件宿主)。"
+  c_g "  ✅ 已补 iOS pdg-mitm 服务(WLOC 服务宿主)。"
+}
+
+# 老装迁移: pdg-probe81 从 iOS 专属改成 Android/iOS 公共组件(6.1B)。
+# Android 老机升级只会通过 manifest 拿到 probe81.py, **拿不到 unit** —— `pdg update` 的
+# 部署路径里从来没有这个 unit。没有这一步, Android 升完就是"文件在、服务没有", 而
+# expected_services 已经把它列为必需 → doctor 直接判红。
+# 幂等: unit 内容一致且已 enabled 就什么都不做。
+migrate_probe81_public(){
+  # probe81 自 6.1B 起是 **Android/iOS 公共必需**服务(链路诊断的 HTTP 会话入口)。
+  # 所以"模板不在就跳过"这条前提已经不成立了 —— 它现在是硬失败。
+  #
+  # 这一条是 `.153` 真机验收换来的: 当时运行模块与 CLI 同步到了新版本, 但 $REPO_DIR
+  # 还停在旧 commit(里面没有这个 unit 模板), 于是本函数在第一行 `|| return 0` 静默返回,
+  # `pdg __migrate` rc=0、更新一路绿灯, 而 unit 根本没被装出来。整块能力就这么无声缺席,
+  # 只有事后手工看 systemctl 才发现。**模板缺失 = 部署源不完整**, 必须让调用方知道。
+  local tmpl="$REPO_DIR/deploy/bot/pdg-probe81.service"
+  if [[ ! -f "$tmpl" ]]; then
+    c_y "  ❌ 当前部署源缺少 pdg-probe81 unit 模板($tmpl)。"
+    c_y "     probe81 是两个平台都必需的组件, 这里不做任何改动 —— 请确认部署源(仓库)已经"
+    c_y "     切到目标版本再重跑迁移。"
+    return 1
+  fi
+  # 程序还没就位是**另一回事**: botfiles 迁移会在同一轮里补上它, 下一次调用就能装。
+  # 这条保持跳过语义(返回 0), 但只在模板确实存在时才轮得到。
+  [[ -f /opt/pdg-bot/probe81.py ]] || return 0
+  local src=/etc/systemd/system/pdg-probe81.service changed=0
+  if ! cmp -s "$tmpl" "$src"; then
+    install -m644 "$tmpl" "$src" 2>/dev/null || {
+      c_y "  ❌ 写入 pdg-probe81.service 失败(保留原状)。"; return 1; }
+    changed=1
+  fi
+  if [[ "$changed" == 1 ]]; then
+    systemctl daemon-reload 2>/dev/null || {
+      c_y "  ❌ daemon-reload 失败, pdg-probe81 可能未生效。"; return 1; }
+  fi
+  if [[ "$(systemctl is-enabled pdg-probe81 2>/dev/null | head -1)" != enabled ]]; then
+    systemctl reset-failed pdg-probe81 >/dev/null 2>&1 || true
+    if systemctl enable --now pdg-probe81 >/dev/null 2>&1; then
+      c_g "  ✅ 已补 pdg-probe81 服务(:81 探测端点, Android/iOS 公共)。"
+    else
+      c_y "  ❌ pdg-probe81 未能启用 —— 链路诊断的 HTTP 会话入口不可用。"
+      return 1
+    fi
+  elif [[ "$changed" == 1 ]]; then
+    systemctl restart pdg-probe81 >/dev/null 2>&1 || true
+  fi
+  return 0
 }
 
 # 老装迁移(Android): 清理误装/残留的 iOS 专属组件。幂等; 仅匹配本项目精确路径/unit, 不误删用户文件。
@@ -2227,18 +2303,21 @@ PY
     systemctl restart mosdns 2>/dev/null || true
   fi
   local removed=0 u f
-  for u in pdg-probe81 pdg-mitm; do
-    if [[ -f /etc/systemd/system/$u.service ]]; then
-      systemctl disable --now "$u" 2>/dev/null; rm -f "/etc/systemd/system/$u.service"; removed=1
-    fi
-  done
-  for f in /opt/pdg-bot/probe81.py /opt/pdg-bot/mitm_ca.py /opt/pdg-bot/mitm_server.py /opt/pdg-bot/mitm_wloc.py \
+  # pdg-probe81 **不再**在这里清理: 它已是 Android/iOS 公共组件, 删掉会让 Android
+  # 装完又被迁移抹掉, 平台来回切也不幂等。只清真正的 iOS 专属件。
+  # 现在只剩 pdg-mitm 一个(probe81 已转公共件), 就别硬套循环了: 单元素 for 会触发
+  # SC2043, 而且读的人会以为这里还有别的 unit 要清。
+  if [[ -f /etc/systemd/system/pdg-mitm.service ]]; then
+    systemctl disable --now pdg-mitm 2>/dev/null
+    rm -f /etc/systemd/system/pdg-mitm.service; removed=1
+  fi
+  for f in /opt/pdg-bot/mitm_ca.py /opt/pdg-bot/mitm_server.py /opt/pdg-bot/mitm_wloc.py \
            /opt/pdg-bot/iosprofile.py /opt/pdg-bot/iosstate.py \
            /opt/pdg-bot/pdg-dot.mobileconfig.tmpl /opt/pdg-bot/pdg-mitm.mobileconfig.tmpl; do
     [[ -f "$f" ]] && { rm -f "$f"; removed=1; }
   done
   [[ "$removed" == 1 ]] && { systemctl daemon-reload 2>/dev/null || true
-    c_g "Android: 已清理 iOS 专属残留(pdg-probe81/pdg-mitm 服务 + mitm 模块 + 描述文件模板; CA/地点数据保留为休眠)。"; }
+    c_g "Android: 已清理 iOS 专属残留(pdg-mitm 服务 + mitm 模块 + 描述文件模板; CA/地点数据保留为休眠)。"; }
   return 0
 }
 
@@ -2594,7 +2673,7 @@ migrate_mosdns_explicit_proxy(){
     local pend rcp=0
     pend="$(python3 "$txm" pending 2>/dev/null)" || rcp=$?
     if [[ "$rcp" != 0 ]]; then
-      c_y "  有需要收尾的配置事务, 明确代理优先级本次不迁移(未改动任何文件):"
+      c_y "  有需要收尾的配置事务, 指定域名优先级本次不迁移(未改动任何文件):"
       printf '%s\n' "$pend" | sed 's/^/    /'
       c_y "  → 先 sudo pdg tx recover <id> 收尾, 再跑一次 sudo pdg update。"
       return 0
@@ -2603,14 +2682,14 @@ migrate_mosdns_explicit_proxy(){
   sip="$(sed -n 's/^PDG_SERVER_IP=//p' /etc/privdns-gateway/profile.env 2>/dev/null | tail -1)"
   [[ -n "$sip" ]] || sip="$(grep -oE 'black_hole [0-9.]+' "$mc" | head -1 | awk '{print $2}')"
   if [[ -z "$sip" ]]; then
-    c_y "  取不到网关 IP(未渲染?), 明确代理优先级未迁移(交 doctor 点名)。"; return 0
+    c_y "  取不到网关 IP(未渲染?), 指定域名优先级未迁移(交 doctor 报出)。"; return 0
   fi
   wd="$(mktemp -d)" || return 0
   # 先在**副本**上试改: 形态不认识就到此为止, 现网从未被碰过。
   cp "$mc" "$wd/cand.yaml" || { rm -rf "$wd"; return 0; }
   if ! out=$(_mosdns_explicit_proxy "$wd/cand.yaml" "$sip" 2>"$wd/err"); then
-    c_y "  mosdns 配置是自定义形态, 明确代理优先级未迁移(不猜着改): $(tr -d '\n' < "$wd/err" | head -c 120)"
-    c_y "  → sudo pdg doctor 会继续点名这一项。"
+    c_y "  mosdns 配置是自定义形态, 指定域名优先级未迁移(不猜着改): $(tr -d '\n' < "$wd/err" | head -c 120)"
+    c_y "  → sudo pdg doctor 会继续报出这一项。"
     rm -rf "$wd"; return 0
   fi
   [[ "$out" == changed ]] || { rm -rf "$wd"; return 0; }
@@ -2632,14 +2711,14 @@ migrate_mosdns_explicit_proxy(){
   if command -v mosdns >/dev/null 2>&1 && [[ -e /etc/systemd/system/mosdns.service ]]; then
     systemctl restart mosdns 2>/dev/null; sleep 1
     if [[ "$(systemctl is-active mosdns 2>/dev/null)" == active ]]; then
-      c_g "  已把「用户点名指到出口的域名」提到 geosite_cn 之前(显式代理优先)。"
+      c_g "  已把「用户指定要走出口的域名」提到 geosite_cn 之前(用户规则优先)。"
       rm -f "$bak"
     else
       c_y "  ⚠️ 新配置起不来 mosdns → 已还原到迁移前。"
       cp -a "$bak" "$mc" 2>/dev/null; systemctl restart mosdns 2>/dev/null; rm -f "$bak"
     fi
   else
-    c_g "  已把「用户点名指到出口的域名」提到 geosite_cn 之前(未起 mosdns 校验: 本机无 mosdns 服务)。"
+    c_g "  已把「用户指定要走出口的域名」提到 geosite_cn 之前(未起 mosdns 校验: 本机无 mosdns 服务)。"
     rm -f "$bak"
   fi
   rm -rf "$wd"
@@ -2668,7 +2747,7 @@ meta = json.load(open(sys.argv[1], encoding="utf-8"))
 data, _undrivable = bot.ruleset_hijack_text(meta)
 open(sys.argv[2], "wb").write(data)
 PY
-    c_y "  规则集劫持表未派生(读不出规则集元数据), 保持原样。"; rm -rf "$wd"; return 0
+    c_y "  规则集生效状态未派生(读不出规则集元数据), 保持原样。"; rm -rf "$wd"; return 0
   fi
   if [[ -f "$f" ]] && cmp -s "$f" "$wd/new.txt"; then rm -rf "$wd"; return 0; fi   # 幂等
   # 管理员手填过(不是派生产物)→ 不覆盖, 交给他自己决定
@@ -2680,7 +2759,7 @@ PY
   local bak; bak="$f.pre-derive.$(date +%s)"
   [[ -f "$f" ]] && { cp -a "$f" "$bak" 2>/dev/null || { rm -rf "$wd"; return 0; }; }
   if ! cat "$wd/new.txt" > "$f" 2>/dev/null; then
-    c_y "  规则集劫持表写入失败, 还原。"; [[ -f "$bak" ]] && cp -a "$bak" "$f"
+    c_y "  规则集生效状态写入失败, 还原。"; [[ -f "$bak" ]] && cp -a "$bak" "$f"
     rm -f "$bak"; rm -rf "$wd"; return 0
   fi
   if command -v mosdns >/dev/null 2>&1 && [[ -e /etc/systemd/system/mosdns.service ]]; then
@@ -2819,7 +2898,7 @@ migrate_cidr_single_source(){
   mv -f "$t" "$prof" || { rm -f "$t"; c_y "⚠️ 迁移: 落盘 profile.env 失败, 未改动"; return 0; }
   grep -q "^PDG_INTERNAL_CIDR=$nftv$" "$prof" \
     || { c_y "⚠️ 迁移: 真源复核未通过"; return 0; }
-  c_g "✅ 迁移: 内网卡段真源已写入 profile.env ($nftv)"
+  c_g "✅ 迁移: 内网卡段一致性基准已写入 profile.env ($nftv)"
 }
 
 run_all_migrations(){
@@ -2839,6 +2918,9 @@ run_all_migrations(){
   migrate_nft_extra || true
   migrate_custom_hijack || true
   migrate_mosdns_mitm || true; migrate_pdg_mitm_service || true
+  # 失败必须传出去: 缺 unit 模板 = 部署源不完整, 装不出这个公共必需服务。以前是 `|| true`,
+  # 于是 `.153` 上"迁移没跑"被整条链路当成成功(见 migrate_probe81_public 里的说明)。
+  migrate_probe81_public || rc=1   # 补公共件 unit; 必须在 android_cleanup 之前
   migrate_android_cleanup || true
   # iOS GMS 清理**失败必须传出**: 它会动 model + 内核配置 + 防火墙三样, 失败即现网可能与
   # 期望形态不一致(它自己会完整回滚, 但回滚不完整时更要让上层知道)。以前是 `|| true`,
@@ -2871,7 +2953,7 @@ _pdg_nft_foreign_input_chains(){
     return $?
   done
   # 判据脚本都不在 → 不能假装现场干净(那正是这道门要挡的事), 按"无法确认"处理
-  echo "找不到 nftscan.py(判据脚本缺失), 无法确认 input 链冲突"
+  echo "找不到 nftscan.py(判据脚本缺失), 无法确认防火墙链冲突"
   return 2
 }
 
@@ -2914,7 +2996,7 @@ _switchcore_nft(){   # $1=target(mihomo)  渲染并应用 mihomo nft(用当前 S
     return 1
   fi
   if [[ "$_frc2" == 2 ]]; then     # 读不到运行 ruleset: 不能假装干净就往下写规则
-    echo "无法确认 input 链冲突 → 未改动防火墙:"
+    echo "无法确认防火墙链冲突 → 未改动防火墙:"
     printf '%s\n' "$_fic2" | sed 's/^/    /'
     return 1
   fi
@@ -3114,18 +3196,18 @@ _plat_write_profile(){
   _profile_set PDG_PLATFORM "$1"
 }
 
-# 部署 iOS 专属组件(幂等)。probe81 / 描述文件模板 / MITM 模块 —— 缺一样 doctor 就会报
-# "pdg-probe81 未运行 / :81 无响应", 而以前 `pdg platform ios` 只写个标记就说"已确认"。
+# 部署 iOS 专属组件(幂等)。描述文件模板 / MITM 模块 —— 缺一样 doctor 就会报错, 而以前
+# `pdg platform ios` 只写个标记就说"已确认"。
+# probe81 不在此列: 它已是 Android/iOS 公共组件, 由通用安装路径与 migrate_probe81_public
+# 负责, 平台切换既不装也不删。
 # iOS 平台必须存在的文件(源 → 目标)。切平台是**事务**, 这里一个都不能少。
 _PLAT_IOS_REQUIRED=(
-  "deploy/ios/probe81.py|/opt/pdg-bot/probe81.py|755"
   "deploy/ios/pdg-dot-ondemand.mobileconfig.tmpl|/opt/pdg-bot/pdg-dot.mobileconfig.tmpl|644"
   "deploy/bot/iosprofile.py|/opt/pdg-bot/iosprofile.py|755"
   "deploy/bot/iosstate.py|/opt/pdg-bot/iosstate.py|755"
   "deploy/bot/mitm_ca.py|/opt/pdg-bot/mitm_ca.py|755"
   "deploy/bot/mitm_server.py|/opt/pdg-bot/mitm_server.py|755"
   "deploy/bot/mitm_wloc.py|/opt/pdg-bot/mitm_wloc.py|755"
-  "deploy/ios/pdg-probe81.service|/etc/systemd/system/pdg-probe81.service|644"
 )
 
 _plat_deploy_ios(){
@@ -3143,8 +3225,7 @@ _plat_deploy_ios(){
     [[ -s "$dst" ]] || { echo "  部署后文件为空/不存在: $dst"; return 1; }
   done
   systemctl daemon-reload >/dev/null 2>&1 || { echo "  systemctl daemon-reload 失败"; return 1; }
-  systemctl reset-failed pdg-probe81 >/dev/null 2>&1 || true
-  systemctl enable --now pdg-probe81 >/dev/null 2>&1 || { echo "  启用 pdg-probe81 失败"; return 1; }
+  # pdg-probe81 是公共件, 由 install / migrate_probe81_public 负责起停, 平台切换不碰它。
   # pdg-mitm unit 也照严格口径写(migrate_pdg_mitm_service 是幂等迁移, 失败同样是吞掉的)
   # shellcheck source=lib/units.sh
   source "$REPO_DIR/lib/units.sh" 2>/dev/null || { echo "  读不到 lib/units.sh"; return 1; }
@@ -3168,16 +3249,16 @@ _plat_verify(){
       [[ -s "$dst" ]] || miss+=("$dst")
     done
     [[ -s /etc/systemd/system/pdg-mitm.service ]] || miss+=("/etc/systemd/system/pdg-mitm.service")
-    [[ "$(systemctl is-active pdg-probe81 2>/dev/null)" == active ]] || miss+=("pdg-probe81(未运行)")
+
     [[ "$(systemctl is-active pdg-mitm 2>/dev/null)" == active ]] || miss+=("pdg-mitm(未运行)")
   else
-    for f in /opt/pdg-bot/probe81.py /opt/pdg-bot/pdg-dot.mobileconfig.tmpl \
+    for f in /opt/pdg-bot/pdg-dot.mobileconfig.tmpl \
              /opt/pdg-bot/iosprofile.py /opt/pdg-bot/iosstate.py \
              /opt/pdg-bot/mitm_ca.py /opt/pdg-bot/mitm_server.py /opt/pdg-bot/mitm_wloc.py \
-             /etc/systemd/system/pdg-probe81.service /etc/systemd/system/pdg-mitm.service; do
+             /etc/systemd/system/pdg-mitm.service; do
       [[ -e "$f" ]] && extra+=("$f")
     done
-    [[ "$(systemctl is-active pdg-probe81 2>/dev/null)" == active ]] && extra+=("pdg-probe81(仍在运行)")
+
     [[ "$(systemctl is-active pdg-mitm 2>/dev/null)" == active ]] && extra+=("pdg-mitm(仍在运行)")
   fi
   if [[ ${#miss[@]} -gt 0 ]]; then
@@ -3775,18 +3856,16 @@ cmd_platform(){
     [[ -e "$f" ]] && cp -a "$f" "$wd/$(basename "$f")" 2>/dev/null
   done
   # 2b) 平台专属文件也要能原样回去: 装上去的要删掉, 清掉的要放回来。
-  # 只还原配置不管这些文件的话, 一次失败的 Android→iOS 会在盘上留下 probe81/描述文件模板/
+  # 只还原配置不管这些文件的话, 一次失败的 Android→iOS 会在盘上留下描述文件模板/
   # MITM 模块和两个 unit —— 平台明明已经回滚成 android, 现场却是半个 iOS。
   # 备份**内容**而不只是记在不在: 文件本来就有(版本旧一点)时, install 会把它改写掉。
   local _PLAT_FILES=(
-    /opt/pdg-bot/probe81.py
     /opt/pdg-bot/pdg-dot.mobileconfig.tmpl
     /opt/pdg-bot/iosprofile.py
     /opt/pdg-bot/iosstate.py
     /opt/pdg-bot/mitm_ca.py
     /opt/pdg-bot/mitm_server.py
     /opt/pdg-bot/mitm_wloc.py
-    /etc/systemd/system/pdg-probe81.service
     /etc/systemd/system/pdg-mitm.service
   )
   mkdir -p "$wd/plat"
@@ -3799,11 +3878,10 @@ cmd_platform(){
   # 只取第一行并在空值时兜底: systemctl 这些子命令是"既打印状态又用退出码表态", 拿
   # `cmd || echo disabled` 兜底会打印两遍, 多出来的那行会被下面的 read 当成新记录读走。
   local _psvc _pstate _pen _pac; _pstate=""
-  for _psvc in pdg-probe81 pdg-mitm; do
-    _pen="$(systemctl is-enabled "$_psvc" 2>/dev/null | head -1)"
-    _pac="$(systemctl is-active  "$_psvc" 2>/dev/null | head -1)"
-    _pstate="$_pstate$_psvc|${_pen:-disabled}|${_pac:-inactive}"$'\n'
-  done
+  _psvc=pdg-mitm
+  _pen="$(systemctl is-enabled "$_psvc" 2>/dev/null | head -1)"
+  _pac="$(systemctl is-active  "$_psvc" 2>/dev/null | head -1)"
+  _pstate="$_psvc|${_pen:-disabled}|${_pac:-inactive}"$'\n'
   _plat_rollback(){
     local g
     for g in platform profile.env mitm.json nftables.conf config.yaml mitm_hijack.txt; do
@@ -3852,9 +3930,13 @@ cmd_platform(){
   _plat_write_profile "$p" || { c_y "profile.env 写入失败"; _plat_rollback; rm -rf "$wd"; return 1; }
 
   # 4) 按目标平台部署 / 清理组件
+  # 先保证**公共件**就位: pdg-probe81 两平台都必需, 而 _pdg_required_svcs 下面就要
+  # 校验它。6.1B 之前装的机器盘上根本没有这个 unit —— 不先补上, `pdg platform` 会因
+  # "服务未稳定运行"整体回滚, 而用户什么都没做错。这一步幂等, 已就位则空转。
+  migrate_probe81_public || true
   if [[ "$p" == ios ]]; then
     if ! _plat_deploy_ios; then
-      echo "❌ iOS 组件部署失败(probe81 / 描述文件模板 / pdg-probe81 服务)"
+      echo "❌ iOS 组件部署失败(描述文件模板 / MITM 模块 / pdg-mitm 服务)"
       _plat_rollback; rm -rf "$wd"; return 1
     fi
   else
@@ -3912,13 +3994,49 @@ cmd_platform(){
     echo "❌ iOS GMS 残留清理失败(详见上方), 平台切换回退"
     _plat_rollback; rm -rf "$wd"; return 1
   fi
+  # probe81 是两个平台**都必需**的公共件(链路诊断的 HTTP 会话入口)。切完平台如果它没就位,
+  # 那台机器就少了一整块能力, 而后面那句"平台已确认"会把这件事盖过去。与 GMS 同样待遇:
+  # 在删回滚材料之前单独跑一次并传播失败(幂等, 下面的 run_all_migrations 再跑就是空转)。
+  if ! migrate_probe81_public; then
+    echo "❌ pdg-probe81 公共件迁移失败(详见上方), 平台切换回退"
+    _plat_rollback; rm -rf "$wd"; return 1
+  fi
   rm -rf "$wd"
-  run_all_migrations || true                    # 其余平台无关的幂等迁移照常跑(GMS 那步已单独跑过)
+  run_all_migrations || true                    # 其余平台无关的幂等迁移照常跑(上面两步已单独跑过)
   c_g "平台已确认: $cur → $p"
   if [[ -x /opt/pdg-bot/doctor.py ]] || [[ -f /opt/pdg-bot/doctor.py ]]; then
     python3 /opt/pdg-bot/doctor.py || c_y "自检有未通过项(见上), 平台切换本身已完成。"
   fi
   return 0
+}
+
+# SIM/APN 链路诊断。6.1A 只有 `status` 一个子命令: **服务器准备状态**, 纯只读。
+#
+# 它不取全局配置写锁, 也不开事务 —— 这是有意的。这条命令是给"出事了想看看"的人用的,
+# 它自己再去抢锁就会在最不该添乱的时候添乱: 读一次状态却挡住 pdg update 或定时的规则库
+# 刷新, 代价远大于收益。cmd_detect_cidr 那种要写配置的才需要锁。
+#
+# 退出码由 linkstat.exit_code() 定: 服务器准备状态里有 FAIL → 2; 只有 WARN/NOT_OBSERVED/
+# SKIP → 0; 模型损坏或没跑完 → 3。NOT_OBSERVED **不算故障**, 所以不影响退出码。
+cmd_link(){
+  local sub="${1:-status}"
+  case "$sub" in
+    status) shift || true
+      local m; m="$(_pdg_module linkstat.py)" || { echo "❌ 找不到 linkstat.py"; return 1; }
+      python3 "$m" "$@"; return $?;;
+    session) shift || true
+      # 会话是**运行时状态**(/run/pdg-probe81/), 不是受管配置: 既不进 pdgtx, 也不取
+      # 全局配置写锁 —— 上锁只会让它和真正的配置写路径互相挡道。
+      local m; m="$(_pdg_module linksess.py)" || { echo "❌ 找不到 linksess.py"; return 1; }
+      python3 "$m" "$@"; return $?;;
+    -h|--help|help)
+      echo "用法: pdg link status [--json]"
+      echo "      pdg link session <start|status|stop> [--json]"
+      echo "  status  只报告**服务器准备状态**(只读, 不改任何东西)。"
+      echo "  session 建一次性 token 的手机协助会话, 观察 HTTP 与 DNS 两类证据。"
+      return 0;;
+    *) echo "用法: pdg link <status|session> …"; return 1;;
+  esac
 }
 
 cmd_hijack_mode(){
@@ -4140,7 +4258,8 @@ case "${1:-menu}" in
   detect-cidr|cidr) shift || true; cmd_detect_cidr "$@";;
   platform)      shift || true; cmd_platform "$@";;
   hijack-mode)   shift || true; cmd_hijack_mode "$@";;
+  link)          shift || true; cmd_link "$@";;
   uninstall|rm)  shift || true; cmd_uninstall "$@";;
   rescue)        shift || true; cmd_rescue "$@";;
-  *) echo "用法: pdg [menu|status|doctor [--json|--deep]|update [--dry-run]|snapshot|rollback [n]|token|restart|log [n]|traffic|ios [status|diff|previous|ack|recover|repair](仅 iOS)|report [--redact-ip|--full]|detect-cidr|platform <ios|android>|hijack-mode <all|gfw>|migrate|migrate-fw|tx <list|show|recover|abort>|rescue <enable|disable|status|fingerprint|bind <IPv4>|rotate-token|rotate-cert>|uninstall [--purge]]";;
+  *) echo "用法: pdg [menu|status|doctor [--json|--deep]|update [--dry-run]|snapshot|rollback [n]|token|restart|log [n]|traffic|ios [status|diff|previous|ack|recover|repair](仅 iOS)|report [--redact-ip|--full]|detect-cidr|platform <ios|android>|hijack-mode <all|gfw>|link status|link session <start|status|stop>|migrate|migrate-fw|tx <list|show|recover|abort>|rescue <enable|disable|status|fingerprint|bind <IPv4>|rotate-token|rotate-cert>|uninstall [--purge]]";;
 esac

@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "deploy", "bot"))
@@ -155,7 +156,7 @@ print("── 3. 候选必须能过真 nft -c ──")
 if not NFT:
     skip("机器上没有 nft —— 候选的真实语法校验未执行(不是通过)")
 else:
-    d = tempfile.mkdtemp(prefix="nftpurge.")
+    d = tmpguard.mkdtemp(prefix="nftpurge.")
     try:
         cand = os.path.join(d, "cand.conf")
         with open(cand, "w", encoding="utf-8") as fh:

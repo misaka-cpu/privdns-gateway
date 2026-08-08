@@ -23,6 +23,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MERGE = os.path.join(ROOT, "deploy/bot/nftmerge.py")
@@ -224,7 +225,7 @@ def preserved(name, rc, merged):
 
 
 def main():
-    d = tempfile.mkdtemp(prefix="nftflush.")
+    d = tmpguard.mkdtemp(prefix="nftflush.")
     try:
         # ── 1. 全新 Debian 13(iptables-nft 的空壳)→ 放行, 且不做多余改动 ──
         rc, msg, merged = run_merge(d, ["inet filter", "ip nat", "ip filter"],
