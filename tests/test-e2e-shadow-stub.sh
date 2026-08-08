@@ -5,7 +5,7 @@
 #   e2e-rescue-migration-lock.sh 会在 /usr/local/bin 造一个假 `ip`(伪造 `ip -4` 的地址
 #   列表), 而 /usr/local/bin 排在 PATH 前面。那个桩残留下来之后, 下一支脚本装机时会把
 #   本机地址看成落在 PDG_INTERNAL_CIDR(127.0.0.0/8)里 → 救援平面被自动启用并写下
-#   PDG_RESCUE_BIND → 沙箱 nft 里没有 8446 放行 → 再下一支 e2e-update.sh 的更新后自检
+#   PDG_RESCUE_BIND → 沙箱 nft 里没有对应的救援端口放行 → 再下一支 e2e-update.sh 的自检
 #   正确判红并整次回滚。整条因果链上没有任何一环指向"上一支留了个假 ip", 所以必须有
 #   判据钉着。e2e-install-nft.sh 的 python3 桩是同一类(它只在正常路径上还原)。
 #
