@@ -48,31 +48,67 @@ e2e_skip(){
 # 两边都碰不到开发机的真实配置。
 _e2e_git_safe(){ grep -q 'directory = \*' /etc/gitconfig 2>/dev/null || printf '[safe]\n\tdirectory = *\n' >> /etc/gitconfig 2>/dev/null || true; }
 
-# 删掉"遮住真程序的桩", 但**只删看起来确实是桩的那些**。
-# 与 e2e_stub_uninstall 的区别: 那个按"内容里写着本轮 $E2E_TMP"认, 只能认出自己造的;
-# 这个是**进场**清理, 要认出**别的脚本上一轮留下的**, 那些桩里没有本轮路径可比对。
+# 测试桩的所有权标记。清理只认带这行的文件 —— 同名但没有标记的一律当成"用户的真程序",
+# 宁可让测试停下来, 也不删一个我们证明不了归属的东西。
+E2E_STUB_MARK="# pdg-e2e-managed-stub"
+
+# 影子桩所在目录。默认就是真实的 /usr/local/bin(它排在 PATH 前面, 桩才会遮住系统命令);
+# 参数化只为让契约测试能在一个临时目录上验同一份实现 —— **不复制一套清理逻辑去自测**。
+E2E_SHADOW_BIN="${E2E_SHADOW_BIN:-/usr/local/bin}"
+
+# 删掉"遮住真程序的桩"。与 e2e_stub_uninstall 的分工:
+#   · e2e_stub_uninstall 按"内容里写着本轮 $E2E_TMP"认, 只认得出**自己这一轮**造的;
+#   · 这个要认出**别的脚本上一轮留下的**, 那些桩里没有本轮路径可比对, 所以改用所有权标记。
+#
+# 只处理显式传进来的 allowlist。判据:
+#   符号链接 → 目标在 /usr/local/bin 内 = 测试搭的还原链(restore_py 那种) → unlink;
+#              **只 unlink 链接本身, 绝不跟随删目标**; 指向别处的是用户的安装, 不碰。
+#   普通文件 → 必须含 $E2E_STUB_MARK, 或与已知的历史桩形态逐字节相同(见 _e2e_legacy_stub)。
+#   其它类型 / 有标记之外的同名真文件 → **fail-closed**: 报出来并返回非零, 不静默继续。
+_e2e_legacy_stub(){
+  # 打标记之前就存在的两种桩形态。留这一层是为了"从旧现场升上来"也能清干净 ——
+  # 否则升级那天残留的桩仍然没人认领, 而它正是这一整条 bug 的起点。
+  local f="$1"
+  head -1 "$f" 2>/dev/null | grep -qE '^#!/bin/(sh|bash)$' || return 1
+  grep -qE 'ip -4|scope global|inet [0-9]' "$f" 2>/dev/null && return 0    # 老的 ip 桩
+  grep -qE 'py3-real|python3' "$f" 2>/dev/null && return 0                 # 老的 python3 桩
+  return 1
+}
+
 e2e_purge_shadow_stub(){
-  local n f sz
+  local n f rc=0
   for n in "$@"; do
-    f="/usr/local/bin/$n"
+    f="$E2E_SHADOW_BIN/$n"
+    [[ -e "$f" || -L "$f" ]] || continue              # 不存在 = 已经干净, 幂等
     if [[ -L "$f" ]]; then
-      # 指向 /usr/local/bin 内部 = 测试自己搭的还原链(restore_py 那种), 删。
-      # 指向别处的符号链接可能是用户的正经安装, 不碰。
-      [[ "$(readlink "$f")" == /usr/local/bin/* ]] && rm -f "$f" 2>/dev/null
+      if [[ "$(readlink "$f")" == "$E2E_SHADOW_BIN"/* ]]; then
+        rm -f "$f" 2>/dev/null || true                # 只删链接, 目标不动
+      fi
       continue
     fi
-    [[ -f "$f" ]] || continue
-    sz="$(stat -c %s "$f" 2>/dev/null || echo 999999)"
-    [[ "$sz" -lt 4096 ]] || continue                  # 真程序是 ELF, 通常几十 KB 起
-    head -c 2 "$f" 2>/dev/null | grep -q '#!' || continue
-    rm -f "$f" 2>/dev/null || true
+    if [[ ! -f "$f" ]]; then
+      echo "[FAIL] $f 既不是普通文件也不是符号链接 —— 拒绝处理(fail-closed)" >&2
+      rc=1; continue
+    fi
+    if grep -qF -- "$E2E_STUB_MARK" "$f" 2>/dev/null || _e2e_legacy_stub "$f"; then
+      rm -f "$f" 2>/dev/null || true
+      continue
+    fi
+    # 同名、但证明不了是我们的 —— 这就是"未知 shadow binary"。它会遮住系统命令,
+    # 让后面每一支测试都在一个说不清的 PATH 上跑; 静默沿用比删错更危险。
+    echo "[FAIL] $f 不是受管测试桩(没有 $E2E_STUB_MARK) —— 不删, 也不能带着它继续" >&2
+    rc=1
   done
-  return 0
+  return $rc
 }
+
 
 # 把机器清回"什么都没装过"的状态。namespace 模式下 overlay 本来就干净, 这里主要给容器模式
 # (CI 里多个脚本共用一个容器)用: 二进制、unit、归属/后端标记、快照、仓库副本、服务桩一个不留。
 e2e_reset_box(){
+  # **必须是第一句**: 下面紧接着就 `systemctl disable --now …`, 而 /usr/local/bin 排在
+  # PATH 前面 —— 上一支留下的桩会在这里被调到。先把影子桩撤掉, 再动任何 PATH 命令。
+  e2e_purge_shadow_stub ip python3 py3-real || return 1
   systemctl disable --now pdg-bot pdg-probe81 pdg-mitm mosdns mihomo sing-box \
                           pdg-rescue.socket pdg-rescue.service >/dev/null 2>&1 || true
   # sing-box 是**必须**清掉的那个: 装机会把来源不明的 sing-box 判成第三方冲突而中止,
@@ -116,7 +152,6 @@ e2e_reset_box(){
   # e2e-update.sh 的更新后自检就正确地判红并整次回滚。查起来完全指不到这里。
   # 判据换成"看起来就是我们的桩": 指向 /usr/local/bin 内部的符号链接, 或者小于 4KiB 的
   # 脚本(带 #! 开头)。真的 ip / python3 是 ELF, 两条都不沾。
-  e2e_purge_shadow_stub ip python3 py3-real
   # 真内核二进制留着(几十 MB, 每个脚本重下一遍既慢又会在没网时把用例整条 skip 成假绿);
   # 但**桩**版本要清 —— 拿 `-t` 恒 0 的假 mihomo 当内核, 配置校验类用例会静默失效。
   if command -v mihomo >/dev/null 2>&1 && ! e2e_mihomo_is_real; then
@@ -233,6 +268,9 @@ e2e_stub_uninstall(){
   for f in /usr/local/bin/systemctl /usr/local/bin/nft; do
     [[ -f "$f" ]] && grep -qF -- "$E2E_TMP" "$f" 2>/dev/null && rm -f "$f"
   done
+  # 影子桩同样在退出时主动清 —— "反正下一支进场会清"是不成立的: serial 的**最后一支**
+  # 后面没有下一支, 桩就留在容器里跑到下一个 job。
+  e2e_purge_shadow_stub ip python3 py3-real || true
   return 0
 }
 

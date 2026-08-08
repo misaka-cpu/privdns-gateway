@@ -101,8 +101,13 @@ chmod 755 /usr/local/bin/mihomo
 
 # `ip -4 -o addr show scope global` 的桩: 救援平面靠它挑监听地址候选。沙箱里没有真网卡,
 # 不桩的话"来源段内恰好一个本机地址"这条路径根本走不到, bind-auto 那格就成了空测试。
+# 自己造的桩自己撤 —— 下一支进场那道兜底是保险, 不是分工(它连异常退出都要兜)。
+_rml_drop_ip_stub(){ e2e_purge_shadow_stub ip || true; }
+e2e_add_exit_hook _rml_drop_ip_stub
+
 _stub_ip(){                      # $@ = 要出现在 scope global 里的地址(可为空)
   { echo '#!/bin/sh'
+  echo "$E2E_STUB_MARK"   # 归属标记: 只有带这行的才会被 e2e_purge_shadow_stub 清掉
     echo 'if [ "$1" = "-4" ]; then'
     for a in "$@"; do echo "  echo '1: eth0    inet $a/16 brd 127.255.255.255 scope global eth0\\       valid_lft forever'"; done
     echo '  exit 0'

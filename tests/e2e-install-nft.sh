@@ -228,8 +228,14 @@ cp -f "$REAL_PY" /usr/local/bin/py3-real 2>/dev/null || cp "$REAL_PY" /usr/local
 put_py_stub(){   # 写一个 python3 桩(先删: 上一步可能留下指向真解释器的符号链接, 直接写会写穿)
   rm -f /usr/local/bin/python3
   cat > /usr/local/bin/python3
+  # 归属标记插在 shebang 之后 —— 桩内容由调用方从 stdin 给, 所以只能事后插。
+  # 没有这行, 异常退出留下的桩在下一支进场时会被当成"用户的真 python3"而拒绝删除。
+  sed -i "1a $E2E_STUB_MARK" /usr/local/bin/python3
   chmod 755 /usr/local/bin/python3
 }
+# restore_py 只挂在两条正常路径上; 异常退出走这里(留下的是符号链接, 也要撤)。
+_nft_drop_py_stub(){ e2e_purge_shadow_stub python3 py3-real || true; }
+e2e_add_exit_hook _nft_drop_py_stub
 restore_py(){ rm -f /usr/local/bin/python3; ln -sf /usr/local/bin/py3-real /usr/local/bin/python3; }
 # 真实模拟"机器上没有 python3": 造一个 PATH 目录, 把系统各 bin 目录里的命令**除 python3**
 # 全部软链进来, 然后只用它当 PATH。比 bind mount 可靠(bind 到符号链接上 `command -v` 仍能
