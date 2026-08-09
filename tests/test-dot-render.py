@@ -55,6 +55,16 @@ def extract_render():
     return m.group(0) if m else None
 
 
+def _rescue_port():
+    """从 lib/rescue.sh 读救援端口, 不在测试里再写一份数字 —— 那个端口的单一事实源就是
+    那个文件, tests/test-rescue-constants.sh 有守卫盯着全仓不许散落字面量。"""
+    src = open(os.path.join(ROOT, "lib", "rescue.sh")).read()
+    m = re.search(r"PDG_RESCUE_PORT:-(\d+)", src)
+    if not m:
+        raise SystemExit("读不到 lib/rescue.sh 的 PDG_RESCUE_PORT")
+    return m.group(1)
+
+
 def run_render(domain, extra_env=None):
     """用真 render() 渲染模板, 返回 (rc, stdout, stderr)。"""
     fn = extract_render()
@@ -65,7 +75,7 @@ def run_render(domain, extra_env=None):
         "CERT_DIR": "/etc/privdns-gateway/dot", "SSH_PORT": "22",
         "MOSDNS_CACHE": "8192", "JOURNALD_MAXUSE": "200M",
         "HIJACK_SET_FILE": "geosite_geolocation-!cn.txt",
-        "PDG_RESCUE_PORT": "8446", "RESCUE_BIND": "203.0.113.1",
+        "PDG_RESCUE_PORT": _rescue_port(), "RESCUE_BIND": "203.0.113.1",
         "DOT_DOMAIN": domain, "SRC": ROOT, "REPO_DIR": ROOT,
     }
     env.update(extra_env or {})

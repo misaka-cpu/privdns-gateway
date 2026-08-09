@@ -103,7 +103,10 @@ RENDERED="$WORK/config.yaml"
   SERVER_IP=203.0.113.1; INTERNAL_CIDR=127.0.0.0/8; CERT_DIR="$WORK"
   SSH_PORT=22; MOSDNS_CACHE=8192; JOURNALD_MAXUSE=200M
   HIJACK_SET_FILE='geosite_geolocation-!cn.txt'
-  PDG_RESCUE_PORT=8446; RESCUE_BIND=203.0.113.1
+  # 救援端口从 lib/rescue.sh 读, 不写死(见 tests/test-rescue-constants.sh 的单一事实源守卫)
+  # shellcheck source=lib/rescue.sh
+  source "$E2E_ROOT/lib/rescue.sh"
+  RESCUE_BIND=203.0.113.1
   DOT_DOMAIN="$DOT_DOMAIN"; REPO_DIR="$E2E_ROOT"
   export SERVER_IP INTERNAL_CIDR CERT_DIR SSH_PORT MOSDNS_CACHE JOURNALD_MAXUSE
   export HIJACK_SET_FILE PDG_RESCUE_PORT RESCUE_BIND DOT_DOMAIN REPO_DIR
