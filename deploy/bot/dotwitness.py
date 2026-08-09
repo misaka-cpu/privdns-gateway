@@ -176,8 +176,12 @@ def _write_state(rec):
     blob = json.dumps(rec, ensure_ascii=False, sort_keys=True).encode("utf-8")
     if len(blob) > STATE_MAX_BYTES:
         return False
-    fd, tmp = tempfile.mkstemp(dir=d, prefix=".ev-")
+    # mkstemp 必须在 try **之内**: 目录被删/不可写时它抛的 FileNotFoundError、
+    # PermissionError 都是 OSError, 放在外面就会一路冒到 serve() 把进程带走 ——
+    # 那不是 fail-closed, 是 fail-crash: 客户端等不到回包, systemd 还会反复重启。
+    tmp = None
     try:
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=".ev-")
         os.fchmod(fd, 0o600)
         with os.fdopen(fd, "wb") as f:
             f.write(blob)
@@ -186,10 +190,11 @@ def _write_state(rec):
         os.replace(tmp, _state_path())
         return True
     except OSError:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
         return False
 
 
@@ -243,7 +248,10 @@ def serve(sock, suffix):
         qid, qname_raw, qtype, qname_lower = parsed
         label = match_probe(qname_raw, qname_lower, suffix)
         if label is not None:
-            record(label, qtype)       # 只有合规 label 才留证据
+            # 记不下来也不能把进程带走: 只报一个**固定类别**(不带 qname/label/来源),
+            # 然后照常回包 —— "没记上"由上层按"没观察到"处理, 不能变成假证据。
+            if not record(label, qtype):
+                print("dotwitness: state write failed", file=sys.stderr, flush=True)
         # 能解析出来的查询**一律给一个有界应答**, 哪怕 label 不合规。
         #
         # 为什么不能像以前那样静默丢弃: 钉定的 mosdns v5.3.4 只能按 qname 后缀 + SNI 路由

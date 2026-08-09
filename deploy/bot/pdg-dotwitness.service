@@ -53,6 +53,8 @@ SystemCallArchitectures=native
 
 MemoryMax=64M
 TasksMax=16
+# 崩溃时不落 core: 内存里可能有刚解析出来的 qname。
+LimitCORE=0
 
 Restart=on-failure
 RestartSec=2
