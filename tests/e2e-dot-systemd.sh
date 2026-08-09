@@ -8,15 +8,21 @@ if [[ "${PDG_E2E_ISOLATED:-}" != 1 || "$(id -u)" != 0 ]]; then
   echo "[SKIP] 非一次性隔离环境(需 PDG_E2E_ISOLATED=1 且 root) —— 不在宿主上装 unit"
   echo; echo "通过 0, 失败 0, 跳过 1"; exit 0
 fi
-R="${PDG_DOTW_REPO:-/srv/repo}"; p=0; f=0; s=0
-ok(){ p=$((p+1)); echo "[OK]   $*"; }; bad(){ f=$((f+1)); echo "[FAIL] $*"; }
-sk(){ s=$((s+1)); echo "[SKIP] $*"; }; sec(){ echo; echo "── $* ──"; }
+R="${PDG_DOTW_REPO:-/srv/repo}"
 
 # 走项目登记式临时目录, 不写死 /tmp。e2e_tmp_init 自带退出钩子, 不覆盖已有 trap。
+#
+# source **必须在**下面那几个计数函数之前: e2e-lib.sh 自己也定义 ok/bad, 放在后面会把
+# 本脚本的定义顶掉 —— 断言照常打印, 却全记到 lib 的计数器上, 汇总变成 0/0/0。
+# 零断言在本项目等同失败, 这种"看起来在跑其实没计数"的形态最难发现。
 # shellcheck source=tests/e2e-lib.sh
-source "${PDG_DOTW_REPO:-/srv/repo}/tests/e2e-lib.sh" 2>/dev/null || source "$R/tests/e2e-lib.sh"
+source "$R/tests/e2e-lib.sh"
 e2e_tmp_init || { echo "[FAIL] 临时目录初始化失败"; exit 1; }
 WORK="$E2E_TMP/sysd"; mkdir -p "$WORK"
+
+p=0; f=0; s=0
+ok(){ p=$((p+1)); echo "[OK]   $*"; }; bad(){ f=$((f+1)); echo "[FAIL] $*"; }
+sk(){ s=$((s+1)); echo "[SKIP] $*"; }; sec(){ echo; echo "── $* ──"; }
 
 sec "0. 环境"
 [ "$(ps -p 1 -o comm=)" = systemd ] && ok "PID1 是真 systemd" || { bad "PID1 不是 systemd"; exit 1; }
