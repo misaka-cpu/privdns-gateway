@@ -25,7 +25,9 @@ SIP=203.0.113.1
 render(){ sed -e "s|__SERVER_IP__|$SIP|g" -e 's|__INTERNAL_CIDR__|127.0.0.0/8|g' \
               -e 's|__CERT_DIR__|/tmp/nocert|g' -e 's|__SSH_PORT__|22|g' \
               -e 's|__MOSDNS_CACHE__|1024|g' -e 's|__HIJACK_SET_FILE__|geosite_gfw.txt|g' \
-              -e "s|__HIJACK_SET_FILE__|geosite_gfw.txt|g" "$ROOT/deploy/mosdns/config.yaml"; }
+              -e 's|__DOT_DOMAIN__|dot.hijack.test|g' \
+              -e "s|__HIJACK_SET_FILE__|geosite_gfw.txt|g" \
+              -e "s|__DOT_DOMAIN__|dot.hijack.test|g" "$ROOT/deploy/mosdns/config.yaml"; }
 gate(){ grep -c '!qname \$hijack_set' "$1"; }
 plug(){ grep -c '\- tag: hijack_set' "$1"; }
 
