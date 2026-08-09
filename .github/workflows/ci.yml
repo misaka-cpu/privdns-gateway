@@ -160,6 +160,23 @@ jobs:
       - name: "mosdns DNS 证据闸门 (API 暴露面: 阶段 3 因缓存导出/投喂端点停止)"
         run: python3 tests/test-link-dns-evidence.py
 
+      # 6.2A DoT 证据源。这六支是纯 Python, 不需要真 mosdns/systemd, 所以留在 lint;
+      # 需要真内核与真 systemd 的三支在下面各自成 job(e2e-dot / dot-systemd)。
+      # tests/helpers/dns-{stub,client}.py 是那两支 E2E 用的库, 没有断言输出,
+      # 不作为独立测试登记; tests/negctl/ 下的负控按项目惯例是本地手动门。
+      - name: "DoT 证据端契约 (SNI + 探测后缀双守卫; 只认 24 位小写 hex)"
+        run: python3 tests/test-dot-witness.py
+      - name: "DoT 配置输入闭包 (占位符都有生产者; witness 端口单一真源)"
+        run: python3 tests/test-dot-render.py
+      - name: "DoT 隐私与边界门 (每条判据先过反向夹具, 防扫不到也绿)"
+        run: python3 tests/test-dot-privacy.py
+      - name: "DoT 故障矩阵 (DNS parser 25 格 + 状态文件 24 格 + 原子写)"
+        run: python3 tests/test-dot-faults.py
+      - name: "DoT evidence 校验闭集与配置缺失时启动 fail-closed"
+        run: python3 tests/test-dot-strict.py
+      - name: "DoT 测试卫生 (异常/SystemExit/中断都要清掉临时目录)"
+        run: python3 tests/test-dot-tmpguard.py
+
       - name: "链路会话证据接进 linkstat (NOT_OBSERVED/PASS/STALE 语义与退出码隔离)"
         run: python3 tests/test-link-live.py
 
@@ -692,6 +709,135 @@ jobs:
       - name: "跑 ${{ matrix.script }}"
         env: { PDG_E2E_ISOLATED: "1" }
         run: bash tests/${{ matrix.script }}
+
+  # 6.2A DoT 证据源的真链路 E2E。单独成 job 而不是并进上面的矩阵: 这两支要真 mosdns
+  # 二进制, 而上面那步不装它 —— 塞进共享矩阵等于给每一个 E2E job 都加一次下载。
+  e2e-dot:
+    runs-on: ubuntu-latest
+    container:
+      image: debian:12
+    strategy:
+      fail-fast: false
+      matrix:
+        script:
+          - e2e-dot-witness.sh
+          - e2e-dot-isolation.sh
+    name: "E2E ${{ matrix.script }}"
+    steps:
+      - name: "先装 git(必须在 checkout 之前)"
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git ca-certificates >/dev/null
+      - uses: actions/checkout@v5
+      - name: 装依赖
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            bash curl ca-certificates python3 unzip openssl iproute2 coreutils procps psmisc >/dev/null
+      # 版本与哈希都取自 lib/versions.sh —— 与 install.sh 用的是同一个信任锚。
+      # 校验不过就让这一步失败, 不允许"下不到就跳过"。
+      - name: "装钉定 mosdns (SHA256 必须命中)"
+        run: |
+          set -euo pipefail
+          # shellcheck source=lib/versions.sh
+          source lib/versions.sh
+          curl -fsSL -o /tmp/mosdns.zip \
+            "https://github.com/IrineSistiana/mosdns/releases/download/${MOSDNS_VER}/mosdns-linux-amd64.zip"
+          echo "${PDG_SHA256[mosdns-amd64]}  /tmp/mosdns.zip" | sha256sum -c -
+          unzip -oq /tmp/mosdns.zip -d /usr/local/bin
+          chmod +x /usr/local/bin/mosdns
+          mosdns version
+      - name: "记录共享桩基线(测试不许动这些真程序)"
+        run: |
+          set -euo pipefail
+          for f in systemctl nft ip python3; do
+            p="/usr/local/bin/$f"
+            if [ -e "$p" ]; then printf '%s\t%s\t%s\n' "$f" "$(stat -c %F "$p")" "$(sha256sum "$p" 2>/dev/null | cut -d' ' -f1)"
+            else printf '%s\tabsent\t-\n' "$f"; fi
+          done > /tmp/stub-baseline.txt
+          cat /tmp/stub-baseline.txt
+      - name: "跑 ${{ matrix.script }}"
+        env: { PDG_E2E_ISOLATED: "1" }
+        run: bash tests/${{ matrix.script }}
+      - name: "退出后不许留下进程/端口/临时目录/影子桩"
+        run: |
+          set -uo pipefail
+          fail=0
+          for f in systemctl nft ip python3; do
+            p="/usr/local/bin/$f"
+            if [ -e "$p" ]; then now="$(printf '%s\t%s\t%s' "$f" "$(stat -c %F "$p")" "$(sha256sum "$p" 2>/dev/null | cut -d' ' -f1)")"
+            else now="$(printf '%s\tabsent\t-' "$f")"; fi
+            base="$(grep -P "^$f\t" /tmp/stub-baseline.txt)"
+            [ "$now" = "$base" ] || { echo "共享程序被动过: $f"; echo "  前: $base"; echo "  后: $now"; fail=1; }
+          done
+          pgrep -f '[m]osdns start' >/dev/null && { echo "残留 mosdns 进程"; fail=1; }
+          pgrep -f '[d]otwitness.py' >/dev/null && { echo "残留 witness 进程"; fail=1; }
+          ss -lun 2>/dev/null | grep -q ':5399' && { echo "5399 仍在监听"; fail=1; }
+          [ -e /etc/systemd/system/pdg-dotwitness.service ] && { echo "残留 unit"; fail=1; }
+          [ -e /run/pdg-dotwitness ] && { echo "残留 RuntimeDirectory"; fail=1; }
+          leftover="$(ls -d /tmp/e2e-tmp.* /tmp/pdg-dot* /tmp/pdg-negctl-* 2>/dev/null || true)"
+          [ -n "$leftover" ] && { echo "残留临时目录: $leftover"; fail=1; }
+          exit "$fail"
+
+  # unit 硬化与"配置缺失就启动失败"只能在**真 systemd** 下验。上面那些 job 跑在容器里,
+  # PID 1 不是 systemd; 而 GitHub runner 本身的 PID 1 就是 —— 所以这支不进容器。
+  # 代码用 git archive 注入一次性只读快照, 不让 root 测试写正式工作树。
+  dot-systemd:
+    runs-on: ubuntu-latest
+    name: "真 systemd: DoT witness unit 硬化与 fail-closed"
+    steps:
+      - uses: actions/checkout@v5
+      - name: "PID 1 必须是真 systemd(不是就判失败, 不 SKIP)"
+        run: |
+          set -euo pipefail
+          comm="$(ps -p 1 -o comm=)"
+          echo "PID1 = $comm"
+          test "$comm" = systemd
+          command -v systemctl
+          test "$(command -v systemctl)" = /usr/bin/systemctl || test "$(command -v systemctl)" = /bin/systemctl
+      - name: "注入当前 commit 的只读快照"
+        run: |
+          set -euo pipefail
+          sudo rm -rf /srv/pdg-snap && sudo mkdir -p /srv/pdg-snap
+          git archive --format=tar HEAD | sudo tar x -C /srv/pdg-snap
+          sudo chown -R root:root /srv/pdg-snap
+          echo "快照文件数: $(sudo find /srv/pdg-snap -type f | wc -l)"
+      - name: "记录共享程序基线"
+        run: |
+          set -euo pipefail
+          for f in systemctl nft ip python3; do
+            p="/usr/local/bin/$f"
+            if [ -e "$p" ]; then printf '%s\t%s\t%s\n' "$f" "$(stat -c %F "$p")" "$(sha256sum "$p" 2>/dev/null | cut -d' ' -f1)"
+            else printf '%s\tabsent\t-\n' "$f"; fi
+          done | sudo tee /tmp/stub-baseline.txt
+      - name: "跑 e2e-dot-systemd.sh"
+        run: sudo -E env PDG_E2E_ISOLATED=1 bash /srv/pdg-snap/tests/e2e-dot-systemd.sh
+      - name: "root 下真跑 test-dot-strict.py, owner 契约 SKIP 必须为 0"
+        run: |
+          set -euo pipefail
+          out="$(sudo -E env PDG_E2E_ISOLATED=1 python3 /srv/pdg-snap/tests/test-dot-strict.py)"
+          echo "$out" | tail -4
+          echo "$out" | grep -qE '失败 0, 跳过 0$' \
+            || { echo "root 下 strict 仍有失败或 SKIP"; exit 1; }
+      - name: "退出后不许留下 unit/端口/状态/影子桩"
+        run: |
+          set -uo pipefail
+          fail=0
+          for f in systemctl nft ip python3; do
+            p="/usr/local/bin/$f"
+            if [ -e "$p" ]; then now="$(printf '%s\t%s\t%s' "$f" "$(stat -c %F "$p")" "$(sha256sum "$p" 2>/dev/null | cut -d' ' -f1)")"
+            else now="$(printf '%s\tabsent\t-' "$f")"; fi
+            base="$(grep -P "^$f\t" /tmp/stub-baseline.txt)"
+            [ "$now" = "$base" ] || { echo "共享程序被动过: $f / 前[$base] 后[$now]"; fail=1; }
+          done
+          [ -e /etc/systemd/system/pdg-dotwitness.service ] && { echo "残留 unit"; fail=1; }
+          [ -e /run/pdg-dotwitness ] && { echo "残留 RuntimeDirectory"; fail=1; }
+          ss -lun 2>/dev/null | grep -q ':5399' && { echo "5399 仍在监听"; fail=1; }
+          pgrep -f '[d]otwitness.py' >/dev/null && { echo "残留 witness 进程"; fail=1; }
+          leftover="$(ls -d /tmp/pdg-dot* /tmp/e2e-tmp.* 2>/dev/null || true)"
+          [ -n "$leftover" ] && { echo "残留临时目录: $leftover"; fail=1; }
+          sudo rm -rf /srv/pdg-snap
+          exit "$fail"
 
   # 串行 hermetic 守卫: 就算将来有人把这些脚本又塞回同一个环境顺序跑, 也必须全绿。
   # 这条专门盯"脚本之间互相踩"的回归 —— 矩阵拆开只是让 CI 不受影响, 并不能保证脚本本身干净。
