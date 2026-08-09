@@ -457,6 +457,10 @@ render_via_install(){   # 走 install.sh 里那条 render() 的**真实定义**(
   {
     echo 'SERVER_IP=x; INTERNAL_CIDR=x; CERT_DIR=x; SSH_PORT=x; MOSDNS_CACHE=x'
     echo 'JOURNALD_MAXUSE=x; HIJACK_SET_FILE=x'
+    # DOT_DOMAIN 也是 render() 的必需输入: 6.2A 起它在函数入口做 fail-closed 校验
+    # (缺值或非法就 return 1, 不静默留占位符)。救援模板本身不含该占位符, 但共享渲染器
+    # 的输入集合是统一的 —— 少一项就渲染不出来, 这正是那道校验该有的行为。
+    echo 'DOT_DOMAIN=dot.rescue.test'
     echo "PDG_RESCUE_PORT='$port'; RESCUE_BIND='$bind'"
     # 从顶层 `render(){` 抽到它真正的收尾 `"$1"; }` —— 不假设第一条命令是 sed
     # (6.2A 起 render 先做 DoT 域名校验), 也不依赖固定行号或缩进。
