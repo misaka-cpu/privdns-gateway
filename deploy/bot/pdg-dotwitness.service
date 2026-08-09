@@ -5,6 +5,10 @@ Description=PrivDNS Gateway DoT 证据端 (仅回环; 每会话探测证据)
 Documentation=file:///opt/privdns-gateway/docs/ROADMAP.md
 After=network.target
 PartOf=mosdns.service
+# 起不来就别无限重试打满日志: 5 分钟内超过 5 次就停下, 等人来看。
+# (这两个键属于 [Unit]; 放进 [Service] systemd 会忽略, 限速就成了摆设。)
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -52,9 +56,6 @@ TasksMax=16
 
 Restart=on-failure
 RestartSec=2
-# 起不来就别无限重试打满日志: 5 分钟内超过 5 次就停下, 等人来看。
-StartLimitIntervalSec=300
-StartLimitBurst=5
 
 [Install]
 WantedBy=multi-user.target
