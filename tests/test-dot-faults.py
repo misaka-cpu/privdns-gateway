@@ -262,15 +262,15 @@ for i, (nm, mk) in enumerate((("3  evidence 是目录", lambda p: os.makedirs(p)
 d = fresh("c6")
 write_good(d)
 os.chmod(os.path.join(d, "evidence.json"), 0o644)
+(ok if W._read_state() == "CORRUPT" else bad)("6  mode 被改宽 → 不读取")
 W.record(LABEL2, 1)
 (ok if oct(os.stat(os.path.join(d, "evidence.json")).st_mode & 0o777) == "0o600" else bad)(
-    "6  mode 被改宽后, 下一次写回落到 0600")
+    "6  下一次写回落到 0600")
 if os.getuid() == 0:
     d = fresh("c7")
     write_good(d)
     os.chown(os.path.join(d, "evidence.json"), 65534, 65534)
-    st = W._read_state()
-    (ok if isinstance(st, dict) else bad)("7  owner 变化不影响读(内容仍可解析) —— 记录为边界")
+    (ok if W._read_state() == "CORRUPT" else bad)("7  owner 不是当前 UID → 不读取")
 else:
     skip("7  owner 注入需要 root")
 
@@ -299,20 +299,19 @@ corrupt("c17", json.dumps(dict(json.loads(good_blob), expires_at=None)).encode()
 d = fresh("c13")
 extra = dict(json.loads(good_blob), extra_field=1)
 open(os.path.join(d, "evidence.json"), "w").write(json.dumps(extra))
-st = W._read_state()
-(ok if isinstance(st, dict) else bad)("13 多字段 → 读得出来(宽进), 但 record 会整份重写")
-W.record(LABEL2, 1)
-(ok if "extra_field" not in json.load(open(os.path.join(d, "evidence.json"))) else bad)(
-    "13 下一次写入把多余字段清掉")
+os.chmod(os.path.join(d, "evidence.json"), 0o600)
+(ok if W._read_state() == "CORRUPT" else bad)("13 多字段 → 判 CORRUPT(字段集合必须精确相等)")
+W.purge_stale()
+(ok if not os.path.exists(os.path.join(d, "evidence.json")) else bad)("13 多字段状态被启动清理删除")
 
 d = fresh("c15")
 open(os.path.join(d, "evidence.json"), "w").write(
     json.dumps(dict(json.loads(good_blob), probe_label_sha256="not-a-sha")))
-st = W._read_state()
-(ok if isinstance(st, dict) else bad)("15 非法 SHA256 → 结构上仍可读(记录为边界)")
+os.chmod(os.path.join(d, "evidence.json"), 0o600)
+(ok if W._read_state() == "CORRUPT" else bad)("15 非法 SHA256 → 判 CORRUPT(必须 64 位小写 hex)")
 (ok if W.record(LABEL, 1) and json.load(open(os.path.join(d, "evidence.json")))[
     "probe_label_sha256"] == hashlib.sha256(LABEL.encode()).hexdigest() else bad)(
-    "15 下一次合法查询把它覆盖成正确哈希")
+    "15 下一次合法查询写出正确哈希")
 
 d = fresh("c18")
 write_good(d, now=time.time() - 10 * W.EVIDENCE_TTL_SECS)

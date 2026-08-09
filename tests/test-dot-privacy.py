@@ -181,9 +181,21 @@ gate("22. witness 不把 qname/label/来源交给 print/stderr",
      lambda t: not logs_user_input(t), WSRC,
      WSRC.replace('print("dotwitness: listening on loopback',
                   'print(qname_raw)\n    print("dotwitness: listening on loopback'))
-gate("23. 状态写入经临时文件 + os.replace",
-     lambda t: "mkstemp" in t and "os.replace" in t, WSRC,
-     WSRC.replace("os.replace(tmp, _state_path())", "open(_state_path(),'wb').write(blob)"))
+# 判据要盯"写状态这条路径本身", 不是全文出现过这两个词 —— 收紧 schema 之后文件里
+# 别处也有 mkstemp/replace, 宽判据会被反向夹具骗过。
+def _atomic_write(t):
+    import re as _re
+    m = _re.search(r"def _write_state\(rec\):.*?(?=\ndef )", t, _re.S)
+    b = m.group(0) if m else ""
+    # 先去注释: 这个函数的注释里正好解释了"os.replace 会把目录项换掉", 不去掉的话
+    # 判据会被注释骗过(和 unit 那条 #21 同一个坑)。
+    b = _re.sub(r"^\s*#.*$", "", b, flags=_re.M)
+    return "mkstemp" in b and "os.replace" in b
+
+
+gate("23. 状态写入经临时文件 + os.replace", _atomic_write, WSRC,
+     WSRC.replace("        os.replace(tmp, _state_path())\n",
+                  "        open(_state_path(), 'wb').write(blob)\n"))
 gate("24. 状态文件上限仍为 4096",
      lambda t: re.search(r"^STATE_MAX_BYTES\s*=\s*4096", t, re.M) is not None, WSRC,
      "STATE_MAX_BYTES = 1048576\n")
