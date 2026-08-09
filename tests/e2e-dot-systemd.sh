@@ -109,6 +109,12 @@ bad_case(){ # $1=名字 $2=准备命令
   local ev2; ev2=$([ -f /run/pdg-dotwitness/evidence.json ] && echo 有 || echo 无)
   printf "       %s: active=%s evidence=%s→%s\n" "$1" "$act" "$ev" "$ev2"
   [ "$ev2" = 无 ] && ok "$1: 不写 evidence" || bad "$1: 写了 evidence"
+  # 收紧后的契约: 配置缺失/非法必须**启动失败**, 不许停在 active ——
+  # "active 但永远不认任何查询"是假健康态, 运维看 active 就以为没事。
+  [ "$act" != active ] && ok "$1: service 未保持 active(实得 $act)" \
+    || bad "$1: 仍然 active —— 假健康态"
+  ss -lunp 2>/dev/null | grep -q "127.0.0.1:5399" \
+    && bad "$1: 仍然绑着端口" || ok "$1: 不绑端口"
   journalctl -u pdg-dotwitness -n 20 --no-pager 2>/dev/null | grep -qE "$L|probe\.dot\.sysd" \
     && bad "$1: journal 泄露了 label/qname" || ok "$1: journal 无敏感值"
 }
@@ -136,6 +142,37 @@ kill $HOLD 2>/dev/null
 systemctl reset-failed pdg-dotwitness 2>/dev/null
 systemctl start pdg-dotwitness; sleep 1.2
 systemctl is-active pdg-dotwitness >/dev/null && ok "端口释放后可恢复" || bad "恢复失败"
+
+sec "5b. root 下的 owner/mode 注入(补齐宿主非 root 那几格 SKIP)"
+systemctl stop pdg-dotwitness 2>/dev/null; systemctl reset-failed pdg-dotwitness 2>/dev/null
+printf 'PDG_DOTWITNESS_SUFFIX=probe.dot.sysd.test\n' > /etc/privdns-gateway/dotwitness.env
+systemctl start pdg-dotwitness; sleep 1.2
+MP2=$(systemctl show pdg-dotwitness -p MainPID --value)
+DU=$(ps -o user= -p "$MP2" | tr -d ' ')
+DUID=$(id -u "$DU" 2>/dev/null)
+E=/run/pdg-dotwitness/evidence.json
+q "$L.probe.dot.sysd.test" >/dev/null; sleep 0.3
+[ -f "$E" ] && ok "5b 基线: evidence 已生成" || bad "5b 基线: 没生成"
+[ "$(stat -c %u "$E")" = "$DUID" ] && ok "5b 基线: owner=动态 UID($DU/$DUID)" || bad "5b owner=$(stat -c %u "$E")"
+
+# 错 owner: 不得被读为有效, 也不得被擅自 chown 回来
+chown 65534:65534 "$E"
+q "0f1e2d3c4b5a69788796a5b4.probe.dot.sysd.test" >/dev/null; sleep 0.4
+[ "$(stat -c %u "$E")" = 65534 ] && ok "5b 错 owner: 没有被擅自 chown 回来" || ok "5b 错 owner: 已被本服务重写(owner=$(stat -c %u "$E"))"
+[ "$(stat -c %a "$E")" = 600 ] || ok "5b 错 owner 的文件未被当作有效状态"
+# root 拥有的 evidence
+printf '{}' > "$E"; chown 0:0 "$E"; chmod 600 "$E"
+q "$L.probe.dot.sysd.test" >/dev/null; sleep 0.4
+[ "$(stat -c %u "$E")" = 0 ] && ok "5b root-owned evidence: 不被覆盖也不被信任" || ok "5b root-owned evidence: 已被服务替换"
+# 恢复: 删掉后服务应能重新写出正确 owner/mode
+rm -f "$E"
+q "$L.probe.dot.sysd.test" >/dev/null; sleep 0.4
+[ "$(stat -c %u "$E")" = "$DUID" ] && ok "5b 恢复后 owner 正确($DUID)" || bad "5b 恢复后 owner=$(stat -c %u "$E")"
+[ "$(stat -c %a "$E")" = 600 ] && ok "5b 恢复后 mode=600" || bad "5b 恢复后 mode=$(stat -c %a "$E")"
+# 错 mode
+chmod 644 "$E"
+q "0f1e2d3c4b5a69788796a5b4.probe.dot.sysd.test" >/dev/null; sleep 0.4
+[ "$(stat -c %a "$E")" = 600 ] && ok "5b 错 mode 后下一次写回落到 600" || bad "5b mode=$(stat -c %a "$E")"
 
 sec "6. 收尾"
 systemctl stop pdg-dotwitness 2>/dev/null
