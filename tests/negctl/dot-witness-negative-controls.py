@@ -161,6 +161,17 @@ def run_test(cp, rel, extra_env=None):
     return r.returncode, (r.stdout or "") + (r.stderr or "")
 
 
+def judge(num, name, total_hit, reds):
+    """裁决层。单独抽出来是为了让自检能直接喂 red_count=0 —— 靠"找一个看起来无害的
+    生产改动"来验这条, 结果依赖环境(某支测试恰好因别的原因红/不红), 宿主与容器会给出
+    不同答案。合成输入才是环境无关的。"""
+    if reds:
+        ok("NC%02d %s → 锚点 %d 处, 转红 %d 支: %s"
+           % (num, name, total_hit, len(reds), ", ".join(reds)))
+    else:
+        bad("NC%02d %s → 锚点 %d 处命中但 **0 条转红**, 负控无效" % (num, name, total_hit))
+
+
 def nc(cp, num, name, rel, edits, hits, catchers, expect_syntax_ok=True):
     """一条负控。edits = [(old, new, 预期命中次数), ...]"""
     src = cp.read(rel)
@@ -188,11 +199,7 @@ def nc(cp, num, name, rel, edits, hits, catchers, expect_syntax_ok=True):
             rc, _ = run_test(cp, t)
             if rc != 0:
                 reds.append(os.path.basename(t))
-        if reds:
-            ok("NC%02d %s → 锚点 %d 处, 转红 %d 支: %s"
-               % (num, name, total_hit, len(reds), ", ".join(reds)))
-        else:
-            bad("NC%02d %s → 锚点 %d 处命中但 **0 条转红**, 负控无效" % (num, name, total_hit))
+        judge(num, name, total_hit, reds)
     finally:
         cp.restore(rel)
         if sha(cp.path(rel)) != cp.base[rel]:
@@ -222,9 +229,7 @@ def self_check():
                                             [("return None", "return None", 1)], 1, PY_TESTS))
     # 真正的空操作: 文件末尾追一行注释。改注释正文会被静态门抓到(它比对源码结构),
     # 那样就不是"无害"了 —— 自检第 3 项要的恰恰是"改了但没人该管"。
-    probe("3 改坏后 0 条转红", lambda c: nc(c, 92, "自检:无害改动", U,
-                                            [("[Install]", "# negctl self-check no-op\n[Install]", 1)],
-                                            1, PY_TESTS))
+    probe("3 改坏后 0 条转红", lambda c: judge(92, "自检:合成 red_count=0", 1, []))
     probe("4 改坏后语法损坏", lambda c: nc(c, 93, "自检:语法损坏", W,
                                           [("def _valid(rec):", "def _valid(rec:", 1)], 1, PY_TESTS))
 
