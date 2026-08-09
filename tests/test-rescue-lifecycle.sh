@@ -458,7 +458,9 @@ render_via_install(){   # 走 install.sh 里那条 render() 的**真实定义**(
     echo 'SERVER_IP=x; INTERNAL_CIDR=x; CERT_DIR=x; SSH_PORT=x; MOSDNS_CACHE=x'
     echo 'JOURNALD_MAXUSE=x; HIJACK_SET_FILE=x'
     echo "PDG_RESCUE_PORT='$port'; RESCUE_BIND='$bind'"
-    sed -n '/^render(){ sed/,/"\$1"; }/p' "$ROOT/install.sh"
+    # 从顶层 `render(){` 抽到它真正的收尾 `"$1"; }` —— 不假设第一条命令是 sed
+    # (6.2A 起 render 先做 DoT 域名校验), 也不依赖固定行号或缩进。
+    sed -n '/^render(){/,/"\$1"; }/p' "$ROOT/install.sh"
     for f in pdg-rescue.socket pdg-rescue.service; do
       echo "render '$ROOT/deploy/rescue/$f' > '$out/$f'"
     done

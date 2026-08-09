@@ -186,7 +186,9 @@ else:
 print()
 print("── 4. 装机时怎么定监听地址 ──")
 inst = open(os.path.join(ROOT, "install.sh"), encoding="utf-8").read()
-blk = inst[inst.index("RESCUE_BIND=\"${PDG_RESCUE_BIND:-}\""):inst.index("render(){ sed -e")]
+# 锚到 `render(){` 而不是 `render(){ sed -e`: render 的第一条命令不一定是 sed
+# (6.2A 起它先做 DoT 域名 fail-closed 校验)。按函数头定位, 不按第一条命令。
+blk = inst[inst.index("RESCUE_BIND=\"${PDG_RESCUE_BIND:-}\""):inst.index("\nrender(){")]
 if "PDG_RESCUE_BIND" in blk and "pdg_rescue_bind " in blk:
     ok("显式值(环境变量 / 已有 profile.env)优先")
 else:
