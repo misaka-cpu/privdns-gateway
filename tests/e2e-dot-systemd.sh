@@ -49,8 +49,6 @@ stat -c %a /run/pdg-dotwitness | grep -qx 700 && ok "RuntimeDirectory 实际 mod
 sec "2. 监听面与写权限"
 ss -lunp 2>/dev/null | grep -q '127.0.0.1:5399' && ok "只监听 127.0.0.1:5399" || bad "监听异常: $(ss -lunp | grep 5399)"
 ss -lunp 2>/dev/null | grep -E '0\.0\.0\.0:5399|\[::\]:5399' && bad "监听了任意地址" || ok "没有监听任意地址"
-# shellcheck disable=SC2016  # heredoc 里是 python 源码, $ 不该被 shell 展开
-py(){ python3 - "$@"; }
 q(){ py <<PY
 import socket,struct
 n="$1".rstrip(".").split(".")
