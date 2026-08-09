@@ -139,9 +139,40 @@ plugins:
       - exec: jump has_resp
       - exec: $ecs_neutral
       - exec: $remote_upstream
+  # 6.2A DoT 证据: 把探测查询交给只绑回环的证据端。
+  # 转发地址里的端口对应 deploy/bot/dotwitness.py 的 DOTWITNESS_PORT(单一事实源),
+  # tests/test-dot-witness.py 有静态门盯着两边不许分叉。
+  - tag: dotwitness_fwd
+    type: forward
+    args:
+      concurrent: 1
+      upstreams:
+        - addr: "udp://127.0.0.1:5399"
+  - tag: probe_seq
+    type: sequence
+    args:
+      - exec: $dotwitness_fwd
+      - exec: jump has_resp
   - tag: main_sequence
     type: sequence
     args:
+      # ── 探测命名空间: 两个条件同时成立才进(matches 列表是**与**, 已用钉定版本实测) ──
+      #   1) qname 落在 `probe.<DoT域名>` 之下;
+      #   2) TLS SNI 恰好等于 DoT 域名 —— 明文 UDP/TCP 53 的 server_name 恒为空字符串,
+      #      所以它们永远进不来。这一条就是"经过 DoT"的判据本身。
+      # 位置必须在 internal_sequence(以及它里面的 lazy_cache)之前: 排在缓存之后的话,
+      # 同一 label 第二次查就可能直接命中缓存, 根本到不了证据端。
+      # 只影响这个命名空间: 任何其它 qname 一个判据都不满足, 逐字节走原来的路。
+      #
+      # ⚠ 6.2B 必须先补的一行: install.sh 的 render() 目前**不替换** __DOT_DOMAIN__
+      #   (它只替换 SERVER_IP / INTERNAL_CIDR / CERT_DIR / SSH_PORT / MOSDNS_CACHE /
+      #    JOURNALD_MAXUSE / HIJACK_SET_FILE / RESCUE_PORT / RESCUE_BIND)。
+      #   未替换时这两条判据谁都匹配不上 —— 配置照常加载、普通 DNS 不受影响, 但探测分支
+      #   是**死的**。6.2A 按停止边界不碰安装路径, 所以这条缺口在本轮登记为 P1。
+      - matches:
+          - qname suffix probe.__DOT_DOMAIN__
+          - string_exp server_name eq __DOT_DOMAIN__
+        exec: goto probe_seq
       - matches: client_ip $npn_clients
         exec: goto internal_sequence
       - matches: qname $geosite_unlock

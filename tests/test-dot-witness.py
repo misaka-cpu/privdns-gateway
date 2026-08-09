@@ -164,11 +164,18 @@ else:
     bad("分支带 qname 探测后缀判据(分支不存在)")
     bad("分支带 TLS server_name 判据(分支不存在)")
 
-if "probe_seq" in cfg and "lazy_cache" in cfg:
-    (ok if cfg.index("goto probe_seq") < cfg.index("$lazy_cache") else bad)(
-        "探测分支位于 lazy_cache 之前")
+# 位置判据要看**执行顺序**, 不是文件里的字面先后 —— internal_sequence(含 lazy_cache)
+# 定义在 main_sequence 前面, 但它是被 goto 进去的, 真正的先后由 main_sequence 内部决定。
+m_main = re.search(r"\n  - tag: main_sequence\n.*?(?=\n  - tag: )", cfg, re.S)
+main_body = m_main.group(0) if m_main else ""
+if "goto probe_seq" in main_body and "goto internal_sequence" in main_body:
+    (ok if main_body.index("goto probe_seq") < main_body.index("goto internal_sequence") else bad)(
+        "探测分支在 main_sequence 里排在 goto internal_sequence(即 lazy_cache)之前")
 else:
-    bad("探测分支位于 lazy_cache 之前(分支或 cache 不存在)")
+    bad("探测分支排在 lazy_cache 之前(main_sequence 里找不到其中一个 goto)")
+(ok if "$lazy_cache" not in (re.search(r"\n  - tag: probe_seq\n.*?(?=\n  - tag: )", cfg, re.S)
+                             or type("x", (), {"group": lambda s, n=0: ""})()).group(0) else bad)(
+    "探测分支自身不经过 cache")
 
 # ── 3. 证据端行为契约 ────────────────────────────────────────────────────────
 head("3. 证据端行为(真收发 UDP DNS 报文)")
