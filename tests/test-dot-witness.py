@@ -13,6 +13,7 @@
 import json
 import os
 import re
+import shutil
 import socket
 import struct
 import subprocess
@@ -65,7 +66,9 @@ class Witness:
 
     def __init__(self, suffix="probe.dot.lab.test"):
         self.port = free_port()
-        self.dir = tempfile.mkdtemp(prefix="pdg-dotw-")
+        # 建在 E2E_TMP 下(有的话)以便随沙箱一起清; 没有就自己建自己清 —— 早先这里
+        # mkdtemp 完从不删, 宿主 /tmp 里攒了一堆 pdg-dotw-*。
+        self.dir = tempfile.mkdtemp(prefix="pdg-dotw-", dir=os.environ.get("E2E_TMP") or None)
         self.suffix = suffix
         self.proc = None
 
@@ -133,6 +136,11 @@ class Witness:
                 self.proc.wait(timeout=5)
             except Exception:  # noqa: BLE001
                 self.proc.kill()
+        keep = os.environ.get("PDG_KEEP_TMP")
+        if keep not in (None, "", "0"):
+            print("[PDG_KEEP_TMP] 现场保留: %s" % self.dir)
+        else:
+            shutil.rmtree(self.dir, ignore_errors=True)
 
 
 LABEL = "a1b2c3d4e5f6a7b8c9d0e1f2"          # 12 字节 = 24 个小写 hex
