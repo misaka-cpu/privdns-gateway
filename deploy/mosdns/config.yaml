@@ -140,14 +140,14 @@ plugins:
       - exec: $ecs_neutral
       - exec: $remote_upstream
   # 6.2A DoT 证据: 把探测查询交给只绑回环的证据端。
-  # 转发地址里的端口对应 deploy/bot/dotwitness.py 的 DOTWITNESS_PORT(单一事实源),
-  # tests/test-dot-witness.py 有静态门盯着两边不许分叉。
+  # 端口不在这里写死: __DOTWITNESS_PORT__ 由渲染器从 deploy/bot/dotwitness.py 的
+  # DOTWITNESS_PORT 常量取值(单一事实源)。tests/test-dot-render.py 盯着两边不许分叉。
   - tag: dotwitness_fwd
     type: forward
     args:
       concurrent: 1
       upstreams:
-        - addr: "udp://127.0.0.1:5399"
+        - addr: "udp://127.0.0.1:__DOTWITNESS_PORT__"
   - tag: probe_seq
     type: sequence
     args:
@@ -163,12 +163,6 @@ plugins:
       # 位置必须在 internal_sequence(以及它里面的 lazy_cache)之前: 排在缓存之后的话,
       # 同一 label 第二次查就可能直接命中缓存, 根本到不了证据端。
       # 只影响这个命名空间: 任何其它 qname 一个判据都不满足, 逐字节走原来的路。
-      #
-      # ⚠ 6.2B 必须先补的一行: install.sh 的 render() 目前**不替换** __DOT_DOMAIN__
-      #   (它只替换 SERVER_IP / INTERNAL_CIDR / CERT_DIR / SSH_PORT / MOSDNS_CACHE /
-      #    JOURNALD_MAXUSE / HIJACK_SET_FILE / RESCUE_PORT / RESCUE_BIND)。
-      #   未替换时这两条判据谁都匹配不上 —— 配置照常加载、普通 DNS 不受影响, 但探测分支
-      #   是**死的**。6.2A 按停止边界不碰安装路径, 所以这条缺口在本轮登记为 P1。
       - matches:
           - qname suffix probe.__DOT_DOMAIN__
           - string_exp server_name eq __DOT_DOMAIN__
