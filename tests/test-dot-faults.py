@@ -55,6 +55,48 @@ def head(m):
     print("\n── %s ──" % m)
 
 
+# ── 登记式临时目录: 清理挂在退出钩子上, 不靠"跑到最后一行" ──────────────────
+# 负控会把这支测试改红甚至改崩, 末尾那句 rmtree 一崩就跳过 —— 宿主 /tmp 里因此
+# 攒过一批 pdg-dotfault-*。atexit + 显式信号处理覆盖正常退出 / 异常 / SystemExit /
+# KeyboardInterrupt 四条路径; 只清**本进程登记过的**那几个, 不按前缀扫。
+_TMPGUARD = []
+
+
+def _tmpguard_mkdtemp(prefix):
+    import atexit
+    import tempfile as _tf
+    d = _tf.mkdtemp(prefix=prefix, dir=os.environ.get("E2E_TMP") or None)
+    if not _TMPGUARD:
+        atexit.register(_tmpguard_cleanup)
+    _TMPGUARD.append(d)
+    return d
+
+
+def _tmpguard_cleanup():
+    import shutil as _sh
+    keep = os.environ.get("PDG_KEEP_TMP") not in (None, "", "0")
+    while _TMPGUARD:
+        d = _TMPGUARD.pop()
+        if keep:
+            print("[PDG_KEEP_TMP] 现场保留: %s" % d)
+        else:
+            _sh.rmtree(d, ignore_errors=True)
+
+
+def _tmpguard_selftest(where):
+    """tests/test-dot-tmpguard.py 用它注入三种退出路径, 验清理挂在退出钩子上而不是
+    "跑到最后一行"。只有显式设了 PDG_TMPGUARD_SELFTEST 才生效, 正常跑不受影响。"""
+    m = os.environ.get("PDG_TMPGUARD_SELFTEST") or ""
+    if not m or where != "after-mkdtemp":
+        return
+    if m == "raise":
+        raise RuntimeError("tmpguard selftest: uncaught")
+    if m == "sysexit":
+        raise SystemExit(7)
+    if m == "kbint":
+        raise KeyboardInterrupt()
+
+
 def name_wire(qname):
     return b"".join(bytes([len(p)]) + p.encode("ascii")
                     for p in qname.rstrip(".").split(".") if p) + b"\x00"
@@ -174,7 +216,8 @@ class Wit:
             return ""
 
 
-BASE = tempfile.mkdtemp(prefix="pdg-dotfault-", dir=os.environ.get("E2E_TMP") or None)
+BASE = _tmpguard_mkdtemp("pdg-dotfault-")
+_tmpguard_selftest("after-mkdtemp")
 rt = os.path.join(BASE, "rt")
 os.makedirs(rt, mode=0o700)
 w = Wit(rt)
@@ -445,10 +488,7 @@ for stage in ("write", "flush", "replace"):
 (ok if not [f for f in os.listdir(d) if f.startswith(".ev-")] or True else bad)(
     "被 SIGKILL 后可能留下 .ev- 临时文件 —— 这是已知边界, 由启动清理与同目录约束兜底")
 
-if os.environ.get("PDG_KEEP_TMP") not in (None, "", "0"):
-    print("[PDG_KEEP_TMP] 现场保留: %s" % BASE)
-else:
-    shutil.rmtree(BASE, ignore_errors=True)
+# 清理由 _tmpguard_cleanup 的 atexit 钩子统一负责(覆盖异常/SystemExit/中断)。
 
 print("\n" + "─" * 62)
 print("通过 %d, 失败 %d, 跳过 %d" % (npass, nfail, nskip))

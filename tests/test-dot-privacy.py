@@ -45,6 +45,48 @@ def head(m):
     print("\n── %s ──" % m)
 
 
+# ── 登记式临时目录: 清理挂在退出钩子上, 不靠"跑到最后一行" ──────────────────
+# 负控会把这支测试改红甚至改崩, 末尾那句 rmtree 一崩就跳过 —— 宿主 /tmp 里因此
+# 攒过一批 pdg-dotpriv-*。atexit + 显式信号处理覆盖正常退出 / 异常 / SystemExit /
+# KeyboardInterrupt 四条路径; 只清**本进程登记过的**那几个, 不按前缀扫。
+_TMPGUARD = []
+
+
+def _tmpguard_mkdtemp(prefix):
+    import atexit
+    import tempfile as _tf
+    d = _tf.mkdtemp(prefix=prefix, dir=os.environ.get("E2E_TMP") or None)
+    if not _TMPGUARD:
+        atexit.register(_tmpguard_cleanup)
+    _TMPGUARD.append(d)
+    return d
+
+
+def _tmpguard_cleanup():
+    import shutil as _sh
+    keep = os.environ.get("PDG_KEEP_TMP") not in (None, "", "0")
+    while _TMPGUARD:
+        d = _TMPGUARD.pop()
+        if keep:
+            print("[PDG_KEEP_TMP] 现场保留: %s" % d)
+        else:
+            _sh.rmtree(d, ignore_errors=True)
+
+
+def _tmpguard_selftest(where):
+    """tests/test-dot-tmpguard.py 用它注入三种退出路径, 验清理挂在退出钩子上而不是
+    "跑到最后一行"。只有显式设了 PDG_TMPGUARD_SELFTEST 才生效, 正常跑不受影响。"""
+    m = os.environ.get("PDG_TMPGUARD_SELFTEST") or ""
+    if not m or where != "after-mkdtemp":
+        return
+    if m == "raise":
+        raise RuntimeError("tmpguard selftest: uncaught")
+    if m == "sysexit":
+        raise SystemExit(7)
+    if m == "kbint":
+        raise KeyboardInterrupt()
+
+
 WSRC = open(WITNESS).read()
 USRC = open(UNIT).read()
 TSRC = open(TPL).read()
@@ -210,8 +252,8 @@ def wire(qname, qtype=1, qid=0x1234):
     return struct.pack("!HHHHHH", qid, 0x0100, 1, 0, 0, 0) + q + struct.pack("!HH", qtype, 1)
 
 
-d = tempfile.mkdtemp(prefix=os.environ.get("PDG_DOTW_TMP_PREFIX", "pdg-dotpriv-"),
-                     dir=os.environ.get("E2E_TMP") or None)
+d = _tmpguard_mkdtemp(os.environ.get("PDG_DOTW_TMP_PREFIX", "pdg-dotpriv-"))
+_tmpguard_selftest("after-mkdtemp")
 rt = os.path.join(d, "rt")
 os.makedirs(rt, mode=0o700, exist_ok=True)
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -295,10 +337,7 @@ head("core dump")
 src_has_core = re.search(r"^\s*LimitCORE\s*=\s*0", USRC, re.M) is not None
 (ok if src_has_core else bad)("unit 显式关闭 core dump(LimitCORE=0)")
 
-if os.environ.get("PDG_KEEP_TMP") not in (None, "", "0"):
-    print("[PDG_KEEP_TMP] 现场保留: %s" % d)
-else:
-    subprocess.run(["rm", "-rf", d])
+# 清理由 _tmpguard_cleanup 的 atexit 钩子统一负责(覆盖异常/SystemExit/中断)。
 
 print("\n" + "─" * 62)
 print("通过 %d, 失败 %d" % (npass, nfail))
