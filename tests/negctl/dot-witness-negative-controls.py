@@ -342,11 +342,13 @@ def main():
            ["tests/test-dot-privacy.py"])
         # 16-18 render 闭包
         nc(cp, 16, "render 不替换 DoT 域名", I,
-           [('              -e "s|__DOT_DOMAIN__|$DOT_DOMAIN|g" \\\n', "", 1)], 1,
+           [(' \\\n              -e "s|__DOT_DOMAIN__|$DOT_DOMAIN|g" "$1"; }', ' "$1"; }', 1)], 1,
            ["tests/test-dot-render.py"])
-        nc(cp, 17, "render 不替换 witness 端口", I,
-           [('              -e "s|__DOTWITNESS_PORT__|$DOTWITNESS_PORT|g" "$1"; }',
-             '              "$1"; }', 1)], 1, ["tests/test-dot-render.py"])
+        # NC17 已重新定义: 端口不再是占位符(那会让没跟上的渲染点加载失败), 现在是
+        # YAML 与 Python 两份表示。要抓的就是这两份**漂移**。
+        nc(cp, 17, "模板端口与 witness 默认端口漂移", M,
+           [('addr: "udp://127.0.0.1:5399"', 'addr: "udp://127.0.0.1:5400"', 1)], 1,
+           ["tests/test-dot-render.py"])
         nc(cp, 18, "dotwitness.env 不生成", I,
            [("( umask 022; printf 'PDG_DOTWITNESS_SUFFIX=probe.%s\\n' \"$DOT_DOMAIN\" > /etc/privdns-gateway/dotwitness.env )",
              ": # 不生成", 1)], 1, ["tests/test-dot-render.py"])
