@@ -35,9 +35,6 @@ SUFFIX="probe.$DOT_DOMAIN"
 LABEL="a1b2c3d4e5f6a7b8c9d0e1f2"                  # 12 字节 → 24 个小写 hex
 MOSDNS_BIN="$(command -v mosdns || true)"
 
-e2e_tmp_init || { bad "临时目录初始化失败"; summary; exit 1; }
-WORK="$E2E_TMP/dotw"; mkdir -p "$WORK/rt" "$WORK/rules"; chmod 700 "$WORK/rt"
-
 # ── 进程账本: 只杀自己起的, 绝不 pkill -f ──────────────────────────────────
 PIDS=()
 track(){ PIDS+=("$1"); }
@@ -57,11 +54,15 @@ stop_all(){
 }
 _cleanup(){
   stop_all
-  if e2e_keep_tmp; then echo "[PDG_KEEP_TMP] 现场保留: $WORK" >&2; fi
+  if e2e_keep_tmp; then echo "[PDG_KEEP_TMP] 现场保留: ${WORK:-$E2E_TMP}" >&2; fi
 }
-trap _cleanup EXIT
-trap '_cleanup; exit 130' INT
-trap '_cleanup; exit 143' TERM
+# 走 lib 的登记式钩子, **不要**自己 `trap ... EXIT` —— 那会把 lib 注册的
+# e2e_tmp_cleanup 顶掉, 临时目录就再也没人清(这一条是实测踩出来的: 容器里留下了
+# 两个 e2e-tmp.* 目录)。先登记本脚本的进程清理, 再 e2e_tmp_init 登记目录清理,
+# 顺序即执行顺序: 先停进程, 再删目录。
+e2e_add_exit_hook _cleanup || { echo "[FAIL] 注册清理钩子失败"; exit 1; }
+e2e_tmp_init || { bad "临时目录初始化失败"; summary; exit 1; }
+WORK="$E2E_TMP/dotw"; mkdir -p "$WORK/rt" "$WORK/rules"; chmod 700 "$WORK/rt"
 
 freeport(){ python3 -c 'import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()'; }
 CLIENT="$E2E_ROOT/tests/helpers/dns-client.py"
