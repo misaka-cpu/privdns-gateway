@@ -12,6 +12,12 @@ R="${PDG_DOTW_REPO:-/srv/repo}"; p=0; f=0; s=0
 ok(){ p=$((p+1)); echo "[OK]   $*"; }; bad(){ f=$((f+1)); echo "[FAIL] $*"; }
 sk(){ s=$((s+1)); echo "[SKIP] $*"; }; sec(){ echo; echo "── $* ──"; }
 
+# 走项目登记式临时目录, 不写死 /tmp。e2e_tmp_init 自带退出钩子, 不覆盖已有 trap。
+# shellcheck source=tests/e2e-lib.sh
+source "${PDG_DOTW_REPO:-/srv/repo}/tests/e2e-lib.sh" 2>/dev/null || source "$R/tests/e2e-lib.sh"
+e2e_tmp_init || { echo "[FAIL] 临时目录初始化失败"; exit 1; }
+WORK="$E2E_TMP/sysd"; mkdir -p "$WORK"
+
 sec "0. 环境"
 [ "$(ps -p 1 -o comm=)" = systemd ] && ok "PID1 是真 systemd" || { bad "PID1 不是 systemd"; exit 1; }
 install -m755 "$R/deploy/bot/dotwitness.py" /opt/pdg-bot/dotwitness.py 2>/dev/null || {
@@ -125,15 +131,15 @@ bad_case "suffix 含空格"   "printf 'PDG_DOTWITNESS_SUFFIX=a b\n' > $SAVE"
 bad_case "suffix 含路径"   "printf 'PDG_DOTWITNESS_SUFFIX=../etc/passwd\n' > $SAVE"
 bad_case "suffix 前导点"   "printf 'PDG_DOTWITNESS_SUFFIX=.probe..x\n' > $SAVE"
 printf 'PDG_DOTWITNESS_SUFFIX=probe.dot.sysd.test\n' > "$SAVE"
-bad_case "Python 文件缺失" "mv /opt/pdg-bot/dotwitness.py /tmp/dw.bak"
-mv /tmp/dw.bak /opt/pdg-bot/dotwitness.py
-bad_case "Python 语法损坏" "cp /opt/pdg-bot/dotwitness.py /tmp/dw.ok; printf 'def (\n' > /opt/pdg-bot/dotwitness.py"
-cp /tmp/dw.ok /opt/pdg-bot/dotwitness.py
+bad_case "Python 文件缺失" "mv /opt/pdg-bot/dotwitness.py \"$WORK/dw.bak\""
+mv "$WORK/dw.bak" /opt/pdg-bot/dotwitness.py
+bad_case "Python 语法损坏" "cp /opt/pdg-bot/dotwitness.py \"$WORK/dw.ok\"; printf 'def (\n' > /opt/pdg-bot/dotwitness.py"
+cp "$WORK/dw.ok" /opt/pdg-bot/dotwitness.py
 systemctl stop pdg-dotwitness 2>/dev/null; systemctl reset-failed pdg-dotwitness 2>/dev/null
 python3 -c "
 import socket,time
 s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.bind(('127.0.0.1',5399))
-open('/tmp/hold.pid','w').write('x'); time.sleep(30)" &
+time.sleep(30)" &
 HOLD=$!; sleep 0.6
 systemctl start pdg-dotwitness 2>/dev/null; sleep 1.5
 a=$(systemctl is-active pdg-dotwitness); r=$(systemctl show pdg-dotwitness -p Result --value)

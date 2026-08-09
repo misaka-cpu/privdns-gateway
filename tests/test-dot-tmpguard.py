@@ -12,7 +12,9 @@ import os
 import re
 import subprocess
 import sys
-import tempfile
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import tmpguard  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TARGETS = {
@@ -68,19 +70,18 @@ head("1. 三种退出路径都必须清理")
 for name, prefix in TARGETS.items():
     for mode, why in (("", "正常退出"), ("raise", "未捕获异常"),
                       ("sysexit", "SystemExit"), ("kbint", "KeyboardInterrupt")):
-        sandbox = tempfile.mkdtemp(prefix="pdg-tmpguard-")
-        try:
-            rc, out = run(name, sandbox, mode)
-            left = dirs_in(sandbox, prefix)
-            (ok if not left else bad)(
-                "%s / %s → 沙箱里 %s* 残留 %d 个" % (name, why, prefix, len(left)))
-        finally:
-            subprocess.run(["rm", "-rf", sandbox])
+        # 沙箱走 tmpguard 登记; **不在这里删** —— 对子进程残留的断言必须发生在父进程
+        # 最终清理之前, 而 tmpguard 的 atexit 在所有断言跑完后才动手, 两边都不冲突。
+        sandbox = tmpguard.mkdtemp(prefix="pdg-tmpguard.")
+        rc, out = run(name, sandbox, mode)
+        left = dirs_in(sandbox, prefix)
+        (ok if not left else bad)(
+            "%s / %s → 沙箱里 %s* 残留 %d 个" % (name, why, prefix, len(left)))
 
 head("2. PDG_KEEP_TMP=1 时保留并打印准确路径")
 for name, prefix in TARGETS.items():
-    sandbox = tempfile.mkdtemp(prefix="pdg-tmpguard-")
-    try:
+    sandbox = tmpguard.mkdtemp(prefix="pdg-tmpguard.")
+    if True:
         rc, out = run(name, sandbox, "", keep=True)
         left = dirs_in(sandbox, prefix)
         printed = re.findall(r"\[PDG_KEEP_TMP\][^\n]*?(%s\S+)" % re.escape(prefix), out)
@@ -88,13 +89,12 @@ for name, prefix in TARGETS.items():
         (ok if printed and any(os.path.basename(p.rstrip("/")) in left or
                                any(l in p for l in left) for p in printed)
             else bad)("%s / KEEP_TMP → 打印了准确路径(%s)" % (name, printed[:1] or "无"))
-    finally:
-        subprocess.run(["rm", "-rf", sandbox])
+
 
 head("3. 只清自己的, 不按宽前缀扫别人")
 for name, prefix in TARGETS.items():
-    sandbox = tempfile.mkdtemp(prefix="pdg-tmpguard-")
-    try:
+    sandbox = tmpguard.mkdtemp(prefix="pdg-tmpguard.")
+    if True:
         # 放两个"别人的"目录: 同前缀但不是本进程建的, 以及完全无关的
         alien = os.path.join(sandbox, prefix + "someoneelse")
         other = os.path.join(sandbox, "unrelated-dir")
@@ -104,8 +104,7 @@ for name, prefix in TARGETS.items():
         (ok if os.path.isdir(alien) else bad)(
             "%s → 同前缀但非本进程建的目录未被误删" % name)
         (ok if os.path.isdir(other) else bad)("%s → 无关目录未被误删" % name)
-    finally:
-        subprocess.run(["rm", "-rf", sandbox])
+
 
 print("\n" + "─" * 62)
 print("通过 %d, 失败 %d" % (npass, nfail))
