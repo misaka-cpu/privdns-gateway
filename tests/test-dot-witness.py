@@ -78,13 +78,29 @@ class Witness:
         env["RUNTIME_DIRECTORY"] = self.dir
         self.proc = subprocess.Popen([sys.executable, WITNESS], env=env,
                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        # 就绪判据: 端口已被绑上。发一个畸形字节 —— 没绑时内核回 ICMP 端口不可达
+        # (recv 抛 ConnectionRefusedError), 绑上了则被静默丢弃(超时)。
         for _ in range(50):
-            if self.query("probe-liveness-check.invalid", expect_reply=False) is not None:
-                return True
             if self.proc.poll() is not None:
                 return False
+            if self._bound():
+                return True
             time.sleep(0.1)
         return False
+
+    def _bound(self):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(0.3)
+        try:
+            s.sendto(b"\x00", ("127.0.0.1", self.port))
+            s.recvfrom(64)
+            return True
+        except socket.timeout:
+            return True
+        except OSError:
+            return False
+        finally:
+            s.close()
 
     def query(self, qname, qtype=1, expect_reply=True, raw=None, t=1.0):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -95,6 +111,8 @@ class Witness:
                 return s.recvfrom(4096)[0]
             except socket.timeout:
                 return b"" if expect_reply else None
+        except OSError:
+            return None
         finally:
             s.close()
 

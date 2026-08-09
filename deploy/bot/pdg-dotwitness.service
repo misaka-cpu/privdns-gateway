@@ -1,0 +1,60 @@
+[Unit]
+# 6.2A: 每会话 DoT 证据端。只绑回环、只回答探测命名空间里的查询。
+# 它是**旁路**: 挂了只影响探测查询, 普通 DNS 由 mosdns 原路径继续走。
+Description=PrivDNS Gateway DoT 证据端 (仅回环; 每会话探测证据)
+Documentation=file:///opt/privdns-gateway/docs/ROADMAP.md
+After=network.target
+PartOf=mosdns.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/pdg-bot/dotwitness.py
+
+# 探测命名空间由安装/会话侧写入这份最小 env 文件(只有 PDG_DOTWITNESS_SUFFIX 一项)。
+# 前缀 `-` = 文件不在也照常启动 —— 那时证据端 fail-closed, 谁都不认。
+# 这里**不读** bot.env / profile.env / 证书私钥 / 用户配置正文。
+EnvironmentFile=-/etc/privdns-gateway/dotwitness.env
+
+# 不以 root 跑。DynamicUser 隐含 ProtectSystem=strict + ProtectHome=read-only,
+# 所以必须显式给出唯一可写点。
+DynamicUser=yes
+NoNewPrivileges=yes
+RuntimeDirectory=pdg-dotwitness
+RuntimeDirectoryMode=0700
+
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+# 只需要本机 UDP。放开 AF_INET 之外的地址族没有理由。
+RestrictAddressFamilies=AF_INET
+# 不需要任何 capability: 端口是高位的, 不用 CAP_NET_BIND_SERVICE。
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+
+MemoryMax=64M
+TasksMax=16
+
+Restart=on-failure
+RestartSec=2
+# 起不来就别无限重试打满日志: 5 分钟内超过 5 次就停下, 等人来看。
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Install]
+WantedBy=multi-user.target
