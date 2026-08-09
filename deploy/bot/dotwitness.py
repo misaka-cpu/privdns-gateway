@@ -19,6 +19,7 @@ import json
 import os
 import re
 import socket
+import stat
 import struct
 import sys
 import tempfile
@@ -38,6 +39,11 @@ TRANSPORT = "dot"
 # probe label 契约: 12 字节随机 → 24 个小写 hex, 96 bit。
 # 大写、23 位、25 位、非 hex 一律不认 —— 放宽这条等于让背景查询有机会冒充证据。
 LABEL_RE = re.compile(r"\A[0-9a-f]{24}\Z")
+SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
+STATE_FIELDS = frozenset(("schema_version", "probe_label_sha256", "observed_at",
+                          "qtype", "transport", "expires_at"))
+STATE_MODE = 0o600
+TMP_PREFIX = ".ev-"
 
 MAX_PACKET = 1232                      # 超过这个长度的 UDP DNS 查询不是我们造的
 MAX_LABEL_LEN = 63
@@ -58,11 +64,17 @@ def _port():
 def _suffix():
     """探测命名空间, 形如 `probe.<DoT域名>`。拿不到就返回 None —— 拿不到就一条都不认,
     而不是退化成"认所有"。"""
-    s = (os.environ.get("PDG_DOTWITNESS_SUFFIX") or "").strip().strip(".").lower()
+    s = (os.environ.get("PDG_DOTWITNESS_SUFFIX") or "").strip().lower()
     if not s or len(s) > MAX_NAME_LEN:
         return None
-    if not re.match(r"\A[a-z0-9._-]+\Z", s) or ".." in s:
+    # 不做 strip(".")。以前那样写会把 `.probe.example` 悄悄normalize成 `probe.example`,
+    # 等于默默接受了一个**不是配置里那个**的命名空间 —— 配置写错了就该在启动时报出来。
+    if s.startswith(".") or s.endswith(".") or ".." in s:
         return None
+    if not re.match(r"\A[a-z0-9._-]+\Z", s):
+        return None
+    if any(not lab or len(lab) > MAX_LABEL_LEN for lab in s.split(".")):
+        return None                      # 单个 label 也有 63 字节上限
     return s
 
 
@@ -144,12 +156,24 @@ def match_probe(qname_raw, qname_lower, suffix):
 
 # ── 证据落盘 ────────────────────────────────────────────────────────────────
 def _read_state():
+    """读出一份**完全合规**的 evidence, 否则一律 "CORRUPT"。
+
+    这里是宽进严出的分界: 早先只查了几个 key 在不在, 于是多字段、probe_label_sha256
+    不是哈希、transport 写成别的值都能被当成有效证据读出去。证据的意义全在"它只可能
+    由本服务按这一种形状写出来" —— 判定放宽一点, 上层就可能把别人塞的文件当成观测结果。
+
+    返回 None(没有) / "CORRUPT"(有但不合规或不安全) / 那份 dict。
+    """
     p = _state_path()
     try:
         st = os.lstat(p)
     except OSError:
         return None
-    if not (st.st_mode & 0o170000) == 0o100000:   # 必须是普通文件, 不跟随软链
+    if not stat.S_ISREG(st.st_mode):          # symlink / FIFO / 目录 / 设备: 不读也不跟随
+        return "CORRUPT"
+    if stat.S_IMODE(st.st_mode) != STATE_MODE:
+        return "CORRUPT"
+    if st.st_uid != os.geteuid():             # 别人写的, 不信
         return "CORRUPT"
     if st.st_size > STATE_MAX_BYTES:
         return "CORRUPT"
@@ -158,16 +182,35 @@ def _read_state():
             rec = json.loads(f.read(STATE_MAX_BYTES + 1).decode("utf-8"))
     except Exception:  # noqa: BLE001
         return "CORRUPT"
-    if not isinstance(rec, dict) or rec.get("schema_version") != SCHEMA_VERSION:
-        return "CORRUPT"
-    for k in ("probe_label_sha256", "observed_at", "expires_at", "transport", "qtype"):
-        if k not in rec:
-            return "CORRUPT"
-    if not isinstance(rec.get("observed_at"), (int, float)):
-        return "CORRUPT"
-    if not isinstance(rec.get("expires_at"), (int, float)):
-        return "CORRUPT"
-    return rec
+    return rec if _valid(rec) else "CORRUPT"
+
+
+def _finite(x):
+    if isinstance(x, bool) or not isinstance(x, (int, float)):
+        return False
+    return x == x and x not in (float("inf"), float("-inf"))
+
+
+def _valid(rec):
+    """evidence 的闭集判据。任何一条不满足都不是有效证据。"""
+    if not isinstance(rec, dict) or set(rec) != STATE_FIELDS:
+        return False
+    if rec["schema_version"] != SCHEMA_VERSION:
+        return False
+    d = rec["probe_label_sha256"]
+    if not isinstance(d, str) or not SHA256_RE.match(d):
+        return False
+    if rec["transport"] != TRANSPORT:
+        return False
+    qt = rec["qtype"]
+    if isinstance(qt, bool) or not isinstance(qt, int) or not (0 <= qt <= 65535):
+        return False
+    o, e = rec["observed_at"], rec["expires_at"]
+    if not _finite(o) or not _finite(e):
+        return False
+    if not (o < e <= o + EVIDENCE_TTL_SECS):   # 生命周期不得超过设计上限
+        return False
+    return True
 
 
 def _write_state(rec):
@@ -179,9 +222,17 @@ def _write_state(rec):
     # mkstemp 必须在 try **之内**: 目录被删/不可写时它抛的 FileNotFoundError、
     # PermissionError 都是 OSError, 放在外面就会一路冒到 serve() 把进程带走 ——
     # 那不是 fail-closed, 是 fail-crash: 客户端等不到回包, systemd 还会反复重启。
+    # 目标位置若不是"本服务自己的普通文件", 就不写 —— os.replace 会把那个目录项换掉,
+    # 对 symlink/FIFO 来说算不上跟随, 但也没有理由替别人做主。
+    try:
+        tst = os.lstat(_state_path())
+        if not stat.S_ISREG(tst.st_mode) or tst.st_uid != os.geteuid():
+            return False
+    except OSError:
+        pass
     tmp = None
     try:
-        fd, tmp = tempfile.mkstemp(dir=d, prefix=".ev-")
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=TMP_PREFIX)
         os.fchmod(fd, 0o600)
         with os.fdopen(fd, "wb") as f:
             f.write(blob)
@@ -217,16 +268,45 @@ def record(label, qtype, now=None):
 
 
 def purge_stale(now=None):
-    """启动时清理: 过期或损坏的状态一律删掉, 不留给下一次会话当假证据。"""
+    """启动清理。只删**本服务自己写的、普通文件**的损坏或过期状态。
+
+    不安全对象(symlink / FIFO / 设备 / 目录)一个都不碰 —— 不读、不跟随、也不删:
+    删掉等于替别人做决定, 而 0700 的 RuntimeDirectory 里出现这种东西本身就该由人来看。
+    `.ev-*` 临时文件同理: 只清符合本服务约束(普通文件 + 属主是自己 + 0600)的那些,
+    绝不按前缀扫着删 —— 那删的可能是别的程序的文件。
+    """
     now = time.time() if now is None else now
-    cur = _read_state()
-    if cur is None:
+    d = _runtime_dir()
+    p = _state_path()
+    try:
+        st = os.lstat(p)
+    except OSError:
+        st = None
+    if st is not None and stat.S_ISREG(st.st_mode) and st.st_uid == os.geteuid():
+        cur = _read_state()
+        if cur == "CORRUPT" or (isinstance(cur, dict) and cur["expires_at"] <= now):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+    try:
+        names = os.listdir(d)
+    except OSError:
         return
-    if cur == "CORRUPT" or cur.get("expires_at", 0) <= now:
+    for n in names:
+        if not n.startswith(TMP_PREFIX):
+            continue
+        q = os.path.join(d, n)
         try:
-            os.unlink(_state_path())
+            s2 = os.lstat(q)
         except OSError:
-            pass
+            continue
+        if stat.S_ISREG(s2.st_mode) and s2.st_uid == os.geteuid() \
+                and stat.S_IMODE(s2.st_mode) == STATE_MODE:
+            try:
+                os.unlink(q)
+            except OSError:
+                pass
 
 
 def nodata_reply(pkt, qid):
@@ -271,6 +351,11 @@ def serve(sock, suffix):
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     suffix = _suffix()
+    if suffix is None:
+        # 早先这里只是"起着但谁都不认" —— 那是假健康态: systemd 显示 active, 运维看不出
+        # 配置错了, 而任何探测都永远不会有证据。缺配置必须在启动时就暴露。
+        print("dotwitness: probe namespace missing or invalid", file=sys.stderr, flush=True)
+        return 2
     d = _runtime_dir()
     if not os.path.isdir(d):
         # 日志里只说目录不可用, 不打印路径以外的任何东西
@@ -284,12 +369,7 @@ def main(argv=None):
         print("dotwitness: bind failed (%s)" % type(e).__name__, file=sys.stderr)
         return 4
     # 日志里不出现 qname、label、来源地址 —— 只说自己起来了
-    print("dotwitness: listening on loopback, namespace %s"
-          % ("configured" if suffix else "MISSING"), file=sys.stderr, flush=True)
-    if suffix is None:
-        # fail-closed: 没有命名空间就谁都不认, 但仍然把进程留着, 免得 mosdns 那边
-        # 因为连不上而把探测查询当成别的错误。
-        pass
+    print("dotwitness: listening on loopback", file=sys.stderr, flush=True)
     try:
         serve(s, suffix)
     except KeyboardInterrupt:

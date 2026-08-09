@@ -15,9 +15,10 @@ Type=simple
 ExecStart=/usr/bin/python3 /opt/pdg-bot/dotwitness.py
 
 # 探测命名空间由安装/会话侧写入这份最小 env 文件(只有 PDG_DOTWITNESS_SUFFIX 一项)。
-# 前缀 `-` = 文件不在也照常启动 —— 那时证据端 fail-closed, 谁都不认。
+# 不带 `-`: 文件不在就直接启动失败。可选形式会造出「active 但永远不认任何查询」的
+# 假健康态 —— 运维看到 active 就以为没事, 而配置其实是错的。
 # 这里**不读** bot.env / profile.env / 证书私钥 / 用户配置正文。
-EnvironmentFile=-/etc/privdns-gateway/dotwitness.env
+EnvironmentFile=/etc/privdns-gateway/dotwitness.env
 
 # 不以 root 跑。DynamicUser 隐含 ProtectSystem=strict + ProtectHome=read-only,
 # 所以必须显式给出唯一可写点。
