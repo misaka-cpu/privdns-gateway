@@ -239,12 +239,21 @@ def serve(sock, suffix):
             continue
         parsed = parse_query(pkt)
         if parsed is None:
-            continue                   # 畸形包: 丢弃, 不回、不写、不记日志
+            continue                   # 畸形包: 连 ID 都取不到, 无从回起 —— 丢弃, 不回不写
         qid, qname_raw, qtype, qname_lower = parsed
         label = match_probe(qname_raw, qname_lower, suffix)
-        if label is None:
-            continue                   # 不属于探测命名空间: 一个字节都不写
-        record(label, qtype)
+        if label is not None:
+            record(label, qtype)       # 只有合规 label 才留证据
+        # 能解析出来的查询**一律给一个有界应答**, 哪怕 label 不合规。
+        #
+        # 为什么不能像以前那样静默丢弃: 钉定的 mosdns v5.3.4 只能按 qname 后缀 + SNI 路由
+        # (它的 qname 匹配器不支持 regexp, domain_set 里的 regexp: 也是 unsupported),
+        # 所以 `<任意>.probe.<域名>` 只要走 DoT 就一定会被转到这里。这边一声不吭的话:
+        #   · 客户端要等满 mosdns 的上游超时(实测 ~5s)才拿到空结果;
+        #   · mosdns 会在 warn 级打出 `upstream error` 与 `entry err`, 两条都带**完整
+        #     qname 和客户端 IP** —— 等于每个乱填的探测名都往日志里写一次隐私数据;
+        #   · 每个这样的查询都占住一个 worker 到超时, 是白送的资源消耗面。
+        # 回一个 NOERROR/NODATA 就把这三样一起消掉, 而证据仍然只认 24 位小写 hex。
         try:
             sock.sendto(nodata_reply(pkt, qid), src)
         except OSError:
