@@ -14,7 +14,9 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import tmpguard  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 INSTALL = os.path.join(ROOT, "install.sh")
@@ -43,16 +45,13 @@ def head(m):
 
 
 def extract_render():
-    """把 install.sh 的渲染闭包原样抽出来 —— 包括 render() 依赖的那些推导(比如
-    DOTWITNESS_PORT 从 dotwitness.py 取值)。只抽函数体的话, 测试等于自己补了一份
-    输入, 单一事实源那条就白测了。抽不到就判红, 不退回自己拼一个。"""
+    """把 install.sh 里那个真正的 render() 原样抽出来, 不另写一套模拟渲染。
+
+    锚必须钉到 render() 真正的收尾 `"$1"; }` —— 用泛化的 `\}\s*$` 会停在函数体内那个
+    `|| { ...; return 1; }` 上, 抽出来是半截函数, 跑起来直接语法错。
+    """
     src = open(INSTALL).read()
-    # 锚到 render() 真正的收尾 `"$1"; }` —— 用泛化的 `\}\s*$` 会停在函数体内那个
-    # `|| { ...; return 1; }` 上, 抽出来的是半截函数, 跑起来直接语法错。
-    m = re.search(r'^DOTWITNESS_PORT=.*?^render\(\)\{.*?"\$1"; \}\s*$', src, re.S | re.M)
-    if m:
-        return m.group(0)
-    m = re.search(r"^render\(\)\{.*?\}\s*$", src, re.S | re.M)
+    m = re.search(r'^render\(\)\{.*?"\$1"; \}\s*$', src, re.S | re.M)
     return m.group(0) if m else None
 
 
@@ -109,21 +108,30 @@ for bogus, why in (("", "空值"), ("has space", "含空格"), ("../etc/passwd",
     dead = (rc2 != 0) or ("__DOT_DOMAIN__" in (out2 or ""))
     (ok if dead else bad)("%s 的 DoT 域名不得被静默接受(rc=%s)" % (why, rc2))
 
-# ── 4. witness 端口只能有一个事实源 ─────────────────────────────────────────
-head("4. witness 端口的单一事实源")
+# ── 4. 端口的两份表示必须一致 ────────────────────────────────────────────────
+head("4. witness 端口: YAML 与 Python 两份表示的一致性硬门")
+# 这里不是单一真源: 端口在 mosdns 模板里是字面量, 在 dotwitness.py 里是常量。
+# 之所以不用占位符, 是因为这份模板有十来个渲染点, 占位符落在"必须解析成端口"的位置时,
+# 任何一处没跟上都会让 mosdns 起不来。代价就是两份表示, 所以在这里逐字比对兜住。
 wsrc = open(WITNESS).read() if os.path.isfile(WITNESS) else ""
+tpl = open(TPL).read()
 m = re.search(r"^DOTWITNESS_PORT\s*=\s*(\d+)", wsrc, re.M)
 (ok if m else bad)("dotwitness.py 里有 DOTWITNESS_PORT 常量")
-tpl = open(TPL).read()
-hard = re.findall(r"udp://127\.0\.0\.1:(\d+)", tpl)
-(ok if not hard else bad)(
-    "mosdns 模板里不再硬编码 witness 端口(实得 %s)" % (", ".join(hard) or "无"))
-(ok if "__DOTWITNESS_PORT__" in tpl else bad)("mosdns 模板用占位符引用 witness 端口")
-if m and out:
-    (ok if ("udp://127.0.0.1:%s" % m.group(1)) in out else bad)(
-        "渲染后端口与 dotwitness.py 常量一致(%s)" % (m.group(1) if m else "?"))
+tports = re.findall(r'addr:\s*"udp://127\.0\.0\.1:(\d+)"', tpl)
+(ok if len(tports) == 1 else bad)(
+    "模板里恰好一处 witness 转发地址(实得 %d 处)" % len(tports))
+if m and len(tports) == 1:
+    (ok if m.group(1) == tports[0] else bad)(
+        "两份表示相等: dotwitness.py=%s 模板=%s" % (m.group(1), tports[0]))
 else:
-    bad("渲染后端口与 dotwitness.py 常量一致")
+    bad("两份表示相等")
+(ok if "__DOTWITNESS_PORT__" not in tpl else bad)(
+    "模板里不再有端口占位符(它会让没跟上的渲染点加载失败)")
+(ok if re.search(r'addr:\s*"udp://127\.0\.0\.1:', tpl) else bad)("witness 地址是环回地址")
+_unit = open(os.path.join(ROOT, "deploy", "bot", "pdg-dotwitness.service")).read()
+_unit_code = re.sub(r"^\s*#.*$", "", _unit, flags=re.M)
+(ok if "PDG_DOTWITNESS_PORT" not in _unit_code else bad)(
+    "生产 unit 不通过环境文件覆盖端口(覆盖了就和模板对不上)")
 
 # ── 5. dotwitness.env 必须有生产者 ──────────────────────────────────────────
 head("5. dotwitness.env 的生产者")
@@ -138,13 +146,16 @@ for f in ("install.sh", os.path.join("deploy", "bot", "pdg.sh")):
 unit = open(os.path.join(ROOT, "deploy", "bot", "pdg-dotwitness.service")).read()
 (ok if "dotwitness.env" in unit else bad)("unit 消费 dotwitness.env")
 
-# ── 6. 测试侧那套渲染器也要跟上 ─────────────────────────────────────────────
+# ── 6. 带"零占位符"断言的渲染点必须替换域名 ─────────────────────────────────
 head("6. 测试侧渲染器")
-pol = open(POLICY).read() if os.path.isfile(POLICY) else ""
-(ok if "__DOT_DOMAIN__" in pol else bad)(
-    "dns-policy-test.sh 的渲染器也替换 __DOT_DOMAIN__(它自带残留占位符断言)")
-(ok if "__DOTWITNESS_PORT__" in pol else bad)(
-    "dns-policy-test.sh 的渲染器也替换 __DOTWITNESS_PORT__")
+# 只要求那些**契约上要求完整生产渲染**(自带"渲染后不许残留占位符"断言)的渲染点替换域名;
+# 其余渲染点留着 __DOT_DOMAIN__ 无害 —— 实测配置照常加载, 只是探测分支不匹配。
+for rel in ("tests/dns-policy-test.sh", "tests/test-hijack-shape.sh",
+            "tests/test-mosdns-ratelimit.sh"):
+    p2 = os.path.join(ROOT, rel)
+    txt = open(p2).read() if os.path.isfile(p2) else ""
+    (ok if "__DOT_DOMAIN__" in txt else bad)(
+        "%s 带零占位符断言, 必须替换 __DOT_DOMAIN__" % os.path.basename(rel))
 
 # ── 7. 渲染产物要能被钉定 mosdns 接受 ───────────────────────────────────────
 head("7. 渲染产物的配置校验")
@@ -154,7 +165,8 @@ if not mos:
 elif not out:
     bad("渲染没有输出, 无法校验")
 else:
-    d = tempfile.mkdtemp(prefix="pdg-dotrender-")
+    # 走项目登记式临时目录(tests/tmpguard.py): 建时登记、退出时按表清, 只清本进程的。
+    d = tmpguard.mkdtemp(prefix="pdg-dotrender.")
     TMP = d
     try:
         cfg = os.path.join(d, "config.yaml")
@@ -178,8 +190,7 @@ else:
             "钉定 mosdns 接受渲染后的配置%s" % ("" if not fatal else ": " + fatal.group(0)))
     except subprocess.TimeoutExpired:
         ok("钉定 mosdns 接受渲染后的配置(起来后一直跑, 未报配置错)")
-    finally:
-        shutil.rmtree(d, ignore_errors=True)
+    # 清理交给 tmpguard 的 atexit, 这里不重复删。
 
 print("\n" + "─" * 62)
 print("通过 %d, 失败 %d" % (npass, nfail))

@@ -140,14 +140,22 @@ plugins:
       - exec: $ecs_neutral
       - exec: $remote_upstream
   # 6.2A DoT 证据: 把探测查询交给只绑回环的证据端。
-  # 端口不在这里写死: __DOTWITNESS_PORT__ 由渲染器从 deploy/bot/dotwitness.py 的
-  # DOTWITNESS_PORT 常量取值(单一事实源)。tests/test-dot-render.py 盯着两边不许分叉。
+  #
+  # 端口在这里写成**字面量**, 不用占位符。原因是实测出来的: 这份模板不止 install.sh 一个
+  # 渲染点, 还有十来处测试 harness(含被间接 source 的 tests/e2e-lib.sh)各自带一份 sed 表。
+  # 占位符一旦落在"必须解析成端口"的位置, 任何一个没跟上的渲染点都会让 mosdns 直接起不来
+  # (报 invalid port ... after host), 一次就打红了 14 支既有测试。
+  # 注意: 这段注释里也不能出现占位符形状的字面 token —— 注释会原样进入渲染产物,
+  # 而好几个渲染点末尾有"零占位符"断言, 写了就会被它们判红。
+  #
+  # 代价是 YAML 与 deploy/bot/dotwitness.py 各存一份端口值。这不是单一真源, 所以用硬门
+  # 兜住: tests/test-dot-render.py 从两边分别读出来比对, 任一侧漂移即判红。
   - tag: dotwitness_fwd
     type: forward
     args:
       concurrent: 1
       upstreams:
-        - addr: "udp://127.0.0.1:__DOTWITNESS_PORT__"
+        - addr: "udp://127.0.0.1:5399"
   - tag: probe_seq
     type: sequence
     args:

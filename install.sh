@@ -755,13 +755,6 @@ if [[ -n "$RESCUE_BIND" ]]; then
     || die "profile.env 未写入预期的 PDG_RESCUE_BIND"
 fi
 
-# witness 端口的**唯一**事实源是 deploy/bot/dotwitness.py 的 DOTWITNESS_PORT。
-# 这里读它而不是再写一遍字面量 —— 两处各写一个数, 迟早分叉成"配置转给了一个没人听的端口"。
-DOTWITNESS_PORT="$(sed -n 's/^DOTWITNESS_PORT[[:space:]]*=[[:space:]]*\([0-9]\{1,5\}\).*/\1/p' \
-                    "$REPO_DIR/deploy/bot/dotwitness.py" | head -1)"
-[[ "$DOTWITNESS_PORT" =~ ^[0-9]{1,5}$ ]] \
-  || die "读不到 dotwitness.py 的 DOTWITNESS_PORT → 中止(不能猜一个端口渲染进配置)"
-
 render(){ # 渲染前先把本模板需要的值验一遍: 缺值不能退回示例值, 也不能静默留占位符。
           [[ -n "${DOT_DOMAIN:-}" && "$DOT_DOMAIN" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] \
             || { echo "render: DoT 域名缺失或非法($DOT_DOMAIN)" >&2; return 1; }
@@ -771,8 +764,7 @@ render(){ # 渲染前先把本模板需要的值验一遍: 缺值不能退回示
               -e "s|__HIJACK_SET_FILE__|$HIJACK_SET_FILE|g" \
               -e "s|__RESCUE_PORT__|$PDG_RESCUE_PORT|g" \
               -e "s|__RESCUE_BIND__|$RESCUE_BIND|g" \
-              -e "s|__DOT_DOMAIN__|$DOT_DOMAIN|g" \
-              -e "s|__DOTWITNESS_PORT__|$DOTWITNESS_PORT|g" "$1"; }
+              -e "s|__DOT_DOMAIN__|$DOT_DOMAIN|g" "$1"; }
 
 render "$REPO_DIR/deploy/mosdns/config.yaml"          > /etc/mosdns/config.yaml
 # 证据端的探测命名空间。只有这一项 —— unit 拿它判"认哪个后缀", 拿不到就 fail-closed 谁都不认。
