@@ -202,7 +202,7 @@ for u in units:
 # 6.2A staged: 源码与 unit 已进仓库, **生命周期尚未接线**(不进安装清单、不迁移、
 # 不 enable/start)。这是一个显式且受限的中间状态, 不是通用白名单 —— 只允许下面这两个
 # 精确文件名, 多一个未归属的 deploy 文件就判红。接线属于 6.2B。
-STAGED_6_2A = frozenset({"dotwitness.py"})
+STAGED_6_2A = frozenset()   # 6.2B: dotwitness.py 已进运行模块清单, 不再 staged
 
 gone = sorted(refs - static - STAGED_6_2A)
 if not gone:
