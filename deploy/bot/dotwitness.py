@@ -14,6 +14,7 @@
 不做的事: 不递归、不访问公网、不转发上游、不记普通查询、不落任何明文标识。
 """
 import binascii
+import errno
 import hashlib
 import json
 import os
@@ -44,6 +45,13 @@ STATE_FIELDS = frozenset(("schema_version", "probe_label_sha256", "observed_at",
                           "qtype", "transport", "expires_at"))
 STATE_MODE = 0o600
 TMP_PREFIX = ".ev-"
+
+# 跨 UID 读取的四种结果。必须分得开: 把"没权限读"和"没有证据"混成一个 None, 上层就会
+# 把"我看不见"说成"它没发生" —— 那正是 6.2B 最不能犯的错(见 read_evidence)。
+READ_OK = "OK"
+READ_ABSENT = "ABSENT"       # 观察端在跑, 但还没有证据(或已被清理)
+READ_DENIED = "DENIED"       # 读不到 → 无从判断有没有 → 上层必须 UNAVAILABLE
+READ_CORRUPT = "CORRUPT"     # 有东西但不合规/对象不安全 → 同样只能 UNAVAILABLE
 
 MAX_PACKET = 1232                      # 超过这个长度的 UDP DNS 查询不是我们造的
 MAX_LABEL_LEN = 63
@@ -163,26 +171,71 @@ def _read_state():
     由本服务按这一种形状写出来" —— 判定放宽一点, 上层就可能把别人塞的文件当成观测结果。
 
     返回 None(没有) / "CORRUPT"(有但不合规或不安全) / 那份 dict。
+
+    这是 witness **自己**读自己写的东西时的形状, 语义与 6.2A 完全一致。跨 UID 的
+    消费者请走 read_evidence() —— 差别见那里的说明。
     """
-    p = _state_path()
+    status, rec = read_evidence(expect_uid=os.geteuid())
+    if status == READ_OK:
+        return rec
+    if status == READ_ABSENT:
+        return None
+    return "CORRUPT"
+
+
+def read_evidence(runtime_dir=None, expect_uid=None):
+    """唯一的 evidence 读取入口。返回 (READ_*, rec 或 None)。
+
+    为什么需要它, 而不是让消费者直接用 _read_state():
+
+      · **属主判据必须锚在观察端身份上, 不能锚在读者身上。** 原来那句
+        `st.st_uid != os.geteuid()` 对 witness 自己是对的(它就是属主), 但换成 root
+        消费者时正好是反的 —— 实测: root 读 witness 真写的证据判 CORRUPT, 而 root
+        自己写的一份假证据反倒判"有效"。所以属主要显式传进来; 不传就取
+        RuntimeDirectory 的属主(linksess 判断动态 UID 用的也是这套)。
+
+      · **"读不到"和"没有"必须分开。** lstat 失败原来一律 return None, ENOENT 和
+        EACCES 落到同一个结论上。对 witness 自己无所谓(它读得到自己的目录), 对跨 UID
+        消费者就是致命的: 没权限被当成"没有证据", 上层据此说出"手机的查询没有到达",
+        而真相是我们根本没看。
+
+    只读: 不创建、不修改、不删除任何东西。
+    """
+    d = runtime_dir or _runtime_dir()
+    p = os.path.join(d, STATE_NAME)
+    if expect_uid is None:
+        try:
+            expect_uid = os.stat(d).st_uid
+        except OSError as e:
+            # 目录都摸不到: 没启动过(ENOENT) vs 无权进入(EACCES/EPERM), 结论不同
+            return (READ_ABSENT if e.errno == errno.ENOENT else READ_DENIED), None
+        # 本服务是 DynamicUser=yes, systemd 建的 RuntimeDirectory 永远归那个动态 UID。
+        # 目录属主是 root 说明它不是 systemd 按这个 unit 建的(实测: 停服后 root 自己
+        # mkdir+chown, 就能让"从目录推导属主"这条判据认下 root 自己写的假证据)。
+        # 这种时候没有可信锚点, 直接判损坏 —— 不是"没有证据", 是这套东西现在不作数。
+        if expect_uid == 0:
+            return READ_CORRUPT, None
     try:
         st = os.lstat(p)
-    except OSError:
-        return None
+    except OSError as e:
+        return (READ_ABSENT if e.errno == errno.ENOENT else READ_DENIED), None
     if not stat.S_ISREG(st.st_mode):          # symlink / FIFO / 目录 / 设备: 不读也不跟随
-        return "CORRUPT"
+        return READ_CORRUPT, None
     if stat.S_IMODE(st.st_mode) != STATE_MODE:
-        return "CORRUPT"
-    if st.st_uid != os.geteuid():             # 别人写的, 不信
-        return "CORRUPT"
+        return READ_CORRUPT, None
+    if st.st_uid != expect_uid:               # 不是观察端写的, 不信
+        return READ_CORRUPT, None
     if st.st_size > STATE_MAX_BYTES:
-        return "CORRUPT"
+        return READ_CORRUPT, None
     try:
         with open(p, "rb") as f:
             rec = json.loads(f.read(STATE_MAX_BYTES + 1).decode("utf-8"))
+    except OSError as e:
+        return (READ_DENIED if e.errno in (errno.EACCES, errno.EPERM)
+                else READ_CORRUPT), None
     except Exception:  # noqa: BLE001
-        return "CORRUPT"
-    return rec if _valid(rec) else "CORRUPT"
+        return READ_CORRUPT, None
+    return (READ_OK, rec) if _valid(rec) else (READ_CORRUPT, None)
 
 
 def _finite(x):

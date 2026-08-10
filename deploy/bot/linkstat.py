@@ -25,6 +25,7 @@ NOT_OBSERVED 是**独立状态**, 既不能升成 PASS 也不能降成 FAIL —�
 只读约束: 不取全局配置写锁、不开事务、不写任何配置/快照/状态/缓存/审计文件、不重启服务、
 不跑迁移。配置坏了只报告, 不代为修复。
 """
+import hmac
 import json
 import os
 import re
@@ -406,6 +407,97 @@ def _l5_tls(ctx):
             "本机 TLS 握手成功(CN=%s)。这**不**代表手机信任这张证书。" % (cn or "?"),
             evidence_source="本机 openssl s_client 127.0.0.1:853"))
     return out
+
+
+# ── 6.2B: 手机 DoT 探测的三态裁决 ─────────────────────────────────────────
+DOT_OBSERVED = "OBSERVED"
+DOT_NOT_OBSERVED = "NOT_OBSERVED"
+DOT_UNAVAILABLE = "UNAVAILABLE"
+DOT_PENDING = "PENDING"          # 窗口还没结束 —— 不是终态, 别塞进上面三个里
+
+# 观察端"这一刻能算数"的状态。activating/deactivating/failed 都不算 —— 它们要么
+# 还没开始接包, 要么已经不接了, 而窗口里那段时间正是我们要给结论的时间。
+_OBS_LIVE = "active"
+
+
+def dot_probe_state(sess, ev_status, ev_rec, observer_now, now):
+    """返回 (三态, 理由码)。纯函数, 不碰文件、不跑子进程 —— 真值表才好逐格钉死。
+
+    这里唯一不能犯的错是**假阳性**: 观察端没在看的时候说"看见了"。取证类结论一旦
+    可能撒谎, 它的全部价值就没了。所以判定顺序是先证明"我确实全程在看", 再看证据。
+
+    NOT_OBSERVED 是个很强的断言 —— 它等于"我全程盯着, 确实没来"。证明不了连续可用
+    就只能说 UNAVAILABLE。把"没看见"和"没在看"混成一件事, 是这套证据最容易骗人的地方。
+
+    evidence 一律由 dotwitness.read_evidence 给出(ev_status/ev_rec), 这里**不**自己
+    解析任何文件 —— 第二份校验器迟早会和第一份对"什么算有效"给出不同答案。
+    """
+    import dotwitness
+
+    # ① 会话本身: 没有会话记录/没有关联摘要, 无从判断
+    if not isinstance(sess, dict) or not sess.get("probe_label_sha256"):
+        return DOT_UNAVAILABLE, "NO_SESSION_LABEL"
+
+    # ② 建会话时的观察端身份。当时就读不到 → 那一刻起就没有可信基线
+    was = sess.get("observer") or {}
+    inv0 = was.get("invocation_id") or ""
+    if not inv0:
+        return DOT_UNAVAILABLE, "OBSERVER_UNKNOWN_AT_START"
+
+    # ③ 结算时的观察端身份
+    nowobs = observer_now or {}
+    if not nowobs.get("installed"):
+        return DOT_UNAVAILABLE, "OBSERVER_NOT_INSTALLED"
+    if nowobs.get("active_state") != _OBS_LIVE:
+        return DOT_UNAVAILABLE, "OBSERVER_NOT_ACTIVE"
+    inv1 = nowobs.get("invocation_id") or ""
+    if not inv1:
+        return DOT_UNAVAILABLE, "OBSERVER_IDENTITY_UNREADABLE"
+    if inv1 != inv0:
+        # 窗口中重启过。中间那段没人接包, 说"没观测到"就是撒谎。
+        return DOT_UNAVAILABLE, "OBSERVER_RESTARTED"
+
+    # ④ 读取通道本身出问题 → 我们没看见, 不代表它没发生
+    if ev_status == dotwitness.READ_DENIED:
+        return DOT_UNAVAILABLE, "EVIDENCE_UNREADABLE"
+    if ev_status == dotwitness.READ_CORRUPT:
+        return DOT_UNAVAILABLE, "EVIDENCE_CORRUPT"
+
+    # ⑤ 到这里连续可用性已经证明。现在才轮到看证据本身。
+    t0 = sess.get("created_at")
+    t1 = sess.get("expires_at")
+    if not isinstance(t0, (int, float)) or not isinstance(t1, (int, float)):
+        return DOT_UNAVAILABLE, "NO_SESSION_WINDOW"
+
+    if ev_status == dotwitness.READ_OK and isinstance(ev_rec, dict):
+        # transport 不是 dot: read_evidence 的闭集本该挡掉。真拿到了说明读取通道
+        # 与校验器不一致 —— 不是"没观测到", 是这套东西现在不可信。
+        if ev_rec.get("transport") != "dot":
+            return DOT_UNAVAILABLE, "EVIDENCE_TRANSPORT_MISMATCH"
+        obs_at = ev_rec.get("observed_at")
+        exp_at = ev_rec.get("expires_at")
+        same = hmac.compare_digest(str(ev_rec.get("probe_label_sha256") or ""),
+                                   str(sess["probe_label_sha256"]))
+        in_window = (isinstance(obs_at, (int, float)) and t0 <= obs_at <= t1)
+        if same and in_window:
+            # 命中了本次会话、且落在窗口内。剩下只看这份记录还在不在它自己的有效期内。
+            if isinstance(exp_at, (int, float)) and now <= exp_at:
+                return DOT_OBSERVED, "MATCHED"
+            # 过期的匹配记录**不能**降成 NOT_OBSERVED —— 我们手里拿着一份写着"它来过"
+            # 的记录, 却对用户说"没来过", 那是明着撒谎。只能说这份证据已经不作数了。
+            return DOT_UNAVAILABLE, "EVIDENCE_STALE"
+
+    if now < t1:
+        # 窗口还开着, 还有机会。沿用会话本来的等待态, 不给终态。
+        return DOT_PENDING, "WINDOW_OPEN"
+
+    # 窗口关了、没有匹配。要说出 NOT_OBSERVED("我全程盯着, 确实没来"), 还差最后一环:
+    # **假如它真的来过, 现在还看得见吗**。witness 写下的证据只活 EVIDENCE_TTL_SECS,
+    # 窗口最早那一刻(t0)写下的记录到 t0+TTL 就到期 —— 过了这个点, "看不见"既可能是
+    # 没来过, 也可能是来过但已经过期, 两者分不开。分不开就不许下负面结论。
+    if now > t0 + dotwitness.EVIDENCE_TTL_SECS:
+        return DOT_UNAVAILABLE, "RETENTION_EXPIRED"
+    return DOT_NOT_OBSERVED, "WINDOW_CLOSED_NO_MATCH"
 
 
 def _l6_dns(_ctx):

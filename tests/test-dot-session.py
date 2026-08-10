@@ -126,8 +126,8 @@ if READ:
 # 像 expires_at 这种名字 linkstat 早就有(第 177/210 行是 link session 记录的到期),
 # 拿它当证据会得到一条恒红的假判据, 那比没有判据更糟。
 ls_src = open(os.path.join(BOT, "linkstat.py"), encoding="utf-8").read()
-EV_ONLY = ("evidence.json", "STATE_FIELDS", "probe_label_sha256",
-           "/run/pdg-dotwitness", "EVIDENCE_TTL_SECS")
+EV_ONLY = ("evidence.json", "STATE_FIELDS", "json.load", "_valid(",
+           "/run/pdg-dotwitness")
 leaks = [k for k in EV_ONLY if k in ls_src]
 (ok if not leaks else bad)(
     "linkstat 没有自带 evidence 解析/校验(否则就是第二份校验器): 命中 %s" % (leaks or "无"))
@@ -159,6 +159,7 @@ for c in ("DOT_OBSERVED", "DOT_NOT_OBSERVED", "DOT_UNAVAILABLE", "DOT_PENDING"):
         bad("linkstat.%s 不存在" % c)
 
 NOW = 1_000_000.0
+T_CLOSE = NOW + 300        # 窗口关闭那一刻: 窗口已结束, 但留存保证还成立
 LAB = "a1b2c3d4e5f6a7b8c9d0e1f2"
 DIG = hashlib.sha256(LAB.encode()).hexdigest()
 INV = "9768fa5bdca741ac959df5fd33d105ce"
@@ -189,47 +190,50 @@ if DECIDE and hasattr(T, "DOT_OBSERVED"):
     # (名字, session, 读取结果, evidence, 结算时 observer, 现在时刻, 期望)
     CASES = [
         # —— OBSERVED 只在全部条件成立时 ——
-        ("全部条件成立", sess(), W.READ_OK, ev(), obs(), NOW + 400, O),
+        ("全部条件成立", sess(), W.READ_OK, ev(), obs(), T_CLOSE, O),
 
         # —— 窗口未结束: 不是终态 ——
         ("窗口内还没证据", sess(), W.READ_ABSENT, None, obs(), NOW + 100, P),
         ("窗口内已有证据", sess(), W.READ_OK, ev(), obs(), NOW + 100, O),
 
         # —— NOT_OBSERVED: 窗口结束 + 全程可用 + 无匹配 ——
-        ("窗口结束/全程可用/无证据", sess(), W.READ_ABSENT, None, obs(), NOW + 400, N),
+        ("窗口结束/全程可用/无证据", sess(), W.READ_ABSENT, None, obs(), T_CLOSE, N),
         ("窗口结束/证据 hash 不匹配", sess(), W.READ_OK,
-         ev(probe_label_sha256="f" * 64), obs(), NOW + 400, N),
+         ev(probe_label_sha256="f" * 64), obs(), T_CLOSE, N),
 
         # —— 以下必须 UNAVAILABLE, 不许降成 NOT_OBSERVED ——
-        ("unit 未安装", sess(), W.READ_ABSENT, None, obs(installed=False), NOW + 400, U),
+        ("unit 未安装", sess(), W.READ_ABSENT, None, obs(installed=False), T_CLOSE, U),
         ("结算时 inactive", sess(), W.READ_ABSENT, None,
-         obs(active_state="inactive"), NOW + 400, U),
+         obs(active_state="inactive"), T_CLOSE, U),
         ("结算时 failed", sess(), W.READ_ABSENT, None,
-         obs(active_state="failed"), NOW + 400, U),
+         obs(active_state="failed"), T_CLOSE, U),
         ("建会话时 observer 就不可用", sess(observer=None), W.READ_ABSENT, None,
-         obs(), NOW + 400, U),
+         obs(), T_CLOSE, U),
         ("建会话时 InvocationID 为空", sess(observer={"invocation_id": "",
                                                      "active_state": "inactive"}),
-         W.READ_ABSENT, None, obs(), NOW + 400, U),
+         W.READ_ABSENT, None, obs(), T_CLOSE, U),
         ("窗口中重启(InvocationID 变了)", sess(), W.READ_ABSENT, None,
-         obs(invocation_id="530a39a5775049b6b1c2d3e4f5a6b7c8"), NOW + 400, U),
+         obs(invocation_id="530a39a5775049b6b1c2d3e4f5a6b7c8"), T_CLOSE, U),
         ("结算时读不到 InvocationID", sess(), W.READ_ABSENT, None,
-         obs(invocation_id=""), NOW + 400, U),
-        ("evidence 无权限读取", sess(), W.READ_DENIED, None, obs(), NOW + 400, U),
-        ("evidence 损坏/对象不安全", sess(), W.READ_CORRUPT, None, obs(), NOW + 400, U),
+         obs(invocation_id=""), T_CLOSE, U),
+        ("evidence 无权限读取", sess(), W.READ_DENIED, None, obs(), T_CLOSE, U),
+        ("evidence 损坏/对象不安全", sess(), W.READ_CORRUPT, None, obs(), T_CLOSE, U),
 
         # —— 时间边界 ——
         ("证据早于窗口起点", sess(), W.READ_OK, ev(observed_at=NOW - 1, expires_at=NOW + 299),
-         obs(), NOW + 400, N),
+         obs(), T_CLOSE, N),
         ("证据晚于窗口终点", sess(), W.READ_OK, ev(observed_at=NOW + 301,
-                                                  expires_at=NOW + 601), obs(), NOW + 400, N),
+                                                  expires_at=NOW + 601), obs(), T_CLOSE, N),
         ("证据恰在窗口起点", sess(), W.READ_OK, ev(observed_at=NOW, expires_at=NOW + 300),
-         obs(), NOW + 400, O),
+         obs(), T_CLOSE, O),
         ("证据恰在窗口终点", sess(), W.READ_OK, ev(observed_at=NOW + 300,
-                                                  expires_at=NOW + 600), obs(), NOW + 400, O),
-        ("证据本身已过期(stale)", sess(), W.READ_OK,
-         ev(observed_at=NOW + 10, expires_at=NOW + 20), obs(), NOW + 400, N),
-        ("transport 不是 dot", sess(), W.READ_OK, ev(transport="udp"), obs(), NOW + 400, U),
+                                                  expires_at=NOW + 600), obs(), T_CLOSE, O),
+        ("匹配但记录已过期", sess(), W.READ_OK,
+         ev(observed_at=NOW + 10, expires_at=NOW + 20), obs(), T_CLOSE, U),
+        # 结算太晚: 窗口最早那一刻的证据到 t0+TTL 就到期, 过了这个点"看不见"既可能是
+        # 没来过也可能是过期了 —— 分不开就不许下负面结论
+        ("结算晚于留存保证", sess(), W.READ_ABSENT, None, obs(), NOW + 400, U),
+        ("transport 不是 dot", sess(), W.READ_OK, ev(transport="udp"), obs(), T_CLOSE, U),
     ]
     for name, s, st, e, o, now, want in CASES:
         try:
@@ -257,7 +261,7 @@ if DECIDE and hasattr(T, "DOT_OBSERVED"):
         ("observer 整个缺失", None),
     ]
     for name, o in BROKEN:
-        got = T.dot_probe_state(sess(), W.READ_OK, ev(), o, NOW + 400)
+        got = T.dot_probe_state(sess(), W.READ_OK, ev(), o, T_CLOSE)
         got = got[0] if isinstance(got, tuple) else got
         (ok if got == T.DOT_UNAVAILABLE else bad)(
             "NC34 %-20s + 完美证据 → 必须 UNAVAILABLE, 实得 %s" % (name, got))
@@ -265,7 +269,7 @@ if DECIDE and hasattr(T, "DOT_OBSERVED"):
     for name, s in (("建会话时 observer 缺失", sess(observer=None)),
                     ("建会话时 InvocationID 空", sess(observer={"invocation_id": "",
                                                                "active_state": "active"}))):
-        got = T.dot_probe_state(s, W.READ_OK, ev(), obs(), NOW + 400)
+        got = T.dot_probe_state(s, W.READ_OK, ev(), obs(), T_CLOSE)
         got = got[0] if isinstance(got, tuple) else got
         (ok if got == T.DOT_UNAVAILABLE else bad)(
             "NC34 %-20s + 完美证据 → 必须 UNAVAILABLE, 实得 %s" % (name, got))
@@ -279,7 +283,7 @@ if DECIDE and hasattr(T, "DOT_OBSERVED"):
     for s, st, e, o in ((sess(), W.READ_OK, ev(), obs()),
                         (sess(), W.READ_DENIED, None, obs()),
                         (sess(), W.READ_CORRUPT, None, obs(active_state="failed"))):
-        r = T.dot_probe_state(s, st, e, o, NOW + 400)
+        r = T.dot_probe_state(s, st, e, o, T_CLOSE)
         blob += repr(r)
     for secret, why in ((LAB, "明文 probe label"), (DIG, "label 摘要"),
                         ("p.test", "探测域名")):
