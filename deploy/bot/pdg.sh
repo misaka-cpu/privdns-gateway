@@ -2318,7 +2318,7 @@ migrate_dotwitness(){
   # ② 候选 env / unit / mosdns 配置。全部先造出来、验过, 再谈落盘。
   printf 'PDG_DOTWITNESS_SUFFIX=probe.%s\n' "$dom" > "$work/env.new"
   cp -f "$tmpl_unit" "$work/unit.new"
-  if ! python3 "$router" render "$DW_MOS" "$dom" > "$work/mos.new" 2>"$work/mos.err"; then
+  if ! python3 "$router" render "$DW_MOS" "$dom" > "$work/candidate.yaml" 2>"$work/mos.err"; then
     c_y "  ❌ mosdns 路由候选生成失败: $(head -1 "$work/mos.err")"
     rm -rf "$work"; return 1
   fi
@@ -2326,7 +2326,7 @@ migrate_dotwitness(){
   # ③ 候选必须过**真 mosdns 校验**。只做文本检查的话, 坏配置要到 restart 时才炸,
   #    那时旧配置已经被换掉了。
   if command -v mosdns >/dev/null 2>&1; then
-    if ! timeout 20 mosdns start -c "$work/mos.new" >"$work/val.log" 2>&1; then
+    if ! timeout 20 mosdns start -c "$work/candidate.yaml" >"$work/val.log" 2>&1; then
       if grep -qiE '^Error|FATAL' "$work/val.log"; then
         c_y "  ❌ mosdns 路由候选未通过校验, 保持原配置不动:"
         grep -iE '^Error' "$work/val.log" | head -1 | sed 's/^/     /'
@@ -2373,7 +2373,7 @@ migrate_dotwitness(){
   # ⑤ 只在内容真的不同时写盘。每次都写 + daemon-reload 会平白打断在用的连接。
   cmp -s "$work/env.new"  "$DW_ENV"  || { _dw_atomic "$work/env.new"  "$DW_ENV"  600 || rc=1; need_wit=1; }
   cmp -s "$work/unit.new" "$DW_UNIT" || { _dw_atomic "$work/unit.new" "$DW_UNIT" 644 || rc=1; need_reload=1; need_wit=1; }
-  cmp -s "$work/mos.new"  "$DW_MOS"  || { _dw_atomic "$work/mos.new"  "$DW_MOS"  644 || rc=1; need_mos=1; }
+  cmp -s "$work/candidate.yaml"  "$DW_MOS"  || { _dw_atomic "$work/candidate.yaml"  "$DW_MOS"  644 || rc=1; need_mos=1; }
   if [[ "$rc" != 0 ]]; then
     c_y "  ❌ 写入 witness 的 unit/env/mosdns 配置失败, 正在回滚。"
     _dw_rollback; rm -rf "$work"; return 1
