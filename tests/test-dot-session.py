@@ -232,7 +232,10 @@ if DECIDE and hasattr(T, "DOT_OBSERVED"):
          ev(observed_at=NOW + 10, expires_at=NOW + 20), obs(), T_CLOSE, U),
         # 结算太晚: 窗口最早那一刻的证据到 t0+TTL 就到期, 过了这个点"看不见"既可能是
         # 没来过也可能是过期了 —— 分不开就不许下负面结论
-        ("结算晚于留存保证", sess(), W.READ_ABSENT, None, obs(), NOW + 400, U),
+        # 时刻取自 EVIDENCE_TTL_SECS 而不是写死 —— 这一格的含义是"超过留存保证",
+        # 写死数字的话下次再调留存期它就悄悄变成别的意思了
+        ("结算晚于留存保证", sess(), W.READ_ABSENT, None, obs(),
+         NOW + W.EVIDENCE_TTL_SECS + 1, U),
         ("transport 不是 dot", sess(), W.READ_OK, ev(transport="udp"), obs(), T_CLOSE, U),
     ]
     for name, s, st, e, o, now, want in CASES:

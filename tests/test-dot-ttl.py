@@ -55,9 +55,11 @@ LAB = "a1b2c3d4e5f6a7b8c9d0e1f2"
 DIG = hashlib.sha256(LAB.encode()).hexdigest()
 INV = "9768fa5bdca741ac959df5fd33d105ce"
 
-# 结算余量: 窗口关闭后仍然能给出确定结论的那段时间。600-300=300 秒 —— 恰好一个
-# 完整会话窗口, 也就是说用户在测试结束后再花同样长的时间来看结果都还来得及。
-SETTLE_MARGIN = 300
+# 结算余量: 窗口关闭后仍然能给出确定结论的那段时间。**从会话窗口派生, 不留自由旋钮** ——
+# 写成一个独立常量的话, 谁把它改小一点这里就跟着松一点, 负控改它更是等于在改需求本身
+# (第一版就是这样, NC-TTL-3 因此抓不到任何东西)。含义: 用户测完之后, 再花一整个测试
+# 那么长的时间来看结果, 都还来得及。
+SETTLE_MARGIN = S.TTL_SECS
 
 
 def sess(t0=T0):
@@ -91,6 +93,7 @@ print("  linksess.TTL_SECS        = %s" % S.TTL_SECS)
 print("  dotwitness.EVIDENCE_TTL  = %s" % W.EVIDENCE_TTL_SECS)
 print("  结算余量                 = %s" % (W.EVIDENCE_TTL_SECS - S.TTL_SECS))
 
+# 判据一(算术): 留存期 >= 窗口 + 一整个窗口
 (ok if W.EVIDENCE_TTL_SECS >= S.TTL_SECS + SETTLE_MARGIN else bad)(
     "EVIDENCE_TTL_SECS(%s) >= SESSION_TTL(%s) + 结算余量(%s) —— 最早产生的证据在窗口"
     "关闭后还要留够一个完整会话窗口, 否则 NOT_OBSERVED 无从证明"
@@ -145,14 +148,17 @@ got = state(sess(), W.READ_OK, ev(T0), obs(invocation_id="0" * 32), T1)
 # ═══ 3. NOT_OBSERVED 必须真的可达 ═════════════════════════════════════════
 head("3. NOT_OBSERVED 可达性")
 
-reach = [now for now in range(int(T1), int(T0 + W.EVIDENCE_TTL_SECS) + 1, 10)
+# 判据二(行为): **不看常量, 只看 dot_probe_state 真的怎么答**。这是第二道独立的牙 ——
+# 就算上面那条算术断言被整条删掉, 留存期不够时这里照样会红。
+reach = [now for now in range(int(T1), int(T1) + 3 * int(S.TTL_SECS), 5)
          if state(sess(), W.READ_ABSENT, None, obs(), float(now)) == N]
 (ok if reach else bad)(
     "窗口关闭后存在能给出 NOT_OBSERVED 的时刻(实得 %d 个采样点)" % len(reach))
 if reach:
     span = max(reach) - min(reach)
-    (ok if span >= SETTLE_MARGIN - 10 else bad)(
-        "可达区间至少覆盖结算余量: 实得 %d 秒(要求 >= %d)" % (span, SETTLE_MARGIN - 10))
+    (ok if span >= S.TTL_SECS - 5 else bad)(
+        "NOT_OBSERVED 的可达区间至少有一整个会话窗口那么长: 实得 %d 秒(要求 >= %d)"
+        % (span, S.TTL_SECS - 5))
 
 
 # ═══ 4. 6.2A 的严格 schema 不因放宽 TTL 而松动 ════════════════════════════

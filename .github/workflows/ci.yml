@@ -176,6 +176,10 @@ jobs:
         run: python3 tests/test-dot-strict.py
       - name: "DoT 测试卫生 (异常/SystemExit/中断都要清掉临时目录)"
         run: python3 tests/test-dot-tmpguard.py
+      - name: "6.2B 会话关联与三态语义 (观察端不可用时永不 OBSERVED)"
+        run: python3 tests/test-dot-session.py
+      - name: "6.2B evidence 留存期必须覆盖窗口+结算余量 (否则 NOT_OBSERVED 不可达)"
+        run: python3 tests/test-dot-ttl.py
 
       - name: "链路会话证据接进 linkstat (NOT_OBSERVED/PASS/STALE 语义与退出码隔离)"
         run: python3 tests/test-link-live.py
