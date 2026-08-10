@@ -72,9 +72,14 @@ END = "# <<< pdg-dotwitness"
     "模板里恰好两段受管块(插件区一段、main_sequence 分支一段), 实得 %d/%d"
     % (tmpl.count(BEGIN), tmpl.count(END)))
 
-# 迁移函数必须用**同一套**标记, 不能各写各的
-(ok if BEGIN in pdg_src and END in pdg_src else bad)(
-    "升级迁移用的是同一套标记(标记只在模板里、迁移另认一套的话, 新装机与升级机会分叉)")
+# 迁移必须用**同一套**标记。最初这条要求 pdg.sh 里也出现字面量 —— 那反而是在鼓励
+# 抄第二份。真正该守的是"标记只有一个定义处": 模板里的那两段和迁移用的那两段来自
+# 同一个模块, 迁移只是调用它。
+route_src = open(os.path.join(ROOT, "deploy", "bot", "dotwroute.py"), encoding="utf-8").read()
+(ok if BEGIN in route_src and END in route_src else bad)(
+    "受管块标记定义在 dotwroute.py 里")
+(ok if "dotwroute.py" in pdg_src else bad)(
+    "迁移调用 dotwroute.py, 不自带第二份标记/插入逻辑(两份迟早分叉)")
 
 
 # ═══ 2. 迁移函数存在并接进迁移链 ═══════════════════════════════════════════
@@ -95,7 +100,7 @@ i_dw = chain.find("migrate_dotwitness")
 
 
 # ═══ 3. 新装路径 ═══════════════════════════════════════════════════════════
-head("3. fresh install")
+head("3. fresh install(本轮不做, 预期红)")
 
 (ok if "pdg-dotwitness.service" in ins_src else bad)("install.sh 安装 witness unit")
 (ok if re.search(r"enable[^\n]*pdg-dotwitness|pdg-dotwitness[^\n]*enable", ins_src) else bad)(
@@ -104,7 +109,7 @@ head("3. fresh install")
 
 
 # ═══ 4. 卸载 ═══════════════════════════════════════════════════════════════
-head("4. uninstall")
+head("4. uninstall(本轮不做, 预期红)")
 
 (ok if "pdg-dotwitness" in uni_src else bad)("uninstall 处理 pdg-dotwitness")
 (ok if re.search(r"disable[^\n]*pdg-dotwitness", uni_src) else bad)("uninstall disable --now 它")
@@ -115,12 +120,21 @@ head("4. uninstall")
 # ═══ 5. 快照/备份覆盖 ══════════════════════════════════════════════════════
 head("5. 快照必须覆盖新增的四件套")
 
-snap_src = ""
-for rel in ("deploy/bot/pdgtx.py", "deploy/bot/pdg.sh"):
-    snap_src += open(os.path.join(ROOT, rel), encoding="utf-8").read()
-for p, why in (("pdg-dotwitness.service", "unit"), ("dotwitness.env", "env")):
-    (ok if p in snap_src else bad)(
-        "%s 进了快照/备份白名单 —— 不在里面的话回滚回不到原状" % why)
+# 判据按**实际覆盖方式**来, 不要求字面量: env 与 mosdns 配置是随父目录整个进快照的
+# (etc/privdns-gateway、etc/mosdns), 硬要求文件名出现反而会逼人写一条冗余条目。
+m = re.search(r"local cand=\((?:.*\n)*?[^\n]*\)\n", pdg_src)
+cand = m.group(0) if m else ""
+(ok if cand else bad)("找得到 update 快照的候选清单")
+for path, why in (("etc/systemd/system/pdg-dotwitness.service", "witness unit"),
+                  ("etc/privdns-gateway", "env 所在目录"),
+                  ("etc/mosdns", "mosdns 配置所在目录"),
+                  ("opt/pdg-bot", "运行模块所在目录")):
+    (ok if path in cand else bad)(
+        "%s 在快照清单里(%s) —— 不在的话 update 回滚回不到原状" % (path, why))
+# evidence 是 /run 上的易失证据, **不许**进持久快照: 把它存下来等于把一次诊断的
+# 观测结果带到另一个时间点去, 那时它既不新鲜也不再对应任何会话。
+(ok if "evidence.json" not in cand and "run/pdg-dotwitness" not in cand else bad)(
+    "evidence.json 不进持久快照(它在 /run, 是易失证据)")
 
 
 # ═══ 6. 状态机: 不变不动 ═══════════════════════════════════════════════════
@@ -141,13 +155,12 @@ else:
     # 回滚: 候选校验失败/启动失败都要恢复
     (ok if re.search(r"before|backup|_dw_restore|rollback", body, re.I) else bad)(
         "留 before-image 并在失败时恢复")
-    (ok if "mosdns -" in body or "check_config" in body or "mosdns start -d" in body
-     or re.search(r"_mosdns_validate|mosdns_check", body) else bad)(
+    (ok if re.search(r"mosdns start -c|mosdns -c|check_config|_mosdns_validate", body) else bad)(
         "用真 mosdns 二进制校验候选(只做文本检查的话, 坏配置会在 restart 时才炸)")
 
 
 # ═══ 7. doctor: witness 故障不得冒充普通 DNS 故障 ══════════════════════════
-head("7. doctor 严重级别")
+head("7. doctor 严重级别(本轮只做「不进关键服务集」那条)")
 
 chk = open(os.path.join(ROOT, "deploy", "bot", "checks.py"), encoding="utf-8").read()
 m = re.search(r"^def expected_services\(\):(?:.*\n)*?^\s*return[^\n]*\n", chk, re.M)
@@ -178,4 +191,6 @@ if body:
 
 print("\n" + "─" * 66)
 print("通过 %d, 失败 %d" % (npass, nfail))
+print("其中 fresh install / uninstall / doctor 三节本轮不在范围内(见 §10), "
+      "它们的红是**已知待办**而不是回归。")
 sys.exit(1 if nfail else 0)
