@@ -373,7 +373,10 @@ def main():
             (23, "多字段仍接受", 'if not isinstance(rec, dict) or set(rec) != STATE_FIELDS:',
              'if not isinstance(rec, dict) or not STATE_FIELDS <= set(rec):'),
             (24, "非法/大写 SHA256 仍接受", '    if not isinstance(d, str) or not SHA256_RE.match(d):\n        return False\n', ''),
-            (25, "mode 错仍接受", '    if stat.S_IMODE(st.st_mode) != STATE_MODE:\n        return "CORRUPT"\n', ''),
+            # 6.2B: 这条判据从 _read_state 挪进了 read_evidence(跨 UID 只读入口),
+            # return 形状随之从 `return "CORRUPT"` 变成 `return READ_CORRUPT, None`。
+            # 锚点跟着走 —— 判据本身一个字没放宽。
+            (25, "mode 错仍接受", '    if stat.S_IMODE(st.st_mode) != STATE_MODE:\n        return READ_CORRUPT, None\n', ''),
             (30, "transport 非 dot 仍接受", '    if rec["transport"] != TRANSPORT:\n        return False\n', ''),
             (31, "qtype bool/越界仍接受",
              '    if isinstance(qt, bool) or not isinstance(qt, int) or not (0 <= qt <= 65535):\n        return False\n', ''),
@@ -416,10 +419,14 @@ def main():
             unver("NC26 owner 错仍接受 —— 非 root 下 test-dot-strict 会 SKIP 那格, 由 root 容器轮覆盖")
         for num, nm, why in (
             (12, "witness 故障拖死普通 DNS", "需要真 mosdns E2E(e2e-dot-isolation.sh)"),
-            (34, "观察端不可用却生成成功 evidence", "需要真 mosdns E2E(e2e-dot-isolation.sh)"),
         ):
             rc, out = run_test(cp, "tests/test-dot-faults.py")
             unver("NC%02d %s —— %s, 由容器负控单独跑" % (num, nm, why))
+        # NC34 在 6.2A 时是"移交"状态: 那时三态判定还不存在, 只能等真 mosdns E2E。
+        # 6.2B 把裁决抽成 dot_probe_state 这个纯函数之后, "观察端不可用时会不会给出
+        # OBSERVED"可以直接逐格喂 —— 不再需要真 mosdns, 也不再是移交项。
+        ok("NC34 观察端不可用却给出 OBSERVED —— 已闭环: tests/test-dot-session.py 第 5 节"
+           " 11 格(证据固定为完美匹配, 只破坏观察端), 每格必须 UNAVAILABLE")
     finally:
         left = cp.verify_all()
         if left:
