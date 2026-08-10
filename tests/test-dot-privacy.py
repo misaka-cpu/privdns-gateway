@@ -167,8 +167,11 @@ def main_seq(t):
 gate("17. 探测分支排在 goto internal_sequence(即 lazy_cache)之前",
      lambda t: (lambda b: "goto probe_seq" in b and "goto internal_sequence" in b
                 and b.index("goto probe_seq") < b.index("goto internal_sequence"))(main_seq(t)),
-     TSRC, TSRC.replace("        exec: goto probe_seq\n      - matches: client_ip $npn_clients\n        exec: goto internal_sequence\n",
-                        "        exec: goto internal_sequence\n      - matches: client_ip $npn_clients\n        exec: goto probe_seq\n"))
+     # 反向夹具的锚点必须跟着模板形状走。6.2B 给探测分支加了受管块起止标记, 中间多了
+     # 一行 `# <<< ...`, 于是原来那段三行 replace 变成空操作 —— 夹具不再注入任何东西,
+     # 这条门自己检出了"反向夹具也合规"。判据一个字没放宽, 换的是夹具锚点。
+     TSRC, TSRC.replace("        exec: goto probe_seq\n      # <<< pdg-dotwitness managed block (main_sequence)\n      - matches: client_ip $npn_clients\n        exec: goto internal_sequence\n",
+                        "        exec: goto internal_sequence\n      # <<< pdg-dotwitness managed block (main_sequence)\n      - matches: client_ip $npn_clients\n        exec: goto probe_seq\n"))
 gate("18. 探测分支同时具备 qname 后缀与 SNI 两道守卫",
      lambda t: (lambda b: re.search(r"qname suffix probe\.", b) and re.search(r"string_exp server_name eq ", b))(main_seq(t)) is not None,
      TSRC, TSRC.replace("          - string_exp server_name eq __DOT_DOMAIN__\n", ""))
