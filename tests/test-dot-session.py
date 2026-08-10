@@ -268,6 +268,12 @@ if DECIDE and hasattr(T, "DOT_OBSERVED"):
         got = got[0] if isinstance(got, tuple) else got
         (ok if got == T.DOT_UNAVAILABLE else bad)(
             "NC34 %-20s + 完美证据 → 必须 UNAVAILABLE, 实得 %s" % (name, got))
+    # 再两格: 观察端好好的, 但证据读不到/不可信 —— 同样不许 OBSERVED
+    for name, st in (("evidence DENIED", W.READ_DENIED), ("evidence CORRUPT", W.READ_CORRUPT)):
+        got = T.dot_probe_state(sess(), st, ev(), obs(), T_CLOSE)
+        got = got[0] if isinstance(got, tuple) else got
+        (ok if got == T.DOT_UNAVAILABLE else bad)(
+            "NC34 %-20s → 必须 UNAVAILABLE, 实得 %s" % (name, got))
     # 建会话时就没有 observer 的那一半
     for name, s in (("建会话时 observer 缺失", sess(observer=None)),
                     ("建会话时 InvocationID 空", sess(observer={"invocation_id": "",
@@ -276,6 +282,40 @@ if DECIDE and hasattr(T, "DOT_OBSERVED"):
         got = got[0] if isinstance(got, tuple) else got
         (ok if got == T.DOT_UNAVAILABLE else bad)(
             "NC34 %-20s + 完美证据 → 必须 UNAVAILABLE, 实得 %s" % (name, got))
+
+
+# ═══ 5b. 理由码必须指对环节 ════════════════════════════════════════════════
+head("5b. UNAVAILABLE 的理由码指对环节")
+
+# 结论都是 UNAVAILABLE 时, 理由码是唯一能告诉用户"该去看哪儿"的东西。指错了比不说
+# 更糟: 把"这服务从来没起来过"说成"测试期间重启过", 用户会去查根本不存在的重启。
+if DECIDE and hasattr(T, "DOT_OBSERVED"):
+    WHY = [
+        ("建会话时 observer 缺失", sess(observer=None), W.READ_OK, ev(), obs(),
+         "OBSERVER_UNKNOWN_AT_START"),
+        ("建会话时 InvocationID 空",
+         sess(observer={"invocation_id": "", "active_state": "active"}),
+         W.READ_OK, ev(), obs(), "OBSERVER_UNKNOWN_AT_START"),
+        ("窗口中重启", sess(), W.READ_OK, ev(), obs(invocation_id="0" * 32),
+         "OBSERVER_RESTARTED"),
+        ("unit 未安装", sess(), W.READ_OK, ev(), obs(installed=False),
+         "OBSERVER_NOT_INSTALLED"),
+        ("结算时 inactive", sess(), W.READ_OK, ev(), obs(active_state="inactive"),
+         "OBSERVER_NOT_ACTIVE"),
+        ("读不到 InvocationID", sess(), W.READ_OK, ev(), obs(invocation_id=""),
+         "OBSERVER_IDENTITY_UNREADABLE"),
+        ("evidence 无权限", sess(), W.READ_DENIED, None, obs(), "EVIDENCE_UNREADABLE"),
+        ("evidence 损坏", sess(), W.READ_CORRUPT, None, obs(), "EVIDENCE_CORRUPT"),
+    ]
+    for name, s_, st, e, o, want in WHY:
+        r = T.dot_probe_state(s_, st, e, o, T_CLOSE)
+        got = r[1] if isinstance(r, tuple) and len(r) > 1 else "(无理由码)"
+        (ok if got == want else bad)("%-24s → 理由码 %s, 实得 %s" % (name, want, got))
+    # 每个理由码都要有给人看的说法, 否则用户看到的是内部标识符
+    ls_mod = __import__("linkstat")
+    human = getattr(ls_mod, "_DOT_WHY_HUMAN", {})
+    missing = [w for _n, _s, _st, _e, _o, w in WHY if w not in human]
+    (ok if not missing else bad)("每个理由码都有面向用户的说法(缺 %s)" % (missing or "无"))
 
 
 # ═══ 6. 隐私: 结论里不得出现 label/qname/DoT 域名/来源 ═════════════════════
@@ -293,6 +333,28 @@ if DECIDE and hasattr(T, "DOT_OBSERVED"):
         (ok if secret not in blob else bad)("三态返回值里不出现%s" % why)
     (ok if not re.search(r"ipv4|source|client|10\.0\.0", blob, re.I) else bad)(
         "DoT evidence 不产生任何来源字段(转发后 witness 只能看见 127.0.0.1)")
+
+# ── probe_domain 的口径 ────────────────────────────────────────────────────
+# 基础 DoT 域名**不是秘密**: 它已经在证书 CN、profile.env 和用户手机上的描述文件里。
+# 6.1B 把它放进会话记录是有意的(第 2 步要拼这个地址), 不删。
+# 真正不许落地的是**每会话唯一**的那些东西: 带 label 的完整 qname、24 位明文 label、
+# HTTP token 原文、来源地址。混为一谈的话, 要么误删 6.1B 的字段, 要么放过真正的泄露。
+tok3, r3 = S.new_session("10.0.0.0/24", probe_domain="dot.example.test",
+                         probe_label=LAB)
+import json as _json
+blob3 = _json.dumps(r3, ensure_ascii=False, default=str)
+(ok if "dot.example.test" in blob3 else bad)(
+    "基础 DoT 域名允许留在会话记录里(6.1B 既有字段, 非秘密)")
+(ok if LAB not in blob3 else bad)("24 位明文 label **不在**持久状态里")
+(ok if ("%s.probe.dot.example.test" % LAB) not in blob3 else bad)(
+    "带 label 的完整 probe qname **不在**持久状态里")
+(ok if tok3 not in blob3 else bad)("HTTP token 原文不在持久状态里")
+(ok if not re.search(r'"source_ipv4_16"|\d+\.\d+\.\d+\.\d+', blob3.replace("10.0.0.0/24", ""))
+ else bad)("持久状态里没有来源地址")
+# 三态输出同样只准出现基础域名以外的零信息
+_r = T.dot_probe_state(r3, W.READ_OK, ev(), obs(), NOW + 400)
+(ok if LAB not in repr(_r) and "dot.example.test" not in repr(_r) else bad)(
+    "三态返回值里既无明文 label 也无域名")
 
 # evidence schema 本身不许有来源字段 —— 6.2A 的冻结契约, 这里复核一次
 (ok if not (set(W.STATE_FIELDS) & {"source", "client_addr", "source_ipv4_16", "ipv4_16"})
