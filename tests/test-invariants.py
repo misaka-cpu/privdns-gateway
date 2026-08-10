@@ -85,8 +85,8 @@ if not missing:
     ok("快照含全部 %d 个必需顶层字段" % len(need))
 else:
     bad("缺字段: %s" % "、".join(missing))
-if snap["manifest"]["count"] == 26 and len(snap["static_files"]) == 26:
-    ok("Android 平台记录 26 项静态成员(数量漂移会直接失败)")
+if snap["manifest"]["count"] == 27 and len(snap["static_files"]) == 27:
+    ok("Android 平台记录 27 项静态成员(数量漂移会直接失败)")
 else:
     bad("成员数不对: manifest=%d static=%d"
         % (snap["manifest"]["count"], len(snap["static_files"])))
