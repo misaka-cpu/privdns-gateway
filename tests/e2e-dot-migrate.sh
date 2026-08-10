@@ -67,6 +67,8 @@ dns_udp(){ dig +short +time=2 +tries=1 @127.0.0.1 example.com A 2>/dev/null | he
 dns_tcp(){ dig +short +tcp +time=2 +tries=1 @127.0.0.1 example.com A 2>/dev/null | head -1; }
 dns_dot(){ python3 "$E2E_ROOT/tests/dotquery.py" example.com 2>/dev/null; }
 ev_count(){ ls /run/pdg-dotwitness/ 2>/dev/null | wc -l; }
+tmpset(){ ls -d /tmp/tmp.* 2>/dev/null | sort | tr '\n' ' '; }
+TMP0="$(tmpset)"
 
 # ── 健康基线 ───────────────────────────────────────────────────────────────
 head "0. 健康基线"
@@ -104,8 +106,8 @@ cell(){
     bad "$n 恢复不一致"$'\n'"      前: $BASE"$'\n'"      后: $after"
   fi
   [[ -n "$(dns_udp)" ]] && ok "$n 普通 DNS 仍可用" || bad "$n 普通 DNS 挂了"
-  [[ "$(ls /tmp/tmp.* -d 2>/dev/null | wc -l)" == 0 ]] && ok "$n 无临时候选残留" \
-    || bad "$n 残留临时目录 $(ls -d /tmp/tmp.* 2>/dev/null | tr '\n' ' ')"
+  if [[ "$(tmpset)" == "$TMP0" ]]; then ok "$n 无**新增**临时候选残留"
+  else bad "$n 新增了临时目录: 前[$TMP0] 后[$(tmpset)]"; fi
   # 复原到健康基线, 不让这一格污染下一格
   migrate_dotwitness >/dev/null 2>&1
   [[ "$(snap)" == "$BASE" ]] && ok "$n 复跑一次正常迁移 → 回到健康基线(状态机能自愈)" \
