@@ -35,7 +35,11 @@ import time
 # 2: 会话记录新增必填字段 internal_cidr(见 new_session 的说明)。旧状态没有这个字段,
 # 而"缺了就从 profile.env 补"恰恰是这次要根除的东西 —— 所以升版号让 read_state 直接
 # fail-closed。会话本来只有 300 秒寿命, 升级后最多让人重开一次测试。
-SCHEMA_VERSION = 2
+# 3: 6.2B 新增 probe_label_sha256 与 observer。同样必填、同样 fail-closed ——
+#    v2 记录里这两样都没有, 而"没有就当观察端一直可用"正是这轮要根除的误判来源。
+#    不做原地伪升级(补几个默认值假装是 v3): 那等于凭空造出一个我们从未观测过的
+#    observer 身份, 结算时会拿它去证明"全程可用"。
+SCHEMA_VERSION = 3
 RUNTIME_DIR = "/run/pdg-probe81"
 STATE_NAME = "session.json"
 STATE_MAX_BYTES = 4096
@@ -178,7 +182,7 @@ def read_state():
         return None, R_STATE_CORRUPT
     # internal_cidr 与其它几个一样是必填。缺了不猜、不从 profile 补 —— 那正是 P0 的来源。
     for k in ("session_id", "token_sha256", "created_at", "expires_at", "state",
-              "internal_cidr"):
+              "internal_cidr", "probe_label_sha256", "observer"):
         if k not in rec:
             return None, R_STATE_CORRUPT
     # 动态 UID 换过之后不许误读上一任留下的会话。RuntimeDirectory 停服即销毁, 正常

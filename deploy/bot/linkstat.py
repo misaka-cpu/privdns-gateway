@@ -75,6 +75,9 @@ CODES = (
     # 阶段 3 因 mosdns API 的安全问题停止(见 tests/test-link-dns-evidence.py)。留在
     # 闭集里是因为模型契约已定, 但当前唯一会出现的是 METRICS_UNAVAILABLE。
     "L6_DOT_PROBE_WINDOW_OBSERVED", "L6_DOT_PROBE_NOT_OBSERVED",
+    # 6.2B: 窗口还开着时的等待态。它**不是**三个终态之一 —— 把"还在等"
+    # 塞进 NOT_OBSERVED 会让用户以为已经有结论了。
+    "L6_DOT_PROBE_PENDING",
     "L6_DOT_METRICS_UNAVAILABLE",
     "L7_REDIRECT_READY", "L7_REDIRECT_RULE_MISSING",
     "L8_SERVICES_READY", "L8_MOSDNS_DOWN", "L8_MIHOMO_DOWN",
@@ -518,17 +521,85 @@ def _l6_dns(_ctx):
             evidence_source="本机 dig @127.0.0.1",
             next_step="systemctl status mosdns; sudo pdg doctor --deep",
             blocks_downstream=True))
-    out.append(Finding(
-        6.5, "L6_DOT_METRICS_UNAVAILABLE", NOT_OBSERVED, None, "手机 DoT 查询证据",
-        # 这里只留结论。为什么不采集(接口暴露面、缓存导出、投喂端点、本机 SSRF、反向代理
-        # 隔离不了上游端口)是给维护者看的论证, 放在 README 与 docs/ROADMAP.md ——
-        # 用户在自检里看到一串内部实现名词, 既看不懂也无从处置。
-        "当前版本暂不采集这项证据，因此无法判断手机的 DoT 查询是否到达；"
-        "这不代表正常，也不代表故障。",
-        evidence_source="none(本版本不采集 DNS 侧证据)",
-        next_step="可先完成 HTTP 链路测试；DNS 实时证据将在后续版本重新设计。"
-                  "技术原因见项目路线图。"))
+    out.append(_l6_dot())
     return out
+
+
+def _l6_dot():
+    """第 6.5 层: 手机这次探测的 DoT 查询到没到过网关的 DoT 接收路径。
+
+    四种结局对应 dot_probe_state 的四个返回值。这里只做**接线**: 取会话、取观察端
+    身份、经 dotwitness 的只读入口取证据, 然后把裁决结果翻成给人看的话。判定逻辑一律
+    在 dot_probe_state 里 —— 采集器里再写一遍 if, 两处迟早会分叉。
+
+    证据一律走 dotwitness.read_evidence(): 不在这里开文件、不在这里解析 JSON、不在这里
+    判 owner/mode/schema。第二份校验器必然比第一份松, 而"松"在取证场景里就等于会撒谎。
+
+    这一层**不产生** source_ipv4_16, 也不覆盖第 1/2 层的 HTTP 来源归属: 查询转发到
+    witness 时手机的原始地址早就没了(6.2A 实测源地址恒为 127.0.0.1)。
+    """
+    rec, _why, _m = _session()
+    try:
+        import dotwitness
+        import linksess
+    except Exception:  # noqa: BLE001
+        return Finding(
+            6.5, "L6_DOT_METRICS_UNAVAILABLE", NOT_OBSERVED, None, "手机 DoT 查询证据",
+            "读不到证据端模块，无法判断手机的 DoT 查询是否到达；"
+            "这不代表正常，也不代表故障。",
+            evidence_source="none(证据端模块不可用)")
+
+    observer = linksess.observer_identity()
+    ev_status, ev_rec = dotwitness.read_evidence()
+    state, why = dot_probe_state(rec, ev_status, ev_rec, observer, time.time())
+
+    if state == DOT_OBSERVED:
+        return Finding(
+            6.5, "L6_DOT_PROBE_WINDOW_OBSERVED", PASS, None, "手机 DoT 查询证据",
+            "本次测试期间，网关的 DoT 接收路径上出现了这次测试专属的探测查询。"
+            "这说明手机的加密 DNS 查询确实到达了网关；"
+            "它**不**说明手机整体联网正常，也不说明其它查询走的是同一条路。",
+            evidence_source="pdg-dotwitness 每会话证据(只有随机标识的摘要，无查询内容)",
+            observed_at=(ev_rec or {}).get("observed_at"))
+    if state == DOT_PENDING:
+        return Finding(
+            6.5, "L6_DOT_PROBE_PENDING", NOT_OBSERVED, None, "手机 DoT 查询证据",
+            "测试还在进行中，暂时还没有看到这次测试专属的探测查询。"
+            "请在手机上完成第 2 步。",
+            evidence_source="pdg-dotwitness 每会话证据",
+            next_step="在手机上打开 `pdg link session start` 给出的第 2 步地址。")
+    if state == DOT_NOT_OBSERVED:
+        return Finding(
+            6.5, "L6_DOT_PROBE_NOT_OBSERVED", NOT_OBSERVED, None, "手机 DoT 查询证据",
+            "本次测试全程都在观察，但没有看到这次测试专属的探测查询到达网关的 "
+            "DoT 接收路径。常见原因是手机没有走这台网关的加密 DNS。",
+            evidence_source="pdg-dotwitness 每会话证据(全程可用，无匹配记录)",
+            next_step="确认手机上的 DNS 配置已启用，并重新做一次测试。")
+    # UNAVAILABLE —— 说不出结论时就说说不出, 不拿"没看到"顶替。理由码留给维护者,
+    # 给用户的那句话不带内部名词。
+    return Finding(
+        6.5, "L6_DOT_METRICS_UNAVAILABLE", NOT_OBSERVED, None, "手机 DoT 查询证据",
+        "这次无法判断手机的 DoT 查询是否到达（%s）；这既不代表正常，也不代表故障。"
+        % _DOT_WHY_HUMAN.get(why, "证据不可用"),
+        evidence_source="none(%s)" % why,
+        next_step="重新开始一次测试；若反复出现，检查证据端服务是否在运行。")
+
+
+# 给用户看的原因。刻意都是"我们这边"的说法 —— 这些情形没有一条能推出手机有问题。
+_DOT_WHY_HUMAN = {
+    "NO_SESSION_LABEL": "当前没有可关联的测试会话",
+    "NO_SESSION_WINDOW": "会话缺少时间窗口",
+    "OBSERVER_UNKNOWN_AT_START": "开始测试时证据端就不可用",
+    "OBSERVER_NOT_INSTALLED": "证据端尚未安装",
+    "OBSERVER_NOT_ACTIVE": "证据端当前没有运行",
+    "OBSERVER_IDENTITY_UNREADABLE": "读不到证据端的运行状态",
+    "OBSERVER_RESTARTED": "测试期间证据端重启过，中间有一段没人观察",
+    "EVIDENCE_UNREADABLE": "读不到证据文件",
+    "EVIDENCE_CORRUPT": "证据文件不完整或不可信",
+    "EVIDENCE_TRANSPORT_MISMATCH": "证据的传输方式与预期不符",
+    "EVIDENCE_STALE": "证据已超过保留期",
+    "RETENTION_EXPIRED": "距离测试结束太久，证据已超过保留期",
+}
 
 
 def _l7_redirect(ctx):

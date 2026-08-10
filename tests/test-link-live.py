@@ -257,29 +257,31 @@ def main():
             "%s 的文案不能出现「服务器观察到本次会话的 HTTP 请求」" % name)
 
     print()
-    print("── 7. 第 6.5 层: 阶段 3 停了, 只能 NOT_OBSERVED ──")
+    print("── 7. 第 6.5 层: 6.2B 起真的采集证据, 但仍不许越界断言 ──")
     l65 = layer(fs, 6.5)
     (ok if l65 and l65[0]["status"] == L.NOT_OBSERVED else bad)(
         "第 6.5 层 NOT_OBSERVED(实得 %s)" % [(f["status"], f["code"]) for f in l65])
     (ok if l65 and l65[0]["code"] == "L6_DOT_METRICS_UNAVAILABLE" else bad)(
         "code 是 L6_DOT_METRICS_UNAVAILABLE(说清为什么没有)")
-    # 「延后到 6.2」这个事实现在钉在 docs/ROADMAP.md —— 用户侧只说"后续版本"并指路,
-    # 版本号写进自检文案对用户没有意义, 改版本时还会到处漏改。
+    # 6.2B 之前这里钉的是"当前版本暂不采集这项证据 / 后续版本重新设计 / 指向路线图"。
+    # 那三句在 6.2A+6.2B 落地后**已经是假话** —— 证据真的在采了。继续钉着等于要求
+    # 代码对用户撒谎, 所以换成"给不出结论时必须说清是哪一环给不出", 这才是不变的那条。
     _ns = (l65[0]["next_step"] or "") if l65 else ""
-    (ok if "后续版本" in _ns and "路线图" in _ns else bad)(
-        "下一步指出「后续版本重新设计」并指向项目路线图(实得 %s)" % _ns[:44])
-    _rm = (ROOT / "docs/ROADMAP.md").read_text(encoding="utf-8")
-    (ok if "移交 **6.2**" in _rm or "移交 6.2" in _rm else bad)(
-        "ROADMAP 里写明了移交 6.2(事实钉在文档而不是自检文案里)")
+    (ok if _ns.strip() else bad)("UNAVAILABLE 时仍然给出可执行的下一步(实得 %s)" % _ns[:44])
     d65 = l65[0]["detail"] if l65 else ""
-    (ok if "暂不采集这项证据" in d65 else bad)(
-        "第 6.5 层明说「当前版本暂不采集这项证据」(实得 %s)" % d65[:44])
+    (ok if "无法判断" in d65 else bad)(
+        "第 6.5 层明说「无法判断」而不是含糊带过(实得 %s)" % d65[:44])
+    # 说不出结论时必须点出是哪一环, 但只能是"我们这边"的说法 —— 这些情形没有一条
+    # 能推出手机有问题。
+    (ok if any(w in d65 for w in ("证据端", "会话")) else bad)(
+        "并点出给不出结论的环节(证据端/会话), 不让用户去猜")
     (ok if "不代表正常" in d65 and "不代表故障" in d65 else bad)(
         "并明说既不代表正常也不代表故障 —— 两个方向都不许被读者补全")
     (ok if l65 and l65[0]["title"] == "手机 DoT 查询证据" else bad)(
         "标题是「手机 DoT 查询证据」(实得 %s)" % (l65[0]["title"] if l65 else "无"))
-    (ok if l65 and "后续版本重新设计" in (l65[0]["next_step"] or "") else bad)(
-        "下一步给的是「先做 HTTP 链路测试 / DNS 证据后续重新设计」")
+    # 不许把"我们这边看不了"说成"你手机有问题"
+    (ok if not any(w in d65 + _ns for w in ("手机没有", "手机故障", "SIM 有问题")) else bad)(
+        "UNAVAILABLE 的文案不指控手机 —— 观察端不可用推不出手机的任何事")
     # 内部实现术语一律不进用户面前的字
     JARGON = ("SSRF", "缓存投喂", "上游端口", "metrics", "缓存导出", "反向代理")
     hit = [w for w in JARGON if w in d65 or w in (l65[0]["next_step"] or "")]
@@ -294,7 +296,7 @@ def main():
     for c in ("L1_HTTP_PROBE_OBSERVED", "L1_HTTP_PROBE_STALE",
               "L2_SOURCE_INSIDE_CIDR", "L2_SOURCE_OUTSIDE_CIDR",
               "L6_DOT_PROBE_WINDOW_OBSERVED", "L6_DOT_PROBE_NOT_OBSERVED",
-              "L6_DOT_METRICS_UNAVAILABLE"):
+              "L6_DOT_PROBE_PENDING", "L6_DOT_METRICS_UNAVAILABLE"):
         (ok if c in L.CODES else bad)("%s 在 CODES 闭集里" % c)
 
     print()
