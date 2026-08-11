@@ -150,7 +150,8 @@ plugins:
   #
   # 代价是 YAML 与 deploy/bot/dotwitness.py 各存一份端口值。这不是单一真源, 所以用硬门
   # 兜住: tests/test-dot-render.py 从两边分别读出来比对, 任一侧漂移即判红。
-  # >>> pdg-dotwitness managed block (plugins) —— 不要手工编辑
+  # 不要手工编辑下面这一段(起止标记之间的内容由 pdg 管理)。
+  # >>> pdg-dotwitness managed block (plugins)
   # 这对起止标记是**新装模板与升级迁移共用**的唯一识别依据。v1.9.0 装出来的机器盘上
   # 没有这一段, 而 pdg update 从不用模板重渲这个文件 —— migrate_dotwitness 靠这对标记
   # 判断"我们管的那段在不在、完不完整", 而不是靠"看见 dotwitness_fwd 就当装好了":
@@ -177,7 +178,8 @@ plugins:
       # 位置必须在 internal_sequence(以及它里面的 lazy_cache)之前: 排在缓存之后的话,
       # 同一 label 第二次查就可能直接命中缓存, 根本到不了证据端。
       # 只影响这个命名空间: 任何其它 qname 一个判据都不满足, 逐字节走原来的路。
-      # >>> pdg-dotwitness managed block (main_sequence) —— 不要手工编辑
+      # 不要手工编辑下面这一段(起止标记之间的内容由 pdg 管理)。
+      # >>> pdg-dotwitness managed block (main_sequence)
       - matches:
           - qname suffix probe.__DOT_DOMAIN__
           - string_exp server_name eq __DOT_DOMAIN__

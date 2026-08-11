@@ -80,22 +80,77 @@ def strip(text):
     return "\n".join(out) + ("\n" if text.endswith("\n") else "")
 
 
+MARKER_TEXT = "pdg-dotwitness managed block"   # 判"这一行是不是在说受管块"用
+_MANAGED_NAMES = ("dotwitness_fwd", "probe_seq")
+
+
+def _scan(text):
+    """逐行扫描。返回 (canonical 标记出现顺序, 近似但不等的标记行数)。
+
+    **必须与 strip() 用同一套判定**: strip() 认的是整行相等, 这里也只认整行相等。
+    以前 state() 用 `text.count()` 子串匹配而 strip() 用整行相等, 于是一个带后缀的
+    BEGIN 行会被 state 数成 1(判 full)、被 strip 完全无视 —— render 便在原块之上再
+    追加一份, mosdns 报 duplicated plugin tag。那条死路就是两套语义分叉造出来的。
+    """
+    seq, near = [], 0
+    for line in text.splitlines():
+        if line == BEGIN_P:
+            seq.append("BP")
+        elif line == END_P:
+            seq.append("EP")
+        elif line == BEGIN_S:
+            seq.append("BS")
+        elif line == END_S:
+            seq.append("ES")
+        elif MARKER_TEXT in line:
+            near += 1               # 缩进不同 / 带后缀 / 手工改过 —— 一律不认
+    return seq, near
+
+
+def _well_ordered(seq):
+    """标记必须成对且不交错: BEGIN 之后只能是同类 END, END 不能先于 BEGIN。"""
+    open_ = None
+    for k in seq:
+        if k in ("BP", "BS"):
+            if open_ is not None:
+                return False        # 上一个块还没闭合就又开一个
+            open_ = k
+        else:
+            if open_ != ("BP" if k == "EP" else "BS"):
+                return False        # END 先于 BEGIN, 或与开着的那个不配对
+            open_ = None
+    return open_ is None
+
+
+def _has_managed(text):
+    return any(n in text for n in _MANAGED_NAMES)
+
+
 def state(text):
     """当前配置处于哪种状态。返回 'full' / 'partial' / 'absent' / 'malformed'。"""
-    np, nps = text.count(BEGIN_P), text.count(END_P)
-    ns, nss = text.count(BEGIN_S), text.count(END_S)
+    seq, near = _scan(text)
+    if near:
+        # 近似标记绝不能当成 absent —— 那会让 render 以为没装过而追加第二份块。
+        return "malformed"
+    np, nps = seq.count("BP"), seq.count("EP")
+    ns, nss = seq.count("BS"), seq.count("ES")
     if np != nps or ns != nss:
         return "malformed"          # 标记不成对: 有人手工编辑过
     if np > 1 or ns > 1:
         return "malformed"          # 重复受管块
-    if np == 1 and ns == 1:
-        return "full"
+    if not _well_ordered(seq):
+        return "malformed"          # 乱序 / 交错
     if np == 0 and ns == 0:
         # 标记一个都没有, 但插件名可能是别的途径塞进来的 —— 那不算我们管的, 要报出来
-        if "dotwitness_fwd" in text or "probe_seq" in text:
+        if _has_managed(text):
             return "malformed"
         return "absent"
-    return "partial"                # 有插件没分支, 或反过来
+    # 收口: 判 full/partial 之前, 先确认剥离之后确实不再有受管内容。
+    # 这一条把"state 说能重写、strip 却删不掉"这类分叉在源头堵死 —— 不靠两处实现
+    # 各自小心, 而是让 state 直接问 strip 一句。
+    if _has_managed(strip(text)):
+        return "malformed"
+    return "full" if (np == 1 and ns == 1) else "partial"
 
 
 def render(text, domain):
