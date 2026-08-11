@@ -175,6 +175,10 @@ def nft_usable():
                        ("__RESCUE_PORT__", "8446"), ("__SERVER_IP__", "203.0.113.10"),
                        ("__CERT_DIR__", "/etc/mosdns/certs")):
             t = t.replace(tok, v)
+        # 模板将来多出一个这里不认识的 token 时, 探针不能因此渲不出合法产物 —— 那会让
+        # 整个动态段静默 SKIP, nft 就不再当裁判了(负控 NC-FW-4 正是这么发现的)。
+        # 未知 token 一律给一个语法上无害的值, 探针只回答"nft 在本环境能不能用"。
+        t = re.sub(r"__[A-Z_]+__", "1", t)
         open(good, "w", encoding="utf-8").write(t)
         p = subprocess.run([nft, "-c", "-f", good], capture_output=True, text=True)
         if p.returncode == 0:
