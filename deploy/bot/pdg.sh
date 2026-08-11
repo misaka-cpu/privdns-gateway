@@ -427,7 +427,11 @@ migrate_firewall_to_pdg(){
     rm -f "$tmp"; return 0
   fi
   c_g "检测到旧版(原装)防火墙 → 迁移到独立表 inet pdg (SSH=$port, 内网段=$cidr)…"
+  # 救援端口取自 lib/rescue.sh(唯一来源), 这里必须先加载: `pdg migrate-fw` 直达本函数,
+  # 不经过 migrate_rescue_plane —— 不加载的话 set -u 下 $PDG_RESCUE_PORT 就是 unbound。
+  _rescue_load || { c_y "  读不到救援常量(lib/rescue.sh), 保留旧防火墙不动。"; rm -f "$tmp"; return 0; }
   sed -e "s/__SSH_PORT__/$port/g" -e "s#__INTERNAL_CIDR__#$cidr#g" \
+      -e "s#__RESCUE_PORT__#$PDG_RESCUE_PORT#g" \
       "$REPO_DIR/deploy/firewall/nftables-mihomo.conf" > "$tmp"
   if ! nft -c -f "$tmp" >/dev/null 2>&1; then
     c_y "  新规则 nft -c 校验未过, 保留旧防火墙不动。"; rm -f "$tmp"; return 0
@@ -3187,7 +3191,10 @@ _switchcore_nft(){   # $1=target(mihomo)  渲染并应用 mihomo nft(用当前 S
   local wd rendered merged bak rc
   wd="$(mktemp -d)" || { echo "无法创建临时目录"; return 1; }
   rendered="$wd/pdg.nft"; merged="$wd/merged.conf"; bak="$wd/nftables.conf.bak"
+  # 同上: 平台切换直达本函数, 也不经过 migrate_rescue_plane, 得自己先加载救援常量。
+  _rescue_load || { rm -rf "$wd"; echo "读不到救援常量(lib/rescue.sh), 未改动防火墙"; return 1; }
   sed -e "s|__SSH_PORT__|$sshp|g" -e "s|__INTERNAL_CIDR__|$icidr|g" \
+      -e "s|__RESCUE_PORT__|$PDG_RESCUE_PORT|g" \
       "$REPO_DIR/deploy/firewall/nftables-mihomo.conf" > "$rendered"
   _pdg_nft_strip_gms "$rendered"          # iOS: 渲染后剥掉 GMS 5228-5230
   # 备份必须先成立(逐字节校验): 后面任何一步失败都要靠它把现网原样放回去
