@@ -31,8 +31,29 @@ WC="$WCROOT/wc"
 cleanup(){ rm -rf "$WCROOT"; }
 trap cleanup EXIT INT TERM          # runner 中途异常退出也要清掉工作副本
 cp -a "$REPO" "$WC"
+
+# ── TOUCHED 闭包 ───────────────────────────────────────────────────────────
+# 不手写猜: 这里列的是**矩阵与本 runner 的 mutation 实际会写到**的每一个文件。
+# 原来的 restore() 只写回 pdg.sh, 于是矩阵第 3/10 格改过的 dotwroute.py、第 1 格改过的
+# dot-domain 一旦在中途被打断就留在改坏状态, 后面每一格都在污染过的地基上跑 ——
+# NC-SM-2 在 runner 里时红时绿, 最可能就是这么来的。
+TOUCHED=(
+  "deploy/bot/pdg.sh"
+  "deploy/bot/dotwroute.py"
+  "deploy/mosdns/config.yaml"
+  "tests/e2e-dot-migrate.sh"
+  "tests/test-dot-lifecycle.py"
+)
+PRISTINE="$WCROOT/pristine"; mkdir -p "$PRISTINE"
+declare -A P_SHA P_MODE
+for rel in "${TOUCHED[@]}"; do
+  [[ -f "$WC/$rel" ]] || { echo "TOUCHED 里的 $rel 不存在, runner 拒绝启动"; exit 1; }
+  install -D -m 600 "$WC/$rel" "$PRISTINE/$rel"
+  P_SHA[$rel]="$(sha256sum "$WC/$rel" | cut -d' ' -f1)"
+  P_MODE[$rel]="$(stat -c %a "$WC/$rel")"
+done
 BASE_SHA="$(sha256sum "$REPO/$TARGET" | cut -d' ' -f1)"
-WC_SHA="$(sha256sum "$WC/$TARGET" | cut -d' ' -f1)"
+WC_SHA="${P_SHA[$TARGET]}"
 
 # 用 Python 做 literal 计数与替换。返回值: 0=成功改坏, 2=锚点数不对, 3=替换后不合预期。
 mutate(){ python3 - "$WC/$TARGET" "$1" "$2" <<'PY'
@@ -66,9 +87,31 @@ run_matrix(){
   PDG_E2E_ISOLATED=1 PDG_DOTW_REPO="$WC" bash "$WC/$MATRIX" </dev/null >"$MATRIX_OUT" 2>&1
 }
 n_red(){ grep -c '^\[FAIL' "$MATRIX_OUT" 2>/dev/null || true; }
+# 失败**集合**而不是失败**条数** —— lifecycle 本来就有 6 条待办红灯, 只比数量的话
+# 一个把某条从红变绿、又新增一条红的 mutation 会被判成"没新增失败"。
+fail_set(){ grep '^\[FAIL' "$1" 2>/dev/null | sed 's/[0-9]\{3,\}/N/g' | sort; }
+new_fails(){ comm -13 <(fail_set "$1") <(fail_set "$2"); }
 n_assert(){ local a b; a="$(grep -c '^\[OK' "$MATRIX_OUT" || true)"; b="$(n_red)"; echo $(( ${a:-0} + ${b:-0} )); }
 
-restore(){ cp -f "$REPO/$TARGET" "$WC/$TARGET"; }
+# 从 pristine **字节**写回全部 TOUCHED, 不用 git checkout(容器里它静默失效过)。
+restore(){
+  local rel
+  for rel in "${TOUCHED[@]}"; do
+    cp -f "$PRISTINE/$rel" "$WC/$rel"
+    chmod "${P_MODE[$rel]}" "$WC/$rel"
+  done
+}
+# 每格结束后核对: TOUCHED 全部精确复原, 且工作副本没有多出别的改动
+verify_restore(){
+  local n="$1" rel bad=0
+  for rel in "${TOUCHED[@]}"; do
+    [[ "$(sha256sum "$WC/$rel" | cut -d' ' -f1)" == "${P_SHA[$rel]}" ]] || { bad "NC-SM-$n 恢复后 $rel 摘要不一致"; bad=1; }
+    [[ "$(stat -c %a "$WC/$rel")" == "${P_MODE[$rel]}" ]] || { bad "NC-SM-$n 恢复后 $rel mode 不一致"; bad=1; }
+  done
+  local dirty; dirty="$(git -C "$WC" status --short 2>/dev/null | wc -l)"
+  [[ "$dirty" == 0 ]] || { bad "NC-SM-$n 工作副本还有 $dirty 项未恢复: $(git -C "$WC" status --short | head -3 | tr '\n' ' ')"; bad=1; }
+  return $bad
+}
 
 sect "基线: 未改坏时矩阵必须全绿"
 if run_matrix; then
@@ -78,6 +121,9 @@ else
   exit 1
 fi
 BASE_ASSERTS="$(n_assert)"
+BASE_OUT=/tmp/nc-base.out
+cp -f "$MATRIX_OUT" "$BASE_OUT"
+echo "  基线失败集合: $(fail_set "$BASE_OUT" | wc -l) 条"
 
 # $1=编号 $2=名字 $3=原文 $4=替换
 cell(){
@@ -90,18 +136,18 @@ cell(){
     bad "NC-SM-$n $name → 改坏后语法不合法, 这条不算有效负控"
     restore; return
   fi
-  if run_matrix; then
-    bad "NC-SM-$n $name → 矩阵**仍然全绿**, 这条判据没有牙齿"
+  run_matrix || true
+  cp -f "$MATRIX_OUT" /tmp/nc-mut.out
+  local added; added="$(new_fails "$BASE_OUT" /tmp/nc-mut.out)"
+  if [[ "$(n_assert)" -lt 10 ]]; then
+    bad "NC-SM-$n $name → 矩阵只跑出 $(n_assert) 条断言(基线 $BASE_ASSERTS), 疑似没真跑起来"
+  elif [[ -z "$added" ]]; then
+    bad "NC-SM-$n $name → **新增失败为 0**(基线已有 $(fail_set "$BASE_OUT" | wc -l) 条), 这条判据没有牙齿"
   else
-    local r; r="$(n_red)"
-    if [[ "$(n_assert)" -lt 10 ]]; then
-      bad "NC-SM-$n $name → 矩阵只跑出 $(n_assert) 条断言(基线 $BASE_ASSERTS), 疑似没真跑起来"
-    else
-      ok "NC-SM-$n $name → 转红 ${r:-0} 条断言"
-    fi
+    ok "NC-SM-$n $name → 新增 $(wc -l <<< "$added") 条失败: $(head -1 <<< "$added" | cut -c1-72)"
   fi
   restore
-  [[ "$(sha256sum "$WC/$TARGET" | cut -d' ' -f1)" == "$WC_SHA" ]] || bad "NC-SM-$n 恢复后摘要不一致"
+  verify_restore "$n" || true
 }
 
 sect "12 类"
