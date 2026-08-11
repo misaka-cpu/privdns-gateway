@@ -47,8 +47,12 @@ for rel in TOUCHED + [TEST]:
     d = os.path.join(WC, os.path.dirname(rel))
     os.makedirs(d, exist_ok=True)
     shutil.copy2(os.path.join(REPO, rel), os.path.join(WC, rel))
-# 判据要按仓库根解析路径, 给它一个最小但完整的目录形态
+# 判据要按仓库根解析路径, 给它一个最小但完整的目录形态。
+# lib/rescue.sh 也必须在: 被测判据从那里读救援端口(全仓不变量: 端口字面量只许出现在
+# 那一个文件)。少拷它的话每一格都会因为"读不出端口"而红 —— 那种红与被测的东西无关。
 shutil.copy2(os.path.join(REPO, "install.sh"), os.path.join(WC, "install.sh"))
+os.makedirs(os.path.join(WC, "lib"), exist_ok=True)
+shutil.copy2(os.path.join(REPO, "lib", "rescue.sh"), os.path.join(WC, "lib", "rescue.sh"))
 PRISTINE = {rel: open(os.path.join(WC, rel), "rb").read() for rel in TOUCHED}
 MODE = {rel: os.stat(os.path.join(WC, rel)).st_mode & 0o777 for rel in TOUCHED}
 BASE_SHA = {rel: sha(os.path.join(REPO, rel)) for rel in TOUCHED}
