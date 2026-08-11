@@ -102,7 +102,14 @@ i_dw = chain.find("migrate_dotwitness")
 # ═══ 3. 新装路径 ═══════════════════════════════════════════════════════════
 head("3. fresh install(本轮不做, 预期红)")
 
-(ok if "pdg-dotwitness.service" in ins_src else bad)("install.sh 安装 witness unit")
+# 判据要分开钉: 这个字符串在 units= 闭包和安装行里各出现一次, 只查"文件里有没有"的话
+# 删掉任一处另一处仍在, 判据恒真(负控 LC-1/LC-2 就是这么抓到的)。
+(ok if re.search(r'^install -m644 "\$REPO_DIR"/deploy/bot/pdg-dotwitness\.service '
+                 r'/etc/systemd/system/$', ins_src, re.M) else bad)(
+    "install.sh 安装 witness unit(独立的 install -m644 行)")
+m_units = re.search(r'local units="([^"]*)"', ins_src, re.S)
+(ok if m_units and "pdg-dotwitness.service" in m_units.group(1) else bad)(
+    "witness unit 在 install 的回滚闭包 units= 里 —— 不在的话装失败时它不会被收回")
 (ok if re.search(r"enable[^\n]*pdg-dotwitness|pdg-dotwitness[^\n]*enable", ins_src) else bad)(
     "install.sh enable witness —— 装完即可用, 不要求用户再手工跑迁移")
 (ok if "dotwitness.env" in ins_src else bad)("install.sh 写 dotwitness.env(6.2A 已有)")
@@ -168,8 +175,18 @@ exp = m.group(0) if m else ""
 (ok if "pdg-dotwitness" not in exp else bad)(
     "witness **不在** expected_services —— 那是关键 DNS 服务集, 放进去等于让一个"
     "诊断辅助件的故障把普通 DNS 判成坏的")
-(ok if "dotwitness" in chk else bad)(
-    "doctor 有独立的 witness 检查项(完全不查的话, 部署缺口没人发现)")
+(ok if re.search(r"^def check_deep_dot_witness\(\):", chk, re.M) else bad)(
+    "doctor 有独立的 witness 检查函数")
+# 定义了还不够, 得真的登记进 DEEP —— 只查函数在不在的话, 把登记删掉照样绿(LC-6)
+m_deep = re.search(r"^DEEP = \[(.*?)\]", chk, re.M | re.S)
+(ok if m_deep and "check_deep_dot_witness" in m_deep.group(1) else bad)(
+    "witness 检查项已登记进 DEEP(定义了却不登记等于没查)")
+# 严重级别: 旁路件的异常只能是 warn。升成 fail 等于让它把整台机器判成 DNS 坏了。
+m_fn = re.search(r"^def check_deep_dot_witness\(\):(?:.*?)(?=^def )", chk, re.M | re.S)
+body = m_fn.group(0) if m_fn else ""
+(ok if body and '"fail"' not in body else bad)(
+    "witness 检查的异常分支一律 warn, 没有 fail —— 它是旁路观察端, "
+    "普通 DNS 不受它影响(P0 隔离门实测两种故障下各 9/9)")
 # 文案不许泄露
 mm = re.findall(r"[\"']([^\"']*dotwitness[^\"']*)[\"']", chk)
 leak = [s for s in mm if re.search(r"qname|label|sha256|probe\.", s)]
