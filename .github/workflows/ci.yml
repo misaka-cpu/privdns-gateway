@@ -180,6 +180,11 @@ jobs:
         run: python3 tests/test-dot-session.py
       - name: "6.2B evidence 留存期必须覆盖窗口+结算余量 (否则 NOT_OBSERVED 不可达)"
         run: python3 tests/test-dot-ttl.py
+      # 下面两支只读源码, 不碰 systemd/网络, 所以留在这个轻量 job 里。
+      - name: "6.2B witness 生命周期接线 (装机闭包/enable 门/卸载/doctor 分级与严重级)"
+        run: python3 tests/test-dot-lifecycle.py
+      - name: "6.2B 迁移矩阵子集选择器必须 fail-closed (误设不许静默只跑一部分)"
+        run: python3 tests/test-dot-matrix-selector.py
 
       - name: "链路会话证据接进 linkstat (NOT_OBSERVED/PASS/STALE 语义与退出码隔离)"
         run: python3 tests/test-link-live.py
