@@ -319,10 +319,80 @@ i_wre2(){ _dirty_unit; i_wre; }
 cell_dirty 9  "witness enable 失败" i_wen2 u_sys
 cell_dirty 10 "witness restart 失败" i_wre2 u_sys
 
-# ═══ 11. restart 成功但没在听 5399 ═════════════════════════════════════════
-i_noport(){ _dirty_unit; ss(){ if [[ "$*" == *-lun* ]]; then return 0; fi; command ss "$@"; }; }
-u_noport(){ unset -f ss; }
-cell_dirty 11 "restart 成功但 5399 未监听" i_noport u_noport
+# ═══ 11. 服务状态已改变之后, 5399 门失败 ═══════════════════════════════════
+# 原来这一格只 _dirty_unit 就注入, 迁移前后 witness 都是 enabled+active —— 回滚里
+# "把服务恢复成原来的 enabled/active"那段从来没被执行过, 摘掉它测试也不会红。
+# 现在 before-image 设成 **disabled + inactive + 无监听**, 三文件保持与目标一致, 于是
+# 迁移会真的走 enable --now 把服务改成 enabled+active, 然后才在 5399 门失败。
+#
+# 插桩必须写**文件**不能写 shell 变量: 生产那行是 `ss -lun | grep -q ...`, 管道两端都在
+# 子 shell 里跑, 变量赋值出不来。第一版就是这么栽的 —— POLLS 恒为 0, 看起来像"门没触发",
+# 其实门触发了, 丢的是我的计数。
+SS_TRACE=/tmp/ss-probe.log
+i_state(){
+  migrate_dotwitness >/dev/null 2>&1              # 三文件先到目标态
+  command systemctl disable --now pdg-dotwitness >/dev/null 2>&1
+  command systemctl reset-failed pdg-dotwitness >/dev/null 2>&1
+  sleep 1
+  : > "$SS_TRACE"
+  ss(){
+    if [[ "$*" == *-lun* ]]; then
+      # 用绝对路径工具采真实证据, 不受本测试任何包装影响; 写文件因为这里是子 shell
+      printf 'poll en=%s act=%s sub=%s pid=%s listen=%s\n' \
+        "$(/usr/bin/systemctl is-enabled pdg-dotwitness 2>/dev/null)" \
+        "$(/usr/bin/systemctl is-active pdg-dotwitness 2>/dev/null)" \
+        "$(/usr/bin/systemctl show pdg-dotwitness -p SubState --value 2>/dev/null)" \
+        "$(/usr/bin/systemctl show pdg-dotwitness -p MainPID --value 2>/dev/null)" \
+        "$(/usr/bin/ss -lun 2>/dev/null | grep -c '127\.0\.0\.1:5399')" >> "$SS_TRACE"
+      return 0                       # 输出空 → grep -q 失败 → 判"没在监听"
+    fi
+    command ss "$@"
+  }
+}
+u_state(){ unset -f ss; }
+
+sect "11. 服务状态已改变之后 5399 门失败"
+i_state
+B11="$(bimg)"
+W11_RESULT="$(command systemctl show pdg-dotwitness -p Result --value)"
+M11_ACT="$(_st is-active mosdns)"
+echo "  before-image: $B11"
+[[ "$B11" == *"witEn=disabled"* && "$B11" == *"witAct=inactive"* && "$B11" == *"p5399=0"* ]] \
+  && ok "11 before-image 确为 disabled + inactive + 无监听" || bad "11 before-image 不符: $B11"
+out11="$(migrate_dotwitness 2>&1)"; rc11=$?
+POLLS="$(wc -l < "$SS_TRACE")"
+SAW_LISTEN="$(grep -c 'listen=1' "$SS_TRACE" || true)"
+SAW_EN="$(grep -c 'en=enabled' "$SS_TRACE" || true)"
+SAW_ACT="$(grep -c 'act=active' "$SS_TRACE" || true)"
+SAW_PID="$(grep -o 'pid=[0-9]*' "$SS_TRACE" | grep -v 'pid=0' | head -1)"
+echo "  轮询留痕 $POLLS 行(生产上限 20 次循环 + 1 次最终判定 = 21); 首条: $(head -1 "$SS_TRACE")"
+[[ "$POLLS" -ge 1 ]] && ok "11 5399 门确实被触发(轮询 $POLLS 次)" || bad "11 门没触发, 插桩 0 行"
+[[ "$SAW_LISTEN" -ge 1 ]] && ok "11 失败前 5399 **曾真实监听**($SAW_LISTEN/$POLLS 次采样命中)" \
+  || bad "11 没能证明 5399 曾监听 —— 这一格没覆盖'状态已改变后回滚'"
+[[ "$SAW_EN" -ge 1 ]] && ok "11 失败前 witness 曾为 enabled" || bad "11 失败前不是 enabled"
+[[ "$SAW_ACT" -ge 1 ]] && ok "11 失败前 witness 曾为 active" || bad "11 失败前不是 active"
+[[ -n "$SAW_PID" ]] && ok "11 失败前存在真实 witness 进程($SAW_PID)" || bad "11 失败前无真实进程"
+[[ $rc11 != 0 ]] && ok "11 migrate 返回非零($rc11)" || bad "11 migrate 返回 0"
+grep -q "已就绪" <<< "$out11" && bad "11 打印了成功文案" || ok "11 没有成功文案"
+grep -q "没有在 127.0.0.1:5399 监听" <<< "$out11" && ok "11 失败原因是 5399 门, 不是更早的步骤" \
+  || bad "11 失败在别处: $(head -1 <<< "$out11")"
+u_state
+k=0; while [[ $k -lt 20 && "$(bimg)" != "$B11" ]]; do sleep 0.25; k=$((k+1)); done
+A11="$(bimg)"
+[[ "$A11" == "$B11" ]] \
+  && ok "11 **即时**回滚: 三文件 + enabled/active/failed + 5399 精确回到 before-image($((k*250))ms)" \
+  || bad "11 即时回滚不精确"$'\n'"      前: $B11"$'\n'"      后: $A11"
+[[ "$(command systemctl show pdg-dotwitness -p Result --value)" == "$W11_RESULT" ]] \
+  && ok "11 Result 与 before-image 一致($W11_RESULT)" || bad "11 Result 变了"
+[[ "$(command systemctl show pdg-dotwitness -p MainPID --value)" == 0 ]] \
+  && ok "11 witness 已无进程" || bad "11 仍有 witness 进程"
+# mosdns: 回滚会无条件 restart 它(即使这一格根本没碰过 mosdns 配置), 所以只能断言它仍
+# active, 不能断言 PID 不变。这条多余的重启已登记为 P2, 不在本轮修生产代码。
+[[ "$(_st is-active mosdns)" == "$M11_ACT" ]] && ok "11 mosdns 仍为 $M11_ACT" || bad "11 mosdns 状态变了"
+[[ -n "$(dns_udp)" ]] && ok "11 普通 DNS 正常" || bad "11 普通 DNS 挂了"
+[[ "$(tmpset)" == "$TMP0" ]] && ok "11 无新增临时/候选文件" || bad "11 有临时残留"
+migrate_dotwitness >/dev/null 2>&1
+[[ "$(snap)" == "$BASE" ]] && ok "11 撤障后正常迁移 → 重新进入健康态" || bad "11 复跑后未回健康态"
 
 # ═══ 12. 模块缺失 → 早退, 一个字节都不动 ═══════════════════════════════════
 i_nomod(){ mv /opt/pdg-bot/dotwitness.py /tmp/dw.py.bak; }
