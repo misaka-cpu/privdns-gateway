@@ -207,7 +207,39 @@ PY
 }
 u_cand(){ cp /tmp/dw.bak "$E2E_ROOT/deploy/bot/dotwroute.py"; }
 h_cand(){ grep -q no_such_plugin "$E2E_ROOT/deploy/bot/dotwroute.py"; }
+# 这一格不能只看最终状态。实测(三次一致): 把预校验那条 `return 1` 吞掉之后, 坏配置会
+# **确定性地**落进 /etc/mosdns/config.yaml、迁移返回 0、且不进回滚 —— 而最终 image 有时
+# 因为后置门和 PartOf 传播看起来"没坏透", 于是只比最终状态的判据会时红时绿。
+# 生产契约本身是顺序的: 候选校验失败后, 必须在**第一次持久写入**和**第一次状态改变调用**
+# 之前返回非零。所以这里直接断言那个顺序, 与 restart 是否报错无关。
+cell3_phase(){
+  sect "3P. 候选校验失败的阶段顺序(不看最终状态)"
+  local mos0; mos0="$(sha256sum "$DW_MOS" | cut -c1-16)"
+  i_cand
+  if ! h_cand; then bad "3P 注入未命中"; u_cand; return; fi
+  ok "3P 注入命中"
+  # 制造必须写盘的差异, 否则 cmp -s 相同就不进写盘分支, 这一格测不到东西
+  python3 -c "
+p='$DW_MOS'; t=open(p).read()
+open(p,'w').write(t.replace('qname suffix probe.','qname suffix probeZ.',1))"
+  local dirty; dirty="$(sha256sum "$DW_MOS" | cut -c1-16)"
+  sctl_reset
+  local out rc3; out="$(migrate_dotwitness 2>&1)"; rc3=$?
+  [[ $rc3 != 0 ]] && ok "3P 校验失败 → 返回非零($rc3)" || bad "3P 返回 0, 但候选是非法的"
+  [[ "$(sha256sum "$DW_MOS" | cut -c1-16)" == "$dirty" ]] \
+    && ok "3P 校验失败后**没有**发生持久写入(mosdns 配置未被换掉)" \
+    || bad "3P 校验失败后仍写了 mosdns 配置: $dirty → $(sha256sum "$DW_MOS"|cut -c1-16)"
+  local nchg; nchg="$(sctl_count '^(daemon-reload|restart|enable|start|stop|disable|reset-failed)')"
+  [[ "$nchg" == 0 ]] && ok "3P 校验失败后**没有**任何状态改变调用" \
+    || bad "3P 校验失败后发出了 $nchg 次状态改变调用: $(grep -E '^(daemon-reload|restart|enable|start|stop|disable|reset-failed)' "$SCTL_LOG"|tr '\n' ' ')"
+  grep -q "no_such_plugin" "$DW_MOS" && bad "3P 坏配置进了正式路径" || ok "3P 坏配置没进正式路径"
+  u_cand
+  cp -f /root/v19.pristine "$DW_MOS" 2>/dev/null || true
+  migrate_dotwitness >/dev/null 2>&1
+  [[ "$(snap)" == "$BASE" ]] && ok "3P 复跑正常迁移 → 回到健康基线" || bad "3P 复跑后未回基线"
+}
 cell 3 "候选未过真 mosdns 校验" i_cand u_cand h_cand
+cell3_phase
 
 # ═══ 4/5/6. 三个原子安装分别失败 ═══════════════════════════════════════════
 _mk_install_fail(){   # $1=只对这个目标失败
