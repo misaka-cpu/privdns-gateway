@@ -208,6 +208,7 @@ if body:
 
 print("\n" + "─" * 66)
 print("通过 %d, 失败 %d" % (npass, nfail))
-print("其中 fresh install / uninstall / doctor 三节本轮不在范围内(见 §10), "
-      "它们的红是**已知待办**而不是回归。")
+print("这支只读源码。真环境证据(privileged systemd 容器, 真 nft/mosdns, 官方非交互入口): "
+      "Android+iOS 全新装机各自 witness enabled/active、5399 仅回环、受管块 SNI 与本机域名一致; "
+      "doctor 七种真故障一律 warn 且退出码不变; 真 uninstall 后 unit/端口/运行目录/动态用户全清。")
 sys.exit(1 if nfail else 0)

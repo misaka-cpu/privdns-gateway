@@ -64,10 +64,22 @@ for mode in stop reject; do
 done
 
 head "恢复后真 probe 必须再次成功"
-systemctl start pdg-dotwitness; sleep 2
-rm -f /run/pdg-dotwitness/evidence.json 2>/dev/null
-python3 "$E2E_ROOT/tests/dotprobe.py" >/dev/null 2>&1; sleep 1
-[[ "$(ev_n)" == 1 ]] && ok "witness 恢复后真 probe → evidence 生成" || bad "恢复后 probe 没出 evidence"
+# probe 的域名必须取自**这台机器实际部署的**那个, 不能用 dotprobe.py 的缺省值:
+# 进探测命名空间要同时满足 qname 后缀与 SNI 两个判据, 域名对不上就一个都不满足,
+# 于是"没出 evidence" —— 看起来像产品坏了, 实际是探针打偏了。这一格在真装机上第一次
+# 跑就是这么红的(机器是 dot.and.test, 缺省值是 dot.example.test)。
+# 单一可信源: dotwitness.env 的后缀按契约恒为 `probe.<DoT域名>`, 与 mosdns 受管块同源。
+DW_SUFFIX="$(sed -n 's/^PDG_DOTWITNESS_SUFFIX=//p' /etc/privdns-gateway/dotwitness.env 2>/dev/null | tail -1)"
+DOT_DOM="${DW_SUFFIX#probe.}"
+if [[ -z "$DOT_DOM" || "$DOT_DOM" == "$DW_SUFFIX" ]]; then
+  bad "取不到本机 DoT 域名(dotwitness.env 后缀 = ${DW_SUFFIX:-<空>}) —— 不拿缺省值蒙混"
+else
+  systemctl start pdg-dotwitness; sleep 2
+  rm -f /run/pdg-dotwitness/evidence.json 2>/dev/null
+  python3 "$E2E_ROOT/tests/dotprobe.py" "$DOT_DOM" >/dev/null 2>&1; sleep 1
+  [[ "$(ev_n)" == 1 ]] && ok "witness 恢复后真 probe($DOT_DOM) → evidence 生成" \
+    || bad "恢复后 probe($DOT_DOM) 没出 evidence"
+fi
 read -r n2 _ <<< "$(run9)"
 [[ "$n2" == 9 ]] && ok "恢复后普通查询仍 9/9" || bad "恢复后只有 $n2/9"
 

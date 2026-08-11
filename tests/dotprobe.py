@@ -9,6 +9,9 @@ import socket, ssl, struct, sys
 LABEL = "a1b2c3d4e5f6a7b8c9d0e1f2"
 
 def main():
+    # 缺省值只对"域名恰好就叫它"的夹具环境成立。真装机上域名是用户填的, 不传参数就会
+    # 两个判据(qname 后缀 / SNI)同时落空, 表现为"没出 evidence" —— 那是探针打偏, 不是
+    # 产品坏。调用方在真环境里必须显式传本机域名(见 tests/e2e-dot-p0.sh 的取法)。
     dom = sys.argv[1] if len(sys.argv) > 1 else "dot.example.test"
     qn = "%s.probe.%s" % (LABEL, dom)
     body = b"".join(bytes([len(p)]) + p.encode() for p in qn.split(".")) + b"\x00"
