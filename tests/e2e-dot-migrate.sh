@@ -24,7 +24,7 @@ p=0; f=0; s=0
 ok(){ p=$((p+1)); echo "[OK]   $*"; }
 bad(){ f=$((f+1)); echo "[FAIL] $*"; }
 skip(){ s=$((s+1)); echo "[SKIP] $*"; }
-head(){ echo; echo "── $* ──"; }
+sect(){ echo; echo "── $* ──"; }   # 不叫 head: 被测代码里有 `| head -1`
 
 if [[ "${PDG_E2E_ISOLATED:-}" != 1 || "$(id -u)" != 0 ]]; then
   echo "需要 PDG_E2E_ISOLATED=1 且 root(它会真装 unit、真改 /etc/mosdns)"; exit 1
@@ -46,6 +46,9 @@ eval "$_fn"
 [[ "$(type -t migrate_dotwitness)" == function ]] || { echo "载入 migrate_dotwitness 失败"; exit 1; }
 
 # ── before-image 采集与比对 ────────────────────────────────────────────────
+# is-enabled/is-active/is-failed 都是"打印结果 + 非零退出"的形态, 直接用命令替换会把
+# 退出码路径上的东西也带进来。统一取第一行、去掉换行。
+_st(){ command systemctl "$1" "$2" 2>/dev/null | command head -1 | tr -d '\n'; }
 snap(){   # 输出一行可比较的完整身份
   local out=""
   local pth
@@ -56,13 +59,44 @@ snap(){   # 输出一行可比较的完整身份
       out+="$(basename "$pth"):ABSENT "
     fi
   done
-  out+="witEnabled=$(systemctl is-enabled pdg-dotwitness 2>/dev/null || echo -) "
-  out+="witActive=$(systemctl is-active pdg-dotwitness 2>/dev/null || echo -) "
-  out+="mosActive=$(systemctl is-active mosdns 2>/dev/null || echo -)"
+  out+="witEnabled=$(_st is-enabled pdg-dotwitness) "
+  out+="witActive=$(_st is-active pdg-dotwitness) "
+  out+="mosActive=$(_st is-active mosdns)"
   echo "$out"
 }
-mos_pid(){ systemctl show mosdns -p MainPID --value 2>/dev/null; }
-wit_inv(){ systemctl show pdg-dotwitness -p InvocationID --value 2>/dev/null; }
+# systemctl 留痕: 状态机**主动发出**的调用会经过这个包装, 而 PartOf=mosdns.service
+# 的依赖传播是 systemd 内部行为, 不会经过这里。所以"谁重启了 witness"这个问题, 靠
+# 留痕 + InvocationID 两份证据回答, 不靠 PID 变化去猜。
+SCTL_LOG=/tmp/sctl.log
+SCTL_FAIL_PAT=""
+systemctl(){
+  printf '%s\n' "$*" >> "$SCTL_LOG"
+  if [[ -n "$SCTL_FAIL_PAT" && "$*" == *"$SCTL_FAIL_PAT"* ]]; then return 5; fi
+  command systemctl "$@"
+}
+sctl_reset(){ : > "$SCTL_LOG"; }
+sctl_count(){ local n; n="$(grep -cE "$1" "$SCTL_LOG" 2>/dev/null)" || n=0; echo "${n:-0}"; }
+
+mos_pid(){ command systemctl show mosdns -p MainPID --value 2>/dev/null; }
+wit_inv(){ command systemctl show pdg-dotwitness -p InvocationID --value 2>/dev/null; }
+wit_pid(){ command systemctl show pdg-dotwitness -p MainPID --value 2>/dev/null; }
+mos_inv(){ command systemctl show mosdns -p InvocationID --value 2>/dev/null; }
+mtimes(){ stat -c %Y "$DW_UNIT" "$DW_ENV" "$DW_MOS" 2>/dev/null | tr '\n' ':'; }
+port5399(){ command ss -lun 2>/dev/null | grep -c '127\.0\.0\.1:5399'; }
+# 一格自己的 before-image: 文件三件套 + 两个服务的完整身份 + 5399 占用
+bimg(){
+  local o=""; local pth
+  for pth in "$DW_UNIT" "$DW_ENV" "$DW_MOS"; do
+    if [[ -e "$pth" ]]; then o+="$(basename "$pth"):$(sha256sum "$pth"|cut -c1-16):$(stat -c '%a:%u:%g' "$pth") "
+    else o+="$(basename "$pth"):ABSENT "; fi
+  done
+  o+="witEn=$(_st is-enabled pdg-dotwitness) "
+  o+="witAct=$(_st is-active pdg-dotwitness) "
+  o+="witFail=$(_st is-failed pdg-dotwitness) "
+  o+="mosAct=$(_st is-active mosdns) "
+  o+="p5399=$(port5399)"
+  echo "$o"
+}
 dns_udp(){ dig +short +time=2 +tries=1 @127.0.0.1 example.com A 2>/dev/null | head -1; }
 dns_tcp(){ dig +short +tcp +time=2 +tries=1 @127.0.0.1 example.com A 2>/dev/null | head -1; }
 dns_dot(){ python3 "$E2E_ROOT/tests/dotquery.py" example.com 2>/dev/null; }
@@ -71,7 +105,7 @@ tmpset(){ ls -d /tmp/tmp.* 2>/dev/null | sort | tr '\n' ' '; }
 TMP0="$(tmpset)"
 
 # ── 健康基线 ───────────────────────────────────────────────────────────────
-head "0. 健康基线"
+sect "0. 健康基线"
 migrate_dotwitness >/tmp/base.log 2>&1
 rc=$?
 [[ $rc == 0 ]] && ok "首次迁移 rc=0" || bad "首次迁移 rc=$rc: $(tail -1 /tmp/base.log)"
@@ -79,11 +113,43 @@ BASE="$(snap)"
 echo "  before-image: $BASE"
 [[ -n "$(dns_udp)" ]] && ok "基线普通 DNS 可用" || bad "基线普通 DNS 不可用"
 
+# ═══ 幂等三件套: 无变化时零写盘、零重启、零 systemctl 变更调用 ═════════════
+sect "I. 幂等(第二次迁移必须什么都不做)"
+sctl_reset
+M0="$(mtimes)"; WP0="$(wit_pid)"; WI0="$(wit_inv)"; MP0="$(mos_pid)"; MI0="$(mos_inv)"
+S0="$(snap)"; EV0="$(ev_count)"
+out_i="$(migrate_dotwitness 2>&1)"; rc_i=$?
+[[ $rc_i == 0 ]] && ok "I rc=0" || bad "I rc=$rc_i"
+[[ "$(snap)" == "$S0" ]] && ok "I 三文件摘要与服务状态未变" || bad "I 状态变了: $(snap)"
+[[ "$(mtimes)" == "$M0" ]] && ok "I 三文件 mtime 未变($M0)" || bad "I mtime 变了: $M0 → $(mtimes)"
+[[ "$(wit_pid)" == "$WP0" && "$(wit_inv)" == "$WI0" ]] \
+  && ok "I witness PID/InvocationID 均未变" || bad "I witness 重启过"
+[[ "$(mos_pid)" == "$MP0" && "$(mos_inv)" == "$MI0" ]] \
+  && ok "I mosdns PID/InvocationID 均未变" || bad "I mosdns 重启过"
+# 调用留痕: 这是区分"状态机主动 restart"与"PartOf 依赖传播"的唯一硬证据
+n_reload="$(sctl_count 'daemon-reload')"
+n_change="$(sctl_count '^(enable|restart|start|try-restart|stop|disable)')"
+[[ "$n_reload" == 0 ]] && ok "I daemon-reload 调用 0 次" || bad "I daemon-reload 调用了 $n_reload 次"
+[[ "$n_change" == 0 ]] && ok "I enable/restart/start/try-restart 调用 0 次" \
+  || bad "I 发出了 $n_change 次变更调用: $(grep -E '^(enable|restart|start|try-restart|stop|disable)' "$SCTL_LOG" | tr '\n' ' ')"
+grep -qE "已就绪|已安装|已更新|已重新排程" <<< "$out_i" && bad "I 输出了变化文案" || ok "I 无变化文案"
+[[ "$(ev_count)" == "$EV0" ]] && ok "I evidence 未被迁移自检改写" || bad "I evidence 变了"
+
+# 对照: 单独手工 restart mosdns(不经状态机)也会改 witness 身份 —— 那是 PartOf 传播。
+# 有了留痕就不必拿 PID 变化去猜是谁干的。
+sctl_reset
+command systemctl restart mosdns; sleep 2
+[[ "$(wit_inv)" != "$WI0" ]] && ok "I 对照: 手工 restart mosdns → witness 身份也变(PartOf 传播)" \
+  || ok "I 对照: 手工 restart mosdns 未波及 witness"
+[[ "$(sctl_count '.')" == 0 ]] && ok "I 对照: 传播不经过状态机的 systemctl 包装(留痕 0 条)" \
+  || bad "I 对照: 留痕里出现了 $(sctl_count '.') 条"
+migrate_dotwitness >/dev/null 2>&1   # 回到健康基线
+
 # ── 一格的通用外壳 ─────────────────────────────────────────────────────────
 # $1=编号 $2=名字 $3=注入函数名 $4=撤销函数名 $5=命中验证函数名
 cell(){
   local n="$1" name="$2" inject="$3" undo="$4" hit="$5"
-  head "$n. $name"
+  sect "$n. $name"
   local before; before="$(snap)"
   if [[ "$before" != "$BASE" ]]; then
     bad "$n 进场时状态就不是健康基线, 这一格无从判断"; return
@@ -155,16 +221,41 @@ _dirty_mos(){  sed -i 's|qname suffix probe\.|qname suffix probeX.|' "$DW_MOS"; 
 i_reload2(){ _dirty_unit; i_reload; }
 i_mosr2(){   _dirty_mos;  i_mosr; }
 # 这两格改脏了盘, before-image 比对会不同 —— 用专门的外壳: 只验 rc/文案/DNS/自愈
+# 4-11 格必须先构造**自己那一格的**脏 before-image(不弄脏就到不了目标分支), 然后在
+# 移除注入、复跑正常迁移**之前**就把回滚验干净。正常迁移的自愈能力会掩盖回滚缺陷 ——
+# "最后回到健康"和"失败当下已经精确回滚"是两件事, 后者才是这套东西的价值所在。
 cell_dirty(){
   local n="$1" name="$2" inject="$3" undo="$4"
-  head "$n. $name"
-  "$inject"
+  sect "$n. $name"
+  "$inject"                       # 弄脏 + 注入
+  local B; B="$(bimg)"            # 这一格自己的 before-image(脏状态)
+  sctl_reset
   local out rc2; out="$(migrate_dotwitness 2>&1)"; rc2=$?
   [[ $rc2 != 0 ]] && ok "$n migrate 返回非零($rc2)" || bad "$n migrate 返回 0"
   grep -q "已就绪" <<< "$out" && bad "$n 打印了成功文案" || ok "$n 没有成功文案"
   grep -qE "回滚|失败" <<< "$out" && ok "$n 明确报告了失败/回滚" || bad "$n 没说清发生了什么"
+  # ── 即时回滚核对: 就在这里, 复跑之前 ──
+  local A; A="$(bimg)"
+  # 5399 单独看: bind 是异步的, 用有界等待而不是瞬时采样(生产代码自己也是轮询的)
+  local wantp; wantp="${B##*p5399=}"
+  local i=0
+  while [[ $i -lt 20 && "$(port5399)" != "$wantp" ]]; do sleep 0.25; i=$((i+1)); done
+  if [[ "$(port5399)" == "$wantp" ]]; then
+    [[ "${A##*p5399=}" == "$wantp" ]] && ok "$n 回滚后 5399 立即与 before-image 一致" \
+      || ok "$n 回滚后 5399 在 $((i*250))ms 内自行收敛到 before-image(未跑任何迁移; bind 异步)"
+  else
+    bad "$n 回滚后 5399 状态在 5 秒内未回到 before-image($wantp) —— 只能靠复跑迁移才恢复"
+  fi
+  A="$(bimg)"
+  if [[ "$A" == "$B" ]]; then
+    ok "$n **即时**回滚: 三文件(内容/存在性/mode/uid/gid)+enabled/active/failed+5399 精确回到本格 before-image"
+  else
+    bad "$n **即时**回滚不精确"$'\n'"      前: $B"$'\n'"      后: $A"
+  fi
+  [[ -n "$(dns_udp)" ]] && ok "$n 回滚后普通 DNS 可用" || bad "$n 普通 DNS 挂了"
+  [[ "$(tmpset)" == "$TMP0" ]] && ok "$n 无新增临时候选" || bad "$n 新增临时目录"
+  # 到这里才允许移除注入并复跑
   "$undo"
-  [[ -n "$(dns_udp)" ]] && ok "$n 普通 DNS 仍可用" || bad "$n 普通 DNS 挂了"
   migrate_dotwitness >/dev/null 2>&1
   [[ "$(snap)" == "$BASE" ]] && ok "$n 复跑正常迁移 → 回到健康基线" || bad "$n 复跑后未回基线: $(snap)"
 }
@@ -179,12 +270,9 @@ cell_dirty 5 "unit 原子安装失败" i_unit u_inst
 cell_dirty 6 "mosdns config 原子安装失败" i_mos u_inst
 
 # ═══ 7-10. systemctl 各动作失败 ════════════════════════════════════════════
-_mk_sysctl_fail(){    # $1=匹配这个动作串就失败
-  local pat="$1"
-  eval "systemctl(){ if [[ \"\$*\" == *\"$pat\"* ]]; then return 5; fi; command systemctl \"\$@\"; }"
-}
-h_sys(){ [[ "$(type -t systemctl)" == function ]]; }
-u_sys(){ unset -f systemctl; }
+_mk_sysctl_fail(){ SCTL_FAIL_PAT="$1"; }
+h_sys(){ [[ -n "$SCTL_FAIL_PAT" ]]; }
+u_sys(){ SCTL_FAIL_PAT=""; }
 i_reload(){ _mk_sysctl_fail "daemon-reload"; }
 i_mosr(){   _mk_sysctl_fail "restart mosdns"; }
 i_wen(){    _mk_sysctl_fail "enable --now pdg-dotwitness"; }
@@ -194,7 +282,7 @@ cell_dirty 7 "daemon-reload 失败" i_reload2 u_sys
 cell_dirty 8 "mosdns restart 失败" i_mosr2 u_sys
 
 # 9/10: 把服务弄成 disabled/inactive 触发 enable/restart 分支
-i_wen2(){ command systemctl disable --now pdg-dotwitness >/dev/null 2>&1; i_wen; }
+i_wen2(){ command systemctl disable --now pdg-dotwitness >/dev/null 2>&1; sleep 1; i_wen; }
 i_wre2(){ _dirty_unit; i_wre; }
 cell_dirty 9  "witness enable 失败" i_wen2 u_sys
 cell_dirty 10 "witness restart 失败" i_wre2 u_sys
@@ -211,13 +299,17 @@ h_nomod(){ [[ ! -f /opt/pdg-bot/dotwitness.py ]]; }
 cell 12 "witness 模块缺失 → 不启用空壳" i_nomod u_nomod h_nomod
 
 # ═══ 13. 回滚阶段自己失败 → 必须明说"回滚不完整" ═══════════════════════════
-head "13. 回滚阶段失败 → 明确报告不完整"
+sect "13. 回滚阶段失败 → 明确报告不完整"
 _dirty_mos
 # 让 mosdns restart 失败进入回滚, 同时让回滚里的 cp 也失败
-systemctl(){ if [[ "$*" == *"restart mosdns"* ]]; then return 5; fi; command systemctl "$@"; }
+# 用统一的 SCTL_FAIL_PAT, 不要另起一个 systemctl —— 那会盖掉留痕包装, 后面 unset -f
+# 还会把包装整个删掉, 之后所有格子的调用留痕就都空了(而它们照样"通过")。
+SCTL_FAIL_PAT="restart mosdns"
+# cp 只打**恢复方向**: _dw_snap_file 采集 before-image 时也用 cp 写 .body, 一并打掉的话
+# 迁移在采集阶段就早退, 验的是早退而不是回滚不完整。
 cp(){ if [[ "${2:-}" == *.body ]]; then return 9; fi; command cp "$@"; }
 out13="$(migrate_dotwitness 2>&1)"; rc13=$?
-unset -f systemctl cp
+SCTL_FAIL_PAT=""; unset -f cp
 [[ $rc13 != 0 ]] && ok "13 主迁移 rc 非零($rc13)" || bad "13 主迁移返回 0"
 grep -q "回滚不完整" <<< "$out13" && ok "13 明确打印「回滚不完整」" || bad "13 没有明说回滚不完整"
 grep -q "请人工核对" <<< "$out13" && ok "13 指出了要人工核对的具体对象" || bad "13 没指出核对对象"
@@ -227,7 +319,7 @@ migrate_dotwitness >/dev/null 2>&1
 [[ "$(snap)" == "$BASE" ]] && ok "13 之后复跑正常迁移仍能回到健康基线" || bad "13 之后无法自愈: $(snap)"
 
 # ═══ 独立验收门: 真 probe(不在生产迁移里, 只在这里) ════════════════════════
-head "A. 独立 E2E 验收: 迁移完成后真 probe 必须产生 evidence"
+sect "A. 独立 E2E 验收: 迁移完成后真 probe 必须产生 evidence"
 rm -f /run/pdg-dotwitness/evidence.json 2>/dev/null
 before_ev="$(ev_count)"
 python3 "$E2E_ROOT/tests/dotprobe.py" >/tmp/probe.log 2>&1
