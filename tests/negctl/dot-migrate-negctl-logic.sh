@@ -65,4 +65,53 @@ printf '[FAIL] 格 4 残留 /tmp/tmp.AAAAAA\n' > "$B"; printf '[FAIL] 格 5 残�
 [[ "$(new_fails "$B" "$M" | wc -l)" == 1 ]] && ok "B 窄归一化没把不同断言合并(格 4 vs 格 5 仍算新增)" \
   || bad "B 归一化过宽, 不同断言被合并了"
 rm -f "$B" "$M"
+
+echo "── C. mutate() 的四种拒绝(最小 fixture, 不跑矩阵) ──"
+# runner 的 mutate() 判据原来只能靠跑十次完整矩阵来证明。这里用一个几行的假目标文件
+# 直接喂它四种输入 —— 同样的判据, 秒级, 于是每次都真的会跑。
+FX="$(mktemp -d -t pdg-fx-XXXXXX)"
+cat > "$FX/target.sh" <<'EOT'
+#!/usr/bin/env bash
+f(){ local x=1; echo "$x"; }
+g(){ local x=2; echo "$x"; }
+EOT
+cp "$FX/target.sh" "$FX/pristine.sh"
+mut(){ python3 - "$FX/target.sh" "$1" "$2" <<'PY'
+import sys
+path, old, new = sys.argv[1], sys.argv[2], sys.argv[3]
+t = open(path).read(); n = t.count(old)
+if n != 1: print("锚点出现 %d 次, 预期 1" % n, file=sys.stderr); sys.exit(2)
+out = t.replace(old, new, 1)
+want_old = 1 if old in new else 0
+if out.count(old) != want_old: print("替换后不合预期", file=sys.stderr); sys.exit(3)
+if new not in out: print("替换后找不到新内容", file=sys.stderr); sys.exit(3)
+if out == t: print("替换没有改变文件", file=sys.stderr); sys.exit(3)
+open(path, "w").write(out)
+PY
+}
+mut "THIS_DOES_NOT_EXIST" "x" 2>/dev/null; [[ $? == 2 ]] && ok "C1 锚点不存在 → rc=2" || bad "C1 未拒绝"
+mut "local x=" "local x=" 2>/dev/null;    [[ $? == 2 ]] && ok "C2 锚点多重(命中 2 次) → rc=2" || bad "C2 未拒绝"
+mut 'f(){ local x=1; echo "$x"; }' 'f(){ local x=1; echo "$x"; }' 2>/dev/null
+[[ $? == 3 ]] && ok "C3 mutation 未改变文件 → rc=3" || bad "C3 未拒绝"
+cmp -s "$FX/target.sh" "$FX/pristine.sh" && ok "C1-C3 被拒后目标文件一个字节没动" || bad "C1-C3 却改了文件"
+# 语法损坏: mutate 本身会成功, 但语法门必须拦住
+mut 'g(){ local x=2; echo "$x"; }' 'g(){ local x=2; echo "$x"; ' >/dev/null 2>&1
+if bash -n "$FX/target.sh" 2>/dev/null; then bad "C4 语法已损坏却通过 bash -n"
+else ok "C4 改坏后语法不合法 → 语法门拦住(不算有效负控)"; fi
+cp -f "$FX/pristine.sh" "$FX/target.sh"
+
+echo "── D. trap 清理与无害改动 ──"
+# trap: 起一个子 shell, 中途 exit, 工作副本目录必须已被清掉
+TD="$(mktemp -d -t pdg-trapchk-XXXXXX)"
+bash -c 'WCROOT="'"$TD"'/wc"; mkdir -p "$WCROOT"; cleanup(){ rm -rf "$WCROOT"; }
+         trap cleanup EXIT INT TERM; echo x > "$WCROOT/f"; exit 7' >/dev/null 2>&1
+[[ ! -d "$TD/wc" ]] && ok "D1 中途 exit → trap 清掉了工作副本" || bad "D1 工作副本残留"
+rmdir "$TD" 2>/dev/null
+# 无害改动: 追加一行注释, 失败集合不变 → 差集为空 → 判无效
+B2=$(mktemp); M2=$(mktemp)
+printf '[FAIL] 甲\n[FAIL] 乙\n' > "$B2"; cp "$B2" "$M2"
+[[ -z "$(new_fails "$B2" "$M2")" ]] && ok "D2 无害改动(失败集合不变) → 新增 0, 判该负控无效" \
+  || bad "D2 无害改动却算出新增"
+rm -f "$B2" "$M2"; rm -rf "$FX"
+
 echo; echo "通过 $P, 失败 $F"; exit $((F?1:0))
