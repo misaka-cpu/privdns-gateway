@@ -26,6 +26,46 @@ bad(){ f=$((f+1)); echo "[FAIL] $*"; }
 skip(){ s=$((s+1)); echo "[SKIP] $*"; }
 sect(){ echo; echo "── $* ──"; }   # 不叫 head: 被测代码里有 `| head -1`
 
+# ── 测试专用的子集执行(fail-closed) ────────────────────────────────────────
+# 为什么需要: 负控要给 12 类各跑一遍矩阵, 而完整矩阵约 10 分钟(F11 光是等 5399 门走满
+# 21 次轮询就要 5 秒), 25 次运行超过 4 小时。让每类只跑与它相关的节, 总时长降一个量级。
+#
+# **不削弱任何判据**: 被选节的断言一条不减, 只是不跑无关的节。全局准备(健康基线)、
+# 每节自己的 before-image、每节收尾的复跑自愈、以及最终污染检查一律照跑。
+#
+# fail-closed 的理由: 这个开关只该出现在负控里。要是它在 CI 或普通运行里被误设,
+# 矩阵会静默地只跑一小部分却照样打印"通过" —— 那正是这套东西最怕的假绿。所以未经
+# 授权就设它 = 立即非零退出, 而不是忽略。
+SECTIONS_ALL=(PREFLIGHT IDEMPOTENCY PROBE F01 F02 F03 F04 F05 F06 F07 F08 F09 F10 F11 F12 F13)
+SEL=""
+if [[ -n "${PDG_MIGRATE_SECTIONS+x}" ]]; then
+  if [[ "${PDG_NEGCTL:-}" != 1 ]]; then
+    echo "PDG_MIGRATE_SECTIONS 只允许负控使用(需同时 PDG_NEGCTL=1)。普通运行/CI 里设它" >&2
+    echo "会让矩阵静默地只跑一部分却照样报通过 —— 拒绝执行。" >&2
+    exit 2
+  fi
+  raw="$PDG_MIGRATE_SECTIONS"
+  [[ -n "$raw" ]] || { echo "PDG_MIGRATE_SECTIONS 为空" >&2; exit 2; }
+  [[ "$raw" =~ ^[A-Z0-9]+(,[A-Z0-9]+)*$ ]] || { echo "PDG_MIGRATE_SECTIONS 格式非法: [$raw]" >&2; exit 2; }
+  declare -A seen=()
+  for x in ${raw//,/ }; do
+    [[ " ${SECTIONS_ALL[*]} " == *" $x "* ]] || { echo "未知节标识: $x" >&2; exit 2; }
+    [[ -z "${seen[$x]:-}" ]] || { echo "重复节标识: $x" >&2; exit 2; }
+    seen[$x]=1
+  done
+  # 规范化成 SECTIONS_ALL 的顺序 —— 乱序输入照样按固定顺序执行, 结果与顺序无关
+  for x in "${SECTIONS_ALL[@]}"; do [[ -n "${seen[$x]:-}" ]] && SEL="$SEL $x"; done
+  SEL="${SEL# }"
+  echo "SECTIONS: $SEL"
+else
+  echo "SECTIONS: FULL"
+fi
+want(){ [[ -z "$SEL" ]] && return 0; [[ " $SEL " == *" $1 "* ]]; }
+# 每个被选节至少要产生一条断言, 否则说明它没真跑起来
+SEL_SEEN=""
+mark(){ SEL_SEEN="$SEL_SEEN $1"; }
+
+
 if [[ "${PDG_E2E_ISOLATED:-}" != 1 || "$(id -u)" != 0 ]]; then
   echo "需要 PDG_E2E_ISOLATED=1 且 root(它会真装 unit、真改 /etc/mosdns)"; exit 1
 fi
@@ -44,6 +84,7 @@ PY
 )"
 eval "$_fn"
 [[ "$(type -t migrate_dotwitness)" == function ]] || { echo "载入 migrate_dotwitness 失败"; exit 1; }
+
 
 # ── before-image 采集与比对 ────────────────────────────────────────────────
 # is-enabled/is-active/is-failed 都是"打印结果 + 非零退出"的形态, 直接用命令替换会把
@@ -114,6 +155,8 @@ echo "  before-image: $BASE"
 [[ -n "$(dns_udp)" ]] && ok "基线普通 DNS 可用" || bad "基线普通 DNS 不可用"
 
 # ═══ 幂等三件套: 无变化时零写盘、零重启、零 systemctl 变更调用 ═════════════
+if want IDEMPOTENCY; then
+mark IDEMPOTENCY
 sect "I. 幂等(第二次迁移必须什么都不做)"
 sctl_reset
 M0="$(mtimes)"; WP0="$(wit_pid)"; WI0="$(wit_inv)"; MP0="$(mos_pid)"; MI0="$(mos_inv)"
@@ -144,11 +187,15 @@ command systemctl restart mosdns; sleep 2
 [[ "$(sctl_count '.')" == 0 ]] && ok "I 对照: 传播不经过状态机的 systemctl 包装(留痕 0 条)" \
   || bad "I 对照: 留痕里出现了 $(sctl_count '.') 条"
 migrate_dotwitness >/dev/null 2>&1   # 回到健康基线
+fi
 
 # ── 一格的通用外壳 ─────────────────────────────────────────────────────────
 # $1=编号 $2=名字 $3=注入函数名 $4=撤销函数名 $5=命中验证函数名
 cell(){
   local n="$1" name="$2" inject="$3" undo="$4" hit="$5"
+  local sid; sid="$(printf 'F%02d' "$n")"
+  want "$sid" || return 0
+  mark "$sid"
   sect "$n. $name"
   local before; before="$(snap)"
   if [[ "$before" != "$BASE" ]]; then
@@ -213,6 +260,8 @@ h_cand(){ grep -q no_such_plugin "$E2E_ROOT/deploy/bot/dotwroute.py"; }
 # 生产契约本身是顺序的: 候选校验失败后, 必须在**第一次持久写入**和**第一次状态改变调用**
 # 之前返回非零。所以这里直接断言那个顺序, 与 restart 是否报错无关。
 cell3_phase(){
+  want PREFLIGHT || return 0
+  mark PREFLIGHT
   sect "3P. 候选校验失败的阶段顺序(不看最终状态)"
   local mos0; mos0="$(sha256sum "$DW_MOS" | cut -c1-16)"
   i_cand
@@ -258,6 +307,9 @@ i_mosr2(){   _dirty_mos;  i_mosr; }
 # "最后回到健康"和"失败当下已经精确回滚"是两件事, 后者才是这套东西的价值所在。
 cell_dirty(){
   local n="$1" name="$2" inject="$3" undo="$4"
+  local sid; sid="$(printf 'F%02d' "$n")"
+  want "$sid" || return 0
+  mark "$sid"
   sect "$n. $name"
   "$inject"                       # 弄脏 + 注入
   local B; B="$(bimg)"            # 这一格自己的 before-image(脏状态)
@@ -351,6 +403,8 @@ i_state(){
 }
 u_state(){ unset -f ss; }
 
+if want F11; then
+mark F11
 sect "11. 服务状态已改变之后 5399 门失败"
 i_state
 B11="$(bimg)"
@@ -401,6 +455,10 @@ h_nomod(){ [[ ! -f /opt/pdg-bot/dotwitness.py ]]; }
 cell 12 "witness 模块缺失 → 不启用空壳" i_nomod u_nomod h_nomod
 
 # ═══ 13. 回滚阶段自己失败 → 必须明说"回滚不完整" ═══════════════════════════
+fi
+
+if want F13; then
+mark F13
 sect "13. 回滚阶段失败 → 明确报告不完整"
 _dirty_mos
 # 让 mosdns restart 失败进入回滚, 同时让回滚里的 cp 也失败
@@ -421,6 +479,10 @@ migrate_dotwitness >/dev/null 2>&1
 [[ "$(snap)" == "$BASE" ]] && ok "13 之后复跑正常迁移仍能回到健康基线" || bad "13 之后无法自愈: $(snap)"
 
 # ═══ 独立验收门: 真 probe(不在生产迁移里, 只在这里) ════════════════════════
+fi
+
+if want PROBE; then
+mark PROBE
 sect "A. 独立 E2E 验收: 迁移完成后真 probe 必须产生 evidence"
 rm -f /run/pdg-dotwitness/evidence.json 2>/dev/null
 before_ev="$(ev_count)"
@@ -430,6 +492,15 @@ after_ev="$(ev_count)"
   || bad "probe 后 evidence: $before_ev → $after_ev ($(head -1 /tmp/probe.log))"
 [[ -n "$(dns_udp)" ]] && ok "普通 UDP53 不产生 evidence 且仍可用" || bad "普通 DNS 挂了"
 
+fi
+
+# 被选节必须都真的跑过, 且都产生了断言 —— 选了却没跑等于静默漏测
+if [[ -n "$SEL" ]]; then
+  for x in $SEL; do
+    [[ " $SEL_SEEN " == *" $x "* ]] || bad "选了节 $x 却没有执行到"
+  done
+  [[ $((p+f)) -gt 0 ]] || bad "被选节一条断言都没产生"
+fi
 echo
 echo "──────────────────────────────────────────────────────────────"
 echo "通过 $p, 失败 $f, 跳过 $s"
