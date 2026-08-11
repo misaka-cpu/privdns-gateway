@@ -343,7 +343,7 @@ rollback(){
   fi
   c_y "安装失败 → 回滚本次全新安装的改动…"
   # 各步骤相互独立: 单项失败只记账, 不挡住后面的恢复; 但也绝不因此谎报"已回滚"。
-  local units="pdg-bot.service pdg-probe81.service mosdns.service sing-box.service mihomo.service
+  local units="pdg-bot.service pdg-probe81.service pdg-dotwitness.service mosdns.service sing-box.service mihomo.service
                pdg-mitm.service pdg-rules-update.service pdg-health.service
                pdg-rules-update.timer pdg-health.timer"
   for u in $units; do
@@ -886,6 +886,9 @@ install -m644 "$REPO_DIR"/deploy/bot/pdg-health.timer         /etc/systemd/syste
 # 都用它做链路诊断的 HTTP 会话入口。nft 模板里 81 本来就只对 __INTERNAL_CIDR__ 放行,
 # 两平台一致, 所以这里无条件装。
 install -m644 "$REPO_DIR"/deploy/bot/pdg-probe81.service /etc/systemd/system/
+# DoT 证据端。两平台公共, 与 probe81 同一范式无条件装。它的 env 在渲染 mosdns 之后已经
+# 写好, 受管路由也随配置落盘 —— 到这里四件套前三件齐了, 装 unit 才有意义。
+install -m644 "$REPO_DIR"/deploy/bot/pdg-dotwitness.service /etc/systemd/system/
 render "$REPO_DIR/deploy/firewall/journald-50-pdg.conf" > /etc/systemd/journald.conf.d/50-pdg.conf; chmod 644 /etc/systemd/journald.conf.d/50-pdg.conf
 
 cat > /etc/systemd/system/mosdns.service <<'EOF'
@@ -971,6 +974,10 @@ systemctl restart systemd-journald
 systemctl enable --now mosdns "$CORE_SVC" >/dev/null 2>&1 || true
 # pdg-probe81 两平台都起; pdg-mitm 仍是 iOS 专属。
 systemctl enable --now pdg-probe81 >/dev/null 2>&1 || true
+# witness 不用 `|| true`: 装完就该可用。它起不来意味着 observer 四件套没闭合, 而那正是
+# "service active 却查不到证据"那类假健康的来源 —— 宁可让安装失败。
+systemctl enable --now pdg-dotwitness >/dev/null 2>&1 \
+  || die "pdg-dotwitness 未能启用 —— DoT 证据端不可用, 不把这次安装报成成功"
 [[ "$PLATFORM" == ios ]] && { systemctl enable --now pdg-mitm >/dev/null 2>&1 || true; }
 # ── 救援平面: 凭据 + unit + 默认启用 ──────────────────────────────────────
 # 默认启用是已拍板的方案(T5): 它存在的意义就是"别的都不通时还能进去", 而需要它的那一刻
