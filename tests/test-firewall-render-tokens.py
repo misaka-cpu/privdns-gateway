@@ -27,6 +27,22 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TPL = os.path.join(ROOT, "deploy", "firewall", "nftables-mihomo.conf")
 PROD = ["install.sh", os.path.join("deploy", "bot", "pdg.sh")]
 
+
+def rescue_port():
+    """救援端口的唯一事实源是 lib/rescue.sh —— 连测试夹具也不许写死。
+
+    全仓有一条不变量(test-rescue-constants.sh 在守): 除 lib/rescue.sh 外, 代码与测试
+    里都不该出现那个端口的字面量。这里照办, 顺便让本支在端口改动时自动跟着走。
+    """
+    src = open(os.path.join(ROOT, "lib", "rescue.sh"), encoding="utf-8").read()
+    m = re.search(r'^PDG_RESCUE_PORT="\$\{PDG_RESCUE_PORT:-(\d+)\}"', src, re.M)
+    if not m:
+        raise SystemExit("读不出 lib/rescue.sh 里的 PDG_RESCUE_PORT 默认值")
+    return m.group(1)
+
+
+RPORT = rescue_port()
+
 npass = nfail = nskip = 0
 
 
@@ -172,7 +188,7 @@ def nft_usable():
         good = os.path.join(wd, "all.nft")
         t = tpl_src
         for tok, v in (("__SSH_PORT__", "22"), ("__INTERNAL_CIDR__", "172.22.0.0/16"),
-                       ("__RESCUE_PORT__", "8446"), ("__SERVER_IP__", "203.0.113.10"),
+                       ("__RESCUE_PORT__", RPORT), ("__SERVER_IP__", "203.0.113.10"),
                        ("__CERT_DIR__", "/etc/mosdns/certs")):
             t = t.replace(tok, v)
         # 模板将来多出一个这里不认识的 token 时, 探针不能因此渲不出合法产物 —— 那会让
@@ -200,7 +216,7 @@ else:
             t = tpl_src
             # 只替换该渲染点声称会替换的那些 —— 漏掉的就让它留在产物里, 由 nft 判死
             vals = {"__SSH_PORT__": "22", "__INTERNAL_CIDR__": "172.22.0.0/16",
-                    "__RESCUE_PORT__": "8446", "__SERVER_IP__": "203.0.113.10",
+                    "__RESCUE_PORT__": RPORT, "__SERVER_IP__": "203.0.113.10",
                     "__CERT_DIR__": "/etc/mosdns/certs"}
             for tok in subs:
                 t = t.replace(tok, vals.get(tok, "PLACEHOLDER"))
