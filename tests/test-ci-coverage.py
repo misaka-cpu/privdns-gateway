@@ -51,7 +51,11 @@ files = sorted(f for f in os.listdir(HERE)
 files = [f for f in files if f not in HELPERS]
 
 print("== 1. 每个测试文件都要出现在 workflow 里 ==")
-missing = [f for f in files if f not in ci]
+# 只认**非注释行**。注释里提一句文件名不是登记 —— 负控 NC-CI-1 就是这么发现的:
+# 把 e2e-dot-migrate.sh 的 matrix 条目整条删掉, 守卫仍绿, 因为同 job 的注释里解释过
+# 它为什么用那个域名。那种"登记"跑不了任何东西。
+ci_exec = "\n".join(l for l in ci.splitlines() if not l.lstrip().startswith("#"))
+missing = [f for f in files if f not in ci_exec]
 if not missing:
     ok("%d 个测试文件全部被 ci.yml 引用" % len(files))
 else:
@@ -266,6 +270,76 @@ if "dot-systemd" in jobs:
             ok("dot-systemd 在跑测试前先断言 $PDG_DOTW_REPO/tests/e2e-lib.sh 存在")
         else:
             bad("dot-systemd 没有前置断言 e2e-lib.sh 存在 —— 路径错了要等脚本跑崩才知道")
+
+print()
+print("== 7. 真 systemd+mosdns E2E job 的接线 ==")
+# 这一节盯 dot-systemd-e2e。它是唯一同时给到真 PID1 systemd 与真 mosdns 的 job, 两支
+# 最容易假绿的 E2E 挂在上面 —— 接线一松, 它们会以"整支 SKIP 然后 rc=0"的形态逃生, 而
+# job 照样绿。判据全部按 job/step 切片, 不做全文关键词计数。
+_J = "dot-systemd-e2e"
+if _J not in jobs:
+    bad("找不到 %s job —— 两支真 systemd E2E 没有执行路径" % _J)
+else:
+    _job = jobs[_J]
+    # ① 每格都必须显式带上隔离门。少了它, 脚本进门就 SKIP 并 rc=0。
+    _iso = [(_s, _n) for _s, _n in _steps(_job) if "PDG_E2E_ISOLATED=1" in _run_body(_s)]
+    # 只认**真的去执行**的步骤: 光提到文件名不算(快照那步会 test -f 断言夹具存在,
+    # 那是检查不是执行 —— 早期版本的选择器把它数了进来, 报了一条假阳性)。
+    _runs = [(_s, _n) for _s, _n in _steps(_job)
+             if re.search(r"bash \"\$PDG_DOTE2E_SNAP/tests/", _run_body(_s))]
+    if len(_runs) < 2:
+        bad("%s 里找不到夹具与测试两步(实得 %d) —— 判据失效" % (_J, len(_runs)))
+    elif len(_iso) < len(_runs):
+        bad("%s 有 %d 步在跑夹具/测试, 却只有 %d 步带 PDG_E2E_ISOLATED=1 —— "
+            "缺了那步会让脚本整支 SKIP 却仍 rc=0" % (_J, len(_runs), len(_iso)))
+    else:
+        ok("%s 的夹具与测试步骤都带 PDG_E2E_ISOLATED=1(%d 步)" % (_J, len(_iso)))
+    # ② 用了 pipefail 就必须显式 shell: bash(GitHub 默认 sh; ubuntu runner 上是 dash 语义之外
+    #    的 bash-as-sh, 但显式声明才是这条守卫的意义 —— 别让别的 job 的教训在这里重演)
+    _bad = [_n for _s, _n in _steps(_job)
+            if "pipefail" in _run_body(_s) and not re.search(r"^        shell:\s*bash\s*$", _s, re.M)]
+    (ok if not _bad else bad)(
+        "%s 所有用 pipefail 的步骤都声明了 shell: bash" % _J if not _bad
+        else "%s 这些步骤用了 pipefail 却没声明 shell: bash: %s" % (_J, _bad))
+    # ③ 快照根只能有一个定义处, 且执行与清理都引用它
+    _m2 = re.search(r"^    env:\n(?:      [A-Za-z0-9_]+:.*\n)*?      PDG_DOTE2E_SNAP:\s*(\S+)\s*$",
+                    _job, re.M)
+    if not _m2:
+        bad("%s 没有在 job 级定义 PDG_DOTE2E_SNAP —— 快照路径就没有唯一来源" % _J)
+    else:
+        _p2 = _m2.group(1)
+        _dup2 = [ln for ln in _job.splitlines()
+                 if _p2 in ln and not re.match(r"^      PDG_DOTE2E_SNAP:", ln)]
+        (ok if not _dup2 else bad)(
+            "%s 路径闭包成立: %s 只在定义处出现一次" % (_J, _p2) if not _dup2
+            else "%s 路径闭包破了: %s 在定义处之外还出现 %d 次(%s)"
+                 % (_J, _p2, len(_dup2), _dup2[0].strip()[:60]))
+        _ref = [_n for _s, _n in _steps(_job) if "$PDG_DOTE2E_SNAP" in _run_body(_s)]
+        (ok if len(_ref) >= 3 else bad)(
+            "%s 快照准备/夹具/测试都引用 $PDG_DOTE2E_SNAP(%d 步)" % (_J, len(_ref)) if len(_ref) >= 3
+            else "%s 只有 %d 步引用 $PDG_DOTE2E_SNAP —— 有人写了字面量" % (_J, len(_ref)))
+    # ④ 汇总门必须同时卡住"通过>0 / 失败 0 / 跳过 0"与"内部 [SKIP] 0"。
+    #    只看退出码会被"零断言也退 0"骗过去; 少卡跳过会让 SKIP 冒充通过。
+    _sum = [_s for _s, _n in _steps(_job) if "失败 " in _run_body(_s) and "test " in _run_body(_s)]
+    if not _sum:
+        bad("%s 没有解析汇总数字的步骤 —— 只靠退出码判绿" % _J)
+    else:
+        _b = _run_body(_sum[0])
+        _need = [('test "$np" -gt 0', "通过数非零"),
+                 ('test "$nf" -eq 0', "失败为 0"),
+                 ('test "$ns" -eq 0', "跳过为 0"),
+                 ("[SKIP", "脚本内部 [SKIP] 为 0")]
+        _miss = [d for t, d in _need if t not in _b]
+        (ok if not _miss else bad)(
+            "%s 汇总门四条齐全(通过>0 / 失败 0 / 跳过 0 / 内部 SKIP 0)" % _J if not _miss
+            else "%s 汇总门缺: %s —— 少一条就能假绿" % (_J, "、".join(_miss)))
+    # ⑤ 污染检查必须挂 if: always()
+    _cl = [_s for _s, _n in _steps(_job) if "残留" in _s or "污染" in _s]
+    (ok if _cl and any(re.search(r"^        if:\s*always\(\)", _s, re.M) for _s in _cl) else bad)(
+        "%s 的污染检查挂了 if: always()" % _J if _cl and any(
+            re.search(r"^        if:\s*always\(\)", _s, re.M) for _s in _cl)
+        else "%s 的污染检查没挂 if: always() —— 测试红了就不清场" % _J)
+
 
 total = PASS[0] + FAIL[0]
 print("\n断言 %d 项: 通过 %d, 失败 %d" % (total, PASS[0], FAIL[0]))
