@@ -909,6 +909,169 @@ jobs:
   # 传不进平台参数, 而这支脚本默认 android —— 只跑矩阵的话 iOS 侧等于没覆盖。
   # 分歧是实打实的: iOS 装机会摘掉 GMS 重定向, migrate_ios_gms_cleanup / migrate_drop_singbox
   # 也只在 iOS 上动内核配置, 迁移路径与 Android 并不相同。
+  # ── 真 systemd + 真 mosdns: 迁移故障矩阵与 P0 隔离门 ─────────────────────────
+  # 这两支和上面的 e2e-dot 不同: 它们要 **PID 1 是真 systemd**(真 enable/restart、真读
+  # InvocationID), 容器 job 给不了; 也要 **真 mosdns 在跑**, dot-systemd 那个 job 没有。
+  # 所以单开一个两格 matrix —— 每格一台全新 runner, 两套夹具之间物理隔离, 不需要证明
+  # "上一支清干净了"。
+  #
+  # 两格的域名故意不同, 各有理由:
+  #   · migrate 用 dot.example.test —— e2e-dot-migrate.sh 已冻结, 它的 PROBE 格调
+  #     dotprobe.py 时不传域名, 走的是那个缺省值。域名对不上, 两个判据(qname 后缀 /
+  #     SNI)一个都不满足, 表现成"没出 evidence"。别把它"顺手统一"掉。
+  #   · P0 用 dot.p0ci.test —— 它必须从 dotwitness.env 推导域名, 用非缺省值才证明得了
+  #     推导真的在跑。
+  dot-systemd-e2e:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - script: e2e-dot-migrate.sh
+            mode: pre
+            domain: dot.example.test
+          - script: e2e-dot-p0.sh
+            mode: deployed
+            domain: dot.p0ci.test
+    name: "真 systemd+mosdns E2E ${{ matrix.script }}"
+    # 快照根只在这里写一次; 准备、执行、清理一律引用这个变量。
+    env:
+      PDG_DOTE2E_SNAP: /srv/pdg-dote2e
+    steps:
+      - name: "PID 1 必须是真 systemd(不是就判失败, 不 SKIP)"
+        shell: bash
+        run: |
+          set -euo pipefail
+          comm="$(ps -p 1 -o comm=)"
+          echo "PID1 = $comm"
+          test "$comm" = systemd
+          test ! -e /usr/local/bin/systemctl
+          test ! -e /usr/local/bin/nft
+      # 需要 v1.9.0 这个 annotated tag: 迁移前形态的 mosdns 配置取自它。
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: "核对 v1.9.0 tag 对象与 peeled commit"
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git cat-file -t v1.9.0)" = tag
+          echo "tag 对象   = $(git rev-parse v1.9.0)"
+          echo "peeled     = $(git rev-parse 'v1.9.0^{commit}')"
+          git show v1.9.0:deploy/mosdns/config.yaml > /tmp/v190-mosdns.yaml
+          test -s /tmp/v190-mosdns.yaml
+          grep -q 'pdg-dotwitness managed block' /tmp/v190-mosdns.yaml \
+            && { echo "v1.9.0 模板里有受管块 —— 迁移前形态不成立"; exit 1; } || true
+          echo "v1.9.0 mosdns 模板 $(wc -l < /tmp/v190-mosdns.yaml) 行, 无受管块"
+      - name: "注入当前 commit 的只读快照"
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$PDG_DOTE2E_SNAP" != "$GITHUB_WORKSPACE"
+          sudo rm -rf "$PDG_DOTE2E_SNAP" && sudo mkdir -p "$PDG_DOTE2E_SNAP"
+          git archive --format=tar "$GITHUB_SHA" | sudo tar x -C "$PDG_DOTE2E_SNAP"
+          sudo chown -R root:root "$PDG_DOTE2E_SNAP"
+          # 逐 blob 证明快照内容 == 该 SHA 的 tree。只数文件个数挡不住少解开一个文件。
+          git ls-tree -r --format='%(objectname) %(path)' "$GITHUB_SHA" | sort -k2 > /tmp/sha-blobs.txt
+          ( cd "$PDG_DOTE2E_SNAP" && find . -type f -printf '%P\n' | sort ) > /tmp/snap-names.txt
+          ( cd "$PDG_DOTE2E_SNAP" && git hash-object --stdin-paths < /tmp/snap-names.txt ) > /tmp/snap-hashes.txt
+          paste -d' ' /tmp/snap-hashes.txt /tmp/snap-names.txt | sort -k2 > /tmp/snap-blobs.txt
+          diff -u /tmp/sha-blobs.txt /tmp/snap-blobs.txt
+          echo "快照 blob 与 $GITHUB_SHA 逐一致: $(wc -l < /tmp/snap-blobs.txt) 个"
+          test ! -e "$PDG_DOTE2E_SNAP/.git"
+          test "$(stat -c %U "$PDG_DOTE2E_SNAP")" = root
+          test -f "$PDG_DOTE2E_SNAP/tests/e2e-lib.sh"
+          test -f "$PDG_DOTE2E_SNAP/tests/helpers/ci-dot-fixture.sh"
+      # 版本与哈希都取自 lib/versions.sh —— 与 install.sh 同一个信任锚。校验不过就失败,
+      # 不允许"下不到就跳过"。
+      - name: "装钉定 mosdns (SHA256 必须命中)"
+        shell: bash
+        run: |
+          set -euo pipefail
+          # shellcheck source=lib/versions.sh
+          source lib/versions.sh
+          curl -fsSL -o /tmp/mosdns.zip \
+            "https://github.com/IrineSistiana/mosdns/releases/download/${MOSDNS_VER}/mosdns-linux-amd64.zip"
+          echo "${PDG_SHA256[mosdns-amd64]}  /tmp/mosdns.zip" | sha256sum -c -
+          sudo unzip -oq /tmp/mosdns.zip -d /usr/local/bin
+          sudo chmod +x /usr/local/bin/mosdns
+          mosdns version
+      - name: "记录共享程序与临时目录基线"
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in systemctl nft ip python3; do
+            p="/usr/local/bin/$f"
+            if [ -e "$p" ]; then printf '%s\t%s\t%s\n' "$f" "$(stat -c %F "$p")" "$(sha256sum "$p" | cut -d' ' -f1)"
+            else printf '%s\tabsent\t-\n' "$f"; fi
+          done | sudo tee /tmp/stub-baseline.txt
+          ls -d /tmp/tmp.* /tmp/pdg-* 2>/dev/null | sort > /tmp/tmpdir-baseline.txt || true
+          wc -l < /tmp/tmpdir-baseline.txt
+      - name: "搭夹具 (${{ matrix.mode }} 形态, 域名 ${{ matrix.domain }})"
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo -E env PDG_E2E_ISOLATED=1 PDG_DOTW_REPO="$PDG_DOTE2E_SNAP" \
+            bash "$PDG_DOTE2E_SNAP/tests/helpers/ci-dot-fixture.sh" \
+            "${{ matrix.mode }}" "${{ matrix.domain }}" /tmp/v190-mosdns.yaml
+      - name: "跑 ${{ matrix.script }} 并核对汇总(通过>0 / 失败 0 / 跳过 0)"
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 不看退出码就下结论会被"零断言也退 0"骗过去 —— 逐项核对汇总数字。
+          sudo -E env PDG_E2E_ISOLATED=1 PDG_DOTW_REPO="$PDG_DOTE2E_SNAP" \
+            bash "$PDG_DOTE2E_SNAP/tests/${{ matrix.script }}" 2>&1 | tee /tmp/e2e-out.txt
+          line="$(grep -E '^通过 [0-9]+, 失败 [0-9]+' /tmp/e2e-out.txt | tail -1)"
+          test -n "$line" || { echo "找不到汇总行 —— 脚本没跑到底"; exit 1; }
+          echo "汇总: $line"
+          np="$(sed -E 's/^通过 ([0-9]+).*/\1/' <<< "$line")"
+          nf="$(sed -E 's/.*失败 ([0-9]+).*/\1/' <<< "$line")"
+          if grep -q '跳过' <<< "$line"; then ns="$(sed -E 's/.*跳过 ([0-9]+).*/\1/' <<< "$line")"; else ns=0; fi
+          echo "通过=$np 失败=$nf 跳过=$ns"
+          test "$np" -gt 0
+          test "$nf" -eq 0
+          test "$ns" -eq 0
+          # 脚本内部的 [SKIP] 一条都不许有: SKIP 不是通过。
+          test "$(grep -c '^\[SKIP' /tmp/e2e-out.txt || true)" -eq 0
+      - name: "退出后不许留下进程/端口/unit/RuntimeDirectory/临时目录/影子桩"
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          fail=0
+          for f in systemctl nft ip python3; do
+            p="/usr/local/bin/$f"
+            if [ -e "$p" ]; then now="$(printf '%s\t%s\t%s' "$f" "$(stat -c %F "$p")" "$(sha256sum "$p" | cut -d' ' -f1)")"
+            else now="$(printf '%s\tabsent\t-' "$f")"; fi
+            base="$(grep -P "^$f\t" /tmp/stub-baseline.txt || true)"
+            [ "$now" = "$base" ] || { echo "共享程序被动过: $f / 前[$base] 后[$now]"; fail=1; }
+          done
+          # 只停本 job 自己装的那两个 unit, 不碰别的
+          sudo systemctl disable --now pdg-dotwitness >/dev/null 2>&1 || true
+          sudo systemctl stop mosdns >/dev/null 2>&1 || true
+          sudo rm -f /etc/systemd/system/pdg-dotwitness.service /etc/systemd/system/mosdns.service
+          sudo systemctl daemon-reload || true
+          sudo systemctl reset-failed >/dev/null 2>&1 || true
+          sudo rm -rf /etc/mosdns /opt/pdg-bot /etc/privdns-gateway "$PDG_DOTE2E_SNAP"
+          # 夹具停过 systemd-resolved, 按它记下的原状还回去
+          if [ "$(cat /run/pdg-fixture-resolved.was 2>/dev/null)" = enabled ]; then
+            sudo systemctl start systemd-resolved >/dev/null 2>&1 || true
+          fi
+          sudo rm -f /run/pdg-fixture-resolved.was
+          pgrep -f '[d]otwitness\.py' >/dev/null && { echo "残留 witness 进程"; fail=1; }
+          pgrep -f '[m]osdns start' >/dev/null && { echo "残留 mosdns 进程"; fail=1; }
+          ss -lun 2>/dev/null | grep -q ':5399' && { echo "5399 仍在监听"; fail=1; }
+          [ -e /etc/systemd/system/pdg-dotwitness.service ] && { echo "残留 unit"; fail=1; }
+          [ -e /run/pdg-dotwitness ] && { echo "残留 RuntimeDirectory"; fail=1; }
+          [ "$(systemctl --failed --no-legend | wc -l)" -eq 0 ] || { systemctl --failed --no-legend; echo "有 failed unit"; fail=1; }
+          sudo nft list tables 2>/dev/null | grep -q 'inet pdg' && { echo "残留 nft inet pdg 表"; fail=1; }
+          ls -d /tmp/tmp.* /tmp/pdg-* 2>/dev/null | sort > /tmp/tmpdir-after.txt || true
+          newdirs="$(comm -13 /tmp/tmpdir-baseline.txt /tmp/tmpdir-after.txt || true)"
+          [ -n "$newdirs" ] && { echo "新增临时目录: $newdirs"; fail=1; }
+          exit "$fail"
+
   e2e-rescue-lock-ios:
     runs-on: ubuntu-latest
     container:
