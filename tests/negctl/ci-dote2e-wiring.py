@@ -18,6 +18,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 WF = ".github/workflows/ci.yml"
@@ -42,7 +44,7 @@ def sha(p):
     return hashlib.sha256(open(p, "rb").read()).hexdigest()
 
 
-WCROOT = tempfile.mkdtemp(prefix="pdg-ciwnc-")
+WCROOT = tmpguard.mkdtemp(prefix="pdg-ciwnc-")
 WC = os.path.join(WCROOT, "wc")
 subprocess.run(["git", "-C", REPO, "worktree", "list"], capture_output=True)
 shutil.copytree(REPO, WC, symlinks=True,

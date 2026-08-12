@@ -16,6 +16,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 TEST = "tests/test-firewall-render-tokens.py"
@@ -40,7 +42,7 @@ def sha(p):
     return hashlib.sha256(open(p, "rb").read()).hexdigest()
 
 
-WCROOT = tempfile.mkdtemp(prefix="pdg-fwnc-")
+WCROOT = tmpguard.mkdtemp(prefix="pdg-fwnc-")
 WC = os.path.join(WCROOT, "wc")
 os.makedirs(WC)
 for rel in TOUCHED + [TEST]:

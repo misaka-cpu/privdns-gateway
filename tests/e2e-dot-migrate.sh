@@ -108,7 +108,7 @@ snap(){   # 输出一行可比较的完整身份
 # systemctl 留痕: 状态机**主动发出**的调用会经过这个包装, 而 PartOf=mosdns.service
 # 的依赖传播是 systemd 内部行为, 不会经过这里。所以"谁重启了 witness"这个问题, 靠
 # 留痕 + InvocationID 两份证据回答, 不靠 PID 变化去猜。
-SCTL_LOG=/tmp/sctl.log
+SCTL_LOG="${TMPDIR:-/tmp}/sctl.log"
 SCTL_FAIL_PAT=""
 systemctl(){
   printf '%s\n' "$*" >> "$SCTL_LOG"
@@ -142,14 +142,14 @@ dns_udp(){ dig +short +time=2 +tries=1 @127.0.0.1 example.com A 2>/dev/null | he
 dns_tcp(){ dig +short +tcp +time=2 +tries=1 @127.0.0.1 example.com A 2>/dev/null | head -1; }
 dns_dot(){ python3 "$E2E_ROOT/tests/dotquery.py" example.com 2>/dev/null; }
 ev_count(){ ls /run/pdg-dotwitness/ 2>/dev/null | wc -l; }
-tmpset(){ ls -d /tmp/tmp.* 2>/dev/null | sort | tr '\n' ' '; }
+tmpset(){ ls -d "${TMPDIR:-/tmp}"/tmp.* 2>/dev/null | sort | tr '\n' ' '; }
 TMP0="$(tmpset)"
 
 # ── 健康基线 ───────────────────────────────────────────────────────────────
 sect "0. 健康基线"
-migrate_dotwitness >/tmp/base.log 2>&1
+migrate_dotwitness >"${TMPDIR:-/tmp}/base.log" 2>&1
 rc=$?
-[[ $rc == 0 ]] && ok "首次迁移 rc=0" || bad "首次迁移 rc=$rc: $(tail -1 /tmp/base.log)"
+[[ $rc == 0 ]] && ok "首次迁移 rc=0" || bad "首次迁移 rc=$rc: $(tail -1 "${TMPDIR:-/tmp}/base.log")"
 BASE="$(snap)"
 echo "  before-image: $BASE"
 [[ -n "$(dns_udp)" ]] && ok "基线普通 DNS 可用" || bad "基线普通 DNS 不可用"
@@ -228,8 +228,8 @@ cell(){
 }
 
 # ═══ 1. 域名缺失/非法 ══════════════════════════════════════════════════════
-i_dom(){ cp /opt/pdg-bot/dot-domain /tmp/dom.bak; echo 'not a domain!' > /opt/pdg-bot/dot-domain; }
-u_dom(){ cp /tmp/dom.bak /opt/pdg-bot/dot-domain; }
+i_dom(){ cp /opt/pdg-bot/dot-domain "${TMPDIR:-/tmp}/dom.bak"; echo 'not a domain!' > /opt/pdg-bot/dot-domain; }
+u_dom(){ cp "${TMPDIR:-/tmp}/dom.bak" /opt/pdg-bot/dot-domain; }
 h_dom(){ grep -q 'not a domain' /opt/pdg-bot/dot-domain; }
 cell 1 "域名非法 → 写盘前失败" i_dom u_dom h_dom
 
@@ -241,7 +241,7 @@ h_route(){ python3 "$E2E_ROOT/deploy/bot/dotwroute.py" render "$DW_MOS" a.b >/de
 cell 2 "dotwroute.py 非零 → 写盘前失败" i_route u_route h_route
 
 # ═══ 3. 候选 mosdns 配置非法 ═══════════════════════════════════════════════
-i_cand(){ cp "$E2E_ROOT/deploy/bot/dotwroute.py" /tmp/dw.bak
+i_cand(){ cp "$E2E_ROOT/deploy/bot/dotwroute.py" "${TMPDIR:-/tmp}/dw.bak"
           python3 - "$E2E_ROOT" <<'PY'
 import sys, os
 p = sys.argv[1] + "/deploy/bot/dotwroute.py"
@@ -252,7 +252,7 @@ assert t.count(old) == 1
 open(p, "w").write(t.replace(old, '        "      - exec: $no_such_plugin",'))
 PY
 }
-u_cand(){ cp /tmp/dw.bak "$E2E_ROOT/deploy/bot/dotwroute.py"; }
+u_cand(){ cp "${TMPDIR:-/tmp}/dw.bak" "$E2E_ROOT/deploy/bot/dotwroute.py"; }
 h_cand(){ grep -q no_such_plugin "$E2E_ROOT/deploy/bot/dotwroute.py"; }
 # 这一格不能只看最终状态。实测(三次一致): 把预校验那条 `return 1` 吞掉之后, 坏配置会
 # **确定性地**落进 /etc/mosdns/config.yaml、迁移返回 0、且不进回滚 —— 而最终 image 有时
@@ -380,7 +380,7 @@ cell_dirty 10 "witness restart 失败" i_wre2 u_sys
 # 插桩必须写**文件**不能写 shell 变量: 生产那行是 `ss -lun | grep -q ...`, 管道两端都在
 # 子 shell 里跑, 变量赋值出不来。第一版就是这么栽的 —— POLLS 恒为 0, 看起来像"门没触发",
 # 其实门触发了, 丢的是我的计数。
-SS_TRACE=/tmp/ss-probe.log
+SS_TRACE="${TMPDIR:-/tmp}/ss-probe.log"
 i_state(){
   migrate_dotwitness >/dev/null 2>&1              # 三文件先到目标态
   command systemctl disable --now pdg-dotwitness >/dev/null 2>&1
@@ -449,8 +449,8 @@ migrate_dotwitness >/dev/null 2>&1
 [[ "$(snap)" == "$BASE" ]] && ok "11 撤障后正常迁移 → 重新进入健康态" || bad "11 复跑后未回健康态"
 
 # ═══ 12. 模块缺失 → 早退, 一个字节都不动 ═══════════════════════════════════
-i_nomod(){ mv /opt/pdg-bot/dotwitness.py /tmp/dw.py.bak; }
-u_nomod(){ mv /tmp/dw.py.bak /opt/pdg-bot/dotwitness.py; }
+i_nomod(){ mv /opt/pdg-bot/dotwitness.py "${TMPDIR:-/tmp}/dw.py.bak"; }
+u_nomod(){ mv "${TMPDIR:-/tmp}/dw.py.bak" /opt/pdg-bot/dotwitness.py; }
 h_nomod(){ [[ ! -f /opt/pdg-bot/dotwitness.py ]]; }
 cell 12 "witness 模块缺失 → 不启用空壳" i_nomod u_nomod h_nomod
 
@@ -486,10 +486,10 @@ mark PROBE
 sect "A. 独立 E2E 验收: 迁移完成后真 probe 必须产生 evidence"
 rm -f /run/pdg-dotwitness/evidence.json 2>/dev/null
 before_ev="$(ev_count)"
-python3 "$E2E_ROOT/tests/dotprobe.py" >/tmp/probe.log 2>&1
+python3 "$E2E_ROOT/tests/dotprobe.py" >"${TMPDIR:-/tmp}/probe.log" 2>&1
 after_ev="$(ev_count)"
 [[ "$before_ev" == 0 && "$after_ev" == 1 ]] && ok "真 DoT probe → evidence 从 0 变 1" \
-  || bad "probe 后 evidence: $before_ev → $after_ev ($(head -1 /tmp/probe.log))"
+  || bad "probe 后 evidence: $before_ev → $after_ev ($(head -1 "${TMPDIR:-/tmp}/probe.log"))"
 [[ -n "$(dns_udp)" ]] && ok "普通 UDP53 不产生 evidence 且仍可用" || bad "普通 DNS 挂了"
 
 fi

@@ -22,6 +22,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TPL = os.path.join(ROOT, "deploy", "firewall", "nftables-mihomo.conf")
@@ -183,7 +185,7 @@ def nft_usable():
     """
     if not os.path.exists(nft):
         return False, "本机没有 nft"
-    wd = tempfile.mkdtemp(prefix="pdg-fwprobe-")
+    wd = tmpguard.mkdtemp(prefix="pdg-fwprobe-")
     try:
         good = os.path.join(wd, "all.nft")
         t = tpl_src
@@ -210,7 +212,7 @@ if not usable:
 else:
     ok("能力对照: 全部替换到位的产物通过 nft -c(下面的红才归因于占位符)")
     for rel, lineno, subs, _stmt, _src in sites:
-        wd = tempfile.mkdtemp(prefix="pdg-fwrender-")
+        wd = tmpguard.mkdtemp(prefix="pdg-fwrender-")
         try:
             out = os.path.join(wd, "rendered.nft")
             t = tpl_src

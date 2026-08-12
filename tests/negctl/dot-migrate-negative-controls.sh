@@ -82,7 +82,7 @@ open(path, "w").write(out)
 PY
 }
 
-MATRIX_OUT=/tmp/negctl-matrix.out
+MATRIX_OUT="${TMPDIR:-/tmp}/negctl-matrix.out"
 run_matrix(){
   PDG_E2E_ISOLATED=1 PDG_DOTW_REPO="$WC" bash "$WC/$MATRIX" </dev/null >"$MATRIX_OUT" 2>&1
 }
@@ -121,7 +121,7 @@ else
   exit 1
 fi
 BASE_ASSERTS="$(n_assert)"
-BASE_OUT=/tmp/nc-base.out
+BASE_OUT="${TMPDIR:-/tmp}/nc-base.out"
 cp -f "$MATRIX_OUT" "$BASE_OUT"
 echo "  基线失败集合: $(fail_set "$BASE_OUT" | wc -l) 条"
 
@@ -137,8 +137,8 @@ cell(){
     restore; return
   fi
   run_matrix || true
-  cp -f "$MATRIX_OUT" /tmp/nc-mut.out
-  local added; added="$(new_fails "$BASE_OUT" /tmp/nc-mut.out)"
+  cp -f "$MATRIX_OUT" "${TMPDIR:-/tmp}/nc-mut.out"
+  local added; added="$(new_fails "$BASE_OUT" "${TMPDIR:-/tmp}/nc-mut.out")"
   if [[ "$(n_assert)" -lt 10 ]]; then
     bad "NC-SM-$n $name → 矩阵只跑出 $(n_assert) 条断言(基线 $BASE_ASSERTS), 疑似没真跑起来"
   elif [[ -z "$added" ]]; then
@@ -154,11 +154,11 @@ sect "12 类"
 
 # 1. 去掉 || rc=1 —— 迁移链的判据在 test-dot-lifecycle, 单独验
 if mutate "  migrate_dotwitness || rc=1" "  migrate_dotwitness || true" >/dev/null 2>&1; then
-  if PDG_DOTW_REPO="$WC" python3 "$WC/tests/test-dot-lifecycle.py" >/tmp/nc-lc.out 2>&1; then
+  if PDG_DOTW_REPO="$WC" python3 "$WC/tests/test-dot-lifecycle.py" >"${TMPDIR:-/tmp}/nc-lc.out" 2>&1; then
     bad "NC-SM-1 去掉 || rc=1 → lifecycle 仍绿, 这条没有牙齿"
   else
-    if grep -q 'rc=1' /tmp/nc-lc.out; then
-      ok "NC-SM-1 去掉 || rc=1 → lifecycle 转红并点名(共 $(grep -c '^\[FAIL' /tmp/nc-lc.out) 条)"
+    if grep -q 'rc=1' "${TMPDIR:-/tmp}/nc-lc.out"; then
+      ok "NC-SM-1 去掉 || rc=1 → lifecycle 转红并点名(共 $(grep -c '^\[FAIL' "${TMPDIR:-/tmp}/nc-lc.out") 条)"
     else
       bad "NC-SM-1 转红但没点名 || rc=1 那一条"
     fi

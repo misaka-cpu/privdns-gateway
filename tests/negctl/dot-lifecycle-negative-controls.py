@@ -20,6 +20,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 TOUCHED = ["install.sh", "uninstall.sh", "deploy/bot/checks.py"]
@@ -44,7 +46,7 @@ def sha(p):
     return hashlib.sha256(open(p, "rb").read()).hexdigest()
 
 
-WCROOT = tempfile.mkdtemp(prefix="pdg-lcnc-")
+WCROOT = tmpguard.mkdtemp(prefix="pdg-lcnc-")
 WC = os.path.join(WCROOT, "wc")
 subprocess.run(["git", "clone", "-q", "--shared", "--no-checkout", REPO, WC], check=True)
 head = subprocess.run(["git", "-C", REPO, "rev-parse", "HEAD"],

@@ -61,7 +61,7 @@ cp "$B" "$M"; sed -i '1d' "$M"; echo '[FAIL] 新的真失败' >> "$M"
 n2="$(new_fails "$B" "$M" | wc -l)"
 [[ "$n2" == 1 ]] && ok "B 一减一增(总数不变) → 差集仍抓到 1 条新增(只比数量会漏)" || bad "B 一减一增判成 $n2"
 # 归一化不能把不同断言合并
-printf '[FAIL] 格 4 残留 /tmp/tmp.AAAAAA\n' > "$B"; printf '[FAIL] 格 5 残留 /tmp/tmp.BBBBBB\n' > "$M"
+printf '[FAIL] 格 4 残留 "${TMPDIR:-/tmp}/tmp.AAAAAA"\n' > "$B"; printf '[FAIL] 格 5 残留 "${TMPDIR:-/tmp}/tmp.BBBBBB"\n' > "$M"
 [[ "$(new_fails "$B" "$M" | wc -l)" == 1 ]] && ok "B 窄归一化没把不同断言合并(格 4 vs 格 5 仍算新增)" \
   || bad "B 归一化过宽, 不同断言被合并了"
 rm -f "$B" "$M"
