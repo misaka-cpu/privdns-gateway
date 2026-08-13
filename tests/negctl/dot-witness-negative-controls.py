@@ -293,15 +293,21 @@ def main():
            [('LABEL_RE = re.compile(r"\\A[0-9a-f]{24}\\Z")',
              'LABEL_RE = re.compile(r"\\A[0-9a-f]{12}\\Z")', 1)], 1,
            ["tests/test-dot-witness.py", "tests/test-dot-privacy.py"])
+        # 锚点必须整块取 canonical 受管块, 不能取"goto probe_seq 紧跟 client_ip"那种文本
+        # 相邻关系: 6.2B 把 `# <<< … (main_sequence)` 结束标记插进了两者之间, 相邻早已不
+        # 成立 —— 这条负控因此命中 0 次、空转了整整一轮而无人发现。
+        # 两步: 先整块摘掉, 再整块插到 client_ip 分支之后。起止标记各一处、块内
+        # qname/SNI/goto probe_seq 三要素齐全、插入目标一处; 任一计数不为 1, nc() 直接判负控无效。
+        MB = ("      # >>> pdg-dotwitness managed block (main_sequence)\n"
+              "      - matches:\n"
+              "          - qname suffix probe.__DOT_DOMAIN__\n"
+              "          - string_exp server_name eq __DOT_DOMAIN__\n"
+              "        exec: goto probe_seq\n"
+              "      # <<< pdg-dotwitness managed block (main_sequence)\n")
+        AFTER = ("      - matches: client_ip $npn_clients\n"
+                 "        exec: goto internal_sequence\n")
         nc(cp, 5, "probe 分支移到 cache 后", M,
-           [("      - matches:\n          - qname suffix probe.__DOT_DOMAIN__\n"
-             "          - string_exp server_name eq __DOT_DOMAIN__\n"
-             "        exec: goto probe_seq\n      - matches: client_ip $npn_clients\n"
-             "        exec: goto internal_sequence\n",
-             "      - matches: client_ip $npn_clients\n        exec: goto internal_sequence\n"
-             "      - matches:\n          - qname suffix probe.__DOT_DOMAIN__\n"
-             "          - string_exp server_name eq __DOT_DOMAIN__\n"
-             "        exec: goto probe_seq\n", 1)], 1,
+           [(MB, "", 1), (AFTER, AFTER + MB, 1)], 2,
            ["tests/test-dot-witness.py", "tests/test-dot-privacy.py"])
         # 6-7 隐私闸门
         nc(cp, 6, "开启 api.http", M,
@@ -412,8 +418,13 @@ def main():
 
         # ── 需要真 E2E / 真 systemd 的几条: 本进程内跑不了, 明确记为未验 ──
         if os.geteuid() == 0:
+            # 属主门在 6.2B 挪进了 read_evidence(), 判据也从"读者自己的 euid"换成了
+            # 观察端身份 expect_uid —— 旧锚点(reader-euid 那句)已不存在, 命中 0 次。
+            # 只能删门, 不能把默认值改回 os.geteuid(): _read_state() 显式传
+            # expect_uid=os.geteuid(), 改默认值对这支 catcher 行为完全等价, 0 条转红。
             nc(cp, 26, "owner 错仍接受", W,
-               [('    if st.st_uid != os.geteuid():             # 别人写的, 不信\n        return "CORRUPT"\n', "", 1)],
+               [("    if st.st_uid != expect_uid:               # 不是观察端写的, 不信\n"
+                 "        return READ_CORRUPT, None\n", "", 1)],
                1, ["tests/test-dot-strict.py"])
         else:
             unver("NC26 owner 错仍接受 —— 非 root 下 test-dot-strict 会 SKIP 那格, 由 root 容器轮覆盖")
