@@ -187,6 +187,9 @@ jobs:
         run: python3 tests/test-dot-matrix-selector.py
       - name: "6.2B 受管块标记契约 (state/strip 同一套精确语义, 九种变体)"
         run: python3 tests/test-dot-route-markers.py
+
+      - name: "witness 迁移的失败理由 (每条出口都可定位 / 缺失与非法分开 / 不回显域名)"
+        run: python3 tests/test-dotwitness-error-reasons.py
       # 这支的动态段要真跑 `nft -c`, 非 root 下 nft 连缓存都初始化不了 —— 会自报 SKIP
       # 并说明原因(不算通过)。用 sudo 跑, 让那段真正当裁判; runner 上 nft 是现成的。
       - name: "nft 模板渲染点必须替换每一个占位符 (含真 nft -c)"

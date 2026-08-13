@@ -107,16 +107,8 @@ e2e_git "$REPO" checkout -q v9.9.8                     # 退回旧版, 好再更
 # ("DoT 域名缺失 → 不部署 observer"), 更新失败回滚, 红的是夹具而不是产品。
 # 真机上更新绝不动这些文件 —— 成功与失败回滚两条路径都实测过前后像逐字节一致
 # (含 mode/uid/gid), 见 tests/e2e-update-preserve-userdata.sh。
-# 保留清单从产品自己的保全契约读, 不在这里写死文件名。
-source "$E2E_ROOT/lib/preserve.sh"
-_keep="$E2E_TMP/e2e-userdata-keep"; rm -rf "$_keep"; mkdir -p "$_keep"
-while read -r _p; do
-  [[ "$_p" == opt/pdg-bot/* && -e "/$_p" ]] || continue
-  mkdir -p "$_keep/$(dirname "$_p")" && cp -a "/$_p" "$_keep/$_p"
-done < <(pdg_user_data)
-rm -rf /opt/pdg-bot; mkdir -p /opt/pdg-bot
-[[ -d "$_keep/opt/pdg-bot" ]] && cp -a "$_keep/opt/pdg-bot/." /opt/pdg-bot/
-rm -rf "$_keep"
+# 保留清单从产品自己的保全契约读, 不在这里写死文件名(见 e2e_reset_botdir)。
+e2e_reset_botdir || bad "重置 /opt/pdg-bot 失败"
 for f in "$E2E_ROOT"/deploy/bot/*.py; do install -m755 "$f" /opt/pdg-bot/; done
 install -m755 "$E2E_ROOT/deploy/bot/pdg-bot.py" /opt/pdg-bot/bot.py
 # 让 doctor 报一条 fail(内核服务不在) —— 用有状态 systemd 桩把 mihomo 置为 inactive

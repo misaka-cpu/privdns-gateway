@@ -814,6 +814,32 @@ E2E_SIP=203.0.113.1
 E2E_CIDR=127.0.0.0/8
 
 # 装好 bot 模块 + 仓库 + pdg 脚本
+# 把 /opt/pdg-bot 清回"只有部署模块"的状态, 但**保住用户数据**。
+#
+# 三支跨版本 E2E 原本都写 `rm -rf /opt/pdg-bot; mkdir -p /opt/pdg-bot` —— 它们想做的是
+# "把部署模块换成某个旧版本的那一份", 却把同住一个目录的用户数据(PDG_USER_DATA 里的
+# dot-domain / rulesets.json)一并带走。机器于是落到"模块在、用户数据没了"这种真机永远
+# 不会出现的形态: 真机上那些文件由 install.sh 写、由 pdg update 逐字节保全(成功与失败
+# 回滚两条路径都实测过, 见 e2e-update-preserve-userdata.sh)。
+# 后果是 6.2B 的 migrate_dotwitness 按契约 fail-closed("拼进配置的值不能靠猜"), 整次
+# 更新回滚 —— 红的是夹具而不是产品。
+#
+# 保留清单从 lib/preserve.sh 的 PDG_USER_DATA 读, 不在任何一支测试里写死文件名。
+e2e_reset_botdir(){
+  # shellcheck source=lib/preserve.sh
+  source "$E2E_ROOT/lib/preserve.sh" || return 1
+  local keep p
+  keep="$(mktemp -d "${TMPDIR:-/tmp}/e2e-ud.XXXXXX")" || return 1
+  while read -r p; do
+    [[ "$p" == opt/pdg-bot/* && -e "/$p" ]] || continue
+    mkdir -p "$keep/$(dirname "$p")" && cp -a "/$p" "$keep/$p"
+  done < <(pdg_user_data)
+  rm -rf /opt/pdg-bot && mkdir -p /opt/pdg-bot || { rm -rf "$keep"; return 1; }
+  [[ -d "$keep/opt/pdg-bot" ]] && cp -a "$keep/opt/pdg-bot/." /opt/pdg-bot/
+  rm -rf "$keep"
+  return 0
+}
+
 e2e_seed_install(){
   mkdir -p /opt/pdg-bot /etc/mosdns/rules /etc/privdns-gateway
   cp -a "$E2E_ROOT" /opt/privdns-gateway

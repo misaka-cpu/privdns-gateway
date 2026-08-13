@@ -2311,12 +2311,23 @@ migrate_dotwitness(){
   # ① DoT 域名: 唯一真源是 /opt/pdg-bot/dot-domain。校验放这里, 因为它会被拼进
   #    mosdns 配置与 env —— 放宽等于允许注入。
   local dom; dom="$(cat /opt/pdg-bot/dot-domain 2>/dev/null | tr -d '[:space:]')"
-  if [[ -z "$dom" || ! "$dom" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]; then
-    c_y "  ❌ DoT 域名缺失或非法($dom) —— 不部署 observer(拼进配置的值不能靠猜)。"
+  # 两类分开报, 且**不回显文件内容**。原先是 `($dom)` 直接把读到的东西打出来 —— 这个值
+  # 会出现在更新日志、doctor 输出与用户贴上来的排障截图里, 而它正是本机 DoT 的域名。
+  # 报类别足够定位(文件在不在 / 内容合不合法), 回显只是把私有信息摊开。
+  if [[ -z "$dom" ]]; then
+    c_y "  ❌ DoT 域名缺失: /opt/pdg-bot/dot-domain 不存在或为空 —— 不部署 observer(拼进配置的值不能靠猜)。"
+    return 1
+  fi
+  if [[ ! "$dom" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]; then
+    c_y "  ❌ DoT 域名非法: /opt/pdg-bot/dot-domain 的内容不是合法域名(不回显内容) —— 不部署 observer。"
     return 1
   fi
 
-  local work; work="$(mktemp -d)" || return 1
+  # 这条以前是唯一一条**一个字都不说**就返回 1 的路径: 建不出临时目录时上层只看得到
+  # "迁移失败", 查不出是哪一步。
+  local work; work="$(mktemp -d)" || {
+    c_y "  ❌ 建不出 witness 的临时工作区(磁盘满 / TMPDIR 不可写?) —— 未做任何改动。"
+    return 1; }
   local rc=0 need_reload=0 need_mos=0 need_wit=0
 
   # ② 候选 env / unit / mosdns 配置。全部先造出来、验过, 再谈落盘。
