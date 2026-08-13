@@ -127,10 +127,10 @@ e2e_dw_reap(){
 }
 
 e2e_reset_box(){
-  e2e_dw_reap
   # **必须是第一句**: 下面紧接着就 `systemctl disable --now …`, 而 /usr/local/bin 排在
   # PATH 前面 —— 上一支留下的桩会在这里被调到。先把影子桩撤掉, 再动任何 PATH 命令。
   e2e_purge_shadow_stub ip python3 py3-real || return 1
+  e2e_dw_reap
   systemctl disable --now pdg-bot pdg-probe81 pdg-mitm mosdns mihomo sing-box \
                           pdg-rescue.socket pdg-rescue.service >/dev/null 2>&1 || true
   # sing-box 是**必须**清掉的那个: 装机会把来源不明的 sing-box 判成第三方冲突而中止,
