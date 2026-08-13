@@ -53,6 +53,10 @@ for rel in TOUCHED + [TEST]:
 # lib/rescue.sh 也必须在: 被测判据从那里读救援端口(全仓不变量: 端口字面量只许出现在
 # 那一个文件)。少拷它的话每一格都会因为"读不出端口"而红 —— 那种红与被测的东西无关。
 shutil.copy2(os.path.join(REPO, "install.sh"), os.path.join(WC, "install.sh"))
+# tmpguard 也得跟着走: 被测判据从 5367b5b 起 `import tmpguard`(临时目录卫生), 它按
+# 自己所在目录解析 sys.path。少拷这一个文件, 判据在工作副本里 import 就崩 —— 每一格
+# 都报 Traceback, 而基线那格因为"0 条失败"看起来还是绿的。
+shutil.copy2(os.path.join(REPO, "tests", "tmpguard.py"), os.path.join(WC, "tests", "tmpguard.py"))
 os.makedirs(os.path.join(WC, "lib"), exist_ok=True)
 shutil.copy2(os.path.join(REPO, "lib", "rescue.sh"), os.path.join(WC, "lib", "rescue.sh"))
 PRISTINE = {rel: open(os.path.join(WC, rel), "rb").read() for rel in TOUCHED}
@@ -83,6 +87,10 @@ BASE_FAILS, BASE_OK, BASE_SKIP, base_out = run_test()
 if BASE_FAILS:
     bad("基线就红了(%d 条), 后面每格都无从判断" % len(BASE_FAILS))
     print("\n".join("      " + x for x in BASE_FAILS[:3]))
+    sys.exit(1)
+if BASE_OK == 0:
+    bad("基线一条断言都没跑出来(判据在工作副本里崩了?) —— '0 条失败'不等于绿")
+    print("\n".join("      " + x for x in base_out.splitlines()[-4:]))
     sys.exit(1)
 ok("基线绿: 通过 %d, 失败 0, 跳过 %d" % (BASE_OK, BASE_SKIP))
 if BASE_SKIP:
