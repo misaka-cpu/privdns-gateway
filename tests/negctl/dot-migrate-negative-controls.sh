@@ -145,6 +145,14 @@ cell(){
     bad "NC-SM-$n $name → **新增失败为 0**(基线已有 $(fail_set "$BASE_OUT" | wc -l) 条), 这条判据没有牙齿"
   else
     ok "NC-SM-$n $name → 新增 $(wc -l <<< "$added") 条失败: $(head -1 <<< "$added" | cut -c1-72)"
+    # 完整留存这一格的**规范化**新增失败集合。上面那行只有计数与首条(截断 72 字符),
+    # 跨次比对"集合是否漂移"时不够用 —— 稳定性复跑要的正是逐条一致, 不是数量一致。
+    # 顺序即 fail_set() 的 canonical 排序; 前缀取 [ADDED*] 而不是 [FAIL]:
+    # fail_set() 与 bad() 都只认 `^[FAIL`, 所以这几行不会被任何汇总器计成真实失败。
+    # 集合为空走上面 elif 那条 bad 分支, 不会到这里 —— 不伪造空记录。
+    echo "[ADDED-BEGIN] NC-SM-$n count=$(wc -l <<< "$added")"
+    while IFS= read -r _added_line; do printf '[ADDED] %s\n' "$_added_line"; done <<< "$added"
+    echo "[ADDED-END] NC-SM-$n sha256=$(printf '%s\n' "$added" | sha256sum | cut -d' ' -f1)"
   fi
   restore
   verify_restore "$n" || true
