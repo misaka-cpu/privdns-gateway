@@ -696,6 +696,7 @@ jobs:
           - e2e-install-nft.sh
           - e2e-platform-switch.sh
           - e2e-update.sh
+          - e2e-update-preserve-userdata.sh
           - e2e-upgrade-from-release.sh
           - e2e-wloc.sh
           - e2e-cli-ops.sh
@@ -1125,7 +1126,8 @@ jobs:
           PDG_SERIAL_SCRIPTS: >-
             e2e-migrate.sh e2e-exit-rule.sh e2e-drop-singbox.sh e2e-custom-nft.sh
             e2e-cross-version-rollback.sh e2e-install.sh e2e-install-nft.sh
-            e2e-platform-switch.sh e2e-update.sh e2e-upgrade-from-release.sh e2e-wloc.sh e2e-cli-ops.sh
+            e2e-platform-switch.sh e2e-update.sh e2e-update-preserve-userdata.sh
+            e2e-upgrade-from-release.sh e2e-wloc.sh e2e-cli-ops.sh
             e2e-rescue-migration-lock.sh e2e-hijack-mode-tx.sh e2e-snapshot-meta.sh
             e2e-config-transaction.sh e2e-config-transaction-recovery.sh
         run: bash tests/e2e-serial-hermetic.sh
