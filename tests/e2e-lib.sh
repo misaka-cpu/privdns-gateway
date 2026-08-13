@@ -105,7 +105,29 @@ e2e_purge_shadow_stub(){
 
 # 把机器清回"什么都没装过"的状态。namespace 模式下 overlay 本来就干净, 这里主要给容器模式
 # (CI 里多个脚本共用一个容器)用: 二进制、unit、归属/后端标记、快照、仓库副本、服务桩一个不留。
+# 只按**本轮登记的 PID** 回收 witness 假 unit 起的真进程。不用 pkill -f, 不碰
+# 任何别的占 5399 的进程 —— 那可能是宿主上别人的东西。
+e2e_dw_reap(){
+  # 登记表刻意放在 $E2E_TMP **之外**: 临时目录清理钩子会把它整个删掉, 登记表放里面就
+  # 会被孤儿化 —— 回收函数读不到 pid, 进程活到下一段落, 后续 pdg 撞全局锁一路连锁失败。
+  local pid
+  if [ -f /run/pdg-e2e-dw.pid ]; then
+    pid="$(cat /run/pdg-e2e-dw.pid 2>/dev/null)"
+    if [ -n "$pid" ]; then
+      kill "$pid" 2>/dev/null
+      local i=0; while [ $i -lt 40 ] && kill -0 "$pid" 2>/dev/null; do i=$((i+1)); sleep 0.05; done
+      kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
+    fi
+    rm -f /run/pdg-e2e-dw.pid
+  fi
+  [ -f /run/pdg-e2e-dw.rundir ] && {
+    rm -rf "$(cat /run/pdg-e2e-dw.rundir 2>/dev/null)"; rm -f /run/pdg-e2e-dw.rundir; }
+  rm -f /run/pdg-e2e-dw.log
+  return 0
+}
+
 e2e_reset_box(){
+  e2e_dw_reap
   # **必须是第一句**: 下面紧接着就 `systemctl disable --now …`, 而 /usr/local/bin 排在
   # PATH 前面 —— 上一支留下的桩会在这里被调到。先把影子桩撤掉, 再动任何 PATH 命令。
   e2e_purge_shadow_stub ip python3 py3-real || return 1
@@ -304,6 +326,7 @@ e2e_tmp_init(){
   else
     # 没走 e2e_enter 的脚本(如 e2e-rescue-10b.sh)也要能用, 那就自己建自己清。
     E2E_TMP="$(mktemp -d "${TMPDIR:-/tmp}/e2e-tmp.XXXXXX")" || return 1
+    e2e_add_exit_hook e2e_dw_reap
     e2e_add_exit_hook e2e_tmp_cleanup
   fi
   mkdir -p "$E2E_TMP" || return 1
@@ -334,6 +357,7 @@ e2e_enter(){
     # 容器由 CI 一次性创建, 但"一次性"这件事必须由本进程自己证明: 建一个带本轮 nonce 的
     # 一次性根并记下来, 之后所有破坏性操作都要落在它之内(见 e2e_guard_path)。
     e2e_sandbox_init "${E2E_DISPOSABLE:-/tmp/e2e-box.$$}" || exit 1
+    e2e_add_exit_hook e2e_dw_reap        # 最先注册: 真进程回收要先于沙箱拆除
     e2e_add_exit_hook e2e_sandbox_cleanup
     e2e_tmp_init || exit 1                 # e2e_reset_box 已经要用 $E2E_TMP, 必须先于它
     e2e_reset_box
@@ -559,21 +583,74 @@ mkdir -p "$D"
 echo "systemctl $*" >> "$CALLS"
 verb="$1"; shift
 now=0; [ "$1" = "--now" ] && { now=1; shift; }
+
+# ── pdg-dotwitness 专用: 只有这一个 unit 起**真的生产进程** ─────────────────
+# 为什么非这么做不可: 6.2B 的状态机装完 witness 会轮询 127.0.0.1:5399 有没有真在听,
+# 听不到就判"四件套没闭合"并精确回滚。那条判据是 P0 隔离门与 doctor 分级的地基, 绝不
+# 能为了迁就假 systemd 去放宽。所以反过来 —— 让桩在这一个 unit 上说真话。
+# 其它 unit 的行为逐字不变; 不做通用的"声明端口就模拟监听"框架。
+_dw_is(){ case "$1" in pdg-dotwitness|pdg-dotwitness.service) return 0;; *) return 1;; esac; }
+_dw_stop(){
+  [ -f "/run/pdg-e2e-dw.pid" ] || return 0
+  p=$(cat "/run/pdg-e2e-dw.pid" 2>/dev/null)
+  [ -n "$p" ] && kill "$p" 2>/dev/null
+  i=0; while [ $i -lt 40 ] && kill -0 "$p" 2>/dev/null; do i=$((i+1)); sleep 0.05; done
+  kill -0 "$p" 2>/dev/null && kill -9 "$p" 2>/dev/null
+  rm -f "/run/pdg-e2e-dw.pid"
+  return 0
+}
+_dw_start(){
+  _dw_stop
+  # 缺件一律 fail-closed, 不谎报成功
+  [ -f /opt/pdg-bot/dotwitness.py ] || return 1
+  [ -f /etc/privdns-gateway/dotwitness.env ] || return 1
+  ns=$(sed -n 's/^PDG_DOTWITNESS_SUFFIX=//p' /etc/privdns-gateway/dotwitness.env | tail -1)
+  [ -n "$ns" ] || return 1
+  mkdir -p /run/pdg-dotwitness && chmod 700 /run/pdg-dotwitness || return 1
+  echo /run/pdg-dotwitness > "/run/pdg-e2e-dw.rundir"      # 登记, 退出钩子按这个清
+  # setsid + 关掉继承的 fd 9: migrate_dotwitness 是在 pdg __migrate 内部跑的, 而 pdg
+  # 用 exec 9>LOCK + flock 持全局锁。子进程继承 fd 9 后, witness 常驻不退 = 锁一直被
+  # 握着, 同一支脚本里后续每个 pdg 调用都撞"已有 pdg 操作在运行"。真 systemd 没这
+  # 问题 —— 服务由 PID 1 拉起, 不是 pdg 的子进程。这里必须显式还原那个前提。
+  RUNTIME_DIRECTORY=/run/pdg-dotwitness PDG_DOTWITNESS_SUFFIX="$ns" \
+    setsid /usr/bin/python3 /opt/pdg-bot/dotwitness.py >>"/run/pdg-e2e-dw.log" 2>&1 9>&- <&- &
+  echo $! > "/run/pdg-e2e-dw.pid"
+  # 等它真的绑上再返回 —— 不 sleep 定额, 按事实判定
+  i=0
+  while [ $i -lt 60 ]; do
+    ss -lun 2>/dev/null | grep -q '127.0.0.1:5399' && return 0
+    kill -0 "$(cat "/run/pdg-e2e-dw.pid" 2>/dev/null)" 2>/dev/null || { rm -f "/run/pdg-e2e-dw.pid"; return 1; }
+    i=$((i+1)); sleep 0.05
+  done
+  return 1
+}
+_dw_alive(){ [ -f "/run/pdg-e2e-dw.pid" ] && kill -0 "$(cat "/run/pdg-e2e-dw.pid" 2>/dev/null)" 2>/dev/null; }
+
 case "$verb" in
   daemon-reload|reset-failed|preset|mask|unmask) exit 0;;
   enable)  for u in "$@"; do echo 1 > "$D/${u}.en"
              # .fail 标记 = 这个 unit "起得来但立刻崩" → 起完仍是 inactive
-             if [ "$now" = 1 ]; then [ -f "$D/${u}.fail" ] && echo 0 > "$D/${u}.ac" || echo 1 > "$D/${u}.ac"; fi
+             if [ "$now" = 1 ]; then
+               if [ -f "$D/${u}.fail" ]; then echo 0 > "$D/${u}.ac"
+               elif _dw_is "$u"; then _dw_start && echo 1 > "$D/${u}.ac" || echo 0 > "$D/${u}.ac"
+               else echo 1 > "$D/${u}.ac"; fi
+             fi
            done; exit 0;;
-  disable) for u in "$@"; do echo 0 > "$D/${u}.en"; [ "$now" = 1 ] && echo 0 > "$D/${u}.ac"; done; exit 0;;
+  disable) for u in "$@"; do echo 0 > "$D/${u}.en"
+             if [ "$now" = 1 ]; then echo 0 > "$D/${u}.ac"; _dw_is "$u" && _dw_stop; fi
+           done; exit 0;;
   start|restart) for u in "$@"; do
-                   [ -f "$D/${u}.fail" ] && echo 0 > "$D/${u}.ac" || echo 1 > "$D/${u}.ac"
+                   if [ -f "$D/${u}.fail" ]; then echo 0 > "$D/${u}.ac"
+                   elif _dw_is "$u"; then _dw_start && echo 1 > "$D/${u}.ac" || echo 0 > "$D/${u}.ac"
+                   else echo 1 > "$D/${u}.ac"; fi
                  done; exit 0;;
-  stop)    for u in "$@"; do echo 0 > "$D/${u}.ac"; done; exit 0;;
+  stop)    for u in "$@"; do echo 0 > "$D/${u}.ac"; _dw_is "$u" && _dw_stop; done; exit 0;;
   is-active)
       u="$1"; v=$(cat "$D/${u}.ac" 2>/dev/null)
       # 没记录过的: 有 unit 文件就当它在跑(模拟装好即运行), 否则 inactive
       [ -z "$v" ] && { [ -f "/etc/systemd/system/${u}.service" ] && v=1 || v=0; }
+      # witness 起的是真进程: 它自己崩了就不能再说 active(真 systemd 也不会)
+      if _dw_is "$u" && [ "$v" = 1 ] && ! _dw_alive; then v=0; echo 0 > "$D/${u}.ac"; fi
       [ "$v" = 1 ] && { echo active; exit 0; }; echo inactive; exit 3;;
   is-enabled)
       u="$1"; v=$(cat "$D/${u}.en" 2>/dev/null)
@@ -743,6 +820,10 @@ e2e_seed_install(){
   install -m755 "$E2E_ROOT/deploy/bot/pdg.sh" /usr/local/bin/pdg
   local f; for f in "$E2E_ROOT"/deploy/bot/*.py; do install -m755 "$f" /opt/pdg-bot/; done
   install -m755 "$E2E_ROOT/deploy/bot/pdg-bot.py" /opt/pdg-bot/bot.py
+  # install.sh 从第一版公开装机脚本(62443ad)起就写这个文件, 它是 DoT 域名的唯一真源。
+  # 夹具既然模拟"已装好的机器", 就得把它一起造出来 —— 少了它, 6.2B 的
+  # migrate_dotwitness 会以"域名缺失"返回 1, 把整条 __migrate 打红。
+  echo dot.e2e.test > /opt/pdg-bot/dot-domain
   printf 'PDG_BOT_TOKEN=x\nPDG_BOT_ALLOWED=1\n' > /etc/privdns-gateway/bot.env
 }
 
