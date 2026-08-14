@@ -253,7 +253,7 @@ cell 11 "before-image 少采 unit" \
 cell 112 "回滚不恢复 enabled/active" \
 '    if [[ "$e0" != enabled ]]; then systemctl disable pdg-dotwitness >/dev/null 2>&1 || true; fi
     if [[ "$a0" == active ]]; then
-      systemctl start pdg-dotwitness >/dev/null 2>&1 || bad=1
+      systemctl start pdg-dotwitness >/dev/null 2>&1 || rb_bad=1
     else
       systemctl stop pdg-dotwitness >/dev/null 2>&1 || true
     fi' \
