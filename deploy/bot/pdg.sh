@@ -2350,34 +2350,35 @@ migrate_dotwitness(){
     fi
   fi
 
-  # ④ before-image。三个持久文件 + 两个服务身份 + 迁移前 5399 是否已被占。
+  # ④ before-image。三个持久文件 + 两个服务身份。
+  # 不含 5399 占用: 该端口只由 pdg-dotwitness 绑, 回滚按 wit0 的 enabled/active 复原服务后
+  # 它自己会收敛(矩阵正是按有界轮询验收的), 产品这边没有独立的端口恢复动作要做。
   local bi="$work/before"; mkdir -p "$bi"
   _dw_snap_file "$DW_UNIT" "$bi" unit || { c_y "  ❌ 采集 unit before-image 失败"; rm -rf "$work"; return 1; }
   _dw_snap_file "$DW_ENV"  "$bi" env  || { c_y "  ❌ 采集 env before-image 失败";  rm -rf "$work"; return 1; }
   _dw_snap_file "$DW_MOS"  "$bi" mos  || { c_y "  ❌ 采集 mosdns before-image 失败"; rm -rf "$work"; return 1; }
   local wit0 mos0; wit0="$(_dw_svc_id pdg-dotwitness)"; mos0="$(_dw_svc_id mosdns)"
-  local port0; port0="$(ss -lun 2>/dev/null | grep -c '127.0.0.1:5399')"
   echo "$wit0" > "$bi/wit.id"; echo "$mos0" > "$bi/mos.id"
 
   # 失败时精确复原。复原不彻底要**明说**, 不许静默 —— 那比失败本身更危险。
   _dw_rollback(){
-    local bad=0
-    _dw_restore_file "$DW_UNIT" "$bi" unit || bad=1
-    _dw_restore_file "$DW_ENV"  "$bi" env  || bad=1
-    _dw_restore_file "$DW_MOS"  "$bi" mos  || bad=1
-    systemctl daemon-reload >/dev/null 2>&1 || bad=1
+    local rb_bad=0
+    _dw_restore_file "$DW_UNIT" "$bi" unit || rb_bad=1
+    _dw_restore_file "$DW_ENV"  "$bi" env  || rb_bad=1
+    _dw_restore_file "$DW_MOS"  "$bi" mos  || rb_bad=1
+    systemctl daemon-reload >/dev/null 2>&1 || rb_bad=1
     # 服务状态回到原样: 原来没启用的不许留成启用, 原来活着的必须活回来。
     local e0 a0; e0="$(_dw_kv "$wit0" UnitFileState)"; a0="$(_dw_kv "$wit0" ActiveState)"
     if [[ "$e0" != enabled ]]; then systemctl disable pdg-dotwitness >/dev/null 2>&1 || true; fi
     if [[ "$a0" == active ]]; then
-      systemctl start pdg-dotwitness >/dev/null 2>&1 || bad=1
+      systemctl start pdg-dotwitness >/dev/null 2>&1 || rb_bad=1
     else
       systemctl stop pdg-dotwitness >/dev/null 2>&1 || true
     fi
     if [[ "$(_dw_kv "$mos0" ActiveState)" == active ]]; then
-      systemctl restart mosdns >/dev/null 2>&1 || bad=1
+      systemctl restart mosdns >/dev/null 2>&1 || rb_bad=1
     fi
-    if [[ "$bad" == 1 ]]; then
+    if [[ "$rb_bad" == 1 ]]; then
       c_y "  ⚠️  回滚不完整 —— unit/env/mosdns 配置或服务状态可能没有完全复原。"
       c_y "     请人工核对 $DW_UNIT、$DW_ENV、$DW_MOS 与 systemctl status mosdns。"
       return 1
