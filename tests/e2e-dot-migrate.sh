@@ -71,7 +71,10 @@ if [[ "${PDG_E2E_ISOLATED:-}" != 1 || "$(id -u)" != 0 ]]; then
 fi
 
 # ── 载入被测函数。只取状态机那一段, 不 source 整个 pdg.sh(它有 main 分派) ──
-REPO_DIR="$E2E_ROOT"
+# 被 eval 进来的生产函数 migrate_dotwitness() 用 $REPO_DIR 取 unit 模板与 router
+# (deploy/bot/pdg.sh 里那两行)。消费发生在动态作用域里, 静态看不见 —— 用 export
+# 显式声明"给外部用", 既是事实也让 SC2034 不再误报。删掉它夹具会取不到模板。
+export REPO_DIR="$E2E_ROOT"
 c_g(){ echo "$@"; }
 c_y(){ echo "$@"; }
 _fn="$(python3 - "$E2E_ROOT" <<'PY'
@@ -263,7 +266,6 @@ cell3_phase(){
   want PREFLIGHT || return 0
   mark PREFLIGHT
   sect "3P. 候选校验失败的阶段顺序(不看最终状态)"
-  local mos0; mos0="$(sha256sum "$DW_MOS" | cut -c1-16)"
   i_cand
   if ! h_cand; then bad "3P 注入未命中"; u_cand; return; fi
   ok "3P 注入命中"

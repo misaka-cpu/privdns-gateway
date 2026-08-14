@@ -18,16 +18,16 @@ ev_n(){ ls /run/pdg-dotwitness/ 2>/dev/null | wc -l; }
 
 # 三种传输各 3 次, 记录耗时上限
 run9(){
-  local okc=0 t0 t1 ms worst=0 i
-  for i in 1 2 3; do
+  local okc=0 t0 t1 ms worst=0
+  for _ in 1 2 3; do
     t0=$(date +%s%N); dig +short +time=2 +tries=1 @127.0.0.1 example.com A >/dev/null 2>&1 && okc=$((okc+1))
     t1=$(date +%s%N); ms=$(( (t1-t0)/1000000 )); [ $ms -gt $worst ] && worst=$ms
   done
-  for i in 1 2 3; do
+  for _ in 1 2 3; do
     t0=$(date +%s%N); dig +short +tcp +time=2 +tries=1 @127.0.0.1 example.com A >/dev/null 2>&1 && okc=$((okc+1))
     t1=$(date +%s%N); ms=$(( (t1-t0)/1000000 )); [ $ms -gt $worst ] && worst=$ms
   done
-  for i in 1 2 3; do
+  for _ in 1 2 3; do
     t0=$(date +%s%N); python3 "$E2E_ROOT/tests/dotquery.py" example.com >/dev/null 2>&1 && okc=$((okc+1))
     t1=$(date +%s%N); ms=$(( (t1-t0)/1000000 )); [ $ms -gt $worst ] && worst=$ms
   done
