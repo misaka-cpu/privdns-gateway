@@ -875,6 +875,50 @@ jobs:
             if [ -e "$p" ]; then printf '%s\t%s\t%s\n' "$f" "$(stat -c %F "$p")" "$(sha256sum "$p" 2>/dev/null | cut -d' ' -f1)"
             else printf '%s\tabsent\t-\n' "$f"; fi
           done | sudo tee /tmp/stub-baseline.txt
+      # ⚠️ 临时只读诊断(用完即回退, 不是常设步骤)。
+      # "Python 语法损坏"那格在 runner 上判红而本地不复现; 本地量到的是 ~60ms 的 active
+      # 窗口, 但加了 4 秒轮询后 runner 仍全程 active —— 那个解释在这里不成立。
+      # 这一步只打印, 不断言、不改被测对象, 且用 `|| true` 保证不影响 job 结论。
+      - name: "TEMP 只读诊断: 语法损坏时的 unit 状态时间线"
+        run: |
+          set -uo pipefail
+          R="$PDG_DOTW_REPO"
+          echo "── 环境 ──"
+          systemctl --version | head -2
+          python3 -VV; command -v python3
+          echo "── 铺 unit 与 env(与用例同一套) ──"
+          sudo install -d -m755 /opt/pdg-bot /etc/privdns-gateway
+          sudo install -m755 "$R/deploy/bot/dotwitness.py" /opt/pdg-bot/dotwitness.py
+          sudo sed -e "s#__DOT_DOMAIN__#dot.sysd.test#g" \
+            "$R/deploy/bot/pdg-dotwitness.service" | sudo tee /etc/systemd/system/pdg-dotwitness.service >/dev/null
+          printf 'PDG_DOTWITNESS_SUFFIX=probe.dot.sysd.test\n' | sudo tee /etc/privdns-gateway/dotwitness.env >/dev/null
+          sudo systemctl daemon-reload
+          echo "── unit 生效后的关键属性 ──"
+          sudo systemctl show pdg-dotwitness -p Type -p Restart -p RestartUSec -p ExecStart \
+            -p DynamicUser -p RuntimeDirectory -p StartLimitIntervalUSec -p StartLimitBurst || true
+          echo "── 改坏成语法错, 起服务, 6 秒内每 100ms 采一次 ──"
+          sudo systemctl stop pdg-dotwitness 2>/dev/null || true
+          sudo systemctl reset-failed pdg-dotwitness 2>/dev/null || true
+          printf 'def (\n' | sudo tee /opt/pdg-bot/dotwitness.py >/dev/null
+          sudo systemctl start pdg-dotwitness 2>/dev/null || true
+          for i in $(seq 0 59); do
+            printf '  t=%4dms  is-active=%-12s SubState=%-12s Result=%-12s NRestarts=%s\n' \
+              "$((i*100))" \
+              "$(sudo systemctl is-active pdg-dotwitness 2>&1)" \
+              "$(sudo systemctl show pdg-dotwitness -p SubState --value 2>/dev/null)" \
+              "$(sudo systemctl show pdg-dotwitness -p Result --value 2>/dev/null)" \
+              "$(sudo systemctl show pdg-dotwitness -p NRestarts --value 2>/dev/null)"
+            sleep 0.1
+          done
+          echo "── 进程与 journal ──"
+          ps -eo pid,ppid,stat,etime,args | grep -E '[d]otwitness' || echo "  无 dotwitness 进程"
+          sudo systemctl status pdg-dotwitness --no-pager -l 2>&1 | head -20 || true
+          sudo journalctl -u pdg-dotwitness -n 30 --no-pager 2>&1 | tail -30 || true
+          echo "── 收尾: 还原 dotwitness.py, 停服务(用例自己还会重铺一遍) ──"
+          sudo systemctl stop pdg-dotwitness 2>/dev/null || true
+          sudo systemctl reset-failed pdg-dotwitness 2>/dev/null || true
+          sudo install -m755 "$R/deploy/bot/dotwitness.py" /opt/pdg-bot/dotwitness.py
+          true
       - name: "跑 e2e-dot-systemd.sh"
         run: |
           set -euo pipefail
