@@ -113,26 +113,39 @@ bad_case(){ # $1=名字 $2=准备命令
   systemctl stop pdg-dotwitness 2>/dev/null; systemctl reset-failed pdg-dotwitness 2>/dev/null
   eval "$2"
   systemctl start pdg-dotwitness 2>/dev/null; sleep 1.5
-  # 判据是"不许**停在** active", 所以不能单点采样: unit 是 Type=simple + Restart=on-failure
-  # + RestartSec=2, 像"Python 语法损坏"那种 exec 成功但进程随即退出的故障, 每个 ~2.05s
-  # 周期里有 ~60ms 处于 active(实测的状态时间线)。1.5s 这一刀落在哪一段取决于机器快慢,
-  # CI 上就真撞进去过一次, 于是本该绿的格判红。
-  # 改成有界轮询: 窗口内只要观察到一次非 active, 就证明服务没能留住 —— 全程 active 才是
-  # 假健康态。真的"起来了且一直活着"会把 4 秒轮询走满, 照样判红, 判据没有被放宽。
-  local act ev i=0
-  act=$(systemctl is-active pdg-dotwitness 2>/dev/null)
-  while [ "$act" = active ] && [ "$i" -lt 40 ]; do
-    sleep 0.1; act=$(systemctl is-active pdg-dotwitness 2>/dev/null); i=$((i+1))
+  # 判据不能盯 is-active 的瞬时值。Ubuntu runner 的 python3 带 apport: 语法错会走进
+  # apport 的 excepthook, 而本 unit 是 DynamicUser=yes + 只读根 —— apport 先
+  # `pwd.getpwuid(临时uid)` KeyError, 再往只读 /var/crash 写崩溃报告 OSError, 一来一回
+  # 让进程多活了约 4 秒(runner 实测; CPU 只花 211ms, 其余全在等 I/O)。这段时间
+  # Type=simple 让 unit 一直是 active/running, 而这个时长随 runner 负载浮动 ——
+  # 无论把采样点放在 1.5s 还是轮询 4s, 都是在跟一个不可控的外部因素赛跑。
+  #
+  # 改成等 systemd **记录下来的退出事实**: Result 不再是 success, 或 NRestarts 已经涨过,
+  # 都证明服务没能留住。这两个都是 systemd 落定后才写的, 不随采样时刻漂移。
+  # 窗口给足 30 秒(apport 慢但有限); 真的常驻服务会把窗口走满且三项都不变 —— 判据没放宽。
+  local act ev i=0 res nre
+  while [ "$i" -lt 300 ]; do
+    act=$(systemctl is-active pdg-dotwitness 2>/dev/null)
+    res=$(systemctl show pdg-dotwitness -p Result --value 2>/dev/null)
+    nre=$(systemctl show pdg-dotwitness -p NRestarts --value 2>/dev/null)
+    [ "$act" != active ] && break
+    [ "$res" != success ] && break
+    [ "${nre:-0}" -gt 0 ] && break
+    sleep 0.1; i=$((i+1))
   done
+  # 三项里任一成立即"没能留住": 当前不是 active / systemd 记下了非 success 的 Result /
+  # 已经重启过。三项都不成立才是真的停在 active。
+  local stayed_up=1
+  { [ "$act" != active ] || [ "$res" != success ] || [ "${nre:-0}" -gt 0 ]; } && stayed_up=0
   ev=$([ -f /run/pdg-dotwitness/evidence.json ] && echo 有 || echo 无)
   q "$L.probe.dot.sysd.test" >/dev/null 2>&1
   sleep 0.3
   local ev2; ev2=$([ -f /run/pdg-dotwitness/evidence.json ] && echo 有 || echo 无)
-  printf "       %s: active=%s evidence=%s→%s\n" "$1" "$act" "$ev" "$ev2"
+  printf "       %s: active=%s Result=%s NRestarts=%s evidence=%s→%s\n" "$1" "$act" "$res" "${nre:-0}" "$ev" "$ev2"
   [ "$ev2" = 无 ] && ok "$1: 不写 evidence" || bad "$1: 写了 evidence"
   # 收紧后的契约: 配置缺失/非法必须**启动失败**, 不许停在 active ——
   # "active 但永远不认任何查询"是假健康态, 运维看 active 就以为没事。
-  [ "$act" != active ] && ok "$1: service 未保持 active(实得 $act)" \
+  [ "$stayed_up" = 0 ] && ok "$1: service 未保持 active(实得 $act Result=$res NRestarts=${nre:-0})" \
     || bad "$1: 仍然 active —— 假健康态"
   ss -lunp 2>/dev/null | grep -q "127.0.0.1:5399" \
     && bad "$1: 仍然绑着端口" || ok "$1: 不绑端口"
