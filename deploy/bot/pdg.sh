@@ -2424,6 +2424,45 @@ migrate_dotwitness(){
     _dw_rollback; rm -rf "$work"; return 1
   fi
 
+  # ⑦b 在听的必须**是我们这个 witness**。上面那道门只问"有没有人在听", 外来监听者
+  # 一样能满足它: witness 自己 bind 失败时(dotwitness.py 返回 4)Restart=on-failure
+  # 会不停重试, 而 Type=simple 让它某一轮仍被判 active —— 端口始终在别人手里, 迁移
+  # 却返回 0 并打出"已就绪"。这不是推演: 占位进程全程持有 5399 时两次复现均如此。
+  #
+  # 判据取 systemd 记的 MainPID 与 ss -lunp 报的持有者比。MainPID 会因自动重启变化,
+  # 所以有界重采样取稳定值, 不做单点判断。
+  #
+  # 拿不到归属就**放行**: 非 root 的 ss 不输出 users: 字段, 精简系统可能根本没有 ss。
+  # 那是环境能力不足, 不是"端口被别人占着"的证据 —— 把未知当成不匹配, 只会让本来
+  # 正常的迁移在这些机器上开始失败。放行时说明白为什么没校验, 不假装校验过。
+  _dw_listener_pids(){
+    ss -lunp 2>/dev/null | grep '127\.0\.0\.1:5399' \
+      | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u
+  }
+  local _lp _mp _k=0 _seen_mp="" _match=0
+  _lp="$(_dw_listener_pids)"
+  if [[ -z "$_lp" ]]; then
+    c_y "  ⚠️  取不到 5399 监听者的进程归属(需要 root 的 ss -p), 本次跳过归属校验。"
+  else
+    while [[ $_k -lt 12 ]]; do
+      _mp="$(systemctl show pdg-dotwitness -p MainPID --value 2>/dev/null)"
+      # 只记**非 0** 的 MainPID: 自动重启退避期间它是 0, 那不是"witness 的 PID",
+      # 拿它去比或者拿它去报错都会说错话。
+      if [[ -n "$_mp" && "$_mp" != 0 ]]; then
+        _seen_mp="$_mp"
+        grep -qx -- "$_mp" <<< "$_lp" && { _match=1; break; }
+      fi
+      sleep 0.25; _k=$((_k+1))
+      _lp="$(_dw_listener_pids)"
+      [[ -z "$_lp" ]] && break        # 中途变成拿不到 → 按"未知"处理, 不判失败
+    done
+    if [[ -n "$_lp" && -n "$_seen_mp" && "$_match" != 1 ]]; then
+      c_y "  ❌ 127.0.0.1:5399 被别的进程占着(持有者 PID $(tr '\n' ' ' <<< "$_lp")," \
+          "pdg-dotwitness 观察到的 MainPID 是 $_seen_mp), 证据端并没有真正接管这个端口, 正在回滚。"
+      _dw_rollback; rm -rf "$work"; return 1
+    fi
+  fi
+
   local changed=$((need_reload + need_mos + need_wit))
   if [[ "$changed" == 0 ]]; then
     rm -rf "$work"; return 0          # 全都健康且无变化: 零写盘、零 reload、零 restart
