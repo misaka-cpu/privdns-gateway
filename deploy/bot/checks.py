@@ -863,6 +863,47 @@ def check_deep_probe81():
     return ("ok", ":81 探测端点", "返回 200 ✓") if code == "200" \
         else ("fail", ":81 探测端点", f"返回 {code or '无响应'}(需要 200)")
 
+def check_deep_dot_witness():
+    """DoT 证据端(pdg-dotwitness)。**独立于关键 DNS 服务集**。
+
+    为什么不放进 expected_services(): 那是"普通 DNS 能不能用"的判据集。witness 只是
+    链路诊断用的旁路观察端 —— 它挂了, mosdns、mihomo、普通解析一点不受影响(P0 隔离门
+    实测两种故障下 UDP/TCP/DoT 各 9/9)。把它算进关键服务, 等于让一个辅助件的故障把
+    整台机器判成坏的。所以异常一律用 warn 级, 不用 fail。
+
+    反过来也不能装看不见: 四件套缺一件就会出现"service active 却查不到证据"那种假健康,
+    而上层据此会对用户说"你手机的加密 DNS 没到达网关" —— 那是假话。所以要独立报出来。
+
+    文案只说部署状态, 不碰 probe label、qname、token、来源地址或 evidence 内容。
+    """
+    unit = "/etc/systemd/system/pdg-dotwitness.service"
+    if not os.path.exists(unit):
+        return ("warn", "DoT 证据端", "未安装 —— 手机 DoT 证据这项会一直报不可判断")
+    st = _run(["systemctl", "is-active", "pdg-dotwitness"])[1].strip()
+    if st == "failed" or _run(["systemctl", "is-failed", "pdg-dotwitness"])[1].strip() == "failed":
+        return ("warn", "DoT 证据端", "服务 failed(不影响普通 DNS, 但证据采不到)")
+    if st != "active":
+        return ("warn", "DoT 证据端", f"服务 {st or '未运行'}(不影响普通 DNS, 但证据采不到)")
+    env = "/etc/privdns-gateway/dotwitness.env"
+    try:
+        suffix = ""
+        for line in open(env, encoding="utf-8"):
+            if line.startswith("PDG_DOTWITNESS_SUFFIX="):
+                suffix = line.split("=", 1)[1].strip()
+        if not suffix or suffix.startswith(".") or suffix.endswith(".") or ".." in suffix:
+            return ("warn", "DoT 证据端", "环境文件里的探测命名空间不合法")
+    except OSError:
+        return ("warn", "DoT 证据端", "环境文件缺失或读不到")
+    # 只认回环。绑到别的地址等于把证据端暴露给内网, 那是硬错不是提示。
+    _, out, _ = _run(["ss", "-lun"])
+    lines = [l for l in out.splitlines() if ":5399" in l]
+    if not lines:
+        return ("warn", "DoT 证据端", "服务在跑但没有在 5399 监听(四件套未闭合)")
+    if not all("127.0.0.1:5399" in l for l in lines):
+        return ("warn", "DoT 证据端", "5399 绑定了非回环地址 —— 证据端不该对内网可见")
+    return ("ok", "DoT 证据端", "已部署, 仅监听 127.0.0.1:5399 ✓")
+
+
 def check_deep_dns_cn():
     # 本机源(127.0.0.1)不在内网卡段 → 走 remote_upstream; 国内域名应得真实 IP(非本机)
     _, out, _ = _run(["dig", "+short", "+time=3", "+tries=1", "@127.0.0.1", "www.qq.com", "A"])
@@ -1480,7 +1521,7 @@ ALL = [check_platform, check_services, check_bot_credentials, check_health_timer
        check_cert, check_dns, check_core_config, check_rulesets, check_rule_precedence,
        check_mitm_structure, check_mitm, check_transactions]
 ALERT = [check_services, check_dns, check_cert]  # healthcheck 用的轻量子集(运行期故障)
-DEEP = [check_deep_dot_handshake, check_deep_probe81, check_deep_dns_cn,
+DEEP = [check_deep_dot_handshake, check_deep_probe81, check_deep_dot_witness, check_deep_dns_cn,
         check_deep_clash, check_deep_upstreams, check_deep_hijack_note]  # pdg doctor --deep 追加
 
 def run(funcs=None):

@@ -139,9 +139,52 @@ plugins:
       - exec: jump has_resp
       - exec: $ecs_neutral
       - exec: $remote_upstream
+  # 6.2A DoT 证据: 把探测查询交给只绑回环的证据端。
+  #
+  # 端口在这里写成**字面量**, 不用占位符。原因是实测出来的: 这份模板不止 install.sh 一个
+  # 渲染点, 还有十来处测试 harness(含被间接 source 的 tests/e2e-lib.sh)各自带一份 sed 表。
+  # 占位符一旦落在"必须解析成端口"的位置, 任何一个没跟上的渲染点都会让 mosdns 直接起不来
+  # (报 invalid port ... after host), 一次就打红了 14 支既有测试。
+  # 注意: 这段注释里也不能出现占位符形状的字面 token —— 注释会原样进入渲染产物,
+  # 而好几个渲染点末尾有"零占位符"断言, 写了就会被它们判红。
+  #
+  # 代价是 YAML 与 deploy/bot/dotwitness.py 各存一份端口值。这不是单一真源, 所以用硬门
+  # 兜住: tests/test-dot-render.py 从两边分别读出来比对, 任一侧漂移即判红。
+  # 不要手工编辑下面这一段(起止标记之间的内容由 pdg 管理)。
+  # >>> pdg-dotwitness managed block (plugins)
+  # 这对起止标记是**新装模板与升级迁移共用**的唯一识别依据。v1.9.0 装出来的机器盘上
+  # 没有这一段, 而 pdg update 从不用模板重渲这个文件 —— migrate_dotwitness 靠这对标记
+  # 判断"我们管的那段在不在、完不完整", 而不是靠"看见 dotwitness_fwd 就当装好了":
+  # 后者认不出半安装(有插件没分支 / 有分支没插件), 那种状态比没装更糟。
+  - tag: dotwitness_fwd
+    type: forward
+    args:
+      concurrent: 1
+      upstreams:
+        - addr: "udp://127.0.0.1:5399"
+  - tag: probe_seq
+    type: sequence
+    args:
+      - exec: $dotwitness_fwd
+      - exec: jump has_resp
+  # <<< pdg-dotwitness managed block (plugins)
   - tag: main_sequence
     type: sequence
     args:
+      # ── 探测命名空间: 两个条件同时成立才进(matches 列表是**与**, 已用钉定版本实测) ──
+      #   1) qname 落在 `probe.<DoT域名>` 之下;
+      #   2) TLS SNI 恰好等于 DoT 域名 —— 明文 UDP/TCP 53 的 server_name 恒为空字符串,
+      #      所以它们永远进不来。这一条就是"经过 DoT"的判据本身。
+      # 位置必须在 internal_sequence(以及它里面的 lazy_cache)之前: 排在缓存之后的话,
+      # 同一 label 第二次查就可能直接命中缓存, 根本到不了证据端。
+      # 只影响这个命名空间: 任何其它 qname 一个判据都不满足, 逐字节走原来的路。
+      # 不要手工编辑下面这一段(起止标记之间的内容由 pdg 管理)。
+      # >>> pdg-dotwitness managed block (main_sequence)
+      - matches:
+          - qname suffix probe.__DOT_DOMAIN__
+          - string_exp server_name eq __DOT_DOMAIN__
+        exec: goto probe_seq
+      # <<< pdg-dotwitness managed block (main_sequence)
       - matches: client_ip $npn_clients
         exec: goto internal_sequence
       - matches: qname $geosite_unlock

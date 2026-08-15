@@ -28,13 +28,18 @@ import json
 import os
 import re
 import secrets
+import subprocess
 import sys
 import time
 
 # 2: 会话记录新增必填字段 internal_cidr(见 new_session 的说明)。旧状态没有这个字段,
 # 而"缺了就从 profile.env 补"恰恰是这次要根除的东西 —— 所以升版号让 read_state 直接
 # fail-closed。会话本来只有 300 秒寿命, 升级后最多让人重开一次测试。
-SCHEMA_VERSION = 2
+# 3: 6.2B 新增 probe_label_sha256 与 observer。同样必填、同样 fail-closed ——
+#    v2 记录里这两样都没有, 而"没有就当观察端一直可用"正是这轮要根除的误判来源。
+#    不做原地伪升级(补几个默认值假装是 v3): 那等于凭空造出一个我们从未观测过的
+#    observer 身份, 结算时会拿它去证明"全程可用"。
+SCHEMA_VERSION = 3
 RUNTIME_DIR = "/run/pdg-probe81"
 STATE_NAME = "session.json"
 STATE_MAX_BYTES = 4096
@@ -177,7 +182,7 @@ def read_state():
         return None, R_STATE_CORRUPT
     # internal_cidr 与其它几个一样是必填。缺了不猜、不从 profile 补 —— 那正是 P0 的来源。
     for k in ("session_id", "token_sha256", "created_at", "expires_at", "state",
-              "internal_cidr"):
+              "internal_cidr", "probe_label_sha256", "observer"):
         if k not in rec:
             return None, R_STATE_CORRUPT
     # 动态 UID 换过之后不许误读上一任留下的会话。RuntimeDirectory 停服即销毁, 正常
@@ -205,7 +210,58 @@ def _expired(rec, now=None):
     return (now if now is not None else _now()) >= rec.get("expires_at", 0)
 
 
-def new_session(internal_cidr, probe_domain=None, metrics_baseline=None):
+def new_probe_label():
+    """本次 session 的 DoT 探测标识: 12 随机字节 → 24 位小写 hex(96 bit)。
+
+    为什么**不复用** HTTP token: 两条链路证明的是不同的事(:81 证明来源在内网段,
+    DoT 探测证明查询经过了 DoT 接收路径), 它们各自的暴露面也不同 —— token 会出现在
+    用户点开的 URL 里、可能进浏览器历史; label 会出现在 DNS 查询名里、会被沿途的
+    解析器看到。同一个值同时走两条路, 等于让其中一条的泄露把另一条也带塌。
+
+    形状必须与 dotwitness.LABEL_RE 完全一致 —— 那边是 fail-closed 的白名单, 这边
+    生成的东西不合它的形状就永远匹配不上, 而且是静默匹配不上。
+    """
+    return secrets.token_bytes(12).hex()
+
+
+def observer_identity(unit="pdg-dotwitness.service"):
+    """观察端的**启动身份**快照。返回 dict, 任何读不到的部分都留空而不是猜。
+
+    为什么不能只看结算时的 is-active: 那只证明"现在活着", 不证明"整个窗口都活着"。
+    窗口中崩一次再拉起来, is-active 照样是 active, 而那段时间里手机的查询根本没人接 ——
+    据此说"没观测到"就是在撒谎。InvocationID 每次启动都换(实测: restart 变、
+    kill -9 后自动重启也变、无事件时稳定), 拿它当"同一段运行"的身份正好。
+
+    解析按 KEY=VALUE, **不按输出位置**: 实测请求 `-p SubState -p ActiveState` 得到的
+    顺序是 ActiveState 在前, 位置取值必然错位。
+    """
+    out = {"unit": unit, "invocation_id": "", "active_state": "",
+           "sub_state": "", "n_restarts": "", "installed": False}
+    try:
+        p = subprocess.run(
+            ["systemctl", "show", unit, "--no-pager",
+             "-p", "InvocationID", "-p", "ActiveState", "-p", "SubState",
+             "-p", "NRestarts", "-p", "LoadState"],
+            capture_output=True, text=True, timeout=10)
+    except Exception:  # noqa: BLE001
+        return out
+    kv = {}
+    for line in (p.stdout or "").splitlines():
+        if "=" in line:
+            k, _, v = line.partition("=")
+            kv[k.strip()] = v.strip()
+    out["invocation_id"] = kv.get("InvocationID", "")
+    out["active_state"] = kv.get("ActiveState", "")
+    out["sub_state"] = kv.get("SubState", "")
+    out["n_restarts"] = kv.get("NRestarts", "")
+    # 不存在的 unit: systemctl show 仍然 rc=0, 只是值全空(实测) —— 所以不能看 rc,
+    # 要看 LoadState。loaded 之外(not-found / masked / error)一律当没装。
+    out["installed"] = kv.get("LoadState", "") == "loaded"
+    return out
+
+
+def new_session(internal_cidr, probe_domain=None, metrics_baseline=None,
+                probe_label=None):
     """建一次新会话。同时最多 1 个 —— 直接覆盖旧的, 旧 token 当场失效。
 
     `internal_cidr` 是**本次会话的判断基准快照**, 由 root 侧从 profile.env 读出并规范化后
@@ -215,8 +271,14 @@ def new_session(internal_cidr, probe_domain=None, metrics_baseline=None):
         建立时的网段判断; 想用新网段就重开一次测试。诊断过程中判据不该在脚下变。
 
     返回 (token, rec)。token **只在这里**以原文形式存在, 之后一律只留 sha256。
+
+    `probe_label` 由调用方(start_session)生成并传入 —— 明文的持有者只能有一个, 让它
+    留在最外层比在这里生成再传出去更难写错。不传就现生成一个: 记录里永远有摘要, 缺
+    这个字段的会话在结算时会被判 UNAVAILABLE, 那不是"更安全"而是更难查。明文在这里
+    **用完即弃**, 一个字节都不进记录。
     """
     token = secrets.token_urlsafe(TOKEN_BYTES)
+    probe_label = probe_label or new_probe_label()
     now = _now()
     uid, _g = _dir_owner()
     rec = {
@@ -235,6 +297,13 @@ def new_session(internal_cidr, probe_domain=None, metrics_baseline=None):
         "source": None,
         "metrics_baseline": metrics_baseline,
         "owner_uid": uid,
+        # ── 6.2B: DoT 侧的关联与观察端身份 ──────────────────────────────
+        # 只存摘要。明文 label 若落进这里, 任何能读到 session.json 的人(probe81 的
+        # 动态 UID 就能)都可以自己发一条查询把证据造出来 —— 证据就不再证明任何事。
+        "probe_label_sha256": hashlib.sha256(probe_label.encode("ascii")).hexdigest(),
+        # 建会话时刻的观察端启动身份。结算时要求它没变过 —— 这是"观察端覆盖了完整
+        # 窗口"的唯一证明。这里读不到就留 None, 结算时一律 UNAVAILABLE, 不猜。
+        "observer": observer_identity(),
     }
     return token, rec
 
@@ -413,7 +482,11 @@ def start_session():
     except Exception:  # noqa: BLE001
         baseline = None
     domain = make_probe_domain()
-    token, rec = new_session(cidr, probe_domain=domain, metrics_baseline=baseline)
+    # 明文 probe label 的**唯一**持有者就是这一层。它进不了状态文件(那里只有摘要),
+    # 也不进日志 —— 和 token 一样, 只允许出现在交给用户的那一次返回值里。
+    probe_label = new_probe_label()
+    token, rec = new_session(cidr, probe_domain=domain, metrics_baseline=baseline,
+                             probe_label=probe_label)
     if not write_state(rec):
         return False, {"error": "会话状态写不下去(%s 不可写?)" % _runtime_dir(),
                        "reason": R_STATE_UNWRITABLE}
@@ -422,6 +495,9 @@ def start_session():
         "expires_at": rec["expires_at"],
         "ttl_secs": rec["ttl_secs"],
         "probe_domain": domain,
+        # 第 2 步要查的那个名字。label 在这里第一次也是最后一次以明文出现。
+        "probe_label": probe_label,
+        "probe_qname": ("%s.probe.%s" % (probe_label, domain)) if domain else None,
         "step1_url": "http://%s:81/probe?t=%s" % (ip, token),
         "step2_url": "http://%s/" % domain if domain else "(DoT 域名未配置, 第 2 步不可用)",
     }

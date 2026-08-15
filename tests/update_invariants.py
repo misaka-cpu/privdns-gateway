@@ -192,7 +192,9 @@ def capture(args):
     # 数量是**故意钉死**的: 装机清单少一项就是整块能力静默降级, 多一项也该有人过目。
     # 6.1C 加了 nftlive.py(doctor 与 linkstat 共用的防火墙语义核心, 两边都 import 它,
     # 不装它 doctor 的防火墙检查会直接 ImportError), 因此两个平台各 +1。
-    expect = {"android": 26, "ios": 32}.get(plat)
+    # 6.2B 加了 dotwitness.py(linkstat 经它的 read_evidence 取 DoT 证据; 证据校验器
+    # 只能有一份, 不装它 linkstat 就只能永远报"不可判断"), 两个平台再各 +1。
+    expect = {"android": 27, "ios": 33}.get(plat)
     if expect is not None and len(members) != expect:
         raise SystemExit("manifest 数量漂移: %s 平台应为 %d 项, 实得 %d" % (plat, expect, len(members)))
 

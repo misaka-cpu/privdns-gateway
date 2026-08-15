@@ -25,6 +25,7 @@ NOT_OBSERVED 是**独立状态**, 既不能升成 PASS 也不能降成 FAIL —�
 只读约束: 不取全局配置写锁、不开事务、不写任何配置/快照/状态/缓存/审计文件、不重启服务、
 不跑迁移。配置坏了只报告, 不代为修复。
 """
+import hmac
 import json
 import os
 import re
@@ -74,6 +75,9 @@ CODES = (
     # 阶段 3 因 mosdns API 的安全问题停止(见 tests/test-link-dns-evidence.py)。留在
     # 闭集里是因为模型契约已定, 但当前唯一会出现的是 METRICS_UNAVAILABLE。
     "L6_DOT_PROBE_WINDOW_OBSERVED", "L6_DOT_PROBE_NOT_OBSERVED",
+    # 6.2B: 窗口还开着时的等待态。它**不是**三个终态之一 —— 把"还在等"
+    # 塞进 NOT_OBSERVED 会让用户以为已经有结论了。
+    "L6_DOT_PROBE_PENDING",
     "L6_DOT_METRICS_UNAVAILABLE",
     "L7_REDIRECT_READY", "L7_REDIRECT_RULE_MISSING",
     "L8_SERVICES_READY", "L8_MOSDNS_DOWN", "L8_MIHOMO_DOWN",
@@ -408,6 +412,97 @@ def _l5_tls(ctx):
     return out
 
 
+# ── 6.2B: 手机 DoT 探测的三态裁决 ─────────────────────────────────────────
+DOT_OBSERVED = "OBSERVED"
+DOT_NOT_OBSERVED = "NOT_OBSERVED"
+DOT_UNAVAILABLE = "UNAVAILABLE"
+DOT_PENDING = "PENDING"          # 窗口还没结束 —— 不是终态, 别塞进上面三个里
+
+# 观察端"这一刻能算数"的状态。activating/deactivating/failed 都不算 —— 它们要么
+# 还没开始接包, 要么已经不接了, 而窗口里那段时间正是我们要给结论的时间。
+_OBS_LIVE = "active"
+
+
+def dot_probe_state(sess, ev_status, ev_rec, observer_now, now):
+    """返回 (三态, 理由码)。纯函数, 不碰文件、不跑子进程 —— 真值表才好逐格钉死。
+
+    这里唯一不能犯的错是**假阳性**: 观察端没在看的时候说"看见了"。取证类结论一旦
+    可能撒谎, 它的全部价值就没了。所以判定顺序是先证明"我确实全程在看", 再看证据。
+
+    NOT_OBSERVED 是个很强的断言 —— 它等于"我全程盯着, 确实没来"。证明不了连续可用
+    就只能说 UNAVAILABLE。把"没看见"和"没在看"混成一件事, 是这套证据最容易骗人的地方。
+
+    evidence 一律由 dotwitness.read_evidence 给出(ev_status/ev_rec), 这里**不**自己
+    解析任何文件 —— 第二份校验器迟早会和第一份对"什么算有效"给出不同答案。
+    """
+    import dotwitness
+
+    # ① 会话本身: 没有会话记录/没有关联摘要, 无从判断
+    if not isinstance(sess, dict) or not sess.get("probe_label_sha256"):
+        return DOT_UNAVAILABLE, "NO_SESSION_LABEL"
+
+    # ② 建会话时的观察端身份。当时就读不到 → 那一刻起就没有可信基线
+    was = sess.get("observer") or {}
+    inv0 = was.get("invocation_id") or ""
+    if not inv0:
+        return DOT_UNAVAILABLE, "OBSERVER_UNKNOWN_AT_START"
+
+    # ③ 结算时的观察端身份
+    nowobs = observer_now or {}
+    if not nowobs.get("installed"):
+        return DOT_UNAVAILABLE, "OBSERVER_NOT_INSTALLED"
+    if nowobs.get("active_state") != _OBS_LIVE:
+        return DOT_UNAVAILABLE, "OBSERVER_NOT_ACTIVE"
+    inv1 = nowobs.get("invocation_id") or ""
+    if not inv1:
+        return DOT_UNAVAILABLE, "OBSERVER_IDENTITY_UNREADABLE"
+    if inv1 != inv0:
+        # 窗口中重启过。中间那段没人接包, 说"没观测到"就是撒谎。
+        return DOT_UNAVAILABLE, "OBSERVER_RESTARTED"
+
+    # ④ 读取通道本身出问题 → 我们没看见, 不代表它没发生
+    if ev_status == dotwitness.READ_DENIED:
+        return DOT_UNAVAILABLE, "EVIDENCE_UNREADABLE"
+    if ev_status == dotwitness.READ_CORRUPT:
+        return DOT_UNAVAILABLE, "EVIDENCE_CORRUPT"
+
+    # ⑤ 到这里连续可用性已经证明。现在才轮到看证据本身。
+    t0 = sess.get("created_at")
+    t1 = sess.get("expires_at")
+    if not isinstance(t0, (int, float)) or not isinstance(t1, (int, float)):
+        return DOT_UNAVAILABLE, "NO_SESSION_WINDOW"
+
+    if ev_status == dotwitness.READ_OK and isinstance(ev_rec, dict):
+        # transport 不是 dot: read_evidence 的闭集本该挡掉。真拿到了说明读取通道
+        # 与校验器不一致 —— 不是"没观测到", 是这套东西现在不可信。
+        if ev_rec.get("transport") != "dot":
+            return DOT_UNAVAILABLE, "EVIDENCE_TRANSPORT_MISMATCH"
+        obs_at = ev_rec.get("observed_at")
+        exp_at = ev_rec.get("expires_at")
+        same = hmac.compare_digest(str(ev_rec.get("probe_label_sha256") or ""),
+                                   str(sess["probe_label_sha256"]))
+        in_window = (isinstance(obs_at, (int, float)) and t0 <= obs_at <= t1)
+        if same and in_window:
+            # 命中了本次会话、且落在窗口内。剩下只看这份记录还在不在它自己的有效期内。
+            if isinstance(exp_at, (int, float)) and now <= exp_at:
+                return DOT_OBSERVED, "MATCHED"
+            # 过期的匹配记录**不能**降成 NOT_OBSERVED —— 我们手里拿着一份写着"它来过"
+            # 的记录, 却对用户说"没来过", 那是明着撒谎。只能说这份证据已经不作数了。
+            return DOT_UNAVAILABLE, "EVIDENCE_STALE"
+
+    if now < t1:
+        # 窗口还开着, 还有机会。沿用会话本来的等待态, 不给终态。
+        return DOT_PENDING, "WINDOW_OPEN"
+
+    # 窗口关了、没有匹配。要说出 NOT_OBSERVED("我全程盯着, 确实没来"), 还差最后一环:
+    # **假如它真的来过, 现在还看得见吗**。witness 写下的证据只活 EVIDENCE_TTL_SECS,
+    # 窗口最早那一刻(t0)写下的记录到 t0+TTL 就到期 —— 过了这个点, "看不见"既可能是
+    # 没来过, 也可能是来过但已经过期, 两者分不开。分不开就不许下负面结论。
+    if now > t0 + dotwitness.EVIDENCE_TTL_SECS:
+        return DOT_UNAVAILABLE, "RETENTION_EXPIRED"
+    return DOT_NOT_OBSERVED, "WINDOW_CLOSED_NO_MATCH"
+
+
 def _l6_dns(_ctx):
     out = []
     rc, ans, _ = checks._run(
@@ -426,17 +521,85 @@ def _l6_dns(_ctx):
             evidence_source="本机 dig @127.0.0.1",
             next_step="systemctl status mosdns; sudo pdg doctor --deep",
             blocks_downstream=True))
-    out.append(Finding(
-        6.5, "L6_DOT_METRICS_UNAVAILABLE", NOT_OBSERVED, None, "手机 DoT 查询证据",
-        # 这里只留结论。为什么不采集(接口暴露面、缓存导出、投喂端点、本机 SSRF、反向代理
-        # 隔离不了上游端口)是给维护者看的论证, 放在 README 与 docs/ROADMAP.md ——
-        # 用户在自检里看到一串内部实现名词, 既看不懂也无从处置。
-        "当前版本暂不采集这项证据，因此无法判断手机的 DoT 查询是否到达；"
-        "这不代表正常，也不代表故障。",
-        evidence_source="none(本版本不采集 DNS 侧证据)",
-        next_step="可先完成 HTTP 链路测试；DNS 实时证据将在后续版本重新设计。"
-                  "技术原因见项目路线图。"))
+    out.append(_l6_dot())
     return out
+
+
+def _l6_dot():
+    """第 6.5 层: 手机这次探测的 DoT 查询到没到过网关的 DoT 接收路径。
+
+    四种结局对应 dot_probe_state 的四个返回值。这里只做**接线**: 取会话、取观察端
+    身份、经 dotwitness 的只读入口取证据, 然后把裁决结果翻成给人看的话。判定逻辑一律
+    在 dot_probe_state 里 —— 采集器里再写一遍 if, 两处迟早会分叉。
+
+    证据一律走 dotwitness.read_evidence(): 不在这里开文件、不在这里解析 JSON、不在这里
+    判 owner/mode/schema。第二份校验器必然比第一份松, 而"松"在取证场景里就等于会撒谎。
+
+    这一层**不产生** source_ipv4_16, 也不覆盖第 1/2 层的 HTTP 来源归属: 查询转发到
+    witness 时手机的原始地址早就没了(6.2A 实测源地址恒为 127.0.0.1)。
+    """
+    rec, _why, _m = _session()
+    try:
+        import dotwitness
+        import linksess
+    except Exception:  # noqa: BLE001
+        return Finding(
+            6.5, "L6_DOT_METRICS_UNAVAILABLE", NOT_OBSERVED, None, "手机 DoT 查询证据",
+            "读不到证据端模块，无法判断手机的 DoT 查询是否到达；"
+            "这不代表正常，也不代表故障。",
+            evidence_source="none(证据端模块不可用)")
+
+    observer = linksess.observer_identity()
+    ev_status, ev_rec = dotwitness.read_evidence()
+    state, why = dot_probe_state(rec, ev_status, ev_rec, observer, time.time())
+
+    if state == DOT_OBSERVED:
+        return Finding(
+            6.5, "L6_DOT_PROBE_WINDOW_OBSERVED", PASS, None, "手机 DoT 查询证据",
+            "本次测试期间，网关的 DoT 接收路径上出现了这次测试专属的探测查询。"
+            "这说明手机的加密 DNS 查询确实到达了网关；"
+            "它**不**说明手机整体联网正常，也不说明其它查询走的是同一条路。",
+            evidence_source="pdg-dotwitness 每会话证据(只有随机标识的摘要，无查询内容)",
+            observed_at=(ev_rec or {}).get("observed_at"))
+    if state == DOT_PENDING:
+        return Finding(
+            6.5, "L6_DOT_PROBE_PENDING", NOT_OBSERVED, None, "手机 DoT 查询证据",
+            "测试还在进行中，暂时还没有看到这次测试专属的探测查询。"
+            "请在手机上完成第 2 步。",
+            evidence_source="pdg-dotwitness 每会话证据",
+            next_step="在手机上打开 `pdg link session start` 给出的第 2 步地址。")
+    if state == DOT_NOT_OBSERVED:
+        return Finding(
+            6.5, "L6_DOT_PROBE_NOT_OBSERVED", NOT_OBSERVED, None, "手机 DoT 查询证据",
+            "本次测试全程都在观察，但没有看到这次测试专属的探测查询到达网关的 "
+            "DoT 接收路径。常见原因是手机没有走这台网关的加密 DNS。",
+            evidence_source="pdg-dotwitness 每会话证据(全程可用，无匹配记录)",
+            next_step="确认手机上的 DNS 配置已启用，并重新做一次测试。")
+    # UNAVAILABLE —— 说不出结论时就说说不出, 不拿"没看到"顶替。理由码留给维护者,
+    # 给用户的那句话不带内部名词。
+    return Finding(
+        6.5, "L6_DOT_METRICS_UNAVAILABLE", NOT_OBSERVED, None, "手机 DoT 查询证据",
+        "这次无法判断手机的 DoT 查询是否到达（%s）；这既不代表正常，也不代表故障。"
+        % _DOT_WHY_HUMAN.get(why, "证据不可用"),
+        evidence_source="none(%s)" % why,
+        next_step="重新开始一次测试；若反复出现，检查证据端服务是否在运行。")
+
+
+# 给用户看的原因。刻意都是"我们这边"的说法 —— 这些情形没有一条能推出手机有问题。
+_DOT_WHY_HUMAN = {
+    "NO_SESSION_LABEL": "当前没有可关联的测试会话",
+    "NO_SESSION_WINDOW": "会话缺少时间窗口",
+    "OBSERVER_UNKNOWN_AT_START": "开始测试时证据端就不可用",
+    "OBSERVER_NOT_INSTALLED": "证据端尚未安装",
+    "OBSERVER_NOT_ACTIVE": "证据端当前没有运行",
+    "OBSERVER_IDENTITY_UNREADABLE": "读不到证据端的运行状态",
+    "OBSERVER_RESTARTED": "测试期间证据端重启过，中间有一段没人观察",
+    "EVIDENCE_UNREADABLE": "读不到证据文件",
+    "EVIDENCE_CORRUPT": "证据文件不完整或不可信",
+    "EVIDENCE_TRANSPORT_MISMATCH": "证据的传输方式与预期不符",
+    "EVIDENCE_STALE": "证据已超过保留期",
+    "RETENTION_EXPIRED": "距离测试结束太久，证据已超过保留期",
+}
 
 
 def _l7_redirect(ctx):

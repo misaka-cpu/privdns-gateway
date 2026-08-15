@@ -427,7 +427,11 @@ migrate_firewall_to_pdg(){
     rm -f "$tmp"; return 0
   fi
   c_g "检测到旧版(原装)防火墙 → 迁移到独立表 inet pdg (SSH=$port, 内网段=$cidr)…"
+  # 救援端口取自 lib/rescue.sh(唯一来源), 这里必须先加载: `pdg migrate-fw` 直达本函数,
+  # 不经过 migrate_rescue_plane —— 不加载的话 set -u 下 $PDG_RESCUE_PORT 就是 unbound。
+  _rescue_load || { c_y "  读不到救援常量(lib/rescue.sh), 保留旧防火墙不动。"; rm -f "$tmp"; return 0; }
   sed -e "s/__SSH_PORT__/$port/g" -e "s#__INTERNAL_CIDR__#$cidr#g" \
+      -e "s#__RESCUE_PORT__#$PDG_RESCUE_PORT#g" \
       "$REPO_DIR/deploy/firewall/nftables-mihomo.conf" > "$tmp"
   if ! nft -c -f "$tmp" >/dev/null 2>&1; then
     c_y "  新规则 nft -c 校验未过, 保留旧防火墙不动。"; rm -f "$tmp"; return 0
@@ -940,6 +944,7 @@ cmd_snapshot(){
               etc/systemd/system/journald.conf.d/50-pdg.conf
               etc/systemd/system/mihomo.service etc/systemd/system/sing-box.service
               etc/systemd/system/pdg-mitm.service etc/systemd/system/pdg-probe81.service
+              etc/systemd/system/pdg-dotwitness.service
               etc/systemd/system/pdg-rules-update.service etc/systemd/system/pdg-rules-update.timer
               etc/systemd/system/pdg-health.service etc/systemd/system/pdg-health.timer
               etc/letsencrypt/renewal-hooks/deploy/99-pdg-cert.sh
@@ -2237,6 +2242,197 @@ migrate_pdg_mitm_service(){
 # 部署路径里从来没有这个 unit。没有这一步, Android 升完就是"文件在、服务没有", 而
 # expected_services 已经把它列为必需 → doctor 直接判红。
 # 幂等: unit 内容一致且已 enabled 就什么都不做。
+# ── 6.2B: DoT 证据端(observer)的生命周期状态机 ──────────────────────────────
+# observer 是**四件套**: 模块 /opt/pdg-bot/dotwitness.py + unit + env + mosdns 路由。
+# 四件齐了才算部署好, 缺一件都不许报成功。
+#
+# 为什么路由是最要紧的那件: v1.9.0 装出来的机器盘上没有 witness 路由, 而 `pdg update`
+# 从不用模板重渲 /etc/mosdns/config.yaml。只补 unit 不补路由的话, 机器会停在
+# "service active、查询永远到不了 witness" —— linkstat 于是走到"全程可用 + 无匹配证据"
+# 并对用户说"你手机的加密 DNS 没到达网关"。那是假话, 比直接说"不可用"有害得多。
+#
+# 只在自己的受管标记之间改 mosdns 配置, 用户的分流/上游/缓存/劫持一个字节都不碰。
+DW_UNIT=/etc/systemd/system/pdg-dotwitness.service
+DW_ENV=/etc/privdns-gateway/dotwitness.env
+DW_MOS=/etc/mosdns/config.yaml
+
+# 采一份文件的完整身份(存在性/内容/mode/uid/gid)。回滚要能精确复原, 光有内容不够。
+_dw_snap_file(){ # $1=path $2=保存目录 $3=标签
+  if [[ -e "$1" ]]; then
+    cp -p "$1" "$2/$3.body" 2>/dev/null || return 1
+    stat -c '%a %u %g' "$1" > "$2/$3.meta" 2>/dev/null || return 1
+    echo yes > "$2/$3.existed"
+  else
+    echo no > "$2/$3.existed"
+  fi
+  return 0
+}
+
+_dw_restore_file(){ # $1=path $2=保存目录 $3=标签; 返回非零表示**没能**复原
+  local ex; ex="$(cat "$2/$3.existed" 2>/dev/null)"
+  if [[ "$ex" == no ]]; then
+    rm -f "$1" 2>/dev/null || return 1
+    return 0
+  fi
+  [[ -f "$2/$3.body" ]] || return 1
+  cp -p "$2/$3.body" "$1" 2>/dev/null || return 1
+  local m u g; read -r m u g < "$2/$3.meta" 2>/dev/null || return 1
+  chmod "$m" "$1" 2>/dev/null || return 1
+  chown "$u:$g" "$1" 2>/dev/null || return 1
+  return 0
+}
+
+# 服务身份: enabled / active / InvocationID。InvocationID 用来判"是不是同一次运行" ——
+# 只看 active 的话, 中途重启过也看不出来。
+_dw_svc_id(){ systemctl show "$1" -p UnitFileState -p ActiveState -p InvocationID --no-pager 2>/dev/null; }
+_dw_kv(){ sed -n "s/^$2=//p" <<< "$1" | head -1; }
+
+_dw_atomic(){ # $1=内容文件 $2=目标 $3=mode —— 同目录 mktemp + install, 不留半截文件
+  local d; d="$(dirname "$2")"
+  [[ -d "$d" ]] || install -d -m 755 "$d" 2>/dev/null || return 1
+  install -m "$3" -o root -g root "$1" "$2" 2>/dev/null
+}
+
+migrate_dotwitness(){
+  local tmpl_unit="$REPO_DIR/deploy/bot/pdg-dotwitness.service"
+  local router="$REPO_DIR/deploy/bot/dotwroute.py"
+  # 部署源不完整就一个字节都不动 —— 这和 migrate_probe81_public 同一条纪律:
+  # 半个部署源装出来的东西比不装更难查。
+  if [[ ! -f "$tmpl_unit" || ! -f "$router" ]]; then
+    c_y "  ❌ 部署源缺少 witness 的 unit 模板或路由工具, 不做任何改动。"
+    return 1
+  fi
+  # 模块必须已经落地(migrate_deploy_botfiles 在前)。没有它就 enable, 等于起一个空壳。
+  [[ -f /opt/pdg-bot/dotwitness.py ]] || {
+    c_y "  ❌ /opt/pdg-bot/dotwitness.py 不在 —— 运行模块还没部署, 不启用 observer。"
+    return 1; }
+  [[ -f "$DW_MOS" ]] || return 0        # 没装 mosdns 的机器不归这条迁移管
+
+  # ① DoT 域名: 唯一真源是 /opt/pdg-bot/dot-domain。校验放这里, 因为它会被拼进
+  #    mosdns 配置与 env —— 放宽等于允许注入。
+  local dom; dom="$(cat /opt/pdg-bot/dot-domain 2>/dev/null | tr -d '[:space:]')"
+  # 两类分开报, 且**不回显文件内容**。原先是 `($dom)` 直接把读到的东西打出来 —— 这个值
+  # 会出现在更新日志、doctor 输出与用户贴上来的排障截图里, 而它正是本机 DoT 的域名。
+  # 报类别足够定位(文件在不在 / 内容合不合法), 回显只是把私有信息摊开。
+  if [[ -z "$dom" ]]; then
+    c_y "  ❌ DoT 域名缺失: /opt/pdg-bot/dot-domain 不存在或为空 —— 不部署 observer(拼进配置的值不能靠猜)。"
+    return 1
+  fi
+  if [[ ! "$dom" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]; then
+    c_y "  ❌ DoT 域名非法: /opt/pdg-bot/dot-domain 的内容不是合法域名(不回显内容) —— 不部署 observer。"
+    return 1
+  fi
+
+  # 这条以前是唯一一条**一个字都不说**就返回 1 的路径: 建不出临时目录时上层只看得到
+  # "迁移失败", 查不出是哪一步。
+  local work; work="$(mktemp -d)" || {
+    c_y "  ❌ 建不出 witness 的临时工作区(磁盘满 / TMPDIR 不可写?) —— 未做任何改动。"
+    return 1; }
+  local rc=0 need_reload=0 need_mos=0 need_wit=0
+
+  # ② 候选 env / unit / mosdns 配置。全部先造出来、验过, 再谈落盘。
+  printf 'PDG_DOTWITNESS_SUFFIX=probe.%s\n' "$dom" > "$work/env.new"
+  cp -f "$tmpl_unit" "$work/unit.new"
+  if ! python3 "$router" render "$DW_MOS" "$dom" > "$work/candidate.yaml" 2>"$work/mos.err"; then
+    c_y "  ❌ mosdns 路由候选生成失败: $(head -1 "$work/mos.err")"
+    rm -rf "$work"; return 1
+  fi
+
+  # ③ 候选必须过**真 mosdns 校验**。只做文本检查的话, 坏配置要到 restart 时才炸,
+  #    那时旧配置已经被换掉了。
+  if command -v mosdns >/dev/null 2>&1; then
+    if ! timeout 20 mosdns start -c "$work/candidate.yaml" >"$work/val.log" 2>&1; then
+      if grep -qiE '^Error|FATAL' "$work/val.log"; then
+        c_y "  ❌ mosdns 路由候选未通过校验, 保持原配置不动:"
+        grep -iE '^Error' "$work/val.log" | head -1 | sed 's/^/     /'
+        rm -rf "$work"; return 1
+      fi
+    fi
+  fi
+
+  # ④ before-image。三个持久文件 + 两个服务身份。
+  # 不含 5399 占用: 该端口只由 pdg-dotwitness 绑, 回滚按 wit0 的 enabled/active 复原服务后
+  # 它自己会收敛(矩阵正是按有界轮询验收的), 产品这边没有独立的端口恢复动作要做。
+  local bi="$work/before"; mkdir -p "$bi"
+  _dw_snap_file "$DW_UNIT" "$bi" unit || { c_y "  ❌ 采集 unit before-image 失败"; rm -rf "$work"; return 1; }
+  _dw_snap_file "$DW_ENV"  "$bi" env  || { c_y "  ❌ 采集 env before-image 失败";  rm -rf "$work"; return 1; }
+  _dw_snap_file "$DW_MOS"  "$bi" mos  || { c_y "  ❌ 采集 mosdns before-image 失败"; rm -rf "$work"; return 1; }
+  local wit0 mos0; wit0="$(_dw_svc_id pdg-dotwitness)"; mos0="$(_dw_svc_id mosdns)"
+  echo "$wit0" > "$bi/wit.id"; echo "$mos0" > "$bi/mos.id"
+
+  # 失败时精确复原。复原不彻底要**明说**, 不许静默 —— 那比失败本身更危险。
+  _dw_rollback(){
+    local rb_bad=0
+    _dw_restore_file "$DW_UNIT" "$bi" unit || rb_bad=1
+    _dw_restore_file "$DW_ENV"  "$bi" env  || rb_bad=1
+    _dw_restore_file "$DW_MOS"  "$bi" mos  || rb_bad=1
+    systemctl daemon-reload >/dev/null 2>&1 || rb_bad=1
+    # 服务状态回到原样: 原来没启用的不许留成启用, 原来活着的必须活回来。
+    local e0 a0; e0="$(_dw_kv "$wit0" UnitFileState)"; a0="$(_dw_kv "$wit0" ActiveState)"
+    if [[ "$e0" != enabled ]]; then systemctl disable pdg-dotwitness >/dev/null 2>&1 || true; fi
+    if [[ "$a0" == active ]]; then
+      systemctl start pdg-dotwitness >/dev/null 2>&1 || rb_bad=1
+    else
+      systemctl stop pdg-dotwitness >/dev/null 2>&1 || true
+    fi
+    if [[ "$(_dw_kv "$mos0" ActiveState)" == active ]]; then
+      systemctl restart mosdns >/dev/null 2>&1 || rb_bad=1
+    fi
+    if [[ "$rb_bad" == 1 ]]; then
+      c_y "  ⚠️  回滚不完整 —— unit/env/mosdns 配置或服务状态可能没有完全复原。"
+      c_y "     请人工核对 $DW_UNIT、$DW_ENV、$DW_MOS 与 systemctl status mosdns。"
+      return 1
+    fi
+    return 0
+  }
+
+  # ⑤ 只在内容真的不同时写盘。每次都写 + daemon-reload 会平白打断在用的连接。
+  cmp -s "$work/env.new"  "$DW_ENV"  || { _dw_atomic "$work/env.new"  "$DW_ENV"  600 || rc=1; need_wit=1; }
+  cmp -s "$work/unit.new" "$DW_UNIT" || { _dw_atomic "$work/unit.new" "$DW_UNIT" 644 || rc=1; need_reload=1; need_wit=1; }
+  cmp -s "$work/candidate.yaml"  "$DW_MOS"  || { _dw_atomic "$work/candidate.yaml"  "$DW_MOS"  644 || rc=1; need_mos=1; }
+  if [[ "$rc" != 0 ]]; then
+    c_y "  ❌ 写入 witness 的 unit/env/mosdns 配置失败, 正在回滚。"
+    _dw_rollback; rm -rf "$work"; return 1
+  fi
+
+  [[ "$need_reload" == 1 ]] && { systemctl daemon-reload >/dev/null 2>&1 || {
+      c_y "  ❌ daemon-reload 失败, 正在回滚。"; _dw_rollback; rm -rf "$work"; return 1; }; }
+  [[ "$need_mos" == 1 ]] && { systemctl restart mosdns >/dev/null 2>&1 || {
+      c_y "  ❌ mosdns 重启失败, 正在回滚。"; _dw_rollback; rm -rf "$work"; return 1; }; }
+
+  # ⑥ 服务状态。内容没变但服务是 disabled/inactive/failed 也要修 —— "文件对了"
+  #    不等于"跑起来了", 这两件事得分开判。
+  local e1 a1; e1="$(_dw_kv "$(_dw_svc_id pdg-dotwitness)" UnitFileState)"
+  a1="$(_dw_kv "$(_dw_svc_id pdg-dotwitness)" ActiveState)"
+  if [[ "$e1" != enabled || "$a1" != active || "$need_wit" == 1 ]]; then
+    systemctl reset-failed pdg-dotwitness >/dev/null 2>&1 || true
+    if ! systemctl enable --now pdg-dotwitness >/dev/null 2>&1; then
+      c_y "  ❌ pdg-dotwitness 未能启用, 正在回滚。"; _dw_rollback; rm -rf "$work"; return 1
+    fi
+    [[ "$need_wit" == 1 ]] && { systemctl restart pdg-dotwitness >/dev/null 2>&1 || {
+        c_y "  ❌ pdg-dotwitness 重启失败, 正在回滚。"; _dw_rollback; rm -rf "$work"; return 1; }; }
+  fi
+
+  # ⑦ 起来了不等于在听。没监听的话上层会得到"全程可用但没证据" —— 正是要避免的假话。
+  local i=0
+  while [[ $i -lt 20 ]]; do
+    ss -lun 2>/dev/null | grep -q '127\.0\.0\.1:5399' && break
+    sleep 0.25; i=$((i+1))
+  done
+  if ! ss -lun 2>/dev/null | grep -q '127\.0\.0\.1:5399'; then
+    c_y "  ❌ pdg-dotwitness 已启动但没有在 127.0.0.1:5399 监听, 正在回滚。"
+    _dw_rollback; rm -rf "$work"; return 1
+  fi
+
+  local changed=$((need_reload + need_mos + need_wit))
+  if [[ "$changed" == 0 ]]; then
+    rm -rf "$work"; return 0          # 全都健康且无变化: 零写盘、零 reload、零 restart
+  fi
+  c_g "  ✅ DoT 证据端已就绪(模块 + unit + env + mosdns 受管路由)。"
+  rm -rf "$work"
+  return 0
+}
+
 migrate_probe81_public(){
   # probe81 自 6.1B 起是 **Android/iOS 公共必需**服务(链路诊断的 HTTP 会话入口)。
   # 所以"模板不在就跳过"这条前提已经不成立了 —— 它现在是硬失败。
@@ -2911,6 +3107,10 @@ run_all_migrations(){
   migrate_mosdns_unlock || true; migrate_fw_gms || true
   migrate_mosdns_ratelimit || true; migrate_lowmem || true; migrate_mihomo_safepaths || true
   migrate_deploy_botfiles || true; migrate_deploy_units || true
+  # observer 四件套(模块+unit+env+mosdns 路由)。必须排在模块部署之后 —— 模块没落地
+  # 就 enable 等于起一个空壳。失败要让整次更新回滚: 装了一半的 observer 会让
+  # linkstat 说出"你手机的加密 DNS 没到达网关"这种假话, 那比不装更糟。
+  migrate_dotwitness || rc=1
   migrate_health_timer || rc=1   # 定时器排不出下一次 = 健康自检静默停摆, 必须让更新回滚
   migrate_mosdns_hijack_shape || true
   migrate_mosdns_explicit_proxy || true
@@ -3003,7 +3203,10 @@ _switchcore_nft(){   # $1=target(mihomo)  渲染并应用 mihomo nft(用当前 S
   local wd rendered merged bak rc
   wd="$(mktemp -d)" || { echo "无法创建临时目录"; return 1; }
   rendered="$wd/pdg.nft"; merged="$wd/merged.conf"; bak="$wd/nftables.conf.bak"
+  # 同上: 平台切换直达本函数, 也不经过 migrate_rescue_plane, 得自己先加载救援常量。
+  _rescue_load || { rm -rf "$wd"; echo "读不到救援常量(lib/rescue.sh), 未改动防火墙"; return 1; }
   sed -e "s|__SSH_PORT__|$sshp|g" -e "s|__INTERNAL_CIDR__|$icidr|g" \
+      -e "s|__RESCUE_PORT__|$PDG_RESCUE_PORT|g" \
       "$REPO_DIR/deploy/firewall/nftables-mihomo.conf" > "$rendered"
   _pdg_nft_strip_gms "$rendered"          # iOS: 渲染后剥掉 GMS 5228-5230
   # 备份必须先成立(逐字节校验): 后面任何一步失败都要靠它把现网原样放回去

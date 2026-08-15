@@ -86,7 +86,7 @@ e2e_git "$REPO" checkout -q "$PREV"
 
 # 机器上装的是**上一个发布**的那份脚本与模块 —— 这才是存量用户的现场
 install -m755 "$REPO/deploy/bot/pdg.sh" /usr/local/bin/pdg
-rm -rf /opt/pdg-bot; mkdir -p /opt/pdg-bot
+e2e_reset_botdir || bad "重置 /opt/pdg-bot 失败"
 for f in "$REPO"/deploy/bot/*.py; do install -m755 "$f" /opt/pdg-bot/; done
 install -m755 "$REPO/deploy/bot/pdg-bot.py" /opt/pdg-bot/bot.py
 { [[ "$(git -C "$REPO" describe --tags)" == "$PREV" ]] && [[ -z "$(git -C "$REPO" tag -l "$NEW_TAG")" ]]; } \
@@ -155,12 +155,20 @@ done
 [[ -z "$_lost" ]] \
   && ok "mosdns 受管配置: 用户上游/规则文件引用全部保留" \
   || bad "迁移把这些从 mosdns 配置里冲掉了:$_lost"
-_changed=$(diff $E2E_TMP/mos-before.yaml /etc/mosdns/config.yaml | grep -cE '^[<>]')
+# 6.2B 起 migrate_dotwitness 会往 mosdns 配置里插一段**标记界定**的受管块(observer 路由)。
+# 那是这次升级的既定产物, 不是漂移。但也不能就此在行级白名单里加几条 grep -v ——
+# 那会把受管块**之外**长得像的改动一并放过。改用产品自己的 dotwroute.py userpart 把
+# 受管块整段剥掉, 再比剩下的用户部分: 受管块内部随版本怎么变都不算漂移, 块外多一个
+# 字节都算。这比原来的行级白名单更严, 不是更松。
+_userpart(){ python3 "$E2E_ROOT/deploy/bot/dotwroute.py" userpart "$1" 2>/dev/null || cat "$1"; }
+_userpart $E2E_TMP/mos-before.yaml   > $E2E_TMP/mos-before.user.yaml
+_userpart /etc/mosdns/config.yaml    > $E2E_TMP/mos-after.user.yaml
+_changed=$(diff $E2E_TMP/mos-before.user.yaml $E2E_TMP/mos-after.user.yaml | grep -cE '^[<>]')
 if [[ "$_changed" == 0 ]]; then
-  ok "mosdns 受管配置逐字节未变"
+  ok "mosdns 受管配置(剥掉 witness 受管块后)逐字节未变"
 else
   # 变了就把变的行摆出来, 并且只接受已知的受管旋钮
-  _unexpected=$(diff $E2E_TMP/mos-before.yaml /etc/mosdns/config.yaml | grep -E '^[<>]' \
+  _unexpected=$(diff $E2E_TMP/mos-before.user.yaml $E2E_TMP/mos-after.user.yaml | grep -E '^[<>]' \
                 | grep -vE 'size: *[0-9]+' | head -5)
   [[ -z "$_unexpected" ]] \
     && ok "mosdns 受管配置只动了受管旋钮 cache size($(grep -oE 'size: *[0-9]+' $E2E_TMP/mos-before.yaml | head -1) → $(grep -oE 'size: *[0-9]+' /etc/mosdns/config.yaml | head -1)), 属既定迁移" \

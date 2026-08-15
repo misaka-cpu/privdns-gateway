@@ -148,7 +148,7 @@ e2e_git "$REPO" checkout -q "$PREV"
 # 只拷 deploy/bot 会得到一台"救援模块半残"的机器 —— 而 _rescue_enable 的第一道门就是
 # 模块闭包完整性, 于是首次启用必然失败, 测出来的是夹具的病不是产品的病。
 install -m755 "$REPO/deploy/bot/pdg.sh" /usr/local/bin/pdg
-rm -rf /opt/pdg-bot; mkdir -p /opt/pdg-bot
+e2e_reset_botdir || bad "重置 /opt/pdg-bot 失败"
 # lib/modules.sh 是 v1.7.x 才有的东西。更老的版本(v1.6.3 / v1.5.9)按目录铺文件, 这里就
 # 照它们当年的做法铺 —— 硬要用新清单去装老版本, 得到的是一台现实中不存在的机器。
 if [[ -f "$REPO/lib/modules.sh" ]] && grep -q 'pdg_platform_modules' "$REPO/lib/modules.sh"; then

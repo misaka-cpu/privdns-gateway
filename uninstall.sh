@@ -61,9 +61,9 @@ if [[ -f "$_UN_HERE/lib/rescue.sh" ]]; then
 else
   _RESCUE_RESIDUE="找不到 lib/rescue.sh, 救援平面(凭据/状态/放行规则)未清理"
 fi
-systemctl disable --now pdg-bot pdg-probe81 mosdns mihomo pdg-mitm pdg-rules-update.timer pdg-health.timer 2>/dev/null || true
+systemctl disable --now pdg-bot pdg-probe81 pdg-dotwitness mosdns mihomo pdg-mitm pdg-rules-update.timer pdg-health.timer 2>/dev/null || true
 [[ "$SB_OWNED" == 1 ]] && systemctl disable --now sing-box 2>/dev/null || true
-rm -f /etc/systemd/system/{pdg-bot,pdg-probe81,mosdns,mihomo,pdg-mitm,pdg-rules-update,pdg-health}.service \
+rm -f /etc/systemd/system/{pdg-bot,pdg-probe81,pdg-dotwitness,mosdns,mihomo,pdg-mitm,pdg-rules-update,pdg-health}.service \
       /etc/systemd/system/pdg-rules-update.timer /etc/systemd/system/pdg-health.timer \
       /etc/systemd/journald.conf.d/50-pdg.conf /etc/systemd/system/journald.conf.d/50-pdg.conf   # 正确路径 + 历史错路径都删
 [[ "$SB_OWNED" == 1 ]] && rm -f "$SB_UNIT"

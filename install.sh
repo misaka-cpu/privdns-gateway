@@ -343,7 +343,7 @@ rollback(){
   fi
   c_y "安装失败 → 回滚本次全新安装的改动…"
   # 各步骤相互独立: 单项失败只记账, 不挡住后面的恢复; 但也绝不因此谎报"已回滚"。
-  local units="pdg-bot.service pdg-probe81.service mosdns.service sing-box.service mihomo.service
+  local units="pdg-bot.service pdg-probe81.service pdg-dotwitness.service mosdns.service sing-box.service mihomo.service
                pdg-mitm.service pdg-rules-update.service pdg-health.service
                pdg-rules-update.timer pdg-health.timer"
   for u in $units; do
@@ -755,14 +755,22 @@ if [[ -n "$RESCUE_BIND" ]]; then
     || die "profile.env 未写入预期的 PDG_RESCUE_BIND"
 fi
 
-render(){ sed -e "s|__SERVER_IP__|$SERVER_IP|g" -e "s|__INTERNAL_CIDR__|$INTERNAL_CIDR|g" \
+render(){ # 渲染前先把本模板需要的值验一遍: 缺值不能退回示例值, 也不能静默留占位符。
+          [[ -n "${DOT_DOMAIN:-}" && "$DOT_DOMAIN" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] \
+            || { echo "render: DoT 域名缺失或非法($DOT_DOMAIN)" >&2; return 1; }
+          sed -e "s|__SERVER_IP__|$SERVER_IP|g" -e "s|__INTERNAL_CIDR__|$INTERNAL_CIDR|g" \
               -e "s|__CERT_DIR__|$CERT_DIR|g"   -e "s|__SSH_PORT__|$SSH_PORT|g" \
               -e "s|__MOSDNS_CACHE__|$MOSDNS_CACHE|g" -e "s|__JOURNALD_MAXUSE__|$JOURNALD_MAXUSE|g" \
               -e "s|__HIJACK_SET_FILE__|$HIJACK_SET_FILE|g" \
               -e "s|__RESCUE_PORT__|$PDG_RESCUE_PORT|g" \
-              -e "s|__RESCUE_BIND__|$RESCUE_BIND|g" "$1"; }
+              -e "s|__RESCUE_BIND__|$RESCUE_BIND|g" \
+              -e "s|__DOT_DOMAIN__|$DOT_DOMAIN|g" "$1"; }
 
 render "$REPO_DIR/deploy/mosdns/config.yaml"          > /etc/mosdns/config.yaml
+# 证据端的探测命名空间。只有这一项 —— unit 拿它判"认哪个后缀", 拿不到就 fail-closed 谁都不认。
+# 这里只落配置输入; 装 unit / enable / start 不在 6.2A 范围内。
+install -d -m 755 /etc/privdns-gateway
+( umask 022; printf 'PDG_DOTWITNESS_SUFFIX=probe.%s\n' "$DOT_DOMAIN" > /etc/privdns-gateway/dotwitness.env )
 # 模板自带 gfw 那道劫持门; all 模式要去掉它 —— all 的语义是"不是国内就劫持"(排除式),
 # 留着门会退化成"只劫持 geosite 策展分类里的域名"。
 _mosdns_hijack_shape "$HIJACK_MODE" /etc/mosdns/config.yaml "$HIJACK_SET_FILE" >/dev/null \
@@ -878,6 +886,9 @@ install -m644 "$REPO_DIR"/deploy/bot/pdg-health.timer         /etc/systemd/syste
 # 都用它做链路诊断的 HTTP 会话入口。nft 模板里 81 本来就只对 __INTERNAL_CIDR__ 放行,
 # 两平台一致, 所以这里无条件装。
 install -m644 "$REPO_DIR"/deploy/bot/pdg-probe81.service /etc/systemd/system/
+# DoT 证据端。两平台公共, 与 probe81 同一范式无条件装。它的 env 在渲染 mosdns 之后已经
+# 写好, 受管路由也随配置落盘 —— 到这里四件套前三件齐了, 装 unit 才有意义。
+install -m644 "$REPO_DIR"/deploy/bot/pdg-dotwitness.service /etc/systemd/system/
 render "$REPO_DIR/deploy/firewall/journald-50-pdg.conf" > /etc/systemd/journald.conf.d/50-pdg.conf; chmod 644 /etc/systemd/journald.conf.d/50-pdg.conf
 
 cat > /etc/systemd/system/mosdns.service <<'EOF'
@@ -963,6 +974,10 @@ systemctl restart systemd-journald
 systemctl enable --now mosdns "$CORE_SVC" >/dev/null 2>&1 || true
 # pdg-probe81 两平台都起; pdg-mitm 仍是 iOS 专属。
 systemctl enable --now pdg-probe81 >/dev/null 2>&1 || true
+# witness 不用 `|| true`: 装完就该可用。它起不来意味着 observer 四件套没闭合, 而那正是
+# "service active 却查不到证据"那类假健康的来源 —— 宁可让安装失败。
+systemctl enable --now pdg-dotwitness >/dev/null 2>&1 \
+  || die "pdg-dotwitness 未能启用 —— DoT 证据端不可用, 不把这次安装报成成功"
 [[ "$PLATFORM" == ios ]] && { systemctl enable --now pdg-mitm >/dev/null 2>&1 || true; }
 # ── 救援平面: 凭据 + unit + 默认启用 ──────────────────────────────────────
 # 默认启用是已拍板的方案(T5): 它存在的意义就是"别的都不通时还能进去", 而需要它的那一刻

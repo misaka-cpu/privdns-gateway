@@ -160,6 +160,46 @@ jobs:
       - name: "mosdns DNS 证据闸门 (API 暴露面: 阶段 3 因缓存导出/投喂端点停止)"
         run: python3 tests/test-link-dns-evidence.py
 
+      # 6.2A DoT 证据源。这六支是纯 Python, 不需要真 mosdns/systemd, 所以留在 lint;
+      # 需要真内核与真 systemd 的三支在下面各自成 job(e2e-dot / dot-systemd)。
+      # tests/helpers/dns-{stub,client}.py 是那两支 E2E 用的库, 没有断言输出,
+      # 不作为独立测试登记; tests/negctl/ 下的负控按项目惯例是本地手动门。
+      - name: "DoT 证据端契约 (SNI + 探测后缀双守卫; 只认 24 位小写 hex)"
+        run: python3 tests/test-dot-witness.py
+      - name: "DoT 配置输入闭包 (占位符都有生产者; witness 端口单一真源)"
+        run: python3 tests/test-dot-render.py
+      - name: "DoT 隐私与边界门 (每条判据先过反向夹具, 防扫不到也绿)"
+        run: python3 tests/test-dot-privacy.py
+      - name: "DoT 故障矩阵 (DNS parser 25 格 + 状态文件 24 格 + 原子写)"
+        run: python3 tests/test-dot-faults.py
+      - name: "DoT evidence 校验闭集与配置缺失时启动 fail-closed"
+        run: python3 tests/test-dot-strict.py
+      - name: "DoT 测试卫生 (异常/SystemExit/中断都要清掉临时目录)"
+        run: python3 tests/test-dot-tmpguard.py
+      - name: "6.2B 会话关联与三态语义 (观察端不可用时永不 OBSERVED)"
+        run: python3 tests/test-dot-session.py
+      - name: "6.2B evidence 留存期必须覆盖窗口+结算余量 (否则 NOT_OBSERVED 不可达)"
+        run: python3 tests/test-dot-ttl.py
+      # 下面两支只读源码, 不碰 systemd/网络, 所以留在这个轻量 job 里。
+      - name: "6.2B witness 生命周期接线 (装机闭包/enable 门/卸载/doctor 分级与严重级)"
+        run: python3 tests/test-dot-lifecycle.py
+      - name: "6.2B 迁移矩阵子集选择器必须 fail-closed (误设不许静默只跑一部分)"
+        run: python3 tests/test-dot-matrix-selector.py
+      - name: "6.2B 受管块标记契约 (state/strip 同一套精确语义, 九种变体)"
+        run: python3 tests/test-dot-route-markers.py
+
+      - name: "witness 迁移的失败理由 (每条出口都可定位 / 缺失与非法分开 / 不回显域名)"
+        run: python3 tests/test-dotwitness-error-reasons.py
+      # 这支的动态段要真跑 `nft -c`, 非 root 下 nft 连缓存都初始化不了 —— 会自报 SKIP
+      # 并说明原因(不算通过)。用 sudo 跑, 让那段真正当裁判; runner 上 nft 是现成的。
+      - name: "nft 模板渲染点必须替换每一个占位符 (含真 nft -c)"
+        run: |
+          set -euo pipefail
+          out="$(sudo -n python3 tests/test-firewall-render-tokens.py)"
+          echo "$out" | tail -3
+          echo "$out" | grep -qE '失败 0, 跳过 0$' \
+            || { echo "渲染门有失败, 或动态 nft -c 段被跳过了"; exit 1; }
+
       - name: "链路会话证据接进 linkstat (NOT_OBSERVED/PASS/STALE 语义与退出码隔离)"
         run: python3 tests/test-link-live.py
 
@@ -659,6 +699,7 @@ jobs:
           - e2e-install-nft.sh
           - e2e-platform-switch.sh
           - e2e-update.sh
+          - e2e-update-preserve-userdata.sh
           - e2e-upgrade-from-release.sh
           - e2e-wloc.sh
           - e2e-cli-ops.sh
@@ -693,12 +734,348 @@ jobs:
         env: { PDG_E2E_ISOLATED: "1" }
         run: bash tests/${{ matrix.script }}
 
+  # 6.2A DoT 证据源的真链路 E2E。单独成 job 而不是并进上面的矩阵: 这两支要真 mosdns
+  # 二进制, 而上面那步不装它 —— 塞进共享矩阵等于给每一个 E2E job 都加一次下载。
+  e2e-dot:
+    runs-on: ubuntu-latest
+    container:
+      image: debian:12
+    strategy:
+      fail-fast: false
+      matrix:
+        script:
+          - e2e-dot-witness.sh
+          - e2e-dot-isolation.sh
+    name: "E2E ${{ matrix.script }}"
+    steps:
+      - name: "先装 git(必须在 checkout 之前)"
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git ca-certificates >/dev/null
+      - uses: actions/checkout@v5
+      - name: 装依赖
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            bash curl ca-certificates python3 unzip openssl iproute2 coreutils procps psmisc >/dev/null
+      # 版本与哈希都取自 lib/versions.sh —— 与 install.sh 用的是同一个信任锚。
+      # 校验不过就让这一步失败, 不允许"下不到就跳过"。
+      #
+      # `shell: bash` 不是装饰: 这个 job 跑在 debian:12 容器里, GitHub 对 run: 的默认 shell
+      # 是 `sh`(在 Debian 上就是 dash), 而 dash 不认 `-o pipefail` —— 整步直接以
+      # "set: Illegal option -o pipefail" 退出 2, 和被测代码毫无关系。下面凡是用了 pipefail
+      # 的步骤都要显式声明 bash; 不能反过来把 pipefail 摘掉迁就 dash, 那样 curl 失败会被
+      # 管道尾巴的退出码盖住, sha256 校验就形同虚设。
+      - name: "装钉定 mosdns (SHA256 必须命中)"
+        shell: bash
+        run: |
+          set -euo pipefail
+          # shellcheck source=lib/versions.sh
+          source lib/versions.sh
+          curl -fsSL -o /tmp/mosdns.zip \
+            "https://github.com/IrineSistiana/mosdns/releases/download/${MOSDNS_VER}/mosdns-linux-amd64.zip"
+          echo "${PDG_SHA256[mosdns-amd64]}  /tmp/mosdns.zip" | sha256sum -c -
+          unzip -oq /tmp/mosdns.zip -d /usr/local/bin
+          chmod +x /usr/local/bin/mosdns
+          mosdns version
+      - name: "记录共享桩基线(测试不许动这些真程序)"
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in systemctl nft ip python3; do
+            p="/usr/local/bin/$f"
+            if [ -e "$p" ]; then printf '%s\t%s\t%s\n' "$f" "$(stat -c %F "$p")" "$(sha256sum "$p" 2>/dev/null | cut -d' ' -f1)"
+            else printf '%s\tabsent\t-\n' "$f"; fi
+          done > /tmp/stub-baseline.txt
+          cat /tmp/stub-baseline.txt
+      - name: "跑 ${{ matrix.script }}"
+        env: { PDG_E2E_ISOLATED: "1" }
+        run: bash tests/${{ matrix.script }}
+      - name: "退出后不许留下进程/端口/临时目录/影子桩"
+        shell: bash
+        run: |
+          set -uo pipefail
+          fail=0
+          for f in systemctl nft ip python3; do
+            p="/usr/local/bin/$f"
+            if [ -e "$p" ]; then now="$(printf '%s\t%s\t%s' "$f" "$(stat -c %F "$p")" "$(sha256sum "$p" 2>/dev/null | cut -d' ' -f1)")"
+            else now="$(printf '%s\tabsent\t-' "$f")"; fi
+            base="$(grep -P "^$f\t" /tmp/stub-baseline.txt)"
+            [ "$now" = "$base" ] || { echo "共享程序被动过: $f"; echo "  前: $base"; echo "  后: $now"; fail=1; }
+          done
+          pgrep -f '[m]osdns start' >/dev/null && { echo "残留 mosdns 进程"; fail=1; }
+          pgrep -f '[d]otwitness.py' >/dev/null && { echo "残留 witness 进程"; fail=1; }
+          ss -lun 2>/dev/null | grep -q ':5399' && { echo "5399 仍在监听"; fail=1; }
+          [ -e /etc/systemd/system/pdg-dotwitness.service ] && { echo "残留 unit"; fail=1; }
+          [ -e /run/pdg-dotwitness ] && { echo "残留 RuntimeDirectory"; fail=1; }
+          leftover="$(ls -d /tmp/e2e-tmp.* /tmp/pdg-dot* /tmp/pdg-negctl-* 2>/dev/null || true)"
+          [ -n "$leftover" ] && { echo "残留临时目录: $leftover"; fail=1; }
+          exit "$fail"
+
+  # unit 硬化与"配置缺失就启动失败"只能在**真 systemd** 下验。上面那些 job 跑在容器里,
+  # PID 1 不是 systemd; 而 GitHub runner 本身的 PID 1 就是 —— 所以这支不进容器。
+  # 代码用 git archive 注入一次性只读快照, 不让 root 测试写正式工作树。
+  dot-systemd:
+    runs-on: ubuntu-latest
+    name: "真 systemd: DoT witness unit 硬化与 fail-closed"
+    # 快照根**只在这里写一次**(下面那行 env 就是唯一定义处, 别在注释或 run: 里再抄一份)。
+    # 第一次接线时准备步骤把路径写死了, 而脚本里 `R="${PDG_DOTW_REPO:-...}"` 回落到另一个
+    # 路径, 于是 source e2e-lib.sh 直接 "No such file" —— 两份路径各自都对, 合起来不成立。
+    # 变量是这条闭包的唯一来源:
+    # 准备、执行、清理都引用它, 任何一处再写字面量都算漂移(见 test-ci-coverage.py 第 6 节)。
+    # 脚本自己的默认值保持 /srv/repo 不动 —— 那是给人手动跑的, 不该被 CI 专用路径污染。
+    env:
+      PDG_DOTW_REPO: /srv/pdg-snap
+    steps:
+      - uses: actions/checkout@v5
+      - name: "PID 1 必须是真 systemd(不是就判失败, 不 SKIP)"
+        run: |
+          set -euo pipefail
+          comm="$(ps -p 1 -o comm=)"
+          echo "PID1 = $comm"
+          test "$comm" = systemd
+          command -v systemctl
+          test "$(command -v systemctl)" = /usr/bin/systemctl || test "$(command -v systemctl)" = /bin/systemctl
+          # 真 systemctl 没被影子桩顶掉: /usr/local/bin 在 PATH 里排在 /usr/bin 前面,
+          # 上一支测试要是漏删自己的桩, 这一支就会拿桩当真 systemd 用而全程假绿。
+          test ! -e /usr/local/bin/systemctl
+      - name: "注入当前 commit 的只读快照"
+        run: |
+          set -euo pipefail
+          # 快照必须是**这次 dispatch 的那个 commit**, 不是"碰巧检出的东西"。
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$PDG_DOTW_REPO" != "$GITHUB_WORKSPACE"
+          sudo rm -rf "$PDG_DOTW_REPO" && sudo mkdir -p "$PDG_DOTW_REPO"
+          git archive --format=tar "$GITHUB_SHA" | sudo tar x -C "$PDG_DOTW_REPO"
+          sudo chown -R root:root "$PDG_DOTW_REPO"
+          echo "快照文件数: $(sudo find "$PDG_DOTW_REPO" -type f | wc -l)"
+          # 逐 blob 证明快照内容 == 该 SHA 的 tree。只数文件个数挡不住"少解开一个文件"
+          # 或"解错了 commit"; 比对 blob 摘要才是真判据。
+          git ls-tree -r --format='%(objectname) %(path)' "$GITHUB_SHA" \
+            | sort -k2 > /tmp/sha-blobs.txt
+          ( cd "$PDG_DOTW_REPO" && find . -type f -printf '%P\n' | sort ) > /tmp/snap-names.txt
+          ( cd "$PDG_DOTW_REPO" && git hash-object --stdin-paths < /tmp/snap-names.txt ) \
+            > /tmp/snap-hashes.txt
+          paste -d' ' /tmp/snap-hashes.txt /tmp/snap-names.txt | sort -k2 > /tmp/snap-blobs.txt
+          diff -u /tmp/sha-blobs.txt /tmp/snap-blobs.txt \
+            || { echo "快照与 $GITHUB_SHA 的 tree 不一致"; exit 1; }
+          echo "快照 blob 与 $GITHUB_SHA 逐一致: $(wc -l < /tmp/snap-blobs.txt) 个"
+          # 是一次性只读投影, 不是可写的正式 checkout: 没有 .git(改了不会被误提交),
+          # 归 root, 且 runner 用户写不进去。
+          test ! -e "$PDG_DOTW_REPO/.git"
+          test "$(stat -c %U "$PDG_DOTW_REPO")" = root
+          test ! -w "$PDG_DOTW_REPO"
+          # 这一条就是上一次远端红灯的直接判据: 脚本进门第一件事就是 source 它。
+          test -f "$PDG_DOTW_REPO/tests/e2e-lib.sh"
+      - name: "记录共享程序基线"
+        run: |
+          set -euo pipefail
+          for f in systemctl nft ip python3; do
+            p="/usr/local/bin/$f"
+            if [ -e "$p" ]; then printf '%s\t%s\t%s\n' "$f" "$(stat -c %F "$p")" "$(sha256sum "$p" 2>/dev/null | cut -d' ' -f1)"
+            else printf '%s\tabsent\t-\n' "$f"; fi
+          done | sudo tee /tmp/stub-baseline.txt
+      - name: "跑 e2e-dot-systemd.sh"
+        run: |
+          set -euo pipefail
+          sudo -E env PDG_E2E_ISOLATED=1 PDG_DOTW_REPO="$PDG_DOTW_REPO" \
+            bash "$PDG_DOTW_REPO/tests/e2e-dot-systemd.sh"
+      - name: "root 下真跑 test-dot-strict.py, owner 契约 SKIP 必须为 0"
+        run: |
+          set -euo pipefail
+          out="$(sudo -E env PDG_E2E_ISOLATED=1 python3 "$PDG_DOTW_REPO/tests/test-dot-strict.py")"
+          echo "$out" | tail -4
+          echo "$out" | grep -qE '失败 0, 跳过 0$' \
+            || { echo "root 下 strict 仍有失败或 SKIP"; exit 1; }
+      - name: "退出后不许留下 unit/端口/状态/影子桩"
+        run: |
+          set -uo pipefail
+          fail=0
+          for f in systemctl nft ip python3; do
+            p="/usr/local/bin/$f"
+            if [ -e "$p" ]; then now="$(printf '%s\t%s\t%s' "$f" "$(stat -c %F "$p")" "$(sha256sum "$p" 2>/dev/null | cut -d' ' -f1)")"
+            else now="$(printf '%s\tabsent\t-' "$f")"; fi
+            base="$(grep -P "^$f\t" /tmp/stub-baseline.txt)"
+            [ "$now" = "$base" ] || { echo "共享程序被动过: $f / 前[$base] 后[$now]"; fail=1; }
+          done
+          [ -e /etc/systemd/system/pdg-dotwitness.service ] && { echo "残留 unit"; fail=1; }
+          [ -e /run/pdg-dotwitness ] && { echo "残留 RuntimeDirectory"; fail=1; }
+          ss -lun 2>/dev/null | grep -q ':5399' && { echo "5399 仍在监听"; fail=1; }
+          pgrep -f '[d]otwitness.py' >/dev/null && { echo "残留 witness 进程"; fail=1; }
+          leftover="$(ls -d /tmp/pdg-dot* /tmp/e2e-tmp.* 2>/dev/null || true)"
+          [ -n "$leftover" ] && { echo "残留临时目录: $leftover"; fail=1; }
+          sudo rm -rf "$PDG_DOTW_REPO"
+          exit "$fail"
+
   # 串行 hermetic 守卫: 就算将来有人把这些脚本又塞回同一个环境顺序跑, 也必须全绿。
   # 这条专门盯"脚本之间互相踩"的回归 —— 矩阵拆开只是让 CI 不受影响, 并不能保证脚本本身干净。
   # 救援平面首次启用那条路径必须**两个平台都真跑一遍**。上面的矩阵是"一个脚本一个 job",
   # 传不进平台参数, 而这支脚本默认 android —— 只跑矩阵的话 iOS 侧等于没覆盖。
   # 分歧是实打实的: iOS 装机会摘掉 GMS 重定向, migrate_ios_gms_cleanup / migrate_drop_singbox
   # 也只在 iOS 上动内核配置, 迁移路径与 Android 并不相同。
+  # ── 真 systemd + 真 mosdns: 迁移故障矩阵与 P0 隔离门 ─────────────────────────
+  # 这两支和上面的 e2e-dot 不同: 它们要 **PID 1 是真 systemd**(真 enable/restart、真读
+  # InvocationID), 容器 job 给不了; 也要 **真 mosdns 在跑**, dot-systemd 那个 job 没有。
+  # 所以单开一个两格 matrix —— 每格一台全新 runner, 两套夹具之间物理隔离, 不需要证明
+  # "上一支清干净了"。
+  #
+  # 两格的域名故意不同, 各有理由:
+  #   · migrate 用 dot.example.test —— e2e-dot-migrate.sh 已冻结, 它的 PROBE 格调
+  #     dotprobe.py 时不传域名, 走的是那个缺省值。域名对不上, 两个判据(qname 后缀 /
+  #     SNI)一个都不满足, 表现成"没出 evidence"。别把它"顺手统一"掉。
+  #   · P0 用 dot.p0ci.test —— 它必须从 dotwitness.env 推导域名, 用非缺省值才证明得了
+  #     推导真的在跑。
+  dot-systemd-e2e:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - script: e2e-dot-migrate.sh
+            mode: pre
+            domain: dot.example.test
+          - script: e2e-dot-p0.sh
+            mode: deployed
+            domain: dot.p0ci.test
+    name: "真 systemd+mosdns E2E ${{ matrix.script }}"
+    # 快照根只在这里写一次; 准备、执行、清理一律引用这个变量。
+    env:
+      PDG_DOTE2E_SNAP: /srv/pdg-dote2e
+    steps:
+      - name: "PID 1 必须是真 systemd(不是就判失败, 不 SKIP)"
+        shell: bash
+        run: |
+          set -euo pipefail
+          comm="$(ps -p 1 -o comm=)"
+          echo "PID1 = $comm"
+          test "$comm" = systemd
+          test ! -e /usr/local/bin/systemctl
+          test ! -e /usr/local/bin/nft
+      # 需要 v1.9.0 这个 annotated tag: 迁移前形态的 mosdns 配置取自它。
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: "核对 v1.9.0 tag 对象与 peeled commit"
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git cat-file -t v1.9.0)" = tag
+          echo "tag 对象   = $(git rev-parse v1.9.0)"
+          echo "peeled     = $(git rev-parse 'v1.9.0^{commit}')"
+          git show v1.9.0:deploy/mosdns/config.yaml > /tmp/v190-mosdns.yaml
+          test -s /tmp/v190-mosdns.yaml
+          grep -q 'pdg-dotwitness managed block' /tmp/v190-mosdns.yaml \
+            && { echo "v1.9.0 模板里有受管块 —— 迁移前形态不成立"; exit 1; } || true
+          echo "v1.9.0 mosdns 模板 $(wc -l < /tmp/v190-mosdns.yaml) 行, 无受管块"
+      - name: "注入当前 commit 的只读快照"
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$PDG_DOTE2E_SNAP" != "$GITHUB_WORKSPACE"
+          sudo rm -rf "$PDG_DOTE2E_SNAP" && sudo mkdir -p "$PDG_DOTE2E_SNAP"
+          git archive --format=tar "$GITHUB_SHA" | sudo tar x -C "$PDG_DOTE2E_SNAP"
+          sudo chown -R root:root "$PDG_DOTE2E_SNAP"
+          # 逐 blob 证明快照内容 == 该 SHA 的 tree。只数文件个数挡不住少解开一个文件。
+          git ls-tree -r --format='%(objectname) %(path)' "$GITHUB_SHA" | sort -k2 > /tmp/sha-blobs.txt
+          ( cd "$PDG_DOTE2E_SNAP" && find . -type f -printf '%P\n' | sort ) > /tmp/snap-names.txt
+          ( cd "$PDG_DOTE2E_SNAP" && git hash-object --stdin-paths < /tmp/snap-names.txt ) > /tmp/snap-hashes.txt
+          paste -d' ' /tmp/snap-hashes.txt /tmp/snap-names.txt | sort -k2 > /tmp/snap-blobs.txt
+          diff -u /tmp/sha-blobs.txt /tmp/snap-blobs.txt
+          echo "快照 blob 与 $GITHUB_SHA 逐一致: $(wc -l < /tmp/snap-blobs.txt) 个"
+          test ! -e "$PDG_DOTE2E_SNAP/.git"
+          test "$(stat -c %U "$PDG_DOTE2E_SNAP")" = root
+          test -f "$PDG_DOTE2E_SNAP/tests/e2e-lib.sh"
+          test -f "$PDG_DOTE2E_SNAP/tests/helpers/ci-dot-fixture.sh"
+      # 版本与哈希都取自 lib/versions.sh —— 与 install.sh 同一个信任锚。校验不过就失败,
+      # 不允许"下不到就跳过"。
+      - name: "装钉定 mosdns (SHA256 必须命中)"
+        shell: bash
+        run: |
+          set -euo pipefail
+          # shellcheck source=lib/versions.sh
+          source lib/versions.sh
+          curl -fsSL -o /tmp/mosdns.zip \
+            "https://github.com/IrineSistiana/mosdns/releases/download/${MOSDNS_VER}/mosdns-linux-amd64.zip"
+          echo "${PDG_SHA256[mosdns-amd64]}  /tmp/mosdns.zip" | sha256sum -c -
+          sudo unzip -oq /tmp/mosdns.zip -d /usr/local/bin
+          sudo chmod +x /usr/local/bin/mosdns
+          mosdns version
+      - name: "记录共享程序与临时目录基线"
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in systemctl nft ip python3; do
+            p="/usr/local/bin/$f"
+            if [ -e "$p" ]; then printf '%s\t%s\t%s\n' "$f" "$(stat -c %F "$p")" "$(sha256sum "$p" | cut -d' ' -f1)"
+            else printf '%s\tabsent\t-\n' "$f"; fi
+          done | sudo tee /tmp/stub-baseline.txt
+          ls -d /tmp/tmp.* /tmp/pdg-* 2>/dev/null | sort > /tmp/tmpdir-baseline.txt || true
+          wc -l < /tmp/tmpdir-baseline.txt
+      - name: "搭夹具 (${{ matrix.mode }} 形态, 域名 ${{ matrix.domain }})"
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo -E env PDG_E2E_ISOLATED=1 PDG_DOTW_REPO="$PDG_DOTE2E_SNAP" \
+            bash "$PDG_DOTE2E_SNAP/tests/helpers/ci-dot-fixture.sh" \
+            "${{ matrix.mode }}" "${{ matrix.domain }}" /tmp/v190-mosdns.yaml
+      - name: "跑 ${{ matrix.script }} 并核对汇总(通过>0 / 失败 0 / 跳过 0)"
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 不看退出码就下结论会被"零断言也退 0"骗过去 —— 逐项核对汇总数字。
+          sudo -E env PDG_E2E_ISOLATED=1 PDG_DOTW_REPO="$PDG_DOTE2E_SNAP" \
+            bash "$PDG_DOTE2E_SNAP/tests/${{ matrix.script }}" 2>&1 | tee /tmp/e2e-out.txt
+          line="$(grep -E '^通过 [0-9]+, 失败 [0-9]+' /tmp/e2e-out.txt | tail -1)"
+          test -n "$line" || { echo "找不到汇总行 —— 脚本没跑到底"; exit 1; }
+          echo "汇总: $line"
+          np="$(sed -E 's/^通过 ([0-9]+).*/\1/' <<< "$line")"
+          nf="$(sed -E 's/.*失败 ([0-9]+).*/\1/' <<< "$line")"
+          if grep -q '跳过' <<< "$line"; then ns="$(sed -E 's/.*跳过 ([0-9]+).*/\1/' <<< "$line")"; else ns=0; fi
+          echo "通过=$np 失败=$nf 跳过=$ns"
+          test "$np" -gt 0
+          test "$nf" -eq 0
+          test "$ns" -eq 0
+          # 脚本内部的 [SKIP] 一条都不许有: SKIP 不是通过。
+          test "$(grep -c '^\[SKIP' /tmp/e2e-out.txt || true)" -eq 0
+      - name: "退出后不许留下进程/端口/unit/RuntimeDirectory/临时目录/影子桩"
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          fail=0
+          for f in systemctl nft ip python3; do
+            p="/usr/local/bin/$f"
+            if [ -e "$p" ]; then now="$(printf '%s\t%s\t%s' "$f" "$(stat -c %F "$p")" "$(sha256sum "$p" | cut -d' ' -f1)")"
+            else now="$(printf '%s\tabsent\t-' "$f")"; fi
+            base="$(grep -P "^$f\t" /tmp/stub-baseline.txt || true)"
+            [ "$now" = "$base" ] || { echo "共享程序被动过: $f / 前[$base] 后[$now]"; fail=1; }
+          done
+          # 只停本 job 自己装的那两个 unit, 不碰别的
+          sudo systemctl disable --now pdg-dotwitness >/dev/null 2>&1 || true
+          sudo systemctl stop mosdns >/dev/null 2>&1 || true
+          sudo rm -f /etc/systemd/system/pdg-dotwitness.service /etc/systemd/system/mosdns.service
+          sudo systemctl daemon-reload || true
+          sudo systemctl reset-failed >/dev/null 2>&1 || true
+          sudo rm -rf /etc/mosdns /opt/pdg-bot /etc/privdns-gateway "$PDG_DOTE2E_SNAP"
+          # 夹具停过 systemd-resolved, 按它记下的原状还回去
+          if [ "$(cat /run/pdg-fixture-resolved.was 2>/dev/null)" = enabled ]; then
+            sudo systemctl start systemd-resolved >/dev/null 2>&1 || true
+          fi
+          sudo rm -f /run/pdg-fixture-resolved.was
+          pgrep -f '[d]otwitness\.py' >/dev/null && { echo "残留 witness 进程"; fail=1; }
+          pgrep -f '[m]osdns start' >/dev/null && { echo "残留 mosdns 进程"; fail=1; }
+          ss -lun 2>/dev/null | grep -q ':5399' && { echo "5399 仍在监听"; fail=1; }
+          [ -e /etc/systemd/system/pdg-dotwitness.service ] && { echo "残留 unit"; fail=1; }
+          [ -e /run/pdg-dotwitness ] && { echo "残留 RuntimeDirectory"; fail=1; }
+          [ "$(systemctl --failed --no-legend | wc -l)" -eq 0 ] || { systemctl --failed --no-legend; echo "有 failed unit"; fail=1; }
+          sudo nft list tables 2>/dev/null | grep -q 'inet pdg' && { echo "残留 nft inet pdg 表"; fail=1; }
+          ls -d /tmp/tmp.* /tmp/pdg-* 2>/dev/null | sort > /tmp/tmpdir-after.txt || true
+          newdirs="$(comm -13 /tmp/tmpdir-baseline.txt /tmp/tmpdir-after.txt || true)"
+          [ -n "$newdirs" ] && { echo "新增临时目录: $newdirs"; fail=1; }
+          exit "$fail"
+
   e2e-rescue-lock-ios:
     runs-on: ubuntu-latest
     container:
@@ -752,7 +1129,8 @@ jobs:
           PDG_SERIAL_SCRIPTS: >-
             e2e-migrate.sh e2e-exit-rule.sh e2e-drop-singbox.sh e2e-custom-nft.sh
             e2e-cross-version-rollback.sh e2e-install.sh e2e-install-nft.sh
-            e2e-platform-switch.sh e2e-update.sh e2e-upgrade-from-release.sh e2e-wloc.sh e2e-cli-ops.sh
+            e2e-platform-switch.sh e2e-update.sh e2e-update-preserve-userdata.sh
+            e2e-upgrade-from-release.sh e2e-wloc.sh e2e-cli-ops.sh
             e2e-rescue-migration-lock.sh e2e-hijack-mode-tx.sh e2e-snapshot-meta.sh
             e2e-config-transaction.sh e2e-config-transaction-recovery.sh
         run: bash tests/e2e-serial-hermetic.sh

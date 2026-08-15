@@ -101,7 +101,14 @@ grep -q '出口/分流/证书/DoT 不动' <<<"$out" \
 # ── 2. doctor 判失败 → 必须回滚且不显示成功 ═════════════════════════════════
 echo; echo "── 2. doctor 报 fail → 回滚 ──"
 e2e_git "$REPO" checkout -q v9.9.8                     # 退回旧版, 好再更新一次
-rm -rf /opt/pdg-bot; mkdir -p /opt/pdg-bot
+# 这里要的是"把**部署模块**退回旧版", 不是"清空 /opt/pdg-bot"。整目录 rm -rf 会把同住
+# 一个目录的用户数据(PDG_USER_DATA 里的 dot-domain / rulesets.json)一并带走, 于是机器
+# 落到"模块在、用户数据没了"这种真机永远不会出现的形态; 随后 __migrate 按契约 fail-closed
+# ("DoT 域名缺失 → 不部署 observer"), 更新失败回滚, 红的是夹具而不是产品。
+# 真机上更新绝不动这些文件 —— 成功与失败回滚两条路径都实测过前后像逐字节一致
+# (含 mode/uid/gid), 见 tests/e2e-update-preserve-userdata.sh。
+# 保留清单从产品自己的保全契约读, 不在这里写死文件名(见 e2e_reset_botdir)。
+e2e_reset_botdir || bad "重置 /opt/pdg-bot 失败"
 for f in "$E2E_ROOT"/deploy/bot/*.py; do install -m755 "$f" /opt/pdg-bot/; done
 install -m755 "$E2E_ROOT/deploy/bot/pdg-bot.py" /opt/pdg-bot/bot.py
 # 让 doctor 报一条 fail(内核服务不在) —— 用有状态 systemd 桩把 mihomo 置为 inactive

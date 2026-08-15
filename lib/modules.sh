@@ -22,6 +22,12 @@
 
 PDG_RUNTIME_DIR="${PDG_RUNTIME_DIR:-/opt/pdg-bot}"
 
+# 6.2B 追加 dotwitness.py: linkstat 要经它的 read_evidence() 取 DoT 证据(证据校验器
+# 只能有一份, 不许把那套 owner/mode/schema 判定抄进 linkstat)。纯标准库单文件, 两个
+# 平台都装 —— 装的是**模块**, 不是服务: pdg-dotwitness.service 仍未接入安装/enable/start。
+# 注意这个清单是**逐行拆三元组的裸字符串**, 里面不能写注释(写了会被当成一行数据,
+# 于是"源路径 #  不存在""mode 非法"一起报出来)。说明一律放在这上面。
+#
 # 平台无关的项目静态文件。三方共用这一份: install.sh 装、`pdg update` 同步、uninstall 删。
 # 每行是 `源路径 目标名 mode` —— 必须能表达**改名**(deploy/bot/pdg-bot.py → bot.py)与
 # **不同源目录**(deploy/bot/ 与 deploy/ios/), 只登记 basename 靠调用方猜目录是不行的。
@@ -33,6 +39,7 @@ deploy/bot/nftscan.py nftscan.py 755
 deploy/bot/nftlive.py nftlive.py 755
 deploy/bot/linkstat.py linkstat.py 755
 deploy/bot/linksess.py linksess.py 755
+deploy/bot/dotwitness.py dotwitness.py 755
 deploy/bot/probe81.py probe81.py 755
 deploy/bot/nftmerge.py nftmerge.py 755
 deploy/bot/sb2mihomo.py sb2mihomo.py 755

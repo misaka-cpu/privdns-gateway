@@ -79,8 +79,11 @@ render_conf(){   # $1=内网段  $2=local 上游内联(默认=单 mock; 故障�
   local local_ups="${2:-$MOCK_UP}"
   local hijack_file="${3:-geosite_geolocation-!cn.txt}"
   # 按上游里的特征 IP 区分 remote(1.1.1.1)/local(223.5.5.5) 整行替换(兼容 concurrent: 前缀)。
+  # __DOT_DOMAIN__ 也要替换: 这支末尾有"渲染后不许残留占位符"的通用断言。
+  # 端口已经是字面量, 没有对应的占位符要替。
   sed -e "s/__SERVER_IP__/$SERVER_IP/g" -e "s#__INTERNAL_CIDR__#$1#g" -e "s#__CERT_DIR__#$WORK#g" \
       -e "s#__MOSDNS_CACHE__#8192#g" -e "s#__HIJACK_SET_FILE__#$hijack_file#g" \
+      -e "s#__DOT_DOMAIN__#dot.policy.test#g" \
       "$ROOT/deploy/mosdns/config.yaml" \
     | sed -e "s#^\([[:space:]]*\)args: {.*1\.1\.1\.1.*}#\1args: { concurrent: 2, upstreams: [ $MOCK_UP ] }#" \
           -e "s#^\([[:space:]]*\)args: {.*223\.5\.5\.5.*}#\1args: { concurrent: 2, upstreams: [ $local_ups ] }#" \

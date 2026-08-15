@@ -199,11 +199,34 @@ refs = set()
 for u in units:
     for m in re.finditer(r"/opt/pdg-bot/([A-Za-z0-9_.-]+)", open(u, encoding="utf-8").read()):
         refs.add(m.group(1))
-gone = sorted(refs - static)
+# 6.2A staged: 源码与 unit 已进仓库, **生命周期尚未接线**(不进安装清单、不迁移、
+# 不 enable/start)。这是一个显式且受限的中间状态, 不是通用白名单 —— 只允许下面这两个
+# 精确文件名, 多一个未归属的 deploy 文件就判红。接线属于 6.2B。
+STAGED_6_2A = frozenset()   # 6.2B: dotwitness.py 已进运行模块清单, 不再 staged
+
+gone = sorted(refs - static - STAGED_6_2A)
 if not gone:
-    ok("unit 引用的 %d 个 /opt/pdg-bot 文件都在静态清单里" % len(refs))
+    ok("unit 引用的 %d 个 /opt/pdg-bot 文件都在静态清单或 6.2A staged 集里" % len(refs))
 else:
-    bad("unit 引用了不在清单里的文件: %s" % "、".join(gone))
+    bad("unit 引用了既不在清单、也不在 staged 集里的文件: %s" % "、".join(gone))
+
+# staged 集自身的两道门, 防它变成"多塞什么都行"的口子。
+# 判据是**集合相等**而不是"实际引用里有它": 后者放得过一个挂在集合里却没人用的名字,
+# 那正是白名单腐化的第一步。
+if set(STAGED_6_2A) == (refs & STAGED_6_2A):
+    ok("staged 集与实际 unit 引用精确相等(%s), 没有空挂的条目"
+       % "、".join(sorted(STAGED_6_2A)))
+else:
+    bad("staged 集有空挂条目: 集合=%s 实际被引用=%s"
+        % (sorted(STAGED_6_2A), sorted(refs & STAGED_6_2A)))
+
+# staged 的东西**必须还没接线** —— 一旦被装进安装清单, 说明 6.2B 已经开始,
+# 那时这条 staged 例外就该删掉, 而不是继续挂着掩盖真实状态。
+wired = sorted(STAGED_6_2A & static)
+if not wired:
+    ok("staged 文件确实尚未接入安装清单(6.2A 边界成立)")
+else:
+    bad("staged 文件已进安装清单, staged 例外应当删除: %s" % "、".join(wired))
 
 total = PASS[0] + FAIL[0]
 print("\n断言 %d 项: 通过 %d, 失败 %d" % (total, PASS[0], FAIL[0]))
