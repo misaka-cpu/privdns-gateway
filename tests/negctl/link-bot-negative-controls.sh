@@ -85,11 +85,16 @@ n='    import secrets\n    _t = secrets.token_urlsafe(32)\n    okk, payload = li
 assert o in s, 'anchor'; io.open(p,'w',encoding='utf-8').write(s.replace(o,n,1))" \
 tests/test-link-bot.py
 
+# replace(...,1) 打的是**第一处** UNAVAILABLE 出口, 也就是 `import dotwitness / linksess`
+# 失败那条兜底。catcher 原本写 test-link-bot.py, 但那支(以及其余七支 link 相关测试)都走
+# 不到这条分支 —— 测试环境里两个模块都导得进来, 于是这条负控长期报"判据是空的"。
+# 真正守它的是 test-link-live.py 第 7b 节: 它用 __import__ 钩子模拟模块不可用, 再断言
+# 第 6.5 层仍是 NOT_OBSERVED。第二处出口(正常兜底)由同文件第 7 节守着。
 nc 10 "第 6.5 层改成 PASS" \
 "import io;p='deploy/bot/linkstat.py';s=io.open(p,encoding='utf-8').read(); \
 o='6.5, \"L6_DOT_METRICS_UNAVAILABLE\", NOT_OBSERVED'; n='6.5, \"L6_DOT_METRICS_UNAVAILABLE\", PASS'; \
 assert o in s, 'anchor'; io.open(p,'w',encoding='utf-8').write(s.replace(o,n,1))" \
-tests/test-link-bot.py
+tests/test-link-live.py
 
 nc 11 "probe81 不可用仍发测试链接" \
 "$(rd); o='    if blockers:'; n='    if False:'; \

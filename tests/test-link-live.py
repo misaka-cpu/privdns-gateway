@@ -10,6 +10,7 @@
   · DNS 那半边(第 6.5 层)当前只能是 NOT_OBSERVED —— 阶段 3 因安全原因停止, 不许
     拿别的东西冒充。
 """
+import builtins
 import json
 import os
 import shutil
@@ -290,6 +291,43 @@ def main():
     txt = L.render_text(fs)
     (ok if "一定" not in txt.split("手机/SIM")[1] else bad)(
         "没有断言「Private DNS 一定关着」")
+
+    print()
+    print("── 7b. 证据端模块读不到时的兜底分支(上面那节走不到它)──")
+    # 第 6.5 层有**两个** UNAVAILABLE 出口: 一个是正常路径上"拿不到结论"的兜底, 一个是
+    # `import dotwitness / linksess` 本身就失败的兜底。上一节测的是前者 —— 测试环境里两个
+    # 模块都能正常导入, 后者从来没被执行过, 于是它的 verdict 长期无人守。
+    # 这不是假设: 把后者的 NOT_OBSERVED 改成 PASS, 全部八支 link 相关测试都是绿的
+    # (tests/negctl/link-bot-negative-controls.sh 的 NC10 正是打在这一处, 长期报"判据是空的")。
+    # 而这条出口一旦说成 PASS, 用户看到的就是"手机 DoT 查询正常" —— 证据端根本没读到,
+    # 这是本项目最不该出现的那类假话。
+    import importlib
+    _real_import = builtins.__import__
+
+    def _no_witness(name, *a, **kw):
+        if name in ("dotwitness", "linksess"):
+            raise ImportError("negctl: 模拟证据端模块不可用")
+        return _real_import(name, *a, **kw)
+
+    for _blocked in ("dotwitness", "linksess"):
+        _saved = {k: sys.modules.pop(k, None) for k in ("dotwitness", "linksess")}
+        builtins.__import__ = _no_witness
+        try:
+            importlib.reload(L)
+            f65 = [f for f in L.collect() if f.layer == 6.5]
+        finally:
+            builtins.__import__ = _real_import
+            for k, v in _saved.items():
+                if v is not None:
+                    sys.modules[k] = v
+            importlib.reload(L)
+        (ok if f65 and f65[0].status == L.NOT_OBSERVED else bad)(
+            "证据端模块不可用 → 第 6.5 层仍是 NOT_OBSERVED, 不许变成 PASS(实得 %s)"
+            % [(f.status, f.code) for f in f65])
+        (ok if f65 and f65[0].code == "L6_DOT_METRICS_UNAVAILABLE" else bad)(
+            "证据端模块不可用 → code 是 L6_DOT_METRICS_UNAVAILABLE(实得 %s)"
+            % [f.code for f in f65])
+        break
 
     print()
     print("── 8. 新 reason code 都在闭集里, 且状态合法 ──")
