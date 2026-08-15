@@ -113,8 +113,17 @@ bad_case(){ # $1=名字 $2=准备命令
   systemctl stop pdg-dotwitness 2>/dev/null; systemctl reset-failed pdg-dotwitness 2>/dev/null
   eval "$2"
   systemctl start pdg-dotwitness 2>/dev/null; sleep 1.5
-  local act ev
+  # 判据是"不许**停在** active", 所以不能单点采样: unit 是 Type=simple + Restart=on-failure
+  # + RestartSec=2, 像"Python 语法损坏"那种 exec 成功但进程随即退出的故障, 每个 ~2.05s
+  # 周期里有 ~60ms 处于 active(实测的状态时间线)。1.5s 这一刀落在哪一段取决于机器快慢,
+  # CI 上就真撞进去过一次, 于是本该绿的格判红。
+  # 改成有界轮询: 窗口内只要观察到一次非 active, 就证明服务没能留住 —— 全程 active 才是
+  # 假健康态。真的"起来了且一直活着"会把 4 秒轮询走满, 照样判红, 判据没有被放宽。
+  local act ev i=0
   act=$(systemctl is-active pdg-dotwitness 2>/dev/null)
+  while [ "$act" = active ] && [ "$i" -lt 40 ]; do
+    sleep 0.1; act=$(systemctl is-active pdg-dotwitness 2>/dev/null); i=$((i+1))
+  done
   ev=$([ -f /run/pdg-dotwitness/evidence.json ] && echo 有 || echo 无)
   q "$L.probe.dot.sysd.test" >/dev/null 2>&1
   sleep 0.3
