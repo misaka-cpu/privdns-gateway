@@ -15,7 +15,9 @@
 字节都不动。
 """
 import argparse
+import ast
 import hashlib
+import io
 import os
 import re
 import shutil
@@ -50,6 +52,12 @@ I = "install.sh"
 PY_TESTS = ["tests/test-dot-witness.py", "tests/test-dot-render.py",
             "tests/test-dot-privacy.py", "tests/test-dot-faults.py",
             "tests/test-dot-strict.py"]
+
+# 以 M(mosdns 的 YAML)为目标的负控 ID —— 钉死集合, 不钉数量。
+# 每个 ID 都代表"这条 mutation 已经用钉定 mosdns 真加载验证过, 改坏后 YAML 仍合法";
+# syntax_ok() 对 .yaml 恒真, 所以这份人工复核是唯一的保障(理由见那里的注释)。
+# 集合一旦增删、或有别的负控改成打 M, check_yaml_inventory() 会判红, 提醒重新复核。
+M_CLASS_IDS = frozenset({1, 2, 5, 6, 7, 17})
 
 npass = nfail = nskip = nunver = 0
 FAILED = []
@@ -144,8 +152,70 @@ def syntax_ok(cp, rel):
         r = subprocess.run(["bash", "-n", p], capture_output=True)
         return r.returncode == 0
     if rel.endswith(".yaml"):
-        return True          # mosdns 的 YAML 由真 mosdns 校验, 见 render 类负控
+        # **本 runner 没有 YAML 语法门。** 这里恒真, 不是"另有人管", 而是真的没管 ——
+        # 早先那句"由真 mosdns 校验, 见 render 类负控"是假话: 本文件的 catcher 全是
+        # tests/test-dot-*.py 这类纯静态测试, 从不启动 mosdns; 真 mosdns 的加载发生在
+        # e2e-dot-migrate.sh 与 ci-dot-fixture.sh 里, 那是另一条路, 校验的也不是这里的
+        # mutation。
+        #
+        # 为什么现在可以这样放着: 当前六条 M 类 mutation(见 M_CLASS_IDS)已用钉定的
+        # mosdns v5.3.4 逐条真加载验证过, 改坏后产出的 YAML 全部仍然合法 —— 所以它们的
+        # 红灯不可能来自解析失败。
+        #
+        # **新增或调整任何改 .yaml 的 mutation 时, 必须重新做一次真 mosdns 加载复核**,
+        # 否则一条破坏缩进/引号的 mutation 会让"YAML 解析失败导致的红"冒充"契约被守住",
+        # 而这正是 runner 自检第 4 项对 .py/.sh 拦着、对 .yaml 拦不住的那类假绿。
+        # 下面的 check_yaml_inventory() 把 M 类 ID 集合钉死, 集合一变就判红提醒复核。
+        return True
     return True
+
+
+def _m_class_ids(src):
+    """从源码里抽出所有以 M 为目标的 nc() 调用的 ID(保留重复, 供查重)。
+
+    用 AST 而不是正则: 锚点里满是引号、反斜杠与跨行字符串, 正则抽这种东西迟早抽歪,
+    而抽歪的清单会安静地给出错误的"集合一致"。只取前四个位置参数里的字面量 ——
+    edits 是不是字面量无所谓(NC5 的就不是), 这里不碰它。
+    """
+    ids = []
+    for node in ast.walk(ast.parse(src)):
+        if not (isinstance(node, ast.Call) and getattr(node.func, "id", "") == "nc"):
+            continue
+        a = node.args
+        if len(a) < 4 or getattr(a[3], "id", None) != "M":
+            continue
+        try:
+            ids.append(ast.literal_eval(a[1]))
+        except (ValueError, SyntaxError):        # ID 不是字面量: 本身就该判红
+            ids.append(None)
+    return ids
+
+
+def check_yaml_inventory(src=None):
+    """fail-closed: M 类负控的 ID 集合必须与 M_CLASS_IDS 逐个相等。
+
+    这**不是** YAML 解析器, 也不打算变成一个: 它只回答"改 .yaml 的负控还是不是原来
+    那几条"。是 → 之前那次真 mosdns 复核仍然作数; 不是 → 判红, 让人去重做复核。
+    """
+    if src is None:
+        with io.open(__file__, encoding="utf-8") as f:
+            src = f.read()
+    ids = _m_class_ids(src)
+    if any(i is None for i in ids):
+        bad("YAML mutation 清单: 有 nc() 的 ID 不是字面量, 无法核对集合")
+        return
+    dup = sorted({i for i in ids if ids.count(i) > 1})
+    if dup:
+        bad("YAML mutation 清单: ID 重复 %s —— 集合语义被破坏" % dup)
+        return
+    got = frozenset(ids)
+    if got == M_CLASS_IDS:
+        ok("YAML mutation 清单未变(NC%s), 之前的真 mosdns 加载复核仍作数"
+           % ", NC".join(str(i) for i in sorted(got)))
+        return
+    bad("YAML mutation 清单变了: 多 %s / 少 %s —— syntax_ok() 对 .yaml 恒真, "
+        "必须用钉定 mosdns 重做一次真加载复核, 再更新 M_CLASS_IDS"
+        % (sorted(got - M_CLASS_IDS) or "无", sorted(M_CLASS_IDS - got) or "无"))
 
 
 def run_test(cp, rel, extra_env=None):
@@ -253,6 +323,47 @@ def self_check():
     results.append(("8 收尾副本干净", not cp.verify_all()))
     cp.drop()
 
+    # 9-12 YAML mutation 清单的 fail-closed 自检。喂**合成源码**给 check_yaml_inventory,
+    # 不动真文件 —— 它只读源码文本, 正好可以这样验。
+    with io.open(__file__, encoding="utf-8") as _f:
+        _src = _f.read()
+
+    def _inv(src_text):
+        """跑一次清单核对, 返回它是否判红(不计入正式统计)。"""
+        global npass, nfail, FAILED
+        p0, f0 = npass, nfail
+        check_yaml_inventory(src_text)
+        got_fail = nfail > f0
+        npass, nfail = p0, f0
+        if got_fail:
+            FAILED.pop()
+        return got_fail
+
+    # 9 多一条 M 类: 把 NC6 那行的目标从 M 换成 M 再多加一条打 M 的 nc()
+    _add = _src + '\n\ndef _synthetic_extra():\n    nc(cp, 99, "合成: 新增 M 类", M, [], 1, [])\n'
+    results.append(("9 新增 M 类 ID → 判红", _inv(_add)))
+
+    # 10/11 改的必须是**真正的 nc() 调用点**, 不是上面这几行自检里的同款字面量 ——
+    # 那些字面量在文件里排在调用点前面, 用 replace(..., 1) 会先命中它们, 于是合成源码
+    # 其实没变、自检恒绿。用 rfind 从后往前替换, 打的就是真调用点(这个坑本身值得留注)。
+    def _sub_last(text, old, new):
+        i = text.rfind(old)
+        return text if i < 0 else text[:i] + new + text[i + len(old):]
+
+    # 10 少一条 M 类: 把 NC17 的目标由 M 改成 W(它就不再算 M 类)
+    _del = _sub_last(_src, 'nc(cp, 17, "模板端口与 witness 默认端口漂移", M,',
+                     'nc(cp, 17, "模板端口与 witness 默认端口漂移", W,')
+    results.append(("10 删除既有 M 类 ID → 判红", _inv(_del) if _del != _src else False))
+
+    # 11 非 M 类改成 M: NC3 本来打 W, 改成打 M
+    _flip = _sub_last(_src, 'nc(cp, 3, "label 放宽为任意文本", W,',
+                      'nc(cp, 3, "label 放宽为任意文本", M,')
+    results.append(("11 非 M 类改成 M → 判红", _inv(_flip) if _flip != _src else False))
+
+    # 12 只加无关注释 → 仍绿(否则这道门会被日常编辑吵到失效)
+    _noop = _src + "\n# 合成: 与 mutation 无关的注释\n"
+    results.append(("12 只加无关注释 → 不判红", not _inv(_noop)))
+
     allok = True
     for label, got in results:
         if got:
@@ -275,6 +386,9 @@ def main():
         return 0
 
     print("\n── 正式负控 ──")
+    # 先核 YAML mutation 清单: 它是 syntax_ok() 对 .yaml 恒真时唯一的把关点,
+    # 集合一变就得重做真 mosdns 加载复核 —— 早报比跑完一轮再报有用。
+    check_yaml_inventory()
     cp = Copy()
     try:
         ALL = PY_TESTS
