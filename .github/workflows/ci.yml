@@ -405,6 +405,15 @@ jobs:
       - name: "证书路径一致性 (钩子写的目录必须就是 mosdns 读的目录; 缺省值与钩子同源)"
         run: python3 tests/test-cert-dir-sync.py
 
+      # Tailscale 节点地址与运营商 SIM/APN 都用 100.64.0.0/10 —— 只看源地址分不开。
+      # 判据必须同时看入口接口, 所以这支用真 netns + 真 veth + 真 nft 加载 + 真流量;
+      # 两侧客户端地址都在同一个配置段内, 换源 IP 冒充不了。环境不足会 SKIP 并说明原因。
+      - name: "Tailscale 入口隔离 (真 netns: tailnet 不进数据面, 物理 CGNAT 照旧)"
+        run: sudo -n python3 tests/test-tailscale-ingress-isolation.py
+
+      - name: "Tailscale 入口隔离 负控 (撤排除/挪顺序/过度排除必须转红; 无关注释仍绿)"
+        run: sudo -n python3 tests/negctl/tailscale-isolation-negative-controls.py
+
       # 真 systemd: 死角复现、状态机、故障注入。容器里跑, 非 root 环境 SKIP(严格模式判失败)。
       - name: "健康自检定时器 真 systemd (死角/状态机/6 种故障注入; 环境不足则 SKIP)"
         run: sudo -E bash tests/e2e-health-timer.sh
