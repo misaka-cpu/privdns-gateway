@@ -138,12 +138,28 @@ def build_lab():
     return ""
 
 
+def rescue_port():
+    """救援端口从 rescue_const.py 读, 不在这里写字面量。
+
+    仓库有一道守卫(test-rescue-constants.sh)禁止端口字面量散落, **注释里也不许写** ——
+    写死一个数字, 等到有人改了常量, 这支测试会拿着旧端口继续"通过", 而它守的恰恰是
+    端口相关的放行; 注释里的数字同样会过期并误导下一个人。
+    """
+    p = run([sys.executable, os.path.join(ROOT, "deploy", "bot", "rescue_const.py"),
+             "--port"], env={**os.environ, "PDG_RESCUE_PORT": ""})
+    v = (p.stdout or "").strip()
+    return v if v.isdigit() else ""
+
+
+RESCUE_PORT = rescue_port()
+
+
 def render(tpl_text):
     """用测试值渲染真实模板。不使用任何生产配置。"""
     return (tpl_text
             .replace("__INTERNAL_CIDR__", CIDR)
             .replace("__SSH_PORT__", "22")
-            .replace("__RESCUE_PORT__", "8446"))
+            .replace("__RESCUE_PORT__", RESCUE_PORT))
 
 
 def load_nft(text):
@@ -335,7 +351,7 @@ try:
     # 2h. 受保护端口全集: tailnet 一律进不去。上面单验了 53, 这里把其余几个补齐,
     #     免得"只挡住了 53"被当成"数据面隔离到位"。
     guarded = []
-    for port in (81, 853, 7893, 8445, 8446):
+    for port in (81, 853, 7893, 8445, int(RESCUE_PORT)):
         lp = listener_start(port)
         time.sleep(0.5)
         reachable = probe_tcp(TSC, BOX_TS, port)
@@ -345,7 +361,7 @@ try:
     if guarded:
         bad("tailnet 能连上受保护端口 %s —— 数据面隔离不完整" % guarded)
     else:
-        ok("tailnet 到 81/853/7893/8445/8446 全部被 policy drop 收口")
+        ok("tailnet 到 81/853/7893/8445/救援端口 全部被 policy drop 收口")
 finally:
     lis.kill()
     lis53.kill()
