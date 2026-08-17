@@ -354,6 +354,37 @@ def check_dot_domain_sync():
                 f"dot-domain={f} 与证书 CN={cn} 不一致; 续期可能部署错证书。建议: echo {cn} > {DOT_DOMAIN_FILE}")
     return ("ok", "DoT 域名一致性", f"{cn} ✓")
 
+# 续期钩子写证书的目录: profile.env 的 PDG_CERT_DIR, 缺省与 deploy/cert/99-reload-cert.deploy-hook.sh
+# 里的 `CERT_DIR="${PDG_CERT_DIR:-/etc/mosdns/certs}"` 保持同一个字面量。两处改一处忘一处,
+# 这道门就会从"防线"变成"误报", 所以它们必须一起改。
+HOOK_CERT_DIR_DEFAULT = "/etc/mosdns/certs"
+
+def check_cert_dir_sync():
+    """续期钩子写证书的目录, 必须就是 mosdns 实际读证书的目录。
+
+    为什么单独立一道门: 现有的 check_cert 只问"mosdns 配的那个文件在不在、过没过期" ——
+    两个问题它都答得出"在、没过期", 因为旧证书**确实**在原地躺着。它答不出的是"下次续期
+    的新证书会不会落到这里"。于是路径一错, 整条链路全绿:certbot 续期成功、钩子退 0、
+    doctor 26 项无一异常, 而 mosdns 从头到尾抱着那张不再更新的旧证书, 直到到期当天 DoT
+    对全部手机静默失效 —— 那天没有任何一个组件会说自己出了错。
+
+    .153 上就是这样: mosdns 读 /etc/dnsdist/certs(dnsdist 时代留下的路径), 钩子写
+    /etc/mosdns/certs, 中间靠一个名叫 99-reload-dnsdist.sh 的老钩子兜着。而那个钩子
+    看名字就该跟 dnsdist 一起清掉 —— 清掉的那一刻, 到期日就成了停服日。
+    """
+    m = re.search(r'cert:\s*"([^"]+)"', _mos())
+    if not m:
+        return ("ok", "证书路径一致性", "mosdns 未配 DoT 证书, 无需检查")
+    # realpath: 软链与结尾斜杠都归一, 否则 /etc/mosdns/certs 与 /etc/mosdns/certs/ 会被判成两处。
+    mos_dir = os.path.realpath(os.path.dirname(m.group(1)))
+    hook_dir = os.path.realpath(_profile("PDG_CERT_DIR") or HOOK_CERT_DIR_DEFAULT)
+    if mos_dir != hook_dir:
+        return ("fail", "证书路径一致性",
+                f"mosdns 读 {mos_dir}, 续期钩子写 {hook_dir} —— 续期不会更新 mosdns 在用的证书, "
+                f"到期当天 DoT 会静默失效(在那之前一切正常)。二选一: 把证书迁到 {hook_dir} "
+                f"并同步改 mosdns config 的 cert/key; 或在 profile.env 写 PDG_CERT_DIR={mos_dir}")
+    return ("ok", "证书路径一致性", f"{mos_dir} ✓")
+
 def check_internal_cidr():
     c = _internal_cidr()
     if not c:
@@ -1518,7 +1549,7 @@ ALL = [check_platform, check_services, check_bot_credentials, check_health_timer
        check_internal_cidr, check_cidr_drift, check_nft, check_nft_input_chains, check_redirect, check_gms,
        check_mosdns_ratelimit, check_mosdns_explicit_proxy, check_ruleset_hijack,
        check_nft_extra, check_rescue_firewall, check_geosite_db, check_mem,
-       check_cert, check_dns, check_core_config, check_rulesets, check_rule_precedence,
+       check_cert, check_cert_dir_sync, check_dns, check_core_config, check_rulesets, check_rule_precedence,
        check_mitm_structure, check_mitm, check_transactions]
 ALERT = [check_services, check_dns, check_cert]  # healthcheck 用的轻量子集(运行期故障)
 DEEP = [check_deep_dot_handshake, check_deep_probe81, check_deep_dot_witness, check_deep_dns_cn,

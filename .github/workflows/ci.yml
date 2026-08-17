@@ -399,6 +399,12 @@ jobs:
       - name: "健康自检定时器判据 (elapsed+infinity 必须 FAIL / 正在跑不误报 / 只读)"
         run: python3 tests/test-health-timer-doctor.py
 
+      # .153 上 mosdns 读 /etc/dnsdist/certs 而续期钩子写 /etc/mosdns/certs, 靠一个看着
+      # 该被清理的老钩子兜着。这种错在证书到期前毫无征兆: 文件在、没过期、续期成功、
+      # doctor 全绿, 到期当天 DoT 对所有手机同时失效。
+      - name: "证书路径一致性 (钩子写的目录必须就是 mosdns 读的目录; 缺省值与钩子同源)"
+        run: python3 tests/test-cert-dir-sync.py
+
       # 真 systemd: 死角复现、状态机、故障注入。容器里跑, 非 root 环境 SKIP(严格模式判失败)。
       - name: "健康自检定时器 真 systemd (死角/状态机/6 种故障注入; 环境不足则 SKIP)"
         run: sudo -E bash tests/e2e-health-timer.sh
