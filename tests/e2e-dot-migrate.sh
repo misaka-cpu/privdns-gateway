@@ -36,7 +36,7 @@ sect(){ echo; echo "── $* ──"; }   # 不叫 head: 被测代码里有 `| 
 # fail-closed 的理由: 这个开关只该出现在负控里。要是它在 CI 或普通运行里被误设,
 # 矩阵会静默地只跑一小部分却照样打印"通过" —— 那正是这套东西最怕的假绿。所以未经
 # 授权就设它 = 立即非零退出, 而不是忽略。
-SECTIONS_ALL=(PREFLIGHT IDEMPOTENCY PROBE F01 F02 F03 F04 F05 F06 F07 F08 F09 F10 F11 F12 F13)
+SECTIONS_ALL=(PREFLIGHT IDEMPOTENCY PROBE F01 F02 F03 F04 F05 F06 F07 F08 F09 F10 F11 F12 F13 F14)
 SEL=""
 if [[ -n "${PDG_MIGRATE_SECTIONS+x}" ]]; then
   if [[ "${PDG_NEGCTL:-}" != 1 ]]; then
@@ -479,6 +479,56 @@ grep -q "已就绪" <<< "$out13" && bad "13 仍打印了成功文案" || ok "13 
 echo "  这一格**不要求**完整恢复 —— 环境随后整体销毁, 不带入下一格。"
 migrate_dotwitness >/dev/null 2>&1
 [[ "$(snap)" == "$BASE" ]] && ok "13 之后复跑正常迁移仍能回到健康基线" || bad "13 之后无法自愈: $(snap)"
+
+# ═══ 14. 5399 被外来进程占着 → 归属校验必须拒绝并回滚 ══════════════════════
+# 只问"有没有人在听"是不够的。witness bind 失败会返回 4, 但 Restart=on-failure 让它
+# 不停重试, Type=simple 又让它某一轮仍被判 active —— 端口始终在别人手里, 迁移却返回 0
+# 并打印"已就绪"。修复前这个错误成功路径两次复现均可达。
+#
+# 这一格不打桩: 真起一个**不设 SO_REUSEADDR** 的占位进程全程持有 5399(witness 自己
+# 也不设, 见 dotwitness.py 的 bind), 让冲突是真的。
+fi
+
+if want F14; then
+mark F14
+sect "14. 5399 被外来进程占着 → 拒绝并回滚"
+command systemctl disable --now pdg-dotwitness >/dev/null 2>&1
+command systemctl reset-failed pdg-dotwitness >/dev/null 2>&1
+sleep 1
+setsid python3 -c "
+import socket,time
+s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+s.bind(('127.0.0.1',5399))
+time.sleep(600)" </dev/null >/dev/null 2>&1 &
+sleep 1
+HOLD_PID="$(command ss -lunp 2>/dev/null | grep '127\.0\.0\.1:5399' \
+             | grep -o 'pid=[0-9]*' | cut -d= -f2 | head -1)"
+if [[ -z "$HOLD_PID" ]]; then
+  bad "14 注入未命中: 没能让外来进程占住 5399"
+else
+  ok "14 注入命中: 外来进程 PID $HOLD_PID 持有 5399"
+  B14="$(bimg)"
+  out14="$(migrate_dotwitness 2>&1)"; rc14=$?
+  [[ $rc14 != 0 ]] && ok "14 迁移 rc 非零($rc14) —— 没把别人的监听当成自己就绪" \
+                   || bad "14 迁移返回 0, 但 5399 在外来进程手里"
+  grep -q "被别的进程占着" <<< "$out14" \
+    && ok "14 点名了归属不符(不是含糊说「没在监听」)" || bad "14 没说清是归属问题"
+  grep -q "已就绪" <<< "$out14" && bad "14 仍打印了成功文案" || ok "14 没有成功文案"
+  # 回滚必须精确: 三文件 + 服务 enabled/active 全部回到本格 before-image
+  # 精确回滚的判据就是 bimg 逐字段相等: 三文件的 sha/mode/uid/gid + 两个服务的
+  # enabled/active/failed + 5399 占用数。
+  # 不要再单独断言"受管块必须为 0" —— 本格的 before-image 是**已迁移态**(上面「0. 健康
+  # 基线」那次迁移成功写过受管块), 精确回滚理应回到"有受管块", 断言为 0 反而自相矛盾。
+  # 第一版就是这么写红的, 而产品其实是对的。
+  [[ "$(bimg)" == "$B14" ]] && ok "14 **即时**回滚: 三文件+enabled/active+5399 精确回到 before-image" \
+                            || bad "14 即时回滚不精确"$'\n'"      前: $B14"$'\n'"      后: $(bimg)"
+  # 普通 DNS 不受影响 —— 这条门失败不许波及解析
+  [[ -n "$(dns_udp)" ]] && ok "14 普通 DNS 仍可用" || bad "14 普通 DNS 挂了"
+fi
+kill "$HOLD_PID" 2>/dev/null || true
+sleep 1
+migrate_dotwitness >/dev/null 2>&1
+[[ "$(snap)" == "$BASE" ]] && ok "14 端口释放后复跑迁移 → 回到健康基线" || bad "14 释放后未回基线: $(snap)"
 
 # ═══ 独立验收门: 真 probe(不在生产迁移里, 只在这里) ════════════════════════
 fi
