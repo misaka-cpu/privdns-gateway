@@ -32,6 +32,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import sys
 import time
 
@@ -140,13 +141,25 @@ def render(tpl_text):
 
 
 def load_nft(text):
-    """把渲染后的规则加载进 box netns。include 那行在实验床里没有对应目录, 剔掉。"""
+    """把渲染后的规则加载进 box netns。include 那行在实验床里没有对应目录, 剔掉。
+
+    临时文件必须唯一: 用固定名字(如 /tmp/pdgts-rules.nft)时, 上一轮非 root 跑留下的
+    文件会让这一轮的 root 写不进去 —— fs.protected_regular 不许 root 打开粘滞目录里
+    别人拥有的文件。表现是 PermissionError, 看着像权限不够, 其实是没清理干净。
+    """
     text = "\n".join(L for L in text.splitlines() if "nft-input.d" not in L)
-    path = "/tmp/pdgts-rules.nft"
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(text)
-    p = run("%s ip netns exec %s nft -f %s" % (SUDO, BOX, path))
-    return p.returncode == 0, (p.stderr or "").strip()
+    fd, path = tempfile.mkstemp(prefix="pdgts-rules-", suffix=".nft")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.chmod(path, 0o644)          # netns exec 下的 nft 要读得到
+        p = run("%s ip netns exec %s nft -f %s" % (SUDO, BOX, path))
+        return p.returncode == 0, (p.stderr or "").strip()
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
 
 
 def probe_tcp(ns, dst, port, timeout=3):
