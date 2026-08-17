@@ -533,6 +533,77 @@ def check_nft():
         return ("warn", "防火墙", "; ".join(extra) + "(不影响手机基础链路)")
     return ("ok", "防火墙", platform_ports_text() + " 仅限内网卡来源")
 
+
+TS_IFACE = "tailscale0"
+
+
+def _ts_isolation_scan(obj):
+    """在内核 nft JSON 里找每条链的「tailscale0 排除规则」与「首个来源匹配」的位置。
+
+    返回 {链名: (排除规则序号, 首个 saddr 规则序号)}, 找不到的用 None。
+    序号按该链内的规则出现顺序, 顺序本身就是判据 —— 先匹配再排除等于没排除。
+    """
+    pos = {}
+    idx = {}
+    for item in (obj or {}).get("nftables", []):
+        r = item.get("rule")
+        if not r or r.get("table") != "pdg":
+            continue
+        ch = r.get("chain")
+        i = idx[ch] = idx.get(ch, -1) + 1
+        ex, src = pos.get(ch, (None, None))
+        for e in r.get("expr", []):
+            m = e.get("match") or {}
+            left = m.get("left") or {}
+            if left.get("meta", {}).get("key") == "iifname" and m.get("right") == TS_IFACE:
+                if ex is None:
+                    ex = i
+            p = left.get("payload") or {}
+            if p.get("protocol") == "ip" and p.get("field") == "saddr":
+                if src is None:
+                    src = i
+        pos[ch] = (ex, src)
+    return pos
+
+
+def check_tailscale_isolation():
+    """Tailscale 入口隔离: 从 tailscale0 进来的流量不得进入 SIM/APN 数据面。
+
+    为什么单独一项: Tailscale 节点地址来自 100.64.0.0/10, 而运营商 SIM/APN 也合法用
+    同一个段(RFC 6598) —— **只看源地址分不开这两者**。所以判据不能是"看见 CGNAT 段就
+    报错"(那会误伤真实运营商用户, 也是本项目明确不接受的做法), 而必须是"排除规则在不在、
+    排得对不对"。
+
+    这一项与 Tailscale 装没装无关: 规则来自模板, 任何时候都该在。没装 Tailscale 时
+    iifname 只是永不命中, 不会因此产生告警 —— 否则每台没用 Tailscale 的机器都会平白多一条红。
+    """
+    v = _nft_view()
+    if not v.disk_ok:
+        return ("fail", "Tailscale 入口隔离", "磁盘上的防火墙配置无效: %s" % v.disk_why)
+    import nftlive
+    obj, why = nftlive.read_kernel(runner=lambda cmd: _run(cmd, 15))
+    if obj is None:
+        return ("fail", "Tailscale 入口隔离",
+                "读不到内核里的防火墙规则(%s) —— 无法确认隔离是否生效" % (why or "原因未知"))
+    pos = _ts_isolation_scan(obj)
+    if not pos:
+        return ("fail", "Tailscale 入口隔离", "内核里没有 inet pdg 的规则")
+    bad = []
+    for ch in ("prerouting", "input"):
+        if ch not in pos:
+            bad.append("%s 链不存在" % ch)
+            continue
+        ex, src = pos[ch]
+        if ex is None:
+            bad.append("%s 缺少 iifname %s 的排除规则" % (ch, TS_IFACE))
+        elif src is not None and ex > src:
+            bad.append("%s 的排除规则排在来源匹配之后(第 %d 条 > 第 %d 条)" % (ch, ex, src))
+    if bad:
+        return ("fail", "Tailscale 入口隔离",
+                "; ".join(bad) + " —— tailnet 流量可能被当成内网卡来源接管")
+    return ("ok", "Tailscale 入口隔离", "prerouting/input 均在来源匹配前排除 %s" % TS_IFACE)
+
+
 def _filesha(path):
     """文件 SHA256(读不到返回空串)。用于比对部署文件与仓库文件是否同一版本。"""
     import hashlib
@@ -1547,6 +1618,7 @@ def check_transactions():
 
 ALL = [check_platform, check_services, check_bot_credentials, check_health_timer, check_core_version, check_dot_arecord, check_dot_domain_sync,
        check_internal_cidr, check_cidr_drift, check_nft, check_nft_input_chains, check_redirect, check_gms,
+       check_tailscale_isolation,
        check_mosdns_ratelimit, check_mosdns_explicit_proxy, check_ruleset_hijack,
        check_nft_extra, check_rescue_firewall, check_geosite_db, check_mem,
        check_cert, check_cert_dir_sync, check_dns, check_core_config, check_rulesets, check_rule_precedence,
