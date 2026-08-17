@@ -148,6 +148,75 @@ def cell(n, name, rel, old, new, want, expect_red=True):
 
 TS_PRE = '        iifname "tailscale0" return\n        ip saddr __INTERNAL_CIDR__ tcp dport { 80, 443, 5228-5230 } redirect to :7893'
 TS_IN = '        iifname "tailscale0" return\n        # 80/443/5228-5230 已在 prerouting 被改写为 7893'
+ICMP_BLOCK = ('        ip protocol icmp accept\n'
+              '        ip6 nexthdr icmpv6 accept\n')
+
+# 0a) 把 tailnet return 挪回 ICMP **之前** —— 这正是上一轮的形态。ICMP 管理可达性必须转红,
+#     而数据面隔离仍然成立(所以这一格证明的是"顺序错了", 不是"隔离没了")。
+def cell_icmp_before():
+    path = os.path.join(WC, NFT)
+    with open(path, encoding="utf-8") as f:
+        src = f.read()
+    old = ICMP_BLOCK + '        # Tailscale 入口隔离'
+    if src.count(old) != 1:
+        bad("NC-TS-0a 锚点命中 %d 次, 预期 1" % src.count(old))
+        return
+    # 先摘掉 ICMP 两行, 再把它们插到 return 之后 → 等价于 return 挪到 ICMP 之前
+    mutated = src.replace(ICMP_BLOCK, "", 1).replace(
+        '        iifname "tailscale0" return\n        # 80/443',
+        '        iifname "tailscale0" return\n' + ICMP_BLOCK + '        # 80/443', 1)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(mutated)
+    try:
+        np_, fails, out = run_suite()
+        if "Traceback" in out:
+            bad("NC-TS-0a 出现 Traceback, 不算转红")
+        elif any("ICMP" in L for L in fails):
+            hit = [L for L in fails if "ICMP" in L]
+            ok("NC-TS-0a return 挪回 ICMP 之前     → ICMP 可达性转红 %d 条: %s"
+               % (len(hit), hit[0][7:80]))
+        else:
+            bad("NC-TS-0a return 挪回 ICMP 之前, ICMP 那几格**没红** —— 可达性判据没有牙齿")
+    finally:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(src)
+
+
+cell_icmp_before()
+
+
+# 0b) 把 return 挪到**全部数据面规则之后** → 隔离整个失效: DNS/受保护端口格必须转红。
+def cell_after_dataplane():
+    path = os.path.join(WC, NFT)
+    with open(path, encoding="utf-8") as f:
+        src = f.read()
+    ret = '        iifname "tailscale0" return\n'
+    tail = '        ip saddr __INTERNAL_CIDR__ udp dport 443 reject'
+    if src.count(ret) != 2 or src.count(tail) != 1:
+        bad("NC-TS-0b 锚点命中 return=%d tail=%d, 预期 2/1" % (src.count(ret), src.count(tail)))
+        return
+    # 只动 input 那一条(第二处), prerouting 的保持不动
+    head, sep, rest = src.partition('        # Tailscale 入口隔离')
+    rest = rest.replace(ret, "", 1)
+    rest = rest.replace(tail, ret + tail, 1)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(head + sep + rest)
+    try:
+        np_, fails, out = run_suite()
+        if "Traceback" in out:
+            bad("NC-TS-0b 出现 Traceback, 不算转红")
+        elif any(("DNS 接管链" in L or "受保护端口" in L) for L in fails):
+            hit = [L for L in fails if "DNS 接管链" in L or "受保护端口" in L]
+            ok("NC-TS-0b return 挪到数据面之后    → 隔离失效转红 %d 条: %s"
+               % (len(hit), hit[0][7:80]))
+        else:
+            bad("NC-TS-0b return 挪到数据面之后, 隔离格**没红** —— 顺序判据没有牙齿")
+    finally:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(src)
+
+
+cell_after_dataplane()
 
 # 1) 只撤掉 prerouting 的排除。
 #    注意这里**动态流量不会漏** —— input 的排除仍在, 会把改写后的包收口, 两道排除构成
