@@ -18,7 +18,9 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
@@ -60,7 +62,7 @@ if os.geteuid() != 0 and subprocess.run(
     print("\n有效 0, 失败 0")
     sys.exit(0)
 
-WCROOT = tempfile.mkdtemp(prefix="pdg-ts-nc-")
+WCROOT = tmpguard.mkdtemp(prefix="pdg-ts-nc-")
 WC = os.path.join(WCROOT, "repo")
 shutil.copytree(ROOT, WC, symlinks=True,
                 ignore=shutil.ignore_patterns(".git", "__pycache__", "*.pyc"))

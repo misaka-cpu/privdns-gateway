@@ -95,6 +95,8 @@ CIDR = "100.64.0.0/16"
 # 物理侧假红)。/30 让路由确定, 而地址仍在上面那个 /16 内, 要害不受影响。
 TS_ADDR, BOX_TS = "100.64.1.2", "100.64.1.1"
 PHY_ADDR, BOX_PHY = "100.64.2.2", "100.64.2.1"
+# ULA, 只用于验证模板里那条 `ip6 nexthdr icmpv6 accept` 的契约; 不涉及任何真实地址。
+TS_ADDR6, BOX_TS6 = "fd00:64::2", "fd00:64::1"
 
 
 def cleanup():
@@ -124,6 +126,10 @@ def build_lab():
         "ip -n %s addr add %s/30 dev eth0" % (PHY, PHY_ADDR),
         "ip -n %s link set eth0 up" % PHY,
         "ip -n %s link set lo up" % PHY,
+        # IPv6: 模板有 `ip6 nexthdr icmpv6 accept`, 契约要求它照旧, 所以实验床也得能发 v6。
+        # 用 ULA, 不碰任何真实地址。
+        "ip -n %s addr add %s/64 dev tailscale0 nodad" % (BOX, BOX_TS6),
+        "ip -n %s addr add %s/64 dev eth0 nodad" % (TSC, TS_ADDR6),
     ]
     for c in cmds:
         p = run("%s %s" % (SUDO, c))
@@ -166,6 +172,18 @@ def probe_tcp(ns, dst, port, timeout=3):
     """从 ns 发起一次 TCP 连接, 返回是否连上。"""
     p = run("%s ip netns exec %s timeout %d bash -c "
             "'</dev/tcp/%s/%d' 2>/dev/null" % (SUDO, ns, timeout, dst, port))
+    return p.returncode == 0
+
+
+def probe_icmp(ns, dst, timeout=3):
+    """从 ns ping 一次。走真实 ICMP echo, 不是端口探测。"""
+    p = run("%s ip netns exec %s ping -c 1 -W %d -n %s" % (SUDO, ns, timeout, dst))
+    return p.returncode == 0
+
+
+def probe_icmp6(ns, dst, timeout=3):
+    """ICMPv6 echo。模板里有 `ip6 nexthdr icmpv6 accept`, 契约要求它照旧。"""
+    p = run("%s ip netns exec %s ping -6 -c 1 -W %d -n %s" % (SUDO, ns, timeout, dst))
     return p.returncode == 0
 
 
@@ -295,6 +313,39 @@ try:
         ok("SSH 总闸未被改动: 物理侧与 tailnet 侧都放行")
     else:
         bad("SSH 放行被改坏(物理=%s tailnet=%s) —— 本轮明确不得动它" % (a, b))
+
+    # 2f. **ICMP 契约**: 模板本来就有 `ip protocol icmp accept`, 隔离不得把它吃掉。
+    #     tailnet 是管理通道, ping 是最基本的可达性手段 —— 这条不是"顺便还能用",
+    #     而是冻结下来的验收项。排除规则必须排在 ICMP 放行**之后**才能同时满足两边。
+    if probe_icmp(TSC, BOX_TS):
+        ok("tailnet ICMP 可达(管理通道的既有契约保持)")
+    else:
+        bad("tailnet ICMP **不通** —— 隔离规则排在 ICMP 放行之前, 把它一起吃掉了")
+    if probe_icmp(PHY, BOX_PHY):
+        ok("物理接口 ICMP 可达(既有行为不变)")
+    else:
+        bad("物理接口 ICMP 不通 —— 改坏了既有 ICMP 放行")
+
+    # 2g. ICMPv6 同一份契约(模板有 `ip6 nexthdr icmpv6 accept`)
+    if probe_icmp6(TSC, BOX_TS6):
+        ok("tailnet ICMPv6 可达(ip6 nexthdr icmpv6 契约保持)")
+    else:
+        bad("tailnet ICMPv6 **不通** —— ICMPv6 放行被隔离规则吃掉了")
+
+    # 2h. 受保护端口全集: tailnet 一律进不去。上面单验了 53, 这里把其余几个补齐,
+    #     免得"只挡住了 53"被当成"数据面隔离到位"。
+    guarded = []
+    for port in (81, 853, 7893, 8445, 8446):
+        lp = listener_start(port)
+        time.sleep(0.5)
+        reachable = probe_tcp(TSC, BOX_TS, port)
+        lp.kill()
+        if reachable:
+            guarded.append(port)
+    if guarded:
+        bad("tailnet 能连上受保护端口 %s —— 数据面隔离不完整" % guarded)
+    else:
+        ok("tailnet 到 81/853/7893/8445/8446 全部被 policy drop 收口")
 finally:
     lis.kill()
     lis53.kill()
