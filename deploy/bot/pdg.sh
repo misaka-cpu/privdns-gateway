@@ -2429,8 +2429,8 @@ migrate_dotwitness(){
   # 会不停重试, 而 Type=simple 让它某一轮仍被判 active —— 端口始终在别人手里, 迁移
   # 却返回 0 并打出"已就绪"。这不是推演: 占位进程全程持有 5399 时两次复现均如此。
   #
-  # 判据取 systemd 记的 MainPID 与 ss -lunp 报的持有者比。MainPID 会因自动重启变化,
-  # 所以有界重采样取稳定值, 不做单点判断。
+  # 判据是"5399 的监听者归不归 pdg-dotwitness 这个 unit 管"(具体怎么比见下一段)。
+  # 自动重启会让监听者在采样瞬间缺席或换人, 所以有界重采样取稳定值, 不做单点判断。
   #
   # 拿不到归属就**放行**: 非 root 的 ss 不输出 users: 字段, 精简系统可能根本没有 ss。
   # 那是环境能力不足, 不是"端口被别人占着"的证据 —— 把未知当成不匹配, 只会让本来
@@ -2439,26 +2439,41 @@ migrate_dotwitness(){
     ss -lunp 2>/dev/null | grep '127\.0\.0\.1:5399' \
       | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u
   }
-  local _lp _mp _k=0 _seen_mp="" _match=0
+  # 归属用 **cgroup** 判, 不用 MainPID 比对。理由是后者会误伤: MainPID 与真正持有
+  # socket 的进程未必是同一个(wrapper、子进程持 fd), 而且两个信号可能不同源 ——
+  # 测试沙箱里 systemctl 是桩、ss 是真的, 桩返回的固定假 PID 永远对不上真 PID, 于是
+  # 每一次正常迁移都会被判成"端口被别人占着"并回滚。把正常迁移打回去比漏报更糟。
+  #
+  # cgroup 是 systemd 自己的归属真源: unit 的 ControlGroup 与进程的 /proc/<pid>/cgroup
+  # 直接可比, 回答的正是"这个 socket 是不是这个 unit 的"。
+  #   · 监听者 cgroup == unit 的 ControlGroup  → 是我们的, 通过
+  #   · 拿到了监听者 cgroup 且都不等          → 别人占着, fail-closed 回滚
+  #   · ControlGroup 取不到 / 不像 cgroup 路径 / 读不到 /proc → 环境给不出归属, 放行
+  # 桩环境天然落进最后一类(桩对未知属性返回 0, 不是 cgroup 路径), 不会误伤。
+  _dw_cg_of(){ sed -n 's/^0::\(.*\)$/\1/p' "/proc/$1/cgroup" 2>/dev/null | head -1; }
+  local _lp _cg _k=0 _match=0 _known=0 _saw=""
+  _cg="$(systemctl show pdg-dotwitness -p ControlGroup --value 2>/dev/null)"
   _lp="$(_dw_listener_pids)"
-  if [[ -z "$_lp" ]]; then
-    c_y "  ⚠️  取不到 5399 监听者的进程归属(需要 root 的 ss -p), 本次跳过归属校验。"
+  if [[ -z "$_lp" || "$_cg" != /* ]]; then
+    c_y "  ⚠️  取不到 5399 监听者的 cgroup 归属(需要 root 的 ss -p 与 systemd 的 ControlGroup), 本次跳过归属校验。"
   else
     while [[ $_k -lt 12 ]]; do
-      _mp="$(systemctl show pdg-dotwitness -p MainPID --value 2>/dev/null)"
-      # 只记**非 0** 的 MainPID: 自动重启退避期间它是 0, 那不是"witness 的 PID",
-      # 拿它去比或者拿它去报错都会说错话。
-      if [[ -n "$_mp" && "$_mp" != 0 ]]; then
-        _seen_mp="$_mp"
-        grep -qx -- "$_mp" <<< "$_lp" && { _match=1; break; }
-      fi
+      _known=0; _saw=""
+      while IFS= read -r _p; do
+        [[ -n "$_p" ]] || continue
+        local _pc; _pc="$(_dw_cg_of "$_p")"
+        [[ -n "$_pc" ]] || continue          # 读不到这个进程的 cgroup: 不作为证据
+        _known=1; _saw="$_saw $_pc"
+        [[ "$_pc" == "$_cg" ]] && { _match=1; break; }
+      done <<< "$_lp"
+      [[ "$_match" == 1 ]] && break
       sleep 0.25; _k=$((_k+1))
       _lp="$(_dw_listener_pids)"
-      [[ -z "$_lp" ]] && break        # 中途变成拿不到 → 按"未知"处理, 不判失败
+      [[ -z "$_lp" ]] && break               # 中途拿不到 → 按"未知"处理, 不判失败
     done
-    if [[ -n "$_lp" && -n "$_seen_mp" && "$_match" != 1 ]]; then
-      c_y "  ❌ 127.0.0.1:5399 被别的进程占着(持有者 PID $(tr '\n' ' ' <<< "$_lp")," \
-          "pdg-dotwitness 观察到的 MainPID 是 $_seen_mp), 证据端并没有真正接管这个端口, 正在回滚。"
+    if [[ "$_known" == 1 && "$_match" != 1 ]]; then
+      c_y "  ❌ 127.0.0.1:5399 被别的进程占着 —— 监听者不在 pdg-dotwitness 的 cgroup 里"
+      c_y "     (unit: $_cg; 监听者:$_saw), 证据端并没有真正接管这个端口, 正在回滚。"
       _dw_rollback; rm -rf "$work"; return 1
     fi
   fi
