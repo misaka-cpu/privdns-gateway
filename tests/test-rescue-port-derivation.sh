@@ -40,25 +40,31 @@ grep -q "ip saddr \[0-9./\]+ tcp dport \[0-9\]+ accept" "$PDG" \
 
 W="$(mktemp -d)"; trap 'rm -rf "$W"' EXIT
 
+# 端口从常量读, 不写字面量(test-rescue-constants.sh 守着这条, 注释里也不许写)。
+# 这支验的恰恰是"端口反解", 拿写死的数字当期望值, 常量一改它就在测一个不存在的端口。
+RP="$(env -u PDG_RESCUE_PORT python3 "$ROOT/deploy/bot/rescue_const.py" --port 2>/dev/null)"
+[[ "$RP" =~ ^[0-9]+$ ]] || { echo "[FAIL] 读不到救援端口常量"; exit 1; }
+OTHER=$(( RP + 1553 ))   # 另一个"确实不同"的端口, 由常量派生而非另写一个字面量
+
 # 形态一: jp 的真实形态 —— 注入规则, saddr 与 dport 之间有 ip daddr
-printf 'ip saddr 172.22.0.0/16 ip daddr 10.0.0.1 tcp dport 8446 accept comment "pdg-rescue"\n' > "$W/a"
-[[ "$(derive "$W/a")" == 8446 ]] \
-  && ok "注入形态(含 ip daddr + pdg-rescue 标记)反解出 8446" \
-  || bad "注入形态反解得到 '$(derive "$W/a")', 期望 8446 —— 旧模板机器就是卡在这里"
+printf 'ip saddr 172.22.0.0/16 ip daddr 10.0.0.1 tcp dport %s accept comment "pdg-rescue"\n' "$RP" > "$W/a"
+[[ "$(derive "$W/a")" == "$RP" ]] \
+  && ok "注入形态(含 ip daddr + pdg-rescue 标记)反解出救援端口" \
+  || bad "注入形态反解得到 '$(derive "$W/a")', 期望常量值 —— 旧模板机器就是卡在这里"
 
 # 形态二: 模板独立行 —— 没启用过救援的机器上只有这个
-printf 'ip saddr 172.22.0.0/16 tcp dport 8446 accept\n' > "$W/b"
-[[ "$(derive "$W/b")" == 8446 ]] \
-  && ok "模板独立行反解出 8446" || bad "模板独立行反解失败"
+printf 'ip saddr 172.22.0.0/16 tcp dport %s accept\n' "$RP" > "$W/b"
+[[ "$(derive "$W/b")" == "$RP" ]] \
+  && ok "模板独立行反解出救援端口" || bad "模板独立行反解失败"
 
 # 形态三: 两者并存(启用救援的当前模板机器)—— 标记优先, 且不得因两条都匹配而判"多个"
-printf 'ip saddr 172.22.0.0/16 ip daddr 10.0.0.1 tcp dport 8446 accept comment "pdg-rescue"\nip saddr 172.22.0.0/16 tcp dport 8446 accept\n' > "$W/c"
-[[ "$(derive "$W/c")" == 8446 ]] \
+printf 'ip saddr 172.22.0.0/16 ip daddr 10.0.0.1 tcp dport %s accept comment "pdg-rescue"\nip saddr 172.22.0.0/16 tcp dport %s accept\n' "$RP" "$RP" > "$W/c"
+[[ "$(derive "$W/c")" == "$RP" ]] \
   && ok "两种形态并存时反解出单值(标记优先, 不误判为多个)" \
   || bad "并存时反解得到 '$(derive "$W/c")'"
 
 # 形态四: 真的有两个不同端口 → 必须给出多值, 由调用方 fail-closed
-printf 'ip saddr 172.22.0.0/16 tcp dport 8446 accept\nip saddr 10.0.0.0/8 tcp dport 9999 accept\n' > "$W/d"
+printf 'ip saddr 172.22.0.0/16 tcp dport %s accept\nip saddr 10.0.0.0/8 tcp dport %s accept\n' "$RP" "$OTHER" > "$W/d"
 # 数法必须和生产一致: `printf '%s'` 不带尾换行, wc -l 会把两个值数成 1 —— 生产用的是
 # `printf '%s\n' | grep -c .`, 这里照抄, 否则测的是我自己的计数而不是生产的判据。
 [[ "$(printf '%s\n' "$(derive "$W/d")" | grep -c .)" -ge 2 ]] \
