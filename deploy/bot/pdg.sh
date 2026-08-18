@@ -585,6 +585,77 @@ PY
 # 老装迁移: 防火墙内网放行集补 5228-5230(GMS/FCM 推送 mtalk.google.com 的原生端口;
 # mihomo 靠 nft 把它们 REDIRECT 进 redir 端口再嗅 SNI 分流)。幂等。
 # 只动"原装形态"的那一行(严格匹配现行端口集); 自定义端口集不碰, 提示手动加。
+# 把**模板的后续改动**同步到已经在 inet pdg 上的机器。
+#
+# migrate_firewall_to_pdg 是一次性搬迁(旧 inet filter → 独立表 inet pdg), 开头就写着
+# 「已是新表 → 无需迁移」并 return。于是已迁移的机器**再也收不到任何模板改动** ——
+# 它跑的永远是当初装机那一版渲染结果。模板里那句「本表每次更新都会按模板重建」是写了
+# 却没实现的契约。
+#
+# 平时看不出来。直到有判据开始查具体规则在不在(Tailscale 入口隔离是第一个), 升级就变成:
+# 新判据要新规则, 而没有任何一步会装上去 → doctor 判红 → cmd_update 自检门整次回滚 →
+# **新版本在所有旧机器上都装不上**。CI 的 e2e-update / e2e-upgrade-from-release 六个 job
+# 同时红, 报的就是这一条。
+#
+# 重建是安全的, 因为用户自定义规则本来就不放在这个文件里: 它们走 nft-input.d/*.conf,
+# 由模板末尾的 include 带进来, 重建不碰那个目录。这也正是模板注释承诺过的边界。
+#
+# 参数从**机器现状**里取(SSH 端口 / 内网段 / 救援端口), 不从模板猜 —— 取不到就不动,
+# 宁可这次不同步, 也不拿错参数去重建一台正在服务的机器的防火墙。
+# $1 可指定文件(供测试), 默认 /etc/nftables.conf。
+# shellcheck disable=SC2120  # $1 仅测试注入, 生产调用不传参
+migrate_firewall_template_sync(){
+  local f="${1:-/etc/nftables.conf}"
+  [[ -f "$f" ]] || return 0
+  grep -q 'table inet pdg' "$f" || return 0        # 还没迁到 inet pdg 的先走 migrate_firewall_to_pdg
+  local tpl="$REPO_DIR/deploy/firewall/nftables-mihomo.conf"
+  [[ -f "$tpl" ]] || return 0
+
+  # 现状参数: 从正在用的这份配置里反解, 而不是从 profile 猜 —— 两者不一致时, 机器上
+  # 跑着的那份才是事实。任一解不出就整体放弃本次同步。
+  local port cidr rport
+  port="$(grep -oE 'tcp dport [{] ?[0-9]+ ?[}] accept' "$f" | head -1 | grep -oE '[0-9]+')"
+  cidr="$(grep -oE 'ip saddr [0-9.]+/[0-9]+' "$f" | head -1 | awk '{print $3}')"
+  _rescue_load 2>/dev/null || true
+  rport="${PDG_RESCUE_PORT:-}"
+  if [[ -z "$port" || -z "$cidr" || -z "$rport" ]]; then
+    c_y "防火墙模板同步: 解不出 SSH端口/内网段/救援端口, 本次跳过(不拿错参数重建)。"
+    return 0
+  fi
+
+  local tmp; tmp="$(mktemp)" || return 0
+  sed -e "s|__SSH_PORT__|$port|g" -e "s|__INTERNAL_CIDR__|$cidr|g" \
+      -e "s|__RESCUE_PORT__|$rport|g" "$tpl" > "$tmp"
+
+  # 已经一致就什么都不做: 幂等, 且避免每次更新都白重启防火墙。
+  if cmp -s "$tmp" "$f"; then rm -f "$tmp"; return 0; fi
+
+  if ! nft -c -f "$tmp" >/dev/null 2>&1; then
+    c_y "防火墙模板同步: 新规则 nft -c 未过, 保留现有防火墙不动。"
+    rm -f "$tmp"; return 1
+  fi
+
+  # 先备份再落位。备份失败就不动 —— 与二进制安装同一条口径: 不在没有退路的前提下改。
+  local bak="$f.pre-tplsync"
+  if ! cp -a "$f" "$bak" 2>/dev/null || ! cmp -s "$f" "$bak"; then
+    c_y "防火墙模板同步: 备份现有配置失败, 不动。"
+    rm -f "$tmp"; return 1
+  fi
+  c_g "防火墙按模板重建(同步模板改动; 你在 nft-input.d/ 里的规则不受影响)…"
+  if ! cat "$tmp" > "$f"; then
+    c_y "防火墙模板同步: 写入失败, 从备份恢复。"
+    cat "$bak" > "$f" 2>/dev/null; rm -f "$tmp"; return 1
+  fi
+  rm -f "$tmp"
+  if ! nft -f "$f" >/dev/null 2>&1; then
+    c_y "防火墙模板同步: 加载新规则失败 → 回滚到同步前那份并重新加载。"
+    cat "$bak" > "$f" 2>/dev/null
+    nft -f "$f" >/dev/null 2>&1 || c_y "  ⚠️ 回滚后的规则也没加载成功, 请人工检查 $f"
+    return 1
+  fi
+  return 0
+}
+
 # $1 可指定文件(供测试), 默认 /etc/nftables.conf; 测试时 nft 可用函数打桩。
 # shellcheck disable=SC2120  # $1 仅测试注入, 生产调用不传参
 migrate_fw_gms(){
@@ -3157,7 +3228,10 @@ run_all_migrations(){
   migrate_rescue_plane || true             # 老机首次获得救援平面(用户停用过则不动)
   migrate_backend_marker || true           # 再把内核标记落地(别再靠默认值兜底)
   migrate_cidr_single_source || true       # 先立真源: 后续 nft/mosdns/救援都从它读
-  migrate_botenv || true; migrate_firewall_to_pdg || true; migrate_mosdns_concurrent || true
+  migrate_botenv || true; migrate_firewall_to_pdg || true
+  # 搬迁之后紧接着同步模板改动: 前者管"换表", 后者管"换表之后模板又变了"。
+  migrate_firewall_template_sync || true
+  migrate_mosdns_concurrent || true
   migrate_mosdns_unlock || true; migrate_fw_gms || true
   migrate_mosdns_ratelimit || true; migrate_lowmem || true; migrate_mihomo_safepaths || true
   migrate_deploy_botfiles || true; migrate_deploy_units || true
