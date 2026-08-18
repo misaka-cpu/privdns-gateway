@@ -119,12 +119,35 @@ try:
 
     print("\n── 二、调生产函数 ──")
     shim = make_shim(work)
+
+    def call_sync(count_calls=False, fail_load=False, fake_ok_load=False):
+        """调生产函数一次, 返回 rc。count_calls=True 时把 nft 调用记进 calls.log,
+        用来证明 B 态确实**没有**执行 nft -f —— 只看返回码分不出 no-op 和"重载了但结果一样"。"""
+        log = os.path.join(work, "calls.log")
+        open(log, "w").close()
+        # 记账必须做在**那个 bash 函数里面**: 同名函数会遮蔽 PATH 上的垫片, 靠垫片记账
+        # 日志恒空, "零 nft -f"就成了永远成立的空判据 —— 上一版正是这么假绿的。
+        # 故障注入放在**那个 bash 函数**里(生产函数看到的就是它):
+        #   fail_load    → `nft -f` 返回非零, 内核不动 —— 验"失败不冒充成功"
+        #   fake_ok_load → `nft -f` 返回 0 但**什么都不加载** —— 验 reload 后的复核
+        #                  真的在读内核, 而不是拿 nft 的返回码当结论
+        inj = ""
+        if fail_load:
+            inj = 'if [ "$1" = "-f" ]; then return 1; fi; '
+        elif fake_ok_load:
+            inj = 'if [ "$1" = "-f" ]; then return 0; fi; '
+        cmd = SYNC_CMD.replace('nft(){ printf', 'nft(){ ' + inj + 'printf', 1)
+        p = subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                           executable="/bin/bash", env={**env, "PDG_NFT_CALLS": log})
+        m = re.search(r"rc=(\d+)", p.stdout or "")
+        return int(m.group(1)) if m else -1
+
     # PATH 要**整个换掉**而不是前置: sudo 的 secure_path 会把继承来的 PATH 覆盖,
     # 于是垫片明明在也用不上, 表现成"nft 返回非零" —— 看着像内核读不到。
     env = {**os.environ, "PATH": shim + ":/usr/sbin:/usr/bin:/sbin:/bin",
            "REPO_DIR": ROOT}
-    fn = subprocess.run(
-        'export REPO_DIR=%s; nft(){ %s ip netns exec %s /usr/sbin/nft "$@"; }; '
+    SYNC_CMD = (
+        'export REPO_DIR=%s; nft(){ printf "%%s\\n" "$*" >> "$PDG_NFT_CALLS"; %s ip netns exec %s /usr/sbin/nft "$@"; }; '
         'c_g(){ echo "    [prod] $*"; }; c_y(){ echo "    [prod] $*"; }; '
         'eval "$(sed -n "/^_rescue_load()/,/^}/p" %s/deploy/bot/pdg.sh)" 2>/dev/null; '
         # 判据 helper 必须一并抽出 —— 漏了它, 生产函数调到一个未定义的名字, shell 返回
@@ -133,8 +156,8 @@ try:
         'eval "$(sed -n "/^_fw_live_has_template_invariants()/,/^}/p" %s/deploy/bot/pdg.sh)"; '
         'eval "$(sed -n "/^migrate_firewall_template_sync()/,/^}/p" %s/deploy/bot/pdg.sh)"; '
         'migrate_firewall_template_sync %s; echo "rc=$?"'
-        % (ROOT, SUDO, NS, ROOT, ROOT, ROOT, conf),
-        shell=True, capture_output=True, text=True, executable="/bin/bash", env=env)
+        % (ROOT, SUDO, NS, ROOT, ROOT, ROOT, conf))
+    fn = subprocess.run(SYNC_CMD, shell=True, capture_output=True, text=True, executable="/bin/bash", env=env)
     rc = re.search(r"rc=(\d+)", fn.stdout or "")
     rc = int(rc.group(1)) if rc else -1
     print("       生产函数 rc=%d" % rc)
@@ -160,6 +183,57 @@ try:
         ok("磁盘 mtime 未变")
     else:
         bad("磁盘 mtime 变了")
+    # ── 五、B 态: 磁盘新、内核新 → 必须是真 no-op ────────────────────────────
+    print("\n── 五、B 态必须零写盘零加载 ──")
+    b_sha = run("sha256sum %s" % conf).stdout.split()[0]
+    b_mt = os.stat(conf).st_mtime_ns
+    calls0 = len(open(os.path.join(work, "calls.log"), encoding="utf-8").read().splitlines()) \
+        if os.path.exists(os.path.join(work, "calls.log")) else 0
+    rc_b = call_sync(count_calls=True)
+    calls1 = len(open(os.path.join(work, "calls.log"), encoding="utf-8").read().splitlines())
+    loads = sum(1 for L in open(os.path.join(work, "calls.log"), encoding="utf-8")
+                if L.startswith("-f "))
+    if rc_b == 0:
+        ok("B 态返回 0")
+    else:
+        bad("B 态返回 %d(内核已满足不变量时应为 0)" % rc_b)
+    if run("sha256sum %s" % conf).stdout.split()[0] == b_sha and os.stat(conf).st_mtime_ns == b_mt:
+        ok("B 态零写盘(摘要与 mtime 均不变)")
+    else:
+        bad("B 态写盘了 —— 内核已是新版, 不该动磁盘")
+    if loads == 0:
+        ok("B 态零 nft -f(没有多余 reload)")
+    else:
+        bad("B 态执行了 %d 次 nft -f —— 应当完全 no-op" % loads)
+
+    # ── 六、reload 失败必须返回非零, 且内核保持 before-image ──────────────────
+    print("\n── 六、reload 失败注入 ──")
+    load(OLD)
+    rc_f = call_sync(fail_load=True)
+    if rc_f != 0:
+        ok("reload 失败 → 返回非零(%d), 不冒充成功" % rc_f)
+    else:
+        bad("reload 失败仍返回 0 —— 更新会据此当成已收敛")
+    if not kernel_has_ts():
+        ok("内核保持 before-image(仍是 OLD)")
+    else:
+        bad("内核被污染了")
+
+    # ── 七、reload 成功但内核仍未收敛 → 复核必须抓住 ─────────────────────────
+    print("\n── 七、注入'加载成功但没收敛' ──")
+    load(OLD)
+    rc_n = call_sync(fake_ok_load=True)
+    if rc_n != 0:
+        ok("加载返回 0 但内核未收敛 → 仍返回非零(%d)" % rc_n)
+    else:
+        bad("内核没收敛却返回 0 —— reload 后的复核形同虚设")
+
+    # 八、reload 前那道 nft -c 守的是**不可达状态**, 故不设用例。
+    #     C 态成立的前提是"磁盘 == 候选", 而候选是模板渲染的产物, 必然通过 nft -c。
+    #     往磁盘写非法内容会让它不再等于候选, 函数就走 A 态(重建)去了 —— 那测的是别的分支。
+    #     保留那道检查是纵深防御(有人手工改过盘上文件又恰好改回同样字节数?), 但诚实地说:
+    #     它在当前调用路径下不可能被触发, 所以这里不假装验过它。
+
 finally:
     run("%s ip netns del %s" % (SUDO, NS))
     shutil.rmtree(work, ignore_errors=True)
