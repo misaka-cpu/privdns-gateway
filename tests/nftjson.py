@@ -29,6 +29,11 @@ _SADDR = re.compile(r"\bip\s+saddr\s+(?P<cidr>[0-9.]+/[0-9]+)")
 _DADDR = re.compile(r"\bip\s+daddr\s+(?P<ip>[0-9.]+)")
 _DPORT = re.compile(r"\b(?P<proto>tcp|udp)\s+dport\s+(?:\{(?P<set>[^}]*)\}|(?P<one>\d+))")
 _REDIR = re.compile(r"\bredirect\s+to\s+:?(?P<port>\d+)")
+# iif 与 iifname 是**两个**匹配: 前者按接口索引(加载时解析), 后者按名字(运行时比对)。
+# 只认 iif 会让 `iifname "x" ...` 的接口条件被静默丢掉 —— 规则还在, 匹配没了, 而那是
+# 最会骗人的失真形态: 判据按接口名去找就永远找不到, 内核里其实有。
+# 先匹配 iifname(更长的那个), 否则 \biif 会先命中 iifname 的前三个字符。
+_IIFNAME = re.compile(r'\biifname\s+"(?P<dev>[^"]+)"')
 _IIF = re.compile(r'\biif\s+"(?P<dev>[^"]+)"')
 _CT = re.compile(r"\bct\s+state\s+(?P<states>[\w,]+)")
 _PROTO = re.compile(r"\bip6?\s+(?:protocol|nexthdr)\s+(?P<p>[\w-]+)")
@@ -66,10 +71,15 @@ def _match(proto, field, right):
 def _rule_expr(line):
     """一行规则 → expr 列表。认不出来的返回 None(跳过, 不猜)。"""
     expr = []
-    m = _IIF.search(line)
+    m = _IIFNAME.search(line)
     if m:
-        expr.append({"match": {"op": "==", "left": {"meta": {"key": "iif"}},
+        expr.append({"match": {"op": "==", "left": {"meta": {"key": "iifname"}},
                                "right": m.group("dev")}})
+    else:
+        m = _IIF.search(line)
+        if m:
+            expr.append({"match": {"op": "==", "left": {"meta": {"key": "iif"}},
+                                   "right": m.group("dev")}})
     m = _CT.search(line)
     if m:
         expr.append({"match": {"op": "in", "left": {"ct": {"key": "state"}},
