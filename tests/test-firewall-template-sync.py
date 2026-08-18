@@ -140,7 +140,12 @@ else:
     bad("回滚不完整没有明确告警")
 
 # 用户 include 与旧表绝不能出现在这个函数里
-if "nft-input.d" in FNB.replace("你在 nft-input.d/ 里的规则不受影响", ""):
+# 只看代码行, 并剔掉 c_g/c_y 的提示文案: 告诉用户"你的 nft-input.d 规则不受影响"
+# 是**说明**, 不是**触碰**。判据认字符串就会把这种文案当成越界, 那是假阳性。
+FN_CODE = "\n".join(L for L in FNB.splitlines()
+                    if not L.strip().startswith("#")
+                    and not re.match(r"\s*c_[gy] ", L))
+if "nft-input.d" in FN_CODE:
     bad("函数体碰了用户 include 目录")
 else:
     ok("函数体不触碰用户 include 目录")

@@ -21,6 +21,9 @@ import subprocess
 import sys
 import tempfile
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import tmpguard
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 TPL = os.path.join(ROOT, "deploy", "firewall", "nftables-mihomo.conf")
@@ -62,7 +65,7 @@ OLD = "\n".join(L for L in NEW.splitlines() if 'iifname "tailscale0"' not in L)
 
 run("%s ip netns del %s" % (SUDO, NS))
 run("%s ip netns add %s" % (SUDO, NS))
-work = tempfile.mkdtemp(prefix="pdgdrift-")
+work = tmpguard.mkdtemp(prefix="pdgdrift-")
 conf = os.path.join(work, "nftables.conf")
 
 
@@ -79,7 +82,7 @@ def make_shim(d):
     with open(p, "w", encoding="utf-8") as f:
         # 垫片本身不再套 sudo: 这段判据已在 root 下跑, 再套一层会撞上 sudo 的 secure_path,
         # 表现成 "nft 返回非零" —— 看着像内核读不到, 其实是垫片没被执行。
-        f.write('#!/bin/sh\nexec ip netns exec %s /usr/sbin/nft "$@"\n' % NS)
+        f.write('#!/bin/sh\nexec %s ip netns exec %s /usr/sbin/nft "$@"\n' % (SUDO, NS))
     os.chmod(p, 0o755)
     return SHIM
 

@@ -415,6 +415,18 @@ jobs:
       - name: "防火墙按模板重建 (已迁移的机器也要收到模板改动; 参数反解 fail-closed)"
         run: sudo -n python3 tests/test-firewall-template-sync.py
 
+      # 磁盘已是新版而内核仍跑旧规则 —— 据磁盘判 no-op 会让防火墙停在旧规则上。
+      - name: "防火墙磁盘/内核漂移 (C 态只 reload 不写盘; B 态真 no-op; 失败注入)"
+        run: sudo -n python3 tests/test-firewall-live-drift.py
+
+      # 转换器认不出的匹配会被静默丢弃, 判据据此看不见内核里确实存在的规则。
+      - name: "nftjson 表达式覆盖 (iifname 等匹配不得在转换时丢失)"
+        run: python3 tests/test-nftjson-coverage.py
+
+      # 夹具渲染不全会造出"不像真机"的沙箱: 漏一个占位符, 参数反解就失败。
+      - name: "E2E 夹具模板渲染闭包 (模板每个占位符夹具都得替换)"
+        run: python3 tests/test-e2e-seed-render.py
+
       - name: "Tailscale 入口隔离 负控 (撤排除/挪顺序/过度排除必须转红; 无关注释仍绿)"
         run: sudo -n python3 tests/negctl/tailscale-isolation-negative-controls.py
 
@@ -726,6 +738,7 @@ jobs:
           - e2e-snapshot-meta.sh
           - e2e-config-transaction.sh
           - e2e-config-transaction-recovery.sh
+          - e2e-firewall-template-sync.sh
           # v1.8.1 修的那条: v1.7.8 的更新器持着全局锁, 新版迁移在首次启用救援平面时
           # 撞上这把锁 → __migrate 退出 → 整次更新回滚。它只在"旧脚本装新版"这条路上
           # 出现, 而且 --dry-run 复现不了(不跑迁移), 所以必须在 CI 里真跑一遍五种救援状态。
