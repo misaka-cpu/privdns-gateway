@@ -66,6 +66,24 @@ work = tempfile.mkdtemp(prefix="pdgdrift-")
 conf = os.path.join(work, "nftables.conf")
 
 
+# nftlive 的 NFT_BIN 是裸 "nft"(走 PATH), 所以把一个转发到 netns 的垫片放在 PATH 最前,
+# 生产判据就会在这个实验床的内核上取数 —— 不需要给产品加环境变量后门或测试特判。
+SHIM = None
+
+
+def make_shim(d):
+    global SHIM
+    SHIM = os.path.join(d, "bin")
+    os.makedirs(SHIM, exist_ok=True)
+    p = os.path.join(SHIM, "nft")
+    with open(p, "w", encoding="utf-8") as f:
+        # 垫片本身不再套 sudo: 这段判据已在 root 下跑, 再套一层会撞上 sudo 的 secure_path,
+        # 表现成 "nft 返回非零" —— 看着像内核读不到, 其实是垫片没被执行。
+        f.write('#!/bin/sh\nexec ip netns exec %s /usr/sbin/nft "$@"\n' % NS)
+    os.chmod(p, 0o755)
+    return SHIM
+
+
 def nft(args):
     return run("%s ip netns exec %s nft %s" % (SUDO, NS, args))
 
@@ -100,17 +118,28 @@ try:
     disk_mt0 = os.stat(conf).st_mtime_ns
 
     print("\n── 二、调生产函数 ──")
+    shim = make_shim(work)
+    # PATH 要**整个换掉**而不是前置: sudo 的 secure_path 会把继承来的 PATH 覆盖,
+    # 于是垫片明明在也用不上, 表现成"nft 返回非零" —— 看着像内核读不到。
+    env = {**os.environ, "PATH": shim + ":/usr/sbin:/usr/bin:/sbin:/bin",
+           "REPO_DIR": ROOT}
     fn = subprocess.run(
-        'REPO_DIR=%s; nft(){ %s ip netns exec %s /usr/sbin/nft "$@"; }; '
-        'c_g(){ :; }; c_y(){ :; }; '
+        'export REPO_DIR=%s; nft(){ %s ip netns exec %s /usr/sbin/nft "$@"; }; '
+        'c_g(){ echo "    [prod] $*"; }; c_y(){ echo "    [prod] $*"; }; '
         'eval "$(sed -n "/^_rescue_load()/,/^}/p" %s/deploy/bot/pdg.sh)" 2>/dev/null; '
+        # 判据 helper 必须一并抽出 —— 漏了它, 生产函数调到一个未定义的名字, shell 返回
+        # command-not-found 的非零, 而那会被当成"内核未收敛"。前一轮就栽在这里:
+        # 同一判据单独跑是 ok, 放进测试就红, 差的不是环境, 是这一行。
+        'eval "$(sed -n "/^_fw_live_has_template_invariants()/,/^}/p" %s/deploy/bot/pdg.sh)"; '
         'eval "$(sed -n "/^migrate_firewall_template_sync()/,/^}/p" %s/deploy/bot/pdg.sh)"; '
         'migrate_firewall_template_sync %s; echo "rc=$?"'
-        % (ROOT, SUDO, NS, ROOT, ROOT, conf),
-        shell=True, capture_output=True, text=True, executable="/bin/bash")
+        % (ROOT, SUDO, NS, ROOT, ROOT, ROOT, conf),
+        shell=True, capture_output=True, text=True, executable="/bin/bash", env=env)
     rc = re.search(r"rc=(\d+)", fn.stdout or "")
     rc = int(rc.group(1)) if rc else -1
     print("       生产函数 rc=%d" % rc)
+    for L in (fn.stdout or "").splitlines():
+        if "[prod]" in L: print(L)
 
     print("\n── 三、内核必须收敛到 NEW ──")
     if kernel_has_ts():
