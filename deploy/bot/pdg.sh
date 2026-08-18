@@ -604,6 +604,32 @@ PY
 # 宁可这次不同步, 也不拿错参数去重建一台正在服务的机器的防火墙。
 # $1 可指定文件(供测试), 默认 /etc/nftables.conf。
 # shellcheck disable=SC2120  # $1 仅测试注入, 生产调用不传参
+# 内核里是否满足模板承诺的关键不变量。判据复用 doctor 那条读取链(checks.py 的 Tailscale
+# 隔离扫描), 而不是把磁盘文本与内核输出硬比 —— nft 会自行规范化写法, 硬比必出假漂移,
+# nftlive.py 开头记过这条实验。
+#
+# 覆盖面是**审计覆盖到的属性**, 不是整表一致性: 这是刻意的取舍。要做整表比较就得把候选
+# 真加载一次才能拿到规范形态, 那会给生产路径新增 netns 依赖, 代价大于收益。
+# 读不到内核 / 读不到 checks 一律非零(fail-closed), 绝不把"不知道"当成"一致"。
+_fw_live_has_template_invariants(){
+  python3 - <<PYEOF >/dev/null 2>&1
+import sys
+# 运行模块优先(线上真源), 仓库副本次之 —— cmd_update 期间新代码已在 REPO_DIR 而
+# /opt/pdg-bot 可能还是上一版; 两处都读不到就 fail-closed, 不猜。
+import os
+for _d in ("/opt/pdg-bot", os.path.join(os.environ.get("REPO_DIR", ""), "deploy", "bot")):
+    if _d and os.path.isdir(_d):
+        sys.path.insert(0, _d)
+try:
+    import checks
+    lvl = checks.check_tailscale_isolation()[0]
+except Exception:
+    sys.exit(2)
+sys.exit(0 if lvl == "ok" else 1)
+PYEOF
+}
+
+# shellcheck disable=SC2120  # $1 仅测试注入, 生产调用不传参
 migrate_firewall_template_sync(){
   local f="${1:-/etc/nftables.conf}"
   [[ -f "$f" ]] || return 0
@@ -643,7 +669,33 @@ migrate_firewall_template_sync(){
       -e "s|__RESCUE_PORT__|$rport|g" "$tpl" > "$tmp"
 
   # 已经一致就什么都不做: 幂等, 且避免每次更新都白重启防火墙。
-  if cmp -s "$tmp" "$f"; then rm -f "$tmp"; return 0; fi
+  if cmp -s "$tmp" "$f"; then
+    rm -f "$tmp"
+    # 磁盘已经是当前模板 —— 但这只说明**盘上**是新的, 不代表内核在跑它。
+    # 装机中断、配置写了没 load、快照只还原文件, 都会留下"磁盘新、内核旧"的现场:
+    # 防火墙实际按旧规则放行, 而这里若据磁盘判 no-op, 就再也没有人会把它们拉回来。
+    #
+    # 判据放在**内核一侧**, 不做"磁盘逐条 vs 内核逐条": nftables v1.0.6 下
+    # `nft -c -j -f` 输出 0 字节, 候选的规范化形态拿不到, 除非真加载(见 nftlive.py)。
+    if _fw_live_has_template_invariants; then
+      return 0                     # B 态: 磁盘新、内核新 —— 真 no-op, 不写盘不加载
+    fi
+    # C 态: 磁盘新、内核旧 → 只 reload, **不重写磁盘**(盘上那份已经是对的)
+    if ! nft -c -f "$f" >/dev/null 2>&1; then
+      c_y "内核规则落后于磁盘, 但磁盘配置 nft -c 未过 → 不加载, 请人工检查。"
+      return 1
+    fi
+    c_g "内核规则落后于磁盘配置 → 重新加载一次(不改磁盘; nft-input.d 规则不受影响)…"
+    if ! nft -f "$f" >/dev/null 2>&1; then
+      c_y "防火墙重新加载失败 —— 内核仍是加载前那份, 磁盘未动。"
+      return 1
+    fi
+    if ! _fw_live_has_template_invariants; then
+      c_y "重新加载后内核仍未收敛到模板承诺的规则 —— 不当作成功, 请人工检查。"
+      return 1
+    fi
+    return 0
+  fi
 
   if ! nft -c -f "$tmp" >/dev/null 2>&1; then
     c_y "防火墙模板同步: 新规则 nft -c 未过, 保留现有防火墙不动。"
