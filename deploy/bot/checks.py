@@ -537,6 +537,22 @@ def check_nft():
 TS_IFACE = "tailscale0"
 
 
+RESCUE_MARK = "pdg-rescue"
+
+
+def _rule_has_rescue_mark(rule):
+    """这条规则是不是救援平面注入的(带 comment "pdg-rescue")。
+
+    nft JSON 里 comment 既可能挂在规则上, 也可能作为表达式出现, 两处都认。
+    """
+    if rule.get("comment") == RESCUE_MARK:
+        return True
+    for e in rule.get("expr", []) or []:
+        if isinstance(e, dict) and e.get("comment") == RESCUE_MARK:
+            return True
+    return False
+
+
 def _ts_isolation_scan(obj):
     """在内核 nft JSON 里找每条链的「tailscale0 排除规则」与「首个来源匹配」的位置。
 
@@ -551,6 +567,16 @@ def _ts_isolation_scan(obj):
             continue
         ch = r.get("chain")
         i = idx[ch] = idx.get(ch, -1) + 1
+        # 救援平面的放行不算"数据面来源匹配"。它按设计插在 input 链首(见 rescue_nft.py),
+        # 带 `ip saddr` 但也带具体 `ip daddr` —— 是对单个绑定地址的点状放行, 不是把一整个
+        # 网段接管进 SIM/APN 数据面。把它当成来源匹配, 结论就成了"排除规则排在来源匹配
+        # 之后", 于是**任何启用过救援的机器一升级就判红** —— 实测 e2e-rescue-migration-lock
+        # 正是这么红的, 而规则本身一条不少、顺序也没问题。
+        #
+        # 认标记, 不认端口或地址: 用户完全可能自己写过同端口的放行, 而标记是我们自己注入的
+        # 凭证(rescue_nft.MARK), 也是别处精确撤销时用的同一个依据。
+        if _rule_has_rescue_mark(r):
+            continue
         ex, src = pos.get(ch, (None, None))
         for e in r.get("expr", []):
             m = e.get("match") or {}

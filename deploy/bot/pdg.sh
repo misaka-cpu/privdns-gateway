@@ -697,6 +697,34 @@ migrate_firewall_template_sync(){
     return 0
   fi
 
+  # 救援平面启用时会往这个文件里注入带 `comment "pdg-rescue"` 标记的放行(见 rescue_nft.py),
+  # 那些规则**不在模板里**。按模板重建会把它们一起抹掉 —— 后果不是"少一条规则", 而是
+  # 一台正处在救援状态的机器, 救援通道被一次常规更新切断。
+  # breakglass.py 开头记的就是同型事故: 恢复末尾 `nft -f`, 而那份配置没有救援放行。
+  #
+  # 所以重建之后、校验之前, 把标记规则原样并回候选。识别与插入都走 rescue_nft.py ——
+  # 它是唯一知道"哪条是我们的、该插在链里哪个位置"的地方, 这里不另写一套正则。
+  if grep -q 'comment "pdg-rescue"' "$f" 2>/dev/null; then
+    if ! python3 - "$f" "$tmp" <<PYEOF 2>/dev/null; then
+import re, sys
+sys.path.insert(0, "/opt/pdg-bot")
+sys.path.insert(0, __import__("os").path.join(__import__("os").environ.get("REPO_DIR", ""), "deploy", "bot"))
+import rescue_nft
+old_txt = open(sys.argv[1], encoding="utf-8").read()
+cand = open(sys.argv[2], encoding="utf-8").read()
+keep = rescue_nft._INLINE_RE.findall(old_txt)
+if not keep:
+    sys.exit(0)
+m = rescue_nft._INPUT_CHAIN_RE.search(cand)
+if not m:
+    sys.exit(1)
+out = cand[:m.end()] + "\n" + "".join(keep).rstrip("\n") + cand[m.end():]
+open(sys.argv[2], "w", encoding="utf-8").write(out)
+PYEOF
+      c_y "防火墙模板同步: 保留救援放行失败 → 不重建(不切断救援通道)。"
+      rm -f "$tmp"; return 1
+    fi
+  fi
   if ! nft -c -f "$tmp" >/dev/null 2>&1; then
     c_y "防火墙模板同步: 新规则 nft -c 未过, 保留现有防火墙不动。"
     rm -f "$tmp"; return 1
