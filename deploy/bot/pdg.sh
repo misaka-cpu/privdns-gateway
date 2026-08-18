@@ -613,13 +613,28 @@ migrate_firewall_template_sync(){
 
   # 现状参数: 从正在用的这份配置里反解, 而不是从 profile 猜 —— 两者不一致时, 机器上
   # 跑着的那份才是事实。任一解不出就整体放弃本次同步。
+  # 三个参数全部从**这台机器正在用的这份配置**反解。救援端口也一样 —— 用常量的话,
+  # 常量和机器现状不一致时会拿常量去重建, 那等于悄悄改掉这台机器的救援端口放行。
+  #
+  # 判据是"唯一且合法", 不是"非空": `head -1` 那种写法会在配置里出现多个不同值时
+  # 静默取第一个, 而那恰恰是最该停下来的情形(配置被手改过 / 上一次同步没干净)。
   local port cidr rport
-  port="$(grep -oE 'tcp dport [{] ?[0-9]+ ?[}] accept' "$f" | head -1 | grep -oE '[0-9]+')"
-  cidr="$(grep -oE 'ip saddr [0-9.]+/[0-9]+' "$f" | head -1 | awk '{print $3}')"
-  _rescue_load 2>/dev/null || true
-  rport="${PDG_RESCUE_PORT:-}"
-  if [[ -z "$port" || -z "$cidr" || -z "$rport" ]]; then
-    c_y "防火墙模板同步: 解不出 SSH端口/内网段/救援端口, 本次跳过(不拿错参数重建)。"
+  port="$(grep -oE 'tcp dport [{] ?[0-9]+ ?[}] accept' "$f" | grep -oE '[0-9]+' | sort -u)"
+  cidr="$(grep -oE 'ip saddr [0-9.]+/[0-9]+' "$f" | awk '{print $3}' | sort -u)"
+  rport="$(grep -oE 'ip saddr [0-9./]+ tcp dport [0-9]+ accept' "$f" \
+           | grep -oE 'dport [0-9]+' | grep -oE '[0-9]+' | sort -u)"
+  local why=""
+  [[ "$(printf '%s\n' "$port"  | grep -c .)" == 1 ]] || why="SSH 端口不唯一"
+  [[ "$(printf '%s\n' "$cidr"  | grep -c .)" == 1 ]] || why="${why:-内网段不唯一}"
+  [[ "$(printf '%s\n' "$rport" | grep -c .)" == 1 ]] || why="${why:-救援端口不唯一}"
+  if [[ -z "$why" ]]; then
+    [[ "$port"  =~ ^[0-9]+$ ]] && [[ "$port"  -ge 1 && "$port"  -le 65535 ]] || why="SSH 端口不合法"
+    [[ "$rport" =~ ^[0-9]+$ ]] && [[ "$rport" -ge 1 && "$rport" -le 65535 ]] || why="${why:-救援端口不合法}"
+    [[ "$cidr" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]] || why="${why:-内网段不合法}"
+  fi
+  if [[ -n "$why" ]]; then
+    # 只说哪一类参数有问题, 不回显具体值 —— 日志里不该出现这台机器的网段和端口。
+    c_y "防火墙模板同步: $why, 本次跳过(不写盘、不加载、不重启)。"
     return 0
   fi
 
@@ -636,9 +651,15 @@ migrate_firewall_template_sync(){
   fi
 
   # 先备份再落位。备份失败就不动 —— 与二进制安装同一条口径: 不在没有退路的前提下改。
-  local bak="$f.pre-tplsync"
-  if ! cp -a "$f" "$bak" 2>/dev/null || ! cmp -s "$f" "$bak"; then
-    c_y "防火墙模板同步: 备份现有配置失败, 不动。"
+  # before-image 要能把文件**完整**还原: 内容之外, 权限位与属主也得对得上, 否则"恢复了"
+  # 的是一个 root 只读或属主不对的 nftables.conf, 下次更新会在别处莫名其妙地失败。
+  local bak="$f.pre-tplsync" pre_mode pre_own
+  pre_mode="$(stat -c %a "$f" 2>/dev/null)"; pre_own="$(stat -c %u:%g "$f" 2>/dev/null)"
+  if [[ -z "$pre_mode" || -z "$pre_own" ]] || ! cp -a "$f" "$bak" 2>/dev/null \
+     || ! cmp -s "$f" "$bak" \
+     || [[ "$(stat -c %a "$bak" 2>/dev/null)" != "$pre_mode" ]] \
+     || [[ "$(stat -c %u:%g "$bak" 2>/dev/null)" != "$pre_own" ]]; then
+    c_y "防火墙模板同步: 备份现有配置失败(内容/权限/属主未能完整留存), 不动。"
     rm -f "$tmp"; return 1
   fi
   c_g "防火墙按模板重建(同步模板改动; 你在 nft-input.d/ 里的规则不受影响)…"
@@ -649,8 +670,15 @@ migrate_firewall_template_sync(){
   rm -f "$tmp"
   if ! nft -f "$f" >/dev/null 2>&1; then
     c_y "防火墙模板同步: 加载新规则失败 → 回滚到同步前那份并重新加载。"
-    cat "$bak" > "$f" 2>/dev/null
-    nft -f "$f" >/dev/null 2>&1 || c_y "  ⚠️ 回滚后的规则也没加载成功, 请人工检查 $f"
+    local rb=0
+    cat "$bak" > "$f" 2>/dev/null || rb=1
+    chmod "$pre_mode" "$f" 2>/dev/null || rb=1
+    chown "$pre_own" "$f" 2>/dev/null || rb=1
+    cmp -s "$bak" "$f" || rb=1
+    nft -f "$f" >/dev/null 2>&1 || rb=1
+    if [[ "$rb" != 0 ]]; then
+      c_y "  ⚠️ 回滚**不完整**(内容/权限/属主/加载 至少一项没成) —— 请人工检查 $f"
+    fi
     return 1
   fi
   return 0

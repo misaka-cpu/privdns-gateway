@@ -94,6 +94,61 @@ if upd:
         bad("__migrate 排在自检之后 —— 自检看到的还是旧规则, 必然误回滚")
 
 # ── 二、真 nft: 旧渲染结果 + 新模板 → 重建后语义必须等于新模板 ──────────────────
+# ── 一之二、参数反解必须"唯一且合法", 且失败时什么都不做 ─────────────────────
+print("\n── 一之二、参数反解的 fail-closed ──")
+fn = re.search(r"^%s\(\)\{(.*?)^\}" % FN, SRC, re.M | re.S)
+FNB = fn.group(1) if fn else ""
+
+if "PDG_RESCUE_PORT" in FNB and "grep -oE 'ip saddr" not in FNB:
+    bad("救援端口取自常量而非反解 —— 常量与机器现状不一致时会悄悄改掉放行")
+elif re.search(r'rport=.*grep', FNB):
+    ok("三个参数都从机器当前配置反解(救援端口也是)")
+else:
+    bad("救援端口没有从当前配置反解")
+
+# 只看代码行: 注释里提到 `head -1` 是在解释为什么不用它, 不该被算成使用。
+CODE = "\n".join(L for L in FNB.splitlines() if not L.strip().startswith("#"))
+if "sort -u" in CODE and "head -1" not in CODE:
+    ok("用 sort -u 判唯一, 代码里没有 head -1 静默取首个")
+else:
+    bad("参数反解仍可能静默取首个 —— 配置里有多个值时最该停下来")
+
+if re.search(r'-ge 1 && .*-le 65535', CODE) and "[0-9]{1,3}" in CODE:
+    ok("端口范围与网段形态都做了合法性校验")
+else:
+    bad("缺端口范围或网段形态的合法性校验")
+
+# 反解失败那条分支必须在写盘/加载之前就 return, 且不回显具体值
+pre = FNB.split("mktemp")[0]
+if "return 0" in pre and ("不写盘" in pre or "跳过" in pre):
+    ok("反解失败在 mktemp/写盘之前就返回(不写盘、不加载、不重启)")
+else:
+    bad("反解失败没有在写盘前返回")
+if re.search(r'c_y "[^"]*\$(port|cidr|rport)', FNB):
+    bad("失败文案回显了具体端口/网段 —— 日志不该出现这台机器的私有值")
+else:
+    ok("失败文案只说哪类参数有问题, 不回显具体值")
+
+# before-image 必须含 mode/uid/gid 且校验过
+if "stat -c %a" in FNB and "stat -c %u:%g" in FNB:
+    ok("before-image 覆盖内容+权限+属主, 且落盘后逐项校验")
+else:
+    bad("before-image 没有覆盖权限/属主")
+if re.search(r'rb=1', FNB) and "回滚\*\*不完整\*\*" in FNB or "回滚**不完整**" in FNB:
+    ok("回滚不完整会明确告警并返回非零")
+else:
+    bad("回滚不完整没有明确告警")
+
+# 用户 include 与旧表绝不能出现在这个函数里
+if "nft-input.d" in FNB.replace("你在 nft-input.d/ 里的规则不受影响", ""):
+    bad("函数体碰了用户 include 目录")
+else:
+    ok("函数体不触碰用户 include 目录")
+if "inet filter" in FNB:
+    bad("函数体碰了用户旧 table inet filter")
+else:
+    ok("函数体不触碰旧 table inet filter")
+
 print("\n── 二、真 nft 语义比对 ──")
 SUDO = "" if os.geteuid() == 0 else "sudo -n"
 if os.geteuid() != 0 and run("sudo -n true").returncode != 0:
