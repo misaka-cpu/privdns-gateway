@@ -115,10 +115,15 @@ else:
     bad("救援端口的替换值来源不明(既非字面量也非 rescue_const.py)")
 
 print("\n── 五、fail-closed 守卫: 渲染后残留任何 token 都必须让夹具失败 ──")
-if re.search(r"__\[A-Z\]\[A-Z0-9_\]\*__|残留.*占位符|未替换的占位符", seed):
-    ok("夹具带残留占位符守卫")
+# 只看代码行: 注释里写着"残留占位符"不构成守卫 —— 摘掉代码留下注释, 判据必须仍能发现。
+seed_code = "\n".join(L for L in seed.splitlines() if not L.strip().startswith("#"))
+has_scan = re.search(r"grep\s+-oE\s+'__\[A-Z\]", seed_code) is not None
+has_fail = re.search(r"return 1", seed_code) is not None
+if has_scan and has_fail:
+    ok("夹具带残留占位符守卫(真有扫描+非零返回, 不是注释)")
 else:
-    bad("夹具没有残留占位符守卫 —— 将来模板新增 token 又会静默漏渲染")
+    bad("夹具没有残留占位符守卫(扫描=%s 非零返回=%s) —— 模板新增 token 会静默漏渲染"
+        % (has_scan, has_fail))
 
 print("\n" + "─" * 62)
 print("通过 %d, 失败 %d" % (npass, nfail))
