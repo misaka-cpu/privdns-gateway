@@ -427,6 +427,11 @@ jobs:
       - name: "E2E 夹具模板渲染闭包 (模板每个占位符夹具都得替换)"
         run: python3 tests/test-e2e-seed-render.py
 
+      # jp 停在旧模板上, 救援端口只出现在注入规则里(saddr 与 dport 之间还有 ip daddr),
+      # 只按当前模板形状反解 → 一条都匹配不到 → 同步跳过 → 更新每次回滚。
+      - name: "救援端口反解 (注入形态与模板独立行都要认; 真多端口才算多值)"
+        run: bash tests/test-rescue-port-derivation.sh
+
       # 本地只查几个手挑的文件, 新增的 tests/*.sh 就永远进不了门 —— 本地全绿, CI 判红。
       - name: "ShellCheck 范围守卫 (本地门必须与 CI 同范围, 范围从 ci.yml 读出)"
         run: bash tests/test-shellcheck-scope.sh

@@ -647,12 +647,27 @@ migrate_firewall_template_sync(){
   local port cidr rport
   port="$(grep -oE 'tcp dport [{] ?[0-9]+ ?[}] accept' "$f" | grep -oE '[0-9]+' | sort -u)"
   cidr="$(grep -oE 'ip saddr [0-9.]+/[0-9]+' "$f" | awk '{print $3}' | sort -u)"
-  rport="$(grep -oE 'ip saddr [0-9./]+ tcp dport [0-9]+ accept' "$f" \
-           | grep -oE 'dport [0-9]+' | grep -oE '[0-9]+' | sort -u)"
+  # 救援端口有两种在机形态, 都要认 —— 这个函数存在的意义就是服务**停在旧模板上的
+  # 机器**, 它们的形态必然与当前模板不同, 只按当前模板的形状反解等于对它们永远失效:
+  #
+  #   1) 带 `pdg-rescue` 标记的注入规则(权威来源: 标记是我们自己写的凭证, 不会与用户
+  #      自己的同端口放行混淆)。注意它在 saddr 与 tcp dport 之间**还有 ip daddr** ——
+  #      漏掉这一点, jp 上一条都匹配不到, 同步被跳过, 更新每次回滚。
+  #   2) 模板里那条独立行 —— 没启用过救援的机器上只有这个, 所以标记形态缺席时拿它兜底。
+  rport="$(grep -oE 'tcp dport [0-9]+ accept comment "pdg-rescue"' "$f" \
+           | grep -oE '[0-9]+' | sort -u)"
+  if [[ -z "$rport" ]]; then
+    rport="$(grep -oE 'ip saddr [0-9./]+ tcp dport [0-9]+ accept' "$f" \
+             | grep -oE 'dport [0-9]+' | grep -oE '[0-9]+' | sort -u)"
+  fi
   local why=""
   [[ "$(printf '%s\n' "$port"  | grep -c .)" == 1 ]] || why="SSH 端口不唯一"
   [[ "$(printf '%s\n' "$cidr"  | grep -c .)" == 1 ]] || why="${why:-内网段不唯一}"
-  [[ "$(printf '%s\n' "$rport" | grep -c .)" == 1 ]] || why="${why:-救援端口不唯一}"
+  case "$(printf '%s\n' "$rport" | grep -c .)" in
+    1) ;;
+    0) why="${why:-救援端口在配置里找不到(两种形态都没匹配上)}" ;;
+    *) why="${why:-救援端口解出多个不同值}" ;;
+  esac
   if [[ -z "$why" ]]; then
     [[ "$port"  =~ ^[0-9]+$ ]] && [[ "$port"  -ge 1 && "$port"  -le 65535 ]] || why="SSH 端口不合法"
     [[ "$rport" =~ ^[0-9]+$ ]] && [[ "$rport" -ge 1 && "$rport" -le 65535 ]] || why="${why:-救援端口不合法}"
