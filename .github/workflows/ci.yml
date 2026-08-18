@@ -427,6 +427,10 @@ jobs:
       - name: "E2E 夹具模板渲染闭包 (模板每个占位符夹具都得替换)"
         run: python3 tests/test-e2e-seed-render.py
 
+      # 本地只查几个手挑的文件, 新增的 tests/*.sh 就永远进不了门 —— 本地全绿, CI 判红。
+      - name: "ShellCheck 范围守卫 (本地门必须与 CI 同范围, 范围从 ci.yml 读出)"
+        run: bash tests/test-shellcheck-scope.sh
+
       - name: "Tailscale 入口隔离 负控 (撤排除/挪顺序/过度排除必须转红; 无关注释仍绿)"
         run: sudo -n python3 tests/negctl/tailscale-isolation-negative-controls.py
 

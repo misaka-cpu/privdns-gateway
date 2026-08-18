@@ -59,9 +59,13 @@ OLD_SHA="$(sha256sum "$CONF" | cut -d' ' -f1)"
 
 # ── 调**生产函数本身** ────────────────────────────────────────────────────────
 # 只抽函数, 不复制实现; REPO_DIR 指向被测仓库。c_g/c_y 打桩避免颜色码干扰断言。
+# shellcheck disable=SC2034  # 由下面 eval 进来的生产函数读取, 静态分析看不到那层引用
 REPO_DIR="$ROOT"
 # shellcheck disable=SC1090
 eval "$(sed -n '/^_rescue_load()/,/^}/p' "$ROOT/deploy/bot/pdg.sh")" 2>/dev/null || true
+# 判据 helper 必须一并抽出: 第一次调用走 A 态(重建)不碰它, 第二次走 B/C 态才会调 ——
+# 漏了它, 幂等那格会以 command-not-found 的非零失败, 而现象看着像"同步不幂等"。
+eval "$(sed -n '/^_fw_live_has_template_invariants()/,/^}/p' "$ROOT/deploy/bot/pdg.sh")"
 eval "$(sed -n '/^migrate_firewall_template_sync()/,/^}/p' "$ROOT/deploy/bot/pdg.sh")"
 c_g(){ echo "    [prod] $*"; }; c_y(){ echo "    [prod] $*"; }
 
@@ -122,6 +126,6 @@ SHA2="$(sha256sum "$CONF" | cut -d' ' -f1)"; MT2="$(stat -c %Y "$CONF")"
 SIG2="$(nft -j list table inet pdg | python3 -c 'import json,sys,hashlib;d=json.load(sys.stdin)["nftables"];print(hashlib.sha256("".join(json.dumps(x["rule"]["expr"],sort_keys=True) for x in d if "rule" in x).encode()).hexdigest())')"
 [[ "$RC2" == 0 && "$SHA1" == "$SHA2" && "$MT1" == "$MT2" && "$SIG1" == "$SIG2" ]] \
   && ok "二次调用完全幂等(摘要/mtime/内核语义指纹均不变)" \
-  || bad "二次调用不幂等(rc=$RC2 sha:$([[ $SHA1 == $SHA2 ]] && echo 同 || echo 变) mtime:$([[ $MT1 == $MT2 ]] && echo 同 || echo 变) sig:$([[ $SIG1 == $SIG2 ]] && echo 同 || echo 变))"
+  || bad "二次调用不幂等(rc=$RC2 sha:$([[ "$SHA1" == "$SHA2" ]] && echo 同 || echo 变) mtime:$([[ "$MT1" == "$MT2" ]] && echo 同 || echo 变) sig:$([[ "$SIG1" == "$SIG2" ]] && echo 同 || echo 变))"
 
 fin
