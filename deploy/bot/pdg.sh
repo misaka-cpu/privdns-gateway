@@ -585,6 +585,185 @@ PY
 # 老装迁移: 防火墙内网放行集补 5228-5230(GMS/FCM 推送 mtalk.google.com 的原生端口;
 # mihomo 靠 nft 把它们 REDIRECT 进 redir 端口再嗅 SNI 分流)。幂等。
 # 只动"原装形态"的那一行(严格匹配现行端口集); 自定义端口集不碰, 提示手动加。
+# 把**模板的后续改动**同步到已经在 inet pdg 上的机器。
+#
+# migrate_firewall_to_pdg 是一次性搬迁(旧 inet filter → 独立表 inet pdg), 开头就写着
+# 「已是新表 → 无需迁移」并 return。于是已迁移的机器**再也收不到任何模板改动** ——
+# 它跑的永远是当初装机那一版渲染结果。模板里那句「本表每次更新都会按模板重建」是写了
+# 却没实现的契约。
+#
+# 平时看不出来。直到有判据开始查具体规则在不在(Tailscale 入口隔离是第一个), 升级就变成:
+# 新判据要新规则, 而没有任何一步会装上去 → doctor 判红 → cmd_update 自检门整次回滚 →
+# **新版本在所有旧机器上都装不上**。CI 的 e2e-update / e2e-upgrade-from-release 六个 job
+# 同时红, 报的就是这一条。
+#
+# 重建是安全的, 因为用户自定义规则本来就不放在这个文件里: 它们走 nft-input.d/*.conf,
+# 由模板末尾的 include 带进来, 重建不碰那个目录。这也正是模板注释承诺过的边界。
+#
+# 参数从**机器现状**里取(SSH 端口 / 内网段 / 救援端口), 不从模板猜 —— 取不到就不动,
+# 宁可这次不同步, 也不拿错参数去重建一台正在服务的机器的防火墙。
+# $1 可指定文件(供测试), 默认 /etc/nftables.conf。
+# shellcheck disable=SC2120  # $1 仅测试注入, 生产调用不传参
+# 内核里是否满足模板承诺的关键不变量。判据复用 doctor 那条读取链(checks.py 的 Tailscale
+# 隔离扫描), 而不是把磁盘文本与内核输出硬比 —— nft 会自行规范化写法, 硬比必出假漂移,
+# nftlive.py 开头记过这条实验。
+#
+# 覆盖面是**审计覆盖到的属性**, 不是整表一致性: 这是刻意的取舍。要做整表比较就得把候选
+# 真加载一次才能拿到规范形态, 那会给生产路径新增 netns 依赖, 代价大于收益。
+# 读不到内核 / 读不到 checks 一律非零(fail-closed), 绝不把"不知道"当成"一致"。
+_fw_live_has_template_invariants(){
+  python3 - <<PYEOF >/dev/null 2>&1
+import sys
+# 运行模块优先(线上真源), 仓库副本次之 —— cmd_update 期间新代码已在 REPO_DIR 而
+# /opt/pdg-bot 可能还是上一版; 两处都读不到就 fail-closed, 不猜。
+import os
+for _d in ("/opt/pdg-bot", os.path.join(os.environ.get("REPO_DIR", ""), "deploy", "bot")):
+    if _d and os.path.isdir(_d):
+        sys.path.insert(0, _d)
+try:
+    import checks
+    lvl = checks.check_tailscale_isolation()[0]
+except Exception:
+    sys.exit(2)
+sys.exit(0 if lvl == "ok" else 1)
+PYEOF
+}
+
+# shellcheck disable=SC2120  # $1 仅测试注入, 生产调用不传参
+migrate_firewall_template_sync(){
+  local f="${1:-/etc/nftables.conf}"
+  [[ -f "$f" ]] || return 0
+  grep -q 'table inet pdg' "$f" || return 0        # 还没迁到 inet pdg 的先走 migrate_firewall_to_pdg
+  local tpl="$REPO_DIR/deploy/firewall/nftables-mihomo.conf"
+  [[ -f "$tpl" ]] || return 0
+
+  # 现状参数: 从正在用的这份配置里反解, 而不是从 profile 猜 —— 两者不一致时, 机器上
+  # 跑着的那份才是事实。任一解不出就整体放弃本次同步。
+  # 三个参数全部从**这台机器正在用的这份配置**反解。救援端口也一样 —— 用常量的话,
+  # 常量和机器现状不一致时会拿常量去重建, 那等于悄悄改掉这台机器的救援端口放行。
+  #
+  # 判据是"唯一且合法", 不是"非空": `head -1` 那种写法会在配置里出现多个不同值时
+  # 静默取第一个, 而那恰恰是最该停下来的情形(配置被手改过 / 上一次同步没干净)。
+  local port cidr rport
+  port="$(grep -oE 'tcp dport [{] ?[0-9]+ ?[}] accept' "$f" | grep -oE '[0-9]+' | sort -u)"
+  cidr="$(grep -oE 'ip saddr [0-9.]+/[0-9]+' "$f" | awk '{print $3}' | sort -u)"
+  rport="$(grep -oE 'ip saddr [0-9./]+ tcp dport [0-9]+ accept' "$f" \
+           | grep -oE 'dport [0-9]+' | grep -oE '[0-9]+' | sort -u)"
+  local why=""
+  [[ "$(printf '%s\n' "$port"  | grep -c .)" == 1 ]] || why="SSH 端口不唯一"
+  [[ "$(printf '%s\n' "$cidr"  | grep -c .)" == 1 ]] || why="${why:-内网段不唯一}"
+  [[ "$(printf '%s\n' "$rport" | grep -c .)" == 1 ]] || why="${why:-救援端口不唯一}"
+  if [[ -z "$why" ]]; then
+    [[ "$port"  =~ ^[0-9]+$ ]] && [[ "$port"  -ge 1 && "$port"  -le 65535 ]] || why="SSH 端口不合法"
+    [[ "$rport" =~ ^[0-9]+$ ]] && [[ "$rport" -ge 1 && "$rport" -le 65535 ]] || why="${why:-救援端口不合法}"
+    [[ "$cidr" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]] || why="${why:-内网段不合法}"
+  fi
+  if [[ -n "$why" ]]; then
+    # 只说哪一类参数有问题, 不回显具体值 —— 日志里不该出现这台机器的网段和端口。
+    c_y "防火墙模板同步: $why, 本次跳过(不写盘、不加载、不重启)。"
+    return 0
+  fi
+
+  local tmp; tmp="$(mktemp)" || return 0
+  sed -e "s|__SSH_PORT__|$port|g" -e "s|__INTERNAL_CIDR__|$cidr|g" \
+      -e "s|__RESCUE_PORT__|$rport|g" "$tpl" > "$tmp"
+
+  # 已经一致就什么都不做: 幂等, 且避免每次更新都白重启防火墙。
+  if cmp -s "$tmp" "$f"; then
+    rm -f "$tmp"
+    # 磁盘已经是当前模板 —— 但这只说明**盘上**是新的, 不代表内核在跑它。
+    # 装机中断、配置写了没 load、快照只还原文件, 都会留下"磁盘新、内核旧"的现场:
+    # 防火墙实际按旧规则放行, 而这里若据磁盘判 no-op, 就再也没有人会把它们拉回来。
+    #
+    # 判据放在**内核一侧**, 不做"磁盘逐条 vs 内核逐条": nftables v1.0.6 下
+    # `nft -c -j -f` 输出 0 字节, 候选的规范化形态拿不到, 除非真加载(见 nftlive.py)。
+    if _fw_live_has_template_invariants; then
+      return 0                     # B 态: 磁盘新、内核新 —— 真 no-op, 不写盘不加载
+    fi
+    # C 态: 磁盘新、内核旧 → 只 reload, **不重写磁盘**(盘上那份已经是对的)
+    if ! nft -c -f "$f" >/dev/null 2>&1; then
+      c_y "内核规则落后于磁盘, 但磁盘配置 nft -c 未过 → 不加载, 请人工检查。"
+      return 1
+    fi
+    c_g "内核规则落后于磁盘配置 → 重新加载一次(不改磁盘; nft-input.d 规则不受影响)…"
+    if ! nft -f "$f" >/dev/null 2>&1; then
+      c_y "防火墙重新加载失败 —— 内核仍是加载前那份, 磁盘未动。"
+      return 1
+    fi
+    if ! _fw_live_has_template_invariants; then
+      c_y "重新加载后内核仍未收敛到模板承诺的规则 —— 不当作成功, 请人工检查。"
+      return 1
+    fi
+    return 0
+  fi
+
+  # 救援平面启用时会往这个文件里注入带 `comment "pdg-rescue"` 标记的放行(见 rescue_nft.py),
+  # 那些规则**不在模板里**。按模板重建会把它们一起抹掉 —— 后果不是"少一条规则", 而是
+  # 一台正处在救援状态的机器, 救援通道被一次常规更新切断。
+  # breakglass.py 开头记的就是同型事故: 恢复末尾 `nft -f`, 而那份配置没有救援放行。
+  #
+  # 所以重建之后、校验之前, 把标记规则原样并回候选。识别与插入都走 rescue_nft.py ——
+  # 它是唯一知道"哪条是我们的、该插在链里哪个位置"的地方, 这里不另写一套正则。
+  if grep -q 'comment "pdg-rescue"' "$f" 2>/dev/null; then
+    if ! python3 - "$f" "$tmp" <<PYEOF 2>/dev/null; then
+import re, sys
+sys.path.insert(0, "/opt/pdg-bot")
+sys.path.insert(0, __import__("os").path.join(__import__("os").environ.get("REPO_DIR", ""), "deploy", "bot"))
+import rescue_nft
+old_txt = open(sys.argv[1], encoding="utf-8").read()
+cand = open(sys.argv[2], encoding="utf-8").read()
+keep = rescue_nft._INLINE_RE.findall(old_txt)
+if not keep:
+    sys.exit(0)
+m = rescue_nft._INPUT_CHAIN_RE.search(cand)
+if not m:
+    sys.exit(1)
+out = cand[:m.end()] + "\n" + "".join(keep).rstrip("\n") + cand[m.end():]
+open(sys.argv[2], "w", encoding="utf-8").write(out)
+PYEOF
+      c_y "防火墙模板同步: 保留救援放行失败 → 不重建(不切断救援通道)。"
+      rm -f "$tmp"; return 1
+    fi
+  fi
+  if ! nft -c -f "$tmp" >/dev/null 2>&1; then
+    c_y "防火墙模板同步: 新规则 nft -c 未过, 保留现有防火墙不动。"
+    rm -f "$tmp"; return 1
+  fi
+
+  # 先备份再落位。备份失败就不动 —— 与二进制安装同一条口径: 不在没有退路的前提下改。
+  # before-image 要能把文件**完整**还原: 内容之外, 权限位与属主也得对得上, 否则"恢复了"
+  # 的是一个 root 只读或属主不对的 nftables.conf, 下次更新会在别处莫名其妙地失败。
+  local bak="$f.pre-tplsync" pre_mode pre_own
+  pre_mode="$(stat -c %a "$f" 2>/dev/null)"; pre_own="$(stat -c %u:%g "$f" 2>/dev/null)"
+  if [[ -z "$pre_mode" || -z "$pre_own" ]] || ! cp -a "$f" "$bak" 2>/dev/null \
+     || ! cmp -s "$f" "$bak" \
+     || [[ "$(stat -c %a "$bak" 2>/dev/null)" != "$pre_mode" ]] \
+     || [[ "$(stat -c %u:%g "$bak" 2>/dev/null)" != "$pre_own" ]]; then
+    c_y "防火墙模板同步: 备份现有配置失败(内容/权限/属主未能完整留存), 不动。"
+    rm -f "$tmp"; return 1
+  fi
+  c_g "防火墙按模板重建(同步模板改动; 你在 nft-input.d/ 里的规则不受影响)…"
+  if ! cat "$tmp" > "$f"; then
+    c_y "防火墙模板同步: 写入失败, 从备份恢复。"
+    cat "$bak" > "$f" 2>/dev/null; rm -f "$tmp"; return 1
+  fi
+  rm -f "$tmp"
+  if ! nft -f "$f" >/dev/null 2>&1; then
+    c_y "防火墙模板同步: 加载新规则失败 → 回滚到同步前那份并重新加载。"
+    local rb=0
+    cat "$bak" > "$f" 2>/dev/null || rb=1
+    chmod "$pre_mode" "$f" 2>/dev/null || rb=1
+    chown "$pre_own" "$f" 2>/dev/null || rb=1
+    cmp -s "$bak" "$f" || rb=1
+    nft -f "$f" >/dev/null 2>&1 || rb=1
+    if [[ "$rb" != 0 ]]; then
+      c_y "  ⚠️ 回滚**不完整**(内容/权限/属主/加载 至少一项没成) —— 请人工检查 $f"
+    fi
+    return 1
+  fi
+  return 0
+}
+
 # $1 可指定文件(供测试), 默认 /etc/nftables.conf; 测试时 nft 可用函数打桩。
 # shellcheck disable=SC2120  # $1 仅测试注入, 生产调用不传参
 migrate_fw_gms(){
@@ -3157,7 +3336,10 @@ run_all_migrations(){
   migrate_rescue_plane || true             # 老机首次获得救援平面(用户停用过则不动)
   migrate_backend_marker || true           # 再把内核标记落地(别再靠默认值兜底)
   migrate_cidr_single_source || true       # 先立真源: 后续 nft/mosdns/救援都从它读
-  migrate_botenv || true; migrate_firewall_to_pdg || true; migrate_mosdns_concurrent || true
+  migrate_botenv || true; migrate_firewall_to_pdg || true
+  # 搬迁之后紧接着同步模板改动: 前者管"换表", 后者管"换表之后模板又变了"。
+  migrate_firewall_template_sync || true
+  migrate_mosdns_concurrent || true
   migrate_mosdns_unlock || true; migrate_fw_gms || true
   migrate_mosdns_ratelimit || true; migrate_lowmem || true; migrate_mihomo_safepaths || true
   migrate_deploy_botfiles || true; migrate_deploy_units || true

@@ -26,11 +26,36 @@ cat >&2 <<EOF
 ──────────────────────────────────────────────
 EOF
 
+# Tailscale 的节点地址同样落在 100.64.0.0/10 —— 和运营商 CGNAT 用的是同一个段, 只看源地址
+# 分不开。若把 tailnet 的样本当成内网卡来源推成 /16 写进 PDG_INTERNAL_CIDR, nft 的 REDIRECT
+# 就会改挂到 tailnet 上, 管理流量被送进透明代理。所以这里按**入口接口**排除, 不按地址段
+# (按段排除会连真实运营商 CGNAT 一起误伤)。
+#
+# `tcpdump -i any` 从 4.99 起把接口名打在第二个字段。老版本不打 —— 那种情况下我们**拿不到
+# 入口接口这个事实**, 于是无从排除。此时:
+#   · 机器上没有 tailscale0 → 与本改动前完全等价, 照常抓(不因装没装 Tailscale 改变行为);
+#   · 机器上有 tailscale0   → 宁可不猜: 直接失败并让调用方走手输, 而不是冒险选到 tailnet。
+TS_IF="tailscale0"
+have_ts=0; ip -o link show "$TS_IF" >/dev/null 2>&1 && have_ts=1
+ifname_ok=0
+if timeout 3 tcpdump -ni any -c 1 2>/dev/null | grep -qE '^[0-9:.]+ +[A-Za-z][A-Za-z0-9_.:-]* +(In|Out|P|M|B) '; then
+  ifname_ok=1
+fi
+if [[ "$have_ts" == 1 && "$ifname_ok" == 0 ]]; then
+  cat >&2 <<EOF
+ ⚠️  本机存在 $TS_IF, 但这台的 tcpdump 不在 -i any 的输出里给接口名 ——
+     无法把 tailnet 的样本从候选里排除。为避免把 tailnet 地址误认成内网卡来源,
+     这里**不猜**。请直接手输内网卡网段(如 172.22.0.0/16), 或用 PDG_INTERNAL_CIDR 指定。
+EOF
+  echo ""; exit 1
+fi
+
 # 抓"打到网关服务端口(53/80/443/853)或 ICMP"且源/目的在私网/CGNAT 段的包; 不限 SYN, 已建连的 DoT 也能抓到
 src=$(timeout "$DUR" tcpdump -ni any -c 60 \
         '((tcp port 53 or tcp port 80 or tcp port 443 or tcp port 853) or icmp or udp port 53 or udp port 443)
          and (net 10.0.0.0/8 or net 172.16.0.0/12 or net 192.168.0.0/16 or net 100.64.0.0/10)' \
         2>/dev/null \
+      | awk -v ts="$TS_IF" '$2 != ts' \
       | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' \
       | awk -F. '($1==10)||($1==172&&$2>=16&&$2<=31)||($1==192&&$2==168)||($1==100&&$2>=64&&$2<=127)' \
       | grep -vE '\.(255|0)$' \

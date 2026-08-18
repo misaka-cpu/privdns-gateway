@@ -405,6 +405,35 @@ jobs:
       - name: "证书路径一致性 (钩子写的目录必须就是 mosdns 读的目录; 缺省值与钩子同源)"
         run: python3 tests/test-cert-dir-sync.py
 
+      # Tailscale 节点地址与运营商 SIM/APN 都用 100.64.0.0/10 —— 只看源地址分不开。
+      # 判据必须同时看入口接口, 所以这支用真 netns + 真 veth + 真 nft 加载 + 真流量;
+      # 两侧客户端地址都在同一个配置段内, 换源 IP 冒充不了。环境不足会 SKIP 并说明原因。
+      - name: "Tailscale 入口隔离 (真 netns: tailnet 不进数据面, 物理 CGNAT 照旧)"
+        run: sudo -n python3 tests/test-tailscale-ingress-isolation.py
+
+      # 模板改了却传不到已装机器上 —— 那条缺口让 v1.10.1→本分支的升级在六个 E2E 里同时红。
+      - name: "防火墙按模板重建 (已迁移的机器也要收到模板改动; 参数反解 fail-closed)"
+        run: sudo -n python3 tests/test-firewall-template-sync.py
+
+      # 磁盘已是新版而内核仍跑旧规则 —— 据磁盘判 no-op 会让防火墙停在旧规则上。
+      - name: "防火墙磁盘/内核漂移 (C 态只 reload 不写盘; B 态真 no-op; 失败注入)"
+        run: sudo -n python3 tests/test-firewall-live-drift.py
+
+      # 转换器认不出的匹配会被静默丢弃, 判据据此看不见内核里确实存在的规则。
+      - name: "nftjson 表达式覆盖 (iifname 等匹配不得在转换时丢失)"
+        run: python3 tests/test-nftjson-coverage.py
+
+      # 夹具渲染不全会造出"不像真机"的沙箱: 漏一个占位符, 参数反解就失败。
+      - name: "E2E 夹具模板渲染闭包 (模板每个占位符夹具都得替换)"
+        run: python3 tests/test-e2e-seed-render.py
+
+      # 本地只查几个手挑的文件, 新增的 tests/*.sh 就永远进不了门 —— 本地全绿, CI 判红。
+      - name: "ShellCheck 范围守卫 (本地门必须与 CI 同范围, 范围从 ci.yml 读出)"
+        run: bash tests/test-shellcheck-scope.sh
+
+      - name: "Tailscale 入口隔离 负控 (撤排除/挪顺序/过度排除必须转红; 无关注释仍绿)"
+        run: sudo -n python3 tests/negctl/tailscale-isolation-negative-controls.py
+
       # 真 systemd: 死角复现、状态机、故障注入。容器里跑, 非 root 环境 SKIP(严格模式判失败)。
       - name: "健康自检定时器 真 systemd (死角/状态机/6 种故障注入; 环境不足则 SKIP)"
         run: sudo -E bash tests/e2e-health-timer.sh
@@ -713,6 +742,7 @@ jobs:
           - e2e-snapshot-meta.sh
           - e2e-config-transaction.sh
           - e2e-config-transaction-recovery.sh
+          - e2e-firewall-template-sync.sh
           # v1.8.1 修的那条: v1.7.8 的更新器持着全局锁, 新版迁移在首次启用救援平面时
           # 撞上这把锁 → __migrate 退出 → 整次更新回滚。它只在"旧脚本装新版"这条路上
           # 出现, 而且 --dry-run 复现不了(不跑迁移), 所以必须在 CI 里真跑一遍五种救援状态。
