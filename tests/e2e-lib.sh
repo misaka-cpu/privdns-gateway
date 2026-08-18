@@ -884,8 +884,22 @@ e2e_seed_mosdns(){
 # 渲染真实防火墙配置(switch-core 要从中提取 SSH 端口)。$1=内核(singbox|mihomo)
 # v1.6.0: 只剩 mihomo 一套模板($1 保留但已无意义, 调用方不必改)。
 e2e_seed_nft(){
-  sed -e "s|__SSH_PORT__|22|g" -e "s|__INTERNAL_CIDR__|$E2E_CIDR|g" -e "s|__SERVER_IP__|$E2E_SIP|g" \
+  # 救援端口取正式常量, 不在这里写字面量 —— 写死一个数字, 常量一改夹具就造出一台
+  # 端口对不上的"机器", 而这正是最难查的那类夹具失真。
+  local _rp; _rp="$(python3 "$E2E_ROOT/deploy/bot/rescue_const.py" --port 2>/dev/null)"
+  if [[ -z "$_rp" ]]; then
+    echo "e2e_seed_nft: 读不到救援端口常量, 无法完整渲染防火墙模板" >&2; return 1
+  fi
+  sed -e "s|__SSH_PORT__|22|g" -e "s|__INTERNAL_CIDR__|$E2E_CIDR|g" -e "s|__RESCUE_PORT__|$_rp|g" \
       "$E2E_ROOT/deploy/firewall/nftables-mihomo.conf" > /etc/nftables.conf
+  # fail-closed: 真机装完不会留下未替换的占位符, 沙箱也不许。漏一个就当场失败 ——
+  # 上一次漏的是 __RESCUE_PORT__, 后果是六个升级类 E2E 同时红而现象指向别处。
+  # 只报 token 名, 不回显渲染后的配置内容。
+  local _left
+  _left="$(grep -oE '__[A-Z][A-Z0-9_]*__' /etc/nftables.conf | sort -u | tr '\n' ' ')"
+  if [[ -n "${_left// /}" ]]; then
+    echo "e2e_seed_nft: 模板未完整渲染, 残留占位符: $_left" >&2; return 1
+  fi
   # 真机上装完会 `nft -f` 应用一次, 内核里于是有这份规则。桩的"内核状态"同步过去,
   # 否则磁盘有、内核空, doctor 会如实判"读不到内核规则"——那是夹具不像真的。
   cp /etc/nftables.conf "$E2E_TMP/e2e-nft-ruleset" 2>/dev/null || true

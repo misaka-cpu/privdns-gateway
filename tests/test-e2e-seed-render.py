@@ -91,13 +91,28 @@ if residue:
 else:
     ok("渲染产物无残留占位符")
 
-print("\n── 四、救援端口必须能被反解成数字 ──")
-# 这正是 migrate_firewall_template_sync 用的那条反解, 不另写一套
-rp = re.findall(r"ip saddr \S+ tcp dport (\d+) accept", rendered)
-if rp:
-    ok("救援端口可反解为数字: 共 %d 处" % len(rp))
+print("\n── 四、救援端口的值必须来自正式常量, 且能解析成数字 ──")
+# 上面第三步是用占位值做的残留检查, 不能拿它判"是不是数字"。这里判的是**来源**:
+# 夹具替换救援端口时用的是项目常量, 还是随手写的字面量 —— 后者在常量变更后会造出
+# 一台端口对不上的"机器", 而那种失真比漏渲染更难查。
+sub = re.search(r"__RESCUE_PORT__\|([^|]*)\|", seed)
+if not sub:
+    bad("夹具没有替换 __RESCUE_PORT__(见上一格)")
+elif re.fullmatch(r"\d+", sub.group(1).strip()):
+    bad("救援端口写成了字面量 %r —— 应读 rescue_const.py, 否则常量一改夹具就失真"
+        % sub.group(1).strip())
+elif "rescue_const" in seed:
+    p_ = subprocess.run([sys.executable,
+                         os.path.join(ROOT, "deploy", "bot", "rescue_const.py"), "--port"],
+                        capture_output=True, text=True,
+                        env={**os.environ, "PDG_RESCUE_PORT": ""})
+    v = (p_.stdout or "").strip()
+    if v.isdigit():
+        ok("救援端口取自 rescue_const.py, 且解析为数字(共 %d 位)" % len(v))
+    else:
+        bad("rescue_const.py 没有给出数字端口, 夹具会渲染出非法值")
 else:
-    bad("救援端口反解不出数字 —— 生产函数会据此安全跳过同步, 防火墙停在旧规则")
+    bad("救援端口的替换值来源不明(既非字面量也非 rescue_const.py)")
 
 print("\n── 五、fail-closed 守卫: 渲染后残留任何 token 都必须让夹具失败 ──")
 if re.search(r"__\[A-Z\]\[A-Z0-9_\]\*__|残留.*占位符|未替换的占位符", seed):
