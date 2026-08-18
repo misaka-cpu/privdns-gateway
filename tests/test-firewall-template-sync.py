@@ -160,10 +160,15 @@ else:
     run("%s ip netns del %s" % (SUDO, NS))
     run("%s ip netns add %s" % (SUDO, NS))
     try:
+        # 救援端口从常量读, 不写字面量(test-rescue-constants.sh 守着这条)。
+        rp = run([sys.executable,
+                  os.path.join(ROOT, "deploy", "bot", "rescue_const.py"), "--port"],
+                 env={**os.environ, "PDG_RESCUE_PORT": ""}).stdout.strip()
+
         def render(text):
             return (text.replace("__INTERNAL_CIDR__", "172.22.0.0/16")
                         .replace("__SSH_PORT__", "22")
-                        .replace("__RESCUE_PORT__", "8446"))
+                        .replace("__RESCUE_PORT__", rp))
 
         with open(TPL, encoding="utf-8") as f:
             tpl_text = f.read()

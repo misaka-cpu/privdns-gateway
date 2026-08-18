@@ -411,6 +411,10 @@ jobs:
       - name: "Tailscale 入口隔离 (真 netns: tailnet 不进数据面, 物理 CGNAT 照旧)"
         run: sudo -n python3 tests/test-tailscale-ingress-isolation.py
 
+      # 模板改了却传不到已装机器上 —— 那条缺口让 v1.10.1→本分支的升级在六个 E2E 里同时红。
+      - name: "防火墙按模板重建 (已迁移的机器也要收到模板改动; 参数反解 fail-closed)"
+        run: sudo -n python3 tests/test-firewall-template-sync.py
+
       - name: "Tailscale 入口隔离 负控 (撤排除/挪顺序/过度排除必须转红; 无关注释仍绿)"
         run: sudo -n python3 tests/negctl/tailscale-isolation-negative-controls.py
 
