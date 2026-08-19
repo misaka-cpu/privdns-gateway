@@ -15,11 +15,31 @@
      统一调这里。
 
 覆盖的语法就是 deploy/firewall/nftables-mihomo.conf 那套形态(它是渲染出来的, 不是手写的,
-所以形态有限)。遇到不认识的行**跳过而不是猜** —— 猜出来的规则会让判据对着不存在的东西打转。
+所以形态有限), 外加真机上会出现的两种注入形态(救援放行带 `ip daddr` + 标记, 证书钩子带标记)。
+
+**认不出来时怎么办, 分两种**:
+
+  · 整行压根不是规则(`include ...`、空行、括号) → 跳过, 这是对的。
+  · 是规则、但里面有**没被任何匹配器吃掉的残渣** → **报错退非零, 绝不输出**。
+    以前的行为是"能认多少认多少, 剩下的丢掉", 于是 `iifname "tailscale0" return`
+    变成裸 `return` —— 规则还在, 接口条件没了。判据按接口名找就永远找不到, 而内核里
+    其实有。六个升级类 E2E 因此全红, 真 nft 环境下同一份规则 12/12 全绿(真 nft 自己
+    出 JSON), 排查方向被带偏好几轮。
+    丢一整条规则至少会让 audit_kernel 说"缺规则"; 丢半条给出的是一个**看着正常的错
+    答案**, 那是本项目最危险的一类缺陷(见交接文档 9.1)。宁可让桩自己喊"我不认识"。
 """
 import json
 import re
 import sys
+
+
+class UnknownSyntax(Exception):
+    """规则里有没被吃掉的残渣 —— 与其丢半条, 不如让调用方知道转换器落后于配置。"""
+
+    def __init__(self, line, residue):
+        self.line = line
+        self.residue = residue
+        super().__init__("nftjson 不认识这段语法: %r (整行: %r)" % (residue, line))
 
 _TABLE = re.compile(r"^\s*table\s+(?P<family>\w+)\s+(?P<name>\S+)\s*\{")
 _CHAIN = re.compile(r"^\s*chain\s+(?P<name>\S+)\s*\{")
@@ -62,6 +82,26 @@ def _ports(spec):
     return out
 
 
+def _eat(eaten, m):
+    """记下这个匹配吃掉的区间。残渣判定全靠它 —— 少记一处就会误报"不认识"。"""
+    if m:
+        eaten.append(m.span())
+    return m
+
+
+def _residue(line, eaten):
+    """挖掉所有被吃掉的区间, 剩下的还有实义字符吗。
+
+    只把**空白与分隔符**当无害(`;` `,` 是 nft 的语法噪声)。任何字母数字残留都算
+    "有一段我没看懂" —— 那正是 iifname 那次的形态, 它当时就是被整段忽略掉的。
+    """
+    chars = list(line)
+    for a, b in eaten:
+        for i in range(a, b):
+            chars[i] = " "
+    return re.sub(r"[\s;,]+", "", "".join(chars))
+
+
 def _match(proto, field, right):
     return {"match": {"op": "==",
                       "left": {"payload": {"protocol": proto, "field": field}},
@@ -69,33 +109,37 @@ def _match(proto, field, right):
 
 
 def _rule_expr(line):
-    """一行规则 → expr 列表。认不出来的返回 None(跳过, 不猜)。"""
+    """一行规则 → expr 列表。
+
+    整行不是规则 → None(跳过)。是规则但有残渣 → 抛 UnknownSyntax(绝不丢半条)。
+    """
     expr = []
-    m = _IIFNAME.search(line)
+    eaten = []                      # 已被某个匹配器吃掉的区间, 用来算残渣
+    m = _eat(eaten, _IIFNAME.search(line))
     if m:
         expr.append({"match": {"op": "==", "left": {"meta": {"key": "iifname"}},
                                "right": m.group("dev")}})
     else:
-        m = _IIF.search(line)
+        m = _eat(eaten, _IIF.search(line))
         if m:
             expr.append({"match": {"op": "==", "left": {"meta": {"key": "iif"}},
                                    "right": m.group("dev")}})
-    m = _CT.search(line)
+    m = _eat(eaten, _CT.search(line))
     if m:
         expr.append({"match": {"op": "in", "left": {"ct": {"key": "state"}},
                                "right": m.group("states").split(",")}})
-    m = _SADDR.search(line)
+    m = _eat(eaten, _SADDR.search(line))
     if m:
         net, ln = m.group("cidr").split("/")
         expr.append({"match": {"op": "==",
                                "left": {"payload": {"protocol": "ip", "field": "saddr"}},
                                "right": {"prefix": {"addr": net, "len": int(ln)}}}})
-    m = _DADDR.search(line)
+    m = _eat(eaten, _DADDR.search(line))
     if m:
         expr.append({"match": {"op": "==",
                                "left": {"payload": {"protocol": "ip", "field": "daddr"}},
                                "right": m.group("ip")}})
-    m = _PROTO.search(line)
+    m = _eat(eaten, _PROTO.search(line))
     if m:
         # nft 会把 icmpv6 归一成 ipv6-icmp —— 桩也照做, 好让"协议别名不算漂移"这条判据
         # 在沙箱里同样成立(它正是 .153 那四条假漂移之一)。
@@ -105,31 +149,36 @@ def _rule_expr(line):
                                                     else "ip", "field": "nexthdr"
                                                     if "nexthdr" in line else "protocol"}},
                                "right": "ipv6-icmp" if p == "icmpv6" else p}})
-    m = _DPORT.search(line)
+    m = _eat(eaten, _DPORT.search(line))
     if m:
         right = ({"set": _ports(m.group("set"))} if m.group("set") is not None
                  else int(m.group("one")))
         expr.append(_match(m.group("proto"), "dport", right))
-    m = _REDIR.search(line)
+    m = _eat(eaten, _REDIR.search(line))
     if m:
         expr.append({"redirect": {"port": int(m.group("port"))}})
     else:
         for v in _VERDICTS:
-            if re.search(r"\b%s\b" % v, line):
+            mv = _eat(eaten, re.search(r"\b%s\b" % v, line))
+            if mv:
                 if v == "reject":
                     # nft 打印 reject 时会补上默认类型 —— 同样是那四条"假漂移"之一
                     expr.append({"reject": {"type": "icmp", "expr": "port-unreachable"}})
                 else:
                     expr.append({v: None})
                 break
-    m = _COMMENT.search(line)
+    m = _eat(eaten, _COMMENT.search(line))
     if m:
         expr.append({"comment": m.group("c")})
-    # 只有 match 没有 verdict, 或者两者都没有 → 认不出来
+    # 只有 match 没有 verdict, 或两者都没有 → 这行压根不是规则(include/括号/空行), 跳过
     if not expr or not any(k in e for e in expr
                            for k in ("accept", "drop", "reject", "redirect", "return",
                                      "masquerade", "continue")):
         return None
+    # 是规则了。还有没被吃掉的实义字符 = 我只认得一半 —— 那是最会骗人的形态, 拒绝输出。
+    left = _residue(line, eaten)
+    if left:
+        raise UnknownSyntax(line.strip(), left)
     return expr
 
 
@@ -191,7 +240,15 @@ def to_json(text, family="inet", table="pdg"):
 def main(argv):
     fam = argv[1] if len(argv) > 1 else "inet"
     tab = argv[2] if len(argv) > 2 else "pdg"
-    obj = to_json(sys.stdin.read(), fam, tab)
+    try:
+        obj = to_json(sys.stdin.read(), fam, tab)
+    except UnknownSyntax as e:
+        # 退 2 而不是 1: 1 是"表不在"(真 nft 也这么退), 2 专指"桩看不懂这条规则"。
+        # 调用方据此能分清"防火墙没配对"与"转换器落后于配置" —— 后者查错方向完全不同。
+        sys.stderr.write("Error: %s\n" % e)
+        sys.stderr.write("Error: 这是**桩**的覆盖不足, 不是防火墙的问题。"
+                         "请给 tests/nftjson.py 补上这个匹配器, 不要放宽判据。\n")
+        return 2
     if not obj["nftables"]:
         # 表不在: 真 nft 会报错退非零, 桩照做 —— 绝不返回一个"看着健康"的空壳
         sys.stderr.write("Error: No such file or directory\n")
