@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# 提交前的快速门 —— 只放**又快又常犯**的那几条, 让反馈落在写的当下。
+#
+# 为什么要有这个: 端口字面量这条不变量, 在本仓库已经被违反过**五次**, 每次形态一模一样
+# ——"新写一支测试时顺手敲了端口"。守卫(tests/test-rescue-constants.sh)一直都在, 但它只在
+# 全量回归里跑到: 从敲下数字到 CI 判红隔着约半小时一整轮往返, 而那时人早已在做别的事。
+# 规矩写在交接文档里、也确实读过, 照样会犯 —— 所以这不是记性问题, 是反馈延迟问题。
+#
+# 这里**不替代 CI**: CI 那一步照旧跑。别人的克隆、没装钩子的环境、以及被 --no-verify
+# 绕过的提交, 都还得靠 CI 兜住。这道门只负责把最常犯的那条提前。
+#
+# 装法(每份克隆各做一次):
+#     git config core.hooksPath .githooks
+# 应急绕过用 git 自带的 `git commit --no-verify` —— 这里不另造开关。
+#
+# 加新门的标准: 单条 < 1 秒、判据已有单一事实源(直接调它, 不在这里抄一份逻辑)、
+# 且是"写的当下就该知道"的那种错。慢的、需要容器/root 的, 一律留给 CI。
+set -uo pipefail
+ROOT="$(git rev-parse --show-toplevel)"
+fail=0
+
+run(){                                  # $1=说明  $2...=命令
+  local desc="$1"; shift
+  local out
+  if ! out="$("$@" 2>&1)"; then
+    printf '\n[pre-commit] ✗ %s\n' "$desc" >&2
+    printf '%s\n' "$out" | grep -E '^\[FAIL\]|^ ' | head -8 >&2
+    fail=1
+  fi
+}
+
+# 救援端口/路径的单一事实源。判据本体在 tests/, 这里只是提前调它一次(0.1s 量级)。
+[[ -f "$ROOT/tests/test-rescue-constants.sh" ]] \
+  && run "救援常量单一事实源(端口字面量只许出现在 lib/rescue.sh)" \
+         bash "$ROOT/tests/test-rescue-constants.sh"
+
+if [[ "$fail" != 0 ]]; then
+  cat >&2 <<'MSG'
+
+[pre-commit] 提交已拦下。
+  端口相关: 别敲数字, 从真源读 —— bash 用 lib/rescue.sh 的 $PDG_RESCUE_PORT,
+            python/测试用 `deploy/bot/rescue_const.py --port`。注释里也不许写。
+  确需绕过: git commit --no-verify (CI 仍会拦)
+MSG
+  exit 1
+fi
+exit 0
