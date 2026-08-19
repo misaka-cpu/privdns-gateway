@@ -18,6 +18,14 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+
+# 救援端口的唯一事实源是 deploy/bot/rescue_const.py —— 连测试夹具也不许敲数字,
+# 注释里也不许写(test-rescue-constants.sh 在守这条全仓不变量)。
+# 这个坑在本仓库已经重复过五次, 每次都是"新写一支测试时顺手写了端口" ——
+# 而守卫只在全量回归里才跑到, 写的当下不会提醒。
+RPORT = subprocess.run([sys.executable, os.path.join(ROOT, "deploy/bot/rescue_const.py"),
+                        "--port"], capture_output=True, text=True, check=True).stdout.strip()
 npass = nfail = 0
 
 
@@ -62,8 +70,8 @@ CASES = [
     ('ip saddr 172.22.0.0/16 udp dport 443 reject', 3, "reject(补默认 icmp 类型)"),
     ('tcp dport { 22 } accept', 2, "单元素集合(不折叠成标量)"),
     ('udp dport 51820 accept', 2, "裸 udp dport"),
-    ('ip saddr 172.22.0.0/16 ip daddr 10.0.0.5 tcp dport 8446 accept comment "pdg-rescue"',
-     5, "救援注入形态: saddr + daddr + dport + accept + 标记"),
+    ('ip saddr 172.22.0.0/16 ip daddr 10.0.0.5 tcp dport %s accept comment "pdg-rescue"'
+     % RPORT, 5, "救援注入形态: saddr + daddr + dport + accept + 标记"),
     ('tcp dport 80 accept comment "pdg-cert-http"', 3, "证书钩子形态: dport + accept + 标记"),
 ]
 
