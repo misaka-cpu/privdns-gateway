@@ -131,6 +131,9 @@ jobs:
       - name: "测试自身不许假绿 (抽不到函数/命令不存在/退出码非 0 必须记 FAIL)"
         run: bash tests/test-false-green-guard.sh
 
+      - name: "P2 运行时缺陷回归 (锁 stderr / 快照提交 / start-limit / 已是最新短路)"
+        run: bash tests/test-p2-runtime-fixes.sh
+
       - name: "E2E 探针生命周期回归(重复启动/退出/信号/并发/临时目录清理)"
         run: bash tests/test-e2e-probe-lifecycle.sh
 

@@ -125,11 +125,28 @@ _lock(){
   if _lock_inherited; then PDG_LOCKED=1; return 0; fi
   # 打不开锁文件 → **拒绝执行**(fail-closed)。以前这里 `|| return 0` 继续往下写: 而
   # /run 出问题往往正意味着系统不正常, 恰恰是最不该让两个进程同时改配置的时候。
-  if ! exec 9>"$LOCK" 2>/dev/null; then
+  # `exec 9>…` 是**无命令的重定向**: 同一行的 `2>/dev/null` 不是"只对这一句生效", 它会
+  # 永久改掉当前 shell 的 fd 2 —— 取锁之后 pdg 的所有 stderr 都进黑洞, `bash -x` 的 trace
+  # 也正好从这一行断掉。
+  # 修法: 先把 fd 2 备份到 fd 7, 让取锁那句把错误写进临时文件, 无论成败立刻把 fd 2 接回来。
+  # 于是既不吞后续 stderr, 失败时还能**把系统给的真实原因原样报出来** —— "Read-only file
+  # system" / "No space left on device" / "Permission denied" 三种的处置完全不同, 只说
+  # 一句"锁文件不可用"等于把排查丢回给用户。
+  # 用 7 不用 8: 交接文档把 8 留给 `BASH_XTRACEFD=8`, 占了它调试时又会打架。
+  # 重定向按从左到右生效, 所以 `2>` 必须写在 `9>` **前面** —— 反过来的话 `9>` 一失败就停,
+  # 后面的 `2>` 根本没应用, 错误照旧打到原始 stderr, 那个临时文件永远是空的。
+  local _lkerr; _lkerr="$(mktemp 2>/dev/null)" || _lkerr=/dev/null
+  exec 7>&2
+  if ! exec 2>"$_lkerr" 9>"$LOCK"; then
+    exec 2>&7 7>&-
     echo "⛔ 锁文件不可用($LOCK) —— 为避免并发写坏配置, 本次拒绝执行。"
+    [[ -s "$_lkerr" ]] && echo "   系统给出的原因: $(head -1 "$_lkerr")"
     echo "   请检查 /run 是否可写(磁盘满/只读挂载/权限), 修好后重试。"
+    [[ "$_lkerr" != /dev/null ]] && rm -f "$_lkerr"
     exit 1
   fi
+  exec 2>&7 7>&-
+  [[ "$_lkerr" != /dev/null ]] && rm -f "$_lkerr"
   flock -n 9 || { echo "⛔ 已有 pdg 操作在运行, 请稍后再试 (锁: $LOCK)"; exit 1; }
   PDG_LOCKED=1
 }
@@ -1085,6 +1102,25 @@ _snap_meta_write(){
   mv -f "$tmp" "$d/snapshot.json" 2>/dev/null || { rm -f "$tmp"; return 1; }
 }
 
+# 读快照记下的仓库提交(读不到 / 不是合法哈希 → 空)。与 _snap_meta_label 同样的原则:
+# 绝不 eval/source 元数据, 坏了就当没有, 不因它挡住回滚。
+_snap_meta_commit(){
+  local j="$1/snapshot.json"
+  [[ -f "$j" ]] || return 0
+  python3 - "$j" 2>/dev/null <<'PY'
+import json, re, sys
+try:
+    m = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    raise SystemExit(0)
+c = str(m.get("git_commit", ""))
+# 只认真正的提交哈希。_snap_meta_write 在读不到时会写字面量 "unknown", 那既不是提交也不该
+# 被当成提交传给 `git reset --hard` —— 正则一并把它挡在外面。
+if re.match(r"^[0-9a-f]{7,64}$", c):
+    print(c)
+PY
+}
+
 # 读来源, 供列表展示。老快照没有这个文件 —— 那是**正常的跨版本形态**, 显示"未知"而不是报错。
 # 元数据坏了也只当未知: 绝不 eval / source 它, 也不因为它坏了就挡住回滚。
 _snap_meta_label(){
@@ -1181,7 +1217,7 @@ cmd_snapshot(){
 cmd_rollback(){
   need_root rollback; _lock
   # 参数: <序号>(默认0) | --dir <快照目录>(精确指定, 供 update 用) | --git <ref>(回滚后把 REPO_DIR 复位到该提交)
-  local idx="" dir="" git_ref="" target preserve=0
+  local idx="" dir="" git_ref="" target preserve=0 no_git=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --dir) dir="${2:-}"; shift 2 || { echo "--dir 缺参数"; return 1; };;
@@ -1190,6 +1226,8 @@ cmd_rollback(){
       # 放行。只有这一个固定开关 —— 不提供 `--exclude <path>` 之类的任意排除, 否则"完整恢复"
       # 可以被指定成"什么都不恢复"。普通 CLI 不传它时行为与历史完全一致。
       --preserve-rescue) preserve=1; shift;;
+      # 只回配置、代码留在当前版本。默认行为见下面"仓库一并带回去"那段。
+      --no-git) no_git=1; shift;;
       *) idx="$1"; shift;;
     esac
   done
@@ -1208,6 +1246,24 @@ cmd_rollback(){
     idx=$((10#$idx))
     (( idx >= ${#snaps[@]} )) && { echo "无效序号 $idx"; return 1; }
     target="${snaps[$idx]}"
+  fi
+  # ── 仓库一并带回去 ──────────────────────────────────────────────────────────
+  # 以前只有 `cmd_update` 失败时的**自动**回滚会传 `--git`; 手动 `pdg rollback` 只还原文件。
+  # 于是盘上跑着快照里的旧代码, 而 REPO_DIR 还停在新版本 —— `pdg version` 与 doctor 都走
+  # `git describe`, 报的是新版号。两边说法不一致, 而且没有任何一处会提这件事: 排障时看到
+  # 的版本号是假的, 按它去比对代码只会越查越远。
+  # 默认取**这份快照自己记下的** git_commit, 不去猜"上一个 tag" —— 快照与提交是同一时刻
+  # 记下的, 猜出来的不是。显式 `--git` 优先; `--no-git` 留给"只想回配置"的场合。
+  if [[ -z "$git_ref" && "$no_git" == 0 ]]; then
+    git_ref="$(_snap_meta_commit "${target%/}")"
+    if [[ -n "$git_ref" ]]; then
+      echo "  将一并把仓库复位到快照记录的提交 ${git_ref:0:12}(不想动代码就加 --no-git)"
+    elif [[ -d "$REPO_DIR/.git" ]]; then
+      # 说出来而不是静默跳过: 老快照没有 snapshot.json 是**正常的跨版本形态**, 但用户
+      # 有权知道这次回滚只回了一半。
+      c_y "  ⚠️ 这份快照没记下仓库提交(旧快照或元数据损坏) —— 只还原文件, 仓库仍停在当前版本。"
+      c_y "     确认要一并复位就自己指定: pdg rollback --git <提交>"
+    fi
   fi
   local f="$target/snap.tar.gz"
   [[ -f "$f" ]] || { echo "快照文件缺失: $f"; return 1; }
@@ -1490,6 +1546,33 @@ cmd_update(){
   fi
   command -v git >/dev/null || { apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git; }
   _lock   # 取锁(嵌套的 cmd_snapshot 不会重复锁)
+  # ── 「已是最新」短路 ────────────────────────────────────────────────────────
+  # 重复跑 `pdg update` 不该有副作用, 以前每次都照走全程: 多留一份快照(挤占 SNAP_DIR)、
+  # 两次 daemon-reload、重启 pdg-bot(iOS 还要加 probe81/mitm), 并把所有已装文件的 mtime
+  # 刷新一遍。用户数据零损伤, 但"什么都没变"的一次操作在现场看起来像动过全身 —— 事后
+  # 按 mtime 找"这次更新到底改了什么", 得到的是全部文件。
+  #
+  # 判据要求**两件事同时成立**: HEAD 正好落在最新发布 tag 上, 且工作树干净。
+  #   · 只比 tag 不看工作树 → 有人手改坏了仓库文件时, 短路会把 `pdg update` 这条修复路径
+  #     一起堵死, 而那正是最需要它能跑的时候;
+  #   · 不是仓库 / 拉不到 tag / 网络不通 → **不短路**, 照常走完整流程, 让后面各步给出自己
+  #     明确的失败理由。短路是优化, 不能变成第二处会拒绝执行的门。
+  # 这里的 fetch 静默: 它失败只意味着"判断不了, 那就别短路", 真正的报错留给下面那次。
+  if [[ -z "${PDG_UPDATE_FORCE:-}" && -d "$REPO_DIR/.git" ]] \
+     && pdg_fetch_release_tags "$REPO_DIR" >/dev/null 2>&1; then
+    local _cur_sha _tgt_tag _tgt_sha
+    _tgt_tag="$(git -C "$REPO_DIR" tag -l 'v*' --sort=-v:refname 2>/dev/null | head -1)"
+    _cur_sha="$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null)"
+    # `^{commit}` 是必要的: 附注 tag 的对象哈希是 tag 自己, 不是它指向的提交, 直接比会
+    # 永远不相等 —— 短路静默失效, 而且没有任何迹象。
+    _tgt_sha="$(git -C "$REPO_DIR" rev-parse "${_tgt_tag}^{commit}" 2>/dev/null)"
+    if [[ -n "$_tgt_tag" && -n "$_cur_sha" && "$_cur_sha" == "$_tgt_sha" ]] \
+       && git -C "$REPO_DIR" diff --quiet HEAD -- 2>/dev/null; then
+      c_g "已是最新发布 $_tgt_tag —— 无需更新(未建快照, 未重启任何服务)。"
+      echo "  要强制重装同一版本: PDG_UPDATE_FORCE=1 pdg update"
+      return 0
+    fi
+  fi
   c_g "更新前留快照…"
   if ! cmd_snapshot --source cli --op update >/dev/null 2>&1 || [[ -z "$_PDG_SNAP_CREATED" || ! -f "$_PDG_SNAP_CREATED/snap.tar.gz" ]]; then
     c_y "❌ 更新前快照失败, 中止更新(拒绝在无法回滚的前提下继续)。"; return 1
@@ -2174,7 +2257,12 @@ migrate_health_timer(){
     fi
     systemctl daemon-reload >/dev/null 2>&1 || _rbad=1
     [[ "$en0" == enabled ]] && { systemctl enable "$T" >/dev/null 2>&1 || _rbad=1; }
-    [[ "$ac0" == active  ]] && { systemctl start  "$T" >/dev/null 2>&1 || _rbad=1; }
+    # start 之前先清 start-limit: 会走到这条回滚路径的现场, 往往正是 unit 反复起不来 ——
+    # 那时它已经处在 start-limit-hit, `systemctl start` 必然失败, 于是一个**本来能恢复**
+    # 的现场被记成"回滚不完整", 运维按提示去人工核对, 却发现 unit 文件明明是对的。
+    # reset-failed 自己失败不计数: unit 没进 failed 态时它本来就返回非 0, 那是正常的。
+    [[ "$ac0" == active  ]] && { systemctl reset-failed "$T" >/dev/null 2>&1 || true
+                                 systemctl start  "$T" >/dev/null 2>&1 || _rbad=1; }
     rm -f "$bak"
     [[ "$_rbad" == 0 ]] || c_y "  ⚠️ 回滚 $T 不完整 —— 请手工核对 $cur 与 systemctl status $T"
     return 0
