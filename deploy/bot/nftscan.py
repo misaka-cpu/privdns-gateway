@@ -188,6 +188,88 @@ def scan_text(conf_txt, live_txt):
     return found
 
 
+# ── 冲突是谁制造的 ──────────────────────────────────────────────────────────
+# 判据说"有冲突"是对的, 但只说这一句, 排查得从头做起。
+#
+# 本轮在生产机上定位一条 80 放行花了七八步, 卡点是: **`nft list` 显示不出 iptables 的
+# comment 匹配**。那条规则在 nft 眼里只是 `tcp dport 80 counter accept` —— 看不出来历、
+# 看不出归属; 换 `iptables -S` 一看就是 `-m comment --comment proxy-gateway-cert-http`,
+# 名字直接写在上面。知道"该换个工具看"这一件事, 就能省掉大半。
+#
+# 所以这里做两件事, 都**只读**:
+#   1. 用 iptables/ip6tables 的视角再看一遍, 把 nft 藏起来的 comment 原样列出来;
+#   2. 已知签名命中就点名(证书钩子 / Tailscale / Docker / fail2ban / ufw / libvirt)。
+# 认不出来也不猜: 只说"这张表有 iptables 规则, 用 iptables -S 看它的 comment"。
+# 判据本身不依赖这里 —— 拿不到就少几行提示, 绝不因此改变"有没有冲突"的结论。
+IPT_CANDIDATES = ("/usr/sbin/%s", "/sbin/%s", "/usr/local/sbin/%s", "/usr/bin/%s", "/bin/%s")
+
+# 签名 → 说明。顺序有意义: 先具体后笼统(ts-input 比 tailscale 具体)。
+_CREATORS = (
+    ("proxy-gateway-cert-http", "本项目的证书 HTTP 放行钩子(proxy-gateway-open-cert-http.sh)"),
+    ("ts-input",  "Tailscale(NetfilterMode=2 会建 INPUT→ts-input 跳转; 设成 1/nodivert 即可避免)"),
+    ("ts-forward", "Tailscale"),
+    ("tailscale", "Tailscale"),
+    ("DOCKER",    "Docker"),
+    ("f2b-",      "fail2ban"),
+    ("ufw-",      "ufw"),
+    ("LIBVIRT_",  "libvirt"),
+)
+
+
+def _ipt_bin(name):
+    from shutil import which
+    p = which(name)
+    if p:
+        return p
+    for pat in IPT_CANDIDATES:
+        cand = pat % name
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return ""
+
+
+def _ipt_dump(name):
+    """`<name> -S` 的输出(拿不到返回 "")。只读, 不改任何规则。"""
+    exe = _ipt_bin(name)
+    if not exe:
+        return ""
+    try:
+        p = subprocess.run([exe, "-S"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           universal_newlines=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return p.stdout if p.returncode == 0 else ""
+
+
+def creator_hints():
+    """→ 提示行列表(可能为空)。给 doctor 在报"防火墙链冲突"时附上"可能是谁建的"。"""
+    hints = []
+    for name, tbl in (("iptables", "ip filter"), ("ip6tables", "ip6 filter")):
+        txt = _ipt_dump(name)
+        if not txt:
+            continue
+        rules = [l.strip() for l in txt.splitlines()
+                 if l.startswith("-A ") or l.startswith("-N ")]
+        if not rules:
+            continue                      # 只有 -P 策略行 = 这张表是空的, 不是它建的
+        named = []
+        for pat, who in _CREATORS:
+            if any(pat in l for l in rules) and who not in named:
+                named.append(who)
+        head = "表 `%s` 里有 %d 条 iptables 规则" % (tbl, len(rules))
+        if named:
+            head += " —— 可能来自: " + " / ".join(named)
+        hints.append(head)
+        # 把带 comment 的原文列出来(最多 3 条): 这正是 nft 看不见、而它一眼能定位归属的东西。
+        marked = [l for l in rules if "--comment" in l][:3]
+        for l in marked:
+            hints.append("    " + l[:120])
+        if marked:
+            hints.append("    ↑ 这些 comment 在 `nft list ruleset` 里**看不到** —— "
+                         "查归属请用 `%s -S`。" % name)
+    return hints
+
+
 def nft_bin():
     """找到 nft 可执行文件的路径(找不到返回 "")。
 

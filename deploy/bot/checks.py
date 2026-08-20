@@ -630,6 +630,57 @@ def check_tailscale_isolation():
     return ("ok", "Tailscale 入口隔离", "prerouting/input 均在来源匹配前排除 %s" % TS_IFACE)
 
 
+# 三个探测点列成常量: 测试可以指到临时文件, 免得为了造"src_valid_mark=1 且没有
+# tailscale0"这种现场去 patch open() 之类的底层函数 —— 那种打桩一旦写错, 测的就不是
+# 产品了。同样的写法见 nftscan.NFT_CANDIDATES。
+PROC_NET_DEV = "/proc/net/dev"
+SRC_VALID_MARK = "/proc/sys/net/ipv4/conf/all/src_valid_mark"
+TAILSCALE_BIN = "/usr/bin/tailscale"
+
+
+def check_tailscale_residue():
+    """Tailscale 卸下之后留在系统里的东西。
+
+    两样都是 Tailscale 自己的行为, 不是本项目造成的 —— 但**只有本项目的 doctor 会去看**,
+    不报就没人会发现:
+
+    1. `net.ipv4.conf.all.src_valid_mark` 被它从 0 改成 1, 而且**不落 /etc/sysctl.d** ——
+       `tailscale logout` + `apt purge` 之后仍是 1, 要等重启才恢复。它放宽的是反向路径
+       过滤(rp_filter)对带 fwmark 的包的校验; 留着不至于立刻出事, 但那是一台机器上
+       没人知道为什么被改过的内核参数, 而且**重启后又会自己变回去** —— 于是"重启前后
+       行为不一致"这种最难查的现象就有了来源。
+    2. `apt purge` 之后 `/usr/bin/tailscale` 仍然留着(dpkg 查不到归属)。它不再工作,
+       但 `command -v tailscale` 照样能找到 —— 任何按"命令在不在"判断的脚本都会被骗。
+
+    判据是**卸载之后**才成立: 装着 Tailscale 时 src_valid_mark=1 完全正常, 那时不报。
+    "装着"的判据取 tailscale0 接口在不在 —— 接口在 = 它正在工作, 与包管理器的状态无关。
+    """
+    name = "Tailscale 卸载残留"
+    try:
+        with open(PROC_NET_DEV, encoding="utf-8") as f:
+            has_if = any(l.strip().startswith("tailscale0:") for l in f)
+    except OSError:
+        return ("warn", name, "读不到 %s, 无法判断 tailscale0 是否还在" % PROC_NET_DEV)
+    if has_if:
+        return ("ok", name, "tailscale0 仍在, 不适用(装着的时候这些都是正常状态)")
+    bad = []
+    try:
+        with open(SRC_VALID_MARK, encoding="utf-8") as f:
+            if f.read().strip() == "1":
+                bad.append("net.ipv4.conf.all.src_valid_mark 仍是 1(Tailscale 改的, 它不会自己还原; "
+                           "重启会变回 0 —— 于是重启前后行为不一致)。"
+                           "确认不再用 Tailscale 就: sysctl -w net.ipv4.conf.all.src_valid_mark=0")
+    except OSError:
+        pass                      # 内核没这个参数(旧内核/容器)—— 不是问题, 不报
+    if os.path.exists(TAILSCALE_BIN):
+        bad.append("%s 仍在(apt purge 之后的残留, dpkg 查不到归属) —— " % TAILSCALE_BIN +
+                   "`command -v tailscale` 还能找到它, 按命令是否存在做判断的脚本会被骗。"
+                   "确认不用了就: rm -f /usr/bin/tailscale")
+    if bad:
+        return ("warn", name, "; ".join(bad))
+    return ("ok", name, "没有 tailscale0, 也没有留下 src_valid_mark / 残留二进制")
+
+
 def _filesha(path):
     """文件 SHA256(读不到返回空串)。用于比对部署文件与仓库文件是否同一版本。"""
     import hashlib
@@ -1490,10 +1541,21 @@ def check_nft_input_chains():
     nftscan.py, 不另写一份。"""
     found, readable = nftscan.scan()
     if found:
-        return ("fail", "防火墙链冲突",
-                "; ".join(found) + " —— PDG 的 input chain 是 policy drop, 同一 hook 上每条 "
-                "base chain 都会执行, 上述表里的放行会被架空(端口看着开着实际不通)。"
-                "请把需要的放行并入 table inet pdg 的 input chain, 或把那些链改挂到非 input hook。")
+        msg = ("; ".join(found) + " —— PDG 的 input chain 是 policy drop, 同一 hook 上每条 "
+               "base chain 都会执行, 上述表里的放行会被架空(端口看着开着实际不通)。"
+               "请把需要的放行并入 table inet pdg 的 input chain, 或把那些链改挂到非 input hook。")
+        # 判据说"有冲突"是对的, 但只说这一句, 排查得从头做起。本轮在生产机上定位一条 80
+        # 放行花了七八步, 卡点是 `nft list` **显示不出 iptables 的 comment 匹配** —— 那条
+        # 规则在 nft 眼里只是 `tcp dport 80 counter accept`, 换 `iptables -S` 一看归属就
+        # 写在上面。这里把 iptables 视角的原文与已知签名一并附上, 省掉大半排查。
+        # 拿不到就少几行提示: 它绝不参与"有没有冲突"的判定。
+        try:
+            hints = nftscan.creator_hints()
+        except Exception:                                    # noqa: BLE001
+            hints = []
+        if hints:
+            msg += "\n    可能是谁建的:\n    " + "\n    ".join(hints)
+        return ("fail", "防火墙链冲突", msg)
     if not readable:
         # 只说"读不到"等于把问题丢回给用户。分清是权限还是 nftables 本身 —— 前者重跑一次就好,
         # 后者加多少 sudo 都没用。
@@ -1644,7 +1706,7 @@ def check_transactions():
 
 ALL = [check_platform, check_services, check_bot_credentials, check_health_timer, check_core_version, check_dot_arecord, check_dot_domain_sync,
        check_internal_cidr, check_cidr_drift, check_nft, check_nft_input_chains, check_redirect, check_gms,
-       check_tailscale_isolation,
+       check_tailscale_isolation, check_tailscale_residue,
        check_mosdns_ratelimit, check_mosdns_explicit_proxy, check_ruleset_hijack,
        check_nft_extra, check_rescue_firewall, check_geosite_db, check_mem,
        check_cert, check_cert_dir_sync, check_dns, check_core_config, check_rulesets, check_rule_precedence,

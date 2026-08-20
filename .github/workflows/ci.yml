@@ -145,6 +145,9 @@ jobs:
       - name: "事务 id 可排序 (同秒多笔不再靠随机后缀定顺序)"
         run: python3 tests/test-txid-ordering.py
 
+      - name: "doctor: 冲突制造者定位 + Tailscale 卸载残留"
+        run: python3 tests/test-doctor-conflict-creator.py
+
       - name: "链路诊断采集器 (证书正常/临期/过期/错域名/损坏/误放私钥; 零写入零写锁)"
         run: python3 tests/test-link-status.py
 
