@@ -935,7 +935,22 @@ def _ensure_root(root):
 
 
 def new_txid():
-    return time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + uuid.uuid4().hex[:8]
+    """事务 id: `%Y%m%dT%H%M%S.mmmZ-<uuid4 前 8 位>`。
+
+    毫秒是后加的。原来只到秒, 同秒的两笔全靠那 8 位随机后缀区分 —— 于是任何
+    `sort | tail -1` 式的"找最新事务"都是掷硬币。e2e-hijack-mode-tx.sh 因此间歇性红了
+    一个多星期(约 6%): 断言读到的是上一小节留下的 ABORTED, 而本次那笔是 ROLLBACK_FAILED。
+    调用方改用差集是治本, 但目录名本身可排序也该补上 —— 不然下一个写查询的人还会踩。
+
+    随机后缀保留: 毫秒不保证唯一(同一毫秒内并发建两笔仍然可能), 它只负责**排序**,
+    唯一性仍由 uuid 后缀兜底。
+    字符集仍限在 `[0-9A-Za-z._-]` 内 —— rescue.py 的 _TXID_RE 按这个集合校验 txid,
+    换个分隔符(比如 `:`)会让救援平面直接拒收本项目自己生成的事务。
+    """
+    t = time.time()
+    return (time.strftime("%Y%m%dT%H%M%S", time.gmtime(t))
+            + ".%03dZ" % int((t % 1) * 1000)
+            + "-" + uuid.uuid4().hex[:8])
 
 
 def _runner_sha():

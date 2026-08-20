@@ -142,6 +142,9 @@ jobs:
       - name: "链路诊断状态模型 (六状态闭集/未登记 code 拒绝/NOT_OBSERVED 不算故障/退出码)"
         run: python3 tests/test-link-model.py
 
+      - name: "事务 id 可排序 (同秒多笔不再靠随机后缀定顺序)"
+        run: python3 tests/test-txid-ordering.py
+
       - name: "链路诊断采集器 (证书正常/临期/过期/错域名/损坏/误放私钥; 零写入零写锁)"
         run: python3 tests/test-link-status.py
 

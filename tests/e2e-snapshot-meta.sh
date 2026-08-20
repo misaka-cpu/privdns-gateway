@@ -28,6 +28,8 @@ SENTINEL='987654321:AAHsnapSENTINELtoken00000000000000000'
 printf 'PDG_SENTINEL_TOKEN=%s\n' "$SENTINEL" >> /etc/privdns-gateway/profile.env
 
 nsnap(){ find "$SNAP" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l; }
+# newest() 只用在"随便拿一份现成快照来当夹具"的地方。**判定本次操作产生了哪一份**一律走
+# e2e-lib.sh 的差集助手 —— 按名字排序去猜"最新的那份", 在同秒撞名时挑中谁纯看运气。
 newest(){ find "$SNAP" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort | tail -1; }
 meta_get(){ python3 -c "import json,sys;print(json.load(open(sys.argv[1]+'/snapshot.json')).get(sys.argv[2],''))" "$1" "$2" 2>/dev/null; }
 
@@ -35,9 +37,10 @@ rm -rf "$SNAP"; mkdir -p "$SNAP"
 
 # ══ 1. 手动快照: 字段齐全, 权限 0600 ═══════════════════════════════════════
 echo "── 1. 手动快照的元数据 ──"
+e2e_dirset_mark "$SNAP"
 out=$(pdg snapshot 2>&1); rc=$?
 [[ "$rc" == 0 ]] && ok "pdg snapshot 成功" || bad "1: rc=$rc: $(tail -2 <<<"$out")"
-D="$(newest)"
+D="$(e2e_dirset_created 1)"
 [[ -f "$D/snapshot.json" ]] && ok "生成了 snapshot.json" || bad "1b: 没有元数据文件"
 [[ "$(stat -c '%a' "$D/snapshot.json" 2>/dev/null)" == 600 ]] \
   && ok "元数据 mode 0600" || bad "1c: mode=$(stat -c '%a' "$D/snapshot.json" 2>/dev/null)"
@@ -61,10 +64,9 @@ grep -qE '"(source|op)": *"[^"]*[;&|$`]' "$D/snapshot.json" \
 echo; echo "── 2. 五种调用来源 ──"
 check_src(){ # $1=期望 source $2=期望 op $3..=命令
   local esrc="$1" eop="$2"; shift 2
-  local before; before="$(newest)"
+  e2e_dirset_mark "$SNAP"
   "$@" >/dev/null 2>&1
-  local d; d="$(newest)"
-  if [[ "$d" == "$before" ]]; then bad "2-$eop: 没有产生新快照"; return; fi
+  local d; d="$(e2e_dirset_created "2-$eop")" || return
   if [[ "$(meta_get "$d" source)" == "$esrc" && "$(meta_get "$d" op)" == "$eop" ]]; then
     ok "$eop 前的快照标为 $esrc/$eop"
   else
@@ -79,10 +81,10 @@ check_src cli    platform          pdg snapshot --source cli --op platform;     
 check_src cli    migrate           pdg snapshot --source cli --op migrate;              sleep 1.05
 check_src rescue pre-full-restore  pdg snapshot --source rescue --op pre-full-restore;  sleep 1.05
 # 再用一条**真实调用路径**证明接线没错(不是只有 CLI 参数能传): pdg migrate 会先拍快照。
-_b="$(newest)"
+e2e_dirset_mark "$SNAP"
 pdg migrate >/dev/null 2>&1
-_d="$(newest)"
-if [[ "$_d" != "$_b" ]]; then
+_d="$(e2e_dirset_created 2-wire)" || _d=""
+if [[ -n "$_d" ]]; then
   [[ "$(meta_get "$_d" source)" == cli && "$(meta_get "$_d" op)" == migrate ]] \
     && ok "真跑 pdg migrate: 它拍的快照确实标成 cli/migrate(接线成立)" \
     || bad "2-wire: 实得 $(meta_get "$_d" source)/$(meta_get "$_d" op)"

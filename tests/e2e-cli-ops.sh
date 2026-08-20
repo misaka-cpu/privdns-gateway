@@ -267,10 +267,14 @@ detect(){ printf 'y\n' | pdg detect-cidr 1 2>&1; }
 # `pdg tx recover`, 不再自己打整机快照(cmd_snapshot 会先拿走同一把 flock, 子进程里的事务
 # 反而拿不到锁)。所以这里验的是**事务确实留下了可恢复的材料**, 而不是"tar 坏了就中止"。
 reset_cidr
+# 事务目录**必须**用差集认, 不能 `ls -1dt | head -1` 按 mtime 猜: 前面小节留下的事务与
+# 本次这笔落在同一时刻时, 挑中谁纯看运气 —— 断言会把别人的状态读成本次的结果, 表现为
+# 低频随机红(e2e-hijack-mode-tx 曾因此约 6% 间歇性失败)。助手在 e2e-lib.sh, 三支共用一份。
+e2e_dirset_mark /var/lib/privdns-gateway/tx
 out=$(detect); rc=$?
 { [[ "$rc" == 0 ]] && grep -q '事务' <<<"$out"; } \
   && ok "成功路径明确说明走的是配置事务" || bad "7a: rc=$rc: $(tail -4 <<<"$out")"
-_txdir="$(ls -1dt /var/lib/privdns-gateway/tx/*/ 2>/dev/null | head -1)"
+_txdir="$(e2e_dirset_created 7b)"
 { [[ -n "$_txdir" ]] && grep -q '"op": "detect-cidr"' "$_txdir/meta.json" 2>/dev/null \
   && grep -q '"state": "COMMITTED"' "$_txdir/meta.json" 2>/dev/null; } \
   && ok "事务留下了 COMMITTED 的 detect-cidr 记录(可查、可审计)" \

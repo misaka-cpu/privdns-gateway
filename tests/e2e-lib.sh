@@ -483,6 +483,31 @@ _e2e_probe_is_mine(){
   [[ "$cl" == *"$E2E_TX_PROBE_SCRIPT"* && "$cl" == *"$E2E_TX_PROBE_PORTS"* ]]
 }
 
+# ── 「本次操作新增了哪个目录」──────────────────────────────────────────────────
+# 事务目录名是 `%Y%m%dT%H%M%S.mmmZ-<uuid4 前 8 位>`, 快照目录是 `%Y%m%d-%H%M%S` —— 两者
+# 都可能在同一时刻出现多笔, 所以**不能**按名字排序去猜"最新的那个": 上一个小节留下的与本次
+# 产生的落在同一时刻时, 谁排在后面纯看运气。
+#
+# 这不是假设出来的风险。e2e-hijack-mode-tx.sh 因此间歇性红了一个多星期(约 6%, 最早可追到
+# 2026-08-02): 断言读到的是上一小节留下的 ABORTED, 而本次那笔其实是 ROLLBACK_FAILED ——
+# 状态读的是别人的, 而且看起来像产品出了随机故障。
+#
+# 改成记差集: 被测命令调用前后各取一次目录集合, 新增的那一笔才是本次要断言的对象。
+# 顺带把"一次操作只应产生一笔"变成硬门 —— 0 笔或多笔都判红, 而不是默默挑一个。
+# 逻辑只此一份: 三支 e2e(hijack-mode-tx / cli-ops / snapshot-meta)共用它, 不各抄一遍。
+_e2e_dirlist(){ find "$1" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort; }
+e2e_dirset_mark(){ _E2E_DIRSET_ROOT="$1"; _E2E_DIRSET_BEFORE="$(_e2e_dirlist "$1")"; }
+e2e_dirset_created(){          # $1=场景名; 打印本次新增的那一个目录, 恰好 1 个才返回 0
+  local nm="$1" now new n
+  now="$(_e2e_dirlist "$_E2E_DIRSET_ROOT")"
+  new="$(comm -13 <(printf '%s\n' "$_E2E_DIRSET_BEFORE") <(printf '%s\n' "$now"))"
+  n="$(grep -c . <<<"$new")"
+  if [[ "$n" == 1 ]]; then printf '%s\n' "$new"; return 0; fi
+  if [[ "$n" == 0 ]]; then bad "$nm: 本次操作没有新增目录(应恰好 1 个)"; return 1; fi
+  bad "$nm: 本次操作新增了 $n 个目录(应恰好 1 个): $(xargs -r -n1 basename <<<"$new" | tr '\n' ' ')"
+  return 1
+}
+
 e2e_tx_probe_stop(){
   local pid="$E2E_TX_PROBE_PID" n=0
   if [[ -n "$pid" ]] && _e2e_probe_is_mine "$pid"; then
