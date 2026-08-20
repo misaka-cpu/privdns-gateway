@@ -293,7 +293,11 @@ with open(det, encoding="utf-8") as f:
     dsrc = f.read()
 # 整行删掉(含行首管道与行尾续行符), 而不是把中段挖空 —— 挖空会留下 `| | grep`,
 # 那是语法错误, 红灯来自 bash 而不是判据, 不算有效负控。
-anchor = '      | awk -v ts="$TS_IF" \'$2 != ts\' \\\n'
+# 锚点跟着产品走: 接口排除现在写在 $EXTRACT 里(见 detect-internal-range.sh),
+# 但整条 awk 管道仍是它唯一的落地处 —— 整行删掉就同时撤掉了两个分支的排除。
+# 这条锚点 2026-08-20 因产品改写(只数入站包的源地址)失配过一次, 负控当场报
+# "命中 0 次" 并转红 —— 那正是它该有的反应, 不是它坏了。
+anchor = '      | awk -v ts="$TS_IF" "$EXTRACT" \\\n'
 if dsrc.count(anchor) != 1:
     bad("NC-TS-7 检测器锚点命中 %d 次, 预期 1" % dsrc.count(anchor))
 else:
