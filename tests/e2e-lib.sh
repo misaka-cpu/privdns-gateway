@@ -483,6 +483,74 @@ _e2e_probe_is_mine(){
   [[ "$cl" == *"$E2E_TX_PROBE_SCRIPT"* && "$cl" == *"$E2E_TX_PROBE_PORTS"* ]]
 }
 
+# ── 「本次操作新增了哪个目录」──────────────────────────────────────────────────
+# 事务目录名是 `%Y%m%dT%H%M%S.mmmZ-<uuid4 前 8 位>`, 快照目录是 `%Y%m%d-%H%M%S` —— 两者
+# 都可能在同一时刻出现多笔, 所以**不能**按名字排序去猜"最新的那个": 上一个小节留下的与本次
+# 产生的落在同一时刻时, 谁排在后面纯看运气。
+#
+# 这不是假设出来的风险。e2e-hijack-mode-tx.sh 因此间歇性红了一个多星期(约 6%, 最早可追到
+# 2026-08-02): 断言读到的是上一小节留下的 ABORTED, 而本次那笔其实是 ROLLBACK_FAILED ——
+# 状态读的是别人的, 而且看起来像产品出了随机故障。
+#
+# 改成记差集: 被测命令调用前后各取一次目录集合, 新增的那一笔才是本次要断言的对象。
+# 顺带把"一次操作只应产生一笔"变成硬门 —— 0 笔或多笔都判红, 而不是默默挑一个。
+# 逻辑只此一份: 三支 e2e(hijack-mode-tx / cli-ops / snapshot-meta)共用它, 不各抄一遍。
+_e2e_dirlist(){ find "$1" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort; }
+e2e_dirset_mark(){ _E2E_DIRSET_ROOT="$1"; _E2E_DIRSET_BEFORE="$(_e2e_dirlist "$1")"; }
+e2e_dirset_created(){          # $1=场景名; 打印本次新增的那一个目录, 恰好 1 个才返回 0
+  local nm="$1" now new n
+  now="$(_e2e_dirlist "$_E2E_DIRSET_ROOT")"
+  new="$(comm -13 <(printf '%s\n' "$_E2E_DIRSET_BEFORE") <(printf '%s\n' "$now"))"
+  n="$(grep -c . <<<"$new")"
+  if [[ "$n" == 1 ]]; then printf '%s\n' "$new"; return 0; fi
+  if [[ "$n" == 0 ]]; then bad "$nm: 本次操作没有新增目录(应恰好 1 个)"; return 1; fi
+  bad "$nm: 本次操作新增了 $n 个目录(应恰好 1 个): $(xargs -r -n1 basename <<<"$new" | tr '\n' ' ')"
+  return 1
+}
+
+# ── nft 桩: 全仓唯一实现 ─────────────────────────────────────────────────────
+# 以前 e2e 里的 nft 桩是 `echo …; exit 0` —— 对 `nft -j list table inet pdg` 什么都不返回,
+# 而 nftlive 读的正是那个。它按设计 fail-closed(读不到内核 = 不知道现在放行了什么, 绝不
+# 当成没问题), 于是更新后自检判红、整次 update 回滚: 测出来的是桩的病, 而排查时最顺手的
+# "修法"恰恰是最坏的 —— 把 fail-closed 降成 WARN。所以桩得做真。
+#
+#   -f FILE            装载: 把内容记成当前"内核状态"
+#   list …             文本查询: 回放状态(去掉注释 —— 真 nft 不会把配置注释吐回来)
+#   -j list table F T  JSON 查询: 由**当前状态**转换而来, 见 tests/nftjson.py
+#                      表不在就非零退出, 绝不返回一个"看着健康"的空壳
+#   -c                 只校验, 不改状态
+#
+# 为什么提成函数: e2e-custom-nft / e2e-install-nft / e2e-platform-switch 过去各带一份
+# **私有的简化桩**, 三份全都没有 `-j` 分支 —— 被测路径一旦走到 nftlive, 桩就静默返回空,
+# 正是上面这段拼命要避免的"看着健康的空壳", 而且它不会报错, 只会让断言读到一个空表。
+# 转换逻辑只此一份(nftjson.py), 桩本身也只此一份。
+# 固定写 /usr/local/bin/nft —— 三处调用点都是这个路径。不留"写到哪"的参数: 桩的位置
+# 一旦可变, 就会出现"装了两份桩、生效的是另一份"这种极难查的现场。
+e2e_write_nft_stub(){
+  local out=/usr/local/bin/nft
+  cp "$E2E_ROOT/tests/nftjson.py" /usr/local/bin/pdg-nftjson.py 2>/dev/null || true
+  { printf '#!/bin/sh\nSTATE=%s/e2e-nft-ruleset\nCALLS=%s/e2e-calls.log\n' "$E2E_TMP" "$E2E_TMP"
+    cat <<'S'
+echo "nft $*" >> "$CALLS"
+if [ "$1" = "-j" ]; then
+  # -j list table <family> <name>
+  fam="$4"; tab="$5"
+  [ -s "$STATE" ] || { echo "Error: No such file or directory" >&2; exit 1; }
+  exec python3 /usr/local/bin/pdg-nftjson.py "${fam:-inet}" "${tab:-pdg}" < "$STATE"
+fi
+case "$1" in
+  -c) exit 0 ;;
+  -f) [ -f "$2" ] && cat "$2" > "$STATE"; exit 0 ;;
+  list) sed -e 's/#.*$//' "$STATE" 2>/dev/null | grep -v '^[[:space:]]*$'; exit 0 ;;
+  delete) : > "$STATE"; exit 0 ;;
+esac
+exit 0
+S
+  } > "$out"
+  chmod 755 "$out"
+  : > "$E2E_TMP/e2e-nft-ruleset"
+}
+
 e2e_tx_probe_stop(){
   local pid="$E2E_TX_PROBE_PID" n=0
   if [[ -n "$pid" ]] && _e2e_probe_is_mine "$pid"; then
@@ -729,38 +797,8 @@ esac
 exit 0
 S
   } > /usr/local/bin/systemctl
-  # 有状态的 nft 桩。以前这里是 `echo …; exit 0` —— 对 `nft -j list table inet pdg` 什么都
-  # 不返回, 而 nftlive 读的正是那个。它按设计 fail-closed(读不到内核 = 不知道现在放行了
-  # 什么, 绝不当成没问题), 于是更新后自检判红、整次 update 回滚: 测出来的是桩的病, 而排查
-  # 时最顺手的"修法"恰恰是最坏的 —— 把 fail-closed 降成 WARN。所以桩得做真。
-  #
-  #   -f FILE            装载: 把内容记成当前"内核状态"
-  #   list …             文本查询: 回放状态(去掉注释 —— 真 nft 不会把配置注释吐回来)
-  #   -j list table F T  JSON 查询: 由**当前状态**转换而来, 见 tests/nftjson.py
-  #                      表不在就非零退出, 绝不返回一个"看着健康"的空壳
-  #   -c                 只校验, 不改状态
-  # 转换逻辑只此一份(nftjson.py), 不在各个 e2e 脚本里各抄一遍。
-  cp "$E2E_ROOT/tests/nftjson.py" /usr/local/bin/pdg-nftjson.py 2>/dev/null || true
-  { printf '#!/bin/sh\nSTATE=%s/e2e-nft-ruleset\nCALLS=%s/e2e-calls.log\n' "$E2E_TMP" "$E2E_TMP"
-    cat <<'S'
-echo "nft $*" >> "$CALLS"
-if [ "$1" = "-j" ]; then
-  # -j list table <family> <name>
-  fam="$4"; tab="$5"
-  [ -s "$STATE" ] || { echo "Error: No such file or directory" >&2; exit 1; }
-  exec python3 /usr/local/bin/pdg-nftjson.py "${fam:-inet}" "${tab:-pdg}" < "$STATE"
-fi
-case "$1" in
-  -c) exit 0 ;;
-  -f) [ -f "$2" ] && cat "$2" > "$STATE"; exit 0 ;;
-  list) sed -e 's/#.*$//' "$STATE" 2>/dev/null | grep -v '^[[:space:]]*$'; exit 0 ;;
-  delete) : > "$STATE"; exit 0 ;;
-esac
-exit 0
-S
-  } > /usr/local/bin/nft
-  : > "$E2E_TMP/e2e-nft-ruleset"
-  chmod 755 /usr/local/bin/systemctl /usr/local/bin/nft
+  e2e_write_nft_stub
+  chmod 755 /usr/local/bin/systemctl
   : > "$E2E_TMP/e2e-calls.log"
 }
 

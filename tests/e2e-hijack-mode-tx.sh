@@ -64,26 +64,17 @@ fp(){ printf '%s|%s|%s||%s|%s|%s' \
         "$(sha256sum "$PE" 2>/dev/null | cut -d' ' -f1)" "$(stat -c '%a' "$PE" 2>/dev/null)" \
         "$(stat -c '%u:%g' "$PE" 2>/dev/null)"; }
 ntx(){ find "$TXR" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l; }
-# 事务目录名是 `%Y%m%dT%H%M%SZ-<uuid4 前 8 位>`(见 pdgtx.py 的 _new_txid)—— 时间戳只到秒,
-# 同秒的两笔靠随机后缀区分。所以**不能**按名字排序去猜"最新的那笔": 上一个小节的事务与本次
-# 的落在同一秒时, 谁排在后面纯看随机数。实测过一次: 第 10 节自己那笔是 ROLLBACK_FAILED(正确),
-# 而 `sort | tail -1` 选中了第 8/9 节留下的 ABORTED, 断言于是把别人的状态读成了本次的结果 ——
-# CI 上表现为约 6% 的随机红, 独立 job 与串行 job 都会中。
+# 差集助手已提到 e2e-lib.sh(e2e_dirset_mark / e2e_dirset_created)—— 同样的逻辑另有两处
+# 要用(e2e-cli-ops 的事务目录、e2e-snapshot-meta 的快照目录), 各抄一份迟早走样。
+# 这里只保留领域名字的薄封装, 判定本身不再有第二份实现。
 #
-# 改成记差集: 被测命令调用前后各取一次目录集合, 新增的那一笔才是本次要断言的对象。
-# 顺带把"一次操作只应产生一笔事务"变成硬门 —— 0 笔或多笔都判红, 而不是默默挑一个。
-_tx_list(){ find "$TXR" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort; }
-tx_mark(){ _TX_BEFORE="$(_tx_list)"; }         # 在被测 CLI 调用**之前**打点
-tx_created(){                                  # $1=场景名; 打印本次新增的那一笔事务目录
-  local now new n
-  now="$(_tx_list)"
-  new="$(comm -13 <(printf '%s\n' "$_TX_BEFORE") <(printf '%s\n' "$now"))"
-  n="$(grep -c . <<<"$new")"
-  if [[ "$n" == 1 ]]; then printf '%s\n' "$new"; return 0; fi
-  if [[ "$n" == 0 ]]; then bad "$1: 本次操作没有产生任何事务(应恰好 1 笔)"; return 1; fi
-  bad "$1: 本次操作产生了 $n 笔事务(应恰好 1 笔): $(xargs -r -n1 basename <<<"$new" | tr '\n' ' ')"
-  return 1
-}
+# 当初为什么非要差集(留着, 这是它存在的全部理由): 事务目录名的时间戳只到秒(现已补到毫秒,
+# 但同毫秒仍可能撞), 同刻的两笔靠随机后缀区分, 于是 `sort | tail -1` 是掷硬币。实测过一次:
+# 第 10 节自己那笔是 ROLLBACK_FAILED(正确), 而排序选中了第 8/9 节留下的 ABORTED ——
+# 断言把别人的状态读成了本次的结果, CI 上表现为约 6% 的随机红。
+tx_mark(){ e2e_dirset_mark "$TXR"; }           # 在被测 CLI 调用**之前**打点
+tx_created(){ e2e_dirset_created "$1"; }       # 打印本次新增的那一笔事务目录
+
 tx_is_ours(){                                  # $1=事务目录 $2=场景名; 核对确实是本次 CLI 操作
   local d="$1" nm="$2" src op tg
   [[ -n "$d" ]] || return 1

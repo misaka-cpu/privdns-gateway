@@ -506,7 +506,10 @@ box5.clean()
 import subprocess as _sp  # noqa: E402
 
 _pdg_src = open(os.path.join(ROOT, "deploy/bot/pdg.sh"), encoding="utf-8").read()
-if "--preserve-rescue) preserve=1" in _pdg_src and "local idx=\"\" dir=\"\" git_ref=\"\" target preserve=0" in _pdg_src:
+# 锚在**意图**上(开关存在 + 默认 0), 不锚整行 local 声明: 那一行是 cmd_rollback 的全部
+# 局部变量, 任何无关的新局部变量都会让这条断言断掉 —— 断的是判据的写法, 不是产品的语义。
+_preserve_default = re.search(r"^\s*local\s+.*\bpreserve=0\b", _pdg_src, re.M)
+if "--preserve-rescue) preserve=1" in _pdg_src and _preserve_default:
     ok("Bash: 保护模式是固定开关, 默认关闭(普通 CLI 语义不变)")
 else:
     bad("保护模式的默认值/开关形态不对")

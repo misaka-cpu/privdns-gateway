@@ -125,11 +125,28 @@ _lock(){
   if _lock_inherited; then PDG_LOCKED=1; return 0; fi
   # 打不开锁文件 → **拒绝执行**(fail-closed)。以前这里 `|| return 0` 继续往下写: 而
   # /run 出问题往往正意味着系统不正常, 恰恰是最不该让两个进程同时改配置的时候。
-  if ! exec 9>"$LOCK" 2>/dev/null; then
+  # `exec 9>…` 是**无命令的重定向**: 同一行的 `2>/dev/null` 不是"只对这一句生效", 它会
+  # 永久改掉当前 shell 的 fd 2 —— 取锁之后 pdg 的所有 stderr 都进黑洞, `bash -x` 的 trace
+  # 也正好从这一行断掉。
+  # 修法: 先把 fd 2 备份到 fd 7, 让取锁那句把错误写进临时文件, 无论成败立刻把 fd 2 接回来。
+  # 于是既不吞后续 stderr, 失败时还能**把系统给的真实原因原样报出来** —— "Read-only file
+  # system" / "No space left on device" / "Permission denied" 三种的处置完全不同, 只说
+  # 一句"锁文件不可用"等于把排查丢回给用户。
+  # 用 7 不用 8: 交接文档把 8 留给 `BASH_XTRACEFD=8`, 占了它调试时又会打架。
+  # 重定向按从左到右生效, 所以 `2>` 必须写在 `9>` **前面** —— 反过来的话 `9>` 一失败就停,
+  # 后面的 `2>` 根本没应用, 错误照旧打到原始 stderr, 那个临时文件永远是空的。
+  local _lkerr; _lkerr="$(mktemp 2>/dev/null)" || _lkerr=/dev/null
+  exec 7>&2
+  if ! exec 2>"$_lkerr" 9>"$LOCK"; then
+    exec 2>&7 7>&-
     echo "⛔ 锁文件不可用($LOCK) —— 为避免并发写坏配置, 本次拒绝执行。"
+    [[ -s "$_lkerr" ]] && echo "   系统给出的原因: $(head -1 "$_lkerr")"
     echo "   请检查 /run 是否可写(磁盘满/只读挂载/权限), 修好后重试。"
+    [[ "$_lkerr" != /dev/null ]] && rm -f "$_lkerr"
     exit 1
   fi
+  exec 2>&7 7>&-
+  [[ "$_lkerr" != /dev/null ]] && rm -f "$_lkerr"
   flock -n 9 || { echo "⛔ 已有 pdg 操作在运行, 请稍后再试 (锁: $LOCK)"; exit 1; }
   PDG_LOCKED=1
 }
@@ -1085,6 +1102,25 @@ _snap_meta_write(){
   mv -f "$tmp" "$d/snapshot.json" 2>/dev/null || { rm -f "$tmp"; return 1; }
 }
 
+# 读快照记下的仓库提交(读不到 / 不是合法哈希 → 空)。与 _snap_meta_label 同样的原则:
+# 绝不 eval/source 元数据, 坏了就当没有, 不因它挡住回滚。
+_snap_meta_commit(){
+  local j="$1/snapshot.json"
+  [[ -f "$j" ]] || return 0
+  python3 - "$j" 2>/dev/null <<'PY'
+import json, re, sys
+try:
+    m = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    raise SystemExit(0)
+c = str(m.get("git_commit", ""))
+# 只认真正的提交哈希。_snap_meta_write 在读不到时会写字面量 "unknown", 那既不是提交也不该
+# 被当成提交传给 `git reset --hard` —— 正则一并把它挡在外面。
+if re.match(r"^[0-9a-f]{7,64}$", c):
+    print(c)
+PY
+}
+
 # 读来源, 供列表展示。老快照没有这个文件 —— 那是**正常的跨版本形态**, 显示"未知"而不是报错。
 # 元数据坏了也只当未知: 绝不 eval / source 它, 也不因为它坏了就挡住回滚。
 _snap_meta_label(){
@@ -1181,15 +1217,17 @@ cmd_snapshot(){
 cmd_rollback(){
   need_root rollback; _lock
   # 参数: <序号>(默认0) | --dir <快照目录>(精确指定, 供 update 用) | --git <ref>(回滚后把 REPO_DIR 复位到该提交)
-  local idx="" dir="" git_ref="" target preserve=0
+  local idx="" dir="" git_ref="" git_ref_src="" target preserve=0 no_git=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --dir) dir="${2:-}"; shift 2 || { echo "--dir 缺参数"; return 1; };;
-      --git) git_ref="${2:-}"; shift 2 || { echo "--git 缺参数"; return 1; };;
+      --git) git_ref="${2:-}"; git_ref_src=explicit; shift 2 || { echo "--git 缺参数"; return 1; };;
       # 救援平面内部固定模式: **事前排除**救援自身的文件, 并让恢复出来的 nft 候选自带救援
       # 放行。只有这一个固定开关 —— 不提供 `--exclude <path>` 之类的任意排除, 否则"完整恢复"
       # 可以被指定成"什么都不恢复"。普通 CLI 不传它时行为与历史完全一致。
       --preserve-rescue) preserve=1; shift;;
+      # 只回配置、代码留在当前版本。默认行为见下面"仓库一并带回去"那段。
+      --no-git) no_git=1; shift;;
       *) idx="$1"; shift;;
     esac
   done
@@ -1208,6 +1246,25 @@ cmd_rollback(){
     idx=$((10#$idx))
     (( idx >= ${#snaps[@]} )) && { echo "无效序号 $idx"; return 1; }
     target="${snaps[$idx]}"
+  fi
+  # ── 仓库一并带回去 ──────────────────────────────────────────────────────────
+  # 以前只有 `cmd_update` 失败时的**自动**回滚会传 `--git`; 手动 `pdg rollback` 只还原文件。
+  # 于是盘上跑着快照里的旧代码, 而 REPO_DIR 还停在新版本 —— `pdg version` 与 doctor 都走
+  # `git describe`, 报的是新版号。两边说法不一致, 而且没有任何一处会提这件事: 排障时看到
+  # 的版本号是假的, 按它去比对代码只会越查越远。
+  # 默认取**这份快照自己记下的** git_commit, 不去猜"上一个 tag" —— 快照与提交是同一时刻
+  # 记下的, 猜出来的不是。显式 `--git` 优先; `--no-git` 留给"只想回配置"的场合。
+  if [[ -z "$git_ref" && "$no_git" == 0 ]]; then
+    git_ref="$(_snap_meta_commit "${target%/}")"
+    [[ -n "$git_ref" ]] && git_ref_src=snapshot
+    if [[ -n "$git_ref" ]]; then
+      echo "  将一并把仓库复位到快照记录的提交 ${git_ref:0:12}(不想动代码就加 --no-git)"
+    elif [[ -d "${REPO_DIR:-}/.git" ]]; then
+      # 说出来而不是静默跳过: 老快照没有 snapshot.json 是**正常的跨版本形态**, 但用户
+      # 有权知道这次回滚只回了一半。
+      c_y "  ⚠️ 这份快照没记下仓库提交(旧快照或元数据损坏) —— 只还原文件, 仓库仍停在当前版本。"
+      c_y "     确认要一并复位就自己指定: pdg rollback --git <提交>"
+    fi
   fi
   local f="$target/snap.tar.gz"
   [[ -f "$f" ]] || { echo "快照文件缺失: $f"; return 1; }
@@ -1338,10 +1395,18 @@ cmd_rollback(){
   systemctl restart systemd-journald 2>/dev/null || true   # journald CanReload=no: 还原封顶需 restart 才生效
   # 仓库 Git 复位(update 回滚: 让 REPO_DIR 与还原出的旧脚本版本一致); 记录未能恢复项, 不谎报"完全回滚"
   if [[ -n "$git_ref" ]]; then
-    if [[ -d "$REPO_DIR/.git" ]] && git -C "$REPO_DIR" reset --hard -q "$git_ref" 2>/dev/null; then
+    if [[ -d "${REPO_DIR:-}/.git" ]] && git -C "$REPO_DIR" reset --hard -q "$git_ref" 2>/dev/null; then
       c_g "  仓库已复位到 ${git_ref:0:12}"
-    else
+    elif [[ "$git_ref_src" == explicit ]]; then
+      # 调用方**点名**要复位到这个提交(update 失败时的自动回滚就是这条) —— 做不到就是没回滚完整。
       unrestored+=("仓库Git($git_ref)")
+    else
+      # 从快照元数据**派生**出来的目标失败, 不算回滚失败: 调用方压根没要求动仓库, 配置与
+      # 服务都已还原到位。最常见的成因是 REPO_DIR 被重新 clone 过(cmd_update 在 .git 缺失时
+      # 会 rm -rf 重克隆), 于是老快照记的提交在新仓库里根本不存在 —— 那时把一次**成功的**
+      # 配置回滚判成失败, 只会让运维以为现场没还原干净, 去查一件根本不存在的事。
+      c_y "  ⚠️ 仓库没能复位到 ${git_ref:0:12}(该提交在当前仓库里可能已不存在)。"
+      c_y "     配置与服务已回滚; 代码仍是当前版本。要对齐就跑一次 pdg update, 或手工 git reset。"
     fi
   fi
   if [[ ${#unrestored[@]} -eq 0 ]]; then
@@ -1466,6 +1531,57 @@ _update_core_binary(){
   rm -rf "$tmp"
 }
 
+# 「机器上装的就是仓库这一版」—— 只有它成立, "已是最新"才成立。
+#
+# 为什么非要这一层: 仓库指针在最新 tag 上, **不等于**跑的就是那一版。/opt/pdg-bot 与
+# /usr/local/bin 里完全可以躺着旧的、半装的、或被手改坏的文件 —— 而那恰恰是 `pdg update`
+# 存在的意义。第一版判据只看 tag 与工作树, 于是把这条修复路径整个堵死了(CI 的
+# test-update-faults.sh 当场转红: 五条故障注入全部打空, "受管目标共 0 个")。
+#
+# 判据**fail-open**: 读不到清单、算不出 sha、少一个文件、清单是空的, 一律当"不同步"。
+# 方向是有意的, 两种误判的代价差着量级 ——
+#   误判为"不同步" → 白跑一次更新, 就是今天的行为, 没有损失;
+#   误判为"同步"   → `pdg update` 静默变成空操作, 而它是这台机器上最重要的修复手段。
+_pdg_same_file(){
+  local a b
+  a="$(sha256sum "$1" 2>/dev/null | cut -d" " -f1)"; [[ -n "$a" ]] || return 1
+  b="$(sha256sum "$2" 2>/dev/null | cut -d" " -f1)"; [[ -n "$b" ]] || return 1
+  [[ "$a" == "$b" ]]
+}
+
+_update_in_sync(){                      # 0 = 已装文件逐个等于仓库版本; 任何存疑一律非 0
+  local repo="${1:-}"
+  [[ -n "$repo" && -d "$repo" ]] || return 1
+  # 整块放子 shell: 这里 source 的 modules.sh 不该泄漏进 cmd_update 自己那次**带校验**的加载,
+  # 否则"清单读坏了"会被这次提前的 source 掩盖过去。
+  (
+    # shellcheck source=lib/modules.sh
+    source "$repo/lib/modules.sh" 2>/dev/null || exit 1
+    # 两个目录都走既有常量, 不写死: PDG_RUNTIME_DIR 由 modules.sh 定义(默认 /opt/pdg-bot),
+    # bin 目录沿用 _core_bindir。测试据此把现场造在沙箱里, 不必为了验这一段去动真路径。
+    local plat src name mode n=0 dest bindir
+    dest="${PDG_RUNTIME_DIR:-/opt/pdg-bot}"; bindir="$(_core_bindir)"
+    plat="$(_pdg_platform 2>/dev/null)" || exit 1
+    [[ -n "$plat" ]] || exit 1
+    while read -r src name mode; do
+      [[ -n "$src" ]] || continue
+      _pdg_same_file "$repo/$src" "$dest/$name" || exit 1
+      n=$((n + 1))
+    done < <(pdg_platform_modules "$plat")
+    # 清单一条都没读出来不是"没有东西要比", 是读出问题了 —— 那种情况下短路等于闭着眼跳过。
+    [[ "$n" -gt 0 ]] || exit 1
+    # 这四个不在 manifest 里, 由 cmd_update 显式安装 —— 漏掉它们的话, 只有 pdg 本体过期
+    # 这种最常见的形态反而检测不到。
+    _pdg_same_file "$repo/deploy/cert/proxy-gateway-open-cert-http.sh" \
+                   "$bindir/proxy-gateway-open-cert-http.sh"   || exit 1
+    _pdg_same_file "$repo/deploy/cert/proxy-gateway-restore-firewall.sh" \
+                   "$bindir/proxy-gateway-restore-firewall.sh" || exit 1
+    _pdg_same_file "$repo/deploy/bot/pdg-set-token.sh" "$bindir/pdg-set-token" || exit 1
+    _pdg_same_file "$repo/deploy/bot/pdg.sh"           "$bindir/pdg"           || exit 1
+    exit 0
+  )
+}
+
 cmd_update(){
   need_root update
   # --dry-run 只查看: 不装 git、不迁移、不写任何东西。任一步失败都要返回非 0 并说清是哪一步 ——
@@ -1490,6 +1606,34 @@ cmd_update(){
   fi
   command -v git >/dev/null || { apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git; }
   _lock   # 取锁(嵌套的 cmd_snapshot 不会重复锁)
+  # ── 「已是最新」短路 ────────────────────────────────────────────────────────
+  # 重复跑 `pdg update` 不该有副作用, 以前每次都照走全程: 多留一份快照(挤占 SNAP_DIR)、
+  # 两次 daemon-reload、重启 pdg-bot(iOS 还要加 probe81/mitm), 并把所有已装文件的 mtime
+  # 刷新一遍。用户数据零损伤, 但"什么都没变"的一次操作在现场看起来像动过全身 —— 事后
+  # 按 mtime 找"这次更新到底改了什么", 得到的是全部文件。
+  #
+  # 判据要求**两件事同时成立**: HEAD 正好落在最新发布 tag 上, 且工作树干净。
+  #   · 只比 tag 不看工作树 → 有人手改坏了仓库文件时, 短路会把 `pdg update` 这条修复路径
+  #     一起堵死, 而那正是最需要它能跑的时候;
+  #   · 不是仓库 / 拉不到 tag / 网络不通 → **不短路**, 照常走完整流程, 让后面各步给出自己
+  #     明确的失败理由。短路是优化, 不能变成第二处会拒绝执行的门。
+  # 这里的 fetch 静默: 它失败只意味着"判断不了, 那就别短路", 真正的报错留给下面那次。
+  if [[ -z "${PDG_UPDATE_FORCE:-}" && -d "${REPO_DIR:-}/.git" ]] \
+     && pdg_fetch_release_tags "$REPO_DIR" >/dev/null 2>&1; then
+    local _cur_sha _tgt_tag _tgt_sha
+    _tgt_tag="$(git -C "$REPO_DIR" tag -l 'v*' --sort=-v:refname 2>/dev/null | head -1)"
+    _cur_sha="$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null)"
+    # `^{commit}` 是必要的: 附注 tag 的对象哈希是 tag 自己, 不是它指向的提交, 直接比会
+    # 永远不相等 —— 短路静默失效, 而且没有任何迹象。
+    _tgt_sha="$(git -C "$REPO_DIR" rev-parse "${_tgt_tag}^{commit}" 2>/dev/null)"
+    if [[ -n "$_tgt_tag" && -n "$_cur_sha" && "$_cur_sha" == "$_tgt_sha" ]] \
+       && git -C "$REPO_DIR" diff --quiet HEAD -- 2>/dev/null \
+       && _update_in_sync "$REPO_DIR"; then
+      c_g "已是最新发布 $_tgt_tag, 且已装文件逐个与仓库一致 —— 无需更新(未建快照, 未重启任何服务)。"
+      echo "  要强制重装同一版本: PDG_UPDATE_FORCE=1 pdg update"
+      return 0
+    fi
+  fi
   c_g "更新前留快照…"
   if ! cmd_snapshot --source cli --op update >/dev/null 2>&1 || [[ -z "$_PDG_SNAP_CREATED" || ! -f "$_PDG_SNAP_CREATED/snap.tar.gz" ]]; then
     c_y "❌ 更新前快照失败, 中止更新(拒绝在无法回滚的前提下继续)。"; return 1
@@ -2174,7 +2318,12 @@ migrate_health_timer(){
     fi
     systemctl daemon-reload >/dev/null 2>&1 || _rbad=1
     [[ "$en0" == enabled ]] && { systemctl enable "$T" >/dev/null 2>&1 || _rbad=1; }
-    [[ "$ac0" == active  ]] && { systemctl start  "$T" >/dev/null 2>&1 || _rbad=1; }
+    # start 之前先清 start-limit: 会走到这条回滚路径的现场, 往往正是 unit 反复起不来 ——
+    # 那时它已经处在 start-limit-hit, `systemctl start` 必然失败, 于是一个**本来能恢复**
+    # 的现场被记成"回滚不完整", 运维按提示去人工核对, 却发现 unit 文件明明是对的。
+    # reset-failed 自己失败不计数: unit 没进 failed 态时它本来就返回非 0, 那是正常的。
+    [[ "$ac0" == active  ]] && { systemctl reset-failed "$T" >/dev/null 2>&1 || true
+                                 systemctl start  "$T" >/dev/null 2>&1 || _rbad=1; }
     rm -f "$bak"
     [[ "$_rbad" == 0 ]] || c_y "  ⚠️ 回滚 $T 不完整 —— 请手工核对 $cur 与 systemctl status $T"
     return 0

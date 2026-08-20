@@ -145,6 +145,64 @@ rc, out, _ = run_detect(env)
 (ok if (rc == 0 and out == "172.22.0.0/16") else bad)(
     "普通私网段不受影响 → %s" % out if rc == 0 else "私网段探测被破坏: rc=%s out=%r" % (rc, out))
 
+# ── 六、DERP 流量不得把结果拽向本机所在段 ────────────────────────────────────
+# Tailscale 的 DERP 中继走 TCP 443, 正好落在脚本的 BPF 端口集里。公网对端会被私网/CGNAT
+# 分类挡掉, 但**本机自己的 tailnet 地址每个包都要记一次** —— 它在入站包里是目的、在出站包
+# 里是源, 老写法把整行的地址一视同仁地捞出来, 两头都算。实测 40 秒本机拿 324 票、tailnet
+# 只有 176 票, 结果被拽向"本机所在段"。
+#
+# 注意这跟前五格测的**不是同一件事**: 接口排除挡的是"选中 tailnet 段", 这里的偏置来自
+# eth0 上的流量, 接口排除完全挡不住。
+LOCAL_TS = "100.98.1.1"          # 本机自己的 tailnet 地址(DERP 会话的本地端)
+DERP_PUB = "203.0.113.77"        # DERP 中继, 公网
+
+
+def derp_pair(local, peer):
+    """一来一回两行 DERP 流量。两行里本机地址各出现一次 —— 老写法就是这么被灌票的。"""
+    return [
+        "12:00:00.000000 %s In IP %s.443 > %s.44444: Flags [P.], seq 1:2, length 1"
+        % (PHYS_IF, peer, local),
+        "12:00:00.000001 %s Out IP %s.44444 > %s.443: Flags [P.], seq 1:2, length 1"
+        % (PHYS_IF, local, peer),
+    ]
+
+
+derp_lines = []
+for _ in range(20):
+    derp_lines += derp_pair(LOCAL_TS, DERP_PUB)
+# 手机样本刻意只给 3 条: 真实现场就是这个比例 —— 探测窗口里 DERP 的心跳远多于手机的查询。
+sample = derp_lines + [line(PHYS_IF, PHONE_SRC)] * 3
+
+env = stub_env(sample, has_ts=True)
+rc, out, _ = run_detect(env)
+if out == PHONE_CIDR:
+    ok("DERP 灌了 %d 票、手机只有 3 票, 仍选中手机那段 → %s" % (len(derp_lines), out))
+elif out == "100.98.0.0/16":
+    bad("被 DERP 拽到本机所在段 100.98.0.0/16 —— 偏置仍在")
+else:
+    bad("既没选中手机段也没选中本机段: rc=%s out=%r" % (rc, out))
+
+# 反向对照: 修复前那一版必须在同一组样本上被拽偏。不然这一格没有判别力 ——
+# 样本比例只要构造得不够狠, 新旧两版都会给出正确答案, 而它看起来照样是绿的。
+# 对照版由**当前源码做最小反向补丁**得到, 不用 `git show HEAD:` —— 那只在修复尚未提交时
+# 成立, 提交之后拿到的就是修好的版本, 这一格会安静地失去判别力却照样显示绿。
+# 反向补丁只改一行: 把"只数入站包的源地址"退回"整行地址一视同仁", 那正是偏置的来源。
+_cur = open(SCRIPT, encoding="utf-8").read()
+_Q = chr(39)                     # 单引号: 直接写会和外层引号打架
+_NEWX = "EXTRACT=" + _Q + '$2 != ts && $3 == "In" { print $5 }' + _Q
+_OLDX = "EXTRACT=" + _Q + '$2 != ts { print }' + _Q
+if _cur.count(_NEWX) != 1:
+    bad("反向补丁打空: 找不到唯一的入站源地址提取式 —— 产品换写法了, 这格必须跟着改")
+else:
+    OLD_SCRIPT = os.path.join(tmpguard.mkdtemp(prefix="pdg-detectold-"), "old.sh")
+    with open(OLD_SCRIPT, "w", encoding="utf-8") as fh:
+        fh.write(_cur.replace(_NEWX, _OLDX))
+    rc_o, out_o, _ = run_detect(stub_env(sample, has_ts=True), script=OLD_SCRIPT)
+    if out_o == out:
+        bad("反向对照: 旧写法在同一组样本上给出同样的 %r —— 这一格没有判别力" % out_o)
+    else:
+        ok("反向对照: 旧写法被同一组样本拽到 %s(证明这格真在测偏置)" % (out_o or "空"))
+
 print("\n" + "─" * 66)
 print("通过 %d, 失败 %d" % (npass, nfail))
 sys.exit(1 if nfail else 0)
