@@ -1217,11 +1217,11 @@ cmd_snapshot(){
 cmd_rollback(){
   need_root rollback; _lock
   # 参数: <序号>(默认0) | --dir <快照目录>(精确指定, 供 update 用) | --git <ref>(回滚后把 REPO_DIR 复位到该提交)
-  local idx="" dir="" git_ref="" target preserve=0 no_git=0
+  local idx="" dir="" git_ref="" git_ref_src="" target preserve=0 no_git=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --dir) dir="${2:-}"; shift 2 || { echo "--dir 缺参数"; return 1; };;
-      --git) git_ref="${2:-}"; shift 2 || { echo "--git 缺参数"; return 1; };;
+      --git) git_ref="${2:-}"; git_ref_src=explicit; shift 2 || { echo "--git 缺参数"; return 1; };;
       # 救援平面内部固定模式: **事前排除**救援自身的文件, 并让恢复出来的 nft 候选自带救援
       # 放行。只有这一个固定开关 —— 不提供 `--exclude <path>` 之类的任意排除, 否则"完整恢复"
       # 可以被指定成"什么都不恢复"。普通 CLI 不传它时行为与历史完全一致。
@@ -1256,6 +1256,7 @@ cmd_rollback(){
   # 记下的, 猜出来的不是。显式 `--git` 优先; `--no-git` 留给"只想回配置"的场合。
   if [[ -z "$git_ref" && "$no_git" == 0 ]]; then
     git_ref="$(_snap_meta_commit "${target%/}")"
+    [[ -n "$git_ref" ]] && git_ref_src=snapshot
     if [[ -n "$git_ref" ]]; then
       echo "  将一并把仓库复位到快照记录的提交 ${git_ref:0:12}(不想动代码就加 --no-git)"
     elif [[ -d "${REPO_DIR:-}/.git" ]]; then
@@ -1394,10 +1395,18 @@ cmd_rollback(){
   systemctl restart systemd-journald 2>/dev/null || true   # journald CanReload=no: 还原封顶需 restart 才生效
   # 仓库 Git 复位(update 回滚: 让 REPO_DIR 与还原出的旧脚本版本一致); 记录未能恢复项, 不谎报"完全回滚"
   if [[ -n "$git_ref" ]]; then
-    if [[ -d "$REPO_DIR/.git" ]] && git -C "$REPO_DIR" reset --hard -q "$git_ref" 2>/dev/null; then
+    if [[ -d "${REPO_DIR:-}/.git" ]] && git -C "$REPO_DIR" reset --hard -q "$git_ref" 2>/dev/null; then
       c_g "  仓库已复位到 ${git_ref:0:12}"
-    else
+    elif [[ "$git_ref_src" == explicit ]]; then
+      # 调用方**点名**要复位到这个提交(update 失败时的自动回滚就是这条) —— 做不到就是没回滚完整。
       unrestored+=("仓库Git($git_ref)")
+    else
+      # 从快照元数据**派生**出来的目标失败, 不算回滚失败: 调用方压根没要求动仓库, 配置与
+      # 服务都已还原到位。最常见的成因是 REPO_DIR 被重新 clone 过(cmd_update 在 .git 缺失时
+      # 会 rm -rf 重克隆), 于是老快照记的提交在新仓库里根本不存在 —— 那时把一次**成功的**
+      # 配置回滚判成失败, 只会让运维以为现场没还原干净, 去查一件根本不存在的事。
+      c_y "  ⚠️ 仓库没能复位到 ${git_ref:0:12}(该提交在当前仓库里可能已不存在)。"
+      c_y "     配置与服务已回滚; 代码仍是当前版本。要对齐就跑一次 pdg update, 或手工 git reset。"
     fi
   fi
   if [[ ${#unrestored[@]} -eq 0 ]]; then

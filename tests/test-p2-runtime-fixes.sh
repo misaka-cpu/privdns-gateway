@@ -96,6 +96,36 @@ SHA=0123456789abcdef0123456789abcdef01234567
 [[ -z "$(_snap_meta_commit "$WORK/nonexistent")" ]] \
   && ok "老快照没有 snapshot.json → 空(正常的跨版本形态)" || bad "缺元数据时行为不对"
 
+# ══ 二之二、派生的 git 复位失败不许把回滚判成失败 ══════════════════════════
+# 场景是真的会发生: cmd_update 在 `.git` 缺失时会 `rm -rf "$REPO_DIR"; git clone` 重克隆,
+# 于是老快照记下的提交在新仓库里根本不存在。那时 `git reset --hard` 必失败 ——
+#   · 调用方**点名** --git(update 失败时的自动回滚): 做不到就是没回滚完整, 计入 unrestored;
+#   · 从快照元数据**派生**出来的: 调用方压根没要求动仓库, 配置与服务都已还原到位。
+#     把这种情况判成失败, 运维会以为现场没还原干净, 去查一件根本不存在的事。
+drv_gitfail(){                          # $1=explicit|snapshot → 打印输出与退出码
+  local mode="$1"
+  { echo 'unrestored=()'
+    echo 'REPO_DIR="'"$WORK"'/norepo"'          # 没有 .git → reset 必失败
+    echo 'c_g(){ echo "$*"; }; c_y(){ echo "$*"; }'
+    echo 'git_ref=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef'
+    echo "git_ref_src=$mode"
+    # 只取 cmd_rollback 尾部那段复位逻辑 —— 整个函数需要真快照, 那不是这一格要验的
+    sed -n '/# 仓库 Git 复位/,/^  fi$/p' "$NEW"
+    echo 'echo "UNRESTORED=${#unrestored[@]}"'
+  } > "$WORK/d5.sh"
+  bash "$WORK/d5.sh" 2>&1
+}
+g_exp="$(drv_gitfail explicit)"; g_snap="$(drv_gitfail snapshot)"
+grep -q 'UNRESTORED=1' <<<"$g_exp" \
+  && ok "点名 --git 却复位不了 → 计入未恢复项(仍按没回滚完整处理)" \
+  || bad "显式 --git 失败没被记成未恢复: $(tr '\n' ' ' <<<"$g_exp" | cut -c1-120)"
+grep -q 'UNRESTORED=0' <<<"$g_snap" \
+  && ok "派生的目标复位不了 → **不**计入未恢复项(配置与服务已还原, 不谎报失败)" \
+  || bad "派生失败被判成回滚失败 —— 运维会去查一件不存在的事: $(tr '\n' ' ' <<<"$g_snap" | cut -c1-120)"
+grep -q '仓库没能复位到' <<<"$g_snap" \
+  && ok "派生失败仍然出声(说清代码没跟着回去, 给了对齐办法)" \
+  || bad "派生失败静默跳过了 —— 用户不知道代码与配置已经不同版"
+
 # ══ 三、migrate_health_timer 的 _restore: start 之前要清 start-limit ══════════
 # 会走到这条回滚路径的现场, 往往正是 unit 反复起不来 —— 那时它已经 start-limit-hit,
 # `systemctl start` 必然失败, 一个**本来能恢复**的现场被记成"回滚不完整"。
