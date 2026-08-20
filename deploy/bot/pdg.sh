@@ -1258,7 +1258,7 @@ cmd_rollback(){
     git_ref="$(_snap_meta_commit "${target%/}")"
     if [[ -n "$git_ref" ]]; then
       echo "  将一并把仓库复位到快照记录的提交 ${git_ref:0:12}(不想动代码就加 --no-git)"
-    elif [[ -d "$REPO_DIR/.git" ]]; then
+    elif [[ -d "${REPO_DIR:-}/.git" ]]; then
       # 说出来而不是静默跳过: 老快照没有 snapshot.json 是**正常的跨版本形态**, 但用户
       # 有权知道这次回滚只回了一半。
       c_y "  ⚠️ 这份快照没记下仓库提交(旧快照或元数据损坏) —— 只还原文件, 仓库仍停在当前版本。"
@@ -1558,7 +1558,7 @@ cmd_update(){
   #   · 不是仓库 / 拉不到 tag / 网络不通 → **不短路**, 照常走完整流程, 让后面各步给出自己
   #     明确的失败理由。短路是优化, 不能变成第二处会拒绝执行的门。
   # 这里的 fetch 静默: 它失败只意味着"判断不了, 那就别短路", 真正的报错留给下面那次。
-  if [[ -z "${PDG_UPDATE_FORCE:-}" && -d "$REPO_DIR/.git" ]] \
+  if [[ -z "${PDG_UPDATE_FORCE:-}" && -d "${REPO_DIR:-}/.git" ]] \
      && pdg_fetch_release_tags "$REPO_DIR" >/dev/null 2>&1; then
     local _cur_sha _tgt_tag _tgt_sha
     _tgt_tag="$(git -C "$REPO_DIR" tag -l 'v*' --sort=-v:refname 2>/dev/null | head -1)"
