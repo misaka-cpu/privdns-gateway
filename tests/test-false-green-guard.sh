@@ -15,9 +15,13 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 TARGET="$HERE/test-platform-install.sh"
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
-pass=0; nfail=0
+pass=0; nfail=0; nskip=0
 ok(){ echo "[OK]   $1"; pass=$((pass+1)); }
 bad(){ echo "[FAIL] $1"; nfail=$((nfail+1)); }
+# 环境不够时**必须出声**。以前那种"条件不满足就整段不跑"最坏: 断言数从 16 掉到 15,
+# 看起来只是少了一条, 没人能从输出里看出少的是哪条、为什么少 —— 而少掉的恰恰是负控。
+# 一支少了负控的测试仍然全绿, 那是最标准的假绿形态, 也正是本文件存在的理由。
+skip(){ echo "[SKIP] $1"; nskip=$((nskip+1)); }
 
 [[ -f "$TARGET" ]] || { bad "找不到被测用例文件: $TARGET"; echo "通过 $pass, 失败 $nfail"; exit 1; }
 
@@ -95,6 +99,11 @@ elif grep --version 2>/dev/null | head -1 | grep -q 'GNU grep'; then
 fi
 LINE='PROBE|fail|netns 不可用(x)'
 printf '%s\n' "$LINE" > "$WORK/gl"
+if [[ -z "$STRICT" ]]; then
+  # 这里少掉的是**负控**(证明坏写法在 POSIX grep 下确实会被截断)。下面那条静态扫描
+  # 仍然会跑, 所以护栏没有全失效 —— 但"行为层的证据没拿到"这件事必须写在输出里。
+  skip "本机既没有 busybox grep 也没有 GNU grep —— POSIX 截断的**行为对照**没跑(静态扫描仍在)"
+fi
 if [[ -n "$STRICT" ]]; then
   got="$($STRICT -o 'PROBE|.*' "$WORK/gl")"
   [[ "$got" == "$LINE" ]] \
@@ -134,7 +143,8 @@ echo; echo "── 故障注入命中率(行为验证, 不是字符串检查) �
 # 指定一个不存在的受管目标名, fake install 不会产生命中记录, 于是它必须判自己失败。
 # 靠 grep 某个字符串在不在文件里, 只能证明那行字还在, 证明不了守卫真的会拦。
 _u="$ROOT/tests/test-update-faults.sh"
-_res="$(mktemp)"
+_res="$WORK/fault-selftest-result"      # 放 $WORK 里: 裸 mktemp 不在 EXIT trap 的覆盖范围内,
+                                       # 中途被打断(Ctrl-C / 超时被杀)就留在 /tmp 不走了
 if PDG_FAULT_SELFTEST=1 PDG_FAULT_RESULT="$_res" timeout 600 bash "$_u" >/dev/null 2>&1; then
   bad "「故意打空」的自检场景竟然返回 0 —— 注入未命中被当成了通过"
 else
@@ -146,7 +156,6 @@ if grep -q 'RESULT=injection-not-hit' "$_res" 2>/dev/null; then
 else
   bad "拿不到 injection-not-hit 标记, 非零可能来自别的异常: $(head -c 120 "$_res" 2>/dev/null)"
 fi
-rm -f "$_res"
 # 辅助(降级为次要证据): 遍历必须真的覆盖 manifest 全集的首尾。
 _n=$(bash -c 'source "'"$ROOT"'/lib/modules.sh"; pdg_platform_modules ios | grep -c .')
 grep -qE "FAIL_NTH=1\"" "$_u" && grep -qE "FAIL_NTH=$_n\"" "$_u" \
@@ -162,5 +171,7 @@ grep -q 'pdg_install_runtime_modules "\$ROOT"' "$_pi" \
   && ok "改为真跑部署函数并核对内容/mode/幂等" || bad "没有真跑部署"
 
 echo "────────────────────────────────────────"
-echo "通过 $pass, 失败 $nfail"
+# 跳过数一并打出来: 断言数在宿主(16)与容器(15)里本来就不同, 差的就是上面那条依赖
+# busybox/GNU grep 的负控。把它记成 SKIP 之后, "少一条"是有名有姓的, 不再是个谜。
+echo "通过 $pass, 失败 $nfail, 跳过 $nskip"
 [[ "$nfail" == 0 ]]
