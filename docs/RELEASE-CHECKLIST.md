@@ -3,6 +3,11 @@
 打 `v*` tag 前,在**一台 throwaway 机**(全新 Debian 12/13 或 Ubuntu 22/24)上把下面四个场景跑一遍。
 单元测试(`tests/`)覆盖不到"装机 / 升级 / sing-box→mihomo 迁移"这类集成问题——本清单专门抓它们。
 
+> **2026-08-20 订正**:①里三处仍按"probe81 是 iOS 专属"写,那是 6.1B 之前的形态 ——
+> 它现在是**两平台公共必需件**。发 v1.10.5 时在沙盒里实测 Android 全新安装
+> `pdg-probe81=active`,回查 `lib/modules.sh:43`(公共清单)与 `migrate_probe81_public`
+> ("自 6.1B 起是 Android/iOS 公共必需服务")确认是清单过时,不是产品错。
+>
 > 本清单是照着真实翻过的车写的:v1.5.1(WLOC 开着时 `pdg update` 误回滚)、v1.5.2(从 v1.4.x 升级漏装 `sb2mihomo`/`mitm_*` → switch-core 报 ModuleNotFoundError)、v1.5.5(切 mihomo 后 TG 代理 :8445 没渲染)。这几个单测全绿、却都是部署才炸。
 
 装机用非交互 env(`PDG_SKIP_CERT=1` 自签占位,免签真证书):
@@ -19,9 +24,15 @@ PDG_NONINTERACTIVE=1 PDG_SERVER_IP=<公网IP> PDG_INTERNAL_CIDR=172.22.0.0/16 \
 至少跑 **iOS** 和 **Android** 两组(内核统一 mihomo)。装完:
 
 - [ ] `pdg doctor` 全绿(无 🔴/🟡)。
-- [ ] 服务全 active:`systemctl is-active mosdns mihomo pdg-bot`(iOS 追加 `pdg-probe81` `pdg-mitm`)。**Android 上 `pdg-probe81`/`pdg-mitm` 应不存在**(`systemctl is-enabled` 报 not-found),81/7894 不监听。**sing-box 二进制/服务都不应存在**。
-- [ ] **平台专属模块只在对应平台**:iOS `ls /opt/pdg-bot/{mitm_ca,mitm_server,mitm_wloc}.py` 齐; **Android 这三个 + `probe81.py` + 描述文件模板都不应存在**。`sb2mihomo.py` 两平台都在。
-- [ ] 平台门控对:**iOS** doctor 有「MITM 插件」「MITM结构」「平台=ios」无「GMS 推送」「iOS 探测」缺失;**Android** 反之(有 GMS、无 MITM/probe81)。
+- [ ] 服务全 active:`systemctl is-active mosdns mihomo pdg-bot pdg-probe81`(iOS 追加 `pdg-mitm`)。
+      **`pdg-probe81` 两个平台都该 active** —— 它自 6.1B 起是公共必需件(链路诊断的 HTTP 会话入口),
+      见 `lib/modules.sh` 的公共清单与 `migrate_probe81_public`。
+      **Android 上 `pdg-mitm` 应不存在**(`systemctl is-enabled` 报 not-found),7894 不监听。
+      **sing-box 二进制/服务都不应存在**。
+- [ ] **平台专属模块只在对应平台**:iOS `ls /opt/pdg-bot/{mitm_ca,mitm_server,mitm_wloc}.py` 齐;
+      **Android 这三个 + 描述文件模板都不应存在**。`sb2mihomo.py` 与 **`probe81.py`** 两平台都在。
+- [ ] 平台门控对:**iOS** doctor 有「MITM 插件」「MITM结构」「平台=ios」无「GMS 推送」;
+      **Android** 反之(有 GMS、无 MITM)。probe81 不在门控范围内 —— 两平台都有。
 - [ ] **平台隔离(硬门控)**:**Android** bot「📱 客户端」无「iOS 描述文件」按钮;点旧消息里的 iOS/WLOC 按钮被拒;`sudo pdg ios` 友好拒绝(不装 qrencode、不开 8443)。**iOS** 有描述文件/WLOC。
 - [ ] **描述文件取件通道**:`sudo pdg ios` 与 `sudo pdg ios previous` **都**打出二维码,其间 `ss -ltn | grep 8443` 有监听、`nft list ruleset | grep 8443` 有临时放行;回车收尾后两者都没有。(5.4 早期 `previous` 只把文件写到服务器上,手机拿不到。)
 - [ ] **iOS 无 GMS 残留**:`grep -c in-gms /etc/sing-box/config.json` = 0;`nft list ruleset | grep 5228` 无。
