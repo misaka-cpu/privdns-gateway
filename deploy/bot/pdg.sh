@@ -1522,6 +1522,57 @@ _update_core_binary(){
   rm -rf "$tmp"
 }
 
+# 「机器上装的就是仓库这一版」—— 只有它成立, "已是最新"才成立。
+#
+# 为什么非要这一层: 仓库指针在最新 tag 上, **不等于**跑的就是那一版。/opt/pdg-bot 与
+# /usr/local/bin 里完全可以躺着旧的、半装的、或被手改坏的文件 —— 而那恰恰是 `pdg update`
+# 存在的意义。第一版判据只看 tag 与工作树, 于是把这条修复路径整个堵死了(CI 的
+# test-update-faults.sh 当场转红: 五条故障注入全部打空, "受管目标共 0 个")。
+#
+# 判据**fail-open**: 读不到清单、算不出 sha、少一个文件、清单是空的, 一律当"不同步"。
+# 方向是有意的, 两种误判的代价差着量级 ——
+#   误判为"不同步" → 白跑一次更新, 就是今天的行为, 没有损失;
+#   误判为"同步"   → `pdg update` 静默变成空操作, 而它是这台机器上最重要的修复手段。
+_pdg_same_file(){
+  local a b
+  a="$(sha256sum "$1" 2>/dev/null | cut -d" " -f1)"; [[ -n "$a" ]] || return 1
+  b="$(sha256sum "$2" 2>/dev/null | cut -d" " -f1)"; [[ -n "$b" ]] || return 1
+  [[ "$a" == "$b" ]]
+}
+
+_update_in_sync(){                      # 0 = 已装文件逐个等于仓库版本; 任何存疑一律非 0
+  local repo="${1:-}"
+  [[ -n "$repo" && -d "$repo" ]] || return 1
+  # 整块放子 shell: 这里 source 的 modules.sh 不该泄漏进 cmd_update 自己那次**带校验**的加载,
+  # 否则"清单读坏了"会被这次提前的 source 掩盖过去。
+  (
+    # shellcheck source=lib/modules.sh
+    source "$repo/lib/modules.sh" 2>/dev/null || exit 1
+    # 两个目录都走既有常量, 不写死: PDG_RUNTIME_DIR 由 modules.sh 定义(默认 /opt/pdg-bot),
+    # bin 目录沿用 _core_bindir。测试据此把现场造在沙箱里, 不必为了验这一段去动真路径。
+    local plat src name mode n=0 dest bindir
+    dest="${PDG_RUNTIME_DIR:-/opt/pdg-bot}"; bindir="$(_core_bindir)"
+    plat="$(_pdg_platform 2>/dev/null)" || exit 1
+    [[ -n "$plat" ]] || exit 1
+    while read -r src name mode; do
+      [[ -n "$src" ]] || continue
+      _pdg_same_file "$repo/$src" "$dest/$name" || exit 1
+      n=$((n + 1))
+    done < <(pdg_platform_modules "$plat")
+    # 清单一条都没读出来不是"没有东西要比", 是读出问题了 —— 那种情况下短路等于闭着眼跳过。
+    [[ "$n" -gt 0 ]] || exit 1
+    # 这四个不在 manifest 里, 由 cmd_update 显式安装 —— 漏掉它们的话, 只有 pdg 本体过期
+    # 这种最常见的形态反而检测不到。
+    _pdg_same_file "$repo/deploy/cert/proxy-gateway-open-cert-http.sh" \
+                   "$bindir/proxy-gateway-open-cert-http.sh"   || exit 1
+    _pdg_same_file "$repo/deploy/cert/proxy-gateway-restore-firewall.sh" \
+                   "$bindir/proxy-gateway-restore-firewall.sh" || exit 1
+    _pdg_same_file "$repo/deploy/bot/pdg-set-token.sh" "$bindir/pdg-set-token" || exit 1
+    _pdg_same_file "$repo/deploy/bot/pdg.sh"           "$bindir/pdg"           || exit 1
+    exit 0
+  )
+}
+
 cmd_update(){
   need_root update
   # --dry-run 只查看: 不装 git、不迁移、不写任何东西。任一步失败都要返回非 0 并说清是哪一步 ——
@@ -1567,8 +1618,9 @@ cmd_update(){
     # 永远不相等 —— 短路静默失效, 而且没有任何迹象。
     _tgt_sha="$(git -C "$REPO_DIR" rev-parse "${_tgt_tag}^{commit}" 2>/dev/null)"
     if [[ -n "$_tgt_tag" && -n "$_cur_sha" && "$_cur_sha" == "$_tgt_sha" ]] \
-       && git -C "$REPO_DIR" diff --quiet HEAD -- 2>/dev/null; then
-      c_g "已是最新发布 $_tgt_tag —— 无需更新(未建快照, 未重启任何服务)。"
+       && git -C "$REPO_DIR" diff --quiet HEAD -- 2>/dev/null \
+       && _update_in_sync "$REPO_DIR"; then
+      c_g "已是最新发布 $_tgt_tag, 且已装文件逐个与仓库一致 —— 无需更新(未建快照, 未重启任何服务)。"
       echo "  要强制重装同一版本: PDG_UPDATE_FORCE=1 pdg update"
       return 0
     fi

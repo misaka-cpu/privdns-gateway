@@ -132,23 +132,53 @@ ctl "$(grep -c 'CY:.*不完整' <<<"$o_new")" "$(grep -c 'CY:.*不完整' <<<"$o
 # ══ 四、cmd_update 的「已是最新」短路 ════════════════════════════════════════
 # 判别力全在**有没有真的跳过副作用**上: 只看它打印了什么, 改坏成"打印后照跑"也能骗过去。
 # 所以桩把 cmd_snapshot 记成一次调用 —— 短路成立时它必须是 0 次。
-mkrepo(){                               # $1=HEAD 是否落在最新 tag 上; 打印仓库路径
+#
+# 这一节的现场是真的: 临时仓库里放真 lib/ 与 deploy/, 再按 manifest 把文件"装"到沙箱目录,
+# 于是 _update_in_sync 走的是与生产同一条路径(逐个比 sha), 不是一个说什么就是什么的桩。
+mkrepo(){                               # $1=latest|behind|dirty; 打印仓库路径
   local d="$WORK/repo$1"; rm -rf "$d"; mkdir -p "$d"
+  cp -a "$ROOT/lib" "$ROOT/deploy" "$d"/ 2>/dev/null || return 1
   git -C "$d" init -q 2>/dev/null    # init 不动 ref, 也没法走 e2e_git(它要求目标已是仓库)
-  e2e_git "$d" -c user.email=t@t -c user.name=t commit -q --allow-empty -m c1
+  e2e_git "$d" add -A >/dev/null 2>&1
+  e2e_git "$d" -c user.email=t@t -c user.name=t commit -q -m c1
   # 用**附注** tag: 轻量 tag 的对象哈希就是提交, 少写 `^{commit}` 也能碰巧相等 ——
   # 那样这一格就测不出真正的错误形态了。
   e2e_git "$d" -c user.email=t@t -c user.name=t tag -a v9.9.9 -m r 2>/dev/null
-  [[ "$1" == "behind" ]] && e2e_git "$d" -c user.email=t@t -c user.name=t commit -q --allow-empty -m c2
+  if [[ "$1" == behind ]]; then
+    echo x > "$d/extra.txt"; e2e_git "$d" add -A >/dev/null 2>&1
+    e2e_git "$d" -c user.email=t@t -c user.name=t commit -q -m c2
+  fi
   echo "$d"
 }
+
+deploy_from(){                          # $1=仓库 → 按 manifest 把文件装到 $WORK/dest 与 $WORK/bin
+  local r="$1" src name mode
+  # `${WORK:?}` 不是形式主义: $WORK 万一为空, 这行就是 `rm -rf /dest /bin`。
+  rm -rf "${WORK:?}/dest" "${WORK:?}/bin"; mkdir -p "$WORK/dest" "$WORK/bin"
+  # shellcheck source=lib/modules.sh
+  source "$r/lib/modules.sh" 2>/dev/null || return 1
+  while read -r src name mode; do
+    [[ -n "$src" ]] || continue
+    install -m"$mode" "$r/$src" "$WORK/dest/$name" 2>/dev/null || return 1
+  done < <(pdg_platform_modules android)
+  install -m755 "$r/deploy/cert/proxy-gateway-open-cert-http.sh"   "$WORK/bin/" 2>/dev/null || return 1
+  install -m755 "$r/deploy/cert/proxy-gateway-restore-firewall.sh" "$WORK/bin/" 2>/dev/null || return 1
+  install -m755 "$r/deploy/bot/pdg-set-token.sh" "$WORK/bin/pdg-set-token" 2>/dev/null || return 1
+  install -m755 "$r/deploy/bot/pdg.sh"           "$WORK/bin/pdg"           2>/dev/null || return 1
+}
+
 drv_update(){                           # $1=pdg.sh $2=仓库 → 输出 + 副作用记录
   local f="$1" r="$2"
   { echo 'REPO_DIR="'"$r"'"'
+    echo 'PDG_RUNTIME_DIR="'"$WORK"'/dest"; PDG_CORE_BINDIR="'"$WORK"'/bin"'
     echo 'c_g(){ echo "$*"; }; c_y(){ echo "$*"; }'
     echo 'need_root(){ :; }; _lock(){ :; }'
+    echo '_pdg_platform(){ echo android; }'          # 平台选择不是这一节要验的
     echo 'pdg_fetch_release_tags(){ return 0; }'
     echo 'cmd_snapshot(){ echo SNAPSHOT-RAN >> "'"$WORK"'/eff"; return 1; }'   # 真跑到就留痕
+    fn "$f" '/^_core_bindir(){/,/^}/p'
+    fn "$f" '/^_pdg_same_file(){/,/^}/p'
+    fn "$f" '/^_update_in_sync(){/,/^}/p'
     fn "$f" '/^cmd_update(){/,/^}/p'
     echo 'cmd_update; echo "RC=$?"'
   } > "$WORK/d4.sh"
@@ -156,10 +186,13 @@ drv_update(){                           # $1=pdg.sh $2=仓库 → 输出 + 副�
   bash "$WORK/d4.sh" 2>&1
   echo "---EFF---"; cat "$WORK/eff"
 }
-u_new="$(drv_update "$NEW" "$(mkrepo latest)")"
-u_old="$(drv_update "$OLD" "$(mkrepo latest)")"
+
+R_LATEST="$(mkrepo latest)"
+deploy_from "$R_LATEST" || bad "夹具没造起来: 按 manifest 装文件失败"
+u_new="$(drv_update "$NEW" "$R_LATEST")"
+u_old="$(drv_update "$OLD" "$R_LATEST")"
 if grep -q 'RC=0' <<<"$u_new" && ! grep -q 'SNAPSHOT-RAN' <<<"$u_new"; then
-  ok "HEAD 已在最新 tag 上 → 返回 0 且**没有**建快照(副作用真的跳过了)"
+  ok "HEAD 在最新 tag 上**且已装文件逐个一致** → 返回 0 且没有建快照(副作用真的跳过了)"
 else
   bad "短路没生效: $(grep -E 'RC=|SNAPSHOT' <<<"$u_new" | tr '\n' ' ')"
 fi
@@ -170,20 +203,38 @@ grep -q 'PDG_UPDATE_FORCE' <<<"$u_new" \
 ctl "$(grep -c 'SNAPSHOT-RAN' <<<"$u_new")" "$(grep -c 'SNAPSHOT-RAN' <<<"$u_old")" \
     "旧版在同样的「已是最新」现场照样建了快照"
 
+# ── ★ 已装文件漂移时**不许**短路 ────────────────────────────────────────────
+# 这一格是补的, 因为第一版判据只看 tag 与工作树 —— 仓库指针在最新 tag 上, 不等于跑的
+# 就是那一版。/opt/pdg-bot 里躺着旧的或被改坏的文件时, `pdg update` 正是要修它。
+# 第一版把这条路径整个堵死, CI 的 test-update-faults.sh 当场转红(五条故障注入全部打空,
+# "受管目标共 0 个")。少了这一格, 同样的错误还会再犯一次。
+_victim="$(ls "$WORK/dest" | head -1)"
+printf '\n# tampered\n' >> "$WORK/dest/$_victim"
+u_drift="$(drv_update "$NEW" "$R_LATEST")"
+grep -q 'SNAPSHOT-RAN' <<<"$u_drift" \
+  && ok "已装文件被改动($_victim)→ 不短路, 照常进入更新流程" \
+  || bad "已装文件漂移了还短路 —— pdg update 修不回来: $(tr '\n' ' ' <<<"$u_drift" | cut -c1-140)"
+
+# ── fail-open: 少一个已装文件也不许短路 ──────────────────────────────────────
+# 判据存疑时的方向必须是"照常更新"。反过来的话, 半装现场会被当成"已是最新"而永远修不好。
+deploy_from "$R_LATEST"; rm -f "$WORK/dest/$_victim"
+u_miss="$(drv_update "$NEW" "$R_LATEST")"
+grep -q 'SNAPSHOT-RAN' <<<"$u_miss" \
+  && ok "已装文件缺失 → 不短路(判据 fail-open, 存疑就更新)" \
+  || bad "缺文件也短路了 —— 半装现场会被当成「已是最新」"
+
 # ── 反向格: 落后一个提交时**必须**照常走全程 ──
 # 少了这一格, 把短路写成"无条件 return 0"也能全绿, 而那会让 pdg update 彻底失效。
-u_behind="$(drv_update "$NEW" "$(mkrepo behind)")"
+R_BEHIND="$(mkrepo behind)"; deploy_from "$R_BEHIND"
+u_behind="$(drv_update "$NEW" "$R_BEHIND")"
 grep -q 'SNAPSHOT-RAN' <<<"$u_behind" \
   && ok "反向格: HEAD 落后于最新 tag → 照常进入快照流程(短路没有误伤真更新)" \
   || bad "落后时也被短路了 —— pdg update 会彻底失效: $(tr '\n' ' ' <<<"$u_behind" | cut -c1-140)"
 
 # ── 工作树脏时不许短路: 那正是要靠 pdg update 修回来的场合 ──
-dirty="$(mkrepo latest)"; echo x > "$dirty/dirty.txt"
-e2e_git "$dirty" -c user.email=t@t -c user.name=t add dirty.txt 2>/dev/null
-e2e_git "$dirty" -c user.email=t@t -c user.name=t commit -q -m d 2>/dev/null
-e2e_git "$dirty" -c user.email=t@t -c user.name=t tag -f -a v9.9.9 -m r 2>/dev/null
-echo "tampered" > "$dirty/dirty.txt"
-u_dirty="$(drv_update "$NEW" "$dirty")"
+R_DIRTY="$(mkrepo dirty)"; deploy_from "$R_DIRTY"
+echo "tampered" >> "$R_DIRTY/lib/modules.sh"
+u_dirty="$(drv_update "$NEW" "$R_DIRTY")"
 grep -q 'SNAPSHOT-RAN' <<<"$u_dirty" \
   && ok "工作树被改脏 → 不短路(修复路径保持可用)" \
   || bad "工作树脏也短路了 —— 手改坏仓库后 pdg update 修不回来"
