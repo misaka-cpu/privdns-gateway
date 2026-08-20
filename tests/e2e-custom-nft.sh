@@ -34,21 +34,10 @@ printf '#!/bin/sh\ncase "$1" in -v|version) echo "Mihomo Meta %s linux amd64";; 
 #   nft -c -f FILE   → 只校验, 不改状态
 #   nft list ruleset → 打印当前 ruleset
 NFT_STATE=$E2E_TMP/e2e-nft-ruleset
-{ printf '#!/bin/sh\nSTATE=%s\n' "$NFT_STATE"      # 引号 heredoc 不展开, 路径从生成的头行注入
-  cat <<'S'
-case "$1" in
-  -c) exit 0 ;;                                   # 只校验
-  -f) [ -f "$2" ] && cat "$2" > "$STATE"; exit 0 ;;   # 装载
-  list)
-     if [ "$2" = "ruleset" ]; then cat "$STATE" 2>/dev/null; exit 0; fi
-     # list chain/table: 从当前 ruleset 里粗筛(够本用例判定用)
-     cat "$STATE" 2>/dev/null; exit 0 ;;
-  delete) exit 0 ;;
-esac
-exit 0
-S
-} > /usr/local/bin/nft
-chmod 755 /usr/local/bin/nft
+# nft 桩走 e2e-lib.sh 的唯一实现。原来这里是一份私有的简化桩, **没有 `-j` 分支** ——
+# 被测路径一旦走到 nftlive(它读的正是 `nft -j list table`), 桩会静默返回空, 于是断言
+# 读到一个"看着健康"的空表。共享桩把 -j 接到 tests/nftjson.py 上, 表不在就非零退出。
+e2e_write_nft_stub
 
 seed_sb(){   # 造出"仍在跑 sing-box 的老机器"(unit 用老版真实形态 + 归属标记, 迁移才会走完整路径)
   printf 'singbox\n' > /etc/privdns-gateway/backend

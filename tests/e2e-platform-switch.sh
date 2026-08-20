@@ -42,19 +42,10 @@ done
 for u in pdg-bot mosdns mihomo; do echo 1 > "$E2E_TMP/e2e-svc/$u.ac"; echo 1 > "$E2E_TMP/e2e-svc/$u.en"; done
 e2e_fetch_mihomo || e2e_skip "取不到 mihomo 二进制"
 
-# nft 桩: 维护一份"已加载 ruleset", 好验证运行规则真的跟着变
-{ printf '#!/bin/sh\nSTATE=%s\n' "$E2E_TMP/e2e-nft-ruleset"   # 引号 heredoc 不展开, 路径走头行
-  cat <<'S'
-case "$1" in
-  -c) exit 0 ;;
-  -f) [ -f "$2" ] && cat "$2" > "$STATE"; exit 0 ;;
-  list) cat "$STATE" 2>/dev/null; exit 0 ;;
-  delete) exit 0 ;;
-esac
-exit 0
-S
-} > /usr/local/bin/nft
-chmod 755 /usr/local/bin/nft
+# nft 桩: 维护一份"已加载 ruleset", 好验证运行规则真的跟着变。
+# 走 e2e-lib.sh 的唯一实现 —— 原来这里是私有简化桩, **没有 `-j` 分支**, 被测路径
+# 一旦走到 nftlive 就会拿到一个空表, 而那不会报错, 只会让断言读到"看着健康"的空壳。
+e2e_write_nft_stub
 nft -f /etc/nftables.conf
 
 gms_in_nft(){ grep -qE 'tcp dport [{][^}]*5228' /etc/nftables.conf; }
