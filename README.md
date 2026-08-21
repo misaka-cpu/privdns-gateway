@@ -223,7 +223,75 @@ ssh <你的网关> sudo pdg rescue fingerprint
 
 手机上的具体步骤见 [docs/rescue-plane-access.md](docs/rescue-plane-access.md)。
 
-## 12. 项目组成
+## 12. Tailscale（可选，但装了就有硬约束）
+
+**本项目不安装、不管理 Tailscale。**装不装、怎么装都是你自己的事。这一节只说**两者的交界处** —— 因为 Tailscale 恰好会碰到这套系统赖以工作的两个地方，装之前不知道的话，出的故障从表面完全看不出跟它有关。
+
+### 为什么会打架
+
+Tailscale 给节点分配的地址来自 `100.64.0.0/10`。而运营商的 SIM/APN 内网卡**也合法使用同一个段**（RFC 6598）—— 这套系统正是靠"来源在内网卡段"来决定要不要接管一个客户端的流量。**只看源地址，分不开这两者。**
+
+本项目的做法是按**入口接口**排除，不按地址段排除：
+
+```
+table inet pdg {
+  chain prerouting {
+    iifname "tailscale0" return     # 第一条 —— tailnet 流量根本走不到 REDIRECT
+    ...
+  }
+  chain input {
+    ...
+    tcp dport 22 accept             # SSH 在排除之前 —— 所以你仍然能从 tailnet 登进来
+    ip protocol icmp accept
+    iifname "tailscale0" return     # 从这里起, tailnet 拿不到内网卡客户端的待遇
+    ip saddr <你的内网段> tcp dport { 53, 81, 853, 7893, 8445 } accept
+  }
+}
+```
+
+按接口而不按段，是为了**不误伤真实的运营商 CGNAT 用户** —— 如果看见 `100.64.x.x` 就拒绝，那些手机本来就在这个段里，会被一起挡掉。
+
+结果是：**从 tailnet 能 SSH、能 ping、已建连的会话不受影响，但拿不到 DNS/代理那几个内网卡专用端口，流量也不会被送进透明代理。**这是有意的 —— 管理通道和数据面本来就该分开。
+
+### 🔴 必须用 nodivert 模式
+
+```bash
+sudo tailscale up --netfilter-mode=nodivert   # 其余参数按你自己的需要加
+```
+
+默认模式（`--netfilter-mode=on`）下，Tailscale 会往 `INPUT` 链插一条跳到 `ts-input` 的规则。那条链和本项目的 `inet pdg` **挂在同一个 hook 上**，而 nftables 里同一 hook 上的每条 base chain 都会执行 —— 于是 `pdg doctor` 会判「防火墙链冲突」，**升级时会因此整次回滚**。
+
+`nodivert` 只是不建那条跳转，Tailscale 自己的反欺骗保护仍然生效（实测：伪造 `100.64.x.x` 源地址的包被拒，而 `ts-input` 的计数器纹丝不动 —— 挡下它的是 `inet pdg`）。
+
+这个设置**会持久化**，重启 tailscaled、重启整机都不丢。而且 Tailscale 自己会拦住误改：不带参数直接跑 `tailscale up` 会报错，要求你把所有非默认参数都写全。
+
+### 装了之后 `pdg detect-cidr` 会变谨慎
+
+它靠抓包猜你的内网卡段。装了 Tailscale 之后：
+
+- tailnet 的样本会按入口接口被排除，不会被误选成内网段；
+- 但如果这台机器的 `tcpdump` 老到 `-i any` 不打接口名，"入口接口"这个事实就拿不到 —— 那时它**直接拒绝猜**，让你手输，而不是赌一把。这是有意的：猜错会把 nft 的 REDIRECT 改挂到 tailnet 上，管理流量被送进透明代理，而这种故障从配置上完全看不出来。
+
+### 卸载之后要手工收两样
+
+Tailscale 卸载时不还原自己改过的东西，`pdg doctor` 会提醒（但不会替你动手）：
+
+```bash
+sysctl -w net.ipv4.conf.all.src_valid_mark=0   # 它改成 1 且不落 /etc/sysctl.d, 重启才恢复
+rm -f /usr/bin/tailscale                       # apt purge 之后仍残留, dpkg 查不到归属
+```
+
+第一条留着不至于立刻出事，但它制造了"重启前后行为不一致"这种最难查的现象。
+
+### 怎么确认没配错
+
+```bash
+sudo pdg doctor          # 看「Tailscale 入口隔离」与「Tailscale 卸载残留」两项
+```
+
+手机上点 Bot 的 **🩺 自检** 也一样 —— 它跑的是同一套检查库。
+
+## 13. 项目组成
 
 | 层 | 组件 | 说明 |
 |---|---|---|
@@ -293,7 +361,7 @@ sudo nft -c -f /etc/nftables.conf && sudo systemctl reload nftables
 - **观测面板前端资源（zashboard）**：固定版本 + SHA256 校验 + 暂存目录 + 原子替换，属于静态
   缓存资源，不是 DNS/分流生产配置，因此不纳入配置事务。
 
-## 13. 文档
+## 14. 文档
 
 - [docs/QUICKSTART.md](docs/QUICKSTART.md) — 新手图文教程
 - [docs/INSTALL.md](docs/INSTALL.md) — 安装细节 / DNS 配置 / 端口 / 版本说明
@@ -304,7 +372,7 @@ sudo nft -c -f /etc/nftables.conf && sudo systemctl reload nftables
 - [docs/RELEASE-CHECKLIST.md](docs/RELEASE-CHECKLIST.md) — 发版前检查清单
 - [CHANGELOG.md](CHANGELOG.md) — 更新日志
 
-## 14. 免责声明与 License
+## 15. 免责声明与 License
 
 本项目仅供学习与合法网络管理用途。请遵守你所在地的法律法规，使用者自行承担责任，作者不对使用后果负责。
 
