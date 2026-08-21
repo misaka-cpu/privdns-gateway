@@ -13,6 +13,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
 TPL="$ROOT/deploy/firewall/nftables-mihomo.conf"
 # 救援端口从真源读, 不敲字面量(pre-commit 有守卫)
+NOTE_ANY='# (SSH 未收紧为 tailnet, 故不放行 Tailscale 直连端口)'
 RPORT="$(python3 "$ROOT/deploy/bot/rescue_const.py" --port 2>/dev/null)"
 [[ -n "$RPORT" ]] || { echo "[FAIL] 读不到救援端口常量"; exit 1; }
 
@@ -136,6 +137,73 @@ has41641(){ grep -qE '^[[:space:]]*udp dport 41641 accept' "$1" && echo 有 || e
 # 注: 上面两条判的是 a.conf / b.conf 在**第一、二格同步之后**的内容 —— b.conf 在第二格里
 # 已被证实真正走过重建路径, 所以这里的 41641 是重建时派生出来的, 不是夹具写死的。
 # (不再单独加一格去复验"是否重建过": 那条写成 `... || ok` 就永远不会红, 是假绿。)
+
+echo
+echo "── 七、cmd_ssh_source 的改写与前置判据 ──"
+# 改写走 _ssh_source_rewrite(就地改两行), 有意**不整份重渲染** —— 那会抹掉救援平面注入的
+# 规则和用户 include 里的东西。收紧 SSH 不该顺手动别的。
+sr(){ # $1=模式 $2=输入 $3=输出
+  { echo '_SSH_TS_ACCEPT='"'"'udp dport 41641 accept comment "pdg-tailnet-direct"'"'"''
+    sed -n '/^_ssh_source_rewrite(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh"
+    echo "_ssh_source_rewrite '$1' '$2' '$3'"
+  } > "$WORK/sr.sh"
+  bash "$WORK/sr.sh"
+}
+render "" "$NOTE_ANY" "$WORK/g0.conf"
+sr tailnet "$WORK/g0.conf" "$WORK/g1.conf"
+{ [[ "$(ssh_form "$WORK/g1.conf")" == tailnet ]] && grep -qE '^[[:space:]]*udp dport 41641 accept' "$WORK/g1.conf"; } \
+  && ok "any → tailnet: SSH 收紧且 41641 一并放行" \
+  || bad "any → tailnet 改写不对: form=$(ssh_form "$WORK/g1.conf") 41641=$(grep -c 41641 "$WORK/g1.conf")"
+
+sr tailnet "$WORK/g1.conf" "$WORK/g1b.conf"
+[[ "$(grep -c '^[[:space:]]*udp dport 41641 accept' "$WORK/g1b.conf")" == 1 ]] \
+  && ok "重复收紧是幂等的(41641 不会插成两条)" \
+  || bad "重复执行插了 $(grep -c '^[[:space:]]*udp dport 41641 accept' "$WORK/g1b.conf") 条 41641"
+
+sr any "$WORK/g1.conf" "$WORK/g2.conf"
+{ [[ "$(ssh_form "$WORK/g2.conf")" == any ]] && ! grep -qE '^[[:space:]]*udp dport 41641 accept' "$WORK/g2.conf"; } \
+  && ok "tailnet → any: SSH 放开且 41641 一并撤销" \
+  || bad "tailnet → any 改写不对"
+
+# 往返必须回到原样 —— 否则每切换一次配置就漂一点, 几轮之后没人认得出它该是什么样
+[[ "$(sha256sum "$WORK/g0.conf" | cut -d' ' -f1)" == "$(sha256sum "$WORK/g2.conf" | cut -d' ' -f1)" ]] \
+  && ok "any→tailnet→any 往返后逐字节回到原样(不留漂移)" \
+  || bad "往返后与原文件不一致: $(diff "$WORK/g0.conf" "$WORK/g2.conf" | head -4 | tr '\n' ' ')"
+
+# 前置判据: 没有经 tailnet 的 SSH 会话时必须拒绝
+gate(){ { echo 'ss(){ :; }; tailscale(){ :; }'
+          sed -n '/^_ssh_via_tailnet(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh"
+          echo 'if _ssh_via_tailnet; then echo YES; else echo NO; fi'; } > "$WORK/gate.sh"
+        bash "$WORK/gate.sh"; }
+[[ "$(gate)" == NO ]] \
+  && ok "没有经 tailnet 的 SSH 会话 → 判据返回否(收紧会被拒)" \
+  || bad "判据在没有 tailnet 会话时也返回是 —— 那道门形同虚设"
+
+echo
+echo "── 八、pipefail + \`| grep -q\` 的陷阱 ──"
+# pdg.sh 开头是 `set -uo pipefail`。管道里 `grep -q` 一命中就退出, 上游若还在写就吃 SIGPIPE(141),
+# 于是**匹配成功反而被判失败**。这个坑在这两个函数里各踩过一次:
+#   · 复核内核形态 → 每次 apply 都回滚, 命令看着"安全"实则彻底不能用;
+#   · tailnet 前置门 → 永远返回否, 收紧永远做不成。
+# 两处现已改成先取到变量再匹配。这里先证明陷阱真实存在, 再守住代码形态。
+set -o pipefail
+if seq 1 200000 | grep -q 1; then
+  bad "本机复现不出 SIGPIPE(141)——下面那条形态守卫因此只是形式, 不是行为证据"
+else
+  ok "陷阱确实存在: pipefail 下 \`大输出 | grep -q\` 命中却返回 $?"
+fi
+set +o pipefail
+
+for fn in _ssh_source_apply _ssh_via_tailnet; do
+  # 先去掉注释再判 —— 那两处的说明文字里正好写着这个坏写法, 不去注释就自己命中自己。
+  body="$(sed -n "/^${fn}(){/,/^}/p" "$ROOT/deploy/bot/pdg.sh" | sed 's/#.*$//')"
+  [[ -n "$body" ]] || { bad "取不到 $fn 的函数体 —— 判据失效"; continue; }
+  if grep -qE '\|[[:space:]]*grep -[a-zA-Z]*q' <<<"$body"; then
+    bad "$fn 里又出现了 \`| grep -q\` —— pipefail 下会把命中判成失败"
+  else
+    ok "$fn 里没有管道式 grep -q(改用先取变量再匹配)"
+  fi
+done
 
 echo "────────────────────────────────────────"
 echo "通过 $pass, 失败 $nfail"

@@ -2214,6 +2214,7 @@ menu(){
     echo " 11) 诊断报告 (脱敏)"
     echo " 12) 识别内网卡段"
     echo " 13) 卸载"
+    echo "  s) SSH 来源限制 (可选: 只允许经 Tailscale 登录)"
     echo "  0) 退出"
     echo "  下次打开本菜单命令: pdg"
     printf "选择: "
@@ -2232,6 +2233,7 @@ menu(){
       14) cmd_ios_state status;;
       11) cmd_report;;
       12) cmd_detect_cidr;;
+      s|ssh) cmd_ssh_source "$(read -rp "  [status|tailnet|any|confirm] (回车=status): " a; echo "${a:-status}")";;
       13) read -rp "卸载: 留空取消 / yes 仅卸载 / purge 连配置一起删: " x
          case "$x" in yes) cmd_uninstall;; purge) cmd_uninstall --purge;; *) echo "已取消";; esac;;
       0|q) exit 0;;
@@ -4700,6 +4702,200 @@ cmd_link(){
   esac
 }
 
+# ── SSH 来源限制 ─────────────────────────────────────────────────────────────
+# 把 SSH 放行从"对全网"收紧成"只允许经 tailnet", 或反过来。
+#
+# 这是本项目里**唯一一个敲错就会把自己锁在门外**的命令, 所以三道网都要有:
+#   ① 前置判据不是"tailscale0 在不在", 而是**你此刻正通过 tailnet 连着** —— 那是端到端
+#      证明这条路能用, 而不是猜。装着 Tailscale 却连不通的现场太常见(见 41641 那段注释)。
+#   ② 落盘前先 `nft -c` 校验, 落盘后立刻复核内核里真的是新形态。
+#   ③ **自动回退**: 收紧之后起一个定时器, 到点没收到 `pdg ssh-source confirm` 就自己撤销
+#      并重载。这是网络设备上的 commit-confirm 模式 —— 万一判据看走了眼, 等一会儿就回来了,
+#      而不是要你去翻服务商的网页控制台。
+_SSH_REVERT_UNIT=pdg-ssh-source-revert
+_SSH_REVERT_MIN="${PDG_SSH_REVERT_MIN:-10}"
+_SSH_TS_ACCEPT='udp dport 41641 accept comment "pdg-tailnet-direct"'
+
+# 当前是否有一条**经 tailnet 进来的** SSH 会话。判据取 established 的本地 22 连接,
+# 对端落在 tailnet 段, 且该地址确实是本机 tailscale0 的对端(不只看 100.64/10 —— 那个段
+# 运营商 CGNAT 也在用, 只看段会把手机的连接误判成 tailnet)。
+_ssh_via_tailnet(){
+  local ip _ts_peers
+  command -v tailscale >/dev/null 2>&1 || return 1
+  ip -o link show tailscale0 >/dev/null 2>&1 || return 1
+  _ts_peers="$(tailscale status 2>/dev/null | awk '{print $1}')" || _ts_peers=""
+  [[ -n "$_ts_peers" ]] || return 1
+  while read -r ip; do
+    [[ -n "$ip" ]] || continue
+    # 对端地址必须出现在 tailscale status 里 = 它确实是 tailnet 节点
+    # 同样不能写成 `... | grep -q`(pipefail + SIGPIPE 会把命中判成失败, 那样这道门
+    # 永远返回否, 收紧就永远做不成)。先取到变量再比。
+    grep -qxF "$ip" <<<"$_ts_peers" && return 0
+  done < <(ss -tn state established '( sport = :22 )' 2>/dev/null \
+           | tail -n +2 | awk '{print $4}' | sed 's/:[0-9]*$//' | sed 's/^\[//; s/\]$//' | sort -u)
+  return 1
+}
+
+_ssh_source_show(){
+  local f=/etc/nftables.conf m
+  if ! m="$(_fw_ssh_match "$f")"; then
+    c_y "当前: 认不出(配置里的 SSH 放行不是已知的两种形态之一)"
+    echo "  这种状态下 pdg update 的防火墙重建会跳过 —— 请先人工把 $f 里的 SSH 放行改回标准形态。"
+    return 1
+  fi
+  if [[ -n "$m" ]]; then
+    c_g "当前: tailnet —— 只允许经 Tailscale 登录, 公网上看不到 SSH 端口"
+    grep -qE "^[[:space:]]*udp dport 41641 accept" "$f" \
+      && echo "  Tailscale 直连端口(UDP 41641): 已放行(避免空闲后第一次连接超时)" \
+      || c_y "  ⚠️ 41641 未放行 —— 空闲一段后第一次 SSH 可能超时。跑一次 pdg ssh-source tailnet 修复。"
+  else
+    echo "当前: any —— SSH 对全网放行(默认)"
+  fi
+  systemctl is-active "$_SSH_REVERT_UNIT.timer" >/dev/null 2>&1 \
+    && c_y "  ⏳ 有一次**未确认**的收紧在等回退: 确认请跑 pdg ssh-source confirm"
+  return 0
+}
+
+# 就地改写 /etc/nftables.conf 的两行(SSH 放行 + 41641)。
+# 有意**不走整份重渲染**: 那会一并抹掉救援平面注入的规则与用户在 include 里的东西 ——
+# 收紧 SSH 这件事不该顺手动别的。改完由调用方负责校验/落盘/重载。
+_ssh_source_rewrite(){          # $1=目标模式(any|tailnet) $2=输入 $3=输出
+  local mode="$1" src="$2" dst="$3"
+  if [[ "$mode" == tailnet ]]; then
+    sed -E -e 's|^([[:space:]]*)tcp dport \{ ([0-9]+) \} accept$|\1iifname "tailscale0" tcp dport { \2 } accept|' "$src" > "$dst" || return 1
+    # 41641 已经在就不重复插(幂等)
+    if ! grep -qE '^[[:space:]]*udp dport 41641 accept' "$dst"; then
+      sed -i -E 's|^([[:space:]]*)iifname "tailscale0" tcp dport \{ ([0-9]+) \} accept$|\1iifname "tailscale0" tcp dport { \2 } accept\n\1'"$_SSH_TS_ACCEPT"'|' "$dst" || return 1
+    fi
+  else
+    sed -E -e 's|^([[:space:]]*)iifname "tailscale0" tcp dport \{ ([0-9]+) \} accept$|\1tcp dport { \2 } accept|' \
+           -e '/^[[:space:]]*udp dport 41641 accept comment "pdg-tailnet-direct"$/d' "$src" > "$dst" || return 1
+  fi
+  return 0
+}
+
+# 落盘 + 重载, 全程可回退。任一步失败都把现网原样放回去。
+_ssh_source_apply(){            # $1=目标模式
+  local mode="$1" f=/etc/nftables.conf tmp bak
+  tmp="$(mktemp)" || { echo "❌ 无法创建临时文件"; return 1; }
+  bak="$(_ssh_revert_path)"
+  _ssh_source_rewrite "$mode" "$f" "$tmp" || { echo "❌ 改写失败"; rm -f "$tmp"; return 1; }
+  if ! nft -c -f "$tmp" >/dev/null 2>&1; then
+    echo "❌ 新规则 nft -c 校验未过 —— 现网未动"; rm -f "$tmp"; return 1
+  fi
+  # before-image 必须先立住: 后面所有回退(手动/自动)都靠它
+  install -m600 "$f" "$bak" 2>/dev/null && cmp -s "$f" "$bak" \
+    || { echo "❌ 备份现有配置失败 —— 现网未动"; rm -f "$tmp"; return 1; }
+  cat "$tmp" > "$f" || { echo "❌ 写入失败"; cat "$bak" > "$f"; rm -f "$tmp"; return 1; }
+  rm -f "$tmp"
+  if ! nft -f "$f" >/dev/null 2>&1; then
+    c_y "❌ 加载新规则失败 → 回退到改动前那份并重新加载"
+    cat "$bak" > "$f"; nft -f "$f" >/dev/null 2>&1 || c_y "  ⚠️ 回退后重载也失败, 请人工检查 $f"
+    return 1
+  fi
+  # 复核内核里真的是新形态 —— 磁盘写对了不等于内核收敛了。
+  # **两种端口写法都要认**: 磁盘上是 `tcp dport { 22 } accept`, 而 nft 会把单元素集合
+  # 归一成 `tcp dport 22 accept` 再吐出来。只认带花括号那种的话, 这道复核永远不成立,
+  # 于是每次 apply 都判失败并回滚 —— 命令表面上"安全", 实际是彻底不能用。
+  local want kre
+  [[ "$mode" == tailnet ]] && want='iifname "tailscale0" tcp dport' || want='tcp dport'
+  kre="^[[:space:]]*${want}( \{ [0-9]+ \}| [0-9]+) accept\$"
+  # **先取到变量再匹配, 不走管道**: 本文件开头是 `set -uo pipefail`, 而 `... | grep -q`
+  # 里 grep 一命中就退出, 上游 nft 收到 SIGPIPE → 整条管道被判失败。于是"匹配成功"反而
+  # 走进失败分支, 每次 apply 都回滚 —— 命令看着安全, 实际彻底不能用。(沙箱里抓到的)
+  local live; live="$(nft list chain inet pdg input 2>/dev/null)" || live=""
+  if ! grep -qE "$kre" <<<"$live"; then
+    c_y "❌ 内核里没有出现预期的 SSH 规则形态 → 回退"
+    cat "$bak" > "$f"; nft -f "$f" >/dev/null 2>&1
+    return 1
+  fi
+  return 0
+}
+
+# before-image 放持久目录, 不放 /run —— 自动回退要能跨重启活着。
+_ssh_revert_path(){ echo "/var/lib/privdns-gateway/ssh-source-revert.conf"; }
+
+_ssh_revert_arm(){              # 起自动回退定时器
+  local bak; bak="$(_ssh_revert_path)"
+  systemctl stop "$_SSH_REVERT_UNIT.timer" >/dev/null 2>&1 || true
+  if systemd-run --unit="$_SSH_REVERT_UNIT" --on-active="${_SSH_REVERT_MIN}min" \
+       --description="PDG: 未确认的 SSH 来源收紧, 到点自动回退" \
+       /usr/local/bin/pdg ssh-source --auto-revert >/dev/null 2>&1; then
+    c_y "⏳ 已起自动回退: ${_SSH_REVERT_MIN} 分钟内不确认就自己撤销并重载。"
+    return 0
+  fi
+  # 起不来必须当场说, 而不是让用户以为有网兜着 —— 那比没有网更危险。
+  c_y "⚠️ **自动回退没起来**(systemd-run 失败)。现在没有任何兜底:"
+  c_y "   若这条 tailnet 路不通, 你将只能走服务商的网页控制台。"
+  c_y "   立刻自己验一遍能不能从 tailnet 重新登录; 不行就跑 pdg ssh-source any。"
+  return 1
+}
+
+_ssh_revert_disarm(){ systemctl stop "$_SSH_REVERT_UNIT.timer" >/dev/null 2>&1 || true
+                      systemctl reset-failed "$_SSH_REVERT_UNIT" >/dev/null 2>&1 || true; }
+
+cmd_ssh_source(){
+  need_root ssh-source
+  local sub="${1:-status}"
+  case "$sub" in
+    status|"") _ssh_source_show; return $? ;;
+
+    --auto-revert)              # 定时器调用, 不给人用
+      local bak; bak="$(_ssh_revert_path)"
+      [[ -f "$bak" ]] || return 0
+      cat "$bak" > /etc/nftables.conf && nft -f /etc/nftables.conf >/dev/null 2>&1
+      logger -t pdg "ssh-source: 未在 ${_SSH_REVERT_MIN} 分钟内确认 → 已自动回退 SSH 来源限制" 2>/dev/null || true
+      rm -f "$bak"; return 0 ;;
+
+    confirm)
+      systemctl is-active "$_SSH_REVERT_UNIT.timer" >/dev/null 2>&1 || {
+        echo "没有待确认的收紧。当前状态:"; _ssh_source_show; return 0; }
+      _ssh_revert_disarm; rm -f "$(_ssh_revert_path)"
+      c_g "✅ 已确认, 自动回退已取消。当前设置会一直保持(也会活过 pdg update)。"
+      return 0 ;;
+
+    any)
+      local cur; cur="$(_fw_ssh_match /etc/nftables.conf)" || { c_y "❌ 认不出当前形态, 拒绝改动"; return 1; }
+      [[ -z "$cur" ]] && { echo "已经是 any, 无需改动。"; return 0; }
+      _ssh_source_apply any || return 1
+      _ssh_revert_disarm; rm -f "$(_ssh_revert_path)"
+      c_g "✅ SSH 已恢复对全网放行(Tailscale 直连端口 41641 一并撤销)。"
+      return 0 ;;
+
+    tailnet)
+      local cur; cur="$(_fw_ssh_match /etc/nftables.conf)" || { c_y "❌ 认不出当前形态, 拒绝改动"; return 1; }
+      if [[ -n "$cur" ]] && grep -qE '^[[:space:]]*udp dport 41641 accept' /etc/nftables.conf; then
+        echo "已经是 tailnet, 无需改动。"; return 0
+      fi
+      # ★ 前置判据: 你此刻必须正通过 tailnet 连着
+      if ! _ssh_via_tailnet; then
+        c_y "⛔ 拒绝收紧 —— 没有检测到**经 tailnet 进来的 SSH 会话**。"
+        echo "   判据是有意这么严的: 装着 Tailscale 不等于这条路通得了(空闲后打洞要重来),"
+        echo "   而收紧之后公网 SSH 就没了, 判错的代价是只能去开服务商的网页控制台。"
+        echo
+        echo "   正确做法: 先用 tailnet 地址登进来, 在**那条会话里**再跑这条命令。"
+        echo "     本机 tailnet 地址: $(tailscale ip -4 2>/dev/null || echo '(取不到 —— Tailscale 可能没装或没认证)')"
+        return 1
+      fi
+      _ssh_source_apply tailnet || return 1
+      _ssh_revert_arm || true
+      c_g "✅ SSH 已收紧: 只允许经 tailnet 登录; UDP 41641 已放行(消除冷启动窗口)。"
+      echo
+      c_y "现在**另开一条 tailnet SSH 会话**验证能进来 —— 别关当前这条。"
+      echo "  验证通过 → pdg ssh-source confirm    (确认, 取消自动回退)"
+      echo "  进不来   → 什么都不做, ${_SSH_REVERT_MIN} 分钟后自动回退"
+      return 0 ;;
+
+    *)
+      echo "用法: pdg ssh-source [status|tailnet|any|confirm]"
+      echo "  status   显示当前 SSH 来源限制(默认)"
+      echo "  tailnet  收紧为只允许经 Tailscale 登录(需当前已通过 tailnet 连着; 带自动回退)"
+      echo "  any      恢复对全网放行"
+      echo "  confirm  确认上一次收紧, 取消自动回退"
+      return 1 ;;
+  esac
+}
+
 cmd_hijack_mode(){
   need_root hijack-mode
   # shellcheck source=/dev/null
@@ -4919,8 +5115,9 @@ case "${1:-menu}" in
   detect-cidr|cidr) shift || true; cmd_detect_cidr "$@";;
   platform)      shift || true; cmd_platform "$@";;
   hijack-mode)   shift || true; cmd_hijack_mode "$@";;
+  ssh-source)    shift || true; cmd_ssh_source "$@";;
   link)          shift || true; cmd_link "$@";;
   uninstall|rm)  shift || true; cmd_uninstall "$@";;
   rescue)        shift || true; cmd_rescue "$@";;
-  *) echo "用法: pdg [menu|status|doctor [--json|--deep]|update [--dry-run]|snapshot|rollback [n]|token|restart|log [n]|traffic|ios [status|diff|previous|ack|recover|repair](仅 iOS)|report [--redact-ip|--full]|detect-cidr|platform <ios|android>|hijack-mode <all|gfw>|link status|link session <start|status|stop>|migrate|migrate-fw|tx <list|show|recover|abort>|rescue <enable|disable|status|fingerprint|bind <IPv4>|rotate-token|rotate-cert>|uninstall [--purge]]";;
+  *) echo "用法: pdg [menu|status|doctor [--json|--deep]|update [--dry-run]|snapshot|rollback [n]|token|restart|log [n]|traffic|ios [status|diff|previous|ack|recover|repair](仅 iOS)|report [--redact-ip|--full]|detect-cidr|platform <ios|android>|hijack-mode <all|gfw>|ssh-source [status|tailnet|any|confirm]|link status|link session <start|status|stop>|migrate|migrate-fw|tx <list|show|recover|abort>|rescue <enable|disable|status|fingerprint|bind <IPv4>|rotate-token|rotate-cert>|uninstall [--purge]]";;
 esac
