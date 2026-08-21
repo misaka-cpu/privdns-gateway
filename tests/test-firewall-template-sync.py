@@ -173,6 +173,8 @@ else:
         def render(text):
             return (text.replace("__INTERNAL_CIDR__", "172.22.0.0/16")
                         .replace("__SSH_PORT__", "22")
+                        .replace("__SSH_MATCH__", "")      # 夹具用默认形态(对全网放行)
+                        .replace("__TAILNET_DIRECT__", "# (SSH 未收紧为 tailnet, 故不放行 Tailscale 直连端口)")
                         .replace("__RESCUE_PORT__", rp))
 
         with open(TPL, encoding="utf-8") as f:

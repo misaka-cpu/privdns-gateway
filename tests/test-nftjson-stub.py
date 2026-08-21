@@ -41,8 +41,12 @@ CIDR = "127.0.0.0/8"
 def render(**kw):
     """按生产模板渲染一份配置文本 —— 不手写夹具, 免得测的是我自己编的形态。"""
     t = (ROOT / "deploy/firewall/nftables-mihomo.conf").read_text(encoding="utf-8")
-    t = (t.replace("__SSH_PORT__", "22").replace("__INTERNAL_CIDR__", kw.get("cidr", CIDR))
+    # __SSH_MATCH__ 默认渲染成空(对全网放行) —— 与真机装出来的形态一致。
+    # 收紧形态另有 tests/test-ssh-source-persist.sh 专门覆盖。
+    t = (t.replace("__SSH_MATCH__", kw.get("ssh_match", ""))
+          .replace("__SSH_PORT__", "22").replace("__INTERNAL_CIDR__", kw.get("cidr", CIDR))
           .replace("__SERVER_IP__", "203.0.113.1")
+          .replace("__TAILNET_DIRECT__", "# (SSH 未收紧为 tailnet, 故不放行 Tailscale 直连端口)")
           .replace("__RESCUE_PORT__", str(rescue_const.port())))
     return t
 

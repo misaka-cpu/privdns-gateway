@@ -144,16 +144,14 @@ def cell(n, name, rel, old, new, want, expect_red=True):
 print("\n── 五格 ──")
 # 1) 摘掉平台切换渲染器的 rescue port 替换
 cell(1, "平台切换摘掉 rescue port", "deploy/bot/pdg.sh",
-     '  sed -e "s|__SSH_PORT__|$sshp|g" -e "s|__INTERNAL_CIDR__|$icidr|g" \\\n'
-     '      -e "s|__RESCUE_PORT__|$PDG_RESCUE_PORT|g" \\\n',
-     '  sed -e "s|__SSH_PORT__|$sshp|g" -e "s|__INTERNAL_CIDR__|$icidr|g" \\\n',
+     '  sed -e "s|__SSH_PORT__|$sshp|g" -e "s|__INTERNAL_CIDR__|$icidr|g" \\\n      -e "s|__SSH_MATCH__|$_psm|g" \\\n      -e "s|__TAILNET_DIRECT__|$(_fw_tailnet_direct "$_psm")|g" \\\n      -e "s|__RESCUE_PORT__|$PDG_RESCUE_PORT|g" \\\n',
+     '  sed -e "s|__SSH_PORT__|$sshp|g" -e "s|__INTERNAL_CIDR__|$icidr|g" \\\n      -e "s|__SSH_MATCH__|$_psm|g" \\\n      -e "s|__TAILNET_DIRECT__|$(_fw_tailnet_direct "$_psm")|g" \\\n',
      "漏替换 __RESCUE_PORT__")
 
 # 2) 摘掉 migrate-fw 渲染器的替换
 cell(2, "migrate-fw 摘掉 rescue port", "deploy/bot/pdg.sh",
-     '  sed -e "s/__SSH_PORT__/$port/g" -e "s#__INTERNAL_CIDR__#$cidr#g" \\\n'
-     '      -e "s#__RESCUE_PORT__#$PDG_RESCUE_PORT#g" \\\n',
-     '  sed -e "s/__SSH_PORT__/$port/g" -e "s#__INTERNAL_CIDR__#$cidr#g" \\\n',
+     '  sed -e "s/__SSH_PORT__/$port/g" -e "s#__INTERNAL_CIDR__#$cidr#g" \\\n      -e "s#__SSH_MATCH__##g" \\\n      -e "s#__TAILNET_DIRECT__#$(_fw_tailnet_direct "")#g" \\\n      -e "s#__RESCUE_PORT__#$PDG_RESCUE_PORT#g" \\\n',
+     '  sed -e "s/__SSH_PORT__/$port/g" -e "s#__INTERNAL_CIDR__#$cidr#g" \\\n      -e "s#__SSH_MATCH__##g" \\\n      -e "s#__TAILNET_DIRECT__#$(_fw_tailnet_direct "")#g" \\\n',
      "漏替换 __RESCUE_PORT__")
 
 # 3) 换成写死的错误端口: 覆盖判据仍满足, 但"必须用现有常量"这条语义判据要抓住

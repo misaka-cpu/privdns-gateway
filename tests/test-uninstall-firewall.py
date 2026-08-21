@@ -51,6 +51,7 @@ PORT = subprocess.run(["bash", "-c", "source %s/lib/rescue.sh; echo $PDG_RESCUE_
 def rendered_template(cidr="172.22.0.0/16", ssh="22"):
     t = open(os.path.join(ROOT, "deploy/firewall/nftables-mihomo.conf"), encoding="utf-8").read()
     return (t.replace("__INTERNAL_CIDR__", cidr).replace("__SSH_PORT__", ssh)
+             .replace("__SSH_MATCH__", "").replace("__TAILNET_DIRECT__", "# (SSH 未收紧为 tailnet, 故不放行 Tailscale 直连端口)")
              .replace("__RESCUE_PORT__", PORT))
 
 

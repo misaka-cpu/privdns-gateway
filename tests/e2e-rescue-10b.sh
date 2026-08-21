@@ -309,6 +309,7 @@ echo
 echo "── 5. 真 nftables ──"
 NFTNS(){ ip netns exec "$NS" "$NFT" "$@"; }
 render_fw(){ sed -e "s|__INTERNAL_CIDR__|$CIDR|g" -e "s|__SSH_PORT__|22|g" -e "s|__RESCUE_PORT__|$RP|g" \
+                 -e "s|__SSH_MATCH__||g" -e "s|__TAILNET_DIRECT__|# (SSH 未收紧为 tailnet, 故不放行 Tailscale 直连端口)|g" \
                  "$ROOT/deploy/firewall/nftables-mihomo.conf"; }
 render_fw > "$BOX/etc/nftables.conf"
 if NFTNS -c -f "$BOX/etc/nftables.conf" 2>/dev/null; then

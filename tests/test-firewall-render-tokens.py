@@ -189,9 +189,16 @@ def nft_usable():
     try:
         good = os.path.join(wd, "all.nft")
         t = tpl_src
+        # 占**整条语句**位置的 token 必须在这里给出语法合法的值 —— 下面那条兜底把未知
+        # token 换成 "1", 那只在"期望一个值"的位置成立; 换在语句位置上会渲出
+        # `1tcp dport 22 accept` 或孤零零一个 `1`, nft 直接语法错, 于是探针判定
+        # "nft 当不了裁判" → 整段动态判据 SKIP → root 下按失败计。
+        # 换句话说: 忘了在这里登记, 症状不是"少测一项", 而是**动态判据整段消失**。
         for tok, v in (("__SSH_PORT__", "22"), ("__INTERNAL_CIDR__", "172.22.0.0/16"),
                        ("__RESCUE_PORT__", RPORT), ("__SERVER_IP__", "203.0.113.10"),
-                       ("__CERT_DIR__", "/etc/mosdns/certs")):
+                       ("__CERT_DIR__", "/etc/mosdns/certs"),
+                       ("__SSH_MATCH__", ""),                       # 来源匹配前缀: 空 = 对全网放行
+                       ("__TAILNET_DIRECT__", "# (SSH 未收紧为 tailnet, 故不放行 Tailscale 直连端口)")):
             t = t.replace(tok, v)
         # 模板将来多出一个这里不认识的 token 时, 探针不能因此渲不出合法产物 —— 那会让
         # 整个动态段静默 SKIP, nft 就不再当裁判了(负控 NC-FW-4 正是这么发现的)。
@@ -217,9 +224,14 @@ else:
             out = os.path.join(wd, "rendered.nft")
             t = tpl_src
             # 只替换该渲染点声称会替换的那些 —— 漏掉的就让它留在产物里, 由 nft 判死
+            # 兜底值是 "PLACEHOLDER" —— 那只在"期望一个值"的位置才渲得出合法语法。
+            # 占**整条语句**位置的 token 必须在这里登记真值, 否则渲出
+            # `PLACEHOLDERtcp dport { 22 } accept` 这种东西, 报的红与"漏替换"无关。
             vals = {"__SSH_PORT__": "22", "__INTERNAL_CIDR__": "172.22.0.0/16",
                     "__RESCUE_PORT__": RPORT, "__SERVER_IP__": "203.0.113.10",
-                    "__CERT_DIR__": "/etc/mosdns/certs"}
+                    "__CERT_DIR__": "/etc/mosdns/certs",
+                    "__SSH_MATCH__": "",                          # 空 = 对全网放行
+                    "__TAILNET_DIRECT__": "# (SSH 未收紧为 tailnet, 故不放行 Tailscale 直连端口)"}
             for tok in subs:
                 t = t.replace(tok, vals.get(tok, "PLACEHOLDER"))
             open(out, "w", encoding="utf-8").write(t)
