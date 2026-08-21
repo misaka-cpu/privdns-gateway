@@ -159,6 +159,7 @@ def render(tpl_text):
     return (tpl_text
             .replace("__INTERNAL_CIDR__", CIDR)
             .replace("__SSH_PORT__", "22")
+            .replace("__SSH_MATCH__", "").replace("__TAILNET_DIRECT__", "# (SSH 未收紧为 tailnet, 故不放行 Tailscale 直连端口)")
             .replace("__RESCUE_PORT__", RESCUE_PORT))
 
 

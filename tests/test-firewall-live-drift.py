@@ -54,7 +54,8 @@ with open(TPL, encoding="utf-8") as f:
 
 def render(text):
     return (text.replace("__INTERNAL_CIDR__", "172.22.0.0/16")
-                .replace("__SSH_PORT__", "22").replace("__RESCUE_PORT__", rp))
+                .replace("__SSH_PORT__", "22").replace("__RESCUE_PORT__", rp)
+                .replace("__SSH_MATCH__", "").replace("__TAILNET_DIRECT__", "# (SSH 未收紧为 tailnet, 故不放行 Tailscale 直连端口)"))
 
 
 # C 态的要害: 磁盘必须与函数渲染的候选**逐字节相同**, 否则它走的是 A 态(重建), 测不到
@@ -156,10 +157,15 @@ try:
         # 判据 helper 必须一并抽出 —— 漏了它, 生产函数调到一个未定义的名字, shell 返回
         # command-not-found 的非零, 而那会被当成"内核未收敛"。前一轮就栽在这里:
         # 同一判据单独跑是 ok, 放进测试就红, 差的不是环境, 是这一行。
+        # 这两个是 migrate_firewall_template_sync 现在的依赖(SSH 来源判据)。漏抽的话它们
+        # 返回 127, 同步判成"形态认不出"直接跳过并 return 0 —— 于是第六、七节注入的
+        # 失败根本走不到, 断言看起来像产品缺陷, 其实是夹具少抽了两个函数。
+        'eval "$(sed -n "/^_fw_tailnet_direct()/,/^}/p" %s/deploy/bot/pdg.sh)"; '
+        'eval "$(sed -n "/^_fw_ssh_match()/,/^}/p" %s/deploy/bot/pdg.sh)"; '
         'eval "$(sed -n "/^_fw_live_has_template_invariants()/,/^}/p" %s/deploy/bot/pdg.sh)"; '
         'eval "$(sed -n "/^migrate_firewall_template_sync()/,/^}/p" %s/deploy/bot/pdg.sh)"; '
         'migrate_firewall_template_sync %s; echo "rc=$?"'
-        % (ROOT, SUDO, NS, ROOT, ROOT, ROOT, conf))
+        % (ROOT, SUDO, NS, ROOT, ROOT, ROOT, ROOT, ROOT, conf))   # 两个 ROOT 对应新加的两行 eval
     fn = subprocess.run(SYNC_CMD, shell=True, capture_output=True, text=True, executable="/bin/bash", env=env)
     rc = re.search(r"rc=(\d+)", fn.stdout or "")
     rc = int(rc.group(1)) if rc else -1

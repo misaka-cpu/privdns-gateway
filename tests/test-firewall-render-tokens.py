@@ -198,7 +198,7 @@ def nft_usable():
                        ("__RESCUE_PORT__", RPORT), ("__SERVER_IP__", "203.0.113.10"),
                        ("__CERT_DIR__", "/etc/mosdns/certs"),
                        ("__SSH_MATCH__", ""),                       # 来源匹配前缀: 空 = 对全网放行
-                       ("__TAILNET_DIRECT__", "udp dport 41641 accept")):
+                       ("__TAILNET_DIRECT__", "# (SSH 未收紧为 tailnet, 故不放行 Tailscale 直连端口)")):
             t = t.replace(tok, v)
         # 模板将来多出一个这里不认识的 token 时, 探针不能因此渲不出合法产物 —— 那会让
         # 整个动态段静默 SKIP, nft 就不再当裁判了(负控 NC-FW-4 正是这么发现的)。
@@ -231,7 +231,7 @@ else:
                     "__RESCUE_PORT__": RPORT, "__SERVER_IP__": "203.0.113.10",
                     "__CERT_DIR__": "/etc/mosdns/certs",
                     "__SSH_MATCH__": "",                          # 空 = 对全网放行
-                    "__TAILNET_DIRECT__": "udp dport 41641 accept"}
+                    "__TAILNET_DIRECT__": "# (SSH 未收紧为 tailnet, 故不放行 Tailscale 直连端口)"}
             for tok in subs:
                 t = t.replace(tok, vals.get(tok, "PLACEHOLDER"))
             open(out, "w", encoding="utf-8").write(t)

@@ -46,6 +46,7 @@ def render(**kw):
     t = (t.replace("__SSH_MATCH__", kw.get("ssh_match", ""))
           .replace("__SSH_PORT__", "22").replace("__INTERNAL_CIDR__", kw.get("cidr", CIDR))
           .replace("__SERVER_IP__", "203.0.113.1")
+          .replace("__TAILNET_DIRECT__", "# (SSH 未收紧为 tailnet, 故不放行 Tailscale 直连端口)")
           .replace("__RESCUE_PORT__", str(rescue_const.port())))
     return t
 
