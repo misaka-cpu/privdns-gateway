@@ -3655,11 +3655,21 @@ _switchcore_nft(){   # $1=target(mihomo)  渲染并应用 mihomo nft(用当前 S
   # 丢了前缀, 一次 `pdg platform ios` 就把收紧过的 22 端口重新对公网打开, 而且
   # 不会有任何提示 —— 用户完全没理由怀疑切平台会动 SSH。
   # 反解不出就**中止**, 不按空串兜底(空串的含义正是"对全网放行")。
-  local _psm
+  local _psm=""
   if ! _psm="$(_fw_ssh_match /etc/nftables.conf)"; then
-    rm -rf "$wd"
-    echo "认不出现有 SSH 放行的来源匹配形态 → 未改动防火墙(避免把已收紧的 22 端口重新开放)"
-    return 1
+    # 认不出时**不能一律中止**: 这个函数也服务**迁移前**的老格式配置, 而老模板里
+    # SSH 行有好几种历史写法(带/不带花括号、含 853), "收紧"这个概念在那一代根本不
+    # 存在。一律中止的结果是迁移直接失败(CI 的 e2e-migrate 当场转红)。
+    #
+    # 判据收窄成: 只要能**确证**文件里没有 tailnet 收紧那一行, 就按空渲染 —— 那与老
+    # 配置的实际语义一致, 不丢任何东西。真有收紧行却解析不出唯一值时仍然中止,
+    # 安全性质(绝不把已收紧的端口重新开放)原样保留。
+    if grep -qE '^[[:space:]]*iifname "tailscale0" tcp dport' /etc/nftables.conf 2>/dev/null; then
+      rm -rf "$wd"
+      echo "认不出现有 SSH 放行的来源匹配形态 → 未改动防火墙(避免把已收紧的 22 端口重新开放)"
+      return 1
+    fi
+    _psm=""
   fi
   # 同上: 平台切换直达本函数, 也不经过 migrate_rescue_plane, 得自己先加载救援常量。
   _rescue_load || { rm -rf "$wd"; echo "读不到救援常量(lib/rescue.sh), 未改动防火墙"; return 1; }
