@@ -369,6 +369,7 @@ sudo nft -c -f /etc/nftables.conf && sudo systemctl reload nftables
 - [docs/production-notes.md](docs/production-notes.md) — 实战记录与已知问题
 - [docs/design-mitm-plugins.md](docs/design-mitm-plugins.md) — iOS 位置改写（WLOC）设计与原理
 - [docs/rescue-plane-access.md](docs/rescue-plane-access.md) — 救援平面的手机端访问与指纹核对
+- [docs/design-lan-panels.md](docs/design-lan-panels.md) — 内网面板访问（手机零 App）的设计与两种架构对比**（设计中，未实现）**
 - [docs/RELEASE-CHECKLIST.md](docs/RELEASE-CHECKLIST.md) — 发版前检查清单
 - [CHANGELOG.md](CHANGELOG.md) — 更新日志
 
