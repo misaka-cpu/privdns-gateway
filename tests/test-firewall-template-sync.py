@@ -173,6 +173,7 @@ else:
         def render(text):
             return (text.replace("__INTERNAL_CIDR__", "172.22.0.0/16")
                         .replace("__SSH_PORT__", "22")
+                        .replace("__SSH_MATCH__", "")      # 夹具用默认形态(对全网放行)
                         .replace("__RESCUE_PORT__", rp))
 
         with open(TPL, encoding="utf-8") as f:

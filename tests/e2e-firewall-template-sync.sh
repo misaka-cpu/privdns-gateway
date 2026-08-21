@@ -49,7 +49,7 @@ USER_SHA="$(sha256sum "$INCD/zz-e2e-tplsync.conf" | cut -d' ' -f1)"
 port=22; cidr=172.22.0.0/16
 rport="$(python3 "$ROOT/deploy/bot/rescue_const.py" --port 2>/dev/null)"
 [[ -n "$rport" ]] || { skip "读不到救援端口常量"; fin; }
-sed -e "s|__SSH_PORT__|$port|g" -e "s|__INTERNAL_CIDR__|$cidr|g" -e "s|__RESCUE_PORT__|$rport|g" \
+sed -e "s|__SSH_PORT__|$port|g" -e "s|__SSH_MATCH__||g" -e "s|__INTERNAL_CIDR__|$cidr|g" -e "s|__RESCUE_PORT__|$rport|g" \
     "$TPL" | grep -v 'iifname "tailscale0"' > "$CONF"
 if ! nft -f "$CONF" >/dev/null 2>&1; then bad "旧版现场加载失败(夹具问题)"; fin; fi
 OLD_SHA="$(sha256sum "$CONF" | cut -d' ' -f1)"

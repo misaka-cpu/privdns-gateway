@@ -494,6 +494,9 @@ fi
 [[ -n "$SERVER_IP" ]] || die "公网 IP 不能为空"
 
 SSH_PORT="${PDG_SSH_PORT:-}"
+# SSH 来源匹配前缀。装机时**恒为空**(对全网放行) —— 收紧是装完之后的选择, 不能在装机
+# 流程里默认打开: 那时 tailnet 还没建起来, 一开就是把自己锁在门外。见 `pdg ssh-source`。
+SSH_MATCH=""
 if [[ -z "$SSH_PORT" ]]; then
   DET_SSH=$(ss -lntpH 2>/dev/null | awk '/sshd/{n=split($4,a,":"); print a[n]; exit}'); DET_SSH="${DET_SSH:-22}"
   if [[ -n "$NONINT" ]]; then SSH_PORT="$DET_SSH"; else ask SSH_PORT "SSH 端口 [${DET_SSH}]: " "$DET_SSH"; fi
@@ -760,6 +763,7 @@ render(){ # 渲染前先把本模板需要的值验一遍: 缺值不能退回示
             || { echo "render: DoT 域名缺失或非法($DOT_DOMAIN)" >&2; return 1; }
           sed -e "s|__SERVER_IP__|$SERVER_IP|g" -e "s|__INTERNAL_CIDR__|$INTERNAL_CIDR|g" \
               -e "s|__CERT_DIR__|$CERT_DIR|g"   -e "s|__SSH_PORT__|$SSH_PORT|g" \
+              -e "s|__SSH_MATCH__|${SSH_MATCH:-}|g" \
               -e "s|__MOSDNS_CACHE__|$MOSDNS_CACHE|g" -e "s|__JOURNALD_MAXUSE__|$JOURNALD_MAXUSE|g" \
               -e "s|__HIJACK_SET_FILE__|$HIJACK_SET_FILE|g" \
               -e "s|__RESCUE_PORT__|$PDG_RESCUE_PORT|g" \

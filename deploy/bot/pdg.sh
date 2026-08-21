@@ -381,6 +381,24 @@ migrate_botenv(){
 # 只要出现一行不认识的(自定义来源/端口/动作/链/表等)就判"非原装" → 不自动重建, 以免静默丢规则。
 # 白名单用正则, 因此兼容历史变体: forward/output 单行或多行写法、不同年代的内网端口子集
 # ({53,80,81,443} → +853 → +8445)都算原装。
+# 从一份 nftables 配置里反解 SSH 放行的**来源匹配前缀**(唯一事实源, 三处渲染共用)。
+# stdout = 前缀(可能是空串); **返回非 0 = 形态认不出或命中多条**, 调用方必须停下, 不能猜。
+#
+# 为什么返回非 0 而不是"拿不到就当空": 空串的含义是"对全网放行"。把一台**已经收紧过**的
+# 机器按空串重建, 等于替用户把 22 端口对公网打开, 而且没有任何提示 —— 他会一直以为是关着的。
+# 判错的代价在这里是极不对称的, 所以宁可整次操作停下。
+_fw_ssh_match(){
+  local f="$1" a t
+  [[ -f "$f" ]] || return 1
+  a="$(grep -cE '^[[:space:]]*tcp dport [{] ?[0-9]+ ?[}] accept[[:space:]]*$' "$f" 2>/dev/null)"
+  t="$(grep -cE '^[[:space:]]*iifname "tailscale0" tcp dport [{] ?[0-9]+ ?[}] accept[[:space:]]*$' "$f" 2>/dev/null)"
+  case "${a}/${t}" in
+    1/0) printf '%s' ""                        ;;
+    0/1) printf '%s' 'iifname "tailscale0" '   ;;
+    *)   return 1 ;;
+  esac
+}
+
 _fw_is_stock(){
   local f="$1" port="$2" cidr="$3" line norm matched pat
   local cre="${cidr//./\\.}"               # 内网段做正则(转义点)
@@ -447,7 +465,11 @@ migrate_firewall_to_pdg(){
   # 救援端口取自 lib/rescue.sh(唯一来源), 这里必须先加载: `pdg migrate-fw` 直达本函数,
   # 不经过 migrate_rescue_plane —— 不加载的话 set -u 下 $PDG_RESCUE_PORT 就是 unbound。
   _rescue_load || { c_y "  读不到救援常量(lib/rescue.sh), 保留旧防火墙不动。"; rm -f "$tmp"; return 0; }
+  # 旧防火墙迁移到 inet pdg: 那一版模板里没有来源匹配这回事, 老配置里
+  # 也不可能出现收紧形态, 所以 __SSH_MATCH__ 恒渲染成空(对全网放行,
+  # 与历史行为逐字一致)。
   sed -e "s/__SSH_PORT__/$port/g" -e "s#__INTERNAL_CIDR__#$cidr#g" \
+      -e "s#__SSH_MATCH__##g" \
       -e "s#__RESCUE_PORT__#$PDG_RESCUE_PORT#g" \
       "$REPO_DIR/deploy/firewall/nftables-mihomo.conf" > "$tmp"
   if ! nft -c -f "$tmp" >/dev/null 2>&1; then
@@ -677,8 +699,11 @@ migrate_firewall_template_sync(){
     rport="$(grep -oE 'ip saddr [0-9./]+ tcp dport [0-9]+ accept' "$f" \
              | grep -oE 'dport [0-9]+' | grep -oE '[0-9]+' | sort -u)"
   fi
-  local why=""
-  [[ "$(printf '%s\n' "$port"  | grep -c .)" == 1 ]] || why="SSH 端口不唯一"
+    # SSH 的来源匹配前缀同样从现状反解(判据在 _fw_ssh_match, 三处渲染共用一份)。
+    local sshm why=""
+    _fw_ssh_match "$f" >/dev/null 2>&1 || why="SSH 放行规则的形态认不出或命中多条"
+    sshm="$(_fw_ssh_match "$f" 2>/dev/null)" || true
+  [[ "$(printf '%s\n' "$port"  | grep -c .)" == 1 ]] || why="${why:-SSH 端口不唯一}"
   [[ "$(printf '%s\n' "$cidr"  | grep -c .)" == 1 ]] || why="${why:-内网段不唯一}"
   case "$(printf '%s\n' "$rport" | grep -c .)" in
     1) ;;
@@ -698,6 +723,7 @@ migrate_firewall_template_sync(){
 
   local tmp; tmp="$(mktemp)" || return 0
   sed -e "s|__SSH_PORT__|$port|g" -e "s|__INTERNAL_CIDR__|$cidr|g" \
+      -e "s|__SSH_MATCH__|$sshm|g" \
       -e "s|__RESCUE_PORT__|$rport|g" "$tpl" > "$tmp"
 
   # 已经一致就什么都不做: 幂等, 且避免每次更新都白重启防火墙。
@@ -3575,7 +3601,10 @@ _pdg_nft_splice(){
 _switchcore_nft(){   # $1=target(mihomo)  渲染并应用 mihomo nft(用当前 SSH端口/内网段)
   local target="$1" sshp icidr
   [[ "$target" == mihomo ]] || { echo "内部错误: _switchcore_nft 只支持 mihomo(收到 $target)"; return 1; }
-  sshp=$(grep -oP '^\s*tcp dport \{ \K[0-9]+(?= \} accept)' /etc/nftables.conf | head -1)
+  # 正则要容忍可选的来源匹配前缀: SSH 收紧过的机器上这一行是
+  # `iifname "tailscale0" tcp dport { 22 } accept`, 锚定写法认不出它,
+  # 会静默退回默认端口 —— 那等于用错的端口重建防火墙。
+  sshp=$(grep -oP '^\s*(iifname \"tailscale0\" )?tcp dport \{ \K[0-9]+(?= \} accept)' /etc/nftables.conf | head -1)
   # 现网 nft 认不出 SSH 端口时(自定义/异形防火墙)不能直接判死 —— 这条路现在跑在**自动迁移**里,
   # 硬失败会把用户永久挡在旧版上。退回问 sshd 实际在听哪个口, 再退回 22(与装机探测同口径)。
   if [[ -z "$sshp" ]]; then
@@ -3603,9 +3632,20 @@ _switchcore_nft(){   # $1=target(mihomo)  渲染并应用 mihomo nft(用当前 S
   local wd rendered merged bak rc
   wd="$(mktemp -d)" || { echo "无法创建临时目录"; return 1; }
   rendered="$wd/pdg.nft"; merged="$wd/merged.conf"; bak="$wd/nftables.conf.bak"
+  # 现有的 SSH 来源匹配必须**原样带过来**。平台切换会整份重渲染防火墙, 这里要是
+  # 丢了前缀, 一次 `pdg platform ios` 就把收紧过的 22 端口重新对公网打开, 而且
+  # 不会有任何提示 —— 用户完全没理由怀疑切平台会动 SSH。
+  # 反解不出就**中止**, 不按空串兜底(空串的含义正是"对全网放行")。
+  local _psm
+  if ! _psm="$(_fw_ssh_match /etc/nftables.conf)"; then
+    rm -rf "$wd"
+    echo "认不出现有 SSH 放行的来源匹配形态 → 未改动防火墙(避免把已收紧的 22 端口重新开放)"
+    return 1
+  fi
   # 同上: 平台切换直达本函数, 也不经过 migrate_rescue_plane, 得自己先加载救援常量。
   _rescue_load || { rm -rf "$wd"; echo "读不到救援常量(lib/rescue.sh), 未改动防火墙"; return 1; }
   sed -e "s|__SSH_PORT__|$sshp|g" -e "s|__INTERNAL_CIDR__|$icidr|g" \
+      -e "s|__SSH_MATCH__|$_psm|g" \
       -e "s|__RESCUE_PORT__|$PDG_RESCUE_PORT|g" \
       "$REPO_DIR/deploy/firewall/nftables-mihomo.conf" > "$rendered"
   _pdg_nft_strip_gms "$rendered"          # iOS: 渲染后剥掉 GMS 5228-5230

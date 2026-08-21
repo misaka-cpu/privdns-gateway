@@ -134,6 +134,9 @@ jobs:
       - name: "P2 运行时缺陷回归 (锁 stderr / 快照提交 / start-limit / 已是最新短路)"
         run: bash tests/test-p2-runtime-fixes.sh
 
+      - name: "SSH 来源限制必须活过模板重建 (收紧过的 22 端口不能被更新悄悄开回全网)"
+        run: bash tests/test-ssh-source-persist.sh
+
       - name: "E2E 探针生命周期回归(重复启动/退出/信号/并发/临时目录清理)"
         run: bash tests/test-e2e-probe-lifecycle.sh
 
