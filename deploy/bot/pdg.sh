@@ -387,6 +387,21 @@ migrate_botenv(){
 # 为什么返回非 0 而不是"拿不到就当空": 空串的含义是"对全网放行"。把一台**已经收紧过**的
 # 机器按空串重建, 等于替用户把 22 端口对公网打开, 而且没有任何提示 —— 他会一直以为是关着的。
 # 判错的代价在这里是极不对称的, 所以宁可整次操作停下。
+# 由 SSH 来源模式派生出 Tailscale 直连端口那一行(与 _fw_ssh_match 配对使用)。
+# $1 = _fw_ssh_match 的输出。空 → 不放行(渲染成注释, 保持行数稳定, 也自带说明);
+# 非空(即已收紧为 tailnet) → 放行 UDP 41641。
+#
+# 刻意**不做成独立开关**: 放行这个端口的唯一理由就是"SSH 只能从 tailnet 进来, 所以那条路
+# 必须随时可用"。拆成两个开关, 迟早出现"收紧了但没放行"的组合 —— 那正是冷启动连不上的形态,
+# 而且从配置上完全看不出两者有关系。
+_fw_tailnet_direct(){
+  if [[ -n "${1:-}" ]]; then
+    printf '%s' 'udp dport 41641 accept comment "pdg-tailnet-direct"'
+  else
+    printf '%s' '# (SSH 未收紧为 tailnet, 故不放行 Tailscale 直连端口)'
+  fi
+}
+
 _fw_ssh_match(){
   local f="$1" a t
   [[ -f "$f" ]] || return 1
@@ -470,6 +485,7 @@ migrate_firewall_to_pdg(){
   # 与历史行为逐字一致)。
   sed -e "s/__SSH_PORT__/$port/g" -e "s#__INTERNAL_CIDR__#$cidr#g" \
       -e "s#__SSH_MATCH__##g" \
+      -e "s#__TAILNET_DIRECT__#$(_fw_tailnet_direct "")#g" \
       -e "s#__RESCUE_PORT__#$PDG_RESCUE_PORT#g" \
       "$REPO_DIR/deploy/firewall/nftables-mihomo.conf" > "$tmp"
   if ! nft -c -f "$tmp" >/dev/null 2>&1; then
@@ -724,6 +740,7 @@ migrate_firewall_template_sync(){
   local tmp; tmp="$(mktemp)" || return 0
   sed -e "s|__SSH_PORT__|$port|g" -e "s|__INTERNAL_CIDR__|$cidr|g" \
       -e "s|__SSH_MATCH__|$sshm|g" \
+      -e "s|__TAILNET_DIRECT__|$(_fw_tailnet_direct "$sshm")|g" \
       -e "s|__RESCUE_PORT__|$rport|g" "$tpl" > "$tmp"
 
   # 已经一致就什么都不做: 幂等, 且避免每次更新都白重启防火墙。
@@ -3646,6 +3663,7 @@ _switchcore_nft(){   # $1=target(mihomo)  渲染并应用 mihomo nft(用当前 S
   _rescue_load || { rm -rf "$wd"; echo "读不到救援常量(lib/rescue.sh), 未改动防火墙"; return 1; }
   sed -e "s|__SSH_PORT__|$sshp|g" -e "s|__INTERNAL_CIDR__|$icidr|g" \
       -e "s|__SSH_MATCH__|$_psm|g" \
+      -e "s|__TAILNET_DIRECT__|$(_fw_tailnet_direct "$_psm")|g" \
       -e "s|__RESCUE_PORT__|$PDG_RESCUE_PORT|g" \
       "$REPO_DIR/deploy/firewall/nftables-mihomo.conf" > "$rendered"
   _pdg_nft_strip_gms "$rendered"          # iOS: 渲染后剥掉 GMS 5228-5230

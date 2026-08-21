@@ -899,7 +899,7 @@ e2e_seed_mosdns(){
   printf 'domain:baidu.com\n' > /etc/mosdns/rules/geosite_cn.txt
   printf 'domain:blocked.test\n' > /etc/mosdns/rules/geosite_gfw.txt
   sed -e "s|__SERVER_IP__|$E2E_SIP|g" -e "s|__INTERNAL_CIDR__|$E2E_CIDR|g" \
-      -e 's|__CERT_DIR__|/etc/mosdns/certs|g' -e 's|__SSH_PORT__|22|g' -e 's|__SSH_MATCH__||g' \
+      -e 's|__CERT_DIR__|/etc/mosdns/certs|g' -e 's|__SSH_PORT__|22|g' -e 's|__SSH_MATCH__||g' -e 's|__TAILNET_DIRECT__|# (SSH 未收紧为 tailnet, 故不放行 Tailscale 直连端口)|g' \
       -e 's|__MOSDNS_CACHE__|1024|g' -e 's|__HIJACK_SET_FILE__|geosite_geolocation-!cn.txt|g' \
       "$E2E_ROOT/deploy/mosdns/config.yaml" > /etc/mosdns/config.yaml
   # shellcheck source=/dev/null
@@ -928,7 +928,7 @@ e2e_seed_nft(){
   if [[ -z "$_rp" ]]; then
     echo "e2e_seed_nft: 读不到救援端口常量, 无法完整渲染防火墙模板" >&2; return 1
   fi
-  sed -e "s|__SSH_PORT__|22|g" -e "s|__SSH_MATCH__||g" -e "s|__INTERNAL_CIDR__|$E2E_CIDR|g" -e "s|__RESCUE_PORT__|$_rp|g" \
+  sed -e "s|__SSH_PORT__|22|g" -e "s|__SSH_MATCH__||g" -e "s|__TAILNET_DIRECT__|# (SSH 未收紧为 tailnet, 故不放行 Tailscale 直连端口)|g" -e "s|__INTERNAL_CIDR__|$E2E_CIDR|g" -e "s|__RESCUE_PORT__|$_rp|g" \
       "$E2E_ROOT/deploy/firewall/nftables-mihomo.conf" > /etc/nftables.conf
   # fail-closed: 真机装完不会留下未替换的占位符, 沙箱也不许。漏一个就当场失败 ——
   # 上一次漏的是 __RESCUE_PORT__, 后果是六个升级类 E2E 同时红而现象指向别处。
@@ -944,7 +944,7 @@ e2e_seed_nft(){
 }
 
 e2e_seed_singbox_model(){
-  sed -e "s|__SERVER_IP__|$E2E_SIP|g" -e "s|__INTERNAL_CIDR__|$E2E_CIDR|g" -e 's|__SSH_PORT__|22|g' -e 's|__SSH_MATCH__||g' \
+  sed -e "s|__SERVER_IP__|$E2E_SIP|g" -e "s|__INTERNAL_CIDR__|$E2E_CIDR|g" -e 's|__SSH_PORT__|22|g' -e 's|__SSH_MATCH__||g' -e 's|__TAILNET_DIRECT__|# (SSH 未收紧为 tailnet, 故不放行 Tailscale 直连端口)|g' \
       "$E2E_ROOT/deploy/singbox/config.json.tmpl" > /etc/sing-box/config.json
 }
 

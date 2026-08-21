@@ -764,6 +764,7 @@ render(){ # 渲染前先把本模板需要的值验一遍: 缺值不能退回示
           sed -e "s|__SERVER_IP__|$SERVER_IP|g" -e "s|__INTERNAL_CIDR__|$INTERNAL_CIDR|g" \
               -e "s|__CERT_DIR__|$CERT_DIR|g"   -e "s|__SSH_PORT__|$SSH_PORT|g" \
               -e "s|__SSH_MATCH__|${SSH_MATCH:-}|g" \
+              -e "s|__TAILNET_DIRECT__|# (SSH 未收紧为 tailnet, 故不放行 Tailscale 直连端口)|g" \
               -e "s|__MOSDNS_CACHE__|$MOSDNS_CACHE|g" -e "s|__JOURNALD_MAXUSE__|$JOURNALD_MAXUSE|g" \
               -e "s|__HIJACK_SET_FILE__|$HIJACK_SET_FILE|g" \
               -e "s|__RESCUE_PORT__|$PDG_RESCUE_PORT|g" \
