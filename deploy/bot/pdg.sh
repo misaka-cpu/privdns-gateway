@@ -5045,7 +5045,14 @@ LAN_ETC="/etc/pdg-lan"
 LAN_CADDYFILE="$LAN_ETC/caddy.conf"
 LAN_NFT_CONF="/etc/nftables-pdg-lan.conf"
 LAN_CERT_DIR="$LAN_ETC/certs"
-LAN_DNS_ENV="/etc/privdns-gateway/lan-dns.env"
+# DNS 服务商凭据。放 $LAN_ETC 下而不是 /etc/privdns-gateway/:
+#   · 普通卸载会把 $LAN_ETC 整个删掉 —— 凭据因此跟着走。服务没了而能改你 DNS 记录的
+#     token 还留在盘上, 比不卸载更糟。
+#   · /etc/privdns-gateway 在普通卸载路径上**必须一个字节都不碰**(里面有 iOS 描述文件的
+#     身份记录, 丢了手机上那份描述文件从此无法更新, 而界面什么都不报)。
+#   · 目录是 750 root:pdg-lan, 但这个文件是 **600 root:root** —— 反代能穿越目录,
+#     读不到文件。目录可穿越不等于文件可读。
+LAN_DNS_ENV="$LAN_ETC/dns.env"
 LAN_UNIT="/etc/systemd/system/pdg-lan.service"
 LAN_STATE_DIR="/var/lib/pdg-lan"
 ACME_HOME="/opt/pdg-acme"
@@ -5125,8 +5132,11 @@ _lan_cert(){
     echo "    网关**签不了你自己的 DoT 域名** —— 风险从权限升级降回只是多一个凭据。"
     echo "    例: pdg lan cert dns_cf acme-deleg.example.net"; return 1; }
   [[ -s "$LAN_DNS_ENV" ]] || { c_y "❌ 缺 $LAN_DNS_ENV —— DNS 服务商的凭据要先放好(600)。"; return 1; }
-  local mode; mode="$(stat -c %a "$LAN_DNS_ENV" 2>/dev/null)"
+  local mode owner
+  mode="$(stat -c %a "$LAN_DNS_ENV" 2>/dev/null)"; owner="$(stat -c %U "$LAN_DNS_ENV" 2>/dev/null)"
   [[ "$mode" == 600 ]] || { c_y "❌ $LAN_DNS_ENV 权限是 $mode, 应为 600 —— 里面是能改你 DNS 的凭据。"; return 1; }
+  # 属主也要查: 目录对 pdg-lan 组可穿越, 文件若属主是 pdg-lan, 600 反而变成"只有反代能读"。
+  [[ "$owner" == root ]] || { c_y "❌ $LAN_DNS_ENV 属主是 $owner, 应为 root。"; return 1; }
   _lan_install_acme || return 1
   local -a doms=(); local h
   while read -r h; do [[ -n "$h" ]] && doms+=(-d "$h"); done < <(_lan_hosts)
@@ -5448,7 +5458,7 @@ cmd_lan(){
       echo "      --legacy-tls               老设备只有 RSA 密钥交换套件(表现是 502 + handshake failure)"
       echo "      --entry-query <q>          前后端分离的应用要在入口带的参数, 如 magicpath=xxxx"
       echo "  rm <面板名>"
-      echo "  cert <dns插件名> [委派zone]  DNS-01 签发(凭据放 /etc/privdns-gateway/lan-dns.env, 600)"
+      echo "  cert <dns插件名> [委派zone]  DNS-01 签发(凭据放 $LAN_DNS_ENV, 600 root:root)"
       echo "                            给了委派 zone, token 就只需要能改那一个 zone ——"
       echo "                            被拿下的网关签不了你自己的 DoT 域名(见 pdg lan status 的风险提示)"
       echo "  enable / disable          启用/停用反代"

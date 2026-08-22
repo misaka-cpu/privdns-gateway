@@ -67,13 +67,16 @@ fi
 # 比不卸载更糟。
 _LAN_RESIDUE=""
 _LAN_REMOVED=""
-[[ -e /etc/pdg-lan || -e /opt/pdg-acme || -e /etc/privdns-gateway/lan-dns.env \
+[[ -e /etc/pdg-lan || -e /opt/pdg-acme \
    || -x /usr/local/bin/caddy || -e /etc/systemd/system/pdg-lan.service ]] && _LAN_REMOVED=1
 systemctl disable --now pdg-lan 2>/dev/null || true
 systemctl reset-failed pdg-lan 2>/dev/null || true
 rm -f /etc/systemd/system/pdg-lan.service /etc/nftables-pdg-lan.conf
 [[ -n "$_UN_NFT" ]] && "$_UN_NFT" delete table inet pdglan 2>/dev/null || true
-for _lp in /etc/pdg-lan /var/lib/pdg-lan /opt/pdg-acme /etc/privdns-gateway/lan-dns.env; do
+# 注意这里**没有** /etc/privdns-gateway 下的任何路径: 普通卸载路径上碰那个目录是禁止的
+# (tests/test-ios-profile-persist.py 有守卫)。DNS 凭据放在 /etc/pdg-lan/dns.env, 跟着
+# 上面第一项一起走 —— 既删干净了, 又没碰用户配置目录。
+for _lp in /etc/pdg-lan /var/lib/pdg-lan /opt/pdg-acme; do
   [[ -e "$_lp" ]] || continue
   rm -rf "$_lp" 2>/dev/null || true
   [[ -e "$_lp" ]] && _LAN_RESIDUE="$_LAN_RESIDUE $_lp"
