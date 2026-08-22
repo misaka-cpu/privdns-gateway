@@ -231,20 +231,22 @@ ok("探测地址与面板同网段但不在表里: %s:%d" % (pick[0], pick[1]))
 # ══ ④ check_lan_cert ═══════════════════════════════════════════════════════
 # 判据用 `openssl x509 -checkend`, 不自己解析 notAfter —— 那个格式带时区缩写,
 # strptime 在不同 locale 下解出来的东西不一样。桩按 checkend 的秒数分支即可。
-def run_cert(present, expired=(), soon=()):
-    # 走 tmpguard 而不是裸 mkdtemp: 这个仓库的测试经常并发跑, 按前缀扫 /tmp 清理等于
-    # 随机破坏隔壁进程的沙箱。登记表是唯一安全的依据。(tests/test-tmp-hygiene 会拦裸调。)
+def run_cert(have_crt=True, sans=None, expired=False, soon=False):
+    """所有面板**共用一张 SAN 证书**, 所以桩按"这一张"来造, 不是按面板逐张。"""
     d = tmpguard.mkdtemp(prefix="lan-doctor.")
-    for n_ in present:
-        open(os.path.join(d, "%s.crt" % n_), "w").write("x")
+    if have_crt:
+        open(os.path.join(d, "panel.crt"), "w").write("x")
+    hosts = [q["host"] for q in CFG["panels"]] if sans is None else sans
 
     def _run(cmd, t=10):
         if cmd[:2] == ["openssl", "x509"]:
-            name = os.path.basename(cmd[-1])[:-4]
+            if "-ext" in cmd:
+                return (0, "X509v3 Subject Alternative Name:\n    "
+                        + ", ".join("DNS:%s" % h for h in hosts), "")
             secs = int(cmd[cmd.index("-checkend") + 1])
-            if name in expired:
+            if expired:
                 return (1, "", "")
-            if secs > 0 and name in soon:
+            if secs > 0 and soon:
                 return (1, "", "")
             return (0, "", "")
         return (1, "", "")
@@ -257,22 +259,29 @@ def run_cert(present, expired=(), soon=()):
         restore(old)
 
 
-st, _n, msg = run_cert(["p0", "p1"])
+st, _n, msg = run_cert()
 assert st == "ok", (st, msg)
-ok("证书齐全且未临期 → ok")
+ok("SAN 覆盖全部面板且未临期 → ok")
 
-st, _n, msg = run_cert(["p0"])
-assert st == "fail" and "p1" in msg, msg
-ok("缺证书 → fail 且点名")
+st, _n, msg = run_cert(have_crt=False)
+assert st == "fail" and "panel.crt" in msg, msg
+ok("没有证书 → fail")
 
-st, _n, msg = run_cert(["p0", "p1"], expired=("p1",))
-assert st == "fail" and "已过期" in msg and "p1" in msg, msg
+# **共用证书带来的新失败形态**: 加了面板却没重签 —— 文件在、也没过期, 但 SAN 里没有它。
+# 只看"文件在不在"会整类漏掉, 而手机上表现成证书错误。
+st, _n, msg = run_cert(sans=["p0.home.example.com"])
+assert st == "fail" and "SAN" in msg and "p1.home.example.com" in msg, msg
+ok("加了面板没重签(SAN 缺该名字) → fail 且点名")
+
+st, _n, msg = run_cert(expired=True)
+assert st == "fail" and "已过期" in msg, msg
 ok("证书已过期 → fail")
 
-st, _n, msg = run_cert(["p0", "p1"], soon=("p0",))
-assert st == "warn" and "14 天内" in msg and "p0" in msg, msg
+st, _n, msg = run_cert(soon=True)
+assert st == "warn" and "14 天内" in msg, msg
 assert "续期链" in msg, "临期要提醒续期链可能断了 —— 它断掉时不会有任何报错"
 ok("证书 14 天内到期 → warn 并提醒续期链")
+
 
 old = stub(_lan_cfg=lambda: CFG, _lan_on=lambda: (False, False))
 assert C.check_lan_cert() is None

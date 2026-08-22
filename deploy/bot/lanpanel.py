@@ -185,7 +185,12 @@ def render_caddy(cfg, certs_dir, bind="127.0.0.1"):
         L.append("# 面板 %s" % name)
         L.append("%s:443 {" % host)
         L.append("\tbind %s" % bind)
-        L.append("\ttls %s/%s.crt %s/%s.key" % (certs_dir, name, certs_dir, name))
+        # **所有面板共用一张证书**, 不是一板一张。acme.sh `--issue -d A -d B ...` 产出的
+        # 就是一张覆盖全部名字的 SAN 证书 —— 按域名逐个去装会对除第一个之外的全部失败
+        # (它们没有各自的证书目录)。真机上踩过: 7 个面板只装上 1 个。
+        # 代价要知道: 加一个面板必须重签整张证书, 而且一个名字签不下来会连累全部。
+        # doctor 的证书项因此还要核对 SAN 是否覆盖了每个面板 —— 见 check_lan_cert。
+        L.append("\ttls %s/%s %s/%s" % (certs_dir, CERT_CRT, certs_dir, CERT_KEY))
 
         if p.get("entry_query"):
             # 前后端分离的应用(sub-store 之类)要在入口带参数, 否则每台设备都得手输后端地址。
@@ -257,6 +262,10 @@ def zone_risk(cfg, dot_domain):
             out.append((h, z))
     return out
 
+
+# 共用证书的文件名。面板表变了要重签, 所以名字与面板无关。
+CERT_CRT = "panel.crt"
+CERT_KEY = "panel.key"
 
 NFT_TABLE = "pdglan"
 

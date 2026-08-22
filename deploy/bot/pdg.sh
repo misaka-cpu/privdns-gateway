@@ -5155,21 +5155,30 @@ _lan_cert(){
     "$ACME_HOME/acme.sh" --home "$ACME_HOME/data" --issue --dns "$dnsapi" \
       "${doms[@]}" "${alias_arg[@]+"${alias_arg[@]}"}" --server letsencrypt --keylength ec-256
   ) || { c_y "❌ 签发失败 —— 看上面 acme.sh 给的原因(多半是凭据权限不足或域名不在该 zone)。"; return 1; }
-  while read -r h; do
-    [[ -n "$h" ]] || continue
-    local name; name="$(python3 -c 'import json,sys
-d=json.load(open(sys.argv[1]))
-print(next((p["name"] for p in d["panels"] if p.get("host")==sys.argv[2]), ""))' "$LAN_TABLE_PATH" "$h" 2>/dev/null)"
-    [[ -n "$name" ]] || continue
-    "$ACME_HOME/acme.sh" --home "$ACME_HOME/data" --install-cert -d "$h" --ecc \
-      --fullchain-file "$LAN_CERT_DIR/$name.crt" --key-file "$LAN_CERT_DIR/$name.key" \
-      --reloadcmd "systemctl reload pdg-lan 2>/dev/null || true" >/dev/null 2>&1 \
-      || c_y "  ⚠️ $h 的证书装不到 $LAN_CERT_DIR/$name.*"
-  done < <(_lan_hosts)
+  # 装**一次**: acme.sh 一次 --issue 多个 -d 产出的是**一张** SAN 证书, 存在第一个域名
+  # 的目录下。按域名逐个 --install-cert 会对除第一个之外的全部失败(它们没有各自的证书
+  # 目录) —— 真机上踩过, 7 个面板只装上 1 个, 而命令还报"证书已就位"。
+  local primary; primary="$(_lan_hosts | head -1)"
+  [[ -n "$primary" ]] || { c_y "❌ 取不到主域名"; return 1; }
+  if ! "$ACME_HOME/acme.sh" --home "$ACME_HOME/data" --install-cert -d "$primary" --ecc \
+        --fullchain-file "$LAN_CERT_DIR/panel.crt" --key-file "$LAN_CERT_DIR/panel.key" \
+        --reloadcmd "systemctl reload pdg-lan 2>/dev/null || true"; then
+    c_y "❌ 证书装不到 $LAN_CERT_DIR/panel.* —— 上面是 acme.sh 给的原因。"
+    return 1
+  fi
   # 私钥给**组**读而不是 600: 反代不是 root, 它必须读得到。目录 750 root:pdg-lan 已经
   # 把范围限在这个用户上了, 再把文件锁成 600 只会让服务起不来。
-  chown root:"$LAN_USER" "$LAN_CERT_DIR"/* 2>/dev/null || true
-  chmod 640 "$LAN_CERT_DIR"/*.key "$LAN_CERT_DIR"/*.crt 2>/dev/null || true
+  #
+  # **失败不能吞**。原来这两句带 `|| true`: pdg-lan 用户是 enable 阶段才建的, 而按文档
+  # 顺序 cert 跑在 enable 之前 —— 于是 chown 静默失败, 证书留成 root:root 640, 反代读不到
+  # 私钥。症状是服务起不来而这里报"证书已就位", 两边都不指向真正的原因。
+  # 所以这里自己把用户建出来(幂等), 并且 chown 失败就当场报。
+  id "$LAN_USER" >/dev/null 2>&1 || useradd -r -s /usr/sbin/nologin -d "$LAN_STATE_DIR" "$LAN_USER"
+  if ! chown root:"$LAN_USER" "$LAN_CERT_DIR"/panel.crt "$LAN_CERT_DIR"/panel.key; then
+    c_y "❌ 证书属主改不了 —— 反代(以 $LAN_USER 身份跑)将读不到私钥, 服务起不来。"
+    return 1
+  fi
+  chmod 640 "$LAN_CERT_DIR"/panel.crt "$LAN_CERT_DIR"/panel.key || return 1
   c_g "✅ 证书已就位: $LAN_CERT_DIR"
 }
 
@@ -5219,17 +5228,23 @@ _lan_preflight(){
     c_y "⛔ Tailscale 没在跑 —— 方案 B 的整条链路都要经它。先装好并认证, 再回来。"
     rc=1
   fi
-  while read -r h; do
-    [[ -n "$h" ]] || continue
-    local name; name="$(python3 -c 'import json,sys
-d=json.load(open(sys.argv[1]))
-print(next((p["name"] for p in d["panels"] if p.get("host")==sys.argv[2]), ""))' "$LAN_TABLE_PATH" "$h" 2>/dev/null)"
-    [[ -s "$LAN_CERT_DIR/$name.crt" && -s "$LAN_CERT_DIR/$name.key" ]] || missing="$missing $h"
-  done < <(_lan_hosts)
-  if [[ -n "$missing" ]]; then
-    c_y "⛔ 这些面板还没有证书:$missing"
+  # 共用一张 SAN 证书 —— 判据是"这张证书在, 而且它的 SAN 覆盖了每个面板"。只看文件在不在
+  # 不够: 加了面板却没重签时文件照样在, 而新面板的名字不在 SAN 里, 手机上会是证书错误。
+  if [[ ! -s "$LAN_CERT_DIR/panel.crt" || ! -s "$LAN_CERT_DIR/panel.key" ]]; then
+    c_y "⛔ 还没有证书($LAN_CERT_DIR/panel.crt)"
     c_y "   先跑 pdg lan cert <dns插件名> 签发。反代读的是落盘的证书, 它自己不去要。"
     rc=1
+  else
+    local sans; sans="$(openssl x509 -in "$LAN_CERT_DIR/panel.crt" -noout -ext subjectAltName 2>/dev/null | tr ',' '\n' | sed 's/.*DNS://;s/ //g')"
+    while read -r h; do
+      [[ -n "$h" ]] || continue
+      grep -qxF "$h" <<<"$sans" || missing="$missing $h"
+    done < <(_lan_hosts)
+    if [[ -n "$missing" ]]; then
+      c_y "⛔ 证书的 SAN 里没有这些面板:$missing"
+      c_y "   加过面板就要重签(所有面板共用一张证书): pdg lan cert <dns插件名>"
+      rc=1
+    fi
   fi
   _lan_zone_warn
   return $rc

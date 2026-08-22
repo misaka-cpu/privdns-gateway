@@ -1909,26 +1909,31 @@ def check_lan_cert():
     panels = [p for p in cfg.get("panels", []) if isinstance(p, dict) and p.get("name")]
     if not panels:
         return None
-    missing, expired, soon = [], [], []
-    for p in panels:
-        crt = os.path.join(LAN_CERT_DIR, "%s.crt" % p["name"])
-        if not os.path.exists(crt):
-            missing.append(p["name"]); continue
-        rc, _, _ = _run(["openssl", "x509", "-checkend", "0", "-noout", "-in", crt], 8)
-        if rc != 0:
-            expired.append(p["name"]); continue
-        rc, _, _ = _run(["openssl", "x509", "-checkend", str(14 * 86400), "-noout", "-in", crt], 8)
-        if rc != 0:
-            soon.append(p["name"])
-    if missing:
-        return ("fail", name, "这些面板没有可读的证书: %s —— 跑 sudo pdg lan cert <dns插件名>"
-                % ", ".join(missing[:5]))
-    if expired:
-        return ("fail", name, "这些面板的证书已过期: %s —— 面板打不开" % ", ".join(expired[:5]))
-    if soon:
-        return ("warn", name, "这些面板的证书 14 天内到期: %s —— 续期链(acme.sh 的 cron)"
-                              "可能已经断了, 它断掉时不会有任何报错" % ", ".join(soon[:5]))
-    return ("ok", name, "%d 张证书都还有 14 天以上" % len(panels))
+    # 所有面板**共用一张 SAN 证书**。所以判据有两层, 缺一不可:
+    #   ① 这张证书本身没过期;
+    #   ② 它的 SAN 覆盖了**每一个**面板 —— 加了面板却没重签时文件照样在、也没过期,
+    #      而新面板的名字不在 SAN 里, 手机上是证书错误。只看文件在不在会漏掉这一整类。
+    crt = os.path.join(LAN_CERT_DIR, "panel.crt")
+    if not os.path.exists(crt):
+        return ("fail", name, "没有 %s —— 跑 sudo pdg lan cert <dns插件名> 签发" % crt)
+    rc, out, _ = _run(["openssl", "x509", "-in", crt, "-noout", "-ext", "subjectAltName"], 8)
+    if rc != 0:
+        return ("warn", name, "证书读不出来(openssl rc=%d), 本项无结论" % rc)
+    sans = {x.strip().replace("DNS:", "") for x in (out or "").replace("\n", ",").split(",")
+            if "DNS:" in x}
+    absent = [p["host"] for p in panels if p.get("host") and p["host"] not in sans]
+    if absent:
+        return ("fail", name,
+                "证书的 SAN 里没有这些面板: %s —— 加过面板就要重签(所有面板共用一张证书): "
+                "sudo pdg lan cert <dns插件名>" % ", ".join(absent[:5]))
+    rc, _, _ = _run(["openssl", "x509", "-checkend", "0", "-noout", "-in", crt], 8)
+    if rc != 0:
+        return ("fail", name, "证书已过期 —— 面板全部打不开")
+    rc, _, _ = _run(["openssl", "x509", "-checkend", str(14 * 86400), "-noout", "-in", crt], 8)
+    if rc != 0:
+        return ("warn", name, "证书 14 天内到期 —— 续期链(acme.sh 的 cron)可能已经断了, "
+                              "它断掉时不会有任何报错")
+    return ("ok", name, "一张 SAN 证书覆盖 %d 个面板, 还有 14 天以上" % len(panels))
 
 
 

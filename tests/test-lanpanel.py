@@ -119,7 +119,10 @@ assert lp.legacy_tls_panels(cfg(P())) == []
 two = lp.render_caddy(cfg(P(), P(name="r", host="r.home.example.com",
                                  target="http://192.168.1.1:8443")), "/c", bind="100.64.1.2")
 assert two.count("bind 100.64.1.2") == 2
-assert two.count("tls /c/") == 2
+# **所有面板共用一张证书**(SAN 覆盖全部名字), 不是一板一张。acme.sh 一次 --issue 多个 -d
+# 产出的就是一张; 按域名逐个装会对除第一个之外的全部失败 —— 真机上踩过, 7 个面板只装上 1 个。
+assert two.count("tls /c/panel.crt /c/panel.key") == 2, two
+assert "/c/nas.crt" not in two and "/c/r.crt" not in two, "不该再按面板名取证书文件"
 
 # ── ⑬ 命令行契约 ─────────────────────────────────────────────────────────────
 def cli(*args, table=None):
