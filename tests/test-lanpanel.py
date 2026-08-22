@@ -96,9 +96,16 @@ assert "header_down Location" not in ref
 # 是"有没有凭空塞一个"。
 import re as _re
 _m = _re.search(r'header_up Referer "([^"]*)" "([^"]*)"', ref)
-assert _m, "Referer 不是替换形式(两个参数): " + ref
-assert _m.group(1).startswith("https?://"), _m.group(1)
+assert _m, "Referer 不是替换形式(三参数): " + ref
+# **搜索式必须匹配任意 Referer**, 不能只匹配指向本域名的那种。
+# 只匹配本域名时, 从 Telegram 按钮点进来(Referer 是 t.me / android-app://…)规则匹配不上,
+# 外来 Referer 原样透传给设备 —— 华为 UPS2000 会回 "Error Referer Request!"。
+# 真机上撞过, 而且这个洞是**加了直达按钮之后才被触发的**(以前手输网址不带 Referer)。
+assert _m.group(1) == ".*", "Referer 的搜索式要能匹配任意来源, 实得 %r" % _m.group(1)
 assert ":443" not in _m.group(2), "替换目标不该带默认端口: " + _m.group(2)
+# **不能用 @matcher**: header_up 在 reverse_proxy 里不支持请求匹配器 —— Caddy 会把
+# @名字 当成头的名字, 真 Referer 原样透传, 而 `caddy validate` 照样通过(它只验语法)。
+assert "@has_ref" not in ref and "header_up @" not in ref, "header_up 不该带 @matcher: " + ref
 
 # Location 用一条正则覆盖 http/https 与带不带端口 —— 逐条字面替换总会漏一种,
 # 而漏掉的那种表现是手机跳到一个到不了的地址。

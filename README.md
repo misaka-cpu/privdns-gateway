@@ -126,6 +126,8 @@ sudo pdg detect-cidr           # 重新识别内网卡来源段，与现配不�
 sudo pdg hijack-mode <all|gfw>          # 切换域名接管模式
 sudo pdg link status                    # 链路诊断：服务器侧准备状态（只读，不改任何配置）
 sudo pdg link session <start|status|stop>   # 手机协助诊断会话（一次性链接，5 分钟有效）
+sudo pdg ssh-source <status|tailnet|any|confirm>   # SSH 来源限制（收紧为只允许经 Tailscale 登录）
+sudo pdg lan <status|list|add|rm|cert|enable|disable|purge>   # 内网面板（见第 13 节）
 sudo pdg uninstall [--purge]            # 卸载（--purge 连配置删）
 ```
 
@@ -225,13 +227,19 @@ ssh <你的网关> sudo pdg rescue fingerprint
 
 ## 12. Tailscale（可选，但装了就有硬约束）
 
-**本项目不安装、不管理 Tailscale。**装不装、怎么装都是你自己的事。这一节只说**两者的交界处** —— 因为 Tailscale 恰好会碰到这套系统赖以工作的两个地方，装之前不知道的话，出的故障从表面完全看不出跟它有关。
+这个项目不会帮你装 Tailscale，也不管它的死活。装不装、怎么装，你自己决定。
+
+这一节只讲一件事：Tailscale 和这套系统会在两个地方碰头，而且碰得不轻。事先不知道的话，出的故障从表面上看跟它一点关系都没有。
+
+另外，如果你想用「内网面板」（第 13 节），那 Tailscale 就不是可选的了 —— 整条链路都要经它。
 
 ### 为什么会打架
 
-Tailscale 给节点分配的地址来自 `100.64.0.0/10`。而运营商的 SIM/APN 内网卡**也合法使用同一个段**（RFC 6598）—— 这套系统正是靠"来源在内网卡段"来决定要不要接管一个客户端的流量。**只看源地址，分不开这两者。**
+Tailscale 给节点分的地址来自 `100.64.0.0/10`。巧的是，运营商的 SIM/APN 内网卡也合法使用同一个段（RFC 6598），而这套系统恰恰是靠「来源在内网卡段」来决定要不要接管一个客户端的流量的。
 
-本项目的做法是按**入口接口**排除，不按地址段排除：
+也就是说，光看源地址，分不开「这是我的手机」和「这是我的 tailnet 节点」。
+
+所以这里按**入口接口**排除，不按地址段排除：
 
 ```
 table inet pdg {
@@ -241,7 +249,7 @@ table inet pdg {
   }
   chain input {
     ...
-    tcp dport 22 accept             # SSH 在排除之前 —— 所以你仍然能从 tailnet 登进来
+    tcp dport 22 accept             # SSH 排在前面, 所以你仍然能从 tailnet 登进来
     ip protocol icmp accept
     iifname "tailscale0" return     # 从这里起, tailnet 拿不到内网卡客户端的待遇
     ip saddr <你的内网段> tcp dport { 53, 81, 853, 7893, 8445 } accept
@@ -249,39 +257,40 @@ table inet pdg {
 }
 ```
 
-按接口而不按段，是为了**不误伤真实的运营商 CGNAT 用户** —— 如果看见 `100.64.x.x` 就拒绝，那些手机本来就在这个段里，会被一起挡掉。
+为什么不图省事按段拒绝？因为真实的运营商 CGNAT 用户本来就在 `100.64.x.x` 里 —— 看见这个段就拒绝的话，会把他们一起挡掉。
 
-结果是：**从 tailnet 能 SSH、能 ping、已建连的会话不受影响，但拿不到 DNS/代理那几个内网卡专用端口，流量也不会被送进透明代理。**这是有意的 —— 管理通道和数据面本来就该分开。
+最后的效果是：从 tailnet 能 SSH、能 ping，已经建好的连接也不受影响；但拿不到 DNS 和代理那几个内网卡专用端口，流量也不会被送进透明代理。这是有意的，管理通道和数据面本来就该分开。
 
-### 🔴 必须用 nodivert 模式
+### nodivert 模式：这条没得商量
 
 ```bash
 sudo tailscale up --netfilter-mode=nodivert   # 其余参数按你自己的需要加
 ```
 
-默认模式（`--netfilter-mode=on`）下，Tailscale 会往 `INPUT` 链插一条跳到 `ts-input` 的规则。那条链和本项目的 `inet pdg` **挂在同一个 hook 上**，而 nftables 里同一 hook 上的每条 base chain 都会执行 —— 于是 `pdg doctor` 会判「防火墙链冲突」，**升级时会因此整次回滚**。
+默认模式（`--netfilter-mode=on`）下，Tailscale 会往 `INPUT` 链里插一条跳到 `ts-input` 的规则。那条链和本项目的 `inet pdg` 挂在同一个 hook 上，而 nftables 里同一个 hook 上的每条 base chain 都会执行 —— 于是 `pdg doctor` 会判「防火墙链冲突」，而升级会因为这条自检整次回滚。
 
-`nodivert` 只是不建那条跳转，Tailscale 自己的反欺骗保护仍然生效（实测：伪造 `100.64.x.x` 源地址的包被拒，而 `ts-input` 的计数器纹丝不动 —— 挡下它的是 `inet pdg`）。
+`nodivert` 只是不建那条跳转，Tailscale 自己的反欺骗保护照样生效。这一点是实测过的：伪造 `100.64.x.x` 源地址的包被拒，而 `ts-input` 的计数器纹丝不动 —— 真正挡下它的是 `inet pdg`。
 
-这个设置**会持久化**，重启 tailscaled、重启整机都不丢。而且 Tailscale 自己会拦住误改：不带参数直接跑 `tailscale up` 会报错，要求你把所有非默认参数都写全。
+这个设置会持久化，重启 tailscaled 或整机都不会丢。而且 Tailscale 自己会拦住误改：不带参数直接跑 `tailscale up`，它会报错要求你把所有非默认参数写全。
 
 ### 装了之后 `pdg detect-cidr` 会变谨慎
 
-它靠抓包猜你的内网卡段。装了 Tailscale 之后：
+这条命令靠抓包猜你的内网卡段。装了 Tailscale 之后：
 
-- tailnet 的样本会按入口接口被排除，不会被误选成内网段；
-- 但如果这台机器的 `tcpdump` 老到 `-i any` 不打接口名，"入口接口"这个事实就拿不到 —— 那时它**直接拒绝猜**，让你手输，而不是赌一把。这是有意的：猜错会把 nft 的 REDIRECT 改挂到 tailnet 上，管理流量被送进透明代理，而这种故障从配置上完全看不出来。
+tailnet 的样本会按入口接口被排除，不会被误选成内网段。但要是这台机器的 `tcpdump` 老到 `-i any` 不打印接口名，「入口接口」这个事实就拿不到了 —— 那时它会直接拒绝猜，让你手输。
 
-### 卸载之后要手工收两样
+宁可麻烦你也不赌，是因为猜错的代价不小：nft 的 REDIRECT 会被改挂到 tailnet 上，管理流量被送进透明代理，而这种故障从配置上完全看不出来。
 
-Tailscale 卸载时不还原自己改过的东西，`pdg doctor` 会提醒（但不会替你动手）：
+### 卸载之后有两样要手工收
+
+Tailscale 卸载时不还原自己改过的东西。`pdg doctor` 会提醒你，但不会替你动手：
 
 ```bash
 sysctl -w net.ipv4.conf.all.src_valid_mark=0   # 它改成 1 且不落 /etc/sysctl.d, 重启才恢复
 rm -f /usr/bin/tailscale                       # apt purge 之后仍残留, dpkg 查不到归属
 ```
 
-第一条留着不至于立刻出事，但它制造了"重启前后行为不一致"这种最难查的现象。
+第一条留着不至于立刻出事，但它会制造「重启前后行为不一致」这种最难查的现象 —— 你今天验过没问题，下次重启之后行为就变了。
 
 ### 怎么确认没配错
 
@@ -289,9 +298,69 @@ rm -f /usr/bin/tailscale                       # apt purge 之后仍残留, dpkg
 sudo pdg doctor          # 看「Tailscale 入口隔离」与「Tailscale 卸载残留」两项
 ```
 
-手机上点 Bot 的 **🩺 自检** 也一样 —— 它跑的是同一套检查库。
+手机上点 Bot 的 🩺 自检也一样，跑的是同一套检查库。
 
-## 13. 项目组成
+## 13. 内网面板（可选，手机零 App 打开家里的 Web 面板）
+
+人在外面，想开一下家里路由器的后台、NAS、UPS、交换机这些 Web 面板 —— 而且不想在手机上装或者开任何 App。
+
+链路是这样的：手机 →（SIM）→ 网关 → tailnet → 家里的设备。手机侧一个字都不用改，它只是在访问一个普通的 HTTPS 网站。
+
+需要家里有一台常开的机器跑 Tailscale 子网路由（OpenWrt、群晖、树莓派都行）。设计细节和风险取舍见 [`docs/design-lan-panels.md`](docs/design-lan-panels.md)。
+
+### 三道门
+
+这三条不是加固，是这个功能能不能安全存在的前提，所以都写进了代码，而不是写在文档里等人去读。
+
+**一、拒绝重叠的子网路由。**家里通告过来的网段一旦和网关正在用的段相交，手机的分流就会错乱 —— 而 nft、mosdns、mihomo 三份配置一个字都没变，只是包不走原来那条路了。这种故障从配置上完全看不出来，所以判据必须在接受之前跑，而且拒绝时会点名是哪个网段跟什么冲突。想先问一句：
+
+```bash
+sudo pdg lan routes 192.168.1.0/24
+```
+
+**二、反代只认白名单。**域名到 `IP:端口` 一对一，不接受通配。上游还必须写字面 IP —— 写域名的话，决定网关去连哪台机器的就成了 DNS，而这台网关自己就在做 DNS 劫持。
+
+**三、反代进程只能连白名单里的地址。**按运行它的 uid 过滤，不按端口（端口挡不住别的进程发起同样的连接）。这条规则挂在反代的启动路径上：加载不上就不让它起来。
+
+### 用起来
+
+```bash
+sudo pdg lan add --name nas --host nas.example.com \
+     --target https://192.168.1.50 --insecure
+sudo pdg lan cert dns_cf          # DNS-01 签发, 凭据放 /etc/pdg-lan/dns.env (600)
+sudo pdg lan enable
+```
+
+`add` 之后会自己把四份派生物跟上（反代配置、出站白名单、DNS 劫持集、分流规则），并且告诉你证书里还缺哪些面板。所有面板共用一张证书，所以加过面板就要重签一次。
+
+Telegram 里也有：**运维 → 🏠 内网面板**，能看列表和状态、加删面板，还有一排直达按钮点一下就开。证书还没覆盖到的面板，按钮上会标着「待重签」—— 不至于点下去才发现是证书错误。
+
+手机要走蜂窝网络。连着 WiFi 时 DNS 查询不是从内网卡过来的，网关不会劫持这些域名，点了打不开。
+
+### 家用设备的那些毛病
+
+这些是在七台真机上一台台踩出来的，生成器从第一版就带着，不用你自己发现：
+
+设备会把自己的局域网 IP 写进跳转头（`--rewrite-location`）；有些会校验 `Referer`/`Origin` 必须是它自己的地址（`--fix-referer`）；老设备可能只提供 RSA 密钥交换的套件，现代 Go 默认不接受，症状是 502 加 handshake failure，看着像证书问题（`--legacy-tls`）；前后端分离的应用要在入口带参数，否则每台设备都得手输一遍后端地址（`--entry-query`）；家用设备的证书基本都是自签的，所以 `--insecure` 得你按设备逐个确认，不给默认值。
+
+### 有一条风险要你自己判断
+
+如果面板域名和本项目的 DoT 域名在同一个 DNS zone 里，那么给面板签证书用的那个 API token **也能签发你的 DoT 域名** —— 一台被拿下的网关可以拿它给 DoT 域名签张真证书，反过来 MITM 你自己的 DNS。这是权限升级，不只是多一个凭据。
+
+`pdg lan status` 每次都会提醒。收窄的办法有两个：面板用另一个域名（token 就碰不到 DoT 那个 zone），或者把 `_acme-challenge` 用 CNAME 委派到单独的 zone，然后 `pdg lan cert <dns插件名> <委派zone>`。
+
+还有一条：网关拿到了主动访问你家内网的能力。真正的硬边界不在网关上，而在家里那台子网路由器 —— Tailscale 的包过滤在目标节点执行，所以网关就算被 root 了，往 ACL 之外的地址发包也会被家里那台丢掉。ACL 要你自己在 tailnet 后台配，`pdg doctor --deep` 会主动探一个不在面板表里的地址，连得上就说明还没收紧。
+
+### 不想要了
+
+```bash
+sudo pdg lan disable              # 停用, 面板表和证书都留着
+sudo pdg lan purge                # 连配置、证书、DNS 凭据、caddy 一起清掉
+```
+
+`pdg uninstall` 也会一并带走，包括 DNS API 凭据和 acme 账户密钥 —— 服务没了而能改你 DNS 记录的凭据还留在盘上，比不卸载更糟。删不掉的会逐条点名。
+
+## 14. 项目组成
 
 | 层 | 组件 | 说明 |
 |---|---|---|
@@ -299,6 +368,7 @@ sudo pdg doctor          # 看「Tailscale 入口隔离」与「Tailscale 卸载
 | 流量 | mihomo（clash.meta） | nft REDIRECT 入站 + redir 监听 + SNI 嗅探。多出口故障切换；提供 clash_api（观测面板）。改配置前先校验，失败回滚 |
 | 管理 | Telegram Bot（Python 标准库） | 出口、分流、规则集、测速、流量、备份恢复、iOS 描述文件、自定义域名、WLOC；改配置前先校验，失败回滚 |
 | 位置改写 | pdg-mitm（可选，iOS） | 自签 CA + 终止 TLS + 转发并替换 `gs-loc` 响应坐标 |
+| 内网面板 | Caddy（可选，方案 B） | 官方原版不带插件，只监听环回；证书由 acme.sh 走 DNS-01 签发。进程以 `pdg-lan` 身份跑，出站按 uid 白名单限死在面板表里的 `IP:端口` |
 | 证书 | certbot standalone | Let's Encrypt，自动续期 |
 | 防火墙 | nftables | 对全网只放行 SSH；DNS、数据、探测端口只放行内网卡来源段；mihomo 用 REDIRECT 入站，同样限内网卡来源。只用独立的 `table inet pdg`，`/etc/nftables.conf` 里你自己的表逐字节保留 |
 
@@ -361,7 +431,7 @@ sudo nft -c -f /etc/nftables.conf && sudo systemctl reload nftables
 - **观测面板前端资源（zashboard）**：固定版本 + SHA256 校验 + 暂存目录 + 原子替换，属于静态
   缓存资源，不是 DNS/分流生产配置，因此不纳入配置事务。
 
-## 14. 文档
+## 15. 文档
 
 - [docs/QUICKSTART.md](docs/QUICKSTART.md) — 新手图文教程
 - [docs/INSTALL.md](docs/INSTALL.md) — 安装细节 / DNS 配置 / 端口 / 版本说明
@@ -369,11 +439,11 @@ sudo nft -c -f /etc/nftables.conf && sudo systemctl reload nftables
 - [docs/production-notes.md](docs/production-notes.md) — 实战记录与已知问题
 - [docs/design-mitm-plugins.md](docs/design-mitm-plugins.md) — iOS 位置改写（WLOC）设计与原理
 - [docs/rescue-plane-access.md](docs/rescue-plane-access.md) — 救援平面的手机端访问与指纹核对
-- [docs/design-lan-panels.md](docs/design-lan-panels.md) — 内网面板访问（手机零 App）的设计与两种架构对比**（设计中，未实现）**
+- [docs/design-lan-panels.md](docs/design-lan-panels.md) — 内网面板访问（手机零 App）的设计、两种架构对比，以及端到端实测记录（含三个沙盒查不出来的坑）
 - [docs/RELEASE-CHECKLIST.md](docs/RELEASE-CHECKLIST.md) — 发版前检查清单
 - [CHANGELOG.md](CHANGELOG.md) — 更新日志
 
-## 15. 免责声明与 License
+## 16. 免责声明与 License
 
 本项目仅供学习与合法网络管理用途。请遵守你所在地的法律法规，使用者自行承担责任，作者不对使用后果负责。
 
