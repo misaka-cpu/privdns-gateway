@@ -414,7 +414,8 @@ def _mixed_listeners(sb, direct_tags):
 def singbox_to_mihomo(sb, *, redir_port=7893, controller="127.0.0.1:9090",
                       secret=None, external_ui=None, external_ui_url=None,
                       tls_ports=None, http_ports=None, rulesets=None,
-                      mitm_domains=None, mitm_port=7894):
+                      mitm_domains=None, mitm_port=7894,
+                      lan_domains=None, lan_addr="127.0.0.1"):
     """把 sing-box 配置 dict 翻译成 mihomo 配置 dict。
 
     rulesets: 可选 {name: {url, behavior, format}} —— 提供则渲染 rule-providers + RULE-SET,
@@ -472,6 +473,27 @@ def singbox_to_mihomo(sb, *, redir_port=7893, controller="127.0.0.1:9090",
                         "server": "127.0.0.1", "port": mitm_port, "udp": False})
         rules = rules[:i] + [f"DOMAIN-SUFFIX,{d},MITM-OUT" for d in mitm_domains] + rules[i:]
 
+    # ── 内网面板(方案 B): 面板域名 → 本机反代 ──────────────────────────────
+    # **必须排在反自环 IP-CIDR REJECT 之前**, 而不是像 MITM 那样排在之后。原因实测定案:
+    #
+    #   · `no-resolve` 的含义是"不要为这条规则发起 DNS 查询", **不是**"目的是域名时不
+    #     匹配"。面板域名在下面的 hosts: 段里被映射到本机地址, 于是 IP 在规则匹配阶段
+    #     就已知 —— `IP-CIDR,127.0.0.0/8,REJECT,no-resolve` 会**命中**并把连接拒掉。
+    #     真机日志: `match IPCIDR(127.0.0.0/8) using REJECT`。
+    #   · MITM 能排在 REJECT 之后, 是因为它的域名**没有 hosts 条目**(匹配时 IP 未知),
+    #     而 MITM-OUT 出站自己连 127.0.0.1:7894 是不过规则的。两者性质不同, 不能照抄。
+    #
+    # 代价: 这**绕过了面板域名的反自环保护**。可接受的前提是**门二禁止面板上游写环回
+    # 地址**(lanpanel.parse_target 的 is_loopback 判据) —— 面板因此不可能指回网关自己。
+    # 那条判据一旦被放宽, 这里就会静默开一个自环的洞, 两处要一起看。
+    #
+    # 前置放在最后做: 上面的 IN-NAME 与 MITM 都按 `i`(= REJECT 之后)插入, 先前置的话
+    # 它们会被算到面板规则前面去, 反而丢掉各自该有的位置。
+    lan_hosts = {}
+    if lan_domains:
+        lan_hosts = {d: lan_addr for d in lan_domains}
+        rules = ["DOMAIN-SUFFIX,%s,DIRECT" % d for d in lan_domains] + rules
+
     tls_ports = tls_ports if tls_ports is not None else DEFAULT_TLS_PORTS
     http_ports = http_ports if http_ports is not None else DEFAULT_HTTP_PORTS
 
@@ -495,6 +517,11 @@ def singbox_to_mihomo(sb, *, redir_port=7893, controller="127.0.0.1:9090",
         "proxies": proxies,
         "proxy-groups": groups,
     }
+    if lan_hosts:
+        # mihomo 的 DIRECT **不读 /etc/hosts**(实测: 加了 hosts 文件条目仍然连不上,
+        # 换成非环回地址也一样 —— 是解析这一步走不通, 不是环回被拒)。要让它连到本机
+        # 反代, 只能用 mihomo 自己的 hosts: 段。
+        cfg["hosts"] = lan_hosts
     if listeners:
         cfg["listeners"] = listeners
     if secret:

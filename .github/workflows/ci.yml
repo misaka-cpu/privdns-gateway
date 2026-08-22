@@ -157,6 +157,9 @@ jobs:
       - name: "内网面板门二: 面板表校验 + 反代生成(改写指令的空测)"
         run: python3 tests/test-lanpanel.py
 
+      - name: "内网面板接线: 面板规则必须排在反自环 REJECT 之前(含空测)"
+        run: python3 tests/test-lan-wire.py
+
       - name: "链路诊断采集器 (证书正常/临期/过期/错域名/损坏/误放私钥; 零写入零写锁)"
         run: python3 tests/test-link-status.py
 
