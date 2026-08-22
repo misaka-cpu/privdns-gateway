@@ -4015,14 +4015,39 @@ def _lan_panels():
             if isinstance(p, dict) and p.get("name")]
 
 
+LAN_CERT = "/etc/pdg-lan/certs/panel.crt"
+
+
+def _lan_cert_sans():
+    """现有证书覆盖的域名集合。读不出来返回 None(表示"不知道", 与"一个都没覆盖"要分开)。"""
+    try:
+        p = subprocess.run(["openssl", "x509", "-in", LAN_CERT, "-noout",
+                            "-ext", "subjectAltName"], capture_output=True, text=True, timeout=8)
+    except Exception:  # noqa: BLE001
+        return None
+    if p.returncode != 0:
+        return None
+    return {x.strip().replace("DNS:", "")
+            for x in (p.stdout or "").replace("\n", ",").split(",") if "DNS:" in x}
+
+
 def lan_open_kb():
     """面板的**直达按钮**: Telegram 的 url 按钮点一下就开浏览器, 省掉手输一长串地址。
 
     只放域名, 不放内网 IP —— 内网 IP 在手机上本来就打不开(那是家里的地址, 手机在外面),
     放上去只会让人点了之后一脸问号。要看上游地址在「📋 面板列表」里。
+
+    **证书没覆盖到的面板要标出来。**所有面板共用一张 SAN 证书, 新加的面板在重签之前
+    名字不在证书里 —— 按钮长得和能用的一模一样, 点下去却是证书错误。让人自己去猜
+    "为什么这个打不开"是不对的, 按钮上就该写着。
     """
     ps = _lan_panels()
-    rows = [[{"text": "🔗 %s" % n_, "url": "https://%s" % h_}] for n_, h_ in ps if h_]
+    sans = _lan_cert_sans()
+    def _mark(n_, h_):
+        if sans is not None and h_ not in sans:
+            return "⚠️ %s (待重签)" % n_
+        return "🔗 %s" % n_
+    rows = [[{"text": _mark(n_, h_), "url": "https://%s" % h_}] for n_, h_ in ps if h_]
     # 两个一行, 面板多的时候不至于拉很长
     packed = []
     for i in range(0, len(rows), 2):
@@ -4316,10 +4341,19 @@ def handle_cb(chat, mid, data):
         ps = _lan_panels()
         if not ps:
             edit(chat, mid, "还没有面板。", LAN_BACK); return
+        _sans = _lan_cert_sans()
+        _bad = [h_ for _n, h_ in ps if h_ and _sans is not None and h_ not in _sans]
+        _tip = ""
+        if _bad:
+            _tip = ("\n\n⚠️ 带「待重签」的面板证书还没覆盖到, 点了会是<b>证书错误</b>。"
+                    "到网关上跑一次 <code>sudo pdg lan cert &lt;dns插件名&gt;</code> 就好"
+                    "（所有面板共用一张证书, 加过面板就要重签）。")
+        elif _sans is None:
+            _tip = "\n\n（读不到证书, 没法标出哪些还没覆盖 —— 看「🩺 状态」）"
         edit(chat, mid,
              "🔗 <b>打开面板</b>（点一下直接开）\n\n"
              "⚠️ 手机要走<b>蜂窝网络</b>。连着 WiFi 时 DNS 查询不是从内网卡过来的, "
-             "网关不会劫持这些域名 —— 点了会打不开。",
+             "网关不会劫持这些域名 —— 点了会打不开。" + _tip,
              lan_open_kb()); return
     if data == "lan_status":
         edit(chat, mid, lan_status_text(), LAN_BACK); return
