@@ -1931,6 +1931,95 @@ def check_lan_cert():
     return ("ok", name, "%d 张证书都还有 14 天以上" % len(panels))
 
 
+
+def _lan_probe_target(cfg):
+    """挑一个**不在面板表里**、但与某个面板同网段的地址, 用来探 tailnet ACL 的边界。
+
+    取同 /24 里的另一个主机位: 家里那侧如果按设计把 ACL 收成"只允许网关访问那几个
+    IP:端口", 这个地址就该到不了。返回 (ip, port, 参照的面板 IP) 或 None。
+    """
+    import ipaddress
+    tgts = []
+    lp = _lanpanel()
+    if lp is None:
+        return None
+    try:
+        tgts = lp.targets(cfg)
+    except Exception:  # noqa: BLE001
+        return None
+    for ip_s, port in tgts:
+        try:
+            ip = ipaddress.ip_address(ip_s)
+        except ValueError:
+            continue
+        if ip.version != 4:
+            continue
+        net = ipaddress.ip_network("%s/24" % ip_s, strict=False)
+        used = {t[0] for t in tgts}
+        # 从网段末尾往回找一个没被用到的主机位 —— 靠后的地址通常没有设备,
+        # 探它比探 .1(往往是路由器)更不容易打扰到真在跑的东西。
+        for host in list(net.hosts())[::-1][:8]:
+            if str(host) not in used:
+                return (str(host), port, ip_s)
+    return None
+
+
+def check_deep_lan_acl():
+    """tailnet ACL 越界探测(慢速, 只在 --deep 跑)。
+
+    设计文档第 4 节把这条列为"能测出来的, 不是只能靠嘱咐": **真正的硬边界在家里那台
+    子网路由器上** —— Tailscale 的包过滤在目标节点执行, 所以网关就算被 root 了, 往
+    ACL 之外的地址发包也会被家里那台丢掉。项目管不了用户的 tailnet 后台, 但可以探。
+
+    判据的读法要小心, 三种结果不是"成功/失败"两分:
+      · 连上了        → ACL 放行了本不该放行的地址 → fail
+      · 连接被拒(RST) → 包**到达了对端**才会有 RST → ACL 同样放行了 → fail
+      · 不可达/超时   → 被丢在半路 → 这正是期望的结果 → ok
+
+    探测**以 root 身份发起**, 因此不受门三(出站白名单)约束 —— 那是有意的: 门三管的是
+    反代进程, 而这一项要量的是**家里那侧**的过滤器。用受限身份去探, 量到的会是自己的
+    防火墙, 那等于什么都没验。
+    """
+    name = "内网面板: tailnet ACL 边界(deep)"
+    cfg = _lan_cfg()
+    if cfg is None:
+        return None
+    on, _active = _lan_on()
+    if not on:
+        return None
+    pick = _lan_probe_target(cfg)
+    if pick is None:
+        return ("warn", name, "挑不出可用的探测地址(面板表里没有 IPv4 上游?), 本项没跑")
+    ip_, port, ref = pick
+    import socket
+    s = socket.socket()
+    s.settimeout(4)
+    try:
+        s.connect((ip_, port))
+        s.close()
+        return ("fail", name,
+                "从网关能连上 %s:%d —— 它**不在**面板表里, 说明 tailnet ACL 没有收窄到"
+                "只允许那几个 IP:端口。一台被拿下的网关因此能摸到你家整个网段。"
+                "去 tailnet 后台按 docs/design-lan-panels.md 第 4 节的模板配 ACL。" % (ip_, port))
+    except socket.timeout:
+        return ("ok", name, "%s:%d(面板表之外)连不上 —— ACL 边界看起来是收紧的" % (ip_, port))
+    except ConnectionRefusedError:
+        return ("fail", name,
+                "%s:%d 回了 RST —— 包**到达了对端**才会有这个回应, 说明 tailnet ACL 放行了"
+                "面板表之外的地址(参照面板 %s)。ACL 该做的是把它丢掉, 而不是让对端拒绝。"
+                % (ip_, port, ref))
+    except OSError as e:
+        # EHOSTUNREACH(113)/ENETUNREACH(101) = 被丢在半路, 正是期望的
+        if getattr(e, "errno", None) in (101, 113):
+            return ("ok", name, "%s:%d(面板表之外)被丢弃 —— ACL 边界成立" % (ip_, port))
+        return ("warn", name, "探测没跑成(%s), 本项无结论" % e)
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+
+
 ALL = [check_platform, check_services, check_bot_credentials, check_health_timer, check_core_version, check_dot_arecord, check_dot_domain_sync,
        check_internal_cidr, check_cidr_drift, check_nft, check_nft_input_chains, check_redirect, check_gms,
        check_tailscale_isolation, check_tailscale_residue,
@@ -1940,7 +2029,8 @@ ALL = [check_platform, check_services, check_bot_credentials, check_health_timer
        check_cert, check_cert_dir_sync, check_dns, check_core_config, check_rulesets, check_rule_precedence,
        check_mitm_structure, check_mitm, check_transactions]
 ALERT = [check_services, check_dns, check_cert]  # healthcheck 用的轻量子集(运行期故障)
-DEEP = [check_deep_dot_handshake, check_deep_probe81, check_deep_dot_witness, check_deep_dns_cn,
+DEEP = [check_deep_lan_acl,
+        check_deep_dot_handshake, check_deep_probe81, check_deep_dot_witness, check_deep_dns_cn,
         check_deep_clash, check_deep_upstreams, check_deep_hijack_note]  # pdg doctor --deep 追加
 
 def run(funcs=None):
