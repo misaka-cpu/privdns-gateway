@@ -358,11 +358,20 @@ if inst.start():
         ok("客户端中途断开: 服务端的恢复仍然跑完")
     else:
         bad("断开后恢复没完成")
-    rec = [r for r in audit_recs(box) if r.get("event") == "recover"]
+    # 状态到位**不等于**审计已落盘: 上面那个循环等的是 meta.json 的 state, 而审计是
+    # 另一次写。机器慢的时候(CI 上真撞过)state 已经是 ROLLED_BACK 而审计还没 flush,
+    # 于是这条断言拿到空列表。要等就各等各的, 不能拿一个信号去代表两件事。
+    rec = []
+    _dl = time.time() + 15
+    while time.time() < _dl:
+        rec = [r for r in audit_recs(box) if r.get("event") == "recover"]
+        if rec and rec[-1].get("trigger_source") == "rescue":
+            break
+        time.sleep(0.3)
     if rec and rec[-1].get("trigger_source") == "rescue":
         ok("客户端中途断开: 最终审计仍然落盘(trigger_source=rescue)")
     else:
-        bad("断开后审计缺失: %r" % rec)
+        bad("断开后审计缺失(等了 15s): %r" % rec)
     if inst.proc.poll() is None:
         ok("客户端中途断开: 服务进程没有被写响应失败搞崩")
     else:
