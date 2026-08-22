@@ -263,19 +263,31 @@ st, _n, msg = run_cert()
 assert st == "ok", (st, msg)
 ok("SAN 覆盖全部面板且未临期 → ok")
 
+# ── 证书项**一律 warn, 不能 fail** ───────────────────────────────────────────
+# `pdg update` 跑完自检, 任何 fail 都会让整次更新回滚。而面板证书出问题只是"面板打不开",
+# 不该把一个修了 DNS/代理缺陷的更新一起挡掉。真机上撞过: 在 v1.10.7 启用过面板的机器,
+# 因为证书布局变了(一板一张 → 共用一张 SAN)这一项判 fail, 于是**每次更新都回滚,
+# 永远升不上来**。危险的那种状态(反代在跑而白名单不在)由 check_lan_whitelist 负责 fail。
 st, _n, msg = run_cert(have_crt=False)
-assert st == "fail" and "panel.crt" in msg, msg
-ok("没有证书 → fail")
+assert st == "warn" and "panel.crt" in msg, (st, msg)
+ok("没有证书 → warn(不是 fail —— fail 会让 pdg update 回滚)")
 
 # **共用证书带来的新失败形态**: 加了面板却没重签 —— 文件在、也没过期, 但 SAN 里没有它。
 # 只看"文件在不在"会整类漏掉, 而手机上表现成证书错误。
 st, _n, msg = run_cert(sans=["p0.home.example.com"])
-assert st == "fail" and "SAN" in msg and "p1.home.example.com" in msg, msg
-ok("加了面板没重签(SAN 缺该名字) → fail 且点名")
+assert st == "warn" and "SAN" in msg and "p1.home.example.com" in msg, (st, msg)
+ok("加了面板没重签(SAN 缺该名字) → warn 且点名")
 
 st, _n, msg = run_cert(expired=True)
-assert st == "fail" and "已过期" in msg, msg
-ok("证书已过期 → fail")
+assert st == "warn" and "已过期" in msg, (st, msg)
+ok("证书已过期 → warn")
+
+# 空测: 整个证书项都不许出现 fail —— 否则升级路径又会被它挡住
+for _case in (dict(have_crt=False), dict(sans=["p0.home.example.com"]),
+              dict(expired=True), dict(soon=True), dict()):
+    _st, _n2, _m = run_cert(**_case)
+    assert _st != "fail", "证书项返回了 fail(%r), 那会让 pdg update 回滚: %s" % (_case, _m)
+ok("证书项在所有分支上都不返回 fail")
 
 st, _n, msg = run_cert(soon=True)
 assert st == "warn" and "14 天内" in msg, msg
