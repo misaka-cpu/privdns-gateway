@@ -15,6 +15,9 @@ import sys
 import tempfile
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "deploy" / "bot"))
 spec = importlib.util.spec_from_file_location("checks", ROOT / "deploy/bot/checks.py")
@@ -229,7 +232,9 @@ ok("探测地址与面板同网段但不在表里: %s:%d" % (pick[0], pick[1]))
 # 判据用 `openssl x509 -checkend`, 不自己解析 notAfter —— 那个格式带时区缩写,
 # strptime 在不同 locale 下解出来的东西不一样。桩按 checkend 的秒数分支即可。
 def run_cert(present, expired=(), soon=()):
-    d = tempfile.mkdtemp()
+    # 走 tmpguard 而不是裸 mkdtemp: 这个仓库的测试经常并发跑, 按前缀扫 /tmp 清理等于
+    # 随机破坏隔壁进程的沙箱。登记表是唯一安全的依据。(tests/test-tmp-hygiene 会拦裸调。)
+    d = tmpguard.mkdtemp(prefix="lan-doctor.")
     for n_ in present:
         open(os.path.join(d, "%s.crt" % n_), "w").write("x")
 
