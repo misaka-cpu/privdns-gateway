@@ -163,6 +163,9 @@ jobs:
       - name: "内网面板自检: 四项判据的每条分支(含 ACL 探测的三种读法)"
         run: python3 tests/test-lan-doctor.py
 
+      - name: "主防火墙重载的唯一入口(裸调会把内网面板白名单冲掉而不补回)"
+        run: bash tests/test-lan-nft-chokepoint.sh
+
       - name: "链路诊断采集器 (证书正常/临期/过期/错域名/损坏/误放私钥; 零写入零写锁)"
         run: python3 tests/test-link-status.py
 

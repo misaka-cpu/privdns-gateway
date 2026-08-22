@@ -255,6 +255,7 @@ def _nav(key):
             [{"text": "🌐 DoT 自定义域名", "callback_data": "setdot"}],
             [{"text": "✈️ Telegram 出口", "callback_data": "tgexit"}]])),
         "lan": ("🏠 <b>内网面板</b> — 手机零 App 打开家里的 Web 面板。选一项:", [
+            [{"text": "🔗 打开面板", "callback_data": "lan_open"}],
             [{"text": "📋 面板列表", "callback_data": "lan_list"},
              {"text": "🩺 状态", "callback_data": "lan_status"}],
             [{"text": "➕ 加面板", "callback_data": "lan_add"},
@@ -4014,6 +4015,22 @@ def _lan_panels():
             if isinstance(p, dict) and p.get("name")]
 
 
+def lan_open_kb():
+    """面板的**直达按钮**: Telegram 的 url 按钮点一下就开浏览器, 省掉手输一长串地址。
+
+    只放域名, 不放内网 IP —— 内网 IP 在手机上本来就打不开(那是家里的地址, 手机在外面),
+    放上去只会让人点了之后一脸问号。要看上游地址在「📋 面板列表」里。
+    """
+    ps = _lan_panels()
+    rows = [[{"text": "🔗 %s" % n_, "url": "https://%s" % h_}] for n_, h_ in ps if h_]
+    # 两个一行, 面板多的时候不至于拉很长
+    packed = []
+    for i in range(0, len(rows), 2):
+        packed.append([r[0] for r in rows[i:i + 2]])
+    packed.extend(_back_rows(LAN_BACK))
+    return {"inline_keyboard": packed}
+
+
 def lan_list_text():
     rc, out = _lan(["list"])
     n = len(_lan_panels())
@@ -4295,6 +4312,15 @@ def handle_cb(chat, mid, data):
         edit(chat, mid, traffic_text(), BACK); return
     if data == "lan_list":
         edit(chat, mid, lan_list_text(), LAN_BACK); return
+    if data == "lan_open":
+        ps = _lan_panels()
+        if not ps:
+            edit(chat, mid, "还没有面板。", LAN_BACK); return
+        edit(chat, mid,
+             "🔗 <b>打开面板</b>（点一下直接开）\n\n"
+             "⚠️ 手机要走<b>蜂窝网络</b>。连着 WiFi 时 DNS 查询不是从内网卡过来的, "
+             "网关不会劫持这些域名 —— 点了会打不开。",
+             lan_open_kb()); return
     if data == "lan_status":
         edit(chat, mid, lan_status_text(), LAN_BACK); return
     if data == "lan_add":
