@@ -5113,10 +5113,17 @@ for p in d.get("panels",[]):
 # 证书: DNS-01 签发。凭据放 600 文件, 由 acme.sh 从环境读 —— 不进命令行(ps 看得见),
 # 不进日志。
 _lan_cert(){
-  local dnsapi="${1:-}"
-  [[ -n "$dnsapi" ]] || { echo "用法: pdg lan cert <acme.sh 的 DNS 插件名, 如 dns_cf>"; 
+  local dnsapi="${1:-}" alias_zone="${2:-}"
+  [[ -n "$dnsapi" ]] || { echo "用法: pdg lan cert <acme.sh 的 DNS 插件名, 如 dns_cf> [委派zone]"; 
     echo "  凭据写进 $LAN_DNS_ENV (600), 一行一个 KEY=值 —— 具体要哪些看 acme.sh 的 dnsapi 文档。"
-    echo "  例(Cloudflare): CF_Token=...   然后 pdg lan cert dns_cf"; return 1; }
+    echo "  例(Cloudflare): CF_Token=...   然后 pdg lan cert dns_cf"
+    echo
+    echo "  [委派zone] 用来把 DNS token 的爆炸半径收窄, **强烈建议给**:"
+    echo "    先在主域下给每个面板加一条 CNAME:"
+    echo "      _acme-challenge.<面板域名>  CNAME  <面板域名>.<委派zone>"
+    echo "    然后 token 只需要能改**委派 zone**, 不再需要能改主域 —— 于是一台被拿下的"
+    echo "    网关**签不了你自己的 DoT 域名**, 风险从"权限升级"降回"多一个凭据"。"
+    echo "    例: pdg lan cert dns_cf acme-deleg.example.net"; return 1; }
   [[ -s "$LAN_DNS_ENV" ]] || { c_y "❌ 缺 $LAN_DNS_ENV —— DNS 服务商的凭据要先放好(600)。"; return 1; }
   local mode; mode="$(stat -c %a "$LAN_DNS_ENV" 2>/dev/null)"
   [[ "$mode" == 600 ]] || { c_y "❌ $LAN_DNS_ENV 权限是 $mode, 应为 600 —— 里面是能改你 DNS 的凭据。"; return 1; }
@@ -5131,8 +5138,12 @@ _lan_cert(){
   (
     set -a; # shellcheck disable=SC1090
     source "$LAN_DNS_ENV"; set +a
+    # --challenge-alias: 把 _acme-challenge 的写入指到**委派 zone**。这不是便利选项 ——
+    # 没有它, token 必须能改主域, 而主域里通常还有本项目自己的 DoT 域名(见 lanpanel.zone_risk)。
+    local -a alias_arg=()
+    [[ -n "$alias_zone" ]] && alias_arg=(--challenge-alias "$alias_zone")
     "$ACME_HOME/acme.sh" --home "$ACME_HOME/data" --issue --dns "$dnsapi" \
-      "${doms[@]}" --server letsencrypt --keylength ec-256
+      "${doms[@]}" "${alias_arg[@]+"${alias_arg[@]}"}" --server letsencrypt --keylength ec-256
   ) || { c_y "❌ 签发失败 —— 看上面 acme.sh 给的原因(多半是凭据权限不足或域名不在该 zone)。"; return 1; }
   while read -r h; do
     [[ -n "$h" ]] || continue
@@ -5416,7 +5427,7 @@ cmd_lan(){
                _lan_transact lan-rm rm "$1" && { c_g "✅ 已从面板表移除。"; _lan_list; };;
     enable)    _lan_enable;;
     disable)   _lan_disable;;
-    cert)      need_root lan; _lan_cert "${1:-}";;
+    cert)      need_root lan; _lan_cert "${1:-}" "${2:-}";;
     render)    need_root lan
                _lan_render || return 1
                c_g "✅ 反代配置与出站白名单已按面板表重新生成。"
@@ -5437,7 +5448,9 @@ cmd_lan(){
       echo "      --legacy-tls               老设备只有 RSA 密钥交换套件(表现是 502 + handshake failure)"
       echo "      --entry-query <q>          前后端分离的应用要在入口带的参数, 如 magicpath=xxxx"
       echo "  rm <面板名>"
-      echo "  cert <dns插件名>          DNS-01 签发(凭据放 /etc/privdns-gateway/lan-dns.env, 600)"
+      echo "  cert <dns插件名> [委派zone]  DNS-01 签发(凭据放 /etc/privdns-gateway/lan-dns.env, 600)"
+      echo "                            给了委派 zone, token 就只需要能改那一个 zone ——"
+      echo "                            被拿下的网关签不了你自己的 DoT 域名(见 pdg lan status 的风险提示)"
       echo "  enable / disable          启用/停用反代"
       echo "  render                    面板表改过之后重新生成全部派生物(反代/白名单/DNS/分流)"
       echo "  wire                      只同步 DNS 劫持集与 mihomo 分流(反代配置不动)"
