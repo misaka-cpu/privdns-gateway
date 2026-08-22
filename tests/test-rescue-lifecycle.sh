@@ -119,10 +119,16 @@ N
             _rescue_nft_count_disk _rescue_nft_count_kernel _rescue_nft_drop_legacy \
             _rescue_nft_open _rescue_nft_close \
             _rescue_rotate cmd_rescue _rescue_enable _rescue_disable _rescue_status \
+            _nft_apply_main _lan_nft_reapply \
             migrate_rescue_plane; do
     sed -n "/^${fn}(){/,/^}/p" "$ROOT/deploy/bot/pdg.sh"
   done
 } > "$WORK/fns.sh"
+
+  # _nft_apply_main / _lan_nft_reapply: 救援平面的放行走它们(主规则加载完顺带把内网面板的
+  # 白名单补回内核)。**抽取清单要跟着依赖走** —— 漏了的话 _rescue_nft_open 里那次加载调到
+  # 一个未定义的名字, 报出来的是"防火墙放行失败(候选未通过 nft -c 或应用失败)", 看起来像
+  # 救援平面自己的缺陷。下面那条 sed 会一并把这两个函数里的默认路径也指到沙盒。
 
 # 生产代码读死 /etc/nftables.conf 与 /opt/pdg-bot —— 沙盒里把它们指到 BOX
 sed -i "s#/etc/nftables.conf#$BOX/etc/nftables.conf#g; s#/opt/pdg-bot#$BOX/opt/pdg-bot#g" "$WORK/fns.sh"
