@@ -200,8 +200,17 @@ def render_caddy(cfg, certs_dir, bind="127.0.0.1"):
 
         if p.get("entry_query"):
             # 前后端分离的应用(sub-store 之类)要在入口带参数, 否则每台设备都得手输后端地址。
-            L.append("\t@bare path /")
-            L.append("\tredir @bare /?%s 302" % p["entry_query"])
+            #
+            # 判据必须是"根路径 **而且还没带这个参数**"。只判路径的话, 跳到 `/?k=v` 之后
+            # 路径**仍然是 `/`** —— 于是再跳一次, 无限循环, 浏览器报"重定向次数过多"。
+            # 真机上撞过: 从网关用 curl 不跟跳转只看到第一个 302, 看着一切正常, 而手机上
+            # 根本打不开。
+            key = p["entry_query"].split("=", 1)[0]
+            L.append("\t@entry {")
+            L.append("\t\tpath /")
+            L.append("\t\tnot query %s=*" % key)
+            L.append("\t}")
+            L.append("\tredir @entry /?%s 302" % p["entry_query"])
 
         L.append("\treverse_proxy %s {" % up)
         if scheme == "https":

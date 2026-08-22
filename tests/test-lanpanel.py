@@ -109,7 +109,13 @@ assert _l and _l.group(1).startswith("https?://") and "(:[0-9]+)?" in _l.group(1
 assert r"192\.168\.1\.50" in _l.group(1), _l.group(1)
 
 q = lp.render_caddy(cfg(P(entry_query="magicpath=abc123")), "/c")
-assert "redir @bare /?magicpath=abc123 302" in q
+assert "redir @entry /?magicpath=abc123 302" in q, q
+# **必须带防自环判据**。只判 `path /` 的话, 跳到 `/?k=v` 之后路径**仍然是 `/`** ——
+# 于是再跳一次, 无限循环。真机上撞过: 从网关 curl 不跟跳转只看到第一个 302, 看着正常,
+# 手机上报"重定向次数过多"。
+assert "not query magicpath=*" in q, "缺少'还没带这个参数'的判据: " + q
+_e = q[q.index("@entry"):q.index("redir @entry")]
+assert "path /" in _e and "not query" in _e, _e
 
 # ── ⑨ 生成: 上游协议决定 transport ──────────────────────────────────────────
 https = lp.render_caddy(cfg(P()), "/c")
