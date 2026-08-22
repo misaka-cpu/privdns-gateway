@@ -4970,6 +4970,43 @@ _lan_routes(){
   esac
 }
 
+# 风险②: 签面板证书的 DNS token 会不会顺带能签本项目自己的 DoT 域名。
+#
+# 这不是"多一个凭据"而是**权限升级**: token 按 zone 授权, 而面板域名与 DoT 域名通常在
+# 同一个 zone 里 —— 一台被拿下的网关可以用它签发 DoT 域名的证书, 进而 MITM 用户自己的
+# DNS。面板被看到是一回事, DNS 被劫持是另一回事。
+#
+# 只警告不阻断: 用户完全可以接受这个风险(自己家、自己用), 那是他的决定。但他必须**知道**
+# 自己在决定什么 —— 这条不能只写在文档第 7 节里等人去读。
+_lan_zone_warn(){
+  local mod dot risks
+  mod="$(_pdg_module lanpanel.py)" || return 0
+  dot="$(cat /opt/pdg-bot/dot-domain 2>/dev/null)"
+  [[ -n "$dot" ]] || return 0
+  # 退出码要**逐个分辨**, 不能只分"成功/其他": 0=没风险, 2=有风险, 其余=判据没跑起来。
+  # 写成 `... && return 0` 的话, 任何一种失败(模块旧、参数不认、python 挂了)都会被当成
+  # "有风险", 而错误文本会被原样当成风险清单打出来 —— 一条本该提醒人的警告变成噪音,
+  # 用户下次就不看它了。
+  local rc
+  risks="$(python3 "$mod" zone-risk "$LAN_TABLE_PATH" "$dot" 2>/dev/null)"; rc=$?
+  case "$rc" in
+    0) return 0;;
+    2) : ;;                     # 有风险, 往下报
+    *) c_y "  ⚠️ 同 zone 风险判据没跑起来(lanpanel.py zone-risk 退出码 $rc) —— 这一条本次没检查。"
+       return 0;;
+  esac
+  [[ -n "$risks" ]] || return 0
+  echo
+  c_y "  ⚠️ 风险: 面板域名与本项目的 DoT 域名($dot)在同一个 zone 里"
+  printf '%s\n' "$risks" | while IFS=$'\t' read -r h z; do echo "       $h  ←同 zone→  $dot   ($z)"
+  done
+  c_y "     签发面板证书要一个能改这个 zone 的 DNS token, 而那个 token **也能签发 $dot**。"
+  c_y "     于是一台被拿下的网关可以给你的 DoT 域名签一张真证书, 反过来 MITM 你自己的 DNS ——"
+  c_y "     面板被看到是一回事, DNS 被劫持是另一回事。"
+  echo "     收窄的办法: 面板用单独的子域, 并把 _acme-challenge 用 CNAME 委派到一个**单独的 zone**,"
+  echo "     让 token 只控制那一个 zone。"
+}
+
 _lan_status(){
   echo "内网面板(方案 B)"
   if [[ -s "$LAN_TABLE_PATH" ]]; then
@@ -4982,6 +5019,7 @@ _lan_status(){
       else
         c_y "  ⚠️ 门二: 面板表**没通过校验** —— 跑 pdg lan check 看具体哪条"
       fi
+      _lan_zone_warn
     fi
   else
     echo "  面板表: 还没有(用 pdg lan add 加第一条)"

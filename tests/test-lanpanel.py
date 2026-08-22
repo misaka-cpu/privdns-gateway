@@ -256,4 +256,26 @@ p_ = subprocess.run([sys.executable, str(MOD), "add", tpath, "--name", "z",
                      "--no-insecure"], capture_output=True, text=True)
 assert p_.returncode == 0, p_.stdout
 
+# ── ⑯ 风险②: DNS token 的爆炸半径(面板域名与 DoT 域名同 zone = 权限升级) ─────
+assert lp.shared_zone("nas.home.example.com", "dot.example.com") == "example.com"
+assert lp.shared_zone("nas.lan.mydom.io", "dot.mydom.io") == "mydom.io"
+# 空测: 不同注册域不该报
+assert lp.shared_zone("nas.home.example.com", "dot.other.net") is None
+assert lp.shared_zone("a.example.com", "b.example.org") is None
+# 只共有 TLD 不算 —— 否则所有 .com 域名两两之间都会报, 这条判据立刻变成噪音
+assert lp.shared_zone("a.com", "b.com") is None
+assert lp.shared_zone("x.co.uk", "y.co.uk") == "co.uk"    # 宁可多报: co.uk 会命中
+# 大小写与末尾点不影响判定(DNS 里它们是同一个名字)
+assert lp.shared_zone("NAS.Home.Example.COM", "dot.example.com.") == "example.com"
+
+r = lp.zone_risk(cfg(P(host="nas.home.example.com"),
+                     P(name="b", host="b.elsewhere.net", target="http://10.0.0.2")),
+                 "dot.example.com")
+assert r == [("nas.home.example.com", "example.com")], r
+# 空测: 没配 DoT 域名时不报(判据没有输入, 不能凭空成立)
+assert lp.zone_risk(cfg(P()), "") == []
+assert lp.zone_risk(cfg(P()), None) == []
+# 空测: DoT 在别的注册域时不报
+assert lp.zone_risk(cfg(P(host="nas.home.example.com")), "dot.other.net") == []
+
 print("test-lanpanel.py: OK")

@@ -17,6 +17,7 @@
   lanpanel.py list    <表.json>              人看的面板清单
   lanpanel.py add     <表.json> --name .. --host .. --target ..   生成加了一条的**候选表**
   lanpanel.py rm      <表.json> <name>       生成删了一条的候选表
+  lanpanel.py zone-risk <表.json> <DoT域名>  风险②: 面板域名与 DoT 是否同 zone
   lanpanel.py render  <表.json> --certs <目录> [--bind <地址>]   生成 Caddyfile
   lanpanel.py targets <表.json>              列出 IP<TAB>端口, 供防火墙白名单使用
 """
@@ -214,6 +215,48 @@ def render_caddy(cfg, certs_dir, bind="127.0.0.1"):
     return "\n".join(L)
 
 
+def shared_zone(a, b):
+    """两个域名共同的父域(按标签从右往左比)。只有一个标签(纯 TLD)时返回 None ——
+    example.com 与 example.net 共有 "com" 不说明任何事。"""
+    la = [x for x in (a or "").lower().strip(".").split(".") if x]
+    lb = [x for x in (b or "").lower().strip(".").split(".") if x]
+    common = []
+    for x, y in zip(reversed(la), reversed(lb)):
+        if x != y:
+            break
+        common.append(x)
+    if len(common) < 2:
+        return None
+    return ".".join(reversed(common))
+
+
+def zone_risk(cfg, dot_domain):
+    """风险②: 签发面板证书用的 DNS token 会不会顺带能签发本项目自己的 DoT 域名。
+
+    为什么这是**权限升级**而不只是"多一个凭据": Cloudflare 这类服务商的 token 按 zone 授权,
+    而面板域名与 DoT 域名通常在同一个 zone 里。那么一台被拿下的网关可以用这个 token 签发
+    `dot.example.com` 的证书, 进而 MITM 用户自己的 DNS —— 而 DoT 正是这个项目存在的理由。
+    面板被看到是一回事, DNS 被劫持是另一回事。
+
+    判据是"共同父域至少两个标签"。这是对 eTLD+1 的近似 —— 不引 public suffix list:
+    多带一份要跟着上游更新的数据, 而这里**宁可多报**: 报错了用户看一眼就知道不相干,
+    漏报了他会在不知情的情况下把 DoT 的签发权交出去。
+
+    返回 [(面板 host, 共同父域), ...], 空 = 没有这个风险。
+    """
+    if not dot_domain:
+        return []
+    out = []
+    for p in cfg.get("panels", []):
+        if not isinstance(p, dict):
+            continue
+        h = p.get("host")
+        z = shared_zone(h, dot_domain)
+        if z:
+            out.append((h, z))
+    return out
+
+
 NFT_TABLE = "pdglan"
 
 
@@ -399,6 +442,14 @@ def main(argv):
                   % (p.get("name"), p.get("host"), p.get("target"),
                      ("   [" + ", ".join(marks) + "]") if marks else ""))
         return 0
+
+    if mode == "zone-risk":
+        # lanpanel.py zone-risk <表> <DoT域名>
+        dot = argv[3] if len(argv) > 3 else ""
+        risks = zone_risk(cfg, dot)
+        for host, z in risks:
+            print("%s\t%s" % (host, z))
+        return 2 if risks else 0
 
     if mode == "targets":
         for ip, port in targets(cfg):
