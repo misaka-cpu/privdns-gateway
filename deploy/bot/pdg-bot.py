@@ -254,6 +254,13 @@ def _nav(key):
             [{"text": "📡 手机链路测试", "callback_data": "linktest"}],
             [{"text": "🌐 DoT 自定义域名", "callback_data": "setdot"}],
             [{"text": "✈️ Telegram 出口", "callback_data": "tgexit"}]])),
+        "lan": ("🏠 <b>内网面板</b> — 手机零 App 打开家里的 Web 面板。选一项:", [
+            [{"text": "📋 面板列表", "callback_data": "lan_list"},
+             {"text": "🩺 状态", "callback_data": "lan_status"}],
+            [{"text": "➕ 加面板", "callback_data": "lan_add"},
+             {"text": "🗑 删面板", "callback_data": "lan_del"}],
+            [{"text": "🔁 重新生成", "callback_data": "lan_sync"},
+             {"text": "🔐 证书", "callback_data": "lan_cert"}]]),
         "ops": ("🛠 <b>运维</b> — 选一项:", [
             [{"text": "🔄 重启服务", "callback_data": "restart"}, {"text": "📦 更新规则库", "callback_data": "updgeo"}],
             [{"text": "💾 备份", "callback_data": "backup"}, {"text": "♻️ 恢复", "callback_data": "restore"}],
@@ -262,6 +269,8 @@ def _nav(key):
     }
     if _platform() == "ios":                          # iOS 专属: 位置改写(WLOC)
         subs["ops"][1].append([{"text": "🍏 位置改写(WLOC)", "callback_data": "wloc"}])
+    if os.path.exists(LAN_TABLE_FILE):                # 配过内网面板才显示(没配的人不该多一个看不懂的按钮)
+        subs["ops"][1].append([{"text": "🏠 内网面板", "callback_data": "nav:lan"}])
     title, rows = subs[key]
     return title, {"inline_keyboard": rows + [[{"text": "⬅️ 返回主菜单", "callback_data": "menu"}]]}
 
@@ -3966,6 +3975,91 @@ def rules_text():
         txt += "\n\n自定义直连: " + ", ".join(d[:20])
     return txt
 
+# ── 内网面板(方案 B) ─────────────────────────────────────────────────────────
+# bot 侧只做**外调**: 真正的判据(门一/门二/门三、证书 SAN、事务)全在 `pdg lan` 里。
+# 在这里另写一份校验的话, CLI 与 bot 迟早给出不同的答案, 而不一致的方向是"一处拦一处不拦"。
+LAN_CLI = "/usr/local/bin/pdg"
+LAN_BACK = {"inline_keyboard": [[{"text": "⬅️ 返回内网面板", "callback_data": "nav:lan"}],
+                                [{"text": "🏠 主菜单", "callback_data": "menu"}]]}
+# 友好词 → pdg lan add 的开关。用中文/短词是因为这几个开关的含义要在按钮说明里讲得清,
+# 而 `--rewrite-location` 这种在手机上敲很烦。
+_LAN_FLAGS = {
+    "insecure": "--insecure", "不校验证书": "--insecure",
+    "no-insecure": "--no-insecure", "校验证书": "--no-insecure",
+    "location": "--rewrite-location", "跳转": "--rewrite-location",
+    "referer": "--fix-referer", "来源": "--fix-referer",
+    "oldtls": "--legacy-tls", "老tls": "--legacy-tls",
+}
+
+
+def _lan(args, timeout=120):
+    """跑 `pdg lan …`, 返回 (rc, 合并输出)。输出去掉颜色码 —— Telegram 里那些是乱码。"""
+    try:
+        p = subprocess.run([LAN_CLI, "lan"] + list(args),
+                           capture_output=True, text=True, timeout=timeout)
+        out = (p.stdout or "") + (p.stderr or "")
+    except Exception as e:  # noqa: BLE001
+        return 1, "跑不起来: %s" % e
+    return p.returncode, re.sub(r"\x1b\[[0-9;]*m", "", out).strip()
+
+
+def _lan_panels():
+    """面板表里的 (name, host)。读不到返回空 —— 没配过这个功能时它本来就不存在。"""
+    try:
+        with open(LAN_TABLE_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return []
+    return [(p.get("name"), p.get("host")) for p in (d.get("panels") or [])
+            if isinstance(p, dict) and p.get("name")]
+
+
+def lan_list_text():
+    rc, out = _lan(["list"])
+    n = len(_lan_panels())
+    if n == 0:
+        return ("🏠 <b>内网面板</b>\n\n还没有面板。\n\n"
+                "这个功能让你在外面用手机打开家里的 Web 面板(路由器后台、NAS、UPS 之类), "
+                "<b>手机上不装也不开任何 App</b>。前提是家里有一台常开的机器跑着 Tailscale 子网路由。")
+    return "🏠 <b>内网面板</b>（%d 个）\n\n<pre>%s</pre>" % (n, _esc(out[:3000]))
+
+
+def lan_status_text():
+    rc, out = _lan(["status"])
+    return "🏠 <b>内网面板状态</b>\n\n<pre>%s</pre>" % _esc(out[:3500])
+
+
+def lan_add_line(line):
+    """一行文本 → `pdg lan add …`。格式与 add_group 同风格(本项目的既有惯例是单行输入)。
+
+        名字 域名 上游 [选项…]
+
+    选项用友好词而不是 --long-flag: 手机上敲 `--rewrite-location` 太难受。
+    **不在这里做校验** —— 门二在 `pdg lan add` 那侧, 它拒绝时的说明本来就写给人看。
+    """
+    p = line.split()
+    if len(p) < 3:
+        return False, ("格式: <b>名字 域名 上游 [选项…]</b>\n"
+                       "例: <code>nas nas.example.com https://192.168.1.50 insecure 跳转 来源</code>\n\n"
+                       "选项(可多选):\n"
+                       "• <code>insecure</code> 上游是 https 且自签证书时必填(或 <code>校验证书</code>)\n"
+                       "• <code>跳转</code> 设备把自己的内网 IP 写进跳转头时用\n"
+                       "• <code>来源</code> 设备校验 Referer/Origin 必须是自己地址时用\n"
+                       "• <code>老tls</code> 老设备只有 RSA 密钥交换套件(502 + handshake failure)")
+    name, host, target = p[0], p[1], p[2]
+    args = ["add", "--name", name, "--host", host, "--target", target]
+    for w in p[3:]:
+        f = _LAN_FLAGS.get(w.lower())
+        if not f:
+            if w.lower().startswith("magicpath=") or "=" in w:
+                args += ["--entry-query", w]; continue
+            return False, "认不出的选项: <code>%s</code>\n可用: %s" % (
+                _esc(w), ", ".join(sorted(set(_LAN_FLAGS))))
+        args.append(f)
+    rc, out = _lan(args)
+    return rc == 0, "<pre>%s</pre>" % _esc(out[:3000])
+
+
 def kb_pick(prefix, tags, back=BACK):
     rows = [[{"text": t, "callback_data": f"{prefix}:{t}"}] for t in tags]
     rows.extend(_back_rows(back))
@@ -4199,6 +4293,48 @@ def handle_cb(chat, mid, data):
                          else "❌ 启动更新失败, 请在终端跑 sudo pdg update。"), BACK); return
     if data == "traffic":
         edit(chat, mid, traffic_text(), BACK); return
+    if data == "lan_list":
+        edit(chat, mid, lan_list_text(), LAN_BACK); return
+    if data == "lan_status":
+        edit(chat, mid, lan_status_text(), LAN_BACK); return
+    if data == "lan_add":
+        state[chat] = "lan_add"
+        edit(chat, mid,
+             "发一行「<b>名字 域名 上游 [选项…]</b>」加面板。\n"
+             "例: <code>nas nas.example.com https://192.168.1.50 insecure 跳转 来源</code>\n\n"
+             "上游<b>必须写字面 IP</b>(写域名的话决定连哪台机器的是 DNS, 而这台网关自己就在做 DNS 劫持)。\n\n"
+             "选项: <code>insecure</code>/<code>校验证书</code>(https 上游二选一)、"
+             "<code>跳转</code>、<code>来源</code>、<code>老tls</code>、<code>magicpath=xxx</code>\n"
+             "/cancel 取消。", LAN_BACK); return
+    if data == "lan_del":
+        ps = _lan_panels()
+        if not ps:
+            edit(chat, mid, "还没有面板。", LAN_BACK); return
+        edit(chat, mid, "选要删的面板:",
+             kb_pick_named("landel", [(n_, "%s  (%s)" % (n_, h_)) for n_, h_ in ps], LAN_BACK)); return
+    if data.startswith("landel:"):
+        nm = data.split(":", 1)[1]
+        def task():
+            rc, out = _lan(["rm", nm])
+            send(chat, ("✅ 已删除 <b>%s</b>\n<pre>%s</pre>" % (_esc(nm), _esc(out[:2500]))) if rc == 0
+                 else ("❌ 删除失败\n<pre>%s</pre>" % _esc(out[:2500])), LAN_BACK)
+        edit(chat, mid, "删除中…", LAN_BACK); run_bg(chat, task); return
+    if data == "lan_sync":
+        def task():
+            rc1, o1 = _lan(["render"]); rc2, o2 = _lan(["wire"])
+            send(chat, "%s 重新生成\n<pre>%s</pre>" % ("✅" if rc1 == 0 and rc2 == 0 else "❌",
+                                                    _esc((o1 + "\n" + o2)[:3000])), LAN_BACK)
+        edit(chat, mid, "重新生成中…", LAN_BACK); run_bg(chat, task); return
+    if data == "lan_cert":
+        # **不在 bot 里跑签发**: 那要 DNS 服务商凭据、会打外网、acme.sh 可能跑上一两分钟,
+        # 而且输出很长。放在 bot 里既容易超时, 出错时也只能回一坨看不懂的日志。
+        # 这里只报状态 + 给出该敲的命令。
+        rc, out = _lan(["status"])
+        edit(chat, mid,
+             "🔐 <b>面板证书</b>\n\n所有面板<b>共用一张 SAN 证书</b>, 加了面板就要重签一次,"
+             "否则新面板在手机上是证书错误。\n\n签发要 DNS 服务商凭据、会打外网、可能跑一两分钟, "
+             "所以不在 bot 里做。到网关上敲:\n<code>sudo pdg lan cert &lt;dns插件名&gt;</code>\n\n"
+             "当前状态:\n<pre>%s</pre>" % _esc(out[:2200]), LAN_BACK); return
     if data == "exit_list":
         edit(chat, mid, exits_text(), EXIT_BACK); return
     if data == "rules":
@@ -4724,6 +4860,11 @@ def handle_text(chat, text, mid=None):
                 send_plain(chat, "❌ 添加失败: 配置校验未过, 已回滚(详情见服务器日志, 未回显链接内容)")
         run_bg(chat, task)
         return
+    if act == "lan_add":
+        def task():
+            ok_, msg = lan_add_line(text)
+            send(chat, ("✅ " if ok_ else "❌ ") + msg, LAN_BACK)
+        send_plain(chat, "处理中…"); run_bg(chat, task); return
     if act == "add_group":
         p = text.split()
         if len(p) < 3:
