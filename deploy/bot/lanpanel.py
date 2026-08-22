@@ -176,7 +176,7 @@ def render_caddy(cfg, certs_dir, bind="127.0.0.1"):
     L.append("}")
     L.append("")
 
-    for p in cfg["panels"]:
+    for idx, p in enumerate(cfg["panels"]):
         scheme, ip, port = parse_target(p["target"])
         host = p["host"]
         name = p["name"]
@@ -241,8 +241,23 @@ def render_caddy(cfg, certs_dir, bind="127.0.0.1"):
             # **但这一条不是实测出来的**: 对华为 UPS2000 直接试过, 带不带 `:443` 都一样
             # 返回 404 —— 决定性的是上面那条"不要凭空塞一个 Referer", 不是端口。
             # 不把没量到的东西写成量到的。
-            L.append("\t\theader_up Referer \"https?://%s\" \"%s\"" % (host_re, up_display))
-            L.append("\t\theader_up Origin \"https?://%s\" \"%s\"" % (host_re, up_display))
+            # 判据是"**有没有** Referer", 不是"它指向谁":
+            #   · 没有  → 不加(浏览器首次导航就不带; 凭空塞一个进去等于伪造来源, 严格
+            #             校验的设备照样拒 —— 华为 UPS2000 实测)
+            #   · 有    → **不管指向谁**, 一律换成上游地址
+            # 早先只替换"指向本域名"的那种, 于是从 Telegram 按钮点进来时(Referer 是
+            # t.me / android-app://…)规则匹配不上, 外来 Referer 原样透传, 设备回
+            # "Error Referer Request!"。真机复现过 —— 而这个洞是加了按钮之后才被触发的:
+            # 以前手输网址不带 Referer, 一直没暴露。
+            # 形式是 `header_up <名> <正则> <替换>` —— 三个参数那种是**在已有的头上做替换**,
+            # 头不存在时什么都不做。正则写成 `.*` 就是"不管原来指向谁, 一律换掉"。
+            #
+            # **不能用 @matcher**: `header_up` 在 reverse_proxy 里不支持请求匹配器(那是站点级
+            # `header` 指令才有的)。写了 `header_up @x Referer "值"` 的话 Caddy 会把 @x 当成
+            # **头的名字**, 于是变成"给一个叫 @x 的头做替换", 真 Referer 原样透传 ——
+            # 而 `caddy validate` 照样通过(它只验语法)。真机上踩过, adapt 成 JSON 才看出来。
+            L.append("\t\theader_up Referer \".*\" \"%s/\"" % up_display)
+            L.append("\t\theader_up Origin \".*\" \"%s\"" % up_display)
         L.append("\t}")
         L.append("}")
         L.append("")
