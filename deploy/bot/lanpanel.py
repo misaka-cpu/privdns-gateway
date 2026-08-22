@@ -181,6 +181,12 @@ def render_caddy(cfg, certs_dir, bind="127.0.0.1"):
         host = p["host"]
         name = p["name"]
         up = "%s://%s:%d" % (scheme, ip, port)
+        # 给设备看的地址: 默认端口不写出来(见下面 fix_referer 那段的理由)。
+        default_port = 443 if scheme == "https" else 80
+        up_display = up if port != default_port else "%s://%s" % (scheme, ip)
+        # 正则里的点要转义 —— 不转义的话 `.` 会匹配任意字符, 改写范围比预期大。
+        ip_re = re.escape(ip)
+        host_re = re.escape(host)
 
         L.append("# 面板 %s" % name)
         L.append("%s:443 {" % host)
@@ -207,13 +213,27 @@ def render_caddy(cfg, certs_dir, bind="127.0.0.1"):
         if p.get("rewrite_location"):
             # 设备会把自己的局域网 IP 写进 Location 跳转头(Zyxel 交换机、华为 UPS 实测)。
             # 不改写的话手机会跟着跳到一个到不了的地址。
-            L.append("\t\theader_down Location \"%s\" \"https://%s\"" % (up, host))
-            L.append("\t\theader_down Location \"http://%s\" \"https://%s\"" % (ip, host))
+            #
+            # 用**一条正则**覆盖 http/https 与"带不带端口", 而不是几条字面替换: 设备回的
+            # Location 可能是 `https://IP`、`https://IP:443`、`http://IP` 里的任意一种,
+            # 逐条穷举总会漏, 而漏掉的那种表现是手机跳到一个到不了的地址。
+            L.append("\t\theader_down Location \"https?://%s(:[0-9]+)?\" \"https://%s\""
+                     % (ip_re, host))
         if p.get("fix_referer"):
             # 有些设备校验 Referer/Origin 必须是自己的地址(华为 UPS2000 实测, 否则返回
-            # Error Referer Request!)。要在上行方向改回去。
-            L.append("\t\theader_up Referer \"%s/\"" % up)
-            L.append("\t\theader_up Origin \"%s\"" % up)
+            # Error Referer Request!)。
+            #
+            # **是"替换"不是"设置"**。写成无条件设置的话, 客户端本来没带 Referer 的请求
+            # (浏览器首次导航就不带)会被硬塞一个进去 —— 那是伪造一个不存在的来源, 严格
+            # 校验的设备照样会拒。这里只把**已经存在的**那个头里的对外域名换回上游地址,
+            # 路径部分原样保留。
+            #
+            # 替换成的地址不带默认端口, 与方案 A 的写法一致, 也更接近 origin 的规范形式。
+            # **但这一条不是实测出来的**: 对华为 UPS2000 直接试过, 带不带 `:443` 都一样
+            # 返回 404 —— 决定性的是上面那条"不要凭空塞一个 Referer", 不是端口。
+            # 不把没量到的东西写成量到的。
+            L.append("\t\theader_up Referer \"https?://%s\" \"%s\"" % (host_re, up_display))
+            L.append("\t\theader_up Origin \"https?://%s\" \"%s\"" % (host_re, up_display))
         L.append("\t}")
         L.append("}")
         L.append("")

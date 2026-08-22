@@ -90,6 +90,23 @@ assert "header_up Referer" not in loc, "只要了 Location, 不该顺手改 Refe
 ref = lp.render_caddy(cfg(P(fix_referer=True)), "/c")
 assert "header_up Referer" in ref and "header_up Origin" in ref
 assert "header_down Location" not in ref
+# **必须是"替换"形式(两个参数), 不能是"设置"形式(一个参数)**。
+# 无条件设置会给本来没带 Referer 的请求(浏览器首次导航就不带)硬塞一个 —— 华为 UPS2000
+# 实测: 根路径不带 Referer 回 302, 带任何 Referer 都回 404。带不带端口没区别, 决定性的
+# 是"有没有凭空塞一个"。
+import re as _re
+_m = _re.search(r'header_up Referer "([^"]*)" "([^"]*)"', ref)
+assert _m, "Referer 不是替换形式(两个参数): " + ref
+assert _m.group(1).startswith("https?://"), _m.group(1)
+assert ":443" not in _m.group(2), "替换目标不该带默认端口: " + _m.group(2)
+
+# Location 用一条正则覆盖 http/https 与带不带端口 —— 逐条字面替换总会漏一种,
+# 而漏掉的那种表现是手机跳到一个到不了的地址。
+_l = _re.search(r'header_down Location "([^"]*)"', loc)
+assert _l and _l.group(1).startswith("https?://") and "(:[0-9]+)?" in _l.group(1), \
+    "Location 改写不是覆盖式正则: " + (loc)
+# 点要转义, 否则 `.` 会匹配任意字符, 改写范围比预期大
+assert r"192\.168\.1\.50" in _l.group(1), _l.group(1)
 
 q = lp.render_caddy(cfg(P(entry_query="magicpath=abc123")), "/c")
 assert "redir @bare /?magicpath=abc123 302" in q
