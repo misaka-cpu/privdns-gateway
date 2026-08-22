@@ -5340,6 +5340,9 @@ _lan_enable(){
   install -d -m750 -o "$LAN_USER" -g "$LAN_USER" "$LAN_STATE_DIR"
   install -d -m750 -o root -g "$LAN_USER" "$LAN_ETC"
   install -d -m750 -o root -g "$LAN_USER" "$LAN_CERT_DIR"
+  # 迁移要排在**预检之前**: 旧布局(一板一张)的机器预检会直接拒(找不到 panel.crt), 于是
+  # 放在 _lan_render 里的迁移永远走不到。迁移是**前提**, 不是渲染的一步。
+  _lan_migrate_certs
   _lan_preflight || return 1
   _lan_render || return 1
   systemctl enable --now pdg-lan >/dev/null 2>&1
