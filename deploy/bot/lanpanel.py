@@ -211,6 +211,66 @@ def render_caddy(cfg, certs_dir, bind="127.0.0.1"):
     return "\n".join(L)
 
 
+NFT_TABLE = "pdglan"
+
+
+def render_nft(cfg, uid):
+    """门三: 反代进程的**出站白名单**。除了面板表里出现过的 IP:端口, 它什么都连不到。
+
+    按 uid 过滤而不是按端口 —— 端口挡不住"别的进程发起同样的连接"。uid 才是"这些包是反代
+    发的"这件事的判据。
+
+    比设计文档更严: 文档说的是"只允许经 tailscale0 访问白名单", 这里做成**不分接口**的
+    白名单。反代的合法出站本来就只有那几个上游 —— 上游必须是字面 IP(见 parse_target),
+    所以它连 DNS 都不需要。多留一个"经别的接口可以随便连"的口子没有任何用途, 只是攻击面。
+
+    为什么可以用独立的表(与救援平面当年的教训相反):
+      · 救援平面那次栽在 **input** 方向 —— 同一 hook 上多条 base chain 都会执行, 别的链里的
+        `accept` 终止不了本链, `inet pdg` 的 policy drop 照样把包丢掉, 于是独立表里的放行
+        形同虚设。
+      · 这里是 **output** 方向而且判决是 `reject` —— drop/reject 是跨链终局的, 任一条链拒了
+        包就没了。所以独立表在这个方向上成立。
+      · 而且 doctor/nftscan 的冲突判据只认 `hook input`(见 nftscan.py 的 _HOOK_IN),
+        挂 output 不会被自己的自检判成冲突 —— 那正是救援平面独立表当年踩的第二个坑。
+
+    **这份规则是 fail-open 的**: 文件加载失败时白名单就不存在, 而反代照跑。所以调用方必须
+    把它挂成反代 unit 的 ExecStartPre —— 加载不上就别启动。这一条不是建议, 是这道门能不能
+    成立的前提。
+    """
+    errs = validate(cfg)
+    if errs:
+        raise PanelError("面板表没通过校验, 拒绝生成防火墙规则:\n" + "\n".join("  " + e for e in errs))
+    if not (isinstance(uid, str) and re.match(r"^[a-z_][a-z0-9_-]{0,31}$", uid)):
+        raise PanelError("uid 要是用户名(收到 %r)" % (uid,))
+
+    L = []
+    L.append("#!/usr/sbin/nft -f")
+    L.append("# 由 lanpanel.py 生成 —— 不要手改。")
+    L.append("# 反代进程(%s)的出站白名单: 只有面板表里出现过的 IP:端口。" % uid)
+    L.append("# 必须挂成反代 unit 的 ExecStartPre —— 这份加载不上就不该让反代跑起来。")
+    L.append("table inet %s" % NFT_TABLE)
+    L.append("delete table inet %s" % NFT_TABLE)
+    L.append("table inet %s {" % NFT_TABLE)
+    L.append("\tchain output {")
+    L.append("\t\ttype filter hook output priority filter; policy accept;")
+    L.append("\t\t# 不是反代发的包, 本链一概不管")
+    L.append('\t\tmeta skuid != "%s" accept' % uid)
+    L.append("\t\t# 回给本机的响应(反代监听在环回上, 由 mihomo 拨进来)")
+    L.append("\t\toif lo accept")
+    tgts = targets(cfg)
+    if tgts:
+        L.append("\t\t# ── 白名单: 与反代读同一份面板表派生 ──")
+    for ip, port in tgts:
+        fam = "ip6" if ":" in ip else "ip"
+        L.append("\t\t%s daddr %s tcp dport %d accept" % (fam, ip, port))
+    L.append("\t\t# 其余一律拒。用 reject 而不是 drop: 反代会立刻拿到错误并回 502,")
+    L.append("\t\t# 而 drop 要等到超时 —— 那时故障看起来像\"设备很慢\", 不像\"被挡了\"。")
+    L.append("\t\treject with icmpx admin-prohibited")
+    L.append("\t}")
+    L.append("}")
+    return "\n".join(L) + "\n"
+
+
 def legacy_tls_panels(cfg):
     """需要放宽 TLS 套件的面板名。
 

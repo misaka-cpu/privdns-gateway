@@ -149,4 +149,56 @@ assert rc == 3, (rc, out)
 rc, out = cli("render", "--certs", "/c", table=cfg(P(target="https://nas.lan")))
 assert rc == 2 and "字面 IP" in out, (rc, out)
 
+# ── ⑭ 门三: 出站白名单的**结构**(真 nft 的行为验证要 NET_ADMIN, CI 给不了 ──────
+#     见 tests/negctl/lan-egress-live.sh, 那是本地门)
+def nft(cfg_, uid="pdg-lan"):
+    return lp.render_nft(cfg_, uid)
+
+
+rules = nft(cfg(P(), P(name="ups", host="ups.home.example.com",
+                       target="http://192.168.1.9:8080")))
+lines = [l.strip() for l in rules.splitlines() if l.strip() and not l.strip().startswith("#")]
+
+# uid 判据必须**排在白名单之前**。排在后面的话白名单对所有进程生效 —— 那正好把
+# "按 uid 过滤"这条设计取消掉, 而规则看起来一条不少。
+i_uid = next(n for n, l in enumerate(lines) if "skuid" in l)
+i_first_allow = next(n for n, l in enumerate(lines) if "daddr" in l)
+assert i_uid < i_first_allow, (i_uid, i_first_allow)
+
+# reject 必须是链里最后一条 —— 后面还有规则的话它们永远走不到
+i_reject = next(n for n, l in enumerate(lines) if l.startswith("reject"))
+assert all("daddr" not in l for l in lines[i_reject:]), lines[i_reject:]
+
+# 白名单逐条对上面板表, 不多不少
+assert rules.count("ip daddr 192.168.1.50 tcp dport 443 accept") == 1
+assert rules.count("ip daddr 192.168.1.9 tcp dport 8080 accept") == 1
+assert "192.168.1.1" not in rules, "表里没有的地址不该出现在规则里"
+
+# 环回响应要放行, 否则反代回不了包
+assert "oif lo accept" in rules
+
+# IPv6 用 ip6 daddr
+v6 = nft(cfg(P(target="https://[fd00::5]:8443")))
+assert "ip6 daddr fd00::5 tcp dport 8443 accept" in v6, v6
+
+# **空表必须是"什么都不许连", 不能是"随便连"**。一份没有面板的配置最容易被当成
+# "还没配, 先放开" —— 那会让反代在配置好之前拥有整个内网的可达性。
+empty = nft(cfg())
+assert "daddr" not in empty and "reject with icmpx admin-prohibited" in empty, empty
+
+# uid 形态不合法就拒绝生成(拼错的用户名会让 nft 加载失败 —— 而那是 fail-open 的)
+for bad_uid in ("", "Root", "a b", "x" * 40, 1000):
+    try:
+        nft(cfg(P()), bad_uid)
+        raise AssertionError("uid %r 不该被接受" % (bad_uid,))
+    except lp.PanelError:
+        pass
+
+# 面板表不合法时连规则也不生成 —— 否则会派生出一份"按半张表放行"的白名单
+try:
+    nft(cfg(P(target="https://nas.lan")))
+    raise AssertionError("不合法的表不该派生出防火墙规则")
+except lp.PanelError:
+    pass
+
 print("test-lanpanel.py: OK")
