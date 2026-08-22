@@ -5217,6 +5217,59 @@ import json; print("1" if m.legacy_tls_panels(json.load(open(sys.argv[2]))) else
   systemctl daemon-reload 2>/dev/null || true
 }
 
+# 现有证书的 SAN 没覆盖到的面板(空 = 都覆盖了)。preflight 与 add/rm 共用这一份判据 ——
+# 两处各写一遍迟早会不一致, 而不一致的方向是"一处拦一处不拦"。
+_lan_cert_missing(){
+  [[ -s "$LAN_CERT_DIR/panel.crt" ]] || { _lan_hosts | tr '\n' ' '; return 0; }
+  local sans h out=""
+  sans="$(openssl x509 -in "$LAN_CERT_DIR/panel.crt" -noout -ext subjectAltName 2>/dev/null \
+          | tr ',' '\n' | sed 's/.*DNS://;s/ //g')"
+  while read -r h; do
+    [[ -n "$h" ]] || continue
+    grep -qxF "$h" <<<"$sans" || out="$out $h"
+  done < <(_lan_hosts)
+  printf '%s' "$out"
+}
+
+# 面板表变了之后把派生物跟上。
+#
+# 为什么要自动做: 面板表是**单一真源**, 反代配置/出站白名单/DNS 劫持集/mihomo 分流都由它
+# 派生 —— 改了源却不重新派生, 等于让四份派生物停在旧状态, 而 `pdg lan add` 报的是成功。
+# 这正是本项目反复要避免的那类问题: 一个操作说完成了, 而它其实没完成。
+#
+# 证书**不自动重签**: 那要 DNS 凭据、会打网络、有速率限制。但必须当场说 —— 不说的话新面板
+# 在手机上是证书错误, 而用户手里拿着一句"✅ 已加入面板表"。
+_lan_sync_after_change(){
+  local on active
+  on="$(_lan_intent)"; active=0
+  systemctl is-active --quiet pdg-lan 2>/dev/null && active=1
+  if [[ "$on" != 1 && "$active" != 1 ]]; then
+    echo "   (内网面板还没启用, 派生物等 pdg lan enable 时一起生成。)"
+    return 0
+  fi
+  _lan_render || { c_y "⚠️ 反代配置/白名单没能重新生成 —— 新面板还不会生效。"; return 1; }
+  _lan_wire   || { c_y "⚠️ DNS 劫持集/分流没能同步 —— 新面板还不会生效。"; return 1; }
+  # **必须 restart, 不能 reload。**出站白名单是靠 unit 的 ExecStartPre 加载进内核的,
+  # 而 reload 只跑 ExecReload —— 于是文件写了新的、内核里还是旧的。
+  # 两个方向都出事, 而且删面板那个方向更危险:
+  #   加面板 → 内核里少一条 → 那个面板 502 打不开(doctor 的白名单漂移检查会报);
+  #   删面板 → 内核里多一条 → **反代仍能连到已经移除的设备**, 门三形同虚设。
+  # 真机上撞过: 加完之后文件 5 条、内核 4 条。
+  if systemctl is-active --quiet pdg-lan 2>/dev/null; then
+    systemctl restart pdg-lan >/dev/null 2>&1 || c_y "⚠️ pdg-lan 重启失败 —— 新的白名单还没进内核。"
+  fi
+  c_g "✅ 反代配置、出站白名单、DNS 劫持集与分流已同步。"
+  local miss; miss="$(_lan_cert_missing)"
+  if [[ -n "$miss" ]]; then
+    c_y "⚠️ 但现有证书的 SAN 里没有:$miss"
+    c_y "   手机上访问这些面板会是**证书错误**。重签一次(所有面板共用一张证书):"
+    c_y "     sudo pdg lan cert <dns插件名>"
+  fi
+}
+
+# profile.env 里的启用意图(读不到 = 空 = 没启用)
+_lan_intent(){ sed -n 's/^[[:space:]]*PDG_LAN_ENABLED=//p' "$PROFILE_ENV" 2>/dev/null | tail -1; }
+
 _lan_preflight(){
   local rc=0 h missing=""
   [[ -s "$LAN_TABLE_PATH" ]] || { c_y "⛔ 面板表是空的 —— 先 pdg lan add 加至少一条。"; return 1; }
@@ -5235,11 +5288,7 @@ _lan_preflight(){
     c_y "   先跑 pdg lan cert <dns插件名> 签发。反代读的是落盘的证书, 它自己不去要。"
     rc=1
   else
-    local sans; sans="$(openssl x509 -in "$LAN_CERT_DIR/panel.crt" -noout -ext subjectAltName 2>/dev/null | tr ',' '\n' | sed 's/.*DNS://;s/ //g')"
-    while read -r h; do
-      [[ -n "$h" ]] || continue
-      grep -qxF "$h" <<<"$sans" || missing="$missing $h"
-    done < <(_lan_hosts)
+    missing="$(_lan_cert_missing)"
     if [[ -n "$missing" ]]; then
       c_y "⛔ 证书的 SAN 里没有这些面板:$missing"
       c_y "   加过面板就要重签(所有面板共用一张证书): pdg lan cert <dns插件名>"
@@ -5446,10 +5495,16 @@ cmd_lan(){
                else rm -f "$t"; return 1; fi;;
     routes)    _lan_routes "$@";;
     add)       need_root lan
-               _lan_transact lan-add add "$@" && { c_g "✅ 已加入面板表。"; _lan_list; };;
+               _lan_transact lan-add add "$@" || return 1
+               c_g "✅ 已加入面板表。"; _lan_list
+               _lan_sync_after_change;;
     rm)        need_root lan
                [[ -n "${1:-}" ]] || { echo "用法: pdg lan rm <面板名>"; return 1; }
-               _lan_transact lan-rm rm "$1" && { c_g "✅ 已从面板表移除。"; _lan_list; };;
+               _lan_transact lan-rm rm "$1" || return 1
+               c_g "✅ 已从面板表移除。"; _lan_list
+               # 删面板同样要重新派生: 不做的话出站白名单里还留着那台设备的地址,
+               # 而反代已经不认这个域名了 —— 白名单比面板表宽, doctor 会报"多出"。
+               _lan_sync_after_change;;
     enable)    _lan_enable;;
     disable)   _lan_disable;;
     cert)      need_root lan; _lan_cert "${1:-}" "${2:-}";;
