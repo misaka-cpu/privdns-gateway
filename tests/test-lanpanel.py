@@ -201,4 +201,59 @@ try:
 except lp.PanelError:
     pass
 
+# ── ⑮ 候选生成: add / rm 不写盘, 只产出新表 ─────────────────────────────────
+base = cfg(P())
+c2 = lp.add_panel(base, {"name": "ups", "host": "ups.home.example.com",
+                         "target": "http://192.168.1.9:8080"})
+assert len(c2["panels"]) == 2
+assert len(base["panels"]) == 1, "add_panel 不该改原对象"
+
+# 候选要**整体**过校验, 不只校验新增那条 —— 撞 name/host 只有放在一起看才发现得了
+for dup in ({"name": "nas", "host": "x.home.example.com", "target": "http://10.0.0.1"},
+            {"name": "other", "host": "nas.home.example.com", "target": "http://10.0.0.1"}):
+    try:
+        lp.add_panel(base, dup)
+        raise AssertionError("重复的 %r 不该加得进去" % dup["name"])
+    except lp.PanelError as ex:
+        assert "重复" in str(ex), ex
+
+# 删不到要报错, 不能静默成功 —— "删了个不存在的"和"删掉了"事后看起来一模一样
+try:
+    lp.rm_panel(base, "nope")
+    raise AssertionError("删不存在的面板不该成功")
+except lp.PanelError as ex:
+    assert "没有名叫" in str(ex), ex
+
+c3 = lp.rm_panel(c2, "nas")
+assert [p["name"] for p in c3["panels"]] == ["ups"]
+assert len(c2["panels"]) == 2, "rm_panel 不该改原对象"
+
+# 落盘文本要稳定 —— 事务比对 before/after, 格式抖动会让"没改内容"看起来像改过
+assert lp.dumps(base) == lp.dumps(json.loads(lp.dumps(base)))
+
+# 命令行 add: 生成候选到 stdout, 原文件一个字节都不动
+with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
+    json.dump(base, f)
+    tpath = f.name
+before = open(tpath, encoding="utf-8").read()
+p_ = subprocess.run([sys.executable, str(MOD), "add", tpath, "--name", "ups",
+                     "--host", "ups.home.example.com", "--target", "http://192.168.1.9:8080"],
+                    capture_output=True, text=True)
+assert p_.returncode == 0, p_.stdout + p_.stderr
+assert len(json.loads(p_.stdout)["panels"]) == 2
+assert open(tpath, encoding="utf-8").read() == before, "add 不该写原文件"
+
+# https 上游没表态 → 拒绝, 且原文件仍不动
+p_ = subprocess.run([sys.executable, str(MOD), "add", tpath, "--name", "z",
+                     "--host", "z.home.example.com", "--target", "https://192.168.1.11"],
+                    capture_output=True, text=True)
+assert p_.returncode == 2 and "insecure_upstream" in p_.stdout, p_.stdout
+assert open(tpath, encoding="utf-8").read() == before
+
+# --no-insecure 是表过态的
+p_ = subprocess.run([sys.executable, str(MOD), "add", tpath, "--name", "z",
+                     "--host", "z.home.example.com", "--target", "https://192.168.1.11",
+                     "--no-insecure"], capture_output=True, text=True)
+assert p_.returncode == 0, p_.stdout
+
 print("test-lanpanel.py: OK")

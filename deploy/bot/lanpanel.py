@@ -14,6 +14,9 @@
 
 用法:
   lanpanel.py check   <表.json>              校验(门二), 0=通过 2=有问题
+  lanpanel.py list    <表.json>              人看的面板清单
+  lanpanel.py add     <表.json> --name .. --host .. --target ..   生成加了一条的**候选表**
+  lanpanel.py rm      <表.json> <name>       生成删了一条的候选表
   lanpanel.py render  <表.json> --certs <目录> [--bind <地址>]   生成 Caddyfile
   lanpanel.py targets <表.json>              列出 IP<TAB>端口, 供防火墙白名单使用
 """
@@ -281,6 +284,45 @@ def legacy_tls_panels(cfg):
     return [p["name"] for p in cfg.get("panels", []) if isinstance(p, dict) and p.get("legacy_tls")]
 
 
+def add_panel(cfg, panel):
+    """返回**新的**面板表(不改原对象, 不写盘)。
+
+    与 cidrgen.py 同一个规矩: 这里只从现有内容生成候选内容, 落盘、校验、观察、回滚全交给
+    pdgtx。于是"改到一半失败"这种状态不存在 —— 要么整张新表生效, 要么原样不动。
+
+    候选**整体**过一次校验, 不只校验新增那条: 新面板可能与既有面板撞 name 或 host, 那种
+    冲突只有把整张表放在一起看才发现得了。
+    """
+    panels = list(cfg.get("panels", []))
+    panels.append(panel)
+    cand = dict(cfg)
+    cand["panels"] = panels
+    errs = validate(cand)
+    if errs:
+        raise PanelError("加进去之后这张表就不合法了, 拒绝改动:\n" + "\n".join("  " + e for e in errs))
+    return cand
+
+
+def rm_panel(cfg, name):
+    """按 name 删一条。删不到就报错而不是静默成功 —— "删了个不存在的东西"和"删掉了"
+    在事后看起来一模一样, 而用户以为面板已经没了。"""
+    panels = list(cfg.get("panels", []))
+    left = [p for p in panels if not (isinstance(p, dict) and p.get("name") == name)]
+    if len(left) == len(panels):
+        have = [p.get("name") for p in panels if isinstance(p, dict)]
+        raise PanelError("没有名叫 %r 的面板。现有: %s"
+                         % (name, ", ".join(have) if have else "(一个都没有)"))
+    cand = dict(cfg)
+    cand["panels"] = left
+    return cand
+
+
+def dumps(cfg):
+    """落盘用的文本。固定 indent 与 key 顺序 —— 事务要比对 before/after, 格式抖动会让
+    "没改内容"的一次操作看起来像改过。"""
+    return json.dumps(cfg, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+
+
 def load(path):
     with open(path, encoding="utf-8") as f:
         return json.load(f)
@@ -302,6 +344,61 @@ def main(argv):
         for e in errs:
             print(e)
         return 2 if errs else 0
+
+    if mode == "add":
+        # lanpanel.py add <表> --name x --host y --target z [--insecure|--no-insecure]
+        #                     [--rewrite-location] [--fix-referer] [--legacy-tls] [--entry-query q]
+        panel, rest = {}, argv[3:]
+        flags = {"--rewrite-location": "rewrite_location", "--fix-referer": "fix_referer",
+                 "--legacy-tls": "legacy_tls"}
+        while rest:
+            a = rest[0]
+            if a in ("--name", "--host", "--target", "--entry-query") and len(rest) > 1:
+                panel[a[2:].replace("-", "_")] = rest[1]; rest = rest[2:]
+            elif a == "--insecure":
+                panel["insecure_upstream"] = True; rest = rest[1:]
+            elif a == "--no-insecure":
+                panel["insecure_upstream"] = False; rest = rest[1:]
+            elif a in flags:
+                panel[flags[a]] = True; rest = rest[1:]
+            else:
+                print("认不出的参数: %s" % a)
+                return 3
+        try:
+            sys.stdout.write(dumps(add_panel(cfg, panel)))
+        except PanelError as e:
+            print(str(e))
+            return 2
+        return 0
+
+    if mode == "rm":
+        if len(argv) < 4:
+            print("rm 要给面板名")
+            return 3
+        try:
+            sys.stdout.write(dumps(rm_panel(cfg, argv[3])))
+        except PanelError as e:
+            print(str(e))
+            return 2
+        return 0
+
+    if mode == "list":
+        panels = cfg.get("panels", [])
+        if not panels:
+            print("(还没有面板)")
+            return 0
+        for p in panels:
+            if not isinstance(p, dict):
+                continue
+            marks = [k for k in ("rewrite_location", "fix_referer", "legacy_tls") if p.get(k)]
+            if p.get("insecure_upstream"):
+                marks.append("不校验上游证书")
+            if p.get("entry_query"):
+                marks.append("入口参数")
+            print("%-12s %-34s → %s%s"
+                  % (p.get("name"), p.get("host"), p.get("target"),
+                     ("   [" + ", ".join(marks) + "]") if marks else ""))
+        return 0
 
     if mode == "targets":
         for ip, port in targets(cfg):

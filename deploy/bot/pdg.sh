@@ -2215,6 +2215,7 @@ menu(){
     echo " 12) 识别内网卡段"
     echo " 13) 卸载"
     echo "  s) SSH 来源限制 (可选: 只允许经 Tailscale 登录)"
+    echo "  l) 内网面板 (可选: 手机零 App 访问家里的 Web 面板)"
     echo "  0) 退出"
     echo "  下次打开本菜单命令: pdg"
     printf "选择: "
@@ -2234,6 +2235,9 @@ menu(){
       11) cmd_report;;
       12) cmd_detect_cidr;;
       s|ssh) cmd_ssh_source "$(read -rp "  [status|tailnet|any|confirm] (回车=status): " a; echo "${a:-status}")";;
+      l|lan) read -rp "  [status|list|check|routes|add|rm] (回车=status): " a
+         # shellcheck disable=SC2086  # 参数要按空白拆开传给子命令, 这里是有意为之
+         cmd_lan ${a:-status};;
       13) read -rp "卸载: 留空取消 / yes 仅卸载 / purge 连配置一起删: " x
          case "$x" in yes) cmd_uninstall;; purge) cmd_uninstall --purge;; *) echo "已取消";; esac;;
       0|q) exit 0;;
@@ -4844,6 +4848,185 @@ _ssh_revert_arm(){              # 起自动回退定时器
 _ssh_revert_disarm(){ systemctl stop "$_SSH_REVERT_UNIT.timer" >/dev/null 2>&1 || true
                       systemctl reset-failed "$_SSH_REVERT_UNIT" >/dev/null 2>&1 || true; }
 
+# ══ 内网面板(方案 B) ═════════════════════════════════════════════════════════
+# 手机零 App 访问家里的内网面板: 手机 →(SIM)→ 网关 → tailnet → 家里的设备。
+# 设计与三道门见 docs/design-lan-panels.md。这里是面板表的增删查与门一的判定入口;
+# 反代与证书的生命周期另见 `pdg lan enable/disable`。
+LAN_TABLE_PATH="${PDG_LAN_TABLE:-/etc/privdns-gateway/lan-panels.json}"
+
+# 面板表的**当前内容**(不存在则给一张空表)。给空表而不是报错: 第一次 add 之前它本来
+# 就不该存在, 让用户先手动建一个空 JSON 是没有道理的仪式。
+_lan_cur(){
+  if [[ -s "$LAN_TABLE_PATH" ]]; then cat "$LAN_TABLE_PATH"
+  else printf '{\n  "panels": []\n}\n'; fi
+}
+
+# 一笔事务改面板表。骨架与 _pdg_cidr_transact 相同 —— 候选由 lanpanel.py 生成(不写盘),
+# 落盘、校验、观察、回滚全交给 pdgtx。
+#   $1 = 事务 op 名(进台账, 事后能看出这笔是谁发起的)
+#   $2.. = 传给 lanpanel.py 的子命令与参数
+_lan_transact(){
+  local op="$1"; shift
+  local mod txm wd txid sha rc=0
+  mod="$(_pdg_module lanpanel.py)" || { c_y "❌ 找不到 lanpanel.py, 未改动任何文件。"; return 1; }
+  txm="$(_pdg_module pdgtx.py)"    || { c_y "❌ 找不到 pdgtx.py(事务核心缺失), 未改动任何文件。"; return 1; }
+
+  local pend; pend="$(python3 "$txm" pending 2>/dev/null)"
+  if [[ -n "$pend" ]]; then
+    c_y "⛔ 有未完成的配置事务, 本次拒绝执行(未改动任何文件):"
+    printf '%s\n' "$pend" | sed 's/^/    /'
+    c_y "   请先 sudo pdg tx show <id> 查看, 再 sudo pdg tx recover <id> 收尾。"
+    return 1
+  fi
+
+  wd="$(mktemp -d)" || { c_y "❌ 无法创建临时目录"; return 1; }
+  _lan_cur > "$wd/cur.json"
+
+  # 先在候选上跑一遍, 不合法就在**碰事务之前**停下 —— 开了事务再失败要多一次 abort,
+  # 而失败原因(表不合法)与事务毫无关系。
+  if ! python3 "$mod" "$@" "$wd/cur.json" > "$wd/new.json" 2>"$wd/err"; then
+    c_y "❌ 拒绝改动(未改动任何文件):"
+    [[ -s "$wd/err" ]] && sed 's/^/    /' "$wd/err"
+    [[ -s "$wd/new.json" ]] && sed 's/^/    /' "$wd/new.json"
+    rm -rf "$wd"; return 1
+  fi
+
+  txid="$(python3 "$txm" new --source cli --op "$op" 2>"$wd/err")" || {
+    c_y "❌ 无法开始配置事务: $(tr -d '\n' < "$wd/err")"; rm -rf "$wd"; return 1; }
+
+  # 前置条件: 生成候选时表是什么样。不存在用 "-" 表示 —— 第一次 add 走的正是这条路。
+  if [[ -s "$LAN_TABLE_PATH" ]]; then
+    if ! python3 "$txm" read --target lan_panels > "$wd/raw" 2>"$wd/err"; then
+      c_y "❌ 读不到面板表: $(tr -d '\n' < "$wd/err") → 未改动任何文件。"
+      python3 "$txm" abort "$txid" >/dev/null 2>&1 || true; rm -rf "$wd"; return 1
+    fi
+    sha="$(head -1 "$wd/raw")"
+  else
+    sha="-"
+  fi
+
+  if ! python3 "$txm" stage --tx "$txid" --target lan_panels --file "$wd/new.json" --expect "$sha" 2>"$wd/err"; then
+    c_y "❌ 暂存候选失败: $(tr -d '\n' < "$wd/err") → 未改动任何文件。"
+    python3 "$txm" abort "$txid" >/dev/null 2>&1 || true; rm -rf "$wd"; return 1
+  fi
+
+  local out; out="$(python3 "$txm" apply --tx "$txid" 2>"$wd/err")"; rc=$?
+  if [[ "$rc" == 0 ]]; then rm -rf "$wd"; return 0; fi
+  case "$rc" in
+    4) c_y "⛔ 已有配置操作在执行(锁被占用), 本次未改动任何文件。";;
+    5) c_y "⛔ 拒绝执行(未改动任何文件):"; [[ -s "$wd/err" ]] && sed 's/^/    /' "$wd/err";;
+    *) c_y "❌ 面板表变更失败, 已按 before-image 回滚:"
+       [[ -s "$wd/err" ]] && sed 's/^/    /' "$wd/err"
+       [[ -n "$out" ]] && printf '%s\n' "$out" | sed 's/^/    /';;
+  esac
+  rm -rf "$wd"; return 1
+}
+
+_lan_list(){
+  local mod; mod="$(_pdg_module lanpanel.py)" || { echo "找不到 lanpanel.py"; return 1; }
+  local t; t="$(mktemp)"; _lan_cur > "$t"
+  python3 "$mod" list "$t"; local rc=$?; rm -f "$t"; return $rc
+}
+
+# 门一: 判一批网段能不能接受。判据全部来自本机现状 —— 内网卡来源段取 profile.env,
+# 本机接口网段现读, 不让调用方传, 免得"传错一个参数"变成"判据看起来通过了"。
+_lan_routes(){
+  local mod; mod="$(_pdg_module lanroute.py)" || { echo "找不到 lanroute.py"; return 1; }
+  [[ $# -gt 0 ]] || { echo "用法: pdg lan routes <网段>...  (判断家里通告的子网路由能不能接受)"; return 1; }
+  local internal; internal="$(sed -n 's/^[[:space:]]*PDG_INTERNAL_CIDR=//p' "$PROFILE_ENV" 2>/dev/null | tail -1)"
+  local -a args=(judge)
+  if [[ -n "$internal" ]]; then
+    args+=(--internal "$internal")
+  else
+    # 取不到内网卡来源段 = 门一里**最要紧的那条判据跑不了**。放行与拒绝两条路上都要说,
+    # 而不是只在成功时轻描淡写提一句 —— 否则用户会拿着一个"✅ 可以接受"去接受一个
+    # 其实会把分流打烂的网段, 而那正是这道门存在的全部理由。
+    c_y "⚠️ 读不到 PDG_INTERNAL_CIDR($PROFILE_ENV) —— **与内网卡来源段相交**这条判据本次没跑。"
+    c_y "   下面的结论只覆盖了默认路由、本机接口、tailnet 自身段、环回这四条。"
+    echo
+  fi
+  local a
+  while read -r a; do [[ -n "$a" ]] && args+=(--local "$a"); done < <(
+    ip -o -4 addr show scope global 2>/dev/null | awk '{print $4}'
+    ip -o -6 addr show scope global 2>/dev/null | awk '{print $4}')
+  local out rc
+  out="$(python3 "$mod" "${args[@]}" "$@" 2>&1)"; rc=$?
+  case "$rc" in
+    0) c_g "✅ 这些网段可以接受:"; printf '  %s\n' "$@"
+       echo "   判据: 与内网卡来源段(${internal:-未配置})、本机接口网段、tailnet 自身段都不相交, 也不是默认路由。"
+       return 0;;
+    2) c_y "⛔ 有网段不能接受 —— 接受它们会让手机的分流数据面错乱, 而配置上看不出来:"
+       printf '%s\n' "$out" | while IFS=$'\t' read -r tag why; do echo "   [$tag] $why"; done
+       [[ -z "$internal" ]] && c_y "   (再说一遍: 与内网卡来源段相交那条**没跑**, 所以这份清单可能还不全)"
+       echo
+       echo "   家里那侧改小通告范围之后再来。别在本机 \`tailscale set --accept-routes\` 硬接 ——"
+       echo "   那会让上面这些后果真的发生。"
+       return 1;;
+    *) c_y "❌ 判定没跑起来: $out"; return 1;;
+  esac
+}
+
+_lan_status(){
+  echo "内网面板(方案 B)"
+  if [[ -s "$LAN_TABLE_PATH" ]]; then
+    local n; n="$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1])).get("panels",[])))' "$LAN_TABLE_PATH" 2>/dev/null || echo '?')"
+    echo "  面板表: $LAN_TABLE_PATH ($n 条)"
+    local mod; mod="$(_pdg_module lanpanel.py)" || mod=""
+    if [[ -n "$mod" ]]; then
+      if python3 "$mod" check "$LAN_TABLE_PATH" >/dev/null 2>&1; then
+        c_g "  门二(白名单映射): 通过"
+      else
+        c_y "  ⚠️ 门二: 面板表**没通过校验** —— 跑 pdg lan check 看具体哪条"
+      fi
+    fi
+  else
+    echo "  面板表: 还没有(用 pdg lan add 加第一条)"
+  fi
+  if command -v tailscale >/dev/null 2>&1 && ip -o link show tailscale0 >/dev/null 2>&1; then
+    local acc; acc="$(tailscale status --json 2>/dev/null | python3 -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit()
+r=(d.get("Self") or {}).get("AllowedIPs") or []
+print(" ".join(x for x in r if not x.startswith(("100.","fd7a:"))))' 2>/dev/null)"
+    echo "  Tailscale: 已连接${acc:+; 本机通告 $acc}"
+  else
+    c_y "  ⚠️ Tailscale 没在跑 —— 方案 B 的整条链路都要经它, 先把它装好并认证"
+  fi
+}
+
+cmd_lan(){
+  local sub="${1:-status}"; shift 2>/dev/null || true
+  case "$sub" in
+    status|"") _lan_status;;
+    list)      _lan_list;;
+    check)     local mod; mod="$(_pdg_module lanpanel.py)" || return 1
+               local t; t="$(mktemp)"; _lan_cur > "$t"
+               if python3 "$mod" check "$t"; then c_g "✅ 面板表通过门二校验"; rm -f "$t"; return 0
+               else rm -f "$t"; return 1; fi;;
+    routes)    _lan_routes "$@";;
+    add)       need_root lan
+               _lan_transact lan-add add "$@" && { c_g "✅ 已加入面板表。"; _lan_list; };;
+    rm)        need_root lan
+               [[ -n "${1:-}" ]] || { echo "用法: pdg lan rm <面板名>"; return 1; }
+               _lan_transact lan-rm rm "$1" && { c_g "✅ 已从面板表移除。"; _lan_list; };;
+    *)
+      echo "用法: pdg lan <status|list|check|routes|add|rm>"
+      echo "  status                    当前状态(面板数、门二、Tailscale)"
+      echo "  list                      面板清单"
+      echo "  check                     跑一遍门二校验"
+      echo "  routes <网段>...          门一: 判断家里通告的子网路由能不能接受"
+      echo "  add --name <短名> --host <域名> --target <http(s)://字面IP[:端口]> [选项]"
+      echo "      --insecure|--no-insecure   上游是 https 时**必须**二选一(家用设备多是自签证书,"
+      echo "                                 但默认跳过校验是错的 —— 那该由你按设备逐个确认)"
+      echo "      --rewrite-location         设备把自己的局域网 IP 写进跳转头时用"
+      echo "      --fix-referer              设备校验 Referer/Origin 必须是自己地址时用"
+      echo "      --legacy-tls               老设备只有 RSA 密钥交换套件(表现是 502 + handshake failure)"
+      echo "      --entry-query <q>          前后端分离的应用要在入口带的参数, 如 magicpath=xxxx"
+      echo "  rm <面板名>"
+      return 1;;
+  esac
+}
+
 cmd_ssh_source(){
   need_root ssh-source
   local sub="${1:-status}"
@@ -5126,6 +5309,7 @@ case "${1:-menu}" in
   platform)      shift || true; cmd_platform "$@";;
   hijack-mode)   shift || true; cmd_hijack_mode "$@";;
   ssh-source)    shift || true; cmd_ssh_source "$@";;
+  lan)           shift || true; cmd_lan "$@";;
   link)          shift || true; cmd_link "$@";;
   uninstall|rm)  shift || true; cmd_uninstall "$@";;
   rescue)        shift || true; cmd_rescue "$@";;

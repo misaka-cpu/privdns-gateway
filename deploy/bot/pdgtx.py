@@ -135,6 +135,10 @@ _STATIC = {
     # 救援平面的运行状态(紧急默认出口的原值等)。放 /var/lib 而不是 /etc: 它是运行态不是配置。
     # 0600 —— 里面有出口 tag; 它们不是凭据, 但也没有任何理由让别的用户读到。
     "rescue_state":   ("/var/lib/privdns-gateway/rescue-state.json", 0o600, False, ("json_any",)),
+    # 内网面板表(方案 B)。0600 —— 里面是用户家里的内网 IP 与设备端口, 那不是凭据, 但也
+    # 没有任何理由让别的用户读到。反代配置与出站白名单都由它派生, 所以它是**单一真源**:
+    # 手改派生出来的那两份迟早与它不一致, 而不一致的方向恰恰是"防火墙按表放行、反代连别处"。
+    "lan_panels":     ("/etc/privdns-gateway/lan-panels.json", 0o600, False, ("json_any",)),
 }
 _MOSDNS_RULE_RE = re.compile(r"^[A-Za-z0-9_!.-]+\.txt$")
 _RULESET_RE = re.compile(r"^[A-Za-z0-9_.-]+\.(json|mrs)$")
@@ -190,6 +194,10 @@ _TARGET_ACTIONS = {
     # 纯记录与纯产物: 没有任何运行中的服务读它们。动作**显式写成空**而不是不写 ——
     # actions_for_targets 对没登记的目标是 fail-closed, 靠"遗漏"表达"不需要动作"会在
     # 恢复时变成一次拒绝, 而那看起来像是恢复功能坏了。
+    # 面板表是源, 没有任何运行中的服务读它 —— 读的是由它派生出来的反代配置与 nft 白名单。
+    # 动作**显式写成空**而不是不写: actions_for_targets 对没登记的目标 fail-closed,
+    # 靠"遗漏"表达"不需要动作"会在恢复时变成一次拒绝, 而那看起来像恢复功能坏了。
+    "lan_panels": (),
     "ios_profile_state": (),
     "ios_profile_current": (),
     "ios_profile_previous": (),
