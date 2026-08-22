@@ -4884,7 +4884,11 @@ _lan_transact(){
 
   # 先在候选上跑一遍, 不合法就在**碰事务之前**停下 —— 开了事务再失败要多一次 abort,
   # 而失败原因(表不合法)与事务毫无关系。
-  if ! python3 "$mod" "$@" "$wd/cur.json" > "$wd/new.json" 2>"$wd/err"; then
+  # lanpanel.py 的契约是 `<子命令> <表路径> [选项...]` —— 表路径在**第二位**, 不是最后。
+  # 拼在最后会让 --name 被当成表路径, 报出来的错是"读不了面板表 --name", 与真正的原因
+  # 隔着一层。
+  local sub="$1"; shift
+  if ! python3 "$mod" "$sub" "$wd/cur.json" "$@" > "$wd/new.json" 2>"$wd/err"; then
     c_y "❌ 拒绝改动(未改动任何文件):"
     [[ -s "$wd/err" ]] && sed 's/^/    /' "$wd/err"
     [[ -s "$wd/new.json" ]] && sed 's/^/    /' "$wd/new.json"
