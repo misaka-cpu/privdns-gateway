@@ -1024,7 +1024,13 @@ def _render_mihomo_file():
     tls_ports = [443] if _platform() == "ios" else None
     cfg, meta = sb2mihomo.singbox_to_mihomo(
         model, redir_port=MIHOMO_REDIR, rulesets=_mihomo_rulesets(),
-        mitm_domains=_mitm_domains(), mitm_port=MITM_PORT, tls_ports=tls_ports, **_panel_render_args(model))
+        mitm_domains=_mitm_domains(), mitm_port=MITM_PORT, tls_ports=tls_ports,
+        # 这条路**直接调 sb2mihomo**, 不经 _render_mihomo_bytes —— 于是每加一个渲染入参
+        # 都要在两处各写一遍。漏了一处的后果不是报错: 这条路渲染出来的配置会静默少掉那块
+        # 能力(本轮就是面板路由全丢, 而事务那条路好好的)。
+        # tests/test-render-shared.py 有一条守卫盯着两条路的产出必须逐字节相同。
+        lan_domains=mihomorender.read_lan_domains(LAN_TABLE_FILE),
+        **_panel_render_args(model))
     _write_mihomo(cfg)
     return meta
 

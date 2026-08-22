@@ -5228,8 +5228,7 @@ _lan_enable(){
   if systemctl is-active --quiet pdg-lan; then
     _profile_set PDG_LAN_ENABLED 1 || c_y "⚠️ profile.env 写入失败, 启用意图未持久化。"
     c_g "✅ 内网面板已启用。反代监听 127.0.0.1:443, 出站白名单已按面板表加载。"
-    echo "   还差最后一步: 让 mosdns 把这些域名劫持到网关、mihomo 把它们指到本机反代。"
-    echo "   现在直接从手机访问还不通 —— 这一段见 pdg lan wire(尚未实现)。"
+    _lan_wire && c_g "   DNS 劫持集与 mihomo 分流已同步 —— 手机侧现在应该能打开了。"
   else
     c_y "❌ pdg-lan 没起来。最近的日志:"
     journalctl -u pdg-lan -n 15 --no-pager 2>/dev/null | sed 's/^/    /'
@@ -5287,6 +5286,119 @@ _lan_purge(){
   return 0
 }
 
+# ── mosdns 侧: 让手机把面板域名解析到网关 ─────────────────────────────────────
+# 少了这一段, 手机查面板域名拿到的是 NXDOMAIN(那些域名没有公网 A 记录), 前面整条链路
+# 一次都不会被触发 —— 反代跑得好好的, 面板就是打不开, 而哪里都不报错。
+LAN_HIJACK_FILE="/etc/mosdns/rules/lan_hijack.txt"
+
+# 一次性迁移: 把 lan_hijack.txt 挂进现有的**明确代理集**。
+#
+# 为什么复用 explicit_proxy 而不是另起一条序列: 面板域名的 DNS 行为与"明确指到出口的
+# 域名"完全一样 —— 抑制 AAAA/HTTPS、A 记录劫持到网关, 剩下的交给 mihomo 按 SNI 分流。
+# 另造一条一模一样的序列只会多一处要同步的地方。
+#
+# 幂等; 只认本项目的标准形态; 备份 → 生成 → 校验 → 失败还原。$1 可指定文件(供测试)。
+# shellcheck disable=SC2120
+migrate_mosdns_lan(){
+  local f="${1:-/etc/mosdns/config.yaml}"
+  [[ -f "$f" ]] || return 0
+  grep -q 'lan_hijack.txt' "$f" && return 0                      # 已挂 → 幂等退出
+  grep -q 'tag: explicit_proxy' "$f" || return 0                 # 非标准形态 → 不动(交 doctor)
+  local rdir; rdir="$(grep -oE '"/[^"]*/custom_hijack\.txt"' "$f" | head -1 | tr -d '"')"
+  rdir="$(dirname "$rdir" 2>/dev/null)"; [[ -n "$rdir" && "$rdir" != "." ]] || rdir="/etc/mosdns/rules"
+  install -d -m755 "$rdir" 2>/dev/null || true
+  [[ -e "$rdir/lan_hijack.txt" ]] || : > "$rdir/lan_hijack.txt"  # 空集 = 休眠, 零影响
+  local bak; bak="$f.prelan.$(date +%s)"
+  if ! cp -a "$f" "$bak" 2>/dev/null || ! cmp -s "$f" "$bak"; then
+    c_y "  [面板迁移] 备份失败(磁盘满?), 中止、不动现网。"; rm -f "$bak" 2>/dev/null; return 0
+  fi
+  if ! python3 - "$f" "$rdir" <<'PY'
+import re, sys
+f, rdir = sys.argv[1], sys.argv[2]
+s = open(f, encoding="utf-8").read()
+# 只改 explicit_proxy 那一条 domain_set 的 files 列表。按 tag 定位再在其后找最近的 files,
+# 不用全局正则 —— 配置里有好几个 domain_set, 改错一个的后果是把面板域名塞进 CN 直连集。
+i = s.find("- tag: explicit_proxy")
+assert i >= 0, "找不到 explicit_proxy"
+m = re.compile(r"args:\s*\{\s*files:\s*\[(.*?)\]\s*\}").search(s, i)
+assert m, "explicit_proxy 之后找不到 files 列表"
+inner = m.group(1)
+assert "lan_hijack.txt" not in inner, "已经在里面了"
+new = inner.rstrip() + ',"%s/lan_hijack.txt"' % rdir
+out = s[:m.start(1)] + new + s[m.end(1):]
+open(f, "w", encoding="utf-8").write(out)
+PY
+  then
+    c_y "  [面板迁移] 注入失败, 已还原。"; cp -a "$bak" "$f"; rm -f "$bak"; return 0
+  fi
+  if command -v mosdns >/dev/null 2>&1 && ! mosdns start -d "$(dirname "$f")" -c "$f" --test 2>/dev/null; then
+    : # mosdns 没有 --test 子命令时跳过静态校验, 下面的重启才是真判据
+  fi
+  if systemctl is-active --quiet mosdns 2>/dev/null; then
+    systemctl restart mosdns 2>/dev/null
+    sleep 1
+    if ! systemctl is-active --quiet mosdns; then
+      c_y "  [面板迁移] mosdns 重启失败 → 已还原配置并重启。"
+      cp -a "$bak" "$f"; systemctl restart mosdns 2>/dev/null; rm -f "$bak"; return 1
+    fi
+  fi
+  rm -f "$bak"
+  c_g "  mosdns 已挂上面板劫持集(空文件 = 休眠, 零影响)。"
+}
+
+# 把面板域名写进劫持集 —— 走事务(mosdns_rule:lan_hijack.txt 是现成的动态目标, 自带
+# restart:mosdns), 于是"写了一半 mosdns 起不来"这种状态不存在。
+_lan_write_hijack(){
+  local txm wd txid sha rc=0
+  txm="$(_pdg_module pdgtx.py)" || { c_y "❌ 找不到 pdgtx.py"; return 1; }
+  wd="$(mktemp -d)" || return 1
+  # 内容: 一行一个域名。mosdns 的 domain_set 默认按域名后缀匹配, 与 custom_hijack.txt 同形。
+  _lan_hosts > "$wd/new.txt"
+  # 判据是**存在与否**, 不是"非空"。迁移那一步会先建一个空文件(休眠), `-s` 对它为假,
+  # 于是会传出"文件不存在"的 `-` —— 而事务读到的是一个存在的空文件, 前置条件当场不符,
+  # 报出来的是 PRECONDITION_FAILED, 与真正的原因(判据用错)隔着一层。
+  if [[ -e "$LAN_HIJACK_FILE" ]]; then
+    if python3 "$txm" read --target "mosdns_rule:lan_hijack.txt" > "$wd/raw" 2>"$wd/err"; then
+      sha="$(head -1 "$wd/raw")"
+    else
+      c_y "❌ 读不到劫持集: $(tr -d '\n' < "$wd/err")"; rm -rf "$wd"; return 1
+    fi
+  else
+    sha="-"
+  fi
+  txid="$(python3 "$txm" new --source cli --op lan-hijack 2>"$wd/err")" || {
+    c_y "❌ 无法开始事务: $(tr -d '\n' < "$wd/err")"; rm -rf "$wd"; return 1; }
+  if ! python3 "$txm" stage --tx "$txid" --target "mosdns_rule:lan_hijack.txt" \
+        --file "$wd/new.txt" --expect "$sha" 2>"$wd/err"; then
+    c_y "❌ 暂存劫持集失败: $(tr -d '\n' < "$wd/err")"
+    python3 "$txm" abort "$txid" >/dev/null 2>&1 || true; rm -rf "$wd"; return 1
+  fi
+  python3 "$txm" apply --tx "$txid" >/dev/null 2>"$wd/err"; rc=$?
+  if [[ "$rc" != 0 ]]; then
+    c_y "❌ 劫持集落盘失败(已回滚): $(tr -d '\n' < "$wd/err")"; rm -rf "$wd"; return 1
+  fi
+  rm -rf "$wd"
+}
+
+# 重渲 mihomo 配置 —— 面板域名变了, 分流规则与 hosts: 段都要跟着变。
+_lan_rerender_mihomo(){
+  if ! ( cd /opt/pdg-bot && python3 -c 'import sys;sys.path.insert(0,"/opt/pdg-bot");import bot; bot._render_mihomo_file()' ) >/dev/null 2>&1; then
+    c_y "⚠️ mihomo 配置重渲失败 —— 面板域名还没进分流规则, 手机侧仍打不开。"
+    c_y "   跑 sudo pdg doctor 看 mihomo 配置那一项。"
+    return 1
+  fi
+  systemctl restart mihomo 2>/dev/null || true
+}
+
+# 手机侧那一整段: 迁移(一次性)→ 写劫持集 → 重渲分流。三步任一失败都要说清楚卡在哪 ——
+# 半通的状态(DNS 劫持了但 mihomo 不认路由, 或反过来)从表面上看都是"面板打不开"。
+_lan_wire(){
+  migrate_mosdns_lan || return 1
+  _lan_write_hijack || { c_y "   卡在: 写 DNS 劫持集。手机会拿到 NXDOMAIN, 整条链路不会被触发。"; return 1; }
+  _lan_rerender_mihomo || { c_y "   卡在: 重渲 mihomo 分流。DNS 已劫持到网关, 但 mihomo 不认这些域名 —— 手机会连上网关然后被按默认规则处理。"; return 1; }
+  return 0
+}
+
 cmd_lan(){
   local sub="${1:-status}"; shift 2>/dev/null || true
   case "$sub" in
@@ -5305,7 +5417,11 @@ cmd_lan(){
     enable)    _lan_enable;;
     disable)   _lan_disable;;
     cert)      need_root lan; _lan_cert "${1:-}";;
-    render)    need_root lan; _lan_render && c_g "✅ 反代配置与出站白名单已按面板表重新生成。";;
+    render)    need_root lan
+               _lan_render || return 1
+               c_g "✅ 反代配置与出站白名单已按面板表重新生成。"
+               _lan_wire && c_g "✅ DNS 劫持集与 mihomo 分流已同步。";;
+    wire)      need_root lan; _lan_wire && c_g "✅ DNS 劫持集与 mihomo 分流已同步。";;
     purge)     _lan_purge "${1:-}";;
     *)
       echo "用法: pdg lan <status|list|check|routes|add|rm>"
@@ -5323,7 +5439,8 @@ cmd_lan(){
       echo "  rm <面板名>"
       echo "  cert <dns插件名>          DNS-01 签发(凭据放 /etc/privdns-gateway/lan-dns.env, 600)"
       echo "  enable / disable          启用/停用反代"
-      echo "  render                    面板表改过之后重新生成反代配置与出站白名单"
+      echo "  render                    面板表改过之后重新生成全部派生物(反代/白名单/DNS/分流)"
+      echo "  wire                      只同步 DNS 劫持集与 mihomo 分流(反代配置不动)"
       echo "  purge [--keep-table]      连配置、证书、DNS 凭据、caddy 一起清掉"
       return 1;;
   esac

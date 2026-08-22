@@ -92,4 +92,42 @@ assert alt["hosts"] == {d: "100.64.0.5" for d in LAN}
 # ── ⑦ 产出仍是合法 JSON/YAML 可序列化 ──────────────────────────────────────
 json.dumps(cfg)
 
+# ── ⑧ 守卫: 两条渲染路径都必须传环境入参 ───────────────────────────────────
+# bot.py 里有**两条**渲染路径:
+#   · _render_mihomo_bytes → mihomorender.render_bytes(事务用)
+#   · _render_mihomo_file  → **直接调** sb2mihomo.singbox_to_mihomo(CLI 用)
+# 每加一个环境入参都要在两处各写一遍。漏了一处不会报错 —— 那条路渲染出来的配置会静默
+# 少掉那块能力。本轮就踩了: 面板路由在事务那条路上好好的, 从 CLI 重渲出来的配置里一条
+# 都没有, 而两边都"成功"。
+#
+# 这条守卫按**源码**判(AST), 不按运行结果: 运行结果要造齐整套环境才测得到, 而源码里
+# "有没有把这个参数传下去"是确定的。
+import ast
+
+ENV_KWARGS = {"mitm_domains", "lan_domains"}
+RENDER_CALLS = {"singbox_to_mihomo", "render_bytes"}
+
+for src in ("deploy/bot/pdg-bot.py", "deploy/bot/mihomorender.py"):
+    tree = ast.parse(open(Path(__file__).resolve().parents[1] / src, encoding="utf-8").read())
+    seen = 0
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        fname = getattr(node.func, "attr", None) or getattr(node.func, "id", None)
+        if fname not in RENDER_CALLS:
+            continue
+        # 定义处不算(那是 def, 不是 call); 只看真正的调用
+        kw = {k.arg for k in node.keywords if k.arg}
+        # **不能因为带了 `**kwargs` 就跳过**。第一版守卫就是这么写的, 结果它恰好放过了
+        # 本轮那个 bug —— 出问题的那处调用正好带着 `**_panel_render_args(model)`。
+        # 一个会跳过目标场景的守卫比没有守卫更糟: 它让人以为这一类问题已经被盯住了。
+        # 环境入参一律要求**显式写出来**; 真有哪天要从 ** 里传, 那次改动本来就该看这条断言。
+        missing = ENV_KWARGS - kw
+        assert not missing, (
+            "%s 第 %d 行调用 %s 时漏了环境入参 %s —— 这条渲染路径产出的配置会"
+            "静默少掉那块能力, 而调用方拿到的是成功。"
+            % (src, node.lineno, fname, sorted(missing)))
+        seen += 1
+    assert seen >= 1, "%s 里没找到任何渲染调用 —— 守卫本身失效了(重构改了函数名?)" % src
+
 print("test-lan-wire.py: OK")
