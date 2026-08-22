@@ -160,12 +160,19 @@ try:
         # 这两个是 migrate_firewall_template_sync 现在的依赖(SSH 来源判据)。漏抽的话它们
         # 返回 127, 同步判成"形态认不出"直接跳过并 return 0 —— 于是第六、七节注入的
         # 失败根本走不到, 断言看起来像产品缺陷, 其实是夹具少抽了两个函数。
+        # 主防火墙加载走 _nft_apply_main(它顺带把内网面板的白名单补回内核)。
+        # **抽取清单要跟着依赖走** —— 少抽一个的后果不是报错, 而是被测函数里那次调用
+        # 静默失败, 于是同步看起来是 no-op, 而失败信息指向别处。
+        'eval "$(sed -n "/^_nft_apply_main()/,/^}/p" %s/deploy/bot/pdg.sh)"; '
+        'eval "$(sed -n "/^_lan_nft_reapply()/,/^}/p" %s/deploy/bot/pdg.sh)"; '
         'eval "$(sed -n "/^_fw_tailnet_direct()/,/^}/p" %s/deploy/bot/pdg.sh)"; '
         'eval "$(sed -n "/^_fw_ssh_match()/,/^}/p" %s/deploy/bot/pdg.sh)"; '
         'eval "$(sed -n "/^_fw_live_has_template_invariants()/,/^}/p" %s/deploy/bot/pdg.sh)"; '
         'eval "$(sed -n "/^migrate_firewall_template_sync()/,/^}/p" %s/deploy/bot/pdg.sh)"; '
         'migrate_firewall_template_sync %s; echo "rc=$?"'
-        % (ROOT, SUDO, NS, ROOT, ROOT, ROOT, ROOT, ROOT, conf))   # 两个 ROOT 对应新加的两行 eval
+        # ROOT 的个数必须与上面 eval 行数一致 —— 少一个 shell 会拿到字面 "%s" 当路径,
+      # sed 读不到文件、抽出空串、函数未定义, 而失败信息指向别处。
+      % (ROOT, SUDO, NS, ROOT, ROOT, ROOT, ROOT, ROOT, ROOT, ROOT, conf))
     fn = subprocess.run(SYNC_CMD, shell=True, capture_output=True, text=True, executable="/bin/bash", env=env)
     rc = re.search(r"rc=(\d+)", fn.stdout or "")
     rc = int(rc.group(1)) if rc else -1

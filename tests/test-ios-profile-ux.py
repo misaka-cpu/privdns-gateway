@@ -538,6 +538,11 @@ for _name, _body in (
 HARNESS_CH = r"""
 set -u
 sed -n '/^_ios_offer_download()/,/^}/p' deploy/bot/pdg.sh > "$CH_DIR/fn.sh"
+# 收尾还原走 _nft_apply_main(它顺带把内网面板的白名单补回内核)。**抽取清单要跟着依赖走**
+# —— 漏了它, 那次还原调到一个未定义的名字, nft 日志里就没有 `-f /etc/nftables.conf`,
+# 断言看起来像"没还原防火墙"这个产品缺陷, 其实是夹具少抽了一个函数。
+sed -n '/^_nft_apply_main()/,/^}/p'  deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
+sed -n '/^_lan_nft_reapply()/,/^}/p' deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 grep -q 'http.server' "$CH_DIR/fn.sh" || { echo "EXTRACT-FAIL"; exit 9; }
 c_g(){ echo "$*"; }; c_y(){ echo "$*"; }
 # shellcheck source=/dev/null
