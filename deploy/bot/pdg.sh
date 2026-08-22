@@ -5122,7 +5122,7 @@ _lan_cert(){
     echo "    先在主域下给每个面板加一条 CNAME:"
     echo "      _acme-challenge.<面板域名>  CNAME  <面板域名>.<委派zone>"
     echo "    然后 token 只需要能改**委派 zone**, 不再需要能改主域 —— 于是一台被拿下的"
-    echo "    网关**签不了你自己的 DoT 域名**, 风险从"权限升级"降回"多一个凭据"。"
+    echo "    网关**签不了你自己的 DoT 域名** —— 风险从权限升级降回只是多一个凭据。"
     echo "    例: pdg lan cert dns_cf acme-deleg.example.net"; return 1; }
   [[ -s "$LAN_DNS_ENV" ]] || { c_y "❌ 缺 $LAN_DNS_ENV —— DNS 服务商的凭据要先放好(600)。"; return 1; }
   local mode; mode="$(stat -c %a "$LAN_DNS_ENV" 2>/dev/null)"
