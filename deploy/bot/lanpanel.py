@@ -20,6 +20,7 @@
   lanpanel.py zone-risk <表.json> <DoT域名>  风险②: 面板域名与 DoT 是否同 zone
   lanpanel.py render  <表.json> --certs <目录> [--bind <地址>]   生成 Caddyfile
   lanpanel.py targets <表.json>              列出 IP<TAB>端口, 供防火墙白名单使用
+  lanpanel.py nft     <表.json> --uid <用户>  门三: 出站白名单的 nft 规则
 """
 import ipaddress
 import json
@@ -441,6 +442,23 @@ def main(argv):
             print("%-12s %-34s → %s%s"
                   % (p.get("name"), p.get("host"), p.get("target"),
                      ("   [" + ", ".join(marks) + "]") if marks else ""))
+        return 0
+
+    if mode == "nft":
+        # lanpanel.py nft <表> --uid <用户名>
+        uid = None
+        rest = argv[3:]
+        while rest:
+            if rest[0] == "--uid" and len(rest) > 1:
+                uid, rest = rest[1], rest[2:]
+            else:
+                print("认不出的参数: %s" % rest[0]); return 3
+        if not uid:
+            print("nft 要 --uid <运行反代的用户名>"); return 3
+        try:
+            sys.stdout.write(render_nft(cfg, uid))
+        except PanelError as e:
+            print(str(e)); return 2
         return 0
 
     if mode == "zone-risk":

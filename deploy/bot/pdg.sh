@@ -5036,6 +5036,257 @@ print(" ".join(x for x in r if not x.startswith(("100.","fd7a:"))))' 2>/dev/null
   fi
 }
 
+LAN_USER="pdg-lan"
+# 反代以 pdg-lan 身份跑, 它要读的东西全放这里(750 root:pdg-lan)。
+# **不放 /etc/privdns-gateway/** —— 那个目录是 700 root:root, 里面有 profile.env 与
+# DNS API 凭据; 为了让反代读一份配置就把它开出去是不划算的交换。而且只给文件 640 也没用:
+# 进不去父目录一样 permission denied, 而报错显示的是"读配置失败"。
+LAN_ETC="/etc/pdg-lan"
+LAN_CADDYFILE="$LAN_ETC/caddy.conf"
+LAN_NFT_CONF="/etc/nftables-pdg-lan.conf"
+LAN_CERT_DIR="$LAN_ETC/certs"
+LAN_DNS_ENV="/etc/privdns-gateway/lan-dns.env"
+LAN_UNIT="/etc/systemd/system/pdg-lan.service"
+LAN_STATE_DIR="/var/lib/pdg-lan"
+ACME_HOME="/opt/pdg-acme"
+
+_lan_arch(){ case "$(dpkg --print-architecture 2>/dev/null)" in amd64) echo amd64;; arm64) echo arm64;; *) return 1;; esac; }
+
+# Caddy: 官方原版静态二进制, 钉版本 + 钉 SHA256。已经是钉死版就不重下。
+_lan_install_caddy(){
+  local arch t want
+  arch="$(_lan_arch)" || { c_y "❌ 不支持的架构: $(dpkg --print-architecture 2>/dev/null)"; return 1; }
+  # shellcheck source=lib/versions.sh
+  source "$REPO_DIR/lib/versions.sh" 2>/dev/null || { c_y "❌ 读不到 lib/versions.sh"; return 1; }
+  if [[ -x /usr/local/bin/caddy ]] && /usr/local/bin/caddy version 2>/dev/null | grep -qF "${CADDY_VER}"; then
+    echo "  Caddy 已是钉死版 $CADDY_VER"; return 0
+  fi
+  want="${PDG_SHA256[caddy-$arch]:-}"
+  [[ -n "$want" ]] || { c_y "❌ lib/versions.sh 里没有 caddy-$arch 的钉死 SHA256, 拒绝安装。"; return 1; }
+  t="$(mktemp -d)" || return 1
+  c_g "下载 Caddy $CADDY_VER ($arch)…"
+  if ! curl -fsSL --max-time 180 \
+       "https://github.com/caddyserver/caddy/releases/download/${CADDY_VER}/caddy_${CADDY_VER#v}_linux_${arch}.tar.gz" \
+       -o "$t/caddy.tgz"; then
+    c_y "❌ 下载失败"; rm -rf "$t"; return 1
+  fi
+  pdg_verify_sha256 "$t/caddy.tgz" "$want" "caddy $CADDY_VER ($arch)" || { rm -rf "$t"; return 1; }
+  tar -xzf "$t/caddy.tgz" -C "$t" caddy 2>/dev/null || { c_y "❌ 解包失败"; rm -rf "$t"; return 1; }
+  install -m755 "$t/caddy" /usr/local/bin/caddy || { rm -rf "$t"; return 1; }
+  rm -rf "$t"
+  c_g "  Caddy $CADDY_VER 已安装"
+}
+
+# acme.sh: 按 commit sha 钉。clone 之后逐字核对 —— tag 可以被移动, commit sha 不能。
+_lan_install_acme(){
+  # shellcheck source=lib/versions.sh
+  source "$REPO_DIR/lib/versions.sh" 2>/dev/null || return 1
+  if [[ -x "$ACME_HOME/acme.sh" ]] && \
+     [[ "$(git -C "$ACME_HOME" rev-parse HEAD 2>/dev/null)" == "$ACME_SH_COMMIT" ]]; then
+    echo "  acme.sh 已是钉死 commit"; return 0
+  fi
+  c_g "获取 acme.sh $ACME_SH_VER…"
+  rm -rf "$ACME_HOME"
+  git clone -q --depth 50 --branch "$ACME_SH_VER" https://github.com/acmesh-official/acme.sh "$ACME_HOME" 2>/dev/null \
+    || { c_y "❌ clone 失败"; return 1; }
+  local got; got="$(git -C "$ACME_HOME" rev-parse HEAD 2>/dev/null)"
+  if [[ "$got" != "$ACME_SH_COMMIT" ]]; then
+    # 不是"警告后继续": 对不上就说明拿到的不是我们审过的那份代码, 而这份代码接下来
+    # 要拿着你的 DNS API token 去改真实 DNS 记录。
+    c_y "❌ acme.sh commit 对不上, 拒绝使用(已删除):"
+    c_y "   期望 $ACME_SH_COMMIT"
+    c_y "   实际 ${got:-<读不出>}"
+    rm -rf "$ACME_HOME"; return 1
+  fi
+  chmod 755 "$ACME_HOME/acme.sh"
+  c_g "  acme.sh 已就位(commit 逐字核对通过)"
+}
+
+_lan_hosts(){
+  python3 -c 'import json,sys
+try: d=json.load(open(sys.argv[1]))
+except Exception: sys.exit(0)
+for p in d.get("panels",[]):
+    if isinstance(p,dict) and p.get("host"): print(p["host"])' "$LAN_TABLE_PATH" 2>/dev/null
+}
+
+# 证书: DNS-01 签发。凭据放 600 文件, 由 acme.sh 从环境读 —— 不进命令行(ps 看得见),
+# 不进日志。
+_lan_cert(){
+  local dnsapi="${1:-}"
+  [[ -n "$dnsapi" ]] || { echo "用法: pdg lan cert <acme.sh 的 DNS 插件名, 如 dns_cf>"; 
+    echo "  凭据写进 $LAN_DNS_ENV (600), 一行一个 KEY=值 —— 具体要哪些看 acme.sh 的 dnsapi 文档。"
+    echo "  例(Cloudflare): CF_Token=...   然后 pdg lan cert dns_cf"; return 1; }
+  [[ -s "$LAN_DNS_ENV" ]] || { c_y "❌ 缺 $LAN_DNS_ENV —— DNS 服务商的凭据要先放好(600)。"; return 1; }
+  local mode; mode="$(stat -c %a "$LAN_DNS_ENV" 2>/dev/null)"
+  [[ "$mode" == 600 ]] || { c_y "❌ $LAN_DNS_ENV 权限是 $mode, 应为 600 —— 里面是能改你 DNS 的凭据。"; return 1; }
+  _lan_install_acme || return 1
+  local -a doms=(); local h
+  while read -r h; do [[ -n "$h" ]] && doms+=(-d "$h"); done < <(_lan_hosts)
+  [[ ${#doms[@]} -gt 0 ]] || { c_y "❌ 面板表里一个域名都没有, 没什么可签的。"; return 1; }
+  install -d -m750 -o root -g "$LAN_USER" "$LAN_ETC" 2>/dev/null || install -d -m750 "$LAN_ETC"
+  install -d -m750 -o root -g "$LAN_USER" "$LAN_CERT_DIR" 2>/dev/null || install -d -m750 "$LAN_CERT_DIR"
+  c_g "签发证书(DNS-01, 插件 $dnsapi)…"
+  # set -a 让 EnvironmentFile 里的键成为环境变量; 用子 shell 圈住, 不污染当前进程。
+  (
+    set -a; # shellcheck disable=SC1090
+    source "$LAN_DNS_ENV"; set +a
+    "$ACME_HOME/acme.sh" --home "$ACME_HOME/data" --issue --dns "$dnsapi" \
+      "${doms[@]}" --server letsencrypt --keylength ec-256
+  ) || { c_y "❌ 签发失败 —— 看上面 acme.sh 给的原因(多半是凭据权限不足或域名不在该 zone)。"; return 1; }
+  while read -r h; do
+    [[ -n "$h" ]] || continue
+    local name; name="$(python3 -c 'import json,sys
+d=json.load(open(sys.argv[1]))
+print(next((p["name"] for p in d["panels"] if p.get("host")==sys.argv[2]), ""))' "$LAN_TABLE_PATH" "$h" 2>/dev/null)"
+    [[ -n "$name" ]] || continue
+    "$ACME_HOME/acme.sh" --home "$ACME_HOME/data" --install-cert -d "$h" --ecc \
+      --fullchain-file "$LAN_CERT_DIR/$name.crt" --key-file "$LAN_CERT_DIR/$name.key" \
+      --reloadcmd "systemctl reload pdg-lan 2>/dev/null || true" >/dev/null 2>&1 \
+      || c_y "  ⚠️ $h 的证书装不到 $LAN_CERT_DIR/$name.*"
+  done < <(_lan_hosts)
+  # 私钥给**组**读而不是 600: 反代不是 root, 它必须读得到。目录 750 root:pdg-lan 已经
+  # 把范围限在这个用户上了, 再把文件锁成 600 只会让服务起不来。
+  chown root:"$LAN_USER" "$LAN_CERT_DIR"/* 2>/dev/null || true
+  chmod 640 "$LAN_CERT_DIR"/*.key "$LAN_CERT_DIR"/*.crt 2>/dev/null || true
+  c_g "✅ 证书已就位: $LAN_CERT_DIR"
+}
+
+# 由面板表**派生**反代配置与出站白名单。两份都从同一张表来 —— 这是门三成立的前提:
+# 白名单与反代实际会连的地址不可能不一致。
+_lan_render(){
+  local mod tmpc tmpn legacy
+  mod="$(_pdg_module lanpanel.py)" || { c_y "❌ 找不到 lanpanel.py"; return 1; }
+  tmpc="$(mktemp)"; tmpn="$(mktemp)"
+  if ! python3 "$mod" render "$LAN_TABLE_PATH" --certs "$LAN_CERT_DIR" > "$tmpc" 2>"$tmpc.err"; then
+    c_y "❌ 生成反代配置失败:"; sed 's/^/    /' "$tmpc.err" "$tmpc" 2>/dev/null | head -10
+    rm -f "$tmpc" "$tmpn" "$tmpc.err"; return 1
+  fi
+  if ! python3 "$mod" nft "$LAN_TABLE_PATH" --uid "$LAN_USER" > "$tmpn" 2>"$tmpn.err"; then
+    c_y "❌ 生成出站白名单失败:"; sed 's/^/    /' "$tmpn.err" 2>/dev/null | head -10
+    rm -f "$tmpc" "$tmpn" "$tmpc.err" "$tmpn.err"; return 1
+  fi
+  # 反代配置先让 caddy 自己判一遍再落盘。落一份它读不懂的配置, 症状是服务起不来,
+  # 而那时旧配置已经被覆盖 —— 连"退回去"都没得退。
+  if [[ -x /usr/local/bin/caddy ]]; then
+    if ! /usr/local/bin/caddy validate --config "$tmpc" --adapter caddyfile >/dev/null 2>&1; then
+      c_y "❌ 生成出来的反代配置 caddy 自己判为不合法, 拒绝落盘(现有配置未动):"
+      /usr/local/bin/caddy validate --config "$tmpc" --adapter caddyfile 2>&1 | head -6 | sed 's/^/    /'
+      rm -f "$tmpc" "$tmpn" "$tmpc.err" "$tmpn.err"; return 1
+    fi
+  fi
+  install -m640 -o root -g "$LAN_USER" "$tmpc" "$LAN_CADDYFILE" 2>/dev/null || install -m644 "$tmpc" "$LAN_CADDYFILE"
+  install -m644 "$tmpn" "$LAN_NFT_CONF"
+  rm -f "$tmpc" "$tmpn" "$tmpc.err" "$tmpn.err"
+  legacy="$(python3 -c 'import importlib.util,sys
+spec=importlib.util.spec_from_file_location("lp",sys.argv[1]); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+import json; print("1" if m.legacy_tls_panels(json.load(open(sys.argv[2]))) else "")' "$mod" "$LAN_TABLE_PATH" 2>/dev/null)"
+  # shellcheck source=lib/units.sh
+  source "$REPO_DIR/lib/units.sh" 2>/dev/null || { c_y "❌ 读不到 lib/units.sh"; return 1; }
+  pdg_unit_lan_caddy "$legacy" > "$LAN_UNIT" && chmod 644 "$LAN_UNIT"
+  systemctl daemon-reload 2>/dev/null || true
+}
+
+_lan_preflight(){
+  local rc=0 h missing=""
+  [[ -s "$LAN_TABLE_PATH" ]] || { c_y "⛔ 面板表是空的 —— 先 pdg lan add 加至少一条。"; return 1; }
+  local mod; mod="$(_pdg_module lanpanel.py)" || return 1
+  python3 "$mod" check "$LAN_TABLE_PATH" || { c_y "⛔ 面板表没通过门二校验(见上), 拒绝启用。"; return 1; }
+  # Tailscale 是整条链路的必经之处。没有它, 反代起来了也连不到家里 —— 那种"服务 active
+  # 但什么都打不开"的状态最难查, 不如在这里就停下。
+  if ! command -v tailscale >/dev/null 2>&1 || ! ip -o link show tailscale0 >/dev/null 2>&1; then
+    c_y "⛔ Tailscale 没在跑 —— 方案 B 的整条链路都要经它。先装好并认证, 再回来。"
+    rc=1
+  fi
+  while read -r h; do
+    [[ -n "$h" ]] || continue
+    local name; name="$(python3 -c 'import json,sys
+d=json.load(open(sys.argv[1]))
+print(next((p["name"] for p in d["panels"] if p.get("host")==sys.argv[2]), ""))' "$LAN_TABLE_PATH" "$h" 2>/dev/null)"
+    [[ -s "$LAN_CERT_DIR/$name.crt" && -s "$LAN_CERT_DIR/$name.key" ]] || missing="$missing $h"
+  done < <(_lan_hosts)
+  if [[ -n "$missing" ]]; then
+    c_y "⛔ 这些面板还没有证书:$missing"
+    c_y "   先跑 pdg lan cert <dns插件名> 签发。反代读的是落盘的证书, 它自己不去要。"
+    rc=1
+  fi
+  _lan_zone_warn
+  return $rc
+}
+
+_lan_enable(){
+  need_root lan
+  _lan_install_caddy || return 1
+  id "$LAN_USER" >/dev/null 2>&1 || useradd -r -s /usr/sbin/nologin -d "$LAN_STATE_DIR" "$LAN_USER"
+  install -d -m750 -o "$LAN_USER" -g "$LAN_USER" "$LAN_STATE_DIR"
+  install -d -m750 -o root -g "$LAN_USER" "$LAN_ETC"
+  install -d -m750 -o root -g "$LAN_USER" "$LAN_CERT_DIR"
+  _lan_preflight || return 1
+  _lan_render || return 1
+  systemctl enable --now pdg-lan >/dev/null 2>&1
+  sleep 2
+  if systemctl is-active --quiet pdg-lan; then
+    _profile_set PDG_LAN_ENABLED 1 || c_y "⚠️ profile.env 写入失败, 启用意图未持久化。"
+    c_g "✅ 内网面板已启用。反代监听 127.0.0.1:443, 出站白名单已按面板表加载。"
+    echo "   还差最后一步: 让 mosdns 把这些域名劫持到网关、mihomo 把它们指到本机反代。"
+    echo "   现在直接从手机访问还不通 —— 这一段见 pdg lan wire(尚未实现)。"
+  else
+    c_y "❌ pdg-lan 没起来。最近的日志:"
+    journalctl -u pdg-lan -n 15 --no-pager 2>/dev/null | sed 's/^/    /'
+    c_y "   ExecStartPre 会先加载出站白名单 —— 那一步失败也会让服务起不来(这是有意的:"
+    c_y "   白名单加载不上就不该让反代跑起来)。"
+    return 1
+  fi
+}
+
+_lan_disable(){
+  need_root lan
+  systemctl disable --now pdg-lan >/dev/null 2>&1 || true
+  nft delete table inet pdglan 2>/dev/null || true
+  _profile_set PDG_LAN_ENABLED 0 || true
+  c_g "✅ 内网面板已停用(反代已停、出站白名单已撤)。"
+  echo "   保留: 面板表、证书、Caddy 二进制 —— 重新 enable 就能用。"
+  echo "   要连这些一起清干净: pdg lan purge"
+}
+
+# 连配置与凭据一起清干净。与 disable 的分界: disable 是"先停一停", purge 是"不用了"。
+#
+# 要点名说清楚删了什么, 尤其是 DNS API 凭据与 acme 账户密钥 —— 那两样删掉之后
+# 证书续期就断了, 而用户可能只是想"清理一下"。
+_lan_purge(){
+  need_root lan
+  local keep_table="${1:-}"
+  _lan_disable >/dev/null 2>&1 || true
+  systemctl disable --now pdg-lan >/dev/null 2>&1 || true
+  rm -f "$LAN_UNIT"; systemctl daemon-reload 2>/dev/null || true
+  rm -f "$LAN_NFT_CONF"
+  nft delete table inet pdglan 2>/dev/null || true
+  local removed="" had_creds=""
+  [[ -e "$LAN_DNS_ENV" || -e "$ACME_HOME" ]] && had_creds=1
+  [[ -e "$LAN_ETC" ]] && { rm -rf "$LAN_ETC"; removed="$removed 反代配置与证书($LAN_ETC)"; }
+  [[ -e "$LAN_STATE_DIR" ]] && { rm -rf "$LAN_STATE_DIR"; removed="$removed 运行态($LAN_STATE_DIR)"; }
+  [[ -e "$LAN_DNS_ENV" ]] && { rm -f "$LAN_DNS_ENV"; removed="$removed DNS-API凭据"; }
+  [[ -e "$ACME_HOME" ]] && { rm -rf "$ACME_HOME"; removed="$removed acme.sh与账户密钥"; }
+  [[ -x /usr/local/bin/caddy ]] && { rm -f /usr/local/bin/caddy; removed="$removed caddy二进制"; }
+  if [[ "$keep_table" != "--keep-table" && -e "$LAN_TABLE_PATH" ]]; then
+    rm -f "$LAN_TABLE_PATH"; removed="$removed 面板表"
+  fi
+  id "$LAN_USER" >/dev/null 2>&1 && { userdel "$LAN_USER" 2>/dev/null || true; removed="$removed 用户$LAN_USER"; }
+  _profile_set PDG_LAN_ENABLED 0 >/dev/null 2>&1 || true
+  c_g "✅ 内网面板已清除。"
+  [[ -n "$removed" ]] && echo "   删掉了:$removed"
+  # 只在**确实存在过**的时候才说删了它们。声称删掉一个本来就不在的东西, 会让人以为
+  # 自己曾经配过 DNS 凭据 —— 而下一步他会去找一个不存在的备份。
+  if [[ -n "$had_creds" ]]; then
+    c_y "   注意: DNS API 凭据与 acme 账户密钥都删了 —— 证书续期从此不再进行。"
+    c_y "   已经签出去的证书到期就失效, 重新用要再跑一遍 pdg lan cert。"
+  else
+    echo "   (本机上没有 DNS 凭据与 acme 账户, 所以没有可删的; 证书也从未由本项目签发过。)"
+  fi
+  [[ "$keep_table" == "--keep-table" ]] && echo "   面板表按你的要求留下了: $LAN_TABLE_PATH"
+  return 0
+}
+
 cmd_lan(){
   local sub="${1:-status}"; shift 2>/dev/null || true
   case "$sub" in
@@ -5051,6 +5302,11 @@ cmd_lan(){
     rm)        need_root lan
                [[ -n "${1:-}" ]] || { echo "用法: pdg lan rm <面板名>"; return 1; }
                _lan_transact lan-rm rm "$1" && { c_g "✅ 已从面板表移除。"; _lan_list; };;
+    enable)    _lan_enable;;
+    disable)   _lan_disable;;
+    cert)      need_root lan; _lan_cert "${1:-}";;
+    render)    need_root lan; _lan_render && c_g "✅ 反代配置与出站白名单已按面板表重新生成。";;
+    purge)     _lan_purge "${1:-}";;
     *)
       echo "用法: pdg lan <status|list|check|routes|add|rm>"
       echo "  status                    当前状态(面板数、门二、Tailscale)"
@@ -5065,6 +5321,10 @@ cmd_lan(){
       echo "      --legacy-tls               老设备只有 RSA 密钥交换套件(表现是 502 + handshake failure)"
       echo "      --entry-query <q>          前后端分离的应用要在入口带的参数, 如 magicpath=xxxx"
       echo "  rm <面板名>"
+      echo "  cert <dns插件名>          DNS-01 签发(凭据放 /etc/privdns-gateway/lan-dns.env, 600)"
+      echo "  enable / disable          启用/停用反代"
+      echo "  render                    面板表改过之后重新生成反代配置与出站白名单"
+      echo "  purge [--keep-table]      连配置、证书、DNS 凭据、caddy 一起清掉"
       return 1;;
   esac
 }

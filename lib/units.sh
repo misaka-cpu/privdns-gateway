@@ -39,6 +39,59 @@ WantedBy=multi-user.target
 EOF
 }
 
+# 内网面板(方案 B)的反代。$1 = 是否需要放宽 TLS 套件(1/空)。
+#
+# 三条不是可选项:
+#   ① ExecStartPre 加载出站白名单, 前缀 `+` 表示以 root 跑(主进程是 pdg-lan)。
+#      白名单那份是 fail-open 的 —— 加载不上时规则不存在而反代照跑, 于是它必须挡在
+#      启动路径上: 加载不了就别起来。这是门三能不能成立的前提, 不是加固。
+#   ② CAP_NET_BIND_SERVICE: 反代监听 127.0.0.1:443, 低端口, 而它不是 root。
+#      少了这一条的症状是"服务起不来 + permission denied", 看着像文件权限问题。
+#   ④ 反代要读的东西全在 /etc/pdg-lan/(750 root:pdg-lan), **不在** /etc/privdns-gateway/。
+#      后者是 700 root:root: 里面有 profile.env 与 DNS API 凭据, 不该为了让反代读一份
+#      配置就把它开出去。踩过 —— 文件给了 640 root:pdg-lan 仍然 permission denied,
+#      因为进不去父目录; 症状显示成"读配置失败", 与真正的原因(目录不可穿越)隔着一层。
+#      分开之后"pdg-lan 需要读什么"看一个目录就有答案。
+#
+#   ③ XDG_DATA_HOME: Caddy 默认把数据写到 $HOME/.local/share, 而系统用户没有可写的
+#      HOME —— 不指的话它会在一个谁也想不到的位置建目录, 或者直接起不来。
+#      它必须与 ReadWritePaths **同一个目录**: ProtectSystem=strict 之下别处全只读,
+#      指到 /var/lib 而只放行 /var/lib/pdg-lan 的话, Caddy 会去写 /var/lib/caddy 然后
+#      permission denied —— 症状看着像文件属主不对, 其实是 sandbox 把它挡了。
+#
+# GODEBUG=tlsrsakex=1 只在**确有面板需要**时才加(面板表里有 legacy_tls)。老设备可能只
+# 提供 AES256-GCM-SHA384(RSA 密钥交换), Go 1.22 起默认禁用, 症状是 502 + handshake
+# failure —— 看着像证书问题。但这是**全进程**的开关, 不需要就不该开: 给所有上游都放宽
+# 密钥交换, 只为了迁就其中一台。
+pdg_unit_lan_caddy(){
+  local legacy="${1:-}"
+  cat <<EOF
+[Unit]
+Description=pdg-lan (PrivDNS Gateway LAN panel reverse proxy)
+After=network-online.target nftables.service
+Wants=network-online.target
+[Service]
+User=pdg-lan
+Group=pdg-lan
+ExecStartPre=+/usr/sbin/nft -f /etc/nftables-pdg-lan.conf
+ExecStart=/usr/local/bin/caddy run --config /etc/pdg-lan/caddy.conf --adapter caddyfile
+ExecReload=/usr/local/bin/caddy reload --config /etc/pdg-lan/caddy.conf --adapter caddyfile --force
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/pdg-lan
+Environment=XDG_DATA_HOME=/var/lib/pdg-lan${legacy:+
+Environment=GODEBUG=tlsrsakex=1}
+Restart=on-failure
+RestartSec=3
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
 # 内核 svc 名 → 对应 unit 生成函数(mihomo 为唯一内核; 保留此壳以便将来扩展/调用方不改)。
 pdg_unit_for_core_svc(){
   case "$1" in
