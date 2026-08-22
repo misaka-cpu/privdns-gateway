@@ -61,6 +61,31 @@ if [[ -f "$_UN_HERE/lib/rescue.sh" ]]; then
 else
   _RESCUE_RESIDUE="找不到 lib/rescue.sh, 救援平面(凭据/状态/放行规则)未清理"
 fi
+# 内网面板(方案 B): 反代 unit、出站白名单、配置与证书、DNS API 凭据、acme 账户密钥、
+# caddy 二进制、专用用户。与救援平面同一条规矩 —— 残留要逐条报出来, 因为这里留下的是
+# **能改用户 DNS 记录的凭据**与**能签发证书的账户密钥**: 服务已经没了而凭据还在,
+# 比不卸载更糟。
+_LAN_RESIDUE=""
+_LAN_REMOVED=""
+[[ -e /etc/pdg-lan || -e /opt/pdg-acme || -e /etc/privdns-gateway/lan-dns.env \
+   || -x /usr/local/bin/caddy || -e /etc/systemd/system/pdg-lan.service ]] && _LAN_REMOVED=1
+systemctl disable --now pdg-lan 2>/dev/null || true
+systemctl reset-failed pdg-lan 2>/dev/null || true
+rm -f /etc/systemd/system/pdg-lan.service /etc/nftables-pdg-lan.conf
+[[ -n "$_UN_NFT" ]] && "$_UN_NFT" delete table inet pdglan 2>/dev/null || true
+for _lp in /etc/pdg-lan /var/lib/pdg-lan /opt/pdg-acme /etc/privdns-gateway/lan-dns.env; do
+  [[ -e "$_lp" ]] || continue
+  rm -rf "$_lp" 2>/dev/null || true
+  [[ -e "$_lp" ]] && _LAN_RESIDUE="$_LAN_RESIDUE $_lp"
+done
+rm -f /usr/local/bin/caddy 2>/dev/null || true
+[[ -e /usr/local/bin/caddy ]] && _LAN_RESIDUE="$_LAN_RESIDUE /usr/local/bin/caddy"
+if id pdg-lan >/dev/null 2>&1; then
+  userdel pdg-lan 2>/dev/null || _LAN_RESIDUE="$_LAN_RESIDUE 用户pdg-lan(删不掉,可能还有进程在跑)"
+fi
+# 面板表跟着 /etc/privdns-gateway 走(purge 模式一起删, 否则保留) —— 与 mosdns/mihomo
+# 配置同一个口径: 它是用户配置, 重装可复用。这里不单独处理。
+
 systemctl disable --now pdg-bot pdg-probe81 pdg-dotwitness mosdns mihomo pdg-mitm pdg-rules-update.timer pdg-health.timer 2>/dev/null || true
 [[ "$SB_OWNED" == 1 ]] && systemctl disable --now sing-box 2>/dev/null || true
 rm -f /etc/systemd/system/{pdg-bot,pdg-probe81,pdg-dotwitness,mosdns,mihomo,pdg-mitm,pdg-rules-update,pdg-health}.service \
@@ -156,6 +181,18 @@ if [[ -n "$_RESCUE_RESIDUE" ]]; then
 else
   echo "救援平面已完全移除(unit、凭据、状态、运行文件与 ${PDG_RESCUE_PORT} 放行规则)。"
 fi
+if [[ -z "$_LAN_RESIDUE" && -n "$_LAN_REMOVED" ]]; then
+  echo "内网面板已完全移除(反代 unit、出站白名单、配置与证书、caddy、专用用户)。"
+  # 单独点名凭据: 删证书和二进制是"卸载本来就该做的", 而删掉 DNS API token 与 acme
+  # 账户密钥意味着**证书续期从此不再进行**, 而且那两样是用户自己去服务商申请来的。
+  echo "  连同 DNS API 凭据与 acme 账户密钥一并删除 —— 已签发的证书到期即失效, 不会再续。"
+fi
+if [[ -n "$_LAN_RESIDUE" ]]; then
+  echo "⚠️  内网面板未能完全清除, 以下仍留在机器上(含 DNS API 凭据 / acme 账户密钥, 请手工删除):"
+  printf '%s\n' "$_LAN_RESIDUE" | tr ' ' '\n' | sed '/^$/d; s/^/    /'
+  _UNINSTALL_FAILED=1
+fi
+
 echo "保留: /etc/mosdns /etc/sing-box /etc/mihomo 与 Let's Encrypt 证书(配置与数据, 重装可复用)。"
 echo "已删除: /opt/pdg-bot 下的事务与救援运行模块(清单见 lib/modules.sh 的 PDG_RUNTIME_MODULES)。"
 # 说"全部"是不准的: install.sh 另有一路把 Bot 本体(bot.py)、MITM 组件、探测脚本等装进同一个
