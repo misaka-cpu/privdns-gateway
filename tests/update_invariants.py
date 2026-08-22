@@ -194,7 +194,10 @@ def capture(args):
     # 不装它 doctor 的防火墙检查会直接 ImportError), 因此两个平台各 +1。
     # 6.2B 加了 dotwitness.py(linkstat 经它的 read_evidence 取 DoT 证据; 证据校验器
     # 只能有一份, 不装它 linkstat 就只能永远报"不可判断"), 两个平台再各 +1。
-    expect = {"android": 27, "ios": 33}.get(plat)
+    # 内网面板(方案 B)加了 lanroute.py(门一, doctor 要常驻跑它)与 lanpanel.py(门二 +
+    # 反代/白名单生成; `pdg lan` 的候选生成也走它)。不装它们, `pdg lan` 与相关 doctor
+    # 检查会直接 ImportError/找不到模块, 因此两个平台各 +2。
+    expect = {"android": 29, "ios": 35}.get(plat)
     if expect is not None and len(members) != expect:
         raise SystemExit("manifest 数量漂移: %s 平台应为 %d 项, 实得 %d" % (plat, expect, len(members)))
 

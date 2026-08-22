@@ -311,7 +311,21 @@ else:
 un = open(os.path.join(ROOT, "uninstall.sh"), encoding="utf-8").read()
 i = un.find('== "--purge"')
 outside, inside = (un[:i], un[i:]) if i >= 0 else (un, "")
-if "/etc/privdns-gateway" not in outside and "/etc/privdns-gateway" in inside:
+
+
+def _code_only(text):
+    """去掉整行注释再判。
+
+    这条判据原来是**纯文本搜索**, 于是一句"这里特意不碰 /etc/privdns-gateway"的注释
+    也会把它触发 —— 而那正是该写下来的说明。判据要认的是**代码里有没有动它**, 不是
+    "这五个字有没有出现过"。
+    只去整行注释, 不去行尾注释: 行尾注释挨着真代码, 保守一点不会漏判。
+    """
+    return "\n".join(l for l in text.split("\n") if not l.lstrip().startswith("#"))
+
+
+outside_code, inside_code = _code_only(outside), _code_only(inside)
+if "/etc/privdns-gateway" not in outside_code and "/etc/privdns-gateway" in inside_code:
     ok("只有 uninstall --purge 才会连记录一起删, 普通卸载保留")
 else:
     bad("普通卸载路径上出现了 /etc/privdns-gateway 删除")

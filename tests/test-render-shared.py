@@ -100,7 +100,7 @@ import hashlib, json, sys
 import mihomorender as M
 model = json.loads(%r)
 meta = json.loads(%r)
-data, meta_out = M.render_bytes(model, rulesets=M.rulesets_arg(meta),
+data, meta_out = M.render_bytes(model, lan_domains=[], rulesets=M.rulesets_arg(meta),
                                 mitm_domains=[], tls_ports=None)
 print("SHA:" + hashlib.sha256(data).hexdigest())
 print("RS:" + json.dumps(M.rulesets_arg(meta), sort_keys=True))
@@ -155,7 +155,8 @@ d = tempfile.mkdtemp()
 try:
     open(os.path.join(d, "platform"), "w").write("android\\n")
     json.dump(json.loads(%r), open(os.path.join(d, "rulesets.json"), "w"))
-    fn = M.deriver_from_paths(rs_meta_path=os.path.join(d, "rulesets.json"),
+    fn = M.deriver_from_paths(lan_table_file=os.path.join(d, "lan-panels.json"),
+                              rs_meta_path=os.path.join(d, "rulesets.json"),
                               mitm_hijack_file=os.path.join(d, "mitm_hijack.txt"),
                               platform_file=os.path.join(d, "platform"))
     data = fn({"model": json.dumps(json.loads(%r)).encode()})
@@ -202,7 +203,8 @@ try:
     bot_bytes, _m = bot._render_mihomo_bytes(MODEL, rs_meta=META, mitm_domains=[])
 finally:
     bot._platform = _p
-shared_bytes, _m2 = M.render_bytes(MODEL, rulesets=shared_rs, mitm_domains=[], tls_ports=None)
+shared_bytes, _m2 = M.render_bytes(MODEL, rulesets=shared_rs, mitm_domains=[], tls_ports=None,
+                                   lan_domains=[])
 if hashlib.sha256(bot_bytes).hexdigest() == hashlib.sha256(shared_bytes).hexdigest():
     ok("bot._render_mihomo_bytes 与 mihomorender.render_bytes 逐字节相同")
 else:

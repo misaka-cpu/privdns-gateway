@@ -151,6 +151,18 @@ jobs:
       - name: "doctor: 冲突制造者定位 + Tailscale 卸载残留"
         run: python3 tests/test-doctor-conflict-creator.py
 
+      - name: "内网面板门一: 子网路由重叠拒绝(含每条判据的空测)"
+        run: python3 tests/test-lanroute.py
+
+      - name: "内网面板门二: 面板表校验 + 反代生成(改写指令的空测)"
+        run: python3 tests/test-lanpanel.py
+
+      - name: "内网面板接线: 面板规则必须排在反自环 REJECT 之前(含空测)"
+        run: python3 tests/test-lan-wire.py
+
+      - name: "内网面板自检: 四项判据的每条分支(含 ACL 探测的三种读法)"
+        run: python3 tests/test-lan-doctor.py
+
       - name: "链路诊断采集器 (证书正常/临期/过期/错域名/损坏/误放私钥; 零写入零写锁)"
         run: python3 tests/test-link-status.py
 

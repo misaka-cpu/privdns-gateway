@@ -85,8 +85,8 @@ if not missing:
     ok("快照含全部 %d 个必需顶层字段" % len(need))
 else:
     bad("缺字段: %s" % "、".join(missing))
-if snap["manifest"]["count"] == 27 and len(snap["static_files"]) == 27:
-    ok("Android 平台记录 27 项静态成员(数量漂移会直接失败)")
+if snap["manifest"]["count"] == 29 and len(snap["static_files"]) == 29:
+    ok("Android 平台记录 29 项静态成员(数量漂移会直接失败)")
 else:
     bad("成员数不对: manifest=%d static=%d"
         % (snap["manifest"]["count"], len(snap["static_files"])))
@@ -162,7 +162,8 @@ NCS = [
     ("删除证书指纹字段",
      lambda d: d["credentials"].pop("rescue_cert_fingerprint"), "required-field", {}),
     ("nft 磁盘/内核计数漂移",
-     lambda d: d["firewall"].update(disk_rescue_rules=99), "firewall.disk_rescue_rules", {}),
+     lambda d: d["firewall"].update(disk_rescue_rules=d["firewall"].get("disk_rescue_rules", 0) + 99),
+     "firewall.disk_rescue_rules", {}),
     ("prewrite 场景 NRestarts 增加",
      lambda d: _bump_restart(d), "nrestarts", {}),
     ("留下 APPLYING pending tx",
@@ -174,8 +175,12 @@ NCS = [
      lambda d: d["user_data"]["rulesets"].update(sha256="deadbeef" * 8), "user_data.rulesets", {}),
     ("静态文件 uid 变了但内容相同",
      lambda d: _chown_static(d), "uid", {}),
+    # 变更要**相对当前值**, 不能锚字面量: 写死 status_lines=7 时, 只要跑测试的那棵树
+    # 恰好有 7 个改动文件, 这一改就是个空操作 —— 比较器如实报"无差异", 负控随之失去
+    # 判别力。真发生过(内网面板那一轮, 工作树正好 7 个改动)。
     ("原仓库工作树被弄脏",
-     lambda d: d["source_repo"].update(status_lines=7), "source_repo", {}),
+     lambda d: d["source_repo"].update(status_lines=d["source_repo"].get("status_lines", 0) + 1),
+     "source_repo", {}),
     ("stub 冒充 real",
      lambda d: d["capabilities"].update(systemd="stub"), "capability",
      {"extra": ["--require-real", "systemd"]}),

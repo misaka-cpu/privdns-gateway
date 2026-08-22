@@ -573,7 +573,8 @@ def restore_managed(snap_id, *, expect_digest="", trigger_source="legacy"):
                 t.derive("mihomo_cfg", mihomorender.deriver_from_paths(
                     rs_meta_path=pdgtx.FSROOT + "/opt/pdg-bot/rulesets.json",
                     mitm_hijack_file=pdgtx.FSROOT + "/etc/mosdns/rules/mitm_hijack.txt",
-                    platform_file=pdgtx.FSROOT + "/etc/privdns-gateway/platform"))
+                    platform_file=pdgtx.FSROOT + "/etc/privdns-gateway/platform",
+                    lan_table_file=pdgtx.FSROOT + "/etc/privdns-gateway/lan-panels.json"))
                 out["derived"] = ["mihomo_cfg"]
             # 动作由**实际落盘的目标**推导(read_for_update 失败被跳过的不算数)
             for a in pdgtx.actions_for_targets(out["restored"] + out.get("derived", [])):

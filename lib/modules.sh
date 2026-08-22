@@ -47,6 +47,8 @@ deploy/bot/mihomorender.py mihomorender.py 755
 deploy/bot/cfgrestore.py cfgrestore.py 755
 deploy/bot/emergency.py emergency.py 755
 deploy/bot/cidrgen.py cidrgen.py 755
+deploy/bot/lanroute.py lanroute.py 755
+deploy/bot/lanpanel.py lanpanel.py 755
 deploy/bot/rescue_const.py rescue_const.py 755
 deploy/bot/rescue_nft.py rescue_nft.py 755
 deploy/rescue/rescue.py rescue.py 755

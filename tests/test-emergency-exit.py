@@ -103,9 +103,37 @@ def load_em(box):
 
 
 def paths_for(box):
+    """渲染派生要用的路径。**这是 rescue.py 的 _tx_paths() 的一份复制** —— 那边读 FSROOT,
+    这里读沙箱 box.root, 所以没法直接复用。复制就会漂移, 于是下面加了一条键集一致性断言:
+    以后往 _tx_paths 里加路径而忘了这里, 会当场红, 而不是等到某支用例莫名其妙失败。"""
     return {"rs_meta_path": box.root + "/opt/pdg-bot/rulesets.json",
             "mitm_hijack_file": box.root + "/etc/mosdns/rules/mitm_hijack.txt",
-            "platform_file": box.root + "/etc/privdns-gateway/platform"}
+            "platform_file": box.root + "/etc/privdns-gateway/platform",
+            "lan_table_file": box.root + "/etc/privdns-gateway/lan-panels.json"}
+
+
+def _assert_paths_parity():
+    """本文件这份 paths 与 rescue.py 的 _tx_paths() 必须**键完全一致**。
+
+    少一个键的后果不是报错而是静默降级: deriver 拿不到那条路径, 渲染出来的配置就少掉
+    对应的那块能力(比如面板路由全丢), 而事务照样提交成功。
+    """
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "pdgrescue", os.path.join(ROOT, "deploy/rescue/rescue.py"))
+    m = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(m)
+    except Exception:  # noqa: BLE001
+        return                      # 救援模块起不来是另一支用例的事, 这里不重复报
+    if not hasattr(m, "_tx_paths"):
+        return
+    mine = set(paths_for(type("B", (), {"root": "/x"})()))
+    theirs = set(m._tx_paths())
+    assert mine == theirs, (
+        "paths 键集漂移了 —— 本文件 %r vs rescue._tx_paths %r。"
+        "少的那个键会让派生出来的 mihomo 配置静默少掉一块能力。"
+        % (sorted(mine - theirs), sorted(theirs - mine)))
 
 
 def read_model(box):
@@ -135,6 +163,7 @@ print("── 1. 启用 ──")
 box = make_box()
 em = load_em(box)
 before = read_model(box)
+_assert_paths_parity()
 res = em.enable("hk", paths=paths_for(box))
 eq("启用提交成功", res["state"], "COMMITTED")
 after = read_model(box)

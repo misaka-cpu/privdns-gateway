@@ -2215,6 +2215,7 @@ menu(){
     echo " 12) 识别内网卡段"
     echo " 13) 卸载"
     echo "  s) SSH 来源限制 (可选: 只允许经 Tailscale 登录)"
+    echo "  l) 内网面板 (可选: 手机零 App 访问家里的 Web 面板)"
     echo "  0) 退出"
     echo "  下次打开本菜单命令: pdg"
     printf "选择: "
@@ -2234,6 +2235,9 @@ menu(){
       11) cmd_report;;
       12) cmd_detect_cidr;;
       s|ssh) cmd_ssh_source "$(read -rp "  [status|tailnet|any|confirm] (回车=status): " a; echo "${a:-status}")";;
+      l|lan) read -rp "  [status|list|check|routes|add|rm] (回车=status): " a
+         # shellcheck disable=SC2086  # 参数要按空白拆开传给子命令, 这里是有意为之
+         cmd_lan ${a:-status};;
       13) read -rp "卸载: 留空取消 / yes 仅卸载 / purge 连配置一起删: " x
          case "$x" in yes) cmd_uninstall;; purge) cmd_uninstall --purge;; *) echo "已取消";; esac;;
       0|q) exit 0;;
@@ -4844,6 +4848,627 @@ _ssh_revert_arm(){              # 起自动回退定时器
 _ssh_revert_disarm(){ systemctl stop "$_SSH_REVERT_UNIT.timer" >/dev/null 2>&1 || true
                       systemctl reset-failed "$_SSH_REVERT_UNIT" >/dev/null 2>&1 || true; }
 
+# ══ 内网面板(方案 B) ═════════════════════════════════════════════════════════
+# 手机零 App 访问家里的内网面板: 手机 →(SIM)→ 网关 → tailnet → 家里的设备。
+# 设计与三道门见 docs/design-lan-panels.md。这里是面板表的增删查与门一的判定入口;
+# 反代与证书的生命周期另见 `pdg lan enable/disable`。
+LAN_TABLE_PATH="${PDG_LAN_TABLE:-/etc/privdns-gateway/lan-panels.json}"
+
+# 面板表的**当前内容**(不存在则给一张空表)。给空表而不是报错: 第一次 add 之前它本来
+# 就不该存在, 让用户先手动建一个空 JSON 是没有道理的仪式。
+_lan_cur(){
+  if [[ -s "$LAN_TABLE_PATH" ]]; then cat "$LAN_TABLE_PATH"
+  else printf '{\n  "panels": []\n}\n'; fi
+}
+
+# 一笔事务改面板表。骨架与 _pdg_cidr_transact 相同 —— 候选由 lanpanel.py 生成(不写盘),
+# 落盘、校验、观察、回滚全交给 pdgtx。
+#   $1 = 事务 op 名(进台账, 事后能看出这笔是谁发起的)
+#   $2.. = 传给 lanpanel.py 的子命令与参数
+_lan_transact(){
+  local op="$1"; shift
+  local mod txm wd txid sha rc=0
+  mod="$(_pdg_module lanpanel.py)" || { c_y "❌ 找不到 lanpanel.py, 未改动任何文件。"; return 1; }
+  txm="$(_pdg_module pdgtx.py)"    || { c_y "❌ 找不到 pdgtx.py(事务核心缺失), 未改动任何文件。"; return 1; }
+
+  local pend; pend="$(python3 "$txm" pending 2>/dev/null)"
+  if [[ -n "$pend" ]]; then
+    c_y "⛔ 有未完成的配置事务, 本次拒绝执行(未改动任何文件):"
+    printf '%s\n' "$pend" | sed 's/^/    /'
+    c_y "   请先 sudo pdg tx show <id> 查看, 再 sudo pdg tx recover <id> 收尾。"
+    return 1
+  fi
+
+  wd="$(mktemp -d)" || { c_y "❌ 无法创建临时目录"; return 1; }
+  _lan_cur > "$wd/cur.json"
+
+  # 先在候选上跑一遍, 不合法就在**碰事务之前**停下 —— 开了事务再失败要多一次 abort,
+  # 而失败原因(表不合法)与事务毫无关系。
+  # lanpanel.py 的契约是 `<子命令> <表路径> [选项...]` —— 表路径在**第二位**, 不是最后。
+  # 拼在最后会让 --name 被当成表路径, 报出来的错是"读不了面板表 --name", 与真正的原因
+  # 隔着一层。
+  local sub="$1"; shift
+  if ! python3 "$mod" "$sub" "$wd/cur.json" "$@" > "$wd/new.json" 2>"$wd/err"; then
+    c_y "❌ 拒绝改动(未改动任何文件):"
+    [[ -s "$wd/err" ]] && sed 's/^/    /' "$wd/err"
+    [[ -s "$wd/new.json" ]] && sed 's/^/    /' "$wd/new.json"
+    rm -rf "$wd"; return 1
+  fi
+
+  txid="$(python3 "$txm" new --source cli --op "$op" 2>"$wd/err")" || {
+    c_y "❌ 无法开始配置事务: $(tr -d '\n' < "$wd/err")"; rm -rf "$wd"; return 1; }
+
+  # 前置条件: 生成候选时表是什么样。不存在用 "-" 表示 —— 第一次 add 走的正是这条路。
+  if [[ -s "$LAN_TABLE_PATH" ]]; then
+    if ! python3 "$txm" read --target lan_panels > "$wd/raw" 2>"$wd/err"; then
+      c_y "❌ 读不到面板表: $(tr -d '\n' < "$wd/err") → 未改动任何文件。"
+      python3 "$txm" abort "$txid" >/dev/null 2>&1 || true; rm -rf "$wd"; return 1
+    fi
+    sha="$(head -1 "$wd/raw")"
+  else
+    sha="-"
+  fi
+
+  if ! python3 "$txm" stage --tx "$txid" --target lan_panels --file "$wd/new.json" --expect "$sha" 2>"$wd/err"; then
+    c_y "❌ 暂存候选失败: $(tr -d '\n' < "$wd/err") → 未改动任何文件。"
+    python3 "$txm" abort "$txid" >/dev/null 2>&1 || true; rm -rf "$wd"; return 1
+  fi
+
+  local out; out="$(python3 "$txm" apply --tx "$txid" 2>"$wd/err")"; rc=$?
+  if [[ "$rc" == 0 ]]; then rm -rf "$wd"; return 0; fi
+  case "$rc" in
+    4) c_y "⛔ 已有配置操作在执行(锁被占用), 本次未改动任何文件。";;
+    5) c_y "⛔ 拒绝执行(未改动任何文件):"; [[ -s "$wd/err" ]] && sed 's/^/    /' "$wd/err";;
+    *) c_y "❌ 面板表变更失败, 已按 before-image 回滚:"
+       [[ -s "$wd/err" ]] && sed 's/^/    /' "$wd/err"
+       [[ -n "$out" ]] && printf '%s\n' "$out" | sed 's/^/    /';;
+  esac
+  rm -rf "$wd"; return 1
+}
+
+_lan_list(){
+  local mod; mod="$(_pdg_module lanpanel.py)" || { echo "找不到 lanpanel.py"; return 1; }
+  local t; t="$(mktemp)"; _lan_cur > "$t"
+  python3 "$mod" list "$t"; local rc=$?; rm -f "$t"; return $rc
+}
+
+# 门一: 判一批网段能不能接受。判据全部来自本机现状 —— 内网卡来源段取 profile.env,
+# 本机接口网段现读, 不让调用方传, 免得"传错一个参数"变成"判据看起来通过了"。
+_lan_routes(){
+  local mod; mod="$(_pdg_module lanroute.py)" || { echo "找不到 lanroute.py"; return 1; }
+  [[ $# -gt 0 ]] || { echo "用法: pdg lan routes <网段>...  (判断家里通告的子网路由能不能接受)"; return 1; }
+  local internal; internal="$(sed -n 's/^[[:space:]]*PDG_INTERNAL_CIDR=//p' "$PROFILE_ENV" 2>/dev/null | tail -1)"
+  local -a args=(judge)
+  if [[ -n "$internal" ]]; then
+    args+=(--internal "$internal")
+  else
+    # 取不到内网卡来源段 = 门一里**最要紧的那条判据跑不了**。放行与拒绝两条路上都要说,
+    # 而不是只在成功时轻描淡写提一句 —— 否则用户会拿着一个"✅ 可以接受"去接受一个
+    # 其实会把分流打烂的网段, 而那正是这道门存在的全部理由。
+    c_y "⚠️ 读不到 PDG_INTERNAL_CIDR($PROFILE_ENV) —— **与内网卡来源段相交**这条判据本次没跑。"
+    c_y "   下面的结论只覆盖了默认路由、本机接口、tailnet 自身段、环回这四条。"
+    echo
+  fi
+  local a
+  while read -r a; do [[ -n "$a" ]] && args+=(--local "$a"); done < <(
+    ip -o -4 addr show scope global 2>/dev/null | awk '{print $4}'
+    ip -o -6 addr show scope global 2>/dev/null | awk '{print $4}')
+  local out rc
+  out="$(python3 "$mod" "${args[@]}" "$@" 2>&1)"; rc=$?
+  case "$rc" in
+    0) c_g "✅ 这些网段可以接受:"; printf '  %s\n' "$@"
+       echo "   判据: 与内网卡来源段(${internal:-未配置})、本机接口网段、tailnet 自身段都不相交, 也不是默认路由。"
+       return 0;;
+    2) c_y "⛔ 有网段不能接受 —— 接受它们会让手机的分流数据面错乱, 而配置上看不出来:"
+       printf '%s\n' "$out" | while IFS=$'\t' read -r tag why; do echo "   [$tag] $why"; done
+       [[ -z "$internal" ]] && c_y "   (再说一遍: 与内网卡来源段相交那条**没跑**, 所以这份清单可能还不全)"
+       echo
+       echo "   家里那侧改小通告范围之后再来。别在本机 \`tailscale set --accept-routes\` 硬接 ——"
+       echo "   那会让上面这些后果真的发生。"
+       return 1;;
+    *) c_y "❌ 判定没跑起来: $out"; return 1;;
+  esac
+}
+
+# 风险②: 签面板证书的 DNS token 会不会顺带能签本项目自己的 DoT 域名。
+#
+# 这不是"多一个凭据"而是**权限升级**: token 按 zone 授权, 而面板域名与 DoT 域名通常在
+# 同一个 zone 里 —— 一台被拿下的网关可以用它签发 DoT 域名的证书, 进而 MITM 用户自己的
+# DNS。面板被看到是一回事, DNS 被劫持是另一回事。
+#
+# 只警告不阻断: 用户完全可以接受这个风险(自己家、自己用), 那是他的决定。但他必须**知道**
+# 自己在决定什么 —— 这条不能只写在文档第 7 节里等人去读。
+_lan_zone_warn(){
+  local mod dot risks
+  mod="$(_pdg_module lanpanel.py)" || return 0
+  dot="$(cat /opt/pdg-bot/dot-domain 2>/dev/null)"
+  [[ -n "$dot" ]] || return 0
+  # 退出码要**逐个分辨**, 不能只分"成功/其他": 0=没风险, 2=有风险, 其余=判据没跑起来。
+  # 写成 `... && return 0` 的话, 任何一种失败(模块旧、参数不认、python 挂了)都会被当成
+  # "有风险", 而错误文本会被原样当成风险清单打出来 —— 一条本该提醒人的警告变成噪音,
+  # 用户下次就不看它了。
+  local rc
+  risks="$(python3 "$mod" zone-risk "$LAN_TABLE_PATH" "$dot" 2>/dev/null)"; rc=$?
+  case "$rc" in
+    0) return 0;;
+    2) : ;;                     # 有风险, 往下报
+    *) c_y "  ⚠️ 同 zone 风险判据没跑起来(lanpanel.py zone-risk 退出码 $rc) —— 这一条本次没检查。"
+       return 0;;
+  esac
+  [[ -n "$risks" ]] || return 0
+  echo
+  c_y "  ⚠️ 风险: 面板域名与本项目的 DoT 域名($dot)在同一个 zone 里"
+  printf '%s\n' "$risks" | while IFS=$'\t' read -r h z; do echo "       $h  ←同 zone→  $dot   ($z)"
+  done
+  c_y "     签发面板证书要一个能改这个 zone 的 DNS token, 而那个 token **也能签发 $dot**。"
+  c_y "     于是一台被拿下的网关可以给你的 DoT 域名签一张真证书, 反过来 MITM 你自己的 DNS ——"
+  c_y "     面板被看到是一回事, DNS 被劫持是另一回事。"
+  echo "     收窄的办法: 面板用单独的子域, 并把 _acme-challenge 用 CNAME 委派到一个**单独的 zone**,"
+  echo "     让 token 只控制那一个 zone。"
+}
+
+_lan_status(){
+  echo "内网面板(方案 B)"
+  if [[ -s "$LAN_TABLE_PATH" ]]; then
+    local n; n="$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1])).get("panels",[])))' "$LAN_TABLE_PATH" 2>/dev/null || echo '?')"
+    echo "  面板表: $LAN_TABLE_PATH ($n 条)"
+    local mod; mod="$(_pdg_module lanpanel.py)" || mod=""
+    if [[ -n "$mod" ]]; then
+      if python3 "$mod" check "$LAN_TABLE_PATH" >/dev/null 2>&1; then
+        c_g "  门二(白名单映射): 通过"
+      else
+        c_y "  ⚠️ 门二: 面板表**没通过校验** —— 跑 pdg lan check 看具体哪条"
+      fi
+      _lan_zone_warn
+    fi
+  else
+    echo "  面板表: 还没有(用 pdg lan add 加第一条)"
+  fi
+  if command -v tailscale >/dev/null 2>&1 && ip -o link show tailscale0 >/dev/null 2>&1; then
+    local acc; acc="$(tailscale status --json 2>/dev/null | python3 -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit()
+r=(d.get("Self") or {}).get("AllowedIPs") or []
+print(" ".join(x for x in r if not x.startswith(("100.","fd7a:"))))' 2>/dev/null)"
+    echo "  Tailscale: 已连接${acc:+; 本机通告 $acc}"
+  else
+    c_y "  ⚠️ Tailscale 没在跑 —— 方案 B 的整条链路都要经它, 先把它装好并认证"
+  fi
+}
+
+LAN_USER="pdg-lan"
+# 反代以 pdg-lan 身份跑, 它要读的东西全放这里(750 root:pdg-lan)。
+# **不放 /etc/privdns-gateway/** —— 那个目录是 700 root:root, 里面有 profile.env 与
+# DNS API 凭据; 为了让反代读一份配置就把它开出去是不划算的交换。而且只给文件 640 也没用:
+# 进不去父目录一样 permission denied, 而报错显示的是"读配置失败"。
+LAN_ETC="/etc/pdg-lan"
+LAN_CADDYFILE="$LAN_ETC/caddy.conf"
+LAN_NFT_CONF="/etc/nftables-pdg-lan.conf"
+LAN_CERT_DIR="$LAN_ETC/certs"
+# DNS 服务商凭据。放 $LAN_ETC 下而不是 /etc/privdns-gateway/:
+#   · 普通卸载会把 $LAN_ETC 整个删掉 —— 凭据因此跟着走。服务没了而能改你 DNS 记录的
+#     token 还留在盘上, 比不卸载更糟。
+#   · /etc/privdns-gateway 在普通卸载路径上**必须一个字节都不碰**(里面有 iOS 描述文件的
+#     身份记录, 丢了手机上那份描述文件从此无法更新, 而界面什么都不报)。
+#   · 目录是 750 root:pdg-lan, 但这个文件是 **600 root:root** —— 反代能穿越目录,
+#     读不到文件。目录可穿越不等于文件可读。
+LAN_DNS_ENV="$LAN_ETC/dns.env"
+LAN_UNIT="/etc/systemd/system/pdg-lan.service"
+LAN_STATE_DIR="/var/lib/pdg-lan"
+ACME_HOME="/opt/pdg-acme"
+
+_lan_arch(){ case "$(dpkg --print-architecture 2>/dev/null)" in amd64) echo amd64;; arm64) echo arm64;; *) return 1;; esac; }
+
+# Caddy: 官方原版静态二进制, 钉版本 + 钉 SHA256。已经是钉死版就不重下。
+_lan_install_caddy(){
+  local arch t want
+  arch="$(_lan_arch)" || { c_y "❌ 不支持的架构: $(dpkg --print-architecture 2>/dev/null)"; return 1; }
+  # shellcheck source=lib/versions.sh
+  source "$REPO_DIR/lib/versions.sh" 2>/dev/null || { c_y "❌ 读不到 lib/versions.sh"; return 1; }
+  if [[ -x /usr/local/bin/caddy ]] && /usr/local/bin/caddy version 2>/dev/null | grep -qF "${CADDY_VER}"; then
+    echo "  Caddy 已是钉死版 $CADDY_VER"; return 0
+  fi
+  want="${PDG_SHA256[caddy-$arch]:-}"
+  [[ -n "$want" ]] || { c_y "❌ lib/versions.sh 里没有 caddy-$arch 的钉死 SHA256, 拒绝安装。"; return 1; }
+  t="$(mktemp -d)" || return 1
+  c_g "下载 Caddy $CADDY_VER ($arch)…"
+  if ! curl -fsSL --max-time 180 \
+       "https://github.com/caddyserver/caddy/releases/download/${CADDY_VER}/caddy_${CADDY_VER#v}_linux_${arch}.tar.gz" \
+       -o "$t/caddy.tgz"; then
+    c_y "❌ 下载失败"; rm -rf "$t"; return 1
+  fi
+  pdg_verify_sha256 "$t/caddy.tgz" "$want" "caddy $CADDY_VER ($arch)" || { rm -rf "$t"; return 1; }
+  tar -xzf "$t/caddy.tgz" -C "$t" caddy 2>/dev/null || { c_y "❌ 解包失败"; rm -rf "$t"; return 1; }
+  install -m755 "$t/caddy" /usr/local/bin/caddy || { rm -rf "$t"; return 1; }
+  rm -rf "$t"
+  c_g "  Caddy $CADDY_VER 已安装"
+}
+
+# acme.sh: 按 commit sha 钉。clone 之后逐字核对 —— tag 可以被移动, commit sha 不能。
+_lan_install_acme(){
+  # shellcheck source=lib/versions.sh
+  source "$REPO_DIR/lib/versions.sh" 2>/dev/null || return 1
+  if [[ -x "$ACME_HOME/acme.sh" ]] && \
+     [[ "$(git -C "$ACME_HOME" rev-parse HEAD 2>/dev/null)" == "$ACME_SH_COMMIT" ]]; then
+    echo "  acme.sh 已是钉死 commit"; return 0
+  fi
+  c_g "获取 acme.sh $ACME_SH_VER…"
+  rm -rf "$ACME_HOME"
+  git clone -q --depth 50 --branch "$ACME_SH_VER" https://github.com/acmesh-official/acme.sh "$ACME_HOME" 2>/dev/null \
+    || { c_y "❌ clone 失败"; return 1; }
+  local got; got="$(git -C "$ACME_HOME" rev-parse HEAD 2>/dev/null)"
+  if [[ "$got" != "$ACME_SH_COMMIT" ]]; then
+    # 不是"警告后继续": 对不上就说明拿到的不是我们审过的那份代码, 而这份代码接下来
+    # 要拿着你的 DNS API token 去改真实 DNS 记录。
+    c_y "❌ acme.sh commit 对不上, 拒绝使用(已删除):"
+    c_y "   期望 $ACME_SH_COMMIT"
+    c_y "   实际 ${got:-<读不出>}"
+    rm -rf "$ACME_HOME"; return 1
+  fi
+  chmod 755 "$ACME_HOME/acme.sh"
+  c_g "  acme.sh 已就位(commit 逐字核对通过)"
+}
+
+_lan_hosts(){
+  python3 -c 'import json,sys
+try: d=json.load(open(sys.argv[1]))
+except Exception: sys.exit(0)
+for p in d.get("panels",[]):
+    if isinstance(p,dict) and p.get("host"): print(p["host"])' "$LAN_TABLE_PATH" 2>/dev/null
+}
+
+# 证书: DNS-01 签发。凭据放 600 文件, 由 acme.sh 从环境读 —— 不进命令行(ps 看得见),
+# 不进日志。
+_lan_cert(){
+  local dnsapi="${1:-}" alias_zone="${2:-}"
+  [[ -n "$dnsapi" ]] || { echo "用法: pdg lan cert <acme.sh 的 DNS 插件名, 如 dns_cf> [委派zone]"; 
+    echo "  凭据写进 $LAN_DNS_ENV (600), 一行一个 KEY=值 —— 具体要哪些看 acme.sh 的 dnsapi 文档。"
+    echo "  例(Cloudflare): CF_Token=...   然后 pdg lan cert dns_cf"
+    echo
+    echo "  [委派zone] 用来把 DNS token 的爆炸半径收窄, **强烈建议给**:"
+    echo "    先在主域下给每个面板加一条 CNAME:"
+    echo "      _acme-challenge.<面板域名>  CNAME  <面板域名>.<委派zone>"
+    echo "    然后 token 只需要能改**委派 zone**, 不再需要能改主域 —— 于是一台被拿下的"
+    echo "    网关**签不了你自己的 DoT 域名** —— 风险从权限升级降回只是多一个凭据。"
+    echo "    例: pdg lan cert dns_cf acme-deleg.example.net"; return 1; }
+  [[ -s "$LAN_DNS_ENV" ]] || { c_y "❌ 缺 $LAN_DNS_ENV —— DNS 服务商的凭据要先放好(600)。"; return 1; }
+  local mode owner
+  mode="$(stat -c %a "$LAN_DNS_ENV" 2>/dev/null)"; owner="$(stat -c %U "$LAN_DNS_ENV" 2>/dev/null)"
+  [[ "$mode" == 600 ]] || { c_y "❌ $LAN_DNS_ENV 权限是 $mode, 应为 600 —— 里面是能改你 DNS 的凭据。"; return 1; }
+  # 属主也要查: 目录对 pdg-lan 组可穿越, 文件若属主是 pdg-lan, 600 反而变成"只有反代能读"。
+  [[ "$owner" == root ]] || { c_y "❌ $LAN_DNS_ENV 属主是 $owner, 应为 root。"; return 1; }
+  _lan_install_acme || return 1
+  local -a doms=(); local h
+  while read -r h; do [[ -n "$h" ]] && doms+=(-d "$h"); done < <(_lan_hosts)
+  [[ ${#doms[@]} -gt 0 ]] || { c_y "❌ 面板表里一个域名都没有, 没什么可签的。"; return 1; }
+  install -d -m750 -o root -g "$LAN_USER" "$LAN_ETC" 2>/dev/null || install -d -m750 "$LAN_ETC"
+  install -d -m750 -o root -g "$LAN_USER" "$LAN_CERT_DIR" 2>/dev/null || install -d -m750 "$LAN_CERT_DIR"
+  c_g "签发证书(DNS-01, 插件 $dnsapi)…"
+  # set -a 让 EnvironmentFile 里的键成为环境变量; 用子 shell 圈住, 不污染当前进程。
+  (
+    set -a; # shellcheck disable=SC1090
+    source "$LAN_DNS_ENV"; set +a
+    # --challenge-alias: 把 _acme-challenge 的写入指到**委派 zone**。这不是便利选项 ——
+    # 没有它, token 必须能改主域, 而主域里通常还有本项目自己的 DoT 域名(见 lanpanel.zone_risk)。
+    local -a alias_arg=()
+    [[ -n "$alias_zone" ]] && alias_arg=(--challenge-alias "$alias_zone")
+    "$ACME_HOME/acme.sh" --home "$ACME_HOME/data" --issue --dns "$dnsapi" \
+      "${doms[@]}" "${alias_arg[@]+"${alias_arg[@]}"}" --server letsencrypt --keylength ec-256
+  ) || { c_y "❌ 签发失败 —— 看上面 acme.sh 给的原因(多半是凭据权限不足或域名不在该 zone)。"; return 1; }
+  while read -r h; do
+    [[ -n "$h" ]] || continue
+    local name; name="$(python3 -c 'import json,sys
+d=json.load(open(sys.argv[1]))
+print(next((p["name"] for p in d["panels"] if p.get("host")==sys.argv[2]), ""))' "$LAN_TABLE_PATH" "$h" 2>/dev/null)"
+    [[ -n "$name" ]] || continue
+    "$ACME_HOME/acme.sh" --home "$ACME_HOME/data" --install-cert -d "$h" --ecc \
+      --fullchain-file "$LAN_CERT_DIR/$name.crt" --key-file "$LAN_CERT_DIR/$name.key" \
+      --reloadcmd "systemctl reload pdg-lan 2>/dev/null || true" >/dev/null 2>&1 \
+      || c_y "  ⚠️ $h 的证书装不到 $LAN_CERT_DIR/$name.*"
+  done < <(_lan_hosts)
+  # 私钥给**组**读而不是 600: 反代不是 root, 它必须读得到。目录 750 root:pdg-lan 已经
+  # 把范围限在这个用户上了, 再把文件锁成 600 只会让服务起不来。
+  chown root:"$LAN_USER" "$LAN_CERT_DIR"/* 2>/dev/null || true
+  chmod 640 "$LAN_CERT_DIR"/*.key "$LAN_CERT_DIR"/*.crt 2>/dev/null || true
+  c_g "✅ 证书已就位: $LAN_CERT_DIR"
+}
+
+# 由面板表**派生**反代配置与出站白名单。两份都从同一张表来 —— 这是门三成立的前提:
+# 白名单与反代实际会连的地址不可能不一致。
+_lan_render(){
+  local mod tmpc tmpn legacy
+  mod="$(_pdg_module lanpanel.py)" || { c_y "❌ 找不到 lanpanel.py"; return 1; }
+  tmpc="$(mktemp)"; tmpn="$(mktemp)"
+  if ! python3 "$mod" render "$LAN_TABLE_PATH" --certs "$LAN_CERT_DIR" > "$tmpc" 2>"$tmpc.err"; then
+    c_y "❌ 生成反代配置失败:"; sed 's/^/    /' "$tmpc.err" "$tmpc" 2>/dev/null | head -10
+    rm -f "$tmpc" "$tmpn" "$tmpc.err"; return 1
+  fi
+  if ! python3 "$mod" nft "$LAN_TABLE_PATH" --uid "$LAN_USER" > "$tmpn" 2>"$tmpn.err"; then
+    c_y "❌ 生成出站白名单失败:"; sed 's/^/    /' "$tmpn.err" 2>/dev/null | head -10
+    rm -f "$tmpc" "$tmpn" "$tmpc.err" "$tmpn.err"; return 1
+  fi
+  # 反代配置先让 caddy 自己判一遍再落盘。落一份它读不懂的配置, 症状是服务起不来,
+  # 而那时旧配置已经被覆盖 —— 连"退回去"都没得退。
+  if [[ -x /usr/local/bin/caddy ]]; then
+    if ! /usr/local/bin/caddy validate --config "$tmpc" --adapter caddyfile >/dev/null 2>&1; then
+      c_y "❌ 生成出来的反代配置 caddy 自己判为不合法, 拒绝落盘(现有配置未动):"
+      /usr/local/bin/caddy validate --config "$tmpc" --adapter caddyfile 2>&1 | head -6 | sed 's/^/    /'
+      rm -f "$tmpc" "$tmpn" "$tmpc.err" "$tmpn.err"; return 1
+    fi
+  fi
+  install -m640 -o root -g "$LAN_USER" "$tmpc" "$LAN_CADDYFILE" 2>/dev/null || install -m644 "$tmpc" "$LAN_CADDYFILE"
+  install -m644 "$tmpn" "$LAN_NFT_CONF"
+  rm -f "$tmpc" "$tmpn" "$tmpc.err" "$tmpn.err"
+  legacy="$(python3 -c 'import importlib.util,sys
+spec=importlib.util.spec_from_file_location("lp",sys.argv[1]); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+import json; print("1" if m.legacy_tls_panels(json.load(open(sys.argv[2]))) else "")' "$mod" "$LAN_TABLE_PATH" 2>/dev/null)"
+  # shellcheck source=lib/units.sh
+  source "$REPO_DIR/lib/units.sh" 2>/dev/null || { c_y "❌ 读不到 lib/units.sh"; return 1; }
+  pdg_unit_lan_caddy "$legacy" > "$LAN_UNIT" && chmod 644 "$LAN_UNIT"
+  systemctl daemon-reload 2>/dev/null || true
+}
+
+_lan_preflight(){
+  local rc=0 h missing=""
+  [[ -s "$LAN_TABLE_PATH" ]] || { c_y "⛔ 面板表是空的 —— 先 pdg lan add 加至少一条。"; return 1; }
+  local mod; mod="$(_pdg_module lanpanel.py)" || return 1
+  python3 "$mod" check "$LAN_TABLE_PATH" || { c_y "⛔ 面板表没通过门二校验(见上), 拒绝启用。"; return 1; }
+  # Tailscale 是整条链路的必经之处。没有它, 反代起来了也连不到家里 —— 那种"服务 active
+  # 但什么都打不开"的状态最难查, 不如在这里就停下。
+  if ! command -v tailscale >/dev/null 2>&1 || ! ip -o link show tailscale0 >/dev/null 2>&1; then
+    c_y "⛔ Tailscale 没在跑 —— 方案 B 的整条链路都要经它。先装好并认证, 再回来。"
+    rc=1
+  fi
+  while read -r h; do
+    [[ -n "$h" ]] || continue
+    local name; name="$(python3 -c 'import json,sys
+d=json.load(open(sys.argv[1]))
+print(next((p["name"] for p in d["panels"] if p.get("host")==sys.argv[2]), ""))' "$LAN_TABLE_PATH" "$h" 2>/dev/null)"
+    [[ -s "$LAN_CERT_DIR/$name.crt" && -s "$LAN_CERT_DIR/$name.key" ]] || missing="$missing $h"
+  done < <(_lan_hosts)
+  if [[ -n "$missing" ]]; then
+    c_y "⛔ 这些面板还没有证书:$missing"
+    c_y "   先跑 pdg lan cert <dns插件名> 签发。反代读的是落盘的证书, 它自己不去要。"
+    rc=1
+  fi
+  _lan_zone_warn
+  return $rc
+}
+
+_lan_enable(){
+  need_root lan
+  _lan_install_caddy || return 1
+  id "$LAN_USER" >/dev/null 2>&1 || useradd -r -s /usr/sbin/nologin -d "$LAN_STATE_DIR" "$LAN_USER"
+  install -d -m750 -o "$LAN_USER" -g "$LAN_USER" "$LAN_STATE_DIR"
+  install -d -m750 -o root -g "$LAN_USER" "$LAN_ETC"
+  install -d -m750 -o root -g "$LAN_USER" "$LAN_CERT_DIR"
+  _lan_preflight || return 1
+  _lan_render || return 1
+  systemctl enable --now pdg-lan >/dev/null 2>&1
+  sleep 2
+  if systemctl is-active --quiet pdg-lan; then
+    _profile_set PDG_LAN_ENABLED 1 || c_y "⚠️ profile.env 写入失败, 启用意图未持久化。"
+    c_g "✅ 内网面板已启用。反代监听 127.0.0.1:443, 出站白名单已按面板表加载。"
+    _lan_wire && c_g "   DNS 劫持集与 mihomo 分流已同步 —— 手机侧现在应该能打开了。"
+  else
+    c_y "❌ pdg-lan 没起来。最近的日志:"
+    journalctl -u pdg-lan -n 15 --no-pager 2>/dev/null | sed 's/^/    /'
+    c_y "   ExecStartPre 会先加载出站白名单 —— 那一步失败也会让服务起不来(这是有意的:"
+    c_y "   白名单加载不上就不该让反代跑起来)。"
+    return 1
+  fi
+}
+
+_lan_disable(){
+  need_root lan
+  systemctl disable --now pdg-lan >/dev/null 2>&1 || true
+  nft delete table inet pdglan 2>/dev/null || true
+  _profile_set PDG_LAN_ENABLED 0 || true
+  c_g "✅ 内网面板已停用(反代已停、出站白名单已撤)。"
+  echo "   保留: 面板表、证书、Caddy 二进制 —— 重新 enable 就能用。"
+  echo "   要连这些一起清干净: pdg lan purge"
+}
+
+# 连配置与凭据一起清干净。与 disable 的分界: disable 是"先停一停", purge 是"不用了"。
+#
+# 要点名说清楚删了什么, 尤其是 DNS API 凭据与 acme 账户密钥 —— 那两样删掉之后
+# 证书续期就断了, 而用户可能只是想"清理一下"。
+_lan_purge(){
+  need_root lan
+  local keep_table="${1:-}"
+  _lan_disable >/dev/null 2>&1 || true
+  systemctl disable --now pdg-lan >/dev/null 2>&1 || true
+  rm -f "$LAN_UNIT"; systemctl daemon-reload 2>/dev/null || true
+  rm -f "$LAN_NFT_CONF"
+  nft delete table inet pdglan 2>/dev/null || true
+  local removed="" had_creds=""
+  [[ -e "$LAN_DNS_ENV" || -e "$ACME_HOME" ]] && had_creds=1
+  [[ -e "$LAN_ETC" ]] && { rm -rf "$LAN_ETC"; removed="$removed 反代配置与证书($LAN_ETC)"; }
+  [[ -e "$LAN_STATE_DIR" ]] && { rm -rf "$LAN_STATE_DIR"; removed="$removed 运行态($LAN_STATE_DIR)"; }
+  [[ -e "$LAN_DNS_ENV" ]] && { rm -f "$LAN_DNS_ENV"; removed="$removed DNS-API凭据"; }
+  [[ -e "$ACME_HOME" ]] && { rm -rf "$ACME_HOME"; removed="$removed acme.sh与账户密钥"; }
+  [[ -x /usr/local/bin/caddy ]] && { rm -f /usr/local/bin/caddy; removed="$removed caddy二进制"; }
+  if [[ "$keep_table" != "--keep-table" && -e "$LAN_TABLE_PATH" ]]; then
+    rm -f "$LAN_TABLE_PATH"; removed="$removed 面板表"
+  fi
+  id "$LAN_USER" >/dev/null 2>&1 && { userdel "$LAN_USER" 2>/dev/null || true; removed="$removed 用户$LAN_USER"; }
+  _profile_set PDG_LAN_ENABLED 0 >/dev/null 2>&1 || true
+  c_g "✅ 内网面板已清除。"
+  [[ -n "$removed" ]] && echo "   删掉了:$removed"
+  # 只在**确实存在过**的时候才说删了它们。声称删掉一个本来就不在的东西, 会让人以为
+  # 自己曾经配过 DNS 凭据 —— 而下一步他会去找一个不存在的备份。
+  if [[ -n "$had_creds" ]]; then
+    c_y "   注意: DNS API 凭据与 acme 账户密钥都删了 —— 证书续期从此不再进行。"
+    c_y "   已经签出去的证书到期就失效, 重新用要再跑一遍 pdg lan cert。"
+  else
+    echo "   (本机上没有 DNS 凭据与 acme 账户, 所以没有可删的; 证书也从未由本项目签发过。)"
+  fi
+  [[ "$keep_table" == "--keep-table" ]] && echo "   面板表按你的要求留下了: $LAN_TABLE_PATH"
+  return 0
+}
+
+# ── mosdns 侧: 让手机把面板域名解析到网关 ─────────────────────────────────────
+# 少了这一段, 手机查面板域名拿到的是 NXDOMAIN(那些域名没有公网 A 记录), 前面整条链路
+# 一次都不会被触发 —— 反代跑得好好的, 面板就是打不开, 而哪里都不报错。
+LAN_HIJACK_FILE="/etc/mosdns/rules/lan_hijack.txt"
+
+# 一次性迁移: 把 lan_hijack.txt 挂进现有的**明确代理集**。
+#
+# 为什么复用 explicit_proxy 而不是另起一条序列: 面板域名的 DNS 行为与"明确指到出口的
+# 域名"完全一样 —— 抑制 AAAA/HTTPS、A 记录劫持到网关, 剩下的交给 mihomo 按 SNI 分流。
+# 另造一条一模一样的序列只会多一处要同步的地方。
+#
+# 幂等; 只认本项目的标准形态; 备份 → 生成 → 校验 → 失败还原。$1 可指定文件(供测试)。
+# shellcheck disable=SC2120
+migrate_mosdns_lan(){
+  local f="${1:-/etc/mosdns/config.yaml}"
+  [[ -f "$f" ]] || return 0
+  grep -q 'lan_hijack.txt' "$f" && return 0                      # 已挂 → 幂等退出
+  grep -q 'tag: explicit_proxy' "$f" || return 0                 # 非标准形态 → 不动(交 doctor)
+  local rdir; rdir="$(grep -oE '"/[^"]*/custom_hijack\.txt"' "$f" | head -1 | tr -d '"')"
+  rdir="$(dirname "$rdir" 2>/dev/null)"; [[ -n "$rdir" && "$rdir" != "." ]] || rdir="/etc/mosdns/rules"
+  install -d -m755 "$rdir" 2>/dev/null || true
+  [[ -e "$rdir/lan_hijack.txt" ]] || : > "$rdir/lan_hijack.txt"  # 空集 = 休眠, 零影响
+  local bak; bak="$f.prelan.$(date +%s)"
+  if ! cp -a "$f" "$bak" 2>/dev/null || ! cmp -s "$f" "$bak"; then
+    c_y "  [面板迁移] 备份失败(磁盘满?), 中止、不动现网。"; rm -f "$bak" 2>/dev/null; return 0
+  fi
+  if ! python3 - "$f" "$rdir" <<'PY'
+import re, sys
+f, rdir = sys.argv[1], sys.argv[2]
+s = open(f, encoding="utf-8").read()
+# 只改 explicit_proxy 那一条 domain_set 的 files 列表。按 tag 定位再在其后找最近的 files,
+# 不用全局正则 —— 配置里有好几个 domain_set, 改错一个的后果是把面板域名塞进 CN 直连集。
+i = s.find("- tag: explicit_proxy")
+assert i >= 0, "找不到 explicit_proxy"
+m = re.compile(r"args:\s*\{\s*files:\s*\[(.*?)\]\s*\}").search(s, i)
+assert m, "explicit_proxy 之后找不到 files 列表"
+inner = m.group(1)
+assert "lan_hijack.txt" not in inner, "已经在里面了"
+new = inner.rstrip() + ',"%s/lan_hijack.txt"' % rdir
+out = s[:m.start(1)] + new + s[m.end(1):]
+open(f, "w", encoding="utf-8").write(out)
+PY
+  then
+    c_y "  [面板迁移] 注入失败, 已还原。"; cp -a "$bak" "$f"; rm -f "$bak"; return 0
+  fi
+  if command -v mosdns >/dev/null 2>&1 && ! mosdns start -d "$(dirname "$f")" -c "$f" --test 2>/dev/null; then
+    : # mosdns 没有 --test 子命令时跳过静态校验, 下面的重启才是真判据
+  fi
+  if systemctl is-active --quiet mosdns 2>/dev/null; then
+    systemctl restart mosdns 2>/dev/null
+    sleep 1
+    if ! systemctl is-active --quiet mosdns; then
+      c_y "  [面板迁移] mosdns 重启失败 → 已还原配置并重启。"
+      cp -a "$bak" "$f"; systemctl restart mosdns 2>/dev/null; rm -f "$bak"; return 1
+    fi
+  fi
+  rm -f "$bak"
+  c_g "  mosdns 已挂上面板劫持集(空文件 = 休眠, 零影响)。"
+}
+
+# 把面板域名写进劫持集 —— 走事务(mosdns_rule:lan_hijack.txt 是现成的动态目标, 自带
+# restart:mosdns), 于是"写了一半 mosdns 起不来"这种状态不存在。
+_lan_write_hijack(){
+  local txm wd txid sha rc=0
+  txm="$(_pdg_module pdgtx.py)" || { c_y "❌ 找不到 pdgtx.py"; return 1; }
+  wd="$(mktemp -d)" || return 1
+  # 内容: 一行一个域名。mosdns 的 domain_set 默认按域名后缀匹配, 与 custom_hijack.txt 同形。
+  _lan_hosts > "$wd/new.txt"
+  # 判据是**存在与否**, 不是"非空"。迁移那一步会先建一个空文件(休眠), `-s` 对它为假,
+  # 于是会传出"文件不存在"的 `-` —— 而事务读到的是一个存在的空文件, 前置条件当场不符,
+  # 报出来的是 PRECONDITION_FAILED, 与真正的原因(判据用错)隔着一层。
+  if [[ -e "$LAN_HIJACK_FILE" ]]; then
+    if python3 "$txm" read --target "mosdns_rule:lan_hijack.txt" > "$wd/raw" 2>"$wd/err"; then
+      sha="$(head -1 "$wd/raw")"
+    else
+      c_y "❌ 读不到劫持集: $(tr -d '\n' < "$wd/err")"; rm -rf "$wd"; return 1
+    fi
+  else
+    sha="-"
+  fi
+  txid="$(python3 "$txm" new --source cli --op lan-hijack 2>"$wd/err")" || {
+    c_y "❌ 无法开始事务: $(tr -d '\n' < "$wd/err")"; rm -rf "$wd"; return 1; }
+  if ! python3 "$txm" stage --tx "$txid" --target "mosdns_rule:lan_hijack.txt" \
+        --file "$wd/new.txt" --expect "$sha" 2>"$wd/err"; then
+    c_y "❌ 暂存劫持集失败: $(tr -d '\n' < "$wd/err")"
+    python3 "$txm" abort "$txid" >/dev/null 2>&1 || true; rm -rf "$wd"; return 1
+  fi
+  python3 "$txm" apply --tx "$txid" >/dev/null 2>"$wd/err"; rc=$?
+  if [[ "$rc" != 0 ]]; then
+    c_y "❌ 劫持集落盘失败(已回滚): $(tr -d '\n' < "$wd/err")"; rm -rf "$wd"; return 1
+  fi
+  rm -rf "$wd"
+}
+
+# 重渲 mihomo 配置 —— 面板域名变了, 分流规则与 hosts: 段都要跟着变。
+_lan_rerender_mihomo(){
+  if ! ( cd /opt/pdg-bot && python3 -c 'import sys;sys.path.insert(0,"/opt/pdg-bot");import bot; bot._render_mihomo_file()' ) >/dev/null 2>&1; then
+    c_y "⚠️ mihomo 配置重渲失败 —— 面板域名还没进分流规则, 手机侧仍打不开。"
+    c_y "   跑 sudo pdg doctor 看 mihomo 配置那一项。"
+    return 1
+  fi
+  systemctl restart mihomo 2>/dev/null || true
+}
+
+# 手机侧那一整段: 迁移(一次性)→ 写劫持集 → 重渲分流。三步任一失败都要说清楚卡在哪 ——
+# 半通的状态(DNS 劫持了但 mihomo 不认路由, 或反过来)从表面上看都是"面板打不开"。
+_lan_wire(){
+  migrate_mosdns_lan || return 1
+  _lan_write_hijack || { c_y "   卡在: 写 DNS 劫持集。手机会拿到 NXDOMAIN, 整条链路不会被触发。"; return 1; }
+  _lan_rerender_mihomo || { c_y "   卡在: 重渲 mihomo 分流。DNS 已劫持到网关, 但 mihomo 不认这些域名 —— 手机会连上网关然后被按默认规则处理。"; return 1; }
+  return 0
+}
+
+cmd_lan(){
+  local sub="${1:-status}"; shift 2>/dev/null || true
+  case "$sub" in
+    status|"") _lan_status;;
+    list)      _lan_list;;
+    check)     local mod; mod="$(_pdg_module lanpanel.py)" || return 1
+               local t; t="$(mktemp)"; _lan_cur > "$t"
+               if python3 "$mod" check "$t"; then c_g "✅ 面板表通过门二校验"; rm -f "$t"; return 0
+               else rm -f "$t"; return 1; fi;;
+    routes)    _lan_routes "$@";;
+    add)       need_root lan
+               _lan_transact lan-add add "$@" && { c_g "✅ 已加入面板表。"; _lan_list; };;
+    rm)        need_root lan
+               [[ -n "${1:-}" ]] || { echo "用法: pdg lan rm <面板名>"; return 1; }
+               _lan_transact lan-rm rm "$1" && { c_g "✅ 已从面板表移除。"; _lan_list; };;
+    enable)    _lan_enable;;
+    disable)   _lan_disable;;
+    cert)      need_root lan; _lan_cert "${1:-}" "${2:-}";;
+    render)    need_root lan
+               _lan_render || return 1
+               c_g "✅ 反代配置与出站白名单已按面板表重新生成。"
+               _lan_wire && c_g "✅ DNS 劫持集与 mihomo 分流已同步。";;
+    wire)      need_root lan; _lan_wire && c_g "✅ DNS 劫持集与 mihomo 分流已同步。";;
+    purge)     _lan_purge "${1:-}";;
+    *)
+      echo "用法: pdg lan <status|list|check|routes|add|rm>"
+      echo "  status                    当前状态(面板数、门二、Tailscale)"
+      echo "  list                      面板清单"
+      echo "  check                     跑一遍门二校验"
+      echo "  routes <网段>...          门一: 判断家里通告的子网路由能不能接受"
+      echo "  add --name <短名> --host <域名> --target <http(s)://字面IP[:端口]> [选项]"
+      echo "      --insecure|--no-insecure   上游是 https 时**必须**二选一(家用设备多是自签证书,"
+      echo "                                 但默认跳过校验是错的 —— 那该由你按设备逐个确认)"
+      echo "      --rewrite-location         设备把自己的局域网 IP 写进跳转头时用"
+      echo "      --fix-referer              设备校验 Referer/Origin 必须是自己地址时用"
+      echo "      --legacy-tls               老设备只有 RSA 密钥交换套件(表现是 502 + handshake failure)"
+      echo "      --entry-query <q>          前后端分离的应用要在入口带的参数, 如 magicpath=xxxx"
+      echo "  rm <面板名>"
+      echo "  cert <dns插件名> [委派zone]  DNS-01 签发(凭据放 $LAN_DNS_ENV, 600 root:root)"
+      echo "                            给了委派 zone, token 就只需要能改那一个 zone ——"
+      echo "                            被拿下的网关签不了你自己的 DoT 域名(见 pdg lan status 的风险提示)"
+      echo "  enable / disable          启用/停用反代"
+      echo "  render                    面板表改过之后重新生成全部派生物(反代/白名单/DNS/分流)"
+      echo "  wire                      只同步 DNS 劫持集与 mihomo 分流(反代配置不动)"
+      echo "  purge [--keep-table]      连配置、证书、DNS 凭据、caddy 一起清掉"
+      return 1;;
+  esac
+}
+
 cmd_ssh_source(){
   need_root ssh-source
   local sub="${1:-status}"
@@ -5126,6 +5751,7 @@ case "${1:-menu}" in
   platform)      shift || true; cmd_platform "$@";;
   hijack-mode)   shift || true; cmd_hijack_mode "$@";;
   ssh-source)    shift || true; cmd_ssh_source "$@";;
+  lan)           shift || true; cmd_lan "$@";;
   link)          shift || true; cmd_link "$@";;
   uninstall|rm)  shift || true; cmd_uninstall "$@";;
   rescue)        shift || true; cmd_rescue "$@";;

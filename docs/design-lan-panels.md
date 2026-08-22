@@ -1,7 +1,10 @@
 # 设计:内网面板访问(手机零 App)
 
-> 状态:**设计,未实现**。方案 A 已在一台真机上跑通并实测(2026-08-21,见第 6 节),
-> 方案 B 尚未实现。本文是把 A 的实测经验整理成 B 的实施依据 —— B 才是能给别人用的形态。
+> 状态:**方案 B 已实现**(2026-08-22)。方案 A 的实测经验见第 6 节 —— 那些设备毛病
+> 在 B 里一条都没消失, 反代生成器从第一版就带着它们。
+>
+> **实现到哪一步、哪些没验, 见第 9 节。**别把"沙盒里产物正确"当成"手机能打开面板":
+> 后者要真实的 tailnet 子网路由与真实设备, 沙盒造不出来。
 
 ## 1. 要解决什么
 
@@ -162,3 +165,41 @@ WLOC 是 940 行 + 7 支 —— 所以这个功能**比救援平面小**,与 WLO
 - **不自动发现内网设备**。扫描用户网段并自动建映射,既不礼貌也不可靠。
 - **不代管 Tailscale 的安装与认证**(与 README 第 12 节同一条口径):那是一次性的系统级操作、
   要交互式认证,而真出事时 Bot 可能就起不来 —— 恰恰是 Tailscale 要救的场景。
+
+
+## 9. 实现状态与**没有验过的东西**(2026-08-22)
+
+### 已实现
+
+| 部分 | 落点 |
+|---|---|
+| 门一 路由重叠拒绝 | `deploy/bot/lanroute.py` + `pdg lan routes` + doctor 常驻 |
+| 门二 面板表校验 / 反代生成 | `deploy/bot/lanpanel.py`(含五条设备毛病) |
+| 门三 出站白名单 | `lanpanel.py render_nft` + unit 的 `ExecStartPre` |
+| 风险② DNS token 权限升级 | `pdg lan status` 每次都会说, 不只写在第 7 节 |
+| CLI | `pdg lan status/list/check/routes/add/rm/cert/enable/disable/render/wire/purge` |
+| 反代与证书 | Caddy 官方原版(钉版本+SHA256) + acme.sh(钉 commit) |
+| 手机侧接线 | mosdns `lan_hijack.txt` 挂进 `explicit_proxy`; mihomo `hosts:` + 面板规则 |
+| doctor | 路由重叠 / 白名单漂移 / 证书剩余 / ACL 越界探测(--deep) |
+| 卸载 | `pdg lan purge` 与 `uninstall.sh` 两条路, 残留逐条报出来 |
+
+### 已在沙盒真机上验过的
+
+- 全新安装 → `pdg lan add/rm` 走事务 → 快照回滚能把面板表还原;
+- 反代真跑起来: 以 `pdg-lan` 身份、只监听 `127.0.0.1:443`、TLS 握手成功、SNI 路由生效;
+- **门三的决定性验证**: 同一请求、同一份 Caddyfile、同一个上游, 只改白名单 ——
+  含该上游时 caddy 报 `connection refused`(放行了), 不含时报 `no route to host`(被拒);
+- **规则顺序的正负控**(两个容器走真 nft REDIRECT): 面板规则在 REJECT 之前 → HTTP 200;
+  在之后 → HTTP 000 `match IPCIDR(127.0.0.0/8) using REJECT`;
+- `wire` 之后三份派生物同时正确: mosdns 劫持集、mihomo `hosts:` 段、面板规则在 0/1 位。
+
+### **没有验过的**(别当成验过了)
+
+- **手机真的打开了面板** —— 整条链路端到端。这要真实的 tailnet 子网路由 + 真实设备,
+  沙盒造不出来。上面验的全是"产物正确", 不是"链路通"。
+- **ACL 越界探测**打在真 tailnet 上的表现。判据的三种读法有单元测试覆盖(连上/被拒/
+  不可达), 但没在真 ACL 上跑过。
+- **acme.sh 的真实签发**。容器里签不了 `.example.com`, 证书全是自签顶替的。
+  证书装到位之后 Caddy 能读、能握手 —— 这一段验过; 签发本身没有。
+- **续期**。acme.sh 装的 cron 是否真的把证书续上, 没有跨越 60 天验证过。
+  doctor 的证书项就是为这条不确定性存在的。

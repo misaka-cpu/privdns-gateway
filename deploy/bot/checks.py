@@ -1704,15 +1704,333 @@ def check_transactions():
             "<code>sudo pdg tx recover &lt;id&gt;</code> 恢复。" % (len(pend), items))
 
 
+
+# ── 内网面板(方案 B) ─────────────────────────────────────────────────────────
+LAN_TABLE = "/etc/privdns-gateway/lan-panels.json"
+LAN_CERT_DIR = "/etc/pdg-lan/certs"
+LAN_NFT_TABLE = "pdglan"
+LAN_USER = "pdg-lan"
+
+
+def _lan_cfg():
+    try:
+        with open(LAN_TABLE, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _lan_on():
+    """这台机器**此刻是否真的在用**内网面板。
+
+    判据不能只看面板表在不在: 停用之后表是刻意留下的(disable 的语义就是先停一停),
+    对着一个没在跑的功能报红只会让人下次不看 doctor。反过来, 服务在跑就必须查 ——
+    哪怕 profile 里的意图写着 0。
+
+    返回 (在用吗, 服务是否 active)。
+    """
+    _rc, out, _e = _run(["systemctl", "is-active", "pdg-lan"], 8)
+    active = (out or "").strip() == "active"
+    intent = (_profile("PDG_LAN_ENABLED") or "").strip() == "1"
+    return (active or intent), active
+
+
+def _lanpanel():
+    """按需 import lanpanel —— 它与 doctor 装在同一个目录(lib/modules.sh 的清单里)。
+    取不到就让调用方报"判据跑不了", 而不是让整个 doctor 崩掉。"""
+    try:
+        import lanpanel
+        return lanpanel
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def check_lan_routes():
+    """门一常驻: 本机接受的子网路由有没有与自己正在用的网段相交。
+
+    **与内网面板功能开没开无关**。危险来自"接受了一个重叠的路由"这件事本身: 只要接受了,
+    本机发往那个段的包就会走进 tailnet, 而分流数据面从配置上完全看不出问题。所以判据
+    挂在"有没有接受路由"上, 不挂在 PDG_LAN_ENABLED 上。
+    """
+    name = "内网面板: 子网路由重叠"
+    if not os.path.exists("/proc/net/dev"):
+        return None
+    try:
+        with open("/proc/net/dev", encoding="utf-8") as f:
+            if not any(l.strip().startswith("tailscale0:") for l in f):
+                return None          # 没有 tailnet, 这条不适用
+    except OSError:
+        return None
+    rc, out, _ = _run(["tailscale", "status", "--json"], 10)
+    if rc != 0 or not out.strip():
+        return ("warn", name, "读不到 tailscale status —— 无法确认接受了哪些子网路由")
+    try:
+        st = json.loads(out)
+    except ValueError:
+        return ("warn", name, "tailscale status 输出不是合法 JSON, 判据本次没跑")
+    # 本机**接受**的路由: 其它节点通告、且本机装进了路由表的那些。
+    routes = []
+    for peer in (st.get("Peer") or {}).values():
+        for r in (peer.get("PrimaryRoutes") or []):
+            if r not in routes:
+                routes.append(r)
+    if not routes:
+        return ("ok", name, "没有从别的节点接受任何子网路由, 不存在重叠")
+    try:
+        import lanroute
+    except Exception:  # noqa: BLE001
+        return ("warn", name, "取不到 lanroute 模块, 重叠判据本次没跑(装机清单里少了它?)")
+    internal = _profile("PDG_INTERNAL_CIDR")
+    locals_ = []
+    for fam in ("-4", "-6"):
+        rc, o, _ = _run(["ip", "-o", fam, "addr", "show", "scope", "global"], 8)
+        if rc == 0:
+            for line in o.splitlines():
+                parts = line.split()
+                if len(parts) > 3:
+                    try:
+                        locals_.append(lanroute.parse_net(parts[3]))
+                    except ValueError:
+                        pass
+    inet = None
+    if internal:
+        try:
+            inet = lanroute.parse_net(internal)
+        except ValueError:
+            inet = None
+    bad = lanroute.judge(routes, inet, locals_)
+    if not bad:
+        note = "" if inet else "(注意: 读不到 PDG_INTERNAL_CIDR, 最要紧的那条判据没跑)"
+        return ("ok" if inet else "warn", name,
+                "接受的 %d 条路由都不与本机网段相交%s" % (len(routes), note))
+    why = "; ".join("%s: %s" % (c, r[0][1]) for c, r in bad[:3])
+    return ("fail", name,
+            "接受的子网路由里有 %d 条会打乱本机数据面 —— %s。"
+            "这类故障从配置上完全看不出来, 要在家里那侧改小通告范围。" % (len(bad), why))
+
+
+def check_lan_whitelist():
+    """门三: 内核里的出站白名单必须与面板表**逐条一致**。
+
+    漂移的两个方向都危险, 但不是同一种危险:
+      · 白名单多出面板表没有的地址 = 反代能连到不该连的地方(通常是删了面板没重新生成);
+      · 白名单少了面板表里的地址 = 那个面板打不开, 而症状是 502, 看着像设备坏了。
+    """
+    name = "内网面板: 出站白名单"
+    cfg = _lan_cfg()
+    if cfg is None:
+        return None                   # 从来没配过这个功能
+    on, active = _lan_on()
+    if not on:
+        return ("ok", name, "内网面板已停用(面板表留着, pdg lan enable 可以随时回来) —— 不适用")
+    lp = _lanpanel()
+    if lp is None:
+        return ("warn", name, "取不到 lanpanel 模块, 白名单判据本次没跑")
+    try:
+        want = set(lp.targets(cfg))
+    except Exception as e:  # noqa: BLE001
+        return ("warn", name, "面板表读不出目标(%s)" % e)
+    # **不能用 nftlive.read_kernel()**: 它只取 `inet pdg` 那一张表, 看不见 pdglan ——
+    # 用它的话这一项会永远报"表不存在", 而一个永远报红的检查等于没有。这里直接问那张表。
+    rc, raw, err = _run(["nft", "-j", "list", "table", "inet", LAN_NFT_TABLE], 15)
+    if rc != 0:
+        # nft 明确说"没有这张表"与"nft 用不了"要分开: 前者是判据成立的一种结果,
+        # 后者是判据没跑成 —— 混成一句会让缺权限的机器看起来像防火墙丢了。
+        low = (err or "").lower()
+        if "no such file" in low or "does not exist" in low:
+            seen_table, have, obj = False, set(), None
+        else:
+            return ("warn", name, "读不到 inet %s 表(%s)" % (LAN_NFT_TABLE, (err or "").strip()[:120]))
+    else:
+        try:
+            obj = json.loads(raw)
+        except ValueError:
+            return ("warn", name, "nft -j 输出不是合法 JSON, 白名单判据本次没跑")
+        seen_table = True
+        have = set()
+    for item in ((obj or {}).get("nftables", []) if obj else []):
+        rule = item.get("rule")
+        if not rule or rule.get("table") != LAN_NFT_TABLE:
+            continue
+        ip_, port = None, None
+        for ex in rule.get("expr", []):
+            m = ex.get("match")
+            if not m:
+                continue
+            left, right = m.get("left", {}), m.get("right")
+            pl = left.get("payload") or {}
+            if pl.get("field") == "daddr" and isinstance(right, str):
+                ip_ = right
+            elif pl.get("field") == "dport" and isinstance(right, int):
+                port = right
+        if ip_ and port:
+            have.add((ip_, port))
+    if not seen_table:
+        if not want:
+            return ("ok", name, "面板表是空的, 也没有白名单表 —— 一致")
+        if active:
+            # 反代**正在跑**而白名单不在 = 这个进程此刻能连到内网任意地址。门三本来靠
+            # ExecStartPre 挡住这种状态, 走到这里说明有人在服务起来之后把表删了。
+            return ("fail", name,
+                    "反代正在运行, 但内核里没有 inet %s 表 —— 它此刻**能连到内网任意地址**。"
+                    "立刻 sudo pdg lan render 再 sudo systemctl restart pdg-lan。" % LAN_NFT_TABLE)
+        return ("warn", name,
+                "启用意图开着, 但反代没在跑、白名单也不在 —— 功能实际上是停的。"
+                "要用就 sudo pdg lan enable, 不用就 sudo pdg lan disable 把意图也改掉。")
+    extra, miss = have - want, want - have
+    if not extra and not miss:
+        return ("ok", name, "白名单与面板表逐条一致(%d 个上游)" % len(want))
+    parts = []
+    if extra:
+        parts.append("白名单多出 %s —— 反代能连到面板表之外的地址"
+                     % ", ".join("%s:%d" % t for t in sorted(extra)[:3]))
+    if miss:
+        parts.append("白名单缺少 %s —— 那些面板会以 502 打不开, 看着像设备坏了"
+                     % ", ".join("%s:%d" % t for t in sorted(miss)[:3]))
+    return ("fail", name, "; ".join(parts) + "。跑 sudo pdg lan render 后重启 pdg-lan。")
+
+
+def check_lan_cert():
+    """面板证书的剩余天数。
+
+    反代读的是**落盘的**证书, 它自己不去续 —— 续期靠 acme.sh 装的 cron。那条链断掉时
+    不会有任何报错, 直到某天所有面板一起打不开。所以这一项存在的意义就是提前那两周。
+
+    判据用 `openssl x509 -checkend`(与 check_cert 同一个惯用法), 不自己解析日期字符串:
+    notAfter 的格式带时区缩写, strptime 在不同 locale 下解出来的东西不一样。
+    """
+    name = "内网面板: 证书"
+    cfg = _lan_cfg()
+    if cfg is None:
+        return None
+    on, _active = _lan_on()
+    if not on:
+        return None                   # 停用中: 证书过不过期都不影响任何东西
+    panels = [p for p in cfg.get("panels", []) if isinstance(p, dict) and p.get("name")]
+    if not panels:
+        return None
+    missing, expired, soon = [], [], []
+    for p in panels:
+        crt = os.path.join(LAN_CERT_DIR, "%s.crt" % p["name"])
+        if not os.path.exists(crt):
+            missing.append(p["name"]); continue
+        rc, _, _ = _run(["openssl", "x509", "-checkend", "0", "-noout", "-in", crt], 8)
+        if rc != 0:
+            expired.append(p["name"]); continue
+        rc, _, _ = _run(["openssl", "x509", "-checkend", str(14 * 86400), "-noout", "-in", crt], 8)
+        if rc != 0:
+            soon.append(p["name"])
+    if missing:
+        return ("fail", name, "这些面板没有可读的证书: %s —— 跑 sudo pdg lan cert <dns插件名>"
+                % ", ".join(missing[:5]))
+    if expired:
+        return ("fail", name, "这些面板的证书已过期: %s —— 面板打不开" % ", ".join(expired[:5]))
+    if soon:
+        return ("warn", name, "这些面板的证书 14 天内到期: %s —— 续期链(acme.sh 的 cron)"
+                              "可能已经断了, 它断掉时不会有任何报错" % ", ".join(soon[:5]))
+    return ("ok", name, "%d 张证书都还有 14 天以上" % len(panels))
+
+
+
+def _lan_probe_target(cfg):
+    """挑一个**不在面板表里**、但与某个面板同网段的地址, 用来探 tailnet ACL 的边界。
+
+    取同 /24 里的另一个主机位: 家里那侧如果按设计把 ACL 收成"只允许网关访问那几个
+    IP:端口", 这个地址就该到不了。返回 (ip, port, 参照的面板 IP) 或 None。
+    """
+    import ipaddress
+    tgts = []
+    lp = _lanpanel()
+    if lp is None:
+        return None
+    try:
+        tgts = lp.targets(cfg)
+    except Exception:  # noqa: BLE001
+        return None
+    for ip_s, port in tgts:
+        try:
+            ip = ipaddress.ip_address(ip_s)
+        except ValueError:
+            continue
+        if ip.version != 4:
+            continue
+        net = ipaddress.ip_network("%s/24" % ip_s, strict=False)
+        used = {t[0] for t in tgts}
+        # 从网段末尾往回找一个没被用到的主机位 —— 靠后的地址通常没有设备,
+        # 探它比探 .1(往往是路由器)更不容易打扰到真在跑的东西。
+        for host in list(net.hosts())[::-1][:8]:
+            if str(host) not in used:
+                return (str(host), port, ip_s)
+    return None
+
+
+def check_deep_lan_acl():
+    """tailnet ACL 越界探测(慢速, 只在 --deep 跑)。
+
+    设计文档第 4 节把这条列为"能测出来的, 不是只能靠嘱咐": **真正的硬边界在家里那台
+    子网路由器上** —— Tailscale 的包过滤在目标节点执行, 所以网关就算被 root 了, 往
+    ACL 之外的地址发包也会被家里那台丢掉。项目管不了用户的 tailnet 后台, 但可以探。
+
+    判据的读法要小心, 三种结果不是"成功/失败"两分:
+      · 连上了        → ACL 放行了本不该放行的地址 → fail
+      · 连接被拒(RST) → 包**到达了对端**才会有 RST → ACL 同样放行了 → fail
+      · 不可达/超时   → 被丢在半路 → 这正是期望的结果 → ok
+
+    探测**以 root 身份发起**, 因此不受门三(出站白名单)约束 —— 那是有意的: 门三管的是
+    反代进程, 而这一项要量的是**家里那侧**的过滤器。用受限身份去探, 量到的会是自己的
+    防火墙, 那等于什么都没验。
+    """
+    name = "内网面板: tailnet ACL 边界(deep)"
+    cfg = _lan_cfg()
+    if cfg is None:
+        return None
+    on, _active = _lan_on()
+    if not on:
+        return None
+    pick = _lan_probe_target(cfg)
+    if pick is None:
+        return ("warn", name, "挑不出可用的探测地址(面板表里没有 IPv4 上游?), 本项没跑")
+    ip_, port, ref = pick
+    import socket
+    s = socket.socket()
+    s.settimeout(4)
+    try:
+        s.connect((ip_, port))
+        s.close()
+        return ("fail", name,
+                "从网关能连上 %s:%d —— 它**不在**面板表里, 说明 tailnet ACL 没有收窄到"
+                "只允许那几个 IP:端口。一台被拿下的网关因此能摸到你家整个网段。"
+                "去 tailnet 后台按 docs/design-lan-panels.md 第 4 节的模板配 ACL。" % (ip_, port))
+    except socket.timeout:
+        return ("ok", name, "%s:%d(面板表之外)连不上 —— ACL 边界看起来是收紧的" % (ip_, port))
+    except ConnectionRefusedError:
+        return ("fail", name,
+                "%s:%d 回了 RST —— 包**到达了对端**才会有这个回应, 说明 tailnet ACL 放行了"
+                "面板表之外的地址(参照面板 %s)。ACL 该做的是把它丢掉, 而不是让对端拒绝。"
+                % (ip_, port, ref))
+    except OSError as e:
+        # EHOSTUNREACH(113)/ENETUNREACH(101) = 被丢在半路, 正是期望的
+        if getattr(e, "errno", None) in (101, 113):
+            return ("ok", name, "%s:%d(面板表之外)被丢弃 —— ACL 边界成立" % (ip_, port))
+        return ("warn", name, "探测没跑成(%s), 本项无结论" % e)
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+
+
 ALL = [check_platform, check_services, check_bot_credentials, check_health_timer, check_core_version, check_dot_arecord, check_dot_domain_sync,
        check_internal_cidr, check_cidr_drift, check_nft, check_nft_input_chains, check_redirect, check_gms,
        check_tailscale_isolation, check_tailscale_residue,
+       check_lan_routes, check_lan_whitelist, check_lan_cert,
        check_mosdns_ratelimit, check_mosdns_explicit_proxy, check_ruleset_hijack,
        check_nft_extra, check_rescue_firewall, check_geosite_db, check_mem,
        check_cert, check_cert_dir_sync, check_dns, check_core_config, check_rulesets, check_rule_precedence,
        check_mitm_structure, check_mitm, check_transactions]
 ALERT = [check_services, check_dns, check_cert]  # healthcheck 用的轻量子集(运行期故障)
-DEEP = [check_deep_dot_handshake, check_deep_probe81, check_deep_dot_witness, check_deep_dns_cn,
+DEEP = [check_deep_lan_acl,
+        check_deep_dot_handshake, check_deep_probe81, check_deep_dot_witness, check_deep_dns_cn,
         check_deep_clash, check_deep_upstreams, check_deep_hijack_note]  # pdg doctor --deep 追加
 
 def run(funcs=None):

@@ -89,7 +89,7 @@ PROBE = textwrap.dedent('''
     import mihomorender as M
     model = json.loads(%r)
     meta = json.loads(%r)
-    data, rmeta = M.render_bytes(model, rulesets=M.rulesets_arg(meta),
+    data, rmeta = M.render_bytes(model, lan_domains=[], rulesets=M.rulesets_arg(meta),
                                  mitm_domains=[], tls_ports=None)
     try:
         M.check_meta(rmeta)

@@ -13,6 +13,17 @@ MOSDNS_VER="v5.3.4"
 MIHOMO_VER="v1.19.29"         # 流量内核: mihomo/clash.meta, sniffer.override-destination 无版本天花板, 活跃维护可更新
 ZASHBOARD_VER="v3.15.0"       # 观测面板(纯静态前端, 由 external_ui 托管; dist-no-fonts 最小、不依赖 CDN; mihomo 原生 clash 核也可托管)
 
+# ── 内网面板(方案 B)专用: 反代 + 证书签发 ──────────────────────────────────
+# Caddy 用**官方原版**(不带任何 DNS 插件)。带插件要用 xcaddy 按服务商各构建一个 46MB
+# 二进制, 等于只支持一家 DNS 服务商; 签发交给 acme.sh(覆盖 150+ 家), 证书落盘后 Caddy
+# 用 `tls <cert> <key>` 读 —— 于是换服务商不用换二进制。
+CADDY_VER="v2.11.4"
+# acme.sh 按**commit sha** 钉, 不按 tarball 哈希。它是个 git 仓库而不是发布二进制,
+# tag 可以被移动, 而 commit sha 是内容寻址的 —— clone 之后逐字核对这个 sha, 对不上就拒装。
+# 自己算一份 tarball 哈希再钉上去只是 TOFU: 第一次下载就被换掉的话, 钉的正是被换过的那份。
+ACME_SH_VER="3.1.4"
+ACME_SH_COMMIT="3661fd86b6304115e42f43910e6dd452ab9866d6"
+
 # key = <name>-<arch>(arch: amd64 / arm64); zashboard 为纯前端, 与架构无关(单一哈希)
 declare -A PDG_SHA256=(
   [mosdns-amd64]="3abcc73080789eb1ccca78dab5049b85ac1e9b8f865ab60158a527b77cd72e85"
@@ -21,6 +32,12 @@ declare -A PDG_SHA256=(
   [mihomo-amd64]="60de76a35a6cbf7b4fa4a20f5c257c24345d1d635ab1aa3877022a1997ef413c"
   [mihomo-arm64]="9a868b5e4e0ad91d9d71e1b41b0cfce78aaba44360c30df74a723f8e3926a86c"
   [zashboard]="403b351d3663f5fe65db053cb2f3dc980108d8f86e8c6968d56164d3452592e1"
+  # Caddy 官方 release 的 caddy_<ver>_linux_<arch>.tar.gz。
+  # 上游发布的校验和文件里是 **SHA-512**, 本项目统一用 SHA-256, 所以这两个值是
+  # "先用上游的 SHA-512 校验下载物、确认无误之后再算出来的" —— 不是直接对一个来路
+  # 不明的文件算哈希盖章。换版本时按同一顺序重做: 先验 SHA-512, 再取 SHA-256。
+  [caddy-amd64]="527fbf917c39189a1e3b31d34fa955601680b2d5c8055d2a87b8b9588dec7bb9"
+  [caddy-arm64]="52d42ae12b3462097e9868da6dfed3c9648ae12edd3b3638102312af84cb6904"
 )
 
 # ── 内核版本判定: 必须精确匹配, 不能用子串 ──────────────────────────────────

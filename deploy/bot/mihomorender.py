@@ -292,6 +292,27 @@ def read_mitm_domains(path, platform):
     return out
 
 
+def read_lan_domains(path):
+    """内网面板(方案 B)的域名列表, 读面板表 —— 与反代配置、出站白名单**同一个真源**。
+
+    读不出来一律返回空列表(功能没启用时它本来就不存在)。这里不做校验: 门二在
+    `pdg lan add` 那一侧已经拦过, 而渲染路径上再拒一次的后果是**整份 mihomo 配置渲染
+    不出来** —— 面板配错不该把用户的全部流量一起搞停。
+    """
+    out = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return out
+    for panel in (d.get("panels") or []):
+        if isinstance(panel, dict) and isinstance(panel.get("host"), str):
+            h = panel["host"].strip().lower()
+            if h and h not in out:
+                out.append(h)
+    return out
+
+
 def read_platform(path):
     """手机平台标记: ios / android(读不到默认 android —— 不启用 iOS 专属的 MITM 等)。"""
     try:
@@ -304,7 +325,7 @@ def read_platform(path):
 
 
 # ── 渲染与判废 ──────────────────────────────────────────────────────────────
-def render_bytes(model, *, rulesets, mitm_domains, tls_ports):
+def render_bytes(model, *, rulesets, mitm_domains, tls_ports, lan_domains):
     """从给定 model 渲染出 mihomo 配置的**字节**(不落盘)。返回 (bytes, meta)。
 
     事务在候选阶段用它: 内核配置是 model 的派生物, 必须和 model 在同一笔事务里一起校验、
@@ -316,6 +337,7 @@ def render_bytes(model, *, rulesets, mitm_domains, tls_ports):
     cfg, meta = sb2mihomo.singbox_to_mihomo(
         model, redir_port=MIHOMO_REDIR, rulesets=rulesets,
         mitm_domains=mitm_domains, mitm_port=MITM_PORT, tls_ports=tls_ports,
+        lan_domains=lan_domains,
         **panel_args(model))
     # mihomo 只吃 YAML; JSON 是 YAML 的子集, 直接可解析
     return json.dumps(cfg, ensure_ascii=False, indent=2).encode("utf-8"), meta
@@ -361,19 +383,19 @@ def _dropped_items(dropped):
     return out
 
 
-def derive_bytes(staged, *, rulesets, mitm_domains, tls_ports):
+def derive_bytes(staged, *, rulesets, mitm_domains, tls_ports, lan_domains):
     """pdgtx deriver 的公共主体: 由**候选** model 渲染并判废。
 
     候选里如果带着 rs_meta, 调用方应当据此算出 rulesets 再传进来 —— 读现网旧文件会让新增的
     规则集"翻译不了"被丢掉, 或者已删的又冒出来。"""
     model = json.loads(staged["model"].decode("utf-8"))
     data, meta = render_bytes(model, rulesets=rulesets, mitm_domains=mitm_domains,
-                              tls_ports=tls_ports)
+                              tls_ports=tls_ports, lan_domains=lan_domains)
     check_meta(meta)
     return data
 
 
-def deriver_from_paths(*, rs_meta_path, mitm_hijack_file, platform_file):
+def deriver_from_paths(*, rs_meta_path, mitm_hijack_file, platform_file, lan_table_file):
     """给**不能 import bot** 的调用方(配置恢复、救援的紧急默认出口)用的 deriver 工厂。
 
     返回一个 pdgtx 认的 deriver(staged → bytes)。路径显式传入, 因为这些调用方跑在事务沙箱
@@ -391,7 +413,8 @@ def deriver_from_paths(*, rs_meta_path, mitm_hijack_file, platform_file):
         try:
             return derive_bytes(staged, rulesets=rulesets_arg(meta),
                                 mitm_domains=read_mitm_domains(mitm_hijack_file, plat),
-                                tls_ports=[443] if plat == "ios" else None)
+                                tls_ports=[443] if plat == "ios" else None,
+                                lan_domains=read_lan_domains(lan_table_file))
         except RenderRefused as e:
             # 边界映射: 事务层认 TxRefused, 于是配置恢复/救援能给出可解释的拒绝而不是 500。
             # 详情一律取 detail()(它自己脱敏); 事务核心不在就把 RenderRefused 原样抛出去 ——

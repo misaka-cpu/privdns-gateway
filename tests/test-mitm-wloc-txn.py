@@ -370,8 +370,21 @@ def main():
             ok("%s → 事务自己收尾成 %s, 候选材料已删" % (label, sts[-1][1]))
         else:
             bad("%s 之后残留: %s" % (label, sts))
-        metas = "".join(open(os.path.join(box.env["PDG_TX_ROOT"], d, "meta.json"),
-                             encoding="utf-8").read() for d, _s, _c in sts)
+        # 判据找的是**候选正文**有没有漏进 meta。txid 与 started_at/ended_at 不是候选
+        # 内容, 但它们的格式(`…SS.mmm…` / `1787378576.055…`)天然可能含有 "35.6" 这四个
+        # 字符 —— 那会让这条断言在某些时刻凭空变红。CI 上真撞过一次(同一 commit 重跑即绿)。
+        # 所以先把这几个字段摘掉再搜: 剔的是干草, 不是针 —— "35.6" 仍是原来那根针。
+        def _no_ts(raw):
+            try:
+                d_ = json.loads(raw)
+            except ValueError:
+                return raw
+            for k in ("txid", "started_at", "ended_at"):
+                d_.pop(k, None)
+            return json.dumps(d_, ensure_ascii=False)
+
+        metas = "".join(_no_ts(open(os.path.join(box.env["PDG_TX_ROOT"], d, "meta.json"),
+                                    encoding="utf-8").read()) for d, _s, _c in sts)
         if "BACKUP-PASSWORD" not in metas and "35.6" not in metas:
             ok("%s: meta 里没有候选正文/坐标" % label)
         else:
