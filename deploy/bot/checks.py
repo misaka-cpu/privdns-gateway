@@ -1913,9 +1913,18 @@ def check_lan_cert():
     #   ① 这张证书本身没过期;
     #   ② 它的 SAN 覆盖了**每一个**面板 —— 加了面板却没重签时文件照样在、也没过期,
     #      而新面板的名字不在 SAN 里, 手机上是证书错误。只看文件在不在会漏掉这一整类。
+    # **一律不用 fail。**`pdg update` 跑完自检, 任何 fail 都会让整次更新回滚 —— 而面板
+    # 证书出问题只是"面板打不开", 不该把一个修了 DNS/代理缺陷的更新一起挡掉。
+    # 真机上撞过: 在 v1.10.7 启用过面板的机器升级时, 因为证书布局变了(一板一张 → 共用
+    # 一张 SAN)这一项判 fail, 于是**每次更新都回滚, 永远升不上来**。
+    # 危险的那种状态(反代在跑而白名单不在)由 check_lan_whitelist 负责, 那一项才该 fail。
     crt = os.path.join(LAN_CERT_DIR, "panel.crt")
     if not os.path.exists(crt):
-        return ("fail", name, "没有 %s —— 跑 sudo pdg lan cert <dns插件名> 签发" % crt)
+        old = [f for f in os.listdir(LAN_CERT_DIR)] if os.path.isdir(LAN_CERT_DIR) else []
+        hint = ("(检测到旧版一板一张的证书布局: %s —— `sudo pdg lan render` 会自动搬过来)"
+                % ", ".join(sorted(x for x in old if x.endswith(".crt"))[:4])) if old else ""
+        return ("warn", name, "没有 %s, 面板打不开 —— 跑 sudo pdg lan cert <dns插件名> 签发%s"
+                % (crt, hint))
     rc, out, _ = _run(["openssl", "x509", "-in", crt, "-noout", "-ext", "subjectAltName"], 8)
     if rc != 0:
         return ("warn", name, "证书读不出来(openssl rc=%d), 本项无结论" % rc)
@@ -1923,12 +1932,13 @@ def check_lan_cert():
             if "DNS:" in x}
     absent = [p["host"] for p in panels if p.get("host") and p["host"] not in sans]
     if absent:
-        return ("fail", name,
-                "证书的 SAN 里没有这些面板: %s —— 加过面板就要重签(所有面板共用一张证书): "
-                "sudo pdg lan cert <dns插件名>" % ", ".join(absent[:5]))
+        return ("warn", name,
+                "证书的 SAN 里没有这些面板: %s —— 手机上访问它们会是证书错误。"
+                "加过面板就要重签(所有面板共用一张证书): sudo pdg lan cert <dns插件名>"
+                % ", ".join(absent[:5]))
     rc, _, _ = _run(["openssl", "x509", "-checkend", "0", "-noout", "-in", crt], 8)
     if rc != 0:
-        return ("fail", name, "证书已过期 —— 面板全部打不开")
+        return ("warn", name, "证书已过期 —— 面板全部打不开(不影响分流与 DNS)")
     rc, _, _ = _run(["openssl", "x509", "-checkend", str(14 * 86400), "-noout", "-in", crt], 8)
     if rc != 0:
         return ("warn", name, "证书 14 天内到期 —— 续期链(acme.sh 的 cron)可能已经断了, "

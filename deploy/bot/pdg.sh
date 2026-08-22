@@ -761,7 +761,7 @@ migrate_firewall_template_sync(){
       return 1
     fi
     c_g "内核规则落后于磁盘配置 → 重新加载一次(不改磁盘; nft-input.d 规则不受影响)…"
-    if ! nft -f "$f" >/dev/null 2>&1; then
+    if ! _nft_apply_main "$f" >/dev/null 2>&1; then
       c_y "防火墙重新加载失败 —— 内核仍是加载前那份, 磁盘未动。"
       return 1
     fi
@@ -1407,7 +1407,7 @@ cmd_rollback(){
   local unrestored=()                         # 未能恢复项(内核激活/仓库Git); 非空即"未完全回滚"
   # daemon-reload 失败必须计入: 后面 enable/start 全建立在它之上, 吞掉它等于谎报回滚成功。
   systemctl daemon-reload || unrestored+=("daemon-reload")
-  nft -f /etc/nftables.conf 2>/dev/null || true
+  _nft_apply_main >/dev/null 2>&1 || true
   # v1.6.0: mihomo 是唯一内核。无论快照记录的是 mihomo 还是迁移前的 singbox, 一律起 mihomo ——
   # config.json 是核无关数据模型, mihomo 总能从它渲染。并清掉快照可能带回来的 sing-box 残留。
   # shellcheck source=/dev/null
@@ -2092,7 +2092,7 @@ _ios_offer_download(){
   fi
   URL="http://$IP:$PORT/$TOK.mobileconfig"
 
-  trap 'kill "$SRV" 2>/dev/null; nft -f /etc/nftables.conf 2>/dev/null; rm -rf "$WWW"; trap - INT TERM' INT TERM
+  trap 'kill "$SRV" 2>/dev/null; _nft_apply_main >/dev/null 2>&1; rm -rf "$WWW"; trap - INT TERM' INT TERM
   nft insert rule inet pdg input ip saddr "$CIDR" tcp dport "$PORT" accept 2>/dev/null
   # exec: 让下面那个 kill 直接打在 timeout 上(它再转发给 python3)。少了它被杀的只是外层
   # 子 shell, 端口会一直开到 10 分钟超时为止 —— 与"按回车即收"不符。
@@ -2108,7 +2108,7 @@ _ios_offer_download(){
   c_y "装好后按回车收尾(10 分钟自动收)…"
   read -t 600 -r _ || true
   kill "$SRV" 2>/dev/null
-  nft -f /etc/nftables.conf 2>/dev/null   # 撤掉临时放行
+  _nft_apply_main >/dev/null 2>&1   # 撤掉临时放行
   rm -rf "$WWW"
   trap - INT TERM
   echo "已关闭临时下载服务。"
@@ -3704,11 +3704,11 @@ _switchcore_nft(){   # $1=target(mihomo)  渲染并应用 mihomo nft(用当前 S
     [[ -e "$bak" ]] && cp -a "$bak" /etc/nftables.conf 2>/dev/null
     rm -rf "$wd"; echo "写入 /etc/nftables.conf 失败(磁盘满?), 已还原"; return 1
   fi
-  if ! nft -f /etc/nftables.conf; then
+  if ! _nft_apply_main; then
     rc=1
     if [[ -e "$bak" ]]; then
       cp -a "$bak" /etc/nftables.conf 2>/dev/null
-      nft -f /etc/nftables.conf 2>/dev/null || true
+      _nft_apply_main >/dev/null 2>&1 || true
       echo "应用新防火墙失败 → 已还原并重新应用原配置"
     fi
     rm -rf "$wd"; return "$rc"
@@ -3800,11 +3800,11 @@ SCPY
   pdg_write_unit pdg_unit_mihomo /etc/systemd/system/mihomo.service   # 与装机同源(含 SAFE_PATHS)
   [[ "$plat" == ios ]] && pdg_write_unit pdg_unit_pdg_mitm /etc/systemd/system/pdg-mitm.service
   systemctl daemon-reload
-  _switchcore_nft mihomo || { printf '%s\n' "${prev_backend:-singbox}" > /etc/privdns-gateway/backend; [[ -f /etc/nftables.conf.scbak ]] && { cp /etc/nftables.conf.scbak /etc/nftables.conf; nft -f /etc/nftables.conf; }; echo "❌ nft 应用失败, 已回滚"; return 1; }
+  _switchcore_nft mihomo || { printf '%s\n' "${prev_backend:-singbox}" > /etc/privdns-gateway/backend; [[ -f /etc/nftables.conf.scbak ]] && { cp /etc/nftables.conf.scbak /etc/nftables.conf; _nft_apply_main; }; echo "❌ nft 应用失败, 已回滚"; return 1; }
   if ! _core_kernel_activate mihomo sing-box; then
     c_y "mihomo 启动/自启核验失败 → 回滚"
     printf '%s\n' "${prev_backend:-singbox}" > /etc/privdns-gateway/backend
-    [[ -f /etc/nftables.conf.scbak ]] && { cp /etc/nftables.conf.scbak /etc/nftables.conf; nft -f /etc/nftables.conf 2>/dev/null; }
+    [[ -f /etc/nftables.conf.scbak ]] && { cp /etc/nftables.conf.scbak /etc/nftables.conf; _nft_apply_main >/dev/null 2>&1; }
     _core_kernel_restore mihomo sing-box; rm -f /etc/nftables.conf.scbak
     echo "❌ 迁移失败, 已回滚。mihomo 最近日志:"
     journalctl -u mihomo -n 15 --no-pager -o cat 2>/dev/null | sed 's/^/    /'
@@ -4034,9 +4034,9 @@ _rescue_nft_open(){
   nft -c -f "$cand" >/dev/null 2>&1 || return 1      # 候选先校验, 再动现网
   cp -a /etc/nftables.conf /etc/nftables.conf.pdg-rescue-bak 2>/dev/null || true
   mv -f "$cand" /etc/nftables.conf || return 1
-  nft -f /etc/nftables.conf >/dev/null 2>&1 || {
+  _nft_apply_main >/dev/null 2>&1 || {
     mv -f /etc/nftables.conf.pdg-rescue-bak /etc/nftables.conf 2>/dev/null
-    nft -f /etc/nftables.conf >/dev/null 2>&1; return 1; }
+    _nft_apply_main >/dev/null 2>&1; return 1; }
   rm -f /etc/nftables.conf.pdg-rescue-bak
   # 磁盘与内核都必须**恰好一条**; 对不上就回滚, 不留"看着开了实际不通"或重复规则
   [[ "$(_rescue_nft_count_disk)" == 1 && "$(_rescue_nft_count_kernel)" == 1 ]] || return 1
@@ -4053,8 +4053,8 @@ _rescue_nft_close(){
   nft -c -f "$cand" >/dev/null 2>&1 || return 1
   cp -a /etc/nftables.conf "$bak" 2>/dev/null || true
   mv -f "$cand" /etc/nftables.conf || return 1
-  nft -f /etc/nftables.conf >/dev/null 2>&1 || {
-    mv -f "$bak" /etc/nftables.conf 2>/dev/null; nft -f /etc/nftables.conf >/dev/null 2>&1; return 1; }
+  _nft_apply_main >/dev/null 2>&1 || {
+    mv -f "$bak" /etc/nftables.conf 2>/dev/null; _nft_apply_main >/dev/null 2>&1; return 1; }
   _rescue_nft_drop_legacy || true                  # 顺手带走旧独立表(内核对象)
   rm -f "$bak"
   [[ "$(_rescue_nft_count_disk)" == 0 && "$(_rescue_nft_count_kernel)" == 0 ]] || return 1
@@ -4564,7 +4564,7 @@ cmd_platform(){
     for g in platform profile.env mitm.json nftables.conf config.yaml mitm_hijack.txt; do
       case "$g" in
         platform|profile.env|mitm.json) [[ -e "$wd/$g" ]] && cp -a "$wd/$g" "/etc/privdns-gateway/$g";;
-        nftables.conf) [[ -e "$wd/$g" ]] && { cp -a "$wd/$g" /etc/nftables.conf; nft -f /etc/nftables.conf 2>/dev/null || true; };;
+        nftables.conf) [[ -e "$wd/$g" ]] && { cp -a "$wd/$g" /etc/nftables.conf; _nft_apply_main >/dev/null 2>&1 || true; };;
         config.yaml)   [[ -e "$wd/$g" ]] && cp -a "$wd/$g" /etc/mihomo/config.yaml;;
         mitm_hijack.txt) [[ -e "$wd/$g" ]] && cp -a "$wd/$g" /etc/mosdns/rules/mitm_hijack.txt;;
       esac
@@ -5184,7 +5184,41 @@ _lan_cert(){
 
 # 由面板表**派生**反代配置与出站白名单。两份都从同一张表来 —— 这是门三成立的前提:
 # 白名单与反代实际会连的地址不可能不一致。
+# 旧布局迁移: v1.10.7/v1.10.8 把证书按面板名装(<name>.crt), 新版共用一张 panel.crt。
+#
+# 能自动搬是因为那个 bug 的性质: acme.sh 一次签发多个域名产出的**本来就是一张 SAN 证书**,
+# 只是被装到了第一个域名的名字下 —— 它的 SAN 已经覆盖全部面板。所以找一张 SAN 覆盖得全的
+# 搬过来即可, 不用重签(重签要 DNS 凭据, 而升级路径上不该要那个)。
+# 找不到覆盖得全的就什么都不做 —— 那种情况只能重签, doctor 会说。
+_lan_migrate_certs(){
+  [[ -d "$LAN_CERT_DIR" ]] || return 0
+  [[ -s "$LAN_CERT_DIR/panel.crt" ]] && return 0
+  local want c sans ok_all
+  want="$(_lan_hosts)"
+  [[ -n "$want" ]] || return 0
+  for c in "$LAN_CERT_DIR"/*.crt; do
+    [[ -e "$c" ]] || continue
+    [[ -s "${c%.crt}.key" ]] || continue
+    sans="$(openssl x509 -in "$c" -noout -ext subjectAltName 2>/dev/null \
+            | tr ',' '\n' | sed 's/.*DNS://;s/ //g')"
+    ok_all=1
+    while read -r h; do
+      [[ -n "$h" ]] || continue
+      grep -qxF "$h" <<<"$sans" || { ok_all=0; break; }
+    done <<<"$want"
+    if [[ "$ok_all" == 1 ]]; then
+      cp -a "$c" "$LAN_CERT_DIR/panel.crt" && cp -a "${c%.crt}.key" "$LAN_CERT_DIR/panel.key" || return 0
+      chown root:"$LAN_USER" "$LAN_CERT_DIR/panel.crt" "$LAN_CERT_DIR/panel.key" 2>/dev/null || true
+      chmod 640 "$LAN_CERT_DIR/panel.crt" "$LAN_CERT_DIR/panel.key" 2>/dev/null || true
+      c_g "  旧布局的证书已搬到共用位置($(basename "$c") → panel.crt, SAN 覆盖全部面板)。"
+      return 0
+    fi
+  done
+  return 0
+}
+
 _lan_render(){
+  _lan_migrate_certs
   local mod tmpc tmpn legacy
   mod="$(_pdg_module lanpanel.py)" || { c_y "❌ 找不到 lanpanel.py"; return 1; }
   tmpc="$(mktemp)"; tmpn="$(mktemp)"
@@ -5484,6 +5518,33 @@ _lan_wire(){
   return 0
 }
 
+# 主防火墙重新加载的**唯一入口**。
+#
+# 为什么必须收成一处: `/etc/nftables.conf` 开头是 `flush ruleset` —— 它把**整个** ruleset
+# 清掉, 内网面板的出站白名单(inet pdglan)一起没。而 pdg-lan 不会因此重启, 于是
+# "反代在跑、门三已经不存在"这个状态会在每次防火墙重建之后悄悄出现。真机复现过:
+# `pdg update` 之后 doctor 立刻报"反代正在运行, 但内核里没有 inet pdglan 表"。
+#
+# 这是安全洞不是不便: 那一刻反代能连到内网任意地址。所以主规则加载完就把白名单补回去,
+# 而不是指望调用方各自记得。tests/test-lan-nft-chokepoint.sh 会拦住新的裸调。
+_nft_apply_main(){
+  local f="${1:-/etc/nftables.conf}" rc=0
+  nft -f "$f" || rc=$?
+  _lan_nft_reapply
+  return $rc
+}
+
+# 把内网面板的出站白名单补回内核。只在**反代确实在跑**时做 —— 没在跑的话那张表本来就
+# 不该存在(disable/purge 之后留一张表反而是残留)。
+_lan_nft_reapply(){
+  [[ -s /etc/nftables-pdg-lan.conf ]] || return 0
+  systemctl is-active --quiet pdg-lan 2>/dev/null || return 0
+  nft -f /etc/nftables-pdg-lan.conf 2>/dev/null && return 0
+  c_y "⚠️ 内网面板的出站白名单没能重新加载 —— 反代此刻**能连到内网任意地址**。"
+  c_y "   跑 sudo systemctl restart pdg-lan 补上。"
+  return 0
+}
+
 cmd_lan(){
   local sub="${1:-status}"; shift 2>/dev/null || true
   case "$sub" in
@@ -5548,7 +5609,7 @@ cmd_ssh_source(){
     --auto-revert)              # 定时器调用, 不给人用
       local bak; bak="$(_ssh_revert_path)"
       [[ -f "$bak" ]] || return 0
-      cat "$bak" > /etc/nftables.conf && nft -f /etc/nftables.conf >/dev/null 2>&1
+      cat "$bak" > /etc/nftables.conf && _nft_apply_main >/dev/null 2>&1
       logger -t pdg "ssh-source: 未在 ${_SSH_REVERT_MIN} 分钟内确认 → 已自动回退 SSH 来源限制" 2>/dev/null || true
       rm -f "$bak"; return 0 ;;
 
