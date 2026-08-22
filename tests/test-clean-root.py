@@ -169,7 +169,8 @@ PROBE = textwrap.dedent('''
     import mihomorender as M, emergency as E, cfgrestore as C
     model = json.loads(%r)
     # 走真实链路: cfgrestore 的 deriver → mihomorender → sb2mihomo → 候选字节
-    fn = M.deriver_from_paths(rs_meta_path="/nonexistent/rulesets.json",
+    fn = M.deriver_from_paths(lan_table_file="/nonexistent/lan-panels.json",
+                              rs_meta_path="/nonexistent/rulesets.json",
                               mitm_hijack_file="/nonexistent/hijack.txt",
                               platform_file="/nonexistent/platform")
     data = fn({"model": json.dumps(model).encode()})

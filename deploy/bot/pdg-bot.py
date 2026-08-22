@@ -32,6 +32,9 @@ import mihomorender                              # 渲染链的共享实现(救�
 MIHOMO_REDIR = mihomorender.MIHOMO_REDIR
 MITM_PORT = mihomorender.MITM_PORT                # MITM 服务(socks5)监听; mihomo 把接管域名路由到这
 MITM_HIJACK_FILE = "/etc/mosdns/rules/mitm_hijack.txt"   # 接管域名(mosdns 强制劫持集, 与 mihomo 路由同源)
+# 内网面板表(方案 B)。渲染 mihomo 配置时要据它把面板域名指到本机反代 ——
+# 与反代配置、出站白名单同一个真源。
+LAN_TABLE_FILE = "/etc/privdns-gateway/lan-panels.json"
 # mihomo 有路径安全限制: external-ui 等文件路径须在工作目录(-d)下或 SAFE_PATHS 白名单内。
 # 观测面板 UI 在 /etc/sing-box/ui/dist(与 sing-box 共用), 不在 /etc/mihomo 下 → 用 SAFE_PATHS 放行,
 # 使 mihomo 服务运行 + 本进程发起的所有 `mihomo -t` 校验都认这个 UI 路径。
@@ -1008,7 +1011,8 @@ def _render_mihomo_bytes(model, rs_meta=None, mitm_domains=None):
     return mihomorender.render_bytes(
         model, rulesets=_mihomo_rulesets(rs_meta),
         mitm_domains=_mitm_domains() if mitm_domains is None else mitm_domains,
-        tls_ports=[443] if _platform() == "ios" else None)
+        tls_ports=[443] if _platform() == "ios" else None,
+        lan_domains=mihomorender.read_lan_domains(LAN_TABLE_FILE))
 
 
 def _render_mihomo_file():
