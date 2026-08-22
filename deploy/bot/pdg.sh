@@ -5141,6 +5141,7 @@ _lan_cert(){
   local -a doms=(); local h
   while read -r h; do [[ -n "$h" ]] && doms+=(-d "$h"); done < <(_lan_hosts)
   [[ ${#doms[@]} -gt 0 ]] || { c_y "❌ 面板表里一个域名都没有, 没什么可签的。"; return 1; }
+  local _issue_rc=0
   install -d -m750 -o root -g "$LAN_USER" "$LAN_ETC" 2>/dev/null || install -d -m750 "$LAN_ETC"
   install -d -m750 -o root -g "$LAN_USER" "$LAN_CERT_DIR" 2>/dev/null || install -d -m750 "$LAN_CERT_DIR"
   c_g "签发证书(DNS-01, 插件 $dnsapi)…"
@@ -5154,12 +5155,30 @@ _lan_cert(){
     [[ -n "$alias_zone" ]] && alias_arg=(--challenge-alias "$alias_zone")
     "$ACME_HOME/acme.sh" --home "$ACME_HOME/data" --issue --dns "$dnsapi" \
       "${doms[@]}" "${alias_arg[@]+"${alias_arg[@]}"}" --server letsencrypt --keylength ec-256
-  ) || { c_y "❌ 签发失败 —— 看上面 acme.sh 给的原因(多半是凭据权限不足或域名不在该 zone)。"; return 1; }
+  ) || _issue_rc=$?
   # 装**一次**: acme.sh 一次 --issue 多个 -d 产出的是**一张** SAN 证书, 存在第一个域名
   # 的目录下。按域名逐个 --install-cert 会对除第一个之外的全部失败(它们没有各自的证书
   # 目录) —— 真机上踩过, 7 个面板只装上 1 个, 而命令还报"证书已就位"。
   local primary; primary="$(_lan_hosts | head -1)"
   [[ -n "$primary" ]] || { c_y "❌ 取不到主域名"; return 1; }
+
+  # **非 0 不等于失败。**acme.sh 在"证书还有效、这次不用续"时也返回非 0(实测 1), 输出是
+  # `Domains not changed. Skipping.`。把它当失败的后果: 重跑一次 `pdg lan cert` 会看到
+  # 一句假的"❌ 签发失败", 而且 --install-cert 那步被跳过 —— 证书明明在库里, 却没装到位。
+  #
+  # 判据不看退出码、也不匹配英文提示(两者都会随上游变), 而是**看库里有没有一张能用的证书**:
+  # 有就继续装, 没有才是真失败。
+  local store_crt
+  store_crt="$(find "$ACME_HOME/data" -path "*${primary}*" -name fullchain.cer -print -quit 2>/dev/null)"
+  if [[ "${_issue_rc:-0}" != 0 ]]; then
+    if [[ -s "$store_crt" ]] && openssl x509 -in "$store_crt" -checkend 0 -noout >/dev/null 2>&1; then
+      echo "  (acme.sh 说这次不用续期 —— 库里那张还有效, 继续装到位)"
+    else
+      c_y "❌ 签发失败, 且证书库里也没有可用的证书 —— 看上面 acme.sh 给的原因"
+      c_y "   (多半是凭据权限不足、域名不在该 zone, 或委派 zone 写错)。"
+      return 1
+    fi
+  fi
   if ! "$ACME_HOME/acme.sh" --home "$ACME_HOME/data" --install-cert -d "$primary" --ecc \
         --fullchain-file "$LAN_CERT_DIR/panel.crt" --key-file "$LAN_CERT_DIR/panel.key" \
         --reloadcmd "systemctl reload pdg-lan 2>/dev/null || true"; then
