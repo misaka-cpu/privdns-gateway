@@ -22,9 +22,10 @@
 
 PDG_RUNTIME_DIR="${PDG_RUNTIME_DIR:-/opt/pdg-bot}"
 
-# 6.2B 追加 dotwitness.py: linkstat 要经它的 read_evidence() 取 DoT 证据(证据校验器
-# 只能有一份, 不许把那套 owner/mode/schema 判定抄进 linkstat)。纯标准库单文件, 两个
-# 平台都装 —— 装的是**模块**, 不是服务: pdg-dotwitness.service 仍未接入安装/enable/start。
+# dotwitness.py: linkstat 要经它的 read_evidence() 取 DoT 证据(证据校验器只能有一份,
+# 不许把那套 owner/mode/schema 判定抄进 linkstat)。纯标准库单文件, 两个平台都装。
+# 与它配套的 pdg-dotwitness.service 由 install.sh 单独安装并 enable --now(起不来就 die),
+# 不走这张模块清单 —— 这里只管**文件**, 不管 unit。
 # 注意这个清单是**逐行拆三元组的裸字符串**, 里面不能写注释(写了会被当成一行数据,
 # 于是"源路径 #  不存在""mode 非法"一起报出来)。说明一律放在这上面。
 #

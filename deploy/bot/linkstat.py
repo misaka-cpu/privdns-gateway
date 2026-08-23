@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
-"""SIM/APN 链路诊断 —— 6.1A: **服务器准备状态**(只读)。
+"""SIM/APN 链路诊断(只读)。
 
-这个模块只回答一件事: **服务器是否具备接收和处理这条链路上流量的条件。**
+这个模块回答两件事, 而且**分两段呈现, 不许混着读**:
+  · 服务器准备状态 —— 本机是否具备接收和处理这条链路上流量的条件;
+  · 手机/SIM 实时证据 —— 一次协助会话的时间窗内, 网关**实际观察到**了什么。
 
-它证明不了的(一条都不许在文案里暗示):
+第二段能有内容, 靠的是会话期间落地的观测点: pdg-probe81 记下到达 :81 的 HTTP 请求,
+pdg-dotwitness 记下到达 DoT 端口的那次专门查询。没有会话、或者观测点不可信时, 它一律是
+NOT_OBSERVED / UNAVAILABLE, 不拿"没在看"冒充"没看到"。
+
+即便两段都满, 也证明不了(一条都不许在文案里暗示):
   · 手机是否用了目标 SIM / 目标 APN;
-  · 手机的流量是否到达了本机;
-  · 手机的 DoT 查询是否进了 mosdns;
+  · 除了被观察到的那几次到达之外, 手机的其它流量走没走这条路;
   · 手机是否信任这张证书;
   · 出口或目标服务是否可用(那是 6.3)。
+每条证据只证明它自己那一次到达 —— 结尾的说明按本次真拿到的证据逐条拼, 见 _phone_note()。
 
 本机回环检查**不得**冒充手机端到端证据。本机 dig 走的是 127.0.0.1, 而 127.0.0.1 不在
 内网卡段里 —— mosdns 的劫持与分流对它根本不生效(checks.check_deep_hijack_note 里写了同一
 件事)。所以"本机 DNS 能解析"只说明 mosdns 活着, 与手机那条路无关。
 
-私网侧的层级在 6.1A 一律是 NOT_OBSERVED: 我们还没有实时观测能力(那是 6.1B)。
+私网侧的层级只有在协助会话里拿到观测点证据时才会是 PASS, 其余一律 NOT_OBSERVED。
 NOT_OBSERVED 是**独立状态**, 既不能升成 PASS 也不能降成 FAIL —— 它的意思是"没看到",
 而"没看到"在这里既不能证明正常, 也不能证明故障。
 
@@ -59,9 +65,8 @@ SECURITY = "SECURITY"
 RESOURCE = "RESOURCE"
 CATEGORIES = (NETWORK_PRIVATE, DNS, FORWARDING, DEPENDENCY, SECURITY, RESOURCE)
 
-# ── reason code: 只登记 6.1A **真的能产生**的那些 ────────────────────────────
-# 服务器分不清的结论(如 TCP853_TIMEOUT / DOT_QUERY_NOT_SEEN)一律不预留 —— 提前放进闭集
-# 会让人以为已经能观测到, 而它们要到 6.1B 有了会话证据才谈得上。
+# ── reason code: 只登记**真的能产生**的那些 ──────────────────────────────────
+# 服务器分不清的结论(如 TCP853_TIMEOUT)一律不预留 —— 提前放进闭集会让人以为已经能观测到。
 CODES = (
     "L1_NOT_OBSERVED", "L1_HTTP_PROBE_OBSERVED", "L1_HTTP_PROBE_STALE",
     "L2_CIDR_READY", "L2_CIDR_DRIFT",
@@ -71,9 +76,8 @@ CODES = (
     "L5_TLS_READY", "L5_TLS_HANDSHAKE_FAILED", "L5_CERT_CN_MISMATCH",
     "L5_CERT_EXPIRING", "L5_CERT_EXPIRED",
     "L6_LOCAL_DNS_READY", "L6_LOCAL_DNS_FAILED", "L6_PHONE_QUERY_NOT_OBSERVED",
-    # 6.1B 的 DNS 时间窗证据。WINDOW_OBSERVED / PROBE_NOT_OBSERVED 目前**产不出来** ——
-    # 阶段 3 因 mosdns API 的安全问题停止(见 tests/test-link-dns-evidence.py)。留在
-    # 闭集里是因为模型契约已定, 但当前唯一会出现的是 METRICS_UNAVAILABLE。
+    # DNS 时间窗证据。证据源是 pdg-dotwitness 的落盘记录, 不是 mosdns 的 API ——
+    # 走 API 那条路因安全问题停掉了(见 tests/test-link-dns-evidence.py)。
     "L6_DOT_PROBE_WINDOW_OBSERVED", "L6_DOT_PROBE_NOT_OBSERVED",
     # 6.2B: 窗口还开着时的等待态。它**不是**三个终态之一 —— 把"还在等"
     # 塞进 NOT_OBSERVED 会让用户以为已经有结论了。
@@ -92,8 +96,8 @@ CODES = (
     "COLLECTOR_ERROR",          # 单项采集器自己抛了 —— 报出来, 但不拖垮整份结果
 )
 
-# 哪些层属于"手机/SIM 实时证据"。它们在 6.1A 永远拿不到真实观测, 单独成段展示,
-# 免得和"服务器准备好了"混在一起被读成"整条链路正常"。
+# 哪些层属于"手机/SIM 实时证据"。单独成段展示, 免得和"服务器准备好了"混在一起被读成
+# "整条链路正常" —— 这两段的可信度来源完全不同。
 PHONE_LAYERS = (1, 6.5)
 
 # 手机侧证据不全都落在 PHONE_LAYERS 上: 6.1B 把"这次探测的来源在不在 PDG_INTERNAL_CIDR"
@@ -152,8 +156,7 @@ class Finding(dict):
 def _session():
     """读当前会话。拿不到就返回 None —— 会话模块缺失/无会话/状态损坏都当"没有"。
 
-    这里**只读**, 不建也不改会话: `pdg link status` 是只读命令, 6.1A 定下的规矩
-    在 6.1B 不放宽。
+    这里**只读**, 不建也不改会话: `pdg link status` 是只读命令, 有了会话证据也不放宽。
     """
     try:
         import linksess
@@ -740,14 +743,39 @@ def collect(platform=None):
 _MARK = {PASS: "🟢", WARN: "🟡", FAIL: "🔴", NOT_OBSERVED: "⚪", STALE: "🕓", SKIP: "⏭️"}
 
 _PHONE_NOTE = ("当前仅检查服务器准备状态, 尚未观察手机的实时链路; "
-               "这不代表 SIM/APN 正常, 也不代表发生故障。")
+               "这不代表 SIM/APN 正常, 也不代表手机整体联网正常, 也不代表发生故障。")
 
-# 会话里真的观察到东西之后, 上面那句就不再成立了(它说的是"尚未观察")。但**能说的
-# 上限**没变: 观察到的是"手机的网络到达了 :81", 不是 SIM/APN 正常, 更不是 DNS 走通。
-_PHONE_NOTE_OBSERVED = (
-    "以上是本次会话时间窗内观察到的证据。HTTP 证据只说明服务器观察到本次会话的 HTTP 请求, "
-    "来源段只说明该请求来自配置的内网卡来源段; 本版本无法观察手机是否真的发出了 DoT 查询。"
-    "因此不能据此判断 SIM/APN、DoT 或手机整体联网是否正常。")
+# 会话里真的观察到东西之后, 上面那句"尚未观察"就不成立了, 得换一段。这段**按本次真正
+# 拿到的证据逐条拼**, 不写死 —— 写死过一次, 代价是自相矛盾: 那句"本版本无法观察手机是否
+# 真的发出了 DoT 查询"在 pdg-dotwitness 之前是对的, 之后就会跟同一屏上方的
+# 🟢 L6_DOT_PROBE_WINDOW_OBSERVED 顶牛, 还把那条真证据抹掉。
+# 见 tests/negctl/link-note-contradiction.py。
+#
+# 能说的上限始终没变, 而且是**逐条**的 —— 每条证据只证明它自己那一次到达:
+_NOTE_HEAD = "以上是本次会话时间窗内观察到的证据。"
+_NOTE_HTTP = ("HTTP 证据只说明服务器观察到本次会话的 HTTP 请求, "
+              "来源段只说明该请求来自配置的内网卡来源段。")
+_NOTE_DOT_SEEN = ("DoT 证据说明本次会话里有一次**专门的 DoT 查询**到达了网关的 DoT 端口 —— "
+                  "仅此而已, 推不出手机的其它 DNS 查询也走了这条路。")
+_NOTE_DOT_NONE = "本次没有拿到 DoT 证据, 因此不知道手机是否真的发出过 DoT 查询。"
+_NOTE_TAIL = "以上都不能据此判断 SIM/APN 或手机整体联网是否正常。"
+
+_NOTE_HTTP_CODES = ("L1_HTTP_PROBE_OBSERVED", "L1_HTTP_PROBE_STALE",
+                    "L2_SOURCE_INSIDE_CIDR", "L2_SOURCE_OUTSIDE_CIDR")
+
+
+def _phone_note(phone):
+    """按本次手机段真正拿到的证据拼说明 —— 说的每一句都得在这批证据里站得住。"""
+    seen = [f for f in phone if f["status"] in (PASS, STALE)]
+    if not seen:
+        return _PHONE_NOTE
+    parts = [_NOTE_HEAD]
+    if any(f["code"] in _NOTE_HTTP_CODES for f in seen):
+        parts.append(_NOTE_HTTP)
+    dot_seen = any(f["code"] == "L6_DOT_PROBE_WINDOW_OBSERVED" for f in seen)
+    parts.append(_NOTE_DOT_SEEN if dot_seen else _NOTE_DOT_NONE)
+    parts.append(_NOTE_TAIL)
+    return "".join(parts)
 
 
 def render_text(findings):
@@ -762,8 +790,7 @@ def render_text(findings):
     lines.append("━━ 手机/SIM 实时证据 ━━━━━━━━━━━━━━━━━━━━━━━━━━")
     for f in sorted(phone, key=lambda x: x["layer"]):
         lines.append("  %s %-16s %s" % (_MARK[f["status"]], f["title"], f["detail"]))
-    observed = any(f["status"] in (PASS, STALE) for f in phone)
-    lines.append("     %s" % (_PHONE_NOTE_OBSERVED if observed else _PHONE_NOTE))
+    lines.append("     %s" % _phone_note(phone))
     return "\n".join(lines)
 
 

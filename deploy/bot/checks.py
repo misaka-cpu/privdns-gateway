@@ -636,6 +636,27 @@ def check_tailscale_isolation():
 PROC_NET_DEV = "/proc/net/dev"
 SRC_VALID_MARK = "/proc/sys/net/ipv4/conf/all/src_valid_mark"
 TAILSCALE_BIN = "/usr/bin/tailscale"
+# 包还装着的第二个凭据。Debian 12 上 tailscale 这个 deb 会放下 unit 文件, 它跟接口在不在
+# 完全无关 —— `tailscale down` 或 tailscaled 停着的时候, 它照样在。
+TAILSCALED_UNIT = "/lib/systemd/system/tailscaled.service"
+
+
+def _tailscale_installed():
+    """Tailscale 这个**包**还在不在 —— 与它此刻通没通没关系。
+
+    返回 (installed, why)。两个凭据, 命中一个就算装着:
+      · dpkg 认领 /usr/bin/tailscale —— 那它就是包的文件, 谁都不许建议删;
+      · tailscaled 的 unit 文件还在 —— deb 放下的, 卸载才会消失。
+
+    刻意**不**看 tailscale0 接口, 也不看 tailscaled 跑没跑: 那两样回答的是"此刻通不通",
+    不是"装没装"。把它们当成安装判据, 正是这一项原先误诊的根子。
+    """
+    rc, out, _err = _run(["dpkg-query", "-S", TAILSCALE_BIN])
+    if rc == 0 and TAILSCALE_BIN in out:
+        return True, "dpkg 认领了 %s(%s)" % (TAILSCALE_BIN, out.strip().split(":")[0])
+    if os.path.exists(TAILSCALED_UNIT):
+        return True, "%s 还在" % TAILSCALED_UNIT
+    return False, ""
 
 
 def check_tailscale_residue():
@@ -652,17 +673,30 @@ def check_tailscale_residue():
     2. `apt purge` 之后 `/usr/bin/tailscale` 仍然留着(dpkg 查不到归属)。它不再工作,
        但 `command -v tailscale` 照样能找到 —— 任何按"命令在不在"判断的脚本都会被骗。
 
-    判据是**卸载之后**才成立: 装着 Tailscale 时 src_valid_mark=1 完全正常, 那时不报。
-    "装着"的判据取 tailscale0 接口在不在 —— 接口在 = 它正在工作, 与包管理器的状态无关。
+    两条都**只在真的卸载之后**才成立, 所以"卸没卸"这个前提必须站得住。原先它取的是
+    tailscale0 接口在不在, 那是错的: 接口不在的原因还有 `tailscale down`、tailscaled
+    临时停、以及装好了从没 `tailscale up` 过。那三种情形下 src_valid_mark=1 本来就正常,
+    /usr/bin/tailscale 也是包自己的文件 —— 照原判据会建议 `rm -f` 掉一个 dpkg 拥有的
+    文件, 把包弄成破损状态, 而且要到下次 apt 操作才看得出来。
+    见 tests/negctl/tailscale-residue-misdiagnosis.py。
+
+    所以现在分两步: 先看**包**还在不在(_tailscale_installed, 看 dpkg 与 unit 文件),
+    装着就整项不适用; 确认卸了, 才谈得上残留。
     """
     name = "Tailscale 卸载残留"
     try:
         with open(PROC_NET_DEV, encoding="utf-8") as f:
             has_if = any(l.strip().startswith("tailscale0:") for l in f)
     except OSError:
-        return ("warn", name, "读不到 %s, 无法判断 tailscale0 是否还在" % PROC_NET_DEV)
+        return ("warn", name, "读不到 %s, 无法判断 tailscale0 是否还在, 本项无结论" % PROC_NET_DEV)
     if has_if:
         return ("ok", name, "tailscale0 仍在, 不适用(装着的时候这些都是正常状态)")
+    installed, why = _tailscale_installed()
+    if installed:
+        # 接口不在但包还在 —— 这是 down / 停服 / 从没 up 过, 不是残留。
+        return ("ok", name,
+                "没有 tailscale0, 但 Tailscale 还装着(%s) —— 这是 `tailscale down`、"
+                "tailscaled 停着或还没 `tailscale up`, 不是卸载残留, 本项不适用。" % why)
     bad = []
     try:
         with open(SRC_VALID_MARK, encoding="utf-8") as f:
@@ -673,6 +707,7 @@ def check_tailscale_residue():
     except OSError:
         pass                      # 内核没这个参数(旧内核/容器)—— 不是问题, 不报
     if os.path.exists(TAILSCALE_BIN):
+        # 走到这里 dpkg 已经明确不认领它了, 删它不会弄破任何包。
         bad.append("%s 仍在(apt purge 之后的残留, dpkg 查不到归属) —— " % TAILSCALE_BIN +
                    "`command -v tailscale` 还能找到它, 按命令是否存在做判断的脚本会被骗。"
                    "确认不用了就: rm -f /usr/bin/tailscale")
