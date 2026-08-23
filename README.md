@@ -391,6 +391,13 @@ Access controls 已经配对了，那件事只能你自己去后台核对。
   后果是连锁的：内网面板全部打不开，而如果 SSH 已经收紧成只走 tailnet（`pdg ssh-source
   tailnet`），你连进都进不去，只剩服务商的网页控制台。要么在后台给网关关掉 key expiry，要么
   给它打上 tag（带 tag 的节点密钥不过期）。
+- **客户端的版本由你跟进，PDG 不管。** 这个项目不安装、不升级、也不检查 Tailscale 客户端的
+  版本——`pdg update` 只动本项目自己的东西。长期在线的网关是要盯官方安全公告的，那件事得管理员
+  自己做。升级之前先把当前状态留一份底：`tailscale debug prefs` 的输出和 `tailscale status`
+  存下来，因为 `tailscale up` 是整套覆盖，出了岔子你得知道原来是什么样。升级之后至少复核四项：
+  `tailscale status` 是不是 Running、子网路由还在不在、DNS 接管有没有被改回去（`CorpDNS`）、
+  `NetfilterMode` 是不是仍然是 nodivert，最后跑一次 `pdg doctor`。生产网关上**不建议**打开没验证过的
+  自动升级——它会在你不知情的时候改掉上面这几项，而症状要等下一次连不上才显出来。
 - **Android 的「私密 DNS」跟 Tailscale 没有关系。** 私密 DNS 是系统 DNS 设置，走的是普通网络；
   Tailscale 是 VPN 隧道。手机上开不开 Tailscale App，都不影响私密 DNS 指向这台网关——反过来
   也一样，Tailscale 连着不代表 DNS 就走了这条路。
