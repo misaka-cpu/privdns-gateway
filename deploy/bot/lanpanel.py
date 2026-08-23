@@ -219,6 +219,23 @@ def render_caddy(cfg, certs_dir, bind="127.0.0.1"):
             if p.get("insecure_upstream"):
                 L.append("\t\t\ttls_insecure_skip_verify")
             L.append("\t\t}")
+        # 指向**本域名**却带着上游端口(或 http)的 Location, 无条件规范化。
+        #
+        # 上游只要遵从 Host 头就会这么干 —— Apache 的 UseCanonicalName Off 是默认行为,
+        # 它把 Host 原样回显、再补上自己实际监听的端口:
+        #     http://nas.example.com:30035/dir/
+        # 主机名是对的, 错的是 scheme 和端口。而反代只在 443 上, 客户端跟着跳必然到不了,
+        # 表现是浏览器卡在"服务器已停止响应"。真机上撞过: TrueNAS 的 WebDAV(Apache,
+        # 30035)对不带结尾斜杠的目录发 301, iPhone 跟过去就死在那儿。
+        #
+        # **不挂在 rewrite_location 后面**, 因为这条不需要用户判断: Location 指向本域名
+        # 却带上游端口, 对客户端永远是坏的, 不存在"用户可能想要"的情形。上面那条不一样 ——
+        # 改写上游 IP 是设备特性, 得由用户按设备确认。
+        #
+        # 端口段之后要求一个 `/` 收口: 少了它, `nas.example.com.evil.com` 也会被前缀匹配
+        # 吃进来。Location 总是带路径的, 这个要求不会漏掉真实情形。
+        L.append("\t\theader_down Location \"^https?://%s(:[0-9]+)?/\" \"https://%s/\""
+                 % (host_re, host))
         if p.get("rewrite_location"):
             # 设备会把自己的局域网 IP 写进 Location 跳转头(Zyxel 交换机、华为 UPS 实测)。
             # 不改写的话手机会跟着跳到一个到不了的地址。
