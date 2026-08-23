@@ -1948,10 +1948,15 @@ def check_lan_cert():
 
 
 def _lan_probe_target(cfg):
-    """挑一个**不在面板表里**、但与某个面板同网段的地址, 用来探 tailnet ACL 的边界。
+    """在面板所在网段里**猜**一个不在面板表里的地址, 用来发现明显的越界。
 
-    取同 /24 里的另一个主机位: 家里那侧如果按设计把 ACL 收成"只允许网关访问那几个
-    IP:端口", 这个地址就该到不了。返回 (ip, port, 参照的面板 IP) 或 None。
+    这个地址只能往一个方向读: 连上了、或者收到 RST, 说明包**到达了对端**, 那是确凿的
+    越界证据。反过来不成立 —— 猜出来的地址本来就可能没有设备, "探不到"既可能是 ACL 把
+    包丢了, 也可能是那儿压根没人。两种情形给出完全相同的观测, 所以探不到**不能**反推
+    Access controls 已收紧。要把"探不到"读成安全, 需要一个已知存活、又在面板表之外的
+    对照地址(canary)来校准, 而那个信息网关自己猜不出来。
+
+    返回 (ip, port, 参照的面板 IP) 或 None。
     """
     import ipaddress
     tgts = []
@@ -1979,6 +1984,16 @@ def _lan_probe_target(cfg):
     return None
 
 
+_ACL_UNVERIFIED = (
+    "%s:%d(面板表之外)%s —— 但这**无法证明** Access controls 已收紧。这个地址是猜出来"
+    "的, 它上面本来就可能没有设备; 那种情况下 tailnet 哪怕还是默认的 allow-all, 观测到"
+    "的也是同一个结果。要把这项读成绿灯, 得有一个**已知存活、又在面板表之外**的对照地址"
+    "(canary)先把仪器校准, 而那个信息网关自己猜不出来。本项只能发现越界, 不能出具安全"
+    "证明 —— 请到 tailnet 后台按 docs/design-lan-panels.md 第 4 节人工核对 Access "
+    "controls。"
+)
+
+
 def check_deep_lan_acl():
     """tailnet ACL 越界探测(慢速, 只在 --deep 跑)。
 
@@ -1986,10 +2001,15 @@ def check_deep_lan_acl():
     子网路由器上** —— Tailscale 的包过滤在目标节点执行, 所以网关就算被 root 了, 往
     ACL 之外的地址发包也会被家里那台丢掉。项目管不了用户的 tailnet 后台, 但可以探。
 
-    判据的读法要小心, 三种结果不是"成功/失败"两分:
-      · 连上了        → ACL 放行了本不该放行的地址 → fail
-      · 连接被拒(RST) → 包**到达了对端**才会有 RST → ACL 同样放行了 → fail
-      · 不可达/超时   → 被丢在半路 → 这正是期望的结果 → ok
+    只是这个探测**不对称**, 能出结论的只有一个方向:
+      · 连上了        → 包到达了对端 → 放行了面板表之外的地址 → fail
+      · 连接被拒(RST) → 包同样到达了对端才会有这个回应       → fail
+      · 不可达/超时   → **无结论**。探的地址是猜的, 它可能根本不存在, 那时 ACL 收没收紧
+                        都是这一个观测。没有已知存活的对照地址(canary)校准仪器, 量到的
+                        东西反推不出 Access controls 的状态 → warn
+
+    早先这里把超时和不可达判成 ok, 文案写"ACL 边界成立"。那是个假绿: 它证明的只是
+    "这个猜出来的地址没有回应"。见 tests/negctl/lan-acl-false-green.py。
 
     探测**以 root 身份发起**, 因此不受门三(出站白名单)约束 —— 那是有意的: 门三管的是
     反代进程, 而这一项要量的是**家里那侧**的过滤器。用受限身份去探, 量到的会是自己的
@@ -2017,16 +2037,17 @@ def check_deep_lan_acl():
                 "只允许那几个 IP:端口。一台被拿下的网关因此能摸到你家整个网段。"
                 "去 tailnet 后台按 docs/design-lan-panels.md 第 4 节的模板配 ACL。" % (ip_, port))
     except socket.timeout:
-        return ("ok", name, "%s:%d(面板表之外)连不上 —— ACL 边界看起来是收紧的" % (ip_, port))
+        return ("warn", name, _ACL_UNVERIFIED % (ip_, port, "连不上"))
     except ConnectionRefusedError:
         return ("fail", name,
                 "%s:%d 回了 RST —— 包**到达了对端**才会有这个回应, 说明 tailnet ACL 放行了"
                 "面板表之外的地址(参照面板 %s)。ACL 该做的是把它丢掉, 而不是让对端拒绝。"
                 % (ip_, port, ref))
     except OSError as e:
-        # EHOSTUNREACH(113)/ENETUNREACH(101) = 被丢在半路, 正是期望的
+        # EHOSTUNREACH(113)/ENETUNREACH(101) = 包被丢在半路。看着像 ACL 在起作用, 但
+        # 地址不存在时也是这个结果, 所以同样只能记成无结论。
         if getattr(e, "errno", None) in (101, 113):
-            return ("ok", name, "%s:%d(面板表之外)被丢弃 —— ACL 边界成立" % (ip_, port))
+            return ("warn", name, _ACL_UNVERIFIED % (ip_, port, "被丢弃"))
         return ("warn", name, "探测没跑成(%s), 本项无结论" % e)
     finally:
         try:
