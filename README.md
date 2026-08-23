@@ -178,18 +178,25 @@ Bot 在切换后会等最多 30 秒，看手机是否真的发来了新的 WLOC 
 Wi-Fi 出去，来源就不在内网卡段里了。测试期间可以随时点「🔄 查看结果」；Bot 重启过也不影响，
 只要会话还没过期，点「查看结果」仍能读到结论。不想继续就点「✖️ 取消测试」，链接立即失效。
 
-**当前版本能观察到的只有两件事**：
+**能观察到三件事，每一件只证明它自己**：
 
-- 服务器观察到了本次会话的 HTTP 请求；
-- 该请求来自配置的内网卡来源段。
+| 证据 | 它证明的 | 它**不**证明的 |
+|---|---|---|
+| HTTP 探测到达 | 网关收到了本次会话的那个 HTTP 请求 | 手机的其它流量走没走这条路 |
+| 来源网段 | 那个请求的来源落在配置的内网卡来源段里 | 请求一定来自你本人的手机——任何拿到链接的人都能打开它 |
+| DoT 查询到达 | 时间窗内有**一次专门的 DoT 查询**进了网关的 DoT 端口 | 手机的其它 DNS 查询也走了这条路 |
 
-**观察不到**手机是否真的发出了 DoT 查询 —— 取这个证据需要打开 mosdns 的 metrics 接口，而同一个
-监听端口会连带暴露 DNS 缓存导出（内含明文查询域名）与缓存投喂端点，安全审查没让它通过。
-该能力计划在 **6.2 重新设计**，详见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+第三条由 `pdg-dotwitness` 提供。它是本项目自己的观测点，只记随机标识的摘要，不碰查询内容，
+也**没有**打开 mosdns 的 metrics 接口——那条路因为同一个监听端口会连带暴露 DNS 缓存导出
+（内含明文查询域名）与缓存投喂端点，安全审查没让它通过，至今仍然关着
+（[docs/ROADMAP.md](docs/ROADMAP.md)）。
 
-所以这两条证据**不能**用来断言 SIM/APN 正常、DoT 正常、移动网络正常或整体链路正常；
-也不能断定那个请求一定来自你本人的手机——任何拿到那条链接的人都能打开它。没有证据同样不等于
-手机故障，只说明这次没有观察到。诊断会话只保存请求来源的 `/16` 网段，不保存完整 IP。
+三条加起来仍然**不能**断言 SIM/APN 正常、移动网络正常或整体链路正常——它们证明的是几次
+**到达**，不是这条路持续可用。没有证据同样不等于手机故障，只说明这次没有观察到；观测点
+本身不可信时（比如中途重启过）会明说「说不出结论」，而不是报「没看到」。诊断会话只保存
+请求来源的 `/16` 网段，不保存完整 IP。
+
+输出结尾那段说明是按**本次真拿到的证据**拼的：拿到 DoT 证据就说到 DoT，没拿到就直说没拿到。
 
 服务器侧还没准备好（比如 `:81` 探测端点没起来）时，不会创建会话、也不会发测试链接——那时候
 拿着一条注定失败的链接去手机上折腾，只会把服务器的问题误诊成手机的问题。
@@ -227,7 +234,9 @@ ssh <你的网关> sudo pdg rescue fingerprint
 
 ## 12. Tailscale（可选，但装了就有硬约束）
 
-这个项目不会帮你装 Tailscale，也不管它的死活。装不装、怎么装，你自己决定。
+这个项目不会帮你装 Tailscale，也不替你管它的账号、密钥和后台策略——那些都在你自己手里。
+但它**会**盯着 Tailscale 和这套系统碰头的那几个点：入口隔离、`nodivert`、`detect-cidr` 的
+样本排除、卸载残留，`pdg doctor` 每次都查。装不装、怎么装由你决定，装了之后这几条就不是可选的了。
 
 这一节只讲一件事：Tailscale 和这套系统会在两个地方碰头，而且碰得不轻。事先不知道的话，出的故障从表面上看跟它一点关系都没有。
 
@@ -261,17 +270,140 @@ table inet pdg {
 
 最后的效果是：从 tailnet 能 SSH、能 ping，已经建好的连接也不受影响；但拿不到 DNS 和代理那几个内网卡专用端口，流量也不会被送进透明代理。这是有意的，管理通道和数据面本来就该分开。
 
+### 先看清现在是什么样
+
+`tailscale up` 是**整套覆盖**，不是增量——漏写一个参数就等于把它改回默认值。所以动手之前先只读地
+看一眼当前状态：
+
+```bash
+tailscale debug prefs
+```
+
+要留意的几行：`NetfilterMode`（`1` = nodivert，见下）、`RouteAll`（接不接受别人宣告的路由）、
+`AdvertiseRoutes`、`ExitNodeIP`、`RunSSH`、`CorpDNS`（`--accept-dns`）。
+
+### 起法：管理用途 / 内网面板用途
+
+只把 Tailscale 当**管理通道**（SSH 进来、Bot 用不着它）：
+
+```bash
+sudo tailscale up \
+  --netfilter-mode=nodivert \
+  --accept-dns=false \
+  --accept-routes=false
+```
+
+要用**内网面板**（第 13 节）的话，网关必须能走到家里那台子网路由器宣告的段，所以只改一个参数：
+
+```bash
+sudo tailscale up \
+  --netfilter-mode=nodivert \
+  --accept-dns=false \
+  --accept-routes=true          # 只有这一项跟上面不同
+```
+
+`--accept-dns=false` 是必须的：网关自己的 DNS 由 mosdns 管，让 Tailscale 去改 `/etc/resolv.conf`
+会把本机解析绕开 mosdns，症状是「手机好好的、网关自己解析不对」。
+
+**默认不要开**的几样，本项目一个都不需要，开了只是白白扩大暴露面：出口节点
+（`--advertise-exit-node` / `--exit-node`）、路由宣告（`--advertise-routes`，网关是**用**路由的
+一侧，不是宣告的一侧）、Tailscale SSH（`--ssh`，它会绕过 sshd 和你自己的 SSH 策略）、
+以及 Serve / Funnel（Funnel 会把服务开到公网上，跟这套系统的整个方向相反）。
+
 ### nodivert 模式：这条没得商量
 
 ```bash
-sudo tailscale up --netfilter-mode=nodivert   # 其余参数按你自己的需要加
+sudo tailscale up --netfilter-mode=nodivert   # 其余参数按上面两种起法补全
 ```
 
 默认模式（`--netfilter-mode=on`）下，Tailscale 会往 `INPUT` 链里插一条跳到 `ts-input` 的规则。那条链和本项目的 `inet pdg` 挂在同一个 hook 上，而 nftables 里同一个 hook 上的每条 base chain 都会执行 —— 于是 `pdg doctor` 会判「防火墙链冲突」，而升级会因为这条自检整次回滚。
 
-`nodivert` 只是不建那条跳转，Tailscale 自己的反欺骗保护照样生效。这一点是实测过的：伪造 `100.64.x.x` 源地址的包被拒，而 `ts-input` 的计数器纹丝不动 —— 真正挡下它的是 `inet pdg`。
+`nodivert` 只是不建那条跳转，Tailscale 的其余功能照常。至于「谁挡下了伪造源地址的包」，本项目
+实测到的事实只有一条：从非 tailscale0 接口伪造 `100.64.x.x` 源地址的包**进不来**，而 `ts-input`
+的计数器纹丝不动——挡下它的是 `inet pdg` 的入口隔离加默认丢弃。`ts-input` 在 `nodivert` 下不被
+执行，所以本项目**没有**验证过它自己的反欺骗保护还生效；需要那一层的话请以 Tailscale 官方文档
+为准，别拿这里的实测结果当依据。
 
 这个设置会持久化，重启 tailscaled 或整机都不会丢。而且 Tailscale 自己会拦住误改：不带参数直接跑 `tailscale up`，它会报错要求你把所有非默认参数写全。
+
+### Access controls：新 tailnet 默认是全通的
+
+这一条最容易被跳过，因为**不配它一切都能用**。新建的 tailnet 默认策略是 allow-all——你的每个
+节点都能访问其它每个节点的每个端口。网关一旦接受了家里的子网路由（上面那个
+`--accept-routes=true`），这句话就变成：**一台被拿下的网关能摸到你家整个内网**。
+
+策略写在 tailnet 后台的 Access controls 里。新写请用 **Grants**（`grants:`）；老的 `acls:` 仍然
+能用，但那是 legacy 写法，新功能只往 Grants 上加。
+
+```jsonc
+{
+  // ① 先声明这个 tag 归谁所有 —— 没有这一段, tag 不能用
+  "tagOwners": {
+    "tag:pdg-gateway": ["autogroup:owner"],
+  },
+
+  "grants": [
+    // ② 你自己 → 网关: 只给 SSH
+    {
+      "src": ["autogroup:member"],
+      "dst": ["tag:pdg-gateway"],
+      "ip":  ["tcp:22"],
+    },
+    // ③ 网关 → 家里内网: **只**给面板表里那几个 IP:端口, 一个不多
+    {
+      "src": ["tag:pdg-gateway"],
+      "dst": ["192.168.100.90/32", "192.168.100.141/32"],
+      "ip":  ["tcp:443", "tcp:8080"],
+    },
+  ],
+}
+```
+
+老写法长这样（对照用，新配置别再这么写）：
+
+```jsonc
+{
+  "acls": [
+    { "action": "accept", "src": ["tag:pdg-gateway"],
+      "dst": ["192.168.100.90:443", "192.168.100.141:8080"] },
+  ],
+}
+```
+
+**tag 不会自己长到节点上**，两步缺一不可：先在 `tagOwners` 里声明它（否则后台直接报错），
+再让节点带上它——
+
+```bash
+sudo tailscale up --advertise-tags=tag:pdg-gateway   # 其余参数照上面补全
+```
+
+打标签会**换掉节点的身份**，所以这一步需要重新认证一次；在后台机器列表里给机器改 tag 也可以，
+效果一样。带 tag 的节点还有个副作用是好事：它的密钥**不会过期**（见下）。
+
+改完之后，`pdg doctor --deep` 会从网关往一个**不在面板表里**的地址试着连一下。这个探测只能往
+一个方向读：**连得上、或者收到 RST，就说明还没收紧**。反过来不成立——探不到既可能是策略把包
+丢了，也可能是那个地址上本来就没有设备，两种情形观测一模一样。所以它**不能**替你证明
+Access controls 已经配对了，那件事只能你自己去后台核对。
+
+### 几条运维边界，事先知道能省很多事
+
+- **密钥会过期。** 节点密钥默认 180 天到期，到期后那台机器**掉出 tailnet**。对这套系统来说
+  后果是连锁的：内网面板全部打不开，而如果 SSH 已经收紧成只走 tailnet（`pdg ssh-source
+  tailnet`），你连进都进不去，只剩服务商的网页控制台。要么在后台给网关关掉 key expiry，要么
+  给它打上 tag（带 tag 的节点密钥不过期）。
+- **客户端的版本由你跟进，PDG 不管。** 这个项目不安装、不升级、也不检查 Tailscale 客户端的
+  版本——`pdg update` 只动本项目自己的东西。长期在线的网关是要盯官方安全公告的，那件事得管理员
+  自己做。升级之前先把当前状态留一份底：`tailscale debug prefs` 的输出和 `tailscale status`
+  存下来，因为 `tailscale up` 是整套覆盖，出了岔子你得知道原来是什么样。升级之后至少复核四项：
+  `tailscale status` 是不是 Running、子网路由还在不在、DNS 接管有没有被改回去（`CorpDNS`）、
+  `NetfilterMode` 是不是仍然是 nodivert，最后跑一次 `pdg doctor`。生产网关上**不建议**打开没验证过的
+  自动升级——它会在你不知情的时候改掉上面这几项，而症状要等下一次连不上才显出来。
+- **Android 的「私密 DNS」跟 Tailscale 没有关系。** 私密 DNS 是系统 DNS 设置，走的是普通网络；
+  Tailscale 是 VPN 隧道。手机上开不开 Tailscale App，都不影响私密 DNS 指向这台网关——反过来
+  也一样，Tailscale 连着不代表 DNS 就走了这条路。
+- **「手机零 App」只覆盖网关反代出来的 HTTP/HTTPS 面板。** 也就是第 13 节里你手工加进面板表的
+  那几个。SSH、SMB、RDP、以及那些直接连内网 IP 的原生 App，都不在其中——那些仍然要手机上装
+  Tailscale。
 
 ### 装了之后 `pdg detect-cidr` 会变谨慎
 
@@ -287,10 +419,21 @@ Tailscale 卸载时不还原自己改过的东西。`pdg doctor` 会提醒你，
 
 ```bash
 sysctl -w net.ipv4.conf.all.src_valid_mark=0   # 它改成 1 且不落 /etc/sysctl.d, 重启才恢复
-rm -f /usr/bin/tailscale                       # apt purge 之后仍残留, dpkg 查不到归属
 ```
 
 第一条留着不至于立刻出事，但它会制造「重启前后行为不一致」这种最难查的现象 —— 你今天验过没问题，下次重启之后行为就变了。
+
+还有一样是 `/usr/bin/tailscale` 本身：`apt purge` 之后它可能仍然留着，`command -v tailscale`
+照样能找到它，按「命令在不在」判断的脚本就会被骗。**删之前先确认它已经没人认领**：
+
+```bash
+dpkg -S /usr/bin/tailscale        # 报 no path found = 孤儿, 这时才可以删
+sudo rm -f /usr/bin/tailscale
+```
+
+要是 `dpkg -S` 报出了包名，那说明 Tailscale **还装着**（可能只是 `tailscale down` 了，或者
+tailscaled 停着），这个文件归包管，删了会把包弄成破损状态，而且要到下次 `apt` 操作才看得出来。
+`pdg doctor` 用的是同一条判据：先看包在不在，包还在就整项不适用，不会建议你删。
 
 ### 怎么确认没配错
 
@@ -349,7 +492,10 @@ Telegram 里也有：**运维 → 🏠 内网面板**，能看列表和状态、
 
 `pdg lan status` 每次都会提醒。收窄的办法有两个：面板用另一个域名（token 就碰不到 DoT 那个 zone），或者把 `_acme-challenge` 用 CNAME 委派到单独的 zone，然后 `pdg lan cert <dns插件名> <委派zone>`。
 
-还有一条：网关拿到了主动访问你家内网的能力。真正的硬边界不在网关上，而在家里那台子网路由器 —— Tailscale 的包过滤在目标节点执行，所以网关就算被 root 了，往 ACL 之外的地址发包也会被家里那台丢掉。ACL 要你自己在 tailnet 后台配，`pdg doctor --deep` 会主动探一个不在面板表里的地址，连得上就说明还没收紧。
+还有一条：网关拿到了主动访问你家内网的能力。真正的硬边界不在网关上，而在家里那台子网路由器 —— Tailscale 的包过滤在目标节点执行，所以网关就算被 root 了，往 ACL 之外的地址发包也会被家里那台丢掉。ACL 要你自己在 tailnet 后台配（写法见第 12 节的 Access controls 一段）。`pdg doctor --deep` 会
+主动探一个不在面板表里的地址，**连得上就说明还没收紧**；但探不到并不能反过来证明收紧了——那个
+地址是猜的，它上面没有设备时的观测跟策略把包丢掉一模一样。所以这一项只帮你发现越界，
+不出具安全证明。
 
 ### 不想要了
 
@@ -368,9 +514,10 @@ sudo pdg lan purge                # 连配置、证书、DNS 凭据、caddy 一�
 | 流量 | mihomo（clash.meta） | nft REDIRECT 入站 + redir 监听 + SNI 嗅探。多出口故障切换；提供 clash_api（观测面板）。改配置前先校验，失败回滚 |
 | 管理 | Telegram Bot（Python 标准库） | 出口、分流、规则集、测速、流量、备份恢复、iOS 描述文件、自定义域名、WLOC；改配置前先校验，失败回滚 |
 | 位置改写 | pdg-mitm（可选，iOS） | 自签 CA + 终止 TLS + 转发并替换 `gs-loc` 响应坐标 |
+| 链路证据 | pdg-dotwitness | 手机链路测试的 DoT 侧观测点。只在诊断会话的时间窗内记「有没有一次专门的 DoT 查询到达」，落盘的是随机标识的摘要，不含查询内容。不依赖 mosdns 的 metrics 接口 |
 | 内网面板 | Caddy（可选，方案 B） | 官方原版不带插件，只监听环回；证书由 acme.sh 走 DNS-01 签发。进程以 `pdg-lan` 身份跑，出站按 uid 白名单限死在面板表里的 `IP:端口` |
 | 证书 | certbot standalone | Let's Encrypt，自动续期 |
-| 防火墙 | nftables | 对全网只放行 SSH；DNS、数据、探测端口只放行内网卡来源段；mihomo 用 REDIRECT 入站，同样限内网卡来源。只用独立的 `table inet pdg`，`/etc/nftables.conf` 里你自己的表逐字节保留 |
+| 防火墙 | nftables | 基座是独立的 `table inet pdg`：对全网只放行 SSH；DNS、数据、探测端口只放行内网卡来源段；mihomo 用 REDIRECT 入站，同样限内网卡来源。启用内网面板后另有一张 `table inet pdglan`，按 uid 把反代进程的**出站**限死在面板表里的 `IP:端口`。`/etc/nftables.conf` 里你自己的表逐字节保留 |
 
 内核版本由 `pdg update` 随 PrivDNS Gateway 发布版指定并逐字节校验（SHA256）后安装。
 

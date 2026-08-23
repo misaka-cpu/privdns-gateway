@@ -4,8 +4,10 @@
 打桩替掉 _run / _lan_cfg / _lan_on, 把每条分支都走到 —— 尤其是那些**只在出事时才成立**
 的分支: 它们在真机上一辈子也许都不触发一次, 而那正是最容易写错又没人发现的地方。
 
-ACL 越界探测那一项的三种读法要分清, 不是"成功/失败"两分:
-  连上了 → fail; 连接被拒(RST, 说明包到达了对端) → **同样 fail**; 不可达/超时 → ok。
+ACL 越界探测那一项**不对称**, 能出结论的只有一个方向:
+  连上了 → fail; 连接被拒(RST, 说明包到达了对端) → **同样 fail**;
+  不可达/超时 → warn(无结论) —— 探的地址是猜的, 它不存在时观测跟 ACL 收紧了一模一样。
+  这条早先判 ok, 是个假绿, 见 tests/negctl/lan-acl-false-green.py。
 """
 import importlib.util
 import json
@@ -210,12 +212,16 @@ assert st == "fail" and "RST" in msg, msg
 ok("连接被拒 → **同样 fail**(包到达了对端才会有 RST)")
 
 st, _n, msg = run_acl(socket.timeout())
-assert st == "ok", msg
-ok("超时 → ok")
+assert st == "warn" and "无法证明" in msg, msg
+ok("超时 → warn(无结论, 不冒充安全证明)")
 
 st, _n, msg = run_acl(OSError(113, "No route to host"))
-assert st == "ok" and "丢弃" in msg, msg
-ok("EHOSTUNREACH → ok")
+assert st == "warn" and "丢弃" in msg and "无法证明" in msg, msg
+ok("EHOSTUNREACH → warn(同上: 地址不存在时也是这个观测)")
+
+st, _n, msg = run_acl(OSError(101, "Network is unreachable"))
+assert st == "warn" and "无法证明" in msg, msg
+ok("ENETUNREACH → warn")
 
 st, _n, msg = run_acl(OSError(13, "Permission denied"))
 assert st == "warn" and "没跑成" in msg, msg

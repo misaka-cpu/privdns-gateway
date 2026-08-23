@@ -108,8 +108,13 @@ except Exception as e:                                           # noqa: BLE001
 os.environ["PATH"] = _orig_path
 
 # ══ 二、check_tailscale_residue ══════════════════════════════════════════════
-def scene(has_iface, svm, has_bin):
-    """造一个现场, 返回 (level, name, detail)。"""
+def scene(has_iface, svm, has_bin, installed=False):
+    """造一个现场, 返回 (level, name, detail)。
+
+    `installed` = Tailscale 这个**包**还在不在。判据里它是"能不能谈残留"的前提, 与接口
+    在不在是两回事 —— `tailscale down` 之后接口没了包还在, 那时报残留是误诊
+    (见 tests/negctl/tailscale-residue-misdiagnosis.py)。所以这里必须能分别摆布。
+    """
     d = tmpguard.mkdtemp(prefix="pdg-tsres-")
     dev = os.path.join(d, "net_dev")
     with open(dev, "w", encoding="utf-8") as fh:
@@ -128,16 +133,28 @@ def scene(has_iface, svm, has_bin):
     if has_bin:
         open(b, "w").close()
     checks.TAILSCALE_BIN = b
-    return checks.check_tailscale_residue()
+    # 包的两个凭据: dpkg 认领、unit 文件在。测试机自己可能装着 tailscale, 所以两个都得
+    # 按场景摆，不能让真实环境漏进来。
+    checks.TAILSCALED_UNIT = os.path.join(d, "tailscaled.service")
+    if installed:
+        open(checks.TAILSCALED_UNIT, "w").close()
+    old_run = checks._run
+    checks._run = lambda cmd, t=10: (
+        (0, "tailscale: /usr/bin/tailscale\n", "") if installed
+        else (1, "", "no path found")) if cmd and cmd[0] == "dpkg-query" else old_run(cmd, t)
+    try:
+        return checks.check_tailscale_residue()
+    finally:
+        checks._run = old_run
 
 
-lvl, _, det = scene(has_iface=True, svm=1, has_bin=True)
+lvl, _, det = scene(has_iface=True, svm=1, has_bin=True, installed=True)
 if lvl == "ok":
     ok("tailscale0 还在 → 判 ok(装着的时候 src_valid_mark=1 本来就是正常的)")
 else:
     bad("装着 Tailscale 也报警(%s) —— 每台用 Tailscale 的机器都会平白多一条黄灯" % lvl)
 
-lvl, _, det = scene(has_iface=False, svm=1, has_bin=False)
+lvl, _, det = scene(has_iface=False, svm=1, has_bin=False, installed=False)
 if lvl == "warn" and "src_valid_mark" in det:
     ok("卸了但 src_valid_mark 仍是 1 → 报警并点名那个参数")
 else:
@@ -151,13 +168,13 @@ if "重启" in det:
 else:
     bad("没说重启会还原 —— 那是这条最难查的后果")
 
-lvl, _, det = scene(has_iface=False, svm=0, has_bin=True)
+lvl, _, det = scene(has_iface=False, svm=0, has_bin=True, installed=False)
 if lvl == "warn" and "tailscale" in det and "rm -f" in det:
     ok("残留二进制被报出来并给了删除命令")
 else:
     bad("残留二进制没报: lvl=%s det=%r" % (lvl, det[:120]))
 
-lvl, _, det = scene(has_iface=False, svm=0, has_bin=False)
+lvl, _, det = scene(has_iface=False, svm=0, has_bin=False, installed=False)
 if lvl == "ok":
     ok("卸干净了 → 判 ok")
 else:

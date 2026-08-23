@@ -636,6 +636,27 @@ def check_tailscale_isolation():
 PROC_NET_DEV = "/proc/net/dev"
 SRC_VALID_MARK = "/proc/sys/net/ipv4/conf/all/src_valid_mark"
 TAILSCALE_BIN = "/usr/bin/tailscale"
+# 包还装着的第二个凭据。Debian 12 上 tailscale 这个 deb 会放下 unit 文件, 它跟接口在不在
+# 完全无关 —— `tailscale down` 或 tailscaled 停着的时候, 它照样在。
+TAILSCALED_UNIT = "/lib/systemd/system/tailscaled.service"
+
+
+def _tailscale_installed():
+    """Tailscale 这个**包**还在不在 —— 与它此刻通没通没关系。
+
+    返回 (installed, why)。两个凭据, 命中一个就算装着:
+      · dpkg 认领 /usr/bin/tailscale —— 那它就是包的文件, 谁都不许建议删;
+      · tailscaled 的 unit 文件还在 —— deb 放下的, 卸载才会消失。
+
+    刻意**不**看 tailscale0 接口, 也不看 tailscaled 跑没跑: 那两样回答的是"此刻通不通",
+    不是"装没装"。把它们当成安装判据, 正是这一项原先误诊的根子。
+    """
+    rc, out, _err = _run(["dpkg-query", "-S", TAILSCALE_BIN])
+    if rc == 0 and TAILSCALE_BIN in out:
+        return True, "dpkg 认领了 %s(%s)" % (TAILSCALE_BIN, out.strip().split(":")[0])
+    if os.path.exists(TAILSCALED_UNIT):
+        return True, "%s 还在" % TAILSCALED_UNIT
+    return False, ""
 
 
 def check_tailscale_residue():
@@ -652,17 +673,30 @@ def check_tailscale_residue():
     2. `apt purge` 之后 `/usr/bin/tailscale` 仍然留着(dpkg 查不到归属)。它不再工作,
        但 `command -v tailscale` 照样能找到 —— 任何按"命令在不在"判断的脚本都会被骗。
 
-    判据是**卸载之后**才成立: 装着 Tailscale 时 src_valid_mark=1 完全正常, 那时不报。
-    "装着"的判据取 tailscale0 接口在不在 —— 接口在 = 它正在工作, 与包管理器的状态无关。
+    两条都**只在真的卸载之后**才成立, 所以"卸没卸"这个前提必须站得住。原先它取的是
+    tailscale0 接口在不在, 那是错的: 接口不在的原因还有 `tailscale down`、tailscaled
+    临时停、以及装好了从没 `tailscale up` 过。那三种情形下 src_valid_mark=1 本来就正常,
+    /usr/bin/tailscale 也是包自己的文件 —— 照原判据会建议 `rm -f` 掉一个 dpkg 拥有的
+    文件, 把包弄成破损状态, 而且要到下次 apt 操作才看得出来。
+    见 tests/negctl/tailscale-residue-misdiagnosis.py。
+
+    所以现在分两步: 先看**包**还在不在(_tailscale_installed, 看 dpkg 与 unit 文件),
+    装着就整项不适用; 确认卸了, 才谈得上残留。
     """
     name = "Tailscale 卸载残留"
     try:
         with open(PROC_NET_DEV, encoding="utf-8") as f:
             has_if = any(l.strip().startswith("tailscale0:") for l in f)
     except OSError:
-        return ("warn", name, "读不到 %s, 无法判断 tailscale0 是否还在" % PROC_NET_DEV)
+        return ("warn", name, "读不到 %s, 无法判断 tailscale0 是否还在, 本项无结论" % PROC_NET_DEV)
     if has_if:
         return ("ok", name, "tailscale0 仍在, 不适用(装着的时候这些都是正常状态)")
+    installed, why = _tailscale_installed()
+    if installed:
+        # 接口不在但包还在 —— 这是 down / 停服 / 从没 up 过, 不是残留。
+        return ("ok", name,
+                "没有 tailscale0, 但 Tailscale 还装着(%s) —— 这是 `tailscale down`、"
+                "tailscaled 停着或还没 `tailscale up`, 不是卸载残留, 本项不适用。" % why)
     bad = []
     try:
         with open(SRC_VALID_MARK, encoding="utf-8") as f:
@@ -673,6 +707,7 @@ def check_tailscale_residue():
     except OSError:
         pass                      # 内核没这个参数(旧内核/容器)—— 不是问题, 不报
     if os.path.exists(TAILSCALE_BIN):
+        # 走到这里 dpkg 已经明确不认领它了, 删它不会弄破任何包。
         bad.append("%s 仍在(apt purge 之后的残留, dpkg 查不到归属) —— " % TAILSCALE_BIN +
                    "`command -v tailscale` 还能找到它, 按命令是否存在做判断的脚本会被骗。"
                    "确认不用了就: rm -f /usr/bin/tailscale")
@@ -1948,10 +1983,15 @@ def check_lan_cert():
 
 
 def _lan_probe_target(cfg):
-    """挑一个**不在面板表里**、但与某个面板同网段的地址, 用来探 tailnet ACL 的边界。
+    """在面板所在网段里**猜**一个不在面板表里的地址, 用来发现明显的越界。
 
-    取同 /24 里的另一个主机位: 家里那侧如果按设计把 ACL 收成"只允许网关访问那几个
-    IP:端口", 这个地址就该到不了。返回 (ip, port, 参照的面板 IP) 或 None。
+    这个地址只能往一个方向读: 连上了、或者收到 RST, 说明包**到达了对端**, 那是确凿的
+    越界证据。反过来不成立 —— 猜出来的地址本来就可能没有设备, "探不到"既可能是 ACL 把
+    包丢了, 也可能是那儿压根没人。两种情形给出完全相同的观测, 所以探不到**不能**反推
+    Access controls 已收紧。要把"探不到"读成安全, 需要一个已知存活、又在面板表之外的
+    对照地址(canary)来校准, 而那个信息网关自己猜不出来。
+
+    返回 (ip, port, 参照的面板 IP) 或 None。
     """
     import ipaddress
     tgts = []
@@ -1979,6 +2019,16 @@ def _lan_probe_target(cfg):
     return None
 
 
+_ACL_UNVERIFIED = (
+    "%s:%d(面板表之外)%s —— 但这**无法证明** Access controls 已收紧。这个地址是猜出来"
+    "的, 它上面本来就可能没有设备; 那种情况下 tailnet 哪怕还是默认的 allow-all, 观测到"
+    "的也是同一个结果。要把这项读成绿灯, 得有一个**已知存活、又在面板表之外**的对照地址"
+    "(canary)先把仪器校准, 而那个信息网关自己猜不出来。本项只能发现越界, 不能出具安全"
+    "证明 —— 请到 tailnet 后台按 docs/design-lan-panels.md 第 4 节人工核对 Access "
+    "controls。"
+)
+
+
 def check_deep_lan_acl():
     """tailnet ACL 越界探测(慢速, 只在 --deep 跑)。
 
@@ -1986,10 +2036,15 @@ def check_deep_lan_acl():
     子网路由器上** —— Tailscale 的包过滤在目标节点执行, 所以网关就算被 root 了, 往
     ACL 之外的地址发包也会被家里那台丢掉。项目管不了用户的 tailnet 后台, 但可以探。
 
-    判据的读法要小心, 三种结果不是"成功/失败"两分:
-      · 连上了        → ACL 放行了本不该放行的地址 → fail
-      · 连接被拒(RST) → 包**到达了对端**才会有 RST → ACL 同样放行了 → fail
-      · 不可达/超时   → 被丢在半路 → 这正是期望的结果 → ok
+    只是这个探测**不对称**, 能出结论的只有一个方向:
+      · 连上了        → 包到达了对端 → 放行了面板表之外的地址 → fail
+      · 连接被拒(RST) → 包同样到达了对端才会有这个回应       → fail
+      · 不可达/超时   → **无结论**。探的地址是猜的, 它可能根本不存在, 那时 ACL 收没收紧
+                        都是这一个观测。没有已知存活的对照地址(canary)校准仪器, 量到的
+                        东西反推不出 Access controls 的状态 → warn
+
+    早先这里把超时和不可达判成 ok, 文案写"ACL 边界成立"。那是个假绿: 它证明的只是
+    "这个猜出来的地址没有回应"。见 tests/negctl/lan-acl-false-green.py。
 
     探测**以 root 身份发起**, 因此不受门三(出站白名单)约束 —— 那是有意的: 门三管的是
     反代进程, 而这一项要量的是**家里那侧**的过滤器。用受限身份去探, 量到的会是自己的
@@ -2017,16 +2072,17 @@ def check_deep_lan_acl():
                 "只允许那几个 IP:端口。一台被拿下的网关因此能摸到你家整个网段。"
                 "去 tailnet 后台按 docs/design-lan-panels.md 第 4 节的模板配 ACL。" % (ip_, port))
     except socket.timeout:
-        return ("ok", name, "%s:%d(面板表之外)连不上 —— ACL 边界看起来是收紧的" % (ip_, port))
+        return ("warn", name, _ACL_UNVERIFIED % (ip_, port, "连不上"))
     except ConnectionRefusedError:
         return ("fail", name,
                 "%s:%d 回了 RST —— 包**到达了对端**才会有这个回应, 说明 tailnet ACL 放行了"
                 "面板表之外的地址(参照面板 %s)。ACL 该做的是把它丢掉, 而不是让对端拒绝。"
                 % (ip_, port, ref))
     except OSError as e:
-        # EHOSTUNREACH(113)/ENETUNREACH(101) = 被丢在半路, 正是期望的
+        # EHOSTUNREACH(113)/ENETUNREACH(101) = 包被丢在半路。看着像 ACL 在起作用, 但
+        # 地址不存在时也是这个结果, 所以同样只能记成无结论。
         if getattr(e, "errno", None) in (101, 113):
-            return ("ok", name, "%s:%d(面板表之外)被丢弃 —— ACL 边界成立" % (ip_, port))
+            return ("warn", name, _ACL_UNVERIFIED % (ip_, port, "被丢弃"))
         return ("warn", name, "探测没跑成(%s), 本项无结论" % e)
     finally:
         try:
