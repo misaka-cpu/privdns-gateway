@@ -3580,6 +3580,7 @@ run_all_migrations(){
   # 唯一"失败必须传出"的迁移 —— 失败即让 __migrate 返回非0,
   # cmd_update 据此回滚到更新前快照(其余迁移都是幂等自愈, 失败 best-effort 吞掉不挡后续)。
   migrate_drop_singbox || rc=1
+  migrate_lan_caddy_reender || true   # 存量机器的反代配置跟上生成器(失败不拖垮更新)
   return $rc
 }
 
@@ -5181,7 +5182,7 @@ _lan_cert(){
   fi
   if ! "$ACME_HOME/acme.sh" --home "$ACME_HOME/data" --install-cert -d "$primary" --ecc \
         --fullchain-file "$LAN_CERT_DIR/panel.crt" --key-file "$LAN_CERT_DIR/panel.key" \
-        --reloadcmd "systemctl reload pdg-lan 2>/dev/null || true"; then
+        --reloadcmd "systemctl restart pdg-lan"; then
     c_y "❌ 证书装不到 $LAN_CERT_DIR/panel.* —— 上面是 acme.sh 给的原因。"
     return 1
   fi
@@ -5292,6 +5293,27 @@ _lan_cert_missing(){
 #
 # 证书**不自动重签**: 那要 DNS 凭据、会打网络、有速率限制。但必须当场说 —— 不说的话新面板
 # 在手机上是证书错误, 而用户手里拿着一句"✅ 已加入面板表"。
+# 让反代真正用上刚生成的东西 —— **反代重载的唯一入口**。
+#
+# **必须 restart, 不能 reload。**两个原因叠在一起, 缺一都以为 reload 能用:
+#   · 出站白名单(门三)是靠 unit 的 ExecStartPre 加载进内核的, 而 reload 只跑 ExecReload;
+#   · 生成的 caddy.conf 里是 `admin off`(刻意的, 不该为了重载去开 2019 端口), 而
+#     ExecReload 是 `caddy reload --config …` —— 那条命令走 admin API, 于是**必败**:
+#         Post "http://localhost:2019/load": connect: connection refused
+#
+# 不重启的后果是"磁盘对了、进程没跟上", 而且没有任何提示。真机上撞过两次:
+#   · 加面板后文件 5 条、内核 4 条 —— 那个面板 502;
+#     删面板那个方向更危险: 内核里多一条, **反代仍能连到已经移除的设备**, 门三形同虚设;
+#   · `pdg lan render` 重新生成了配置却不重启, pdg-lan 停在 9 小时前, 新规则没进内存。
+#
+# 没在跑就什么都不做 —— 那是"还没 enable", 不是故障。
+_lan_apply_proxy(){
+  systemctl is-active --quiet pdg-lan 2>/dev/null || return 0
+  systemctl restart pdg-lan >/dev/null 2>&1 && return 0
+  c_y "⚠️ pdg-lan 重启失败 —— 新的反代配置与出站白名单都还没生效。"
+  return 1
+}
+
 _lan_sync_after_change(){
   local on active
   on="$(_lan_intent)"; active=0
@@ -5302,15 +5324,7 @@ _lan_sync_after_change(){
   fi
   _lan_render || { c_y "⚠️ 反代配置/白名单没能重新生成 —— 新面板还不会生效。"; return 1; }
   _lan_wire   || { c_y "⚠️ DNS 劫持集/分流没能同步 —— 新面板还不会生效。"; return 1; }
-  # **必须 restart, 不能 reload。**出站白名单是靠 unit 的 ExecStartPre 加载进内核的,
-  # 而 reload 只跑 ExecReload —— 于是文件写了新的、内核里还是旧的。
-  # 两个方向都出事, 而且删面板那个方向更危险:
-  #   加面板 → 内核里少一条 → 那个面板 502 打不开(doctor 的白名单漂移检查会报);
-  #   删面板 → 内核里多一条 → **反代仍能连到已经移除的设备**, 门三形同虚设。
-  # 真机上撞过: 加完之后文件 5 条、内核 4 条。
-  if systemctl is-active --quiet pdg-lan 2>/dev/null; then
-    systemctl restart pdg-lan >/dev/null 2>&1 || c_y "⚠️ pdg-lan 重启失败 —— 新的白名单还没进内核。"
-  fi
+  _lan_apply_proxy || true   # 已经自己报过原因了, 不因此中断后面的证书提示
   c_g "✅ 反代配置、出站白名单、DNS 劫持集与分流已同步。"
   local miss; miss="$(_lan_cert_missing)"
   if [[ -n "$miss" ]]; then
@@ -5438,6 +5452,34 @@ LAN_HIJACK_FILE="/etc/mosdns/rules/lan_hijack.txt"
 # 域名"完全一样 —— 抑制 AAAA/HTTPS、A 记录劫持到网关, 剩下的交给 mihomo 按 SNI 分流。
 # 另造一条一模一样的序列只会多一处要同步的地方。
 #
+# 生成器改了、而磁盘上还是旧版渲染出来的 caddy.conf → 重渲一次。
+#
+# 为什么需要它: `pdg update` 只刷新代码, 不碰 /etc/pdg-lan/caddy.conf —— 那是**持久配置**,
+# 由 lanpanel.py 在"加/删面板"时生成。于是生成器修好了 bug, 存量机器却继续用着旧规则,
+# 而且**一切自检都是绿的**(面板表、白名单、证书都对, 错的只是反代的一条改写规则)。
+# v1.10.13 修 Location 端口那次就是这样: 两台线上是我手工跑 `pdg lan render` 才生效的,
+# 按发布包正常升级的机器一个都没修上。
+#
+# 判据取"**生成物里有没有新形态**", 不取版本号 —— 版本号判据下次改生成器就过期, 而且
+# 会漏掉"降级又升级"这类路径。这里认的是 Location 改写那条规则的边界写法。
+#
+# 只在面板已启用、且 caddy.conf 确实存在时动。重渲走 _lan_render(它自带 caddy validate,
+# 不合法就拒绝落盘、现网不动), 之后必须 _lan_apply_proxy —— 只生成不重启等于没改。
+migrate_lan_caddy_reender(){
+  [[ -f "$LAN_CADDYFILE" ]] || return 0                  # 没启用过面板 → 不适用
+  [[ -s "$LAN_TABLE_PATH" ]] || return 0                 # 面板表空 → 没什么可渲
+  # 新形态: Location 改写的边界是 (/|\?|#|$) 四选一。旧版只有一个 `/`。
+  grep -q 'header_down Location "\^https?://.*(/|\\?|#|\$)"' "$LAN_CADDYFILE" && return 0
+  c_g "  [面板迁移] 反代配置是旧版生成器渲染的, 重新生成…"
+  if ! _lan_render; then
+    c_y "  [面板迁移] 重渲失败 —— 现网配置未动, 面板仍可用但 Location 改写还是旧规则。"
+    c_y "             手工补救: sudo pdg lan render"
+    return 0                                             # 不拖垮整次更新: 旧规则只影响个别上游
+  fi
+  _lan_apply_proxy || true
+  c_g "  [面板迁移] 已重新生成并生效。"
+}
+
 # 幂等; 只认本项目的标准形态; 备份 → 生成 → 校验 → 失败还原。$1 可指定文件(供测试)。
 # shellcheck disable=SC2120
 migrate_mosdns_lan(){
@@ -5593,7 +5635,9 @@ cmd_lan(){
     cert)      need_root lan; _lan_cert "${1:-}" "${2:-}";;
     render)    need_root lan
                _lan_render || return 1
-               c_g "✅ 反代配置与出站白名单已按面板表重新生成。"
+               # 只生成不重启 = 文件是新的、进程还用着旧的。撞过一次, 见 _lan_apply_proxy。
+               _lan_apply_proxy || true
+               c_g "✅ 反代配置与出站白名单已按面板表重新生成并生效。"
                _lan_wire && c_g "✅ DNS 劫持集与 mihomo 分流已同步。";;
     wire)      need_root lan; _lan_wire && c_g "✅ DNS 劫持集与 mihomo 分流已同步。";;
     purge)     _lan_purge "${1:-}";;

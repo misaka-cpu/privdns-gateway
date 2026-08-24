@@ -232,9 +232,17 @@ def render_caddy(cfg, certs_dir, bind="127.0.0.1"):
         # 却带上游端口, 对客户端永远是坏的, 不存在"用户可能想要"的情形。上面那条不一样 ——
         # 改写上游 IP 是设备特性, 得由用户按设备确认。
         #
-        # 端口段之后要求一个 `/` 收口: 少了它, `nas.example.com.evil.com` 也会被前缀匹配
-        # 吃进来。Location 总是带路径的, 这个要求不会漏掉真实情形。
-        L.append("\t\theader_down Location \"^https?://%s(:[0-9]+)?/\" \"https://%s/\""
+        # 端口段之后必须有个**边界**, 否则 `nas.example.com.evil.com` 会被前缀匹配吃进来。
+        #
+        # 边界是 `/` `?` `#` 或**字符串结尾**四选一, 不能只认 `/`。RFC 3986 里 authority
+        # 之后可以直接跟 query、fragment, 或者干脆到此为止 —— `http://HOST:30035` 是完全
+        # 合法的 Location。早先只认 `/`, 理由写的是"Location 总是带路径" —— 那是拍脑袋的
+        # 断言不是事实, 于是无路径 / 直接跟 `?` / 直接跟 `#` 三种形态全漏, 而静态测试对此
+        # 一路绿灯。补这一条的同时新增了 tests/test-lan-location-live.sh: 起真 Caddy、打真
+        # 响应头, 因为"生成的文本长这样"和"头真的被改了"是两回事。
+        #
+        # 边界那一段要**原样带回**替换结果, 所以用 $2 引回去 —— 少了它 `?x=1` 会被吃掉。
+        L.append("\t\theader_down Location \"^https?://%s(:[0-9]+)?(/|\\?|#|$)\" \"https://%s$2\""
                  % (host_re, host))
         if p.get("rewrite_location"):
             # 设备会把自己的局域网 IP 写进 Location 跳转头(Zyxel 交换机、华为 UPS 实测)。
