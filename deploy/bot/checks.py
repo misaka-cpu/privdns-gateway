@@ -639,6 +639,10 @@ TAILSCALE_BIN = "/usr/bin/tailscale"
 # 包还装着的第二个凭据。Debian 12 上 tailscale 这个 deb 会放下 unit 文件, 它跟接口在不在
 # 完全无关 —— `tailscale down` 或 tailscaled 停着的时候, 它照样在。
 TAILSCALED_UNIT = "/lib/systemd/system/tailscaled.service"
+# Debian 12 的 tailscale 包把监听端口放在这里, unit 经 EnvironmentFile 传给
+# `tailscaled --port=${PORT}`。项目里 41641 是硬编码常量, 靠这份文件对账。
+TAILSCALED_DEFAULTS = "/etc/default/tailscaled"
+TAILNET_DIRECT_COMMENT = "pdg-tailnet-direct"
 
 
 def _tailscale_installed():
@@ -714,6 +718,60 @@ def check_tailscale_residue():
     if bad:
         return ("warn", name, "; ".join(bad))
     return ("ok", name, "没有 tailscale0, 也没有留下 src_valid_mark / 残留二进制")
+
+
+def check_tailnet_direct_port():
+    """放行的 UDP 端口与 tailscaled 实际监听的端口是否还对得上。
+
+    `pdg ssh-source tailnet` 会插一条 `udp dport 41641 accept comment "pdg-tailnet-direct"`。
+    41641 是官方默认值, 但**它是可配的** —— Debian 12 上来自 /etc/default/tailscaled 的
+    `PORT=`。项目里那个数字是硬编码常量, 从不读那份文件。
+
+    用户改了 PORT 之后, 这条放行**静默地双向失效**:
+      · 41641 那条没有监听者, 成了一个永远不会有人应答的陈旧洞;
+      · 真正的端口被 input 链的 policy drop 挡住。
+    于是 `pdg ssh-source` 当初要消除的冷启动窗口原样回来 —— 几小时没用 tailnet, 出事了
+    想连进去, 第一次 SSH 必超时。而从配置上完全看不出两者有关系。
+
+    判据只做**两份配置的对账**, 不发探测包: 端口通不通要发包才知道, 而"探不到"证明不了
+    任何事(同 check_deep_lan_acl 那条教训)。读文件是确定的。
+
+    读不到 /etc/default/tailscaled 就**无结论** —— 那可能是没装 Tailscale、或者不是 deb
+    装的。不猜, 也绝不判 fail: fail 会让 `pdg update` 的自检门整次回滚。
+    """
+    name = "Tailscale 直连端口对账"
+    try:
+        with open(NFT_CONF, encoding="utf-8") as f:
+            nft = f.read()
+    except OSError:
+        return None                       # 读不到防火墙配置, 别的判据会报, 这里不重复
+    m = re.search(r"udp\s+dport\s+(\d+)\s+accept\s+comment\s+\"%s\""
+                  % TAILNET_DIRECT_COMMENT, nft)
+    if not m:
+        return None                       # SSH 没收紧为 tailnet, 整项不适用
+    allowed = int(m.group(1))
+    try:
+        with open(TAILSCALED_DEFAULTS, encoding="utf-8") as f:
+            txt = f.read()
+    except OSError:
+        return ("ok", name,
+                "放行了 UDP %d; 读不到 %s, 没法跟 tailscaled 的实际端口对账(没装 Tailscale "
+                "或不是 deb 装的?), 本项无结论。" % (allowed, TAILSCALED_DEFAULTS))
+    pm = re.search(r"^\s*PORT\s*=\s*[\"']?(\d+)[\"']?", txt, re.M)
+    if not pm:
+        return ("ok", name,
+                "放行了 UDP %d; %s 里没有 PORT= 这一行, 无从对账。"
+                % (allowed, TAILSCALED_DEFAULTS))
+    actual = int(pm.group(1))
+    if actual == allowed:
+        return ("ok", name, "放行的 UDP %d 与 tailscaled 的监听端口一致。" % allowed)
+    return ("warn", name,
+            "防火墙放行的是 UDP %d, 但 %s 里写的是 PORT=%d —— 两边对不上。"
+            "于是 %d 那条成了没有监听者的陈旧放行, 而真正在用的 %d 被 input 链丢掉。"
+            "后果是 `pdg ssh-source tailnet` 本来要消除的冷启动窗口又回来了: 空闲一段之后"
+            "第一次 SSH 会超时。要么把 PORT 改回 %d, 要么跑一次 `pdg ssh-source tailnet` "
+            "让放行跟上(它目前只认 %d, 改端口的话需要手工调 /etc/nftables.conf 里那一行)。"
+            % (allowed, TAILSCALED_DEFAULTS, actual, allowed, actual, allowed, allowed))
 
 
 def _filesha(path):
@@ -2093,7 +2151,7 @@ def check_deep_lan_acl():
 
 ALL = [check_platform, check_services, check_bot_credentials, check_health_timer, check_core_version, check_dot_arecord, check_dot_domain_sync,
        check_internal_cidr, check_cidr_drift, check_nft, check_nft_input_chains, check_redirect, check_gms,
-       check_tailscale_isolation, check_tailscale_residue,
+       check_tailscale_isolation, check_tailscale_residue, check_tailnet_direct_port,
        check_lan_routes, check_lan_whitelist, check_lan_cert,
        check_mosdns_ratelimit, check_mosdns_explicit_proxy, check_ruleset_hijack,
        check_nft_extra, check_rescue_firewall, check_geosite_db, check_mem,
