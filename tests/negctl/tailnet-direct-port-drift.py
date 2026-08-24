@@ -27,8 +27,10 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import tmpguard          # noqa: E402 - 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = Path(__file__).resolve().parents[2]
 TOUCHED = ROOT / "deploy/bot/checks.py"
@@ -84,7 +86,10 @@ MUTATIONS = [
 ]
 
 before = sha(TOUCHED)
-wd = tempfile.mkdtemp(prefix="pdg-tnp-negctl.")
+# 顶层沙箱必须走 tmpguard: 它建了就登记, 正常退出、抛异常、被 SIGTERM 杀都会清掉。
+# 裸 tempfile.mkdtemp 绕过登记 —— test-tmp-hygiene 第 4 节盯的就是这个, 而它盯得对:
+# 这支负控中途会 raise SystemExit(基线不绿时), 那条路径正是最容易漏清的。
+wd = tmpguard.mkdtemp(prefix="pdg-tnp-negctl.")
 try:
     for sub in ("deploy/bot", "tests"):
         shutil.copytree(ROOT / sub, Path(wd) / sub, dirs_exist_ok=True)
