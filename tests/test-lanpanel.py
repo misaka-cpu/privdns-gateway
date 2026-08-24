@@ -103,9 +103,17 @@ for _src in (plain, lp.render_caddy(cfg(P(rewrite_location=True)), "/c")):
     assert _pat.startswith("^https?://"), "要同时覆盖 http 与 https, 且锚在头部: " + _pat
     assert "(:[0-9]+)?" in _pat, "要覆盖'带不带端口': " + _pat
     assert r"\." in _pat, "域名里的点要转义, 否则匹配范围过大: " + _pat
-    assert _pat.rstrip("/").endswith("(:[0-9]+)?"), \
-        "端口段之后要跟 / 收口, 否则 nas.example.com.evil.com 也会被吃进来: " + _pat
-    assert _rep.startswith("https://") and ":" not in _rep[8:].rstrip("/"), \
+    # 端口段之后必须有边界, 否则 nas.example.com.evil.com 会被前缀吃进来。
+    # 但边界不能只认 `/` —— RFC 3986 里 authority 之后可以直接跟 `?`、`#`, 或到此为止,
+    # `http://HOST:30035` 是完全合法的 Location。只认 `/` 会漏掉那三种形态, 而这条静态
+    # 断言当初就是这么写的、一路绿灯。真正的判据在 tests/test-lan-location-live.sh:
+    # 起真 Caddy 打真响应头 —— "文本长这样"和"头真的被改了"是两回事。
+    _bound = r"(/|\?|#|$)"
+    assert _pat.endswith(_bound), "端口段之后的边界要覆盖 / ? # 与字符串结尾四种: " + _pat
+    assert "(:[0-9]+)?" + _bound in _pat, "边界要紧跟在端口段之后: " + _pat
+    # 边界那一段要原样带回替换结果, 否则 `?x=1` 会被吃掉。
+    assert _rep.endswith("$2"), "替换目标要用 $2 把边界带回来: " + _rep
+    assert _rep.startswith("https://") and ":" not in _rep[8:-2], \
         "替换目标必须是不带端口的 https 形式: " + _rep
 
 loc = lp.render_caddy(cfg(P(rewrite_location=True)), "/c")

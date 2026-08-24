@@ -3580,6 +3580,7 @@ run_all_migrations(){
   # 唯一"失败必须传出"的迁移 —— 失败即让 __migrate 返回非0,
   # cmd_update 据此回滚到更新前快照(其余迁移都是幂等自愈, 失败 best-effort 吞掉不挡后续)。
   migrate_drop_singbox || rc=1
+  migrate_lan_caddy_reender || true   # 存量机器的反代配置跟上生成器(失败不拖垮更新)
   return $rc
 }
 
@@ -5451,6 +5452,34 @@ LAN_HIJACK_FILE="/etc/mosdns/rules/lan_hijack.txt"
 # 域名"完全一样 —— 抑制 AAAA/HTTPS、A 记录劫持到网关, 剩下的交给 mihomo 按 SNI 分流。
 # 另造一条一模一样的序列只会多一处要同步的地方。
 #
+# 生成器改了、而磁盘上还是旧版渲染出来的 caddy.conf → 重渲一次。
+#
+# 为什么需要它: `pdg update` 只刷新代码, 不碰 /etc/pdg-lan/caddy.conf —— 那是**持久配置**,
+# 由 lanpanel.py 在"加/删面板"时生成。于是生成器修好了 bug, 存量机器却继续用着旧规则,
+# 而且**一切自检都是绿的**(面板表、白名单、证书都对, 错的只是反代的一条改写规则)。
+# v1.10.13 修 Location 端口那次就是这样: 两台线上是我手工跑 `pdg lan render` 才生效的,
+# 按发布包正常升级的机器一个都没修上。
+#
+# 判据取"**生成物里有没有新形态**", 不取版本号 —— 版本号判据下次改生成器就过期, 而且
+# 会漏掉"降级又升级"这类路径。这里认的是 Location 改写那条规则的边界写法。
+#
+# 只在面板已启用、且 caddy.conf 确实存在时动。重渲走 _lan_render(它自带 caddy validate,
+# 不合法就拒绝落盘、现网不动), 之后必须 _lan_apply_proxy —— 只生成不重启等于没改。
+migrate_lan_caddy_reender(){
+  [[ -f "$LAN_CADDYFILE" ]] || return 0                  # 没启用过面板 → 不适用
+  [[ -s "$LAN_TABLE_PATH" ]] || return 0                 # 面板表空 → 没什么可渲
+  # 新形态: Location 改写的边界是 (/|\?|#|$) 四选一。旧版只有一个 `/`。
+  grep -q 'header_down Location "\^https?://.*(/|\\?|#|\$)"' "$LAN_CADDYFILE" && return 0
+  c_g "  [面板迁移] 反代配置是旧版生成器渲染的, 重新生成…"
+  if ! _lan_render; then
+    c_y "  [面板迁移] 重渲失败 —— 现网配置未动, 面板仍可用但 Location 改写还是旧规则。"
+    c_y "             手工补救: sudo pdg lan render"
+    return 0                                             # 不拖垮整次更新: 旧规则只影响个别上游
+  fi
+  _lan_apply_proxy || true
+  c_g "  [面板迁移] 已重新生成并生效。"
+}
+
 # 幂等; 只认本项目的标准形态; 备份 → 生成 → 校验 → 失败还原。$1 可指定文件(供测试)。
 # shellcheck disable=SC2120
 migrate_mosdns_lan(){

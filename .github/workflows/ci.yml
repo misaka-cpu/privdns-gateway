@@ -169,6 +169,9 @@ jobs:
       - name: "反代重载的唯一入口(admin off 下 reload 必败, 只生成不重启=进程用着旧的)"
         run: bash tests/test-lan-proxy-reload-chokepoint.sh
 
+      - name: "Location 改写: 真 Caddy 打真响应头(静态测试证明不了头被改了)"
+        run: bash tests/test-lan-location-live.sh
+
       - name: "链路诊断采集器 (证书正常/临期/过期/错域名/损坏/误放私钥; 零写入零写锁)"
         run: python3 tests/test-link-status.py
 
