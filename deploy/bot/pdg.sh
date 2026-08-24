@@ -5181,7 +5181,7 @@ _lan_cert(){
   fi
   if ! "$ACME_HOME/acme.sh" --home "$ACME_HOME/data" --install-cert -d "$primary" --ecc \
         --fullchain-file "$LAN_CERT_DIR/panel.crt" --key-file "$LAN_CERT_DIR/panel.key" \
-        --reloadcmd "systemctl reload pdg-lan 2>/dev/null || true"; then
+        --reloadcmd "systemctl restart pdg-lan"; then
     c_y "❌ 证书装不到 $LAN_CERT_DIR/panel.* —— 上面是 acme.sh 给的原因。"
     return 1
   fi
@@ -5292,6 +5292,27 @@ _lan_cert_missing(){
 #
 # 证书**不自动重签**: 那要 DNS 凭据、会打网络、有速率限制。但必须当场说 —— 不说的话新面板
 # 在手机上是证书错误, 而用户手里拿着一句"✅ 已加入面板表"。
+# 让反代真正用上刚生成的东西 —— **反代重载的唯一入口**。
+#
+# **必须 restart, 不能 reload。**两个原因叠在一起, 缺一都以为 reload 能用:
+#   · 出站白名单(门三)是靠 unit 的 ExecStartPre 加载进内核的, 而 reload 只跑 ExecReload;
+#   · 生成的 caddy.conf 里是 `admin off`(刻意的, 不该为了重载去开 2019 端口), 而
+#     ExecReload 是 `caddy reload --config …` —— 那条命令走 admin API, 于是**必败**:
+#         Post "http://localhost:2019/load": connect: connection refused
+#
+# 不重启的后果是"磁盘对了、进程没跟上", 而且没有任何提示。真机上撞过两次:
+#   · 加面板后文件 5 条、内核 4 条 —— 那个面板 502;
+#     删面板那个方向更危险: 内核里多一条, **反代仍能连到已经移除的设备**, 门三形同虚设;
+#   · `pdg lan render` 重新生成了配置却不重启, pdg-lan 停在 9 小时前, 新规则没进内存。
+#
+# 没在跑就什么都不做 —— 那是"还没 enable", 不是故障。
+_lan_apply_proxy(){
+  systemctl is-active --quiet pdg-lan 2>/dev/null || return 0
+  systemctl restart pdg-lan >/dev/null 2>&1 && return 0
+  c_y "⚠️ pdg-lan 重启失败 —— 新的反代配置与出站白名单都还没生效。"
+  return 1
+}
+
 _lan_sync_after_change(){
   local on active
   on="$(_lan_intent)"; active=0
@@ -5302,15 +5323,7 @@ _lan_sync_after_change(){
   fi
   _lan_render || { c_y "⚠️ 反代配置/白名单没能重新生成 —— 新面板还不会生效。"; return 1; }
   _lan_wire   || { c_y "⚠️ DNS 劫持集/分流没能同步 —— 新面板还不会生效。"; return 1; }
-  # **必须 restart, 不能 reload。**出站白名单是靠 unit 的 ExecStartPre 加载进内核的,
-  # 而 reload 只跑 ExecReload —— 于是文件写了新的、内核里还是旧的。
-  # 两个方向都出事, 而且删面板那个方向更危险:
-  #   加面板 → 内核里少一条 → 那个面板 502 打不开(doctor 的白名单漂移检查会报);
-  #   删面板 → 内核里多一条 → **反代仍能连到已经移除的设备**, 门三形同虚设。
-  # 真机上撞过: 加完之后文件 5 条、内核 4 条。
-  if systemctl is-active --quiet pdg-lan 2>/dev/null; then
-    systemctl restart pdg-lan >/dev/null 2>&1 || c_y "⚠️ pdg-lan 重启失败 —— 新的白名单还没进内核。"
-  fi
+  _lan_apply_proxy || true   # 已经自己报过原因了, 不因此中断后面的证书提示
   c_g "✅ 反代配置、出站白名单、DNS 劫持集与分流已同步。"
   local miss; miss="$(_lan_cert_missing)"
   if [[ -n "$miss" ]]; then
@@ -5593,7 +5606,9 @@ cmd_lan(){
     cert)      need_root lan; _lan_cert "${1:-}" "${2:-}";;
     render)    need_root lan
                _lan_render || return 1
-               c_g "✅ 反代配置与出站白名单已按面板表重新生成。"
+               # 只生成不重启 = 文件是新的、进程还用着旧的。撞过一次, 见 _lan_apply_proxy。
+               _lan_apply_proxy || true
+               c_g "✅ 反代配置与出站白名单已按面板表重新生成并生效。"
                _lan_wire && c_g "✅ DNS 劫持集与 mihomo 分流已同步。";;
     wire)      need_root lan; _lan_wire && c_g "✅ DNS 劫持集与 mihomo 分流已同步。";;
     purge)     _lan_purge "${1:-}";;
