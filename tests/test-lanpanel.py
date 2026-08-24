@@ -77,11 +77,36 @@ assert t == [("192.168.1.50", 443), ("192.168.1.1", 8443)], t
 # 省略端口时按 scheme 取默认值 —— 防火墙要的是具体端口
 assert lp.targets(cfg(P(target="http://10.0.0.9"))) == [("10.0.0.9", 80)]
 
+import re as _re
+
 # ── ⑧ 生成: 改写指令只在被要求时出现(这是本文件最要紧的一组空测) ────────────
 plain = lp.render_caddy(cfg(P()), "/c")
-assert "header_down Location" not in plain, "没要求就不该改 Location"
 assert "header_up Referer" not in plain, "没要求就不该改 Referer"
 assert "redir" not in plain, "没要求就不该注入跳转"
+# 上游 IP 那条是设备特性, 要用户点名才加
+assert r"192\.168\.1\.50" not in plain, "没要求就不该改写指向上游 IP 的 Location"
+
+# ── ⑧b 指向**本域名**却带着上游端口的 Location, 必须无条件规范化 ──────────────
+# 上游若遵从 Host 头(Apache 的 UseCanonicalName Off 就是默认行为), 它回的 Location 长这样:
+#     http://nas.example.com:30035/dir/
+# 主机名已经是对的, 错的是 scheme 和端口 —— 而反代只在 443 上, 客户端跟着跳必然到不了。
+# 真机上撞过: TrueNAS 的 WebDAV(Apache, 跑在 30035)对不带结尾斜杠的目录发 301, iPhone
+# 跟过去卡死在"服务器已停止响应"。
+#
+# 这条**不挂在 rewrite_location 后面**: 指向本域名却带上游端口的 Location, 对客户端
+# 永远是坏的, 不存在"用户可能想要"的情形。上游 IP 那条不一样 —— 那是设备特性, 需要判断。
+for _src in (plain, lp.render_caddy(cfg(P(rewrite_location=True)), "/c")):
+    _hm = [m for m in _re.finditer(r'header_down Location "([^"]*)" "([^"]*)"', _src)
+           if "example" in m.group(1)]
+    assert _hm, "没有生成指向本域名的 Location 规范化规则:\n" + _src
+    _pat, _rep = _hm[0].group(1), _hm[0].group(2)
+    assert _pat.startswith("^https?://"), "要同时覆盖 http 与 https, 且锚在头部: " + _pat
+    assert "(:[0-9]+)?" in _pat, "要覆盖'带不带端口': " + _pat
+    assert r"\." in _pat, "域名里的点要转义, 否则匹配范围过大: " + _pat
+    assert _pat.rstrip("/").endswith("(:[0-9]+)?"), \
+        "端口段之后要跟 / 收口, 否则 nas.example.com.evil.com 也会被吃进来: " + _pat
+    assert _rep.startswith("https://") and ":" not in _rep[8:].rstrip("/"), \
+        "替换目标必须是不带端口的 https 形式: " + _rep
 
 loc = lp.render_caddy(cfg(P(rewrite_location=True)), "/c")
 assert "header_down Location" in loc
@@ -89,12 +114,11 @@ assert "header_up Referer" not in loc, "只要了 Location, 不该顺手改 Refe
 
 ref = lp.render_caddy(cfg(P(fix_referer=True)), "/c")
 assert "header_up Referer" in ref and "header_up Origin" in ref
-assert "header_down Location" not in ref
+assert r"192\.168\.1\.50" not in ref, "只要了 Referer, 不该顺手改写上游 IP 的 Location"
 # **必须是"替换"形式(两个参数), 不能是"设置"形式(一个参数)**。
 # 无条件设置会给本来没带 Referer 的请求(浏览器首次导航就不带)硬塞一个 —— 华为 UPS2000
 # 实测: 根路径不带 Referer 回 302, 带任何 Referer 都回 404。带不带端口没区别, 决定性的
 # 是"有没有凭空塞一个"。
-import re as _re
 _m = _re.search(r'header_up Referer "([^"]*)" "([^"]*)"', ref)
 assert _m, "Referer 不是替换形式(三参数): " + ref
 # **搜索式必须匹配任意 Referer**, 不能只匹配指向本域名的那种。
@@ -109,8 +133,13 @@ assert "@has_ref" not in ref and "header_up @" not in ref, "header_up 不该带 
 
 # Location 用一条正则覆盖 http/https 与带不带端口 —— 逐条字面替换总会漏一种,
 # 而漏掉的那种表现是手机跳到一个到不了的地址。
-_l = _re.search(r'header_down Location "([^"]*)"', loc)
-assert _l and _l.group(1).startswith("https?://") and "(:[0-9]+)?" in _l.group(1), \
+# 现在有两条 header_down Location: 本域名规范化(无条件, 见 ⑧b)与上游 IP 改写(要 flag)。
+# 这里只验后者, 所以按上游 IP 挑出来 —— 挑"第一条"会抓到前者, 判据就落空了。
+_l = [m for m in _re.finditer(r'header_down Location "([^"]*)"', loc)
+      if "192" in m.group(1)]
+assert _l, "没有生成针对上游 IP 的 Location 改写: " + loc
+_l = _l[0]
+assert _l.group(1).startswith("https?://") and "(:[0-9]+)?" in _l.group(1), \
     "Location 改写不是覆盖式正则: " + (loc)
 # 点要转义, 否则 `.` 会匹配任意字符, 改写范围比预期大
 assert r"192\.168\.1\.50" in _l.group(1), _l.group(1)
