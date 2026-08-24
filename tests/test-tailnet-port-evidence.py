@@ -152,8 +152,13 @@ if "41641" in _msg and ("只支持" in _msg or "只生成" in _msg or "只认" i
     ok("文案明说了该命令目前只支持默认端口")
 else:
     bad("文案没说清该命令只支持 41641: " + _msg[:120])
-if "监听" in _msg and "配置" not in _msg:
-    bad("文案把 defaults 说成了运行时监听事实, 而这一项只是配置对账")
+# 盯的是**冒充运行时事实**这一形态, 不是某个字。defaults 只是端口的配置来源, 进程有没有
+# 按它跑, 这条判据管不着 —— 所以不能写"实际监听/监听端口/在监听", 只能写"声明/配置"。
+_claims_runtime = [w for w in ("实际监听", "监听端口", "正在监听", "监听的端口") if w in _msg]
+if _claims_runtime:
+    bad("文案把 defaults 说成了运行时监听事实(%s), 而这一项只是配置对账" % _claims_runtime[0])
+elif not any(w in _msg for w in ("声明", "配置", "对账")):
+    bad("文案没把自己限定为配置对账, 读者会以为它探过端口: " + _msg[:110])
 else:
     ok("文案把自己限定为配置对账, 没冒充监听探测")
 
