@@ -720,24 +720,66 @@ def check_tailscale_residue():
     return ("ok", name, "没有 tailscale0, 也没有留下 src_valid_mark / 残留二进制")
 
 
+def _tailscaled_port(txt):
+    """从 /etc/default/tailscaled 的内容里取 PORT= 的**最终生效值**。
+
+    返回 (port, reason)。port 为 None 时 reason 说明取不到的原因。
+
+    按 systemd EnvironmentFile 的语义来: 逐行解析, 空行与 `#` 开头的注释跳过, **后面的
+    赋值覆盖前面的**。用 re.search 取第一个是错的 —— 那正好取到被覆盖掉的那个值, 而且
+    错得很安静(两边"对上了", 实际用的是另一个端口)。
+
+    最后一条赋值解析不出合法端口时, **不退回前一个值**。退回去等于拿一个已经被覆盖的旧值
+    冒充现状, 而那正是这条判据要防的事; 宁可说不知道。
+
+    只做这一件事: 不展开变量、不处理续行、不解释引号内的转义 —— 那是 shell 解释器的活,
+    这里不需要, 多写一分就多一分猜错的机会。
+    """
+    port, reason = None, "%s 里没有 PORT= 赋值" % TAILSCALED_DEFAULTS
+    for raw in txt.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = re.match(r"^PORT\s*=\s*(.*)$", line)
+        if not m:
+            continue
+        val = m.group(1).strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+            val = val[1:-1].strip()
+        if not val.isdigit():
+            port, reason = None, "最后一条 PORT= 赋值解析不出端口(%r)" % raw.strip()[:40]
+            continue
+        n = int(val)
+        if not (1 <= n <= 65535):
+            port, reason = None, "最后一条 PORT= 赋值不是合法端口(%d)" % n
+            continue
+        port, reason = n, ""
+    return port, reason
+
+
 def check_tailnet_direct_port():
-    """放行的 UDP 端口与 tailscaled 实际监听的端口是否还对得上。
+    """放行的 UDP 端口与 tailscaled 配置里声明的端口是否还对得上。
 
     `pdg ssh-source tailnet` 会插一条 `udp dport 41641 accept comment "pdg-tailnet-direct"`。
     41641 是官方默认值, 但**它是可配的** —— Debian 12 上来自 /etc/default/tailscaled 的
-    `PORT=`。项目里那个数字是硬编码常量, 从不读那份文件。
+    `PORT=`, unit 经 EnvironmentFile 传给 `tailscaled --port=${PORT}`。项目里那个数字是
+    硬编码常量, 从不读那份文件。
 
     用户改了 PORT 之后, 这条放行**静默地双向失效**:
-      · 41641 那条没有监听者, 成了一个永远不会有人应答的陈旧洞;
-      · 真正的端口被 input 链的 policy drop 挡住。
+      · 41641 那条没有监听者, 成了一个永远不会有人应答的陈旧放行;
+      · 真正在用的端口被 input 链的 policy drop 挡住。
     于是 `pdg ssh-source` 当初要消除的冷启动窗口原样回来 —— 几小时没用 tailnet, 出事了
     想连进去, 第一次 SSH 必超时。而从配置上完全看不出两者有关系。
 
-    判据只做**两份配置的对账**, 不发探测包: 端口通不通要发包才知道, 而"探不到"证明不了
-    任何事(同 check_deep_lan_acl 那条教训)。读文件是确定的。
+    **这是配置对账, 不是监听探测。**判据只比两份配置, 不发探测包: 端口通不通要发包才知道,
+    而"探不到"证明不了任何事(同 check_deep_lan_acl 那条假绿的教训)。读文件是确定的。
+    所以文案里不能把 /etc/default/tailscaled 说成"实际监听端口" —— 它只是 Debian 包的
+    端口配置来源, 进程有没有按它跑, 这条判据管不着。
 
-    读不到 /etc/default/tailscaled 就**无结论** —— 那可能是没装 Tailscale、或者不是 deb
-    装的。不猜, 也绝不判 fail: fail 会让 `pdg update` 的自检门整次回滚。
+    取不到证据时判 **warn + 明说无结论**, 不判 ok: 读不到那份文件、或者文件里没有合法的
+    PORT=, 我们对"放行的端口还有没有人监听"一无所知 —— 那不是"没问题", 是"不知道"。
+    也不判 fail: fail 会让 `pdg update` 的自检门整次回滚, 而"这台机器没装 Tailscale"
+    根本不该阻断更新。
     """
     name = "Tailscale 直连端口对账"
     try:
@@ -750,28 +792,31 @@ def check_tailnet_direct_port():
     if not m:
         return None                       # SSH 没收紧为 tailnet, 整项不适用
     allowed = int(m.group(1))
+    unresolved = ("放行了 UDP %d, 但%s —— **本项无结论**: 取不到声明的端口, 就没法判断这条"
+                  "放行是否还指着 tailscaled 在用的那个口。没装 Tailscale、或不是 deb 装的, "
+                  "属于正常情形, 不必处理。" % (allowed, "%s"))
     try:
         with open(TAILSCALED_DEFAULTS, encoding="utf-8") as f:
             txt = f.read()
-    except OSError:
-        return ("ok", name,
-                "放行了 UDP %d; 读不到 %s, 没法跟 tailscaled 的实际端口对账(没装 Tailscale "
-                "或不是 deb 装的?), 本项无结论。" % (allowed, TAILSCALED_DEFAULTS))
-    pm = re.search(r"^\s*PORT\s*=\s*[\"']?(\d+)[\"']?", txt, re.M)
-    if not pm:
-        return ("ok", name,
-                "放行了 UDP %d; %s 里没有 PORT= 这一行, 无从对账。"
-                % (allowed, TAILSCALED_DEFAULTS))
-    actual = int(pm.group(1))
+    except OSError as e:
+        return ("warn", name, unresolved % ("读不到 %s(%s)" % (TAILSCALED_DEFAULTS, e.strerror or e)))
+    actual, why = _tailscaled_port(txt)
+    if actual is None:
+        return ("warn", name, unresolved % why)
     if actual == allowed:
-        return ("ok", name, "放行的 UDP %d 与 tailscaled 的监听端口一致。" % allowed)
+        return ("ok", name,
+                "放行的 UDP %d 与 %s 里声明的端口一致。" % (allowed, TAILSCALED_DEFAULTS))
     return ("warn", name,
-            "防火墙放行的是 UDP %d, 但 %s 里写的是 PORT=%d —— 两边对不上。"
-            "于是 %d 那条成了没有监听者的陈旧放行, 而真正在用的 %d 被 input 链丢掉。"
+            "防火墙放行的是 UDP %d, 而 %s 里声明的是 PORT=%d —— 两边对不上。"
+            "于是 %d 那条成了没有监听者的陈旧放行, 而声明在用的 %d 被 input 链丢掉。"
             "后果是 `pdg ssh-source tailnet` 本来要消除的冷启动窗口又回来了: 空闲一段之后"
-            "第一次 SSH 会超时。要么把 PORT 改回 %d, 要么跑一次 `pdg ssh-source tailnet` "
-            "让放行跟上(它目前只认 %d, 改端口的话需要手工调 /etc/nftables.conf 里那一行)。"
-            % (allowed, TAILSCALED_DEFAULTS, actual, allowed, actual, allowed, allowed))
+            "第一次 SSH 会超时。"
+            "**`pdg ssh-source tailnet` 目前只生成 41641, 跟不了自定义端口。**"
+            "要恢复默认: 先把 %s 改回 PORT=41641, 重启 tailscaled, 再重新应用一次 tailnet "
+            "SSH 来源策略。要坚持用 %d: 得按运维流程人工把 /etc/nftables.conf 里那一行对齐, "
+            "本命令不会替你处理。"
+            % (allowed, TAILSCALED_DEFAULTS, actual, allowed, actual,
+               TAILSCALED_DEFAULTS, actual))
 
 
 def _filesha(path):
