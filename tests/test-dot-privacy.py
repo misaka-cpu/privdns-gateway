@@ -186,6 +186,10 @@ def normal_chain(t):
     inner = m.group(0) if m else ""
     b = main_seq(t)
     b = re.sub(r"      # ── 探测命名空间.*?        exec: goto probe_seq\n", "", b, flags=re.S)
+    # 去广告受管块同理: 它是**新加的一段**, 判据要问的是"原有顺序有没有被改写", 所以把
+    # 整段剥掉再比。剥的是有起止标记的那一段, 剥不干净会立刻表现为这一格红。
+    inner = re.sub(r" *# >>> pdg-adblock managed block \(internal_sequence\).*?"
+                   r"# <<< pdg-adblock managed block \(internal_sequence\)\n", "", inner, flags=re.S)
     # 两段都要去注释: 新插件的说明块夹在 internal_sequence 与 main_sequence 之间,
     # 只去 main 那一半的话, 注释本身会被当成"主链变了"。
     strip = lambda x: re.sub(r"^\s*#.*$", "", x, flags=re.M)

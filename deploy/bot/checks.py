@@ -1150,7 +1150,12 @@ def check_mosdns_explicit_proxy():
     if not conf:
         return ("warn", "指定域名优先级", "读不到 mosdns 配置")
     blk = _internal_seq_block(conf)
-    gi = blk.find("qname $explicit_proxy")
+    # 找的是**真正的分派那一步**(`goto explicit_proxy_seq`), 不是任意一次 `explicit_proxy`
+    # 的出现。v1.11.0 的去广告受管块里有一句 `!qname $explicit_proxy`(用户显式分流对第三方
+    # 表免疫), 它排在这条判断**之前** —— 按"第一次出现"找会命中那一句, 于是"顺序反了"也
+    # 会被判成 ok。判据要盯的是分派动作, 不是名字出现在哪。
+    m_disp = re.search(r"matches:\s*qname \$explicit_proxy\s*\n\s*exec:\s*goto explicit_proxy_seq", blk)
+    gi = m_disp.start() if m_disp else -1
     ci = blk.find("qname $geosite_cn")
     has_set = re.search(r"-\s*tag:\s*explicit_proxy\s*\n\s*type:\s*domain_set", conf)
     has_seq = re.search(r"-\s*tag:\s*explicit_proxy_seq\s*\n\s*type:\s*sequence", conf)

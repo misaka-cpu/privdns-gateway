@@ -219,9 +219,17 @@ else:
         rules = os.path.join(d, "rules")
         os.makedirs(rules)
         for leaf in ("geosite_cn", "geosite_apple", "geosite_gfw", "geosite_geolocation-!cn",
+                     "adblock_allow", "adblock_block",
                      "custom_direct", "custom_hijack", "ruleset_hijack", "unlock", "mitm_hijack"):
             open(os.path.join(rules, leaf + ".txt"), "w").close()   # 全空
+        # 去广告受管块把三个 domain_set 指到 /var/lib/privdns-gateway/adblock/ ——
+        # 同样"缺文件即 FATAL", 在沙箱里一并建成空文件并把路径改写过去。
+        adb = os.path.join(d, "adblock")
+        os.makedirs(adb, exist_ok=True)
+        for leaf in ("infra_allow", "effective_block", "effective_list"):
+            open(os.path.join(adb, leaf + ".txt"), "w").close()
         tmpl = (ROOT / "deploy/mosdns/config.yaml").read_text(encoding="utf-8")
+        tmpl = tmpl.replace("/var/lib/privdns-gateway/adblock/", adb + "/")
         cfg = (tmpl.split("  - tag: dot_server")[0]
                .replace("__SERVER_IP__", "10.9.9.9")
                .replace("__INTERNAL_CIDR__", "127.0.0.0/8")
