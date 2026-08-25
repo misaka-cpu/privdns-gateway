@@ -40,6 +40,10 @@ MEMBER_TARGET = {
     "etc/mosdns/config.yaml": "mosdns_conf",
     "etc/mosdns/rules/custom_direct.txt": "mosdns_rule:custom_direct.txt",
     "etc/mosdns/rules/custom_hijack.txt": "mosdns_rule:custom_hijack.txt",
+    # 去广告的用户规则是**用户数据**: 第三方表可以随时重下, 用户自己写的这两份不能。
+    # 第三方编译产物有意不在这张表里 —— 它在 /var/lib 下, 可再生, 也不进全局快照。
+    "etc/mosdns/rules/adblock_allow.txt": "mosdns_rule:adblock_allow.txt",
+    "etc/mosdns/rules/adblock_block.txt": "mosdns_rule:adblock_block.txt",
     "opt/pdg-bot/rulesets.json": "rs_meta",
     # iOS 描述文件生命周期三件套。缺任何一件, 恢复出来的都是自相矛盾的状态。
     "etc/privdns-gateway/ios-profile.json": "ios_profile_state",

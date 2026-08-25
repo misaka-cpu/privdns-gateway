@@ -83,6 +83,10 @@ for _lp in /etc/pdg-lan /var/lib/pdg-lan /opt/pdg-acme; do
 done
 rm -f /usr/local/bin/caddy 2>/dev/null || true
 [[ -e /usr/local/bin/caddy ]] && _LAN_RESIDUE="$_LAN_RESIDUE /usr/local/bin/caddy"
+# 去广告: 删**可再生**的第三方表与编译产物; 用户自己写的 allow/block 在
+# /etc/mosdns/rules/ 下, 与其它规则集同口径由那一段统一处理, 这里一个字节都不碰。
+[[ -d /var/lib/privdns-gateway/adblock ]] && rm -rf /var/lib/privdns-gateway/adblock
+
 if id pdg-lan >/dev/null 2>&1; then
   userdel pdg-lan 2>/dev/null || _LAN_RESIDUE="$_LAN_RESIDUE 用户pdg-lan(删不掉,可能还有进程在跑)"
 fi
