@@ -506,7 +506,55 @@ sudo pdg lan purge                # 连配置、证书、DNS 凭据、caddy 一�
 
 `pdg uninstall` 也会一并带走，包括 DNS API 凭据和 acme 账户密钥 —— 服务没了而能改你 DNS 记录的凭据还留在盘上，比不卸载更糟。删不掉的会逐条点名。
 
-## 14. 项目组成
+## 14. DNS 去广告(可选,默认关闭)
+
+在 DNS 这一层把广告与追踪域名答成 NXDOMAIN。**默认关闭**,不启用时解析行为与不装这个
+功能时完全一样。
+
+```bash
+sudo pdg adblock update     # 取一份第三方表(默认 anti-AD, MIT)
+sudo pdg adblock enable     # 启用
+pdg adblock status          # 看状态
+pdg adblock check ads.example.com   # 查某个域名会不会被拦, 命中哪一层
+sudo pdg adblock disable    # 停用(用户规则与已下载的表都保留)
+```
+
+### 优先级(六层,从高到低)
+
+| | 层 | 谁能压过它 |
+|---|---|---|
+| 1 | **基础设施**(本机 DoT 域名、面板域名、WLOC 接管域名、更新源、证书与 ACME) | 首版谁都不能 |
+| 2 | 用户 allow(`/etc/mosdns/rules/adblock_allow.txt`) | 只有基础设施 |
+| 3 | 用户 block(`/etc/mosdns/rules/adblock_block.txt`) | allow 与基础设施 |
+| 4 | 你自己点名指到出口的域名 | 用户 block 可以;**第三方表不行** |
+| 5 | 第三方广告表 | 上面四层都行 |
+| 6 | geosite / 自动规则 / 默认出口 | — |
+
+第 4 行那条是要点:**第三方表不得压过你点名指到出口的域名**。那是自动生成的批量规则,
+而这个项目一贯的语义是"用户点名的具体意图 > 自动生成的批量规则"。反过来,你自己写进
+block 的域名**可以**压过自己的分流规则 —— 那也是点名的意图,只是方向相反。
+
+### 两条边界
+
+**基础设施白名单是从本机状态生成的,不是手写的。**枚举不到的那一类**不猜、也不会用宽泛
+后缀放行整个公共域** —— 比如 DNS 服务商的 API 域名,只有能从 acme.sh 的 dnsapi 脚本里
+真读出来时才写进去;读不出来就在 `pdg adblock status` 与 `pdg doctor` 里如实说"这些域名
+不在保护内"。
+
+**更新失败绝不会切成空表。**下载到错页、空文件、条目数骤降、格式认不出,一律拒绝并
+**继续使用上一份可用的表**。空表在 DNS 层是完全合法的,所以"错页 → 编译出零条 → 一切
+照常"这条路本来是通的、而且全程零报错;挡住它的是下载侧的判据。
+
+### 不会做的事
+
+不记录任何查询域名 —— `pdg adblock check` 只查规则文件,不发 DNS 查询也不读日志。
+首版只支持精确(`full:`)与后缀(`domain:`)两种匹配,不做正则、ABP 语法、URL 路径过滤、
+IP 黑名单、CNAME cloaking、按设备生效,也不拦浏览器自带的 DoH。
+
+第三方表存在 `/var/lib/privdns-gateway/adblock/`(可再生,**不进版本快照**);你自己写的
+allow/block 在 `/etc/mosdns/rules/` 下,和其它规则集一样受 `pdg update` 保全。
+
+## 15. 项目组成
 
 | 层 | 组件 | 说明 |
 |---|---|---|
@@ -578,7 +626,7 @@ sudo nft -c -f /etc/nftables.conf && sudo systemctl reload nftables
 - **观测面板前端资源（zashboard）**：固定版本 + SHA256 校验 + 暂存目录 + 原子替换，属于静态
   缓存资源，不是 DNS/分流生产配置，因此不纳入配置事务。
 
-## 15. 文档
+## 16. 文档
 
 - [docs/QUICKSTART.md](docs/QUICKSTART.md) — 新手图文教程
 - [docs/INSTALL.md](docs/INSTALL.md) — 安装细节 / DNS 配置 / 端口 / 版本说明
@@ -590,7 +638,7 @@ sudo nft -c -f /etc/nftables.conf && sudo systemctl reload nftables
 - [docs/RELEASE-CHECKLIST.md](docs/RELEASE-CHECKLIST.md) — 发版前检查清单
 - [CHANGELOG.md](CHANGELOG.md) — 更新日志
 
-## 16. 免责声明与 License
+## 17. 免责声明与 License
 
 本项目仅供学习与合法网络管理用途。请遵守你所在地的法律法规，使用者自行承担责任，作者不对使用后果负责。
 
