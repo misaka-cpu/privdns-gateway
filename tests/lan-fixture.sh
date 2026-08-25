@@ -37,9 +37,16 @@ lan_fx_extract(){
 LAN_FX_FUNCS=(
   c_g c_y
   _pdg_mktemp_dir _pdg_module
+  _profile_set
   _lan_hosts _lan_intent _lan_migrate_certs _lan_cert_missing
-  _lan_render _lan_apply_proxy _lan_sync_after_change _lan_disable
+  _lan_render _lan_install_managed _lan_restore_pre
+  _lan_apply_proxy _lan_sync_after_change _lan_disable
 )
+
+# 沙箱专用的桩(**不是**生产函数): need_root 在非 root 下会 exit 1, 而这一组测的不是
+# 权限门。写在这里而不是各测试里各写一份, 免得两支对"沙箱里什么算已就绪"的假设分叉。
+LAN_FX_STUB_FUNCS='need_root(){ :; }'
+
 
 # 把闭包写成一个可 source 的文件。缺哪个就整体失败, 不半截交付。
 lan_fx_emit(){
@@ -49,6 +56,7 @@ lan_fx_emit(){
     lan_fx_extract "$fn" >> "$out" || return 1
     echo >> "$out"
   done
+  printf '%s\n\n' "$LAN_FX_STUB_FUNCS" >> "$out"
   # 可选函数: 存在才抽(本轮新增的收敛入口在基线上还不存在, 缺席要能被具名报出来)
   for extra in "${LAN_FX_OPTIONAL[@]:-}"; do
     [[ -n "$extra" ]] || continue

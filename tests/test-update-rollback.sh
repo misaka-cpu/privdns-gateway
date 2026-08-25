@@ -66,6 +66,9 @@ _pdg_apply_snapshot_tree(){ cat "\$1/etc/privdns-gateway/snapid" > "\$APPLIED" 2
 # 覆盖生产文件之前的 iOS 联合校验(见 pdg.sh _pdg_ios_verify_tree)。这些快照里根本没有
 # iOS 生命周期成员, 生产里它会直接 return 0 —— 这里打桩只是因为本壳没抽那一批函数。
 _pdg_ios_verify_tree(){ return 0; }
+# 内网面板的回滚收敛(见 pdg.sh _lan_rollback_converge)。同样是"本壳没抽那一批函数"才打的桩 ——
+# 收敛本身由 tests/test-lan-rollback-convergence.sh 跑真函数覆盖, 这里只要它不影响本壳的判据。
+_lan_rollback_converge(){ return 0; }
 EOF
 
 run(){ bash -c "source '$WORK/harness.sh'; source '$WORK/rollback.sh'; cmd_rollback $1" 2>&1; }

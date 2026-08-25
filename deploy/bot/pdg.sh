@@ -1452,6 +1452,11 @@ cmd_rollback(){
       c_y "     配置与服务已回滚; 代码仍是当前版本。要对齐就跑一次 pdg update, 或手工 git reset。"
     fi
   fi
+  # 内网面板的派生产物在全局快照之外, 得从**刚恢复的**模型现渲一遍才算回滚完整。
+  # 位置有讲究: 必须在上面的 git reset 之后 —— 生成器来自 REPO_DIR, 那一步才刚复位。
+  if ! _lan_rollback_converge; then
+    unrestored+=("内网面板派生产物")
+  fi
   if [[ ${#unrestored[@]} -eq 0 ]]; then
     echo "✅ 已回滚并重启服务"
   else
@@ -5237,38 +5242,126 @@ _lan_migrate_certs(){
   return 0
 }
 
+# 把面板表渲染成三个派生产物, **一笔局部事务**: 一起生成、一起校验、一起落盘,
+# 任一步不成立就整笔退回本次调用的前像。
+#
+# 为什么必须是一笔: 三个产物是同一个模型的三个投影。落一半 = 反代、防火墙、systemd
+# 各自看着不同版本的面板表, 而这种状态没有任何一条自检会报。旧实现有三个各自独立的
+# 写点, 而且:
+#   · `pdg_unit_lan_caddy … > "$LAN_UNIT"` —— 重定向**先截断正式文件**再执行, 生成失败
+#     就留下一个空 unit, 失败本身又被 `&&` 短路吞掉;
+#   · 函数最后一条是 `systemctl daemon-reload … || true` —— **恒为真**, 于是上面任何
+#     一步失败, 整个函数照样返回 0。调用方据此打印"已生成并生效"。
+#   · `install -m640 -o root -g "$LAN_USER" … || install -m644 …` —— 属组装不上就静默
+#     降级成 644 root:root, 而那份配置里是面板拓扑。
+#
+# 边界: 只碰这三个产物。凭据(dns.env / 证书 / acme 账户密钥)一个字节都不读不写 ——
+# 它们不是版本产物, 不随模型变化, 也不该出现在任何候选目录里。
 _lan_render(){
   _lan_migrate_certs
-  local mod tmpc tmpn legacy
+  local mod stg pre legacy cbin f base rc=0
   mod="$(_pdg_module lanpanel.py)" || { c_y "❌ 找不到 lanpanel.py"; return 1; }
-  tmpc="$(mktemp)"; tmpn="$(mktemp)"
-  if ! python3 "$mod" render "$LAN_TABLE_PATH" --certs "$LAN_CERT_DIR" > "$tmpc" 2>"$tmpc.err"; then
-    c_y "❌ 生成反代配置失败:"; sed 's/^/    /' "$tmpc.err" "$tmpc" 2>/dev/null | head -10
-    rm -f "$tmpc" "$tmpn" "$tmpc.err"; return 1
+  stg="$(_pdg_mktemp_dir)" || { c_y "❌ 候选目录创建失败(未改动任何文件)"; return 1; }
+  chmod 700 "$stg" 2>/dev/null || true      # 候选里是面板拓扑, 不给旁人看
+  pre="$stg/pre"
+  if ! mkdir -p "$pre"; then
+    c_y "❌ 前像目录创建失败(未改动任何文件)"; rm -rf "$stg"; return 1
   fi
-  if ! python3 "$mod" nft "$LAN_TABLE_PATH" --uid "$LAN_USER" > "$tmpn" 2>"$tmpn.err"; then
-    c_y "❌ 生成出站白名单失败:"; sed 's/^/    /' "$tmpn.err" 2>/dev/null | head -10
-    rm -f "$tmpc" "$tmpn" "$tmpc.err" "$tmpn.err"; return 1
+
+  # ── ① 三个候选一起生成 ────────────────────────────────────────────────────
+  if ! python3 "$mod" render "$LAN_TABLE_PATH" --certs "$LAN_CERT_DIR" > "$stg/caddy.conf" 2>"$stg/err"; then
+    c_y "❌ 生成反代配置失败:"; sed 's/^/    /' "$stg/err" 2>/dev/null | head -10
+    rm -rf "$stg"; return 1
   fi
-  # 反代配置先让 caddy 自己判一遍再落盘。落一份它读不懂的配置, 症状是服务起不来,
-  # 而那时旧配置已经被覆盖 —— 连"退回去"都没得退。
-  if [[ -x /usr/local/bin/caddy ]]; then
-    if ! /usr/local/bin/caddy validate --config "$tmpc" --adapter caddyfile >/dev/null 2>&1; then
-      c_y "❌ 生成出来的反代配置 caddy 自己判为不合法, 拒绝落盘(现有配置未动):"
-      /usr/local/bin/caddy validate --config "$tmpc" --adapter caddyfile 2>&1 | head -6 | sed 's/^/    /'
-      rm -f "$tmpc" "$tmpn" "$tmpc.err" "$tmpn.err"; return 1
-    fi
+  if ! python3 "$mod" nft "$LAN_TABLE_PATH" --uid "$LAN_USER" > "$stg/lan.nft" 2>"$stg/err"; then
+    c_y "❌ 生成出站白名单失败:"; sed 's/^/    /' "$stg/err" 2>/dev/null | head -10
+    rm -rf "$stg"; return 1
   fi
-  install -m640 -o root -g "$LAN_USER" "$tmpc" "$LAN_CADDYFILE" 2>/dev/null || install -m644 "$tmpc" "$LAN_CADDYFILE"
-  install -m644 "$tmpn" "$LAN_NFT_CONF"
-  rm -f "$tmpc" "$tmpn" "$tmpc.err" "$tmpn.err"
   legacy="$(python3 -c 'import importlib.util,sys
 spec=importlib.util.spec_from_file_location("lp",sys.argv[1]); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 import json; print("1" if m.legacy_tls_panels(json.load(open(sys.argv[2]))) else "")' "$mod" "$LAN_TABLE_PATH" 2>/dev/null)"
   # shellcheck source=lib/units.sh
-  source "$REPO_DIR/lib/units.sh" 2>/dev/null || { c_y "❌ 读不到 lib/units.sh"; return 1; }
-  pdg_unit_lan_caddy "$legacy" > "$LAN_UNIT" && chmod 644 "$LAN_UNIT"
-  systemctl daemon-reload 2>/dev/null || true
+  if ! source "$REPO_DIR/lib/units.sh" 2>/dev/null; then
+    c_y "❌ 读不到 lib/units.sh(未改动任何文件)"; rm -rf "$stg"; return 1
+  fi
+  if ! pdg_unit_lan_caddy "$legacy" > "$stg/pdg-lan.service" || [[ ! -s "$stg/pdg-lan.service" ]]; then
+    c_y "❌ 生成 pdg-lan.service 失败(未改动任何文件)"; rm -rf "$stg"; return 1
+  fi
+
+  # ── ② 落盘前校验 ──────────────────────────────────────────────────────────
+  # 反代配置交给**真 Caddy**, 防火墙候选交给 nft -c。两者都只在工具可用时做 ——
+  # 拿"工具不在"当判据就是假红(§9.10)。caddy 的取用顺序与 tests/test-lan-location-live.sh
+  # 一致: 装好的那份优先, 否则 PATH。生产上 _lan_install_caddy 保证前者存在, 于是这条
+  # 只可能让校验**多跑**, 不会让它少跑。
+  cbin=""
+  if [[ -x /usr/local/bin/caddy ]]; then cbin=/usr/local/bin/caddy
+  elif command -v caddy >/dev/null 2>&1; then cbin="$(command -v caddy)"; fi
+  if [[ -n "$cbin" ]] && ! "$cbin" validate --config "$stg/caddy.conf" --adapter caddyfile >/dev/null 2>&1; then
+    c_y "❌ 生成出来的反代配置 caddy 自己判为不合法, 拒绝落盘(现有配置未动):"
+    "$cbin" validate --config "$stg/caddy.conf" --adapter caddyfile 2>&1 | head -6 | sed 's/^/    /'
+    rm -rf "$stg"; return 1
+  fi
+  if command -v nft >/dev/null 2>&1 && ! nft -c -f "$stg/lan.nft" >/dev/null 2>&1; then
+    c_y "❌ 生成出来的出站白名单 nft 判为不合法, 拒绝落盘(现有配置未动):"
+    nft -c -f "$stg/lan.nft" 2>&1 | head -6 | sed 's/^/    /'
+    rm -rf "$stg"; return 1
+  fi
+
+  # ── ③ 留前像 ──────────────────────────────────────────────────────────────
+  # 记下"本来存不存在": 本来没有的, 退回时要删掉而不是留一份新的。
+  for f in "$LAN_CADDYFILE" "$LAN_NFT_CONF" "$LAN_UNIT"; do
+    base="$(basename "$f")"
+    if [[ -e "$f" ]]; then
+      cp -a "$f" "$pre/$base" || { c_y "❌ 备份前像失败(未改动任何文件): $f"; rm -rf "$stg"; return 1; }
+    else
+      : > "$pre/$base.absent"
+    fi
+  done
+
+  # ── ④ 落盘 ────────────────────────────────────────────────────────────────
+  _lan_install_managed "$stg/caddy.conf"      "$LAN_CADDYFILE" 640 "$LAN_USER" || rc=1
+  [[ "$rc" == 0 ]] && { _lan_install_managed "$stg/lan.nft"    "$LAN_NFT_CONF"  644 ""          || rc=1; }
+  [[ "$rc" == 0 ]] && { _lan_install_managed "$stg/pdg-lan.service" "$LAN_UNIT" 644 ""          || rc=1; }
+  # daemon-reload 属于这一笔: 新 unit 落了盘而 systemd 不知道, 等于没换。
+  # 旧实现这里是 `|| true` —— 那是整个函数假成功的最后一环。
+  [[ "$rc" == 0 ]] && { systemctl daemon-reload 2>/dev/null || rc=1; }
+
+  if [[ "$rc" != 0 ]]; then
+    c_y "❌ 派生产物落盘失败 → 整笔退回本次调用前的状态。"
+    _lan_restore_pre "$pre"
+    systemctl daemon-reload 2>/dev/null || true
+    rm -rf "$stg"; return 1
+  fi
+  rm -rf "$stg"
+  return 0
+}
+
+# 落一个受管产物。**没有静默降级的退路**: 属组/权限设不成就是失败。
+# 旧实现的 `|| install -m644` 会把一份 640 root:pdg-lan 的配置悄悄变成 644 root:root。
+# 属主设成 root 只在真的是 root 时做 —— 不是 root 就没有这个权力, 而生产上这个函数
+# 只经 need_root 之后才可能被调到。
+_lan_install_managed(){
+  local src="$1" dst="$2" mode="$3" grp="${4:-}"
+  install -m "$mode" "$src" "$dst" 2>/dev/null || { c_y "  落盘失败: $dst"; return 1; }
+  if [[ -n "$grp" ]]; then
+    chgrp "$grp" "$dst" 2>/dev/null || { c_y "  属组设不成 $grp(不静默降级): $dst"; return 1; }
+    [[ $EUID -eq 0 ]] && { chown root "$dst" 2>/dev/null || { c_y "  属主设不成 root: $dst"; return 1; }; }
+  fi
+  return 0
+}
+
+# 把三个受管产物退回前像。本来不存在的删掉 —— 留一份"回滚前没有过"的新文件
+# 同样是半套状态, 只是方向相反。
+_lan_restore_pre(){
+  local pre="$1" f base
+  for f in "$LAN_CADDYFILE" "$LAN_NFT_CONF" "$LAN_UNIT"; do
+    base="$(basename "$f")"
+    if [[ -e "$pre/$base.absent" ]]; then
+      rm -f "$f" 2>/dev/null || true
+    elif [[ -e "$pre/$base" ]]; then
+      cp -a "$pre/$base" "$f" 2>/dev/null || c_y "  ⚠️ 前像退回失败: $f"
+    fi
+  done
 }
 
 # 现有证书的 SAN 没覆盖到的面板(空 = 都覆盖了)。preflight 与 add/rm 共用这一份判据 ——
@@ -5314,6 +5407,53 @@ _lan_apply_proxy(){
   return 1
 }
 
+# 回滚收尾: 让三个派生产物跟上**刚恢复的**模型。
+#
+# 现场是这样出现的: /etc/privdns-gateway/{lan-panels.json, profile.env} 在全局快照内,
+# 回滚把它们带回去了; 而 caddy.conf / nftables-pdg-lan.conf / pdg-lan.service 都在快照
+# 之外, 回滚一个字节都不碰。于是模型是旧的、产物是新的 —— 白名单那半有 doctor 逐条对账,
+# 反代那半在门四之前根本没人看。
+#
+# ⚠️ 调用点必须在 **git reset 之后**: _lan_render 会 source "$REPO_DIR/lib/units.sh"
+# 并经 _pdg_module 取 lanpanel.py, 而仓库在 cmd_rollback 的最后一步才复位。插在它之前
+# 等于拿**新版**生成器去渲**旧版**模型, 那正是要消除的那类半新半旧。
+#
+# 边界(三条都不许放宽):
+#   · 只碰那三个派生产物。凭据(dns.env / 证书 / acme 账户密钥)不读不写;
+#   · 绝不签证书、不下载、不读 tailnet —— 回滚是把现场退回去, 不是重建一遍;
+#   · **不碰 mosdns 劫持集与 mihomo 分流**: /etc/mosdns 与 /etc/mihomo 本来就在快照里,
+#     已经跟着回滚了。在这里再 _lan_wire 一次, 等于拿当前状态覆盖掉刚恢复的那一份。
+_lan_rollback_converge(){
+  local intent active=0
+  intent="$(_lan_intent)"
+  systemctl is-active --quiet pdg-lan 2>/dev/null && active=1
+
+  if [[ "$intent" == 1 ]]; then
+    if ! _lan_render; then
+      c_y "⚠️ LAN 回滚不完整: 派生产物没能按恢复出来的面板表重新生成(第一失败点: 渲染/落盘)。"
+      c_y "   面板表与 profile 已经回滚到位; 反代仍在用回滚前的配置。手工补: sudo pdg lan render"
+      return 1
+    fi
+    if ! _lan_apply_proxy; then
+      c_y "⚠️ LAN 回滚不完整: 产物已按面板表更新, 但反代没能重启(第一失败点: 重启 pdg-lan)。"
+      c_y "   此刻磁盘是新的、进程还用着旧的。手工补: sudo systemctl restart pdg-lan"
+      return 1
+    fi
+    return 0
+  fi
+
+  # 意图是"停用"。**只有确实还有东西在跑或在盘上时**才收敛: 从未启用过面板的机器上
+  # _lan_disable 会往 profile.env 写一个快照里根本没有的 PDG_LAN_ENABLED=0 ——
+  # 那是在改写刚刚恢复出来的状态, 方向虽小, 性质与漂移相同。
+  if (( active == 1 )) || [[ -e "$LAN_UNIT" || -s "$LAN_NFT_CONF" ]]; then
+    if ! _lan_disable >/dev/null; then
+      c_y "⚠️ LAN 回滚不完整: 面板已回到停用态, 但反代没能停下来(第一失败点: 停用 pdg-lan)。"
+      return 1
+    fi
+  fi
+  return 0
+}
+
 _lan_sync_after_change(){
   local on active
   on="$(_lan_intent)"; active=0
@@ -5324,7 +5464,9 @@ _lan_sync_after_change(){
   fi
   _lan_render || { c_y "⚠️ 反代配置/白名单没能重新生成 —— 新面板还不会生效。"; return 1; }
   _lan_wire   || { c_y "⚠️ DNS 劫持集/分流没能同步 —— 新面板还不会生效。"; return 1; }
-  _lan_apply_proxy || true   # 已经自己报过原因了, 不因此中断后面的证书提示
+  # 失败必须向上传播: 这里曾是 `|| true` —— 反代没重启起来, 而调用方照旧打印"已同步"。
+  # "磁盘对了、进程没跟上"是本项目反复出事的那个形态, 不能由一句成功文案盖过去。
+  _lan_apply_proxy || return 1
   c_g "✅ 反代配置、出站白名单、DNS 劫持集与分流已同步。"
   local miss; miss="$(_lan_cert_missing)"
   if [[ -n "$miss" ]]; then
@@ -5476,7 +5618,10 @@ migrate_lan_caddy_reender(){
     c_y "             手工补救: sudo pdg lan render"
     return 0                                             # 不拖垮整次更新: 旧规则只影响个别上游
   fi
-  _lan_apply_proxy || true
+  if ! _lan_apply_proxy; then
+    c_y "  [面板迁移] 配置已重新生成, 但反代没能重启 —— 进程仍用着旧规则。"
+    return 1                                   # 调用侧(cmd_update)自带 `|| true`, 不拖垮整次更新
+  fi
   c_g "  [面板迁移] 已重新生成并生效。"
 }
 
@@ -5636,7 +5781,7 @@ cmd_lan(){
     render)    need_root lan
                _lan_render || return 1
                # 只生成不重启 = 文件是新的、进程还用着旧的。撞过一次, 见 _lan_apply_proxy。
-               _lan_apply_proxy || true
+               _lan_apply_proxy || return 1
                c_g "✅ 反代配置与出站白名单已按面板表重新生成并生效。"
                _lan_wire && c_g "✅ DNS 劫持集与 mihomo 分流已同步。";;
     wire)      need_root lan; _lan_wire && c_g "✅ DNS 劫持集与 mihomo 分流已同步。";;
