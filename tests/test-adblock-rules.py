@@ -219,6 +219,30 @@ if A:
         "源码里没有把查询域名写日志的路径" if not leaky
         else "出现可能记录查询的调用: %s" % leaky)
 
+# ══ ⑧ 第三方表不得进入全局快照 ═════════════════════════════════════════════
+# 第三方表是**可再生**的(随时能重下), 而全局快照只保留最近 10 份 —— 把一张几 MiB 的表
+# 塞进去, 十份轮转就是几十 MiB, 而且回滚回一份旧广告表毫无意义。
+# 用户自己写的 allow/block 是另一回事: 它们在 /etc/mosdns/rules/ 下, 本来就在快照里。
+pdgsh = (ROOT / "deploy/bot/pdg.sh").read_text(encoding="utf-8")
+import re as _re
+m = _re.search(r"local cand=\((.*?)\)\n", pdgsh, _re.S)
+if not m:
+    bad("抽不到 cmd_snapshot 的 cand 数组 —— 这一条无从谈起")
+else:
+    cand = m.group(1)
+    if "adblock" in cand:
+        bad("第三方表所在目录被加进了全局快照候选集 —— 十份轮转会各存一份")
+    else:
+        ok("第三方表所在目录不在全局快照候选集里")
+    # 越界守卫也该主动拒收它(双重保障: 就算有人加进 cand, 落盘那步也过不去)
+    g = _re.search(r"grep -Evq '\^\((.*?)\)\(", pdgsh)
+    if not g:
+        bad("抽不到快照的越界守卫正则")
+    elif "var/lib/privdns-gateway/adblock" in g.group(1):
+        bad("越界守卫被放宽到允许 adblock 目录 —— 不该为这个功能放宽守卫")
+    else:
+        ok("快照越界守卫未被放宽(仍只放行 ios-profile 那一个 var/lib 子树)")
+
 print("-" * 58)
 print("通过 %d, 失败 %d" % (PASS[0], len(FAIL)))
 sys.exit(1 if FAIL else 0)
