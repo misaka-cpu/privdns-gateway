@@ -354,6 +354,41 @@ grep -q '内网面板派生产物' "$W/rollback.sh" \
   && ok "D3 收敛失败会计入未恢复项(不谎报完全回滚)" \
   || bad "D3 收敛失败没有计入 unrestored —— 会报成'✅ 已回滚'"
 
+echo "══ E. 第一次执行 / 二次幂等 / 凭据保全 ══"
+
+# E1: 产物一个都不存在时(第一次执行)必须能从零生成 —— 回滚到"面板刚启用之前"那种快照,
+# 现场就是这样: 模型说启用, 而三个产物还没有。
+W="$(new_box e1)"
+lan_fx_model "$W/etc/privdns-gateway/lan-panels.json" a:a.lan.test:192.168.100.10:80
+echo "PDG_LAN_ENABLED=1" > "$W/etc/privdns-gateway/profile.env"
+rm -f "$W/etc/pdg-lan/caddy.conf" "$W/etc/nftables-pdg-lan.conf" "$W/etc/systemd/system/pdg-lan.service"
+rc1="$(run_box "$W" "$CONV; converge")"
+first="$(snap3 "$W")"
+if [[ "$rc1" == 0 && "$first" != *"-"* ]]; then
+  ok "E1 第一次执行(产物全不存在)→ 三个都生成出来了"
+else
+  bad "E1 第一次执行没能生成齐(rc=$rc1, 指纹=[$first])"
+fi
+
+# E2: 再跑一次, 三个产物必须**逐字节相同**。渲染里混进时间戳/随机名之类的东西, 会让
+# "有没有变"这个问题永远答不清楚 —— 而回滚收尾要能反复跑。
+before_creds="$(creds "$W")"
+rc2="$(run_box "$W" "$CONV; converge")"
+second="$(snap3 "$W")"
+[[ "$rc2" == 0 && "$second" == "$first" ]] \
+  && ok "E2 二次幂等: 三个产物逐字节相同" \
+  || bad "E2 二次不幂等(rc=$rc2): 首次=[$first] 二次=[$second]"
+
+# E3: 两次跑完, 凭据的内容 + mode + uid:gid 全都不许动。
+[[ "$(creds "$W")" == "$before_creds" ]] \
+  && ok "E3 两次收敛全程凭据零改动(内容+mode+属主)" \
+  || bad "E3 凭据被改动: 前=[$before_creds] 后=[$(creds "$W")]"
+
+# E4: 收敛不许碰 acme 账户目录 —— 它是不可再生的凭据, 也是"绝不签证书"这条边界的落点。
+[[ ! -e "$W/opt/pdg-acme" ]] \
+  && ok "E4 收敛没有创建/触碰 acme 账户目录(不签证书、不联网)" \
+  || bad "E4 收敛动了 acme 账户目录"
+
 echo "─────────────────────────────────────────"
 echo "通过 $PASS, 失败 $FAIL"
 [[ "$FAIL" == 0 ]]
