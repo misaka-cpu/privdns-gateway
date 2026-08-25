@@ -75,6 +75,33 @@ plugins:
     args:
       size: __MOSDNS_CACHE__            # 标准 8192 / 低内存 2048(install 按内存模式渲染, pdg 更新按 profile 迁移)
       lazy_cache_ttl: 86400
+  # 不要手工编辑下面这一段(起止标记之间的内容由 pdg 管理)。
+  # >>> pdg-adblock managed block (plugins)
+  # DNS 去广告(可选, 默认关闭)。四个集合分别对应优先级的前四层, 顺序在
+  # internal_sequence 那段里用**合取**表达, 不靠这里的先后。
+  #
+  # 路径全部写成**字面量**, 不用占位符 —— 这份模板有十来个渲染点(install.sh 与多个测试
+  # harness 各带一份 sed 表), 占位符一旦落在必须被替换的位置, 任何一个没跟上的渲染点都会
+  # 让配置带着未替换的 token 照常加载, 而那条分支永远不匹配(假绿)。同 dotwitness 端口那次。
+  #
+  # 四个文件**必须存在**(空文件可以): domain_set 缺文件会让 mosdns FATAL 退出。
+  # install.sh 与 migrate_adblock 负责把它们建成空文件常驻。
+  #
+  # 用户源在 /etc/mosdns/rules/(受快照与 cfgrestore 保全); 编译产物与第三方表在
+  # /var/lib/privdns-gateway/adblock/(可再生, **有意不进全局快照**)。
+  - tag: adblock_infra_allow
+    type: domain_set
+    args: { files: ["/var/lib/privdns-gateway/adblock/infra_allow.txt"] }
+  - tag: adblock_user_allow
+    type: domain_set
+    args: { files: ["/etc/mosdns/rules/adblock_allow.txt"] }
+  - tag: adblock_user_block
+    type: domain_set
+    args: { files: ["/var/lib/privdns-gateway/adblock/effective_block.txt"] }
+  - tag: adblock_list
+    type: domain_set
+    args: { files: ["/var/lib/privdns-gateway/adblock/effective_list.txt"] }
+  # <<< pdg-adblock managed block (plugins)
   # MITM 接管域名的劫持序列(经 goto 进入, 不返回): 抑制 AAAA/HTTPS + A 劫持到网关。
   - tag: force_hijack_seq
     type: sequence
@@ -105,6 +132,32 @@ plugins:
     args:
       - matches: "!$client_limiter"     # 单客户端超 QPS → REFUSED, 抢在缓存/上游之前拦掉
         exec: reject 5
+      # 不要手工编辑下面这一段(起止标记之间的内容由 pdg 管理)。
+      # >>> pdg-adblock managed block (internal_sequence)
+      # 位置有讲究: 排在限速**之后**(被阻断的查询照样受 QPS 兜底约束), 排在 $lazy_cache
+      # **之前**。缓存那句后面紧跟 `jump has_resp` —— 命中即 accept 并终止整个序列, 排在
+      # 其后的判据在缓存命中时根本不会被执行; 而 lazy_cache_ttl 是 86400, 那就是最长 24h
+      # 的绕过窗口。默认关闭时四个集合都是空文件, 两条都不命中, 解析行为逐条不变。
+      #
+      # 优先级用**合取**表达, 不靠规则先后 —— 顺序表达的优先级在插入新规则时会静默改变,
+      # 合取写死在同一条里, 改坏了就是语法可见的改动。
+      #
+      # ① 用户 block: 压过用户自己的显式分流(custom_hijack), 但压不过 allow 与基础设施。
+      - matches:
+          - qname $adblock_user_block
+          - "!qname $adblock_user_allow"
+          - "!qname $adblock_infra_allow"
+        exec: reject 3
+      # ② 第三方广告表: 额外让**用户显式分流的域名免疫** —— 那是 test-rule-precedence.py
+      #    那条"用户点名的规则 > 自动生成的批量规则"契约在 DNS 侧的延续。第三方表是典型的
+      #    自动批量规则, 不得压过用户点名指到出口的域名。
+      - matches:
+          - qname $adblock_list
+          - "!qname $adblock_user_allow"
+          - "!qname $adblock_infra_allow"
+          - "!qname $explicit_proxy"
+        exec: reject 3
+      # <<< pdg-adblock managed block (internal_sequence)
       - exec: $lazy_cache
       - exec: jump has_resp
       # MITM 接管域名: 强制劫持(在 CN 判断之前, 即使 Apple/国内域名也劫持; goto 不返回)

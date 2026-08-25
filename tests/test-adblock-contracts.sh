@@ -42,7 +42,10 @@ printf 'domain:dot.adb.invalid\ndomain:panel.adb.invalid\ndomain:wloc.adb.invali
 # 用户 allow
 printf 'domain:allowme.ads.invalid\ndomain:bothlists.invalid\n' > "$R/adblock_allow.txt"
 # 用户 block(其中 routed-blocked 同时是显式分流域名 → 用户 block 必须压过它)
+# 写两份: $R 下是**用户源文件**(受快照与 cfgrestore 保全), $V 下是**编译产物**——
+# 受管块读的是后者, 因为"关闭"要靠把编译产物清空来实现, 而用户源文件必须原样保留。
 printf 'domain:userblocked.invalid\ndomain:bothlists.invalid\ndomain:routed-blocked.invalid\n' > "$R/adblock_block.txt"
+cp "$R/adblock_block.txt" "$V/effective_block.txt"
 # 第三方表(其中 routed-listed 同时是显式分流域名 → 第三方**不得**压过它;
 #           infra 那几个也塞进来 → 必须压不过基础设施白名单)
 printf 'domain:ads.invalid\ndomain:allowme.ads.invalid\ndomain:routed-listed.invalid\ndomain:dot.adb.invalid\ndomain:panel.adb.invalid\ndomain:wloc.adb.invalid\ndomain:updates.adb.invalid\n' > "$V/effective_list.txt"
