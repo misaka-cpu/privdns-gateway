@@ -88,6 +88,12 @@ def have_env():
 SUDO = "" if os.geteuid() == 0 else "sudo -n"
 
 BOX, TSC, PHY = "pdgts_box", "pdgts_tsc", "pdgts_phy"
+# veth 的**临时**名字: 建的时候用它们, 移进 netns 之后再改成 tailscale0 / wan0 / eth0。
+# 直接用目标名建会在宿主 netns 里短暂占用 "tailscale0", 与真机上跑着的 Tailscale 撞车。
+# 名字里带 PID: 同一台机器上并发跑两份时互不干扰(netns 名本身不带 PID, 所以并发本来就
+# 不支持 —— 这里只保证"上一次残留的链不会顶掉这一次")。
+V_TS_A, V_TS_B = "pdgts_t%da" % os.getpid(), "pdgts_t%db" % os.getpid()
+V_PHY_A, V_PHY_B = "pdgts_p%da" % os.getpid(), "pdgts_p%db" % os.getpid()
 # 配置给 PDG 的内网段。**两个客户端地址都落在它里面** —— 这是这支测试的全部要害:
 # 判据若只看源地址, 两侧完全不可区分, 必须靠入口接口才能分开。
 CIDR = "100.64.0.0/16"
@@ -102,6 +108,11 @@ TS_ADDR6, BOX_TS6 = "fd00:64::2", "fd00:64::1"
 def cleanup():
     for ns in (BOX, TSC, PHY):
         run("%s ip netns del %s" % (SUDO, ns))
+    # 删 netns 会带走里面的链, 但**建链与移入 netns 之间**失败时那一对还留在宿主里 ——
+    # 那正是本文件唯一会往宿主 netns 写东西的窗口, 不清就是给下一次留脏现场。
+    # 只删本进程用的那四个临时名, 不按前缀扫(别人的并发跑不该被我们删掉)。
+    for link in (V_TS_A, V_TS_B, V_PHY_A, V_PHY_B):
+        run("%s ip link del %s" % (SUDO, link))
 
 
 def build_lab():
@@ -111,9 +122,24 @@ def build_lab():
         # netns
         "ip netns add %s" % BOX, "ip netns add %s" % TSC, "ip netns add %s" % PHY,
         # veth: box.tailscale0 <-> tsclient.eth0
-        "ip link add tailscale0 netns %s type veth peer name eth0 netns %s" % (BOX, TSC),
-        # veth: box.wan0 <-> phyclient.eth0
-        "ip link add wan0 netns %s type veth peer name eth0 netns %s" % (BOX, PHY),
+        #
+        # ⚠️ **先用临时名建、再移进 netns 里改名**, 不能直接 `ip link add tailscale0 netns …`。
+        # `ip link add` 是**先在当前(宿主)netns 建出这一对, 再移过去** —— 于是那个瞬间宿主
+        # 里就有了一个叫 tailscale0 的接口。在**真的跑着 Tailscale 的机器上**(开发机就是),
+        # 这一步必然 `RTNETLINK answers: File exists`, 整个实验床建不起来, 而报错指向的是
+        # "建实验床失败", 看不出跟宿主的 tailscale0 有关。
+        # 临时名带 pdgts_ 前缀 + PID, 与 cleanup() 的清理范围一致, 不会撞到任何真实接口。
+        "ip link add %s type veth peer name %s" % (V_TS_A, V_TS_B),
+        "ip link set %s netns %s" % (V_TS_A, BOX),
+        "ip link set %s netns %s" % (V_TS_B, TSC),
+        "ip -n %s link set %s name tailscale0" % (BOX, V_TS_A),
+        "ip -n %s link set %s name eth0" % (TSC, V_TS_B),
+        # veth: box.wan0 <-> phyclient.eth0(同样的道理, 统一走临时名)
+        "ip link add %s type veth peer name %s" % (V_PHY_A, V_PHY_B),
+        "ip link set %s netns %s" % (V_PHY_A, BOX),
+        "ip link set %s netns %s" % (V_PHY_B, PHY),
+        "ip -n %s link set %s name wan0" % (BOX, V_PHY_A),
+        "ip -n %s link set %s name eth0" % (PHY, V_PHY_B),
         # 地址与启用
         "ip -n %s addr add %s/30 dev tailscale0" % (BOX, BOX_TS),
         "ip -n %s addr add %s/30 dev wan0" % (BOX, BOX_PHY),

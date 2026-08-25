@@ -41,6 +41,19 @@ HEAD_REF=$(git -C "$REPO" rev-parse HEAD)
 
 # ── 抽取 cmd_rollback + 打桩 ──────────────────────────────────────────────────
 sed -n '/^cmd_rollback(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh" > "$WORK/rollback.sh"
+# _snap_meta_commit 也要**抽真的**, 不能靠打桩、更不能不管。
+#
+# 它是 cmd_rollback 在"调用方没点名 --git"时用来取回滚目标提交的那一步。原来两样都没做:
+# 没抽也没打桩, 于是壳里跑到那行是 **127(command not found)**, 输出被 2>/dev/null 吞掉,
+# 命令替换得到空串 —— 恰好和"这份快照没记提交"是同一个结果, 于是判据一路绿着走过去,
+# 而**真函数从来没被执行过**。这条 127 在基线上就存在, 是 v1.10.16 那轮加收敛调用时才
+# 因为退出码变化被顺带暴露出来的。
+#
+# 它只依赖 python3(读 snapshot.json 的 git_commit, 且只认合法哈希 —— 字面量 "unknown"
+# 会被正则挡掉), 抽进来零成本, 比任何桩都忠实。
+sed -n '/^_snap_meta_commit(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh" >> "$WORK/rollback.sh"
+grep -q '^_snap_meta_commit(){' "$WORK/rollback.sh" \
+  || { echo "[FAIL] 抽不到 _snap_meta_commit —— 改名了? 后面的判据全部无效"; exit 1; }
 # 快照里不含 etc/sing-box/config.json 与 etc/nftables.conf → 内核/nft 校验分支被跳过,
 # 无需真 sing-box/mihomo/nft 二进制(也就不必打桩带连字符的函数名)。
 cat > "$WORK/harness.sh" <<EOF
@@ -88,6 +101,31 @@ e2e_git "$REPO" reset --hard -q "$HEAD_REF"
 out=$(run "--dir '$SNAP/A' --git '$GOOD_REF'")
 [[ "$(git -C "$REPO" rev-parse HEAD)" == "$GOOD_REF" ]] \
   && echo "$out" | grep -q '已回滚并重启服务' && ok "--git: REPO_DIR 复位到指定提交 + 报完全回滚" || bad "B: HEAD=$(git -C "$REPO" rev-parse HEAD) out=$out"
+
+# ── B2. 不带 --git 时, 目标从**快照自己记的** git_commit 派生 ────────────────
+# 这一格是补上来的: 本壳原来每个用例都显式传 --git, 于是 _snap_meta_commit 那条路径
+# 一次都没走过 —— 而它当时根本没被抽进壳里, 跑到那行是静默 127, 命令替换得到空串,
+# 恰好与"这份快照没记提交"同一个结果, 所以一路绿着走过去。127 消失了不等于这条路被验了。
+e2e_git "$REPO" reset --hard -q "$HEAD_REF"
+printf '{"id":"A","source":"cli","op":"update","git_commit":"%s"}\n' "$GOOD_REF" > "$SNAP/A/snapshot.json"
+out=$(run "--dir '$SNAP/A'")
+[[ "$(git -C "$REPO" rev-parse HEAD)" == "$GOOD_REF" ]] \
+  && ok "无 --git: 目标取自快照记的 git_commit(仓库已复位)" \
+  || bad "B2: HEAD=$(git -C "$REPO" rev-parse HEAD) 期望=$GOOD_REF out=$out"
+echo "$out" | grep -q '将一并把仓库复位到快照记录的提交' \
+  && ok "  并明说目标是从快照元数据派生的" || bad "B2b: out=$out"
+
+# ── B3. git_commit 是字面量 "unknown" 时不许当成提交 ─────────────────────────
+# _snap_meta_write 读不到仓库时写的就是 "unknown"。把它交给 `git reset --hard` 会拿一个
+# 不存在的 ref 去复位 —— 正则必须把它挡在外面, 表现应与"没记提交"一致。
+e2e_git "$REPO" reset --hard -q "$HEAD_REF"
+printf '{"id":"A","source":"cli","op":"update","git_commit":"unknown"}\n' > "$SNAP/A/snapshot.json"
+out=$(run "--dir '$SNAP/A'")
+[[ "$(git -C "$REPO" rev-parse HEAD)" == "$HEAD_REF" ]] \
+  && ok "git_commit=unknown → 不当成提交, 仓库不动" || bad "B3: HEAD 被改成 $(git -C "$REPO" rev-parse HEAD)"
+echo "$out" | grep -q '没记下仓库提交' \
+  && ok "  并如实说'只还原了一半'而不是静默跳过" || bad "B3b: out=$out"
+rm -f "$SNAP/A/snapshot.json"
 
 # ── C. git ref 不存在 → 不谎报完全回滚, 返回 1 ───────────────────────────────
 rc=0; out=$(run "--dir '$SNAP/A' --git 'deadbeefdeadbeef'") || rc=$?
