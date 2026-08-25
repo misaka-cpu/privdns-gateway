@@ -927,6 +927,85 @@ _RL_WARN = ("warn", "限流", "mosdns 单客户端 QPS 兜底(rate_limiter)缺�
                             "'!$client_limiter → reject 5'。")
 _RL_WANT = {"qps": "200", "burst": "400", "mask4": "32", "mask6": "128"}
 
+def _lan_route_projection(text):
+    """把一份 Caddyfile 投影成 {host: 上游}。
+
+    **正反两侧共用这一个抽取器** —— 期望值那边也用它。抽取器自己有偏差时两边同样偏,
+    于是它不可能凭空造出"漂移"; 能造出漂移的只有真正的内容差异。
+    """
+    out, host = {}, None
+    for line in (text or "").splitlines():
+        m = re.match(r"^(\S+):443\s*\{", line)
+        if m:
+            host = m.group(1)
+            continue
+        m = re.match(r"^\s*reverse_proxy\s+(\S+)", line)
+        if m and host:
+            out[host] = m.group(1)
+            host = None
+    return out
+
+
+def check_lan_proxy_routes():
+    """门四: 受管的反代路由必须与面板表**双向一致**。
+
+    门三(check_lan_whitelist)看的是内核里的出站白名单, 这一条看的是**反代自己的配置**。
+    两者都由面板表派生, 但只有门三有人对账 —— 于是这种状态可以长期存在且零告警:
+
+        模型里已经没有 c 面板了, 而 caddy.conf 还在为 c 转发。
+
+    最典型的来源是回滚: /etc/privdns-gateway(面板表 + 启用意图)在全局快照内, 跟着回去了;
+    /etc/pdg-lan/caddy.conf 在快照之外, 留在原地。两个方向的危险不对称:
+      · 反代多出模型没有的站点 = 仍在服务一个**已经被移除**的面板;
+      · 反代少了模型有的站点   = 那个面板打不开, 而白名单是按模型放行的, 现场看着正常。
+
+    期望值用**真渲染器**(lanpanel.render_caddy)现渲, 不另写一套宽松版判据 —— 第二实现
+    迟早与真渲染器分叉, 而分叉方向通常是"判据比产品宽", 也就是假绿。
+    读不出来的一律 warn: "判据没跑成"与"判据成立"混成一句, 会让缺文件的机器看着像配置丢了。
+    """
+    name = "内网面板: 反代路由对账"
+    cfg = _lan_cfg()
+    if cfg is None:
+        return None                   # 从来没配过这个功能
+    on, _active = _lan_on()
+    if not on:
+        return ("ok", name, "内网面板已停用 —— 不适用")
+    lp = _lanpanel()
+    if lp is None:
+        return ("warn", name, "取不到 lanpanel 模块, 反代对账本次没跑")
+    try:
+        with open(LAN_CADDYFILE, encoding="utf-8") as f:
+            live_txt = f.read()
+    except OSError as e:
+        return ("warn", name, "读不到受管反代配置 %s(%s), 本项没跑成" % (LAN_CADDYFILE, e.__class__.__name__))
+    try:
+        want_txt = lp.render_caddy(cfg, LAN_CERT_DIR)
+    except Exception as e:  # noqa: BLE001  含 PanelError: 面板表自己就不合法
+        return ("warn", name, "面板表渲不出反代配置(%s), 对账本次没跑" % e)
+
+    live, want = _lan_route_projection(live_txt), _lan_route_projection(want_txt)
+    if want and not live:
+        return ("fail", name,
+                "面板表有 %d 个站点, 而受管反代配置里一个都解析不到 —— 反代此刻不按面板表工作。"
+                "跑 sudo pdg lan render 后重启 pdg-lan。" % len(want))
+    missing = sorted(h for h in want if h not in live)
+    extra = sorted(h for h in live if h not in want)
+    drift = sorted(h for h in want if h in live and live[h] != want[h])
+    if not (missing or extra or drift):
+        return ("ok", name, "反代路由与面板表逐条一致(%d 个站点)" % len(want))
+    parts = []
+    if extra:
+        parts.append("反代仍在服务面板表里没有的 %s —— 那些面板已经被移除, 而反代还在转发"
+                     % ", ".join(extra[:3]))
+    if missing:
+        parts.append("反代缺少面板表里的 %s —— 那些面板打不开, 而白名单是按表放行的, 看着一切正常"
+                     % ", ".join(missing[:3]))
+    if drift:
+        parts.append("上游对不上: %s" % ", ".join(
+            "%s(反代→%s, 表→%s)" % (h, live[h], want[h]) for h in drift[:3]))
+    return ("fail", name, "; ".join(parts) + "。跑 sudo pdg lan render 后重启 pdg-lan。")
+
+
 def check_mosdns_ratelimit():
     """单客户端 QPS 兜底(rate_limiter)是否就位且参数/动作正确:
     插件 client_limiter 是 rate_limiter 且 qps200/burst400/mask4-32/mask6-128;
@@ -1845,6 +1924,7 @@ def check_transactions():
 
 # ── 内网面板(方案 B) ─────────────────────────────────────────────────────────
 LAN_TABLE = "/etc/privdns-gateway/lan-panels.json"
+LAN_CADDYFILE = "/etc/pdg-lan/caddy.conf"
 LAN_CERT_DIR = "/etc/pdg-lan/certs"
 LAN_NFT_TABLE = "pdglan"
 LAN_USER = "pdg-lan"
@@ -2197,7 +2277,7 @@ def check_deep_lan_acl():
 ALL = [check_platform, check_services, check_bot_credentials, check_health_timer, check_core_version, check_dot_arecord, check_dot_domain_sync,
        check_internal_cidr, check_cidr_drift, check_nft, check_nft_input_chains, check_redirect, check_gms,
        check_tailscale_isolation, check_tailscale_residue, check_tailnet_direct_port,
-       check_lan_routes, check_lan_whitelist, check_lan_cert,
+       check_lan_routes, check_lan_whitelist, check_lan_proxy_routes, check_lan_cert,
        check_mosdns_ratelimit, check_mosdns_explicit_proxy, check_ruleset_hijack,
        check_nft_extra, check_rescue_firewall, check_geosite_db, check_mem,
        check_cert, check_cert_dir_sync, check_dns, check_core_config, check_rulesets, check_rule_precedence,

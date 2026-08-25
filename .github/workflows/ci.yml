@@ -175,6 +175,12 @@ jobs:
       - name: "Location 改写: 真 Caddy 打真响应头(静态测试证明不了头被改了)"
         run: bash tests/test-lan-location-live.sh
 
+      - name: "内网面板门四: 受管反代路由与面板表双向对账(回滚后的静默漂移)"
+        run: python3 tests/test-lan-proxy-drift.py
+
+      - name: "内网面板回滚收敛: 派生产物跟随已恢复的模型, 且 render/apply 不假成功"
+        run: bash tests/test-lan-rollback-convergence.sh
+
       - name: "链路诊断采集器 (证书正常/临期/过期/错域名/损坏/误放私钥; 零写入零写锁)"
         run: python3 tests/test-link-status.py
 
