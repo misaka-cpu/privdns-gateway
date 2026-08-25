@@ -187,6 +187,12 @@ jobs:
       - name: "去广告行为契约: 真 mosdns + 生产模板, 优先级六层与三协议一致"
         run: bash tests/test-adblock-contracts.sh
 
+      - name: "去广告基础设施闭包: ACME provider 的 API 域名能否枚举(枚举不到 ≠ 没有 provider)"
+        run: python3 tests/test-adblock-provider.py
+
+      - name: "去广告启用门: 闭包不完整必须 fail-closed, 且失败后逐项不变"
+        run: bash tests/test-adblock-enable-gate.sh
+
       - name: "链路诊断采集器 (证书正常/临期/过期/错域名/损坏/误放私钥; 零写入零写锁)"
         run: python3 tests/test-link-status.py
 
