@@ -31,11 +31,17 @@ echo "qq.com" > "$WORK/rules/geosite_cn.txt"
 echo "example.com" > "$WORK/rules/geosite_geolocation-!cn.txt"
 # (mitm_hijack.txt 故意不建: 迁移应自动补)
 
+# 去广告受管块的 domain_set 输入(缺文件 mosdns 直接 FATAL); 空 = 默认关闭
+mkdir -p "$WORK/adblock"
+for _a in infra_allow effective_block effective_list; do : > "$WORK/adblock/$_a.txt"; done
+: > "$WORK/rules/adblock_allow.txt"; : > "$WORK/rules/adblock_block.txt"
+
 # ── 渲染当前 config → 完整版(v1.5), 端口换高位、去 DoT、rules 指向 $WORK/rules ──
 render_full(){
   sed -e "s/__SERVER_IP__/10.9.9.9/g" -e "s#__INTERNAL_CIDR__#127.0.0.0/8#g" -e "s#__CERT_DIR__#$WORK#g" \
       -e "s#__MOSDNS_CACHE__#8192#g" -e "s#__HIJACK_SET_FILE__#geosite_geolocation-!cn.txt#g" \
       -e "s#/etc/mosdns/rules/#$WORK/rules/#g" -e "s#0.0.0.0:53#127.0.0.1:15997#g" \
+      -e "s#/var/lib/privdns-gateway/adblock/#$WORK/adblock/#g" \
       -e "/- tag: dot_server/,\$d" "$ROOT/deploy/mosdns/config.yaml"
 }
 render_full > "$WORK/full.yaml"

@@ -7,6 +7,7 @@
 删三样: explicit_proxy 域名集块、explicit_proxy_seq 序列块、internal_sequence 里那道判断;
 每样连同紧挨在它上面的注释一起删。删不干净就报错退出。
 """
+import re
 import sys
 
 
@@ -43,6 +44,13 @@ def main():
         lambda l: l.strip().startswith("- matches:") or l.startswith("  - tag: "))
 
     out = "".join(lines)
+    # 去广告受管块(v1.11.0)也引用 $explicit_proxy —— 那是"第三方表不得压过用户显式分流"
+    # 那条合取。退回 v1.7.0 形态时它整段都不该在, 连同 plugins 那一段一起剥掉;
+    # 剥不干净会立刻表现为下面那条"仍残留 explicit_proxy"。
+    out = re.sub(r" *# 不要手工编辑下面这一段[^\n]*\n *# >>> pdg-adblock managed block \(plugins\)"
+                 r"[\s\S]*?# <<< pdg-adblock managed block \(plugins\)\n", "", out)
+    out = re.sub(r" *# 不要手工编辑下面这一段[^\n]*\n *# >>> pdg-adblock managed block \(internal_sequence\)"
+                 r"[\s\S]*?# <<< pdg-adblock managed block \(internal_sequence\)\n", "", out)
     if "explicit_proxy" in out:
         sys.exit("没退回到 v1.7.0 形态: 仍残留 explicit_proxy")
     open(f, "w", encoding="utf-8").write(out)

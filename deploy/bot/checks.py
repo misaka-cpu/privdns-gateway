@@ -1126,8 +1126,14 @@ def check_mosdns_ratelimit():
     #    关键: 匹配到的 reject 5 步骤本身要在缓存之前 —— 否则"缓存前动作错(如 accept)+ 缓存后另有正确 reject 5"
     #    会被误判为 ok。故用 step.start() < i_cache 校验, 而非只看首个 !$client_limiter 的位置。
     blk = _internal_seq_block(conf)
-    i_cache = blk.find("$lazy_cache")
-    step = re.search(r'matches:\s*"?!\$client_limiter"?[ \t]*(?:#[^\n]*)?\n\s*exec:\s*reject\s+5\b', blk)
+    # **先剥注释再定位**: 受管块的说明文字里会出现 `$lazy_cache` 这样的字面量,
+    # 按原文 find 会命中注释(它排在真正的缓存那一步之前), 于是"限流在缓存前"这条
+    # 判据会把一段说明当成缓存的位置 —— 同 HANDOFF §14 那个 grep 命中注释行的形态。
+    # 两个位置必须在**同一个坐标系**里比 —— 一个在剥注释后的文本里找、另一个在原文里找,
+    # 得到的下标根本不可比(这一版就是这么错过一次)。故两者都用 blk_nc。
+    blk_nc = re.sub(r"^\s*#.*$", "", blk, flags=re.M)
+    i_cache = blk_nc.find("$lazy_cache")
+    step = re.search(r'matches:\s*"?!\$client_limiter"?[ \t]*\n\s*exec:\s*reject\s+5\b', blk_nc)
     if not step or (i_cache >= 0 and step.start() >= i_cache):
         return _RL_WARN
     return ("ok", "限流", "单客户端 QPS 兜底已就位(rate_limiter qps200/burst400, reject 5, 缓存前)")

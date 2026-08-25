@@ -44,10 +44,14 @@ grep -q 'type: rate_limiter' "$WORK/old.yaml" && grep -q '!\$client_limiter' "$W
   && ok "迁移补上 client_limiter + 拦截步骤" || bad "迁移未补上 limiter"
 # 缓存前: internal_sequence 里 !$client_limiter 出现在 $lazy_cache 之前
 python3 - "$WORK/old.yaml" <<'PY' && ok "拦截步骤在缓存查询之前" || exit 1
-import sys
+import re, sys
 s=open(sys.argv[1]).read()
 b=s[s.index('- tag: internal_sequence'):]
 b=b[:b.index('- tag: main_sequence')]
+# **先剥注释再比位置**: 受管块的说明里会出现 `$lazy_cache` 这样的字面量, 按原文取首次
+# 出现会命中注释, 于是"顺序不对"报的是一段说明文字的位置(同 HANDOFF §14 那个
+# `grep 'tcp dport 80'` 命中注释行的形态)。
+b=re.sub(r'^\s*#.*$', '', b, flags=re.M)
 assert b.index('!$client_limiter') < b.index('$lazy_cache'), '顺序不对'
 PY
 
@@ -83,7 +87,12 @@ if [[ -n "${MD:-}" ]] && command -v dig >/dev/null; then
       -e "s|__HIJACK_SET_FILE__|geosite_geolocation-!cn.txt|g" \
       -e "s|__DOT_DOMAIN__|dot.ratelimit.test|g" \
       "$ROOT/deploy/mosdns/config.yaml" > "$WORK/r.yaml"
-  sed -i -e "s#/etc/mosdns/rules/#$WORK/rules/#g" -e 's#0.0.0.0:53#127.0.0.1:15353#g' \
+  mkdir -p "$WORK/adblock"
+  # 去广告受管块的三个 domain_set 输入(缺文件 mosdns 直接 FATAL); 空 = 默认关闭
+  for _a in infra_allow effective_block effective_list; do : > "$WORK/adblock/$_a.txt"; done
+  : > "$WORK/rules/adblock_allow.txt"; : > "$WORK/rules/adblock_block.txt"
+  sed -i -e "s#/etc/mosdns/rules/#$WORK/rules/#g" -e 's#0.0.0.0:53#127.0.0.1:15353#g'\
+         -e "s#/var/lib/privdns-gateway/adblock/#$WORK/adblock/#g" \
          -e 's#qps: 200, burst: 400#qps: 3, burst: 3#' "$WORK/r.yaml"
   # 去掉 DoT server(测试无证书)
   python3 - "$WORK/r.yaml" <<'PY'

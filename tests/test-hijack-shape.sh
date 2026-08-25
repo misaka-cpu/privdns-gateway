@@ -86,7 +86,12 @@ serve(){  # $1=mode $2=劫持集文件名
   # 先归一化(它写 /etc/mosdns/rules 绝对路径), 再按 dns-policy-test 那套配方落到沙箱
   render > "$cfg"
   _mosdns_hijack_shape "$1" "$cfg" "$2" >/dev/null
-  sed -i -e "s#/etc/mosdns/rules/#$WORK/rules/#g" \
+  mkdir -p "$WORK/adblock"
+  # 去广告受管块的三个 domain_set 输入(缺文件 mosdns 直接 FATAL); 空 = 默认关闭
+  for _a in infra_allow effective_block effective_list; do : > "$WORK/adblock/$_a.txt"; done
+  : > "$WORK/rules/adblock_allow.txt"; : > "$WORK/rules/adblock_block.txt"
+  sed -i -e "s#/etc/mosdns/rules/#$WORK/rules/#g"\
+         -e "s#/var/lib/privdns-gateway/adblock/#$WORK/adblock/#g" \
          -e "s#0.0.0.0:53#127.0.0.1:15353#g" \
          -e "s#^\([[:space:]]*\)args: {.*1\.1\.1\.1.*}#\1args: { concurrent: 1, upstreams: [ {addr: \"udp://127.0.0.1:15999\"} ] }#" \
          -e "s#^\([[:space:]]*\)args: {.*223\.5\.5\.5.*}#\1args: { concurrent: 1, upstreams: [ {addr: \"udp://127.0.0.1:15999\"} ] }#" \
