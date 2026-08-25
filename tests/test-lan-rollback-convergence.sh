@@ -101,23 +101,26 @@ lan_fx_guard127 "$W/out.log" || bad "A 组: $(lan_fx_guard127 "$W/out.log")"
   || bad "A2 live unit 被截断/改写(重定向直接打在正式文件上)"
 
 # ── A3: nft 配置落盘失败 → 三文件回到前像 ───────────────────────────────────
+# 注入用"父目录不存在"而不是权限位: install 不会替你造父目录, 而且 **root 也一样失败**。
+# 第一版用 chmod 444 + 555 堵落点 —— 那在宿主(非 root)有效, 在真 systemd 容器里以 root 跑
+# 时权限位根本拦不住, 于是同一份代码宿主绿、容器红(§9.10 那类环境依赖)。
+# 顺带把"本来不存在的产物"这条路径也覆盖到: 退回时它必须仍然不存在, 而不是留下一份新的。
 W="$(new_box a3)"
 lan_fx_model "$W/etc/privdns-gateway/lan-panels.json" p1:p1.lan.test:192.168.100.10:80
 echo "OLDCADDY" > "$W/etc/pdg-lan/caddy.conf"
-echo "OLDNFT"   > "$W/etc/nftables-pdg-lan.conf"
 echo "OLDUNIT"  > "$W/etc/systemd/system/pdg-lan.service"
-before="$(snap3 "$W")"
-chmod 444 "$W/etc/nftables-pdg-lan.conf"; chmod 555 "$W/etc"      # 只堵这一个落点
-rc="$(run_box "$W" '_lan_render')"
-chmod 755 "$W/etc"; chmod 644 "$W/etc/nftables-pdg-lan.conf"
+NFTDST="$W/etc/nope/nftables-pdg-lan.conf"
+a3fp(){ echo "$(fp "$W/etc/pdg-lan/caddy.conf") $(fp "$NFTDST") $(fp "$W/etc/systemd/system/pdg-lan.service")"; }
+before="$(a3fp)"
+rc="$(run_box "$W" "LAN_NFT_CONF='$NFTDST'; _lan_render")"
 if [[ "$rc" == 0 ]]; then
   bad "A3 nft 配置落盘失败, _lan_render 仍返回 0 —— 假成功"
 else
   ok "A3 nft 配置落盘失败 → 返回非零($rc)"
 fi
-[[ "$(snap3 "$W")" == "$before" ]] \
-  && ok "A3b 落盘失败后三个产物都回到前像" \
-  || bad "A3b 落盘失败后留下半套状态: 前=[$before] 后=[$(snap3 "$W")]"
+[[ "$(a3fp)" == "$before" ]] \
+  && ok "A3b 落盘失败后三个产物都回到前像(含'本来就不存在'那一个)" \
+  || bad "A3b 落盘失败后留下半套状态: 前=[$before] 后=[$(a3fp)]"
 
 # ── A4: 候选校验失败 → 正式文件零改动 ───────────────────────────────────────
 # 注入走 **nft 校验**而不是 caddy: _lan_render 里的 caddy 路径是写死的
