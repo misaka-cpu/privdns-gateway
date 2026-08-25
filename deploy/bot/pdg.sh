@@ -5823,14 +5823,29 @@ for p in d.get("panels",[]):
     acme_host="$(grep -rhoE 'https://[a-zA-Z0-9.-]*acme[a-zA-Z0-9.-]*' /etc/letsencrypt/renewal/*.conf 2>/dev/null | head -1 | sed 's|https://||')"
   fi
   if [[ -n "$acme_host" ]]; then printf 'domain:%s\n' "$acme_host" >> "$tmp"; else note="$note acme"; fi
-  # ⑥ DNS 服务商 API: 只在能从 acme.sh 的 dnsapi 脚本里**读出来**时才写。
-  #    读不出来就记 note —— 猜一个 api.<provider>.com 等于放行一整个公共域。
-  local prov api=""
-  prov="$(grep -oE "dns_[a-z0-9_]+" /opt/pdg-acme/account.conf 2>/dev/null | head -1)"
-  if [[ -n "$prov" && -s "/opt/pdg-acme/dnsapi/$prov.sh" ]]; then
-    api="$(grep -oE 'https://[a-zA-Z0-9.-]+' "/opt/pdg-acme/dnsapi/$prov.sh" 2>/dev/null | head -1 | sed 's|https://||')"
+  # ⑥ DNS 服务商 API: 交给 adblock.py 的 infra_closure 判定 —— 那里有受支持 provider 的
+  #    显式表, 外加与安装的 dnsapi 脚本做交叉核对。**枚举不到就不写**, 也不猜:
+  #    猜一个 api.<provider>.com 等于放行一整个公共域。
+  #    (早先这里读的是 /opt/pdg-acme/account.conf 里的 dns_ 字样 —— 位置就是错的:
+  #     本项目以 `--home <家>/data` 调 acme.sh, provider 记在每域名的 Le_Webroot 里。)
+  local _mod _cl
+  if _mod="$(_pdg_module adblock.py)"; then
+    _cl="$(python3 -c 'import json,sys,importlib.util
+spec=importlib.util.spec_from_file_location("a", sys.argv[1]); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+print(json.dumps(m.infra_closure(sys.argv[2], sys.argv[3]), ensure_ascii=False))' "$_mod" "$ACME_HOME" "$ADB_USER_ALLOW" 2>/dev/null)"
+    if [[ -n "$_cl" ]]; then
+      python3 -c 'import json,sys
+d=json.loads(sys.argv[1])
+for h in d.get("hosts") or []: print("domain:%s" % h)' "$_cl" >> "$tmp" 2>/dev/null
+      printf '%s' "$_cl" > "$ADB_STATE_DIR/infra.closure.json"
+      python3 -c 'import json,sys; sys.exit(0 if json.loads(sys.argv[1]).get("complete") else 1)' "$_cl" \
+        || note="$note dns-api"
+    else
+      note="$note dns-api"
+    fi
+  else
+    note="$note dns-api"
   fi
-  if [[ -n "$api" ]]; then printf 'domain:%s\n' "$api" >> "$tmp"; else note="$note dns-api"; fi
 
   LC_ALL=C sort -u "$tmp" -o "$tmp"
   install -m644 "$tmp" "$ADB_STATE_DIR/infra_allow.txt" || { rm -f "$tmp"; return 1; }
@@ -5876,6 +5891,24 @@ except Exception: print("(无)")' 2>/dev/null)"
   echo "  生效中的表: block $(grep -vce '^$|^#' "$ADB_STATE_DIR/effective_block.txt" 2>/dev/null || echo 0) 条 / list $(grep -vce '^$|^#' "$ADB_STATE_DIR/effective_list.txt" 2>/dev/null || echo 0) 条"
   local note; note="$(cat "$ADB_STATE_DIR/infra.note" 2>/dev/null)"
   [[ -n "$note" ]] && c_y "  ⚠️ 基础设施白名单有枚举不到的类别(不猜, 也不放行整个公共域): $note"
+  # 点名 provider 类型 —— 但只出**插件名**, 不出 token / 账号 / zone。
+  # **自己现算一次**, 不依赖 enable 时落下的缓存: status 是只读命令, 用户完全可能在
+  # 从没成功启用过的机器上先看一眼状态, 那时缓存根本不存在, 而"provider 是什么"恰恰
+  # 是他最需要知道的一行。现算不写盘。
+  local cj mod2; cj=""
+  if mod2="$(_pdg_module adblock.py)"; then
+    cj="$(python3 -c 'import json,sys,importlib.util
+spec=importlib.util.spec_from_file_location("a", sys.argv[1]); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+print(json.dumps(m.infra_closure(sys.argv[2], sys.argv[3]), ensure_ascii=False))' "$mod2" "$ACME_HOME" "$ADB_USER_ALLOW" 2>/dev/null)"
+  fi
+  [[ -n "$cj" ]] || cj="$(cat "$ADB_STATE_DIR/infra.closure.json" 2>/dev/null)"
+  if [[ -n "$cj" ]]; then
+    python3 -c 'import json,sys
+d=json.loads(sys.argv[1]); p=d.get("provider")
+if p is None: print("  ACME DNS provider: 未配置(无需保护其 API 域名)")
+elif d.get("complete"): print("  ACME DNS provider: %s —— API 域名已纳入保护(%s)" % (p, ", ".join(d.get("hosts") or [])))
+else: print("  ACME DNS provider: %s —— **无法枚举其 API 域名, 保护列表不完整**" % p)' "$cj" 2>/dev/null
+  fi
   return 0
 }
 
@@ -5886,6 +5919,29 @@ cmd_adblock(){
     enable)
       need_root adblock; _adblock_ensure_files || return 1
       _adblock_gen_infra || { c_y "❌ 基础设施白名单生成失败 —— 不启用(宁可不拦, 也不能误杀自己的域名)。"; return 1; }
+      # **基础设施闭包门(fail-closed)。**已经配了 ACME DNS provider, 却枚举不出它的 API
+      # 域名时, 拒绝启用 —— 不是 WARN 之后照样开。那个域名一旦落进第三方广告表, 证书续期
+      # 会**静默失败**: 不是某个网站打不开那种一眼可见的故障, 而是几十天后所有面板同时
+      # 证书过期, 全程零告警(同 v1.10.14 修的"续期是哑的", 只是触发源换了)。
+      # 没配 provider 是正常情形, 照常继续 —— "枚举不到"与"没有"必须分开。
+      local _cj _cok=1 _cprov="" _cdet=""
+      _cj="$(cat "$ADB_STATE_DIR/infra.closure.json" 2>/dev/null)"
+      if [[ -n "$_cj" ]]; then
+        python3 -c 'import json,sys; sys.exit(0 if json.loads(sys.argv[1]).get("complete") else 1)' "$_cj" || _cok=0
+        _cprov="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("provider") or "")' "$_cj" 2>/dev/null)"
+        _cdet="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("detail") or "")' "$_cj" 2>/dev/null)"
+      fi
+      if [[ "$_cok" != 1 ]]; then
+        c_y "❌ 基础设施保护列表不完整 —— **去广告没有被启用**。"
+        c_y "   provider: ${_cprov:-未知}"
+        c_y "   $_cdet"
+        c_y "   为什么拦住: 拦不住的话, 这个 provider 的 API 域名可能被第三方广告表挡掉,"
+        c_y "   证书续期会从此静默失败 —— 几十天后所有面板同时证书过期, 期间没有任何告警。"
+        c_y "   证书与现有 DNS 服务**未被改动**; 用户 allow/block 与已下载的表也未被改动。"
+        c_y "   可以怎么做: 改用受支持的 DNS provider、或不用 DNS-01 这条证书路径、或等待本产品支持它。"
+        c_y "   注意: 自己往 allow 里加一条**不算**产品已经认全了该 provider 的 API 域名。"
+        return 1
+      fi
       # 必须先有可用的表: 没有候选也没有 LKG 就启用, 等于开了个空壳
       if [[ ! -s "$ADB_STATE_DIR/list.lkg" && ! -s "$ADB_USER_BLOCK" ]]; then
         c_y "❌ 既没有第三方表(先跑 pdg adblock update), 也没有用户 block 规则 —— 保持关闭。"

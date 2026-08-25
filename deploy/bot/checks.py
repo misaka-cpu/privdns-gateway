@@ -8,6 +8,7 @@ import nftscan  # noqa: E402  与迁移前置门共用的 input 链冲突判据(
 
 SB = "/etc/sing-box/config.json"
 MOSDNS_CONF = "/etc/mosdns/config.yaml"
+ACME_HOME_DIR = "/opt/pdg-acme"
 DOT_DOMAIN_FILE = "/opt/pdg-bot/dot-domain"
 BACKEND_MARKER = "/etc/privdns-gateway/backend"
 MIHOMO_CFG = "/etc/mihomo/config.yaml"
@@ -1072,16 +1073,37 @@ def check_adblock():
 
     eff_b, eff_l = _n(os.path.join(ADBLOCK_STATE_DIR, "effective_block.txt")), \
                    _n(os.path.join(ADBLOCK_STATE_DIR, "effective_list.txt"))
+    # 基础设施保护闭包: 已配 ACME DNS provider 却枚举不出它的 API 域名时, 这条功能
+    # **不该被启用**(理由见 adblock.infra_closure 的注释)。停用态下这不是故障, 但也不是
+    # "没问题" —— 是"能不能安全启用, 本项没有结论", 所以判 warn 而不是 ok。
+    ab_mod = _adblock_mod()
+    closure = None
+    if ab_mod is not None:
+        try:
+            closure = ab_mod.infra_closure(ACME_HOME_DIR, ADBLOCK_USER_ALLOW)
+        except Exception:                              # noqa: BLE001
+            closure = None
+
     if not intent:
         if eff_b > 0 or eff_l > 0:
             return ("fail", name, "profile 里是停用, 但生效中的表还有 %d+%d 条 —— "
                                   "状态漂移, 跑 sudo pdg adblock disable 收敛。" % (eff_b, eff_l))
+        if closure is not None and not closure.get("complete"):
+            return ("warn", name, "未启用。另: 基础设施保护列表**不完整**(%s)—— 这台机器上"
+                                  "能不能安全启用去广告, 本项**无结论**。" % closure.get("detail", ""))
         return ("ok", name, "未启用(受管块在位, 生效表为空 —— 解析行为与不装这个功能时一致)")
 
     if eff_b <= 0 and eff_l <= 0:
         return ("fail", name, "profile 里写着已启用, 但生效中的表是空的 —— 此刻一条都拦不住。"
                               "跑 sudo pdg adblock update 取表, 或 disable 把意图也改掉。")
-    ab = _adblock_mod()
+    # 已启用 + 闭包不完整 = 那个 provider 的 API 域名此刻可能正被第三方表拦着,
+    # 而证书续期的失败是静默的。这是 fail, 不是 warn。
+    if closure is not None and not closure.get("complete"):
+        return ("fail", name, "已启用, 但基础设施保护列表**不完整**(%s)—— 该 provider 的 API "
+                              "域名可能被第三方表拦掉, 证书续期会静默失败。"
+                              "跑 sudo pdg adblock disable, 或改用受支持的 DNS provider。"
+                              % closure.get("detail", ""))
+    ab = ab_mod
     if ab is None:
         return ("warn", name, "取不到 adblock 模块, 表龄与来源本次没查(拦截本身仍在生效)")
     stale = ab.list_is_stale(ADBLOCK_STATE_DIR)

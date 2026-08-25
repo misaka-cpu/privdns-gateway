@@ -288,6 +288,111 @@ def update_lists(state_dir=None, sources=None, fetch=None):
             "detail": "全部源都不可用: " + "; ".join(errs[:3]), "count": 0}
 
 
+# ── ACME DNS provider 的基础设施闭包 ─────────────────────────────────────────
+# 本项目把 acme.sh 钉版本 clone 到 /opt/pdg-acme, 并以 `--home <家>/data` 调用, 于是
+# provider 记在**每域名的配置**里: data/<域名>/<域名>.conf 的 `Le_Webroot='dns_xxx'`。
+# (account.conf 里没有这个值 —— 早先在那里找是错的, 表现是永远读不到 provider。)
+ACME_DEFAULT_HOME = "/opt/pdg-acme"
+
+# **受支持的 provider → 它的 API 主机名。**
+#
+# 为什么是一张显式的表, 而不是从 dnsapi 脚本里提取: acme.sh 3.1.4 实测三种形态并存 ——
+#   dns_cf.sh   CF_Api="https://api.cloudflare.com/client/v4"    静态常量, 能提
+#   dns_he.sh   赋值行里没有任何 https 常量                        提不到
+#   dns_aws.sh  AWS_HOST="route53.global.api.aws"                主机名与 scheme 分开
+#               AWS_URL="https://$AWS_HOST"                      运行期拼
+#               AWS_WIKI="https://github.com/acmesh-official/…"  赋值行上的**文档链接**
+# 只按 `VAR=https://…` 提取, dns_aws 会得到 github.com —— 一个公共域, 而且是错的。
+# 放行一个公共域比不放行更糟, 所以这里**不猜**。
+#
+# 每一条都是对着钉死版(lib/versions.sh 的 ACME_SH_VER)的 dnsapi 脚本核过的; 加新条目时
+# 必须同样核过, 并且下面的运行期交叉核对会兜住"上游改了端点"这种漂移。
+PROVIDER_API_HOSTS = {
+    "dns_cf": ("api.cloudflare.com",),
+    "dns_ali": ("alidns.aliyuncs.com",),
+    "dns_dp": ("dnsapi.cn",),
+    "dns_gd": ("api.godaddy.com",),
+    "dns_namecheap": ("api.namecheap.com",),
+}
+
+
+def acme_provider(acme_home=None):
+    """本机**已配置**的 ACME DNS provider(读不到返回 None)。
+
+    None 的含义是"没有配置 DNS-01 的 provider", 与"配了但认不出"**不是**一回事 ——
+    后者由 provider_api_hosts / infra_closure 判成无法枚举。这两者混同是最危险的写法:
+    认不出被当成没有, 于是闭包门直接放行。
+    """
+    home = acme_home or ACME_DEFAULT_HOME
+    data = os.path.join(home, "data")
+    if not os.path.isdir(data):
+        return None
+    for entry in sorted(os.listdir(data)):
+        conf = os.path.join(data, entry, entry + ".conf")
+        if not os.path.isfile(conf):
+            continue
+        m = re.search(r"^\s*Le_Webroot\s*=\s*'?\"?(dns_[A-Za-z0-9_]+)", _read(conf), re.M)
+        if m:
+            return m.group(1)
+    return None
+
+
+def provider_api_hosts(provider, acme_home=None):
+    """(hosts, reason)。hosts 非空 = 能确定性枚举; 空则 reason 说明为什么不能。
+
+    两道: 表里要有; 且**安装的那份 dnsapi 脚本里真的出现这个主机名**(交叉核对)。
+    第二道挡的是"上游换了端点而表没跟上" —— 那时按表放行等于放行一个已经不用的域名,
+    而真正在用的那个仍然会被广告表拦掉。
+    """
+    if not provider:
+        return ((), "NO_PROVIDER")
+    hosts = PROVIDER_API_HOSTS.get(provider)
+    if not hosts:
+        return ((), "UNSUPPORTED")
+    script = os.path.join(acme_home or ACME_DEFAULT_HOME, "dnsapi", provider + ".sh")
+    if not os.path.isfile(script):
+        return ((), "NO_SCRIPT")
+    body = _read(script)
+    missing = [h for h in hosts if h not in body]
+    if missing:
+        return ((), "DRIFT")
+    return (tuple(hosts), "")
+
+
+_CLOSURE_HINT = {
+    "UNSUPPORTED": "本产品还不能确定这个 provider 的 API 域名",
+    "NO_SCRIPT": "装的 acme.sh 里找不到这个 provider 的插件脚本",
+    "DRIFT": "插件脚本里的端点与本产品记录的对不上(上游可能改过)",
+}
+
+
+def infra_closure(acme_home=None, user_allow=None):
+    """基础设施保护闭包是否完整。**不读凭据, 不发任何网络请求。**
+
+    返回 {complete, provider, hosts, reason, detail}。complete=False 时调用方必须
+    **拒绝启用** —— 那个 provider 的 API 域名一旦落进第三方广告表, 证书续期会静默失败:
+    不是"某个网站打不开"那种一眼可见的故障, 而是几十天后所有面板同时证书过期, 全程零告警。
+
+    user_allow 只用来**说明**用户已经自己写过一条 —— 它不改变"产品无法枚举"这个事实。
+    产品说不出该 provider 的全部 API 域名时, 拿用户写的一条来充数, 是把责任偷偷推给用户。
+    """
+    prov = acme_provider(acme_home)
+    if prov is None:
+        return {"complete": True, "provider": None, "hosts": (), "reason": "NO_PROVIDER",
+                "detail": "未配置 ACME DNS provider —— 没有需要保护的 API 域名"}
+    hosts, why = provider_api_hosts(prov, acme_home)
+    if hosts:
+        return {"complete": True, "provider": prov, "hosts": hosts, "reason": "",
+                "detail": "provider %s 的 API 域名已纳入保护: %s" % (prov, ", ".join(hosts))}
+    note = ""
+    if user_allow and os.path.exists(user_allow):
+        # 只作说明, 不参与判定
+        if _read(user_allow).strip():
+            note = "(你的 allow 名单里已有条目, 但那不能证明该 provider 的**全部** API 域名都在)"
+    return {"complete": False, "provider": prov, "hosts": (), "reason": why,
+            "detail": "%s: %s%s" % (prov, _CLOSURE_HINT.get(why, why), note)}
+
+
 def list_is_stale(state_dir=None, max_age_days=14):
     """表是否过期。拿不到元数据 → 返回 None(无结论), 不猜。"""
     m = read_meta(state_dir)

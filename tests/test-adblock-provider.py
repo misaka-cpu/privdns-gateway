@@ -168,6 +168,76 @@ if closure:
         "用户手工 allow 不改变'产品无法枚举'这个事实" if not r.get("complete")
         else "用户写了一条 allow 就被当成闭包完整 —— 那是把责任偷偷推给用户")
 
+# ══ ⑦ doctor: 停用 + 闭包不完整 → WARN 无结论; 启用 + 不完整 → FAIL ═══════
+cspec = importlib.util.spec_from_file_location("checks", ROOT / "deploy/bot/checks.py")
+C = importlib.util.module_from_spec(cspec)
+sys.path.insert(0, str(ROOT / "deploy" / "bot"))
+cspec.loader.exec_module(C)
+
+
+def doctor_with(enabled, complete):
+    """把 doctor 放进一个受控现场: 受管块在位、文件齐、生效表非空, 只切换启用位与闭包。"""
+    box = Path(tmpguard.mkdtemp(prefix="adblock-doctor."))
+    st = box / "state"; st.mkdir()
+    rules = box / "rules"; rules.mkdir()
+    # 生效表只在**启用态**才非空 —— 停用却留着非空生效表本身就是状态漂移(另有判据盯),
+    # 拿那种现场去测"闭包不完整时怎么判", 测到的是漂移那条分支。
+    (st / "infra_allow.txt").write_text("domain:x.invalid\n", encoding="utf-8")
+    for n in ("effective_block.txt", "effective_list.txt"):
+        (st / n).write_text("domain:x.invalid\n" if enabled else "", encoding="utf-8")
+    for n in ("adblock_allow.txt", "adblock_block.txt"):
+        (rules / n).write_text("", encoding="utf-8")
+    (st / "meta.json").write_text(json.dumps(
+        {"count": 5000, "source": "t", "updated": __import__("time").strftime("%Y-%m-%dT%H:%M:%SZ")}),
+        encoding="utf-8")
+    conf = box / "mosdns.yaml"
+    conf.write_text(
+        "  - tag: internal_sequence\n"
+        "    args:\n"
+        "      # >>> pdg-adblock managed block (internal_sequence)\n"
+        "      - matches: [qname $adblock_user_block]\n"
+        "      # <<< pdg-adblock managed block (internal_sequence)\n"
+        "      - exec: $lazy_cache\n"
+        "  - tag: main_sequence\n"
+        "# >>> pdg-adblock managed block (plugins)\n"
+        "# <<< pdg-adblock managed block (plugins)\n", encoding="utf-8")
+    home = acme_home("dns_cf", 'CF_Api="https://api.cloudflare.com/client/v4"\n') if complete \
+        else acme_home("dns_he", "# 无常量\n")
+    old = (C.ADBLOCK_STATE_DIR, C.ADBLOCK_USER_ALLOW, C.ADBLOCK_USER_BLOCK,
+           C.MOSDNS_CONF, getattr(C, "_profile", None), getattr(C, "ACME_HOME_DIR", None))
+    C.ADBLOCK_STATE_DIR = str(st)
+    C.ADBLOCK_USER_ALLOW = str(rules / "adblock_allow.txt")
+    C.ADBLOCK_USER_BLOCK = str(rules / "adblock_block.txt")
+    C.MOSDNS_CONF = str(conf)
+    C.ACME_HOME_DIR = home
+    C._profile = lambda k: ("1" if enabled else "0") if k == "PDG_ADBLOCK_ENABLED" else None
+    try:
+        return C.check_adblock()
+    finally:
+        (C.ADBLOCK_STATE_DIR, C.ADBLOCK_USER_ALLOW, C.ADBLOCK_USER_BLOCK,
+         C.MOSDNS_CONF) = old[:4]
+        if old[4]:
+            C._profile = old[4]
+
+
+r = doctor_with(enabled=False, complete=False)
+if r and r[0] == "warn" and ("无结论" in r[2] or "不完整" in r[2]):
+    ok("doctor: 停用 + 闭包不完整 → WARN 且明说(%s)" % r[2][:44])
+else:
+    bad("doctor: 停用 + 闭包不完整应 WARN + 无结论, 实得 %r" % (r,))
+
+r = doctor_with(enabled=True, complete=False)
+if r and r[0] == "fail":
+    ok("doctor: 启用 + 闭包不完整 → FAIL(%s)" % r[2][:44])
+else:
+    bad("doctor: 启用 + 闭包不完整必须 FAIL, 实得 %r" % (r,))
+
+r = doctor_with(enabled=True, complete=True)
+if r and r[0] == "ok":
+    ok("doctor: 启用 + 闭包完整 → ok")
+else:
+    bad("doctor: 启用 + 闭包完整应 ok, 实得 %r" % (r,))
+
 print("-" * 58)
 print("通过 %d, 失败 %d" % (PASS[0], len(FAIL)))
 sys.exit(1 if FAIL else 0)
