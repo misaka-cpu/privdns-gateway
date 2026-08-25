@@ -301,6 +301,56 @@ grep -qE 'LAN 回滚不完整|回滚不完整' "$W/out.log" \
   && ok "C6c 收敛失败后恢复本次调用前像" \
   || bad "C6c 收敛失败后留下半套状态"
 
+echo "══ D. 调用点: 收敛必须在仓库复位之后跑 ══"
+
+# 为什么按**执行顺序**判而不是 grep 一行: _lan_render 会 source "$REPO_DIR/lib/units.sh"
+# 并经 _pdg_module 取 lanpanel.py, 而 REPO_DIR 在 cmd_rollback 的最后一步才被 git reset
+# 复位。收敛若排在复位之前, 拿到的是**新版**生成器 + **旧版**模型 —— 半新半旧, 正是这一轮
+# 要消除的东西, 而它在任何静态检查里都看不出来。
+W="$(new_box d1)"
+sed -n '/^cmd_rollback(){/,/^}/p' "$LAN_FX_SRC" > "$W/rollback.sh"
+SNAP="$W/snapdir/20260101-000000"; mkdir -p "$SNAP/etc/privdns-gateway"
+( cd "$W" && mkdir -p snaproot/etc/privdns-gateway && echo x > snaproot/etc/privdns-gateway/keep \
+  && tar czf "$SNAP/snap.tar.gz" -C snaproot etc ) 2>/dev/null
+cat > "$W/d.sh" <<EOF
+SNAP_DIR="$W/snapdir"; REPO_DIR="$W/repo"; ORDER="$W/order.txt"; : > "\$ORDER"
+LAN_UNIT="$W/etc/systemd/system/pdg-lan.service"; LAN_NFT_CONF="$W/etc/nftables-pdg-lan.conf"
+need_root(){ :; }; _lock(){ :; }
+c_g(){ echo "\$*"; }; c_y(){ echo "\$*"; }
+_pdg_mktemp_dir(){ mktemp -d; }
+_snap_meta_commit(){ echo deadbeefdeadbeefdeadbeefdeadbeefdeadbeef; }
+_snap_meta_label(){ echo l; }
+_sb_panel_managed_on(){ return 1; }
+_pdg_ios_verify_tree(){ return 0; }
+_pdg_apply_snapshot_tree(){ echo MODEL >> "\$ORDER"; return 0; }
+_nft_apply_main(){ return 0; }
+_core_kernel_activate(){ return 0; }
+pdg_write_unit(){ return 0; }; pdg_unit_mihomo(){ echo x; }
+_pdg_drop_singbox_files(){ :; }; _pdg_singbox_is_ours(){ return 1; }
+systemctl(){ return 0; }; nft(){ return 0; }
+git(){ [[ "\$*" == *"reset --hard"* ]] && echo GITRESET >> "\$ORDER"; return 0; }
+_lan_rollback_converge(){ echo CONVERGE >> "\$ORDER"; return 0; }
+EOF
+mkdir -p "$W/repo/.git" "$W/etc/privdns-gateway"
+( set +e; source "$W/d.sh"; source "$W/rollback.sh"; cmd_rollback --dir "$SNAP" --git deadbeef ) \
+  > "$W/d.log" 2>&1
+order="$(tr '\n' ' ' < "$W/order.txt")"
+if [[ "$order" != *CONVERGE* ]]; then
+  bad "D1 回滚全程没有调用 LAN 收敛(顺序=[$order])"
+elif [[ "$order" == *GITRESET*CONVERGE* ]]; then
+  ok "D1 收敛排在仓库复位之后(顺序=[$order])"
+else
+  bad "D1 收敛跑在仓库复位**之前** —— 会拿新版生成器渲旧版模型(顺序=[$order])"
+fi
+if [[ "$order" == *MODEL*CONVERGE* ]]; then
+  ok "D2 收敛排在模型恢复之后"
+else
+  bad "D2 收敛没排在模型恢复之后(顺序=[$order])"
+fi
+grep -q '内网面板派生产物' "$W/rollback.sh" \
+  && ok "D3 收敛失败会计入未恢复项(不谎报完全回滚)" \
+  || bad "D3 收敛失败没有计入 unrestored —— 会报成'✅ 已回滚'"
+
 echo "─────────────────────────────────────────"
 echo "通过 $PASS, 失败 $FAIL"
 [[ "$FAIL" == 0 ]]
