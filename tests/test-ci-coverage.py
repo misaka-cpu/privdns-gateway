@@ -35,6 +35,7 @@ HELPERS = {
     "rescuebox.py", "rescueform.py", "snapmatrix.py", "txbox.py", "mihomobin.py",
     "mock_dns.py", "mock_socks.py", "sni_client.py", "e2e-lib.sh", "prepare-mihomo.sh",
     "prepare-mosdns.sh", "update_invariants.py", "lan-fixture.sh",
+    "adblock-lib.sh", "adblock_upstream.py",
 }
 
 if not os.path.exists(CI):

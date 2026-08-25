@@ -181,6 +181,12 @@ jobs:
       - name: "内网面板回滚收敛: 派生产物跟随已恢复的模型, 且 render/apply 不假成功"
         run: bash tests/test-lan-rollback-convergence.sh
 
+      - name: "去广告规则编译/校验/LKG/check 判定(不起 mosdns, 盯落盘之前那一段)"
+        run: python3 tests/test-adblock-rules.py
+
+      - name: "去广告行为契约: 真 mosdns + 生产模板, 优先级六层与三协议一致"
+        run: bash tests/test-adblock-contracts.sh
+
       - name: "链路诊断采集器 (证书正常/临期/过期/错域名/损坏/误放私钥; 零写入零写锁)"
         run: python3 tests/test-link-status.py
 
