@@ -1006,6 +1006,105 @@ def check_lan_proxy_routes():
     return ("fail", name, "; ".join(parts) + "。跑 sudo pdg lan render 后重启 pdg-lan。")
 
 
+def _adblock_intent():
+    return (_profile("PDG_ADBLOCK_ENABLED") or "").strip() == "1"
+
+
+def _adblock_mod():
+    try:
+        import adblock
+        return adblock
+    except Exception:                              # noqa: BLE001
+        return None
+
+
+def check_adblock():
+    """DNS 去广告:启用意图与受管块的**实际状态**必须收敛。
+
+    这一项刻意做成"证据不足就说不知道":读不到配置、模块不在、元数据坏了,一律 warn +
+    明说本项无结论。判绿的条件很窄 —— 因为"绿"在这里的含义是"它此刻真的按你以为的方式
+    在拦",而那是个很强的断言。
+    """
+    name = "DNS 去广告"
+    intent = _adblock_intent()
+    try:
+        with open(MOSDNS_CONF, encoding="utf-8") as f:
+            conf = f.read()
+    except OSError as e:
+        if not intent and not os.path.exists(ADBLOCK_STATE_DIR):
+            return None                            # 从来没用过这个功能, 整项不适用
+        return ("warn", name, "读不到 %s(%s) —— 本项无结论" % (MOSDNS_CONF, e.__class__.__name__))
+
+    n_pl = conf.count(">>> pdg-adblock managed block (plugins)")
+    n_sq = conf.count(">>> pdg-adblock managed block (internal_sequence)")
+    if n_pl == 0 and n_sq == 0:
+        if intent:
+            return ("fail", name, "profile 里写着已启用, 但 mosdns 配置里根本没有去广告受管块 "
+                                  "—— 意图与实际状态不一致。跑 sudo pdg update 装上受管块。")
+        return None                                # 没装也没启用: 不适用, 不显示
+    if n_pl != 1 or n_sq != 1:
+        return ("fail", name, "去广告受管块数量异常(plugins=%d sequence=%d)—— 半安装或重复安装, "
+                              "请人工核对 %s。" % (n_pl, n_sq, MOSDNS_CONF))
+
+    # 位置: 必须排在缓存命中终止点之前。排在其后, 缓存命中时整条判据不会被执行。
+    seq = conf.split("- tag: internal_sequence", 1)[-1].split(chr(10) + "  - tag: ", 1)[0]
+    ipos, cpos = seq.find("adblock"), seq.find("$lazy_cache")
+    if ipos < 0 or cpos < 0:
+        return ("warn", name, "解析不出受管块与缓存的相对位置 —— 本项无结论")
+    if ipos > cpos:
+        return ("fail", name, "去广告判据排在 $lazy_cache 之后 —— 缓存命中会绕过阻断"
+                              "(lazy_cache_ttl 86400, 最长一天)。")
+
+    missing = [p for p in (os.path.join(ADBLOCK_STATE_DIR, "infra_allow.txt"),
+                           os.path.join(ADBLOCK_STATE_DIR, "effective_block.txt"),
+                           os.path.join(ADBLOCK_STATE_DIR, "effective_list.txt"),
+                           ADBLOCK_USER_ALLOW, ADBLOCK_USER_BLOCK) if not os.path.exists(p)]
+    if missing:
+        return ("fail", name, "domain_set 需要的规则文件缺失, mosdns 会 FATAL 退出: %s"
+                % ", ".join(os.path.basename(x) for x in missing[:3]))
+
+    def _n(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                return sum(1 for l in f if l.strip() and not l.startswith("#"))
+        except OSError:
+            return -1
+
+    eff_b, eff_l = _n(os.path.join(ADBLOCK_STATE_DIR, "effective_block.txt")), \
+                   _n(os.path.join(ADBLOCK_STATE_DIR, "effective_list.txt"))
+    if not intent:
+        if eff_b > 0 or eff_l > 0:
+            return ("fail", name, "profile 里是停用, 但生效中的表还有 %d+%d 条 —— "
+                                  "状态漂移, 跑 sudo pdg adblock disable 收敛。" % (eff_b, eff_l))
+        return ("ok", name, "未启用(受管块在位, 生效表为空 —— 解析行为与不装这个功能时一致)")
+
+    if eff_b <= 0 and eff_l <= 0:
+        return ("fail", name, "profile 里写着已启用, 但生效中的表是空的 —— 此刻一条都拦不住。"
+                              "跑 sudo pdg adblock update 取表, 或 disable 把意图也改掉。")
+    ab = _adblock_mod()
+    if ab is None:
+        return ("warn", name, "取不到 adblock 模块, 表龄与来源本次没查(拦截本身仍在生效)")
+    stale = ab.list_is_stale(ADBLOCK_STATE_DIR)
+    meta = ab.read_meta(ADBLOCK_STATE_DIR)
+    note = ""
+    try:
+        with open(os.path.join(ADBLOCK_STATE_DIR, "infra.note"), encoding="utf-8") as f:
+            note = f.read().strip()
+    except OSError:
+        pass
+    if stale is None:
+        return ("warn", name, "已启用(block %d / list %d 条), 但读不出表的更新时间 —— "
+                              "是否过期本项无结论。" % (eff_b, eff_l))
+    if stale:
+        return ("warn", name, "已启用(block %d / list %d 条), 但第三方表更新于 %s, 已经过期 —— "
+                              "跑 sudo pdg adblock update。" % (eff_b, eff_l, meta.get("updated", "?")))
+    msg = "已启用: 用户 block %d 条 + 第三方表 %d 条, 更新于 %s" % (eff_b, eff_l, meta.get("updated", "?"))
+    if note:
+        return ("warn", name, msg + "。⚠️ 基础设施白名单有枚举不到的类别(不猜, 也不放行整个"
+                                    "公共域): %s —— 这些域名不在保护内。" % note)
+    return ("ok", name, msg)
+
+
 def check_mosdns_ratelimit():
     """单客户端 QPS 兜底(rate_limiter)是否就位且参数/动作正确:
     插件 client_limiter 是 rate_limiter 且 qps200/burst400/mask4-32/mask6-128;
@@ -1923,6 +2022,10 @@ def check_transactions():
 
 
 # ── 内网面板(方案 B) ─────────────────────────────────────────────────────────
+ADBLOCK_STATE_DIR = "/var/lib/privdns-gateway/adblock"
+ADBLOCK_USER_ALLOW = MOSDNS_RULES_DIR + "/adblock_allow.txt"
+ADBLOCK_USER_BLOCK = MOSDNS_RULES_DIR + "/adblock_block.txt"
+MOSDNS_CONF = "/etc/mosdns/config.yaml"
 LAN_TABLE = "/etc/privdns-gateway/lan-panels.json"
 LAN_CADDYFILE = "/etc/pdg-lan/caddy.conf"
 LAN_CERT_DIR = "/etc/pdg-lan/certs"
@@ -2278,6 +2381,7 @@ ALL = [check_platform, check_services, check_bot_credentials, check_health_timer
        check_internal_cidr, check_cidr_drift, check_nft, check_nft_input_chains, check_redirect, check_gms,
        check_tailscale_isolation, check_tailscale_residue, check_tailnet_direct_port,
        check_lan_routes, check_lan_whitelist, check_lan_proxy_routes, check_lan_cert,
+       check_adblock,
        check_mosdns_ratelimit, check_mosdns_explicit_proxy, check_ruleset_hijack,
        check_nft_extra, check_rescue_firewall, check_geosite_db, check_mem,
        check_cert, check_cert_dir_sync, check_dns, check_core_config, check_rulesets, check_rule_precedence,
