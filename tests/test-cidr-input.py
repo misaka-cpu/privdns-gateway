@@ -40,13 +40,40 @@ def bad(msg):
 
 
 def fake_tcpdump(delay):
-    """假 tcpdump: delay 秒后吐一个私网源包(控制'多久才抓到')。"""
+    """假 tcpdump: delay 秒后吐几个私网入站包(控制"多久才抓到")。
+
+    **必须模仿 tcpdump ≥4.99 的 `-i any` 格式**, 也就是带上时刻 / 接口名 / 方向:
+
+        <时刻> <接口> In  IP <源>.<端口> > <目的>.<端口>: …
+
+    原来的桩吐的是老格式(整行只有 `IP a.b.c.d.p > …`)。后果不是"少测一条路径", 而是
+    **这支测试在装了 Tailscale 的机器上恒红**:
+      · lib/detect-internal-range.sh 会先用 `tcpdump -ni any -c 1` 探一次"这台的 tcpdump
+        打不打接口名"; 打不出来就 ifname_ok=0;
+      · 宿主有 tailscale0 且 ifname_ok=0 时, 产品**有意拒绝猜测**(宁可让人手输, 也不冒险
+        把 tailnet 地址当成内网卡来源)—— 于是 RESULT 为空, 断言失败。
+    产品那个分支是对的; 错的是桩没把现代 tcpdump 的样子演出来。
+
+    另一半同样要紧: **探测调用要立刻应答**。探测那句外面套着 `timeout 3`, 而桩原来对所有
+    调用一律先 sleep delay ——  delay=60 的那一格必然把探测拖超时, 于是又回到 ifname_ok=0。
+    真机上这两次调用本来就不同: 探测只要一个包, 抓取要等够样本。按 `-c 1` 区分即可。
+    """
     os.makedirs(BIN, exist_ok=True)
     p = os.path.join(BIN, "tcpdump")
+    line = "12:34:56.789012 enp1s0 In  IP 172.22.0.5.55000 > 10.0.0.1.853: tcp"
     with open(p, "w") as f:
-        f.write("#!/bin/sh\nsleep %s\n"
-                "printf 'IP 172.22.0.5.55000 > 10.0.0.1.853: tcp\\n172.22.0.5\\n172.22.0.5\\n'\n"
-                "exit 0\n" % delay)
+        f.write(
+            "#!/bin/sh\n"
+            "# 探测调用(-c 1, 无 BPF 过滤): 立刻给一行现代格式, 让 ifname_ok=1\n"
+            "for a in \"$@\"; do\n"
+            "  if [ \"$a\" = \"1\" ] && [ \"$prev\" = \"-c\" ]; then\n"
+            "    printf '%s\\n'; exit 0\n"
+            "  fi\n"
+            "  prev=$a\n"
+            "done\n"
+            "sleep %s\n"
+            "printf '%s\\n%s\\n%s\\n'\n"
+            "exit 0\n" % (line, delay, line, line, line))
     os.chmod(p, 0o755)
 
 
