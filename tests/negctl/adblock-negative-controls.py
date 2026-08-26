@@ -24,6 +24,8 @@ pdg.sh 的全局快照候选集。这一支回答的是另一个问题:**如果�
   ⑥ 更新失败切成空表                —— fail-open, 全部放行
   ⑦ 让 DoT 走另一条入口             —— 单协议绕过
   ⑧ 把第三方表塞进全局快照          —— 大表进十份轮转快照
+  ⑩ 夹具少播种一个受管文件          —— mosdns FATAL, 8 个 E2E job 一起红的那件事
+  ⑪ 夹具少播种用户 allow 文件       —— 同上
   ⑨ 只加无关注释                    —— 反向对照, 不该有任何新失败
 """
 import hashlib
@@ -41,7 +43,8 @@ ROOT = Path(__file__).resolve().parents[2]
 CFG = "deploy/mosdns/config.yaml"
 MOD = "deploy/bot/adblock.py"
 PDG = "deploy/bot/pdg.sh"
-TOUCHED = [ROOT / CFG, ROOT / MOD, ROOT / PDG]
+LIB = "tests/e2e-lib.sh"
+TOUCHED = [ROOT / CFG, ROOT / MOD, ROOT / PDG, ROOT / LIB]
 
 PASS, FAIL = [0], [0]
 
@@ -119,6 +122,17 @@ MUTATIONS = [
     ("⑧ 把第三方表塞进全局快照", PDG,
      [("var/lib/privdns-gateway/ios-profile\n", "var/lib/privdns-gateway/ios-profile var/lib/privdns-gateway/adblock\n", 1)],
      "快照"),
+    # ── E2E 夹具闭包(exact-head run 32923836445 的根因)────────────────────
+    # mosdns 的 domain_set 缺一个文件就 FATAL, 配置根本加载不了, 断言一条都跑不到。
+    # 所以"夹具有没有播种模板引用的全部文件"必须有守卫, 而不是等 CI 上 8 个 job 一起红。
+    ("⑩ 夹具少播种一个 /var/lib 受管文件", LIB,
+     [("  for f in infra_allow effective_block effective_list; do",
+       "  for f in effective_block effective_list; do", 1)],
+     "infra_allow.txt"),
+    ("⑪ 夹具少播种用户 allow 文件", LIB,
+     [("geosite_gfw adblock_allow adblock_block 'geosite_geolocation-!cn'",
+       "geosite_gfw adblock_block 'geosite_geolocation-!cn'", 1)],
+     "adblock_allow.txt"),
     ("⑨ 只加一行无关注释(反向对照)", CFG,
      [("  - tag: adblock_infra_allow", "  # (负控的空转对照, 不改变任何行为)\n  - tag: adblock_infra_allow", 1)],
      None),
@@ -132,7 +146,7 @@ try:
     for sub in ("tests", "deploy", "lib"):
         shutil.copytree(ROOT / sub, Path(wd) / sub, dirs_exist_ok=True,
                         symlinks=True, ignore=shutil.ignore_patterns("__pycache__"))
-    pristine = {rel: (Path(wd) / rel).read_text(encoding="utf-8") for rel in (CFG, MOD, PDG)}
+    pristine = {rel: (Path(wd) / rel).read_text(encoding="utf-8") for rel in (CFG, MOD, PDG, LIB)}
 
     base = run_suites(wd)
     if base:
