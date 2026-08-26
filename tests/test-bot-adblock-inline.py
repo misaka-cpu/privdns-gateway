@@ -13,10 +13,11 @@ import importlib.util as u
 import os
 import re
 import sys
-import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "tests"))
+import tmpguard          # noqa: E402
 PASS, FAIL = [0], [0]
 
 
@@ -30,7 +31,7 @@ def bad(m):
     print("[FAIL] %s" % m)
 
 
-ROOTFS = tempfile.mkdtemp(prefix="pdg-bot-adblock.")
+ROOTFS = tmpguard.mkdtemp(prefix="pdg-bot-adblock.")
 os.makedirs(os.path.join(ROOTFS, "etc", "privdns-gateway"), exist_ok=True)
 os.makedirs(os.path.join(ROOTFS, "run"), exist_ok=True)
 PROFILE = os.path.join(ROOTFS, "etc", "privdns-gateway", "profile.env")
