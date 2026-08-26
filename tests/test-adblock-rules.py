@@ -243,6 +243,68 @@ else:
     else:
         ok("快照越界守卫未被放宽(仍只放行 ios-profile 那一个 var/lib 子树)")
 
+# ══ ⑨ E2E 夹具必须覆盖模板引用的**全部**本地 domain_set 文件 ═══════════════
+# exact-head run 32923836445 上 8 个 E2E job 同时 FATAL, 全是同一句:
+#     failed to init plugin adblock_infra_allow, failed to load file
+#     /var/lib/privdns-gateway/adblock/infra_allow.txt: no such file or directory
+# mosdns 的 domain_set **缺一个文件就 FATAL 退出**, 于是配置根本加载不了, 断言一条都没跑到。
+#
+# 这条守卫**不 grep 三个固定文件名** —— 那样将来模板再加一个受管 domain_set,
+# 夹具没跟上时又会静默漏掉。做法是: 从真实模板里把所有本地文件路径抽出来, 再看
+# e2e-lib.sh 的播种闭包盖不盖得住。模板加新文件而夹具没跟, 这里就会转红并点名。
+import re as _re2
+
+cfg_text = (ROOT / "deploy/mosdns/config.yaml").read_text(encoding="utf-8")
+lib_text = (ROOT / "tests/e2e-lib.sh").read_text(encoding="utf-8")
+
+# ① 模板里所有 domain_set 引用的**本地路径**(跳过注释行)
+tmpl_paths = set()
+block = None
+for line in cfg_text.splitlines():
+    if _re2.match(r"^\s*#", line):
+        continue
+    if _re2.search(r"type:\s*domain_set", line):
+        block = True
+    elif _re2.match(r"^\s*- tag:", line):
+        block = False
+    if block:
+        for m in _re2.finditer(r'"(/[^"]+\.txt)"', line):
+            tmpl_paths.add(m.group(1))
+
+if not tmpl_paths:
+    bad("从模板里抽不到任何 domain_set 文件路径 —— 这条守卫自己失效了")
+else:
+    ok("模板里共有 %d 个 domain_set 文件引用" % len(tmpl_paths))
+
+# ② e2e-lib.sh 的播种闭包: 展开 `for f in … ; do : > "<目录>/$f.txt"` 这类循环, 外加字面重定向
+seeded = set()
+for m in _re2.finditer(
+        r'for f in ((?:[^\n;]|\\\n)+?);\s*do\s*:\s*>\s*"([^"$]*)\$f\.txt"', lib_text):
+    names = m.group(1).replace("\\\n", " ").replace("'", "").split()
+    for n in names:
+        seeded.add(m.group(2) + n + ".txt")
+for m in _re2.finditer(r'>\s*"?(/(?:etc|var)/[A-Za-z0-9_./-]+\.txt)"?', lib_text):
+    seeded.add(m.group(1))
+
+missing = sorted(pth for pth in tmpl_paths if pth not in seeded)
+if missing:
+    bad("E2E 夹具没有播种模板引用的 %d 个 domain_set 文件 —— mosdns 会 FATAL, "
+        "断言一条都跑不到: %s" % (len(missing), ", ".join(missing)))
+else:
+    ok("E2E 夹具的播种闭包覆盖模板引用的全部 %d 个 domain_set 文件" % len(tmpl_paths))
+
+# ③ 受管文件与既有普通规则文件分开点名(便于定位是哪一类漏了)
+managed = sorted(pth for pth in tmpl_paths if "adblock" in pth)
+plain = sorted(pth for pth in tmpl_paths if "adblock" not in pth)
+miss_m = [pth for pth in managed if pth not in seeded]
+miss_p = [pth for pth in plain if pth not in seeded]
+(ok if not miss_m else bad)(
+    "去广告受管文件 %d 个全部被播种" % len(managed) if not miss_m
+    else "去广告受管文件缺 %d 个: %s" % (len(miss_m), ", ".join(miss_m)))
+(ok if not miss_p else bad)(
+    "既有普通规则文件 %d 个全部被播种" % len(plain) if not miss_p
+    else "既有普通规则文件缺 %d 个: %s" % (len(miss_p), ", ".join(miss_p)))
+
 print("-" * 58)
 print("通过 %d, 失败 %d" % (PASS[0], len(FAIL)))
 sys.exit(1 if FAIL else 0)
