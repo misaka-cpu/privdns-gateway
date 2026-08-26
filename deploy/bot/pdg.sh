@@ -3565,10 +3565,13 @@ run_all_migrations(){
   # 就 enable 等于起一个空壳。失败要让整次更新回滚: 装了一半的 observer 会让
   # linkstat 说出"你手机的加密 DNS 没到达网关"这种假话, 那比不装更糟。
   migrate_dotwitness || rc=1
-  migrate_adblock || rc=1   # 去广告受管块(默认关闭; 失败要让整次更新回滚)
   migrate_health_timer || rc=1   # 定时器排不出下一次 = 健康自检静默停摆, 必须让更新回滚
   migrate_mosdns_hijack_shape || true
   migrate_mosdns_explicit_proxy || true
+  # **必须排在 explicit_proxy 之后**: 去广告受管块里写着 `!qname $explicit_proxy`, 那个 tag 是
+  # 上一行装的。排在它前面的话, 一台还没有明确代理层的老机器会被插进一个引用不存在插件的块 ——
+  # mosdns 起不来, 迁移整份还原并返回 1, 整次更新回滚, 这台机器就再也升不上去了。
+  migrate_adblock || rc=1   # 去广告受管块(默认关闭; 失败要让整次更新回滚)
   migrate_ruleset_hijack || true
   migrate_nft_extra || true
   migrate_custom_hijack || true
@@ -6013,18 +6016,37 @@ except Exception: print("(读不到元数据)")' "$meta" 2>/dev/null)"
 migrate_adblock(){
   local mos=/etc/mosdns/config.yaml
   [[ -f "$mos" ]] || return 0                     # 没装 mosdns 的机器不归这条管
-  _adblock_ensure_files || { c_y "  ❌ 去广告规则文件建不出来, 不动 mosdns 配置。"; return 1; }
+  # 形态判定全是只读的, 放在任何写入之前 —— 判定要跳过时, 这台机器上一个字节都不该被动过。
   local n_pl n_sq
   n_pl="$(grep -c "$ADB_MARK_PL" "$mos" 2>/dev/null)"; n_sq="$(grep -c "$ADB_MARK_SQ" "$mos" 2>/dev/null)"
   if [[ "$n_pl" -gt 1 || "$n_sq" -gt 1 ]]; then
     c_y "  ❌ mosdns 配置里 pdg-adblock 受管块出现多次(plugins=$n_pl sequence=$n_sq) —— 不自动修改, 请人工核对。"
     return 1
   fi
-  [[ "$n_pl" == 1 && "$n_sq" == 1 ]] && return 0  # 已经装好
   if [[ "$n_pl" != "$n_sq" ]]; then
     c_y "  ❌ 受管块只装了一半(plugins=$n_pl sequence=$n_sq) —— 半安装比没装更糟, 不自动修补。"
     return 1
   fi
+  if [[ "$n_pl" == 1 && "$n_sq" == 1 ]]; then
+    # 已经装好: 不改配置, 但仍要把 domain_set 的输入文件补齐 —— 受管块在场而文件被删掉的话
+    # mosdns 起不来, 这是每次更新都该做的自愈, 不能因为"无事可做"就跳过。
+    _adblock_ensure_files || { c_y "  ❌ 受管块在场, 但去广告规则文件建不出来 —— mosdns 可能起不来。"; return 1; }
+    return 0
+  fi
+  # 前置依赖: 受管块对外只引用一个 tag —— `$explicit_proxy`(由 migrate_mosdns_explicit_proxy 装)。
+  # 调用顺序已经把它排在前面, 但那一支是 `|| true`, 允许自己跳过(pdgtx 卡在待收尾 / 配置形态
+  # 不认识)。所以这里不能假设它成功, 必须自己确认 tag 真的定义了。不在就**跳过**而不是报错:
+  # 插一个引用不存在插件的块会让 mosdns 起不来 → 整次更新回滚 → 这台机器再也升不上去。
+  # 跳过是可恢复的: 等 explicit_proxy 到位, 下一次 pdg update 会把受管块补上。
+  # 判据用 `- tag: explicit_proxy` 的**定义**(锚到行尾, 免得匹配上 explicit_proxy_seq),
+  # 而不是它有没有被引用 —— 让引用合法的是定义, 不是用法。
+  # 位置也是判据的一部分: 它必须排在**所有写入之前**, 包括建规则文件那一步。
+  if ! grep -qE '^ *- tag: explicit_proxy$' "$mos"; then
+    c_y "  [去广告] 这台的 mosdns 还没有 explicit_proxy 明确代理层 —— 本次跳过受管块安装"
+    c_y "           (去广告功能暂不可用; 等明确代理层到位后, 下一次 pdg update 会自动补上)。"
+    return 0
+  fi
+  _adblock_ensure_files || { c_y "  ❌ 去广告规则文件建不出来, 不动 mosdns 配置。"; return 1; }
   local tmpl="$REPO_DIR/deploy/mosdns/config.yaml"
   [[ -f "$tmpl" ]] || { c_y "  ❌ 部署源缺 mosdns 模板, 不改现网。"; return 1; }
   local work; work="$(mktemp -d)" || return 1

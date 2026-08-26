@@ -120,8 +120,13 @@ _call = re.search(r"^\s*migrate_adblock[^\n]*", RA, re.M)
 
 
 # ═══ 2. 真跑 migrate_adblock ═══════════════════════════════════════════════════
-def run_migrate(conf_text):
-    """真跑一次 migrate_adblock。返回 (rc, 输出, 落盘后的配置正文)。"""
+def run_migrate(conf_text, want_touch=False):
+    """真跑一次 migrate_adblock。返回 (rc, 输出, 落盘后的配置正文)。
+
+    want_touch=True 时改为返回 (rc, 输出, 配置正文, 是否动过 _adblock_ensure_files)。
+    后者是"前置判据必须排在任何写入之前"这条的观察点: ensure_files 会在
+    /var/lib/privdns-gateway/adblock/ 下建文件, 是这个函数的**第一个写动作**。
+    """
     wd = Path(tmpguard.mkdtemp(prefix="pdg-adblock-mig."))
     (wd / "deploy" / "mosdns").mkdir(parents=True)
     (wd / "deploy" / "mosdns" / "config.yaml").write_text(TMPL, encoding="utf-8")
@@ -133,7 +138,7 @@ def run_migrate(conf_text):
         "set -u\n"
         'REPO_DIR="%s"\n' % wd
         + 'ADB_MARK_PL="%s"\nADB_MARK_SQ="%s"\n' % (MARK_PL, MARK_SQ)
-        + "_adblock_ensure_files(){ return 0; }\n"
+        + ("_adblock_ensure_files(){ echo called >> '%s'; return 0; }\n" % (wd / "ensure.log"))
         + "c_y(){ echo \"$*\"; }; c_g(){ echo \"$*\"; }; c_r(){ echo \"$*\"; }\n"
         # 起不起得来不是这一格要验的, 桩成"起得来"; sleep 桩掉省时间
         + "systemctl(){ return 0; }\nsleep(){ return 0; }\n"
@@ -141,7 +146,11 @@ def run_migrate(conf_text):
     r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=180)
     out = r.stdout + r.stderr
     m = re.search(r"RC=(\d+)", out)
-    return (int(m.group(1)) if m else -1), out, live.read_text(encoding="utf-8")
+    rc = int(m.group(1)) if m else -1
+    conf = live.read_text(encoding="utf-8")
+    if want_touch:
+        return rc, out, conf, (wd / "ensure.log").exists()
+    return rc, out, conf
 
 
 print()
@@ -154,6 +163,15 @@ rc, out, conf = run_migrate(OLD)
 (ok if conf == OLD else bad)("现网配置逐字节未被改动")
 (ok if "explicit_proxy" in out else bad)(
     "跳过这件事是可观察的, 且说明了原因(输出提到 explicit_proxy): %r" % out.strip()[:100])
+# 判据的**位置**也是判据的一部分: 它要排在所有写入之前。ensure_files 会在状态目录下建文件,
+# 是这个函数的第一个写动作 —— 跳过的那一趟里它一次都不该被调到。
+_rc_t, _, _, _touched = run_migrate(OLD, want_touch=True)
+(ok if _rc_t == 0 and not _touched else bad)(
+    "跳过时连规则文件都没建(前置判据排在第一个写动作之前; 实得 touched=%s)" % _touched)
+# 反面: 真要装的那一趟, ensure_files 必须被调到(否则 domain_set 没有输入文件, mosdns 起不来)
+_rc_t2, _, _, _touched2 = run_migrate(NEW, want_touch=True)
+(ok if _rc_t2 == 0 and _touched2 else bad)(
+    "要装的那一趟仍然建了规则文件(实得 touched=%s)" % _touched2)
 
 print()
 print("══ 3. 新机器(有 explicit_proxy): 照常安装(正向对照)══")
