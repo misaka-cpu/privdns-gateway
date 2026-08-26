@@ -69,6 +69,11 @@ class Server:
 
     def __init__(self, work, cn=HOST, mode="ok"):
         self.mode = mode
+        # 默认把重定向指到**回环明文** —— 那是真实攻击的形状。
+        # 但"跟不跟随"这条性质被 scheme 白名单与地址判据**先拦住了**, 于是单看这一种目标,
+        # 摘掉"不跟随"也观察不到任何变化(负控第一版就是 0 条转红)。所以另有一格把
+        # Location 指到**白名单主机**: 那时唯一还拦着第二跳的, 就只剩"不跟随"本身。
+        self.location = "http://127.0.0.1:0/inner"
         self.hits = []
         key, crt = make_cert(cn, work)
         self.ca = crt
@@ -82,7 +87,7 @@ class Server:
                 if outer.mode.startswith("redirect"):
                     code = int(outer.mode.split(":")[1])
                     self.send_response(code)
-                    self.send_header("Location", "http://127.0.0.1:%d/inner" % outer.port)
+                    self.send_header("Location", outer.location)
                     self.send_header("Content-Length", "0")
                     self.end_headers()
                     return
@@ -104,6 +109,8 @@ class Server:
         self.httpd = http.server.HTTPServer(("127.0.0.1", 0), H)
         self.httpd.socket = ctx.wrap_socket(self.httpd.socket, server_side=True)
         self.port = self.httpd.server_address[1]
+        if self.location.endswith(":0/inner"):
+            self.location = "http://127.0.0.1:%d/inner" % self.port
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
 
     def close(self):
@@ -191,6 +198,23 @@ for code in (301, 302, 303, 307, 308):
         else:
             bad("%d 失败了, 但发出了 %d 次请求" % (code, len(srv.hits)))
 srv.mode = "ok"
+
+# 把 Location 换成**白名单主机**: 其它守卫都放行它, 于是"只发生一次请求"这条断言
+# 唯一依赖的就是"不跟随重定向"本身。
+srv.location = "https://%s/second" % HOST
+for code in (302, 308):
+    srv.mode = "redirect:%d" % code
+    srv.hits.clear()
+    try:
+        fetch("https://%s/domains.txt" % HOST, srv)
+        bad("%d(Location 指向白名单主机)被跟随了" % code)
+    except Exception:                                          # noqa: BLE001
+        if len(srv.hits) == 1:
+            ok("%d 且 Location 在白名单内 → 仍只发生一次请求(不跟随)" % code)
+        else:
+            bad("%d(白名单 Location)发出了 %d 次请求 —— 跟随了" % (code, len(srv.hits)))
+srv.mode = "ok"
+srv.location = "http://127.0.0.1:%d/inner" % srv.port
 
 srv.mode = "404"
 srv.hits.clear()
