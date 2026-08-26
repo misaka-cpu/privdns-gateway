@@ -895,7 +895,21 @@ e2e_seed_install(){
 e2e_seed_mosdns(){
   local mode="${1:-all}" f
   for f in geosite_cn geosite_apple custom_direct custom_hijack ruleset_hijack unlock mitm_hijack \
-           geosite_gfw 'geosite_geolocation-!cn'; do : > "/etc/mosdns/rules/$f.txt"; done
+           geosite_gfw adblock_allow adblock_block 'geosite_geolocation-!cn'; do : > "/etc/mosdns/rules/$f.txt"; done
+  # 去广告受管块的 domain_set 输入。**缺一个 mosdns 就 FATAL 退出**, 配置根本加载不了,
+  # 于是断言一条都跑不到 —— exact-head run 32923836445 上 8 个 E2E job 就是这么一起红的,
+  # 而它们的表象各不相同(mosdns 起不来 / connection refused / 事务被基线门拒), 全是下游。
+  #
+  # 目录 755、文件 644: 与生产的 _adblock_ensure_files 和 install.sh 一致(照着读的, 不是猜的)。
+  # 内容一律为空 = 去广告未启用, 夹具里**不写任何测试域名** —— 写了就等于在所有 E2E 里
+  # 悄悄开了这个功能。
+  # 清单不在这里另立真源: tests/test-adblock-rules.py 会从模板抽出全部 domain_set 路径,
+  # 再核对这份播种闭包盖不盖得住, 模板加了新受管文件而这里没跟就转红。
+  install -d -m755 /var/lib/privdns-gateway/adblock
+  for f in infra_allow effective_block effective_list; do
+    : > "/var/lib/privdns-gateway/adblock/$f.txt"; chmod 644 "/var/lib/privdns-gateway/adblock/$f.txt"
+  done
+  chmod 644 /etc/mosdns/rules/adblock_allow.txt /etc/mosdns/rules/adblock_block.txt
   printf 'domain:baidu.com\n' > /etc/mosdns/rules/geosite_cn.txt
   printf 'domain:blocked.test\n' > /etc/mosdns/rules/geosite_gfw.txt
   sed -e "s|__SERVER_IP__|$E2E_SIP|g" -e "s|__INTERNAL_CIDR__|$E2E_CIDR|g" \
