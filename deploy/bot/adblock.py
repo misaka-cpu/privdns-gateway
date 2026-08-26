@@ -182,6 +182,70 @@ def _hit(domain, path):
     return None
 
 
+def _canonical_block_line(domain):
+    """用户 block 源里的规范形态。**只有这一种形态**由本接口产生与删除。
+
+    为什么钉成 `domain:` 而不是裸名: 裸行在 mosdns 的 domain_set 里是后缀语义, 与
+    `domain:` 等价, 但两种形态混着写会让"这一行是谁加的、能不能删"变得没法回答。
+    工具只产出一种形态, 也只删这一种 —— 用户自己手写的任何形态都不归它管。
+    """
+    return "domain:" + domain
+
+
+def rule_add(domain, path=None):
+    """把域名以 canonical 形态加进用户 block 源。返回 (change, normalized)。
+
+    change ∈ {"added", "none"}。已存在完全相同的规范行时是 no-op —— 不写文件, 于是上层
+    的"产物没变就不重启"能一路成立。
+
+    其它行**逐字节保留**: 不排序、不去重、不整理注释与空行。用户手写的东西不归这个接口管,
+    动了它就等于替用户做决定。
+    """
+    good, norm, why = validate_domain(domain)
+    if not good:
+        raise ValueError(why)
+    target = path or USER_BLOCK
+    canon = _canonical_block_line(norm)
+    try:
+        with open(target, encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        text = ""
+    if any(ln.strip() == canon for ln in text.splitlines()):
+        return ("none", norm)
+    if text and not text.endswith("\n"):
+        text += "\n"
+    _atomic_write(target, text + canon + "\n")
+    return ("added", norm)
+
+
+def rule_del(domain, path=None):
+    """从用户 block 源里删掉 canonical 行。返回 (change, normalized)。
+
+    **只删规范化后完全相等的那一行。** 父域、子域、`full:`、裸规则、注释、包含该字符串的
+    其它行, 一律不动 —— 子串匹配在这里等于"用户以为删了一条, 实际被删掉一片"。
+
+    完全相等的重复行(历史原因可能有)**全部删除**: 留一条下来的话, 同一个接口连续两次删除
+    会得到不同结果, 幂等就不成立了。
+    """
+    good, norm, why = validate_domain(domain)
+    if not good:
+        raise ValueError(why)
+    target = path or USER_BLOCK
+    canon = _canonical_block_line(norm)
+    try:
+        with open(target, encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return ("none", norm)
+    lines = text.splitlines(keepends=True)
+    kept = [ln for ln in lines if ln.strip() != canon]
+    if len(kept) == len(lines):
+        return ("none", norm)
+    _atomic_write(target, "".join(kept))
+    return ("removed", norm)
+
+
 def check_domain(domain, state_dir=None, rules_dir=None):
     """逐层判定一个域名。**只读规则文件** —— 不发 DNS 查询、不读日志、不落 qname。
 
@@ -607,10 +671,25 @@ if __name__ == "__main__":
                                       sys.argv[3] if len(sys.argv) > 3 else None,
                                       sys.argv[4] if len(sys.argv) > 4 else None),
                          ensure_ascii=False))
+    elif len(sys.argv) >= 3 and sys.argv[1] in ("rule-add", "rule-del"):
+        # 只吐 JSON, 不吐文案 —— 调用方(pdg.sh → Bot)认字段不认措辞。
+        # 与 check 同一条规矩: **非法输入不回显原文**, 只说是哪一类不合法。
+        try:
+            fn = rule_add if sys.argv[1] == "rule-add" else rule_del
+            change, norm = fn(sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else None)
+        except ValueError as e:
+            print(json.dumps({"error": "INVALID_DOMAIN", "why": str(e)}, ensure_ascii=False))
+            sys.exit(2)
+        print(json.dumps({"change": change, "normalized": norm}, ensure_ascii=False))
     elif len(sys.argv) >= 2 and sys.argv[1] == "update":
         print(json.dumps(update_lists(sys.argv[2] if len(sys.argv) > 2 else None), ensure_ascii=False))
     elif len(sys.argv) >= 3 and sys.argv[1] == "compile":
-        compile_effective(sys.argv[2] == "1", sys.argv[3] if len(sys.argv) > 3 else None)
+        # 第 4 个参数是用户 block 源的路径, 可选。调用方(pdg.sh)手里本来就有 ADB_USER_BLOCK
+        # 这个真源, 让它传进来比在这里再写死一次好 —— 也让沙箱测试能指到假根, 而不必去
+        # 伪造 /etc/mosdns。不传时沿用模块常量, 现有调用点行为不变。
+        compile_effective(sys.argv[2] == "1",
+                          sys.argv[3] if len(sys.argv) > 3 else None,
+                          sys.argv[4] if len(sys.argv) > 4 else None)
         print("ok")
     else:
         print("用法: adblock.py check <域名> [规则目录] | update [状态目录] | compile <0|1> [状态目录]")

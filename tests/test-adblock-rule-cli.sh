@@ -216,6 +216,7 @@ grep -q 'lkg1.invalid' "$W/var/adblock/effective_list.txt" \
 
 echo
 echo "══ ⑨ 启用态幂等: 产物没变 → 重启 0 次 ══"
+: > "$W/state/restarts"            # 只数本次, 上一格的计数不算进来
 rc="$(run_box "$W" 'cmd_adblock rule-add newly-blocked.invalid')"
 [[ "$(jf "$W" result)" == "already_exists" ]] && ok "result=already_exists" || bad "result=$(jf "$W" result)"
 [[ "$(restarts "$W")" == 0 ]] && ok "本次重启 0 次" || bad "幂等却重启了 $(restarts "$W") 次"
@@ -248,7 +249,12 @@ W="$(new_box c11)"; enable_it "$W"
 run_box "$W" 'cmd_adblock rule-add first.invalid' >/dev/null
 touch "$W/state/mosdns-dead"
 # 让回滚写不回去: 把用户源换成不可写的目录形态
-rc="$(run_box "$W" 'chmod 500 "$(dirname "$ADB_USER_BLOCK")" 2>/dev/null; cmd_adblock rule-add third.invalid; chmod 755 "$(dirname "$ADB_USER_BLOCK")" 2>/dev/null')"
+# run_box 返回 eval 里**最后一条**命令的码, 所以这里必须把 cmd_adblock 的码单独接出来,
+# 否则测的是收尾那条 chmod。
+rc="$(run_box "$W" 'chmod 500 "$(dirname "$ADB_USER_BLOCK")" 2>/dev/null
+cmd_adblock rule-add third.invalid; _r=$?
+chmod 755 "$(dirname "$ADB_USER_BLOCK")" 2>/dev/null
+exit "$_r"')"
 res="$(jf "$W" result)"
 [[ "$res" == "rollback_incomplete" || "$res" == "apply_failed_rolled_back" ]] \
   && ok "失败结果码属于闭集(实得 $res)" || bad "结果码不在闭集: $res"

@@ -5974,6 +5974,119 @@ cmd_adblock(){
         sed 's/^/    /' <<<"$out" | head -3
         return 1
       fi;;
+    rule-add|rule-del)
+      # Telegram Bot 的可信入口。Bot **不许自己写规则文件**, 也不许解析这里的中文文案 ——
+      # 这条分支最后一定吐一份闭集 JSON, 字段含义见 test-adblock-rule-cli.sh:
+      #   result ∈ invalid_input|already_exists|not_found|saved_inactive|applied
+      #            |apply_failed_rolled_back|rollback_incomplete
+      #   change ∈ added|removed|none
+      need_root adblock
+      # cmd_adblock 开头已经 shift 过: 这里 $1 是域名, 动作在 $sub 里。
+      local _act="${sub#rule-}" _dom="${1:-}"
+      _adb_emit(){ printf '{"result":"%s","change":"%s","restarted":%s,"overridden_by_allow":%s}\n' \
+                     "$1" "$2" "${3:-false}" "${4:-false}"; }
+      if [[ $# -ne 1 ]]; then
+        echo "需要恰好一个域名参数。" >&2
+        _adb_emit invalid_input none; return 2
+      fi
+      # 取的是**全局**那把锁: 去广告这条路此前从来没取过锁, 而规则变更要改用户源 + 编译产物
+      # 并重启 mosdns, 与 update/迁移属于同一类写操作, 没有理由让它们并发。
+      _lock
+      _adblock_ensure_files || { _adb_emit apply_failed_rolled_back none; return 1; }
+      local mod; mod="$(_pdg_module adblock.py)" || { _adb_emit apply_failed_rolled_back none; return 1; }
+
+      # ① 校验 + 改源。校验与规范化**只有 adblock.py 一份**(validate_domain), shell 不另造。
+      local _src_bak _out _change _norm
+      _src_bak="$(mktemp)" || { _adb_emit apply_failed_rolled_back none; return 1; }
+      cp -a "$ADB_USER_BLOCK" "$_src_bak" 2>/dev/null || : > "$_src_bak"
+      local _prc=0
+      _out="$(python3 "$mod" "rule-$_act" "$_dom" "$ADB_USER_BLOCK" 2>/dev/null)" || _prc=$?
+      if [[ "$_prc" == 2 ]]; then
+        # 只有"域名非法"是 2。其它非零是**写不进去**, 不能冒充成用户输入的错。
+        rm -f "$_src_bak"; _adb_emit invalid_input none; return 2
+      fi
+      if [[ "$_prc" != 0 ]]; then
+        c_y "  ❌ 写用户规则失败 —— 未改动任何生效产物。"
+        rm -f "$_src_bak"; _adb_emit apply_failed_rolled_back none; return 1
+      fi
+      _change="$(printf '%s' "$_out" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("change",""))
+except Exception: print("")')"
+      _norm="$(printf '%s' "$_out" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("normalized",""))
+except Exception: print("")')"
+
+      # ② 没变就到此为止: 不编译、不重启 —— 幂等操作的重启次数必须是 0。
+      if [[ "$_change" == none ]]; then
+        rm -f "$_src_bak"
+        if [[ "$_act" == add ]]; then _adb_emit already_exists none; else _adb_emit not_found none; fi
+        return 0
+      fi
+
+      # 用户 allow 压过 block(见受管块里的合取): 加了也不会真拦, 必须说清楚, 不能冒充已生效。
+      local _ovr=false
+      if [[ "$_act" == add ]] && python3 -c 'import sys
+canon = "domain:" + sys.argv[1]
+try:
+    with open(sys.argv[2], encoding="utf-8") as f:
+        hit = any(l.strip() in (canon, sys.argv[1]) for l in f)
+except OSError:
+    hit = False
+sys.exit(0 if hit else 1)' "$_norm" "$ADB_USER_ALLOW"; then
+        _ovr=true
+      fi
+
+      # ③ 停用态: 只改源。不编译、不重启、不碰 LKG、不动启用位。
+      if [[ "$(_adblock_intent)" != 1 ]]; then
+        rm -f "$_src_bak"
+        c_y "  规则已保存, 但去广告当前未启用, 因此尚未生效。"
+        _adb_emit saved_inactive "$_change" false "$_ovr"
+        return 0
+      fi
+
+      # ④ 启用态: 存产物前像 → 用**现有** LKG/白名单/用户规则重编译(不联网) → 产物真变才重启。
+      local _eb="$ADB_STATE_DIR/effective_block.txt" _el="$ADB_STATE_DIR/effective_list.txt"
+      local _eb_bak _el_bak _eb0 _el0
+      _eb_bak="$(mktemp)"; _el_bak="$(mktemp)"
+      cp -a "$_eb" "$_eb_bak" 2>/dev/null || : > "$_eb_bak"
+      cp -a "$_el" "$_el_bak" 2>/dev/null || : > "$_el_bak"
+      _eb0="$(sha256sum "$_eb" 2>/dev/null | cut -d' ' -f1)"
+      _el0="$(sha256sum "$_el" 2>/dev/null | cut -d' ' -f1)"
+      _adb_rollback(){
+        local _bad=0
+        cp -a "$_src_bak" "$ADB_USER_BLOCK" 2>/dev/null || _bad=1
+        cp -a "$_eb_bak" "$_eb" 2>/dev/null || _bad=1
+        cp -a "$_el_bak" "$_el" 2>/dev/null || _bad=1
+        rm -f "$_src_bak" "$_eb_bak" "$_el_bak"
+        return "$_bad"
+      }
+      if ! python3 "$mod" compile 1 "$ADB_STATE_DIR" "$ADB_USER_BLOCK" >/dev/null 2>&1; then
+        c_y "  ❌ 编译失败 —— 已回滚, 规则未生效。"
+        if _adb_rollback; then _adb_emit apply_failed_rolled_back "$_change"
+        else _adb_emit rollback_incomplete "$_change"; fi
+        return 1
+      fi
+      local _eb1 _el1 _restarted=false
+      _eb1="$(sha256sum "$_eb" 2>/dev/null | cut -d' ' -f1)"
+      _el1="$(sha256sum "$_el" 2>/dev/null | cut -d' ' -f1)"
+      if [[ "$_eb0" != "$_eb1" || "$_el0" != "$_el1" ]]; then
+        systemctl restart mosdns 2>/dev/null; sleep 1
+        if ! systemctl is-active --quiet mosdns; then
+          c_y "  ❌ mosdns 起不来 —— 已回滚, 规则未生效。"
+          if _adb_rollback; then
+            systemctl restart mosdns 2>/dev/null
+            _adb_emit apply_failed_rolled_back "$_change"
+          else
+            c_y "  ⚠️ 回滚未能完整完成 —— 需要人工核对用户规则与编译产物。"
+            _adb_emit rollback_incomplete "$_change"
+          fi
+          return 1
+        fi
+        _restarted=true
+      fi
+      rm -f "$_src_bak" "$_eb_bak" "$_el_bak"
+      _adb_emit applied "$_change" "$_restarted" "$_ovr"
+      return 0;;
     check)
       # **恰好一个参数。**多给一个多半是引号没打对(`check "a b"` 写成了 `check a b`),
       # 那时按第一个参数回答等于对着一个用户没打算问的东西给出确定结论。
