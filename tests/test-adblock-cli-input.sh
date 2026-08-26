@@ -120,11 +120,58 @@ illegal "Unicode 原文" "广告.invalid"
 illegal "空 label" "ads..invalid"
 illegal "起始连字符" "-ads.invalid"
 illegal "结尾连字符" "ads-.invalid"
-illegal "单 label(无点)" "invalid"
+illegal "单 label 起始连字符" "-bad"
+illegal "单 label 结尾连字符" "bad-"
+illegal "单 label 超长" "$(printf 'a%.0s' {1..64})"
 illegal "超长 label" "$(printf 'a%.0s' {1..64}).invalid"
 illegal "超长总长" "$(printf 'aaaaaaaa.%.0s' {1..30})invalid"
 illegal "控制符" "$(printf 'ads\ax.invalid')"
 illegal "多参数" "ads.invalid" "extra.invalid"
+
+echo "══ 二之二、合法单 label 必须可查(与运行时一致)══"
+# 依据是**实测**的 mosdns 语义, 不是印象:
+#   domain:<单label> 与裸行 <单label> = 后缀(含子域); full:<单label> = 精确(不含子域)。
+# 用户 block 里的单 label 会被 compile_effective 原样透传进 effective_block.txt,
+# mosdns 真的按它拦 —— 那么 check 就必须能查它, 否则存在"能被拦却查不了"的域名。
+printf 'domain:intranet\nfull:nas\nrouter\n' > "$BOX/etc/mosdns/rules/adblock_block.txt"
+printf 'domain:intranet\nfull:nas\nrouter\n' > "$BOX/var/adblock/effective_block.txt"
+: > "$BOX/etc/mosdns/rules/adblock_allow.txt"
+
+legal "intranet"       "是" "单 label 用户 block 可查(domain: 写法)"
+legal "host.intranet"  "是" "单 label 的后缀语义: 子域同样命中"
+legal "nas"            "是" "单 label 用户 block 可查(full: 写法)"
+legal "host.nas"       "否" "full: 单 label 精确, 子域不命中"
+legal "router"         "是" "裸行单 label 可查(与 domain: 同义)"
+legal "NAS"            "是" "单 label 大小写归一化"
+legal "router."        "是" "单 label 允许一个末尾点"
+legal "notlisted"      "否" "合法单 label 未命中 → 正常报未阻断"
+legal "xn--fiqs8s"     "否" "合法单 label punycode 被接受"
+legal "a1b2"           "否" "数字与字母组成的单 label 被接受"
+
+# allow 高于 block, 单 label 也一样
+printf 'domain:intranet\n' > "$BOX/etc/mosdns/rules/adblock_allow.txt"
+rc="$(run_check intranet)"
+if [[ "$rc" == 0 ]] && grep -q '是否阻断  : 否' "$WORK/out.log" \
+   && grep -q 'ADBLOCK_USER_ALLOW\|命中层级  : ADBLOCK_USER_ALLOW' "$WORK/out.log"; then
+  ok "单 label 的用户 allow 压过 user block(命中层级=allow)"
+else
+  bad "单 label allow 未压过 block: $(grep -E '是否阻断|命中层级' "$WORK/out.log"|tr '\n' ' ')"
+fi
+: > "$BOX/etc/mosdns/rules/adblock_allow.txt"
+
+echo "══ 二之三、第三方表的边界不得被放宽 ══"
+# 放宽 check 不等于放宽下载表: 第三方源仍必须至少一个点, 否则一行 "com" 就能拦掉整个 TLD。
+if python3 -c '
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("a", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+sys.exit(0 if m.parse_source("intranet\nnas\n") == [] and
+              m.parse_source("com\n") == [] and
+              sorted(m.parse_source("ads.invalid\n")) == ["ads.invalid"] else 1)'    "$ROOT/deploy/bot/adblock.py"; then
+  ok "第三方源仍拒绝单 label(_DOMAIN_RE 未被放宽)"
+else
+  bad "第三方源开始接受单 label —— 一行 \"com\" 就能拦掉整个 TLD"
+fi
 
 echo "══ 三、非法输入不得回显原文、不得动状态 ══"
 run_check "ads.invalid; rm -rf /" >/dev/null
