@@ -4,7 +4,7 @@
 盯 `adblock.py` 的安全下载器与域名契约、`pdg.sh` 的 shell/Python 边界。逐格把生产代码
 改坏(只改工作副本),跑三支聚焦测试,看具名失败集合相对基线有没有新增。
 
-八格:
+十二格:
   ① 恢复自动跟随重定向        —— 本轮修的头一件事
   ② 放行明文 http://          —— scheme 白名单
   ③ 摘掉非公网地址拒绝        —— SSRF 的落点
@@ -12,6 +12,10 @@
   ⑤ 下载失败后覆盖 LKG        —— fail-open, 现网直接变全放行
   ⑥ 恢复 shell→Python 插值    —— 注入形状
   ⑦ 非法域名重新答"未阻断"    —— 诚实性缺口
+  ⑨ 恢复"必须两个 label"      —— 单 label 又变成查不了
+  ⑩ 删掉 label 语法校验        —— 为了接受单 label 而放行 `-bad` / 超长
+  ⑪ allow 不再压过 block       —— 优先级
+  ⑫ 第三方 _DOMAIN_RE 也放宽   —— 一行 `com` 拦掉整个 TLD
   ⑧ 只加无关注释              —— 反向对照, 不该有任何新失败
 """
 import hashlib
@@ -115,6 +119,34 @@ MUTATIONS = [
        "        good, norm, why = validate_domain(sys.argv[2])\n"
        "        norm = norm or sys.argv[2]\n        if False:", 1)],
      "返回 0"),
+    # ── 单 label 诊断一致性(v1.11.0 收口)────────────────────────────────────
+    ("⑨ 恢复'必须至少两个 label'的旧判据", MOD,
+     [("    for lb in labels:\n        if not lb:",
+       "    if len(labels) < 2:\n        return (False, \"\", \"至少要有两个 label\")\n"
+       "    for lb in labels:\n        if not lb:", 1)],
+     "单 label"),
+    ("⑩ 为接受单 label 而删掉 label 语法校验", MOD,
+     [("        if not _LABEL_RE.match(lb):\n"
+       "            return (False, \"\", \"label 只能是字母/数字/连字符, 且不能以连字符开头或结尾\")",
+       "        if False:\n"
+       "            return (False, \"\", \"label 只能是字母/数字/连字符, 且不能以连字符开头或结尾\")", 1)],
+     "连字符"),
+    ("⑪ 用户 allow 不再压过 user block", MOD,
+     [('        ("ADBLOCK_USER_ALLOW", p(rbase, "adblock_allow.txt",\n'
+       '                                 p(base, "adblock_allow.txt", USER_ALLOW)), False),\n'
+       '        ("ADBLOCK_USER_BLOCK", p(base, "effective_block.txt",\n'
+       '                                 p(base, "adblock_block.txt", EFF_BLOCK)), True),',
+       '        ("ADBLOCK_USER_BLOCK", p(base, "effective_block.txt",\n'
+       '                                 p(base, "adblock_block.txt", EFF_BLOCK)), True),\n'
+       '        ("ADBLOCK_USER_ALLOW", p(rbase, "adblock_allow.txt",\n'
+       '                                 p(base, "adblock_allow.txt", USER_ALLOW)), False),', 1)],
+     "allow"),
+    ("⑫ 把第三方 _DOMAIN_RE 也放宽到单 label", MOD,
+     [('_DOMAIN_RE = re.compile(r"^(?=.{1,253}$)[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?"\n'
+       '                        r"(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$")',
+       '_DOMAIN_RE = re.compile(r"^(?=.{1,253}$)[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?"\n'
+       '                        r"(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$")', 1)],
+     "第三方源"),
     ("⑧ 只加一行无关注释(反向对照)", MOD,
      [("def validate_domain(", "# (负控的空转对照, 不改变任何行为)\ndef validate_domain(", 1)],
      None),
