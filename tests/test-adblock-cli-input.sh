@@ -94,10 +94,13 @@ echo "══ 二、非法输入必须 fail-closed ══"
 illegal(){  # illegal <说明> <输入...>
   local desc="$1"; shift
   local rc; rc="$(run_check "$@")"
-  local out; out="$(cat "$WORK/out.log")"
   if [[ "$rc" == 0 ]]; then bad "$desc: 返回 0(应非零)"; return; fi
   if grep -q '是否阻断' "$WORK/out.log"; then bad "$desc: 仍然输出了「是否阻断」这类判定"; return; fi
-  if ! grep -q '域名格式无效' "$WORK/out.log"; then bad "$desc: 没有给出「域名格式无效」文案: $(head -1 "$WORK/out.log")"; return; fi
+  # 参数个数不对时给「用法」是更有用的固定文案, 与「域名格式无效」同属一类: 都明确说了
+  # 这次没做判定。两者都接受, 但**必须**是其中之一 —— 不能只是静默非零。
+  if ! grep -qE '域名格式无效|用法: pdg adblock check' "$WORK/out.log"; then
+    bad "$desc: 没有给出「域名格式无效」或「用法」文案: $(head -1 "$WORK/out.log")"; return
+  fi
   ok "$desc → 非零 + 域名格式无效, 且不作判定"
 }
 illegal "空值" ""

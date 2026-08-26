@@ -118,11 +118,15 @@ def client_ctx(ca):
 def fetch(url, srv, addrs=None, record=None, ctx=None, max_bytes=8 * 1024 * 1024):
     """调**生产** _safe_fetch,注入 resolver 与 connector。连接一律落到本地服务。"""
     def _resolve(host):
-        record and record.setdefault("resolved", []).append(host)
-        return addrs if addrs is not None else ["203.0.113.9"]
+        # `record and ...` 是错的: 空 dict 是**假值**, 于是记录从来不会发生, 而"没记到"
+        # 与"没解析"长得一模一样 —— 第一版就是这么让绑定判据空转的。
+        if record is not None:
+            record.setdefault("resolved", []).append(host)
+        return addrs if addrs is not None else ["104.21.1.1"]
 
     def _connect(addr, port, timeout):
-        record and record.setdefault("connected", []).append((addr, port))
+        if record is not None:
+            record.setdefault("connected", []).append((addr, port))
         return socket.create_connection(("127.0.0.1", srv.port), timeout=timeout)
 
     return A._safe_fetch(url, max_bytes, resolve=_resolve, connect=_connect,
@@ -149,7 +153,7 @@ cases = [
     ("白名单主机的子域", "https://sub.%s/domains.txt" % HOST),
     ("userinfo", "https://user:pw@%s/domains.txt" % HOST),
     ("非 443 端口", "https://%s:8443/domains.txt" % HOST),
-    ("IPv4 字面量", "https://203.0.113.9/domains.txt"),
+    ("IPv4 字面量", "https://104.21.1.1/domains.txt"),
     ("IPv6 字面量", "https://[2606:4700::1111]/domains.txt"),
 ]
 for label, url in cases:
@@ -215,7 +219,7 @@ for a in NONPUB:
 # 公网 + 非公网混合 → 整次失败(不许挑一个能用的)
 srv.hits.clear()
 try:
-    fetch("https://%s/domains.txt" % HOST, srv, addrs=["203.0.113.9", "127.0.0.1"])
+    fetch("https://%s/domains.txt" % HOST, srv, addrs=["104.21.1.1", "127.0.0.1"])
     bad("公网+非公网混合时仍然连接了 —— 应整次失败")
 except Exception:                                              # noqa: BLE001
     ok("公网与非公网混合 → 整次失败(不挑能用的那个)")
@@ -223,13 +227,13 @@ except Exception:                                              # noqa: BLE001
 # ══ ④ DNS 结果与实际连接地址绑定 ═══════════════════════════════════════════
 print("══ ④ DNS 与连接地址绑定 ══")
 rec = {}
-fetch("https://%s/domains.txt" % HOST, srv, addrs=["203.0.113.9"], record=rec)
+fetch("https://%s/domains.txt" % HOST, srv, addrs=["104.21.1.1"], record=rec)
 (ok if rec.get("resolved") == [HOST] else bad)(
     "整个下载只解析了一次(%s)" % rec.get("resolved") if rec.get("resolved") == [HOST]
     else "解析次数不是一次: %r —— 两次解析之间可以换答案(rebinding)" % rec.get("resolved"))
-(ok if rec.get("connected") == [("203.0.113.9", 443)] else bad)(
+(ok if rec.get("connected") == [("104.21.1.1", 443)] else bad)(
     "连接用的就是校验过的那个地址与端口 %r" % (rec.get("connected"),)
-    if rec.get("connected") == [("203.0.113.9", 443)]
+    if rec.get("connected") == [("104.21.1.1", 443)]
     else "连接地址与校验地址对不上: %r" % (rec.get("connected"),))
 
 # ══ ⑤ TLS 仍以原主机名校验 ═════════════════════════════════════════════════
@@ -261,10 +265,10 @@ try:
     for k in old:
         os.environ[k] = "http://127.0.0.1:9"
     rec2 = {}
-    fetch("https://%s/domains.txt" % HOST, srv, addrs=["203.0.113.9"], record=rec2)
-    (ok if rec2.get("connected") == [("203.0.113.9", 443)] else bad)(
+    fetch("https://%s/domains.txt" % HOST, srv, addrs=["104.21.1.1"], record=rec2)
+    (ok if rec2.get("connected") == [("104.21.1.1", 443)] else bad)(
         "设了 HTTPS_PROXY 仍直连校验过的地址(不采用环境代理)"
-        if rec2.get("connected") == [("203.0.113.9", 443)]
+        if rec2.get("connected") == [("104.21.1.1", 443)]
         else "环境代理影响了连接目标: %r" % (rec2.get("connected"),))
 finally:
     for k, v in old.items():

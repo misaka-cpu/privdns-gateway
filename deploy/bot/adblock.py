@@ -14,12 +14,16 @@ explicit_proxy 都在用的同一个加载器,这里绝不另写一套语义。
 的是下载侧的判据,不是 mosdns。所以下面每一道校验都是 fail-closed:不达标就整笔不落盘,
 现网继续用 last-known-good。
 """
+import http.client
+import ipaddress
 import json
 import os
 import re
-import shutil
+import socket
+import ssl
 import tempfile
 import time
+import urllib.parse
 
 # ── 目录与文件(与 mosdns 受管块里的字面路径一一对应)────────────────────────
 STATE_DIR = "/var/lib/privdns-gateway/adblock"
@@ -178,17 +182,28 @@ def _hit(domain, path):
     return None
 
 
-def check_domain(domain, rules_dir=None):
-    """逐层判定一个域名。**只读规则文件** —— 不发 DNS 查询、不读日志、不落 qname。"""
-    base = rules_dir or STATE_DIR
-    def p(name, fallback):
-        cand = os.path.join(base, name)
+def check_domain(domain, state_dir=None, rules_dir=None):
+    """逐层判定一个域名。**只读规则文件** —— 不发 DNS 查询、不读日志、不落 qname。
+
+    读的是 **mosdns 真正读的那四个文件**, 不是"用户写在哪儿":
+        infra_allow.txt / effective_block.txt / effective_list.txt  在状态目录
+        adblock_allow.txt                                          在 mosdns 规则目录
+    这个区分不是洁癖 —— 用户 block 的源文件与**编译产物**是两份不同的东西(停用时后者
+    为空而前者原样保留), check 要回答的是"此刻会不会被拦", 那就必须看编译产物。
+    第一版把这两者混成一个候选名, 于是在真实布局下永远找不到用户 block。
+    """
+    base = state_dir or STATE_DIR
+    rbase = rules_dir or RULES_DIR
+    def p(d, name, fallback):
+        cand = os.path.join(d, name)
         return cand if os.path.exists(cand) else fallback
     layers = (
-        ("ADBLOCK_INFRA_ALLOW", p("infra_allow.txt", INFRA_ALLOW), False),
-        ("ADBLOCK_USER_ALLOW", p("adblock_allow.txt", USER_ALLOW), False),
-        ("ADBLOCK_USER_BLOCK", p("adblock_block.txt", EFF_BLOCK), True),
-        ("ADBLOCK_LIST_BLOCK", p("effective_list.txt", EFF_LIST), True),
+        ("ADBLOCK_INFRA_ALLOW", p(base, "infra_allow.txt", INFRA_ALLOW), False),
+        ("ADBLOCK_USER_ALLOW", p(rbase, "adblock_allow.txt",
+                                 p(base, "adblock_allow.txt", USER_ALLOW)), False),
+        ("ADBLOCK_USER_BLOCK", p(base, "effective_block.txt",
+                                 p(base, "adblock_block.txt", EFF_BLOCK)), True),
+        ("ADBLOCK_LIST_BLOCK", p(base, "effective_list.txt", EFF_LIST), True),
     )
     for reason, path, blocks in layers:
         rule = _hit(domain, path)
@@ -225,17 +240,6 @@ def compile_effective(enabled, state_dir=None, user_block=None, lkg=None):
     return True
 
 
-def _default_fetch(url, max_bytes):
-    import urllib.request
-    req = urllib.request.Request(url, headers={"User-Agent": "privdns-gateway/adblock"})
-    with urllib.request.urlopen(req, timeout=45) as r:     # noqa: S310 - 固定 https 源
-        if r.status != 200:
-            raise OSError("HTTP %s" % r.status)
-        ctype = (r.headers.get("Content-Type") or "").lower()
-        data = r.read(max_bytes + 1)
-    if len(data) > max_bytes:
-        raise OSError("超过最大下载体积 %d" % max_bytes)
-    return (data.decode("utf-8", "replace"), ctype, 200)
 
 
 def update_lists(state_dir=None, sources=None, fetch=None):
@@ -247,7 +251,7 @@ def update_lists(state_dir=None, sources=None, fetch=None):
     os.makedirs(d, exist_ok=True)
     lk = os.path.join(d, "list.lkg")
     prev = read_meta(d).get("count") or None
-    fetch = fetch or (lambda u: _default_fetch(u, LIMITS["max_bytes"]))
+    fetch = fetch or (lambda u: _safe_fetch(u, LIMITS["max_bytes"]))
     errs = []
     for url in (sources or DEFAULT_SOURCES):
         try:
@@ -393,6 +397,183 @@ def infra_closure(acme_home=None, user_allow=None):
             "detail": "%s: %s%s" % (prov, _CLOSURE_HINT.get(why, why), note)}
 
 
+# ── 安全下载 ─────────────────────────────────────────────────────────────────
+# 上一轮安全终审实测到两件事(都是真跑出来的, 不是读代码推的):
+#   · urllib 默认**跟随重定向**: 让服务回 `302 → http://127.0.0.1:<port>/`, 客户端照单
+#     跟过去并取回内容 —— 上游一旦被劫持或 DNS 被污染, 它就能让网关去访问自己的回环与内网;
+#   · 没有 scheme 白名单时, 明文 `http://` 照样能取。
+# 对一个墙内 DNS 网关来说这不是遥远的威胁模型, 而它的回环上正跑着 mosdns 53 / witness
+# 5399 / probe81 81 / mihomo api 9090 / 救援平面。
+#
+# 所以这里**不用任何会自己解析域名或自己跟随重定向的 HTTP 客户端**: 自己解析、自己校验、
+# 自己连、自己发一个最小请求。多写几十行, 换的是"校验过的地址就是真正连上去的地址"。
+
+# 允许连接的主机名 = 从 DEFAULT_SOURCES **算出来**的精确集合。不是通配、不是后缀匹配,
+# 也不是"URL 里写了什么就信什么" —— 换源不在首版范围内, 这个集合就该是封闭的。
+ALLOWED_FETCH_HOSTS = frozenset(
+    h for h in (urllib.parse.urlsplit(u).hostname for u in DEFAULT_SOURCES) if h)
+
+FETCH_TIMEOUT = 45
+
+
+class FetchRefused(OSError):
+    """下载在**连接之前或期间**被判据拒绝。文案里绝不带原始 URL —— 它可能含 userinfo。"""
+
+
+def _is_public_addr(addr):
+    """这个地址能不能连。
+
+    ⚠️ 只用 `is_global` 是不够的: Python 3.11.2 实测 `224.0.0.1` 与 `ff02::1` 的
+    `is_global` 都是 **True**(组播不在它的判定里)。所以下面把每一类分别点名 ——
+    宁可写长, 也不把"标准库大概覆盖了吧"当判据。
+    """
+    try:
+        o = ipaddress.ip_address(addr)
+    except ValueError:
+        return False
+    if (o.is_loopback or o.is_private or o.is_link_local or o.is_multicast
+            or o.is_reserved or o.is_unspecified):
+        return False
+    return bool(o.is_global)
+
+
+def _default_resolve(host):
+    infos = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP)
+    out, seen = [], set()
+    for ai in infos:
+        a = ai[4][0]
+        if a not in seen:
+            seen.add(a)
+            out.append(a)
+    return out
+
+
+def _default_connect(addr, port, timeout):
+    return socket.create_connection((addr, port), timeout=timeout)
+
+
+def _safe_fetch(url, max_bytes, resolve=None, connect=None, ssl_context=None):
+    """按固定白名单取一份规则表。返回 (text, content_type, status)。
+
+    每一道都在**连接之前**判完, 判不过就一个字节都不发。
+    """
+    p = urllib.parse.urlsplit(url)
+    if p.scheme != "https":
+        raise FetchRefused("只允许 https(实得 scheme=%s)" % (p.scheme or "空",))
+    if p.username or p.password:
+        raise FetchRefused("URL 里带 userinfo —— 拒绝(不回显内容)")
+    try:
+        port = p.port
+    except ValueError:
+        raise FetchRefused("URL 的端口部分非法")
+    if port not in (None, 443):
+        raise FetchRefused("只允许默认 443 端口(实得 %s)" % port)
+    host = p.hostname or ""
+    if not host:
+        raise FetchRefused("URL 里没有主机名")
+    try:
+        ipaddress.ip_address(host)
+        raise FetchRefused("主机名是 IP 字面量 —— 拒绝(证书与白名单都无从谈起)")
+    except ValueError:
+        pass
+    if host not in ALLOWED_FETCH_HOSTS:
+        raise FetchRefused("主机名不在固定白名单内: %s" % host)
+
+    addrs = (resolve or _default_resolve)(host)
+    if not addrs:
+        raise FetchRefused("解析不到任何地址: %s" % host)
+    bad = [a for a in addrs if not _is_public_addr(a)]
+    if bad:
+        # **有一个不干净就整次失败**, 不从里面挑一个能用的 —— 挑就等于允许对方混进来一个
+        # 内网地址再靠运气避开。
+        raise FetchRefused("解析结果里有非公网地址(%d/%d), 整次拒绝" % (len(bad), len(addrs)))
+
+    addr = addrs[0]
+    sock = (connect or _default_connect)(addr, 443, FETCH_TIMEOUT)
+    try:
+        ctx = ssl_context or ssl.create_default_context()      # 系统 CA, 且默认校验主机名
+        # server_hostname 用**原始主机名**: SNI 与证书校验都必须对着它, 不是对着 IP。
+        tls = ctx.wrap_socket(sock, server_hostname=host)
+    except Exception:
+        try:
+            sock.close()
+        except OSError:
+            pass
+        raise
+    try:
+        tls.settimeout(FETCH_TIMEOUT)
+        path = p.path or "/"
+        if p.query:
+            path += "?" + p.query
+        req = ("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: privdns-gateway/adblock\r\n"
+               "Accept: text/plain\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n"
+               % (path, host))
+        tls.sendall(req.encode("ascii"))
+        resp = http.client.HTTPResponse(tls, method="GET")
+        resp.begin()
+        status = resp.status
+        ctype = (resp.getheader("Content-Type") or "").lower()
+        if status != 200:
+            # **重定向一律不跟随。**跟随是这一整段存在的理由。
+            raise FetchRefused("只接受 200, 实得 %d(重定向一律不跟随)" % status)
+        data = resp.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            raise FetchRefused("超过最大下载体积 %d" % max_bytes)
+        return (data.decode("utf-8", "replace"), ctype, status)
+    finally:
+        try:
+            tls.close()
+        except OSError:
+            pass
+
+
+# ── 域名输入契约 ─────────────────────────────────────────────────────────────
+_LABEL_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
+
+
+def validate_domain(value):
+    """(ok, normalized, reason)。**只接受一个 ASCII DNS 名称。**
+
+    为什么要有它: `check` 原来对空值、换行、`../../etc/passwd`、`*.example.com`、IP 字面量
+    一律答"未阻断"。那不是安全洞(纯字符串匹配), 是**诚实性缺口** —— 用户问"这个会不会被
+    拦", 工具对一个根本不是域名的东西回答"不会被拦"。诊断命令给出看似确定的错答案,
+    比报错更糟。
+    """
+    if value is None:
+        return (False, "", "空值")
+    if not isinstance(value, str):
+        return (False, "", "不是字符串")
+    if value != value.strip():
+        return (False, "", "前后有空白")
+    if not value:
+        return (False, "", "空值")
+    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in value):
+        return (False, "", "含控制字符")
+    if any(ord(c) > 0x7E for c in value):
+        return (False, "", "含非 ASCII 字符(请用 xn-- punycode 形式)")
+    v = value[:-1] if value.endswith(".") else value           # 允许**一个**末尾点
+    if not v:
+        return (False, "", "只有一个点")
+    if len(v) > 253:
+        return (False, "", "总长超过 253")
+    try:
+        ipaddress.ip_address(v)
+        return (False, "", "是 IP 字面量, 不是域名")
+    except ValueError:
+        pass
+    labels = v.split(".")
+    if len(labels) < 2:
+        return (False, "", "至少要有两个 label")
+    for lb in labels:
+        if not lb:
+            return (False, "", "有空 label")
+        if len(lb) > 63:
+            return (False, "", "有 label 超过 63 字符")
+        if not _LABEL_RE.match(lb):
+            return (False, "", "label 只能是字母/数字/连字符, 且不能以连字符开头或结尾")
+    return (True, v.lower(), "")
+
+
 def list_is_stale(state_dir=None, max_age_days=14):
     """表是否过期。拿不到元数据 → 返回 None(无结论), 不猜。"""
     m = read_meta(state_dir)
@@ -409,7 +590,15 @@ def list_is_stale(state_dir=None, max_age_days=14):
 if __name__ == "__main__":
     import sys
     if len(sys.argv) >= 3 and sys.argv[1] == "check":
-        print(json.dumps(check_domain(sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else None),
+        good, norm, why = validate_domain(sys.argv[2])
+        if not good:
+            # **不回显原始输入** —— 它可能含 shell 标点或换行, 复述一遍等于把危险内容
+            # 又抄进日志与用户的排障截图里。只说是哪一类不合法。
+            print(json.dumps({"error": "INVALID_DOMAIN", "why": why}, ensure_ascii=False))
+            sys.exit(2)
+        print(json.dumps(check_domain(norm,
+                                      sys.argv[3] if len(sys.argv) > 3 else None,
+                                      sys.argv[4] if len(sys.argv) > 4 else None),
                          ensure_ascii=False))
     elif len(sys.argv) >= 2 and sys.argv[1] == "update":
         print(json.dumps(update_lists(sys.argv[2] if len(sys.argv) > 2 else None), ensure_ascii=False))

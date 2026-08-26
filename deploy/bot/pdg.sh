@@ -5879,12 +5879,15 @@ _adblock_apply(){
 _adblock_status(){
   local intent count updated
   intent="$(_adblock_intent)"; [[ "$intent" == 1 ]] || intent=0
+  # 路径经 **argv** 传进去, 不再插进 Python 字符串字面量。
+  # 今天 ADB_STATE_DIR 是固定常量, 插值不可利用 —— 但那正是"变量一旦可变就变成注入"的
+  # 形状, 而这个文件里其它地方都已经走 argv 了, 留一处例外只会让下一个人照抄。
   count="$(python3 -c 'import json,sys
-try: print(json.load(open("'"$ADB_STATE_DIR"'/meta.json")).get("count",0))
-except Exception: print(0)' 2>/dev/null)"
+try: print(json.load(open(sys.argv[1] + "/meta.json")).get("count",0))
+except Exception: print(0)' "$ADB_STATE_DIR" 2>/dev/null)"
   updated="$(python3 -c 'import json,sys
-try: print(json.load(open("'"$ADB_STATE_DIR"'/meta.json")).get("updated","(无)"))
-except Exception: print("(无)")' 2>/dev/null)"
+try: print(json.load(open(sys.argv[1] + "/meta.json")).get("updated","(无)"))
+except Exception: print("(无)")' "$ADB_STATE_DIR" 2>/dev/null)"
   echo "  启用意图: $([[ "$intent" == 1 ]] && echo 已启用 || echo 未启用)"
   echo "  第三方表: $count 条, 更新于 $updated"
   echo "  用户 allow: $(grep -vce '^$|^#' "$ADB_USER_ALLOW" 2>/dev/null || echo 0) 条   用户 block: $(grep -vce '^$|^#' "$ADB_USER_BLOCK" 2>/dev/null || echo 0) 条"
@@ -5969,14 +5972,32 @@ cmd_adblock(){
         return 1
       fi;;
     check)
-      local d="${1:-}"; [[ -n "$d" ]] || { echo "用法: pdg adblock check <域名>"; return 1; }
+      # **恰好一个参数。**多给一个多半是引号没打对(`check "a b"` 写成了 `check a b`),
+      # 那时按第一个参数回答等于对着一个用户没打算问的东西给出确定结论。
+      if [[ $# -ne 1 || -z "${1:-}" ]]; then
+        echo "用法: pdg adblock check <域名>   (恰好一个参数)"; return 1
+      fi
+      local d="$1"
       local mod; mod="$(_pdg_module adblock.py)" || return 1
-      python3 "$mod" check "$d" "$ADB_STATE_DIR" | python3 -c 'import json,sys
-r=json.load(sys.stdin)
-print("  域名      : %s" % sys.argv[1])
+      # 先过输入契约。**管道会吞掉退出码**, 所以这里先落到变量再判 —— 原实现正是把
+      # `python3 … | python3 …` 的成败丢掉了, 于是非法输入也一路走到"是否阻断"。
+      local raw rc=0
+      raw="$(python3 "$mod" check "$d" "$ADB_STATE_DIR" "$(dirname "$ADB_USER_ALLOW")" 2>/dev/null)" || rc=$?
+      if [[ "$rc" != 0 ]]; then
+        # 不回显原始输入 —— 它可能含 shell 标点或换行, 复述一遍等于把危险内容又抄进
+        # 日志与用户的排障截图。只说是哪一类不合法。
+        c_y "❌ 域名格式无效: $(python3 -c 'import json,sys
+try: print(json.loads(sys.argv[1]).get("why","(未说明)"))
+except Exception: print("(未说明)")' "$raw" 2>/dev/null)"
+        c_y "   只接受一个 ASCII 域名(可带一个末尾点)。未做任何判定。"
+        return 2
+      fi
+      python3 -c 'import json,sys
+r=json.loads(sys.argv[1])
+print("  域名      : %s" % sys.argv[2])
 print("  是否阻断  : %s" % ("是" if r.get("blocked") else "否"))
 print("  命中层级  : %s" % (r.get("layer") or "无命中"))
-print("  命中规则  : %s" % (r.get("rule") or "-"))' "$d"
+print("  命中规则  : %s" % (r.get("rule") or "-"))' "$raw" "$d"
       local meta; meta="$(cat "$ADB_STATE_DIR/meta.json" 2>/dev/null)"
       echo "  表版本    : $(python3 -c 'import json,sys
 try: d=json.loads(sys.argv[1] or "{}"); print("%s 条, 更新于 %s, 来源 %s" % (d.get("count","?"), d.get("updated","?"), d.get("source","?")))
