@@ -650,7 +650,21 @@ e2e_stub_system(){
 mkdir -p "$D"
 echo "systemctl $*" >> "$CALLS"
 verb="$1"; shift
-now=0; [ "$1" = "--now" ] && { now=1; shift; }
+# 选项在这里一次剥干净。真 systemd 的 `--quiet` 只是**不打印**, 判定与退出码分毫不变。
+# 原来只剥 `--now`, 于是 `is-active --quiet mosdns` 里的 `--quiet` 被当成了 unit 名 ——
+# 桩回答的是一个根本不存在的 unit, 所有这么调的地方在沙箱里统统得到 inactive/rc=3。
+# 它答的恰恰是"服务起来了没有"这种承重判据: 去广告受管块迁移靠它判断新配置能不能起,
+# 于是在 e2e-migrate 的 v1.7.0 场景里被判成"装上就起不来", 整次迁移回滚 —— 而被测代码
+# 一点毛病没有。pdg.sh 里有 9 处 `is-active --quiet`(去广告与 pdg-lan)受这条影响。
+now=0; quiet=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --now)      now=1;   shift;;
+    --quiet|-q) quiet=1; shift;;
+    *) break;;
+  esac
+done
+_say(){ [ "$quiet" = 1 ] || echo "$1"; }
 
 # ── pdg-dotwitness 专用: 只有这一个 unit 起**真的生产进程** ─────────────────
 # 为什么非这么做不可: 6.2B 的状态机装完 witness 会轮询 127.0.0.1:5399 有没有真在听,
@@ -719,11 +733,11 @@ case "$verb" in
       [ -z "$v" ] && { [ -f "/etc/systemd/system/${u}.service" ] && v=1 || v=0; }
       # witness 起的是真进程: 它自己崩了就不能再说 active(真 systemd 也不会)
       if _dw_is "$u" && [ "$v" = 1 ] && ! _dw_alive; then v=0; echo 0 > "$D/${u}.ac"; fi
-      [ "$v" = 1 ] && { echo active; exit 0; }; echo inactive; exit 3;;
+      [ "$v" = 1 ] && { _say active; exit 0; }; _say inactive; exit 3;;
   is-enabled)
       u="$1"; v=$(cat "$D/${u}.en" 2>/dev/null)
       [ -z "$v" ] && { [ -f "/etc/systemd/system/${u}.service" ] && v=1 || v=0; }
-      [ "$v" = 1 ] && { echo enabled; exit 0; }; echo disabled; exit 1;;
+      [ "$v" = 1 ] && { _say enabled; exit 0; }; _say disabled; exit 1;;
   show)
       # show [-p PROP]... [--value] UNIT
       #
@@ -895,7 +909,21 @@ e2e_seed_install(){
 e2e_seed_mosdns(){
   local mode="${1:-all}" f
   for f in geosite_cn geosite_apple custom_direct custom_hijack ruleset_hijack unlock mitm_hijack \
-           geosite_gfw 'geosite_geolocation-!cn'; do : > "/etc/mosdns/rules/$f.txt"; done
+           geosite_gfw adblock_allow adblock_block 'geosite_geolocation-!cn'; do : > "/etc/mosdns/rules/$f.txt"; done
+  # 去广告受管块的 domain_set 输入。**缺一个 mosdns 就 FATAL 退出**, 配置根本加载不了,
+  # 于是断言一条都跑不到 —— exact-head run 32923836445 上 8 个 E2E job 就是这么一起红的,
+  # 而它们的表象各不相同(mosdns 起不来 / connection refused / 事务被基线门拒), 全是下游。
+  #
+  # 目录 755、文件 644: 与生产的 _adblock_ensure_files 和 install.sh 一致(照着读的, 不是猜的)。
+  # 内容一律为空 = 去广告未启用, 夹具里**不写任何测试域名** —— 写了就等于在所有 E2E 里
+  # 悄悄开了这个功能。
+  # 清单不在这里另立真源: tests/test-adblock-rules.py 会从模板抽出全部 domain_set 路径,
+  # 再核对这份播种闭包盖不盖得住, 模板加了新受管文件而这里没跟就转红。
+  install -d -m755 /var/lib/privdns-gateway/adblock
+  for f in infra_allow effective_block effective_list; do
+    : > "/var/lib/privdns-gateway/adblock/$f.txt"; chmod 644 "/var/lib/privdns-gateway/adblock/$f.txt"
+  done
+  chmod 644 /etc/mosdns/rules/adblock_allow.txt /etc/mosdns/rules/adblock_block.txt
   printf 'domain:baidu.com\n' > /etc/mosdns/rules/geosite_cn.txt
   printf 'domain:blocked.test\n' > /etc/mosdns/rules/geosite_gfw.txt
   sed -e "s|__SERVER_IP__|$E2E_SIP|g" -e "s|__INTERNAL_CIDR__|$E2E_CIDR|g" \

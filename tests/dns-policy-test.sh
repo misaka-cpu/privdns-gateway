@@ -71,6 +71,14 @@ echo "domain:unlktest.example" > "$WORK/rules/unlock.txt"
 echo "example.com" > "$WORK/rules/geosite_geolocation-!cn.txt"   # 劫持集(all 模式=geolocation-!cn): 代理域名在集内 → 被劫持
 : > "$WORK/rules/mitm_hijack.txt"                                # MITM 接管域名(force_hijack): 本测试无, 留空
 : > "$WORK/rules/ruleset_hijack.txt"                             # 规则集所需劫持域名(explicit_proxy 的第二个文件)
+# 去广告(v1.11.0): 两个用户源在 rules/ 下, 三个编译产物在单独的 adblock/ 下。
+# 五个都是 domain_set 的输入 —— 缺一个 mosdns 直接 FATAL, 所以一律建成空文件(= 默认关闭)。
+: > "$WORK/rules/adblock_allow.txt"
+: > "$WORK/rules/adblock_block.txt"
+mkdir -p "$WORK/adblock"
+: > "$WORK/adblock/infra_allow.txt"
+: > "$WORK/adblock/effective_block.txt"
+: > "$WORK/adblock/effective_list.txt"
 echo "blocked.example" > "$WORK/rules/geosite_gfw.txt"           # gfw 模式的劫持集(只含真被墙域名)
 
 # ── 渲染真实 config.yaml → 测试版(上游指 mock, 端口换高位, 去掉 DoT server 省证书)──
@@ -89,14 +97,19 @@ render_conf(){   # $1=内网段  $2=local 上游内联(默认=单 mock; 故障�
           -e "s#^\([[:space:]]*\)args: {.*223\.5\.5\.5.*}#\1args: { concurrent: 2, upstreams: [ $local_ups ] }#" \
           -e "s#^\([[:space:]]*\)args: {.*22\.22\.22\.22.*}#\1args: { concurrent: 1, upstreams: [ {addr: \"udp://127.0.0.1:$UNLOCKP\"} ] }#" \
           -e "s#/etc/mosdns/rules/#$WORK/rules/#g" \
+          -e "s#/var/lib/privdns-gateway/adblock/#$WORK/adblock/#g" \
           -e "s#0.0.0.0:53#127.0.0.1:$DNSP#g" \
           -e "/- tag: dot_server/,\$d" \
       > "$WORK/config.yaml"
   if [[ "${PDG_NC_DROP_EXPLICIT_GATE:-0}" == 1 ]]; then
-    grep -q 'qname \$explicit_proxy' "$WORK/config.yaml" \
+    # 前后两道断言都盯**分派那一行**(`matches: qname $explicit_proxy`), 不是任意一次
+    # `qname $explicit_proxy` 的出现 —— v1.11.0 的去广告受管块里有一句
+    # `- "!qname $explicit_proxy"`(用户显式分流对第三方表免疫), 用宽泛模式判的话:
+    # 前置断言会被它顶成"存在"(即使分派真的没了), 后置断言会被它顶成"没删掉"。
+    grep -q 'matches: qname \$explicit_proxy' "$WORK/config.yaml" \
       || fail "负控失效: 渲染产物里本来就没有 explicit_proxy 判断(删了个不存在的东西=空跑)"
     sed -i '/matches: qname \$explicit_proxy/,+1d' "$WORK/config.yaml"
-    grep -q 'qname \$explicit_proxy' "$WORK/config.yaml" \
+    grep -q 'matches: qname \$explicit_proxy' "$WORK/config.yaml" \
       && fail "负控失效: 判断没被删掉"
     grep -q 'tag: explicit_proxy_seq' "$WORK/config.yaml" \
       || fail "负控过头: 连序列插件都删了(要删的只是那道判断)"

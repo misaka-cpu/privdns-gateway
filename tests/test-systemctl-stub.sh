@@ -262,6 +262,31 @@ UP="$(get -p NoSuchPropertyXyz --value)"
 
 rm -f "/etc/systemd/system/$U"; reset_state
 
+echo
+echo "── 13. --quiet 不许改变判定结果 ──"
+# 真 systemd 的 `is-active --quiet` 只是**不打印**, 退出码与不带它时完全一致。桩原来只剥
+# `--now`, 于是 `--quiet` 被当成 unit 名 —— 一个叫 "--quiet" 的 unit 当然不存在, 所有
+# `is-active --quiet <unit>` 的调用方在沙箱里统统得到 inactive/rc=3。这不是被测代码的
+# 毛病, 是假 systemd 说了假话; 而它答的恰恰是"服务起来了没有"这种承重判据。
+# pdg.sh 里有 9 处这么调(去广告的受管块迁移与 apply、pdg-lan 的若干处), 都被它答反。
+reset_state
+mk_unit
+"$SC" restart "$U" >/dev/null 2>&1
+_plain="$("$SC" is-active "$U" 2>/dev/null)"; _prc=$?
+"$SC" is-active --quiet "$U" >/dev/null 2>&1; _qrc=$?
+[[ "$_plain" == active && "$_prc" == 0 ]]   && t_ok "前提: 不带 --quiet 时这个 unit 确实是 active" || t_bad "前提不成立: '$_plain' rc=$_prc"
+[[ "$_qrc" == "$_prc" ]]   && t_ok "active 时 --quiet 的退出码与不带它一致(rc=$_qrc)" || t_bad "--quiet 实得 rc=$_qrc, 应为 $_prc"
+[[ -z "$("$SC" is-active --quiet "$U" 2>/dev/null)" ]]   && t_ok "--quiet 不打印任何东西(与真 systemd 一致)" || t_bad "--quiet 仍打印: '$("$SC" is-active --quiet "$U" 2>/dev/null)'"
+# 反向: 停掉之后 --quiet 也必须跟着变, 别是"永远说 active"那种假修
+"$SC" stop "$U" >/dev/null 2>&1
+"$SC" is-active --quiet "$U" >/dev/null 2>&1; _qrc2=$?
+[[ "$_qrc2" != 0 ]]   && t_ok "停掉后 --quiet 退出码非 0(不是恒真)" || t_bad "停掉后 --quiet 仍返回 0"
+# is-enabled 同理
+"$SC" enable "$U" >/dev/null 2>&1
+"$SC" is-enabled --quiet "$U" >/dev/null 2>&1; _erc=$?
+[[ "$_erc" == 0 ]] && t_ok "is-enabled --quiet 也认这个选项" || t_bad "is-enabled --quiet 实得 rc=$_erc"
+rm -f "/etc/systemd/system/$U"; reset_state
+
 # ── 收尾: 显式清一次, 并在脚本内部把"确实恢复了"验掉 ──────────────────────────
 # EXIT hook 仍然留着管异常路径; 这里显式调用是为了让下面的正向断言能在本脚本里完成 ——
 # 桩没清干净这件事必须在这里被抓住, 而不是留给几十步之后的另一支测试。

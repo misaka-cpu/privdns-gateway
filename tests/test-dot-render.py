@@ -190,6 +190,13 @@ else:
         for name in set(re.findall(r"/etc/mosdns/rules/([A-Za-z0-9_.!-]+)", body)):
             open(os.path.join(rules, name), "w").close()
         body = body.replace("/etc/mosdns/rules/", rules + "/")
+        # 去广告的受管块把三个 domain_set 指到 /var/lib/privdns-gateway/adblock/ ——
+        # 同样是"缺文件就 FATAL", 所以按引用一并建出来(空文件即可)。
+        adb = os.path.join(d, "adblock")
+        os.makedirs(adb, exist_ok=True)
+        for name in set(re.findall(r"/var/lib/privdns-gateway/adblock/([A-Za-z0-9_.!-]+)", body)):
+            open(os.path.join(adb, name), "w").close()
+        body = body.replace("/var/lib/privdns-gateway/adblock/", adb + "/")
         body = re.sub(r'listen: "0\.0\.0\.0:53"', 'listen: "127.0.0.1:15399"', body)
         open(cfg, "w").write(body)
         p = subprocess.run([mos, "start", "-c", cfg, "--as-service"],

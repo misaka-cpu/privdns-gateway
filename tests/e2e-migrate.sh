@@ -151,7 +151,15 @@ seed_v170_box(){
     printf '[Unit]\nDescription=mosdns (e2e)\n[Service]\nExecStart=/usr/local/bin/mosdns start\n' \
       > /etc/systemd/system/mosdns.service
 }
-epline(){ grep -n 'qname \$explicit_proxy' /etc/mosdns/config.yaml | head -1 | cut -d: -f1; }
+# 这三个探针量的是"判据在 internal_sequence 里的先后", 所以要认**判据那一行的形态**
+# (`- matches: qname $X`), 不能只认裸的 tag 名。v1.11.0 的去广告受管块里有一行
+# `- "!qname $explicit_proxy"`(第三方表不得压过用户显式分流那条合取), 它排在真判据之前 ——
+# 裸 tag 加 head -1 会抓到它, 于是"顺序不对"报的是探针自己的位置, 与被测顺序无关。
+epline(){ grep -n -- '- matches: qname \$explicit_proxy' /etc/mosdns/config.yaml | head -1 | cut -d: -f1; }
+# "明确代理这条判据装上了没有" —— 与 epline 同一个理由: 认判据那一行的形态。裸 tag 会被
+# 去广告受管块里的 `- "!qname $explicit_proxy"` 满足, 那几处 `&& ok` 就会在真判据缺失时**假绿**
+# (比假红更难发现)。这里只留一个真源, 四处调用都走它。
+ep_installed(){ grep -q -- '- matches: qname \$explicit_proxy' /etc/mosdns/config.yaml; }
 cnline(){ grep -n 'qname \$geosite_cn'     /etc/mosdns/config.yaml | head -1 | cut -d: -f1; }
 fhline(){ grep -n 'qname \$force_hijack'   /etc/mosdns/config.yaml | head -1 | cut -d: -f1; }
 
@@ -188,7 +196,7 @@ bash /usr/local/bin/pdg __migrate >$E2E_TMP/mig4b.log 2>&1
 [[ "$(sha256sum /etc/mosdns/rules/ruleset_hijack.txt | cut -d" " -f1)" == "$RSH_BEFORE" ]] \
   && ok "已有内容的 ruleset_hijack.txt 逐字节保留(不许无条件清空)" \
   || bad "管理员写的 ruleset_hijack.txt 被迁移清掉了($(wc -l < /etc/mosdns/rules/ruleset_hijack.txt) 行)"
-grep -q 'qname \$explicit_proxy' /etc/mosdns/config.yaml \
+ep_installed \
   && ok "保留内容的同时迁移照常完成" || bad "这次迁移没完成"
 sed -n '/- tag: explicit_proxy$/,/^  - tag: /p' /etc/mosdns/config.yaml > $E2E_TMP/ep_set.txt
 { grep -q 'custom_hijack.txt' $E2E_TMP/ep_set.txt && grep -q 'ruleset_hijack.txt' $E2E_TMP/ep_set.txt; } \
@@ -268,7 +276,7 @@ python3 /opt/pdg-bot/pdgtx.py pending 2>/dev/null | grep -q "$stale" \
   && ok "前置: 陈旧 PREPARING 确实会出现在 pending 输出里(判据不能只看输出)" \
   || bad "前置: 没造出陈旧 PREPARING"
 bash /usr/local/bin/pdg __migrate >$E2E_TMP/mig7.log 2>&1
-grep -q 'qname \$explicit_proxy' /etc/mosdns/config.yaml \
+ep_installed \
   && ok "陈旧 PREPARING 在场: 迁移照常完成(没被无关事务挡住)" \
   || bad "被陈旧 PREPARING 挡住了: $(grep -i 事务 $E2E_TMP/mig7.log | head -2)"
 
@@ -280,7 +288,7 @@ python3 "$E2E_ROOT/tests/helpers/strip-explicit-proxy.py" /etc/mosdns/config.yam
 applying="$(python3 "$E2E_ROOT/tests/helpers/seed-stale-tx.py" "$TXROOT" APPLYING 0)"
 cp /etc/mosdns/config.yaml $E2E_TMP/m6b
 bash /usr/local/bin/pdg __migrate >$E2E_TMP/mig8.log 2>&1
-grep -q 'qname \$explicit_proxy' /etc/mosdns/config.yaml \
+ep_installed \
   && bad "APPLYING 事务在场却照样迁移了(该挡没挡)" \
   || ok "APPLYING 事务在场: 迁移拒绝执行"
 cmp -s $E2E_TMP/m6b /etc/mosdns/config.yaml && ok "拒绝时现网配置逐字节未动" || bad "拒绝了却改了配置"
@@ -330,7 +338,7 @@ grep -q 'CHILD-RC=0' $E2E_TMP/mig9.log \
   && ok "子迁移复用了继承来的那把锁, 返回 0" \
   || bad "子迁移没跑通: $(grep -iE 'BUSY|锁|CHILD-RC' $E2E_TMP/mig9.log | head -2)"
 
-grep -q 'qname \$explicit_proxy' /etc/mosdns/config.yaml \
+ep_installed \
   && ok "持锁时迁移照样完成(复用同一把锁, 没有去抢第二把)" \
   || bad "被锁挡住了: $(grep -iE 'BUSY|事务|锁' $E2E_TMP/mig9.log | head -2)"
 grep -qi 'BUSY' $E2E_TMP/mig9.log && bad "迁移日志里出现了 BUSY(说明还在走 pdgtx 事务)" \

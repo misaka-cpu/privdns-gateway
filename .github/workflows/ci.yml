@@ -181,6 +181,27 @@ jobs:
       - name: "内网面板回滚收敛: 派生产物跟随已恢复的模型, 且 render/apply 不假成功"
         run: bash tests/test-lan-rollback-convergence.sh
 
+      - name: "去广告规则编译/校验/LKG/check 判定(不起 mosdns, 盯落盘之前那一段)"
+        run: python3 tests/test-adblock-rules.py
+
+      - name: "去广告行为契约: 真 mosdns + 生产模板, 优先级六层与三协议一致"
+        run: bash tests/test-adblock-contracts.sh
+
+      - name: "去广告基础设施闭包: ACME provider 的 API 域名能否枚举(枚举不到 ≠ 没有 provider)"
+        run: python3 tests/test-adblock-provider.py
+
+      - name: "去广告启用门: 闭包不完整必须 fail-closed, 且失败后逐项不变"
+        run: bash tests/test-adblock-enable-gate.sh
+
+      - name: "去广告下载器安全边界: scheme/host/端口/重定向/非公网地址/TLS/代理(本地真 TLS, 不碰外网)"
+        run: python3 tests/test-adblock-fetch-security.py
+
+      - name: "去广告 check 的输入契约: 非法域名必须 fail-closed, 不答'未阻断'"
+        run: bash tests/test-adblock-cli-input.sh
+
+      - name: "去广告受管块的迁移依赖: 排在 explicit_proxy 之后 + 缺前置时跳过而不是插坏块"
+        run: python3 tests/test-adblock-migration-order.py
+
       - name: "链路诊断采集器 (证书正常/临期/过期/错域名/损坏/误放私钥; 零写入零写锁)"
         run: python3 tests/test-link-status.py
 

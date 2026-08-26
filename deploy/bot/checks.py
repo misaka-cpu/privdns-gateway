@@ -8,6 +8,7 @@ import nftscan  # noqa: E402  与迁移前置门共用的 input 链冲突判据(
 
 SB = "/etc/sing-box/config.json"
 MOSDNS_CONF = "/etc/mosdns/config.yaml"
+ACME_HOME_DIR = "/opt/pdg-acme"
 DOT_DOMAIN_FILE = "/opt/pdg-bot/dot-domain"
 BACKEND_MARKER = "/etc/privdns-gateway/backend"
 MIHOMO_CFG = "/etc/mihomo/config.yaml"
@@ -1006,6 +1007,126 @@ def check_lan_proxy_routes():
     return ("fail", name, "; ".join(parts) + "。跑 sudo pdg lan render 后重启 pdg-lan。")
 
 
+def _adblock_intent():
+    return (_profile("PDG_ADBLOCK_ENABLED") or "").strip() == "1"
+
+
+def _adblock_mod():
+    try:
+        import adblock
+        return adblock
+    except Exception:                              # noqa: BLE001
+        return None
+
+
+def check_adblock():
+    """DNS 去广告:启用意图与受管块的**实际状态**必须收敛。
+
+    这一项刻意做成"证据不足就说不知道":读不到配置、模块不在、元数据坏了,一律 warn +
+    明说本项无结论。判绿的条件很窄 —— 因为"绿"在这里的含义是"它此刻真的按你以为的方式
+    在拦",而那是个很强的断言。
+    """
+    name = "DNS 去广告"
+    intent = _adblock_intent()
+    try:
+        with open(MOSDNS_CONF, encoding="utf-8") as f:
+            conf = f.read()
+    except OSError as e:
+        if not intent and not os.path.exists(ADBLOCK_STATE_DIR):
+            return None                            # 从来没用过这个功能, 整项不适用
+        return ("warn", name, "读不到 %s(%s) —— 本项无结论" % (MOSDNS_CONF, e.__class__.__name__))
+
+    n_pl = conf.count(">>> pdg-adblock managed block (plugins)")
+    n_sq = conf.count(">>> pdg-adblock managed block (internal_sequence)")
+    if n_pl == 0 and n_sq == 0:
+        if intent:
+            return ("fail", name, "profile 里写着已启用, 但 mosdns 配置里根本没有去广告受管块 "
+                                  "—— 意图与实际状态不一致。跑 sudo pdg update 装上受管块。")
+        return None                                # 没装也没启用: 不适用, 不显示
+    if n_pl != 1 or n_sq != 1:
+        return ("fail", name, "去广告受管块数量异常(plugins=%d sequence=%d)—— 半安装或重复安装, "
+                              "请人工核对 %s。" % (n_pl, n_sq, MOSDNS_CONF))
+
+    # 位置: 必须排在缓存命中终止点之前。排在其后, 缓存命中时整条判据不会被执行。
+    seq = conf.split("- tag: internal_sequence", 1)[-1].split(chr(10) + "  - tag: ", 1)[0]
+    ipos, cpos = seq.find("adblock"), seq.find("$lazy_cache")
+    if ipos < 0 or cpos < 0:
+        return ("warn", name, "解析不出受管块与缓存的相对位置 —— 本项无结论")
+    if ipos > cpos:
+        return ("fail", name, "去广告判据排在 $lazy_cache 之后 —— 缓存命中会绕过阻断"
+                              "(lazy_cache_ttl 86400, 最长一天)。")
+
+    missing = [p for p in (os.path.join(ADBLOCK_STATE_DIR, "infra_allow.txt"),
+                           os.path.join(ADBLOCK_STATE_DIR, "effective_block.txt"),
+                           os.path.join(ADBLOCK_STATE_DIR, "effective_list.txt"),
+                           ADBLOCK_USER_ALLOW, ADBLOCK_USER_BLOCK) if not os.path.exists(p)]
+    if missing:
+        return ("fail", name, "domain_set 需要的规则文件缺失, mosdns 会 FATAL 退出: %s"
+                % ", ".join(os.path.basename(x) for x in missing[:3]))
+
+    def _n(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                return sum(1 for l in f if l.strip() and not l.startswith("#"))
+        except OSError:
+            return -1
+
+    eff_b, eff_l = _n(os.path.join(ADBLOCK_STATE_DIR, "effective_block.txt")), \
+                   _n(os.path.join(ADBLOCK_STATE_DIR, "effective_list.txt"))
+    # 基础设施保护闭包: 已配 ACME DNS provider 却枚举不出它的 API 域名时, 这条功能
+    # **不该被启用**(理由见 adblock.infra_closure 的注释)。停用态下这不是故障, 但也不是
+    # "没问题" —— 是"能不能安全启用, 本项没有结论", 所以判 warn 而不是 ok。
+    ab_mod = _adblock_mod()
+    closure = None
+    if ab_mod is not None:
+        try:
+            closure = ab_mod.infra_closure(ACME_HOME_DIR, ADBLOCK_USER_ALLOW)
+        except Exception:                              # noqa: BLE001
+            closure = None
+
+    if not intent:
+        if eff_b > 0 or eff_l > 0:
+            return ("fail", name, "profile 里是停用, 但生效中的表还有 %d+%d 条 —— "
+                                  "状态漂移, 跑 sudo pdg adblock disable 收敛。" % (eff_b, eff_l))
+        if closure is not None and not closure.get("complete"):
+            return ("warn", name, "未启用。另: 基础设施保护列表**不完整**(%s)—— 这台机器上"
+                                  "能不能安全启用去广告, 本项**无结论**。" % closure.get("detail", ""))
+        return ("ok", name, "未启用(受管块在位, 生效表为空 —— 解析行为与不装这个功能时一致)")
+
+    if eff_b <= 0 and eff_l <= 0:
+        return ("fail", name, "profile 里写着已启用, 但生效中的表是空的 —— 此刻一条都拦不住。"
+                              "跑 sudo pdg adblock update 取表, 或 disable 把意图也改掉。")
+    # 已启用 + 闭包不完整 = 那个 provider 的 API 域名此刻可能正被第三方表拦着,
+    # 而证书续期的失败是静默的。这是 fail, 不是 warn。
+    if closure is not None and not closure.get("complete"):
+        return ("fail", name, "已启用, 但基础设施保护列表**不完整**(%s)—— 该 provider 的 API "
+                              "域名可能被第三方表拦掉, 证书续期会静默失败。"
+                              "跑 sudo pdg adblock disable, 或改用受支持的 DNS provider。"
+                              % closure.get("detail", ""))
+    ab = ab_mod
+    if ab is None:
+        return ("warn", name, "取不到 adblock 模块, 表龄与来源本次没查(拦截本身仍在生效)")
+    stale = ab.list_is_stale(ADBLOCK_STATE_DIR)
+    meta = ab.read_meta(ADBLOCK_STATE_DIR)
+    note = ""
+    try:
+        with open(os.path.join(ADBLOCK_STATE_DIR, "infra.note"), encoding="utf-8") as f:
+            note = f.read().strip()
+    except OSError:
+        pass
+    if stale is None:
+        return ("warn", name, "已启用(block %d / list %d 条), 但读不出表的更新时间 —— "
+                              "是否过期本项无结论。" % (eff_b, eff_l))
+    if stale:
+        return ("warn", name, "已启用(block %d / list %d 条), 但第三方表更新于 %s, 已经过期 —— "
+                              "跑 sudo pdg adblock update。" % (eff_b, eff_l, meta.get("updated", "?")))
+    msg = "已启用: 用户 block %d 条 + 第三方表 %d 条, 更新于 %s" % (eff_b, eff_l, meta.get("updated", "?"))
+    if note:
+        return ("warn", name, msg + "。⚠️ 基础设施白名单有枚举不到的类别(不猜, 也不放行整个"
+                                    "公共域): %s —— 这些域名不在保护内。" % note)
+    return ("ok", name, msg)
+
+
 def check_mosdns_ratelimit():
     """单客户端 QPS 兜底(rate_limiter)是否就位且参数/动作正确:
     插件 client_limiter 是 rate_limiter 且 qps200/burst400/mask4-32/mask6-128;
@@ -1027,8 +1148,14 @@ def check_mosdns_ratelimit():
     #    关键: 匹配到的 reject 5 步骤本身要在缓存之前 —— 否则"缓存前动作错(如 accept)+ 缓存后另有正确 reject 5"
     #    会被误判为 ok。故用 step.start() < i_cache 校验, 而非只看首个 !$client_limiter 的位置。
     blk = _internal_seq_block(conf)
-    i_cache = blk.find("$lazy_cache")
-    step = re.search(r'matches:\s*"?!\$client_limiter"?[ \t]*(?:#[^\n]*)?\n\s*exec:\s*reject\s+5\b', blk)
+    # **先剥注释再定位**: 受管块的说明文字里会出现 `$lazy_cache` 这样的字面量,
+    # 按原文 find 会命中注释(它排在真正的缓存那一步之前), 于是"限流在缓存前"这条
+    # 判据会把一段说明当成缓存的位置 —— 同 HANDOFF §14 那个 grep 命中注释行的形态。
+    # 两个位置必须在**同一个坐标系**里比 —— 一个在剥注释后的文本里找、另一个在原文里找,
+    # 得到的下标根本不可比(这一版就是这么错过一次)。故两者都用 blk_nc。
+    blk_nc = re.sub(r"^\s*#.*$", "", blk, flags=re.M)
+    i_cache = blk_nc.find("$lazy_cache")
+    step = re.search(r'matches:\s*"?!\$client_limiter"?[ \t]*\n\s*exec:\s*reject\s+5\b', blk_nc)
     if not step or (i_cache >= 0 and step.start() >= i_cache):
         return _RL_WARN
     return ("ok", "限流", "单客户端 QPS 兜底已就位(rate_limiter qps200/burst400, reject 5, 缓存前)")
@@ -1051,7 +1178,12 @@ def check_mosdns_explicit_proxy():
     if not conf:
         return ("warn", "指定域名优先级", "读不到 mosdns 配置")
     blk = _internal_seq_block(conf)
-    gi = blk.find("qname $explicit_proxy")
+    # 找的是**真正的分派那一步**(`goto explicit_proxy_seq`), 不是任意一次 `explicit_proxy`
+    # 的出现。v1.11.0 的去广告受管块里有一句 `!qname $explicit_proxy`(用户显式分流对第三方
+    # 表免疫), 它排在这条判断**之前** —— 按"第一次出现"找会命中那一句, 于是"顺序反了"也
+    # 会被判成 ok。判据要盯的是分派动作, 不是名字出现在哪。
+    m_disp = re.search(r"matches:\s*qname \$explicit_proxy\s*\n\s*exec:\s*goto explicit_proxy_seq", blk)
+    gi = m_disp.start() if m_disp else -1
     ci = blk.find("qname $geosite_cn")
     has_set = re.search(r"-\s*tag:\s*explicit_proxy\s*\n\s*type:\s*domain_set", conf)
     has_seq = re.search(r"-\s*tag:\s*explicit_proxy_seq\s*\n\s*type:\s*sequence", conf)
@@ -1923,6 +2055,10 @@ def check_transactions():
 
 
 # ── 内网面板(方案 B) ─────────────────────────────────────────────────────────
+ADBLOCK_STATE_DIR = "/var/lib/privdns-gateway/adblock"
+ADBLOCK_USER_ALLOW = MOSDNS_RULES_DIR + "/adblock_allow.txt"
+ADBLOCK_USER_BLOCK = MOSDNS_RULES_DIR + "/adblock_block.txt"
+MOSDNS_CONF = "/etc/mosdns/config.yaml"
 LAN_TABLE = "/etc/privdns-gateway/lan-panels.json"
 LAN_CADDYFILE = "/etc/pdg-lan/caddy.conf"
 LAN_CERT_DIR = "/etc/pdg-lan/certs"
@@ -2278,6 +2414,7 @@ ALL = [check_platform, check_services, check_bot_credentials, check_health_timer
        check_internal_cidr, check_cidr_drift, check_nft, check_nft_input_chains, check_redirect, check_gms,
        check_tailscale_isolation, check_tailscale_residue, check_tailnet_direct_port,
        check_lan_routes, check_lan_whitelist, check_lan_proxy_routes, check_lan_cert,
+       check_adblock,
        check_mosdns_ratelimit, check_mosdns_explicit_proxy, check_ruleset_hijack,
        check_nft_extra, check_rescue_firewall, check_geosite_db, check_mem,
        check_cert, check_cert_dir_sync, check_dns, check_core_config, check_rulesets, check_rule_precedence,

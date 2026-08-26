@@ -7,6 +7,7 @@
 删三样: explicit_proxy 域名集块、explicit_proxy_seq 序列块、internal_sequence 里那道判断;
 每样连同紧挨在它上面的注释一起删。删不干净就报错退出。
 """
+import re
 import sys
 
 
@@ -43,6 +44,18 @@ def main():
         lambda l: l.strip().startswith("- matches:") or l.startswith("  - tag: "))
 
     out = "".join(lines)
+    # 去广告受管块(v1.11.0)也引用 $explicit_proxy —— 那是"第三方表不得压过用户显式分流"
+    # 那条合取。退回 v1.7.0 形态时它整段都不该在, 连同 plugins 那一段一起剥掉。
+    #
+    # 锚点只认起止标记, **前缀注释必须是可选的** —— 正是这个文件开头那条规矩。两种来源的形态
+    # 不一样: 仓库模板里受管块上面有一行"# 不要手工编辑下面这一段", 而 migrate_adblock 是拿
+    # `# >>> ... # <<<` 之间的内容整段搬过去的, 搬出来**不带**那行注释。第一版把注释写进了
+    # 必需锚点, 于是对"迁移写进去的"那一种完全空跑, 受管块留在原地 —— 表现为下面那条
+    # "仍残留 explicit_proxy" 直接把调用方的前置判成失败(e2e-migrate 场景 6b)。
+    for kind in ("plugins", "internal_sequence"):
+        out = re.sub(r"(?: *# 不要手工编辑下面这一段[^\n]*\n)?"
+                     r" *# >>> pdg-adblock managed block \(%s\)"
+                     r"[\s\S]*?# <<< pdg-adblock managed block \(%s\)\n" % (kind, kind), "", out)
     if "explicit_proxy" in out:
         sys.exit("没退回到 v1.7.0 形态: 仍残留 explicit_proxy")
     open(f, "w", encoding="utf-8").write(out)

@@ -213,7 +213,7 @@ assert_fail_rollback "受管目标 #12 安装失败" "PLATFORM=ios FAIL_NTH=12"
 # 会核对这里的 FAIL_NTH 是否等于当前全集项数, 对不上就红。改清单必须一起改这里, 否则
 # "末项失败也能回滚"这条就没被测到, 而它恰恰是最容易漏的那一项。
 # 沿革: 6.1C 加 nftlive.py, 6.2B 加 dotwitness.py, 内网面板加 lanroute.py + lanpanel.py。
-assert_fail_rollback "受管目标 #35 安装失败" "PLATFORM=ios FAIL_NTH=35"
+assert_fail_rollback "受管目标 #36 安装失败" "PLATFORM=ios FAIL_NTH=36"   # 末项序号 = iOS 清单长度; 加模块时必须跟着改(见 HANDOFF §10.5)
 
 # Android: 这几个 iOS 专属文件根本不该被安装 → 即使注入同名失败也不影响更新。
 # probe81.py 不在此列了 —— 它现在 Android 也装, 装失败必须回滚(见上面的公共件循环)。

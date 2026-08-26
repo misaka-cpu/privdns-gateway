@@ -624,8 +624,15 @@ source "$REPO_DIR/lib/preserve.sh"
 _kept_rules=(); _new_rules=()
 # ruleset_hijack: 启用中的规则集所需的劫持域名(与 custom_hijack 一起构成"明确代理集")。
 # 目前是预留的空文件槽位 —— explicit_proxy 域名集要求文件存在, 缺了 mosdns 起不来。
-for _rf in custom_direct custom_hijack ruleset_hijack unlock mitm_hijack; do
+for _rf in custom_direct custom_hijack ruleset_hijack unlock mitm_hijack adblock_allow adblock_block; do
   if pdg_keep_or_init "/etc/mosdns/rules/$_rf.txt"; then _kept_rules+=("$_rf"); else _new_rules+=("$_rf"); fi
+done
+# 去广告的三个编译产物/生成物在 /var/lib(可再生, 有意不进全局快照)。
+# 四个 domain_set 都要求文件存在 —— 缺一个 mosdns 直接 FATAL, 所以这里一律建成空文件。
+install -d -m755 /var/lib/privdns-gateway/adblock
+for _af in infra_allow effective_block effective_list; do
+  [[ -e "/var/lib/privdns-gateway/adblock/$_af.txt" ]] || : > "/var/lib/privdns-gateway/adblock/$_af.txt"
+  chmod 644 "/var/lib/privdns-gateway/adblock/$_af.txt"
 done
 (( ${#_kept_rules[@]} )) && c_g "保留已有规则集: ${_kept_rules[*]}"
 (( ${#_new_rules[@]} ))  && echo "新建空规则集: ${_new_rules[*]}"

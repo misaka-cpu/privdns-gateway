@@ -82,6 +82,13 @@ def v170_template():
     s = re.sub(r"  # 明确代理集:[\s\S]*?(?=  - tag: ecs_china\n)", "", s)
     s = re.sub(r"  # 明确代理域名的劫持序列[\s\S]*?(?=  - tag: internal_sequence\n)", "", s)
     s = re.sub(r"      # 用户点名指到出口的域名[\s\S]*?exec: goto explicit_proxy_seq\n", "", s)
+    # 去广告受管块(v1.11.0)也引用 $explicit_proxy —— 那是"第三方表不得压过用户显式分流"
+    # 那条合取。重建 v1.7.0 形态时它整段都不该在, 所以连同 plugins 那一段一起摘掉;
+    # 摘不干净会立刻表现为下面那条"仍残留 explicit_proxy"。
+    s = re.sub(r" *# 不要手工编辑下面这一段[^\n]*\n *# >>> pdg-adblock managed block \(plugins\)"
+               r"[\s\S]*?# <<< pdg-adblock managed block \(plugins\)\n", "", s)
+    s = re.sub(r" *# 不要手工编辑下面这一段[^\n]*\n *# >>> pdg-adblock managed block \(internal_sequence\)"
+               r"[\s\S]*?# <<< pdg-adblock managed block \(internal_sequence\)\n", "", s)
     rebuilt = s.encode()
     if b"explicit_proxy" in rebuilt:
         bad("重建 v1.7.0 模板失败: 摘除后仍残留 explicit_proxy")

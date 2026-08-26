@@ -3568,6 +3568,10 @@ run_all_migrations(){
   migrate_health_timer || rc=1   # 定时器排不出下一次 = 健康自检静默停摆, 必须让更新回滚
   migrate_mosdns_hijack_shape || true
   migrate_mosdns_explicit_proxy || true
+  # **必须排在 explicit_proxy 之后**: 去广告受管块里写着 `!qname $explicit_proxy`, 那个 tag 是
+  # 上一行装的。排在它前面的话, 一台还没有明确代理层的老机器会被插进一个引用不存在插件的块 ——
+  # mosdns 起不来, 迁移整份还原并返回 1, 整次更新回滚, 这台机器就再也升不上去了。
+  migrate_adblock || rc=1   # 去广告受管块(默认关闭; 失败要让整次更新回滚)
   migrate_ruleset_hijack || true
   migrate_nft_extra || true
   migrate_custom_hijack || true
@@ -5754,6 +5758,340 @@ _lan_nft_reapply(){
   return 0
 }
 
+# ══ DNS 去广告(可选, 默认关闭)═══════════════════════════════════════════════
+ADB_STATE_DIR="/var/lib/privdns-gateway/adblock"
+ADB_USER_ALLOW="/etc/mosdns/rules/adblock_allow.txt"
+ADB_USER_BLOCK="/etc/mosdns/rules/adblock_block.txt"
+ADB_MARK_PL=">>> pdg-adblock managed block (plugins)"
+ADB_MARK_SQ=">>> pdg-adblock managed block (internal_sequence)"
+
+# profile.env 里的启用意图(读不到 = 空 = 未启用)
+_adblock_intent(){ sed -n 's/^[[:space:]]*PDG_ADBLOCK_ENABLED=//p' "$PROFILE_ENV" 2>/dev/null | tail -1; }
+
+# 四个 domain_set 文件必须常驻(空文件可以)。缺一个 mosdns 直接 FATAL 退出 —— 这是
+# "规则文件为空是可接受的降级, 规则文件缺失是致命的"那条老规矩。
+_adblock_ensure_files(){
+  install -d -m755 "$ADB_STATE_DIR" 2>/dev/null || return 1
+  local f
+  for f in "$ADB_STATE_DIR/infra_allow.txt" "$ADB_STATE_DIR/effective_block.txt" \
+           "$ADB_STATE_DIR/effective_list.txt"; do
+    [[ -e "$f" ]] || : > "$f"; chmod 644 "$f" 2>/dev/null
+  done
+  for f in "$ADB_USER_ALLOW" "$ADB_USER_BLOCK"; do
+    [[ -e "$f" ]] || : > "$f"
+    # 与同目录其它规则文件同权限(custom_hijack.txt 等)
+    chmod 644 "$f" 2>/dev/null; chown root:root "$f" 2>/dev/null || true
+  done
+}
+
+# 基础设施白名单: 从**权威本机状态**枚举, 不手写一份会过期的名单。
+# 枚举不到的那一类**不猜、也不用宽泛后缀放行整个公共域** —— 缺哪一类如实记进 .note,
+# doctor 据此判 WARN + 无结论。
+_adblock_gen_infra(){
+  _adblock_ensure_files || return 1
+  local tmp note; tmp="$(mktemp)" || return 1; note=""
+  # ① 本机 DoT 域名(唯一真源)
+  local dom; dom="$(tr -d '[:space:]' < /opt/pdg-bot/dot-domain 2>/dev/null)"
+  if [[ -n "$dom" ]]; then printf 'domain:%s\n' "$dom" >> "$tmp"; else note="$note dot"; fi
+  # ② 内网面板域名(面板表是真源)
+  if [[ -s /etc/privdns-gateway/lan-panels.json ]]; then
+    python3 -c 'import json,sys
+try: d=json.load(open("/etc/privdns-gateway/lan-panels.json"))
+except Exception: sys.exit(0)
+for p in d.get("panels",[]):
+    h=p.get("host")
+    if h: print("domain:%s"%h.strip().lower().rstrip("."))' >> "$tmp" 2>/dev/null
+  fi
+  # ③ WLOC / MITM 接管域名(mitm_hijack.txt 是真源)
+  if [[ -s /etc/mosdns/rules/mitm_hijack.txt ]]; then
+    sed 's/^[[:space:]]*//; s/[[:space:]]*$//' /etc/mosdns/rules/mitm_hijack.txt \
+      | grep -vE '^$|^#' | sed 's|^domain:||; s|^full:||' | sed 's|^|domain:|' >> "$tmp"
+  fi
+  # ④ 更新源(从仓库 remote 取主机名, 不写死)
+  local rurl rhost
+  rurl="$(git -C "${REPO_DIR:-/opt/privdns-gateway}" remote get-url origin 2>/dev/null)"
+  rhost="$(sed -E 's|^[a-z]+://||; s|^[^@]*@||; s|[:/].*$||' <<<"$rurl")"
+  if [[ -n "$rhost" ]]; then printf 'domain:%s\n' "$rhost" >> "$tmp"; else note="$note update-src"; fi
+  # ⑤ 证书/ACME: 已签发的域名 + acme 目录服务器主机名
+  local d2
+  for d2 in /etc/letsencrypt/live/*/; do
+    [[ -d "$d2" ]] || continue
+    printf 'domain:%s\n' "$(basename "$d2")" >> "$tmp"
+  done
+  local acme_host=""
+  if [[ -s /opt/pdg-acme/account.conf ]]; then
+    acme_host="$(grep -oE 'https://[a-zA-Z0-9.-]+' /opt/pdg-acme/account.conf 2>/dev/null | head -1 | sed 's|https://||')"
+  fi
+  if [[ -z "$acme_host" ]]; then
+    acme_host="$(grep -rhoE 'https://[a-zA-Z0-9.-]*acme[a-zA-Z0-9.-]*' /etc/letsencrypt/renewal/*.conf 2>/dev/null | head -1 | sed 's|https://||')"
+  fi
+  if [[ -n "$acme_host" ]]; then printf 'domain:%s\n' "$acme_host" >> "$tmp"; else note="$note acme"; fi
+  # ⑥ DNS 服务商 API: 交给 adblock.py 的 infra_closure 判定 —— 那里有受支持 provider 的
+  #    显式表, 外加与安装的 dnsapi 脚本做交叉核对。**枚举不到就不写**, 也不猜:
+  #    猜一个 api.<provider>.com 等于放行一整个公共域。
+  #    (早先这里读的是 /opt/pdg-acme/account.conf 里的 dns_ 字样 —— 位置就是错的:
+  #     本项目以 `--home <家>/data` 调 acme.sh, provider 记在每域名的 Le_Webroot 里。)
+  local _mod _cl
+  if _mod="$(_pdg_module adblock.py)"; then
+    _cl="$(python3 -c 'import json,sys,importlib.util
+spec=importlib.util.spec_from_file_location("a", sys.argv[1]); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+print(json.dumps(m.infra_closure(sys.argv[2], sys.argv[3]), ensure_ascii=False))' "$_mod" "$ACME_HOME" "$ADB_USER_ALLOW" 2>/dev/null)"
+    if [[ -n "$_cl" ]]; then
+      python3 -c 'import json,sys
+d=json.loads(sys.argv[1])
+for h in d.get("hosts") or []: print("domain:%s" % h)' "$_cl" >> "$tmp" 2>/dev/null
+      printf '%s' "$_cl" > "$ADB_STATE_DIR/infra.closure.json"
+      python3 -c 'import json,sys; sys.exit(0 if json.loads(sys.argv[1]).get("complete") else 1)' "$_cl" \
+        || note="$note dns-api"
+    else
+      note="$note dns-api"
+    fi
+  else
+    note="$note dns-api"
+  fi
+
+  LC_ALL=C sort -u "$tmp" -o "$tmp"
+  install -m644 "$tmp" "$ADB_STATE_DIR/infra_allow.txt" || { rm -f "$tmp"; return 1; }
+  printf '%s\n' "${note# }" > "$ADB_STATE_DIR/infra.note"
+  rm -f "$tmp"
+  return 0
+}
+
+# 编译产物 → 重启 mosdns → 校验。失败要把编译产物退回去。
+_adblock_apply(){
+  local want="$1" mod bak_b bak_l
+  mod="$(_pdg_module adblock.py)" || { c_y "❌ 找不到 adblock.py"; return 1; }
+  bak_b="$(mktemp)"; bak_l="$(mktemp)"
+  cp -a "$ADB_STATE_DIR/effective_block.txt" "$bak_b" 2>/dev/null
+  cp -a "$ADB_STATE_DIR/effective_list.txt"  "$bak_l" 2>/dev/null
+  if ! python3 "$mod" compile "$want" "$ADB_STATE_DIR" >/dev/null 2>&1; then
+    c_y "❌ 编译规则失败(现网未改动)"; rm -f "$bak_b" "$bak_l"; return 1
+  fi
+  systemctl restart mosdns 2>/dev/null; sleep 1
+  if ! systemctl is-active --quiet mosdns; then
+    c_y "❌ mosdns 重启失败 → 退回上一份编译产物。"
+    cp -a "$bak_b" "$ADB_STATE_DIR/effective_block.txt" 2>/dev/null
+    cp -a "$bak_l" "$ADB_STATE_DIR/effective_list.txt" 2>/dev/null
+    systemctl restart mosdns 2>/dev/null
+    rm -f "$bak_b" "$bak_l"; return 1
+  fi
+  rm -f "$bak_b" "$bak_l"
+  return 0
+}
+
+_adblock_status(){
+  local intent count updated
+  intent="$(_adblock_intent)"; [[ "$intent" == 1 ]] || intent=0
+  # 路径经 **argv** 传进去, 不再插进 Python 字符串字面量。
+  # 今天 ADB_STATE_DIR 是固定常量, 插值不可利用 —— 但那正是"变量一旦可变就变成注入"的
+  # 形状, 而这个文件里其它地方都已经走 argv 了, 留一处例外只会让下一个人照抄。
+  count="$(python3 -c 'import json,sys
+try: print(json.load(open(sys.argv[1] + "/meta.json")).get("count",0))
+except Exception: print(0)' "$ADB_STATE_DIR" 2>/dev/null)"
+  updated="$(python3 -c 'import json,sys
+try: print(json.load(open(sys.argv[1] + "/meta.json")).get("updated","(无)"))
+except Exception: print("(无)")' "$ADB_STATE_DIR" 2>/dev/null)"
+  echo "  启用意图: $([[ "$intent" == 1 ]] && echo 已启用 || echo 未启用)"
+  echo "  第三方表: $count 条, 更新于 $updated"
+  echo "  用户 allow: $(grep -vce '^$|^#' "$ADB_USER_ALLOW" 2>/dev/null || echo 0) 条   用户 block: $(grep -vce '^$|^#' "$ADB_USER_BLOCK" 2>/dev/null || echo 0) 条"
+  echo "  生效中的表: block $(grep -vce '^$|^#' "$ADB_STATE_DIR/effective_block.txt" 2>/dev/null || echo 0) 条 / list $(grep -vce '^$|^#' "$ADB_STATE_DIR/effective_list.txt" 2>/dev/null || echo 0) 条"
+  local note; note="$(cat "$ADB_STATE_DIR/infra.note" 2>/dev/null)"
+  [[ -n "$note" ]] && c_y "  ⚠️ 基础设施白名单有枚举不到的类别(不猜, 也不放行整个公共域): $note"
+  # 点名 provider 类型 —— 但只出**插件名**, 不出 token / 账号 / zone。
+  # **自己现算一次**, 不依赖 enable 时落下的缓存: status 是只读命令, 用户完全可能在
+  # 从没成功启用过的机器上先看一眼状态, 那时缓存根本不存在, 而"provider 是什么"恰恰
+  # 是他最需要知道的一行。现算不写盘。
+  local cj mod2; cj=""
+  if mod2="$(_pdg_module adblock.py)"; then
+    cj="$(python3 -c 'import json,sys,importlib.util
+spec=importlib.util.spec_from_file_location("a", sys.argv[1]); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+print(json.dumps(m.infra_closure(sys.argv[2], sys.argv[3]), ensure_ascii=False))' "$mod2" "$ACME_HOME" "$ADB_USER_ALLOW" 2>/dev/null)"
+  fi
+  [[ -n "$cj" ]] || cj="$(cat "$ADB_STATE_DIR/infra.closure.json" 2>/dev/null)"
+  if [[ -n "$cj" ]]; then
+    python3 -c 'import json,sys
+d=json.loads(sys.argv[1]); p=d.get("provider")
+if p is None: print("  ACME DNS provider: 未配置(无需保护其 API 域名)")
+elif d.get("complete"): print("  ACME DNS provider: %s —— API 域名已纳入保护(%s)" % (p, ", ".join(d.get("hosts") or [])))
+else: print("  ACME DNS provider: %s —— **无法枚举其 API 域名, 保护列表不完整**" % p)' "$cj" 2>/dev/null
+  fi
+  return 0
+}
+
+cmd_adblock(){
+  local sub="${1:-status}"; shift 2>/dev/null || true
+  case "$sub" in
+    status|"") _adblock_ensure_files >/dev/null 2>&1; _adblock_status;;
+    enable)
+      need_root adblock; _adblock_ensure_files || return 1
+      _adblock_gen_infra || { c_y "❌ 基础设施白名单生成失败 —— 不启用(宁可不拦, 也不能误杀自己的域名)。"; return 1; }
+      # **基础设施闭包门(fail-closed)。**已经配了 ACME DNS provider, 却枚举不出它的 API
+      # 域名时, 拒绝启用 —— 不是 WARN 之后照样开。那个域名一旦落进第三方广告表, 证书续期
+      # 会**静默失败**: 不是某个网站打不开那种一眼可见的故障, 而是几十天后所有面板同时
+      # 证书过期, 全程零告警(同 v1.10.14 修的"续期是哑的", 只是触发源换了)。
+      # 没配 provider 是正常情形, 照常继续 —— "枚举不到"与"没有"必须分开。
+      local _cj _cok=1 _cprov="" _cdet=""
+      _cj="$(cat "$ADB_STATE_DIR/infra.closure.json" 2>/dev/null)"
+      if [[ -n "$_cj" ]]; then
+        python3 -c 'import json,sys; sys.exit(0 if json.loads(sys.argv[1]).get("complete") else 1)' "$_cj" || _cok=0
+        _cprov="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("provider") or "")' "$_cj" 2>/dev/null)"
+        _cdet="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("detail") or "")' "$_cj" 2>/dev/null)"
+      fi
+      if [[ "$_cok" != 1 ]]; then
+        c_y "❌ 基础设施保护列表不完整 —— **去广告没有被启用**。"
+        c_y "   provider: ${_cprov:-未知}"
+        c_y "   $_cdet"
+        c_y "   为什么拦住: 拦不住的话, 这个 provider 的 API 域名可能被第三方广告表挡掉,"
+        c_y "   证书续期会从此静默失败 —— 几十天后所有面板同时证书过期, 期间没有任何告警。"
+        c_y "   证书与现有 DNS 服务**未被改动**; 用户 allow/block 与已下载的表也未被改动。"
+        c_y "   可以怎么做: 改用受支持的 DNS provider、或不用 DNS-01 这条证书路径、或等待本产品支持它。"
+        c_y "   注意: 自己往 allow 里加一条**不算**产品已经认全了该 provider 的 API 域名。"
+        return 1
+      fi
+      # 必须先有可用的表: 没有候选也没有 LKG 就启用, 等于开了个空壳
+      if [[ ! -s "$ADB_STATE_DIR/list.lkg" && ! -s "$ADB_USER_BLOCK" ]]; then
+        c_y "❌ 既没有第三方表(先跑 pdg adblock update), 也没有用户 block 规则 —— 保持关闭。"
+        return 1
+      fi
+      _adblock_apply 1 || { c_y "❌ 启用失败, 保持关闭状态。"; _adblock_apply 0 >/dev/null 2>&1; return 1; }
+      _profile_set PDG_ADBLOCK_ENABLED 1 || { c_y "⚠️ profile.env 写入失败, 启用意图未持久化。"; return 1; }
+      c_g "✅ DNS 去广告已启用。"; _adblock_status;;
+    disable)
+      need_root adblock; _adblock_ensure_files || return 1
+      _adblock_apply 0 || return 1
+      _profile_set PDG_ADBLOCK_ENABLED 0 || c_y "⚠️ profile.env 写入失败。"
+      c_g "✅ DNS 去广告已停用(用户规则与已下载的表都保留, 随时可以再 enable)。";;
+    update)
+      need_root adblock; _adblock_ensure_files || return 1
+      local mod out; mod="$(_pdg_module adblock.py)" || return 1
+      out="$(python3 "$mod" update "$ADB_STATE_DIR" 2>&1)"
+      if grep -q '"ok": *true' <<<"$out"; then
+        c_g "✅ 规则表已更新。"
+        [[ "$(_adblock_intent)" == 1 ]] && { _adblock_apply 1 || return 1; }
+        _adblock_status
+      else
+        c_y "⚠️ 更新失败, **继续使用上一份可用的表**(不会切成空表):"
+        sed 's/^/    /' <<<"$out" | head -3
+        return 1
+      fi;;
+    check)
+      # **恰好一个参数。**多给一个多半是引号没打对(`check "a b"` 写成了 `check a b`),
+      # 那时按第一个参数回答等于对着一个用户没打算问的东西给出确定结论。
+      if [[ $# -ne 1 || -z "${1:-}" ]]; then
+        echo "用法: pdg adblock check <域名>   (恰好一个参数)"; return 1
+      fi
+      local d="$1"
+      local mod; mod="$(_pdg_module adblock.py)" || return 1
+      # 先过输入契约。**管道会吞掉退出码**, 所以这里先落到变量再判 —— 原实现正是把
+      # `python3 … | python3 …` 的成败丢掉了, 于是非法输入也一路走到"是否阻断"。
+      local raw rc=0
+      raw="$(python3 "$mod" check "$d" "$ADB_STATE_DIR" "$(dirname "$ADB_USER_ALLOW")" 2>/dev/null)" || rc=$?
+      if [[ "$rc" != 0 ]]; then
+        # 不回显原始输入 —— 它可能含 shell 标点或换行, 复述一遍等于把危险内容又抄进
+        # 日志与用户的排障截图。只说是哪一类不合法。
+        c_y "❌ 域名格式无效: $(python3 -c 'import json,sys
+try: print(json.loads(sys.argv[1]).get("why","(未说明)"))
+except Exception: print("(未说明)")' "$raw" 2>/dev/null)"
+        c_y "   只接受一个 ASCII 域名(可带一个末尾点)。未做任何判定。"
+        return 2
+      fi
+      python3 -c 'import json,sys
+r=json.loads(sys.argv[1])
+print("  域名      : %s" % sys.argv[2])
+print("  是否阻断  : %s" % ("是" if r.get("blocked") else "否"))
+print("  命中层级  : %s" % (r.get("layer") or "无命中"))
+print("  命中规则  : %s" % (r.get("rule") or "-"))' "$raw" "$d"
+      local meta; meta="$(cat "$ADB_STATE_DIR/meta.json" 2>/dev/null)"
+      echo "  表版本    : $(python3 -c 'import json,sys
+try: d=json.loads(sys.argv[1] or "{}"); print("%s 条, 更新于 %s, 来源 %s" % (d.get("count","?"), d.get("updated","?"), d.get("source","?")))
+except Exception: print("(读不到元数据)")' "$meta" 2>/dev/null)"
+      echo "  使用 LKG  : $([[ -s "$ADB_STATE_DIR/list.lkg" ]] && echo 是 || echo 否)";;
+    *)
+      echo "用法: pdg adblock <status|enable|disable|update|check <域名>>";;
+  esac
+}
+
+# 受管块迁移: 老机器的 mosdns 配置里没有这两段(pdg update 从不用模板重渲那个文件)。
+# 锚点缺失或重复一律 fail-closed —— 半安装的受管块比没装更难查。
+migrate_adblock(){
+  local mos=/etc/mosdns/config.yaml
+  [[ -f "$mos" ]] || return 0                     # 没装 mosdns 的机器不归这条管
+  # 形态判定全是只读的, 放在任何写入之前 —— 判定要跳过时, 这台机器上一个字节都不该被动过。
+  local n_pl n_sq
+  n_pl="$(grep -c "$ADB_MARK_PL" "$mos" 2>/dev/null)"; n_sq="$(grep -c "$ADB_MARK_SQ" "$mos" 2>/dev/null)"
+  if [[ "$n_pl" -gt 1 || "$n_sq" -gt 1 ]]; then
+    c_y "  ❌ mosdns 配置里 pdg-adblock 受管块出现多次(plugins=$n_pl sequence=$n_sq) —— 不自动修改, 请人工核对。"
+    return 1
+  fi
+  if [[ "$n_pl" != "$n_sq" ]]; then
+    c_y "  ❌ 受管块只装了一半(plugins=$n_pl sequence=$n_sq) —— 半安装比没装更糟, 不自动修补。"
+    return 1
+  fi
+  if [[ "$n_pl" == 1 && "$n_sq" == 1 ]]; then
+    # 已经装好: 不改配置, 但仍要把 domain_set 的输入文件补齐 —— 受管块在场而文件被删掉的话
+    # mosdns 起不来, 这是每次更新都该做的自愈, 不能因为"无事可做"就跳过。
+    _adblock_ensure_files || { c_y "  ❌ 受管块在场, 但去广告规则文件建不出来 —— mosdns 可能起不来。"; return 1; }
+    return 0
+  fi
+  # 前置依赖: 受管块对外只引用一个 tag —— `$explicit_proxy`(由 migrate_mosdns_explicit_proxy 装)。
+  # 调用顺序已经把它排在前面, 但那一支是 `|| true`, 允许自己跳过(pdgtx 卡在待收尾 / 配置形态
+  # 不认识)。所以这里不能假设它成功, 必须自己确认 tag 真的定义了。不在就**跳过**而不是报错:
+  # 插一个引用不存在插件的块会让 mosdns 起不来 → 整次更新回滚 → 这台机器再也升不上去。
+  # 跳过是可恢复的: 等 explicit_proxy 到位, 下一次 pdg update 会把受管块补上。
+  # 判据用 `- tag: explicit_proxy` 的**定义**(锚到行尾, 免得匹配上 explicit_proxy_seq),
+  # 而不是它有没有被引用 —— 让引用合法的是定义, 不是用法。
+  # 位置也是判据的一部分: 它必须排在**所有写入之前**, 包括建规则文件那一步。
+  if ! grep -qE '^ *- tag: explicit_proxy$' "$mos"; then
+    c_y "  [去广告] 这台的 mosdns 还没有 explicit_proxy 明确代理层 —— 本次跳过受管块安装"
+    c_y "           (去广告功能暂不可用; 等明确代理层到位后, 下一次 pdg update 会自动补上)。"
+    return 0
+  fi
+  _adblock_ensure_files || { c_y "  ❌ 去广告规则文件建不出来, 不动 mosdns 配置。"; return 1; }
+  local tmpl="$REPO_DIR/deploy/mosdns/config.yaml"
+  [[ -f "$tmpl" ]] || { c_y "  ❌ 部署源缺 mosdns 模板, 不改现网。"; return 1; }
+  local work; work="$(mktemp -d)" || return 1
+  if ! python3 - "$mos" "$tmpl" "$work/candidate.yaml" <<'PYEOF'
+import re, sys
+live, tmpl, out = sys.argv[1], sys.argv[2], sys.argv[3]
+t = open(tmpl, encoding="utf-8").read()
+cur = open(live, encoding="utf-8").read()
+def block(text, kind):
+    m = re.search(r"( *# >>> pdg-adblock managed block \(%s\).*?# <<< pdg-adblock managed block \(%s\)\n)"
+                  % (kind, kind), text, re.S)
+    return m.group(1) if m else None
+pl, sq = block(t, "plugins"), block(t, "internal_sequence")
+if not pl or not sq:
+    sys.exit("模板里找不到受管块")
+# plugins: 插在 force_hijack_seq 定义之前; sequence: 插在 $lazy_cache 之前
+anc_pl = "  # MITM 接管域名的劫持序列"
+anc_sq = "      - exec: $lazy_cache\n"
+if anc_pl not in cur or anc_sq not in cur:
+    sys.exit("现网配置里找不到插入锚点(这台的 mosdns 配置形态不认识)")
+cur = cur.replace(anc_pl, pl + anc_pl, 1)
+cur = cur.replace(anc_sq, sq + anc_sq, 1)
+open(out, "w", encoding="utf-8").write(cur)
+PYEOF
+  then
+    c_y "  ❌ 去广告受管块候选生成失败, 现网未改动。"; rm -rf "$work"; return 1
+  fi
+  # 候选的正确性靠**落盘后真的重启一次**来判 —— 与 pdg.sh 里其它改 mosdns 配置的地方
+  # 同一口径(见 cache 调整那两处): 先备份, 再落盘, 起不来就整份还原。
+  # 不在这里跑 `mosdns start` 做预检: 它是常驻进程, 用"超时没退出"当合法证据是假判据,
+  # 而真正的失败(端口占用/权限)在预检里也复现不出来。
+  local bak; bak="$mos.pre-adblock.$(date +%s)"
+  cp -a "$mos" "$bak" || { rm -rf "$work"; return 1; }
+  install -m644 "$work/candidate.yaml" "$mos" || { rm -rf "$work"; return 1; }
+  systemctl restart mosdns 2>/dev/null; sleep 1
+  if ! systemctl is-active --quiet mosdns; then
+    c_y "  ❌ 装上去广告受管块后 mosdns 起不来 → 已还原。"
+    cp -a "$bak" "$mos"; systemctl restart mosdns 2>/dev/null
+    rm -rf "$work"; return 1
+  fi
+  rm -f "$bak"; rm -rf "$work"
+  c_g "  [去广告] mosdns 受管块已装好(默认关闭, 解析行为不变)。"
+  return 0
+}
+
 cmd_lan(){
   local sub="${1:-status}"; shift 2>/dev/null || true
   case "$sub" in
@@ -6094,6 +6432,7 @@ case "${1:-menu}" in
   hijack-mode)   shift || true; cmd_hijack_mode "$@";;
   ssh-source)    shift || true; cmd_ssh_source "$@";;
   lan)           shift || true; cmd_lan "$@";;
+  adblock)       shift || true; cmd_adblock "$@";;
   link)          shift || true; cmd_link "$@";;
   uninstall|rm)  shift || true; cmd_uninstall "$@";;
   rescue)        shift || true; cmd_rescue "$@";;
