@@ -57,7 +57,9 @@ def setup():
     bot.state.clear()
     bot.edit = lambda chat, mid, text, kb=None: EDITS.append((text, kb))
     bot.edit_only = lambda chat, mid, text, kb=None: (EDITS.append((text, kb)) or True)
-    bot.send = lambda chat, text, kb=None: SENDS.append((text, kb))
+    # 生产的 send 是 `reply_markup = kb or MENU` —— mock 不照做的话, 主菜单那一格
+    # 看到的永远是 None, 判据就成了对 mock 的断言。
+    bot.send = lambda chat, text, kb=None: SENDS.append((text, kb or bot.MENU))
     bot.send_plain = lambda chat, text: PLAIN.append(text)
     bot.answer_cb_async = lambda *a, **k: None
     bot.status_text = lambda: "(主菜单)"

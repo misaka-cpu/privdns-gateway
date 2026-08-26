@@ -11,7 +11,7 @@ UI 原地编辑消息(editMessageText), 不刷屏。改 sing-box 前备份, chec
 注: 模块可被 import (供定时任务调用 refresh_rulesets), 此时无需 token。
 """
 from __future__ import annotations
-import base64, contextlib, fcntl, hashlib, http.client, io, json, os, re, shutil, socket, subprocess, sys, tarfile, tempfile, threading, time, uuid
+import base64, contextlib, fcntl, hashlib, html, http.client, io, json, os, re, shutil, socket, subprocess, sys, tarfile, tempfile, threading, time, uuid
 import concurrent.futures
 import urllib.parse, urllib.request, urllib.error
 from collections import Counter
@@ -210,7 +210,20 @@ MENU = {"inline_keyboard": [
     [{"text": "🚦 测出口", "callback_data": "test"}, {"text": "📈 流量", "callback_data": "traffic"}],
     [{"text": "📤 出口管理", "callback_data": "nav:exit"}, {"text": "📑 分流管理", "callback_data": "nav:rule"}],
     [{"text": "📱 客户端", "callback_data": "nav:client"}, {"text": "🛠 运维", "callback_data": "nav:ops"}],
+    [{"text": "🛡 去广告", "callback_data": "adblock:menu"}],
 ]}
+# 去广告二级菜单。**只有查看与用户规则**: 启用/停用与第三方表更新不在这里 —— 那两件事会
+# 改变整台网关的解析行为并重启 mosdns, 属于要人坐在终端前确认的操作, 不该是手机上一次误触。
+ADBLOCK_MENU = {"inline_keyboard": [
+    [{"text": "📊 当前状态", "callback_data": "adblock:status"}],
+    [{"text": "➕ 添加阻断规则", "callback_data": "adblock:add"},
+     {"text": "➖ 删除阻断规则", "callback_data": "adblock:del"}],
+    [{"text": "🔎 查询域名", "callback_data": "adblock:check"}],
+    [{"text": "↩️ 返回", "callback_data": "adblock:back"}],
+]}
+ADBLOCK_BACK = {"inline_keyboard": [[{"text": "⬅️ 返回去广告", "callback_data": "adblock:menu"}],
+                                    [{"text": "🏠 主菜单", "callback_data": "menu"}]]}
+ADBLOCK_CANCEL = {"inline_keyboard": [[{"text": "✖️ 取消", "callback_data": "adblock:cancel"}]]}
 BACK = {"inline_keyboard": [[{"text": "⬅️ 返回主菜单", "callback_data": "menu"}]]}
 EXIT_BACK = {"inline_keyboard": [[{"text": "⬅️ 返回出口管理", "callback_data": "nav:exit"}],
                                 [{"text": "🏠 主菜单", "callback_data": "menu"}]]}
@@ -4278,7 +4291,85 @@ def linktest_cancel(chat, mid):
     edit(chat, mid, "已取消本次测试，测试链接立即失效。", LINK_DONE_KB)
 
 
-def handle_cb(chat, mid, data):
+PDG_CLI = "/usr/local/bin/pdg"
+# 去广告结果码 → 给人看的话。**文案由结果码决定**, 不去猜 CLI 的自由输出:
+# 那是"可信接口"这四个字的全部意义所在。
+ADBLOCK_SAY = {
+    "added": "✅ 已添加",
+    "removed": "✅ 已删除",
+    "already_exists": "ℹ️ 原本已存在，未改动",
+    "not_found": "ℹ️ 原本不存在，未改动",
+    "saved_inactive": "✅ 规则已保存，但去广告当前未启用，因此尚未生效。",
+    "invalid_input": "❌ 不是一个合法域名，未做任何改动。",
+    "apply_failed_rolled_back": "❌ 应用失败，已回滚，规则未生效。",
+    "rollback_incomplete": "⚠️ 应用失败且回滚未能完整完成 —— 需要在网关上人工核对。",
+}
+
+
+def _adblock_cli(*args):
+    """经**结构化 argv** 调可信 CLI, 取它最后一行 JSON。
+
+    Bot 一个字节都不写规则文件, 也不解析中文文案 —— 只认闭集字段。解析不出 JSON 时
+    fail-closed 当成失败, 不猜"大概成功了"。
+    """
+    r = sh([PDG_CLI, "adblock", *args])
+    for line in reversed((r.stdout or "").splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                d = json.loads(line)
+            except Exception:  # noqa: BLE001
+                break
+            d["_rc"] = r.returncode
+            return d
+    return {"result": "apply_failed_rolled_back", "change": "none", "_rc": r.returncode or 1}
+
+
+def _adblock_reply(d, act):
+    """把闭集结果码翻成一句话。change 与 result 都要说到, 不能只说一半。"""
+    res = d.get("result", "")
+    parts = []
+    if res in ("saved_inactive",) and d.get("change") in ("added", "removed"):
+        parts.append("✅ 已" + ("添加" if d["change"] == "added" else "删除") + "。")
+    parts.append(ADBLOCK_SAY.get(res, "❌ 未知结果，未做任何改动。"))
+    if res == "applied":
+        parts = ["✅ 已" + ("添加" if d.get("change") == "added" else "删除")
+                 + ("，并已生效。" if d.get("restarted") else "，规则已生效（无需重启）。")]
+    if d.get("overridden_by_allow"):
+        parts.append("注意：该域名同时在你的放行名单里，放行优先，因此仍然不会被阻断。")
+    return "\n".join(parts)
+
+
+def _adblock_pending(chat, uid, kind):
+    """建立待输入状态。值里带发起者 uid —— 状态本身是 chat 键(沿用既有约定),
+    但**谁发起的就只有谁能完成**, 群里旁人发的下一条不算数。"""
+    state[chat] = "adblock_%s:%s" % (kind, uid if uid is not None else "")
+
+
+def handle_cb(chat, mid, data, uid=None):
+    # ── 去广告(闭集 callback, 不接受任意动作名)────────────────────────────────
+    if data.startswith("adblock:"):
+        act = data.split(":", 1)[1]
+        if act not in ("menu", "status", "add", "del", "check", "cancel", "back"):
+            # 未知或过期的 adblock callback: fail-closed, 什么都不做, 也不留状态。
+            state.pop(chat, None)
+            edit(chat, mid, "这个操作已失效，请重新从菜单进入。", ADBLOCK_BACK); return
+        if act in ("menu", "back", "cancel"):
+            state.pop(chat, None)          # 进菜单/返回/取消 一律放弃进行中的输入
+            if act == "back":
+                edit(chat, mid, status_text(), MENU); return
+            edit(chat, mid, "🛡 <b>DNS 去广告</b> — 选一项:", ADBLOCK_MENU); return
+        if act == "status":
+            r = sh([PDG_CLI, "adblock", "status"])
+            out = (r.stdout or "").strip() or "(读不到状态)"
+            edit(chat, mid, "📊 <b>去广告状态</b>\n<pre>" + html.escape(out) + "</pre>", ADBLOCK_BACK); return
+        kind = {"add": "add", "del": "del", "check": "check"}[act]
+        _adblock_pending(chat, uid, kind)
+        tip = {"add": "发一个要<b>阻断</b>的域名。",
+               "del": "发一个要<b>删除</b>的阻断规则域名（只删由本入口添加的那一条）。",
+               "check": "发一个域名，我查它现在会不会被阻断。"}[kind]
+        edit(chat, mid, tip + "\n/cancel 或按下面的按钮取消。", ADBLOCK_CANCEL); return
+
     # 用户对这条消息做了新操作 → 还挂在它上面的 WLOC 监听立即作废。否则用户点了「返回菜单」,
     # 30 秒后监听把菜单原地改成一句"尚未收到请求", 正看着的界面就没了。
     wloc_invalidate_watch(chat, mid)
@@ -4819,7 +4910,7 @@ def handle_cb(chat, mid, data):
         ok, msg = del_ruleset(data[6:]); edit(chat, mid, ("✅ " if ok else "") + msg, RULE_BACK); return
 
 # ── 文本 ──
-def handle_text(chat, text, mid=None):
+def handle_text(chat, text, mid=None, uid=None):
     text = text.strip()
     if text == "/cancel":
         # 首次流程收下的 SSID 一并作废 —— 取消之后再生成, 不该莫名其妙带上上次输的东西。
@@ -4894,6 +4985,23 @@ def handle_text(chat, text, mid=None):
                        else f"⚠️ 完成，规则集刷新 {n} 个，{len(rs_failed)} 个没刷上(仍用上一份好档)"); return
         send_plain(chat, "未识别命令，发 /start 打开菜单"); return
     act = state.pop(chat, None) or ""   # 无待输入时为 "", 避免下面 act.startswith(...) 在 None 上崩
+    if act.startswith("adblock_"):
+        kind, _, owner = act[len("adblock_"):].partition(":")
+        # **谁发起的只有谁能完成。**群里旁人发的下一条不算数 —— 状态已经在上面 pop 掉了,
+        # 所以这条路径不会留下可被重放的残留。
+        if owner and uid is not None and str(uid) != owner:
+            # 状态在上面已被 pop, 这里要**还回去** —— 否则群里旁人随便发一句就能把别人
+            # 正在进行的操作取消掉, 那是一条白送的骚扰路径。
+            state[chat] = act
+            send_plain(chat, "这个输入不是你发起的，已忽略。"); return
+        if kind == "check":
+            r = sh([PDG_CLI, "adblock", "check", text])
+            out = (r.stdout or "").strip() or "(没有输出)"
+            send(chat, "🔎 <pre>" + html.escape(out) + "</pre>", ADBLOCK_BACK); return
+        if kind in ("add", "del"):
+            d = _adblock_cli("rule-" + kind, text)
+            send(chat, _adblock_reply(d, kind), ADBLOCK_BACK); return
+        return
     if act == "add_exit":
         # state 已在上面 state.pop 清除 → 紧接着发的下一条不会再被当 add_exit。
         # 关键: 先无条件删含凭据(密码/uuid/服务器)的原消息 —— 独立线程, 不受 BUSY/执行器影响,
@@ -5061,7 +5169,7 @@ def main():
                     if m["from"]["id"] not in ALLOWED:
                         continue
                     if "text" in m:
-                        handle_text(m["chat"]["id"], m["text"], m.get("message_id"))
+                        handle_text(m["chat"]["id"], m["text"], m.get("message_id"), m["from"]["id"])
                     elif "document" in m:
                         handle_document(m["chat"]["id"], m["document"])
                 elif "callback_query" in u:
@@ -5069,7 +5177,7 @@ def main():
                     # 先停按钮转圈, 再跑可能较慢的 handle_cb(检查更新/测出口/自检等)。
                     answer_cb_async(q["id"])
                     if q["from"]["id"] in ALLOWED:
-                        handle_cb(q["message"]["chat"]["id"], q["message"]["message_id"], q["data"])
+                        handle_cb(q["message"]["chat"]["id"], q["message"]["message_id"], q["data"], q["from"]["id"])
             except Exception as e:  # noqa: BLE001
                 print("handle err", e, flush=True)
 
