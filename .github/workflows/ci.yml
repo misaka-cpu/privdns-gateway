@@ -199,6 +199,9 @@ jobs:
       - name: "去广告 check 的输入契约: 非法域名必须 fail-closed, 不答'未阻断'"
         run: bash tests/test-adblock-cli-input.sh
 
+      - name: "去广告受管块的迁移依赖: 排在 explicit_proxy 之后 + 缺前置时跳过而不是插坏块"
+        run: python3 tests/test-adblock-migration-order.py
+
       - name: "链路诊断采集器 (证书正常/临期/过期/错域名/损坏/误放私钥; 零写入零写锁)"
         run: python3 tests/test-link-status.py
 

@@ -650,7 +650,21 @@ e2e_stub_system(){
 mkdir -p "$D"
 echo "systemctl $*" >> "$CALLS"
 verb="$1"; shift
-now=0; [ "$1" = "--now" ] && { now=1; shift; }
+# 选项在这里一次剥干净。真 systemd 的 `--quiet` 只是**不打印**, 判定与退出码分毫不变。
+# 原来只剥 `--now`, 于是 `is-active --quiet mosdns` 里的 `--quiet` 被当成了 unit 名 ——
+# 桩回答的是一个根本不存在的 unit, 所有这么调的地方在沙箱里统统得到 inactive/rc=3。
+# 它答的恰恰是"服务起来了没有"这种承重判据: 去广告受管块迁移靠它判断新配置能不能起,
+# 于是在 e2e-migrate 的 v1.7.0 场景里被判成"装上就起不来", 整次迁移回滚 —— 而被测代码
+# 一点毛病没有。pdg.sh 里有 9 处 `is-active --quiet`(去广告与 pdg-lan)受这条影响。
+now=0; quiet=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --now)      now=1;   shift;;
+    --quiet|-q) quiet=1; shift;;
+    *) break;;
+  esac
+done
+_say(){ [ "$quiet" = 1 ] || echo "$1"; }
 
 # ── pdg-dotwitness 专用: 只有这一个 unit 起**真的生产进程** ─────────────────
 # 为什么非这么做不可: 6.2B 的状态机装完 witness 会轮询 127.0.0.1:5399 有没有真在听,
@@ -719,11 +733,11 @@ case "$verb" in
       [ -z "$v" ] && { [ -f "/etc/systemd/system/${u}.service" ] && v=1 || v=0; }
       # witness 起的是真进程: 它自己崩了就不能再说 active(真 systemd 也不会)
       if _dw_is "$u" && [ "$v" = 1 ] && ! _dw_alive; then v=0; echo 0 > "$D/${u}.ac"; fi
-      [ "$v" = 1 ] && { echo active; exit 0; }; echo inactive; exit 3;;
+      [ "$v" = 1 ] && { _say active; exit 0; }; _say inactive; exit 3;;
   is-enabled)
       u="$1"; v=$(cat "$D/${u}.en" 2>/dev/null)
       [ -z "$v" ] && { [ -f "/etc/systemd/system/${u}.service" ] && v=1 || v=0; }
-      [ "$v" = 1 ] && { echo enabled; exit 0; }; echo disabled; exit 1;;
+      [ "$v" = 1 ] && { _say enabled; exit 0; }; _say disabled; exit 1;;
   show)
       # show [-p PROP]... [--value] UNIT
       #
