@@ -202,6 +202,9 @@ jobs:
       - name: "去广告受管块的迁移依赖: 排在 explicit_proxy 之后 + 缺前置时跳过而不是插坏块"
         run: python3 tests/test-adblock-migration-order.py
 
+      - name: "去广告用户规则事务 CLI: 停用态只改源 / 幂等零重启 / 精确删除 / 失败整份回滚"
+        run: bash tests/test-adblock-rule-cli.sh
+
       - name: "链路诊断采集器 (证书正常/临期/过期/错域名/损坏/误放私钥; 零写入零写锁)"
         run: python3 tests/test-link-status.py
 
