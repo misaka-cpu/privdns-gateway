@@ -138,7 +138,15 @@ h1="$(sha256sum "$ENVF" | cut -d' ' -f1)"
 
 # 把配置改成本轮可用: 规则文件指到临时目录、监听换高位端口、证书指到临时证书
 for n in $(grep -oE '/etc/mosdns/rules/[A-Za-z0-9_.!-]+' "$RENDERED" | sed 's#.*/##' | sort -u); do : > "$WORK/rules/$n"; done
-sed -i -e "s#/etc/mosdns/rules/#$WORK/rules/#g" \
+# 去广告受管块的 domain_set 输入在 /var/lib 下, 不在 rules 目录 —— 上面那句只推导 rules/,
+# 漏掉它们的话 mosdns **缺一个文件就 FATAL**, 配置根本加载不了(exact-head run 32923836445
+# 上 8 个 E2E job 就是这么一起红的)。同样**从配置里推导**, 不写死文件名。
+mkdir -p "$WORK/adblock"
+for n in $(grep -oE '/var/lib/privdns-gateway/adblock/[A-Za-z0-9_.!-]+' "$RENDERED" | sed 's#.*/##' | sort -u); do
+  : > "$WORK/adblock/$n"; chmod 644 "$WORK/adblock/$n"
+done
+sed -i -e "s#/var/lib/privdns-gateway/adblock/#$WORK/adblock/#g" \
+       -e "s#/etc/mosdns/rules/#$WORK/rules/#g" \
        -e "s#listen: \"0.0.0.0:53\"#listen: \"127.0.0.1:$DNSP\"#g" \
        -e "s#listen: \"0.0.0.0:853\"#listen: \"127.0.0.1:$DOTP\"#g" \
        -e "s#args: {.*1\.1\.1\.1.*}#args: { concurrent: 1, upstreams: [ {addr: \"udp://127.0.0.1:$UPPORT\"} ] }#" \
