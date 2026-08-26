@@ -87,19 +87,37 @@ def all_buttons(kbs=None):
     return out
 
 
+def _guard(fn, what):
+    """handler 抛异常时记成**具名失败**, 而不是让整支测试崩掉。
+
+    崩掉的代价不只是少几条断言: 负控靠"具名失败集合有没有新增"判一格有没有牙, 而崩溃
+    产生的是 traceback 不是 [FAIL] 行 —— 于是"把守卫摘掉"这种改坏反而显示成 0 条转红,
+    看上去像判据没牙, 实际是判据根本没跑到。
+    """
+    try:
+        return fn()
+    except Exception as e:  # noqa: BLE001
+        bad("%s 抛异常 %s: %s" % (what, type(e).__name__, str(e)[:60]))
+        return None
+
+
 def cb(data, chat=1, uid=1):
     """调 handle_cb。新签名要能收 uid; 旧签名收不了就说清楚, 不静默降级。"""
-    try:
-        return bot.handle_cb(chat, 2, data, uid)
-    except TypeError:
-        return bot.handle_cb(chat, 2, data)
+    def go():
+        try:
+            return bot.handle_cb(chat, 2, data, uid)
+        except TypeError:
+            return bot.handle_cb(chat, 2, data)
+    return _guard(go, "handle_cb(%s)" % data)
 
 
 def txt(text, chat=1, uid=1):
-    try:
-        return bot.handle_text(chat, text, 3, uid)
-    except TypeError:
-        return bot.handle_text(chat, text, 3)
+    def go():
+        try:
+            return bot.handle_text(chat, text, 3, uid)
+        except TypeError:
+            return bot.handle_text(chat, text, 3)
+    return _guard(go, "handle_text")
 
 
 # ═══ 1. 入口是内联按钮, 不是 slash command ═════════════════════════════════════
@@ -136,6 +154,16 @@ stray = {d for d in datas if d.startswith("adblock") and d not in CLOSED}
 (ok if all(len(d.encode()) <= 64 for d in datas) else bad)("callback_data 长度均 ≤64 字节")
 forbidden = [d for d in datas if re.search(r"\.[a-z]{2,}|/|\d{5,}", d)]
 (ok if not forbidden else bad)("callback_data 不含域名/路径/ID(可疑: %s)" % (forbidden or "无"))
+
+# 未知 / 过期的 adblock callback 必须 fail-closed: 不建状态、不调 CLI、不改任何东西。
+setup()
+cb("adblock:nuke-everything")
+(ok if not SHELL else bad)("未知 adblock callback 不触发任何 CLI(实得 %s)" % SHELL)
+(ok if not bot.state.get(1) else bad)("未知 adblock callback 不建立待输入状态(实得 %r)" % bot.state.get(1))
+setup()
+cb("adblock:add")
+cb("adblock:bogus")
+(ok if not bot.state.get(1) else bad)("未知 callback 还会清掉进行中的状态(fail-closed)")
 
 # ═══ 3. 待输入状态 ════════════════════════════════════════════════════════════
 print()

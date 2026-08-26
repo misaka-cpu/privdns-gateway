@@ -71,6 +71,13 @@ esac
 exit 0
 S
   chmod 755 "$w/bin/systemctl"
+  # python3 记账垫片: 第三方表的下载走的是 urllib(不是 curl), 所以"有没有联网"这件事
+  # 只能从**调没调 adblock.py update** 上判。垫片记完 argv 就转交真 python3。
+  REAL_PY3="$(command -v python3)"
+  { printf '#!/usr/bin/env bash\n'
+    printf 'echo "$*" >> "$FX_ROOT/state/py"\n'
+    printf 'exec %s "$@"\n' "$REAL_PY3"; } > "$w/bin/python3"
+  chmod 755 "$w/bin/python3"
   # 联网探针: 本轮任何路径都不该调它们
   for n in curl wget; do
     printf '#!/usr/bin/env bash\necho "%s $*" >> "$FX_ROOT/state/net"\nexit 1\n' "$n" > "$w/bin/$n"
@@ -100,6 +107,8 @@ run_box(){
 blk(){ echo "$1/etc/mosdns/rules/adblock_block.txt"; }
 restarts(){ [[ -e "$1/state/restarts" ]] && wc -l < "$1/state/restarts" | tr -d ' ' || echo 0; }
 netcalls(){ [[ -e "$1/state/net" ]] && wc -l < "$1/state/net" | tr -d ' ' || echo 0; }
+# 有没有去重新下载第三方表: 看有没有人调过 `adblock.py update`
+updcalls(){ local n; n="$(grep -c 'adblock.py update' "$1/state/py" 2>/dev/null)"; echo "${n:-0}"; }
 locks(){ [[ -e "$1/state/locks" ]] && wc -l < "$1/state/locks" | tr -d ' ' || echo 0; }
 fp(){ [[ -e "$1" ]] && sha256sum "$1" 2>/dev/null | cut -c1-16 || echo "-"; }
 intent_of(){ sed -n 's/^[[:space:]]*PDG_ADBLOCK_ENABLED=//p' "$1/etc/privdns-gateway.profile" 2>/dev/null | tail -1; }
@@ -146,7 +155,8 @@ echo "══ ③ 幂等: 重复添加不写不编译不重启 ══"
 b1="$(fp "$(blk "$W")")"
 rc="$(run_box "$W" 'cmd_adblock rule-add add-me.invalid')"
 [[ "$rc" == 0 && "$(jf "$W" result)" == "already_exists" ]] \
-  && ok "重复添加 result=already_exists rc=0" || bad "rc=$rc result=$(jf "$W" result)"
+  && ok "重复添加 result=already_exists rc=0" \
+  || bad "重复添加应为 already_exists, 实得 rc=$rc result=$(jf "$W" result)"
 [[ "$(jf "$W" change)" == "none" ]] && ok "change=none" || bad "change=$(jf "$W" change)"
 [[ "$(fp "$(blk "$W")")" == "$b1" ]] && ok "源文件逐字节未变" || bad "幂等操作却改了源文件"
 [[ "$(restarts "$W")" == 0 ]] && ok "重启仍为 0 次" || bad "幂等却重启了"
@@ -208,6 +218,8 @@ grep -q 'newly-blocked.invalid' "$W/var/adblock/effective_block.txt" \
 grep -q 'lkg1.invalid' "$W/var/adblock/effective_list.txt" \
   && ok "第三方产物由现有 LKG 编译而来" || bad "没用 LKG 编译"
 [[ "$(netcalls "$W")" == 0 ]] && ok "全程零联网" || bad "联网了 $(netcalls "$W") 次"
+[[ "$(updcalls "$W")" == 0 ]] && ok "没有重新下载第三方表(未调 adblock.py update)" \
+  || bad "启用态却去下载了第三方表($(updcalls "$W") 次)"
 [[ "$(restarts "$W")" == 1 ]] && ok "产物变化 → 恰好重启 1 次" || bad "重启了 $(restarts "$W") 次(应为 1)"
 [[ "$(jf "$W" restarted)" == "True" || "$(jf "$W" restarted)" == "true" ]] \
   && ok "restarted=true 如实上报" || bad "restarted=$(jf "$W" restarted)"
@@ -218,7 +230,8 @@ echo
 echo "══ ⑨ 启用态幂等: 产物没变 → 重启 0 次 ══"
 : > "$W/state/restarts"            # 只数本次, 上一格的计数不算进来
 rc="$(run_box "$W" 'cmd_adblock rule-add newly-blocked.invalid')"
-[[ "$(jf "$W" result)" == "already_exists" ]] && ok "result=already_exists" || bad "result=$(jf "$W" result)"
+[[ "$(jf "$W" result)" == "already_exists" ]] && ok "result=already_exists" \
+  || bad "启用态重复添加应为 already_exists, 实得 $(jf "$W" result)"
 [[ "$(restarts "$W")" == 0 ]] && ok "本次重启 0 次" || bad "幂等却重启了 $(restarts "$W") 次"
 [[ "$(jf "$W" restarted)" == "False" || "$(jf "$W" restarted)" == "false" ]] \
   && ok "restarted=false" || bad "restarted=$(jf "$W" restarted)"
