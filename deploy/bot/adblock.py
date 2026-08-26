@@ -562,8 +562,15 @@ def validate_domain(value):
     except ValueError:
         pass
     labels = v.split(".")
-    if len(labels) < 2:
-        return (False, "", "至少要有两个 label")
+    # **单 label 是合法查询对象。**用户可以往 adblock_block.txt 里写 `intranet` / `nas`
+    # 这类局域网名字(靠搜索域补全), compile_effective 原样透传, mosdns 真的按它拦 ——
+    # 诊断工具必须覆盖运行时能生效的规则全集, 否则就存在"能被拦却查不了"的域名。
+    #
+    # 代价是 `check invalid` 这种笔误会被当成一个合法单 label 来回答。可以接受:
+    # check 是只读命令, 只回报阻断状态, 不发 DNS 查询也不改任何状态。
+    #
+    # 放宽的**只有**"至少两个 label"这一条 —— 下面每个 label 的语法约束一个都不松。
+    # 第三方下载表另有 _DOMAIN_RE 把关, 仍要求至少一个点: 那边一行 `com` 就能拦掉整个 TLD。
     for lb in labels:
         if not lb:
             return (False, "", "有空 label")
