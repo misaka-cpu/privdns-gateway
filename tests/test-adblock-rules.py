@@ -305,6 +305,33 @@ miss_p = [pth for pth in plain if pth not in seeded]
     "既有普通规则文件 %d 个全部被播种" % len(plain) if not miss_p
     else "既有普通规则文件缺 %d 个: %s" % (len(miss_p), ", ".join(miss_p)))
 
+# ══ ⑩ **每一个**自己渲染模板的 E2E 都要覆盖全部受管目录 ═════════════════════
+# 上面那格只查了 e2e-lib.sh 的播种闭包 —— 而它漏掉了另外两个渲染点:
+# e2e-dot-witness.sh 与 e2e-dot-isolation.sh 各自渲染模板并**从配置里推导**规则文件名
+# (比硬编码好), 但那段推导只认 /etc/mosdns/rules/, 于是 /var/lib/.../adblock/ 下的三个
+# 仍然没被创建, mosdns 照样 FATAL。第一版守卫因此没抓到它们 —— 守卫自己也会有盲区。
+#
+# 这一格按**目录**判, 不按文件名: 模板里的 domain_set 涉及哪几个目录, 每个自己渲染模板的
+# E2E 就都得处理到。将来再加一个受管目录, 这里会点名是哪个脚本没跟上。
+tmpl_dirs = sorted({pth.rsplit("/", 1)[0] + "/" for pth in tmpl_paths})
+renderers = sorted(q for q in (ROOT / "tests").glob("e2e-*.sh")
+                   if "deploy/mosdns/config.yaml" in q.read_text(encoding="utf-8"))
+if not renderers:
+    bad("找不到任何自己渲染 mosdns 模板的 E2E —— 这条守卫失效了")
+else:
+    ok("自己渲染模板的 E2E 共 %d 支: %s"
+       % (len(renderers), ", ".join(q.name for q in renderers)))
+    gaps = []
+    for q in renderers:
+        body = q.read_text(encoding="utf-8")
+        for dr in tmpl_dirs:
+            if dr not in body:
+                gaps.append("%s 未处理 %s" % (q.name, dr))
+    (ok if not gaps else bad)(
+        "每个渲染点都处理了模板涉及的全部 %d 个 domain_set 目录" % len(tmpl_dirs)
+        if not gaps else
+        "渲染点漏了受管目录(mosdns 会 FATAL): %s" % "; ".join(gaps))
+
 print("-" * 58)
 print("通过 %d, 失败 %d" % (PASS[0], len(FAIL)))
 sys.exit(1 if FAIL else 0)
