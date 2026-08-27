@@ -785,6 +785,9 @@ jobs:
         run: bash tests/test-explicit-proxy-nc.sh
       - name: DNS 限流 (rate_limiter 迁移幂等 + 真起 mosdns 验证超限 REFUSED + doctor)
         run: bash tests/test-mosdns-ratelimit.sh
+
+      - name: "限流判据必须认得模板与迁移两种形态(行尾注释不该被当成缺失)"
+        run: python3 tests/test-ratelimit-judgement.py
       - name: 出站 schema (锁定版 sing-box check 各协议 parse_link 输出)
         run: bash tests/test-outbound-schema.sh
       - name: 劫持形态 (真起 mosdns 验证 all=排除式劫持 / gfw=白名单放行)
