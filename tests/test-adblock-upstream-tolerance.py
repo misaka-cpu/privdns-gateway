@@ -65,10 +65,27 @@ print()
 print("══ 2. 只放行下划线, 其余照拒(整份)══")
 for label, line in (("通配符", "*.evil.invalid"), ("路径", "evil.invalid/ads"),
                     ("ABP", "||evil.invalid^"), ("正则", "/ads?/"),
-                    ("IP 字面量", "1.2.3.4"), ("localhost", "localhost"),
                     ("空格分三段", "a b c")):
     got = adblock.parse_source(body(1200, [line]))
     (ok if not got else bad)("%s(%s)仍然整份拒(实得 %d 条)" % (label, line, len(got)))
+
+print()
+print("══ 2b. 少量 IP / localhost 条目: 跳过计数, 不废掉整张表 ══")
+# 线上实测: adblockfilters 那张 215320 行的表里混着 **57 条纯 IPv4**(103.179.189.35 之类)。
+# 合并型广告表从多个上游拼起来, 掺进几条 IP 是常态。而 domain_set 里放一个 IPv4 字面量,
+# mosdns 会把它当域名匹配 —— 永远匹配不到真实查询, **无害也无用**。
+# 为这 0.026% 废掉 21.5 万条不成比例, 所以它们和"域名不合格"归一类: 跳过并计数。
+mixed_ip = body(2000, ["1.2.3.4", "203.0.113.9", "localhost", "localhost.localdomain"])
+names, skipped, why = adblock.parse_source_ex(mixed_ip)
+(ok if len(names) == 2000 else bad)("合法域名全部保留(实得 %d, 应 2000)" % len(names))
+(ok if skipped == 4 else bad)("IP/localhost 被跳过且计数正确(实得 %d, 应 4)" % skipped)
+(ok if not why else bad)("没有整份拒(实得 %r)" % why)
+
+# 但"整张表都是 IP"必须照样整份拒 —— 那是真拿错了文件(比如拿到一份 IP 黑名单)。
+allip = "\n".join("10.0.%d.%d" % (i // 256, i % 256) for i in range(1500)) + "\n"
+names, skipped, why = adblock.parse_source_ex(allip)
+(ok if not names else bad)("整表都是 IP 时仍整份拒(实得 %d 条)" % len(names))
+(ok if why else bad)("给出了整份拒的理由(实得 %r)" % why)
 
 print()
 print("══ 3. 少量坏行: 跳过并计数, 不废掉整张表 ══")

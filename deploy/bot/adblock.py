@@ -132,9 +132,14 @@ def parse_source_ex(text):
         else:
             return ([], 0, "认不出的行形态")         # 结构性不对
         cand = cand.strip().lower().rstrip(".")
-        if _IPV4_RE.match(cand) or cand in ("localhost", "localhost.localdomain", "local"):
-            return ([], 0, "出现纯 IP / localhost 条目")   # 结构性不对 → 整份拒
-        if not _DOMAIN_RE.match(cand):
+        # 纯 IP / localhost: **跳过计数**, 不整份拒。合并型广告表从多个上游拼起来, 掺进
+        # 几条 IP 是常态(线上那张 215320 行的表里有 57 条, 占 0.026%), 而 domain_set 里放
+        # 一个 IPv4 字面量, mosdns 会拿它当域名匹配 —— 永远匹配不到真实查询, 无害也无用。
+        # 为这点比例废掉 21.5 万条不成比例。真拿错成一份 IP 黑名单时, 比例会接近 100%,
+        # 下面的 max_skip_ratio 照样把它整份拒掉。
+        if (_IPV4_RE.match(cand)
+                or cand in ("localhost", "localhost.localdomain", "local")
+                or not _DOMAIN_RE.match(cand)):
             skipped += 1                            # 逐行的域名不合格: 跳过并计数
             continue
         names.append(cand)
