@@ -50,6 +50,32 @@ _lock(){ :; }
 PDG_LOCKED=""
 STUB
 
+# §6 的接缝: 把这个 box 的 adblock.py 换成一层薄壳。`update` 只调**真模块**的 read_sources()
+# 把生效源打印出来, 不出网; 其余子命令 execv 原样转交真模块。
+#
+# 为什么必须这样: 原来那格直接断言 update 的真实输出里含用户源的主机名 —— 它**只在跑测试
+# 的机器能连外网时才绿**。我本地能连, 所以本地 25/0; CI 连不上, 抓到 0 条, 于是红。这既是
+# 假绿, 也违反"CI 不碰真实 anti-AD 网络"。壳挡掉的只有 socket 那一层: pdg.sh 是否把
+# $ADB_SOURCES 交下去、真模块是否据此解析出用户源而非内置默认, 两件事都仍在真代码里跑。
+shim_module(){
+  local w="$1" d f
+  d="$w/repo/deploy/bot"
+  rm -f "$d"; mkdir -p "$d"
+  for f in "$ROOT/deploy/bot"/*; do ln -sfn "$f" "$d/$(basename "$f")"; done
+  rm -f "$d/adblock.py"
+  cat > "$d/adblock.py" <<PYEOF
+import os, sys, importlib.util
+REAL = "$ROOT/deploy/bot/adblock.py"
+if len(sys.argv) > 1 and sys.argv[1] == "update":
+    spec = importlib.util.spec_from_file_location("adblock_real", REAL)
+    m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+    for u in m.read_sources(sys.argv[3] if len(sys.argv) > 3 else None):
+        print("WOULD-FETCH " + u)
+    sys.exit(0)
+os.execv(sys.executable, [sys.executable, REAL] + sys.argv[1:])
+PYEOF
+}
+
 new_box(){
   local w="$WORK/$1"; mkdir -p "$w/etc/privdns-gateway" "$w/etc/mosdns/rules" "$w/var/adblock" "$w/repo/deploy" "$w/bin"
   ln -sfn "$ROOT/deploy/bot" "$w/repo/deploy/bot"
@@ -125,7 +151,7 @@ rc="$(run_box "$W" 'cmd_adblock source reset')"
 
 echo
 echo "══ ⑥ update 真的用用户源 ══"
-W="$(new_box s6)"
+W="$(new_box s6)"; shim_module "$W"
 run_box "$W" "cmd_adblock source add '$U1'" >/dev/null
 run_box "$W" 'cmd_adblock update' >/dev/null 2>&1
 out="$(cat "$W/out.log")"
