@@ -83,7 +83,10 @@ assert_near('if data == "tfo":', '"callback_data": "menu"', (
 
 callback_block = bot[bot.find('elif "callback_query" in u:'):]
 answer_pos = callback_block.find('answer_cb_async(q["id"])')
-handle_pos = callback_block.find('handle_cb(q["message"]["chat"]["id"], q["message"]["message_id"], q["data"])')
+# 用**前缀**定位这次调用, 不锁死整行字节: 这条判据要验的是"先 answer 再 handle"的顺序,
+# 而不是调用点长什么样。锁死整行的话, 往 handle_cb 加一个参数(例如把发起者 uid 传下去)
+# 就会让它红 —— 红的是形态, 不是顺序。test-link-bot.py 一直是按前缀找的, 这里跟齐。
+handle_pos = callback_block.find('handle_cb(q["message"]')
 assert answer_pos >= 0 and handle_pos >= 0, "callback loop should answer and handle callback queries"
 assert answer_pos < handle_pos, "answerCallbackQuery should be sent before slow callback handling"
 
