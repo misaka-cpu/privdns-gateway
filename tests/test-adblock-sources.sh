@@ -162,8 +162,36 @@ grep -qF "anti-ad.net" <<<"$out" \
 
 echo
 echo "══ ⑦ 用户源是用户数据, 必须进版本快照 ══"
-grep -q 'adblock-sources' "$ROOT/deploy/bot/cfgrestore.py" \
-  && ok "cfgrestore 的快照表里登记了 adblock-sources" || bad "源文件没进快照 —— 回滚会丢用户配置"
+# 这一格原来只是 `grep -q adblock-sources cfgrestore.py` —— **它放跑了一个 P0**: 映射加了、
+# pdgtx 没登记, grep 照样命中, CI 全绿, 而真恢复会整笔 fail-closed。grep 只能证明"有人写过
+# 这个词", 证明不了"这条链走得通"。改成真的走一遍链: 成员名 → target_for → pdgtx.resolve_target。
+_r7="$(python3 - "$ROOT" <<'PY7'
+import sys
+sys.path.insert(0, sys.argv[1] + "/deploy/bot")
+import cfgrestore, pdgtx
+m = "etc/privdns-gateway/adblock-sources.txt"
+t = cfgrestore.target_for(m)
+if not t:
+    print("NOTMAPPED"); raise SystemExit
+try:
+    path, mode, _s, _v = pdgtx.resolve_target(t)
+except Exception as e:
+    print("UNRESOLVED %s %s" % (t, type(e).__name__)); raise SystemExit
+try:
+    pdgtx.actions_for_targets([t])
+except Exception as e:
+    print("NOACTION %s %s" % (t, type(e).__name__)); raise SystemExit
+print("OK %s %s" % (t, path))
+PY7
+)"
+case "$_r7" in
+  "OK adblock_sources /etc/privdns-gateway/adblock-sources.txt")
+    ok "源文件走得通整条恢复链(成员 → target → pdgtx 白名单 → 服务动作)" ;;
+  NOTMAPPED*)   bad "源文件没进恢复映射 —— 回滚会丢用户配置" ;;
+  UNRESOLVED*)  bad "映射有了但 pdgtx 不认这个目标, 含它的快照会**整笔**恢复失败: $_r7" ;;
+  NOACTION*)    bad "pdgtx 推不出这个目标的服务动作, 恢复会被拒: $_r7" ;;
+  *)            bad "恢复链判定结果意外: $_r7" ;;
+esac
 
 echo
 echo "══ ⑧ 白名单跟着源走, 但只跟着**配置过的**源走 ══"
