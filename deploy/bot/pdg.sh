@@ -5921,9 +5921,12 @@ else: print("  ACME DNS provider: %s —— **无法枚举其 API 域名, 保护
 cmd_adblock(){
   local sub="${1:-status}"; shift 2>/dev/null || true
   case "$sub" in
-    status|"") _adblock_ensure_files >/dev/null 2>&1; _adblock_status;;
+    # status 是**只读**命令: 缺文件按空集报告, 不许先建再读。原来这里挂着
+    # `_adblock_ensure_files` —— 看一眼状态就在磁盘上留下三个空文件, 于是"这台机器用没用过
+    # 去广告"这个问题被工具自己搅浑了(doctor 的 ADBLOCK_STATE_DIR 判据正是看它存不存在)。
+    status|"") _adblock_status;;
     enable)
-      need_root adblock; _adblock_ensure_files || return 1
+      need_root adblock; _lock; _adblock_ensure_files || return 1
       _adblock_gen_infra || { c_y "❌ 基础设施白名单生成失败 —— 不启用(宁可不拦, 也不能误杀自己的域名)。"; return 1; }
       # **基础设施闭包门(fail-closed)。**已经配了 ACME DNS provider, 却枚举不出它的 API
       # 域名时, 拒绝启用 —— 不是 WARN 之后照样开。那个域名一旦落进第三方广告表, 证书续期
@@ -5957,12 +5960,12 @@ cmd_adblock(){
       _profile_set PDG_ADBLOCK_ENABLED 1 || { c_y "⚠️ profile.env 写入失败, 启用意图未持久化。"; return 1; }
       c_g "✅ DNS 去广告已启用。"; _adblock_status;;
     disable)
-      need_root adblock; _adblock_ensure_files || return 1
+      need_root adblock; _lock; _adblock_ensure_files || return 1
       _adblock_apply 0 || return 1
       _profile_set PDG_ADBLOCK_ENABLED 0 || c_y "⚠️ profile.env 写入失败。"
       c_g "✅ DNS 去广告已停用(用户规则与已下载的表都保留, 随时可以再 enable)。";;
     update)
-      need_root adblock; _adblock_ensure_files || return 1
+      need_root adblock; _lock; _adblock_ensure_files || return 1
       local mod out; mod="$(_pdg_module adblock.py)" || return 1
       out="$(python3 "$mod" update "$ADB_STATE_DIR" 2>&1)"
       if grep -q '"ok": *true' <<<"$out"; then
@@ -5989,9 +5992,15 @@ cmd_adblock(){
         echo "需要恰好一个域名参数。" >&2
         _adb_emit invalid_input none; return 2
       fi
-      # 取的是**全局**那把锁: 去广告这条路此前从来没取过锁, 而规则变更要改用户源 + 编译产物
-      # 并重启 mosdns, 与 update/迁移属于同一类写操作, 没有理由让它们并发。
-      _lock
+      # 取的是**全局**那把锁 —— 与 enable/disable/update/`pdg update` 同一把, 互斥。
+      # 但这条分支要给机器结果, 不能让 _lock 忙时那句 `exit 1` 把 JSON 吞掉: Bot 拿不到
+      # 结果就只能兜底成 apply_failed_rolled_back, 而那是在说"改了又回滚了" —— 与事实不符。
+      # 所以先**非阻塞地自己试一次**: 抢不到就吐 ADBLOCK_BUSY 走人, 一个字节都还没动过。
+      # 抢到了就把 fd 留着(PDG_LOCKED=1), 后面的 _lock 调用会认这把锁, 不会二次抢。
+      if ! { exec 9>"$LOCK"; } 2>/dev/null || ! flock -n 9; then
+        _adb_emit ADBLOCK_BUSY none; return 1
+      fi
+      PDG_LOCKED=1
       _adblock_ensure_files || { _adb_emit apply_failed_rolled_back none; return 1; }
       local mod; mod="$(_pdg_module adblock.py)" || { _adb_emit apply_failed_rolled_back none; return 1; }
 

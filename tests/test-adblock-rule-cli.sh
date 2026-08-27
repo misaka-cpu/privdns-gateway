@@ -39,7 +39,7 @@ done
 # 沙箱桩(**不是**生产函数): 权限门不在本支判据内; _lock 记账以便断言"确实取了锁"。
 cat >> "$CLOSURE" <<'STUB'
 need_root(){ :; }
-_lock(){ echo locked >> "$FX_ROOT/state/locks"; }
+_lock(){ :; }   # 新实现内联取锁, 这里只保留桩防止未定义
 STUB
 
 new_box(){
@@ -96,7 +96,10 @@ run_box(){
     ADB_STATE_DIR="$w/var/adblock"
     ADB_USER_ALLOW="$w/etc/mosdns/rules/adblock_allow.txt"
     ADB_USER_BLOCK="$w/etc/mosdns/rules/adblock_block.txt"
-    export PROFILE_ENV ADB_STATE_DIR ADB_USER_ALLOW ADB_USER_BLOCK
+    # pdg.sh 第 91 行的顶层变量。只抽函数会漏掉它, 而 pdg.sh 跑在 `set -u` 下 ——
+    # 漏了的话取锁那一句直接 unbound variable 把子 shell 打死。
+    LOCK="$w/pdg.lock"
+    export PROFILE_ENV ADB_STATE_DIR ADB_USER_ALLOW ADB_USER_BLOCK LOCK
     # shellcheck source=/dev/null
     source "$CLOSURE"
     eval "$body"
@@ -109,7 +112,7 @@ restarts(){ [[ -e "$1/state/restarts" ]] && wc -l < "$1/state/restarts" | tr -d 
 netcalls(){ [[ -e "$1/state/net" ]] && wc -l < "$1/state/net" | tr -d ' ' || echo 0; }
 # 有没有去重新下载第三方表: 看有没有人调过 `adblock.py update`
 updcalls(){ local n; n="$(grep -c 'adblock.py update' "$1/state/py" 2>/dev/null)"; echo "${n:-0}"; }
-locks(){ [[ -e "$1/state/locks" ]] && wc -l < "$1/state/locks" | tr -d ' ' || echo 0; }
+locks(){ [[ -e "$1/pdg.lock" ]] && echo 1 || echo 0; }
 fp(){ [[ -e "$1" ]] && sha256sum "$1" 2>/dev/null | cut -c1-16 || echo "-"; }
 intent_of(){ sed -n 's/^[[:space:]]*PDG_ADBLOCK_ENABLED=//p' "$1/etc/privdns-gateway.profile" 2>/dev/null | tail -1; }
 enable_it(){ printf 'PDG_ADBLOCK_ENABLED=1\n' >> "$1/etc/privdns-gateway.profile"; }
@@ -148,7 +151,8 @@ grep -qx 'domain:add-me.invalid' "$(blk "$W")" \
 [[ "$(restarts "$W")" == 0 ]] && ok "重启 0 次" || bad "停用态却重启了 $(restarts "$W") 次"
 [[ "$(netcalls "$W")" == 0 ]] && ok "零联网" || bad "联网 $(netcalls "$W") 次"
 [[ -z "$(intent_of "$W")" ]] && ok "启用位未被写入(不自动启用)" || bad "启用位变成了 $(intent_of "$W")"
-[[ "$(locks "$W")" -ge 1 ]] && ok "取了全局锁($(locks "$W") 次)" || bad "没取锁"
+[[ "$(locks "$W")" == 1 ]] && ok "打开了全局锁文件(与 enable/update/pdg update 同一把)" \
+  || bad "没有碰全局锁文件"
 
 echo
 echo "══ ③ 幂等: 重复添加不写不编译不重启 ══"
