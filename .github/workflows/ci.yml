@@ -208,6 +208,9 @@ jobs:
       - name: "Telegram 内联按钮管理去广告规则: 闭集 callback / 跨用户隔离 / 只经 argv 调 CLI"
         run: python3 tests/test-bot-adblock-inline.py
 
+      - name: "去广告写入口并发闭包: 五个写命令共用全局锁 / 锁忙零副作用 / status 严格只读"
+        run: bash tests/test-adblock-lock-closure.sh
+
       - name: "链路诊断采集器 (证书正常/临期/过期/错域名/损坏/误放私钥; 零写入零写锁)"
         run: python3 tests/test-link-status.py
 
