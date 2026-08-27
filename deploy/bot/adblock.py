@@ -45,23 +45,42 @@ DEFAULT_SOURCES = (
 
 # ── 阈值 ─────────────────────────────────────────────────────────────────────
 # 每个数字都能解释, 不是"看着合理":
-#   max_entries 150000 —— Phase 0 在 MemoryMax=96M、禁 swap 下实测过 15 万条:
-#                         RSS 45.1 MiB、200 QPS p99 1.56ms、oom_kill=0。上限取到实测过的
-#                         那个点为止, 再高就没有证据了。
-#   max_bytes   8 MiB  —— 实测 anti-AD 2.0 MiB / AdGuard 4.1 MiB; 8 MiB 留一倍余量,
+#   max_entries 500000 —— 见下面 LIMITS 里那段实测。(旧值 150000 出自更早的 Phase 0, 那次
+#                         的约束是 MemoryMax=96M —— 一个测试时人为加的上限, 产品并不设它;
+#                         按"整机 512M 可用"重测之后, 那个数不再是决策依据。)
+#   max_skip_ratio 1%  —— 第三方表逐行域名不合格时跳过的比例上限, 见 LIMITS 里的说明。
+#   max_bytes   8 MiB  —— 实测 anti-AD 2.0 MiB / AdGuard 4.1 MiB / adblockfilters 4.2 MiB;
+#                         8 MiB 留了余量,
 #                         同时给下载一个硬边界(防的是"对方返回了一个巨大的东西")。
 #   min_entries 1000   —— 真实广告表都在万条以上; 1000 挡的是截断、半截下载与错页。
 #   max_drop_ratio 0.5 —— 新表不足上一份 LKG 的一半就拒。源被投毒或半截发布时, 条目数是
 #                         最先塌下来的那个量。
 LIMITS = {
     "min_entries": 1000,
-    "max_entries": 150000,
+    # 512M 整机实测重定(旧值 150000 是更早在 MemoryMax=96M 那个更紧的约束下压的, 已不是
+    # 今天的决策依据)。真跑 mosdns v5.3.4 + 生产模板 + 145591 条 geosite, 逐档量 RSS:
+    #     15 万 61.6 MiB · 30 万 77.8 · 50 万 108.6 · 60 万 109.5 · 80 万 123.0 · 100 万 166.7
+    # 选 50 万是因为它正好在一个台阶顶上(50 万与 60 万的 RSS 几乎一样), 再多一点不会突然
+    # 多吃内存。512M 机器上非 mosdns 部分实测约 217 MiB(mihomo 36.4 + bot 39.6 + lan 40.9
+    # + 系统底噪), 50 万条时整机约 326 MiB, **余量 186 MiB 且不依赖 swap**。
+    # 延迟与条数无关: 150 qps 定速下 p50 稳在 0.11 ms、p95 0.18 ms, 从 15 万到 100 万看不出
+    # 趋势 —— domain_set 的查询是 O(域名长度) 而不是 O(表大小)。约束只在内存。
+    "max_entries": 500000,
     "max_bytes": 8 * 1024 * 1024,
     "max_drop_ratio": 0.5,
+    # 逐行域名校验失败允许跳过的比例上限。第三方表是**别人**在维护, 上游一行手滑不该让用户
+    # 整张表用不了(线上实测: 21.5 万条的表里一行下划线就全废)。但也不能静默丢 —— 跳过要计数
+    # 并上报, 超过这个比例仍然整份拒: 格式真的变了(比如返回半页 HTML), 比例会立刻远超 1%。
+    "max_skip_ratio": 0.01,
 }
 
-_DOMAIN_RE = re.compile(r"^(?=.{1,253}$)[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?"
-                        r"(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$")
+# 放行下划线: DNS 协议本身允许(`_dmarc` / `_acme-challenge` 就是), 只是 RFC 1123 的
+# **hostname** 规范不允许。作为阻断规则的模式串, 下划线不造成任何歧义或注入, 而拒掉它等于
+# 对一类真实存在、也确实该拦的名字视而不见(线上那张表里的 fb_servpub-a.akamaihd.net)。
+# 放宽的**只有**下划线 —— 连字符不许出现在标签首尾这条没动, 通配符 / 路径 / ABP / 正则 /
+# IP 字面量仍然由 _SYNTAX_CHARS 与后面几道判据整份拒。
+_DOMAIN_RE = re.compile(r"^(?=.{1,253}$)[a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?"
+                        r"(\.[a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?)+$")
 _IPV4_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
 _REJECT_HINTS = ("<html", "<!doctype", "<head", "<body")
 # ABP / 正则 / URL / 通配这些语法一律不吃 —— 首版只做精确与后缀两种匹配。
@@ -84,36 +103,47 @@ def normalize(names):
 
 
 def parse_source(text):
-    """把一份第三方表解析成域名列表。**拒绝比接受更重要** —— 拒不掉的坏输入会变成一张
+    """薄封装: 只要域名列表。整份被拒时返回空列表, 与首版行为一致。"""
+    return parse_source_ex(text)[0]
+
+
+def parse_source_ex(text):
+    """(names, skipped, reject_reason)。把一份第三方表解析成域名列表。**拒绝比接受更重要** —— 拒不掉的坏输入会变成一张
     看着正常的假表。任何一行认不出来就整份拒(返回空列表),不做"尽力而为"的部分解析:
     部分解析出来的表少了多少条没人知道,而少掉的正是被跳过的那些。
     """
     if not text or not text.strip():
-        return []
+        return ([], 0, "空内容")
     head = text[:4096].lower()
     if any(h in head for h in _REJECT_HINTS):
-        return []                                   # HTML 错页
-    names = []
+        return ([], 0, "看着像 HTML 错页")           # 结构性不对 → 整份拒
+    names, skipped = [], 0
     for line in text.splitlines():
         s = line.strip()
         if not s or s.startswith("#") or s.startswith("!"):
             continue                                # 注释(# 与 ABP 的 !)
         if any(c in _SYNTAX_CHARS for c in s):
-            return []                               # ABP / 正则 / URL / 通配
+            return ([], 0, "含 ABP / 正则 / URL / 通配语法")   # 结构性不对
         parts = s.split()
         if len(parts) == 2 and _IPV4_RE.match(parts[0]):
             cand = parts[1]                         # hosts 格式: 0.0.0.0 domain
         elif len(parts) == 1:
             cand = parts[0]
         else:
-            return []                               # 认不出的形态
+            return ([], 0, "认不出的行形态")         # 结构性不对
         cand = cand.strip().lower().rstrip(".")
         if _IPV4_RE.match(cand) or cand in ("localhost", "localhost.localdomain", "local"):
-            return []                               # 纯 IP / localhost
+            return ([], 0, "出现纯 IP / localhost 条目")   # 结构性不对 → 整份拒
         if not _DOMAIN_RE.match(cand):
-            return []
+            skipped += 1                            # 逐行的域名不合格: 跳过并计数
+            continue
         names.append(cand)
-    return normalize(names)
+    total = len(names) + skipped
+    if skipped and total and skipped > total * LIMITS["max_skip_ratio"]:
+        return ([], skipped,
+                "跳过的行 %d / %d 超过上限 %.0f%%(格式可能已经变了)"
+                % (skipped, total, LIMITS["max_skip_ratio"] * 100))
+    return (normalize(names), skipped, "")
 
 
 def validate_candidate(domains, prev_count=None):
@@ -332,7 +362,10 @@ def update_lists(state_dir=None, sources=None, fetch=None):
         if len(text.encode("utf-8", "replace")) > LIMITS["max_bytes"]:
             errs.append("%s: 超过最大体积" % url)
             continue
-        names = parse_source(text)
+        names, skipped, rej = parse_source_ex(text)
+        if rej:
+            errs.append("%s: %s" % (url, rej))
+            continue
         good, why = validate_candidate(names, prev_count=prev)
         if not good:
             errs.append("%s: %s" % (url, why))
@@ -342,7 +375,7 @@ def update_lists(state_dir=None, sources=None, fetch=None):
         try:
             _atomic_write(lk, "\n".join(names) + "\n")
             _atomic_write(os.path.join(d, "meta.json"), json.dumps({
-                "count": len(names), "source": url,
+                "count": len(names), "source": url, "skipped": skipped,
                 "updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             }, ensure_ascii=False) + "\n")
         except Exception as e:                              # noqa: BLE001
