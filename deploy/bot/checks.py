@@ -1153,7 +1153,15 @@ def check_mosdns_ratelimit():
     # 判据会把一段说明当成缓存的位置 —— 同 HANDOFF §14 那个 grep 命中注释行的形态。
     # 两个位置必须在**同一个坐标系**里比 —— 一个在剥注释后的文本里找、另一个在原文里找,
     # 得到的下标根本不可比(这一版就是这么错过一次)。故两者都用 blk_nc。
+    # 只剥整行注释是不够的。`!$client_limiter` 那一行有**两个生产者**, 形态不同:
+    #     模板 config.yaml       - matches: "!$client_limiter"     # 单客户端超 QPS → REFUSED, …
+    #     migrate_mosdns_ratelimit  - matches: "!$client_limiter"
+    # 上一版改成在剥过注释的文本上匹配时, 顺手去掉了原来对行尾注释的容忍 —— 而剥法只管整行,
+    # 于是**模板形态**(= 全新装机的形态)一律被判成"缺失或参数异常": 一条假警告, 还建议用户
+    # 去跑 pdg restart 追一个不存在的问题(线上 jp2 实测到的就是它)。行尾注释一并剥掉:
+    # 位置判断照样不被受管块说明文字里的 `$lazy_cache` 骗过, 两个生产者的形态也都认得。
     blk_nc = re.sub(r"^\s*#.*$", "", blk, flags=re.M)
+    blk_nc = re.sub(r"[ \t]+#[^\n]*$", "", blk_nc, flags=re.M)
     i_cache = blk_nc.find("$lazy_cache")
     step = re.search(r'matches:\s*"?!\$client_limiter"?[ \t]*\n\s*exec:\s*reject\s+5\b', blk_nc)
     if not step or (i_cache >= 0 and step.start() >= i_cache):
