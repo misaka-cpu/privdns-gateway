@@ -444,6 +444,89 @@ else:
     bad("bot.env 被改了")
 box.clean()
 
+# ── 12. MEMBER_TARGET 整张表必须与 pdgtx 白名单对得上 ────────────────────
+# 第 10 格测的是"塞一个未知目标会 fail-closed"—— 行为对了, 但**没人验过真表本身**。
+# 于是往 MEMBER_TARGET 里加一行、忘了在 pdgtx 登记, CI 全绿, 到回滚那一刻才炸: 而且按
+# cfgrestore.py:496-502 的设计, 那是**整笔恢复被拒**, 不是跳过一个成员 —— 一台换过第三方
+# 源的机器, 快照从此恢复不了, 且只在最需要回滚的时候才发现。
+# 这一格遍历真表, 让"加映射忘登记"在 CI 就红。
+import cfgrestore as _cr_real                                   # noqa: E402
+import pdgtx as _tx_real                                        # noqa: E402
+
+_bad_resolve, _bad_actions = [], []
+for _member, _target in sorted(_cr_real.MEMBER_TARGET.items()):
+    try:
+        _tx_real.resolve_target(_target)
+    except Exception as _e:                                     # noqa: BLE001
+        _bad_resolve.append("%s→%s(%s)" % (_member, _target, type(_e).__name__))
+        continue
+    if _target in _tx_real.EXPLICIT_ONLY:
+        continue                    # 动作必须由调用方显式声明, 不该能自动推导
+    try:
+        _tx_real.actions_for_targets([_target])
+    except Exception as _e:                                     # noqa: BLE001
+        _bad_actions.append("%s→%s(%s)" % (_member, _target, type(_e).__name__))
+
+if not _bad_resolve:
+    ok("MEMBER_TARGET 里每个目标都在 pdgtx 白名单里(%d 个)" % len(_cr_real.MEMBER_TARGET))
+else:
+    bad("这些目标 pdgtx 不认识, 含它们的快照会**整笔**恢复失败: %s" % ", ".join(_bad_resolve))
+if not _bad_actions:
+    ok("MEMBER_TARGET 里每个目标都推得出服务动作")
+else:
+    bad("这些目标推不出服务动作, 恢复会被拒: %s" % ", ".join(_bad_actions))
+
+# 反面: 真塞一个没登记的进去, 这一格必须变红 —— 否则它只是句空话。
+_orig = _cr_real.MEMBER_TARGET.copy()
+_cr_real.MEMBER_TARGET["etc/privdns-gateway/never-registered.txt"] = "never_registered"
+try:
+    _tx_real.resolve_target("never_registered")
+    _caught = False
+except Exception:                                               # noqa: BLE001
+    _caught = True
+finally:
+    _cr_real.MEMBER_TARGET.clear()
+    _cr_real.MEMBER_TARGET.update(_orig)
+(ok if _caught else bad)("负控: 没登记的目标确实解析不了(这一格不是空话)")
+
+# ── 13. 源清单校验器不许与 adblock.check_source_url 漂移 ─────────────────
+# pdgtx 是只依赖标准库的事务核心, 不 import adblock —— 代价是同一条判据有两份实现。
+# 两份实现就会漂移, 所以用同一份语料逐条对照: 一边说行、另一边说不行, 这一格就红。
+import adblock as _adb                                          # noqa: E402
+
+_CORPUS = [
+    "https://gcore.jsdelivr.net/gh/x/y@main/rules/a.txt",       # 正常
+    "https://anti-ad.net/domains.txt",
+    "https://a.example.com:443/l.txt",                          # 显式默认端口
+    "https://fb_servpub-a.example.com/l.txt",                   # 下划线主机
+    "http://plain.example.com/l.txt",                           # 非 https
+    "https://example.com:8443/l.txt",                           # 非 443
+    "https://192.0.2.1/l.txt",                                  # IP 字面量
+    "https://[2001:db8::1]/l.txt",                              # IPv6 字面量
+    "https://u:p@example.com/l.txt",                            # userinfo
+    "ftp://x.example.com/l.txt",                                # 非 http(s)
+    "not-a-url",
+    "https:///l.txt",                                           # 无主机名
+    "https://example.com/l.txt?a=1#f",                          # 带 query/fragment
+]
+_drift = []
+for _u in _CORPUS:
+    _a = _adb.check_source_url(_u)[0]
+    _t = _tx_real.VALIDATORS["adblock_sources"]("/x", (_u + "\n").encode(), None)[0]
+    if _a != _t:
+        _drift.append("%s: adblock=%s pdgtx=%s" % (_u, _a, _t))
+(ok if not _drift else bad)("两份 URL 判据同判(%d 条语料)%s"
+                            % (len(_CORPUS), "" if not _drift else ": " + "; ".join(_drift)))
+
+# 校验器本身也得能吃真实文件形态: 空行 + 注释 + 多行
+_real_file = b"# \xe6\xb3\xa8\xe9\x87\x8a\n\nhttps://a.example.com/l.txt\nhttps://b.example.com/l.txt\n"
+(ok if _tx_real.VALIDATORS["adblock_sources"]("/x", _real_file, None)[0] else
+ bad)("源清单校验器接受 空行 + 注释 + 多行 的真实形态")
+_poison = b"https://a.example.com/l.txt\nhttps://evil.example.com:9999/x\n"
+_r = _tx_real.VALIDATORS["adblock_sources"]("/x", _poison, None)
+(ok if not _r[0] and "第 2 行" in _r[1] else
+ bad)("被投毒的快照逐行拒并指出行号(实得 %r)" % (_r,))
+
 shutil.rmtree(work, ignore_errors=True)
 print("─" * 40)
 print("通过 %d, 失败 %d" % (PASS[0], FAIL[0]))
