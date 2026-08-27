@@ -234,6 +234,24 @@ for result, want_any, forbid in cases:
             "%s 的回复里没有成功文案" % result)
 CLI_RESULT["rc"] = 0
 
+# ═══ 6b. 锁忙: 必须说"别人在用", 不许说"改了又回滚了" ══════════════════════════
+# CLI 抢不到全局锁时吐 ADBLOCK_BUSY, 一个字节都没动过。Bot 若把它显示成"应用失败, 已回滚",
+# 就是在告诉用户"改过又撤回了" —— 与事实不符, 而且会让人以为规则可能处在半途状态。
+print()
+print("══ 6b. 锁忙文案 ══")
+setup(); cb("adblock:add"); SHELL.clear()
+CLI_RESULT["rc"] = 1
+CLI_RESULT["out"] = '{"result":"ADBLOCK_BUSY","change":"none","restarted":false,"overridden_by_allow":false}'
+txt("busy.invalid")
+body = all_text()
+(ok if ("正在进行" in body or "稍后重试" in body) else bad)(
+    "锁忙时说明是别的操作占着(实得 %r)" % body[:70])
+(ok if "没有修改" in body or "未修改" in body else bad)(
+    "锁忙时明说没有改动任何规则(实得 %r)" % body[:70])
+for w in ("回滚", "已保存", "已生效", "应用失败"):
+    (ok if w not in body else bad)("锁忙文案里没有「%s」" % w)
+CLI_RESULT["rc"] = 0
+
 # ═══ 7. 授权顺序(源码序: 授权必须在 handler 之前) ═════════════════════════════
 print()
 print("══ 7. 授权边界 ══")
