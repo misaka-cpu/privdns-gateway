@@ -103,7 +103,11 @@ n_bad = int(n_good * ((adblock.LIMITS["max_skip_ratio"] or 0.01) * 4)) + 50
 heavy = body(n_good, ["bad..%d" % i for i in range(n_bad)])
 names, skipped, why = adblock.parse_source_ex(heavy)
 (ok if not names else bad)("坏行过多时整份拒(实得 %d 条)" % len(names))
-(ok if skipped >= 0 else bad)("skipped 是真实计数, 不是兜底(实得 %r)" % skipped)
+# 整份拒时 skipped 必须仍是**真实计数**, 不能因为要返回空表就顺手回 0 ——
+# 这个数字是运维判断"上游是不是换格式了"的唯一依据。
+# (原来这里写的是 `skipped >= 0`: 对任何计数都恒真, 兜底的 0 照样过, 等于没测。)
+(ok if skipped == n_bad else bad)(
+    "整份拒时 skipped 仍是真实计数(实得 %r, 应 %d)" % (skipped, n_bad))
 (ok if why and "尚不存在" not in why else bad)("给出了整份拒的理由(实得 %r)" % why)
 (ok if not adblock.parse_source(heavy) else bad)("parse_source 薄封装同样返回空")
 
