@@ -6168,7 +6168,6 @@ migrate_adblock(){
     c_y "           (去广告功能暂不可用; 等明确代理层到位后, 下一次 pdg update 会自动补上)。"
     return 0
   fi
-  _adblock_ensure_files || { c_y "  ❌ 去广告规则文件建不出来, 不动 mosdns 配置。"; return 1; }
   local tmpl="$REPO_DIR/deploy/mosdns/config.yaml"
   [[ -f "$tmpl" ]] || { c_y "  ❌ 部署源缺 mosdns 模板, 不改现网。"; return 1; }
   local work; work="$(mktemp -d)" || return 1
@@ -6185,7 +6184,13 @@ pl, sq = block(t, "plugins"), block(t, "internal_sequence")
 if not pl or not sq:
     sys.exit("模板里找不到受管块")
 # plugins: 插在 force_hijack_seq 定义之前; sequence: 插在 $lazy_cache 之前
-anc_pl = "  # MITM 接管域名的劫持序列"
+# 锚点必须是**结构**, 不是注释文案。上一版拿 `  # MITM 接管域名的劫持序列` 当 plugins 锚点 ——
+# 那行只在仓库模板里(2026-07-20 的 ce9b72d 才加进去), 没有任何迁移会把它写进现网配置。于是
+# 只有"那之后全新装机、由模板渲染出配置"的机器才有它; 存量机器的配置是老模板加一串迁移堆出来
+# 的, 一律没有 —— 线上 jp(v1.10.16)实测就缺这一行, 整次更新因此回滚, 老机器全都升不上来。
+# 换成 `  - tag: force_hijack_seq` 这个**定义行**: 它是被迁移真正写出来的结构, 不随注释文案变。
+# (仓库自己早写过这条: tests/helpers/strip-explicit-proxy.py —— "不拿注释文案当锚点"。)
+anc_pl = "  - tag: force_hijack_seq\n"
 anc_sq = "      - exec: $lazy_cache\n"
 if anc_pl not in cur or anc_sq not in cur:
     sys.exit("现网配置里找不到插入锚点(这台的 mosdns 配置形态不认识)")
@@ -6196,6 +6201,11 @@ PYEOF
   then
     c_y "  ❌ 去广告受管块候选生成失败, 现网未改动。"; rm -rf "$work"; return 1
   fi
+  # 规则文件在**候选生成成功之后**才建: 候选都生成不出来时这台机器什么都没被改, 状态目录也
+  # 不该凭空出现 —— 线上那次失败就在 /var/lib 下留了三个 0 字节文件, 而 doctor 的"从来没用过
+  # 这个功能"判据正是看这个目录存不存在。但必须赶在落盘之前建好: 受管块一旦生效, mosdns 缺任何
+  # 一个 domain_set 文件都会 FATAL。
+  _adblock_ensure_files || { c_y "  ❌ 去广告规则文件建不出来, 不动 mosdns 配置。"; rm -rf "$work"; return 1; }
   # 候选的正确性靠**落盘后真的重启一次**来判 —— 与 pdg.sh 里其它改 mosdns 配置的地方
   # 同一口径(见 cache 调整那两处): 先备份, 再落盘, 起不来就整份还原。
   # 不在这里跑 `mosdns start` 做预检: 它是常驻进程, 用"超时没退出"当合法证据是假判据,
