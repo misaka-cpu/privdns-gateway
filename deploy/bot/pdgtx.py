@@ -112,6 +112,11 @@ _STATIC = {
     "mosdns_conf":    ("/etc/mosdns/config.yaml", 0o644, False, ("mosdns_probe",)),
     "rs_meta":        ("/opt/pdg-bot/rulesets.json", 0o644, False, ("json_any",)),
     "profile_env":    ("/etc/privdns-gateway/profile.env", 0o600, False, ("kv_env",)),
+    # 用户配置的去广告第三方源。**它决定 update 会往哪儿发请求**, 所以恢复时要逐行校验:
+    # 一份被换过的快照不该借着回滚把任意 URL 塞进来。校验器只判 URL 形态, 真正的门仍在
+    # adblock._safe_fetch(零重定向 / 非公网地址拒绝 / DNS 与连接地址绑定 / TLS 原始主机名)。
+    "adblock_sources": ("/etc/privdns-gateway/adblock-sources.txt", 0o644, False,
+                        ("adblock_sources",)),
     "nftables_conf":  ("/etc/nftables.conf", 0o644, False, ("nft_check",)),
     "mitm_json":      ("/etc/privdns-gateway/mitm.json", 0o600, False, ("json_any",)),
     # iOS 描述文件的身份与修订记录。它是**用户持久数据**: 丢了会在下次生成时造出第二个身份,
@@ -184,6 +189,9 @@ _TARGET_ACTIONS = {
     "nftables_conf": ("nft:apply",),
     "sysctl_tfo": ("sysctl:apply",),
     "rs_meta": (),
+    # 第三方源清单: 没有任何运行中的服务读它, 只有 `pdg adblock update` 被调用时读一次。
+    # 恢复它不该顺手重启 DNS。动作**显式写成空**而不是不写(见上面那段 fail-closed 的说明)。
+    "adblock_sources": (),
     "profile_env": (),
     "dot_marker": (),
     # 纯运行状态: 改它本身不牵动任何服务。真正要重启内核的是同一笔事务里的 model/mihomo_cfg,
@@ -637,6 +645,21 @@ def _nft_bin():
 _MOSDNS_LINE = re.compile(r"^(#.*|\s*|(domain|full|keyword|regexp):\S+|[A-Za-z0-9_.*-]+)$")
 
 
+# https://<host>[:443][/path] —— userinfo(`@`)、非 443 端口、非 https 一律匹配不上。
+# 下划线放行的理由与 adblock._DOMAIN_RE 一致。
+_ADBLOCK_SRC_RE = re.compile(
+    r"^https://([a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?"
+    r"(?:\.[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?)+)(?::443)?(?:/[^\s]*)?$", re.I)
+
+
+def _looks_like_ip(host):
+    try:
+        __import__("ipaddress").ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
 def _v_mosdns_lines(path, data, ctx):
     """domain/规则文件的严格行级格式校验。
 
@@ -649,6 +672,29 @@ def _v_mosdns_lines(path, data, ctx):
     for i, ln in enumerate(text.splitlines(), 1):
         if not _MOSDNS_LINE.match(ln.strip()):
             return False, "第 %d 行不是合法的 mosdns 域名条目: %r" % (i, ln[:60])
+    return True, ""
+
+
+def _v_adblock_sources(path, data, ctx):
+    """去广告第三方源清单的行级校验: 一行一个 https URL, 允许空行与 # 注释。
+
+    判据与 adblock.check_source_url 一致(https / 无 userinfo / 默认 443 / 主机名不是 IP
+    字面量)。这里**不 import adblock** —— pdgtx 是只依赖标准库的事务核心, 反向依赖它的
+    消费方会把层次拧反; 两边不漂移由 test-restore-actions.py 的共用语料对照守着。"""
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return False, "不是 UTF-8 文本"
+    for i, ln in enumerate(text.splitlines(), 1):
+        s_ = ln.strip()
+        if not s_ or s_.startswith("#"):
+            continue
+        m = _ADBLOCK_SRC_RE.match(s_)
+        if not m:
+            return False, "第 %d 行不是合法的 https 源 URL" % i
+        host = m.group(1)
+        if _looks_like_ip(host):
+            return False, "第 %d 行的主机名是 IP 字面量" % i
     return True, ""
 
 
@@ -888,9 +934,10 @@ VALIDATORS = {
     "ruleset_format": _v_ruleset_format, "kv_env": _v_kv_env, "hostname_line": _v_hostname_line,
     "pem_cert": _v_pem_cert, "pem_key": _v_pem_key, "systemd_unit": _v_systemd_unit,
     "mobileconfig": _v_mobileconfig,
+    "adblock_sources": _v_adblock_sources,
 }
 # 只做行级格式校验的目标: 报告里要标出来, 不能说成完整配置强校验
-LINE_LEVEL_ONLY = ("mosdns_lines", "kv_env", "hostname_line")
+LINE_LEVEL_ONLY = ("mosdns_lines", "kv_env", "hostname_line", "adblock_sources")
 
 
 # ── 全局锁(fail-closed)────────────────────────────────────────────────────────

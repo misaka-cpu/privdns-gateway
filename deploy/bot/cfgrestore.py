@@ -44,6 +44,9 @@ MEMBER_TARGET = {
     # 第三方编译产物有意不在这张表里 —— 它在 /var/lib 下, 可再生, 也不进全局快照。
     "etc/mosdns/rules/adblock_allow.txt": "mosdns_rule:adblock_allow.txt",
     "etc/mosdns/rules/adblock_block.txt": "mosdns_rule:adblock_block.txt",
+    # 用户配置的第三方源: 和上面两份一样是**用户数据**, 回滚必须带回去 —— 换过源的机器
+    # 回滚后要是悄悄退回内置默认, 现场看着一切正常, 拉的却是另一张表。
+    "etc/privdns-gateway/adblock-sources.txt": "adblock_sources",
     "opt/pdg-bot/rulesets.json": "rs_meta",
     # iOS 描述文件生命周期三件套。缺任何一件, 恢复出来的都是自相矛盾的状态。
     "etc/privdns-gateway/ios-profile.json": "ios_profile_state",

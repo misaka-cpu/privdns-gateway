@@ -5762,6 +5762,7 @@ _lan_nft_reapply(){
 ADB_STATE_DIR="/var/lib/privdns-gateway/adblock"
 ADB_USER_ALLOW="/etc/mosdns/rules/adblock_allow.txt"
 ADB_USER_BLOCK="/etc/mosdns/rules/adblock_block.txt"
+ADB_SOURCES="/etc/privdns-gateway/adblock-sources.txt"   # 用户配置的第三方源; 是用户数据, 进快照
 ADB_MARK_PL=">>> pdg-adblock managed block (plugins)"
 ADB_MARK_SQ=">>> pdg-adblock managed block (internal_sequence)"
 
@@ -5967,7 +5968,7 @@ cmd_adblock(){
     update)
       need_root adblock; _lock; _adblock_ensure_files || return 1
       local mod out; mod="$(_pdg_module adblock.py)" || return 1
-      out="$(python3 "$mod" update "$ADB_STATE_DIR" 2>&1)"
+      out="$(python3 "$mod" update "$ADB_STATE_DIR" "$ADB_SOURCES" 2>&1)"
       if grep -q '"ok": *true' <<<"$out"; then
         c_g "✅ 规则表已更新。"
         [[ "$(_adblock_intent)" == 1 ]] && { _adblock_apply 1 || return 1; }
@@ -6096,6 +6097,72 @@ sys.exit(0 if hit else 1)' "$_norm" "$ADB_USER_ALLOW"; then
       rm -f "$_src_bak" "$_eb_bak" "$_el_bak"
       _adb_emit applied "$_change" "$_restarted" "$_ovr"
       return 0;;
+    source)
+      # 第三方源可配。存在 $ADB_SOURCES(一行一个 URL, 允许 # 注释); 文件缺失或为空就沿用
+      # adblock.py 里的内置默认 —— 老机器升上来行为一个字节不变。
+      # 白名单跟着**配置过的源**走(见 adblock.py allowed_fetch_hosts): 没 add 过的主机照样
+      # 连不上, 而零重定向 / 非公网拒绝 / DNS-连接绑定 / TLS 校验那几道一条都没松。
+      local _sub="${1:-list}" _url="${2:-}" mod
+      mod="$(_pdg_module adblock.py)" || return 1
+      case "$_sub" in
+        list)
+          python3 "$mod" list-sources "$ADB_SOURCES" 2>/dev/null | python3 -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit("读不到源列表")
+cur=d.get("sources") or []; dft=d.get("defaults") or []
+using_default = cur == dft
+print("  当前生效的第三方源%s:" % ("(内置默认, 未自定义)" if using_default else ""))
+for u in cur: print("    " + u)
+if not using_default:
+    print("  内置默认(reset 可回到这里):")
+    for u in dft: print("    " + u)'
+          ;;
+        add)
+          need_root adblock
+          [[ -n "$_url" ]] || { c_y "❌ 需要一个 URL。"; return 2; }
+          # 当场校验, 不拖到 update —— 那时用户已经把它记进配置里了。
+          local _cw
+          if ! _cw="$(python3 "$mod" check-source "$_url" 2>/dev/null)"; then
+            c_y "❌ 这个 URL 不能作为规则源: $(printf '%s' "$_cw" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("why",""))
+except Exception: print("")')"
+            c_y "   只接受 https、默认 443 端口、主机名是合法域名(不能是 IP 字面量)。"
+            return 2
+          fi
+          _lock
+          mkdir -p "$(dirname "$ADB_SOURCES")" || return 1
+          if [[ -f "$ADB_SOURCES" ]] && grep -qxF "$_url" "$ADB_SOURCES"; then
+            c_g "  已存在, 未改动。"; return 0          # 幂等
+          fi
+          local _t; _t="$(mktemp)" || return 1
+          [[ -f "$ADB_SOURCES" ]] && cat "$ADB_SOURCES" > "$_t"
+          printf '%s\n' "$_url" >> "$_t"
+          install -m644 "$_t" "$ADB_SOURCES" || { rm -f "$_t"; c_y "❌ 写入失败, 未改动。"; return 1; }
+          rm -f "$_t"
+          c_g "  ✅ 已添加。下次 pdg adblock update 生效。"
+          ;;
+        del)
+          need_root adblock
+          [[ -n "$_url" ]] || { c_y "❌ 需要一个 URL。"; return 2; }
+          [[ -f "$ADB_SOURCES" ]] && grep -qxF "$_url" "$ADB_SOURCES" \
+            || { c_y "❌ 这个源不在列表里, 未改动。"; return 1; }
+          _lock
+          local _t; _t="$(mktemp)" || return 1
+          grep -vxF "$_url" "$ADB_SOURCES" > "$_t"
+          install -m644 "$_t" "$ADB_SOURCES" || { rm -f "$_t"; c_y "❌ 写入失败, 未改动。"; return 1; }
+          rm -f "$_t"
+          c_g "  ✅ 已删除。"
+          ;;
+        reset)
+          need_root adblock
+          _lock
+          : > "$ADB_SOURCES" 2>/dev/null || { c_y "❌ 清空失败。"; return 1; }
+          c_g "  ✅ 已回到内置默认源。"
+          ;;
+        *)
+          echo "用法: pdg adblock source <list|add <URL>|del <URL>|reset>"; return 1;;
+      esac
+      ;;
     check)
       # **恰好一个参数。**多给一个多半是引号没打对(`check "a b"` 写成了 `check a b`),
       # 那时按第一个参数回答等于对着一个用户没打算问的东西给出确定结论。
@@ -6129,7 +6196,7 @@ try: d=json.loads(sys.argv[1] or "{}"); print("%s 条, 更新于 %s, 来源 %s" 
 except Exception: print("(读不到元数据)")' "$meta" 2>/dev/null)"
       echo "  使用 LKG  : $([[ -s "$ADB_STATE_DIR/list.lkg" ]] && echo 是 || echo 否)";;
     *)
-      echo "用法: pdg adblock <status|enable|disable|update|check <域名>>";;
+      echo "用法: pdg adblock <status|enable|disable|update|check <域名>|source <list|add|del|reset>|rule-add <域名>|rule-del <域名>>";;
   esac
 }
 

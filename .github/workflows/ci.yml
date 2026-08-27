@@ -205,6 +205,12 @@ jobs:
       - name: "去广告用户规则事务 CLI: 停用态只改源 / 幂等零重启 / 精确删除 / 失败整份回滚"
         run: bash tests/test-adblock-rule-cli.sh
 
+      - name: "去广告第三方源可配: add 当场校验 / 幂等 / 白名单只跟配置过的源走 / 进快照"
+        run: bash tests/test-adblock-sources.sh
+
+      - name: "第三方表容错: 下划线主机名放行 / 少量坏行跳过计数 / 超阈值仍整份拒"
+        run: python3 tests/test-adblock-upstream-tolerance.py
+
       - name: "Telegram 内联按钮管理去广告规则: 闭集 callback / 跨用户隔离 / 只经 argv 调 CLI"
         run: python3 tests/test-bot-adblock-inline.py
 
