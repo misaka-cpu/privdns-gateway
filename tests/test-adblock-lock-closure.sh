@@ -142,7 +142,7 @@ for act in rule-add rule-del; do
     && ok "[$act] 锁忙 result=$r(闭集)" \
     || bad "[$act] 锁忙没有闭集结果(实得 '${r:-<无 JSON>}')"
   grep -qE '回滚|已保存|已生效|应用失败' "$W/out.log" \
-    && bad "[$act] 锁忙输出里出现了"回滚/已保存/已生效/应用失败"字样" \
+    && bad "[$act] 锁忙输出里出现了「回滚/已保存/已生效/应用失败」字样" \
     || ok "[$act] 锁忙输出没有误导性字样"
 done
 
