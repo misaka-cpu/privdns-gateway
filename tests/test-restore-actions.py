@@ -489,6 +489,42 @@ finally:
     _cr_real.MEMBER_TARGET.update(_orig)
 (ok if _caught else bad)("负控: 没登记的目标确实解析不了(这一格不是空话)")
 
+# ── 14. 真走一遍: 含第三方源清单的快照必须能恢复 ─────────────────────────
+# 前面几格证明的是"resolve_target 返回了一个元组"。这一格证明的是用户真正会遇到的那件事:
+# 一台配过第三方源的机器, 回滚回得去。原缺陷下这里会拿到
+# "目标 adblock_sources 不在事务白名单里 …… 拒绝执行", 而且是**整笔**被拒。
+_SRC_OLD = "https://old.example.com/list.txt\n"
+_SRC_NEW = "# \u6ce8\u91ca\nhttps://new.example.com/list.txt\nhttps://two.example.com/l.txt\n"
+box = Box()
+base = seed(box, [("etc/privdns-gateway/adblock-sources.txt", _SRC_OLD)])
+sid = snap(box, [("etc/privdns-gateway/adblock-sources.txt", _SRC_NEW)])
+cr = load_cr(box)
+open(box.calls, "w").close()
+res = cr.restore_managed(sid, expect_digest=cr.snapshot_digest(sid), trigger_source="rescue")
+_p = os.path.join(box.root, "etc/privdns-gateway/adblock-sources.txt")
+(ok if res.get("ok") else bad)("含第三方源清单的快照恢复成功(实得 error=%r)" % res.get("error"))
+(ok if open(_p, encoding="utf-8").read() == _SRC_NEW else
+ bad)("源清单逐字节恢复成快照里的那份")
+_c = calls(box)
+(ok if _c.get("mutating") == 0 else
+ bad)("只换源清单不重启任何服务(实得 mutating=%r)" % _c.get("mutating"))
+(ok if oct(os.stat(_p).st_mode & 0o777) == "0o644" else
+ bad)("恢复出来的权限是 0644(实得 %s)" % oct(os.stat(_p).st_mode & 0o777))
+
+# 反面: 快照里那份被换成非法 URL, 必须整笔拒且现网不动
+box.clean()
+box = Box()
+base = seed(box, [("etc/privdns-gateway/adblock-sources.txt", _SRC_OLD)])
+sid = snap(box, [("etc/privdns-gateway/adblock-sources.txt",
+                  "https://ok.example.com/l.txt\nhttp://evil.example.com/x\n")])
+cr = load_cr(box)
+res = cr.restore_managed(sid, expect_digest=cr.snapshot_digest(sid), trigger_source="rescue")
+_p = os.path.join(box.root, "etc/privdns-gateway/adblock-sources.txt")
+(ok if not res.get("ok") else bad)("快照里带非法源 URL: 恢复被拒(实得 ok=%r)" % res.get("ok"))
+(ok if open(_p, encoding="utf-8").read() == _SRC_OLD else
+ bad)("被拒之后现网的源清单逐字节不变")
+box.clean()
+
 # ── 13. 源清单校验器不许与 adblock.check_source_url 漂移 ─────────────────
 # pdgtx 是只依赖标准库的事务核心, 不 import adblock —— 代价是同一条判据有两份实现。
 # 两份实现就会漂移, 所以用同一份语料逐条对照: 一边说行、另一边说不行, 这一格就红。
