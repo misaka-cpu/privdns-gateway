@@ -37,6 +37,13 @@ for fn in c_g c_y _pdg_module _adblock_intent _adblock_ensure_files _adblock_sta
   extract "$fn" >> "$CLOSURE" || { bad "抽不到 $fn"; echo "通过 $pass, 失败 $nfail"; exit 1; }
   echo >> "$CLOSURE"
 done
+# pdg.sh 的**顶层常量**整体注入。只抽函数会漏掉它们, 而 pdg.sh 跑在 `set -u` 下 ——
+# 漏一个就是 unbound variable, 而且往往只在某条分支上炸(本地与 CI 失败点不同, 就成了假绿)。
+# 这一类缺口已经栽过三次: PDG_LOCKED、LOCK、ACME_HOME。不再一个个补, 整体注入了事。
+# 安全性: 这 34 条里**零条含命令替换**(`grep -cE '^[A-Z][A-Z0-9_]*=.*\$\(' = 0`), 纯字面量
+# 与变量引用, 注入不会执行任何东西。沙箱随后 export 的同名变量会覆盖它们。
+grep -E '^[A-Z][A-Z0-9_]*=' "$ROOT/deploy/bot/pdg.sh" \
+  | sed -E 's/^([A-Z][A-Z0-9_]*)=(.*)$/\1="${\1:-}"; [[ -z "${\1}" ]] \&\& \1=\2/' >> "$CLOSURE"
 cat >> "$CLOSURE" <<'STUB'
 need_root(){ :; }
 _lock(){ :; }
