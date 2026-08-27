@@ -315,9 +315,11 @@ def update_lists(state_dir=None, sources=None, fetch=None):
     os.makedirs(d, exist_ok=True)
     lk = os.path.join(d, "list.lkg")
     prev = read_meta(d).get("count") or None
-    fetch = fetch or (lambda u: _safe_fetch(u, LIMITS["max_bytes"]))
+    src = list(sources or DEFAULT_SOURCES)
+    hosts = allowed_fetch_hosts(src)          # 白名单跟着**这一次真正要取的源**算
+    fetch = fetch or (lambda u: _safe_fetch(u, LIMITS["max_bytes"], allowed_hosts=hosts))
     errs = []
-    for url in (sources or DEFAULT_SOURCES):
+    for url in src:
         try:
             got = fetch(url)
             text, ctype = (got[0], got[1]) if isinstance(got, (tuple, list)) else (got, "")
@@ -472,8 +474,67 @@ def infra_closure(acme_home=None, user_allow=None):
 # 所以这里**不用任何会自己解析域名或自己跟随重定向的 HTTP 客户端**: 自己解析、自己校验、
 # 自己连、自己发一个最小请求。多写几十行, 换的是"校验过的地址就是真正连上去的地址"。
 
-# 允许连接的主机名 = 从 DEFAULT_SOURCES **算出来**的精确集合。不是通配、不是后缀匹配,
-# 也不是"URL 里写了什么就信什么" —— 换源不在首版范围内, 这个集合就该是封闭的。
+SOURCES_FILE = "/etc/privdns-gateway/adblock-sources.txt"     # 用户源, 一行一个; 是用户数据
+
+
+def check_source_url(url):
+    """(ok, reason)。URL 形态的**单一真源** —— `source add` 与 `_safe_fetch` 用同一套。
+
+    分开写是为了让 `source add` 能在**落盘之前**当场拒:等到 update 才报"这个源不合规",
+    用户已经把它记进配置里了, 排查起来还得先想起来是什么时候加的。
+    这里只判 URL 本身, 不做任何网络动作。
+    """
+    p = urllib.parse.urlsplit(url or "")
+    if p.scheme != "https":
+        return (False, "只允许 https(实得 scheme=%s)" % (p.scheme or "空",))
+    if p.username or p.password:
+        return (False, "URL 里带 userinfo")
+    try:
+        port = p.port
+    except ValueError:
+        return (False, "URL 的端口部分非法")
+    if port not in (None, 443):
+        return (False, "只允许默认 443 端口(实得 %s)" % port)
+    host = p.hostname or ""
+    if not host:
+        return (False, "URL 里没有主机名")
+    try:
+        ipaddress.ip_address(host)
+        return (False, "主机名是 IP 字面量(证书与白名单都无从谈起)")
+    except ValueError:
+        pass
+    if not _DOMAIN_RE.match(host.lower()):
+        return (False, "主机名不是合法域名")
+    return (True, "")
+
+
+def read_sources(path=None):
+    """用户配置的源; 没配就返回内置默认。允许 # 注释与空行。
+
+    "没配 = 用默认"这条让老机器升上来行为一个字节不变 —— 升级不该顺手改掉别人在用的源。
+    """
+    try:
+        with open(path or SOURCES_FILE, encoding="utf-8") as f:
+            urls = [l.strip() for l in f if l.strip() and not l.strip().startswith("#")]
+    except OSError:
+        urls = []
+    return urls or list(DEFAULT_SOURCES)
+
+
+def allowed_fetch_hosts(sources=None):
+    """允许连接的主机名 = 从**生效的源**算出来的精确集合。不是通配、不是后缀匹配,
+    也不是"URL 里写了什么就信什么"。
+
+    用户 `source add` 一个主机, 它才进这个集合 —— 那一步本身就是显式授权, 且 add 时已经
+    过了 check_source_url。**没被配置过的主机照样连不上**: 这道门挡的是"URL 被改成任意
+    地方", 而真正的安全价值在它后面几道(零重定向 / 非公网地址拒绝 / DNS 与连接地址绑定 /
+    TLS 用原始主机名校验)—— 那几道一条都没有因为源可配而松动。
+    """
+    src = sources if sources is not None else read_sources()
+    return frozenset(h for h in (urllib.parse.urlsplit(u).hostname for u in src) if h)
+
+
+# 内置默认算出来的那份, 保留给不传 sources 的老调用点(行为与首版一致)。
 ALLOWED_FETCH_HOSTS = frozenset(
     h for h in (urllib.parse.urlsplit(u).hostname for u in DEFAULT_SOURCES) if h)
 
@@ -516,7 +577,8 @@ def _default_connect(addr, port, timeout):
     return socket.create_connection((addr, port), timeout=timeout)
 
 
-def _safe_fetch(url, max_bytes, resolve=None, connect=None, ssl_context=None):
+def _safe_fetch(url, max_bytes, resolve=None, connect=None, ssl_context=None,
+                allowed_hosts=None):
     """按固定白名单取一份规则表。返回 (text, content_type, status)。
 
     每一道都在**连接之前**判完, 判不过就一个字节都不发。
@@ -540,8 +602,8 @@ def _safe_fetch(url, max_bytes, resolve=None, connect=None, ssl_context=None):
         raise FetchRefused("主机名是 IP 字面量 —— 拒绝(证书与白名单都无从谈起)")
     except ValueError:
         pass
-    if host not in ALLOWED_FETCH_HOSTS:
-        raise FetchRefused("主机名不在固定白名单内: %s" % host)
+    if host not in (allowed_hosts if allowed_hosts is not None else ALLOWED_FETCH_HOSTS):
+        raise FetchRefused("主机名不在允许集合内: %s" % host)
 
     addrs = (resolve or _default_resolve)(host)
     if not addrs:
@@ -671,6 +733,15 @@ if __name__ == "__main__":
                                       sys.argv[3] if len(sys.argv) > 3 else None,
                                       sys.argv[4] if len(sys.argv) > 4 else None),
                          ensure_ascii=False))
+    elif len(sys.argv) >= 3 and sys.argv[1] == "check-source":
+        good, why = check_source_url(sys.argv[2])
+        print(json.dumps({"ok": good, "why": why}, ensure_ascii=False))
+        sys.exit(0 if good else 2)
+    elif len(sys.argv) >= 2 and sys.argv[1] == "list-sources":
+        print(json.dumps({
+            "sources": read_sources(sys.argv[2] if len(sys.argv) > 2 else None),
+            "defaults": list(DEFAULT_SOURCES),
+        }, ensure_ascii=False))
     elif len(sys.argv) >= 3 and sys.argv[1] in ("rule-add", "rule-del"):
         # 只吐 JSON, 不吐文案 —— 调用方(pdg.sh → Bot)认字段不认措辞。
         # 与 check 同一条规矩: **非法输入不回显原文**, 只说是哪一类不合法。
@@ -682,7 +753,11 @@ if __name__ == "__main__":
             sys.exit(2)
         print(json.dumps({"change": change, "normalized": norm}, ensure_ascii=False))
     elif len(sys.argv) >= 2 and sys.argv[1] == "update":
-        print(json.dumps(update_lists(sys.argv[2] if len(sys.argv) > 2 else None), ensure_ascii=False))
+        # argv[3] 可选: 用户源文件路径。调用方(pdg.sh)手里就有这个真源, 传进来比在这里
+        # 再写死一次好, 也让沙箱测试能指到假根。
+        _srcs = read_sources(sys.argv[3]) if len(sys.argv) > 3 else None
+        print(json.dumps(update_lists(sys.argv[2] if len(sys.argv) > 2 else None, _srcs),
+                         ensure_ascii=False))
     elif len(sys.argv) >= 3 and sys.argv[1] == "compile":
         # 第 4 个参数是用户 block 源的路径, 可选。调用方(pdg.sh)手里本来就有 ADB_USER_BLOCK
         # 这个真源, 让它传进来比在这里再写死一次好 —— 也让沙箱测试能指到假根, 而不必去
