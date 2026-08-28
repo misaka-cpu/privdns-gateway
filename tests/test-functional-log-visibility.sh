@@ -25,7 +25,13 @@ mkclosure(){
   printf '%s' "$c"
 }
 C="$(mkclosure)"
-run(){ ( set +e; WORK="$1"; _MH_DUMPED="${2:-0}"; export WORK; source "$C"; dump_mihomo ) 2>&1; }
+run(){
+  ( set +e
+    WORK="$1"; _MH_DUMPED="${2:-0}"; export WORK
+    # shellcheck source=/dev/null
+    source "$C"
+    dump_mihomo ) 2>&1
+}
 
 echo "══ 1. 有日志就打出来 ══"
 B="$WORK/b1"; mkdir -p "$B"; printf 'line-A\nline-B\n' > "$B/mh.out"
