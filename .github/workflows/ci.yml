@@ -238,6 +238,9 @@ jobs:
       - name: "去广告受管块的插入锚点必须是结构而非注释(存量机器形态)"
         run: python3 tests/test-adblock-anchor-shape.py
 
+      - name: "跨版本迁移矩阵(历史 tag 的配置 → 当前迁移 → 真 mosdns 起得来)"
+        run: bash tests/test-cross-version-migration.sh
+
       - name: "链路诊断采集器 (证书正常/临期/过期/错域名/损坏/误放私钥; 零写入零写锁)"
         run: python3 tests/test-link-status.py
 
