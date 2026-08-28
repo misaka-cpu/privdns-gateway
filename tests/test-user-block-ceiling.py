@@ -25,6 +25,8 @@ import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "deploy/bot"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import tmpguard                                             # noqa: E402
 import adblock                                              # noqa: E402
 
 PASS, FAIL = [0], [0]
@@ -50,7 +52,7 @@ seg = src[src.index("LIMITS = {"):src.index("}", src.index("LIMITS = {"))]
 
 print()
 print("══ 2. compile: 超限整笔拒, 且**不动**现网产物 ══")
-d = tempfile.mkdtemp()
+d = tmpguard.mkdtemp(prefix="pdg-ubcap.")
 eff = os.path.join(d, "effective_block.txt")
 open(eff, "w", encoding="utf-8").write("domain:old.example\n")
 before = open(eff, encoding="utf-8").read()
@@ -67,7 +69,7 @@ except Exception as e:                                      # noqa: BLE001
 
 print()
 print("══ 3. compile: 体积上限同样拦得住 ══")
-d2 = tempfile.mkdtemp()
+d2 = tmpguard.mkdtemp(prefix="pdg-ubcap.")
 ub2 = os.path.join(d2, "user_block.txt")
 # 条数远低于上限, 但单行极长 → 只有体积这道能拦住
 big = "domain:" + ("a" * 200) + ".example\n"
@@ -81,7 +83,7 @@ r2 = adblock.compile_effective(1, state_dir=d2, user_block=ub2, lkg=os.path.join
 
 print()
 print("══ 4. 正常大小照常编译 ══")
-d3 = tempfile.mkdtemp()
+d3 = tmpguard.mkdtemp(prefix="pdg-ubcap.")
 ub3 = os.path.join(d3, "user_block.txt")
 open(ub3, "w", encoding="utf-8").write("domain:a.example\ndomain:b.example\n")
 open(os.path.join(d3, "list.lkg"), "w", encoding="utf-8").write("c.example\n")
@@ -93,7 +95,7 @@ got = open(os.path.join(d3, "effective_block.txt"), encoding="utf-8").read()
 
 print()
 print("══ 5. 关闭态不受上限影响(产物为空, 用户源一个字节不动)══")
-d4 = tempfile.mkdtemp()
+d4 = tmpguard.mkdtemp(prefix="pdg-ubcap.")
 ub4 = os.path.join(d4, "user_block.txt")
 huge = "".join("domain:x%d.example\n" % i
                for i in range(adblock.LIMITS["max_user_entries"] + 10))
@@ -108,7 +110,7 @@ r4 = adblock.compile_effective(0, state_dir=d4, user_block=ub4,
 
 print()
 print("══ 6. rule-add: 到顶时当场拒, 且不写坏文件 ══")
-d5 = tempfile.mkdtemp()
+d5 = tmpguard.mkdtemp(prefix="pdg-ubcap.")
 ub5 = os.path.join(d5, "user_block.txt")
 full = "".join("domain:x%d.example\n" % i for i in range(adblock.LIMITS["max_user_entries"]))
 open(ub5, "w", encoding="utf-8").write(full)
@@ -143,7 +145,7 @@ _mod = os.path.join(ROOT, "deploy/bot/adblock.py")
 # **不能复用 ub5** —— §7 从它里面删掉了一条, 现在是 49999, 再加一条正好压线不超。
 # (第一版就是这么写的, 于是这一格拿到 rc=0 而红得莫名其妙。)前一格改过的夹具不能当后一格
 # 的前提, 每格自备。
-_d8 = tempfile.mkdtemp()
+_d8 = tmpguard.mkdtemp(prefix="pdg-ubcap.")
 _ub8 = os.path.join(_d8, "b.txt")
 open(_ub8, "w", encoding="utf-8").write(full)
 _r = _sp.run([sys.executable, _mod, "rule-add", "newone.example", _ub8],
@@ -158,7 +160,7 @@ except Exception:                                            # noqa: BLE001
  bad)("超限的退出码与「域名不合法」(2)区分得开(实得 %d)" % _r.returncode)
 
 # 合法域名 + 未满的文件 → 照常加得进去(证明上面那条不是把所有 rule-add 都拦了)
-_d9 = tempfile.mkdtemp()
+_d9 = tmpguard.mkdtemp(prefix="pdg-ubcap.")
 _ub9 = os.path.join(_d9, "b.txt")
 open(_ub9, "w", encoding="utf-8").write("")
 _r9 = _sp.run([sys.executable, _mod, "rule-add", "fine.example", _ub9],
