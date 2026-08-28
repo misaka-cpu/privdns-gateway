@@ -3947,6 +3947,17 @@ def _groups_desc(c):
     g = [o for o in c["outbounds"] if o.get("type") == "urltest"]
     return "\n".join(f"🔀 故障组 <b>{o['tag']}</b>: {' › '.join(o.get('outbounds', []))}" for o in g)
 
+def _adblock_line():
+    """主状态页那一行。文案来自 CLI(`pdg adblock status-line`), Bot 不自己拼 ——
+    两处措辞迟早有一处会把"表的大小"说成"命中次数", 而本项目没有命中统计。"""
+    try:
+        r = sh([PDG_CLI, "adblock", "status-line"])
+        out = (r.stdout or "").strip().splitlines()
+        return out[-1] if out and r.returncode == 0 else "(读不到)"
+    except Exception:                                        # noqa: BLE001
+        return "(读不到)"
+
+
 def status_text():
     svc = _core_svc()
     _st = sh(["systemctl", "is-active", "mosdns", svc, "pdg-bot"]).stdout.split()
@@ -3968,7 +3979,8 @@ def status_text():
             + (g + "\n" if g else "")
             + f"🎯 默认出口(其余国际): <b>{final}</b>\n"
             f"📚 规则集: {len(_rs_meta())} 个\n"
-            f"🌏 分流: {split}")
+            f"🌏 分流: {split}\n"
+            f"🛡 去广告: {_adblock_line()}")
 
 def exits_text():
     c = load(); lines = []

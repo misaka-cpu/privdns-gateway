@@ -812,6 +812,15 @@ jobs:
 
       - name: "限流判据必须认得模板与迁移两种形态(行尾注释不该被当成缺失)"
         run: python3 tests/test-ratelimit-judgement.py
+
+      - name: "doctor 报出 mosdns 版本并与钉死值精确对照(只对照, 不建议升级)"
+        run: python3 tests/test-mosdns-version-visibility.py
+
+      - name: "adblock status 的条数渲染(0 条不许断行 / 注释空行不计 / 全仓守卫)"
+        run: bash tests/test-adblock-status-render.sh
+
+      - name: "主状态页有去广告一行(未启用也要说话 / 措辞不许说成命中次数 / Bot 调的子命令真存在)"
+        run: python3 tests/test-status-adblock-line.py
       - name: 出站 schema (锁定版 sing-box check 各协议 parse_link 输出)
         run: bash tests/test-outbound-schema.sh
       - name: 劫持形态 (真起 mosdns 验证 all=排除式劫持 / gfw=白名单放行)

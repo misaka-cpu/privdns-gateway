@@ -333,6 +333,55 @@ def check_core_version():
     return ("ok", "mihomo 版本", "v" + m.group(1) + " ✓(版本随项目发布更新)") if m \
         else ("warn", "mihomo 版本", "读不到版本")
 
+# mosdns 的钉死版本。**从 lib/versions.sh 读**, 不在这里写第二份 —— 两处手写必然漂,
+# 而漂掉的表现是这条判据报绿、实际跑的却不是钉死那版。
+def _pinned_mosdns_ver():
+    for base in (os.environ.get("PDG_REPO_ROOT"), "/opt/privdns-gateway",
+                 os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))):
+        if not base:
+            continue
+        try:
+            with open(os.path.join(base, "lib/versions.sh"), encoding="utf-8") as f:
+                m = re.search(r'^MOSDNS_VER="([^"]+)"', f.read(), re.M)
+            if m:
+                return m.group(1)
+        except OSError:
+            continue
+    return ""
+
+
+def check_mosdns_version():
+    """现在跑的 mosdns 是不是钉死的那一版。
+
+    为什么单独立一条(mihomo 那条不够用): 两个组件的处境完全不同。mihomo 活跃维护、版本
+    随项目发布更新, 所以那条只报"读到了什么"就够。mosdns 近乎停摆 —— 最后一次发布
+    2026-01-11, 最后一次提交 2026-02-27, 近 100 笔提交的时间跨度回到 2023-11 —— 而它是
+    这台机器上**唯一不能坏**的组件。上游没人在修了, "现在跑的到底是哪一版"就成了一个需要
+    随时看得见的事实。
+
+    **只对照, 不建议。** 判据不说"该升级" —— mosdns 的版本恰恰不该被自动跟随, 换不换是
+    需要权衡的决定(触发条件记在项目文档里)。把它说成一条例行操作, 等于替人做了那个决定。
+
+    读不到版本时判 warn 而不是 ok: 那不是"没问题", 是"不知道"。
+    """
+    name = "mosdns 版本"
+    pinned = _pinned_mosdns_ver()
+    rc, out, err = _run(["mosdns", "version"])
+    m = re.search(r"v\d+\.\d+\.\d+", (out or "") + (err or ""))
+    if not m:
+        return ("warn", name, "读不到版本(rc=%s) —— 本项无结论" % rc)
+    cur = m.group(0)
+    if not pinned:
+        return ("warn", name, "跑的是 %s, 但读不到 lib/versions.sh 里的钉死值 —— 无从对照" % cur)
+    # **精确匹配**, 不用子串: 期望 v5.3.4 时跑着 v5.3.40 也会被子串判成命中,
+    # 而这类错判只在版本号进位到两位数时出现, 极难发现(见 tests/test-version-match.sh)。
+    if cur == pinned:
+        return ("ok", name, "%s ✓(钉死值; 上游近乎停摆, 有意不自动跟随)" % cur)
+    return ("warn", name,
+            "跑的是 %s, 钉死的是 %s —— 两边不一致。不自动处理: mosdns 换不换版本是需要"
+            "权衡的决定, 不是例行操作。" % (cur, pinned))
+
+
 def check_dot_arecord():
     d = _dot_domain(); sip = _server_ip()
     if not d or not sip:
@@ -2421,7 +2470,7 @@ def check_deep_lan_acl():
             pass
 
 
-ALL = [check_platform, check_services, check_bot_credentials, check_health_timer, check_core_version, check_dot_arecord, check_dot_domain_sync,
+ALL = [check_platform, check_services, check_bot_credentials, check_health_timer, check_core_version, check_mosdns_version, check_dot_arecord, check_dot_domain_sync,
        check_internal_cidr, check_cidr_drift, check_nft, check_nft_input_chains, check_redirect, check_gms,
        check_tailscale_isolation, check_tailscale_residue, check_tailnet_direct_port,
        check_lan_routes, check_lan_whitelist, check_lan_proxy_routes, check_lan_cert,
