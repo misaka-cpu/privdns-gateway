@@ -40,6 +40,10 @@ run_sync(){ # $1=配置路径 $2=pdg.sh 路径
     echo '_fw_live_has_template_invariants(){ return 0; }'
     # 判据本体在 _fw_ssh_match(三处渲染共用), 必须一并抽出来 —— 少了它函数未定义,
     # 返回 127, sync 判成"形态认不出"而跳过, 于是这支测试测的是漏抽而不是产品。
+    # 直连端口现在从 /etc/default/tailscaled 派生(_ssh_ts_probe → checks._tailscaled_port),
+    # 这三个不抽的话 _fw_tailnet_direct 里那句命令替换取到空串, 重建出来的配置里那一行是**空的** ——
+    # 而空行不会让任何东西报错, 只会让"41641 放行"这条判据静默地不成立。
+    sed -n '/^_ssh_ts_probe(){/,/^}/p;/^_ssh_ts_port(){/,/^}/p;/^_ssh_ts_accept(){/,/^}/p' "$2"
     sed -n '/^_fw_tailnet_direct(){/,/^}/p' "$2"
     sed -n '/^_fw_ssh_match(){/,/^}/p' "$2"
     sed -n '/^migrate_firewall_template_sync(){/,/^}/p' "$2"
@@ -127,7 +131,7 @@ echo
 echo "── 六、★ 联动: 41641 放行必须与 SSH 收紧同进同退 ──"
 # 选项 A 的核心保证。拆成两个独立开关的话, 迟早出现"收紧了但没放行"的组合 —— 那正是
 # 冷启动连不上的形态(入站打洞包被 policy drop 丢掉), 而且从配置上完全看不出两者有关系。
-has41641(){ grep -qE '^[[:space:]]*udp dport 41641 accept' "$1" && echo 有 || echo 无; }
+has41641(){ grep -qE '^[[:space:]]*udp dport [0-9]+ accept comment "pdg-tailnet-direct"$' "$1" && echo 有 || echo 无; }
 [[ "$(has41641 "$WORK/a.conf")" == 无 ]] \
   && ok "any 模式(未收紧)→ 不放行 41641(不平白多开一个对公网可见的 UDP 口)" \
   || bad "未收紧却放行了 41641"
@@ -143,15 +147,19 @@ echo "── 七、cmd_ssh_source 的改写与前置判据 ──"
 # 改写走 _ssh_source_rewrite(就地改两行), 有意**不整份重渲染** —— 那会抹掉救援平面注入的
 # 规则和用户 include 里的东西。收紧 SSH 不该顺手动别的。
 sr(){ # $1=模式 $2=输入 $3=输出
-  { echo '_SSH_TS_ACCEPT='"'"'udp dport 41641 accept comment "pdg-tailnet-direct"'"'"''
+  # 这里以前把 _SSH_TS_ACCEPT **假造成一个常量**。端口改成从 /etc/default/tailscaled 派生
+  # 之后, 那个假常量就成了"测试自己造的现实" —— 真函数换了实现, 这支照样绿。引真的三个函数。
+  { sed -n '/^_ssh_ts_probe(){/,/^}/p;/^_ssh_ts_port(){/,/^}/p;/^_ssh_ts_accept(){/,/^}/p' \
+        "$ROOT/deploy/bot/pdg.sh"
     sed -n '/^_ssh_source_rewrite(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh"
     echo "_ssh_source_rewrite '$1' '$2' '$3'"
   } > "$WORK/sr.sh"
-  bash "$WORK/sr.sh"
+  # 沙箱里没有 /etc/default/tailscaled → 派生回退到官方默认 41641, 与这支原本的期望一致。
+  TAILSCALED_DEFAULTS="$WORK/no-such-tailscaled" REPO_DIR="$ROOT" bash "$WORK/sr.sh"
 }
 render "" "$NOTE_ANY" "$WORK/g0.conf"
 sr tailnet "$WORK/g0.conf" "$WORK/g1.conf"
-{ [[ "$(ssh_form "$WORK/g1.conf")" == tailnet ]] && grep -qE '^[[:space:]]*udp dport 41641 accept' "$WORK/g1.conf"; } \
+{ [[ "$(ssh_form "$WORK/g1.conf")" == tailnet ]] && grep -qE '^[[:space:]]*udp dport [0-9]+ accept comment "pdg-tailnet-direct"$' "$WORK/g1.conf"; } \
   && ok "any → tailnet: SSH 收紧且 41641 一并放行" \
   || bad "any → tailnet 改写不对: form=$(ssh_form "$WORK/g1.conf") 41641=$(grep -c 41641 "$WORK/g1.conf")"
 
@@ -161,7 +169,7 @@ sr tailnet "$WORK/g1.conf" "$WORK/g1b.conf"
   || bad "重复执行插了 $(grep -c '^[[:space:]]*udp dport 41641 accept' "$WORK/g1b.conf") 条 41641"
 
 sr any "$WORK/g1.conf" "$WORK/g2.conf"
-{ [[ "$(ssh_form "$WORK/g2.conf")" == any ]] && ! grep -qE '^[[:space:]]*udp dport 41641 accept' "$WORK/g2.conf"; } \
+{ [[ "$(ssh_form "$WORK/g2.conf")" == any ]] && ! grep -qE '^[[:space:]]*udp dport [0-9]+ accept comment "pdg-tailnet-direct"$' "$WORK/g2.conf"; } \
   && ok "tailnet → any: SSH 放开且 41641 一并撤销" \
   || bad "tailnet → any 改写不对"
 

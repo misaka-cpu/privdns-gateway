@@ -31,7 +31,7 @@ extract(){
   [[ -n "$ln" ]] || return 1
   sed -n "${ln},/^}/p" "$ROOT/deploy/bot/pdg.sh"
 }
-for fn in _fw_tailnet_direct _ssh_source_rewrite _ssh_ts_port _ssh_ts_accept; do
+for fn in _fw_tailnet_direct _ssh_source_rewrite _ssh_ts_probe _ssh_ts_port _ssh_ts_why _ssh_ts_accept; do
   extract "$fn" >> "$CLOSURE" 2>/dev/null || true      # 后两个是本支要新增的, 现在抽不到
   echo >> "$CLOSURE"
 done
@@ -122,15 +122,54 @@ else
 fi
 
 echo
-echo "══ 7. 端口解析只有一份实现(不许 shell 里再造一个)══"
+echo "══ 7. 状态显示与幂等判据也不许按端口号认 ══"
+# 这两处不是文案问题, 是**判据**:
+#   · _ssh_source_show 按 41641 找放行 —— 自定义端口下会报"41641 未放行, 跑一次 tailnet 修复",
+#     而跑完还是这句, 用户被指向一个修不好的循环。
+#   · `ssh-source tailnet` 的"已经是 tailnet"判据同样按 41641 找 —— 自定义端口下判成"还没收紧",
+#     于是又走一遍 apply(幸好 rewrite 那边幂等), 并再次起自动回退定时器。
+_pdgsh="$ROOT/deploy/bot/pdg.sh"
+_show_body="$(sed -n '/^_ssh_source_show()/,/^}/p' "$_pdgsh")"
+grep -qE 'udp dport 41641' <<<"$_show_body" \
+  && bad "_ssh_source_show 仍按 41641 认放行" || ok "_ssh_source_show 不按端口号认"
+grep -qE 'pdg-tailnet-direct' <<<"$_show_body" \
+  && ok "_ssh_source_show 按 comment 认" || bad "_ssh_source_show 没有按 comment 认"
+
+_tail_arm="$(sed -n '/^    tailnet)/,/^      _ssh_source_apply tailnet/p' "$_pdgsh")"
+grep -qE 'udp dport 41641' <<<"$_tail_arm" \
+  && bad "「已经是 tailnet」的幂等判据仍按 41641 认" || ok "幂等判据不按端口号认"
+
+echo
+echo "══ 8. 「按默认处理」的提示必须真的能触发 ══"
+# `$(_ssh_ts_port)` 是**子 shell** —— 函数里给全局变量赋的值回不到父进程。第一版就是这么写的:
+# 提示语句在, 条件永远为假, 于是端口取不到时用户什么也看不到, 而防火墙已经按 41641 放行了。
+# 死代码比没有代码更坏: 读代码的人以为这件事被覆盖了。
+mkdefaults 'PORT=abc'
+why="$(run '_ssh_ts_why')"
+[[ -n "$why" ]] && ok "取不到端口时给得出原因(实得: $why)" || bad "原因是空的 —— 提示永远不会触发"
+mkdefaults 'PORT=51820'
+why2="$(run '_ssh_ts_why')"
+[[ -z "$why2" ]] && ok "端口取到时原因为空(不虚报)" || bad "端口明明取到了却报了原因: $why2"
+
+echo
+echo "══ 9. 端口解析只有一份实现(不许 shell 里再造一个)══"
 # checks.py 的 _tailscaled_port 是唯一真源: EnvironmentFile 的覆盖语义、引号、范围校验
 # 都在那儿写好了。shell 里再写一遍正则, 两份迟早对不上 —— 而对不上的表现是防火墙放行了
 # 一个没人监听的端口, 不会有任何报错。
-if grep -qE '_tailscaled_port|checks\.py' <<<"$(sed -n "/^_ssh_ts_port()/,/^}/p" "$ROOT/deploy/bot/pdg.sh")"; then
-  ok "_ssh_ts_port 复用 checks.py 的解析器"
-else
-  bad "_ssh_ts_port 没有复用 checks.py 的解析器(或函数不存在)"
-fi
+_probe_body="$(sed -n "/^_ssh_ts_probe()/,/^}/p" "$ROOT/deploy/bot/pdg.sh")"
+grep -q '_tailscaled_port' <<<"$_probe_body" \
+  && ok "_ssh_ts_probe 复用 checks.py 的 _tailscaled_port" \
+  || bad "_ssh_ts_probe 没有复用 checks.py 的解析器(或函数不存在)"
+# 端口派生这一处不许在 shell 里再造一份解析 —— 那就是漂移的起点。
+# 范围只取 `_ssh_ts_*` 三个函数体: 全文扫会扫到 PDG_RESCUE_PORT 之类完全无关的行(第一版
+# 就是这么误报的), 那种红灯除了让人学会忽略它以外没有别的作用。
+_ts_bodies="$(sed -n '/^_ssh_ts_probe()/,/^}/p;/^_ssh_ts_port()/,/^}/p;/^_ssh_ts_why()/,/^}/p' \
+              "$ROOT/deploy/bot/pdg.sh")"
+[[ -n "$_ts_bodies" ]] && ok "抽得到 _ssh_ts_* 函数体" || bad "抽不到 _ssh_ts_* 函数体, 这一格不作数"
+_shellparse="$(grep -nE '(grep|sed|awk|cut)[^#]*PORT' <<<"$_ts_bodies" | grep -vE '^[0-9]+:[[:space:]]*#' || true)"
+[[ -z "$_shellparse" ]] \
+  && ok "端口派生里没有 shell 版 PORT 解析" \
+  || bad "端口派生里出现了 shell 版 PORT 解析 —— 两份判据迟早对不上: $_shellparse"
 
 echo "────────────────────────────────────────"
 echo "通过 $pass, 失败 $nfail"
