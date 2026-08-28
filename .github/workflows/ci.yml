@@ -815,6 +815,9 @@ jobs:
 
       - name: "doctor 报出 mosdns 版本并与钉死值精确对照(只对照, 不建议升级)"
         run: python3 tests/test-mosdns-version-visibility.py
+
+      - name: "adblock status 的条数渲染(0 条不许断行 / 注释空行不计 / 全仓守卫)"
+        run: bash tests/test-adblock-status-render.sh
       - name: 出站 schema (锁定版 sing-box check 各协议 parse_link 输出)
         run: bash tests/test-outbound-schema.sh
       - name: 劫持形态 (真起 mosdns 验证 all=排除式劫持 / gfw=白名单放行)

@@ -5992,6 +5992,26 @@ _adblock_apply(){
   return 0
 }
 
+# 数一份规则文件里的**有效条数**(空行与 `#` 注释不算)。
+#
+# 单独抽出来是因为原地那种写法同时踩了两个坑, 而且互相盖住:
+#
+#   grep -vce '^$|^#' FILE 2>/dev/null || echo 0
+#
+#   ① `grep -c` 无匹配时**既打印 0、又返回退出码 1** —— 于是 `|| echo 0` 再追加一个 0,
+#      输出变成 "0\n0", status 那一行就断成两截。**只在某类规则为 0 条时出现**, 而那
+#      正是绝大多数机器的默认状态, 所以它一直没被发现。
+#   ② `-e` 是**基本正则**, 里面的 `|` 不是"或"而是字面竖线 —— 那个模式从来没排除过注释
+#      和空行。3 条规则会被数成 5 条。
+#
+# 两个坑叠在一起还互相掩护: ① 让人以为是显示问题, ② 让人以为数字本来就该那么大。
+_adb_count_rules(){
+  local f="${1:-}" n
+  [[ -f "$f" ]] || { printf '0'; return 0; }
+  n="$(grep -vcE '^[[:space:]]*(#|$)' "$f" 2>/dev/null)"
+  printf '%s' "${n:-0}"
+}
+
 _adblock_status(){
   local intent count updated
   intent="$(_adblock_intent)"; [[ "$intent" == 1 ]] || intent=0
@@ -6006,8 +6026,8 @@ try: print(json.load(open(sys.argv[1] + "/meta.json")).get("updated","(无)"))
 except Exception: print("(无)")' "$ADB_STATE_DIR" 2>/dev/null)"
   echo "  启用意图: $([[ "$intent" == 1 ]] && echo 已启用 || echo 未启用)"
   echo "  第三方表: $count 条, 更新于 $updated"
-  echo "  用户 allow: $(grep -vce '^$|^#' "$ADB_USER_ALLOW" 2>/dev/null || echo 0) 条   用户 block: $(grep -vce '^$|^#' "$ADB_USER_BLOCK" 2>/dev/null || echo 0) 条"
-  echo "  生效中的表: block $(grep -vce '^$|^#' "$ADB_STATE_DIR/effective_block.txt" 2>/dev/null || echo 0) 条 / list $(grep -vce '^$|^#' "$ADB_STATE_DIR/effective_list.txt" 2>/dev/null || echo 0) 条"
+  echo "  用户 allow: $(_adb_count_rules "$ADB_USER_ALLOW") 条   用户 block: $(_adb_count_rules "$ADB_USER_BLOCK") 条"
+  echo "  生效中的表: block $(_adb_count_rules "$ADB_STATE_DIR/effective_block.txt") 条 / list $(_adb_count_rules "$ADB_STATE_DIR/effective_list.txt") 条"
   local note; note="$(cat "$ADB_STATE_DIR/infra.note" 2>/dev/null)"
   [[ -n "$note" ]] && c_y "  ⚠️ 基础设施白名单有枚举不到的类别(不猜, 也不放行整个公共域): $note"
   # 点名 provider 类型 —— 但只出**插件名**, 不出 token / 账号 / zone。
