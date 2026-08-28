@@ -6299,6 +6299,13 @@ sys.exit(0 if hit else 1)' "$_norm" "$ADB_USER_ALLOW"; then
       mod="$(_pdg_module adblock.py)" || return 1
       case "$_sub" in
         list)
+          # `--json` 给机器看(Telegram Bot 走这条): Bot **认字段不认措辞** —— 让它去解析
+          # 下面那段中文, 措辞一改 Bot 就瞎了。人看的那份保持原样, 一个字没动。
+          if [[ "$_url" == "--json" ]]; then
+            python3 "$mod" list-sources "$ADB_SOURCES" 2>/dev/null || {
+              echo '{"sources":[],"defaults":[]}'; return 1; }
+            return 0
+          fi
           python3 "$mod" list-sources "$ADB_SOURCES" 2>/dev/null | python3 -c 'import json,sys
 try: d=json.load(sys.stdin)
 except Exception: sys.exit("读不到源列表")
@@ -6353,7 +6360,7 @@ except Exception: print("")')"
           c_g "  ✅ 已回到内置默认源。"
           ;;
         *)
-          echo "用法: pdg adblock source <list|add <URL>|del <URL>|reset>"; return 1;;
+          echo "用法: pdg adblock source <list [--json]|add <URL>|del <URL>|reset>"; return 1;;
       esac
       ;;
     check)
@@ -6832,5 +6839,5 @@ case "${1:-menu}" in
   link)          shift || true; cmd_link "$@";;
   uninstall|rm)  shift || true; cmd_uninstall "$@";;
   rescue)        shift || true; cmd_rescue "$@";;
-  *) echo "用法: pdg [menu|status|doctor [--json|--deep]|update [--dry-run]|snapshot|rollback [n]|token|restart|log [n]|traffic|ios [status|diff|previous|ack|recover|repair](仅 iOS)|report [--redact-ip|--full]|detect-cidr|platform <ios|android>|hijack-mode <all|gfw>|ssh-source [status|tailnet|any|confirm]|link status|link session <start|status|stop>|lan <status|list|check|routes|add|rm>|adblock <status|enable|disable|update|check <域名>|rule-add <域名>|rule-del <域名>|source <list|add <URL>|del <URL>|reset>>|migrate|migrate-fw|tx <list|show|recover|abort>|rescue <enable|disable|status|fingerprint|bind <IPv4>|rotate-token|rotate-cert>|uninstall [--purge]]";;
+  *) echo "用法: pdg [menu|status|doctor [--json|--deep]|update [--dry-run]|snapshot|rollback [n]|token|restart|log [n]|traffic|ios [status|diff|previous|ack|recover|repair](仅 iOS)|report [--redact-ip|--full]|detect-cidr|platform <ios|android>|hijack-mode <all|gfw>|ssh-source [status|tailnet|any|confirm]|link status|link session <start|status|stop>|lan <status|list|check|routes|add|rm>|adblock <status|enable|disable|update|check <域名>|rule-add <域名>|rule-del <域名>|source <list [--json]|add <URL>|del <URL>|reset>>|migrate|migrate-fw|tx <list|show|recover|abort>|rescue <enable|disable|status|fingerprint|bind <IPv4>|rotate-token|rotate-cert>|uninstall [--purge]]";;
 esac

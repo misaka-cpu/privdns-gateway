@@ -229,6 +229,9 @@ jobs:
       - name: "Telegram 内联按钮管理去广告规则: 闭集 callback / 跨用户隔离 / 只经 argv 调 CLI"
         run: python3 tests/test-bot-adblock-inline.py
 
+      - name: "Telegram 里能管规则集(源)并让它生效: 下标按钮 / 点击时重新对照 / 慢操作走后台"
+        run: python3 tests/test-bot-adblock-sources.py
+
       - name: "去广告写入口并发闭包: 五个写命令共用全局锁 / 锁忙零副作用 / status 严格只读"
         run: bash tests/test-adblock-lock-closure.sh
 

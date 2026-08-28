@@ -216,10 +216,19 @@ MENU = {"inline_keyboard": [
 # 改变整台网关的解析行为并重启 mosdns, 属于要人坐在终端前确认的操作, 不该是手机上一次误触。
 ADBLOCK_MENU = {"inline_keyboard": [
     [{"text": "📊 当前状态", "callback_data": "adblock:status"}],
+    # 启用/停用与规则集管理以前只有 CLI 有。少了它们, Telegram 这边就是**半个功能**:
+    # 用户能往一份永远不会被下载的表里加单条域名, 却没有任何一条路把新表用起来。
+    [{"text": "🟢 启用", "callback_data": "adblock:enable"},
+     {"text": "🔴 停用", "callback_data": "adblock:disable"}],
     [{"text": "➕ 添加阻断规则", "callback_data": "adblock:add"},
      {"text": "➖ 删除阻断规则", "callback_data": "adblock:del"}],
     [{"text": "🔎 查询域名", "callback_data": "adblock:check"}],
+    [{"text": "📚 规则集(第三方源)", "callback_data": "adblock:src"}],
     [{"text": "↩️ 返回", "callback_data": "adblock:back"}],
+]}
+ADBLOCK_SRC_BACK = {"inline_keyboard": [
+    [{"text": "⬅️ 返回规则集", "callback_data": "adblock:src"}],
+    [{"text": "🛡 去广告菜单", "callback_data": "adblock:menu"}],
 ]}
 ADBLOCK_BACK = {"inline_keyboard": [[{"text": "⬅️ 返回去广告", "callback_data": "adblock:menu"}],
                                     [{"text": "🏠 主菜单", "callback_data": "menu"}]]}
@@ -4401,6 +4410,44 @@ def _adblock_bulk_reply(d):
     return "\n".join(parts)
 
 
+def _adblock_sources():
+    """当前生效的源与内置默认。读不到就返回两个空列表 —— 不编。"""
+    r = sh([PDG_CLI, "adblock", "source", "list", "--json"])
+    for line in reversed((r.stdout or "").strip().splitlines()):
+        try:
+            d = json.loads(line)
+        except Exception:                                # noqa: BLE001
+            continue
+        return (d.get("sources") or [], d.get("defaults") or [])
+    return ([], [])
+
+
+def _adblock_src_menu_kb():
+    return {"inline_keyboard": [
+        [{"text": "➕ 添加规则集", "callback_data": "adblock:srcadd"},
+         {"text": "➖ 删除规则集", "callback_data": "adblock:srcdel"}],
+        [{"text": "↩️ 恢复内置默认", "callback_data": "adblock:srcreset"}],
+        [{"text": "🔄 立即更新(下载并生效)", "callback_data": "adblock:srcupd"}],
+        [{"text": "⬅️ 返回去广告", "callback_data": "adblock:menu"}],
+    ]}
+
+
+def _adblock_src_text():
+    """子菜单正文顺带把当前源列出来 —— 不用再点一次才知道现在是什么。"""
+    cur, dft = _adblock_sources()
+    if not cur:
+        return "📚 <b>规则集</b>\n\n(读不到当前源列表)"
+    same = cur == dft
+    lines = ["📚 <b>规则集(第三方源)</b>", ""]
+    lines.append("当前生效%s:" % ("(内置默认，未自定义)" if same else ""))
+    lines += ["  • <code>%s</code>" % html.escape(u) for u in cur]
+    if not same and dft:
+        lines += ["", "内置默认(可用「恢复内置默认」回到这里):"]
+        lines += ["  • <code>%s</code>" % html.escape(u) for u in dft]
+    lines += ["", "改完记得点「🔄 立即更新」才会真正下载并生效。"]
+    return "\n".join(lines)
+
+
 def _adblock_pending(chat, uid, kind):
     """建立待输入状态。值里带发起者 uid —— 状态本身是 chat 键(沿用既有约定),
     但**谁发起的就只有谁能完成**, 群里旁人发的下一条不算数。"""
@@ -4411,7 +4458,24 @@ def handle_cb(chat, mid, data, uid=None):
     # ── 去广告(闭集 callback, 不接受任意动作名)────────────────────────────────
     if data.startswith("adblock:"):
         act = data.split(":", 1)[1]
-        if act not in ("menu", "status", "add", "del", "check", "cancel", "back"):
+        # 删除是"点按钮选一条", 按钮里放的是**下标** —— callback_data 只有 64 字节,
+        # URL 放不下。下标在**点的那一刻**重新对照当前列表: 渲染与点击之间列表可能被另一条
+        # 会话或 CLI 改过, 拿旧下标直接删等于删掉另一条。对不上就拒绝, 让用户重新进一次。
+        if act.startswith("srcdel:"):
+            state.pop(chat, None)
+            cur, _d = _adblock_sources()
+            raw = act.split(":", 1)[1]
+            if not raw.isdigit() or int(raw) >= len(cur):
+                edit(chat, mid, "这个列表已失效(源列表变过了)，请重新进一次「删除规则集」。",
+                     ADBLOCK_SRC_BACK); return
+            url = cur[int(raw)]
+            r = sh([PDG_CLI, "adblock", "source", "del", url])
+            good = r.returncode == 0
+            edit(chat, mid, ("✅ 已删除 <code>%s</code>\n\n点「🔄 立即更新」让改动生效。"
+                             if good else "❌ 删除失败：<code>%s</code>")
+                 % html.escape(url), ADBLOCK_SRC_BACK); return
+        if act not in ("menu", "status", "add", "del", "check", "cancel", "back",
+                       "enable", "disable", "src", "srcadd", "srcdel", "srcreset", "srcupd"):
             # 未知或过期的 adblock callback: fail-closed, 什么都不做, 也不留状态。
             state.pop(chat, None)
             edit(chat, mid, "这个操作已失效，请重新从菜单进入。", ADBLOCK_BACK); return
@@ -4420,6 +4484,50 @@ def handle_cb(chat, mid, data, uid=None):
             if act == "back":
                 edit(chat, mid, status_text(), MENU); return
             edit(chat, mid, "🛡 <b>DNS 去广告</b> — 选一项:", ADBLOCK_MENU); return
+        if act in ("enable", "disable"):
+            # 慢操作(要重编译, 可能重启 mosdns)—— 不能把 Bot 卡在这儿。
+            def _task(act=act, chat=chat, mid=mid):
+                r = sh([PDG_CLI, "adblock", act])
+                out = ((r.stdout or "") + (r.stderr or "")).strip()[-500:] or "(没有输出)"
+                edit(chat, mid, ("✅ 已%s。\n<pre>%s</pre>" if r.returncode == 0
+                                 else "❌ %s失败：\n<pre>%s</pre>")
+                     % ("启用" if act == "enable" else "停用", html.escape(out)), ADBLOCK_BACK)
+            edit(chat, mid, "处理中…（可能重启 DNS，几秒）", ADBLOCK_BACK)
+            run_bg(chat, _task); return
+        if act == "src":
+            state.pop(chat, None)
+            edit(chat, mid, _adblock_src_text(), _adblock_src_menu_kb()); return
+        if act == "srcadd":
+            _adblock_pending(chat, uid, "srcadd")
+            edit(chat, mid,
+                 "发一个规则集 URL（只接受 https、默认 443 端口、主机名是合法域名）。\n"
+                 "例：<code>https://gcore.jsdelivr.net/gh/…/adblockmosdns.txt</code>\n\n"
+                 "注意：配了自定义源就是<b>替换</b>内置默认，不是追加。\n/cancel 或按下面的按钮取消。",
+                 ADBLOCK_CANCEL); return
+        if act == "srcdel":
+            state.pop(chat, None)
+            cur, _d = _adblock_sources()
+            if not cur:
+                edit(chat, mid, "读不到当前源列表，未做任何改动。", ADBLOCK_SRC_BACK); return
+            rows = [[{"text": "➖ %s" % (u[:48] + ("…" if len(u) > 48 else "")),
+                      "callback_data": "adblock:srcdel:%d" % i}] for i, u in enumerate(cur)]
+            rows.append([{"text": "⬅️ 返回规则集", "callback_data": "adblock:src"}])
+            edit(chat, mid, "选一个要删除的规则集：", {"inline_keyboard": rows}); return
+        if act == "srcreset":
+            r = sh([PDG_CLI, "adblock", "source", "reset"])
+            edit(chat, mid, ("✅ 已恢复内置默认源。\n\n点「🔄 立即更新」让改动生效。"
+                             if r.returncode == 0 else "❌ 恢复失败。"),
+                 ADBLOCK_SRC_BACK); return
+        if act == "srcupd":
+            # 真下载 + 可能重启 mosdns, 是这一组里最慢的一步 —— 必须后台。
+            def _upd(chat=chat, mid=mid):
+                r = sh([PDG_CLI, "adblock", "update"])
+                out = ((r.stdout or "") + (r.stderr or "")).strip()[-800:] or "(没有输出)"
+                edit(chat, mid, ("✅ 规则表已更新。\n<pre>%s</pre>" if r.returncode == 0
+                                 else "❌ 更新失败（继续用上一份可用的表）：\n<pre>%s</pre>")
+                     % html.escape(out), ADBLOCK_SRC_BACK)
+            edit(chat, mid, "正在下载并编译规则表…（几十秒，可能重启 DNS）", ADBLOCK_SRC_BACK)
+            run_bg(chat, _upd); return
         if act == "status":
             r = sh([PDG_CLI, "adblock", "status"])
             out = (r.stdout or "").strip() or "(读不到状态)"
@@ -5059,6 +5167,16 @@ def handle_text(chat, text, mid=None, uid=None):
             r = sh([PDG_CLI, "adblock", "check", text])
             out = (r.stdout or "").strip() or "(没有输出)"
             send(chat, "🔎 <pre>" + html.escape(out) + "</pre>", ADBLOCK_BACK); return
+        if kind == "srcadd":
+            r = sh([PDG_CLI, "adblock", "source", "add", text.strip()])
+            out = ((r.stdout or "") + (r.stderr or "")).strip()[-400:]
+            if r.returncode == 0:
+                send(chat, "✅ 已添加规则集。\n点「🔄 立即更新」才会真正下载并生效。",
+                     ADBLOCK_SRC_BACK)
+            else:
+                send(chat, "❌ 没能添加：\n<pre>%s</pre>" % html.escape(out or "(没有输出)"),
+                     ADBLOCK_SRC_BACK)
+            return
         if kind in ("add", "del"):
             # 一条消息里可以给多个域名(换行或空格分隔)。批量走 CLI 的 rule-add-many ——
             # **不在这里循环调 N 次 rule-add**: 那只是把 N 次 mosdns 重启从用户手里搬进
