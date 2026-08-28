@@ -394,9 +394,64 @@ migrate_botenv(){
 # 刻意**不做成独立开关**: 放行这个端口的唯一理由就是"SSH 只能从 tailnet 进来, 所以那条路
 # 必须随时可用"。拆成两个开关, 迟早出现"收紧了但没放行"的组合 —— 那正是冷启动连不上的形态,
 # 而且从配置上完全看不出两者有关系。
+# Tailscale 直连端口。41641 是官方默认值, 但**它是可配的** —— Debian 12 上来自
+# /etc/default/tailscaled 的 `PORT=`, unit 经 EnvironmentFile 传给 `tailscaled --port=${PORT}`。
+#
+# 解析**不在这里做**: EnvironmentFile 的覆盖语义(后面的赋值盖前面的)、引号剥离、端口范围
+# 校验, checks.py 的 `_tailscaled_port` 已经全写好了, 而且 doctor 的对账判据用的就是它。
+# shell 里再写一遍正则, 两份迟早对不上 —— 对不上的表现是防火墙放行了一个没人监听的端口,
+# 不会有任何报错, 只会在某次真出事、想连进去的时候发现连不上。
+#
+# 取不到就退回 41641: 没装 Tailscale、不是 deb 装的、文件里没有合法 PORT=, 都属于正常情形,
+# 而 41641 是这些情形下唯一有依据的猜测。**不静默** —— 调用方用 _ssh_ts_why 把原因说出来。
+# 探一次: 输出 `端口<TAB>原因`。原因非空 = 用了回退默认值。
+#
+# 为什么是"输出"而不是"设全局变量": `$(_ssh_ts_port)` 是**子 shell**, 函数里给全局变量赋的
+# 值回不到父进程。第一版就是那么写的 —— 提示语句在, 条件永远为假, 端口取不到时用户什么也
+# 看不到, 而防火墙已经按 41641 放行了。死代码比没有代码更坏: 读的人以为这件事被覆盖了。
+_ssh_ts_probe(){
+  local f="${TAILSCALED_DEFAULTS:-/etc/default/tailscaled}" out
+  out="$(python3 - "$f" <<'PY_TSPORT' 2>/dev/null
+import os, sys
+sys.path.insert(0, os.environ.get("REPO_DIR", "/opt/privdns-gateway") + "/deploy/bot")
+sys.path.insert(0, "/opt/pdg-bot")
+try:
+    import checks
+except Exception:
+    print("41641\t读不到 checks 模块"); raise SystemExit
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        txt = fh.read()
+except OSError as e:
+    print("41641\t读不到 %s(%s)" % (sys.argv[1], e.strerror or e)); raise SystemExit
+port, why = checks._tailscaled_port(txt)
+print("%d\t" % port if port else "41641\t%s" % why)
+PY_TSPORT
+)" || out=""
+  [[ -n "$out" ]] || out="41641"$'\t'"端口解析没跑起来"
+  printf '%s' "$out"
+}
+# 两个薄封装。**必须写成多行、`}` 独占一行**: 全仓的测试闭包都靠 `sed -n '/^f(){/,/^}/p'`
+# 抽函数, 单行函数会让那个范围一路吃到下一个函数的收尾 —— 抽出来的东西语法上还成立, 于是
+# 闭包静默地少定义几个函数, 表现是"输出全空"而不是报错。(这一版就先踩了一次。)
+_ssh_ts_port(){
+  local o; o="$(_ssh_ts_probe)"
+  printf '%s' "${o%%$'\t'*}"
+}
+_ssh_ts_why(){
+  local o; o="$(_ssh_ts_probe)"
+  printf '%s' "${o#*$'\t'}"
+}
+
+# 那一行放行规则的**唯一**生成处。端口跟着上面派生, comment 固定 —— comment 才是这条规则的
+# 身份标记(doctor 的对账判据也是按它找的), 端口只是内容。
+_ssh_ts_accept(){
+  printf 'udp dport %s accept comment "pdg-tailnet-direct"' "$(_ssh_ts_port)"
+}
+
 _fw_tailnet_direct(){
   if [[ -n "${1:-}" ]]; then
-    printf '%s' 'udp dport 41641 accept comment "pdg-tailnet-direct"'
+    _ssh_ts_accept
   else
     printf '%s' '# (SSH 未收紧为 tailnet, 故不放行 Tailscale 直连端口)'
   fi
@@ -4738,7 +4793,8 @@ cmd_link(){
 #      而不是要你去翻服务商的网页控制台。
 _SSH_REVERT_UNIT=pdg-ssh-source-revert
 _SSH_REVERT_MIN="${PDG_SSH_REVERT_MIN:-10}"
-_SSH_TS_ACCEPT='udp dport 41641 accept comment "pdg-tailnet-direct"'
+# 这一行以前是常量 _SSH_TS_ACCEPT。改成函数 _ssh_ts_accept(定义在 _fw_tailnet_direct 上面):
+# 端口要跟着 /etc/default/tailscaled 走, 常量在 source 时就定死了, 跟不了。
 
 # 当前是否有一条**经 tailnet 进来的** SSH 会话。判据取 established 的本地 22 连接,
 # 对端落在 tailnet 段, 且该地址确实是本机 tailscale0 的对端(不只看 100.64/10 —— 那个段
@@ -4769,9 +4825,15 @@ _ssh_source_show(){
   fi
   if [[ -n "$m" ]]; then
     c_g "当前: tailnet —— 只允许经 Tailscale 登录, 公网上看不到 SSH 端口"
-    grep -qE "^[[:space:]]*udp dport 41641 accept" "$f" \
-      && echo "  Tailscale 直连端口(UDP 41641): 已放行(避免空闲后第一次连接超时)" \
-      || c_y "  ⚠️ 41641 未放行 —— 空闲一段后第一次 SSH 可能超时。跑一次 pdg ssh-source tailnet 修复。"
+    # 按 comment 认, 不按端口号认: 端口是可配的(见 _ssh_ts_port)。按数字认的话, 换过端口
+    # 的机器会一直被告知"41641 未放行, 跑一次 tailnet 修复"—— 而跑完还是这句, 把人指进一个
+    # 修不好的循环。顺带把**实际放行的端口**报出来: 用户改过端口时, 这是唯一能看见它的地方。
+    local _tsline; _tsline="$(grep -oE '^[[:space:]]*udp dport [0-9]+ accept comment "pdg-tailnet-direct"$' "$f" | head -1)" || _tsline=""
+    if [[ -n "$_tsline" ]]; then
+      echo "  Tailscale 直连端口(UDP $(sed -E 's/.*udp dport ([0-9]+).*/\1/' <<<"$_tsline")): 已放行(避免空闲后第一次连接超时)"
+    else
+      c_y "  ⚠️ Tailscale 直连端口未放行 —— 空闲一段后第一次 SSH 可能超时。跑一次 pdg ssh-source tailnet 修复。"
+    fi
   else
     echo "当前: any —— SSH 对全网放行(默认)"
   fi
@@ -4787,13 +4849,14 @@ _ssh_source_rewrite(){          # $1=目标模式(any|tailnet) $2=输入 $3=输�
   local mode="$1" src="$2" dst="$3"
   if [[ "$mode" == tailnet ]]; then
     sed -E -e 's|^([[:space:]]*)tcp dport \{ ([0-9]+) \} accept$|\1iifname "tailscale0" tcp dport { \2 } accept|' "$src" > "$dst" || return 1
-    # 41641 已经在就不重复插(幂等)
-    if ! grep -qE '^[[:space:]]*udp dport 41641 accept' "$dst"; then
-      sed -i -E 's|^([[:space:]]*)iifname "tailscale0" tcp dport \{ ([0-9]+) \} accept$|\1iifname "tailscale0" tcp dport { \2 } accept\n\1'"$_SSH_TS_ACCEPT"'|' "$dst" || return 1
+    # 已经在就不重复插(幂等)。**按 comment 认, 不按端口号认** —— 端口是可配的, 按数字认
+    # 的话换过端口的机器会被判成"还没插", 于是插第二条, 两条都在。
+    if ! grep -qE '^[[:space:]]*udp dport [0-9]+ accept comment "pdg-tailnet-direct"$' "$dst"; then
+      sed -i -E 's|^([[:space:]]*)iifname "tailscale0" tcp dport \{ ([0-9]+) \} accept$|\1iifname "tailscale0" tcp dport { \2 } accept\n\1'"$(_ssh_ts_accept)"'|' "$dst" || return 1
     fi
   else
     sed -E -e 's|^([[:space:]]*)iifname "tailscale0" tcp dport \{ ([0-9]+) \} accept$|\1tcp dport { \2 } accept|' \
-           -e '/^[[:space:]]*udp dport 41641 accept comment "pdg-tailnet-direct"$/d' "$src" > "$dst" || return 1
+           -e '/^[[:space:]]*udp dport [0-9]+ accept comment "pdg-tailnet-direct"$/d' "$src" > "$dst" || return 1
   fi
   return 0
 }
@@ -6373,12 +6436,14 @@ cmd_ssh_source(){
       [[ -z "$cur" ]] && { echo "已经是 any, 无需改动。"; return 0; }
       _ssh_source_apply any || return 1
       _ssh_revert_disarm; rm -f "$(_ssh_revert_path)"
-      c_g "✅ SSH 已恢复对全网放行(Tailscale 直连端口 41641 一并撤销)。"
+      c_g "✅ SSH 已恢复对全网放行(Tailscale 直连端口一并撤销)。"
       return 0 ;;
 
     tailnet)
-      local cur; cur="$(_fw_ssh_match /etc/nftables.conf)" || { c_y "❌ 认不出当前形态, 拒绝改动"; return 1; }
-      if [[ -n "$cur" ]] && grep -qE '^[[:space:]]*udp dport 41641 accept' /etc/nftables.conf; then
+      local cur _tswhy; cur="$(_fw_ssh_match /etc/nftables.conf)" || { c_y "❌ 认不出当前形态, 拒绝改动"; return 1; }
+      # 幂等判据同样按 comment 认。按 41641 认的话, 换过端口的机器每次都被判成"还没收紧",
+      # 于是重复 apply 并**再起一次自动回退定时器** —— 而用户以为什么都没发生。
+      if [[ -n "$cur" ]] && grep -qE '^[[:space:]]*udp dport [0-9]+ accept comment "pdg-tailnet-direct"$' /etc/nftables.conf; then
         echo "已经是 tailnet, 无需改动。"; return 0
       fi
       # ★ 前置判据: 你此刻必须正通过 tailnet 连着
@@ -6393,7 +6458,9 @@ cmd_ssh_source(){
       fi
       _ssh_source_apply tailnet || return 1
       _ssh_revert_arm || true
-      c_g "✅ SSH 已收紧: 只允许经 tailnet 登录; UDP 41641 已放行(消除冷启动窗口)。"
+      c_g "✅ SSH 已收紧: 只允许经 tailnet 登录; UDP $(_ssh_ts_port) 已放行(消除冷启动窗口)。"
+      _tswhy="$(_ssh_ts_why)"
+      [[ -n "$_tswhy" ]] && c_y "   ⚠️ 端口按默认 41641 处理: $_tswhy"
       echo
       c_y "现在**另开一条 tailnet SSH 会话**验证能进来 —— 别关当前这条。"
       echo "  验证通过 → pdg ssh-source confirm    (确认, 取消自动回退)"
