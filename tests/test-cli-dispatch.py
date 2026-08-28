@@ -306,6 +306,32 @@ for argv, want_n, label in (([], "40", "pdg log 默认 40 行"),
     else:
         bad("%s 不对: %r" % (label, out))
 
+# ── 用法串必须覆盖 dispatcher 的每一条分支 ────────────────────────────────
+# `pdg` 打错子命令时唯一的自助线索就是这一行用法串。它是**手写**的, 而 dispatcher 是另一处
+# 手写的 —— 两处手写就会漂移: 加了子命令、忘了改用法, 于是那条命令**存在但没人知道**。
+# 实测漂了两条(lan 在 v1.9 加的、adblock 在 v1.11 加的), 一直没人发现, 因为没有一格在看。
+import re as _re                                                # noqa: E402
+
+_src = open(PDG, encoding="utf-8").read().splitlines()
+_ui = [i for i, l in enumerate(_src) if "用法: pdg [" in l]
+(ok if len(_ui) == 1 else bad)("顶层用法串恰好一处(实得 %d)" % len(_ui))
+if len(_ui) == 1:
+    _u = _ui[0]
+    _arms = []
+    for _l in _src[max(0, _u - 70):_u]:
+        _m = _re.match(r"^  ([a-z][a-z0-9|_-]*)\)", _l)
+        if _m:
+            _arms.append(_m.group(1))
+    (ok if len(_arms) >= 20 else bad)("抽到了 dispatcher 的分支(实得 %d, 少于 20 说明抽法坏了)" % len(_arms))
+    _inside = _re.search(r"用法: pdg \[(.*)\]", _src[_u])
+    _listed = _inside.group(1) if _inside else ""
+    (ok if _listed else bad)("用法串里抽得出方括号内容")
+    _missing = [a for a in _arms
+                if not any(_re.search(r"(?<![a-z-])%s(?![a-z-])" % _re.escape(n), _listed)
+                           for n in a.split("|"))]
+    (ok if not _missing else
+     bad)("这些子命令**存在但用法串没列**, 用户无从知道: %s" % ", ".join(_missing))
+
 print("─" * 40)
 print("通过 %d, 失败 %d" % (PASS[0], FAIL[0]))
 for d in TMPS:
