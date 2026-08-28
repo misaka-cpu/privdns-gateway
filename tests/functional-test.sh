@@ -13,7 +13,8 @@
 # 测试里直接连该端口即可 —— sniffer 的 override-destination 会用嗅到的 SNI 顶掉原目的地,
 # 正是生产中"手机连过来 → 嗅 SNI → 按域名选出口"那条路。
 #
-# 退出码 0 = 通过; 非 0 = 失败(并打印 mihomo 输出便于排查)。
+# 退出码 0 = 通过; 非 0 = 失败。**两种情况都打印 mihomo 输出** —— 绿的时候拿不到它,
+# 真出事时就只能拿红 run 去猜正常长什么样。
 # ─────────────────────────────────────────────────────────────────────────────
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -35,7 +36,25 @@ drop_conntrack_table(){
     NFT_TABLE=""
   fi
 }
+# mihomo 的输出**成功时也要打出来**。以前只有失败路径 cat 它, 而 cleanup 又把整个 $WORK
+# 删掉 —— 于是绿的那些 run 里根本拿不到 mihomo 日志。真出事的时候(HANDOFF §9.12 那个坑)
+# 只能拿红 run 去猜"绿的时候它是什么样", 而那正是最需要对照的东西。
+#
+# 幂等: 失败路径已经就地 cat 过一次的, 这里不再重复(_MH_DUMPED)。
+# 截断到最后 200 行: 一次跑只有几秒, 正常远不到这个量; 设上限是防"mihomo 疯狂刷日志"
+# 那种情形把 CI 日志淹掉。截断了就说清楚, 不假装打全了。
+_MH_DUMPED=0
+dump_mihomo(){
+  [[ "$_MH_DUMPED" == 1 ]] && return 0
+  [[ -s "$WORK/mh.out" ]] || return 0
+  _MH_DUMPED=1
+  local n; n="$(wc -l < "$WORK/mh.out")"
+  echo "---- mihomo 输出(共 $n 行$( (( n > 200 )) && echo ", 只显示最后 200 行" ))----" >&2
+  tail -200 "$WORK/mh.out" >&2
+  echo "---- mihomo 输出结束 ----" >&2
+}
 cleanup(){
+  dump_mihomo
   for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done
   rm -rf "$WORK"
   drop_conntrack_table
@@ -175,14 +194,14 @@ for _ in $(seq 1 50); do
   if python3 -c 'import socket,sys; s=socket.socket(); s.settimeout(.2); sys.exit(0 if s.connect_ex(("127.0.0.1",18443))==0 else 1)'; then ready=1; break; fi
   sleep 0.1
 done
-[[ "$ready" == 1 ]] || { cat "$WORK/mh.out" >&2; fail "mihomo 入口 :18443 未就绪"; }
+[[ "$ready" == 1 ]] || { dump_mihomo; fail "mihomo 入口 :18443 未就绪"; }
 
 # ── 4. 各 SNI 断言落到正确出口(只比对 host, 端口随入口口子) ──
 check_case(){  # $1=SNI $2=期望日志文件 $3=出口名
   local sni="$1" log="$2" name="$3"
   python3 "$HERE/sni_client.py" 127.0.0.1 18443 "$sni"
   for _ in $(seq 1 30); do grep -q "^${sni}:" "$log" 2>/dev/null && { note "  $sni → $name ✓"; return 0; }; sleep 0.1; done
-  echo "---- mihomo 输出 ----" >&2; cat "$WORK/mh.out" >&2
+  dump_mihomo
   fail "SNI=$sni 未按预期到达 $name (A='$(tr '\n' ' ' <"$LOGA")' B='$(tr '\n' ' ' <"$LOGB")' D='$(tr '\n' ' ' <"$LOGD")')"
 }
 
