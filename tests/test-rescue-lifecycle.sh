@@ -123,6 +123,10 @@ N
             migrate_rescue_plane; do
     sed -n "/^${fn}(){/,/^}/p" "$ROOT/deploy/bot/pdg.sh"
   done
+  # 常量也要跟着抽: _lan_nft_reapply 现在从 $LAN_NFT_CONF 读路径(以前写死在函数体里, 被
+  # 下面那条 sed 顺手改掉了)。`set -u` 下漏一个就是 unbound variable, 而它半途死掉的表现
+  # 与"漏抽函数"一模一样 —— 报出来的是"防火墙放行失败", 看起来像救援平面自己的缺陷。
+  grep -E '^LAN_NFT_CONF=' "$ROOT/deploy/bot/pdg.sh"
 } > "$WORK/fns.sh"
 
   # _nft_apply_main / _lan_nft_reapply: 救援平面的放行走它们(主规则加载完顺带把内网面板的
@@ -131,7 +135,7 @@ N
   # 救援平面自己的缺陷。下面那条 sed 会一并把这两个函数里的默认路径也指到沙盒。
 
 # 生产代码读死 /etc/nftables.conf 与 /opt/pdg-bot —— 沙盒里把它们指到 BOX
-sed -i "s#/etc/nftables.conf#$BOX/etc/nftables.conf#g; s#/opt/pdg-bot#$BOX/opt/pdg-bot#g" "$WORK/fns.sh"
+sed -i "s#/etc/nftables-pdg-lan.conf#$BOX/etc/nftables-pdg-lan.conf#g; s#/etc/nftables.conf#$BOX/etc/nftables.conf#g; s#/opt/pdg-bot#$BOX/opt/pdg-bot#g" "$WORK/fns.sh"
 
 run(){ bash -c "source '$WORK/fns.sh' 2>/dev/null; $1" 2>&1; }
 

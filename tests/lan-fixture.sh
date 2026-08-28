@@ -41,6 +41,9 @@ LAN_FX_FUNCS=(
   _lan_hosts _lan_intent _lan_migrate_certs _lan_cert_missing
   _lan_render _lan_install_managed _lan_restore_pre
   _lan_apply_proxy _lan_sync_after_change _lan_disable
+  # _lan_apply_proxy 现在要判"产物变没变"(不变就不重启), 并在跳过重启时把内核白名单补回去。
+  # 这两个是它新的内部依赖 —— 漏抽的话它会 127, 而 127 在这组里恰好长得像"收敛没执行"。
+  _lan_artifacts_digest _lan_nft_reapply
 )
 
 # 沙箱专用的桩(**不是**生产函数): need_root 在非 root 下会 exit 1, 而这一组测的不是

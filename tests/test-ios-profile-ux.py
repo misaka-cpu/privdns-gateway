@@ -543,6 +543,11 @@ sed -n '/^_ios_offer_download()/,/^}/p' deploy/bot/pdg.sh > "$CH_DIR/fn.sh"
 # 断言看起来像"没还原防火墙"这个产品缺陷, 其实是夹具少抽了一个函数。
 sed -n '/^_nft_apply_main()/,/^}/p'  deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 sed -n '/^_lan_nft_reapply()/,/^}/p' deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
+# 常量也要跟着抽。`set -u` 下漏一个就是 unbound variable, 而那会让 _nft_apply_main 在
+# 调 _lan_nft_reapply 时半途死掉 —— 表现同样是"没还原防火墙", 与漏抽函数一模一样。
+# (_lan_nft_reapply 原先把这个路径写死在函数体里, 于是这里不抽也能跑; 路径收归常量之后
+#  就不行了 —— 写死路径让夹具"碰巧能用", 那本身就是它该被改掉的理由之一。)
+grep -E '^LAN_NFT_CONF=' deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 grep -q 'http.server' "$CH_DIR/fn.sh" || { echo "EXTRACT-FAIL"; exit 9; }
 c_g(){ echo "$*"; }; c_y(){ echo "$*"; }
 # shellcheck source=/dev/null

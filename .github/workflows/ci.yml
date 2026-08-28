@@ -175,6 +175,12 @@ jobs:
       - name: "反代重载的唯一入口(admin off 下 reload 必败, 只生成不重启=进程用着旧的)"
         run: bash tests/test-lan-proxy-reload-chokepoint.sh
 
+      - name: "LAN 产物没变就别重启反代(跳过重启的那条路仍要补回内核白名单)"
+        run: bash tests/test-lan-restart-idempotent.sh
+
+      - name: "功能测试成功路径也要打印 mihomo 日志(截断要说清楚)"
+        run: bash tests/test-functional-log-visibility.sh
+
       - name: "Location 改写: 真 Caddy 打真响应头(静态测试证明不了头被改了)"
         run: bash tests/test-lan-location-live.sh
 

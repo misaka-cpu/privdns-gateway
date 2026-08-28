@@ -5467,8 +5467,47 @@ _lan_cert_missing(){
 #   · `pdg lan render` 重新生成了配置却不重启, pdg-lan 停在 9 小时前, 新规则没进内存。
 #
 # 没在跑就什么都不做 —— 那是"还没 enable", 不是故障。
+# LAN 的三个派生产物的联合指纹。**三个都要算** —— 少算一个, 那个产物变了就不会重启, 而
+# "配置变了进程没跟上"正是本项目反复出事的形态。文件缺失也要体现在指纹里(用一个占位标记),
+# 否则"产物被删"会被当成"没变"而跳过重启, 可那时反代恰恰该被拉起来。
+_lan_artifacts_digest(){
+  local f h out=""
+  for f in "$LAN_CADDYFILE" "$LAN_NFT_CONF" "$LAN_UNIT"; do
+    if [[ -f "$f" ]]; then
+      h="$(sha256sum "$f" 2>/dev/null | cut -d" " -f1)"
+      # **算不出来就整个作废**(打印空串)。文件在但读不到时 sha256sum 只吐一个空串, 那会让
+      # 两份**内容不同**的产物得到同一个指纹 —— 于是"没变"成立、重启被跳过, 而磁盘上其实
+      # 已经换了一份。指纹的用途只有一个: 判断"能不能安全地不重启"; 算不出来时唯一安全的
+      # 答案是"不知道", 而"不知道"必须落到重启那一边。
+      [[ -n "$h" ]] || { printf ''; return 1; }
+      out+="$h"$'\n'
+    else
+      out+="ABSENT:$f"$'\n'      # 缺文件与空文件是两回事, 不能都算成"没内容"
+    fi
+  done
+  printf '%s' "$out" | sha256sum | cut -d" " -f1
+}
+
+# $1(可选)= 改动**之前**取的产物指纹。给了就先比一比: 一个字节都没变就不重启。
+#
+# 为什么值得: LAN 的派生产物在产物层已经是逐字节幂等的, 于是每一次 pdg update、每一次面板
+# 同步都会为一份没变的配置重启一次反代 —— 重启期间反代是断的, 手机上开着的面板会掉一次,
+# 而这类重启没有任何事情能从中获益。本项目在别处早就守着同一条规矩(去广告是"产物真变才
+# 重启", 恢复是"动作从这次内容确实变了的目标推出来"), 这里是唯一的例外。
+#
+# 但跳过重启**不能只是不做事**: 出站白名单是靠 unit 的 ExecStartPre 进内核的, 跳过重启就
+# 跳过了那一步。所以那条路上仍要走一遍 _lan_nft_reapply(它自己幂等, 且只在反代确实在跑时
+# 动手)—— 否则"少一次重启"换来的是一个反代能连内网任意地址的窗口。
+#
+# **不传参数时保持原行为(无条件重启)**: 老调用点的语义是"我不知道变没变", 那时默认值只能
+# 偏保守 —— 静默地少一次重启, 比多一次重启危险得多。
 _lan_apply_proxy(){
+  local before="${1:-}"
   systemctl is-active --quiet pdg-lan 2>/dev/null || return 0
+  if [[ -n "$before" && "$before" == "$(_lan_artifacts_digest)" ]]; then
+    _lan_nft_reapply
+    return 0
+  fi
   systemctl restart pdg-lan >/dev/null 2>&1 && return 0
   c_y "⚠️ pdg-lan 重启失败 —— 新的反代配置与出站白名单都还没生效。"
   return 1
@@ -5496,12 +5535,15 @@ _lan_rollback_converge(){
   systemctl is-active --quiet pdg-lan 2>/dev/null && active=1
 
   if [[ "$intent" == 1 ]]; then
+    # 渲染**之前**取指纹: 回滚收敛在绝大多数机器上会渲出一份与现网逐字节相同的产物
+    # (面板表没变过), 那时不该为它断一次反代。
+    local _lan_d0; _lan_d0="$(_lan_artifacts_digest)"
     if ! _lan_render; then
       c_y "⚠️ LAN 回滚不完整: 派生产物没能按恢复出来的面板表重新生成(第一失败点: 渲染/落盘)。"
       c_y "   面板表与 profile 已经回滚到位; 反代仍在用回滚前的配置。手工补: sudo pdg lan render"
       return 1
     fi
-    if ! _lan_apply_proxy; then
+    if ! _lan_apply_proxy "$_lan_d0"; then
       c_y "⚠️ LAN 回滚不完整: 产物已按面板表更新, 但反代没能重启(第一失败点: 重启 pdg-lan)。"
       c_y "   此刻磁盘是新的、进程还用着旧的。手工补: sudo systemctl restart pdg-lan"
       return 1
@@ -5529,11 +5571,12 @@ _lan_sync_after_change(){
     echo "   (内网面板还没启用, 派生物等 pdg lan enable 时一起生成。)"
     return 0
   fi
+  local _lan_d0; _lan_d0="$(_lan_artifacts_digest)"     # 渲染前, 用来判断产物到底变没变
   _lan_render || { c_y "⚠️ 反代配置/白名单没能重新生成 —— 新面板还不会生效。"; return 1; }
   _lan_wire   || { c_y "⚠️ DNS 劫持集/分流没能同步 —— 新面板还不会生效。"; return 1; }
   # 失败必须向上传播: 这里曾是 `|| true` —— 反代没重启起来, 而调用方照旧打印"已同步"。
   # "磁盘对了、进程没跟上"是本项目反复出事的那个形态, 不能由一句成功文案盖过去。
-  _lan_apply_proxy || return 1
+  _lan_apply_proxy "$_lan_d0" || return 1
   c_g "✅ 反代配置、出站白名单、DNS 劫持集与分流已同步。"
   local miss; miss="$(_lan_cert_missing)"
   if [[ -n "$miss" ]]; then
@@ -5813,9 +5856,11 @@ _nft_apply_main(){
 # 把内网面板的出站白名单补回内核。只在**反代确实在跑**时做 —— 没在跑的话那张表本来就
 # 不该存在(disable/purge 之后留一张表反而是残留)。
 _lan_nft_reapply(){
-  [[ -s /etc/nftables-pdg-lan.conf ]] || return 0
+  # 路径走 $LAN_NFT_CONF, 不写死 —— 同一个文件有两个真源, 迟早对不上; 而且写死之后沙箱
+  # 测试根本指不到假根, 于是这个函数在测试里永远走"文件不存在"那条早退, 什么都没验到。
+  [[ -s "$LAN_NFT_CONF" ]] || return 0
   systemctl is-active --quiet pdg-lan 2>/dev/null || return 0
-  nft -f /etc/nftables-pdg-lan.conf 2>/dev/null && return 0
+  nft -f "$LAN_NFT_CONF" 2>/dev/null && return 0
   c_y "⚠️ 内网面板的出站白名单没能重新加载 —— 反代此刻**能连到内网任意地址**。"
   c_y "   跑 sudo systemctl restart pdg-lan 补上。"
   return 0
