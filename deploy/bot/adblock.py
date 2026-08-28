@@ -72,6 +72,18 @@ LIMITS = {
     # 整张表用不了(线上实测: 21.5 万条的表里一行下划线就全废)。但也不能静默丢 —— 跳过要计数
     # 并上报, 超过这个比例仍然整份拒: 格式真的变了(比如返回半页 HTML), 比例会立刻远超 1%。
     "max_skip_ratio": 0.01,
+    # 用户自己那份 block 文件的上限。以前一道都没有 —— 而 compile_effective 把它**逐字节**
+    # 拷进 mosdns 要加载的 effective_block.txt, 也就是说上面那个按 512 MiB 定出来的内存预算
+    # 可以从这条路完整绕过去。规则是能脚本化追加的(rule-add 就是给 Bot 用的), 一个循环写岔、
+    # 或者把一份下载来的表直接 `cat >>` 进去就到了; 触发之后不会有任何提示, 只在下一次
+    # enable 或 mosdns 重启时把整台机器的 DNS 打没。
+    #
+    # 50000 条的依据是同一次 512 MiB 实测: 15 万条 61.6 MiB → 50 万条 108.6 MiB, 边际约
+    # 0.134 KiB/条, 50000 条 ≈ 6.7 MiB, 相对那次测出来的 186 MiB 余量不到 4%。手工维护的
+    # 名单到不了这个量级 —— 到得了的那都不是手工维护的。
+    # 2 MiB 是同一件事的另一面: 50000 条 × 约 40 字符。单行极长的病态文件靠它兜住。
+    "max_user_entries": 50000,
+    "max_user_bytes": 2 * 1024 * 1024,
 }
 
 # 放行下划线: DNS 协议本身允许(`_dmarc` / `_acme-challenge` 就是), 只是 RFC 1123 的
@@ -227,6 +239,32 @@ def _canonical_block_line(domain):
     return "domain:" + domain
 
 
+class BlockListFull(ValueError):
+    """用户 block 文件满了。
+
+    **必须与"域名不合法"分开。**继承 ValueError 是为了不破坏既有的 `except ValueError`,
+    但调用方要先接这一支: 把"文件满了"报成 INVALID_DOMAIN, 用户会照着那句去改一个完全合法的
+    域名, 改多少次都没用 —— 而真正要做的是删几条旧规则。
+    """
+
+
+def user_block_overflow(text):
+    """用户 block 文件是否超限。返回 (超了吗, 原因)。
+
+    只看两件事: 非空非注释的行数、字节数。**不做规范化、不去重** —— 那会改变"用户文件里
+    到底有多少条"这个事实, 而这道门要拦的正是那个事实。
+    """
+    n = sum(1 for ln in text.splitlines()
+            if ln.strip() and not ln.strip().startswith("#"))
+    if n > LIMITS["max_user_entries"]:
+        return (True, "用户规则 %d 条, 超过上限 %d 条" % (n, LIMITS["max_user_entries"]))
+    b = len(text.encode("utf-8", "replace"))
+    if b > LIMITS["max_user_bytes"]:
+        return (True, "用户规则文件 %.1f MiB, 超过上限 %.1f MiB"
+                % (b / 1048576.0, LIMITS["max_user_bytes"] / 1048576.0))
+    return (False, "")
+
+
 def rule_add(domain, path=None):
     """把域名以 canonical 形态加进用户 block 源。返回 (change, normalized)。
 
@@ -250,7 +288,14 @@ def rule_add(domain, path=None):
         return ("none", norm)
     if text and not text.endswith("\n"):
         text += "\n"
-    _atomic_write(target, text + canon + "\n")
+    cand = text + canon + "\n"
+    # 在**加的那一刻**撞墙, 而不是几天后 enable 时才发现。这里判的是"加完之后会不会超",
+    # 不是"现在超没超" —— 后者会让最后一条压线的规则加进去, 然后 compile 那道门再把整个
+    # enable 拒掉, 用户得到的是一次莫名其妙的失败。
+    over, why = user_block_overflow(cand)
+    if over:
+        raise BlockListFull(why + " —— 未添加。先删掉一些用不着的规则(pdg adblock rule-del)。")
+    _atomic_write(target, cand)
     return ("added", norm)
 
 
@@ -329,7 +374,14 @@ def compile_effective(enabled, state_dir=None, user_block=None, lkg=None):
     ub = user_block or USER_BLOCK
     lk = lkg or os.path.join(d, "list.lkg")
     if enabled:
-        _atomic_write(os.path.join(d, "effective_block.txt"), _read(ub))
+        # rule-add 不是唯一入口 —— 那份文件是用户数据, 可以直接编辑, 也会被快照恢复带回来。
+        # 所以这里才是真正的门。超限**整笔不落盘**: 现网继续用上一份编译产物, 与 update 那边
+        # "任何一步不成立都不落盘, 继续用 LKG"是同一条规矩。
+        ub_text = _read(ub)
+        over, why = user_block_overflow(ub_text)
+        if over:
+            return (False, why)
+        _atomic_write(os.path.join(d, "effective_block.txt"), ub_text)
         raw = normalize(_read(lk).splitlines())
         _atomic_write(os.path.join(d, "effective_list.txt"),
                       "".join("domain:%s\n" % x for x in raw))
@@ -786,6 +838,10 @@ if __name__ == "__main__":
         try:
             fn = rule_add if sys.argv[1] == "rule-add" else rule_del
             change, norm = fn(sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else None)
+        except BlockListFull as e:
+            # 先接这一支: 它也是 ValueError, 落到下面就会被报成"域名不合法"。
+            print(json.dumps({"error": "BLOCKLIST_FULL", "why": str(e)}, ensure_ascii=False))
+            sys.exit(4)
         except ValueError as e:
             print(json.dumps({"error": "INVALID_DOMAIN", "why": str(e)}, ensure_ascii=False))
             sys.exit(2)
@@ -800,9 +856,13 @@ if __name__ == "__main__":
         # 第 4 个参数是用户 block 源的路径, 可选。调用方(pdg.sh)手里本来就有 ADB_USER_BLOCK
         # 这个真源, 让它传进来比在这里再写死一次好 —— 也让沙箱测试能指到假根, 而不必去
         # 伪造 /etc/mosdns。不传时沿用模块常量, 现有调用点行为不变。
-        compile_effective(sys.argv[2] == "1",
-                          sys.argv[3] if len(sys.argv) > 3 else None,
-                          sys.argv[4] if len(sys.argv) > 4 else None)
+        _r = compile_effective(sys.argv[2] == "1",
+                               sys.argv[3] if len(sys.argv) > 3 else None,
+                               sys.argv[4] if len(sys.argv) > 4 else None)
+        # 拒绝的理由必须能传到调用方 —— 否则用户拿到的是一次没有原因的失败。
+        if _r is not True:
+            sys.stderr.write("%s\n" % (_r[1] if isinstance(_r, tuple) else "编译被拒"))
+            sys.exit(3)
         print("ok")
     else:
         print("用法: adblock.py check <域名> [规则目录] | update [状态目录] | compile <0|1> [状态目录]")

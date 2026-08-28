@@ -211,6 +211,9 @@ jobs:
       - name: "第三方表容错: 下划线主机名放行 / 少量坏行跳过计数 / 超阈值仍整份拒"
         run: python3 tests/test-adblock-upstream-tolerance.py
 
+      - name: "用户 block 体积上限: compile 与 rule-add 两道门 / 满了不等于域名不合法"
+        run: python3 tests/test-user-block-ceiling.py
+
       - name: "Telegram 内联按钮管理去广告规则: 闭集 callback / 跨用户隔离 / 只经 argv 调 CLI"
         run: python3 tests/test-bot-adblock-inline.py
 

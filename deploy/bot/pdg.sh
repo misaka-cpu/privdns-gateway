@@ -5865,9 +5865,13 @@ _adblock_apply(){
   bak_b="$(mktemp)"; bak_l="$(mktemp)"
   cp -a "$ADB_STATE_DIR/effective_block.txt" "$bak_b" 2>/dev/null
   cp -a "$ADB_STATE_DIR/effective_list.txt"  "$bak_l" 2>/dev/null
-  if ! python3 "$mod" compile "$want" "$ADB_STATE_DIR" >/dev/null 2>&1; then
-    c_y "❌ 编译规则失败(现网未改动)"; rm -f "$bak_b" "$bak_l"; return 1
-  fi
+  # 把 stderr 留下来: 编译被拒是有具体理由的(比如用户 block 文件超了上限), 丢进 /dev/null
+  # 的话用户拿到的是一次没有原因的失败, 而这条失败恰恰是他自己能修的。
+  local _cerr; _cerr="$(python3 "$mod" compile "$want" "$ADB_STATE_DIR" 2>&1 >/dev/null)" || {
+    c_y "❌ 编译规则失败(现网未改动)"
+    [[ -n "$_cerr" ]] && c_y "   原因: $(head -1 <<<"$_cerr")"
+    rm -f "$bak_b" "$bak_l"; return 1
+  }
   systemctl restart mosdns 2>/dev/null; sleep 1
   if ! systemctl is-active --quiet mosdns; then
     c_y "❌ mosdns 重启失败 → 退回上一份编译产物。"
@@ -5981,8 +5985,8 @@ cmd_adblock(){
     rule-add|rule-del)
       # Telegram Bot 的可信入口。Bot **不许自己写规则文件**, 也不许解析这里的中文文案 ——
       # 这条分支最后一定吐一份闭集 JSON, 字段含义见 test-adblock-rule-cli.sh:
-      #   result ∈ invalid_input|already_exists|not_found|saved_inactive|applied
-      #            |apply_failed_rolled_back|rollback_incomplete
+      #   result ∈ invalid_input|blocklist_full|already_exists|not_found|saved_inactive
+      #            |applied|apply_failed_rolled_back|rollback_incomplete
       #   change ∈ added|removed|none
       need_root adblock
       # cmd_adblock 开头已经 shift 过: 这里 $1 是域名, 动作在 $sub 里。
@@ -6014,6 +6018,14 @@ cmd_adblock(){
       if [[ "$_prc" == 2 ]]; then
         # 只有"域名非法"是 2。其它非零是**写不进去**, 不能冒充成用户输入的错。
         rm -f "$_src_bak"; _adb_emit invalid_input none; return 2
+      fi
+      if [[ "$_prc" == 4 ]]; then
+        # 用户 block 文件满了。**一个字节都没动过** —— 既不是"域名不合法"(用户会去改一个
+        # 完全合法的域名, 改多少次都没用), 也不是"应用失败已回滚"(那是在说改了又撤回)。
+        c_y "  ❌ $(printf '%s' "$_out" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("why",""))
+except Exception: print("用户规则文件已达上限")')"
+        rm -f "$_src_bak"; _adb_emit blocklist_full none; return 4
       fi
       if [[ "$_prc" != 0 ]]; then
         c_y "  ❌ 写用户规则失败 —— 未改动任何生效产物。"
@@ -6070,8 +6082,10 @@ sys.exit(0 if hit else 1)' "$_norm" "$ADB_USER_ALLOW"; then
         rm -f "$_src_bak" "$_eb_bak" "$_el_bak"
         return "$_bad"
       }
-      if ! python3 "$mod" compile 1 "$ADB_STATE_DIR" "$ADB_USER_BLOCK" >/dev/null 2>&1; then
+      local _cerr2
+      if ! _cerr2="$(python3 "$mod" compile 1 "$ADB_STATE_DIR" "$ADB_USER_BLOCK" 2>&1 >/dev/null)"; then
         c_y "  ❌ 编译失败 —— 已回滚, 规则未生效。"
+        [[ -n "$_cerr2" ]] && c_y "     原因: $(head -1 <<<"$_cerr2")"
         if _adb_rollback; then _adb_emit apply_failed_rolled_back "$_change"
         else _adb_emit rollback_incomplete "$_change"; fi
         return 1
