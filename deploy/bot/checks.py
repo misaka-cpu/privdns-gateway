@@ -922,12 +922,6 @@ def _internal_seq_block(conf):
             out.append(ln)
     return "\n".join(out)
 
-_RL_WARN = ("warn", "限流", "mosdns 单客户端 QPS 兜底(rate_limiter)缺失或参数/动作异常; "
-                            "运行 sudo pdg restart 或 sudo pdg 触发迁移。高度自定义配置请手动在 "
-                            "internal_sequence 缓存前加 client_limiter(qps200/burst400/mask4-32/mask6-128)+ "
-                            "'!$client_limiter → reject 5'。")
-_RL_WANT = {"qps": "200", "burst": "400", "mask4": "32", "mask6": "128"}
-
 def _lan_route_projection(text):
     """把一份 Caddyfile 投影成 {host: 上游}。
 
@@ -1126,6 +1120,15 @@ def check_adblock():
                                     "公共域): %s —— 这些域名不在保护内。" % note)
     return ("ok", name, msg)
 
+
+# 这两个常量的**唯一**消费者就是下面那个函数。它们原本在 200 行开外 —— v1.10.16 把
+# check_lan_proxy_routes 插在了中间, 于是判据的期望值和用它的地方隔着两个不相干的函数。
+# 行为没受影响, 但改判据的人得先找到它们; 而"找不到就照着记忆改"正是判据悄悄漂掉的起点。
+_RL_WARN = ("warn", "限流", "mosdns 单客户端 QPS 兜底(rate_limiter)缺失或参数/动作异常; "
+                            "运行 sudo pdg restart 或 sudo pdg 触发迁移。高度自定义配置请手动在 "
+                            "internal_sequence 缓存前加 client_limiter(qps200/burst400/mask4-32/mask6-128)+ "
+                            "'!$client_limiter → reject 5'。")
+_RL_WANT = {"qps": "200", "burst": "400", "mask4": "32", "mask6": "128"}
 
 def check_mosdns_ratelimit():
     """单客户端 QPS 兜底(rate_limiter)是否就位且参数/动作正确:

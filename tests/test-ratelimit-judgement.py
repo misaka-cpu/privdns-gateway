@@ -127,6 +127,32 @@ poisoned_bad = LINE_RE.sub("", poisoned)
 lvl2, _ = verdict(poisoned_bad)
 (ok if lvl2 == "warn" else bad)("同样有注释但判据真缺失时仍然 warn(实得 %s)" % lvl2)
 
+print()
+print("══ 5. 判据的期望值必须挨着用它的那个函数 ══")
+# `_RL_WARN` / `_RL_WANT` 的唯一消费者就是 check_mosdns_ratelimit。它们曾经被隔在 200 行
+# 开外(v1.10.16 把 check_lan_proxy_routes 插在了中间)—— 行为没受影响, 但改判据的人得先
+# 找到它们, 而"找不到就照着记忆改"正是判据悄悄漂掉的起点(这一版修的那条假警告就是这么来的)。
+_src = (ROOT / "deploy/bot/checks.py").read_text(encoding="utf-8").splitlines()
+_pos = {}
+for _i, _l in enumerate(_src, 1):
+    if _l.startswith("_RL_WARN =") and "warn" not in _pos:
+        _pos["warn"] = _i
+    if _l.startswith("_RL_WANT =") and "want" not in _pos:
+        _pos["want"] = _i
+    if _l.startswith("def check_mosdns_ratelimit(") and "fn" not in _pos:
+        _pos["fn"] = _i
+(ok if len(_pos) == 3 else bad)("三处都找得到(实得 %r)" % _pos)
+if len(_pos) == 3:
+    _gap = max(_pos["fn"] - _pos["warn"], _pos["fn"] - _pos["want"])
+    (ok if 0 < _gap <= 20 else
+     bad)("常量就在函数上方 20 行内(实得相隔 %d 行 —— 中间又被插进别的东西了)" % _gap)
+    # 反面: 它们**必须**在函数之前(不能被挪到后面, 那样 import 时就 NameError)
+    (ok if _pos["warn"] < _pos["fn"] and _pos["want"] < _pos["fn"] else
+     bad)("常量定义在函数之前")
+# 还有一条更要紧的: 别处不许再出现第二份同名期望值
+_dups = [i for i, l in enumerate(_src, 1) if l.startswith("_RL_WANT =")]
+(ok if len(_dups) == 1 else bad)("_RL_WANT 只有一处定义(实得 %r)" % _dups)
+
 print("-" * 62)
 print("test-ratelimit-judgement.py: 通过 %d, 失败 %d" % (PASS[0], FAIL[0]))
 sys.exit(1 if FAIL[0] else 0)
