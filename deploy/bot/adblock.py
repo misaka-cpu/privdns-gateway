@@ -84,6 +84,11 @@ LIMITS = {
     # 2 MiB 是同一件事的另一面: 50000 条 × 约 40 字符。单行极长的病态文件靠它兜住。
     "max_user_entries": 50000,
     "max_user_bytes": 2 * 1024 * 1024,
+    # 一次批量最多接受多少个域名。这个数不是内存约束(那由上面两条兜着), 是**回执可读性**与
+    # 事务时长: 100 条的逐条回执在 Telegram 里已经要翻屏了, 再多用户也读不完; 而一笔事务
+    # 拖太久, 期间 `pdg update` 就一直抢不到锁。粘贴一屏域名远超这个数的, 那是在导入一份表,
+    # 该走 `source add` 而不是手工规则。
+    "max_bulk_domains": 100,
 }
 
 # 放行下划线: DNS 协议本身允许(`_dmarc` / `_acme-challenge` 就是), 只是 RFC 1123 的
@@ -297,6 +302,60 @@ def rule_add(domain, path=None):
         raise BlockListFull(why + " —— 未添加。先删掉一些用不着的规则(pdg adblock rule-del)。")
     _atomic_write(target, cand)
     return ("added", norm)
+
+
+def rule_add_many(domains, path=None):
+    """一次加多个。返回 (results, changed)。
+
+    **逐条给结果, 不整批拒。** 用户粘贴 20 个域名、其中一个打错就整批退回的话, 他还得自己
+    去找是哪一个 —— 那正是他想让机器替他做的事。所以合法的照收, 不合法的逐条点名。
+
+    只有两种情况整批拒: 条数超上限、空输入。那两种下面一个字节都不写。
+
+    写盘只有**一次**: 逐条 append 会让 N 条规则产生 N 次原子写, 中途失败就停在一个谁也说不清
+    的中间态。这里先在内存里把最终文本拼好, 一次落盘。
+    """
+    doms = [d.strip() for d in domains if d and d.strip()]
+    if not doms:
+        return ([], 0, "EMPTY")
+    if len(doms) > LIMITS["max_bulk_domains"]:
+        return ([], 0, "TOO_MANY")
+    target = path or USER_BLOCK
+    try:
+        with open(target, encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        text = ""
+    if text and not text.endswith("\n"):
+        text += "\n"
+    have = {ln.strip() for ln in text.splitlines() if ln.strip()}
+    results = []
+    changed = 0
+    for raw in doms:
+        good, norm, why = validate_domain(raw)
+        if not good:
+            # **不回显原文** —— 与 check / rule-add 同一条规矩。域名字段回的是用户给的那个串,
+            # 用户要靠它认出是哪一条打错了; why 只说是哪一类不合法。
+            results.append({"domain": raw, "error": "INVALID_DOMAIN", "why": why})
+            continue
+        canon = _canonical_block_line(norm)
+        if canon in have:
+            results.append({"domain": raw, "normalized": norm, "change": "none"})
+            continue
+        cand = text + canon + "\n"
+        over, why2 = user_block_overflow(cand)
+        if over:
+            # 满了之后**继续走完剩下的**: 每一条都得有回执, 用户才知道谁没进去。
+            results.append({"domain": raw, "normalized": norm,
+                            "error": "BLOCKLIST_FULL", "why": why2})
+            continue
+        text = cand
+        have.add(canon)
+        changed += 1
+        results.append({"domain": raw, "normalized": norm, "change": "added"})
+    if changed:
+        _atomic_write(target, text)
+    return (results, changed, "")
 
 
 def rule_del(domain, path=None):
@@ -832,6 +891,19 @@ if __name__ == "__main__":
             "sources": read_sources(sys.argv[2] if len(sys.argv) > 2 else None),
             "defaults": list(DEFAULT_SOURCES),
         }, ensure_ascii=False))
+    elif len(sys.argv) >= 2 and sys.argv[1] == "rule-add-many":
+        # 域名走 **stdin**, 一行一个。不走 argv: 条数由用户决定, 而 argv 有长度上限,
+        # 超限的表现是 E2BIG —— 一个跟"域名对不对"毫无关系的报错。
+        _doms = [l for l in sys.stdin.read().splitlines()]
+        _res, _changed, _err = rule_add_many(
+            _doms, sys.argv[2] if len(sys.argv) > 2 else None)
+        if _err:
+            print(json.dumps({"error": _err, "results": [], "changed": 0},
+                             ensure_ascii=False))
+            sys.exit(2)
+        print(json.dumps({"results": _res, "changed": _changed}, ensure_ascii=False))
+        # 有任何一条没进去就退非零 —— 调用方不该靠数数组长度才发现出了事。
+        sys.exit(0 if all("error" not in r for r in _res) else 2)
     elif len(sys.argv) >= 3 and sys.argv[1] in ("rule-add", "rule-del"):
         # 只吐 JSON, 不吐文案 —— 调用方(pdg.sh → Bot)认字段不认措辞。
         # 与 check 同一条规矩: **非法输入不回显原文**, 只说是哪一类不合法。

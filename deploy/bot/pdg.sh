@@ -6045,6 +6045,77 @@ cmd_adblock(){
         sed 's/^/    /' <<<"$out" | head -3
         return 1
       fi;;
+    rule-add-many)
+      # 批量加阻断规则。**一笔事务**: 一次锁、一次改源、一次编译、一次重启。
+      # 不做成"在 Bot 里循环调 N 次 rule-add": 那只是把 N 次 mosdns 重启从用户手里搬进代码,
+      # 一次都没少, 而且中间任何一次撞上 `pdg update` 就卡住。
+      #
+      # 域名走 **stdin**(一行一个), 不走 argv —— 条数由用户决定, argv 有长度上限, 超限的
+      # 表现是 E2BIG, 一个跟域名毫无关系的报错。
+      need_root adblock
+      local mod _bulk_out _bulk_rc=0 _changed=0
+      mod="$(_pdg_module adblock.py)" || { echo '{"result":"apply_failed_rolled_back","changed":0}'; return 1; }
+      # 与单条那支同一把全局锁, 同样先非阻塞试一次 —— 抢不到就吐 ADBLOCK_BUSY 走人,
+      # 一个字节都还没动过, 不能说成"失败并回滚"。
+      exec 9>"$LOCK" 2>/dev/null || { echo '{"result":"ADBLOCK_BUSY","changed":0}'; return 1; }
+      if ! flock -n 9; then
+        echo '{"result":"ADBLOCK_BUSY","changed":0}'; return 1
+      fi
+      PDG_LOCKED=1
+      _adblock_ensure_files || { echo '{"result":"apply_failed_rolled_back","changed":0}'; return 1; }
+      local _src_bak; _src_bak="$(mktemp)" || return 1
+      cp -a "$ADB_USER_BLOCK" "$_src_bak" 2>/dev/null || : > "$_src_bak"
+      _bulk_out="$(python3 "$mod" rule-add-many "$ADB_USER_BLOCK")" || _bulk_rc=$?
+      _changed="$(printf '%s' "$_bulk_out" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("changed",0))
+except Exception: print(0)')"
+      # 一条都没变 → 没什么要编译的, 更没必要重启。直接把逐条回执交出去。
+      if [[ "${_changed:-0}" == 0 ]]; then
+        rm -f "$_src_bak"
+        printf '%s\n' "$_bulk_out"
+        return "$_bulk_rc"
+      fi
+      if [[ "$(_adblock_intent)" != 1 ]]; then
+        rm -f "$_src_bak"
+        printf '%s\n' "$_bulk_out"
+        c_y "  规则已保存, 但去广告当前未启用, 因此尚未生效。" >&2
+        return "$_bulk_rc"
+      fi
+      # 启用态: 与单条那支同样的产物前像 + 编译 + 产物真变才重启 + 失败整份回滚。
+      local _eb="$ADB_STATE_DIR/effective_block.txt" _el="$ADB_STATE_DIR/effective_list.txt"
+      local _eb_bak _el_bak _eb0 _el0 _cerr3
+      _eb_bak="$(mktemp)"; _el_bak="$(mktemp)"
+      cp -a "$_eb" "$_eb_bak" 2>/dev/null || : > "$_eb_bak"
+      cp -a "$_el" "$_el_bak" 2>/dev/null || : > "$_el_bak"
+      _eb0="$(sha256sum "$_eb" 2>/dev/null | cut -d' ' -f1)"
+      _el0="$(sha256sum "$_el" 2>/dev/null | cut -d' ' -f1)"
+      _bulk_rollback(){
+        cp -a "$_src_bak" "$ADB_USER_BLOCK" 2>/dev/null
+        cp -a "$_eb_bak" "$_eb" 2>/dev/null
+        cp -a "$_el_bak" "$_el" 2>/dev/null
+        rm -f "$_src_bak" "$_eb_bak" "$_el_bak"
+      }
+      if ! _cerr3="$(python3 "$mod" compile 1 "$ADB_STATE_DIR" "$ADB_USER_BLOCK" 2>&1 >/dev/null)"; then
+        _bulk_rollback
+        c_y "  ❌ 编译失败 —— 已回滚, 规则未生效。" >&2
+        [[ -n "$_cerr3" ]] && c_y "     原因: $(head -1 <<<"$_cerr3")" >&2
+        echo '{"result":"apply_failed_rolled_back","changed":0}'; return 1
+      fi
+      local _eb1 _el1
+      _eb1="$(sha256sum "$_eb" 2>/dev/null | cut -d' ' -f1)"
+      _el1="$(sha256sum "$_el" 2>/dev/null | cut -d' ' -f1)"
+      if [[ "$_eb0" != "$_eb1" || "$_el0" != "$_el1" ]]; then
+        systemctl restart mosdns 2>/dev/null; sleep 1
+        if ! systemctl is-active --quiet mosdns; then
+          _bulk_rollback; systemctl restart mosdns 2>/dev/null
+          c_y "  ❌ mosdns 起不来 —— 已回滚, 规则未生效。" >&2
+          echo '{"result":"apply_failed_rolled_back","changed":0}'; return 1
+        fi
+      fi
+      rm -f "$_src_bak" "$_eb_bak" "$_el_bak"
+      printf '%s\n' "$_bulk_out"
+      return "$_bulk_rc" ;;
+
     rule-add|rule-del)
       # Telegram Bot 的可信入口。Bot **不许自己写规则文件**, 也不许解析这里的中文文案 ——
       # 这条分支最后一定吐一份闭集 JSON, 字段含义见 test-adblock-rule-cli.sh:

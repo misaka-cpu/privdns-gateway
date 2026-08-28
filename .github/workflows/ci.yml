@@ -217,6 +217,9 @@ jobs:
       - name: "用户 block 体积上限: compile 与 rule-add 两道门 / 满了不等于域名不合法"
         run: python3 tests/test-user-block-ceiling.py
 
+      - name: "批量加规则是一笔事务(一次锁/一次编译/一次重启), 单域名旧契约不变"
+        run: python3 tests/test-adblock-bulk-rules.py
+
       - name: "Telegram 内联按钮管理去广告规则: 闭集 callback / 跨用户隔离 / 只经 argv 调 CLI"
         run: python3 tests/test-bot-adblock-inline.py
 
