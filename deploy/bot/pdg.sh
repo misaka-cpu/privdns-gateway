@@ -340,6 +340,7 @@ cmd_status(){
   # mihomo 模式 443/80 由 nft 转到 7893(redir), 故把 7893 一并纳入端口展示
   ports=$(ss -lntu 2>/dev/null | grep -oE ':(53|80|81|443|853|7893|8445|9090)\b' | sed 's/^://' | sort -u | sed "s|^9090$|$p9090|" | tr '\n' ' ')
   echo "  监听端口     $ports"
+  echo "  去广告       $(_adblock_status_line)"
   # 读不到就说读不到 —— 以前 describe 失败(仓库损坏 / dubious ownership)时这里输出一个空值,
   # 看起来像"版本号是空的", 排错方向全歪。
   if [[ -d "$REPO_DIR/.git" ]]; then
@@ -6012,6 +6013,23 @@ _adb_count_rules(){
   printf '%s' "${n:-0}"
 }
 
+# 主状态页那一行。**未启用时也要输出** —— 只在启用时才显示的话, 一台"以为开着其实没开"
+# 的机器在主状态页上看不出任何区别, 而那正是最需要它说话的情形。
+#
+# 报的是**表的大小**, 不是命中次数。本项目没有命中统计(四条实现路径都调查过并否决,
+# 见 HANDOFF), 措辞不许造出一个看着像命中数的数字。
+_adblock_status_line(){
+  local intent lst usr
+  intent="$(_adblock_intent)"
+  if [[ "$intent" != 1 ]]; then
+    printf '未启用'
+    return 0
+  fi
+  lst="$(_adb_count_rules "$ADB_STATE_DIR/effective_list.txt")"
+  usr="$(_adb_count_rules "$ADB_USER_BLOCK")"
+  printf '已启用(第三方表 %s 条 / 自定义 %s 条)' "$lst" "$usr"
+}
+
 _adblock_status(){
   local intent count updated
   intent="$(_adblock_intent)"; [[ "$intent" == 1 ]] || intent=0
@@ -6110,6 +6128,11 @@ cmd_adblock(){
         sed 's/^/    /' <<<"$out" | head -3
         return 1
       fi;;
+    status-line)
+      # 主状态页那一行的**唯一**来源。Bot 也调它 —— 两处各拼一份措辞, 迟早有一处把
+      # "表的大小"说成"命中次数", 而本项目没有命中统计(见 HANDOFF)。
+      _adblock_status_line; echo
+      return 0;;
     rule-add-many)
       # 批量加阻断规则。**一笔事务**: 一次锁、一次改源、一次编译、一次重启。
       # 不做成"在 Bot 里循环调 N 次 rule-add": 那只是把 N 次 mosdns 重启从用户手里搬进代码,
@@ -6416,7 +6439,7 @@ try: d=json.loads(sys.argv[1] or "{}"); print("%s 条, 更新于 %s, 来源 %s" 
 except Exception: print("(读不到元数据)")' "$meta" 2>/dev/null)"
       echo "  使用 LKG  : $([[ -s "$ADB_STATE_DIR/list.lkg" ]] && echo 是 || echo 否)";;
     *)
-      echo "用法: pdg adblock <status|enable|disable|update|check <域名>|source <list|add|del|reset>|rule-add <域名>|rule-del <域名>>";;
+      echo "用法: pdg adblock <status|status-line|enable|disable|update|check <域名>|source <list|add|del|reset>|rule-add <域名>|rule-del <域名>>";;
   esac
 }
 
@@ -6859,5 +6882,5 @@ case "${1:-menu}" in
   link)          shift || true; cmd_link "$@";;
   uninstall|rm)  shift || true; cmd_uninstall "$@";;
   rescue)        shift || true; cmd_rescue "$@";;
-  *) echo "用法: pdg [menu|status|doctor [--json|--deep]|update [--dry-run]|snapshot|rollback [n]|token|restart|log [n]|traffic|ios [status|diff|previous|ack|recover|repair](仅 iOS)|report [--redact-ip|--full]|detect-cidr|platform <ios|android>|hijack-mode <all|gfw>|ssh-source [status|tailnet|any|confirm]|link status|link session <start|status|stop>|lan <status|list|check|routes|add|rm>|adblock <status|enable|disable|update|check <域名>|rule-add <域名>|rule-del <域名>|source <list [--json]|add <URL>|del <URL>|reset>>|migrate|migrate-fw|tx <list|show|recover|abort>|rescue <enable|disable|status|fingerprint|bind <IPv4>|rotate-token|rotate-cert>|uninstall [--purge]]";;
+  *) echo "用法: pdg [menu|status|doctor [--json|--deep]|update [--dry-run]|snapshot|rollback [n]|token|restart|log [n]|traffic|ios [status|diff|previous|ack|recover|repair](仅 iOS)|report [--redact-ip|--full]|detect-cidr|platform <ios|android>|hijack-mode <all|gfw>|ssh-source [status|tailnet|any|confirm]|link status|link session <start|status|stop>|lan <status|list|check|routes|add|rm>|adblock <status|status-line|enable|disable|update|check <域名>|rule-add <域名>|rule-del <域名>|source <list [--json]|add <URL>|del <URL>|reset>>|migrate|migrate-fw|tx <list|show|recover|abort>|rescue <enable|disable|status|fingerprint|bind <IPv4>|rotate-token|rotate-cert>|uninstall [--purge]]";;
 esac
