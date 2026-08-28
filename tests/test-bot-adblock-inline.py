@@ -148,8 +148,11 @@ want = ["当前状态", "添加", "删除", "查询", "返回"]
 missing = [w for w in want if not any(w in t for t, _ in menu)]
 (ok if not missing else bad)("五个按钮齐全(缺: %s)" % (missing or "无"))
 datas = {d for _, d in menu if d}
-CLOSED = {"adblock:menu", "adblock:status", "adblock:add", "adblock:del",
-          "adblock:check", "adblock:cancel", "adblock:back"}
+# 闭集要与 handle_cb 里那张白名单**同源** —— 两处手写会漂: 实现多一个动作而这里不知道,
+# 这一格就成了对旧世界的断言。直接从源码里把那张表抽出来。
+_wl = re.search(r'if act not in \(([^)]*)\)', SRC, re.S)
+CLOSED = {"adblock:" + m for m in re.findall(r'"([a-z]+)"', _wl.group(1))} if _wl else set()
+(ok if len(CLOSED) >= 7 else bad)("抽得到 handle_cb 的动作白名单(实得 %d 个)" % len(CLOSED))
 stray = {d for d in datas if d.startswith("adblock") and d not in CLOSED}
 (ok if not stray else bad)("callback_data 全在闭集内(越界: %s)" % (stray or "无"))
 (ok if all(len(d.encode()) <= 64 for d in datas) else bad)("callback_data 长度均 ≤64 字节")
