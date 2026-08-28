@@ -376,8 +376,10 @@ def answer_cb_async(cb_id):
             pass
     threading.Thread(target=go, daemon=True).start()
 
-def sh(cmd):
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+def sh(cmd, input=None):          # noqa: A002 —— 与 subprocess.run 同名, 刻意保持一致
+    """跑一条命令。`input` 走 stdin —— 批量域名条数由用户决定, argv 有长度上限, 超了会得到
+    E2BIG 这种跟内容毫无关系的报错。"""
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=180, input=input)
 
 # ── clash_api (sing-box experimental) ──
 def _clash_secret():
@@ -4294,6 +4296,14 @@ def linktest_cancel(chat, mid):
 PDG_CLI = "/usr/local/bin/pdg"
 # 去广告结果码 → 给人看的话。**文案由结果码决定**, 不去猜 CLI 的自由输出:
 # 那是"可信接口"这四个字的全部意义所在。
+# 一次批量的域名上限。**从 adblock.py 读**, 不在这里再写一个数 —— 两处手写的数字必然
+# 漂移, 而漂移的表现是 Bot 说"最多 100 个"而 CLI 在 50 个就拒了。
+try:
+    import adblock as _adblock_mod                           # noqa: E402
+    BULK_MAX = _adblock_mod.LIMITS["max_bulk_domains"]
+except Exception:                                            # noqa: BLE001
+    BULK_MAX = 100
+
 ADBLOCK_SAY = {
     "added": "✅ 已添加",
     "removed": "✅ 已删除",
@@ -4346,6 +4356,51 @@ def _adblock_reply(d, act):
     return "\n".join(parts)
 
 
+def _adblock_bulk(names):
+    """批量加阻断规则。域名走 stdin(一行一个)—— 不走 argv, 条数由用户决定而 argv 有长度上限。"""
+    try:
+        r = sh([PDG_CLI, "adblock", "rule-add-many"], input="\n".join(names))
+    except Exception:                                        # noqa: BLE001
+        return {"result": "apply_failed_rolled_back", "results": [], "changed": 0}
+    for line in reversed((r.stdout or "").strip().splitlines()):
+        try:
+            return json.loads(line)
+        except Exception:                                    # noqa: BLE001
+            continue
+    return {"result": "apply_failed_rolled_back", "results": [], "changed": 0}
+
+
+def _adblock_bulk_reply(d):
+    """批量结果 → 一条人话回执。
+
+    逐条都要交代 —— 用户粘了 20 个域名, 只说"成功 18 个"等于让他自己去数是哪两个没进去。
+    但也不能把 20 行全铺开: 成功的归成一个数, **没进去的逐条点名**, 那才是他要看的。
+    """
+    if d.get("result") in ADBLOCK_SAY:
+        return ADBLOCK_SAY[d["result"]]
+    if d.get("error") == "TOO_MANY":
+        return ("❌ 一次最多 %d 个域名，未做任何改动。\n"
+                "要导入一整份表的话，用 <code>pdg adblock source add &lt;URL&gt;</code> 更合适。"
+                % BULK_MAX)
+    rs = d.get("results") or []
+    if not rs:
+        return "❌ 没有可处理的域名，未做任何改动。"
+    added = [x for x in rs if x.get("change") == "added"]
+    dup = [x for x in rs if x.get("change") == "none"]
+    badr = [x for x in rs if x.get("error")]
+    parts = []
+    if added:
+        parts.append("✅ 已添加 %d 个" % len(added))
+    if dup:
+        parts.append("ℹ️ %d 个原本已存在" % len(dup))
+    for x in badr:
+        why = ("已达上限" if x.get("error") == "BLOCKLIST_FULL" else "不是合法域名")
+        parts.append("❌ <code>%s</code>：%s" % (html.escape(str(x.get("domain", "?"))[:80]), why))
+    if not added and not dup and badr:
+        parts.append("未做任何改动。")
+    return "\n".join(parts)
+
+
 def _adblock_pending(chat, uid, kind):
     """建立待输入状态。值里带发起者 uid —— 状态本身是 chat 键(沿用既有约定),
     但**谁发起的就只有谁能完成**, 群里旁人发的下一条不算数。"""
@@ -4371,7 +4426,7 @@ def handle_cb(chat, mid, data, uid=None):
             edit(chat, mid, "📊 <b>去广告状态</b>\n<pre>" + html.escape(out) + "</pre>", ADBLOCK_BACK); return
         kind = {"add": "add", "del": "del", "check": "check"}[act]
         _adblock_pending(chat, uid, kind)
-        tip = {"add": "发一个要<b>阻断</b>的域名。",
+        tip = {"add": "发要<b>阻断</b>的域名，一次可以发多个（换行或空格分隔，最多 %d 个）。" % BULK_MAX,
                "del": "发一个要<b>删除</b>的阻断规则域名（只删由本入口添加的那一条）。",
                "check": "发一个域名，我查它现在会不会被阻断。"}[kind]
         edit(chat, mid, tip + "\n/cancel 或按下面的按钮取消。", ADBLOCK_CANCEL); return
@@ -5005,6 +5060,12 @@ def handle_text(chat, text, mid=None, uid=None):
             out = (r.stdout or "").strip() or "(没有输出)"
             send(chat, "🔎 <pre>" + html.escape(out) + "</pre>", ADBLOCK_BACK); return
         if kind in ("add", "del"):
+            # 一条消息里可以给多个域名(换行或空格分隔)。批量走 CLI 的 rule-add-many ——
+            # **不在这里循环调 N 次 rule-add**: 那只是把 N 次 mosdns 重启从用户手里搬进
+            # 代码, 一次都没少, 而且中间任何一次撞上 pdg update 就卡住。
+            names = text.split()
+            if kind == "add" and len(names) > 1:
+                send(chat, _adblock_bulk_reply(_adblock_bulk(names)), ADBLOCK_BACK); return
             d = _adblock_cli("rule-" + kind, text)
             send(chat, _adblock_reply(d, kind), ADBLOCK_BACK); return
         return
