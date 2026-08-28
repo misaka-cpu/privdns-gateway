@@ -164,6 +164,8 @@ try:
         # **抽取清单要跟着依赖走** —— 少抽一个的后果不是报错, 而是被测函数里那次调用
         # 静默失败, 于是同步看起来是 no-op, 而失败信息指向别处。
         'eval "$(sed -n "/^_nft_apply_main()/,/^}/p" %s/deploy/bot/pdg.sh)"; '
+        # 常量跟着抽: 路径已从函数体收归 $LAN_NFT_CONF, set -u 下漏了就是 unbound。
+        'eval "$(grep -E \'^LAN_NFT_CONF=\' %s/deploy/bot/pdg.sh)"; '
         'eval "$(sed -n "/^_lan_nft_reapply()/,/^}/p" %s/deploy/bot/pdg.sh)"; '
         'eval "$(sed -n "/^_fw_tailnet_direct()/,/^}/p" %s/deploy/bot/pdg.sh)"; '
         'eval "$(sed -n "/^_fw_ssh_match()/,/^}/p" %s/deploy/bot/pdg.sh)"; '
@@ -172,7 +174,7 @@ try:
         'migrate_firewall_template_sync %s; echo "rc=$?"'
         # ROOT 的个数必须与上面 eval 行数一致 —— 少一个 shell 会拿到字面 "%s" 当路径,
       # sed 读不到文件、抽出空串、函数未定义, 而失败信息指向别处。
-      % (ROOT, SUDO, NS, ROOT, ROOT, ROOT, ROOT, ROOT, ROOT, ROOT, conf))
+      % (ROOT, SUDO, NS, ROOT, ROOT, ROOT, ROOT, ROOT, ROOT, ROOT, ROOT, conf))
     fn = subprocess.run(SYNC_CMD, shell=True, capture_output=True, text=True, executable="/bin/bash", env=env)
     rc = re.search(r"rc=(\d+)", fn.stdout or "")
     rc = int(rc.group(1)) if rc else -1
