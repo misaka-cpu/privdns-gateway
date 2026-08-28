@@ -5856,9 +5856,11 @@ _nft_apply_main(){
 # 把内网面板的出站白名单补回内核。只在**反代确实在跑**时做 —— 没在跑的话那张表本来就
 # 不该存在(disable/purge 之后留一张表反而是残留)。
 _lan_nft_reapply(){
-  [[ -s /etc/nftables-pdg-lan.conf ]] || return 0
+  # 路径走 $LAN_NFT_CONF, 不写死 —— 同一个文件有两个真源, 迟早对不上; 而且写死之后沙箱
+  # 测试根本指不到假根, 于是这个函数在测试里永远走"文件不存在"那条早退, 什么都没验到。
+  [[ -s "$LAN_NFT_CONF" ]] || return 0
   systemctl is-active --quiet pdg-lan 2>/dev/null || return 0
-  nft -f /etc/nftables-pdg-lan.conf 2>/dev/null && return 0
+  nft -f "$LAN_NFT_CONF" 2>/dev/null && return 0
   c_y "⚠️ 内网面板的出站白名单没能重新加载 —— 反代此刻**能连到内网任意地址**。"
   c_y "   跑 sudo systemctl restart pdg-lan 补上。"
   return 0
