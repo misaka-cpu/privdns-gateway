@@ -376,6 +376,9 @@ jobs:
       - name: "update 前置 mosdns 完整性预检 (缺失/命令非零/版本不符/摘要不符均在第一次副作用前停下)"
         run: bash tests/test-update-mosdns-preflight.sh
 
+      - name: "E2E 夹具必须播真 mosdns (shell 假桩被生产判据拒绝 / 真钉定二进制被接受 / 夹具不联网)"
+        run: python3 tests/test-e2e-mosdns-fixture.py
+
       - name: "全局锁继承八格 (父锁复用/独立取锁/BUSY/环境变量伪造/错文件/inode 变更/并发/释放)"
         run: bash tests/test-lock-inherit.sh
 
@@ -908,6 +911,11 @@ jobs:
           apt-get update -qq
           DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
             bash curl ca-certificates python3 tar gzip unzip dnsutils git coreutils openssl iproute2 >/dev/null
+      # 与 lint / functional 用的是**同一份**脚本(版本与 SHA256 走 lib/versions.sh)。
+      # 备在 job 这一层而不是每个用例各取一次: 夹具于是直接复用已经就位的那一份, 自己
+      # 一次网络请求都不发。校验不过就让这一步失败, 不允许"下不到就跳过"。
+      - name: "准备钉死版 mosdns (健康夹具要真二进制: 短路与 doctor 都比 SHA256)"
+        run: bash tests/prepare-mosdns.sh
       - name: "跑 ${{ matrix.script }}"
         env: { PDG_E2E_ISOLATED: "1" }
         run: bash tests/${{ matrix.script }}
@@ -1275,6 +1283,11 @@ jobs:
           DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
             bash curl ca-certificates python3 tar gzip unzip dnsutils git coreutils openssl \
             iproute2 psmisc procps >/dev/null
+      # 与 lint / functional 用的是**同一份**脚本(版本与 SHA256 走 lib/versions.sh)。
+      # 备在 job 这一层而不是每个用例各取一次: 夹具于是直接复用已经就位的那一份, 自己
+      # 一次网络请求都不发。校验不过就让这一步失败, 不允许"下不到就跳过"。
+      - name: "准备钉死版 mosdns (健康夹具要真二进制: 短路与 doctor 都比 SHA256)"
+        run: bash tests/prepare-mosdns.sh
       - name: "跑 e2e-rescue-migration-lock.sh (iOS)"
         env:
           PDG_E2E_ISOLATED: "1"
