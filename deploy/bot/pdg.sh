@@ -1776,7 +1776,10 @@ _update_mosdns_preflight(){
     2)  echo "  $bin 在那儿但**执行不了**(权限 / 不是可执行文件)";;
     3)  echo "  $bin version **命令非零**(它起不来, 打印出来的版本号不算数)";;
     4)  echo "  $bin version 的输出里**读不出版本号**";;
-    5)  echo "  自报**版本不符**: 跑的是 ${BASH_REMATCH[1]:-未知}, 钉死的另有其值";;
+    5)  local _got _want
+        _got="$("$bin" version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+        _want="$(sed -n 's/^MOSDNS_VER="\(.*\)"/\1/p' "$REPO_DIR/lib/versions.sh" 2>/dev/null | head -1)"
+        echo "  自报**版本不符**: 跑的是 v${_got:-未知}, 钉死的是 ${_want:-未知}";;
     6)  echo "  **SHA256 摘要不符**: 版本号对得上, 但文件**内容**不是官方那一份";;
     10) echo "  读不到 $REPO_DIR/lib/versions.sh —— 无从对照, 不在存疑时动手";;
     11) echo "  本架构($march)在钉值表里没有条目 —— 无从对照, 不在存疑时动手";;
