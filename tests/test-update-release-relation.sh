@@ -27,6 +27,11 @@ ok(){ echo "[OK]   $1"; pass=$((pass+1)); }
 bad(){ echo "[FAIL] $1"; nfail=$((nfail+1)); }
 
 command -v git >/dev/null 2>&1 || { echo "[SKIP] 没有 git —— 这一支必须用真 git 判祖先关系"; exit 0; }
+# 会动 ref/config 的 git 一律走 e2e_git: 它把守卫和动作绑成一件事, 于是不存在"忘了守"
+# 这种形态。由来是一次真事故 —— 裸 git 打在了本仓库上, 56 个 tag 与全部 remote-tracking
+# 一起没了。这一支要造四种 git 拓扑, 正是最该走它的用例。
+# shellcheck source=tests/repoguard.sh
+source "$ROOT/tests/repoguard.sh"
 
 sed -n '/^cmd_update(){/,/^}/p'                 "$ROOT/deploy/bot/pdg.sh" > "$WORK/upd.sh"
 sed -n '/^_update_release_relation(){/,/^}/p'   "$ROOT/deploy/bot/pdg.sh" > "$WORK/rel.sh"
@@ -46,11 +51,13 @@ _nuse=$(grep -c '_update_release_relation' "$ROOT/deploy/bot/pdg.sh")
   || bad "判据只出现 $_nuse 处 —— dry-run 与正式 update 没有共用它"
 
 # ── 真 git 拓扑 ─────────────────────────────────────────────────────────────
-g(){ command git -C "$1" "${@:2}"; }
+g(){ e2e_git "$1" "${@:2}"; }          # 只读查询也走它: 目标始终是本轮自造的一次性仓库
 mkrepo(){ # $1=目标目录 $2=是否给 C 打 v2.0.0(1/0); 造出 A(v1.0.0) → B → C 与从 A 分叉的 D
   local r="$1" tag2="${2:-0}"
   rm -rf "$r"; mkdir -p "$r"
-  g "$r" init -q -b main
+  # init 时目标还不是仓库, e2e_guard_repo 必然拒 —— 这一处只能裸调, 但它建的是本轮自己
+  # 刚 mkdir 出来的空目录, 且 $WORK 由 mktemp 生成。init 之后所有操作都走 e2e_git。
+  command git -C "$r" init -q -b main
   g "$r" config user.email t@t; g "$r" config user.name t; g "$r" config commit.gpgsign false
   mkdir -p "$r/lib"
   # cmd_update 会 source 仓库里的运行模块清单; 给一份最小替身(真清单要校验源文件存在)
@@ -136,7 +143,7 @@ echo "══ 2. 正式 update: 当前领先最新发布 → 拒绝且零副作�
 r=$(run main 0 "")
 rc="${r%%|*}"; out="${r#*|}"
 [[ "$rc" != 0 ]] && ok "rc 非 0(实得 $rc)" || bad "当前领先最新发布, update 竟然 rc=0 —— 这就是静默降级"
-did_reset && bad "执行了 git reset —— 未发布提交被退回 $(grep -oE 'reset.*' "$WORK/git.log" | head -1)" || ok "没有执行 git reset"
+did_reset && bad "执行了 reset --hard —— 未发布提交被退回: $(grep -oE 'reset.*' "$WORK/git.log" | head -1)" || ok "没有执行 reset"
 side SNAPSHOT_CALLED && bad "建了快照(拒绝路径不该有任何副作用)" || ok "没建快照"
 side migrate         && bad "跑了迁移" || ok "没跑迁移"
 side "install "      && bad "装了文件" || ok "没装任何文件"
@@ -147,13 +154,13 @@ grep -q '✅ 已更新' <<<"$out" && bad "谎报成功" || ok "没谎报成功"
 # 环境变量不得成为降级后门: PDG_UPDATE_FORCE 是"强制重装同一版本", 不是"允许降级"
 r=$(run main 0 "PDG_UPDATE_FORCE=1"); rc="${r%%|*}"
 [[ "$rc" != 0 ]] && ok "PDG_UPDATE_FORCE=1 也拒绝(它不是降级开关)" || bad "PDG_UPDATE_FORCE 成了降级后门"
-did_reset && bad "PDG_UPDATE_FORCE 下执行了 reset" || ok "PDG_UPDATE_FORCE 下也没 reset"
+did_reset && bad "PDG_UPDATE_FORCE 下执行了 reset --hard" || ok "PDG_UPDATE_FORCE 下也没 reset"
 
 echo
 echo "══ 3. 正式 update: 两边分叉 → 拒绝, 不猜方向 ══"
 r=$(run side 1 ""); rc="${r%%|*}"; out="${r#*|}"
 [[ "$rc" != 0 ]] && ok "rc 非 0(实得 $rc)" || bad "分叉时 update rc=0"
-did_reset && bad "分叉时执行了 git reset" || ok "分叉时没 reset"
+did_reset && bad "分叉时执行了 reset --hard" || ok "分叉时没 reset"
 side SNAPSHOT_CALLED && bad "分叉时建了快照" || ok "分叉时没建快照"
 grep -qE '分叉|拒绝' <<<"$out" && ok "说清了是分叉" || bad "分叉没说清: $(tail -3 <<<"$out")"
 
@@ -195,7 +202,7 @@ else
   ok "dry-run 不再显示那段会被误读的空 HEAD..tag"
 fi
 side SNAPSHOT_CALLED && bad "dry-run 建了快照" || ok "dry-run 零副作用: 没建快照"
-did_reset && bad "dry-run 执行了 reset" || ok "dry-run 零副作用: 没 reset"
+did_reset && bad "dry-run 执行了 reset --hard" || ok "dry-run 零副作用: 没 reset"
 # dry-run 在正常「落后」时仍要列出待更新提交
 r=$(run v1.0.0 1 "" --dry-run); out="${r#*|}"
 grep -q 'B' <<<"$out" && ok "dry-run 落后时照旧列出待更新提交" || bad "dry-run 落后时不列提交了: $out"
