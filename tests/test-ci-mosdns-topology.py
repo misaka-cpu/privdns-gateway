@@ -53,6 +53,21 @@ FETCH = re.compile(r"prepare-mosdns\.sh|mosdns-linux-\w+\.zip")
 NET = re.compile(r"\bcurl\b|\bwget\b|releases/download")
 
 
+def code(text):
+    """去掉 shell / YAML 的整行与行尾注释。
+
+    这几格判的是"代码里有没有做某件事", 而注释里恰恰会**写明不做那件事**
+    (「不用 actions/cache」「没有 curl 回退」「无 token」)。不去注释就会把说明文字
+    当成违规 —— 第一版这一支自己踩了五次。
+    """
+    out = []
+    for ln in text.splitlines():
+        t = ln.split("#", 1)[0] if ln.lstrip().startswith("#") else \
+            (ln.split(" #", 1)[0] if " #" in ln else ln)
+        out.append(t)
+    return "\n".join(out)
+
+
 def steps(j):
     return JOBS[j].get("steps") or []
 
@@ -129,8 +144,8 @@ if os.path.exists(os.path.join(ROOT, INSTALLER)):
     (ok if "lib/versions.sh" in src else bad)("期望值从当前 checkout 的 lib/versions.sh 读")
     (ok if "pdg_mosdns_binary_ok" in src else bad)("消费者也走生产判据复核")
     (ok if re.search(r"install\s+-m\s*755", src) else bad)("以 mode 755 安装")
-    (ok if not NET.search(src) else bad)("消费者安装脚本里没有任何联网动作")
-    (ok if "SKIP" not in src else bad)("不合格时硬失败, 不 SKIP")
+    (ok if not NET.search(code(src)) else bad)("消费者安装脚本里没有任何联网动作")
+    (ok if "SKIP" not in code(src) else bad)("不合格时硬失败, 不 SKIP")
 for j in sorted(consumers):
     uses_installer = any(INSTALLER in r for _, _, r in runs(j))
     (ok if uses_installer else bad)("%s 用统一的 %s 做二次校验" % (j, INSTALLER))
@@ -145,7 +160,7 @@ if os.path.exists(os.path.join(ROOT, NAMER)):
     (ok if "lib/versions.sh" in ns else bad)("名字生成器读 lib/versions.sh")
     for part, why in (("MOSDNS_VER", "版本"), ("arch", "架构"), ("sha", "摘要前缀")):
         (ok if re.search(part, ns, re.I) else bad)("名字含%s" % why)
-    (ok if not re.search(r'v[0-9]+\.[0-9]+\.[0-9]+', ns) else
+    (ok if not re.search(r'v[0-9]+\.[0-9]+\.[0-9]+', code(ns)) else
      bad)("名字生成器里没有硬编码的版本号")
 up = [(j, s) for j in JOBS for s in steps(j) if "upload-artifact" in str(s.get("uses") or "")]
 (ok if len(up) == 1 else bad)("只有一处 upload-artifact(实得 %d)" % len(up))
@@ -163,9 +178,10 @@ conv = re.compile(r"^actions/[\w-]+@(v\d+|[0-9a-f]{40})$")
 for u in uses:
     print("       %s" % u)
     (ok if conv.match(u) else bad)("%s 钉定合规(不许 @main/@master/无 ref)" % u)
-(ok if not re.search(r"uses:\s*\S+@(main|master|latest)\b", TEXT) else
+(ok if not any(re.search(r"@(main|master|latest)$", u) for u in uses) else
  bad)("没有浮动引用 @main/@master/@latest")
-(ok if "actions/cache" not in TEXT else bad)("没有使用 actions/cache(跨 run 缓存被禁)")
+(ok if not any("actions/cache" in u for u in uses) else
+ bad)("没有任何 uses: actions/cache(跨 run 缓存被禁)")
 
 print()
 print("══ 9. producer 的四层校验 ══")
@@ -178,7 +194,7 @@ if PRODUCER in JOBS:
         (ok if re.search(pat, body, re.I) else bad)("producer %s" % why)
     (ok if re.search(r"rm -f .*mosdns|隔离", body) else
      bad)("producer 先移除 runner 上偶然存在的 mosdns(不把已有状态当隐式输入)")
-    (ok if not re.search(r"token|secrets\.", body, re.I) else
+    (ok if not re.search(r"token|secrets\.", code(body), re.I) else
      bad)("manifest / producer 步骤里不出现 token 或 secrets")
 
 print("-" * 62)

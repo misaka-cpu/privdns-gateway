@@ -11,7 +11,71 @@ permissions:
   contents: read
 
 jobs:
+  # ── mosdns 取件的唯一入口 ──────────────────────────────────────────────────
+  # 为什么单独立一个 job: 官方 Release 的取件曾经散在六个 job 里, 而 e2e 是 matrix ——
+  # 每格一个独立容器, 于是"备在 job 层"恰恰就是"每个用例一次": 21 格 = 21 次下载。
+  # 整个 run 对 GitHub Release 发了 28 次请求(还不算 e2e-serial 在夹具里悄悄发的那次)。
+  #
+  # 现在改成: 每 run、每架构**只取一次**, 校验四层, 再经本次 workflow 的短期 artifact
+  # 扇出给所有消费者。artifact 的上下行是同一次 workflow 内部的传递, 不是消费者重新去
+  # 访问官方 Release。
+  #
+  # 不用 actions/cache、不跨 run 复用、不烘进长期镜像、不把二进制提交进 Git —— 那几条
+  # 要么让"这一版是不是官方那一份"失去每次重新证明的机会, 要么把版本维护分叉成两处。
+  prepare-mosdns-fixture:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        # 目前所有 runner 都是 x86_64 → 只有 amd64 一格。将来真出现 arm64 runner 时
+        # 这里加一格即可: 消费者各自按自己的架构算 artifact 名, 不会拿错。
+        arch: [amd64]
+    name: "取件 mosdns (${{ matrix.arch }}, 每 run 每架构仅此一次)"
+    steps:
+      - uses: actions/checkout@v5
+      # 不把 runner 上偶然存在的 mosdns 当隐式输入: 先清干净, 这一步才真的证明了完整取件。
+      - name: "隔离 runner 上偶然存在的 mosdns"
+        run: |
+          set -euo pipefail
+          sudo rm -f /usr/local/bin/mosdns
+          ! command -v mosdns >/dev/null 2>&1 || { echo "PATH 上仍有 mosdns: $(command -v mosdns)"; exit 1; }
+      - name: "推导 artifact 名(由 lib/versions.sh 的钉值生成)"
+        id: name
+        run: echo "artifact=$(bash tests/mosdns-artifact-name.sh ${{ matrix.arch }})" >> "$GITHUB_OUTPUT"
+      # 取件走仓库既有流程: 它自己校验归档 SHA256, 解压后再核一次自报版本。
+      - name: "从官方 Release 取件并校验(归档 SHA + 自报版本)"
+        run: |
+          set -euo pipefail
+          mkdir -p artifact
+          PDG_TEST_MOSDNS="$PWD/artifact/mosdns" bash tests/prepare-mosdns.sh
+      - name: "校验最终二进制 SHA + 生产判据 + 生成 manifest"
+        shell: bash
+        run: |
+          set -euo pipefail
+          # shellcheck source=lib/versions.sh
+          source lib/versions.sh
+          ARCH='${{ matrix.arch }}'
+          WANT="${PDG_SHA256[mosdns-bin-$ARCH]}"
+          GOT="$(sha256sum artifact/mosdns | awk '{print $1}')"
+          [ "$GOT" = "$WANT" ] || { echo "二进制 SHA256 不符: $GOT != $WANT"; exit 1; }
+          # 生产判据 —— 与 install.sh 的严格短路、doctor 的完整性判据同一个函数
+          pdg_mosdns_binary_ok "$ARCH" "$MOSDNS_VER" "$PWD/artifact/mosdns"
+          # manifest 只记可公开的溯源事实: 无 token、无 runner 路径、无生产地址
+          printf '{"version":"%s","arch":"%s","archive_sha256":"%s","binary_sha256":"%s","source_release":"%s","producer_commit":"%s"}\n' \
+            "$MOSDNS_VER" "$ARCH" "${PDG_SHA256[mosdns-$ARCH]}" "$GOT" \
+            "https://github.com/IrineSistiana/mosdns/releases/tag/$MOSDNS_VER" \
+            "$GITHUB_SHA" > artifact/manifest.json
+          cat artifact/manifest.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.name.outputs.artifact }}
+          path: artifact/
+          # 平台允许的最短保留期: 它只服务本次 run, 留久了就成了跨 run 复用的入口。
+          retention-days: 1
+          if-no-files-found: error
+
   lint:
+    needs: prepare-mosdns-fixture
     runs-on: ubuntu-latest
     env:
       # 严格模式: 缺钉死版内核 = 失败。开发者本机单跑时不设它, 那时缺二进制记 [SKIP]。
@@ -40,8 +104,19 @@ jobs:
       # REFUSED。这条以前没有 —— 本地一直绿是因为开发机上有早前 E2E 留下的 mosdns, 而
       # CI 的 lint job 里没有, 于是 test-cidr-transaction 一串失败。v1.7.0 发布前的
       # 第一次真实 CI 就是栽在这里。
-      - name: "准备钉死版 mosdns (事务候选校验要真启动它; 版本与 SHA256 走 lib/versions.sh)"
-        run: sudo -E bash tests/prepare-mosdns.sh
+      # 取本次 run 的钉定 mosdns —— 不再自己去 GitHub Release。名字由 lib/versions.sh 的
+      # 钉值算出来, 与 producer 上传时用的是同一份生成器, 于是"上传的叫什么"与"要什么"
+      # 没有第二个答案。
+      - name: "推导 mosdns artifact 名"
+        run: echo "MOSDNS_ARTIFACT=$(bash tests/mosdns-artifact-name.sh)" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.MOSDNS_ARTIFACT }}
+          path: /tmp/mosdns-fixture
+      # 服务端摘要只证明"传输没坏", 不证明"内容是官方那一份"。这里按当前 checkout 的
+      # lib/versions.sh 自己重算 SHA、重核自报版本, 最后再走一次生产判据。不合格硬失败。
+      - name: "校验并安装钉定 mosdns (自算 SHA / manifest 交叉 / 自报版本 / 生产判据)"
+        run: sudo -E bash tests/install-mosdns-artifact.sh /tmp/mosdns-fixture
 
 
       - name: Python 语法 (py_compile)
@@ -383,6 +458,9 @@ jobs:
         run: |
           python3 -c 'import yaml' 2>/dev/null || sudo apt-get install -y -q python3-yaml
           python3 tests/test-ci-mosdns-topology.py
+
+      - name: "mosdns artifact 往返 (两个消费者各自四层复核 / 改一字节与改 manifest 均硬失败 / 消费者不联网)"
+        run: bash tests/test-mosdns-artifact-roundtrip.sh
 
       - name: "全局锁继承八格 (父锁复用/独立取锁/BUSY/环境变量伪造/错文件/inode 变更/并发/释放)"
         run: bash tests/test-lock-inherit.sh
@@ -805,6 +883,7 @@ jobs:
         run: python3 tests/test-platform-isolation.py
 
   functional:
+    needs: prepare-mosdns-fixture
     # 真功能测试: 下载钉死 SHA256 的 sing-box / mosdns, 真起一遍, 验证两层核心链路。
     runs-on: ubuntu-latest
     steps:
@@ -813,8 +892,19 @@ jobs:
       # `command -v mosdns` —— 装到 PATH 上才算数。**必须紧跟在 checkout 之后**: 放在失败的
       # 那一步后面就永远不会执行(v1.7.0 发布前踩过一次)。顺带让两次 dns-policy 复用同一份
       # 二进制, 不必各下一遍。
-      - name: "准备钉死版 mosdns (负控脚本按 PATH 判前提; 版本与 SHA256 走 lib/versions.sh)"
-        run: sudo -E bash tests/prepare-mosdns.sh
+      # 取本次 run 的钉定 mosdns —— 不再自己去 GitHub Release。名字由 lib/versions.sh 的
+      # 钉值算出来, 与 producer 上传时用的是同一份生成器, 于是"上传的叫什么"与"要什么"
+      # 没有第二个答案。
+      - name: "推导 mosdns artifact 名"
+        run: echo "MOSDNS_ARTIFACT=$(bash tests/mosdns-artifact-name.sh)" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.MOSDNS_ARTIFACT }}
+          path: /tmp/mosdns-fixture
+      # 服务端摘要只证明"传输没坏", 不证明"内容是官方那一份"。这里按当前 checkout 的
+      # lib/versions.sh 自己重算 SHA、重核自报版本, 最后再走一次生产判据。不合格硬失败。
+      - name: "校验并安装钉定 mosdns (自算 SHA / manifest 交叉 / 自报版本 / 生产判据)"
+        run: sudo -E bash tests/install-mosdns-artifact.sh /tmp/mosdns-fixture
       - name: 流量层 (真起 sing-box 验证按 SNI 分到不同出口 + final 兜底)
         run: bash tests/functional-test.sh
       - name: DNS 层 (真起 mosdns 验证 A 劫持 / AAAA·HTTPS 置空 / 国内直连 / 按来源门控)
@@ -853,6 +943,7 @@ jobs:
         run: bash tests/test-hijack-shape.sh
 
   e2e:
+    needs: prepare-mosdns-fixture
     # 端到端: 在真实绝对路径上跑真正的 migrate / switch-core / bot 代码, 配合真内核与真 mosdns。
     # 单测都在函数级别打桩, 跨组件的接缝没人看着 —— 这几条查出过 GMS 重复插入、backend 标记
     # 从不落地、分流规则不进 mosdns、不可转换出站被静默丢弃等接缝 bug。
@@ -916,11 +1007,19 @@ jobs:
           apt-get update -qq
           DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
             bash curl ca-certificates python3 tar gzip unzip dnsutils git coreutils openssl iproute2 >/dev/null
-      # 与 lint / functional 用的是**同一份**脚本(版本与 SHA256 走 lib/versions.sh)。
-      # 备在 job 这一层而不是每个用例各取一次: 夹具于是直接复用已经就位的那一份, 自己
-      # 一次网络请求都不发。校验不过就让这一步失败, 不允许"下不到就跳过"。
-      - name: "准备钉死版 mosdns (健康夹具要真二进制: 短路与 doctor 都比 SHA256)"
-        run: bash tests/prepare-mosdns.sh
+      # 取本次 run 的钉定 mosdns —— 不再自己去 GitHub Release。名字由 lib/versions.sh 的
+      # 钉值算出来, 与 producer 上传时用的是同一份生成器, 于是"上传的叫什么"与"要什么"
+      # 没有第二个答案。
+      - name: "推导 mosdns artifact 名"
+        run: echo "MOSDNS_ARTIFACT=$(bash tests/mosdns-artifact-name.sh)" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.MOSDNS_ARTIFACT }}
+          path: /tmp/mosdns-fixture
+      # 服务端摘要只证明"传输没坏", 不证明"内容是官方那一份"。这里按当前 checkout 的
+      # lib/versions.sh 自己重算 SHA、重核自报版本, 最后再走一次生产判据。不合格硬失败。
+      - name: "校验并安装钉定 mosdns (自算 SHA / manifest 交叉 / 自报版本 / 生产判据)"
+        run: bash tests/install-mosdns-artifact.sh /tmp/mosdns-fixture
       - name: "跑 ${{ matrix.script }}"
         env: { PDG_E2E_ISOLATED: "1" }
         run: bash tests/${{ matrix.script }}
@@ -928,6 +1027,7 @@ jobs:
   # 6.2A DoT 证据源的真链路 E2E。单独成 job 而不是并进上面的矩阵: 这两支要真 mosdns
   # 二进制, 而上面那步不装它 —— 塞进共享矩阵等于给每一个 E2E job 都加一次下载。
   e2e-dot:
+    needs: prepare-mosdns-fixture
     runs-on: ubuntu-latest
     container:
       image: debian:12
@@ -949,26 +1049,19 @@ jobs:
           apt-get update -qq
           DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
             bash curl ca-certificates python3 unzip openssl iproute2 coreutils procps psmisc >/dev/null
-      # 版本与哈希都取自 lib/versions.sh —— 与 install.sh 用的是同一个信任锚。
-      # 校验不过就让这一步失败, 不允许"下不到就跳过"。
-      #
-      # `shell: bash` 不是装饰: 这个 job 跑在 debian:12 容器里, GitHub 对 run: 的默认 shell
-      # 是 `sh`(在 Debian 上就是 dash), 而 dash 不认 `-o pipefail` —— 整步直接以
-      # "set: Illegal option -o pipefail" 退出 2, 和被测代码毫无关系。下面凡是用了 pipefail
-      # 的步骤都要显式声明 bash; 不能反过来把 pipefail 摘掉迁就 dash, 那样 curl 失败会被
-      # 管道尾巴的退出码盖住, sha256 校验就形同虚设。
-      - name: "装钉定 mosdns (SHA256 必须命中)"
-        shell: bash
-        run: |
-          set -euo pipefail
-          # shellcheck source=lib/versions.sh
-          source lib/versions.sh
-          curl -fsSL -o /tmp/mosdns.zip \
-            "https://github.com/IrineSistiana/mosdns/releases/download/${MOSDNS_VER}/mosdns-linux-amd64.zip"
-          echo "${PDG_SHA256[mosdns-amd64]}  /tmp/mosdns.zip" | sha256sum -c -
-          unzip -oq /tmp/mosdns.zip -d /usr/local/bin
-          chmod +x /usr/local/bin/mosdns
-          mosdns version
+      # 取本次 run 的钉定 mosdns —— 不再自己去 GitHub Release。名字由 lib/versions.sh 的
+      # 钉值算出来, 与 producer 上传时用的是同一份生成器, 于是"上传的叫什么"与"要什么"
+      # 没有第二个答案。
+      - name: "推导 mosdns artifact 名"
+        run: echo "MOSDNS_ARTIFACT=$(bash tests/mosdns-artifact-name.sh)" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.MOSDNS_ARTIFACT }}
+          path: /tmp/mosdns-fixture
+      # 服务端摘要只证明"传输没坏", 不证明"内容是官方那一份"。这里按当前 checkout 的
+      # lib/versions.sh 自己重算 SHA、重核自报版本, 最后再走一次生产判据。不合格硬失败。
+      - name: "校验并安装钉定 mosdns (自算 SHA / manifest 交叉 / 自报版本 / 生产判据)"
+        run: bash tests/install-mosdns-artifact.sh /tmp/mosdns-fixture
       - name: "记录共享桩基线(测试不许动这些真程序)"
         shell: bash
         run: |
@@ -1117,6 +1210,7 @@ jobs:
   #   · P0 用 dot.p0ci.test —— 它必须从 dotwitness.env 推导域名, 用非缺省值才证明得了
   #     推导真的在跑。
   dot-systemd-e2e:
+    needs: prepare-mosdns-fixture
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -1179,20 +1273,19 @@ jobs:
           test "$(stat -c %U "$PDG_DOTE2E_SNAP")" = root
           test -f "$PDG_DOTE2E_SNAP/tests/e2e-lib.sh"
           test -f "$PDG_DOTE2E_SNAP/tests/helpers/ci-dot-fixture.sh"
-      # 版本与哈希都取自 lib/versions.sh —— 与 install.sh 同一个信任锚。校验不过就失败,
-      # 不允许"下不到就跳过"。
-      - name: "装钉定 mosdns (SHA256 必须命中)"
-        shell: bash
-        run: |
-          set -euo pipefail
-          # shellcheck source=lib/versions.sh
-          source lib/versions.sh
-          curl -fsSL -o /tmp/mosdns.zip \
-            "https://github.com/IrineSistiana/mosdns/releases/download/${MOSDNS_VER}/mosdns-linux-amd64.zip"
-          echo "${PDG_SHA256[mosdns-amd64]}  /tmp/mosdns.zip" | sha256sum -c -
-          sudo unzip -oq /tmp/mosdns.zip -d /usr/local/bin
-          sudo chmod +x /usr/local/bin/mosdns
-          mosdns version
+      # 取本次 run 的钉定 mosdns —— 不再自己去 GitHub Release。名字由 lib/versions.sh 的
+      # 钉值算出来, 与 producer 上传时用的是同一份生成器, 于是"上传的叫什么"与"要什么"
+      # 没有第二个答案。
+      - name: "推导 mosdns artifact 名"
+        run: echo "MOSDNS_ARTIFACT=$(bash tests/mosdns-artifact-name.sh)" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.MOSDNS_ARTIFACT }}
+          path: /tmp/mosdns-fixture
+      # 服务端摘要只证明"传输没坏", 不证明"内容是官方那一份"。这里按当前 checkout 的
+      # lib/versions.sh 自己重算 SHA、重核自报版本, 最后再走一次生产判据。不合格硬失败。
+      - name: "校验并安装钉定 mosdns (自算 SHA / manifest 交叉 / 自报版本 / 生产判据)"
+        run: bash tests/install-mosdns-artifact.sh /tmp/mosdns-fixture
       - name: "记录共享程序与临时目录基线"
         shell: bash
         run: |
@@ -1268,6 +1361,7 @@ jobs:
           exit "$fail"
 
   e2e-rescue-lock-ios:
+    needs: prepare-mosdns-fixture
     runs-on: ubuntu-latest
     container:
       image: debian:12
@@ -1288,11 +1382,19 @@ jobs:
           DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
             bash curl ca-certificates python3 tar gzip unzip dnsutils git coreutils openssl \
             iproute2 psmisc procps >/dev/null
-      # 与 lint / functional 用的是**同一份**脚本(版本与 SHA256 走 lib/versions.sh)。
-      # 备在 job 这一层而不是每个用例各取一次: 夹具于是直接复用已经就位的那一份, 自己
-      # 一次网络请求都不发。校验不过就让这一步失败, 不允许"下不到就跳过"。
-      - name: "准备钉死版 mosdns (健康夹具要真二进制: 短路与 doctor 都比 SHA256)"
-        run: bash tests/prepare-mosdns.sh
+      # 取本次 run 的钉定 mosdns —— 不再自己去 GitHub Release。名字由 lib/versions.sh 的
+      # 钉值算出来, 与 producer 上传时用的是同一份生成器, 于是"上传的叫什么"与"要什么"
+      # 没有第二个答案。
+      - name: "推导 mosdns artifact 名"
+        run: echo "MOSDNS_ARTIFACT=$(bash tests/mosdns-artifact-name.sh)" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.MOSDNS_ARTIFACT }}
+          path: /tmp/mosdns-fixture
+      # 服务端摘要只证明"传输没坏", 不证明"内容是官方那一份"。这里按当前 checkout 的
+      # lib/versions.sh 自己重算 SHA、重核自报版本, 最后再走一次生产判据。不合格硬失败。
+      - name: "校验并安装钉定 mosdns (自算 SHA / manifest 交叉 / 自报版本 / 生产判据)"
+        run: bash tests/install-mosdns-artifact.sh /tmp/mosdns-fixture
       - name: "跑 e2e-rescue-migration-lock.sh (iOS)"
         env:
           PDG_E2E_ISOLATED: "1"
@@ -1300,6 +1402,7 @@ jobs:
         run: bash tests/e2e-rescue-migration-lock.sh
 
   e2e-serial:
+    needs: prepare-mosdns-fixture
     runs-on: ubuntu-latest
     container:
       image: debian:12
@@ -1319,6 +1422,17 @@ jobs:
           apt-get update -qq
           DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
             bash curl ca-certificates python3 tar gzip unzip dnsutils git coreutils openssl iproute2 >/dev/null
+      # e2e-serial 串行跑 e2e-install / e2e-update 等, 它们的夹具要真 mosdns。
+      # 以前这个 job 没有取件步骤 —— 那次下载发生在夹具内部、被脚本的输出捕获吞掉,
+      # job 日志上一个字都看不见(审计时才发现它也是消费者)。现在与别的消费者同路。
+      - name: "推导 mosdns artifact 名"
+        run: echo "MOSDNS_ARTIFACT=$(bash tests/mosdns-artifact-name.sh)" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.MOSDNS_ARTIFACT }}
+          path: /tmp/mosdns-fixture
+      - name: "校验并安装钉定 mosdns (自算 SHA / manifest 交叉 / 自报版本 / 生产判据)"
+        run: bash tests/install-mosdns-artifact.sh /tmp/mosdns-fixture
       - name: "E2E 串行 hermetic (同一容器里按原顺序连着跑, 每个都必须全绿)"
         env:
           PDG_E2E_ISOLATED: "1"
