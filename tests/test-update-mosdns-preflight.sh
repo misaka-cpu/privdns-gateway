@@ -60,48 +60,74 @@ else
 fi
 
 echo
-echo "══ 3. 四类状态 × 真跑 cmd_update ══"
-g(){ e2e_git "$1" "${@:2}"; }
-mkrepo(){                       # HEAD 落后一个 tag → 关系判定为 behind, 走真实更新
-  local r="$1"; rm -rf "$r"; mkdir -p "$r/lib"
-  command git -C "$r" init -q -b main
-  g "$r" config user.email t@t; g "$r" config user.name t; g "$r" config commit.gpgsign false
-  printf 'pdg_install_runtime_modules(){ return 0; }\n' > "$r/lib/modules.sh"
-  # 仓库自带一份 versions.sh: 预检要从它读钉值, 与 install.sh 同一个来源
-  cat > "$r/lib/versions.sh" <<'V'
-MOSDNS_VER="v9.9.9"
-declare -A PDG_SHA256=( [mosdns-bin-amd64]="__SHA__" [mosdns-bin-arm64]="__SHA__" )
-pdg_mosdns_binary_ok(){
-  local arch="${1:-}" want="${2:-${MOSDNS_VER:-}}" bin="${3:-/usr/local/bin/mosdns}" got exp
-  [[ -n "$arch" && -n "$want" && -x "$bin" ]] || return 1
-  exp="${PDG_SHA256[mosdns-bin-$arch]:-}"; [[ -n "$exp" ]] || return 1
-  got="$("$bin" version 2>/dev/null | head -1)" || return 1
-  [[ "$got" =~ ([0-9]+\.[0-9]+\.[0-9]+) ]] || return 1
-  [[ "${BASH_REMATCH[1]}" == "${want#v}" ]] || return 1
-  got="$(sha256sum "$bin" 2>/dev/null | awk '{print $1}')"
-  [[ -n "$got" && "$got" == "$exp" ]]
-}
-V
-  echo A > "$r/f"; g "$r" add -A; g "$r" commit -qm A
-  g "$r" tag -a v1.0.0 -m v1.0.0
-  echo B > "$r/f"; g "$r" add -A; g "$r" commit -qm B
-  g "$r" tag -a v2.0.0 -m v2.0.0
-  g "$r" checkout -q -b side v1.0.0
-  echo D > "$r/f"; g "$r" add -A; g "$r" commit -qm D
-  g "$r" checkout -q v1.0.0            # HEAD = v1.0.0, 最新 tag = v2.0.0 → behind
-}
-
-# 造一个"合法 mosdns": 自报 v9.9.9 的可执行文件, 钉值就取它自己的 sha256
+echo "══ 3A. 四类不合法状态: 直接问预检(路径由参数注入, 生产调用点不传参)══"
+# 沙箱里改不动 /usr/local/bin/mosdns(要 root), 所以四种形态用参数注入。
+# **裁决逻辑一个字没变** —— 变的只是被问的是哪个文件。
 BIN="$WORK/bin"; mkdir -p "$BIN"
-mkmosdns(){                      # $1=version 串; 打印文件路径
-  printf '#!/bin/sh\ncase "$1" in version) echo "mosdns %s-0-gabc";; esac\nexit 0\n' "$1" > "$BIN/mosdns"
-  chmod 755 "$BIN/mosdns"; echo "$BIN/mosdns"
+mkmosdns(){ printf '#!/bin/sh\ncase "$1" in version) echo "mosdns %s-0-gabc";; esac\nexit 0\n' "$1" > "$2"; chmod 755 "$2"; }
+mkmosdns v9.9.9 "$WORK/mosdns.good"
+GOOD_SHA="$(sha256sum "$WORK/mosdns.good" | cut -d' ' -f1)"
+
+mkvers(){        # $1=目标目录; 造一份只认 $GOOD_SHA 的 versions.sh(结构与生产同形)
+  mkdir -p "$1/lib"
+  cat > "$1/lib/versions.sh" <<V
+MOSDNS_VER="v9.9.9"
+declare -A PDG_SHA256=( [mosdns-bin-amd64]="$GOOD_SHA" [mosdns-bin-arm64]="$GOOD_SHA" )
+V
+  # 判据本体从**真的那份**取, 不在测试里另写一遍 —— 否则测的是我抄得对不对
+  sed -n '/^pdg_mosdns_binary_ok(){/,/^}/p' "$ROOT/lib/versions.sh" >> "$1/lib/versions.sh"
 }
-# 原件另存一份: $BIN/mosdns 每一格都会被改坏或删掉, 拿它当"合法原件"的话,
-# 第二格之后就 cp 不出东西来了(第一版就是这么把 ①⑥ 两格测空的)。
-mkmosdns v9.9.9 >/dev/null
-GOOD="$WORK/mosdns.pristine"; cp "$BIN/mosdns" "$GOOD"; chmod 755 "$GOOD"
-GOOD_SHA="$(sha256sum "$GOOD" | cut -d' ' -f1)"
+mkvers "$WORK/vrepo"
+
+ask(){           # $1=二进制路径 → "rc|输出"
+  local rc=0 out
+  out=$(REPO_DIR="$WORK/vrepo" bash -c "
+    c_y(){ echo \"\$*\"; }
+    REPO_DIR='$WORK/vrepo'
+    source '$WORK/pre.sh'
+    _update_mosdns_preflight '$1'" 2>&1) || rc=$?
+  printf '%s\n' "$rc|$out"
+}
+cp "$WORK/mosdns.good" "$BIN/mosdns"; chmod 755 "$BIN/mosdns"
+r=$(ask "$BIN/mosdns"); [[ "${r%%|*}" == 0 ]] \
+  && ok "合法(版本对 + 摘要对)→ 预检放行" || bad "合法却被拒: ${r#*|}"
+
+declare -A CASE=(
+  ["文件不存在"]='rm -f "$BIN/mosdns"'
+  ["执行不了"]='cp "$WORK/mosdns.good" "$BIN/mosdns"; chmod 644 "$BIN/mosdns"'
+  ["version 命令非零"]='printf "#!/bin/sh\nexit 3\n" > "$BIN/mosdns"; chmod 755 "$BIN/mosdns"'
+  ["自报版本不符"]='mkmosdns v1.2.3 "$BIN/mosdns"'
+  ["摘要不符"]='mkmosdns v9.9.9 "$BIN/mosdns"; printf "\n# tampered\n" >> "$BIN/mosdns"'
+)
+declare -A WANT=(
+  ["文件不存在"]='不存在'  ["执行不了"]='执行不了'  ["version 命令非零"]='命令非零'
+  ["自报版本不符"]='版本不符'  ["摘要不符"]='摘要不符'
+)
+for k in "文件不存在" "执行不了" "version 命令非零" "自报版本不符" "摘要不符"; do
+  eval "${CASE[$k]}"
+  r=$(ask "$BIN/mosdns"); rc="${r%%|*}"; out="${r#*|}"
+  [[ "$rc" != 0 ]] && ok "[$k] 预检拒绝(rc=$rc)" || bad "[$k] 预检竟然放行"
+  grep -q "${WANT[$k]}" <<<"$out" && ok "[$k] 原因具名: ${WANT[$k]}" \
+    || bad "[$k] 原因不具名(期望含 ${WANT[$k]}): $(tr '\n' ' ' <<<"$out" | cut -c1-120)"
+  grep -q 'mosdns' <<<"$out" && ok "[$k] 点名了是 mosdns" || bad "[$k] 没点名组件"
+done
+# 读不到 versions.sh / 架构无钉值 → 一样拒绝(fail-closed)
+cp "$WORK/mosdns.good" "$BIN/mosdns"; chmod 755 "$BIN/mosdns"
+r=$(REPO_DIR="$WORK/nosuch" bash -c "c_y(){ echo \"\$*\"; }; REPO_DIR='$WORK/nosuch'; source '$WORK/pre.sh'; _update_mosdns_preflight '$BIN/mosdns'" 2>&1; echo "rc=$?")
+grep -q 'rc=1' <<<"$r" && ok "读不到 versions.sh → 拒绝(fail-closed, 不在存疑时动手)" \
+  || bad "读不到 versions.sh 却放行了: $r"
+
+echo
+echo "══ 3B. 真跑 cmd_update: 预检不合法时零副作用 ══"
+# 这一层不注入路径 —— 走的是生产那条写死的 /usr/local/bin/mosdns。
+# 让它"不合法"的办法不是动那个文件(沙箱里动不了), 而是让仓库的钉值与它对不上:
+# 判据两边都要对得上才算合法, 改哪一边效果一样, 而改钉值不需要 root。
+REALBIN=/usr/local/bin/mosdns
+if [[ ! -x "$REALBIN" ]]; then
+  bash "$ROOT/tests/prepare-mosdns.sh" >/dev/null 2>&1 || true
+fi
+if [[ -x "$REALBIN" ]]; then ok "本机有 $REALBIN, 可以跑真实调用链那一层"
+else bad "拿不到钉死版 mosdns —— 真实调用链那一层未验(不是通过)。备一份: bash tests/prepare-mosdns.sh"; fi
 
 cat > "$WORK/harness.sh" <<'EOF'
 REPO_DIR="$WORK/repo"; REPO_URL="file:///dev/null"; ENVF="$WORK/none.env"
@@ -115,12 +141,14 @@ _pdg_core(){ echo mihomo; }
 _pdg_bot_cred(){ echo unset; }
 pdg_fetch_release_tags(){ return 0; }
 _update_in_sync(){ return 1; }
-dpkg(){ echo amd64; }
-git(){ printf '%s\n' "$*" >> "$WORK/git.log"; command git "$@"; }
-install(){ printf 'install %s\n' "$*" >> "$WORK/side.log"; return 0; }
+git(){ printf '%s
+' "$*" >> "$WORK/git.log"; command git "$@"; }
+install(){ printf 'install %s
+' "$*" >> "$WORK/side.log"; return 0; }
 bash(){ [[ "$*" == *__migrate* ]] && { echo migrate >> "$WORK/side.log"; return 0; }; command bash "$@"; }
 _update_core_binary(){ echo core >> "$WORK/side.log"; return 0; }
-systemctl(){ printf 'systemctl %s\n' "$*" >> "$WORK/side.log"; return 0; }
+systemctl(){ printf 'systemctl %s
+' "$*" >> "$WORK/side.log"; return 0; }
 python3(){ case "$*" in *py_compile*) return 0;;
   *doctor.py*) cat "$WORK/doctor.json";; *) command python3 "$@";; esac; }
 mihomo(){ return 0; }
@@ -132,68 +160,70 @@ EOF
 export WORK
 echo '[{"level":"ok","check":"服务","detail":"都在"}]' > "$WORK/doctor.json"
 
-run(){                          # $1=mosdns 现场造法; 打印 "rc|输出"
-  mkrepo "$WORK/repo" >/dev/null 2>&1
-  sed -i "s/__SHA__/$GOOD_SHA/g" "$WORK/repo/lib/versions.sh"
-  : > "$WORK/side.log"; : > "$WORK/git.log"
-  eval "$1"
-  local rc=0 out
-  out=$(PATH="$BIN:$PATH" bash -c "source '$WORK/harness.sh'; source '$WORK/pre.sh'; source '$WORK/upd.sh'; cmd_update" 2>&1) || rc=$?
-  printf '%s\n' "$rc|$out"
+g(){ e2e_git "$1" "${@:2}"; }
+mkrepo(){                       # HEAD 落后一个 tag → behind → 走真实更新
+  local r="$1" pin="$2"         # pin=real → 用仓库真钉值; pin=bogus → 故意对不上
+  rm -rf "$r"; mkdir -p "$r/lib"
+  command git -C "$r" init -q -b main
+  g "$r" config user.email t@t; g "$r" config user.name t; g "$r" config commit.gpgsign false
+  printf 'pdg_install_runtime_modules(){ return 0; }\n' > "$r/lib/modules.sh"
+  cp "$ROOT/lib/versions.sh" "$r/lib/versions.sh"
+  if [[ "$pin" == bogus ]]; then
+    sed -i 's/\[mosdns-bin-amd64\]="./[mosdns-bin-amd64]="0/; s/\[mosdns-bin-arm64\]="./[mosdns-bin-arm64]="0/' "$r/lib/versions.sh"
+  fi
+  echo A > "$r/f"; g "$r" add -A; g "$r" commit -qm A
+  g "$r" tag -a v1.0.0 -m v1.0.0
+  echo B > "$r/f"; g "$r" add -A; g "$r" commit -qm B
+  g "$r" tag -a v2.0.0 -m v2.0.0
+  g "$r" checkout -q -b side v1.0.0
+  echo D > "$r/f"; g "$r" add -A; g "$r" commit -qm D
+  g "$r" checkout -q v1.0.0
 }
 side(){ grep -qF "$1" "$WORK/side.log" 2>/dev/null; }
 did_reset(){ grep -qE '(^| )reset ' "$WORK/git.log" 2>/dev/null; }
 HEAD_OF(){ command git -C "$WORK/repo" rev-parse HEAD 2>/dev/null; }
-
-nofx(){                          # 逐项零副作用
-  local tag="$1" h0="$2"
+run(){                          # $1=real|bogus [$2=--dry-run] → "rc|输出"; h0 存进 $H0
+  mkrepo "$WORK/repo" "$1" >/dev/null 2>&1
+  HEAD_OF > "$WORK/head0"          # $(run …) 是子 shell, 变量回不来, 前像只能落盘
+  : > "$WORK/side.log"; : > "$WORK/git.log"
+  local rc=0 out
+  out=$(bash -c "source '$WORK/harness.sh'; source '$WORK/pre.sh'; source '$WORK/upd.sh'; cmd_update ${2:-}" 2>&1) || rc=$?
+  printf '%s\n' "$rc|$out"
+}
+nofx(){
+  local tag="$1"
   side SNAPSHOT   && bad "$tag: 建了快照" || ok "$tag: 快照数不变"
-  did_reset       && bad "$tag: 执行了 reset" || ok "$tag: HEAD 未被 reset"
-  [[ "$(HEAD_OF)" == "$h0" ]] && ok "$tag: git HEAD 逐字节不变" || bad "$tag: HEAD 变了"
-  side "install " && bad "$tag: 装了文件" || ok "$tag: 已装文件未被触碰"
+  did_reset       && bad "$tag: 执行了 reset" || ok "$tag: 未 reset"
+  [[ "$(HEAD_OF)" == "$(cat "$WORK/head0" 2>/dev/null)" ]] \
+    && ok "$tag: git HEAD 与工作区逐字节不变" || bad "$tag: HEAD 变了"
+  side "install " && bad "$tag: 装了文件" || ok "$tag: 已装文件摘要不变"
   side migrate    && bad "$tag: 调了 __migrate" || ok "$tag: __migrate 未调用"
-  side systemctl  && bad "$tag: 碰了 systemctl" || ok "$tag: 服务未被动过(InvocationID 不变)"
+  side systemctl  && bad "$tag: 碰了 systemctl" || ok "$tag: 服务未动(InvocationID 不变)"
   side ROLLBACK   && bad "$tag: 进了 rollback" || ok "$tag: rollback 计数 0"
 }
 
-# ① 合法 → 允许进入更新
-r=$(run 'install -m755 "$GOOD" "$BIN/mosdns"'); rc="${r%%|*}"; out="${r#*|}"
-did_reset && ok "① 合法 mosdns → 放行, 正常进入更新" || bad "① 合法却被挡住了: $(tail -3 <<<"$out")"
-[[ "$rc" == 0 ]] && ok "① rc=0" || bad "① rc=$rc: $(tail -3 <<<"$out")"
+if [[ -x "$REALBIN" ]]; then
+  r=$(run real); rc="${r%%|*}"; out="${r#*|}"
+  did_reset && ok "钉值与真实二进制相符 → 预检放行, 正常进入更新" \
+    || bad "合法却被挡住: $(tail -3 <<<"$out")"
+  [[ "$rc" == 0 ]] && ok "合法路径 rc=0" || bad "合法路径 rc=$rc: $(tail -3 <<<"$out")"
+fi
+r=$(run bogus); rc="${r%%|*}"; out="${r#*|}"
+[[ "$rc" != 0 ]] && ok "钉值对不上 → rc 非 0(实得 $rc)" || bad "钉值对不上却 rc=0"
+grep -q 'mosdns' <<<"$out" && ok "具名指出是 mosdns" || bad "没点名: $(tail -2 <<<"$out")"
+grep -q '✅ 已更新' <<<"$out" && bad "冒充已更新" || ok "没冒充已更新"
+nofx "预检拒绝"
 
-# ②③④⑤ 四类不合法
-for cell in \
-  "② 文件不存在|rm -f \"\$BIN/mosdns\"|不存在|缺失" \
-  "③ 版本命令非零|printf '#!/bin/sh\\nexit 3\\n' > \"\$BIN/mosdns\"; chmod 755 \"\$BIN/mosdns\"|执行不了|version 命令" \
-  "④ 自报版本不符|mkmosdns v1.2.3 >/dev/null|版本|不符" \
-  "⑤ SHA256 不符|mkmosdns v9.9.9 >/dev/null; printf '\\n# tampered\\n' >> \"\$BIN/mosdns\"|摘要|内容" \
-; do
-  IFS='|' read -r tag setup kw1 kw2 <<<"$cell"
-  mkrepo "$WORK/repo" >/dev/null 2>&1
-  h0="$(HEAD_OF)"
-  r=$(run "$setup"); rc="${r%%|*}"; out="${r#*|}"
-  echo "── $tag ──"
-  [[ "$rc" != 0 ]] && ok "$tag: rc 非 0(实得 $rc)" || bad "$tag: 竟然 rc=0"
-  grep -q 'mosdns' <<<"$out" && ok "$tag: 具名指出是 mosdns 的问题" || bad "$tag: 没说是 mosdns: $(tail -2 <<<"$out")"
-  # 关键词必须出现在**提到 mosdns 的那一行**上。否则 "校验新版本…" 里的「版本」二字
-  # 就能让 ③ 假绿 —— 那句话跟 mosdns 毫无关系(第一版就是这么绿的)。
-  grep 'mosdns' <<<"$out" | grep -qE "$kw1|$kw2" && ok "$tag: 说清了是哪一类不合法" \
-    || bad "$tag: 原因不具名(期望 mosdns 那一行含 $kw1/$kw2): $(tail -2 <<<"$out")"
-  grep -q '✅ 已更新' <<<"$out" && bad "$tag: 冒充已更新" || ok "$tag: 没冒充已更新"
-  nofx "$tag" "$h0"
-done
-
-echo
 echo "══ 4. 关系门优先于预检: ahead/diverged 仍由关系门拒绝 ══"
 for spec in "ahead:main:领先" "diverged:side:分叉"; do
   IFS=: read -r nm ref kw <<<"$spec"
-  mkrepo "$WORK/repo" >/dev/null 2>&1
+  mkrepo "$WORK/repo" bogus >/dev/null 2>&1
   command git -C "$WORK/repo" tag -d v2.0.0 >/dev/null 2>&1
   g "$WORK/repo" checkout -q "$ref" 2>/dev/null
   [[ "$nm" == diverged ]] && g "$WORK/repo" tag -a v2.0.0 -m x main >/dev/null 2>&1
-  rm -f "$BIN/mosdns"                       # mosdns 同时也不合法 —— 看谁先说话
+  # 仓库钉值同时也是坏的 → mosdns 预检也过不了。看谁先说话。
   : > "$WORK/side.log"; : > "$WORK/git.log"
-  out=$(PATH="$BIN:$PATH" bash -c "source '$WORK/harness.sh'; source '$WORK/pre.sh'; source '$WORK/upd.sh'; cmd_update" 2>&1); rc=$?
+  out=$(bash -c "source '$WORK/harness.sh'; source '$WORK/pre.sh'; source '$WORK/upd.sh'; cmd_update" 2>&1); rc=$?
   { [[ "$rc" != 0 ]] && grep -q "$kw" <<<"$out"; } \
     && ok "$nm: 仍由关系门先拒绝(不是被预检抢答)" \
     || bad "$nm: 关系门没有优先(rc=$rc): $(tail -2 <<<"$out")"
@@ -201,23 +231,21 @@ done
 
 echo
 echo "══ 5. dry-run 契约不变: 零副作用, 不受预检影响 ══"
-mkrepo "$WORK/repo" >/dev/null 2>&1
-sed -i "s/__SHA__/$GOOD_SHA/g" "$WORK/repo/lib/versions.sh"
-rm -f "$BIN/mosdns"                          # 故意不合法
-h0="$(HEAD_OF)"; : > "$WORK/side.log"; : > "$WORK/git.log"
-out=$(PATH="$BIN:$PATH" bash -c "source '$WORK/harness.sh'; source '$WORK/pre.sh'; source '$WORK/upd.sh'; cmd_update --dry-run" 2>&1); rc=$?
+r=$(run bogus --dry-run); rc="${r%%|*}"; out="${r#*|}"
 grep -q '待更新提交' <<<"$out" && ok "dry-run 照旧列出待更新提交(不被预检打断)" \
   || bad "dry-run 被预检改了行为: $out"
-nofx "dry-run" "$h0"
+nofx "dry-run"
 
 echo
 echo "══ 6. 更新前合法、更新过程把它破坏 → 更新后 doctor 仍判红并回滚 ══"
 # 这条安全门不得因为加了前置预检就放松。
 echo '[{"level":"fail","check":"mosdns 二进制","detail":"内容与官方钉值不一致"}]' > "$WORK/doctor.json"
-r=$(run 'install -m755 "$GOOD" "$BIN/mosdns"'); rc="${r%%|*}"; out="${r#*|}"
+if [[ -x "$REALBIN" ]]; then
+r=$(run real); rc="${r%%|*}"; out="${r#*|}"
 [[ "$rc" != 0 ]] && ok "更新后自检判红 → rc 非 0" || bad "更新后判红却 rc=0"
 side ROLLBACK && ok "触发了既有回滚(安全门没被放松)" || bad "没回滚: $(tail -3 <<<"$out")"
 grep -q '✅ 已更新' <<<"$out" && bad "谎报成功" || ok "没谎报成功"
+fi
 echo '[{"level":"ok","check":"服务","detail":"都在"}]' > "$WORK/doctor.json"
 
 echo "────────────────────────────────────────"

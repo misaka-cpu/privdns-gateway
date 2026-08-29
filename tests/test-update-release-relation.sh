@@ -35,6 +35,11 @@ source "$ROOT/tests/repoguard.sh"
 
 sed -n '/^cmd_update(){/,/^}/p'                 "$ROOT/deploy/bot/pdg.sh" > "$WORK/upd.sh"
 sed -n '/^_update_release_relation(){/,/^}/p'   "$ROOT/deploy/bot/pdg.sh" > "$WORK/rel.sh"
+# behind 那一路现在还要过一次 mosdns 完整性预检。判据本身另有专测
+# (test-update-mosdns-preflight.sh), 这一支只关心方向, 所以把真函数抽出来、再用一个
+# 恒真的替身盖住 —— 不抽的话是 command-not-found, 那测的既不是方向也不是完整性。
+sed -n '/^_update_mosdns_preflight(){/,/^}/p'  "$ROOT/deploy/bot/pdg.sh" >> "$WORK/rel.sh"
+printf '_update_mosdns_preflight(){ return 0; }\n' >> "$WORK/rel.sh"
 
 # ── 判据函数必须存在, 且**只有一份** ────────────────────────────────────────
 # dry-run 与正式 update 各写一份关系判断的话, 两边迟早会漂: 一边修好了另一边还在降级。

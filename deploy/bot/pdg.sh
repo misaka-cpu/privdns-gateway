@@ -1728,6 +1728,65 @@ _update_release_relation(){
   esac
 }
 
+# _update_mosdns_preflight → 0 = 现在这台机器的 mosdns 二进制合法, 可以开始更新
+#
+# 为什么要在更新**之前**问: doctor 的 check_mosdns_binary 判 fail 是对的 —— mosdns 是核心
+# 运行文件, 缺失或内容与钉值不符是确定性故障, 不是"无结论"。但 cmd_update 的自检门跑在
+# 更新**做完之后**, 于是一台 mosdns 已经不对的机器会先建快照、reset、装文件、跑迁移、
+# 重启服务, 走完全程, 最后被自检判红再整个回滚 —— 动了一遍又回到起点, 而且每跑一次
+# `pdg update` 就重复一遍。真正该做的是在动手之前就停下。
+#
+# 裁决**只由生产共用判据给出**: lib/versions.sh 的 pdg_mosdns_binary_ok, 与 install.sh 的
+# 严格短路是同一个函数、同一份钉值。下面那几次探测只负责把"为什么不合法"说成人话, 不参与
+# 判定 —— 两套判断并存的话, 它们迟早会在某个边角上给出不同答案。
+#
+# 读不到 versions.sh / 架构不在钉值表里 → 一样拒绝。这里是 fail-closed: 判不出来就不该
+# 在这台机器上开始一次会改动系统的操作。(doctor 那条对同样情形判 warn 是另一回事 ——
+# 它在报告状态, 这里在决定要不要动手。)
+# $1 可选: 要检查的二进制路径, 默认就是 systemd 真正执行的那个。留这个参数是为了让测试
+# 能在沙箱里造出"缺失 / 执行不了 / 版本不符 / 摘要不符"四种形态 —— 生产调用点不传参,
+# 走的永远是写死的绝对路径。**不是**环境变量后门: 没有任何 env 能改变生产行为。
+# shellcheck disable=SC2120  # 这个可选参数只由 tests/test-update-mosdns-preflight.sh 传,
+# 生产调用点(下面 cmd_update 里那一处)有意不传 —— shellcheck 看不到测试里的调用。
+_update_mosdns_preflight(){
+  local bin="${1:-/usr/local/bin/mosdns}" march rc=0
+  (
+    # 放子 shell: versions.sh 定义的 MOSDNS_VER / PDG_SHA256 不该泄漏进 cmd_update 后面
+    # 那些步骤的作用域。
+    # shellcheck source=lib/versions.sh
+    source "$REPO_DIR/lib/versions.sh" 2>/dev/null || exit 10
+    march=$(dpkg --print-architecture 2>/dev/null); [[ "$march" == arm64 ]] || march=amd64
+    pdg_mosdns_binary_ok "$march" "$MOSDNS_VER" "$bin" && exit 0
+    # 到这里就是"不合法"。下面只为把原因说清楚, 判定已经做完了。
+    [[ -e "$bin" ]] || exit 1                       # 文件不存在
+    [[ -x "$bin" ]] || exit 2                       # 在那儿但执行不了
+    "$bin" version >/dev/null 2>&1  || exit 3       # version 命令非零
+    local got; got="$("$bin" version 2>/dev/null | head -1)"
+    [[ "$got" =~ ([0-9]+\.[0-9]+\.[0-9]+) ]] || exit 4      # 输出里读不出版本
+    [[ "${BASH_REMATCH[1]}" == "${MOSDNS_VER#v}" ]] || exit 5 # 自报版本不符
+    [[ -n "${PDG_SHA256[mosdns-bin-$march]:-}" ]] || exit 11  # 该架构没有钉值
+    exit 6                                          # 版本对得上, 那就是内容摘要不符
+  )
+  rc=$?
+  [[ "$rc" == 0 ]] && return 0
+  march=$(dpkg --print-architecture 2>/dev/null); [[ "$march" == arm64 ]] || march=amd64
+  c_y "❌ 更新前自检: mosdns 二进制不合法, 拒绝开始更新。"
+  case "$rc" in
+    1)  echo "  $bin **不存在**(缺失 —— 核心解析器不在, 这台机器现在是坏的)";;
+    2)  echo "  $bin 在那儿但**执行不了**(权限 / 不是可执行文件)";;
+    3)  echo "  $bin version **命令非零**(它起不来, 打印出来的版本号不算数)";;
+    4)  echo "  $bin version 的输出里**读不出版本号**";;
+    5)  echo "  自报**版本不符**: 跑的是 ${BASH_REMATCH[1]:-未知}, 钉死的另有其值";;
+    6)  echo "  **SHA256 摘要不符**: 版本号对得上, 但文件**内容**不是官方那一份";;
+    10) echo "  读不到 $REPO_DIR/lib/versions.sh —— 无从对照, 不在存疑时动手";;
+    11) echo "  本架构($march)在钉值表里没有条目 —— 无从对照, 不在存疑时动手";;
+    *)  echo "  判据未通过(rc=$rc)";;
+  esac
+  echo "  先修好它再更新: sudo pdg doctor 会指出同一项。"
+  echo "  没动任何文件: 未建快照, 未 reset, 未装文件, 未迁移, 未重启服务。"
+  return 1
+}
+
 cmd_update(){
   need_root update
   # --dry-run 只查看: 不装 git、不迁移、不写任何东西。任一步失败都要返回非 0 并说清是哪一步 ——
@@ -1806,6 +1865,12 @@ cmd_update(){
           echo "  没动任何文件: 未建快照, 未 reset, 未重启服务。"
           return 1;;
       esac
+      # ── 真实更新前的 mosdns 完整性预检 ───────────────────────────────────
+      # 只挂在 behind(真的要往前走)这一路上: same 走下面的短路, ahead/diverged 已经在
+      # 上面被关系门拒了, dry-run 压根到不了这里 —— 那三条的既有契约一个字都不动。
+      if [[ "$_rel" == behind ]] && ! _update_mosdns_preflight; then
+        return 1
+      fi
       # ── 「已是最新」短路 ──────────────────────────────────────────────────
       # 重复跑 `pdg update` 不该有副作用, 以前每次都照走全程: 多留一份快照(挤占 SNAP_DIR)、
       # 两次 daemon-reload、重启 pdg-bot(iOS 还要加 probe81/mitm), 并把所有已装文件的 mtime
