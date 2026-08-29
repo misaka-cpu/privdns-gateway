@@ -370,6 +370,9 @@ jobs:
       - name: "update 关键步骤故障注入 (git reset/必需文件/迁移/内核/daemon-reload 失败均回滚且不谎报成功)"
         run: bash tests/test-update-faults.sh
 
+      - name: "update 与最新发布的关系四态 (相同幂等/落后升级/领先拒绝/分叉拒绝; 真 git 判祖先)"
+        run: bash tests/test-update-release-relation.sh
+
       - name: "全局锁继承八格 (父锁复用/独立取锁/BUSY/环境变量伪造/错文件/inode 变更/并发/释放)"
         run: bash tests/test-lock-inherit.sh
 
