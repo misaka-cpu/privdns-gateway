@@ -218,7 +218,7 @@ echo "══ 4. 关系门优先于预检: ahead/diverged 仍由关系门拒绝 �
 for spec in "ahead:main:领先" "diverged:side:分叉"; do
   IFS=: read -r nm ref kw <<<"$spec"
   mkrepo "$WORK/repo" bogus >/dev/null 2>&1
-  command git -C "$WORK/repo" tag -d v2.0.0 >/dev/null 2>&1
+  g "$WORK/repo" tag -d v2.0.0 >/dev/null 2>&1
   g "$WORK/repo" checkout -q "$ref" 2>/dev/null
   [[ "$nm" == diverged ]] && g "$WORK/repo" tag -a v2.0.0 -m x main >/dev/null 2>&1
   # 仓库钉值同时也是坏的 → mosdns 预检也过不了。看谁先说话。
