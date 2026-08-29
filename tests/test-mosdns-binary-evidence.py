@@ -166,7 +166,10 @@ if hasattr(checks, "check_mosdns_binary"):
      bad)("说清是「二进制内容与官方钉值不一致」(实得 %r)" % (r[2] if r else None))
 
     r = call(gone, real_sha)
-    (ok if r and r[0] != "ok" else bad)("文件不存在 → 不许 ok(实得 %r)" % (r,))
+    # 精确判 fail, 不是"只要不是 ok 就行"。mosdns 是核心运行文件, 它不在是**确定性故障**,
+    # 不是"无结论" —— 写成 != ok 的话, 把它降成 warn 这一格照样绿(负控③当场量到 0 条转红)。
+    (ok if r and r[0] == "fail" else
+     bad)("文件不存在 → fail(核心运行文件缺失是确定性故障, 不是无结论)(实得 %r)" % (r,))
 
     r = call(real, "")
     (ok if r and r[0] == "warn" else
