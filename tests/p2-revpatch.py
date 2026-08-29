@@ -58,14 +58,14 @@ def main(argv):
     old_start = '    [[ "$ac0" == active  ]] && { systemctl start  "$T" >/dev/null 2>&1 || _rbad=1; }'
     src = rev(src, new_start, old_start, "_restore 的 start 那行")
 
-    # ③ cmd_update: 整段拿掉「已是最新」短路(从注释头到 "更新前留快照" 那行之前)
-    head = '  # ── 「已是最新」短路 '
-    tail = '  c_g "更新前留快照…"'
-    if src.count(head) != 1 or src.count(tail) != 1:
-        raise SystemExit("反向补丁打空: 定位不到「已是最新」短路段")
-    i = src.index(head)
-    j = src.index(tail, i)
-    src = src[:i] + src[j:]
+    # ③ cmd_update: 让「已是最新」短路永远不成立。
+    #    以前是"从注释头整段切到 '更新前留快照' 那行", 但短路现在嵌在方向判据(same/behind/
+    #    ahead/diverged)那个 if 里 —— 按行区间切会把外层的 fi 一起带走, 得到的 $OLD 语法就坏了。
+    #    一份跑不起来的"旧版"当然不会建快照, 于是对照格看着与新版一致, 安静地失去判别力
+    #    (那正是本文件开头说的最糟情形)。改成动条件本身: 最小、局部, 且 $OLD 仍是可执行的。
+    new_sc = '[[ -z "${PDG_UPDATE_FORCE:-}" && "$_rel" == same ]]'
+    old_sc = '[[ -z "${PDG_UPDATE_FORCE:-}" && "$_rel" == __no_shortcircuit__ ]]'
+    src = rev(src, new_sc, old_sc, "「已是最新」短路的条件")
 
     io.open(argv[2], "w", encoding="utf-8").write(src)
     return 0
