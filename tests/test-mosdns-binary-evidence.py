@@ -185,8 +185,19 @@ seg = re.search(r"# ── 2\. mosdns ──.*?(?=# ── 3\.)", INST, re.S)
 (ok if seg else bad)("抽得到 install.sh 的 mosdns 安装段")
 if seg:
     s = seg.group(0)
-    (ok if "mosdns-bin-" in s or "pdg_mosdns_binary_ok" in s else
-     bad)("短路条件里带上了二进制摘要(否则跳过下载 = 跳过供应链校验)")
+    # 判据要落在**短路条件那一行**上。写成"这一段里提到过摘要"是不够的: 段尾还有一处
+    # 装完之后的复核也提到 mosdns-bin-, 于是把短路改回只看自报版本时, 这一格照样绿
+    # (负控⑨当场量到 0 条转红)。
+    cond = re.search(r"^if ! (.+); then$", s, re.M)
+    (ok if cond else bad)("抽得到短路那一行的条件")
+    if cond:
+        c = cond.group(1)
+        (ok if "pdg_mosdns_binary_ok" in c else
+         bad)("短路条件本身要求二进制摘要相符, 不只是版本(实得 %r)" % c)
+        (ok if "pdg_mosdns_is_version" not in c else
+         bad)("短路条件不再是「自报版本相同就跳过」(实得 %r)" % c)
+    (ok if "mosdns-bin-" in s else
+     bad)("安装段里用到了二进制钉值(装完之后还要再核一次落盘内容)")
     (ok if "PDG_SHA256[mosdns-$MARCH]" in s else
      bad)("下载后的压缩包 ZIP 校验没有被削弱")
     (ok if "_stash_bin" in s else bad)("既有的回滚保护还在")
