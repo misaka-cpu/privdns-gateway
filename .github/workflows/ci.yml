@@ -872,6 +872,7 @@ jobs:
           - e2e-install-nft.sh
           - e2e-platform-switch.sh
           - e2e-update.sh
+          - e2e-update-ahead-of-release.sh
           - e2e-update-preserve-userdata.sh
           - e2e-upgrade-from-release.sh
           - e2e-wloc.sh
