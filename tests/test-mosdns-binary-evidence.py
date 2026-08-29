@@ -179,7 +179,9 @@ if hasattr(checks, "check_mosdns_binary"):
 print()
 print("══ 5. 安装器: 同版本但内容不同, 不许短路 ══")
 # 短路条件必须是"语义版本相同 **且** 落盘二进制的 SHA256 等于该架构钉值"。
-seg = re.search(r"if ! pdg_mosdns_is_version.*?\nfi\n", INST, re.S)
+# 锚在**章节边界**上而不是某个函数名上: 短路判据换个名字是这一轮正要做的事,
+# 把锚点写成旧函数名, 修好之后这一格会安静地抽不到东西。
+seg = re.search(r"# ── 2\. mosdns ──.*?(?=# ── 3\.)", INST, re.S)
 (ok if seg else bad)("抽得到 install.sh 的 mosdns 安装段")
 if seg:
     s = seg.group(0)
@@ -204,7 +206,7 @@ if helper:
     def probe(pin_sha):
         script = (
             'source "%s/lib/versions.sh"\n'
-            'PDG_SHA256[mosdns-amd64test]="%s"\n'
+            'PDG_SHA256[mosdns-bin-amd64test]="%s"\n'
             'PATH="%s:$PATH"\n'
             'pdg_mosdns_binary_ok amd64test "%s" "%s"; echo "rc=$?"\n'
             % (ROOT, pin_sha, sb, PIN_VER, fake))

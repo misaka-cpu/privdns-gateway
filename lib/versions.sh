@@ -28,6 +28,20 @@ ACME_SH_COMMIT="3661fd86b6304115e42f43910e6dd452ab9866d6"
 declare -A PDG_SHA256=(
   [mosdns-amd64]="3abcc73080789eb1ccca78dab5049b85ac1e9b8f865ab60158a527b77cd72e85"
   [mosdns-arm64]="82d80a1a21606fca0bc6b65ac6f90d30cff6bb4a19a6ab6a246cf247dbb78bc0"
+  # ── mosdns: **解压后二进制**本身的 SHA256 ──────────────────────────────────
+  # 上面两行钉的是下载压缩包。它只在"真的下载了"那条路上起作用 —— 而安装器的短路条件是
+  # "自报版本相同就跳过下载", 于是一个内容不同、自报 v5.3.4 的二进制会让整段安装被跳过,
+  # 连带跳过 ZIP 校验; 落盘的那个文件本身, 项目从来没有钉过。
+  #
+  # 取值步骤(可复现, 换个人来照做应得到同一串):
+  #   1) curl -fsSL https://github.com/IrineSistiana/mosdns/releases/download/v5.3.4/mosdns-linux-<arch>.zip -o m.zip
+  #   2) 先用上面的 [mosdns-<arch>] 校验归档: sha256sum m.zip
+  #   3) 校验通过后才解压: unzip -q m.zip
+  #   4) sha256sum mosdns
+  # 顺序不能颠倒: 先解压再算哈希, 等于给一个来路未经确认的文件盖章(TOFU)。
+  # 版本 v5.3.4, 上游发布日 2026-01-11; 两个架构各自独立下载、独立校验、独立计算。
+  [mosdns-bin-amd64]="5357fbb83c89f0a7acad275b72c33aa70d4c720cb5590525660132b10cee8af9"
+  [mosdns-bin-arm64]="5e651992dbec784df43e0e483428319b0f2892f5fadfd4e39a1462a5d62cb495"
   # mihomo(流量内核): 官方 release 的 mihomo-linux-<arch>-<ver>.gz
   [mihomo-amd64]="60de76a35a6cbf7b4fa4a20f5c257c24345d1d635ab1aa3877022a1997ef413c"
   [mihomo-arm64]="9a868b5e4e0ad91d9d71e1b41b0cfce78aaba44360c30df74a723f8e3926a86c"
@@ -73,6 +87,27 @@ pdg_mosdns_is_version(){
   local want="${1#v}" got
   got="$(pdg_mosdns_version)"; got="${got#v}"
   [[ -n "$got" && "$got" == "$want" ]]
+}
+
+# pdg_mosdns_binary_ok <架构> [期望版本] [二进制路径]
+#   → 0 **仅当**语义版本相同 **且** 该文件的 SHA256 等于该架构的二进制钉值。
+#
+# 安装器拿它当"可以跳过下载吗"的唯一判据。以前那个判据只问版本, 而版本是二进制**自报**的:
+# 换掉内容、保留版本串, 就能让安装器跳过整段下载与校验, 而安装日志上连"下载 mosdns"
+# 这一行都不会出现(这个坑早年在 `command -v mosdns` 上踩过一次, 形态一模一样)。
+#
+# 版本读的是**这个文件**而不是 PATH 上的 mosdns: 问的是"要不要换掉这个文件", 那就必须
+# 问它本人。任何一步存疑一律返回非 0 —— 宁可多装一次, 不能存疑就跳过。
+pdg_mosdns_binary_ok(){
+  local arch="${1:-}" want="${2:-${MOSDNS_VER:-}}" bin="${3:-/usr/local/bin/mosdns}" got exp
+  [[ -n "$arch" && -n "$want" && -x "$bin" ]] || return 1
+  exp="${PDG_SHA256[mosdns-bin-$arch]:-}"
+  [[ -n "$exp" ]] || return 1
+  got="$("$bin" version 2>/dev/null | head -1)" || return 1
+  [[ "$got" =~ ([0-9]+\.[0-9]+\.[0-9]+) ]] || return 1
+  [[ "${BASH_REMATCH[1]}" == "${want#v}" ]] || return 1
+  got="$(sha256sum "$bin" 2>/dev/null | awk '{print $1}')"
+  [[ -n "$got" && "$got" == "$exp" ]]
 }
 
 # pdg_verify_sha256 <文件> <期望hash> [名称]  → 不符返回非 0 并打印期望/实际

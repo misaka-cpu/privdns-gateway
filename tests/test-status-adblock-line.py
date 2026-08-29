@@ -80,7 +80,10 @@ open(os.path.join(W, "state", "effective_list.txt"), "w").write(
     "".join("x%d.example\n" % i for i in range(1234)))
 
 # 只抽那一行所依赖的函数, 单独跑 —— 整个 cmd_status 要 systemctl, 跑不动
-need = ["_adb_count_rules", "_adblock_intent", "_adblock_status_line"]
+# 只读状态那条链现在是四段: 三态读取器 + 可读性判据 + 计数 + 渲染。少抽一段,
+# 渲染函数会掉进"规则文件读不出来"那条分支, 而现场其实好好的。
+need = ["_adblock_read_state", "_adb_rules_readable",
+        "_adb_count_rules", "_adblock_intent", "_adblock_status_line"]
 missing = [f for f in need if ("\n%s()" % f) not in PDGSH]
 (ok if not missing else bad)("依赖的函数都在(缺: %r)" % missing)
 if not missing:

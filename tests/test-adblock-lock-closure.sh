@@ -37,7 +37,10 @@ extract(){
 }
 CLOSURE="$WORK/closure.sh"; : > "$CLOSURE"
 # **真的 _lock**(连同 _lock_inherited)—— 这一支验的就是锁本身, 不能桩掉。
+# _adblock_read_state / _adb_rules_readable / _adb_count_rules 是只读状态那条链:
+# _adblock_status 现在经它们读启用位与条数, 不抽出来就是 command-not-found。
 for fn in c_g c_y _profile_set _pdg_module _lock_inherited _lock _adblock_intent \
+          _adblock_read_state _adb_rules_readable _adb_count_rules \
           _adblock_ensure_files _adblock_gen_infra _adblock_apply _adblock_status cmd_adblock; do
   extract "$fn" >> "$CLOSURE" || { bad "生产函数闭包抽取失败: $fn"; echo "通过 $pass, 失败 $nfail"; exit 1; }
   echo >> "$CLOSURE"

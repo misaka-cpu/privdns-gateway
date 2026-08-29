@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """PrivDNS Gateway 只读检查库。doctor.py 跑全部, healthcheck.py 跑子集。
 每个 check() 返回 (level, label, detail), level ∈ 'ok'|'warn'|'fail'|'info'。只读, 不改任何东西。"""
-import os, re, json, ipaddress, subprocess, sys, urllib.request
+import os, re, json, hashlib, ipaddress, platform, subprocess, sys, urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import nftscan  # noqa: E402  与迁移前置门共用的 input 链冲突判据(单一来源)
@@ -335,19 +335,40 @@ def check_core_version():
 
 # mosdns 的钉死版本。**从 lib/versions.sh 读**, 不在这里写第二份 —— 两处手写必然漂,
 # 而漂掉的表现是这条判据报绿、实际跑的却不是钉死那版。
-def _pinned_mosdns_ver():
+# systemd 的 ExecStart 写的就是这个绝对路径。判据必须问**同一个文件** —— 问 PATH 上的
+# `mosdns` 只能告诉你"某个 mosdns 是什么版本", 而不是"这台网关在跑的那个是什么版本"。
+MOSDNS_BIN = "/usr/local/bin/mosdns"
+
+
+def _versions_sh():
+    """lib/versions.sh 的正文。钉死值只有这一个真源, checks.py 里不再写第二份。"""
     for base in (os.environ.get("PDG_REPO_ROOT"), "/opt/privdns-gateway",
                  os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))):
         if not base:
             continue
         try:
             with open(os.path.join(base, "lib/versions.sh"), encoding="utf-8") as f:
-                m = re.search(r'^MOSDNS_VER="([^"]+)"', f.read(), re.M)
-            if m:
-                return m.group(1)
+                return f.read()
         except OSError:
             continue
     return ""
+
+
+def _pinned_mosdns_ver():
+    m = re.search(r'^MOSDNS_VER="([^"]+)"', _versions_sh(), re.M)
+    return m.group(1) if m else ""
+
+
+def _pinned_mosdns_bin_shas():
+    """{架构: 解压后二进制的 SHA256}。架构不在这张表里 = 本项无从对照, 不是"没问题"。"""
+    return dict(re.findall(r'\[mosdns-bin-(\w+)\]="([0-9a-f]{64})"', _versions_sh()))
+
+
+def _host_arch():
+    rc, out, _ = _run(["dpkg", "--print-architecture"])
+    if rc == 0 and out.strip():
+        return out.strip()
+    return {"x86_64": "amd64", "aarch64": "arm64"}.get(platform.machine(), platform.machine())
 
 
 def check_mosdns_version():
@@ -366,10 +387,18 @@ def check_mosdns_version():
     """
     name = "mosdns 版本"
     pinned = _pinned_mosdns_ver()
-    rc, out, err = _run(["mosdns", "version"])
-    m = re.search(r"v\d+\.\d+\.\d+", (out or "") + (err or ""))
+    rc, out, err = _run([MOSDNS_BIN, "version"])
+    # 退出码是证据的一部分。以前把 stdout 与 stderr 拼起来正则找版本号, 找到就算数 ——
+    # 于是 rc=1 / stdout="mosdns v5.3.4-…" / stderr="fatal: broken" 这组输入被判成 ✓。
+    # 一个起不来的 mosdns 照样能打印自己的版本, 那不是"版本对得上", 那是"它崩之前说了句话"。
+    if rc != 0:
+        return ("warn", name,
+                "%s version 退出码非 0(rc=%s)—— 本项无结论。命令失败时它打印的版本号不算证据。"
+                % (MOSDNS_BIN, rc))
+    # 只认 stdout: 版本号出现在 stderr 里, 说明它是在报错的路上顺带说的, 同样不是成功证据。
+    m = re.search(r"v\d+\.\d+\.\d+", out or "")
     if not m:
-        return ("warn", name, "读不到版本(rc=%s) —— 本项无结论" % rc)
+        return ("warn", name, "解析不出版本(stdout 里没有版本串)—— 本项无结论")
     cur = m.group(0)
     if not pinned:
         return ("warn", name, "跑的是 %s, 但读不到 lib/versions.sh 里的钉死值 —— 无从对照" % cur)
@@ -380,6 +409,47 @@ def check_mosdns_version():
     return ("warn", name,
             "跑的是 %s, 钉死的是 %s —— 两边不一致。不自动处理: mosdns 换不换版本是需要"
             "权衡的决定, 不是例行操作。" % (cur, pinned))
+
+
+def check_mosdns_binary(_bin=None, _pin=None, _arch=None):
+    """跑着的 mosdns 二进制**内容**是不是官方那一份。
+
+    为什么版本判据不够: 版本是二进制自报的。安装器的短路条件曾经只看版本, 于是一个内容
+    不同、自报 v5.3.4 的文件会让整段安装被跳过 —— 连带跳过 SHA256 供应链校验。而项目原先
+    钉的是下载**压缩包**的哈希: 一旦跳过下载, 那个钉值就再也没有机会被用上。
+
+    所以钉值改成"解压后二进制本身"(lib/versions.sh 的 PDG_SHA256[mosdns-bin-<arch>]),
+    安装器与 doctor 共用同一份。
+
+    钉值读不到 / 架构不在表里 → warn + 无结论。那不是"没问题", 是"无从对照"。
+
+    三个下划线参数只给测试用(注入沙箱里的路径与钉值), 生产调用不传。
+    """
+    name = "mosdns 二进制"
+    b = _bin or MOSDNS_BIN
+    arch = _arch if _arch is not None else _host_arch()
+    shas = _pinned_mosdns_bin_shas()
+    if arch not in shas:
+        return ("warn", name, "架构 %s 不在钉值表里(已钉: %s)—— 本项无结论"
+                % (arch, "/".join(sorted(shas)) or "无"))
+    pin = _pin if _pin is not None else shas.get(arch, "")
+    if not pin:
+        return ("warn", name, "读不到 %s 的二进制钉死摘要 —— 本项无结论" % arch)
+    try:
+        h = hashlib.sha256()
+        with open(b, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        got = h.hexdigest()
+    except OSError as e:
+        # mosdns 是必需运行组件: 它的二进制读不到不是"存疑", 是这台机器有问题。
+        return ("fail", name, "读不到 %s(%s)" % (b, e.strerror or e.errno))
+    if got == pin:
+        return ("ok", name, "内容与官方钉值一致 ✓(sha256 %s…)" % got[:12])
+    # 只出短前缀: 完整摘要在 lib/versions.sh 里, doctor 上并排两串 64 位十六进制没人会去比。
+    return ("fail", name,
+            "二进制内容与官方钉值**不一致**: 实得 %s…, 钉死 %s… —— "
+            "同一个版本号下内容被换过(或安装时跳过了校验)。" % (got[:12], pin[:12]))
 
 
 def check_dot_arecord():
@@ -2470,7 +2540,7 @@ def check_deep_lan_acl():
             pass
 
 
-ALL = [check_platform, check_services, check_bot_credentials, check_health_timer, check_core_version, check_mosdns_version, check_dot_arecord, check_dot_domain_sync,
+ALL = [check_platform, check_services, check_bot_credentials, check_health_timer, check_core_version, check_mosdns_version, check_mosdns_binary, check_dot_arecord, check_dot_domain_sync,
        check_internal_cidr, check_cidr_drift, check_nft, check_nft_input_chains, check_redirect, check_gms,
        check_tailscale_isolation, check_tailscale_residue, check_tailnet_direct_port,
        check_lan_routes, check_lan_whitelist, check_lan_proxy_routes, check_lan_cert,

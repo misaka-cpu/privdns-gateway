@@ -5964,6 +5964,52 @@ ADB_MARK_SQ=">>> pdg-adblock managed block (internal_sequence)"
 # profile.env 里的启用意图(读不到 = 空 = 未启用)
 _adblock_intent(){ sed -n 's/^[[:space:]]*PDG_ADBLOCK_ENABLED=//p' "$PROFILE_ENV" 2>/dev/null | tail -1; }
 
+# _adblock_read_state → enabled | disabled | unknown  (窄的**只读**三态读取器)
+#
+# 为什么不直接改 _adblock_intent: enable / disable / apply / 迁移都依赖它现有的语义,
+# 动它等于把行为面扩到那些写路径上去。这一个只服务"显示状态"这一件事。
+#
+# 三态不是形式主义。线上 profile.env 是 0600 root:root, 同一台**已启用**的机器上:
+#     root   → 已启用(第三方表 214982 条 / 自定义 0 条)
+#     nobody → 未启用
+# 一个**权限问题**在屏幕上长得和"这台机器没开去广告"一模一样 —— 而后者会让人去点"启用"。
+#
+# 最后一次赋值不是 0/1 时报 unknown, 不退回更早的合法值: 有人往启用位里写了看不懂的东西,
+# 说"未启用"是在替他下结论, 而我们并不知道他要什么。
+_adblock_read_state(){
+  local raw last
+  [[ -e "$PROFILE_ENV" ]] || { printf 'unknown'; return 0; }
+  # 先确认**读得出来**。sed 非零就是打不开(权限 / 路径是目录 / IO 错误)—— 那不是"没启用",
+  # 而是"不知道"。以前这一步的 2>/dev/null 把两者一起吞了。
+  if ! raw="$(sed -n 's/^[[:space:]]*PDG_ADBLOCK_ENABLED=[[:space:]]*//p' "$PROFILE_ENV" 2>/dev/null)"; then
+    printf 'unknown'; return 0
+  fi
+  # 键一次都没出现 = 从没开过。与"值读不出来"分开: 上一步已经证明文件可读。
+  if ! grep -q '^[[:space:]]*PDG_ADBLOCK_ENABLED=' "$PROFILE_ENV" 2>/dev/null; then
+    printf 'disabled'; return 0
+  fi
+  last="$(printf '%s\n' "$raw" | tail -1)"
+  # profile.env 是 shell 片段: 值可能带引号, 后面也可能跟行内注释。
+  last="${last%%[[:space:]]*}"
+  last="${last%\"}"; last="${last#\"}"; last="${last%\'}"; last="${last#\'}"
+  case "$last" in
+    1) printf 'enabled';;
+    0) printf 'disabled';;
+    *) printf 'unknown';;
+  esac
+}
+
+# 规则文件**读得出来吗**。`-r` 只看权限位, 真正的判据是能不能打开 —— 路径是目录、
+# IO 错误、ACL 都只在打开那一步现形。
+# 为什么要单立一条: 缺文件与"0 条"是两件不同的事。0 条是一个具体事实(表在, 里面没东西);
+# 文件不在是另一回事(mosdns 会 FATAL 退出)。显示成同一句话, 现场就没法区分。
+_adb_rules_readable(){
+  local f="${1:-}"
+  [[ -f "$f" ]] || return 1
+  { : < "$f"; } 2>/dev/null || return 1
+  return 0
+}
+
 # 四个 domain_set 文件必须常驻(空文件可以)。缺一个 mosdns 直接 FATAL 退出 —— 这是
 # "规则文件为空是可接受的降级, 规则文件缺失是致命的"那条老规矩。
 _adblock_ensure_files(){
@@ -6105,10 +6151,16 @@ _adb_count_rules(){
 # 报的是**表的大小**, 不是命中次数。本项目没有命中统计(四条实现路径都调查过并否决,
 # 见 HANDOFF), 措辞不许造出一个看着像命中数的数字。
 _adblock_status_line(){
-  local intent lst usr
-  intent="$(_adblock_intent)"
-  if [[ "$intent" != 1 ]]; then
-    printf '未启用'
+  local st lst usr
+  st="$(_adblock_read_state)"
+  case "$st" in
+    disabled) printf '未启用'; return 0;;
+    unknown)  printf '状态未知(启用位读不到: 文件缺失或不可读)—— 请运行 sudo pdg doctor'; return 0;;
+  esac
+  # 启用位是开着的, 但表读不出来 —— 这里**不能**掉回 0 条: 那会把"证据缺失"说成一个事实。
+  if ! _adb_rules_readable "$ADB_STATE_DIR/effective_list.txt" \
+     || ! _adb_rules_readable "$ADB_USER_BLOCK"; then
+    printf '已启用, 但规则文件缺失或不可读; 请运行 sudo pdg doctor'
     return 0
   fi
   lst="$(_adb_count_rules "$ADB_STATE_DIR/effective_list.txt")"
@@ -6117,8 +6169,10 @@ _adblock_status_line(){
 }
 
 _adblock_status(){
-  local intent count updated
-  intent="$(_adblock_intent)"; [[ "$intent" == 1 ]] || intent=0
+  local state count updated
+  # 与 status-line 走**同一个**读取器。两处各读各的话, 迟早会一个说开着一个说关着,
+  # 而用户看到哪一个取决于他敲了哪条命令。
+  state="$(_adblock_read_state)"
   # 路径经 **argv** 传进去, 不再插进 Python 字符串字面量。
   # 今天 ADB_STATE_DIR 是固定常量, 插值不可利用 —— 但那正是"变量一旦可变就变成注入"的
   # 形状, 而这个文件里其它地方都已经走 argv 了, 留一处例外只会让下一个人照抄。
@@ -6128,7 +6182,11 @@ except Exception: print(0)' "$ADB_STATE_DIR" 2>/dev/null)"
   updated="$(python3 -c 'import json,sys
 try: print(json.load(open(sys.argv[1] + "/meta.json")).get("updated","(无)"))
 except Exception: print("(无)")' "$ADB_STATE_DIR" 2>/dev/null)"
-  echo "  启用意图: $([[ "$intent" == 1 ]] && echo 已启用 || echo 未启用)"
+  case "$state" in
+    enabled)  echo "  启用意图: 已启用";;
+    disabled) echo "  启用意图: 未启用";;
+    *)        c_y "  启用意图: 状态未知(启用位读不到: 文件缺失或不可读)—— 请运行 sudo pdg doctor";;
+  esac
   echo "  第三方表: $count 条, 更新于 $updated"
   echo "  用户 allow: $(_adb_count_rules "$ADB_USER_ALLOW") 条   用户 block: $(_adb_count_rules "$ADB_USER_BLOCK") 条"
   echo "  生效中的表: block $(_adb_count_rules "$ADB_STATE_DIR/effective_block.txt") 条 / list $(_adb_count_rules "$ADB_STATE_DIR/effective_list.txt") 条"
