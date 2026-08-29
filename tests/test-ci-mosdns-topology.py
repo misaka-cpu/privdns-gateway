@@ -144,6 +144,14 @@ if os.path.exists(os.path.join(ROOT, INSTALLER)):
     (ok if "lib/versions.sh" in src else bad)("期望值从当前 checkout 的 lib/versions.sh 读")
     (ok if "pdg_mosdns_binary_ok" in src else bad)("消费者也走生产判据复核")
     (ok if re.search(r"install\s+-m\s*755", src) else bad)("以 mode 755 安装")
+    # 版本这一层用真二进制造不出反例(SHA 对得上的文件不可能自报别的版本), 所以它的守卫
+    # 只能是结构判据 —— 少了这条, 把版本比对整段摘掉不会有任何一格转红(负控④量到 0 条)。
+    cmp_line = [ln for ln in code(src).splitlines()
+                if "==" in ln and "got_ver" in ln and "MOSDNS_VER" in ln]
+    (ok if cmp_line else
+     bad)("消费者**比较**自报版本与钉值(不是只在失败提示里提到这两个名字)")
+    (ok if re.search(r'want_sha|PDG_SHA256\[mosdns-bin-', src) else
+     bad)("消费者拿 lib/versions.sh 的钉值当权威(而不是 manifest)")
     (ok if not NET.search(code(src)) else bad)("消费者安装脚本里没有任何联网动作")
     (ok if "SKIP" not in code(src) else bad)("不合格时硬失败, 不 SKIP")
 for j in sorted(consumers):

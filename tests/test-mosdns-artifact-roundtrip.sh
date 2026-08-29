@@ -81,7 +81,7 @@ neg(){ # $1=场景 $2=准备命令
   local out rc=0
   out="$(bash "$ROOT/tests/install-mosdns-artifact.sh" "$D/dl" "$ARCH" "$D/bin/mosdns" 2>&1)" || rc=$?
   if [[ "$rc" != 0 ]]; then
-    ok "$1 → 硬失败(rc=$rc): $(grep -m1 '\[FAIL\]' <<<"$out" | cut -c1-92)"
+    ok "$1 → 硬失败(rc=$rc): $(grep -m1 '\[FAIL\]' <<<"$out" | awk '{print substr($0,1,90)}')"
   else
     bad "$1 → 竟然通过了"
   fi
@@ -96,6 +96,16 @@ neg "manifest 版本写错" \
     'python3 -c "
 import json,sys
 p=sys.argv[1]; d=json.load(open(p)); d[\"version\"]=\"v0.0.1\"; json.dump(d,open(p,\"w\"))" "$D/dl/manifest.json"'
+# 这一格专门隔离"自算 SHA"那一层: 二进制被换掉, manifest 也被同步改成与新内容一致 ——
+# 于是 manifest 交叉核对是过的, 能抓住它的只剩"与 lib/versions.sh 钉值比对"这一步。
+# 少了它, 把消费者的 SHA 校验整段摘掉也不会有任何一格转红(负控③当场量到 0 条)。
+neg "二进制被换 + manifest 同步改成一致(只有仓库钉值能抓)" \
+    'printf "\x00" >> "$D/dl/mosdns"
+     python3 -c "
+import json,sys,hashlib
+p=sys.argv[1]; d=json.load(open(p))
+d[\"binary_sha256\"]=hashlib.sha256(open(sys.argv[2],\"rb\").read()).hexdigest()
+json.dump(d,open(p,\"w\"))" "$D/dl/manifest.json" "$D/dl/mosdns"'
 neg "manifest 缺失" 'rm -f "$D/dl/manifest.json"'
 neg "二进制缺失" 'rm -f "$D/dl/mosdns"'
 
