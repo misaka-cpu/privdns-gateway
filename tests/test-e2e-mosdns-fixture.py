@@ -87,15 +87,23 @@ impl = [f for f in os.listdir(os.path.join(ROOT, "tests"))
  bad)("tests/ 下没有第二份 pdg_mosdns_binary_ok 实现(实得 %r)" % impl)
 
 print()
-print("══ 5. CI: e2e job 先备好钉定二进制, 于是夹具本身不联网 ══")
-# 夹具在 CI 里应当直接复用 job 备好的那一份 —— 让每个用例各下一次才是新增的公网依赖。
+print("══ 5. CI: 夹具靠 producer 的 artifact, 自己不取件 ══")
+# 上一版这里要求"e2e job 里有 prepare-mosdns.sh 这一步" —— 那正是把官方下载放大到 28 次的
+# 形态(e2e 是 matrix, 每格一个容器, "备在 job 层"就是"每个用例一次")。现在改成单次取件 +
+# artifact 扇出, 判据跟着换: e2e job **不许**自己取件, 只许 needs 到 producer 并下载。
+# 取件次数与 DAG 的完整守卫在 tests/test-ci-mosdns-topology.py, 这里只钉与夹具直接相关的两条。
 m = re.search(r"\n  e2e:\n(.*?)\n  [a-z-]+:\n", CI, re.S)
 (ok if m else bad)("抽得到 e2e job")
 if m:
-    (ok if "prepare-mosdns.sh" in m.group(1) else
-     bad)("e2e job 里有「准备钉死版 mosdns」这一步(与 lint/functional 同一份脚本)")
-(ok if CI.count("prepare-mosdns.sh") >= 3 else
- bad)("prepare-mosdns.sh 被复用而不是各写各的(实得 %d 处)" % CI.count("prepare-mosdns.sh"))
+    (ok if "prepare-mosdns.sh" not in m.group(1) else
+     bad)("e2e job **不再**自己调 prepare-mosdns.sh(那会按 matrix 格数放大官方下载)")
+    (ok if "prepare-mosdns-fixture" in m.group(1) else
+     bad)("e2e job needs 到 producer")
+    (ok if "download-artifact" in m.group(1) else
+     bad)("e2e job 用 download-artifact 取本次 run 的钉定二进制")
+(ok if CI.count("prepare-mosdns.sh") == 1 else
+ bad)("整份 workflow 里 prepare-mosdns.sh 只出现 1 次(唯一的取件入口)(实得 %d)"
+      % CI.count("prepare-mosdns.sh"))
 
 print()
 print("══ 6. 真跑一次: 桩被拒, 真二进制被接受 ══")
