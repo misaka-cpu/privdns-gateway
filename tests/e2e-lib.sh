@@ -850,15 +850,39 @@ e2e_fetch_mihomo(){
   gunzip -c "$E2E_TMP/m.gz" > /usr/local/bin/mihomo 2>/dev/null || return 1
   chmod 755 /usr/local/bin/mihomo
 }
+# 播种**真实钉定**的 mosdns 二进制, 并用生产判据复核。
+#
+# 为什么不能用 shell 桩: 一台"装好的网关"按定义就有这个文件, 而安装器的短路与 doctor 的
+# 完整性判据现在都要求它的 SHA256 等于 lib/versions.sh 的钉值。只会 echo 版本号的桩
+# 自报版本是对的、内容是错的 —— 正是这两条判据要抓的形态。夹具里放一个这样的桩,
+# 等于让夹具替被测代码说谎(exact-head CI 33235374627 的六支红灯就是这么来的)。
+#
+# 取件顺序: 已经就位(CI 的 job 用同一份 prepare-mosdns.sh 备好了)→ 直接用, 一次网络请求
+# 都不发; 不在就走那份**既有准备流程**(它自己会核 ZIP 的 SHA256)。让每个用例各下一次
+# 才是真的"新增公网依赖", 所以先复用、后取件。
+#
+# 拿不到就**响亮地失败**, 不 skip: 静默跳过等于把这条夹具契约变回一句空话。
+e2e_seed_mosdns_bin(){
+  local bin=/usr/local/bin/mosdns march
+  march="$(dpkg --print-architecture 2>/dev/null)"; [[ "$march" == arm64 ]] || march=amd64
+  _e2e_mosdns_ok(){
+    # shellcheck source=/dev/null
+    ( . "$E2E_ROOT/lib/versions.sh" 2>/dev/null \
+      && pdg_mosdns_binary_ok "$march" "$MOSDNS_VER" "$bin" )
+  }
+  _e2e_mosdns_ok && return 0
+  rm -f "$bin" 2>/dev/null || true          # 桩清干净再取件
+  hash -r 2>/dev/null || true
+  bash "$E2E_ROOT/tests/prepare-mosdns.sh" >/dev/null 2>&1 || true
+  _e2e_mosdns_ok && return 0
+  echo "[FAIL] 夹具拿不到钉死版 mosdns($march) —— 一台「装好的网关」按定义就有它。" >&2
+  echo "       CI 由 job 的「准备钉死版 mosdns」步骤备好; 本地先跑 sudo bash tests/prepare-mosdns.sh" >&2
+  return 1
+}
+
+# 旧名保留(六支用例在用), 但不再各走各的: 它以前直接 curl 且**不核 SHA256**。
 e2e_fetch_mosdns(){
-  command -v mosdns >/dev/null 2>&1 && return 0
-  # shellcheck source=/dev/null
-  . "$E2E_ROOT/lib/versions.sh"
-  curl -fsSL --retry 2 -m 120 \
-    "https://github.com/IrineSistiana/mosdns/releases/download/${MOSDNS_VER}/mosdns-linux-amd64.zip" \
-    -o "$E2E_TMP/mos.zip" 2>/dev/null || return 1
-  (cd "$E2E_TMP" && unzip -qo mos.zip mosdns) 2>/dev/null || return 1
-  install -m755 "$E2E_TMP/mosdns" /usr/local/bin/mosdns 2>/dev/null || return 1
+  e2e_seed_mosdns_bin
 }
 
 # ── 造现场 ──────────────────────────────────────────────────────────────────
@@ -893,6 +917,10 @@ e2e_reset_botdir(){
 }
 
 e2e_seed_install(){
+  # 一台"已经装好的机器"必须有真实的 mosdns 二进制 —— 没有它, doctor 的完整性判据判 fail,
+  # 而 cmd_update 的自检门看到 fail 就整个回滚。以前这些夹具压根不播种它, 于是
+  # "更新成功"这条正常路径在 CI 上根本走不通, 红的却不是被测代码。
+  e2e_seed_mosdns_bin || return 1
   mkdir -p /opt/pdg-bot /etc/mosdns/rules /etc/privdns-gateway
   cp -a "$E2E_ROOT" /opt/privdns-gateway
   install -m755 "$E2E_ROOT/deploy/bot/pdg.sh" /usr/local/bin/pdg

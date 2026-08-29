@@ -80,7 +80,10 @@ open(os.path.join(W, "state", "effective_list.txt"), "w").write(
     "".join("x%d.example\n" % i for i in range(1234)))
 
 # 只抽那一行所依赖的函数, 单独跑 —— 整个 cmd_status 要 systemctl, 跑不动
-need = ["_adb_count_rules", "_adblock_intent", "_adblock_status_line"]
+# 只读状态那条链现在是四段: 三态读取器 + 可读性判据 + 计数 + 渲染。少抽一段,
+# 渲染函数会掉进"规则文件读不出来"那条分支, 而现场其实好好的。
+need = ["_adblock_read_state", "_adb_rules_readable",
+        "_adb_count_rules", "_adblock_intent", "_adblock_status_line"]
 missing = [f for f in need if ("\n%s()" % f) not in PDGSH]
 (ok if not missing else bad)("依赖的函数都在(缺: %r)" % missing)
 if not missing:
@@ -110,8 +113,17 @@ if not missing:
     r2 = subprocess.run(["bash", "-c", "source %s; _adblock_status_line" % cl],
                         capture_output=True, text=True, env=env)
     out_on = (r2.stdout or "").strip()
-    (ok if "1234" in out_on else bad)("已启用时报出生效表的条数(实得 %r)" % out_on)
-    (ok if "2" in out_on else bad)("已启用时报出用户规则数(实得 %r)" % out_on)
+    # 两个数字必须**分别具名断言**, 不能用子串包含。`"2" in out_on` 看着像在验"自定义 2 条",
+    # 实际同一行里的 1234 就含着字符 2 —— 把产品改成恒定输出"自定义 0 条", 这一格照样绿
+    # (实测: 改坏之后 23/23 全通过)。一个永远不会红的断言比没有断言更糟, 它还在冒充证据。
+    mline = re.search(r"第三方表\s*(\d+)\s*条\s*/\s*自定义\s*(\d+)\s*条", out_on)
+    (ok if mline else
+     bad)("已启用那行能按结构解析出两个具名字段(实得 %r)" % out_on)
+    if mline:
+        (ok if mline.group(1) == "1234" else
+         bad)("第三方表 = 1234(实得 %s, 整行 %r)" % (mline.group(1), out_on))
+        (ok if mline.group(2) == "2" else
+         bad)("自定义 = 2(实得 %s, 整行 %r)" % (mline.group(2), out_on))
     (ok if "\n" not in out_on else bad)("已启用那行是单行(实得 %r)" % out_on)
     (ok if not re.findall(r"\d+\s*次", out_on) else
      bad)("那一行里没有「N 次」(实得 %r)" % out_on)

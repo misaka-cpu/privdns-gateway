@@ -1686,6 +1686,110 @@ _update_in_sync(){                      # 0 = 已装文件逐个等于仓库版�
   )
 }
 
+# _update_release_relation <仓库> <tag> → stdout 四态之一; 判不出来返回非 0 且不输出
+#
+#   same      HEAD 就是那个 tag 指向的提交
+#   behind    HEAD 是 tag 的祖先        → 正常升级
+#   ahead     tag 是 HEAD 的祖先        → 机器上跑着**尚未发布**的提交
+#   diverged  两边互不为祖先            → 无法安全地"更新"过去
+#
+# 为什么要单独立一个函数: 以前的判据只有"HEAD 是否等于 tag", 相等就短路、不等就
+# `git reset --hard <tag>`。`reset --hard` 对方向一视同仁 —— 于是 ahead 这一态被当成
+# 升级执行了, 未发布的提交被静默退回上一个 Release。判据必须先分清方向, 才轮到动作。
+#
+# dry-run 与正式 update **共用这一份**。各写一份的话两边迟早会漂: 一边修好了另一边还在降级,
+# 而 dry-run 恰恰是用户用来"先看看会发生什么"的那条路径。
+#
+# 判不出来一律非 0(fail-closed): 上游拿它当"要不要拒绝"的依据, 那就绝不能在存疑时
+# 退回某个默认关系 —— 默认成 behind 就等于把"判不出来"变成了"那就 reset 吧"。
+_update_release_relation(){
+  local repo="${1:-}" tag="${2:-}" cur tgt rc
+  [[ -n "$repo" && -d "$repo/.git" && -n "$tag" ]] || return 1
+  cur="$(git -C "$repo" rev-parse --verify -q "HEAD^{commit}" 2>/dev/null)" || return 1
+  # `^{commit}` 是必要的: 附注 tag 的对象哈希是 tag 自己而不是它指向的提交, 直接比会永远
+  # 不相等 —— 相等判据静默失效, 而且没有任何迹象。
+  tgt="$(git -C "$repo" rev-parse --verify -q "${tag}^{commit}" 2>/dev/null)" || return 1
+  [[ -n "$cur" && -n "$tgt" ]] || return 1
+  [[ "$cur" == "$tgt" ]] && { printf 'same\n'; return 0; }
+  # `merge-base --is-ancestor` 的退出码分三档: 0=是祖先, 1=不是, 其它=git 自己出错
+  # (对象缺失 / 仓库损坏)。第三档必须与"不是祖先"区分开, 否则一次读坏的仓库会被判成分叉,
+  # 而分叉的处置是拒绝 —— 看着像安全, 实则把"仓库坏了"这条真正的诊断藏起来了。
+  git -C "$repo" merge-base --is-ancestor "$cur" "$tgt" 2>/dev/null; rc=$?
+  case "$rc" in
+    0) printf 'behind\n'; return 0;;
+    1) :;;
+    *) return 1;;
+  esac
+  git -C "$repo" merge-base --is-ancestor "$tgt" "$cur" 2>/dev/null; rc=$?
+  case "$rc" in
+    0) printf 'ahead\n';    return 0;;
+    1) printf 'diverged\n'; return 0;;
+    *) return 1;;
+  esac
+}
+
+# _update_mosdns_preflight → 0 = 现在这台机器的 mosdns 二进制合法, 可以开始更新
+#
+# 为什么要在更新**之前**问: doctor 的 check_mosdns_binary 判 fail 是对的 —— mosdns 是核心
+# 运行文件, 缺失或内容与钉值不符是确定性故障, 不是"无结论"。但 cmd_update 的自检门跑在
+# 更新**做完之后**, 于是一台 mosdns 已经不对的机器会先建快照、reset、装文件、跑迁移、
+# 重启服务, 走完全程, 最后被自检判红再整个回滚 —— 动了一遍又回到起点, 而且每跑一次
+# `pdg update` 就重复一遍。真正该做的是在动手之前就停下。
+#
+# 裁决**只由生产共用判据给出**: lib/versions.sh 的 pdg_mosdns_binary_ok, 与 install.sh 的
+# 严格短路是同一个函数、同一份钉值。下面那几次探测只负责把"为什么不合法"说成人话, 不参与
+# 判定 —— 两套判断并存的话, 它们迟早会在某个边角上给出不同答案。
+#
+# 读不到 versions.sh / 架构不在钉值表里 → 一样拒绝。这里是 fail-closed: 判不出来就不该
+# 在这台机器上开始一次会改动系统的操作。(doctor 那条对同样情形判 warn 是另一回事 ——
+# 它在报告状态, 这里在决定要不要动手。)
+# $1 可选: 要检查的二进制路径, 默认就是 systemd 真正执行的那个。留这个参数是为了让测试
+# 能在沙箱里造出"缺失 / 执行不了 / 版本不符 / 摘要不符"四种形态 —— 生产调用点不传参,
+# 走的永远是写死的绝对路径。**不是**环境变量后门: 没有任何 env 能改变生产行为。
+# shellcheck disable=SC2120  # 这个可选参数只由 tests/test-update-mosdns-preflight.sh 传,
+# 生产调用点(下面 cmd_update 里那一处)有意不传 —— shellcheck 看不到测试里的调用。
+_update_mosdns_preflight(){
+  local bin="${1:-/usr/local/bin/mosdns}" march rc=0
+  (
+    # 放子 shell: versions.sh 定义的 MOSDNS_VER / PDG_SHA256 不该泄漏进 cmd_update 后面
+    # 那些步骤的作用域。
+    # shellcheck source=lib/versions.sh
+    source "$REPO_DIR/lib/versions.sh" 2>/dev/null || exit 10
+    march=$(dpkg --print-architecture 2>/dev/null); [[ "$march" == arm64 ]] || march=amd64
+    pdg_mosdns_binary_ok "$march" "$MOSDNS_VER" "$bin" && exit 0
+    # 到这里就是"不合法"。下面只为把原因说清楚, 判定已经做完了。
+    [[ -e "$bin" ]] || exit 1                       # 文件不存在
+    [[ -x "$bin" ]] || exit 2                       # 在那儿但执行不了
+    "$bin" version >/dev/null 2>&1  || exit 3       # version 命令非零
+    local got; got="$("$bin" version 2>/dev/null | head -1)"
+    [[ "$got" =~ ([0-9]+\.[0-9]+\.[0-9]+) ]] || exit 4      # 输出里读不出版本
+    [[ "${BASH_REMATCH[1]}" == "${MOSDNS_VER#v}" ]] || exit 5 # 自报版本不符
+    [[ -n "${PDG_SHA256[mosdns-bin-$march]:-}" ]] || exit 11  # 该架构没有钉值
+    exit 6                                          # 版本对得上, 那就是内容摘要不符
+  )
+  rc=$?
+  [[ "$rc" == 0 ]] && return 0
+  march=$(dpkg --print-architecture 2>/dev/null); [[ "$march" == arm64 ]] || march=amd64
+  c_y "❌ 更新前自检: mosdns 二进制不合法, 拒绝开始更新。"
+  case "$rc" in
+    1)  echo "  $bin **不存在**(缺失 —— 核心解析器不在, 这台机器现在是坏的)";;
+    2)  echo "  $bin 在那儿但**执行不了**(权限 / 不是可执行文件)";;
+    3)  echo "  $bin version **命令非零**(它起不来, 打印出来的版本号不算数)";;
+    4)  echo "  $bin version 的输出里**读不出版本号**";;
+    5)  local _got _want
+        _got="$("$bin" version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+        _want="$(sed -n 's/^MOSDNS_VER="\(.*\)"/\1/p' "$REPO_DIR/lib/versions.sh" 2>/dev/null | head -1)"
+        echo "  自报**版本不符**: 跑的是 v${_got:-未知}, 钉死的是 ${_want:-未知}";;
+    6)  echo "  **SHA256 摘要不符**: 版本号对得上, 但文件**内容**不是官方那一份";;
+    10) echo "  读不到 $REPO_DIR/lib/versions.sh —— 无从对照, 不在存疑时动手";;
+    11) echo "  本架构($march)在钉值表里没有条目 —— 无从对照, 不在存疑时动手";;
+    *)  echo "  判据未通过(rc=$rc)";;
+  esac
+  echo "  先修好它再更新: sudo pdg doctor 会指出同一项。"
+  echo "  没动任何文件: 未建快照, 未 reset, 未装文件, 未迁移, 未重启服务。"
+  return 1
+}
+
 cmd_update(){
   need_root update
   # --dry-run 只查看: 不装 git、不迁移、不写任何东西。任一步失败都要返回非 0 并说清是哪一步 ——
@@ -1704,38 +1808,88 @@ cmd_update(){
     tgt="$(git -C "$REPO_DIR" tag -l 'v*' --sort=-v:refname 2>/dev/null | head -1)"
     [[ -n "$tgt" ]] || { c_y "❌ 仓库里没有任何发布 tag(v*)→ 无法确定目标版本"; return 1; }
     echo "当前: $cur_desc   最新发布: $tgt"
-    echo "待更新提交(HEAD..$tgt):"
-    git -C "$REPO_DIR" log --oneline "HEAD..$tgt" 2>/dev/null || echo "  (已是最新或无法比较)"
+    # 关系先判、再决定说什么。以前无论什么关系都打印一段 "待更新提交(HEAD..$tgt):" ——
+    # HEAD 领先 tag 时那个区间是**空的**, 于是屏幕上只剩一个标题, 读起来正好是"没有待更新
+    # 的提交, 已经最新了"。而真相相反: 正式 update 会把机器退回 $tgt。
+    local rel
+    if ! rel="$(_update_release_relation "$REPO_DIR" "$tgt")"; then
+      c_y "❌ 判不出当前提交与 $tgt 的关系(仓库损坏 / 对象缺失)→ 正式 update 也会拒绝执行"; return 1
+    fi
+    case "$rel" in
+      same)   echo "已是最新发布 —— 无需更新。";;
+      behind) echo "待更新提交(HEAD..$tgt):"
+              git -C "$REPO_DIR" log --oneline "HEAD..$tgt" 2>/dev/null || echo "  (读不到区间)";;
+      ahead)  c_y "当前跑的是**尚未发布**的提交, 领先 $tgt $(git -C "$REPO_DIR" rev-list --count "${tgt}..HEAD" 2>/dev/null) 笔:"
+              git -C "$REPO_DIR" log --oneline "${tgt}..HEAD" 2>/dev/null | sed 's/^/  /'
+              c_y "正式 pdg update 会**拒绝**执行, 不会自动降级回 $tgt。"
+              echo "  真要退回该版本, 走 pdg rollback 或重装那一版 —— update 不兼作降级工具。";;
+      diverged)
+              c_y "当前提交与 $tgt 已经**分叉**(互不为祖先)。"
+              c_y "正式 pdg update 会**拒绝**执行: 两个方向都不是「更新」, 而它不猜方向。";;
+    esac
     return 0
   fi
   command -v git >/dev/null || { apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git; }
   _lock   # 取锁(嵌套的 cmd_snapshot 不会重复锁)
-  # ── 「已是最新」短路 ────────────────────────────────────────────────────────
-  # 重复跑 `pdg update` 不该有副作用, 以前每次都照走全程: 多留一份快照(挤占 SNAP_DIR)、
-  # 两次 daemon-reload、重启 pdg-bot(iOS 还要加 probe81/mitm), 并把所有已装文件的 mtime
-  # 刷新一遍。用户数据零损伤, 但"什么都没变"的一次操作在现场看起来像动过全身 —— 事后
-  # 按 mtime 找"这次更新到底改了什么", 得到的是全部文件。
+  # 不是仓库 / 拉不到 tag / 网络不通 → 这一整块都跳过, 照常走完整流程, 让后面各步给出
+  # 自己明确的失败理由。上面的 fetch 静默正是这个意思: 它失败只表示"这里判断不了",
+  # 真正的报错留给下面那次带提示的 fetch。
   #
-  # 判据要求**两件事同时成立**: HEAD 正好落在最新发布 tag 上, 且工作树干净。
-  #   · 只比 tag 不看工作树 → 有人手改坏了仓库文件时, 短路会把 `pdg update` 这条修复路径
-  #     一起堵死, 而那正是最需要它能跑的时候;
-  #   · 不是仓库 / 拉不到 tag / 网络不通 → **不短路**, 照常走完整流程, 让后面各步给出自己
-  #     明确的失败理由。短路是优化, 不能变成第二处会拒绝执行的门。
-  # 这里的 fetch 静默: 它失败只意味着"判断不了, 那就别短路", 真正的报错留给下面那次。
-  if [[ -z "${PDG_UPDATE_FORCE:-}" && -d "${REPO_DIR:-}/.git" ]] \
-     && pdg_fetch_release_tags "$REPO_DIR" >/dev/null 2>&1; then
-    local _cur_sha _tgt_tag _tgt_sha
+  # ── 方向判据: 必须在快照 / 迁移 / 装文件 / 重启**之前** ────────────────────
+  # `git reset --hard` 对方向一视同仁, 所以"这次到底是不是在往前走"必须在动任何东西之前
+  # 先被回答一次。ahead 与 diverged 两态就地返回: 一个生产文件都不动, 不建快照, 不 reset,
+  # 不重启服务。
+  #
+  # 这一段**不受 PDG_UPDATE_FORCE 影响**: 那个开关的语义是"强制重装同一版本", 不是
+  # "允许降级"。让它兼作降级后门的话, 现场只要有人凭印象带上它, 未发布的提交就没了 ——
+  # 而那正是最需要拦住的时刻。
+  #
+  # .git 缺失时不判: 那条路是"重新 clone"的自愈: 一个不是 git 仓库的目录里, 也不可能有
+  # 未发布的本地提交需要保护。
+  if [[ -d "${REPO_DIR:-}/.git" ]] && pdg_fetch_release_tags "$REPO_DIR" >/dev/null 2>&1; then
+    local _tgt_tag _rel
     _tgt_tag="$(git -C "$REPO_DIR" tag -l 'v*' --sort=-v:refname 2>/dev/null | head -1)"
-    _cur_sha="$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null)"
-    # `^{commit}` 是必要的: 附注 tag 的对象哈希是 tag 自己, 不是它指向的提交, 直接比会
-    # 永远不相等 —— 短路静默失效, 而且没有任何迹象。
-    _tgt_sha="$(git -C "$REPO_DIR" rev-parse "${_tgt_tag}^{commit}" 2>/dev/null)"
-    if [[ -n "$_tgt_tag" && -n "$_cur_sha" && "$_cur_sha" == "$_tgt_sha" ]] \
-       && git -C "$REPO_DIR" diff --quiet HEAD -- 2>/dev/null \
-       && _update_in_sync "$REPO_DIR"; then
-      c_g "已是最新发布 $_tgt_tag, 且已装文件逐个与仓库一致 —— 无需更新(未建快照, 未重启任何服务)。"
-      echo "  要强制重装同一版本: PDG_UPDATE_FORCE=1 pdg update"
-      return 0
+    if [[ -n "$_tgt_tag" ]]; then
+      if ! _rel="$(_update_release_relation "$REPO_DIR" "$_tgt_tag")"; then
+        c_y "❌ 判不出当前提交与最新发布 $_tgt_tag 的关系(仓库损坏 / 对象缺失), 中止更新。"
+        echo "  没动任何文件: 未建快照, 未 reset, 未重启服务。"
+        return 1
+      fi
+      case "$_rel" in
+        ahead)
+          c_y "❌ 当前跑的是**尚未发布**的提交(领先 $_tgt_tag $(git -C "$REPO_DIR" rev-list --count "${_tgt_tag}..HEAD" 2>/dev/null) 笔), 拒绝更新。"
+          echo "  update 只往前走。退回 $_tgt_tag 是**降级**, 不该由一条例行命令顺手做掉 ——"
+          echo "  真要退回, 走 pdg rollback 或重装那一版。"
+          echo "  没动任何文件: 未建快照, 未 reset, 未重启服务。"
+          return 1;;
+        diverged)
+          c_y "❌ 当前提交与最新发布 $_tgt_tag 已**分叉**(互不为祖先), 拒绝更新。"
+          echo "  两个方向都不是「更新」, 而 update 不猜方向。"
+          echo "  没动任何文件: 未建快照, 未 reset, 未重启服务。"
+          return 1;;
+      esac
+      # ── 真实更新前的 mosdns 完整性预检 ───────────────────────────────────
+      # 只挂在 behind(真的要往前走)这一路上: same 走下面的短路, ahead/diverged 已经在
+      # 上面被关系门拒了, dry-run 压根到不了这里 —— 那三条的既有契约一个字都不动。
+      if [[ "$_rel" == behind ]] && ! _update_mosdns_preflight; then
+        return 1
+      fi
+      # ── 「已是最新」短路 ──────────────────────────────────────────────────
+      # 重复跑 `pdg update` 不该有副作用, 以前每次都照走全程: 多留一份快照(挤占 SNAP_DIR)、
+      # 两次 daemon-reload、重启 pdg-bot(iOS 还要加 probe81/mitm), 并把所有已装文件的 mtime
+      # 刷新一遍。用户数据零损伤, 但"什么都没变"的一次操作在现场看起来像动过全身 —— 事后
+      # 按 mtime 找"这次更新到底改了什么", 得到的是全部文件。
+      #
+      # 判据要求**两件事同时成立**: 关系是 same, 且工作树干净、已装文件与仓库一致。
+      # 只比 tag 不看工作树 → 有人手改坏了仓库文件时, 短路会把 `pdg update` 这条修复路径
+      # 一起堵死, 而那正是最需要它能跑的时候。
+      if [[ -z "${PDG_UPDATE_FORCE:-}" && "$_rel" == same ]] \
+         && git -C "$REPO_DIR" diff --quiet HEAD -- 2>/dev/null \
+         && _update_in_sync "$REPO_DIR"; then
+        c_g "已是最新发布 $_tgt_tag, 且已装文件逐个与仓库一致 —— 无需更新(未建快照, 未重启任何服务)。"
+        echo "  要强制重装同一版本: PDG_UPDATE_FORCE=1 pdg update"
+        return 0
+      fi
     fi
   fi
   c_g "更新前留快照…"
@@ -5878,6 +6032,52 @@ ADB_MARK_SQ=">>> pdg-adblock managed block (internal_sequence)"
 # profile.env 里的启用意图(读不到 = 空 = 未启用)
 _adblock_intent(){ sed -n 's/^[[:space:]]*PDG_ADBLOCK_ENABLED=//p' "$PROFILE_ENV" 2>/dev/null | tail -1; }
 
+# _adblock_read_state → enabled | disabled | unknown  (窄的**只读**三态读取器)
+#
+# 为什么不直接改 _adblock_intent: enable / disable / apply / 迁移都依赖它现有的语义,
+# 动它等于把行为面扩到那些写路径上去。这一个只服务"显示状态"这一件事。
+#
+# 三态不是形式主义。线上 profile.env 是 0600 root:root, 同一台**已启用**的机器上:
+#     root   → 已启用(第三方表 214982 条 / 自定义 0 条)
+#     nobody → 未启用
+# 一个**权限问题**在屏幕上长得和"这台机器没开去广告"一模一样 —— 而后者会让人去点"启用"。
+#
+# 最后一次赋值不是 0/1 时报 unknown, 不退回更早的合法值: 有人往启用位里写了看不懂的东西,
+# 说"未启用"是在替他下结论, 而我们并不知道他要什么。
+_adblock_read_state(){
+  local raw last
+  [[ -e "$PROFILE_ENV" ]] || { printf 'unknown'; return 0; }
+  # 先确认**读得出来**。sed 非零就是打不开(权限 / 路径是目录 / IO 错误)—— 那不是"没启用",
+  # 而是"不知道"。以前这一步的 2>/dev/null 把两者一起吞了。
+  if ! raw="$(sed -n 's/^[[:space:]]*PDG_ADBLOCK_ENABLED=[[:space:]]*//p' "$PROFILE_ENV" 2>/dev/null)"; then
+    printf 'unknown'; return 0
+  fi
+  # 键一次都没出现 = 从没开过。与"值读不出来"分开: 上一步已经证明文件可读。
+  if ! grep -q '^[[:space:]]*PDG_ADBLOCK_ENABLED=' "$PROFILE_ENV" 2>/dev/null; then
+    printf 'disabled'; return 0
+  fi
+  last="$(printf '%s\n' "$raw" | tail -1)"
+  # profile.env 是 shell 片段: 值可能带引号, 后面也可能跟行内注释。
+  last="${last%%[[:space:]]*}"
+  last="${last%\"}"; last="${last#\"}"; last="${last%\'}"; last="${last#\'}"
+  case "$last" in
+    1) printf 'enabled';;
+    0) printf 'disabled';;
+    *) printf 'unknown';;
+  esac
+}
+
+# 规则文件**读得出来吗**。`-r` 只看权限位, 真正的判据是能不能打开 —— 路径是目录、
+# IO 错误、ACL 都只在打开那一步现形。
+# 为什么要单立一条: 缺文件与"0 条"是两件不同的事。0 条是一个具体事实(表在, 里面没东西);
+# 文件不在是另一回事(mosdns 会 FATAL 退出)。显示成同一句话, 现场就没法区分。
+_adb_rules_readable(){
+  local f="${1:-}"
+  [[ -f "$f" ]] || return 1
+  { : < "$f"; } 2>/dev/null || return 1
+  return 0
+}
+
 # 四个 domain_set 文件必须常驻(空文件可以)。缺一个 mosdns 直接 FATAL 退出 —— 这是
 # "规则文件为空是可接受的降级, 规则文件缺失是致命的"那条老规矩。
 _adblock_ensure_files(){
@@ -6009,7 +6209,13 @@ _adblock_apply(){
 _adb_count_rules(){
   local f="${1:-}" n
   [[ -f "$f" ]] || { printf '0'; return 0; }
-  n="$(grep -vcE '^[[:space:]]*(#|$)' "$f" 2>/dev/null)"
+  # LC_ALL=C 只加在**这一次调用**上, 不 export: 规则文件的内容契约是纯 ASCII
+  # (adblock.py 的 _DOMAIN_RE 只放行 [a-z0-9_-] 与点), 而 UTF-8 locale 下 grep 要为每个
+  # 字节做多字节解码, 二十多万行的表上这笔开销是白花的。语义不变 —— 这个模式里没有任何
+  # 依赖 locale 的字符类语义(见 tests/test-adblock-count-locale.sh 的双 locale 对拍)。
+  # 不做计数缓存、不改文件格式、不拿 meta.json 里的数字冒充磁盘真实条数: 那三样都会让
+  # "现在盘上到底有多少条"这个问题失去唯一答案。
+  n="$(LC_ALL=C grep -vcE '^[[:space:]]*(#|$)' "$f" 2>/dev/null)"
   printf '%s' "${n:-0}"
 }
 
@@ -6019,10 +6225,16 @@ _adb_count_rules(){
 # 报的是**表的大小**, 不是命中次数。本项目没有命中统计(四条实现路径都调查过并否决,
 # 见 HANDOFF), 措辞不许造出一个看着像命中数的数字。
 _adblock_status_line(){
-  local intent lst usr
-  intent="$(_adblock_intent)"
-  if [[ "$intent" != 1 ]]; then
-    printf '未启用'
+  local st lst usr
+  st="$(_adblock_read_state)"
+  case "$st" in
+    disabled) printf '未启用'; return 0;;
+    unknown)  printf '状态未知(启用位读不到: 文件缺失或不可读)—— 请运行 sudo pdg doctor'; return 0;;
+  esac
+  # 启用位是开着的, 但表读不出来 —— 这里**不能**掉回 0 条: 那会把"证据缺失"说成一个事实。
+  if ! _adb_rules_readable "$ADB_STATE_DIR/effective_list.txt" \
+     || ! _adb_rules_readable "$ADB_USER_BLOCK"; then
+    printf '已启用, 但规则文件缺失或不可读; 请运行 sudo pdg doctor'
     return 0
   fi
   lst="$(_adb_count_rules "$ADB_STATE_DIR/effective_list.txt")"
@@ -6031,8 +6243,10 @@ _adblock_status_line(){
 }
 
 _adblock_status(){
-  local intent count updated
-  intent="$(_adblock_intent)"; [[ "$intent" == 1 ]] || intent=0
+  local state count updated
+  # 与 status-line 走**同一个**读取器。两处各读各的话, 迟早会一个说开着一个说关着,
+  # 而用户看到哪一个取决于他敲了哪条命令。
+  state="$(_adblock_read_state)"
   # 路径经 **argv** 传进去, 不再插进 Python 字符串字面量。
   # 今天 ADB_STATE_DIR 是固定常量, 插值不可利用 —— 但那正是"变量一旦可变就变成注入"的
   # 形状, 而这个文件里其它地方都已经走 argv 了, 留一处例外只会让下一个人照抄。
@@ -6042,7 +6256,11 @@ except Exception: print(0)' "$ADB_STATE_DIR" 2>/dev/null)"
   updated="$(python3 -c 'import json,sys
 try: print(json.load(open(sys.argv[1] + "/meta.json")).get("updated","(无)"))
 except Exception: print("(无)")' "$ADB_STATE_DIR" 2>/dev/null)"
-  echo "  启用意图: $([[ "$intent" == 1 ]] && echo 已启用 || echo 未启用)"
+  case "$state" in
+    enabled)  echo "  启用意图: 已启用";;
+    disabled) echo "  启用意图: 未启用";;
+    *)        c_y "  启用意图: 状态未知(启用位读不到: 文件缺失或不可读)—— 请运行 sudo pdg doctor";;
+  esac
   echo "  第三方表: $count 条, 更新于 $updated"
   echo "  用户 allow: $(_adb_count_rules "$ADB_USER_ALLOW") 条   用户 block: $(_adb_count_rules "$ADB_USER_BLOCK") 条"
   echo "  生效中的表: block $(_adb_count_rules "$ADB_STATE_DIR/effective_block.txt") 条 / list $(_adb_count_rules "$ADB_STATE_DIR/effective_list.txt") 条"

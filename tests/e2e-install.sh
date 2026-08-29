@@ -37,7 +37,12 @@ S
   esac
   chmod 755 "/usr/local/bin/$c"
 done
-# 内核/解析器二进制: 装机会下载并校验 SHA, 这里用桩替代下载(下载与 SHA 校验有专门单测)
+# mosdns 用**真实钉定二进制**播种, 且必须赶在下面把 curl 打桩之前 —— 取件流程要用真 curl。
+# 这样安装器走的是"已有合法二进制 → 严格短路"这条路: 版本与 SHA256 同时命中才跳过下载。
+# 以前这里写的是只会 echo 版本号的 shell 桩: 旧短路只比自报版本所以够用; 现在短路还要比
+# 内容摘要, 桩必然不符 → 进入下载分支 → 撞上下面那个假 curl → 整次装机 die。
+e2e_seed_mosdns_bin || { echo "[FAIL] 播种钉定 mosdns 失败"; exit 1; }
+# 内核二进制: 装机会下载并校验 SHA, 这里用桩替代下载(下载与 SHA 校验有专门单测)
 . "$E2E_ROOT/lib/versions.sh"
 cat > /usr/local/bin/curl <<S
 #!/bin/sh
@@ -53,16 +58,6 @@ esac
 exit 0
 S
 chmod 755 /usr/local/bin/curl
-# 让"已是钉死版本"成立 → 跳过下载分支(下载本身另有单测覆盖)。
-# 宿主已有真二进制时直接用真的(userns 里也改不动它)。
-if ! command -v mosdns >/dev/null 2>&1; then
-cat > /usr/local/bin/mosdns <<S
-#!/bin/sh
-case "\$1" in version) echo "v$MOSDNS_VER";; start) sleep 3600;; esac
-exit 0
-S
-chmod 755 /usr/local/bin/mosdns
-fi
 if ! command -v mihomo >/dev/null 2>&1; then
 cat > /usr/local/bin/mihomo <<S
 #!/bin/sh

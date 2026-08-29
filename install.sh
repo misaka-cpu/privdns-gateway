@@ -446,10 +446,14 @@ apt-get install -y -qq curl tar unzip zstd nftables iproute2 python3 openssl cer
 systemctl enable --now vnstat >/dev/null 2>&1 || true   # 网卡流量统计(轻量, ~3MB)
 
 # ── 2. mosdns ──
-# 按**钉死版本**判定, 不是"装了就算数": 机器上原有的 mosdns(第三方装的/早年老版)会让
-# `command -v mosdns` 成立而整段跳过 —— 既不升到钉死版, 也跳过 SHA256 供应链校验,
-# 安装日志上连"下载 mosdns"这行都不会出现(现场就这么发现的)。
-if ! pdg_mosdns_is_version "$MOSDNS_VER"; then
+# 按**钉死版本 + 二进制内容**判定, 不是"装了就算数", 也不是"自报版本对就算数":
+#   · `command -v mosdns` 成立就跳过 → 既不升到钉死版, 也跳过 SHA256 校验, 安装日志上
+#     连"下载 mosdns"这行都不会出现(现场踩过);
+#   · 只比自报版本就跳过 → 一个**内容不同、自报 v5.3.4** 的二进制同样能让整段被跳过,
+#     而项目原先钉的是下载压缩包的哈希 —— 跳过下载, 那个钉值就永远用不上了。
+# pdg_mosdns_binary_ok 要求版本相同**且** /usr/local/bin/mosdns 的 SHA256 等于该架构的
+# 二进制钉值; 任一不成立就照常走"备份 → 下载 → ZIP 校验 → 解压 → 安装"。
+if ! pdg_mosdns_binary_ok "$MARCH" "$MOSDNS_VER" /usr/local/bin/mosdns; then
   c_g "下载 mosdns $MOSDNS_VER ($MARCH)…"
   t=$(mktemp -d)
   curl -fsSL "https://github.com/IrineSistiana/mosdns/releases/download/${MOSDNS_VER}/mosdns-linux-${MARCH}.zip" -o "$t/m.zip"
@@ -457,6 +461,11 @@ if ! pdg_mosdns_is_version "$MOSDNS_VER"; then
     || { rm -rf "$t"; die "mosdns 二进制校验未通过 → 拒绝安装(供应链异常, 或版本与 lib/versions.sh 不符)"; }
   _stash_bin /usr/local/bin/mosdns || die "备份既有 mosdns 失败 → 中止(不在无法回退的前提下覆盖二进制)。"
   (cd "$t" && unzip -q m.zip && install -m755 mosdns /usr/local/bin/mosdns)
+  # 落盘之后再核一次内容。ZIP 校验通过只说明"下载对了", 解压与安装之间还有磁盘、
+  # 有 install、有别的进程 —— 而这个二进制正是下次短路判据要比对的那个文件。
+  pdg_verify_sha256 /usr/local/bin/mosdns "${PDG_SHA256[mosdns-bin-$MARCH]:-}" \
+    "mosdns $MOSDNS_VER 二进制 ($MARCH)" \
+    || { rm -rf "$t"; die "mosdns 二进制内容与钉值不符 → 拒绝继续(ZIP 校验已过, 说明问题出在解压/落盘这一段)"; }
   # shellcheck disable=SC2034  # 保留为"装成功了吗"的标记并保持 trap 前初始化;
   # 回滚已改看 BIN_TXN 事务台账(它才代表"这次碰过目标没有")。
   MOSDNS_INSTALLED=1

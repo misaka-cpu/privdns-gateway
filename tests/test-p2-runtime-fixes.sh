@@ -175,8 +175,14 @@ mkrepo(){                               # $1=latest|behind|dirty; 打印仓库�
   # 那样这一格就测不出真正的错误形态了。
   e2e_git "$d" -c user.email=t@t -c user.name=t tag -a v9.9.9 -m r 2>/dev/null
   if [[ "$1" == behind ]]; then
+    # 这一格的名字是"落后", 造的现场必须**真的**落后: 在 c1 之上再提交 c2、把 tag 移到 c2,
+    # 再把 HEAD 退回 c1。原先只是在打完 tag 之后多提交一笔而 HEAD 留在 c2 —— 那是
+    # **领先**最新发布, 恰好是相反的一态。旧判据只比"相等不相等", 两者看起来一样,
+    # 于是这个名不副实的夹具一直绿着; 方向判据一上来它就露馅了。
     echo x > "$d/extra.txt"; e2e_git "$d" add -A >/dev/null 2>&1
     e2e_git "$d" -c user.email=t@t -c user.name=t commit -q -m c2
+    e2e_git "$d" -c user.email=t@t -c user.name=t tag -f -a v9.9.9 -m r 2>/dev/null
+    e2e_git "$d" checkout -q HEAD~1 2>/dev/null
   fi
   echo "$d"
 }
@@ -209,6 +215,10 @@ drv_update(){                           # $1=pdg.sh $2=仓库 → 输出 + 副�
     fn "$f" '/^_core_bindir(){/,/^}/p'
     fn "$f" '/^_pdg_same_file(){/,/^}/p'
     fn "$f" '/^_update_in_sync(){/,/^}/p'
+    # 短路现在建在方向判据之上(same/behind/ahead/diverged), 判据要跟着抽出来 ——
+    # 缺了它 cmd_update 会在第一道门上 command-not-found, 于是这一节测的全是"判不出关系",
+    # 而不是短路本身。旧版 pdg.sh 里没有这个函数, fn 抽不到就是一段空 —— 反向对照照旧成立。
+    fn "$f" '/^_update_release_relation(){/,/^}/p'
     fn "$f" '/^cmd_update(){/,/^}/p'
     echo 'cmd_update; echo "RC=$?"'
   } > "$WORK/d4.sh"
