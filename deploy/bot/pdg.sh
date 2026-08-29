@@ -6141,7 +6141,13 @@ _adblock_apply(){
 _adb_count_rules(){
   local f="${1:-}" n
   [[ -f "$f" ]] || { printf '0'; return 0; }
-  n="$(grep -vcE '^[[:space:]]*(#|$)' "$f" 2>/dev/null)"
+  # LC_ALL=C 只加在**这一次调用**上, 不 export: 规则文件的内容契约是纯 ASCII
+  # (adblock.py 的 _DOMAIN_RE 只放行 [a-z0-9_-] 与点), 而 UTF-8 locale 下 grep 要为每个
+  # 字节做多字节解码, 二十多万行的表上这笔开销是白花的。语义不变 —— 这个模式里没有任何
+  # 依赖 locale 的字符类语义(见 tests/test-adblock-count-locale.sh 的双 locale 对拍)。
+  # 不做计数缓存、不改文件格式、不拿 meta.json 里的数字冒充磁盘真实条数: 那三样都会让
+  # "现在盘上到底有多少条"这个问题失去唯一答案。
+  n="$(LC_ALL=C grep -vcE '^[[:space:]]*(#|$)' "$f" 2>/dev/null)"
   printf '%s' "${n:-0}"
 }
 
