@@ -1278,7 +1278,7 @@ cmd_snapshot(){
               etc/systemd/system/pdg-health.service etc/systemd/system/pdg-health.timer
               etc/letsencrypt/renewal-hooks/deploy/99-pdg-cert.sh
               usr/local/bin/pdg usr/local/bin/pdg-set-token
-              usr/local/bin/mihomo usr/local/bin/sing-box
+              usr/local/bin/mosdns usr/local/bin/mihomo usr/local/bin/sing-box
               usr/local/bin/proxy-gateway-open-cert-http.sh usr/local/bin/proxy-gateway-restore-firewall.sh)
   local items=(); local p; for p in "${cand[@]}"; do [[ -e "/$p" ]] && items+=("$p"); done
   # 面板受管开启态: 用净化后的 config 入档(排除真实 config.json, 追加净化版), 快照不含临时监听/密钥/UI。
@@ -1524,10 +1524,37 @@ cmd_rollback(){
 # 内核二进制目录(默认 /usr/local/bin; 测试可用 PDG_CORE_BINDIR 指到沙箱)。
 _core_bindir(){ echo "${PDG_CORE_BINDIR:-/usr/local/bin}"; }
 
-# 用**刚装上的**新内核二进制对现网配置跑 check(显式走路径, 不依赖 PATH)。
+# 用**刚装上的**新二进制对现网配置跑离线 check(显式走路径, 不依赖 PATH)。
+# 返回: 0 = 通过; 2 = **这个组件没有离线校验能力**(不是"通过"); 其它 = 校验不过。
+#
+# 为什么把"查不了"单列成一个码, 而不是 return 0: 那就是假绿 —— 调用方会把"我没查"
+# 当成"我查过了没问题", 而这正是本项目反复清理的那一类。
+#
+# mosdns 为什么查不了: 上游没有 `-t` / validate 这类离线模式(v5.3.4 的子命令只有
+# start / config / probe / service / version, config 下面也只有 gen 与 conv)。唯一能
+# "加载一遍配置"的是 `start`, 而它会真的去 bind 端口 —— 服务还跑着的时候拿现网配置
+# 跑一遍必然撞端口, 报出来的 Error 与"配置真的坏了"混在一起分不开。靠认上游的报错
+# 文案去分, 是这个项目吃过亏的那类最脆耦合, 不做。
+# 补偿放在 _core_swap_verify: 换完之后用**监听套接字有没有回来**当落地判据。
 _core_config_check(){
-  local svc="$1" bindir="$2"   # svc 恒为 mihomo(v1.6.0 唯一内核); 保留形参以兼容调用方
-  "$bindir/mihomo" -t -d /etc/mihomo -f /etc/mihomo/config.yaml >/dev/null 2>&1
+  local svc="$1" bindir="$2"
+  case "$svc" in
+    mihomo) "$bindir/mihomo" -t -d /etc/mihomo -f /etc/mihomo/config.yaml >/dev/null 2>&1 ;;
+    mosdns) return 2 ;;
+    *)      return 1 ;;   # 不认识的组件: 宁可判失败, 也不替它宣布"检查通过"
+  esac
+}
+
+# 某个服务此刻持有的监听套接字集合(每行 "netid:地址:端口", 排序去重)。
+# 只做**前后对照**, 不解析成任何配置语义 —— 上游改了监听格式也不会让判据说谎, 顶多
+# 前后都变、对不上, 而那本来就该拦。
+# 读不出来(没有 ss / 权限不够 / 就是没有监听)一律回空串, 由调用方决定怎么处置。
+_core_listeners(){
+  local svc="$1"
+  command -v ss >/dev/null 2>&1 || return 0
+  # 用 index()+ENVIRON 而不是 awk -v + 正则: -v 赋值会做转义处理, 且 gawk 与 mawk
+  # 不一致(见 tools/bump-kernel.sh 那次 CI 红)。这里是字面量匹配, 不需要正则。
+  ss -lntup 2>/dev/null | S="\"$svc\"" awk 'index($0, ENVIRON["S"]) { print $1 ":" $5 }' | sort -u
 }
 
 # 内核活性 + 稳定判定: 起得来, 且持续观察若干次仍在跑。
@@ -1584,7 +1611,10 @@ _core_restore_prev(){
 # (旧实现在 check 通过时就删了 .prev, 新核重启失败便无核可退)。
 _core_swap_verify(){
   local svc="$1" newbin="$2" bindir="$3" ver="$4"
-  local bin="$bindir/$svc" stash bak="" sha=""
+  local bin="$bindir/$svc" stash bak="" sha="" cc=0 lis0="" lis1=""
+  # 监听前像必须在**换掉二进制之前**采。换完再采, 采到的已经是新版的结果, 对照就没有
+  # 意义了 —— 这类"前像其实是后像"的判据, 永远绿。
+  lis0="$(_core_listeners "$svc")"
   # 备份必须先成: 拷不下来就在这里停, 绝不能带着"无核可退"的状态去装新内核。
   if ! stash="$(_core_stash_kernel "$svc" "$bindir")"; then
     c_y "  备份现有 $svc 失败 → 中止换核(不在无法回退的前提下装新内核)。"; return 1
@@ -1595,7 +1625,9 @@ _core_swap_verify(){
     _core_restore_prev "$svc" "$bindir" "$bak" "$sha" || c_y "  ⚠️ 旧版内核回退未达标, 请立即 pdg doctor"
     return 1
   fi
-  if ! _core_config_check "$svc" "$bindir"; then
+  # cc: 0=离线校验通过  2=这个组件没有离线校验能力  其它=校验没过
+  _core_config_check "$svc" "$bindir"; cc=$?
+  if [[ "$cc" != 0 && "$cc" != 2 ]]; then
     c_y "  新版与当前配置不兼容(check 失败), 已还原旧版内核"
     _core_restore_prev "$svc" "$bindir" "$bak" "$sha" || c_y "  ⚠️ 旧版内核回退未达标, 请立即 pdg doctor"
     return 1
@@ -1605,6 +1637,33 @@ _core_swap_verify(){
     c_y "  新版内核重启后未稳定运行, 已还原旧版内核并重启"
     _core_restore_prev "$svc" "$bindir" "$bak" "$sha" || c_y "  ⚠️ 旧版内核回退未达标, 请立即 pdg doctor"
     return 1
+  fi
+  # 没有离线校验能力的组件, 在这里补上落地判据: **监听套接字有没有回到换核前的样子**。
+  # 配置解析不了、server 插件起不来这些形态, 恰恰表现为"服务活着、端口没绑回来" ——
+  # is-active 与 NRestarts 两条都看不见它。
+  if [[ "$cc" == 2 ]]; then
+    if [[ -z "$lis0" ]]; then
+      # 前像是空的就没得比。**说出来**, 不要让它看起来像"比过了"。
+      c_y "  注: $svc 没有离线配置校验, 换核前也读不到它的监听端口(没有 ss / 权限不足 / 本来就没监听),"
+      c_y "      故本次只验到「起得来且稳定」这一层。"
+    else
+      # 有界重试, 不是只看一眼。mosdns 起来之后要先把规则集读完才 bind —— 去广告规则大的
+      # 时候那是**秒级**的。单次抽样会把"还没绑好"误判成"绑不回来", 而这条判据的处置是
+      # 还原旧版并让整次更新回滚: 一次计时误判就能把一台好机器拖去回滚。宁可多等十几秒。
+      local _i
+      for ((_i = 0; _i < 15; _i++)); do
+        lis1="$(_core_listeners "$svc")"
+        [[ "$lis1" == "$lis0" ]] && break
+        sleep 1
+      done
+      if [[ "$lis1" != "$lis0" ]]; then
+        c_y "  新版 $svc 起来了, 但监听端口没有回到换核前的样子 → 判为与当前配置不兼容, 已还原旧版"
+        c_y "    换核前: $(tr '\n' ' ' <<<"$lis0")"
+        c_y "    换核后: $(tr '\n' ' ' <<<"${lis1:-<无>}")"
+        _core_restore_prev "$svc" "$bindir" "$bak" "$sha" || c_y "  ⚠️ 旧版回退未达标, 请立即 pdg doctor"
+        return 1
+      fi
+    fi
   fi
   [[ -n "$bak" ]] && rm -f "$bak" 2>/dev/null    # 到此新核确认可用, 旧核备份才可以删
   c_g "  → $svc $ver 已装并重启"
@@ -1632,6 +1691,52 @@ _update_core_binary(){
   gunzip -c "$tmp/m.gz" > "$tmp/mihomo" || { c_y "  解压失败"; rm -rf "$tmp"; return 1; }
   [[ -s "$tmp/mihomo" ]] || { c_y "  解压产物为空"; rm -rf "$tmp"; return 1; }
   if ! _core_swap_verify mihomo "$tmp/mihomo" "$bindir" "$ver"; then rm -rf "$tmp"; return 1; fi
+  rm -rf "$tmp"
+}
+
+# mosdns 二进制更新。与 _update_core_binary 同构, 差别有三处, 每一处都是 mosdns 特有的:
+#
+#   ① 官方产物是 **zip**(而且文件名里不带版本), 不是 mihomo 那种 .gz;
+#   ② 项目对它钉了**两份**哈希 —— 压缩包 PDG_SHA256[mosdns-<arch>] 与解压后的二进制
+#      PDG_SHA256[mosdns-bin-<arch>]。两份都要过;
+#   ③ **解压产物先验完再落盘**。install.sh 那边是先 install 再回头核, 那个顺序在装机
+#      场景下能接受(装坏了就 die), 但换核是在一台**正在服务**的机器上覆盖运行文件 ——
+#      没有理由先把一个还没核过的文件放到 /usr/local/bin 去。
+#
+# 短路判据用生产共用的 pdg_mosdns_binary_ok: 与 install.sh、doctor 的 check_mosdns_binary、
+# 以及更新前预检是同一个函数、同一份钉值。它要求版本相同**且**内容摘要等于钉值 ——
+# 只比版本的话, 一个自报版本正确、内容不同的文件就能让整段更新被跳过。
+#
+# 返回: 0 = 已是钉死版 / 换成功; 1 = 任一环节失败(二进制已还原) → 调用方须回滚整次更新。
+# 注意与 _update_core_binary 的返回约定一致: 下载或校验失败**不降级成警告**, 因为
+# 更新后的 doctor 判据会拿新钉值去比这个文件, 留在旧版就是一次注定翻车的更新。
+_update_mosdns_binary(){
+  local march ver tmp bindir
+  bindir="$(_core_bindir)"
+  # shellcheck source=/dev/null
+  source "$REPO_DIR/lib/versions.sh" 2>/dev/null \
+    || { c_y "读不到 versions.sh, 无法确认 mosdns 目标版本"; return 1; }
+  march=$(dpkg --print-architecture 2>/dev/null); [[ "$march" == arm64 ]] || march=amd64
+  ver="$MOSDNS_VER"
+  # 空的目标版本要在这里停。放它过去的话, 下载 URL 会变成 .../download//mosdns-linux-*.zip,
+  # 最后仍然失败, 但报出来的是"下载失败", 排错方向整个偏掉。
+  [[ -n "$ver" ]] || { c_y "versions.sh 里没有 MOSDNS_VER —— 无从确认目标版本"; return 1; }
+  pdg_mosdns_binary_ok "$march" "$ver" "$bindir/mosdns" && return 0   # 版本 + 内容都已是钉死版
+  command -v unzip >/dev/null 2>&1 \
+    || { c_y "  没有 unzip, 解不开 mosdns 官方产物(zip) → 判为更新失败"; return 1; }
+  c_g "更新 mosdns → $ver …"
+  tmp=$(mktemp -d)
+  curl -fsSL "https://github.com/IrineSistiana/mosdns/releases/download/${ver}/mosdns-linux-${march}.zip" -o "$tmp/m.zip" \
+    || { c_y "  下载失败(版本与发布不一致, 不能当作已更新)"; rm -rf "$tmp"; return 1; }
+  pdg_verify_sha256 "$tmp/m.zip" "${PDG_SHA256[mosdns-$march]:-}" "mosdns $ver ($march)" \
+    || { c_y "  压缩包 SHA 校验失败 → 判为更新失败(不降级成警告后继续)"; rm -rf "$tmp"; return 1; }
+  ( cd "$tmp" && unzip -qo m.zip mosdns ) >/dev/null 2>&1 \
+    || { c_y "  解压失败(压缩包里没有 mosdns?)"; rm -rf "$tmp"; return 1; }
+  [[ -s "$tmp/mosdns" ]] || { c_y "  解压产物为空"; rm -rf "$tmp"; return 1; }
+  chmod 755 "$tmp/mosdns" 2>/dev/null || true
+  pdg_verify_sha256 "$tmp/mosdns" "${PDG_SHA256[mosdns-bin-$march]:-}" "mosdns $ver 二进制 ($march)" \
+    || { c_y "  二进制内容与钉值不符 → 拒绝换核(ZIP 已过, 说明问题出在解压这一段)"; rm -rf "$tmp"; return 1; }
+  if ! _core_swap_verify mosdns "$tmp/mosdns" "$bindir" "$ver"; then rm -rf "$tmp"; return 1; fi
   rm -rf "$tmp"
 }
 
@@ -1770,16 +1875,33 @@ _update_mosdns_preflight(){
   rc=$?
   [[ "$rc" == 0 ]] && return 0
   march=$(dpkg --print-architecture 2>/dev/null); [[ "$march" == arm64 ]] || march=amd64
+  # ── rc=5(自报版本与钉值不符)**不再是拒绝的理由** ───────────────────────────
+  # 从 _update_mosdns_binary 存在那天起, "版本不是钉死的那个"就是一个本次更新**会顺手
+  # 修好**的状态, 而不是故障。在这里拦下来, 等于把唯一能修好它的那条路一起堵死 ——
+  # 与 _update_in_sync 上面那段取向一致: 误判成"要修"顶多白跑一次, 误判成"不用修"才是
+  # 把这台机器最重要的修复手段变成空操作。
+  #
+  # 注意这里读的是**更新前**的 versions.sh(预检跑在 reset 之前), 所以它比的是"旧钉值"。
+  # 正常的升级路径根本走不到这一条: 在同步的机器上二进制本来就等于旧钉值, rc=0 直接过,
+  # 换新钉值那一步发生在 reset 之后。会落到这里的是**版本漂了的机器** —— 手装过、
+  # 装过第三方包、或上一次更新在换核之后、回滚之前断掉的。
+  #
+  # rc=6(版本对得上、内容不符)仍然拒绝, 而且是**有意不让换核路径顺手覆盖掉它**:
+  # 那是篡改/供应链的形态, 不是版本漂移。一次例行更新把它悄悄抹平, 等于把这台机器上
+  # 最该报警的一件事变成一行没人看的日志。
+  if [[ "$rc" == 5 ]]; then
+    local _g5 _w5
+    _g5="$("$bin" version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+    _w5="$(sed -n 's/^MOSDNS_VER="\(.*\)"/\1/p' "$REPO_DIR/lib/versions.sh" 2>/dev/null | head -1)"
+    c_g "更新前自检: mosdns 自报 v${_g5:-未知}, 与本机仓库钉的 ${_w5:-未知} 不符 —— 本次更新会把它收敛到钉死版。"
+    return 0
+  fi
   c_y "❌ 更新前自检: mosdns 二进制不合法, 拒绝开始更新。"
   case "$rc" in
     1)  echo "  $bin **不存在**(缺失 —— 核心解析器不在, 这台机器现在是坏的)";;
     2)  echo "  $bin 在那儿但**执行不了**(权限 / 不是可执行文件)";;
     3)  echo "  $bin version **命令非零**(它起不来, 打印出来的版本号不算数)";;
     4)  echo "  $bin version 的输出里**读不出版本号**";;
-    5)  local _got _want
-        _got="$("$bin" version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
-        _want="$(sed -n 's/^MOSDNS_VER="\(.*\)"/\1/p' "$REPO_DIR/lib/versions.sh" 2>/dev/null | head -1)"
-        echo "  自报**版本不符**: 跑的是 v${_got:-未知}, 钉死的是 ${_want:-未知}";;
     6)  echo "  **SHA256 摘要不符**: 版本号对得上, 但文件**内容**不是官方那一份";;
     10) echo "  读不到 $REPO_DIR/lib/versions.sh —— 无从对照, 不在存疑时动手";;
     11) echo "  本架构($march)在钉值表里没有条目 —— 无从对照, 不在存疑时动手";;
@@ -1941,7 +2063,13 @@ cmd_update(){
   if ! bash /usr/local/bin/pdg __migrate; then
     c_y "迁移(__migrate)失败, 回滚到更新前快照…"; cmd_rollback --dir "$snap_dir" --git "$pre_sha"; return 1
   fi
-  # 内核二进制: mihomo 按 versions.sh 钉死版本更新。
+  # 二进制: mosdns 与 mihomo 都按 versions.sh 的钉死版本收敛。
+  # mosdns 排在前面 —— 它是解析器, 先让它回到钉死版, 再去动流量内核。
+  # 两者都必须在这里做: 更新后的 doctor 自检门会拿**新**钉值去比这两个文件, 谁没跟上
+  # 谁就把整次更新拖去回滚(mosdns 那条以前根本没人跟, 于是每次升 MOSDNS_VER 都必翻)。
+  if ! _update_mosdns_binary; then
+    c_y "mosdns 二进制更新失败, 回滚到更新前快照…"; cmd_rollback --dir "$snap_dir" --git "$pre_sha"; return 1
+  fi
   if ! _update_core_binary; then
     c_y "内核二进制更新失败, 回滚到更新前快照…"; cmd_rollback --dir "$snap_dir" --git "$pre_sha"; return 1
   fi

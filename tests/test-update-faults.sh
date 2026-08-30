@@ -100,6 +100,7 @@ install(){
 # __migrate 经 `bash /usr/local/bin/pdg __migrate` 调用 → 拦 bash 函数
 bash(){ [[ "$*" == *__migrate* ]] && return "${MIGRATE_RC:-0}"; command bash "$@"; }
 _update_core_binary(){ [[ -n "${FAIL_CORE:-}" ]] && return 1; return 0; }
+_update_mosdns_binary(){ [[ -n "${FAIL_MOSBIN:-}" ]] && return 1; return 0; }
 systemctl(){ [[ "${1:-}" == daemon-reload && -n "${FAIL_RELOAD:-}" ]] && return 1; return 0; }
 python3(){
   case "$*" in
@@ -175,6 +176,7 @@ assert_fail_rollback "必需文件(report.py)安装失败" "FAIL_INSTALL=report.
 assert_fail_rollback "必需文件(pdg 主脚本)安装失败" "FAIL_INSTALL=/usr/local/bin/pdg"
 assert_fail_rollback "__migrate 迁移非0"       "MIGRATE_RC=1"
 assert_fail_rollback "运行模块安装失败"         "FAIL_MODULES=1"
+assert_fail_rollback "mosdns 二进制更新失败"    "FAIL_MOSBIN=1"
 assert_fail_rollback "内核二进制更新失败"       "FAIL_CORE=1"
 assert_fail_rollback "daemon-reload 失败"      "FAIL_RELOAD=1"
 # ── doctor 校验门: 命令失败/输出不可信一律回滚, 绝不跳过后报成功 ──

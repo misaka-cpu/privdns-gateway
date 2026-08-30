@@ -18,6 +18,7 @@ bad(){ echo "[FAIL] $1"; nfail=$((nfail+1)); }
 
 xt(){ sed -n "/^$1(){/,/^}/p" "$ROOT/deploy/bot/pdg.sh"; }
 eval "$(xt _core_bindir)"; eval "$(xt _core_config_check)"; eval "$(xt _core_kernel_stable)"
+eval "$(xt _core_listeners)"
 eval "$(xt _pdg_sha)"; eval "$(xt _core_stash_kernel)"; eval "$(xt _core_restore_prev)"; eval "$(xt _core_swap_verify)"; eval "$(xt _pdg_apply_snapshot_tree)"
 eval "$(xt _pdg_mktemp_dir)"
 # 落盘要先给 iOS 生命周期拍完整底片, 那套 helper 全在 pdg.sh 里。按前缀自动抽 —— 写死
@@ -54,7 +55,9 @@ setup(){ # $1=svc $2=新核 check 退出码
 }
 cursha(){ sha256sum "$BIN/$1" | cut -d' ' -f1; }
 
-# shellcheck disable=SC2043  # v1.6.0 只剩 mihomo 一个内核; 循环结构保留, 将来加核直接扩列表
+# A 只对有离线 check 的组件成立。mosdns 的 _core_config_check 恒返回 2(查不了),
+# 拿它跑这一格测的是"不存在的能力失败了没有", 没有意义 —— 它那条路由 I/J 两组覆盖。
+# shellcheck disable=SC2043  # 有意只有 mihomo 一项; 将来再有带离线 check 的组件直接扩列表
 for svc in mihomo; do
   # ── A. 配置 check 失败 → 还原旧核 ──
   setup "$svc" 3; NEW_ACTIVE=active
@@ -83,8 +86,7 @@ done
 
 # ── E. 备份失败必须在装新内核之前中止(问题四) ────────────────────────────
 # 旧实现 `cp -a "$bin" "$prev"` 不看结果, 备份没成也照装新核 → 出事时无核可退。
-# shellcheck disable=SC2043  # v1.6.0 只剩 mihomo 一个内核; 循环结构保留, 将来加核直接扩列表
-for svc in mihomo; do
+for svc in mihomo mosdns; do
   setup "$svc" 0; NEW_ACTIVE=active
   rc=0
   out=$(cp(){ return 1; }                       # 注入: 备份拷不动
@@ -98,8 +100,7 @@ done
 # ── F. 历史遗留的 <svc>.prev 不得被当成"本次备份"还原回去 ──────────────────
 # 真正的危险: 备份 cp 失败时旧实现原地留下上次的 .prev, 还原那步会把这个**来源不明的
 # 历史文件** mv 成当前内核 —— 等于用一个谁也不知道是什么的二进制顶替了正在跑的内核。
-# shellcheck disable=SC2043  # v1.6.0 只剩 mihomo 一个内核; 循环结构保留, 将来加核直接扩列表
-for svc in mihomo; do
+for svc in mihomo mosdns; do
   setup "$svc" 3; NEW_ACTIVE=active
   printf '#!/bin/sh\n# STALE-HISTORICAL-PREV\nexit 0\n' > "$BIN/$svc.prev"
   rc=0
@@ -112,8 +113,7 @@ for svc in mihomo; do
 done
 
 # ── G. 还原时 mv 失败 → _core_restore_prev 必须返回非0(不能只凭服务 active 判成功) ──
-# shellcheck disable=SC2043  # v1.6.0 只剩 mihomo 一个内核; 循环结构保留, 将来加核直接扩列表
-for svc in mihomo; do
+for svc in mihomo mosdns; do
   setup "$svc" 0; NEW_ACTIVE=active
   cp -a "$BIN/$svc" "$BIN/$svc.prev"           # 备份路径同时喂给新旧两种签名
   rc=0
@@ -125,8 +125,7 @@ for svc in mihomo; do
 done
 
 # ── H. 起来即崩: is-active 每次都答 active, 但观察窗口内 NRestarts 在涨 → 必须判不稳定 ──
-# shellcheck disable=SC2043  # v1.6.0 只剩 mihomo 一个内核; 循环结构保留, 将来加核直接扩列表
-for svc in mihomo; do
+for svc in mihomo mosdns; do
   setup "$svc" 0; NEW_ACTIVE=active; RESTART_LOOP=1; : > "$WORK/nrestarts"
   rc=0; out=$(_core_swap_verify "$svc" "$WORK/new-$svc" "$BIN" vTEST 2>&1) || rc=$?
   unset RESTART_LOOP; rm -f "$WORK/nrestarts"
@@ -136,8 +135,8 @@ for svc in mihomo; do
 done
 
 # ── D. 快照含内核二进制, 且回滚能按内容还原(网络无关) ──
-grep -q 'usr/local/bin/mihomo usr/local/bin/sing-box' "$ROOT/deploy/bot/pdg.sh" \
-  && ok "cmd_snapshot cand 已含两内核二进制(回滚不依赖联网重下)" || bad "D1: 快照 cand 缺内核二进制"
+grep -q 'usr/local/bin/mosdns usr/local/bin/mihomo usr/local/bin/sing-box' "$ROOT/deploy/bot/pdg.sh" \
+  && ok "cmd_snapshot cand 已含 mosdns + 两内核二进制(回滚不依赖联网重下)" || bad "D1: 快照 cand 缺二进制"
 
 TREE="$WORK/tree"; DEST="$WORK/dest"; mkdir -p "$TREE/usr/local/bin" "$DEST"
 printf '#!/bin/sh\n# SNAPSHOT-OLDKERNEL\nexit 0\n' > "$TREE/usr/local/bin/mihomo"
@@ -148,6 +147,64 @@ if _pdg_apply_snapshot_tree "$TREE" "$WORK/members" "$DEST" \
    && [[ "$(sha256sum "$DEST/usr/local/bin/mihomo" | cut -d' ' -f1)" == "$SNAPSHA" ]]; then
   ok "回滚落盘: 快照里的内核二进制按 sha 覆盖回坏内核"
 else bad "D2: 回滚未还原内核二进制"; fi
+
+# ── I. "没有离线校验能力" 必须是一个**独立状态**, 不许伪装成"检查通过" ──────
+# mosdns 上游没有 -t / validate。诱惑是让 _core_config_check 直接 return 0 —— 那样
+# 调用方就会把"我没查"当成"我查过没问题", 而这正是本项目反复在清的那类假绿。
+rc=0; _core_config_check mosdns "$BIN" || rc=$?
+[[ "$rc" == 2 ]] && ok "mosdns: 离线校验返回 2(具名的「查不了」), 不是 0" \
+  || bad "I1: mosdns 的离线校验返回 $rc —— 0 就是把「没查」说成了「通过」"
+rc=0; _core_config_check no-such-core "$BIN" || rc=$?
+{ [[ "$rc" != 0 && "$rc" != 2 ]]; } \
+  && ok "不认识的组件: 判失败(不替它宣布检查通过)" || bad "I2: 未知组件返回 $rc"
+
+# ── J. 换核后的监听对照: 端口没回来 = 与配置不兼容 → 还原 ───────────────────
+# 这是替 mosdns 补上离线 check 那一层的判据。配置解析不了 / server 插件起不来的形态,
+# 恰恰是"服务活着但端口没绑回来" —— is-active 和 NRestarts 都看不见它。
+setup mosdns 0; NEW_ACTIVE=active
+# 桩必须按**调用次序**作答: 第一次是换核前的前像, 之后才是换核后的。
+# (第一版按"文件存不存在"分支, 结果前后两次拿到同一个值, 判据恒真 —— 那就是个假绿桩。)
+_core_listeners(){
+  local n; n=$(( $(cat "$WORK/lcount" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$WORK/lcount"
+  if [[ "$n" == 1 ]]; then printf 'udp:127.0.0.1:53\n'; else cat "$WORK/after"; fi
+}
+: > "$WORK/lcount"; printf 'udp:127.0.0.1:9999\n' > "$WORK/after"   # 换核后绑到了别处
+rc=0; out=$(_core_swap_verify mosdns "$WORK/new-mosdns" "$BIN" vTEST 2>&1) || rc=$?
+{ [[ "$rc" != 0 ]] && [[ "$(cursha mosdns)" == "$OLDSHA" ]] && ! grep -q '已装并重启' <<<"$out"; } \
+  && ok "mosdns: 监听端口没回到换核前的样子 → 还原旧版 + 非 0" \
+  || bad "J1: rc=$rc sha=$(cursha mosdns) out=$out"
+grep -q '换核前' <<<"$out" && ok "mosdns: 把前后两组监听都打了出来(能查)" || bad "J2: 没打印前后对照"
+
+setup mosdns 0; NEW_ACTIVE=active
+: > "$WORK/lcount"; printf 'udp:127.0.0.1:53\n' > "$WORK/after"    # 端口原样回来
+rc=0; out=$(_core_swap_verify mosdns "$WORK/new-mosdns" "$BIN" vTEST 2>&1) || rc=$?
+{ [[ "$rc" == 0 ]] && [[ "$(cursha mosdns)" == "$NEWSHA" ]] && grep -q '已装并重启' <<<"$out"; } \
+  && ok "mosdns: 监听原样回来 → 换核成功" || bad "J3: rc=$rc sha=$(cursha mosdns) out=$out"
+
+# 前像读不到时**明说**只验到活性, 不许闷声当成"比过了"
+setup mosdns 0; NEW_ACTIVE=active
+_core_listeners(){ printf ''; }
+rc=0; out=$(_core_swap_verify mosdns "$WORK/new-mosdns" "$BIN" vTEST 2>&1) || rc=$?
+{ [[ "$rc" == 0 ]] && grep -q '只验到' <<<"$out"; } \
+  && ok "mosdns: 读不到监听前像 → 放行但**明说**本次只验到活性与稳定性" \
+  || bad "J4: rc=$rc out=$out"
+# J5. 端口**晚几拍**才绑上 → 不许误判。mosdns 要先读完规则集才 bind, 去广告规则大的时候
+# 那是秒级的; 单次抽样会把"还没绑好"当成"绑不回来", 而这条的处置是让整次更新回滚。
+setup mosdns 0; NEW_ACTIVE=active
+: > "$WORK/lcount"
+_core_listeners(){
+  local n; n=$(( $(cat "$WORK/lcount" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$WORK/lcount"
+  # 第 1 次是前像; 第 2..4 次还没绑上(空); 第 5 次起才回到原样
+  if [[ "$n" == 1 ]]; then printf 'udp:127.0.0.1:53\n'
+  elif [[ "$n" -le 4 ]]; then printf ''
+  else printf 'udp:127.0.0.1:53\n'; fi
+}
+rc=0; out=$(_core_swap_verify mosdns "$WORK/new-mosdns" "$BIN" vTEST 2>&1) || rc=$?
+{ [[ "$rc" == 0 ]] && [[ "$(cursha mosdns)" == "$NEWSHA" ]] && grep -q '已装并重启' <<<"$out"; } \
+  && ok "mosdns: 端口晚几拍才绑上 → 有界重试等到了, 没有误判成不兼容" \
+  || bad "J5: 慢启动被误判(rc=$rc sha=$(cursha mosdns)) —— 一次计时误判就能拖垮整次更新"
+
+rm -f "$WORK/after" "$WORK/lcount"
 
 echo "────────────────────────────────────────"
 echo "通过 $pass, 失败 $nfail"

@@ -448,8 +448,11 @@ jobs:
       - name: "update 与最新发布的关系四态 (相同幂等/落后升级/领先拒绝/分叉拒绝; 真 git 判祖先)"
         run: bash tests/test-update-release-relation.sh
 
-      - name: "update 前置 mosdns 完整性预检 (缺失/命令非零/版本不符/摘要不符均在第一次副作用前停下)"
+      - name: "update 前置 mosdns 完整性预检 (缺失/命令非零/摘要不符在第一次副作用前停下; 版本漂移放行交给换版路径)"
         run: bash tests/test-update-mosdns-preflight.sh
+
+      - name: "mosdns 运行时换版路径 (短路判据/压缩包与解压产物双重校验/坏件绝不落盘/失败回滚/快照收二进制)"
+        run: bash tests/test-update-mosdns-binary.sh
 
       - name: "换内核工具契约 (只改钉值不提交/两种钉值形状/取件后核对版本与架构/离线改写)"
         run: bash tests/test-bump-kernel-tool.sh

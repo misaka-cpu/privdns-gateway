@@ -97,6 +97,7 @@ git(){ printf '%s\n' "$*" >> "$WORK/git.log"; command git "$@"; }
 install(){ printf 'install %s\n' "$*" >> "$WORK/side.log"; return 0; }
 bash(){ [[ "$*" == *__migrate* ]] && { echo "migrate" >> "$WORK/side.log"; return 0; }; command bash "$@"; }
 _update_core_binary(){ echo "core" >> "$WORK/side.log"; return 0; }
+_update_mosdns_binary(){ echo "mosbin" >> "$WORK/side.log"; return 0; }
 systemctl(){ printf 'systemctl %s\n' "$*" >> "$WORK/side.log"; return 0; }
 python3(){ case "$*" in *py_compile*) return 0;; *doctor.py*) echo '[{"level":"ok","check":"服务","detail":"都在"}]'; return 0;; *) command python3 "$@";; esac; }
 mihomo(){ return 0; }

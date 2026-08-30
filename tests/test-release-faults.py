@@ -57,7 +57,8 @@ UPD = UPD[:UPD.index("\n}\n")]
 print("== 1. 阶段图必须与生产代码一致 ==")
 stages = [("更新前快照", "cmd_snapshot"), ("git reset 到 tag", "reset --hard"),
           ("读 manifest", "lib/modules.sh"), ("部署静态文件", "pdg_install_runtime_modules"),
-          ("迁移", "__migrate"), ("内核二进制", "_update_core_binary"),
+          ("迁移", "__migrate"), ("mosdns 二进制", "_update_mosdns_binary"),
+          ("内核二进制", "_update_core_binary"),
           ("py_compile", "py_compile"), ("mihomo 校验", "mihomo -t"),
           ("nft 校验", "nft -c"), ("doctor", "doctor.py"), ("回滚", "cmd_rollback")]
 missing = [n for n, k in stages if k not in UPD]
@@ -82,6 +83,27 @@ if 0 <= _i_sha < _i_gz:
     ok("checksum 在解压**之前**(坏档不会被展开)")
 else:
     bad("checksum 排在解压之后")
+
+# mosdns 走的是另一条路(zip + 两份钉值), 校验顺序要单独钉一遍 —— 它比 mihomo 多一步:
+# 解压产物**落盘之前**还要再核一次内容, 因为换核是在一台正在服务的机器上覆盖运行文件。
+mos = PDG[PDG.index("_update_mosdns_binary(){"):]
+mos = mos[:mos.index("\n}\n")]
+_z_sha = mos.find('pdg_verify_sha256 "$tmp/m.zip"')
+_unzip = mos.find("unzip -qo")
+_b_sha = mos.find('pdg_verify_sha256 "$tmp/mosdns"')
+_swap = mos.find("_core_swap_verify mosdns")
+if 0 <= _z_sha < _unzip:
+    ok("mosdns: 压缩包 checksum 在解压**之前**")
+else:
+    bad("mosdns: 压缩包 checksum 不在解压之前(zip=%d unzip=%d)" % (_z_sha, _unzip))
+if 0 <= _b_sha < _swap:
+    ok("mosdns: 解压产物的 checksum 在换核(落盘)**之前**")
+else:
+    bad("mosdns: 解压产物没在落盘前核过(bin=%d swap=%d)" % (_b_sha, _swap))
+if "pdg_mosdns_binary_ok" in mos:
+    ok("mosdns: 短路判据走生产共用的 pdg_mosdns_binary_ok")
+else:
+    bad("mosdns: 短路判据没走共用判据 —— 迟早与安装器/doctor 漂开")
 # 真跑一次校验函数: 内容不符必须非 0, 且不写出任何东西
 open(os.path.join(BOX, "art.gz"), "wb").write(b"not-really-a-gzip")
 rc, out = sh('source lib/versions.sh; pdg_verify_sha256 "%s/art.gz" '
