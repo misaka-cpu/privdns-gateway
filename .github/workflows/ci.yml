@@ -730,6 +730,15 @@ jobs:
       - name: "准备钉死版 mihomo (SHA256 校验, 供需要真内核的测试共用)"
         run: bash tests/prepare-mihomo.sh
 
+      - name: "mihomo 完整性闭包 (绝对路径+退出码+自报版本+内容摘要; PATH 影子无效; 内容漂移仍可修)"
+        run: bash tests/test-mihomo-integrity.sh
+
+      - name: "mihomo doctor 四态 (版本不符/摘要不符 fail; 无从对照 warn 且明说无结论; 全中才 ok)"
+        run: python3 tests/test-mihomo-binary-evidence.py
+
+      - name: "mihomo 真实换核 (v1.19.29→钉死版; 成功/配置检查失败/起来不稳 三态; 坏件绝不落盘)"
+        run: bash tests/test-mihomo-real-swap.sh
+
       - name: "混合规则 AND 语义 (跨字段 AND/同字段 OR/不支持组合拒绝/真 mihomo -t)"
         run: python3 tests/test-rule-mixed.py
 
