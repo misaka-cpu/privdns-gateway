@@ -43,6 +43,9 @@ echo
 echo "══ 3. 用法与参数校验(不联网也应立刻拒绝坏输入)══"
 run(){ ( cd "$WORK" && PDG_BUMP_ROOT="$WORK/repo" bash "$TOOL" "$@" 2>&1 ); }
 mkdir -p "$WORK/repo/lib"; cp "$ROOT/lib/versions.sh" "$WORK/repo/lib/versions.sh"
+# 前像: 「没误伤另一侧」那两格拿它比, 而不是写死某个版本号
+PRE_MIHOMO="$(sed -n 's/^MIHOMO_VER="\([^"]*\)".*/\1/p' "$ROOT/lib/versions.sh")"
+PRE_MOSDNS="$(sed -n 's/^MOSDNS_VER="\([^"]*\)".*/\1/p' "$ROOT/lib/versions.sh")"
 out=$(run); rc=$?
 { [[ "$rc" != 0 ]] && grep -qE '用法|usage' <<<"$out"; } && ok "无参数 → 非零 + 打印用法" || bad "无参数时 rc=$rc: $(head -2 <<<"$out")"
 out=$(run nosuchcomp v1.2.3); rc=$?
@@ -108,7 +111,10 @@ F
     grep -q "\[mihomo-amd64\]=\"$a\"" "$WORK/repo/lib/versions.sh" && ok "amd64 钉值 = 归档的真实 sha256" || bad "amd64 钉值不对"
     b=$(printf 'archive-mihomo-v9.9.9-arm64' | sha256sum | cut -d' ' -f1)
     grep -q "\[mihomo-arm64\]=\"$b\"" "$WORK/repo/lib/versions.sh" && ok "arm64 钉值 = 归档的真实 sha256" || bad "arm64 钉值不对"
-    grep -q 'MOSDNS_VER="v5.3.4"' "$WORK/repo/lib/versions.sh" && ok "没有误伤 mosdns 那一侧" || bad "动了 mosdns"
+    # 比的是**前像**, 不是写死的版本号: 那个值每次换版都会合法地变, 钉死它等于让这支测试
+    # 在工具第一次真被使用的那天自己转红(第一版就是这样)。
+    grep -q "MOSDNS_VER=\"$PRE_MOSDNS\"" "$WORK/repo/lib/versions.sh" \
+      && ok "没有误伤 mosdns 那一侧(仍是 $PRE_MOSDNS)" || bad "动了 mosdns"
     bash -n "$WORK/repo/lib/versions.sh" && ok "改写后 versions.sh 仍能解析" || bad "改写后语法坏了"
     ( set -a; . "$WORK/repo/lib/versions.sh"; [[ "${PDG_SHA256[mihomo-amd64]}" == "$a" ]] ) \
       && ok "source 出来的关联数组取值正确" || bad "source 后取不到正确的值"
@@ -132,7 +138,8 @@ if grep -q 'PDG_BUMP_FETCHER' <<<"$c"; then
   grep -q "\[mosdns-amd64\]=\"$za\"" "$WORK/repo/lib/versions.sh" && ok "归档钉值已改" || bad "归档钉值不对"
   grep -q "\[mosdns-bin-amd64\]=\"$ba\"" "$WORK/repo/lib/versions.sh" && ok "解压后二进制钉值已改(两份都动了)" || bad "mosdns-bin 钉值没改"
   [[ "$za" != "$ba" ]] && ok "两份钉值确实是不同的对象" || bad "两份钉值相同, 说明钉错了对象"
-  grep -q 'MIHOMO_VER="v1.19.29"' "$WORK/repo/lib/versions.sh" && ok "没有误伤 mihomo 那一侧" || bad "动了 mihomo"
+  grep -q "MIHOMO_VER=\"$PRE_MIHOMO\"" "$WORK/repo/lib/versions.sh" \
+    && ok "没有误伤 mihomo 那一侧(仍是 $PRE_MIHOMO)" || bad "动了 mihomo"
 fi
 
 echo "────────────────────────────────────────"
