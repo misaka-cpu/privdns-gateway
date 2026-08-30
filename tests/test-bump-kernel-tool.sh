@@ -108,9 +108,12 @@ F
     n=$(grep -cE '^MIHOMO_VER=' "$WORK/repo/lib/versions.sh")
     [[ "$n" == 1 ]] && ok "版本常量仍只有一行(替换而非追加)" || bad "版本常量变成 $n 行"
     a=$(printf 'archive-mihomo-v9.9.9-amd64' | sha256sum | cut -d' ' -f1)
-    grep -q "\[mihomo-amd64\]=\"$a\"" "$WORK/repo/lib/versions.sh" && ok "amd64 钉值 = 归档的真实 sha256" || bad "amd64 钉值不对"
+    _act(){ sed -n "s/^  \\[$1\\]=\"\\([^\"]*\\)\".*/\\1/p" "$WORK/repo/lib/versions.sh" | head -1; }
+    grep -q "\[mihomo-amd64\]=\"$a\"" "$WORK/repo/lib/versions.sh" && ok "amd64 钉值 = 归档的真实 sha256" \
+      || bad "amd64 钉值不对: 实得 '$(_act mihomo-amd64)', 期望 '$a'; 工具输出: $(tr '\n' ' ' <<<"$out" | cut -c1-200)"
     b=$(printf 'archive-mihomo-v9.9.9-arm64' | sha256sum | cut -d' ' -f1)
-    grep -q "\[mihomo-arm64\]=\"$b\"" "$WORK/repo/lib/versions.sh" && ok "arm64 钉值 = 归档的真实 sha256" || bad "arm64 钉值不对"
+    grep -q "\[mihomo-arm64\]=\"$b\"" "$WORK/repo/lib/versions.sh" && ok "arm64 钉值 = 归档的真实 sha256" \
+      || bad "arm64 钉值不对: 实得 '$(_act mihomo-arm64)', 期望 '$b'"
     # 比的是**前像**, 不是写死的版本号: 那个值每次换版都会合法地变, 钉死它等于让这支测试
     # 在工具第一次真被使用的那天自己转红(第一版就是这样)。
     grep -q "MOSDNS_VER=\"$PRE_MOSDNS\"" "$WORK/repo/lib/versions.sh" \
@@ -135,12 +138,44 @@ if grep -q 'PDG_BUMP_FETCHER' <<<"$c"; then
   grep -q 'MOSDNS_VER="v8.8.8"' "$WORK/repo/lib/versions.sh" && ok "MOSDNS_VER 已改" || bad "MOSDNS_VER 没改"
   za=$(printf 'archive-mosdns-v8.8.8-amd64' | sha256sum | cut -d' ' -f1)
   ba=$(printf 'binary-mosdns-v8.8.8-amd64' | sha256sum | cut -d' ' -f1)
-  grep -q "\[mosdns-amd64\]=\"$za\"" "$WORK/repo/lib/versions.sh" && ok "归档钉值已改" || bad "归档钉值不对"
-  grep -q "\[mosdns-bin-amd64\]=\"$ba\"" "$WORK/repo/lib/versions.sh" && ok "解压后二进制钉值已改(两份都动了)" || bad "mosdns-bin 钉值没改"
+  _act2(){ sed -n "s/^  \\[$1\\]=\"\\([^\"]*\\)\".*/\\1/p" "$WORK/repo/lib/versions.sh" | head -1; }
+  grep -q "\[mosdns-amd64\]=\"$za\"" "$WORK/repo/lib/versions.sh" && ok "归档钉值已改" \
+    || bad "归档钉值不对: 实得 '$(_act2 mosdns-amd64)', 期望 '$za'; 工具输出: $(tr '\n' ' ' <<<"$out" | cut -c1-200)"
+  grep -q "\[mosdns-bin-amd64\]=\"$ba\"" "$WORK/repo/lib/versions.sh" && ok "解压后二进制钉值已改(两份都动了)" \
+    || bad "mosdns-bin 钉值不对: 实得 '$(_act2 mosdns-bin-amd64)', 期望 '$ba'"
   [[ "$za" != "$ba" ]] && ok "两份钉值确实是不同的对象" || bad "两份钉值相同, 说明钉错了对象"
   grep -q "MIHOMO_VER=\"$PRE_MIHOMO\"" "$WORK/repo/lib/versions.sh" \
     && ok "没有误伤 mihomo 那一侧(仍是 $PRE_MIHOMO)" || bad "动了 mihomo"
 fi
+
+echo
+echo "══ 9. awk 实现无关: mawk 与 gawk 都要给出同一个结果 ══"
+# 由来是一次真事故: 改写用 `awk -v pat='^  \[mihomo-amd64\]='` 传正则, 而 -v 会处理转义 ——
+# gawk 把 `\[` 变成裸 `[`, 于是 pat 成了字符类 `[mihomo-amd64]`, a-6 是非法区间 → gawk fatal,
+# awk 进程死掉、`&&` 短路、文件原样不动。Debian 默认 mawk 保持原样, 照常匹配。
+# 于是同一份脚本本机全绿、CI(gawk)上**版本号换了哈希没换**, 而且不报错。
+# 现在改写走 index()+ENVIRON(都不碰正则也不做转义), 这一格拿两种 awk 各跑一遍钉住它。
+if grep -q 'ENVIRON\[' <<<"$c" && ! grep -qE "awk -v (pat|p)=" <<<"$c"; then
+  ok "改写不再把正则喂给 awk -v(用 index()+ENVIRON)"
+else
+  bad "改写仍在用 awk -v 传正则 —— gawk 上会静默失效"
+fi
+for AWKBIN in mawk gawk; do
+  command -v "$AWKBIN" >/dev/null 2>&1 || { echo "[NOTE] 本机没有 $AWKBIN, 该实现未验(CI 上有 gawk)"; continue; }
+  d="$WORK/awk-$AWKBIN"; mkdir -p "$d/bin" "$d/repo/lib"
+  ln -sf "$(command -v "$AWKBIN")" "$d/bin/awk"
+  cp "$ROOT/lib/versions.sh" "$d/repo/lib/versions.sh"
+  if PATH="$d/bin:$PATH" PDG_BUMP_ROOT="$d/repo" PDG_BUMP_FETCHER="$WORK/fake-fetch.sh" \
+     PDG_BUMP_SKIP_VERIFY=1 bash "$TOOL" mihomo v9.9.9 >/dev/null 2>&1; then
+    x=$(printf 'archive-mihomo-v9.9.9-amd64' | sha256sum | cut -d' ' -f1)
+    grep -q "\[mihomo-amd64\]=\"$x\"" "$d/repo/lib/versions.sh" \
+      && ok "$AWKBIN 下钉值写对了" \
+      || bad "$AWKBIN 下钉值没写对(实得 $(sed -n 's/^  \[mihomo-amd64\]="\([^"]*\)".*/\1/p' "$d/repo/lib/versions.sh" | head -1))"
+    grep -q 'MIHOMO_VER="v9.9.9"' "$d/repo/lib/versions.sh" && ok "$AWKBIN 下版本常量也对" || bad "$AWKBIN 下版本常量没改"
+  else
+    bad "$AWKBIN 下工具直接失败了"
+  fi
+done
 
 echo "────────────────────────────────────────"
 echo "test-bump-kernel-tool.sh: 通过 $pass, 失败 $nfail"

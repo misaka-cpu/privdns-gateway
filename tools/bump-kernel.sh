@@ -53,8 +53,12 @@ esac
 
 [[ -f "$VERSIONS" ]] || die "找不到 $VERSIONS"
 
-# 工作树必须干净 —— 否则这次改写会和别人的改动混进同一笔, 事后分不清哪行是谁写的
-if git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+# 工作树必须干净 —— 否则这次改写会和别人的改动混进同一笔, 事后分不清哪行是谁写的。
+# 只在 $ROOT **就是某个仓库的顶层**时才查: 否则(比如测试把 ROOT 指到临时目录, 而那个
+# 临时目录恰好落在另一个仓库里)git 会向上找到**无关的**仓库, 把沙箱自己的文件看成未跟踪,
+# 于是工具拒绝干活 —— 判的根本不是同一件事。
+if _top="$(git -C "$ROOT" rev-parse --show-toplevel 2>/dev/null)" \
+   && [[ "$(realpath -m "$_top")" == "$(realpath -m "$ROOT")" ]]; then
   if [[ -n "$(git -C "$ROOT" status --porcelain=v1 -- lib/versions.sh 2>/dev/null)" ]]; then
     die "lib/versions.sh 已有未提交改动 —— 先处理干净再来, 免得混成一笔"
   fi
@@ -134,24 +138,51 @@ for arch in amd64 arm64; do
 done
 
 # ── 改写: 逐行**替换**, 不追加 ────────────────────────────────────────────────
-_sub(){                          # $1=正则(整行) $2=新行
-  local pat="$1" new="$2" n
-  n=$(grep -cE "$pat" "$VERSIONS")
-  [[ "$n" == 1 ]] || die "锚点命中 $n 次(期望 1): $pat —— versions.sh 换写法了, 工具要跟着改"
-  local tmp; tmp="$(mktemp)"
-  awk -v pat="$pat" -v new="$new" '$0 ~ pat { print new; next } { print }' "$VERSIONS" > "$tmp" \
-    && cat "$tmp" > "$VERSIONS" && rm -f "$tmp"
+# 锚点用**行首字面量**匹配(index), 不用正则 —— 这不是风格问题:
+# `awk -v pat='^  \[mihomo-amd64\]='` 里的 `\[` 会被 awk 的 -v 当转义序列处理。gawk 把它
+# 变成裸 `[`, 于是 pat 成了字符类, 什么都匹配不上; mawk 保持原样, 照常匹配。同一份脚本在
+# Debian(mawk)上全绿、在 GitHub runner(gawk)上静默不改那两行 —— 版本号换了、哈希没换,
+# 而且没有任何报错。ENVIRON[] 取值不做转义处理, index() 也不碰正则, 两头都堵上。
+_sub(){                          # $1=行首字面量前缀 $2=整行新内容
+  local pre="$1" new="$2" n tmp
+  n=$(P="$pre" awk 'index($0, ENVIRON["P"])==1 {c++} END{print c+0}' "$VERSIONS")
+  [[ "$n" == 1 ]] || die "锚点命中 $n 次(期望 1): '$pre' —— versions.sh 换写法了, 工具要跟着改"
+  tmp="$(mktemp)"
+  P="$pre" N="$new" awk 'index($0, ENVIRON["P"])==1 { print ENVIRON["N"]; next } { print }' \
+    "$VERSIONS" > "$tmp" && cat "$tmp" > "$VERSIONS" && rm -f "$tmp"
 }
-_sub "^${VER_KEY}=" "$(awk -v k="$VER_KEY" -v v="$VER" '
-  $0 ~ "^"k"=" { sub(/"[^"]*"/, "\""v"\""); print; exit }' "$VERSIONS")"
+# 版本常量那一行: 保留行尾原有注释, 只换引号里的值
+_verline="$(K="$VER_KEY" V="$VER" awk '
+  index($0, ENVIRON["K"] "=")==1 { sub(/"[^"]*"/, "\"" ENVIRON["V"] "\""); print; exit }' "$VERSIONS")"
+[[ -n "$_verline" ]] || die "取不到 $VER_KEY 那一行"
+_sub "${VER_KEY}=" "$_verline"
 for arch in amd64 arm64; do
-  _sub "^  \\[${COMP}-${arch}\\]=" "  [${COMP}-${arch}]=\"${ARCHIVE_SHA[$arch]}\""
+  _sub "  [${COMP}-${arch}]=" "  [${COMP}-${arch}]=\"${ARCHIVE_SHA[$arch]}\""
   if [[ "$COMP" == mosdns ]]; then
-    _sub "^  \\[${COMP}-bin-${arch}\\]=" "  [${COMP}-bin-${arch}]=\"${BIN_SHA[$arch]}\""
+    _sub "  [${COMP}-bin-${arch}]=" "  [${COMP}-bin-${arch}]=\"${BIN_SHA[$arch]}\""
   fi
 done
 
 bash -n "$VERSIONS" || die "改写后 $VERSIONS 语法坏了 —— 请 git checkout 还原后报告"
+
+# 写完读回来自查。这是钉供应链哈希的工具, "我以为我写对了"不算证据 —— 逐项把文件里的值
+# 读出来与刚算的比, 不一致就把**两个值都摆出来**再退出, 而不是留一个静默写错的钉值。
+_readback(){                     # $1=键名 → 打印文件里那一份
+  grep -oE "^  \[$1\]=\"[0-9a-f]*\"" "$VERSIONS" | head -1 | grep -oE '[0-9a-f]{16,}' | head -1
+}
+_rb="$(grep -oE "^${VER_KEY}=\"[^\"]*\"" "$VERSIONS" | head -1 | sed -e 's/.*="//' -e 's/"$//')"
+[[ "$_rb" == "$VER" ]] || die "回读 $VER_KEY = '${_rb:-<空>}', 期望 '$VER'"
+for arch in amd64 arm64; do
+  _rb="$(_readback "${COMP}-${arch}")"
+  [[ "$_rb" == "${ARCHIVE_SHA[$arch]}" ]] \
+    || die "回读 [${COMP}-${arch}] = '${_rb:-<空>}', 期望 '${ARCHIVE_SHA[$arch]}'"
+  if [[ "$COMP" == mosdns ]]; then
+    _rb="$(_readback "${COMP}-bin-${arch}")"
+    [[ "$_rb" == "${BIN_SHA[$arch]}" ]] \
+      || die "回读 [${COMP}-bin-${arch}] = '${_rb:-<空>}', 期望 '${BIN_SHA[$arch]}'"
+  fi
+done
+say "  回读自查 ✓ 文件里的值与刚算的逐项一致"
 
 say ""
 say "== 改动 =="
