@@ -174,7 +174,7 @@ jobs:
         run: |
           command -v shellcheck >/dev/null || sudo apt-get install -y -q shellcheck
           shellcheck --severity=warning -e SC1091 \
-            install.sh uninstall.sh deploy/bot/*.sh deploy/cert/*.sh lib/*.sh tests/*.sh
+            install.sh uninstall.sh deploy/bot/*.sh deploy/cert/*.sh lib/*.sh tests/*.sh tools/*.sh
 
       - name: "防火墙迁移识别回归 (原装应迁移 / 自定义应跳过)"
         run: bash tests/test-fw-migration.sh
@@ -450,6 +450,9 @@ jobs:
 
       - name: "update 前置 mosdns 完整性预检 (缺失/命令非零/版本不符/摘要不符均在第一次副作用前停下)"
         run: bash tests/test-update-mosdns-preflight.sh
+
+      - name: "换内核工具契约 (只改钉值不提交/两种钉值形状/取件后核对版本与架构/离线改写)"
+        run: bash tests/test-bump-kernel-tool.sh
 
       - name: "E2E 夹具必须播真 mosdns (shell 假桩被生产判据拒绝 / 真钉定二进制被接受 / 夹具不联网)"
         run: python3 tests/test-e2e-mosdns-fixture.py

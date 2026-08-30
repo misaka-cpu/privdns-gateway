@@ -10,7 +10,7 @@
 # 哈希取自上游官方 GitHub Release(信任锚 = 官方发布页),装机/测试时逐字节比对,不符即拒装。
 # ─────────────────────────────────────────────────────────────────────────────
 MOSDNS_VER="v5.3.4"
-MIHOMO_VER="v1.19.29"         # 流量内核: mihomo/clash.meta, sniffer.override-destination 无版本天花板, 活跃维护可更新
+MIHOMO_VER="v1.19.30"         # 流量内核: mihomo/clash.meta, sniffer.override-destination 无版本天花板, 活跃维护可更新
 ZASHBOARD_VER="v3.15.0"       # 观测面板(纯静态前端, 由 external_ui 托管; dist-no-fonts 最小、不依赖 CDN; mihomo 原生 clash 核也可托管)
 
 # ── 内网面板(方案 B)专用: 反代 + 证书签发 ──────────────────────────────────
@@ -43,8 +43,8 @@ declare -A PDG_SHA256=(
   [mosdns-bin-amd64]="5357fbb83c89f0a7acad275b72c33aa70d4c720cb5590525660132b10cee8af9"
   [mosdns-bin-arm64]="5e651992dbec784df43e0e483428319b0f2892f5fadfd4e39a1462a5d62cb495"
   # mihomo(流量内核): 官方 release 的 mihomo-linux-<arch>-<ver>.gz
-  [mihomo-amd64]="60de76a35a6cbf7b4fa4a20f5c257c24345d1d635ab1aa3877022a1997ef413c"
-  [mihomo-arm64]="9a868b5e4e0ad91d9d71e1b41b0cfce78aaba44360c30df74a723f8e3926a86c"
+  [mihomo-amd64]="cf06ce2c7d1421bdbda14ee4a5b6046672dc35ebf8eecd8e77504ec3c0ed9a84"
+  [mihomo-arm64]="58896873736d28628f66de3677c8654fa0f180662523148e136cff4f6e890069"
   [zashboard]="403b351d3663f5fe65db053cb2f3dc980108d8f86e8c6968d56164d3452592e1"
   # Caddy 官方 release 的 caddy_<ver>_linux_<arch>.tar.gz。
   # 上游发布的校验和文件里是 **SHA-512**, 本项目统一用 SHA-256, 所以这两个值是
