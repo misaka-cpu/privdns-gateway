@@ -35,9 +35,9 @@ def bad(m):
     FAIL[0] += 1
 
 
-import tempfile  # noqa: E402
+import tmpguard  # noqa: E402  一次性临时目录: 建了就登记, 退出即清(顶层沙箱不许裸用 tempfile)
 
-WORK = tempfile.mkdtemp(prefix="pdg-mihev.")
+WORK = tmpguard.mkdtemp(prefix="pdg-mihev.")
 PIN_VER = checks._pinned_mihomo_ver()
 
 
