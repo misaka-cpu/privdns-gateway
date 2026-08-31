@@ -266,6 +266,57 @@ leftovers = [f for f in os.listdir(WORK) if f.startswith("m.gz") or f.startswith
 rc, out, ignored = run(TGT, IMPGZ)
 (bad if re.search(r"✅|已装|成功", out) else ok)("失败路径没有错误的成功文案")
 
+print()
+print("══ 4. 静态守卫: E2E 里不许再出现「只 echo 版本的 mihomo 桩」══")
+# exact-head CI 33353591548 的五支红灯全在这上面: 那些用例各自内联一个 shell 桩 mihomo,
+# 而 install.sh 的判据一旦看内容, 桩就被正确拒绝 —— 于是安装真的去下载, 撞上同一个用例
+# 自己装的假 curl(对 *.gz 写字面量 'stub', sha256 恰好是 725c546b990dd1b4…)。
+# 桩必须换成播真钉死版; 这条守卫保证它不会再长回来。
+import glob  # noqa: E402
+STUB = re.compile(r"(cat|tee)\s*>?\s*[\"']?/usr/local/bin/mihomo")
+offenders = []
+for fn in sorted(glob.glob(os.path.join(ROOT, "tests", "e2e-*.sh"))):
+    for i, line in enumerate(io.open(fn, encoding="utf-8"), 1):
+        if line.lstrip().startswith("#"):
+            continue
+        if STUB.search(line.split("#")[0]):
+            offenders.append("%s:%d" % (os.path.basename(fn), i))
+(ok if not offenders else
+ bad)("没有 E2E 用例把 mihomo 写成内联 shell 桩(实得: %s)" % (", ".join(offenders) or "无"))
+
+SEED = sh("e2e_seed_mihomo_bin") if "\ne2e_seed_mihomo_bin(){" in LIB else ""
+(ok if SEED else bad)("tests/e2e-lib.sh 里有统一的 e2e_seed_mihomo_bin")
+if SEED:
+    for pat, why in [
+        (r"pdg_mihomo_binary_ok", "播种前后都要过生产判据"),
+        (r"install -m ?755", "装到 /usr/local/bin/mihomo"),
+    ]:
+        (ok if re.search(pat, SEED) else bad)("e2e_seed_mihomo_bin: %s" % why)
+    (bad if re.search(r"curl|wget", SEED) else
+     ok)("e2e_seed_mihomo_bin 自己不联网(取件由 CI 的 artifact / prepare 脚本负责)")
+    # 源文件必须**先验后装**: 装完再验挡不住"装了个坏的再报错"。
+    # 断言必须落在**对源文件那次调用**上 —— 第一版用的是函数定义里那个 pdg_mihomo_binary_ok,
+    # 把"验源"整行删掉它也不动, 于是那一格没有牙齿(负控当场揭穿)。
+    _i_src = SEED.find('_e2e_mihomo_ok "$src"')
+    _i_ins = SEED.find('install -m755 "$src"')
+    (ok if 0 <= _i_src < _i_ins else
+     bad)("源文件在 install **之前**就过了判据(验源=%d install=%d)" % (_i_src, _i_ins))
+# 五支用例必须改用它
+NEED = ["e2e-install.sh", "e2e-upgrade-from-release.sh", "e2e-rescue-migration-lock.sh",
+        "e2e-update.sh", "e2e-update-preserve-userdata.sh"]
+for fn in NEED:
+    p = os.path.join(ROOT, "tests", fn)
+    txt = io.open(p, encoding="utf-8").read() if os.path.exists(p) else ""
+    (ok if "e2e_seed_mihomo_bin" in txt else bad)("%s 改用 e2e_seed_mihomo_bin" % fn)
+# e2e-install.sh 的次序: 播种必须在装假 curl **之前**
+p = os.path.join(ROOT, "tests", "e2e-install.sh")
+if os.path.exists(p):
+    t = io.open(p, encoding="utf-8").read()
+    i_seed = t.find("e2e_seed_mihomo_bin")
+    i_curl = t.find("/usr/local/bin/curl")
+    (ok if 0 <= i_seed < i_curl else
+     bad)("e2e-install.sh: 真内核播种排在假 curl **之前**(seed=%d curl=%d)" % (i_seed, i_curl))
+
 print("-" * 62)
 print("test-e2e-mihomo-fixture.py: 通过 %d, 失败 %d" % (PASS[0], FAIL[0]))
 sys.exit(1 if FAIL[0] else 0)
