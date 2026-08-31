@@ -746,6 +746,8 @@ jobs:
       # 而 tests/test-rescue-sets.py 正是钉着"只准备一次"这条(判据按字面数出现次数,
       # 所以这段注释也不能把那条命令原样写出来)。
       # CI 上必须**严格模式** —— 缺二进制要判失败, 不许把关键校验变成绿灯跳过。
+      # 这一步**不需要 sudo**(与同 job 的 mosdns 步不同): 它装到工作区的 tests/.bin/,
+      # 不写 /usr/local/bin。容器里的 e2e 各 job 则是本来就 root、镜像里没有 sudo。
       - name: "校验并安装钉定 mihomo 到 tests/.bin (自算 SHA / manifest 交叉 / 自报版本 / 生产判据)"
         run: |
           set -euo pipefail
@@ -1057,7 +1059,9 @@ jobs:
       - name: "校验并安装钉定 mihomo (自算 SHA / manifest 交叉 / 自报版本 / 生产判据)"
         # 与 mosdns 同一个 artifact、同一套四层复核。E2E 夹具需要**真钉死版**内核:
         # shell 桩自报版本对、内容不对, 会被 install.sh 的短路与 doctor 判据正确拒掉。
-        run: sudo -E bash tests/install-mihomo-artifact.sh /tmp/mosdns-fixture
+        # 这三个 job 跑在 debian:12 容器里(本来就是 root, 镜像里没有 sudo) —— 与同 job
+        # 既有的 mosdns 安装步写法保持一致, 不能照抄 lint/functional 那种宿主机上的 sudo -E。
+        run: bash tests/install-mihomo-artifact.sh /tmp/mosdns-fixture
       - name: "跑 ${{ matrix.script }}"
         env: { PDG_E2E_ISOLATED: "1" }
         run: bash tests/${{ matrix.script }}
@@ -1436,7 +1440,9 @@ jobs:
       - name: "校验并安装钉定 mihomo (自算 SHA / manifest 交叉 / 自报版本 / 生产判据)"
         # 与 mosdns 同一个 artifact、同一套四层复核。E2E 夹具需要**真钉死版**内核:
         # shell 桩自报版本对、内容不对, 会被 install.sh 的短路与 doctor 判据正确拒掉。
-        run: sudo -E bash tests/install-mihomo-artifact.sh /tmp/mosdns-fixture
+        # 这三个 job 跑在 debian:12 容器里(本来就是 root, 镜像里没有 sudo) —— 与同 job
+        # 既有的 mosdns 安装步写法保持一致, 不能照抄 lint/functional 那种宿主机上的 sudo -E。
+        run: bash tests/install-mihomo-artifact.sh /tmp/mosdns-fixture
       - name: "跑 e2e-rescue-migration-lock.sh (iOS)"
         env:
           PDG_E2E_ISOLATED: "1"
@@ -1478,7 +1484,9 @@ jobs:
       - name: "校验并安装钉定 mihomo (自算 SHA / manifest 交叉 / 自报版本 / 生产判据)"
         # 与 mosdns 同一个 artifact、同一套四层复核。E2E 夹具需要**真钉死版**内核:
         # shell 桩自报版本对、内容不对, 会被 install.sh 的短路与 doctor 判据正确拒掉。
-        run: sudo -E bash tests/install-mihomo-artifact.sh /tmp/mosdns-fixture
+        # 这三个 job 跑在 debian:12 容器里(本来就是 root, 镜像里没有 sudo) —— 与同 job
+        # 既有的 mosdns 安装步写法保持一致, 不能照抄 lint/functional 那种宿主机上的 sudo -E。
+        run: bash tests/install-mihomo-artifact.sh /tmp/mosdns-fixture
       - name: "E2E 串行 hermetic (同一容器里按原顺序连着跑, 每个都必须全绿)"
         env:
           PDG_E2E_ISOLATED: "1"
