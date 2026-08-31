@@ -457,6 +457,9 @@ jobs:
       - name: "E2E 夹具必须播真 mosdns (shell 假桩被生产判据拒绝 / 真钉定二进制被接受 / 夹具不联网)"
         run: python3 tests/test-e2e-mosdns-fixture.py
 
+      - name: "E2E mihomo 夹具闭包 (复用要版本+摘要都对; 归档与解压产物双重校验; 失败保全前像)"
+        run: python3 tests/test-e2e-mihomo-fixture.py
+
       - name: "CI 取件拓扑 (官方 Release 每 run 每架构只取一次 / 消费者靠 artifact 且自己复核 / action 钉定)"
         run: |
           python3 -c 'import yaml' 2>/dev/null || sudo apt-get install -y -q python3-yaml
