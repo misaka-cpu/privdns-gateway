@@ -456,7 +456,15 @@ systemctl enable --now vnstat >/dev/null 2>&1 || true   # 网卡流量统计(轻
 if ! pdg_mosdns_binary_ok "$MARCH" "$MOSDNS_VER" /usr/local/bin/mosdns; then
   c_g "下载 mosdns $MOSDNS_VER ($MARCH)…"
   t=$(mktemp -d)
-  curl -fsSL "https://github.com/IrineSistiana/mosdns/releases/download/${MOSDNS_VER}/mosdns-linux-${MARCH}.zip" -o "$t/m.zip"
+  # 取件这一步要有自己的具名失败。裸 curl 的两种坏形态都会让人查错方向:
+  #   · curl 真失败(DNS 不通 / 404 / 超时)→ set -e 在这一行静默中止, EXIT trap 去回滚,
+  #     用户看到的只有"回滚"和 curl 的数字退出码, 从头到尾没有一句说是取件挂了;
+  #   · curl 返回 0 但产物是空的(磁盘满 / 传输被截成 0 字节)→ 空文件的 SHA 当然不符,
+  #     于是报成"供应链异常", 读起来像被投毒, 实际只是没下下来。
+  curl -fsSL "https://github.com/IrineSistiana/mosdns/releases/download/${MOSDNS_VER}/mosdns-linux-${MARCH}.zip" -o "$t/m.zip" \
+    || { rm -rf "$t"; die "下载 mosdns $MOSDNS_VER ($MARCH) 失败(网络不通 / 该版本不存在 / 超时)。这不是校验问题, 是没取到件。"; }
+  [[ -s "$t/m.zip" ]] \
+    || { rm -rf "$t"; die "下载 mosdns $MOSDNS_VER ($MARCH) 得到空文件(磁盘满? 传输被截断?)。同样不是校验问题。"; }
   pdg_verify_sha256 "$t/m.zip" "${PDG_SHA256[mosdns-$MARCH]:-}" "mosdns $MOSDNS_VER ($MARCH)" \
     || { rm -rf "$t"; die "mosdns 二进制校验未通过 → 拒绝安装(供应链异常, 或版本与 lib/versions.sh 不符)"; }
   _stash_bin /usr/local/bin/mosdns || die "备份既有 mosdns 失败 → 中止(不在无法回退的前提下覆盖二进制)。"
@@ -486,7 +494,11 @@ CORE_SVC=mihomo
 if ! pdg_mihomo_binary_ok "$MARCH" "$MIHOMO_VER" /usr/local/bin/mihomo; then
   c_g "下载 mihomo $MIHOMO_VER ($MARCH)…"
   t=$(mktemp -d)
-  curl -fsSL "https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VER}/mihomo-linux-${MARCH}-${MIHOMO_VER}.gz" -o "$t/mihomo.gz"
+  # 与 mosdns 那一处对称: 取件失败与"下到的东西不对"必须报成两种话。
+  curl -fsSL "https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VER}/mihomo-linux-${MARCH}-${MIHOMO_VER}.gz" -o "$t/mihomo.gz" \
+    || { rm -rf "$t"; die "下载 mihomo $MIHOMO_VER ($MARCH) 失败(网络不通 / 该版本不存在 / 超时)。这不是校验问题, 是没取到件。"; }
+  [[ -s "$t/mihomo.gz" ]] \
+    || { rm -rf "$t"; die "下载 mihomo $MIHOMO_VER ($MARCH) 得到空文件(磁盘满? 传输被截断?)。同样不是校验问题。"; }
   pdg_verify_sha256 "$t/mihomo.gz" "${PDG_SHA256[mihomo-$MARCH]:-}" "mihomo $MIHOMO_VER ($MARCH)" \
     || { rm -rf "$t"; die "mihomo 归档校验未通过 → 拒绝安装(供应链异常, 或版本与 lib/versions.sh 不符)"; }
   gunzip -c "$t/mihomo.gz" > "$t/mihomo"

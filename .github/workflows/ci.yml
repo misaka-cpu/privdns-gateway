@@ -466,6 +466,12 @@ jobs:
       - name: "换内核工具契约 (只改钉值不提交/两种钉值形状/取件后核对版本与架构/离线改写)"
         run: bash tests/test-bump-kernel-tool.sh
 
+      - name: "装机取件的错误分类 (下载失败/空产物/内容不符报成三种话; 两个内核对称)"
+        run: bash tests/test-download-error-classification.sh
+
+      - name: "pipefail + grep -q 条件反转守卫 (只拦真风险: 整体透传 >64KiB 文件)"
+        run: python3 tests/test-pipefail-grepq-guard.py
+
       - name: "E2E 夹具必须播真 mosdns (shell 假桩被生产判据拒绝 / 真钉定二进制被接受 / 夹具不联网)"
         run: python3 tests/test-e2e-mosdns-fixture.py
 
