@@ -168,6 +168,22 @@ ctl "$(grep -c 'CY:.*不完整' <<<"$o_new")" "$(grep -c 'CY:.*不完整' <<<"$o
 mkrepo(){                               # $1=latest|behind|dirty; 打印仓库路径
   local d="$WORK/repo$1"; rm -rf "$d"; mkdir -p "$d"
   cp -a "$ROOT/lib" "$ROOT/deploy" "$d"/ 2>/dev/null || return 1
+  # ── 内核二进制桩 + 把沙箱仓库的钉值改成桩的摘要 ────────────────────────────
+  # 必须在**提交之前**做。改在提交之后, 工作树就脏了, 而「已是最新」短路的条件之一正是
+  # `git diff --quiet HEAD` —— 于是短路永远不成立, 表现成"新判据把短路弄坏了"(踩过一次)。
+  # 这个 job(lint)上没有真内核: 既没有 mosdns 夹具, 也没跑 prepare-mihomo。所以造壳,
+  # 并只把**钉值**换成本地的; 判据本体仍是生产那一份, 与 test-update-mosdns-preflight 同法。
+  mkdir -p "$WORK/kstub"
+  local _mv _osv
+  _mv="$(sed -n 's/^MIHOMO_VER="\([^"]*\)".*/\1/p' "$d/lib/versions.sh" | head -1)"
+  _osv="$(sed -n 's/^MOSDNS_VER="\([^"]*\)".*/\1/p' "$d/lib/versions.sh" | head -1)"
+  printf '#!/bin/sh\ncase "$1" in -v) echo "Mihomo Meta %s linux amd64";; esac\nexit 0\n' "$_mv" \
+    > "$WORK/kstub/mihomo"; chmod 755 "$WORK/kstub/mihomo"
+  printf '#!/bin/sh\ncase "$1" in version) echo "mosdns %s-0-gstub";; esac\nexit 0\n' "$_osv" \
+    > "$WORK/kstub/mosdns"; chmod 755 "$WORK/kstub/mosdns"
+  # 分隔符不能用 |: 模式里的 (amd64|arm64) 会把 s 命令提前截断(踩过一次)
+  sed -i -E "s#^  \[mihomo-bin-(amd64|arm64)\]=\"[0-9a-f]*\"#  [mihomo-bin-\1]=\"$(sha256sum "$WORK/kstub/mihomo" | cut -d' ' -f1)\"#" "$d/lib/versions.sh"
+  sed -i -E "s#^  \[mosdns-bin-(amd64|arm64)\]=\"[0-9a-f]*\"#  [mosdns-bin-\1]=\"$(sha256sum "$WORK/kstub/mosdns" | cut -d' ' -f1)\"#" "$d/lib/versions.sh"
   git -C "$d" init -q 2>/dev/null    # init 不动 ref, 也没法走 e2e_git(它要求目标已是仓库)
   e2e_git "$d" add -A >/dev/null 2>&1
   e2e_git "$d" -c user.email=t@t -c user.name=t commit -q -m c1
@@ -201,6 +217,18 @@ deploy_from(){                          # $1=仓库 → 按 manifest 把文件�
   install -m755 "$r/deploy/cert/proxy-gateway-restore-firewall.sh" "$WORK/bin/" 2>/dev/null || return 1
   install -m755 "$r/deploy/bot/pdg-set-token.sh" "$WORK/bin/pdg-set-token" 2>/dev/null || return 1
   install -m755 "$r/deploy/bot/pdg.sh"           "$WORK/bin/pdg"           2>/dev/null || return 1
+  # 内核二进制也算"已装文件": _update_in_sync 现在会问 pdg_mihomo_binary_ok /
+  # pdg_mosdns_binary_ok —— 「已是最新」意味着这台机器是**健康**的, 内核内容也得对上钉值。
+  # 桩由 mkrepo 造好(它必须在**提交之前**改钉值, 见那里的说明), 这里只负责装上去。
+  install -m755 "$WORK/kstub/mihomo" "$WORK/bin/mihomo" 2>/dev/null || return 1
+  install -m755 "$WORK/kstub/mosdns" "$WORK/bin/mosdns" 2>/dev/null || return 1
+  # 自证夹具真的成立 —— 钉值改没改对, 用生产判据自己问一遍
+  ( set +u; source "$r/lib/versions.sh"
+    a=$(dpkg --print-architecture 2>/dev/null || echo amd64)
+    mver="$(sed -n 's/^MIHOMO_VER="\([^"]*\)".*/\1/p' "$r/lib/versions.sh" | head -1)"
+    mosver="$(sed -n 's/^MOSDNS_VER="\([^"]*\)".*/\1/p' "$r/lib/versions.sh" | head -1)"
+    pdg_mihomo_binary_ok "$a" "$mver" "$WORK/bin/mihomo" \
+      && pdg_mosdns_binary_ok "$a" "$mosver" "$WORK/bin/mosdns" ) || return 1
 }
 
 drv_update(){                           # $1=pdg.sh $2=仓库 → 输出 + 副作用记录

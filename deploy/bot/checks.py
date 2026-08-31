@@ -327,11 +327,89 @@ def check_health_timer():
     return ("ok", NAME, "已排定下一次运行。")
 
 
-def check_core_version():
-    _, out, _ = _run(["mihomo", "-v"])
-    m = re.search(r"v?(\d+\.\d+\.\d+)", out or "")
-    return ("ok", "mihomo 版本", "v" + m.group(1) + " ✓(版本随项目发布更新)") if m \
-        else ("warn", "mihomo 版本", "读不到版本")
+# systemd 的 ExecStart 写的就是这个绝对路径。判据必须问**同一个文件** —— 问 PATH 上的
+# `mihomo` 只能告诉你"某个 mihomo 是什么版本", 而不是"这台网关在跑的那个是什么版本"。
+# (与 MOSDNS_BIN 同构; 这条判据以前正是缺了这一层, 见 check_core_version 的说明。)
+MIHOMO_BIN = "/usr/local/bin/mihomo"
+
+
+def check_core_version(_bin=None, _pin=None):
+    """跑着的 mihomo **自报**什么版本, 与钉死版是否精确相等。
+
+    这条判据以前是三重假绿, 三层都要说清楚:
+      · 它跑的是 PATH 上的 `mihomo`, 而 systemd 执行的是 /usr/local/bin/mihomo;
+      · 它对**任何**能解析出来的版本都返回 ok, 文案还写"版本随项目发布更新" ——
+        v0.0.1 也绿;
+      · 它吞掉退出码: 命令非零但输出里有个版本号照样绿。
+    现在: 绝对路径 + 退出码为 0 + 与 MIHOMO_VER 精确相等, 才 ok。
+
+    本条只管**自报版本**; 文件**内容**是不是官方那一份由 check_mihomo_binary 单独判 ——
+    两件事分开报, 因为"版本对但内容不对"正是最该被看见的那一种。
+    """
+    name = "mihomo 版本"
+    b = _bin or MIHOMO_BIN
+    want = _pin if _pin is not None else _pinned_mihomo_ver()
+    if not want:
+        return ("warn", name, "读不到 lib/versions.sh 里的 MIHOMO_VER —— 本项无结论")
+    if not os.path.exists(b):
+        return ("fail", name, "%s **不存在**(核心内核不在, 这台机器现在是坏的)" % b)
+    rc, out, err = _run([b, "-v"])
+    if rc != 0:
+        return ("fail", name, "%s -v **退出码非零**(rc=%s) —— 它打印出来的版本号不算数" % (b, rc))
+    m = re.search(r"v?(\d+\.\d+\.\d+)", (out or "") + (err or ""))
+    if not m:
+        return ("fail", name, "%s -v 的输出里**读不出版本号**" % b)
+    got = "v" + m.group(1)
+    if got != (want if want.startswith("v") else "v" + want):
+        return ("fail", name, "自报版本 %s 与钉死版 %s **不符** —— `sudo pdg update` 会把它换回来"
+                % (got, want))
+    return ("ok", name, "%s ✓(自报版本与钉死版一致; 文件内容另见「mihomo 二进制」)" % got)
+
+
+def _pinned_mihomo_ver():
+    m = re.search(r'^MIHOMO_VER="([^"]+)"', _versions_sh(), re.M)
+    return m.group(1) if m else ""
+
+
+def _pinned_mihomo_bin_shas():
+    """{架构: 解压后二进制的 SHA256}。架构不在这张表里 = 本项无从对照, 不是"没问题"。"""
+    return dict(re.findall(r'\[mihomo-bin-(\w+)\]="([0-9a-f]{64})"', _versions_sh()))
+
+
+def check_mihomo_binary(_bin=None, _pin=None, _arch=None):
+    """跑着的 mihomo 二进制**内容**是不是官方那一份。
+
+    与 check_mosdns_binary 同构, 理由也一样: 版本是二进制自报的字符串。安装器与换核的
+    短路条件曾经只看自报版本(而且看的是 PATH 上那个), 于是一个内容不同、自报 v1.19.30
+    的文件能让整段下载与校验被跳过 —— 而项目原先只钉了下载**归档**的哈希, 一旦跳过下载,
+    那个钉值就再也没有机会被用上。
+
+    钉值读不到 / 架构不在表里 → warn + 无结论。那不是"没问题", 是"无从对照"。
+    """
+    name = "mihomo 二进制"
+    b = _bin or MIHOMO_BIN
+    arch = _arch if _arch is not None else _host_arch()
+    shas = _pinned_mihomo_bin_shas()
+    if arch not in shas:
+        return ("warn", name, "架构 %s 不在钉值表里(已钉: %s)—— 本项无结论"
+                % (arch, "/".join(sorted(shas)) or "无"))
+    pin = _pin if _pin is not None else shas.get(arch, "")
+    if not pin:
+        return ("warn", name, "读不到 %s 的二进制钉死摘要 —— 本项无结论" % arch)
+    try:
+        h = hashlib.sha256()
+        with open(b, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        got = h.hexdigest()
+    except OSError as e:
+        return ("fail", name, "读不到 %s(%s)" % (b, e.strerror or e.errno))
+    if got == pin:
+        return ("ok", name, "内容与官方钉值一致 ✓(sha256 %s…)" % got[:12])
+    return ("fail", name,
+            "二进制**内容**与官方钉值不一致: 实得 %s…, 钉死 %s… —— "
+            "同一个版本号下内容被换过(或安装时跳过了校验)。`sudo pdg update` 会重下并修复。"
+            % (got[:12], pin[:12]))
 
 # mosdns 的钉死版本。**从 lib/versions.sh 读**, 不在这里写第二份 —— 两处手写必然漂,
 # 而漂掉的表现是这条判据报绿、实际跑的却不是钉死那版。
@@ -2540,7 +2618,7 @@ def check_deep_lan_acl():
             pass
 
 
-ALL = [check_platform, check_services, check_bot_credentials, check_health_timer, check_core_version, check_mosdns_version, check_mosdns_binary, check_dot_arecord, check_dot_domain_sync,
+ALL = [check_platform, check_services, check_bot_credentials, check_health_timer, check_core_version, check_mihomo_binary, check_mosdns_version, check_mosdns_binary, check_dot_arecord, check_dot_domain_sync,
        check_internal_cidr, check_cidr_drift, check_nft, check_nft_input_chains, check_redirect, check_gms,
        check_tailscale_isolation, check_tailscale_residue, check_tailnet_direct_port,
        check_lan_routes, check_lan_whitelist, check_lan_proxy_routes, check_lan_cert,

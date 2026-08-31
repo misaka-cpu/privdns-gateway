@@ -45,6 +45,29 @@ declare -A PDG_SHA256=(
   # mihomo(流量内核): 官方 release 的 mihomo-linux-<arch>-<ver>.gz
   [mihomo-amd64]="cf06ce2c7d1421bdbda14ee4a5b6046672dc35ebf8eecd8e77504ec3c0ed9a84"
   [mihomo-arm64]="58896873736d28628f66de3677c8654fa0f180662523148e136cff4f6e890069"
+  # ── mihomo: **解压后二进制**本身的 SHA256 ─────────────────────────────────
+  # 与 mosdns 同一个道理, 而且这里的洞更大: 上面两行钉的是下载归档, 只在"真的下载了"
+  # 那条路上起作用 —— 而跳过下载的短路条件曾经是 `pdg_mihomo_is_version`, 它问的是
+  # **PATH** 上的 mihomo、而且只比**自报版本**。于是 PATH 上放一个自报 v1.19.30 的壳,
+  # 或者把 /usr/local/bin/mihomo 的内容换掉、版本串留着, 整段下载与校验都会被跳过,
+  # 而安装日志上连"下载 mihomo"这行都不会出现。落盘的那个文件本身从来没被钉过。
+  #
+  # 取值步骤(可复现, 换个人来照做应得到同一串):
+  #   1) 按**精确资产名** mihomo-linux-<arch>-v1.19.30.gz 取(同 tag 下有 20+ 个相似名:
+  #      -compatible- / -v1- / -v2- / -v3- / -go120- / -go123- 以及 .deb/.rpm/.pkg.tar.zst,
+  #      通配一下就会抓错文件);
+  #   2) 与上面的 [mihomo-<arch>] 核对归档摘要;
+  #   3) 与 GitHub Release API 的 asset digest 交叉核对(见下方说明);
+  #   4) 归档确认无误后才 gunzip;
+  #   5) sha256sum 解压产物;
+  #   6) 本机架构真跑一次 `-v` 核对自报版本, 另一架构核对完整 ELF 头。
+  # 版本 v1.19.30; 两个架构各自独立下载、独立校验、独立计算。
+  #
+  # 关于 asset digest: 上游**没有**独立签名校验文件。GitHub 在 Release API 里给出
+  # 服务器侧计算的 sha256 asset digest —— 它是一条**额外的交叉证据**, 与我们自己算的
+  # 摘要相互印证; 它不构成独立的签名信任链(同一方既托管文件又给出摘要)。
+  [mihomo-bin-amd64]="3e92df24f5e80e86b9cf9183ceb7bb575f0bd132a9dc4081dae42e80f21076ae"
+  [mihomo-bin-arm64]="b9456718a8955364b9a77c80f74dca49ded10f071c1c6b4513a0ea68a3d87a50"
   [zashboard]="403b351d3663f5fe65db053cb2f3dc980108d8f86e8c6968d56164d3452592e1"
   # Caddy 官方 release 的 caddy_<ver>_linux_<arch>.tar.gz。
   # 上游发布的校验和文件里是 **SHA-512**, 本项目统一用 SHA-256, 所以这两个值是
@@ -72,6 +95,32 @@ pdg_mihomo_is_version(){
   local want="${1#v}" got
   got="$(pdg_mihomo_version)"; got="${got#v}"
   [[ -n "$got" && "$got" == "$want" ]]
+}
+
+# pdg_mihomo_binary_ok <架构> [期望版本] [二进制路径]
+#   → 0 **仅当**四件事同时成立: 架构有钉值、文件存在且可执行、`-v` 退出码为 0 且自报版本
+#     精确相等、该文件的 SHA256 等于该架构的二进制钉值。任何一步存疑一律非 0。
+#
+# 为什么不能用 pdg_mihomo_is_version 当短路判据(它是本项目最久的一处假绿):
+#   · 它问的是 **PATH** 上的 mihomo, 而 systemd 的 ExecStart 写的是 /usr/local/bin/mihomo。
+#     PATH 上放一个自报正确版本的壳, 判据就答"已是钉死版" —— 而真正在跑的那个文件
+#     可以是缺失、旧版, 或者内容被换过;
+#   · 它只比**自报版本**, 而版本是二进制自己打印的字符串。
+# 所以这里问的是**显式路径**(默认就是 systemd 执行的那个), 并且版本与内容都要核。
+#
+# 退出码单独取, 不经管道: `$(cmd | head -1)` 的退出码是 head 的, mihomo 自己非零会被吞掉
+# —— 那正是"命令返回非零但输出里有正确版本号"这一格要挡的形态。
+pdg_mihomo_binary_ok(){
+  local arch="${1:-}" want="${2:-${MIHOMO_VER:-}}" bin="${3:-/usr/local/bin/mihomo}" out got exp
+  [[ -n "$arch" && -n "$want" && -x "$bin" ]] || return 1
+  exp="${PDG_SHA256[mihomo-bin-$arch]:-}"
+  [[ -n "$exp" ]] || return 1
+  out="$("$bin" -v 2>/dev/null)" || return 1        # 退出码必须是 0
+  out="${out%%$'\n'*}"
+  [[ "$out" =~ v?([0-9]+\.[0-9]+\.[0-9]+) ]] || return 1
+  [[ "${BASH_REMATCH[1]}" == "${want#v}" ]] || return 1
+  got="$(sha256sum "$bin" 2>/dev/null | awk '{print $1}')"
+  [[ -n "$got" && "$got" == "$exp" ]]
 }
 
 # mosdns 同理。装机曾用 `command -v mosdns` 判定 —— PATH 上有任何一个 mosdns(第三方装的、

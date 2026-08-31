@@ -827,28 +827,129 @@ e2e_svc_heal(){ rm -f "$E2E_TMP/e2e-svc/$1.fail"; echo 1 > "$E2E_TMP/e2e-svc/$1.
 
 # PATH 上那个 mihomo 是不是**真内核**: 正反两份配置都要判对。串行跑时它很可能是上一个脚本
 # 留下的桩(`-t` 恒 0), 拿它当内核用, "配置不合法就不许重启"这类用例会静默失效。
+# 好/坏配置探针: 证明这不是"只会回显版本号"的桩。
+# $1 可选: 要探的二进制路径, 默认沿用 PATH 上的 mihomo(既有调用点靠这个语义清桩)。
+# 注意它**只**回答"是不是一个真能解析配置的内核", 不回答版本与内容 —— 那两问由
+# pdg_mihomo_binary_ok 负责。把它当成"可以复用了"的唯一判据, 正是 exact-head CI
+# 33348976467 里五支 E2E 变红的起点。
 e2e_mihomo_is_real(){
-  command -v mihomo >/dev/null 2>&1 || return 1
+  local exe="${1:-}"
+  if [[ -z "$exe" ]]; then command -v mihomo >/dev/null 2>&1 || return 1; exe=mihomo
+  else [[ -x "$exe" ]] || return 1; fi
   local d rc_good rc_bad; d="$(mktemp -d)" || return 1
   printf '{"log-level":"silent","mixed-port":17899,"proxies":[],"rules":["MATCH,DIRECT"]}\n' > "$d/good.yaml"
   printf '{"proxies":[{"name":"x","type":"definitely-not-a-real-protocol","server":"1.1.1.1","port":1}],"rules":["MATCH,DIRECT"]}\n' > "$d/bad.yaml"
-  mihomo -t -d "$d" -f "$d/good.yaml" >/dev/null 2>&1; rc_good=$?
-  mihomo -t -d "$d" -f "$d/bad.yaml"  >/dev/null 2>&1; rc_bad=$?
+  "$exe" -t -d "$d" -f "$d/good.yaml" >/dev/null 2>&1; rc_good=$?
+  "$exe" -t -d "$d" -f "$d/bad.yaml"  >/dev/null 2>&1; rc_bad=$?
   rm -rf "$d"
   [[ "$rc_good" == 0 && "$rc_bad" != 0 ]]
 }
 
-# 取真内核二进制(钉死版本); 拿不到回非 0, 调用方据此跳过
+# 播种**真实钉定**的 mihomo 二进制, 并用生产判据复核 —— 与 e2e_seed_mosdns_bin 同构。
+#
+# 为什么不能用 shell 桩: 一台"装好的网关"按定义就有这个文件, 而 install.sh 的短路与 doctor
+# 的完整性判据现在都要求它的 SHA256 等于 lib/versions.sh 的钉值。只会 echo 版本号的桩
+# 自报版本是对的、内容是错的 —— 正是这两条判据要抓的形态。
+# exact-head CI 33353591548 的五支红灯就是这么来的: 用例各自内联一个 shell 桩, 判据把它
+# 拒了之后 install.sh 真的去下载, 撞上同一个用例自己装的**假 curl**(对 *.gz 写字面量
+# 'stub', sha256 恰好是 725c546b990dd1b4…)。
+#
+# 取件顺序: 已经就位 → 直接用, 零网络; 否则从**显式路径**复制(CI 由 job 的
+# install-mihomo-artifact.sh 步骤按 artifact 装好, 每 run 只取一次件); 都没有才退到
+# prepare-mihomo.sh。本函数自己**不联网** —— 经过 curl 就会在 e2e-install 里拿到假 curl 的
+# 'stub', 所以调用点也必须排在装假 curl **之前**。
+e2e_seed_mihomo_bin(){
+  local bin=/usr/local/bin/mihomo march src
+  march="$(dpkg --print-architecture 2>/dev/null)"; [[ "$march" == arm64 ]] || march=amd64
+  _e2e_mihomo_ok(){
+    # shellcheck source=/dev/null
+    ( . "$E2E_ROOT/lib/versions.sh" 2>/dev/null \
+      && pdg_mihomo_binary_ok "$march" "$MIHOMO_VER" "$1" )
+  }
+  _e2e_mihomo_ok "$bin" && return 0
+  # 先验源、再装、装完再验 —— 装完才验挡不住"装了个坏的再报错"。
+  for src in "${PDG_TEST_MIHOMO:-}" "$E2E_ROOT/tests/.bin/mihomo" /opt/pdg-e2e-bin/mihomo; do
+    [[ -n "$src" && -f "$src" ]] || continue
+    _e2e_mihomo_ok "$src" || continue
+    install -m755 "$src" "$bin" 2>/dev/null || continue
+    _e2e_mihomo_ok "$bin" && return 0
+  done
+  rm -f "$bin" 2>/dev/null || true          # 桩清干净再取件
+  hash -r 2>/dev/null || true
+  bash "$E2E_ROOT/tests/prepare-mihomo.sh" >/dev/null 2>&1 || true
+  src="$E2E_ROOT/tests/.bin/mihomo"
+  if [[ -f "$src" ]] && _e2e_mihomo_ok "$src" \
+     && install -m755 "$src" "$bin" 2>/dev/null && _e2e_mihomo_ok "$bin"; then
+    return 0
+  fi
+  echo "[FAIL] 夹具拿不到钉死版 mihomo($march) —— 一台「装好的网关」按定义就有它。" >&2
+  echo "       CI 由 job 的「校验并安装钉定 mihomo」步骤备好; 本地先跑 bash tests/prepare-mihomo.sh" >&2
+  return 1
+}
+
+# 取真内核二进制并形成**钉值闭包** —— 与 e2e_seed_mosdns_bin 同一种语义。
+# $1 可选: 目标路径, 默认 /usr/local/bin/mihomo(生产调用点不传参; 传参只为让沙箱能验,
+# 与 _update_mosdns_preflight 的可选参数同一种写法, **不是**环境变量后门)。
+#
+# 旧版为什么会让五支 E2E 红(exact-head CI 33348976467):
+#   · 复用判据只有 e2e_mihomo_is_real —— 它只问"能不能解析好/坏配置", 不问版本也不问内容。
+#     镜像里任何一个能跑的 mihomo 都会让它提前返回, 于是夹具里那个是"能跑但未钉"的;
+#   · 归档下下来一个字节都不核, 解压产物也不核;
+#   · `gunzip -c … > /usr/local/bin/mihomo` **直接写目标路径** —— 下载截断就在生产路径上
+#     留半个内核, 而且旧文件已经先被 rm 掉了。
+# 生产判据从"只比自报版本"收紧成"绝对路径 + 内容摘要"之后, 这个未钉的二进制被正确地拒绝,
+# 安装失败、update 被 doctor 判红回滚。夹具替被测代码说谎, 这一版把它闭上。
 e2e_fetch_mihomo(){
-  e2e_mihomo_is_real && return 0
-  rm -f /usr/local/bin/mihomo 2>/dev/null || true      # 桩要换成真的
+  local bin="${1:-/usr/local/bin/mihomo}" march tmp cand
+  march="$(dpkg --print-architecture 2>/dev/null)"; [[ "$march" == arm64 ]] || march=amd64
   # shellcheck source=/dev/null
-  . "$E2E_ROOT/lib/versions.sh"
-  curl -fsSL --retry 2 -m 120 \
-    "https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VER}/mihomo-linux-amd64-${MIHOMO_VER}.gz" \
-    -o "$E2E_TMP/m.gz" 2>/dev/null || return 1
-  gunzip -c "$E2E_TMP/m.gz" > /usr/local/bin/mihomo 2>/dev/null || return 1
-  chmod 755 /usr/local/bin/mihomo
+  . "$E2E_ROOT/lib/versions.sh" 2>/dev/null || { echo "[FAIL] 夹具读不到 lib/versions.sh" >&2; return 1; }
+
+  # ── 复用门: 版本 + 内容都对上, 再加真内核探针, 才算"已经就位" ──────────────
+  # 问的是**这个绝对路径**, 不是 PATH 上碰巧有的那个(PATH 影子不得影响判断)。
+  if pdg_mihomo_binary_ok "$march" "$MIHOMO_VER" "$bin" && e2e_mihomo_is_real "$bin"; then
+    return 0                                   # 零网络请求
+  fi
+
+  tmp="$(mktemp -d)" || { echo "[FAIL] 夹具建不出临时目录" >&2; return 1; }
+  # 失败要保全前像: 旧目标在候选全部验过之前**一个字节都不动**。
+  if ! curl -fsSL --retry 2 -m 120 \
+       "https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VER}/mihomo-linux-${march}-${MIHOMO_VER}.gz" \
+       -o "$tmp/m.gz" 2>/dev/null; then
+    echo "[FAIL] 夹具下载 mihomo $MIHOMO_VER ($march) 失败(网络不通? 版本不存在?)" >&2
+    rm -rf "$tmp"; return 1
+  fi
+  if [[ ! -s "$tmp/m.gz" ]]; then
+    echo "[FAIL] 夹具下到的 mihomo 归档是空的" >&2; rm -rf "$tmp"; return 1
+  fi
+  # 解压**之前**核归档 —— 坏档不该被展开。
+  if ! pdg_verify_sha256 "$tmp/m.gz" "${PDG_SHA256[mihomo-$march]:-}" "mihomo $MIHOMO_VER 归档 ($march)" >/dev/null 2>&1; then
+    echo "[FAIL] 夹具下到的 mihomo 归档摘要与 lib/versions.sh 钉值不符 —— 拒绝解压" >&2
+    rm -rf "$tmp"; return 1
+  fi
+  cand="$tmp/mihomo"
+  if ! gunzip -c "$tmp/m.gz" > "$cand" 2>/dev/null || [[ ! -s "$cand" ]]; then
+    echo "[FAIL] 夹具解压 mihomo 失败或产物为空" >&2; rm -rf "$tmp"; return 1
+  fi
+  chmod 755 "$cand" 2>/dev/null || true
+  # 候选必须同时过: 生产判据(版本 + 解压后二进制摘要) 与 真内核探针。
+  if ! pdg_mihomo_binary_ok "$march" "$MIHOMO_VER" "$cand"; then
+    echo "[FAIL] 夹具候选 mihomo 的版本或内容摘要与钉值不符 —— 拒绝安装" >&2
+    rm -rf "$tmp"; return 1
+  fi
+  if ! e2e_mihomo_is_real "$cand"; then
+    echo "[FAIL] 夹具候选 mihomo 不是真内核(分不出好/坏配置)—— 拒绝安装" >&2
+    rm -rf "$tmp"; return 1
+  fi
+  # 到这里才动目标路径。
+  if ! install -m755 "$cand" "$bin" 2>/dev/null; then
+    echo "[FAIL] 夹具安装 mihomo 到 $bin 失败" >&2; rm -rf "$tmp"; return 1
+  fi
+  rm -rf "$tmp"
+  # 落盘之后再用生产同源判据复核一次(install 与磁盘之间还有一段路)。
+  if ! pdg_mihomo_binary_ok "$march" "$MIHOMO_VER" "$bin"; then
+    echo "[FAIL] 夹具装完后 $bin 的内容与钉值不符" >&2; return 1
+  fi
 }
 # 播种**真实钉定**的 mosdns 二进制, 并用生产判据复核。
 #

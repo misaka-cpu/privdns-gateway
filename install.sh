@@ -478,15 +478,25 @@ fi
 # mihomo 成唯一内核。旧的 sing-box 机器 `pdg update` 时由 migrate_drop_singbox 自动迁移。
 CORE=mihomo
 CORE_SVC=mihomo
-if ! pdg_mihomo_is_version "$MIHOMO_VER"; then
+# 跳过判据按**内容**判, 不是"PATH 上有个自报版本对的就算数":
+#   · 旧判据 pdg_mihomo_is_version 问的是 PATH, 而 systemd 执行的是 /usr/local/bin/mihomo
+#     —— PATH 上放个自报 v1.19.30 的壳就能让整段下载与 SHA256 校验被跳过;
+#   · 它还只比自报版本, 而版本是二进制自己打印的字符串, 换内容留版本串同样能骗过它。
+# pdg_mihomo_binary_ok 问的是**那个绝对路径**, 且版本与内容摘要都要对上(与 mosdns 同构)。
+if ! pdg_mihomo_binary_ok "$MARCH" "$MIHOMO_VER" /usr/local/bin/mihomo; then
   c_g "下载 mihomo $MIHOMO_VER ($MARCH)…"
   t=$(mktemp -d)
   curl -fsSL "https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VER}/mihomo-linux-${MARCH}-${MIHOMO_VER}.gz" -o "$t/mihomo.gz"
   pdg_verify_sha256 "$t/mihomo.gz" "${PDG_SHA256[mihomo-$MARCH]:-}" "mihomo $MIHOMO_VER ($MARCH)" \
-    || { rm -rf "$t"; die "mihomo 二进制校验未通过 → 拒绝安装(供应链异常, 或版本与 lib/versions.sh 不符)"; }
+    || { rm -rf "$t"; die "mihomo 归档校验未通过 → 拒绝安装(供应链异常, 或版本与 lib/versions.sh 不符)"; }
   gunzip -c "$t/mihomo.gz" > "$t/mihomo"
   _stash_bin /usr/local/bin/mihomo || die "备份既有 mihomo 失败 → 中止(不在无法回退的前提下覆盖二进制)。"
   install -m755 "$t/mihomo" /usr/local/bin/mihomo
+  # 落盘之后再核一次内容。归档校验通过只说明"下载对了", 解压与 install 之间还有磁盘、
+  # 还有别的进程 —— 而这个文件正是下次短路判据与 doctor 要比对的那一个(与 mosdns 同构)。
+  pdg_verify_sha256 /usr/local/bin/mihomo "${PDG_SHA256[mihomo-bin-$MARCH]:-}" \
+    "mihomo $MIHOMO_VER 二进制 ($MARCH)" \
+    || { rm -rf "$t"; die "mihomo 二进制内容与钉值不符 → 拒绝继续(归档校验已过, 问题出在解压/落盘这一段)"; }
   # shellcheck disable=SC2034  # 保留为"装成功了吗"的标记并保持 trap 前初始化;
   # 回滚已改看 BIN_TXN 事务台账(它才代表"这次碰过目标没有")。
   MIHOMO_INSTALLED=1
