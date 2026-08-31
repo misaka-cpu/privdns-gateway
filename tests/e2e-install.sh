@@ -42,8 +42,14 @@ done
 # 以前这里写的是只会 echo 版本号的 shell 桩: 旧短路只比自报版本所以够用; 现在短路还要比
 # 内容摘要, 桩必然不符 → 进入下载分支 → 撞上下面那个假 curl → 整次装机 die。
 e2e_seed_mosdns_bin || { echo "[FAIL] 播种钉定 mosdns 失败"; exit 1; }
-# 内核二进制: 装机会下载并校验 SHA, 这里用桩替代下载(下载与 SHA 校验有专门单测)
+# 内核二进制: 与 mosdns 同一处置 —— 播真钉死版, 让安装器走"已有合法二进制 → 严格短路"。
 . "$E2E_ROOT/lib/versions.sh"
+# ⚠️ 次序要紧: 真内核播种必须排在装**假 curl** 之前。假 curl 对 *.gz 一律写字面量
+# 'stub'(sha256 = 725c546b990dd1b4…), 播种若排在它后面、又恰好需要取件, 拿到的就是它。
+# 播真钉死版, 不用 shell 桩: 桩自报版本是对的、内容是错的, 而 install.sh 的短路与
+# doctor 的完整性判据现在都看内容(CI 33353591548 的五支红灯就是这么来的)。
+e2e_seed_mihomo_bin || { echo "[FAIL] 播种钉定 mihomo 失败"; exit 1; }
+
 cat > /usr/local/bin/curl <<S
 #!/bin/sh
 # 只拦内核/规则下载: 造出一个"看起来对"的产物; 其余照常失败即可
@@ -58,14 +64,7 @@ esac
 exit 0
 S
 chmod 755 /usr/local/bin/curl
-if ! command -v mihomo >/dev/null 2>&1; then
-cat > /usr/local/bin/mihomo <<S
-#!/bin/sh
-case "\$1" in -v|version) echo "Mihomo Meta $MIHOMO_VER linux amd64";; -t) exit 0;; esac
-exit 0
-S
-chmod 755 /usr/local/bin/mihomo
-fi
+
 # tcpdump 桩: 让 detect-internal-range.sh 解析出一个确定的内网卡段(交互用例的 CIDR 探测)
 cat > /usr/local/bin/tcpdump <<'S'
 #!/bin/sh

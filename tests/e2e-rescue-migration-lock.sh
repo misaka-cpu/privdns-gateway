@@ -92,12 +92,9 @@ mkdir -p /var/lib/privdns-gateway
 e2e_seed_cert || e2e_skip "无 openssl, 造不出占位证书"
 
 . "$E2E_ROOT/lib/versions.sh"
-cat > /usr/local/bin/mihomo <<S
-#!/bin/sh
-case "\$1" in -v|version) echo "Mihomo Meta $MIHOMO_VER linux amd64";; -t) exit 0;; esac
-exit 0
-S
-chmod 755 /usr/local/bin/mihomo
+# 播真钉死版, 不用 shell 桩: 桩自报版本是对的、内容是错的, 而 install.sh 的短路与
+# doctor 的完整性判据现在都看内容(CI 33353591548 的五支红灯就是这么来的)。
+e2e_seed_mihomo_bin || { echo "[FAIL] 播种钉定 mihomo 失败"; exit 1; }
 
 # `ip -4 -o addr show scope global` 的桩: 救援平面靠它挑监听地址候选。沙箱里没有真网卡,
 # 不桩的话"来源段内恰好一个本机地址"这条路径根本走不到, bind-auto 那格就成了空测试。

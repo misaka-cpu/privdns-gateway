@@ -16,6 +16,7 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 LIB = os.path.join(ROOT, "tests/e2e-lib.sh")
 INTEG = os.path.join(ROOT, "tests/test-mihomo-integrity.sh")
+INST = os.path.join(ROOT, "tests/e2e-install.sh")
 
 TESTS = {
     "guard":   (sys.executable, "tests/test-e2e-repo-guard.py"),
@@ -71,6 +72,26 @@ CELLS = [
     :
   fi''',
      "fixture", "点到**下载**这一层"),
+    ('⑦ E2E 里重新长出 shell 桩 mihomo', INST,
+     'e2e_seed_mihomo_bin || { echo "[FAIL] 播种钉定 mihomo 失败"; exit 1; }',
+     'cat > /usr/local/bin/mihomo <<EOSTUB\n#!/bin/sh\necho stub\nEOSTUB',
+     'fixture', '内联 shell 桩'),
+
+    ('⑧ 播种跳过源文件校验', LIB,
+     '    _e2e_mihomo_ok "$src" || continue\n    install -m755 "$src" "$bin" 2>/dev/null || continue',
+     '    install -m755 "$src" "$bin" 2>/dev/null || continue',
+     'fixture', 'install **之前**'),
+
+    ('⑨ 播种改成自己 curl(绕开 artifact)', LIB,
+     '  bash "$E2E_ROOT/tests/prepare-mihomo.sh" >/dev/null 2>&1 || true',
+     '  curl -fsSL http://example.invalid/mihomo -o "$bin" 2>/dev/null || true',
+     'fixture', '不联网'),
+
+    ('⑩ e2e-install 把播种挪到假 curl 之后', INST,
+     'e2e_seed_mihomo_bin || { echo "[FAIL] 播种钉定 mihomo 失败"; exit 1; }\n\ncat > /usr/local/bin/curl <<S',
+     'cat > /usr/local/bin/curl <<S',
+     'fixture', '假 curl'),
+
 ]
 
 

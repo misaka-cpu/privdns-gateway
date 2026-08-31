@@ -845,6 +845,48 @@ e2e_mihomo_is_real(){
   [[ "$rc_good" == 0 && "$rc_bad" != 0 ]]
 }
 
+# 播种**真实钉定**的 mihomo 二进制, 并用生产判据复核 —— 与 e2e_seed_mosdns_bin 同构。
+#
+# 为什么不能用 shell 桩: 一台"装好的网关"按定义就有这个文件, 而 install.sh 的短路与 doctor
+# 的完整性判据现在都要求它的 SHA256 等于 lib/versions.sh 的钉值。只会 echo 版本号的桩
+# 自报版本是对的、内容是错的 —— 正是这两条判据要抓的形态。
+# exact-head CI 33353591548 的五支红灯就是这么来的: 用例各自内联一个 shell 桩, 判据把它
+# 拒了之后 install.sh 真的去下载, 撞上同一个用例自己装的**假 curl**(对 *.gz 写字面量
+# 'stub', sha256 恰好是 725c546b990dd1b4…)。
+#
+# 取件顺序: 已经就位 → 直接用, 零网络; 否则从**显式路径**复制(CI 由 job 的
+# install-mihomo-artifact.sh 步骤按 artifact 装好, 每 run 只取一次件); 都没有才退到
+# prepare-mihomo.sh。本函数自己**不联网** —— 经过 curl 就会在 e2e-install 里拿到假 curl 的
+# 'stub', 所以调用点也必须排在装假 curl **之前**。
+e2e_seed_mihomo_bin(){
+  local bin=/usr/local/bin/mihomo march src
+  march="$(dpkg --print-architecture 2>/dev/null)"; [[ "$march" == arm64 ]] || march=amd64
+  _e2e_mihomo_ok(){
+    # shellcheck source=/dev/null
+    ( . "$E2E_ROOT/lib/versions.sh" 2>/dev/null \
+      && pdg_mihomo_binary_ok "$march" "$MIHOMO_VER" "$1" )
+  }
+  _e2e_mihomo_ok "$bin" && return 0
+  # 先验源、再装、装完再验 —— 装完才验挡不住"装了个坏的再报错"。
+  for src in "${PDG_TEST_MIHOMO:-}" "$E2E_ROOT/tests/.bin/mihomo" /opt/pdg-e2e-bin/mihomo; do
+    [[ -n "$src" && -f "$src" ]] || continue
+    _e2e_mihomo_ok "$src" || continue
+    install -m755 "$src" "$bin" 2>/dev/null || continue
+    _e2e_mihomo_ok "$bin" && return 0
+  done
+  rm -f "$bin" 2>/dev/null || true          # 桩清干净再取件
+  hash -r 2>/dev/null || true
+  bash "$E2E_ROOT/tests/prepare-mihomo.sh" >/dev/null 2>&1 || true
+  src="$E2E_ROOT/tests/.bin/mihomo"
+  if [[ -f "$src" ]] && _e2e_mihomo_ok "$src" \
+     && install -m755 "$src" "$bin" 2>/dev/null && _e2e_mihomo_ok "$bin"; then
+    return 0
+  fi
+  echo "[FAIL] 夹具拿不到钉死版 mihomo($march) —— 一台「装好的网关」按定义就有它。" >&2
+  echo "       CI 由 job 的「校验并安装钉定 mihomo」步骤备好; 本地先跑 bash tests/prepare-mihomo.sh" >&2
+  return 1
+}
+
 # 取真内核二进制并形成**钉值闭包** —— 与 e2e_seed_mosdns_bin 同一种语义。
 # $1 可选: 目标路径, 默认 /usr/local/bin/mihomo(生产调用点不传参; 传参只为让沙箱能验,
 # 与 _update_mosdns_preflight 的可选参数同一种写法, **不是**环境变量后门)。

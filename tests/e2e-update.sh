@@ -26,12 +26,9 @@ e2e_seed_cert || e2e_skip "无 openssl, 造不出占位证书"
 
 # 内核二进制打桩: update 里的 _update_core_binary 会比对版本, 让它认为"已是钉死版本"
 . "$E2E_ROOT/lib/versions.sh"
-cat > /usr/local/bin/mihomo <<S
-#!/bin/sh
-case "\$1" in -v|version) echo "Mihomo Meta $MIHOMO_VER linux amd64";; -t) exit 0;; esac
-exit 0
-S
-chmod 755 /usr/local/bin/mihomo
+# 播真钉死版, 不用 shell 桩: 桩自报版本是对的、内容是错的, 而 install.sh 的短路与
+# doctor 的完整性判据现在都看内容(CI 33353591548 的五支红灯就是这么来的)。
+e2e_seed_mihomo_bin || { echo "[FAIL] 播种钉定 mihomo 失败"; exit 1; }
 # 现场是"仍在跑 sing-box 的老机器"(backend=singbox + 二进制/unit 都在): 这次 update 应当
 # 由 migrate_drop_singbox 自动迁到 mihomo 并把 sing-box 运行时清掉。
 printf '#!/bin/sh\nexit 0\n' > /usr/local/bin/sing-box; chmod 755 /usr/local/bin/sing-box
