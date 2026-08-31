@@ -17,6 +17,9 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/pdg-bumpkernel.XXXXXX")"; trap 'rm -rf "$WORK
 pass=0; nfail=0
 ok(){ echo "[OK]   $1"; pass=$((pass+1)); }
 bad(){ echo "[FAIL] $1"; nfail=$((nfail+1)); }
+# shellcheck source=tests/repoguard.sh
+source "$ROOT/tests/repoguard.sh"    # e2e_git: 守卫与动作绑成一件事(见 test-e2e-repo-guard.py)
+
 TOOL="$ROOT/tools/bump-kernel.sh"
 
 echo "══ 1. 工具存在且可执行 ══"
@@ -212,8 +215,14 @@ echo
 echo "══ 12. 目标文件已有改动时拒绝(注释与实现必须一致)══"
 atom
 printf '\n# someone else was here\n' >> "$WORK/atom/lib/versions.sh"
-( cd "$WORK/atom" && git init -q -b main && git config user.email t@t && git config user.name t \
-  && git config commit.gpgsign false && git add -A && git commit -qm base ) >/dev/null 2>&1
+# 会写 ref/config 的 git 一律走 e2e_git —— 守卫与动作绑成一件事, 不存在"忘了守"的形态。
+# (`git init` 不受限: 仓库还不存在时守卫必然假拒。)
+git init -q -b main "$WORK/atom" >/dev/null 2>&1
+e2e_git "$WORK/atom" config user.email t@t        >/dev/null 2>&1
+e2e_git "$WORK/atom" config user.name t           >/dev/null 2>&1
+e2e_git "$WORK/atom" config commit.gpgsign false  >/dev/null 2>&1
+e2e_git "$WORK/atom" add -A                       >/dev/null 2>&1
+e2e_git "$WORK/atom" commit -qm base              >/dev/null 2>&1
 printf '\n# uncommitted change\n' >> "$WORK/atom/lib/versions.sh"
 B2="$(sha256sum "$WORK/atom/lib/versions.sh" | cut -d' ' -f1)"
 out=$( cd "$WORK" && PDG_BUMP_ROOT="$WORK/atom" PDG_BUMP_FETCHER="$WORK/fake-fetch.sh" \

@@ -164,8 +164,14 @@ for f in deploy/cert/proxy-gateway-open-cert-http.sh deploy/cert/proxy-gateway-r
 cp "$REPO/deploy/cert/proxy-gateway-open-cert-http.sh"   "$BIN/proxy-gateway-open-cert-http.sh"
 cp "$REPO/deploy/cert/proxy-gateway-restore-firewall.sh" "$BIN/proxy-gateway-restore-firewall.sh"
 cp "$REPO/deploy/bot/pdg-set-token.sh" "$BIN/pdg-set-token"; cp "$REPO/deploy/bot/pdg.sh" "$BIN/pdg"
-( cd "$REPO" && git init -qb main && git config user.email t@t && git config user.name t \
-  && git config commit.gpgsign false && git add -A && git commit -qm v1 && git tag -a v9.9.9 -m v9.9.9 ) >/dev/null 2>&1
+# 会写 ref/config 的 git 一律走 e2e_git(见 test-e2e-repo-guard.py 与 07-31 那次事故)。
+git init -qb main "$REPO" >/dev/null 2>&1
+e2e_git "$REPO" config user.email t@t        >/dev/null 2>&1
+e2e_git "$REPO" config user.name t           >/dev/null 2>&1
+e2e_git "$REPO" config commit.gpgsign false  >/dev/null 2>&1
+e2e_git "$REPO" add -A                       >/dev/null 2>&1
+e2e_git "$REPO" commit -qm v1                >/dev/null 2>&1
+e2e_git "$REPO" tag -a v9.9.9 -m v9.9.9      >/dev/null 2>&1
 mk "$PIN_VER" DRIFTED-CONTENT "$BIN/mihomo"        # 自报版本正确, 内容不是官方那份
 # _update_in_sync 现在同时问 mihomo 与 mosdns 两条。要让这一格**只**说明 mihomo 那条,
 # 就得先把 mosdns 那条弄成通过 —— 否则把 mihomo 判据整个删掉, 短路照样不成立(mosdns
