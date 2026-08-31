@@ -1623,7 +1623,11 @@ _update_core_binary(){
   march=$(dpkg --print-architecture 2>/dev/null); [[ "$march" == arm64 ]] || march=amd64
   tmp=$(mktemp -d)
   ver="$MIHOMO_VER"
-  pdg_mihomo_is_version "$ver" && { rm -rf "$tmp"; return 0; }   # 已是钉死版本(精确比较, 非子串)
+  # 短路判据按**内容**判(与 install.sh、doctor 同一个函数、同一份钉值)。旧判据
+  # pdg_mihomo_is_version 问的是 PATH 上的 mihomo 且只比自报版本 —— PATH 上一个自报
+  # v1.19.30 的壳, 或者把 /usr/local/bin/mihomo 内容换掉而版本串留着, 都能让整段换核
+  # 被跳过, 而日志上连"更新 mihomo 内核"这行都不会出现。
+  pdg_mihomo_binary_ok "$march" "$ver" "$bindir/mihomo" && { rm -rf "$tmp"; return 0; }
   c_g "更新 mihomo 内核 → $ver …"
   curl -fsSL "https://github.com/MetaCubeX/mihomo/releases/download/${ver}/mihomo-linux-${march}-${ver}.gz" -o "$tmp/m.gz" \
     || { c_y "  下载失败(版本与发布不一致, 不能当作已更新)"; rm -rf "$tmp"; return 1; }
@@ -1631,6 +1635,11 @@ _update_core_binary(){
     || { c_y "  SHA 校验失败 → 判为更新失败(不降级成警告后继续)"; rm -rf "$tmp"; return 1; }
   gunzip -c "$tmp/m.gz" > "$tmp/mihomo" || { c_y "  解压失败"; rm -rf "$tmp"; return 1; }
   [[ -s "$tmp/mihomo" ]] || { c_y "  解压产物为空"; rm -rf "$tmp"; return 1; }
+  chmod 755 "$tmp/mihomo" 2>/dev/null || true
+  # 落盘**之前**核解压产物。归档 SHA 过了只说明下载对了; 而换核是在一台正在服务的机器上
+  # 覆盖运行文件, 没有理由先把一个还没核过的文件放进 /usr/local/bin 再回头补票。
+  pdg_verify_sha256 "$tmp/mihomo" "${PDG_SHA256[mihomo-bin-$march]:-}" "mihomo $ver 二进制 ($march)" \
+    || { c_y "  二进制内容与钉值不符 → 拒绝换核(归档校验已过, 问题出在解压这一段)"; rm -rf "$tmp"; return 1; }
   if ! _core_swap_verify mihomo "$tmp/mihomo" "$bindir" "$ver"; then rm -rf "$tmp"; return 1; fi
   rm -rf "$tmp"
 }
@@ -1682,6 +1691,16 @@ _update_in_sync(){                      # 0 = 已装文件逐个等于仓库版�
                    "$bindir/proxy-gateway-restore-firewall.sh" || exit 1
     _pdg_same_file "$repo/deploy/bot/pdg-set-token.sh" "$bindir/pdg-set-token" || exit 1
     _pdg_same_file "$repo/deploy/bot/pdg.sh"           "$bindir/pdg"           || exit 1
+    # 内核二进制也算"已装文件"。不算的话就有这么一个现场: 仓库精确在最新 tag、工作树干净、
+    # 项目文件逐个一致, 但 /usr/local/bin/mihomo 的**内容**被换过 —— 短路照样成立,
+    # `pdg update` 直接返回 0, 而它正是这台机器上唯一的修复手段。判据用生产共用的那两个
+    # (与 install.sh、doctor 同一份钉值), 读不到 versions.sh 一律当"不同步"(fail-open,
+    # 与本函数其余部分同向: 白跑一次没有损失, 跳过修复才是灾难)。
+    # shellcheck source=lib/versions.sh
+    source "$repo/lib/versions.sh" 2>/dev/null || exit 1
+    local march; march=$(dpkg --print-architecture 2>/dev/null); [[ "$march" == arm64 ]] || march=amd64
+    pdg_mihomo_binary_ok "$march" "${MIHOMO_VER:-}" "$bindir/mihomo" || exit 1
+    pdg_mosdns_binary_ok "$march" "${MOSDNS_VER:-}" "$bindir/mosdns" || exit 1
     exit 0
   )
 }
@@ -3976,11 +3995,17 @@ _activate_mihomo_core(){
   source "$REPO_DIR/lib/units.sh"   2>/dev/null || { echo "❌ 读不到 units.sh"; return 1; }
   cp /etc/nftables.conf /etc/nftables.conf.scbak 2>/dev/null
 
-  if ! pdg_mihomo_is_version "$MIHOMO_VER"; then
+  # 这是第三个装 mihomo 的地方(前两个是 install.sh 与 _update_core_binary), 判据必须同一份:
+  # 用 PATH + 只比自报版本的老判据, 等于给"迁到 mihomo"这条路留一个后门 —— 迁过去之后
+  # 跑的可能根本不是官方那一份, 而 doctor 以前对任何能解析的版本都报绿。
+  if ! pdg_mihomo_binary_ok "$march" "$MIHOMO_VER" /usr/local/bin/mihomo; then
     c_g "下载 mihomo $MIHOMO_VER…"; t=$(mktemp -d)
     if ! curl -fsSL "https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VER}/mihomo-linux-${march}-${MIHOMO_VER}.gz" -o "$t/m.gz" \
        || ! pdg_verify_sha256 "$t/m.gz" "${PDG_SHA256[mihomo-$march]:-}" "mihomo $MIHOMO_VER" \
        || ! gunzip -c "$t/m.gz" > "$t/mihomo"; then rm -rf "$t"; echo "❌ mihomo 下载/校验失败, 未迁移"; return 1; fi
+    # 落盘前核解压产物 —— 与 install.sh / _update_core_binary 同一道门, 同一份钉值。
+    if ! pdg_verify_sha256 "$t/mihomo" "${PDG_SHA256[mihomo-bin-$march]:-}" "mihomo $MIHOMO_VER 二进制 ($march)"; then
+      rm -rf "$t"; echo "❌ mihomo 二进制内容与钉值不符, 未迁移"; return 1; fi
     install -m755 "$t/mihomo" /usr/local/bin/mihomo; rm -rf "$t"
   fi
   install -d -m700 /etc/mihomo

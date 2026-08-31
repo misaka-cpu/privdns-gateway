@@ -30,15 +30,16 @@ jobs:
         # 目前所有 runner 都是 x86_64 → 只有 amd64 一格。将来真出现 arm64 runner 时
         # 这里加一格即可: 消费者各自按自己的架构算 artifact 名, 不会拿错。
         arch: [amd64]
-    name: "取件 mosdns (${{ matrix.arch }}, 每 run 每架构仅此一次)"
+    name: "取件 mosdns + mihomo (${{ matrix.arch }}, 每 run 每架构仅此一次)"
     steps:
       - uses: actions/checkout@v5
-      # 不把 runner 上偶然存在的 mosdns 当隐式输入: 先清干净, 这一步才真的证明了完整取件。
-      - name: "隔离 runner 上偶然存在的 mosdns"
+      # 不把 runner 上偶然存在的内核当隐式输入: 先清干净, 这一步才真的证明了完整取件。
+      - name: "隔离 runner 上偶然存在的 mosdns / mihomo"
         run: |
           set -euo pipefail
-          sudo rm -f /usr/local/bin/mosdns
+          sudo rm -f /usr/local/bin/mosdns /usr/local/bin/mihomo
           ! command -v mosdns >/dev/null 2>&1 || { echo "PATH 上仍有 mosdns: $(command -v mosdns)"; exit 1; }
+          ! command -v mihomo >/dev/null 2>&1 || { echo "PATH 上仍有 mihomo: $(command -v mihomo)"; exit 1; }
       - name: "推导 artifact 名(由 lib/versions.sh 的钉值生成)"
         id: name
         run: echo "artifact=$(bash tests/mosdns-artifact-name.sh ${{ matrix.arch }})" >> "$GITHUB_OUTPUT"
@@ -48,6 +49,11 @@ jobs:
           set -euo pipefail
           mkdir -p artifact
           PDG_TEST_MOSDNS="$PWD/artifact/mosdns" bash tests/prepare-mosdns.sh
+          # mihomo 走同一条路、同一个 artifact: E2E 的夹具需要**真钉死版**内核(shell 桩
+          # 自报版本对、内容不对, 会被 install.sh 的短路与 doctor 判据正确地拒掉)。
+          # 放在这个 job 里 = 每 run 每架构仍然只取一次件, 消费者一律靠 artifact。
+          PDG_TEST_BIN_DIR="$PWD/artifact-mihomo" bash tests/prepare-mihomo.sh >/dev/null
+          cp "$PWD/artifact-mihomo/mihomo" artifact/mihomo
       - name: "校验最终二进制 SHA + 生产判据 + 生成 manifest"
         shell: bash
         run: |
@@ -60,11 +66,17 @@ jobs:
           [ "$GOT" = "$WANT" ] || { echo "二进制 SHA256 不符: $GOT != $WANT"; exit 1; }
           # 生产判据 —— 与 install.sh 的严格短路、doctor 的完整性判据同一个函数
           pdg_mosdns_binary_ok "$ARCH" "$MOSDNS_VER" "$PWD/artifact/mosdns"
+          MI_WANT="${PDG_SHA256[mihomo-bin-$ARCH]}"
+          MI_GOT="$(sha256sum artifact/mihomo | awk '{print $1}')"
+          [ "$MI_GOT" = "$MI_WANT" ] || { echo "mihomo 二进制 SHA256 不符: $MI_GOT != $MI_WANT"; exit 1; }
+          pdg_mihomo_binary_ok "$ARCH" "$MIHOMO_VER" "$PWD/artifact/mihomo"
           # manifest 只记可公开的溯源事实: 无 token、无 runner 路径、无生产地址
-          printf '{"version":"%s","arch":"%s","archive_sha256":"%s","binary_sha256":"%s","source_release":"%s","producer_commit":"%s"}\n' \
+          printf '{"version":"%s","arch":"%s","archive_sha256":"%s","binary_sha256":"%s","source_release":"%s","producer_commit":"%s","mihomo_version":"%s","mihomo_archive_sha256":"%s","mihomo_binary_sha256":"%s","mihomo_source_release":"%s"}\n' \
             "$MOSDNS_VER" "$ARCH" "${PDG_SHA256[mosdns-$ARCH]}" "$GOT" \
             "https://github.com/IrineSistiana/mosdns/releases/tag/$MOSDNS_VER" \
-            "$GITHUB_SHA" > artifact/manifest.json
+            "$GITHUB_SHA" \
+            "$MIHOMO_VER" "${PDG_SHA256[mihomo-$ARCH]}" "$MI_GOT" \
+            "https://github.com/MetaCubeX/mihomo/releases/tag/$MIHOMO_VER" > artifact/manifest.json
           cat artifact/manifest.json
       - uses: actions/upload-artifact@v4
         with:
@@ -457,6 +469,9 @@ jobs:
       - name: "E2E 夹具必须播真 mosdns (shell 假桩被生产判据拒绝 / 真钉定二进制被接受 / 夹具不联网)"
         run: python3 tests/test-e2e-mosdns-fixture.py
 
+      - name: "E2E mihomo 夹具闭包 (复用要版本+摘要都对; 归档与解压产物双重校验; 失败保全前像)"
+        run: python3 tests/test-e2e-mihomo-fixture.py
+
       - name: "CI 取件拓扑 (官方 Release 每 run 每架构只取一次 / 消费者靠 artifact 且自己复核 / action 钉定)"
         run: |
           python3 -c 'import yaml' 2>/dev/null || sudo apt-get install -y -q python3-yaml
@@ -725,10 +740,28 @@ jobs:
       - name: "渲染判废默认安全 (pdgtx 缺失/损坏/旧版时 str/repr/审计均不含用户值)"
         run: python3 tests/test-render-refusal.py
 
-      # 需要真内核的测试共用这一份: 下一次、按 lib/versions.sh 的 SHA256 校验一次, 放到
-      # tests/.bin/。CI 上必须**严格模式** —— 缺二进制要判失败, 不许把关键校验变成绿灯跳过。
-      - name: "准备钉死版 mihomo (SHA256 校验, 供需要真内核的测试共用)"
-        run: bash tests/prepare-mihomo.sh
+      # 需要真内核的测试共用这一份, 放到 tests/.bin/。取件**不在这里做** —— 走与 mosdns
+      # 同一个 artifact(producer 每 run 每架构只取一次件), 这里只做四层复核后装到位。
+      # 以前这一步自己跑准备脚本, 那样全 run 就有两处取件(这里一处、producer 一处),
+      # 而 tests/test-rescue-sets.py 正是钉着"只准备一次"这条(判据按字面数出现次数,
+      # 所以这段注释也不能把那条命令原样写出来)。
+      # CI 上必须**严格模式** —— 缺二进制要判失败, 不许把关键校验变成绿灯跳过。
+      # 这一步**不需要 sudo**(与同 job 的 mosdns 步不同): 它装到工作区的 tests/.bin/,
+      # 不写 /usr/local/bin。容器里的 e2e 各 job 则是本来就 root、镜像里没有 sudo。
+      - name: "校验并安装钉定 mihomo 到 tests/.bin (自算 SHA / manifest 交叉 / 自报版本 / 生产判据)"
+        run: |
+          set -euo pipefail
+          mkdir -p tests/.bin
+          bash tests/install-mihomo-artifact.sh /tmp/mosdns-fixture "" "$PWD/tests/.bin/mihomo"
+
+      - name: "mihomo 完整性闭包 (绝对路径+退出码+自报版本+内容摘要; PATH 影子无效; 内容漂移仍可修)"
+        run: bash tests/test-mihomo-integrity.sh
+
+      - name: "mihomo doctor 四态 (版本不符/摘要不符 fail; 无从对照 warn 且明说无结论; 全中才 ok)"
+        run: python3 tests/test-mihomo-binary-evidence.py
+
+      - name: "mihomo 真实换核 (v1.19.29→钉死版; 成功/配置检查失败/起来不稳 三态; 坏件绝不落盘)"
+        run: bash tests/test-mihomo-real-swap.sh
 
       - name: "混合规则 AND 语义 (跨字段 AND/同字段 OR/不支持组合拒绝/真 mihomo -t)"
         run: python3 tests/test-rule-mixed.py
@@ -1023,6 +1056,12 @@ jobs:
       # lib/versions.sh 自己重算 SHA、重核自报版本, 最后再走一次生产判据。不合格硬失败。
       - name: "校验并安装钉定 mosdns (自算 SHA / manifest 交叉 / 自报版本 / 生产判据)"
         run: bash tests/install-mosdns-artifact.sh /tmp/mosdns-fixture
+      - name: "校验并安装钉定 mihomo (自算 SHA / manifest 交叉 / 自报版本 / 生产判据)"
+        # 与 mosdns 同一个 artifact、同一套四层复核。E2E 夹具需要**真钉死版**内核:
+        # shell 桩自报版本对、内容不对, 会被 install.sh 的短路与 doctor 判据正确拒掉。
+        # 这三个 job 跑在 debian:12 容器里(本来就是 root, 镜像里没有 sudo) —— 与同 job
+        # 既有的 mosdns 安装步写法保持一致, 不能照抄 lint/functional 那种宿主机上的 sudo -E。
+        run: bash tests/install-mihomo-artifact.sh /tmp/mosdns-fixture
       - name: "跑 ${{ matrix.script }}"
         env: { PDG_E2E_ISOLATED: "1" }
         run: bash tests/${{ matrix.script }}
@@ -1398,6 +1437,12 @@ jobs:
       # lib/versions.sh 自己重算 SHA、重核自报版本, 最后再走一次生产判据。不合格硬失败。
       - name: "校验并安装钉定 mosdns (自算 SHA / manifest 交叉 / 自报版本 / 生产判据)"
         run: bash tests/install-mosdns-artifact.sh /tmp/mosdns-fixture
+      - name: "校验并安装钉定 mihomo (自算 SHA / manifest 交叉 / 自报版本 / 生产判据)"
+        # 与 mosdns 同一个 artifact、同一套四层复核。E2E 夹具需要**真钉死版**内核:
+        # shell 桩自报版本对、内容不对, 会被 install.sh 的短路与 doctor 判据正确拒掉。
+        # 这三个 job 跑在 debian:12 容器里(本来就是 root, 镜像里没有 sudo) —— 与同 job
+        # 既有的 mosdns 安装步写法保持一致, 不能照抄 lint/functional 那种宿主机上的 sudo -E。
+        run: bash tests/install-mihomo-artifact.sh /tmp/mosdns-fixture
       - name: "跑 e2e-rescue-migration-lock.sh (iOS)"
         env:
           PDG_E2E_ISOLATED: "1"
@@ -1436,6 +1481,12 @@ jobs:
           path: /tmp/mosdns-fixture
       - name: "校验并安装钉定 mosdns (自算 SHA / manifest 交叉 / 自报版本 / 生产判据)"
         run: bash tests/install-mosdns-artifact.sh /tmp/mosdns-fixture
+      - name: "校验并安装钉定 mihomo (自算 SHA / manifest 交叉 / 自报版本 / 生产判据)"
+        # 与 mosdns 同一个 artifact、同一套四层复核。E2E 夹具需要**真钉死版**内核:
+        # shell 桩自报版本对、内容不对, 会被 install.sh 的短路与 doctor 判据正确拒掉。
+        # 这三个 job 跑在 debian:12 容器里(本来就是 root, 镜像里没有 sudo) —— 与同 job
+        # 既有的 mosdns 安装步写法保持一致, 不能照抄 lint/functional 那种宿主机上的 sudo -E。
+        run: bash tests/install-mihomo-artifact.sh /tmp/mosdns-fixture
       - name: "E2E 串行 hermetic (同一容器里按原顺序连着跑, 每个都必须全绿)"
         env:
           PDG_E2E_ISOLATED: "1"

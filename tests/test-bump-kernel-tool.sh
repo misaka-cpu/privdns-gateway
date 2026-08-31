@@ -17,6 +17,9 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/pdg-bumpkernel.XXXXXX")"; trap 'rm -rf "$WORK
 pass=0; nfail=0
 ok(){ echo "[OK]   $1"; pass=$((pass+1)); }
 bad(){ echo "[FAIL] $1"; nfail=$((nfail+1)); }
+# shellcheck source=tests/repoguard.sh
+source "$ROOT/tests/repoguard.sh"    # e2e_git: 守卫与动作绑成一件事(见 test-e2e-repo-guard.py)
+
 TOOL="$ROOT/tools/bump-kernel.sh"
 
 echo "══ 1. 工具存在且可执行 ══"
@@ -176,6 +179,122 @@ for AWKBIN in mawk gawk; do
     bad "$AWKBIN 下工具直接失败了"
   fi
 done
+
+echo
+echo "══ 10. 原子性: 中途失败时正式文件逐字节不变 ══"
+# 这个脚本要改 3~6 行, 其中大多数是 64 位十六进制。逐次直写正式文件时, 中途任何一次失败
+# 都会把它停在"版本换了、第二个哈希没换"的半套状态 —— 装机会 die 在 SHA 校验上, 报错
+# 指向供应链异常, 现场根本看不出是工具写了一半。
+atom(){ rm -rf "$WORK/atom"; mkdir -p "$WORK/atom/lib"; cp "$ROOT/lib/versions.sh" "$WORK/atom/lib/versions.sh"; }
+atom
+# 制造"第二个哈希替换失败": 把 [mihomo-bin-arm64] 那一行删掉 → 该锚点命中 0 次 → 必须整体放弃
+grep -v '\[mihomo-bin-arm64\]' "$WORK/atom/lib/versions.sh" > "$WORK/atom/lib/v2" \
+  && mv "$WORK/atom/lib/v2" "$WORK/atom/lib/versions.sh"
+BEFORE="$(sha256sum "$WORK/atom/lib/versions.sh" | cut -d' ' -f1)"
+out=$( cd "$WORK" && PDG_BUMP_ROOT="$WORK/atom" PDG_BUMP_FETCHER="$WORK/fake-fetch.sh" \
+       PDG_BUMP_SKIP_VERIFY=1 bash "$TOOL" mihomo v9.9.9 2>&1 ); rc=$?
+AFTER="$(sha256sum "$WORK/atom/lib/versions.sh" | cut -d' ' -f1)"
+[[ "$rc" != 0 ]] && ok "锚点命中 0 次 → 非零退出" || bad "缺锚点却成功了(rc=$rc)"
+[[ "$BEFORE" == "$AFTER" ]] \
+  && ok "中途失败后正式文件**逐字节不变**(sha ${BEFORE:0:12}…)" \
+  || bad "正式文件被改成了半套状态 —— 这正是原子性要挡的"
+grep -qE 'MIHOMO_VER="v9\.9\.9"' "$WORK/atom/lib/versions.sh" \
+  && bad "版本号已经被写进去了(半套状态)" || ok "版本号也没被写进去(不是只回滚了哈希)"
+compgen -G "$WORK/atom/lib/versions.sh.pdg-bump.*" >/dev/null \
+  && bad "留下了暂存文件残骸" || ok "没有暂存文件残留"
+
+echo
+echo "══ 11. 暂存文件必须与目标同目录(跨文件系统 mv 不是原子的)══"
+c2="$(sed -E 's/^[[:space:]]*#.*$//' "$TOOL")"
+[[ "$(grep -c 'mktemp "${VERSIONS}' <<<"$c2" || true)" != 0 ]] \
+  && ok "暂存文件建在 \$VERSIONS 同目录" || bad "暂存文件不在目标同目录 —— mv 可能跨文件系统"
+[[ "$(grep -c 'mv -f "\$STAGE" "\$VERSIONS"' <<<"$c2" || true)" != 0 ]] \
+  && ok "用 mv 原子替换(不是 cat 覆盖)" || bad "没有用 mv 做原子替换"
+
+echo
+echo "══ 12. 目标文件已有改动时拒绝(注释与实现必须一致)══"
+atom
+printf '\n# someone else was here\n' >> "$WORK/atom/lib/versions.sh"
+# 会写 ref/config 的 git 一律走 e2e_git —— 守卫与动作绑成一件事, 不存在"忘了守"的形态。
+# (`git init` 不受限: 仓库还不存在时守卫必然假拒。)
+git init -q -b main "$WORK/atom" >/dev/null 2>&1
+e2e_git "$WORK/atom" config user.email t@t        >/dev/null 2>&1
+e2e_git "$WORK/atom" config user.name t           >/dev/null 2>&1
+e2e_git "$WORK/atom" config commit.gpgsign false  >/dev/null 2>&1
+e2e_git "$WORK/atom" add -A                       >/dev/null 2>&1
+e2e_git "$WORK/atom" commit -qm base              >/dev/null 2>&1
+printf '\n# uncommitted change\n' >> "$WORK/atom/lib/versions.sh"
+B2="$(sha256sum "$WORK/atom/lib/versions.sh" | cut -d' ' -f1)"
+out=$( cd "$WORK" && PDG_BUMP_ROOT="$WORK/atom" PDG_BUMP_FETCHER="$WORK/fake-fetch.sh" \
+       PDG_BUMP_SKIP_VERIFY=1 bash "$TOOL" mihomo v9.9.9 2>&1 ); rc=$?
+{ [[ "$rc" != 0 ]] && [[ "$(sha256sum "$WORK/atom/lib/versions.sh" | cut -d' ' -f1)" == "$B2" ]]; } \
+  && ok "目标文件有未提交改动 → 拒绝且不动它" || bad "目标文件脏时仍然改写了(rc=$rc)"
+# 注释若写"工作树必须干净", 实现却只查目标文件 —— 文案要准确
+[[ "$(grep -c '工作树必须干净' "$TOOL" || true)" == 0 ]] \
+  && ok '注释没把范围说成整个工作区(实现查的只是目标文件)' \
+  || bad "注释说工作树, 实现只查 lib/versions.sh —— 文案与实现不符"
+
+echo
+echo "══ 13. 官方 asset digest: 精确资产名 + 不一致就拒绝 ══"
+[[ "$(grep -c '_official_digest' <<<"$c2" || true)" != 0 ]] \
+  && ok "有官方 digest 交叉核对" || bad "没有 digest 交叉核对"
+[[ "$(grep -c 'select(.name==' <<<"$c2" || true)" != 0 ]] \
+  && ok "按**精确资产名**匹配(==), 不是通配" || bad "资产名不是精确匹配 —— 同 tag 下有 20+ 个相似名"
+[[ "$(grep -c 'releases/tags/\$ver' <<<"$c2" || true)" != 0 ]] \
+  && ok "按精确 tag 取" || bad "没有按精确 tag 取"
+[[ "$(grep -c '拒绝写文件' <<<"$c2" || true)" != 0 ]] \
+  && ok "digest 不一致 → 拒绝写文件" || bad "digest 不一致没有拒绝写文件"
+# 相似资产名不得命中: 用真实的 mihomo 资产名家族做判据
+for n in mihomo-linux-amd64-compatible-v1.19.30.gz mihomo-linux-amd64-v1-v1.19.30.gz \
+         mihomo-linux-amd64-v3-go123-v1.19.30.gz mihomo-linux-amd64-v1.19.30.deb; do
+  [[ "$n" == "mihomo-linux-amd64-v1.19.30.gz" ]] && bad "相似名 $n 与目标名相等?!" || :
+done
+ok "相似资产名清单(compatible/-v1-/-v3-go123-/.deb)与目标名互不相等 —— 精确匹配才不会抓错"
+# 文案: 不许把 GitHub digest 说成独立签名
+[[ "$(grep -c '不构成独立的签名信任链' "$TOOL" || true)" != 0 ]] \
+  && ok "文案说清 digest 不是独立签名信任链" || bad "文案把 digest 说成了独立信任链"
+[[ "$(grep -c '不发布独立的签名校验文件' "$TOOL" || true)" != 0 ]] \
+  && ok "文案说清上游没有独立签名校验文件" || bad "文案没交代上游无签名文件"
+
+echo
+echo "══ 14. PDG_BUMP_SKIP_VERIFY 不得成为正式取件路径的后门 ══"
+atom
+out=$( cd "$WORK" && PDG_BUMP_ROOT="$WORK/atom" PDG_BUMP_SKIP_VERIFY=1 \
+       bash "$TOOL" mihomo v9.9.9 2>&1 ); rc=$?
+{ [[ "$rc" != 0 ]] && grep -q 'PDG_BUMP_FETCHER' <<<"$out"; } \
+  && ok "官方下载路径 + SKIP_VERIFY → 明确拒绝(它只能配测试取件器)" \
+  || bad "SKIP_VERIFY 在官方路径上被接受了 —— 那是跳过全部证据的后门(rc=$rc)"
+
+echo
+echo "══ 15. 非本机架构: 完整 ELF 头, 伪造 e_machine 不够 ══"
+[[ "$(grep -c '_elf_header_ok' <<<"$c2" || true)" != 0 ]] && ok "用的是完整 ELF 头判据" || bad "还是只读 e_machine"
+for k in '7f454c46' 'EI_CLASS' 'EI_DATA'; do
+  [[ "$(grep -c "$k" "$TOOL" || true)" != 0 ]] && ok "ELF 判据覆盖 $k" || bad "ELF 判据没覆盖 $k"
+done
+# 真造一个"只把 18-19 伪造成 amd64"的非 ELF 文件, 它必须过不了
+mkdir -p "$WORK/elf"
+python3 - "$WORK/elf/fake" <<'PYX'
+import sys
+b = bytearray(b'NOT-AN-ELF-AT-ALL...' + b'\x00'*40)
+b[18:20] = b'\x3e\x00'          # 伪造 e_machine = x86-64
+open(sys.argv[1], 'wb').write(bytes(b))
+PYX
+if bash -c "source <(sed -n '/^_elf_header_ok(){/,/^}/p' '$TOOL'); say(){ :; }; _elf_header_ok '$WORK/elf/fake' amd64" 2>/dev/null; then
+  bad "伪造 e_machine 的非 ELF 文件通过了判据"
+else ok "伪造 e_machine 的非 ELF 文件被拒(magic/class 挡住了)"; fi
+
+echo
+echo "══ 16. 反向对照: 无关注释不得凭空制造失败 ══"
+# 上面多条断言扫的是**去注释后**的代码。往工具里塞一段只含关键词的注释, 断言数不该变。
+cp "$TOOL" "$WORK/tool-commented.sh"
+printf '\n# 无关注释: git commit git push sudo 工作树必须干净 select(.name== \n' >> "$WORK/tool-commented.sh"
+c3="$(sed -E 's/^[[:space:]]*#.*$//; s/[[:space:]]#[^"'"'"']*$//' "$WORK/tool-commented.sh")"
+n_extra=0
+for w in 'git commit' 'git push' 'sudo'; do
+  [[ "$(grep -c -- "$w" <<<"$c3" || true)" != 0 ]] && n_extra=$((n_extra+1))
+done
+[[ "$n_extra" == 0 ]] && ok "注释里的关键词不会被算成代码(去注释判据有效)" \
+  || bad "注释被当成代码了 —— 会造出 $n_extra 条假失败"
 
 echo "────────────────────────────────────────"
 echo "test-bump-kernel-tool.sh: 通过 $pass, 失败 $nfail"
