@@ -490,6 +490,9 @@ jobs:
       - name: "换核取件的工作区与边界 (临时目录失败即停/不退化到根目录/有界超时/超时不冒充版本问题)"
         run: bash tests/test-core-download-workspace.sh
 
+      - name: "内核判据先证内容后执行 (摘要不符时不得运行待验二进制; 摘要过关后版本仍须精确)"
+        run: bash tests/test-core-verify-before-exec.sh
+
       - name: "换内核工具契约 (只改钉值不提交/两种钉值形状/取件后核对版本与架构/离线改写)"
         run: bash tests/test-bump-kernel-tool.sh
 
