@@ -103,15 +103,20 @@ MUT = [
       ('  c_g "更新前留快照…"\n',
        '  c_g "更新前留快照…"\n  _update_mosdns_preflight || return 1\n', 1)], [T_PRE]),
     ("③ 缺文件从 fail 降成 warn", CHK,
-     [('        return ("fail", name, "读不到 %s(%s)" % (b, e.strerror or e.errno))',
+     [('        # mosdns 是必需运行组件: 它的二进制读不到不是"存疑", 是这台机器有问题。\n'
+       '        return ("fail", name, "读不到 %s(%s)" % (b, e.strerror or e.errno))',
        '        return ("warn", name, "读不到 %s(%s)" % (b, e.strerror or e.errno))', 1)],
      [T_MOS]),
     ("④ check_mosdns_binary 移出 ALL", CHK,
      [("check_mosdns_version, check_mosdns_binary,", "check_mosdns_version,", 1)], [T_MOS]),
+    # 锚点带上 mosdns 独有的 `"$bin" version`: 摘要段两个内核逐字相同, 只取它会命中 2 次。
     ("⑤ shell 假桩重新被接受(短路只比自报版本)", VER,
      [('  got="$(sha256sum "$bin" 2>/dev/null | awk \'{print $1}\')"\n'
-       '  [[ -n "$got" && "$got" == "$exp" ]]',
-       '  return 0', 1)], [T_MOS, T_FIX]),
+       '  [[ -n "$got" && "$got" == "$exp" ]] || return 1\n'
+       '  # 顺带补上一处一直没跟上的不对称: 原来这里是 `$("$bin" version | head -1)`, 退出码取的是\n'
+       '  # head 的、永远为 0 —— 与 mihomo 那边 v1.11.7 已经修掉的形态一样。改成不经管道取首行。\n'
+       '  got="$("$bin" version 2>/dev/null)" || return 1   # 退出码必须是 0',
+       '  got="$("$bin" version 2>/dev/null)" || return 1', 1)], [T_MOS, T_FIX]),
     ("⑥ 摘掉预检里的 SHA256 裁决", PDG,
      [('    pdg_mosdns_binary_ok "$march" "$MOSDNS_VER" "$bin" && exit 0',
        '    [[ -x "$bin" ]] && exit 0', 1)], [T_PRE]),
