@@ -54,6 +54,10 @@ jobs:
           # 放在这个 job 里 = 每 run 每架构仍然只取一次件, 消费者一律靠 artifact。
           PDG_TEST_BIN_DIR="$PWD/artifact-mihomo" bash tests/prepare-mihomo.sh >/dev/null
           cp "$PWD/artifact-mihomo/mihomo" artifact/mihomo
+          # 跨版本换核 E2E 的**旧版**起点(v5.3.3)。同样走这一个 job、同一个 artifact: 全 run 对
+          # 上游只取这一次件, 消费者一律离线。钉值在 tests/legacy-pins.sh, 不进生产 lib/versions.sh。
+          PDG_TEST_LEGACY_DIR="$PWD/artifact-legacy" bash tests/prepare-mosdns-legacy.sh >/dev/null
+          cp "$PWD/artifact-legacy/mosdns-legacy" artifact/mosdns-legacy
       - name: "校验最终二进制 SHA + 生产判据 + 生成 manifest"
         shell: bash
         run: |
@@ -70,6 +74,15 @@ jobs:
           MI_GOT="$(sha256sum artifact/mihomo | awk '{print $1}')"
           [ "$MI_GOT" = "$MI_WANT" ] || { echo "mihomo 二进制 SHA256 不符: $MI_GOT != $MI_WANT"; exit 1; }
           pdg_mihomo_binary_ok "$ARCH" "$MIHOMO_VER" "$PWD/artifact/mihomo"
+          # 旧版: 该 release 早于 GitHub 资产 digest 字段, 证据链只有精确 tag + 精确资产名 +
+          # 实算 SHA + 自报版本 —— 等级低于 v5.3.4, 如实记进 manifest。
+          source tests/legacy-pins.sh
+          LG_WANT="${PDG_LEGACY_SHA256[mosdns-bin-$ARCH]}"
+          LG_GOT="$(sha256sum artifact/mosdns-legacy | awk '{print $1}')"
+          [ "$LG_GOT" = "$LG_WANT" ] || { echo "旧版二进制 SHA256 不符: $LG_GOT != $LG_WANT"; exit 1; }
+          LG_VER="$(artifact/mosdns-legacy version 2>/dev/null | head -1)"
+          [ "$LG_VER" = "$PDG_LEGACY_MOSDNS_SELFVER" ] \
+            || { echo "旧版自报版本不符: [$LG_VER] != [$PDG_LEGACY_MOSDNS_SELFVER]"; exit 1; }
           # manifest 只记可公开的溯源事实: 无 token、无 runner 路径、无生产地址
           printf '{"version":"%s","arch":"%s","archive_sha256":"%s","binary_sha256":"%s","source_release":"%s","producer_commit":"%s","mihomo_version":"%s","mihomo_archive_sha256":"%s","mihomo_binary_sha256":"%s","mihomo_source_release":"%s"}\n' \
             "$MOSDNS_VER" "$ARCH" "${PDG_SHA256[mosdns-$ARCH]}" "$GOT" \
@@ -77,6 +90,17 @@ jobs:
             "$GITHUB_SHA" \
             "$MIHOMO_VER" "${PDG_SHA256[mihomo-$ARCH]}" "$MI_GOT" \
             "https://github.com/MetaCubeX/mihomo/releases/tag/$MIHOMO_VER" > artifact/manifest.json
+          # manifest 补旧版溯源。不用 heredoc: run: | 块里顶格的行会把 YAML 撑破。
+          python3 -c 'import json,sys
+          m=json.load(open("artifact/manifest.json"))
+          m["legacy_mosdns_version"]=sys.argv[1]
+          m["legacy_mosdns_archive_sha256"]=sys.argv[2]
+          m["legacy_mosdns_binary_sha256"]=sys.argv[3]
+          m["legacy_mosdns_self_version"]=sys.argv[4]
+          m["legacy_mosdns_source_release"]="https://github.com/IrineSistiana/mosdns/releases/tag/"+sys.argv[1]
+          m["legacy_mosdns_evidence"]="exact-tag+exact-asset+computed-sha+self-version; upstream release predates asset digest"
+          json.dump(m,open("artifact/manifest.json","w"))' \
+            "$PDG_LEGACY_MOSDNS_VER" "${PDG_LEGACY_SHA256[mosdns-$ARCH]}" "$LG_GOT" "$LG_VER"
           cat artifact/manifest.json
       - uses: actions/upload-artifact@v4
         with:
@@ -942,6 +966,47 @@ jobs:
 
       - name: "平台隔离回归 (Android 无 iOS 按钮/回调/后端; iOS 原功能; checks 平台一致)"
         run: python3 tests/test-platform-isolation.py
+
+  core-startlimit:
+    needs: prepare-mosdns-fixture
+    runs-on: ubuntu-latest
+    name: "真 systemd: 换核回滚必须穿过 systemd 启动限速"
+    # 为什么单独一个 job 而不是并进 lint: 它要写 unit、起真服务、读 journal。lint 里那些
+    # 用例一个都不需要这些, 混进去等于让两百多支测试跟着一次 systemd 现场一起红。
+    env:
+      PDG_TEST_STRICT: "1"
+    steps:
+      - uses: actions/checkout@v5
+      - name: "PID 1 必须是真 systemd(不是就判失败, 不 SKIP)"
+        run: |
+          set -euo pipefail
+          comm="$(ps -p 1 -o comm=)"
+          echo "PID1 = $comm"
+          test "$comm" = systemd
+          test "$(command -v systemctl)" = /usr/bin/systemctl || test "$(command -v systemctl)" = /bin/systemctl
+      - name: "推导 artifact 名"
+        run: echo "MOSDNS_ARTIFACT=$(bash tests/mosdns-artifact-name.sh)" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.MOSDNS_ARTIFACT }}
+          path: /tmp/mosdns-fixture
+      # 消费者不联网: 件来自本次 run 的唯一取件步骤, 这里只做复核后放到位。
+      - name: "校验并安装钉定 mosdns 到 tests/.bin"
+        run: |
+          set -euo pipefail
+          mkdir -p tests/.bin
+          bash tests/install-mosdns-artifact.sh /tmp/mosdns-fixture "" "$PWD/tests/.bin/mosdns"
+      - name: "校验并安装旧版 mosdns 到 tests/.bin (实算 SHA + manifest 交叉 + 自报版本)"
+        run: bash tests/install-mosdns-legacy-artifact.sh /tmp/mosdns-fixture "" "$PWD/tests/.bin/mosdns-legacy"
+      - name: "换核回滚穿过启动限速 (真 v5.3.3 + 真 systemd; 八项排除法钉死第一失败点)"
+        run: sudo -E env PDG_TEST_MOSDNS_LEGACY="$PWD/tests/.bin/mosdns-legacy" bash tests/e2e-core-startlimit-recovery.sh
+      - name: "收尾: 现场必须不留 unit/进程/端口"
+        if: always()
+        run: |
+          set -uo pipefail
+          test ! -e /etc/systemd/system/mosdns.service || { echo "残留 unit"; exit 1; }
+          test "$(pgrep -c -x mosdns || true)" = 0 || { echo "残留进程"; exit 1; }
+          test "$(ss -lntu 2>/dev/null | grep -cE ':(15353|15853)' || true)" = 0 || { echo "残留端口"; exit 1; }
 
   functional:
     needs: prepare-mosdns-fixture
