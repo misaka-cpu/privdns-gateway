@@ -1560,6 +1560,28 @@ _core_listeners(){
 # 内核活性 + 稳定判定: 起得来, 且持续观察若干次仍在跑。
 # 只抽两次 is-active 挡不住"起来即崩": systemd 会把它反复拉起, 每次抽样都可能正好撞上
 # 刚起来的那一瞬。故再比对 NRestarts —— 观察窗口内重启计数涨了就是崩溃循环。
+# 重启一个内核 unit 之前, 先清掉它的 failed 与**启动限速计数**。
+#
+# 为什么必须成对: systemd 的 StartLimitBurst 把**成功的启动也计进去**(本轮实测: 一个完全
+# 健康的服务在 10s 窗口里第 6 次 restart 同样被拒, Result=start-limit-hit)。一次 pdg update
+# 本来就会重启若干服务, 换核自己还要重启新核、失败后再重启旧核 —— 预算用尽时 systemd 会连
+# **还原回去的那个正确旧核**一起拒掉。结果是盘上文件全对、DNS 却起不来, 而回滚判据只会说
+# "旧内核重启后未稳定运行", 看不出真正的原因。
+#
+# 只指定这一个 unit: 无参数的 reset-failed 会清掉全系统的 failed 状态, 那是别人的事。
+# reset-failed 在 unit 没进 failed 态时本来就返回非 0(那是正常的, 不算故障), 所以它的返回码
+# 不作为成败判据 —— 但输出要留着: restart 真失败时, 那句话是判断"限速到底清掉没有"的唯一线索,
+# 不能让它静默消失、把失败说成别的原因。
+_core_restart_clean(){   # $1=unit → 0=重启成功
+  local svc="$1" rfout rfrc
+  rfout="$(systemctl reset-failed "$svc" 2>&1)"; rfrc=$?
+  if ! systemctl restart "$svc" 2>/dev/null; then
+    c_y "  $svc 重启失败(先行 reset-failed rc=$rfrc${rfout:+, 输出: $rfout})"
+    return 1
+  fi
+  return 0
+}
+
 _core_kernel_stable(){
   local svc="$1" i n="${PDG_STABLE_SAMPLES:-3}" r0 r1
   r0="$(systemctl show -p NRestarts --value "$svc" 2>/dev/null)"; r0="${r0:-0}"
@@ -1602,7 +1624,11 @@ _core_restore_prev(){
       c_y "  旧内核还原后校验和与备份不符"; return 1
     fi
   fi
-  systemctl restart "$svc" 2>/dev/null || true
+  # 还原完文件才重启, 且重启之前先清限速 —— 否则文件对了、服务照样起不来(见 _core_restart_clean)。
+  if ! _core_restart_clean "$svc"; then
+    c_y "  旧内核已还原到盘上, 但服务没有恢复 —— 恢复闭包未完成, 不能当作已回退。"
+    return 1
+  fi
   _core_kernel_stable "$svc" || { c_y "  旧内核重启后未稳定运行"; return 1; }
 }
 
@@ -1632,7 +1658,14 @@ _core_swap_verify(){
     _core_restore_prev "$svc" "$bindir" "$bak" "$sha" || c_y "  ⚠️ 旧版内核回退未达标, 请立即 pdg doctor"
     return 1
   fi
-  systemctl restart "$svc" 2>/dev/null || true
+  # 新核也走同一条: 装完就重启, 而这次重启同样可能撞上前面几次启动攒下的限速。
+  # restart 直接失败时立刻进恢复路径 —— 没有理由再让 _core_kernel_stable 轮询三秒去
+  # "发现"一件已经确定的事, 那三秒里 DNS 是断的。
+  if ! _core_restart_clean "$svc"; then
+    c_y "  新版内核重启失败, 已还原旧版内核"
+    _core_restore_prev "$svc" "$bindir" "$bak" "$sha" || c_y "  ⚠️ 旧版内核回退未达标, 请立即 pdg doctor"
+    return 1
+  fi
   if ! _core_kernel_stable "$svc"; then
     c_y "  新版内核重启后未稳定运行, 已还原旧版内核并重启"
     _core_restore_prev "$svc" "$bindir" "$bak" "$sha" || c_y "  ⚠️ 旧版内核回退未达标, 请立即 pdg doctor"

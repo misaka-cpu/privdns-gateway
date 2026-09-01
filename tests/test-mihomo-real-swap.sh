@@ -82,7 +82,7 @@ mkdir -p "$WORK/repo/lib"
 # 独立的 `}` 收尾, sed 的结束锚点于是跑到**下一个**函数的末尾, 把真的 _core_config_check
 # (里面写死 /etc/mihomo)一起抽了进来。桩若写在前面就会被它覆盖, 表现是"真内核说配置不兼容"。
 : > "$WORK/h.sh"
-for f in _core_bindir _pdg_sha _core_stash_kernel _core_restore_prev _core_kernel_stable \
+for f in _core_bindir _pdg_sha _core_stash_kernel _core_restore_prev _core_kernel_stable _core_restart_clean \
          _core_listeners _core_swap_verify _pdg_mktemp_dir _core_dl_reason _update_core_binary; do
   xt "$f" >> "$WORK/h.sh"
 done
@@ -94,6 +94,7 @@ done
   echo "_core_config_check(){ \"\$2/mihomo\" -t -d '$CFG' -f \"$CFG/\$CFGF\" > '$WORK/cfgchk.log' 2>&1; }"
   echo "systemctl(){ if [[ \"\$1\" == is-active ]]; then"
   echo "               if grep -q OLD-v1.19.29 '$BIN/mihomo' 2>/dev/null; then echo active; else echo \"\$NEWACT\"; fi"
+  echo "             elif [[ \"\$1\" == reset-failed ]]; then return 1"   # 没进 failed 态时真 systemctl 就返回非 0
   echo "             elif [[ \"\$1\" == show ]]; then echo 0; fi; return 0; }"
 } >> "$WORK/h.sh"
 echo 'HARNESS_OK=1' >> "$WORK/h.sh"

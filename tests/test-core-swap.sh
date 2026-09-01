@@ -21,6 +21,7 @@ eval "$(xt _core_bindir)"; eval "$(xt _core_config_check)"; eval "$(xt _core_ker
 eval "$(xt _core_listeners)"
 eval "$(xt _pdg_sha)"; eval "$(xt _core_stash_kernel)"; eval "$(xt _core_restore_prev)"; eval "$(xt _core_swap_verify)"; eval "$(xt _pdg_apply_snapshot_tree)"
 eval "$(xt _pdg_mktemp_dir)"
+eval "$(xt _core_restart_clean)"   # 换核/回滚重启前清 failed 与启动限速计数
 # 落盘要先给 iOS 生命周期拍完整底片, 那套 helper 全在 pdg.sh 里。按前缀自动抽 —— 写死
 # 名字的话, 生产那边多加一个 helper 就变成 "command not found" 的假红(已经发生过两次)。
 eval "$(sed -n '/^_PDG_IOS_[A-Z_]*=/p' "$ROOT/deploy/bot/pdg.sh")"
@@ -35,6 +36,12 @@ BIN="$WORK/bin"; export PDG_CORE_BINDIR="$BIN"
 systemctl(){
   if [[ "${1:-}" == is-active ]]; then
     if grep -q NEWKERNEL "$BIN/${2:-}" 2>/dev/null; then echo "${NEW_ACTIVE:-active}"; else echo active; fi
+  elif [[ "${1:-}" == reset-failed ]]; then
+    # 真 systemctl 在 unit 没进 failed 态时返回非 0 —— 桩照着这个形态来, 否则
+    # _core_restart_clean 里"返回码不当成败判据"那条设计根本走不到。
+    echo "reset-failed ${2:-}" >> "$WORK/sctl"; return 1
+  elif [[ "${1:-}" == restart ]]; then
+    echo "restart ${2:-}" >> "$WORK/sctl"; return "${RESTART_RC:-0}"
   elif [[ "${1:-}" == show ]]; then
     # 模拟 NRestarts: RESTART_LOOP=1 时每问一次就涨一次(起来即崩的样子)。
     # 必须用文件计数 —— $(systemctl show …) 在子 shell 里跑, 变量自增回传不到父 shell。

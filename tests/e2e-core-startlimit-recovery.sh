@@ -69,10 +69,37 @@ xv_dns_ok && ok "前像: DNS 真查询成功" || die "前像 DNS 查不通"
 # 只还原"这个 unit 在限速窗口内已经被重启过几次"这个再普通不过的现场。
 SLB="$(systemctl show "$XV_UNIT" -p StartLimitBurst --value 2>/dev/null)"
 SLI="$(systemctl show "$XV_UNIT" -p StartLimitIntervalUSec --value 2>/dev/null)"
-for _ in 1 2 3; do systemctl restart "$XV_UNIT" >/dev/null 2>&1; done
+BURN=$(( ${SLB:-5} - 1 ))
+
+# 对照组: 另起一个一次性 unit, 受同样次数的重启, 然后再来一次**不带 reset-failed** 的
+# restart。它必须被拒 —— 这就证明了"预算确实用尽"这个前提是真的。
+# 为什么要对照而不是直接看被测 unit: 修好之后被测 unit 永远不会再撞上限速(那正是修复的
+# 意义), 拿它当判据的话, 这一格会在修复后变成一条永远测不到东西的断言。
+CTRL=pdg-xv-ctrl
+cat > "/etc/systemd/system/$CTRL.service" <<CTRLEOF
+[Unit]
+Description=pdg cross-version start-limit control
+[Service]
+ExecStart=/bin/sleep 600
+Restart=on-failure
+RestartSec=3
+CTRLEOF
+systemctl daemon-reload
+for ((i=0;i<=BURN;i++)); do systemctl restart "$CTRL" >/dev/null 2>&1; done
+if systemctl restart "$CTRL" >/dev/null 2>&1; then
+  bad "对照组: 连续重启 $((BURN+2)) 次仍未被限速(burst=$SLB interval=$SLI) —— 本机限速语义与预期不符, 这一格没测到目标前提"
+else
+  ok "对照组证明预算确实会用尽: 同一窗口内第 $((BURN+2)) 次 restart 被 systemd 拒(burst=$SLB interval=$SLI)"
+fi
+systemctl stop "$CTRL" >/dev/null 2>&1; systemctl reset-failed "$CTRL" >/dev/null 2>&1
+rm -f "/etc/systemd/system/$CTRL.service"; systemctl daemon-reload
+
+# 被测 unit: 同样把预算压到临界。全部是真实且成功的 restart, 不制造任何故障 ——
+# 还原的是"这个 unit 在限速窗口内已经被重启过几次"这个再普通不过的现场。
+for ((i=0;i<BURN;i++)); do systemctl restart "$XV_UNIT" >/dev/null 2>&1; done
 xv_wait_listeners 3 >/dev/null 2>&1
 { [[ "$(systemctl is-active "$XV_UNIT")" == active ]] && xv_dns_ok; } \
-  && ok "预置: 窗口内已有若干次启动(burst=$SLB interval=$SLI), 服务仍然健康、仍在解析" \
+  && ok "预置: 被测 unit 窗口内已有 $BURN 次启动, 服务仍然健康、仍在解析" \
   || die "预置阶段就把服务弄坏了 —— 后面的因果链不成立"
 
 # ── 换入一个起不来的新核, 走真实换核路径 ───────────────────────────────────────
@@ -87,10 +114,10 @@ mkdir -p "$XV_WORK/repo/lib"
   sed -n '/^pdg_verify_sha256(){/,/^}/p'     "$ROOT/lib/versions.sh"; } > "$XV_WORK/repo/lib/versions.sh"
 
 H="$XV_WORK/harness.sh"
-xv_build_harness "$H" _core_bindir _pdg_mktemp_dir _core_dl_reason _pdg_sha \
+xv_build_harness "$H" _core_bindir _pdg_mktemp_dir _core_dl_reason _pdg_sha _core_restart_clean \
   _core_stash_kernel _core_restore_prev _core_kernel_stable _core_listeners \
   _core_config_check _core_swap_verify _update_mosdns_binary || exit 1
-ok "换核闭包完整且可解析(11 个函数全在, bash -n 通过)"
+ok "换核闭包完整且可解析(12 个函数全在, bash -n 通过)"
 
 rc=0
 REPO_DIR="$XV_WORK/repo" PDG_CORE_BINDIR="$XV_BINDIR" FEED="$XV_WORK/dead.zip" \
@@ -105,9 +132,7 @@ echo "══ 第一失败点 ══"
 RESULT="$(systemctl show "$XV_UNIT" -p Result --value)"
 SLHIT="$(journalctl -u "$XV_UNIT" --since "-3min" --no-pager 2>/dev/null \
          | grep -c 'Start request repeated too quickly')"
-[[ "$SLHIT" -gt 0 ]] \
-  && ok "systemd 真的拒了启动: journal 里有 $SLHIT 条 'Start request repeated too quickly'(Result=$RESULT)" \
-  || bad "没有真正撞到启动限速(journal 命中 0, Result=$RESULT) —— 这一格没测到目标形态"
+echo "       (现场记录: Result=$RESULT, journal 里 'Start request repeated too quickly' x$SLHIT)"
 [[ "$(xv_sha "$XV_BINDIR/mosdns")" == "$OLD_SHA" ]] \
   && ok "_core_swap_verify 把旧二进制内容正确还原了(${OLD_SHA:0:12}…)" \
   || bad "旧二进制没还原: $(xv_sha "$XV_BINDIR/mosdns" | cut -c1-12)…"
@@ -161,12 +186,31 @@ echo
 echo "══ 源码判据: 恢复闭包里必须有 reset-failed ══"
 _rp="$(sed -n '/^_core_restore_prev(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh")"
 _sv="$(sed -n '/^_core_swap_verify(){/,/^}/p'  "$ROOT/deploy/bot/pdg.sh")"
-grep -q 'reset-failed' <<<"$_rp" \
-  && ok "_core_restore_prev 里有 reset-failed" \
-  || bad "_core_restore_prev 里没有 reset-failed —— 还原了文件却起不了服务"
-grep -q 'reset-failed' <<<"$_sv" \
-  && ok "_core_swap_verify 里有 reset-failed" \
-  || bad "_core_swap_verify 里没有 reset-failed —— 新核 restart 之前不清限速"
+_rc="$(sed -n '/^_core_restart_clean(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh")"
+[[ -n "$_rc" ]] && ok "有共用的 _core_restart_clean" || bad "没有 _core_restart_clean"
+_i_reset="$(grep -n 'reset-failed' <<<"$_rc" | head -1 | cut -d: -f1)"
+_i_restart="$(grep -n 'systemctl restart' <<<"$_rc" | head -1 | cut -d: -f1)"
+{ [[ -n "$_i_reset" && -n "$_i_restart" ]] && [[ "$_i_reset" -lt "$_i_restart" ]]; } \
+  && ok "_core_restart_clean 里 reset-failed 排在 restart **之前**(第 $_i_reset 行 vs 第 $_i_restart 行)" \
+  || bad "reset-failed 不在 restart 之前(reset=$_i_reset restart=$_i_restart) —— 事后补等于没清"
+grep -qE 'reset-failed "\$svc"' <<<"$_rc" \
+  && ok "reset-failed 明确指定了 unit(不是无参数清全系统 failed 状态)" \
+  || bad "reset-failed 没指定 unit —— 会清掉别人的 failed 状态"
+for _pair in "_core_swap_verify:$_sv" "_core_restore_prev:$_rp"; do
+  _nm="${_pair%%:*}"; _body="${_pair#*:}"
+  grep -q '_core_restart_clean' <<<"$_body" \
+    && ok "$_nm 走 _core_restart_clean(与另一处同一份时序)" \
+    || bad "$_nm 没走 _core_restart_clean"
+  grep -qE '^\s*systemctl restart' <<<"$_body" \
+    && bad "$_nm 里还留着裸的 systemctl restart —— 那一条不清限速" \
+    || ok "$_nm 里没有裸的 systemctl restart"
+done
+# .prev 只能在新核稳定且监听回来之后才删
+_i_lis="$(grep -n '监听端口没有回到换核前' <<<"$_sv" | head -1 | cut -d: -f1)"
+_i_rm="$(grep -n 'rm -f "\$bak"' <<<"$_sv" | head -1 | cut -d: -f1)"
+{ [[ -n "$_i_lis" && -n "$_i_rm" ]] && [[ "$_i_rm" -gt "$_i_lis" ]]; } \
+  && ok "旧核备份(.prev)在监听对账之后才删(第 $_i_rm 行 > 第 $_i_lis 行)" \
+  || bad "备份删得太早(lis=$_i_lis rm=$_i_rm) —— 判据还没过就没得退了"
 
 echo "────────────────────────────────────────"
 echo "通过 $pass, 失败 $nfail"
