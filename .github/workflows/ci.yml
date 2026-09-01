@@ -487,6 +487,9 @@ jobs:
       - name: "mosdns 运行时换版路径 (短路判据/压缩包与解压产物双重校验/坏件绝不落盘/失败回滚/快照收二进制)"
         run: bash tests/test-update-mosdns-binary.sh
 
+      - name: "换核取件的工作区与边界 (临时目录失败即停/不退化到根目录/有界超时/超时不冒充版本问题)"
+        run: bash tests/test-core-download-workspace.sh
+
       - name: "换内核工具契约 (只改钉值不提交/两种钉值形状/取件后核对版本与架构/离线改写)"
         run: bash tests/test-bump-kernel-tool.sh
 
