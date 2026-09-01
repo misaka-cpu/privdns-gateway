@@ -50,8 +50,14 @@ CELLS = [
      '  pdg_mosdns_is_version "$ver" && return 0',
      "test-update-mosdns-binary.sh", "短路失效"),
 
+    # ⚠️ 锚点必须带上 mosdns 独有的那行版本解析: v1.11.7 加的 pdg_mihomo_binary_ok 与本函数
+    # **尾部逐字相同**, 只取尾部的话锚点会命中 2 次, 负控自己先红。
     ("共用判据不再比对内容(只剩版本)", os.path.join(ROOT, "lib/versions.sh"),
-     '  got="$(sha256sum "$bin" 2>/dev/null | awk \'{print $1}\')"\n  [[ -n "$got" && "$got" == "$exp" ]]',
+     '  got="$("$bin" version 2>/dev/null | head -1)" || return 1\n'
+     '  [[ "$got" =~ ([0-9]+\\.[0-9]+\\.[0-9]+) ]] || return 1\n'
+     '  [[ "${BASH_REMATCH[1]}" == "${want#v}" ]] || return 1\n'
+     '  got="$(sha256sum "$bin" 2>/dev/null | awk \'{print $1}\')"\n'
+     '  [[ -n "$got" && "$got" == "$exp" ]]',
      '  return 0',
      "test-update-mosdns-binary.sh", "短路跳过"),
 
