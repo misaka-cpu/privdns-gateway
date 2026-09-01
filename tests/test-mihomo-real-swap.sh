@@ -83,10 +83,12 @@ mkdir -p "$WORK/repo/lib"
 # (里面写死 /etc/mihomo)一起抽了进来。桩若写在前面就会被它覆盖, 表现是"真内核说配置不兼容"。
 : > "$WORK/h.sh"
 for f in _core_bindir _pdg_sha _core_stash_kernel _core_restore_prev _core_kernel_stable \
-         _core_listeners _core_swap_verify _update_core_binary; do
+         _core_listeners _core_swap_verify _pdg_mktemp_dir _core_dl_reason _update_core_binary; do
   xt "$f" >> "$WORK/h.sh"
 done
 {
+  # 取件的超时常量原样取自 pdg.sh, 不在夹具里另写一份数值
+  grep -E '^PDG_CORE_(CONNECT_TIMEOUT|MAX_TIME)=' "$ROOT/deploy/bot/pdg.sh"
   echo 'c_g(){ echo "$*"; }; c_y(){ echo "$*"; }; sleep(){ :; }'
   echo "curl(){ local o=\"\"; while [[ \$# -gt 0 ]]; do [[ \"\$1\" == -o ]] && { o=\"\$2\"; shift; }; shift; done; cp '$WORK/m.gz' \"\$o\"; }"
   echo "_core_config_check(){ \"\$2/mihomo\" -t -d '$CFG' -f \"$CFG/\$CFGF\" > '$WORK/cfgchk.log' 2>&1; }"

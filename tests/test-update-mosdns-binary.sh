@@ -89,7 +89,10 @@ run(){
     REPO_DIR="$repo" PDG_CORE_BINDIR="$BIN" ZIPSRC="$zip" CALLS="$WORK/calls.log" \
     bash -c '
       c_g(){ echo "$*"; }; c_y(){ echo "$*"; }
+      '"$(grep -E '^PDG_CORE_(CONNECT_TIMEOUT|MAX_TIME)=' "$ROOT/deploy/bot/pdg.sh")"'
       '"$(xt _core_bindir)"'
+      '"$(xt _pdg_mktemp_dir)"'
+      '"$(xt _core_dl_reason)"'
       curl(){ echo "curl" >> "$CALLS"
               [[ "$ZIPSRC" == FAIL ]] && return 1
               local o=""; while [[ $# -gt 0 ]]; do [[ "$1" == -o ]] && { o="$2"; shift; }; shift; done

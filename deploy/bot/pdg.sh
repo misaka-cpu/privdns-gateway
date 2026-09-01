@@ -1672,24 +1672,56 @@ _core_swap_verify(){
 # 内核二进制更新: 比对 versions.sh 钉死版本与已装版本, 不一致则下载+SHA校验+装。
 # 关键安全: 先备份旧二进制, 用新二进制对现有配置跑 check + 重启稳定判定, 全过才切换; 失败还原旧版, 不留坏内核。
 # 返回: 0=已是钉死版/下载或校验失败(保留现版本, 非致命); 1=换核失败(已还原) → 调用方须回滚整次更新。
+# curl 退出码 → 人话原因。**把"出不去"和"那边没这个东西"分开**: 前者是网络现场,
+# 后者才是"版本与发布不一致"。原先两条换核路径对任何 curl 失败都只说后者, 于是一次
+# 超时会把人送去 Release 页面翻版本号, 而真正要查的是这台机器出不出得去。
+# 两条路径共用同一份分类, 免得日后只改一边。
+_core_dl_reason(){   # $1=curl 退出码 $2=目标的人话名字
+  case "$1" in
+    6)     c_y "  域名解析失败($2)。这是网络问题, 不是版本问题。";;
+    7)     c_y "  连不上($2): TCP 连接失败。这是网络问题, 不是版本问题。";;
+    28)    c_y "  下载超时($2): 超过连接或总时长上限。这是网络问题, 不是版本问题。";;
+    35|56) c_y "  连接被中断($2): TLS 握手或接收失败。这是网络问题, 不是版本问题。";;
+    22)    c_y "  服务器返回 HTTP 错误($2): 该版本的产物可能不存在 —— 这一条才是版本与发布不一致。";;
+    *)     c_y "  下载失败($2, curl 退出码 $1): 既不能当作已更新, 也不要按版本问题去查。";;
+  esac
+}
+
+# 换核取件的超时上限。180s 沿用同仓库 Caddy 取件那条既有约定(同一类: GitHub Release
+# 上几十 MB 的二进制)。连接超时仓库里没有先例, 取 10s —— 够一次正常的 DNS+TCP+TLS,
+# 又能把黑洞路由很快判死; 它远小于总时长, 所以在能连通的机器上永远不是那个起作用的限。
+PDG_CORE_CONNECT_TIMEOUT=10
+PDG_CORE_MAX_TIME=180
+
 _update_core_binary(){
-  local march ver tmp bindir   # v1.6.0: mihomo 是唯一内核
+  local march ver tmp bindir crc   # v1.6.0: mihomo 是唯一内核
   bindir="$(_core_bindir)"
   # shellcheck source=/dev/null
   # 读不到 versions.sh 就无从知道该装哪个版本 —— 以前"跳过"后照报成功, 实际内核可能没升上去。
   source "$REPO_DIR/lib/versions.sh" 2>/dev/null \
     || { c_y "读不到 versions.sh, 无法确认内核目标版本"; return 1; }
   march=$(dpkg --print-architecture 2>/dev/null); [[ "$march" == arm64 ]] || march=amd64
-  tmp=$(mktemp -d)
   ver="$MIHOMO_VER"
   # 短路判据按**内容**判(与 install.sh、doctor 同一个函数、同一份钉值)。旧判据
   # pdg_mihomo_is_version 问的是 PATH 上的 mihomo 且只比自报版本 —— PATH 上一个自报
   # v1.19.30 的壳, 或者把 /usr/local/bin/mihomo 内容换掉而版本串留着, 都能让整段换核
   # 被跳过, 而日志上连"更新 mihomo 内核"这行都不会出现。
-  pdg_mihomo_binary_ok "$march" "$ver" "$bindir/mihomo" && { rm -rf "$tmp"; return 0; }
+  # 短路排在**申请工作区之前**: 无事可做的路径不该因为建不出临时目录而失败, 也不该先
+  # 建一个下一行就要删掉的目录。
+  pdg_mihomo_binary_ok "$march" "$ver" "$bindir/mihomo" && return 0
   c_g "更新 mihomo 内核 → $ver …"
-  curl -fsSL "https://github.com/MetaCubeX/mihomo/releases/download/${ver}/mihomo-linux-${march}-${ver}.gz" -o "$tmp/m.gz" \
-    || { c_y "  下载失败(版本与发布不一致, 不能当作已更新)"; rm -rf "$tmp"; return 1; }
+  # 裸 `tmp=$(mktemp -d)` 在 set -uo pipefail(**无 -e**)下会留下空串继续跑, 下载目标于是
+  # 从 "$tmp/m.gz" 退化成 **/m.gz** —— 这段以 root 运行。建不出来就地停住, 并且说清是
+  # 工作区的问题, 不冒充网络或摘要失败。
+  if ! tmp="$(_pdg_mktemp_dir)"; then
+    c_y "  无法创建临时目录 → 未取件, 现有内核一字节未动"; return 1
+  fi
+  curl -fsSL --connect-timeout "$PDG_CORE_CONNECT_TIMEOUT" --max-time "$PDG_CORE_MAX_TIME" \
+    "https://github.com/MetaCubeX/mihomo/releases/download/${ver}/mihomo-linux-${march}-${ver}.gz" -o "$tmp/m.gz"
+  crc=$?
+  if [[ "$crc" != 0 ]]; then
+    _core_dl_reason "$crc" "mihomo $ver ($march)"; rm -rf "$tmp"; return 1
+  fi
   pdg_verify_sha256 "$tmp/m.gz" "${PDG_SHA256[mihomo-$march]:-}" "mihomo $ver ($march)" \
     || { c_y "  SHA 校验失败 → 判为更新失败(不降级成警告后继续)"; rm -rf "$tmp"; return 1; }
   gunzip -c "$tmp/m.gz" > "$tmp/mihomo" || { c_y "  解压失败"; rm -rf "$tmp"; return 1; }
@@ -1720,7 +1752,7 @@ _update_core_binary(){
 # 注意与 _update_core_binary 的返回约定一致: 下载或校验失败**不降级成警告**, 因为
 # 更新后的 doctor 判据会拿新钉值去比这个文件, 留在旧版就是一次注定翻车的更新。
 _update_mosdns_binary(){
-  local march ver tmp bindir
+  local march ver tmp bindir crc
   bindir="$(_core_bindir)"
   # shellcheck source=/dev/null
   source "$REPO_DIR/lib/versions.sh" 2>/dev/null \
@@ -1734,9 +1766,17 @@ _update_mosdns_binary(){
   command -v unzip >/dev/null 2>&1 \
     || { c_y "  没有 unzip, 解不开 mosdns 官方产物(zip) → 判为更新失败"; return 1; }
   c_g "更新 mosdns → $ver …"
-  tmp=$(mktemp -d)
-  curl -fsSL "https://github.com/IrineSistiana/mosdns/releases/download/${ver}/mosdns-linux-${march}.zip" -o "$tmp/m.zip" \
-    || { c_y "  下载失败(版本与发布不一致, 不能当作已更新)"; rm -rf "$tmp"; return 1; }
+  # 与 mihomo 那条对称: 裸 `tmp=$(mktemp -d)` 在 set -uo pipefail(**无 -e**)下会留下空串
+  # 继续跑, 下载目标退化成 **/m.zip**。建不出来就地停住, 并说清是工作区的问题。
+  if ! tmp="$(_pdg_mktemp_dir)"; then
+    c_y "  无法创建临时目录 → 未取件, 现有 mosdns 一字节未动"; return 1
+  fi
+  curl -fsSL --connect-timeout "$PDG_CORE_CONNECT_TIMEOUT" --max-time "$PDG_CORE_MAX_TIME" \
+    "https://github.com/IrineSistiana/mosdns/releases/download/${ver}/mosdns-linux-${march}.zip" -o "$tmp/m.zip"
+  crc=$?
+  if [[ "$crc" != 0 ]]; then
+    _core_dl_reason "$crc" "mosdns $ver ($march)"; rm -rf "$tmp"; return 1
+  fi
   pdg_verify_sha256 "$tmp/m.zip" "${PDG_SHA256[mosdns-$march]:-}" "mosdns $ver ($march)" \
     || { c_y "  压缩包 SHA 校验失败 → 判为更新失败(不降级成警告后继续)"; rm -rf "$tmp"; return 1; }
   ( cd "$tmp" && unzip -qo m.zip mosdns ) >/dev/null 2>&1 \

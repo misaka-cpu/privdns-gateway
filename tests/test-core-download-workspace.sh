@@ -23,6 +23,7 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/pdg-coredl.XXXXXX")"; trap 'rm -rf "$WORK"' EXIT
+: > "$WORK/notfound.log"
 pass=0; nfail=0
 ok(){ echo "[OK]   $1"; pass=$((pass+1)); }
 bad(){ echo "[FAIL] $1"; nfail=$((nfail+1)); }
@@ -32,10 +33,14 @@ source "$ROOT/tests/repoguard.sh"
 xt(){  sed -n "/^$1(){/,/^}/p" "$ROOT/deploy/bot/pdg.sh"; }
 xtv(){ sed -n "/^$1(){/,/^}/p" "$ROOT/lib/versions.sh"; }
 
-for f in _update_core_binary _update_mosdns_binary _core_bindir; do
+# 闭包清单。少抽一个就是 127, 而 127 会被下游判据当成普通返回值吞掉 —— 见 HANDOFF §9.11。
+# 末尾还有一条 command not found 的运行期记账兜底。
+for f in _update_core_binary _update_mosdns_binary _core_bindir _pdg_mktemp_dir; do
   [[ -n "$(xt "$f")" ]] || { echo "[FAIL] pdg.sh 里抽不到 $f"; echo "通过 0, 失败 1"; exit 1; }
 done
-ok "从 deploy/bot/pdg.sh 抽到两条换核取件函数与 _core_bindir"
+ok "从 deploy/bot/pdg.sh 抽到两条换核取件函数与 _core_bindir / _pdg_mktemp_dir"
+# 超时常量从 pdg.sh 原样取, 不在测试里另写一份数值(写两份迟早漂开)
+TMO="$(grep -E '^PDG_CORE_(CONNECT_TIMEOUT|MAX_TIME)=' "$ROOT/deploy/bot/pdg.sh")"
 
 # ── 夹具 ─────────────────────────────────────────────────────────────────────
 BIN="$WORK/bin"; mkdir -p "$BIN"
@@ -82,13 +87,17 @@ run(){
       unzip(){ echo "unzip" >> "$CALLS"; return 1; }
       gunzip(){ echo "gunzip" >> "$CALLS"; return 1; }
       _core_swap_verify(){ echo "swap" >> "$CALLS"; return 0; }
+      '"$TMO"'
       '"$(xt _core_bindir)"'
+      '"$(xt _pdg_mktemp_dir)"'
+      '"$(xt _core_dl_reason)"'
       '"$(xt _update_core_binary)"'
       '"$(xt _update_mosdns_binary)"'
       "$1"' _ "$fn" 2>&1
   ) || rc=$?
   printf '%s\n' "$rc"
   printf '%s' "$out" > "$WORK/out.txt"
+  grep -F 'command not found' <<<"$out" >> "$WORK/notfound.log" 2>/dev/null || true
 }
 ncalls(){ local n; n="$(grep -c "^$1" "$WORK/calls.log" 2>/dev/null)"; printf '%s\n' "${n:-0}"; }
 argv(){ tr '\0' '\n' < "$WORK/argv.log" 2>/dev/null; }
@@ -173,6 +182,11 @@ for spec in "mosdns|_update_mosdns_binary" "mihomo|_update_core_binary"; do
     && bad "[$nm] 把网络超时冒充成「版本与发布不一致」—— 排错方向整个偏掉" \
     || ok "[$nm] 没有把超时冒充成版本问题"
 done
+
+
+[[ ! -s "$WORK/notfound.log" ]] \
+  && ok "闭包完整: 一条 command not found 都没有(127 不会被判据当普通返回值吞掉)" \
+  || bad "闭包漏桩: $(grep -oE '[A-Za-z0-9_]+: command not found' "$WORK/notfound.log" | sort -u | tr '\n' ' ')"
 
 echo "────────────────────────────────────────"
 echo "通过 $pass, 失败 $nfail"
