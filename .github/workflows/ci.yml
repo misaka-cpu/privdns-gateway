@@ -130,6 +130,27 @@ jobs:
       - name: "校验并安装钉定 mosdns (自算 SHA / manifest 交叉 / 自报版本 / 生产判据)"
         run: sudo -E bash tests/install-mosdns-artifact.sh /tmp/mosdns-fixture
 
+      # 需要真内核的测试共用这一份, 放到 tests/.bin/。**必须排在所有用例之前** —— 它以前
+      # 紧挨着自己的消费者放在半程, 而 test-migrate-drop-singbox.sh 排在它前面就跑了。
+      # v1.11.7 把装核判据收紧成"问绝对路径上的真文件 + 内容摘要"之后, 那支用例的沙箱根里
+      # 没有钉死版可播, 判据恒假 → 每跑一次真去 GitHub 下 8 次 mihomo。它不报错、断言数不变、
+      # 照样全绿, 只是从确定性测试退化成网络运气的函数, 直到 run 33455929038 撞上一次
+      # connection reset 才红。**备件排在哪一步, 本身就是判据的一部分。**
+      # 取件**不在这里做** —— 走与 mosdns
+      # 同一个 artifact(producer 每 run 每架构只取一次件), 这里只做四层复核后装到位。
+      # 以前这一步自己跑准备脚本, 那样全 run 就有两处取件(这里一处、producer 一处),
+      # 而 tests/test-rescue-sets.py 正是钉着"只准备一次"这条(判据按字面数出现次数,
+      # 所以这段注释也不能把那条命令原样写出来)。
+      # CI 上必须**严格模式** —— 缺二进制要判失败, 不许把关键校验变成绿灯跳过。
+      # 这一步**不需要 sudo**(与同 job 的 mosdns 步不同): 它装到工作区的 tests/.bin/,
+      # 不写 /usr/local/bin。容器里的 e2e 各 job 则是本来就 root、镜像里没有 sudo。
+      - name: "校验并安装钉定 mihomo 到 tests/.bin (自算 SHA / manifest 交叉 / 自报版本 / 生产判据)"
+        run: |
+          set -euo pipefail
+          mkdir -p tests/.bin
+          bash tests/install-mihomo-artifact.sh /tmp/mosdns-fixture "" "$PWD/tests/.bin/mihomo"
+
+
 
       - name: Python 语法 (py_compile)
         run: python3 -m py_compile deploy/bot/*.py tests/*.py
@@ -472,6 +493,9 @@ jobs:
       - name: "pipefail + grep -q 条件反转守卫 (只拦真风险: 整体透传 >64KiB 文件)"
         run: python3 tests/test-pipefail-grepq-guard.py
 
+      - name: "沙箱夹具不得偷偷联网 (抽了含 curl 的生产函数就必须自带禁令桩)"
+        run: python3 tests/test-fixture-network-guard.py
+
       - name: "E2E 夹具必须播真 mosdns (shell 假桩被生产判据拒绝 / 真钉定二进制被接受 / 夹具不联网)"
         run: python3 tests/test-e2e-mosdns-fixture.py
 
@@ -745,20 +769,6 @@ jobs:
 
       - name: "渲染判废默认安全 (pdgtx 缺失/损坏/旧版时 str/repr/审计均不含用户值)"
         run: python3 tests/test-render-refusal.py
-
-      # 需要真内核的测试共用这一份, 放到 tests/.bin/。取件**不在这里做** —— 走与 mosdns
-      # 同一个 artifact(producer 每 run 每架构只取一次件), 这里只做四层复核后装到位。
-      # 以前这一步自己跑准备脚本, 那样全 run 就有两处取件(这里一处、producer 一处),
-      # 而 tests/test-rescue-sets.py 正是钉着"只准备一次"这条(判据按字面数出现次数,
-      # 所以这段注释也不能把那条命令原样写出来)。
-      # CI 上必须**严格模式** —— 缺二进制要判失败, 不许把关键校验变成绿灯跳过。
-      # 这一步**不需要 sudo**(与同 job 的 mosdns 步不同): 它装到工作区的 tests/.bin/,
-      # 不写 /usr/local/bin。容器里的 e2e 各 job 则是本来就 root、镜像里没有 sudo。
-      - name: "校验并安装钉定 mihomo 到 tests/.bin (自算 SHA / manifest 交叉 / 自报版本 / 生产判据)"
-        run: |
-          set -euo pipefail
-          mkdir -p tests/.bin
-          bash tests/install-mihomo-artifact.sh /tmp/mosdns-fixture "" "$PWD/tests/.bin/mihomo"
 
       - name: "mihomo 完整性闭包 (绝对路径+退出码+自报版本+内容摘要; PATH 影子无效; 内容漂移仍可修)"
         run: bash tests/test-mihomo-integrity.sh
