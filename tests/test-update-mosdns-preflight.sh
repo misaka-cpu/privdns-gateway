@@ -83,6 +83,7 @@ ask(){           # $1=二进制路径 → "rc|输出"
   local rc=0 out
   out=$(REPO_DIR="$WORK/vrepo" bash -c "
     c_y(){ echo \"\$*\"; }
+    c_g(){ echo \"\$*\"; }
     REPO_DIR='$WORK/vrepo'
     source '$WORK/pre.sh'
     _update_mosdns_preflight '$1'" 2>&1) || rc=$?
@@ -96,14 +97,13 @@ declare -A CASE=(
   ["文件不存在"]='rm -f "$BIN/mosdns"'
   ["执行不了"]='cp "$WORK/mosdns.good" "$BIN/mosdns"; chmod 644 "$BIN/mosdns"'
   ["version 命令非零"]='printf "#!/bin/sh\nexit 3\n" > "$BIN/mosdns"; chmod 755 "$BIN/mosdns"'
-  ["自报版本不符"]='mkmosdns v1.2.3 "$BIN/mosdns"'
   ["摘要不符"]='mkmosdns v9.9.9 "$BIN/mosdns"; printf "\n# tampered\n" >> "$BIN/mosdns"'
 )
 declare -A WANT=(
   ["文件不存在"]='不存在'  ["执行不了"]='执行不了'  ["version 命令非零"]='命令非零'
-  ["自报版本不符"]='版本不符'  ["摘要不符"]='摘要不符'
+  ["摘要不符"]='摘要不符'
 )
-for k in "文件不存在" "执行不了" "version 命令非零" "自报版本不符" "摘要不符"; do
+for k in "文件不存在" "执行不了" "version 命令非零" "摘要不符"; do
   eval "${CASE[$k]}"
   r=$(ask "$BIN/mosdns"); rc="${r%%|*}"; out="${r#*|}"
   [[ "$rc" != 0 ]] && ok "[$k] 预检拒绝(rc=$rc)" || bad "[$k] 预检竟然放行"
@@ -111,9 +111,30 @@ for k in "文件不存在" "执行不了" "version 命令非零" "自报版本�
     || bad "[$k] 原因不具名(期望含 ${WANT[$k]}): $(tr '\n' ' ' <<<"$out" | cut -c1-120)"
   grep -q 'mosdns' <<<"$out" && ok "[$k] 点名了是 mosdns" || bad "[$k] 没点名组件"
 done
+echo
+echo "══ 3A-bis. 版本漂移 ≠ 故障: 预检必须放行, 交给换核路径收敛 ══"
+# 契约在 _update_mosdns_binary 落地那天变了。在此之前"自报版本不符"是拒绝理由, 因为
+# 当时**没有任何东西**能把它修回去; 现在更新过程里就有一步专门做这件事, 再拦就等于
+# 把唯一的修复路径也堵死(与 _update_in_sync 的取向一致)。
+mkmosdns v1.2.3 "$BIN/mosdns"
+r=$(ask "$BIN/mosdns"); rc="${r%%|*}"; out="${r#*|}"
+[[ "$rc" == 0 ]] && ok "[自报版本不符] 预检放行(本次更新会把它收敛到钉死版)" \
+  || bad "[自报版本不符] 仍被拒绝(rc=$rc) —— 换核路径已经存在, 这条拦截把修复路堵死了: $out"
+grep -q '收敛' <<<"$out" && ok "[自报版本不符] 明说了会收敛, 不是闷声放行" \
+  || bad "[自报版本不符] 放行但没说为什么: $(tr '\n' ' ' <<<"$out" | cut -c1-120)"
+grep -qE 'v1\.2\.3' <<<"$out" && ok "[自报版本不符] 点出了实际跑的版本" \
+  || bad "[自报版本不符] 没说清跑的是哪一版: $(tr '\n' ' ' <<<"$out" | cut -c1-120)"
+# 而"版本对得上、内容不符"必须**仍然**拒绝 —— 那是篡改形态, 不是版本漂移。
+# 这两格是一对: 放松了前者却顺手放松后者, 等于让一次例行更新悄悄抹掉一个安全事件。
+mkmosdns v9.9.9 "$BIN/mosdns"; printf "\n# tampered\n" >> "$BIN/mosdns"
+r=$(ask "$BIN/mosdns"); rc="${r%%|*}"
+[[ "$rc" != 0 ]] && ok "[摘要不符] 放松版本判据之后, 篡改形态仍然被拒绝(rc=$rc)" \
+  || bad "[摘要不符] 竟然也被放行了 —— 换核路径不该顺手覆盖掉一个被篡改的二进制"
+
+echo
 # 读不到 versions.sh / 架构无钉值 → 一样拒绝(fail-closed)
 cp "$WORK/mosdns.good" "$BIN/mosdns"; chmod 755 "$BIN/mosdns"
-r=$(REPO_DIR="$WORK/nosuch" bash -c "c_y(){ echo \"\$*\"; }; REPO_DIR='$WORK/nosuch'; source '$WORK/pre.sh'; _update_mosdns_preflight '$BIN/mosdns'" 2>&1; echo "rc=$?")
+r=$(REPO_DIR="$WORK/nosuch" bash -c "c_y(){ echo \"\$*\"; }; c_g(){ echo \"\$*\"; }; REPO_DIR='$WORK/nosuch'; source '$WORK/pre.sh'; _update_mosdns_preflight '$BIN/mosdns'" 2>&1; echo "rc=$?")
 grep -q 'rc=1' <<<"$r" && ok "读不到 versions.sh → 拒绝(fail-closed, 不在存疑时动手)" \
   || bad "读不到 versions.sh 却放行了: $r"
 
@@ -147,6 +168,7 @@ install(){ printf 'install %s
 ' "$*" >> "$WORK/side.log"; return 0; }
 bash(){ [[ "$*" == *__migrate* ]] && { echo migrate >> "$WORK/side.log"; return 0; }; command bash "$@"; }
 _update_core_binary(){ echo core >> "$WORK/side.log"; return 0; }
+_update_mosdns_binary(){ echo mosbin >> "$WORK/side.log"; return 0; }
 systemctl(){ printf 'systemctl %s
 ' "$*" >> "$WORK/side.log"; return 0; }
 python3(){ case "$*" in *py_compile*) return 0;;
