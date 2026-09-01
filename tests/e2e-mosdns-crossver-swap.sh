@@ -207,6 +207,42 @@ grep -q '已还原到盘上' <<<"$out" \
   && ok "文案分清了「文件已还原」与「服务没回来」" || bad "文案没分清: $out"
 [[ -e "$XV_BINDIR/mosdns" ]] && ok "盘上仍留有内核文件(证据没被抹掉)" || bad "把现场删空了"
 
+# 6c: 备份内容与登记的摘要对不上 → 必须在重启之前就拒绝。
+# 备份是"退路"的全部内容; 它要是被换过, 还原就等于把一个来路不明的文件装上去再起服务。
+out6c="$(REPO_DIR="$XV_WORK/repo" PDG_CORE_BINDIR="$XV_BINDIR" \
+  bash -c 'source "$0"; cp -a "$1" "$2/.mosdns.pdg-prev.bad"
+           _core_restore_prev mosdns "$2" "$2/.mosdns.pdg-prev.bad" deadbeef' \
+  "$H" "$OLDBIN" "$XV_BINDIR" 2>&1)"; rc6c=$?
+[[ "$rc6c" != 0 ]] && ok "6c: 备份摘要对不上 → 还原被拒(返回非零)" || bad "6c: 摘要不符却还原了"
+grep -q '校验和与备份不符' <<<"$out6c" \
+  && ok "6c: 点名是校验和不符, 不是笼统失败" || bad "6c: 原因没点名: $out6c"
+rm -f "$XV_BINDIR"/.mosdns.pdg-prev.*
+
+# 6d: **直打恢复路径**的限速。_core_swap_verify 里新核那次 restart 会先把计数清掉, 于是
+# 恢复时预算总是新的 —— 恢复侧那句 reset-failed 在"换核已经重启过新核"的路径上被上游遮住了。
+# 它真正要保住的是**还没走到新核 restart 就失败**的那几条(装不上去 / 配置检查不过), 那时
+# 预算还是进函数时的样子。这里把预算真正打满, 再直接调 _core_restore_prev, 让那句话单独受检。
+reset_site || die "复位失败"
+SLB6="$(systemctl show "$XV_UNIT" -p StartLimitBurst --value)"
+for ((i=0;i<=${SLB6:-5};i++)); do systemctl restart "$XV_UNIT" >/dev/null 2>&1; done
+if systemctl restart "$XV_UNIT" >/dev/null 2>&1; then
+  bad "6d 前提不成立: 预算没打满(burst=$SLB6), 这一格测不到目标形态"
+else
+  ok "6d 前提: 预算已打满, 裸 restart 被 systemd 拒"
+  cp -a "$OLDBIN" "$XV_WORK/goodbak"
+  out6d="$(REPO_DIR="$XV_WORK/repo" PDG_CORE_BINDIR="$XV_BINDIR" \
+    bash -c 'source "$0"; cp -a "$1" "$2/.mosdns.pdg-prev.good"
+             _core_restore_prev mosdns "$2" "$2/.mosdns.pdg-prev.good" "$(_pdg_sha "$1")"' \
+    "$H" "$XV_WORK/goodbak" "$XV_BINDIR" 2>&1)"; rc6d=$?
+  [[ "$rc6d" == 0 ]] \
+    && ok "6d: 预算打满时, _core_restore_prev 自己就能把旧核带回来(恢复侧的 reset-failed 起作用)" \
+    || bad "6d: 预算打满时恢复失败(rc=$rc6d): $out6d"
+  xv_wait_listeners 3 >/dev/null 2>&1
+  { [[ "$(systemctl is-active "$XV_UNIT")" == active ]] && xv_dns_ok; } \
+    && ok "6d: 恢复后服务 active 且 DNS 可查" || bad "6d: 恢复后服务没起来"
+  rm -f "$XV_BINDIR"/.mosdns.pdg-prev.*
+fi
+
 # 6b: systemd 直接**拒绝** start 的那条分支。Type=simple 下 `systemctl restart` 对"起来就退"
 # 的进程是返回 0 的(失败由 _core_kernel_stable 抓), 所以真现场里走不到那条分支 —— 修好之后
 # 更走不到(限速已经被清掉了)。这里只把 systemctl restart 打成非零来验**文案**: 拒绝时必须
