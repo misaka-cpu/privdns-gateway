@@ -70,8 +70,8 @@ CELLS = [
      "integrity", "二次核验"),
 
     ("换核短路退回只比版本", PDG,
-     '  pdg_mihomo_binary_ok "$march" "$ver" "$bindir/mihomo" && { rm -rf "$tmp"; return 0; }',
-     '  pdg_mihomo_is_version "$ver" && { rm -rf "$tmp"; return 0; }',
+     '  pdg_mihomo_binary_ok "$march" "$ver" "$bindir/mihomo" && return 0',
+     '  pdg_mihomo_is_version "$ver" && return 0',
      "swap", "内容漂移"),
 
     ("换核不再核解压产物", PDG,
