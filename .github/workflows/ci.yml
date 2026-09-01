@@ -970,7 +970,7 @@ jobs:
   core-startlimit:
     needs: prepare-mosdns-fixture
     runs-on: ubuntu-latest
-    name: "真 systemd: 换核回滚必须穿过 systemd 启动限速"
+    name: "真 systemd: 换核回滚闭环与真实跨版本换核"
     # 为什么单独一个 job 而不是并进 lint: 它要写 unit、起真服务、读 journal。lint 里那些
     # 用例一个都不需要这些, 混进去等于让两百多支测试跟着一次 systemd 现场一起红。
     env:
@@ -1000,6 +1000,11 @@ jobs:
         run: bash tests/install-mosdns-legacy-artifact.sh /tmp/mosdns-fixture "" "$PWD/tests/.bin/mosdns-legacy"
       - name: "换核回滚穿过启动限速 (真 v5.3.3 + 真 systemd; 八项排除法钉死第一失败点)"
         run: sudo -E env PDG_TEST_MOSDNS_LEGACY="$PWD/tests/.bin/mosdns-legacy" bash tests/e2e-core-startlimit-recovery.sh
+      - name: "真实跨版本换核 (v5.3.3→v5.3.4; 成功/起不来/限速/监听漂移/快照回滚/恢复失败/幂等 七格)"
+        run: |
+          sudo -E env PDG_TEST_MOSDNS="$PWD/tests/.bin/mosdns" \
+                      PDG_TEST_MOSDNS_LEGACY="$PWD/tests/.bin/mosdns-legacy" \
+                      bash tests/e2e-mosdns-crossver-swap.sh
       - name: "收尾: 现场必须不留 unit/进程/端口"
         if: always()
         run: |

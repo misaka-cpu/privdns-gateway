@@ -30,6 +30,7 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
+# shellcheck disable=SC2034  # 给 e2e-lib-crossver.sh 用, shellcheck 看不到跨文件
 XV_ROOT="$ROOT"
 pass=0; nfail=0
 ok(){ echo "[OK]   $1"; pass=$((pass+1)); }
