@@ -2,6 +2,63 @@
 
 本项目按语义化 `v1.x` tag 正式发布;以下按版本/日期记录主要变化,完整提交见 git 历史。
 
+## 2026-09-01 — v1.11.8(一支测试悄悄改行去下载了)
+
+**只动测试与 CI, 不动任何生产代码。** 装机、更新、换核、迁移的行为一字未改。
+
+### main 上那个红灯不是 flake
+
+`f47c74ab` 的 lint 红在 `tests/test-migrate-drop-singbox.sh` 第 2 格, 表层是
+`curl: (35) Recv failure: Connection reset by peer`。根因在 v1.11.7:
+
+那一版把 `_activate_mihomo_core` 的跳过判据从 `pdg_mihomo_is_version`(只问自报版本、走 PATH)
+换成 `pdg_mihomo_binary_ok`(问绝对路径上的真文件 + 内容摘要)。**生产侧这是对的**, 它堵的正是
+上一版列的那个后门。但这支测试的 `mihomo()` 只是个 shell 函数桩、沙箱根里从来没有那个文件,
+判据于是恒假 —— 它从 v1.11.7 起**每跑一次就真去 GitHub 下 8 次 mihomo**(约 100MB/run)。
+
+这个退化没有任何信号: 不报错、断言数不变、照样 18/0。它只是从"确定性测试"变成了"网络运气的
+函数"。v1.11.7 那次绿、PR #53 那次绿, 在这一格上都是运气而不是证据。同时这也违反了本项目
+自己定的一条: 不给每个 job 新增 Release 下载。
+
+### 顺手挖出的第二处: 一道 P0 门在这支测试里一直是空操作
+
+`_pdg_nft_foreign_input_chains` 与 `_nft_apply_main` 定义在 `pdg.sh` 里, 但既没被抽进沙箱闭包、
+也没打桩。缺失的函数返回 127, 而 127 会被下游判据当成一个**普通返回值**吞掉:
+
+- 前者的契约是 `0`=发现别的 input base chain、`2`=判不了、其余=干净。127 从 `==2` 和 `==0`
+  两个分支之间穿过去 → 被当成"现场干净"。于是"迁移前发现外来 input 链就必须中止"这道 P0 门
+  (v1.6.0 加的)在这支测试的全部 18 格里都没跑过。
+- 后者是回滚时把恢复出来的 `nftables.conf` 真正应用回内核。缺桩 = 回滚只拷了文件、从没应用,
+  而只看 backend 标记的断言照样绿。
+
+两道门在别处仍有覆盖(`tests/e2e-custom-nft.sh` / `tests/test-nft-input-scan.py`), 所以是
+"这支单元测试从没真跑过它们", 不是"没人管"。
+
+### 改了什么
+
+- **`tests/test-migrate-drop-singbox.sh`**: 沙箱根里播**真的钉死版 mihomo**(装前验源、装后再验,
+  判据用生产那一个 `pdg_mihomo_binary_ok`, 不是"能跑就行"); 补上两个漏掉的桩; 新增
+  `_pdg_nft_foreign_input_chains` 的正反用例(发现外来链 → 中止且现场未被改动; 判不了 → 同样
+  中止, 不当成干净)与两条"回滚真的把 nft 应用回去了"。18 → 26 格。
+- **夹具自证两条**(不验业务, 只验前提): 全程零联网 —— harness 里的 `curl` 是**记账 + 失败**的
+  禁令桩, 谁再让沙箱联网, 断言直接点名 URL; 闭包完整 —— 任何一次 `command not found` 都记硬
+  失败, 127 不会再被判据当普通返回值吞掉。第二条在本轮当场就逮出了 `_nft_apply_main`。
+- **`tests/test-fixture-network-guard.py`**(新, 静态守卫): 凡是把"函数体里有 curl"的生产函数抽进
+  沙箱执行的 lint 用例, 必须自带 curl 禁令桩。规则只覆盖真有联网能力的闭包, 不搞人人都要绕的
+  形式主义; 判据源自己也有自检(认不出 `_activate_mihomo_core` 含 curl 就判自己失效)。
+- **`.github/workflows/ci.yml`**: 把 lint 里"装钉定 mihomo 到 `tests/.bin`"那一步**前移到所有用例
+  之前**。件本来就在同一个 artifact 里(producer 每 run 每架构只取一次), 以前它紧挨着自己的
+  消费者放在半程, 而这支用例排在它前面就跑了。**备件排在哪一步, 本身就是判据的一部分。**
+- **`tests/negctl/migrate-singbox-fixture-negative-controls.py`**(新, 本地跑不进 CI): 9 格负控 +
+  正控 + 反向对照, 逐格改坏播种/闭包/P0 门/静态守卫, 要求目标测试变红**且红在该红的那一条上**。
+  本轮 14/0 —— 其中两格先红在我自己写错的预期上, 改的是负控不是代码。
+
+### 证据
+
+`test-migrate-drop-singbox.sh` 26/0, PATH 上挂 curl 探针实测**真实网络调用 0 次**(修复前同一棵树
+实测 8 次); 负控 14/0; 静态守卫 4/0; `test-ci-mosdns-topology.py` 68/0(真解析 YAML);
+lint 全量 205 支回归。
+
 ## 2026-08-31 — v1.11.7(mihomo 的完整性判据一直在说谎)
 
 **建议升。** 没有配置格式变化, 升完不需要做任何事。这一版**不动任何运行行为** —— 改的是
