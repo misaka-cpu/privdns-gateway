@@ -186,10 +186,11 @@ try:
 
     # 钉死版 mihomo 备到工作副本(不落正式树)。干净 netns 里只有 lo, 下不了东西 ——
     # 必须在进 netns **之前**备好并放上 PATH, 让 mihomo_usable() 走"用现有 mihomo"。
-    bindir = Path(wd) / "bin"
+    # 用 prepare-mihomo.sh 的默认缓存(ROOT/tests/.bin, 已 gitignore): 负控会拿改坏过的
+    # 副本反复驱动这一支, 每格另下一份既慢又是白跑的公网流量。副本里带着缓存, 于是零下载。
+    bindir = ROOT / "tests/.bin"
     prep = subprocess.run(["bash", str(ROOT / "tests/prepare-mihomo.sh")],
-                          cwd=str(ROOT), capture_output=True, text=True, timeout=600,
-                          env={**os.environ, "PDG_TEST_BIN_DIR": str(bindir)})
+                          cwd=str(ROOT), capture_output=True, text=True, timeout=600)
     if not (bindir / "mihomo").exists():
         bad("备不出钉死版 mihomo, 后面每一格都无从判断: %s"
             % (prep.stderr.strip()[-200:] or prep.stdout.strip()[-200:]))
@@ -396,11 +397,27 @@ try:
             bad("⑨ 失败行有 %d 条, 预期恰好 1 条(第一次失败不许被洗掉或重复)" % nfail)
         else:
             ok("⑨ 失败取证五项齐全, 且没有重试: 一条具名失败, 0 个用例命中")
-        # 取证只读: 不许在失败路径上重启 mock 或重建表
-        if re.search(r"重启|restart|nft add table", out):
-            bad("⑨ 失败路径上出现了重启/建表动作 —— 取证必须只读")
+        # 取证必须只读 —— 判据用**行为计数**, 不用词面: 重启过 mock 就会多一行
+        # "mock-socks :", 补建过表就会多一次夹具的决策行。词面匹配只会误伤取证自己的措辞。
+        n_mock = len(re.findall(r"mock-socks :\d+", out))
+        n_note = len(NOTE_RE.findall(out))
+        if n_mock != 3:
+            bad("⑨ mock 启动行有 %d 条(预期 3)—— 失败路径上重启过出口" % n_mock)
+        elif n_note != 1:
+            bad("⑨ conntrack 决策行有 %d 条(预期 1)—— 失败路径上补建过前提" % n_note)
         else:
-            ok("⑨ 失败取证是只读的: 没有重启 mock, 也没有补建任何表")
+            ok("⑨ 失败取证只读: mock 启动行恰 3 条、conntrack 决策行恰 1 条, 都没被重来一次")
+
+        # "不重试"没有行为判据可用: 前提塌了以后重试一样失败, 从外面看不出区别。
+        # 所以这一条是**结构判据** —— check_case 每格只发一次 ClientHello。负控里把重试
+        # 加回去, 这一条必须转红(见 functional-conntrack-fixture.py 的对应格)。
+        m = re.search(r"^check_case\(\)\{(.*?)^\}", pristine, re.S | re.M)
+        n_send = len(re.findall(r"sni_client\.py", m.group(1))) if m else -1
+        if n_send == 1:
+            ok("⑨ check_case 每格只发一次 ClientHello(结构判据: 失败不许被重试洗掉)")
+        else:
+            bad("⑨ check_case 里有 %d 处 sni_client 调用(预期 1)—— 第一次失败会被重试洗掉"
+                % n_send)
 finally:
     shutil.rmtree(wd, ignore_errors=True)
 
