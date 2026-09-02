@@ -1560,6 +1560,28 @@ _core_listeners(){
 # 内核活性 + 稳定判定: 起得来, 且持续观察若干次仍在跑。
 # 只抽两次 is-active 挡不住"起来即崩": systemd 会把它反复拉起, 每次抽样都可能正好撞上
 # 刚起来的那一瞬。故再比对 NRestarts —— 观察窗口内重启计数涨了就是崩溃循环。
+# 重启一个内核 unit 之前, 先清掉它的 failed 与**启动限速计数**。
+#
+# 为什么必须成对: systemd 的 StartLimitBurst 把**成功的启动也计进去**(本轮实测: 一个完全
+# 健康的服务在 10s 窗口里第 6 次 restart 同样被拒, Result=start-limit-hit)。一次 pdg update
+# 本来就会重启若干服务, 换核自己还要重启新核、失败后再重启旧核 —— 预算用尽时 systemd 会连
+# **还原回去的那个正确旧核**一起拒掉。结果是盘上文件全对、DNS 却起不来, 而回滚判据只会说
+# "旧内核重启后未稳定运行", 看不出真正的原因。
+#
+# 只指定这一个 unit: 无参数的 reset-failed 会清掉全系统的 failed 状态, 那是别人的事。
+# reset-failed 在 unit 没进 failed 态时本来就返回非 0(那是正常的, 不算故障), 所以它的返回码
+# 不作为成败判据 —— 但输出要留着: restart 真失败时, 那句话是判断"限速到底清掉没有"的唯一线索,
+# 不能让它静默消失、把失败说成别的原因。
+_core_restart_clean(){   # $1=unit → 0=重启成功
+  local svc="$1" rfout rfrc
+  rfout="$(systemctl reset-failed "$svc" 2>&1)"; rfrc=$?
+  if ! systemctl restart "$svc" 2>/dev/null; then
+    c_y "  $svc 重启失败(先行 reset-failed rc=$rfrc${rfout:+, 输出: $rfout})"
+    return 1
+  fi
+  return 0
+}
+
 _core_kernel_stable(){
   local svc="$1" i n="${PDG_STABLE_SAMPLES:-3}" r0 r1
   r0="$(systemctl show -p NRestarts --value "$svc" 2>/dev/null)"; r0="${r0:-0}"
@@ -1602,8 +1624,15 @@ _core_restore_prev(){
       c_y "  旧内核还原后校验和与备份不符"; return 1
     fi
   fi
-  systemctl restart "$svc" 2>/dev/null || true
-  _core_kernel_stable "$svc" || { c_y "  旧内核重启后未稳定运行"; return 1; }
+  # 还原完文件才重启, 且重启之前先清限速 —— 否则文件对了、服务照样起不来(见 _core_restart_clean)。
+  if ! _core_restart_clean "$svc"; then
+    c_y "  旧内核已还原到盘上, 但服务没有恢复 —— 恢复闭包未完成, 不能当作已回退。"
+    return 1
+  fi
+  # 两条失败路径要说同一件事: 文件已经还原, 服务没回来。之前这一条只说"未稳定运行",
+  # 读的人分不清是"没还原成功"还是"还原了但起不来" —— 而这两种的处置完全不同。
+  _core_kernel_stable "$svc" \
+    || { c_y "  旧内核已还原到盘上, 但服务没有恢复(重启后未稳定运行) —— 恢复闭包未完成。"; return 1; }
 }
 
 # 内核热切(mihomo/sing-box 同一套): 备份旧核 → 装新 → 配置 check → 重启 → 活性/稳定判定。
@@ -1632,7 +1661,14 @@ _core_swap_verify(){
     _core_restore_prev "$svc" "$bindir" "$bak" "$sha" || c_y "  ⚠️ 旧版内核回退未达标, 请立即 pdg doctor"
     return 1
   fi
-  systemctl restart "$svc" 2>/dev/null || true
+  # 新核也走同一条: 装完就重启, 而这次重启同样可能撞上前面几次启动攒下的限速。
+  # restart 直接失败时立刻进恢复路径 —— 没有理由再让 _core_kernel_stable 轮询三秒去
+  # "发现"一件已经确定的事, 那三秒里 DNS 是断的。
+  if ! _core_restart_clean "$svc"; then
+    c_y "  新版内核重启失败, 已还原旧版内核"
+    _core_restore_prev "$svc" "$bindir" "$bak" "$sha" || c_y "  ⚠️ 旧版内核回退未达标, 请立即 pdg doctor"
+    return 1
+  fi
   if ! _core_kernel_stable "$svc"; then
     c_y "  新版内核重启后未稳定运行, 已还原旧版内核并重启"
     _core_restore_prev "$svc" "$bindir" "$bak" "$sha" || c_y "  ⚠️ 旧版内核回退未达标, 请立即 pdg doctor"
@@ -1672,24 +1708,56 @@ _core_swap_verify(){
 # 内核二进制更新: 比对 versions.sh 钉死版本与已装版本, 不一致则下载+SHA校验+装。
 # 关键安全: 先备份旧二进制, 用新二进制对现有配置跑 check + 重启稳定判定, 全过才切换; 失败还原旧版, 不留坏内核。
 # 返回: 0=已是钉死版/下载或校验失败(保留现版本, 非致命); 1=换核失败(已还原) → 调用方须回滚整次更新。
+# curl 退出码 → 人话原因。**把"出不去"和"那边没这个东西"分开**: 前者是网络现场,
+# 后者才是"版本与发布不一致"。原先两条换核路径对任何 curl 失败都只说后者, 于是一次
+# 超时会把人送去 Release 页面翻版本号, 而真正要查的是这台机器出不出得去。
+# 两条路径共用同一份分类, 免得日后只改一边。
+_core_dl_reason(){   # $1=curl 退出码 $2=目标的人话名字
+  case "$1" in
+    6)     c_y "  域名解析失败($2)。这是网络问题, 不是版本问题。";;
+    7)     c_y "  连不上($2): TCP 连接失败。这是网络问题, 不是版本问题。";;
+    28)    c_y "  下载超时($2): 超过连接或总时长上限。这是网络问题, 不是版本问题。";;
+    35|56) c_y "  连接被中断($2): TLS 握手或接收失败。这是网络问题, 不是版本问题。";;
+    22)    c_y "  服务器返回 HTTP 错误($2): 该版本的产物可能不存在 —— 这一条才是版本与发布不一致。";;
+    *)     c_y "  下载失败($2, curl 退出码 $1): 既不能当作已更新, 也不要按版本问题去查。";;
+  esac
+}
+
+# 换核取件的超时上限。180s 沿用同仓库 Caddy 取件那条既有约定(同一类: GitHub Release
+# 上几十 MB 的二进制)。连接超时仓库里没有先例, 取 10s —— 够一次正常的 DNS+TCP+TLS,
+# 又能把黑洞路由很快判死; 它远小于总时长, 所以在能连通的机器上永远不是那个起作用的限。
+PDG_CORE_CONNECT_TIMEOUT=10
+PDG_CORE_MAX_TIME=180
+
 _update_core_binary(){
-  local march ver tmp bindir   # v1.6.0: mihomo 是唯一内核
+  local march ver tmp bindir crc   # v1.6.0: mihomo 是唯一内核
   bindir="$(_core_bindir)"
   # shellcheck source=/dev/null
   # 读不到 versions.sh 就无从知道该装哪个版本 —— 以前"跳过"后照报成功, 实际内核可能没升上去。
   source "$REPO_DIR/lib/versions.sh" 2>/dev/null \
     || { c_y "读不到 versions.sh, 无法确认内核目标版本"; return 1; }
   march=$(dpkg --print-architecture 2>/dev/null); [[ "$march" == arm64 ]] || march=amd64
-  tmp=$(mktemp -d)
   ver="$MIHOMO_VER"
   # 短路判据按**内容**判(与 install.sh、doctor 同一个函数、同一份钉值)。旧判据
   # pdg_mihomo_is_version 问的是 PATH 上的 mihomo 且只比自报版本 —— PATH 上一个自报
   # v1.19.30 的壳, 或者把 /usr/local/bin/mihomo 内容换掉而版本串留着, 都能让整段换核
   # 被跳过, 而日志上连"更新 mihomo 内核"这行都不会出现。
-  pdg_mihomo_binary_ok "$march" "$ver" "$bindir/mihomo" && { rm -rf "$tmp"; return 0; }
+  # 短路排在**申请工作区之前**: 无事可做的路径不该因为建不出临时目录而失败, 也不该先
+  # 建一个下一行就要删掉的目录。
+  pdg_mihomo_binary_ok "$march" "$ver" "$bindir/mihomo" && return 0
   c_g "更新 mihomo 内核 → $ver …"
-  curl -fsSL "https://github.com/MetaCubeX/mihomo/releases/download/${ver}/mihomo-linux-${march}-${ver}.gz" -o "$tmp/m.gz" \
-    || { c_y "  下载失败(版本与发布不一致, 不能当作已更新)"; rm -rf "$tmp"; return 1; }
+  # 裸 `tmp=$(mktemp -d)` 在 set -uo pipefail(**无 -e**)下会留下空串继续跑, 下载目标于是
+  # 从 "$tmp/m.gz" 退化成 **/m.gz** —— 这段以 root 运行。建不出来就地停住, 并且说清是
+  # 工作区的问题, 不冒充网络或摘要失败。
+  if ! tmp="$(_pdg_mktemp_dir)"; then
+    c_y "  无法创建临时目录 → 未取件, 现有内核一字节未动"; return 1
+  fi
+  curl -fsSL --connect-timeout "$PDG_CORE_CONNECT_TIMEOUT" --max-time "$PDG_CORE_MAX_TIME" \
+    "https://github.com/MetaCubeX/mihomo/releases/download/${ver}/mihomo-linux-${march}-${ver}.gz" -o "$tmp/m.gz"
+  crc=$?
+  if [[ "$crc" != 0 ]]; then
+    _core_dl_reason "$crc" "mihomo $ver ($march)"; rm -rf "$tmp"; return 1
+  fi
   pdg_verify_sha256 "$tmp/m.gz" "${PDG_SHA256[mihomo-$march]:-}" "mihomo $ver ($march)" \
     || { c_y "  SHA 校验失败 → 判为更新失败(不降级成警告后继续)"; rm -rf "$tmp"; return 1; }
   gunzip -c "$tmp/m.gz" > "$tmp/mihomo" || { c_y "  解压失败"; rm -rf "$tmp"; return 1; }
@@ -1720,7 +1788,7 @@ _update_core_binary(){
 # 注意与 _update_core_binary 的返回约定一致: 下载或校验失败**不降级成警告**, 因为
 # 更新后的 doctor 判据会拿新钉值去比这个文件, 留在旧版就是一次注定翻车的更新。
 _update_mosdns_binary(){
-  local march ver tmp bindir
+  local march ver tmp bindir crc
   bindir="$(_core_bindir)"
   # shellcheck source=/dev/null
   source "$REPO_DIR/lib/versions.sh" 2>/dev/null \
@@ -1734,9 +1802,17 @@ _update_mosdns_binary(){
   command -v unzip >/dev/null 2>&1 \
     || { c_y "  没有 unzip, 解不开 mosdns 官方产物(zip) → 判为更新失败"; return 1; }
   c_g "更新 mosdns → $ver …"
-  tmp=$(mktemp -d)
-  curl -fsSL "https://github.com/IrineSistiana/mosdns/releases/download/${ver}/mosdns-linux-${march}.zip" -o "$tmp/m.zip" \
-    || { c_y "  下载失败(版本与发布不一致, 不能当作已更新)"; rm -rf "$tmp"; return 1; }
+  # 与 mihomo 那条对称: 裸 `tmp=$(mktemp -d)` 在 set -uo pipefail(**无 -e**)下会留下空串
+  # 继续跑, 下载目标退化成 **/m.zip**。建不出来就地停住, 并说清是工作区的问题。
+  if ! tmp="$(_pdg_mktemp_dir)"; then
+    c_y "  无法创建临时目录 → 未取件, 现有 mosdns 一字节未动"; return 1
+  fi
+  curl -fsSL --connect-timeout "$PDG_CORE_CONNECT_TIMEOUT" --max-time "$PDG_CORE_MAX_TIME" \
+    "https://github.com/IrineSistiana/mosdns/releases/download/${ver}/mosdns-linux-${march}.zip" -o "$tmp/m.zip"
+  crc=$?
+  if [[ "$crc" != 0 ]]; then
+    _core_dl_reason "$crc" "mosdns $ver ($march)"; rm -rf "$tmp"; return 1
+  fi
   pdg_verify_sha256 "$tmp/m.zip" "${PDG_SHA256[mosdns-$march]:-}" "mosdns $ver ($march)" \
     || { c_y "  压缩包 SHA 校验失败 → 判为更新失败(不降级成警告后继续)"; rm -rf "$tmp"; return 1; }
   ( cd "$tmp" && unzip -qo m.zip mosdns ) >/dev/null 2>&1 \

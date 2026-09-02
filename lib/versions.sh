@@ -115,12 +115,17 @@ pdg_mihomo_binary_ok(){
   [[ -n "$arch" && -n "$want" && -x "$bin" ]] || return 1
   exp="${PDG_SHA256[mihomo-bin-$arch]:-}"
   [[ -n "$exp" ]] || return 1
-  out="$("$bin" -v 2>/dev/null)" || return 1        # 退出码必须是 0
+  # **先证内容, 再执行。** 判据存在的理由就是"盘上这个文件可能不是官方那一份"; 在排除这件事
+  # 之前先把它跑起来, 等于假设结论。而且这个判据一定跑在最坏的现场 —— doctor 与更新前预检
+  # 就是专门去看这台机器有没有被动过手脚的, 那时它以 root 运行一个来路不明的可执行文件。
+  got="$(sha256sum "$bin" 2>/dev/null | awk '{print $1}')"
+  [[ -n "$got" && "$got" == "$exp" ]] || return 1
+  # 摘要精确一致之后才执行它读版本。版本这一关不能免: 钉值表本身可能贴错行(把别的版本的
+  # 摘要写进这一格), 那时自报版本是第二道门。仍然是**精确相等**, 不退回子串。
+  out="$("$bin" -v 2>/dev/null)" || return 1        # 退出码必须是 0(不经管道, 免得被 head 吞掉)
   out="${out%%$'\n'*}"
   [[ "$out" =~ v?([0-9]+\.[0-9]+\.[0-9]+) ]] || return 1
-  [[ "${BASH_REMATCH[1]}" == "${want#v}" ]] || return 1
-  got="$(sha256sum "$bin" 2>/dev/null | awk '{print $1}')"
-  [[ -n "$got" && "$got" == "$exp" ]]
+  [[ "${BASH_REMATCH[1]}" == "${want#v}" ]]
 }
 
 # mosdns 同理。装机曾用 `command -v mosdns` 判定 —— PATH 上有任何一个 mosdns(第三方装的、
@@ -152,11 +157,15 @@ pdg_mosdns_binary_ok(){
   [[ -n "$arch" && -n "$want" && -x "$bin" ]] || return 1
   exp="${PDG_SHA256[mosdns-bin-$arch]:-}"
   [[ -n "$exp" ]] || return 1
-  got="$("$bin" version 2>/dev/null | head -1)" || return 1
-  [[ "$got" =~ ([0-9]+\.[0-9]+\.[0-9]+) ]] || return 1
-  [[ "${BASH_REMATCH[1]}" == "${want#v}" ]] || return 1
+  # 与 mihomo 那份同序: 先证内容, 再执行(理由见上)。
   got="$(sha256sum "$bin" 2>/dev/null | awk '{print $1}')"
-  [[ -n "$got" && "$got" == "$exp" ]]
+  [[ -n "$got" && "$got" == "$exp" ]] || return 1
+  # 顺带补上一处一直没跟上的不对称: 原来这里是 `$("$bin" version | head -1)`, 退出码取的是
+  # head 的、永远为 0 —— 与 mihomo 那边 v1.11.7 已经修掉的形态一样。改成不经管道取首行。
+  got="$("$bin" version 2>/dev/null)" || return 1   # 退出码必须是 0
+  got="${got%%$'\n'*}"
+  [[ "$got" =~ ([0-9]+\.[0-9]+\.[0-9]+) ]] || return 1
+  [[ "${BASH_REMATCH[1]}" == "${want#v}" ]]
 }
 
 # pdg_verify_sha256 <文件> <期望hash> [名称]  → 不符返回非 0 并打印期望/实际

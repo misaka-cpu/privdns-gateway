@@ -36,6 +36,8 @@ HELPERS = {
     "mock_dns.py", "mock_socks.py", "sni_client.py", "e2e-lib.sh", "prepare-mihomo.sh",
     "prepare-mosdns.sh", "update_invariants.py", "lan-fixture.sh",
     "adblock-lib.sh", "adblock_upstream.py",
+    # 跨版本换核那两支共用的现场夹具与取件脚本: 被 source / 被 CI 步骤调用, 不是用例本身。
+    "e2e-lib-crossver.sh", "prepare-mosdns-legacy.sh",
 }
 
 if not os.path.exists(CI):

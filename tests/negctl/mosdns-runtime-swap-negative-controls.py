@@ -50,15 +50,16 @@ CELLS = [
      '  pdg_mosdns_is_version "$ver" && return 0',
      "test-update-mosdns-binary.sh", "短路失效"),
 
-    # ⚠️ 锚点必须带上 mosdns 独有的那行版本解析: v1.11.7 加的 pdg_mihomo_binary_ok 与本函数
-    # **尾部逐字相同**, 只取尾部的话锚点会命中 2 次, 负控自己先红。
+    # ⚠️ 锚点必须落在 mosdns 独有的那行上。两个内核判据的**摘要段逐字相同**(先证内容后执行
+    # 之后更是如此), 只取摘要段会命中 2 次、负控自己先红。mosdns 读版本用 `"$bin" version`,
+    # mihomo 用 `"$bin" -v` —— 这是两者唯一逐字不同的地方。
     ("共用判据不再比对内容(只剩版本)", os.path.join(ROOT, "lib/versions.sh"),
-     '  got="$("$bin" version 2>/dev/null | head -1)" || return 1\n'
-     '  [[ "$got" =~ ([0-9]+\\.[0-9]+\\.[0-9]+) ]] || return 1\n'
-     '  [[ "${BASH_REMATCH[1]}" == "${want#v}" ]] || return 1\n'
      '  got="$(sha256sum "$bin" 2>/dev/null | awk \'{print $1}\')"\n'
-     '  [[ -n "$got" && "$got" == "$exp" ]]',
-     '  return 0',
+     '  [[ -n "$got" && "$got" == "$exp" ]] || return 1\n'
+     '  # 顺带补上一处一直没跟上的不对称: 原来这里是 `$("$bin" version | head -1)`, 退出码取的是\n'
+     '  # head 的、永远为 0 —— 与 mihomo 那边 v1.11.7 已经修掉的形态一样。改成不经管道取首行。\n'
+     '  got="$("$bin" version 2>/dev/null)" || return 1   # 退出码必须是 0',
+     '  got="$("$bin" version 2>/dev/null)" || return 1',
      "test-update-mosdns-binary.sh", "短路跳过"),
 
     ("快照不再收 mosdns 二进制", PDG,
