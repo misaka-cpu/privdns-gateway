@@ -24,14 +24,18 @@ source "$ROOT/lib/versions.sh"
 
 WORK="$(mktemp -d)"
 PIDS=()
-NFT_TABLE=""                    # 非空 = 本次运行**确实建过**临时 conntrack 表, 清理要负责删掉
+NFT_TABLE=""                    # 非空 = 本次运行**确实建过**自有 conntrack 表, 清理要负责删掉
+CT_OWNED=0                      # 1 = 前提由本轮**自己持有**(就是 $NFT_TABLE 那一张)
+CT_FIRST=""; CT_FIRST_RC=""     # 首探只作环境观察 —— 它不再决定走不走 no-op
+CT_CLEAN_FAILED=0               # 清理没删干净: 只打一行字不够, 整支测试必须红
 # 只删本轮自己建的那一张(名字带 PID, 唯一), 不动任何既有表, 更不 flush。
 # 幂等: 没建过是 no-op; 删掉并确认不存在后注销登记, 重复调用第二次同样是 no-op。
 drop_conntrack_table(){
   [[ -n "$NFT_TABLE" ]] || return 0
   sudo -n nft delete table inet "$NFT_TABLE" 2>/dev/null
   if sudo -n nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
-    echo "[FAIL] 临时 conntrack 表 inet $NFT_TABLE 没删掉, 给现场留了残留" >&2
+    echo "[FAIL] 自有 conntrack 表 inet $NFT_TABLE 没删掉, 给现场留了残留" >&2
+    CT_CLEAN_FAILED=1
   else
     NFT_TABLE=""
   fi
@@ -54,10 +58,14 @@ dump_mihomo(){
   echo "---- mihomo 输出结束 ----" >&2
 }
 cleanup(){
+  local rc=$?
   dump_mihomo
   for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done
   rm -rf "$WORK"
   drop_conntrack_table
+  # 删不掉自有表 = 给下一个用这台机器的人留了脏现场。只打一行字等于没发生过。
+  [[ "$CT_CLEAN_FAILED" == 1 ]] && exit 1
+  exit "$rc"
 }
 trap cleanup EXIT
 fail(){ echo "[FAIL] $*" >&2; exit 1; }
@@ -71,54 +79,75 @@ esac
 # ── 0. redir 入站的前提: 本 netns 的 conntrack 必须在跟踪 ───────────────────────
 # mihomo 的 redir 入站在 accept 之后立刻 getsockopt(SOL_IP, SO_ORIGINAL_DST) 取回原始目的地
 # (理由见 deploy/firewall/nftables-mihomo.conf 开头)。那个 sockopt 由 conntrack 提供 ——
-# 本 netns 没启用 conntrack hook 时它返回 ENOENT, mihomo 于是**静默丢掉**这条连接。症状是
-# 三个出口日志全空、第一个用例卡满轮询后失败, 而 mihomo 自己一个字都不打, 完全看不出真因。
+# 拿不到时 mihomo 在 listener/redir/tcp.go 的 handleRedir 里 `conn.Close(); return`,
+# **任何日志级别都不打一个字**。症状是三个出口日志全空、第一个用例卡满轮询后失败, 完全
+# 看不出真因。
 #
-# 生产上这个前提恒成立(nft 模板自带 nat prerouting 与 ct state 两类规则), 测试里却一直靠
-# 宿主碰巧激活过 conntrack 白捡 —— runner 上捡不到就是一次假红: main 的 32722985743 与
-# 32579827324 都是这么来的, 同一份代码在别的 run 上全绿。所以这里先探, 缺了就自己建。
+# 生产上这个前提恒成立(nft 模板自带 nat prerouting 与 ct state 两类规则)。测试里必须**自己
+# 持有**它 —— v1.10.15 那一版只做到"先探一次, 探得到就 no-op", 于是整轮架在一份自己不拥有、
+# 也无法保证会一直在的外部状态上。PR #56 的 functional 红(run 33585584528)正是这个形态:
+# 首探 ORIGDST=ok, 夹具 no-op, pdgfunc 表从未创建, 0.9 秒后 mihomo 的真实 redir 流仍然拿不到
+# ORIGDST。同一个 commit 的 run 33576760292 却全绿 —— 一绿一红只说明前提不由我们掌握。
+#
+# 所以只要拿得到权限, **无论首探是 ok 还是 ENOENT 都建自己那一张表**, 并靠二次探针确认它
+# 真的生效; 首探从此只是环境观察, 不再决定走不走 no-op。这闭合的是"夹具不拥有前提"这一
+# 已证明的事实, **不是**"Azure 内核为什么偶发丢 ORIGDST"——后者本轮没有证据, 也没有结论。
 #
 # 与启动时那两行 `IP_TRANSPARENT … operation not permitted` 无关: 那是 Redir **UDP** 监听器
-# 要 CAP_NET_ADMIN, TCP 那半照常 listen 成功, 而本测试只走 TCP。非 root 跑必然有那两行,
+# 要 CAP_NET_ADMIN(mihomo 的 ReCreateRedir 里 UDP 失败后没把 err 清空, defer 又按 error 级别
+# 打了一遍, 看着像致命), TCP 那半照常 listen 成功, 而本测试只走 TCP。非 root 跑必然有那两行,
 # 它不是失败条件 —— 别去压它, 压了就再也看不见真的权限问题了。
 probe_origdst(){ python3 "$HERE/origdst_probe.py" 2>&1; }
 
 ensure_conntrack(){
-  local out rc t
-  out="$(probe_origdst)"; rc=$?
-  case "$rc" in
-    0) note "conntrack 前提已满足($out), 不建任何临时规则" ; return 0 ;;
-    3) : ;;                       # 未激活 → 往下自己建一张只属于本次运行的表
-    *) fail "conntrack 前提探不出结论($out) —— 不猜, 也不跳过" ;;
+  local t out rc
+  CT_FIRST="$(probe_origdst)"; CT_FIRST_RC=$?
+  case "$CT_FIRST_RC" in
+    0|3) : ;;                     # ok 与 ENOENT 都往下走: 有没有外部状态, 都要自己建
+    *) fail "conntrack 前提探不出结论($CT_FIRST) —— 不猜, 也不跳过" ;;
   esac
-  note "本 netns 的 conntrack 未激活($out), 建一张只属于本次运行的临时表"
-  # 缺工具时**判失败而不是跳过**: 跳过等于零覆盖, 而零覆盖会以绿灯的样子出现, 正是本项目
-  # 最怕的那种假绿 —— 真出问题时它一声不吭。
-  sudo -n true 2>/dev/null \
-    || fail "本 netns 缺 conntrack 且没有免密 sudo, 建不起前提(不跳过: 跳过等于零覆盖)"
+
   # 探 nft 用 `sudo -n nft --version`, 不用 `command -v nft`: nft 装在 /usr/sbin, 非 root 的
   # PATH 通常不含那一段 —— 按 command -v 判会把"其实有 nft 的机器"误判成没有, 平白把一次本
   # 可以自愈的运行变成硬失败。要问的是"待会那条命令跑不跑得起来", 那就照原样问一次。
-  sudo -n nft --version >/dev/null 2>&1 \
-    || fail "本 netns 缺 conntrack 且 sudo 下也调不到 nft, 建不起前提(不跳过: 跳过等于零覆盖)"
-  t="pdgfunc$$"
-  # 只**新建**一张名字唯一的表, 不 flush、不碰任何既有表。规则本身什么都不做(policy accept
-  # 加一条 ct state 匹配), 它唯一的作用是让内核为本 netns 注册 conntrack hook —— 这正是
-  # 定性实验里唯一改动的那一条: 改之前 5/5 红, 加上之后 5/5 绿。
-  sudo -n nft add table inet "$t" || fail "建临时 conntrack 表失败: inet $t"
-  NFT_TABLE="$t"                  # 建成即登记 —— 后面任何一步失败, 清理都能把它删掉
-  sudo -n nft add chain inet "$t" input '{ type filter hook input priority 0; policy accept; }' \
-    || fail "建临时 conntrack 链失败: inet $t"
-  sudo -n nft add rule inet "$t" input ct state established,related accept \
-    || fail "加 ct 规则失败: inet $t"
-  # 建完必须**再探一次**: 三条 nft 命令全都返回 0, 不等于 conntrack 真的被激活了。
-  # 少了这一步, 一个"成功但不生效"的 setup 就会冒充已准备好, 把假绿换成假红而已。
-  out="$(probe_origdst)"; rc=$?
-  [[ "$rc" == 0 ]] \
-    || fail "临时表建好了但 SO_ORIGINAL_DST 仍拿不到($out) —— 前提不成立, 不继续碰运气"
-  note "临时 conntrack 表 inet $t 已生效($out)"
+  if sudo -n true 2>/dev/null && sudo -n nft --version >/dev/null 2>&1; then
+    t="pdgfunc$$"
+    # 只**新建**一张名字唯一的表, 不 flush、不碰任何既有表。规则本身什么都不做(policy accept
+    # 加一条 ct state 匹配), 它唯一的作用是让内核为本 netns 注册 conntrack hook —— 这正是
+    # 定性实验里唯一改动的那一条: 改之前 5/5 红, 加上之后 5/5 绿。
+    sudo -n nft add table inet "$t" || fail "建自有 conntrack 表失败: inet $t"
+    NFT_TABLE="$t"                # 建成即登记 —— 后面任何一步失败, 清理都能把它删掉
+    sudo -n nft add chain inet "$t" input '{ type filter hook input priority 0; policy accept; }' \
+      || fail "建自有 conntrack 链失败: inet $t"
+    sudo -n nft add rule inet "$t" input ct state established,related accept \
+      || fail "加 ct 规则失败: inet $t"
+    # 建完必须**再探一次**: 三条 nft 命令全都返回 0, 不等于 conntrack 真的被激活了。
+    # 少了这一步, 一个"成功但不生效"的 setup 就会冒充已准备好, 把假绿换成假红而已。
+    out="$(probe_origdst)"; rc=$?
+    [[ "$rc" == 0 ]] \
+      || fail "自有表建好了但 SO_ORIGINAL_DST 仍拿不到($out) —— 前提不成立, 不继续碰运气"
+    CT_OWNED=1
+    note "自有 conntrack 表 inet $t 已生效(首探 $CT_FIRST; 复探 $out)"
+    return 0
+  fi
+
+  # 没有免密 sudo / 调不到 nft: 保留非 root 本地跑得起来的能力, 但必须把话说清楚 ——
+  # "跑得起来"和"前提是自己持有的"是两件事, 混为一谈就等于把外部运气写成了保证。
+  if [[ "$CT_FIRST_RC" == 0 ]]; then
+    note "ORIGDST 前提来自外部环境，本轮无法建立自有 conntrack 表($CT_FIRST)"
+    return 0
+  fi
+  # 缺权限时**判失败而不是跳过**: 跳过等于零覆盖, 而零覆盖会以绿灯的样子出现, 正是本项目
+  # 最怕的那种假绿 —— 真出问题时它一声不吭。
+  fail "本 netns 缺 conntrack, 且没有免密 sudo/nft, 建不起前提(不跳过: 跳过等于零覆盖)"
 }
 ensure_conntrack
+
+# CI 是权威环境: GitHub runner 有免密 sudo + nft, 所以这里必须走"自有表"那条路。这个变量只
+# 用来**收紧**判据 —— 它不跳过任何测试, 也不能把失败说成成功。
+if [[ "${GITHUB_ACTIONS:-}" == "true" && "$CT_OWNED" != 1 ]]; then
+  fail "CI 上没能建立本轮自有 conntrack 表(首探 $CT_FIRST) —— 不接受退回依赖外部状态的 no-op"
+fi
 
 # ── 1. 取 mihomo ────────────────────────────────────────────────────────────
 # PATH 上那个未必可信: 可能是别的测试留下的**桩**(只会回一句版本号), 拿它跑功能测试等于
@@ -164,7 +193,7 @@ python3 "$HERE/mock_socks.py" 11082 "$LOGD" & PIDS+=($!)
 # (JSON 即合法 YAML —— 与生产渲染出的 /etc/mihomo/config.yaml 同一形态)
 cat > "$WORK/cfg.yaml" <<'JSON'
 {
-  "log-level": "warning",
+  "log-level": "debug",
   "redir-port": 18443,
   "sniffer": {
     "enable": true,
@@ -197,10 +226,47 @@ done
 [[ "$ready" == 1 ]] || { dump_mihomo; fail "mihomo 入口 :18443 未就绪"; }
 
 # ── 4. 各 SNI 断言落到正确出口(只比对 host, 端口随入口口子) ──
+# 出口为空 = 连接在进入路由前就没了。mihomo 在那条路上一个字都不打(handleRedir 里
+# parserPacket 一失败就 close), 所以必须由测试自己把该问的问一遍。取证**只读**: 不重试、
+# 不重启任何东西、不补建任何表 —— 第一次失败仍然是失败, 洗掉它就等于把偶发红藏起来。
+diag_empty_exits(){
+  local out rc i=0 cnt="n/a" names=(exitA exitB exitDefault)
+  echo "---- 失败取证(只读: 不重试, 不改变任何状态)----" >&2
+  # ① 此刻的 SO_ORIGINAL_DST: 现在若是 ENOENT, 说明前提在跑的过程中塌了; 仍是 ok 则
+  #    ORIGDST 当场被洗清, 下一轮得往别处查。两种答案都比"三格全空"有用得多。
+  out="$(probe_origdst)"; rc=$?
+  echo "  再探 ORIGDST: rc=$rc $out" >&2
+  echo "  首探 ORIGDST: rc=$CT_FIRST_RC $CT_FIRST" >&2
+  # ② 自有表还在不在 —— 不在 = 被谁删了; 从未建 = 本轮压根没持有过前提
+  if [[ -z "$NFT_TABLE" ]]; then
+    echo "  自有 nft 表: 本轮没有建立(CT_OWNED=$CT_OWNED)" >&2
+  elif sudo -n nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
+    echo "  自有 nft 表: inet $NFT_TABLE 仍在" >&2
+  else
+    echo "  自有 nft 表: inet $NFT_TABLE **已不在了**" >&2
+  fi
+  # ③ 三个出口进程: 只问存活, 不动它们
+  for p in "${PIDS[@]:-}"; do
+    [[ "$i" -lt 3 ]] || break
+    if kill -0 "$p" 2>/dev/null; then echo "  mock ${names[$i]} pid=$p 存活" >&2
+    else                              echo "  mock ${names[$i]} pid=$p **已退出**" >&2; fi
+    i=$((i+1))
+  done
+  # ④ 只列本测试自己那四个端口 —— 不倾倒宿主的全部连接
+  echo "  本测试端口监听(11080/11081/11082/18443):" >&2
+  ss -lntH 2>/dev/null | grep -E ':(11080|11081|11082|18443)[[:space:]]' | sed 's/^/    /' >&2
+  # ⑤ conntrack 只记"在不在"与条目数, 一条连接都不打印
+  [[ -r /proc/sys/net/netfilter/nf_conntrack_count ]] \
+    && cnt="$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null)"
+  echo "  conntrack: /proc/net/nf_conntrack $([[ -e /proc/net/nf_conntrack ]] && echo 在 || echo 不在), 条目数 $cnt" >&2
+  echo "---- 失败取证结束 ----" >&2
+}
+
 check_case(){  # $1=SNI $2=期望日志文件 $3=出口名
   local sni="$1" log="$2" name="$3"
   python3 "$HERE/sni_client.py" 127.0.0.1 18443 "$sni"
   for _ in $(seq 1 30); do grep -q "^${sni}:" "$log" 2>/dev/null && { note "  $sni → $name ✓"; return 0; }; sleep 0.1; done
+  if [[ ! -s "$LOGA" || ! -s "$LOGB" || ! -s "$LOGD" ]]; then diag_empty_exits; fi
   dump_mihomo
   fail "SNI=$sni 未按预期到达 $name (A='$(tr '\n' ' ' <"$LOGA")' B='$(tr '\n' ' ' <"$LOGB")' D='$(tr '\n' ' ' <"$LOGD")')"
 }

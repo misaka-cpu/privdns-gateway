@@ -231,10 +231,10 @@ try:
         return r
 
     # 两处改坏用的锚点 —— 都取自夹具里语义唯一的那一行。
-    CT_RULE = ('  sudo -n nft add rule inet "$t" input ct state established,related accept \\\n'
-               '    || fail "加 ct 规则失败: inet $t"')
-    CT_NOOP = ('  sudo -n nft list table inet "$t" >/dev/null \\\n'
-               '    || fail "加 ct 规则失败: inet $t"')
+    CT_RULE = ('    sudo -n nft add rule inet "$t" input ct state established,related accept \\\n'
+               '      || fail "加 ct 规则失败: inet $t"')
+    CT_NOOP = ('    sudo -n nft list table inet "$t" >/dev/null \\\n'
+               '      || fail "加 ct 规则失败: inet $t"')
     CLEANUP = "\n  drop_conntrack_table\n"
 
     def mut(old, new):
