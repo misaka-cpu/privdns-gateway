@@ -40,6 +40,34 @@ trap xv_cleanup EXIT
 xv_require_env || exit 1
 ok "环境: root + 真 systemd + 真 systemctl + 无同名 unit 可覆盖"
 
+# ── 清理前像 ─────────────────────────────────────────────────────────────────
+# 判据是「结束状态 == 开始状态」, 不是「结束状态等于我以为的那个样子」。
+# 上一版把生产路径写成"摘要必须等于钉值": 在开发机上恰好成立(早前 E2E 留下的就是钉死版),
+# 在 CI 上那个文件**根本不存在** —— 于是一条"我没碰过它"的断言反而报红(run 33518310032)。
+# **「不存在」是一种合法前像**, 不是无条件豁免: 开始不存在, 结束就必须仍然不存在。
+state_of(){   # 文件的完整前像; 不存在也是一种状态
+  local p="$1"
+  [[ -e "$p" ]] || { echo "absent"; return; }
+  printf 'present sha=%s mode=%s\n' \
+    "$(sha256sum "$p" 2>/dev/null | cut -d' ' -f1)" "$(stat -c %a "$p" 2>/dev/null)"
+}
+unit_state_of(){   # unit 的完整前像: 文件在不在 + active/enabled/失败结果
+  local u="$1"
+  [[ -e "/etc/systemd/system/$u.service" ]] || { echo "absent"; return; }
+  printf 'present active=%s enabled=%s result=%s\n' \
+    "$(systemctl is-active "$u" 2>/dev/null)" "$(systemctl is-enabled "$u" 2>/dev/null)" \
+    "$(systemctl show "$u" -p Result --value 2>/dev/null)"
+}
+nproc_mosdns(){ local n; n="$(pgrep -c -x mosdns 2>/dev/null)"; printf '%s\n' "${n:-0}"; }
+nlisten_test(){ ss -lntuH 2>/dev/null | grep -cE ":($XV_UDP_PORT|$XV_DOT_PORT) "; }
+
+PRE_PROD="$(state_of /usr/local/bin/mosdns)"
+PRE_UNIT="$(unit_state_of "$XV_UNIT")"
+PRE_PROC="$(nproc_mosdns)"
+PRE_PORTS="$(nlisten_test)"
+[[ "$PRE_PORTS" == 0 ]] || die "开始时 $XV_UDP_PORT/$XV_DOT_PORT 已被占用 —— 现场不干净, 拒绝在上面做判定"
+ok "前像已采集: 生产内核[$PRE_PROD] unit[$PRE_UNIT] mosdns进程[$PRE_PROC] 测试端口[$PRE_PORTS]"
+
 ARCH="$(dpkg --print-architecture 2>/dev/null)"; [[ "$ARCH" == arm64 ]] || ARCH=amd64
 OLDBIN="${PDG_TEST_MOSDNS_LEGACY:-$ROOT/tests/.bin/mosdns-legacy}"
 NEWBIN="${PDG_TEST_MOSDNS:-$ROOT/tests/.bin/mosdns}"
@@ -279,12 +307,32 @@ rc="$(swap "$XV_WORK/new.zip")"
   && ok "NRestarts 未变" || bad "NRestarts 变了"
 
 echo
-echo "══ 残留 ══"
+echo "══ 残留: 先验前后一致, 再收尾验清零 ══"
 shopt -s nullglob; _p=( "$XV_BINDIR"/.mosdns.pdg-prev.* "$XV_BINDIR"/*.prev ); shopt -u nullglob
 [[ "${#_p[@]}" == 0 ]] && ok "bindir 无 .prev 残留" || bad "残留: ${_p[*]}"
 [[ ! -e /m.zip && ! -e /mosdns ]] && ok "根目录无残留" || bad "根目录有残留"
-[[ "$(xv_sha /usr/local/bin/mosdns)" == "${PDG_SHA256[mosdns-bin-$ARCH]}" ]] \
-  && ok "生产路径 /usr/local/bin/mosdns 一字节未动" || bad "动到生产路径的内核了"
+
+# 没碰别人的东西: 结束状态必须逐字等于前像(含"开始就不存在, 结束也得不存在")。
+POST_PROD="$(state_of /usr/local/bin/mosdns)"
+[[ "$POST_PROD" == "$PRE_PROD" ]] \
+  && ok "生产路径 /usr/local/bin/mosdns 前后一致([$PRE_PROD])" \
+  || bad "生产路径被动过: 前[$PRE_PROD] 后[$POST_PROD]"
+
+# 测试自己造的东西**无条件清零**, 不受前像影响 —— 前像里它们本来就都不存在
+# (unit 由 xv_require_env 挡掉同名, 端口在采集前像时已确认无人监听)。
+# 收尾在这里显式跑一次(xv_cleanup 幂等, EXIT trap 再跑无副作用), 好让"清零"成为**被断言过**
+# 的事实, 而不是留给 CI 收尾步去发现。
+xv_cleanup
+[[ "$(unit_state_of "$XV_UNIT")" == absent ]] \
+  && ok "测试建的 $XV_UNIT.service 已删除(前像 absent → 结束 absent)" \
+  || bad "unit 残留: $(unit_state_of "$XV_UNIT")"
+[[ "$(nproc_mosdns)" == "$PRE_PROC" ]] \
+  && ok "mosdns 进程数回到前像($PRE_PROC)" || bad "进程残留: 前 $PRE_PROC 后 $(nproc_mosdns)"
+[[ "$(nlisten_test)" == 0 ]] \
+  && ok "测试端口 $XV_UDP_PORT/$XV_DOT_PORT 无人监听" || bad "端口残留: $(nlisten_test) 条"
+[[ ! -d "$XV_WORK" ]] && ok "临时目录已删除" || bad "临时目录残留: $XV_WORK"
+[[ ! -e /etc/systemd/system/pdg-xv-ctrl.service ]] \
+  && ok "无 pdg-xv-ctrl.service 残留(另一支 E2E 的对照 unit)" || bad "pdg-xv-ctrl.service 残留"
 
 echo "────────────────────────────────────────"
 echo "通过 $pass, 失败 $nfail"
