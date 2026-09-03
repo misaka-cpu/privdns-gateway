@@ -82,7 +82,10 @@ print("\n== 2. 明确不兼容: 仍然 fail ==")
 for label, meta in (
     (".srs URL", {"a": {"url": "https://x/y.srs", "label": "A"}}),
     ("format=binary", {"a": {"url": "https://x/y.list", "format": "binary", "label": "B"}}),
-    ("path 以 .srs 结尾", {"a": {"url": "https://x/y.list", "path": "/tmp/z.srs", "label": "C"}}),
+    # 这是**元数据里的字符串**, 不是真去建的临时目录 —— 但写死 /tmp 会被 tmp 卫生守卫逮住
+    # (它逮得对: 按字面扫分不出"路径数据"和"真临时目录", 而放宽扫描等于给真违规开口子)。
+    ("path 以 .srs 结尾",
+     {"a": {"url": "https://x/y.list", "path": "/var/lib/pdg/z.srs", "label": "C"}}),
 ):
     r = ask(meta)
     if r and r[0] == "fail":
