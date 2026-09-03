@@ -32,9 +32,12 @@ sed -n '/^_update_mosdns_preflight(){/,/^}/p'     "$ROOT/deploy/bot/pdg.sh" >  "
 echo "══ 1. 预检函数存在, 且用的是生产共用判据 ══"
 if [[ -s "$WORK/pre.sh" ]]; then ok "pdg.sh 里有 _update_mosdns_preflight"; else
   bad "pdg.sh 里没有 _update_mosdns_preflight —— 更新前没有这一问"; fi
-grep -q 'pdg_mosdns_binary_ok' "$WORK/pre.sh" 2>/dev/null \
-  && ok "预检的裁决走 pdg_mosdns_binary_ok(与 install.sh 同一份判据)" \
-  || bad "预检没走生产共用判据 —— 另立一套迟早与安装器/doctor 漂开"
+# 必须是**真调用**, 不能是注释里提一句。裸 grep 在这里是假绿: 本轮重排预检时我在注释里
+# 写了 "判据本体(pdg_mosdns_binary_ok)…", 裸 grep 照样变绿, 而那一版实际上把判据内联了 ——
+# 单一真源已经断了, 断言却没说话。判据不该看注释。
+grep -qE '^[^#]*pdg_mosdns_binary_ok ' "$WORK/pre.sh" 2>/dev/null \
+  && ok "预检的裁决**真的调用**了 pdg_mosdns_binary_ok(与 install.sh 同一份判据)" \
+  || bad "预检没走生产共用判据(注释里提到不算)—— 另立一套迟早与安装器/doctor 漂开"
 grep -q 'lib/versions.sh' "$WORK/pre.sh" 2>/dev/null \
   && ok "钉值从 lib/versions.sh 读(单一真源)" || bad "预检没读 lib/versions.sh"
 
@@ -96,14 +99,12 @@ r=$(ask "$BIN/mosdns"); [[ "${r%%|*}" == 0 ]] \
 declare -A CASE=(
   ["文件不存在"]='rm -f "$BIN/mosdns"'
   ["执行不了"]='cp "$WORK/mosdns.good" "$BIN/mosdns"; chmod 644 "$BIN/mosdns"'
-  ["version 命令非零"]='printf "#!/bin/sh\nexit 3\n" > "$BIN/mosdns"; chmod 755 "$BIN/mosdns"'
   ["摘要不符"]='mkmosdns v9.9.9 "$BIN/mosdns"; printf "\n# tampered\n" >> "$BIN/mosdns"'
 )
 declare -A WANT=(
-  ["文件不存在"]='不存在'  ["执行不了"]='执行不了'  ["version 命令非零"]='命令非零'
-  ["摘要不符"]='摘要不符'
+  ["文件不存在"]='不存在'  ["执行不了"]='执行不了'  ["摘要不符"]='摘要不符'
 )
-for k in "文件不存在" "执行不了" "version 命令非零" "摘要不符"; do
+for k in "文件不存在" "执行不了" "摘要不符"; do
   eval "${CASE[$k]}"
   r=$(ask "$BIN/mosdns"); rc="${r%%|*}"; out="${r#*|}"
   [[ "$rc" != 0 ]] && ok "[$k] 预检拒绝(rc=$rc)" || bad "[$k] 预检竟然放行"
@@ -112,24 +113,43 @@ for k in "文件不存在" "执行不了" "version 命令非零" "摘要不符";
   grep -q 'mosdns' <<<"$out" && ok "[$k] 点名了是 mosdns" || bad "[$k] 没点名组件"
 done
 echo
-echo "══ 3A-bis. 版本漂移 ≠ 故障: 预检必须放行, 交给换核路径收敛 ══"
-# 契约在 _update_mosdns_binary 落地那天变了。在此之前"自报版本不符"是拒绝理由, 因为
-# 当时**没有任何东西**能把它修回去; 现在更新过程里就有一步专门做这件事, 再拦就等于
-# 把唯一的修复路径也堵死(与 _update_in_sync 的取向一致)。
+echo "══ 3A-bis. 摘要没过就不执行, 也不靠自报版本洗白 ══"
+# **契约本轮反转了。** v1.11.9 那版是: 自报版本与钉值不符 → 当成"这次更新会顺手修好的版本
+# 漂移", 放行。撤掉它的两个理由:
+#   ① 要读到自报版本, 就得先**执行**那个文件 —— 而"要不要信这个文件"正是当时还没回答的问题;
+#   ② 自报版本是文件自己说的。被替换过的二进制想说什么版本就说什么版本, 于是这条放行通道
+#      对真正需要拦住的那类文件恰好是敞开的。
+# 代价有意接受: 手工换过内核的机器不再被例行 update 自动抹平, 用户要先恢复可信内核。
+# 行为层面的证据(marker 证明它真的没被执行)在 tests/test-update-preflight-no-exec.sh。
 mkmosdns v1.2.3 "$BIN/mosdns"
 r=$(ask "$BIN/mosdns"); rc="${r%%|*}"; out="${r#*|}"
-[[ "$rc" == 0 ]] && ok "[自报版本不符] 预检放行(本次更新会把它收敛到钉死版)" \
-  || bad "[自报版本不符] 仍被拒绝(rc=$rc) —— 换核路径已经存在, 这条拦截把修复路堵死了: $out"
-grep -q '收敛' <<<"$out" && ok "[自报版本不符] 明说了会收敛, 不是闷声放行" \
-  || bad "[自报版本不符] 放行但没说为什么: $(tr '\n' ' ' <<<"$out" | cut -c1-120)"
-grep -qE 'v1\.2\.3' <<<"$out" && ok "[自报版本不符] 点出了实际跑的版本" \
-  || bad "[自报版本不符] 没说清跑的是哪一版: $(tr '\n' ' ' <<<"$out" | cut -c1-120)"
-# 而"版本对得上、内容不符"必须**仍然**拒绝 —— 那是篡改形态, 不是版本漂移。
-# 这两格是一对: 放松了前者却顺手放松后者, 等于让一次例行更新悄悄抹掉一个安全事件。
+[[ "$rc" != 0 ]] && ok "[摘要不符 + 自报别的版本] 拒绝(rc=$rc) —— 未知内容不靠自报版本洗白" \
+  || bad "[摘要不符 + 自报别的版本] 竟然放行(rc=0)"
+grep -q '摘要不符' <<<"$out" && ok "[摘要不符 + 自报别的版本] 原因归到摘要, 不是版本" \
+  || bad "[摘要不符 + 自报别的版本] 原因不具名: $(tr '\n' ' ' <<<"$out" | cut -c1-120)"
+grep -q '收敛' <<<"$out" && bad "[摘要不符 + 自报别的版本] 仍在说「会收敛到钉死版」—— 那是旧放行的措辞" \
+  || ok "[摘要不符 + 自报别的版本] 不再把不可信内容说成版本漂移"
+grep -qE '恢复可信内核|rollback' <<<"$out" && ok "[摘要不符] 给了出路(先恢复可信内核)" \
+  || bad "[摘要不符] 只说不行, 没说怎么办: $(tr '\n' ' ' <<<"$out" | cut -c1-120)"
+# 版本对得上、内容不符 —— 同样拒绝(这一格从来就该拒绝, 反转前后都是)
 mkmosdns v9.9.9 "$BIN/mosdns"; printf "\n# tampered\n" >> "$BIN/mosdns"
 r=$(ask "$BIN/mosdns"); rc="${r%%|*}"
-[[ "$rc" != 0 ]] && ok "[摘要不符] 放松版本判据之后, 篡改形态仍然被拒绝(rc=$rc)" \
-  || bad "[摘要不符] 竟然也被放行了 —— 换核路径不该顺手覆盖掉一个被篡改的二进制"
+[[ "$rc" != 0 ]] && ok "[摘要不符 + 自报正确版本] 仍然拒绝(rc=$rc)" \
+  || bad "[摘要不符 + 自报正确版本] 竟然放行 —— 篡改形态不该被例行更新覆盖"
+
+echo
+echo "══ 3A-ter. 摘要对得上之后, version 那一层照常判 ══"
+# 这几格必须**先把钉值对上**才走得到 —— 新顺序下内容不符会在更早一步就停。
+{ echo '#!/bin/sh'; echo 'exit 3'; } > "$BIN/mosdns"; chmod 755 "$BIN/mosdns"
+mkdir -p "$WORK/v_rc3/lib"
+{ printf 'MOSDNS_VER="v9.9.9"\n'
+  printf 'declare -A PDG_SHA256=( [mosdns-bin-amd64]="%s" [mosdns-bin-arm64]="%s" )\n' \
+    "$(sha256sum "$BIN/mosdns" | cut -d' ' -f1)" "$(sha256sum "$BIN/mosdns" | cut -d' ' -f1)"
+  sed -n '/^pdg_mosdns_binary_ok(){/,/^}/p' "$ROOT/lib/versions.sh"; } > "$WORK/v_rc3/lib/versions.sh"
+r=$(REPO_DIR="$WORK/v_rc3" bash -c "c_y(){ echo \"\$*\"; }; c_g(){ echo \"\$*\"; }; REPO_DIR='$WORK/v_rc3'; source '$WORK/pre.sh'; _update_mosdns_preflight '$BIN/mosdns'" 2>&1; echo "rc=$?")
+grep -q 'rc=1' <<<"$r" && ok "[摘要对 + version 非零] 拒绝" || bad "[摘要对 + version 非零] 放行了: $r"
+grep -qE '命令非零' <<<"$r" && ok "[摘要对 + version 非零] 原因具名到 version 命令" \
+  || bad "[摘要对 + version 非零] 原因不具名: $(tr '\n' ' ' <<<"$r" | cut -c1-120)"
 
 echo
 # 读不到 versions.sh / 架构无钉值 → 一样拒绝(fail-closed)
