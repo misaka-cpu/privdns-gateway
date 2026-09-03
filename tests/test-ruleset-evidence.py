@@ -152,6 +152,32 @@ for pat in ("9090", "external-controller", "ext-ctl", "requests.", "urlopen", "u
         ("check_rulesets 里出现了 %s —— 本项不该碰运行期/网络" % pat) if pat in body
         else "check_rulesets 不含: %s" % pat)
 
+print("\n== 8. 本项只读 RS_META 这一个文件, 不拿别的文件冒充证据 ==")
+# "配置文件存在 → 视为 provider 已加载"是最省事也最像样的**证据替换**: 它返回 ok, 而它
+# 证明的东西和规则集有没有被加载毫无关系。按行为判抓不住它 —— 沙箱里那个路径通常不存在,
+# 分支根本不触发, 于是"改坏了却 0 条转红"。所以这一条按**结构**判: 函数体里除了 RS_META,
+# 不许再出现任何文件系统探测。
+_fs_calls = []
+for _n in _ast.walk(_ast.parse(body)):
+    if isinstance(_n, _ast.Call):
+        _f = _n.func
+        _nm = _f.attr if isinstance(_f, _ast.Attribute) else getattr(_f, "id", "")
+        if _nm in ("exists", "isfile", "isdir", "glob", "listdir", "stat", "read_text"):
+            _fs_calls.append(_nm)
+(ok if not _fs_calls else bad)(
+    "函数体不含额外的文件系统探测(实得 %s)" % (_fs_calls or "无"))
+_paths = [c.value for c in _ast.walk(_ast.parse(body))
+          if isinstance(c, _ast.Constant) and isinstance(c.value, str)
+          and c.value.startswith("/") and len(c.value) > 1]
+(ok if not _paths else bad)(
+    "函数体里没有写死的其它路径(实得 %s)" % (_paths or "无"))
+_opens = [c for c in _ast.walk(_ast.parse(body))
+          if isinstance(c, _ast.Call) and getattr(c.func, "id", "") == "open"]
+_bad_open = [c for c in _opens
+             if not (c.args and isinstance(c.args[0], _ast.Name) and c.args[0].id == "RS_META")]
+(ok if not _bad_open else bad)(
+    "所有 open() 的第一个参数都是 RS_META(实得 %d 处不是)" % len(_bad_open))
+
 n = PASS[0] + FAIL[0]
 print("\n断言 %d 项: 通过 %d, 失败 %d" % (n, PASS[0], FAIL[0]))
 sys.exit(1 if FAIL[0] else 0)
