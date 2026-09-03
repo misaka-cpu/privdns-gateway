@@ -248,8 +248,12 @@ def main():
         json.dump({"rs_a": {"url": "https://x/a.list", "format": "source"}},
                   open(checks.RS_META, "w"))
         lv, _lab, _d = checks.check_rulesets()
-        if lv != "ok":
-            bad(f"正常规则集被判成 {lv}")
+        # 契约本轮改了: 静态形态没问题**不等于**已被 mihomo 加载, 所以这里是 warn 而不是 ok。
+        # 这条判据读的只有 rulesets.json 元数据, 一行运行期状态都没读; 说 ok 就是替运行期
+        # 打包票。warn 不改变 doctor 总退出码(更新自检只按 level=="fail" 计数), 不挡任何人。
+        # 证据等级的完整判据见 tests/test-ruleset-evidence.py。
+        if lv != "warn":
+            bad(f"静态形态无问题的规则集应判 warn(不冒充运行期结论), 实得 {lv}")
         checks.RS_META = os.path.join(tmp, "srs.json")
         json.dump({"rs_old": {"url": "https://x/geo.srs", "format": "binary", "label": "旧规则"}},
                   open(checks.RS_META, "w"))

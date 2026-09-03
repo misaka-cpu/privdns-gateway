@@ -1857,30 +1857,63 @@ def check_mitm():
     return ("ok", "WLOC 服务", "pdg-mitm active + CA + mitm_hijack + mihomo MITM 路由 就位")
 
 def check_rulesets():
-    """规则集能否进入 mihomo 运行配置。
+    """规则集的**静态形态**有没有已知不兼容 —— 只能说到这里, 说不到"已加载"。
+
+    这条判据读的只有 `rulesets.json` 这份元数据, 所以它能证明的仅仅是: 文件读得出来、里面
+    没有明确属于 sing-box 的 `.srs` / `format=binary`、扩展名没命中已知不兼容形态。
+
+    它**证明不了**: mihomo 已经读到这些 provider、provider 下载成功、解析出非零条规则、
+    运行期配置里真有对应的 RULE-SET、provider 当前没有 error。
+
+    所以它以前那句 `ok / N 个, 格式均可被 mihomo 加载` 是假绿: "可被 mihomo 加载"是一句
+    **运行期结论**, 而这里一行运行期状态都没读。一个写着 .yaml 却在运行期根本没被加载的
+    provider, 在旧判据下与一切正常的机器长得一模一样。
+
+    现在有规则集且静态形态没发现问题时返回 **warn 且明说没验运行期** —— warn 不改变
+    `pdg doctor` 的总退出码(更新自检只按 level=="fail" 计数), 所以它不会挡住任何人,
+    只是不再替运行期打包票。
+
+    要真证明"已加载", 需要一个安全的运行期查询接口(mihomo 管理面), 那是**架构待决项**:
+    本项不新增 HTTP 管理端口、不读现有 9090、不开 ext-ctl-unix、不拿 `mihomo -t` 的配置
+    语法通过冒充 provider 已加载、也不去访问 provider 地址做在线探测。只读, 不改任何东西。
 
     mihomo 读不了 sing-box 的二进制 `.srs`; 这类**老机器遗留**的规则集会让渲染器把对应规则
-    丢弃 → _core_apply/迁移一律判失败。若等到 `pdg update` 才发现, 用户是"更新被挡住"才回头
-    查原因。这里提前报出来, 并直说该怎么办。只读, 不改任何东西。"""
+    丢弃 → _core_apply/迁移一律判失败。那一类仍然判 fail 并直说该怎么办。"""
+    name = "规则集"
     try:
-        meta = json.load(open(RS_META, encoding="utf-8"))
-    except Exception:  # noqa: BLE001  没有规则集元数据 = 没加过规则集
-        return None
-    if not isinstance(meta, dict) or not meta:
+        raw = open(RS_META, encoding="utf-8").read()
+    except FileNotFoundError:
+        return None                      # 没加过规则集 —— 不是问题, 不该出现在报告里
+    except OSError as e:                 # 在那儿但读不了: 无结论, 不当成"没配置"
+        return ("warn", name, "读不到 %s(%s) —— 本项无结论, 不能据此说没配过规则集"
+                              % (RS_META, e.strerror or e.errno))
+    try:
+        meta = json.loads(raw)
+    except Exception:  # noqa: BLE001
+        # 文件在、内容坏 —— 这是**确定性故障**, 不是"没配过": bot 管不了规则集, 渲染器也读不到。
+        # 静默返回 None 会把它显示成"这台机器没配规则集", 那是把无结论说成没问题。
+        return ("fail", name, "%s 解析不了(不是合法 JSON)—— 规则集元数据损坏, "
+                              "bot 的分流管理与渲染都会读到同一份文件。请在 bot「📑 分流管理」"
+                              "里重建规则集, 或从快照恢复该文件。" % RS_META)
+    if not isinstance(meta, dict):
+        return ("fail", name, "%s 的顶层不是对象 —— 规则集元数据形态不对, 处理同上。" % RS_META)
+    if not meta:
         return None
     stale = []
-    for name, info in meta.items():
+    for rs_name, info in meta.items():
         if not isinstance(info, dict):
             continue
         url = str(info.get("url", "")).lower().split("?", 1)[0]
         if url.endswith(".srs") or str(info.get("format", "")) == "binary" \
            or str(info.get("path", "")).endswith(".srs"):
-            stale.append(str(info.get("label") or name))
+            stale.append(str(info.get("label") or rs_name))
     if stale:
-        return ("fail", "规则集", "这些是 sing-box 二进制 .srs, mihomo 读不了 → 分流不会生效, "
-                                  "且会挡住 `pdg update`: " + "、".join(stale[:6])
-                                  + "。请在 bot「📑 分流管理」里删掉它们, 换成 .list/.txt/.yaml/.mrs。")
-    return ("ok", "规则集", "%d 个, 格式均可被 mihomo 加载" % len(meta))
+        return ("fail", name, "这些是 sing-box 二进制 .srs, mihomo 读不了 → 分流不会生效, "
+                              "且会挡住 `pdg update`: " + "、".join(stale[:6])
+                              + "。请在 bot「📑 分流管理」里删掉它们, 换成 .list/.txt/.yaml/.mrs。")
+    return ("warn", name, "%d 个: 静态元数据里未发现已知不兼容格式。"
+                          "但本项**没有读取 mihomo 运行期 provider 状态**, 因此不能证明这些规则"
+                          "已经被加载、下载成功或解析出条目 —— 只说明形态上没问题。" % len(meta))
 
 
 # ── 分流优先级: 自动生成的规则不许静默压过用户点名的域名规则 ──────────────────
