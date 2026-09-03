@@ -900,6 +900,11 @@ jobs:
       - name: "CI 覆盖守卫 (每个测试文件都必须真的被本 workflow 调用)"
         run: python3 tests/test-ci-coverage.py
 
+      # 这条判据读的只有 rulesets.json 元数据, 却曾宣称"格式均可被 mihomo 加载" —— 那是一句
+      # 运行期结论。本支盯证据等级: 静态无问题只能说到 warn, 不许冒充 ok。
+      - name: "规则集证据等级 (静态形态 ≠ 已加载; 损坏不许当没配置; 不读 controller/不发请求)"
+        run: python3 tests/test-ruleset-evidence.py
+
       # 弃用期内 runner 会把 node20 的 action 强行拉到 node24 上跑 —— 流程照常绿, 只是每个
       # job 都打一条 warning。那种"不红只是提醒"的形态最容易被放过, 直到某天 runner 不再兜底。
       - name: "action 运行时守卫 (没有 action 停在已弃用的 Node 20 上; 不认识的 action 判失败)"
