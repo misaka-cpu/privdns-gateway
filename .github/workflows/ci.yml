@@ -102,7 +102,7 @@ jobs:
           json.dump(m,open("artifact/manifest.json","w"))' \
             "$PDG_LEGACY_MOSDNS_VER" "${PDG_LEGACY_SHA256[mosdns-$ARCH]}" "$LG_GOT" "$LG_VER"
           cat artifact/manifest.json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.name.outputs.artifact }}
           path: artifact/
@@ -145,7 +145,7 @@ jobs:
       # 没有第二个答案。
       - name: "推导 mosdns artifact 名"
         run: echo "MOSDNS_ARTIFACT=$(bash tests/mosdns-artifact-name.sh)" >> "$GITHUB_ENV"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: ${{ env.MOSDNS_ARTIFACT }}
           path: /tmp/mosdns-fixture
@@ -991,7 +991,7 @@ jobs:
           test "$(command -v systemctl)" = /usr/bin/systemctl || test "$(command -v systemctl)" = /bin/systemctl
       - name: "推导 artifact 名"
         run: echo "MOSDNS_ARTIFACT=$(bash tests/mosdns-artifact-name.sh)" >> "$GITHUB_ENV"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: ${{ env.MOSDNS_ARTIFACT }}
           path: /tmp/mosdns-fixture
@@ -1033,7 +1033,7 @@ jobs:
       # 没有第二个答案。
       - name: "推导 mosdns artifact 名"
         run: echo "MOSDNS_ARTIFACT=$(bash tests/mosdns-artifact-name.sh)" >> "$GITHUB_ENV"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: ${{ env.MOSDNS_ARTIFACT }}
           path: /tmp/mosdns-fixture
@@ -1148,7 +1148,7 @@ jobs:
       # 没有第二个答案。
       - name: "推导 mosdns artifact 名"
         run: echo "MOSDNS_ARTIFACT=$(bash tests/mosdns-artifact-name.sh)" >> "$GITHUB_ENV"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: ${{ env.MOSDNS_ARTIFACT }}
           path: /tmp/mosdns-fixture
@@ -1196,7 +1196,7 @@ jobs:
       # 没有第二个答案。
       - name: "推导 mosdns artifact 名"
         run: echo "MOSDNS_ARTIFACT=$(bash tests/mosdns-artifact-name.sh)" >> "$GITHUB_ENV"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: ${{ env.MOSDNS_ARTIFACT }}
           path: /tmp/mosdns-fixture
@@ -1420,7 +1420,7 @@ jobs:
       # 没有第二个答案。
       - name: "推导 mosdns artifact 名"
         run: echo "MOSDNS_ARTIFACT=$(bash tests/mosdns-artifact-name.sh)" >> "$GITHUB_ENV"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: ${{ env.MOSDNS_ARTIFACT }}
           path: /tmp/mosdns-fixture
@@ -1529,7 +1529,7 @@ jobs:
       # 没有第二个答案。
       - name: "推导 mosdns artifact 名"
         run: echo "MOSDNS_ARTIFACT=$(bash tests/mosdns-artifact-name.sh)" >> "$GITHUB_ENV"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: ${{ env.MOSDNS_ARTIFACT }}
           path: /tmp/mosdns-fixture
@@ -1575,7 +1575,7 @@ jobs:
       # job 日志上一个字都看不见(审计时才发现它也是消费者)。现在与别的消费者同路。
       - name: "推导 mosdns artifact 名"
         run: echo "MOSDNS_ARTIFACT=$(bash tests/mosdns-artifact-name.sh)" >> "$GITHUB_ENV"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: ${{ env.MOSDNS_ARTIFACT }}
           path: /tmp/mosdns-fixture

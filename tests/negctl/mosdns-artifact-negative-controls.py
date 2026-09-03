@@ -86,7 +86,7 @@ def suite(wd, cmds):
     return failures(out)
 
 
-CONSUMER_DL = '''      - uses: actions/download-artifact@v4
+CONSUMER_DL = '''      - uses: actions/download-artifact@v8
         with:
           name: ${{ env.MOSDNS_ARTIFACT }}
           path: /tmp/mosdns-fixture
@@ -96,7 +96,7 @@ MUT = [
      [(CONSUMER_DL,
        '      - name: "直接下载"\n        run: |\n'
        '          curl -fsSL -o /tmp/m.zip '
-       '"https://github.com/IrineSistiana/mosdns/releases/download/v5.3.4/mosdns-linux-amd64.zip"\n', 7)],
+       '"https://github.com/IrineSistiana/mosdns/releases/download/v5.3.4/mosdns-linux-amd64.zip"\n', 8)],
      [T_TOPO]),
     ("② 消费者加回联网 fallback", INS,
      [('[[ -f "$BIN" ]] || die "artifact 里没有 mosdns($BIN)"',
@@ -109,7 +109,7 @@ MUT = [
      [('[[ "v${got_ver:-}" == "$MOSDNS_VER" ]] \\\n  || die', 'true \\\n  || die', 1)],
      [T_TOPO, T_TRIP]),
     ("⑤ 摘掉 needs", CI,
-     [("    needs: prepare-mosdns-fixture\n", "", 7)], [T_TOPO]),
+     [("    needs: prepare-mosdns-fixture\n", "", 8)], [T_TOPO]),
     ("⑥ artifact 名去掉摘要段", NAM,
      [("printf 'mosdns-%s-%s-%s\\n' \"$MOSDNS_VER\" \"$arch\" \"${sha:0:12}\"",
        "printf 'mosdns-%s-%s\\n' \"$MOSDNS_VER\" \"$arch\"", 1)], [T_TRIP]),
@@ -117,11 +117,11 @@ MUT = [
      [('          pdg_mosdns_binary_ok "$ARCH" "$MOSDNS_VER" "$PWD/artifact/mosdns"\n', "", 1)],
      [T_TOPO]),
     ("⑧ 改用 actions/cache", CI,
-     [("      - uses: actions/upload-artifact@v4\n",
+     [("      - uses: actions/upload-artifact@v7\n",
        "      - uses: actions/cache@v4\n", 1)], [T_TOPO]),
     ("⑨ action 改成浮动引用", CI,
-     [("      - uses: actions/download-artifact@v4\n",
-       "      - uses: actions/download-artifact@main\n", 7)], [T_TOPO]),
+     [("      - uses: actions/download-artifact@v8\n",
+       "      - uses: actions/download-artifact@main\n", 8)], [T_TOPO]),
     ("⑩ 只加一行无关注释(反向对照)", INS,
      [("die(){ echo", "# (负控的空转对照, 不改变任何行为)\ndie(){ echo", 1)], [T_TOPO, T_TRIP]),
 ]
