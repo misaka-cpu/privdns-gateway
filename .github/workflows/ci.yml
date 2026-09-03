@@ -102,7 +102,7 @@ jobs:
           json.dump(m,open("artifact/manifest.json","w"))' \
             "$PDG_LEGACY_MOSDNS_VER" "${PDG_LEGACY_SHA256[mosdns-$ARCH]}" "$LG_GOT" "$LG_VER"
           cat artifact/manifest.json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.name.outputs.artifact }}
           path: artifact/
@@ -145,7 +145,7 @@ jobs:
       # 没有第二个答案。
       - name: "推导 mosdns artifact 名"
         run: echo "MOSDNS_ARTIFACT=$(bash tests/mosdns-artifact-name.sh)" >> "$GITHUB_ENV"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: ${{ env.MOSDNS_ARTIFACT }}
           path: /tmp/mosdns-fixture
@@ -894,6 +894,11 @@ jobs:
       - name: "CI 覆盖守卫 (每个测试文件都必须真的被本 workflow 调用)"
         run: python3 tests/test-ci-coverage.py
 
+      # 弃用期内 runner 会把 node20 的 action 强行拉到 node24 上跑 —— 流程照常绿, 只是每个
+      # job 都打一条 warning。那种"不红只是提醒"的形态最容易被放过, 直到某天 runner 不再兜底。
+      - name: "action 运行时守卫 (没有 action 停在已弃用的 Node 20 上; 不认识的 action 判失败)"
+        run: python3 tests/test-action-runtime.py
+
       - name: "clean-root 安装产物自足 (移出仓库/隔离解释器/无源码兜底)"
         run: python3 tests/test-clean-root.py
 
@@ -986,7 +991,7 @@ jobs:
           test "$(command -v systemctl)" = /usr/bin/systemctl || test "$(command -v systemctl)" = /bin/systemctl
       - name: "推导 artifact 名"
         run: echo "MOSDNS_ARTIFACT=$(bash tests/mosdns-artifact-name.sh)" >> "$GITHUB_ENV"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: ${{ env.MOSDNS_ARTIFACT }}
           path: /tmp/mosdns-fixture
@@ -1028,7 +1033,7 @@ jobs:
       # 没有第二个答案。
       - name: "推导 mosdns artifact 名"
         run: echo "MOSDNS_ARTIFACT=$(bash tests/mosdns-artifact-name.sh)" >> "$GITHUB_ENV"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: ${{ env.MOSDNS_ARTIFACT }}
           path: /tmp/mosdns-fixture
@@ -1143,7 +1148,7 @@ jobs:
       # 没有第二个答案。
       - name: "推导 mosdns artifact 名"
         run: echo "MOSDNS_ARTIFACT=$(bash tests/mosdns-artifact-name.sh)" >> "$GITHUB_ENV"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: ${{ env.MOSDNS_ARTIFACT }}
           path: /tmp/mosdns-fixture
@@ -1191,7 +1196,7 @@ jobs:
       # 没有第二个答案。
       - name: "推导 mosdns artifact 名"
         run: echo "MOSDNS_ARTIFACT=$(bash tests/mosdns-artifact-name.sh)" >> "$GITHUB_ENV"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: ${{ env.MOSDNS_ARTIFACT }}
           path: /tmp/mosdns-fixture
@@ -1415,7 +1420,7 @@ jobs:
       # 没有第二个答案。
       - name: "推导 mosdns artifact 名"
         run: echo "MOSDNS_ARTIFACT=$(bash tests/mosdns-artifact-name.sh)" >> "$GITHUB_ENV"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: ${{ env.MOSDNS_ARTIFACT }}
           path: /tmp/mosdns-fixture
@@ -1524,7 +1529,7 @@ jobs:
       # 没有第二个答案。
       - name: "推导 mosdns artifact 名"
         run: echo "MOSDNS_ARTIFACT=$(bash tests/mosdns-artifact-name.sh)" >> "$GITHUB_ENV"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: ${{ env.MOSDNS_ARTIFACT }}
           path: /tmp/mosdns-fixture
@@ -1570,7 +1575,7 @@ jobs:
       # job 日志上一个字都看不见(审计时才发现它也是消费者)。现在与别的消费者同路。
       - name: "推导 mosdns artifact 名"
         run: echo "MOSDNS_ARTIFACT=$(bash tests/mosdns-artifact-name.sh)" >> "$GITHUB_ENV"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: ${{ env.MOSDNS_ARTIFACT }}
           path: /tmp/mosdns-fixture
