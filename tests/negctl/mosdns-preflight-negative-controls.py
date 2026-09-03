@@ -81,6 +81,7 @@ T_PRE = ["bash", "tests/test-update-mosdns-preflight.sh"]
 T_FIX = ["python3", "tests/test-e2e-mosdns-fixture.py"]
 T_MOS = ["python3", "tests/test-mosdns-binary-evidence.py"]
 T_REL = ["bash", "tests/test-update-release-relation.sh"]
+T_NOX = ["bash", "tests/test-update-preflight-no-exec.sh"]
 
 
 def suite(wd, cmds):
@@ -91,6 +92,20 @@ def suite(wd, cmds):
     return failures(out)
 
 
+# 重排后诊断路径的两段: 先证内容, 再执行。⑨ 把它们对调, 于是又变成"先跑再说"。
+SHA_GATE = '''    local got_sha
+    got_sha="$(sha256sum "$bin" 2>/dev/null | awk '{print $1}')"
+    [[ -n "$got_sha" ]]                 || exit 8   # 算不出摘要
+    [[ "$got_sha" == "${PDG_SHA256[mosdns-bin-$march]}" ]] || exit 6   # 内容不是官方那一份
+'''
+EXEC_GATE = '''    # ── 内容已经证明过, 此时执行它是安全的 ────────────────────────────────
+    # 能走到这里说明摘要相符而判据仍然失败, 所以问题一定出在 version 那一层。
+    local got_ver
+    got_ver="$("$bin" version 2>/dev/null)" || exit 3   # version 命令非零
+    got_ver="${got_ver%%$'\\n'*}"
+    [[ "$got_ver" =~ ([0-9]+\\.[0-9]+\\.[0-9]+) ]] || exit 4   # 输出里读不出版本
+    [[ "${BASH_REMATCH[1]}" == "${MOSDNS_VER#v}" ]] || exit 5  # 钉值与资产自相矛盾
+'''
 PRE_CALL = '''      if [[ "$_rel" == behind ]] && ! _update_mosdns_preflight; then
         return 1
       fi
@@ -129,6 +144,33 @@ MUT = [
        '    c_y "自检发现 $nfail 项失败(变异: 不回滚)"\n'
        '    return 1', 1)],
      [T_PRE]),
+    # ── 以下八格盯的是重排后的诊断顺序: 摘要没过之前一次都不执行候选文件 ──────────
+    # 这一段过去为了分辨"版本漂移"又跑了两次 `"$bin" version`, 判据挡在门外的文件被诊断
+    # 请了进来。判据是 marker(它真的被跑起来过没有), 不是源码形状 —— 换个写法照样能执行。
+    ("⑨ 把 version 调用重新移到摘要之前", PDG,
+     [(SHA_GATE + EXEC_GATE, EXEC_GATE + SHA_GATE, 1)], [T_NOX]),
+    ("⑩ 摘要不符时再执行一次候选文件", PDG,
+     [('    [[ "$got_sha" == "${PDG_SHA256[mosdns-bin-$march]}" ]] || exit 6',
+       '    if [[ "$got_sha" != "${PDG_SHA256[mosdns-bin-$march]}" ]]; then\n'
+       '      "$bin" version >/dev/null 2>&1; exit 6\n    fi', 1)], [T_NOX]),
+    ("⑪ 摘要不符改成放行", PDG,
+     [('    [[ "$got_sha" == "${PDG_SHA256[mosdns-bin-$march]}" ]] || exit 6',
+       '    [[ "$got_sha" == "${PDG_SHA256[mosdns-bin-$march]}" ]] || exit 0', 1)], [T_NOX, T_PRE]),
+    ("⑫ 恢复 rc=5 自动放行(自报版本不符就当版本漂移)", PDG,
+     [('  [[ "$rc" == 0 ]] && return 0\n',
+       '  [[ "$rc" == 0 ]] && return 0\n  [[ "$rc" == 5 ]] && { c_g "更新前自检: 本次更新会把它收敛到钉死版。"; return 0; }\n',
+       1)], [T_NOX, T_PRE]),
+    ("⑬ 忽略 version 命令的退出码", PDG,
+     [('    got_ver="$("$bin" version 2>/dev/null)" || exit 3   # version 命令非零',
+       '    got_ver="$("$bin" version 2>/dev/null)"   # 变异: 不看退出码', 1)], [T_NOX]),
+    ("⑭ 只比版本字符串, 不比摘要", PDG,
+     [(SHA_GATE, '    local got_sha=""\n', 1)], [T_NOX, T_PRE]),
+    ("⑮ 摘要相符之后不再验证版本", PDG,
+     [('    [[ "${BASH_REMATCH[1]}" == "${MOSDNS_VER#v}" ]] || exit 5  # 钉值与资产自相矛盾',
+       '    :  # 变异: 摘要过了就不再看版本', 1)], [T_NOX]),
+    ("⑯ 摘掉「没动任何文件」的副作用说明", PDG,
+     [('  echo "  没动任何文件: 未建快照, 未 reset, 未装文件, 未迁移, 未重启服务。"\n', "", 1)],
+     [T_NOX]),
     ("⑧ 只加一行无关注释(反向对照)", PDG,
      [("_update_mosdns_preflight(){",
        "# (负控的空转对照, 不改变任何行为)\n_update_mosdns_preflight(){", 1)],
