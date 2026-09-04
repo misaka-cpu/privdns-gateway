@@ -448,6 +448,9 @@ qrencode(){ echo "DANGER:qrencode"; return 1; }
 nft(){ echo "DANGER:nft $*"; return 1; }
 # `mktemp -d` 得**真把目录建出来**。只回显一个路径的桩从来就不忠实, 只是旧代码不查;
 # 调用方开始检查 -d 之后, 它就变成了"注入一次 mktemp 失败", 与本格要测的东西无关。
+# 这个 harness 的输出经 head 截断, 会提前收到 SIGPIPE, 收尾函数跑不到 —— 所以目录
+# 的清理挂在 EXIT 上, 否则每跑一次就在 /tmp 留一个空壳。
+trap 'rm -rf "${TMPDIR:-/tmp}/iosdisp-www.$$"' EXIT
 mktemp(){ local d=${TMPDIR:-/tmp}/iosdisp-www.$$; mkdir -p "$d"; echo "$d"; }
 # shellcheck source=/dev/null
 . ${TMPDIR:-/tmp}/iosdisp.$$
