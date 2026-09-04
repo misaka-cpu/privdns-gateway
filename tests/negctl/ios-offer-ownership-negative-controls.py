@@ -74,7 +74,7 @@ LOCKCALL = "  _ios_offer_lock_acquire || return 1"
 # 服务已从 `-m http.server` 换成内置的精确路径 handler(它会列目录, 一次性 token 就白带了),
 # 锚点跟着走。这一格问的仍是同一件事: 子进程有没有继承会话锁的 fd。
 # 外层 timeout 已去掉, 锚点跟着走。这一格问的仍是: 子进程有没有继承会话锁的 fd。
-SRVLINE = '  ( cd "$WWW" && exec python3 -c "$IOS_OFFER_SERVER" \\\n        "$PORT" "/$TOK.mobileconfig" "$WWW/$TOK.mobileconfig" 0.0.0.0 >/dev/null 2>&1 ) 6>&- &'
+SRVLINE = '  ( cd "$WWW" && exec python3 -c "$IOS_OFFER_SERVER" \\\n        "$PORT" "/$TOK.mobileconfig" "$WWW/$TOK.mobileconfig" 0.0.0.0 \\\n        "$WWW/$IOS_OFFER_PIDFILE" >/dev/null 2>&1 ) 6>&- &'
 READY = ('''  if ! _ios_offer_ready "/$TOK.mobileconfig" "$want_sha" "$want_len"; then
     _ios_offer_abort "临时 HTTP 没能就绪 —— 端口 $PORT 上没有我们这一份文件(可能被别的服务占着), 未开放任何临时端口。"; return 1
   fi''')

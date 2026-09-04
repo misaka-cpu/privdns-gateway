@@ -35,33 +35,32 @@ def failures(out):
 T_SESS = ["python3", "tests/test-ios-offer-session.py"]
 T_HARD = ["python3", "tests/test-ios-offer-hardening.py"]
 
-PRINTF = ("  if ! printf 'sid=%s\\npid=%s\\nstart=%s\\nwww=%s\\n' "
-          '"$sid" "$pid" "$start" "$www" > "$tmp" 2>/dev/null; then')
-PRINTF_NO_DIR = ("  if ! printf 'sid=%s\\npid=%s\\nstart=%s\\n' "
-                 '"$sid" "$pid" "$start" > "$tmp" 2>/dev/null; then')
-RMWWW = '  rm -rf "$www"'
+# 锚点全部从产品源码原样取出。本轮服务行多收了 pid 凭据参数、state 记录多了 phase、
+# 回收整段重写 —— 手写转义踩过一次, 结果是改坏器空转, 而那和"判据没牙"长得一样。
+PRINTF = '  if ! printf \'phase=%s\\nsid=%s\\npid=%s\\nstart=%s\\nwww=%s\\n\' \\\n        "$phase" "$sid" "$pid" "$start" "$www" > "$tmp" 2>/dev/null; then'
+PRINTF_NO_DIR = PRINTF.replace('\\nwww=%s', '').replace(' "$www"', '')
+RMDIR = '  rm -rf "$dir"\n  [[ -e "$dir" ]] && { echo "❌ 删不掉上一轮的会话目录($dir)。"; return 1; }'
 SENTINEL = '  [[ "$(cat "$dir/$IOS_OFFER_SENTINEL" 2>/dev/null)" == "$sid" ]] || return 1'
-TD_STATE = '''    if ! rm -f "$IOS_OFFER_STATE" 2>/dev/null || [[ -e "$IOS_OFFER_STATE" ]]; then
-      echo "❌ 清不掉本轮的运行期所有权记录($IOS_OFFER_STATE) —— 下一次会话会拿它做身份核对。"
-      rc=1
-    else
-      _IOS_OFFER_STATE_OWNED=""
-    fi'''
-SERVE = '''  ( cd "$WWW" && exec python3 -c "$IOS_OFFER_SERVER" \\
-        "$PORT" "/$TOK.mobileconfig" "$WWW/$TOK.mobileconfig" 0.0.0.0 >/dev/null 2>&1 ) 6>&- &'''
-SERVE_TIMEOUT = SERVE.replace("exec python3 -c", "exec timeout 600 python3 -c")
+TD_STATE = '    if ! rm -f "$IOS_OFFER_STATE" 2>/dev/null || [[ -e "$IOS_OFFER_STATE" ]]; then\n      echo "❌ 清不掉上一轮的运行期所有权记录($IOS_OFFER_STATE) —— 下一次会话会拿它做身份核对。"\n      rc=1\n    fi'
+SERVE = '  ( cd "$WWW" && exec python3 -c "$IOS_OFFER_SERVER" \\\n        "$PORT" "/$TOK.mobileconfig" "$WWW/$TOK.mobileconfig" 0.0.0.0 \\\n        "$WWW/$IOS_OFFER_PIDFILE" >/dev/null 2>&1 ) 6>&- &'
+SERVE_TIMEOUT = SERVE.replace('exec python3 -c', 'exec timeout 600 python3 -c')
 
 MUT = [
-    ("① state 不记录目录", [(PRINTF, PRINTF_NO_DIR, 1)], [T_SESS]),
-    ("② PID 不在时删记录、留目录",
-     [(RMWWW, '  [[ -d "/proc/$pid" ]] && rm -rf "$www"  # 变异', 1)], [T_SESS]),
+    # ① 原本打的是"state 不记录目录"。它已经打不动了, 而且是**因为修复本身**: 回收现在
+    # 由扫会话根目录驱动, 记录里的 www 字段不再参与恢复 —— 去掉它不改变任何行为。记录自己
+    # 的契约(目录一落盘就得有 staging 相、且不带 pid)由
+    # tests/negctl/ios-offer-prestate-negative-controls.py 的 ① 盯着。
+    # 与其为了让格子变红去弱化产品(比如把扫描删掉), 不如把这一格撤掉并说明。
+    # 回收改成了"先证明归属 → 停数据面 → 删目录", 删除挪进了 _ios_offer_reap_dir。
+    ("② PID 不在时不删目录",
+     [(RMDIR, '  [[ -n "$pid" ]] && rm -rf "$dir"  # 变异', 1)], [T_SESS]),
     ("③ 目录删除不核会话凭据", [(SENTINEL, "  :  # 变异", 1)], [T_SESS]),
     ("④ state unlink 恢复 || true",
      [(TD_STATE, '    rm -f "$IOS_OFFER_STATE" 2>/dev/null || true  # 变异\n'
                  '    _IOS_OFFER_STATE_OWNED=""', 1)], [T_SESS]),
     ("⑤ 恢复外层 timeout(记录的 PID 不是听端口那个)", [(SERVE, SERVE_TIMEOUT, 1)], [T_SESS]),
     ("⑥ 只加无关注释(反向对照)",
-     [(RMWWW, "  # 变异: 一条无关注释\n" + RMWWW, 1)], [T_SESS, T_HARD]),
+     [(RMDIR, "  # 变异: 一条无关注释\n" + RMDIR, 1)], [T_SESS, T_HARD]),
 ]
 
 before = {p: sha(p) for p in TOUCHED}

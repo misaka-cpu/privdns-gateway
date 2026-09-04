@@ -58,18 +58,12 @@ T_HARD = ["python3", "tests/test-ios-offer-hardening.py"]
 T_LIFE = ["python3", "tests/test-ios-offer-lifecycle.py"]
 
 # 外层 `timeout 600` 已去掉(只保留服务脚本自带的 Timer), 锚点跟着走。
-SERVE = '  ( cd "$WWW" && exec python3 -c "$IOS_OFFER_SERVER" \\\n        "$PORT" "/$TOK.mobileconfig" "$WWW/$TOK.mobileconfig" 0.0.0.0 >/dev/null 2>&1 ) 6>&- &'
-# 这一格要证的是"根路径会列目录", 与绑定地址和超时时长无关。所以变异体绑回环、超时取
-# 20 秒: `-m http.server` **绕过了桩的绑定改写**(桩只认那段 serve_forever 脚本), 照抄
-# 0.0.0.0 + 600 秒的话, 一次负控就会在这台机器上真开一个对外端口并占满十分钟 ——
-# 实测发生过, 它把后面三支负控的基线全带红了。
+SERVE = '  ( cd "$WWW" && exec python3 -c "$IOS_OFFER_SERVER" \\\n        "$PORT" "/$TOK.mobileconfig" "$WWW/$TOK.mobileconfig" 0.0.0.0 \\\n        "$WWW/$IOS_OFFER_PIDFILE" >/dev/null 2>&1 ) 6>&- &'
 SERVE_OLD = ('  ( cd "$WWW" && exec timeout 20 python3 -m http.server "$PORT" '
              '--bind 127.0.0.1 >/dev/null 2>&1 ) 6>&- &')
-STATEW = '''  if ! _ios_offer_state_write "$_IOS_OFFER_SID" "$_IOS_OFFER_SRV" \\
-        "$(_ios_offer_starttime "$_IOS_OFFER_SRV")" "$WWW"; then
-    _ios_offer_abort "写不下运行期所有权记录($IOS_OFFER_STATE) —— 强杀之后将无法自愈, 本次不开通道。"; return 1
-  fi'''
-STATEW_OLD = ('  _ios_offer_state_write "$_IOS_OFFER_SID" "$_IOS_OFFER_SRV" '
+STAGING = '  if ! _ios_offer_state_write staging "$_IOS_OFFER_SID" "" "" "$dir"; then\n    rm -rf "$dir"; _IOS_OFFER_WWW=""\n    _ios_offer_abort "写不下会话所有权记录($IOS_OFFER_STATE) —— 未开放任何临时端口。"; return 1\n  fi'
+STATEW = '  if ! _ios_offer_state_write serving "$_IOS_OFFER_SID" "$_IOS_OFFER_SRV" \\\n        "$(_ios_offer_starttime "$_IOS_OFFER_SRV")" "$WWW"; then\n    _ios_offer_abort "写不下运行期所有权记录($IOS_OFFER_STATE) —— 强杀之后将无法自愈, 本次不开通道。"; return 1\n  fi'
+STATEW_OLD = ('  _ios_offer_state_write serving "$_IOS_OFFER_SID" "$_IOS_OFFER_SRV" '
               '"$(_ios_offer_starttime "$_IOS_OFFER_SRV")" "$WWW" || true  # 变异')
 CHMOD = '  chmod 0600 "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }'
 ORDER = '''  local reap_rc=0 sweep_rc=0
@@ -83,7 +77,12 @@ TRAPIGN = '  trap "" HUP INT TERM'
 
 MUT = [
     ("① 换回 python3 -m http.server(根路径又能列目录)", [(SERVE, SERVE_OLD, 1)], [T_HARD]),
-    ("② state 写失败退回 || true", [(STATEW, STATEW_OLD, 1)], [T_HARD]),
+    # 现在有**两次** state 写入: 建目录时的 staging 与 HTTP 起来后的 serving。只改后者的话,
+    # 前者仍然 fail-closed, 会话在更早的地方就停了 —— 变异被自己的加固掩盖。要复原
+    # "best-effort 写记录"这个缺陷, 两处都得退回去。
+    ("② 两次 state 写入都退回 || true",
+     [(STAGING, '  _ios_offer_state_write staging "$_IOS_OFFER_SID" "" "" "$dir" || true  # 变异', 1),
+      (STATEW, STATEW_OLD, 1)], [T_HARD]),
     ("③ state mode 放宽成 0644", [(CHMOD, CHMOD.replace("0600", "0644"), 1)], [T_HARD]),
     ("④ 先 nft 后 orphan(链读不到就跳过回收)", [(ORDER, ORDER_OLD, 1)], [T_HARD]),
     # ⑤ 原本打的是"目录删除移出身份校验"。那条代码路径已经不存在了: 归属现在由
