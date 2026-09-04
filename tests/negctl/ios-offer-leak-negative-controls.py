@@ -70,7 +70,8 @@ TRAP_EXIT = "  trap '_ios_offer_teardown' EXIT"
 ADD = '  if ! addout="$(nft -j --echo --handle add rule inet pdg input ip saddr "$CIDR" \\'
 MARK = '        tcp dport "$PORT" accept comment "$IOS_OFFER_MARK" 2>&1)"; then'
 CLOSE_HEAD = "_ios_offer_nft_close(){\n  local txt h left"
-SWEEP = "  if ! _ios_offer_nft_close; then"
+# 入场清理已经拆成"先回收孤儿、再清残留放行", 两边错误合并上报。这一格打的仍是清残留那一半。
+SWEEP = "  _ios_offer_nft_close   || sweep_rc=1"
 PRECISE = ("""  for h in $(printf '%s\\n' "$txt" | _ios_offer_marks); do\n"""
            '    nft delete rule inet pdg input handle "$h" >/dev/null 2>&1 || true\n'
            '  done')
@@ -91,7 +92,7 @@ MUT = [
     ("⑤ 撤除函数空壳化(三条信号路径全泄漏)",
      [(CLOSE_HEAD, "_ios_offer_nft_close(){\n  return 0  # 变异\n  local txt h left", 1)], [T_LEAK]),
     ("⑥ 入场清理删掉(残留永远不会被带走)",
-     [(SWEEP, "  if false; then  # 变异: 不清残留", 1)], [T_LEAK]),
+     [(SWEEP, "  : # 变异: 不清残留", 1)], [T_LEAK]),
     ("⑦ 精确删除换成整表重载(冲掉别人的运行期规则)",
      [(PRECISE, "  _nft_apply_main >/dev/null 2>&1 || true  # 变异: 直接整表重载", 1)], [T_LEAK]),
     # 替换体也要跟着形态走: 抽取从"管道接一段 awk"变成了独立函数 _ios_offer_marks 里的
