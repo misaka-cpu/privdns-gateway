@@ -137,7 +137,7 @@ IOS_TMPL="$CH_DIR/tmpl.mobileconfig"
 export PDG_IOS_LEGACY=n
 # shellcheck source=/dev/null
 . "$CH_DIR/fn.sh"
-"$CH_FN" ${CH_ARG:+"$CH_ARG"} < <(sleep "${CH_STDIN_HOLD:-8}")
+"$CH_FN" ${CH_ARG:+"$CH_ARG"} < <(exec 6>&-; sleep "${CH_STDIN_HOLD:-8}")
 echo "RC=$?"
 echo "REACHED-END"
 '''
@@ -155,7 +155,7 @@ def mkcase(tag, fn="cmd_ios", **env_extra):
     with open(os.path.join(d, "iosstate.py"), "w", encoding="utf-8") as f:
         f.write("# stub\n")
     for name, s in (("nft", NFT_STUB), ("python3", PY_STUB),
-                    ("openssl", '#!/bin/sh\nod -An -N6 -tx1 /dev/urandom | tr -d " \\n"\necho\n'),
+                    ("openssl", '#!/bin/sh\n# 按请求长度出: `rand -hex N` 要 2N 位十六进制。写死 12 位的话, 会话标识(-hex 8)\n# 会被产品判成非法, 现场长得像"openssl 坏了"。\nn=$(eval echo \\$$#)\ncase "$n" in ""|*[!0-9]*) n=6 ;; esac\nod -An -N"$n" -tx1 /dev/urandom | tr -d " \\n"\necho\n'),
                     ("qrencode", '#!/bin/sh\nexit 0\n')):
         p = os.path.join(b, name)
         with open(p, "w", encoding="utf-8") as f:
@@ -229,20 +229,24 @@ def wait_for(fn, limit=30.0):
     return False
 
 
-def tmpdirs(d):
-    """本轮在沙箱里建出来的临时目录 —— 通道的 WWW 与调用方的 staging 都在这里。"""
-    out = []
-    for name in sorted(os.listdir(d)):
-        p = os.path.join(d, name)
-        if name.startswith("tmp.") and os.path.isdir(p):
-            out.append(p)
+def session_dirs(d):
+    """固定安全父目录下的会话目录 —— 一轮应当**恰好一个**。"""
     root = os.path.join(d, "offerroot")
-    if os.path.isdir(root):
-        for name in sorted(os.listdir(root)):
-            p = os.path.join(root, name)
-            if os.path.isdir(p):
-                out.append(p)
-    return out
+    if not os.path.isdir(root):
+        return []
+    return [os.path.join(root, n) for n in sorted(os.listdir(root))
+            if os.path.isdir(os.path.join(root, n))]
+
+
+def stray_dirs(d):
+    """沙箱里 mktemp 风格的散装目录。调用方一旦另建 staging 就会出现在这里 ——
+    合并成一个会话目录之后, 它必须是空的: 那正是"第二个没人认领的目录"消失的证据。"""
+    return [os.path.join(d, n) for n in sorted(os.listdir(d))
+            if n.startswith("tmp.") and os.path.isdir(os.path.join(d, n))]
+
+
+def tmpdirs(d):
+    return session_dirs(d) + stray_dirs(d)
 
 
 def alive(pids):
@@ -309,13 +313,20 @@ for fn, arg, why in (("cmd_ios", None, "pdg ios"),
             bad("%s: 通道没就绪, 这一组没测到东西\n%s"
                 % (why, read(os.path.join(pre["dir"], "out"))[:400]))
             continue
-        print("       %s 前像: 目录=%d 个 %s | HTTP=%s | 8443=%s | 标记=%d | state=%s"
-              % (why, len(pre["dirs"]), [os.path.basename(x) for x in pre["dirs"]],
+        sess = [x for x in pre["dirs"] if os.sep + "offerroot" + os.sep in x]
+        stray = [x for x in pre["dirs"] if x not in sess]
+        print("       %s 前像: 会话目录=%s | 散装 staging=%s | HTTP=%s | 8443=%s | 标记=%d | state=%s"
+              % (why, [os.path.basename(x) for x in sess] or "无",
+                 [os.path.basename(x) for x in stray] or "无",
                  pre["srv"] or "无", pre["port"], pre["marks"], pre["state"]))
-        if len(pre["dirs"]) < 2 or not pre["srv"] or not pre["port"] \
+        if len(sess) != 1 or not pre["srv"] or not pre["port"] \
                 or pre["marks"] != 1 or not pre["state"]:
-            bad("%s 前像不成立(目录 %d 个, 期望 ≥2: 调用方 staging + 通道 WWW)"
-                % (why, len(pre["dirs"])))
+            bad("%s 前像不成立(会话目录 %d 个, 期望恰好 1; HTTP=%s 端口=%s 标记=%d state=%s)"
+                % (why, len(sess), pre["srv"], pre["port"], pre["marks"], pre["state"]))
+            continue
+        if stray:
+            bad("%s: 调用方另建了 staging(%s) —— 一轮应当只有一个会话目录"
+                % (why, [os.path.basename(x) for x in stray]))
             continue
         r = successor(pre, "g1s-" + fn)
         left = [x for x in pre["dirs"] if os.path.isdir(x)]

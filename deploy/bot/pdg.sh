@@ -2538,6 +2538,87 @@ IOS_OFFER_LOCK="${PDG_IOS_OFFER_LOCKFILE:-/run/privdns-gateway-ios-offer.lock}"
 # 可能打死一个毫不相干的新进程。
 IOS_OFFER_STATE="${PDG_IOS_OFFER_STATEFILE:-/run/privdns-gateway-ios-offer.state}"
 
+# 会话目录的固定安全父目录。**不再用 mktemp -d 各自建一个**: 以前调用方有自己的 staging、
+# 通道有自己的 WWW, 两个目录只有一个进了所有权记录 —— 被强杀之后, 后继会话按记录收掉了
+# 一个, 另一个里那份同样带 DoT 主机名与根证书的描述文件没人认领, 而报告是 rc=0。
+# 现在一轮只有一个目录, 归属由目录自身携带的凭据证明, 而不是靠"进程还活着"。
+IOS_OFFER_ROOT="${PDG_IOS_OFFER_ROOT:-/run/privdns-gateway-ios}"
+IOS_OFFER_SENTINEL=".pdg-offer-session"
+
+# 目录归不归本功能所有 —— **不依赖任何进程还活着**。HTTP 自己的 600 秒超时一到, PID 就没了,
+# 那时若还只认 PID, 目录就永远没人敢删。六条全过才算数:
+#   在固定安全父目录之下 / 本身不是符号链接 / 是目录 / 属主是自己 / 权限恰好 0700 /
+#   里面带着 mode 0600 的会话凭据且内容与记录里的 session id 逐字相等, 且除凭据外只有描述文件。
+_ios_offer_dir_ok(){
+  local dir="$1" sid="$2" real root_real ent
+  [[ -n "$dir" && -n "$sid" ]] || return 1
+  [[ -L "$dir" ]] && return 1
+  [[ -d "$dir" ]] || return 1
+  root_real="$(readlink -f "$IOS_OFFER_ROOT" 2>/dev/null)" || return 1
+  real="$(readlink -f "$dir" 2>/dev/null)" || return 1
+  [[ -n "$root_real" && "$real" == "$root_real"/* ]] || return 1
+  [[ -O "$dir" ]] || return 1
+  [[ "$(stat -c %a "$dir" 2>/dev/null)" == 700 ]] || return 1
+  [[ -f "$dir/$IOS_OFFER_SENTINEL" && ! -L "$dir/$IOS_OFFER_SENTINEL" ]] || return 1
+  [[ "$(stat -c %a "$dir/$IOS_OFFER_SENTINEL" 2>/dev/null)" == 600 ]] || return 1
+  [[ "$(cat "$dir/$IOS_OFFER_SENTINEL" 2>/dev/null)" == "$sid" ]] || return 1
+  # 允许内容集合: 凭据本身 + 描述文件。多出任何别的东西就不是我们建的那个目录。
+  while IFS= read -r ent; do
+    [[ -z "$ent" ]] && continue
+    ent="$(basename "$ent")"
+    [[ "$ent" == "$IOS_OFFER_SENTINEL" ]] && continue
+    [[ "$ent" == *.mobileconfig ]] && continue
+    return 1
+  done < <(find "$dir" -mindepth 1 -maxdepth 1 2>/dev/null)
+  return 0
+}
+
+# 会话开场: 取锁 → 收上一轮的残留(数据面在先) → 建本轮唯一的目录并写下会话凭据。
+# 调用方在生成描述文件**之前**调它, 于是生成物一开始就落在这个目录里, 不存在第二个目录。
+_ios_offer_session_begin(){
+  _ios_offer_lock_acquire || return 1
+  _IOS_OFFER_ACTIVE=1; _IOS_OFFER_SRV=""; _IOS_OFFER_WWW=""; _IOS_OFFER_HANDLE=""
+  _IOS_OFFER_SID=""; _IOS_OFFER_STATE_OWNED=""
+  trap '_ios_offer_teardown' EXIT
+  trap '_ios_offer_on_signal HUP 1'   HUP
+  trap '_ios_offer_on_signal INT 2'   INT
+  trap '_ios_offer_on_signal TERM 15' TERM
+
+  # 顺序是先关数据面、再撤访问面: 上一次被强杀的会话留下的 HTTP 还在对外服务, 那是更紧的
+  # 一头; nft 链读不到不是跳过它的理由。两边都要试, 错误合并上报。
+  local reap_rc=0 sweep_rc=0
+  _ios_offer_reap_orphan || reap_rc=1
+  _ios_offer_nft_close   || sweep_rc=1
+  if [[ "$reap_rc" -ne 0 || "$sweep_rc" -ne 0 ]]; then
+    _ios_offer_abort "入场清理未完成(孤儿回收 rc=$reap_rc, 残留放行清理 rc=$sweep_rc) —— 未开放任何临时端口。"
+    return 1
+  fi
+
+  mkdir -p "$IOS_OFFER_ROOT" 2>/dev/null
+  chmod 0700 "$IOS_OFFER_ROOT" 2>/dev/null
+  if [[ -L "$IOS_OFFER_ROOT" ]] || [[ ! -d "$IOS_OFFER_ROOT" ]] || [[ ! -O "$IOS_OFFER_ROOT" ]] \
+     || [[ "$(stat -c %a "$IOS_OFFER_ROOT" 2>/dev/null)" != 700 ]]; then
+    _ios_offer_abort "会话目录的父目录不可信($IOS_OFFER_ROOT: 需为自己拥有的 0700 真实目录) —— 未开放任何临时端口。"
+    return 1
+  fi
+  _IOS_OFFER_SID="$(openssl rand -hex 8 2>/dev/null)" || _IOS_OFFER_SID=""
+  if [[ ! "$_IOS_OFFER_SID" =~ ^[0-9a-f]{16}$ ]]; then
+    _ios_offer_abort "生成会话标识失败(openssl) —— 未开放任何临时端口。"; return 1
+  fi
+  local dir="$IOS_OFFER_ROOT/s.$_IOS_OFFER_SID"
+  if ! (umask 077 && mkdir "$dir") 2>/dev/null; then
+    _ios_offer_abort "创建本轮会话目录失败($dir) —— 未开放任何临时端口。"; return 1
+  fi
+  if ! (umask 077 && printf '%s' "$_IOS_OFFER_SID" > "$dir/$IOS_OFFER_SENTINEL") 2>/dev/null; then
+    rm -rf "$dir"
+    _ios_offer_abort "写不下会话凭据 —— 未开放任何临时端口。"; return 1
+  fi
+  chmod 0600 "$dir/$IOS_OFFER_SENTINEL" 2>/dev/null
+  _IOS_OFFER_WWW="$dir"
+  return 0
+}
+
+
 # 极小的**精确路径** HTTP 服务, 取代 `python3 -m http.server`。
 # 换掉它的理由不是洁癖: 那个模块对 `/` 返回**目录清单**, 于是"文件名带一次性随机串, 同网段
 # 猜不到"这句话不成立 —— nft 放行的正是那个网段, 里面任何设备请求一次根路径就把文件名拿走
@@ -2584,14 +2665,15 @@ S((BIND, PORT), H).serve_forever()
 # 同目录候选文件 → 写满 → chmod 0600 → 原子 rename。任何一步失败都算失败, 且不留半截文件。
 # 里面是 pid 与本机路径, 所以权限固定 0600, 不跟 umask 走。
 _ios_offer_state_write(){
-  local pid="$1" start="$2" www="$3" dir tmp
+  local sid="$1" pid="$2" start="$3" www="$4" dir tmp
+  [[ "$sid" =~ ^[0-9a-f]{16}$ ]] || return 1
   [[ "$pid" =~ ^[0-9]+$ ]] || return 1
   [[ "$start" =~ ^[0-9]+$ ]] || return 1
   [[ -n "$www" && -d "$www" ]] || return 1
   dir="$(dirname "$IOS_OFFER_STATE")"
   [[ -d "$dir" && -w "$dir" ]] || return 1
   tmp="$(mktemp "$IOS_OFFER_STATE.XXXXXX" 2>/dev/null)" || return 1
-  if ! printf 'pid=%s\nstart=%s\nwww=%s\n' "$pid" "$start" "$www" > "$tmp" 2>/dev/null; then
+  if ! printf 'sid=%s\npid=%s\nstart=%s\nwww=%s\n' "$sid" "$pid" "$start" "$www" > "$tmp" 2>/dev/null; then
     rm -f "$tmp"; return 1
   fi
   chmod 0600 "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
@@ -2615,39 +2697,61 @@ _ios_offer_starttime(){
 # 正是我们当初建的那个目录。任何一条对不上就只清记录, 不碰任何进程。
 _ios_offer_reap_orphan(){
   [[ -s "$IOS_OFFER_STATE" ]] || return 0
-  local pid start www now n=0 rc=0 matched=0
-  pid="$(sed -n 's/^pid=//p'   "$IOS_OFFER_STATE" | head -1)"
+  local sid pid start www now n=0 rc=0
+  sid="$(sed -n 's/^sid=//p'     "$IOS_OFFER_STATE" | head -1)"
+  pid="$(sed -n 's/^pid=//p'     "$IOS_OFFER_STATE" | head -1)"
   start="$(sed -n 's/^start=//p' "$IOS_OFFER_STATE" | head -1)"
-  www="$(sed -n 's/^www=//p'   "$IOS_OFFER_STATE" | head -1)"
-  # 记录**先不删**: 处理完才算接手。上一版一进来就 rm, 于是半途失败时这份记录也没了,
-  # 下一次会话既不知道该收谁、也不知道该删哪个目录。
-  if [[ "$pid" =~ ^[0-9]+$ && "$start" =~ ^[0-9]+$ && -n "$www" && -d "/proc/$pid" ]]; then
-    now="$(_ios_offer_starttime "$pid")"
-    if [[ -n "$now" && "$now" == "$start" ]] \
-       && [[ "$(readlink -f "/proc/$pid/cwd" 2>/dev/null)" == "$(readlink -f "$www" 2>/dev/null)" ]]; then
-      matched=1
-      kill -TERM "$pid" 2>/dev/null
-      while [[ "$n" -lt 30 ]] && kill -0 "$pid" 2>/dev/null; do sleep 0.1; n=$((n + 1)); done
-      if kill -0 "$pid" 2>/dev/null; then
-        kill -KILL "$pid" 2>/dev/null
-        n=0
-        while [[ "$n" -lt 20 ]] && kill -0 "$pid" 2>/dev/null; do sleep 0.1; n=$((n + 1)); done
-      fi
-      if kill -0 "$pid" 2>/dev/null; then
-        echo "❌ 上一次强杀留下的临时下载服务(pid $pid)停不掉 —— 端口可能仍被占着。"
-        rc=1
-      else
-        c_y "回收了上一次被强杀留下的临时下载服务(pid $pid)。"
-      fi
+  www="$(sed -n 's/^www=//p'     "$IOS_OFFER_STATE" | head -1)"
+  # 记录先不删: 处理完才算接手。半途失败时留着它, 下一次会话还能接着收。
+
+  # 目录已经不在了 —— 没有可收的东西, 记录作废。
+  if [[ -z "$www" || ! -e "$www" ]]; then
+    if ! rm -f "$IOS_OFFER_STATE" 2>/dev/null || [[ -e "$IOS_OFFER_STATE" ]]; then
+      echo "❌ 清不掉过期的运行期所有权记录($IOS_OFFER_STATE) —— 下一次会话会拿它做身份核对。"
+      return 1
     fi
+    return 0
   fi
-  # **目录删除必须在身份校验之内。** 上一版把它放在校验分支外面: 一份内容对得上的 state
-  # 就足以让它删掉一个与本功能毫无关系的目录 —— 那是拿 rm -rf 认字符串, 不是认身份。
-  if [[ "$matched" == 1 && "$rc" == 0 && -n "$www" && -d "$www" ]]; then
-    [[ -z "$(find "$www" -mindepth 1 -maxdepth 1 ! -name '*.mobileconfig' -print -quit 2>/dev/null)" ]] \
-      && rm -rf "$www"
+
+  # 目录还在但**证不明归属**: 不杀、不删、不覆盖记录, 让本次会话 fail-closed。
+  # 一份能解析的 state 不该成为删掉任意目录的凭据。
+  if ! _ios_offer_dir_ok "$www" "$sid"; then
+    echo "❌ 运行期记录指向的目录证不明归属($www) —— 不动它, 也不动那份记录; 本次拒绝开通道。"
+    echo "   判据: 必须位于 $IOS_OFFER_ROOT 之下、非符号链接、自己拥有、权限 0700,"
+    echo "   且带着与记录一致的会话凭据、目录内除凭据外只有描述文件。请人工确认后处理。"
+    return 1
   fi
-  [[ "$rc" == 0 ]] && rm -f "$IOS_OFFER_STATE"
+
+  # 进程还在: 必须 PID + starttime + cwd 三者全对才动手。starttime 排除 PID 复用。
+  if [[ "$pid" =~ ^[0-9]+$ && -d "/proc/$pid" ]]; then
+    now="$(_ios_offer_starttime "$pid")"
+    if [[ -z "$now" || "$now" != "$start" ]] \
+       || [[ "$(readlink -f "/proc/$pid/cwd" 2>/dev/null)" != "$(readlink -f "$www" 2>/dev/null)" ]]; then
+      echo "❌ 运行期记录里的 PID $pid 与记录对不上(starttime 或 cwd 不符) —— 不杀、不删; 本次拒绝开通道。"
+      return 1
+    fi
+    kill -TERM "$pid" 2>/dev/null
+    while [[ "$n" -lt 30 ]] && kill -0 "$pid" 2>/dev/null; do sleep 0.1; n=$((n + 1)); done
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -KILL "$pid" 2>/dev/null
+      n=0
+      while [[ "$n" -lt 20 ]] && kill -0 "$pid" 2>/dev/null; do sleep 0.1; n=$((n + 1)); done
+    fi
+    if kill -0 "$pid" 2>/dev/null; then
+      echo "❌ 上一次强杀留下的临时下载服务(pid $pid)停不掉 —— 端口可能仍被占着。"
+      return 1
+    fi
+    c_y "回收了上一次被强杀留下的临时下载服务(pid $pid)。"
+  fi
+  # 进程已经不在(比如它自己的 600 秒超时到了)时, 归属由上面 _ios_offer_dir_ok 那六条证明,
+  # **不需要活着的 PID**。上一版在这种情形下把记录删了却留着目录, 线索就此永远丢失。
+  rm -rf "$www"
+  if [[ -e "$www" ]]; then
+    echo "❌ 删不掉上一轮的会话目录($www)。"; rc=1
+  fi
+  if ! rm -f "$IOS_OFFER_STATE" 2>/dev/null || [[ -e "$IOS_OFFER_STATE" ]]; then
+    echo "❌ 清不掉运行期所有权记录($IOS_OFFER_STATE) —— 下一次会话会拿它做身份核对。"; rc=1
+  fi
   return "$rc"
 }
 
@@ -2823,29 +2927,27 @@ _ios_offer_teardown(){
     fi
   fi
   _ios_offer_nft_close || rc=1
+  # 一轮只有一个目录 —— 调用方的生成物与 HTTP 服务的根是同一个, 所以这里收干净就没有
+  # "另一个没人认领的目录"了。
   if [[ -n "${_IOS_OFFER_WWW:-}" ]]; then
     rm -rf "$_IOS_OFFER_WWW"
     if [[ -e "$_IOS_OFFER_WWW" ]]; then
-      echo "❌ 临时下载目录没能删掉: $_IOS_OFFER_WWW"; rc=1
+      echo "❌ 本轮会话目录没能删掉: $_IOS_OFFER_WWW"; rc=1
     fi
   fi
-  # 调用方的 staging 目录也归这里收。信号路径是 `exit`, 调用方那句 `rm -rf "$STAGE"`
-  # 永远执行不到 —— 不在这里收, 每被打断一次就在盘上留一份描述文件。
-  if [[ -n "${_IOS_OFFER_STAGE:-}" ]]; then
-    rm -rf "$_IOS_OFFER_STAGE"
-    if [[ -e "$_IOS_OFFER_STAGE" ]]; then
-      echo "❌ 调用方的 staging 目录没能删掉: $_IOS_OFFER_STAGE"; rc=1
-    fi
-    _IOS_OFFER_STAGE=""
-  fi
-  # **只删本轮自己写下的那份 state。** 入场时读到的旧孤儿记录不归我们处置 —— 回收流程
-  # 处理完才会删它; 在这里一并删掉的话, 一次半途失败就把下一次会话的线索抹了。
+  # **只删本轮自己写下的那份 state**, 而且删不掉要**计入返回码**。入场时读到的旧孤儿记录
+  # 不归这里处置(回收流程处理完才会删它); 而 `rm -f … || true` 那种吞法会让下一次会话拿着
+  # 一份本该消失的记录去做身份核对。
   if [[ -n "${_IOS_OFFER_STATE_OWNED:-}" ]]; then
-    rm -f "$IOS_OFFER_STATE" 2>/dev/null || true
-    _IOS_OFFER_STATE_OWNED=""
+    if ! rm -f "$IOS_OFFER_STATE" 2>/dev/null || [[ -e "$IOS_OFFER_STATE" ]]; then
+      echo "❌ 清不掉本轮的运行期所有权记录($IOS_OFFER_STATE) —— 下一次会话会拿它做身份核对。"
+      rc=1
+    else
+      _IOS_OFFER_STATE_OWNED=""
+    fi
   fi
   _ios_offer_lock_release
-  _IOS_OFFER_SRV=""; _IOS_OFFER_WWW=""; _IOS_OFFER_HANDLE=""
+  _IOS_OFFER_SRV=""; _IOS_OFFER_WWW=""; _IOS_OFFER_HANDLE=""; _IOS_OFFER_SID=""
   trap - HUP INT TERM
   return "$rc"
 }
@@ -2865,75 +2967,43 @@ _ios_offer_abort(){
 # 用法: _ios_offer_download <文件> <网关IP> <内网卡段> [附注行…]
 _ios_offer_download(){
   local SRC="$1" IP="$2" CIDR="$3"; shift 3
-  [[ -s "$SRC" ]] || { echo "❌ 没有可下发的文件, 未开放任何临时端口。"; return 1; }
-
-  # 抢会话锁**在做任何事之前**: 抢不到就零副作用退出 —— 装包、建目录、动 nft 一律不行,
-  # 因为此刻另一条通道正在服务, 它的规则、端口和目录都不属于我们。
-  _ios_offer_lock_acquire || return 1
-  _IOS_OFFER_ACTIVE=1; _IOS_OFFER_SRV=""; _IOS_OFFER_WWW=""; _IOS_OFFER_HANDLE=""
-  _IOS_OFFER_STATE_OWNED=""
-  # EXIT 与 HUP 缺一不可: HUP 是 SSH 断开发的信号, 线上那次泄漏就是它 —— 旧写法只捕
-  # INT/TERM, 收到 HUP 时 bash 直接死, 收尾一行都没跑。EXIT 兜住其余任何异常退出。
-  # SIGKILL 兜不住; 那种情况靠下一次进来时、拿到锁之后的残留清理。
-  # EXIT 只兜"异常退出", 三个信号各自走终止处理器 —— 它们的语义不同: EXIT 之后本来就
-  # 不会再有代码, 而信号之后 bash 会回到断点继续跑, 必须显式终止。
-  trap '_ios_offer_teardown' EXIT
-  trap '_ios_offer_on_signal HUP 1'   HUP
-  trap '_ios_offer_on_signal INT 2'   INT
-  trap '_ios_offer_on_signal TERM 15' TERM
+  # 会话必须已经由 _ios_offer_session_begin 开好: 锁、入场清理、本轮目录都在那里完成,
+  # 生成物一开始就落在这个目录里 —— 于是不存在"第二个没人认领的目录"。
+  if [[ -z "${_IOS_OFFER_ACTIVE:-}" || -z "${_IOS_OFFER_WWW:-}" || -z "${_IOS_OFFER_SID:-}" ]]; then
+    echo "❌ 内部错误: 临时下载通道未经会话开场就被调用。"; return 1
+  fi
+  [[ -s "$SRC" ]] || { _ios_offer_abort "没有可下发的文件, 未开放任何临时端口。"; return 1; }
 
   command -v qrencode >/dev/null || { c_g "装 qrencode…"; apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq qrencode; }
 
-  local PORT=8443 TOK WWW URL note txt want_sha want_len
-  # token 必须真的生成出来且严格是 12 位十六进制。openssl 失败时上一版对此一无所知, 于是
-  # 文件名退化成 `.mobileconfig` —— 同一网段里任何设备都猜得到那个路径。
+  local PORT=8443 TOK WWW URL note txt want_sha want_len addout
+  WWW="$_IOS_OFFER_WWW"
+  # token 必须真的生成出来且严格是 12 位十六进制。openssl 失败时文件名会退化成
+  # `.mobileconfig` —— 那是一个固定的、谁都知道的路径。
   TOK="$(openssl rand -hex 6 2>/dev/null)" || TOK=""
   if [[ ! "$TOK" =~ ^[0-9a-f]{12}$ ]]; then
     _ios_offer_abort "生成一次性下载令牌失败(openssl) —— 未开放任何临时端口。"; return 1
   fi
-  # mktemp 失败时上一版让 WWW 变成空串, 于是 install 的目标成了 `/$TOK.mobileconfig` ——
-  # 描述文件被写到**文件系统根目录**, 而且没人会去删它。
-  WWW="$(mktemp -d 2>/dev/null)" || WWW=""
-  if [[ -z "$WWW" || ! -d "$WWW" ]]; then
-    _ios_offer_abort "创建临时下载目录失败(mktemp -d) —— 未开放任何临时端口。"; return 1
+  # 同目录内改名, 不做拷贝: 生成物本来就在会话目录里。
+  if ! mv -f "$SRC" "$WWW/$TOK.mobileconfig" 2>/dev/null; then
+    _ios_offer_abort "准备下发文件失败 —— 未开放任何临时端口。"; return 1
   fi
-  _IOS_OFFER_WWW="$WWW"
-  # 文件名带一次性随机串: 同一网段里的别的设备猜不到这一次的路径。
-  if ! install -m 0644 "$SRC" "$WWW/$TOK.mobileconfig"; then
-    _ios_offer_abort "准备临时下载目录失败 —— 未开放任何临时端口。"; return 1
-  fi
+  chmod 0644 "$WWW/$TOK.mobileconfig" 2>/dev/null
   URL="http://$IP:$PORT/$TOK.mobileconfig"
-  # 就绪判据要拿本轮这一份的指纹去对, 不是"有东西应答就算"。
   want_sha="$(sha256sum "$WWW/$TOK.mobileconfig" 2>/dev/null | awk '{print $1}')"
   want_len="$(stat -c %s "$WWW/$TOK.mobileconfig" 2>/dev/null)"
   if [[ ! "$want_sha" =~ ^[0-9a-f]{64}$ ]] || [[ ! "$want_len" =~ ^[0-9]+$ ]]; then
     _ios_offer_abort "算不出待下发文件的指纹 —— 无法证明服务的是我们这一份, 未开放任何临时端口。"; return 1
   fi
 
-  # 拿到锁之后才清残留: 有锁作保证, 此刻链里带标记的规则一定是**上一次没收干净的**,
-  # 不可能是另一条还活着的会话 —— 这两者以前分不开, 于是清理等于抢别人的东西。
-  # 清不掉就不能继续: 那意味着我们连自己加的规则将来能不能撤掉都没有把握。
-  # 顺序是**先关数据面, 再撤访问面**: 上一次被强杀的会话留下的 HTTP 还在对外服务, 那是更
-  # 紧的一头; nft 链读不到不是跳过它的理由 —— 上一版把回收排在入场清理后面, 于是链一读不到
-  # 就 abort, 孤儿继续占着 8443 直到十分钟超时。两边都要试, 错误合并上报。
-  local reap_rc=0 sweep_rc=0
-  _ios_offer_reap_orphan || reap_rc=1
-  _ios_offer_nft_close   || sweep_rc=1
-  if [[ "$reap_rc" -ne 0 || "$sweep_rc" -ne 0 ]]; then
-    _ios_offer_abort "入场清理未完成(孤儿回收 rc=$reap_rc, 残留放行清理 rc=$sweep_rc) —— 未开放任何临时端口。"; return 1
-  fi
-
-  # exec: 让 kill 直接打在 timeout 上(它再转发给 python3)。少了它被杀的只是外层子 shell,
-  # 端口会一直开到 10 分钟超时为止。
-  # 6>&-: **子进程不许继承会话锁**。继承了的话, 父 shell 被 SIGKILL 之后锁还被这个子进程
-  # 攥着, 一直攥到 600 秒超时 —— 那十分钟里谁都开不了新通道, 而且看不出来是为什么。
-  ( cd "$WWW" && exec timeout 600 python3 -c "$IOS_OFFER_SERVER" \
+  # **只有一个 600 秒退出机制**: 服务脚本自带的 Timer。外层不再套 GNU timeout —— 套着的话
+  # 记录下来的 PID 是 timeout 的、真正听端口的是它的子进程, 身份核对与"停没停干净"就分了两层。
+  # 现在 `$!` 就是那个 HTTP 进程本身。
+  # 6>&-: 子进程不许继承会话锁, 否则父进程被 SIGKILL 之后锁还被它攥着直到超时。
+  ( cd "$WWW" && exec python3 -c "$IOS_OFFER_SERVER" \
         "$PORT" "/$TOK.mobileconfig" "$WWW/$TOK.mobileconfig" 0.0.0.0 >/dev/null 2>&1 ) 6>&- &
   _IOS_OFFER_SRV=$!
-  # 记录本轮的所有权凭据, 供"被 SIGKILL 之后的下一次会话"核对身份并回收。
-  # 写不成功就**不开通道**: 自愈完全靠这份记录, 记录没落盘的话, 强杀之后端口白占十分钟,
-  # 而现场看不出任何异常。
-  if ! _ios_offer_state_write "$_IOS_OFFER_SRV" \
+  if ! _ios_offer_state_write "$_IOS_OFFER_SID" "$_IOS_OFFER_SRV" \
         "$(_ios_offer_starttime "$_IOS_OFFER_SRV")" "$WWW"; then
     _ios_offer_abort "写不下运行期所有权记录($IOS_OFFER_STATE) —— 强杀之后将无法自愈, 本次不开通道。"; return 1
   fi
@@ -2941,13 +3011,8 @@ _ios_offer_download(){
     _ios_offer_abort "临时 HTTP 没能就绪 —— 端口 $PORT 上没有我们这一份文件(可能被别的服务占着), 未开放任何临时端口。"; return 1
   fi
 
-  # **追加**(add)而不是插到链首(insert): 链首在 `iifname "tailscale0" return` 之前,
-  # 在那里放一条按源地址的放行会踩中 Tailscale 入口隔离判据 —— tailnet 与运营商 SIM/APN
-  # 共用 RFC 6598 段, 只看源地址分不开两者, 所以判据看的是"排除规则排在来源匹配之前"。
-  # `-j --echo --handle` 让内核把**刚加进去的那一条**连同它的 handle 回报出来(nftables
-  # v1.0.6 实测: JSON 里是 `{"add":{"rule":{... "handle": N ...}}}`)。撤除凭据必须在这一刻
-  # 就拿到手 —— 只靠"事后读链找标记"的话, 读不了链的那一刻规则就再也删不掉了。
-  local addout
+  # **追加**(add)而不是插到链首: 链首在 `iifname "tailscale0" return` 之前, 在那里放一条
+  # 按源地址的放行会踩中 Tailscale 入口隔离判据。
   if ! addout="$(nft -j --echo --handle add rule inet pdg input ip saddr "$CIDR" \
         tcp dport "$PORT" accept comment "$IOS_OFFER_MARK" 2>&1)"; then
     _ios_offer_abort "添加临时放行失败(nft add): $(printf '%s' "$addout" | head -1) —— 通道未开放。"; return 1
@@ -2967,7 +3032,6 @@ sys.exit(1)
   if [[ ! "$_IOS_OFFER_HANDLE" =~ ^[0-9]+$ ]]; then
     _ios_offer_abort "nft add 没有回报本轮规则的 handle —— 拿不到撤除凭据, 已回收。"; return 1
   fi
-  # 加成功不等于加对了: 复查它确实在链里, 而且排在排除规则之后。
   if ! txt="$(_ios_offer_chain)"; then
     _ios_offer_abort "加完放行后读不回 input 链 —— 无法确认通道状态, 已回收。"; return 1
   fi
@@ -2975,7 +3039,6 @@ sys.exit(1)
     _ios_offer_abort "临时放行不在预期位置(应在 tailscale0 排除之后) —— 已回收。"; return 1
   fi
 
-  # 到这里才展示链接: 前面每一步都验过, 打出去的二维码是真能用的。
   qrencode -o /opt/pdg-bot/ios-qr.png "$URL" 2>/dev/null || true
   echo
   c_g "用手机(走【内网卡/蜂窝】, 关 WiFi)扫下面二维码 → Safari 打开 → 安装描述文件:"
@@ -3006,26 +3069,21 @@ cmd_ios_previous(){
   IP="$(_ios_server_ip)"
   CIDR="$(_ios_internal_cidr)"
   [[ -n "$IP" && -n "$CIDR" ]] || { echo "信息不全 (IP=$IP CIDR=$CIDR), 未开放任何临时端口。"; return 1; }
-  local STAGE OUT rc
-  # mktemp 失败时上一版让 STAGE 变成空串, OUT 就成了 `/PrivDNS-Gateway-prev.mobileconfig` ——
-  # 描述文件(带着这台网关的 DoT 主机名与根证书)被生成到**文件系统根目录**, 而收尾那句
-  # `rm -rf "$STAGE"` 展开成 `rm -rf ""`, 什么都不删, 于是它永远留在那儿。
-  STAGE="$(mktemp -d 2>/dev/null)" || STAGE=""
-  if [[ -z "$STAGE" || ! -d "$STAGE" ]]; then
-    echo "❌ 创建临时目录失败(mktemp -d) —— 未生成描述文件, 未开放任何临时端口。"; return 1
-  fi
-  OUT="$STAGE/PrivDNS-Gateway-prev.mobileconfig"
-  # 交给通道之前先登记: 信号路径是 exit, 下面那句 `rm -rf "$STAGE"` 永远执行不到。
-  _IOS_OFFER_STAGE="$STAGE"
+  local OUT rc
+  # 会话开场在**生成之前**: 取锁、收上一轮残留、建本轮唯一目录。生成物直接落在那个目录里,
+  # 所以不存在第二个只有一半进了所有权记录的 staging —— 强杀之后后继会话按记录就能一次收净。
+  _ios_offer_session_begin || return 1
+  OUT="$_IOS_OFFER_WWW/prev.mobileconfig"
   # 取字节这一步在 iosstate.py 里过 verified_artifact(): 与记录对不上就拿不到文件, 也就
   # 不会有端口被打开 —— 通道只服务于已经确认过的那一份产物, 和 Bot 那条路一样严。
   if ! python3 "$st" previous --out "$OUT"; then
-    rm -rf "$STAGE"; echo "❌ 取不出上一版, 未开放任何临时端口。"; return 1
+    _ios_offer_teardown || true
+    trap - EXIT HUP INT TERM
+    echo "❌ 取不出上一版, 未开放任何临时端口。"; return 1
   fi
   _ios_offer_download "$OUT" "$IP" "$CIDR" \
     "这一份是**上一版**: 只是把旧文件再给你一次, 记录的当前版本不会回退。"
   rc=$?
-  rm -rf "$STAGE"
   return $rc
 }
 
@@ -3068,25 +3126,20 @@ cmd_ios(){
     fi
     [[ "$ans" == [yY]* ]] && LEGACY=(--legacy)
   fi
-  local STAGE OUT rc
-  # mktemp 失败时上一版让 STAGE 变成空串, OUT 就成了 `/PrivDNS-Gateway.mobileconfig` ——
-  # 描述文件(带着这台网关的 DoT 主机名与根证书)被生成到**文件系统根目录**, 而收尾那句
-  # `rm -rf "$STAGE"` 展开成 `rm -rf ""`, 什么都不删, 于是它永远留在那儿。
-  STAGE="$(mktemp -d 2>/dev/null)" || STAGE=""
-  if [[ -z "$STAGE" || ! -d "$STAGE" ]]; then
-    echo "❌ 创建临时目录失败(mktemp -d) —— 未生成描述文件, 未开放任何临时端口。"; return 1
-  fi
-  OUT="$STAGE/PrivDNS-Gateway.mobileconfig"
-  # 交给通道之前先登记: 信号路径是 exit, 下面那句 `rm -rf "$STAGE"` 永远执行不到。
-  _IOS_OFFER_STAGE="$STAGE"
+  local OUT rc
+  # 会话开场在**生成之前**: 取锁、收上一轮残留、建本轮唯一目录。生成物直接落在那个目录里,
+  # 所以不存在第二个只有一半进了所有权记录的 staging —— 强杀之后后继会话按记录就能一次收净。
+  _ios_offer_session_begin || return 1
+  OUT="$_IOS_OFFER_WWW/gen.mobileconfig"
   if ! python3 "$ST" generate --dot-host "$HOST" --server-ip "$IP" --template "$TMPL" \
         --wloc-config /etc/privdns-gateway/mitm.json --ca-crt /etc/privdns-gateway/ca/ca.crt \
         --out "$OUT" "${LEGACY[@]}"; then
-    rm -rf "$STAGE"; echo "❌ 生成描述文件失败, 未开放任何临时端口。"; return 1
+    _ios_offer_teardown || true
+    trap - EXIT HUP INT TERM
+    echo "❌ 生成描述文件失败, 未开放任何临时端口。"; return 1
   fi
   _ios_offer_download "$OUT" "$IP" "$CIDR" "DoT:  $HOST"
   rc=$?
-  rm -rf "$STAGE"
   return $rc
 }
 

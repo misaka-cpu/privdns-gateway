@@ -438,6 +438,10 @@ PDG_IOS_LEGACY=n                   # 首次生成的那句问话在非交互场�
 python3(){ shift; echo "READONLY:${1:-none}"; }   # 调用形态是 python3 <模块> <子命令> …
 # 临时下载通道的落点: 同样给一句可识别的输出 —— "有没有给手机开取件的路"因此也是可观察的
 _ios_offer_download(){ echo "CHANNEL:$1"; }
+# 调用方现在先开会话(取锁/收残留/建本轮唯一目录)。这一格只问"子命令有没有落对分支",
+# 所以把会话开场与收尾一并顶掉 —— 不顶的话它们是未定义命令, 现场长得像分发错了。
+_ios_offer_session_begin(){ _IOS_OFFER_WWW="$(mktemp -d)"; _IOS_OFFER_ACTIVE=1; return 0; }
+_ios_offer_teardown(){ rm -rf "${_IOS_OFFER_WWW:-}"; return 0; }
 # 生成路径上那些会真动机器的动作: 一旦被走到就立刻暴露
 apt-get(){ echo "DANGER:apt-get $*"; return 1; }
 qrencode(){ echo "DANGER:qrencode"; return 1; }
@@ -568,19 +572,23 @@ esac
 exit 0
 """),
         ("qrencode", '#!/bin/sh\necho "qrencode $*" >> "$PDG_TEST_LOG"\n'),
-        # timeout 记下自己被怎么调起来、服务目录里到底是什么, 然后变成一个可被 kill 的长命
-        # 进程 —— "按回车即收"到底收没收干净, 靠它活着还是死了来判。
-        ("timeout", '#!/bin/bash\n'
-                    '{ echo "timeout-args=$(echo $*)"\n'
+        # 产品去掉了外层 `timeout 600`(只保留服务脚本自带的 Timer), 所以桩挪到 python3,
+        # 按被要求跑的东西分派。它记下自己被怎么调起来、服务目录里到底是什么, 然后变成那个
+        # 可被 kill 的长命进程 —— "按回车即收"到底收没收干净, 靠它活着还是死了来判。
+        ("python3", '#!/bin/bash\n'
+                    'real=/usr/bin/python3\n'
+                    'if [ "${1:-}" = -c ] && case "${2:-}" in *serve_forever*) true;; *) false;; esac; then\n'
+                    '{ echo "srv-args=$(echo $*)"\n'
                     '  echo "serve-cwd=$PWD"\n'
                     '  echo "serve-files=$(ls)"\n'
                     '  echo "serve-sha=$(sha256sum -- *.mobileconfig | awk \'{print $1}\')"\n'
                     '  echo "serve-pid=$$"\n'
                     '} >> "$PDG_TEST_LOG"\n'
                     ': > "$PDG_TEST_READY"\n'
-                    'shift\n'
                     'args=(); for a in "$@"; do [ "$a" = 0.0.0.0 ] && a=127.0.0.1; args+=("$a"); done\n'
-                    'exec "${args[@]}"\n')):
+                    'exec "$real" "${args[@]}"\n'
+                    'fi\n'
+                    'exec "$real" "$@"\n')):
     _p = os.path.join(CHBIN, _name)
     with open(_p, "w", encoding="utf-8") as f:
         f.write(_body)
@@ -597,6 +605,7 @@ sed -n '/^_lan_nft_reapply()/,/^}/p' deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 # 收尾从"整表重载"改成"按标记精确删除"之后又多了三个依赖(见 tests/test-ios-offer-download-leak.py)。
 # 漏抽任何一个, 现场都长成"产品没撤规则"的样子 —— 与真缺陷一模一样。
 for _fn in _ios_offer_teardown _ios_offer_abort _ios_offer_nft_close \
+           _ios_offer_session_begin _ios_offer_dir_ok \
            _ios_offer_chain _ios_offer_marks _ios_offer_rule_ok _ios_offer_ready \
            _ios_offer_lock_acquire _ios_offer_lock_release \
            _ios_offer_srv_alive _ios_offer_on_signal _ios_offer_reap_orphan _ios_offer_starttime _ios_offer_state_write; do
@@ -606,7 +615,7 @@ done
 # 调 _lan_nft_reapply 时半途死掉 —— 表现同样是"没还原防火墙", 与漏抽函数一模一样。
 # (_lan_nft_reapply 原先把这个路径写死在函数体里, 于是这里不抽也能跑; 路径收归常量之后
 #  就不行了 —— 写死路径让夹具"碰巧能用", 那本身就是它该被改掉的理由之一。)
-grep -E '^(LAN_NFT_CONF|IOS_OFFER_MARK|IOS_OFFER_LOCK|IOS_OFFER_STATE)=' deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
+grep -E '^(LAN_NFT_CONF|IOS_OFFER_MARK|IOS_OFFER_LOCK|IOS_OFFER_STATE|IOS_OFFER_ROOT|IOS_OFFER_SENTINEL)=' deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 # IOS_OFFER_PROBE 是多行常量, grep 抓不全 —— set -u 下就绪判据会当场炸。
 sed -n "/^IOS_OFFER_PROBE='/,/^'$/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 sed -n "/^IOS_OFFER_SERVER='/,/^'$/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
@@ -625,15 +634,22 @@ c_g(){ echo "$*"; }; c_y(){ echo "$*"; }
 # shellcheck source=/dev/null
 . "$CH_DIR/fn.sh"
 # 桩里的 HTTP 一起来就 touch ready, 这里的"回车"随之到达 —— 不靠 sleep 猜时序。
-_ios_offer_download "$CH_SRC" 203.0.113.10 172.22.0.0/16 "这一份是**上一版**" \
-  < <(n=0; while [ ! -e "$PDG_TEST_READY" ]; do sleep 0.05
+# 通道要求先开会话(取锁/收残留/建本轮唯一目录), 产物直接落进那个目录 —— 与真实调用方同序。
+# `if ! cmd; then echo "$?"` 里的 $? 是取反之后的状态(恒 0), 所以先存再判。
+_ios_offer_session_begin; _sb=$?
+if [ "$_sb" -ne 0 ]; then echo "RC=$_sb"; exit "$_sb"; fi
+cp "$CH_SRC" "$_IOS_OFFER_WWW/gen.mobileconfig"
+# `exec 6>&-`: stdin 占位子进程在会话锁 fd 打开之后才 fork, 不关掉会一直攥着 flock。
+_ios_offer_download "$_IOS_OFFER_WWW/gen.mobileconfig" 203.0.113.10 172.22.0.0/16 "这一份是**上一版**" \
+  < <(exec 6>&-; n=0; while [ ! -e "$PDG_TEST_READY" ]; do sleep 0.05
         n=$((n+1)); [ "$n" -gt 200 ] && break; done)
 echo "RC=$?"
 """
 _chenv = dict(os.environ, PATH=CHBIN + os.pathsep + os.environ.get("PATH", ""),
               PDG_TEST_LOG=CHLOG, PDG_TEST_READY=CHREADY, CH_DIR=CH, CH_SRC=CHSRC,
               PDG_IOS_OFFER_LOCKFILE=os.path.join(CH, "offer.lock"),
-              PDG_IOS_OFFER_STATEFILE=os.path.join(CH, "offer.state"), TMPDIR=CH)
+              PDG_IOS_OFFER_STATEFILE=os.path.join(CH, "offer.state"),
+              PDG_IOS_OFFER_ROOT=os.path.join(CH, "offerroot"), TMPDIR=CH)
 _r = subprocess.run(["bash", "-c", HARNESS_CH], capture_output=True, text=True,
                     cwd=str(ROOT), timeout=180, env=_chenv)
 _chout = (_r.stdout or "") + (_r.stderr or "")
@@ -645,15 +661,19 @@ def _lv(key):
     return m.group(1).strip() if m else ""
 
 
-# 命令行形态: `600 python3 -c <精确路径 handler> 8443 /<tok>.mobileconfig <文件> 0.0.0.0`。
-# 逐字比对整条太脆(脚本本身会随实现演进), 这里钉住不会变的三件: 10 分钟硬超时、端口、
-# 以及**不是** `-m http.server`(那正是被换掉的东西)。
-_ta = _lv("timeout-args")
-if _ta.startswith("600 python3 -c ") and " 8443 " in _ta and _ta.endswith(" 0.0.0.0") \
+# 命令行形态: `-c <精确路径 handler> 8443 /<tok>.mobileconfig <文件> 0.0.0.0`。
+# 逐字比对整条太脆(脚本本身会随实现演进), 这里钉住不会变的三件: 端口、绑定地址、以及
+# **不是** `-m http.server`(那正是被换掉的东西 —— 它会列目录)。
+# 10 分钟超时改由服务脚本自带的 Timer 负责, 外层不再套 GNU timeout, 于是记录里的 PID 就是
+# 真正听端口的那个进程, 身份核对与"停没停干净"不再分两层。
+_ta = _lv("srv-args")
+# 桩记的是**改写之前**的原样参数, 所以这里看到的绑定地址就是产品传的 0.0.0.0
+# (访问范围由 nft 那条按源地址的放行来控, 这一点没有放宽)。
+if _ta.startswith("-c ") and " 8443 " in _ta and _ta.endswith(" 0.0.0.0") \
         and "-m http.server" not in _ta:
-    ok("下载通道起的是精确路径 handler(非 -m http.server), 绑 8443, 自带 10 分钟硬超时")
+    ok("下载通道起的是精确路径 handler(非 -m http.server), 绑 8443, 无外层 timeout 包装")
 else:
-    bad("HTTP 没按预期起: timeout-args=%r\n%s" % (_lv("timeout-args"), _chout[:300]))
+    bad("HTTP 没按预期起: srv-args=%r\n%s" % (_lv("srv-args"), _chout[:300]))
 
 _tok = re.match(r"^([0-9a-f]{12})\.mobileconfig$", _lv("serve-files"))
 _url = "http://203.0.113.10:8443/%s.mobileconfig" % (_tok.group(1) if _tok else "?")

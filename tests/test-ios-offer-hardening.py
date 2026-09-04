@@ -89,16 +89,22 @@ esac
 exit 0
 '''
 
-SRV_STUB = r'''#!/bin/bash
-echo "srv-invoked $*" >> "$PDG_TEST_SRVLOG"
-echo "$$" >> "$PDG_TEST_SRVPID"
-shift
-[ "${PDG_TEST_SRV_MODE:-serve}" = instant ] && exit 1
-args=(); for a in "$@"; do [ "$a" = 0.0.0.0 ] && a=127.0.0.1; args+=("$a"); done
-exec "${args[@]}"
+PY_STUB = r'''#!/bin/bash
+# 产品已去掉外层 `timeout 600`(只保留服务脚本自带的 Timer), 所以桩从 `timeout` 挪到
+# `python3`, 按被要求跑的东西分派: 服务这一路才改写(把 0.0.0.0 换成回环, 免得跑一次测试
+# 对外开端口), 其余(就绪探针、handle 解析)一律 exec 真 python3。
+real=/usr/bin/python3
+if [ "${1:-}" = -c ] && case "${2:-}" in *serve_forever*) true;; *) false;; esac; then
+  echo "srv-invoked $*" >> "$PDG_TEST_SRVLOG"
+  echo "$$" >> "$PDG_TEST_SRVPID"
+  [ "${PDG_TEST_SRV_MODE:-serve}" = instant ] && exit 1
+  args=(); for a in "$@"; do [ "$a" = 0.0.0.0 ] && a=127.0.0.1; args+=("$a"); done
+  exec "$real" "${args[@]}"
+fi
+exec "$real" "$@"
 '''
 
-OPENSSL_STUB = ('#!/bin/sh\nod -An -N6 -tx1 /dev/urandom | tr -d " \\n"\necho\n')
+OPENSSL_STUB = ('#!/bin/sh\n# 按请求长度出: `rand -hex N` 要 2N 位十六进制。写死 12 位的话, 会话标识(-hex 8)\n# 会被产品判成非法, 现场长得像"openssl 坏了"。\nn=$(eval echo \\$$#)\ncase "$n" in ""|*[!0-9]*) n=6 ;; esac\nod -An -N"$n" -tx1 /dev/urandom | tr -d " \\n"\necho\n')
 
 INSTALL_STUB = r'''#!/bin/bash
 tgt="${!#}"
@@ -116,10 +122,12 @@ for fn in _ios_offer_download _ios_offer_teardown _ios_offer_abort _ios_offer_nf
           _ios_offer_chain _ios_offer_marks _ios_offer_rule_ok _ios_offer_ready \
           _ios_offer_lock_acquire _ios_offer_lock_release _ios_offer_on_signal \
           _ios_offer_srv_alive _ios_offer_reap_orphan _ios_offer_starttime \
-          _ios_offer_state_write _ios_offer_serve _nft_apply_main _lan_nft_reapply; do
+          _ios_offer_state_write _ios_offer_serve _ios_offer_session_begin \
+          _ios_offer_dir_ok \
+          _nft_apply_main _lan_nft_reapply; do
   sed -n "/^$fn()/,/^}/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 done
-grep -E '^(LAN_NFT_CONF|IOS_OFFER_MARK|IOS_OFFER_LOCK|IOS_OFFER_STATE)=' deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
+grep -E '^(LAN_NFT_CONF|IOS_OFFER_MARK|IOS_OFFER_LOCK|IOS_OFFER_STATE|IOS_OFFER_ROOT|IOS_OFFER_SENTINEL)=' deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 for v in IOS_OFFER_PROBE IOS_OFFER_SERVER; do
   sed -n "/^$v='/,/^'\$/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 done
@@ -135,7 +143,16 @@ done
 c_g(){ echo "$*"; }; c_y(){ echo "$*"; }
 # shellcheck source=/dev/null
 . "$CH_DIR/fn.sh"
-_ios_offer_download "$CH_SRC" 203.0.113.10 172.22.0.0/16 < <(sleep "${CH_STDIN_HOLD:-8}")
+# 通道现在要求先开会话: 取锁、收残留、建本轮**唯一**目录都在 _ios_offer_session_begin 里,
+# 生成物直接落在那个目录 —— 所以夹具也必须照这个次序来, 否则测的就不是产品的真实调用形态。
+# `if ! cmd; then echo "$?"` 里的 $? 是**取反之后**的状态(恒为 0)—— 会把开场失败报成 RC=0。
+_ios_offer_session_begin; _sb=$?
+if [ "$_sb" -ne 0 ]; then echo "RC=$_sb"; echo "REACHED-END"; exit "$_sb"; fi
+cp "$CH_SRC" "$_IOS_OFFER_WWW/gen.mobileconfig"
+# `exec 6>&-`: 这个 stdin 占位子进程是在会话锁的 fd 打开**之后**才 fork 的, 不关掉的话
+# 它会一直攥着 flock —— 父 shell 被 SIGKILL 之后它还活着, 后继会话就被自己的夹具挡成
+# BUSY。生产里 stdin 是 tty, 没有这种长命子进程。
+_ios_offer_download "$_IOS_OFFER_WWW/gen.mobileconfig" 203.0.113.10 172.22.0.0/16 < <(exec 6>&-; sleep "${CH_STDIN_HOLD:-8}")
 echo "RC=$?"
 echo "REACHED-END"
 '''
@@ -151,7 +168,7 @@ def mkcase(tag, **env_extra):
     src = os.path.join(d, "cur.mobileconfig")
     with open(src, "wb") as f:
         f.write(BODY)
-    for name, s in (("nft", NFT_STUB), ("timeout", SRV_STUB), ("openssl", OPENSSL_STUB),
+    for name, s in (("nft", NFT_STUB), ("python3", PY_STUB), ("openssl", OPENSSL_STUB),
                     ("install", INSTALL_STUB), ("qrencode", '#!/bin/sh\nexit 0\n')):
         p = os.path.join(b, name)
         with open(p, "w", encoding="utf-8") as f:
@@ -166,6 +183,7 @@ def mkcase(tag, **env_extra):
                PDG_TEST_PIDFILE=os.path.join(d, "pid"),
                PDG_IOS_OFFER_LOCKFILE=os.path.join(d, "offer.lock"),
                PDG_IOS_OFFER_STATEFILE=os.path.join(d, "offer.state"),
+               PDG_IOS_OFFER_ROOT=os.path.join(d, "offerroot"),
                TMPDIR=d, CH_DIR=d, CH_SRC=src, CH_ROOT=str(ROOT))
     env.update({k: str(v) for k, v in env_extra.items()})
     return d, env
@@ -412,6 +430,9 @@ try:
             envH["PDG_TEST_STATE"] = envK["PDG_TEST_STATE"]
             envH["PDG_IOS_OFFER_LOCKFILE"] = envK["PDG_IOS_OFFER_LOCKFILE"]
             envH["PDG_IOS_OFFER_STATEFILE"] = statefile
+            # 会话目录的固定安全父目录也必须共享 —— 后继会话拿自己的根去校验别人的目录,
+            # 判据当然不通过, 而那不是产品的问题。
+            envH["PDG_IOS_OFFER_ROOT"] = envK["PDG_IOS_OFFER_ROOT"]
             rH = finish(launch(dH, envH), dH, limit=40)
             still = [x for x in alive if os.path.exists("/proc/%d" % x)]
             probs = []
@@ -422,7 +443,8 @@ try:
             if shows_link(rH["out"]):
                 probs.append("后继会话仍打出了链接")
             if probs:
-                bad("后继会话 nft 读失败: " + "; ".join(probs))
+                bad("后继会话 nft 读失败: " + "; ".join(probs) + "\n       后继输出: "
+                    + rH["out"].strip().replace("\n", " | ")[:300])
             else:
                 ok("后继会话即使 nft 读失败, 也先停掉并确认了旧 HTTP, 自身非零退出不开通道")
 finally:

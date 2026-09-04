@@ -111,15 +111,19 @@ exit 0
 
 # `exec timeout …` 只认可执行文件, shell 函数换不掉它 —— 必须是真文件桩。
 # 它 touch ready 之后变成长命进程, "收没收干净"靠它死没死来判。
-TIMEOUT_STUB = r'''#!/bin/bash
-echo "timeout-args=$*" >> "$PDG_TEST_LOG"
-echo "$$" > "$PDG_TEST_SRVPID"
-: > "$PDG_TEST_READY"
-shift                                     # 吃掉 600
-# exec 真的 python3, 但把 --bind 0.0.0.0 改写成回环 —— 产品的就绪判据是"真取到文件",
-# 桩不真起就永远过不了; 而绑 0.0.0.0 会让一次跑测试对外开端口, 没有必要。
-args=(); for a in "$@"; do [ "$a" = 0.0.0.0 ] && a=127.0.0.1; args+=("$a"); done
-exec "${args[@]}"
+PY_STUB = r'''#!/bin/bash
+# 产品已去掉外层 `timeout 600`(只保留服务脚本自带的 Timer), 所以桩从 `timeout` 挪到
+# `python3`, 按被要求跑的东西分派: 服务这一路才改写(把 0.0.0.0 换成回环, 免得跑一次测试
+# 对外开端口), 其余(就绪探针、handle 解析)一律 exec 真 python3。
+real=/usr/bin/python3
+if [ "${1:-}" = -c ] && case "${2:-}" in *serve_forever*) true;; *) false;; esac; then
+  echo "srv-args=$(echo $*)" >> "$PDG_TEST_LOG"
+  echo "$$" > "$PDG_TEST_SRVPID"
+  : > "$PDG_TEST_READY"
+  args=(); for a in "$@"; do [ "$a" = 0.0.0.0 ] && a=127.0.0.1; args+=("$a"); done
+  exec "$real" "${args[@]}"
+fi
+exec "$real" "$@"
 '''
 
 HARNESS = r'''
@@ -131,12 +135,14 @@ for fn in _ios_offer_download _ios_offer_teardown _ios_offer_abort _ios_offer_nf
           _ios_offer_chain _ios_offer_marks _ios_offer_rule_ok _ios_offer_ready \
           _ios_offer_lock_acquire _ios_offer_lock_release \
           _ios_offer_srv_alive _ios_offer_on_signal _ios_offer_reap_orphan _ios_offer_starttime _ios_offer_state_write \
+          _ios_offer_session_begin \
+          _ios_offer_dir_ok \
           _nft_apply_main _lan_nft_reapply; do
   sed -n "/^$fn()/,/^}/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 done
 # 常量也要跟着抽: `set -u` 下漏一个就是 unbound variable, 而那会让收尾在半途死掉 ——
 # 表现与"产品没撤规则"一模一样(HANDOFF §10.7)。
-grep -E '^(LAN_NFT_CONF|IOS_OFFER_MARK|IOS_OFFER_LOCK|IOS_OFFER_STATE)=' deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
+grep -E '^(LAN_NFT_CONF|IOS_OFFER_MARK|IOS_OFFER_LOCK|IOS_OFFER_STATE|IOS_OFFER_ROOT|IOS_OFFER_SENTINEL)=' deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 # IOS_OFFER_PROBE 是**多行**单引号常量, `grep '^…='` 只会抓到第一行 —— 那样 set -u 下
 # 就绪判据当场炸掉, 现场看起来像"服务永远不就绪"。按范围抽。
 sed -n "/^IOS_OFFER_PROBE='/,/^'$/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
@@ -158,7 +164,13 @@ c_g(){ echo "$*"; }; c_y(){ echo "$*"; }
 . "$CH_DIR/fn.sh"
 # stdin 是一根**永远不会来数据**的管子: 函数会停在 `read` 上等我们发信号,
 # 而不是自己走完正常路径 —— 否则测的就不是信号路径了。
-_ios_offer_download "$CH_SRC" 203.0.113.10 172.22.0.0/16 < <(sleep 8)
+_ios_offer_session_begin; _sb=$?
+if [ "$_sb" -ne 0 ]; then echo "RC=$_sb"; exit "$_sb"; fi
+cp "$CH_SRC" "$_IOS_OFFER_WWW/gen.mobileconfig"
+# `exec 6>&-`: 这个 stdin 占位子进程是在会话锁的 fd 打开**之后**才 fork 的, 不关掉的话
+# 它会一直攥着 flock —— 父 shell 被 SIGKILL 之后它还活着, 后继会话就被自己的夹具挡成
+# BUSY。生产里 stdin 是 tty, 没有这种长命子进程。
+_ios_offer_download "$_IOS_OFFER_WWW/gen.mobileconfig" 203.0.113.10 172.22.0.0/16 < <(exec 6>&-; sleep 8)
 echo "RC=$?"
 '''
 
@@ -171,9 +183,15 @@ def _mkcase(tag):
     src = os.path.join(d, "cur.mobileconfig")
     with open(src, "w", encoding="utf-8") as f:
         f.write('<?xml version="1.0"?><plist><dict/></plist>\n')
-    for name, body in (("nft", NFT_STUB), ("timeout", TIMEOUT_STUB),
+    for name, body in (("nft", NFT_STUB), ("python3", PY_STUB),
                        ("qrencode", '#!/bin/sh\nexit 0\n'),
-                       ("openssl", '#!/bin/sh\necho deadbeefcafe\n')):
+                       # 按请求长度出: `rand -hex N` 要 2N 位。写死 12 位的话, 会话标识(-hex 8)会被判非法,
+                       # 现场长得像"openssl 坏了"。
+                       ("openssl", '#!/bin/sh\n'
+                                   'n=6\n'
+                                   'for a in "$@"; do n="$a"; done\n'
+                                   'case "$n" in ""|*[!0-9]*) n=6 ;; esac\n'
+                                   'od -An -N"$n" -tx1 /dev/urandom | tr -d " \\n"\necho\n')):
         p = os.path.join(b, name)
         with open(p, "w", encoding="utf-8") as f:
             f.write(body)
@@ -186,6 +204,7 @@ def _mkcase(tag):
                PDG_TEST_SRVPID=os.path.join(d, "srvpid"),
                PDG_IOS_OFFER_LOCKFILE=os.path.join(d, "offer.lock"),
                PDG_IOS_OFFER_STATEFILE=os.path.join(d, "offer.state"),
+               PDG_IOS_OFFER_ROOT=os.path.join(d, "offerroot"),
                TMPDIR=d,
                CH_DIR=d, CH_SRC=src, CH_ROOT=str(ROOT))
     return d, env

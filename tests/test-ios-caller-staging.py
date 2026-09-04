@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
-"""`pdg ios` / `pdg ios previous` 的 staging 目录 —— fail-closed 行为验证。
+"""`pdg ios` / `pdg ios previous` 的会话开场 —— fail-closed 行为验证。
 
-两个调用方都是 `STAGE=$(mktemp -d)`, 返回码没人看。`mktemp -d` 失败时 STAGE 变成空串,
-于是 `OUT="$STAGE/PrivDNS-Gateway.mobileconfig"` 算成 **`/PrivDNS-Gateway.mobileconfig`** ——
-描述文件被生成到**文件系统根目录**。收尾那句 `rm -rf "$STAGE"` 变成 `rm -rf ""`, 什么也不删,
-所以它会一直留在那儿, 而且没有任何人知道。
+两个调用方以前各自 `STAGE=$(mktemp -d)` 且不看返回码: 失败时 OUT 会算成
+`/PrivDNS-Gateway.mobileconfig`, 描述文件(带着这台网关的 DoT 主机名与根证书)被生成到
+**文件系统根目录**, 而 `rm -rf ""` 什么也不删。
 
-描述文件不是普通临时文件: 它带着这台网关的 DoT 主机名与根证书。掉在 / 上等于把它留给
-任何能读到根目录的人, 且永远不会被清理。
+现在它们改成先调 `_ios_offer_session_begin` —— 取锁、收上一轮残留、在固定安全父目录下建出
+本轮**唯一**的会话目录, 生成物直接落进去。于是"第二个没人认领的目录"不再存在, 而这一支
+要钉的是新契约: **会话开不起来时必须立刻停**, 不生成、不交出任何路径、不去开通道。
 
-判据是行为的: 真跑两个调用方(依赖用桩顶掉), 让 `mktemp -d` 失败, 看它们**有没有继续**
-往下生成、有没有把根目录路径交出去、有没有去开通道。
+判据是行为的: 真跑两个调用方(依赖用桩顶掉), 让会话开场失败, 看它们有没有继续往下走。
 夹具里的 python3 桩拒绝真写沙箱外的路径 —— 跑一次测试不该让这台机器的 / 多出文件。
 """
 import os
@@ -64,7 +63,15 @@ cd "$CH_ROOT"
 for fn in cmd_ios cmd_ios_previous; do
   sed -n "/^$fn()/,/^}/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 done
-grep -q 'STAGE=' "$CH_DIR/fn.sh" || { echo "EXTRACT-FAIL-stage"; exit 9; }
+grep -q '_ios_offer_session_begin' "$CH_DIR/fn.sh" || { echo "EXTRACT-FAIL-session"; exit 9; }
+# 会话内部不是这一支要测的东西, 顶掉它: 成功时给一个本轮目录, 失败注入时直接返回非零。
+_ios_offer_session_begin(){
+  if [ "${PDG_TEST_SESSION_FAIL:-}" = 1 ]; then
+    echo "❌ 会话开场失败(注入)"; return 1
+  fi
+  _IOS_OFFER_WWW="$(mktemp -d)"; _IOS_OFFER_ACTIVE=1; return 0
+}
+_ios_offer_teardown(){ rm -rf "${_IOS_OFFER_WWW:-}"; return 0; }
 # 依赖全部顶掉: 这一支只问"staging 失败之后调用方做了什么", 不牵扯真实平台门控与真实生成。
 need_root(){ :; }
 ic_gate(){ return 0; }
@@ -125,9 +132,9 @@ for fn in ("cmd_ios", "cmd_ios_previous"):
         bad("前提不成立: %s rc=%s, 没走到开通道 —— 下面几格无从判断\n%s"
             % (fn, r["rc"], r["out"][:300]))
 
-# ── mktemp -d 失败 → 必须立刻停, 不生成、不给根目录路径、不开通道 ───────────
+# ── 会话开不起来 → 必须立刻停, 不生成、不给根目录路径、不开通道 ─────────────
 for fn, why in (("cmd_ios", "pdg ios"), ("cmd_ios_previous", "pdg ios previous")):
-    r = run_caller(fn, PDG_TEST_MKTEMP_FAIL=1)
+    r = run_caller(fn, PDG_TEST_SESSION_FAIL=1)
     probs = []
     if r["rc"] in (None, 0):
         probs.append("返回 0")
@@ -139,9 +146,9 @@ for fn, why in (("cmd_ios", "pdg ios"), ("cmd_ios_previous", "pdg ios previous")
     if "OFFER-CALLED" in r["log"]:
         probs.append("仍然去开临时下载通道")
     if probs:
-        bad("%s 的 mktemp -d 失败: %s" % (why, "; ".join(probs)))
+        bad("%s 的会话开场失败: %s" % (why, "; ".join(probs)))
     else:
-        ok("%s 的 mktemp -d 失败 → 立即非零退出, 不生成、不给根目录路径、不开通道" % why)
+        ok("%s 的会话开场失败 → 立即非零退出, 不生成、不给根目录路径、不开通道" % why)
 
 print("\n%d passed, %d failed" % (PASS[0], FAIL[0]))
 sys.exit(1 if FAIL[0] else 0)

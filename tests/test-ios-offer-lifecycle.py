@@ -118,17 +118,19 @@ exit 0
 #   serve    正常起
 #   instant  起来就退(端口被占 / 解释器炸了的等价形态)
 #   bindfail 去绑一个已经被占住的端口, 让 python 自己失败
-SRV_STUB = r'''#!/bin/bash
-echo "srv-invoked $*" >> "$PDG_TEST_SRVLOG"
-echo "$$" >> "$PDG_TEST_SRVPID"
-shift                                   # 吃掉 600
-# bindfail 不在这里造: 追加第二个 --bind 只会被 argparse 取最后一个, 反而绑成功了。
-# 真正的绑定失败由测试**先把 8443 占住**制造, 让 python 自己撞 EADDRINUSE 退出。
-case "${PDG_TEST_SRV_MODE:-serve}" in
-  instant) exit 1 ;;
-esac
-args=(); for a in "$@"; do [ "$a" = 0.0.0.0 ] && a=127.0.0.1; args+=("$a"); done
-exec "${args[@]}"
+PY_STUB = r'''#!/bin/bash
+# 产品已去掉外层 `timeout 600`(只保留服务脚本自带的 Timer), 所以桩从 `timeout` 挪到
+# `python3`, 按被要求跑的东西分派: 服务这一路才改写(把 0.0.0.0 换成回环, 免得跑一次测试
+# 对外开端口), 其余(就绪探针、handle 解析)一律 exec 真 python3。
+real=/usr/bin/python3
+if [ "${1:-}" = -c ] && case "${2:-}" in *serve_forever*) true;; *) false;; esac; then
+  echo "srv-invoked $*" >> "$PDG_TEST_SRVLOG"
+  echo "$$" >> "$PDG_TEST_SRVPID"
+  [ "${PDG_TEST_SRV_MODE:-serve}" = instant ] && exit 1
+  args=(); for a in "$@"; do [ "$a" = 0.0.0.0 ] && a=127.0.0.1; args+=("$a"); done
+  exec "$real" "${args[@]}"
+fi
+exec "$real" "$@"
 '''
 
 # token 必须**每次不同**, 和生产里的 `openssl rand -hex 6` 一样。固定 token 会造出一个
@@ -137,7 +139,10 @@ exec "${args[@]}"
 OPENSSL_STUB = ('#!/bin/sh\n'
                 '[ "${PDG_TEST_TOKEN_FAIL:-}" = 1 ] && { echo "err" >&2; exit 1; }\n'
                 '[ "${PDG_TEST_TOKEN_FAIL:-}" = junk ] && { echo "NOT-HEX!!"; exit 0; }\n'
-                'od -An -N6 -tx1 /dev/urandom | tr -d " \\n"\n'
+                'n=6\n'
+                'for a in "$@"; do n="$a"; done\n'
+                'case "$n" in ""|*[!0-9]*) n=6 ;; esac\n'
+                'od -An -N"$n" -tx1 /dev/urandom | tr -d " \\n"\n'
                 'echo\n')
 
 MKTEMP_STUB = ('#!/bin/sh\n'
@@ -169,10 +174,11 @@ for fn in _ios_offer_download _ios_offer_teardown _ios_offer_abort _ios_offer_nf
           _ios_offer_chain _ios_offer_marks _ios_offer_rule_ok _ios_offer_ready \
           _ios_offer_lock_acquire _ios_offer_lock_release \
           _ios_offer_srv_alive _ios_offer_on_signal _ios_offer_reap_orphan _ios_offer_starttime _ios_offer_state_write \
+          _ios_offer_session_begin _ios_offer_dir_ok \
           _nft_apply_main _lan_nft_reapply; do
   sed -n "/^$fn()/,/^}/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 done
-grep -E '^(LAN_NFT_CONF|IOS_OFFER_MARK|IOS_OFFER_LOCK|IOS_OFFER_STATE)=' deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
+grep -E '^(LAN_NFT_CONF|IOS_OFFER_MARK|IOS_OFFER_LOCK|IOS_OFFER_STATE|IOS_OFFER_ROOT|IOS_OFFER_SENTINEL)=' deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 # IOS_OFFER_PROBE 是**多行**单引号常量, `grep '^…='` 只会抓到第一行 —— 那样 set -u 下
 # 就绪判据当场炸掉, 现场看起来像"服务永远不就绪"。按范围抽。
 sed -n "/^IOS_OFFER_PROBE='/,/^'$/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
@@ -195,7 +201,16 @@ done
 c_g(){ echo "$*"; }; c_y(){ echo "$*"; }
 # shellcheck source=/dev/null
 . "$CH_DIR/fn.sh"
-_ios_offer_download "$CH_SRC" 203.0.113.10 172.22.0.0/16 < <(sleep "${CH_STDIN_HOLD:-8}")
+# 通道现在要求先开会话: 取锁、收残留、建本轮**唯一**目录都在 _ios_offer_session_begin 里,
+# 生成物直接落在那个目录 —— 所以夹具也必须照这个次序来, 否则测的就不是产品的真实调用形态。
+# `if ! cmd; then echo "$?"` 里的 $? 是**取反之后**的状态(恒为 0)—— 会把开场失败报成 RC=0。
+_ios_offer_session_begin; _sb=$?
+if [ "$_sb" -ne 0 ]; then echo "RC=$_sb"; echo "REACHED-END"; exit "$_sb"; fi
+cp "$CH_SRC" "$_IOS_OFFER_WWW/gen.mobileconfig"
+# `exec 6>&-`: 这个 stdin 占位子进程是在会话锁的 fd 打开**之后**才 fork 的, 不关掉的话
+# 它会一直攥着 flock —— 父 shell 被 SIGKILL 之后它还活着, 后继会话就被自己的夹具挡成
+# BUSY。生产里 stdin 是 tty, 没有这种长命子进程。
+_ios_offer_download "$_IOS_OFFER_WWW/gen.mobileconfig" 203.0.113.10 172.22.0.0/16 < <(exec 6>&-; sleep "${CH_STDIN_HOLD:-8}")
 echo "RC=$?"
 '''
 
@@ -246,7 +261,7 @@ def mkcase(tag, **env_extra):
     src = os.path.join(d, "cur.mobileconfig")
     with open(src, "w", encoding="utf-8") as f:
         f.write('<?xml version="1.0"?><plist><dict/></plist>\n')
-    for name, body in (("nft", NFT_STUB), ("timeout", SRV_STUB), ("openssl", OPENSSL_STUB),
+    for name, body in (("nft", NFT_STUB), ("python3", PY_STUB), ("openssl", OPENSSL_STUB),
                        ("mktemp", MKTEMP_STUB), ("install", INSTALL_STUB),
                        ("qrencode", '#!/bin/sh\nexit 0\n')):
         p = os.path.join(b, name)
@@ -261,6 +276,7 @@ def mkcase(tag, **env_extra):
                PDG_TEST_STATE=os.path.join(d, "chain"),
                PDG_IOS_OFFER_LOCKFILE=os.path.join(d, "offer.lock"),
                PDG_IOS_OFFER_STATEFILE=os.path.join(d, "offer.state"),
+               PDG_IOS_OFFER_ROOT=os.path.join(d, "offerroot"),
                TMPDIR=d,
                CH_DIR=d, CH_SRC=src, CH_ROOT=str(ROOT))
     env.update({k: str(v) for k, v in env_extra.items()})
@@ -317,6 +333,16 @@ def run_case(tag, stdin_hold=1, **env_extra):
     d, env = mkcase(tag, CH_STDIN_HOLD=stdin_hold, **env_extra)
     p = launch(d, env)
     return finish(p, d)
+
+
+def session_dirs(env):
+    """本轮会话目录 —— 从固定安全父目录里取。以前是从 `install-target` 日志里推的, 而通道
+    现在用 mv(生成物本来就在会话目录里), 那条日志不再产生, 判据会静默变成"没有目录"。"""
+    root = env.get("PDG_IOS_OFFER_ROOT", "")
+    if not root or not os.path.isdir(root):
+        return []
+    return [os.path.join(root, n) for n in sorted(os.listdir(root))
+            if os.path.isdir(os.path.join(root, n))]
 
 
 def shows_link(out):
@@ -512,10 +538,9 @@ for tag, sig, why in (("hup", signal.SIGHUP, "SIGHUP"),
         probs.append("标记规则残留 %d 条" % len(r["marks"]))
     if has_listener():
         probs.append("8443 仍有监听")
-    www = re.search(r"install-target (\S+)", r["log"])
-    if www and os.path.exists(os.path.dirname(www.group(1))) \
-            and os.path.dirname(www.group(1)) != d:
-        probs.append("临时目录还在: %s" % os.path.dirname(www.group(1)))
+    _sd = session_dirs(env)
+    if _sd:
+        probs.append("会话目录还在: %s" % [os.path.basename(x) for x in _sd])
     # 锁文件不存在 = 这条通道**根本没有会话锁**, 那是缺陷本体, 不是"无需检查"。
     # 写成"存在才查"的话, 负控里"删掉会话锁"这一格会静默变成空转。
     lk = os.path.join(d, "offer.lock")
@@ -563,8 +588,8 @@ try:
                 alive.append(sp)
             except OSError:
                 pass
-        www = re.search(r"install-target (\S+)", read(os.path.join(dK, "log")))
-        wwwdir = os.path.dirname(www.group(1)) if www else ""
+        _sd = session_dirs(envK)
+        wwwdir = _sd[0] if _sd else ""
         lockfree = True
         try:
             fh = open(envK["PDG_IOS_OFFER_LOCKFILE"], "a")
@@ -614,6 +639,7 @@ try:
         envH["PDG_TEST_STATE"] = envK["PDG_TEST_STATE"]
         envH["PDG_IOS_OFFER_LOCKFILE"] = envK["PDG_IOS_OFFER_LOCKFILE"]
         envH["PDG_IOS_OFFER_STATEFILE"] = envK["PDG_IOS_OFFER_STATEFILE"]
+        envH["PDG_IOS_OFFER_ROOT"] = envK["PDG_IOS_OFFER_ROOT"]
         rH = finish(launch(dH, envH), dH, limit=60)
         post_orphan = []
         for sp in pre["orphan"]:
