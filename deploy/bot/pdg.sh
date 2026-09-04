@@ -2526,34 +2526,130 @@ _ios_internal_cidr(){
 # 上一次没收干净的残留, 下一次进来时能被认出来并顺手带走。
 IOS_OFFER_MARK="pdg-ios-offer"
 
-# 此刻链里带标记的临时放行有哪些(handle 列表, 一行一个)。
-_ios_offer_nft_handles(){
-  nft -a list chain inet pdg input 2>/dev/null \
-    | awk -v m="comment \"$IOS_OFFER_MARK\"" \
-          'index($0, m){ for(i=1;i<=NF;i++) if($i=="handle") print $(i+1) }'
+# 会话锁。这条通道最长活 600 秒, 期间**不能占着全局 _lock** —— 菜单进程可能还在跑, 拿全局
+# 锁会把不相干的运维动作一起挡住十分钟。所以单开一把只保护这条通道的非阻塞锁。
+# 它解决的是一个真问题: 标记与端口都是固定的, 没有锁的话第二次调用的入场清理会把第一条
+# **正在服务**的规则删掉, 而第一条毫不知情, 继续对着一个已经不通的链接等回车。
+IOS_OFFER_LOCK="${PDG_IOS_OFFER_LOCKFILE:-/run/privdns-gateway-ios-offer.lock}"
+
+# fd 6: 9 是全局锁、8 留给 BASH_XTRACEFD、7 是 _lock 里备份 stderr 用的, 都不能占。
+# 刻意不学 _lock 那样把 `2>` 和 `9>` 写在同一句 exec 里 —— 那个顺序陷阱它自己的注释里写着。
+_ios_offer_lock_acquire(){
+  if ! exec 6>>"$IOS_OFFER_LOCK"; then
+    echo "⛔ 会话锁文件不可用($IOS_OFFER_LOCK) —— 为避免两条通道互相拆台, 本次拒绝开通。"
+    return 1
+  fi
+  if ! flock -n 6; then
+    exec 6>&-
+    echo "⛔ BUSY: 已有一条 iOS 临时下载通道在运行 —— 本次不开, 也不动它的任何东西。"
+    echo "   等那一条按回车收尾(或 10 分钟自动收)之后再试。"
+    return 1
+  fi
+  return 0
 }
 
-# 撤掉带标记的临时放行。**幂等**(没有就什么都不做), 且**精确**(按 handle, 不按端口)。
-# 只有精确删除没删干净才退回整表重载 —— 那是兜底不是常态: 整表重载会把别人的运行期规则
-# 一并冲掉, 而这条通道没有理由去动别人的规则。
+_ios_offer_lock_release(){
+  [[ -e "/proc/$$/fd/6" ]] || return 0
+  exec 6>&-
+}
+
+# 读一次 input 链, 并让"读失败"能被区分出来。上一版把它 `2>/dev/null` 吞掉, 于是
+# **"链是空的"和"根本没读到"长得一模一样** —— 而后者被当成了"没有残留", 一句
+# "已关闭临时下载服务" 就这么建立在一次从未发生的读取上。
+_ios_offer_chain(){ nft -a list chain inet pdg input 2>&1; }
+
+# 从链文本里挑出带标记的 handle(一行一个)。只认标记, 不认端口。
+_ios_offer_marks(){
+  awk -v m="comment \"$IOS_OFFER_MARK\"" \
+      'index($0, m){ for(i=1;i<=NF;i++) if($i=="handle") print $(i+1) }'
+}
+
+# 撤掉带标记的临时放行, 并**证明**撤干净了。
+# 判据是撤除后重新读回来的最终状态, 不是删除命令自己的返回码: 命令失败但规则确实已经不在
+# 了(比如另一条路径先删了)算成功; 命令返回 0 而规则还在, 那是失败。
+# 绝不退回 _nft_apply_main 整表重载 —— 那会把救援平面和别人的运行期规则一并冲掉, 这条
+# 通道没有任何理由去动别人的规则。
 _ios_offer_nft_close(){
-  local h
-  for h in $(_ios_offer_nft_handles); do
+  local txt h left
+  if ! txt="$(_ios_offer_chain)"; then
+    echo "❌ 读不到 inet pdg input 链 —— 无法确认临时放行是否还在, 不当作已清理。"
+    echo "   nft 给出的原因: $(printf '%s' "$txt" | head -1)"
+    return 1
+  fi
+  for h in $(printf '%s\n' "$txt" | _ios_offer_marks); do
     nft delete rule inet pdg input handle "$h" >/dev/null 2>&1 || true
   done
-  [[ -z "$(_ios_offer_nft_handles)" ]] && return 0
-  _nft_apply_main >/dev/null 2>&1 || true
-  return 0
+  if ! txt="$(_ios_offer_chain)"; then
+    echo "❌ 撤除后读不回 inet pdg input 链 —— 无法确认已清理。"
+    echo "   nft 给出的原因: $(printf '%s' "$txt" | head -1)"
+    return 1
+  fi
+  left="$(printf '%s\n' "$txt" | _ios_offer_marks | grep -c . || true)"
+  [[ "$left" == 0 ]] && return 0
+  echo "❌ 撤除后仍有 $left 条 $IOS_OFFER_MARK 临时放行 —— 请人工检查 inet pdg input。"
+  return 1
 }
 
-# 收尾: 停服务、撤放行、清目录。三条信号路径与正常路径**共用这一处** —— 收尾只写一次,
-# 就不会出现"改了正常路径、忘了信号路径"。必须幂等: EXIT 兜底会让它在正常路径上再跑一次。
+# 加完之后复查: 规则真的在链里, 而且排在 `iifname "tailscale0" return` **之后**。
+# 只有当排除规则确实存在时才校验顺序 —— 不在本项目模板上的机器不该被这一条拦住。
+_ios_offer_rule_ok(){
+  local txt="$1" ret mark
+  mark="$(printf '%s\n' "$txt" | grep -n "comment \"$IOS_OFFER_MARK\"" | head -1 | cut -d: -f1)"
+  [[ -n "$mark" ]] || return 1
+  ret="$(printf '%s\n' "$txt" | grep -n 'iifname "tailscale0" return' | head -1 | cut -d: -f1)"
+  [[ -n "$ret" ]] || return 0
+  [[ "$mark" -gt "$ret" ]]
+}
+
+# 就绪判据: **真去把那份文件取一次**。走回环 —— input 链第一条就是 `iif "lo" accept`,
+# 所以这一步不依赖临时放行, 可以排在开放 nft 之前。
+# 只看进程活着是不够的: 8443 被别人占着时 python 会立刻退出, 而"刚 fork 出来还没死"那个
+# 瞬间与成功长得一模一样, 上一版就是据此打出二维码的。
+_ios_offer_ready(){
+  local url="$1" n=0
+  while [[ "$n" -lt 40 ]]; do
+    python3 -c 'import sys, urllib.request; urllib.request.urlopen(sys.argv[1], timeout=2).read(1)' \
+        "$url" >/dev/null 2>&1 && return 0
+    kill -0 "${_IOS_OFFER_SRV:-0}" 2>/dev/null || return 1   # 进程已死, 不必再等满 4 秒
+    sleep 0.1
+    n=$((n + 1))
+  done
+  return 1
+}
+
+# 收尾: 停服务 → 确认真的退了 → 精确撤放行 → 删目录 → 放锁 → 汇总。
+# 三条信号路径与正常路径**共用这一处**, 收尾只写一次。必须幂等: EXIT 兜底会让它在正常
+# 路径上再跑一次, 那一次必须是真 no-op, 而不是"再删一遍"或"把上一次的失败盖掉"。
 _ios_offer_teardown(){
-  [[ -n "${_IOS_OFFER_SRV:-}" ]] && kill "$_IOS_OFFER_SRV" 2>/dev/null
-  _ios_offer_nft_close
-  [[ -n "${_IOS_OFFER_WWW:-}" ]] && rm -rf "$_IOS_OFFER_WWW"
+  [[ -n "${_IOS_OFFER_ACTIVE:-}" ]] || return 0
+  _IOS_OFFER_ACTIVE=""
+  local rc=0
+  # 顺序要紧: 先停服务再撤放行。反过来的话, 撤除失败时服务还在跑, 而我们已经以为收干净了。
+  if [[ -n "${_IOS_OFFER_SRV:-}" ]]; then
+    kill "$_IOS_OFFER_SRV" 2>/dev/null
+    wait "$_IOS_OFFER_SRV" 2>/dev/null
+    if kill -0 "$_IOS_OFFER_SRV" 2>/dev/null; then
+      echo "❌ 临时 HTTP 进程($_IOS_OFFER_SRV)没能退出 —— 端口可能仍开着。"; rc=1
+    fi
+  fi
+  _ios_offer_nft_close || rc=1
+  if [[ -n "${_IOS_OFFER_WWW:-}" ]]; then
+    rm -rf "$_IOS_OFFER_WWW"
+    if [[ -e "$_IOS_OFFER_WWW" ]]; then
+      echo "❌ 临时下载目录没能删掉: $_IOS_OFFER_WWW"; rc=1
+    fi
+  fi
+  _ios_offer_lock_release
   _IOS_OFFER_SRV=""; _IOS_OFFER_WWW=""
-  return 0
+  return "$rc"
+}
+
+# setup 任何一步失败都走它: 把已经建起来的东西收掉、摘 trap, 由调用处 return 非零。
+# 于是"半开的通道"这种状态不存在 —— 要么全好, 要么什么都没留下。
+_ios_offer_abort(){
+  echo "❌ $1"
+  _ios_offer_teardown || true
+  trap - EXIT HUP INT TERM
 }
 
 # 给一份**已经生成好**的描述文件开一条临时下载通道, 用完就收:
@@ -2564,36 +2660,72 @@ _ios_offer_teardown(){
 _ios_offer_download(){
   local SRC="$1" IP="$2" CIDR="$3"; shift 3
   [[ -s "$SRC" ]] || { echo "❌ 没有可下发的文件, 未开放任何临时端口。"; return 1; }
+
+  # 抢会话锁**在做任何事之前**: 抢不到就零副作用退出 —— 装包、建目录、动 nft 一律不行,
+  # 因为此刻另一条通道正在服务, 它的规则、端口和目录都不属于我们。
+  _ios_offer_lock_acquire || return 1
+  _IOS_OFFER_ACTIVE=1; _IOS_OFFER_SRV=""; _IOS_OFFER_WWW=""
+  # EXIT 与 HUP 缺一不可: HUP 是 SSH 断开发的信号, 线上那次泄漏就是它 —— 旧写法只捕
+  # INT/TERM, 收到 HUP 时 bash 直接死, 收尾一行都没跑。EXIT 兜住其余任何异常退出。
+  # SIGKILL 兜不住; 那种情况靠下一次进来时、拿到锁之后的残留清理。
+  trap '_ios_offer_teardown' EXIT HUP INT TERM
+
   command -v qrencode >/dev/null || { c_g "装 qrencode…"; apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq qrencode; }
-  local PORT=8443 TOK WWW URL note
-  TOK=$(openssl rand -hex 6)
-  WWW=$(mktemp -d)
+
+  local PORT=8443 TOK WWW URL PROBE note txt
+  # token 必须真的生成出来且严格是 12 位十六进制。openssl 失败时上一版对此一无所知, 于是
+  # 文件名退化成 `.mobileconfig` —— 同一网段里任何设备都猜得到那个路径。
+  TOK="$(openssl rand -hex 6 2>/dev/null)" || TOK=""
+  if [[ ! "$TOK" =~ ^[0-9a-f]{12}$ ]]; then
+    _ios_offer_abort "生成一次性下载令牌失败(openssl) —— 未开放任何临时端口。"; return 1
+  fi
+  # mktemp 失败时上一版让 WWW 变成空串, 于是 install 的目标成了 `/$TOK.mobileconfig` ——
+  # 描述文件被写到**文件系统根目录**, 而且没人会去删它。
+  WWW="$(mktemp -d 2>/dev/null)" || WWW=""
+  if [[ -z "$WWW" || ! -d "$WWW" ]]; then
+    _ios_offer_abort "创建临时下载目录失败(mktemp -d) —— 未开放任何临时端口。"; return 1
+  fi
+  _IOS_OFFER_WWW="$WWW"
   # 文件名带一次性随机串: 同一网段里的别的设备猜不到这一次的路径。
   if ! install -m 0644 "$SRC" "$WWW/$TOK.mobileconfig"; then
-    rm -rf "$WWW"; echo "❌ 准备临时下载目录失败, 未开放任何临时端口。"; return 1
+    _ios_offer_abort "准备临时下载目录失败 —— 未开放任何临时端口。"; return 1
   fi
   URL="http://$IP:$PORT/$TOK.mobileconfig"
+  PROBE="http://127.0.0.1:$PORT/$TOK.mobileconfig"
 
-  # 上一次没收干净的残留先带走 —— 泄漏过的机器走一次这条路就自愈, 不必人工去摘规则。
-  _ios_offer_nft_close
+  # 拿到锁之后才清残留: 有锁作保证, 此刻链里带标记的规则一定是**上一次没收干净的**,
+  # 不可能是另一条还活着的会话 —— 这两者以前分不开, 于是清理等于抢别人的东西。
+  # 清不掉就不能继续: 那意味着我们连自己加的规则将来能不能撤掉都没有把握。
+  if ! _ios_offer_nft_close; then
+    _ios_offer_abort "清理上一次残留的临时放行失败 —— 未开放任何临时端口。"; return 1
+  fi
 
-  _IOS_OFFER_WWW="$WWW"; _IOS_OFFER_SRV=""
-  # **EXIT 与 HUP 是后加的**: HUP 是 SSH 断开发的信号, 也是线上那次泄漏的真凶 —— 旧写法
-  # 只捕 INT/TERM, 收到 HUP 时 bash 直接死, 收尾一行都没跑, 放行就永远留在链里; 而 Bot 的
-  # 「📱 iOS 描述文件」按钮是非交互调用, 根本不会有人"按回车"。EXIT 兜住其余任何异常退出。
-  # SIGKILL 兜不住 —— 那种情况靠上面那次入场清理。
-  trap '_ios_offer_teardown' EXIT HUP INT TERM
-  # **追加**(add)而不是插到链首(insert): 链首在 `iifname "tailscale0" return` **之前**,
+  # exec: 让 kill 直接打在 timeout 上(它再转发给 python3)。少了它被杀的只是外层子 shell,
+  # 端口会一直开到 10 分钟超时为止。
+  # 6>&-: **子进程不许继承会话锁**。继承了的话, 父 shell 被 SIGKILL 之后锁还被这个子进程
+  # 攥着, 一直攥到 600 秒超时 —— 那十分钟里谁都开不了新通道, 而且看不出来是为什么。
+  ( cd "$WWW" && exec timeout 600 python3 -m http.server "$PORT" --bind 0.0.0.0 >/dev/null 2>&1 ) 6>&- &
+  _IOS_OFFER_SRV=$!
+  if ! _ios_offer_ready "$PROBE"; then
+    _ios_offer_abort "临时 HTTP 没能就绪(端口 $PORT 可能被占) —— 未开放任何临时端口。"; return 1
+  fi
+
+  # **追加**(add)而不是插到链首(insert): 链首在 `iifname "tailscale0" return` 之前,
   # 在那里放一条按源地址的放行会踩中 Tailscale 入口隔离判据 —— tailnet 与运营商 SIM/APN
   # 共用 RFC 6598 段, 只看源地址分不开两者, 所以判据看的是"排除规则排在来源匹配之前"。
-  # 追加到链尾就排在排除之后, tailnet 流量永远到不了它; 即便真泄漏了也不会把 doctor 判红,
-  # 更不会让 pdg update 每次整轮回滚。
-  nft add rule inet pdg input ip saddr "$CIDR" tcp dport "$PORT" accept \
-      comment "$IOS_OFFER_MARK" 2>/dev/null
-  # exec: 让下面那个 kill 直接打在 timeout 上(它再转发给 python3)。少了它被杀的只是外层
-  # 子 shell, 端口会一直开到 10 分钟超时为止 —— 与"按回车即收"不符。
-  ( cd "$WWW" && exec timeout 600 python3 -m http.server "$PORT" --bind 0.0.0.0 >/dev/null 2>&1 ) &
-  _IOS_OFFER_SRV=$!
+  if ! nft add rule inet pdg input ip saddr "$CIDR" tcp dport "$PORT" accept \
+        comment "$IOS_OFFER_MARK" 2>/dev/null; then
+    _ios_offer_abort "添加临时放行失败(nft add) —— 通道未开放。"; return 1
+  fi
+  # 加成功不等于加对了: 复查它确实在链里, 而且排在排除规则之后。
+  if ! txt="$(_ios_offer_chain)"; then
+    _ios_offer_abort "加完放行后读不回 input 链 —— 无法确认通道状态, 已回收。"; return 1
+  fi
+  if ! _ios_offer_rule_ok "$txt"; then
+    _ios_offer_abort "临时放行不在预期位置(应在 tailscale0 排除之后) —— 已回收。"; return 1
+  fi
+
+  # 到这里才展示链接: 前面每一步都验过, 打出去的二维码是真能用的。
   qrencode -o /opt/pdg-bot/ios-qr.png "$URL" 2>/dev/null || true
   echo
   c_g "用手机(走【内网卡/蜂窝】, 关 WiFi)扫下面二维码 → Safari 打开 → 安装描述文件:"
@@ -2603,9 +2735,14 @@ _ios_offer_download(){
   echo "  (二维码 PNG 已存 /opt/pdg-bot/ios-qr.png)"
   c_y "装好后按回车收尾(10 分钟自动收)…"
   read -t 600 -r _ || true
-  _ios_offer_teardown
+  if _ios_offer_teardown; then
+    trap - EXIT HUP INT TERM
+    echo "已关闭临时下载服务。"
+    return 0
+  fi
   trap - EXIT HUP INT TERM
-  echo "已关闭临时下载服务。"
+  echo "❌ 收尾未完成 —— 见上面的诊断; 在人工确认之前不要认为这条通道已经关闭。"
+  return 1
 }
 
 # 取回上一版: 走的是与 `pdg ios` **同一条**临时下载通道。以前这里只把文件写到服务器上的

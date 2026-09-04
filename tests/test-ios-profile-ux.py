@@ -517,11 +517,38 @@ with open(CHSRC, "wb") as f:
 CHSHA = hashlib.sha256(open(CHSRC, "rb").read()).hexdigest()
 
 for _name, _body in (
-        ("nft", '#!/bin/sh\necho "nft $*" >> "$PDG_TEST_LOG"\n'),
+        # nft 要**有状态**: 产品加完放行会重新读链, 确认它确实在、且排在 tailscale0
+        # 排除之后。只回显命令的桩会让那次复查读到空链, 于是通道判自己开失败 —— 现场
+        # 长得像产品缺陷, 其实是桩太薄。
+        ("nft", r"""#!/bin/bash
+st="$CH_DIR/chain"
+if [ ! -s "$st" ]; then cat > "$st" <<'BASE'
+1|iif "lo" accept
+2|ct state established,related accept
+3|tcp dport 22 accept
+4|iifname "tailscale0" return
+BASE
+fi
+echo "nft $*" >> "$PDG_TEST_LOG"
+render(){ local a out="" q=0
+  for a in "$@"; do
+    if [ "$q" = 1 ]; then out="$out \"$a\""; q=0
+    else out="$out $a"; [ "$a" = comment ] && q=1; fi
+  done; echo "${out# }"; }
+case "$1" in
+  -a) echo "table inet pdg {"; echo "	chain input {"
+      while IFS='|' read -r h r; do [ -n "$h" ] && echo "		$r # handle $h"; done < "$st"
+      echo "	}"; echo "}" ;;
+  add) shift 5; nh=$(( $(cut -d'|' -f1 "$st" | sort -n | tail -1) + 1 ))
+       echo "$nh|$(render "$@")" >> "$st" ;;
+  delete) shift $(($# - 1)); grep -v "^$1|" "$st" > "$st.new" 2>/dev/null; mv "$st.new" "$st" ;;
+esac
+exit 0
+"""),
         ("qrencode", '#!/bin/sh\necho "qrencode $*" >> "$PDG_TEST_LOG"\n'),
         # timeout 记下自己被怎么调起来、服务目录里到底是什么, 然后变成一个可被 kill 的长命
         # 进程 —— "按回车即收"到底收没收干净, 靠它活着还是死了来判。
-        ("timeout", '#!/bin/sh\n'
+        ("timeout", '#!/bin/bash\n'
                     '{ echo "timeout-args=$*"\n'
                     '  echo "serve-cwd=$PWD"\n'
                     '  echo "serve-files=$(ls)"\n'
@@ -529,7 +556,9 @@ for _name, _body in (
                     '  echo "serve-pid=$$"\n'
                     '} >> "$PDG_TEST_LOG"\n'
                     ': > "$PDG_TEST_READY"\n'
-                    'exec sleep 30\n')):
+                    'shift\n'
+                    'args=(); for a in "$@"; do [ "$a" = 0.0.0.0 ] && a=127.0.0.1; args+=("$a"); done\n'
+                    'exec "${args[@]}"\n')):
     _p = os.path.join(CHBIN, _name)
     with open(_p, "w", encoding="utf-8") as f:
         f.write(_body)
@@ -545,14 +574,16 @@ sed -n '/^_nft_apply_main()/,/^}/p'  deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 sed -n '/^_lan_nft_reapply()/,/^}/p' deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 # 收尾从"整表重载"改成"按标记精确删除"之后又多了三个依赖(见 tests/test-ios-offer-download-leak.py)。
 # 漏抽任何一个, 现场都长成"产品没撤规则"的样子 —— 与真缺陷一模一样。
-sed -n '/^_ios_offer_teardown()/,/^}/p'    deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
-sed -n '/^_ios_offer_nft_close()/,/^}/p'   deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
-sed -n '/^_ios_offer_nft_handles()/,/^}/p' deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
+for _fn in _ios_offer_teardown _ios_offer_abort _ios_offer_nft_close \
+           _ios_offer_chain _ios_offer_marks _ios_offer_rule_ok _ios_offer_ready \
+           _ios_offer_lock_acquire _ios_offer_lock_release; do
+  sed -n "/^$_fn()/,/^}/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
+done
 # 常量也要跟着抽。`set -u` 下漏一个就是 unbound variable, 而那会让 _nft_apply_main 在
 # 调 _lan_nft_reapply 时半途死掉 —— 表现同样是"没还原防火墙", 与漏抽函数一模一样。
 # (_lan_nft_reapply 原先把这个路径写死在函数体里, 于是这里不抽也能跑; 路径收归常量之后
 #  就不行了 —— 写死路径让夹具"碰巧能用", 那本身就是它该被改掉的理由之一。)
-grep -E '^(LAN_NFT_CONF|IOS_OFFER_MARK)=' deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
+grep -E '^(LAN_NFT_CONF|IOS_OFFER_MARK|IOS_OFFER_LOCK)=' deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 grep -q 'http.server' "$CH_DIR/fn.sh" || { echo "EXTRACT-FAIL"; exit 9; }
 c_g(){ echo "$*"; }; c_y(){ echo "$*"; }
 # shellcheck source=/dev/null
@@ -564,7 +595,8 @@ _ios_offer_download "$CH_SRC" 203.0.113.10 172.22.0.0/16 "这一份是**上一�
 echo "RC=$?"
 """
 _chenv = dict(os.environ, PATH=CHBIN + os.pathsep + os.environ.get("PATH", ""),
-              PDG_TEST_LOG=CHLOG, PDG_TEST_READY=CHREADY, CH_DIR=CH, CH_SRC=CHSRC)
+              PDG_TEST_LOG=CHLOG, PDG_TEST_READY=CHREADY, CH_DIR=CH, CH_SRC=CHSRC,
+              PDG_IOS_OFFER_LOCKFILE=os.path.join(CH, "offer.lock"), TMPDIR=CH)
 _r = subprocess.run(["bash", "-c", HARNESS_CH], capture_output=True, text=True,
                     cwd=str(ROOT), timeout=180, env=_chenv)
 _chout = (_r.stdout or "") + (_r.stderr or "")

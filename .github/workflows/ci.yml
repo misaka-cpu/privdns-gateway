@@ -609,6 +609,9 @@ jobs:
       - name: "iOS 临时下载通道收得回来 (HUP/EXIT 收尾 + 排在 tailnet 排除之后 + 按标记精确撤除)"
         run: python3 tests/test-ios-offer-download-leak.py
 
+      - name: "iOS 临时下载通道 fail-closed 与会话所有权 (失败不假成功 / 第二条会话 BUSY)"
+        run: python3 tests/test-ios-offer-lifecycle.py
+
       - name: "iOS 描述文件身份持久性 (update/快照/备份恢复/平台来回切都不丢身份)"
         run: python3 tests/test-ios-profile-persist.py
 

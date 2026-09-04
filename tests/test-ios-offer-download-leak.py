@@ -94,24 +94,31 @@ exit 0
 
 # `exec timeout …` 只认可执行文件, shell 函数换不掉它 —— 必须是真文件桩。
 # 它 touch ready 之后变成长命进程, "收没收干净"靠它死没死来判。
-TIMEOUT_STUB = ('#!/bin/sh\n'
-                'echo "timeout-args=$*" >> "$PDG_TEST_LOG"\n'
-                'echo "$$" > "$PDG_TEST_SRVPID"\n'
-                ': > "$PDG_TEST_READY"\n'
-                'exec sleep 20\n')
+TIMEOUT_STUB = r'''#!/bin/bash
+echo "timeout-args=$*" >> "$PDG_TEST_LOG"
+echo "$$" > "$PDG_TEST_SRVPID"
+: > "$PDG_TEST_READY"
+shift                                     # 吃掉 600
+# exec 真的 python3, 但把 --bind 0.0.0.0 改写成回环 —— 产品的就绪判据是"真取到文件",
+# 桩不真起就永远过不了; 而绑 0.0.0.0 会让一次跑测试对外开端口, 没有必要。
+args=(); for a in "$@"; do [ "$a" = 0.0.0.0 ] && a=127.0.0.1; args+=("$a"); done
+exec "${args[@]}"
+'''
 
 HARNESS = r'''
 set -u
 cd "$CH_ROOT"
 echo $$ > "$CH_DIR/pid"
 : > "$CH_DIR/fn.sh"
-for fn in _ios_offer_download _ios_offer_teardown _ios_offer_nft_close \
-          _ios_offer_nft_handles _nft_apply_main _lan_nft_reapply; do
+for fn in _ios_offer_download _ios_offer_teardown _ios_offer_abort _ios_offer_nft_close \
+          _ios_offer_chain _ios_offer_marks _ios_offer_rule_ok _ios_offer_ready \
+          _ios_offer_lock_acquire _ios_offer_lock_release \
+          _nft_apply_main _lan_nft_reapply; do
   sed -n "/^$fn()/,/^}/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 done
 # 常量也要跟着抽: `set -u` 下漏一个就是 unbound variable, 而那会让收尾在半途死掉 ——
 # 表现与"产品没撤规则"一模一样(HANDOFF §10.7)。
-grep -E '^(LAN_NFT_CONF|IOS_OFFER_MARK)=' deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
+grep -E '^(LAN_NFT_CONF|IOS_OFFER_MARK|IOS_OFFER_LOCK)=' deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 grep -q 'http.server' "$CH_DIR/fn.sh" || { echo "EXTRACT-FAIL-http"; exit 9; }
 c_g(){ echo "$*"; }; c_y(){ echo "$*"; }
 # shellcheck source=/dev/null
@@ -144,8 +151,32 @@ def _mkcase(tag):
                PDG_TEST_STATE=os.path.join(d, "chain"),
                PDG_TEST_READY=os.path.join(d, "ready"),
                PDG_TEST_SRVPID=os.path.join(d, "srvpid"),
+               PDG_IOS_OFFER_LOCKFILE=os.path.join(d, "offer.lock"),
+               TMPDIR=d,
                CH_DIR=d, CH_SRC=src, CH_ROOT=str(ROOT))
     return d, env
+
+
+def _mark_handles(env):
+    return {l.split("|", 1)[0] for l in _read(env["PDG_TEST_STATE"]).splitlines()
+            if MARKRE.search(l)}
+
+
+def _wait_open(env, skip, limit=25.0):
+    """等到链里出现**本轮新加的**带标记放行 —— 那是通道开放的时刻。
+
+    两处讲究:
+      · 不能再用"HTTP 起来了"当判据: 产品现在先起服务、验证真能取到文件、**再**开放 nft,
+        两件事之间有实打实的间隔, 拿前者当后者会在链还没变的时候就去发信号;
+      · 必须排除种子里预置的残留 handle。否则"入场自愈"那一格里, 判据会被**上一次的残留**
+        直接满足, 于是在新会话还没起来时就去 kill, 整格空转。
+    """
+    end = time.time() + limit
+    while time.time() < end:
+        if _mark_handles(env) - skip:
+            return True
+        time.sleep(0.05)
+    return False
 
 
 def _wait(path, limit=15.0):
@@ -174,14 +205,15 @@ def run_signal_case(tag, sig, seed=None):
     if seed is not None:
         with open(env["PDG_TEST_STATE"], "w", encoding="utf-8") as f:
             f.write(seed)
+    seeded = _mark_handles(env)
     hp = os.path.join(d, "harness.sh")
     with open(hp, "w", encoding="utf-8") as f:
         f.write(HARNESS)
     proc = subprocess.Popen(["bash", hp], env=env, cwd=str(ROOT),
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    ready = _wait(env["PDG_TEST_READY"])
+    ready = _wait_open(env, seeded)
     chain_open = _read(env["PDG_TEST_STATE"])
-    if ready and sig is not None:
+    if ready and sig is not None and _wait(os.path.join(d, "pid")):
         with open(os.path.join(d, "pid"), encoding="utf-8") as f:
             os.kill(int(f.read().strip()), sig)
     try:
