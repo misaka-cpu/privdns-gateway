@@ -2601,20 +2601,80 @@ _ios_offer_rule_ok(){
   [[ "$mark" -gt "$ret" ]]
 }
 
-# 就绪判据: **真去把那份文件取一次**。走回环 —— input 链第一条就是 `iif "lo" accept`,
-# 所以这一步不依赖临时放行, 可以排在开放 nft 之前。
-# 只看进程活着是不够的: 8443 被别人占着时 python 会立刻退出, 而"刚 fork 出来还没死"那个
-# 瞬间与成功长得一模一样, 上一版就是据此打出二维码的。
+# 本轮的服务进程还活着吗。空 PID 一律判否 —— `kill -0 0` 打的是整个进程组, 永远成功,
+# 拿它当"服务还在"会把"根本没起来"读成"活着"。
+_ios_offer_srv_alive(){
+  [[ -n "${_IOS_OFFER_SRV:-}" ]] || return 1
+  kill -0 "$_IOS_OFFER_SRV" 2>/dev/null
+}
+
+# 就绪判据: 把**本轮要下发的那一份**从 127.0.0.1:8443 完整取回来, 逐字节对上才算数。
+#
+# 上一版问的是"能不能从 URL 读到一个字节", 那句话有三个洞, 每一个都能让别人的服务冒充我们:
+#   · urllib 会跟随重定向 —— 8443 上的东西一句 302 就能把判据引到别处;
+#   · urllib 会读 HTTP_PROXY / http_proxy / ALL_PROXY —— 判据的请求根本没到过 8443;
+#   · 只读一个字节, 返回什么内容一概不问。
+# 所以这里**不用 urllib**, 直接开裸 socket 说 HTTP/1.0: 结构上就没有代理和重定向可言。
+# 判据是 200 + 体积上限 + 长度一致 + SHA256 一致 + 本轮服务进程仍存活, 缺一不可。
+IOS_OFFER_PROBE='
+import hashlib, os, socket, sys
+CAP = 4 * 1024 * 1024
+try:
+    s = socket.create_connection(("127.0.0.1", int(os.environ["PDG_PORT"])), timeout=2)
+    s.settimeout(2)
+    s.sendall(("GET " + os.environ["PDG_PATH"] +
+               " HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n").encode())
+    buf = b""
+    while len(buf) <= CAP:
+        c = s.recv(65536)
+        if not c:
+            break
+        buf += c
+    s.close()
+except Exception:
+    sys.exit(1)
+if len(buf) > CAP:
+    sys.exit(1)
+head, sep, body = buf.partition(b"\r\n\r\n")
+if not sep:
+    sys.exit(1)
+line = head.split(b"\r\n", 1)[0].split()
+if len(line) < 2 or not line[0].startswith(b"HTTP/1.") or line[1] != b"200":
+    sys.exit(1)
+if len(body) != int(os.environ["PDG_W_LEN"]):
+    sys.exit(1)
+if hashlib.sha256(body).hexdigest() != os.environ["PDG_W_SHA"]:
+    sys.exit(1)
+sys.exit(0)
+'
+
 _ios_offer_ready(){
-  local url="$1" n=0
+  local path="$1" want_sha="$2" want_len="$3" n=0
   while [[ "$n" -lt 40 ]]; do
-    python3 -c 'import sys, urllib.request; urllib.request.urlopen(sys.argv[1], timeout=2).read(1)' \
-        "$url" >/dev/null 2>&1 && return 0
-    kill -0 "${_IOS_OFFER_SRV:-0}" 2>/dev/null || return 1   # 进程已死, 不必再等满 4 秒
+    if PDG_PORT="${PORT:-8443}" PDG_PATH="$path" PDG_W_SHA="$want_sha" PDG_W_LEN="$want_len" \
+       python3 -c "$IOS_OFFER_PROBE" >/dev/null 2>&1; then
+      _ios_offer_srv_alive || return 1   # 取到了文件, 但服务已经不是我们那个了
+      return 0
+    fi
+    _ios_offer_srv_alive || return 1     # 进程已死, 不必再等满 4 秒
     sleep 0.1
     n=$((n + 1))
   done
   return 1
+}
+
+# 信号处理器: 收尾之后**必须终止进程**, 不能只是收尾然后返回。
+# bash 的 trap 处理器跑完会回到被打断的地方接着执行 —— 通道此刻已经收干净了, 而 setup 的
+# 后半截会在这个已经收干净的通道上原样重做一遍: 再起一个 HTTP、再加一条放行、把二维码打
+# 出来。用户按了 Ctrl-C, 屏幕上却出现一个可用的下载链接, 而收尾早已过去、不会再来一次。
+# 退出状态取 128+signum, 与被该信号杀死的进程一致, 调用方分得清是被打断还是自己失败。
+_ios_offer_on_signal(){
+  local name="$1" num="$2"
+  trap - EXIT HUP INT TERM          # 先摘干净, 免得收尾期间再来一次变成递归
+  if ! _ios_offer_teardown; then
+    echo "❌ 被 SIG$name 打断, 且收尾未完成 —— 请人工检查 inet pdg input 与 $IOS_OFFER_LOCK。"
+  fi
+  exit $((128 + num))
 }
 
 # 收尾: 停服务 → 确认真的退了 → 精确撤放行 → 删目录 → 放锁 → 汇总。
@@ -2638,6 +2698,15 @@ _ios_offer_teardown(){
     if [[ -e "$_IOS_OFFER_WWW" ]]; then
       echo "❌ 临时下载目录没能删掉: $_IOS_OFFER_WWW"; rc=1
     fi
+  fi
+  # 调用方的 staging 目录也归这里收。信号路径是 `exit`, 调用方那句 `rm -rf "$STAGE"`
+  # 永远执行不到 —— 不在这里收, 每被打断一次就在盘上留一份描述文件。
+  if [[ -n "${_IOS_OFFER_STAGE:-}" ]]; then
+    rm -rf "$_IOS_OFFER_STAGE"
+    if [[ -e "$_IOS_OFFER_STAGE" ]]; then
+      echo "❌ 调用方的 staging 目录没能删掉: $_IOS_OFFER_STAGE"; rc=1
+    fi
+    _IOS_OFFER_STAGE=""
   fi
   _ios_offer_lock_release
   _IOS_OFFER_SRV=""; _IOS_OFFER_WWW=""
@@ -2668,11 +2737,16 @@ _ios_offer_download(){
   # EXIT 与 HUP 缺一不可: HUP 是 SSH 断开发的信号, 线上那次泄漏就是它 —— 旧写法只捕
   # INT/TERM, 收到 HUP 时 bash 直接死, 收尾一行都没跑。EXIT 兜住其余任何异常退出。
   # SIGKILL 兜不住; 那种情况靠下一次进来时、拿到锁之后的残留清理。
-  trap '_ios_offer_teardown' EXIT HUP INT TERM
+  # EXIT 只兜"异常退出", 三个信号各自走终止处理器 —— 它们的语义不同: EXIT 之后本来就
+  # 不会再有代码, 而信号之后 bash 会回到断点继续跑, 必须显式终止。
+  trap '_ios_offer_teardown' EXIT
+  trap '_ios_offer_on_signal HUP 1'   HUP
+  trap '_ios_offer_on_signal INT 2'   INT
+  trap '_ios_offer_on_signal TERM 15' TERM
 
   command -v qrencode >/dev/null || { c_g "装 qrencode…"; apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq qrencode; }
 
-  local PORT=8443 TOK WWW URL PROBE note txt
+  local PORT=8443 TOK WWW URL note txt want_sha want_len
   # token 必须真的生成出来且严格是 12 位十六进制。openssl 失败时上一版对此一无所知, 于是
   # 文件名退化成 `.mobileconfig` —— 同一网段里任何设备都猜得到那个路径。
   TOK="$(openssl rand -hex 6 2>/dev/null)" || TOK=""
@@ -2691,7 +2765,12 @@ _ios_offer_download(){
     _ios_offer_abort "准备临时下载目录失败 —— 未开放任何临时端口。"; return 1
   fi
   URL="http://$IP:$PORT/$TOK.mobileconfig"
-  PROBE="http://127.0.0.1:$PORT/$TOK.mobileconfig"
+  # 就绪判据要拿本轮这一份的指纹去对, 不是"有东西应答就算"。
+  want_sha="$(sha256sum "$WWW/$TOK.mobileconfig" 2>/dev/null | awk '{print $1}')"
+  want_len="$(stat -c %s "$WWW/$TOK.mobileconfig" 2>/dev/null)"
+  if [[ ! "$want_sha" =~ ^[0-9a-f]{64}$ ]] || [[ ! "$want_len" =~ ^[0-9]+$ ]]; then
+    _ios_offer_abort "算不出待下发文件的指纹 —— 无法证明服务的是我们这一份, 未开放任何临时端口。"; return 1
+  fi
 
   # 拿到锁之后才清残留: 有锁作保证, 此刻链里带标记的规则一定是**上一次没收干净的**,
   # 不可能是另一条还活着的会话 —— 这两者以前分不开, 于是清理等于抢别人的东西。
@@ -2706,8 +2785,8 @@ _ios_offer_download(){
   # 攥着, 一直攥到 600 秒超时 —— 那十分钟里谁都开不了新通道, 而且看不出来是为什么。
   ( cd "$WWW" && exec timeout 600 python3 -m http.server "$PORT" --bind 0.0.0.0 >/dev/null 2>&1 ) 6>&- &
   _IOS_OFFER_SRV=$!
-  if ! _ios_offer_ready "$PROBE"; then
-    _ios_offer_abort "临时 HTTP 没能就绪(端口 $PORT 可能被占) —— 未开放任何临时端口。"; return 1
+  if ! _ios_offer_ready "/$TOK.mobileconfig" "$want_sha" "$want_len"; then
+    _ios_offer_abort "临时 HTTP 没能就绪 —— 端口 $PORT 上没有我们这一份文件(可能被别的服务占着), 未开放任何临时端口。"; return 1
   fi
 
   # **追加**(add)而不是插到链首(insert): 链首在 `iifname "tailscale0" return` 之前,

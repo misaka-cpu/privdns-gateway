@@ -576,7 +576,8 @@ sed -n '/^_lan_nft_reapply()/,/^}/p' deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 # 漏抽任何一个, 现场都长成"产品没撤规则"的样子 —— 与真缺陷一模一样。
 for _fn in _ios_offer_teardown _ios_offer_abort _ios_offer_nft_close \
            _ios_offer_chain _ios_offer_marks _ios_offer_rule_ok _ios_offer_ready \
-           _ios_offer_lock_acquire _ios_offer_lock_release; do
+           _ios_offer_lock_acquire _ios_offer_lock_release \
+           _ios_offer_srv_alive _ios_offer_on_signal; do
   sed -n "/^$_fn()/,/^}/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 done
 # 常量也要跟着抽。`set -u` 下漏一个就是 unbound variable, 而那会让 _nft_apply_main 在
@@ -584,6 +585,8 @@ done
 # (_lan_nft_reapply 原先把这个路径写死在函数体里, 于是这里不抽也能跑; 路径收归常量之后
 #  就不行了 —— 写死路径让夹具"碰巧能用", 那本身就是它该被改掉的理由之一。)
 grep -E '^(LAN_NFT_CONF|IOS_OFFER_MARK|IOS_OFFER_LOCK)=' deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
+# IOS_OFFER_PROBE 是多行常量, grep 抓不全 —— set -u 下就绪判据会当场炸。
+sed -n "/^IOS_OFFER_PROBE='/,/^'$/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 grep -q 'http.server' "$CH_DIR/fn.sh" || { echo "EXTRACT-FAIL"; exit 9; }
 c_g(){ echo "$*"; }; c_y(){ echo "$*"; }
 # shellcheck source=/dev/null
