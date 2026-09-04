@@ -104,9 +104,10 @@ exit 0
 SRV_STUB = r'''#!/bin/bash
 echo "srv-invoked $*" >> "$PDG_TEST_SRVLOG"
 shift                                   # 吃掉 600
+# bindfail 不在这里造: 追加第二个 --bind 只会被 argparse 取最后一个, 反而绑成功了。
+# 真正的绑定失败由测试**先把 8443 占住**制造, 让 python 自己撞 EADDRINUSE 退出。
 case "${PDG_TEST_SRV_MODE:-serve}" in
-  instant)  exit 1 ;;
-  bindfail) exec "$@" --bind 127.0.0.1 2>/dev/null ;;   # 端口已被占, python 自己退
+  instant) exit 1 ;;
 esac
 args=(); for a in "$@"; do [ "$a" = 0.0.0.0 ] && a=127.0.0.1; args+=("$a"); done
 exec "${args[@]}"
@@ -156,7 +157,14 @@ echo "RC=$?"
 
 
 def port_free(port=PORT, host="127.0.0.1"):
+    """能不能绑上 —— **必须带 SO_REUSEADDR**, 否则判据比真实情况严。
+
+    python 的 http.server 自己就设了 allow_reuse_address, 所以上一轮连接遗留的 TIME_WAIT
+    并不妨碍它绑定; 而不带 REUSEADDR 的探测会在同样的现场报"端口被占", 于是整支测试因为
+    一个**并不存在的**前提失败而一格都跑不了。
+    """
     s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         s.bind((host, port))
         return True
@@ -164,6 +172,12 @@ def port_free(port=PORT, host="127.0.0.1"):
         return False
     finally:
         s.close()
+
+
+def has_listener():
+    """8443 上此刻有没有人在听。直连被拒 = 没有 —— 比"绑得上吗"更贴近要问的问题,
+    也不会把 TIME_WAIT 误读成"还在监听"。"""
+    return fetch(timeout=1.0)[0]
 
 
 def fetch(path_ok=True, timeout=2.0):
@@ -314,23 +328,55 @@ else:
 
 # ── 4. nft add 失败 → HTTP / 目录 / 锁全部收净, 不展示链接 ────────────────
 r = run_case("nftadd", PDG_TEST_NFT_FAIL="add")
-lock_held = os.path.exists(os.path.join(r["dir"], "offer.lock")) and not port_free()
 leftovers = []
 if r["rc"] in (None, 0):
     leftovers.append("返回 0")
 if shows_link(r["out"]):
     leftovers.append("展示了链接")
-if not port_free():
-    leftovers.append("8443 仍被占用")
+if has_listener():
+    leftovers.append("8443 仍有监听")
+# 锁必须已经放掉: 这一格失败发生在拿到锁**之后**, 收尾漏放锁的话下一次调用会被自己
+# 十分钟前的一次失败挡在门外, 而现场看不出任何原因。
+import fcntl as _fcntl
+_lk = os.path.join(r["dir"], "offer.lock")
+if os.path.exists(_lk):
+    try:
+        _fh = open(_lk, "a")
+        _fcntl.flock(_fh.fileno(), _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        _fh.close()
+    except OSError:
+        leftovers.append("会话锁没释放")
 if leftovers:
     bad("nft add 失败后没收净: " + "; ".join(leftovers))
 else:
     ok("nft add 失败 → 非零退出, 不展示链接, HTTP/端口已收净")
 
 # ── 5. HTTP 起来就退 / 绑不上 → 不得加规则, 或必须立刻撤回; 不展示链接 ─────
+class hold_port:
+    """真占住 127.0.0.1:8443, 让被测进程去撞 EADDRINUSE。
+
+    产品的就绪探针会先连上这个 socket 再超时(2 秒), 然后发现服务进程已经死了就立刻返回 ——
+    所以这一格慢的那两秒是判据的一部分, 不是等待。
+    """
+
+    def __enter__(self):
+        self.s = socket.socket()
+        self.s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.s.bind(("127.0.0.1", PORT))
+        self.s.listen(1)
+        return self
+
+    def __exit__(self, *a):
+        self.s.close()
+
+
 for tag, mode, why in (("instant", "instant", "HTTP 进程起来就退"),
-                       ("bindfail", "bindfail", "8443 绑定失败")):
-    r = run_case(tag, PDG_TEST_SRV_MODE=mode)
+                       ("bindfail", "serve", "8443 已被别人占住(绑定失败)")):
+    if tag == "bindfail":
+        with hold_port():
+            r = run_case(tag, PDG_TEST_SRV_MODE=mode)
+    else:
+        r = run_case(tag, PDG_TEST_SRV_MODE=mode)
     probs = []
     if r["rc"] in (None, 0):
         probs.append("返回 0")
@@ -386,7 +432,7 @@ else:
     zero = []
     if rA["marks"]:
         zero.append("标记规则 %d 条" % len(rA["marks"]))
-    if not port_free():
+    if has_listener():
         zero.append("8443 仍有监听")
     if zero:
         bad("A 结束后没归零: " + "; ".join(zero))
@@ -413,7 +459,7 @@ for tag, sig, why in (("hup", signal.SIGHUP, "SIGHUP"),
         probs.append("通道没就绪, 这一格没测到东西")
     if r["marks"]:
         probs.append("标记规则残留 %d 条" % len(r["marks"]))
-    if not port_free():
+    if has_listener():
         probs.append("8443 仍有监听")
     www = re.search(r"install-target (\S+)", r["log"])
     if www and os.path.exists(os.path.dirname(www.group(1))) \
