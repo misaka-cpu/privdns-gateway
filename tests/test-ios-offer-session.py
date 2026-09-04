@@ -344,6 +344,43 @@ for fn, arg, why in (("cmd_ios", None, "pdg ios"),
         wait_for(lambda: not connectable(), limit=10)
 
 
+# ── 组 1b: 进程拓扑 —— 记录里的 PID 就是真正听端口的那一个, 且没有子进程 ────────
+# 外层套 `timeout 600` 的话, 记录下来的是 timeout 的 PID、真正听端口的是它的子进程:
+# 身份核对与"停没停干净"就分在两层, 而遗留子进程正是 SIGKILL 之后收不干净的来源。
+d1b, env1b = mkcase("topo", CH_STDIN_HOLD=40)
+p1b = launch(d1b, env1b)
+ready1b = wait_for(lambda: shows_link(read(os.path.join(d1b, "out"))))
+try:
+    if not ready1b:
+        bad("进程拓扑: 通道没就绪, 这一格没测到东西")
+    else:
+        rec = re.search(r"^pid=(\d+)$", read(env1b["PDG_IOS_OFFER_STATEFILE"]), re.M)
+        rec_pid = int(rec.group(1)) if rec else 0
+        stub_pids = srvpids(d1b)
+        kids = []
+        if rec_pid:
+            try:
+                kids = [x for x in read("/proc/%d/task/%d/children" % (rec_pid, rec_pid)).split()]
+            except Exception:
+                kids = []
+        probs = []
+        if rec_pid not in stub_pids:
+            probs.append("记录里的 PID %s 不是真正起服务的那个 %s" % (rec_pid, stub_pids))
+        if kids:
+            probs.append("它还有子进程 %s —— 收尾要跨两层" % kids)
+        if probs:
+            bad("进程拓扑: " + "; ".join(probs))
+        else:
+            ok("进程拓扑: 记录里的 PID(%d)就是真正听端口的那个, 且没有子进程" % rec_pid)
+finally:
+    try:
+        os.kill(int(read(os.path.join(d1b, "pid")).strip()), signal.SIGTERM)
+    except (OSError, ValueError):
+        pass
+    finish(p1b, d1b, limit=40)
+    kill_all(srvpids(d1b))
+    wait_for(lambda: not connectable(), limit=10)
+
 # ── 组 2: PID 已经不在的过期孤儿 ──────────────────────────────────────────
 # 模拟 HTTP 自己的 600 秒超时到点退出: state 里的 PID 已经不存在。这时不能再靠"进程还活着"
 # 去证明目录属于本功能 —— 需要目录自身带得走的凭据。
@@ -377,6 +414,36 @@ finally:
     kill_all(srvpids(pre["dir"]))
     wait_for(lambda: not connectable(), limit=10)
 
+
+# ── 组 2b: 会话凭据对不上的目录, 一律不动 ────────────────────────────────
+# 造一个**形态完全合规**的目录: 就在固定安全父目录之下、0700、带 0600 的凭据、里面只有
+# 描述文件 —— 只有凭据内容与记录里的 session id 不一致。这一格问的就是那一条: 归属靠凭据
+# 证明, 不靠"看起来像我们建的"。
+d2b, env2b = mkcase("sentinel", CH_STDIN_HOLD=1)
+root2b = env2b["PDG_IOS_OFFER_ROOT"]
+os.makedirs(root2b, mode=0o700, exist_ok=True)
+victim = os.path.join(root2b, "s.deadbeefdeadbeef")
+os.makedirs(victim, mode=0o700)
+with open(os.path.join(victim, ".pdg-offer-session"), "w", encoding="utf-8") as f:
+    f.write("ffffffffffffffff")          # ← 与记录里的 sid 不同
+os.chmod(os.path.join(victim, ".pdg-offer-session"), 0o600)
+with open(os.path.join(victim, "aaaaaaaaaaaa.mobileconfig"), "w", encoding="utf-8") as f:
+    f.write("<plist/>\n")
+with open(env2b["PDG_IOS_OFFER_STATEFILE"], "w", encoding="utf-8") as f:
+    f.write("sid=deadbeefdeadbeef\npid=999999\nstart=1\nwww=%s\n" % victim)
+r2b = finish(launch(d2b, env2b), d2b)
+probs = []
+if not os.path.isdir(victim):
+    probs.append("目录被删了")
+if r2b["rc"] in (None, 0):
+    probs.append("返回 %s(证不明归属就该 fail-closed)" % r2b["rc"])
+if not os.path.exists(env2b["PDG_IOS_OFFER_STATEFILE"]):
+    probs.append("记录被覆盖/删除了")
+if probs:
+    bad("会话凭据不一致: " + "; ".join(probs))
+else:
+    ok("会话凭据不一致 → 目录不动、记录不动、本次会话 fail-closed")
+wait_for(lambda: not connectable(), limit=10)
 
 # ── 组 3: state 删不掉必须计入返回码 ──────────────────────────────────────
 # 3a 正常收尾路径

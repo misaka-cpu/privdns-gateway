@@ -57,15 +57,19 @@ def failures(out):
 T_HARD = ["python3", "tests/test-ios-offer-hardening.py"]
 T_LIFE = ["python3", "tests/test-ios-offer-lifecycle.py"]
 
-SERVE = '''  ( cd "$WWW" && exec timeout 600 python3 -c "$IOS_OFFER_SERVER" \\
-        "$PORT" "/$TOK.mobileconfig" "$WWW/$TOK.mobileconfig" 0.0.0.0 >/dev/null 2>&1 ) 6>&- &'''
-SERVE_OLD = ('  ( cd "$WWW" && exec timeout 600 python3 -m http.server "$PORT" '
-             '--bind 0.0.0.0 >/dev/null 2>&1 ) 6>&- &')
-STATEW = '''  if ! _ios_offer_state_write "$_IOS_OFFER_SRV" \\
+# 外层 `timeout 600` 已去掉(只保留服务脚本自带的 Timer), 锚点跟着走。
+SERVE = '  ( cd "$WWW" && exec python3 -c "$IOS_OFFER_SERVER" \\\n        "$PORT" "/$TOK.mobileconfig" "$WWW/$TOK.mobileconfig" 0.0.0.0 >/dev/null 2>&1 ) 6>&- &'
+# 这一格要证的是"根路径会列目录", 与绑定地址和超时时长无关。所以变异体绑回环、超时取
+# 20 秒: `-m http.server` **绕过了桩的绑定改写**(桩只认那段 serve_forever 脚本), 照抄
+# 0.0.0.0 + 600 秒的话, 一次负控就会在这台机器上真开一个对外端口并占满十分钟 ——
+# 实测发生过, 它把后面三支负控的基线全带红了。
+SERVE_OLD = ('  ( cd "$WWW" && exec timeout 20 python3 -m http.server "$PORT" '
+             '--bind 127.0.0.1 >/dev/null 2>&1 ) 6>&- &')
+STATEW = '''  if ! _ios_offer_state_write "$_IOS_OFFER_SID" "$_IOS_OFFER_SRV" \\
         "$(_ios_offer_starttime "$_IOS_OFFER_SRV")" "$WWW"; then
     _ios_offer_abort "写不下运行期所有权记录($IOS_OFFER_STATE) —— 强杀之后将无法自愈, 本次不开通道。"; return 1
   fi'''
-STATEW_OLD = ('  _ios_offer_state_write "$_IOS_OFFER_SRV" '
+STATEW_OLD = ('  _ios_offer_state_write "$_IOS_OFFER_SID" "$_IOS_OFFER_SRV" '
               '"$(_ios_offer_starttime "$_IOS_OFFER_SRV")" "$WWW" || true  # 变异')
 CHMOD = '  chmod 0600 "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }'
 ORDER = '''  local reap_rc=0 sweep_rc=0
@@ -75,7 +79,6 @@ ORDER_OLD = '''  local reap_rc=0 sweep_rc=0
   _ios_offer_nft_close   || sweep_rc=1
   [[ "$sweep_rc" -ne 0 ]] && { _ios_offer_abort "变异: 清理失败直接停"; return 1; }
   _ios_offer_reap_orphan || reap_rc=1'''
-DIRGUARD = '  if [[ "$matched" == 1 && "$rc" == 0 && -n "$www" && -d "$www" ]]; then'
 TRAPIGN = '  trap "" HUP INT TERM'
 
 MUT = [
@@ -83,10 +86,42 @@ MUT = [
     ("② state 写失败退回 || true", [(STATEW, STATEW_OLD, 1)], [T_HARD]),
     ("③ state mode 放宽成 0644", [(CHMOD, CHMOD.replace("0600", "0644"), 1)], [T_HARD]),
     ("④ 先 nft 后 orphan(链读不到就跳过回收)", [(ORDER, ORDER_OLD, 1)], [T_HARD]),
-    ("⑤ 目录删除移出身份校验", [(DIRGUARD, '  if [[ -n "$www" && -d "$www" ]]; then', 1)], [T_HARD]),
+    # ⑤ 原本打的是"目录删除移出身份校验"。那条代码路径已经不存在了: 归属现在由
+    # _ios_offer_dir_ok 在**任何删除之前**证明(安全父目录/非符号链接/属主/0700/会话凭据/
+    # 允许内容集合), 而 tests/negctl/ios-offer-session-negative-controls.py 的 ③ 打的正是
+    # 那处校验。在这里再复制一份不会多证明任何东西, 所以撤掉而不是硬凑一个锚点。
     ("⑥ 收尾期间的信号改回默认处置", [(TRAPIGN, '  trap - HUP INT TERM  # 变异', 1)], [T_HARD]),
     ("⑦ 只加无关注释(反向对照)", [(TRAPIGN, "  # 变异: 一条无关注释\n" + TRAPIGN, 1)], [T_HARD, T_LIFE]),
 ]
+
+def _sweep_leftover_servers():
+    """按**确切 PID** 收掉变异体留下的临时服务, 并等 8443 释放。
+    改坏之后的产品可能起一个我们的收尾逻辑管不到的服务(比如 ① 恢复的 `-m http.server`
+    带自己的 timeout), 它会一直占着端口, 把后面每一格的基线都带红。
+    绝不用宽模式 `pkill -f`(HANDOFF §9.13: 它会咬到发起命令的 shell 自己)。"""
+    import signal as _sig, socket as _sock, time as _t
+    needle = "-m http" + ".server 8443"
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        try:
+            cl = open("/proc/%s/cmdline" % d, "rb").read().replace(b"\0", b" ").decode("utf8", "replace")
+        except OSError:
+            continue
+        if needle in cl and str(os.getpid()) != d:
+            try:
+                os.kill(int(d), _sig.SIGKILL)
+            except OSError:
+                pass
+    end = _t.time() + 10
+    while _t.time() < end:
+        s_ = _sock.socket()
+        try:
+            s_.connect(("127.0.0.1", 8443)); s_.close(); _t.sleep(0.2)
+        except OSError:
+            s_.close(); return
+    return
+
 
 before = {p: sha(p) for p in TOUCHED}
 modes = {p: os.stat(p).st_mode for p in TOUCHED}
@@ -135,6 +170,7 @@ try:
             continue
         added = suite(targets) - base
         target.write_text(pristine, encoding="utf-8")
+        _sweep_leftover_servers()
 
         if label.startswith("⑦"):
             (ok if not added else bad)("%s → %d 条新增(应为 0)" % (label, len(added)))

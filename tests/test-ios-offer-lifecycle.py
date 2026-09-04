@@ -137,8 +137,14 @@ exec "$real" "$@"
 # 假象: SIGKILL 留下的孤儿服务的正是同一路径同一内容, 于是后继会话的就绪判据在孤儿身上
 # 通过, 看起来"自愈成功"了 —— 真机上 token 随机, 后继只会拿到 404。
 OPENSSL_STUB = ('#!/bin/sh\n'
-                '[ "${PDG_TEST_TOKEN_FAIL:-}" = 1 ] && { echo "err" >&2; exit 1; }\n'
-                '[ "${PDG_TEST_TOKEN_FAIL:-}" = junk ] && { echo "NOT-HEX!!"; exit 0; }\n'
+                '# 注入只对 token(-hex 6)生效。会话标识也走 openssl(-hex 8) —— 一刀切地失败\n'
+                '# 会让会话开场先挂掉, 那几格测的就不是 token 了(实测把负控⑩变成了空转)。\n'
+                'n=6\n'
+                'for a in "$@"; do n="$a"; done\n'
+                'if [ "$n" = 6 ]; then\n'
+                '  [ "${PDG_TEST_TOKEN_FAIL:-}" = 1 ] && { echo "err" >&2; exit 1; }\n'
+                '  [ "${PDG_TEST_TOKEN_FAIL:-}" = junk ] && { echo "NOT-HEX!!"; exit 0; }\n'
+                'fi\n'
                 'n=6\n'
                 'for a in "$@"; do n="$a"; done\n'
                 'case "$n" in ""|*[!0-9]*) n=6 ;; esac\n'

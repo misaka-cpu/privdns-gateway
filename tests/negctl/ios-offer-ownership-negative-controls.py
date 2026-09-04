@@ -73,9 +73,8 @@ DELLOOP = ('''  for h in $(printf '%s\\n' "$txt" | _ios_offer_marks); do
 LOCKCALL = "  _ios_offer_lock_acquire || return 1"
 # 服务已从 `-m http.server` 换成内置的精确路径 handler(它会列目录, 一次性 token 就白带了),
 # 锚点跟着走。这一格问的仍是同一件事: 子进程有没有继承会话锁的 fd。
-SRVLINE = ('  ( cd "$WWW" && exec timeout 600 python3 -c "$IOS_OFFER_SERVER" \\\n'
-           '        "$PORT" "/$TOK.mobileconfig" "$WWW/$TOK.mobileconfig" 0.0.0.0 '
-           '>/dev/null 2>&1 ) 6>&- &')
+# 外层 timeout 已去掉, 锚点跟着走。这一格问的仍是: 子进程有没有继承会话锁的 fd。
+SRVLINE = '  ( cd "$WWW" && exec python3 -c "$IOS_OFFER_SERVER" \\\n        "$PORT" "/$TOK.mobileconfig" "$WWW/$TOK.mobileconfig" 0.0.0.0 >/dev/null 2>&1 ) 6>&- &'
 READY = ('''  if ! _ios_offer_ready "/$TOK.mobileconfig" "$want_sha" "$want_len"; then
     _ios_offer_abort "临时 HTTP 没能就绪 —— 端口 $PORT 上没有我们这一份文件(可能被别的服务占着), 未开放任何临时端口。"; return 1
   fi''')
@@ -89,9 +88,6 @@ HANDLECHK = '''  if [[ ! "$_IOS_OFFER_HANDLE" =~ ^[0-9]+$ ]]; then
 TDOWN = "  if _ios_offer_teardown; then"
 TOKCHK = ('''  if [[ ! "$TOK" =~ ^[0-9a-f]{12}$ ]]; then
     _ios_offer_abort "生成一次性下载令牌失败(openssl) —— 未开放任何临时端口。"; return 1
-  fi''')
-TMPCHK = ('''  if [[ -z "$WWW" || ! -d "$WWW" ]]; then
-    _ios_offer_abort "创建临时下载目录失败(mktemp -d) —— 未开放任何临时端口。"; return 1
   fi''')
 
 MUT = [
@@ -117,8 +113,9 @@ MUT = [
      [(LOCKCALL, "  _ios_offer_lock_acquire || true  # 变异", 1)], [T_LIFE]),
     ("⑨ 收尾失败仍打印成功",
      [(TDOWN, "  if _ios_offer_teardown || true; then  # 变异", 1)], [T_LIFE]),
-    ("⑩ 删掉 token / mktemp 的 fail-closed 判据",
-     [(TOKCHK, "  : # 变异: 不查 token", 1), (TMPCHK, "  : # 变异: 不查 mktemp", 1)], [T_LIFE]),
+    # mktemp 那半边已经没有了(调用方不再自建目录), 只剩 token 这一处 fail-closed。
+    ("⑩ 删掉 token 的 fail-closed 判据",
+     [(TOKCHK, "  : # 变异: 不查 token", 1)], [T_LIFE]),
     ("⑪ 只加无关注释(反向对照)",
      [(LOCKCALL, "  # 变异: 一条无关注释\n" + LOCKCALL, 1)], [T_LIFE]),
 ]

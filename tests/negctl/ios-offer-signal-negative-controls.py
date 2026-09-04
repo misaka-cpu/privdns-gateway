@@ -92,11 +92,10 @@ if hashlib.sha256(body).hexdigest() != os.environ["PDG_W_SHA"]:
 HANDLE_FIRST = '''  if [[ -n "${_IOS_OFFER_HANDLE:-}" ]]; then
     nft delete rule inet pdg input handle "$_IOS_OFFER_HANDLE" >/dev/null 2>&1 || true
   fi'''
-STAGE_OK = '''  STAGE="$(mktemp -d 2>/dev/null)" || STAGE=""
-  if [[ -z "$STAGE" || ! -d "$STAGE" ]]; then
-    echo "❌ 创建临时目录失败(mktemp -d) —— 未生成描述文件, 未开放任何临时端口。"; return 1
-  fi
-  OUT="$STAGE/PrivDNS-Gateway.mobileconfig"'''
+# 调用方已不再有独立 staging(生成物直接落在会话目录里), 这一格改打新的等价约束:
+# **会话开不起来必须立刻停**。
+STAGE_OK = ('  _ios_offer_session_begin || return 1\n'
+            '  OUT="$_IOS_OFFER_WWW/gen.mobileconfig"')
 SUCCESSOR = '        dH, envH = mkcase("selfheal", CH_STDIN_HOLD=1)'
 
 MUT = [
@@ -110,9 +109,9 @@ MUT = [
      [(DIGEST, "pass  # 变异", 1)], [T_INT]),
     ("⑤ 收尾不使用保存的 handle", PDG,
      [(HANDLE_FIRST, "  :  # 变异: 不用本轮 handle", 1)], [T_INT]),
-    ("⑥ 外层 STAGE 不检查(描述文件写进 /)", PDG,
-     [(STAGE_OK, '  STAGE=$(mktemp -d); OUT="$STAGE/PrivDNS-Gateway.mobileconfig"  # 变异', 1)],
-     [T_STAGE]),
+    ("⑥ 会话开场失败不检查(继续往下生成并开通道)", PDG,
+     [(STAGE_OK, '  _ios_offer_session_begin || true  # 变异\n'
+                 '  OUT="$_IOS_OFFER_WWW/gen.mobileconfig"', 1)], [T_STAGE]),
     ("⑦ SIGKILL 测试在断言前手工杀孤儿(把测试清理冒充产品自愈)", LIFE,
      [(SUCCESSOR,
        '        for _sp in pre["orphan"]:\n'
