@@ -63,15 +63,17 @@ T_LEAK = ["python3", "tests/test-ios-offer-download-leak.py"]
 T_UX = ["python3", "tests/test-ios-profile-ux.py"]
 
 TRAP = "  trap '_ios_offer_teardown' EXIT HUP INT TERM"
-ADD = '  nft add rule inet pdg input ip saddr "$CIDR" tcp dport "$PORT" accept \\'
-MARK = '      comment "$IOS_OFFER_MARK" 2>/dev/null'
-CLOSE_HEAD = "_ios_offer_nft_close(){\n  local h"
-SWEEP = ("  # 上一次没收干净的残留先带走 —— 泄漏过的机器走一次这条路就自愈, 不必人工去摘规则。\n"
-         "  _ios_offer_nft_close")
-PRECISE = ('  for h in $(_ios_offer_nft_handles); do\n'
+# 锚点跟着产品走。收尾在 1e1a48b 里从"整表兜底"改成了"精确删除 + 复查最终状态", 会话锁
+# 也是那一笔加的 —— 下面五个锚点当时全部失效。它们没有静默变哑弹, 而是被"锚点命中 0 次"
+# 当场报出来(HANDOFF §9.18 立的规矩), 这里只是把它们接回新形态。
+ADD = '  if ! nft add rule inet pdg input ip saddr "$CIDR" tcp dport "$PORT" accept \\'
+MARK = '        comment "$IOS_OFFER_MARK" 2>/dev/null; then'
+CLOSE_HEAD = "_ios_offer_nft_close(){\n  local txt h left"
+SWEEP = "  if ! _ios_offer_nft_close; then"
+PRECISE = ("""  for h in $(printf '%s\\n' "$txt" | _ios_offer_marks); do\n"""
            '    nft delete rule inet pdg input handle "$h" >/dev/null 2>&1 || true\n'
            '  done')
-AWKMARK = '    | awk -v m="comment \\"$IOS_OFFER_MARK\\"" \\'
+AWKMARK = '  awk -v m="comment \\"$IOS_OFFER_MARK\\"" \\'
 
 MUT = [
     ("① trap 去掉 HUP(缺陷本体)",
@@ -81,15 +83,18 @@ MUT = [
     ("③ add 改回 insert(又插到链首)",
      [(ADD, ADD.replace("nft add rule", "nft insert rule"), 1)], [T_LEAK, T_UX]),
     ("④ 去掉标记(收尾只能按端口猜)",
-     [(MARK, "      2>/dev/null", 1)], [T_LEAK, T_UX]),
+     [(MARK, "        2>/dev/null; then", 1)], [T_LEAK, T_UX]),
     ("⑤ 撤除函数空壳化(三条信号路径全泄漏)",
-     [(CLOSE_HEAD, "_ios_offer_nft_close(){\n  return 0  # 变异\n  local h", 1)], [T_LEAK]),
+     [(CLOSE_HEAD, "_ios_offer_nft_close(){\n  return 0  # 变异\n  local txt h left", 1)], [T_LEAK]),
     ("⑥ 入场清理删掉(残留永远不会被带走)",
-     [(SWEEP, "  : # 变异: 不清残留", 1)], [T_LEAK]),
+     [(SWEEP, "  if false; then  # 变异: 不清残留", 1)], [T_LEAK]),
     ("⑦ 精确删除换成整表重载(冲掉别人的运行期规则)",
      [(PRECISE, "  _nft_apply_main >/dev/null 2>&1 || true  # 变异: 直接整表重载", 1)], [T_LEAK]),
+    # 替换体也要跟着形态走: 抽取从"管道接一段 awk"变成了独立函数 _ios_offer_marks 里的
+    # 一行 awk, 缩进和有没有前导管道都变了。照旧写法替换会造出语法错误 —— 那不是负控,
+    # 是改坏器自己坏了(改坏器语法不合法这一格会被显式判掉, 不会伪装成"有效负控")。
     ("⑧ 抽取改成按端口匹配(越权删别人的规则)",
-     [(AWKMARK, '    | awk -v m="tcp dport 8443" \\', 1)], [T_LEAK]),
+     [(AWKMARK, '  awk -v m="tcp dport 8443" \\', 1)], [T_LEAK]),
     ("⑨ 只加无关注释(反向对照)",
      [(TRAP, "  # 变异: 一条无关注释\n" + TRAP, 1)], [T_LEAK]),
 ]
