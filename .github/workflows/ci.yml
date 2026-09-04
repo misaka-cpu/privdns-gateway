@@ -615,6 +615,9 @@ jobs:
       - name: "iOS 临时下载通道信号中止与服务所有权 (setup 三屏障 / 外来 200-302-代理 全拒)"
         run: python3 tests/test-ios-offer-interrupt.py
 
+      - name: "iOS 调用方 staging fail-closed (mktemp -d 失败不得把描述文件生成到 /)"
+        run: python3 tests/test-ios-caller-staging.py
+
       - name: "iOS 描述文件身份持久性 (update/快照/备份恢复/平台来回切都不丢身份)"
         run: python3 tests/test-ios-profile-persist.py
 

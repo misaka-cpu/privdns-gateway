@@ -216,7 +216,7 @@ if "iosstate.py" in cli and "__UUID" not in cli and "random/uuid" not in cli:
     ok("CLI 不再自己拼占位符/自取随机 UUID, 改调 iosstate.py(与 Bot 同一份实现与记录)")
 else:
     bad("CLI 仍在自己生成描述文件")
-if "python3 -m http.server" in chan and "nft add rule" in chan \
+if "python3 -m http.server" in chan and "add rule inet pdg input" in chan \
         and "python3 -m http.server" not in cli and "_ios_offer_download" in cli:
     ok("现状(CLI): 临时 HTTP + 临时 nft 放行搬进 _ios_offer_download, cmd_ios 调它而不是自带一份")
 else:

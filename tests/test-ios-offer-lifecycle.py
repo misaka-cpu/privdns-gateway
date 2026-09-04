@@ -73,6 +73,16 @@ render(){
 }
 [ -s "$state" ] || reset_state
 log "nft $*"
+# 产品现在用 `nft -j --echo --handle add rule …` 取回本轮规则的 handle。
+# 形态取自 nftables v1.0.6 实测: {"nftables":[{"add":{"rule":{... "handle": N ...}}}]}
+if [ "$1" = -j ] && [ "$2" = --echo ]; then
+  [ "${PDG_TEST_NFT_FAIL:-}" = add ] && { echo "Error: could not add" >&2; exit 1; }
+  shift 3; shift 5
+  nh=$(next_handle); echo "$nh|$(render "$@")" >> "$state"
+  if [ "${PDG_TEST_NO_HANDLE:-}" = 1 ]; then echo "{\"nftables\":[{\"add\":{\"rule\":{}}}]}"
+  else printf "{\"nftables\":[{\"add\":{\"rule\":{\"handle\":%s}}}]}\n" "$nh"; fi
+    exit 0
+fi
 case "$1" in
   -a)
     if [ "${PDG_TEST_NFT_FAIL:-}" = list ]; then
@@ -151,21 +161,29 @@ echo $$ > "$CH_DIR/pid"
 for fn in _ios_offer_download _ios_offer_teardown _ios_offer_abort _ios_offer_nft_close \
           _ios_offer_chain _ios_offer_marks _ios_offer_rule_ok _ios_offer_ready \
           _ios_offer_lock_acquire _ios_offer_lock_release \
-          _ios_offer_srv_alive _ios_offer_on_signal _ios_offer_reap_orphan \
+          _ios_offer_srv_alive _ios_offer_on_signal _ios_offer_reap_orphan _ios_offer_starttime \
           _nft_apply_main _lan_nft_reapply; do
   sed -n "/^$fn()/,/^}/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 done
-missing=""
-for fn in $(grep -oE '_ios_offer_[a-z_]+' "$CH_DIR/fn.sh" | sort -u); do
-  grep -q "^$fn()" "$CH_DIR/fn.sh" || missing="$missing $fn"
-done
-[ -z "$missing" ] || { echo "EXTRACT-MISSING:$missing"; exit 9; }
 grep -E '^(LAN_NFT_CONF|IOS_OFFER_MARK|IOS_OFFER_LOCK|IOS_OFFER_STATE)=' deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 # IOS_OFFER_PROBE 是**多行**单引号常量, `grep '^…='` 只会抓到第一行 —— 那样 set -u 下
 # 就绪判据当场炸掉, 现场看起来像"服务永远不就绪"。按范围抽。
 sed -n "/^IOS_OFFER_PROBE='/,/^'$/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 grep -q "^IOS_OFFER_PROBE=" "$CH_DIR/fn.sh" || { echo "EXTRACT-MISSING:IOS_OFFER_PROBE"; exit 9; }
 grep -q 'http.server' "$CH_DIR/fn.sh" || { echo "EXTRACT-FAIL-http"; exit 9; }
+# 抽取自证必须排在**所有**抽取之后 —— 排在前面的话它检查的是一个还没装满的 fn.sh。
+# 函数和常量都要查: 只查函数时, 漏抽一个 IOS_OFFER_* 常量会变成 set -u 的运行期报错,
+# 现场长得像"服务永远不就绪"。
+missing=""
+for fn in $(grep -oE '_ios_offer_[a-z_]+' "$CH_DIR/fn.sh" | sort -u); do
+  grep -q "^$fn()" "$CH_DIR/fn.sh" || missing="$missing $fn"
+done
+# **常量也要自证。** 只查函数名的话, 漏抽一个 IOS_OFFER_* 常量会变成 set -u 的运行期报错,
+# 现场长得像"服务永远不就绪"——本轮实测漏过一次(IOS_OFFER_STATE)。
+for k in $(grep -oE '\bIOS_OFFER_[A-Z_]+' "$CH_DIR/fn.sh" | sort -u); do
+  grep -qE "^$k=" "$CH_DIR/fn.sh" || missing="$missing \$$k"
+done
+[ -z "$missing" ] || { echo "EXTRACT-MISSING:$missing"; exit 9; }
 c_g(){ echo "$*"; }; c_y(){ echo "$*"; }
 # shellcheck source=/dev/null
 . "$CH_DIR/fn.sh"
@@ -321,7 +339,7 @@ if claims_closed(r["out"]):
     probs.append("声称已关闭")
 if "srv-invoked" in r["srvlog"]:
     probs.append("仍然起了 HTTP")
-if re.search(r"^nft add rule", r["log"], re.M):
+if re.search(r"^nft .*add rule", r["log"], re.M):
     probs.append("仍然加了放行规则")
 if probs:
     bad("nft 链读取失败时: " + "; ".join(probs) + " —— 读不到被当成了没有规则")

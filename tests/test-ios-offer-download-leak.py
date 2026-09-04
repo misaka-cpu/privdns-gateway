@@ -75,6 +75,16 @@ render(){
 }
 [ -s "$state" ] || reset_state
 log "nft $*"
+# 产品现在用 `nft -j --echo --handle add rule …` 取回本轮规则的 handle。
+# 形态取自 nftables v1.0.6 实测: {"nftables":[{"add":{"rule":{... "handle": N ...}}}]}
+if [ "$1" = -j ] && [ "$2" = --echo ]; then
+  [ "${PDG_TEST_NFT_FAIL:-}" = add ] && { echo "Error: could not add" >&2; exit 1; }
+  shift 3; shift 5
+  nh=$(next_handle); echo "$nh|$(render "$@")" >> "$state"
+  if [ "${PDG_TEST_NO_HANDLE:-}" = 1 ]; then echo "{\"nftables\":[{\"add\":{\"rule\":{}}}]}"
+  else printf "{\"nftables\":[{\"add\":{\"rule\":{\"handle\":%s}}}]}\n" "$nh"; fi
+    exit 0
+fi
 case "$1" in
   -a)  # -a list chain inet pdg input
     echo "table inet pdg {"
@@ -113,18 +123,28 @@ echo $$ > "$CH_DIR/pid"
 for fn in _ios_offer_download _ios_offer_teardown _ios_offer_abort _ios_offer_nft_close \
           _ios_offer_chain _ios_offer_marks _ios_offer_rule_ok _ios_offer_ready \
           _ios_offer_lock_acquire _ios_offer_lock_release \
-          _ios_offer_srv_alive _ios_offer_on_signal \
+          _ios_offer_srv_alive _ios_offer_on_signal _ios_offer_reap_orphan _ios_offer_starttime \
           _nft_apply_main _lan_nft_reapply; do
   sed -n "/^$fn()/,/^}/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 done
 # 常量也要跟着抽: `set -u` 下漏一个就是 unbound variable, 而那会让收尾在半途死掉 ——
 # 表现与"产品没撤规则"一模一样(HANDOFF §10.7)。
-grep -E '^(LAN_NFT_CONF|IOS_OFFER_MARK|IOS_OFFER_LOCK)=' deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
+grep -E '^(LAN_NFT_CONF|IOS_OFFER_MARK|IOS_OFFER_LOCK|IOS_OFFER_STATE)=' deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 # IOS_OFFER_PROBE 是**多行**单引号常量, `grep '^…='` 只会抓到第一行 —— 那样 set -u 下
 # 就绪判据当场炸掉, 现场看起来像"服务永远不就绪"。按范围抽。
 sed -n "/^IOS_OFFER_PROBE='/,/^'$/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 grep -q "^IOS_OFFER_PROBE=" "$CH_DIR/fn.sh" || { echo "EXTRACT-MISSING:IOS_OFFER_PROBE"; exit 9; }
 grep -q 'http.server' "$CH_DIR/fn.sh" || { echo "EXTRACT-FAIL-http"; exit 9; }
+# 抽取自证: 函数**和常量**都要查。只查函数的话, 漏抽一个 IOS_OFFER_* 常量会变成 set -u 的
+# 运行期报错, 现场长得像"服务永远不就绪"—— 本轮实测漏过一次(IOS_OFFER_STATE)。
+missing=""
+for fn in $(grep -oE '_ios_offer_[a-z_]+' "$CH_DIR/fn.sh" | sort -u); do
+  grep -q "^$fn()" "$CH_DIR/fn.sh" || missing="$missing $fn"
+done
+for k in $(grep -oE '\bIOS_OFFER_[A-Z_]+' "$CH_DIR/fn.sh" | sort -u); do
+  grep -qE "^$k=" "$CH_DIR/fn.sh" || missing="$missing \$$k"
+done
+[ -z "$missing" ] || { echo "EXTRACT-MISSING:$missing"; exit 9; }
 c_g(){ echo "$*"; }; c_y(){ echo "$*"; }
 # shellcheck source=/dev/null
 . "$CH_DIR/fn.sh"

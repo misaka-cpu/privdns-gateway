@@ -64,6 +64,18 @@ render(){ local a out="" q=0
     else out="$out $a"; [ "$a" = comment ] && q=1; fi
   done; echo "${out# }"; }
 sig(){ [ -n "${PDG_TEST_SIG:-}" ] && kill "-${PDG_TEST_SIG}" "$(cat "$PDG_TEST_PIDFILE")" 2>/dev/null; }
+next_handle(){ echo $(( $(cut -d'|' -f1 "$st" | sort -n | tail -1) + 1 )); }
+# 产品现在用 `nft -j --echo --handle add rule …` 取回本轮规则的 handle。
+# 形态取自 nftables v1.0.6 实测: {"nftables":[{"add":{"rule":{... "handle": N ...}}}]}
+if [ "$1" = -j ] && [ "$2" = --echo ]; then
+  [ "${PDG_TEST_NFT_FAIL:-}" = add ] && { echo "Error: could not add" >&2; exit 1; }
+  shift 3; shift 5
+  nh=$(next_handle); echo "$nh|$(render "$@")" >> "$st"
+  if [ "${PDG_TEST_NO_HANDLE:-}" = 1 ]; then echo "{\"nftables\":[{\"add\":{\"rule\":{}}}]}"
+  else printf "{\"nftables\":[{\"add\":{\"rule\":{\"handle\":%s}}}]}\n" "$nh"; fi
+  [ "${PDG_TEST_SIG_AT:-}" = add ] && sig
+  exit 0
+fi
 case "$1" in
   -a|-j)
     n=$(( $(cat "$cnt" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$cnt"
@@ -120,7 +132,8 @@ echo $$ > "$CH_DIR/pid"
 : > "$CH_DIR/fn.sh"
 for fn in _ios_offer_download _ios_offer_teardown _ios_offer_abort _ios_offer_nft_close \
           _ios_offer_chain _ios_offer_marks _ios_offer_rule_ok _ios_offer_ready \
-          _ios_offer_lock_acquire _ios_offer_lock_release _ios_offer_on_signal \
+          _ios_offer_lock_acquire _ios_offer_lock_release \
+          _ios_offer_reap_orphan _ios_offer_starttime _ios_offer_on_signal \
           _ios_offer_srv_alive \
           _ios_offer_reap_orphan _nft_apply_main _lan_nft_reapply; do
   sed -n "/^$fn()/,/^}/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
@@ -133,6 +146,11 @@ grep -q "^IOS_OFFER_PROBE=" "$CH_DIR/fn.sh" || { echo "EXTRACT-MISSING:IOS_OFFER
 missing=""
 for fn in $(grep -oE '_ios_offer_[a-z_]+' "$CH_DIR/fn.sh" | sort -u); do
   grep -q "^$fn()" "$CH_DIR/fn.sh" || missing="$missing $fn"
+done
+# **常量也要自证。** 只查函数名的话, 漏抽一个 IOS_OFFER_* 常量会变成 set -u 的运行期报错,
+# 现场长得像"服务永远不就绪"——本轮实测漏过一次(IOS_OFFER_STATE)。
+for k in $(grep -oE '\bIOS_OFFER_[A-Z_]+' "$CH_DIR/fn.sh" | sort -u); do
+  grep -qE "^$k=" "$CH_DIR/fn.sh" || missing="$missing \$$k"
 done
 [ -z "$missing" ] || { echo "EXTRACT-MISSING:$missing"; exit 9; }
 c_g(){ echo "$*"; }; c_y(){ echo "$*"; }
@@ -260,7 +278,7 @@ for at, why in BARRIERS:
             probs.append("退出状态 %s, 不是 SIG%s 的终止状态" % (r["status"], signame))
         # 信号之后不许再做**任何**新的开通动作。每个屏障各自的"已发生"基线不同。
         nsrv = len(re.findall(r"^srv-invoked", r["srvlog"], re.M))
-        nadd = len(re.findall(r"^nft add rule", r["log"], re.M))
+        nadd = len(re.findall(r"^nft .*add rule", r["log"], re.M))
         exp_srv, exp_add = {"token": (0, 0), "serve": (1, 0), "add": (1, 1)}[at]
         if nsrv > exp_srv:
             probs.append("信号后又起了 HTTP(%d 个, 基线 %d)" % (nsrv, exp_srv))
@@ -398,9 +416,11 @@ for tag, why, r, phits, ahits in foreign_cases:
     probs = []
     if shows_link(r["out"]):
         probs.append("展示了下载链接")
-    if re.search(r"^nft add rule", r["log"], re.M):
+    if re.search(r"^nft .*add rule", r["log"], re.M):
         probs.append("加了 nft 放行")
-    if r["rc"] in (None, 0):
+    if r["rc"] is None:
+        probs.append("夹具没跑到函数返回(可能是 EXTRACT-MISSING): %s" % r["out"][:80])
+    elif r["rc"] == 0:
         probs.append("返回 0")
     if tag == "fproxy" and phits:
         probs.append("走了代理(代理收到 %d 次请求)" % len(phits))
@@ -423,7 +443,7 @@ if not wait_port_free():
 else:
     d, env, _, _ = mkcase("readback", CH_STDIN_HOLD=1, PDG_TEST_LIST_FAIL_FROM=3)
     r = run(d, env)
-    nadd = len(re.findall(r"^nft add rule", r["log"], re.M))
+    nadd = len(re.findall(r"^nft .*add rule", r["log"], re.M))
     ndel = len(re.findall(r"^nft delete rule", r["log"], re.M))
     probs = []
     if nadd != 1:
