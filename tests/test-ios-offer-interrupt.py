@@ -140,7 +140,7 @@ echo $$ > "$CH_DIR/pid"
 for fn in _ios_offer_download _ios_offer_teardown _ios_offer_abort _ios_offer_nft_close \
           _ios_offer_chain _ios_offer_marks _ios_offer_rule_ok _ios_offer_ready \
           _ios_offer_lock_acquire _ios_offer_lock_release \
-          _ios_offer_reap_orphan _ios_offer_starttime _ios_offer_on_signal \
+          _ios_offer_reap_orphan _ios_offer_starttime _ios_offer_state_write _ios_offer_on_signal \
           _ios_offer_srv_alive \
           _ios_offer_reap_orphan _nft_apply_main _lan_nft_reapply; do
   sed -n "/^$fn()/,/^}/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
@@ -149,6 +149,7 @@ grep -E '^(LAN_NFT_CONF|IOS_OFFER_MARK|IOS_OFFER_LOCK|IOS_OFFER_STATE)=' deploy/
 # IOS_OFFER_PROBE 是**多行**单引号常量, `grep '^…='` 只会抓到第一行 —— 那样 set -u 下
 # 就绪判据当场炸掉, 现场看起来像"服务永远不就绪"。按范围抽。
 sed -n "/^IOS_OFFER_PROBE='/,/^'$/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
+sed -n "/^IOS_OFFER_SERVER='/,/^'$/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 grep -q "^IOS_OFFER_PROBE=" "$CH_DIR/fn.sh" || { echo "EXTRACT-MISSING:IOS_OFFER_PROBE"; exit 9; }
 missing=""
 for fn in $(grep -oE '_ios_offer_[a-z_]+' "$CH_DIR/fn.sh" | sort -u); do

@@ -168,7 +168,7 @@ echo $$ > "$CH_DIR/pid"
 for fn in _ios_offer_download _ios_offer_teardown _ios_offer_abort _ios_offer_nft_close \
           _ios_offer_chain _ios_offer_marks _ios_offer_rule_ok _ios_offer_ready \
           _ios_offer_lock_acquire _ios_offer_lock_release \
-          _ios_offer_srv_alive _ios_offer_on_signal _ios_offer_reap_orphan _ios_offer_starttime \
+          _ios_offer_srv_alive _ios_offer_on_signal _ios_offer_reap_orphan _ios_offer_starttime _ios_offer_state_write \
           _nft_apply_main _lan_nft_reapply; do
   sed -n "/^$fn()/,/^}/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 done
@@ -176,8 +176,9 @@ grep -E '^(LAN_NFT_CONF|IOS_OFFER_MARK|IOS_OFFER_LOCK|IOS_OFFER_STATE)=' deploy/
 # IOS_OFFER_PROBE 是**多行**单引号常量, `grep '^…='` 只会抓到第一行 —— 那样 set -u 下
 # 就绪判据当场炸掉, 现场看起来像"服务永远不就绪"。按范围抽。
 sed -n "/^IOS_OFFER_PROBE='/,/^'$/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
+sed -n "/^IOS_OFFER_SERVER='/,/^'$/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 grep -q "^IOS_OFFER_PROBE=" "$CH_DIR/fn.sh" || { echo "EXTRACT-MISSING:IOS_OFFER_PROBE"; exit 9; }
-grep -q 'http.server' "$CH_DIR/fn.sh" || { echo "EXTRACT-FAIL-http"; exit 9; }
+grep -q 'IOS_OFFER_SERVER=' "$CH_DIR/fn.sh" || { echo "EXTRACT-FAIL-server"; exit 9; }
 # 抽取自证必须排在**所有**抽取之后 —— 排在前面的话它检查的是一个还没装满的 fn.sh。
 # 函数和常量都要查: 只查函数时, 漏抽一个 IOS_OFFER_* 常量会变成 set -u 的运行期报错,
 # 现场长得像"服务永远不就绪"。

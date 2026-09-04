@@ -494,7 +494,9 @@ else:
 # 另一边照旧, 而两边看起来都在正常工作。
 _OFFER = re.search(r"^_ios_offer_download\(\)\{.*?^\}", pdg, re.S | re.M)
 _OFFER = _OFFER.group(0) if _OFFER else ""
-_dup = [lbl for pat, lbl in (("python3 -m http.server", "临时 HTTP"),
+# 服务从 `python3 -m http.server` 换成了内置的精确路径 handler(它会列目录, 一次性 token
+# 就白带了)。"一处实现"的标记随之改成那个常量的定义点。
+_dup = [lbl for pat, lbl in (('python3 -c "$IOS_OFFER_SERVER"', "临时 HTTP"),
                              ("add rule inet pdg input", "临时 nft 放行"),
                              ("qrencode -t", "终端二维码"))
         if pdg.count(pat) != 1 or pat not in _OFFER]
@@ -569,7 +571,7 @@ exit 0
         # timeout 记下自己被怎么调起来、服务目录里到底是什么, 然后变成一个可被 kill 的长命
         # 进程 —— "按回车即收"到底收没收干净, 靠它活着还是死了来判。
         ("timeout", '#!/bin/bash\n'
-                    '{ echo "timeout-args=$*"\n'
+                    '{ echo "timeout-args=$(echo $*)"\n'
                     '  echo "serve-cwd=$PWD"\n'
                     '  echo "serve-files=$(ls)"\n'
                     '  echo "serve-sha=$(sha256sum -- *.mobileconfig | awk \'{print $1}\')"\n'
@@ -597,7 +599,7 @@ sed -n '/^_lan_nft_reapply()/,/^}/p' deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 for _fn in _ios_offer_teardown _ios_offer_abort _ios_offer_nft_close \
            _ios_offer_chain _ios_offer_marks _ios_offer_rule_ok _ios_offer_ready \
            _ios_offer_lock_acquire _ios_offer_lock_release \
-           _ios_offer_srv_alive _ios_offer_on_signal _ios_offer_reap_orphan _ios_offer_starttime; do
+           _ios_offer_srv_alive _ios_offer_on_signal _ios_offer_reap_orphan _ios_offer_starttime _ios_offer_state_write; do
   sed -n "/^$_fn()/,/^}/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 done
 # 常量也要跟着抽。`set -u` 下漏一个就是 unbound variable, 而那会让 _nft_apply_main 在
@@ -607,7 +609,8 @@ done
 grep -E '^(LAN_NFT_CONF|IOS_OFFER_MARK|IOS_OFFER_LOCK|IOS_OFFER_STATE)=' deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 # IOS_OFFER_PROBE 是多行常量, grep 抓不全 —— set -u 下就绪判据会当场炸。
 sed -n "/^IOS_OFFER_PROBE='/,/^'$/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
-grep -q 'http.server' "$CH_DIR/fn.sh" || { echo "EXTRACT-FAIL"; exit 9; }
+sed -n "/^IOS_OFFER_SERVER='/,/^'$/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
+grep -q 'IOS_OFFER_SERVER=' "$CH_DIR/fn.sh" || { echo "EXTRACT-FAIL"; exit 9; }
 # 抽取自证: 函数**和常量**都要查。只查函数的话, 漏抽一个 IOS_OFFER_* 常量会变成 set -u 的
 # 运行期报错, 现场长得像"服务永远不就绪"—— 本轮实测漏过一次(IOS_OFFER_STATE)。
 missing=""
@@ -629,7 +632,8 @@ echo "RC=$?"
 """
 _chenv = dict(os.environ, PATH=CHBIN + os.pathsep + os.environ.get("PATH", ""),
               PDG_TEST_LOG=CHLOG, PDG_TEST_READY=CHREADY, CH_DIR=CH, CH_SRC=CHSRC,
-              PDG_IOS_OFFER_LOCKFILE=os.path.join(CH, "offer.lock"), TMPDIR=CH)
+              PDG_IOS_OFFER_LOCKFILE=os.path.join(CH, "offer.lock"),
+              PDG_IOS_OFFER_STATEFILE=os.path.join(CH, "offer.state"), TMPDIR=CH)
 _r = subprocess.run(["bash", "-c", HARNESS_CH], capture_output=True, text=True,
                     cwd=str(ROOT), timeout=180, env=_chenv)
 _chout = (_r.stdout or "") + (_r.stderr or "")
@@ -641,8 +645,13 @@ def _lv(key):
     return m.group(1).strip() if m else ""
 
 
-if _lv("timeout-args") == "600 python3 -m http.server 8443 --bind 0.0.0.0":
-    ok("下载通道真的起了 HTTP:8443, 并自带 10 分钟硬超时(没人管也会自己收)")
+# 命令行形态: `600 python3 -c <精确路径 handler> 8443 /<tok>.mobileconfig <文件> 0.0.0.0`。
+# 逐字比对整条太脆(脚本本身会随实现演进), 这里钉住不会变的三件: 10 分钟硬超时、端口、
+# 以及**不是** `-m http.server`(那正是被换掉的东西)。
+_ta = _lv("timeout-args")
+if _ta.startswith("600 python3 -c ") and " 8443 " in _ta and _ta.endswith(" 0.0.0.0") \
+        and "-m http.server" not in _ta:
+    ok("下载通道起的是精确路径 handler(非 -m http.server), 绑 8443, 自带 10 分钟硬超时")
 else:
     bad("HTTP 没按预期起: timeout-args=%r\n%s" % (_lv("timeout-args"), _chout[:300]))
 

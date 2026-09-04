@@ -2538,6 +2538,68 @@ IOS_OFFER_LOCK="${PDG_IOS_OFFER_LOCKFILE:-/run/privdns-gateway-ios-offer.lock}"
 # 可能打死一个毫不相干的新进程。
 IOS_OFFER_STATE="${PDG_IOS_OFFER_STATEFILE:-/run/privdns-gateway-ios-offer.state}"
 
+# 极小的**精确路径** HTTP 服务, 取代 `python3 -m http.server`。
+# 换掉它的理由不是洁癖: 那个模块对 `/` 返回**目录清单**, 于是"文件名带一次性随机串, 同网段
+# 猜不到"这句话不成立 —— nft 放行的正是那个网段, 里面任何设备请求一次根路径就把文件名拿走
+# 了, 一次都不用猜。
+# 这里只认本轮那一条路径(含查询串在内逐字相等), 其余一律 404: 不列目录、不重定向、不猜
+# MIME。绑定地址由调用方给(生产是 0.0.0.0, 访问范围仍由 nft 那条按源地址的放行来控)。
+IOS_OFFER_SERVER='
+import http.server, os, socketserver, sys, threading
+PORT = int(sys.argv[1]); WANT = sys.argv[2]; FILE = sys.argv[3]; BIND = sys.argv[4]
+with open(FILE, "rb") as fh:
+    BODY = fh.read()
+
+class H(http.server.BaseHTTPRequestHandler):
+    server_version = "pdg"
+    sys_version = ""
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        if self.path != WANT:
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-apple-aspen-config")
+        self.send_header("Content-Length", str(len(BODY)))
+        self.end_headers()
+        self.wfile.write(BODY)
+
+class S(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+t = threading.Timer(600, lambda: os._exit(0))
+t.daemon = True
+t.start()
+S((BIND, PORT), H).serve_forever()
+'
+
+# state 必须**可信落盘**: SIGKILL 之后的自愈完全依赖它。写不进去还继续开通道, 等于把"能
+# 自愈"建立在一次没发生的写入上, 而现场看不出任何异常。
+# 同目录候选文件 → 写满 → chmod 0600 → 原子 rename。任何一步失败都算失败, 且不留半截文件。
+# 里面是 pid 与本机路径, 所以权限固定 0600, 不跟 umask 走。
+_ios_offer_state_write(){
+  local pid="$1" start="$2" www="$3" dir tmp
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  [[ "$start" =~ ^[0-9]+$ ]] || return 1
+  [[ -n "$www" && -d "$www" ]] || return 1
+  dir="$(dirname "$IOS_OFFER_STATE")"
+  [[ -d "$dir" && -w "$dir" ]] || return 1
+  tmp="$(mktemp "$IOS_OFFER_STATE.XXXXXX" 2>/dev/null)" || return 1
+  if ! printf 'pid=%s\nstart=%s\nwww=%s\n' "$pid" "$start" "$www" > "$tmp" 2>/dev/null; then
+    rm -f "$tmp"; return 1
+  fi
+  chmod 0600 "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$IOS_OFFER_STATE" 2>/dev/null || { rm -f "$tmp"; return 1; }
+  _IOS_OFFER_STATE_OWNED=1     # 只有写成功才算这份记录归本轮所有, teardown 才可以删它
+  return 0
+}
+
 # /proc/<pid>/stat 的 starttime(第 22 域)。不能直接 `awk '{print $22}'` —— 第二个域是
 # `(comm)`, 里面可能有空格和括号, 域号会整体错位。先按最后一个 `)` 截断再数。
 _ios_offer_starttime(){
@@ -2553,29 +2615,40 @@ _ios_offer_starttime(){
 # 正是我们当初建的那个目录。任何一条对不上就只清记录, 不碰任何进程。
 _ios_offer_reap_orphan(){
   [[ -s "$IOS_OFFER_STATE" ]] || return 0
-  local pid start www now n=0
+  local pid start www now n=0 rc=0 matched=0
   pid="$(sed -n 's/^pid=//p'   "$IOS_OFFER_STATE" | head -1)"
   start="$(sed -n 's/^start=//p' "$IOS_OFFER_STATE" | head -1)"
   www="$(sed -n 's/^www=//p'   "$IOS_OFFER_STATE" | head -1)"
-  rm -f "$IOS_OFFER_STATE"
-  [[ "$pid" =~ ^[0-9]+$ && "$start" =~ ^[0-9]+$ ]] || return 0
-  if [[ -d "/proc/$pid" ]]; then
+  # 记录**先不删**: 处理完才算接手。上一版一进来就 rm, 于是半途失败时这份记录也没了,
+  # 下一次会话既不知道该收谁、也不知道该删哪个目录。
+  if [[ "$pid" =~ ^[0-9]+$ && "$start" =~ ^[0-9]+$ && -n "$www" && -d "/proc/$pid" ]]; then
     now="$(_ios_offer_starttime "$pid")"
-    if [[ -n "$now" && "$now" == "$start" && -n "$www" ]] \
+    if [[ -n "$now" && "$now" == "$start" ]] \
        && [[ "$(readlink -f "/proc/$pid/cwd" 2>/dev/null)" == "$(readlink -f "$www" 2>/dev/null)" ]]; then
+      matched=1
       kill -TERM "$pid" 2>/dev/null
       while [[ "$n" -lt 30 ]] && kill -0 "$pid" 2>/dev/null; do sleep 0.1; n=$((n + 1)); done
-      kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
-      c_y "回收了上一次被强杀留下的临时下载服务(pid $pid)。"
+      if kill -0 "$pid" 2>/dev/null; then
+        kill -KILL "$pid" 2>/dev/null
+        n=0
+        while [[ "$n" -lt 20 ]] && kill -0 "$pid" 2>/dev/null; do sleep 0.1; n=$((n + 1)); done
+      fi
+      if kill -0 "$pid" 2>/dev/null; then
+        echo "❌ 上一次强杀留下的临时下载服务(pid $pid)停不掉 —— 端口可能仍被占着。"
+        rc=1
+      else
+        c_y "回收了上一次被强杀留下的临时下载服务(pid $pid)。"
+      fi
     fi
   fi
-  # 目录只删**经过校验的那一个**: 记录里的路径、确实是目录、里面除了描述文件没有别的东西。
-  # 不做"按前缀猜一个临时目录删掉"这种事 —— 那是拿 rm -rf 赌路径。
-  if [[ -n "$www" && -d "$www" ]]; then
+  # **目录删除必须在身份校验之内。** 上一版把它放在校验分支外面: 一份内容对得上的 state
+  # 就足以让它删掉一个与本功能毫无关系的目录 —— 那是拿 rm -rf 认字符串, 不是认身份。
+  if [[ "$matched" == 1 && "$rc" == 0 && -n "$www" && -d "$www" ]]; then
     [[ -z "$(find "$www" -mindepth 1 -maxdepth 1 ! -name '*.mobileconfig' -print -quit 2>/dev/null)" ]] \
       && rm -rf "$www"
   fi
-  return 0
+  [[ "$rc" == 0 ]] && rm -f "$IOS_OFFER_STATE"
+  return "$rc"
 }
 
 # fd 6: 9 是全局锁、8 留给 BASH_XTRACEFD、7 是 _lock 里备份 stderr 用的, 都不能占。
@@ -2736,6 +2809,10 @@ _ios_offer_on_signal(){
 _ios_offer_teardown(){
   [[ -n "${_IOS_OFFER_ACTIVE:-}" ]] || return 0
   _IOS_OFFER_ACTIVE=""
+  # 收尾一旦开始就必须跑完。信号处理器进来时已经把 trap 摘干净, 此后第二个 HUP/INT/TERM
+  # 会走**默认处置** = 直接杀掉 shell, 把收尾停在半路(端口撤了目录还在, 或 nft 撤了 state
+  # 还在)。这里临时忽略它们 —— 忽略期间到达的信号会被丢弃, 不会排队等在后面。
+  trap "" HUP INT TERM
   local rc=0
   # 顺序要紧: 先停服务再撤放行。反过来的话, 撤除失败时服务还在跑, 而我们已经以为收干净了。
   if [[ -n "${_IOS_OFFER_SRV:-}" ]]; then
@@ -2761,9 +2838,15 @@ _ios_offer_teardown(){
     fi
     _IOS_OFFER_STAGE=""
   fi
-  rm -f "$IOS_OFFER_STATE" 2>/dev/null || true
+  # **只删本轮自己写下的那份 state。** 入场时读到的旧孤儿记录不归我们处置 —— 回收流程
+  # 处理完才会删它; 在这里一并删掉的话, 一次半途失败就把下一次会话的线索抹了。
+  if [[ -n "${_IOS_OFFER_STATE_OWNED:-}" ]]; then
+    rm -f "$IOS_OFFER_STATE" 2>/dev/null || true
+    _IOS_OFFER_STATE_OWNED=""
+  fi
   _ios_offer_lock_release
   _IOS_OFFER_SRV=""; _IOS_OFFER_WWW=""; _IOS_OFFER_HANDLE=""
+  trap - HUP INT TERM
   return "$rc"
 }
 
@@ -2788,6 +2871,7 @@ _ios_offer_download(){
   # 因为此刻另一条通道正在服务, 它的规则、端口和目录都不属于我们。
   _ios_offer_lock_acquire || return 1
   _IOS_OFFER_ACTIVE=1; _IOS_OFFER_SRV=""; _IOS_OFFER_WWW=""; _IOS_OFFER_HANDLE=""
+  _IOS_OFFER_STATE_OWNED=""
   # EXIT 与 HUP 缺一不可: HUP 是 SSH 断开发的信号, 线上那次泄漏就是它 —— 旧写法只捕
   # INT/TERM, 收到 HUP 时 bash 直接死, 收尾一行都没跑。EXIT 兜住其余任何异常退出。
   # SIGKILL 兜不住; 那种情况靠下一次进来时、拿到锁之后的残留清理。
@@ -2829,21 +2913,30 @@ _ios_offer_download(){
   # 拿到锁之后才清残留: 有锁作保证, 此刻链里带标记的规则一定是**上一次没收干净的**,
   # 不可能是另一条还活着的会话 —— 这两者以前分不开, 于是清理等于抢别人的东西。
   # 清不掉就不能继续: 那意味着我们连自己加的规则将来能不能撤掉都没有把握。
-  if ! _ios_offer_nft_close; then
-    _ios_offer_abort "清理上一次残留的临时放行失败 —— 未开放任何临时端口。"; return 1
+  # 顺序是**先关数据面, 再撤访问面**: 上一次被强杀的会话留下的 HTTP 还在对外服务, 那是更
+  # 紧的一头; nft 链读不到不是跳过它的理由 —— 上一版把回收排在入场清理后面, 于是链一读不到
+  # 就 abort, 孤儿继续占着 8443 直到十分钟超时。两边都要试, 错误合并上报。
+  local reap_rc=0 sweep_rc=0
+  _ios_offer_reap_orphan || reap_rc=1
+  _ios_offer_nft_close   || sweep_rc=1
+  if [[ "$reap_rc" -ne 0 || "$sweep_rc" -ne 0 ]]; then
+    _ios_offer_abort "入场清理未完成(孤儿回收 rc=$reap_rc, 残留放行清理 rc=$sweep_rc) —— 未开放任何临时端口。"; return 1
   fi
-  # 同样要在锁里做: 上一次被 SIGKILL 打死的那条会话, 它的 HTTP 还占着 8443、临时目录还在盘上。
-  _ios_offer_reap_orphan
 
   # exec: 让 kill 直接打在 timeout 上(它再转发给 python3)。少了它被杀的只是外层子 shell,
   # 端口会一直开到 10 分钟超时为止。
   # 6>&-: **子进程不许继承会话锁**。继承了的话, 父 shell 被 SIGKILL 之后锁还被这个子进程
   # 攥着, 一直攥到 600 秒超时 —— 那十分钟里谁都开不了新通道, 而且看不出来是为什么。
-  ( cd "$WWW" && exec timeout 600 python3 -m http.server "$PORT" --bind 0.0.0.0 >/dev/null 2>&1 ) 6>&- &
+  ( cd "$WWW" && exec timeout 600 python3 -c "$IOS_OFFER_SERVER" \
+        "$PORT" "/$TOK.mobileconfig" "$WWW/$TOK.mobileconfig" 0.0.0.0 >/dev/null 2>&1 ) 6>&- &
   _IOS_OFFER_SRV=$!
   # 记录本轮的所有权凭据, 供"被 SIGKILL 之后的下一次会话"核对身份并回收。
-  printf 'pid=%s\nstart=%s\nwww=%s\n' "$_IOS_OFFER_SRV" \
-      "$(_ios_offer_starttime "$_IOS_OFFER_SRV")" "$WWW" > "$IOS_OFFER_STATE" 2>/dev/null || true
+  # 写不成功就**不开通道**: 自愈完全靠这份记录, 记录没落盘的话, 强杀之后端口白占十分钟,
+  # 而现场看不出任何异常。
+  if ! _ios_offer_state_write "$_IOS_OFFER_SRV" \
+        "$(_ios_offer_starttime "$_IOS_OFFER_SRV")" "$WWW"; then
+    _ios_offer_abort "写不下运行期所有权记录($IOS_OFFER_STATE) —— 强杀之后将无法自愈, 本次不开通道。"; return 1
+  fi
   if ! _ios_offer_ready "/$TOK.mobileconfig" "$want_sha" "$want_len"; then
     _ios_offer_abort "临时 HTTP 没能就绪 —— 端口 $PORT 上没有我们这一份文件(可能被别的服务占着), 未开放任何临时端口。"; return 1
   fi

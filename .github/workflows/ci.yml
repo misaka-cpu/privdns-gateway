@@ -618,6 +618,9 @@ jobs:
       - name: "iOS 调用方 staging fail-closed (mktemp -d 失败不得把描述文件生成到 /)"
         run: python3 tests/test-ios-caller-staging.py
 
+      - name: "iOS 临时下载通道加固 (根路径不可枚举 / state 0600 原子落盘 / 孤儿身份核验 / 收尾不被二次信号打断)"
+        run: python3 tests/test-ios-offer-hardening.py
+
       - name: "iOS 描述文件身份持久性 (update/快照/备份恢复/平台来回切都不丢身份)"
         run: python3 tests/test-ios-profile-persist.py
 
