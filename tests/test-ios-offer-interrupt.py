@@ -101,7 +101,8 @@ exec "${args[@]}"
 OPENSSL_STUB = ('#!/bin/sh\n'
                 '[ "${PDG_TEST_SIG_AT:-}" = token ] && '
                 'kill "-${PDG_TEST_SIG}" "$(cat "$PDG_TEST_PIDFILE")" 2>/dev/null\n'
-                'echo deadbeefcafe\n')
+                'od -An -N6 -tx1 /dev/urandom | tr -d " \\n"\n'
+                'echo\n')
 
 INSTALL_STUB = r'''#!/bin/bash
 tgt="${!#}"
@@ -411,6 +412,34 @@ for tag, why, r, phits, ahits in foreign_cases:
         bad("%s: %s —— 就绪判据把别人的服务当成了自己的" % (why, "; ".join(probs)))
     else:
         ok("%s → 不认账: 非零退出, 不加放行、不展示链接" % why)
+
+
+# ── 组 3: nft add 成功, 之后每一次读链都失败 ───────────────────────────────
+# 时序: 入场读链成功 → add 成功 → add 后第一次读链失败 → teardown 读链仍失败。
+# 这一格问的是**规则去哪了**。"返回非零"是诚实的, 但它不等于"放行已经撤回" —— 撤除的
+# 凭据(handle)在 add 那一刻就拿得到, 丢了它就只剩"读链找 handle"这一条路, 而链正好读不了。
+if not wait_port_free():
+    bad("组 3: 8443 被上一格残留占着, 无法测量")
+else:
+    d, env, _, _ = mkcase("readback", CH_STDIN_HOLD=1, PDG_TEST_LIST_FAIL_FROM=3)
+    r = run(d, env)
+    nadd = len(re.findall(r"^nft add rule", r["log"], re.M))
+    ndel = len(re.findall(r"^nft delete rule", r["log"], re.M))
+    probs = []
+    if nadd != 1:
+        probs.append("add 没发生或发生了 %d 次, 时序没造出来" % nadd)
+    if r["marks"]:
+        probs.append("放行仍留在链里(%d 条) —— 丢了 handle 就再也删不掉了" % len(r["marks"]))
+    if ndel == 0:
+        probs.append("一次精确删除都没尝试(没有保存 add 时拿到的 handle)")
+    if claims_closed(r["out"]):
+        probs.append("声称已关闭")
+    if r["rc"] in (None, 0):
+        probs.append("返回 0(读不到链就无法证明已撤回, 不能算成功)")
+    if probs:
+        bad("add 后复读失败: " + "; ".join(probs))
+    else:
+        ok("add 后复读失败 → 用 add 时保存的 handle 精确删除, 链里归零, 但仍非零退出(无法复核)")
 
 print("\n%d passed, %d failed" % (PASS[0], FAIL[0]))
 sys.exit(1 if FAIL[0] else 0)

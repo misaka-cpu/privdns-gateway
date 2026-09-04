@@ -114,10 +114,14 @@ args=(); for a in "$@"; do [ "$a" = 0.0.0.0 ] && a=127.0.0.1; args+=("$a"); done
 exec "${args[@]}"
 '''
 
+# token 必须**每次不同**, 和生产里的 `openssl rand -hex 6` 一样。固定 token 会造出一个
+# 假象: SIGKILL 留下的孤儿服务的正是同一路径同一内容, 于是后继会话的就绪判据在孤儿身上
+# 通过, 看起来"自愈成功"了 —— 真机上 token 随机, 后继只会拿到 404。
 OPENSSL_STUB = ('#!/bin/sh\n'
                 '[ "${PDG_TEST_TOKEN_FAIL:-}" = 1 ] && { echo "err" >&2; exit 1; }\n'
                 '[ "${PDG_TEST_TOKEN_FAIL:-}" = junk ] && { echo "NOT-HEX!!"; exit 0; }\n'
-                'echo deadbeefcafe\n')
+                'od -An -N6 -tx1 /dev/urandom | tr -d " \\n"\n'
+                'echo\n')
 
 MKTEMP_STUB = ('#!/bin/sh\n'
                '[ "${PDG_TEST_MKTEMP_FAIL:-}" = 1 ] && { echo "mktemp: failed" >&2; exit 1; }\n'
@@ -147,7 +151,7 @@ echo $$ > "$CH_DIR/pid"
 for fn in _ios_offer_download _ios_offer_teardown _ios_offer_abort _ios_offer_nft_close \
           _ios_offer_chain _ios_offer_marks _ios_offer_rule_ok _ios_offer_ready \
           _ios_offer_lock_acquire _ios_offer_lock_release \
-          _ios_offer_srv_alive _ios_offer_on_signal \
+          _ios_offer_srv_alive _ios_offer_on_signal _ios_offer_reap_orphan \
           _nft_apply_main _lan_nft_reapply; do
   sed -n "/^$fn()/,/^}/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 done
@@ -156,7 +160,7 @@ for fn in $(grep -oE '_ios_offer_[a-z_]+' "$CH_DIR/fn.sh" | sort -u); do
   grep -q "^$fn()" "$CH_DIR/fn.sh" || missing="$missing $fn"
 done
 [ -z "$missing" ] || { echo "EXTRACT-MISSING:$missing"; exit 9; }
-grep -E '^(LAN_NFT_CONF|IOS_OFFER_MARK|IOS_OFFER_LOCK)=' deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
+grep -E '^(LAN_NFT_CONF|IOS_OFFER_MARK|IOS_OFFER_LOCK|IOS_OFFER_STATE)=' deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 # IOS_OFFER_PROBE 是**多行**单引号常量, `grep '^…='` 只会抓到第一行 —— 那样 set -u 下
 # 就绪判据当场炸掉, 现场看起来像"服务永远不就绪"。按范围抽。
 sed -n "/^IOS_OFFER_PROBE='/,/^'$/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
@@ -230,6 +234,7 @@ def mkcase(tag, **env_extra):
                PDG_TEST_SRVPID=os.path.join(d, "srvpid"),
                PDG_TEST_STATE=os.path.join(d, "chain"),
                PDG_IOS_OFFER_LOCKFILE=os.path.join(d, "offer.lock"),
+               PDG_IOS_OFFER_STATEFILE=os.path.join(d, "offer.state"),
                TMPDIR=d,
                CH_DIR=d, CH_SRC=src, CH_ROOT=str(ROOT))
     env.update({k: str(v) for k, v in env_extra.items()})
@@ -503,60 +508,94 @@ for tag, sig, why in (("hup", signal.SIGHUP, "SIGHUP"),
     else:
         ok("%s 之后: 规则 0 / 端口 0 / 临时目录 0 / 会话锁已释放" % why)
 
-# ── 7b. SIGKILL: 锁不许被孤儿子进程攥着, 下一次会话要能自愈 ────────────────
-# SIGKILL 是唯一兜不住的路径 —— 收尾一行都不会跑。所以这一格问两件事:
-#   · 父 shell 被打死之后, **会话锁必须是可再取的**。HTTP 子进程如果继承了锁 fd, 它会
-#     一直攥到自己 600 秒超时为止, 那十分钟里谁都开不了新通道, 而且现场看不出原因;
-#   · 残留的放行必须能被下一次会话带走(拿到锁之后清), 不需要人工去摘规则。
+# ── 7b. SIGKILL: 断言之前**不做任何人工干预** ─────────────────────────────
+# 上一版在这里先按 pid 把孤儿 HTTP 杀掉、再去看后继会话"自愈"得怎么样, 然后把结果写成了
+# "SIGKILL 之后下一次会话拿到锁、带走残留、自己也收干净"。那句话是**测试清理**换来的,
+# 不是产品行为 —— 端口一直被孤儿占着的话, 后继会话根本起不来。
+# 这一格改成: 打死父 shell 之后原样启动后继会话, 记录五项前像, 断言全部做完了再清场。
 import fcntl
 
 dK, envK = mkcase("sigkill", CH_STDIN_HOLD=60)
 pK = launch(dK, envK)
 readyK = wait_for(lambda: shows_link(read(os.path.join(dK, "out"))))
-marksK = marks(dK)
-if not readyK or not marksK:
-    bad("SIGKILL: 通道没就绪(ready=%s 规则=%d), 这一格没测到东西" % (readyK, len(marksK)))
-else:
-    try:
-        os.kill(int(read(os.path.join(dK, "pid")).strip()), signal.SIGKILL)
-    except (OSError, ValueError):
-        pass
-    pK.wait(timeout=15)
-    time.sleep(0.4)
-    lock_reacquirable = True
-    try:
-        fh = open(envK["PDG_IOS_OFFER_LOCKFILE"], "a")
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-        fh.close()
-    except OSError:
-        lock_reacquirable = False
-    if not lock_reacquirable:
-        bad("SIGKILL 之后会话锁仍被占着 —— HTTP 子进程继承了锁 fd, "
-            "接下来十分钟谁都开不了新通道")
+pre = {}
+try:
+    if not readyK or not marks(dK):
+        bad("SIGKILL: 通道没就绪(ready=%s), 这一格没测到东西" % readyK)
     else:
-        ok("SIGKILL 之后会话锁可以再取(子进程没有继承锁 fd)")
-    # 孤儿服务还在(它有自己的 600 秒超时占着 8443), 先按**确切 pid** 收掉, 再看下一次
-    # 会话能不能自愈残留。绝不用 `pkill -f <模式>`: 它会连发起命令的那个 shell 一起咬掉
-    # (HANDOFF §9.13, 本轮又实测中了一次)。
-    for spid in read(os.path.join(dK, "srvpid")).split():
         try:
-            os.kill(int(spid), signal.SIGKILL)
+            os.kill(int(read(os.path.join(dK, "pid")).strip()), signal.SIGKILL)
         except (OSError, ValueError):
             pass
-    wait_for(lambda: not fetch(timeout=0.5)[0], limit=10)
-    dH, envH = mkcase("selfheal", CH_STDIN_HOLD=1)
-    envH["PDG_TEST_STATE"] = envK["PDG_TEST_STATE"]      # 带着 SIGKILL 留下的残留进场
-    envH["PDG_IOS_OFFER_LOCKFILE"] = envK["PDG_IOS_OFFER_LOCKFILE"]
-    rH = finish(launch(dH, envH), dH, limit=40)
-    left = [l for l in read(envK["PDG_TEST_STATE"]).splitlines()
-            if 'comment "pdg-ios-offer"' in l]
-    if "BUSY" in rH["out"]:
-        bad("SIGKILL 之后下一次会话被自己的孤儿挡成了 BUSY —— 无法自愈")
-    elif left:
-        bad("SIGKILL 之后下一次会话没能带走残留放行(还剩 %d 条)" % len(left))
-    else:
-        ok("SIGKILL 之后下一次会话拿到锁、带走残留、自己也收干净")
+        pK.wait(timeout=15)
+        time.sleep(0.5)
+        srvpids = [int(x) for x in read(os.path.join(dK, "srvpid")).split() if x.isdigit()]
+        alive = []
+        for sp in srvpids:
+            try:
+                os.kill(sp, 0)
+                alive.append(sp)
+            except OSError:
+                pass
+        www = re.search(r"install-target (\S+)", read(os.path.join(dK, "log")))
+        wwwdir = os.path.dirname(www.group(1)) if www else ""
+        lockfree = True
+        try:
+            fh = open(envK["PDG_IOS_OFFER_LOCKFILE"], "a")
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            fh.close()
+        except OSError:
+            lockfree = False
+        pre = {"orphan": alive, "port": has_listener(), "marks": len(marks(dK)),
+               "www": wwwdir if wwwdir and os.path.isdir(wwwdir) else "",
+               "lockfree": lockfree}
+        print("       SIGKILL 前像: 孤儿 HTTP=%s, 8443 有监听=%s, nft 标记=%d, 旧 WWW=%s, 锁可取=%s"
+              % (pre["orphan"] or "无", pre["port"], pre["marks"],
+                 pre["www"] or "已不在", pre["lockfree"]))
+        if not lockfree:
+            bad("SIGKILL 之后会话锁仍被占着 —— HTTP 子进程继承了锁 fd")
+        else:
+            ok("SIGKILL 之后会话锁可以再取(子进程没有继承锁 fd)")
+
+        # 后继会话: 共用同一条链、同一把锁、同一份运行期记录。不预先杀孤儿, 不预先删目录。
+        dH, envH = mkcase("selfheal", CH_STDIN_HOLD=1)
+        envH["PDG_TEST_STATE"] = envK["PDG_TEST_STATE"]
+        envH["PDG_IOS_OFFER_LOCKFILE"] = envK["PDG_IOS_OFFER_LOCKFILE"]
+        envH["PDG_IOS_OFFER_STATEFILE"] = envK["PDG_IOS_OFFER_STATEFILE"]
+        rH = finish(launch(dH, envH), dH, limit=60)
+        post_orphan = []
+        for sp in pre["orphan"]:
+            try:
+                os.kill(sp, 0)
+                post_orphan.append(sp)
+            except OSError:
+                pass
+        probs = []
+        if "BUSY" in rH["out"]:
+            probs.append("被自己的孤儿挡成 BUSY")
+        if rH["rc"] not in (0,):
+            probs.append("后继会话没能开通(rc=%s)" % rH["rc"])
+        if not shows_link(rH["out"]):
+            probs.append("后继会话没打出链接")
+        if post_orphan:
+            probs.append("孤儿 HTTP 仍在跑 %s" % post_orphan)
+        if pre["www"] and os.path.isdir(pre["www"]):
+            probs.append("上一轮的临时目录仍在 %s" % pre["www"])
+        if rH["marks"]:
+            probs.append("链里仍有 %d 条标记放行" % len(rH["marks"]))
+        if probs:
+            bad("SIGKILL 后继会话未能自愈: " + "; ".join(probs))
+        else:
+            ok("SIGKILL 后继会话自愈: 收掉孤儿、删掉旧目录、开通并收干净(全程无人工干预)")
+finally:
+    # 清场只放在断言之后, 且只按记录到的确切 pid / 路径来收 —— 不是产品证据的一部分。
+    for sp in [int(x) for x in read(os.path.join(dK, "srvpid")).split() if x.isdigit()]:
+        try:
+            os.kill(sp, signal.SIGKILL)
+        except OSError:
+            pass
+    wait_for(lambda: not has_listener(), limit=10)
 
 # ── 8. token 与 mktemp 必须 fail-closed, 尤其不许往 / 写 .mobileconfig ────
 for tag, why, extra in (("tokfail", "openssl 失败", {"PDG_TEST_TOKEN_FAIL": "1"}),
