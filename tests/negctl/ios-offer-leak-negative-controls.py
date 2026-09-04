@@ -62,12 +62,13 @@ def failures(out):
 T_LEAK = ["python3", "tests/test-ios-offer-download-leak.py"]
 T_UX = ["python3", "tests/test-ios-profile-ux.py"]
 
-TRAP = "  trap '_ios_offer_teardown' EXIT HUP INT TERM"
-# 锚点跟着产品走。收尾在 1e1a48b 里从"整表兜底"改成了"精确删除 + 复查最终状态", 会话锁
-# 也是那一笔加的 —— 下面五个锚点当时全部失效。它们没有静默变哑弹, 而是被"锚点命中 0 次"
-# 当场报出来(HANDOFF §9.18 立的规矩), 这里只是把它们接回新形态。
-ADD = '  if ! nft add rule inet pdg input ip saddr "$CIDR" tcp dport "$PORT" accept \\'
-MARK = '        comment "$IOS_OFFER_MARK" 2>/dev/null; then'
+TRAP = "  trap '_ios_offer_on_signal HUP 1'   HUP"
+# 单条 trap 在"信号中止"那一轮被拆成了四条(EXIT 兜异常退出, 三个信号各自终止控制流),
+# 加规则那句也从 `nft add` 变成了 `nft -j --echo --handle add`(要在插入的那一刻拿到 handle)。
+# 三个锚点当时全部失效, 但它们没有静默变哑弹 —— "锚点命中 0 次"当场把它们报了出来。
+TRAP_EXIT = "  trap '_ios_offer_teardown' EXIT"
+ADD = '  if ! addout="$(nft -j --echo --handle add rule inet pdg input ip saddr "$CIDR" \\'
+MARK = '        tcp dport "$PORT" accept comment "$IOS_OFFER_MARK" 2>&1)"; then'
 CLOSE_HEAD = "_ios_offer_nft_close(){\n  local txt h left"
 SWEEP = "  if ! _ios_offer_nft_close; then"
 PRECISE = ("""  for h in $(printf '%s\\n' "$txt" | _ios_offer_marks); do\n"""
@@ -77,13 +78,16 @@ AWKMARK = '  awk -v m="comment \\"$IOS_OFFER_MARK\\"" \\'
 
 MUT = [
     ("① trap 去掉 HUP(缺陷本体)",
-     [(TRAP, "  trap '_ios_offer_teardown' EXIT INT TERM", 1)], [T_LEAK]),
+     [(TRAP, "  : # 变异: 不捕 HUP", 1)], [T_LEAK]),
     ("② trap 去掉 EXIT(异常退出没兜底)",
-     [(TRAP, "  trap '_ios_offer_teardown' HUP INT TERM", 1)], [T_LEAK]),
+     [(TRAP_EXIT, "  : # 变异: 不装 EXIT 兜底", 1)], [T_LEAK]),
     ("③ add 改回 insert(又插到链首)",
-     [(ADD, ADD.replace("nft add rule", "nft insert rule"), 1)], [T_LEAK, T_UX]),
+     # 替换式要跟着锚点走: 新的 ADD 里是 `nft -j --echo --handle add rule`, 不含
+     # "nft add rule" 这个子串 —— 照旧写法 replace 会原样返回, 于是"改坏器"写回去一个字
+     # 都没改, 格子报"0 条转红"。这不是判据没牙, 是改坏器空转。
+     [(ADD, ADD.replace("--handle add rule", "--handle insert rule"), 1)], [T_LEAK, T_UX]),
     ("④ 去掉标记(收尾只能按端口猜)",
-     [(MARK, "        2>/dev/null; then", 1)], [T_LEAK, T_UX]),
+     [(MARK, '        tcp dport "$PORT" accept 2>&1)"; then', 1)], [T_LEAK, T_UX]),
     ("⑤ 撤除函数空壳化(三条信号路径全泄漏)",
      [(CLOSE_HEAD, "_ios_offer_nft_close(){\n  return 0  # 变异\n  local txt h left", 1)], [T_LEAK]),
     ("⑥ 入场清理删掉(残留永远不会被带走)",

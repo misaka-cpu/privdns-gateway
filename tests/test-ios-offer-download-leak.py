@@ -79,8 +79,15 @@ log "nft $*"
 # 形态取自 nftables v1.0.6 实测: {"nftables":[{"add":{"rule":{... "handle": N ...}}}]}
 if [ "$1" = -j ] && [ "$2" = --echo ]; then
   [ "${PDG_TEST_NFT_FAIL:-}" = add ] && { echo "Error: could not add" >&2; exit 1; }
-  shift 3; shift 5
-  nh=$(next_handle); echo "$nh|$(render "$@")" >> "$state"
+  # add 追加到链尾, insert 插到链首 —— 桩必须区分, 否则"改回 insert"这个变异
+  # 在桩上看起来和 add 一模一样, 位置判据就成了摆设。
+  shift 3; verb="$1"; shift 5
+  nh=$(next_handle)
+  if [ "$verb" = insert ]; then
+    { echo "$nh|$(render "$@")"; cat "$state"; } > "$state.new"; mv "$state.new" "$state"
+  else
+    echo "$nh|$(render "$@")" >> "$state"
+  fi
   if [ "${PDG_TEST_NO_HANDLE:-}" = 1 ]; then echo "{\"nftables\":[{\"add\":{\"rule\":{}}}]}"
   else printf "{\"nftables\":[{\"add\":{\"rule\":{\"handle\":%s}}}]}\n" "$nh"; fi
     exit 0

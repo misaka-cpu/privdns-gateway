@@ -77,8 +77,15 @@ log "nft $*"
 # 形态取自 nftables v1.0.6 实测: {"nftables":[{"add":{"rule":{... "handle": N ...}}}]}
 if [ "$1" = -j ] && [ "$2" = --echo ]; then
   [ "${PDG_TEST_NFT_FAIL:-}" = add ] && { echo "Error: could not add" >&2; exit 1; }
-  shift 3; shift 5
-  nh=$(next_handle); echo "$nh|$(render "$@")" >> "$state"
+  # add 追加到链尾, insert 插到链首 —— 桩必须区分, 否则"改回 insert"这个变异
+  # 在桩上看起来和 add 一模一样, 位置判据就成了摆设。
+  shift 3; verb="$1"; shift 5
+  nh=$(next_handle)
+  if [ "$verb" = insert ]; then
+    { echo "$nh|$(render "$@")"; cat "$state"; } > "$state.new"; mv "$state.new" "$state"
+  else
+    echo "$nh|$(render "$@")" >> "$state"
+  fi
   if [ "${PDG_TEST_NO_HANDLE:-}" = 1 ]; then echo "{\"nftables\":[{\"add\":{\"rule\":{}}}]}"
   else printf "{\"nftables\":[{\"add\":{\"rule\":{\"handle\":%s}}}]}\n" "$nh"; fi
     exit 0
@@ -575,9 +582,34 @@ try:
             bad("SIGKILL 之后会话锁仍被占着 —— HTTP 子进程继承了锁 fd")
         else:
             ok("SIGKILL 之后会话锁可以再取(子进程没有继承锁 fd)")
+        # **前像必须成立**, 而且要单独判。孤儿不在了 / 端口空着 / 标记没了, 说明有人在断言
+        # 之前替产品把场清了 —— 后面那格"自愈"就成了测试清理的功劳。上一轮正是这么把
+        # "后继会话拿到锁、带走残留、自己也收干净"写进报告的。
+        if not pre["orphan"] or not pre["port"] or pre["marks"] != 1 or not pre["www"]:
+            bad("SIGKILL 前像不成立(孤儿=%s 端口=%s 标记=%d 旧目录=%s)—— "
+                "有人在断言前替产品清了场, 后面的自愈判据不作数"
+                % (pre["orphan"] or "无", pre["port"], pre["marks"], pre["www"] or "无"))
+        else:
+            ok("SIGKILL 前像成立: 孤儿仍在跑、8443 仍被占、标记 1 条、旧目录仍在")
 
         # 后继会话: 共用同一条链、同一把锁、同一份运行期记录。不预先杀孤儿, 不预先删目录。
         dH, envH = mkcase("selfheal", CH_STDIN_HOLD=1)
+        # **后继会话启动的那一刻**孤儿必须还活着。前像是更早采的, 只看前像的话, 有人在
+        # 两者之间替产品清了场同样看不出来 —— 而那正是把测试清理冒充成产品自愈的做法,
+        # 上一轮就是这么得出"后继全零"这个不实结论的。判据必须钉在这一刻。
+        still = []
+        for _sp in pre["orphan"]:
+            try:
+                os.kill(_sp, 0)
+                still.append(_sp)
+            except OSError:
+                pass
+        if not still or not has_listener():
+            bad("后继会话启动前孤儿已经不在了(存活=%s, 8443 有监听=%s) —— "
+                "有人在断言前替产品清了场, 下面的自愈判据不作数"
+                % (still or "无", has_listener()))
+        else:
+            ok("后继会话启动时孤儿仍在跑 %s 且仍占着 8443(自愈判据的前提成立)" % still)
         envH["PDG_TEST_STATE"] = envK["PDG_TEST_STATE"]
         envH["PDG_IOS_OFFER_LOCKFILE"] = envK["PDG_IOS_OFFER_LOCKFILE"]
         envH["PDG_IOS_OFFER_STATEFILE"] = envK["PDG_IOS_OFFER_STATEFILE"]
@@ -633,6 +665,24 @@ for tag, why, extra in (("tokfail", "openssl 失败", {"PDG_TEST_TOKEN_FAIL": "1
         bad("%s: %s" % (why, "; ".join(probs)))
     else:
         ok("%s → fail-closed: 非零退出, 不写盘、不加规则、不展示链接" % why)
+
+# ── 8b. nft 不回报 handle → 必须 fail-closed ──────────────────────────────
+# handle 是**撤除凭据**: 拿不到它, 一旦之后读不了链, 自己刚加的规则就再也删不掉。
+# 所以"加成功了但没回报 handle"不能当成功 —— 那是一条撤不掉的放行。
+r = run_case("nohandle", PDG_TEST_NO_HANDLE=1)
+probs = []
+if r["rc"] in (None, 0):
+    probs.append("返回 0")
+if shows_link(r["out"]):
+    probs.append("展示了链接")
+if r["marks"]:
+    probs.append("链里残留 %d 条标记放行" % len(r["marks"]))
+if "handle" not in r["out"]:
+    probs.append("诊断没点名 handle —— 操作员看不出缺的是撤除凭据")
+if probs:
+    bad("nft 没回报 handle: %s" % "; ".join(probs))
+else:
+    ok("nft 没回报 handle → fail-closed: 非零退出, 不展示链接, 链里无残留")
 
 # ── 9. 只删自己的; 用户不带标记的同端口放行必须原样保留 ────────────────────
 d, env = mkcase("own")

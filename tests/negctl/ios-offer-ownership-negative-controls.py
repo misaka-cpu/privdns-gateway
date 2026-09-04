@@ -73,13 +73,16 @@ DELLOOP = ('''  for h in $(printf '%s\\n' "$txt" | _ios_offer_marks); do
 LOCKCALL = "  _ios_offer_lock_acquire || return 1"
 SRVLINE = ('  ( cd "$WWW" && exec timeout 600 python3 -m http.server "$PORT" '
            '--bind 0.0.0.0 >/dev/null 2>&1 ) 6>&- &')
-READY = ('''  if ! _ios_offer_ready "$PROBE"; then
-    _ios_offer_abort "临时 HTTP 没能就绪(端口 $PORT 可能被占) —— 未开放任何临时端口。"; return 1
+READY = ('''  if ! _ios_offer_ready "/$TOK.mobileconfig" "$want_sha" "$want_len"; then
+    _ios_offer_abort "临时 HTTP 没能就绪 —— 端口 $PORT 上没有我们这一份文件(可能被别的服务占着), 未开放任何临时端口。"; return 1
   fi''')
-ADD = ('''  if ! nft add rule inet pdg input ip saddr "$CIDR" tcp dport "$PORT" accept \\
-        comment "$IOS_OFFER_MARK" 2>/dev/null; then
-    _ios_offer_abort "添加临时放行失败(nft add) —— 通道未开放。"; return 1
+ADD = ('''  if ! addout="$(nft -j --echo --handle add rule inet pdg input ip saddr "$CIDR" \\
+        tcp dport "$PORT" accept comment "$IOS_OFFER_MARK" 2>&1)"; then
+    _ios_offer_abort "添加临时放行失败(nft add): $(printf '%s' "$addout" | head -1) —— 通道未开放。"; return 1
   fi''')
+HANDLECHK = '''  if [[ ! "$_IOS_OFFER_HANDLE" =~ ^[0-9]+$ ]]; then
+    _ios_offer_abort "nft add 没有回报本轮规则的 handle —— 拿不到撤除凭据, 已回收。"; return 1
+  fi'''
 TDOWN = "  if _ios_offer_teardown; then"
 TOKCHK = ('''  if [[ ! "$TOK" =~ ^[0-9a-f]{12}$ ]]; then
     _ios_offer_abort "生成一次性下载令牌失败(openssl) —— 未开放任何临时端口。"; return 1
@@ -96,9 +99,11 @@ MUT = [
      [(LEFT, "  return 0  # 变异", 1)], [T_LIFE]),
     ("③ 恢复 _nft_apply_main 整表兜底",
      [(DELLOOP, DELLOOP + "\n  _nft_apply_main >/dev/null 2>&1 || true  # 变异", 1)], [T_LIFE, T_LEAK]),
-    ("④ 忽略 nft add 的返回码",
-     [(ADD, '  nft add rule inet pdg input ip saddr "$CIDR" tcp dport "$PORT" accept \\\n'
-            '      comment "$IOS_OFFER_MARK" 2>/dev/null || true  # 变异', 1)], [T_LIFE]),
+    # 原本这一格打的是"忽略 nft add 的返回码"。实测它**打不动**: add 失败之后 handle 解析
+    # 同样失败, 照样 fail-closed, 诊断里也照样出现 "nft add"。那个返回码检查现在确实是冗余
+    # 的第二道保险 —— 与其为了让格子变红去弱化产品, 不如改打真正承重的那一处: handle 校验。
+    ("④ 删掉 handle 校验(拿不到撤除凭据也照开)",
+     [(HANDLECHK, "  : # 变异: 不查 handle", 1)], [T_LIFE]),
     ("⑤ 删除 HTTP 就绪验证",
      [(READY, "  : # 变异: 不验就绪", 1)], [T_LIFE]),
     ("⑥ 删除会话锁",
