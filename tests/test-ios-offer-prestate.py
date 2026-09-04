@@ -287,6 +287,15 @@ for fn, why in (("cmd_ios", "pdg ios"), ("cmd_ios_previous", "pdg ios previous")
     probs = []
     if len(dirs) != 1:
         probs.append("会话目录 %d 个(期望 1)" % len(dirs))
+    # 目录一落盘就该有记录, 而且是 staging(只说"这个目录归本轮所有", 不含 pid)。
+    # 不能等 HTTP 起来才第一次记录所有权 —— 那正是这个窗口原本的真空。
+    st_txt = read(env["PDG_IOS_OFFER_STATEFILE"])
+    if not has_state:
+        probs.append("目录已落盘却没有任何所有权记录")
+    elif not re.search(r"^phase=staging$", st_txt, re.M):
+        probs.append("记录不是 staging 相: %r" % st_txt.replace("\n", "|")[:60])
+    elif re.search(r"^pid=[0-9]", st_txt, re.M):
+        probs.append("staging 记录里居然带了 pid —— 不完整的记录不该冒充运行期记录")
     if gen_holds_fd6 or not lk_during:
         probs.append("生成子进程继承了会话锁 fd 6, 父 shell 死后锁仍被占")
     # 等生成子进程自己结束(不杀它), 再让后继会话跑
@@ -355,6 +364,27 @@ finally:
             pass
     wait_for(lambda: not connectable(), limit=10)
 
+
+# ── 会话根目录里的外来目录: 一律不碰, 也不因此拒绝开通道 ──────────────────
+# 回收只处理**严格匹配** `s.<16位十六进制>` 且通过完整所有权判据的目录。名字对不上的东西
+# 不该出现在这个父目录里, 但"不该有"不是动手的理由 —— 既不删它, 也不拿它当拒绝服务的借口。
+d7, env7 = mkcase("foreign", CH_STDIN_HOLD=1)
+os.makedirs(env7["PDG_IOS_OFFER_ROOT"], mode=0o700, exist_ok=True)
+foreign = os.path.join(env7["PDG_IOS_OFFER_ROOT"], "not-a-session")
+os.makedirs(foreign, mode=0o700)
+with open(os.path.join(foreign, "keep.txt"), "w", encoding="utf-8") as f:
+    f.write("someone else\n")
+r7 = finish(launch(d7, env7), d7)
+probs = []
+if not os.path.isdir(foreign) or sorted(os.listdir(foreign)) != ["keep.txt"]:
+    probs.append("外来目录被动过了")
+if r7["rc"] != 0:
+    probs.append("会话被它挡住了(rc=%s)" % r7["rc"])
+if probs:
+    bad("根目录里的外来目录: " + "; ".join(probs))
+else:
+    ok("根目录里的外来目录 → 原样不动, 也不阻塞本次会话")
+wait_for(lambda: not connectable(), limit=10)
 
 # ── B: 父目录必须先验后改 ────────────────────────────────────────────────
 d3, env3 = mkcase("rootlink", CH_STDIN_HOLD=1)
