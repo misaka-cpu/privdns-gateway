@@ -624,6 +624,9 @@ jobs:
       - name: "iOS 临时下载通道会话目录所有权 (真实调用方 SIGKILL / PID 已消失的过期孤儿 / state 删除失败)"
         run: python3 tests/test-ios-offer-session.py
 
+      - name: "iOS 临时下载通道 pre-state 窗口与父目录信任顺序 (生成中/HTTP 已起未记录的 SIGKILL / 符号链接根不得被 chmod)"
+        run: python3 tests/test-ios-offer-prestate.py
+
       - name: "iOS 描述文件身份持久性 (update/快照/备份恢复/平台来回切都不丢身份)"
         run: python3 tests/test-ios-profile-persist.py
 

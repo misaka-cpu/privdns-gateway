@@ -611,14 +611,15 @@ for _fn in _ios_offer_teardown _ios_offer_abort _ios_offer_nft_close \
            _ios_offer_session_begin _ios_offer_dir_ok \
            _ios_offer_chain _ios_offer_marks _ios_offer_rule_ok _ios_offer_ready \
            _ios_offer_lock_acquire _ios_offer_lock_release \
-           _ios_offer_srv_alive _ios_offer_on_signal _ios_offer_reap_orphan _ios_offer_starttime _ios_offer_state_write; do
+           _ios_offer_srv_alive _ios_offer_on_signal _ios_offer_reap_orphan _ios_offer_starttime _ios_offer_state_write \
+           _ios_offer_root_ok _ios_offer_reap_dir _ios_offer_dir_pid; do
   sed -n "/^$_fn()/,/^}/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 done
 # 常量也要跟着抽。`set -u` 下漏一个就是 unbound variable, 而那会让 _nft_apply_main 在
 # 调 _lan_nft_reapply 时半途死掉 —— 表现同样是"没还原防火墙", 与漏抽函数一模一样。
 # (_lan_nft_reapply 原先把这个路径写死在函数体里, 于是这里不抽也能跑; 路径收归常量之后
 #  就不行了 —— 写死路径让夹具"碰巧能用", 那本身就是它该被改掉的理由之一。)
-grep -E '^(LAN_NFT_CONF|IOS_OFFER_MARK|IOS_OFFER_LOCK|IOS_OFFER_STATE|IOS_OFFER_ROOT|IOS_OFFER_SENTINEL)=' deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
+grep -E '^(LAN_NFT_CONF|IOS_OFFER_MARK|IOS_OFFER_LOCK|IOS_OFFER_STATE|IOS_OFFER_ROOT|IOS_OFFER_SENTINEL|IOS_OFFER_PIDFILE)=' deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 # IOS_OFFER_PROBE 是多行常量, grep 抓不全 —— set -u 下就绪判据会当场炸。
 sed -n "/^IOS_OFFER_PROBE='/,/^'$/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 sed -n "/^IOS_OFFER_SERVER='/,/^'$/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
@@ -672,8 +673,11 @@ def _lv(key):
 _ta = _lv("srv-args")
 # 桩记的是**改写之前**的原样参数, 所以这里看到的绑定地址就是产品传的 0.0.0.0
 # (访问范围由 nft 那条按源地址的放行来控, 这一点没有放宽)。
-if _ta.startswith("-c ") and " 8443 " in _ta and _ta.endswith(" 0.0.0.0") \
-        and "-m http.server" not in _ta:
+# 服务现在多收一个参数: 会话目录里的 pid 凭据路径 —— 服务自己把身份写进**已证明归属的
+# 那个目录**, 于是"目录已建、运行期记录尚无"那段真空里也有据可查。所以绑定地址不再是
+# 最后一个参数了。
+if _ta.startswith("-c ") and " 8443 " in _ta and " 0.0.0.0 " in _ta \
+        and _ta.endswith(".pdg-offer-pid") and "-m http.server" not in _ta:
     ok("下载通道起的是精确路径 handler(非 -m http.server), 绑 8443, 无外层 timeout 包装")
 else:
     bad("HTTP 没按预期起: srv-args=%r\n%s" % (_lv("srv-args"), _chout[:300]))

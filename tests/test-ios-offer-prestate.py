@@ -74,15 +74,27 @@ fi
 exec "$real" "$@"
 '''
 
-# mktemp 桩: `state` 屏障卡在运行期记录**落盘之前**的那一刻 —— 此时 HTTP 已经在跑。
+# chmod 桩: `state` 屏障卡在**运行期(serving)记录**落盘之前 —— 那一刻 HTTP 已经在跑。
+# 为什么不用 mktemp: 它跑在 `tmp="$(mktemp …)"` 这个**命令替换**里, 外层那个子 shell 同样
+# 继承了会话锁的 fd 6, 而它在等桩返回 —— 桩里关自己的 fd 也没用, 锁仍被外层攥着, 后继会话
+# 被夹具挡成 BUSY。chmod 是直接命令: bash fork 之后立刻 exec 成这个桩, 桩里 `exec 6>&-`
+# 关掉的就是唯一那一份。
+# 会话开场也写一次 state(staging), 所以要数次数, 卡第二次。
 MKTEMP_STUB = r'''#!/bin/bash
+exec /usr/bin/mktemp "$@"
+'''
+
+CHMOD_STUB = r'''#!/bin/bash
 case "${*}" in
   *offer.state*)
-    if [ "${PDG_TEST_BARRIER:-}" = state ]; then
-      : > "$CH_DIR/state-barrier"; sleep "${PDG_TEST_STATE_HOLD:-8}"
+    n=$(( $(cat "$CH_DIR/stn" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$CH_DIR/stn"
+    if [ "${PDG_TEST_BARRIER:-}" = state ] && [ "$n" = "${PDG_TEST_STATE_NTH:-2}" ]; then
+      exec 6>&-
+      : > "$CH_DIR/state-barrier"
+      sleep "${PDG_TEST_STATE_HOLD:-8}"
     fi ;;
 esac
-exec /usr/bin/mktemp "$@"
+exec /usr/bin/chmod "$@"
 '''
 
 OPENSSL_STUB = ('#!/bin/sh\nn=6\nfor a in "$@"; do n="$a"; done\n'
@@ -142,7 +154,7 @@ def mkcase(tag, fn="cmd_ios", **extra):
         with open(os.path.join(d, n), "w", encoding="utf-8") as f:
             f.write(c)
     for name, s in (("nft", NFT_STUB), ("python3", PY_STUB),
-                    ("mktemp", MKTEMP_STUB), ("openssl", OPENSSL_STUB),
+                    ("mktemp", MKTEMP_STUB), ("chmod", CHMOD_STUB), ("openssl", OPENSSL_STUB),
                     ("qrencode", "#!/bin/sh\nexit 0\n")):
         p = os.path.join(b, name)
         with open(p, "w", encoding="utf-8") as f:
@@ -330,7 +342,8 @@ try:
             if r2["rc"] != 0:
                 probs.append("后继会话没能开通并收尾(rc=%s)" % r2["rc"])
             if probs:
-                bad("HTTP 已起、记录未落盘时被 SIGKILL: " + "; ".join(probs))
+                bad("HTTP 已起、记录未落盘时被 SIGKILL: " + "; ".join(probs)
+                    + "\n       后继输出: " + r2["out"].strip().replace("\n", " | ")[:320])
             else:
                 ok("HTTP 已起、记录未落盘时被 SIGKILL → 后继会话停掉旧 HTTP、释放端口、"
                    "删旧目录、清标记, 并正常开通收尾")
