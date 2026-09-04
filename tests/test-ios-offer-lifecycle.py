@@ -103,6 +103,7 @@ exit 0
 #   bindfail 去绑一个已经被占住的端口, 让 python 自己失败
 SRV_STUB = r'''#!/bin/bash
 echo "srv-invoked $*" >> "$PDG_TEST_SRVLOG"
+echo "$$" >> "$PDG_TEST_SRVPID"
 shift                                   # 吃掉 600
 # bindfail 不在这里造: 追加第二个 --bind 只会被 argparse 取最后一个, 反而绑成功了。
 # 真正的绑定失败由测试**先把 8443 占住**制造, 让 python 自己撞 EADDRINUSE 退出。
@@ -139,13 +140,21 @@ set -uo pipefail
 cd "$CH_ROOT"
 echo $$ > "$CH_DIR/pid"
 : > "$CH_DIR/fn.sh"
-for fn in _ios_offer_download _ios_offer_teardown _ios_offer_nft_close \
-          _ios_offer_nft_handles _ios_offer_chain _ios_offer_marks \
-          _ios_offer_rule_ok _ios_offer_ready \
+# 抽取清单必须跟着依赖走(HANDOFF §10.7)。**漏一个的代价是假绿, 不是报错**: 早先这里
+# 漏了 _ios_offer_abort, 于是每条失败路径都撞 `command not found` 退出 —— 退出码同样非零、
+# 同样不打链接, 几格"fail-closed 通过"其实一次都没跑到产品的收尾代码。
+# 所以下面加一道自证: 抽完之后, 通道函数里调用到的 _ios_offer_* 必须**全部**已经定义。
+for fn in _ios_offer_download _ios_offer_teardown _ios_offer_abort _ios_offer_nft_close \
+          _ios_offer_chain _ios_offer_marks _ios_offer_rule_ok _ios_offer_ready \
           _ios_offer_lock_acquire _ios_offer_lock_release \
           _nft_apply_main _lan_nft_reapply; do
   sed -n "/^$fn()/,/^}/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 done
+missing=""
+for fn in $(grep -oE '_ios_offer_[a-z_]+' "$CH_DIR/fn.sh" | sort -u); do
+  grep -q "^$fn()" "$CH_DIR/fn.sh" || missing="$missing $fn"
+done
+[ -z "$missing" ] || { echo "EXTRACT-MISSING:$missing"; exit 9; }
 grep -E '^(LAN_NFT_CONF|IOS_OFFER_MARK|IOS_OFFER_LOCK)=' deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 grep -q 'http.server' "$CH_DIR/fn.sh" || { echo "EXTRACT-FAIL-http"; exit 9; }
 c_g(){ echo "$*"; }; c_y(){ echo "$*"; }
@@ -213,6 +222,7 @@ def mkcase(tag, **env_extra):
                PATH=b + os.pathsep + os.environ.get("PATH", ""),
                PDG_TEST_LOG=os.path.join(d, "log"),
                PDG_TEST_SRVLOG=os.path.join(d, "srvlog"),
+               PDG_TEST_SRVPID=os.path.join(d, "srvpid"),
                PDG_TEST_STATE=os.path.join(d, "chain"),
                PDG_IOS_OFFER_LOCKFILE=os.path.join(d, "offer.lock"),
                TMPDIR=d,
@@ -335,6 +345,11 @@ if shows_link(r["out"]):
     leftovers.append("展示了链接")
 if has_listener():
     leftovers.append("8443 仍有监听")
+# 诊断要点名**是哪一步**失败。这不是文案洁癖: 加规则失败之后, 下一道"复查规则在不在、
+# 位置对不对"照样会把它拦下来 —— 结果同样是 fail-closed, 但操作员看到的会是"位置不对",
+# 于是去查一个根本不存在的顺序问题。判据只看结果的话, 这层退化一个字都不会说。
+if "nft add" not in r["out"]:
+    leftovers.append("诊断没点名 nft add —— 操作员看不出是哪一步失败")
 # 锁必须已经放掉: 这一格失败发生在拿到锁**之后**, 收尾漏放锁的话下一次调用会被自己
 # 十分钟前的一次失败挡在门外, 而现场看不出任何原因。
 import fcntl as _fcntl
@@ -482,6 +497,61 @@ for tag, sig, why in (("hup", signal.SIGHUP, "SIGHUP"),
         bad("%s 之后: %s" % (why, "; ".join(probs)))
     else:
         ok("%s 之后: 规则 0 / 端口 0 / 临时目录 0 / 会话锁已释放" % why)
+
+# ── 7b. SIGKILL: 锁不许被孤儿子进程攥着, 下一次会话要能自愈 ────────────────
+# SIGKILL 是唯一兜不住的路径 —— 收尾一行都不会跑。所以这一格问两件事:
+#   · 父 shell 被打死之后, **会话锁必须是可再取的**。HTTP 子进程如果继承了锁 fd, 它会
+#     一直攥到自己 600 秒超时为止, 那十分钟里谁都开不了新通道, 而且现场看不出原因;
+#   · 残留的放行必须能被下一次会话带走(拿到锁之后清), 不需要人工去摘规则。
+import fcntl
+
+dK, envK = mkcase("sigkill", CH_STDIN_HOLD=60)
+pK = launch(dK, envK)
+readyK = wait_for(lambda: shows_link(read(os.path.join(dK, "out"))))
+marksK = marks(dK)
+if not readyK or not marksK:
+    bad("SIGKILL: 通道没就绪(ready=%s 规则=%d), 这一格没测到东西" % (readyK, len(marksK)))
+else:
+    try:
+        os.kill(int(read(os.path.join(dK, "pid")).strip()), signal.SIGKILL)
+    except (OSError, ValueError):
+        pass
+    pK.wait(timeout=15)
+    time.sleep(0.4)
+    lock_reacquirable = True
+    try:
+        fh = open(envK["PDG_IOS_OFFER_LOCKFILE"], "a")
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        fh.close()
+    except OSError:
+        lock_reacquirable = False
+    if not lock_reacquirable:
+        bad("SIGKILL 之后会话锁仍被占着 —— HTTP 子进程继承了锁 fd, "
+            "接下来十分钟谁都开不了新通道")
+    else:
+        ok("SIGKILL 之后会话锁可以再取(子进程没有继承锁 fd)")
+    # 孤儿服务还在(它有自己的 600 秒超时占着 8443), 先按**确切 pid** 收掉, 再看下一次
+    # 会话能不能自愈残留。绝不用 `pkill -f <模式>`: 它会连发起命令的那个 shell 一起咬掉
+    # (HANDOFF §9.13, 本轮又实测中了一次)。
+    for spid in read(os.path.join(dK, "srvpid")).split():
+        try:
+            os.kill(int(spid), signal.SIGKILL)
+        except (OSError, ValueError):
+            pass
+    wait_for(lambda: not fetch(timeout=0.5)[0], limit=10)
+    dH, envH = mkcase("selfheal", CH_STDIN_HOLD=1)
+    envH["PDG_TEST_STATE"] = envK["PDG_TEST_STATE"]      # 带着 SIGKILL 留下的残留进场
+    envH["PDG_IOS_OFFER_LOCKFILE"] = envK["PDG_IOS_OFFER_LOCKFILE"]
+    rH = finish(launch(dH, envH), dH, limit=40)
+    left = [l for l in read(envK["PDG_TEST_STATE"]).splitlines()
+            if 'comment "pdg-ios-offer"' in l]
+    if "BUSY" in rH["out"]:
+        bad("SIGKILL 之后下一次会话被自己的孤儿挡成了 BUSY —— 无法自愈")
+    elif left:
+        bad("SIGKILL 之后下一次会话没能带走残留放行(还剩 %d 条)" % len(left))
+    else:
+        ok("SIGKILL 之后下一次会话拿到锁、带走残留、自己也收干净")
 
 # ── 8. token 与 mktemp 必须 fail-closed, 尤其不许往 / 写 .mobileconfig ────
 for tag, why, extra in (("tokfail", "openssl 失败", {"PDG_TEST_TOKEN_FAIL": "1"}),
