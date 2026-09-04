@@ -493,7 +493,7 @@ else:
 _OFFER = re.search(r"^_ios_offer_download\(\)\{.*?^\}", pdg, re.S | re.M)
 _OFFER = _OFFER.group(0) if _OFFER else ""
 _dup = [lbl for pat, lbl in (("python3 -m http.server", "临时 HTTP"),
-                             ("nft insert rule", "临时 nft 放行"),
+                             ("nft add rule", "临时 nft 放行"),
                              ("qrencode -t", "终端二维码"))
         if pdg.count(pat) != 1 or pat not in _OFFER]
 if not _OFFER:
@@ -543,11 +543,16 @@ sed -n '/^_ios_offer_download()/,/^}/p' deploy/bot/pdg.sh > "$CH_DIR/fn.sh"
 # 断言看起来像"没还原防火墙"这个产品缺陷, 其实是夹具少抽了一个函数。
 sed -n '/^_nft_apply_main()/,/^}/p'  deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 sed -n '/^_lan_nft_reapply()/,/^}/p' deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
+# 收尾从"整表重载"改成"按标记精确删除"之后又多了三个依赖(见 tests/test-ios-offer-download-leak.py)。
+# 漏抽任何一个, 现场都长成"产品没撤规则"的样子 —— 与真缺陷一模一样。
+sed -n '/^_ios_offer_teardown()/,/^}/p'    deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
+sed -n '/^_ios_offer_nft_close()/,/^}/p'   deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
+sed -n '/^_ios_offer_nft_handles()/,/^}/p' deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 # 常量也要跟着抽。`set -u` 下漏一个就是 unbound variable, 而那会让 _nft_apply_main 在
 # 调 _lan_nft_reapply 时半途死掉 —— 表现同样是"没还原防火墙", 与漏抽函数一模一样。
 # (_lan_nft_reapply 原先把这个路径写死在函数体里, 于是这里不抽也能跑; 路径收归常量之后
 #  就不行了 —— 写死路径让夹具"碰巧能用", 那本身就是它该被改掉的理由之一。)
-grep -E '^LAN_NFT_CONF=' deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
+grep -E '^(LAN_NFT_CONF|IOS_OFFER_MARK)=' deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 grep -q 'http.server' "$CH_DIR/fn.sh" || { echo "EXTRACT-FAIL"; exit 9; }
 c_g(){ echo "$*"; }; c_y(){ echo "$*"; }
 # shellcheck source=/dev/null
@@ -584,11 +589,14 @@ else:
     bad("服务的内容/路径不对: files=%r sha=%r" % (_lv("serve-files"), _lv("serve-sha")))
 
 _nft = re.findall(r"^nft (.*)$", _chlog, re.M)
-_ins = [i for i, x in enumerate(_nft)
-        if x == "insert rule inet pdg input ip saddr 172.22.0.0/16 tcp dport 8443 accept"]
-_res = [i for i, x in enumerate(_nft) if x == "-f /etc/nftables.conf"]
-if _ins and _res and _res[-1] > _ins[0]:
-    ok("放行只对内网卡段开 8443, 收尾时 nft -f 原样还原")
+# 放行改成**追加**(排在 tailscale0 排除之后)并带标记, 收尾按标记回查再精确删除 ——
+# 三样的行为验证在 tests/test-ios-offer-download-leak.py, 这里只钉住"通道确实这么干了"。
+_add = [i for i, x in enumerate(_nft)
+        if x == "add rule inet pdg input ip saddr 172.22.0.0/16 tcp dport 8443 accept "
+                "comment pdg-ios-offer"]
+_close = [i for i, x in enumerate(_nft) if x == "-a list chain inet pdg input"]
+if _add and _close and _close[-1] > _add[0]:
+    ok("放行只对内网卡段开 8443 且带标记, 收尾时按标记回查并撤除")
 else:
     bad("nft 动作不对: %r" % (_nft,))
 

@@ -2521,6 +2521,41 @@ _ios_internal_cidr(){
   grep -oE 'ip saddr [0-9./]+' /etc/nftables.conf 2>/dev/null | head -1 | awk '{print $3}'
 }
 
+# 临时放行的标记。与救援平面同一套口径: **认标记, 不认端口** —— 用户完全可能自己写过一条
+# 同端口放行, 那是他的规则, 撤我们自己的东西不能把他的一起撤了。带标记还多一层好处:
+# 上一次没收干净的残留, 下一次进来时能被认出来并顺手带走。
+IOS_OFFER_MARK="pdg-ios-offer"
+
+# 此刻链里带标记的临时放行有哪些(handle 列表, 一行一个)。
+_ios_offer_nft_handles(){
+  nft -a list chain inet pdg input 2>/dev/null \
+    | awk -v m="comment \"$IOS_OFFER_MARK\"" \
+          'index($0, m){ for(i=1;i<=NF;i++) if($i=="handle") print $(i+1) }'
+}
+
+# 撤掉带标记的临时放行。**幂等**(没有就什么都不做), 且**精确**(按 handle, 不按端口)。
+# 只有精确删除没删干净才退回整表重载 —— 那是兜底不是常态: 整表重载会把别人的运行期规则
+# 一并冲掉, 而这条通道没有理由去动别人的规则。
+_ios_offer_nft_close(){
+  local h
+  for h in $(_ios_offer_nft_handles); do
+    nft delete rule inet pdg input handle "$h" >/dev/null 2>&1 || true
+  done
+  [[ -z "$(_ios_offer_nft_handles)" ]] && return 0
+  _nft_apply_main >/dev/null 2>&1 || true
+  return 0
+}
+
+# 收尾: 停服务、撤放行、清目录。三条信号路径与正常路径**共用这一处** —— 收尾只写一次,
+# 就不会出现"改了正常路径、忘了信号路径"。必须幂等: EXIT 兜底会让它在正常路径上再跑一次。
+_ios_offer_teardown(){
+  [[ -n "${_IOS_OFFER_SRV:-}" ]] && kill "$_IOS_OFFER_SRV" 2>/dev/null
+  _ios_offer_nft_close
+  [[ -n "${_IOS_OFFER_WWW:-}" ]] && rm -rf "$_IOS_OFFER_WWW"
+  _IOS_OFFER_SRV=""; _IOS_OFFER_WWW=""
+  return 0
+}
+
 # 给一份**已经生成好**的描述文件开一条临时下载通道, 用完就收:
 #   二维码 → 临时 HTTP :8443 → 只对内网卡段的临时 nft 放行 → 回车或 10 分钟后一起撤掉。
 # 当前版(cmd_ios)和上一版(cmd_ios_previous)共用这一处 —— 手机取件只有这一条路, 于是加固
@@ -2530,7 +2565,7 @@ _ios_offer_download(){
   local SRC="$1" IP="$2" CIDR="$3"; shift 3
   [[ -s "$SRC" ]] || { echo "❌ 没有可下发的文件, 未开放任何临时端口。"; return 1; }
   command -v qrencode >/dev/null || { c_g "装 qrencode…"; apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq qrencode; }
-  local PORT=8443 TOK WWW URL SRV="" note
+  local PORT=8443 TOK WWW URL note
   TOK=$(openssl rand -hex 6)
   WWW=$(mktemp -d)
   # 文件名带一次性随机串: 同一网段里的别的设备猜不到这一次的路径。
@@ -2539,12 +2574,26 @@ _ios_offer_download(){
   fi
   URL="http://$IP:$PORT/$TOK.mobileconfig"
 
-  trap 'kill "$SRV" 2>/dev/null; _nft_apply_main >/dev/null 2>&1; rm -rf "$WWW"; trap - INT TERM' INT TERM
-  nft insert rule inet pdg input ip saddr "$CIDR" tcp dport "$PORT" accept 2>/dev/null
+  # 上一次没收干净的残留先带走 —— 泄漏过的机器走一次这条路就自愈, 不必人工去摘规则。
+  _ios_offer_nft_close
+
+  _IOS_OFFER_WWW="$WWW"; _IOS_OFFER_SRV=""
+  # **EXIT 与 HUP 是后加的**: HUP 是 SSH 断开发的信号, 也是线上那次泄漏的真凶 —— 旧写法
+  # 只捕 INT/TERM, 收到 HUP 时 bash 直接死, 收尾一行都没跑, 放行就永远留在链里; 而 Bot 的
+  # 「📱 iOS 描述文件」按钮是非交互调用, 根本不会有人"按回车"。EXIT 兜住其余任何异常退出。
+  # SIGKILL 兜不住 —— 那种情况靠上面那次入场清理。
+  trap '_ios_offer_teardown' EXIT HUP INT TERM
+  # **追加**(add)而不是插到链首(insert): 链首在 `iifname "tailscale0" return` **之前**,
+  # 在那里放一条按源地址的放行会踩中 Tailscale 入口隔离判据 —— tailnet 与运营商 SIM/APN
+  # 共用 RFC 6598 段, 只看源地址分不开两者, 所以判据看的是"排除规则排在来源匹配之前"。
+  # 追加到链尾就排在排除之后, tailnet 流量永远到不了它; 即便真泄漏了也不会把 doctor 判红,
+  # 更不会让 pdg update 每次整轮回滚。
+  nft add rule inet pdg input ip saddr "$CIDR" tcp dport "$PORT" accept \
+      comment "$IOS_OFFER_MARK" 2>/dev/null
   # exec: 让下面那个 kill 直接打在 timeout 上(它再转发给 python3)。少了它被杀的只是外层
   # 子 shell, 端口会一直开到 10 分钟超时为止 —— 与"按回车即收"不符。
   ( cd "$WWW" && exec timeout 600 python3 -m http.server "$PORT" --bind 0.0.0.0 >/dev/null 2>&1 ) &
-  SRV=$!
+  _IOS_OFFER_SRV=$!
   qrencode -o /opt/pdg-bot/ios-qr.png "$URL" 2>/dev/null || true
   echo
   c_g "用手机(走【内网卡/蜂窝】, 关 WiFi)扫下面二维码 → Safari 打开 → 安装描述文件:"
@@ -2554,10 +2603,8 @@ _ios_offer_download(){
   echo "  (二维码 PNG 已存 /opt/pdg-bot/ios-qr.png)"
   c_y "装好后按回车收尾(10 分钟自动收)…"
   read -t 600 -r _ || true
-  kill "$SRV" 2>/dev/null
-  _nft_apply_main >/dev/null 2>&1   # 撤掉临时放行
-  rm -rf "$WWW"
-  trap - INT TERM
+  _ios_offer_teardown
+  trap - EXIT HUP INT TERM
   echo "已关闭临时下载服务。"
 }
 
