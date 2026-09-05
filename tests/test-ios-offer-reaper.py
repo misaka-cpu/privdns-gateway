@@ -60,7 +60,10 @@ if [ "${1:-}" = "$CH_DIR/iosstate.py" ]; then
   [ "$(dirname "$out")" = "/" ] && { echo "REFUSED-ROOT $out" >> "$PDG_TEST_LOG"; exit 1; }
   if [ "${PDG_TEST_BARRIER:-}" = gen ]; then
     echo "$$" > "$CH_DIR/genpid"; : > "$CH_DIR/gen-started"
-    sleep "${PDG_TEST_GEN_HOLD:-10}"
+    # 等测试放行, **不用固定 sleep**: 负控里并发跑多套件时机器会变慢, 固定时长会漂 ——
+    # 反向对照因此出现过一条"新增失败", 而那与被改的代码毫无关系。
+    n=0
+    while [ ! -e "$CH_DIR/gen-release" ] && [ "$n" -lt 900 ]; do sleep 0.1; n=$((n+1)); done
     mkdir -p "$(dirname "$out")"            # ← atomic_write 会把父目录一起建回来
     printf '%s' "$PDG_TEST_BODY" > "$out"
     : > "$CH_DIR/gen-wrote"
@@ -256,7 +259,7 @@ ok("环境前提: 127.0.0.1:%d 空闲" % PORT)
 # ── A: 生成子进程活得比回收更久 ─────────────────────────────────────────
 for fn, why in (("cmd_ios", "pdg ios"), ("cmd_ios_previous", "pdg ios previous")):
     d, env = mkcase("A-" + fn, fn=fn, CH_STDIN_HOLD=60,
-                    PDG_TEST_BARRIER="gen", PDG_TEST_GEN_HOLD=12)
+                    PDG_TEST_BARRIER="gen")
     p = launch(d, env)
     if not wait_file(os.path.join(d, "gen-started")):
         bad("%s: 生成屏障没命中, 这一组没测到东西" % why)
@@ -287,8 +290,12 @@ for fn, why in (("cmd_ios", "pdg ios"), ("cmd_ios_previous", "pdg ios previous")
         # 拒绝也是可接受的收口方式, 但必须点名
         if not re.search(r"生成|writer|gen", r["out"]):
             probs.append("拒绝了却没点名仍在写入的生成器")
-    # 等生成器落笔(它醒来会 mkdir -p 重建目录), 再看盘上留下了什么
-    wait_file(os.path.join(d, "gen-wrote"), limit=25)
+    # 放行生成器让它落笔(醒来会 mkdir -p 重建目录), 再看盘上留下了什么。
+    # 修好之后后继会**先停住它**, 那时放行也不会有人醒来 —— 所以只在它仍存活时才等,
+    # 免得白等一轮超时。
+    open(os.path.join(d, "gen-release"), "w").close()
+    if alive(genpid):
+        wait_file(os.path.join(d, "gen-wrote"), limit=25)
     wait_for(lambda: not alive(genpid), limit=15)
     after = sess_dirs(env)
     orphan = [x for x in after
