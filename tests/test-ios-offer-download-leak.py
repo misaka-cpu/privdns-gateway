@@ -139,7 +139,8 @@ for fn in _ios_offer_download _ios_offer_teardown _ios_offer_abort _ios_offer_nf
           _ios_offer_dir_ok \
           _ios_offer_root_ok _ios_offer_reap_dir _ios_offer_dir_pid \
           _nft_apply_main _lan_nft_reapply \
-          _ios_offer_proc_state _ios_offer_stop_pid _ios_offer_list _ios_offer_gen_run; do
+          _ios_offer_proc_state _ios_offer_stop_pid _ios_offer_list _ios_offer_gen_run \
+          _ios_offer_stop_child _ios_offer_proc_dead; do
   sed -n "/^$fn()/,/^}/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 done
 # 常量也要跟着抽: `set -u` 下漏一个就是 unbound variable, 而那会让收尾在半途死掉 ——

@@ -630,6 +630,9 @@ jobs:
       - name: "iOS 临时下载通道回收判定 (存活生成者 / 身份未知≠已退出 / 枚举失败不当空集合)"
         run: python3 tests/test-ios-offer-reaper.py
 
+      - name: "iOS 临时下载通道信号收尾停住本轮生成者 (HUP/INT/TERM 与整组 INT, 目录不得被重建)"
+        run: python3 tests/test-ios-offer-abortgen.py
+
       - name: "iOS 描述文件身份持久性 (update/快照/备份恢复/平台来回切都不丢身份)"
         run: python3 tests/test-ios-profile-persist.py
 

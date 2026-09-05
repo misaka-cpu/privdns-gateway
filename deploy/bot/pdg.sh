@@ -2632,6 +2632,31 @@ _ios_offer_proc_state(){
   return 0
 }
 
+# 进程是否已经不在: 不存在, 或者已经是僵尸(退出了、只等回收)。
+# 单用 `kill -0` 判不出来 —— 它对僵尸仍然成功, 于是"停没停掉"永远得不到答案。
+_ios_offer_proc_dead(){
+  local st
+  [[ -d "/proc/$1" ]] || return 0
+  st="$(cat "/proc/$1/stat" 2>/dev/null)" || return 0
+  st="${st##*) }"
+  [[ "${st%% *}" == Z ]]
+}
+
+# 停一个**本 shell 的直接子进程**, 并把它回收掉。与 _ios_offer_stop_pid 的区别只在僵尸:
+# 子进程退出后要经 wait 收尸才会从 /proc 消失, 中间那段时间 kill -0 照样成功。
+_ios_offer_stop_child(){
+  local pid="$1" n=0
+  kill -TERM "$pid" 2>/dev/null
+  while [[ "$n" -lt 30 ]] && ! _ios_offer_proc_dead "$pid"; do sleep 0.1; n=$((n + 1)); done
+  if ! _ios_offer_proc_dead "$pid"; then
+    kill -KILL "$pid" 2>/dev/null
+    n=0
+    while [[ "$n" -lt 20 ]] && ! _ios_offer_proc_dead "$pid"; do sleep 0.1; n=$((n + 1)); done
+  fi
+  wait "$pid" 2>/dev/null
+  _ios_offer_proc_dead "$pid"
+}
+
 # 停一个**身份已确认**的进程并确认它真的停了。停不掉返回非零。
 _ios_offer_stop_pid(){
   local pid="$1" n=0
@@ -2656,11 +2681,15 @@ _ios_offer_gen_run(){
   # 6>&-: 生成子进程不许继承会话锁。
   "$@" 6>&- &
   gpid=$!
+  # 交给收尾: 普通信号进来时 teardown 要能停住它 —— 以前只有后继的孤儿回收会管生成者,
+  # 于是本轮收尾删完目录, 它才落笔并把目录重建成一个没有 sentinel 的壳。
+  _IOS_OFFER_GEN="$gpid"
   gstart="$(_ios_offer_starttime "$gpid")"
   if [[ -n "$gstart" ]]; then
     (umask 077 && printf 'pid=%s\nstart=%s\n' "$gpid" "$gstart" > "$gf") 2>/dev/null || true
   fi
   wait "$gpid"; rc=$?
+  _IOS_OFFER_GEN=""
   rm -f "$gf" 2>/dev/null || true
   return "$rc"
 }
@@ -2737,7 +2766,7 @@ _ios_offer_root_ok(){
 _ios_offer_session_begin(){
   _ios_offer_lock_acquire || return 1
   _IOS_OFFER_ACTIVE=1; _IOS_OFFER_SRV=""; _IOS_OFFER_WWW=""; _IOS_OFFER_HANDLE=""
-  _IOS_OFFER_SID=""; _IOS_OFFER_STATE_OWNED=""
+  _IOS_OFFER_SID=""; _IOS_OFFER_STATE_OWNED=""; _IOS_OFFER_GEN=""
   trap '_ios_offer_teardown' EXIT
   trap '_ios_offer_on_signal HUP 1'   HUP
   trap '_ios_offer_on_signal INT 2'   INT
@@ -3096,7 +3125,42 @@ _ios_offer_teardown(){
   # 会走**默认处置** = 直接杀掉 shell, 把收尾停在半路(端口撤了目录还在, 或 nft 撤了 state
   # 还在)。这里临时忽略它们 —— 忽略期间到达的信号会被丢弃, 不会排队等在后面。
   trap "" HUP INT TERM
-  local rc=0
+  local rc=0 gen_unsafe="" gst
+  # **本轮的描述文件生成器也归收尾管。** 以前只有后继的孤儿回收会处理它: 普通信号进来,
+  # teardown 停 HTTP、撤 nft、删目录, 生成器却还在跑 —— 它随后落笔时 atomic_write 会把
+  # 父目录一起重建, 盘上留下一个没有 sentinel 的壳, 下一次回收据此拒绝启动。那时退出码
+  # 是对的(129/130/143), 现场却是脏的, 只看退出码什么也发现不了。
+  # 身份与停止判据复用孤儿回收那一套, 不另起一份会各自漂移的状态机。
+  if [[ -n "${_IOS_OFFER_GEN:-}" ]]; then
+    if ! _ios_offer_proc_dead "$_IOS_OFFER_GEN"; then
+      if _ios_offer_stop_child "$_IOS_OFFER_GEN"; then
+        c_y "已停止本轮的描述文件生成器(pid $_IOS_OFFER_GEN)。"
+      else
+        echo "❌ 本轮的描述文件生成器(pid $_IOS_OFFER_GEN)停不掉 —— 它可能仍在往会话目录写入。"
+        gen_unsafe=1; rc=1
+      fi
+    else
+      wait "$_IOS_OFFER_GEN" 2>/dev/null
+    fi
+    _IOS_OFFER_GEN=""
+  elif [[ -n "${_IOS_OFFER_WWW:-}" ]]; then
+    # 信号可能落在 fork 与登记之间, 那时本轮还没拿到 pid —— 回到目录里的凭据上判,
+    # 与孤儿回收同一套判据: 认不出就不动, 而不是删掉线索。
+    gst="$(_ios_offer_proc_state "$_IOS_OFFER_WWW/$IOS_OFFER_GENFILE")"
+    case "$gst" in
+      absent|gone) ;;
+      "alive "*)
+        if _ios_offer_stop_child "${gst#alive }"; then
+          c_y "已停止本轮的描述文件生成器(pid ${gst#alive })。"
+        else
+          echo "❌ 本轮的描述文件生成器(pid ${gst#alive })停不掉 —— 它可能仍在往会话目录写入。"
+          gen_unsafe=1; rc=1
+        fi ;;
+      *)
+        echo "❌ 本轮生成者的身份无法确认(${gst#unknown }) —— 它可能仍在往会话目录写入。"
+        gen_unsafe=1; rc=1 ;;
+    esac
+  fi
   # 顺序要紧: 先停服务再撤放行。反过来的话, 撤除失败时服务还在跑, 而我们已经以为收干净了。
   if [[ -n "${_IOS_OFFER_SRV:-}" ]]; then
     kill "$_IOS_OFFER_SRV" 2>/dev/null
@@ -3109,15 +3173,20 @@ _ios_offer_teardown(){
   # 一轮只有一个目录 —— 调用方的生成物与 HTTP 服务的根是同一个, 所以这里收干净就没有
   # "另一个没人认领的目录"了。
   if [[ -n "${_IOS_OFFER_WWW:-}" ]]; then
-    rm -rf "$_IOS_OFFER_WWW"
-    if [[ -e "$_IOS_OFFER_WWW" ]]; then
-      echo "❌ 本轮会话目录没能删掉: $_IOS_OFFER_WWW"; rc=1
+    if [[ -n "$gen_unsafe" ]]; then
+      # 确认不了"没人再写"就不能删: 删掉的是线索, 而写入者随后会把目录重建成一个空壳。
+      echo "   保留会话目录与所有权记录以便人工处理: $_IOS_OFFER_WWW"
+    else
+      rm -rf "$_IOS_OFFER_WWW"
+      if [[ -e "$_IOS_OFFER_WWW" ]]; then
+        echo "❌ 本轮会话目录没能删掉: $_IOS_OFFER_WWW"; rc=1
+      fi
     fi
   fi
   # **只删本轮自己写下的那份 state**, 而且删不掉要**计入返回码**。入场时读到的旧孤儿记录
   # 不归这里处置(回收流程处理完才会删它); 而 `rm -f … || true` 那种吞法会让下一次会话拿着
   # 一份本该消失的记录去做身份核对。
-  if [[ -n "${_IOS_OFFER_STATE_OWNED:-}" ]]; then
+  if [[ -z "$gen_unsafe" && -n "${_IOS_OFFER_STATE_OWNED:-}" ]]; then
     if ! rm -f "$IOS_OFFER_STATE" 2>/dev/null || [[ -e "$IOS_OFFER_STATE" ]]; then
       echo "❌ 清不掉本轮的运行期所有权记录($IOS_OFFER_STATE) —— 下一次会话会拿它做身份核对。"
       rc=1

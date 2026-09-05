@@ -89,7 +89,8 @@ for fn in cmd_ios cmd_ios_previous _ios_offer_download _ios_offer_teardown _ios_
           _ios_offer_starttime _ios_offer_state_write _ios_offer_session_begin \
           _ios_offer_dir_ok _ios_offer_root_ok _ios_offer_reap_dir _ios_offer_dir_pid \
           _ios_offer_proc_state _ios_offer_stop_pid _ios_offer_list _ios_offer_gen_run \
-          _nft_apply_main _lan_nft_reapply; do
+          _nft_apply_main _lan_nft_reapply \
+          _ios_offer_stop_child _ios_offer_proc_dead; do
   sed -n "/^$fn()/,/^}/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 done
 grep -E '^(LAN_NFT_CONF|IOS_OFFER_MARK|IOS_OFFER_LOCK|IOS_OFFER_STATE|IOS_OFFER_ROOT|IOS_OFFER_SENTINEL|IOS_OFFER_PIDFILE|IOS_OFFER_GENFILE)=' \
