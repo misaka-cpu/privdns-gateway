@@ -632,6 +632,8 @@ jobs:
 
       - name: "iOS 临时下载通道信号收尾停住本轮生成者 (HUP/INT/TERM 与整组 INT, 目录不得被重建)"
         run: python3 tests/test-ios-offer-abortgen.py
+      - name: "iOS 临时通道停止失败有界返回 (停不住/状态读不到时保留现场, 不得无界 wait)"
+        run: python3 tests/test-ios-offer-stopfail.py
 
       - name: "iOS 描述文件身份持久性 (update/快照/备份恢复/平台来回切都不丢身份)"
         run: python3 tests/test-ios-profile-persist.py
