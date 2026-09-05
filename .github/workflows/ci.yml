@@ -636,6 +636,9 @@ jobs:
       - name: "iOS 临时通道停止失败有界返回 (停不住/状态读不到时保留现场, 不得无界 wait)"
         run: python3 tests/test-ios-offer-stopfail.py
 
+      - name: "iOS 临时通道 HTTP 停不掉时保住恢复线索 (真 handler/回环随机口; 后继凭凭据回收)"
+        run: python3 tests/test-ios-offer-srvkeep.py
+
       - name: "iOS 描述文件身份持久性 (update/快照/备份恢复/平台来回切都不丢身份)"
         run: python3 tests/test-ios-profile-persist.py
 

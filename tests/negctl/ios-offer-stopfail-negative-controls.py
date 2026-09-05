@@ -51,9 +51,10 @@ def lift(pattern, flags=re.M | re.S):
 STOP_TAIL   = lift(r'^  _ios_offer_proc_dead "\$pid"\n  case "\$\?" in\n.*?^  esac$')
 # proc_dead 里"读失败 ≠ 已退出"的那道门
 READ_GUARD  = lift(r'^  if ! st="\$\(cat "/proc/\$1/stat" 2>/dev/null\)"; then\n.*?^  fi$')
-# 收尾里"停不住就不删"的两道门
-DIR_GUARD   = lift(r'^    if \[\[ -n "\$gen_unsafe" \]\]; then$')
-STATE_GUARD = lift(r'^  if \[\[ -z "\$gen_unsafe" && -n "\$\{_IOS_OFFER_STATE_OWNED:-\}" \]\]; then$')
+# 收尾里"停不住就不删"的两道门。开关后来从 gen_unsafe 换成了 keep_scene(生成者与 HTTP
+# 任一未确认安全结束都保留), 锚点随之更新 —— 这两格守的仍是生成者那一侧的分支。
+DIR_GUARD   = lift(r'^    if \[\[ -n "\$keep_scene" \]\]; then$')
+STATE_GUARD = lift(r'^  if \[\[ -z "\$keep_scene" && -n "\$\{_IOS_OFFER_STATE_OWNED:-\}" \]\]; then$')
 
 MUT = [
     ("① 恢复无条件 wait(停不住时卡死, 失败送不出去)",
@@ -63,7 +64,7 @@ MUT = [
     ("③ 停不住/认不出时照样删会话目录",
      [(DIR_GUARD, '    if [[ -n "" ]]; then  # 变异: 保留现场那条路走不到了', 1)]),
     ("④ 停不住/认不出时照样删运行期所有权记录",
-     [(STATE_GUARD, '  if [[ -n "${_IOS_OFFER_STATE_OWNED:-}" ]]; then  # 变异: 不再看 gen_unsafe', 1)]),
+     [(STATE_GUARD, '  if [[ -n "${_IOS_OFFER_STATE_OWNED:-}" ]]; then  # 变异: 不再看保留开关', 1)]),
     ("⑤ 只加无关注释(反向对照)",
      [(READ_GUARD, "  # 变异: 一条无关注释\n" + READ_GUARD, 1)]),
 ]
