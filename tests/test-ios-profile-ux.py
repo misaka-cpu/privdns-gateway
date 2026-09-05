@@ -442,6 +442,11 @@ _ios_offer_download(){ echo "CHANNEL:$1"; }
 # 所以把会话开场与收尾一并顶掉 —— 不顶的话它们是未定义命令, 现场长得像分发错了。
 _ios_offer_session_begin(){ _IOS_OFFER_WWW="$(mktemp -d)"; _IOS_OFFER_ACTIVE=1; return 0; }
 _ios_offer_teardown(){ rm -rf "${_IOS_OFFER_WWW:-}"; return 0; }
+# 调用方现在经 _ios_offer_gen_run 启动生成器(它关锁 fd 并在会话目录里留下生成者身份)。
+# 这一格只问调用方的控制流, 所以顶掉它、直接跑命令 —— 不顶的话它是未定义命令,
+# 现场长得像"调用方分发错了"。
+_ios_offer_gen_run(){ "$@"; }
+
 # 生成路径上那些会真动机器的动作: 一旦被走到就立刻暴露
 apt-get(){ echo "DANGER:apt-get $*"; return 1; }
 qrencode(){ echo "DANGER:qrencode"; return 1; }
@@ -612,14 +617,15 @@ for _fn in _ios_offer_teardown _ios_offer_abort _ios_offer_nft_close \
            _ios_offer_chain _ios_offer_marks _ios_offer_rule_ok _ios_offer_ready \
            _ios_offer_lock_acquire _ios_offer_lock_release \
            _ios_offer_srv_alive _ios_offer_on_signal _ios_offer_reap_orphan _ios_offer_starttime _ios_offer_state_write \
-           _ios_offer_root_ok _ios_offer_reap_dir _ios_offer_dir_pid; do
+           _ios_offer_root_ok _ios_offer_reap_dir _ios_offer_dir_pid \
+          _ios_offer_proc_state _ios_offer_stop_pid _ios_offer_list _ios_offer_gen_run; do
   sed -n "/^$_fn()/,/^}/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 done
 # 常量也要跟着抽。`set -u` 下漏一个就是 unbound variable, 而那会让 _nft_apply_main 在
 # 调 _lan_nft_reapply 时半途死掉 —— 表现同样是"没还原防火墙", 与漏抽函数一模一样。
 # (_lan_nft_reapply 原先把这个路径写死在函数体里, 于是这里不抽也能跑; 路径收归常量之后
 #  就不行了 —— 写死路径让夹具"碰巧能用", 那本身就是它该被改掉的理由之一。)
-grep -E '^(LAN_NFT_CONF|IOS_OFFER_MARK|IOS_OFFER_LOCK|IOS_OFFER_STATE|IOS_OFFER_ROOT|IOS_OFFER_SENTINEL|IOS_OFFER_PIDFILE)=' deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
+grep -E '^(LAN_NFT_CONF|IOS_OFFER_MARK|IOS_OFFER_LOCK|IOS_OFFER_STATE|IOS_OFFER_ROOT|IOS_OFFER_SENTINEL|IOS_OFFER_PIDFILE|IOS_OFFER_GENFILE)=' deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 # IOS_OFFER_PROBE 是多行常量, grep 抓不全 —— set -u 下就绪判据会当场炸。
 sed -n "/^IOS_OFFER_PROBE='/,/^'$/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 sed -n "/^IOS_OFFER_SERVER='/,/^'$/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"

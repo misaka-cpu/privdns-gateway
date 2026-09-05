@@ -72,6 +72,11 @@ _ios_offer_session_begin(){
   _IOS_OFFER_WWW="$(mktemp -d)"; _IOS_OFFER_ACTIVE=1; return 0
 }
 _ios_offer_teardown(){ rm -rf "${_IOS_OFFER_WWW:-}"; return 0; }
+# 调用方现在经 _ios_offer_gen_run 启动生成器(它关锁 fd 并在会话目录里留下生成者身份)。
+# 这一格只问调用方的控制流, 所以顶掉它、直接跑命令 —— 不顶的话它是未定义命令,
+# 现场长得像"调用方分发错了"。
+_ios_offer_gen_run(){ "$@"; }
+
 # 依赖全部顶掉: 这一支只问"staging 失败之后调用方做了什么", 不牵扯真实平台门控与真实生成。
 need_root(){ :; }
 ic_gate(){ return 0; }

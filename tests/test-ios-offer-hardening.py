@@ -125,10 +125,11 @@ for fn in _ios_offer_download _ios_offer_teardown _ios_offer_abort _ios_offer_nf
           _ios_offer_state_write _ios_offer_serve _ios_offer_session_begin \
           _ios_offer_dir_ok \
           _ios_offer_root_ok _ios_offer_reap_dir _ios_offer_dir_pid \
-          _nft_apply_main _lan_nft_reapply; do
+          _nft_apply_main _lan_nft_reapply \
+          _ios_offer_proc_state _ios_offer_stop_pid _ios_offer_list _ios_offer_gen_run; do
   sed -n "/^$fn()/,/^}/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 done
-grep -E '^(LAN_NFT_CONF|IOS_OFFER_MARK|IOS_OFFER_LOCK|IOS_OFFER_STATE|IOS_OFFER_ROOT|IOS_OFFER_SENTINEL|IOS_OFFER_PIDFILE)=' deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
+grep -E '^(LAN_NFT_CONF|IOS_OFFER_MARK|IOS_OFFER_LOCK|IOS_OFFER_STATE|IOS_OFFER_ROOT|IOS_OFFER_SENTINEL|IOS_OFFER_PIDFILE|IOS_OFFER_GENFILE)=' deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 for v in IOS_OFFER_PROBE IOS_OFFER_SERVER; do
   sed -n "/^$v='/,/^'\$/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 done

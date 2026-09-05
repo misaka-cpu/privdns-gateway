@@ -2550,6 +2550,11 @@ IOS_OFFER_SENTINEL=".pdg-offer-session"
 # 目录、一个还在服务的进程, 却没有任何记录可依。凭据跟着目录走, 这段真空就没有了。
 IOS_OFFER_PIDFILE=".pdg-offer-pid"
 
+# 描述文件生成器的身份凭据。生成器由调用方启动、可能活得比一次回收更久 —— 它落笔时
+# atomic_write 会把父目录一起重建, 于是"删完目录就报成功"会在盘上留下一个没有 sentinel
+# 的目录, 下一次会话据此拒绝启动。凭据让后继会话能认出它并先停住它。
+IOS_OFFER_GENFILE=".pdg-offer-gen"
+
 # 目录归不归本功能所有 —— **不依赖任何进程还活着**。HTTP 自己的 600 秒超时一到, PID 就没了,
 # 那时若还只认 PID, 目录就永远没人敢删。六条全过才算数:
 #   在固定安全父目录之下 / 本身不是符号链接 / 是目录 / 属主是自己 / 权限恰好 0700 /
@@ -2567,55 +2572,151 @@ _ios_offer_dir_ok(){
   [[ -f "$dir/$IOS_OFFER_SENTINEL" && ! -L "$dir/$IOS_OFFER_SENTINEL" ]] || return 1
   [[ "$(stat -c %a "$dir/$IOS_OFFER_SENTINEL" 2>/dev/null)" == 600 ]] || return 1
   [[ "$(cat "$dir/$IOS_OFFER_SENTINEL" 2>/dev/null)" == "$sid" ]] || return 1
-  # 允许内容集合: 凭据本身 + 描述文件。多出任何别的东西就不是我们建的那个目录。
-  while IFS= read -r ent; do
-    [[ -z "$ent" ]] && continue
-    ent="$(basename "$ent")"
-    [[ "$ent" == "$IOS_OFFER_SENTINEL" ]] && continue
-    [[ "$ent" == "$IOS_OFFER_PIDFILE" ]] && continue
-    [[ "$ent" == *.mobileconfig ]] && continue
-    return 1
-  done < <(find "$dir" -mindepth 1 -maxdepth 1 2>/dev/null)
+  # 允许内容集合: 两份凭据 + 描述文件。多出任何别的东西就不是我们建的那个目录。
+  # 枚举不完整时返回 **2**(与"不是我们的"区分开)—— 没看全就不能说"里面没有别的东西"。
+  local listing
+  listing="$(_ios_offer_list "$dir")" || return 2
+  if [[ -n "$listing" ]]; then
+    while IFS= read -r ent; do
+      [[ -z "$ent" ]] && continue
+      ent="$(basename "$ent")"
+      [[ "$ent" == "$IOS_OFFER_SENTINEL" ]] && continue
+      [[ "$ent" == "$IOS_OFFER_PIDFILE" ]] && continue
+      [[ "$ent" == "$IOS_OFFER_GENFILE" ]] && continue
+      [[ "$ent" == *.mobileconfig ]] && continue
+      return 1
+    done <<<"$listing"
+  fi
   return 0
+}
+
+# 枚举一个目录的直接子项, 并把**枚举是否完成**如实带回调用方。
+# 以前两处扫描都是 `find … 2>/dev/null` 直接灌进 while: find 的退出码被丢掉, 循环跑完就
+# 当扫描成功 —— 于是"不曾看到"等同于"不存在", 而据此删东西是最坏的一种。
+# 约定: stdout 逐行给出路径; 返回 0 表示枚举完整, 非零表示不完整(此时可能已有部分条目)。
+_ios_offer_list(){
+  local out rc
+  out="$(find "$1" -mindepth 1 -maxdepth 1 -print 2>/dev/null)"; rc=$?
+  [[ -n "$out" ]] && printf '%s\n' "$out"
+  return "$rc"
+}
+
+# 判定一份进程凭据此刻的状态。**"没认出来"不等于"已经退出"**: 记录损坏、读不出、
+# starttime 读不到、cwd 不符 —— 没有一种能证明那个进程已经不在了, 而上一版把它们和
+# "确实退出了"共用一个非零返回, 调用方据此照删。
+# stdout 四选一: absent(没有凭据) / gone(确认已退出) / "alive <pid>" / "unknown <原因>"
+# 第二个参数是期望的 cwd; 留空则不校验 cwd(生成器不在会话目录里跑, 它的身份靠 pid+starttime)。
+_ios_offer_proc_state(){
+  local f="$1" want_cwd="${2:-}" pid start now cwd
+  [[ -e "$f" || -L "$f" ]] || { echo absent; return 0; }
+  [[ -f "$f" && ! -L "$f" && -r "$f" ]] || { echo "unknown 凭据不是可读的普通文件"; return 0; }
+  pid="$(sed -n 's/^pid=//p'     "$f" 2>/dev/null | head -1)"
+  start="$(sed -n 's/^start=//p' "$f" 2>/dev/null | head -1)"
+  if [[ ! "$pid" =~ ^[0-9]+$ || ! "$start" =~ ^[0-9]+$ ]]; then
+    echo "unknown 凭据内容损坏或尚未登记"; return 0
+  fi
+  [[ -d "/proc/$pid" ]] || { echo gone; return 0; }
+  now="$(_ios_offer_starttime "$pid")"
+  [[ -n "$now" ]] || { echo "unknown 读不到 pid $pid 的 starttime"; return 0; }
+  # starttime 对不上, 从外面看有两种可能: pid 被复用(原进程确已退出), 或者这份凭据本身
+  # 就是错的/过期的。两者产生**完全相同的观测**, 分不开就不能当成"已经退出"去删东西 ——
+  # 归到 unknown, 由人工确认。只有 /proc/<pid> 根本不在, 才是可证明的"已退出"。
+  [[ "$now" == "$start" ]] || { echo "unknown pid $pid 的 starttime 与凭据不符"; return 0; }
+  if [[ -n "$want_cwd" ]]; then
+    cwd="$(readlink -f "/proc/$pid/cwd" 2>/dev/null)"
+    [[ -n "$cwd" ]] || { echo "unknown 读不到 pid $pid 的 cwd"; return 0; }
+    [[ "$cwd" == "$(readlink -f "$want_cwd" 2>/dev/null)" ]] \
+      || { echo "unknown pid $pid 的 cwd 与会话目录不符"; return 0; }
+  fi
+  echo "alive $pid"
+  return 0
+}
+
+# 停一个**身份已确认**的进程并确认它真的停了。停不掉返回非零。
+_ios_offer_stop_pid(){
+  local pid="$1" n=0
+  kill -TERM "$pid" 2>/dev/null
+  while [[ "$n" -lt 30 ]] && kill -0 "$pid" 2>/dev/null; do sleep 0.1; n=$((n + 1)); done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -KILL "$pid" 2>/dev/null
+    n=0
+    while [[ "$n" -lt 20 ]] && kill -0 "$pid" 2>/dev/null; do sleep 0.1; n=$((n + 1)); done
+  fi
+  kill -0 "$pid" 2>/dev/null && return 1
+  return 0
+}
+
+# 跑描述文件生成器, 并在会话目录里留下它的身份。
+# 先落一个 pending 记号**再** fork: 从"生成者已经存在"到"身份登记完成"之间若被强杀,
+# 下一次会话看到 pending 就知道"可能还有人在写, 但认不出是谁", 于是拒绝动这个目录 ——
+# 而不是删掉它, 然后被那个人重建成一个没有 sentinel 的壳。
+_ios_offer_gen_run(){
+  local gf="$_IOS_OFFER_WWW/$IOS_OFFER_GENFILE" gpid gstart rc
+  (umask 077 && printf 'pending\n' > "$gf") 2>/dev/null || return 1
+  # 6>&-: 生成子进程不许继承会话锁。
+  "$@" 6>&- &
+  gpid=$!
+  gstart="$(_ios_offer_starttime "$gpid")"
+  if [[ -n "$gstart" ]]; then
+    (umask 077 && printf 'pid=%s\nstart=%s\n' "$gpid" "$gstart" > "$gf") 2>/dev/null || true
+  fi
+  wait "$gpid"; rc=$?
+  rm -f "$gf" 2>/dev/null || true
+  return "$rc"
 }
 
 # 从**已经证明归属的**会话目录里读出服务进程身份, 并核对它确实是那个进程。
 # 判据三条: /proc/<pid> 还在、starttime 与记录逐字相等(排除 PID 复用)、cwd 正是这个目录。
 # 任何一条不符就返回非零 —— 身份不明的进程一律不杀。
 _ios_offer_dir_pid(){
-  local dir="$1" f="$1/$IOS_OFFER_PIDFILE" pid start now
-  [[ -f "$f" && ! -L "$f" ]] || return 1
-  pid="$(sed -n 's/^pid=//p'   "$f" | head -1)"
-  start="$(sed -n 's/^start=//p' "$f" | head -1)"
-  [[ "$pid" =~ ^[0-9]+$ && "$start" =~ ^[0-9]+$ ]] || return 1
-  [[ -d "/proc/$pid" ]] || return 1
-  now="$(_ios_offer_starttime "$pid")"
-  [[ -n "$now" && "$now" == "$start" ]] || return 1
-  [[ "$(readlink -f "/proc/$pid/cwd" 2>/dev/null)" == "$(readlink -f "$dir" 2>/dev/null)" ]] || return 1
-  printf '%s' "$pid"
+  # 兼容包装: 只在"身份确认且存活"时给出 pid。判定本身在 _ios_offer_proc_state 里, 那里
+  # 把 absent / gone / alive / unknown 分开 —— 单一非零推断不出"进程已退出"。
+  local st
+  st="$(_ios_offer_proc_state "$1/$IOS_OFFER_PIDFILE" "$1")"
+  [[ "$st" == alive\ * ]] || return 1
+  printf '%s' "${st#alive }"
   return 0
 }
 
 # 收掉一个**已经证明归属**的会话目录: 先停数据面, 再删目录。顺序不能反 —— 目录一删,
 # 那个还在服务的进程就再也没有凭据可查了。
 _ios_offer_reap_dir(){
-  local dir="$1" pid n=0
-  if pid="$(_ios_offer_dir_pid "$dir")"; then
-    kill -TERM "$pid" 2>/dev/null
-    while [[ "$n" -lt 30 ]] && kill -0 "$pid" 2>/dev/null; do sleep 0.1; n=$((n + 1)); done
-    if kill -0 "$pid" 2>/dev/null; then
-      kill -KILL "$pid" 2>/dev/null
-      n=0
-      while [[ "$n" -lt 20 ]] && kill -0 "$pid" 2>/dev/null; do sleep 0.1; n=$((n + 1)); done
-    fi
-    if kill -0 "$pid" 2>/dev/null; then
-      echo "❌ 上一轮留下的临时下载服务(pid $pid)停不掉 —— 端口可能仍被占着。"; return 1
-    fi
-    c_y "回收了上一轮留下的临时下载服务(pid $pid)。"
-  elif [[ -f "$dir/$IOS_OFFER_PIDFILE" ]]; then
-    # 凭据在, 但那个进程已经不在了(比如它自己的 600 秒超时到点)。目录仍可安全回收。
-    :
-  fi
+  local dir="$1" st pid
+  # **先看还有没有人往这个目录写。** 描述文件生成器由调用方启动, 完全可能活得比一次回收
+  # 更久: 删掉目录之后它才落笔, 而 atomic_write 会把父目录一起重建 —— 盘上于是多出一个
+  # 没有 sentinel 的壳, 下一次会话据此拒绝启动。关掉锁 fd 只解决了锁, 没解决写入者。
+  st="$(_ios_offer_proc_state "$dir/$IOS_OFFER_GENFILE")"
+  case "$st" in
+    absent|gone) ;;
+    "alive "*)
+      pid="${st#alive }"
+      if ! _ios_offer_stop_pid "$pid"; then
+        echo "❌ 上一轮的描述文件生成器(pid $pid)停不掉 —— 不删目录, 本次拒绝开通道。"
+        return 1
+      fi
+      c_y "回收了上一轮仍在运行的描述文件生成器(pid $pid)。" ;;
+    *)
+      echo "❌ 上一轮的描述文件生成器身份无法确认(${st#unknown }) —— 它可能仍在往 $dir 写入。"
+      echo "   不杀、不删, 本次拒绝开通道; 请人工确认后处理。"
+      return 1 ;;
+  esac
+
+  # 再看 HTTP。同样三分: 确认存活 → 停掉; 确认已退出 → 放行; 无法确认 → 一律不动。
+  st="$(_ios_offer_proc_state "$dir/$IOS_OFFER_PIDFILE" "$dir")"
+  case "$st" in
+    absent|gone) ;;
+    "alive "*)
+      pid="${st#alive }"
+      if ! _ios_offer_stop_pid "$pid"; then
+        echo "❌ 上一轮留下的临时下载服务(pid $pid)停不掉 —— 端口可能仍被占着。"
+        return 1
+      fi
+      c_y "回收了上一轮留下的临时下载服务(pid $pid)。" ;;
+    *)
+      echo "❌ 上一轮临时下载服务的身份无法确认(${st#unknown }) —— 不杀、不删, 本次拒绝开通道。"
+      return 1 ;;
+  esac
+
   rm -rf "$dir"
   [[ -e "$dir" ]] && { echo "❌ 删不掉上一轮的会话目录($dir)。"; return 1; }
   return 0
@@ -2789,8 +2890,15 @@ _ios_offer_reap_orphan(){
   # 以前第一行就是 `[[ -s "$IOS_OFFER_STATE" ]] || return 0`, 于是"目录已建、记录尚无"
   # 那段真空里的残留永远没人收。现在直接扫会话根目录 —— 有锁在手, 里面的东西一定来自
   # 已经结束的会话。
-  local rc=0 ent base dir
+  local rc=0 ent base dir listing dok
   if [[ -d "$IOS_OFFER_ROOT" && ! -L "$IOS_OFFER_ROOT" ]]; then
+    # 枚举不完整就**到此为止**: 没看全的列表不能拿来决定删什么, 也不能据此认为
+    # "根目录里没有别的东西"。以前 find 的退出码被丢在 `2>/dev/null` 里, 循环跑完即成功。
+    if ! listing="$(_ios_offer_list "$IOS_OFFER_ROOT")"; then
+      echo "❌ 会话根目录枚举不完整($IOS_OFFER_ROOT) —— 拿不到完整清单就不动任何东西, 本次拒绝开通道。"
+      return 1
+    fi
+    [[ -z "$listing" ]] && listing=""
     while IFS= read -r ent; do
       [[ -z "$ent" ]] && continue
       base="$(basename "$ent")"
@@ -2798,7 +2906,13 @@ _ios_offer_reap_orphan(){
       # 别的东西, 但"不该有"不是动手的理由。
       [[ "$base" =~ ^s\.[0-9a-f]{16}$ ]] || continue
       dir="$IOS_OFFER_ROOT/$base"
-      if ! _ios_offer_dir_ok "$dir" "${base#s.}"; then
+      _ios_offer_dir_ok "$dir" "${base#s.}"; dok=$?
+      if [[ "$dok" == 2 ]]; then
+        echo "❌ 会话目录内容枚举不完整($dir) —— 没看全就不能说它是我们的, 也不能删, 本次拒绝开通道。"
+        rc=1
+        continue
+      fi
+      if [[ "$dok" != 0 ]]; then
         echo "❌ 会话根目录里有一个证不明归属的目录($dir) —— 不动它, 本次拒绝开通道。"
         echo "   判据: 非符号链接、自己拥有、权限 0700、带与目录名一致的会话凭据,"
         echo "   且目录内除凭据外只有描述文件。请人工确认后处理。"
@@ -2806,7 +2920,7 @@ _ios_offer_reap_orphan(){
         continue
       fi
       _ios_offer_reap_dir "$dir" || rc=1
-    done < <(find "$IOS_OFFER_ROOT" -mindepth 1 -maxdepth 1 2>/dev/null)
+    done <<<"$listing"
   fi
   # 记录本身也要清掉: 走到这里说明写下它的那条会话已经不在了(锁在我们手上)。
   # **但只在全都收干净的前提下清。** 上面若遇到证不明归属的目录, 记录要原样留着 ——
@@ -3142,9 +3256,9 @@ cmd_ios_previous(){
   OUT="$_IOS_OFFER_WWW/prev.mobileconfig"
   # 取字节这一步在 iosstate.py 里过 verified_artifact(): 与记录对不上就拿不到文件, 也就
   # 不会有端口被打开 —— 通道只服务于已经确认过的那一份产物, 和 Bot 那条路一样严。
-  # 6>&-: 生成子进程不许继承会话锁。继承了的话, 父 shell 被 SIGKILL 之后锁还被它攥着,
-  # 后继会话会被自己上一轮的生成进程挡成 BUSY。
-  if ! python3 "$st" previous --out "$OUT" 6>&-; then
+  # 经 _ios_offer_gen_run 启动: 它关掉锁 fd, 并在会话目录里留下生成者身份 —— 强杀之后
+  # 后继会话据此认出它、先停住它, 再删目录, 于是不会被它醒来后重建出的空壳挡住。
+  if ! _ios_offer_gen_run python3 "$st" previous --out "$OUT"; then
     _ios_offer_teardown || true
     trap - EXIT HUP INT TERM
     echo "❌ 取不出上一版, 未开放任何临时端口。"; return 1
@@ -3199,10 +3313,10 @@ cmd_ios(){
   # 所以不存在第二个只有一半进了所有权记录的 staging —— 强杀之后后继会话按记录就能一次收净。
   _ios_offer_session_begin || return 1
   OUT="$_IOS_OFFER_WWW/gen.mobileconfig"
-  # 6>&-: 生成子进程不许继承会话锁(理由同 cmd_ios_previous)。
-  if ! python3 "$ST" generate --dot-host "$HOST" --server-ip "$IP" --template "$TMPL" \
-        --wloc-config /etc/privdns-gateway/mitm.json --ca-crt /etc/privdns-gateway/ca/ca.crt \
-        --out "$OUT" "${LEGACY[@]}" 6>&-; then
+  # 经 _ios_offer_gen_run 启动(理由同 cmd_ios_previous)。
+  if ! _ios_offer_gen_run python3 "$ST" generate --dot-host "$HOST" --server-ip "$IP" \
+        --template "$TMPL" --wloc-config /etc/privdns-gateway/mitm.json \
+        --ca-crt /etc/privdns-gateway/ca/ca.crt --out "$OUT" "${LEGACY[@]}"; then
     _ios_offer_teardown || true
     trap - EXIT HUP INT TERM
     echo "❌ 生成描述文件失败, 未开放任何临时端口。"; return 1

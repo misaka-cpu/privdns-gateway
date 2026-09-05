@@ -627,6 +627,9 @@ jobs:
       - name: "iOS 临时下载通道 pre-state 窗口与父目录信任顺序 (生成中/HTTP 已起未记录的 SIGKILL / 符号链接根不得被 chmod)"
         run: python3 tests/test-ios-offer-prestate.py
 
+      - name: "iOS 临时下载通道回收判定 (存活生成者 / 身份未知≠已退出 / 枚举失败不当空集合)"
+        run: python3 tests/test-ios-offer-reaper.py
+
       - name: "iOS 描述文件身份持久性 (update/快照/备份恢复/平台来回切都不丢身份)"
         run: python3 tests/test-ios-profile-persist.py
 
