@@ -3146,7 +3146,7 @@ _ios_offer_teardown(){
   # 会走**默认处置** = 直接杀掉 shell, 把收尾停在半路(端口撤了目录还在, 或 nft 撤了 state
   # 还在)。这里临时忽略它们 —— 忽略期间到达的信号会被丢弃, 不会排队等在后面。
   trap "" HUP INT TERM
-  local rc=0 gen_unsafe="" gst
+  local rc=0 gen_unsafe="" srv_unsafe="" keep_scene="" gst
   # **本轮的描述文件生成器也归收尾管。** 以前只有后继的孤儿回收会处理它: 普通信号进来,
   # teardown 停 HTTP、撤 nft、删目录, 生成器却还在跑 —— 它随后落笔时 atomic_write 会把
   # 父目录一起重建, 盘上留下一个没有 sentinel 的壳, 下一次回收据此拒绝启动。那时退出码
@@ -3188,16 +3188,30 @@ _ios_offer_teardown(){
     # 收尾无界地卡在这里。走与生成器同一套停止流程 —— 有预算、会升级、停不住就返回。
     if ! _ios_offer_stop_child "$_IOS_OFFER_SRV"; then
       echo "❌ 临时 HTTP 进程没能退出(${_IOS_OFFER_STOP_WHY:-原因未记录}) —— 端口可能仍开着。"
-      rc=1
+      # **和生成者一样要保住现场。** 以前这里只记 rc=1, 随后照样删目录与运行期记录 ——
+      # 而定位这个还活着的服务所需要的东西(会话目录里的 pid+starttime 凭据、目录本身的
+      # 归属证明、记录里的 pid/start/www)恰恰都在被删的那几样里。删完之后端口还开着、
+      # 服务还在发同一份描述文件, 下一次会话却扫不到任何线索, 回收一路返回 0 ——
+      # "收干净了", 实际什么也没收。
+      srv_unsafe=1; rc=1
     fi
   fi
+  # 防火墙照撤: 服务停不掉不是不撤放行的理由, 撤不掉也不能反过来盖住服务没停这件事 ——
+  # 两个失败各自计入 rc, 各自具名。
   _ios_offer_nft_close || rc=1
+  # 生成者与 HTTP 任意一个还没确认安全结束, 恢复线索就一样也不能删。两个条件合成一个
+  # 保留开关, 而不是各写一套 —— 少一处就是一条能悄悄把线索删掉的路。
+  if [[ -n "$gen_unsafe" || -n "$srv_unsafe" ]]; then keep_scene=1; fi
   # 一轮只有一个目录 —— 调用方的生成物与 HTTP 服务的根是同一个, 所以这里收干净就没有
   # "另一个没人认领的目录"了。
   if [[ -n "${_IOS_OFFER_WWW:-}" ]]; then
-    if [[ -n "$gen_unsafe" ]]; then
+    if [[ -n "$keep_scene" ]]; then
       # 确认不了"没人再写"就不能删: 删掉的是线索, 而写入者随后会把目录重建成一个空壳。
+      # HTTP 那一侧同理 —— 删掉目录就等于删掉下一次会话据以停掉它的 pid/starttime 凭据。
       echo "   保留会话目录与所有权记录以便人工处理: $_IOS_OFFER_WWW"
+      if [[ -n "$srv_unsafe" ]]; then
+        echo "   下一次会话会凭这里的 $IOS_OFFER_PIDFILE 与目录归属继续回收它。"
+      fi
     else
       rm -rf "$_IOS_OFFER_WWW"
       if [[ -e "$_IOS_OFFER_WWW" ]]; then
@@ -3208,7 +3222,7 @@ _ios_offer_teardown(){
   # **只删本轮自己写下的那份 state**, 而且删不掉要**计入返回码**。入场时读到的旧孤儿记录
   # 不归这里处置(回收流程处理完才会删它); 而 `rm -f … || true` 那种吞法会让下一次会话拿着
   # 一份本该消失的记录去做身份核对。
-  if [[ -z "$gen_unsafe" && -n "${_IOS_OFFER_STATE_OWNED:-}" ]]; then
+  if [[ -z "$keep_scene" && -n "${_IOS_OFFER_STATE_OWNED:-}" ]]; then
     if ! rm -f "$IOS_OFFER_STATE" 2>/dev/null || [[ -e "$IOS_OFFER_STATE" ]]; then
       echo "❌ 清不掉本轮的运行期所有权记录($IOS_OFFER_STATE) —— 下一次会话会拿它做身份核对。"
       rc=1
