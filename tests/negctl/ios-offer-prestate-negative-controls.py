@@ -49,11 +49,15 @@ def lift(pattern, flags=re.M | re.S):
 
 REAP_HEAD = lift(r"^_ios_offer_reap_orphan\(\)\{\n")
 STAGING = lift(r"^  if ! _ios_offer_state_write staging .*?\n  fi\n")
-GEN_FD = lift(r'^  if ! python3 "\$ST" generate .*?"\$\{LEGACY\[@\]\}" 6>&-; then$')
+# 两个调用方现在都经 _ios_offer_gen_run 启动生成器, `6>&-` 随之挪进了那个函数。
+# 这一格问的仍是同一件事: 生成子进程会不会继承会话锁的 fd。
+GEN_FD = lift(r'^  "\$@" 6>&- &$')
 PIDWRITE = lift(r"^_fd = os\.open\(PIDF.*?^os\.close\(_fd\)$")
 ROOTORDER = lift(r"^  if \[\[ -e \"\$IOS_OFFER_ROOT\" \|\| -L \"\$IOS_OFFER_ROOT\" \]\]; then\n.*?^  fi\n")
 NAMEGUARD = lift(r'^      \[\[ "\$base" =~ \^s\\\.\[0-9a-f\]\{16\}\$ \]\] \|\| continue$')
-IDGUARD = lift(r"^      if ! _ios_offer_dir_ok \"\$dir\" \"\$\{base#s\.\}\"; then\n.*?^      fi\n")
+# dir_ok 的调用点改成了先取 rc(2 = 没看全, 1 = 不是我们的), 身份判定挪进了 `dok != 0`
+# 这一支。这一格问的仍是: 证不明归属时会不会照收。
+IDGUARD = lift(r'^      if \[\[ "\$dok" != 0 \]\]; then\n.*?^      fi$')
 
 ROOT_OLD = '''  mkdir -p "$IOS_OFFER_ROOT" 2>/dev/null
   chmod 0700 "$IOS_OFFER_ROOT" 2>/dev/null
@@ -73,13 +77,13 @@ MUT = [
      [(REAP_HEAD, REAP_HEAD + '  [[ -s "$IOS_OFFER_STATE" ]] || return 0  # 变异\n', 1),
       (STAGING, "  : # 变异: 不记 staging\n", 1)], [T_PRE]),
     ("③ 生成子进程重新继承 fd 6",
-     [(GEN_FD, GEN_FD.replace(' 6>&-; then', '; then'), 1)], [T_PRE]),
+     [(GEN_FD, GEN_FD.replace(' 6>&- &', ' &'), 1)], [T_PRE]),
     ("④ 服务不再往目录里写 pid 凭据", [(PIDWRITE, "pass", 1)], [T_PRE]),
     ("⑤ 根目录恢复「先 chmod 后验」", [(ROOTORDER, ROOT_OLD, 1)], [T_PRE]),
     ("⑥ 目录扫描不再限定命名", [(NAMEGUARD, "      :  # 变异", 1)], [T_PRE]),
     ("⑦ 身份不明仍照收",
-     [(IDGUARD, '      if ! _ios_offer_dir_ok "$dir" "${base#s.}"; then\n'
-                '        :  # 变异: 证不明归属也照收\n      fi\n', 1)], [T_SESS]),
+     [(IDGUARD, '      if [[ "$dok" != 0 ]]; then\n'
+                '        :  # 变异: 证不明归属也照收\n      fi', 1)], [T_SESS]),
     ("⑧ 只加无关注释(反向对照)",
      [(NAMEGUARD, "      # 变异: 一条无关注释\n" + NAMEGUARD, 1)], [T_PRE, T_SESS]),
 ]
