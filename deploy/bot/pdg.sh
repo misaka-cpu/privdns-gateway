@@ -2634,18 +2634,35 @@ _ios_offer_proc_state(){
 
 # 进程是否已经不在: 不存在, 或者已经是僵尸(退出了、只等回收)。
 # 单用 `kill -0` 判不出来 —— 它对僵尸仍然成功, 于是"停没停掉"永远得不到答案。
+# 三态, 不是布尔: 0 = 确证已退出(/proc 不在, 或已成僵尸只等回收); 1 = 确证仍在; 2 = 读
+# 不到, 判不了。**读失败不算已退出** —— 上一版 `cat … || return 0` 把"读不到"当成"走了",
+# 调用方据此去 wait、去删目录, 而进程其实还在往会话目录里写。这与 _ios_offer_proc_state
+# 那边"未知不得冒充确定"是同一条原则, 两处不能各执一词。
 _ios_offer_proc_dead(){
   local st
   [[ -d "/proc/$1" ]] || return 0
-  st="$(cat "/proc/$1/stat" 2>/dev/null)" || return 0
+  if ! st="$(cat "/proc/$1/stat" 2>/dev/null)"; then
+    # 读失败之后 /proc/<pid> 也不见了 —— 那是读的过程中它真的退出了, 可以判成已退出;
+    # 目录还在却读不到, 才是"不知道"。
+    [[ -d "/proc/$1" ]] || return 0
+    return 2
+  fi
   st="${st##*) }"
   [[ "${st%% *}" == Z ]]
 }
 
 # 停一个**本 shell 的直接子进程**, 并把它回收掉。与 _ios_offer_stop_pid 的区别只在僵尸:
 # 子进程退出后要经 wait 收尸才会从 /proc 消失, 中间那段时间 kill -0 照样成功。
+# 返回 0 = 确证已停并已回收; 1 = TERM 与 KILL 都发过了它仍然活着; 2 = 状态读不到, 停没停
+# 判不了。失败时把理由留在 _IOS_OFFER_STOP_WHY 里, 由调用方原样报出来。
+#
+# **只有确证退出才 wait。** 上一版无论停没停住都无条件 `wait "$pid"`: 对仍然存活的直接子
+# 进程, 这一句是无界阻塞 —— 收尾卡在半路, 会话锁一直占着, 而"停不掉"这个结论永远送不到
+# 调用方手里, 上层为它写好的"保留现场并返回非零"根本走不到。确证退出之后再 wait 才是有界
+# 的: 僵尸立刻被收尸, 已被 shell 收过的立刻返回。
 _ios_offer_stop_child(){
   local pid="$1" n=0
+  _IOS_OFFER_STOP_WHY=""
   kill -TERM "$pid" 2>/dev/null
   while [[ "$n" -lt 30 ]] && ! _ios_offer_proc_dead "$pid"; do sleep 0.1; n=$((n + 1)); done
   if ! _ios_offer_proc_dead "$pid"; then
@@ -2653,8 +2670,12 @@ _ios_offer_stop_child(){
     n=0
     while [[ "$n" -lt 20 ]] && ! _ios_offer_proc_dead "$pid"; do sleep 0.1; n=$((n + 1)); done
   fi
-  wait "$pid" 2>/dev/null
   _ios_offer_proc_dead "$pid"
+  case "$?" in
+    0) wait "$pid" 2>/dev/null; return 0 ;;
+    2) _IOS_OFFER_STOP_WHY="读不到 pid $pid 的运行状态, 无法确认它已经退出"; return 2 ;;
+    *) _IOS_OFFER_STOP_WHY="pid $pid 收过 TERM 与 KILL 之后仍然存活"; return 1 ;;
+  esac
 }
 
 # 停一个**身份已确认**的进程并确认它真的停了。停不掉返回非零。
@@ -3136,7 +3157,7 @@ _ios_offer_teardown(){
       if _ios_offer_stop_child "$_IOS_OFFER_GEN"; then
         c_y "已停止本轮的描述文件生成器(pid $_IOS_OFFER_GEN)。"
       else
-        echo "❌ 本轮的描述文件生成器(pid $_IOS_OFFER_GEN)停不掉 —— 它可能仍在往会话目录写入。"
+        echo "❌ 本轮的描述文件生成器停不掉(${_IOS_OFFER_STOP_WHY:-原因未记录}) —— 它可能仍在往会话目录写入。"
         gen_unsafe=1; rc=1
       fi
     else
@@ -3153,7 +3174,7 @@ _ios_offer_teardown(){
         if _ios_offer_stop_child "${gst#alive }"; then
           c_y "已停止本轮的描述文件生成器(pid ${gst#alive })。"
         else
-          echo "❌ 本轮的描述文件生成器(pid ${gst#alive })停不掉 —— 它可能仍在往会话目录写入。"
+          echo "❌ 本轮的描述文件生成器停不掉(${_IOS_OFFER_STOP_WHY:-原因未记录}) —— 它可能仍在往会话目录写入。"
           gen_unsafe=1; rc=1
         fi ;;
       *)
@@ -3163,10 +3184,11 @@ _ios_offer_teardown(){
   fi
   # 顺序要紧: 先停服务再撤放行。反过来的话, 撤除失败时服务还在跑, 而我们已经以为收干净了。
   if [[ -n "${_IOS_OFFER_SRV:-}" ]]; then
-    kill "$_IOS_OFFER_SRV" 2>/dev/null
-    wait "$_IOS_OFFER_SRV" 2>/dev/null
-    if kill -0 "$_IOS_OFFER_SRV" 2>/dev/null; then
-      echo "❌ 临时 HTTP 进程($_IOS_OFFER_SRV)没能退出 —— 端口可能仍开着。"; rc=1
+    # 同一处病灶: 上一版 TERM 之后就无条件 wait, 既不升级到 KILL, 也会在服务不肯走时把
+    # 收尾无界地卡在这里。走与生成器同一套停止流程 —— 有预算、会升级、停不住就返回。
+    if ! _ios_offer_stop_child "$_IOS_OFFER_SRV"; then
+      echo "❌ 临时 HTTP 进程没能退出(${_IOS_OFFER_STOP_WHY:-原因未记录}) —— 端口可能仍开着。"
+      rc=1
     fi
   fi
   _ios_offer_nft_close || rc=1
