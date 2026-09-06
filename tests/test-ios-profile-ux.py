@@ -438,11 +438,25 @@ PDG_IOS_LEGACY=n                   # 首次生成的那句问话在非交互场�
 python3(){ shift; echo "READONLY:${1:-none}"; }   # 调用形态是 python3 <模块> <子命令> …
 # 临时下载通道的落点: 同样给一句可识别的输出 —— "有没有给手机开取件的路"因此也是可观察的
 _ios_offer_download(){ echo "CHANNEL:$1"; }
+# 调用方现在先开会话(取锁/收残留/建本轮唯一目录)。这一格只问"子命令有没有落对分支",
+# 所以把会话开场与收尾一并顶掉 —— 不顶的话它们是未定义命令, 现场长得像分发错了。
+_ios_offer_session_begin(){ _IOS_OFFER_WWW="$(mktemp -d)"; _IOS_OFFER_ACTIVE=1; return 0; }
+_ios_offer_teardown(){ rm -rf "${_IOS_OFFER_WWW:-}"; return 0; }
+# 调用方现在经 _ios_offer_gen_run 启动生成器(它关锁 fd 并在会话目录里留下生成者身份)。
+# 这一格只问调用方的控制流, 所以顶掉它、直接跑命令 —— 不顶的话它是未定义命令,
+# 现场长得像"调用方分发错了"。
+_ios_offer_gen_run(){ "$@"; }
+
 # 生成路径上那些会真动机器的动作: 一旦被走到就立刻暴露
 apt-get(){ echo "DANGER:apt-get $*"; return 1; }
 qrencode(){ echo "DANGER:qrencode"; return 1; }
 nft(){ echo "DANGER:nft $*"; return 1; }
-mktemp(){ echo ${TMPDIR:-/tmp}/iosdisp-www.$$; }
+# `mktemp -d` 得**真把目录建出来**。只回显一个路径的桩从来就不忠实, 只是旧代码不查;
+# 调用方开始检查 -d 之后, 它就变成了"注入一次 mktemp 失败", 与本格要测的东西无关。
+# 这个 harness 的输出经 head 截断, 会提前收到 SIGPIPE, 收尾函数跑不到 —— 所以目录
+# 的清理挂在 EXIT 上, 否则每跑一次就在 /tmp 留一个空壳。
+trap 'rm -rf "${TMPDIR:-/tmp}/iosdisp-www.$$"' EXIT
+mktemp(){ local d=${TMPDIR:-/tmp}/iosdisp-www.$$; mkdir -p "$d"; echo "$d"; }
 # shellcheck source=/dev/null
 . ${TMPDIR:-/tmp}/iosdisp.$$
 rm -f ${TMPDIR:-/tmp}/iosdisp.$$
@@ -492,8 +506,10 @@ else:
 # 另一边照旧, 而两边看起来都在正常工作。
 _OFFER = re.search(r"^_ios_offer_download\(\)\{.*?^\}", pdg, re.S | re.M)
 _OFFER = _OFFER.group(0) if _OFFER else ""
-_dup = [lbl for pat, lbl in (("python3 -m http.server", "临时 HTTP"),
-                             ("nft insert rule", "临时 nft 放行"),
+# 服务从 `python3 -m http.server` 换成了内置的精确路径 handler(它会列目录, 一次性 token
+# 就白带了)。"一处实现"的标记随之改成那个常量的定义点。
+_dup = [lbl for pat, lbl in (('python3 -c "$IOS_OFFER_SERVER"', "临时 HTTP"),
+                             ("add rule inet pdg input", "临时 nft 放行"),
                              ("qrencode -t", "终端二维码"))
         if pdg.count(pat) != 1 or pat not in _OFFER]
 if not _OFFER:
@@ -517,19 +533,70 @@ with open(CHSRC, "wb") as f:
 CHSHA = hashlib.sha256(open(CHSRC, "rb").read()).hexdigest()
 
 for _name, _body in (
-        ("nft", '#!/bin/sh\necho "nft $*" >> "$PDG_TEST_LOG"\n'),
+        # nft 要**有状态**: 产品加完放行会重新读链, 确认它确实在、且排在 tailscale0
+        # 排除之后。只回显命令的桩会让那次复查读到空链, 于是通道判自己开失败 —— 现场
+        # 长得像产品缺陷, 其实是桩太薄。
+        ("nft", r"""#!/bin/bash
+st="$CH_DIR/chain"
+if [ ! -s "$st" ]; then cat > "$st" <<'BASE'
+1|iif "lo" accept
+2|ct state established,related accept
+3|tcp dport 22 accept
+4|iifname "tailscale0" return
+BASE
+fi
+echo "nft $*" >> "$PDG_TEST_LOG"
+next_handle(){ echo $(( $(cut -d'|' -f1 "$st" | sort -n | tail -1) + 1 )); }
+render(){ local a out="" q=0
+  for a in "$@"; do
+    if [ "$q" = 1 ]; then out="$out \"$a\""; q=0
+    else out="$out $a"; [ "$a" = comment ] && q=1; fi
+  done; echo "${out# }"; }
+# 产品现在用 `nft -j --echo --handle add rule …` 取回本轮规则的 handle。
+# 形态取自 nftables v1.0.6 实测: {"nftables":[{"add":{"rule":{... "handle": N ...}}}]}
+if [ "$1" = -j ] && [ "$2" = --echo ]; then
+  [ "${PDG_TEST_NFT_FAIL:-}" = add ] && { echo "Error: could not add" >&2; exit 1; }
+  # add 追加到链尾, insert 插到链首 —— 桩必须区分, 否则"改回 insert"这个变异
+  # 在桩上看起来和 add 一模一样, 位置判据就成了摆设。
+  shift 3; verb="$1"; shift 5
+  nh=$(next_handle)
+  if [ "$verb" = insert ]; then
+    { echo "$nh|$(render "$@")"; cat "$st"; } > "$st.new"; mv "$st.new" "$st"
+  else
+    echo "$nh|$(render "$@")" >> "$st"
+  fi
+  if [ "${PDG_TEST_NO_HANDLE:-}" = 1 ]; then echo "{\"nftables\":[{\"add\":{\"rule\":{}}}]}"
+  else printf "{\"nftables\":[{\"add\":{\"rule\":{\"handle\":%s}}}]}\n" "$nh"; fi
+    exit 0
+fi
+case "$1" in
+  -a) echo "table inet pdg {"; echo "	chain input {"
+      while IFS='|' read -r h r; do [ -n "$h" ] && echo "		$r # handle $h"; done < "$st"
+      echo "	}"; echo "}" ;;
+  add) shift 5; nh=$(( $(cut -d'|' -f1 "$st" | sort -n | tail -1) + 1 ))
+       echo "$nh|$(render "$@")" >> "$st" ;;
+  delete) shift $(($# - 1)); grep -v "^$1|" "$st" > "$st.new" 2>/dev/null; mv "$st.new" "$st" ;;
+esac
+exit 0
+"""),
         ("qrencode", '#!/bin/sh\necho "qrencode $*" >> "$PDG_TEST_LOG"\n'),
-        # timeout 记下自己被怎么调起来、服务目录里到底是什么, 然后变成一个可被 kill 的长命
-        # 进程 —— "按回车即收"到底收没收干净, 靠它活着还是死了来判。
-        ("timeout", '#!/bin/sh\n'
-                    '{ echo "timeout-args=$*"\n'
+        # 产品去掉了外层 `timeout 600`(只保留服务脚本自带的 Timer), 所以桩挪到 python3,
+        # 按被要求跑的东西分派。它记下自己被怎么调起来、服务目录里到底是什么, 然后变成那个
+        # 可被 kill 的长命进程 —— "按回车即收"到底收没收干净, 靠它活着还是死了来判。
+        ("python3", '#!/bin/bash\n'
+                    'real=/usr/bin/python3\n'
+                    'if [ "${1:-}" = -c ] && case "${2:-}" in *serve_forever*) true;; *) false;; esac; then\n'
+                    '{ echo "srv-args=$(echo $*)"\n'
                     '  echo "serve-cwd=$PWD"\n'
                     '  echo "serve-files=$(ls)"\n'
                     '  echo "serve-sha=$(sha256sum -- *.mobileconfig | awk \'{print $1}\')"\n'
                     '  echo "serve-pid=$$"\n'
                     '} >> "$PDG_TEST_LOG"\n'
                     ': > "$PDG_TEST_READY"\n'
-                    'exec sleep 30\n')):
+                    'args=(); for a in "$@"; do [ "$a" = 0.0.0.0 ] && a=127.0.0.1; args+=("$a"); done\n'
+                    'exec "$real" "${args[@]}"\n'
+                    'fi\n'
+                    'exec "$real" "$@"\n')):
     _p = os.path.join(CHBIN, _name)
     with open(_p, "w", encoding="utf-8") as f:
         f.write(_body)
@@ -543,23 +610,57 @@ sed -n '/^_ios_offer_download()/,/^}/p' deploy/bot/pdg.sh > "$CH_DIR/fn.sh"
 # 断言看起来像"没还原防火墙"这个产品缺陷, 其实是夹具少抽了一个函数。
 sed -n '/^_nft_apply_main()/,/^}/p'  deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
 sed -n '/^_lan_nft_reapply()/,/^}/p' deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
+# 收尾从"整表重载"改成"按标记精确删除"之后又多了三个依赖(见 tests/test-ios-offer-download-leak.py)。
+# 漏抽任何一个, 现场都长成"产品没撤规则"的样子 —— 与真缺陷一模一样。
+for _fn in _ios_offer_teardown _ios_offer_abort _ios_offer_nft_close \
+           _ios_offer_session_begin _ios_offer_dir_ok \
+           _ios_offer_chain _ios_offer_marks _ios_offer_rule_ok _ios_offer_ready \
+           _ios_offer_lock_acquire _ios_offer_lock_release \
+           _ios_offer_srv_alive _ios_offer_on_signal _ios_offer_reap_orphan _ios_offer_starttime _ios_offer_state_write \
+           _ios_offer_root_ok _ios_offer_reap_dir _ios_offer_dir_pid \
+          _ios_offer_proc_state _ios_offer_stop_pid _ios_offer_list _ios_offer_gen_run \
+          _ios_offer_stop_child _ios_offer_proc_dead; do
+  sed -n "/^$_fn()/,/^}/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
+done
 # 常量也要跟着抽。`set -u` 下漏一个就是 unbound variable, 而那会让 _nft_apply_main 在
 # 调 _lan_nft_reapply 时半途死掉 —— 表现同样是"没还原防火墙", 与漏抽函数一模一样。
 # (_lan_nft_reapply 原先把这个路径写死在函数体里, 于是这里不抽也能跑; 路径收归常量之后
 #  就不行了 —— 写死路径让夹具"碰巧能用", 那本身就是它该被改掉的理由之一。)
-grep -E '^LAN_NFT_CONF=' deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
-grep -q 'http.server' "$CH_DIR/fn.sh" || { echo "EXTRACT-FAIL"; exit 9; }
+grep -E '^(LAN_NFT_CONF|IOS_OFFER_MARK|IOS_OFFER_LOCK|IOS_OFFER_STATE|IOS_OFFER_ROOT|IOS_OFFER_SENTINEL|IOS_OFFER_PIDFILE|IOS_OFFER_GENFILE)=' deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
+# IOS_OFFER_PROBE 是多行常量, grep 抓不全 —— set -u 下就绪判据会当场炸。
+sed -n "/^IOS_OFFER_PROBE='/,/^'$/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
+sed -n "/^IOS_OFFER_SERVER='/,/^'$/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
+grep -q 'IOS_OFFER_SERVER=' "$CH_DIR/fn.sh" || { echo "EXTRACT-FAIL"; exit 9; }
+# 抽取自证: 函数**和常量**都要查。只查函数的话, 漏抽一个 IOS_OFFER_* 常量会变成 set -u 的
+# 运行期报错, 现场长得像"服务永远不就绪"—— 本轮实测漏过一次(IOS_OFFER_STATE)。
+missing=""
+for fn in $(grep -oE '_ios_offer_[a-z_]+' "$CH_DIR/fn.sh" | sort -u); do
+  grep -q "^$fn()" "$CH_DIR/fn.sh" || missing="$missing $fn"
+done
+for k in $(grep -oE '\bIOS_OFFER_[A-Z_]+' "$CH_DIR/fn.sh" | sort -u); do
+  grep -qE "^$k=" "$CH_DIR/fn.sh" || missing="$missing \$$k"
+done
+[ -z "$missing" ] || { echo "EXTRACT-MISSING:$missing"; exit 9; }
 c_g(){ echo "$*"; }; c_y(){ echo "$*"; }
 # shellcheck source=/dev/null
 . "$CH_DIR/fn.sh"
 # 桩里的 HTTP 一起来就 touch ready, 这里的"回车"随之到达 —— 不靠 sleep 猜时序。
-_ios_offer_download "$CH_SRC" 203.0.113.10 172.22.0.0/16 "这一份是**上一版**" \
-  < <(n=0; while [ ! -e "$PDG_TEST_READY" ]; do sleep 0.05
+# 通道要求先开会话(取锁/收残留/建本轮唯一目录), 产物直接落进那个目录 —— 与真实调用方同序。
+# `if ! cmd; then echo "$?"` 里的 $? 是取反之后的状态(恒 0), 所以先存再判。
+_ios_offer_session_begin; _sb=$?
+if [ "$_sb" -ne 0 ]; then echo "RC=$_sb"; exit "$_sb"; fi
+cp "$CH_SRC" "$_IOS_OFFER_WWW/gen.mobileconfig"
+# `exec 6>&-`: stdin 占位子进程在会话锁 fd 打开之后才 fork, 不关掉会一直攥着 flock。
+_ios_offer_download "$_IOS_OFFER_WWW/gen.mobileconfig" 203.0.113.10 172.22.0.0/16 "这一份是**上一版**" \
+  < <(exec 6>&-; n=0; while [ ! -e "$PDG_TEST_READY" ]; do sleep 0.05
         n=$((n+1)); [ "$n" -gt 200 ] && break; done)
 echo "RC=$?"
 """
 _chenv = dict(os.environ, PATH=CHBIN + os.pathsep + os.environ.get("PATH", ""),
-              PDG_TEST_LOG=CHLOG, PDG_TEST_READY=CHREADY, CH_DIR=CH, CH_SRC=CHSRC)
+              PDG_TEST_LOG=CHLOG, PDG_TEST_READY=CHREADY, CH_DIR=CH, CH_SRC=CHSRC,
+              PDG_IOS_OFFER_LOCKFILE=os.path.join(CH, "offer.lock"),
+              PDG_IOS_OFFER_STATEFILE=os.path.join(CH, "offer.state"),
+              PDG_IOS_OFFER_ROOT=os.path.join(CH, "offerroot"), TMPDIR=CH)
 _r = subprocess.run(["bash", "-c", HARNESS_CH], capture_output=True, text=True,
                     cwd=str(ROOT), timeout=180, env=_chenv)
 _chout = (_r.stdout or "") + (_r.stderr or "")
@@ -571,10 +672,22 @@ def _lv(key):
     return m.group(1).strip() if m else ""
 
 
-if _lv("timeout-args") == "600 python3 -m http.server 8443 --bind 0.0.0.0":
-    ok("下载通道真的起了 HTTP:8443, 并自带 10 分钟硬超时(没人管也会自己收)")
+# 命令行形态: `-c <精确路径 handler> 8443 /<tok>.mobileconfig <文件> 0.0.0.0`。
+# 逐字比对整条太脆(脚本本身会随实现演进), 这里钉住不会变的三件: 端口、绑定地址、以及
+# **不是** `-m http.server`(那正是被换掉的东西 —— 它会列目录)。
+# 10 分钟超时改由服务脚本自带的 Timer 负责, 外层不再套 GNU timeout, 于是记录里的 PID 就是
+# 真正听端口的那个进程, 身份核对与"停没停干净"不再分两层。
+_ta = _lv("srv-args")
+# 桩记的是**改写之前**的原样参数, 所以这里看到的绑定地址就是产品传的 0.0.0.0
+# (访问范围由 nft 那条按源地址的放行来控, 这一点没有放宽)。
+# 服务现在多收一个参数: 会话目录里的 pid 凭据路径 —— 服务自己把身份写进**已证明归属的
+# 那个目录**, 于是"目录已建、运行期记录尚无"那段真空里也有据可查。所以绑定地址不再是
+# 最后一个参数了。
+if _ta.startswith("-c ") and " 8443 " in _ta and " 0.0.0.0 " in _ta \
+        and _ta.endswith(".pdg-offer-pid") and "-m http.server" not in _ta:
+    ok("下载通道起的是精确路径 handler(非 -m http.server), 绑 8443, 无外层 timeout 包装")
 else:
-    bad("HTTP 没按预期起: timeout-args=%r\n%s" % (_lv("timeout-args"), _chout[:300]))
+    bad("HTTP 没按预期起: srv-args=%r\n%s" % (_lv("srv-args"), _chout[:300]))
 
 _tok = re.match(r"^([0-9a-f]{12})\.mobileconfig$", _lv("serve-files"))
 _url = "http://203.0.113.10:8443/%s.mobileconfig" % (_tok.group(1) if _tok else "?")
@@ -584,11 +697,14 @@ else:
     bad("服务的内容/路径不对: files=%r sha=%r" % (_lv("serve-files"), _lv("serve-sha")))
 
 _nft = re.findall(r"^nft (.*)$", _chlog, re.M)
-_ins = [i for i, x in enumerate(_nft)
-        if x == "insert rule inet pdg input ip saddr 172.22.0.0/16 tcp dport 8443 accept"]
-_res = [i for i, x in enumerate(_nft) if x == "-f /etc/nftables.conf"]
-if _ins and _res and _res[-1] > _ins[0]:
-    ok("放行只对内网卡段开 8443, 收尾时 nft -f 原样还原")
+# 放行改成**追加**(排在 tailscale0 排除之后)并带标记, 收尾按标记回查再精确删除 ——
+# 三样的行为验证在 tests/test-ios-offer-download-leak.py, 这里只钉住"通道确实这么干了"。
+_add = [i for i, x in enumerate(_nft)
+        if x.endswith("add rule inet pdg input ip saddr 172.22.0.0/16 tcp dport 8443 "
+                      "accept comment pdg-ios-offer")]
+_close = [i for i, x in enumerate(_nft) if x == "-a list chain inet pdg input"]
+if _add and _close and _close[-1] > _add[0]:
+    ok("放行只对内网卡段开 8443 且带标记, 收尾时按标记回查并撤除")
 else:
     bad("nft 动作不对: %r" % (_nft,))
 

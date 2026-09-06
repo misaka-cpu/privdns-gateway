@@ -606,6 +606,39 @@ jobs:
       - name: "iOS 描述文件交互 (Bot/CLI 同一份记录 + 不声称设备状态 + Android 全拒)"
         run: python3 tests/test-ios-profile-ux.py
 
+      - name: "iOS 临时下载通道收得回来 (HUP/EXIT 收尾 + 排在 tailnet 排除之后 + 按标记精确撤除)"
+        run: python3 tests/test-ios-offer-download-leak.py
+
+      - name: "iOS 临时下载通道 fail-closed 与会话所有权 (失败不假成功 / 第二条会话 BUSY)"
+        run: python3 tests/test-ios-offer-lifecycle.py
+
+      - name: "iOS 临时下载通道信号中止与服务所有权 (setup 三屏障 / 外来 200-302-代理 全拒)"
+        run: python3 tests/test-ios-offer-interrupt.py
+
+      - name: "iOS 调用方 staging fail-closed (mktemp -d 失败不得把描述文件生成到 /)"
+        run: python3 tests/test-ios-caller-staging.py
+
+      - name: "iOS 临时下载通道加固 (根路径不可枚举 / state 0600 原子落盘 / 孤儿身份核验 / 收尾不被二次信号打断)"
+        run: python3 tests/test-ios-offer-hardening.py
+
+      - name: "iOS 临时下载通道会话目录所有权 (真实调用方 SIGKILL / PID 已消失的过期孤儿 / state 删除失败)"
+        run: python3 tests/test-ios-offer-session.py
+
+      - name: "iOS 临时下载通道 pre-state 窗口与父目录信任顺序 (生成中/HTTP 已起未记录的 SIGKILL / 符号链接根不得被 chmod)"
+        run: python3 tests/test-ios-offer-prestate.py
+
+      - name: "iOS 临时下载通道回收判定 (存活生成者 / 身份未知≠已退出 / 枚举失败不当空集合)"
+        run: python3 tests/test-ios-offer-reaper.py
+
+      - name: "iOS 临时下载通道信号收尾停住本轮生成者 (HUP/INT/TERM 与整组 INT, 目录不得被重建)"
+        run: python3 tests/test-ios-offer-abortgen.py
+
+      - name: "iOS 临时通道停止失败有界返回 (停不住/状态读不到时保留现场, 不得无界 wait)"
+        run: python3 tests/test-ios-offer-stopfail.py
+
+      - name: "iOS 临时通道 HTTP 停不掉时保住恢复线索 (真 handler/回环随机口; 后继凭凭据回收)"
+        run: python3 tests/test-ios-offer-srvkeep.py
+
       - name: "iOS 描述文件身份持久性 (update/快照/备份恢复/平台来回切都不丢身份)"
         run: python3 tests/test-ios-profile-persist.py
 
