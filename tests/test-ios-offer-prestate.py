@@ -14,7 +14,17 @@
      别处的符号链接, `chmod` 先跟着它把**目标目录**的权限改掉, 校验才在后面说"不可信"。
      退出码是对的, 副作用已经造成了。
 
-屏障用文件标记, 不用 sleep 猜时序。
+屏障用文件标记, 不用 sleep 猜时序。**且"生成者已启动"不等于"生成者身份已登记"**:
+`_ios_offer_gen_run` 先写 `pending`, fork 之后才用 `_ios_offer_starttime` 取到 starttime
+回填 `pid=`/`start=`。生成器一 exec 就能写下 gen-started, 那一刻父 shell 可能还停在取
+starttime 那一步 —— 只等 gen-started 就发信号, 打中的往往是 pending 窗口, 于是后继按
+"身份尚不能确认"拒绝(这是产品的安全契约, 不是缺陷), 测试却把它读成红灯。
+
+所以窗口 1 改用**登记门**: 凭据里 pid= 与 start= 齐备、pid 等于夹具实际启动的那个生成器、
+start 与该进程 /proc 里的真实 starttime 一致、进程仍存活且停在屏障上 —— 缺一不可, 只匹配
+pid= 是弱判据。为了让这道门确定性地被考到, 窗口 1 用 PATH 上的 `cat` 桩给取 starttime 那
+一次读加一个**受控延迟**(纯测试侧, 产品不动)。
+pending 那个窗口本身没有被藏起来: 窗口 1b 用一个明确标注的隔离现场单独验它。
 """
 import hashlib, os, re, signal, socket, subprocess, sys, time
 from pathlib import Path
@@ -59,9 +69,10 @@ if [ "${1:-}" = "$CH_DIR/iosstate.py" ]; then
   out=""; prev=""
   for a in "$@"; do [ "$prev" = --out ] && out="$a"; prev="$a"; done
   [ "$(dirname "$out")" = "/" ] && { echo "REFUSED-ROOT $out" >> "$PDG_TEST_LOG"; exit 1; }
+  if [ "${PDG_TEST_BARRIER:-}" = gen ]; then echo "$$" > "$CH_DIR/genpid"; fi
   printf '%s' "$PDG_TEST_BODY" > "$out"
   if [ "${PDG_TEST_BARRIER:-}" = gen ]; then
-    echo "$$" > "$CH_DIR/genpid"; : > "$CH_DIR/gen-started"
+    : > "$CH_DIR/gen-started"
     sleep "${PDG_TEST_GEN_HOLD:-8}"
   fi
   exit 0
@@ -95,6 +106,23 @@ case "${*}" in
     fi ;;
 esac
 exec /usr/bin/chmod "$@"
+'''
+
+# 受控登记延迟: 只给"读生成器 pid 的 stat"那一次加延迟(即 _ios_offer_starttime 那一步),
+# 其余 cat 原样放过。纯测试侧的时序控制 —— 产品里不加任何注入开关。
+CAT_STUB = r'''#!/bin/bash
+# 延迟**本次会话第一次** /proc/<pid>/stat 读取。会话根目录是空的, 回收流程一次 proc_state
+# 也不会做, 所以那一次就是 _ios_offer_gen_run 里的 `_ios_offer_starttime "$gpid"` ——
+# 也就是登记窗口的正中央。不按 genpid 匹配: 那份文件由生成器自己写, 时间上晚于这次读取。
+if [ -n "${PDG_TEST_REG_DELAY:-}" ] && [ ! -e "$CH_DIR/reg-delayed" ]; then
+  case "${1:-}" in
+    /proc/[0-9]*/stat)
+      : > "$CH_DIR/reg-delayed"
+      echo "${1}" >> "$CH_DIR/catlog"
+      sleep "$PDG_TEST_REG_DELAY" ;;
+  esac
+fi
+exec /bin/cat "$@"
 '''
 
 OPENSSL_STUB = ('#!/bin/sh\nn=6\nfor a in "$@"; do n="$a"; done\n'
@@ -155,7 +183,7 @@ def mkcase(tag, fn="cmd_ios", **extra):
     for n, c in (("tmpl.mobileconfig", "<plist/>\n"), ("iosstate.py", "# stub\n")):
         with open(os.path.join(d, n), "w", encoding="utf-8") as f:
             f.write(c)
-    for name, s in (("nft", NFT_STUB), ("python3", PY_STUB),
+    for name, s in (("nft", NFT_STUB), ("python3", PY_STUB), ("cat", CAT_STUB),
                     ("mktemp", MKTEMP_STUB), ("chmod", CHMOD_STUB), ("openssl", OPENSSL_STUB),
                     ("qrencode", "#!/bin/sh\nexit 0\n")):
         p = os.path.join(b, name)
@@ -250,6 +278,54 @@ def alive(p):
     return os.path.exists("/proc/%d" % p)
 
 
+def starttime_of(pid):
+    try:
+        with open("/proc/%d/stat" % pid, "rb") as f:
+            return f.read().rsplit(b") ", 1)[1].split()[19].decode()
+    except (OSError, IndexError):
+        return None
+
+
+def wait_registered(env, d, genpid, limit=30.0):
+    """等到**本次会话的生成者身份确实登记完成**, 而不是等它"启动了"。
+
+    缺一不可: 凭据 pid= 与 start= 同时齐备且可解析; pid 等于夹具实际启动的那个生成器;
+    start 与该进程 /proc 里的真实 starttime 一致; 进程仍存活且停在本场景要求的屏障上。
+    只匹配 pid= 是弱判据 —— 半截记录、旧会话遗留的凭据都能蒙混过去。
+    返回 (是否满足, 最后一个未满足的具体条件)。
+    """
+    last = "会话目录还没出现"
+    end = time.time() + limit
+    while time.time() < end:
+        dirs = sess_dirs(env)
+        if len(dirs) != 1:
+            last = "会话目录 %d 个(期望 1)" % len(dirs)
+        elif not os.path.exists(os.path.join(d, "gen-started")):
+            last = "生成器还没到达屏障(gen-started 未出现)"
+        elif not alive(genpid):
+            last = "生成器 %d 已经不在了" % genpid
+        else:
+            txt = read(os.path.join(dirs[0], ".pdg-offer-gen"))
+            m_pid = re.search(r"^pid=(\d+)$", txt, re.M)
+            m_st = re.search(r"^start=(\d+)$", txt, re.M)
+            if not txt:
+                last = "生成者凭据还没落盘"
+            elif txt.strip() == "pending":
+                last = "凭据仍是 pending(登记未完成)"
+            elif not m_pid or not m_st:
+                last = "凭据不完整(缺 pid= 或 start=): %r" % txt.strip().replace("\n", "|")[:60]
+            elif int(m_pid.group(1)) != genpid:
+                last = ("凭据里的 pid=%s 不是本次夹具启动的生成器 %d"
+                        % (m_pid.group(1), genpid))
+            elif starttime_of(genpid) != m_st.group(1):
+                last = ("凭据 start=%s 与进程真实 starttime=%s 不符"
+                        % (m_st.group(1), starttime_of(genpid)))
+            else:
+                return True, ""
+        time.sleep(0.01)
+    return False, last
+
+
 def successor(env0, tag, **kw):
     d, e = mkcase(tag, CH_STDIN_HOLD=1, **kw)
     for k in ("PDG_TEST_CHAIN", "PDG_IOS_OFFER_LOCKFILE",
@@ -264,55 +340,137 @@ if connectable():
 ok("环境前提: 127.0.0.1:%d 空闲" % PORT)
 
 
-# ── 窗口 1: 目录已建、描述文件生成中 ─────────────────────────────────────
+# ── 窗口 1: 目录已建、生成者身份已登记, 随后父 shell 被 SIGKILL ─────────
+# 这一格测的是**生成者已经退出之后的回收**: 信号发出前先过登记门, 信号发出后不杀生成器、
+# 等它自己跑完, 再让后继会话来收。旧生成器仍活着时"后继先停写入方再删目录"那一条不在这里,
+# 由 tests/test-ios-offer-reaper.py 的 A 组负责。
 for fn, why in (("cmd_ios", "pdg ios"), ("cmd_ios_previous", "pdg ios previous")):
     d, env = mkcase("w1-" + fn, fn=fn, CH_STDIN_HOLD=40,
-                    PDG_TEST_BARRIER="gen", PDG_TEST_GEN_HOLD=8)
+                    PDG_TEST_BARRIER="gen", PDG_TEST_GEN_HOLD=8,
+                    PDG_TEST_REG_DELAY=3)
     p = launch(d, env)
-    hit = wait_file(os.path.join(d, "gen-started"))
-    if not hit:
-        bad("%s 窗口1: 生成屏障没命中, 这一格没测到东西" % why)
-        p.kill(); p.wait(timeout=10); continue
-    genpid = int(read(os.path.join(d, "genpid")).strip() or 0)
     try:
-        os.kill(int(read(os.path.join(d, "pid")).strip()), signal.SIGKILL)
-    except (OSError, ValueError):
-        pass
-    p.wait(timeout=20); time.sleep(0.3)
-    dirs = sess_dirs(env)
-    has_state = os.path.exists(env["PDG_IOS_OFFER_STATEFILE"])
-    gen_holds_fd6 = os.path.exists("/proc/%d/fd/6" % genpid) if genpid else False
-    lk_during = lock_free(env)
-    print("       %s 窗口1 前像: 会话目录=%s | state=%s | 生成子进程 %s 持 fd6=%s | 锁可取=%s"
-          % (why, [os.path.basename(x) for x in dirs] or "无", has_state,
-             genpid, gen_holds_fd6, lk_during))
+        if not wait_file(os.path.join(d, "gen-started")):
+            bad("%s 窗口1: 生成屏障没命中, 这一格没测到东西" % why)
+            continue
+        wait_for(lambda: read(os.path.join(d, "genpid")).strip().isdigit(), limit=15)
+        genpid = int(read(os.path.join(d, "genpid")).strip() or 0)
+        # **登记门**: 只等 gen-started 会打中 pending 窗口 —— 那时后继按"身份尚不能确认"
+        # 拒绝是产品的安全契约, 不是缺陷。这里等到身份真的登记完为止。
+        gated, why_not = wait_registered(env, d, genpid, limit=30)
+        delayed = read(os.path.join(d, "catlog")).strip()
+        if not delayed:
+            bad("%s 窗口1: 受控登记延迟没生效(cat 桩未被调用), 这一格没测到东西" % why)
+            continue
+        if delayed.splitlines()[0] != "/proc/%d/stat" % genpid:
+            bad("%s 窗口1: 延迟打在了 %s, 不是生成器 %d 的 starttime 读取, 这一格没测到东西"
+                % (why, delayed.splitlines()[0], genpid))
+            continue
+        if not gated:
+            bad("%s 窗口1: 登记门超时, 未满足的条件: %s" % (why, why_not))
+            continue
+        gen_txt = read(os.path.join(sess_dirs(env)[0], ".pdg-offer-gen")).strip().replace("\n", "|")
+        try:
+            os.kill(int(read(os.path.join(d, "pid")).strip()), signal.SIGKILL)
+        except (OSError, ValueError):
+            pass
+        p.wait(timeout=20); time.sleep(0.3)
+        dirs = sess_dirs(env)
+        has_state = os.path.exists(env["PDG_IOS_OFFER_STATEFILE"])
+        gen_holds_fd6 = os.path.exists("/proc/%d/fd/6" % genpid) if genpid else False
+        lk_during = lock_free(env)
+        print("       %s 窗口1 前像: 会话目录=%s | state=%s | 生成子进程 %s 持 fd6=%s | 锁可取=%s | 凭据=%s"
+              % (why, [os.path.basename(x) for x in dirs] or "无", has_state,
+                 genpid, gen_holds_fd6, lk_during, gen_txt))
+        probs = []
+        if len(dirs) != 1:
+            probs.append("会话目录 %d 个(期望 1)" % len(dirs))
+        # 目录一落盘就该有记录, 而且是 staging(只说"这个目录归本轮所有", 不含 pid)。
+        # 不能等 HTTP 起来才第一次记录所有权 —— 那正是这个窗口原本的真空。
+        st_txt = read(env["PDG_IOS_OFFER_STATEFILE"])
+        if not has_state:
+            probs.append("目录已落盘却没有任何所有权记录")
+        elif not re.search(r"^phase=staging$", st_txt, re.M):
+            probs.append("记录不是 staging 相: %r" % st_txt.replace("\n", "|")[:60])
+        elif re.search(r"^pid=[0-9]", st_txt, re.M):
+            probs.append("staging 记录里居然带了 pid —— 不完整的记录不该冒充运行期记录")
+        if gen_holds_fd6 or not lk_during:
+            probs.append("生成子进程继承了会话锁 fd 6, 父 shell 死后锁仍被占")
+        # 等生成子进程自己结束(不杀它), 再让后继会话跑
+        wait_for(lambda: not (genpid and alive(genpid)), limit=25)
+        # 锁必须真的可取, 否则后继的 BUSY 会冒充"按身份拒绝", 把这一格测成别的东西。
+        if not lock_free(env):
+            bad("%s 窗口1: 生成者退出后会话锁仍被占 —— 夹具残留, 这一格没测到东西" % why)
+            continue
+        r = successor(env, "w1s-" + fn)
+        left = [x for x in dirs if os.path.isdir(x)]
+        if left:
+            probs.append("后继会话跑完后旧目录仍在: %s" % [os.path.basename(x) for x in left])
+        if r["rc"] != 0:
+            probs.append("后继会话没能开通(rc=%s); 后继输出: %s"
+                         % (r["rc"], r["out"].strip().replace("\n", " | ")[:240]))
+        if probs:
+            bad("%s 登记完成后被 SIGKILL: %s" % (why, "; ".join(probs)))
+        else:
+            ok("%s 登记完成后被 SIGKILL → 生成子进程不持锁; 它自行退出后, "
+               "后继会话收走旧目录并正常开通" % why)
+    finally:
+        if p.poll() is None:
+            p.kill(); p.wait(timeout=10)
+        wait_for(lambda: not connectable(), limit=10)
+
+
+# ── 窗口 1b: 登记未完成(pending) —— 明确标注的隔离现场 ───────────────────
+# 上面那道登记门只是把"发信号时机"钉死, 它不该把 pending 这个真实窗口藏起来。这一格
+# 直接手工造出该窗口的盘上形态(不启动任何生成者进程, 现场完全隔离), 验产品的安全契约:
+# 身份证不明就不动 —— 不杀、不删、不清记录, 而且非零退出并说明原因。
+d0, env0 = mkcase("w1b", CH_STDIN_HOLD=1)
+root = env0["PDG_IOS_OFFER_ROOT"]
+os.makedirs(root, mode=0o700, exist_ok=True)
+sid = "0123456789abcdef"
+wdir = os.path.join(root, "s." + sid)
+os.makedirs(wdir, mode=0o700)
+with open(os.path.join(wdir, ".pdg-offer-session"), "w", encoding="utf-8") as f:
+    f.write(sid)
+os.chmod(os.path.join(wdir, ".pdg-offer-session"), 0o600)
+with open(os.path.join(wdir, "aaaaaaaaaaaa.mobileconfig"), "w", encoding="utf-8") as f:
+    f.write("<plist/>\n")
+genf = os.path.join(wdir, ".pdg-offer-gen")
+with open(genf, "w", encoding="utf-8") as f:
+    f.write("pending\n")                      # 产品在 fork 之前写下的那一行, 原样复刻
+os.chmod(genf, 0o600)
+with open(env0["PDG_IOS_OFFER_STATEFILE"], "w", encoding="utf-8") as f:
+    f.write("phase=staging\nsid=%s\npid=\nstart=\nwww=%s\n" % (sid, wdir))
+os.chmod(env0["PDG_IOS_OFFER_STATEFILE"], 0o600)
+pre = {"dir": os.path.isdir(wdir), "sent": os.path.exists(os.path.join(wdir, ".pdg-offer-session")),
+       "gen": read(genf).strip(), "state": os.path.exists(env0["PDG_IOS_OFFER_STATEFILE"])}
+print("       窗口1b 前像(隔离现场, 无任何生成者进程): 目录=%s | sentinel=%s | 凭据=%r | staging state=%s"
+      % (pre["dir"], pre["sent"], pre["gen"], pre["state"]))
+if not (pre["dir"] and pre["sent"] and pre["gen"] == "pending" and pre["state"]):
+    bad("窗口1b: 隔离现场没造出来, 这一格没测到东西")
+elif not lock_free(env0):
+    bad("窗口1b: 会话锁不可取, 这一格没测到东西")
+else:
+    rb = successor(env0, "w1bs")
     probs = []
-    if len(dirs) != 1:
-        probs.append("会话目录 %d 个(期望 1)" % len(dirs))
-    # 目录一落盘就该有记录, 而且是 staging(只说"这个目录归本轮所有", 不含 pid)。
-    # 不能等 HTTP 起来才第一次记录所有权 —— 那正是这个窗口原本的真空。
-    st_txt = read(env["PDG_IOS_OFFER_STATEFILE"])
-    if not has_state:
-        probs.append("目录已落盘却没有任何所有权记录")
-    elif not re.search(r"^phase=staging$", st_txt, re.M):
-        probs.append("记录不是 staging 相: %r" % st_txt.replace("\n", "|")[:60])
-    elif re.search(r"^pid=[0-9]", st_txt, re.M):
-        probs.append("staging 记录里居然带了 pid —— 不完整的记录不该冒充运行期记录")
-    if gen_holds_fd6 or not lk_during:
-        probs.append("生成子进程继承了会话锁 fd 6, 父 shell 死后锁仍被占")
-    # 等生成子进程自己结束(不杀它), 再让后继会话跑
-    wait_for(lambda: not (genpid and alive(genpid)), limit=25)
-    r = successor(env, "w1s-" + fn)
-    left = [x for x in dirs if os.path.isdir(x)]
-    if left:
-        probs.append("后继会话跑完后旧目录仍在: %s" % [os.path.basename(x) for x in left])
-    if r["rc"] != 0:
-        probs.append("后继会话没能开通(rc=%s)" % r["rc"])
+    if rb["rc"] == 0:
+        probs.append("后继返回 0 —— 把「身份不能确认」当成了已回收/已开通")
+    if not re.search(r"身份无法确认|尚未登记|损坏", rb["out"]):
+        probs.append("拒绝了却没说明身份尚不能确认; 输出: %s"
+                     % rb["out"].strip().replace("\n", " | ")[:240])
+    if not os.path.isdir(wdir):
+        probs.append("会话目录被删了")
+    if read(genf).strip() != "pending":
+        probs.append("pending 凭据被改动或删除")
+    if not os.path.exists(os.path.join(wdir, ".pdg-offer-session")):
+        probs.append("sentinel 被删了")
+    if not os.path.exists(env0["PDG_IOS_OFFER_STATEFILE"]):
+        probs.append("恢复用的 staging 记录被删了")
     if probs:
-        bad("%s 在生成中被 SIGKILL: %s" % (why, "; ".join(probs)))
+        bad("登记未完成(pending)的窗口: " + "; ".join(probs))
     else:
-        ok("%s 在生成中被 SIGKILL → 生成子进程不持锁, 后继会话收走旧目录并正常开通" % why)
-    wait_for(lambda: not connectable(), limit=10)
+        ok("登记未完成(pending) → 后继非零退出并说明身份尚不能确认; "
+           "目录/sentinel/pending 凭据/staging 记录一样不动")
 
 
 # ── 窗口 2: HTTP 已起、运行期记录尚未落盘 ────────────────────────────────
