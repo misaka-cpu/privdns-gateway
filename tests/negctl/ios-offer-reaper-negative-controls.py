@@ -27,7 +27,7 @@ import tmpguard          # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 PDG = "deploy/bot/pdg.sh"
-TOUCHED = [ROOT / PDG]
+TOUCHED = [ROOT / PDG, ROOT / "tests/test-ios-offer-reaper.py"]
 PASS, FAIL = [0], [0]
 def ok(m):  PASS[0] += 1; print("[OK]   %s" % m)
 def bad(m): FAIL[0] += 1; print("[FAIL] %s" % m)
@@ -57,6 +57,18 @@ LIST_FN = lift(r'^  out="\$\(find "\$1" -mindepth 1 -maxdepth 1 -print 2>/dev/nu
 DIROK_2 = lift(r'^  listing="\$\(_ios_offer_list "\$dir"\)" \|\| return 2$')
 REAP_UNKNOWN = lift(r'^    \*\)\n      echo "❌ 上一轮临时下载服务的身份无法确认.*?^      return 1 ;;$')
 
+T_REAP_FILE = "tests/test-ios-offer-reaper.py"
+REAP_TEXT = (ROOT / T_REAP_FILE).read_text(encoding="utf-8")
+
+def lift_reap(pattern, flags=re.M | re.S):
+    '''同样的取法, 但锚点在**正控自己**身上 —— A 组的登记门属于夹具。'''
+    m = re.search(pattern, REAP_TEXT, flags)
+    assert m, pattern
+    assert REAP_TEXT.count(m.group(0)) == 1, pattern
+    return m.group(0)
+
+A_GATE = lift_reap(r"^    gated, why_not = wait_registered\(env, d, genpid, limit=30\)$")
+
 MUT = [
     ("① 生成器不登记身份",
      [(GEN_REG, "  :  # 变异: 不登记生成者身份", 1)], [T_REAP]),
@@ -73,6 +85,12 @@ MUT = [
      [T_REAP]),
     ("⑦ 目录内容枚举失败退化成「不是我们的」",
      [(DIROK_2, '  listing="$(_ios_offer_list "$dir")" || return 1  # 变异', 1)], [T_REAP]),
+    # ⑨ 改的是**正控自己的夹具**: A 组靠登记门决定何时发 SIGKILL。退回"只等 gen-started"
+    # 之后, 受控登记延迟让信号确定性地落在 pending 窗口, 后继按"身份尚不能确认"拒绝 ——
+    # A 组要测的"先停住还活着的写入方再删目录"根本考不到。
+    ("⑨ A 组屏障退回「只等 gen-started」",
+     [(A_GATE, '    gated, why_not = (True, "")  # 变异: 不再等身份登记完成',
+       1, T_REAP_FILE)], [T_REAP]),
     ("⑧ 只加无关注释(反向对照)",
      [(GEN_PENDING, "  # 变异: 一条无关注释\n" + GEN_PENDING, 1)], [T_REAP, T_PRE]),
 ]
@@ -83,8 +101,8 @@ wd = tmpguard.mkdtemp(prefix="pdg-iosrp-negctl.")
 try:
     for sub in ("tests", "deploy", "lib"):
         shutil.copytree(ROOT / sub, Path(wd) / sub, dirs_exist_ok=True)
-    target = Path(wd) / PDG
-    pristine = target.read_text(encoding="utf-8")
+    targets_files = {PDG: Path(wd) / PDG, T_REAP_FILE: Path(wd) / T_REAP_FILE}
+    pristine_files = {k: v.read_text(encoding="utf-8") for k, v in targets_files.items()}
 
     def suite(cmds):
         out = ""
@@ -99,21 +117,33 @@ try:
         raise SystemExit(1)
     ok("基线绿: 两支正控在未改坏的副本上 0 条具名失败")
 
+    def restore():
+        for k, v in targets_files.items():
+            v.write_text(pristine_files[k], encoding="utf-8")
+
     for label, edits, targets in MUT:
-        mutated, aborted = pristine, False
-        for old, new, want in edits:
-            hits = mutated.count(old)
+        work = dict(pristine_files)
+        aborted = False
+        for e in edits:
+            old, new, want = e[0], e[1], e[2]
+            where = e[3] if len(e) > 3 else PDG
+            hits = work[where].count(old)
             if hits != want:
-                bad("%s → 锚点命中 %d 次, 预期 %d" % (label, hits, want)); aborted = True; break
+                bad("%s → 锚点在 %s 命中 %d 次, 预期 %d" % (label, where, hits, want))
+                aborted = True; break
             if new == old:
                 bad("%s → 改坏器空转: 替换文本与原文一字不差" % label); aborted = True; break
-            mutated = mutated.replace(old, new, 1)
+            work[where] = work[where].replace(old, new, 1)
         if aborted: continue
-        target.write_text(mutated, encoding="utf-8")
-        if run(["bash", "-n", str(target)], cwd=wd).returncode != 0:
-            bad("%s → 改坏后语法不合法" % label); target.write_text(pristine, encoding="utf-8"); continue
+        for k, v in targets_files.items():
+            v.write_text(work[k], encoding="utf-8")
+        if run(["bash", "-n", str(targets_files[PDG])], cwd=wd).returncode != 0:
+            bad("%s → 改坏后 pdg.sh 语法不合法" % label); restore(); continue
+        if run(["python3", "-c", "import ast,sys; ast.parse(open(sys.argv[1]).read())",
+                str(targets_files[T_REAP_FILE])], cwd=wd).returncode != 0:
+            bad("%s → 改坏后正控语法不合法" % label); restore(); continue
         added = suite(targets) - base
-        target.write_text(pristine, encoding="utf-8")
+        restore()
         if label.startswith("⑧"):
             (ok if not added else bad)("%s → %d 条新增(应为 0)" % (label, len(added))); continue
         real = [a for a in added if "没测到东西" not in a and "夹具没跑" not in a
@@ -129,7 +159,7 @@ finally:
     shutil.rmtree(wd, ignore_errors=True)
 
 clean = all(sha(p) == before[p] and os.stat(p).st_mode == modes[p] for p in TOUCHED)
-(ok if clean else bad)("正式树未被污染: pdg.sh sha256 与 mode 均一致" if clean else "正式树被改动了!")
+(ok if clean else bad)("正式树未被污染: pdg.sh 与正控 sha256/mode 均一致" if clean else "正式树被改动了!")
 print("-" * 62)
 print("ios-offer-reaper-negative-controls.py: 通过 %d, 失败 %d" % (PASS[0], FAIL[0]))
 sys.exit(1 if FAIL[0] else 0)
