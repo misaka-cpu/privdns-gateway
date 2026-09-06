@@ -473,6 +473,50 @@ else:
            "目录/sentinel/pending 凭据/staging 记录一样不动")
 
 
+# ── 窗口 1c: 登记门自身的判据 ───────────────────────────────────────────
+# 上面两格靠这道门决定"什么时候发信号"。门若放宽, 它们会重新退化成只等进程启动, 而且
+# 退化得悄无声息。这里直接喂给 wait_registered 几份合成凭据, 逐条验它认什么、不认什么。
+d1c, env1c = mkcase("w1c", CH_STDIN_HOLD=1)
+root1c = env1c["PDG_IOS_OFFER_ROOT"]
+os.makedirs(root1c, mode=0o700, exist_ok=True)
+sid1c = "fedcba9876543210"
+w1c = os.path.join(root1c, "s." + sid1c)
+os.makedirs(w1c, mode=0o700)
+open(os.path.join(d1c, "gen-started"), "w").close()
+helper = subprocess.Popen(["/usr/bin/sleep", "60"])
+other = subprocess.Popen(["/usr/bin/sleep", "60"])
+gf1c = os.path.join(w1c, ".pdg-offer-gen")
+try:
+    hs = starttime_of(helper.pid)
+    os_ = starttime_of(other.pid)
+    cases = [
+        ("pending(登记未完成)", "pending\n", False, "pending"),
+        ("只有 pid= 的半截凭据", "pid=%d\n" % helper.pid, False, "凭据不完整"),
+        ("pid 指向别的进程", "pid=%d\nstart=%s\n" % (other.pid, os_), False, "不是本次夹具启动的"),
+        ("start 与真实 starttime 不符", "pid=%d\nstart=%s\n" % (helper.pid, int(hs) + 7),
+         False, "与进程真实 starttime"),
+        ("完整且一致", "pid=%d\nstart=%s\n" % (helper.pid, hs), True, ""),
+    ]
+    probs = []
+    for name, body, want_ok, want_why in cases:
+        with open(gf1c, "w", encoding="utf-8") as f:
+            f.write(body)
+        got_ok, got_why = wait_registered(env1c, d1c, helper.pid, limit=1.0)
+        if got_ok != want_ok:
+            probs.append("%s: 门%s了(应%s)" % (name, "放行" if got_ok else "拦下",
+                                              "放行" if want_ok else "拦下"))
+        elif not want_ok and want_why not in got_why:
+            probs.append("%s: 拦下了但理由不对: %s" % (name, got_why))
+    if probs:
+        bad("登记门判据: " + "; ".join(probs))
+    else:
+        ok("登记门判据: pending / 半截 pid= / pid 不匹配 / start 不符 一律拦下并点名原因, "
+           "只有完整且与真实进程一致才放行")
+finally:
+    for h in (helper, other):
+        h.kill(); h.wait(timeout=10)
+
+
 # ── 窗口 2: HTTP 已起、运行期记录尚未落盘 ────────────────────────────────
 d2, env2 = mkcase("w2", CH_STDIN_HOLD=40, PDG_TEST_BARRIER="state", PDG_TEST_STATE_HOLD=8)
 p2 = launch(d2, env2)
