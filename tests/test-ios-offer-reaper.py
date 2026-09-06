@@ -531,7 +531,12 @@ for why, dc, ec, target, helper in B_CASES:
 
 # ④ 真正已退出 + 归属完整 → 正常回收
 dB4, eB4 = mkcase("B4", fn="_ios_offer_reap_orphan", CH_STDIN_HOLD=1)
-h4 = spawn_helper(eB4["PDG_IOS_OFFER_ROOT"] if os.path.isdir(eB4["PDG_IOS_OFFER_ROOT"]) else "/tmp")
+# helper 的 cwd 用本场景自己的沙箱(tmpguard 建的, 此刻已存在、退出时统一清)。
+# 原来那句在 PDG_IOS_OFFER_ROOT 还没被产品建出来时会退到写死的 /tmp —— 并发跑必然
+# 互相踩, 而且踩中了 tests/test-tmp-hygiene.py 的字面量 /tmp 守卫。
+# 这一格与 cwd 无关: helper 在产品跑起来之前就已经被 kill+wait 回收, 产品看到的是
+# /proc/<pid> 根本不在(gone), 判据不读 cwd。
+h4 = spawn_helper(dB4)
 h4pid, h4start = h4.pid, starttime_of(h4.pid)
 h4.kill(); h4.wait(timeout=10)
 wait_for(lambda: not alive(h4pid), limit=10)
