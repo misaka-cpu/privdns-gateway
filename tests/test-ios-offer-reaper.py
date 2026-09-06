@@ -345,6 +345,17 @@ if connectable():
 ok("环境前提: 127.0.0.1:%d 空闲" % PORT)
 
 
+
+# 登记门超时的两种成因必须分开: 凭据一直不完整/不一致, 说明**产品没有登记生成者身份**
+# —— 那是契约失败, 要具名报红; 而目录没出现、生成器提前没了、没到屏障, 才是夹具问题。
+# 混在一起写成"这一格没测到东西", 会把真的产品退化悄悄吞掉。
+GATE_PRODUCT_REASONS = ("凭据仍是 pending", "凭据不完整", "生成者凭据还没落盘",
+                        "不是本次夹具启动的生成器", "与进程真实 starttime")
+
+
+def gate_is_product_fault(why_not):
+    return any(k in why_not for k in GATE_PRODUCT_REASONS)
+
 # ── A: 生成子进程活得比回收更久 ─────────────────────────────────────────
 for fn, why in (("cmd_ios", "pdg ios"), ("cmd_ios_previous", "pdg ios previous")):
     d, env = mkcase("A-" + fn, fn=fn, CH_STDIN_HOLD=60,
@@ -358,6 +369,19 @@ for fn, why in (("cmd_ios", "pdg ios"), ("cmd_ios_previous", "pdg ios previous")
     # **登记门**: 只等 gen-started 会打中 pending 窗口, 那时后继按"身份尚不能确认"拒绝 ——
     # 那是产品的安全契约, 不是这一组要测的东西。等到身份真的登记完再发信号。
     gated, why_not = wait_registered(env, d, genpid, limit=30)
+    # 顺序要紧: **先判登记门**。门没过而且原因出在凭据上, 那就是产品没登记身份 —— 此时
+    # 受控延迟可能根本没机会触发(取 starttime 那一步整个不见了), 若先要求"延迟必须打过",
+    # 真的产品退化会被写成"这一组没测到东西"而悄悄吞掉。
+    if not gated:
+        if gate_is_product_fault(why_not):
+            bad("%s: 生成者已启动, 却始终没有登记出可用的身份凭据 —— %s" % (why, why_not))
+        else:
+            bad("%s: 登记门超时(夹具原因), 未满足的条件: %s —— 这一组没测到东西"
+                % (why, why_not))
+        p.kill(); p.wait(timeout=10)
+        try: os.kill(genpid, signal.SIGKILL)
+        except OSError: pass
+        continue
     delayed = read(os.path.join(d, "catlog")).strip()
     if not delayed:
         bad("%s: 受控登记延迟没生效(cat 桩未被调用), 这一组没测到东西" % why)
@@ -372,12 +396,6 @@ for fn, why in (("cmd_ios", "pdg ios"), ("cmd_ios_previous", "pdg ios previous")
         try: os.kill(genpid, signal.SIGKILL)
         except OSError: pass
         continue
-    if not gated:
-        bad("%s: 登记门超时, 未满足的条件: %s" % (why, why_not))
-        p.kill(); p.wait(timeout=10)
-        try: os.kill(genpid, signal.SIGKILL)
-        except OSError: pass
-        continue
     gen_txt = read(os.path.join(sess_dirs(env)[0], ".pdg-offer-gen")).strip().replace("\n", "|")
     try:
         os.kill(int(read(os.path.join(d, "pid")).strip()), signal.SIGKILL)
@@ -386,7 +404,9 @@ for fn, why in (("cmd_ios", "pdg ios"), ("cmd_ios_previous", "pdg ios previous")
     p.wait(timeout=20); time.sleep(0.2)
     pre_dirs = sess_dirs(env)
     gen_alive = alive(genpid)
-    lk = lock_free(env)
+    # 有界等待, 不做瞬时快照: 受控延迟期间 `_ios_offer_starttime` 跑在 `$( )` 里, 那个
+    # 命令替换子 shell 也持有 fd 6, 父 shell 被强杀后它还要把 sleep 走完才退出。
+    lk = wait_for(lambda: lock_free(env), limit=15)
     print("       %s 前像: 会话目录=%s | 生成器 %d 仍存活=%s | 凭据=%s | 锁可取=%s"
           % (why, [os.path.basename(x) for x in pre_dirs] or "无", genpid, gen_alive,
              gen_txt, lk))

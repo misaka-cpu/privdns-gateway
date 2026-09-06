@@ -340,6 +340,17 @@ if connectable():
 ok("环境前提: 127.0.0.1:%d 空闲" % PORT)
 
 
+
+# 登记门超时的两种成因必须分开: 凭据一直不完整/不一致, 说明**产品没有登记生成者身份**
+# —— 那是契约失败, 要具名报红; 而目录没出现、生成器提前没了、没到屏障, 才是夹具问题。
+# 混在一起写成"这一格没测到东西", 会把真的产品退化悄悄吞掉。
+GATE_PRODUCT_REASONS = ("凭据仍是 pending", "凭据不完整", "生成者凭据还没落盘",
+                        "不是本次夹具启动的生成器", "与进程真实 starttime")
+
+
+def gate_is_product_fault(why_not):
+    return any(k in why_not for k in GATE_PRODUCT_REASONS)
+
 # ── 窗口 1: 目录已建、生成者身份已登记, 随后父 shell 被 SIGKILL ─────────
 # 这一格测的是**生成者已经退出之后的回收**: 信号发出前先过登记门, 信号发出后不杀生成器、
 # 等它自己跑完, 再让后继会话来收。旧生成器仍活着时"后继先停写入方再删目录"那一条不在这里,
@@ -358,6 +369,16 @@ for fn, why in (("cmd_ios", "pdg ios"), ("cmd_ios_previous", "pdg ios previous")
         # **登记门**: 只等 gen-started 会打中 pending 窗口 —— 那时后继按"身份尚不能确认"
         # 拒绝是产品的安全契约, 不是缺陷。这里等到身份真的登记完为止。
         gated, why_not = wait_registered(env, d, genpid, limit=30)
+        # 顺序要紧: **先判登记门**。门没过而且原因出在凭据上, 那就是产品没登记身份 ——
+        # 此时受控延迟可能根本没机会触发(比如取 starttime 那一步整个不见了), 若先要求
+        # "延迟必须打过", 真的产品退化会被写成"这一格没测到东西"而悄悄吞掉。
+        if not gated:
+            if gate_is_product_fault(why_not):
+                bad("%s: 生成者已启动, 却始终没有登记出可用的身份凭据 —— %s" % (why, why_not))
+            else:
+                bad("%s 窗口1: 登记门超时(夹具原因), 未满足的条件: %s —— 这一格没测到东西"
+                    % (why, why_not))
+            continue
         delayed = read(os.path.join(d, "catlog")).strip()
         if not delayed:
             bad("%s 窗口1: 受控登记延迟没生效(cat 桩未被调用), 这一格没测到东西" % why)
@@ -365,9 +386,6 @@ for fn, why in (("cmd_ios", "pdg ios"), ("cmd_ios_previous", "pdg ios previous")
         if delayed.splitlines()[0] != "/proc/%d/stat" % genpid:
             bad("%s 窗口1: 延迟打在了 %s, 不是生成器 %d 的 starttime 读取, 这一格没测到东西"
                 % (why, delayed.splitlines()[0], genpid))
-            continue
-        if not gated:
-            bad("%s 窗口1: 登记门超时, 未满足的条件: %s" % (why, why_not))
             continue
         gen_txt = read(os.path.join(sess_dirs(env)[0], ".pdg-offer-gen")).strip().replace("\n", "|")
         try:
@@ -378,7 +396,7 @@ for fn, why in (("cmd_ios", "pdg ios"), ("cmd_ios_previous", "pdg ios previous")
         dirs = sess_dirs(env)
         has_state = os.path.exists(env["PDG_IOS_OFFER_STATEFILE"])
         gen_holds_fd6 = os.path.exists("/proc/%d/fd/6" % genpid) if genpid else False
-        lk_during = lock_free(env)
+        lk_during = wait_for(lambda: lock_free(env), limit=15)
         print("       %s 窗口1 前像: 会话目录=%s | state=%s | 生成子进程 %s 持 fd6=%s | 锁可取=%s | 凭据=%s"
               % (why, [os.path.basename(x) for x in dirs] or "无", has_state,
                  genpid, gen_holds_fd6, lk_during, gen_txt))
@@ -399,7 +417,9 @@ for fn, why in (("cmd_ios", "pdg ios"), ("cmd_ios_previous", "pdg ios previous")
         # 等生成子进程自己结束(不杀它), 再让后继会话跑
         wait_for(lambda: not (genpid and alive(genpid)), limit=25)
         # 锁必须真的可取, 否则后继的 BUSY 会冒充"按身份拒绝", 把这一格测成别的东西。
-        if not lock_free(env):
+        # 有界等待, 不做瞬时快照: 受控延迟期间 `_ios_offer_starttime` 跑在 `$( )` 里,
+        # 那个命令替换子 shell 也持有 fd 6, 父 shell 被强杀后它还要把 sleep 走完才退出。
+        if not wait_for(lambda: lock_free(env), limit=15):
             bad("%s 窗口1: 生成者退出后会话锁仍被占 —— 夹具残留, 这一格没测到东西" % why)
             continue
         r = successor(env, "w1s-" + fn)
