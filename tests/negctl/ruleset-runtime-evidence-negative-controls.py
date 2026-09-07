@@ -53,10 +53,10 @@ def lift(pattern, max_lines=20, flags=re.M | re.S):
     return g
 
 UNAVAIL   = lift(r'^    provs, why = _clash_rule_providers\(\)\n    if provs is None:\n.*?^                              % \(len\(meta\), why\)\)$')
-MISSING   = lift(r'^    if missing:\n        return \("fail", name, "这些规则集在配置里声明了.*?可达。"\)$')
-EMPTY     = lift(r'^    if empty:\n        return \("fail", name, "这些规则集在运行期.*?重建。"\)$')
-LOOPBACK  = lift(r'^    if host not in \("127\.0\.0\.1", "::1", "localhost", ""\):\n        return None, "external-controller 不在回环 —— 本项不主动连非回环管理端口"$')
-INCOMPL   = lift(r'^    if incomplete:\n        # 字段缺了.*?incomplete\[:6\]\)\)\)$')
+MISSING   = lift(r'^    if missing:\n        return \("fail", name, "这些规则集在配置里声明了.*?可达。" \+ note\)$')
+EMPTY     = lift(r'^    if empty:\n        return \("fail", name, "这些规则集在运行期.*?重建。" \+ note\)$')
+LOOPBACK  = lift(r'^    is_loop = host in \("::1", "localhost"\).*?\n    if not is_loop:\n        return None, "external-controller 不在回环 —— 本项不主动连非回环管理端口"$')
+INCOMPL   = lift(r'^    if incomplete:\n        # 没有确定性失败.*?incomplete\[:6\]\)\)\)$')
 
 MUT = [
     ("① 读不到管理面时退回 ok",
@@ -68,7 +68,7 @@ MUT = [
     ("③ ruleCount==0 放过",
      [(EMPTY, '    if False:  # 变异: 0 条也放过\n        pass', 1)]),
     ("④ 去掉回环限制(会去连非回环控制面)",
-     [(LOOPBACK, '    if False:\n        return None, "x"  # 变异: 不再限制回环', 1)]),
+     [(LOOPBACK, '    is_loop = True  # 变异: 不再限制回环\n    if not is_loop:\n        return None, "x"', 1)]),
     ("⑤ 缺 ruleCount 当成通过",
      [(INCOMPL, '    if False:  # 变异: 字段缺失也当证据齐全\n        pass', 1)]),
     ("⑥ 只加无关注释(反向对照)",
