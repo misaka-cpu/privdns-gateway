@@ -55,7 +55,9 @@ def lift(pattern, max_lines=20, flags=re.M | re.S):
 UNAVAIL   = lift(r'^    provs, why = _clash_rule_providers\(\)\n    if provs is None:\n.*?^                              % \(len\(meta\), why\)\)$')
 MISSING   = lift(r'^    if missing:\n        return \("fail", name, "这些规则集在配置里声明了.*?可达。" \+ note\)$')
 EMPTY     = lift(r'^    if empty:\n        return \("fail", name, "这些规则集在运行期.*?重建。" \+ note\)$')
-LOOPBACK  = lift(r'^    is_loop = host in \("::1", "localhost"\).*?\n    if not is_loop:\n        return None, "external-controller 不在回环 —— 本项不主动连非回环管理端口"$')
+# v1.11.13+ 的地址门改成了"严格解析数字 IP 再看 is_loopback"(不再有 is_loop 变量),
+# 锚点跟着挪到 `if not ip.is_loopback:` 这两行。
+LOOPBACK  = lift(r'^    if not ip\.is_loopback:\n        return None, "external-controller 不在回环 —— 本项不主动连非回环管理端口"$')
 INCOMPL   = lift(r'^    if incomplete:\n        # 没有确定性失败.*?incomplete\[:6\]\)\)\)$')
 
 MUT = [
@@ -68,7 +70,7 @@ MUT = [
     ("③ ruleCount==0 放过",
      [(EMPTY, '    if False:  # 变异: 0 条也放过\n        pass', 1)]),
     ("④ 去掉回环限制(会去连非回环控制面)",
-     [(LOOPBACK, '    is_loop = True  # 变异: 不再限制回环\n    if not is_loop:\n        return None, "x"', 1)]),
+     [(LOOPBACK, '    if False:  # 变异: 不再限制回环\n        return None, "x"', 1)]),
     ("⑤ 缺 ruleCount 当成通过",
      [(INCOMPL, '    if False:  # 变异: 字段缺失也当证据齐全\n        pass', 1)]),
     ("⑥ 只加无关注释(反向对照)",
