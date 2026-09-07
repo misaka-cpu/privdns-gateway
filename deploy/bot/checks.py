@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """PrivDNS Gateway 只读检查库。doctor.py 跑全部, healthcheck.py 跑子集。
 每个 check() 返回 (level, label, detail), level ∈ 'ok'|'warn'|'fail'|'info'。只读, 不改任何东西。"""
-import os, re, json, hashlib, ipaddress, platform, subprocess, sys, urllib.request
+import os, re, json, hashlib, ipaddress, platform, subprocess, sys, urllib.request, urllib.error
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import nftscan  # noqa: E402  与迁移前置门共用的 input 链冲突判据(单一来源)
@@ -1860,10 +1860,20 @@ def check_mitm():
 # 只做 GET, 只在**回环**地址上做。判据宁可"无结论"也不主动去连非回环的管理端口:
 # 那是控制面, 能改配置、切出站, 不该由一条自检去外连。
 def _clash_ctrl():
-    """解析 mihomo 的 external-controller。回环才给 base_url。
+    """解析 mihomo 的 external-controller。回环才给 base_url, **且地址族原样保留**。
 
     返回 (base_url, why)。base_url 为 None 时 why 说明为什么没有结论。
-    配置既可能是 JSON 形态(带引号的键)也可能是 YAML, 所以按文本抽, 不引 yaml 依赖。"""
+    配置既可能是 JSON 形态(带引号的键)也可能是 YAML, 所以按文本抽, 不引 yaml 依赖。
+
+    地址契约(逐种写清, 不做静默替换 —— 换一个地址就可能换成**另一个监听实例**):
+      · `127.0.0.1:P` / 其它 `127.x.y.z:P` → 回环, 原样用;
+      · `[::1]:P`                          → 回环, 原样用(URL 里保留方括号);
+      · `localhost:P`                      → 原样用 `localhost`, 由解析器决定 v4/v6;
+                                             我们不替它挑一个, 那是替用户改接收端;
+      · `:P`(空 host, 即通配监听)          → **无结论**: 通配不等于回环, 不能假定连上的是本机
+                                             那个实例;
+      · 其它主机名或非回环地址             → 无结论, 不主动连。
+    仓库渲染器生成的是 `127.0.0.1:9090`(见 deploy/bot/sb2mihomo.py), 正常机器落在第一条。"""
     try:
         txt = open(MIHOMO_CFG, encoding="utf-8", errors="replace").read()
     except OSError as e:
@@ -1872,13 +1882,27 @@ def _clash_ctrl():
     m = re.search(r'(?:^|[{,\s])"?external-controller"?\s*:\s*"?([^"\s,}]+)"?', txt, re.M)
     if not m:
         return None, "mihomo 未配置 external-controller"
-    host, _, port = m.group(1).strip().rpartition(":")
-    host = (host or "127.0.0.1").strip("[]")
+    raw = m.group(1).strip()
+    # `[v6]:port` 与 `host:port` 分开切, 否则 IPv6 里的冒号会把地址切碎。
+    if raw.startswith("["):
+        end = raw.find("]")
+        if end < 0:
+            return None, "external-controller 形态不可解析"
+        host, rest = raw[1:end], raw[end + 1:]
+        port = rest[1:] if rest.startswith(":") else ""
+        literal = "[%s]" % host
+    else:
+        host, _, port = raw.rpartition(":")
+        literal = host
     if not port.isdigit():
         return None, "external-controller 形态不可解析"
-    if host not in ("127.0.0.1", "::1", "localhost", ""):
+    if host == "":
+        return None, ("external-controller 是通配监听(:%s) —— 通配不等于回环, "
+                      "本项不据此假定连到的是本机实例" % port)
+    is_loop = host in ("::1", "localhost") or re.match(r"^127\.\d+\.\d+\.\d+$", host)
+    if not is_loop:
         return None, "external-controller 不在回环 —— 本项不主动连非回环管理端口"
-    return "http://127.0.0.1:%s" % port, ""
+    return "http://%s:%s" % (literal, port), ""
 
 
 def _clash_secret():
@@ -1897,8 +1921,30 @@ def _clash_secret():
         return ""
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """不跟随任何重定向。
+
+    我们带着 `Authorization` 去问管理面, 而默认 opener 会自动请求 Location —— 那等于把凭据
+    交给**另一个接收端**。这里让重定向直接变成错误, 由调用方判成"无结论"。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _clash_opener():
+    """本次查询专属的 opener: **禁用环境代理, 禁止重定向**。
+
+    默认 opener 自带 ProxyHandler(读 http_proxy/HTTP_PROXY/all_proxy 等), 于是环境里有代理
+    时整个请求会交给代理 —— 连同 Authorization。管理面在回环上, 本来就不该经任何代理。
+    `ProxyHandler({})` 传空表即关闭代理查找。**不调 install_opener**: 只影响本次查询,
+    其它检查的网络行为一个字节都不变。"""
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+
+
 def _clash_rule_providers(timeout=4):
-    """只读取运行期的 rule provider 状态。返回 (providers, None) 或 (None, 无结论原因)。"""
+    """只读取运行期的 rule provider 状态。返回 (providers, None) 或 (None, 无结论原因)。
+
+    只对配置指向的那个回环地址发一次 GET /providers/rules; 不经代理、不跟重定向。"""
     base, why = _clash_ctrl()
     if not base:
         return None, why
@@ -1907,9 +1953,16 @@ def _clash_rule_providers(timeout=4):
         sec = _clash_secret()
         if sec:
             req.add_header("Authorization", "Bearer " + sec)
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with _clash_opener().open(req, timeout=timeout) as r:
             data = json.load(r)
-    except Exception as e:  # noqa: BLE001  连不上/非 2xx/超时/应答不是 JSON, 一律无结论
+    except urllib.error.HTTPError as e:
+        if 300 <= e.code < 400:
+            # 配置指向的那一端把我们支到别处去了。不跟 —— 跟了就等于把凭据送给另一个接收端,
+            # 而它的响应也证明不了**本机这个 mihomo** 的 provider 状态。
+            return None, ("管理面返回重定向(HTTP %d) —— 不跟随, 也不把另一个接收端的响应"
+                          "当作运行期证据" % e.code)
+        return None, "管理面返回 HTTP %d" % e.code
+    except Exception as e:  # noqa: BLE001  连不上/超时/应答不是 JSON, 一律无结论
         return None, "读不到管理面(%s)" % type(e).__name__
     if not isinstance(data, dict) or not isinstance(data.get("providers"), dict):
         return None, "管理面应答里没有 providers 对象"
@@ -1917,10 +1970,11 @@ def _clash_rule_providers(timeout=4):
 
 
 def check_rulesets():
-    """规则集的**静态形态**有没有已知不兼容 —— 只能说到这里, 说不到"已加载"。
+    """规则集: 静态形态 + **运行期 provider 证据**。
 
-    这条判据读的只有 `rulesets.json` 这份元数据, 所以它能证明的仅仅是: 文件读得出来、里面
-    没有明确属于 sing-box 的 `.srs` / `format=binary`、扩展名没命中已知不兼容形态。
+    第一段仍是静态形态: 读 `rulesets.json` 这份元数据 —— 文件读得出来、里面没有明确属于
+    sing-box 的 `.srs` / `format=binary`、扩展名没命中已知不兼容形态。静态这一段**说不到
+    "已加载"**, 所以后面才有第二段: 去管理面取运行期状态(见下)。
 
     它**证明不了**: mihomo 已经读到这些 provider、provider 下载成功、解析出非零条规则、
     运行期配置里真有对应的 RULE-SET、provider 当前没有 error。
@@ -2002,18 +2056,22 @@ def check_rulesets():
         u = str(p.get("updatedAt") or "")
         if u and (oldest is None or u < oldest):
             oldest = u
-    if incomplete:
-        # 字段缺了就是**读不出条数**, 与读不到管理面同级: 无结论, 不判故障也不给 ok。
-        return ("warn", name, "%d 个: 管理面应答里这些规则集没有可解析的 ruleCount, "
-                              "运行期条数无结论: %s" % (len(meta), "、".join(incomplete[:6])))
+    # 顺序要紧: **确定性失败优先**。以前先判 incomplete, 于是"A 已确认缺失 + B 缺 ruleCount"
+    # 整体只报 warn —— 一个已经证实是死规则的 provider, 被另一个 provider 的"无结论"盖掉了。
+    # 无结论不该降低已成立结论的等级; 它只作为附注跟在后面。
+    note = ("; 另有 %s 的 ruleCount 读不出, 那几项本次无结论" % "、".join(incomplete[:6])) if incomplete else ""
     if missing:
         return ("fail", name, "这些规则集在配置里声明了, 但 mihomo 运行期**没有对应的 provider** "
                               "—— 规则被静默丢弃, 分流对它们是死的: " + "、".join(missing[:6])
-                              + "。请在 bot「📑 分流管理」里重建, 或检查 provider 地址是否可达。")
+                              + "。请在 bot「📑 分流管理」里重建, 或检查 provider 地址是否可达。" + note)
     if empty:
         return ("fail", name, "这些规则集在运行期**解析出 0 条规则**(下载失败或内容为空), "
                               "分流对它们同样是死的: " + "、".join(empty[:6])
-                              + "。请检查 provider 地址与内容, 或在 bot 里重建。")
+                              + "。请检查 provider 地址与内容, 或在 bot 里重建。" + note)
+    if incomplete:
+        # 没有确定性失败, 但字段缺了 —— 读不出条数, 与读不到管理面同级: 无结论。
+        return ("warn", name, "%d 个: 管理面应答里这些规则集没有可解析的 ruleCount, "
+                              "运行期条数无结论: %s" % (len(meta), "、".join(incomplete[:6])))
     return ("ok", name, "%d 个, 运行期均已加载, 共 %d 条规则%s。"
                         % (len(meta), total, ("; 最旧一次更新 " + oldest[:19]) if oldest else ""))
 
