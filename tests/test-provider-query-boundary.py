@@ -16,8 +16,14 @@ v1.11.13 让 `check_rulesets` 去读 mihomo 管理面取运行期证据, 这一�
   C. **确定性 FAIL 被 WARN 遮住。** 判定顺序是 incomplete → missing → empty, 于是"A 缺失 +
      B 缺 ruleCount"整体只报 WARN, 一个已经证实为死规则的 provider 被一条"无结论"盖掉。
 
-本支所有接收端都是**本轮自己起的回环端口**, 用自造 token, 不碰真实 9090、不用真实 secret、
-不访问公网或生产。超时只用于回收故障夹具, 不作判据。
+  D. **地址门认的是"形状"而不是地址。** `^127\.\d+\.\d+\.\d+$` 这种正则会放行 `127.999.1.1`
+     这类**非法数字地址**; 而 `localhost` 被直接放行, 于是真正连到哪里由系统解析器决定 ——
+     检查对象与实际连接对象脱节。收紧成: 用 `ipaddress` 严格解析数字 IP 并看 `is_loopback`,
+     主机名一律无结论、**不做解析**。
+
+本支所有接收端都是**本轮自己起的回环端口(随机可用端口)**, 用自造 token, 不用真实 secret、
+不访问公网或生产。**完整查询格会核对连接目标属于本格登记的服务**; 地址门那一格只调地址解析
+函数, 不走网络。超时只用于回收故障夹具, 不作判据。
 """
 import http.server
 import json
@@ -90,18 +96,45 @@ def addr_of(srv):
 
 
 DRIVER = r'''
-import importlib.util, json, os, sys
+import importlib.util, json, os, socket, sys
+# 记账 + 拦截: 解析与连接都要留痕; 目标不在本格登记的白名单里就**在发包前**拒掉。
+# [["127.0.0.1", 41234], ...] -> {(host, port)}; json 给的是 list, 直接 set() 会 unhashable。
+ALLOW = {(a, int(b)) for a, b in json.loads(sys.argv[4])}
+STATS = {"getaddrinfo": 0, "connect": [], "blocked": []}
+FAKE = json.loads(sys.argv[5]) if len(sys.argv) > 5 and sys.argv[5] else {}
+_gai = socket.getaddrinfo
+def gai(host, port, *a, **k):
+    STATS["getaddrinfo"] += 1
+    if host in FAKE:            # 模拟解析: 名字被解到一个**非回环**地址
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (FAKE[host], int(port)))]
+    return _gai(host, port, *a, **k)
+socket.getaddrinfo = gai
+_conn = socket.socket.connect
+def conn(self, addr):
+    try:
+        hp = (addr[0], int(addr[1]))
+    except Exception:
+        hp = (str(addr), -1)
+    STATS["connect"].append(list(hp))
+    if hp not in ALLOW:
+        STATS["blocked"].append(list(hp))
+        raise OSError("blocked-by-test: %s 不属于本格登记的回环服务" % (hp,))
+    return _conn(self, addr)
+socket.socket.connect = conn
 spec = importlib.util.spec_from_file_location("checks", sys.argv[1])
 c = importlib.util.module_from_spec(spec); spec.loader.exec_module(c)
 c.MIHOMO_CFG = sys.argv[2]; c.RS_META = sys.argv[3]; c.SB = sys.argv[2] + ".nosuch"
 base, why = c._clash_ctrl()
 r = c.check_rulesets()
-print(json.dumps({"base": base, "why": why, "res": list(r) if r else None}))
+print(json.dumps({"base": base, "why": why, "res": list(r) if r else None, "stats": STATS}))
 '''
 
 
-def query(controller, meta=META2, secret=TOKEN, env=None, providers_cfg=None):
-    """在**子进程**里跑一次真实查询(代理等环境变量只有新进程才确定生效)。"""
+def query(controller, meta=META2, secret=TOKEN, env=None, own=(), fake=None):
+    """在**子进程**里跑一次真实查询(代理等环境变量只有新进程才确定生效)。
+
+    `own` 是本格**自己起的**回环服务列表; 连接目标不在其中的, 在 socket.connect 里就被拦下并
+    记账 —— 测试绝不去碰不属于本轮的监听端口。"""
     cfg = os.path.join(WD, "mihomo.json")
     d = {}
     if controller is not None: d["external-controller"] = controller
@@ -113,18 +146,21 @@ def query(controller, meta=META2, secret=TOKEN, env=None, providers_cfg=None):
     for k in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "all_proxy", "no_proxy", "NO_PROXY"):
         e.pop(k, None)
     if env: e.update(env)
-    p = subprocess.run([sys.executable, "-c", DRIVER, str(ROOT / "deploy/bot/checks.py"), cfg, mp],
+    allow = json.dumps([[srv.server_address[0], srv.server_address[1]] for srv in own])
+    p = subprocess.run([sys.executable, "-c", DRIVER, str(ROOT / "deploy/bot/checks.py"), cfg, mp, allow,
+                        json.dumps(fake or {})],
                        capture_output=True, text=True, timeout=60, env=e)
     try:
         return json.loads(p.stdout.strip().splitlines()[-1])
     except Exception:
-        return {"base": None, "why": "驱动异常", "res": None, "err": (p.stdout + p.stderr)[:300]}
+        return {"base": None, "why": "驱动异常", "res": None, "stats": {"getaddrinfo": 0, "connect": [], "blocked": []},
+                "err": (p.stdout + p.stderr)[:300]}
 
 
 print("== A1. 管理面回 302: 不得请求 Location, 更不得把 Authorization 交给另一端 ==")
 other = serve(mode="ok")
 conf = serve(mode="redirect", location="http://%s/providers/rules" % addr_of(other))
-r = query(addr_of(conf))
+r = query(addr_of(conf), own=(conf, other))
 lvl = (r["res"] or [None])[0]
 auth_leaked = [h for h in other.hits if h["auth"]]
 if other.hits:
@@ -140,7 +176,7 @@ print("== A2. 环境里有代理: 仍须直连配置端, 代理接收次数必�
 proxy = serve(mode="ok", providers={"proxied": {"name": "proxied", "ruleCount": 1}})
 conf = serve(mode="ok")
 paddr = "http://%s" % addr_of(proxy)
-r = query(addr_of(conf), env={"http_proxy": paddr, "HTTP_PROXY": paddr, "all_proxy": paddr})
+r = query(addr_of(conf), env={"http_proxy": paddr, "HTTP_PROXY": paddr, "all_proxy": paddr}, own=(conf, proxy))
 lvl = (r["res"] or [None])[0]
 pauth = [h for h in proxy.hits if h["auth"]]
 if proxy.hits:
@@ -154,30 +190,78 @@ conf.shutdown(); proxy.shutdown()
 
 print("== A3. 凭据不得出现在文案里 ==")
 conf = serve(mode="ok")
-r = query(addr_of(conf))
+r = query(addr_of(conf), own=(conf,))
 txt = json.dumps(r, ensure_ascii=False)
 (ok if TOKEN not in txt else bad)("返回结构与文案里不含自造 token")
 got_auth = [h for h in conf.hits if h["auth"] == "Bearer " + TOKEN]
 (ok if got_auth else bad)("配置端确实收到了 Authorization(%d 次) —— 有鉴权路径仍能工作" % len(got_auth))
 conf.shutdown()
 
-print("== B. 地址忠实于配置: [::1] 不得被改写成 127.0.0.1 ==")
-r6 = query("[::1]:9090", secret="")
-base = r6["base"] or ""
-if "127.0.0.1" in base:
-    bad("配置 [::1]:9090 → 实际目标 %s, IPv6 回环被静默改成 IPv4(可能是另一个监听实例)" % base)
-elif "[::1]" in base:
-    ok("配置 [::1]:9090 → 目标保留为 %s" % base)
+print("== B. 地址门(只调地址解析函数, 零网络; 端口用不占用的高位号, 不连任何服务)==")
+CTRL = r'''
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location("checks", sys.argv[1])
+c = importlib.util.module_from_spec(spec); spec.loader.exec_module(c)
+c.MIHOMO_CFG = sys.argv[2]
+print(json.dumps(list(c._clash_ctrl())))
+'''
+
+
+def ctrl(controller):
+    """只问地址门, 不跑 check_rulesets —— 这一格一个包都不发。"""
+    cfg = os.path.join(WD, "ctrl.json")
+    json.dump({} if controller is None else {"external-controller": controller},
+              open(cfg, "w", encoding="utf-8"))
+    p = subprocess.run([sys.executable, "-c", CTRL, str(ROOT / "deploy/bot/checks.py"), cfg],
+                       capture_output=True, text=True, timeout=30)
+    try:
+        return json.loads(p.stdout.strip().splitlines()[-1])
+    except Exception:
+        return [None, "驱动异常:" + (p.stdout + p.stderr)[:120]]
+
+
+GATE = [
+    ("127.0.0.1:45001", "http://127.0.0.1:45001", None),
+    ("[::1]:45002",     "http://[::1]:45002",     None),
+    ("127.0.0.53:45003","http://127.0.0.53:45003", None),
+    ("127.999.1.1:45004", None, "不是合法"),
+    ("localhost:45005",   None, "数字回环"),
+    ("10.0.0.5:45006",    None, "不在回环"),
+    (":45007",            None, "通配"),
+    ("127.0.0.1:abc",     None, "端口"),
+    ("127.0.0.1:0",       None, "端口"),
+]
+for raw, want_base, want_why in GATE:
+    base, why = ctrl(raw)
+    if want_base is not None:
+        (ok if base == want_base else bad)("%-20s → %s" % (raw, base if base == want_base else "实得 %r(期望 %s)" % (base, want_base)))
+    elif base is not None:
+        bad("%-20s → 被放行为 %s(应拒绝: %s)" % (raw, base, want_why))
+    elif want_why in (why or ""):
+        ok("%-20s → 拒绝, 理由含「%s」: %s" % (raw, want_why, (why or "")[:44]))
+    else:
+        bad("%-20s → 拒绝了但理由不对(期望含 %r): %s" % (raw, want_why, why))
+
+print("== B3. 名字不做解析: 模拟把 localhost 解到非回环地址, 解析与连接都必须为 0 次 ==")
+# 拦截器在 socket.connect **发包之前**记账并拒绝, 全程不产生任何真实非回环连接;
+# 也不改 hosts、不动系统 DNS。
+r = query("localhost:45111", secret="", own=(), fake={"localhost": "203.0.113.7"})
+st = r.get("stats") or {}
+gai_n = st.get("getaddrinfo", -1)
+conns = st.get("connect") or []
+nonloop = [c for c in conns if not str(c[0]).startswith("127.") and c[0] != "::1"]
+if gai_n == 0 and not conns:
+    ok("localhost 在地址门就被拒(理由: %s); 解析 0 次、连接尝试 0 次" % (r["why"] or "")[:44])
 else:
-    bad("配置 [::1]:9090 → 目标 %r, 既不是 IPv6 也没给出无结论理由(why=%s)" % (base, r6["why"]))
-r4 = query("127.0.0.1:9091", secret="")
-(ok if (r4["base"] or "").startswith("http://127.0.0.1:9091") else bad)(
-    "IPv4 配置仍忠实: %s" % r4["base"])
+    bad("localhost 未在地址门拦下: 解析 %d 次, 连接尝试 %s(其中非回环 %s) —— "
+        "检查对象与实际连接对象脱节" % (gai_n, conns, nonloop))
+(ok if not nonloop else bad)("全程没有对非回环地址发起过连接(拦截器记录 %d 条被拦: %s)"
+                             % (len(st.get("blocked") or []), (st.get("blocked") or [])[:2]))
 
 print("== B2. IPv6 实连(隔离环境; 不可用则明确记录, 不冒充通过)==")
 try:
     s6 = serve(family=socket.AF_INET6)
-    r = query(addr_of(s6), secret="")
+    r = query(addr_of(s6), secret="", own=(s6,))
     lvl = (r["res"] or [None])[0]
     if s6.hits and lvl == "ok":
         ok("[::1] 上的假管理面实收 %d 次, 判据给 ok —— IPv6 目标真的连通了" % len(s6.hits))
@@ -198,7 +282,7 @@ cases = [
 ]
 for label, provs, want in cases:
     srv = serve(mode="ok", providers=provs)
-    r = query(addr_of(srv), secret="")
+    r = query(addr_of(srv), secret="", own=(srv,))
     got = (r["res"] or [None])[0]
     msg = (r["res"] or ["", "", ""])[2]
     if got == want:
