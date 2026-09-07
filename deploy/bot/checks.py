@@ -1866,13 +1866,16 @@ def _clash_ctrl():
     配置既可能是 JSON 形态(带引号的键)也可能是 YAML, 所以按文本抽, 不引 yaml 依赖。
 
     地址契约(逐种写清, 不做静默替换 —— 换一个地址就可能换成**另一个监听实例**):
-      · `127.0.0.1:P` / 其它 `127.x.y.z:P` → 回环, 原样用;
-      · `[::1]:P`                          → 回环, 原样用(URL 里保留方括号);
-      · `localhost:P`                      → 原样用 `localhost`, 由解析器决定 v4/v6;
-                                             我们不替它挑一个, 那是替用户改接收端;
-      · `:P`(空 host, 即通配监听)          → **无结论**: 通配不等于回环, 不能假定连上的是本机
-                                             那个实例;
-      · 其它主机名或非回环地址             → 无结论, 不主动连。
+      · `127.0.0.1:P` 及 127.0.0.0/8 内其它地址 → 回环, **原地址**照用;
+      · `[::1]:P`                               → 回环, 地址族与方括号都保留;
+      · `localhost:P` 及任何主机名              → **无结论, 且不做解析**。名字解析成什么地址
+                                                  由系统决定(hosts / nsswitch / DNS 都能改),
+                                                  那样"门检查的对象"与"实际连接的对象"就是
+                                                  两回事。**这是有意收紧的支持范围**, 不是
+                                                  没有行为变化;
+      · `:P`(空 host, 即通配监听)               → 无结论: 通配不等于回环;
+      · 非法数字地址(如 127.999.1.1)、非回环地址、非法端口 → 无结论, **零网络尝试**。
+    地址一律交给 `ipaddress` 严格解析后看 `is_loopback`, 不用正则比形状。
     仓库渲染器生成的是 `127.0.0.1:9090`(见 deploy/bot/sb2mihomo.py), 正常机器落在第一条。"""
     try:
         txt = open(MIHOMO_CFG, encoding="utf-8", errors="replace").read()
@@ -1890,19 +1893,24 @@ def _clash_ctrl():
             return None, "external-controller 形态不可解析"
         host, rest = raw[1:end], raw[end + 1:]
         port = rest[1:] if rest.startswith(":") else ""
-        literal = "[%s]" % host
     else:
         host, _, port = raw.rpartition(":")
-        literal = host
-    if not port.isdigit():
-        return None, "external-controller 形态不可解析"
+    if not port.isdigit() or not (0 < int(port) < 65536):
+        return None, "external-controller 的端口不合法(%s)" % (port or "缺失")
     if host == "":
         return None, ("external-controller 是通配监听(:%s) —— 通配不等于回环, "
                       "本项不据此假定连到的是本机实例" % port)
-    is_loop = host in ("::1", "localhost") or re.match(r"^127\.\d+\.\d+\.\d+$", host)
-    if not is_loop:
+    # **严格解析成数字 IP 再看 is_loopback**, 不用正则比形状: ^127\.\d+\.\d+\.\d+$ 这种会
+    # 放行 127.999.1.1 这类非法地址。主机名(含 localhost)一律无结论且**不做解析** —— 名字
+    # 解析出的地址由系统决定(hosts/nsswitch/DNS 都能改), 门检查的对象就会和实际连接的对象脱节。
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return None, ("external-controller 是主机名或非法数字地址 —— 本项只接受"
+                      "**数字回环地址**(127.0.0.0/8 或 ::1), 不对名字做解析")
+    if not ip.is_loopback:
         return None, "external-controller 不在回环 —— 本项不主动连非回环管理端口"
-    return "http://%s:%s" % (literal, port), ""
+    return "http://%s:%s" % ((("[%s]" % host) if ip.version == 6 else host), port), ""
 
 
 def _clash_secret():
