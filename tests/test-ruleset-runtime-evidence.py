@@ -24,6 +24,7 @@ v1.11.11 把这条判据从假绿改成 warn, 是对的 —— 它当时确实�
 import importlib.util
 import json
 import os
+import socket
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -43,6 +44,29 @@ def bad(m): FAIL[0] += 1; print("  ✗ %s" % m)
 
 WD = tmpguard.mkdtemp(prefix="pdg-rsrt.")
 
+# ── 连接所有权拦截器 ────────────────────────────────────────────────────────
+# 本支的接收端只能是**本进程自己起的回环假管理面**。加这层是因为负控要撤掉产品里的回环限制,
+# 撤掉之后被测代码会真的去连用例里写的那个非回环地址(10.0.0.5:9090) —— 那是一个不属于本轮、
+# 也不该被打扰的地址。拦截器在 socket.connect **发包之前**拒绝并记账, 于是负控照样有牙,
+# 却一个包也不会离开本机。记账在收尾统一核对。
+OWNED = set()
+BLOCKED = []
+_conn = socket.socket.connect
+
+
+def _guarded_connect(self, addr):
+    try:
+        hp = (addr[0], int(addr[1]))
+    except Exception:  # noqa: BLE001
+        hp = (str(addr), -1)
+    if hp not in OWNED:
+        BLOCKED.append(list(hp))
+        raise OSError("blocked-by-test: %s 不属于本轮登记的回环服务" % (hp,))
+    return _conn(self, addr)
+
+
+socket.socket.connect = _guarded_connect
+
 
 class Fake(BaseHTTPRequestHandler):
     """冒充 mihomo 管理面。只应答 /providers/rules; 行为由 server 上的属性决定。"""
@@ -60,6 +84,7 @@ class Fake(BaseHTTPRequestHandler):
 def serve(plan):
     srv = HTTPServer(("127.0.0.1", 0), Fake)
     srv.plan = plan
+    OWNED.add((srv.server_address[0], srv.server_address[1]))   # 登记: 只有它允许被连
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv
 
@@ -186,6 +211,11 @@ if none2 is not None: probs.append("空元数据未返回 None")
 if lvl(broken) != "fail": probs.append("元数据损坏未判 fail(%s)" % lvl(broken))
 if probs: bad("既有契约回退: " + "; ".join(probs))
 else: ok(".srs→fail / 无元数据→None / 空→None / 损坏→fail 四条既有契约均未回退")
+
+print("== 8. 测试自身的访问范围: 全程只连本轮登记的回环服务 ==")
+(ok if not BLOCKED else bad)(
+    "拦截器记录的越界连接尝试 %d 条%s"
+    % (len(BLOCKED), "" if not BLOCKED else " —— 碰了不属于本轮的地址: %s" % BLOCKED[:4]))
 
 print()
 print("通过 %d, 失败 %d" % (PASS[0], FAIL[0]))

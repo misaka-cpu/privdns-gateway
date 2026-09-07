@@ -25,6 +25,7 @@ v1.11.13 让 `check_rulesets` 去读 mihomo 管理面取运行期证据, 这一�
 不访问公网或生产。**完整查询格会核对连接目标属于本格登记的服务**; 地址门那一格只调地址解析
 函数, 不走网络。超时只用于回收故障夹具, 不作判据。
 """
+import atexit
 import http.server
 import json
 import os
@@ -44,6 +45,9 @@ def ok(m):  PASS[0] += 1; print("  ✓ %s" % m)
 def bad(m): FAIL[0] += 1; print("  ✗ %s" % m)
 
 WD = tmpguard.mkdtemp(prefix="pdg-pqb.")
+# 全程记账: 任何一格都不许连**非本轮登记**的端口。拦截器在 connect 前拦下并记账,
+# 这里在收尾统一核对 —— 上一轮就是因为地址格走了完整查询, 去碰了不属于本轮的端口。
+BLOCKED_ALL = []
 TOKEN = "acc-selfmade-token-2f9c41a7"          # 自造, 与任何真实 secret 无关
 
 FULL = {"rs_a": {"name": "rs_a", "ruleCount": 13, "updatedAt": "2026-09-06T13:30:45Z"},
@@ -79,15 +83,46 @@ class Rec(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+SERVERS = []
+
+
 def serve(mode="ok", providers=None, location=None, family=socket.AF_INET):
+    """起一个**本轮拥有**的回环假服务, 端口交给内核随机分配(绑 0)。"""
     class S(http.server.HTTPServer):
         address_family = family
     host = "127.0.0.1" if family == socket.AF_INET else "::1"
     srv = S((host, 0), Rec)
     srv.mode = mode; srv.providers = providers or FULL; srv.location = location
     srv.hits = []
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    srv._th = threading.Thread(target=srv.serve_forever, daemon=True)
+    srv._th.start()
+    SERVERS.append(srv)
     return srv
+
+
+def stop(srv):
+    """shutdown + server_close + 等线程退出; 异常路径也走这里。"""
+    try:
+        srv.shutdown()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        srv.server_close()
+    except Exception:  # noqa: BLE001
+        pass
+    th = getattr(srv, "_th", None)
+    if th is not None:
+        th.join(timeout=5)
+    if srv in SERVERS:
+        SERVERS.remove(srv)
+
+
+@atexit.register
+def _reap_servers():
+    """异常/断言中断也要把假服务收干净 —— 否则线程连同监听端口一直挂着。
+    临时目录由 tmpguard 在它自己的 atexit 里清, 这里只管进程内的服务。"""
+    for srv in list(SERVERS):
+        stop(srv)
 
 
 def addr_of(srv):
@@ -151,10 +186,13 @@ def query(controller, meta=META2, secret=TOKEN, env=None, own=(), fake=None):
                         json.dumps(fake or {})],
                        capture_output=True, text=True, timeout=60, env=e)
     try:
-        return json.loads(p.stdout.strip().splitlines()[-1])
+        out = json.loads(p.stdout.strip().splitlines()[-1])
     except Exception:
-        return {"base": None, "why": "驱动异常", "res": None, "stats": {"getaddrinfo": 0, "connect": [], "blocked": []},
-                "err": (p.stdout + p.stderr)[:300]}
+        out = {"base": None, "why": "驱动异常", "res": None,
+               "stats": {"getaddrinfo": 0, "connect": [], "blocked": []},
+               "err": (p.stdout + p.stderr)[:300]}
+    BLOCKED_ALL.extend((out.get("stats") or {}).get("blocked") or [])
+    return out
 
 
 print("== A1. 管理面回 302: 不得请求 Location, 更不得把 Authorization 交给另一端 ==")
@@ -170,7 +208,7 @@ elif lvl == "warn":
     ok("302 → 目标端 0 次接收, 判据给 warn(不把重定向后的响应当运行期证据)")
 else:
     bad("302 → 目标端未被请求, 但判据给了 %s(应 warn): %s" % (lvl, (r["res"] or ["","",""])[2][:80]))
-conf.shutdown(); other.shutdown()
+stop(conf); stop(other)
 
 print("== A2. 环境里有代理: 仍须直连配置端, 代理接收次数必须为 0 ==")
 proxy = serve(mode="ok", providers={"proxied": {"name": "proxied", "ruleCount": 1}})
@@ -186,7 +224,7 @@ elif conf.hits and lvl == "ok":
     ok("代理 0 次接收, 配置端实收 %d 次, 判据正常给出 ok" % len(conf.hits))
 else:
     bad("代理 0 次, 但配置端实收 %d 次 / 判据 %s" % (len(conf.hits), lvl))
-conf.shutdown(); proxy.shutdown()
+stop(conf); stop(proxy)
 
 print("== A3. 凭据不得出现在文案里 ==")
 conf = serve(mode="ok")
@@ -195,7 +233,7 @@ txt = json.dumps(r, ensure_ascii=False)
 (ok if TOKEN not in txt else bad)("返回结构与文案里不含自造 token")
 got_auth = [h for h in conf.hits if h["auth"] == "Bearer " + TOKEN]
 (ok if got_auth else bad)("配置端确实收到了 Authorization(%d 次) —— 有鉴权路径仍能工作" % len(got_auth))
-conf.shutdown()
+stop(conf)
 
 print("== B. 地址门(只调地址解析函数, 零网络; 端口用不占用的高位号, 不连任何服务)==")
 CTRL = r'''
@@ -224,7 +262,7 @@ GATE = [
     ("127.0.0.1:45001", "http://127.0.0.1:45001", None),
     ("[::1]:45002",     "http://[::1]:45002",     None),
     ("127.0.0.53:45003","http://127.0.0.53:45003", None),
-    ("127.999.1.1:45004", None, "不是合法"),
+    ("127.999.1.1:45004", None, "非法数字地址"),
     ("localhost:45005",   None, "数字回环"),
     ("10.0.0.5:45006",    None, "不在回环"),
     (":45007",            None, "通配"),
@@ -267,7 +305,7 @@ try:
         ok("[::1] 上的假管理面实收 %d 次, 判据给 ok —— IPv6 目标真的连通了" % len(s6.hits))
     else:
         bad("IPv6 实连未成立: 接收 %d 次, 判据 %s, base=%s why=%s" % (len(s6.hits), lvl, r["base"], r["why"]))
-    s6.shutdown()
+    stop(s6)
 except OSError as e:
     print("  [SKIP] 本环境 IPv6 回环不可用(%s) —— 实连这一格未执行, 不计入通过" % e)
 
@@ -289,7 +327,12 @@ for label, provs, want in cases:
         ok("%-24s → %s" % (label, got))
     else:
         bad("%-24s → 实得 %s, 期望 %s: %s" % (label, got, want, msg[:90]))
-    srv.shutdown()
+    stop(srv)
+
+print("== E. 测试自身的访问范围: 全程只连本轮登记的回环服务 ==")
+(ok if not BLOCKED_ALL else bad)(
+    "拦截器记录的越界连接尝试 %d 条%s" % (len(BLOCKED_ALL),
+    "" if not BLOCKED_ALL else " —— 测试碰了不属于本轮的端口: %s" % BLOCKED_ALL[:4]))
 
 print()
 print("通过 %d, 失败 %d" % (PASS[0], FAIL[0]))
