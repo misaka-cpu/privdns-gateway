@@ -1856,6 +1856,66 @@ def check_mitm():
         return ("fail", "WLOC 服务", "mihomo 缺 MITM-OUT 出站或 gs-loc 路由(重开一次 WLOC 重渲染内核)")
     return ("ok", "WLOC 服务", "pdg-mitm active + CA + mitm_hijack + mihomo MITM 路由 就位")
 
+# ── mihomo 管理面(external-controller)的只读查询 ────────────────────────────
+# 只做 GET, 只在**回环**地址上做。判据宁可"无结论"也不主动去连非回环的管理端口:
+# 那是控制面, 能改配置、切出站, 不该由一条自检去外连。
+def _clash_ctrl():
+    """解析 mihomo 的 external-controller。回环才给 base_url。
+
+    返回 (base_url, why)。base_url 为 None 时 why 说明为什么没有结论。
+    配置既可能是 JSON 形态(带引号的键)也可能是 YAML, 所以按文本抽, 不引 yaml 依赖。"""
+    try:
+        txt = open(MIHOMO_CFG, encoding="utf-8", errors="replace").read()
+    except OSError as e:
+        return None, "读不到 mihomo 配置(%s)" % (e.strerror or e.errno)
+    # JSON(键在行中)与 YAML(键在行首)两种形态都要认: 前缀允许行首、`{`、`,` 或空白。
+    m = re.search(r'(?:^|[{,\s])"?external-controller"?\s*:\s*"?([^"\s,}]+)"?', txt, re.M)
+    if not m:
+        return None, "mihomo 未配置 external-controller"
+    host, _, port = m.group(1).strip().rpartition(":")
+    host = (host or "127.0.0.1").strip("[]")
+    if not port.isdigit():
+        return None, "external-controller 形态不可解析"
+    if host not in ("127.0.0.1", "::1", "localhost", ""):
+        return None, "external-controller 不在回环 —— 本项不主动连非回环管理端口"
+    return "http://127.0.0.1:%s" % port, ""
+
+
+def _clash_secret():
+    """管理面的 secret。mihomo 放顶层 `secret`; 老的 sing-box 放 experimental.clash_api.secret。
+    读不到就返回空串 —— 回环且未设 secret 时本来就无需鉴权。**只用于加请求头, 不记录、不回显。**"""
+    try:
+        m = re.search(r'(?:^|[{,\s])"?secret"?\s*:\s*"([^"]*)"',
+                      open(MIHOMO_CFG, encoding="utf-8", errors="replace").read(), re.M)
+        if m and m.group(1):
+            return m.group(1)
+    except OSError:
+        pass
+    try:
+        return (json.load(open(SB)).get("experimental", {}).get("clash_api", {}) or {}).get("secret") or ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _clash_rule_providers(timeout=4):
+    """只读取运行期的 rule provider 状态。返回 (providers, None) 或 (None, 无结论原因)。"""
+    base, why = _clash_ctrl()
+    if not base:
+        return None, why
+    try:
+        req = urllib.request.Request(base + "/providers/rules")
+        sec = _clash_secret()
+        if sec:
+            req.add_header("Authorization", "Bearer " + sec)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.load(r)
+    except Exception as e:  # noqa: BLE001  连不上/非 2xx/超时/应答不是 JSON, 一律无结论
+        return None, "读不到管理面(%s)" % type(e).__name__
+    if not isinstance(data, dict) or not isinstance(data.get("providers"), dict):
+        return None, "管理面应答里没有 providers 对象"
+    return data["providers"], None
+
+
 def check_rulesets():
     """规则集的**静态形态**有没有已知不兼容 —— 只能说到这里, 说不到"已加载"。
 
@@ -1873,9 +1933,17 @@ def check_rulesets():
     `pdg doctor` 的总退出码(更新自检只按 level=="fail" 计数), 所以它不会挡住任何人,
     只是不再替运行期打包票。
 
-    要真证明"已加载", 需要一个安全的运行期查询接口(mihomo 管理面), 那是**架构待决项**:
-    本项不新增 HTTP 管理端口、不读现有 9090、不开 ext-ctl-unix、不拿 `mihomo -t` 的配置
-    语法通过冒充 provider 已加载、也不去访问 provider 地址做在线探测。只读, 不改任何东西。
+    现在它**会去读运行期**: mihomo 的 external-controller 提供 `/providers/rules`, 给出每个
+    rule provider 的 name/behavior/format/ruleCount/updatedAt。判据据此分三种结论:
+
+      · 每个声明的规则集都能找到同名 provider 且 ruleCount>0 → **ok**(报总条数与最旧更新时间);
+      · 声明了却没有同名 provider, 或 provider 解析出 0 条 → **fail**(规则被静默丢弃, 分流是死的);
+      · 管理面读不到/非 2xx/应答不是预期结构/缺 ruleCount → 仍然 **warn 且明说无结论**。
+        "试过了"不等于可以退回 ok。
+
+    边界仍然守死: **只 GET, 只连回环**。external-controller 不在回环或没配置 → warn, 判据
+    不主动去连非回环的管理端口(那是控制面, 能改配置、切出站)。不新增管理端口、不开
+    ext-ctl-unix、不拿 `mihomo -t` 的语法通过冒充已加载、不去访问 provider 地址做在线探测。
 
     mihomo 读不了 sing-box 的二进制 `.srs`; 这类**老机器遗留**的规则集会让渲染器把对应规则
     丢弃 → _core_apply/迁移一律判失败。那一类仍然判 fail 并直说该怎么办。"""
@@ -1911,9 +1979,43 @@ def check_rulesets():
         return ("fail", name, "这些是 sing-box 二进制 .srs, mihomo 读不了 → 分流不会生效, "
                               "且会挡住 `pdg update`: " + "、".join(stale[:6])
                               + "。请在 bot「📑 分流管理」里删掉它们, 换成 .list/.txt/.yaml/.mrs。")
-    return ("warn", name, "%d 个: 静态元数据里未发现已知不兼容格式。"
-                          "但本项**没有读取 mihomo 运行期 provider 状态**, 因此不能证明这些规则"
-                          "已经被加载、下载成功或解析出条目 —— 只说明形态上没问题。" % len(meta))
+    # 静态形态没问题之后, 去管理面取**运行期证据**。取不到就仍然说"无结论" —— 试过了不等于
+    # 可以退回 ok; 取到了才可能给 ok, 而且必须逐个规则集对得上。
+    provs, why = _clash_rule_providers()
+    if provs is None:
+        return ("warn", name, "%d 个: 静态元数据里未发现已知不兼容格式。"
+                              "**运行期 provider 状态本次不可得**(%s), 因此仍不能证明这些规则"
+                              "已被 mihomo 加载、下载成功或解析出条目 —— 只说明形态上没问题。"
+                              % (len(meta), why))
+    missing, empty, incomplete, total, oldest = [], [], [], 0, None
+    for rs_name, info in meta.items():
+        label = str((info.get("label") if isinstance(info, dict) else None) or rs_name)
+        p = provs.get(rs_name)
+        if not isinstance(p, dict):
+            missing.append(label); continue
+        cnt = p.get("ruleCount")
+        if not isinstance(cnt, int) or isinstance(cnt, bool):
+            incomplete.append(label); continue
+        if cnt <= 0:
+            empty.append(label); continue
+        total += cnt
+        u = str(p.get("updatedAt") or "")
+        if u and (oldest is None or u < oldest):
+            oldest = u
+    if incomplete:
+        # 字段缺了就是**读不出条数**, 与读不到管理面同级: 无结论, 不判故障也不给 ok。
+        return ("warn", name, "%d 个: 管理面应答里这些规则集没有可解析的 ruleCount, "
+                              "运行期条数无结论: %s" % (len(meta), "、".join(incomplete[:6])))
+    if missing:
+        return ("fail", name, "这些规则集在配置里声明了, 但 mihomo 运行期**没有对应的 provider** "
+                              "—— 规则被静默丢弃, 分流对它们是死的: " + "、".join(missing[:6])
+                              + "。请在 bot「📑 分流管理」里重建, 或检查 provider 地址是否可达。")
+    if empty:
+        return ("fail", name, "这些规则集在运行期**解析出 0 条规则**(下载失败或内容为空), "
+                              "分流对它们同样是死的: " + "、".join(empty[:6])
+                              + "。请检查 provider 地址与内容, 或在 bot 里重建。")
+    return ("ok", name, "%d 个, 运行期均已加载, 共 %d 条规则%s。"
+                        % (len(meta), total, ("; 最旧一次更新 " + oldest[:19]) if oldest else ""))
 
 
 # ── 分流优先级: 自动生成的规则不许静默压过用户点名的域名规则 ──────────────────

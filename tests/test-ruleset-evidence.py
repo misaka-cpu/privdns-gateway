@@ -19,17 +19,17 @@
 用静态元数据说出来就是假绿。一个写着 `.yaml` 但运行期根本没被加载的 provider, 在这条判据
 下与一切正常的机器长得一模一样。
 
-本轮关掉的是这句假绿文案, **不是**运行期 provider 证据本身。要真证明"已加载", 需要一个
-安全的运行期查询接口(mihomo 的管理面), 那是架构待决项, 本轮不引入: 不新增 HTTP 管理端口、
-不读现有 9090、不偷偷开 ext-ctl-unix、不拿 `mihomo -t` 的配置语法通过冒充 provider 已加载、
-不去访问 provider URL 做在线探测。
+本支关掉的是那句假绿文案。运行期 provider 证据后来补上了(只 GET、只连回环的
+external-controller), 由 tests/test-ruleset-runtime-evidence.py 覆盖; 本支专管
+**运行期不可得**那一侧: 那时仍须 warn, 不许因为"试过了"就退回 ok。
 
 新契约:
   · 明确不兼容(.srs / format=binary / path 以 .srs 结尾)→ 仍然 **fail**;
   · 没有元数据 / 元数据为空 → 仍然 **None**(没配过规则集, 不是问题);
   · 元数据损坏 → **不得静默当成"没配置"**;
-  · 有规则集且静态形态没发现已知不兼容 → **warn**, 并说清"本项未读取运行期 provider 状态,
-    因此不能证明规则已加载";
+  · 有规则集、静态形态没发现已知不兼容、**且运行期证据不可得** → **warn**, 并说清
+    "不能证明规则已加载"(运行期取得到时给 ok 才是对的, 见
+    tests/test-ruleset-runtime-evidence.py);
   · WARN 不改变 `pdg doctor` 的总退出码(更新自检只按 level=="fail" 计数)。
 """
 import importlib.util
@@ -64,12 +64,16 @@ def ask(meta, raw=None):
             os.remove(p)
     else:
         json.dump(meta, open(p, "w", encoding="utf-8"))
-    old = checks.RS_META
+    # 本支测的是**运行期证据不可得**那一侧的契约, 所以把 MIHOMO_CFG 钉到一个不存在的路径:
+    # 否则结论会随宿主上有没有 mihomo 配置而变(装了并且 provider 齐全时 ok 才是对的,
+    # 那一侧由 tests/test-ruleset-runtime-evidence.py 覆盖)。
+    old, old_cfg = checks.RS_META, checks.MIHOMO_CFG
     checks.RS_META = p
+    checks.MIHOMO_CFG = os.path.join(WD, "no-such-mihomo-config.yaml")
     try:
         return checks.check_rulesets()
     finally:
-        checks.RS_META = old
+        checks.RS_META, checks.MIHOMO_CFG = old, old_cfg
 
 
 print("== 1. 没配过规则集: 保持 None(不是问题, 不该出现在报告里)==")

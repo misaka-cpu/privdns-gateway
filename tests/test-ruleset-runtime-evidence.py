@@ -162,10 +162,14 @@ if allw:
 print("== 6. external-controller 非回环或缺失 → warn, 且不主动连非回环 ==")
 r1 = ask(META3, controller="10.0.0.5:9090")
 r2 = ask(META3, controller=None)
-if lvl(r1) == "warn" and lvl(r2) == "warn":
-    ok("非回环与未配置都判 warn(不主动外连): %s / %s" % (msg(r1)[:44], msg(r2)[:44]))
+# 光看 level 不够: 去掉回环限制之后, 连非回环也会连失败 → 照样是 warn, 那这一格就白设了。
+# 判据落在**理由**上 —— 必须是"不在回环"(压根没去连), 而不是"读不到管理面"(连了没连上)。
+p1 = lvl(r1) == "warn" and "不在回环" in msg(r1) and "读不到管理面" not in msg(r1)
+p2 = lvl(r2) == "warn" and "未配置" in msg(r2)
+if p1 and p2:
+    ok("非回环 → warn 且理由是「不在回环」(根本没发起连接); 未配置 → warn 且理由是「未配置」")
 else:
-    bad("非回环/缺失处理不对: %s / %s" % (lvl(r1), lvl(r2)))
+    bad("非回环/缺失处理不对: r1=%s|%s ; r2=%s|%s" % (lvl(r1), msg(r1)[:60], lvl(r2), msg(r2)[:60]))
 
 print("== 7. 既有契约不得回退 ==")
 srv = serve({"/providers/rules": (200, providers_body(FULL))})
