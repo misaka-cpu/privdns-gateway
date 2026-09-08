@@ -67,7 +67,7 @@ assert 'edit(chat, mid, "测试中…", None)' not in bot, (
 # 的产生点**。要守的性质一个字没松: 仍然要求它挂 BACK 而不是整排一级菜单; 忙/未受理这类
 # 反馈同样如此。
 assert_near('def _upd_check_async(chat, mid):',
-            '_upd_emit(chat, mid, token, "progress",\n'
+            '_upd_emit(chat, mid, tok, "progress",\n'
             '                      "🔄 检查更新中…(结果会更新到这条消息)", BACK)', (
                 "update-check progress message should show only a back button, "
                 "not the full first-level menu"
@@ -75,10 +75,10 @@ assert_near('def _upd_check_async(chat, mid):',
 assert 'edit(chat, mid, "🔄 检查更新中…(结果会更新到这条消息)", None)' not in bot, (
     "passing None to edit() falls back to the full first-level MENU"
 )
-assert_near('def _upd_notify_async(', '_upd_emit(chat, mid, token, "busy", text, BACK)', (
+assert_near('def _upd_notify(', '_upd_emit(chat, mid, tok, "notice", txt, BACK)', (
     "update-check busy/rejection feedback should also show only a back button"
 ), window=1400)
-assert_near('if data == "upd_check":', "_upd_notify_async(chat, mid,", (
+assert_near('if data == "upd_check":', "_upd_notify(chat, mid, _msg, _tok,", (
     "update-check callback must route its feedback through the async notifier, "
     "not edit inline on the polling thread"
 ), window=1400)
