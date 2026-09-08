@@ -54,6 +54,7 @@ bot.PDG_REPO = REPO
 _REAL_GIT = bot._git
 _REAL_UPDATE_CHECK = bot.update_check      # 后面几节会拿桩替换它, 用完要还回来
 _REAL_FETCH_TAGS = bot._fetch_release_tags
+_REAL_POST = bot.post                      # §14 要用**真实** post(带重连), 不能是假件
 
 
 def at(rev):
@@ -75,7 +76,7 @@ class Tg:
         self.unreachable = False    # 完全不可达
         self.delay = 0.0
 
-    def post(self, method, params):
+    def post(self, method, params, deadline=None):
         if self.delay:
             time.sleep(self.delay)
         with self.lock:
@@ -272,6 +273,8 @@ gate2.set(); time.sleep(0.6)
 (ok if not any(m == "sendMessage" and "旧结果 B" in p.get("text", "")
                for m, p in tg.calls) else bad)("也不补发新消息把旧结果推回来")
 (ok if 303 not in bot._upd_inflight else bad)("作废后占用仍被释放")
+(ok if (303, 33) not in bot._upd_sess else
+ bad)("作废写入权后**仍有清理资格**: 会话记录也被清掉(残留 %r)" % (list(bot._upd_sess),))
 
 print()
 print("══ 6. 消息编辑失败 / 发送失败 / API 不可达: 回退有界, 占用能释放 ══")
@@ -452,8 +455,8 @@ tg = Tg(); with_tg(tg)
 _real_submit = bot._EXEC.submit
 bot._EXEC.submit = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("closed"))
 _v, _tk = bot._upd_check_async(910, 91)
-(ok if _v == bot.ACCEPT_SUBMIT_FAIL and _tk is None else
- bad)("提交失败返回 SUBMIT_FAIL 而不是 BUSY(实得 %r)" % (_v,))
+(ok if _v == bot.ACCEPT_SUBMIT_FAIL and _tk else
+ bad)("提交失败返回 SUBMIT_FAIL(且带可作废的通知归属; 实得 %r/%s)" % (_v, bool(_tk)))
 (ok if 910 not in bot._upd_inflight else bad)("提交失败后占用不残留")
 bot.handle_cb(910, 91, "upd_check")     # 仍在"提交必失败"状态下走真实回调
 time.sleep(0.5)
@@ -513,7 +516,7 @@ class GateTg:
         self.gates = {}
         self.waiters = {}          # 哪一条已经**进到网络调用里**被闸挡住了
 
-    def post(self, method, params):
+    def post(self, method, params, deadline=None):
         txt = params.get("text") or ""
         for k, g in list(self.gates.items()):
             if k in txt:
@@ -648,6 +651,276 @@ _s = gt.seq()
  bad)("13c 导航抢写后收敛回新页面(实得 %r)" % (_s,))
 (ok if any("旧结果C" in x for x in _s) else
  bad)("13c 如实记录: 旧结果那一次请求确实到达过, 收敛不是撤回(实得 %r)" % (_s,))
+
+print()
+print("══ 14. 投递时限: 在**连接层**注入故障, 保留真实 post 重连与 edit_only 回退 ══")
+# 这一节**不替换 post** —— 替换掉它就等于没验投递路径。故障注入在 HTTPSConnection 上,
+# 于是 post 的重连、edit_only 的两段回退、以及新加的 deadline 全都真的跑到。
+# 用受控时钟量"模拟时间", 与墙钟分开记。
+
+
+class _Clock:
+    def __init__(self):
+        self.t = 10000.0
+        self.lock = threading.Lock()
+
+    def mono(self):
+        with self.lock:
+            return self.t
+
+    def advance(self, d):
+        with self.lock:
+            self.t += d
+
+
+class _DeadConn:
+    """每次 request 都走满 socket timeout 再失败 —— 模拟不可达。"""
+    tries = []
+
+    def __init__(self, host, timeout=None):
+        self.timeout = timeout
+
+    def request(self, *a, **k):
+        _DeadConn.tries.append(self.timeout)
+        _CK.advance(self.timeout or 0)
+        raise OSError("unreachable")
+
+    def getresponse(self):
+        raise OSError("unreachable")
+
+    def close(self):
+        pass
+
+
+_CK = _Clock()
+_real_conn_cls = bot.http.client.HTTPSConnection
+_real_mono = time.monotonic
+_post_calls = [0]
+
+
+def _counting_post(method, params, deadline=None):
+    """**包装**真实 post(不替换它): 数调用次数, 内部仍走真实重连与 deadline 逻辑。"""
+    _post_calls[0] += 1
+    return _REAL_POST(method, params, deadline)
+
+
+bot.post = _counting_post                  # 关键: 内部仍是真实 post, 只在连接层注入故障
+bot.http.client.HTTPSConnection = _DeadConn
+bot.time.monotonic = _CK.mono
+_DeadConn.tries = []
+bot._tls.conn = None
+with bot._upd_lock:
+    bot._upd_inflight.clear(); bot._upd_sess.clear()
+_emits = [0]
+_real_emit = bot._upd_emit
+
+
+def _counting_emit(chat, mid, token, phase, text, kb):
+    _emits[0] += 1
+    return _real_emit(chat, mid, token, phase, text, kb)
+
+
+bot._upd_emit = _counting_emit
+bot.update_check = lambda budget=None: (True, "🔄 终态14")
+_sim0 = _CK.mono()
+_wall0 = _real_mono()
+bot.handle_cb(1401, 141, "upd_check")
+while 1401 in bot._upd_inflight and _real_mono() - _wall0 < 60:
+    time.sleep(0.02)
+bot._upd_emit = _real_emit
+_sim = _CK.mono() - _sim0
+_wall = _real_mono() - _wall0
+bot.http.client.HTTPSConnection = _real_conn_cls
+bot.time.monotonic = _real_mono
+bot._tls.conn = None
+(ok if bot.post is _counting_post else bad)("14 走的是包装后的真实 post(未被假件替换)")
+bot.post = _REAL_POST
+(ok if _post_calls[0] < 2 * max(1, _emits[0]) else
+ bad)("14 期限到了 edit_only 不再回退重试: post 调用 %d 次 < emit %d × 2"
+      % (_post_calls[0], _emits[0]))
+print("       post 调用 %d 次" % _post_calls[0])
+print("       emit %d 次 / 传输尝试 %d 次 / 模拟耗时 %.0fs / 实测墙钟 %.2fs"
+      % (_emits[0], len(_DeadConn.tries), _sim, _wall))
+(ok if _sim <= bot.UPD_CHECK_BUDGET else
+ bad)("投递受期限约束: 模拟耗时 %.0fs ≤ 总预算 %.0fs" % (_sim, bot.UPD_CHECK_BUDGET))
+(ok if len(_DeadConn.tries) < 2 * max(1, _emits[0]) else
+ bad)("期限到了就不再回退重试: 传输 %d 次 < emit %d × 2(否则说明 edit_only 仍走满回退)"
+      % (len(_DeadConn.tries), _emits[0]))
+(ok if any(t is not None and t < bot.API_TIMEOUT for t in _DeadConn.tries) else
+ bad)("至少一次传输的 socket 超时被期限压小(实得 %r)" % (_DeadConn.tries,))
+(ok if 1401 not in bot._upd_inflight and (1401, 141) not in bot._upd_sess else
+ bad)("不可达之后两张表都清理")
+
+print()
+print("══ 15. 排队过期: 先占满 worker, 再受理, 推进时间, 核对裁决 ══")
+with bot._upd_lock:
+    bot._upd_inflight.clear(); bot._upd_sess.clear()
+tg = Tg(); with_tg(tg)
+_hold = threading.Event()
+for _ in range(bot._EXEC._max_workers):
+    bot._EXEC.submit(lambda: _hold.wait(40))
+time.sleep(0.4)
+(ok if all(w for w in [True]) else bad)("worker 已被占满(提交了 %d 个阻塞任务)" % bot._EXEC._max_workers)
+_gitcalls = []
+bot.update_check = lambda budget=None: (_gitcalls.append(1), (True, "x"))[1]
+_CK2 = _Clock()
+bot.time.monotonic = _CK2.mono
+_v, _t = bot._upd_check_async(1501, 151)
+(ok if _v == bot.ACCEPT_OK and 1501 in bot._upd_inflight else
+ bad)("worker 满时仍先受理并占名额(实得 %r)" % (_v,))
+_CK2.advance(bot.UPD_CHECK_BUDGET - bot.UPD_DELIVER_BUDGET + 1)
+time.sleep(bot.UPD_REAP_TICK * 3)
+(ok if 1501 not in bot._upd_inflight else
+ bad)("排队过期被裁决并释放名额(不等空闲 worker; 在飞 %r)" % (list(bot._upd_inflight),))
+_hold.set()
+time.sleep(1.2)
+(ok if not _gitcalls else
+ bad)("迟到启动的旧任务不再执行检查/Git(实得 %d 次)" % len(_gitcalls))
+_texts = tg.texts("editMessageText")
+(ok if any("排队过久" in t for t in _texts) else
+ bad)("排队过期有终态说明(实得 %r)" % (_texts[-2:],))
+bot.time.monotonic = _real_mono
+
+print()
+print("══ 16. 补绘期间第二次导航: 最后页面必须对应最新动作 ══")
+with bot._upd_lock:
+    bot._upd_inflight.clear(); bot._upd_sess.clear()
+gt = GateTg(); bot.post = gt.post
+_rel = threading.Event()
+bot.update_check = lambda budget=None: (_rel.wait(15), (True, "🔄 旧结果F"))[1]
+bot.handle_cb(1601, 161, "upd_check"); time.sleep(0.3)
+gt.gates["旧结果F"] = threading.Event()
+_rel.set()
+(ok if _wait_gate(gt, "旧结果F") else bad)("16 旧结果已进入网络调用(窗口成立)")
+_rs = bot.status_text
+bot.status_text = lambda: "（菜单A）"
+try:
+    bot.handle_cb(1601, 161, "menu")
+finally:
+    bot.status_text = _rs
+gt.gates["菜单A"] = threading.Event()      # 卡住补绘 A
+gt.gates["旧结果F"].set()
+_wait_gate(gt, "菜单A")
+bot.status_text = lambda: "（菜单B）"       # 用户又翻到 B
+try:
+    bot.handle_cb(1601, 161, "menu")
+finally:
+    bot.status_text = _rs
+time.sleep(0.2)
+gt.gates["菜单A"].set()
+_settle(1601); _quiesce(gt, limit=12)
+_s = gt.seq()
+(ok if _s and "菜单B" in _s[-1] else
+ bad)("16 补绘服从最新意图, 最后页面是 B(实得 %r)" % (_s,))
+
+print()
+print("══ 17. 取消资格 / 拒绝通知归属 / 通知合并 ══")
+# 17a 被标记 cancelled 的排队任务, 即使 worker 后来空出来也不得执行检查
+with bot._upd_lock:
+    bot._upd_inflight.clear(); bot._upd_sess.clear()
+tg = Tg(); with_tg(tg)
+_hold = threading.Event()
+for _ in range(bot._EXEC._max_workers):
+    bot._EXEC.submit(lambda: _hold.wait(30))
+time.sleep(0.4)
+_calls = []
+bot.update_check = lambda budget=None: (_calls.append(1), (True, "x"))[1]
+_v, _t = bot._upd_check_async(1701, 171)
+(ok if _v == bot.ACCEPT_OK else bad)("17a 已受理并排队(实得 %r)" % (_v,))
+with bot._upd_lock:                      # 模拟收割线程刚标记、还没来得及丢弃会话的那个窗口
+    bot._upd_sess[(1701, 171)]["cancelled"] = True
+_hold.set()
+_t0 = time.monotonic()
+while 1701 in bot._upd_inflight and time.monotonic() - _t0 < 15:
+    time.sleep(0.05)
+(ok if not _calls else
+ bad)("17a 已取消资格的任务即使拿到 worker 也不执行检查(实得 %d 次)" % len(_calls))
+(ok if not any("检查更新中" in t for t in tg.texts()) else
+ bad)("17a 已取消资格的任务不发进度(实得 %r)" % (tg.texts(),))
+
+# 17b 拒绝通知必须有可作废的归属
+with bot._upd_lock:
+    bot._upd_inflight.clear(); bot._upd_sess.clear()
+bot.update_check = lambda budget=None: (True, "x")
+_held = threading.Event()
+bot.update_check = lambda budget=None: (_held.wait(20), (True, "x"))[1]
+for _c in range(1710, 1710 + bot.UPD_MAX_INFLIGHT):
+    bot._upd_check_async(_c, _c)
+_v, _t = bot._upd_check_async(1799, 179)
+(ok if _v == bot.ACCEPT_FULL and _t else
+ bad)("17b 超出上限得到 FULL 且带归属(实得 %r/%s)" % (_v, bool(_t)))
+_sess = bot._upd_sess.get((1799, 179))
+(ok if _sess and _sess.get("kind") == "notice" else
+ bad)("17b 拒绝通知有自己的会话记录(kind=%r)" % ((_sess or {}).get("kind"),))
+(ok if _sess and _sess.get("deadline") else bad)("17b 拒绝通知带期限")
+bot._upd_invalidate(1799, 179)
+(ok if bot._upd_sess.get((1799, 179), {}).get("token") is None else
+ bad)("17b 拒绝通知可被导航作废")
+tg = Tg(); with_tg(tg)
+bot._upd_notify(1799, 179, "迟到的拒绝通知", _t, time.monotonic() + 10)
+time.sleep(0.5)
+(ok if not any("迟到的拒绝通知" in t for t in tg.texts()) else
+ bad)("17b 作废之后迟到的拒绝通知不再写入(实得 %r)" % (tg.texts(),))
+_held.set()
+_t0 = time.monotonic()
+while bot._upd_inflight and time.monotonic() - _t0 < 15:
+    time.sleep(0.05)
+
+# 17c 连点不新开工作: 待发表按消息合并
+with bot._upd_lock:
+    bot._upd_inflight.clear(); bot._upd_sess.clear(); bot._upd_notify_pending.clear()
+_gate = threading.Event()
+_seen_note = [0]
+_lk = threading.Lock()
+
+
+class _SlowTg(Tg):
+    def post(self, method, params, deadline=None):
+        t = params.get("text") or ""
+        if "还在跑" in t:
+            with _lk:
+                _seen_note[0] += 1
+            _gate.wait(10)
+        return Tg.post(self, method, params, deadline)
+
+
+tg = _SlowTg(); with_tg(tg)
+_submits = [0]
+_real_note_submit = bot._upd_notify_exec.submit
+
+
+def _counting_submit(fn, *a, **k):
+    _submits[0] += 1
+    return _real_note_submit(fn, *a, **k)
+
+
+bot._upd_notify_exec.submit = _counting_submit
+_hold2 = threading.Event()
+bot.update_check = lambda budget=None: (_hold2.wait(25), (True, "终态17c"))[1]
+bot._upd_check_async(1720, 172)
+time.sleep(0.2)
+_base_threads = threading.active_count()
+_peak_pending = 0
+for _ in range(20):
+    bot.handle_cb(1720, 172, "upd_check")
+    _peak_pending = max(_peak_pending, len(bot._upd_notify_pending))
+time.sleep(0.5)
+_grew = threading.active_count() - _base_threads
+(ok if _peak_pending <= 1 else
+ bad)("17c 待发通知按消息合并(峰值 %d 条, 应 ≤1)" % _peak_pending)
+(ok if _grew <= 2 else
+ bad)("17c 连点 20 次不新开线程(线程 +%d, 应 ≤2)" % _grew)
+(ok if _seen_note[0] <= 1 else
+ bad)("17c 实际发出的忙提示 ≤1 条(实得 %d)" % _seen_note[0])
+(ok if _submits[0] <= 1 else
+ bad)("17c 连点 20 次只给通知执行器排 1 份工作(实得 %d 份)" % _submits[0])
+bot._upd_notify_exec.submit = _real_note_submit
+_gate.set(); _hold2.set()
+_t0 = time.monotonic()
+while 1720 in bot._upd_inflight and time.monotonic() - _t0 < 20:
+    time.sleep(0.05)
+(ok if 1720 not in bot._upd_inflight and not bot._upd_notify_pending else
+ bad)("17c 结束后在飞表与待发表都清空")
 
 print()
 print("-" * 62)

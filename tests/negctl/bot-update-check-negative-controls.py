@@ -60,12 +60,23 @@ INVAL = lift(r'^    _upd_invalidate\(chat, mid\)$')
 CLIP = lift(r'^    return line if len\(line\) <= UPD_LINE_MAX else line\[:UPD_LINE_MAX - 1\] \+ "…"$')
 # ── 本轮新增的六条承重性质 ────────────────────────────────────────────────────
 SENDLOCK = lift(r'^    with send_lock:$')
+# ── 本轮六项 ──────────────────────────────────────────────────────────────────
+POSTDL = lift(r'^        if deadline is not None:\n            left = deadline - time\.monotonic\(\)\n            if left <= 0:\n                print\("api", method, "deadline-exceeded"\); return \{\}$')
+EDITDL = lift(r'^    if deadline is not None and time\.monotonic\(\) >= deadline:$')
+REAPER = lift(r'^                if now >= sess\["deadline"\] - UPD_DELIVER_BUDGET:$')
+CANCEL = lift(r'^                if not sess or sess\.get\("job"\) != job or sess\.get\("cancelled"\):$')
+DROPJOB = lift(r'^    if sess is not None and sess\.get\("job"\) == job:\n        _upd_sess\.pop\(\(chat, mid\), None\)$')
+NOTICE = lift(r'^            job = _upd_new_sess\(chat, mid, now \+ UPD_NOTICE_BUDGET, kind="notice"\)\n            return ACCEPT_FULL, job$')
+NOTEMERGE = lift(r'^    if had:\n        return$')
+INTENTVER = lift(r'^        ver, intent, last = _intent_now\(chat, mid\)$')
 PHASE = lift(r'^            if sess\.get\("phase", 0\) >= want:\n                return False, "stale-phase"$')
-NOTIFY_TOK = lift(r'^        if token:\n            _upd_emit\(chat, mid, token, "busy", text, BACK\)\n        else:\n            edit_only\(chat, mid, text, BACK\)$')
-ADMIT = lift(r'^        if len\(_upd_inflight\) >= UPD_MAX_INFLIGHT:\n            return ACCEPT_FULL, None$')
+# 忙/拒绝反馈现在一律经通道(notice 阶段), 锚点跟着挪。
+NOTIFY_TOK = lift(r'^            _upd_emit\(chat, mid, tok, "notice", txt, BACK\)$')
+ADMIT = lift(r'^        if len\(_upd_inflight\) >= UPD_MAX_INFLIGHT:$')
 SHALLOW = lift(r'^    if shallow\.returncode != 0 or _sv not in \("true", "false"\):\n.*?shallow\.returncode$')
 SLUGCAP = lift(r'^        cap = 5 if deadline is None else min\(5, max\(0\.0, deadline - time\.monotonic\(\)\)\)$')
-REPAINT = lift(r'^            if len\(hist\) > 1 and hist\[0\]\[0\] == text and hist\[1\]\[0\] not in mine:$')
+# 补绘已改成按用户意图版本收敛, 锚点指到它的调用点。
+REPAINT = lift(r'^        if need_repaint and delivered:\n            _upd_repaint\(chat, mid, dl\)$')
 KILLPG = lift(r'^        try:\n            os\.killpg\(os\.getpgid\(p\.pid\), signal\.SIGKILL\)\n.*?p\.kill\(\)$')
 
 MUT = [
@@ -97,16 +108,33 @@ MUT = [
     ("⑧ 取消阶段序(低阶段可以盖掉已落地的高阶段)",
      [(PHASE, '            if False:\n                return False, "stale-phase"', 1)]),
     ("⑨ 忙反馈绕过通道(退化成裸 edit_only)",
-     [(NOTIFY_TOK, '        edit_only(chat, mid, text, BACK)', 1)]),
+     [(NOTIFY_TOK, '            edit_only(chat, mid, txt, BACK)', 1)]),
     ("⑩ 取消全局准入上限(线程有限≠队列有界)",
-     [(ADMIT, '        if False:\n            return ACCEPT_FULL, None', 1)]),
+     [(ADMIT, '        if False:', 1)]),
     ("⑪ shallow 探测不校验退出码/取值",
      [(SHALLOW, '    if False:\n        return False, "x" % shallow.returncode', 1)]),
     ("⑫ origin 查询另拿独立预算",
      [(SLUGCAP, '        cap = 5', 1)]),
     ("⑬ 取消导航抢写后的收敛修复",
-     [(REPAINT, '            if False:', 1)]),
-    ("⑭ 只加无关注释(反向对照)",
+     [(REPAINT, '        if False:\n            _upd_repaint(chat, mid, dl)', 1)]),
+    ("⑮ post 忽略 deadline(投递回到恒定 70s + 必重连)",
+     [(POSTDL, '        if False:\n            left = 0\n            if left <= 0:\n'
+               '                print("x"); return {}', 1)]),
+    ("⑯ edit_only 期限到了仍然回退重试",
+     [(EDITDL, '    if False:', 1)]),
+    ("⑰ 取消收割线程的排队裁决(回到等空闲 worker)",
+     [(REAPER, '                if False:', 1)]),
+    ("⑱ 迟到启动的旧任务仍然执行(不看 cancelled)",
+     [(CANCEL, '                if not sess or sess.get("job") != job:\n                    return', 1)]),
+    ("⑲ 清理按写入权而不是稳定身份(作废后漏清理)",
+     [(DROPJOB, '    if sess is not None and sess.get("token") == job:\n        _upd_sess.pop((chat, mid), None)', 1)]),
+    ("⑳ 拒绝通知不再建归属(裸通知, 不可作废)",
+     [(NOTICE, '            return ACCEPT_FULL, None', 1)]),
+    ("㉑ 通知不合并(每次点击都排一份新工作)",
+     [(NOTEMERGE, '    if False:\n        return', 1)]),
+    ("㉒ 补绘回到猜「最近一次写入」而非最新意图",
+     [(INTENTVER, '        ver, intent, last = (0, None, None)', 1)]),
+    ("㉓ 只加无关注释(反向对照)",
      [(INVAL, '    # (负控的空转对照)\n' + INVAL, 1)]),
 ]
 
@@ -188,7 +216,7 @@ try:
             bad("%s → 正控没有正常运行(%s), 这一格既不算有牙也不算无牙" % (tag, kind))
             continue
         new = got - base
-        if tag.startswith("⑭"):
+        if tag.startswith("㉓"):
             (ok if not new else bad)("%s → %d 条新增(应为 0)" % (tag, len(new)))
             continue
         if new:
