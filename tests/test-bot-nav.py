@@ -63,10 +63,14 @@ assert_near('if data == "test":', 'edit(chat, mid, "测试中…", BACK)', (
 assert 'edit(chat, mid, "测试中…", None)' not in bot, (
     "passing None to edit() falls back to the full first-level MENU"
 )
-assert_near('if data == "upd_check":', 'edit(chat, mid, "🔄 检查更新中…", BACK)', (
-    "update-check progress message should show only a back button, not the full first-level menu"
-))
-assert 'edit(chat, mid, "🔄 检查更新中…", None)' not in bot, (
+# 检查改成后台执行之后, 这条"进行中"文案多了一句"结果会更新到这条消息" —— 结果是异步回填的,
+# 得告诉用户去哪儿看。断言的性质一个字没松: 仍然要求它挂 BACK 而不是整排一级菜单。
+assert_near('if data == "upd_check":',
+            'edit(chat, mid, "🔄 检查更新中…(结果会更新到这条消息)", BACK)', (
+                "update-check progress message should show only a back button, "
+                "not the full first-level menu"
+            ))
+assert 'edit(chat, mid, "🔄 检查更新中…(结果会更新到这条消息)", None)' not in bot, (
     "passing None to edit() falls back to the full first-level MENU"
 )
 none_progress_edits = re.findall(r"edit\(chat, mid, [^\n]+, None\)", bot)
