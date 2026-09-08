@@ -60,15 +60,30 @@ del_sel: dict[int, set] = {}   # 删规则多选: chat -> 已勾选域名集合
 # 一条 HTTPS 连接不能被多线程并发复用(交错请求会串包), 故按线程隔离而非全局共享。
 _tls = threading.local()
 
-def post(method, params):
+API_TIMEOUT = 70                 # 默认单次传输上限(主轮询 getUpdates 靠它)
+
+
+def post(method, params, deadline=None):
+    """调一次 Telegram API。
+
+    deadline(time.monotonic 的绝对时刻)给了就**真正约束**这一次调用: 每次传输的 socket
+    超时取"剩余时间"与默认值的较小者, 剩余为 0 就直接放弃, 重试也要重新看剩余。
+    以前这里恒用 70s 且必重连一次 —— 于是一次检查的两个 emit 各带两段回退, 合起来能发出
+    8 次传输、耗掉 560 秒, 远超整次检查的预算。调用方不传 deadline 时行为一个字不变。
+    """
     body = json.dumps(params).encode()
     path = "/bot" + TOKEN + "/" + method
     hdr = {"Content-Type": "application/json", "Connection": "keep-alive"}
     for attempt in (0, 1):                       # 连接断了就重连重试一次
+        if deadline is not None:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                print("api", method, "deadline-exceeded"); return {}
         try:
             conn = getattr(_tls, "conn", None)
             if conn is None:
-                conn = http.client.HTTPSConnection("api.telegram.org", timeout=70)
+                _to = API_TIMEOUT if deadline is None else max(0.1, min(API_TIMEOUT, left))
+                conn = http.client.HTTPSConnection("api.telegram.org", timeout=_to)
                 _tls.conn = conn
             conn.request("POST", path, body, hdr)
             data = conn.getresponse().read()
@@ -330,22 +345,42 @@ def send_tracked(chat, text, kb=None):
 _last_page: dict = {}
 _last_page_lock = threading.Lock()
 _LAST_PAGE_MAX = 256
+# 用户**意图版本**: 每次回调进来 +1。只有主轮询线程(handle_cb 里)写的页面才算"用户想看的",
+# 后台任务/补绘写的不算 —— 靠一个 thread-local 区分, 不用改 137 处调用方。
+_intent: dict = {}                 # (chat, mid) -> (ver, text, kb)
+_intent_ver: dict = {}             # (chat, mid) -> ver
+_last_write: dict = {}             # (chat, mid) -> 最近一次**成功**写入的文本
+_intent_tls = threading.local()
+
+
+def _bump_intent(chat, mid):
+    with _last_page_lock:
+        v = _intent_ver.get((chat, mid), 0) + 1
+        _intent_ver[(chat, mid)] = v
+        while len(_intent_ver) > _LAST_PAGE_MAX:
+            _intent_ver.pop(next(iter(_intent_ver)))
+        return v
+
+
+def _intent_now(chat, mid):
+    with _last_page_lock:
+        return _intent_ver.get((chat, mid), 0), _intent.get((chat, mid)), _last_write.get((chat, mid))
 
 
 def _remember_page(chat, mid, text, kb):
-    """记最近**两**条: 后台任务抢在导航之后落地时, 要靠上一条把用户真正要看的那页补回去。"""
+    """记一次成功写入。**带上写它的那一刻的用户意图版本** —— 只有主轮询线程有版本号,
+    后台写入没有, 于是"用户想看哪一页"不会被后台的迟到写入冒名顶替。"""
     if mid is None:
         return
+    ver = getattr(_intent_tls, "ver", None)
     with _last_page_lock:
-        hist = _last_page.get((chat, mid)) or []
-        _last_page[(chat, mid)] = ([(text, kb)] + hist)[:2]
-        while len(_last_page) > _LAST_PAGE_MAX:
-            _last_page.pop(next(iter(_last_page)))
-
-
-def _recall_pages(chat, mid):
-    with _last_page_lock:
-        return list(_last_page.get((chat, mid)) or [])
+        _last_write[(chat, mid)] = text
+        if ver is not None:
+            _intent[(chat, mid)] = (ver, text, kb)
+        while len(_last_write) > _LAST_PAGE_MAX:
+            _last_write.pop(next(iter(_last_write)))
+        while len(_intent) > _LAST_PAGE_MAX:
+            _intent.pop(next(iter(_intent)))
 
 
 def edit(chat, mid, text, kb=None):
@@ -358,7 +393,7 @@ def edit(chat, mid, text, kb=None):
         _remember_page(chat, mid, text, kb); return
     send(chat, text, kb)             # 仍不行(如消息已删)再发新消息
 
-def edit_only(chat, mid, text, kb=None):
+def edit_only(chat, mid, text, kb=None, deadline=None):
     """只尝试原地编辑, **绝不退化成发新消息**。成功 True, 失败 False。
 
     给后台监听这类"事后回报"用: 用户可能早就把那条消息删了, 这时普通 edit() 的 fallback
@@ -366,11 +401,17 @@ def edit_only(chat, mid, text, kb=None):
     只在日志里留一行(不含正文)。"""
     p = {"chat_id": chat, "message_id": mid, "text": text, "parse_mode": "HTML",
          "reply_markup": kb or MENU, "disable_web_page_preview": True}
-    r = post("editMessageText", p)
+    # 兼容: 没有期限时**按原样两参调用** —— 既有调用方(以及它们的测试替身)一个字都不用改。
+    def _post(pp):
+        return post("editMessageText", pp) if deadline is None else post("editMessageText", pp, deadline)
+
+    r = _post(p)
     if r.get("ok"):
         _remember_page(chat, mid, text, kb); return True
+    if deadline is not None and time.monotonic() >= deadline:
+        print("edit_only give up: deadline"); return False   # 期限到了就不再回退重试
     p.pop("parse_mode", None)        # HTML 解析失败(文本含 < & 等)→ 退回纯文本再试一次
-    r = post("editMessageText", p)
+    r = _post(p)
     if r.get("ok"):
         _remember_page(chat, mid, text, kb); return True
     print("edit_only skipped", (r or {}).get("error_code"), flush=True)
@@ -2878,30 +2919,35 @@ def update_check(budget=None):
     except Exception as e:  # noqa: BLE001   # 不带异常正文(可能含远端 URL/凭据)
         return False, "❌ 检查更新失败(%s), 本次无结论。稍后重试。" % type(e).__name__
 
-# ── 检查更新: 受理 → 排队 → 执行 → 投递, 全程有界且写入有序 ──────────────────
-# 上一版把检查挪到后台就以为完事了, 留下六个洞(每一个都在 tests/ 里有确定性复现):
-#   · 结果比"检查中"先落地 → 终态被进度覆盖(倒退);
-#   · "还在跑"先出发后落地 → 终态被它覆盖;
-#   · 初始 edit 失败会 send 一条新消息 → 孤立进度消息, 任务只认原 mid, 永不更新它;
-#   · 过了 token 检查、正在投递时用户返回菜单 → 新页面被旧结果取代;
-#   · 提交失败被说成"上一次还在跑";
-#   · 初始提示/忙反馈在主轮询里同步发 → 网络慢就把 getUpdates 卡住。
-#
-# 收口办法是**一条通道**: 这条消息上的每一次写入都走 _upd_emit, 它按阶段序(进度 < 忙 < 终态)
-# 单调推进 —— 低阶段永远盖不了已经落地的高阶段。归属仍是 (chat, message_id) → token。
-# 三种写入(进度/忙/终态)一律在后台线程发出, 主轮询一次网络都不做。
-UPD_PHASE = {"progress": 1, "busy": 2, "final": 3}
-# 全局准入上限: 线程数有限**不等于**队列有界 —— ThreadPoolExecutor 的队列是无限的,
-# 4 个 worker 被占满时 20 个会话照样全被受理, 然后一起排队等到超时。
-UPD_MAX_INFLIGHT = 8
-# 排队太久就别做了: worker 真正开跑时若剩余预算不足这个数, 直接给终态, 不再发起 git。
-UPD_MIN_RUN_BUDGET = 20.0
-# 投递(含重试)与子进程收尾的固定收尾预算, 计入端到端上界。
-UPD_DELIVER_BUDGET = 40.0
+# ── 检查更新: 受理 → 排队 → 执行 → 投递, 全程有界、写入有序、归属可作废 ────────
+# 六条来之不易的性质(每条都有确定性复现与撤销负控):
+#   1. **投递也在期限内**。post/edit_only 接受 deadline: 每次传输的 socket 超时取剩余,
+#      期限到了就不再回退重试。以前恒用 70s 且必重连一次 —— 两个 emit 能发 8 次传输、560 秒。
+#   2. **排队过期不等空闲 worker**。一个共用的收割线程按期限裁决, 取消待执行的 Future、
+#      释放名额; 迟到才启动的旧任务看到 cancelled 就直接返回, 不跑 git、不发进度。
+#   3. **身份与写入权分开**。job 是稳定身份(清理按它匹配), write token 可被导航作废 ——
+#      作废写入权不等于丢掉清理自己的资格。
+#   4. **拒绝通知同样有归属与期限**: FULL / SUBMIT_FAIL 也建一条 notice 会话, 能被作废。
+#   5. **反馈不新开线程**: 一个有界的通知执行器 + 按消息合并的待发表, 连点 20 次也只有
+#      一份在途工作。主轮询不等网络、不等投递锁。
+#   6. **补绘服从最新意图**: 用用户意图版本(只有主轮询线程的写入才算意图), 不再靠"最近两条
+#      成功写入"猜; 补绘自己也受版本、归属与期限约束, 尝试次数有界。
+UPD_PHASE = {"progress": 1, "busy": 2, "notice": 2, "final": 3, "repaint": 4}
+UPD_MAX_INFLIGHT = 8               # 全局准入上限(独立于线程数)
+UPD_MIN_RUN_BUDGET = 20.0          # worker 开跑时剩余不足这个数就直接给终态
+UPD_DELIVER_BUDGET = 40.0          # 投递 + 补绘 + 收尾的固定预算
+UPD_NOTICE_BUDGET = 20.0           # 拒绝/忙 通知自己的期限
+UPD_REPAINT_MAX = 3                # 补绘尝试次数上限
+UPD_REAP_TICK = 1.0                # 收割线程的轮询间隔
 
 _upd_lock = threading.Lock()
-_upd_sess: dict = {}       # (chat, mid) -> {"token", "phase", "inflight", "deadline"}
-_upd_inflight: dict = {}   # chat -> (mid, token)
+_upd_sess: dict = {}       # (chat, mid) -> 会话
+_upd_inflight: dict = {}   # chat -> job(稳定身份)
+_upd_jobs: dict = {}       # job -> (chat, mid)
+# 通知: 一个有界执行器 + 按消息合并的待发表 —— 连点多少次都只有一份在途工作。
+_upd_notify_exec = concurrent.futures.ThreadPoolExecutor(max_workers=2,
+                                                         thread_name_prefix="pdg-updnote")
+_upd_notify_pending: dict = {}     # (chat, mid) -> (text, token, deadline)
 
 UPD_CONFIRM_KB = {"inline_keyboard": [[{"text": "✅ 确认更新", "callback_data": "upd_apply"}],
                                       [{"text": "⬅️ 返回主菜单", "callback_data": "menu"}]]}
@@ -2909,37 +2955,51 @@ UPD_CONFIRM_KB = {"inline_keyboard": [[{"text": "✅ 确认更新", "callback_da
 ACCEPT_OK, ACCEPT_BUSY, ACCEPT_FULL, ACCEPT_SUBMIT_FAIL = "ok", "busy", "full", "submit_fail"
 
 
-def _upd_invalidate(chat, mid):
-    """这条消息被新回调接管 → 作废在飞检查的写入权。
+def _upd_new_sess(chat, mid, deadline, kind="check"):
+    """建一条会话。job = 稳定身份(清理按它匹配); token = 可被作废的写入权。"""
+    job = uuid.uuid4().hex
+    _upd_sess[(chat, mid)] = {"job": job, "token": job, "phase": 0, "inflight": None,
+                              "deadline": deadline, "send": threading.Lock(),
+                              "kind": kind, "cancelled": False, "fut": None,
+                              "started": False, "repaint": False, "mine": set()}
+    _upd_jobs[job] = (chat, mid)
+    return job
 
-    返回 True 表示**此刻正有一次投递在网上飞**: 已经发出的请求收不回来(这一点不假装能做到),
-    所以由那个写入方在收到响应后, 把用户真正要看的那一页补回去(见 _upd_emit 的 repaint)。
-    """
+
+def _upd_drop_sess(chat, mid, job):
+    """按**稳定身份**清理自己的记录 —— 写入权被作废也照样能清; 同一条消息上后来新建的
+    会话 job 不同, 不会被误删。"""
+    sess = _upd_sess.get((chat, mid))
+    if sess is not None and sess.get("job") == job:
+        _upd_sess.pop((chat, mid), None)
+    _upd_jobs.pop(job, None)
+    for c, j in list(_upd_inflight.items()):
+        if j == job:
+            _upd_inflight.pop(c, None)
+
+
+def _upd_invalidate(chat, mid):
+    """这条消息被新回调接管 → 作废写入权(身份不动, 清理资格保留)。"""
     with _upd_lock:
         sess = _upd_sess.get((chat, mid))
         if not sess:
             return False
-        sess["token"] = None            # 之后任何 emit 都会被拒
+        sess["token"] = None
         if sess.get("inflight"):
-            sess["repaint"] = True      # 有一次投递正在网上飞 —— 落地后要把新页面补回去
+            sess["repaint"] = True
             return True
         return False
 
 
 def _upd_emit(chat, mid, token, phase, text, kb):
-    """这条消息的**唯一**写入口。阶段序单调: 低阶段盖不了已经落地的高阶段。
-
-    锁只用来占位与记账, **网络调用在锁外**做 —— 主轮询和导航都不会因为它而等网络。
-    """
+    """这条消息的**唯一**写入口。阶段序管准入, per-message 投递锁管落地顺序,
+    deadline 管每一次传输与重试。"""
     want = UPD_PHASE[phase]
     with _upd_lock:
         sess = _upd_sess.get((chat, mid))
         if not sess or sess.get("token") != token:
             return False, "superseded"
-        send_lock = sess["send"]
-    # **按消息串行化投递**。阶段序只管准入: 两次写入可以按序被放行, 却因为网络快慢而乱序
-    # 落地(上一版就栽在这里 —— "还在跑"先出发、后落地, 把已经到达的终态盖了回去)。
-    # 这把锁只在后台线程里持有, 主轮询和导航都不取它, 不会因此等网络。
+        send_lock, dl, job = sess["send"], sess["deadline"], sess["job"]
     with send_lock:
         with _upd_lock:
             sess = _upd_sess.get((chat, mid))
@@ -2951,106 +3011,158 @@ def _upd_emit(chat, mid, token, phase, text, kb):
             sess["inflight"] = want
             sess["mine"].add(text)
         try:
-            delivered = edit_only(chat, mid, text, kb)
+            delivered = edit_only(chat, mid, text, kb, deadline=dl)
         finally:
             with _upd_lock:
                 sess = _upd_sess.get((chat, mid))
-                if sess is not None and sess.get("inflight") == want:
-                    sess["inflight"] = None
+                if sess is not None and sess.get("job") == job:
+                    if sess.get("inflight") == want:
+                        sess["inflight"] = None
                 need_repaint = bool(sess and sess.get("repaint"))
-                mine = set(sess["mine"]) if sess else set()
         if need_repaint and delivered:
-            # 我们在"用户已经翻页"之后才落地。已经发出的请求收不回来 —— 这里做的是**收敛**:
-            # 把用户真正要看的那一页补回去。上一条页面若还是我们自己写的, 说明导航那次编辑
-            # 没落地(或失败了), 那就不补 —— 补了会把终态倒退成进度。
-            hist = _recall_pages(chat, mid)
-            if len(hist) > 1 and hist[0][0] == text and hist[1][0] not in mine:
-                edit_only(chat, mid, hist[1][0], hist[1][1])
-                return False, "repainted"
+            _upd_repaint(chat, mid, dl)
+            return False, "repainted"
     return delivered, ("ok" if delivered else "undelivered")
 
 
-def _upd_check_async(chat, mid):
-    """受理一次检查。返回 ACCEPT_* —— 忙 / 全局满 / 提交失败必须分开, 不能互相冒充。
+def _upd_repaint(chat, mid, deadline):
+    """把用户**当前**想看的那一页补回去。
 
-    **等待从受理这一刻开始计时**(accepted_at), 不是等 worker 跑起来才开始 —— 排队时间
-    也算在用户的等待里。
+    不靠"最近两条成功写入"猜: 用意图版本。每写一次就重看一次版本, 版本又变了就照最新的再写,
+    次数与期限双重有界。已经发出去的请求收不回来 —— 这里做的是收敛, 不是撤回。
     """
-    accepted_at = time.monotonic()
+    for _ in range(UPD_REPAINT_MAX):
+        if time.monotonic() >= deadline:
+            print("upd repaint give up: deadline", flush=True)
+            return
+        ver, intent, last = _intent_now(chat, mid)
+        if not intent or intent[0] != ver:
+            return                      # 当前版本还没有对应的页面, 不猜
+        if last == intent[1]:
+            return                      # 屏幕上已经是用户要看的那页
+        edit_only(chat, mid, intent[1], intent[2], deadline=deadline)
+        ver2, _i2, _l2 = _intent_now(chat, mid)
+        if ver2 == ver:
+            return                      # 期间没有新动作 —— 收敛完成
+    print("upd repaint give up: attempts", flush=True)
+
+
+def _upd_notify(chat, mid, text, token, deadline):
+    """有界通知: 同一条消息只保留一份待发工作, 重复点击合并成一次, 不新开线程。"""
     with _upd_lock:
-        cur = _upd_inflight.get(chat)
-        if cur is not None:
-            if cur[0] == mid:                       # 同一条消息上的重复点击: 归属还回去
+        had = (chat, mid) in _upd_notify_pending
+        _upd_notify_pending[(chat, mid)] = (text, token, deadline)
+    if had:
+        return
+    def go():
+        while True:
+            with _upd_lock:
+                item = _upd_notify_pending.pop((chat, mid), None)
+            if item is None:
+                return
+            txt, tok, dl = item
+            if time.monotonic() >= dl:
+                continue
+            _upd_emit(chat, mid, tok, "notice", txt, BACK)
+    try:
+        _upd_notify_exec.submit(go)
+    except Exception:  # noqa: BLE001
+        with _upd_lock:
+            _upd_notify_pending.pop((chat, mid), None)
+
+
+def _upd_reap():
+    """收割线程: 按期限裁决排队过久的检查 —— **不等空闲 worker**。
+
+    取消还没开跑的 Future、置 cancelled、释放名额, 并把终态通知交给有界通知器。
+    """
+    while True:
+        time.sleep(UPD_REAP_TICK)
+        now = time.monotonic()
+        expired = []
+        with _upd_lock:
+            for (c, m), sess in list(_upd_sess.items()):
+                if sess.get("kind") != "check" or sess.get("started") or sess.get("cancelled"):
+                    continue
+                if now >= sess["deadline"] - UPD_DELIVER_BUDGET:
+                    sess["cancelled"] = True
+                    fut = sess.get("fut")
+                    expired.append((c, m, sess["job"], sess.get("token"), sess["deadline"], fut))
+        for c, m, job, tok, dl, fut in expired:
+            if fut is not None:
+                fut.cancel()
+            with _upd_lock:
+                _upd_drop_sess(c, m, job)
+                _upd_new_sess(c, m, now + UPD_NOTICE_BUDGET, kind="notice")
+                ntok = _upd_sess[(c, m)]["token"]
+            print("upd check expired in queue", flush=True)
+            _upd_notify(c, m, "❌ 检查更新排队过久, 本次未执行(未发起任何 git)。稍后重试。",
+                        ntok, now + UPD_NOTICE_BUDGET)
+
+
+_upd_reaper = threading.Thread(target=_upd_reap, daemon=True, name="pdg-updreap")
+_upd_reaper.start()
+
+
+def _upd_check_async(chat, mid):
+    """受理一次检查。等待从**受理**这一刻计时。返回 (ACCEPT_*, token)。"""
+    now = time.monotonic()
+    with _upd_lock:
+        if chat in _upd_inflight:
+            job = _upd_inflight[chat]
+            c_m = _upd_jobs.get(job)
+            if c_m == (chat, mid):                  # 同一条消息重复点击: 写入权还回去
                 sess = _upd_sess.get((chat, mid))
                 if sess is not None:
-                    sess["token"] = cur[1]
-            # 把在飞任务的 token 一并交出去: "还在跑"这条反馈必须走**同一条通道**,
-            # 否则任务一旦已经收尾把会话记录清掉, 这条反馈就会绕过阶段序、把终态盖回去。
-            return ACCEPT_BUSY, cur[1]
+                    sess["token"] = sess["job"]
+                    return ACCEPT_BUSY, sess["job"]
+            return ACCEPT_BUSY, None
         if len(_upd_inflight) >= UPD_MAX_INFLIGHT:
-            return ACCEPT_FULL, None
-        token = uuid.uuid4().hex
-        _upd_inflight[chat] = (mid, token)
-        _upd_sess[(chat, mid)] = {"token": token, "phase": 0, "inflight": None,
-                                  "deadline": accepted_at + UPD_CHECK_BUDGET,
-                                  "send": threading.Lock(), "repaint": False, "mine": set()}
-
-    def _release():
-        with _upd_lock:
-            if _upd_inflight.get(chat) == (mid, token):
-                _upd_inflight.pop(chat, None)
-            sess = _upd_sess.get((chat, mid))
-            if sess is not None and sess.get("token") == token:
-                _upd_sess.pop((chat, mid), None)
+            job = _upd_new_sess(chat, mid, now + UPD_NOTICE_BUDGET, kind="notice")
+            return ACCEPT_FULL, job
+        job = _upd_new_sess(chat, mid, now + UPD_CHECK_BUDGET)
+        _upd_inflight[chat] = job
 
     def go():
         try:
-            _upd_emit(chat, mid, token, "progress",
-                      "🔄 检查更新中…(结果会更新到这条消息)", BACK)
-            left = _upd_sess.get((chat, mid), {}).get("deadline", 0) - time.monotonic()
+            with _upd_lock:
+                sess = _upd_sess.get((chat, mid))
+                if not sess or sess.get("job") != job or sess.get("cancelled"):
+                    return                          # 已被收割: 不跑 git, 不发进度
+                sess["started"] = True
+                dl, tok = sess["deadline"], sess.get("token")
+            left = dl - time.monotonic()
             if left < UPD_MIN_RUN_BUDGET:
-                # 排队排掉了预算: 直接给终态, 不再发起任何 git。
-                _upd_emit(chat, mid, token, "final",
-                          "❌ 检查更新排队过久, 本次未执行。稍后重试。", BACK)
+                _upd_emit(chat, mid, tok, "final",
+                          "❌ 检查更新排队过久, 本次未执行(未发起任何 git)。稍后重试。", BACK)
                 return
+            _upd_emit(chat, mid, tok, "progress",
+                      "🔄 检查更新中…(结果会更新到这条消息)", BACK)
             try:
-                has, txt = update_check(budget=max(0.0, left - UPD_DELIVER_BUDGET))
+                has, txt = update_check(budget=max(0.0, dl - time.monotonic() - UPD_DELIVER_BUDGET))
             except BaseException as e:      # noqa: BLE001
                 has, txt = False, ("❌ 检查更新失败(%s), 本次无结论。稍后重试。"
                                    % type(e).__name__)
-            delivered, why = _upd_emit(chat, mid, token, "final", txt,
+            delivered, why = _upd_emit(chat, mid, tok, "final", txt,
                                        UPD_CONFIRM_KB if has else BACK)
-            # 任务结束 ≠ 用户收到。两件事分开记。
             print("upd check finished has=%s delivered=%s why=%s"
                   % (bool(has), bool(delivered), why), flush=True)
         finally:
-            _release()
+            with _upd_lock:
+                _upd_drop_sess(chat, mid, job)      # 按稳定身份清理, 与写入权无关
 
     try:
-        _EXEC.submit(go)
-        return ACCEPT_OK, token
+        fut = _EXEC.submit(go)
+        with _upd_lock:
+            sess = _upd_sess.get((chat, mid))
+            if sess is not None and sess.get("job") == job:
+                sess["fut"] = fut
+        return ACCEPT_OK, job
     except Exception:  # noqa: BLE001
-        _release()
-        return ACCEPT_SUBMIT_FAIL, None
-
-
-def _upd_notify_async(chat, mid, text, token=None):
-    """把"忙 / 队列满 / 提交失败"这类反馈也放后台发 —— 主轮询不做网络调用。
-
-    token 非空(=有任务在飞)时走**同一条通道**, 阶段序 busy(2) < final(3): 终态已经落地就
-    直接拒掉, 不会把结果盖回去; 任务已经收尾、会话记录被清掉时, emit 同样判 superseded 而
-    不写 —— 这正是上一版的洞: 那时它退化成裸 edit_only, 把终态覆盖成了"还在跑"。
-    token 为空(队列满 / 提交失败)时这条消息上本来就没有在飞的检查, 直接写。
-    """
-    def go():
-        if token:
-            _upd_emit(chat, mid, token, "busy", text, BACK)
-        else:
-            edit_only(chat, mid, text, BACK)
-    try:
-        threading.Thread(target=go, daemon=True).start()
-    except Exception:  # noqa: BLE001
-        pass
+        with _upd_lock:
+            _upd_drop_sess(chat, mid, job)
+            njob = _upd_new_sess(chat, mid, now + UPD_NOTICE_BUDGET, kind="notice")
+        return ACCEPT_SUBMIT_FAIL, njob
 
 
 def start_update():
@@ -4835,9 +4947,18 @@ def _adblock_pending(chat, uid, kind):
 
 
 def handle_cb(chat, mid, data, uid=None):
-    # 这条消息被新回调接管了 → 作废还在飞的"检查更新"结果。用户已经返回菜单、开始更新、
-    # 或者又点了一次检查, 旧结果再写回去就是覆盖他正在看的页面。
+    # 每次回调都推进这条消息的**用户意图版本**, 并作废还在飞的"检查更新"写入权。
+    # thread-local 的版本号让 _remember_page 分得清"用户想看的页"与"后台迟到的写入" ——
+    # 补绘据此收敛到最新意图, 而不是靠猜最近两条写入。
+    _intent_tls.ver = _bump_intent(chat, mid)
     _upd_invalidate(chat, mid)
+    try:
+        return _handle_cb_inner(chat, mid, data, uid)
+    finally:
+        _intent_tls.ver = None
+
+
+def _handle_cb_inner(chat, mid, data, uid=None):
     # ── 去广告(闭集 callback, 不接受任意动作名)────────────────────────────────
     if data.startswith("adblock:"):
         act = data.split(":", 1)[1]
@@ -4969,16 +5090,20 @@ def handle_cb(chat, mid, data, uid=None):
         # 主轮询在这里**一次网络调用都不做**: 受理只动内存表, 连"检查更新中…"这条进度
         # 也由后台任务自己发 —— 否则它既会阻塞 getUpdates, 又可能后于终态落地把结果盖掉。
         # 三种受理结果必须分开说: 忙 / 全局排满 / 提交失败, 互相冒充会把用户引到错的动作上。
+        # 主轮询在这里**一次网络调用都不做, 也不等任何投递锁**: 受理只动内存表,
+        # 反馈交给有界通知器。三种受理结果分开说 —— 忙 / 全局排满 / 提交失败互不冒充。
         _acc, _tok = _upd_check_async(chat, mid)
+        _msg = None
         if _acc == ACCEPT_BUSY:
-            _upd_notify_async(chat, mid, "⏳ 上一次「检查更新」还在跑, 结果会更新到发起它的"
-                                         "那条消息。等它出结果再点。", _tok)
+            _msg = ("⏳ 上一次「检查更新」还在跑, 结果会更新到发起它的那条消息。"
+                    "等它出结果再点。")
         elif _acc == ACCEPT_FULL:
-            _upd_notify_async(chat, mid, "⏳ 正在检查更新的会话太多, 本次<b>未受理</b>。"
-                                         "稍后再点一次。")
+            _msg = "⏳ 正在检查更新的会话太多, 本次<b>未受理</b>。稍后再点一次。"
         elif _acc == ACCEPT_SUBMIT_FAIL:
-            _upd_notify_async(chat, mid, "❌ 后台执行器不可用, 本次<b>未受理</b>(没有任务在跑)。"
-                                         "稍后再试; 也可以到服务器上跑 <code>sudo pdg update</code>。")
+            _msg = ("❌ 后台执行器不可用, 本次<b>未受理</b>(没有任务在跑)。稍后再试; "
+                    "也可以到服务器上跑 <code>sudo pdg update</code>。")
+        if _msg and _tok:
+            _upd_notify(chat, mid, _msg, _tok, time.monotonic() + UPD_NOTICE_BUDGET)
         return
     if data == "upd_apply":
         ok = start_update()
