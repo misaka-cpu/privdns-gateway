@@ -92,24 +92,49 @@ class Halt(Exception):
     """前置门不过 —— 停在任何一格改坏之前, 不进变异, 不打印通过。"""
 
 
+# 两支子测试的约定(读它们的源码得来, 不是猜):
+#   · 断言一律打在**行首**: `[OK]   …` / `[FAIL] …`;
+#   · 退出码只有 0 与 1 —— 0 ⟺ 没有 [FAIL] 行, 1 ⟺ 至少一条 [FAIL] 行。
+#     早退路径(缺 pyyaml / 读不到 lib/versions.sh / 没有钉值)也是先打一条 [FAIL] 再 exit 1。
+# 判读必须与这份约定对齐, 且**与 failures() 用同一条行级规则** —— 以前这里用的是全文
+# `out.count("[OK]")`, 于是文案里引用一句 "失败时会打印 [FAIL] 开头的行" 就被算成一条断言,
+# 而 failures() 按行首只认真失败, 两边对同一份输出得出互相矛盾的结论。
+LINE_OK = re.compile(r"^\[OK\]", re.M)
+LINE_FAIL = re.compile(r"^\[FAIL\]", re.M)
+
+
+def assert_counts(out):
+    """有效断言只按**行首**认 —— 与 failures() 同一条规则。文案里引用的标记不算断言。"""
+    return len(LINE_OK.findall(out)), len(LINE_FAIL.findall(out))
+
+
 def classify_run(rc, out):
     """把"子测试到底跑没跑起来"与"跑起来了但判据没红"分开。
 
     只看 `[FAIL]` 文本是不够的: 子测试在 import 期崩掉时一条 `[FAIL]` 也不会打印, 于是
     "提取到 0 条失败"与"全绿"长得一模一样。这里按可判别的形态归类, 归类结果决定这一次
     执行**算不算数**, 而不是直接拿它当判据。
+
+    退出码、有效断言数、具名失败数三者必须自洽; 任何一对矛盾都判执行异常 —— 尤其不能
+    因为"已经打印过一条失败"就把异常退出或被信号打断当成一次正常的断言失败。
     """
-    n_ok, n_fail = out.count("[OK]"), out.count("[FAIL]")
+    n_ok, n_fail = assert_counts(out)
     if "Traceback (most recent call last)" in out:
         return "崩溃(Traceback)", n_ok, n_fail
     if "ModuleNotFoundError" in out or "ImportError" in out:
         return "导入失败", n_ok, n_fail
-    if rc == 127 or "command not found" in out or "No such file or directory" in out and n_ok + n_fail == 0:
-        return "命令不存在", n_ok, n_fail
+    if rc == 127:
+        return "命令不存在(rc=127)", n_ok, n_fail
+    if rc < 0:
+        return "被信号终止(rc=%d)" % rc, n_ok, n_fail
     if n_ok + n_fail == 0:
-        return "零断言", n_ok, n_fail
-    if rc != 0 and n_fail == 0:
-        return "非零退出但无具名失败", n_ok, n_fail
+        return "零有效断言", n_ok, n_fail
+    if rc not in (0, 1):
+        return "退出码超出约定(rc=%d, 约定只有 0/1)" % rc, n_ok, n_fail
+    if rc == 0 and n_fail:
+        return "退出码与失败数矛盾(rc=0 却有 %d 条具名失败)" % n_fail, n_ok, n_fail
+    if rc == 1 and not n_fail:
+        return "退出码与失败数矛盾(rc=1 却没有具名失败)", n_ok, n_fail
     return "正常", n_ok, n_fail
 
 
@@ -203,17 +228,18 @@ N_CONSUMER = len(CONSUMERS)
 COUNTS = anchor_counts(CI_TEXT)
 
 
-def preflight_verdict(consumers, counts, gaps):
-    """P1/P2 的**纯判定**: 只吃数据、只出结论, 便于用合成输入直接验它自己有没有牙。
-
-    返回 (P1 说明, P2 说明) 或抛 Halt。放行的两条说明各算一条断言。
-    """
+def p1_verdict(consumers):
+    """P1 的纯判定: 消费者个数必须现推得出且大于零。"""
     n = len(consumers)
     if n == 0:
         raise Halt("P1: 从 ci.yml 现推出的消费者个数是 0 —— 要么 workflow 真没有消费者, "
                    "要么推导口径与产品脱节。这正是锚点失配的样子, 不能当成「改 0 处」放过。")
-    p1 = "P1 消费者个数现推 = %d(不写死): %s" % (n, ", ".join(consumers))
+    return "P1 消费者个数现推 = %d(不写死): %s" % (n, ", ".join(consumers))
 
+
+def p2_verdict(consumers, counts, gaps):
+    """P2 的纯判定: 三个锚点处数必须都等于消费者个数, 对不上就点名到 job。"""
+    n = len(consumers)
     wrong = {lab: c for lab, c in counts.items() if c != n}
     if wrong:
         detail = "; ".join("%s=%d" % (k, v) for k, v in sorted(counts.items()))
@@ -221,14 +247,22 @@ def preflight_verdict(consumers, counts, gaps):
                  or "逐 job 结构看不出缺口 —— 多半是换了写法(缩进/字段顺序), 锚点字面量已失效")
         raise Halt("P2: 锚点处数与消费者个数(%d)对不上 —— %s。具体到 job: %s"
                    % (n, detail, named))
-    return p1, "P2 三个锚点处数均 = 消费者个数 %d(取件块 / download 引用 / needs 生产者)" % n
+    return "P2 三个锚点处数均 = 消费者个数 %d(取件块 / download 引用 / needs 生产者)" % n
+
+
+def preflight_verdict(consumers, counts, gaps):
+    """一次过两道门(正控用合成输入直接验它们有没有牙)。左到右求值, P1 先抛。"""
+    return p1_verdict(consumers), p2_verdict(consumers, counts, gaps)
 
 
 def preflight():
-    """任何一格改坏之前先过闸。不过就 raise Halt —— 不进变异, 不打印通过。"""
-    p1, p2 = preflight_verdict(CONSUMERS, COUNTS, consumer_gaps(CI_TEXT))
-    ok(p1)
-    ok(p2)
+    """任何一格改坏之前先过闸。不过就 raise Halt —— 不进变异, 不打印通过。
+
+    两道门**逐条记账**: P1 真的过了就先记一条, 不能因为 P2 随后抛 Halt 就把它一起吞掉
+    (那会让"P1 通过"这件事在报告里消失, 排查时看不出闸门停在哪一道)。
+    """
+    ok(p1_verdict(CONSUMERS))
+    ok(p2_verdict(CONSUMERS, COUNTS, consumer_gaps(CI_TEXT)))
 
 
 MUT = [
