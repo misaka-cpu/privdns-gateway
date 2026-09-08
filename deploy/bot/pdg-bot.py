@@ -11,7 +11,7 @@ UI 原地编辑消息(editMessageText), 不刷屏。改 sing-box 前备份, chec
 注: 模块可被 import (供定时任务调用 refresh_rulesets), 此时无需 token。
 """
 from __future__ import annotations
-import base64, contextlib, fcntl, hashlib, html, http.client, io, json, os, re, shutil, socket, subprocess, sys, tarfile, tempfile, threading, time, uuid
+import base64, contextlib, fcntl, hashlib, html, http.client, io, json, os, re, shutil, signal, socket, subprocess, sys, tarfile, tempfile, threading, time, uuid
 import concurrent.futures
 import urllib.parse, urllib.request, urllib.error
 from collections import Counter
@@ -2641,49 +2641,281 @@ PDG_REPO = "/opt/privdns-gateway"
 def _esc(s):
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-def _git(*args, t=60):
-    return subprocess.run(["git", "-C", PDG_REPO, *args], capture_output=True, text=True, timeout=t)
+# 一次检查的**总时限**。以前每个 git 步骤各自拿一份完整超时(fetch 120 + unshallow 180 +
+# 后面若干个 60), 最坏情况能把一次"检查更新"拖到十分钟以上, 而用户只看到"检查更新中…"。
+# 现在全链路共用一个截止时间, 后续步骤只拿**剩余**预算。
+UPD_CHECK_BUDGET = 150.0
+# fetch 是唯一可能真的很慢的一步, 给它一个上限, 免得它把后面几步的预算吃光而"卡在最后一格"。
+UPD_FETCH_CAP = 90.0
+# 整条消息的字符预算。Telegram 文本上限是 4096, 这里留出余量: 键盘、实体、以及极端情况下
+# HTML 转义把 1 个字符变成 6 个(&quot;)。**预算覆盖整条消息**, 不是只覆盖提交列表那一段。
+UPD_TG_LIMIT = 4096
+UPD_MSG_BUDGET = 3500
+# 单条提交标题的展示上限(按码点截, 截完再转义 —— 绝不切开 HTML 实体或标签)。
+UPD_LINE_MAX = 110
 
-def _fetch_release_tags():
-    r = _git("fetch", "-q", "--tags", "origin", "main", t=120)
+
+class _UpdCheckTimeout(Exception):
+    """整次检查超出总时限。单独成类, 好和"某一步 git 超时"区分开。"""
+
+
+def _upd_left(deadline, cap=None):
+    """还剩多少秒。已经超了就抛 —— 后续步骤不再重新获得完整等待时长。"""
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise _UpdCheckTimeout()
+    return min(left, cap) if cap else left
+
+
+def _git(*args, t=60):
+    """跑一条 git; 超时按**本次自己创建的进程组**收干净。
+
+    为什么不能只 kill 父进程: `git fetch` 会派生 git-remote-https 这类助手, 父进程被杀之后
+    助手还连着网络、还攥着我们这一端的管道 —— 于是 communicate() 继续等, "超时"并没有真正结束。
+    start_new_session=True 让这一次调用独占一个进程组, killpg 打到的**只可能是本次启动的进程**;
+    不按进程名做宽匹配, 不会碰到别的检查、真实升级或用户自己的 git。
+    """
+    p = subprocess.Popen(["git", "-C", PDG_REPO, *args],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         text=True, start_new_session=True)
+    try:
+        out, err = p.communicate(timeout=t)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            p.kill()
+        try:
+            out, err = p.communicate(timeout=10)     # 收尸并把管道读干净, 不留 FD
+        except subprocess.TimeoutExpired:            # 连尸体都收不掉: 如实抛, 不假装收干净了
+            out, err = "", ""
+        raise subprocess.TimeoutExpired(cmd=["git", *args], timeout=t, output=out, stderr=err)
+    return subprocess.CompletedProcess(p.args, p.returncode, out, err)
+
+
+def _fetch_release_tags(deadline=None):
+    """拉发布 tag。deadline 给了就按**剩余预算**分配, 不再每步重新计时。"""
+    def _t(cap):
+        return cap if deadline is None else _upd_left(deadline, cap)
+    r = _git("fetch", "-q", "--tags", "origin", "main", t=_t(UPD_FETCH_CAP))
     if r.returncode != 0:
         return False, (r.stderr or r.stdout or "git fetch 失败").strip()
-    shallow = _git("rev-parse", "--is-shallow-repository")
+    shallow = _git("rev-parse", "--is-shallow-repository", t=_t(20))
     if shallow.stdout.strip() == "true":
-        r = _git("fetch", "-q", "--unshallow", "--tags", "origin", "main", t=180)
+        r = _git("fetch", "-q", "--unshallow", "--tags", "origin", "main", t=_t(UPD_FETCH_CAP))
         if r.returncode != 0:
             return False, (r.stderr or r.stdout or "git fetch --unshallow 失败").strip()
     return True, ""
 
-def update_check():
-    """检查是否有更新的发布 tag(只跟 tag, 不拉 main 中间提交)。返回 (有更新?, 文本)。"""
+
+def _upd_repo_slug():
+    """从 origin 推出 owner/repo, 只接受 github.com, 并**丢掉任何 userinfo**。
+
+    远端 URL 里可能带 token(https://x-access-token:***@github.com/…), 那东西一个字都不能进
+    用户消息。推不出来就不给链接 —— 少一个链接可以, 泄凭据不行。"""
     try:
-        ok, err = _fetch_release_tags()
+        u = _git("config", "--get", "remote.origin.url", t=5).stdout.strip()
+    except Exception:  # noqa: BLE001
+        return None
+    m = re.match(r"^(?:https://|ssh://git@|git@)(?:[^@/]*@)?github\.com[:/]"
+                 r"([A-Za-z0-9._-]{1,64})/([A-Za-z0-9._-]{1,64}?)(?:\.git)?$", u)
+    return "%s/%s" % (m.group(1), m.group(2)) if m else None
+
+
+def _upd_clip(line):
+    """把一条提交标题裁到展示上限。**先裁明文再转义** —— 于是永远不会切出半个 HTML 实体。
+    按码点裁: 中文/emoji 都算一个, 不会把一个字符劈成半个字节。"""
+    line = line.replace("\r", "").strip()
+    return line if len(line) <= UPD_LINE_MAX else line[:UPD_LINE_MAX - 1] + "…"
+
+
+def _upd_render(cur, tgt, lines, slug):
+    """在**整条消息**的字符预算内渲染。总数独立于展示条数: 截断的是展示, 不是计数。"""
+    total = len(lines)
+    head = ("🔄 有新发布 <b>%s</b>(当前 <code>%s</code>,共 <b>%d</b> 个提交):\n"
+            % (_esc(tgt), _esc(cur), total))
+    links = ""
+    if slug:
+        links = ('\n📄 <a href="https://github.com/%s/releases/tag/%s">%s 发布说明</a>'
+                 ' · <a href="https://github.com/%s/compare/%s...%s">完整提交比较</a>\n'
+                 % (slug, urllib.parse.quote(tgt, safe=""), _esc(tgt),
+                    slug, urllib.parse.quote(cur, safe=""), urllib.parse.quote(tgt, safe="")))
+    tail = ("确认后后台执行 pdg update → 更新到 %s(约 30-60 秒, bot 自动重启回来)。\n"
+            "更新会同时安装该 PrivDNS Gateway 发布版指定并校验过的内核版本。" % _esc(tgt))
+
+    def assemble(shown, omitted):
+        body = ""
+        if shown:
+            note = ("\n… 另有 <b>%d</b> 条未在此显示(见上面的完整提交比较)" % omitted) if omitted else ""
+            body = "<pre>%s</pre>%s\n" % ("\n".join(shown), note)
+        return head + body + links + tail
+
+    esc = [_esc(_upd_clip(x)) for x in lines]
+    shown = []
+    for i, e in enumerate(esc):
+        cand = shown + [e]
+        if len(assemble(cand, total - len(cand))) > UPD_MSG_BUDGET:
+            break
+        shown = cand
+    msg = assemble(shown, total - len(shown))
+    if len(msg) > UPD_MSG_BUDGET:            # 连零条提交都放不下(极端长的 tag/版本串)
+        msg = head + links + tail
+    return msg
+
+
+def update_check(budget=None):
+    """检查是否有更新的发布 tag(只跟 tag, 不拉 main 中间提交)。返回 (有更新?, 文本)。
+
+    三条契约, 都是这一版补的:
+      · **整条链路**都在 try 里 —— 以前只包到 `tag -l`, 后面的 rev-parse / merge-base / log
+        一旦超时就把异常抛给调用方, 回调拿不到终态, 页面永远停在"检查更新中…";
+      · **判不出来就说判不出来**。任何一步非零返回、输出为空、或超时, 一律 ❌, 不退回 🟢;
+      · **不回显可能含凭据的东西**: git 的 stderr 里可能有远端 URL(带 token), 所以只报
+        "第几步失败 + 返回码/异常类名", 不带命令行、不带环境、不带异常正文。
+    """
+    deadline = time.monotonic() + (UPD_CHECK_BUDGET if budget is None else budget)
+
+    def g(*args, cap=30):
+        return _git(*args, t=_upd_left(deadline, cap))
+
+    try:
+        ok, err = _fetch_release_tags(deadline)
         if not ok:
-            return False, f"检查更新失败: {err}"
-        cur = _git("describe", "--tags", "--always").stdout.strip()
-        tags = _git("tag", "-l", "v*", "--sort=-v:refname").stdout.split()
-    except Exception as e:  # noqa: BLE001
-        return False, f"检查更新失败: {e}"
-    if not tags:
-        return False, "🟢 仓库还没有发布 tag。"
-    tgt = tags[0]
-    head = _git("rev-parse", "HEAD").stdout.strip()
-    tcommit = _git("rev-parse", tgt + "^{commit}").stdout.strip()
-    if head == tcommit:
-        return False, f"🟢 已是最新发布 <b>{tgt}</b>。"
-    mb = _git("merge-base", "--is-ancestor", "HEAD", tgt)
-    if mb.returncode == 0:
-        pass
-    elif mb.returncode == 1:
-        return False, f"🟢 已是最新(当前 <code>{cur}</code> 不落后于最新发布 {tgt})。"
-    else:
-        return False, f"检查更新失败: merge-base 判断失败: {(mb.stderr or mb.stdout).strip()}"
-    log = _git("log", "--oneline", "HEAD.." + tgt).stdout.strip()
-    n = len(log.splitlines())
-    return True, (f"🔄 有新发布 <b>{tgt}</b>(当前 <code>{cur}</code>,含 {n} 个提交):\n"
-                  f"<pre>{_esc(log)}</pre>\n确认后后台执行 pdg update → 更新到 {tgt}(约 30-60 秒, bot 自动重启回来)。\n"
-                  "更新会同时安装该 PrivDNS Gateway 发布版指定并校验过的内核版本。")
+            # err 来自 git stderr, 可能含远端 URL → 只说哪一步坏了, 不带正文
+            print("upd check fetch failed", (err or "")[:0], flush=True)
+            return False, "❌ 检查更新失败: 拉取发布 tag 没成功(网络或仓库状态)。稍后重试。"
+
+        r = g("describe", "--tags", "--always")
+        cur = r.stdout.strip()
+        if r.returncode != 0 or not cur:
+            return False, "❌ 检查更新失败: 读不出当前版本(git describe 返回 %d)。" % r.returncode
+
+        r = g("tag", "-l", "v*", "--sort=-v:refname")
+        if r.returncode != 0:
+            return False, "❌ 检查更新失败: 读不出发布 tag 列表(git tag 返回 %d)。" % r.returncode
+        tags = r.stdout.split()
+        if not tags:
+            # 一条发布 tag 都没读到 —— 那就**判不出**最新是哪一版。以前这里报 🟢, 但绿色
+            # 读起来就是"你已经最新了", 而实际情况是我们根本不知道最新是什么。
+            return False, "❌ 检查更新失败: 没有读到任何发布 tag(v*), 本次判不出是否有新版本。"
+        tgt = tags[0]
+
+        r = g("rev-parse", "HEAD")
+        head = r.stdout.strip()
+        if r.returncode != 0 or not head:
+            return False, "❌ 检查更新失败: 读不出当前提交(git rev-parse 返回 %d)。" % r.returncode
+
+        r = g("rev-parse", tgt + "^{commit}")
+        tcommit = r.stdout.strip()
+        if r.returncode != 0 or not tcommit:
+            return False, ("❌ 检查更新失败: 解析不出 %s 指向的提交(git rev-parse 返回 %d)。"
+                           % (_esc(tgt), r.returncode))
+        if head == tcommit:
+            return False, "🟢 已是最新发布 <b>%s</b>。" % _esc(tgt)
+
+        # merge-base --is-ancestor 是**三态**: 0=HEAD 是 tgt 的祖先(确实有更新)、
+        # 1=不是祖先(已是最新)、其它=git 自己出错。三者必须分开 —— 把"出错"并进"已是最新"
+        # 就是拿故障冒充绿色。这三个分支有 tests/test-release-flow.sh 的静态守卫盯着。
+        mb = g("merge-base", "--is-ancestor", "HEAD", tgt)
+        if mb.returncode == 0:
+            pass
+        elif mb.returncode == 1:
+            return False, ("🟢 已是最新(当前 <code>%s</code> 不落后于最新发布 %s)。"
+                           % (_esc(cur), _esc(tgt)))
+        else:
+            return False, ("❌ 检查更新失败: merge-base 判断失败(返回 %d), 本次无结论。"
+                           % mb.returncode)
+
+        r = g("log", "--oneline", "HEAD.." + tgt, cap=60)
+        if r.returncode != 0:
+            return False, "❌ 检查更新失败: 取不到提交列表(git log 返回 %d)。" % r.returncode
+        lines = [x for x in r.stdout.splitlines() if x.strip()]
+        if not lines:
+            # 前面已判定 HEAD 落后于 tgt, 这里却一条提交都没有 —— 自相矛盾, 不猜
+            return False, "❌ 检查更新失败: 版本关系与提交列表对不上, 本次无结论。"
+        return True, _upd_render(cur, tgt, lines, _upd_repo_slug())
+    except _UpdCheckTimeout:
+        return False, ("❌ 检查更新超时(超过 %d 秒仍未完成), 本次无结论。稍后重试。"
+                       % int(UPD_CHECK_BUDGET if budget is None else budget))
+    except subprocess.TimeoutExpired:
+        return False, "❌ 检查更新失败: git 操作超时, 本次无结论。稍后重试。"
+    except Exception as e:  # noqa: BLE001   # 不带异常正文(可能含远端 URL/凭据)
+        return False, "❌ 检查更新失败(%s), 本次无结论。稍后重试。" % type(e).__name__
+
+# ── 检查更新的后台执行与消息归属 ────────────────────────────────────────────
+# 为什么必须后台: 检查里有 git fetch, 线上要走网络。以前它**同步跑在主 getUpdates 循环里**,
+# 这段时间整个 bot 不响应任何菜单。
+# 为什么不用 run_bg: run_bg 会占住 per-chat BUSY, 于是"检查更新"期间用户连自检、状态都点不了 ——
+# 而检查本身不改任何配置, 没有互斥的必要。这里只给**这一个入口**一个 per-chat 在飞上限。
+# 归属沿用本文件里 WLOC 监听那套最小写法: (chat, message_id) → token。用户在这条消息上做任何
+# 新动作(返回菜单、开始更新、再点一次检查)都会换掉 token, 旧检查的结果就不再往回写 ——
+# 不用补发把用户已经翻过去的页面刷回来。
+_upd_lock = threading.Lock()
+_upd_token: dict[tuple, str] = {}     # (chat, mid) -> token; 只有持有当前 token 的任务能写回
+_upd_inflight: dict = {}              # chat -> (mid, token); 同一会话同时只允许一次检查
+
+UPD_CONFIRM_KB = {"inline_keyboard": [[{"text": "✅ 确认更新", "callback_data": "upd_apply"}],
+                                      [{"text": "⬅️ 返回主菜单", "callback_data": "menu"}]]}
+
+
+def _upd_invalidate(chat, mid):
+    """这条消息被任何新回调接管 → 作废还在飞的检查结果。"""
+    with _upd_lock:
+        _upd_token.pop((chat, mid), None)
+
+
+def _upd_check_async(chat, mid):
+    """把一次检查放进后台执行器。返回 True=已受理, False=忙/提交失败(调用方给明确反馈)。"""
+    with _upd_lock:
+        cur = _upd_inflight.get(chat)
+        if cur is not None:
+            # 同一条消息上的重复点击: handle_cb 入口刚把归属作废掉了, 这里**还回去** ——
+            # 否则在飞的那次检查出了结果也不敢写回, 页面就永久停在"还在跑"上, 等于把旧的
+            # "检查更新中…"换成了一个新的卡死态。
+            if cur[0] == mid:
+                _upd_token[(chat, mid)] = cur[1]
+            return False
+        token = uuid.uuid4().hex
+        _upd_inflight[chat] = (mid, token)
+        _upd_token[(chat, mid)] = token
+
+    def _release():
+        with _upd_lock:
+            if _upd_inflight.get(chat) == (mid, token):
+                _upd_inflight.pop(chat, None)
+            if _upd_token.get((chat, mid)) == token:
+                _upd_token.pop((chat, mid), None)
+
+    def superseded():
+        with _upd_lock:
+            return _upd_token.get((chat, mid)) != token
+
+    def go():
+        try:
+            try:
+                has, txt = update_check()
+            except BaseException as e:      # noqa: BLE001  兜底: 任何逃逸都要变成终态
+                has, txt = False, ("❌ 检查更新失败(%s), 本次无结论。稍后重试。"
+                                   % type(e).__name__)
+            if superseded():
+                # 用户已经翻到别的页面了。**不补发** —— 补发等于把他刚离开的界面又刷回来。
+                print("upd check superseded", flush=True)
+                return
+            # edit_only: 只原地改, 编辑不成就安静结束(消息可能已被删)。它最多两次 API 调用,
+            # 每次 post() 自带 70s 超时 + 一次重连 —— 投递路径是有界的, 不会把任务吊在这里。
+            delivered = edit_only(chat, mid, txt, UPD_CONFIRM_KB if has else BACK)
+            # 服务端任务已结束 ≠ 用户已收到。两件事分开记, 不用前者冒充后者。
+            print("upd check finished has=%s delivered=%s" % (bool(has), bool(delivered)), flush=True)
+        finally:
+            _release()
+
+    try:
+        _EXEC.submit(go)
+        return True
+    except Exception:  # noqa: BLE001       # 执行器满/已关 → 立刻释放, 不静默泄漏占用
+        _release()
+        return False
+
 
 def start_update():
     """在独立的 systemd 瞬时单元里跑 pdg update, 不受 pdg-bot 自身重启影响。"""
@@ -4467,6 +4699,9 @@ def _adblock_pending(chat, uid, kind):
 
 
 def handle_cb(chat, mid, data, uid=None):
+    # 这条消息被新回调接管了 → 作废还在飞的"检查更新"结果。用户已经返回菜单、开始更新、
+    # 或者又点了一次检查, 旧结果再写回去就是覆盖他正在看的页面。
+    _upd_invalidate(chat, mid)
     # ── 去广告(闭集 callback, 不接受任意动作名)────────────────────────────────
     if data.startswith("adblock:"):
         act = data.split(":", 1)[1]
@@ -4595,11 +4830,12 @@ def handle_cb(chat, mid, data, uid=None):
     if data == "doctor":
         edit(chat, mid, "🩺 自检中(几秒)…", BACK); edit(chat, mid, doctor_text(), BACK); return
     if data == "upd_check":
-        edit(chat, mid, "🔄 检查更新中…", BACK)
-        has, txt = update_check()
-        kb = ({"inline_keyboard": [[{"text": "✅ 确认更新", "callback_data": "upd_apply"}],
-                                   [{"text": "⬅️ 返回主菜单", "callback_data": "menu"}]]} if has else BACK)
-        edit(chat, mid, txt, kb); return
+        # 检查里有 git fetch(走网络) —— 绝不能在主 getUpdates 循环里同步等它, 否则整个
+        # bot 在这段时间不响应任何菜单。这里只把消息改成"检查中", 剩下的交给后台执行器。
+        if not _upd_check_async(chat, mid):
+            edit(chat, mid, "⏳ 上一次「检查更新」还在跑, 结果会更新到发起它的那条消息。"
+                            "等它出结果再点。", BACK); return
+        edit(chat, mid, "🔄 检查更新中…(结果会更新到这条消息)", BACK); return
     if data == "upd_apply":
         ok = start_update()
         edit(chat, mid, ("🚀 已开始后台更新, 约 30-60 秒后 bot 自动回来(期间可能短暂无响应)。\n"
