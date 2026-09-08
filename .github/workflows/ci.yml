@@ -944,6 +944,12 @@ jobs:
       - name: "管理面查询边界 (拒重定向/禁代理/地址族忠实; 确定性 FAIL 不被 WARN 遮住)"
         run: python3 tests/test-provider-query-boundary.py
 
+      # 这一支只验 tests/negctl/mosdns-artifact-negative-controls.py 那几条判定本身有没有牙:
+      # 负控是本地手动门、CI 不跑, 它悄悄退化不会有任何信号(PR #56 那次三格哑火了整整一版)。
+      # 只吃合成输入、只跑纯函数 —— 不联网、不取件、不新增消费者 job。
+      - name: "artifact 负控收口契约 (消费者数量现推/零命中不放行/拓扑不一致不合理化/子测试没跑不算绿)"
+        run: python3 tests/test-negctl-artifact-closure.py
+
       # 弃用期内 runner 会把 node20 的 action 强行拉到 node24 上跑 —— 流程照常绿, 只是每个
       # job 都打一条 warning。那种"不红只是提醒"的形态最容易被放过, 直到某天 runner 不再兜底。
       - name: "action 运行时守卫 (没有 action 停在已弃用的 Node 20 上; 不认识的 action 判失败)"
