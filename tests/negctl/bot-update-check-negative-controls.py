@@ -52,11 +52,20 @@ def lift(pattern, max_lines=24, flags=re.M | re.S):
     return g
 
 
-RENDER = lift(r'^        return True, _upd_render\(cur, tgt, lines, _upd_repo_slug\(\)\)$')
+RENDER = lift(r'^        return True, _upd_render\(cur, tgt, lines, _upd_repo_slug\(deadline\)\)$')
 TRY = lift(r'^    except _UpdCheckTimeout:\n.*?稍后重试。" % type\(e\)\.__name__$')
-ASYNC = lift(r'^        if not _upd_check_async\(chat, mid\):\n.*?结果会更新到这条消息\)", BACK\); return$')
+# 回调这一段在本轮重写过(受理返回三态 + 反馈全走后台), 锚点跟着挪。
+ASYNC = lift(r'^        _acc, _tok = _upd_check_async\(chat, mid\)\n.*?^        return$', max_lines=14)
 INVAL = lift(r'^    _upd_invalidate\(chat, mid\)$')
 CLIP = lift(r'^    return line if len\(line\) <= UPD_LINE_MAX else line\[:UPD_LINE_MAX - 1\] \+ "…"$')
+# ── 本轮新增的六条承重性质 ────────────────────────────────────────────────────
+SENDLOCK = lift(r'^    with send_lock:$')
+PHASE = lift(r'^            if sess\.get\("phase", 0\) >= want:\n                return False, "stale-phase"$')
+NOTIFY_TOK = lift(r'^        if token:\n            _upd_emit\(chat, mid, token, "busy", text, BACK\)\n        else:\n            edit_only\(chat, mid, text, BACK\)$')
+ADMIT = lift(r'^        if len\(_upd_inflight\) >= UPD_MAX_INFLIGHT:\n            return ACCEPT_FULL, None$')
+SHALLOW = lift(r'^    if shallow\.returncode != 0 or _sv not in \("true", "false"\):\n.*?shallow\.returncode$')
+SLUGCAP = lift(r'^        cap = 5 if deadline is None else min\(5, max\(0\.0, deadline - time\.monotonic\(\)\)\)$')
+REPAINT = lift(r'^            if len\(hist\) > 1 and hist\[0\]\[0\] == text and hist\[1\]\[0\] not in mine:$')
 KILLPG = lift(r'^        try:\n            os\.killpg\(os\.getpgid\(p\.pid\), signal\.SIGKILL\)\n.*?p\.kill\(\)$')
 
 MUT = [
@@ -73,16 +82,31 @@ MUT = [
        '        raise', 1)]),
     ("③ 回调恢复同步调用(占住主轮询)",
      [(ASYNC,
-       '        edit(chat, mid, "🔄 检查更新中…", BACK)\n'
+       '        edit(chat, mid, "🔄 检查更新中…(结果会更新到这条消息)", BACK)\n'
        '        has, txt = update_check()\n'
-       '        edit(chat, mid, txt, UPD_CONFIRM_KB if has else BACK); return', 1)]),
+       '        edit(chat, mid, txt, UPD_CONFIRM_KB if has else BACK)\n'
+       '        return', 1)]),
     ("④ 取消归属作废(旧结果会覆盖新页面)",
      [(INVAL, '    pass  # 变异: 不再作废在飞的检查', 1)]),
     ("⑤ 单条标题不再裁剪(超长标题撑爆消息)",
      [(CLIP, '    return line', 1)]),
     ("⑥ 超时只杀父进程(留下 git 派生的助手)",
      [(KILLPG, '        try:\n            p.kill()\n        except Exception:  # noqa: BLE001\n            p.kill()', 1)]),
-    ("⑦ 只加无关注释(反向对照)",
+    ("⑦ 取消按消息串行化投递(阶段序只管准入, 落地会乱序)",
+     [(SENDLOCK, '    if True:', 1)]),
+    ("⑧ 取消阶段序(低阶段可以盖掉已落地的高阶段)",
+     [(PHASE, '            if False:\n                return False, "stale-phase"', 1)]),
+    ("⑨ 忙反馈绕过通道(退化成裸 edit_only)",
+     [(NOTIFY_TOK, '        edit_only(chat, mid, text, BACK)', 1)]),
+    ("⑩ 取消全局准入上限(线程有限≠队列有界)",
+     [(ADMIT, '        if False:\n            return ACCEPT_FULL, None', 1)]),
+    ("⑪ shallow 探测不校验退出码/取值",
+     [(SHALLOW, '    if False:\n        return False, "x" % shallow.returncode', 1)]),
+    ("⑫ origin 查询另拿独立预算",
+     [(SLUGCAP, '        cap = 5', 1)]),
+    ("⑬ 取消导航抢写后的收敛修复",
+     [(REPAINT, '            if False:', 1)]),
+    ("⑭ 只加无关注释(反向对照)",
      [(INVAL, '    # (负控的空转对照)\n' + INVAL, 1)]),
 ]
 
@@ -164,7 +188,7 @@ try:
             bad("%s → 正控没有正常运行(%s), 这一格既不算有牙也不算无牙" % (tag, kind))
             continue
         new = got - base
-        if tag.startswith("⑦"):
+        if tag.startswith("⑭"):
             (ok if not new else bad)("%s → %d 条新增(应为 0)" % (tag, len(new)))
             continue
         if new:
