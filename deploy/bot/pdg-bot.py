@@ -77,24 +77,72 @@ def _api_idle_timeout(deadline):
     return max(0.05, min(API_TIMEOUT, deadline - time.monotonic()))
 
 
-def _api_read(conn, resp, deadline):
+class _ApiGuard:
+    """到点就把这条 socket 的收发关掉, 让**任何**阶段正在阻塞的读立刻结束。
+
+    为什么非要它: 一次响应的阻塞点不止"响应体"这一处 —— 沿 http.client 的调用栈数,
+    至少有状态行(_read_status → fp.readline)、响应头(begin → parse_headers 的多次 readline)、
+    分块头与尾部(_read_next_chunk_size / _read_and_discard_trailer 的 readline)、响应体
+    (read1 → fp.read1)。前两处发生在 getresponse() **里面**, 中间两处发生在 read1()
+    **里面** —— 调用方在循环里查期限, 一次也查不到它们。
+
+    socket 超时也顶不上: 它管的是"多久没收到字节"(空闲), 每收到一个字节就重新计时。
+    对端逐字节慢吐时它永远不触发, 整个响应可以远超绝对期限 —— 实测状态行慢吐让
+    1.00s 预算的调用跑到 4.26s。
+
+    还有一个更隐蔽的: `Connection: close` 时 getresponse() 会把 conn.sock 置空, 而响应流
+    照样能继续读。此时"每轮 settimeout 到 conn.sock 上"这一手一次都不会执行。
+
+    所以按**绝对时刻**在这条 socket 上 shutdown: 不是让外层返回了事, 是真的把本次网络
+    工作结束掉, 不留后台线程继续读。用 shutdown 而不是 close —— 关掉别的线程正阻塞着的
+    fd 是未定义行为, shutdown 则会让阻塞中的读立刻拿到 EOF/错误。
+    """
+
+    __slots__ = ("sock", "timer", "fired")
+
+    def __init__(self, sock, deadline):
+        self.sock, self.timer, self.fired = sock, None, False
+        if sock is None or deadline is None:
+            return
+        self.timer = threading.Timer(max(0.0, deadline - time.monotonic()), self._fire)
+        self.timer.daemon = True
+        self.timer.start()
+
+    def _fire(self):
+        self.fired = True
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    def cancel(self):
+        if self.timer is not None:
+            self.timer.cancel()
+
+
+def _api_read(sock, resp, deadline):
     """按绝对期限读完响应体。
 
-    只在请求前查一次期限是不够的: socket 超时管的是**单次空闲**, 对端持续小块发送时
-    每一次 recv 都不超时, 整个响应却可以远超期限, 最后还返回成功。
+    sock 是**请求发出时抓住的那条** socket, 不是 conn.sock: `Connection: close` 之后
+    conn.sock 已经是 None, 而响应流还能继续读 —— 依赖 conn.sock 就等于这一路完全没有约束。
 
     必须用 read1 而不是 read: read(n) 底层是 BufferedReader.read(n), 它会**读满 n 或读到
     EOF 才返回** —— 于是"每块之间查期限"实际上要等整个响应读完才第一次执行, 等于没查。
     read1(n) 只返回当下这一次底层读到的那一段, 期限检查才真的落在读取**过程**里。
+
+    这里的逐轮检查只是细粒度的第一道; 单次 read1 内部还可能有多个阻塞 readline(分块头、
+    尾部), 那一层由 _ApiGuard 按绝对时刻兜底。
     """
     buf = bytearray()
     while True:
         if deadline is not None:
             if time.monotonic() >= deadline:
                 raise _ApiDeadline()
-            sk = conn.sock
-            if sk is not None:
-                sk.settimeout(_api_idle_timeout(deadline))
+            if sock is not None:
+                try:
+                    sock.settimeout(_api_idle_timeout(deadline))
+                except OSError:
+                    pass                 # 已被 guard 关掉 —— 下面的读会立刻结束
         b = resp.read1(API_READ_CHUNK)
         buf += b
         # 读完就跳出, 不再多绕一圈查期限: 响应已经完整拿到了, 却因为"下一轮开始时刚好
@@ -117,11 +165,22 @@ def post(method, params, deadline=None):
         settimeout 到那条 socket 上) —— 否则 150s 预算跑掉 109s 之后, 最后一次传输
         还在用建连时的 70s; 反过来, 上一次更新任务留下的短超时也不会被 deadline=None
         的调用继承;
-      · **读响应**时每块之间重新核对(见 _api_read) —— socket 超时只管"多久没收到字节",
-        对端持续小块发送时它永远不触发, 整个响应却能远超期限、最后还返回成功。
+      · **整个响应**都在期限之内, 不只是"普通响应体":
+          - 逐轮核对(见 _api_read)管响应体这一层;
+          - 状态行、响应头在 getresponse() 里面, 分块头与尾部在 read1() 里面 —— 调用方
+            的循环一次也查不到它们, 由 _ApiGuard 按绝对时刻 shutdown 那条 socket 兜底;
+          - 读完之后再判一次: 逐轮检查通过、之后才到齐的完整 JSON, 内容是完整的, 但它是
+            期限**之后**才到的 —— 按时到达和内容完整是两件事。
 
-    剩余为 0 就直接放弃, 重试也要重新看剩余; 期限在读取中到达则关掉连接、不重试。
-    调用方不传 deadline 时上限就是 API_TIMEOUT, 行为与从前一致。
+    剩余为 0 就直接放弃, 重试也要重新看剩余; 期限在响应途中到达则结束这次网络工作
+    (shutdown + 关连接)、不重试, 不留后台线程继续读。
+    调用方不传 deadline 时上限就是 API_TIMEOUT(只有空闲超时, 没有绝对期限), 行为与从前一致。
+
+    **覆盖边界(不要读成"所有网络阶段都有硬上界")**: _ApiGuard 要先拿到 socket 才能武装,
+    而 socket 是 conn.request() 之后才有的 —— 所以**建连(TCP connect + TLS 握手)与发送请求**
+    这几段不在 guard 之内, 它们目前只受 socket 超时 _to = min(API_TIMEOUT, 剩余) 约束:
+    单次阻塞不会越过期限, 但握手里的多次往返理论上仍可能累计超出。这一段尚未复现、
+    也未验证, 按已登记的独立问题处理, 不在这里顺手改。
     """
     body = json.dumps(params).encode()
     path = "/bot" + TOKEN + "/" + method
@@ -145,7 +204,21 @@ def post(method, params, deadline=None):
                 if conn.sock is not None:
                     conn.sock.settimeout(_to)
             conn.request("POST", path, body, hdr)
-            data = _api_read(conn, conn.getresponse(), deadline)
+            # 必须在 getresponse() **之前**抓住这条 socket: Connection: close 会在
+            # getresponse() 里把 conn.sock 置空, 之后就再也拿不到正在读的那个资源了。
+            sk = conn.sock
+            guard = _ApiGuard(sk, deadline)
+            try:
+                resp = conn.getresponse()          # 状态行 + 响应头也在期限之内
+                data = _api_read(sk, resp, deadline)
+            finally:
+                guard.cancel()
+            if guard.fired:
+                raise _ApiDeadline()
+            if deadline is not None and time.monotonic() >= deadline:
+                # 逐轮检查通过之后才读完的那一次: 内容是完整的, 但它是期限**之后**才到齐的。
+                # 按时到达和内容完整是两件事, 不能拿后者冒充前者。
+                raise _ApiDeadline()
             return json.loads(data) if data else {}
         except _ApiDeadline:
             # 期限到了: 本次实际网络工作到此为止 —— 关掉连接, 不留阻塞线程, 也不重试。
@@ -3223,20 +3296,21 @@ def _upd_reap():
                     continue
                 if now >= sess["deadline"] - UPD_DELIVER_BUDGET:
                     sess["cancelled"] = True
-                    expired.append((c, m, sess["job"], sess.get("fut"),
-                                    sess.get("token") is None))
-        for c, m, job, fut, revoked in expired:
+                    expired.append((c, m, sess["job"], sess.get("fut")))
+        for c, m, job, fut in expired:
             if fut is not None:
-                fut.cancel()
+                fut.cancel()                    # 锁外 —— 这一段就是下面说的"窗口"
             ntok = njob = None
             with _upd_lock:
-                # 快照到动作之间可能已经换了任务: 动作前按**稳定身份**重新核对, 只清自己的,
-                # 绝不覆盖或清掉后来建立的新会话。
+                # 快照与动作之间隔着一段没有锁的窗口(fut.cancel() 那一下)。用户可能正好在
+                # 这段时间里返回菜单 —— 拿快照时的 revoked 裁决, 就会给一个**已经被撤销**的
+                # 任务新建 notice/token, 等于把撤销掉的写回权又发回去, 过期提示盖掉菜单。
+                # 所以身份和写回权都在锁内**重新读当前值**再裁决, 快照只用来找对象。
                 cur = _upd_sess.get((c, m))
                 mine = cur is not None and cur.get("job") == job
+                revoked = mine and cur.get("token") is None
                 _upd_drop_sess(c, m, job)
                 if mine and not revoked:
-                    # 撤销过的任务不在这里"恢复权限": 用户已经翻到别处, 过期提示不该盖回去。
                     njob = _upd_new_sess(c, m, now + UPD_NOTICE_BUDGET, kind="notice")
                     ntok = _upd_sess[(c, m)]["token"]
             print("upd check expired in queue revoked=%s mine=%s" % (revoked, mine), flush=True)
