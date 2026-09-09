@@ -55,7 +55,7 @@ def lift(pattern, max_lines=24, flags=re.M | re.S):
 RENDER = lift(r'^        return True, _upd_render\(cur, tgt, lines, _upd_repo_slug\(deadline\)\)$')
 TRY = lift(r'^    except _UpdCheckTimeout:\n.*?稍后重试。" % type\(e\)\.__name__$')
 # 回调这一段在本轮重写过(受理返回三态 + 反馈全走后台), 锚点跟着挪。
-ASYNC = lift(r'^        _acc, _tok = _upd_check_async\(chat, mid\)\n.*?^        return$', max_lines=14)
+ASYNC = lift(r'^        _acc, _tok = _upd_check_async\(chat, mid\)\n.*?^        return$', max_lines=18)
 INVAL = lift(r'^    _upd_invalidate\(chat, mid\)$')
 CLIP = lift(r'^    return line if len\(line\) <= UPD_LINE_MAX else line\[:UPD_LINE_MAX - 1\] \+ "…"$')
 # ── 本轮新增的六条承重性质 ────────────────────────────────────────────────────
@@ -67,16 +67,43 @@ REAPER = lift(r'^                if now >= sess\["deadline"\] - UPD_DELIVER_BUDG
 CANCEL = lift(r'^                if not sess or sess\.get\("job"\) != job or sess\.get\("cancelled"\):$')
 DROPJOB = lift(r'^    if sess is not None and sess\.get\("job"\) == job:\n        _upd_sess\.pop\(\(chat, mid\), None\)$')
 NOTICE = lift(r'^            job = _upd_new_sess\(chat, mid, now \+ UPD_NOTICE_BUDGET, kind="notice"\)\n            return ACCEPT_FULL, job$')
-NOTEMERGE = lift(r'^    if had:\n        return$')
+# 合并点本轮从"只看待发"改成"待发或在飞", 锚点跟着挪。
+NOTEMERGE = lift(r'^        if key in _upd_notify_pending or key in _upd_notify_live:$')
 INTENTVER = lift(r'^        ver, intent, last = _intent_now\(chat, mid\)$')
 PHASE = lift(r'^            if sess\.get\("phase", 0\) >= want:\n                return False, "stale-phase"$')
 # 忙/拒绝反馈现在一律经通道(notice 阶段), 锚点跟着挪。
-NOTIFY_TOK = lift(r'^            _upd_emit\(chat, mid, tok, "notice", txt, BACK\)$')
+NOTIFY_TOK = lift(r'^                        _upd_emit\(chat, mid, tok, "notice", txt, BACK\)$')
 ADMIT = lift(r'^        if len\(_upd_inflight\) >= UPD_MAX_INFLIGHT:$')
 SHALLOW = lift(r'^    if shallow\.returncode != 0 or _sv not in \("true", "false"\):\n.*?shallow\.returncode$')
 SLUGCAP = lift(r'^        cap = 5 if deadline is None else min\(5, max\(0\.0, deadline - time\.monotonic\(\)\)\)$')
 # 补绘已改成按用户意图版本收敛, 锚点指到它的调用点。
 REPAINT = lift(r'^        if need_repaint and delivered:\n            _upd_repaint\(chat, mid, dl\)$')
+
+# ── 本轮(绝对期限 / 撤销权限 / 通知生命周期)的锚点 ─────────────────────────────
+REUSETO = lift(r'^                conn\.timeout = _to\n'
+               r'                if conn\.sock is not None:\n'
+               r'                    conn\.sock\.settimeout\(_to\)$')
+READDL = lift(r'^        if deadline is not None:\n'
+              r'            if time\.monotonic\(\) >= deadline:\n'
+              r'                raise _ApiDeadline\(\)$')
+# 空 token 有两道拦截(入口快速判 + 取到投递锁后复查)。单撤一道另一道仍拦得住 ——
+# 要撤就两道一起撤, 否则这一格没牙。
+EMITNULL = lift(r'^    if token is None:$')
+EMITNULL2 = lift(r'^            if not sess or sess\.get\("token"\) is None or sess\.get\("token"\) != token:$')
+REVOKED = lift(r'^                if sess\.get\("token"\) is None:$')
+REAPMINE = lift(r'^                mine = cur is not None and cur\.get\("job"\) == job$')
+REAPREVOKE = lift(r'^                if mine and not revoked:$')
+NOTICEREL = lift(r'^    cur = _upd_sess\.get\(\(chat, mid\)\)\n'
+                 r'    if cur is not None and cur\.get\("job"\) == job:\n'
+                 r'        if cur\.get\("kind"\) == "notice":\n'
+                 r'            _upd_drop_sess\(chat, mid, job\)$')
+NOTICEKIND = lift(r'^        if cur\.get\("kind"\) == "notice":\n'
+                  r'            _upd_drop_sess\(chat, mid, job\)$')
+NOTICECAP = lift(r'^        if len\(_upd_notify_live\) >= UPD_NOTICE_MAX:$')
+READCLOSE = lift(r'^    resp\.close\(\)\n    return bytes\(buf\)$')
+SESSOLD = lift(r'^    old = _upd_sess\.get\(\(chat, mid\)\)\n'
+               r'    if old is not None:\n'
+               r'        _upd_jobs\.pop\(old\.get\("job"\), None\)$')
 KILLPG = lift(r'^        try:\n            os\.killpg\(os\.getpgid\(p\.pid\), signal\.SIGKILL\)\n.*?p\.kill\(\)$')
 
 MUT = [
@@ -108,7 +135,7 @@ MUT = [
     ("⑧ 取消阶段序(低阶段可以盖掉已落地的高阶段)",
      [(PHASE, '            if False:\n                return False, "stale-phase"', 1)]),
     ("⑨ 忙反馈绕过通道(退化成裸 edit_only)",
-     [(NOTIFY_TOK, '            edit_only(chat, mid, txt, BACK)', 1)]),
+     [(NOTIFY_TOK, '                        edit_only(chat, mid, txt, BACK)', 1)]),
     ("⑩ 取消全局准入上限(线程有限≠队列有界)",
      [(ADMIT, '        if False:', 1)]),
     ("⑪ shallow 探测不校验退出码/取值",
@@ -131,9 +158,37 @@ MUT = [
     ("⑳ 拒绝通知不再建归属(裸通知, 不可作废)",
      [(NOTICE, '            return ACCEPT_FULL, None', 1)]),
     ("㉑ 通知不合并(每次点击都排一份新工作)",
-     [(NOTEMERGE, '    if False:\n        return', 1)]),
+     [(NOTEMERGE, '        if False:', 1)]),
     ("㉒ 补绘回到猜「最近一次写入」而非最新意图",
      [(INTENTVER, '        ver, intent, last = (0, None, None)', 1)]),
+    # ── A: 绝对期限贯穿真实请求 ──
+    ("㉔ 复用的连接不按剩余预算重设超时(缓存超时)",
+     [(REUSETO, '                pass', 1)]),
+    ("㉕ 读响应不再核对绝对期限(只在请求前查一次)",
+     [(READDL, '        if False:\n            if False:\n                raise _ApiDeadline()', 1)]),
+    ("㉟ 按块读之后不收尾(keep-alive 名存实亡, 每次都白重连一次)",
+     [(READCLOSE, '    return bytes(buf)', 1)]),
+    # ── B: 撤销即撤销 ──
+    ("㉖ 空 token 重新被当成写回权(两道拦截一起撤: None == None 放行)",
+     [(EMITNULL, '    if False:', 1),
+      (EMITNULL2, '            if not sess or sess.get("token") != token:', 1)]),
+    ("㉗ 排队期间被撤销的任务照样执行",
+     [(REVOKED, '                if False:', 1)]),
+    ("㉘ 过期处理靠新建通知恢复写回权(不看撤销事实)",
+     [(REAPREVOKE, '                if mine:', 1)]),
+    ("㉙ 收割器动作前不重新核对身份(会覆盖后来的新任务)",
+     [(REAPMINE, '                mine = True', 1)]),
+    # ── C: 通知生命周期与全局准入 ──
+    ("㉚ 通知投递完不释放自己的记录",
+     [(NOTICEREL, '    cur = None\n    if cur is not None and cur.get("job") == job:\n'
+                  '        if cur.get("kind") == "notice":\n'
+                  '            _upd_drop_sess(chat, mid, job)', 1)]),
+    ("㉛ 通知收尾不看 kind(忙提示把在跑的检查会话一起收掉)",
+     [(NOTICEKIND, '        if True:\n            _upd_drop_sess(chat, mid, job)', 1)]),
+    ("㉜ 通知排队没有全局上限(只限执行线程数)",
+     [(NOTICECAP, '        if False:', 1)]),
+    ("㉝ 替换会话不摘旧身份(_upd_jobs 单调增长)",
+     [(SESSOLD, '    old = None', 1)]),
     ("㉓ 只加无关注释(反向对照)",
      [(INVAL, '    # (负控的空转对照)\n' + INVAL, 1)]),
 ]

@@ -536,6 +536,24 @@ def _reset_state():
     with bot._upd_lock:
         bot._upd_inflight.clear()
         bot._upd_sess.clear()
+        bot._upd_jobs.clear()
+        bot._upd_notify_pending.clear()
+        bot._upd_notify_live.clear()
+
+
+def _tables():
+    """五张表的当下规模。判"零残留"要看**全部**, 不能只看在飞表。"""
+    with bot._upd_lock:
+        return (len(bot._upd_sess), len(bot._upd_jobs), len(bot._upd_inflight),
+                len(bot._upd_notify_pending), len(bot._upd_notify_live))
+
+
+def _drain(limit=20):
+    """等到本轮真的都结束再看表 —— 不是先清空映射再宣布零残留。"""
+    t0 = time.monotonic()
+    while _tables() != (0, 0, 0, 0, 0) and time.monotonic() - t0 < limit:
+        time.sleep(0.02)
+    return _tables()
 
 
 def _settle(chat, limit=20):
@@ -921,6 +939,493 @@ while 1720 in bot._upd_inflight and time.monotonic() - _t0 < 20:
     time.sleep(0.05)
 (ok if 1720 not in bot._upd_inflight and not bot._upd_notify_pending else
  bad)("17c 结束后在飞表与待发表都清空")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 18. 绝对期限贯穿**真实**请求: 自建回环服务, 走真实 post 的建连/复用/读响应
+# ──────────────────────────────────────────────────────────────────────────────
+# 只换端点(127.0.0.1 上自己起的服务、自造数据), post() 的逻辑一个字不改 ——
+# 换掉 post 就等于没验这条路径。绝不连 api.telegram.org / 9090 / 任何生产口。
+print()
+print("══ 18. 绝对期限贯穿真实请求(自建回环服务; 建连 / 复用 / 读响应) ══")
+
+import http.client as _hc                                          # noqa: E402
+import socketserver                                                # noqa: E402
+
+_LB_BODY = b'{"ok":true,"result":{"message_id":1}}'
+
+
+class _LbHandler(socketserver.StreamRequestHandler):
+    def handle(self):
+        while True:
+            if not self.rfile.readline():
+                return
+            n = 0
+            while True:
+                h = self.rfile.readline()
+                if h in (b"\r\n", b"\n", b""):
+                    break
+                if h.lower().startswith(b"content-length:"):
+                    n = int(h.split(b":")[1])
+            if n:
+                self.rfile.read(n)
+            _LB.hits.append(time.monotonic())
+            _LB.conns.add(id(self.connection))
+            try:
+                time.sleep(_LB.head_delay)
+                self.wfile.write(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n"
+                                 b"Content-Type: application/json\r\n\r\n" % len(_LB_BODY))
+                self.wfile.flush()
+                if _LB.drip:
+                    # 每块之间都比 socket 空闲超时短 —— 空闲超时永远不触发, 但总时长超期限
+                    for i in range(0, len(_LB_BODY), 4):
+                        self.wfile.write(_LB_BODY[i:i + 4])
+                        self.wfile.flush()
+                        time.sleep(_LB.drip)
+                else:
+                    self.wfile.write(_LB_BODY)
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return                       # 客户端按期限先走了 —— 预期内, 不是异常
+
+
+class _Lb(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+    head_delay = 0.0
+    drip = 0.0
+    hits: list = []
+    conns: set = set()
+
+
+_LB = _Lb(("127.0.0.1", 0), _LbHandler)
+_LB_PORT = _LB.server_address[1]
+threading.Thread(target=_LB.serve_forever, daemon=True).start()
+
+
+class _LbClient:
+    @staticmethod
+    def HTTPSConnection(host, timeout=None):
+        return _hc.HTTPConnection("127.0.0.1", _LB_PORT, timeout=timeout)
+
+
+class _LbHttp:
+    client = _LbClient
+
+
+_real_http, bot.http = bot.http, _LbHttp
+bot.post = _REAL_POST                        # 走真实 post: 建连、复用、重连、读响应
+
+
+def _lb_reset():
+    c = getattr(bot._tls, "conn", None)
+    if c:
+        try:
+            c.close()
+        except Exception:      # noqa: BLE001
+            pass
+    bot._tls.conn = None
+    _LB.hits.clear()
+    _LB.conns.clear()
+    _LB.head_delay = 0.0
+    _LB.drip = 0.0
+
+
+# 18a 复用的连接必须按**本次**剩余预算重设 socket 超时
+_lb_reset()
+bot.post("m", {}, time.monotonic() + 150)                    # 建连: 剩余 150 → 取 70
+_t_new = bot._tls.conn.timeout
+bot.post("m", {}, time.monotonic() + 2.0)                    # 复用: 剩余只剩 2s
+_t_reuse = bot._tls.conn.timeout
+_t_sock = bot._tls.conn.sock.gettimeout() if bot._tls.conn.sock else None
+(ok if _t_new == bot.API_TIMEOUT else
+ bad)("18a 建连时 socket 超时取默认上限(实得 %s)" % _t_new)
+(ok if _t_reuse is not None and _t_reuse <= 2.0 else
+ bad)("18a 复用连接按剩余预算重设 conn.timeout(实得 %s, 应 ≤2.0)" % _t_reuse)
+(ok if _t_sock is not None and _t_sock <= 2.0 else
+ bad)("18a 已连上的那条 socket 也被重设(实得 %s, 应 ≤2.0) —— conn.timeout 只在建连时生效"
+      % _t_sock)
+
+# 18b deadline=None 的调用不继承上一任务留下的短超时
+_lb_reset()
+bot.post("m", {}, time.monotonic() + 3.0)                    # 更新任务: 留下 3s 的连接
+_cached_to = bot._tls.conn.timeout
+_LB.head_delay = 5.0                                         # 服务端慢 5s: 70s 上限等得起
+_LB.hits.clear()
+_t0 = time.monotonic()
+_r = bot.post("m", {})                                       # 非更新调用: 上限应是 70s
+_el = time.monotonic() - _t0
+(ok if _cached_to is not None and _cached_to <= 3.0 else
+ bad)("18b 上一任务确实留下了短超时的缓存连接(实得 %s)" % _cached_to)
+(ok if len(_LB.hits) == 1 and _r.get("ok") else
+ bad)("18b deadline=None 不继承短超时: 一次传输就成功(实得 %d 次传输, ok=%s)"
+      % (len(_LB.hits), bool(_r.get("ok"))))
+(ok if _el >= 5.0 else
+ bad)("18b 它真的等满了服务端的 5s(实得 %.2fs) —— 没被 3s 误判超时" % _el)
+
+# 18c socket 空闲超时以内持续小块返回: 整个读取仍受绝对期限约束
+_lb_reset()
+_LB.drip = 0.25                                              # 每块间隔 0.25s ≪ 空闲超时
+_dl = time.monotonic() + 1.5
+_t0 = time.monotonic()
+_r = bot.post("m", {}, _dl)
+_el = time.monotonic() - _t0
+_fd_after = len(os.listdir("/proc/self/fd"))
+(ok if not _r.get("ok") else
+ bad)("18c 响应读取超过绝对期限 → 判失败, 不冒充成功(实得 ok=%s)" % bool(_r.get("ok")))
+(ok if _el < 1.5 + 1.0 else
+ bad)("18c 超期后立刻结束, 不读到底(耗时 %.2fs, 期限 1.50s)" % _el)
+(ok if getattr(bot._tls, "conn", None) is None else
+ bad)("18c 超期时真的把连接收掉了(不是只让外层返回、把线程留在 socket 上)")
+_lb_reset()
+_LB.drip = 0.25
+_dl = time.monotonic() + 1.5
+bot.post("m", {}, _dl)
+time.sleep(1.0)
+_fd_now = len(os.listdir("/proc/self/fd"))
+(ok if _fd_now <= _fd_after + 2 else
+ bad)("18c 超期收尾不漏 FD(前 %d → 后 %d)" % (_fd_after, _fd_now))
+
+# 18d 本地超时 / 请求完成 / 投递确认分开记账 —— 不把"本地放弃"说成"对端没收到"
+_lb_reset()
+_LB.drip = 0.25
+_dl = time.monotonic() + 1.5
+_r = bot.post("m", {}, _dl)
+_reached = len(_LB.hits)                     # 对端**确实**收到了这个请求
+(ok if _reached == 1 and not _r.get("ok") else
+ bad)("18d 请求已到达对端(%d 次)但本地判超时(ok=%s) —— 两件事分开记, 不谎称撤回"
+      % (_reached, bool(_r.get("ok"))))
+_lb_reset()
+_r = bot.post("m", {}, time.monotonic() + 30)
+(ok if _r.get("ok") and len(_LB.hits) == 1 else
+ bad)("18d 正常路径: 一次传输, 投递确认为成功(实得 %d 次/ok=%s)"
+      % (len(_LB.hits), bool(_r.get("ok"))))
+
+# 18e keep-alive 真的复用: 按块读之后必须自己把响应收尾, 否则连接停在 "Request-sent",
+# 下一次调用撞 ResponseNotReady 再重连 —— 表面还是成功, 每次都白跑一个来回。
+_lb_reset()
+for _ in range(4):
+    bot.post("m", {}, time.monotonic() + 30)
+(ok if len(_LB.hits) == 4 else
+ bad)("18e 4 次调用 = 4 次传输, 没有隐性重连(实得 %d)" % len(_LB.hits))
+(ok if len(_LB.conns) == 1 else
+ bad)("18e 4 次调用共用一条 TCP 连接(实得 %d 条) —— keep-alive 名副其实"
+      % len(_LB.conns))
+
+_lb_reset()
+_LB.shutdown()
+bot.http = _real_http
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 19. 已撤销的写回权限不得被重新赋予
+# ──────────────────────────────────────────────────────────────────────────────
+print()
+print("══ 19. 撤销即撤销: 空 token 不是写回权 / 排队期间导航 / 过期不恢复权限 ══")
+
+# 19a 空 token 直接被写入通道拒掉(None == None 曾经放行)
+_reset_state()
+_tg19 = Tg(); bot.post = _tg19.post
+with bot._upd_lock:
+    _j = bot._upd_new_sess(1901, 191, time.monotonic() + 60)
+bot._upd_invalidate(1901, 191)
+_r19, _why19 = bot._upd_emit(1901, 191, None, "progress", "🔄 空 token", bot.BACK)
+(ok if not _r19 and _why19 == "superseded" else
+ bad)("19a token=None 被拒(实得 %r/%r)" % (_r19, _why19))
+(ok if not [c for c in _tg19.calls if c[0] == "editMessageText"] else
+ bad)("19a 一个字都没写出去(实得 %s)"
+      % [c[1].get("text", "")[:16] for c in _tg19.calls if c[0] == "editMessageText"])
+with bot._upd_lock:
+    bot._upd_drop_sess(1901, 191, _j)
+
+# 19b 排队期间导航 → worker 启动时直接结束: 不跑 Git、不发进度、不发终态
+_reset_state()
+_tg19b = Tg(); bot.post = _tg19b.post
+_ran19 = [0]
+
+
+def _count_check(budget=None):
+    _ran19[0] += 1
+    return True, "🔄 旧结果(不该出现)"
+
+
+bot.update_check = _count_check
+_entered19 = threading.Semaphore(0)
+_hold19 = threading.Event()
+for _ in range(4):
+    bot._EXEC.submit(lambda: (_entered19.release(), _hold19.wait(30)))
+_full19 = all(_entered19.acquire(timeout=10) for _ in range(4))
+(ok if _full19 else bad)("19b 4 个 worker 已**确认**进入(信号量到齐, 不靠 sleep 推断)")
+_acc19, _ = bot._upd_check_async(1902, 192)
+_sess19 = bot._upd_sess.get((1902, 192)) or {}
+(ok if _acc19 == "ok" and not _sess19.get("started") else
+ bad)("19b 任务确实在队列里等(受理 %r, started=%s)" % (_acc19, _sess19.get("started")))
+bot._upd_invalidate(1902, 192)                       # 用户返回菜单
+_tg19b.calls.clear()
+_ran19[0] = 0
+_hold19.set()                                        # 放行 worker: 排队任务现在才启动
+_settle(1902)
+time.sleep(0.4)
+_w19 = [c[1].get("text", "")[:18] for c in _tg19b.calls if c[0] == "editMessageText"]
+(ok if _ran19[0] == 0 else
+ bad)("19b 导航之后不再执行 Git/检查(实得 %d 次)" % _ran19[0])
+(ok if not _w19 else bad)("19b 导航之后不发进度、不发终态(实得 %s)" % _w19)
+(ok if _drain() == (0, 0, 0, 0, 0) else
+ bad)("19b 结束后五张表零残留(实得 %s)" % (_drain(),))
+
+# 19c 已导航作废的排队任务过期: 保留撤销事实, 不靠新建通知恢复写回权
+_reset_state()
+_tg19c = Tg(); bot.post = _tg19c.post
+with bot._upd_lock:
+    _j19c = bot._upd_new_sess(1903, 193, time.monotonic() + bot.UPD_DELIVER_BUDGET - 1.0)
+    bot._upd_inflight[1903] = _j19c
+bot._upd_invalidate(1903, 193)
+_t0 = time.monotonic()
+while (1903, 193) in bot._upd_sess and time.monotonic() - _t0 < 15:
+    time.sleep(0.05)
+time.sleep(0.6)
+_w19c = [c[1].get("text", "")[:18] for c in _tg19c.calls if c[0] == "editMessageText"]
+(ok if (1903, 193) not in bot._upd_sess else
+ bad)("19c 过期任务被清掉, 没有换一条新会话续命")
+(ok if not _w19c else
+ bad)("19c 过期提示不写回已经翻走的页面(实得 %s)" % _w19c)
+(ok if _drain() == (0, 0, 0, 0, 0) else
+ bad)("19c 五张表零残留(实得 %s)" % (_drain(),))
+
+# 19d 没被导航过的排队任务过期: 该给的终态说明照给(19c 不能把它一并压掉)
+_reset_state()
+_tg19d = Tg(); bot.post = _tg19d.post
+with bot._upd_lock:
+    _j19d = bot._upd_new_sess(1904, 194, time.monotonic() + bot.UPD_DELIVER_BUDGET - 1.0)
+    bot._upd_inflight[1904] = _j19d
+_t0 = time.monotonic()
+while not [c for c in _tg19d.calls if c[0] == "editMessageText"] and time.monotonic() - _t0 < 15:
+    time.sleep(0.05)
+_w19d = [c[1].get("text", "")[:20] for c in _tg19d.calls if c[0] == "editMessageText"]
+(ok if _w19d and "排队过久" in _w19d[0] else
+ bad)("19d 未被导航的过期任务仍有终态说明(实得 %s)" % _w19d)
+(ok if _drain() == (0, 0, 0, 0, 0) else
+ bad)("19d 五张表零残留(实得 %s)" % (_drain(),))
+
+# 19e 收割器在**真实窗口**(快照后释放锁、fut.cancel() 期间)不覆盖后来的新任务
+_reset_state()
+bot.post = Tg().post
+_inwin = threading.Event()
+_gowin = threading.Event()
+
+
+class _WinFut:
+    """收割器在锁外调 cancel() —— 产品里真实存在的那段窗口。"""
+
+    def cancel(self):
+        _inwin.set()
+        _gowin.wait(15)
+        return True
+
+
+with bot._upd_lock:
+    _oldj = bot._upd_new_sess(1905, 195, time.monotonic() + bot.UPD_DELIVER_BUDGET - 1.0)
+    bot._upd_sess[(1905, 195)]["fut"] = _WinFut()
+    bot._upd_inflight[1905] = _oldj
+(ok if _inwin.wait(15) else bad)("19e 收割器已**确认**进入窗口(不靠 sleep 撞)")
+with bot._upd_lock:                                  # 产品里 _upd_new_sess 永远在锁内
+    _newj = bot._upd_new_sess(1905, 195, time.monotonic() + 120)
+    _newt = bot._upd_sess[(1905, 195)]["token"]
+    bot._upd_inflight[1905] = _newj
+_gowin.set()
+time.sleep(1.2)
+_cur19 = bot._upd_sess.get((1905, 195))
+(ok if _cur19 is not None and _cur19.get("job") == _newj else
+ bad)("19e 新会话没被旧任务覆盖(实得 job 一致=%s)"
+      % (_cur19 is not None and _cur19.get("job") == _newj))
+(ok if _cur19 is not None and _cur19.get("token") == _newt else
+ bad)("19e 新会话的写回权保留")
+(ok if _cur19 is not None and _cur19.get("kind") == "check" else
+ bad)("19e 新会话没被 notice 顶掉(实得 kind=%r)" % (_cur19 and _cur19.get("kind")))
+(ok if bot._upd_inflight.get(1905) == _newj else
+ bad)("19e 新任务的名额没被旧任务让出去")
+(ok if _oldj not in bot._upd_jobs else
+ bad)("19e 旧任务只清掉了**自己**的身份")
+with bot._upd_lock:
+    bot._upd_drop_sess(1905, 195, _newj)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 20. 通知的完整收尾与真实全局准入
+# ──────────────────────────────────────────────────────────────────────────────
+print()
+print("══ 20. 通知生命周期: 成功/失败/过期/作废/提交失败 + 全局上限 + 两阶段合并 ══")
+
+# 20a 五条结束路径都精确释放自己的状态
+for _name, _setup in (
+        ("成功投递", "ok"),
+        ("持续失败", "fail"),
+        ("已过期", "expired"),
+        ("导航作废", "revoked"),
+):
+    _reset_state()
+    _tg20 = Tg()
+    if _setup == "fail":
+        _tg20.unreachable = True
+    bot.post = _tg20.post
+    with bot._upd_lock:
+        _j20 = bot._upd_new_sess(2001, 200, time.monotonic() + bot.UPD_NOTICE_BUDGET,
+                                 kind="notice")
+        _t20 = bot._upd_sess[(2001, 200)]["token"]
+    _dl20 = time.monotonic() + (-1.0 if _setup == "expired" else 5.0)
+    if _setup == "revoked":
+        bot._upd_invalidate(2001, 200)
+    bot._upd_notify(2001, 200, "⏳ 忙", _t20, _dl20, _j20)
+    (ok if _drain(10) == (0, 0, 0, 0, 0) else
+     bad)("20a 通知「%s」结束后五张表零残留(实得 %s)" % (_name, _drain(0.1)))
+
+# 20a' 提交失败也要收尾
+_reset_state()
+bot.post = Tg().post
+_real_sub20 = bot._upd_notify_exec.submit
+bot._upd_notify_exec.submit = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("submit 拒绝"))
+with bot._upd_lock:
+    _j20s = bot._upd_new_sess(2002, 200, time.monotonic() + bot.UPD_NOTICE_BUDGET,
+                              kind="notice")
+    _t20s = bot._upd_sess[(2002, 200)]["token"]
+_r20s = bot._upd_notify(2002, 200, "⏳", _t20s, time.monotonic() + 5, _j20s)
+bot._upd_notify_exec.submit = _real_sub20
+(ok if _r20s is False else bad)("20a' 提交失败如实返回 False(实得 %r)" % _r20s)
+(ok if _tables() == (0, 0, 0, 0, 0) else
+ bad)("20a' 提交失败后零残留(实得 %s)" % (_tables(),))
+
+# 20b 忙提示复用的是**检查**会话的身份 —— 通知收尾不得把在跑的检查一起收掉
+_reset_state()
+bot.post = Tg().post
+with bot._upd_lock:
+    _cj20 = bot._upd_new_sess(2003, 200, time.monotonic() + 120)      # kind='check'
+    _ct20 = bot._upd_sess[(2003, 200)]["token"]
+    bot._upd_inflight[2003] = _cj20
+# 忙提示照实把**检查**会话的身份传进去 —— 归属由 _upd_notice_release 判, 不靠调用方先挑
+bot._upd_notify(2003, 200, "⏳ 上一次还在跑", _ct20, time.monotonic() + 5, _cj20)
+_t0 = time.monotonic()
+while bot._upd_notify_live and time.monotonic() - _t0 < 10:
+    time.sleep(0.02)
+_alive20 = bot._upd_sess.get((2003, 200))
+(ok if _alive20 is not None and _alive20.get("job") == _cj20 else
+ bad)("20b 通知收尾没有动正在跑的检查会话")
+(ok if bot._upd_inflight.get(2003) == _cj20 else
+ bad)("20b 在跑的检查名额也没被通知收掉")
+with bot._upd_lock:
+    bot._upd_drop_sess(2003, 200, _cj20)
+
+# 20c 替换 notice 清旧身份, 不误删新身份
+_reset_state()
+with bot._upd_lock:
+    _a20 = bot._upd_new_sess(2004, 200, time.monotonic() + 30, kind="notice")
+    _b20 = bot._upd_new_sess(2004, 200, time.monotonic() + 30, kind="notice")
+(ok if len(bot._upd_jobs) == 1 and _a20 not in bot._upd_jobs else
+ bad)("20c 替换会话摘掉旧身份(jobs=%d, 旧身份仍在=%s)"
+      % (len(bot._upd_jobs), _a20 in bot._upd_jobs))
+(ok if bot._upd_jobs.get(_b20) == (2004, 200) else
+ bad)("20c 新身份完好")
+with bot._upd_lock:
+    bot._upd_notice_release(2004, 200, _a20)          # 旧身份的收尾不能误删新会话
+(ok if bot._upd_sess.get((2004, 200), {}).get("job") == _b20 else
+ bad)("20c 旧身份收尾不误删新会话")
+with bot._upd_lock:
+    bot._upd_drop_sess(2004, 200, _b20)
+
+# 20d 全局上限: 待发 + 在飞 有真实上限, 不是只限执行线程数
+_reset_state()
+bot.post = Tg().post
+_block20 = threading.Event()
+_real_emit20 = bot._upd_emit
+bot._upd_emit = lambda *a, **k: (_block20.wait(25), (True, "ok"))[1]
+_accepted20 = 0
+for _i in range(300):
+    with bot._upd_lock:
+        _jj = bot._upd_new_sess(2005, 3000 + _i, time.monotonic() + 60, kind="notice")
+        _tt = bot._upd_sess[(2005, 3000 + _i)]["token"]
+    if bot._upd_notify(2005, 3000 + _i, "⏳", _tt, time.monotonic() + 60, _jj):
+        _accepted20 += 1
+time.sleep(0.4)
+_pend20, _live20 = len(bot._upd_notify_pending), len(bot._upd_notify_live)
+(ok if _live20 <= bot.UPD_NOTICE_MAX else
+ bad)("20d 在跑的通知受全局上限约束(实得 %d ≤ %d)" % (_live20, bot.UPD_NOTICE_MAX))
+(ok if set(bot._upd_notify_pending) <= bot._upd_notify_live else
+ bad)("20d 待发表恒为在飞集合的子集(准入才数得准; 待发 %d / 在飞 %d)" % (_pend20, _live20))
+(ok if _accepted20 == bot.UPD_NOTICE_MAX else
+ bad)("20d 300 次点击恰好受理到上限 %d 条(实得 %d), 其余当场拒绝"
+      % (bot.UPD_NOTICE_MAX, _accepted20))
+(ok if len(bot._upd_sess) <= bot.UPD_NOTICE_MAX else
+ bad)("20d 满载被拒的通知没有留下会话(sess=%d ≤ %d)"
+      % (len(bot._upd_sess), bot.UPD_NOTICE_MAX))
+_block20.set()
+bot._upd_emit = _real_emit20
+_reset_state()
+
+# 20e 合并覆盖**排队**与**投递在飞**两个阶段
+_reset_state()
+bot.post = Tg().post
+_inflight20 = threading.Event()
+_hold20 = threading.Event()
+_emits20 = [0]
+
+
+def _gate_emit(chat, mid, token, phase, text, kb):
+    _emits20[0] += 1
+    _inflight20.set()
+    _hold20.wait(20)
+    return True, "ok"
+
+
+bot._upd_emit = _gate_emit
+_subs20 = [0]
+_real_sub20b = bot._upd_notify_exec.submit
+
+
+def _count_sub20(fn, *a, **k):
+    _subs20[0] += 1
+    return _real_sub20b(fn, *a, **k)
+
+
+bot._upd_notify_exec.submit = _count_sub20
+with bot._upd_lock:
+    _j20e = bot._upd_new_sess(2006, 206, time.monotonic() + 60, kind="notice")
+    _t20e = bot._upd_sess[(2006, 206)]["token"]
+bot._upd_notify(2006, 206, "⏳ 第一条", _t20e, time.monotonic() + 60, _j20e)
+(ok if _inflight20.wait(10) else bad)("20e 第一条通知**确认**已进入投递(不靠 sleep)")
+(ok if not bot._upd_notify_pending else
+ bad)("20e 此刻待发表已空(处于「在飞」阶段, 合并只看待发就会漏)")
+for _ in range(10):
+    bot._upd_notify(2006, 206, "⏳ 追加", _t20e, time.monotonic() + 60, _j20e)
+(ok if _subs20[0] == 1 else
+ bad)("20e 在飞阶段的重复通知合并进同一份工作(提交 %d 份, 应 1)" % _subs20[0])
+_hold20.set()
+bot._upd_emit = _real_emit20
+bot._upd_notify_exec.submit = _real_sub20b
+_t0 = time.monotonic()
+while bot._upd_notify_live and time.monotonic() - _t0 < 15:
+    time.sleep(0.02)
+(ok if _emits20[0] <= 2 else
+ bad)("20e 11 次通知最多落地 2 次(在飞 1 + 合并后的 1; 实得 %d)" % _emits20[0])
+(ok if _drain() == (0, 0, 0, 0, 0) else bad)("20e 结束后五张表零残留(实得 %s)" % (_drain(),))
+
+# 20f 同一聊天多条历史消息 / 多个聊天: 各自独立, 结束后都不留残留
+_reset_state()
+_tg20f = Tg(); bot.post = _tg20f.post
+for _chat, _mid in ((2007, 71), (2007, 72), (2007, 73), (2008, 71), (2009, 71)):
+    with bot._upd_lock:
+        _jj = bot._upd_new_sess(_chat, _mid, time.monotonic() + 30, kind="notice")
+        _tt = bot._upd_sess[(_chat, _mid)]["token"]
+    bot._upd_notify(_chat, _mid, "⏳ %d/%d" % (_chat, _mid), _tt,
+                    time.monotonic() + 30, _jj)
+_res20f = _drain(15)
+_mids20f = sorted({c[1].get("message_id") for c in _tg20f.calls
+                   if c[0] == "editMessageText"})
+(ok if _res20f == (0, 0, 0, 0, 0) else
+ bad)("20f 3 条历史消息 + 3 个聊天结束后零残留(实得 %s)" % (_res20f,))
+(ok if _mids20f == [71, 72, 73] else
+ bad)("20f 每条消息各写各的, 不串(实得 mid %s)" % _mids20f)
+
+_reset_state()
+bot.post = _REAL_POST
+bot.update_check = _REAL_UPDATE_CHECK
 
 print()
 print("-" * 62)
