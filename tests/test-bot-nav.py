@@ -75,9 +75,11 @@ assert_near('def _upd_check_async(chat, mid):',
 assert 'edit(chat, mid, "🔄 检查更新中…(结果会更新到这条消息)", None)' not in bot, (
     "passing None to edit() falls back to the full first-level MENU"
 )
+# 窗口只跟着 _upd_notify 的文档串变长而放宽; 断言的性质一字未动 ——
+# 反馈仍必须经 _upd_emit 且挂 BACK, 不是整排一级菜单。
 assert_near('def _upd_notify(', '_upd_emit(chat, mid, tok, "notice", txt, BACK)', (
     "update-check busy/rejection feedback should also show only a back button"
-), window=1400)
+), window=2600)
 assert_near('if data == "upd_check":', "_upd_notify(chat, mid, _msg, _tok,", (
     "update-check callback must route its feedback through the async notifier, "
     "not edit inline on the polling thread"
