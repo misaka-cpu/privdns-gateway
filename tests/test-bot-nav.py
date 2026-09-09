@@ -63,12 +63,27 @@ assert_near('if data == "test":', 'edit(chat, mid, "测试中…", BACK)', (
 assert 'edit(chat, mid, "测试中…", None)' not in bot, (
     "passing None to edit() falls back to the full first-level MENU"
 )
-assert_near('if data == "upd_check":', 'edit(chat, mid, "🔄 检查更新中…", BACK)', (
-    "update-check progress message should show only a back button, not the full first-level menu"
-))
-assert 'edit(chat, mid, "🔄 检查更新中…", None)' not in bot, (
+# 进度消息现在由后台任务经 _upd_emit 发出(回调里一次网络调用都不做), 所以断言指到它**现在
+# 的产生点**。要守的性质一个字没松: 仍然要求它挂 BACK 而不是整排一级菜单; 忙/未受理这类
+# 反馈同样如此。
+assert_near('def _upd_check_async(chat, mid):',
+            '_upd_emit(chat, mid, tok, "progress",\n'
+            '                      "🔄 检查更新中…(结果会更新到这条消息)", BACK)', (
+                "update-check progress message should show only a back button, "
+                "not the full first-level menu"
+            ), window=2600)
+assert 'edit(chat, mid, "🔄 检查更新中…(结果会更新到这条消息)", None)' not in bot, (
     "passing None to edit() falls back to the full first-level MENU"
 )
+# 窗口只跟着 _upd_notify 的文档串变长而放宽; 断言的性质一字未动 ——
+# 反馈仍必须经 _upd_emit 且挂 BACK, 不是整排一级菜单。
+assert_near('def _upd_notify(', '_upd_emit(chat, mid, tok, "notice", txt, BACK)', (
+    "update-check busy/rejection feedback should also show only a back button"
+), window=2600)
+assert_near('if data == "upd_check":', "_upd_notify(chat, mid, _msg, _tok,", (
+    "update-check callback must route its feedback through the async notifier, "
+    "not edit inline on the polling thread"
+), window=1400)
 none_progress_edits = re.findall(r"edit\(chat, mid, [^\n]+, None\)", bot)
 assert not none_progress_edits, (
     "progress/result edits must pass an explicit keyboard; None falls back to the full first-level MENU: "
