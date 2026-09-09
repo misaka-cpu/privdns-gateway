@@ -62,7 +62,8 @@ CLIP = lift(r'^    return line if len\(line\) <= UPD_LINE_MAX else line\[:UPD_LI
 SENDLOCK = lift(r'^    with send_lock:$')
 # ── 本轮六项 ──────────────────────────────────────────────────────────────────
 POSTDL = lift(r'^        if deadline is not None:\n            left = deadline - time\.monotonic\(\)\n            if left <= 0:\n                print\("api", method, "deadline-exceeded"\); return \{\}$')
-EDITDL = lift(r'^    if deadline is not None and time\.monotonic\(\) >= deadline:$')
+EDITDL = lift(r'^    if deadline is not None and time\.monotonic\(\) >= deadline:\n'
+              r'        print\("edit_only give up: deadline"\); return False.*?$')
 REAPER = lift(r'^                if now >= sess\["deadline"\] - UPD_DELIVER_BUDGET:$')
 CANCEL = lift(r'^                if not sess or sess\.get\("job"\) != job or sess\.get\("cancelled"\):$')
 DROPJOB = lift(r'^    if sess is not None and sess\.get\("job"\) == job:\n        _upd_sess\.pop\(\(chat, mid\), None\)$')
@@ -83,9 +84,6 @@ REPAINT = lift(r'^        if need_repaint and delivered:\n            _upd_repai
 REUSETO = lift(r'^                conn\.timeout = _to\n'
                r'                if conn\.sock is not None:\n'
                r'                    conn\.sock\.settimeout\(_to\)$')
-READDL = lift(r'^        if deadline is not None:\n'
-              r'            if time\.monotonic\(\) >= deadline:\n'
-              r'                raise _ApiDeadline\(\)$')
 # 空 token 有两道拦截(入口快速判 + 取到投递锁后复查)。单撤一道另一道仍拦得住 ——
 # 要撤就两道一起撤, 否则这一格没牙。
 EMITNULL = lift(r'^    if token is None:$')
@@ -101,6 +99,23 @@ NOTICEKIND = lift(r'^        if cur\.get\("kind"\) == "notice":\n'
                   r'            _upd_drop_sess\(chat, mid, job\)$')
 NOTICECAP = lift(r'^        if len\(_upd_notify_live\) >= UPD_NOTICE_MAX:$')
 READCLOSE = lift(r'^    resp\.close\(\)\n    return bytes\(buf\)$')
+
+# ── 本轮(完整响应期限 / 回收器撤销窗口)的锚点 ─────────────────────────────────
+# _api_read 里的逐轮期限检查、逐轮 settimeout, 以及用 read1 而不是 read —— 这三处**没有**
+# 对应的变异格。加了 _ApiGuard 之后它们被完全包住: 实测单撤 ㉕、合并撤 ㉕+㊵、以及 read1
+# 换回 read, 都是 0 条转红。它们是同线程的第一道(不依赖定时器线程被调度), 保留在实现里,
+# 但按纪律不计入"已验证" —— 一格永远不会红的对照等于没有对照。
+# 若将来去掉 guard, 必须把这几格补回来。
+GUARDARM = lift(r'^            sk = conn\.sock\n            guard = _ApiGuard\(sk, deadline\)$')
+GUARDFIRE = lift(r'^    def _fire\(self\):\n'
+                 r'        self\.fired = True\n'
+                 r'        try:\n'
+                 r'            self\.sock\.shutdown\(socket\.SHUT_RDWR\)$')
+GUARDCHK = lift(r'^            if guard\.fired:\n                raise _ApiDeadline\(\)$')
+LATECHK = lift(r'^            if deadline is not None and time\.monotonic\(\) >= deadline:\n'
+               r'                # 逐轮检查通过之后才读完的那一次.*?\n.*?\n'
+               r'                raise _ApiDeadline\(\)$', max_lines=6)
+REAPRECHK = lift(r'^                revoked = mine and cur\.get\("token"\) is None$')
 SESSOLD = lift(r'^    old = _upd_sess\.get\(\(chat, mid\)\)\n'
                r'    if old is not None:\n'
                r'        _upd_jobs\.pop\(old\.get\("job"\), None\)$')
@@ -148,7 +163,7 @@ MUT = [
      [(POSTDL, '        if False:\n            left = 0\n            if left <= 0:\n'
                '                print("x"); return {}', 1)]),
     ("⑯ edit_only 期限到了仍然回退重试",
-     [(EDITDL, '    if False:', 1)]),
+     [(EDITDL, '    if False:\n        print("x"); return False', 1)]),
     ("⑰ 取消收割线程的排队裁决(回到等空闲 worker)",
      [(REAPER, '                if False:', 1)]),
     ("⑱ 迟到启动的旧任务仍然执行(不看 cancelled)",
@@ -164,11 +179,19 @@ MUT = [
     # ── A: 绝对期限贯穿真实请求 ──
     ("㉔ 复用的连接不按剩余预算重设超时(缓存超时)",
      [(REUSETO, '                pass', 1)]),
-    ("㉕ 读响应不再核对绝对期限(只在请求前查一次)",
-     [(READDL, '        if False:\n            if False:\n                raise _ApiDeadline()', 1)]),
     ("㉟ 按块读之后不收尾(keep-alive 名存实亡, 每次都白重连一次)",
      [(READCLOSE, '    return bytes(buf)', 1)]),
+    ("㊱ 期限不覆盖状态行/响应头(守卫不武装, getresponse 裸奔)",
+     [(GUARDARM, '            sk = conn.sock\n            guard = _ApiGuard(sk, None)', 1)]),
+    ("㊲ 守卫到点不结束实际网络工作(只置标志, 不 shutdown)",
+     [(GUARDFIRE, '    def _fire(self):\n        self.fired = True\n        try:\n'
+                  '            pass', 1)]),
+    ("㊳ 超期不再判失败(守卫开火与读完后两处判定一起撤)",
+     [(GUARDCHK, '            if False:\n                raise _ApiDeadline()', 1),
+      (LATECHK, '            if False:\n                raise _ApiDeadline()', 1)]),
     # ── B: 撤销即撤销 ──
+    ("㊶ 回收器动作前不重读撤销状态(用快照时的 revoked 裁决)",
+     [(REAPRECHK, '                revoked = False', 1)]),
     ("㉖ 空 token 重新被当成写回权(两道拦截一起撤: None == None 放行)",
      [(EMITNULL, '    if False:', 1),
       (EMITNULL2, '            if not sess or sess.get("token") != token:', 1)]),
@@ -210,6 +233,19 @@ try:
                         ignore=shutil.ignore_patterns("__pycache__", ".bin"))
     pristine = (Path(wd) / BOT).read_text(encoding="utf-8")
 
+    _crash = {"out": None}
+
+    def _stash(out):
+        """把这一次"没跑正常"的完整输出留住 —— 只报个形态, 排查时等于什么都没说。"""
+        _crash["out"] = out
+
+    def _crash_excerpt():
+        out = _crash["out"] or ""
+        i = out.find("Traceback (most recent call last)")
+        if i < 0:
+            return [l for l in out.splitlines() if l.strip()][-6:]
+        return out[i:].splitlines()[:14]
+
     def run_pos():
         """跑一次正控, 返回 (具名失败集合, 形态)。形态用来把「没牙」和「压根没跑起来」分开。"""
         try:
@@ -221,12 +257,16 @@ try:
         n_ok = len(re.findall(r"^\[OK\]", out, re.M))
         n_fail = len(re.findall(r"^\[FAIL\]", out, re.M))
         if "Traceback (most recent call last)" in out:
+            _stash(out)
             return set(), "崩溃(Traceback)"
         if "ModuleNotFoundError" in out or "ImportError" in out:
+            _stash(out)
             return set(), "导入失败"
         if n_ok + n_fail == 0:
+            _stash(out)
             return set(), "零有效断言"
         if "通过 " not in out:
+            _stash(out)
             return set(), "没有汇总行"
         fails = {re.sub(r"\s+", " ", l.strip())[:150]
                  for l in out.splitlines() if l.startswith("[FAIL]")}
@@ -269,6 +309,8 @@ try:
         (Path(wd) / BOT).write_text(pristine, encoding="utf-8")
         if kind != "正常":
             bad("%s → 正控没有正常运行(%s), 这一格既不算有牙也不算无牙" % (tag, kind))
+            for _l in _crash_excerpt():
+                print("       | " + _l[:150])
             continue
         new = got - base
         if tag.startswith("㉓"):

@@ -956,21 +956,25 @@ _LB_BODY = b'{"ok":true,"result":{"message_id":1}}'
 
 class _LbHandler(socketserver.StreamRequestHandler):
     def handle(self):
-        while True:
-            if not self.rfile.readline():
-                return
-            n = 0
+        # 整个 handle 都要罩住, **读请求那半段也算**: 客户端按期限先走时会 RST, 于是第一句
+        # rfile.readline() 就抛 ConnectionResetError。异常从这里逃出去, socketserver 会把
+        # 完整 traceback 打到 stderr —— 负控看到 "Traceback" 就把整次正控判成崩溃, 一格本来
+        # 有牙的对照被记成无效。服务端收摊的噪音不能冒充正控崩溃。
+        try:
             while True:
-                h = self.rfile.readline()
-                if h in (b"\r\n", b"\n", b""):
-                    break
-                if h.lower().startswith(b"content-length:"):
-                    n = int(h.split(b":")[1])
-            if n:
-                self.rfile.read(n)
-            _LB.hits.append(time.monotonic())
-            _LB.conns.add(id(self.connection))
-            try:
+                if not self.rfile.readline():
+                    return
+                n = 0
+                while True:
+                    h = self.rfile.readline()
+                    if h in (b"\r\n", b"\n", b""):
+                        break
+                    if h.lower().startswith(b"content-length:"):
+                        n = int(h.split(b":")[1])
+                if n:
+                    self.rfile.read(n)
+                _LB.hits.append(time.monotonic())
+                _LB.conns.add(id(self.connection))
                 time.sleep(_LB.head_delay)
                 self.wfile.write(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n"
                                  b"Content-Type: application/json\r\n\r\n" % len(_LB_BODY))
@@ -984,8 +988,8 @@ class _LbHandler(socketserver.StreamRequestHandler):
                 else:
                     self.wfile.write(_LB_BODY)
                     self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError, OSError):
-                return                       # 客户端按期限先走了 —— 预期内, 不是异常
+        except Exception:      # noqa: BLE001
+            return             # 客户端按期限先走了 / 连接被重置 —— 都是预期内的收摊
 
 
 class _Lb(socketserver.ThreadingTCPServer):
@@ -1422,6 +1426,326 @@ _mids20f = sorted({c[1].get("message_id") for c in _tg20f.calls
  bad)("20f 3 条历史消息 + 3 个聊天结束后零残留(实得 %s)" % (_res20f,))
 (ok if _mids20f == [71, 72, 73] else
  bad)("20f 每条消息各写各的, 不串(实得 mid %s)" % _mids20f)
+
+_reset_state()
+bot.post = _REAL_POST
+bot.update_check = _REAL_UPDATE_CHECK
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 21. 绝对期限覆盖**完整响应**, 不只是普通响应体
+# ──────────────────────────────────────────────────────────────────────────────
+# 沿 http.client 的调用栈, 一次响应至少有四类阻塞点:
+#   状态行(_read_status→fp.readline)、响应头(begin→parse_headers 的多次 readline) —— 在
+#   getresponse() **里面**; 分块头/尾部(_read_next_chunk_size / _read_and_discard_trailer
+#   的 readline)、响应体(read1→fp.read1) —— 在 read1() **里面**。调用方在循环里查期限,
+#   一次也查不到前三类。socket 超时也顶不上: 它只管"多久没收到字节"。
+# 这一节用**裸 socket** 回环服务逐字节控制每个阶段的节奏, 自造响应, 不连任何真实服务。
+print()
+print("══ 21. 期限覆盖完整响应: 状态行 / 响应头 / 分块头与尾部 / close 下的响应体 ══")
+
+import socket as _sock                                             # noqa: E402
+
+_RB_BODY = b'{"ok":true,"result":{"message_id":1}}'
+_RB = {"mode": "fast", "gap": 0.8, "got": threading.Event(),
+       "phase": threading.Event(), "conns": set()}
+
+
+def _rb_serve(cli):
+    """裸应答: 每个阶段的节奏都由 mode 决定; 每段间隔都**小于** socket 空闲超时。"""
+    f = cli.makefile("rb")
+    try:
+        while True:
+            if not f.readline():
+                return
+            n = 0
+            while True:
+                h = f.readline()
+                if h in (b"\r\n", b"\n", b""):
+                    break
+                if h.lower().startswith(b"content-length:"):
+                    n = int(h.split(b":")[1])
+            if n:
+                f.read(n)
+            _RB["conns"].add(id(cli))
+            _RB["got"].set()
+            m, g = _RB["mode"], _RB["gap"]
+            if m == "slow_status":
+                _RB["phase"].set()
+                for ch in b"HTTP/1.1 200 OK\r\n":            # 状态行逐字节
+                    cli.sendall(bytes([ch]))
+                    time.sleep(g)
+                cli.sendall(b"Content-Length: %d\r\n\r\n" % len(_RB_BODY))
+                cli.sendall(_RB_BODY)
+            elif m == "slow_headers":
+                cli.sendall(b"HTTP/1.1 200 OK\r\n")
+                _RB["phase"].set()
+                for i in range(12):                          # 响应头一条条慢吐
+                    cli.sendall(b"X-Pad-%02d: y\r\n" % i)
+                    time.sleep(g)
+                cli.sendall(b"Content-Length: %d\r\n\r\n" % len(_RB_BODY))
+                cli.sendall(_RB_BODY)
+            elif m == "slow_chunk":
+                cli.sendall(b"HTTP/1.1 200 OK\r\nConnection: close\r\n"
+                            b"Transfer-Encoding: chunked\r\n\r\n")
+                _RB["phase"].set()
+                for i in range(0, len(_RB_BODY), 6):
+                    seg = _RB_BODY[i:i + 6]
+                    time.sleep(g)                            # 分块**头**之前停顿
+                    cli.sendall(b"%x\r\n" % len(seg) + seg + b"\r\n")
+                time.sleep(g); cli.sendall(b"0\r\n")
+                time.sleep(g); cli.sendall(b"\r\n")          # 尾部也慢
+                cli.shutdown(_sock.SHUT_WR); return
+            elif m == "close_body":
+                cli.sendall(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
+                _RB["phase"].set()
+                for i in range(0, len(_RB_BODY), 6):
+                    time.sleep(g); cli.sendall(_RB_BODY[i:i + 6])
+                cli.shutdown(_sock.SHUT_WR); return
+            elif m == "late_complete":
+                # 末段正好落在"逐轮检查刚通过"的那一轮里 → 内容完整, 但到得比期限晚
+                cli.sendall(b"HTTP/1.1 200 OK\r\nConnection: close\r\n"
+                            b"Content-Length: %d\r\n\r\n" % len(_RB_BODY))
+                _RB["phase"].set()
+                half = len(_RB_BODY) // 2
+                time.sleep(g); cli.sendall(_RB_BODY[:half])
+                time.sleep(g); cli.sendall(_RB_BODY[half:])
+                cli.shutdown(_sock.SHUT_WR); return
+            else:
+                cli.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(_RB_BODY))
+                cli.sendall(_RB_BODY)
+    except Exception:      # noqa: BLE001
+        return                 # 客户端按期限先走 / 连接里有残字节 —— 都是预期内的收摊
+
+
+_RB_SRV = _sock.socket()
+_RB_SRV.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEADDR, 1)
+_RB_SRV.bind(("127.0.0.1", 0))
+_RB_SRV.listen(16)
+_RB_PORT = _RB_SRV.getsockname()[1]
+
+
+def _rb_accept():
+    while True:
+        try:
+            c, _ = _RB_SRV.accept()
+        except OSError:
+            return
+        threading.Thread(target=_rb_serve, args=(c,), daemon=True).start()
+
+
+threading.Thread(target=_rb_accept, daemon=True).start()
+
+
+class _RbClient:
+    @staticmethod
+    def HTTPSConnection(host, timeout=None):
+        return _hc.HTTPConnection("127.0.0.1", _RB_PORT, timeout=timeout)
+
+
+class _RbHttp:
+    client = _RbClient
+
+
+_prev_http, bot.http = bot.http, _RbHttp
+bot.post = _REAL_POST
+
+
+def _rb_reset(mode="fast", gap=0.8):
+    c = getattr(bot._tls, "conn", None)
+    if c:
+        try:
+            c.close()
+        except Exception:      # noqa: BLE001
+            pass
+    bot._tls.conn = None
+    _RB["mode"], _RB["gap"] = mode, gap
+    _RB["got"].clear(); _RB["phase"].clear(); _RB["conns"].clear()
+
+
+def _rb_call(mode, budget, gap, full_secs, label):
+    """跑一次并核对: 服务端确实收到请求、确实进到目标阶段、且**及时终止**。
+
+    full_secs = 等完整响应大约要多久。判据同时卡两头: 既要落在预算的调度余量内,
+    又要明显小于"等完整响应"——这样放宽阈值也掩盖不了失效。
+    """
+    _rb_reset(mode, gap)
+    dl = time.monotonic() + budget
+    t0 = time.monotonic()
+    r = bot.post("m", {}, dl)
+    el = time.monotonic() - t0
+    (ok if _RB["got"].is_set() and _RB["phase"].is_set() else
+     bad)("21 %s: 服务端确实收到请求并进入目标阶段(收到=%s 阶段=%s)"
+          % (label, _RB["got"].is_set(), _RB["phase"].is_set()))
+    (ok if el <= budget + 0.6 else
+     bad)("21 %s: 及时终止(实耗 %.2fs ≤ 预算 %.2fs + 0.6s 调度余量)" % (label, el, budget))
+    (ok if el < full_secs * 0.6 else
+     bad)("21 %s: 不是等完整响应才返回(实耗 %.2fs, 等完整约 %.1fs)" % (label, el, full_secs))
+    (ok if not r.get("ok") else
+     bad)("21 %s: 超期不判成功(实得 ok=%s)" % (label, bool(r.get("ok"))))
+    return el
+
+
+# 21a 状态行慢吐 —— 阻塞在 getresponse() 里的 _read_status
+_rb_call("slow_status", 1.0, 0.25, 16 * 0.25, "慢状态行")
+# 21b 响应头慢吐 —— 阻塞在 getresponse() 里的 parse_headers
+_rb_call("slow_headers", 1.0, 0.25, 12 * 0.25, "慢响应头")
+# 21c chunked 的分块头与尾部慢吐 —— 阻塞在 read1() 内部的 readline
+_rb_call("slow_chunk", 1.0, 0.8, 8 * 0.8, "慢分块头/尾部")
+# 21d Connection: close 下慢吐响应体 —— conn.sock 已被置空, 逐轮 settimeout 一次都不会执行
+_rb_call("close_body", 1.0, 0.8, 7 * 0.8, "close+慢响应体")
+
+# 21e 逐轮检查通过之后才到齐的完整 JSON: 内容完整 ≠ 按时到达
+_rb_reset("late_complete", 0.8)
+_dl21 = time.monotonic() + 1.0
+_t0 = time.monotonic()
+_r21 = bot.post("m", {}, _dl21)
+_el21 = time.monotonic() - _t0
+(ok if _RB["phase"].is_set() else bad)("21e 服务端确实进入了响应体阶段")
+(ok if not _r21.get("ok") else
+ bad)("21e 期限后才到齐的完整 JSON 不判为按时成功(实得 ok=%s)" % bool(_r21.get("ok")))
+(ok if _el21 <= 1.0 + 0.6 else
+ bad)("21e 及时终止(实耗 %.2fs)" % _el21)
+
+# 21f 超时结束的是**实际网络工作**: 连接收掉, 守卫定时器不堆积
+def _live_timers():
+    return [t for t in threading.enumerate() if isinstance(t, threading.Timer) and t.is_alive()]
+
+
+_rb_reset("close_body", 0.8)
+_t_before = len(_live_timers())
+for _ in range(3):
+    bot.post("m", {}, time.monotonic() + 0.6)
+time.sleep(1.5)                                   # 若有守卫没被取消, 这段时间足够暴露
+_t_after = len(_live_timers())
+(ok if getattr(bot._tls, "conn", None) is None else
+ bad)("21f 超期后连接已收掉(不是只让外层返回)")
+(ok if _t_after == _t_before else
+ bad)("21f 每次调用的守卫定时器都收干净(前 %d → 后 %d, 必须相等)" % (_t_before, _t_after))
+# 正常路径也不能漏: 成功返回时守卫要被 cancel 掉, 而不是留到期限自然到点
+_rb_reset("fast")
+_t_before2 = len(_live_timers())
+for _ in range(5):
+    bot.post("m", {}, time.monotonic() + 60)      # 期限很远: 没 cancel 就会挂 60s
+time.sleep(0.3)
+_t_after2 = len(_live_timers())
+(ok if _t_after2 == _t_before2 else
+ bad)("21f 正常返回也把守卫取消掉(前 %d → 后 %d; 5 次调用 60s 期限, 不取消必然堆 5 条)"
+      % (_t_before2, _t_after2))
+
+# 21g 已验证过的行为不能被这次修复破坏
+_rb_reset("fast")
+_t0 = time.monotonic()
+_r21g = bot.post("m", {}, time.monotonic() + 30)
+_el21g = time.monotonic() - _t0
+(ok if _r21g.get("ok") and _el21g < 1.0 else
+ bad)("21g 正常 Content-Length 照常成功(ok=%s, %.2fs)" % (bool(_r21g.get("ok")), _el21g))
+_rb_reset("fast")
+for _ in range(4):
+    bot.post("m", {}, time.monotonic() + 30)
+(ok if len(_RB["conns"]) == 1 else
+ bad)("21g keep-alive 仍复用同一条连接(实得 %d 条)" % len(_RB["conns"]))
+_rb_reset("fast")
+_r21n = bot.post("m", {})                         # deadline=None: 只有空闲超时, 不设期限
+(ok if _r21n.get("ok") else bad)("21g deadline=None 的默认路径照常成功")
+(ok if bot._tls.conn is not None and bot._tls.conn.timeout == bot.API_TIMEOUT else
+ bad)("21g deadline=None 恢复默认超时 %s(实得 %s)"
+      % (bot.API_TIMEOUT, bot._tls.conn and bot._tls.conn.timeout))
+
+# 21h 本地超时与"对端已收到请求"继续分别记账
+_rb_reset("close_body", 0.8)
+_r21h = bot.post("m", {}, time.monotonic() + 1.0)
+(ok if _RB["got"].is_set() and not _r21h.get("ok") else
+ bad)("21h 请求已到达对端(%s)但本地判超时(ok=%s) —— 不谎称撤回"
+      % (_RB["got"].is_set(), bool(_r21h.get("ok"))))
+
+_rb_reset("fast")
+_RB_SRV.close()
+bot.http = _prev_http
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 22. 回收器的 cancel() 窗口: 动作前必须重读撤销状态
+# ──────────────────────────────────────────────────────────────────────────────
+# 快照与动作之间隔着一段没有锁的窗口(锁外的 fut.cancel())。拿快照时的 revoked 裁决,
+# 就会给一个**窗口内已被撤销**的任务新建 notice/token —— 等于把撤销掉的写回权发回去。
+# 注意: 这一格不能只看五张表。修前那一次表全是零, 菜单照样被盖掉了。
+print()
+print("══ 22. 回收器 cancel() 窗口的四种交错(断言写入序列与最终页面) ══")
+
+
+def _reap_case(nav, label, expect_write):
+    _reset_state()
+    _tg22 = Tg()
+    bot.post = _tg22.post
+    _inwin = threading.Event()
+    _go = threading.Event()
+
+    class _CancelFut:
+        """收割器在**锁外**调 cancel() —— 产品里真实存在的那段窗口。"""
+
+        def cancel(self):
+            _inwin.set()
+            _go.wait(15)
+            return True
+
+    chat, mid = 2200, 220
+    with bot._upd_lock:
+        job = bot._upd_new_sess(chat, mid, time.monotonic() + bot.UPD_DELIVER_BUDGET - 1.0)
+        bot._upd_sess[(chat, mid)]["fut"] = _CancelFut()
+        bot._upd_inflight[chat] = job
+    if nav == "before":
+        bot._upd_invalidate(chat, mid)              # 快照之前就撤销
+    entered = _inwin.wait(15)
+    (ok if entered else bad)("22 %s: 收割器已**确认**进入 cancel 窗口(不靠 sleep 撞)" % label)
+    newjob = newtok = None
+    if nav == "inwindow":
+        bot._upd_invalidate(chat, mid)              # 窗口内撤销, 同一个 job
+    elif nav == "newjob":
+        with bot._upd_lock:                         # 产品里 _upd_new_sess 永远在锁内
+            newjob = bot._upd_new_sess(chat, mid, time.monotonic() + 120)
+            newtok = bot._upd_sess[(chat, mid)]["token"]
+            bot._upd_inflight[chat] = newjob
+    _go.set()
+    t0 = time.monotonic()
+    while bot._upd_notify_live and time.monotonic() - t0 < 15:
+        time.sleep(0.02)
+    time.sleep(0.6)
+    seq = [c[1].get("text", "")[:20] for c in _tg22.calls if c[0] == "editMessageText"]
+    cur = bot._upd_sess.get((chat, mid))
+    if expect_write:
+        (ok if seq and "排队过久" in seq[0] else
+         bad)("22 %s: 应得的过期提示照常给(写入序列 %s)" % (label, seq))
+    else:
+        (ok if not seq else
+         bad)("22 %s: 一个字都不该写回(写入序列 %s)" % (label, seq))
+    return seq, cur, newjob, newtok
+
+
+# 22a 导航发生在快照之前
+_reap_case("before", "导航在快照之前", False)
+# 22b 导航发生在快照之后、cancel() 尚未返回时(同一个 job) —— 本轮的目标缺口
+_seq22b, _cur22b, _, _ = _reap_case("inwindow", "导航在窗口内(同 job)", False)
+(ok if _cur22b is None else
+ bad)("22b 撤销过的任务没有靠新建 notice 续命(实得 kind=%r)" % (_cur22b and _cur22b.get("kind")))
+(ok if _tables() == (0, 0, 0, 0, 0) else
+ bad)("22b 状态也清干净(实得 %s)" % (_tables(),))
+# 22c 窗口内建立了新 job
+_seq22c, _cur22c, _nj22, _nt22 = _reap_case("newjob", "窗口内建立新 job", False)
+(ok if _cur22c is not None and _cur22c.get("job") == _nj22 else
+ bad)("22c 新任务的会话原样保留")
+(ok if _cur22c is not None and _cur22c.get("token") == _nt22 else
+ bad)("22c 新任务的写回权原样保留")
+(ok if _cur22c is not None and _cur22c.get("kind") == "check" else
+ bad)("22c 新任务没被 notice 顶掉(实得 kind=%r)" % (_cur22c and _cur22c.get("kind")))
+(ok if bot._upd_inflight.get(2200) == _nj22 else
+ bad)("22c 新任务的名额没被旧任务让出去")
+with bot._upd_lock:
+    if _nj22:
+        bot._upd_drop_sess(2200, 220, _nj22)
+# 22d 未导航、未替换: 正常过期仍能收到应有提示
+_seq22d, _, _, _ = _reap_case("none", "未导航未替换正常过期", True)
+(ok if _drain() == (0, 0, 0, 0, 0) else
+ bad)("22d 结束后五张表零残留(实得 %s)" % (_drain(),))
 
 _reset_state()
 bot.post = _REAL_POST
