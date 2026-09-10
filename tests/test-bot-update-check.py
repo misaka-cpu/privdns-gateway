@@ -13,7 +13,9 @@
 本支不连真实 Telegram、不用真实 token、不访问生产, git 用**克隆到临时目录的隔离仓库**
 (只读本地对象, 不碰共享 refs/tag/remote), 也从不调用真实升级入口。
 """
+import contextlib
 import importlib.util
+import io as _io
 import os
 import subprocess
 import sys
@@ -128,32 +130,218 @@ for base, want_has in (("v1.11.3", True), ("v1.11.10", True), ("v1.11.13", True)
 # 共享仓库上去。必须是独立 .git 的仓库(git init), 才谈得上 tag 隔离。
 _SB = tmpguard.mkdtemp(prefix="pdg-updcheck-sandbox.")
 
+_SB_CFG = (("user.email", "fixture@example.invalid"), ("user.name", "fixture"),
+           ("commit.gpgsign", "false"), ("tag.gpgsign", "false"))
+
+
+class _SbAbort(Exception):
+    """夹具初始化的**硬停**。
+
+    夹具自己出错时必须就地停住, 不能继续往下走 —— 否则后面那些产品断言会替夹具的
+    错误兜底: git init 失败了还去 config/commit/tag, 最终红的是某条产品判据,
+    看起来像产品坏了, 实际是夹具压根没建起来。
+    """
+
+    def __init__(self, reason):
+        Exception.__init__(self, reason)
+        self.reason = reason
+
+
+def _sb_die(reason):
+    raise _SbAbort(reason)
+
 
 def _sbgit(*a, **kw):
     return subprocess.run(["git", "-C", _SB, *a], capture_output=True, text=True, **kw)
 
 
+def _sb_must(run, *a):
+    """必需的 git 操作: 退出码非零就点名停住, 不静默继续。"""
+    r = run(*a)
+    if r.returncode != 0:
+        _sb_die("git %s 失败(返回 %d): %s"
+                % (" ".join(a[:2]), r.returncode, (r.stderr or r.stdout or "").strip()[:80]))
+    return r
+
+
+def _sb_check_owned(gitdir, sb):
+    """确认 Git 元数据确实属于**本轮自建**的那个独立仓库。
+
+    两件事都要成立, 任一不成立就硬停:
+      · git 目录正好是 <sb>/.git —— worktree 的 git 目录会指到主仓库的
+        .git/worktrees/... 去, 在那里打 tag 会写进共享仓库;
+      · sandbox 落在系统临时目录**之内**。
+
+    路径比较走 realpath + commonpath, **不是字符串 startswith**:
+    "/tmp/xy" 以 "/tmp/x" 开头在字符串上成立, 在路径上不成立 —— 拿前缀当边界,
+    真出事的时候正好拦不住。
+    """
+    real_git = os.path.realpath(gitdir)
+    real_sb = os.path.realpath(sb)
+    real_tmp = os.path.realpath(tempfile.gettempdir())
+    want = os.path.join(real_sb, ".git")
+    if real_git != want:
+        _sb_die("git 目录不属于本轮自建仓库(实得 %s, 期望 %s) —— 可能是 worktree 或共享仓库"
+                % (real_git, want))
+    try:
+        inside = os.path.commonpath([real_sb, real_tmp]) == real_tmp
+    except ValueError:                      # 不同盘符 / 相对路径混用
+        inside = False
+    if not inside:
+        _sb_die("沙箱不在系统临时目录内(沙箱 %s, 临时目录 %s)" % (real_sb, real_tmp))
+
+
+def _sb_init(run, sb):
+    """自建仓库的初始化。顺序是**硬的**, 每一步都拦:
+
+        git init  →  核验归属  →  写本地 config  →  (调用方再写对象)
+
+    归属核验必须排在 config 与任何对象写入**之前**: 万一 git -C 落到了别的仓库上,
+    先写 config 就已经改了别人的仓库了。
+    """
+    r = run("init", "-q", "-b", "main")
+    if r.returncode != 0:
+        _sb_die("git init 失败(返回 %d): %s"
+                % (r.returncode, (r.stderr or r.stdout or "").strip()[:80]))
+    r = run("rev-parse", "--absolute-git-dir")
+    if r.returncode != 0:
+        _sb_die("读不出 git 目录(rev-parse --absolute-git-dir 返回 %d)" % r.returncode)
+    gitdir = r.stdout.strip()
+    _sb_check_owned(gitdir, sb)             # 不合格 → 硬停, 后面一个字都不写
+    for k, v in _SB_CFG:
+        r = run("config", k, v)
+        if r.returncode != 0:
+            _sb_die("git config %s 失败(返回 %d)" % (k, r.returncode))
+    return gitdir
+
+
+def _sb_bootstrap(run, sb):
+    """真实入口: 硬停一律转成**非零退出**。"""
+    try:
+        return _sb_init(run, sb)
+    except _SbAbort as e:
+        print("[FAIL] 夹具初始化硬停: %s" % e.reason)
+        FAIL[0] += 1
+        print()
+        print("-" * 62)
+        print("test-bot-update-check.py: 通过 %d, 失败 %d" % (PASS[0], FAIL[0]))
+        raise SystemExit(1)
+
+
 def _sb_commit(msg):
-    """在自有仓库里造一笔提交, 返回它的 sha。"""
+    """在自有仓库里造一笔提交, 返回它的 sha。每步都查退出码。"""
     open(os.path.join(_SB, "f.txt"), "a", encoding="utf-8").write(msg + "\n")
-    _sbgit("add", "f.txt")
-    _sbgit("commit", "-q", "-m", msg)
-    return _sbgit("rev-parse", "HEAD").stdout.strip()
+    _sb_must(_sbgit, "add", "f.txt")
+    _sb_must(_sbgit, "commit", "-q", "-m", msg)
+    return _sb_must(_sbgit, "rev-parse", "HEAD").stdout.strip()
 
 
-# 建仓库并钉死身份, 免得读到用户的 git config
-_sbgit("init", "-q", "-b", "main")
-for k, v in (("user.email", "fixture@example.invalid"), ("user.name", "fixture"),
-             ("commit.gpgsign", "false"), ("tag.gpgsign", "false")):
-    _sbgit("config", k, v)
-# 安全护栏: 确认待会儿动 tag 的确实是这个自有仓库, 不是共享仓库/用户仓库
-_sb_gitdir = _sbgit("rev-parse", "--absolute-git-dir").stdout.strip()
-(ok if _sb_gitdir == os.path.join(_SB, ".git") and _SB.startswith(tempfile.gettempdir())
- else bad)("1x 版本场景用的是自己的独立仓库(独立 .git, 非 worktree/共享仓库; 实得 %s)"
-           % _sb_gitdir)
+# ── 先验安全门: 初始化失败 / 仓库身份不符, 都必须在写任何东西之前停住 ──────────
+class _SbProbe:
+    """受控桩: 记录每一次 git 调用, 并按需让某一步失败或返回别人的 git 目录。
 
+    注入只发生在这个桩里和它自己的临时目录里 —— 不拿共享仓库实测。
+    """
+
+    def __init__(self, fail_on=None, gitdir=None):
+        self.calls = []
+        self.fail_on = fail_on
+        self.gitdir = gitdir
+
+    def __call__(self, *a, **kw):
+        self.calls.append(a[0])
+        if self.fail_on == a[0]:
+            return _SbR(1, "", "injected failure")
+        if a[0] == "rev-parse":
+            return _SbR(0, self.gitdir if self.gitdir is not None else "", "")
+        return _SbR(0, "", "")
+
+    @property
+    def wrote(self):
+        """有没有做过"写"动作(配置或对象)。"""
+        return [c for c in self.calls if c in ("config", "add", "commit", "tag", "checkout")]
+
+
+class _SbR:
+    def __init__(self, rc=0, out="", err=""):
+        self.returncode, self.stdout, self.stderr = rc, out, err
+
+
+def _sb_exit_code(probe, sb):
+    """在真实入口上重放同一注入, 取它的退出码 —— 硬停必须是**非零**, 不能只打一行红字。
+
+    走的是真实 _sb_bootstrap(不是简化版), 但把它那次的 stdout 收进缓冲、计数也还原:
+    这次重放只为取退出码, 不该在日志里多出两行 [FAIL] 让人分不清哪条是真失败。
+    """
+    probe.calls = []
+    saved = (PASS[0], FAIL[0])
+    try:
+        with contextlib.redirect_stdout(_io.StringIO()):
+            _sb_bootstrap(probe, sb)
+    except SystemExit as e:
+        return e.code if isinstance(e.code, int) else 1
+    finally:
+        PASS[0], FAIL[0] = saved
+    return 0
+
+
+def _sb_reason(fn):
+    """跑一段应当硬停的代码, 返回它是否确实硬停了。"""
+    try:
+        fn()
+        return False
+    except _SbAbort:
+        return True
+
+
+print("══ 0. 夹具自身的安全门: 初始化失败与仓库归属 ══")
+_probe_sb = tmpguard.mkdtemp(prefix="pdg-updcheck-probe.")
+
+# 注入一: git init 返回非零
+_p1 = _SbProbe(fail_on="init")
+try:
+    _sb_init(_p1, _probe_sb)
+    bad("0a git init 失败后仍然继续了(应硬停)")
+except _SbAbort as _e:
+    (ok if "git init 失败" in _e.reason and "返回 1" in _e.reason else
+     bad)("0a git init 失败 → 具名原因(实得 %r)" % _e.reason[:60])
+(ok if _p1.calls == ["init"] else
+ bad)("0a init 失败后再没发出任何 git 命令(实得 %s)" % _p1.calls)
+(ok if not _p1.wrote else
+ bad)("0a init 失败后没有任何配置或对象写入尝试(实得 %s)" % _p1.wrote)
+(ok if _sb_exit_code(_p1, _probe_sb) == 1 else
+ bad)("0a 该硬停在真实入口上转成非零退出")
+
+# 注入二: init 成功, 但 git 目录不是本轮自建的那个(模拟 worktree/共享仓库)
+_p2 = _SbProbe(gitdir="/some/other/repo/.git")
+try:
+    _sb_init(_p2, _probe_sb)
+    bad("0b 仓库身份不符仍然继续了(应硬停)")
+except _SbAbort as _e:
+    (ok if "不属于本轮自建仓库" in _e.reason else
+     bad)("0b 身份不符 → 具名原因(实得 %r)" % _e.reason[:60])
+(ok if _p2.calls == ["init", "rev-parse"] else
+ bad)("0b 身份核验排在 config 之前(调用记录实得 %s)" % _p2.calls)
+(ok if not _p2.wrote else
+ bad)("0b 身份不符后没有任何配置或对象写入尝试(实得 %s)" % _p2.wrote)
+(ok if _sb_exit_code(_p2, _probe_sb) == 1 else
+ bad)("0b 该硬停在真实入口上转成非零退出")
+
+# 0c 路径边界用**真实路径**判定, 不是字符串前缀。
+#    构造一个与临时目录同前缀、但并不在它里面的路径: <tmpdir>foo。
+#    "/tmpfoo".startswith("/tmp") 为真 —— 拿 startswith 当边界就会放行;
+#    commonpath(["/tmpfoo", "/tmp"]) == "/" != "/tmp" —— 按路径判就拦得住。
+_tmp_real = os.path.realpath(tempfile.gettempdir())
+_outside = _tmp_real.rstrip("/") + "foo"
+(ok if _outside.startswith(_tmp_real) else
+ bad)("0c 前提: 构造的路径确实与临时目录同字符串前缀(实得 %s)" % _outside)
+(ok if _sb_reason(lambda: _sb_check_owned(os.path.join(_outside, ".git"), _outside)) else
+ bad)("0c 同前缀但不在临时目录**内**的沙箱被拦下(startswith 会放行, 路径边界不会)")
+
+_C1 = None  # 占位, 真实初始化在下面
+_sb_bootstrap(_sbgit, _SB)
 _C1 = _sb_commit("base")
-_sbgit("tag", "-a", "v9.0.0", "-m", "v9.0.0")
+_sb_must(_sbgit, "tag", "-a", "v9.0.0", "-m", "v9.0.0")
 _C2 = _sb_commit("next")           # 后继提交, 先不打 tag
 
 _prev_repo = bot.PDG_REPO
