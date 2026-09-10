@@ -944,6 +944,12 @@ jobs:
       - name: "管理面查询边界 (拒重定向/禁代理/地址族忠实; 确定性 FAIL 不被 WARN 遮住)"
         run: python3 tests/test-provider-query-boundary.py
 
+      # 用户反复遇到「检查更新中…」不结束。三个根因: 整段 git log 拼进一条消息超 Telegram
+      # 长度上限、异常只包到前半段、检查同步占住主 getUpdates 轮询。这一支把整条链路钉死。
+      # 隔离 git 仓库 + 假 Telegram 接收端, 不连真实 API、不用真实 token、不碰生产。
+      - name: "Bot 更新检查链路 (消息长度预算/全链路终态/后台与归属/有界等待与清理)"
+        run: python3 tests/test-bot-update-check.py
+
       # 这一支只验 tests/negctl/mosdns-artifact-negative-controls.py 那几条判定本身有没有牙:
       # 负控是本地手动门、CI 不跑, 它悄悄退化不会有任何信号(PR #56 那次三格哑火了整整一版)。
       # 只吃合成输入、只跑纯函数 —— 不联网、不取件、不新增消费者 job。
