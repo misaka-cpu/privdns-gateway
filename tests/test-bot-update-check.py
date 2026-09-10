@@ -17,6 +17,7 @@ import importlib.util
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -117,15 +118,78 @@ for base, want_has in (("v1.11.3", True), ("v1.11.10", True), ("v1.11.13", True)
     good = has == want_has and len(txt) <= bot.UPD_MSG_BUDGET
     (ok if good else bad)("%-9s → has=%s 消息 %d 字符 ≤ 预算 %d"
                           % (base, has, len(txt), bot.UPD_MSG_BUDGET))
-at("v1.11.14") or at("HEAD")
-_head = _REAL_GIT("rev-parse", "HEAD").stdout.strip()
-_tag = _REAL_GIT("rev-parse", "v1.11.14^{commit}").stdout.strip()
-if _head == _tag:
+# ── 无更新 / 有更新 的状态转换: 用**完全自有**的仓库, 不看宿主发布了什么 ──────────
+# 以前这里 checkout v1.11.14 然后断言"已是最新"。那把**当期发布版本钉进了断言**:
+# v1.11.15 一发布, 从 v1.11.14 看当然"有新发布", 这一格就自动变红 —— 它红的是
+# 仓库又发了一版, 不是产品坏了。自指的判据没有价值, 每次发版都要来改一次。
+#
+# 现在给这个场景一个自己的 Git 仓库: 自造提交、自造 tag、自己说了算。
+# 注意**不能用 git worktree** —— worktree 与主仓库共享 refs/tags, 在里面建 tag 会写到
+# 共享仓库上去。必须是独立 .git 的仓库(git init), 才谈得上 tag 隔离。
+_SB = tmpguard.mkdtemp(prefix="pdg-updcheck-sandbox.")
+
+
+def _sbgit(*a, **kw):
+    return subprocess.run(["git", "-C", _SB, *a], capture_output=True, text=True, **kw)
+
+
+def _sb_commit(msg):
+    """在自有仓库里造一笔提交, 返回它的 sha。"""
+    open(os.path.join(_SB, "f.txt"), "a", encoding="utf-8").write(msg + "\n")
+    _sbgit("add", "f.txt")
+    _sbgit("commit", "-q", "-m", msg)
+    return _sbgit("rev-parse", "HEAD").stdout.strip()
+
+
+# 建仓库并钉死身份, 免得读到用户的 git config
+_sbgit("init", "-q", "-b", "main")
+for k, v in (("user.email", "fixture@example.invalid"), ("user.name", "fixture"),
+             ("commit.gpgsign", "false"), ("tag.gpgsign", "false")):
+    _sbgit("config", k, v)
+# 安全护栏: 确认待会儿动 tag 的确实是这个自有仓库, 不是共享仓库/用户仓库
+_sb_gitdir = _sbgit("rev-parse", "--absolute-git-dir").stdout.strip()
+(ok if _sb_gitdir == os.path.join(_SB, ".git") and _SB.startswith(tempfile.gettempdir())
+ else bad)("1x 版本场景用的是自己的独立仓库(独立 .git, 非 worktree/共享仓库; 实得 %s)"
+           % _sb_gitdir)
+
+_C1 = _sb_commit("base")
+_sbgit("tag", "-a", "v9.0.0", "-m", "v9.0.0")
+_C2 = _sb_commit("next")           # 后继提交, 先不打 tag
+
+_prev_repo = bot.PDG_REPO
+try:
+    bot.PDG_REPO = _SB
+    # A. HEAD 正好停在自有仓库的最新 tag 上 → 已是最新
+    _sbgit("checkout", "-q", "--detach", "v9.0.0")
     has, txt = bot.update_check()
-    (ok if (not has and "🟢" in txt and "❌" not in txt) else
-     bad)("已是最新 → has=False 且报绿(实得 has=%s, %r)" % (has, txt[:50]))
-else:
-    print("  [SKIP] 当前不在 v1.11.14 上, 无更新那一格未执行")
+    (ok if (not has and "🟢" in txt and "❌" not in txt and "v9.0.0" in txt) else
+     bad)("1A HEAD=最新 tag → has=False 且报绿并点名 v9.0.0(实得 has=%s, %r)"
+          % (has, txt[:60]))
+
+    # B. 同一个仓库里新增一个指向后继提交的更高版本 tag, HEAD 不动 → 应报有更新
+    #    这一步就是以前要"等真实发版"才能覆盖的转换, 现在一次测试里就能走完。
+    _sbgit("tag", "-a", "v9.1.0", "-m", "v9.1.0", _C2)
+    has, txt = bot.update_check()
+    (ok if (has and "v9.1.0" in txt and "🟢 已是最新" not in txt) else
+     bad)("1B 出现更高版本 tag 而 HEAD 未动 → has=True 且点名 v9.1.0, 不再报「已是最新」"
+          "(实得 has=%s, %r)" % (has, txt[:60]))
+
+    # C. HEAD 跟进到新 tag → 重新变成已是最新, 且点名的是**新**版本
+    _sbgit("checkout", "-q", "--detach", "v9.1.0")
+    has, txt = bot.update_check()
+    (ok if (not has and "🟢" in txt and "v9.1.0" in txt and "v9.0.0" not in txt) else
+     bad)("1C HEAD 跟到新 tag → has=False 且点名 v9.1.0(不是旧的 v9.0.0; 实得 has=%s, %r)"
+          % (has, txt[:60]))
+
+    # D. 宿主仓库的发布 tag 集合变了也不影响这一组 —— 它们只看自己的输入。
+    #    这里直接核对: 自有仓库里根本没有宿主那套 v1.11.x。
+    _sb_tags = _sbgit("tag", "-l", "v*", "--sort=-v:refname").stdout.split()
+    (ok if _sb_tags == ["v9.1.0", "v9.0.0"] else
+     bad)("1D 自有仓库的 tag 集合完全自定(实得 %s), 不含宿主发布 tag" % _sb_tags)
+    (ok if not any(t.startswith("v1.11.") for t in _sb_tags) else
+     bad)("1D 自有仓库不借用宿主 latest —— 宿主再发版也不会改变 A/B/C 的前提")
+finally:
+    bot.PDG_REPO = _prev_repo       # 不污染后面的故障 / 后台 / 导航 / 期限场景
 
 # 这条标题长到「不裁就放不进预算」——于是能同时验两件事: 整条消息仍在预算内, 而且那条提交
 # 是被**裁短后展示**的, 不是整条丢掉(丢掉的话用户一条摘要也看不到)。
