@@ -2003,6 +2003,241 @@ _reset_state()
 bot.post = _REAL_POST
 bot.update_check = _REAL_UPDATE_CHECK
 
+# ══════════════════════════════════════════════════════════════════════════════
+# 23. 超期的完整响应不得判成功 —— 确定性场景, 不跟时序赛跑
+# ──────────────────────────────────────────────────────────────────────────────
+# §21 那几格是真实回环: 它们证明的是"慢响应下能及时终止"。但那里客户端拿到的响应
+# 是**不完整**的, 所以证不到本节这条性质: **完整、可解析、ok=true 的 JSON, 只要是在
+# 期限之后才到齐, 也不能返回成功**。
+#
+# 产品里守这条的是 post() 尾部那两句:
+#     if guard.fired:                                   raise _ApiDeadline()
+#     if deadline is not None and now >= deadline:      raise _ApiDeadline()
+# 以前验它们只能靠"连接是否被收掉"这类副作用, 而那取决于 socket 空闲超时与守卫定时器
+# 谁先到 —— 同一个变异有时红有时不红。这一节把两个变量都拿掉:
+#   · 时钟用**线程局部**垫片: 只有跑这一节的线程看到假时间, 收割器等别的线程照拿真时间;
+#   · 守卫是否触发由测试直接决定, 不等 threading.Timer 真的到点。
+# 跑的仍是**真实** post() 与真实 _api_read(), 只把"时间"和"什么时候触发守卫"变成可控输入。
+# 这是受控逻辑证据, **不冒充真实网络期限实测** —— 那部分证据在 §21。
+print()
+print("══ 23. 超期完整响应: 确定性判定(真实 post/_api_read, 受控时钟与守卫) ══")
+
+_DET_BODY = b'{"ok":true,"result":{"message_id":777}}'
+
+
+class _DetClock:
+    """只对**当前线程**撒谎的单调时钟。
+
+    直接改 bot.time.monotonic 会波及收割器与通知线程 —— 它们也在同一个模块命名空间里
+    读时间。这里用 thread-local: 没设过值的线程一律走真实时钟。
+    """
+
+    def __init__(self, real):
+        self._real = real
+        self._tl = threading.local()
+
+    def __getattr__(self, name):            # sleep / time / 其余一律透传给真模块
+        return getattr(self._real, name)
+
+    def monotonic(self):
+        v = getattr(self._tl, "v", None)
+        return self._real.monotonic() if v is None else v
+
+    def freeze(self, v):
+        self._tl.v = v
+
+    def advance(self, d):
+        self._tl.v = getattr(self._tl, "v", self._real.monotonic()) + d
+
+    def release(self):
+        self._tl.v = None
+
+
+class _DetSock:
+    """受控 socket。shutdown 记录但**不真的断流** —— 这样"守卫已触发"与"响应仍然完整"
+    可以同时成立, 才谈得上单验 guard.fired 那一支。"""
+
+    def __init__(self):
+        self.timeouts = []
+        self.shutdowns = 0
+        self.closed = 0
+
+    def settimeout(self, t):
+        self.timeouts.append(t)
+
+    def shutdown(self, how):
+        self.shutdowns += 1
+
+    def close(self):
+        self.closed += 1
+
+
+class _DetResp:
+    """真实形态的响应: read1 分块吐出**完整**的 JSON, 读完 length 归零、isclosed 为真。
+
+    推进时钟的钩子挂在 read1 **之后**: 挂在 settimeout(读之前)会让钟在最后一块读到之前
+    就越过期限, 于是 _api_read 的**逐轮**检查先抛出 —— 那验的是另一支, 而且响应根本读不完。
+    要验"读完之后才发现超期", 时间必须在**数据到手之后**才推进。
+    """
+
+    def __init__(self, chunks, after_read=None):
+        self._chunks = list(chunks)
+        self.length = sum(len(c) for c in self._chunks)
+        self._closed = False
+        self.closed_calls = 0
+        self.reads = 0
+        self._after = after_read
+
+    def read1(self, n=-1):
+        if not self._chunks:
+            self._closed = True
+            return b""
+        c = self._chunks.pop(0)
+        self.length -= len(c)
+        self.reads += 1
+        if not self._chunks:
+            self._closed = True
+        if self._after:
+            self._after(self.reads)
+        return c
+
+    def isclosed(self):
+        return self._closed
+
+    def close(self):
+        self.closed_calls += 1
+        self._closed = True
+
+
+class _DetConn:
+    def __init__(self, sock, resp):
+        self.sock = sock
+        self._resp = resp
+        self.timeout = None
+        self.requests = 0
+        self.closed = 0
+
+    def request(self, *a, **k):
+        self.requests += 1
+
+    def getresponse(self):
+        return self._resp
+
+    def close(self):
+        self.closed += 1
+
+
+def _det_run(label, budget, advance_per_read, fire_guard_at=None):
+    """跑一次真实 post(), 返回 (结果, 观测)。
+
+    budget            这次调用的绝对预算(受控时钟的秒)
+    advance_per_read  每次 settimeout(即每读一块前)把受控时钟推进多少
+    fire_guard_at     在第几次 settimeout 时直接触发守卫(None = 不触发)
+    """
+    obs = {}
+    guards = []
+    real_guard = bot._ApiGuard
+
+    def capturing_guard(sock, deadline):
+        g = real_guard(sock, deadline)
+        guards.append(g)
+        return g
+
+    def after_read(nth):
+        clock.advance(advance_per_read)     # 数据已到手, 再推进时间
+        if fire_guard_at is not None and nth == fire_guard_at and guards:
+            guards[-1]._fire()              # 直接触发, 不等 Timer 到点
+
+    half = len(_DET_BODY) // 2
+    resp = _DetResp([_DET_BODY[:half], _DET_BODY[half:]], after_read)
+    sock = _DetSock()
+    conn = _DetConn(sock, resp)
+
+    clock = _DetClock(bot.time)
+    prev_time, prev_conn = bot.time, getattr(bot._tls, "conn", None)
+    try:
+        bot.time = clock
+        bot._ApiGuard = capturing_guard
+        bot._tls.conn = conn                # 复用这条"连接", 不建新的
+        t0 = 1000.0
+        clock.freeze(t0)
+        r = bot.post("m", {}, t0 + budget)
+        obs["result"] = r
+        obs["guard_fired"] = bool(guards and guards[-1].fired)
+        # Timer.cancel() 与"到点跑完"都会 set 这个 Event; 配合 fired 才分得清是哪一种。
+        obs["timer_done"] = bool(guards and guards[-1].timer is not None
+                                 and guards[-1].timer.finished.is_set())
+        obs["reads"] = resp.reads
+        obs["requests"] = conn.requests
+        obs["settimeouts"] = len(sock.timeouts)
+        obs["shutdowns"] = sock.shutdowns
+        obs["resp_closed"] = resp.closed_calls
+        obs["body_left"] = resp.length
+        obs["clock_end"] = clock.monotonic()
+        obs["deadline"] = t0 + budget
+        obs["tls_conn"] = getattr(bot._tls, "conn", None)
+    finally:
+        clock.release()
+        bot.time = prev_time
+        bot._ApiGuard = real_guard
+        bot._tls.conn = prev_conn
+    return obs
+
+
+# A. 按时完整返回 → 允许成功
+_a = _det_run("A", budget=10.0, advance_per_read=0.1)
+(ok if _a["body_left"] == 0 and _a["resp_closed"] >= 1 else
+ bad)("23A 前提: 响应体已完整读完并收尾(剩余 %s 字节, close %s 次)"
+      % (_a["body_left"], _a["resp_closed"]))
+(ok if _a["clock_end"] < _a["deadline"] else
+ bad)("23A 前提: 读完时**未**超期(钟 %.1f < 期限 %.1f)" % (_a["clock_end"], _a["deadline"]))
+(ok if not _a["guard_fired"] else bad)("23A 前提: 守卫未触发")
+(ok if _a["result"].get("ok") is True and _a["result"]["result"]["message_id"] == 777 else
+ bad)("23A 按时完整返回 → 判成功且内容解析正确(实得 %r)" % (_a["result"],))
+(ok if _a["requests"] == 1 else bad)("23A 只发了一次请求(实得 %d)" % _a["requests"])
+(ok if _a["timer_done"] and not _a["guard_fired"] else
+ bad)("23A 正常返回把守卫定时器取消掉(且不是因为它到点跑过; finished=%s fired=%s)"
+      % (_a["timer_done"], _a["guard_fired"]))
+(ok if _a["reads"] == 2 else bad)("23A 两块都读到了(实得 %d 次)" % _a["reads"])
+
+# B. 超期完整返回, 守卫**尚未**触发 → 必须拒绝成功
+_b = _det_run("B", budget=1.0, advance_per_read=0.6)
+(ok if _b["body_left"] == 0 and _b["resp_closed"] >= 1 else
+ bad)("23B 前提: 响应体已完整读完并收尾(剩余 %s 字节)" % _b["body_left"])
+(ok if not _b["guard_fired"] else
+ bad)("23B 前提: 守卫**未**触发 —— 这一格单验读完后的期限判定")
+(ok if _b["clock_end"] >= _b["deadline"] else
+ bad)("23B 前提: 最后一块到齐时已超期(钟 %.1f ≥ 期限 %.1f)" % (_b["clock_end"], _b["deadline"]))
+(ok if _b["result"] == {} else
+ bad)("23B 超期后到齐的**完整 ok=true JSON** 不得判成功(实得 %r)" % (_b["result"],))
+(ok if _b["tls_conn"] is None else
+ bad)("23B 判失败后连接被收掉, 缓存清空(实得 %r)" % (_b["tls_conn"],))
+(ok if _b["reads"] == 2 else bad)("23B 两块都读到了(实得 %d 次)" % _b["reads"])
+(ok if _b["timer_done"] else bad)("23B 守卫定时器已收")
+
+# C. 超期完整返回, 守卫**已**触发 → 必须拒绝成功
+#    守卫的 shutdown 打在受控 socket 上、不真的断流, 所以"已触发"与"响应完整"同时成立。
+_c = _det_run("C", budget=10.0, advance_per_read=0.1, fire_guard_at=1)
+(ok if _c["body_left"] == 0 and _c["resp_closed"] >= 1 else
+ bad)("23C 前提: 响应体仍然完整读完(剩余 %s 字节)" % _c["body_left"])
+(ok if _c["guard_fired"] and _c["shutdowns"] >= 1 else
+ bad)("23C 前提: 守卫**已**触发并调了 shutdown(fired=%s, shutdown %d 次)"
+      % (_c["guard_fired"], _c["shutdowns"]))
+(ok if _c["clock_end"] < _c["deadline"] else
+ bad)("23C 前提: 读完时**未**超期(钟 %.1f < 期限 %.1f) —— 这一格单验 guard.fired 那一支"
+      % (_c["clock_end"], _c["deadline"]))
+(ok if _c["result"] == {} else
+ bad)("23C 守卫已触发时, 完整 JSON 同样不得判成功(实得 %r)" % (_c["result"],))
+(ok if _c["tls_conn"] is None else
+ bad)("23C 判失败后连接被收掉, 缓存清空(实得 %r)" % (_c["tls_conn"],))
+
+# 三格共同的边界: 受控时钟只影响本线程
+_det_probe = []
+_det_t = threading.Thread(target=lambda: _det_probe.append(bot.time.monotonic()))
+_det_t.start(); _det_t.join(5)
+(ok if _det_probe and abs(_det_probe[0] - time.monotonic()) < 5 else
+ bad)("23 受控时钟只对本线程生效, 别的线程拿到的仍是真实时间(实得 %r)" % (_det_probe[:1],))
+
 print()
 print("-" * 62)
 print("test-bot-update-check.py: 通过 %d, 失败 %d" % (PASS[0], FAIL[0]))
