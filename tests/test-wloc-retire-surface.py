@@ -138,6 +138,18 @@ pdgsh = text_of(BOT / "pdg.sh")
 inst = re.findall(r'"deploy/bot/(mitm_server|mitm_wloc)\.py\|', pdgsh)
 chk(not inst, "pdg.sh 的安装清单不再部署 MITM 宿主与插件(实得 %s)" % (inst or "0 条"))
 
+# ══ 3b. 新装: 既不安装, 也不启动 ════════════════════════════════════════════
+# 装机脚本是**另一条**路径(不经 pdg.sh 的平台切换、也不经迁移)。漏改它的后果不是报错 ——
+# 是每一台新装的 iOS 机器都会去写一个已经不存在的 unit 生成器, 或者去 enable 一个没有
+# unit 文件的服务。第一种当场失败, 第二种静默留下"该服务应存在"的错觉。
+ins = text_of(ROOT / "install.sh")
+ins_code = "\n".join(l for l in ins.splitlines() if not l.lstrip().startswith("#"))
+chk("pdg_unit_pdg_mitm" not in ins_code, "install.sh 不再写 pdg-mitm 的 unit")
+chk("enable --now pdg-mitm" not in ins_code, "install.sh 不再启动 pdg-mitm")
+# 卸载与失败回滚这两条**相反**: 老机器上那份 unit 还在, 收不走就留下一个孤儿服务。
+chk("pdg-mitm" in text_of(ROOT / "uninstall.sh"), "uninstall.sh 仍然收走老机器上的 pdg-mitm")
+chk("pdg-mitm.service" in ins, "install.sh 的失败回滚清单里仍列着 pdg-mitm(重装前的残留要收走)")
+
 # ══ 4. 事务层不再具备 pdg-mitm 的目标态能力 ══════════════════════════════════
 print()
 print("══ 4. 事务层 ══")

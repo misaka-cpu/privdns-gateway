@@ -290,9 +290,9 @@ def main():
                              "deploy/ios/pdg-dot-ondemand.mobileconfig.tmpl")
         # lock=False: 这条用例跑在非 root 下, 拿不到 /run 的锁; 生命周期的并发语义由
         # test-ios-profile-concurrency.py 负责, 这里只需要一份自洽的三件套。
-        bot.iosstate.generate("dot.a.example", "203.0.113.10", (), b"", False, _tmpl,
+        bot.iosstate.generate("dot.a.example", "203.0.113.10", (), _tmpl,
                               bot.IOS_META, bot.IOS_ART_DIR, False, False)
-        bot.iosstate.generate("dot.b.example", "203.0.113.10", (), b"", False, _tmpl,
+        bot.iosstate.generate("dot.b.example", "203.0.113.10", (), _tmpl,
                               bot.IOS_META, bot.IOS_ART_DIR, False, False)
         bot.BACKUP_FILES = [bot.SB, bot.MOSDNS_CONF, bot.MOSDNS_DIRECT, bot.MOSDNS_HIJACK,
                             bot.RS_META, bot.IOS_META, bot.IOS_CURRENT, bot.IOS_PREVIOUS]

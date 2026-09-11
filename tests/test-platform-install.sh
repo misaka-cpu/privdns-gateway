@@ -594,15 +594,21 @@ _ios_only="$(comm -13 <(ls "$_pi_tmp/android" | sort) <(ls "$_pi_tmp/ios" | sort
 _leaked=""
 # 6.1B: probe81.py 已从"iOS 五件套"里挪出去 —— 它现在两平台都装, 所以既要确认它
 # 不在 iOS 专属清单里, 也要确认**两边都有**(否则 Android 会缺掉公共件)。
-for _f in mitm_ca.py mitm_server.py mitm_wloc.py pdg-dot.mobileconfig.tmpl; do
+# WLOC 退役后 mitm_server.py / mitm_wloc.py 不再安装 —— iOS 专属件只剩 mitm_ca.py
+# (退役后的只读兼容读取)与描述文件模板。下面另有一格盯死那两个**两平台都不该出现**。
+for _f in mitm_ca.py pdg-dot.mobileconfig.tmpl; do
   [[ -e "$_pi_tmp/android/$_f" ]] && _leaked="$_leaked $_f"
   [[ -e "$_pi_tmp/ios/$_f" ]] || _leaked="$_leaked 缺:$_f"
 done
 for _p in android ios; do
   [[ -e "$_pi_tmp/$_p/probe81.py" ]] || _leaked="$_leaked 缺公共件:$_p/probe81.py"
+  # 已退役的两个模块与平台无关: 切到哪边都不该被装上。
+  for _r in mitm_server.py mitm_wloc.py; do
+    [[ -e "$_pi_tmp/$_p/$_r" ]] && _leaked="$_leaked 已退役却装了:$_p/$_r"
+  done
 done
 [[ -z "$_leaked" ]] \
-  && ok "Android 不装 iOS 四件套, iOS 齐全, probe81 两平台都有(仅 iOS: $_ios_only)" \
+  && ok "Android 不装 iOS 专属件, iOS 齐全, probe81 两平台都有, 已退役模块两平台都无(仅 iOS: $_ios_only)" \
   || bad "平台部署有偏差:$_leaked"
 # 内容与 mode 都要对 —— 只看"文件在不在"挡不住装了个旧版或权限错的。
 _bad=0
