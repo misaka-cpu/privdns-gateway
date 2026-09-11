@@ -95,8 +95,10 @@ class Box:
         with open(os.path.join(self.root, "etc/mosdns/config.yaml"), "w") as f:
             f.write("log:\n  level: info\n")
 
-    def gen(self, host="dot.example.com", addrs="203.0.113.10", ssids=(), ca=b""):
-        return self.s.generate(host, addrs, ssids, ca, bool(ca), TMPL,
+    def gen(self, host="dot.example.com", addrs="203.0.113.10", ssids=()):
+        # WLOC 退役: 生成路径不再接受根证书, 夹具去掉 ca 这一维。这一支验的东西
+        # 与产物里有没有根证书无关, 判据本身一条没动。
+        return self.s.generate(host, addrs, ssids, TMPL,
                                self.meta, self.art, True, False)
 
     def p(self, rel):
@@ -132,7 +134,7 @@ CA_A = IP.ca_der_from_pem(open(mkca("PDG CA A"), encoding="utf-8").read())
 
 # ── 造样本: 全部摘要一起重算, 于是失败不可能来自"忘了配平" ────────────────────
 BASE = Box()
-BASE.gen(ca=CA_A)
+BASE.gen()
 S = BASE.s
 BASE_META = json.loads(BASE.rd(ARC_META).decode("utf-8"))
 BASE_CUR = BASE.rd(ARC_CUR)
@@ -356,10 +358,12 @@ for label, mutate in (("非 UUID 身份", lambda m: m.__setitem__("instance_id",
 
 print()
 print("══ 六、正常样本一律不许误伤 ══")
-for label, kw in (("无 CA、无 SSID", {}),
-                  ("有 CA、无 SSID", {"ca": CA_A}),
-                  ("无 CA、有 SSID", {"ssids": ["Home", "Office"]}),
-                  ("有 CA、有 SSID", {"ca": CA_A, "ssids": ["Café ☕", "办公室"]})):
+# "有 CA"那两格随 WLOC 退役一并去掉 —— 生成路径已经产不出带根证书的描述文件了。
+# 老产物里那一格仍要被认得(schema 1 的契约没放松), 那条覆盖在
+# tests/test-wloc-retire-schema.py 与 test-ios-ca-der-exact.py 里。
+for label, kw in (("无 SSID", {}),
+                  ("有 SSID", {"ssids": ["Home", "Office"]}),
+                  ("含非 ASCII 的 SSID", {"ssids": ["Café ☕", "办公室"]})):
     nb = Box()
     nb.gen(host="dot.normal.example", **kw)
     raw, cur = nb.rd(ARC_META), nb.rd(ARC_CUR)
@@ -375,7 +379,7 @@ for label, kw in (("无 CA、无 SSID", {}),
         bad("现渲染的正常产物(%s)被自己人挡住: %s" % (label, str(e)[:140]))
 
 mb = Box()
-mb.gen(host="dot.multi.example", addrs=["203.0.113.10", "198.51.100.7"], ca=CA_A)
+mb.gen(host="dot.multi.example", addrs=["203.0.113.10", "198.51.100.7"])
 try:
     mb.s.validate_restore_set(mb.rd(ARC_META), mb.rd(ARC_CUR), None)
     ok("多个合法字符串服务器地址: 正常通过")
@@ -522,8 +526,8 @@ def cli_rollback(box, blob):
 
 def victim():
     v = Box()
-    v.gen(ca=CA_A)
-    v.gen(host="dot.v2.example", ca=CA_A)
+    v.gen()
+    v.gen(host="dot.v2.example")
     return v
 
 

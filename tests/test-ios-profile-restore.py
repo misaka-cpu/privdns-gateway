@@ -65,8 +65,10 @@ class Box:
         self.meta = self.root + "/etc/privdns-gateway/ios-profile.json"
         self.art = self.root + "/var/lib/privdns-gateway/ios-profile"
 
-    def gen(self, host="dot.example.com", ca=b""):
-        return self.s.generate(host, "203.0.113.10", (), ca, bool(ca), TMPL,
+    def gen(self, host="dot.example.com"):
+        # WLOC 退役: 生成路径不再接受根证书, 夹具去掉 ca 这一维。这一支验的东西
+        # 与产物里有没有根证书无关, 判据本身一条没动。
+        return self.s.generate(host, "203.0.113.10", (), TMPL,
                                self.meta, self.art, True, False)
 
     def cur(self):
@@ -99,8 +101,8 @@ CA_C = iosprofile.ca_der_from_pem(open(mkca("PDG CA C"), encoding="utf-8").read(
 
 def life(box):
     """造一条真实的生命周期: rev1(CA=A) → rev2(CA=B), 此时 current=rev2、previous=rev1。"""
-    box.gen(ca=CA_A)
-    box.gen(host="dot.v2.example", ca=CA_B)
+    box.gen()
+    box.gen(host="dot.v2.example")
     return box.trio()
 
 
@@ -114,7 +116,7 @@ subprocess.run(["bash", "-c",
                 "cd %s && tar czf %s/snap.tar.gz etc/privdns-gateway "
                 "var/lib/privdns-gateway/ios-profile" % (b.root, snapdir)],
                check=True, capture_output=True)
-b.gen(host="dot.v3.example", ca=CA_C)       # rev3
+b.gen(host="dot.v3.example")       # rev3
 members = subprocess.run(["tar", "tzf", snapdir + "/snap.tar.gz"],
                          capture_output=True, text=True).stdout.split()
 if any(m.endswith("ios-profile/current.mobileconfig") for m in members) \
@@ -177,7 +179,7 @@ def make_backup(root, with_cur=True, with_prev=True):
 
 blob_full = make_backup(b.root)
 blob_legacy = make_backup(b.root, with_cur=False, with_prev=False)
-b.gen(host="dot.v3.example", ca=CA_C)       # 现网走到 rev3
+b.gen(host="dot.v3.example")       # 现网走到 rev3
 
 
 def run_restore(root, blob):
@@ -231,12 +233,15 @@ if b.trio() == backup_trio:
 else:
     bad("恢复后内容对不上备份")
 m = b.read_meta()
+# 原判据是"恢复回来的两版, 根证书指纹逐个对得上(rev2=CA_B、rev1=CA_A)"。WLOC 退役后描述
+# 文件不再携带根证书, 指纹这一维没有了 —— 换成盯住**它本来要证明的那件事**: 恢复拿回来的
+# 是备份那一刻的第 2 版 + 第 1 版, 而且两版的语义输入各自不同(不是把同一版复制了两遍)。
 if m["current"]["revision"] == 2 and m["previous"]["revision"] == 1 \
-        and m["current"]["inputs"]["wloc_ca_sha256"] == hashlib.sha256(CA_B).hexdigest() \
-        and m["previous"]["inputs"]["wloc_ca_sha256"] == hashlib.sha256(CA_A).hexdigest():
-    ok("CA A→B→C 之后恢复: 拿回的是 rev2(CA=B)+ rev1(CA=A), 指纹逐个对得上")
+        and m["current"]["inputs"] != m["previous"]["inputs"] \
+        and m["current"]["digest"] != m["previous"]["digest"]:
+    ok("三次生成之后恢复: 拿回的是 rev2 + rev1, 两版的输入与摘要各自独立")
 else:
-    bad("恢复出来的版本/指纹不对: %r" % m.get("current", {}).get("revision"))
+    bad("恢复出来的版本不对: %r" % m.get("current", {}).get("revision"))
 for which in ("current", "previous"):
     st, detail = b.s.artifact_health(m, which, b.art)
     if st == "healthy":
@@ -247,14 +252,19 @@ try:
     blob_c = b.s.verified_artifact(m, "current", b.art)
     blob_p = b.s.verified_artifact(m, "previous", b.art)
     import plistlib
-    ca_c = [x for x in plistlib.loads(blob_c)["PayloadContent"]
-            if x.get("PayloadType") == "com.apple.security.root"][0]["PayloadContent"]
-    ca_p = [x for x in plistlib.loads(blob_p)["PayloadContent"]
-            if x.get("PayloadType") == "com.apple.security.root"][0]["PayloadContent"]
-    if ca_c == CA_B and ca_p == CA_A:
-        ok("发送 current / previous 都放行, 里面分别是 CA B 与 CA A 的 DER 原文")
+    # 原判据是"两份产物里分别嵌着 CA B 与 CA A 的 DER 原文"。WLOC 退役后描述文件不再携带
+    # 根证书 —— 于是这一格改成**两面都验**: 两份确实是不同的两版(没有把同一版复制两遍),
+    # 而且都不含根证书那一格(退役之后任何一条发送路径都不许再把它交出去)。
+    pc = plistlib.loads(blob_c)["PayloadContent"]
+    pp = plistlib.loads(blob_p)["PayloadContent"]
+    has_ca = [x for x in list(pc) + list(pp)
+              if x.get("PayloadType") == "com.apple.security.root"]
+    if has_ca:
+        bad("恢复回来的产物里仍有根证书 payload —— 旧备份把退役的 CA 放回来了")
+    elif blob_c != blob_p:
+        ok("发送 current / previous 都放行, 是不同的两版, 且都不含根证书")
     else:
-        bad("恢复出来的产物里 CA 不对")
+        bad("current 与 previous 竟然逐字节相同")
 except Exception as e:  # noqa: BLE001
     bad("恢复后发送被拒: %s" % e)
 
@@ -268,7 +278,7 @@ json.dump({"outbounds": [], "route": {"rules": []}},
           open(b2.root + "/etc/sing-box/config.json", "w"))
 open(b2.root + "/etc/mosdns/config.yaml", "w").write("log:\n  level: info\n")
 legacy = make_backup(b2.root, with_cur=False, with_prev=False)
-b2.gen(host="dot.v3.example", ca=CA_C)
+b2.gen(host="dot.v3.example")
 res = run_restore(b2.root, legacy)
 msg = res.get("msg", "")
 if res["ok"] and "旧格式" in msg:
@@ -285,15 +295,41 @@ if st != "healthy":
     ok("当前版本的产物没跟着回来 → 如实标成 %s, 没有谎报完整成功" % st)
 else:
     bad("当前版本竟然被判成健康")
-# 这台机器现在手里只有 CA_C, 而记录说的那一版用的是 B → 不许"修复"
+# 旧格式备份只带回了**记录**, 产物不在。记录说的是第 N 版、而这台机器现在的 DoT 主机名
+# 已经换过 → 按记录重新渲染出来的不是那一版 → 不许"修复"。
+# (退役前这一格用的是"手上的 CA 指纹与记录那一版对不上"; 描述文件不再携带根证书, 那道门
+#  连同它的对象一起没了。剩下的"逐字节相等"才是真正兜住"别拿另一份文件冒充那一版"的。)
+# 退役前这里验的是"手上只有 CA_C、而记录那一版用的是 B → 不许修复"。描述文件不再携带根
+# 证书, 那道门连同它的对象一起没了 —— 而这带来一个**真实的改善**: 一份只带记录的旧格式备份
+# 现在可以被确定性复原了(渲染只取记录里的 inputs 与稳定身份, 不再依赖手上有没有那张证书)。
+# 判据跟着变成两半, 两半都要验。
+_rev_before = b2.read_meta()["current"]["revision"]
 try:
-    b2.s.repair_current(CA_C, TMPL, b2.meta, b2.art, True)
-    bad("CA 对不上却仍然修复了")
-except Exception as e:  # noqa: BLE001
-    if "根证书指纹" in str(e):
-        ok("按记录复原被指纹那道门拒掉(手上的 CA 不是那一版用的): %s" % str(e)[:52])
+    b2.s.repair_current(TMPL, b2.meta, b2.art, True)
+    _m = b2.read_meta()
+    _st, _dt = b2.s.artifact_health(_m, "current", b2.art)
+    if _st == "healthy" and _m["current"]["revision"] == _rev_before:
+        ok("旧格式备份的当前版本可被逐字节复原(revision 未推进) —— 不再依赖手上有没有根证书")
     else:
-        bad("拒是拒了, 但不是指纹那道门: %s" % str(e)[:90])
+        bad("复原后状态不对: health=%s revision=%s(原 %s)"
+            % (_st, _m["current"]["revision"], _rev_before))
+except Exception as e:  # noqa: BLE001
+    bad("确定性复原被拒: %s" % str(e)[:90])
+
+# 另一半: "渲染不出记录说的那一版"仍然必须拒。把记录里的 sha256 改掉制造这个处境 ——
+# 少了这一格, 上面那条"能复原"就可能是因为那道门整个被删了。
+_m2 = b2.read_meta()
+_m2["current"]["sha256"] = "0" * 64
+with open(b2.meta, "w", encoding="utf-8") as _f:
+    json.dump(_m2, _f, ensure_ascii=False, indent=2, sort_keys=True)
+try:
+    b2.s.repair_current(TMPL, b2.meta, b2.art, True)
+    bad("渲染结果与记录对不上却仍然修复了")
+except Exception as e:  # noqa: BLE001
+    if "对不上" in str(e) or "无法确定性复原" in str(e):
+        ok("渲染不出记录说的那一版 → 被逐字节那道门拒掉: %s" % str(e)[:52])
+    else:
+        bad("拒是拒了, 但不是逐字节那道门: %s" % str(e)[:90])
 
 print()
 print("══ 四、恢复失败 → 三件全部回到操作前 ══")
@@ -305,7 +341,7 @@ json.dump({"outbounds": [], "route": {"rules": []}},
           open(b3.root + "/etc/sing-box/config.json", "w"))
 open(b3.root + "/etc/mosdns/config.yaml", "w").write("log:\n  level: info\n")
 good = make_backup(b3.root)
-b3.gen(host="dot.v3.example", ca=CA_C)
+b3.gen(host="dot.v3.example")
 before = b3.trio()
 # 注入: 第二个 iOS 目标落盘时失败 —— 第一个已经写下去了, 必须整组退回去
 fault = r'''
@@ -367,7 +403,7 @@ else:
 print()
 print("══ 五、软链/硬链/权限 ══")
 b4 = Box()
-b4.gen(ca=CA_A)
+b4.gen()
 real = b4.cur() + ".real"
 shutil.move(b4.cur(), real)
 os.symlink(real, b4.cur())
@@ -392,9 +428,9 @@ else:
     bad("普通文件却仍不健康: %s" % st)
 
 b5 = Box()
-b5.gen(ca=CA_A)
+b5.gen()
 os.chmod(b5.cur(), 0o666)
-b5.gen(ca=CA_A)                                  # 再生成一次 = 走复原路径
+b5.gen()                                  # 再生成一次 = 走复原路径
 mode = oct(os.stat(b5.cur()).st_mode & 0o777)
 if mode == "0o644":
     ok("产物 mode 由生产代码写定(0644), 被改宽之后复原会写回去")
@@ -413,8 +449,8 @@ else:
 print()
 print("══ 六、产物里不许有凭据 ══")
 b6 = Box()
-b6.gen(ca=CA_A)
-b6.gen(host="dot.v2.example", ca=CA_B)
+b6.gen()
+b6.gen(host="dot.v2.example")
 blob = open(b6.cur(), "rb").read() + open(b6.prev(), "rb").read() + open(b6.meta, "rb").read()
 sentinels = [b"PRIVATE KEY", b"BEGIN RSA PRIVATE", b"vmess://", b"vless://", b"trojan://",
              b"hysteria2://", b"ss://", b"bot_token", b"PDG_BOT_TOKEN"]

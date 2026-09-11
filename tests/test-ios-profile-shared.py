@@ -67,16 +67,16 @@ IDS = {"root": "11111111-1111-1111-1111-111111111111",
        "ca": "33333333-3333-3333-3333-333333333333"}
 
 # ── 1. 确定性: 同输入同字节 ────────────────────────────────────────────────
-a = iosprofile.render("dot.example.com", "203.0.113.10", (), b"", IDS, TMPL)
-b = iosprofile.render("dot.example.com", "203.0.113.10", (), b"", IDS, TMPL)
+a = iosprofile.render("dot.example.com", "203.0.113.10", (), IDS, TMPL)
+b = iosprofile.render("dot.example.com", "203.0.113.10", (), IDS, TMPL)
 if a == b:
     ok("同样输入 + 同样身份 → 逐字节相同(%d 字节)" % len(a))
 else:
     bad("同样输入却产出不同字节")
 
 # SSID 顺序不同不算"配置变了"
-s1 = iosprofile.render("dot.example.com", "203.0.113.10", ["B", "A"], b"", IDS, TMPL)
-s2 = iosprofile.render("dot.example.com", "203.0.113.10", ["A", "B", "A"], b"", IDS, TMPL)
+s1 = iosprofile.render("dot.example.com", "203.0.113.10", ["B", "A"], IDS, TMPL)
+s2 = iosprofile.render("dot.example.com", "203.0.113.10", ["A", "B", "A"], IDS, TMPL)
 if s1 == s2:
     ok("SSID 顺序不同 / 有重复 → 规范化后字节仍相同")
 else:
@@ -140,41 +140,46 @@ else:
     bad("带 SSID 时 Bot/CLI 不一致: %s / %s"
         % (pb.stderr.decode()[-200:], pc.stderr.decode()[-200:]))
 
+# 这一节原本验"Bot 与 CLI 在 WLOC 启用时字节相同 / 关闭时都不附 CA"。WLOC 位置改写已退役:
+# 两条路都不再附根证书, 那个对照没有对象了。判据换成盯住**退役本身**在 CLI 这一侧也做到了:
+# 三个附带根证书的开关必须被**显式拒绝**, 而不是静默忽略 —— 老脚本里还带着 --wloc-config,
+# 静默忽略会让它悄悄改变行为而没人发现, 那正是最难查的一种。
 mitm_on = os.path.join(CA_DIR, "mitm-on.json")
 json.dump({"wloc": {"enabled": True}}, open(mitm_on, "w"))
-pb = bot_run(wloc="['gs-loc.apple.com']", pem=CA_PEM)
-pc = cli_run(base_args + ["--wloc-config", mitm_on, "--ca-crt", CA_CRT])
-if pb.returncode == 0 and pb.stdout == pc.stdout and pb.stdout:
-    ok("Bot 与 CLI 在 WLOC 启用时字节相同 —— CLI 以前**从不附**根证书")
-    p = plistlib.loads(pb.stdout)
-    cas = [x for x in p["PayloadContent"] if x.get("PayloadType") == "com.apple.security.root"]
-    if len(cas) == 1 and cas[0]["PayloadContent"] == CA_DER:
-        ok("附上的确实是那张 CA 的 DER")
+for flags, label in ((["--wloc-config", mitm_on, "--ca-crt", CA_CRT], "--wloc-config/--ca-crt"),
+                     (["--ca-pem", CA_CRT], "--ca-pem")):
+    pc = cli_run(base_args + flags)
+    if pc.returncode != 0 and "退役".encode() in pc.stderr and not pc.stdout:
+        ok("CLI %s 被显式拒绝且不输出任何字节(不是静默忽略)" % label)
     else:
-        bad("CA payload 内容不对")
-else:
-    bad("WLOC 时 Bot/CLI 不一致: %s / %s"
-        % (pb.stderr.decode()[-200:], pc.stderr.decode()[-200:]))
+        bad("CLI %s 没有被显式拒绝: rc=%d out=%d" % (label, pc.returncode, len(pc.stdout)))
 
-mitm_off = os.path.join(CA_DIR, "mitm-off.json")
-json.dump({"wloc": {"enabled": False}}, open(mitm_off, "w"))
-pc = cli_run(base_args + ["--wloc-config", mitm_off, "--ca-crt", CA_CRT])
-if pc.returncode == 0 and pc.stdout == a:
-    ok("WLOC 未启用 → CLI 不附根证书(信任面不无故扩大)")
+# 不带那些开关时, Bot 与 CLI 仍须逐字节相同 —— 这条才是本支的主旨。
+pb = bot_run()
+pc = cli_run(base_args)
+if pb.returncode == 0 and pb.stdout == pc.stdout and pb.stdout:
+    ok("Bot 与 CLI 在默认情形下字节相同")
 else:
-    bad("WLOC 关闭时 CLI 仍然带了 CA")
+    bad("Bot/CLI 不一致: %s / %s"
+        % (pb.stderr.decode()[-200:], pc.stderr.decode()[-200:]))
+if not [x for x in plistlib.loads(pc.stdout)["PayloadContent"]
+        if x.get("PayloadType") == "com.apple.security.root"]:
+    ok("CLI 产出的描述文件里没有根证书那一格")
+else:
+    bad("CLI 仍然附上了根证书")
 
 # ── 3. 输出格式统一 ────────────────────────────────────────────────────────
 # v1.7.8 有两种输出格式: 没 SSID 也没 CA 时直接吐模板原文(连模板里讲部署细节的 XML 注释
 # 一起发给用户), 否则走 plistlib。受管生命周期要拿"字节是否相同"当证据, 格式就不能取决于
 # 走了哪个分支。现在只有一种。
-with_ca = iosprofile.render("dot.example.com", "203.0.113.10", (), CA_DER, IDS, TMPL)
-if b"<!--" not in a and b"<!--" not in with_ca:
+# 原本这里拿"带 CA / 不带 CA"两种产出对比头部格式。退役后只剩一种情形 —— 换成"有 SSID /
+# 无 SSID"这对仍然存在的分支, 验的还是同一件事: 只有一条序列化路径。
+if b"<!--" not in a and b"<!--" not in s1:
     ok("两种情形的输出都不再夹带模板里那段讲部署细节的 XML 注释")
 else:
     bad("模板注释仍然出现在发给用户的文件里")
-if a.split(b"<plist")[0] == with_ca.split(b"<plist")[0]:
-    ok("带不带 CA 的输出头部格式一致(只有一种序列化路径)")
+if a.split(b"<plist")[0] == s1.split(b"<plist")[0]:
+    ok("带不带 SSID 的输出头部格式一致(只有一种序列化路径)")
 else:
     bad("输出格式仍然分叉")
 
@@ -184,53 +189,47 @@ expect_error(lambda: iosprofile.ca_der_from_pem(KEY_PEM), "私钥", "PEM 里只�
 expect_error(lambda: iosprofile.ca_der_from_pem(CA_PEM + KEY_PEM), "私钥", "证书后面跟着私钥")
 expect_error(lambda: iosprofile.ca_der_from_pem(KEY_PEM + CA_PEM), "私钥", "私钥在证书前面")
 
-key_file = os.path.join(CA_DIR, "wrong.crt")
-open(key_file, "w").write(KEY_PEM)
-pc = cli_run(base_args + ["--wloc-config", mitm_on, "--ca-crt", key_file])
-if pc.returncode != 0 and b"\xe7\xa7\x81\xe9\x92\xa5" in pc.stderr and not pc.stdout:
-    ok("CA 路径误指向 key 文件 → CLI 拒绝生成且不输出任何字节")
-else:
-    bad("误指向 key 文件竟然生成了: rc=%d out=%d" % (pc.returncode, len(pc.stdout)))
+# "CA 路径误指向 key 文件 → 拒绝"这一格随那三个开关一起退役(上面已验它们被显式拒绝)。
+# 但 ca_der_from_pem 那道门仍然守着老产物那一侧, 上面三条 expect_error 就是它。
 
 expect_error(lambda: iosprofile.validate(
     b"<?xml version='1.0'?><plist version='1.0'><dict><key>k</key>"
     b"<string>-----BEGIN PRIVATE KEY-----</string></dict></plist>"),
     "私钥标记", "最终字节里出现私钥标记")
 
-# ── 5. WLOC 开着但 CA 坏了/没有 → 拒绝, 不是悄悄发一份没 CA 的 ─────────────
-expect_error(lambda: iosprofile.ca_der_for(True, os.path.join(CA_DIR, "nope.crt")),
-             "拒绝生成", "WLOC 启用但 CA 文件不存在")
+# ── 5. 解析根证书的能力保留, 生成的能力没了 ────────────────────────────────
+# ca_der_for() / wloc_enabled() 随 WLOC 退役一并删除 —— 它们是"配置说要就把根证书塞进
+# 描述文件"的那条路。**解析**那一侧必须留着: 退役迁移与旧备份校验都要看得懂老产物里那一格。
+for gone in ("ca_der_for", "wloc_enabled"):
+    if not hasattr(iosprofile, gone):
+        ok("iosprofile 不再提供 %s(生成根证书那条路已退役)" % gone)
+    else:
+        bad("iosprofile 仍有 %s —— 生成路径还能被配置驱动着附上根证书" % gone)
 broken = os.path.join(CA_DIR, "broken.crt")
 open(broken, "w").write("-----BEGIN CERTIFICATE-----\nnot-base64!!!\n-----END CERTIFICATE-----\n")
-expect_error(lambda: iosprofile.ca_der_for(True, broken), "损坏", "CA base64 坏了")
+expect_error(lambda: iosprofile.ca_der_from_pem(open(broken, encoding="utf-8").read()),
+             "损坏", "CA base64 坏了(解析侧仍然守着)")
 notder = os.path.join(CA_DIR, "notder.crt")
 open(notder, "w").write("-----BEGIN CERTIFICATE-----\n"
                         + base64.b64encode(b"hello world").decode() + "\n"
                         "-----END CERTIFICATE-----\n")
-expect_error(lambda: iosprofile.ca_der_for(True, notder), "DER", "解出来不是 DER 结构")
-
-bad_json = os.path.join(CA_DIR, "bad.json")
-open(bad_json, "w").write("{ not json")
-expect_error(lambda: iosprofile.wloc_enabled(bad_json), "拒绝生成", "MITM 配置解析失败")
-if iosprofile.wloc_enabled(os.path.join(CA_DIR, "absent.json")) is False:
-    ok("MITM 配置不存在 → 视为未启用(那台机器从没开过 WLOC)")
-else:
-    bad("配置缺失时判定不对")
+expect_error(lambda: iosprofile.ca_der_from_pem(open(notder, encoding="utf-8").read()),
+             "DER", "解出来不是 DER 结构(解析侧仍然守着)")
 
 # ── 6. 缺输入一律拒绝, 而不是生成一份连不上的文件 ───────────────────────
-expect_error(lambda: iosprofile.render("", "203.0.113.10", (), b"", IDS, TMPL),
+expect_error(lambda: iosprofile.render("", "203.0.113.10", (), IDS, TMPL),
              "DoT 主机名", "DoT 主机名为空")
-expect_error(lambda: iosprofile.render("dot.example.com", "", (), b"", IDS, TMPL),
+expect_error(lambda: iosprofile.render("dot.example.com", "", (), IDS, TMPL),
              "网关地址", "网关地址为空")
-expect_error(lambda: iosprofile.render("dot.example.com", "203.0.113.10", (), b"",
+expect_error(lambda: iosprofile.render("dot.example.com", "203.0.113.10", (),
                                        {"root": "nope", "dns": IDS["dns"]}, TMPL),
              "合法 UUID", "身份 UUID 不合法")
-expect_error(lambda: iosprofile.render("dot.example.com", "203.0.113.10", (), b"", IDS,
+expect_error(lambda: iosprofile.render("dot.example.com", "203.0.113.10", (), IDS,
                                        os.path.join(CA_DIR, "no-such.tmpl")),
              "缺少描述文件模板", "模板文件不存在")
 broken_tmpl = os.path.join(CA_DIR, "broken.tmpl")
 open(broken_tmpl, "w").write("<plist><dict><key>oops</key>")
-expect_error(lambda: iosprofile.render("dot.example.com", "203.0.113.10", (), b"", IDS,
+expect_error(lambda: iosprofile.render("dot.example.com", "203.0.113.10", (), IDS,
                                        broken_tmpl), "模板", "模板不是合法 plist")
 
 # ── 7. 输出校验真的会挡住结构错误 ────────────────────────────────────────

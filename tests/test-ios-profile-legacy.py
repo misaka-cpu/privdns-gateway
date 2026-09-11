@@ -180,20 +180,19 @@ def _real_der():
 
 
 FAKE_DER = _real_der()
+# 这两条原本刻画"WLOC 启用时 Bot 会附上 root CA payload(DER 原文), identifier 固定、UUID 随机"。
+# WLOC 位置改写已退役: 那个行为不存在了。特征化测试刻画的是**当前**行为, 所以这里反过来 ——
+# 即便喂一份"WLOC 开着"的配置, 产物里也不该有根证书那一格。
 outs, err = bot_profile(wloc="['x.example']", der=FAKE_DER)
 if outs:
     p0 = plistlib.loads(outs[0])
     cas = [x for x in p0["PayloadContent"] if x.get("PayloadType") == "com.apple.security.root"]
-    if len(cas) == 1 and cas[0]["PayloadContent"] == FAKE_DER:
-        ok("现状(Bot): WLOC 启用时附上 root CA payload(DER 原文)")
+    if not cas:
+        ok("现状(Bot): 即便配置说 WLOC 开着, 产物里也没有 root CA payload(已退役)")
     else:
-        bad("CA payload 不对: %d 个" % len(cas))
-    if cas and cas[0].get("PayloadIdentifier") == "com.privdns.mitm.ca":
-        ok("现状(Bot): CA payload 的 Identifier 是固定值, 但 UUID 仍是随机的")
-    else:
-        bad("CA identifier 变了")
+        bad("退役之后仍然附上了 %d 个 CA payload" % len(cas))
 else:
-    bad("WLOC 用例生成失败: %s" % err)
+    bad("用例生成失败: %s" % err)
 
 outs, err = bot_profile(wloc="[]", der=FAKE_DER)
 if outs and not [x for x in plistlib.loads(outs[0])["PayloadContent"]

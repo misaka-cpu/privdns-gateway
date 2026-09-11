@@ -249,28 +249,22 @@ subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
                 "-subj", "/CN=PDG Test CA"], check=True,
                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 CA_PEM = open(CA_DIR + "/ca.crt", encoding="utf-8").read()
+# 这两格原本是"状态页只显示根证书指纹前缀"与"WLOC 开着但 CA 读不到 → 报失败不发文件"。
+# WLOC 位置改写已退役: 描述文件不再携带根证书, 两个场景都没有对象了。判据换成盯住退役
+# 这一侧 —— 状态页里不该再出现任何根证书字样, 而且**任何**路径都发不出带根证书的文件。
 setup()
 bot._dot_host = lambda: "dot.new.example"
-bot._mitm_enabled_domains = lambda: ["gs-loc.apple.com"]
-bot._mitm_ca_pem = lambda: CA_PEM
 bot.handle_cb(1, 2, "iosgen")
 bot.handle_cb(1, 2, "ios")
 txt, _ = EDITS[-1]
-if "含根证书: 是" in txt and "BEGIN CERTIFICATE" not in txt and "PRIVATE" not in txt:
-    ok("状态页只显示根证书指纹前缀, 不输出证书正文")
+if "含根证书" not in txt and "BEGIN CERTIFICATE" not in txt and "PRIVATE" not in txt:
+    ok("状态页不再提根证书, 也没有证书正文/私钥")
 else:
-    bad("状态页的证书展示不对: %r" % txt[:200])
-
-setup()
-bot._dot_host = lambda: "dot.new.example"
-bot._mitm_enabled_domains = lambda: ["gs-loc.apple.com"]
-bot._mitm_ca_pem = lambda: ""
-bot.handle_cb(1, 2, "iosgen")
-txt, _ = EDITS[-1]
-if "生成失败" in txt and "CA" in txt and not SENT:
-    ok("WLOC 开着但 CA 读不到 → Bot 报失败且不发文件")
+    bad("状态页仍在展示根证书: %r" % txt[:200])
+if SENT and b"com.apple.security.root" not in SENT[-1][1]:
+    ok("发出去的描述文件里没有根证书 payload")
 else:
-    bad("CA 缺失时仍然发了文件: %r" % txt[:120])
+    bad("发出去的文件里仍有根证书 payload, 或压根没发出文件")
 
 # ── 6. Android: 一个都不许露, 一个都不许动 ────────────────────────────────
 before = open(META, "rb").read()
@@ -320,16 +314,24 @@ want = ["第 %d 版 → 第 %d 版" % (meta["previous"]["revision"], meta["curre
 want += [bot.iosstate.FIELD_LABEL[k]
          for k, _, _, _ in bot.iosstate.diff_fields(meta["previous"]["inputs"],
                                                     meta["current"]["inputs"])]
-if r.returncode == 0 and all(w in r.stdout for w in want) and "必须更新" in r.stdout:
-    ok("CLI diff 逐字段列出 %s, 并标了各自的更新等级" % "、".join(want[1:]))
+# 等级标签由**字段自己的分级**推出来, 不写死"必须更新" —— 写死的话, 分级表一改这条就
+# 变成在验一个巧合。(退役前这里之所以恒是"必须更新", 是因为那两版之间换过根证书。)
+_lv = [bot.iosstate.LEVEL_LABEL[bot.iosstate.FIELD_LEVELS.get(k, bot.iosstate.REQUIRED)]
+       for k, _, _, _ in bot.iosstate.diff_fields(meta["previous"]["inputs"],
+                                                  meta["current"]["inputs"])]
+if r.returncode == 0 and all(w in r.stdout for w in want) and _lv \
+        and all(x in r.stdout for x in _lv):
+    ok("CLI diff 逐字段列出 %s, 并标了各自的更新等级(%s)"
+       % ("、".join(want[1:]), "、".join(sorted(set(_lv)))))
 else:
-    bad("CLI diff 不对: rc=%d 缺 %r\n%s"
-        % (r.returncode, [w for w in want if w not in r.stdout], r.stdout[:200]))
+    bad("CLI diff 不对: rc=%d 缺 %r / 等级 %r\n%s"
+        % (r.returncode, [w for w in want if w not in r.stdout],
+           [x for x in _lv if x not in r.stdout], r.stdout[:200]))
 if "BEGIN CERTIFICATE" not in r.stdout and "PRIVATE" not in r.stdout \
-        and meta["current"]["inputs"]["wloc_ca_sha256"][:16] in r.stdout:
-    ok("CLI diff 里的根证书只有指纹前缀, 没有证书正文")
+        and "wloc" not in r.stdout:
+    ok("CLI diff 里没有证书正文、没有私钥, 也没有 WLOC 残留字段")
 else:
-    bad("CLI diff 输出了证书正文或漏了指纹")
+    bad("CLI diff 输出了证书正文/私钥/WLOC 残留")
 
 out = ROOTFS + "/prev.mobileconfig"
 r = subprocess.run([sys.executable, ST, "previous", "--out", out], capture_output=True,

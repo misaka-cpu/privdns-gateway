@@ -52,9 +52,10 @@ class Box:
         self.meta = self.root + "/etc/privdns-gateway/ios-profile.json"
         self.art = self.root + "/var/lib/privdns-gateway/ios-profile"
 
-    def gen(self, host="dot.example.com", ip="203.0.113.10", ssids=(), ca=b"",
-            wloc=False, legacy=False, template=TMPL):
-        return self.s.generate(host, ip, ssids, ca, wloc, template,
+    def gen(self, host="dot.example.com", ip="203.0.113.10", ssids=(),
+            legacy=False, template=TMPL):
+        # WLOC 退役: 生成路径不再有 ca / wloc 这两维(描述文件不再携带任何根证书)。
+        return self.s.generate(host, ip, ssids, template,
                                self.meta, self.art, True, legacy)
 
     def read_meta(self):
@@ -147,7 +148,7 @@ cases = [
     ("必须更新: DoT 主机名", dict(host="dot.new.example"), "required", "DoT 主机名"),
     ("必须更新: 网关地址", dict(ip="198.51.100.9"), "required", "网关地址"),
     ("建议更新: 强制直连 Wi-Fi", dict(ssids=("Home",)), "recommended", "强制直连 Wi-Fi"),
-    ("必须更新: 启用 WLOC", dict(wloc=True, ca=CA_DER), "required", "位置改写"),
+    # ("必须更新: 启用 WLOC", …) 随 WLOC 退役一并去掉 —— 那个开关不存在了。
 ]
 for label, kw, want_lv, want_field in cases:
     bx = Box()
@@ -168,25 +169,27 @@ if not ch2 and lv2 == bx.s.NONE and data == data2:
 else:
     bad("SSID 顺序变化被当成了配置变化: changed=%s lv=%s" % (ch2, lv2))
 
-# CA 换了 = 必须更新, 且元数据里**只有指纹**
+# 这里原本验"换了根 CA → 必须更新, 且元数据里只有指纹"。WLOC 退役后描述文件不再携带根
+# 证书, 这个场景不存在了。换成盯住退役这一侧: **任何**一次生成都产不出根证书那一格 ——
+# 这比"换了要提示"更强, 因为它管住的是全部路径而不是某一次变化。
 bx = Box()
-bx.gen(wloc=True, ca=CA_DER)
-subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
-                "-keyout", CA_DIR + "/ca2.key", "-out", CA_DIR + "/ca2.crt", "-days", "1",
-                "-subj", "/CN=PDG Test CA 2"], check=True,
-               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-CA2 = iosprofile.ca_der_from_pem(open(CA_DIR + "/ca2.crt", encoding="utf-8").read())
-meta, lv, why, data, ch = bx.gen(wloc=True, ca=CA2)
-if lv == "required" and any("根证书" in r for r in why):
-    ok("换了根 CA → 必须更新(手机信任的还是旧的, 不换会全站证书报错)")
+meta, lv, why, data, ch = bx.gen()
+_pl = plistlib.loads(data)
+if not [x for x in _pl["PayloadContent"]
+        if x.get("PayloadType") == "com.apple.security.root"] \
+        and "wloc_ca_sha256" not in meta["current"]["inputs"] \
+        and "wloc_enabled" not in meta["current"]["inputs"]:
+    ok("生成出来的产物里没有根证书那一格, 记录里也没有 WLOC 那两个字段")
 else:
-    bad("换 CA 没被判成必须更新: %s %s" % (lv, why))
+    bad("产物里仍有根证书那一格, 或记录里仍有 WLOC 字段: %s %s" % (lv, why))
 raw_meta = open(bx.meta, encoding="utf-8").read()
+# 原判据是"元数据里只有 CA 指纹, 没有证书正文"。指纹那一维已随退役去掉 —— 剩下的这一半
+# (证书正文与私钥都不许进元数据)仍然要守: 元数据是会被备份、被贴进工单的东西。
 if "BEGIN CERTIFICATE" not in raw_meta and "PRIVATE" not in raw_meta \
-        and hashlib.sha256(CA2).hexdigest() in raw_meta:
-    ok("元数据里只有 CA 指纹, 没有证书正文, 更没有私钥")
+        and "wloc" not in raw_meta:
+    ok("元数据里没有证书正文、没有私钥, 也没有任何 WLOC 残留字段")
 else:
-    bad("元数据里出现了证书正文或私钥")
+    bad("元数据里出现了证书正文/私钥/WLOC 残留")
 
 # ── 2b. SSID 是**配置**, 不是每次都要重报的参数 ────────────────────────────
 # SSID 名单进了 digest, 就等于成了受管配置的一部分。那么"调用方没传"必须解释成"沿用",
@@ -196,9 +199,9 @@ bx = Box()
 bx.gen()
 bx.gen(ssids=("Home", "Office"))
 rev_ssid = bx.read_meta()["current"]["revision"]
-inputs_plain = bx.s.make_inputs("dot.example.com", "203.0.113.10", (), False, b"", TMPL)
+inputs_plain = bx.s.make_inputs("dot.example.com", "203.0.113.10", (), TMPL)
 lv, why = bx.s.classify(bx.read_meta(), bx.s.effective_inputs(
-    bx.read_meta(), "dot.example.com", "203.0.113.10", None, False, b"", TMPL))
+    bx.read_meta(), "dot.example.com", "203.0.113.10", None, TMPL))
 if lv == bx.s.NONE:
     ok("设过 SSID 之后, 不指定 SSID 的判定仍是「无需更新」(没有幻影提示)")
 else:
@@ -257,7 +260,7 @@ else:
 
 with open(bx.s.art_path("current", bx.art), "ab") as f:
     f.write(b"<!-- tampered -->")
-inputs = bx.s.make_inputs("dot.example.com", "203.0.113.10", (), False, b"", TMPL)
+inputs = bx.s.make_inputs("dot.example.com", "203.0.113.10", (), TMPL)
 lv, why = bx.s.classify(bx.read_meta(), inputs)
 # 产物坏了是**服务端**的事, 不是"手机该更新了"。配置变化等级必须一点都不受它影响 ——
 # 两者混在一起时, 用户会去动手机, 而真正坏掉的服务端文件被一句温和提示盖了过去。
@@ -294,7 +297,7 @@ before_id = bx.read_meta()["instance_id"]
 bx.s.ack_migration(bx.meta)
 meta2 = bx.read_meta()
 lv2, why2 = bx.s.classify(meta2, bx.s.make_inputs("dot.example.com", "203.0.113.10",
-                                                  (), False, b"", TMPL))
+                                                  (), TMPL))
 if not meta2["migration_pending"] and lv2 == "none" and meta2["instance_id"] == before_id:
     ok("用户确认已按说明处理 → 迁移提示关闭, 身份不变")
 else:
@@ -400,7 +403,7 @@ open(bx.root + "/run/nodir/sub", "w").close()      # 把父路径占成普通文
 for m in ("iosstate", "pdgtx"):
     sys.modules.pop(m, None)
 import iosstate as _fc  # noqa: E402
-expect_error(lambda: _fc.generate("dot.x.example", "203.0.113.10", (), b"", False, TMPL,
+expect_error(lambda: _fc.generate("dot.x.example", "203.0.113.10", (), TMPL,
                                   bx.meta, bx.art, True, False),
              "锁文件不可用", "锁文件打不开", _fc.StateError)
 
@@ -435,23 +438,26 @@ for broken, want in ((json.dumps({"schema": 99, "instance_id": keep}), "格式�
     expect_error(lambda: bx.s.load(bx.meta), want, "元数据: %s" % want, bx.s.StateError)
 
 # ── 8. 私钥绝不进产物 / 元数据 ────────────────────────────────────────────
-bx = Box()
-key_pem = open(CA_DIR + "/ca.key", encoding="utf-8").read()
-expect_error(lambda: bx.gen(wloc=True, ca=key_pem.encode()), "私钥",
-             "把私钥当 CA 传进生成器")
-if not os.path.exists(bx.meta):
-    ok("被拒绝的那次生成没有留下任何元数据")
+# 原本这一节是"把私钥当 CA 传进生成器 → 被拒"。生成器已经**没有**传 CA 这条路了, 那一格
+# 连同它的对象一起没了 —— 而这正是更强的形态: 拒绝依赖一道门, 没有入口则不依赖任何门。
+# 保留的是另一半(它仍然成立, 而且是这一节真正要保证的事): 产物与元数据里不许出现私钥。
+# "私钥冒充根证书"那道门本身仍被 test-ios-profile-backup-trust.py 用 schema 1 的样本逼着。
+import inspect as _inspect
+if "ca_der" not in _inspect.signature(iosprofile.render).parameters:
+    ok("渲染器已经没有传根证书这条入口(不是靠一道门拦, 是根本进不来)")
 else:
-    bad("拒绝之后仍然写了元数据")
+    bad("iosprofile.render 仍然接受 ca_der —— 传进来就生效的路还在")
 
 bx = Box()
-bx.gen(wloc=True, ca=CA_DER)
+bx.gen()
 blob = open(bx.s.art_path("current", bx.art), "rb").read() + open(bx.meta, "rb").read()
-if b"PRIVATE KEY" not in blob and CA_DER in plistlib.loads(
-        bx.s.read_artifact("current", bx.art))["PayloadContent"][-1]["PayloadContent"]:
-    ok("产物里是公开 CA 证书, 全程没有私钥")
+_pl2 = plistlib.loads(bx.s.read_artifact("current", bx.art))
+if b"PRIVATE KEY" not in blob and not [
+        x for x in _pl2["PayloadContent"]
+        if x.get("PayloadType") == "com.apple.security.root"]:
+    ok("产物与元数据里既没有私钥, 也没有根证书那一格")
 else:
-    bad("产物或元数据里出现私钥")
+    bad("产物或元数据里出现私钥/根证书")
 
 print("─" * 40)
 print("通过 %d, 失败 %d" % (PASS[0], FAIL[0]))

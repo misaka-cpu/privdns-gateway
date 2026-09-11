@@ -46,7 +46,7 @@ _retire_rerender_core(){ echo "rerender" >> "$SC_LOG"; return "$RENDER_RC"; }
 
 # 抽出被测函数与它的两个产品侧辅助。**不**抽 _retire_rerender_core: 那一个在生产里要
 # /opt/pdg-bot 下的 bot 模块, 上面已经用打桩替代了它(本支关心的是"调了没、失败怎么办")。
-for _fn in migrate_wloc_retire _retire_disable_wloc_json _retire_ca_report; do
+for _fn in migrate_wloc_retire _retire_disable_wloc_json _retire_ca_report _retire_ios_schema; do
   eval "$(sed -n "/^$_fn(){/,/^}/p" "$ROOT/deploy/bot/pdg.sh")"
   declare -F "$_fn" >/dev/null || bad "pdg.sh 里抽不出 $_fn"
 done

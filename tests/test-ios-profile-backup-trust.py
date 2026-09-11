@@ -112,8 +112,10 @@ class Box:
         with open(self.root + "/etc/mosdns/config.yaml", "w") as f:
             f.write("log:\n  level: info\n")
 
-    def gen(self, host="dot.example.com", ca=b""):
-        return self.s.generate(host, "203.0.113.10", (), ca, bool(ca), TMPL,
+    def gen(self, host="dot.example.com"):
+        # WLOC 退役: 生成路径不再接受根证书, 夹具去掉 ca 这一维。这一支验的东西
+        # 与产物里有没有根证书无关, 判据本身一条没动。
+        return self.s.generate(host, "203.0.113.10", (), TMPL,
                                self.meta, self.art, True, False)
 
     def cur(self):
@@ -177,8 +179,8 @@ def pack(members):
 def source_backup():
     """一份**真的**备份: rev1(CA=A) → rev2(CA=B), 三件齐全。"""
     src = Box()
-    src.gen(ca=CA_A)
-    src.gen(host="dot.v2.example", ca=CA_B)
+    src.gen()
+    src.gen(host="dot.v2.example")
     meta, cur, prev = src.trio()
     with open(src.root + "/etc/sing-box/config.json", "rb") as f:
         sb = f.read()
@@ -236,9 +238,9 @@ def run_restore(box, blob, inject="", env=None):
 def victim():
     """一台"现网"机器: 自己的身份, 走到 rev3(CA=C)。恢复要么整组换掉它, 要么一个字节不动。"""
     v = Box()
-    v.gen(ca=CA_A)
-    v.gen(host="dot.v2.example", ca=CA_B)
-    v.gen(host="dot.v3.example", ca=CA_C)
+    v.gen()
+    v.gen(host="dot.v2.example")
+    v.gen(host="dot.v3.example")
     return v
 
 
@@ -288,6 +290,51 @@ def rewrite_meta(meta_raw, fn):
 print("══ 一、基线: 干净的备份必须照常恢复 ══")
 src, good = source_backup()
 good_meta = json.loads(good[ARC_META].decode("utf-8"))
+
+
+def legacy_backup(ca_der=None):
+    """一份**退役前**(schema 1)的备份: 记录是 schema 1, 产物里嵌着根证书。
+
+    根证书那一格的那几道门 —— 必须是真的公钥证书、identifier / 文件名 / 版本 / 类型必须是
+    本项目那一套 —— 在 WLOC 退役之后**只对 schema 1 的老产物成立**: 新产物根本没有这一格。
+    但老备份仍然是可恢复的输入, 所以这些门一条都不能撤, 只能换到它们仍然适用的样本上来验。
+
+    当前代码已经渲染不出带根证书的描述文件(那正是退役做对了的证明), 所以这里照着 schema 1
+    的形态手工拼 —— 老机器盘上躺着的本来就是这样一份东西, 它不是当前代码的产物。
+    """
+    der = CA_A if ca_der is None else ca_der
+    m = json.loads(good[ARC_META].decode("utf-8"))
+    ids = _S0.derive_ids(m["instance_id"])
+    out = dict(good)
+    m["schema"] = 1
+    m.pop("retired_revision", None)
+    for which, arc in (("current", ARC_CUR), ("previous", ARC_PREV)):
+        if not m.get(which):
+            continue
+        doc = plistlib.loads(good[arc])
+        doc["PayloadContent"].append({
+            "PayloadType": "com.apple.security.root",
+            "PayloadVersion": 1,
+            "PayloadIdentifier": iosprofile.ID_CA,
+            "PayloadUUID": ids["ca"],
+            "PayloadDisplayName": iosprofile.CA_DISPLAY,
+            "PayloadContent": der,
+            "PayloadCertificateFileName": iosprofile.CA_FILENAME,
+        })
+        blob = plistlib.dumps(doc)
+        out[arc] = blob
+        inp = m[which]["inputs"]
+        inp["schema"] = 1
+        inp["wloc_enabled"] = True
+        inp["wloc_ca_sha256"] = hashlib.sha256(der).hexdigest()
+        m[which]["sha256"] = hashlib.sha256(blob).hexdigest()
+        m[which]["digest"] = _S0.digest_of(inp)
+    out[ARC_META] = json.dumps(m, ensure_ascii=False, indent=2,
+                               sort_keys=True).encode("utf-8") + b"\n"
+    return out
+
+
+LEGACY = legacy_backup()
 v = victim()
 res = run_restore(v, pack(good))
 if res["ok"]:
@@ -332,11 +379,13 @@ else:
     bad("身份没恢复: %r" % mv.get("instance_id"))
 
 print()
-print("══ 三、根证书那一格必须是真的公钥证书 ══")
+print("══ 三、根证书那一格必须是真的公钥证书(schema 1 的老产物)══")
+# 样本换成 LEGACY: schema 2 的产物压根没有这一格, 拿它验这道门只会被更早的
+# "schema 2 不许有根证书" 拦下 —— 那证明不了这道门还在。
 ids = _S0.derive_ids(good_meta["instance_id"])
 for kind in ("ec", "rsa", "pkcs8"):
     key_der = der_private_key(kind)
-    doc = plistlib.loads(good[ARC_CUR])
+    doc = plistlib.loads(LEGACY[ARC_CUR])
     for x in doc["PayloadContent"]:
         if x.get("PayloadType") == "com.apple.security.root":
             x["PayloadContent"] = key_der
@@ -346,9 +395,9 @@ for kind in ("ec", "rsa", "pkcs8"):
     def _fix(m):
         m["current"]["inputs"]["wloc_ca_sha256"] = hashlib.sha256(key_der).hexdigest()
         m["current"]["sha256"] = hashlib.sha256(forged).hexdigest()
-    raw2 = rewrite_meta(good[ARC_META], _fix)     # digest 也一并重算, 直逼根证书那道门
+    raw2 = rewrite_meta(LEGACY[ARC_META], _fix)  # digest 也一并重算, 直逼根证书那道门
     refuse_case("DER %s 私钥冒充根证书" % kind,
-                dict(good, **{ARC_META: raw2, ARC_CUR: forged}),
+                dict(LEGACY, **{ARC_META: raw2, ARC_CUR: forged}),
                 ["根证书", "私钥", "证书"])
 
 print()
@@ -398,14 +447,15 @@ refuse_case("拿另一台机器的产物配本备份的记录",
                           ARC_CUR: mixed}),
             ["身份", "不是这台", "instance"])
 
-doc = plistlib.loads(good[ARC_CUR])
+# 同样换 schema 1 样本: 指纹这道门的对象是根证书那一格, 而新产物没有那一格。
+doc = plistlib.loads(LEGACY[ARC_CUR])
 for x in doc["PayloadContent"]:
     if x.get("PayloadType") == "com.apple.security.root":
-        x["PayloadContent"] = CA_C          # 记录说这一版用 B, 文件里放 C
+        x["PayloadContent"] = CA_C          # 记录说这一版用 A, 文件里放 C
 swapca = plistlib.dumps(doc)
 refuse_case("产物里的根证书换成了另一张(指纹与记录不符)",
-            dict(good, **{ARC_META: resha(good[ARC_META], "current", swapca),
-                          ARC_CUR: swapca}),
+            dict(LEGACY, **{ARC_META: resha(LEGACY[ARC_META], "current", swapca),
+                            ARC_CUR: swapca}),
             ["根证书", "指纹"])
 
 doc = plistlib.loads(good[ARC_CUR])
@@ -523,19 +573,20 @@ for key, val, words in (("PayloadIdentifier", "com.evil.ca", ["identifier", "Ide
                         ("PayloadCertificateFileName", "evil.crt", ["证书文件名", "根证书"]),
                         ("PayloadVersion", 2, ["PayloadVersion", "根证书"]),
                         ("PayloadType", "com.apple.security.pkcs1", ["payload", "根证书"])):
-    doc = plistlib.loads(good[ARC_CUR])
+    doc = plistlib.loads(LEGACY[ARC_CUR])
     for x in doc["PayloadContent"]:
         if x.get("PayloadType") == "com.apple.security.root":
             x[key] = val
     forged = plistlib.dumps(doc)
     refuse_case("根证书 payload 的 %s 被改成 %r" % (key, val),
-                dict(good, **{ARC_META: resha(good[ARC_META], "current", forged),
-                              ARC_CUR: forged}),
+                dict(LEGACY, **{ARC_META: resha(LEGACY[ARC_META], "current", forged),
+                                ARC_CUR: forged}),
                 words)
 
 # 5) 没有 openssl / openssl 跑不起来: 不能把结构判据冒充完整 X.509 校验。安装本来就依赖它。
+# 同样要用 schema 1 的样本: 强校验的对象就是根证书那一格, 而新产物没有那一格。
 refuse_case("openssl 不可用时不许把结构判据当成强校验",
-            dict(good),
+            dict(LEGACY),
             ["强校验", "openssl", "OpenSSL"],
             env={"PATH": "/nonexistent-for-openssl-probe"})
 
@@ -681,12 +732,13 @@ print("══ 五之三、白名单必须跟得上渲染器(否则正常备份�
 # 字段白名单是钉死在当前 schema 上的一张表。它和 iosprofile.render 是两处定义, 会漂移。
 # 这条守卫拿**现渲染**的产物过一遍联合校验: 模板或渲染器改了字段而白名单没跟上, 这里先红,
 # 而不是等某个用户恢复备份时才发现"自己生成的文件自己不认"。
-for label, ca, ssids in (("带根证书", CA_A, []),
-                         ("不带根证书", b"", []),
-                         ("带 SSID 强制直连名单", b"", ["Home", "Office"]),
-                         ("根证书 + SSID 都有", CA_B, ["Cafe"])):
+# "带根证书"那两格随 WLOC 退役一并去掉 —— 渲染器已经产不出那一格了。老产物那一侧的漂移
+# 守卫由 LEGACY 那几条用例覆盖(它们拿 schema 1 的样本逼根证书那几道门)。
+for label, ssids in (("不带 SSID", []),
+                     ("带 SSID 强制直连名单", ["Home", "Office"]),
+                     ("含非 ASCII 的 SSID", ["Café ☕", "办公室"])):
     probe = Box()
-    probe.s.generate("dot.probe.example", "203.0.113.10", ssids, ca, bool(ca), TMPL,
+    probe.s.generate("dot.probe.example", "203.0.113.10", ssids, TMPL,
                      probe.meta, probe.art, True, False)
     p_meta, p_cur, _p_prev = probe.trio()
     try:

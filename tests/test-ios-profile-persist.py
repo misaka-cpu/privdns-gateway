@@ -57,7 +57,7 @@ def box():
         sys.modules.pop(m, None)
     sys.path.insert(0, BOTDIR)
     import iosstate
-    iosstate.generate("dot.example.com", "203.0.113.10", (), b"", False, TMPL,
+    iosstate.generate("dot.example.com", "203.0.113.10", (), TMPL,
                       root + "/etc/privdns-gateway/ios-profile.json",
                       root + "/var/lib/privdns-gateway/ios-profile", True, False)
     return root, iosstate
@@ -120,12 +120,12 @@ root2, st2 = box()
 meta2 = root2 + "/etc/privdns-gateway/ios-profile.json"
 art2 = root2 + "/var/lib/privdns-gateway/ios-profile"
 old_meta = open(meta2, "rb").read()
-st2.generate("dot.v2.example", "203.0.113.10", (), b"", False, TMPL, meta2, art2, True, False)
+st2.generate("dot.v2.example", "203.0.113.10", (), TMPL, meta2, art2, True, False)
 with open(meta2, "wb") as f:                      # 模拟"记录被回滚, 产物还是新的"
     f.write(old_meta)
 # 错位先被**如实检出**(不是"建议更新"那种关于手机的措辞), 然后按记录逐字节复原。
 st_before, detail = st2.artifact_health(json.load(open(meta2, encoding="utf-8")), "current", art2)
-m, lv, why, data, changed = st2.generate("dot.example.com", "203.0.113.10", (), b"", False,
+m, lv, why, data, changed = st2.generate("dot.example.com", "203.0.113.10", (),
                                          TMPL, meta2, art2, True, False)
 st_after, _ = st2.artifact_health(m, "current", art2)
 if st_before == "state_mismatch" and lv == "none" and st_after == "healthy" \
@@ -234,7 +234,7 @@ else:
 
 # 承接: 切回来之后再生成, 必须还是同一个身份、同一个 revision
 m, lv, why, data, changed = st3.generate(
-    "dot.example.com", "203.0.113.10", (), b"", False, TMPL,
+    "dot.example.com", "203.0.113.10", (), TMPL,
     root3 + "/etc/privdns-gateway/ios-profile.json",
     root3 + "/var/lib/privdns-gateway/ios-profile", True, False)
 if not changed and m["instance_id"] == id3 and m["current"]["revision"] == 1:
@@ -246,7 +246,7 @@ else:
 root5, st5 = box()
 meta5 = root5 + "/etc/privdns-gateway/ios-profile.json"
 art5 = root5 + "/var/lib/privdns-gateway/ios-profile"
-st5.generate("dot.v2.example", "203.0.113.10", (), b"", False, TMPL, meta5, art5, True, False)
+st5.generate("dot.v2.example", "203.0.113.10", (), TMPL, meta5, art5, True, False)
 trio_before = tuple(open(p, "rb").read() for p in
                     (meta5, art5 + "/current.mobileconfig", art5 + "/previous.mobileconfig"))
 os.makedirs(root5 + "/opt/pdg-bot", exist_ok=True)
