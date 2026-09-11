@@ -112,7 +112,6 @@ unlock_domains = {"v": []}                 # 现网 unlock.txt 的镜像(事务�
 bot._wda_authorized = lambda: True
 bot._unlock_precheck = lambda domains: (True, "")
 bot._platform = lambda: "android"
-bot._mitm_domains = lambda: []
 bot._mihomo_rulesets = lambda rs_meta=None: {}
 bot.load = lambda: copy.deepcopy(state["model"])
 bot._read_hijack = lambda: []
@@ -518,20 +517,26 @@ def doctor_layer(model, bad_order):
     with tempfile.TemporaryDirectory() as tmp:
         checks.MIHOMO_CFG = os.path.join(tmp, "config.yaml")
         checks.UNLOCK_FILE = os.path.join(tmp, "unlock.txt")
-        checks.MITM_HIJACK_FILE = os.path.join(tmp, "mitm_hijack.txt")
         checks.CUSTOM_DIRECT_FILE = os.path.join(tmp, "custom_direct.txt")
 
-        def put(model_, mitm=()):
-            old = bot._mitm_domains
-            bot._mitm_domains = lambda: list(mitm)
-            try:
-                data, _ = bot._render_mihomo_bytes(model_, rs_meta={})
-            finally:
-                bot._mitm_domains = old
+        def put(model_, legacy_mitm=()):
+            """渲染并落盘。legacy_mitm 非空时, 再把 MITM-OUT 那一批**手工注进去**。
+
+            为什么是手工注入而不是让渲染器产生: WLOC 已退役, 渲染器不再产出 MITM-OUT。
+            但**还没跑到退役迁移的老机器**盘上那份 mihomo 配置里它仍然在 —— 而这一节检查的
+            正是 doctor 读**现网配置**时的行为。用渲染器造不出这个现场, 就只能照着老机器
+            的样子摆出来: 那才是 doctor 真正会遇到的输入。"""
+            data, _ = bot._render_mihomo_bytes(model_, rs_meta={})
+            if legacy_mitm:
+                cfg_ = json.loads(data.decode("utf-8"))
+                cfg_.setdefault("proxies", []).append(
+                    {"name": "MITM-OUT", "type": "socks5", "server": "127.0.0.1",
+                     "port": 7894, "udp": False})
+                # 老机器上它排在最前(接管要先于一切分流)
+                cfg_["rules"] = ["DOMAIN-SUFFIX,%s,MITM-OUT" % d for d in legacy_mitm] + cfg_["rules"]
+                data = json.dumps(cfg_, ensure_ascii=False, indent=2).encode("utf-8")
             with open(checks.MIHOMO_CFG, "wb") as fh:
                 fh.write(data)
-            with open(checks.MITM_HIJACK_FILE, "w", encoding="utf-8") as fh:
-                fh.write("".join("domain:%s\n" % d for d in mitm))
 
         with open(checks.UNLOCK_FILE, "w", encoding="utf-8") as fh:
             fh.write("".join("domain:%s\n" % d for d in bot.WDA_DOMAINS))
@@ -567,18 +572,25 @@ def doctor_layer(model, bad_order):
             bad("直连表冲突没被报出来: (%s) %s" % (level, detail))
         open(checks.CUSTOM_DIRECT_FILE, "w").close()
 
-        # ④ MITM 接管也是自动生成的规则: 压过用户规则同样要报
+        # ④ 老机器上残留的 MITM 接管那一批: 压过用户规则同样要报, 且要给出**退役**的处置
+        #
+        # 判据没有跟着功能一起删, 是因为这一格管的不是 WLOC, 而是 doctor 读到一份
+        # "自动生成的规则压过用户点名规则"的配置时说不说得清。退役迁移没跑到的机器上,
+        # 这批规则就是真实存在的; 把识别删掉的话, 那台机器上的 MITM-OUT 会被当成用户
+        # 自己写的规则, doctor 反而会报出一条根本不存在的冲突。
+        #
+        # 变的是**建议**: 以前说"要么删掉那条规则, 要么关掉 WLOC"。WLOC 已经没有开关可关,
+        # 照旧说就是叫用户去点一个不存在的按钮 —— 现在必须指向退役迁移。
         mitm_model = copy.deepcopy(model)
         mitm_model["route"]["rules"].insert(
             1, {"domain_suffix": ["gs-loc.apple.com"], "outbound": "hkt"})
-        put(mitm_model, mitm=["gs-loc.apple.com"])
+        put(mitm_model, legacy_mitm=["gs-loc.apple.com"])
         level, _, detail = checks.check_rule_precedence()
-        # MITM 那批是**故意**排最前的, 建议必须与 WDA 那批不同 —— 说成"等自愈"会让人白等
         if level == "warn" and "gs-loc.apple.com" in detail and "MITM" in detail \
-           and "WLOC" in detail:
-            ok("doctor 也认 MITM 接管这一批, 并给出与 WDA 不同的处置(删规则或关 WLOC)")
+           and "退役" in detail and "__migrate" in detail and "关掉 WLOC" not in detail:
+            ok("doctor 认老机器上残留的 MITM 接管批, 并指向退役迁移(不再叫人去关一个不存在的开关)")
         else:
-            bad("MITM 压过用户规则没被报出来/建议不对: (%s) %s" % (level, detail))
+            bad("残留 MITM 压过用户规则没被报出来/建议不对: (%s) %s" % (level, detail))
 
         # ⑤ WDA 关着: 不许无中生有
         with open(checks.UNLOCK_FILE, "w", encoding="utf-8"):

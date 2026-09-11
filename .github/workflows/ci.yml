@@ -476,7 +476,7 @@ jobs:
       - name: "GMS 推送端口迁移回归 (fw/sing-box 补 5228-5230, 自定义跳过, 失败回滚)"
         run: bash tests/test-gms-migration.sh
 
-      - name: "v1.4.x→WLOC 迁移回归 (补 force_hijack/seq/优先级规则/mitm_hijack, 幂等/自定义跳过/失败还原)"
+      - name: "mosdns force_hijack 锚点结构迁移回归 (补 domain_set/seq/优先级规则, 幂等/自定义跳过/失败还原)"
         run: bash tests/test-mitm-migration.sh
 
       - name: "parse_link 多协议回归 (各协议链接 + Surge ss 行字段映射)"
@@ -992,38 +992,29 @@ jobs:
       - name: "TFO 状态回归 (持久化意图 + 加出口不冲掉 + 渲染映射)"
         run: python3 tests/test-tfo.py
 
-      - name: "MITM CA 骨架回归 (自签 CA + 叶子证书验链/SAN/EKU/缓存)"
-        run: python3 tests/test-mitm-ca.py
 
-      - name: "MITM CA 并发回归 (24 线程+跨进程同域签发: 0 异常/cert-key 匹配/无残留)"
-        run: python3 tests/test-mitm-ca-concurrent.py
 
-      - name: "MITM 服务回归 (socks5→CA叶子终止TLS→插件; 客户端CA验链; 非接管兜底关闭)"
-        run: python3 tests/test-mitm-server.py
 
-      - name: "Apple WLOC 插件回归 (gs-loc protobuf 编解码 + 坐标改写 + 负坐标)"
-        run: python3 tests/test-mitm-wloc.py
 
-      - name: "WLOC bot 后端回归 (set_wloc 开关/坐标/平台门控/接管域名同源)"
-        run: python3 tests/test-mitm-wloc-bot.py
 
-      - name: "平台文案/门控回归 (客户端·状态·WLOC 按平台/内核 + README 文案一致)"
+      - name: "WLOC 退役 · CA 只读兼容 (五档不互冒充/零写入/拒私钥/复用严格证书门)"
+        run: python3 tests/test-wloc-retire-ca-readonly.py
+
+      - name: "WLOC 退役 · 执行面闭合 (模块与 unit 已删/无悬空调用/旧按钮回退役提示/残留不复活路由)"
+        run: python3 tests/test-wloc-retire-surface.py
+
+      - name: "WLOC 退役 · 老装迁移 (停服务→撤劫持→撤路由→删模块; 幂等/归属不清拒绝/失败还原)"
+        run: bash tests/test-wloc-retire-migration.sh
+
+      - name: "平台文案/门控回归 (客户端·状态 按平台/内核 + README 文案一致)"
         run: python3 tests/test-platform-copy.py
 
       - name: "诊断报告内核一致性 (版本/日志按当前后端取, mihomo 机上不再固定问 sing-box)"
         run: python3 tests/test-report-backend.py
 
-      - name: "WLOC 手机端文案一致性 (README/Bot 同一套三步 + 平台隔离)"
-        run: python3 tests/test-wloc-copy.py
 
-      - name: "WLOC 事务化回归 (BUSY/CA/内核/pdg-mitm/mosdns 故障注入均回滚, 不留 enabled=true)"
-        run: python3 tests/test-mitm-wloc-txn.py
 
-      - name: "WLOC 热切换回归 (切地点零 systemctl/零重渲 + 配置锁 + 加改语义 + 监听不覆盖菜单)"
-        run: python3 tests/test-wloc-hotswitch.py
 
-      - name: "WLOC 热加载回归 (真起 pdg-mitm: 同 PID 换坐标 + 并发不混坐标 + 状态文件)"
-        run: python3 tests/test-wloc-hotreload.py
 
       - name: "文案与当前行为一致 (WLOC 热加载/:81 返回 200/端口按平台)"
         run: python3 tests/test-wording-accuracy.py
@@ -1175,7 +1166,6 @@ jobs:
           - e2e-update-ahead-of-release.sh
           - e2e-update-preserve-userdata.sh
           - e2e-upgrade-from-release.sh
-          - e2e-wloc.sh
           - e2e-cli-ops.sh
           - e2e-hijack-mode-tx.sh
           - e2e-snapshot-meta.sh
@@ -1656,7 +1646,7 @@ jobs:
             e2e-migrate.sh e2e-exit-rule.sh e2e-drop-singbox.sh e2e-custom-nft.sh
             e2e-cross-version-rollback.sh e2e-install.sh e2e-install-nft.sh
             e2e-platform-switch.sh e2e-update.sh e2e-update-preserve-userdata.sh
-            e2e-upgrade-from-release.sh e2e-wloc.sh e2e-cli-ops.sh
+            e2e-upgrade-from-release.sh e2e-cli-ops.sh
             e2e-rescue-migration-lock.sh e2e-hijack-mode-tx.sh e2e-snapshot-meta.sh
             e2e-config-transaction.sh e2e-config-transaction-recovery.sh
         run: bash tests/e2e-serial-hermetic.sh

@@ -107,7 +107,6 @@ def paths_for(box):
     这里读沙箱 box.root, 所以没法直接复用。复制就会漂移, 于是下面加了一条键集一致性断言:
     以后往 _tx_paths 里加路径而忘了这里, 会当场红, 而不是等到某支用例莫名其妙失败。"""
     return {"rs_meta_path": box.root + "/opt/pdg-bot/rulesets.json",
-            "mitm_hijack_file": box.root + "/etc/mosdns/rules/mitm_hijack.txt",
             "platform_file": box.root + "/etc/privdns-gateway/platform",
             "lan_table_file": box.root + "/etc/privdns-gateway/lan-panels.json"}
 

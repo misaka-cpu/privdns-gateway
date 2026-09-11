@@ -1,5 +1,18 @@
 # 设计:MITM 插件框架 + Apple WLOC 位置改写(v1.5.0 特性 B)
 
+> # ⛔ 本功能已退役 —— 本文是历史记录
+>
+> WLOC 位置改写连同它专属的 MITM 执行能力(`pdg-mitm` 服务、`mitm_server.py` / `mitm_wloc.py`、
+> 自签根 CA 的签发面、`gs-loc` 的 DNS 劫持与内核路由)已从项目中移除。新装不含它; 升级会在
+> 老机器上停服务、撤劫持与路由(见 `migrate_wloc_retire`)。
+>
+> **本文以下内容描述的是退役前的实现**, 不再对应任何现有代码。保留它是因为它记录了当初
+> 为什么要这么做、以及踩过的那些坑(forward+patch 而非自造响应、控制中心关 WiFi 与设置里
+> 关 WiFi 的区别、按请求整份读配置而不是看 mtime) —— 把这些一起删掉, 下一个想做类似东西
+> 的人就得重新踩一遍。
+>
+> 用过它的用户要做什么, 见 [README 第 10 节](../README.md)。
+
 > **阅读提示(v1.6.0 后)**:本文写于"sing-box / mihomo 双核并存"时期,文中"两核对称""sing-box:
 > outbound+route"等描述属**当时的设计背景**。v1.6.0 已彻底移除 sing-box 运行时,mihomo 是唯一
 > 内核 —— 实际实现里只剩 mihomo 一侧(`proxies` + `rules`)。其余设计要点(mosdns 强制劫持、

@@ -90,7 +90,7 @@ PROBE = textwrap.dedent('''
     model = json.loads(%r)
     meta = json.loads(%r)
     data, rmeta = M.render_bytes(model, lan_domains=[], rulesets=M.rulesets_arg(meta),
-                                 mitm_domains=[], tls_ports=None)
+                                 tls_ports=None)
     try:
         M.check_meta(rmeta)
         print("NOREFUSE:1")

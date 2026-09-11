@@ -2,10 +2,9 @@
 """文案必须与当前行为一致(历史记录不动, 但"现在怎么工作"不许说错)。
 
 守三处曾经说错的:
-  1. WLOC 热加载: 实现早就改成"每次 WLOC 请求整份读 mitm.json", 但 README / 设计文档 /
-     测试说明 / 代码注释里还写着"按 mtime(文件修改时间)加载" —— 照着文档去排错的人会以为
-     "改完文件要等 mtime 变", 而真正的边界(网关只能保证下一次请求用新坐标, 清不掉 iOS
-     locationd 缓存)反而没写清楚。
+  1. WLOC: 这一节原本守"热加载按 mtime"那句错话。该功能已**退役**, 现在守的是退役本身没
+     说漏 —— 面向用户的文档不许再教人怎么用它, 设计文档保留但要标明是历史记录, 而且必须
+     交代"网关删不掉手机上已经给出的证书信任, 那一步只有用户自己能做"。
   2. :81 探测端点: probe81.py 一直返回 **200**(iOS 的 URLStringProbe 只认 200), 而 unit
      描述和实战记录里写成 204 —— 有人照着去"修正"实现就把探测搞挂了。
   3. 端口清单: 写死一串全平台端口, 于是 iOS 机器上 doctor 声称 GMS 5228-5230 已就位
@@ -32,34 +31,40 @@ def text(rel):
     return (ROOT / rel).read_text(encoding="utf-8")
 
 
-# ── 1. WLOC 热加载 ──────────────────────────────────────────────────────────
-STALE = ("按 mtime 热加载", "按 mtime_ns 热加载", "按文件修改时间", "按 mtime 自己热加载")
-for rel in ("README.md", "docs/design-mitm-plugins.md", "tests/e2e-wloc.sh",
-            "tests/test-wloc-hotswitch.py", "tests/test-wloc-hotreload.py",
-            "deploy/bot/pdg-bot.py", "deploy/bot/mitm_server.py"):
-    t = text(rel)
-    for bad_phrase in STALE:
-        if bad_phrase in t:
-            bad(f"{rel} 仍写着「{bad_phrase}」, 与当前实现(每次请求整份读)不符")
-ok("README / 设计文档 / 测试 / 代码注释都不再说「按 mtime 加载」")
+# ── 1. WLOC 已退役: 文档不许再教人怎么用它 ─────────────────────────────────
+# 这一节原本守的是"WLOC 热加载按 mtime"这句错话。功能退役后, 错的不再是某句描述, 而是
+# **整套使用说明还在**: 照着它去操作的人会找不到按钮、找不到服务, 然后以为是自己装坏了。
+#
+# 判据分两层, 因为两种错法不同:
+#   · 面向用户的文档(README)必须明确写"已退役", 并且**不再**给出操作步骤;
+#   · 设计文档保留(它记着当初为什么这么做), 但必须在开头标明它是历史记录 —— 否则它读起来
+#     和一份现行设计没有区别。
+readme = text("README.md")
+if "已退役" not in readme:
+    bad("README 没写明 WLOC 已退役")
+for lure in ("🍏 位置改写", "➕ 添加地点", "📍 地点 / 切换"):
+    if lure in readme:
+        bad(f"README 里还留着 WLOC 的操作入口「{lure}」—— 那些按钮已经不存在了")
+ok("README 写明 WLOC 已退役, 且不再给出操作步骤")
 
-# 实现本身必须仍是"每次请求读", 而不是又退回缓存(文案对了代码变了同样是不一致)
-wl = text("deploy/bot/mitm_wloc.py")
-assert "def snapshot" in wl
-_snap = wl.split("def snapshot", 1)[1].split("\ndef ", 1)[0]
-if "mtime" in _snap or "st_mtime" in _snap:
-    bad("WlocConfig.snapshot 又开始看 mtime 了 —— 文案与实现再次脱节")
-ok("WlocConfig.snapshot 确实是每次整份读(不看 mtime)")
+# 退役说明必须把**手机那一侧**交代清楚: 网关删不掉手机上已经给出的证书信任, 只有用户能。
+# 漏掉这一条, 用户手机上会长期留着一张仍被信任、而私钥去向不明的根证书。
+sec = readme.split("## 10.", 1)[1].split("\n## ", 1)[0] if "## 10." in readme else ""
+for need in ("证书信任设置", "重新生成"):
+    if need not in sec:
+        bad(f"README 的退役说明没交代「{need}」这一步")
+ok("README 的退役说明交代了: 重新生成描述文件 + 到手机上取消对根 CA 的信任")
 
-for rel, need in (("README.md", "下一次"), ("docs/design-mitm-plugins.md", "下一次"),
-                  ("deploy/bot/mitm_server.py", "下一次 WLOC 请求")):
-    if need not in text(rel):
-        bad(f"{rel} 没写明「网关只保证下一次请求用新坐标」这条边界")
-ok("三处都写明了边界: 只保证下一次请求用新坐标, 清不掉 iOS locationd 缓存")
-for rel in ("README.md", "docs/design-mitm-plugins.md"):
-    if "locationd" not in text(rel):
-        bad(f"{rel} 没提 locationd 缓存这条网关做不到的事")
-ok("README / 设计文档都点明了 locationd 缓存不归网关清")
+design = text("docs/design-mitm-plugins.md")
+if "已退役" not in design.split("\n## ", 1)[0]:
+    bad("docs/design-mitm-plugins.md 开头没标明它是已退役功能的历史记录")
+ok("设计文档保留为历史记录, 且开头标明已退役")
+
+# 实现侧: 那两个模块必须真的不在(文档说退役而代码还在, 同样是不一致)
+for gone in ("deploy/bot/mitm_server.py", "deploy/bot/mitm_wloc.py"):
+    if (ROOT / gone).exists():
+        bad(f"{gone} 还在 —— 文档说退役了, 代码没退")
+ok("MITM 宿主与 WLOC 插件确实已从仓库移除")
 
 # ── 2. :81 返回 200 ─────────────────────────────────────────────────────────
 probe = text("deploy/bot/probe81.py")

@@ -139,8 +139,11 @@ USER_DATA = [
     ("dot_domain", "/opt/pdg-bot/dot-domain"),
     ("platform", "/etc/privdns-gateway/platform"),
     ("profile_env", "/etc/privdns-gateway/profile.env"),
-    ("mitm_json", "/etc/privdns-gateway/mitm.json"),
-    ("mitm_hijack", "/etc/mosdns/rules/mitm_hijack.txt"),
+    # WLOC 退役后 mitm.json / mitm_hijack.txt 不再是受管配置。仍然**要采**它们 ——
+    # 升级不变量比的是"升级前后有没有东西被动过", 而退役迁移恰恰会动这两样: 不采的话
+    # 那次改动在快照里看不见, 而"看不见"正是这份不变量要防的。
+    ("mitm_json_retired", "/etc/privdns-gateway/mitm.json"),
+    ("mitm_hijack_retired", "/etc/mosdns/rules/mitm_hijack.txt"),
 ]
 CREDENTIALS = [
     ("bot_token_file", "/etc/privdns-gateway/bot.env"),
