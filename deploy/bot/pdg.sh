@@ -2482,8 +2482,7 @@ cmd_ios_state(){
       local HOST IP
       HOST="$(_ios_dot_host)"; IP="$(_ios_server_ip)"
       if [[ -n "$HOST" && -n "$IP" ]]; then
-        python3 "$st" status --dot-host "$HOST" --server-ip "$IP" --template "$IOS_TMPL" \
-          --wloc-config /etc/privdns-gateway/mitm.json --ca-crt /etc/privdns-gateway/ca/ca.crt
+        python3 "$st" status --dot-host "$HOST" --server-ip "$IP" --template "$IOS_TMPL"
       else
         # 读不到当前网关配置就只报记录, 不硬猜一个判定结果。
         echo "⚠️ 读不到当前 DoT 主机名 / 网关地址, 只显示已生成的记录:"
@@ -2491,10 +2490,9 @@ cmd_ios_state(){
       fi;;
     diff|ack|recover) python3 "$st" "$sub";;
     repair)
-      # 按记录逐字节复原 current。要带上 WLOC 配置与 CA —— 那一版用的根证书指纹对不上就
-      # 复原不了(拿现在的证书渲染出来的是另一份文件), 缺参数会让它误报"模板变了"。
-      python3 "$st" repair --template "$IOS_TMPL" \
-        --wloc-config /etc/privdns-gateway/mitm.json --ca-crt /etc/privdns-gateway/ca/ca.crt
+      # 按记录逐字节复原 current。以前这里要带上 WLOC 配置与 CA(那一版用的根证书指纹对不上
+      # 就复原不了); WLOC 已退役, 描述文件不再携带根证书, 那两个参数也随之作废。
+      python3 "$st" repair --template "$IOS_TMPL"
       ;;
     *) echo "用法: pdg ios {status|diff|previous|ack|recover|repair}"; return 2;;
   esac
@@ -3420,8 +3418,7 @@ cmd_ios(){
   OUT="$_IOS_OFFER_WWW/gen.mobileconfig"
   # 经 _ios_offer_gen_run 启动(理由同 cmd_ios_previous)。
   if ! _ios_offer_gen_run python3 "$ST" generate --dot-host "$HOST" --server-ip "$IP" \
-        --template "$TMPL" --wloc-config /etc/privdns-gateway/mitm.json \
-        --ca-crt /etc/privdns-gateway/ca/ca.crt --out "$OUT" "${LEGACY[@]}"; then
+        --template "$TMPL" --out "$OUT" "${LEGACY[@]}"; then
     _ios_offer_teardown || true
     trap - EXIT HUP INT TERM
     echo "❌ 生成描述文件失败, 未开放任何临时端口。"; return 1
@@ -3959,6 +3956,19 @@ migrate_wloc_retire(){
   done
   [[ $did -eq 1 ]] && systemctl daemon-reload >/dev/null 2>&1
 
+  # ── ⑤b iOS 描述文件记录的格式迁移(schema 1 → 2)────────────────────────
+  # 与上面那几步是**同一件事的两半**: 那边撤的是网关上的执行能力, 这边撤的是"还能把一份
+  # 嵌着退役根证书的描述文件再发一次"这个能力。只做前一半的话, 服务停了、劫持撤了, 而
+  # 「📱 iOS 描述文件 → 重新发送」照样会把那张根 CA 再装一次到用户手机上。
+  #
+  # 失败要传出去: 迁移是**三段式**(严格验 schema 1 → 明确迁移 → 严格复核 schema 2), 任何
+  # 一段不成立它都一个字节不写。吞掉失败的后果就是上面那句。
+  if ! _retire_ios_schema; then
+    c_r "❌ WLOC 退役: iOS 描述文件记录的格式迁移失败。"
+    c_y "   上面的服务/劫持/路由已经撤下, 但记录仍是旧格式 —— 修好之后重跑 sudo pdg __migrate。"
+    return 1
+  fi
+
   # ── ⑥ 盘上的 CA 材料: 只报告 ───────────────────────────────────────────
   # 判定复用 mitm_ca 那份只读探测(它不写盘、四态分得清"确认不在"与"看不见")。
   if [[ $did -eq 1 ]]; then
@@ -4008,6 +4018,32 @@ d = os.environ.get("PDG_CA_DIR")
 if d:
     mitm_ca.CA_DIR = d
 print(json.dumps(mitm_ca.ca_material_readonly(), ensure_ascii=False))' 2>/dev/null ) || true
+}
+
+# iOS 描述文件记录的 schema 1 → 2 迁移。判据与实现都在 iosstate.migrate_schema 里 ——
+# 这里只负责调它并把结果说给用户听, 不在 bash 侧另写一份格式判断。
+# 组件不在(Android 机器、或者根本没装过 iOS 组件)= 没有这一步要做, 返回 0。
+_retire_ios_schema(){
+  local R="${PDG_RETIRE_ROOT:-}"
+  local st="$R/opt/pdg-bot/iosstate.py"
+  [[ -f "$st" ]] || return 0
+  local out
+  if ! out="$(cd "$R/opt/pdg-bot" && python3 -c '
+import json, sys
+import iosstate
+try:
+    print(json.dumps(iosstate.migrate_schema(), ensure_ascii=False))
+except iosstate.StateError as e:
+    sys.stderr.write(str(e) + "\n"); sys.exit(1)
+' 2>&1)"; then
+    printf '%s\n' "$out" | sed 's/^/     /'
+    return 1
+  fi
+  printf '%s' "$out" | grep -q '"changed": true' && \
+    c_g "  ✅ iOS 描述文件记录已迁移到新格式(不再含 WLOC 字段)。"
+  printf '%s' "$out" | grep -q '"retired_revision": [0-9]' && \
+    c_y "  ⚠️ 有历史版本的描述文件里嵌着已退役的根证书, 已不再保留 —— 请重新生成一份。"
+  return 0
 }
 
 # 重渲内核配置(撤掉 MITM 路由)。单独一个函数是为了能在测试里替换掉 ——

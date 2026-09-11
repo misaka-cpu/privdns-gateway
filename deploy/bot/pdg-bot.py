@@ -3423,8 +3423,8 @@ def _ios_profile(ssids=(), ids=None):
     """
     if _platform() != "ios":         # 最底层门控: 即便某路径绕过按钮/回调, 也生成不了 iOS 描述文件
         raise RuntimeError("iOS 描述文件仅 iOS 平台可用(本机为 Android)。" + _platform_unconfirmed())
-    _, der = _ios_ca()
-    return iosprofile.render(_dot_host(), _server_ip(), ssids, der, ids, IOS_TMPL)
+    _ios_ca()          # 仍然过一次: 它是"到底发不发根证书"的唯一那道口子
+    return iosprofile.render(_dot_host(), _server_ip(), ssids, ids, IOS_TMPL)
 
 # ── iOS 描述文件: 受管生命周期 ──
 # 服务器**不知道**手机上此刻装的是什么 —— 本项目不是 MDM。所以下面所有文案只讲"我们生成/
@@ -3453,15 +3453,13 @@ def _ios_ca():
 def _ios_generate(ssids=None, legacy=False):   # ssids=None ⇒ 沿用记录里的名单
     if _platform() != "ios":
         raise RuntimeError("iOS 描述文件仅 iOS 平台可用(本机为 Android)。" + _platform_unconfirmed())
-    enabled, der = _ios_ca()
-    return iosstate.generate(_dot_host(), _server_ip(), ssids, der, enabled,
-                             IOS_TMPL, legacy_seen=legacy)
+    _ios_ca()
+    return iosstate.generate(_dot_host(), _server_ip(), ssids, IOS_TMPL, legacy_seen=legacy)
 
 
 def _ios_inputs(meta, ssids=None):
-    enabled, der = _ios_ca()
-    return iosstate.effective_inputs(meta, _dot_host(), _server_ip(), ssids, enabled,
-                                     der, IOS_TMPL)
+    _ios_ca()
+    return iosstate.effective_inputs(meta, _dot_host(), _server_ip(), ssids, IOS_TMPL)
 
 
 def _ios_status_text():
@@ -3484,12 +3482,11 @@ def _ios_status_text():
              "DoT: <code>%s</code>" % cur["inputs"]["dot_host"]]
     if ssids:
         lines.append("强制直连 Wi-Fi: %s" % ", ".join(ssids))
-    if cur["inputs"].get("wloc_enabled"):
-        # 只有**退役迁移之前生成的**旧记录才会走到这里。照实说明它是历史状态, 并把"该去手机上
-        # 取消信任"这件事带出来 —— 用户界面上看到"含根证书: 是"却无从知道要处理它, 比不显示更糟。
-        lines.append("含根证书: 是(指纹 %s…)　⚠️ 这是 WLOC 退役前的旧版本; "
-                     "重新生成一份即可去掉根证书, 并记得到手机上取消对它的信任"
-                     % cur["inputs"]["wloc_ca_sha256"][:16])
+    if meta.get("retired_revision") is not None:
+        # 这台机器在 WLOC 退役迁移里丢弃过版本。措辞与 iosstate.status_lines 同源。
+        lines.append("⚠️ 第 %d 版及更早的描述文件里带着已退役的根证书(WLOC 已退役), 已不再保留。"
+                     "请到 iPhone「设置 → 通用 → 关于本机 → 证书信任设置」取消对 "
+                     "PrivDNS Gateway MITM CA 的信任。" % meta["retired_revision"])
     lines += ["", "配置变化: <b>%s</b>" % iosstate.LEVEL_LABEL[lv]]
     lines += ["• " + r for r in why]
     if meta.get("previous"):

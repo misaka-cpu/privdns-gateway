@@ -40,7 +40,19 @@ import pdgtx                                                 # noqa: E402
 # ⚠️ 因此**不能**在已持有该锁的路径里调用本模块的写操作(`pdg update` 持锁调 __migrate 就是
 # 这种路径), 否则自死锁 —— 这个坑在 v1.7.1/v1.7.2 真踩过。生命周期只在用户主动生成时初始化。
 
-SCHEMA = 1
+SCHEMA = 2
+# 能**读懂并迁移**的历史格式。它们不是运行时 —— 本版本写出去的记录永远是 SCHEMA。
+# 把 schema 1 留在这里而不是一删了之, 是因为记录里有 instance_id: 丢了就会造出第二个身份,
+# 用户手机上那份描述文件从此永远无法再被更新, 而界面上什么都不会报。
+SCHEMA_HISTORY = (1,)
+
+# schema 1 → 2 变了什么(只有这一处说明, 别处引用它):
+#   · inputs 去掉 wloc_enabled / wloc_ca_sha256 —— WLOC 位置改写已退役;
+#   · 产物里**不许**再有 com.apple.security.root 那一格;
+#   · 顶层多一个 retired_revision: 退役迁移丢弃掉的那一版的版本号(见 _migrate_1_to_2)。
+# **没变**的: instance_id 与由它派生的各 payload 身份、顶层与 DNS 的语义、SSID 规则、
+# 以及 OnDemand 骨架 —— 两个 schema 的按需连接语义**完全相同**, 所以骨架只有一份常量
+# (_ONDEMAND_CORE), 不按 schema 分派。抄成两份迟早漂移成一松一紧, 而松的那份就是出口。
 FSROOT = os.environ.get("PDG_TX_FSROOT", "")
 META = FSROOT + "/etc/privdns-gateway/ios-profile.json"
 ART_DIR = FSROOT + "/var/lib/privdns-gateway/ios-profile"
@@ -65,9 +77,9 @@ FIELD_LEVELS = {
     "dns_protocol": REQUIRED,       # 同上
     "probe_url": REQUIRED,          # 探测地址错了 = DoT 该开的时候不开 / 不该开的时候开
     "ondemand_core": REQUIRED,      # 规则骨架变了
-    "wloc_enabled": REQUIRED,       # 关了却还信任 CA, 或开了却没有 CA
-    "wloc_ca_sha256": REQUIRED,     # CA 换了 ⇒ 手机信任的是旧的 ⇒ 全站证书报错
     "ssids": RECOMMENDED,           # 强制直连名单; 核心连接仍可用
+    # wloc_enabled / wloc_ca_sha256 曾在这里。schema 2 的 inputs 里没有这两个字段, 所以
+    # diff_fields 永远比不出它们; 真要出现(一份没迁移干净的记录), 缺省是 REQUIRED, 那也对。
 }
 FIELD_LABEL = {
     "schema": "描述文件格式",
@@ -76,8 +88,6 @@ FIELD_LABEL = {
     "dns_protocol": "DNS 协议",
     "probe_url": "探测地址",
     "ondemand_core": "按需连接规则",
-    "wloc_enabled": "位置改写(WLOC)",
-    "wloc_ca_sha256": "根证书指纹",
     "ssids": "强制直连 Wi-Fi",
 }
 
@@ -106,7 +116,7 @@ def ondemand_core(template=None):
     必须更新, 而不是让用户拿着一份规则骨架已经过时的描述文件继续用。
     """
     ids = {r: "00000000-0000-0000-0000-00000000000%d" % i for i, r in enumerate(ROLES)}
-    raw = iosprofile.render("x.invalid", "192.0.2.1", (), b"", ids, template)
+    raw = iosprofile.render("x.invalid", "192.0.2.1", (), ids, template)
     import plistlib
     rules = plistlib.loads(raw)["PayloadContent"][0]["OnDemandRules"]
     out = []
@@ -131,8 +141,7 @@ def probe_url_for(server_addresses):
     return "http://%s:81/probe" % iosprofile.norm_addrs(server_addresses)[0]
 
 
-def make_inputs(dot_host, server_addresses, ssids=(), wloc_enabled=False, ca_der=b"",
-                template=None):
+def make_inputs(dot_host, server_addresses, ssids=(), template=None):
     """把一次生成的**语义输入**规范化。只有这里出现的字段参与 digest。
 
     刻意排除: 生成时间、发送时间、临时文件名、随机值、模板路径。它们变了不代表配置变了,
@@ -146,9 +155,8 @@ def make_inputs(dot_host, server_addresses, ssids=(), wloc_enabled=False, ca_der
         "probe_url": probe_url_for(server_addresses),
         "ondemand_core": ondemand_core(template),
         "ssids": iosprofile.norm_ssids(ssids),
-        "wloc_enabled": bool(wloc_enabled),
-        # 只留指纹。证书正文既不进元数据也不进任何输出 —— 元数据是会被备份、被贴进工单的。
-        "wloc_ca_sha256": hashlib.sha256(ca_der).hexdigest() if ca_der else "",
+        # schema 1 这里还有 wloc_enabled 与 wloc_ca_sha256(根证书指纹)。WLOC 退役后
+        # 描述文件不再携带任何根证书, 这两个字段没有对象了 —— 见 _migrate_1_to_2。
     }
 
 
@@ -165,11 +173,9 @@ def effective_ssids(meta, ssids):
     return list((cur.get("inputs") or {}).get("ssids") or ())
 
 
-def effective_inputs(meta, dot_host, server_addresses, ssids, wloc_enabled, ca_der,
-                     template=None):
+def effective_inputs(meta, dot_host, server_addresses, ssids, template=None):
     """按"沿用"语义算出这一刻的规范化输入。status / 判定 / 生成共用它, 于是三处不会各算各的。"""
-    return make_inputs(dot_host, server_addresses, effective_ssids(meta, ssids),
-                       wloc_enabled, ca_der, template)
+    return make_inputs(dot_host, server_addresses, effective_ssids(meta, ssids), template)
 
 
 def digest_of(inputs):
@@ -193,9 +199,21 @@ def diff_fields(old, new):
 
 
 # ── 元数据读写 ──────────────────────────────────────────────────────────────
-def _blank():
-    return {"schema": SCHEMA, "instance_id": None, "created_at": None,
+def _blank(schema=None):
+    """某个 schema 下一份空记录的**完整**字段集。字段白名单直接拿它做基准。
+
+    按 schema 分开给, 不给一个"两版并集": 并集会让 schema 1 的记录多带一个 retired_revision
+    也照样过关, 而那种记录不是任何版本的本项目写得出来的。
+    """
+    schema = SCHEMA if schema is None else schema
+    base = {"schema": schema, "instance_id": None, "created_at": None,
             "migration_pending": False, "current": None, "previous": None}
+    if schema >= 2:
+        # 退役迁移丢弃掉的那一版的版本号。留着它有两个用处, 都不能少:
+        #   · 下一次生成从这个号往下数, 而不是退回第 1 版(用户与我们对不上版本号);
+        #   · 它同时是"这台手机上很可能装着一份带根证书的旧描述文件"的唯一标记。
+        base["retired_revision"] = None
+    return base
 
 
 def load(path=None):
@@ -220,15 +238,26 @@ def load(path=None):
         raise StateError("iOS 描述文件记录 %s 已损坏。不自动重建: 重建会生成一个新身份, "
                          "而你手机上那份描述文件将永远无法再被更新。请先修复或删除该文件"
                          "(删除等于放弃现有身份, 之后必须手工删掉手机上的旧描述文件)。" % p)
-    if not isinstance(meta, dict) or meta.get("schema") != SCHEMA:
+    sc = meta.get("schema") if isinstance(meta, dict) else None
+    if not isinstance(meta, dict) or (sc != SCHEMA and sc not in SCHEMA_HISTORY):
         raise StateError("iOS 描述文件记录 %s 的格式版本不认识(schema=%r), 拒绝继续。"
-                         % (p, (meta or {}).get("schema") if isinstance(meta, dict) else None))
+                         % (p, sc))
     # 走**同一份**完整契约(_check_meta_object): 本地这份记录一样可能被手工改坏、被半截
     # 恢复写坏。放行的下场是 status_lines 拿着一条缺字段的记录直接 KeyError —— 用户看到
     # 的是一个打不开的页面, 而那份记录还是我们自己写进去的。
     # 判据只有一份, 这里只把门名与原因换成本机的说法。
+    #
+    # schema 1 走**同一个** _migrate_1_to_2: 严格验 schema 1 → 迁移 → 严格复核 schema 2。
+    # 为什么读的时候就迁: 一台还没跑过 `pdg __migrate` 的机器上, 记录里那份 current 可能
+    # 嵌着已退役的根证书 —— 原样交出去, 状态页会把它显示成"可以重新发送的当前版本"。
+    # 读路径与写路径共用同一份迁移实现, 于是两处不会得出不同的结论。
+    #
+    # **这里不写盘**: load 是读。改写盘上那份由 migrate_schema() 负责, 那是个看得见的动作。
     try:
-        _check_meta_object(meta)
+        if sc == SCHEMA:
+            _check_meta_object(meta, schema=SCHEMA)
+        else:
+            meta, _retired = _migrate_1_to_2(meta)
     except RestoreRefused as e:
         raise StateError("iOS 描述文件记录 %s 没通过「%s」这道门: %s\n"
                          "**不自动重建**: 重建会生成一个新身份, 而你手机上那份描述文件将"
@@ -391,6 +420,14 @@ def classify(meta, inputs):
     if meta.get("migration_pending"):
         level = REQUIRED
         reasons.append("正在从旧的随机身份迁移: 必须先删掉手机上那份旧描述文件, 再装新的")
+    retired = meta.get("retired_revision")
+    if retired is not None and not meta.get("current"):
+        # 说"还没有生成过"是假话: 生成过, 而且那一版现在还装在用户手机上 —— 只是它嵌着
+        # 一张已经退役的根证书, 我们不再留着它、也不再发它。两件要做的事都得说出来。
+        return REQUIRED, reasons + [
+            "位置改写(WLOC)已退役: 第 %d 版描述文件里嵌着已退役的根证书, 已不再保留。"
+            "请重新生成一份(新的不含根证书), 并到 iPhone「设置 → 通用 → 关于本机 → "
+            "证书信任设置」里取消对 PrivDNS Gateway MITM CA 的信任" % retired]
     if not meta.get("current"):
         reasons.append("还没有生成过受管描述文件")
         return REQUIRED, reasons
@@ -549,27 +586,26 @@ def _cleanup_candidates(root=None):
     return n
 
 
-def generate(dot_host, server_addresses, ssids=None, ca_der=b"", wloc_enabled=False,
-             template=None, meta_path=None, art_root=None, lock=True, legacy_seen=False):
+def generate(dot_host, server_addresses, ssids=None, template=None,
+             meta_path=None, art_root=None, lock=True, legacy_seen=False):
     """生成(或确认无需生成)受管描述文件。返回 (meta, level, reasons, data, changed)。
 
     输入没变时**不产生新 revision**: 产物逐字节相同, previous 不被顶掉。这正是"点一下重新
     生成"应有的样子 —— 重新拿一份文件, 而不是制造一次版本变更。
     """
     with _LifecycleLock(lock, "本次生成"):
-        return _generate_locked(dot_host, server_addresses, ssids, ca_der, wloc_enabled,
+        return _generate_locked(dot_host, server_addresses, ssids,
                                 template, meta_path, art_root, legacy_seen)
 
 
-def _generate_locked(dot_host, server_addresses, ssids, ca_der, wloc_enabled,
+def _generate_locked(dot_host, server_addresses, ssids,
                      template, meta_path, art_root, legacy_seen):
     """**必须在持锁状态下调用。** 读记录 → 算候选 → 落盘 → 写后复核, 整段在同一把锁里。"""
     mp = meta_path or META
     ar = art_root or ART_DIR
     meta = load(mp)
     # ssids=None ⇒ 沿用记录里的名单。必须在 load 之后算 —— 它要读记录。
-    inputs = effective_inputs(meta, dot_host, server_addresses, ssids, wloc_enabled,
-                              ca_der, template)
+    inputs = effective_inputs(meta, dot_host, server_addresses, ssids, template)
     fresh = meta is None
     if fresh:
         meta = _blank()
@@ -579,7 +615,7 @@ def _generate_locked(dot_host, server_addresses, ssids, ca_der, wloc_enabled,
         meta["migration_pending"] = bool(legacy_seen)
     ids = derive_ids(meta["instance_id"])
     data = iosprofile.render(inputs["dot_host"], inputs["server_addresses"], inputs["ssids"],
-                             ca_der, ids, template)
+                             ids, template)
     sha = hashlib.sha256(data).hexdigest()
 
     cur = meta.get("current")
@@ -594,7 +630,7 @@ def _generate_locked(dot_host, server_addresses, ssids, ca_der, wloc_enabled,
         if state == HEALTHY:
             return meta, level, reasons, data, False
         # 产物不可用 → 只能在"能逐字节复原"的前提下修, 修不了就 fail-closed。
-        meta = _repair_current_locked(ca_der, template, mp, ar)
+        meta = _repair_current_locked(template, mp, ar)
         reasons = list(reasons) + ["%s(%s), 已按记录逐字节复原" % (HEALTH_LABEL[state], detail)]
         return meta, level, reasons, data, False
 
@@ -613,8 +649,13 @@ def _generate_locked(dot_host, server_addresses, ssids, ca_der, wloc_enabled,
             new["previous"] = None
             reasons = list(reasons) + ["原当前版本产物不可用(%s), 未留作上一版" % cur_state]
         tx.write(art_path("current", ar), data, 0o644)
+        # 版本号接着**曾经发出去过的最高版**往下数。退役迁移丢弃过槽位时 current 是空的,
+        # 光看 current 会退回第 1 版 —— 于是用户手机上装着"第 3 版", 而网关说这是"第 1 版"。
+        base = (cur or {}).get("revision")
+        if base is None:
+            base = meta.get("retired_revision") or 0
         new["current"] = {
-            "revision": (cur or {}).get("revision", 0) + 1,
+            "revision": base + 1,
             "digest": digest_of(inputs),
             "inputs": inputs,
             "sha256": sha,
@@ -628,22 +669,24 @@ def _generate_locked(dot_host, server_addresses, ssids, ca_der, wloc_enabled,
     return meta, level, reasons, data, True
 
 
-def repair_current(ca_der=b"", template=None, meta_path=None, art_root=None, lock=True):
+def repair_current(template=None, meta_path=None, art_root=None, lock=True):
     """按记录**逐字节复原** current。复原不了就拒绝 —— 不猜、不新建身份、不推进 revision。
 
     允许复原的全部条件(缺一不可):
       · 元数据完整可读;
       · 记录里有 current, 且带 inputs 与 sha256;
-      · 手上这张公开 CA 的指纹与记录里那一版一致(记录里只有指纹, 正文只在产物里 ——
-        指纹对不上就说明手上的不是那一版用的证书, 拿它渲染出来的是**另一份文件**);
       · 用记录里的 inputs + 稳定身份重新渲染, 结果的 sha256 与记录**精确相等**。
+
+    (WLOC 退役前这里还有一条: 手上那张根 CA 的指纹要与记录里那一版一致。描述文件不再携带
+    根证书, 那条判据没有对象了 —— 而且**退役前的那些版本根本不可复原**: 它们的记录已经在
+    schema 迁移时被丢弃了, 走不到这里。)
     然后才写盘, 且: revision 不变、previous 一个字节不动、写完复核。
     """
     with _LifecycleLock(lock, "本次复原"):
-        return _repair_current_locked(ca_der, template, meta_path, art_root)
+        return _repair_current_locked(template, meta_path, art_root)
 
 
-def _repair_current_locked(ca_der=b"", template=None, meta_path=None, art_root=None):
+def _repair_current_locked(template=None, meta_path=None, art_root=None):
     """**必须在持锁状态下调用。**"""
     mp = meta_path or META
     ar = art_root or ART_DIR
@@ -655,15 +698,9 @@ def _repair_current_locked(ca_der=b"", template=None, meta_path=None, art_root=N
     want = rec.get("sha256")
     if not inp or not want:
         raise IntegrityError("记录里缺 inputs 或 sha256, 无法确定性复原, 已拒绝。")
-    have = hashlib.sha256(ca_der).hexdigest() if ca_der else ""
-    if have != (inp.get("wloc_ca_sha256") or ""):
-        raise IntegrityError(
-            "第 %s 版用的根证书指纹与当前手上的不一致, 无法复原那一版 —— "
-            "拿现在的证书渲染出来的是另一份文件。请从备份恢复, 或重新生成一版新的。"
-            % rec.get("revision"))
     ids = derive_ids(meta["instance_id"])
     data = iosprofile.render(inp["dot_host"], inp["server_addresses"], inp.get("ssids") or (),
-                             ca_der, ids, template)
+                             ids, template)
     got = hashlib.sha256(data).hexdigest()
     if got != want:
         raise IntegrityError(
@@ -678,6 +715,131 @@ def _repair_current_locked(ca_der=b"", template=None, meta_path=None, art_root=N
         raise IntegrityError("复原过程动到了上一版产物, 这不该发生。")
     verified_artifact(meta, "current", ar)
     return meta
+
+
+
+# ── schema 1 → 2 迁移 ───────────────────────────────────────────────────────
+# 退役的最后一段, 也是最容易做错的一段。做错的样子很具体: 把 `!= SCHEMA` 放宽成
+# `in (1, 2)` 就宣称"兼容完成" —— 记录于是同时被两套契约放行, 而**产物一个字节没动**:
+# 那份嵌着根证书的 .mobileconfig 还躺在 /var/lib 下, 还能被「重新发送」发出去。
+#
+# 真正要回答的是: 这条记录描述的那份产物, 在 schema 2 里还成不成立?
+#
+#   · inputs.wloc_enabled 为 False ⇒ 那份产物里**本来就没有**根证书那一格。它逐字节就是一份
+#     合法的 schema 2 产物(渲染只取 dot_host / 地址 / SSID / 身份 / 模板, 与 schema 无关)。
+#     所以记录原地迁移: 去掉两个 WLOC 字段、inputs.schema 置 2、**按新字段集重算摘要**。
+#     revision / sha256 / 时间戳一概不动 —— 产物没变, 说它变了就是假话。
+#   · inputs.wloc_enabled 为 True  ⇒ 那份产物里嵌着根证书。schema 2 没有任何办法描述它,
+#     而它更不该再被发出去。这个槽位**退役**: 记录丢弃、盘上的文件删掉, 版本号记进
+#     retired_revision, 由用户重新生成一份不含根证书的。
+#
+# 摘要必须重算而不是照抄: 字段集变了摘要却没变, 等于说"配置没变过" —— 而一份 schema 1 的
+# 记录与一份 schema 2 的记录本来就不该有相同的摘要。
+def _migrate_record_1_to_2(rec):
+    inp = dict(rec["inputs"])
+    inp.pop("wloc_enabled", None)
+    inp.pop("wloc_ca_sha256", None)
+    inp["schema"] = 2
+    return dict(rec, inputs=inp, digest=digest_of(inp))
+
+
+def _migrate_1_to_2(meta):
+    """(新记录, 被退役的版本号列表)。**不碰盘**, 纯函数 —— 落盘由调用方决定。
+
+    三段式, 每一段都不能省:
+      ① 按**严格的 schema 1 契约**验旧记录。恶意或损坏的旧记录要在这里就被拒掉 ——
+         迁移是一次改写, 拿一份没验过的东西去改写, 等于把伪造的输入洗成"当前格式";
+      ② 明确迁移(上面那段说明);
+      ③ 按**严格的 schema 2 契约**复核结果。少了这一步, 迁移里任何一个手滑都会直接落盘。
+    """
+    _check_meta_object(meta, schema=1)                       # ① 严格 schema 1
+    out = {"schema": 2,
+           "instance_id": meta["instance_id"],               # 身份**必须**原样带过来
+           "created_at": meta["created_at"],
+           "migration_pending": meta["migration_pending"],
+           "current": None, "previous": None,
+           "retired_revision": None}
+    retired, keep = [], {}
+    for which in ("current", "previous"):                    # ②
+        rec = meta.get(which)
+        if rec is None:
+            continue
+        if rec["inputs"]["wloc_enabled"]:
+            retired.append(rec["revision"])
+        else:
+            keep[which] = _migrate_record_1_to_2(rec)
+    # current 被退役而 previous 还在: "有上一版却没有当前版本"这一组不成立(见 _check_meta_object)。
+    # 把 previous 提成 current 是造假 —— 它不是当前发出去的那一版。所以一起退役, 版本号一起记下。
+    if "current" not in keep and "previous" in keep:
+        retired.append(keep.pop("previous")["revision"])
+    out["current"] = keep.get("current")
+    out["previous"] = keep.get("previous")
+    out["retired_revision"] = max(retired) if retired else None
+    _check_meta_object(out, schema=SCHEMA)                   # ③ 严格 schema 2
+    return out, sorted(set(retired))
+
+
+def migrate_schema(meta_path=None, art_root=None, lock=True):
+    """把盘上那份记录迁到当前 schema。幂等; 返回一份可打印的报告。
+
+    这是**明确的**迁移入口(`pdg __migrate` 调它), 与 load() 里那次只读迁移分开:
+    load 是读, 读不该写盘; 而"什么时候真正改写用户的记录"应该是一个看得见的动作。
+    """
+    with _LifecycleLock(lock, "本次格式迁移"):
+        return _migrate_schema_locked(meta_path, art_root)
+
+
+def _migrate_schema_locked(meta_path=None, art_root=None):
+    """**必须在持锁状态下调用。**"""
+    mp = meta_path or META
+    ar = art_root or ART_DIR
+    try:
+        with open(mp, encoding="utf-8") as f:
+            raw = f.read()
+    except FileNotFoundError:
+        # 从没生成过描述文件。**不造记录** —— 造一份就等于凭空造出一个身份。
+        return {"changed": False, "reason": "没有受管描述文件记录, 无需迁移"}
+    except OSError as e:
+        raise StateError("读不到 iOS 描述文件记录 %s(%s), 本次迁移未做任何改动。"
+                         % (mp, e.strerror))
+    try:
+        meta = json.loads(raw)
+    except ValueError:
+        raise StateError("iOS 描述文件记录 %s 已损坏, 拒绝迁移 —— 不自动重建: 重建会生成一个"
+                         "新身份, 而你手机上那份描述文件将永远无法再被更新。" % mp)
+    try:
+        sc = _schema_of(meta, "iOS 描述文件记录 %s" % mp)
+        if sc == SCHEMA:
+            _check_meta_object(meta, schema=SCHEMA)     # 幂等这一格也要复核, 不是直接返回
+            return {"changed": False, "reason": "记录已是 schema %d" % SCHEMA}
+        new, retired = _migrate_1_to_2(meta)
+    except RestoreRefused as e:
+        raise StateError("iOS 描述文件记录 %s 没通过「%s」这道门: %s\n"
+                         "本次迁移未做任何改动。请先修复或删除该文件(删除等于放弃现有身份, "
+                         "之后必须手工删掉手机上的旧描述文件)。" % (mp, e.gate, e.why))
+    with _Txn(lock=False) as tx:
+        # 被退役的槽位, 盘上的文件也要删掉。留着它是留了一条路: 那是一份嵌着根证书、
+        # 而且已经没有任何记录能解释它的 .mobileconfig。
+        for which in ("current", "previous"):
+            if meta.get(which) is not None and new.get(which) is None:
+                tx.remove(art_path(which, ar))
+        tx.write(mp, json.dumps(new, ensure_ascii=False, indent=2,
+                                sort_keys=True).encode("utf-8") + b"\n", 0o600)
+    # 写后复核: 从盘上**重新读一遍**再验一次。上面验的是内存里那个对象, 而落盘可能坏在
+    # 序列化、权限、磁盘满上 —— 那几种坏法都不会抛异常。
+    back = load(mp)
+    _check_meta_object(back, schema=SCHEMA)
+    if back != new:
+        raise StateError("迁移写盘后读回来的记录与预期不一致, 请检查 %s。" % mp)
+    for which in ("current", "previous"):
+        if back.get(which) is not None:
+            verified_artifact(back, which, ar)   # 保留下来的产物必须仍然对得上它的记录
+    return {"changed": True, "from": sc, "to": SCHEMA,
+            "retired_revisions": retired,
+            "retired_revision": new["retired_revision"],
+            "reason": ("已迁移到 schema %d" % SCHEMA) if not retired else
+                      ("已迁移到 schema %d; 第 %s 版描述文件里嵌着已退役的根证书, 已退役"
+                       % (SCHEMA, "、".join(str(x) for x in retired)))}
 
 
 def _update_meta(fn, meta_path=None, lock=True, what="本次修改"):
@@ -854,7 +1016,11 @@ _RECORD_KEYS = frozenset(("revision", "digest", "inputs", "sha256",
 # 于是模板改了而这里没跟上会先红)。将来渲染语义有意变化 ⇒ 升 SCHEMA 或按 schema 分派另一个
 # 校验器, **不**靠放宽未知规则来兼容未来版本。
 _PROBE = "<probe>"
-_SCHEMA1_ONDEMAND_CORE = [
+# **一份**骨架, 两个 schema 共用。schema 1 与 schema 2 的按需连接语义完全相同 —— 退役动的是
+# 根证书那一格与 inputs 的字段集, 没有动 OnDemand 的任何一条规则。所以这里不按 schema 分派、
+# 也不复制第二份: 两份判据迟早漂移成一松一紧, 而松的那份就是出口。
+# 将来 OnDemand 语义真要变 ⇒ 再升一次 SCHEMA 并在那时才分派, **不**靠放宽未知规则来兼容。
+_ONDEMAND_CORE = [
     {"InterfaceTypeMatch": "WiFi", "Action": "Connect", "URLStringProbe": _PROBE},
     {"InterfaceTypeMatch": "WiFi", "Action": "Disconnect"},
     {"InterfaceTypeMatch": "Cellular", "Action": "Connect", "URLStringProbe": _PROBE},
@@ -868,9 +1034,26 @@ def _ssid_rule(ssids):
     return {"InterfaceTypeMatch": "WiFi", "SSIDMatch": list(ssids), "Action": "Disconnect"}
 # 记录里 inputs 的字段与类型。多一个少一个都拒: 少了会让后面的比对静默跳过, 多了说明这份
 # 记录不是本版本写出来的, 而我们没有能力判断多出来的那个字段意味着什么。
-_INPUT_TYPES = (("schema", int), ("dot_host", str), ("server_addresses", list),
-                ("dns_protocol", str), ("probe_url", str), ("ondemand_core", list),
-                ("ssids", list), ("wloc_enabled", bool), ("wloc_ca_sha256", str))
+#
+# **按 schema 分成两套完整契约, 不是一个"新旧字段都认"的松并集。** 并集的后果很具体: 一份
+# schema 2 的记录带着 wloc_ca_sha256 也能过关 —— 而那种记录正是"迁移只改了版本号、产物里
+# 那张根证书还在"的样子, 也正是恶意备份最想伪造的形态。每个 schema 的字段集都是**闭**的。
+_INPUT_TYPES_COMMON = (("schema", int), ("dot_host", str), ("server_addresses", list),
+                       ("dns_protocol", str), ("probe_url", str), ("ondemand_core", list),
+                       ("ssids", list))
+_INPUT_TYPES_BY_SCHEMA = {
+    1: _INPUT_TYPES_COMMON + (("wloc_enabled", bool), ("wloc_ca_sha256", str)),
+    2: _INPUT_TYPES_COMMON,
+}
+
+
+def _schema_of(meta, where="记录"):
+    """记录自称的 schema, 且必须是我们读得懂的。"""
+    sc = (meta or {}).get("schema") if isinstance(meta, dict) else None
+    if sc != SCHEMA and sc not in SCHEMA_HISTORY:
+        _refuse("记录格式", "%s的格式版本不认识(schema=%r) —— 本版本只读得懂 %s"
+                % (where, sc, "、".join(str(x) for x in sorted((SCHEMA,) + SCHEMA_HISTORY))))
+    return sc
 
 def _refuse(gate, why):
     raise RestoreRefused(gate, why)
@@ -904,7 +1087,7 @@ def _canon(fn, value, field, name):
 
 
 def _check_inputs_canonical(inp, name):
-    """schema 1 下, 记录里的输入必须是**本项目生成器可能产出的**规范形式。
+    """记录里的输入必须是**本项目生成器可能产出的**规范形式。
 
     集中在这一处: 恢复的联合校验、artifact_health、写后复核走的都是它, 不各写一套。
     """
@@ -923,10 +1106,11 @@ def _check_inputs_canonical(inp, name):
         _refuse("输入规范", "%s 的 inputs.server_addresses 推导不出探测地址" % name)
     if inp["probe_url"] != want:
         _refuse("输入规范", "%s 的 inputs.probe_url 不是由第一个服务器地址推导出来的 —— "
-                "schema %d 没有单独配置探测地址的入口" % (name, SCHEMA))
+                "本项目没有单独配置探测地址的入口(schema 1 与 2 都没有)" % name)
 
 
-def _check_record(rec, name):
+def _check_record(rec, name, schema):
+    """一条记录对上**它所属 schema 的那一套**契约。schema 由调用方给, 不由记录自己说了算。"""
     gate = "记录格式"
     if not isinstance(rec, dict):
         _refuse(gate, "%s 那一栏不是一条记录" % name)
@@ -951,30 +1135,38 @@ def _check_record(rec, name):
     inp = rec.get("inputs")
     if not isinstance(inp, dict):
         _refuse(gate, "%s 缺 inputs" % name)
-    want = {k for k, _ in _INPUT_TYPES}
+    types = _INPUT_TYPES_BY_SCHEMA[schema]
+    want = {k for k, _ in types}
     if set(inp) != want:
-        _refuse(gate, "%s 的 inputs 字段与本版本对不上(多/少: %s)"
-                % (name, "、".join(sorted(set(inp) ^ want)) or "?"))
-    for k, ty in _INPUT_TYPES:
+        _refuse(gate, "%s 的 inputs 字段与 schema %d 对不上(多/少: %s)"
+                % (name, schema, "、".join(sorted(set(inp) ^ want)) or "?"))
+    for k, ty in types:
         v = inp[k]
         if ty is bool:
             if not isinstance(v, bool):
                 _refuse(gate, "%s 的 inputs.%s 不是布尔" % (name, k))
         elif isinstance(v, bool) or not isinstance(v, ty):
             _refuse(gate, "%s 的 inputs.%s 类型不对(%r)" % (name, k, type(v).__name__))
-    if inp["schema"] != SCHEMA:
-        _refuse(gate, "%s 的 inputs.schema=%r, 本版本只认 %d" % (name, inp["schema"], SCHEMA))
-    if inp["wloc_enabled"] != bool(inp["wloc_ca_sha256"]):
-        _refuse(gate, "%s 的 inputs 自相矛盾: wloc_enabled=%r 而根证书指纹%s"
-                % (name, inp["wloc_enabled"], "有" if inp["wloc_ca_sha256"] else "没有"))
-    if inp["wloc_ca_sha256"] and not _HEX64.match(inp["wloc_ca_sha256"]):
-        _refuse(gate, "%s 的 inputs.wloc_ca_sha256 不是 64 位十六进制" % name)
+    # inputs.schema 必须与顶层的 schema **一致**。分开放行的话, 一份顶层写 1、inputs 写 2
+    # 的混合记录就能一边享受 schema 1 的读入资格、一边用 schema 2 的松字段集绕过 WLOC 那两
+    # 个字段的交叉校验。
+    if inp["schema"] != schema:
+        _refuse(gate, "%s 的 inputs.schema=%r 与记录顶层的 schema=%d 不一致"
+                % (name, inp["schema"], schema))
+    if schema == 1:
+        # schema 1 专属的交叉校验。schema 2 没有这两个字段, 上面的字段白名单已经把带着它们
+        # 的记录挡在外面了 —— 所以这里不需要、也不应该有一个"两版都跑"的分支。
+        if inp["wloc_enabled"] != bool(inp["wloc_ca_sha256"]):
+            _refuse(gate, "%s 的 inputs 自相矛盾: wloc_enabled=%r 而根证书指纹%s"
+                    % (name, inp["wloc_enabled"], "有" if inp["wloc_ca_sha256"] else "没有"))
+        if inp["wloc_ca_sha256"] and not _HEX64.match(inp["wloc_ca_sha256"]):
+            _refuse(gate, "%s 的 inputs.wloc_ca_sha256 不是 64 位十六进制" % name)
     _check_inputs_canonical(inp, name)
-    # 记录里的骨架本身也必须是 schema 1 的那一套 —— 不能只跟产物互相配平。
-    if inp["ondemand_core"] != _SCHEMA1_ONDEMAND_CORE:
-        _refuse("按需规则", "%s 记录里的 ondemand_core 不是 schema %d 的固定骨架 —— "
-                "它是判断「这份产物是不是我们生成的」的基准, 不能由备份自己说了算"
-                % (name, SCHEMA))
+    # 记录里的骨架本身也必须是那一套固定骨架 —— 不能只跟产物互相配平。
+    # 两个 schema 共用同一份(按需连接语义没变), 见 _ONDEMAND_CORE 上面那段。
+    if inp["ondemand_core"] != _ONDEMAND_CORE:
+        _refuse("按需规则", "%s 记录里的 ondemand_core 不是本项目的固定骨架 —— "
+                "它是判断「这份产物是不是我们生成的」的基准, 不能由备份自己说了算" % name)
     # digest 是"配置有没有变"的唯一依据, 三档判定全靠它。只看格式是不够的 —— 伪造一串
     # 合法形态的 digest 就能让"必须更新"变成"无需更新"。按 inputs 重新算一遍核对。
     if rec["digest"] != digest_of(inp):
@@ -982,7 +1174,7 @@ def _check_record(rec, name):
                 "拿它做更新判定会得出相反的结论" % name)
 
 
-def _check_meta_object(meta):
+def _check_meta_object(meta, schema=None):
     """一份**完整**的生命周期记录该长什么样 —— 唯一实现。
 
     共用它的入口: load()(本地状态)、_check_meta()(外部恢复的 UTF-8/JSON 解析之后)、
@@ -997,17 +1189,25 @@ def _check_meta_object(meta):
     gate = "记录格式"
     if not isinstance(meta, dict):
         _refuse(gate, "记录不是一个 JSON 对象 —— 格式版本无法识别")
-    if meta.get("schema") != SCHEMA:
-        _refuse(gate, "格式版本不认识(schema=%r)" % meta.get("schema"))
+    got = _schema_of(meta)
+    # schema 显式给出时必须**正好**是它: 调用方说"这应该是一份 schema 2 的记录", 而记录
+    # 自称 1, 那就是不成立, 不能顺着记录改口。迁移的前后两次复核全靠这一条才有意义。
+    if schema is not None and got != schema:
+        _refuse(gate, "期望一份 schema %d 的记录, 实际是 schema %r" % (schema, got))
+    schema = got
     # instance_id 必须是本项目写下的那种身份: 规范小写的 UUID **version 4**。
     # 光靠"uuid5 收不收得下这个字符串"证明不了任何事 —— 它什么字符串都收。
     if meta.get("instance_id") in (None, ""):
         _refuse("身份", "没有身份标识")
     if not valid_instance_id(meta.get("instance_id")):
         _refuse("身份", "instance_id 不是规范小写的 UUID4(本项目写下的身份都是那种形态)")
-    if set(meta) != set(_blank()):
-        _refuse(gate, "顶层字段与本版本对不上(多/少: %s)"
-                % "、".join(sorted(set(meta) ^ set(_blank()))))
+    if set(meta) != set(_blank(schema)):
+        _refuse(gate, "顶层字段与 schema %d 对不上(多/少: %s)"
+                % (schema, "、".join(sorted(set(meta) ^ set(_blank(schema))))))
+    if schema >= 2 and meta["retired_revision"] is not None:
+        rr = meta["retired_revision"]
+        if not isinstance(rr, int) or isinstance(rr, bool) or rr < 1:
+            _refuse(gate, "retired_revision 只能是 null 或正整数(实际 %r)" % (rr,))
     if not isinstance(meta.get("migration_pending"), bool):
         _refuse(gate, "migration_pending 必须是布尔(实际 %r)"
                 % type(meta.get("migration_pending")).__name__)
@@ -1016,7 +1216,7 @@ def _check_meta_object(meta):
                 "(实际 %r)" % (meta.get("created_at"),))
     for which in ("current", "previous"):
         if meta.get(which) is not None:
-            _check_record(meta[which], which)
+            _check_record(meta[which], which, schema)
     if meta.get("previous") is not None and meta.get("current") is None:
         _refuse("三件配套", "记录里有上一版(previous)却没有当前版本(current) —— 这一组不成立")
     if meta.get("previous") and meta.get("current") \
@@ -1047,10 +1247,10 @@ def _check_meta(raw):
 
 
 def _check_ondemand(rules, inp, name):
-    """产物里的 OnDemandRules 必须**恰好**是 schema 1 那一套。
+    """产物里的 OnDemandRules 必须**恰好**是那一套固定骨架(schema 1 与 2 相同)。
 
     判据不是"跟这份备份自己记的骨架对得上" —— 那两边都是攻击者可以改的。judge 的基准是
-    _SCHEMA1_ONDEMAND_CORE 这个常量:
+    _ONDEMAND_CORE 这个常量(两个 schema 共用同一份, 因为语义完全相同):
 
       · SSID 名单非空 ⇒ 最前面**恰好**多那一条规范化的 Wi-Fi Disconnect 规则, 别处不许再有;
       · SSID 名单为空 ⇒ 任何位置都不许出现 SSIDMatch;
@@ -1074,25 +1274,30 @@ def _check_ondemand(rules, inp, name):
     if stray:
         _refuse(gate, "%s里出现了记录中没有的 SSID 规则(第 %s 条) —— 记录里的名单是空的"
                 % (name, "、".join(str(x) for x in stray)))
-    if len(rules) != len(_SCHEMA1_ONDEMAND_CORE):
-        _refuse(gate, "%s的按需规则有 %d 条, schema %d 的骨架是 %d 条 —— 多出来或少掉的那些"
-                "会改变什么时候启用 DoT" % (name, len(rules), SCHEMA,
-                                            len(_SCHEMA1_ONDEMAND_CORE)))
-    for i, (got, want) in enumerate(zip(rules, _SCHEMA1_ONDEMAND_CORE)):
+    if len(rules) != len(_ONDEMAND_CORE):
+        _refuse(gate, "%s的按需规则有 %d 条, 固定骨架是 %d 条 —— 多出来或少掉的那些"
+                "会改变什么时候启用 DoT" % (name, len(rules), len(_ONDEMAND_CORE)))
+    for i, (got, want) in enumerate(zip(rules, _ONDEMAND_CORE)):
         probe = got.pop("URLStringProbe", None) if "URLStringProbe" in got else None
         if probe is not None:
             if probe != inp["probe_url"]:
                 _refuse(gate, "%s的第 %d 条按需规则里的探测地址与记录不符" % (name, i + 1))
             got["URLStringProbe"] = _PROBE
         if got != want:
-            _refuse(gate, "%s的第 %d 条按需规则与 schema %d 的固定骨架不符(顺序、Action、"
-                    "InterfaceTypeMatch、探测地址有无, 任何一项对不上都算)"
-                    % (name, i + 1, SCHEMA))
+            _refuse(gate, "%s的第 %d 条按需规则与固定骨架不符(顺序、Action、"
+                    "InterfaceTypeMatch、探测地址有无, 任何一项对不上都算)" % (name, i + 1))
 
 
-def _check_artifact(meta, which, data, ids):
-    """一份产物对上它自己那条记录。每道门单独命名 —— 出事时要知道是哪一条不成立。"""
+def _check_artifact(meta, which, data, ids, schema=None):
+    """一份产物对上它自己那条记录。每道门单独命名 —— 出事时要知道是哪一条不成立。
+
+    根证书那一格按 schema 判, 而且两边都是**硬**判据:
+      · schema 1: 有没有那一格必须与 inputs.wloc_enabled 完全一致(退役前的原判据, 未放松);
+      · schema 2: **一格都不许有**。schema 2 的产物是"退役之后生成的", 里面出现根证书只有
+        两种可能 —— 记录被改过, 或者迁移只改了版本号而没动产物。两种都要拒。
+    """
     name = "当前版本" if which == "current" else "上一版"
+    schema = _schema_of(meta) if schema is None else schema
     rec = meta[which]
     inp = rec["inputs"]
     if not data:
@@ -1111,7 +1316,11 @@ def _check_artifact(meta, which, data, ids):
     except iosprofile.ProfileError as e:
         _refuse("描述文件结构", "%s不是一份合法的描述文件: %s" % (name, e))
     items = [x for x in (p.get("PayloadContent") or []) if isinstance(x, dict)]
-    extra = sorted({str(x.get("PayloadType")) for x in items} - set(iosprofile.ALLOWED_PAYLOAD_TYPES))
+    # payload 白名单也按 schema 收紧: schema 2 只剩 DNS 这一种。iosprofile 那份常量是**历史
+    # 全集**(校验老产物时还要认得根证书那一格), 不能直接拿来当新格式的白名单。
+    allowed = (iosprofile.ALLOWED_PAYLOAD_TYPES if schema == 1
+               else ("com.apple.dnsSettings.managed",))
+    extra = sorted({str(x.get("PayloadType")) for x in items} - set(allowed))
     if extra:
         _refuse("payload 白名单", "%s里有本项目不会生成的 payload: %s —— 恢复之后它会从"
                 "「📱 iOS 描述文件」页发给用户安装, 拒绝。" % (name, "、".join(extra)))
@@ -1128,7 +1337,12 @@ def _check_artifact(meta, which, data, ids):
             or dns.get("PayloadIdentifier") != iosprofile.ID_DNS + "." + ids["dns"]:
         _refuse("身份", "%s的 DNS payload 不是这台网关(instance_id)派生的身份" % name)
     cas = [x for x in items if x.get("PayloadType") == "com.apple.security.root"]
-    if bool(cas) != bool(inp["wloc_enabled"]):
+    if schema >= 2:
+        if cas:
+            _refuse("根证书", "%s里含根证书 payload, 而 schema %d 的产物一格都不许有 —— "
+                    "WLOC 位置改写已退役, 描述文件不再携带任何根证书。这份东西要么是被改过, "
+                    "要么是一份只改了版本号、没有真正迁移的旧产物。" % (name, schema))
+    elif bool(cas) != bool(inp["wloc_enabled"]):
         _refuse("根证书", "%s是否含根证书与记录不符(记录说%s)"
                 % (name, "有" if inp["wloc_enabled"] else "没有"))
     if cas:
@@ -1173,7 +1387,7 @@ def _check_artifact(meta, which, data, ids):
 
 
 def strict_artifact_check(meta, which, data):
-    """schema 1 的「记录 + 产物」严格契约 —— **唯一**一处实现。
+    """「记录 + 产物」的严格契约 —— **唯一**一处实现, 按记录自称的 schema 分派。
 
     共用它的路径: 备份恢复的联合校验、artifact_health()、verified_artifact()(经
     artifact_health)、生成的写后复核、repair_current() 完成后的复核。分开写的下场很具体:
@@ -1215,7 +1429,9 @@ def validate_restore_set(raw, cur=None, prev=None):
                 + "当前版本的文件不在备份里, 请到「📱 iOS 描述文件」页确认服务端状态。"
         raw_out = json.dumps(meta, ensure_ascii=False, indent=2,
                              sort_keys=True).encode("utf-8") + b"\n"
-        return raw_out, None, None, (note or None)
+        # 旧格式备份这一支同样要过迁移 —— 它带回来的是**记录**, 而一条 schema 1 的记录
+        # 落到盘上, 下一次读就又是一次迁移; 更要紧的是 retired_revision 那条提示会丢。
+        return _restore_migrate(meta, raw_out, None, None, (note or None))
     if have - want:
         _refuse("三件配套", "包里带着记录里没有的%s产物 —— 这一组自相矛盾, 不能只按其中一半"
                 "恢复(常见成因: 旧快照回滚留下的孤儿文件)"
@@ -1229,7 +1445,34 @@ def validate_restore_set(raw, cur=None, prev=None):
         _check_artifact(meta, "current", cur, ids)
     if "previous" in want:
         _check_artifact(meta, "previous", prev, ids)
-    return raw, cur, prev, None
+    return _restore_migrate(meta, raw, cur, prev, None)
+
+
+def _restore_migrate(meta, raw, cur, prev, note):
+    """恢复的最后一段: 旧格式的备份要**迁移之后**才落盘。
+
+    到这里为止, 一份 schema 1 的备份已经按 schema 1 的严格契约整份过关了(记录、三件配套、
+    两份产物逐一验过)。现在才谈得上迁移 —— 顺序反过来就是"拿一份没验过的东西洗成当前格式"。
+
+    这是退役里最容易漏的一条复活路径: 服务停了、劫持撤了、模块删了, 而用户从一份**退役前的
+    备份**恢复一次, 那份嵌着根证书的 .mobileconfig 就又躺回 /var/lib, 又能从「重新发送」
+    发出去。所以被退役的槽位在这里变成 None —— 上层会把它翻译成 DELETE(见 plan_restore)。
+    """
+    if meta["schema"] == SCHEMA:
+        return raw, cur, prev, note
+    new, retired = _migrate_1_to_2(meta)
+    raw = json.dumps(new, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8") + b"\n"
+    if new.get("current") is None:
+        cur = None
+    if new.get("previous") is None:
+        prev = None
+    if retired:
+        extra = ("ℹ️ 这份备份是 WLOC 退役之前的(schema %d): 第 %s 版描述文件里嵌着已退役的"
+                 "根证书, 恢复时**不会**把它放回来。请重新生成一份(新的不含根证书), 并到 "
+                 "iPhone 的证书信任设置里取消对 PrivDNS Gateway MITM CA 的信任。"
+                 % (meta["schema"], "、".join(str(x) for x in retired)))
+        note = (note + " " + extra) if note else extra
+    return raw, cur, prev, note
 
 
 # ── 恢复计划: Bot / 救援平面 / CLI 回滚共用的**同一份**判断 ──────────────────
@@ -1353,8 +1596,12 @@ def status_lines(meta, inputs=None, art_root=None):
     out.append("网关地址: %s" % ", ".join(cur["inputs"]["server_addresses"]))
     if cur["inputs"].get("ssids"):
         out.append("强制直连 Wi-Fi: %s" % ", ".join(cur["inputs"]["ssids"]))
-    if cur["inputs"].get("wloc_enabled"):
-        out.append("含根证书: 是(指纹 %s…)" % cur["inputs"]["wloc_ca_sha256"][:16])
+    if meta.get("retired_revision") is not None:
+        # 这台机器在 WLOC 退役迁移里丢弃过版本。说出来, 因为"去手机上取消那张根证书的信任"
+        # 这件事我们做不到, 只有用户能做 —— 而他没有别的地方能看到这条提示。
+        out.append("⚠️ 第 %d 版及更早的描述文件里带着已退役的根证书(WLOC 已退役), 已不再保留。"
+                   "请到 iPhone「设置 → 通用 → 关于本机 → 证书信任设置」取消对 "
+                   "PrivDNS Gateway MITM CA 的信任。" % meta["retired_revision"])
     if meta.get("previous"):
         out.append("上一版: 第 %d 版" % meta["previous"]["revision"])
     if inputs is not None:
@@ -1414,8 +1661,10 @@ def main(argv=None):
         # 用 default=[] 的话, 任何一次不带 --ssid 的调用都等于"把名单清掉"。
         p.add_argument("--ssid", action="append", default=None)
         p.add_argument("--clear-ssid", action="store_true", help="明确清空强制直连名单")
-        p.add_argument("--wloc-config")
-        p.add_argument("--ca-crt")
+        # --wloc-config / --ca-crt 已随 WLOC 退役。保留下来**显式拒绝**: pdg.sh 里的老
+        # 调用还带着它们, 静默忽略会让那条路悄悄改变行为而没人发现。
+        p.add_argument("--wloc-config", help="(已退役)")
+        p.add_argument("--ca-crt", help="(已退役)")
         p.add_argument("--template")
 
     g = sub.add_parser("generate", help="生成/更新受管描述文件")
@@ -1441,22 +1690,26 @@ def main(argv=None):
         ap.print_help(sys.stderr)
         return 2
 
+    retired_flags = [f for f, v in (("--wloc-config", getattr(a, "wloc_config", None)),
+                                    ("--ca-crt", getattr(a, "ca_crt", None))) if v]
+    if retired_flags:
+        sys.stderr.write(
+            "%s 已随 WLOC 位置改写退役: 描述文件不再携带任何根证书。\n"
+            "去掉这些参数重跑即可。手机上那张旧根证书需要你自己到"
+            "「设置 → 通用 → 关于本机 → 证书信任设置」里取消信任。\n"
+            % "、".join(retired_flags))
+        return 3
+
     def _ssids():
         return [] if getattr(a, "clear_ssid", False) else a.ssid
 
     def _inputs():
-        der = iosprofile.ca_der_for(iosprofile.wloc_enabled(a.wloc_config), a.ca_crt) \
-            if a.wloc_config else b""
-        return effective_inputs(load(), a.dot_host, a.server_ip, _ssids(), bool(der), der,
-                                a.template), der
+        return effective_inputs(load(), a.dot_host, a.server_ip, _ssids(), a.template), b""
 
     try:
         if a.cmd == "generate":
-            der = iosprofile.ca_der_for(iosprofile.wloc_enabled(a.wloc_config), a.ca_crt) \
-                if a.wloc_config else b""
             meta, lv, why, data, changed = generate(
-                a.dot_host, a.server_ip, _ssids(), der, bool(der), a.template,
-                legacy_seen=a.legacy)
+                a.dot_host, a.server_ip, _ssids(), a.template, legacy_seen=a.legacy)
             # 落到临时下载目录的那一份也必须过校验器 —— 二维码/临时 HTTP 是最终交到手机
             # 手里的那条路, 不能比 Bot 那条松。
             pdgtx.atomic_write(a.out, verified_artifact(meta, "current"), mode=0o644)
@@ -1534,9 +1787,7 @@ def main(argv=None):
                 print("无需修复。")
                 return 0
             print("%s: %s" % (HEALTH_LABEL[st], detail))
-            der = iosprofile.ca_der_for(iosprofile.wloc_enabled(a.wloc_config), a.ca_crt) \
-                if a.wloc_config else b""
-            meta = repair_current(der, a.template)
+            meta = repair_current(a.template)
             print("已按记录逐字节复原第 %d 版(revision 未变, 上一版未动)。"
                   % meta["current"]["revision"])
     except (StateError, iosprofile.ProfileError) as e:
