@@ -68,8 +68,10 @@ def plift(pattern, max_lines=24, flags=re.M | re.S):
 
 
 GUARDCANCEL = lift(r'^            finally:\n                guard\.cancel\(\)$')
-OWNA = plift(r'^\(ok if _a_ok else$')
-OWNB = plift(r'^\(ok if \(not _b_ok\) and _b_stuck else$')
+OWNA = plift(r'^    \(ok if _a_ok else$')
+OWNB = plift(r'^    \(ok if \(not _b_ok\) and _b_stuck else$')
+SCOPEA = plift(r'^    _a_before = _count_alive\(_a_scope\)\s+# 此刻只有 _pa 活着$')
+SCOPEB = plift(r'^    _b_before = _count_alive\(_b_scope\)\s+# 只有 _pb 活着$')
 
 RENDER = lift(r'^        return True, _upd_render\(cur, tgt, lines, _upd_repo_slug\(deadline\)\)$')
 TRY = lift(r'^    except _UpdCheckTimeout:\n.*?稍后重试。" % type\(e\)\.__name__$')
@@ -233,10 +235,13 @@ MUT = [
      [(SESSOLD, '    old = None', 1)]),
     # ── C: 21f 的资源归属 ──
     ("㊴ 换回旧的全进程计数判据(丢掉资源归属)",
-     [(OWNA, '(ok if _a_after == _a_before else', 1),
-      (OWNB, '(ok if _b_after != _b_before else', 1)], POS),
+     [(OWNA, '    (ok if _a_after == _a_before else', 1),
+      (OWNB, '    (ok if _b_after != _b_before else', 1)], POS),
     ("㊵ 正常路径不再取消守卫(cancel 撤掉, 线程留到 60s 期限)",
      [(GUARDCANCEL, '            finally:\n                pass', 1)]),
+    ("㊷ 自证改回依赖共享进程全局计数(无关 Timer 一退出就翻车)",
+     [(SCOPEA, '    _a_before = len(_global_live_timers())', 1),
+      (SCOPEB, '    _b_before = len(_global_live_timers())', 1)], POS),
     ("㉓ 只加无关注释(反向对照)",
      [(INVAL, '    # (负控的空转对照)\n' + INVAL, 1)]),
 ]
