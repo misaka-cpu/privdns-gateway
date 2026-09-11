@@ -52,6 +52,25 @@ def lift(pattern, max_lines=24, flags=re.M | re.S):
     return g
 
 
+PSRC = (ROOT / POS).read_text(encoding="utf-8")
+
+
+def plift(pattern, max_lines=24, flags=re.M | re.S):
+    """同 lift(), 但锚在**正控**里。21f 的所有权判据住在测试侧, 要验证"换回旧的全进程
+    计数判据会怎样", 就必须能改坏正控本身 —— 否则那一格根本挂不上去。"""
+    m = re.search(pattern, PSRC, flags)
+    assert m, pattern
+    g = m.group(0)
+    assert PSRC.count(g) == 1, pattern
+    n = g.count("\n") + 1
+    assert n <= max_lines, "锚点跨度 %d 行 > %d: %s" % (n, max_lines, pattern)
+    return g
+
+
+GUARDCANCEL = lift(r'^            finally:\n                guard\.cancel\(\)$')
+OWNA = plift(r'^\(ok if _a_ok else$')
+OWNB = plift(r'^\(ok if \(not _b_ok\) and _b_stuck else$')
+
 RENDER = lift(r'^        return True, _upd_render\(cur, tgt, lines, _upd_repo_slug\(deadline\)\)$')
 TRY = lift(r'^    except _UpdCheckTimeout:\n.*?稍后重试。" % type\(e\)\.__name__$')
 # 回调这一段在本轮重写过(受理返回三态 + 反馈全走后台), 锚点跟着挪。
@@ -212,6 +231,12 @@ MUT = [
      [(NOTICECAP, '        if False:', 1)]),
     ("㉝ 替换会话不摘旧身份(_upd_jobs 单调增长)",
      [(SESSOLD, '    old = None', 1)]),
+    # ── C: 21f 的资源归属 ──
+    ("㊴ 换回旧的全进程计数判据(丢掉资源归属)",
+     [(OWNA, '(ok if _a_after == _a_before else', 1),
+      (OWNB, '(ok if _b_after != _b_before else', 1)], POS),
+    ("㊵ 正常路径不再取消守卫(cancel 撤掉, 线程留到 60s 期限)",
+     [(GUARDCANCEL, '            finally:\n                pass', 1)]),
     ("㉓ 只加无关注释(反向对照)",
      [(INVAL, '    # (负控的空转对照)\n' + INVAL, 1)]),
 ]
@@ -231,7 +256,7 @@ try:
     for sub in ("tests", "deploy", "lib"):
         shutil.copytree(ROOT / sub, Path(wd) / sub, dirs_exist_ok=True, symlinks=True,
                         ignore=shutil.ignore_patterns("__pycache__", ".bin"))
-    pristine = (Path(wd) / BOT).read_text(encoding="utf-8")
+    pristine = {f: (Path(wd) / f).read_text(encoding="utf-8") for f in (BOT, POS)}
 
     _crash = {"out": None}
 
@@ -283,8 +308,10 @@ try:
         raise SystemExit(1)
     ok("基线绿: 正控在未改坏的副本上 0 条具名失败")
 
-    for tag, edits in MUT:
-        text, good = pristine, True
+    for _entry in MUT:
+        tag, edits = _entry[0], _entry[1]
+        tgt = _entry[2] if len(_entry) > 2 else BOT     # 默认改坏产品; 声明了就改那一支
+        text, good = pristine[tgt], True
         for anchor, repl, want in edits:
             hits = text.count(anchor)
             if hits != want:
@@ -299,14 +326,14 @@ try:
             text = after
         if not good:
             continue
-        (Path(wd) / BOT).write_text(text, encoding="utf-8")
-        if subprocess.run([sys.executable, "-m", "py_compile", str(Path(wd) / BOT)],
+        (Path(wd) / tgt).write_text(text, encoding="utf-8")
+        if subprocess.run([sys.executable, "-m", "py_compile", str(Path(wd) / tgt)],
                           capture_output=True).returncode != 0:
             bad("%s → 改坏后语法不合法" % tag)
-            (Path(wd) / BOT).write_text(pristine, encoding="utf-8")
+            (Path(wd) / tgt).write_text(pristine[tgt], encoding="utf-8")
             continue
         got, kind = run_pos()
-        (Path(wd) / BOT).write_text(pristine, encoding="utf-8")
+        (Path(wd) / tgt).write_text(pristine[tgt], encoding="utf-8")
         if kind != "正常":
             bad("%s → 正控没有正常运行(%s), 这一格既不算有牙也不算无牙" % (tag, kind))
             for _l in _crash_excerpt():
