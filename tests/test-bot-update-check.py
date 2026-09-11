@@ -13,10 +13,13 @@
 本支不连真实 Telegram、不用真实 token、不访问生产, git 用**克隆到临时目录的隔离仓库**
 (只读本地对象, 不碰共享 refs/tag/remote), 也从不调用真实升级入口。
 """
+import contextlib
 import importlib.util
+import io as _io
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -117,15 +120,264 @@ for base, want_has in (("v1.11.3", True), ("v1.11.10", True), ("v1.11.13", True)
     good = has == want_has and len(txt) <= bot.UPD_MSG_BUDGET
     (ok if good else bad)("%-9s → has=%s 消息 %d 字符 ≤ 预算 %d"
                           % (base, has, len(txt), bot.UPD_MSG_BUDGET))
-at("v1.11.14") or at("HEAD")
-_head = _REAL_GIT("rev-parse", "HEAD").stdout.strip()
-_tag = _REAL_GIT("rev-parse", "v1.11.14^{commit}").stdout.strip()
-if _head == _tag:
+# ── 无更新 / 有更新 的状态转换: 用**完全自有**的仓库, 不看宿主发布了什么 ──────────
+# 以前这里 checkout v1.11.14 然后断言"已是最新"。那把**当期发布版本钉进了断言**:
+# v1.11.15 一发布, 从 v1.11.14 看当然"有新发布", 这一格就自动变红 —— 它红的是
+# 仓库又发了一版, 不是产品坏了。自指的判据没有价值, 每次发版都要来改一次。
+#
+# 现在给这个场景一个自己的 Git 仓库: 自造提交、自造 tag、自己说了算。
+# 注意**不能用 git worktree** —— worktree 与主仓库共享 refs/tags, 在里面建 tag 会写到
+# 共享仓库上去。必须是独立 .git 的仓库(git init), 才谈得上 tag 隔离。
+_SB = tmpguard.mkdtemp(prefix="pdg-updcheck-sandbox.")
+
+_SB_CFG = (("user.email", "fixture@example.invalid"), ("user.name", "fixture"),
+           ("commit.gpgsign", "false"), ("tag.gpgsign", "false"))
+
+
+class _SbAbort(Exception):
+    """夹具初始化的**硬停**。
+
+    夹具自己出错时必须就地停住, 不能继续往下走 —— 否则后面那些产品断言会替夹具的
+    错误兜底: git init 失败了还去 config/commit/tag, 最终红的是某条产品判据,
+    看起来像产品坏了, 实际是夹具压根没建起来。
+    """
+
+    def __init__(self, reason):
+        Exception.__init__(self, reason)
+        self.reason = reason
+
+
+def _sb_die(reason):
+    raise _SbAbort(reason)
+
+
+def _sbgit(*a, **kw):
+    return subprocess.run(["git", "-C", _SB, *a], capture_output=True, text=True, **kw)
+
+
+def _sb_must(run, *a):
+    """必需的 git 操作: 退出码非零就点名停住, 不静默继续。"""
+    r = run(*a)
+    if r.returncode != 0:
+        _sb_die("git %s 失败(返回 %d): %s"
+                % (" ".join(a[:2]), r.returncode, (r.stderr or r.stdout or "").strip()[:80]))
+    return r
+
+
+def _sb_check_owned(gitdir, sb):
+    """确认 Git 元数据确实属于**本轮自建**的那个独立仓库。
+
+    两件事都要成立, 任一不成立就硬停:
+      · git 目录正好是 <sb>/.git —— worktree 的 git 目录会指到主仓库的
+        .git/worktrees/... 去, 在那里打 tag 会写进共享仓库;
+      · sandbox 落在系统临时目录**之内**。
+
+    路径比较走 realpath + commonpath, **不是字符串 startswith**:
+    "/tmp/xy" 以 "/tmp/x" 开头在字符串上成立, 在路径上不成立 —— 拿前缀当边界,
+    真出事的时候正好拦不住。
+    """
+    real_git = os.path.realpath(gitdir)
+    real_sb = os.path.realpath(sb)
+    real_tmp = os.path.realpath(tempfile.gettempdir())
+    want = os.path.join(real_sb, ".git")
+    if real_git != want:
+        _sb_die("git 目录不属于本轮自建仓库(实得 %s, 期望 %s) —— 可能是 worktree 或共享仓库"
+                % (real_git, want))
+    try:
+        inside = os.path.commonpath([real_sb, real_tmp]) == real_tmp
+    except ValueError:                      # 不同盘符 / 相对路径混用
+        inside = False
+    if not inside:
+        _sb_die("沙箱不在系统临时目录内(沙箱 %s, 临时目录 %s)" % (real_sb, real_tmp))
+
+
+def _sb_init(run, sb):
+    """自建仓库的初始化。顺序是**硬的**, 每一步都拦:
+
+        git init  →  核验归属  →  写本地 config  →  (调用方再写对象)
+
+    归属核验必须排在 config 与任何对象写入**之前**: 万一 git -C 落到了别的仓库上,
+    先写 config 就已经改了别人的仓库了。
+    """
+    r = run("init", "-q", "-b", "main")
+    if r.returncode != 0:
+        _sb_die("git init 失败(返回 %d): %s"
+                % (r.returncode, (r.stderr or r.stdout or "").strip()[:80]))
+    r = run("rev-parse", "--absolute-git-dir")
+    if r.returncode != 0:
+        _sb_die("读不出 git 目录(rev-parse --absolute-git-dir 返回 %d)" % r.returncode)
+    gitdir = r.stdout.strip()
+    _sb_check_owned(gitdir, sb)             # 不合格 → 硬停, 后面一个字都不写
+    for k, v in _SB_CFG:
+        r = run("config", k, v)
+        if r.returncode != 0:
+            _sb_die("git config %s 失败(返回 %d)" % (k, r.returncode))
+    return gitdir
+
+
+def _sb_bootstrap(run, sb):
+    """真实入口: 硬停一律转成**非零退出**。"""
+    try:
+        return _sb_init(run, sb)
+    except _SbAbort as e:
+        print("[FAIL] 夹具初始化硬停: %s" % e.reason)
+        FAIL[0] += 1
+        print()
+        print("-" * 62)
+        print("test-bot-update-check.py: 通过 %d, 失败 %d" % (PASS[0], FAIL[0]))
+        raise SystemExit(1)
+
+
+def _sb_commit(msg):
+    """在自有仓库里造一笔提交, 返回它的 sha。每步都查退出码。"""
+    open(os.path.join(_SB, "f.txt"), "a", encoding="utf-8").write(msg + "\n")
+    _sb_must(_sbgit, "add", "f.txt")
+    _sb_must(_sbgit, "commit", "-q", "-m", msg)
+    return _sb_must(_sbgit, "rev-parse", "HEAD").stdout.strip()
+
+
+# ── 先验安全门: 初始化失败 / 仓库身份不符, 都必须在写任何东西之前停住 ──────────
+class _SbProbe:
+    """受控桩: 记录每一次 git 调用, 并按需让某一步失败或返回别人的 git 目录。
+
+    注入只发生在这个桩里和它自己的临时目录里 —— 不拿共享仓库实测。
+    """
+
+    def __init__(self, fail_on=None, gitdir=None):
+        self.calls = []
+        self.fail_on = fail_on
+        self.gitdir = gitdir
+
+    def __call__(self, *a, **kw):
+        self.calls.append(a[0])
+        if self.fail_on == a[0]:
+            return _SbR(1, "", "injected failure")
+        if a[0] == "rev-parse":
+            return _SbR(0, self.gitdir if self.gitdir is not None else "", "")
+        return _SbR(0, "", "")
+
+    @property
+    def wrote(self):
+        """有没有做过"写"动作(配置或对象)。"""
+        return [c for c in self.calls if c in ("config", "add", "commit", "tag", "checkout")]
+
+
+class _SbR:
+    def __init__(self, rc=0, out="", err=""):
+        self.returncode, self.stdout, self.stderr = rc, out, err
+
+
+def _sb_exit_code(probe, sb):
+    """在真实入口上重放同一注入, 取它的退出码 —— 硬停必须是**非零**, 不能只打一行红字。
+
+    走的是真实 _sb_bootstrap(不是简化版), 但把它那次的 stdout 收进缓冲、计数也还原:
+    这次重放只为取退出码, 不该在日志里多出两行 [FAIL] 让人分不清哪条是真失败。
+    """
+    probe.calls = []
+    saved = (PASS[0], FAIL[0])
+    try:
+        with contextlib.redirect_stdout(_io.StringIO()):
+            _sb_bootstrap(probe, sb)
+    except SystemExit as e:
+        return e.code if isinstance(e.code, int) else 1
+    finally:
+        PASS[0], FAIL[0] = saved
+    return 0
+
+
+def _sb_reason(fn):
+    """跑一段应当硬停的代码, 返回它是否确实硬停了。"""
+    try:
+        fn()
+        return False
+    except _SbAbort:
+        return True
+
+
+print("══ 0. 夹具自身的安全门: 初始化失败与仓库归属 ══")
+_probe_sb = tmpguard.mkdtemp(prefix="pdg-updcheck-probe.")
+
+# 注入一: git init 返回非零
+_p1 = _SbProbe(fail_on="init")
+try:
+    _sb_init(_p1, _probe_sb)
+    bad("0a git init 失败后仍然继续了(应硬停)")
+except _SbAbort as _e:
+    (ok if "git init 失败" in _e.reason and "返回 1" in _e.reason else
+     bad)("0a git init 失败 → 具名原因(实得 %r)" % _e.reason[:60])
+(ok if _p1.calls == ["init"] else
+ bad)("0a init 失败后再没发出任何 git 命令(实得 %s)" % _p1.calls)
+(ok if not _p1.wrote else
+ bad)("0a init 失败后没有任何配置或对象写入尝试(实得 %s)" % _p1.wrote)
+(ok if _sb_exit_code(_p1, _probe_sb) == 1 else
+ bad)("0a 该硬停在真实入口上转成非零退出")
+
+# 注入二: init 成功, 但 git 目录不是本轮自建的那个(模拟 worktree/共享仓库)
+_p2 = _SbProbe(gitdir="/some/other/repo/.git")
+try:
+    _sb_init(_p2, _probe_sb)
+    bad("0b 仓库身份不符仍然继续了(应硬停)")
+except _SbAbort as _e:
+    (ok if "不属于本轮自建仓库" in _e.reason else
+     bad)("0b 身份不符 → 具名原因(实得 %r)" % _e.reason[:60])
+(ok if _p2.calls == ["init", "rev-parse"] else
+ bad)("0b 身份核验排在 config 之前(调用记录实得 %s)" % _p2.calls)
+(ok if not _p2.wrote else
+ bad)("0b 身份不符后没有任何配置或对象写入尝试(实得 %s)" % _p2.wrote)
+(ok if _sb_exit_code(_p2, _probe_sb) == 1 else
+ bad)("0b 该硬停在真实入口上转成非零退出")
+
+# 0c 路径边界用**真实路径**判定, 不是字符串前缀。
+#    构造一个与临时目录同前缀、但并不在它里面的路径: <tmpdir>foo。
+#    "/tmpfoo".startswith("/tmp") 为真 —— 拿 startswith 当边界就会放行;
+#    commonpath(["/tmpfoo", "/tmp"]) == "/" != "/tmp" —— 按路径判就拦得住。
+_tmp_real = os.path.realpath(tempfile.gettempdir())
+_outside = _tmp_real.rstrip("/") + "foo"
+(ok if _outside.startswith(_tmp_real) else
+ bad)("0c 前提: 构造的路径确实与临时目录同字符串前缀(实得 %s)" % _outside)
+(ok if _sb_reason(lambda: _sb_check_owned(os.path.join(_outside, ".git"), _outside)) else
+ bad)("0c 同前缀但不在临时目录**内**的沙箱被拦下(startswith 会放行, 路径边界不会)")
+
+_C1 = None  # 占位, 真实初始化在下面
+_sb_bootstrap(_sbgit, _SB)
+_C1 = _sb_commit("base")
+_sb_must(_sbgit, "tag", "-a", "v9.0.0", "-m", "v9.0.0")
+_C2 = _sb_commit("next")           # 后继提交, 先不打 tag
+
+_prev_repo = bot.PDG_REPO
+try:
+    bot.PDG_REPO = _SB
+    # A. HEAD 正好停在自有仓库的最新 tag 上 → 已是最新
+    _sbgit("checkout", "-q", "--detach", "v9.0.0")
     has, txt = bot.update_check()
-    (ok if (not has and "🟢" in txt and "❌" not in txt) else
-     bad)("已是最新 → has=False 且报绿(实得 has=%s, %r)" % (has, txt[:50]))
-else:
-    print("  [SKIP] 当前不在 v1.11.14 上, 无更新那一格未执行")
+    (ok if (not has and "🟢" in txt and "❌" not in txt and "v9.0.0" in txt) else
+     bad)("1A HEAD=最新 tag → has=False 且报绿并点名 v9.0.0(实得 has=%s, %r)"
+          % (has, txt[:60]))
+
+    # B. 同一个仓库里新增一个指向后继提交的更高版本 tag, HEAD 不动 → 应报有更新
+    #    这一步就是以前要"等真实发版"才能覆盖的转换, 现在一次测试里就能走完。
+    _sbgit("tag", "-a", "v9.1.0", "-m", "v9.1.0", _C2)
+    has, txt = bot.update_check()
+    (ok if (has and "v9.1.0" in txt and "🟢 已是最新" not in txt) else
+     bad)("1B 出现更高版本 tag 而 HEAD 未动 → has=True 且点名 v9.1.0, 不再报「已是最新」"
+          "(实得 has=%s, %r)" % (has, txt[:60]))
+
+    # C. HEAD 跟进到新 tag → 重新变成已是最新, 且点名的是**新**版本
+    _sbgit("checkout", "-q", "--detach", "v9.1.0")
+    has, txt = bot.update_check()
+    (ok if (not has and "🟢" in txt and "v9.1.0" in txt and "v9.0.0" not in txt) else
+     bad)("1C HEAD 跟到新 tag → has=False 且点名 v9.1.0(不是旧的 v9.0.0; 实得 has=%s, %r)"
+          % (has, txt[:60]))
+
+    # D. 宿主仓库的发布 tag 集合变了也不影响这一组 —— 它们只看自己的输入。
+    #    这里直接核对: 自有仓库里根本没有宿主那套 v1.11.x。
+    _sb_tags = _sbgit("tag", "-l", "v*", "--sort=-v:refname").stdout.split()
+    (ok if _sb_tags == ["v9.1.0", "v9.0.0"] else
+     bad)("1D 自有仓库的 tag 集合完全自定(实得 %s), 不含宿主发布 tag" % _sb_tags)
+    (ok if not any(t.startswith("v1.11.") for t in _sb_tags) else
+     bad)("1D 自有仓库不借用宿主 latest —— 宿主再发版也不会改变 A/B/C 的前提")
+finally:
+    bot.PDG_REPO = _prev_repo       # 不污染后面的故障 / 后台 / 导航 / 期限场景
 
 # 这条标题长到「不裁就放不进预算」——于是能同时验两件事: 整条消息仍在预算内, 而且那条提交
 # 是被**裁短后展示**的, 不是整条丢掉(丢掉的话用户一条摘要也看不到)。
@@ -1606,32 +1858,221 @@ _el21 = time.monotonic() - _t0
 (ok if _el21 <= 1.0 + 0.6 else
  bad)("21e 及时终止(实耗 %.2fs)" % _el21)
 
-# 21f 超时结束的是**实际网络工作**: 连接收掉, 守卫定时器不堆积
-def _live_timers():
+# 21f 超时结束的是**实际网络工作**: 连接收掉, 本轮武装的守卫线程真的退出。
+#
+# 判据只认**本轮这些调用自己创建的**守卫对象, 不数全进程 Timer。旧写法拿
+# threading.enumerate() 前后相减, 把资源归属丢了, 两头都会错:
+#   · 误红 —— 前像里还活着的若是**别处**的 Timer, 它在随后的等待里正常退出, 计数就
+#     成了"前 1 → 后 0"而判红。main 的 run 34485860847 红的就是这条断言, 而同一棵
+#     tree 在另外两次 CI 与三次本地跑里取到的是"前 0 → 后 0" —— 差的不是代码, 是采样
+#     那一刻进程里还有没有别人的 Timer。**那一条究竟是谁留下的, 日志只有计数, 来源
+#     未知**; 下面的受控场景复现的是机制, 不是那一次现场。
+#   · 假绿 —— 别处退一条、本轮漏一条, 总数照样相等, 泄漏被抵消掉。
+#     这一半更要命: 它不会闹, 只会让判据在真出问题时保持沉默。
+#
+# 还要把三件事分开: cancel() 只是**发信号**(Timer.cancel 不等线程退出), 回调跑没跑
+# 看 guard.fired, 线程退没退只能 join。判据看的是最后一件 —— 前两件都成立而线程仍
+# 挂着, 资源照样没收掉。
+_REAL_GUARD = bot._ApiGuard
+_GUARDS = []                                      # 本轮记录到的守卫对象
+
+
+class _RecGuard(_REAL_GUARD):
+    """真守卫的薄记录层。
+
+    构造仍走产品的 __init__(真 Timer、真 shutdown 回调), 这里只把对象登记下来,
+    好在判定时按身份回看。不改行为, 不代替产品 cancel/shutdown —— 测试一旦替产品
+    收场, 判据证明的就只是"测试自己会清理"。
+    """
+    __slots__ = ()
+
+    def __init__(self, sock, deadline):
+        _REAL_GUARD.__init__(self, sock, deadline)
+        _GUARDS.append(self)
+
+
+def _record_guards(fn):
+    """只在 fn 执行期间记录守卫, 出来就还原 —— 不影响别的场景。"""
+    del _GUARDS[:]
+    bot._ApiGuard = _RecGuard
+    try:
+        fn()
+    finally:
+        bot._ApiGuard = _REAL_GUARD
+    return list(_GUARDS)
+
+
+def _guards_settled(guards, budget=3.0):
+    """本轮这些守卫的 Timer 线程是否都真的退出了。
+
+    返回 (是否都退出, 未退出者的点名)。用有界 join 而不是固定 sleep: 早退出就早返回,
+    没退出也不会无限等; 而且报的是**哪个对象**没退出, 不是一个数字。
+    """
+    end = time.monotonic() + budget
+    stuck = []
+    for i, g in enumerate(guards):
+        t = getattr(g, "timer", None)
+        if t is None:
+            continue                              # 没 sock 或没 deadline 的调用本就不武装
+        t.join(max(0.0, end - time.monotonic()))
+        if t.is_alive():
+            stuck.append("#%d(fired=%s)" % (i, getattr(g, "fired", None)))
+    return (not stuck), stuck
+
+
+# ── 超期路径: 真实回环, 真 Timer ──
+_rb_reset("close_body", 0.8)
+_g_to = _record_guards(lambda: [bot.post("m", {}, time.monotonic() + 0.6) for _ in range(3)])
+(ok if getattr(bot._tls, "conn", None) is None else
+ bad)("21f 超期后连接已收掉(不是只让外层返回)")
+# 先证明"确实有对象可判" —— 记录为空时下面那条会空转成假绿
+(ok if len(_g_to) == 3 else
+ bad)("21f 超期路径确实武装了守卫(实得 %d 个, 期望 3; 零对象不算干净)" % len(_g_to))
+_to_settled, _to_stuck = _guards_settled(_g_to)
+(ok if _to_settled else
+ bad)("21f 本轮超期守卫的 Timer 线程都已退出(未退出: %s)" % ("、".join(_to_stuck) or "无"))
+
+# ── 正常路径: 成功返回时守卫要被 cancel 掉, 而不是留到期限自然到点 ──
+# 期限放在 60s 之外: 线程能在这之内退出, 就只可能是 cancel 起了作用, 不是等到点。
+_rb_reset("fast")
+_g_ok = _record_guards(lambda: [bot.post("m", {}, time.monotonic() + 60) for _ in range(5)])
+(ok if len(_g_ok) == 5 else
+ bad)("21f 正常路径确实武装了守卫(实得 %d 个, 期望 5; 零对象不算干净)" % len(_g_ok))
+_ok_settled, _ok_stuck = _guards_settled(_g_ok)
+(ok if _ok_settled else
+ bad)("21f 正常返回后守卫线程也已退出(60s 期限内退出只可能是 cancel; 未退出: %s)"
+      % ("、".join(_ok_stuck) or "无"))
+(ok if not any(g.fired for g in _g_ok) else
+ bad)("21f 正常路径一个守卫都没开过火(实得 fired=%s)" % [g.fired for g in _g_ok])
+
+# ── 21j 受控屏障自证: 上面那条判据自己分不分得清归属 ──
+# 这一格**不走网络**, 只用真 Timer + Event 屏障造确定性场景 —— 不靠重复运行撞概率。
+# 它验证的是"按对象看"与"按数量看"的差别; 真实网络与 Timer 收尾由上面那两段回环负责,
+# 两者不互相冒充。
+#
+# 旧算法在这里是个**受控模型**: 只在本格明确创建的那一组 Timer 上数活着的个数。
+# 刻意不拿 threading.enumerate() 当自证的前提 —— 共享进程里随时可能有别人的 Timer
+# 在窗口内退出, 前提就跟着别人的生命周期抖(实测注入一条无关 Timer, 下面 B 的前提会
+# 稳定变成"前 2 → 后 1")。所以这里数的是**已知集合**, 只用来构造"旧写法会怎么判"的
+# 对照, 不声称等价于线上那一次全进程采样。
+
+
+class _StubSock:
+    """只给守卫一个可 shutdown 的东西, 好让它真的武装出 Timer。不碰网络。"""
+
+    def shutdown(self, how):
+        pass
+
+
+def _global_live_timers():
+    """全进程枚举 —— 旧写法用的就是它。这里只留作对照, 不作为自证的前提。"""
     return [t for t in threading.enumerate() if isinstance(t, threading.Timer) and t.is_alive()]
 
 
-_rb_reset("close_body", 0.8)
-_t_before = len(_live_timers())
-for _ in range(3):
-    bot.post("m", {}, time.monotonic() + 0.6)
-time.sleep(1.5)                                   # 若有守卫没被取消, 这段时间足够暴露
-_t_after = len(_live_timers())
-(ok if getattr(bot._tls, "conn", None) is None else
- bad)("21f 超期后连接已收掉(不是只让外层返回)")
-(ok if _t_after == _t_before else
- bad)("21f 每次调用的守卫定时器都收干净(前 %d → 后 %d, 必须相等)" % (_t_before, _t_after))
-# 正常路径也不能漏: 成功返回时守卫要被 cancel 掉, 而不是留到期限自然到点
-_rb_reset("fast")
-_t_before2 = len(_live_timers())
-for _ in range(5):
-    bot.post("m", {}, time.monotonic() + 60)      # 期限很远: 没 cancel 就会挂 60s
-time.sleep(0.3)
-_t_after2 = len(_live_timers())
-(ok if _t_after2 == _t_before2 else
- bad)("21f 正常返回也把守卫取消掉(前 %d → 后 %d; 5 次调用 60s 期限, 不取消必然堆 5 条)"
-      % (_t_before2, _t_after2))
+def _count_alive(timers):
+    """旧算法的受控模型: 在一个**已知集合**上数活着的个数。"""
+    return sum(1 for t in timers if t.is_alive())
 
+
+def _barrier_timer():
+    """一条听指令退出的 Timer。用来扮演"窗口里另有一条 Timer"这件事本身 ——
+    至于线上那次红灯里活着的究竟是谁留下的, 日志只有计数, **来源未知**, 这里不冒充。"""
+    rel, done = threading.Event(), threading.Event()
+
+    def _body():
+        rel.wait(5)
+        done.set()
+
+    t = threading.Timer(0, _body)
+    t.daemon = True
+    t.start()
+    return t, rel, done
+
+
+# 一条与本格无关的 Timer, 横跨 A 与 B 两个窗口, 在 B 采样后像之前退出。
+# 它是"共享进程里别人的 Timer"的替身: 受控集合不该数它, 全进程枚举则会数到。
+_noise, _noise_rel, _noise_done = _barrier_timer()
+_a_mine, _b_leak = [], None
+try:
+    # A. 另有一条 Timer 在前像里活着、随后退出; 本轮自己的守卫全部收尾。
+    #    受控集合里计数前后不等 → 旧算法误红; 按对象看应当干净。
+    _pa, _pa_rel, _pa_done = _barrier_timer()
+    _a_scope = [_pa]                              # 本格已知的 Timer 全集
+    _a_before = _count_alive(_a_scope)            # 此刻只有 _pa 活着
+    _a_wide_before = _count_alive(_a_scope + [_noise])
+    _a_mine = [_REAL_GUARD(_StubSock(), time.monotonic() + 30) for _ in range(2)]
+    _a_scope += [g.timer for g in _a_mine]
+    for _g in _a_mine:
+        _g.cancel()                               # 走产品自己的 cancel
+    _a_ok, _a_stuck = _guards_settled(_a_mine, budget=2.0)
+    _pa_rel.set()
+    _pa.join(3)
+    _a_after = _count_alive(_a_scope)
+    _a_wide_after = _count_alive(_a_scope + [_noise])
+    (ok if _pa_done.is_set() and not _pa.is_alive() else
+     bad)("21j A 前提: 窗口里那条别人的 Timer 先活着后退出(done=%s alive=%s)"
+          % (_pa_done.is_set(), _pa.is_alive()))
+    (ok if len(_a_mine) == 2 and all(g.timer is not None for g in _a_mine) else
+     bad)("21j A 前提: 本轮确实造出了 2 个武装过的守卫(实得 %d 个)" % len(_a_mine))
+    (ok if _a_before != _a_after else
+     bad)("21j A 受控集合内计数前后不等(前 %d → 后 %d) —— 旧算法在这里会误红"
+          % (_a_before, _a_after))
+    (ok if _a_ok else
+     bad)("21j A 按对象看: 本轮守卫已全部收尾, 不该被别人的 Timer 带红(未退出: %s)" % _a_stuck)
+
+    # B. 另有一条退出、本轮漏一条 → 受控集合内计数相等 → 旧算法假绿;
+    #    按对象看必须点出漏的那一条。
+    _pb, _pb_rel, _pb_done = _barrier_timer()
+    _b_scope = [_pb]
+    _b_before = _count_alive(_b_scope)             # 只有 _pb 活着
+    _b_wide_before = _count_alive(_b_scope + [_noise])
+    _b_leak = _REAL_GUARD(_StubSock(), time.monotonic() + 30)   # 故意不 cancel
+    _b_scope.append(_b_leak.timer)
+    _pb_rel.set()
+    _pb.join(3)
+    _noise_rel.set()                               # 无关 Timer 也在这个窗口里退出
+    _noise.join(3)
+    _b_after = _count_alive(_b_scope)              # _pb 退出, 漏网者顶上
+    _b_wide_after = _count_alive(_b_scope + [_noise])
+    _b_ok, _b_stuck = _guards_settled([_b_leak], budget=0.5)
+    (ok if _b_leak.timer is not None else
+     bad)("21j B 前提: 本轮确实造出了一个武装过的漏网守卫")
+    (ok if _b_before == _b_after else
+     bad)("21j B 受控集合内计数前后相等(前 %d → 后 %d) —— 旧算法在这里会假绿"
+          % (_b_before, _b_after))
+    (ok if (not _b_ok) and _b_stuck else
+     bad)("21j B 按对象看: 本轮漏下的那条被点名(实得 %s)" % _b_stuck)
+
+    # C. 同一个 B 场景, 只要把那条无关 Timer 也数进来, 前提就翻了。
+    #    这正是自证不能拿全进程枚举当前提的理由 —— 别人的生命周期会替我们做判断。
+    (ok if _noise_done.is_set() and not _noise.is_alive() else
+     bad)("21j C 前提: 无关 Timer 确实活过 A/B 两个窗口并在 B 的后像之前退出(done=%s alive=%s)"
+          % (_noise_done.is_set(), _noise.is_alive()))
+    (ok if _b_wide_before != _b_wide_after else
+     bad)("21j C 把无关 Timer 也数进来, 同一场景的前提就从「相等」翻成「不等」"
+          "(宽计数 前 %d → 后 %d; 受控计数 前 %d → 后 %d)"
+          % (_b_wide_before, _b_wide_after, _b_before, _b_after))
+    (ok if _a_wide_before != _a_wide_after else
+     bad)("21j C A 场景在宽计数下同样不等(前 %d → 后 %d) —— 它分不出是谁的 Timer"
+          % (_a_wide_before, _a_wide_after))
+finally:
+    # 记录完了再收拾, 且只收拾自己造的那几个 —— 清理不能跑到判定前面去。
+    # 放 finally 里: 上面任何一条抛了, 本格造的 Timer 也得按对象收干净。
+    for _g in _a_mine:
+        _g.cancel()
+        if _g.timer is not None:
+            _g.timer.join(3)
+    if _b_leak is not None:
+        _b_leak.cancel()
+        if _b_leak.timer is not None:
+            _b_leak.timer.join(3)
+    _noise_rel.set()
+    _noise.join(3)
+_leftover = [g for g in _a_mine + ([_b_leak] if _b_leak is not None else [])
+             if g.timer is not None and g.timer.is_alive()]
+(ok if not _leftover and not _noise.is_alive() else
+ bad)("21j 收尾: 本格自造的 Timer 都已按对象清理(仍活着 %d 个, noise=%s)"
+      % (len(_leftover), _noise.is_alive()))
 # 21g 已验证过的行为不能被这次修复破坏
 _rb_reset("fast")
 _t0 = time.monotonic()
@@ -1750,6 +2191,241 @@ _seq22d, _, _, _ = _reap_case("none", "未导航未替换正常过期", True)
 _reset_state()
 bot.post = _REAL_POST
 bot.update_check = _REAL_UPDATE_CHECK
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 23. 超期的完整响应不得判成功 —— 确定性场景, 不跟时序赛跑
+# ──────────────────────────────────────────────────────────────────────────────
+# §21 那几格是真实回环: 它们证明的是"慢响应下能及时终止"。但那里客户端拿到的响应
+# 是**不完整**的, 所以证不到本节这条性质: **完整、可解析、ok=true 的 JSON, 只要是在
+# 期限之后才到齐, 也不能返回成功**。
+#
+# 产品里守这条的是 post() 尾部那两句:
+#     if guard.fired:                                   raise _ApiDeadline()
+#     if deadline is not None and now >= deadline:      raise _ApiDeadline()
+# 以前验它们只能靠"连接是否被收掉"这类副作用, 而那取决于 socket 空闲超时与守卫定时器
+# 谁先到 —— 同一个变异有时红有时不红。这一节把两个变量都拿掉:
+#   · 时钟用**线程局部**垫片: 只有跑这一节的线程看到假时间, 收割器等别的线程照拿真时间;
+#   · 守卫是否触发由测试直接决定, 不等 threading.Timer 真的到点。
+# 跑的仍是**真实** post() 与真实 _api_read(), 只把"时间"和"什么时候触发守卫"变成可控输入。
+# 这是受控逻辑证据, **不冒充真实网络期限实测** —— 那部分证据在 §21。
+print()
+print("══ 23. 超期完整响应: 确定性判定(真实 post/_api_read, 受控时钟与守卫) ══")
+
+_DET_BODY = b'{"ok":true,"result":{"message_id":777}}'
+
+
+class _DetClock:
+    """只对**当前线程**撒谎的单调时钟。
+
+    直接改 bot.time.monotonic 会波及收割器与通知线程 —— 它们也在同一个模块命名空间里
+    读时间。这里用 thread-local: 没设过值的线程一律走真实时钟。
+    """
+
+    def __init__(self, real):
+        self._real = real
+        self._tl = threading.local()
+
+    def __getattr__(self, name):            # sleep / time / 其余一律透传给真模块
+        return getattr(self._real, name)
+
+    def monotonic(self):
+        v = getattr(self._tl, "v", None)
+        return self._real.monotonic() if v is None else v
+
+    def freeze(self, v):
+        self._tl.v = v
+
+    def advance(self, d):
+        self._tl.v = getattr(self._tl, "v", self._real.monotonic()) + d
+
+    def release(self):
+        self._tl.v = None
+
+
+class _DetSock:
+    """受控 socket。shutdown 记录但**不真的断流** —— 这样"守卫已触发"与"响应仍然完整"
+    可以同时成立, 才谈得上单验 guard.fired 那一支。"""
+
+    def __init__(self):
+        self.timeouts = []
+        self.shutdowns = 0
+        self.closed = 0
+
+    def settimeout(self, t):
+        self.timeouts.append(t)
+
+    def shutdown(self, how):
+        self.shutdowns += 1
+
+    def close(self):
+        self.closed += 1
+
+
+class _DetResp:
+    """真实形态的响应: read1 分块吐出**完整**的 JSON, 读完 length 归零、isclosed 为真。
+
+    推进时钟的钩子挂在 read1 **之后**: 挂在 settimeout(读之前)会让钟在最后一块读到之前
+    就越过期限, 于是 _api_read 的**逐轮**检查先抛出 —— 那验的是另一支, 而且响应根本读不完。
+    要验"读完之后才发现超期", 时间必须在**数据到手之后**才推进。
+    """
+
+    def __init__(self, chunks, after_read=None):
+        self._chunks = list(chunks)
+        self.length = sum(len(c) for c in self._chunks)
+        self._closed = False
+        self.closed_calls = 0
+        self.reads = 0
+        self._after = after_read
+
+    def read1(self, n=-1):
+        if not self._chunks:
+            self._closed = True
+            return b""
+        c = self._chunks.pop(0)
+        self.length -= len(c)
+        self.reads += 1
+        if not self._chunks:
+            self._closed = True
+        if self._after:
+            self._after(self.reads)
+        return c
+
+    def isclosed(self):
+        return self._closed
+
+    def close(self):
+        self.closed_calls += 1
+        self._closed = True
+
+
+class _DetConn:
+    def __init__(self, sock, resp):
+        self.sock = sock
+        self._resp = resp
+        self.timeout = None
+        self.requests = 0
+        self.closed = 0
+
+    def request(self, *a, **k):
+        self.requests += 1
+
+    def getresponse(self):
+        return self._resp
+
+    def close(self):
+        self.closed += 1
+
+
+def _det_run(label, budget, advance_per_read, fire_guard_at=None):
+    """跑一次真实 post(), 返回 (结果, 观测)。
+
+    budget            这次调用的绝对预算(受控时钟的秒)
+    advance_per_read  每次 settimeout(即每读一块前)把受控时钟推进多少
+    fire_guard_at     在第几次 settimeout 时直接触发守卫(None = 不触发)
+    """
+    obs = {}
+    guards = []
+    real_guard = bot._ApiGuard
+
+    def capturing_guard(sock, deadline):
+        g = real_guard(sock, deadline)
+        guards.append(g)
+        return g
+
+    def after_read(nth):
+        clock.advance(advance_per_read)     # 数据已到手, 再推进时间
+        if fire_guard_at is not None and nth == fire_guard_at and guards:
+            guards[-1]._fire()              # 直接触发, 不等 Timer 到点
+
+    half = len(_DET_BODY) // 2
+    resp = _DetResp([_DET_BODY[:half], _DET_BODY[half:]], after_read)
+    sock = _DetSock()
+    conn = _DetConn(sock, resp)
+
+    clock = _DetClock(bot.time)
+    prev_time, prev_conn = bot.time, getattr(bot._tls, "conn", None)
+    try:
+        bot.time = clock
+        bot._ApiGuard = capturing_guard
+        bot._tls.conn = conn                # 复用这条"连接", 不建新的
+        t0 = 1000.0
+        clock.freeze(t0)
+        r = bot.post("m", {}, t0 + budget)
+        obs["result"] = r
+        obs["guard_fired"] = bool(guards and guards[-1].fired)
+        # Timer.cancel() 与"到点跑完"都会 set 这个 Event; 配合 fired 才分得清是哪一种。
+        obs["timer_done"] = bool(guards and guards[-1].timer is not None
+                                 and guards[-1].timer.finished.is_set())
+        obs["reads"] = resp.reads
+        obs["requests"] = conn.requests
+        obs["settimeouts"] = len(sock.timeouts)
+        obs["shutdowns"] = sock.shutdowns
+        obs["resp_closed"] = resp.closed_calls
+        obs["body_left"] = resp.length
+        obs["clock_end"] = clock.monotonic()
+        obs["deadline"] = t0 + budget
+        obs["tls_conn"] = getattr(bot._tls, "conn", None)
+    finally:
+        clock.release()
+        bot.time = prev_time
+        bot._ApiGuard = real_guard
+        bot._tls.conn = prev_conn
+    return obs
+
+
+# A. 按时完整返回 → 允许成功
+_a = _det_run("A", budget=10.0, advance_per_read=0.1)
+(ok if _a["body_left"] == 0 and _a["resp_closed"] >= 1 else
+ bad)("23A 前提: 响应体已完整读完并收尾(剩余 %s 字节, close %s 次)"
+      % (_a["body_left"], _a["resp_closed"]))
+(ok if _a["clock_end"] < _a["deadline"] else
+ bad)("23A 前提: 读完时**未**超期(钟 %.1f < 期限 %.1f)" % (_a["clock_end"], _a["deadline"]))
+(ok if not _a["guard_fired"] else bad)("23A 前提: 守卫未触发")
+(ok if _a["result"].get("ok") is True and _a["result"]["result"]["message_id"] == 777 else
+ bad)("23A 按时完整返回 → 判成功且内容解析正确(实得 %r)" % (_a["result"],))
+(ok if _a["requests"] == 1 else bad)("23A 只发了一次请求(实得 %d)" % _a["requests"])
+(ok if _a["timer_done"] and not _a["guard_fired"] else
+ bad)("23A 正常返回把守卫定时器取消掉(且不是因为它到点跑过; finished=%s fired=%s)"
+      % (_a["timer_done"], _a["guard_fired"]))
+(ok if _a["reads"] == 2 else bad)("23A 两块都读到了(实得 %d 次)" % _a["reads"])
+
+# B. 超期完整返回, 守卫**尚未**触发 → 必须拒绝成功
+_b = _det_run("B", budget=1.0, advance_per_read=0.6)
+(ok if _b["body_left"] == 0 and _b["resp_closed"] >= 1 else
+ bad)("23B 前提: 响应体已完整读完并收尾(剩余 %s 字节)" % _b["body_left"])
+(ok if not _b["guard_fired"] else
+ bad)("23B 前提: 守卫**未**触发 —— 这一格单验读完后的期限判定")
+(ok if _b["clock_end"] >= _b["deadline"] else
+ bad)("23B 前提: 最后一块到齐时已超期(钟 %.1f ≥ 期限 %.1f)" % (_b["clock_end"], _b["deadline"]))
+(ok if _b["result"] == {} else
+ bad)("23B 超期后到齐的**完整 ok=true JSON** 不得判成功(实得 %r)" % (_b["result"],))
+(ok if _b["tls_conn"] is None else
+ bad)("23B 判失败后连接被收掉, 缓存清空(实得 %r)" % (_b["tls_conn"],))
+(ok if _b["reads"] == 2 else bad)("23B 两块都读到了(实得 %d 次)" % _b["reads"])
+(ok if _b["timer_done"] else bad)("23B 守卫定时器已收")
+
+# C. 超期完整返回, 守卫**已**触发 → 必须拒绝成功
+#    守卫的 shutdown 打在受控 socket 上、不真的断流, 所以"已触发"与"响应完整"同时成立。
+_c = _det_run("C", budget=10.0, advance_per_read=0.1, fire_guard_at=1)
+(ok if _c["body_left"] == 0 and _c["resp_closed"] >= 1 else
+ bad)("23C 前提: 响应体仍然完整读完(剩余 %s 字节)" % _c["body_left"])
+(ok if _c["guard_fired"] and _c["shutdowns"] >= 1 else
+ bad)("23C 前提: 守卫**已**触发并调了 shutdown(fired=%s, shutdown %d 次)"
+      % (_c["guard_fired"], _c["shutdowns"]))
+(ok if _c["clock_end"] < _c["deadline"] else
+ bad)("23C 前提: 读完时**未**超期(钟 %.1f < 期限 %.1f) —— 这一格单验 guard.fired 那一支"
+      % (_c["clock_end"], _c["deadline"]))
+(ok if _c["result"] == {} else
+ bad)("23C 守卫已触发时, 完整 JSON 同样不得判成功(实得 %r)" % (_c["result"],))
+(ok if _c["tls_conn"] is None else
+ bad)("23C 判失败后连接被收掉, 缓存清空(实得 %r)" % (_c["tls_conn"],))
+
+# 三格共同的边界: 受控时钟只影响本线程
+_det_probe = []
+_det_t = threading.Thread(target=lambda: _det_probe.append(bot.time.monotonic()))
+_det_t.start(); _det_t.join(5)
+(ok if _det_probe and abs(_det_probe[0] - time.monotonic()) < 5 else
+ bad)("23 受控时钟只对本线程生效, 别的线程拿到的仍是真实时间(实得 %r)" % (_det_probe[:1],))
 
 print()
 print("-" * 62)
