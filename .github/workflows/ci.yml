@@ -1006,6 +1006,9 @@ jobs:
       - name: "WLOC 退役 · 老装迁移 (停服务→撤劫持→撤路由→删模块; 幂等/归属不清拒绝/失败还原)"
         run: bash tests/test-wloc-retire-migration.sh
 
+      - name: "WLOC 退役 · 描述文件 schema 1→2 (三种老机器状态/严格验-迁移-复核/不再下发退役 CA)"
+        run: python3 tests/test-wloc-retire-schema.py
+
       - name: "平台文案/门控回归 (客户端·状态 按平台/内核 + README 文案一致)"
         run: python3 tests/test-platform-copy.py
 
