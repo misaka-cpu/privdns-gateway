@@ -1858,32 +1858,221 @@ _el21 = time.monotonic() - _t0
 (ok if _el21 <= 1.0 + 0.6 else
  bad)("21e 及时终止(实耗 %.2fs)" % _el21)
 
-# 21f 超时结束的是**实际网络工作**: 连接收掉, 守卫定时器不堆积
-def _live_timers():
+# 21f 超时结束的是**实际网络工作**: 连接收掉, 本轮武装的守卫线程真的退出。
+#
+# 判据只认**本轮这些调用自己创建的**守卫对象, 不数全进程 Timer。旧写法拿
+# threading.enumerate() 前后相减, 把资源归属丢了, 两头都会错:
+#   · 误红 —— 前像里还活着的若是**别处**的 Timer, 它在随后的等待里正常退出, 计数就
+#     成了"前 1 → 后 0"而判红。main 的 run 34485860847 红的就是这条断言, 而同一棵
+#     tree 在另外两次 CI 与三次本地跑里取到的是"前 0 → 后 0" —— 差的不是代码, 是采样
+#     那一刻进程里还有没有别人的 Timer。**那一条究竟是谁留下的, 日志只有计数, 来源
+#     未知**; 下面的受控场景复现的是机制, 不是那一次现场。
+#   · 假绿 —— 别处退一条、本轮漏一条, 总数照样相等, 泄漏被抵消掉。
+#     这一半更要命: 它不会闹, 只会让判据在真出问题时保持沉默。
+#
+# 还要把三件事分开: cancel() 只是**发信号**(Timer.cancel 不等线程退出), 回调跑没跑
+# 看 guard.fired, 线程退没退只能 join。判据看的是最后一件 —— 前两件都成立而线程仍
+# 挂着, 资源照样没收掉。
+_REAL_GUARD = bot._ApiGuard
+_GUARDS = []                                      # 本轮记录到的守卫对象
+
+
+class _RecGuard(_REAL_GUARD):
+    """真守卫的薄记录层。
+
+    构造仍走产品的 __init__(真 Timer、真 shutdown 回调), 这里只把对象登记下来,
+    好在判定时按身份回看。不改行为, 不代替产品 cancel/shutdown —— 测试一旦替产品
+    收场, 判据证明的就只是"测试自己会清理"。
+    """
+    __slots__ = ()
+
+    def __init__(self, sock, deadline):
+        _REAL_GUARD.__init__(self, sock, deadline)
+        _GUARDS.append(self)
+
+
+def _record_guards(fn):
+    """只在 fn 执行期间记录守卫, 出来就还原 —— 不影响别的场景。"""
+    del _GUARDS[:]
+    bot._ApiGuard = _RecGuard
+    try:
+        fn()
+    finally:
+        bot._ApiGuard = _REAL_GUARD
+    return list(_GUARDS)
+
+
+def _guards_settled(guards, budget=3.0):
+    """本轮这些守卫的 Timer 线程是否都真的退出了。
+
+    返回 (是否都退出, 未退出者的点名)。用有界 join 而不是固定 sleep: 早退出就早返回,
+    没退出也不会无限等; 而且报的是**哪个对象**没退出, 不是一个数字。
+    """
+    end = time.monotonic() + budget
+    stuck = []
+    for i, g in enumerate(guards):
+        t = getattr(g, "timer", None)
+        if t is None:
+            continue                              # 没 sock 或没 deadline 的调用本就不武装
+        t.join(max(0.0, end - time.monotonic()))
+        if t.is_alive():
+            stuck.append("#%d(fired=%s)" % (i, getattr(g, "fired", None)))
+    return (not stuck), stuck
+
+
+# ── 超期路径: 真实回环, 真 Timer ──
+_rb_reset("close_body", 0.8)
+_g_to = _record_guards(lambda: [bot.post("m", {}, time.monotonic() + 0.6) for _ in range(3)])
+(ok if getattr(bot._tls, "conn", None) is None else
+ bad)("21f 超期后连接已收掉(不是只让外层返回)")
+# 先证明"确实有对象可判" —— 记录为空时下面那条会空转成假绿
+(ok if len(_g_to) == 3 else
+ bad)("21f 超期路径确实武装了守卫(实得 %d 个, 期望 3; 零对象不算干净)" % len(_g_to))
+_to_settled, _to_stuck = _guards_settled(_g_to)
+(ok if _to_settled else
+ bad)("21f 本轮超期守卫的 Timer 线程都已退出(未退出: %s)" % ("、".join(_to_stuck) or "无"))
+
+# ── 正常路径: 成功返回时守卫要被 cancel 掉, 而不是留到期限自然到点 ──
+# 期限放在 60s 之外: 线程能在这之内退出, 就只可能是 cancel 起了作用, 不是等到点。
+_rb_reset("fast")
+_g_ok = _record_guards(lambda: [bot.post("m", {}, time.monotonic() + 60) for _ in range(5)])
+(ok if len(_g_ok) == 5 else
+ bad)("21f 正常路径确实武装了守卫(实得 %d 个, 期望 5; 零对象不算干净)" % len(_g_ok))
+_ok_settled, _ok_stuck = _guards_settled(_g_ok)
+(ok if _ok_settled else
+ bad)("21f 正常返回后守卫线程也已退出(60s 期限内退出只可能是 cancel; 未退出: %s)"
+      % ("、".join(_ok_stuck) or "无"))
+(ok if not any(g.fired for g in _g_ok) else
+ bad)("21f 正常路径一个守卫都没开过火(实得 fired=%s)" % [g.fired for g in _g_ok])
+
+# ── 21j 受控屏障自证: 上面那条判据自己分不分得清归属 ──
+# 这一格**不走网络**, 只用真 Timer + Event 屏障造确定性场景 —— 不靠重复运行撞概率。
+# 它验证的是"按对象看"与"按数量看"的差别; 真实网络与 Timer 收尾由上面那两段回环负责,
+# 两者不互相冒充。
+#
+# 旧算法在这里是个**受控模型**: 只在本格明确创建的那一组 Timer 上数活着的个数。
+# 刻意不拿 threading.enumerate() 当自证的前提 —— 共享进程里随时可能有别人的 Timer
+# 在窗口内退出, 前提就跟着别人的生命周期抖(实测注入一条无关 Timer, 下面 B 的前提会
+# 稳定变成"前 2 → 后 1")。所以这里数的是**已知集合**, 只用来构造"旧写法会怎么判"的
+# 对照, 不声称等价于线上那一次全进程采样。
+
+
+class _StubSock:
+    """只给守卫一个可 shutdown 的东西, 好让它真的武装出 Timer。不碰网络。"""
+
+    def shutdown(self, how):
+        pass
+
+
+def _global_live_timers():
+    """全进程枚举 —— 旧写法用的就是它。这里只留作对照, 不作为自证的前提。"""
     return [t for t in threading.enumerate() if isinstance(t, threading.Timer) and t.is_alive()]
 
 
-_rb_reset("close_body", 0.8)
-_t_before = len(_live_timers())
-for _ in range(3):
-    bot.post("m", {}, time.monotonic() + 0.6)
-time.sleep(1.5)                                   # 若有守卫没被取消, 这段时间足够暴露
-_t_after = len(_live_timers())
-(ok if getattr(bot._tls, "conn", None) is None else
- bad)("21f 超期后连接已收掉(不是只让外层返回)")
-(ok if _t_after == _t_before else
- bad)("21f 每次调用的守卫定时器都收干净(前 %d → 后 %d, 必须相等)" % (_t_before, _t_after))
-# 正常路径也不能漏: 成功返回时守卫要被 cancel 掉, 而不是留到期限自然到点
-_rb_reset("fast")
-_t_before2 = len(_live_timers())
-for _ in range(5):
-    bot.post("m", {}, time.monotonic() + 60)      # 期限很远: 没 cancel 就会挂 60s
-time.sleep(0.3)
-_t_after2 = len(_live_timers())
-(ok if _t_after2 == _t_before2 else
- bad)("21f 正常返回也把守卫取消掉(前 %d → 后 %d; 5 次调用 60s 期限, 不取消必然堆 5 条)"
-      % (_t_before2, _t_after2))
+def _count_alive(timers):
+    """旧算法的受控模型: 在一个**已知集合**上数活着的个数。"""
+    return sum(1 for t in timers if t.is_alive())
 
+
+def _barrier_timer():
+    """一条听指令退出的 Timer。用来扮演"窗口里另有一条 Timer"这件事本身 ——
+    至于线上那次红灯里活着的究竟是谁留下的, 日志只有计数, **来源未知**, 这里不冒充。"""
+    rel, done = threading.Event(), threading.Event()
+
+    def _body():
+        rel.wait(5)
+        done.set()
+
+    t = threading.Timer(0, _body)
+    t.daemon = True
+    t.start()
+    return t, rel, done
+
+
+# 一条与本格无关的 Timer, 横跨 A 与 B 两个窗口, 在 B 采样后像之前退出。
+# 它是"共享进程里别人的 Timer"的替身: 受控集合不该数它, 全进程枚举则会数到。
+_noise, _noise_rel, _noise_done = _barrier_timer()
+_a_mine, _b_leak = [], None
+try:
+    # A. 另有一条 Timer 在前像里活着、随后退出; 本轮自己的守卫全部收尾。
+    #    受控集合里计数前后不等 → 旧算法误红; 按对象看应当干净。
+    _pa, _pa_rel, _pa_done = _barrier_timer()
+    _a_scope = [_pa]                              # 本格已知的 Timer 全集
+    _a_before = _count_alive(_a_scope)            # 此刻只有 _pa 活着
+    _a_wide_before = _count_alive(_a_scope + [_noise])
+    _a_mine = [_REAL_GUARD(_StubSock(), time.monotonic() + 30) for _ in range(2)]
+    _a_scope += [g.timer for g in _a_mine]
+    for _g in _a_mine:
+        _g.cancel()                               # 走产品自己的 cancel
+    _a_ok, _a_stuck = _guards_settled(_a_mine, budget=2.0)
+    _pa_rel.set()
+    _pa.join(3)
+    _a_after = _count_alive(_a_scope)
+    _a_wide_after = _count_alive(_a_scope + [_noise])
+    (ok if _pa_done.is_set() and not _pa.is_alive() else
+     bad)("21j A 前提: 窗口里那条别人的 Timer 先活着后退出(done=%s alive=%s)"
+          % (_pa_done.is_set(), _pa.is_alive()))
+    (ok if len(_a_mine) == 2 and all(g.timer is not None for g in _a_mine) else
+     bad)("21j A 前提: 本轮确实造出了 2 个武装过的守卫(实得 %d 个)" % len(_a_mine))
+    (ok if _a_before != _a_after else
+     bad)("21j A 受控集合内计数前后不等(前 %d → 后 %d) —— 旧算法在这里会误红"
+          % (_a_before, _a_after))
+    (ok if _a_ok else
+     bad)("21j A 按对象看: 本轮守卫已全部收尾, 不该被别人的 Timer 带红(未退出: %s)" % _a_stuck)
+
+    # B. 另有一条退出、本轮漏一条 → 受控集合内计数相等 → 旧算法假绿;
+    #    按对象看必须点出漏的那一条。
+    _pb, _pb_rel, _pb_done = _barrier_timer()
+    _b_scope = [_pb]
+    _b_before = _count_alive(_b_scope)             # 只有 _pb 活着
+    _b_wide_before = _count_alive(_b_scope + [_noise])
+    _b_leak = _REAL_GUARD(_StubSock(), time.monotonic() + 30)   # 故意不 cancel
+    _b_scope.append(_b_leak.timer)
+    _pb_rel.set()
+    _pb.join(3)
+    _noise_rel.set()                               # 无关 Timer 也在这个窗口里退出
+    _noise.join(3)
+    _b_after = _count_alive(_b_scope)              # _pb 退出, 漏网者顶上
+    _b_wide_after = _count_alive(_b_scope + [_noise])
+    _b_ok, _b_stuck = _guards_settled([_b_leak], budget=0.5)
+    (ok if _b_leak.timer is not None else
+     bad)("21j B 前提: 本轮确实造出了一个武装过的漏网守卫")
+    (ok if _b_before == _b_after else
+     bad)("21j B 受控集合内计数前后相等(前 %d → 后 %d) —— 旧算法在这里会假绿"
+          % (_b_before, _b_after))
+    (ok if (not _b_ok) and _b_stuck else
+     bad)("21j B 按对象看: 本轮漏下的那条被点名(实得 %s)" % _b_stuck)
+
+    # C. 同一个 B 场景, 只要把那条无关 Timer 也数进来, 前提就翻了。
+    #    这正是自证不能拿全进程枚举当前提的理由 —— 别人的生命周期会替我们做判断。
+    (ok if _noise_done.is_set() and not _noise.is_alive() else
+     bad)("21j C 前提: 无关 Timer 确实活过 A/B 两个窗口并在 B 的后像之前退出(done=%s alive=%s)"
+          % (_noise_done.is_set(), _noise.is_alive()))
+    (ok if _b_wide_before != _b_wide_after else
+     bad)("21j C 把无关 Timer 也数进来, 同一场景的前提就从「相等」翻成「不等」"
+          "(宽计数 前 %d → 后 %d; 受控计数 前 %d → 后 %d)"
+          % (_b_wide_before, _b_wide_after, _b_before, _b_after))
+    (ok if _a_wide_before != _a_wide_after else
+     bad)("21j C A 场景在宽计数下同样不等(前 %d → 后 %d) —— 它分不出是谁的 Timer"
+          % (_a_wide_before, _a_wide_after))
+finally:
+    # 记录完了再收拾, 且只收拾自己造的那几个 —— 清理不能跑到判定前面去。
+    # 放 finally 里: 上面任何一条抛了, 本格造的 Timer 也得按对象收干净。
+    for _g in _a_mine:
+        _g.cancel()
+        if _g.timer is not None:
+            _g.timer.join(3)
+    if _b_leak is not None:
+        _b_leak.cancel()
+        if _b_leak.timer is not None:
+            _b_leak.timer.join(3)
+    _noise_rel.set()
+    _noise.join(3)
+_leftover = [g for g in _a_mine + ([_b_leak] if _b_leak is not None else [])
+             if g.timer is not None and g.timer.is_alive()]
+(ok if not _leftover and not _noise.is_alive() else
+ bad)("21j 收尾: 本格自造的 Timer 都已按对象清理(仍活着 %d 个, noise=%s)"
+      % (len(_leftover), _noise.is_alive()))
 # 21g 已验证过的行为不能被这次修复破坏
 _rb_reset("fast")
 _t0 = time.monotonic()
