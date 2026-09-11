@@ -1,173 +1,82 @@
 #!/usr/bin/env python3
-"""MITM 自签 CA + 叶子证书管理(Feature B / iOS 专属)。
+"""退役后的 CA 兼容读取(WLOC 已退役, 本模块只剩「看一眼旧现场」这一个用途)。
 
-用 openssl(项目已依赖)签发, EC P-256。根 CA 私钥留在网关(600);公钥 CA 证书
-下发到 iOS 设备信任, MITM 服务用它给接管域名现签叶子证书终止 TLS。
+WLOC 位置改写及其专属 MITM 执行能力已退役: 不再签发根 CA、不再现签叶子证书、不再有
+服务消费它们。留下这个模块只为两件**只读**的事:
 
-⚠️ 信任提示: 设备一旦信任这张 CA, 它理论上能解密该设备所有 HTTPS。系统只对
-声明的接管域名实际 MITM, 但能力是广的 —— 由 bot/描述文件向用户显著告知。
+  · 退役迁移要判断这台机器上有没有过旧 CA —— 有才需要按保留策略搬走并记档;
+  · 旧备份 / 旧描述文件的校验要拿到旧 CA 的指纹, 才能判断"这份旧产物里嵌的是不是它"。
 
-iOS 叶子证书约束(iOS 13+): 必须带 SAN、extendedKeyUsage=serverAuth、有效期 ≤ 825 天。
+**这里不写任何东西。** 旧实现是反的: `ca_cert_pem()` 走 `ensure_ca()`, 而 ensure_ca 会
+建目录(0700)、建 .ca.lock 并 flock、没有就用 openssl **生成一张根 CA**。于是"问一句有没有"
+变成了"没有就给你造一张" —— 在退役语境下尤其坏: 迁移跑一遍、doctor 看一眼、旧备份校验
+一次, 每次都可能在一台本该退役干净的机器上重新落下 CA 私钥。
+
+三档分明, 不许混:
+  absent   —— 确实没有。迁移据此判定"这台机器没开过 WLOC", 可以直接跳过搬迁。
+  present  —— 有, 连同 PEM 正文与 sha256 指纹一起给出。
+  damaged  —— 在, 但读不出或不是证书。**绝不能冒充 absent**: 冒充了就会被读成"没开过
+              WLOC", 于是迁移跳过、旧备份放行 —— 一条静默复活的路。
+
+签发面(ensure_ca / _gen_ca / leaf_cert / _sign_leaf / prewarm / ca_cert_pem)随退役一并
+移除。它们是"制造信任"的入口, 退役之后留着就是留了一条能把 CA 变回来的路。
 """
-import fcntl
+import hashlib
 import os
-import secrets
 import subprocess
-import tempfile
-import threading
 
 CA_DIR = "/etc/privdns-gateway/ca"          # 测试可覆盖
-
-# 并发签发:mitm_server 多线程(甚至多进程实例)会对同一域名同时现签。三重防护:
-#   1) 进程内 threading.Lock(按域名 / CA 各一把)——同进程多线程串行;
-#   2) 跨进程 flock(锁文件)——多进程/多实例串行;
-#   3) 加锁后双/三重检查缓存——先到者签好, 后到者直接命中同一对 crt/key。
-# 另: 叶子用随机序列号(-set_serial)代替 -CAcreateserial, 免去共享 ca.srl 文件的读改写竞态
-#     (旧实现首个并发即因 ca.srl / 共享 .tmp 抢占抛 FileNotFoundError)。
-_ca_lock = threading.Lock()
-_leaf_locks_guard = threading.Lock()
-_leaf_locks = {}
 
 
 def _p(name):
     return os.path.join(CA_DIR, name)
 
 
-def _run(cmd):
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+def _pem_to_der(pem_text):
+    """用 openssl 把 PEM 转 DER —— 指纹要按证书的 DER 算, 不是按文件字节算。
+
+    文件里可能有多余空行/CRLF/注释, 按文件字节算出来的"指纹"会因为无关编辑而变,
+    那种指纹拿去比对旧描述文件只会得出假的不一致。
+    """
+    r = subprocess.run(["openssl", "x509", "-outform", "DER"],
+                       input=pem_text.encode("utf-8"),
+                       capture_output=True, timeout=30)
+    if r.returncode != 0 or not r.stdout:
+        raise ValueError((r.stderr or b"").decode("utf-8", "replace").strip()[:120]
+                         or "openssl 不认这份 PEM")
+    return r.stdout
 
 
-def _leaf_lock(domain):
-    with _leaf_locks_guard:
-        lk = _leaf_locks.get(domain)
-        if lk is None:
-            lk = threading.Lock()
-            _leaf_locks[domain] = lk
-        return lk
+def ca_material_readonly():
+    """只读地看一眼旧 CA 现场。**不创建目录、不建锁、不生成、不缓存。**
 
+    返回 dict:
+      {"state": "absent"}
+      {"state": "present", "pem": <str>, "sha256": <str 64hex>, "path": <str>,
+       "has_key": <bool>}
+      {"state": "damaged", "reason": <str>, "path": <str>}
 
-def _rand_serial():
-    """随机正整数序列号(DER 正数, 非全零前缀), 免共享序列号文件的并发竞态。"""
-    b = bytearray(secrets.token_bytes(16))
-    b[0] = (b[0] & 0x7F) | 0x40        # 清最高位→正数; 置次高位→非零且够大
-    return "0x" + b.hex()
-
-
-def _gen_ca(ca_crt, ca_key):
-    """实际生成根 CA(调用方已持锁 + 已确认不存在)。唯一临时名 + 原子替换。"""
-    kt = ca_key + "." + secrets.token_hex(4) + ".tmp"
-    ct = ca_crt + "." + secrets.token_hex(4) + ".tmp"
+    has_key 单独给出来: 证书在而私钥也在, 说明这台机器上还留着签发能力的原料,
+    退役迁移要按保留策略把它搬走并记档(而不是当作"只有一张公钥证书"轻轻放过)。
+    """
+    crt = _p("ca.crt")
+    if not os.path.exists(crt):
+        # 只问存在性, 不 makedirs、不 touch。父目录不存在也照样是 absent。
+        return {"state": "absent"}
     try:
-        r = _run(["openssl", "ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", kt])
-        if r.returncode != 0:
-            raise RuntimeError("CA key 生成失败: " + r.stderr[-200:])
-        os.chmod(kt, 0o600)
-        r = _run(["openssl", "req", "-x509", "-new", "-key", kt, "-sha256", "-days", "3650",
-                  "-out", ct, "-subj", "/CN=PrivDNS Gateway MITM CA",
-                  "-addext", "basicConstraints=critical,CA:TRUE,pathlen:0",
-                  "-addext", "keyUsage=critical,keyCertSign,cRLSign"])
-        if r.returncode != 0:
-            raise RuntimeError("CA 证书生成失败: " + r.stderr[-200:])
-        os.replace(kt, ca_key)
-        os.replace(ct, ca_crt)
-        os.chmod(ca_crt, 0o644)
-    finally:
-        for t in (kt, ct):
-            try:
-                os.remove(t)
-            except OSError:
-                pass
-
-
-def ensure_ca():
-    """生成根 CA(若不存在, 幂等 + 并发安全)。返回 CA 证书路径。"""
-    ca_crt, ca_key = _p("ca.crt"), _p("ca.key")
-    if os.path.isfile(ca_crt) and os.path.isfile(ca_key):    # 快路径: 已在, 无锁
-        return ca_crt
-    os.makedirs(CA_DIR, exist_ok=True)
-    os.chmod(CA_DIR, 0o700)
-    with _ca_lock:                                           # 进程内串行
-        if os.path.isfile(ca_crt) and os.path.isfile(ca_key):
-            return ca_crt
-        with open(_p(".ca.lock"), "w", encoding="utf-8") as lf:
-            fcntl.flock(lf, fcntl.LOCK_EX)                   # 跨进程串行
-            if os.path.isfile(ca_crt) and os.path.isfile(ca_key):
-                return ca_crt
-            _gen_ca(ca_crt, ca_key)
-    return ca_crt
-
-
-def _sign_leaf(domain, crt, key):
-    """实际现签叶子(调用方已持锁 + 已确认缓存未命中)。唯一临时(私有子目录)+ 原子替换。"""
-    ca_crt, ca_key = _p("ca.crt"), _p("ca.key")
-    leaf_dir = os.path.dirname(crt)
-    with tempfile.TemporaryDirectory(dir=leaf_dir) as td:   # 与目标同盘 → os.replace 原子
-        lkey = os.path.join(td, "leaf.key")
-        csr = os.path.join(td, "leaf.csr")
-        ext = os.path.join(td, "ext")
-        ctmp = os.path.join(td, "leaf.crt")
-        if _run(["openssl", "ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", lkey]).returncode != 0:
-            raise RuntimeError("叶子 key 生成失败")
-        if _run(["openssl", "req", "-new", "-key", lkey, "-subj", "/CN=" + domain, "-out", csr]).returncode != 0:
-            raise RuntimeError("叶子 CSR 生成失败")
-        with open(ext, "w", encoding="utf-8") as f:
-            f.write("subjectAltName=DNS:%s\nextendedKeyUsage=serverAuth\nbasicConstraints=CA:FALSE\n" % domain)
-        r = _run(["openssl", "x509", "-req", "-in", csr, "-CA", ca_crt, "-CAkey", ca_key,
-                  "-set_serial", _rand_serial(), "-days", "825", "-sha256", "-out", ctmp, "-extfile", ext])
-        if r.returncode != 0:
-            raise RuntimeError("叶子证书签发失败: " + r.stderr[-200:])
-        os.chmod(lkey, 0o600)
-        os.replace(lkey, key)          # 同盘原子; 先私钥后证书
-        os.replace(ctmp, crt)
-        os.chmod(crt, 0o644)
-
-
-def leaf_cert(domain):
-    """为 domain 现签(或取缓存)叶子证书。返回 (crt_path, key_path)。并发安全: 同域并发只签一份。"""
-    ensure_ca()
-    leaf_dir = _p("leaf")
-    os.makedirs(leaf_dir, exist_ok=True)
-    os.chmod(leaf_dir, 0o700)
-    safe = domain.replace("*", "_wild_").replace("/", "_")
-    crt = os.path.join(leaf_dir, safe + ".crt")
-    key = os.path.join(leaf_dir, safe + ".key")
-    if os.path.isfile(crt) and os.path.isfile(key):          # 快路径: 命中即走
-        return crt, key
-    with _leaf_lock(domain):                                 # 进程内: 同域串行
-        if os.path.isfile(crt) and os.path.isfile(key):
-            return crt, key
-        with open(os.path.join(leaf_dir, "." + safe + ".lock"), "w", encoding="utf-8") as lf:
-            fcntl.flock(lf, fcntl.LOCK_EX)                   # 跨进程: 同域串行
-            if os.path.isfile(crt) and os.path.isfile(key):  # 别的进程可能刚签好
-                return crt, key
-            _sign_leaf(domain, crt, key)
-    return crt, key
-
-
-def prewarm(domains, strict=False):
-    """预签一组域名叶子证书(WLOC 开启时调用, 免首个 TLS 连接现签的并发抖动)。
-    默认尽力而为: 单域失败不影响其它, 返回成功签发/命中的域名数(保持既有调用方语义不变)。
-    strict=True(事务化调用): 任一域签发失败立即向上抛, 不吞异常 —— 由调用方整体回滚,
-    避免"叶子证书没签出来却把 WLOC 标成已启用"。"""
-    n = 0
-    for d in domains or []:
-        try:
-            leaf_cert(d)
-            n += 1
-        except Exception:  # noqa: BLE001
-            if strict:
-                raise
-    return n
-
-
-def ca_cert_pem():
-    """返回根 CA 证书 PEM 文本(供下发到 iOS 描述文件)。"""
-    return open(ensure_ca(), encoding="utf-8").read()
-
-
-if __name__ == "__main__":
-    import sys
-    if len(sys.argv) > 1 and sys.argv[1] == "leaf" and len(sys.argv) > 2:
-        c, k = leaf_cert(sys.argv[2]); print(c, k)
-    else:
-        print(ensure_ca())
+        pem = open(crt, encoding="utf-8").read()
+    except OSError as e:
+        return {"state": "damaged", "path": crt,
+                "reason": "读不出 %s(%s)" % (crt, type(e).__name__)}
+    except UnicodeDecodeError:
+        return {"state": "damaged", "path": crt, "reason": "%s 不是文本 PEM" % crt}
+    if "BEGIN CERTIFICATE" not in pem:
+        return {"state": "damaged", "path": crt, "reason": "%s 里没有证书块" % crt}
+    try:
+        der = _pem_to_der(pem)
+    except Exception as e:  # noqa: BLE001
+        return {"state": "damaged", "path": crt,
+                "reason": "%s 解析不出证书(%s)" % (crt, e)}
+    return {"state": "present", "path": crt, "pem": pem,
+            "sha256": hashlib.sha256(der).hexdigest(),
+            "has_key": os.path.exists(_p("ca.key"))}
