@@ -118,7 +118,6 @@ _STATIC = {
     "adblock_sources": ("/etc/privdns-gateway/adblock-sources.txt", 0o644, False,
                         ("adblock_sources",)),
     "nftables_conf":  ("/etc/nftables.conf", 0o644, False, ("nft_check",)),
-    "mitm_json":      ("/etc/privdns-gateway/mitm.json", 0o600, False, ("json_any",)),
     # iOS 描述文件的身份与修订记录。它是**用户持久数据**: 丢了会在下次生成时造出第二个身份,
     # 用户手机上那份描述文件从此再也无法被更新, 而界面上什么都不会报错。所以它必须能跟着
     # 备份/快照一起恢复 —— 恢复走事务, 事务只认白名单里的目标, 于是这一行是必需的。
@@ -132,7 +131,6 @@ _STATIC = {
                              0o644, False, ("mobileconfig",)),
     "ios_profile_previous": ("/var/lib/privdns-gateway/ios-profile/previous.mobileconfig",
                              0o644, False, ("mobileconfig",)),
-    "mitm_hijack":    ("/etc/mosdns/rules/mitm_hijack.txt", 0o644, False, ("mosdns_lines",)),
     "sysctl_tfo":     ("/etc/sysctl.d/99-pdg-tfo.conf", 0o644, False, ("kv_env",)),
     "dot_marker":     ("/opt/pdg-bot/dot-domain", 0o644, False, ("hostname_line",)),
     "cert_fullchain": ("/etc/mosdns/certs/fullchain.pem", 0o644, False, ("pem_cert",)),
@@ -152,16 +150,19 @@ _UNIT_RE = re.compile(r"^[A-Za-z0-9_.@-]+\.(service|timer)$")
 # 目标 → 该目标牵动哪个服务(决定基线范围、观察范围)
 _TARGET_SVC = {
     "model": "mihomo", "mihomo_cfg": "mihomo", "rs_meta": "mihomo",
-    "mosdns_conf": "mosdns", "mitm_hijack": "mosdns",
+    "mosdns_conf": "mosdns",
     "cert_fullchain": "mosdns", "cert_privkey": "mosdns",
-    "mitm_json": "pdg-mitm",
 }
 
-_SERVICE_UNITS = ("mosdns", "mihomo", "pdg-mitm", "pdg-bot", "pdg-probe81")
-# 只有 pdg-mitm 需要"目标态": WLOC 开 = 让它跑起来(操作前通常没在跑), 关 = 让它停下。
-# 不给 mosdns/mihomo 开 start/stop —— 那两个在本项目里永远应该是 active, 给它们加"停"
-# 这种能力只会让某天写错的事务把 DNS 停掉。
-_STATE_UNITS = ("pdg-mitm",)
+_SERVICE_UNITS = ("mosdns", "mihomo", "pdg-bot", "pdg-probe81")
+# "目标态"(start/stop)这一格现在是空的。曾经只有 pdg-mitm 用它: WLOC 开 = 让它跑起来
+# (操作前通常没在跑), 关 = 让它停下。WLOC 位置改写连同它专属的 MITM 执行能力已退役, 那个
+# 服务不再存在, 于是这里也不该再有它 —— 事务能对一个服务发 start/stop, 就是一条把它接回来
+# 的路。空元组保留而不是删掉这层: 判空的分支还在, 将来真有需要目标态的服务时不必重新发明。
+#
+# 依旧**不给** mosdns/mihomo 开 start/stop —— 那两个在本项目里永远应该是 active, 给它们
+# 加"停"这种能力只会让某天写错的事务把 DNS 停掉。
+_STATE_UNITS = ()
 _ACTIONS = tuple(["restart:" + u for u in _SERVICE_UNITS] +
                  ["start:" + u for u in _STATE_UNITS] +
                  ["stop:" + u for u in _STATE_UNITS] +
@@ -176,14 +177,13 @@ _ACTIONS = tuple(["restart:" + u for u in _SERVICE_UNITS] +
 # 判据按真实依赖, 不按名字猜:
 #   · rs_meta 是 bot 的标签/计数元数据, 内核读的是 ruleset:* 里的**内容** → 自己不触发重启;
 #   · profile_env / dot_marker 是持久化意图与续期提示, 不被运行中的服务直接读 → 无动作;
-#   · 证书与 mitm_hijack 由 mosdns 读(DoT 与劫持表) → mosdns;
+#   · 证书由 mosdns 读(DoT) → mosdns;
 #   · nftables_conf 只需要重新应用防火墙, 不该顺手重启 mihomo/mosdns;
 #   · unit:* 改的是 systemd 单元文件 → daemon-reload。
 _TARGET_ACTIONS = {
     "model": ("restart:mihomo",),
     "mihomo_cfg": ("restart:mihomo",),
     "mosdns_conf": ("restart:mosdns",),
-    "mitm_hijack": ("restart:mosdns",),
     "cert_fullchain": ("restart:mosdns",),
     "cert_privkey": ("restart:mosdns",),
     "nftables_conf": ("nft:apply",),
@@ -213,13 +213,14 @@ _TARGET_ACTIONS = {
 _PREFIX_ACTIONS = (("mosdns_rule:", ("restart:mosdns",)),
                    ("ruleset:", ("restart:mihomo",)),
                    ("unit:", ("daemon-reload",)))
-# 动作取决于"要开还是要关"、通用推导给不出答案的目标: 必须由调用方显式声明。
-# mitm_json 就是这一类 —— WLOC 打开时要 start:pdg-mitm, 关闭时要 stop:pdg-mitm, 光看文件
-# 本身推不出来。这里 fail-closed, 不许猜(猜错就是把用户刚关掉的 MITM 又拉起来)。
-EXPLICIT_ONLY = frozenset({"mitm_json"})
+# 动作取决于"要开还是要关"、通用推导给不出答案的目标: 必须由调用方显式声明, 这里 fail-closed。
+# 这份集合现在是空的 —— 唯一的成员曾是 mitm_json(WLOC 打开时要 start:pdg-mitm, 关闭时要
+# stop:pdg-mitm, 光看文件本身推不出来), 它随 WLOC 退役一起没了。**这层不跟着删**: 它是
+# "推不出动作就拒绝, 不许猜"的那道门, 下一个这类目标出现时该被它拦住, 而不是靠谁记得重写。
+EXPLICIT_ONLY = frozenset()
 # 固定执行顺序(可测试): 先把防火墙/内核参数落到位, 再 reload 单元, 最后重启服务(DNS 先于内核)。
 _ACTION_ORDER = ("nft:apply", "sysctl:apply", "daemon-reload",
-                 "restart:mosdns", "restart:mihomo", "restart:pdg-mitm")
+                 "restart:mosdns", "restart:mihomo")
 
 
 def actions_for_targets(names):
@@ -564,14 +565,12 @@ def health_snapshot(services, relax_units=()):
     """本次事务**范围内**的硬门指标。与公网无关 —— 出口探测那类属软门, 不在这里。
 
     relax_units: 本笔事务显式给了 start:/stop: 的 unit。它们的 active 与否由"期望终态"单独判
-    (见 Tx._observe), 不进这份快照 —— 否则"开启 WLOC"这种操作前 pdg-mitm 本来就没在跑的场景,
-    会在基线阶段被判成"操作前硬门就是坏的"而根本开不了事务。**只放宽这一个 unit 的 active 检查**,
+    (见 Tx._observe), 不进这份快照 —— 否则一笔"把某个本来没在跑的服务拉起来"的事务, 会在基线
+    阶段被判成"操作前硬门就是坏的"而根本开不了。**只放宽点名的那些 unit 的 active 检查**,
     DNS / DoT / redir 端口以及其它服务一条都不放宽。"""
     h = {}
     for u in sorted(set(services)):
         if u in relax_units:
-            continue
-        if u == "pdg-mitm" and not _svc_prop(u, "LoadState") == "loaded":
             continue
         h["svc:" + u] = _svc_active(u)
     if "mosdns" in services:
@@ -861,7 +860,7 @@ def _v_mosdns_probe(path, data, ctx):
                     if os.path.isfile(src):
                         os.symlink(src, os.path.join(probe_rules, leaf))
             for name, t in sorted(getattr(ctx, "targets", {}).items() if ctx else []):
-                if not (name.startswith("mosdns_rule:") or name == "mitm_hijack"):
+                if not name.startswith("mosdns_rule:"):
                     continue
                 leaf = os.path.basename(t["path"])
                 dst = os.path.join(probe_rules, leaf)
@@ -1149,7 +1148,7 @@ class Tx:
     def watch(self, target, optional=False):
         """登记一个**只读依赖**: 候选是根据它算出来的, 但本次不打算改它。返回它当前的 bytes(或 None)。
 
-        典型场景: mihomo 配置由 model + rs_meta 渲染, 而本次只改 mitm.json —— model/rs_meta
+        典型场景: mihomo 配置由 model + rs_meta 渲染, 而本次只改 nftables.conf —— model/rs_meta
         不该被"假装 stage 一遍再原样写回"(那会凭空产生一次写入、一份 before-image 和一次
         服务牵连)。watch 只记 sha, 在拿到全局锁、动生产文件之前再核对一次: 变了就
         PRECONDITION_FAILED, 生产文件一个字节都不动。
@@ -1276,7 +1275,7 @@ class Tx:
 
     def __exit__(self, et, ev, tb):
         # abort_unstarted 自身已是严格 no-throw; 这层 try 是"两条路径语义一致"的保险 ——
-        # finally 里直接调它的那些生产入口(tx_apply / _mitm_transact / …)也同样不会被它影响。
+        # finally 里直接调它的那些生产入口(tx_apply / restore_managed / …)也同样不会被它影响。
         try:
             self.abort_unstarted("候选阶段异常: %s" % et.__name__ if et is not None
                                  else "调用方在候选阶段返回")
@@ -1540,7 +1539,7 @@ class Tx:
 
         两类判据要分开:
           · **显式动作**(restart/start/stop)的 unit → 硬门: 本次事务点名要它变成什么样, 没做到
-            就是失败, 不因 repair 放宽(否则"启动 pdg-mitm 失败"也能提交成功);
+            就是失败, 不因 repair 放宽(否则"启动某个服务失败"也能提交成功);
           · 其余硬门(未点名动作的 unit、DNS、DoT、redir 端口)→ 判据是"不得比操作前更差":
             操作前坏、操作后仍坏 = 记 warning 后放行(这才是 repair 的用处);
             **操作前好、操作后坏 = 一律回滚, normal 与 repair 都一样**。

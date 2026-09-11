@@ -30,8 +30,6 @@ MIHOMO_CFG = MIHOMO_DIR + "/config.yaml"
 MIHOMO_BIN = "mihomo"
 import mihomorender                              # 渲染链的共享实现(救援/恢复也用同一份)
 MIHOMO_REDIR = mihomorender.MIHOMO_REDIR
-MITM_PORT = mihomorender.MITM_PORT                # MITM 服务(socks5)监听; mihomo 把接管域名路由到这
-MITM_HIJACK_FILE = "/etc/mosdns/rules/mitm_hijack.txt"   # 接管域名(mosdns 强制劫持集, 与 mihomo 路由同源)
 # 内网面板表(方案 B)。渲染 mihomo 配置时要据它把面板域名指到本机反代 ——
 # 与反代配置、出站白名单同一个真源。
 LAN_TABLE_FILE = "/etc/privdns-gateway/lan-panels.json"
@@ -399,8 +397,20 @@ OPS_BACK = {"inline_keyboard": [[{"text": "⬅️ 返回运维", "callback_data"
                                [{"text": "🏠 主菜单", "callback_data": "menu"}]]}
 DNS_BACK = {"inline_keyboard": [[{"text": "⬅️ 返回 DNS 上游", "callback_data": "dnsup"}],
                                [{"text": "🏠 主菜单", "callback_data": "menu"}]]}
-WLOC_BACK = {"inline_keyboard": [[{"text": "⬅️ 返回 WLOC", "callback_data": "wloc:menu"}],
-                                [{"text": "🏠 主菜单", "callback_data": "menu"}]]}
+# 旧 TG 消息里的 WLOC 按钮点下去会看到这一段。TG 消息不会自己消失, 所以这条路必须一直在。
+# 文案要说清三件事, 缺一件用户就得来问: 功能没了、他手机上那份描述文件要怎么办、以及那张
+# 已经被他手动信任过的根证书该怎么处理 —— 最后一件尤其不能省: 网关这边退役并不会让手机上
+# 那张受信根证书消失, 而一张还被信任着、私钥又不知所踪的根证书, 是留给用户的真实风险。
+WLOC_RETIRED_TEXT = (
+    "🍏 <b>位置改写(WLOC)已退役</b>\n\n"
+    "这个功能连同它专属的 MITM 执行能力已经从网关移除: 不再改写 Apple 网络定位响应, "
+    "不再签发或下发根证书, 相关服务与流量接管也已撤除。\n\n"
+    "<b>你这边要做两件事:</b>\n"
+    "① 到「📱 客户端」<b>重新生成并安装 iOS 描述文件</b> —— 新的那份不含根证书。\n"
+    "② 到 iPhone「设置 → 通用 → 关于本机 → 证书信任设置」，<b>关掉对 "
+    "PrivDNS Gateway MITM CA 的信任</b>；再到「设置 → 通用 → VPN 与设备管理」把旧的描述"
+    "文件删掉。网关退役不会自动取消手机上已经给出的信任。\n\n"
+    "定位相关的其它功能不受影响，DNS、分流与代理照常。")
 
 def _back_rows(kb):
     return [row[:] for row in kb["inline_keyboard"]]
@@ -447,8 +457,6 @@ def _nav(key):
             [{"text": "🌐 DNS 上游", "callback_data": "dnsup"}, {"text": "🚀 TFO", "callback_data": "tfo"}],
             [{"text": "📊 观测面板", "callback_data": "panel"}]]),
     }
-    if _platform() == "ios":                          # iOS 专属: 位置改写(WLOC)
-        subs["ops"][1].append([{"text": "🍏 位置改写(WLOC)", "callback_data": "wloc"}])
     if os.path.exists(LAN_TABLE_FILE):                # 配过内网面板才显示(没配的人不该多一个看不懂的按钮)
         subs["ops"][1].append([{"text": "🏠 内网面板", "callback_data": "nav:lan"}])
     title, rows = subs[key]
@@ -701,556 +709,15 @@ def _mihomo_rulesets(meta=None):
         return {}
     return mihomorender.rulesets_arg(meta)
 
-def _mitm_domains():
-    """接管域名列表(仅 iOS 平台且有插件启用时非空)。路径用 **bot 自己的 MITM_HIJACK_FILE**
-    (测试 monkeypatch 的是它), 解析走共享实现。"""
-    return mihomorender.read_mitm_domains(MITM_HIJACK_FILE, _platform())
-
-# ── MITM 插件(Feature B / iOS): WLOC 位置改写 ──
-MITM_CONFIG = "/etc/privdns-gateway/mitm.json"
-MITM_PLUGIN_DOMAINS = {"wloc": ["gs-loc.apple.com", "gs-loc-cn.apple.com"]}   # 插件 → 接管域名(与 mitm_server.PLUGIN_DOMAINS 同源)
-
-
-def _mitm_config():
-    try:
-        return json.load(open(MITM_CONFIG))
-    except OSError:
-        return {}
-
-def _save_mitm_config(cfg):
-    os.makedirs(os.path.dirname(MITM_CONFIG), exist_ok=True)
-    t = MITM_CONFIG + ".tmp"
-    with open(t, "w") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
-    os.chmod(t, 0o600)
-    os.replace(t, MITM_CONFIG)
-
-def _mitm_enabled_domains():
-    # 平台门控最终入口: 非 iOS 一律视为无接管域名 —— 即便 Android 上有残留 mitm.json,
-    # 也不会推导出任何接管域名(渲染器/劫持写入/pdg-mitm 都据此判空, 不动核心 MITM 路由)。
-    if _platform() != "ios":
-        return []
-    cfg = _mitm_config()
-    doms = []
-    for name, dl in MITM_PLUGIN_DOMAINS.items():
-        if (cfg.get(name) or {}).get("enabled"):
-            doms += dl
-    return doms
-
-def _mitm_ca_pem():
-    try:
-        import mitm_ca
-        return mitm_ca.ca_cert_pem()
-    except Exception:  # noqa: BLE001
-        return ""
-
-def _mitm_hijack_bytes(domains):
-    """接管域名 → mosdns 强制劫持集的文件内容(纯函数, 供事务派生用)。"""
-    return "".join("domain:" + d + "\n" for d in domains).encode("utf-8")
-
-
-def _mitm_domains_from(mitm_json_bytes):
-    """从**候选** mitm.json 推导接管域名(不读生产文件)。非 iOS 一律为空。"""
-    if _platform() != "ios":
-        return []
-    try:
-        cfg = json.loads((mitm_json_bytes or b"{}").decode("utf-8"))
-    except Exception:  # noqa: BLE001
-        return []
-    doms = []
-    for name, dl in MITM_PLUGIN_DOMAINS.items():
-        if isinstance(cfg, dict) and (cfg.get(name) or {}).get("enabled"):
-            doms += dl
-    return doms
-
-
-def _mitm_json_bytes(cur, w):
-    """把 WLOC 目标态并进现有 mitm.json, 返回候选字节(纯函数, 不落盘)。
-
-    只改 wloc 这一段 —— 别的插件段(以后有)原样保留, 这与 _wloc_save 的语义一致。"""
-    try:
-        cfg = json.loads((cur or b"{}").decode("utf-8"))
-        if not isinstance(cfg, dict):
-            cfg = {}
-    except Exception:  # noqa: BLE001
-        cfg = {}
-    cfg["wloc"] = _wloc_doc(w)
-    return (json.dumps(cfg, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
-
-
-def _mitm_transact(new_wloc):
-    """落地 WLOC/MITM 目标态 —— **一笔 pdgtx 事务**: mitm.json + mitm_hijack + mihomo 配置
-    一起校验、一起落盘, 服务动作与观察期、回滚、崩溃恢复全交给事务核心。
-
-    new_wloc 可以是算好的目标态(dict), 也可以是 mutate(w) —— 后者用于开/关 WLOC 这类
-    "要先看当前状态再决定目标"的操作: 目标态基于 read_for_update 读到的那一份算, 并把它的 sha
-    当前置条件, 中途被别人改掉就 PRECONDITION_FAILED 而不是把过期状态写回去。
-    mutate 里 raise _WlocAbort(msg) = 现场一动未动地放弃。
-
-    CA 与叶子证书预签属于**缓存准备**: 在 stage 之前做完, 失败就直接返回, 这时生产配置一个字节
-    都还没动; 失败事务残留的证书不被任何配置引用(enabled 没落盘), 下次开启命中缓存而已。
-
-    动作顺序固定 —— 开启: 落盘 → restart:mihomo → restart:mosdns → start:pdg-mitm;
-    关闭: 落盘 → stop:pdg-mitm → restart:mihomo → restart:mosdns。返回 (ok, msg)。"""
-    if _platform() != "ios":         # 平台硬门控: Android 连事务都不开(不生成 CA / 不写任何文件)
-        return False, "MITM/WLOC 仅 iOS 平台可用。"
-    tx = _pdgtx()
-    try:
-        t = tx.Tx(source="bot", op="wloc_apply")
-    except Exception as e:  # noqa: BLE001
-        return False, "无法开始配置事务(%s)" % type(e).__name__
-    try:
-        cur, sha = t.read_for_update("mitm_json")
-        if callable(new_wloc):
-            w = _wloc_state_from(cur)
-            try:
-                new_wloc(w)
-            except _WlocAbort as e:
-                return False, str(e)                                 # 还没动任何东西
-        else:
-            w = new_wloc
-        cand_mitm = _mitm_json_bytes(cur, w)
-        doms = _mitm_domains_from(cand_mitm)
-        if doms:                                                     # 缓存准备: 事务之外, 失败零改动
-            try:
-                import mitm_ca
-                mitm_ca.ensure_ca()
-                warmed = mitm_ca.prewarm(doms, strict=True)          # 严格预签: 少一张就抛
-            except Exception as e:  # noqa: BLE001
-                return False, "MITM 根 CA 生成失败(%s), 未改动任何配置。" % type(e).__name__
-            if warmed != len(doms):
-                return False, ("MITM 叶子证书预签不完整(%d/%d), 未改动任何配置。"
-                               % (warmed, len(doms)))
-        # 内核配置由 model + rs_meta + **候选**接管域名渲染。model/rs_meta 本次不改 → 只 watch:
-        # 它们变了说明候选已过期, 提交前就该拒, 而不是把按旧 model 渲染的配置写下去。
-        model_raw = t.watch("model")
-        meta_raw = t.watch("rs_meta", optional=True)
-        model = json.loads((model_raw or b"{}").decode("utf-8"))
-        rs_meta = json.loads(meta_raw.decode("utf-8")) if meta_raw else None
-        t.stage("mitm_json", cand_mitm, expect=sha)
-        t.derive("mitm_hijack", lambda c: _mitm_hijack_bytes(_mitm_domains_from(c["mitm_json"])))
-        t.derive("mihomo_cfg", lambda c: _render_mihomo_bytes(
-            model, rs_meta, mitm_domains=_mitm_domains_from(c["mitm_json"]))[0])
-        if doms:
-            t.service("restart:mihomo"); t.service("restart:mosdns"); t.service("start:pdg-mitm")
-        else:
-            t.service("stop:pdg-mitm"); t.service("restart:mihomo"); t.service("restart:mosdns")
-        res = t.commit()
-    except tx.TxBusy:
-        return False, BUSY_MSG
-    except tx.TxRefused as e:
-        return False, tx.redact(str(e))
-    except tx.TxError as e:
-        return False, "配置事务内部错误: %s" % tx.redact(str(e))
-    except Exception as e:  # noqa: BLE001
-        return False, "MITM 应用异常(%s)" % type(e).__name__
-    finally:
-        # 候选阶段 return / 抛异常时把这笔事务收尾成 ABORTED 并删掉候选材料 ——
-        # 否则会留下 PREPARING 目录, 里面的候选 model 还带着出口凭据。已进入
-        # APPLYING/OBSERVING 的不受影响(那是现网被动过的证据, 必须留给 recover)。
-        t.abort_unstarted()
-    if res["state"] == tx.COMMITTED:
-        return True, ""
-    if res["state"] == tx.ROLLBACK_FAILED:
-        return False, ("应用失败(%s)\n⚠️ 回滚未完成: %s\n事务材料已保留, 请运行 "
-                       "<code>sudo pdg tx recover %s</code>"
-                       % (res.get("error", ""), "、".join(res.get("rollback_failed_items") or []),
-                          res["txid"]))
-    return False, "应用失败(%s), 已回滚到操作前。" % res.get("error", "")
-
-def _wloc_state():
-    """归一化 WLOC 配置(迁移老单坐标格式)→ {enabled, accuracy, active, generation, locations:[…]}。"""
-    return _wloc_state_from_cfg(_mitm_config())
-
-
-def _wloc_state_from(mitm_json_bytes):
-    """同 _wloc_state, 但基于**给定的 mitm.json 字节**(事务候选阶段用: 读到的那一份才算数)。"""
-    try:
-        cfg = json.loads((mitm_json_bytes or b"{}").decode("utf-8"))
-        if not isinstance(cfg, dict):
-            cfg = {}
-    except Exception:  # noqa: BLE001
-        cfg = {}
-    return _wloc_state_from_cfg(cfg)
-
-
-def _wloc_state_from_cfg(cfg):
-    w = dict((cfg or {}).get("wloc") or {})
-    locs = w.get("locations")
-    if locs is None:                              # 迁移老格式 {lat,lon} → 一个"默认"地点
-        locs = [{"name": "默认", "lat": w["lat"], "lon": w["lon"]}] if "lat" in w and "lon" in w else []
-    w["locations"] = locs
-    w.setdefault("accuracy", 50)
-    w.setdefault("enabled", False)
-    try:
-        w["generation"] = int(w.get("generation") or 0)
-    except (TypeError, ValueError):
-        w["generation"] = 0
-    if w.get("active") not in [l["name"] for l in locs]:
-        w["active"] = locs[0]["name"] if locs else None
-    return w
-
-def _wloc_active(w=None):
-    w = w or _wloc_state()
-    for l in w.get("locations", []):
-        if l["name"] == w.get("active"):
-            return l
-    return None
-
-def _wloc_doc(w):
-    """WLOC 目标态 → 写进 mitm.json 的那一段(纯函数, 事务候选与热路径共用同一份形态)。"""
-    return {"enabled": bool(w.get("enabled")), "accuracy": w.get("accuracy", 50),
-            "active": w.get("active"), "generation": int(w.get("generation") or 0),
-            "locations": w.get("locations", [])}
-
-
-def _wloc_save(w):
-    cfg = _mitm_config()
-    cfg["wloc"] = _wloc_doc(w)
-    _save_mitm_config(cfg)
-
-class _WlocAbort(Exception):
-    """目标态还没落地就发现不该做(如没有可用地点)→ 带着给用户的话原样返回, 不动任何东西。"""
-
-def _wloc_edit_locked(mutate):
-    """在配置锁内读-改-写 mitm.json(内部 os.replace, 不留半个 JSON)。
-
-    读取、存在性判断、选目标、改 generation 全在这把锁里做完 —— 锁外判断、锁内使用就是
-    TOCTOU: 两个人同时点删除/切换时, 后一个会拿着已经过期的状态覆盖前一个的结果。
-    mutate 返回 False 表示"什么都不用改", 不写盘。
-
-    切地点走这里而不是 _mitm_transact: 接管域名只由 enabled 决定, 换坐标既不影响 CA、也不
-    影响 hijack 表和内核路由, 而 pdg-mitm 会在下一次 WLOC 请求开始时读取当前 mitm.json —— 那一整套
-    (预热证书/重渲内核/重启 pdg-mitm/重启 mosdns)对"只换经纬度"是纯粹的浪费, 还会断一次
-    DNS。返回改后的 w; 锁忙返回 None。
-
-    **这是受控的 hot-path 例外, 不走 pdgtx**: 单文件、单次原子替换、零服务动作 —— 没有
-    "多组件半成功"可言(写失败 = 旧文件完好), 而完整事务的观察期光稳定性采样就够把 1 秒的
-    目标击穿。例外不等于不留痕: 成功/失败都在同一把锁内写一条脱敏审计(与事务同一份日志、
-    同一种格式), 只记代号与 generation 变化, 不记地点名、经纬度、chat id 之类。"""
-    with _cfg_guard() as got:
-        if not got:
-            return None
-        w = _wloc_state()
-        gen_before = int(w.get("generation") or 0)
-        if mutate(w) is False:
-            _wloc_hot_audit("wloc_hot_noop", "NOCHANGE", gen_before, gen_before)
-            return w
-        _wloc_save(w)
-        _wloc_hot_audit("wloc_hot_edit", "APPLIED", gen_before, int(w.get("generation") or 0))
-        return w
-
-
-def _wloc_hot_audit(op, result, gen_before, gen_after):
-    """给热路径写一条审计。**审计失败绝不能让已经成功的切换报失败** —— 坐标已经落盘了,
-    这时回一句"失败"会让用户以为没生效而反复重试。只把脱敏后的异常类型记进日志。"""
-    try:
-        _pdgtx().audit_event("bot", op, result,
-                             extra={"generation_before": gen_before, "generation_after": gen_after,
-                                    "generation_changed": gen_after != gen_before})
-    except Exception as e:  # noqa: BLE001
-        print("[wloc] 审计写入失败(%s), 切换本身已生效" % type(e).__name__, file=sys.stderr)
-
-def _wloc_bump(w):
-    """generation +1 —— bot 靠它认出"这次 WLOC 命中对应的是我刚才那次切换"。"""
-    w["generation"] = int(w.get("generation") or 0) + 1
-
-def wloc_add_gen(name, lat, lon):
-    """加/改一个命名地点。返回 (ok, msg, generation) —— generation>0 表示这次相当于一次热切换。
-
-    三种语义分清楚(以前含糊: 改当前地点会被 pdg-mitm 立刻热加载, 但 generation 不变, bot 还
-    让用户再去列表点一次 —— 点了个寂寞):
-      · 新增的不是当前目标 → 只保存, 不切换、不动 generation;
-      · 改的就是当前目标且 WLOC 开着 → 这就是一次热切换: generation +1, 直接进入命中监听;
-      · 改的是当前目标但 WLOC 没开 → 只保存, 明说开启后才生效。"""
-    if _platform() != "ios":
-        return False, "位置改写(WLOC)仅 iOS 平台可用。", 0
-    name = (name or "").strip()
-    if not name:
-        return False, "地点名不能为空", 0
-    st = {}
-    def _mut(w):
-        st["was_active"] = (w.get("active") == name)      # 判断也在锁内: 锁外判、锁内用就是 TOCTOU
-        st["first"] = not w.get("active")
-        w["locations"] = [l for l in w["locations"] if l["name"] != name]
-        w["locations"].append({"name": name, "lat": lat, "lon": lon})
-        if st["first"]:
-            w["active"] = name
-        st["hot"] = bool(w.get("enabled")) and (st["was_active"] or st["first"])
-        if st["hot"]:
-            _wloc_bump(w)
-        st["gen"] = int(w.get("generation") or 0)
-        st["enabled"] = bool(w.get("enabled"))
-    w = _wloc_edit_locked(_mut)
-    if w is None:
-        return False, busy_msg(), 0
-    if st["hot"]:
-        return True, (f"✅ 当前目标坐标已更新：<b>{name}</b>（{lat}, {lon}）\n"
-                      "网关目标地点已切换，网关服务无需重启，也不用再去列表里点一次。\n\n"
-                      "现在请关闭 iPhone 定位服务，等待 2 秒后重新开启。"), st["gen"]
-    if st["was_active"] or st["first"]:
-        return True, (f"✅ 已保存当前目标 <b>{name}</b>（{lat}, {lon}）\n"
-                      "WLOC 未开启，这个坐标还不会生效 —— 点「✅ 开启」后才会改写定位。"), 0
-    return True, (f"✅ 已添加地点 <b>{name}</b>（{lat}, {lon}）\n"
-                  "当前目标没变；要用它请到「📍 地点/切换」点它。"), 0
-
-def wloc_add(name, lat, lon):
-    """加/改地点(兼容 2 元组返回)。"""
-    ok, msg, _gen = wloc_add_gen(name, lat, lon)
-    return ok, msg
-
-def wloc_del(name):
-    """删地点。存在性判断/选下一个目标/generation 全在配置锁内做完(锁外判就是 TOCTOU)。"""
-    if _platform() != "ios":
-        return False, "位置改写(WLOC)仅 iOS 平台可用。"
-    st = {}
-    def _mut(w):
-        st["exists"] = any(l["name"] == name for l in w["locations"])
-        if not st["exists"]:
-            return False                              # 什么都不改, 也不写盘
-        st["was_active"] = (w.get("active") == name)
-        rest = [l for l in w["locations"] if l["name"] != name]
-        st["last_one"] = st["was_active"] and not rest
-        if st["last_one"] and w.get("enabled"):
-            # 删掉最后一个地点且 WLOC 开着: 接管域名要撤 → 必须走完整事务(它自己拿锁)。
-            # 这里只把目标态算出来, 不落盘。
-            st["needs_txn"] = True
-            return False
-        w["locations"] = rest
-        if st["was_active"]:
-            w["active"] = rest[0]["name"] if rest else None
-            if rest:
-                _wloc_bump(w)                        # 切到剩余地点 = 一次热切换
-            else:
-                w["enabled"] = False
-        st["next"] = w.get("active")
-    w = _wloc_edit_locked(_mut)
-    if w is None:
-        return False, busy_msg()
-    if not st.get("exists"):
-        return False, "没有这个地点"
-    if st.get("needs_txn"):
-        def _txn(ww):
-            if not any(l["name"] == name for l in ww["locations"]):
-                raise _WlocAbort("没有这个地点")     # 拿到锁时别人已经删掉了
-            ww["locations"] = [l for l in ww["locations"] if l["name"] != name]
-            ww["active"] = None
-            ww["enabled"] = False
-        ok, msg = _mitm_transact(_txn)               # 失败则不落新态, 回滚旧态
-        return (True, f"✅ 已删除 <b>{name}</b>（已无地点，WLOC 已关闭）") if ok else (False, msg)
-    if not st.get("was_active"):
-        return True, f"✅ 已删除 <b>{name}</b>"
-    if st.get("next"):
-        return True, f"✅ 已删除 <b>{name}</b>，当前目标切到 <b>{st['next']}</b>"
-    return True, f"✅ 已删除 <b>{name}</b>（已无地点）"
-
-def wloc_switch_gen(name):
-    """切换激活地点。返回 (ok, msg, generation)。
-
-    快路径: 只在配置锁内原子改 mitm.json 的 active + generation。不预热 CA、不写 hijack、
-    不重渲内核、不重启 mihomo/mosdns/pdg-mitm —— 那些只有"接管域名变了"(开/关 WLOC)才需要,
-    而 pdg-mitm 会在下一次 WLOC 请求开始时读取当前 mitm.json(无需重启服务)。
-    目标是这条路径 1 秒内完成。"""
-    if _platform() != "ios":
-        return False, "位置改写(WLOC)仅 iOS 平台可用。", 0
-    st = {}
-    def _mut(ww):
-        st["exists"] = any(l["name"] == name for l in ww["locations"])
-        if not st["exists"]:                          # 存在性也在锁内判: 别人刚删掉就不该切过去
-            return False
-        ww["active"] = name
-        _wloc_bump(ww)
-    w = _wloc_edit_locked(_mut)
-    if w is None:
-        return False, busy_msg(), 0
-    if not st.get("exists"):
-        return False, "没有这个地点", 0
-    loc = _wloc_active(w)
-    if not w.get("enabled"):
-        return True, (f"✅ 已选中 <b>{name}</b>（{loc['lat']}, {loc['lon']}）\n"
-                      "WLOC 未开启，这个地点还不会生效 —— 点「✅ 开启」后才会改写定位。"), w["generation"]
-    return True, (f"✅ 网关目标已切换：<b>{name}</b>（{loc['lat']}, {loc['lon']}）\n"
-                  "网关目标地点已切换，网关服务无需重启。\n\n"
-                  "现在请关闭 iPhone 定位服务，等待 2 秒后重新开启。"), w["generation"]
-
-def wloc_switch(name):
-    """切换激活地点(兼容 2 元组返回)。"""
-    ok, msg, _gen = wloc_switch_gen(name)
-    return ok, msg
-
-def wloc_enable(on):
-    """开/关 WLOC(开启需已有激活地点)。"""
-    if _platform() != "ios":
-        return False, "位置改写(WLOC)仅 iOS 平台可用。"
-    st = {}
-    def _txn(w):
-        if on and not _wloc_active(w):   # 判断在事务锁内做, 拿的就是当下的状态
-            raise _WlocAbort("请先「➕ 添加地点」设一个坐标再开启。")
-        w["enabled"] = bool(on)
-        if on:
-            _wloc_bump(w)                # 开启也是一次新目标 → 让 bot 能等这一代的命中
-        st["active"] = w.get("active")
-        st["loc"] = _wloc_active(w)
-        st["gen"] = int(w.get("generation") or 0)
-    ok, msg = _mitm_transact(_txn)       # 事务化: 失败则 enabled 不被持久化(回滚), 不留"返回失败却 enabled=true"
-    if not ok:
-        return False, msg
-    if on:
-        loc = st["loc"]
-        return True, (f"✅ 位置改写已开启：<b>{st['active']}</b>（{loc['lat']}, {loc['lon']}）\n\n"
-                      "首次开启后，请到「📱 客户端」重新生成并安装 iOS 描述文件，"
-                      "然后在「证书信任设置」中信任 PrivDNS Gateway MITM CA。\n\n"
-                      "然后关闭 iPhone 定位服务，等 2 秒再打开 —— 下一次 Apple 网络定位请求就会用新坐标。")
-    return True, "✅ 位置改写已关闭。"
-
-def wloc_add_reply(chat, name, lat, lon):
-    """加/改地点并回话。改的就是当前目标且 WLOC 开着 = 一次热切换 → 和点列表切换一样,
-    也进入命中监听(此前这条路径只会让用户"再去列表点一次", 点了其实也没有新意义)。"""
-    since = time.time()
-    ok, msg, gen = wloc_add_gen(name, lat, lon)
-    if ok and gen:
-        mid = send_tracked(chat, msg, WLOC_BACK)
-        if mid:
-            _wloc_watch_async(chat, mid, gen, name, kb=WLOC_BACK, since=since)
-            return
-    send_plain(chat, msg if ok else ("❌ " + msg))
-
-def wloc_generation():
-    """当前 WLOC 目标代号(bot 等命中用)。"""
-    return int(_wloc_state().get("generation") or 0)
-
-# ── 等一次真实的 WLOC 命中 ───────────────────────────────────────────────────
-# 网关能保证的只有"下一次 WLOC 请求会用新坐标"; 手机什么时候发那次请求、locationd 缓存要不要
-# 清, 都不归网关管。所以这里等的是**手机真的来过请求**这件事实, 措辞也只说到这一步 ——
-# 绝不把"网关改写了响应"说成"手机位置已经变了"。
-WLOC_STATUS_FILE = os.environ.get("PDG_WLOC_STATUS", "/run/privdns-gateway/wloc-status.json")
-# (chat, message_id) -> token: 那条消息当前归谁管。任何新回调都会换掉 token,
-# 于是还在等的旧监听立刻失效 —— 否则用户点了「返回菜单」, 30 秒后监听把菜单覆盖成一句
-# "尚未收到请求", 用户正看着的界面就没了。
-_wloc_watch_token: dict[tuple, str] = {}
-_wloc_watch_gen: dict[int, int] = {}             # chat -> 最近一次切换的 generation
-_wloc_watch_lock = threading.Lock()
-
-def wloc_invalidate_watch(chat, mid):
-    """让绑在这条消息上的监听失效(任何新回调都该调一次)。"""
-    with _wloc_watch_lock:
-        _wloc_watch_token.pop((chat, mid), None)
-
-def _wloc_read_status():
-    try:
-        with open(WLOC_STATUS_FILE, encoding="utf-8") as f:
-            d = json.load(f)
-        return d if isinstance(d, dict) else None
-    except Exception:  # noqa: BLE001            # 文件还没有 / 正在被替换 / 坏档 → 当作还没命中
-        return None
-
-def _wloc_status_hit(st, gen, target, since):
-    """这条状态算不算"我这次切换的命中"。
-
-    三项都要对得上: generation 相同、目标名相同、时间不早于本次切换开始 —— 只看 generation
-    的话, 上次运行留下的历史状态(/run 没清干净、或 generation 回绕)会被当成刚刚的命中,
-    用户还没开关定位服务就先看到"已收到新请求"。字段类型不对一律当作没命中, 不抛异常:
-    这是后台线程, 抛出去就是静默死掉, 该出现的超时提示也没了。"""
-    if not isinstance(st, dict):
-        return False
-    try:
-        if int(st.get("generation")) != int(gen):
-            return False
-        if str(st.get("target_name") or "") != str(target or ""):
-            return False
-        return float(st.get("received_at") or 0) >= float(since)
-    except (TypeError, ValueError):
-        return False
-
-def _wloc_hit_text(st, target):
-    """把一次命中翻译成给用户的话。区分三种结局, 不含糊。"""
-    if st.get("upstream_ok") and st.get("patched"):
-        return (f"✅ 已收到 iPhone 的新定位请求\n"
-                f"Apple 网络定位响应已改写为：<b>{target}</b>\n\n"
-                "若地图仍显示旧位置，属于 iOS 缓存或 GPS 覆盖。")
-    if not st.get("upstream_ok"):
-        return (f"❌ 收到了 iPhone 的新定位请求，但网关取 Apple 原始响应失败"
-                f"（{st.get('error_type') or '未知'}），本次未改写。\n"
-                "请检查网关到 Apple 的出网是否正常，稍后再试一次开关定位服务。")
-    return (f"⚠️ 收到了 iPhone 的新定位请求，Apple 响应也拿到了，但里面没有可改写的坐标字段"
-            f"（{st.get('error_type') or '未知'}），本次未改写。")
-
-WLOC_MISS_TEXT = ("⚠️ 网关目标已切换，但尚未收到 iPhone 的新 WLOC 请求。\n\n"
-                  "请检查：\n"
-                  "· 当前使用内网卡\n"
-                  "· 控制中心 Wi-Fi 已点灰\n"
-                  "· 网关 CA 已信任\n"
-                  "· iOS 定位缓存；iOS 26 必要时重启")
-
-def _wloc_watch_async(chat, mid, gen, target, timeout=30.0, interval=0.5, kb=None, since=None):
-    """后台等这一代 generation 的命中, 最多 timeout 秒, 然后原地编辑那条消息。
-
-    放后台执行器里跑 —— 主 getUpdates 循环一秒都不等它。不走 run_bg: 那会占住 per-chat BUSY,
-    等待期间用户连再切一次地点都做不了。
-
-    监听绑定 (chat, message_id, token): 用户对这条消息做**任何**新操作(再切一次、返回菜单、
-    关 WLOC、删地点)都会换掉 token, 旧监听立刻失效, 不会把用户正在看的界面覆盖掉。
-    since = 本次切换开始的时间, 用来把历史状态挡在外面。"""
-    token = uuid.uuid4().hex
-    key = (chat, mid)
-    start = time.time() if since is None else since
-    with _wloc_watch_lock:
-        _wloc_watch_token[key] = token
-        _wloc_watch_gen[chat] = gen
-    def superseded():
-        """两种作废: 这条消息被新回调接管了(别覆盖用户正看的界面), 或者用户已经切到了
-        更新的一代(旧目标的结果再报出来就是误导)。"""
-        with _wloc_watch_lock:
-            return (_wloc_watch_token.get(key) != token
-                    or _wloc_watch_gen.get(chat, gen) != gen)
-    def done():
-        """结束时把自己的 token 摘掉, 免得残留在表里。"""
-        with _wloc_watch_lock:
-            if _wloc_watch_token.get(key) == token:
-                _wloc_watch_token.pop(key, None)
-    def go():
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if superseded():
-                return
-            st = _wloc_read_status()
-            if _wloc_status_hit(st, gen, target, start):
-                if not superseded():
-                    edit_only(chat, mid, _wloc_hit_text(st, target), kb or WLOC_BACK)
-                    done()
-                return
-            time.sleep(interval)
-        if not superseded():
-            edit_only(chat, mid, WLOC_MISS_TEXT, kb or WLOC_BACK)
-            done()
-    try:
-        return _EXEC.submit(go)
-    except Exception:  # noqa: BLE001            # 执行器满/已关 → 不等了, 消息保持"已切换"即可
-        with _wloc_watch_lock:
-            _wloc_watch_token.pop(key, None)
-        return None
-
-def set_wloc(on, lat=None, lon=None):
-    """兼容旧接口: 给了 lat/lon 就存成「默认」地点并激活, 再开/关。"""
-    if _platform() != "ios":
-        return False, "位置改写(WLOC)仅 iOS 平台可用。"
-    if lat is not None and lon is not None:
-        wloc_add("默认", lat, lon)
-        wloc_switch("默认")
-    return wloc_enable(on)
-
-def _render_mihomo_bytes(model, rs_meta=None, mitm_domains=None):
+def _render_mihomo_bytes(model, rs_meta=None):
     """从给定 model 渲染出 mihomo 配置的**字节**(不落盘)。返回 (bytes, meta)。
 
     事务在候选阶段用它: 内核配置是 model 的派生物, 必须和 model 在同一笔事务里一起校验、
     一起落盘 —— 否则"model 写进去了、渲染失败"就会留下两份不一致的配置。
 
-    mitm_domains: 显式给出接管域名(WLOC 事务用**候选** mitm.json 推出来的那一份)。不给就读
-    生产的 mitm_hijack.txt —— 那是"这次不改 MITM"的路径才成立的默认值。
     渲染本体在 mihomorender(与恢复/救援共用); 这里只负责把 bot 当前的环境读好传进去。"""
     return mihomorender.render_bytes(
         model, rulesets=_mihomo_rulesets(rs_meta),
-        mitm_domains=_mitm_domains() if mitm_domains is None else mitm_domains,
         tls_ports=[443] if _platform() == "ios" else None,
         lan_domains=mihomorender.read_lan_domains(LAN_TABLE_FILE))
 
@@ -1263,8 +730,7 @@ def _render_mihomo_file():
     # iOS: 嗅探端口不含 GMS 5228-5230(iOS 走 APNs); Android 用默认(含 GMS)。两平台 canonical/内核均无 GMS 残留。
     tls_ports = [443] if _platform() == "ios" else None
     cfg, meta = sb2mihomo.singbox_to_mihomo(
-        model, redir_port=MIHOMO_REDIR, rulesets=_mihomo_rulesets(),
-        mitm_domains=_mitm_domains(), mitm_port=MITM_PORT, tls_ports=tls_ports,
+        model, redir_port=MIHOMO_REDIR, rulesets=_mihomo_rulesets(), tls_ports=tls_ports,
         # 这条路**直接调 sb2mihomo**, 不经 _render_mihomo_bytes —— 于是每加一个渲染入参
         # 都要在两处各写一遍。漏了一处的后果不是报错: 这条路渲染出来的配置会静默少掉那块
         # 能力(本轮就是面板路由全丢, 而事务那条路好好的)。
@@ -1366,7 +832,7 @@ def tx_apply(op, model_mod=None, files=None, services=(), tfo_intent=None, mode=
     except tx.TxBusy:
         # 直接用 BUSY_MSG, **不要**走 busy_msg(): 后者看的是本线程上一次 _cfg_guard() 的结果,
         # 而这里的失败来自 pdgtx 自己的锁。线程池会复用线程 —— 同一个工作线程先前若碰上过
-        # "锁文件不可用"(比如一次 WLOC 操作), 那份状态还在, TxBusy 就会被错报成 NOLOCK。
+        # "锁文件不可用"(比如另一笔配置事务), 那份状态还在, TxBusy 就会被错报成 NOLOCK。
         # pdgtx._Lock 已经把两件事分开了: 打不开锁文件 → TxRefused, 锁被占 → TxBusy。
         return False, BUSY_MSG
     except tx.TxRefused as e:
@@ -3929,7 +3395,7 @@ def set_dot_domain(domain):
 
 # ── iOS 描述文件 ──
 # 生成实现在 iosprofile 里、生命周期在 iosstate 里 —— Bot 与 CLI(`pdg ios`)共用同一份。
-# 以前两边各写一套, CLI 那套既不支持 SSID 排除也不附 WLOC 根证书, 同一台网关走两条路拿到的
+# 以前两边各写一套, CLI 那套不支持 SSID 排除, 同一台网关走两条路拿到的
 # 文件内容不一样。
 #
 # ⚠️ 这两个是**按平台安装**的 iOS 专属组件: Android 机器上 /opt/pdg-bot 里根本没有它们。
@@ -3947,19 +3413,6 @@ def _ios_mods():
     要给一句能照着做的话, 而不是让调用方吃一个 ModuleNotFoundError 堆栈。"""
     if iosprofile is None or iosstate is None:
         raise RuntimeError("缺少 iOS 组件(iosprofile / iosstate)—— 请先跑 sudo pdg update 补齐。")
-
-def _mitm_ca_der():
-    """根 CA 证书的 DER 字节(供 iOS 描述文件的 root 证书 payload)。
-
-    解析与"私钥绝不进描述文件"的拦截都在 iosprofile 里做。以前这里是宽容解析: 解不开就
-    悄悄返回 b"" —— 于是 WLOC 开着、CA 却坏了的时候, 用户拿到的是一份**不含根证书**的
-    描述文件, 装上去表现为"全站证书报错", 而没有任何一处告诉他 CA 坏了。现在直接拒绝生成。
-    """
-    pem = _mitm_ca_pem()
-    if not pem:
-        return b""
-    _ios_mods()
-    return iosprofile.ca_der_from_pem(pem)
 
 def _ios_profile(ssids=(), ids=None):
     """**不碰生命周期状态**的渲染入口: 平台门控 + 本机数据源 + 可选身份 → 文件字节。
@@ -3980,17 +3433,21 @@ IOS_UNKNOWN = "ℹ️ 服务器无法确认 iPhone 上此刻装的是哪一版, 
 
 
 def _ios_ca():
-    """(WLOC 是否启用, 根 CA 的 DER)。启用却读不到 CA 时抛错, 不返回空 —— 见 _mitm_ca_der。"""
+    """恒为 (False, b"") —— 描述文件不再携带任何根 CA。
+
+    这个函数曾经的职责是"WLOC 开着就把网关自签的根 CA 塞进描述文件, 读不到就拒绝生成"。
+    WLOC 位置改写连同它专属的 MITM 执行能力已退役: 没有东西再需要用户信任那张根证书, 于是
+    **任何**新下发的描述文件都不该再带它。
+
+    保留这个函数、而不是把调用点各自改掉, 是因为它是唯一那道口子 —— current、previous、
+    repair、restore、"重新发送"这几条路全都经由它取 CA。收在一处, "退役后不再下发"才是一条
+    盯得住的判据; 散到各调用点去判, 迟早漏掉一条, 而漏掉的表现是用户手机上又多了一张来历
+    不明的受信根证书, 界面上什么都不会报。
+
+    盘上**可能仍有**旧 CA 材料 —— 那是退役迁移按保留策略处置的事(mitm_ca.ca_material_readonly
+    只读地报告它)。发不发由这里定, 与盘上有没有无关。"""
     _ios_mods()
-    enabled = bool(_mitm_enabled_domains())
-    if not enabled:
-        return False, b""
-    der = _mitm_ca_der()
-    if not der:
-        raise iosprofile.ProfileError(
-            "WLOC 已启用但读不到根 CA 证书, 拒绝生成描述文件 —— "
-            "不含 CA 的描述文件装上去会让被劫持的站点全部证书报错。")
-    return True, der
+    return False, b""
 
 
 def _ios_generate(ssids=None, legacy=False):   # ssids=None ⇒ 沿用记录里的名单
@@ -4028,7 +3485,11 @@ def _ios_status_text():
     if ssids:
         lines.append("强制直连 Wi-Fi: %s" % ", ".join(ssids))
     if cur["inputs"].get("wloc_enabled"):
-        lines.append("含根证书: 是(指纹 %s…)" % cur["inputs"]["wloc_ca_sha256"][:16])
+        # 只有**退役迁移之前生成的**旧记录才会走到这里。照实说明它是历史状态, 并把"该去手机上
+        # 取消信任"这件事带出来 —— 用户界面上看到"含根证书: 是"却无从知道要处理它, 比不显示更糟。
+        lines.append("含根证书: 是(指纹 %s…)　⚠️ 这是 WLOC 退役前的旧版本; "
+                     "重新生成一份即可去掉根证书, 并记得到手机上取消对它的信任"
+                     % cur["inputs"]["wloc_ca_sha256"][:16])
     lines += ["", "配置变化: <b>%s</b>" % iosstate.LEVEL_LABEL[lv]]
     lines += ["• " + r for r in why]
     if meta.get("previous"):
@@ -5268,13 +4729,14 @@ def _handle_cb_inner(chat, mid, data, uid=None):
                "check": "发一个域名，我查它现在会不会被阻断。"}[kind]
         edit(chat, mid, tip + "\n/cancel 或按下面的按钮取消。", ADBLOCK_CANCEL); return
 
-    # 用户对这条消息做了新操作 → 还挂在它上面的 WLOC 监听立即作废。否则用户点了「返回菜单」,
-    # 30 秒后监听把菜单原地改成一句"尚未收到请求", 正看着的界面就没了。
-    wloc_invalidate_watch(chat, mid)
-    # iOS 专属功能的统一后端门控(不只隐藏按钮): 旧 TG 消息里的 iOS 描述文件 / WLOC 按钮被点也拒绝。
-    if (data in ("ios", "ios_ssid", "iosgen", "iosgen:legacy", "iosgen:fresh",
-                 "iosgen:cancel", "iosdiff", "iosprev", "iosack")
-            or data == "wloc" or data.startswith("wloc:")) \
+    # 旧 TG 消息里的 WLOC 按钮: 先于一切门控答复。放在 iOS 平台门控**之前**是有意的 ——
+    # 那道门对非 iOS 机器直接 return, 于是一台切过平台的机器上点旧按钮会毫无反应, 而"没反应"
+    # 恰恰是这里最不该给的回答: 用户分不出是功能没了、消息过期了, 还是 bot 挂了。
+    if data == "wloc" or data.startswith("wloc:"):
+        edit(chat, mid, WLOC_RETIRED_TEXT, OPS_BACK); return
+    # iOS 专属功能的统一后端门控(不只隐藏按钮): 旧 TG 消息里的 iOS 描述文件按钮被点也拒绝。
+    if data in ("ios", "ios_ssid", "iosgen", "iosgen:legacy", "iosgen:fresh",
+                "iosgen:cancel", "iosdiff", "iosprev", "iosack") \
        and not _ios_only(chat, mid):
         ios_first_ssids.pop(chat, None)   # 平台不对 ⇒ 这段流程作废, 别把输入留到下一次
         return
@@ -5658,78 +5120,6 @@ def _handle_cb_inner(chat, mid, data, uid=None):
                                   [{"text": "🏠 主菜单", "callback_data": "menu"}]]}); return
     if data in ("tfo:on", "tfo:off"):
         ok, msg = set_tfo(data == "tfo:on"); edit(chat, mid, msg if ok else ("❌ " + msg), OPS_BACK); return
-    if data in ("wloc", "wloc:menu"):
-        if _platform() != "ios":
-            edit(chat, mid, "位置改写(WLOC)仅 iOS 平台可用。", OPS_BACK); return
-        w = _wloc_state(); on = bool(w.get("enabled")); loc = _wloc_active(w)
-        cur = f"<b>{w['active']}</b>({loc['lat']}, {loc['lon']})" if loc else "未设"
-        edit(chat, mid, f"🍏 <b>位置改写 (WLOC)</b>\n状态: <b>{'🟢 开启' if on else '关闭'}</b>　当前: {cur}　地点: {len(w['locations'])} 个\n\n"
-             "WLOC 只修改 Apple 网络定位响应中的坐标，不修改 GPS 数据。使用前需要安装并信任网关 CA。\n\n"
-             "<b>首次使用顺序:</b>\n"
-             "① 添加地点并开启 WLOC\n"
-             "② 返回「📱 客户端」，重新生成并安装 iOS 描述文件\n"
-             "③ 到「设置 → 通用 → 关于本机 → 证书信任设置」，信任 PrivDNS Gateway MITM CA\n\n"
-             "<b>切换地点的推荐顺序（全程用内网卡）：</b>\n"
-             "① 控制中心把 Wi-Fi 点灰（不是在设置里关 Wi-Fi）\n"
-             "② 在 Bot「📍 地点 / 切换」里点目标地点\n"
-             "③ 等 Bot 显示「网关目标地点已切换，网关服务无需重启」\n"
-             "④ 设置 → 隐私与安全性 → 定位服务：关闭，等 2 秒后重新开启\n"
-             "⑤ 打开目标 App\n"
-             "⑥ iOS 26 如果一直没有发起新的 WLOC 请求，可能仍需重启手机\n\n"
-             "切地点只改网关配置，不重启任何服务；网关能保证的是<b>下一次</b> Apple 网络定位"
-             "请求用新坐标，iOS 自己的定位缓存不归网关清。\n"
-             "长期无法定位时：设置 → 通用 → 传输或还原 iPhone → 还原 → 还原位置与隐私 → 重启手机",
-             {"inline_keyboard": [
-                 [{"text": "🟢 已开启" if on else "✅ 开启", "callback_data": "wloc:on"},
-                  {"text": "关闭", "callback_data": "wloc:off"}],
-                 [{"text": "📍 地点 / 切换", "callback_data": "wloc:list"}],
-                 [{"text": "➕ 添加地点", "callback_data": "wloc:add"},
-                  {"text": "🗑 删除地点", "callback_data": "wloc:del"}],
-                 [{"text": "⬅️ 返回运维", "callback_data": "nav:ops"}],
-                 [{"text": "🏠 主菜单", "callback_data": "menu"}]]}); return
-    if data == "wloc:list":
-        w = _wloc_state()
-        if not w["locations"]:
-            edit(chat, mid, "还没有地点。点「➕ 添加地点」。", WLOC_BACK); return
-        kb = [[{"text": ("✅ " if l["name"] == w["active"] else "○ ")
-                + f"{l['name']} ({l['lat']}, {l['lon']})", "callback_data": f"wloc:sw:{i}"}]
-              for i, l in enumerate(w["locations"])]
-        kb.append([{"text": "⬅️ 返回 WLOC", "callback_data": "wloc:menu"}])
-        edit(chat, mid, "点一个地点即切换到它。\n开启中为热切换：只改网关配置，不重启服务；"
-                        "切完请关闭定位服务、等 2 秒再开启。", {"inline_keyboard": kb}); return
-    if data == "wloc:add":
-        state[chat] = "wloc_add"
-        send(chat, "发「<b>名称 纬度,经度</b>」如 <code>上海 31.2304,121.4737</code>(小数;北纬东经为正)。/cancel 取消。", BACK); return
-    if data == "wloc:del":
-        w = _wloc_state()
-        if not w["locations"]:
-            edit(chat, mid, "没有可删的地点。", WLOC_BACK); return
-        kb = [[{"text": f"🗑 {l['name']} ({l['lat']}, {l['lon']})", "callback_data": f"wloc:rm:{i}"}]
-              for i, l in enumerate(w["locations"])]
-        kb.append([{"text": "⬅️ 返回 WLOC", "callback_data": "wloc:menu"}])
-        edit(chat, mid, "点一个删除:", {"inline_keyboard": kb}); return
-    if data.startswith("wloc:sw:"):
-        w = _wloc_state(); i = int(data.rsplit(":", 1)[1])
-        if 0 <= i < len(w["locations"]):
-            name = w["locations"][i]["name"]
-            kb = {"inline_keyboard": [[{"text": "📍 地点列表", "callback_data": "wloc:list"}],
-                                      [{"text": "⬅️ 返回 WLOC", "callback_data": "wloc:menu"}],
-                                      [{"text": "🏠 主菜单", "callback_data": "menu"}]]}
-            since = time.time()                    # 早于这一刻的状态一律不算这次的命中
-            ok, msg, gen = wloc_switch_gen(name)   # 快路径: 只写配置, 不动任何服务
-            edit(chat, mid, msg if ok else ("❌ " + msg), kb)
-            if ok and _wloc_state().get("enabled"):
-                # 切换本身已经完成了; 下面只是在后台等手机真的来一次请求, 好把结果如实回报
-                _wloc_watch_async(chat, mid, gen, name, kb=kb, since=since)
-        return
-    if data.startswith("wloc:rm:"):
-        w = _wloc_state(); i = int(data.rsplit(":", 1)[1])
-        if 0 <= i < len(w["locations"]):
-            ok, msg = wloc_del(w["locations"][i]["name"])
-            edit(chat, mid, msg if ok else ("❌ " + msg), WLOC_BACK)
-        return
-    if data in ("wloc:on", "wloc:off"):
-        ok, msg = wloc_enable(data == "wloc:on"); edit(chat, mid, msg if ok else ("❌ " + msg), WLOC_BACK); return
     if data == "panel":
         on = _panel_on()
         edit(chat, mid, "📊 <b>临时观测/控制面板 (zashboard)</b>\n"
@@ -6029,25 +5419,11 @@ def handle_text(chat, text, mid=None, uid=None):
         if len(p) < 2:
             send_plain(chat, "格式: remote|local 地址1 [地址2 …]"); return
         ok, msg = set_mosdns_upstream(p[0].lower(), p[1:]); send_plain(chat, msg if ok else ("❌ " + msg)); return
-    if act == "wloc_add":
-        m = re.match(r"^\s*(\S+)\s+(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$", text)
-        if not m:
-            send_plain(chat, "格式: <b>名称 纬度,经度</b>  如 <code>上海 31.2304,121.4737</code>"); return
-        name, lat, lon = m.group(1), float(m.group(2)), float(m.group(3))
-        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
-            send_plain(chat, "坐标超范围(纬度 -90~90, 经度 -180~180)"); return
-        wloc_add_reply(chat, name, lat, lon); return
     if act == "set_dot":
         send_plain(chat, "正在校验域名并签发证书(约 30-60 秒, 期间代理短暂中断)…")
         ok, msg = set_dot_domain(text); send_plain(chat, msg if ok else ("❌ " + msg)); return
     if act == "restore":
         send_plain(chat, "请把备份 <code>.tar.gz</code> 作为「文件」发来, 而不是文字。/cancel 取消。"); state[chat] = "restore"; return
-    # 裸发「名称 纬度,经度」: 当作加 WLOC 地点(iOS), 即使没先点「➕ 添加地点」也能加(状态因重启丢了也不怕)
-    mw = re.match(r"^\s*(\S+)\s+(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$", text)
-    if mw and _platform() == "ios":
-        name, lat, lon = mw.group(1), float(mw.group(2)), float(mw.group(3))
-        if -90 <= lat <= 90 and -180 <= lon <= 180:
-            wloc_add_reply(chat, name, lat, lon); return
     # 裸发一个像域名的文本: 当作想设 DoT 域名, 给一键按钮 (省得先点菜单进状态)
     if re.match(r"^(?=.{1,253}$)([a-z0-9-]+\.)+[a-z]{2,}$", text.lower()):
         d = text.lower()

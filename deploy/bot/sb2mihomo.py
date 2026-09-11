@@ -414,7 +414,6 @@ def _mixed_listeners(sb, direct_tags):
 def singbox_to_mihomo(sb, *, redir_port=7893, controller="127.0.0.1:9090",
                       secret=None, external_ui=None, external_ui_url=None,
                       tls_ports=None, http_ports=None, rulesets=None,
-                      mitm_domains=None, mitm_port=7894,
                       lan_domains=None, lan_addr="127.0.0.1"):
     """把 sing-box 配置 dict 翻译成 mihomo 配置 dict。
 
@@ -467,14 +466,9 @@ def singbox_to_mihomo(sb, *, redir_port=7893, controller="127.0.0.1:9090",
     if in_rules:
         rules = rules[:i] + in_rules + rules[i:]; i += len(in_rules)
 
-    # MITM(Feature B / iOS): 接管域名路由到本地 MITM 服务(socks5 出站, 由它终止 TLS 交插件)。
-    if mitm_domains:
-        proxies.append({"name": "MITM-OUT", "type": "socks5",
-                        "server": "127.0.0.1", "port": mitm_port, "udp": False})
-        rules = rules[:i] + [f"DOMAIN-SUFFIX,{d},MITM-OUT" for d in mitm_domains] + rules[i:]
-
     # ── 内网面板(方案 B): 面板域名 → 本机反代 ──────────────────────────────
-    # **必须排在反自环 IP-CIDR REJECT 之前**, 而不是像 MITM 那样排在之后。原因实测定案:
+    # **必须排在反自环 IP-CIDR REJECT 之前**。(历史上 WLOC 的 MITM 路由排在之后, 那条已随
+    # WLOC 退役一起删掉 —— 别照着它的位置摆面板规则。)原因实测定案:
     #
     #   · `no-resolve` 的含义是"不要为这条规则发起 DNS 查询", **不是**"目的是域名时不
     #     匹配"。面板域名在下面的 hosts: 段里被映射到本机地址, 于是 IP 在规则匹配阶段

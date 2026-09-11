@@ -579,7 +579,6 @@ def restore_managed(snap_id, *, expect_digest="", trigger_source="legacy"):
             if "model" in out["restored"]:
                 t.derive("mihomo_cfg", mihomorender.deriver_from_paths(
                     rs_meta_path=pdgtx.FSROOT + "/opt/pdg-bot/rulesets.json",
-                    mitm_hijack_file=pdgtx.FSROOT + "/etc/mosdns/rules/mitm_hijack.txt",
                     platform_file=pdgtx.FSROOT + "/etc/privdns-gateway/platform",
                     lan_table_file=pdgtx.FSROOT + "/etc/privdns-gateway/lan-panels.json"))
                 out["derived"] = ["mihomo_cfg"]
