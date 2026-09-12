@@ -4304,8 +4304,8 @@ _retire_rerender_core(){
   fi
   install -d -m700 "$(dirname "$mc")" 2>/dev/null || true
   # 候选放**同目录**, 名字带 PID 以免撞车; 无论成败都由这里自己删(它不属于账本)。
-  local cand="$mc.retire-cand.$$"
-  rm -f "$cand"
+  local _rc_cand="$mc.retire-cand.$$"
+  rm -f "$_rc_cand"
   if ! ( cd "$botdir" && PDG_RETIRE_ROOT="$R" PYTHONPATH="$botdir" python3 -c '
 import os, sys
 sys.path.insert(0, os.getcwd())
@@ -4323,33 +4323,33 @@ if R:
                                      if os.path.exists(p) else "android")
 data, _meta = bot._render_mihomo_bytes(bot.load())
 sys.stdout.buffer.write(data)
-' ) > "$cand" 2>"$cand.err"; then
-    c_y "   渲染候选失败: $(tr -d '\n' < "$cand.err" | tail -c 200)"
-    rm -f "$cand" "$cand.err"; return 1
+' ) > "$_rc_cand" 2>"$_rc_cand.err"; then
+    c_y "   渲染候选失败: $(tr -d '\n' < "$_rc_cand.err" | tail -c 200)"
+    rm -f "$_rc_cand" "$_rc_cand.err"; return 1
   fi
-  rm -f "$cand.err"
-  [[ -s "$cand" ]] || { c_y "   渲染出来是空的, 拒绝安装。"; rm -f "$cand"; return 1; }
+  rm -f "$_rc_cand.err"
+  [[ -s "$_rc_cand" ]] || { c_y "   渲染出来是空的, 拒绝安装。"; rm -f "$_rc_cand"; return 1; }
   # 自证: 候选里不许还有 MITM-OUT。渲染器已经不产生它了, 这一条防的是"改了别处、漏改渲染器"。
-  if grep -q 'MITM-OUT' "$cand"; then
+  if grep -q 'MITM-OUT' "$_rc_cand"; then
     c_y "   渲染出来的候选里仍有 MITM-OUT —— 渲染器没有真的撤掉那条路由, 拒绝安装。"
-    rm -f "$cand"; return 1
+    rm -f "$_rc_cand"; return 1
   fi
   if command -v mihomo >/dev/null 2>&1; then
-    if ! mihomo -t -d "$(dirname "$mc")" -f "$cand" >"$cand.terr" 2>&1; then
-      c_y "   候选配置没通过 mihomo -t: $(tr -d '\n' < "$cand.terr" | tail -c 200)"
-      rm -f "$cand" "$cand.terr"; return 1
+    if ! mihomo -t -d "$(dirname "$mc")" -f "$_rc_cand" >"$_rc_cand.terr" 2>&1; then
+      c_y "   候选配置没通过 mihomo -t: $(tr -d '\n' < "$_rc_cand.terr" | tail -c 200)"
+      rm -f "$_rc_cand" "$_rc_cand.terr"; return 1
     fi
-    rm -f "$cand.terr"
+    rm -f "$_rc_cand.terr"
   fi
   # 属性跟着旧那份走(旧的不在就用 0600); 然后原子替换。
   if [[ -f "$mc" ]]; then
-    chmod --reference="$mc" "$cand" 2>/dev/null || chmod 600 "$cand"
-    chown --reference="$mc" "$cand" 2>/dev/null || true
+    chmod --reference="$mc" "$_rc_cand" 2>/dev/null || chmod 600 "$_rc_cand"
+    chown --reference="$mc" "$_rc_cand" 2>/dev/null || true
   else
-    chmod 600 "$cand"
+    chmod 600 "$_rc_cand"
   fi
-  if ! mv -f "$cand" "$mc"; then
-    c_y "   原子替换内核配置失败。"; rm -f "$cand"; return 1
+  if ! mv -f "$_rc_cand" "$mc"; then
+    c_y "   原子替换内核配置失败。"; rm -f "$_rc_cand"; return 1
   fi
   # 后置确认: 重启 + is-active。返回 0 不单独算数。
   if ! _retire_reload_svc "$(_pdg_core_svc)"; then
