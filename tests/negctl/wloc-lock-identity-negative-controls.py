@@ -20,6 +20,7 @@ import re
 import shutil
 import signal
 import subprocess
+import time
 import sys
 from pathlib import Path
 
@@ -46,8 +47,114 @@ def sha(p):
     return hashlib.sha256(Path(p).read_bytes()).hexdigest()
 
 
-def run(cmd, cwd=None, timeout=900):
-    return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+SUITE_TIMEOUT = 900     # 正式预算。测试只覆盖**它自己那次**调用, 不动这个默认值。
+REAP_BUDGET = 10        # 收尾自己的上限 —— kill 完不能再用无期限的 wait 卡死
+
+
+def _txt(v):
+    """把管道读出来的东西统一成 str, 别让一次解码错误盖住真正的失败。"""
+    if v is None:
+        return ""
+    if isinstance(v, bytes):
+        return v.decode("utf-8", "replace")
+    return v
+
+
+def _confirm_group_gone(pgid, budget=REAP_BUDGET):
+    """有界确认那个进程组是不是真的空了。返回 (确认清空, 说明)。
+
+    信号发出去了不等于组已经空 —— SIGKILL 不可捕获, 但后代要等被 init 收尸才从进程表消失。
+    所以这里轮询 killpg(pgid, 0): 抛 ProcessLookupError 才算确认。有界, 到点就如实说没确认。
+    """
+    deadline = time.monotonic() + budget
+    while True:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return True, "进程组已清空"
+        except PermissionError:
+            return False, "无权确认进程组状态"
+        except OSError as e:
+            return False, "确认进程组状态失败(%s)" % e
+        if time.monotonic() >= deadline:
+            return False, "%ds 内进程组仍未清空" % budget
+        time.sleep(0.02)
+
+
+def _kill_own_group(p):
+    """结束**本次自己创建的那个进程组**。返回 (pgid 或 None, 说明)。
+
+    只打这一次 Popen 建出来的组 —— start_new_session=True 保证组里只可能有本次启动的进程,
+    所以不必、也绝不按进程名或命令行做宽匹配(那会打到别的检查、别人的 python, 甚至自己)。
+    """
+    try:
+        pgid = os.getpgid(p.pid)
+    except (ProcessLookupError, PermissionError, OSError) as e:
+        try:
+            p.kill()
+        except OSError:
+            pass
+        return None, "拿不到进程组(%s), 后代去向无法确认" % e
+    if pgid == os.getpgid(0):
+        # 没能独占进程组: 这时 killpg 会打到我们自己身上, 绝不能发。
+        try:
+            p.kill()
+        except OSError:
+            pass
+        return None, "子进程没有独占进程组, 只结束了直接子进程, 后代去向无法确认"
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass                     # 组已经空了, 也算打到位
+    except OSError as e:
+        try:
+            p.kill()
+        except OSError:
+            pass
+        return None, "killpg 失败(%s)" % e
+    return pgid, ""
+
+
+def run(cmd, cwd=None, timeout=SUITE_TIMEOUT):
+    """跑一条子测试。超时按**本次自己创建的进程组**收干净, 并把已经产生的输出带出来。
+
+    为什么不能只让外层 return: 子测试会派生后代(持锁进程、桩子进程)。直接子进程被杀之后
+    后代还攥着锁、还连着我们这一端的管道 —— 于是"超时"根本没真正结束: 下一格会在一把没人
+    释放的锁上跑, 删工作目录时还可能撞上仍在写的进程。实测过修前的行为: 执行器 2.00s 返回
+    anomaly, 而后代仍是 S 状态、临时锁仍拿不到、stdout/stderr 却是空的。
+
+    start_new_session=True 让这一次调用独占一个进程组, killpg 打到的只可能是本次启动的进程。
+    同样的形状产品侧 deploy/bot/pdg-bot.py 的 _git() 已经在用; 那是产品模块, import 它会把
+    整个 bot 拉进来, 所以这里照它的语义写本支需要的最小一份, 不新建通用框架。
+
+    超时时抛 TimeoutExpired, 并挂上三件事实(彼此分开, 不合成一句"已强杀完成"):
+      · output/stderr —— 超时前实际产生的输出, 有什么留什么, 不清空;
+      · pdg_reaped    —— **确认**收干净了没有; 确认不了就是 False;
+      · pdg_rc        —— 真拿到的退出状态(被 SIGKILL 就是 -9); 拿不到是 None, 不伪造。
+    """
+    p = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         text=True, errors="replace", start_new_session=True)
+    try:
+        out, err = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as first:
+        early_out, early_err = _txt(first.output), _txt(first.stderr)
+        pgid, note = _kill_own_group(p)
+        try:
+            # 收尸 + 把管道读干净。communicate 是**续读**同一对缓冲区, 返回的是全量,
+            # 所以直接取它, 不与 early 拼接(拼了会重复)。
+            out, err = p.communicate(timeout=REAP_BUDGET)
+            out, err = _txt(out) or early_out, _txt(err) or early_err
+            reaped, why = (False, note) if pgid is None else _confirm_group_gone(pgid)
+        except subprocess.TimeoutExpired:
+            # 连尸体都收不掉: 不假装收干净, 也不把已有输出清空。
+            out, err, reaped = early_out, early_err, False
+            why = "%ds 内管道都没读干净" % REAP_BUDGET
+        exc = subprocess.TimeoutExpired(cmd, timeout, output=out, stderr=err)
+        exc.pdg_reaped = reaped
+        exc.pdg_note = "; ".join(x for x in (note, why) if x) or "进程组已清空"
+        exc.pdg_rc = p.returncode
+        raise exc
+    return subprocess.CompletedProcess(cmd, p.returncode, _txt(out), _txt(err))
 
 
 # ── 子测试的执行有效性 ───────────────────────────────────────────────────────
@@ -77,7 +184,10 @@ OK_RE = re.compile(r"^\[OK\]\s", re.M)
 FAIL_RE = re.compile(r"^\[FAIL\]\s", re.M)
 TRACEBACK = "Traceback (most recent call last)"
 
-Outcome = collections.namedtuple("Outcome", "status reason failures rc out err")
+# halt: 这次执行留下了**没确认收干净**的东西(还在跑的后代、没释放的锁)。带着它继续做下一格
+# 等于在污染过的现场做实验, 所以上层见到 halt 就停, 不再开新格、也不动相关目录。
+Outcome = collections.namedtuple("Outcome", "status reason failures rc out err halt")
+Outcome.__new__.__defaults__ = (False,)
 
 
 def failures(out):
@@ -140,22 +250,51 @@ def verdict(rc, out, err, timed_out=False, launch_error=""):
 SUITES = (["python3", "tests/test-inherited-lock-proof.py"],)
 
 
+def _suite_name(cmd):
+    """给这条命令起个认得出的名字: 取第一个像脚本的参数, 而不是最后一个 argv。"""
+    for a in cmd[1:]:
+        if a.endswith(".py") or a.endswith(".sh"):
+            return a
+    return cmd[-1]
+
+
 def run_suites(wd):
     """跑子测试并给出裁决。多支时: 任何一支异常即整体异常, 失败集合取并集。"""
     merged, worst = set(), None
     for cmd in SUITES:
+        name = _suite_name(cmd)
         try:
-            r = run(cmd, cwd=wd)
-        except subprocess.TimeoutExpired:
-            return Outcome("anomaly", "子测试超时被强杀(%s)" % cmd[-1], set(), None, "", "")
+            # 预算显式传进去: 测试要覆盖的是**自己那次调用**的预算, 不该去改正式默认值。
+            r = run(cmd, cwd=wd, timeout=SUITE_TIMEOUT)
+        except subprocess.TimeoutExpired as e:
+            # 超时和收尾是两件事, 分开记。收尾没确认就**明说没确认**, 并让上层停下来 ——
+            # 带着还在跑的后代进下一格, 等于在一把没人释放的锁上继续做实验。
+            reaped = getattr(e, "pdg_reaped", False)
+            note = getattr(e, "pdg_note", "收尾结果未知")
+            return Outcome("anomaly",
+                           "%s: 子测试超时被强杀(%ss); 收尾%s —— %s"
+                           % (name, e.timeout, "已完成" if reaped else "**未完成**", note),
+                           set(), getattr(e, "pdg_rc", None),
+                           _txt(e.output), _txt(e.stderr), halt=not reaped)
         except OSError as e:
-            return Outcome("anomaly", "子测试启动失败(%s: %s)" % (cmd[-1], e), set(), None, "", "")
+            return Outcome("anomaly", "子测试启动失败(%s: %s)" % (name, e), set(), None, "", "")
         res = verdict(r.returncode, r.stdout, r.stderr)
         if res.status == "anomaly":
-            return res._replace(reason="%s: %s" % (cmd[-1], res.reason))
+            return res._replace(reason="%s: %s" % (name, res.reason))
         merged |= res.failures
         worst = res if (worst is None or res.status == "failed") else worst
     return worst._replace(failures=merged)
+
+
+def halt_now(stage, wd):
+    """收尾没确认时的停机: 现场可能还有在跑的后代和没释放的锁。
+
+    不删工作目录 —— 往一个可能还有进程在写的目录上 rmtree, 既可能删不干净, 也会把唯一能
+    排查的残骸抹掉。tmpguard 的 PDG_KEEP_TMP 就是为留现场准备的公开开关, 这里只在停机这一
+    条路上打开它, 并把路径说出来。
+    """
+    os.environ[tmpguard.KEEP_ENV] = "1"
+    print("       %s: 现场保留在 %s(收尾未确认, 不删目录、不开下一格)" % (stage, wd))
 
 
 def refuse(stage, res):
@@ -250,7 +389,7 @@ MUT = [
 def main():
     before_sha = {p: sha(p) for p in TOUCHED}
     modes = {p: os.stat(p).st_mode for p in TOUCHED}
-    started = False
+    started = halted = False
     wd = tmpguard.mkdtemp(prefix="pdg-lockid-negctl.")
     try:
         for sub in ("tests", "deploy", "lib"):
@@ -259,7 +398,11 @@ def main():
         pristine = {TX: (Path(wd) / TX).read_text(encoding="utf-8")}
         base_res = run_suites(wd)
         base = base_res.failures
-        if base_res.status == "anomaly":
+        if base_res.halt:
+            refuse("基线", base_res)
+            halt_now("基线", wd)
+            started = False
+        elif base_res.status == "anomaly":
             # 执行异常时**不打印"基线全绿"、不开跑变异**: 拿一次没跑起来的执行当比较基准,
             # 后面每一格的"新增失败"都是空集合减空集合, 结论全是误导性的。
             refuse("基线", base_res)
@@ -296,6 +439,13 @@ def main():
                 target.write_text(pristine[rel], encoding="utf-8")
                 continue
             got_res = run_suites(wd)
+            if got_res.halt:
+                # 收尾没确认: 既不回滚工作副本(那是往可能还有进程在写的目录里写), 也不开
+                # 下一格。带着污染的现场继续做实验, 后面每一格的结论都没有意义。
+                refuse(label, got_res)
+                halt_now(label, wd)
+                halted = True
+                break
             target.write_text(pristine[rel], encoding="utf-8")
             if got_res.status == "anomaly":
                 # 关键的一条: 哪怕输出里已经有目标 [FAIL], 只要这次执行本身不正常, 就不算"有牙"
@@ -327,8 +477,13 @@ def main():
                 bad("正式树文件 mode 变了: %s" % p)
 
     print("-" * 62)
+    tail = ""
+    if not started:
+        tail = "(基线未通过, 变异未开跑)"
+    elif halted:
+        tail = "(收尾未完成, 已停机, 后续变异未开跑)"
     print("wloc-lock-identity-negative-controls.py: 通过 %d, 失败 %d%s"
-          % (PASS[0], FAIL[0], "" if started else "(基线未通过, 变异未开跑)"))
+          % (PASS[0], FAIL[0], tail))
     return 1 if FAIL[0] else 0
 
 
