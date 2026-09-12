@@ -1009,6 +1009,12 @@ jobs:
       - name: "WLOC 退役 · 描述文件 schema 1→2 (三种老机器状态/严格验-迁移-复核/不再下发退役 CA)"
         run: python3 tests/test-wloc-retire-schema.py
 
+      - name: "WLOC 退役 · 配置锁交接 (CLI 持锁时走真实 __migrate 路径; 不抢锁/不中途释放)"
+        run: bash tests/test-wloc-retire-lock-handoff.sh
+
+      - name: "WLOC 退役 · 真模块回环 (真渲染器真撤 MITM 路由/候选先行/不回退宿主 /opt)"
+        run: bash tests/test-wloc-retire-realrun.sh
+
       - name: "平台文案/门控回归 (客户端·状态 按平台/内核 + README 文案一致)"
         run: python3 tests/test-platform-copy.py
 
