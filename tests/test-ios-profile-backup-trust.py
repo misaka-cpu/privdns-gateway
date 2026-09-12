@@ -307,7 +307,12 @@ def legacy_backup(ca_der=None):
     ids = _S0.derive_ids(m["instance_id"])
     out = dict(good)
     m["schema"] = 1
-    m.pop("retired_revision", None)
+    # 按 schema 1 的**字段集**裁剪, 不逐个点名。点名的写法每加一个 schema 2 专属字段就会
+    # 悄悄失效一次: 多出来的那个字段会让顶层白名单**先于**下面那几道根证书的门拒掉,
+    # 于是这几条用例全部退化成"拒是拒了, 但不是这道门"——看起来像被测逻辑坏了。
+    _keep = set(_S0._blank(1))
+    for _k in [k for k in m if k not in _keep]:
+        m.pop(_k, None)
     for which, arc in (("current", ARC_CUR), ("previous", ARC_PREV)):
         if not m.get(which):
             continue
