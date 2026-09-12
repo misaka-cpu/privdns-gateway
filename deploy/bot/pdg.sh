@@ -3981,43 +3981,69 @@ _retire_reload_svc(){
 }
 
 # 把某个服务的 enabled + 运行状态登记进账本。两样分开记, 分开还。
+# $2 非空 = 这是个**配置消费者**(mihomo/mosdns): 还原时要 restart 而不是 start,
+# 否则旧配置不会被重新读一遍。
 _retire_track_svc(){
-  local svc="$1" en st
+  local svc="$1" cfgsvc="${2:-}" en st
   en="$(systemctl is-enabled "$svc" 2>/dev/null | tr -d '[:space:]')"
   st="$(systemctl is-active  "$svc" 2>/dev/null | tr -d '[:space:]')"
-  _retire_undo_push "_retire_restore_svc $(printf '%q' "$svc") $(printf '%q' "${en:-unknown}") $(printf '%q' "${st:-unknown}")"
+  _retire_undo_push "_retire_restore_svc $(printf '%q' "$svc") $(printf '%q' "${en:-unknown}") $(printf '%q' "${st:-unknown}") $(printf '%q' "$cfgsvc")"
 }
 
-_retire_restore_svc(){   # $1=服务 $2=原 enabled $3=原运行状态
-  local svc="$1" en="$2" st="$3" rc=0
+# 我们**有把握原样还回去**的自启状态。别的(static / masked / indirect / generated /
+# transient / 查不到)一律不支持 —— 它们要么没有对应的 systemctl 动作, 要么动作的含义与
+# 原状态不同。不支持的必须在**动手之前**被拒(见 _retire_svc_enable_supported), 而不是
+# 先改成永久自启、再在回滚报告里说一句"不一致"。
+_retire_enable_supported(){ [[ "$1" == enabled || "$1" == enabled-runtime || "$1" == disabled ]]; }
+
+_retire_restore_svc(){   # $1=服务 $2=原 enabled $3=原运行状态 [$4=config 消费者?]
+  local svc="$1" en="$2" st="$3" cfgsvc="${4:-}" rc=0
+  # ── 自启状态 ──
+  # enabled 与 enabled-runtime **不是一回事**: 前者写进 /etc 的 wants 目录(重启后还在),
+  # 后者只在 /run 里(重启就没了)。把 runtime 的还原成永久自启, 等于替用户做了一个他没做过
+  # 的决定, 而且下次重启才看得出来。
   case "$en" in
-    enabled|enabled-runtime) systemctl enable "$svc" >/dev/null 2>&1 || rc=1;;
-    disabled)                systemctl disable "$svc" >/dev/null 2>&1 || rc=1;;
-    *) : ;;   # static / masked / 查不到 —— 不猜, 原样不动
+    enabled)         systemctl enable "$svc" >/dev/null 2>&1 || rc=1;;
+    enabled-runtime) systemctl enable --runtime "$svc" >/dev/null 2>&1 || rc=1;;
+    disabled)        systemctl disable "$svc" >/dev/null 2>&1 || rc=1;;
+    *) echo "$svc 原来的自启状态是 ${en:-查不到}, 不在可还原之列 —— 未改动它"; rc=1;;
   esac
+  # ── 运行状态 ──
   case "$st" in
-    active)   systemctl start "$svc" >/dev/null 2>&1 || rc=1;;
-    inactive) systemctl stop  "$svc" >/dev/null 2>&1 || rc=1;;
+    active)
+      # 配置消费者(mihomo/mosdns)要 restart 而不是 start: 它们此刻**正在跑着新配置**,
+      # start 是空操作, 旧配置不会被重新读一遍 —— 盘上是旧的而跑着的是新的。
+      if [[ -n "$cfgsvc" ]]; then
+        systemctl restart "$svc" >/dev/null 2>&1 || rc=1
+      else
+        systemctl start "$svc" >/dev/null 2>&1 || rc=1
+      fi;;
+    inactive)
+      systemctl stop "$svc" >/dev/null 2>&1 || { echo "$svc stop 失败"; rc=1; };;
     *)
       # failed / activating / deactivating / 查不到 —— 这几种**复现不出来**: 没有哪条
-      # systemctl 命令能把一个服务变成 failed。假装还原了是撒谎, 当成回滚失败又会让一台
-      # pdg-mitm 早就崩着的机器每次都收到"回滚不完整"。
-      # 折中: 保证它是停的(那是这几种状态的共同事实 —— 都没在提供服务), 并**如实说明**
-      # 原状态复现不了。这条会被 _retire_undo_run 原样打出来。
-      systemctl stop "$svc" >/dev/null 2>&1 || true
-      echo "$svc 原来的运行状态是 ${st:-查不到}, 复现不了 —— 已保持停止, 请自行确认"
+      # systemctl 命令能把一个服务变成 failed。假装还原了是撒谎。
+      # 能做到、也该做到的是**让它停下来**: 这几种状态的共同事实是"没在提供服务"。
+      # 但"已保持停止"这句话必须有**后置条件**撑着 —— stop 的退出码不算数, 下面统一复核。
+      systemctl stop "$svc" >/dev/null 2>&1 || { echo "$svc stop 失败"; rc=1; }
+      echo "$svc 原来的运行状态是 ${st:-查不到}, 复现不了 —— 已按「停止」处置(下面复核)"
       ;;
   esac
+  # ── 后置复核: 说了还原就要拿得出证据 ──
   local now_en now_st
   now_en="$(systemctl is-enabled "$svc" 2>/dev/null | tr -d '[:space:]')"
   now_st="$(systemctl is-active  "$svc" 2>/dev/null | tr -d '[:space:]')"
-  case "$en" in
-    enabled|enabled-runtime|disabled)
-      [[ "$now_en" == "$en" ]] || { echo "$svc 的 enabled 没还原($en → ${now_en:-查不到})"; rc=1; };;
-  esac
+  if _retire_enable_supported "$en"; then
+    [[ "$now_en" == "$en" ]] || { echo "$svc 的自启状态没还原($en → ${now_en:-查不到})"; rc=1; }
+  fi
   case "$st" in
     active|inactive)
       [[ "$now_st" == "$st" ]] || { echo "$svc 的运行状态没还原($st → ${now_st:-查不到})"; rc=1; };;
+    *)
+      # "已保持停止"的后置条件: 真的停了。deactivating/activating/unknown 都不算 ——
+      # 进程可能还在, 端口可能还开着。
+      [[ "$now_st" == inactive || "$now_st" == failed ]] \
+        || { echo "$svc 说是已保持停止, 实际是 ${now_st:-查不到} —— 没停住"; rc=1; };;
   esac
   return "$rc"
 }
@@ -4029,14 +4055,28 @@ _retire_cleanup(){
   _RETIRE_TMP=""
 }
 
+# 事务只有三种结束方式, 各自的收尾不同:
+#
+#   · **成功提交**   —— 改动全部生效。账本作废, 本轮备份清掉(没有东西需要退回去了);
+#   · **完整回滚**   —— 每一条撤销都执行并复核通过。现场等于操作前, 备份同样可以清掉;
+#   · **回滚不完整** —— 至少一条撤销失败。这时**绝不能**清: 那些备份是现在唯一能把现场
+#     救回去的东西。清掉之后用户既回不去也前进不了, 而我们连"当时是什么样"都说不出来。
+#
+# 第三种还必须把三件事一起说出来: 本来为什么失败、恢复哪一步没做成、材料在哪。少说哪一件,
+# 人就得靠猜: 只说前者他以为现场干净, 只说后者他不知道起因, 不说路径他连东西都找不到。
 _retire_fail(){   # $1 = 给用户的话
   local rb=0
   _retire_undo_run || rb=1
-  _retire_cleanup
   c_r "❌ WLOC 退役: $1"
   if [[ $rb -eq 1 ]]; then
-    c_r "   ⚠️ **回滚本身也有步骤失败**(上面已逐条列出) —— 现场可能不完整, 请按提示逐项复核。"
+    c_r "   ⚠️ **回滚本身也有步骤失败**(上面已逐条列出) —— 现场可能不完整。"
     c_y "   这两件事都要看: 上面那句是本来为什么失败, 这一句是恢复没做干净。"
+    c_y "   ⚠️ 本轮的恢复材料**已保留**, 没有清理: $_RETIRE_TMP"
+    c_y "   里面是每一个被改过的文件在操作前的副本(含 mode/uid/gid), 可以照着手工恢复。"
+    c_y "   还没完成的撤销动作已在上面逐条列出。处理完之后手工删掉那个目录即可。"
+    _RETIRE_TMP=""          # 交给用户了, 本函数不再拥有它 —— 也就不会被后面的清理带走
+  else
+    _retire_cleanup         # 完整回滚: 现场等于操作前, 材料没用了
   fi
   return 1
 }
@@ -4081,11 +4121,20 @@ migrate_wloc_retire(){
   local was_active=0
   [[ "$(systemctl is-active pdg-mitm 2>/dev/null | tr -d '[:space:]')" == active ]] && was_active=1
   local need_svc=0 need_hij=0 need_core=0 need_json=0 need_mods=0
+  # need_svc 曾经只看 `-f unit || was_active`。漏掉的那一格很具体: unit 文件被手工删过、
+  # 服务状态 systemd 也说不清(unknown), 而模块还躺在 /opt —— 两个条件都不成立 ⇒ 停止判据
+  # **整段被跳过** ⇒ 直接去删执行文件。7894 上那个进程可能还在转发, 而它的源码没了。
+  #
+  # 所以只要还有模块残留, 就必须把服务走一遍停止判据。真的"确实不存在"(is-active 明确说
+  # inactive)那一格会在下面被放行, 不会误伤干净的机器。
+  local svc_state; svc_state="$(systemctl is-active pdg-mitm 2>/dev/null | tr -d '[:space:]')"
   [[ -f "$unit" || $was_active -eq 1 ]] && need_svc=1
   [[ -s "$hij" ]] && need_hij=1
   _retire_core_has_mitm && need_core=1
   [[ -f "$mj" ]] && grep -q '"enabled": *true' "$mj" 2>/dev/null && need_json=1
   for f in "${mods[@]}" "$unit"; do [[ -e "$f" ]] && need_mods=1; done
+  # 有模块残留而服务状态**不是明确的"没在跑"** ⇒ 也要走停止判据。
+  [[ $need_mods -eq 1 && "$svc_state" != inactive && "$svc_state" != failed ]] && need_svc=1
 
   # 归属检查。这张表历来只由 WLOC 写(接管域名 = gs-loc 那两个)。出现别的东西 = 有人手工
   # 改过 —— 一把清空会顺手删掉不属于本次退役的配置, 整笔拒绝交给人判断。
@@ -4101,6 +4150,20 @@ migrate_wloc_retire(){
       c_y "   这张表历来只由 WLOC 写入, 出现别的域名说明有人手工改过 —— 归属不清就不能一把清空。"
       printf '%s\n' "$stray" | sed 's/^/     /'
       c_y "   自己确认后清掉这些行(或整表清空), 再重跑 sudo pdg __migrate。"
+      return 1
+    fi
+  fi
+
+  # 不支持的自启状态要在**动第一样东西之前**拒掉。等改完再说一句"不一致"就晚了 ——
+  # 那时 static/masked 已经被 `disable` 改成 disabled, 而那是用户没做过的决定。
+  if [[ $need_svc -eq 1 ]]; then
+    local cur_en; cur_en="$(systemctl is-enabled pdg-mitm 2>/dev/null | tr -d '[:space:]')"
+    if ! _retire_enable_supported "$cur_en"; then
+      c_r "❌ WLOC 退役: pdg-mitm 的自启状态是 ${cur_en:-查不到}, 本次未做任何改动。"
+      c_y "   可还原的只有 enabled / enabled-runtime / disabled 三种 —— 其余状态一旦动过就"
+      c_y "   回不去原样(static 没有 enable/disable 可言, masked 需要先 unmask)。"
+      c_y "   与其改完再说一句「不一致」, 不如现在就停下: 请自行确认该服务该是什么状态,"
+      c_y "   处理后重跑 sudo pdg __migrate。"
       return 1
     fi
   fi
@@ -4139,7 +4202,7 @@ migrate_wloc_retire(){
     # 是新的。所以要补一条"重新加载"; 而账本是**逆序**执行的, 于是它必须**先压**:
     # 压入顺序 [reload, 文件] ⇒ 回滚顺序 [文件, reload] ⇒ 先把表放回去, 再让 mosdns 重读。
     # 反过来压的话回滚会先重载(读到的还是空表)再还文件, 等于什么都没修。
-    _retire_undo_push "_retire_reload_svc mosdns"
+    _retire_track_svc mosdns cfg
     _retire_track_file "$hij" || { _retire_fail "备份接管表失败(磁盘满?)。"; return 1; }
     # 只清空, **不删文件**: mosdns 的 force_hijack domain_set 指着它, 文件没了 mosdns 起不来。
     : > "$hij" || { _retire_fail "清空接管表失败。"; return 1; }
@@ -4154,7 +4217,7 @@ migrate_wloc_retire(){
   if [[ $need_hij -eq 1 || $need_core -eq 1 ]]; then
     local mc="$R${PDG_MIHOMO_CFG:-/etc/mihomo/config.yaml}"
     # 同上: 先压重载、后压文件, 回滚才会是"先还旧配置, 再让内核重读它"。
-    _retire_undo_push "_retire_reload_svc $(printf '%q' "$(_pdg_core_svc)")"
+    _retire_track_svc "$(_pdg_core_svc)" cfg
     _retire_track_file "$mc" || { _retire_fail "备份内核配置失败。"; return 1; }
     if ! _retire_rerender_core; then
       c_y "   查 sudo pdg doctor 与 mihomo -t 的输出, 处理后重跑 sudo pdg __migrate。"
