@@ -106,10 +106,14 @@ for p in PRODUCT:
             mod_hits.append("%s:%s" % (os.path.relpath(p, ROOT), mod))
 chk(not mod_hits, "产品源不再 import 已删模块(实得 %s)" % (mod_hits or "0 处"))
 
+# 字节码落到**本轮独占**的临时目录, 不是 /tmp 下一个固定文件名。固定名字有两个真问题:
+# 并发跑两支测试时互相覆盖(结果取决于谁最后写), 以及别的用户先建了同名文件时这里会因为
+# 权限直接炸 —— 两种都表现成"编译失败", 而实际上源码好好的。
+_pyc_dir = tmpguard.mkdtemp(prefix="pdg-wloc-pyc.")
 bad_compile = []
 for p in sorted(BOT.glob("*.py")):
     try:
-        py_compile.compile(str(p), cfile=os.path.join(tempfile.gettempdir(), "pdgc.pyc"),
+        py_compile.compile(str(p), cfile=os.path.join(_pyc_dir, p.name + "c"),
                            doraise=True)
     except py_compile.PyCompileError as e:
         bad_compile.append("%s(%s)" % (p.name, type(e).__name__))
