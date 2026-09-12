@@ -22,6 +22,7 @@ import importlib.util
 import os
 import shutil
 import subprocess
+import tempfile
 import sys
 from pathlib import Path
 
@@ -467,6 +468,9 @@ print("       [记账] 执行器收尾: 未确认(受控注入) ｜ 测试兜底
 
 
 # ── C2. 停机要一直传到驱动层: 后续变异不得开跑 ──
+KEPT_CLEANED = []      # C2 触发停机后, 由本测试收掉的"留现场"目录
+
+
 def run_negctl_patched(patches, plan="healthy", phase=""):
     """在假仓库里给负控**副本**打补丁再整支跑 —— 补丁只落在测试自有的副本上。"""
     dest = build_fake()
@@ -482,7 +486,17 @@ def run_negctl_patched(patches, plan="healthy", phase=""):
     env.pop(tmpguard.KEEP_ENV, None)
     r = subprocess.run([sys.executable, str(f)], cwd=str(dest), capture_output=True,
                        text=True, timeout=600, env=env)
-    return r.returncode, r.stdout + r.stderr
+    out = r.stdout + r.stderr
+    # 停机路径**故意**保留现场(PDG_KEEP_TMP), 那是它该有的行为。但那份现场是本测试的
+    # 子进程造出来的, 归本测试收 —— 否则每跑一次就在 /tmp 留一个目录。
+    # 只清报告里点名的那一个路径, 不按前缀扫(那会删掉并发跑的别人的沙箱)。
+    for ln in out.splitlines():
+        if "现场保留在 " in ln:
+            leftover = ln.split("现场保留在 ", 1)[1].split("(")[0].strip()
+            if leftover.startswith(tempfile.gettempdir() + os.sep) and os.path.isdir(leftover):
+                shutil.rmtree(leftover, ignore_errors=True)
+                KEPT_CLEANED.append(leftover)
+    return r.returncode, out
 
 
 rc, out = run_negctl_patched(
@@ -528,6 +542,8 @@ for entry in os.listdir("/proc"):
     except (OSError, IndexError, ValueError):
         continue
 chk(not kids, "子进程: 本支起的进程都已回收(残留 pid %s)" % (kids or "无",))
+chk(KEPT_CLEANED and not [d for d in KEPT_CLEANED if os.path.exists(d)],
+    "临时目录: C2 停机留下的现场已由本测试收掉(%d 个, 无残留)" % len(KEPT_CLEANED))
 
 print()
 print("[SUM] OK=%d FAIL=%d" % (PASS[0], FAIL[0]))
