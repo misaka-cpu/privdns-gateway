@@ -1018,6 +1018,9 @@ jobs:
       - name: "继承锁凭据 (真 flock: 未加锁的 fd 不算继承且不被意外持锁/错 inode/他人持锁)"
         run: python3 tests/test-inherited-lock-proof.py
 
+      - name: "锁负控的执行有效性 (崩溃/零断言/退出码越界不许冒充「基线全绿」或「有牙」)"
+        run: python3 tests/test-negctl-exec-verdict.py
+
       - name: "WLOC 退役 · 事务闭环 (文件+mode+uid/gid、enabled、运行态、已加载配置全恢复)"
         run: bash tests/test-wloc-retire-txn-closure.sh
 
