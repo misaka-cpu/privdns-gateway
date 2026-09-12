@@ -3907,22 +3907,167 @@ _retire_core_has_mitm(){
 #
 # 幂等: 已经退役干净的机器上再跑, 不动文件也不重启任何服务。每台老机器升级都会跑到这里,
 # 白断一次 DNS 是真实代价。失败一律**具名且非 0**: 这不是"顺手打扫", 失败就意味着退役没做到。
+# ── 退役迁移的事务账本 ──────────────────────────────────────────────────────
+# 每成功改动一样, **立刻**登记一条撤销动作; 任一步失败就逆序执行并**逐项复核**。
+#
+# 账本要记的不只是文件。一次失败之后现场可能在四个维度上互相矛盾, 少记一个就留半截:
+#   · 文件的内容、存在性、mode、uid/gid —— 只记内容的话, 权限被改过照样是现场被动过;
+#   · 服务的**运行状态**(active / inactive / failed) —— 原来就没在跑的不能被起起来;
+#   · 服务的 **enabled 状态** —— `disable --now` 同时改了两样, 只 `start` 回去是拿运行状态
+#     冒充自启状态: 下次开机它不会起来, 而当下看着一切正常;
+#   · **已加载的运行配置** —— 把文件还原回去而不让服务重新读一遍, 盘上是旧的、跑着的是新的。
+#     这一条最容易漏, 也最难看出来: doctor 查文件, 文件是对的。
+#
+# 恢复失败时**两件事都要报**: 原始失败与恢复失败。只报后一件的话, 人不知道当初是什么炸的;
+# 只报前一件的话, 他不知道现场还是脏的。
 _RETIRE_UNDO=()
+_RETIRE_TMP=""                 # 本轮**自己**建的工作目录, 精确清理用(不按前缀扫)
+
 _retire_undo_push(){ _RETIRE_UNDO+=("$1"); }
+
 _retire_undo_run(){
-  local i rc=0
+  local i rc=0 out
   for (( i=${#_RETIRE_UNDO[@]}-1; i>=0; i-- )); do
-    eval "${_RETIRE_UNDO[$i]}" || rc=1
+    if out="$(eval "${_RETIRE_UNDO[$i]}" 2>&1)"; then
+      # 成功但**有话说**的情形也要说出来: 典型是"原状态 failed 复现不了, 已保持停止"。
+      # 只在失败时打印的话, 这类"恢复到了一个与原来不同、但已经是最接近的状态"就被吞掉了 ——
+      # 而那恰恰是用户需要自己去确认的一格。
+      [[ -n "$out" ]] && c_y "   ℹ️ 回滚说明: $out"
+    else
+      rc=1
+      c_r "   ⚠️ 回滚失败: ${out:-${_RETIRE_UNDO[$i]}}"
+    fi
   done
   _RETIRE_UNDO=()
   return "$rc"
 }
-_retire_fail(){   # $1=给用户的话; 其余行由调用方自己 c_y
-  _retire_undo_run || c_r "   ⚠️ 回滚过程中有步骤失败, 现场可能不完整 —— 请按上面的提示逐项复核。"
+
+# 把一份文件登记进账本(内容 + 存在性 + mode + uid/gid), 并给出复核。
+# $1 = 路径; 备份落在本轮工作目录里, 成功与失败两条路径都由 _retire_cleanup 精确清掉。
+_retire_track_file(){
+  local f="$1" key bak
+  key="$(printf '%s' "$f" | tr '/' '_')"
+  bak="$_RETIRE_TMP/$key"
+  if [[ -e "$f" ]]; then
+    cp -a "$f" "$bak" || return 1
+    cmp -s "$f" "$bak" || return 1
+    _retire_undo_push "_retire_restore_file $(printf '%q' "$bak") $(printf '%q' "$f")"
+  else
+    # 本来就没有 ⇒ 撤销 = 删掉。少了这一条, 一次失败的切换会留下一份**本来不存在**的配置。
+    _retire_undo_push "rm -f $(printf '%q' "$f")"
+  fi
+  return 0
+}
+
+_retire_restore_file(){   # $1=备份 $2=目标; 还原后复核内容与属性
+  local bak="$1" f="$2"
+  cp -a "$bak" "$f" || { echo "还原 $f 失败"; return 1; }
+  cmp -s "$bak" "$f" || { echo "还原 $f 之后内容对不上"; return 1; }
+  local a b
+  a="$(stat -c '%a %u %g' "$bak" 2>/dev/null)"
+  b="$(stat -c '%a %u %g' "$f" 2>/dev/null)"
+  [[ "$a" == "$b" ]] || { echo "还原 $f 之后 mode/uid/gid 对不上($a ≠ $b)"; return 1; }
+  return 0
+}
+
+# 让服务重新读一遍配置, 并**以 is-active 确认**。重启返回 0 不单独算成功:
+# systemd 的 restart 在某些失败形态下照样返回 0, 而服务落在 failed。
+_retire_reload_svc(){
+  local svc="$1"
+  systemctl restart "$svc" >/dev/null 2>&1 || { echo "重启 $svc 失败"; return 1; }
+  [[ "$(systemctl is-active "$svc" 2>/dev/null | tr -d '[:space:]')" == active ]] \
+    || { echo "$svc 重启后不是 active"; return 1; }
+  return 0
+}
+
+# 把某个服务的 enabled + 运行状态登记进账本。两样分开记, 分开还。
+_retire_track_svc(){
+  local svc="$1" en st
+  en="$(systemctl is-enabled "$svc" 2>/dev/null | tr -d '[:space:]')"
+  st="$(systemctl is-active  "$svc" 2>/dev/null | tr -d '[:space:]')"
+  _retire_undo_push "_retire_restore_svc $(printf '%q' "$svc") $(printf '%q' "${en:-unknown}") $(printf '%q' "${st:-unknown}")"
+}
+
+_retire_restore_svc(){   # $1=服务 $2=原 enabled $3=原运行状态
+  local svc="$1" en="$2" st="$3" rc=0
+  case "$en" in
+    enabled|enabled-runtime) systemctl enable "$svc" >/dev/null 2>&1 || rc=1;;
+    disabled)                systemctl disable "$svc" >/dev/null 2>&1 || rc=1;;
+    *) : ;;   # static / masked / 查不到 —— 不猜, 原样不动
+  esac
+  case "$st" in
+    active)   systemctl start "$svc" >/dev/null 2>&1 || rc=1;;
+    inactive) systemctl stop  "$svc" >/dev/null 2>&1 || rc=1;;
+    *)
+      # failed / activating / deactivating / 查不到 —— 这几种**复现不出来**: 没有哪条
+      # systemctl 命令能把一个服务变成 failed。假装还原了是撒谎, 当成回滚失败又会让一台
+      # pdg-mitm 早就崩着的机器每次都收到"回滚不完整"。
+      # 折中: 保证它是停的(那是这几种状态的共同事实 —— 都没在提供服务), 并**如实说明**
+      # 原状态复现不了。这条会被 _retire_undo_run 原样打出来。
+      systemctl stop "$svc" >/dev/null 2>&1 || true
+      echo "$svc 原来的运行状态是 ${st:-查不到}, 复现不了 —— 已保持停止, 请自行确认"
+      ;;
+  esac
+  local now_en now_st
+  now_en="$(systemctl is-enabled "$svc" 2>/dev/null | tr -d '[:space:]')"
+  now_st="$(systemctl is-active  "$svc" 2>/dev/null | tr -d '[:space:]')"
+  case "$en" in
+    enabled|enabled-runtime|disabled)
+      [[ "$now_en" == "$en" ]] || { echo "$svc 的 enabled 没还原($en → ${now_en:-查不到})"; rc=1; };;
+  esac
+  case "$st" in
+    active|inactive)
+      [[ "$now_st" == "$st" ]] || { echo "$svc 的运行状态没还原($st → ${now_st:-查不到})"; rc=1; };;
+  esac
+  return "$rc"
+}
+
+# 本轮**自己**建的东西, 按精确路径清 —— 不按 `*.preretire.*` 这类前缀扫盘:
+# 前缀扫会连别人留下的同名文件一起删, 而那正是"顺手清理"最容易闯的祸。
+_retire_cleanup(){
+  [[ -n "$_RETIRE_TMP" && -d "$_RETIRE_TMP" ]] && rm -rf "$_RETIRE_TMP"
+  _RETIRE_TMP=""
+}
+
+_retire_fail(){   # $1 = 给用户的话
+  local rb=0
+  _retire_undo_run || rb=1
+  _retire_cleanup
   c_r "❌ WLOC 退役: $1"
+  if [[ $rb -eq 1 ]]; then
+    c_r "   ⚠️ **回滚本身也有步骤失败**(上面已逐条列出) —— 现场可能不完整, 请按提示逐项复核。"
+    c_y "   这两件事都要看: 上面那句是本来为什么失败, 这一句是恢复没做干净。"
+  fi
   return 1
 }
 
+# ── WLOC 退役迁移 ────────────────────────────────────────────────────────────
+# 这里曾经是 migrate_pdg_mitm_service: 给老机器**补上** pdg-mitm 服务(WLOC 的 MITM 宿主)。
+# 现在方向反过来 —— WLOC 位置改写连同它专属的 MITM 执行能力已退役, 这一步负责把已经装在
+# 老机器上的那一套真正撤下来。
+#
+# ## 顺序: 先全部检查完, 再动第一样东西
+#
+# 第一版是"先停服务, 再查劫持表归属"。于是一台劫持表被手工写过别的域名的机器会先被停掉
+# pdg-mitm、再被告知"归属不清, 本次未做任何改动" —— 后半句是假话。
+#
+# ## schema 是**最后一个提交点**
+#
+# 它一提交, 带根证书的产物就被删了, 而那一步是不可逆的(产物已经没有记录能解释它, 只能重新
+# 生成)。所以它后面**不许再有任何可能失败的破坏性步骤** —— 否则一次 daemon-reload 失败就会
+# 留下"记录已是新格式、产物已删、而模块和服务是旧的"这种谁也解释不清的现场。
+# 于是排最后: 停服务 → 撤劫持 → 撤路由 → 关配置 → 删模块 → daemon-reload → **schema**。
+# 它自己是三段式且原子的(严格验 schema 1 + 产物 → 迁移 → 严格复核 schema 2), 失败时一个
+# 字节都不写, 而这里负责把它**之前**的每一步撤回去。
+#
+# ## 失败恢复: 四个维度, 见 _retire_track_file / _retire_track_svc 上面那段
+#
+# ## 保留策略(沿用项目既有那一条, 见 migrate_android_cleanup)
+#
+# 清运行时接管 + enabled=false, **保留地点与 CA 数据**。盘上的 CA 材料只报告、不替用户永久
+# 销毁 —— 销毁私钥不可逆, 而那张根证书很可能还被他手机信任着, 取消信任只有他自己能做。
+#
+# 幂等: 已经退役干净的机器上再跑, 不动文件也不重启任何服务。
 migrate_wloc_retire(){
   local R="${PDG_RETIRE_ROOT:-}"          # 测试用的整体前缀; 生产为空
   local unit="$R/etc/systemd/system/pdg-mitm.service"
@@ -3930,7 +4075,7 @@ migrate_wloc_retire(){
   local mj="$R/etc/privdns-gateway/mitm.json"
   local mods=("$R/opt/pdg-bot/mitm_server.py" "$R/opt/pdg-bot/mitm_wloc.py")
   local f
-  _RETIRE_UNDO=()
+  _RETIRE_UNDO=(); _RETIRE_TMP=""
 
   # ══ 第一段: 只读。该拒的在这里全拒掉, 一个 systemctl 都不调。 ══════════════
   local was_active=0
@@ -3943,7 +4088,10 @@ migrate_wloc_retire(){
   for f in "${mods[@]}" "$unit"; do [[ -e "$f" ]] && need_mods=1; done
 
   # 归属检查。这张表历来只由 WLOC 写(接管域名 = gs-loc 那两个)。出现别的东西 = 有人手工
-  # 改过, 归属不清 —— 一把清空会顺手删掉不属于本次退役的配置, 所以整笔拒绝, 交给人判断。
+  # 改过 —— 一把清空会顺手删掉不属于本次退役的配置, 整笔拒绝交给人判断。
+  #
+  # **模块残留也要过这道门**: unit 文件可能已经没了、服务状态可能查不到, 但只要劫持表归属
+  # 不清, 就不能靠"反正 unit 都不在了"跳过判断直接删模块 —— 那台机器上还有人在用这张表。
   if [[ $need_hij -eq 1 ]]; then
     local stray
     stray="$(sed 's/^[[:space:]]*//; s/[[:space:]]*$//' "$hij" | grep -vE '^$|^#' \
@@ -3957,112 +4105,119 @@ migrate_wloc_retire(){
     fi
   fi
 
-  # 一件活都没有 → 什么都不做。每台老机器升级都会跑到这里, 白断一次 DNS 是真实代价。
+  # 一件活都没有 → 只跑 schema 迁移(它自己幂等), 然后照旧报告 CA 残留。
+  # **CA-only 的机器也要走到报告那一段**: 服务、劫持、模块都干净了, 而盘上那张根证书还在、
+  # 手机上那份信任也还在 —— 不说的话, 用户永远不知道还有这一步要做。
   if [[ $need_svc -eq 0 && $need_hij -eq 0 && $need_core -eq 0 && $need_json -eq 0 && $need_mods -eq 0 ]]; then
-    _retire_ios_schema || return 1      # 记录格式该迁还是要迁(它自己是幂等的)
+    _retire_ios_schema || return 1
+    _retire_report_ca "$R"
     return 0
   fi
 
-  # ══ 第二段: 动运行态。从这里开始每一步都压一条撤销动作。 ═══════════════════
+  _RETIRE_TMP="$(mktemp -d)" || { c_r "❌ WLOC 退役: 无法创建工作目录。"; return 1; }
+
+  # ══ 第二段: 动运行态。每改一样就登记一条撤销。 ═════════════════════════════
   # ── ① 停服务(严格判据)──────────────────────────────────────────────────
   if [[ $need_svc -eq 1 ]]; then
+    # enabled 与运行状态**先记下来再动**。`disable --now` 一次改两样, 只 start 回去是拿
+    # 运行状态冒充自启状态: 下次开机它不会起来, 而当下看着一切正常。
+    _retire_track_svc pdg-mitm
     systemctl disable --now pdg-mitm >/dev/null 2>&1
     _retire_svc_stopped pdg-mitm || systemctl stop pdg-mitm >/dev/null 2>&1
     if ! _retire_svc_stopped pdg-mitm; then
       local st; st="$(systemctl is-active pdg-mitm 2>/dev/null | tr -d '[:space:]')"
-      c_r "❌ WLOC 退役: pdg-mitm 没有停稳(is-active=${st:-查不到}), 本次不再往下做。"
-      c_y "   ${st:-查不到} 不等于已停: 进程可能还在, 7894 可能还开着。"
-      c_y "   这时**不会**去删它的执行文件 —— 代码删了而进程还在, 等于留下一个没有源码可查的"
-      c_y "   MITM 在转发流量。查 systemctl status pdg-mitm 与 ss -lntp | grep 7894, 处理后"
-      c_y "   重跑 sudo pdg __migrate。"
-      [[ $was_active -eq 1 ]] && systemctl start pdg-mitm >/dev/null 2>&1
-      return 1
+      c_y "   ${st:-查不到} 不等于已停: 进程可能还在, 7894 可能还开着。这时**不会**去删它的"
+      c_y "   执行文件 —— 代码删了而进程还在, 等于留下一个没有源码可查的 MITM 在转发流量。"
+      c_y "   查 systemctl status pdg-mitm 与 ss -lntp | grep 7894, 处理后重跑 sudo pdg __migrate。"
+      _retire_fail "pdg-mitm 没有停稳(is-active=${st:-查不到}), 本次不再往下做。"; return 1
     fi
-    [[ $was_active -eq 1 ]] && _retire_undo_push "systemctl start pdg-mitm >/dev/null 2>&1"
   fi
 
   # ── ② 撤专属 DNS 劫持 ──────────────────────────────────────────────────
   if [[ $need_hij -eq 1 ]]; then
-    local bak; bak="$hij.preretire.$$"
-    if ! cp -a "$hij" "$bak" 2>/dev/null || ! cmp -s "$hij" "$bak"; then
-      rm -f "$bak" 2>/dev/null
-      _retire_fail "备份接管表失败(磁盘满?), 未动现网。"; return 1
-    fi
-    _retire_undo_push "cp -a $(printf '%q' "$bak") $(printf '%q' "$hij") 2>/dev/null; rm -f $(printf '%q' "$bak")"
+    # 撤销这一条时不能只把文件放回去 —— 跑着的 mosdns 读的还是空表, 盘上是旧的而跑着的
+    # 是新的。所以要补一条"重新加载"; 而账本是**逆序**执行的, 于是它必须**先压**:
+    # 压入顺序 [reload, 文件] ⇒ 回滚顺序 [文件, reload] ⇒ 先把表放回去, 再让 mosdns 重读。
+    # 反过来压的话回滚会先重载(读到的还是空表)再还文件, 等于什么都没修。
+    _retire_undo_push "_retire_reload_svc mosdns"
+    _retire_track_file "$hij" || { _retire_fail "备份接管表失败(磁盘满?)。"; return 1; }
     # 只清空, **不删文件**: mosdns 的 force_hijack domain_set 指着它, 文件没了 mosdns 起不来。
-    # 空文件 = 休眠, 那正是这套结构本来的静息态。
-    if ! : > "$hij"; then _retire_fail "清空接管表失败。"; return 1; fi
+    : > "$hij" || { _retire_fail "清空接管表失败。"; return 1; }
+    if ! _retire_reload_svc mosdns; then
+      _retire_fail "撤掉接管表后 mosdns 没能带着新表起来。"; return 1
+    fi
   fi
 
   # ── ③ 撤内核 MITM 路由 ─────────────────────────────────────────────────
-  # 只要**劫持表变过**或**内核里还留着 MITM 路由**就要重渲。两个条件是"或", 不是"劫持表
-  # 说了算" —— 见 _retire_core_has_mitm 上面那段。
+  # 只要**劫持表变过**或**内核里还留着 MITM 路由**就要重渲。两个条件是"或" —— 表可能早就
+  # 空了而那条 MITM-OUT 还在, 按"表说了算"处置的话它永远撤不掉而迁移每次报成功。
   if [[ $need_hij -eq 1 || $need_core -eq 1 ]]; then
+    local mc="$R${PDG_MIHOMO_CFG:-/etc/mihomo/config.yaml}"
+    # 同上: 先压重载、后压文件, 回滚才会是"先还旧配置, 再让内核重读它"。
+    _retire_undo_push "_retire_reload_svc $(printf '%q' "$(_pdg_core_svc)")"
+    _retire_track_file "$mc" || { _retire_fail "备份内核配置失败。"; return 1; }
     if ! _retire_rerender_core; then
       c_y "   查 sudo pdg doctor 与 mihomo -t 的输出, 处理后重跑 sudo pdg __migrate。"
       _retire_fail "重新渲染或启用内核配置失败。"; return 1
-    fi
-    # mosdns 读的是劫持表, 表变了就得让它重新加载。**不吞失败**: 吞掉的话, 一台 mosdns 起
-    # 不来的机器会被报成"退役完成", 而它此刻连 DNS 都没有。
-    if [[ $need_hij -eq 1 ]]; then
-      if ! systemctl restart mosdns >/dev/null 2>&1; then
-        _retire_fail "撤掉接管表后重启 mosdns 失败。"; return 1
-      fi
     fi
   fi
 
   # ── ④ 关掉配置里的开关(保留地点)────────────────────────────────────────
   if [[ $need_json -eq 1 ]]; then
-    local mjbak; mjbak="$mj.preretire.$$"
-    cp -a "$mj" "$mjbak" 2>/dev/null || { _retire_fail "备份 $mj 失败。"; return 1; }
-    _retire_undo_push "cp -a $(printf '%q' "$mjbak") $(printf '%q' "$mj") 2>/dev/null; rm -f $(printf '%q' "$mjbak")"
+    _retire_track_file "$mj" || { _retire_fail "备份 $mj 失败。"; return 1; }
     if ! _retire_disable_wloc_json "$mj"; then
       _retire_fail "改写 $mj 失败。"; return 1
     fi
   fi
 
-  # ── ⑤ iOS 描述文件记录的格式迁移(schema 1 → 2)────────────────────────
-  # 与上面那几步是**同一件事的两半**: 那边撤的是网关上的执行能力, 这边撤的是"还能把一份
-  # 嵌着退役根证书的描述文件再发一次"这个能力。只做前一半的话, 服务停了、劫持撤了, 而
-  # 「📱 iOS 描述文件 → 重新发送」照样会把那张根 CA 再装一次到用户手机上。
-  # 它自己是三段式且原子的(严格验 schema 1 + 产物 → 迁移 → 严格复核 schema 2), 失败时
-  # 一个字节都不写; 这里只负责把失败往上传并把**前面几步**撤回去。
+  # ── ⑤ 删退役模块与 unit(此时服务已确认停稳)─────────────────────────────
+  if [[ $need_mods -eq 1 ]]; then
+    for f in "${mods[@]}" "$unit"; do
+      [[ -e "$f" ]] || continue
+      _retire_track_file "$f" || { _retire_fail "备份 $f 失败。"; return 1; }
+      rm -f "$f" || { _retire_fail "删除 $f 失败。"; return 1; }
+    done
+    # daemon-reload **不吞失败**: unit 删了而 systemd 还记着它, 下一次 start 会起一个
+    # 已经没有可执行文件的服务。
+    if ! systemctl daemon-reload >/dev/null 2>&1; then
+      _retire_fail "删除 unit 后 systemctl daemon-reload 失败。"; return 1
+    fi
+    _retire_undo_push "systemctl daemon-reload >/dev/null 2>&1"
+  fi
+
+  # ── ⑥ iOS 描述文件记录的格式迁移 —— **最后一个提交点** ────────────────────
+  # 与上面那几步是同一件事的两半: 那边撤的是网关上的执行能力, 这边撤的是"还能把一份嵌着
+  # 退役根证书的描述文件再发一次"这个能力。它排在最后, 因为它一提交就删掉带 CA 的产物,
+  # 而那一步不可逆 —— 它后面不许再有任何可能失败的破坏性步骤。
   if ! _retire_ios_schema; then
-    c_y "   上面的服务/劫持/路由改动会被回滚。修好之后重跑 sudo pdg __migrate。"
+    c_y "   上面的服务/劫持/路由/模块改动会被回滚。修好之后重跑 sudo pdg __migrate。"
     _retire_fail "iOS 描述文件记录的格式迁移失败。"; return 1
   fi
 
-  # ── ⑥ 删退役模块与 unit(此时服务已确认停稳)─────────────────────────────
-  if [[ $need_mods -eq 1 ]]; then
-    local keep; keep="$(mktemp -d)" || { _retire_fail "无法创建临时目录。"; return 1; }
-    _retire_undo_push "rm -rf $(printf '%q' "$keep")"
-    for f in "${mods[@]}" "$unit"; do
-      [[ -e "$f" ]] || continue
-      cp -a "$f" "$keep/$(basename "$f")" 2>/dev/null \
-        || { _retire_fail "备份 $f 失败。"; return 1; }
-      _retire_undo_push "cp -a $(printf '%q' "$keep/$(basename "$f")") $(printf '%q' "$f") 2>/dev/null"
-      rm -f "$f" || { _retire_fail "删除 $f 失败。"; return 1; }
-    done
-    systemctl daemon-reload >/dev/null 2>&1
-    rm -rf "$keep"
-    _RETIRE_UNDO=()      # 到这一步已经不可逆(也不需要逆): 退役完成
-  fi
-
-  # ── ⑦ 盘上的 CA 材料: 只报告 ───────────────────────────────────────────
-  # 判定复用 mitm_ca 那份只读探测(它不写盘、四态分得清"确认不在"与"看不见")。
-  local careport; careport="$(_retire_ca_report "$R")"
+  # 到这里退役已经完成。账本作废(它记的是"怎么退回去", 而我们不再退了), 备份按精确路径清掉。
+  _RETIRE_UNDO=()
+  _retire_cleanup
   c_g "  ✅ WLOC 位置改写及其专属 MITM 执行能力已退役(服务已停, 专属劫持与路由已撤)。"
+  _retire_report_ca "$R"
+  return 0
+}
+
+# 盘上的 CA 材料: **只报告**。判定复用 mitm_ca 那份只读探测(它不写盘、四态分得清"确认不在"
+# 与"看不见")。销毁私钥不可逆, 而那张根证书很可能还被用户手机信任着 —— 取消信任这件事网关
+# 做不到, 只有他自己能做。所以哪怕别的都干净了, 这段话也要说。
+_retire_report_ca(){
+  local R="${1:-}" careport
+  careport="$(_retire_ca_report "$R")"
   case "$careport" in
     *'"present"'*|*'"residue"'*|*'"damaged"'*)
       c_y "  ⚠️ 盘上仍有 WLOC 时期的 CA 材料(按保留策略未删): $R/etc/privdns-gateway/ca/"
       c_y "     请到 iPhone「设置 → 通用 → 关于本机 → 证书信任设置」取消对 PrivDNS Gateway"
       c_y "     MITM CA 的信任, 并到「VPN 与设备管理」删掉旧描述文件 —— 网关退役不会自动"
-      c_y "     取消手机上已经给出的信任。确认之后可以自行删除该目录。";;
+      c_y "     取消手机上已经给出的信任。确认之后可以自行删除该目录。"
+      c_y "     iOS 描述文件请重新生成一份: 新版本不含根证书。";;
     *'"unknown"'*)
       c_y "  ⚠️ 无法确认 $R/etc/privdns-gateway/ca/ 下是否还有 CA 材料(目录不可达?), 请自行检查。";;
   esac
-  c_y "     iOS 描述文件请重新生成一份: 新版本不含根证书。"
-  return 0
 }
 
 # 只把 wloc.enabled 置 false。locations / active 是用户自己存的地点 —— 那是他的数据。
@@ -4124,18 +4279,21 @@ except iosstate.StateError as e:
   return 0
 }
 
-# 重渲内核配置(撤掉 MITM 路由)。**候选先行**: 先在临时目录里渲染出来并校验, 全过了才装。
+# 重渲内核配置(撤掉 MITM 路由)。**候选先行 + 同目录原子替换 + 后置确认**。
 #
-# 第一版是 `cd /opt/pdg-bot && python3 -c 'import bot; bot._render_mihomo_file()'` —— 两个问题:
-#   · `_render_mihomo_file` **直接写生产文件**。渲染出来的东西还没被任何人看过就已经是现网
-#     配置了; 校验不过时那份坏配置已经在盘上, 只能事后补救;
-#   · 写死 /opt/pdg-bot。测试要跑真模块就只能去动宿主那一份 —— 于是"改了仓库里的代码"与
-#     "测试结果"之间没有因果关系, 绿是假绿。现在一律从 $PDG_RETIRE_ROOT 下取, **不回退**:
-#     取不到就失败, 而不是悄悄用宿主上那一份。
+# 三条纪律各有来由:
+#   · 候选先行 —— 第一版是 `bot._render_mihomo_file()`, 它**直接写生产文件**: 渲染出来的
+#     东西还没被任何人看过就已经是现网配置了, 校验不过时那份坏配置已经在盘上;
+#   · **同目录**候选 + rename —— 跨目录 install/cp 不是原子的, 中途断电或磁盘满会留下半截
+#     文件。rename(2) 在同一个文件系统内是原子的: 要么全是新的, 要么全是旧的;
+#   · 后置确认 —— `systemctl restart` 返回 0 不单独算成功。systemd 在某些失败形态下照样
+#     返回 0 而服务落在 failed, 于是"重启成功"与"跑起来了"是两件事。
 #
-# 顺序: 渲染成字节 → 自证候选里确实没有 MITM-OUT → mihomo -t 校验候选 → 备份 → 原子安装 →
-# 重启 → 失败按备份还原并复核。重启失败**不吞**: 吞掉的话, 一台内核起不来的机器会被报成
-# "退役完成", 而它此刻连代理都没有。
+# 模块路径一律从 $PDG_RETIRE_ROOT 下取, **不回退宿主 /opt**: 回退的后果不是少一行提示,
+# 是测试里读到宿主那一份, 结果与被改的代码无关。
+#
+# 旧配置的备份与恢复**不在这里**做 —— 由调用方登记进事务账本(见 _retire_track_file):
+# 这一步之后还有别的步骤会失败, 只在本函数里自恢复的话, 后面炸了旧配置就回不来了。
 _retire_rerender_core(){
   local R="${PDG_RETIRE_ROOT:-}"
   local botdir="$R/opt/pdg-bot"
@@ -4144,8 +4302,10 @@ _retire_rerender_core(){
     c_y "   找不到 $botdir/bot.py —— 渲染器不在, 无法撤掉内核里的 MITM 路由。"
     return 1
   fi
-  local wd; wd="$(mktemp -d)" || return 1
-  # ① 候选: 只渲染出**字节**, 一个生产文件都不碰。
+  install -d -m700 "$(dirname "$mc")" 2>/dev/null || true
+  # 候选放**同目录**, 名字带 PID 以免撞车; 无论成败都由这里自己删(它不属于账本)。
+  local cand="$mc.retire-cand.$$"
+  rm -f "$cand"
   if ! ( cd "$botdir" && PDG_RETIRE_ROOT="$R" PYTHONPATH="$botdir" python3 -c '
 import os, sys
 sys.path.insert(0, os.getcwd())
@@ -4163,40 +4323,39 @@ if R:
                                      if os.path.exists(p) else "android")
 data, _meta = bot._render_mihomo_bytes(bot.load())
 sys.stdout.buffer.write(data)
-' ) > "$wd/cand" 2>"$wd/err"; then
-    c_y "   渲染候选失败: $(tr -d '\n' < "$wd/err" | tail -c 200)"
-    rm -rf "$wd"; return 1
+' ) > "$cand" 2>"$cand.err"; then
+    c_y "   渲染候选失败: $(tr -d '\n' < "$cand.err" | tail -c 200)"
+    rm -f "$cand" "$cand.err"; return 1
   fi
-  [[ -s "$wd/cand" ]] || { c_y "   渲染出来是空的, 拒绝安装。"; rm -rf "$wd"; return 1; }
-  # ② 自证: 候选里不许还有 MITM-OUT。渲染器已经不产生它了, 这一条是防"改了别处却没改渲染器"。
-  if grep -q 'MITM-OUT' "$wd/cand"; then
+  rm -f "$cand.err"
+  [[ -s "$cand" ]] || { c_y "   渲染出来是空的, 拒绝安装。"; rm -f "$cand"; return 1; }
+  # 自证: 候选里不许还有 MITM-OUT。渲染器已经不产生它了, 这一条防的是"改了别处、漏改渲染器"。
+  if grep -q 'MITM-OUT' "$cand"; then
     c_y "   渲染出来的候选里仍有 MITM-OUT —— 渲染器没有真的撤掉那条路由, 拒绝安装。"
-    rm -rf "$wd"; return 1
+    rm -f "$cand"; return 1
   fi
-  # ③ 校验候选(有 mihomo 才校验; 没有就跳过这一层, 但不假装校验过)
   if command -v mihomo >/dev/null 2>&1; then
-    if ! mihomo -t -d "$(dirname "$mc")" -f "$wd/cand" >"$wd/terr" 2>&1; then
-      c_y "   候选配置没通过 mihomo -t: $(tr -d '\n' < "$wd/terr" | tail -c 200)"
-      rm -rf "$wd"; return 1
+    if ! mihomo -t -d "$(dirname "$mc")" -f "$cand" >"$cand.terr" 2>&1; then
+      c_y "   候选配置没通过 mihomo -t: $(tr -d '\n' < "$cand.terr" | tail -c 200)"
+      rm -f "$cand" "$cand.terr"; return 1
     fi
+    rm -f "$cand.terr"
   fi
-  # ④ 备份 → 原子安装 → 重启 → 失败还原
-  local bak=""
+  # 属性跟着旧那份走(旧的不在就用 0600); 然后原子替换。
   if [[ -f "$mc" ]]; then
-    bak="$wd/live.bak"
-    cp -a "$mc" "$bak" || { c_y "   备份现网内核配置失败。"; rm -rf "$wd"; return 1; }
+    chmod --reference="$mc" "$cand" 2>/dev/null || chmod 600 "$cand"
+    chown --reference="$mc" "$cand" 2>/dev/null || true
+  else
+    chmod 600 "$cand"
   fi
-  install -d -m700 "$(dirname "$mc")" 2>/dev/null || true
-  if ! install -m600 "$wd/cand" "$mc"; then
-    c_y "   安装候选失败。"; rm -rf "$wd"; return 1
+  if ! mv -f "$cand" "$mc"; then
+    c_y "   原子替换内核配置失败。"; rm -f "$cand"; return 1
   fi
-  if ! systemctl restart "$(_pdg_core_svc)" >/dev/null 2>&1; then
-    [[ -n "$bak" ]] && cp -a "$bak" "$mc" 2>/dev/null
-    systemctl restart "$(_pdg_core_svc)" >/dev/null 2>&1 || true
-    c_y "   撤掉 MITM 路由后 $(_pdg_core_svc) 重启失败, 已把内核配置还原。"
-    rm -rf "$wd"; return 1
+  # 后置确认: 重启 + is-active。返回 0 不单独算数。
+  if ! _retire_reload_svc "$(_pdg_core_svc)"; then
+    c_y "   撤掉 MITM 路由后 $(_pdg_core_svc) 没能带着新配置起来。"
+    return 1
   fi
-  rm -rf "$wd"
   return 0
 }
 
