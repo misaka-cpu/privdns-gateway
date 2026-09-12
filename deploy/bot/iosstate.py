@@ -37,8 +37,10 @@ import iosprofile                                            # noqa: E402
 import pdgtx                                                 # noqa: E402
 # 复用 pdgtx 的锁而不是自己再写一把: 描述文件生成会读 mitm.json / CA / 证书, 这些正是
 # pdgtx 事务在改的东西。两把不同的锁等于没有锁。
-# ⚠️ 因此**不能**在已持有该锁的路径里调用本模块的写操作(`pdg update` 持锁调 __migrate 就是
-# 这种路径), 否则自死锁 —— 这个坑在 v1.7.1/v1.7.2 真踩过。生命周期只在用户主动生成时初始化。
+# ⚠️ 因此在已持有该锁的路径里调用本模块的写操作(`pdg update` 持锁调 __migrate 就是这种路径),
+# 必须走**继承锁**那条: _LifecycleLock 会先用 pdgtx.inherited_lock_fd() 证明那把锁确实在手,
+# 证明得了就借用(且不释放), 证明不了才自己去抢。不这么做就是每次 TxBusy —— 这个坑在
+# v1.7.1/v1.7.2 真踩过。生命周期只在用户主动生成时初始化。
 
 SCHEMA = 2
 # 能**读懂并迁移**的历史格式。它们不是运行时 —— 本版本写出去的记录永远是 SCHEMA。
@@ -170,7 +172,13 @@ def effective_ssids(meta, ssids):
     if ssids is not None:
         return list(ssids)
     cur = (meta or {}).get("current") or {}
-    return list((cur.get("inputs") or {}).get("ssids") or ())
+    if cur:
+        return list((cur.get("inputs") or {}).get("ssids") or ())
+    # current 是空的: 要么从没生成过(那本来就没有名单可沿用), 要么那一栏在 WLOC 退役迁移里
+    # 被丢掉了。后一种情况下用户的名单还在 retired_inputs 里 —— 不看它就等于把"撤掉 WLOC"
+    # 顺手做成了"清空他的强制直连名单"。
+    ri = (meta or {}).get("retired_inputs") or {}
+    return list(ri.get("ssids") or ())
 
 
 def effective_inputs(meta, dot_host, server_addresses, ssids, template=None):
@@ -213,6 +221,15 @@ def _blank(schema=None):
         #   · 下一次生成从这个号往下数, 而不是退回第 1 版(用户与我们对不上版本号);
         #   · 它同时是"这台手机上很可能装着一份带根证书的旧描述文件"的唯一标记。
         base["retired_revision"] = None
+        # 被退役那一版的**输入**(schema 2 形态)。退役撤的是 WLOC, 不是用户的 Wi-Fi 名单:
+        # "没传 SSID = 沿用记录里的"这条语义原本从 current.inputs 取, 而 current 被退役后
+        # 那一栏是空的 —— 不留一份的话, 下一次**普通生成**会把用户配好的强制直连名单当成
+        # "用户要清空", 悄悄抹掉并推进一个版本。他既没做过这个决定, 界面上也不会报。
+        #
+        # 只留**输入**, 不留 revision / sha256 / generated_at / sent_at —— 那些一带上就成了
+        # 一条"曾经发过这一版"的记录, 而它对应的产物已经因为嵌着根证书被删掉了。留意图, 不
+        # 留凭证。
+        base["retired_inputs"] = None
     return base
 
 
@@ -457,19 +474,33 @@ class _LifecycleLock:
         self.enabled = enabled
         self.what = what
         self._lk = None
+        self.inherited = False        # 锁是父进程的 → 我们只借用, 退出时不还
 
     def __enter__(self):
-        if self.enabled:
-            self._lk = pdgtx._Lock()
-            try:
-                self._lk.__enter__()
-            except pdgtx.TxBusy:
-                raise StateError("已有配置操作正在执行, %s已跳过(避免并发写坏记录)。" % self.what)
-            except pdgtx.TxRefused as e:
-                raise StateError(str(e))
+        if not self.enabled:
+            return self
+        # `pdg update` 持锁调 `__migrate`, 迁移又要调本模块的写操作 —— 那条路上这把锁**已经
+        # 在手**(在父进程的 fd 上)。再去 flock 一次同一个文件是新的 OFD, 必然撞上父进程自己。
+        # 所以先找有没有**可证明**的继承锁(判据见 pdgtx.inherited_lock_fd: fd 开着 + 指向的
+        # 就是锁文件 + 在那个 fd 上真跑过一次非阻塞 flock)。
+        #
+        # 这里**不是** lock=False: 没有继承锁时照旧自己去抢, 抢不到照旧拒绝。差别在于借来的
+        # 那把**不由我们释放** —— 释放的是父进程那把(同一个 OFD), 窗口期里谁都能进来。
+        if pdgtx.inherited_lock_fd() is not None:
+            self.inherited = True
+            return self
+        self._lk = pdgtx._Lock()
+        try:
+            self._lk.__enter__()
+        except pdgtx.TxBusy:
+            raise StateError("已有配置操作正在执行, %s已跳过(避免并发写坏记录)。" % self.what)
+        except pdgtx.TxRefused as e:
+            raise StateError(str(e))
         return self
 
     def __exit__(self, *exc):
+        if self.inherited:
+            return False              # 借来的不还 —— 父进程还要用它
         if self._lk:
             self._lk.__exit__(None, None, None)
             self._lk = None
@@ -758,7 +789,7 @@ def _migrate_1_to_2(meta):
            "created_at": meta["created_at"],
            "migration_pending": meta["migration_pending"],
            "current": None, "previous": None,
-           "retired_revision": None}
+           "retired_revision": None, "retired_inputs": None}
     retired, keep = [], {}
     for which in ("current", "previous"):                    # ②
         rec = meta.get(which)
@@ -775,6 +806,11 @@ def _migrate_1_to_2(meta):
     out["current"] = keep.get("current")
     out["previous"] = keep.get("previous")
     out["retired_revision"] = max(retired) if retired else None
+    # current 那一栏被退役 ⇒ 用户的非 WLOC 意图(SSID、DoT 主机名、网关地址…)会跟着一起没。
+    # 取**它**的输入而不是 previous 的: current 才是最新的那次意图, 退回上一版等于把用户
+    # 后来改过的设置又改回去。current 保住了就不必留 —— 意图还在它自己那份 inputs 里。
+    if meta.get("current") is not None and "current" not in keep:
+        out["retired_inputs"] = _migrate_record_1_to_2(meta["current"])["inputs"]
     _check_meta_object(out, schema=SCHEMA)                   # ③ 严格 schema 2
     return out, sorted(set(retired))
 
@@ -807,11 +843,33 @@ def _migrate_schema_locked(meta_path=None, art_root=None):
     except ValueError:
         raise StateError("iOS 描述文件记录 %s 已损坏, 拒绝迁移 —— 不自动重建: 重建会生成一个"
                          "新身份, 而你手机上那份描述文件将永远无法再被更新。" % mp)
+    missing = []
     try:
         sc = _schema_of(meta, "iOS 描述文件记录 %s" % mp)
         if sc == SCHEMA:
             _check_meta_object(meta, schema=SCHEMA)     # 幂等这一格也要复核, 不是直接返回
             return {"changed": False, "reason": "记录已是 schema %d" % SCHEMA}
+        # 先把**旧记录整份**验过(严格 schema 1)。
+        _check_meta_object(meta, schema=sc)
+        # 再验**产物**, 而且必须在动任何东西之前。
+        #
+        # 只验记录是不够的: 迁移接下来要删掉带根证书的那几份产物、并改写记录。一份被改过的
+        # 产物在这两步之后就**再也查不出来**了 —— 文件没了, 记录说的是新格式, 现场干干净净。
+        # 那正是"把损坏洗成当前格式"的样子, 比留着损坏更糟: 留着至少 doctor 还会报。
+        #
+        # 缺失与损坏要分开(既有契约就是这么分的, 见 artifact_health):
+        #   · 文件**不在** = MISSING。那台机器只是丢了文件, 身份与记录都还在, 迁移照走,
+        #     报告里如实说哪一栏不在 —— 迁移前后它都是 MISSING, 不是迁移弄坏的;
+        #   · 文件**在但对不上** = 被改过。整笔拒, 一个字节都不动。
+        ids = derive_ids(meta["instance_id"])
+        for which in ("current", "previous"):
+            if meta.get(which) is None:
+                continue
+            data = read_artifact(which, ar)
+            if data is None:
+                missing.append(which)
+                continue
+            _check_artifact(meta, which, data, ids, schema=sc)
         new, retired = _migrate_1_to_2(meta)
     except RestoreRefused as e:
         raise StateError("iOS 描述文件记录 %s 没通过「%s」这道门: %s\n"
@@ -825,21 +883,31 @@ def _migrate_schema_locked(meta_path=None, art_root=None):
                 tx.remove(art_path(which, ar))
         tx.write(mp, json.dumps(new, ensure_ascii=False, indent=2,
                                 sort_keys=True).encode("utf-8") + b"\n", 0o600)
-    # 写后复核: 从盘上**重新读一遍**再验一次。上面验的是内存里那个对象, 而落盘可能坏在
-    # 序列化、权限、磁盘满上 —— 那几种坏法都不会抛异常。
-    back = load(mp)
-    _check_meta_object(back, schema=SCHEMA)
-    if back != new:
-        raise StateError("迁移写盘后读回来的记录与预期不一致, 请检查 %s。" % mp)
-    for which in ("current", "previous"):
-        if back.get(which) is not None:
-            verified_artifact(back, which, ar)   # 保留下来的产物必须仍然对得上它的记录
+        # 写后复核放在**事务里面**: 从盘上重新读一遍再验一次。上面验的是内存里那个对象,
+        # 而落盘可能坏在序列化、权限、磁盘满上 —— 那几种坏法都不会抛异常。
+        #
+        # 放在 with 外面(第一版就是)的后果很具体: 复核失败时记录已经改写、产物已经删掉,
+        # 而异常没有经过 _Txn.__exit__, 于是既没回滚也没人知道现场是半截的。放进来之后
+        # 任何一条不成立都会走 _restore(), 内容 + mode + uid/gid 逐项还原并复核。
+        back = load(mp)
+        _check_meta_object(back, schema=SCHEMA)
+        if back != new:
+            raise StateError("迁移写盘后读回来的记录与预期不一致, 请检查 %s。" % mp)
+        for which in ("current", "previous"):
+            # 缺失的那一栏迁移前就缺, 不能拿它当"迁移把产物弄丢了"。
+            if back.get(which) is not None and which not in missing:
+                verified_artifact(back, which, ar)   # 保留下来的产物仍要对得上它的记录
     return {"changed": True, "from": sc, "to": SCHEMA,
             "retired_revisions": retired,
             "retired_revision": new["retired_revision"],
-            "reason": ("已迁移到 schema %d" % SCHEMA) if not retired else
-                      ("已迁移到 schema %d; 第 %s 版描述文件里嵌着已退役的根证书, 已退役"
-                       % (SCHEMA, "、".join(str(x) for x in retired)))}
+            "missing_artifacts": missing,
+            "reason": (("已迁移到 schema %d" % SCHEMA) if not retired else
+                       ("已迁移到 schema %d; 第 %s 版描述文件里嵌着已退役的根证书, 已退役"
+                        % (SCHEMA, "、".join(str(x) for x in retired))))
+                      + ("" if not missing else
+                         "; 注意: %s 的产物文件本来就不在服务器上(迁移前后都缺)"
+                         % "、".join("当前版本" if w == "current" else "上一版"
+                                     for w in missing))}
 
 
 def _update_meta(fn, meta_path=None, lock=True, what="本次修改"):
@@ -1208,6 +1276,31 @@ def _check_meta_object(meta, schema=None):
         rr = meta["retired_revision"]
         if not isinstance(rr, int) or isinstance(rr, bool) or rr < 1:
             _refuse(gate, "retired_revision 只能是 null 或正整数(实际 %r)" % (rr,))
+    if schema >= 2 and meta["retired_inputs"] is not None:
+        # 它要被 effective_ssids 当成"用户最后一次的意图"来用, 所以必须过**和记录里的
+        # inputs 同一套**契约 —— 松一格, 一份被改过的备份就能借这一栏把 SSID / 探测地址
+        # 塞进下一次生成。
+        ri = meta["retired_inputs"]
+        if not isinstance(ri, dict):
+            _refuse(gate, "retired_inputs 只能是 null 或一份输入对象")
+        types = _INPUT_TYPES_BY_SCHEMA[schema]
+        want = {k for k, _ in types}
+        if set(ri) != want:
+            _refuse(gate, "retired_inputs 的字段与 schema %d 对不上(多/少: %s)"
+                    % (schema, "、".join(sorted(set(ri) ^ want)) or "?"))
+        for k, ty in types:
+            v = ri[k]
+            if ty is bool:
+                if not isinstance(v, bool):
+                    _refuse(gate, "retired_inputs.%s 不是布尔" % k)
+            elif isinstance(v, bool) or not isinstance(v, ty):
+                _refuse(gate, "retired_inputs.%s 类型不对(%r)" % (k, type(v).__name__))
+        if ri["schema"] != schema:
+            _refuse(gate, "retired_inputs.schema=%r 与记录顶层的 schema=%d 不一致"
+                    % (ri["schema"], schema))
+        _check_inputs_canonical(ri, "retired_inputs")
+        if ri["ondemand_core"] != _ONDEMAND_CORE:
+            _refuse("按需规则", "retired_inputs 里的 ondemand_core 不是本项目的固定骨架")
     if not isinstance(meta.get("migration_pending"), bool):
         _refuse(gate, "migration_pending 必须是布尔(实际 %r)"
                 % type(meta.get("migration_pending")).__name__)

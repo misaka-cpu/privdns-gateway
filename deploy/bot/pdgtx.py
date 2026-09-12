@@ -940,6 +940,63 @@ LINE_LEVEL_ONLY = ("mosdns_lines", "kv_env", "hostname_line", "adblock_sources")
 
 
 # ── 全局锁(fail-closed)────────────────────────────────────────────────────────
+# ── 继承来的锁 ──────────────────────────────────────────────────────────────
+# `pdg update` **全程持着**这把锁, 中途用刚装好的新脚本跑一次 `pdg __migrate`。跑在那里面的
+# Python 子进程如果照常去 flock 同一个文件, 拿到的是一个**新的** open file description ——
+# 它不持有那把锁, 于是撞上父进程自己, 每次都 TxBusy。v1.7.1 就是这么把整次更新回滚掉的,
+# 而 update 还报成功, 只有 doctor 那条告警露了馅(见 pdg.sh 的 _lock_inherited 与
+# migrate_mosdns_explicit_proxy 上面那两段)。
+#
+# 三种绕法**都不行**, 它们把并发保护弄没了:
+#   · 无条件跳过取锁     → 第三方 CLI/Bot 此刻照样能写;
+#   · 中途 LOCK_UN       → 释放的是父进程那把(同一个 OFD), 窗口期里谁都能进来;
+#   · 信任调用方"说已锁" → 说了不算。
+#
+# 所以要**凭据**, 不要声明。判据与 pdg.sh 那边逐条同源(两侧判不一样才是真的危险):
+#   1. 那个 fd 是打开的 —— "fd 号存在"本身什么都不说明, 它可能是任何东西;
+#   2. 它指向的必须**就是锁文件本身**。比路径字符串不算数(/proc 里的路径可以是符号链接、
+#      可以被 bind mount 换掉、文件也可能被删了重建), 只有设备号 + inode 说了算;
+#   3. 在这个 fd 上**真跑一次非阻塞 flock**。同一个 OFD 已经持锁时它直接成功; 锁在别人
+#      手里时它失败。这一步才是凭据 —— 前两步只是防认错文件, 不能代替它。
+# 三步全过才算数。任何一步不过就当没有继承, 老老实实自己去开、自己去抢。
+#
+# fd 号沿用 shell 侧的约定(9)。`PDG_LOCK_FD=none` 明确关掉这条识别 —— 测试拿它做"撤销修复"
+# 的对照: 关掉之后 CLI 持锁的场景必须重新失败, 否则说明根本没在抢那把锁。
+LOCK_FD_ENV = "PDG_LOCK_FD"
+LOCK_FD_DEFAULT = 9
+
+
+def inherited_lock_fd(path=None):
+    """父进程传下来、**已经持有**那把锁的 fd; 没有(或证明不了)就返回 None。
+
+    注意它**不会**去 unlock: 那把锁是父进程的, 释放了就等于在它眼皮底下把门打开。
+    """
+    raw = os.environ.get(LOCK_FD_ENV, "")
+    if raw.strip().lower() in ("none", "off", "0-"):
+        return None
+    try:
+        fd = int(raw) if raw.strip() else LOCK_FD_DEFAULT
+    except ValueError:
+        return None
+    if fd < 0:
+        return None
+    try:
+        st = os.fstat(fd)                                   # ① fd 是开着的
+    except OSError:
+        return None
+    try:
+        want = os.stat(path or LOCKFILE)                    # ② 指的就是锁文件本身
+    except OSError:
+        return None
+    if (st.st_dev, st.st_ino) != (want.st_dev, want.st_ino):
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)      # ③ 凭据: 真跑一次
+    except OSError:
+        return None
+    return fd
+
+
 class _Lock:
     """整笔事务持有同一把跨进程锁。拿不到 → TxBusy; **打不开锁文件 → TxRefused**。
 
