@@ -34,6 +34,9 @@ c_g(){ echo "$*"; }; c_y(){ echo "$*"; }; c_r(){ echo "$*"; }
 SC_LOG=""
 DAEMON_RELOAD_FAIL=""
 RESTART_FAIL=""
+# restart **返回 0** 却没起来 —— systemd 在某些失败形态下就是这样。`restart` 的退出码与
+# "服务真的在跑"是两件事, 这个旋钮专门制造那个差。
+RESTART_RC0_DEAD=""
 STOP_LEAVES=""
 
 _svc_conf(){   # 某个服务"读的那份配置"
@@ -69,6 +72,7 @@ systemctl(){
     stop) echo "${STOP_LEAVES:-inactive}" > "$SBOX/state/$svc.state"; return 0;;
     start|restart)
       [[ "$RESTART_FAIL" == "$svc" ]] && { echo failed > "$SBOX/state/$svc.state"; return 1; }
+      [[ "$RESTART_RC0_DEAD" == "$svc" ]] && { echo failed > "$SBOX/state/$svc.state"; return 0; }
       echo active > "$SBOX/state/$svc.state"; _svc_snapshot "$svc"; return 0;;
     reset-failed) return 0;;
     *) return 0;;
@@ -100,9 +104,19 @@ _retire_ios_schema(){
 }
 
 machine(){   # $1 = pdg-mitm 的 enabled 状态, $2 = 运行状态
+  # **先还原 TMPDIR 再建沙箱**: 上一轮把它指进了上一个沙箱, 而那个沙箱已经被删掉 ——
+  # 带着一个不存在的 TMPDIR 去跑 mktemp, 沙箱会建不出来, 而报出来的是"沙箱构造失败",
+  # 看起来像被测逻辑坏了。
+  unset TMPDIR
   sbox_new || return 1
+  # 迁移的工作目录是 `mktemp -d`, 默认落在 /tmp —— 沙箱里看不见它清没清。
+  # 把 TMPDIR 指进沙箱, "本轮的工作目录有没有被清掉"才是可观察的。
+  # 夹具自己造 CA 时也会用 mktemp(留下 c.pem/k.pem), 那不是被测代码的残留。
+  # 所以**先把夹具那一批造完, 再**把 TMPDIR 指进一个空的子目录 —— 之后落在里面的东西
+  # 就只可能是被测代码建的。
+  mkdir -p "$SBOX/tmp"
   SC_LOG="$SBOX/systemctl.log"; : > "$SC_LOG"
-  DAEMON_RELOAD_FAIL=""; RESTART_FAIL=""; STOP_LEAVES=""; SCHEMA_FAIL=""
+  DAEMON_RELOAD_FAIL=""; RESTART_FAIL=""; RESTART_RC0_DEAD=""; STOP_LEAVES=""; SCHEMA_FAIL=""
   sbox_legacy_ios on Home >/dev/null || return 1
   echo ios > "$SBOX/etc/privdns-gateway/platform"
   printf 'domain:gs-loc.apple.com\ndomain:gs-loc-cn.apple.com\n' > "$SBOX/etc/mosdns/rules/mitm_hijack.txt"
@@ -125,6 +139,8 @@ YAML
   svc_set pdg-mitm "$1" "$2"
   svc_set mihomo enabled active
   svc_set mosdns enabled active
+  # 夹具该建的都建完了 —— 现在把 TMPDIR 指进一个**干净的**子目录。
+  rm -rf "$SBOX/tmp"; mkdir -p "$SBOX/tmp"; export TMPDIR="$SBOX/tmp"
   return 0
 }
 
@@ -292,10 +308,44 @@ RESTART_FAIL=""
   || bad "留下了一份本来不存在的 live 配置"
 sbox_rm
 
+# ══ 4b. 重启返回 0 但服务没起来 ════════════════════════════════════════════
+echo
+echo "══ 4b. restart 返回 0 ≠ 跑起来了 ══"
+machine enabled active || bad "沙箱构造失败"
+core_sha="$(fsha "$SBOX/etc/mihomo/config.yaml")"
+RESTART_RC0_DEAD=mihomo
+run; rc=$?
+RESTART_RC0_DEAD=""
+[[ $rc -ne 0 ]] \
+  && ok "内核重启返回 0 但落在 failed → 仍判失败(退出码不单独算数)" \
+  || bad "restart 返回 0 就被当成成功了 —— 服务其实没起来"
+[[ "$(fsha "$SBOX/etc/mihomo/config.yaml")" == "$core_sha" ]] \
+  && ok "这种失败下旧内核配置也已恢复" || bad "旧内核配置没恢复"
+sbox_rm
+
+# ══ 4c. 本轮的工作目录成功与失败都要清掉 ═══════════════════════════════════
+echo
+echo "══ 4c. 工作目录 ══"
+machine enabled active || bad "沙箱构造失败"
+run
+left="$(find "$SBOX/tmp" -mindepth 1 2>/dev/null | head -5)"
+[[ -z "$left" ]] && ok "成功路径: 本轮工作目录已清掉" \
+  || bad "成功路径残留工作目录: $(echo "$left" | tr '\n' ' ')"
+sbox_rm
+
+machine enabled active || bad "沙箱构造失败"
+SCHEMA_FAIL=1; run; SCHEMA_FAIL=""
+left="$(find "$SBOX/tmp" -mindepth 1 2>/dev/null | head -5)"
+[[ -z "$left" ]] && ok "失败路径: 本轮工作目录也清掉了" \
+  || bad "失败路径残留工作目录: $(echo "$left" | tr '\n' ' ')"
+sbox_rm
+
 # ══ 5. CA-only 残留: 其它都干净时仍要报告 ══════════════════════════════════
 echo
 echo "══ 5. 只剩 CA 材料 ══"
+unset TMPDIR
 sbox_new || bad "沙箱构造失败"
+mkdir -p "$SBOX/tmp"; export TMPDIR="$SBOX/tmp"
 SC_LOG="$SBOX/systemctl.log"; : > "$SC_LOG"
 mkdir -p "$SBOX/state"; svc_set mihomo enabled active; svc_set mosdns enabled active
 echo ios > "$SBOX/etc/privdns-gateway/platform"
@@ -303,6 +353,7 @@ echo ios > "$SBOX/etc/privdns-gateway/platform"
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
   -keyout "$SBOX/etc/privdns-gateway/ca/ca.key" -out "$SBOX/etc/privdns-gateway/ca/ca.crt" \
   -days 30 -subj "/CN=PDG CA-only" >/dev/null 2>&1
+rm -rf "$SBOX/tmp"; mkdir -p "$SBOX/tmp"; export TMPDIR="$SBOX/tmp"
 out="$( ( exec 9>"$PDG_LOCKFILE"; flock -n 9; migrate_wloc_retire ) 2>&1 )"; rc=$?
 [[ $rc -eq 0 ]] && ok "只剩 CA 材料: rc=0" || bad "rc=$rc"
 grep -q 'CA' <<<"$out" && ok "仍然报告了盘上还有 CA 材料" || bad "没报告 CA 残留: ${out:0:120}"
@@ -311,6 +362,7 @@ grep -qE '信任|证书信任设置' <<<"$out" \
 [[ -e "$SBOX/etc/privdns-gateway/ca/ca.key" ]] && ok "私钥未被销毁(保留策略)" || bad "私钥被删了"
 sbox_rm
 
+unset TMPDIR
 echo
 echo "[SUM] OK=$pass FAIL=$nfail"
 [[ $nfail -eq 0 ]]
