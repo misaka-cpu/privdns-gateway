@@ -288,11 +288,56 @@ def art_path(which, root=None):
 
 
 def read_artifact(which, root=None):
+    """产物字节; 读不到一律 None。
+
+    ⚠️ 这个函数**分不清**"不在"与"读不出来"。判断"该不该把它当成缺失"时不要用它 ——
+    用 read_artifact_strict()。这里保留宽容语义是因为 artifact_health 那条路本来就是
+    "拿不到就报不健康", 它不需要区分。
+    """
     try:
         with open(art_path(which, root), "rb") as f:
             return f.read()
     except OSError:
         return None
+
+
+def read_artifact_strict(which, root=None):
+    """(字节, 状态)。状态为 "ok" / "missing" / "error:<原因>"。
+
+    为什么要三态: 迁移会把"读不到产物"当成"那台机器只是丢了文件"放行 —— 然后改写记录、
+    删掉带根证书的产物。可 OSError 里只有 **ENOENT** 才是"不在":
+
+      · EACCES     权限不够 —— 文件还在, 只是这一刻读不了;
+      · EIO        介质出错 —— 文件多半还在;
+      · EISDIR     那个位置上放着一个目录 —— 不是我们的产物, 但也绝不是"没有";
+      · ELOOP/断链 软链在, 目标解析不了。
+
+    把这些都压成"不在", 后果是一台产物**还在**、只是暂时读不出来的机器被当成缺产物照常
+    迁移。等权限修好, 那份东西已经没有任何记录能解释它了。
+    "看不见"不等于"没有" —— 与 mitm_ca._probe 是同一个判据(那边也踩过这个坑)。
+    """
+    p = art_path(which, root)
+    try:
+        st = os.lstat(p)
+    except FileNotFoundError:
+        return None, "missing"
+    except OSError as e:
+        return None, "error:lstat %s" % (errno.errorcode.get(e.errno, e.errno),)
+    if stat.S_ISLNK(st.st_mode):
+        # 软链本身在。目标解析得开才谈得上读; 解析不开是**断链**, 不是"不在"。
+        try:
+            os.stat(p)
+        except OSError as e:
+            return None, "error:软链指向解析不了的目标(%s)" % (
+                errno.errorcode.get(e.errno, e.errno),)
+    elif not stat.S_ISREG(st.st_mode):
+        return None, "error:这个位置上不是普通文件(%s)" % (
+            "目录" if stat.S_ISDIR(st.st_mode) else "特殊文件",)
+    try:
+        with open(p, "rb") as f:
+            return f.read(), "ok"
+    except OSError as e:
+        return None, "error:读取失败(%s)" % (errno.errorcode.get(e.errno, e.errno),)
 
 
 # ── 服务端产物健康状态 ──────────────────────────────────────────────────────
@@ -865,10 +910,18 @@ def _migrate_schema_locked(meta_path=None, art_root=None):
         for which in ("current", "previous"):
             if meta.get(which) is None:
                 continue
-            data = read_artifact(which, ar)
-            if data is None:
-                missing.append(which)
+            data, why = read_artifact_strict(which, ar)
+            if why == "missing":
+                missing.append(which)          # **真的**不在: 迁移前后都缺, 不是迁移弄丢的
                 continue
+            if why != "ok":
+                # 读不出来 ≠ 不在。文件多半还在, 只是这一刻拿不到 —— 照 MISSING 放行的话,
+                # 记录会被改写、带根证书的产物会被删掉, 而等问题修好那份东西已经没有任何
+                # 记录能解释它了。
+                _refuse("产物可读性",
+                        "%s的产物读不出来(%s) —— 这不是「文件不在」, 不能当成缺失放行。"
+                        "修好之后重跑迁移。" % ("当前版本" if which == "current" else "上一版",
+                                                why.split(":", 1)[1]))
             _check_artifact(meta, which, data, ids, schema=sc)
         new, retired = _migrate_1_to_2(meta)
     except RestoreRefused as e:
