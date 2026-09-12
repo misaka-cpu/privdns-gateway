@@ -756,7 +756,13 @@ def readerr_case(label, setup, cleanup=None):
         if _snap(mpp, arr) != before:
             bad("%s: 拒绝了却动过记录/产物" % label)
             return
-        ok("%s → 拒绝(%s), 记录与产物零改动" % (label, msg.split("\n")[0][:48]))
+        # **必须是可读性那道门**拦下的, 不能只断言"被拒了"。
+        # 把这道门拿掉之后, data 会以 None 继续往下走, 被"三件配套: 是空文件"那一条拒掉 ——
+        # 于是"只要红就算过"的写法在撤销修复之后照样绿, 这一格等于没有。
+        if "读不出来" not in msg and "产物可读性" not in msg:
+            bad("%s: 拒是拒了, 但不是可读性那道门: %s" % (label, msg.replace("\n", " ")[:110]))
+            return
+        ok("%s → 由可读性那道门拒绝, 记录与产物零改动" % label)
     finally:
         if cleanup:
             cleanup(mpp, arr)
