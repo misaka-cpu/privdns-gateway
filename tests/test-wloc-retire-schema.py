@@ -29,6 +29,7 @@ import json
 import os
 import plistlib
 import shutil
+import stat
 import sys
 import tempfile
 from pathlib import Path
@@ -388,6 +389,323 @@ except Exception as e:  # noqa: BLE001
     bad("load 读 schema 1 抛 %s: %s" % (type(e).__name__, str(e)[:70]))
 chk(json.load(open(mp, encoding="utf-8"))["schema"] == 1,
     "load 是**只读**的: 盘上那份仍是 schema 1, 改写由明确的迁移入口负责")
+
+# ══ 7. 退役不许静默改掉用户的非 WLOC 设置 ═══════════════════════════════════
+print()
+print("══ 7. 用户的 SSID / OnDemand 意图必须活过退役 ══")
+# 带 CA 的 current 被退役之后, 记录里那一栏就空了。而"没传 SSID = 沿用记录里的"这条语义
+# (effective_ssids)正是从 current.inputs.ssids 取的 —— current 一空, 下一次**普通生成**
+# 会把用户配好的强制直连名单当成"用户要清空", 悄悄抹掉并推进一个版本。
+#
+# 用户既没做过这个决定, 界面上也不会报。退役撤的是 WLOC, 不是他的 Wi-Fi 名单。
+SS = ["Home", "Office"]
+w = tmpguard.mkdtemp(prefix="pdg-schema-keep.")
+mp, art, old = legacy_meta(w, wloc=True, ssids=SS)
+S.migrate_schema(meta_path=mp, art_root=art, lock=False)
+m = S.load(mp)
+chk(m.get("current") is None, "前置: 带 CA 的 current 确实被退役了")
+
+# ① 沿用语义: 不指定 SSID 时, 算出来的输入里必须仍是用户那份名单
+eff = S.effective_inputs(m, DOT, IP, None, TMPL)
+chk(eff["ssids"] == SS, "不指定 SSID → 仍沿用用户配好的名单(实得 %r)" % (eff["ssids"],))
+
+# ② 走**真的**后继生成: 产物里必须真的有那条 SSID 规则
+meta2, lv2, why2, data2, ch2 = S.generate(DOT, IP, None, TMPL, meta_path=mp,
+                                          art_root=art, lock=False)
+chk(meta2["current"]["inputs"]["ssids"] == SS,
+    "退役后第一次普通生成: SSID 名单原样保留(实得 %r)" % (meta2["current"]["inputs"]["ssids"],))
+_pl = plistlib.loads(data2)
+_rules = _pl["PayloadContent"][0].get("OnDemandRules") or []
+chk(_rules and _rules[0].get("SSIDMatch") == SS,
+    "产物里那条 SSID 强制直连规则仍在最前面(实得 %r)" % (_rules[0] if _rules else None))
+# OnDemand 骨架本身也不能被退役改掉
+chk([r for r in _rules if "SSIDMatch" not in r] == S.ondemand_core(TMPL) or True, "")
+PASS[0] -= 1                                   # 上一行只是取值, 不计数
+_core = [dict(r) for r in _rules if "SSIDMatch" not in r]
+for r in _core:
+    if "URLStringProbe" in r:
+        r["URLStringProbe"] = "<probe>"
+chk(_core == S.ondemand_core(TMPL), "OnDemand 骨架没有被退役改动")
+
+# ③ 保留意图**不等于**保留一份能发的旧产物
+chk(m.get("previous") is None, "没有把带 CA 的旧版留作 previous")
+for f in (S.CUR, S.PREV):
+    pass
+chk(not any(b"com.apple.security.root" in open(os.path.join(art, f), "rb").read()
+            for f in (S.CUR, S.PREV) if os.path.exists(os.path.join(art, f))),
+    "盘上不存在任何仍含根证书的产物")
+
+# ④ 不许伪造发送记录: 沿用下来的只能是**输入**, 不能带版本号/指纹/发送时间
+raw = json.load(open(mp, encoding="utf-8")) if False else None
+mig = json.load(open(mp, encoding="utf-8"))
+kept = mig.get("retired_inputs")
+if kept is None:
+    bad("迁移没有把用户意图带过来 —— 下一次生成会把 SSID 抹掉")
+else:
+    ok("迁移把退役那一版的**输入**带了过来(retired_inputs)")
+    stray = sorted(set(kept) & {"revision", "sha256", "sent_at", "generated_at", "digest"})
+    chk(not stray, "带过来的只有输入, 没有版本号/指纹/发送时间(实得 %s)" % (stray or "无"))
+    chk("wloc_enabled" not in kept and "wloc_ca_sha256" not in kept,
+        "带过来的输入里没有 WLOC 字段")
+
+# ⑤ 空名单的机器: 不许凭空长出 SSID
+w2 = tmpguard.mkdtemp(prefix="pdg-schema-keep0.")
+mp2, art2, _o2 = legacy_meta(w2, wloc=True, ssids=())
+S.migrate_schema(meta_path=mp2, art_root=art2, lock=False)
+eff2 = S.effective_inputs(S.load(mp2), DOT, IP, None, TMPL)
+chk(eff2["ssids"] == [], "本来就没有 SSID 的机器: 迁移后仍然是空(不凭空长出来)")
+
+# ⑥ 混合状态: current 带 CA(要退役)、previous 不带(本来可留)
+#    —— "有 previous 没 current"这一组不成立, 所以 previous 也一起退役; 但用户意图取的是
+#    **current 那一版**的(它才是最新的一次意图), 不能退回到 previous 那一版的旧名单。
+w3 = tmpguard.mkdtemp(prefix="pdg-schema-mixed.")
+mp3, art3, _o3 = legacy_meta(w3, wloc=False, ssids=["OldWiFi"])
+m3 = json.load(open(mp3, encoding="utf-8"))
+# 把 current 改成"带 CA"那一版, 名单换成新的 —— 手工拼(当前代码渲染不出带 CA 的产物)
+cur_data = _render_legacy(["NewWiFi"], CA_DER, S.derive_ids(m3["instance_id"]))
+ci = dict(m3["current"]["inputs"])
+ci.update({"ssids": ["NewWiFi"], "wloc_enabled": True,
+           "wloc_ca_sha256": hashlib.sha256(CA_DER).hexdigest()})
+m3["current"] = dict(m3["current"], inputs=ci, digest=S.digest_of(ci),
+                     sha256=hashlib.sha256(cur_data).hexdigest())
+open(os.path.join(art3, S.CUR), "wb").write(cur_data)
+open(mp3, "w", encoding="utf-8").write(json.dumps(m3, ensure_ascii=False, indent=2,
+                                                  sort_keys=True) + "\n")
+S.migrate_schema(meta_path=mp3, art_root=art3, lock=False)
+m3n = S.load(mp3)
+chk(m3n.get("current") is None and m3n.get("previous") is None,
+    "混合状态: current 带 CA → 两栏一起退役(有 previous 没 current 这一组不成立)")
+eff3 = S.effective_inputs(m3n, DOT, IP, None, TMPL)
+chk(eff3["ssids"] == ["NewWiFi"],
+    "混合状态: 沿用的是 current 那一版的最新意图, 不是 previous 的旧名单(实得 %r)"
+    % (eff3["ssids"],))
+
+# ⑦ 撤销修复对照: 把沿用链掐掉, ② 必须转红
+_saved = S.effective_ssids
+try:
+    S.effective_ssids = lambda meta, ssids: list(ssids) if ssids is not None else \
+        list(((meta or {}).get("current") or {}).get("inputs", {}).get("ssids") or ())
+    w4 = tmpguard.mkdtemp(prefix="pdg-schema-undo.")
+    mp4, art4, _o4 = legacy_meta(w4, wloc=True, ssids=SS)
+    S.migrate_schema(meta_path=mp4, art_root=art4, lock=False)
+    e4 = S.effective_inputs(S.load(mp4), DOT, IP, None, TMPL)
+    chk(e4["ssids"] == [], "撤销修复对照: 掐掉沿用链后 SSID 确实被抹掉 —— ② 不是碰巧绿的")
+finally:
+    S.effective_ssids = _saved
+
+# ══ 8. 改任何东西之前先验产物; 改的过程要么整笔成, 要么整笔回 ══════════════
+print()
+print("══ 8. 迁移前的产物校验与原子性 ══")
+
+
+def _tree(d):
+    """目录的完整身份: 相对路径 + 内容 sha + mode + uid + gid。回滚要能精确复原,
+    光比内容不够 —— 权限被改掉同样是现场被动过。"""
+    out = {}
+    for base, _dirs, files in os.walk(d):
+        for f in sorted(files):
+            fp = os.path.join(base, f)
+            st = os.lstat(fp)
+            out[os.path.relpath(fp, d)] = (
+                hashlib.sha256(open(fp, "rb").read()).hexdigest(),
+                stat.S_IMODE(st.st_mode), st.st_uid, st.st_gid)
+    return out
+
+
+def _snap(mp, art):
+    return (_tree(os.path.dirname(mp)), _tree(art))
+
+
+def refuse_case(label, mutate, *, words=()):
+    """迁移必须**具名拒绝**, 且记录与产物一个字节、一格权限都不许动。"""
+    ww = tmpguard.mkdtemp(prefix="pdg-schema-atom.")
+    mpp, arr, _m = legacy_meta(ww, wloc=True)
+    mutate(mpp, arr)
+    before = _snap(mpp, arr)
+    try:
+        S.migrate_schema(meta_path=mpp, art_root=arr, lock=False)
+        bad("%s: 迁移没有拒绝 —— 损坏现场被洗成了当前格式" % label)
+        return
+    except S.StateError as e:
+        msg = str(e)
+    except Exception as e:  # noqa: BLE001
+        bad("%s: 抛的是 %s 而不是 StateError" % (label, type(e).__name__))
+        return
+    hit = [w for w in words if w in msg]
+    if words and not hit:
+        bad("%s: 拒是拒了, 但不是这道门: %s" % (label, msg.replace("\n", " ")[:110]))
+        return
+    if _snap(mpp, arr) != before:
+        bad("%s: 拒绝了却动过记录/产物(含权限)" % label)
+        return
+    ok("%s → 具名拒绝(%s), 记录与产物逐字节+权限未动" % (label, (hit or ["已拒"])[0]))
+
+
+def _tamper_cur_bytes(mpp, arr):
+    fp = os.path.join(arr, S.CUR)
+    b = bytearray(open(fp, "rb").read())
+    i = b.find(b"dot.example.com")
+    b[i:i + 3] = b"XXX"
+    open(fp, "wb").write(bytes(b))
+
+
+def _swap_identity(mpp, arr):
+    # 产物换成**另一台机器**生成的那一份(身份对不上), 并把记录里的 sha 配平
+    other = _render_legacy((), CA_DER, S.derive_ids("11111111-2222-4333-8444-555555555555"))
+    open(os.path.join(arr, S.CUR), "wb").write(other)
+    m = json.load(open(mpp, encoding="utf-8"))
+    m["current"]["sha256"] = hashlib.sha256(other).hexdigest()
+    open(mpp, "w", encoding="utf-8").write(json.dumps(m, ensure_ascii=False, indent=2,
+                                                      sort_keys=True) + "\n")
+
+
+def _swap_ca(mpp, arr):
+    # 产物里的根证书换成另一张, 记录里的 sha 配平 —— 只剩指纹那道门能拦
+    other = _ca_der()
+    doc = plistlib.loads(open(os.path.join(arr, S.CUR), "rb").read())
+    for x in doc["PayloadContent"]:
+        if x.get("PayloadType") == "com.apple.security.root":
+            x["PayloadContent"] = other
+    blob = plistlib.dumps(doc)
+    open(os.path.join(arr, S.CUR), "wb").write(blob)
+    m = json.load(open(mpp, encoding="utf-8"))
+    m["current"]["sha256"] = hashlib.sha256(blob).hexdigest()
+    open(mpp, "w", encoding="utf-8").write(json.dumps(m, ensure_ascii=False, indent=2,
+                                                      sort_keys=True) + "\n")
+
+
+refuse_case("产物被改过(与记录的 sha256 对不上)", _tamper_cur_bytes, words=("内容指纹", "sha256"))
+refuse_case("产物是另一台机器生成的(身份对不上)", _swap_identity, words=("身份", "instance"))
+refuse_case("产物里的根证书换成了另一张", _swap_ca, words=("根证书", "指纹"))
+
+# 合法缺失 ≠ 损坏: 记录说有 current 而盘上没有那份文件, 是既有契约里的 MISSING,
+# 不该被当成"被人改过"而整笔拒 —— 那台机器只是丢了文件, 身份还在, 迁移照走。
+w8 = tmpguard.mkdtemp(prefix="pdg-schema-missing.")
+mp8, art8, _o8 = legacy_meta(w8, wloc=False)
+os.remove(os.path.join(art8, S.CUR))
+try:
+    rep8 = S.migrate_schema(meta_path=mp8, art_root=art8, lock=False)
+    ok("产物合法缺失 → 仍然迁移(不与「被改过」混为一谈): %s" % rep8.get("reason", "")[:40])
+    chk(json.load(open(mp8, encoding="utf-8"))["schema"] == 2, "缺失产物的机器也迁到了 schema 2")
+    chk("缺" in json.dumps(rep8, ensure_ascii=False) or rep8.get("missing"),
+        "报告里说明了哪一栏的产物不在(实得 %s)" % json.dumps(rep8, ensure_ascii=False)[:90])
+except S.StateError as e:
+    bad("产物合法缺失被当成损坏整笔拒了: %s" % str(e)[:90])
+
+# ── 原子性: 注入三种失败, 每一种都要逐字节 + 权限恢复 ──────────────────────
+import pdgtx as _TX  # noqa: E402
+
+
+def inject_case(label, arm, disarm):
+    ww = tmpguard.mkdtemp(prefix="pdg-schema-inj.")
+    mpp, arr, _m = legacy_meta(ww, wloc=True)
+    before = _snap(mpp, arr)
+    arm()
+    try:
+        S.migrate_schema(meta_path=mpp, art_root=arr, lock=False)
+        bad("%s: 注入了失败却报成功" % label)
+        return
+    except Exception:  # noqa: BLE001
+        pass
+    finally:
+        disarm()
+    after = _snap(mpp, arr)
+    if after == before:
+        ok("%s → 整笔回到操作前(内容 + mode + uid/gid 逐项相等)" % label)
+    else:
+        diff = []
+        for tag, b, a in (("记录目录", before[0], after[0]), ("产物目录", before[1], after[1])):
+            for k in sorted(set(b) | set(a)):
+                if b.get(k) != a.get(k):
+                    diff.append("%s/%s: %r → %r" % (tag, k, b.get(k), a.get(k)))
+        bad("%s: 没有完整回滚 —— %s" % (label, "; ".join(diff)[:200]))
+
+
+_real_write = _TX.atomic_write
+_state = {"n": 0}
+
+
+def _boom_write():
+    def w(path, data, *a, **kw):
+        if path.endswith("ios-profile.json") and _state["n"] == 0:
+            _state["n"] = 1
+            raise OSError(28, "No space left on device")
+        return _real_write(path, data, *a, **kw)
+    _state["n"] = 0
+    _TX.atomic_write = w
+
+
+inject_case("写记录时磁盘满", _boom_write, lambda: setattr(_TX, "atomic_write", _real_write))
+
+_real_load = S.load
+
+
+def _boom_load():
+    def l(path=None):
+        if _state.get("armed"):
+            _state["armed"] = False
+            raise S.StateError("注入: 写后读回失败")
+        return _real_load(path)
+    _state["armed"] = True
+    S.load = l
+
+
+inject_case("写完之后读回失败", _boom_load, lambda: setattr(S, "load", _real_load))
+
+_real_check = S._check_meta_object
+
+
+def _boom_verify():
+    """只打**写后**那一次复核。
+
+    迁移里对 schema 2 的复核有两次: _migrate_1_to_2 结尾那次(在内存里、写盘之前)与写盘之后
+    从盘上读回来那次。打第一次只能证明"写之前失败不会动盘", 那本来就成立; 要证的是
+    **写完之后**才失败时能不能整笔回滚, 所以跳过第一次、打第二次。
+    """
+    def c(meta, schema=None):
+        r = _real_check(meta, schema)
+        if schema == S.SCHEMA:
+            _state["v"] = _state.get("v", 0) + 1
+            if _state["v"] == 2:
+                raise S.RestoreRefused("注入", "末段复核失败")
+        return r
+    _state["v"] = 0
+    S._check_meta_object = c
+
+
+def _disarm_verify():
+    S._check_meta_object = _real_check
+    _state["v"] = False
+
+
+inject_case("末段复核失败", _boom_verify, _disarm_verify)
+
+# ── 合法样本必须**真的走通**, 不能"拒绝或成功均可" ────────────────────────
+w9 = tmpguard.mkdtemp(prefix="pdg-schema-legit.")
+mp9, art9, o9 = legacy_meta(w9, wloc=False, ssids=["Home"])
+rep9 = S.migrate_schema(meta_path=mp9, art_root=art9, lock=False)
+chk(rep9.get("changed") is True, "合法旧记录: 迁移确实发生了(不是被拒)")
+m9 = S.load(mp9)
+chk(m9["schema"] == 2 and m9["current"] is not None
+    and m9["current"]["sha256"] == o9["current"]["sha256"],
+    "合法旧记录: 产物一个字节没动, 记录已是 schema 2")
+S.verified_artifact(m9, "current", art9)
+ok("合法旧记录: 迁移后 verified_artifact 仍然交得出字节(契约自洽)")
+
+# ── 撤销修复对照: 拿掉产物校验, 损坏样本就会被洗掉 ────────────────────────
+ww = tmpguard.mkdtemp(prefix="pdg-schema-undo8.")
+mpp, arr, _m = legacy_meta(ww, wloc=True)
+_tamper_cur_bytes(mpp, arr)
+_real_ca = S._check_artifact
+try:
+    S._check_artifact = lambda *a, **k: None          # 撤销这一轮加的那道门
+    try:
+        S.migrate_schema(meta_path=mpp, art_root=arr, lock=False)
+        ok("撤销修复对照: 拿掉产物校验后, 被改过的产物确实被洗成了当前格式")
+    except S.StateError:
+        bad("撤销修复对照: 拿掉产物校验后仍被拒 —— 说明拦它的不是这道门")
+finally:
+    S._check_artifact = _real_ca
 
 print()
 print("[SUM] OK=%d FAIL=%d" % (PASS[0], FAIL[0]))
