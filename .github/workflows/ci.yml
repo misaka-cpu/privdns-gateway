@@ -1015,6 +1015,12 @@ jobs:
       - name: "WLOC 退役 · 真模块回环 (真渲染器真撤 MITM 路由/候选先行/不回退宿主 /opt)"
         run: bash tests/test-wloc-retire-realrun.sh
 
+      - name: "继承锁凭据 (真 flock: 未加锁的 fd 不算继承且不被意外持锁/错 inode/他人持锁)"
+        run: python3 tests/test-inherited-lock-proof.py
+
+      - name: "WLOC 退役 · 事务闭环 (文件+mode+uid/gid、enabled、运行态、已加载配置全恢复)"
+        run: bash tests/test-wloc-retire-txn-closure.sh
+
       - name: "平台文案/门控回归 (客户端·状态 按平台/内核 + README 文案一致)"
         run: python3 tests/test-platform-copy.py
 
