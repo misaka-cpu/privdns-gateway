@@ -951,108 +951,96 @@ LINE_LEVEL_ONLY = ("mosdns_lines", "kv_env", "hostname_line", "adblock_sources")
 #   · 中途 LOCK_UN       → 释放的是父进程那把(同一个 OFD), 窗口期里谁都能进来;
 #   · 信任调用方"说已锁" → 说了不算。
 #
-# ## 为什么不能用 flock 来证明
+# ## 为什么 flock 和 PID 都证明不了
 #
-# 前两版都栽在同一件事上: **flock 只能回答"我能不能锁上", 回答不了"这把锁本来是谁的"。**
+# 前三版栽在同两件事上: **flock 只能回答"我能不能锁上", 回答不了"这把锁本来是谁的"**;
+# **PID 是进程级的, 而 flock 锁是挂在「打开文件描述(OFD)」上的**。
 #
-#   v1: 直接在候选 fd 上 flock, 成功就算继承。父进程只 open 没 flock 时, 子进程一锁就成 ——
+#   v1: 直接在候选 fd 上 flock, 成功就算继承。父进程只 open 没 flock 时子进程一锁就成 ——
 #       判成继承, 而按继承的规矩退出时不释放, 于是凭空多出一把没人认领的锁。
 #   v2: 先用另一个 OFD(probe)探一探本来有没有人持锁, 被挡住才去锁候选 fd。看着严密, 但那
 #       两步之间有个真实的窗口: 持锁者恰好在这一瞬放手, 候选 fd 上那次 flock 就**成功**了,
-#       拿到的是一把**全新的**锁 —— 判据仍然说"继承", 仍然不释放。
-#       靠重试去缩小窗口只是把问题变成概率问题, 而"偶尔错"比"一直错"更难查。
+#       拿到的仍是一把全新的锁。靠重试缩小窗口只是把问题变成概率问题。
+#   v3: 改用 /proc/locks 里记的持有者 PID, 同 PID 就直接放行。可同一个进程里另一次 open()
+#       出来的 fd 是**另一个 OFD**, 它并不持锁, 却和真正持锁的那个 fd 共用一个 PID:
+#         · 于是任意一个 fd 都能冒充"继承来的锁"。实测: A 线程用真实 _Lock 持着锁, B 线程
+#           拿另一次 open 的 fd 就被判成继承、直接进了临界区 —— 两边同时在里面, 而 A 退出
+#           后 B 还在里面, 此刻第三个 fd 已经能把锁拿走。互斥与锁生命周期一起失守。
+#         · 同 PID 不成立时 v3 会去 flock 一把, 再回读一次记录来分辨新旧锁。那次**回读**
+#           失败时它 LOCK_UN —— 解掉的是**父进程**那把(同一个 OFD), 一次读 /proc 失败就把
+#           父进程的临界区拆了, 而父 fd 还开着, 别人已经能进来。
 #
-# ## 所有权证据: /proc/locks
+# ## 所有权证据: /proc/self/fdinfo/<fd>
 #
-# Linux 把每一把文件锁连同**当初调用 flock 的那个进程的 PID** 一起摆在 /proc/locks 里。
-# 子进程继承 fd 之后, 那条记录里的 PID 仍然是父进程 —— 这正是"这把锁是上面传下来的"的
-# 直接证据, 而一把我们自己刚拿到的锁只会记着**我们自己的** PID。两者从根上分得开。
+# 内核只在**这个 fd 背后的 OFD 自己持锁**时, 才往 fdinfo 里写出 `lock:` 行 —— 它是 OFD 级的,
+# 正好对上 flock 的语义。本机(Linux 6.1.0-52-amd64)实测, 不是照字段名猜的:
 #
-# 于是判据变成三步, 而且**全程不碰 flock**:
-#   1. 候选 fd 是打开的 —— "fd 号存在"本身什么都不说明;
-#   2. 它指向的就是锁文件本身(dev + ino)。比路径字符串不算数: /proc 里的路径可以是符号链接、
-#      可以被 bind mount 换掉、文件也可能被删了重建;
-#   3. /proc/locks 里那把锁的持有者是**我们自己或某个祖先进程**。
+#   持锁的 fd              → lock:\t1: FLOCK  ADVISORY  WRITE <pid> <maj:min:ino> 0 EOF
+#   同进程另一次 open()    → 没有 lock 行          ← 这条把 v3 那个冒充从根上堵死
+#   dup()/fork 继承来的 fd → 有, 与原 fd 一模一样  ← 真正的继承照常认得出
+#   别的进程持锁时我方 fd  → 没有 lock 行
+#   真实 CLI 形态(exec 9>LOCK; flock -n 9, 外部 flock 上完锁就退出)→ fd 9 有 lock 行
 #
-# 不 flock ⇒ 不可能"顺手拿到一把新锁", 也就没有把新锁误认成旧锁的余地; 持锁者中途放手的话
-# 第 3 步直接查不到记录, 老老实实走普通锁。
+# 类型字段必须一起卡死: LOCK_SH 记成 READ、POSIX lockf 记成 POSIX, 都不是我们要的那把排他
+# flock 写锁; inode 再对一次, 防止 fd 中途被换掉。
 #
-# 读不到 /proc/locks(非 Linux、容器里被挡)⇒ 证明不了 ⇒ 当没有继承。那会退化成"自己去抢、
-# 抢不到就 TxBusy" —— 与修这个坑之前一样, 但**不会**多造出一把锁。fail-closed。
+# 判据于是只剩两步, 而且**一次 flock 都不调**:
+#   1. 候选 fd 是打开的, 且指向的就是锁文件本身(dev + ino)。比路径字符串不算数: /proc 里的
+#      路径可以是符号链接、可以被 bind mount 换掉、文件也可能被删了重建;
+#   2. 这个 fd 的 fdinfo 里有那把锁 —— 是**它自己**持着, 不是"本进程某处持着"。
+#
+# 不调 flock 就同时消掉了两类事故: 不会顺手拿到一把新锁留在那儿没人认领, 也不存在任何
+# LOCK_UN 去动一把不属于自己的锁。判定前后锁状态原封不动 —— 这条不变量与实现细节无关。
+#
+# 读不到 fdinfo(非 Linux、/proc 没挂、容器挡了、fd 已关)⇒ **证明不了** ⇒ 按"没有继承"处理,
+# 回到普通取锁路径: 抢得到就自己持着, 抢不到就 TxBusy。既不凭空进临界区, 也不解别人的锁。
+# fail-closed —— 代价是退回修这个坑之前的行为, 不是多造一把锁或者拆掉一把。
 #
 # fd 号沿用 shell 侧的约定(9)。`PDG_LOCK_FD=none` 明确关掉这条识别 —— 测试拿它做"撤销修复"
 # 的对照。
 LOCK_FD_ENV = "PDG_LOCK_FD"
 LOCK_FD_DEFAULT = 9
-PROC_LOCKS = "/proc/locks"
+PROC_FDINFO = "/proc/self/fdinfo/%d"
 
 
-def _flock_record(st):
-    """(锁 id, 持有者 PID) —— /proc/locks 里这个 (dev, ino) 上的 FLOCK 写锁; 没有就 None。
+def _fd_holds_lock(fd, st):
+    """这个 fd 背后的 OFD **自己**是否持着 st 那个 inode 上的 flock 排他写锁。
 
-    只取**持有者**: 以 `->` 开头的那几行是排队等锁的, 把它们算成持有者会把"有人在等"
-    误读成"有人持着"。
-
-    读不到 /proc/locks(非 Linux、容器里被挡)返回 "unknown" —— 与"没有锁"是两回事:
-    没有锁可以放心走普通锁, 而读不到意味着**证明不了**, 只能当没有继承。
+    True / False / None。None 是"读不到 ⇒ 证明不了", 与 False 不是一回事: False 说明确实
+    没锁, 可以放心走普通取锁; None 只是我们看不见, 两者的共同点仅仅是"都不能当继承用"。
     """
     want = "%02x:%02x:%d" % (os.major(st.st_dev), os.minor(st.st_dev), st.st_ino)
     try:
-        with open(PROC_LOCKS, encoding="utf-8") as f:
-            for line in f:
-                parts = line.split()
-                if len(parts) < 6 or parts[1] == "->":
-                    continue
-                if parts[1] != "FLOCK" or parts[3] != "WRITE" or parts[5] != want:
-                    continue
-                try:
-                    return parts[0], int(parts[4])
-                except ValueError:
-                    return parts[0], -1
+        with open(PROC_FDINFO % fd, encoding="utf-8") as f:
+            lines = [ln for ln in f if ln.startswith("lock:")]
     except OSError:
-        return "unknown"
-    return None
+        return None
+    for ln in lines:
+        parts = ln.split()[1:]          # 去掉 "lock:"; 其余与 /proc/locks 同构
+        if len(parts) < 6 or parts[1] == "->":
+            continue                    # `->` 那几行是在排队等锁的, 不是持有者
+        if parts[1] != "FLOCK" or parts[3] != "WRITE" or parts[5] != want:
+            continue                    # 共享锁记成 READ, POSIX 锁记成 POSIX, 都不算
+        return True
+    return False
 
 
 def inherited_lock_fd(path=None):
-    """父进程传下来、**已经持有**那把锁的 fd; 没有(或证明不了)就返回 None。
+    """父进程传下来、**这个 fd 自己已经持着**那把锁时返回它; 其余一律 None。
 
-    退出时**绝不 unlock**: 那把锁是父进程的, 释放了就等于在它眼皮底下把门打开。
-    而"万一自己不小心拿到了一把新锁", 见下面第 ④ 步 —— 那种情况下会当场还回去。
+    退出时**绝不 unlock**: 那把锁是父进程的, 释放了就等于在它眼皮底下把门打开。而既然判定
+    全程不调 flock, 也就不存在"自己不小心拿到一把新锁"要还回去的情况。
 
-    ## 判据
+    ## 判据(细节与取舍见上面那段注释)
 
-      ① 候选 fd 是打开的, 且指向的**就是锁文件本身**(dev + ino)。比路径字符串不算数:
-         /proc 里的路径可以是符号链接、可以被 bind mount 换掉、文件也可能被删了重建;
-      ② /proc/locks 上这个 inode **有**一把 FLOCK 写锁。没有 ⇒ 谈不上"继承", 而且这一步
-         **不碰 flock** —— 不碰就绝不会顺手拿到一把新锁;
-      ③ 那把锁的持有者 PID 就是我们自己 ⇒ 本进程已经持着(嵌套调用/测试), 直接算数,
-         同样不必 flock;
-      ④ 否则在候选 fd 上试一次非阻塞 flock:
-           失败 ⇒ 锁在**另一个 OFD** 手里, 那是并发不是继承 ⇒ 拒;
-           成功 ⇒ 还要再看一眼 /proc/locks 分辨两种可能:
-             · 记录没变(持有者仍是原来那个 PID)⇒ 我们这次 flock 落在**同一个 OFD** 上,
-               内核认它本来就持着 —— 这才是真正的继承;
-             · 记录变成了**我们自己的 PID** ⇒ 原持有者恰好在这一瞬放了手, 我们拿到的是一把
-               **全新的**锁 ⇒ 当场 LOCK_UN 还回去, 判定为"不是继承"。
+      ① 候选 fd 是打开的, 且指向的就是锁文件本身(dev + ino);
+      ② `/proc/self/fdinfo/<fd>` 里有这个 inode 上的 FLOCK 写锁 —— 内核只对**持锁的那个
+         OFD** 写出这行, 所以它回答的正是"这把锁是不是就在这个 fd 手里", 而不是"本进程有没有
+         人持着"。同进程另一次 open() 的 fd 没有这行, dup/继承来的有。
 
-    ## 为什么必须是这套, 而不是前两版
-
-    前两版都栽在同一件事上: **flock 只能回答"我能不能锁上", 回答不了"这把锁本来是谁的"。**
-
-      v1: 直接在候选 fd 上 flock, 成功就算继承。父进程只 open 没 flock 时子进程一锁就成 ——
-          判成继承, 而按继承的规矩退出时不释放, 凭空多出一把没人认领的锁。
-      v2: 先用另一个 OFD 探一探本来有没有人持锁, 被挡住才去锁候选 fd。那两步之间有个真实的
-          窗口: 持锁者恰好在这一瞬放手, 候选 fd 上那次 flock 就成功了, 拿到的仍是新锁。
-          靠重试缩小窗口只是把问题变成概率问题, 而"偶尔错"比"一直错"更难查。
-
-    第 ④ 步那次**事后**核对才是真凭据: 内核在 /proc/locks 里记的是**当初调用 flock 的那个
-    进程**, 同一个 OFD 上再 flock 一次不会改写它; 而一把我们自己刚拿到的锁只会记着我们自己
-    的 PID。两者从根上分得开, 与时序无关。
-
-    (注意持有者 PID **可能是个已经退出的进程** —— `pdg.sh` 用的是外部 `flock -n 9`,
-     它上完锁就退出, 锁活在 shell 的 fd 9 上。所以这里只拿 PID 当"是不是我们自己"的标记,
-     不拿它去做亲缘判断: 按祖先链判会把生产上最常见的那条路径判成"不是继承"。)
+    ③ 以外的一切(读不到证据、fd 没持锁、指错文件)⇒ None ⇒ 调用方走普通取锁。这条路上
+    **不碰 flock**: 不试着锁(能锁上不等于本来就持着), 更不解锁(万一真是父进程的锁, 解了
+    就把它的临界区拆了)。
     """
     raw = os.environ.get(LOCK_FD_ENV, "")
     if raw.strip().lower() in ("none", "off"):
@@ -1073,24 +1061,8 @@ def inherited_lock_fd(path=None):
         return None
     if (st.st_dev, st.st_ino) != (want.st_dev, want.st_ino):
         return None
-    before = _flock_record(want)                            # ②
-    if before is None or before == "unknown":
-        return None
-    me = os.getpid()
-    if before[1] == me:                                     # ③
-        return fd
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)      # ④
-    except OSError:
-        return None                       # 锁在别的 OFD 手里 = 并发, 不是继承
-    after = _flock_record(want)
-    if after == "unknown" or after is None or after[1] == me:
-        # 拿到的是一把**新**锁(原持有者刚放手), 不是继承来的 —— 当场还回去。
-        try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        except OSError:
-            pass
-        return None
+    if _fd_holds_lock(fd, want) is not True:                # ②
+        return None                                         # False/None 都不足以证明
     return fd
 
 

@@ -2,24 +2,25 @@
 """继承锁的**凭据**必须真的是凭据。
 
 `pdg update` 持锁调 `pdg __migrate`, 里面的 Python 子进程不能再去抢同一把锁(新的 OFD 会撞上
-父进程自己)。判法是"证明那把锁已经在手上", 而不是"被告知别锁"。
+父进程自己, 必然 TxBusy, 整次更新回滚)。判法是"证明那把锁已经在手上", 而不是"被告知别锁"。
 
-第一版的证明有一个**假阳性**, 而且它的后果不是少一层保护, 是反过来制造了一把没人知道的锁:
+这条判据前后错过三次, 三次的教训都写在下面的用例里:
 
-    父进程只是 `exec 9>"$LOCK"` 打开了 fd, 还没 `flock` ——
-    子进程在 fd 9 上跑 `flock(LOCK_EX|LOCK_NB)`, **成功**(本来就没人持锁),
-    于是判成"继承", 而且按继承的规矩**退出时不释放**。
-    从此那把锁挂在父进程的 fd 9 上, 谁也不知道它是什么时候被谁拿走的。
+  v1 「能锁上就算继承」——  父进程只 `exec 9>"$LOCK"` 打开了 fd 还没 flock, 子进程一锁就成,
+     判成继承, 而按继承的规矩退出时不释放 ⇒ 凭空多出一把没人认领的锁(§1、§6)。
+  v2 「先用另一个 OFD 探一探」—— 探完到锁候选 fd 之间有个真实窗口, 持锁者恰好在这一瞬放手,
+     拿到的仍是新锁(§5b)。
+  v3 「/proc/locks 里的持有者 PID 是我自己就算继承」—— PID 是**进程**级的, flock 锁却挂在
+     **打开文件描述(OFD)**上: 同进程另一次 open() 出来的 fd 不持锁, 却和真正持锁的那个 fd
+     共用一个 PID ⇒ 任意一个 fd 都能冒充继承, 持锁方还在临界区里冒充者就被放进去了(§7);
+     而 v3 分辨新旧锁靠的那次**回读**一旦失败, 它会 LOCK_UN —— 解掉的是**父进程**那把(§8)。
 
-"能锁上"证明不了"已经锁着"。要分清这两件事, 必须先从**另一个 OFD** 试一次:
+现在的判据是 OFD 级的: `/proc/self/fdinfo/<fd>` 里那行 `lock:` 只在**这个 fd 背后的 OFD 自己
+持锁**时才有。判定全程一次 flock 都不调, 于是既不会顺手攒出一把新锁, 也没有任何 LOCK_UN
+去动别人的锁 —— "判定前后锁状态原封不动"这条不变量在每一格里都直接断言。
 
-    · 另开一个 probe fd, 非阻塞抢锁。
-      抢到了 ⇒ 原先**没人持锁** ⇒ 候选 fd 不是继承锁 ⇒ 立刻还回去, 走普通锁;
-      被挡住 ⇒ 确实有人持锁 ⇒ 再看候选 fd:
-        候选也能锁上 ⇒ 它与持锁者共享同一个 OFD ⇒ **这才是继承**;
-        候选锁不上 ⇒ 锁在别人手里 ⇒ 拒绝。
-
-本支用真实 flock 验这四种情形, 不看调用记录。
+本支全程用真实 flock、真实线程、真实子进程(含 `exec 9>LOCK; flock -n 9` 这个真实 CLI 形态)
+来验, 不看调用记录, 也不靠 sleep 猜时序。
 """
 import fcntl
 import json
@@ -28,6 +29,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 from pathlib import Path
 
 import tmpguard
@@ -158,20 +160,23 @@ with Holder():
     k.close()
 chk(outsider_can_lock(), "持锁进程退出后锁被正常释放")
 
-# 同进程、另一个 OFD 持锁 —— 这一格的判据**随所有权证据一起变了**, 而且是变对了。
+# 同进程、另一个 OFD 持锁 —— 这一格曾经判错, 而且错得很重。
 #
-# 旧判据(在候选 fd 上 flock)会拒: 候选那个 OFD 锁不上。但拒的后果是调用方转头自己去抢同一把
-# 锁 —— 它已经在本进程手上了, 于是必然 TxBusy。那是个假报警: 配置**已经**被保护着。
+# 一度的判据是"/proc/locks 里那把锁的持有者 PID 就是我自己 ⇒ 算继承"。可 PID 是**进程**级的,
+# flock 锁却挂在**打开文件描述(OFD)**上: 同一个进程里另一次 open() 出来的 fd 是另一个 OFD,
+# 它根本不持锁, 却和真正持锁的那个 fd 共用一个 PID。于是任意一个 fd 都能冒充继承 ——
+# 持锁的那一方还在临界区里, 冒充者就被放进去了(完整复现见 §7)。
 #
-# 新判据问的是"这把锁归谁"。答案是"本进程", 那就没有再抢一次的道理, 也没有并发风险。
-# 真正要拒的是**别人**持着(上一格), 那才是并发。
+# 判据问的必须是"这把锁是不是就在**这个 fd** 手里", 而不是"本进程有没有人持着"。
 print()
 m1 = open(LOCK, "w")
 fcntl.flock(m1, fcntl.LOCK_EX | fcntl.LOCK_NB)
-m2 = open(LOCK, "w")                       # 另一次 open = 另一个 OFD
+m2 = open(LOCK, "w")                       # 另一次 open = 另一个 OFD, 自己不持锁
 got = call_with_fd(m2)
-chk(got == m2.fileno(),
-    "锁在**本进程**手上(哪怕是另一个 OFD)→ 不必再抢, 按已在手处理(实得 %r)" % got)
+chk(got is None,
+    "锁在本进程另一个 OFD 手上 → **不算**继承(同 PID 不是持有凭据; 实得 %r)" % got)
+chk(call_with_fd(m1) == m1.fileno(),
+    "同一时刻, 真正持锁的那个 fd 仍被正确识别(真继承没被误伤)")
 chk(not outsider_can_lock(), "这一格没有动那把锁(它还在 m1 手上)")
 fcntl.flock(m1, fcntl.LOCK_UN); m1.close(); m2.close()
 chk(outsider_can_lock(), "m1 释放后锁恢复空闲")
@@ -248,27 +253,27 @@ class TimedHolder:
 # 接下来那次 flock 于是**会成功**, 拿到的是一把新锁。这正是 v2 栽进去的那个窗口。
 with TimedHolder() as holder:
     q = open(LOCK, "w")                     # 候选 fd: 另一个 OFD, 自己不持锁
-    _real_rec = pdgtx._flock_record
+    _real_rec = pdgtx._fd_holds_lock
     _fired = {"n": 0}
 
-    def _rec_then_release(st):
-        r = _real_rec(st)
+    def _rec_then_release(fd, st):
+        r = _real_rec(fd, st)
         if _fired["n"] == 0:
             _fired["n"] = 1
             holder.release_now()            # 证据读完了, 持锁者这一刻放手
         return r
 
-    pdgtx._flock_record = _rec_then_release
+    pdgtx._fd_holds_lock = _rec_then_release
     try:
         got = call_with_fd(q)
     finally:
-        pdgtx._flock_record = _real_rec
+        pdgtx._fd_holds_lock = _real_rec
 
     chk(_fired["n"] == 1, "窗口被钉死了(所有权证据确实被读过, 钩子打中)")
     chk(got is None,
-        "在窗口里拿到的是**新锁**, 不算继承(实得 %r)" % got)
-    # 最要紧的一条: 那把顺手拿到的新锁必须当场还回去。
-    chk(outsider_can_lock(), "顺手拿到的新锁已经还回去了(没有留下无人认领的锁)")
+        "持锁者在窗口里放了手, 候选 fd 自己从来没持过锁 → 不算继承(实得 %r)" % got)
+    # 最要紧的一条: 判定不许在这个窗口里顺手攒出一把没人认领的锁。
+    chk(outsider_can_lock(), "窗口里没有多出一把无人认领的锁")
     q.close()
 chk(outsider_can_lock(), "关掉候选 fd 之后锁仍然空闲")
 
@@ -335,22 +340,33 @@ _sub = subprocess.run(
         os.environ["PDG_LOCKFILE"] = lock
         import pdgtx
         pdgtx.LOCKFILE = lock
+        def record():
+            # 测试自己读 /proc/locks —— 不借产品的辅助函数来给产品打分。
+            st = os.stat(lock)
+            want = "%02x:%02x:%d" % (os.major(st.st_dev), os.minor(st.st_dev), st.st_ino)
+            out = []
+            with open("/proc/locks") as fh:
+                for line in fh:
+                    q = line.split()
+                    if len(q) >= 6 and q[1] == "FLOCK" and q[5] == want:
+                        out.append(" ".join(q[1:]))
+            return out
         f = open(lock, "w")
         os.dup2(f.fileno(), 9)                 # 模拟 shell 的 exec 9>LOCK
         fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        st = os.stat(lock)
-        before = pdgtx._flock_record(st)
+        before = record()
         os.environ["PDG_LOCK_FD"] = "9"
         got = pdgtx.inherited_lock_fd()
-        after = pdgtx._flock_record(st)
+        after = record()
         print(json.dumps({"got": got, "same_record": before == after,
-                          "holder_is_me": after[1] == os.getpid()}))
+                          "held": bool(after)}))
     """), LOCK, str(ROOT / "deploy" / "bot")],
     capture_output=True, text=True, timeout=60)
 try:
     info = json.loads(_sub.stdout.strip().splitlines()[-1])
     chk(info["got"] == 9, "同 OFD 已持锁 → 判成继承(实得 %r)" % info["got"])
-    chk(info["same_record"], "判定没有改写那条锁记录(还是原来那把锁, 不是新拿的)")
+    chk(info["same_record"] and info["held"],
+        "判定前后那条锁记录一个字没变(还是原来那把, 不是新拿的)")
 except Exception as e:  # noqa: BLE001
     bad("继承那一格跑不起来(%s): %s" % (type(e).__name__, (_sub.stderr or "")[-160:]))
 chk(outsider_can_lock(), "子进程退出后锁被释放")
@@ -446,6 +462,328 @@ try:
     ff.close()
 finally:
     pdgtx.inherited_lock_fd = _real
+
+# ══ 7. A 组: 同 PID **不等于**同一把锁的持有凭据 ═══════════════════════════
+print()
+print("══ 7. 同 PID / 不同 OFD: 互斥与锁生命周期 ══")
+# 判据按 PID 认继承 ⇒ 同一个进程里的**任何**一个 fd 都能冒充"继承来的锁"。
+# 后果是互斥直接失守, 而且不是理论上的:
+#
+#   · 线程 A 用真实 _Lock 持锁, 进入临界区;
+#   · 线程 B 的候选 fd 只是同一文件的**另一次 open**(不同 OFD, 自己不持锁);
+#   · B 经真实 _LifecycleLock 被判成"继承", 于是和 A **同时**在临界区里;
+#   · A 退出后 B 还在临界区, 而此刻第三个独立 fd 已经能把锁拿走 —— 谁都不认为自己该拦它。
+#
+# 这一组全程用 Event 做屏障, 不用 sleep 猜前提; 也不拿"两个线程都跑完了"当互斥的证明 ——
+# 要证的是**重叠**: A 还持着的那一刻 B 到底进没进去。
+sys.path.insert(0, str(ROOT / "deploy" / "bot"))
+import iosstate as _ios  # noqa: E402
+
+_ios.pdgtx.LOCKFILE = LOCK
+
+
+def outsider_lock_fails():
+    """第三个**独立进程**拿不到锁 = 此刻确实有人持着。"""
+    return not outsider_can_lock()
+
+
+a_holding = threading.Event()      # A 已经真的持锁了
+b_tried = threading.Event()        # B 已经做完那次判定
+a_release = threading.Event()      # 让 A 松手
+rec = {}
+
+
+def _thread_a():
+    lk = pdgtx._Lock(LOCK)
+    try:
+        lk.__enter__()
+        rec["a_got"] = True
+        rec["a_lock_seen_by_outsider"] = outsider_lock_fails()
+        a_holding.set()
+        b_tried.wait(20)                    # 等 B 判定完, 这期间 A **一直**持着
+        rec["a_still_holding_when_b_done"] = True
+    except Exception as e:                  # noqa: BLE001
+        rec["a_got"] = False
+        rec["a_err"] = "%s: %s" % (type(e).__name__, e)
+        a_holding.set()
+    finally:
+        a_release.wait(20)
+        try:
+            lk.__exit__()
+        except Exception:                   # noqa: BLE001
+            pass
+        rec["a_released"] = True
+
+
+def _thread_b():
+    a_holding.wait(20)
+    fb = open(LOCK, "w")                    # 另一次 open = 不同 OFD, 自己不持锁
+    rec["b_fd"] = fb.fileno()
+    os.environ["PDG_LOCK_FD"] = str(fb.fileno())
+    try:
+        # **真实入口**: 不喂辅助函数字符串, 走 _LifecycleLock 那条路。
+        lk = _ios._LifecycleLock(True, "B 的操作")
+        try:
+            lk.__enter__()
+            rec["b_entered"] = True
+            rec["b_inherited"] = lk.inherited
+        except _ios.StateError as e:
+            rec["b_entered"] = False
+            rec["b_refuse"] = str(e)[:60]
+        else:
+            lk.__exit__()
+    finally:
+        os.environ.pop("PDG_LOCK_FD", None)
+        fb.close()
+        b_tried.set()
+
+
+ta, tb = threading.Thread(target=_thread_a), threading.Thread(target=_thread_b)
+ta.start(); tb.start()
+b_tried.wait(25); a_release.set()
+tb.join(25); ta.join(25)
+
+chk(rec.get("a_got") is True, "前提: 线程 A 用真实 _Lock 拿到了锁(%s)" % rec.get("a_err", "ok"))
+chk(rec.get("a_lock_seen_by_outsider") is True, "前提: A 持锁期间第三方确实抢不到")
+chk(rec.get("b_entered") is False,
+    "A 还持着锁时, B **没有**从继承捷径进临界区(实得 entered=%r inherited=%r)"
+    % (rec.get("b_entered"), rec.get("b_inherited")))
+chk(rec.get("b_entered") is False and "已有配置操作" in (rec.get("b_refuse") or ""),
+    "B 按既有非阻塞语义被判成竞争(实得 %r)" % (rec.get("b_refuse"),))
+
+# A 松手之后, B 正常重试应当能拿到**自己的**锁 —— 不能靠一律拒绝继承把路堵死。
+ta.join(10)
+_fb2 = open(LOCK, "w")
+os.environ["PDG_LOCK_FD"] = str(_fb2.fileno())
+_lk2 = _ios._LifecycleLock(True, "B 重试")
+try:
+    _lk2.__enter__()
+    _b2_ok = True
+except _ios.StateError:
+    _b2_ok = False
+os.environ.pop("PDG_LOCK_FD", None)
+chk(_b2_ok, "A 释放后 B 正常重试拿到了自己的锁")
+chk(not _lk2.inherited, "那是**自己取的**锁, 不是继承(inherited=%r)" % _lk2.inherited)
+chk(outsider_lock_fails(), "B 合法持锁期间, 第三个独立 OFD 取锁失败")
+_lk2.__exit__(); _fb2.close()
+chk(outsider_can_lock(), "B 退出后第三个独立 OFD 才能取得")
+
+# ══ 8. B 组: 凭据二次读取失败, 不许把父进程那把锁解掉 ══════════════════════
+print()
+print("══ 8. 真实继承锁 + 凭据读取失败 ══")
+# 现在的实现在候选 fd 上 flock 成功之后, 要**再读一次**锁记录来分辨"刚拿到的新锁"与"本来
+# 就持着的旧锁"。那次读取失败时它会 LOCK_UN —— 而那把锁是**父进程的**(同一个 OFD),
+# 于是一次读 /proc 失败就把父进程的临界区拆了, 父 fd 还开着, 别人已经能进来。
+
+
+def run_in_cli_lock(pycode, extra_env=None):
+    """按**真实 CLI 形态**造一把继承锁: 父打开 fd 9, 外部 flock 加锁后退出, 父继续持有该 OFD。
+    然后在那个父进程里跑 pycode。返回 (rc, stdout, stderr)。"""
+    script = (
+        'exec 9>"$1"\n'
+        'flock -n 9 || exit 9\n'
+        'python3 - "$1" "$2" <<\'PYEOF\'\n' + pycode + '\nPYEOF\n'
+    )
+    env = dict(os.environ)
+    env.pop("PDG_LOCK_FD", None)
+    env.update(extra_env or {})
+    r = subprocess.run(["bash", "-c", script, "_", LOCK, str(ROOT / "deploy" / "bot")],
+                       capture_output=True, text=True, timeout=90, env=env)
+    return r.returncode, r.stdout, r.stderr
+
+
+_CHILD = """
+import json, os, sys
+lock, botdir = sys.argv[1], sys.argv[2]
+sys.path.insert(0, botdir)
+os.environ["PDG_LOCKFILE"] = lock
+import pdgtx, iosstate
+pdgtx.LOCKFILE = lock
+iosstate.pdgtx.LOCKFILE = lock
+if os.environ.get("CAND_FD") == "OWN":
+    _own = open(lock, "w")                # 另一次 open = 另一个 OFD, 自己不持锁
+    os.environ["PDG_LOCK_FD"] = str(_own.fileno())
+else:
+    os.environ["PDG_LOCK_FD"] = os.environ.get("CAND_FD", "9")
+
+# 注入点: 判据靠读内核凭据来立论, 这里让**从第 N 次读取起**读不出来。
+# 用"从第 N 次起持续失败"而不是一次性打嗝, 是因为 /proc 读不到通常是环境条件(没挂、被容器
+# 挡住); 而且这样才压得到**调用方自己那次读取** —— 否则它独立重读一遍就绕过注入了。
+# N=2 正好落在旧实现"flock 之后那次回读"的位置。
+#
+# 钩住所有在用的凭据读取函数, 不预设实现用的是哪一个 —— 同一份测试既压当前实现, 也压负控里
+# 恢复出来的旧实现(否则注入空转, 负控就没牙了)。
+NTH = int(os.environ.get("EVIDENCE_FAIL_FROM", "0"))
+reads = [0]
+fired = [0]
+hooked = []
+if NTH:
+    def arm(name, failval):
+        real = getattr(pdgtx, name, None)
+        if real is None:
+            return
+        hooked.append(name)
+
+        def wrapper(*a, **kw):
+            reads[0] += 1
+            if reads[0] >= NTH:
+                fired[0] += 1
+                return failval            # 模拟 /proc 这会儿读不出来
+            return real(*a, **kw)
+        setattr(pdgtx, name, wrapper)
+    arm("_fd_holds_lock", None)           # 当前实现: 读不到 = 证明不了
+    arm("_flock_record", "unknown")       # 旧实现(负控恢复的那版)同样的语义
+
+got = "skipped" if os.environ.get("SKIP_PROBE") else pdgtx.inherited_lock_fd()
+probe_reads = reads[0]
+
+def parent_lock_still_held():
+    # 用**另一个独立 OFD** 去试: 拿得到就说明父进程那把锁已经被解掉了。
+    import fcntl
+    probe = open(lock, "w")
+    try:
+        fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(probe, fcntl.LOCK_UN)
+        return False
+    except OSError:
+        return True
+    finally:
+        probe.close()
+
+held_after_probe = parent_lock_still_held()
+
+# 真实调用方拿到这个结果之后到底怎么做 —— 只看辅助函数返回 None 是不够的。
+caller = {}
+if os.environ.get("RUN_CALLER"):
+    lk = iosstate._LifecycleLock(True, "子进程的操作")
+    try:
+        lk.__enter__()
+        caller = {"entered": True, "inherited": lk.inherited}
+        lk.__exit__()
+    except iosstate.StateError as e:
+        caller = {"entered": False, "refuse": str(e)[:60]}
+
+print(json.dumps({"got": got, "parent_lock_still_held": held_after_probe,
+                  "reads": reads[0], "probe_reads": probe_reads, "fired": fired[0],
+                  "hooked": hooked,
+                  "caller": caller,
+                  "parent_lock_at_end": parent_lock_still_held()}))
+"""
+
+
+def cli_case(label, env=None, expect_got=None):
+    rc, out, err = run_in_cli_lock(_CHILD, env)
+    try:
+        return json.loads(out.strip().splitlines()[-1])
+    except Exception as e:  # noqa: BLE001
+        bad("%s: 跑不起来(%s) %s" % (label, type(e).__name__, (err or out)[-240:]))
+        return None
+
+
+# ① 健康对照: 不注入任何失败
+info = cli_case("健康对照")
+if info:
+    chk(info["got"] == 9, "健康对照: 真实继承(外部 flock 已退出)被识别(实得 %r)" % info["got"])
+    chk(info["parent_lock_still_held"], "健康对照: 判定之后父进程那把锁**还在**")
+chk(outsider_can_lock(), "父进程退出后锁被释放(没有泄漏)")
+
+# ①b 健康对照下, 真实调用方确实走继承那条, 而且不还锁
+info = cli_case("健康对照(过调用方)", {"RUN_CALLER": "1"})
+if info:
+    chk(info["caller"].get("entered") is True and info["caller"].get("inherited") is True,
+        "健康对照: _LifecycleLock 认出继承并进了临界区(实得 %r)" % (info["caller"],))
+    chk(info["parent_lock_at_end"], "健康对照: 调用方用完**没有**把父进程的锁还掉")
+chk(outsider_can_lock(), "这一格跑完锁没有泄漏")
+
+# ② 候选 fd 是子进程**自己**新开的 —— 同一个文件、父进程正持着锁, 但不是同一个 OFD
+info = cli_case("不同 OFD 候选", {"CAND_FD": "OWN", "RUN_CALLER": "1"})
+if info:
+    chk(info["got"] is None, "候选是另一次 open 的 fd → 不算继承(实得 %r)" % info["got"])
+    chk(info["parent_lock_still_held"], "拒绝时没有动父进程那把锁")
+    chk(info["caller"].get("entered") is False
+        and "已有配置操作" in (info["caller"].get("refuse") or ""),
+        "调用方据此按竞争拒绝, 没有硬闯临界区(实得 %r)" % (info["caller"],))
+chk(outsider_can_lock(), "这一格跑完锁没有泄漏")
+
+# ③ 只注入凭据读取失败, **单次判定**: 不跑调用方, 读取次数才数得清。
+#    N=2 正是旧实现里"flock 成功之后那次回读"的位置 —— 它失败时旧实现会 LOCK_UN, 解掉的
+#    是父进程那把锁(同一个 OFD)。这一格就是负控要打红的那条。
+for nth, label in ((2, "第二次"), (1, "第一次")):
+    info = cli_case("注入%s读取失败" % label, {"EVIDENCE_FAIL_FROM": str(nth)})
+    if not info:
+        continue
+    chk(info["hooked"], "注入%s: 钩子确实挂上了(挂住 %s)" % (label, info["hooked"]))
+    chk(info["parent_lock_still_held"],
+        "注入%s凭据读取失败 → **没有**把父进程那把锁解掉(这次判定读了 %d 次凭据, 失败 %d 次)"
+        % (label, info["probe_reads"], info["fired"]))
+    chk(info["got"] in (None, 9),
+        "注入%s读取失败 → 要么如实说不确定, 要么仍正确识别; 不能是别的(实得 %r)"
+        % (label, info["got"]))
+    chk(info["parent_lock_at_end"], "注入%s: 这一格从头到尾父进程的锁都在" % label)
+
+# 一次判定到底读几次凭据 —— "回读失败就解锁"那条分支还在不在的直接度量。
+info = cli_case("读取次数", {"EVIDENCE_FAIL_FROM": "99"})
+if info:
+    chk(info["probe_reads"] == 1,
+        "一次判定只读一次凭据 ⇒ 根本不存在「回读失败就解锁」那条分支(实得 %d 次)"
+        % info["probe_reads"])
+
+# ④ 调用方在"证明不了"时怎么做: 从第一次读取起就失败, 把它自己那次重读也盖住。
+info = cli_case("调用方遇到证明不了",
+                {"EVIDENCE_FAIL_FROM": "1", "SKIP_PROBE": "1", "RUN_CALLER": "1"})
+if info:
+    chk(info["fired"] >= 1, "调用方那次凭据读取确实被注入了(命中 %d 次)" % info["fired"])
+    chk(info["caller"].get("entered") is False
+        and "已有配置操作" in (info["caller"].get("refuse") or ""),
+        "证明不了 → 调用方不硬闯临界区, 按既有非阻塞语义拒绝(实得 %r)" % (info["caller"],))
+    chk(info["parent_lock_at_end"], "证明不了 → 调用方也没有去解父进程那把锁")
+chk(outsider_can_lock(), "这一组跑完锁没有泄漏")
+
+# ══ 9. 资源归属与收尾: 按对象分别记账 ═════════════════════════════════════
+print()
+print("══ 9. 资源收尾 ══")
+# 四类资源分开数, 不合成一个"跑完了没崩"的笼统判断; 而且是**判完之后**才数 ——
+# 先主动清一遍再数, 数出来的只是清理动作本身, 证明不了这些用例没留东西。
+
+
+def open_fds_under(dirpath):
+    out = []
+    for name in os.listdir("/proc/self/fd"):
+        try:
+            tgt = os.readlink("/proc/self/fd/" + name)
+        except OSError:
+            continue
+        if tgt.startswith(dirpath + os.sep) or tgt == dirpath:
+            out.append("%s→%s" % (name, tgt))
+    return sorted(out)
+
+
+def live_children():
+    out = []
+    me = os.getpid()
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open("/proc/%s/stat" % entry) as fh:
+                fields = fh.read().rsplit(") ", 1)[1].split()
+            if int(fields[1]) == me:
+                out.append(entry)
+        except (OSError, IndexError, ValueError):
+            continue
+    return out
+
+
+_fds = open_fds_under(WORK)
+chk(not _fds, "fd: 用例开的文件描述符都关干净了(残留 %s)" % (_fds or "无",))
+
+_thr = [t.name for t in threading.enumerate() if t is not threading.current_thread()]
+chk(not _thr, "线程: 没有还活着的工作线程(残留 %s)" % (_thr or "无",))
+
+_kids = live_children()
+chk(not _kids, "子进程: 持锁进程/子调用都已回收(残留 pid %s)" % (_kids or "无",))
+
+chk(outsider_can_lock(), "锁: 全部跑完后锁是空闲的(没有谁把它带走)")
 
 print()
 print("[SUM] OK=%d FAIL=%d" % (PASS[0], FAIL[0]))
