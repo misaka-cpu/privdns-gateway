@@ -40,6 +40,11 @@ systemctl(){
   echo "$*" >> "$SC_LOG"
   local svc="${*: -1}"
   case "$1" in
+    # enabled 与 active 是**两件事**(见 pdg.sh 的 _retire_restore_svc): 自启状态与在不在跑
+    # 各管各的。这里两样都建模, 少一样的话被测函数会拿不到自启状态而按"不支持"拒。
+    is-enabled)
+        local e; e="$(cat "$WORK/state/$2.enabled" 2>/dev/null || echo enabled)"
+        echo "$e"; [[ "$e" == enabled ]] && return 0; return 1;;
     is-active)
         if [[ -n "$STOP_LEAVES" && -e "$WORK/state/$2.stopped" ]]; then
           echo "$STOP_LEAVES"; return 3
@@ -47,9 +52,14 @@ systemctl(){
         [[ -e "$WORK/state/$2.active" ]] && { echo active; return 0; }
         echo inactive; return 3;;
     disable|stop)
+        [[ "$1" == disable ]] && echo disabled > "$WORK/state/$svc.enabled"
         [[ "$STUBBORN" == "$svc" ]] && return 0          # 假装停了, 其实没停(状态文件还在)
         rm -f "$WORK/state/$svc.active"
         : > "$WORK/state/$svc.stopped"                   # 供 STOP_LEAVES 判定
+        return 0;;
+    enable)
+        if [[ "$2" == "--runtime" ]]; then echo enabled-runtime > "$WORK/state/$svc.enabled"
+        else echo enabled > "$WORK/state/$svc.enabled"; fi
         return 0;;
     start)
         rm -f "$WORK/state/$svc.stopped"; : > "$WORK/state/$svc.active"; return 0;;
@@ -78,7 +88,8 @@ _retire_ios_schema(){ echo "iosschema" >> "$SC_LOG"; [[ -n "$SCHEMA_FAIL" ]] && 
 # 顺序、判据、失败怎么恢复)。它们各自的真实行为由 lock-handoff 与 realrun 两支负责。
 for _fn in _retire_svc_stopped _retire_core_has_mitm _retire_undo_push _retire_undo_run \
            _retire_track_file _retire_restore_file _retire_reload_svc _retire_track_svc \
-           _retire_restore_svc _retire_cleanup _retire_fail _retire_report_ca \
+           _retire_enable_supported _retire_restore_svc _retire_cleanup _retire_fail \
+           _retire_report_ca \
            migrate_wloc_retire _retire_disable_wloc_json _retire_ca_report; do
   eval "$(sed -n "/^$_fn(){/,/^}/p" "$ROOT/deploy/bot/pdg.sh")"
   declare -F "$_fn" >/dev/null || bad "pdg.sh 里抽不出 $_fn"
@@ -91,7 +102,8 @@ fi
 # ── 现场构造 ────────────────────────────────────────────────────────────────
 scene(){   # $1=名字  $2=enabled/disabled/never
   local d="$WORK/$1"; rm -rf "$d"; mkdir -p "$d"/{etc/systemd/system,etc/mosdns/rules,etc/privdns-gateway/ca,opt/pdg-bot}
-  mkdir -p "$WORK/state"; rm -f "$WORK/state"/*.active "$WORK/state"/*.stopped
+  mkdir -p "$WORK/state"; rm -f "$WORK/state"/*.active "$WORK/state"/*.stopped "$WORK/state"/*.enabled
+  echo enabled > "$WORK/state/pdg-mitm.enabled"
   : > "$SC_LOG"
   export PDG_RETIRE_ROOT="$d"
   STUBBORN=""; RENDER_RC=0; STOP_LEAVES=""; RESTART_FAIL=""; SCHEMA_FAIL=""

@@ -28,9 +28,17 @@ SC_LOG=""
 systemctl(){
   echo "$*" >> "$SC_LOG"
   case "$1" in
+    # enabled 与 active 分开建模 —— 见 pdg.sh 的 _retire_restore_svc: 自启状态与在不在跑
+    # 是两件事, 少一样的话被测函数拿不到自启状态, 会按"不支持"整笔拒。
+    is-enabled) local e; e="$(cat "$SBOX/state/$2.enabled" 2>/dev/null || echo enabled)"
+                echo "$e"; [[ "$e" == enabled ]] && return 0; return 1;;
     is-active) [[ -e "$SBOX/state/$2.active" ]] && { echo active; return 0; }
                echo inactive; return 3;;
-    disable|stop) rm -f "$SBOX/state/${*: -1}.active"; return 0;;
+    enable) if [[ "$2" == "--runtime" ]]; then echo enabled-runtime > "$SBOX/state/${*: -1}.enabled"
+            else echo enabled > "$SBOX/state/${*: -1}.enabled"; fi; return 0;;
+    disable) echo disabled > "$SBOX/state/${*: -1}.enabled"
+             rm -f "$SBOX/state/${*: -1}.active"; return 0;;
+    stop) rm -f "$SBOX/state/${*: -1}.active"; return 0;;
     start|restart) : > "$SBOX/state/${*: -1}.active"; return 0;;
     *) return 0;;
   esac
@@ -41,7 +49,9 @@ _pdg_core_svc(){ echo mihomo; }
 # 被测的**全部**是真的, 一个都不替换。
 for _fn in _retire_svc_stopped _retire_core_has_mitm _retire_undo_push _retire_undo_run \
            _retire_track_file _retire_restore_file _retire_reload_svc _retire_track_svc \
-           _retire_restore_svc _retire_cleanup _retire_fail _retire_report_ca _retire_rerender_core _retire_ios_schema \
+           _retire_enable_supported _retire_restore_svc _retire_cleanup _retire_fail \
+           _retire_report_ca _retire_rerender_core _retire_ios_schema \
+           \
            migrate_wloc_retire _retire_disable_wloc_json _retire_ca_report; do
   eval "$(sed -n "/^$_fn(){/,/^}/p" "$ROOT/deploy/bot/pdg.sh")"
   declare -F "$_fn" >/dev/null || { bad "pdg.sh 里抽不出 $_fn"; }
@@ -54,6 +64,8 @@ full_machine(){   # $1 = SSID(可空)
   sbox_new || return 1
   SC_LOG="$SBOX/systemctl.log"; : > "$SC_LOG"
   mkdir -p "$SBOX/state"; : > "$SBOX/state/pdg-mitm.active"
+  echo enabled > "$SBOX/state/pdg-mitm.enabled"
+  : > "$SBOX/state/mihomo.active"; : > "$SBOX/state/mosdns.active"
   sbox_legacy_ios on ${1:-} >/dev/null || return 1
   echo ios > "$SBOX/etc/privdns-gateway/platform"
   printf 'domain:gs-loc.apple.com\ndomain:gs-loc-cn.apple.com\n' \
