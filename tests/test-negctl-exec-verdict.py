@@ -196,6 +196,11 @@ if plan != "healthy" and os.environ.get("STUB_BREAK_PHASE", "") == phase:
     if plan == "target_then_rc3":
         print(TARGET.get(phase, "[FAIL] 桩: 目标断言"))
         print(); print("[SUM] OK=0 FAIL=1"); sys.exit(3)
+    if plan == "hang":
+        # 挂住不返回 —— 用来触发执行器那边的超时与收尾。
+        print("[OK]   桩: 挂起前写出的标记"); sys.stdout.flush()
+        import time as _t
+        _t.sleep(600)
     raise SystemExit("桩: 未知形态 " + plan)
 normal()
 '''
@@ -270,7 +275,247 @@ chk("新增失败 0 条" not in m4, "反向对照崩溃 → 没有冒充「零�
 chk(rc != 0, "反向对照异常 → 负控非零结束(实得 rc=%d)" % rc)
 
 
-# ══ 3. 收尾 ════════════════════════════════════════════════════════════════
+# ══ 3. 超时的收尾: 走真实 run_suites()/run() ═══════════════════════════════
+print()
+print("══ 3. 超时收尾(真实执行器) ══")
+# 只把 timed_out=True 喂给 verdict() 是测不出这件事的 —— 问题在执行器那一层: 直接子进程
+# 被杀, 不等于它启动的后代也结束了。后代还攥着锁、还连着管道, "超时"就没真正结束: 下一格
+# 会在一把没人释放的锁上跑, 删工作目录时还可能撞上仍在写的进程。
+#
+# 所以这一节调**真实** run_suites(), 只覆盖它自己那次调用的预算(不动正式默认值 900s),
+# 而且所有正式判据都在测试做任何兜底清理**之前**取。
+
+import signal      # noqa: E402
+import threading   # noqa: E402
+import time        # noqa: E402
+
+
+def proc_state(pid):
+    """运行 / 僵尸 / 已回收 —— 单凭 kill(pid, 0) 分不开前两者。"""
+    if pid is None:
+        return "无 pid"
+    try:
+        with open("/proc/%d/stat" % pid) as f:
+            st = f.read().rsplit(") ", 1)[1].split()[0]
+    except OSError:
+        return "已回收"
+    return "僵尸" if st == "Z" else "运行(%s)" % st
+
+
+PROBE = ("import fcntl, sys\n"
+         "f = open(sys.argv[1], 'w')\n"
+         "try:\n"
+         "    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+         "except OSError:\n"
+         "    sys.exit(1)\n"
+         "sys.exit(0)\n")
+
+
+def outsider_can_lock(path):
+    """独立进程 = 独立 OFD, 不会被本进程的 fd 带偏。"""
+    r = subprocess.run([sys.executable, "-c", PROBE, path], capture_output=True, timeout=60)
+    return r.returncode == 0
+
+
+DESCENDANT = (
+    "import fcntl, os, sys, time\n"
+    "f = open(sys.argv[1], 'w')\n"
+    "fcntl.flock(f, fcntl.LOCK_EX)\n"                 # 后代持住本轮自造的临时锁
+    "open(sys.argv[3], 'w').write(str(os.getpid()))\n"
+    "print('DESCENDANT-READY'); sys.stdout.flush()\n"
+    "print('DESCENDANT-STDERR', file=sys.stderr); sys.stderr.flush()\n"
+    "open(sys.argv[2], 'w').write('1')\n"             # 就绪标记最后落地: 见到它前面就都成了
+    "time.sleep(600)\n")
+
+SUB_HEAD = ("import subprocess, sys, time\n"
+            "print('[OK]   子测试: 超时前的 stdout 标记'); sys.stdout.flush()\n"
+            "print('SUBTEST-STDERR', file=sys.stderr); sys.stderr.flush()\n")
+
+
+def make_case(with_descendant):
+    """造一次子测试调用。返回 (cmd, 锁路径, 就绪文件, pid 文件)。"""
+    d = tmpguard.mkdtemp(prefix="pdg-negexec-reap.")
+    lock = os.path.join(d, "descendant.lock")
+    open(lock, "w").close()
+    ready, pidf = os.path.join(d, "ready"), os.path.join(d, "pid")
+    body = SUB_HEAD
+    if with_descendant:
+        body += ("subprocess.Popen([sys.executable, '-c', %r,\n"
+                 "                  sys.argv[1], sys.argv[2], sys.argv[3]])\n" % DESCENDANT)
+    body += "time.sleep(600)\n"
+    script = Path(d) / "subtest.py"
+    script.write_text(body, encoding="utf-8")
+    return [sys.executable, str(script), lock, ready, pidf], lock, ready, pidf
+
+
+def call_executor(cmd, budget, ready=None, pidf=None, lock=None):
+    """跑真实 run_suites(); 顺便在**触发超时之前**把前提确认下来。"""
+    state = {}
+
+    def watch():
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 60:
+            if os.path.exists(ready) and os.path.exists(pidf):
+                try:
+                    state["pid"] = int(open(pidf).read())
+                except (OSError, ValueError):
+                    return
+                state["ready_at"] = time.monotonic()
+                state["held_before"] = not outsider_can_lock(lock)   # 前提: 后代真持着锁
+                state["state_before"] = proc_state(state["pid"])
+                return
+            time.sleep(0.01)
+
+    th = threading.Thread(target=watch)
+    if ready:
+        th.start()
+    old_budget, old_suites = _neg.SUITE_TIMEOUT, _neg.SUITES
+    _neg.SUITE_TIMEOUT, _neg.SUITES = budget, (cmd,)
+    t0 = time.monotonic()
+    try:
+        res = _neg.run_suites(os.path.dirname(cmd[1]))
+    finally:
+        _neg.SUITE_TIMEOUT, _neg.SUITES = old_budget, old_suites
+    state["returned_at"] = time.monotonic()
+    state["elapsed"] = state["returned_at"] - t0
+    if ready:
+        th.join(65)
+    return res, state
+
+
+def reap_leftover(pid):
+    """测试自己的兜底清理 —— 与执行器的收尾**分开记**, 且只清本测试造出来的东西。"""
+    if pid is None:
+        return "无 pid"
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return "已不在(执行器收尾时就没了)"
+    except OSError as e:
+        return "兜底清理失败(%s)" % e
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 10:
+        if proc_state(pid) == "已回收":
+            return "兜底清掉了"
+        time.sleep(0.02)
+    return "兜底也没清掉"
+
+
+# ── A. 普通超时: 没有后代 ──
+cmd, lock, ready, pidf = make_case(False)
+res, st = call_executor(cmd, 2)
+chk(res.status == "anomaly" and "超时" in res.reason,
+    "A 普通超时 → 裁决是超时异常(%s)" % res.reason[:66])
+chk(res.halt is False and "收尾已完成" in res.reason, "A 普通超时 → 收尾已完成, 不停机")
+chk(res.rc == -9, "A 普通超时 → 保留真实退出状态 rc=%r(被 SIGKILL), 不伪造" % (res.rc,))
+chk("超时前的 stdout 标记" in (res.out or ""), "A 普通超时 → 超时前的 stdout 留住了")
+chk("SUBTEST-STDERR" in (res.err or ""), "A 普通超时 → 超时前的 stderr 留住了")
+chk(st["elapsed"] < 2 + _neg.REAP_BUDGET,
+    "A 普通超时 → 收尾有界, 没有再卡一次(耗时 %.2fs, 上限 %ds)"
+    % (st["elapsed"], 2 + _neg.REAP_BUDGET))
+
+# ── B. 带后代的超时 ──
+cmd, lock, ready, pidf = make_case(True)
+res, st = call_executor(cmd, 4, ready, pidf, lock)
+dpid = st.get("pid")
+
+# 先确认前提真的成立过 —— 否则"后代没了"证明不了任何东西。
+chk(dpid is not None and st.get("ready_at") is not None,
+    "B 前提: 后代起来了并写出就绪标记(pid=%s)" % dpid)
+chk(st.get("held_before") is True, "B 前提: 就绪时后代确实持着那把临时锁(外人抢不到)")
+chk(str(st.get("state_before", "")).startswith("运行"),
+    "B 前提: 就绪时后代处于运行态(实得 %s)" % st.get("state_before"))
+chk(st.get("ready_at", 0) < st.get("returned_at", 0),
+    "B 前提: 就绪发生在执行器返回**之前**, 不是事后才起来")
+
+# 正式判据 —— 全部在测试做任何兜底清理之前取。
+after_state = proc_state(dpid)
+after_lock = outsider_can_lock(lock)
+chk(after_state == "已回收", "B 执行器返回时后代已不运行且已被回收(实得 %s)" % after_state)
+chk(after_lock, "B 执行器返回时独立 OFD 能取得那把临时锁(后代确实放手了)")
+chk("超时前的 stdout 标记" in (res.out or "") and "DESCENDANT-READY" in (res.out or ""),
+    "B 超时前的 stdout 标记仍在(子测试与后代两边都在)")
+chk("SUBTEST-STDERR" in (res.err or "") and "DESCENDANT-STDERR" in (res.err or ""),
+    "B 超时前的 stderr 标记仍在")
+chk(res.status == "anomaly" and "超时" in res.reason,
+    "B 裁决是超时异常, 不是正常成功也不是正常断言失败(实得 %s)" % res.status)
+chk(res.halt is False and "收尾已完成" in res.reason, "B 收尾确认完成, 不停机")
+chk(st["elapsed"] < 4 + _neg.REAP_BUDGET,
+    "B 收尾没有无限等待(耗时 %.2fs, 上限 %ds)" % (st["elapsed"], 4 + _neg.REAP_BUDGET))
+print("       [记账] 执行器收尾: %s ｜ 测试兜底: %s"
+      % (res.reason.split("—— ")[-1], reap_leftover(dpid)))
+
+# ── C. 清理失败(受控注入) ──
+# 只注入**确认**那一步的失败: killpg 照常真的发出去, 所以不会留下真的杀不掉的进程。
+# 要验的是"确认不了的时候怎么报、还继不继续"。
+cmd, lock, ready, pidf = make_case(True)
+_real_confirm = _neg._confirm_group_gone
+_neg._confirm_group_gone = lambda pgid, budget=None: (False, "注入: 无权确认进程组状态")
+try:
+    res, st = call_executor(cmd, 4, ready, pidf, lock)
+finally:
+    _neg._confirm_group_gone = _real_confirm
+dpid = st.get("pid")
+chk(st.get("held_before") is True, "C 前提: 就绪时后代确实持着那把临时锁")
+chk("超时" in res.reason and "收尾**未完成**" in res.reason,
+    "C 原始超时与清理失败**同时**保留在报告里(%s)" % res.reason[-56:])
+chk("注入: 无权确认进程组状态" in res.reason, "C 报告点名了清理失败的原因")
+chk(res.halt is True, "C 收尾未确认 → halt=True, 上层据此停机")
+chk("超时前的 stdout 标记" in (res.out or ""), "C 清理失败时也没有清空已有输出")
+chk("已清干净" not in res.reason and "强杀完成" not in res.reason, "C 没有宣称已清干净")
+print("       [记账] 执行器收尾: 未确认(受控注入) ｜ 测试兜底: %s" % reap_leftover(dpid))
+
+
+# ── C2. 停机要一直传到驱动层: 后续变异不得开跑 ──
+def run_negctl_patched(patches, plan="healthy", phase=""):
+    """在假仓库里给负控**副本**打补丁再整支跑 —— 补丁只落在测试自有的副本上。"""
+    dest = build_fake()
+    f = dest / "tests" / "negctl" / NEGCTL.name
+    txt = f.read_text(encoding="utf-8")
+    for old, new in patches:
+        if txt.count(old) != 1:
+            return None, "锚点命中 %d 次: %s" % (txt.count(old), old[:40])
+        txt = txt.replace(old, new, 1)
+    f.write_text(txt, encoding="utf-8")
+    env = dict(os.environ, STUB_PLAN=plan, STUB_BREAK_PHASE=phase)
+    env.pop("TMPDIR", None)
+    env.pop(tmpguard.KEEP_ENV, None)
+    r = subprocess.run([sys.executable, str(f)], cwd=str(dest), capture_output=True,
+                       text=True, timeout=600, env=env)
+    return r.returncode, r.stdout + r.stderr
+
+
+rc, out = run_negctl_patched(
+    [("SUITE_TIMEOUT = 900", "SUITE_TIMEOUT = 3"),
+     ("def _confirm_group_gone(pgid, budget=REAP_BUDGET):",
+      "def _confirm_group_gone(pgid, budget=REAP_BUDGET):\n"
+      "    return False, '注入: 无权确认进程组状态'\n\n\n"
+      "def _shelved_confirm(pgid, budget=REAP_BUDGET):")],
+    plan="hang", phase="m1")
+if rc is None:
+    bad("C2 打不上补丁: %s" % out)
+else:
+    chk(rc != 0, "C2 收尾未完成 → 负控非零结束(实得 rc=%s)" % rc)
+    chk("收尾**未完成**" in out, "C2 报告说了收尾未完成")
+    chk("现场保留在" in out, "C2 停机时保留现场, 没有去删工作目录")
+    chk(not line_for(out, "② 回读失败"), "C2 后续变异一格都没开跑")
+    chk("已停机" in out, "C2 汇总行说明已停机")
+
+# ── D. 正常对照: 正常结束不许被当成超时, 也不许被误杀 ──
+_d = tmpguard.mkdtemp(prefix="pdg-negexec-ok.")
+for _label, _body, _want, _rc in (
+        ("健康成功", "[OK]   甲\n[OK]   乙\n\n[SUM] OK=2 FAIL=0\n", "ok", 0),
+        ("正常 rc=1 且有具名失败", "[OK]   甲\n[FAIL] 乙没过\n\n[SUM] OK=1 FAIL=1\n", "failed", 1)):
+    _sc = Path(_d) / ("ok-%s.py" % _want)
+    _sc.write_text("import sys\nsys.stdout.write(%r)\nsys.exit(%d)\n" % (_body, _rc),
+                   encoding="utf-8")
+    res, _ = call_executor([sys.executable, str(_sc)], 60)
+    chk(res.status == _want and res.rc == _rc and res.halt is False,
+        "D %s → 裁决 %s / rc=%r / 不停机(实得 %s / %r / %r)"
+        % (_label, _want, _rc, res.status, res.rc, res.halt))
+
+
+# ══ 4. 收尾 ════════════════════════════════════════════════════════════════
 print()
 kids = []
 for entry in os.listdir("/proc"):
