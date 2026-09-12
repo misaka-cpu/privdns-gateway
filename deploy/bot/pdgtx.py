@@ -944,44 +944,118 @@ LINE_LEVEL_ONLY = ("mosdns_lines", "kv_env", "hostname_line", "adblock_sources")
 # `pdg update` **全程持着**这把锁, 中途用刚装好的新脚本跑一次 `pdg __migrate`。跑在那里面的
 # Python 子进程如果照常去 flock 同一个文件, 拿到的是一个**新的** open file description ——
 # 它不持有那把锁, 于是撞上父进程自己, 每次都 TxBusy。v1.7.1 就是这么把整次更新回滚掉的,
-# 而 update 还报成功, 只有 doctor 那条告警露了馅(见 pdg.sh 的 _lock_inherited 与
-# migrate_mosdns_explicit_proxy 上面那两段)。
+# 而 update 还报成功, 只有 doctor 那条告警露了馅。
 #
 # 三种绕法**都不行**, 它们把并发保护弄没了:
 #   · 无条件跳过取锁     → 第三方 CLI/Bot 此刻照样能写;
 #   · 中途 LOCK_UN       → 释放的是父进程那把(同一个 OFD), 窗口期里谁都能进来;
 #   · 信任调用方"说已锁" → 说了不算。
 #
-# 所以要**凭据**, 不要声明。判据与 pdg.sh 那边逐条同源(两侧判不一样才是真的危险):
-#   1. 那个 fd 是打开的 —— "fd 号存在"本身什么都不说明, 它可能是任何东西;
-#   2. 它指向的必须**就是锁文件本身**。比路径字符串不算数(/proc 里的路径可以是符号链接、
-#      可以被 bind mount 换掉、文件也可能被删了重建), 只有设备号 + inode 说了算;
-#   3. **先用另一个 OFD 探一探本来有没有人持锁**, 再看候选 fd 能不能锁上。
+# ## 为什么不能用 flock 来证明
 #
-# 第三步为什么不能只是"在候选 fd 上 flock 一次成功":那证明不了"已经锁着", 只证明了"能锁上"。
-# 父进程如果只是 `exec 9>"$LOCK"` 打开了 fd 却还没 flock, 子进程在 fd 9 上一锁就成 —— 于是
-# 判成继承, 而且按继承的规矩**退出时不释放**。从此那把锁挂在父进程的 fd 9 上, 谁也不知道
-# 它是什么时候被谁拿走的: 不是少了一层保护, 是凭空造出一把没人认领的锁。
+# 前两版都栽在同一件事上: **flock 只能回答"我能不能锁上", 回答不了"这把锁本来是谁的"。**
 #
-# 分清这两件事只能靠**另一个 OFD**:
-#   · 另开 probe fd 非阻塞抢锁 —— 抢到了 ⇒ 原先没人持锁 ⇒ 候选不是继承 ⇒ 立刻还回去、走普通锁;
-#   · 被挡住 ⇒ 确实有人持锁 ⇒ 再看候选 fd: 它也能锁上 ⇒ 与持锁者共享同一个 OFD ⇒ 这才是继承;
-#     锁不上 ⇒ 锁在别人手里 ⇒ 拒绝。
-# 三步全过才算数。任何一步不过就当没有继承, 老老实实自己去开、自己去抢。
+#   v1: 直接在候选 fd 上 flock, 成功就算继承。父进程只 open 没 flock 时, 子进程一锁就成 ——
+#       判成继承, 而按继承的规矩退出时不释放, 于是凭空多出一把没人认领的锁。
+#   v2: 先用另一个 OFD(probe)探一探本来有没有人持锁, 被挡住才去锁候选 fd。看着严密, 但那
+#       两步之间有个真实的窗口: 持锁者恰好在这一瞬放手, 候选 fd 上那次 flock 就**成功**了,
+#       拿到的是一把**全新的**锁 —— 判据仍然说"继承", 仍然不释放。
+#       靠重试去缩小窗口只是把问题变成概率问题, 而"偶尔错"比"一直错"更难查。
+#
+# ## 所有权证据: /proc/locks
+#
+# Linux 把每一把文件锁连同**当初调用 flock 的那个进程的 PID** 一起摆在 /proc/locks 里。
+# 子进程继承 fd 之后, 那条记录里的 PID 仍然是父进程 —— 这正是"这把锁是上面传下来的"的
+# 直接证据, 而一把我们自己刚拿到的锁只会记着**我们自己的** PID。两者从根上分得开。
+#
+# 于是判据变成三步, 而且**全程不碰 flock**:
+#   1. 候选 fd 是打开的 —— "fd 号存在"本身什么都不说明;
+#   2. 它指向的就是锁文件本身(dev + ino)。比路径字符串不算数: /proc 里的路径可以是符号链接、
+#      可以被 bind mount 换掉、文件也可能被删了重建;
+#   3. /proc/locks 里那把锁的持有者是**我们自己或某个祖先进程**。
+#
+# 不 flock ⇒ 不可能"顺手拿到一把新锁", 也就没有把新锁误认成旧锁的余地; 持锁者中途放手的话
+# 第 3 步直接查不到记录, 老老实实走普通锁。
+#
+# 读不到 /proc/locks(非 Linux、容器里被挡)⇒ 证明不了 ⇒ 当没有继承。那会退化成"自己去抢、
+# 抢不到就 TxBusy" —— 与修这个坑之前一样, 但**不会**多造出一把锁。fail-closed。
 #
 # fd 号沿用 shell 侧的约定(9)。`PDG_LOCK_FD=none` 明确关掉这条识别 —— 测试拿它做"撤销修复"
-# 的对照: 关掉之后 CLI 持锁的场景必须重新失败, 否则说明根本没在抢那把锁。
+# 的对照。
 LOCK_FD_ENV = "PDG_LOCK_FD"
 LOCK_FD_DEFAULT = 9
+PROC_LOCKS = "/proc/locks"
+
+
+def _flock_record(st):
+    """(锁 id, 持有者 PID) —— /proc/locks 里这个 (dev, ino) 上的 FLOCK 写锁; 没有就 None。
+
+    只取**持有者**: 以 `->` 开头的那几行是排队等锁的, 把它们算成持有者会把"有人在等"
+    误读成"有人持着"。
+
+    读不到 /proc/locks(非 Linux、容器里被挡)返回 "unknown" —— 与"没有锁"是两回事:
+    没有锁可以放心走普通锁, 而读不到意味着**证明不了**, 只能当没有继承。
+    """
+    want = "%02x:%02x:%d" % (os.major(st.st_dev), os.minor(st.st_dev), st.st_ino)
+    try:
+        with open(PROC_LOCKS, encoding="utf-8") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 6 or parts[1] == "->":
+                    continue
+                if parts[1] != "FLOCK" or parts[3] != "WRITE" or parts[5] != want:
+                    continue
+                try:
+                    return parts[0], int(parts[4])
+                except ValueError:
+                    return parts[0], -1
+    except OSError:
+        return "unknown"
+    return None
 
 
 def inherited_lock_fd(path=None):
     """父进程传下来、**已经持有**那把锁的 fd; 没有(或证明不了)就返回 None。
 
-    注意它**不会**去 unlock: 那把锁是父进程的, 释放了就等于在它眼皮底下把门打开。
+    退出时**绝不 unlock**: 那把锁是父进程的, 释放了就等于在它眼皮底下把门打开。
+    而"万一自己不小心拿到了一把新锁", 见下面第 ④ 步 —— 那种情况下会当场还回去。
+
+    ## 判据
+
+      ① 候选 fd 是打开的, 且指向的**就是锁文件本身**(dev + ino)。比路径字符串不算数:
+         /proc 里的路径可以是符号链接、可以被 bind mount 换掉、文件也可能被删了重建;
+      ② /proc/locks 上这个 inode **有**一把 FLOCK 写锁。没有 ⇒ 谈不上"继承", 而且这一步
+         **不碰 flock** —— 不碰就绝不会顺手拿到一把新锁;
+      ③ 那把锁的持有者 PID 就是我们自己 ⇒ 本进程已经持着(嵌套调用/测试), 直接算数,
+         同样不必 flock;
+      ④ 否则在候选 fd 上试一次非阻塞 flock:
+           失败 ⇒ 锁在**另一个 OFD** 手里, 那是并发不是继承 ⇒ 拒;
+           成功 ⇒ 还要再看一眼 /proc/locks 分辨两种可能:
+             · 记录没变(持有者仍是原来那个 PID)⇒ 我们这次 flock 落在**同一个 OFD** 上,
+               内核认它本来就持着 —— 这才是真正的继承;
+             · 记录变成了**我们自己的 PID** ⇒ 原持有者恰好在这一瞬放了手, 我们拿到的是一把
+               **全新的**锁 ⇒ 当场 LOCK_UN 还回去, 判定为"不是继承"。
+
+    ## 为什么必须是这套, 而不是前两版
+
+    前两版都栽在同一件事上: **flock 只能回答"我能不能锁上", 回答不了"这把锁本来是谁的"。**
+
+      v1: 直接在候选 fd 上 flock, 成功就算继承。父进程只 open 没 flock 时子进程一锁就成 ——
+          判成继承, 而按继承的规矩退出时不释放, 凭空多出一把没人认领的锁。
+      v2: 先用另一个 OFD 探一探本来有没有人持锁, 被挡住才去锁候选 fd。那两步之间有个真实的
+          窗口: 持锁者恰好在这一瞬放手, 候选 fd 上那次 flock 就成功了, 拿到的仍是新锁。
+          靠重试缩小窗口只是把问题变成概率问题, 而"偶尔错"比"一直错"更难查。
+
+    第 ④ 步那次**事后**核对才是真凭据: 内核在 /proc/locks 里记的是**当初调用 flock 的那个
+    进程**, 同一个 OFD 上再 flock 一次不会改写它; 而一把我们自己刚拿到的锁只会记着我们自己
+    的 PID。两者从根上分得开, 与时序无关。
+
+    (注意持有者 PID **可能是个已经退出的进程** —— `pdg.sh` 用的是外部 `flock -n 9`,
+     它上完锁就退出, 锁活在 shell 的 fd 9 上。所以这里只拿 PID 当"是不是我们自己"的标记,
+     不拿它去做亲缘判断: 按祖先链判会把生产上最常见的那条路径判成"不是继承"。)
     """
     raw = os.environ.get(LOCK_FD_ENV, "")
-    if raw.strip().lower() in ("none", "off", "0-"):
+    if raw.strip().lower() in ("none", "off"):
         return None
     try:
         fd = int(raw) if raw.strip() else LOCK_FD_DEFAULT
@@ -990,39 +1064,33 @@ def inherited_lock_fd(path=None):
     if fd < 0:
         return None
     try:
-        st = os.fstat(fd)                                   # ① fd 是开着的
+        st = os.fstat(fd)                                   # ①
     except OSError:
         return None
     try:
-        want = os.stat(path or LOCKFILE)                    # ② 指的就是锁文件本身
+        want = os.stat(path or LOCKFILE)
     except OSError:
         return None
     if (st.st_dev, st.st_ino) != (want.st_dev, want.st_ino):
         return None
-    # ③ 先探: 另一个 OFD 能不能拿到这把锁。
-    try:
-        probe = os.open(path or LOCKFILE, os.O_RDWR)
-    except OSError:
+    before = _flock_record(want)                            # ②
+    if before is None or before == "unknown":
         return None
+    me = os.getpid()
+    if before[1] == me:                                     # ③
+        return fd
     try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)      # ④
+    except OSError:
+        return None                       # 锁在别的 OFD 手里 = 并发, 不是继承
+    after = _flock_record(want)
+    if after == "unknown" or after is None or after[1] == me:
+        # 拿到的是一把**新**锁(原持有者刚放手), 不是继承来的 —— 当场还回去。
         try:
-            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
         except OSError:
-            free = False                     # 被挡住 = 确实有人持着
-        else:
-            free = True                      # 抢到了 = 本来就没人持锁
-            fcntl.flock(probe, fcntl.LOCK_UN)   # 立刻还回去, 一秒都不多占
-    finally:
-        os.close(probe)
-    if free:
-        # 没人持锁 ⇒ 候选 fd 不是"继承来的锁", 它只是一个碰巧指着锁文件的 fd。
-        # **绝不**在它上面 flock: 那会把锁挂到调用方的 fd 上, 而按继承的规矩我们不会释放它。
+            pass
         return None
-    # ④ 有人持着。候选 fd 也能锁上 ⇒ 它与持锁者是同一个 OFD ⇒ 继承成立。
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        return None                          # 锁在别人手里, 不是我们继承来的
     return fd
 
 
@@ -1046,9 +1114,17 @@ class _Lock:
                             % (self.path, e.__class__.__name__))
         try:
             fcntl.flock(self.f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
+        except OSError as e:
             self.f.close(); self.f = None
-            raise TxBusy("已有配置操作正在执行")
+            # **只有真正的锁竞争才算竞争。** flock 失败的原因不止"被别人占着": ENOLCK
+            # (内核锁资源耗尽)、EBADF、EINTR… 都会走到这里。把它们一律报成"已有配置操作
+            # 正在执行", 用户会去找另一个 pdg 进程 —— 而真正的原因(环境坏了)被那句话盖掉,
+            # 他永远找不到。两类分开: 竞争 → TxBusy(等一等再来); 其余 → TxRefused(去修环境)。
+            if e.errno in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+                raise TxBusy("已有配置操作正在执行")
+            raise TxRefused("取锁失败(%s: %s) —— 这不是「别人正在改配置」, 是锁本身用不了; "
+                            "为避免并发写坏配置, 本次拒绝执行"
+                            % (self.path, errno.errorcode.get(e.errno, e.errno)))
         return self
 
     def __exit__(self, *exc):
