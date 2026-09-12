@@ -38,6 +38,8 @@ RESTART_FAIL=""
 # "服务真的在跑"是两件事, 这个旋钮专门制造那个差。
 RESTART_RC0_DEAD=""
 STOP_LEAVES=""
+# stop 命令本身失败(被别的 unit 拉着 / 权限 / systemd 忙)
+STOP_FAIL=""
 
 _svc_conf(){   # 某个服务"读的那份配置"
   case "$1" in
@@ -63,13 +65,15 @@ systemctl(){
     daemon-reload) [[ -n "$DAEMON_RELOAD_FAIL" ]] && return 1; return 0;;
     is-enabled) svc_enabled "$2"; [[ "$(svc_enabled "$2")" == enabled ]] && return 0; return 1;;
     is-active)  svc_active  "$2"; [[ "$(svc_active  "$2")" == active   ]] && return 0; return 3;;
-    enable)  echo enabled  > "$SBOX/state/$svc.enabled"
+    enable)  if [[ "$2" == "--runtime" ]]; then echo enabled-runtime > "$SBOX/state/$svc.enabled"
+             else echo enabled > "$SBOX/state/$svc.enabled"; fi
              [[ "$2" == "--now" ]] && { echo active > "$SBOX/state/$svc.state"; _svc_snapshot "$svc"; }
              return 0;;
     disable) echo disabled > "$SBOX/state/$svc.enabled"
              [[ "$2" == "--now" ]] && echo "${STOP_LEAVES:-inactive}" > "$SBOX/state/$svc.state"
              return 0;;
-    stop) echo "${STOP_LEAVES:-inactive}" > "$SBOX/state/$svc.state"; return 0;;
+    stop) [[ "$STOP_FAIL" == "$svc" ]] && return 1
+          echo "${STOP_LEAVES:-inactive}" > "$SBOX/state/$svc.state"; return 0;;
     start|restart)
       [[ "$RESTART_FAIL" == "$svc" ]] && { echo failed > "$SBOX/state/$svc.state"; return 1; }
       [[ "$RESTART_RC0_DEAD" == "$svc" ]] && { echo failed > "$SBOX/state/$svc.state"; return 0; }
@@ -83,23 +87,41 @@ _pdg_core_svc(){ echo mihomo; }
 
 # 被测的全是真的(systemctl 与 schema 子进程除外, 见各处说明)。
 SCHEMA_FAIL=""
+# 恢复旧 core 配置那一步失败 —— 用来演"回滚自己炸了"这一态。
+RESTORE_CORE_FAIL=""
+# 仅在**回滚阶段**才让 stop 落到这个状态。前向阶段不能武装它, 否则停服务那一关就返回了,
+# 根本到不了恢复路径。
+STOP_LEAVES_ON_ROLLBACK=""
 for _fn in _retire_svc_stopped _retire_core_has_mitm _retire_undo_push _retire_undo_run \
            _retire_track_file _retire_restore_file _retire_reload_svc _retire_track_svc \
-           _retire_restore_svc _retire_cleanup _retire_fail _retire_report_ca \
-           _retire_rerender_core _retire_ios_schema _retire_disable_wloc_json \
-           _retire_ca_report migrate_wloc_retire; do
+           _retire_enable_supported _retire_restore_svc _retire_cleanup _retire_fail \
+           _retire_report_ca _retire_rerender_core _retire_ios_schema \
+           _retire_disable_wloc_json _retire_ca_report migrate_wloc_retire; do
   eval "$(sed -n "/^$_fn(){/,/^}/p" "$ROOT/deploy/bot/pdg.sh")"
   declare -F "$_fn" >/dev/null || bad "pdg.sh 里抽不出 $_fn"
 done
 _RETIRE_UNDO=()
 # 真的那一份改名留着: schema 迁移本身是真跑的(它有自己的原子性), 这里只在需要时让它失败。
 # `declare -f f` 打印的是 `f () \n{ … }`, 去掉函数名再拼上新名字就是一份同体的副本。
+# 恢复文件那一步: 指名的目标可以按需失败(它是产品函数, 这里包一层, 不改被测逻辑)。
+_REAL_RESTORE_FILE_DEF="$(declare -f _retire_restore_file)"
+eval "_real_retire_restore_file${_REAL_RESTORE_FILE_DEF#_retire_restore_file}"
+_retire_restore_file(){
+  if [[ -n "$RESTORE_CORE_FAIL" && "$2" == *"/etc/mihomo/config.yaml" ]]; then
+    echo "注入: 还原 $2 失败"; return 1
+  fi
+  _real_retire_restore_file "$@"
+}
 _REAL_IOS_SCHEMA_DEF="$(declare -f _retire_ios_schema)"
 eval "_real_ios_schema${_REAL_IOS_SCHEMA_DEF#_retire_ios_schema}"
 declare -F _real_ios_schema >/dev/null || bad "夹具: _retire_ios_schema 改名失败"
 _retire_ios_schema(){
   echo "iosschema" >> "$SC_LOG"
-  [[ -n "$SCHEMA_FAIL" ]] && return 1
+  if [[ -n "$SCHEMA_FAIL" ]]; then
+    # 从这一刻起进入回滚。要演"恢复时 stop 落到坏状态"就在这里武装。
+    [[ -n "$STOP_LEAVES_ON_ROLLBACK" ]] && STOP_LEAVES="$STOP_LEAVES_ON_ROLLBACK"
+    return 1
+  fi
   _real_ios_schema
 }
 
@@ -116,7 +138,8 @@ machine(){   # $1 = pdg-mitm 的 enabled 状态, $2 = 运行状态
   # 就只可能是被测代码建的。
   mkdir -p "$SBOX/tmp"
   SC_LOG="$SBOX/systemctl.log"; : > "$SC_LOG"
-  DAEMON_RELOAD_FAIL=""; RESTART_FAIL=""; RESTART_RC0_DEAD=""; STOP_LEAVES=""; SCHEMA_FAIL=""
+  DAEMON_RELOAD_FAIL=""; RESTART_FAIL=""; RESTART_RC0_DEAD=""; STOP_LEAVES=""
+  STOP_FAIL=""; SCHEMA_FAIL=""; RESTORE_CORE_FAIL=""; STOP_LEAVES_ON_ROLLBACK=""
   sbox_legacy_ios on Home >/dev/null || return 1
   echo ios > "$SBOX/etc/privdns-gateway/platform"
   printf 'domain:gs-loc.apple.com\ndomain:gs-loc-cn.apple.com\n' > "$SBOX/etc/mosdns/rules/mitm_hijack.txt"
@@ -361,6 +384,158 @@ grep -qE '信任|证书信任设置' <<<"$out" \
   && ok "仍然提示到手机上手工撤销信任(网关做不到那一步)" || bad "没给撤信任提示"
 [[ -e "$SBOX/etc/privdns-gateway/ca/ca.key" ]] && ok "私钥未被销毁(保留策略)" || bad "私钥被删了"
 sbox_rm
+
+unset TMPDIR
+# ══ 6. 删模块前必须证明服务已停或确实不存在 ═══════════════════════════════
+echo
+echo "══ 6. unit 缺失 + 模块残留 + 状态 unknown + 劫持表合法 ══"
+# 这是一个**独立**场景, 刻意不掺非法域名: 掺了的话归属那道门会先拒, 于是"停止判据"这一格
+# 被别人兜了底, 看着绿而实际没被验过。
+#
+# 现场: unit 文件没了(被手工删过), 模块还躺着, 服务状态 unknown(systemd 也说不清),
+# 劫持表是空的或只有 gs-loc —— 每一道既有的门都拦不住它。
+# 而 need_svc 只看 `-f unit || was_active`: 两个都不成立 ⇒ 停止判据**整段被跳过** ⇒
+# 直接去删模块。7894 上那个进程可能还在转发, 而它的源码没了。
+for hijstate in empty legal; do
+  machine enabled active || { bad "沙箱构造失败"; continue; }
+  d="$SBOX"
+  rm -f "$d/etc/systemd/system/pdg-mitm.service"      # unit 没了
+  echo unknown > "$SBOX/state/pdg-mitm.state"          # 状态说不清
+  STOP_LEAVES=unknown                                  # 而且**一直**说不清: stop 之后还是 unknown
+  if [[ "$hijstate" == empty ]]; then : > "$d/etc/mosdns/rules/mitm_hijack.txt"
+  else printf 'domain:gs-loc.apple.com\n' > "$d/etc/mosdns/rules/mitm_hijack.txt"; fi
+  run; rc=$?
+  [[ $rc -ne 0 ]] \
+    && ok "[劫持表=$hijstate] unit 缺失 + 状态 unknown → 拒绝(没有假设它已经停了)" \
+    || bad "[劫持表=$hijstate] 没证明服务停了就往下走"
+  [[ -e "$d/opt/pdg-bot/mitm_server.py" ]] \
+    && ok "[劫持表=$hijstate] 模块没被删(证明不了已停就不删执行文件)" \
+    || bad "[劫持表=$hijstate] 状态 unknown 却把模块删了"
+  STOP_LEAVES=""
+  sbox_rm
+done
+# 反面: 服务**确实不存在**(unit 无、状态 inactive)→ 该放行, 不能一律拒
+machine disabled inactive || bad "沙箱构造失败"
+rm -f "$SBOX/etc/systemd/system/pdg-mitm.service"
+echo inactive > "$SBOX/state/pdg-mitm.state"
+run; rc=$?
+[[ $rc -eq 0 ]] && ok "服务确实不存在(inactive + 无 unit)→ 放行, 不误伤" || bad "误伤了干净的机器"
+[[ ! -e "$SBOX/opt/pdg-bot/mitm_server.py" ]] && ok "确实不存在时模块正常删除" || bad "该删没删"
+sbox_rm
+
+# ══ 7. 事务三态: 回滚不完整时必须**保留**恢复材料 ═══════════════════════════
+echo
+echo "══ 7. 成功提交 / 完整回滚 / 回滚不完整 ══"
+machine enabled active || bad "沙箱构造失败"
+core_sha="$(fsha "$SBOX/etc/mihomo/config.yaml")"
+# 注入: 旧 core **恢复**失败 —— 回滚自己炸了
+RESTORE_CORE_FAIL=1
+SCHEMA_FAIL=1
+out="$( ( exec 9>"$PDG_LOCKFILE"; flock -n 9; migrate_wloc_retire ) 2>&1 )"; rc=$?
+RESTORE_CORE_FAIL=""; SCHEMA_FAIL=""
+[[ $rc -ne 0 ]] && ok "回滚不完整 → 非 0" || bad "回滚失败却报成功"
+grep -q '格式迁移失败\|schema' <<<"$out" && ok "报告里有**原始**失败" || bad "没报原始失败: ${out:0:100}"
+grep -qE '回滚失败|恢复没做干净|不完整' <<<"$out" && ok "报告里有**恢复**失败" || bad "没报恢复失败"
+# 最要紧: 恢复材料不许被清掉, 而且要能**真的**拿它恢复
+bak="$(find "$SBOX/tmp" -type f 2>/dev/null | head -20)"
+[[ -n "$bak" ]] && ok "回滚不完整 → 本轮备份**保留**下来了" || bad "回滚不完整却把备份清了 —— 没东西可恢复了"
+found=""
+while read -r f; do
+  [[ -z "$f" ]] && continue
+  [[ "$(sha256sum "$f" | cut -d' ' -f1)" == "$core_sha" ]] && found="$f"
+done <<< "$bak"
+[[ -n "$found" ]] \
+  && ok "保留下来的材料里确实有可用于恢复的旧 core 配置($(basename "$found"))" \
+  || bad "备份留着但里面没有旧 core 配置 —— 留了个空壳"
+grep -qE "$SBOX/tmp|可定位|保留" <<<"$out" && ok "报告里给出了可定位的路径" || bad "没告诉人材料在哪: ${out:0:160}"
+sbox_rm
+
+# ══ 8. mihomo/mosdns 的原运行状态也要记 ═══════════════════════════════════
+echo
+echo "══ 8. 被改动的每个服务都要记原状态 ══"
+# 回滚里对 mihomo/mosdns 做的是 restart。它们**原本 inactive** 的话, 回滚会把它们起起来 ——
+# 那不是"恢复", 是凭空改变了现场。
+machine enabled active || bad "沙箱构造失败"
+svc_set mihomo enabled inactive
+svc_set mosdns enabled inactive
+SCHEMA_FAIL=1
+out="$( ( exec 9>"$PDG_LOCKFILE"; flock -n 9; migrate_wloc_retire ) 2>&1 )"; rc=$?
+SCHEMA_FAIL=""
+if [[ $rc -ne 0 ]]; then
+  [[ "$(svc_active mihomo)" != active ]] \
+    && ok "mihomo 原本 inactive → 回滚后没被起起来" \
+    || bad "回滚把原本没在跑的 mihomo 起起来了"
+  [[ "$(svc_active mosdns)" != active ]] \
+    && ok "mosdns 原本 inactive → 回滚后没被起起来" \
+    || bad "回滚把原本没在跑的 mosdns 起起来了"
+else
+  grep -qE 'inactive|没在跑|不支持' <<<"$out" \
+    && ok "原本 inactive 的内核/DNS → 操作前就明确拒绝(另一种可接受的做法)" \
+    || bad "原本 inactive 却照常跑完, 也没说什么"
+fi
+sbox_rm
+# 原本 active 的仍要验"旧配置重新加载了"(已有 §1 覆盖, 这里确认没被上面那格带偏)
+machine enabled active || bad "沙箱构造失败"
+core_sha="$(fsha "$SBOX/etc/mihomo/config.yaml")"
+hij_sha="$(fsha "$SBOX/etc/mosdns/rules/mitm_hijack.txt")"
+SCHEMA_FAIL=1; run; SCHEMA_FAIL=""
+[[ "$(svc_loaded mihomo)" == "$core_sha" && "$(svc_active mihomo)" == active ]] \
+  && ok "原本 active: 回滚后 mihomo 重新加载了旧配置且仍 active" || bad "旧配置没被重新加载"
+[[ "$(svc_loaded mosdns)" == "$hij_sha" && "$(svc_active mosdns)" == active ]] \
+  && ok "原本 active: 回滚后 mosdns 重新加载了旧表且仍 active" || bad "mosdns 没重新加载"
+sbox_rm
+
+# ══ 9. stop 失败不许被吞 ═══════════════════════════════════════════════════
+echo
+echo "══ 9. 恢复时 stop 失败 ══"
+machine enabled failed || bad "沙箱构造失败"
+STOP_FAIL=pdg-mitm        # 恢复那一步要 stop, 但它失败
+SCHEMA_FAIL=1
+out="$( ( exec 9>"$PDG_LOCKFILE"; flock -n 9; migrate_wloc_retire ) 2>&1 )"; rc=$?
+STOP_FAIL=""; SCHEMA_FAIL=""
+grep -qE '回滚失败|恢复没做干净|不完整' <<<"$out" \
+  && ok "恢复时 stop 失败 → 判成恢复失败(没被 || true 吞掉)" \
+  || bad "stop 失败被吞了: ${out:0:160}"
+[[ -n "$(find "$SBOX/tmp" -type f 2>/dev/null | head -1)" ]] \
+  && ok "恢复失败 → 触发保留策略, 材料还在" || bad "恢复失败却清了材料"
+sbox_rm
+# deactivating / activating / unknown: "已保持停止"必须有停止后置条件支持
+for st in deactivating activating unknown; do
+  machine enabled failed || { bad "沙箱构造失败"; continue; }
+  # 原状态 failed ⇒ 恢复时走"复现不了 → 按停止处置"那一支; 而**回滚阶段**的 stop 把它落在
+  # $st, 于是"已保持停止"这句话拿不出后置条件。
+  STOP_LEAVES_ON_ROLLBACK="$st"
+  SCHEMA_FAIL=1
+  out="$( ( exec 9>"$PDG_LOCKFILE"; flock -n 9; migrate_wloc_retire ) 2>&1 )"
+  STOP_LEAVES_ON_ROLLBACK=""; STOP_LEAVES=""; SCHEMA_FAIL=""
+  grep -qE '回滚失败|恢复没做干净|不完整' <<<"$out" \
+    && ok "恢复后仍是 $st → 不算恢复成功" \
+    || bad "$st 被当成「已保持停止」了: ${out:0:140}"
+  sbox_rm
+done
+
+# ══ 10. enabled-runtime 与 enabled 是两回事 ═══════════════════════════════
+echo
+echo "══ 10. 自启状态逐项恢复 ══"
+machine enabled-runtime active || bad "沙箱构造失败"
+SCHEMA_FAIL=1; run; SCHEMA_FAIL=""
+[[ "$(svc_enabled pdg-mitm)" == "enabled-runtime" ]] \
+  && ok "原本 enabled-runtime → 恢复成 enabled-runtime(不是变成永久自启)" \
+  || bad "enabled-runtime 被恢复成了 $(svc_enabled pdg-mitm) —— 临时自启变永久"
+sbox_rm
+# 不支持的自启状态: 必须在**改之前**拒绝, 不能改完再报告不一致
+for en in static masked indirect; do
+  machine "$en" active || { bad "沙箱构造失败"; continue; }
+  before_en="$(svc_enabled pdg-mitm)"
+  out="$( ( exec 9>"$PDG_LOCKFILE"; flock -n 9; migrate_wloc_retire ) 2>&1 )"; rc=$?
+  [[ $rc -ne 0 ]] && ok "自启状态 $en 不支持 → 操作前拒绝" || bad "$en 却照常跑完了"
+  [[ "$(svc_enabled pdg-mitm)" == "$before_en" ]] \
+    && ok "$en: 拒绝时自启状态一个字都没动" \
+    || bad "$en 被改成了 $(svc_enabled pdg-mitm) —— 先改再报告不一致"
+  [[ "$(svc_active pdg-mitm)" == active ]] \
+    && ok "$en: 拒绝时服务也没被停" || bad "$en: 拒绝前已经把服务停了"
+  sbox_rm
+done
 
 unset TMPDIR
 echo
