@@ -40,12 +40,14 @@ _pdg_core_svc(){ echo mihomo; }
 
 # 被测的**全部**是真的, 一个都不替换。
 for _fn in _retire_svc_stopped _retire_core_has_mitm _retire_undo_push _retire_undo_run \
-           _retire_fail _retire_rerender_core _retire_ios_schema _retire_disable_wloc_json \
-           _retire_ca_report migrate_wloc_retire; do
+           _retire_track_file _retire_restore_file _retire_reload_svc _retire_track_svc \
+           _retire_restore_svc _retire_cleanup _retire_fail _retire_report_ca _retire_rerender_core _retire_ios_schema \
+           migrate_wloc_retire _retire_disable_wloc_json _retire_ca_report; do
   eval "$(sed -n "/^$_fn(){/,/^}/p" "$ROOT/deploy/bot/pdg.sh")"
   declare -F "$_fn" >/dev/null || { bad "pdg.sh 里抽不出 $_fn"; }
 done
 _RETIRE_UNDO=()
+_RETIRE_TMP=""
 
 # ── 造一台**退役前的完整机器** ───────────────────────────────────────────────
 full_machine(){   # $1 = SSID(可空)

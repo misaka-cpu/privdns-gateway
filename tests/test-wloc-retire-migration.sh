@@ -27,6 +27,7 @@ bad(){ echo "[FAIL] $1"; nfail=$((nfail+1)); }
 c_g(){ :; }; c_y(){ :; }; c_r(){ :; }
 # 回滚账本是个数组, 按函数抽取拿不到 —— 显式声明一份(与 pdg.sh 同名同义)。
 _RETIRE_UNDO=()
+_RETIRE_TMP=""
 
 # ── systemctl 打桩 ──────────────────────────────────────────────────────────
 # 三个可控旋钮, 各自对应一类真实故障:
@@ -76,7 +77,9 @@ _retire_ios_schema(){ echo "iosschema" >> "$SC_LOG"; [[ -n "$SCHEMA_FAIL" ]] && 
 # 它们在生产里都要起 /opt/pdg-bot 下的真模块, 上面用可控旋钮替代(本支关心的是编排:
 # 顺序、判据、失败怎么恢复)。它们各自的真实行为由 lock-handoff 与 realrun 两支负责。
 for _fn in _retire_svc_stopped _retire_core_has_mitm _retire_undo_push _retire_undo_run \
-            _retire_fail migrate_wloc_retire _retire_disable_wloc_json _retire_ca_report; do
+           _retire_track_file _retire_restore_file _retire_reload_svc _retire_track_svc \
+           _retire_restore_svc _retire_cleanup _retire_fail _retire_report_ca \
+           migrate_wloc_retire _retire_disable_wloc_json _retire_ca_report; do
   eval "$(sed -n "/^$_fn(){/,/^}/p" "$ROOT/deploy/bot/pdg.sh")"
   declare -F "$_fn" >/dev/null || bad "pdg.sh 里抽不出 $_fn"
 done
