@@ -956,8 +956,17 @@ LINE_LEVEL_ONLY = ("mosdns_lines", "kv_env", "hostname_line", "adblock_sources")
 #   1. 那个 fd 是打开的 —— "fd 号存在"本身什么都不说明, 它可能是任何东西;
 #   2. 它指向的必须**就是锁文件本身**。比路径字符串不算数(/proc 里的路径可以是符号链接、
 #      可以被 bind mount 换掉、文件也可能被删了重建), 只有设备号 + inode 说了算;
-#   3. 在这个 fd 上**真跑一次非阻塞 flock**。同一个 OFD 已经持锁时它直接成功; 锁在别人
-#      手里时它失败。这一步才是凭据 —— 前两步只是防认错文件, 不能代替它。
+#   3. **先用另一个 OFD 探一探本来有没有人持锁**, 再看候选 fd 能不能锁上。
+#
+# 第三步为什么不能只是"在候选 fd 上 flock 一次成功":那证明不了"已经锁着", 只证明了"能锁上"。
+# 父进程如果只是 `exec 9>"$LOCK"` 打开了 fd 却还没 flock, 子进程在 fd 9 上一锁就成 —— 于是
+# 判成继承, 而且按继承的规矩**退出时不释放**。从此那把锁挂在父进程的 fd 9 上, 谁也不知道
+# 它是什么时候被谁拿走的: 不是少了一层保护, 是凭空造出一把没人认领的锁。
+#
+# 分清这两件事只能靠**另一个 OFD**:
+#   · 另开 probe fd 非阻塞抢锁 —— 抢到了 ⇒ 原先没人持锁 ⇒ 候选不是继承 ⇒ 立刻还回去、走普通锁;
+#   · 被挡住 ⇒ 确实有人持锁 ⇒ 再看候选 fd: 它也能锁上 ⇒ 与持锁者共享同一个 OFD ⇒ 这才是继承;
+#     锁不上 ⇒ 锁在别人手里 ⇒ 拒绝。
 # 三步全过才算数。任何一步不过就当没有继承, 老老实实自己去开、自己去抢。
 #
 # fd 号沿用 shell 侧的约定(9)。`PDG_LOCK_FD=none` 明确关掉这条识别 —— 测试拿它做"撤销修复"
@@ -990,10 +999,30 @@ def inherited_lock_fd(path=None):
         return None
     if (st.st_dev, st.st_ino) != (want.st_dev, want.st_ino):
         return None
+    # ③ 先探: 另一个 OFD 能不能拿到这把锁。
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)      # ③ 凭据: 真跑一次
+        probe = os.open(path or LOCKFILE, os.O_RDWR)
     except OSError:
         return None
+    try:
+        try:
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            free = False                     # 被挡住 = 确实有人持着
+        else:
+            free = True                      # 抢到了 = 本来就没人持锁
+            fcntl.flock(probe, fcntl.LOCK_UN)   # 立刻还回去, 一秒都不多占
+    finally:
+        os.close(probe)
+    if free:
+        # 没人持锁 ⇒ 候选 fd 不是"继承来的锁", 它只是一个碰巧指着锁文件的 fd。
+        # **绝不**在它上面 flock: 那会把锁挂到调用方的 fd 上, 而按继承的规矩我们不会释放它。
+        return None
+    # ④ 有人持着。候选 fd 也能锁上 ⇒ 它与持锁者是同一个 OFD ⇒ 继承成立。
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return None                          # 锁在别人手里, 不是我们继承来的
     return fd
 
 
