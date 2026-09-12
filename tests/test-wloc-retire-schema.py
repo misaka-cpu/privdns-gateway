@@ -500,15 +500,34 @@ print("══ 8. 迁移前的产物校验与原子性 ══")
 
 def _tree(d):
     """目录的完整身份: 相对路径 + 内容 sha + mode + uid + gid。回滚要能精确复原,
-    光比内容不够 —— 权限被改掉同样是现场被动过。"""
+    光比内容不够 —— 权限被改掉同样是现场被动过。
+
+    **读不出来的条目按"读不到"记, 不抛异常**: 有几格故意把文件设成 0o000 或换成目录来验
+    "读不出来 ≠ 不存在"。快照在这里炸掉的话, 那几格就退化成 traceback —— 而崩溃不是具名
+    失败, 撤掉被测的那道门反而会显示成"没有新增红行"。
+    这一层要证的是"现场没被动过", 读不读得出内容不影响这个判断。
+    """
     out = {}
-    for base, _dirs, files in os.walk(d):
-        for f in sorted(files):
+    for base, dirs, files in os.walk(d):
+        for f in sorted(files) + sorted(dirs):
             fp = os.path.join(base, f)
-            st = os.lstat(fp)
+            try:
+                st = os.lstat(fp)
+            except OSError as e:
+                out[os.path.relpath(fp, d)] = ("lstat:%s" % e.errno,)
+                continue
+            if stat.S_ISDIR(st.st_mode):
+                digest = "<dir>"
+            elif stat.S_ISLNK(st.st_mode):
+                digest = "<link:%s>" % os.readlink(fp)
+            else:
+                try:
+                    with open(fp, "rb") as fh:
+                        digest = hashlib.sha256(fh.read()).hexdigest()
+                except OSError as e:
+                    digest = "<unreadable:%s>" % e.errno
             out[os.path.relpath(fp, d)] = (
-                hashlib.sha256(open(fp, "rb").read()).hexdigest(),
-                stat.S_IMODE(st.st_mode), st.st_uid, st.st_gid)
+                digest, stat.S_IMODE(st.st_mode), st.st_uid, st.st_gid)
     return out
 
 
@@ -706,6 +725,107 @@ try:
         bad("撤销修复对照: 拿掉产物校验后仍被拒 —— 说明拦它的不是这道门")
 finally:
     S._check_artifact = _real_ca
+
+# ══ 9. 只有**真的不在**才算 MISSING ═════════════════════════════════════════
+print()
+print("══ 9. 读不出来 ≠ 不存在 ══")
+# 迁移把"读不到产物"当成 MISSING 放行。但 read_artifact 把**所有** OSError 都压成 None ——
+# 于是权限不足(EACCES)、IO 错误、路径上放了个目录、软链指向不存在的地方, 统统被当成
+# "那台机器只是丢了文件"。
+#
+# 后果很具体: 一台产物**还在**、只是暂时读不出来的机器, 会被当成缺产物照常迁移 —— 记录改写、
+# 带 CA 的产物删掉。等权限修好, 那份东西已经没有任何记录能解释它了。
+# "看不见"不等于"没有", 这条与 mitm_ca._probe 是同一个判据(那边也踩过)。
+
+
+def readerr_case(label, setup, cleanup=None):
+    ww = tmpguard.mkdtemp(prefix="pdg-schema-rderr.")
+    mpp, arr, _m = legacy_meta(ww, wloc=False)
+    try:
+        setup(mpp, arr)
+        before = _snap(mpp, arr)
+        try:
+            S.migrate_schema(meta_path=mpp, art_root=arr, lock=False)
+            bad("%s: 被当成 MISSING 放行了 —— 产物其实还在" % label)
+            return
+        except S.StateError as e:
+            msg = str(e)
+        except Exception as e:  # noqa: BLE001
+            bad("%s: 抛的是 %s 而不是 StateError" % (label, type(e).__name__))
+            return
+        if _snap(mpp, arr) != before:
+            bad("%s: 拒绝了却动过记录/产物" % label)
+            return
+        ok("%s → 拒绝(%s), 记录与产物零改动" % (label, msg.split("\n")[0][:48]))
+    finally:
+        if cleanup:
+            cleanup(mpp, arr)
+
+
+def _unreadable(mpp, arr):
+    os.chmod(os.path.join(arr, S.CUR), 0o000)
+
+
+def _unchmod(mpp, arr):
+    try:
+        os.chmod(os.path.join(arr, S.CUR), 0o644)
+    except OSError:
+        pass
+
+
+def _dir_masquerade(mpp, arr):
+    fp = os.path.join(arr, S.CUR)
+    os.remove(fp)
+    os.makedirs(fp)
+
+
+def _dangling_symlink(mpp, arr):
+    fp = os.path.join(arr, S.CUR)
+    os.remove(fp)
+    os.symlink(os.path.join(arr, "nope-not-here"), fp)
+
+
+if os.geteuid() == 0:
+    print("[SKIP] 权限不足(EACCES)这一格: 本次以 root 身份运行, 0o000 拦不住 root。"
+          " 其余几格照跑。")
+else:
+    readerr_case("产物存在但读不出来(EACCES)", _unreadable, _unchmod)
+readerr_case("产物的位置上放着一个目录", _dir_masquerade)
+readerr_case("产物是一条指向不存在目标的软链", _dangling_symlink)
+
+# 反面: **真的**不在才算 MISSING(§8 已验一次, 这里再确认它没被上面几格带偏)
+w9b = tmpguard.mkdtemp(prefix="pdg-schema-realmiss.")
+mp9b, art9b, _o = legacy_meta(w9b, wloc=False)
+os.remove(os.path.join(art9b, S.CUR))
+try:
+    r = S.migrate_schema(meta_path=mp9b, art_root=art9b, lock=False)
+    chk(r.get("missing_artifacts") == ["current"],
+        "真的不在 → 仍按 MISSING 放行并点名(实得 %r)" % (r.get("missing_artifacts"),))
+except S.StateError as e:
+    bad("真的不在却被拒了: %s" % str(e)[:80])
+
+# 撤销修复对照: 把**三态**探测换回两态("读不到就是 None"), 目录冒充那一格必须转红。
+# 瞄的必须是 read_artifact_strict —— 迁移读的是它; 换掉 read_artifact 只会换掉一个
+# 迁移根本不走的函数, 那样的"对照"什么都不证明(第一版正是这么写的, 于是它自己先红了)。
+_real_read = S.read_artifact_strict
+try:
+    def _naive(which, root=None):
+        try:
+            with open(S.art_path(which, root), "rb") as f:
+                return f.read(), "ok"
+        except OSError:
+            return None, "missing"
+    S.read_artifact_strict = _naive
+    ww = tmpguard.mkdtemp(prefix="pdg-schema-undo9.")
+    mpp, arr, _m = legacy_meta(ww, wloc=False)
+    _dir_masquerade(mpp, arr)
+    try:
+        S.migrate_schema(meta_path=mpp, art_root=arr, lock=False)
+        ok("撤销修复对照: 退回「读不到就是 None」后, 目录冒充确实被当成 MISSING 放行")
+    except S.StateError:
+        bad("撤销修复对照: 退回之后仍被拒 —— 拦它的不是这道门")
+finally:
+    S.read_artifact_strict = _real_read
 
 print()
 print("[SUM] OK=%d FAIL=%d" % (PASS[0], FAIL[0]))
