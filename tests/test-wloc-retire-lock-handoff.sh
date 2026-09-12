@@ -32,10 +32,11 @@ bad(){ echo "[FAIL] $1"; nfail=$((nfail+1)); }
 c_g(){ :; }; c_y(){ :; }; c_r(){ :; }
 
 # 抽出被测函数。**只抽 shell 侧**: Python 那一半必须是真模块, 否则这支测试什么都证明不了。
-for _fn in _retire_ios_schema; do
-  eval "$(sed -n "/^$_fn(){/,/^}/p" "$ROOT/deploy/bot/pdg.sh")"
-  declare -F "$_fn" >/dev/null || { bad "pdg.sh 里抽不出 $_fn"; echo "[SUM] OK=$pass FAIL=$nfail"; exit 1; }
-done
+eval "$(sed -n '/^_retire_ios_schema(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh")"
+if ! declare -F _retire_ios_schema >/dev/null; then
+  bad "pdg.sh 里抽不出 _retire_ios_schema"
+  echo "[SUM] OK=$pass FAIL=$nfail"; exit 1
+fi
 
 # ── 探针: 一个**没有继承 fd** 的第三方去抢锁。抢到 = 那一刻锁是松的。 ─────────
 probe_can_lock(){  # 0 = 抢到了(说明锁没被持住)

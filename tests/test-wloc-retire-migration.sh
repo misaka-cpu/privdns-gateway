@@ -259,7 +259,7 @@ mkdir -p "$d/etc/mihomo"
 printf '{"proxies":[{"name":"MITM-OUT"}],"rules":["DOMAIN-SUFFIX,gs-loc.apple.com,MITM-OUT"]}\n' \
   > "$d/etc/mihomo/config.yaml"
 : > "$SC_LOG"
-migrate_wloc_retire; rcI2=$?
+migrate_wloc_retire >/dev/null 2>&1
 grep -q rerender "$SC_LOG" \
   && ok "劫持表文件缺失时同样去查内核路由" || bad "I2: 表缺失就跳过了内核"
 
