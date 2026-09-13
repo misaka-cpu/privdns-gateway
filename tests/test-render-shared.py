@@ -101,7 +101,7 @@ import mihomorender as M
 model = json.loads(%r)
 meta = json.loads(%r)
 data, meta_out = M.render_bytes(model, lan_domains=[], rulesets=M.rulesets_arg(meta),
-                                mitm_domains=[], tls_ports=None)
+                                tls_ports=None)
 print("SHA:" + hashlib.sha256(data).hexdigest())
 print("RS:" + json.dumps(M.rulesets_arg(meta), sort_keys=True))
 print("BH:" + str(M.mrs_behavior(open(%r, "rb").read())))
@@ -157,7 +157,6 @@ try:
     json.dump(json.loads(%r), open(os.path.join(d, "rulesets.json"), "w"))
     fn = M.deriver_from_paths(lan_table_file=os.path.join(d, "lan-panels.json"),
                               rs_meta_path=os.path.join(d, "rulesets.json"),
-                              mitm_hijack_file=os.path.join(d, "mitm_hijack.txt"),
                               platform_file=os.path.join(d, "platform"))
     data = fn({"model": json.dumps(json.loads(%r)).encode()})
     print("SHA:" + hashlib.sha256(data).hexdigest())
@@ -200,10 +199,10 @@ else:
 _p = bot._platform
 bot._platform = lambda: "android"
 try:
-    bot_bytes, _m = bot._render_mihomo_bytes(MODEL, rs_meta=META, mitm_domains=[])
+    bot_bytes, _m = bot._render_mihomo_bytes(MODEL, rs_meta=META)
 finally:
     bot._platform = _p
-shared_bytes, _m2 = M.render_bytes(MODEL, rulesets=shared_rs, mitm_domains=[], tls_ports=None,
+shared_bytes, _m2 = M.render_bytes(MODEL, rulesets=shared_rs, tls_ports=None,
                                    lan_domains=[])
 if hashlib.sha256(bot_bytes).hexdigest() == hashlib.sha256(shared_bytes).hexdigest():
     ok("bot._render_mihomo_bytes 与 mihomorender.render_bytes 逐字节相同")
@@ -225,20 +224,11 @@ else:
     bad("patch RS_META 无效: %r" % bot._mihomo_rulesets())
 bot.RS_META = RS_PATH
 
-HJ = os.path.join(work, "hijack.txt")
-open(HJ, "w").write("domain:patched.example.com\n")
-bot.MITM_HIJACK_FILE = HJ
-bot._platform = lambda: "ios"
-try:
-    if bot._mitm_domains() == ["patched.example.com"]:
-        ok("monkeypatch bot.MITM_HIJACK_FILE → _mitm_domains 跟着变")
-    else:
-        bad("patch MITM_HIJACK_FILE 无效: %r" % bot._mitm_domains())
-finally:
-    bot._platform = _p
+# (这里曾经还有一格: monkeypatch bot.MITM_HIJACK_FILE → _mitm_domains 跟着变。
+#  WLOC 退役后渲染器不再读那份劫持表, 那个 monkeypatch 点本身不存在了。)
 
 for name in ("mrs_behavior", "_mrs_behavior_of_file", "_mihomo_rulesets",
-             "_mitm_domains", "_render_mihomo_bytes", "_mihomo_derive",
+             "_render_mihomo_bytes", "_mihomo_derive",
              "_fmt_dropped", "_panel_render_args", "MRS_BEHAVIORS"):
     if hasattr(bot, name):
         ok("bot.%s 仍然存在(既有调用方与测试的入口未被搬走)" % name)

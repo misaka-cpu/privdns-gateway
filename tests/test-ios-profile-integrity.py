@@ -72,8 +72,10 @@ class Box:
         self.meta = self.root + "/etc/privdns-gateway/ios-profile.json"
         self.art = self.root + "/var/lib/privdns-gateway/ios-profile"
 
-    def gen(self, host="dot.example.com", ip="203.0.113.10", ssids=(), ca=b"", legacy=False):
-        return self.s.generate(host, ip, ssids, ca, bool(ca), TMPL,
+    def gen(self, host="dot.example.com", ip="203.0.113.10", ssids=(), legacy=False):
+        # WLOC 退役: 生成路径不再接受根证书, 夹具去掉 ca 这一维。这一支验的东西
+        # 与产物里有没有根证书无关, 判据本身一条没动。
+        return self.s.generate(host, ip, ssids, TMPL,
                                self.meta, self.art, True, legacy)
 
     def cur(self):
@@ -164,8 +166,8 @@ case("current 其实是另一个 revision 的文件(串位)", _cross_revision)
 
 for label, setup, which in CASES:
     b = Box()
-    b.gen(ca=CA_A)                      # rev1
-    b.gen(host="dot.v2.example", ca=CA_A)   # rev2, previous=rev1
+    b.gen()                      # rev1
+    b.gen(host="dot.v2.example")   # rev2, previous=rev1
     setup(b)
     st, detail = health(b, which)
     if st is None:
@@ -185,10 +187,10 @@ for label, setup, which in CASES:
 print()
 print("══ 二、等级与健康状态互不污染 ══")
 b = Box()
-b.gen(ca=CA_A)
+b.gen()
 _tamper_current(b)
 lv, why = b.s.classify(b.read_meta(),
-                       b.s.make_inputs("dot.example.com", "203.0.113.10", (), True, CA_A, TMPL))
+                       b.s.make_inputs("dot.example.com", "203.0.113.10", (), TMPL))
 if lv == b.s.NONE and not any("产物" in r or "重建" in r for r in why):
     ok("产物损坏**不影响**配置变化等级: 仍是「%s」" % b.s.LEVEL_LABEL[lv])
 else:
@@ -200,9 +202,9 @@ else:
     bad("产物健康状态没有单独表达: %r %s" % (st, detail))
 
 b2 = Box()
-b2.gen(ca=CA_A)
+b2.gen()
 lv2, why2 = b2.s.classify(b2.read_meta(),
-                          b2.s.make_inputs("dot.new.example", "203.0.113.10", (), True, CA_A, TMPL))
+                          b2.s.make_inputs("dot.new.example", "203.0.113.10", (), TMPL))
 st2, _ = health(b2)
 if lv2 == "required" and st2 == "healthy":
     ok("反过来: 配置真的变了 → 必须更新, 而产物健康状态仍是 healthy")
@@ -212,12 +214,12 @@ else:
 print()
 print("══ 三、自动修复的边界 ══")
 b = Box()
-b.gen(ca=CA_A)
+b.gen()
 rev = b.read_meta()["current"]["revision"]
 orig = open(b.cur(), "rb").read()
 prev_before = os.path.exists(b.prev())
 _drop_current(b)
-m, lv, why, data, changed = b.gen(ca=CA_A)
+m, lv, why, data, changed = b.gen()
 after = open(b.cur(), "rb").read()
 if after == orig and b.read_meta()["current"]["revision"] == rev and not changed:
     ok("输入与记录一致 + CA 指纹一致 → 逐字节复原, revision 不变")
@@ -228,26 +230,33 @@ if os.path.exists(b.prev()) == prev_before:
 else:
     bad("修复过程改动了 previous")
 
-# 无法精确重建: CA 换了(指纹对不上) → 不许"修复", 只能当成新版本
+# 无法精确重建 → 不许"修复", 只能当成新版本。
+#
+# 这一格原本用的是"手上的 CA 换了(指纹对不上)"这个由头, 并且刻意断言**是指纹那道门**拦下的。
+# WLOC 退役后描述文件不再携带根证书, 指纹那道门连同它的对象一起没了。剩下的那道门是
+# "按记录重新渲染, sha256 必须精确相等" —— 它才是真正兜住"别把另一份文件冒充成那一版"的。
+# 换个由头制造同样的处境: 把记录里的 sha256 改掉(等价于"这一版用当时的模板渲染不出来了")。
 b = Box()
-b.gen(ca=CA_A)
+b.gen()
 rev = b.read_meta()["current"]["revision"]
 _drop_current(b)
+_m = b.read_meta()
+_m["current"]["sha256"] = "0" * 64
+with open(b.meta, "w", encoding="utf-8") as _f:
+    json.dump(_m, _f, ensure_ascii=False, indent=2, sort_keys=True)
 repair = getattr(b.s, "repair_current", None)
 if repair is None:
     bad("iosstate 没有 repair_current(自动修复没有独立入口, 边界无从表达)")
 else:
     try:
-        repair(CA_C, TMPL, b.meta, b.art, True)
-        bad("CA 指纹对不上却仍然「修复」了")
+        repair(TMPL, b.meta, b.art, True)
+        bad("渲染结果与记录对不上却仍然「修复」了")
     except Exception as e:  # noqa: BLE001
-        # 判据要落在**是哪道门拦下的**上。渲染结果的 sha 也对不上, 所以只断言"被拒了"会让
-        # 指纹这道门被删掉也照样绿 —— 而它正是那句能让用户看懂的话("你手上的不是那一版用的
-        # 证书"), 少了它就退化成一句含糊的"结果对不上"。
-        if "根证书指纹" in str(e):
-            ok("CA 指纹对不上 → 由指纹这道门拒绝: %s" % str(e)[:56])
+        # 仍然断言**是哪道门**拦下的: 只断言"被拒了"的话, 这道门被删掉也照样绿。
+        if "对不上" in str(e) and "逐字节复原" in str(e):
+            ok("重新渲染与记录对不上 → 由逐字节复原那道门拒绝: %s" % str(e)[:56])
         else:
-            bad("拒是拒了, 但不是指纹那道门(消息里没提指纹): %s" % str(e)[:90])
+            bad("拒是拒了, 但不是逐字节复原那道门: %s" % str(e)[:90])
     if b.read_meta()["current"]["revision"] == rev:
         ok("拒绝修复之后 revision 没有被偷偷推进")
     else:
@@ -278,8 +287,8 @@ else:
 print()
 print("══ 四、previous 不许猜着重建 ══")
 b = Box()
-b.gen(ca=CA_A)                          # rev1, CA=A
-b.gen(host="dot.v2.example", ca=CA_B)   # rev2, CA=B; previous=rev1(CA=A)
+b.gen()                          # rev1, CA=A
+b.gen(host="dot.v2.example")   # rev2, CA=B; previous=rev1(CA=A)
 prev_bytes = open(b.prev(), "rb").read()
 _drop_previous(b)
 # 现在服务器手里只有 CA=B。rev1 用的 A 只剩指纹, 证书正文早就不在了。
@@ -298,7 +307,7 @@ elif sendable is None:
 else:
     bad("previous 缺失却放行了")
 # 关键: 绝不能拿当前的 CA(B)去"重建"出一个假的 rev1
-b.gen(host="dot.v2.example", ca=CA_B)
+b.gen(host="dot.v2.example")
 if not os.path.exists(b.prev()):
     ok("再生成一次也不会凭空造出 previous(拿当前 CA 猜出来的不是那一版)")
 elif open(b.prev(), "rb").read() == prev_bytes:
@@ -309,8 +318,8 @@ else:
 print()
 print("══ 五、备份/快照必须带上产物 ══")
 b = Box()
-b.gen(ca=CA_A)                              # rev1 CA=A
-b.gen(host="dot.v2.example", ca=CA_B)       # rev2 CA=B, previous=rev1
+b.gen()                              # rev1 CA=A
+b.gen(host="dot.v2.example")       # rev2 CA=B, previous=rev1
 snap_cur = open(b.cur(), "rb").read()
 snap_prev = open(b.prev(), "rb").read()
 snap_meta = open(b.meta, "rb").read()
@@ -364,12 +373,12 @@ for t in ("ios_profile_state", "ios_profile_current", "ios_profile_previous"):
 print()
 print("══ 六、CA A→B→C 之后的恢复 ══")
 b = Box()
-b.gen(ca=CA_A)                              # rev1 CA=A
-b.gen(host="dot.v2.example", ca=CA_B)       # rev2 CA=B, previous=rev1
+b.gen()                              # rev1 CA=A
+b.gen(host="dot.v2.example")       # rev2 CA=B, previous=rev1
 keep = {"meta": open(b.meta, "rb").read(),
         "cur": open(b.cur(), "rb").read(),
         "prev": open(b.prev(), "rb").read()}
-b.gen(host="dot.v3.example", ca=CA_C)       # rev3 CA=C, previous=rev2
+b.gen(host="dot.v3.example")       # rev3 CA=C, previous=rev2
 # 用"只恢复 metadata"模拟修复前的备份行为, 看它会不会被检出
 with open(b.meta, "wb") as f:
     f.write(keep["meta"])
@@ -382,7 +391,7 @@ elif st_c is None:
 else:
     bad("只恢复 metadata 却判成健康: current=%s previous=%s" % (st_c, st_p))
 
-# 完整恢复(三件一起回去)之后必须逐字节相等, 且 CA 指纹对得上
+# 完整恢复(三件一起回去)之后必须逐字节相等, 两版各自与自己的记录对得上
 with open(b.cur(), "wb") as f:
     f.write(keep["cur"])
 with open(b.prev(), "wb") as f:
@@ -394,21 +403,24 @@ if st_c == "healthy" and st_p == "healthy":
     ok("三件一起恢复 → 两份产物都健康")
 else:
     bad("完整恢复后仍不健康: current=%s previous=%s" % (st_c, st_p))
+# 原判据比的是两版各自嵌着哪张根证书的 DER 原文。WLOC 退役后描述文件不再携带根证书 ——
+# 换成盯住它本来要证明的两件事: 回来的确实是**两个不同的版本**(没有把同一版复制两遍),
+# 而且每一份都与**它自己那条记录**的 sha256 精确相等(没有串位)。
 if hashlib.sha256(keep["cur"]).hexdigest() == m["current"]["sha256"] \
-        and m["current"]["inputs"]["wloc_ca_sha256"] == hashlib.sha256(CA_B).hexdigest() \
-        and m["previous"]["inputs"]["wloc_ca_sha256"] == hashlib.sha256(CA_A).hexdigest():
-    ok("恢复回来的是 rev2(CA=B)+ rev1(CA=A), 指纹逐个对得上")
+        and hashlib.sha256(keep["prev"]).hexdigest() == m["previous"]["sha256"] \
+        and m["current"]["sha256"] != m["previous"]["sha256"]:
+    ok("恢复回来的是 rev2 + rev1, 两份各自与自己的记录逐字节对得上, 且互不相同")
 else:
-    bad("恢复后的版本/指纹不对")
+    bad("恢复后的版本对不上自己的记录, 或两版内容相同(串位)")
 try:
     pc = plistlib.loads(keep["cur"])
     pp = plistlib.loads(keep["prev"])
-    ca_c = [x for x in pc["PayloadContent"] if x.get("PayloadType") == "com.apple.security.root"]
-    ca_p = [x for x in pp["PayloadContent"] if x.get("PayloadType") == "com.apple.security.root"]
-    if ca_c and ca_c[0]["PayloadContent"] == CA_B and ca_p and ca_p[0]["PayloadContent"] == CA_A:
-        ok("产物里嵌的确实分别是 CA B 与 CA A 的 DER 原文")
+    stray = [x for x in list(pc["PayloadContent"]) + list(pp["PayloadContent"])
+             if x.get("PayloadType") == "com.apple.security.root"]
+    if stray:
+        bad("恢复回来的产物里仍有根证书 payload —— WLOC 已退役, 那一格不该再出现")
     else:
-        bad("产物里的 CA 不对")
+        ok("恢复回来的两份产物都不含根证书 payload")
 except Exception as e:  # noqa: BLE001
     bad("解析恢复出来的产物失败: %s" % e)
 

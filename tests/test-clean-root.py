@@ -171,7 +171,6 @@ PROBE = textwrap.dedent('''
     # 走真实链路: cfgrestore 的 deriver → mihomorender → sb2mihomo → 候选字节
     fn = M.deriver_from_paths(lan_table_file="/nonexistent/lan-panels.json",
                               rs_meta_path="/nonexistent/rulesets.json",
-                              mitm_hijack_file="/nonexistent/hijack.txt",
                               platform_file="/nonexistent/platform")
     data = fn({"model": json.dumps(model).encode()})
     print("RENDER:" + hashlib.sha256(data).hexdigest())
@@ -247,8 +246,8 @@ IOS_PROBE = "\n".join([
     "    tmpl = os.path.join(%r, 'pdg-dot.mobileconfig.tmpl')" % IOSROOT,
     "    meta = root + '/etc/privdns-gateway/ios-profile.json'",
     "    art = root + '/var/lib/privdns-gateway/ios-profile'",
-    "    m, lv, why, data, ch = iosstate.generate('dot.example.com', '203.0.113.10', (), b'',",
-    "                                             False, tmpl, meta, art, True, False)",
+    "    m, lv, why, data, ch = iosstate.generate('dot.example.com', '203.0.113.10', (),",
+    "                                             tmpl, meta, art, True, False)",
     "    st, detail = iosstate.artifact_health(m, 'current', art)",
     "    blob = iosstate.verified_artifact(m, 'current', art)",
     "    print('GEN:' + json.dumps({'rev': m['current']['revision'], 'health': st,",

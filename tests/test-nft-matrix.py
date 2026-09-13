@@ -339,20 +339,18 @@ expect("4 iOS 无 GMS", c, ok_=True, kinds=[], dkinds=[], l8=L.PASS, blocked=Fal
 (ok if c.doctor["GMS"] is None or "残留" in (c.doctor["GMS"] or ("", "", ""))[1] else bad)(
     "[4 iOS 无 GMS] doctor 不显示 GMS 推送项(实得 %r)" % (c.doctor["GMS"],))
 
-# 5/6. iOS WLOC 关 / 开
-# 这一格不能靠"喂两份一样的夹具, 看结果一样"来证 —— 那只证明函数是确定性的。真正要证的是
-# **WLOC 开关根本不动 nft**: 去看它那笔事务落哪些 target。落的是 mitm_json / mitm_hijack /
-# mihomo_cfg, nftables_conf 一次都没出现, 所以两种状态下防火墙判定同为 PASS 是有原因的。
+# 5/6. iOS WLOC 关 / 开 —— **该功能已退役**
+# 原判据是"去看 WLOC 那笔事务落哪些 target, nftables_conf 一次都没出现", 用来解释两种状态下
+# 防火墙判定同为 PASS 是有原因的, 而不是函数确定性的假象。WLOC 位置改写连同它专属的 MITM
+# 执行能力已退役: 那笔事务不存在了。判据换成更强的形态 —— 整个 bot 里不该再有任何能写
+# nftables_conf 的 WLOC/MITM 路径, 因为那些函数一个都不在。
 _bsrc = _io.open(str(ROOT / "deploy/bot/pdg-bot.py"), encoding="utf-8").read()
 import re as _re  # noqa: E402
-_wl = _re.search(r"\ndef _mitm_transact\(new_wloc\):.*?\n(?=def )", _bsrc, _re.S)
-(ok if _wl else bad)("[5/6 WLOC] 抽到了 WLOC 落地的那笔事务(_mitm_transact)")
-_wtargets = set(_re.findall(r"t\.(?:stage|derive|watch)\(\s*\"([a-z_]+)\"", _wl.group(0) if _wl else ""))
-(ok if _wtargets else bad)("[5/6 WLOC] 抽到了它的事务 target(实得 %s)" % sorted(_wtargets))
-(ok if "nftables_conf" not in _wtargets else bad)(
-    "[5/6 WLOC] 开关 WLOC 不写 nftables_conf(实得 target: %s)" % sorted(_wtargets))
+_wl_fns = _re.findall(r"^def (_?(?:mitm|wloc)[a-z_]*|_mitm_transact|set_wloc)\(", _bsrc, _re.M)
+(ok if not _wl_fns else bad)(
+    "[5/6 WLOC] bot 里没有任何 WLOC/MITM 事务函数(已退役; 实得 %s)" % (_wl_fns or "0 个"))
 c_off = Cell(kernel("ios", gms=False), platform="ios")
-expect("5/6 iOS WLOC 两态", c_off, ok_=True, kinds=[], dkinds=[], l8=L.PASS, blocked=False,
+expect("5/6 iOS(WLOC 已退役)", c_off, ok_=True, kinds=[], dkinds=[], l8=L.PASS, blocked=False,
        doctor={"防火墙": "ok", "代理入口": "ok"})
 
 # 7. rescue 关闭且无救援放行 —— 不许误报

@@ -35,6 +35,7 @@ ENOENT, 都必须建立本轮独占的表, 并靠二次探针确认它真的生�
 """
 import hashlib
 import os
+import collections
 import re
 import shutil
 import subprocess
@@ -399,20 +400,29 @@ try:
             ok("⑨ 失败取证五项齐全, 且没有重试: 一条具名失败, 0 个用例命中")
         # 取证必须只读 —— 判据用**行为计数**, 不用词面: 重启过 mock 就会多一行
         # "mock-socks :", 补建过表就会多一次夹具的决策行。词面匹配只会误伤取证自己的措辞。
-        n_mock = len(re.findall(r"mock-socks :\d+", out))
+        # 原来比的是"总数恰 3"。夹具后来多了一个**就绪专用出口**(它有自己的端口与日志,
+        # 不参与业务分流断言), 总数就从 3 变成 4 —— 那不是"重启过出口"。这里改成按端口计数:
+        # **每个出口端口恰好一条启动行**。这比原判据更强 —— 总数相等但某个出口重启、另一个
+        # 没起来的情形, 原判据会放过, 这一版不会。
+        per_port = collections.Counter(re.findall(r"mock-socks :(\d+)", out))
+        dup = {k: v for k, v in per_port.items() if v != 1}
         n_note = len(NOTE_RE.findall(out))
-        if n_mock != 3:
-            bad("⑨ mock 启动行有 %d 条(预期 3)—— 失败路径上重启过出口" % n_mock)
+        if not per_port:
+            bad("⑨ 一条 mock 启动行都没有 —— 出口压根没起来")
+        elif dup:
+            bad("⑨ 这些出口端口的启动行不是恰好 1 条: %s —— 失败路径上重启过出口" % dup)
         elif n_note != 1:
             bad("⑨ conntrack 决策行有 %d 条(预期 1)—— 失败路径上补建过前提" % n_note)
         else:
-            ok("⑨ 失败取证只读: mock 启动行恰 3 条、conntrack 决策行恰 1 条, 都没被重来一次")
+            ok("⑨ 失败取证只读: %d 个出口各恰 1 条启动行、conntrack 决策行恰 1 条, 都没被重来一次"
+               % len(per_port))
 
         # "不重试"没有行为判据可用: 前提塌了以后重试一样失败, 从外面看不出区别。
         # 所以这一条是**结构判据** —— check_case 每格只发一次 ClientHello。负控里把重试
         # 加回去, 这一条必须转红(见 functional-conntrack-fixture.py 的对应格)。
         m = re.search(r"^check_case\(\)\{(.*?)^\}", pristine, re.S | re.M)
-        n_send = len(re.findall(r"sni_client\.py", m.group(1))) if m else -1
+        # 数**调用**而不是数文件名字面量: 注释里提一句 sni_client 不该被当成一次发送。
+        n_send = len(re.findall(r"python3\s+\"\$HERE/sni_client\.py\"", m.group(1))) if m else -1
         if n_send == 1:
             ok("⑨ check_case 每格只发一次 ClientHello(结构判据: 失败不许被重试洗掉)")
         else:

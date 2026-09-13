@@ -82,8 +82,10 @@ class Box:
         self.meta = os.path.join(self.root, REL_META)
         self.art = os.path.join(self.root, SUB)
 
-    def gen(self, host="dot.example.com", ca=b""):
-        return self.s.generate(host, "203.0.113.10", (), ca, bool(ca), TMPL,
+    def gen(self, host="dot.example.com"):
+        # WLOC 退役: 生成路径不再接受根证书, 夹具去掉 ca 这一维。这一支验的东西
+        # 与产物里有没有根证书无关, 判据本身一条没动。
+        return self.s.generate(host, "203.0.113.10", (), TMPL,
                                self.meta, self.art, True, False)
 
     def p(self, rel):
@@ -125,8 +127,8 @@ def fresh():
     才变红, 测不到关系判据本身。
     """
     b = Box()
-    b.gen(ca=CA_A)
-    b.gen(host="dot.v2.example", ca=CA_A)
+    b.gen()
+    b.gen(host="dot.v2.example")
     return b
 
 
@@ -290,7 +292,7 @@ def _only_current(m):
 
 
 b1 = Box()
-b1.gen(ca=CA_A)                                  # 只有 current 的正常机器
+b1.gen()                                  # 只有 current 的正常机器
 raw1 = b1.rd(REL_META)
 meta1 = json.loads(raw1.decode("utf-8"))
 try:
@@ -313,7 +315,7 @@ print("══ 五、校验的字节必须就是返回的字节 ══")
 swap = fresh()
 GOOD = swap.rd(REL_CUR)
 other = Box()
-other.gen(host="dot.evil.example", ca=CA_A)
+other.gen(host="dot.evil.example")
 EVIL = other.rd(REL_CUR)
 if EVIL and EVIL != GOOD:
     ok("前提: 准备了一份与被校验字节不同的替换内容(%d vs %d 字节)" % (len(GOOD), len(EVIL)))

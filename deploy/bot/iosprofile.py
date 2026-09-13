@@ -225,48 +225,12 @@ def ca_der_from_pem(pem):
     return der
 
 
-def wloc_enabled(config_path=None):
-    """MITM 插件配置里有没有启用项。读不到文件按"没启用"处理(那台机器根本没开过 WLOC);
-    但文件在却解不开 —— 那是**坏了**, 不能当成没启用, 否则会悄悄发出一份不含 CA 的描述文件。"""
-    path = config_path or MITM_CONFIG
-    try:
-        with open(path, encoding="utf-8") as f:
-            raw = f.read()
-    except FileNotFoundError:
-        return False
-    except OSError as e:
-        raise ProfileError("读不到 MITM 配置 %s: %s —— 无法判断是否需要下发根证书, 拒绝生成。"
-                           % (path, e.strerror))
-    try:
-        cfg = json.loads(raw) if raw.strip() else {}
-    except ValueError:
-        raise ProfileError("MITM 配置 %s 解析失败, 无法判断是否需要下发根证书, 拒绝生成。" % path)
-    if not isinstance(cfg, dict):
-        return False
-    return any(isinstance(v, dict) and v.get("enabled") for v in cfg.values())
-
-
-def ca_der_for(enabled, ca_crt=None):
-    """按"是否启用 WLOC"决定要不要根证书, 并在需要时把它读出来。
-
-    未启用 ⇒ 不带 CA(多带一张根证书是扩大信任面, 不是"顺手")。
-    启用但 CA 缺失/损坏 ⇒ **拒绝生成**, 而不是发一份没有 CA 的。后者装到手机上的表现是
-    被接管的站点全部证书报错, 用户完全无从知道是这里出的问题。
-    """
-    if not enabled:
-        return b""
-    path = ca_crt or CA_CRT
-    try:
-        with open(path, encoding="utf-8", errors="replace") as f:
-            pem = f.read()
-    except OSError as e:
-        raise ProfileError("WLOC 已启用, 但读不到根 CA 证书 %s(%s) —— 拒绝生成描述文件: "
-                           "不含 CA 的描述文件装上去会让被接管的站点全部证书报错。"
-                           % (path, e.strerror))
-    der = ca_der_from_pem(pem)
-    if not der:
-        raise ProfileError("WLOC 已启用, 但根 CA 证书 %s 为空, 拒绝生成描述文件。" % path)
-    return der
+# wloc_enabled() / ca_der_for() 曾经在这里: 前者读 mitm.json 判断要不要下发根证书, 后者
+# 把那张证书读出来。两个都随 WLOC 退役一并删除 —— 留着就留了一条"配置说要, 就把根证书塞进
+# 描述文件"的路, 而那正是退役要断掉的东西。
+#
+# **解析根证书的能力保留**(ca_der_from_pem / assert_public_cert_der): 退役迁移与旧备份校验
+# 都要能看懂老产物里那一格, 只是不再有任何路径会**生成**它。看得懂与发得出, 是两件事。
 
 
 def _check_uuid(u, what):
@@ -294,15 +258,17 @@ def _read_template(path):
         raise ProfileError("读不到描述文件模板 %s: %s" % (path, e.strerror))
 
 
-def render(dot_host, server_addresses, ssids=(), ca_der=b"", ids=None, template=None):
-    """生成 .mobileconfig 字节。
+def render(dot_host, server_addresses, ssids=(), ids=None, template=None):
+    """生成 .mobileconfig 字节。**永远不含根证书 payload。**
 
     输出**始终**走 plistlib.dumps 这一条路。以前"没有 SSID 也没有 CA"时直接返回替换过占位符
     的模板原文, 于是同一台网关会吐出两种不同格式(还夹着模板里那段解释部署细节的 XML 注释)。
     受管生命周期要拿"字节是否相同"当证据, 就不能容忍"取决于走哪条分支"的格式。
+
+    这里曾经有一个 `ca_der` 形参: 非空就往 PayloadContent 里追加一格
+    `com.apple.security.root`。WLOC 退役后它被**删掉**而不是恒传空值 —— 形参还在, 就还有
+    一条"传进来就生效"的路; 而这一格的后果是"这台设备信任谁"。
     """
-    if ca_der:
-        reject_key_material(ca_der, "传入的根证书")
     ids = dict(ids or random_ids())
     u_root = _check_uuid(ids.get("root"), "顶层 PayloadUUID")
     u_dns = _check_uuid(ids.get("dns"), "DNS payload UUID")
@@ -332,18 +298,8 @@ def render(dot_host, server_addresses, ssids=(), ca_der=b"", ids=None, template=
         # 插在最前面: OnDemand 是"第一条命中的说了算", 排在探测规则之后就永远轮不到。
         dns["OnDemandRules"].insert(
             0, {"InterfaceTypeMatch": "WiFi", "SSIDMatch": list(ssids), "Action": "Disconnect"})
-    if ca_der:
-        p["PayloadContent"].append({
-            "PayloadType": "com.apple.security.root",
-            "PayloadVersion": 1,
-            "PayloadIdentifier": ID_CA,
-            "PayloadUUID": _check_uuid(ids.get("ca"), "CA payload UUID"),
-            "PayloadDisplayName": CA_DISPLAY,
-            "PayloadContent": ca_der,
-            "PayloadCertificateFileName": CA_FILENAME,
-        })
     out = plistlib.dumps(p)
-    validate(out, expect_ca=bool(ca_der))
+    validate(out, expect_ca=False)
     return out
 
 
@@ -429,9 +385,11 @@ def main(argv=None):
     r.add_argument("--server-ip", required=True, action="append",
                    help="网关地址, 可重复")
     r.add_argument("--ssid", action="append", default=[], help="强制直连的 Wi-Fi 名, 可重复")
-    r.add_argument("--ca-pem", help="直接指定根 CA 证书 PEM(无条件附带)")
-    r.add_argument("--wloc-config", help="MITM 配置路径; 据它判断要不要附根证书")
-    r.add_argument("--ca-crt", help="配合 --wloc-config: 根 CA 证书路径")
+    # 三个"附带根证书"的开关已随 WLOC 退役。保留下来是为了**显式拒绝**: 老脚本里还带着
+    # --wloc-config, 静默忽略会让它悄悄改变行为而没人发现。
+    r.add_argument("--ca-pem", help="(已退役)")
+    r.add_argument("--wloc-config", help="(已退役)")
+    r.add_argument("--ca-crt", help="(已退役)")
     r.add_argument("--uuid-root")
     r.add_argument("--uuid-dns")
     r.add_argument("--uuid-ca")
@@ -440,17 +398,20 @@ def main(argv=None):
     if a.cmd != "render":
         ap.print_help(sys.stderr)
         return 2
+    retired = [f for f, v in (("--ca-pem", a.ca_pem), ("--wloc-config", a.wloc_config),
+                              ("--ca-crt", a.ca_crt)) if v]
+    if retired:
+        sys.stderr.write(
+            "%s 已随 WLOC 位置改写退役: 描述文件不再附带任何根证书。\n"
+            "去掉这些参数重跑即可; 手机上那张旧根证书需要你自己到"
+            "「设置 → 通用 → 关于本机 → 证书信任设置」里取消信任。\n"
+            % "、".join(retired))
+        return 3
     try:
-        if a.ca_pem:
-            der = ca_der_for(True, a.ca_pem)
-        elif a.wloc_config:
-            der = ca_der_for(wloc_enabled(a.wloc_config), a.ca_crt)
-        else:
-            der = b""
         ids = None
         if a.uuid_root or a.uuid_dns or a.uuid_ca:
             ids = {"root": a.uuid_root, "dns": a.uuid_dns, "ca": a.uuid_ca or a.uuid_root}
-        out = render(a.dot_host, a.server_ip, a.ssid, der, ids, a.template)
+        out = render(a.dot_host, a.server_ip, a.ssid, ids, a.template)
     except ProfileError as e:
         sys.stderr.write("%s\n" % e)
         return 3

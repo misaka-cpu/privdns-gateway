@@ -236,24 +236,37 @@ try:
 except IP.ProfileError as e:
     ok("路径1 ca_der_from_pem: 被拒(%s)" % str(e)[:60])
 
-# 路径 2: render(最终字节的守门人 validate 就在它里面)
-ids = S.derive_ids("11111111-2222-3333-4444-555555555555")
-try:
-    IP.render("dot.example.com", "203.0.113.10", (), GLUED, ids, TMPL)
-    bad("路径2 render: 生成出了一份 CA 那一格夹着私钥的描述文件")
-except IP.ProfileError as e:
-    ok("路径2 render: 被拒(%s)" % str(e)[:60])
+# 路径 2 曾经是 render: 把"证书+私钥"的拼接体当 CA 传进去, 看最终字节的守门人拦不拦。
+# WLOC 退役后 render 已经**没有**传根证书这条入口了 —— 那比"传进去被拦下"更强: 拒绝依赖
+# 一道门, 没有入口则不依赖任何门。判据跟着换成盯住入口本身不在。
+import inspect as _inspect
+if "ca_der" not in _inspect.signature(IP.render).parameters:
+    ok("路径2: 渲染器根本没有传根证书这条入口(WLOC 已退役)")
+else:
+    bad("路径2: iosprofile.render 仍接受 ca_der —— 传进来就生效的路还在")
 
-# 路径 3/4: 先造一份健康的产物, 再把 CA 那一格换成拼接体并把记录全部配平,
-#           然后看 artifact_health / verified_artifact / 联合校验各自怎么说。
-good = S.generate("dot.example.com", "203.0.113.10", (), CERT_DER, True, TMPL,
-                  META, ART, True, False)[0]
+# 路径 3/4: 老产物那一侧的门必须原样还在 —— 老备份仍是可恢复的输入。
+# 当前代码渲染不出带根证书的描述文件(那正是退役做对了的证明), 所以这里照着 schema 1 的
+# 形态**手工拼**一份: 老机器盘上躺着的本来就是这样一份东西。
+good = S.generate("dot.example.com", "203.0.113.10", (), TMPL, META, ART, True, False)[0]
+_ids = S.derive_ids(good["instance_id"])
 doc = plistlib.loads(open(os.path.join(ART, "current.mobileconfig"), "rb").read())
-for x in doc["PayloadContent"]:
-    if x.get("PayloadType") == "com.apple.security.root":
-        x["PayloadContent"] = GLUED
+doc["PayloadContent"].append({
+    "PayloadType": "com.apple.security.root",
+    "PayloadVersion": 1,
+    "PayloadIdentifier": IP.ID_CA,
+    "PayloadUUID": _ids["ca"],
+    "PayloadDisplayName": IP.CA_DISPLAY,
+    "PayloadContent": GLUED,
+    "PayloadCertificateFileName": IP.CA_FILENAME,
+})
 forged = plistlib.dumps(doc)
 meta = json.load(open(META, encoding="utf-8"))
+meta["schema"] = 1
+meta.pop("retired_revision", None)
+meta["previous"] = None
+meta["current"]["inputs"]["schema"] = 1
+meta["current"]["inputs"]["wloc_enabled"] = True
 meta["current"]["inputs"]["wloc_ca_sha256"] = hashlib.sha256(GLUED).hexdigest()
 meta["current"]["sha256"] = hashlib.sha256(forged).hexdigest()
 meta["current"]["digest"] = S.digest_of(meta["current"]["inputs"])

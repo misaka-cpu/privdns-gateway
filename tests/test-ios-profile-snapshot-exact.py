@@ -78,8 +78,10 @@ class Box:
         with open(self.root + "/etc/mosdns/config.yaml", "w") as f:
             f.write("log:\n  level: info\n")
 
-    def gen(self, host="dot.example.com", ca=b""):
-        return self.s.generate(host, "203.0.113.10", (), ca, bool(ca), TMPL,
+    def gen(self, host="dot.example.com"):
+        # WLOC 退役: 生成路径不再接受根证书。这一支验的是"回滚之后产物目录精确等于快照那
+        # 一刻", 与产物里有没有根证书无关 —— 去掉这一维, 判据本身一条没动。
+        return self.s.generate(host, "203.0.113.10", (), TMPL,
                                self.meta, self.art, True, False)
 
     def p(self, rel):
@@ -171,14 +173,14 @@ def listing(box, rel=SUB):
 
 print("══ 一、rev1 快照 → rev2 → 回滚 rev1: 目录必须精确回到 rev1 ══")
 b = Box()
-b.gen(ca=CA_A)                                   # rev1: 只有 current
+b.gen()                                   # rev1: 只有 current
 snap1 = snapshot(b)
 want_meta, want_cur = b.rd("etc/privdns-gateway/ios-profile.json"), b.rd(SUB + "/current.mobileconfig")
 if not os.path.exists(b.p(SUB + "/previous.mobileconfig")):
     ok("rev1 那一刻盘上只有 current(快照里也就没有 previous)")
 else:
     bad("rev1 就已经有 previous 了, 这条用例的前提不成立")
-b.gen(host="dot.v2.example", ca=CA_B)            # rev2: previous 出现
+b.gen(host="dot.v2.example")            # rev2: previous 出现
 if os.path.exists(b.p(SUB + "/previous.mobileconfig")):
     ok("rev2 之后盘上出现了 previous")
 else:
@@ -295,9 +297,9 @@ else:
 print()
 print("══ 三、对账只碰这一棵子树 ══")
 b2 = Box()
-b2.gen(ca=CA_A)
+b2.gen()
 snap2 = snapshot(b2)
-b2.gen(host="dot.v2.example", ca=CA_B)
+b2.gen(host="dot.v2.example")
 # 快照之外的东西: 事务记录、救援运行态、备份包、以及 /etc 下用户后加的文件
 others = {"var/lib/privdns-gateway/tx/0001/state.json": b"{}",
           "var/lib/privdns-gateway/rescue/state": b"on",
@@ -328,7 +330,7 @@ else:
 print()
 print("══ 四、快照里根本没有这棵子树时不许乱删 ══")
 b3 = Box()
-b3.gen(ca=CA_A)
+b3.gen()
 # 真正的 5.4 之前快照: 那时 ios-profile.json 这个文件还不存在, 产物目录也不存在。
 old = tmpguard.mkdtemp(prefix="iossnap-old-")
 TMPS.append(old)
@@ -349,7 +351,7 @@ else:
 # 反过来: 快照里有记录、没有产物 —— 那是"当时就没有产物", 整组替换就该把产物清掉,
 # 而不是留下一份没有记录能解释的文件。这是有意选的语义, 钉在这里。
 b3b = Box()
-b3b.gen(ca=CA_A)
+b3b.gen()
 half = tmpguard.mkdtemp(prefix="iossnap-half-")
 TMPS.append(half)
 os.makedirs(half + "/etc/privdns-gateway", exist_ok=True)
@@ -397,9 +399,9 @@ def diff_state(before, after):
 def fault_case(title, fault, expect_rollback=True, expect_words=()):
     """造 rev1 快照 → 走到 rev2 + 一个孤儿 → 注入故障回滚 → 整组必须回到操作前。"""
     box = Box()
-    box.gen(ca=CA_A)
+    box.gen()
     snap = snapshot(box)
-    box.gen(host="dot.v2.example", ca=CA_B)
+    box.gen(host="dot.v2.example")
     with open(box.p(SUB + "/stray.mobileconfig"), "wb") as f:
         f.write(b"stray\n")
     os.chmod(box.p(SUB + "/stray.mobileconfig"), 0o640)
@@ -510,9 +512,9 @@ stat(){
 print()
 print("══ 六、拍不下完整底片就不许落盘 ══")
 b6 = Box()
-b6.gen(ca=CA_A)
+b6.gen()
 snap6 = snapshot(b6)
-b6.gen(host="dot.v2.example", ca=CA_B)
+b6.gen(host="dot.v2.example")
 before6 = group_state(b6)
 r = rollback(b6, snap6, r'''
 _pdg_mktemp_dir(){ return 1; }
@@ -527,9 +529,9 @@ else:
     bad("没有底片却已经动了现网: %r" % diff_state(before6, group_state(b6)))
 
 b7 = Box()
-b7.gen(ca=CA_A)
+b7.gen()
 snap7 = snapshot(b7)
-b7.gen(host="dot.v2.example", ca=CA_B)
+b7.gen(host="dot.v2.example")
 before7 = group_state(b7)
 r = rollback(b7, snap7, r'''
 cp(){ case "$*" in *ios-profile*) return 1;; esac; command cp "$@"; }
@@ -543,9 +545,9 @@ else:
 print()
 print("══ 七、底片不许留下描述文件副本 ══")
 b8 = Box()
-b8.gen(ca=CA_A)
+b8.gen()
 snap8 = snapshot(b8)
-b8.gen(host="dot.v2.example", ca=CA_B)
+b8.gen(host="dot.v2.example")
 # 观察生产的 `mktemp -d` 落在哪 —— 它认 TMPDIR, 所以看的也得是 TMPDIR。写死 /tmp 的话:
 # 在私有 TMPDIR 下跑就永远看不到底片(判据静默失效), 直接跑又会把并发进程新建的目录算进来。
 TMPROOT = os.environ.get("TMPDIR") or "/tmp"

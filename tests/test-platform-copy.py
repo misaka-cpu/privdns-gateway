@@ -66,15 +66,13 @@ def main():
     assert "ios" in cbs(kb) and "请生成并安装 iOS 描述文件" in t
     ok("iOS 客户端菜单: 含 iOS 描述文件入口")
 
-    # 2 / 7 运维菜单 WLOC
-    bot._platform = lambda: "android"
-    _, opskb = bot._nav("ops")
-    assert not any("位置改写" in x for x in texts(opskb))
-    ok("Android 运维菜单: 无 WLOC")
-    bot._platform = lambda: "ios"
-    _, opskb = bot._nav("ops")
-    assert any("位置改写" in x for x in texts(opskb))
-    ok("iOS 运维菜单: 含 WLOC")
+    # 2 / 7 运维菜单: WLOC 已退役 —— 两个平台都不该再有那个入口
+    # (原判据是"Android 无、iOS 有", 那是平台门控的形态; 退役比门控更彻底。)
+    for plat in ("android", "ios"):
+        bot._platform = lambda p=plat: p
+        _, opskb = bot._nav("ops")
+        assert not any("位置改写" in x for x in texts(opskb)), plat
+    ok("两个平台的运维菜单都没有 WLOC 入口(已退役)")
 
     # 3 / 5 状态 DoT 文案
     bot._platform = lambda: "android"

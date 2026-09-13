@@ -48,15 +48,22 @@ def h(path):
 print("── 1. 用户数据清单 ──")
 items = [l for l in sh("pdg_user_data").stdout.splitlines() if l.strip()]
 must = ["etc/privdns-gateway/bot.env", "etc/sing-box/config.json",
-        "etc/mosdns/rules/custom_hijack.txt", "etc/mosdns/rules/mitm_hijack.txt",
+        "etc/mosdns/rules/custom_hijack.txt",
         "etc/mosdns/rules/unlock.txt", "etc/mosdns/rules/custom_direct.txt",
         "etc/privdns-gateway/profile.env", "etc/privdns-gateway/platform",
         "etc/privdns-gateway/backend", "opt/pdg-bot/rulesets.json", "opt/pdg-bot/dot-domain"]
 miss = [m for m in must if m not in items]
 if not miss:
-    ok("清单覆盖 bot 凭据 / 数据模型 / 四个规则集 / 平台与后端标记 / 规则集元数据(%d 项)" % len(items))
+    ok("清单覆盖 bot 凭据 / 数据模型 / 三个规则集 / 平台与后端标记 / 规则集元数据(%d 项)" % len(items))
 else:
     bad("清单漏了: %s" % ", ".join(miss))
+# mitm_hijack.txt 曾在这份清单里。WLOC 退役后它必须**退出**保留清单: 那份表里躺着的是
+# gs-loc 接管域名, 重装时带过去就等于把已退役的 DNS 劫持原样搬到新装的机器上 —— 而新机器
+# 上既没有 pdg-mitm 也没有 MITM 路由, 那些域名会被劫持到一个谁也不在监听的地址。
+if "etc/mosdns/rules/mitm_hijack.txt" not in items:
+    ok("已退役的接管表不在保留清单里(重装不把 gs-loc 劫持带过去)")
+else:
+    bad("mitm_hijack.txt 仍在保留清单里 —— 重装会把已退役的劫持带到新机器上")
 
 # ── 2. 保留判据 ────────────────────────────────────────────────────────────
 print()
@@ -190,35 +197,41 @@ if "PDG_PLATFORM" in inst and "/etc/privdns-gateway/platform" in inst:
 else:
     bad("平台标记来源不清")
 
-# ── 5. 重装后派生配置要与 WLOC 状态一致 ────────────────────────────────────
+# ── 5. 重装不得把已退役的 MITM 路由带回来 ──────────────────────────────────
 print()
 print("── 5. 重装后的 mihomo 派生配置 ──")
-# 接管域名的真源是 mitm_hijack.txt(重装保留), 但 MITM-OUT 出站与 gs-loc 路由是**渲染时**
-# 加进 mihomo 配置的。渲染不传域名, 重装完 doctor 立刻报 "mihomo 缺 MITM-OUT" —— 域名还在,
-# WLOC 却已经不工作了(.200 实机重装后就是这样)。
+# 这一节原本验的是反面: 装机渲染必须**读** mitm_hijack.txt 并把接管域名传进去, 否则重装后
+# WLOC 静默失效(.200 实机上真出过)。WLOC 位置改写连同它专属的 MITM 执行能力已退役, 那条
+# 要求整个反过来 —— 装机渲染不该再读那份表, 更不该产出 MITM-OUT。
+#
+# 这是退役里最容易漏的一格: 装机脚本是**另一条**渲染路径(直接调 sb2mihomo, 不经事务),
+# 漏改它的后果不是报错, 而是每一台新装的机器都自带一条指向 7894 的路由, 而那个端口上
+# 什么都没有。
 sys.path.insert(0, os.path.join(ROOT, "deploy", "bot"))
 import sb2mihomo  # noqa: E402
 
 MODEL = {"log": {}, "inbounds": [], "outbounds": [{"type": "direct", "tag": "direct"}],
          "route": {"rules": [], "final": "direct"}}
-cfg_off, _ = sb2mihomo.singbox_to_mihomo(MODEL, redir_port=7893, mitm_domains=None)
-cfg_on, _ = sb2mihomo.singbox_to_mihomo(MODEL, redir_port=7893,
-                                        mitm_domains=["gs-loc.apple.com"])
-if not any(p.get("name") == "MITM-OUT" for p in cfg_off.get("proxies", [])):
-    ok("没有接管域名(WLOC 休眠)→ 派生配置里不该有 MITM-OUT")
+cfg_new, _ = sb2mihomo.singbox_to_mihomo(MODEL, redir_port=7893)
+if not any(p.get("name") == "MITM-OUT" for p in cfg_new.get("proxies", [])) and \
+        not any("MITM-OUT" in r for r in cfg_new.get("rules", [])):
+    ok("渲染器不再产出 MITM-OUT 出站与路由")
 else:
-    bad("休眠状态也渲染了 MITM-OUT")
-if any(p.get("name") == "MITM-OUT" for p in cfg_on.get("proxies", [])) and \
-        any("MITM-OUT" in r and "gs-loc" in r for r in cfg_on.get("rules", [])):
-    ok("有接管域名 → 派生配置带 MITM-OUT 出站与 gs-loc 路由")
-else:
-    bad("传了域名却没渲染出 MITM-OUT/路由")
-seg3 = between(inst, "# WLOC/MITM 的接管域名要一起带上", "render \"$REPO_DIR/deploy/bot/pdg-bot.service\"",
+    bad("渲染器仍在产出 MITM-OUT")
+try:
+    sb2mihomo.singbox_to_mihomo(MODEL, redir_port=7893, mitm_domains=["gs-loc.apple.com"])
+    bad("singbox_to_mihomo 仍接受 mitm_domains —— 注入入口还在")
+except TypeError:
+    ok("singbox_to_mihomo 不再接受 mitm_domains(注入入口已删)")
+seg3 = between(inst, "install -d -m700 /etc/mihomo", "render \"$REPO_DIR/deploy/bot/pdg-bot.service\"",
                "重装时的 mihomo 渲染")
-if seg3 and "mitm_hijack.txt" in seg3 and "mitm_domains=" in seg3:
-    ok("装机/重装的渲染读 mitm_hijack.txt 并把域名传进去(重装不再让 WLOC 静默失效)")
+# 判**代码**, 不判注释: 那一段里留着一句说明"这里曾经读接管表、现在为什么不读了"。
+# 连注释一起判的话, 唯一的过法就是把解释删掉 —— 而那句解释正是下一个人最需要看到的。
+code3 = "\n".join(l for l in (seg3 or "").splitlines() if not l.lstrip().startswith("#"))
+if seg3 and "mitm_hijack.txt" not in code3 and "mitm_domains=" not in code3:
+    ok("装机/重装的渲染不再读接管表、也不传接管域名")
 elif seg3:
-    bad("渲染仍未带上接管域名")
+    bad("装机渲染仍然碰接管表或传接管域名 —— 新装的机器会自带一条已退役的路由")
 
 # ── 6. 重装不得把救援放行渲染没了 ──────────────────────────────────────────
 print()

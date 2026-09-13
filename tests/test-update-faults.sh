@@ -204,7 +204,9 @@ r=$(run "DOCTOR_OUT=warn"); rc="${r%%|*}"; out="${r#*|}"
 
 # ══ iOS 平台组件: 在 iOS 上是必需件, 装失败必须回滚(不能 ||true 后留旧版混装) ══
 # 按**受管目标名**注入(mobileconfig 在目标侧是改名后的 pdg-dot.mobileconfig.tmpl)
-for f in mitm_ca.py mitm_server.py mitm_wloc.py pdg-dot.mobileconfig.tmpl; do
+# mitm_server.py / mitm_wloc.py 随 WLOC 退役不再安装 —— 它们已不在受管目标里, 继续注入
+# 只会得到"故障注入未命中", 那条用例什么都没测到。
+for f in mitm_ca.py pdg-dot.mobileconfig.tmpl; do
   assert_fail_rollback "iOS: $f 安装失败" "PLATFORM=ios FAIL_TARGET=$f"
 done
 # probe81.py 是**公共件**(6.1B): 两平台都装, 所以两平台装失败都必须回滚 ——
@@ -218,8 +220,9 @@ assert_fail_rollback "受管目标 #12 安装失败" "PLATFORM=ios FAIL_NTH=12"
 # 清单**末项**。数字跟着 lib/modules.sh 的 iOS 全集走 —— tests/test-false-green-guard.sh
 # 会核对这里的 FAIL_NTH 是否等于当前全集项数, 对不上就红。改清单必须一起改这里, 否则
 # "末项失败也能回滚"这条就没被测到, 而它恰恰是最容易漏的那一项。
-# 沿革: 6.1C 加 nftlive.py, 6.2B 加 dotwitness.py, 内网面板加 lanroute.py + lanpanel.py。
-assert_fail_rollback "受管目标 #36 安装失败" "PLATFORM=ios FAIL_NTH=36"   # 末项序号 = iOS 清单长度; 加模块时必须跟着改(见 HANDOFF §10.5)
+# 沿革: 6.1C 加 nftlive.py, 6.2B 加 dotwitness.py, 内网面板加 lanroute.py + lanpanel.py,
+#       WLOC 退役减 mitm_server.py + mitm_wloc.py(36 → 34)。
+assert_fail_rollback "受管目标 #34 安装失败" "PLATFORM=ios FAIL_NTH=34"   # 末项序号 = iOS 清单长度; 加模块时必须跟着改(见 HANDOFF §10.5)
 
 # Android: 这几个 iOS 专属文件根本不该被安装 → 即使注入同名失败也不影响更新。
 # probe81.py 不在此列了 —— 它现在 Android 也装, 装失败必须回滚(见上面的公共件循环)。

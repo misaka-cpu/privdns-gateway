@@ -75,15 +75,13 @@ shuffled = shuffled[:2] + [x for x in r if "home.example.com" in x] + shuffled[2
 assert idx(shuffled, "nas.home.example.com") > idx(shuffled, "IP-CIDR,127.0.0.0/8,REJECT"), \
     "空测本身构造错了"
 
-# ── ⑤ MITM 的位置不能被面板规则带偏 ────────────────────────────────────────
-# MITM 必须仍排在 REJECT **之后**: 它的域名没有 hosts 条目, 匹配时 IP 未知, 所以那个
-# 位置是对的; 而且 MITM-OUT 出站自己连本机是不过规则的。两者性质不同, 不能一起挪。
-both, _ = sb2mihomo.singbox_to_mihomo(SB, lan_domains=LAN, mitm_domains=["gsp-ssl.ls.apple.com"])
-b = both["rules"]
-i_mitm = idx(b, "MITM-OUT")
-i_rej2 = idx(b, "IP-CIDR,127.0.0.0/8,REJECT")
-i_panel2 = idx(b, "nas.home.example.com")
-assert i_panel2 < i_rej2 < i_mitm, ("面板 < REJECT < MITM 这个次序被破坏了: %r" % b[:8])
+# ── ⑤ 渲染器不再注入 MITM 路由 ─────────────────────────────────────────────
+# 这里原本盯的是"面板 < REJECT < MITM"这个三段次序 —— MITM 排在 REJECT 之后是对的, 因为
+# 它的域名没有 hosts 条目、匹配时 IP 未知。WLOC 位置改写连同它专属的 MITM 执行能力已退役,
+# 那条出站与路由不再渲染, 参照物没了。
+# 保留这一格但换成**反向**判据: 无论怎么渲染, 结果里都不该再冒出 MITM-OUT。面板规则的
+# 位置正确性由 ③④ 两格(面板 < REJECT + 空测)独立保证, 不依赖这个已经不存在的参照物。
+assert not any("MITM-OUT" in x for x in r), ("渲染结果里出现了已退役的 MITM 路由: %r" % r[:8])
 
 # ── ⑥ lan_addr 可配(将来若改成绑非环回地址, 不必动渲染逻辑) ────────────────
 alt, _ = sb2mihomo.singbox_to_mihomo(SB, lan_domains=LAN, lan_addr="100.64.0.5")
@@ -104,7 +102,9 @@ json.dumps(cfg)
 # "有没有把这个参数传下去"是确定的。
 import ast
 
-ENV_KWARGS = {"mitm_domains", "lan_domains"}
+# mitm_domains 曾经也在这份清单里。WLOC 退役后渲染器不再接受它, 留着会让这条守卫
+# 反过来要求两条渲染路径传一个已经不存在的参数。
+ENV_KWARGS = {"lan_domains"}
 RENDER_CALLS = {"singbox_to_mihomo", "render_bytes"}
 
 for src in ("deploy/bot/pdg-bot.py", "deploy/bot/mihomorender.py"):

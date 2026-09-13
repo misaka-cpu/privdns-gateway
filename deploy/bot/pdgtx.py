@@ -118,7 +118,6 @@ _STATIC = {
     "adblock_sources": ("/etc/privdns-gateway/adblock-sources.txt", 0o644, False,
                         ("adblock_sources",)),
     "nftables_conf":  ("/etc/nftables.conf", 0o644, False, ("nft_check",)),
-    "mitm_json":      ("/etc/privdns-gateway/mitm.json", 0o600, False, ("json_any",)),
     # iOS 描述文件的身份与修订记录。它是**用户持久数据**: 丢了会在下次生成时造出第二个身份,
     # 用户手机上那份描述文件从此再也无法被更新, 而界面上什么都不会报错。所以它必须能跟着
     # 备份/快照一起恢复 —— 恢复走事务, 事务只认白名单里的目标, 于是这一行是必需的。
@@ -132,7 +131,6 @@ _STATIC = {
                              0o644, False, ("mobileconfig",)),
     "ios_profile_previous": ("/var/lib/privdns-gateway/ios-profile/previous.mobileconfig",
                              0o644, False, ("mobileconfig",)),
-    "mitm_hijack":    ("/etc/mosdns/rules/mitm_hijack.txt", 0o644, False, ("mosdns_lines",)),
     "sysctl_tfo":     ("/etc/sysctl.d/99-pdg-tfo.conf", 0o644, False, ("kv_env",)),
     "dot_marker":     ("/opt/pdg-bot/dot-domain", 0o644, False, ("hostname_line",)),
     "cert_fullchain": ("/etc/mosdns/certs/fullchain.pem", 0o644, False, ("pem_cert",)),
@@ -152,16 +150,19 @@ _UNIT_RE = re.compile(r"^[A-Za-z0-9_.@-]+\.(service|timer)$")
 # 目标 → 该目标牵动哪个服务(决定基线范围、观察范围)
 _TARGET_SVC = {
     "model": "mihomo", "mihomo_cfg": "mihomo", "rs_meta": "mihomo",
-    "mosdns_conf": "mosdns", "mitm_hijack": "mosdns",
+    "mosdns_conf": "mosdns",
     "cert_fullchain": "mosdns", "cert_privkey": "mosdns",
-    "mitm_json": "pdg-mitm",
 }
 
-_SERVICE_UNITS = ("mosdns", "mihomo", "pdg-mitm", "pdg-bot", "pdg-probe81")
-# 只有 pdg-mitm 需要"目标态": WLOC 开 = 让它跑起来(操作前通常没在跑), 关 = 让它停下。
-# 不给 mosdns/mihomo 开 start/stop —— 那两个在本项目里永远应该是 active, 给它们加"停"
-# 这种能力只会让某天写错的事务把 DNS 停掉。
-_STATE_UNITS = ("pdg-mitm",)
+_SERVICE_UNITS = ("mosdns", "mihomo", "pdg-bot", "pdg-probe81")
+# "目标态"(start/stop)这一格现在是空的。曾经只有 pdg-mitm 用它: WLOC 开 = 让它跑起来
+# (操作前通常没在跑), 关 = 让它停下。WLOC 位置改写连同它专属的 MITM 执行能力已退役, 那个
+# 服务不再存在, 于是这里也不该再有它 —— 事务能对一个服务发 start/stop, 就是一条把它接回来
+# 的路。空元组保留而不是删掉这层: 判空的分支还在, 将来真有需要目标态的服务时不必重新发明。
+#
+# 依旧**不给** mosdns/mihomo 开 start/stop —— 那两个在本项目里永远应该是 active, 给它们
+# 加"停"这种能力只会让某天写错的事务把 DNS 停掉。
+_STATE_UNITS = ()
 _ACTIONS = tuple(["restart:" + u for u in _SERVICE_UNITS] +
                  ["start:" + u for u in _STATE_UNITS] +
                  ["stop:" + u for u in _STATE_UNITS] +
@@ -176,14 +177,13 @@ _ACTIONS = tuple(["restart:" + u for u in _SERVICE_UNITS] +
 # 判据按真实依赖, 不按名字猜:
 #   · rs_meta 是 bot 的标签/计数元数据, 内核读的是 ruleset:* 里的**内容** → 自己不触发重启;
 #   · profile_env / dot_marker 是持久化意图与续期提示, 不被运行中的服务直接读 → 无动作;
-#   · 证书与 mitm_hijack 由 mosdns 读(DoT 与劫持表) → mosdns;
+#   · 证书由 mosdns 读(DoT) → mosdns;
 #   · nftables_conf 只需要重新应用防火墙, 不该顺手重启 mihomo/mosdns;
 #   · unit:* 改的是 systemd 单元文件 → daemon-reload。
 _TARGET_ACTIONS = {
     "model": ("restart:mihomo",),
     "mihomo_cfg": ("restart:mihomo",),
     "mosdns_conf": ("restart:mosdns",),
-    "mitm_hijack": ("restart:mosdns",),
     "cert_fullchain": ("restart:mosdns",),
     "cert_privkey": ("restart:mosdns",),
     "nftables_conf": ("nft:apply",),
@@ -213,13 +213,14 @@ _TARGET_ACTIONS = {
 _PREFIX_ACTIONS = (("mosdns_rule:", ("restart:mosdns",)),
                    ("ruleset:", ("restart:mihomo",)),
                    ("unit:", ("daemon-reload",)))
-# 动作取决于"要开还是要关"、通用推导给不出答案的目标: 必须由调用方显式声明。
-# mitm_json 就是这一类 —— WLOC 打开时要 start:pdg-mitm, 关闭时要 stop:pdg-mitm, 光看文件
-# 本身推不出来。这里 fail-closed, 不许猜(猜错就是把用户刚关掉的 MITM 又拉起来)。
-EXPLICIT_ONLY = frozenset({"mitm_json"})
+# 动作取决于"要开还是要关"、通用推导给不出答案的目标: 必须由调用方显式声明, 这里 fail-closed。
+# 这份集合现在是空的 —— 唯一的成员曾是 mitm_json(WLOC 打开时要 start:pdg-mitm, 关闭时要
+# stop:pdg-mitm, 光看文件本身推不出来), 它随 WLOC 退役一起没了。**这层不跟着删**: 它是
+# "推不出动作就拒绝, 不许猜"的那道门, 下一个这类目标出现时该被它拦住, 而不是靠谁记得重写。
+EXPLICIT_ONLY = frozenset()
 # 固定执行顺序(可测试): 先把防火墙/内核参数落到位, 再 reload 单元, 最后重启服务(DNS 先于内核)。
 _ACTION_ORDER = ("nft:apply", "sysctl:apply", "daemon-reload",
-                 "restart:mosdns", "restart:mihomo", "restart:pdg-mitm")
+                 "restart:mosdns", "restart:mihomo")
 
 
 def actions_for_targets(names):
@@ -564,14 +565,12 @@ def health_snapshot(services, relax_units=()):
     """本次事务**范围内**的硬门指标。与公网无关 —— 出口探测那类属软门, 不在这里。
 
     relax_units: 本笔事务显式给了 start:/stop: 的 unit。它们的 active 与否由"期望终态"单独判
-    (见 Tx._observe), 不进这份快照 —— 否则"开启 WLOC"这种操作前 pdg-mitm 本来就没在跑的场景,
-    会在基线阶段被判成"操作前硬门就是坏的"而根本开不了事务。**只放宽这一个 unit 的 active 检查**,
+    (见 Tx._observe), 不进这份快照 —— 否则一笔"把某个本来没在跑的服务拉起来"的事务, 会在基线
+    阶段被判成"操作前硬门就是坏的"而根本开不了。**只放宽点名的那些 unit 的 active 检查**,
     DNS / DoT / redir 端口以及其它服务一条都不放宽。"""
     h = {}
     for u in sorted(set(services)):
         if u in relax_units:
-            continue
-        if u == "pdg-mitm" and not _svc_prop(u, "LoadState") == "loaded":
             continue
         h["svc:" + u] = _svc_active(u)
     if "mosdns" in services:
@@ -861,7 +860,7 @@ def _v_mosdns_probe(path, data, ctx):
                     if os.path.isfile(src):
                         os.symlink(src, os.path.join(probe_rules, leaf))
             for name, t in sorted(getattr(ctx, "targets", {}).items() if ctx else []):
-                if not (name.startswith("mosdns_rule:") or name == "mitm_hijack"):
+                if not name.startswith("mosdns_rule:"):
                     continue
                 leaf = os.path.basename(t["path"])
                 dst = os.path.join(probe_rules, leaf)
@@ -941,6 +940,132 @@ LINE_LEVEL_ONLY = ("mosdns_lines", "kv_env", "hostname_line", "adblock_sources")
 
 
 # ── 全局锁(fail-closed)────────────────────────────────────────────────────────
+# ── 继承来的锁 ──────────────────────────────────────────────────────────────
+# `pdg update` **全程持着**这把锁, 中途用刚装好的新脚本跑一次 `pdg __migrate`。跑在那里面的
+# Python 子进程如果照常去 flock 同一个文件, 拿到的是一个**新的** open file description ——
+# 它不持有那把锁, 于是撞上父进程自己, 每次都 TxBusy。v1.7.1 就是这么把整次更新回滚掉的,
+# 而 update 还报成功, 只有 doctor 那条告警露了馅。
+#
+# 三种绕法**都不行**, 它们把并发保护弄没了:
+#   · 无条件跳过取锁     → 第三方 CLI/Bot 此刻照样能写;
+#   · 中途 LOCK_UN       → 释放的是父进程那把(同一个 OFD), 窗口期里谁都能进来;
+#   · 信任调用方"说已锁" → 说了不算。
+#
+# ## 为什么 flock 和 PID 都证明不了
+#
+# 前三版栽在同两件事上: **flock 只能回答"我能不能锁上", 回答不了"这把锁本来是谁的"**;
+# **PID 是进程级的, 而 flock 锁是挂在「打开文件描述(OFD)」上的**。
+#
+#   v1: 直接在候选 fd 上 flock, 成功就算继承。父进程只 open 没 flock 时子进程一锁就成 ——
+#       判成继承, 而按继承的规矩退出时不释放, 于是凭空多出一把没人认领的锁。
+#   v2: 先用另一个 OFD(probe)探一探本来有没有人持锁, 被挡住才去锁候选 fd。看着严密, 但那
+#       两步之间有个真实的窗口: 持锁者恰好在这一瞬放手, 候选 fd 上那次 flock 就**成功**了,
+#       拿到的仍是一把全新的锁。靠重试缩小窗口只是把问题变成概率问题。
+#   v3: 改用 /proc/locks 里记的持有者 PID, 同 PID 就直接放行。可同一个进程里另一次 open()
+#       出来的 fd 是**另一个 OFD**, 它并不持锁, 却和真正持锁的那个 fd 共用一个 PID:
+#         · 于是任意一个 fd 都能冒充"继承来的锁"。实测: A 线程用真实 _Lock 持着锁, B 线程
+#           拿另一次 open 的 fd 就被判成继承、直接进了临界区 —— 两边同时在里面, 而 A 退出
+#           后 B 还在里面, 此刻第三个 fd 已经能把锁拿走。互斥与锁生命周期一起失守。
+#         · 同 PID 不成立时 v3 会去 flock 一把, 再回读一次记录来分辨新旧锁。那次**回读**
+#           失败时它 LOCK_UN —— 解掉的是**父进程**那把(同一个 OFD), 一次读 /proc 失败就把
+#           父进程的临界区拆了, 而父 fd 还开着, 别人已经能进来。
+#
+# ## 所有权证据: /proc/self/fdinfo/<fd>
+#
+# 内核只在**这个 fd 背后的 OFD 自己持锁**时, 才往 fdinfo 里写出 `lock:` 行 —— 它是 OFD 级的,
+# 正好对上 flock 的语义。本机(Linux 6.1.0-52-amd64)实测, 不是照字段名猜的:
+#
+#   持锁的 fd              → lock:\t1: FLOCK  ADVISORY  WRITE <pid> <maj:min:ino> 0 EOF
+#   同进程另一次 open()    → 没有 lock 行          ← 这条把 v3 那个冒充从根上堵死
+#   dup()/fork 继承来的 fd → 有, 与原 fd 一模一样  ← 真正的继承照常认得出
+#   别的进程持锁时我方 fd  → 没有 lock 行
+#   真实 CLI 形态(exec 9>LOCK; flock -n 9, 外部 flock 上完锁就退出)→ fd 9 有 lock 行
+#
+# 类型字段必须一起卡死: LOCK_SH 记成 READ、POSIX lockf 记成 POSIX, 都不是我们要的那把排他
+# flock 写锁; inode 再对一次, 防止 fd 中途被换掉。
+#
+# 判据于是只剩两步, 而且**一次 flock 都不调**:
+#   1. 候选 fd 是打开的, 且指向的就是锁文件本身(dev + ino)。比路径字符串不算数: /proc 里的
+#      路径可以是符号链接、可以被 bind mount 换掉、文件也可能被删了重建;
+#   2. 这个 fd 的 fdinfo 里有那把锁 —— 是**它自己**持着, 不是"本进程某处持着"。
+#
+# 不调 flock 就同时消掉了两类事故: 不会顺手拿到一把新锁留在那儿没人认领, 也不存在任何
+# LOCK_UN 去动一把不属于自己的锁。判定前后锁状态原封不动 —— 这条不变量与实现细节无关。
+#
+# 读不到 fdinfo(非 Linux、/proc 没挂、容器挡了、fd 已关)⇒ **证明不了** ⇒ 按"没有继承"处理,
+# 回到普通取锁路径: 抢得到就自己持着, 抢不到就 TxBusy。既不凭空进临界区, 也不解别人的锁。
+# fail-closed —— 代价是退回修这个坑之前的行为, 不是多造一把锁或者拆掉一把。
+#
+# fd 号沿用 shell 侧的约定(9)。`PDG_LOCK_FD=none` 明确关掉这条识别 —— 测试拿它做"撤销修复"
+# 的对照。
+LOCK_FD_ENV = "PDG_LOCK_FD"
+LOCK_FD_DEFAULT = 9
+PROC_FDINFO = "/proc/self/fdinfo/%d"
+
+
+def _fd_holds_lock(fd, st):
+    """这个 fd 背后的 OFD **自己**是否持着 st 那个 inode 上的 flock 排他写锁。
+
+    True / False / None。None 是"读不到 ⇒ 证明不了", 与 False 不是一回事: False 说明确实
+    没锁, 可以放心走普通取锁; None 只是我们看不见, 两者的共同点仅仅是"都不能当继承用"。
+    """
+    want = "%02x:%02x:%d" % (os.major(st.st_dev), os.minor(st.st_dev), st.st_ino)
+    try:
+        with open(PROC_FDINFO % fd, encoding="utf-8") as f:
+            lines = [ln for ln in f if ln.startswith("lock:")]
+    except OSError:
+        return None
+    for ln in lines:
+        parts = ln.split()[1:]          # 去掉 "lock:"; 其余与 /proc/locks 同构
+        if len(parts) < 6 or parts[1] == "->":
+            continue                    # `->` 那几行是在排队等锁的, 不是持有者
+        if parts[1] != "FLOCK" or parts[3] != "WRITE" or parts[5] != want:
+            continue                    # 共享锁记成 READ, POSIX 锁记成 POSIX, 都不算
+        return True
+    return False
+
+
+def inherited_lock_fd(path=None):
+    """父进程传下来、**这个 fd 自己已经持着**那把锁时返回它; 其余一律 None。
+
+    退出时**绝不 unlock**: 那把锁是父进程的, 释放了就等于在它眼皮底下把门打开。而既然判定
+    全程不调 flock, 也就不存在"自己不小心拿到一把新锁"要还回去的情况。
+
+    ## 判据(细节与取舍见上面那段注释)
+
+      ① 候选 fd 是打开的, 且指向的就是锁文件本身(dev + ino);
+      ② `/proc/self/fdinfo/<fd>` 里有这个 inode 上的 FLOCK 写锁 —— 内核只对**持锁的那个
+         OFD** 写出这行, 所以它回答的正是"这把锁是不是就在这个 fd 手里", 而不是"本进程有没有
+         人持着"。同进程另一次 open() 的 fd 没有这行, dup/继承来的有。
+
+    ③ 以外的一切(读不到证据、fd 没持锁、指错文件)⇒ None ⇒ 调用方走普通取锁。这条路上
+    **不碰 flock**: 不试着锁(能锁上不等于本来就持着), 更不解锁(万一真是父进程的锁, 解了
+    就把它的临界区拆了)。
+    """
+    raw = os.environ.get(LOCK_FD_ENV, "")
+    if raw.strip().lower() in ("none", "off"):
+        return None
+    try:
+        fd = int(raw) if raw.strip() else LOCK_FD_DEFAULT
+    except ValueError:
+        return None
+    if fd < 0:
+        return None
+    try:
+        st = os.fstat(fd)                                   # ①
+    except OSError:
+        return None
+    try:
+        want = os.stat(path or LOCKFILE)
+    except OSError:
+        return None
+    if (st.st_dev, st.st_ino) != (want.st_dev, want.st_ino):
+        return None
+    if _fd_holds_lock(fd, want) is not True:                # ②
+        return None                                         # False/None 都不足以证明
+    return fd
+
+
 class _Lock:
     """整笔事务持有同一把跨进程锁。拿不到 → TxBusy; **打不开锁文件 → TxRefused**。
 
@@ -961,9 +1086,17 @@ class _Lock:
                             % (self.path, e.__class__.__name__))
         try:
             fcntl.flock(self.f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
+        except OSError as e:
             self.f.close(); self.f = None
-            raise TxBusy("已有配置操作正在执行")
+            # **只有真正的锁竞争才算竞争。** flock 失败的原因不止"被别人占着": ENOLCK
+            # (内核锁资源耗尽)、EBADF、EINTR… 都会走到这里。把它们一律报成"已有配置操作
+            # 正在执行", 用户会去找另一个 pdg 进程 —— 而真正的原因(环境坏了)被那句话盖掉,
+            # 他永远找不到。两类分开: 竞争 → TxBusy(等一等再来); 其余 → TxRefused(去修环境)。
+            if e.errno in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+                raise TxBusy("已有配置操作正在执行")
+            raise TxRefused("取锁失败(%s: %s) —— 这不是「别人正在改配置」, 是锁本身用不了; "
+                            "为避免并发写坏配置, 本次拒绝执行"
+                            % (self.path, errno.errorcode.get(e.errno, e.errno)))
         return self
 
     def __exit__(self, *exc):
@@ -1149,7 +1282,7 @@ class Tx:
     def watch(self, target, optional=False):
         """登记一个**只读依赖**: 候选是根据它算出来的, 但本次不打算改它。返回它当前的 bytes(或 None)。
 
-        典型场景: mihomo 配置由 model + rs_meta 渲染, 而本次只改 mitm.json —— model/rs_meta
+        典型场景: mihomo 配置由 model + rs_meta 渲染, 而本次只改 nftables.conf —— model/rs_meta
         不该被"假装 stage 一遍再原样写回"(那会凭空产生一次写入、一份 before-image 和一次
         服务牵连)。watch 只记 sha, 在拿到全局锁、动生产文件之前再核对一次: 变了就
         PRECONDITION_FAILED, 生产文件一个字节都不动。
@@ -1276,7 +1409,7 @@ class Tx:
 
     def __exit__(self, et, ev, tb):
         # abort_unstarted 自身已是严格 no-throw; 这层 try 是"两条路径语义一致"的保险 ——
-        # finally 里直接调它的那些生产入口(tx_apply / _mitm_transact / …)也同样不会被它影响。
+        # finally 里直接调它的那些生产入口(tx_apply / restore_managed / …)也同样不会被它影响。
         try:
             self.abort_unstarted("候选阶段异常: %s" % et.__name__ if et is not None
                                  else "调用方在候选阶段返回")
@@ -1540,7 +1673,7 @@ class Tx:
 
         两类判据要分开:
           · **显式动作**(restart/start/stop)的 unit → 硬门: 本次事务点名要它变成什么样, 没做到
-            就是失败, 不因 repair 放宽(否则"启动 pdg-mitm 失败"也能提交成功);
+            就是失败, 不因 repair 放宽(否则"启动某个服务失败"也能提交成功);
           · 其余硬门(未点名动作的 unit、DNS、DoT、redir 端口)→ 判据是"不得比操作前更差":
             操作前坏、操作后仍坏 = 记 warning 后放行(这才是 repair 的用处);
             **操作前好、操作后坏 = 一律回滚, normal 与 repair 都一样**。

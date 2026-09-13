@@ -890,20 +890,11 @@ import json, os, sys
 sys.path.insert(0, "$REPO_DIR/deploy/bot")
 import sb2mihomo
 model = json.load(open("/etc/sing-box/config.json"))   # config.json 仍是核无关的数据模型
-# WLOC/MITM 的接管域名要一起带上。这些域名的真源是 /etc/mosdns/rules/mitm_hijack.txt(重装
-# 会保留它), 但派生出来的 mihomo 配置里那条 MITM-OUT 出站与 gs-loc 路由是**渲染时**加的 ——
-# 渲染时不传, 重装完 doctor 立刻报"mihomo 缺 MITM-OUT 出站或 gs-loc 路由", WLOC 静默失效
-# (.200 实机重装后就是这样)。域名文件为空 = WLOC 休眠, 那时本来就不该有这条出站。
-_mitm = []
-try:
-    with open("/etc/mosdns/rules/mitm_hijack.txt", encoding="utf-8") as _fh:
-        for _l in _fh:
-            _l = _l.strip()
-            if _l and not _l.startswith("#"):
-                _mitm.append(_l.split(":", 1)[1] if _l.startswith("domain:") else _l)
-except OSError:
-    pass
-cfg, _ = sb2mihomo.singbox_to_mihomo(model, redir_port=7893, mitm_domains=_mitm or None)
+# 这里曾经把 /etc/mosdns/rules/mitm_hijack.txt 里的接管域名读出来一起渲染, 好让重装后的
+# WLOC 不静默失效。WLOC 位置改写连同它专属的 MITM 执行能力已退役, 那条 MITM-OUT 出站与
+# gs-loc 路由不再渲染 —— 而且**尤其**不能照旧读那份文件: 它是用户机器上的残留, 照读就等于
+# 让一台全新安装的机器把已退役的流量路径自己长回来。
+cfg, _ = sb2mihomo.singbox_to_mihomo(model, redir_port=7893)
 with open("/etc/mihomo/config.yaml", "w") as f:
     json.dump(cfg, f, ensure_ascii=False, indent=2)   # JSON 即合法 YAML
 os.chmod("/etc/mihomo/config.yaml", 0o600)
@@ -948,10 +939,11 @@ WantedBy=multi-user.target
 EOF
 pdg_write_unit pdg_unit_mihomo /etc/systemd/system/mihomo.service
 
-# pdg-mitm: MITM 插件服务(Feature B, 仅 iOS)。按 /etc/privdns-gateway/mitm.json 加载启用的插件。
-if [[ "$PLATFORM" == ios ]]; then
-  pdg_write_unit pdg_unit_pdg_mitm /etc/systemd/system/pdg-mitm.service
-fi
+# 这里曾经在 iOS 上写 pdg-mitm.service(WLOC 的 MITM 插件宿主)。WLOC 位置改写连同它专属的
+# MITM 执行能力已退役: 不写、不起。unit 生成器本身也已从 lib/units.sh 删掉 —— 留着这一段
+# 会让每一台新装的 iOS 机器当场失败在一个不存在的函数上。
+# (卸载与失败回滚那两处**相反**, 仍然点名 pdg-mitm: 老机器上那份 unit 还在, 收不走就留下
+#  一个孤儿服务。)
 
 # ── 6. DoT 证书 ──
 if [[ -n "${PDG_SKIP_CERT:-}" ]]; then
@@ -1015,13 +1007,12 @@ _write_resolv "nameserver 1.1.1.1"
 systemctl daemon-reload
 systemctl restart systemd-journald
 systemctl enable --now mosdns "$CORE_SVC" >/dev/null 2>&1 || true
-# pdg-probe81 两平台都起; pdg-mitm 仍是 iOS 专属。
+# pdg-probe81 两平台都起。(pdg-mitm 已随 WLOC 退役, 不再有这个服务。)
 systemctl enable --now pdg-probe81 >/dev/null 2>&1 || true
 # witness 不用 `|| true`: 装完就该可用。它起不来意味着 observer 四件套没闭合, 而那正是
 # "service active 却查不到证据"那类假健康的来源 —— 宁可让安装失败。
 systemctl enable --now pdg-dotwitness >/dev/null 2>&1 \
   || die "pdg-dotwitness 未能启用 —— DoT 证据端不可用, 不把这次安装报成成功"
-[[ "$PLATFORM" == ios ]] && { systemctl enable --now pdg-mitm >/dev/null 2>&1 || true; }
 # ── 救援平面: 凭据 + unit + 默认启用 ──────────────────────────────────────
 # 默认启用是已拍板的方案(T5): 它存在的意义就是"别的都不通时还能进去", 而需要它的那一刻
 # 用户往往已经进不去 SSH 了 —— 那时候再让他去开是开不了的。

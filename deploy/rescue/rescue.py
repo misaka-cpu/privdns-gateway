@@ -107,7 +107,6 @@ def _tx_paths():
     """渲染派生要用的三个路径。跟随事务沙箱根 —— 真机上 FSROOT 是空串, 与写死绝对路径一致。"""
     root = _fsroot() or ""
     return {"rs_meta_path": root + "/opt/pdg-bot/rulesets.json",
-            "mitm_hijack_file": root + "/etc/mosdns/rules/mitm_hijack.txt",
             "platform_file": root + "/etc/privdns-gateway/platform",
             # 内网面板表: 渲染 mihomo 配置时要据它把面板域名指到本机反代。救援路径同样要传
             # —— 少传的后果不是报错, 而是救援渲染出来的配置**悄悄丢掉所有面板路由**,

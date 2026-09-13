@@ -31,7 +31,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, "/opt/pdg-bot")
 
 MIHOMO_REDIR = 7893                     # mihomo redir 入口
-MITM_PORT = 7894                        # MITM 服务(socks5); 接管域名路由到这
 MRS_BEHAVIORS = ("domain", "ipcidr")
 _MRS_BEHAVIOR_BYTE = {0: "domain", 1: "ipcidr"}
 # mihomo 有路径安全限制: external-ui 等路径须在工作目录下或 SAFE_PATHS 白名单内。观测面板 UI
@@ -276,21 +275,6 @@ def read_rs_meta(path):
     return {}
 
 
-def read_mitm_domains(path, platform):
-    """接管域名列表(仅 iOS 平台且有插件启用时非空)。读 mosdns 的强制劫持表(去 domain: 前缀),
-    与 mosdns 强制劫持同源。"""
-    if platform != "ios":
-        return []
-    out = []
-    try:
-        for line in open(path, encoding="utf-8"):
-            line = line.strip()
-            if line and not line.startswith("#"):
-                out.append(line.replace("domain:", "").strip())
-    except OSError:
-        pass
-    return out
-
 
 def read_lan_domains(path):
     """内网面板(方案 B)的域名列表, 读面板表 —— 与反代配置、出站白名单**同一个真源**。
@@ -325,7 +309,7 @@ def read_platform(path):
 
 
 # ── 渲染与判废 ──────────────────────────────────────────────────────────────
-def render_bytes(model, *, rulesets, mitm_domains, tls_ports, lan_domains):
+def render_bytes(model, *, rulesets, tls_ports, lan_domains):
     """从给定 model 渲染出 mihomo 配置的**字节**(不落盘)。返回 (bytes, meta)。
 
     事务在候选阶段用它: 内核配置是 model 的派生物, 必须和 model 在同一笔事务里一起校验、
@@ -336,7 +320,7 @@ def render_bytes(model, *, rulesets, mitm_domains, tls_ports, lan_domains):
     import sb2mihomo
     cfg, meta = sb2mihomo.singbox_to_mihomo(
         model, redir_port=MIHOMO_REDIR, rulesets=rulesets,
-        mitm_domains=mitm_domains, mitm_port=MITM_PORT, tls_ports=tls_ports,
+        tls_ports=tls_ports,
         lan_domains=lan_domains,
         **panel_args(model))
     # mihomo 只吃 YAML; JSON 是 YAML 的子集, 直接可解析
@@ -383,19 +367,19 @@ def _dropped_items(dropped):
     return out
 
 
-def derive_bytes(staged, *, rulesets, mitm_domains, tls_ports, lan_domains):
+def derive_bytes(staged, *, rulesets, tls_ports, lan_domains):
     """pdgtx deriver 的公共主体: 由**候选** model 渲染并判废。
 
     候选里如果带着 rs_meta, 调用方应当据此算出 rulesets 再传进来 —— 读现网旧文件会让新增的
     规则集"翻译不了"被丢掉, 或者已删的又冒出来。"""
     model = json.loads(staged["model"].decode("utf-8"))
-    data, meta = render_bytes(model, rulesets=rulesets, mitm_domains=mitm_domains,
+    data, meta = render_bytes(model, rulesets=rulesets,
                               tls_ports=tls_ports, lan_domains=lan_domains)
     check_meta(meta)
     return data
 
 
-def deriver_from_paths(*, rs_meta_path, mitm_hijack_file, platform_file, lan_table_file):
+def deriver_from_paths(*, rs_meta_path, platform_file, lan_table_file):
     """给**不能 import bot** 的调用方(配置恢复、救援的紧急默认出口)用的 deriver 工厂。
 
     返回一个 pdgtx 认的 deriver(staged → bytes)。路径显式传入, 因为这些调用方跑在事务沙箱
@@ -412,7 +396,6 @@ def deriver_from_paths(*, rs_meta_path, mitm_hijack_file, platform_file, lan_tab
         plat = read_platform(platform_file)
         try:
             return derive_bytes(staged, rulesets=rulesets_arg(meta),
-                                mitm_domains=read_mitm_domains(mitm_hijack_file, plat),
                                 tls_ports=[443] if plat == "ios" else None,
                                 lan_domains=read_lan_domains(lan_table_file))
         except RenderRefused as e:

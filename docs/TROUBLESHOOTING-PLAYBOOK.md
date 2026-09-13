@@ -41,8 +41,9 @@ iOS 靠描述文件的 OnDemand「探测 `:81` 成功才启用 DoT」。
   - 🔓 **WDA 解锁**(55 个流媒体/AI 域名 → jp 直出,内核里显示 `DIRECT`)排在**你点名的单域名规则之后**;
     老机器上如果还是旧顺序(WDA 是在你加规则之后开的),下一次在 bot 里改任何配置就会自动重排,
     也可以立刻关一次再开 🔓 WDA。
-  - **MITM 接管**(`gs-loc*.apple.com` → `MITM-OUT`,仅 iOS)**故意**排在最前(WLOC 要先接管 TLS),
-    它不会给点名规则让路——要么删掉那条规则,要么关掉 WLOC。
+  - **MITM 接管**(`gs-loc*.apple.com` → `MITM-OUT`):WLOC **已退役**,渲染器不再产生这一批。
+    还能看到它,说明这台机器的退役迁移没跑到 —— 运行 `sudo pdg __migrate` 清掉并重渲内核配置。
+    (以前这里写的是"要么删规则、要么关掉 WLOC";WLOC 已经没有开关可关,照旧做会白折腾。)
 - 想看内核真正的求值顺序:`curl -s 127.0.0.1:9090/rules | python3 -m json.tool | head -60`(顺序即优先级;
   面板设了 secret 就加 `-H "Authorization: Bearer <secret>"`)。
 

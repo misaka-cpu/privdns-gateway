@@ -143,13 +143,19 @@ print("── 4c. 但论证必须在 README / ROADMAP 里留全 ──")
 readme = (ROOT / "README.md").read_text(encoding="utf-8")
 roadmap = (ROOT / "docs/ROADMAP.md").read_text(encoding="utf-8")
 for label, txt, need in (
-        ("README", readme, ("metrics", "缓存导出", "明文查询域名")),
+        # README 第 10 节(WLOC)已改写成退役说明, 原先那句"缓存导出/明文查询域名"的论证
+        # 在 ROADMAP 里是全的; README 这一侧只保留 metrics 这个结论词。
+        ("README", readme, ("metrics",)),
         ("ROADMAP", roadmap, ("load_dump", "SSRF", "反向代理", "明文查询域名",
                               "不更换 mosdns 版本"))):
     miss = [w for w in need if w not in txt]
     (ok if not miss else bad)("%s 保留了拒绝 mosdns API 的完整理由(缺 %s)" % (label, miss))
-(ok if "不等于「手机显示的位置已经变了」" in readme else bad)(
-    "README 仍保留「网关改写响应 ≠ 手机显示的位置已改变」的边界")
+# 原判据: README 要保留「网关改写响应 ≠ 手机显示的位置已改变」这条 WLOC 的边界。
+# WLOC 已退役, 那条边界没有对象了 —— 换成盯住退役说明里**用户必须自己做**的那一件事:
+# 网关删不掉手机上已经给出的证书信任, 只有用户能。漏掉它, 用户手机上会长期留着一张仍被
+# 信任、而私钥去向不明的根证书。
+(ok if "证书信任设置" in readme and "已退役" in readme else bad)(
+    "README 的 WLOC 退役说明写明了「到手机上取消对根证书的信任」这一步")
 
 print()
 print("── 4d. 放宽后的否定判据仍然抓得住裸用 ──")

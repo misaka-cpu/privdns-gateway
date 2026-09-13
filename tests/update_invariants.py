@@ -139,8 +139,11 @@ USER_DATA = [
     ("dot_domain", "/opt/pdg-bot/dot-domain"),
     ("platform", "/etc/privdns-gateway/platform"),
     ("profile_env", "/etc/privdns-gateway/profile.env"),
-    ("mitm_json", "/etc/privdns-gateway/mitm.json"),
-    ("mitm_hijack", "/etc/mosdns/rules/mitm_hijack.txt"),
+    # WLOC 退役后 mitm.json / mitm_hijack.txt 不再是受管配置。仍然**要采**它们 ——
+    # 升级不变量比的是"升级前后有没有东西被动过", 而退役迁移恰恰会动这两样: 不采的话
+    # 那次改动在快照里看不见, 而"看不见"正是这份不变量要防的。
+    ("mitm_json_retired", "/etc/privdns-gateway/mitm.json"),
+    ("mitm_hijack_retired", "/etc/mosdns/rules/mitm_hijack.txt"),
 ]
 CREDENTIALS = [
     ("bot_token_file", "/etc/privdns-gateway/bot.env"),
@@ -197,7 +200,8 @@ def capture(args):
     # 内网面板(方案 B)加了 lanroute.py(门一, doctor 要常驻跑它)与 lanpanel.py(门二 +
     # 反代/白名单生成; `pdg lan` 的候选生成也走它)。不装它们, `pdg lan` 与相关 doctor
     # 检查会直接 ImportError/找不到模块, 因此两个平台各 +2。
-    expect = {"android": 30, "ios": 36}.get(plat)   # +1: adblock.py(v1.11.0 新增运行模块)
+    # ios 36 → 34: WLOC 退役后 mitm_server.py / mitm_wloc.py 不再安装。
+    expect = {"android": 30, "ios": 34}.get(plat)   # +1: adblock.py(v1.11.0 新增运行模块)
     if expect is not None and len(members) != expect:
         raise SystemExit("manifest 数量漂移: %s 平台应为 %d 项, 实得 %d" % (plat, expect, len(members)))
 

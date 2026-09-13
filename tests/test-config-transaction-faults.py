@@ -17,6 +17,23 @@ import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tests"))
 from txbox import Box, load_tx  # noqa: E402
+
+# WLOC 退役后 pdgtx._STATE_UNITS 是空的 —— 唯一的成员 pdg-mitm 随它一起没了。但 start/stop
+# 那套"目标态"机制(期望终态判定、基线放宽、动作冲突检测、回滚要停回去)**仍在代码里**,
+# 下一个需要它的服务出现时必须能用。这里把一个既有服务临时登记成目标态 unit, 好让下面那
+# 一整块判据继续盯着那套机制, 而不是随功能一起删掉。
+STATE_UNIT = "pdg-probe81"
+
+
+def load_tx_state(env):
+    """load_tx, 外加把 STATE_UNIT 登记成目标态 unit(只影响这一份沙箱里的模块实例)。"""
+    tx = load_tx(env)
+    tx._STATE_UNITS = (STATE_UNIT,)
+    tx._ACTIONS = tuple(["restart:" + u for u in tx._SERVICE_UNITS]
+                        + ["start:" + u for u in tx._STATE_UNITS]
+                        + ["stop:" + u for u in tx._STATE_UNITS]
+                        + ["daemon-reload", "nft:apply", "sysctl:apply"])
+    return tx
 pass_n = 0
 fail_n = 0
 
@@ -443,20 +460,17 @@ def main():
     box5.clean()
 
     # 原本 inactive 的服务: 回滚要确认它**仍然**没在跑; stop 失败必须判未恢复
-    box6 = Box(svc_fail=["mosdns"]); tx6 = load_tx(box6.env)
-    box6.up("mosdns")                      # mosdns 在跑(基线要好), pdg-mitm 不在跑
-    live6 = box6.path("/etc/privdns-gateway/mitm.json")
-    with open(live6, "wb") as f:
-        f.write(b'{"wloc": {"enabled": false}}')
-    box6.fail_stop("pdg-mitm")            # 停不下来: 回滚必须如实报"未恢复"而不是假装停好了
-    # pdg-mitm 操作前就没在跑 → 普通事务会被基线门正确拒绝; 这类"在降级现场动手"正是
+    box6 = Box(svc_fail=["mosdns"]); tx6 = load_tx_state(box6.env)
+    box6.up("mosdns")                      # mosdns 在跑(基线要好), STATE_UNIT 不在跑
+    box6.fail_stop(STATE_UNIT)            # 停不下来: 回滚必须如实报"未恢复"而不是假装停好了
+    # STATE_UNIT 操作前就没在跑 → 普通事务会被基线门正确拒绝; 这类"在降级现场动手"正是
     # 修复模式的用途, 用它才谈得上"回滚要把它停回去"
     t = tx6.Tx("bot", "rt-stop", mode="repair")
-    t.stage("mitm_json", b'{"wloc": {"enabled": true}}')
-    t.service("restart:pdg-mitm")          # 先把它拉起来(原本 inactive)
-    t.service("restart:mosdns")            # 这一步失败 → 触发回滚 → 必须把 pdg-mitm 停回去
+    t.stage("mosdns_rule:custom_hijack.txt", b"domain:tx-fault.example\n")
+    t.service("restart:" + STATE_UNIT)     # 先把它拉起来(原本 inactive)
+    t.service("restart:mosdns")            # 这一步失败 → 触发回滚 → 必须把它停回去
     res = t.commit()
-    if res["state"] == tx6.ROLLBACK_FAILED and any("pdg-mitm" in x for x in res["rollback_failed_items"]):
+    if res["state"] == tx6.ROLLBACK_FAILED and any(STATE_UNIT in x for x in res["rollback_failed_items"]):
         ok("原本 inactive 的服务停不下来 → ROLLBACK_FAILED 并点名")
     else:
         bad("stop 失败没被判未恢复: %s" % res)
@@ -932,46 +946,51 @@ def main():
         ok("watch: 必需的只读依赖不存在 → 直接拒绝")
     box13.clean()
 
-    # ── 14. 服务期望状态: start/stop pdg-mitm ────────────────────────────────
+    # ── 14. 服务期望状态: start/stop ─────────────────────────────────────────
+    # 这一块原本以 服务 为载体(WLOC 开 = 让它跑起来, 关 = 让它停下)。那个服务随 WLOC
+    # 退役没了, 但**这套机制还在**: 期望终态判定、基线放宽、动作冲突检测、回滚要停回去。
+    # 载体换成 STATE_UNIT(见文件头), 判据一条没改。
+    MARK = "/etc/mosdns/rules/custom_hijack.txt"
+
     def _mitm_box():
-        b = Box(); t = load_tx(b.env)
+        b = Box(); t = load_tx_state(b.env)
         b.up("mosdns"); b.up("mihomo")
-        b.put("/etc/privdns-gateway/mitm.json", b'{"wloc": {"enabled": false}}')
+        b.put(MARK, b"domain:tx-fault-before.example\n")
         return b, t
 
     def _mitm_tx(txm, op, actions, mode="normal"):
         t = txm.Tx("test", op, mode=mode)
-        t.stage("mitm_json", b'{"wloc": {"enabled": true}}')
+        t.stage("mosdns_rule:custom_hijack.txt", b"domain:tx-fault.example\n")
         for a in actions:
             t.service(a)
         return t
 
-    b14, tx14 = _mitm_box()                       # start: 操作前 pdg-mitm 没在跑(WLOC 常态)
-    b14.down("pdg-mitm")
-    res = _mitm_tx(tx14, "mitm_start", ["start:pdg-mitm"]).commit()
-    if res["state"] == tx14.COMMITTED and os.path.exists(os.path.join(b14.state, "pdg-mitm.active")):
-        ok("start:pdg-mitm: 操作前 inactive 也能开事务(不再被基线硬门拦), 操作后确认 active")
+    b14, tx14 = _mitm_box()                       # start: 操作前 服务 没在跑(WLOC 常态)
+    b14.down(STATE_UNIT)
+    res = _mitm_tx(tx14, "mitm_start", ["start:" + STATE_UNIT]).commit()
+    if res["state"] == tx14.COMMITTED and os.path.exists(os.path.join(b14.state, STATE_UNIT + '.active')):
+        ok("start:服务: 操作前 inactive 也能开事务(不再被基线硬门拦), 操作后确认 active")
     else:
         bad("start 失败: %s" % res)
     b14.clean()
 
     b14, tx14 = _mitm_box()                       # stop: 操作后必须确认 inactive
-    b14.up("pdg-mitm")
-    res = _mitm_tx(tx14, "mitm_stop", ["stop:pdg-mitm"]).commit()
-    if res["state"] == tx14.COMMITTED and not os.path.exists(os.path.join(b14.state, "pdg-mitm.active")):
-        ok("stop:pdg-mitm: 停成功不被判成服务故障, 且确认已 inactive")
+    b14.up(STATE_UNIT)
+    res = _mitm_tx(tx14, "mitm_stop", ["stop:" + STATE_UNIT]).commit()
+    if res["state"] == tx14.COMMITTED and not os.path.exists(os.path.join(b14.state, STATE_UNIT + '.active')):
+        ok("stop:服务: 停成功不被判成服务故障, 且确认已 inactive")
     else:
         bad("stop 失败: %s" % res)
     b14.clean()
 
     b14, tx14 = _mitm_box()                       # 动作冲突: 写生产文件之前就拒
-    b14.up("pdg-mitm")
-    live14 = b14.read("/etc/privdns-gateway/mitm.json")
+    b14.up(STATE_UNIT)
+    live14 = b14.read(MARK)
     try:
-        _mitm_tx(tx14, "mitm_conflict", ["start:pdg-mitm", "stop:pdg-mitm"])
+        _mitm_tx(tx14, "mitm_conflict", ["start:" + STATE_UNIT, "stop:" + STATE_UNIT])
         bad("同一 unit 上 start+stop 竟然被接受")
     except tx14.TxError as e:
-        if b14.read("/etc/privdns-gateway/mitm.json") == live14:
+        if b14.read(MARK) == live14:
             ok("动作冲突 → 组装阶段就拒(%s), 生产零改动" % str(e)[:24])
         else:
             bad("拒绝了但动过生产文件")
@@ -979,49 +998,49 @@ def main():
 
     for st in ("failed", "activating", "deactivating"):
         b14, tx14 = _mitm_box()                   # stop 之后落到 failed/activating… 不算停成功
-        b14.up("pdg-mitm"); b14.stop_leaves("pdg-mitm", st)
-        before14 = b14.read("/etc/privdns-gateway/mitm.json")
-        res = _mitm_tx(tx14, "mitm_stop_" + st, ["stop:pdg-mitm"]).commit()
-        if res["state"] == tx14.ROLLED_BACK and b14.read("/etc/privdns-gateway/mitm.json") == before14:
-            ok("stop 后 ActiveState=%s 不冒充成功 → 回滚且 mitm.json 还原" % st)
+        b14.up(STATE_UNIT); b14.stop_leaves(STATE_UNIT, st)
+        before14 = b14.read(MARK)
+        res = _mitm_tx(tx14, "mitm_stop_" + st, ["stop:" + STATE_UNIT]).commit()
+        if res["state"] == tx14.ROLLED_BACK and b14.read(MARK) == before14:
+            ok("stop 后 ActiveState=%s 不冒充成功 → 回滚且 受管文件还原" % st)
         else:
             bad("ActiveState=%s 被当成停成功: %s" % (st, res["state"]))
         b14.clean()
 
     b14, tx14 = _mitm_box()                       # start 命令本身失败 → 立即回滚
-    b14.down("pdg-mitm"); b14._systemctl(["pdg-mitm"], False)
-    before14 = b14.read("/etc/privdns-gateway/mitm.json")
-    res = _mitm_tx(tx14, "mitm_start_fail", ["start:pdg-mitm"]).commit()
-    if res["state"] == tx14.ROLLED_BACK and b14.read("/etc/privdns-gateway/mitm.json") == before14:
-        ok("start 命令失败 → 回滚 + mitm.json 逐字节还原")
+    b14.down(STATE_UNIT); b14._systemctl([STATE_UNIT], False)
+    before14 = b14.read(MARK)
+    res = _mitm_tx(tx14, "mitm_start_fail", ["start:" + STATE_UNIT]).commit()
+    if res["state"] == tx14.ROLLED_BACK and b14.read(MARK) == before14:
+        ok("start 命令失败 → 回滚 + 受管文件逐字节还原")
     else:
         bad("start 失败却没回滚: %s" % res["state"])
     b14.clean()
 
     b14, tx14 = _mitm_box()                       # start 成功但在崩溃循环里 → 判失败
-    b14.down("pdg-mitm"); b14.bump_restarts("pdg-mitm", 3)
-    res = _mitm_tx(tx14, "mitm_start_crash", ["start:pdg-mitm"]).commit()
+    b14.down(STATE_UNIT); b14.bump_restarts(STATE_UNIT, 3)
+    res = _mitm_tx(tx14, "mitm_start_crash", ["start:" + STATE_UNIT]).commit()
     if res["state"] == tx14.ROLLED_BACK:
         ok("start 后 NRestarts 还在涨 → 判起来即崩并回滚")
     else:
         bad("崩溃循环被当成启动成功: %s" % res["state"])
-    if not os.path.exists(os.path.join(b14.state, "pdg-mitm.active")):
-        ok("回滚把 pdg-mitm 恢复成事务前的 inactive(原本没在跑的不许留着在跑)")
+    if not os.path.exists(os.path.join(b14.state, STATE_UNIT + '.active')):
+        ok("回滚把 服务 恢复成事务前的 inactive(原本没在跑的不许留着在跑)")
     else:
-        bad("回滚后 pdg-mitm 仍在跑")
+        bad("回滚后 服务 仍在跑")
     b14.clean()
 
     b14, tx14 = _mitm_box()                       # 放宽只针对该 unit: 别的硬门坏了照样拒
-    b14.down("pdg-mitm"); b14.down("mosdns"); b14.up("mihomo")
+    b14.down(STATE_UNIT); b14.down("mosdns"); b14.up("mihomo")
     try:
         t = tx14.Tx("test", "relax_scope")
-        t.stage("mitm_json", b'{"wloc": {"enabled": true}}')
+        t.stage("mosdns_rule:custom_hijack.txt", b"domain:tx-fault.example\n")
         t.stage("mosdns_rule:custom_direct.txt", b"domain:x14.example\n")
-        t.service("start:pdg-mitm"); t.service("restart:mosdns")
+        t.service("start:" + STATE_UNIT); t.service("restart:mosdns")
         t.commit()
         bad("mosdns 操作前就没在跑, normal 模式却放行了")
     except tx14.TxRefused as e:
-        ok("start:pdg-mitm 只放宽 pdg-mitm 自己的基线, mosdns 的硬门照旧(%s)" % str(e)[:24])
+        ok("start:服务 只放宽 服务 自己的基线, mosdns 的硬门照旧(%s)" % str(e)[:24])
     b14.clean()
 
     # ── 15. 兼容: 5.1A 留下的事务(meta 里没有新字段)仍要能 recover ──────────────
@@ -1106,19 +1125,19 @@ def main():
     # ── 17. 运行态回滚的严格判据 ────────────────────────────────────────────
     # 原本 inactive 的服务, 回滚 stop 之后落到 failed/activating/deactivating 都不算停稳。
     for st in ("failed", "activating", "deactivating"):
-        b17 = Box(); tx17 = load_tx(b17.env)
-        b17.up("mosdns"); b17.down("pdg-mitm")
-        b17.put("/etc/privdns-gateway/mitm.json", b'{"wloc": {"enabled": false}}')
-        before17 = b17.read("/etc/privdns-gateway/mitm.json")
-        b17.stop_leaves("pdg-mitm", st)
+        b17 = Box(); tx17 = load_tx_state(b17.env)
+        b17.up("mosdns"); b17.down(STATE_UNIT)
+        b17.put("/etc/mosdns/rules/custom_hijack.txt", b"domain:before17.example\n", 0o644)
+        before17 = b17.read("/etc/mosdns/rules/custom_hijack.txt")
+        b17.stop_leaves(STATE_UNIT, st)
         t = tx17.Tx("bot", "rt-strict-" + st, mode="repair")
-        t.stage("mitm_json", b'{"wloc": {"enabled": true}}')
-        t.service("restart:pdg-mitm")       # 先把它拉起来(原本 inactive)
+        t.stage("mosdns_rule:custom_hijack.txt", b"domain:tx-fault.example\n")
+        t.service("restart:" + STATE_UNIT)       # 先把它拉起来(原本 inactive)
         t.service("restart:mosdns")
         b17._systemctl(["mosdns"], False)   # mosdns 重启失败 → 触发回滚
         res = t.commit()
-        recovered = b17.read("/etc/privdns-gateway/mitm.json") == before17
-        named = any("pdg-mitm" in x for x in res.get("rollback_failed_items") or [])
+        recovered = b17.read("/etc/mosdns/rules/custom_hijack.txt") == before17
+        named = any(STATE_UNIT in x for x in res.get("rollback_failed_items") or [])
         if res["state"] == tx17.ROLLBACK_FAILED and named and recovered:
             ok("回滚 stop 后 ActiveState=%s → ROLLBACK_FAILED 并点名, 文件仍逐字节还原" % st)
         else:
@@ -1326,37 +1345,37 @@ def main():
 
     # 正常 active / inactive 两种 before-image + 回滚
     for pre_active in (True, False):
-        b20 = Box(); tx20 = load_tx(b20.env)
+        b20 = Box(); tx20 = load_tx_state(b20.env)
         b20.up("mosdns")
         if pre_active:
-            b20.up("pdg-mitm")
+            b20.up(STATE_UNIT)
         else:
-            b20.down("pdg-mitm")
-        b20.put("/etc/privdns-gateway/mitm.json", b'{"wloc": {"enabled": false}}')
-        before20 = b20.read("/etc/privdns-gateway/mitm.json")
+            b20.down(STATE_UNIT)
+        b20.put("/etc/mosdns/rules/custom_hijack.txt", b"domain:before20.example\n", 0o644)
+        before20 = b20.read("/etc/mosdns/rules/custom_hijack.txt")
         t = tx20.Tx("bot", "before-image", mode="repair")
-        t.stage("mitm_json", b'{"wloc": {"enabled": true}}')
-        t.service("restart:pdg-mitm"); t.service("restart:mosdns")
+        t.stage("mosdns_rule:custom_hijack.txt", b"domain:tx-fault.example\n")
+        t.service("restart:" + STATE_UNIT); t.service("restart:mosdns")
         b20._systemctl(["mosdns"], False)            # mosdns 重启失败 → 触发回滚
         res = t.commit()
         rec = {}
         try:
             bi20 = json.load(open(os.path.join(res["dir"], "before", "index.json"), encoding="utf-8"))
-            rec = (bi20.get("services") or {}).get("pdg-mitm") or {}
+            rec = (bi20.get("services") or {}).get(STATE_UNIT) or {}
         except Exception:  # noqa: BLE001
             pass
-        now_active = os.path.exists(os.path.join(b20.state, "pdg-mitm.active"))
+        now_active = os.path.exists(os.path.join(b20.state, STATE_UNIT + '.active'))
         want_state = "active" if pre_active else "inactive"
         if rec.get("active") is pre_active and rec.get("active_state") == want_state \
                 and now_active is pre_active \
-                and b20.read("/etc/privdns-gateway/mitm.json") == before20:
+                and b20.read("/etc/mosdns/rules/custom_hijack.txt") == before20:
             ok("操作前 %s 的服务: before-image 记对了, 回滚后回到同一状态" % want_state)
         else:
             bad("before-image/回滚不对(pre_active=%s): %s / now=%s" % (pre_active, rec, now_active))
         b20.clean()
 
     # 旧格式 before-image(只有 active 布尔)仍能 recover
-    b20 = Box(); tx20 = load_tx(b20.env)
+    b20 = Box(); tx20 = load_tx_state(b20.env)
     b20.up("mosdns")
     b20.put("/etc/mosdns/rules/custom_direct.txt", b"domain:old20.example\n", 0o644)
     keep20 = b20.read("/etc/mosdns/rules/custom_direct.txt")
@@ -1386,17 +1405,17 @@ def main():
     b20.clean()
 
     # ── 21. UnitFileState: 合法空值也要参与精确比对 ──────────────────────────
-    b21 = Box(); tx21 = load_tx(b21.env)
-    b21.up("mosdns"); b21.down("pdg-mitm")
-    with open(os.path.join(b21.state, "pdg-mitm.ufs"), "w") as f:
+    b21 = Box(); tx21 = load_tx_state(b21.env)
+    b21.up("mosdns"); b21.down(STATE_UNIT)
+    with open(os.path.join(b21.state, STATE_UNIT + '.ufs'), "w") as f:
         f.write("\n")                                   # 操作前 UnitFileState 是**合法空值**
-    b21.put("/etc/privdns-gateway/mitm.json", b'{"wloc": {"enabled": false}}')
+    b21.put("/etc/mosdns/rules/custom_hijack.txt", b"domain:before21.example\n", 0o644)
     t = tx21.Tx("bot", "ufs-empty-then-enabled", mode="repair")
-    t.stage("mitm_json", b'{"wloc": {"enabled": true}}')
-    t.service("restart:pdg-mitm"); t.service("restart:mosdns")
+    t.stage("mosdns_rule:custom_hijack.txt", b"domain:tx-fault.example\n")
+    t.service("restart:" + STATE_UNIT); t.service("restart:mosdns")
     # 在**事务进行中**把 UnitFileState 从空值改成 enabled(模拟别的东西动了 unit), 同时让这一步
     # 失败以触发回滚 —— 顺序很关键: before-image 必须先记下那个合法空值。
-    ufs21 = os.path.join(b21.state, "pdg-mitm.ufs")
+    ufs21 = os.path.join(b21.state, STATE_UNIT + '.ufs')
     real_do21 = tx21.Tx._do_actions
 
     def _flip21(self):

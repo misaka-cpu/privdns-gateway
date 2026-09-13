@@ -24,7 +24,6 @@ etc/mosdns/rules/custom_direct.txt
 etc/mosdns/rules/custom_hijack.txt
 etc/mosdns/rules/ruleset_hijack.txt
 etc/mosdns/rules/unlock.txt
-etc/mosdns/rules/mitm_hijack.txt
 opt/pdg-bot/rulesets.json
 opt/pdg-bot/dot-domain"
 

@@ -20,7 +20,6 @@ REPO_DIR = "/opt/privdns-gateway"   # 已装仓库(比对部署文件是否与�
 RS_META = "/opt/pdg-bot/rulesets.json"   # 规则集元数据(与 bot 同源)
 MOSDNS_RULES_DIR = "/etc/mosdns/rules"
 UNLOCK_FILE = MOSDNS_RULES_DIR + "/unlock.txt"                # WDA 解锁清单(= 自动生成那批域名的真源)
-MITM_HIJACK_FILE = MOSDNS_RULES_DIR + "/mitm_hijack.txt"      # MITM 接管域名
 CUSTOM_DIRECT_FILE = MOSDNS_RULES_DIR + "/custom_direct.txt"  # 用户判直连的域名(DNS 侧就返真实 IP)
 # 面板 UI 在 /etc/sing-box/ui/dist, 不在 mihomo 工作目录下 → SAFE_PATHS 放行, 否则 `mihomo -t` 拒。
 os.environ.setdefault("SAFE_PATHS", "/etc/sing-box/ui/dist")
@@ -217,7 +216,7 @@ def bot_credentials():
 
 def expected_services():
     """必需服务集。pdg-probe81 是 Android/iOS **公共**组件(:81 探测 + 链路会话入口),
-    两平台都必需。pdg-mitm 由 check_mitm 单独按启用态判定, 不列入必需集。
+    两平台都必需。(pdg-mitm 曾按 WLOC 启用态单独判定; WLOC 已退役, 那个服务不再存在。)
     未配 bot 凭据时 pdg-bot 不在必需集里 —— 它本来就不该启动。
     CLI/status/report/healthcheck 统一取此。"""
     svc = _core_svc()
@@ -1768,97 +1767,6 @@ def check_deep_upstreams():
         level = max(level, "warn", key=rank.get)
     return (level, "DNS 上游探测", " ; ".join(parts))
 
-GS_LOC = ("gs-loc.apple.com", "gs-loc-cn.apple.com")   # WLOC 接管域名(与 bot MITM_PLUGIN_DOMAINS 同源)
-
-def check_mitm_structure():
-    """MITM 接管结构(mosdns force_hijack domain_set + force_hijack_seq + 优先级规则 + mitm_hijack.txt):
-    升级迁移是否补到位。仅 iOS。自定义/读不到 → info(不判); 标准结构缺 force_hijack 或规则顺序错 → warn。
-    与「MITM 插件」启用态分开: 结构应常驻(平时空文件=休眠), 缺了说明 v1.4.x 升级迁移没跑到。"""
-    if _platform() != "ios":
-        return None
-    conf = _mos()
-    if not conf:
-        return ("info", "WLOC DNS 接管", "读不到 mosdns 配置")
-    if "tag: internal_sequence" not in conf or "tag: ecs_china" not in conf:
-        return ("info", "WLOC DNS 接管", "自定义 mosdns 配置, 跳过 force_hijack 检查")
-    if "tag: force_hijack" not in conf:
-        return ("warn", "WLOC DNS 接管", "缺 force_hijack 接管结构(v1.4.x 升级迁移未跑到); 开 WLOC 前 sudo pdg __migrate")
-    blk = _internal_seq_block(conf)
-    i_fh, i_cn = blk.find("qname $force_hijack"), blk.find("qname $geosite_cn")
-    if i_fh < 0 or (i_cn >= 0 and i_fh > i_cn):
-        return ("warn", "WLOC DNS 接管", "force_hijack 优先级规则缺失或顺序错(应在 geosite_cn 之前强制接管)")
-    if "tag: force_hijack_seq" not in conf:
-        return ("warn", "WLOC DNS 接管", "缺 force_hijack_seq(接管域名的 AAAA/HTTPS 抑制 + A 劫持序列)")
-    if not os.path.isfile(MITM_HIJACK_FILE):
-        return ("warn", "WLOC DNS 接管", "缺 " + MITM_HIJACK_FILE + "(接管域名集文件)")
-    return ("ok", "WLOC DNS 接管", "force_hijack + force_hijack_seq + 优先级规则 + mitm_hijack.txt 就位")
-
-def check_mitm():
-    """MITM 插件(Feature B / iOS): 启用时应 pdg-mitm active + CA + mitm_hijack 含接管域名 +
-    当前内核有 MITM 路由。未启用 = info。安卓不适用。(不只是 CA+active)"""
-    if _platform() != "ios":
-        return None                              # MITM/WLOC 仅 iOS, 安卓不显示此项
-    try:
-        cfg = json.load(open("/etc/privdns-gateway/mitm.json"))
-    except Exception:  # noqa: BLE001
-        cfg = {}
-    enabled = [k for k in ("wloc",) if (cfg.get(k) or {}).get("enabled")]
-    if not enabled:
-        return ("info", "WLOC 服务", "未启用")
-    # WLOC 开着就说明这几个组件是必需件: 更新时若某个装失败(旧实现 ||true 会静默跳过),
-    # 目标位置留着上一版文件 —— 光看"服务 active"发现不了新旧混装, 这里按文件在不在直接判死。
-    need = ["/opt/pdg-bot/mitm_ca.py", "/opt/pdg-bot/mitm_server.py", "/opt/pdg-bot/mitm_wloc.py",
-            "/opt/pdg-bot/probe81.py", "/opt/pdg-bot/pdg-dot.mobileconfig.tmpl",
-            # 缺它 ⇒ 描述文件根本生成不出来(Bot 与 CLI 都走这一份), 而 WLOC 开着时
-            # 用户恰恰**必须**重新生成一份带根证书的描述文件。
-            "/opt/pdg-bot/iosprofile.py", "/opt/pdg-bot/iosstate.py"]
-    miss = [os.path.basename(p) for p in need if not os.path.isfile(p)]
-    if miss:
-        return ("fail", "WLOC 服务", "已启用但缺 iOS 组件: " + ", ".join(miss)
-                + "; 运行 sudo pdg update 重新部署。")
-    # 版本一致性: 仓库在本机可读时, 逐个比对部署文件与仓库文件。装到一半失败会把上一版留在
-    # 原地, 只看"文件在不在"发现不了这种新旧混装。仓库不可用则跳过这一层(不误报)。
-    drift = []
-    for dst, src in (("mitm_ca.py", "deploy/bot/mitm_ca.py"),
-                     ("mitm_server.py", "deploy/bot/mitm_server.py"),
-                     ("mitm_wloc.py", "deploy/bot/mitm_wloc.py"),
-                     ("iosprofile.py", "deploy/bot/iosprofile.py"),
-                     ("iosstate.py", "deploy/bot/iosstate.py"),
-                     ("probe81.py", "deploy/bot/probe81.py"),
-                     ("pdg-dot.mobileconfig.tmpl", "deploy/ios/pdg-dot-ondemand.mobileconfig.tmpl")):
-        sp = os.path.join(REPO_DIR, src)
-        if not os.path.isfile(sp):
-            continue
-        if _filesha(os.path.join("/opt/pdg-bot", dst)) != _filesha(sp):
-            drift.append(dst)
-    if drift:
-        return ("fail", "WLOC 服务", "已启用但这些组件与当前发布不一致(疑似新旧混装): "
-                + ", ".join(drift) + "; 运行 sudo pdg update 重新部署。")
-    if _run(["systemctl", "is-active", "pdg-mitm"])[1].strip() != "active":
-        return ("fail", "WLOC 服务", "已启用(" + ",".join(enabled) + ")但 pdg-mitm 未运行")
-    if not os.path.isfile("/etc/privdns-gateway/ca/ca.crt"):
-        return ("fail", "WLOC 服务", "缺 CA 证书 /etc/privdns-gateway/ca/ca.crt")
-    # 接管域名集应含 gs-loc 两域名(mosdns 强制劫持源)
-    try:
-        hij = open(MITM_HIJACK_FILE).read()
-    except OSError:
-        hij = ""
-    if not all(d in hij for d in GS_LOC):
-        return ("fail", "WLOC 服务", "mitm_hijack.txt 未含 gs-loc 接管域名(mosdns 未强制劫持, 重开一次 WLOC)")
-    # MITM 路由(mihomo): 需 MITM-OUT 出站 + gs-loc → MITM-OUT 规则。
-    try:
-        mc = json.load(open(MIHOMO_CFG))
-        has_out = any(p.get("name") == "MITM-OUT" for p in mc.get("proxies", []))
-        has_rule = any(("MITM-OUT" in r) and ("gs-loc" in r) for r in mc.get("rules", []))
-    except Exception:  # noqa: BLE001
-        has_out = has_rule = False
-    if not (has_out and has_rule):
-        return ("fail", "WLOC 服务", "mihomo 缺 MITM-OUT 出站或 gs-loc 路由(重开一次 WLOC 重渲染内核)")
-    return ("ok", "WLOC 服务", "pdg-mitm active + CA + mitm_hijack + mihomo MITM 路由 就位")
-
-# ── mihomo 管理面(external-controller)的只读查询 ────────────────────────────
-# 只做 GET, 只在**回环**地址上做。判据宁可"无结论"也不主动去连非回环的管理端口:
-# 那是控制面, 能改配置、切出站, 不该由一条自检去外连。
 def _clash_ctrl():
     """解析 mihomo 的 external-controller。回环才给 base_url, **且地址族原样保留**。
 
@@ -2086,8 +1994,9 @@ def check_rulesets():
 
 # ── 分流优先级: 自动生成的规则不许静默压过用户点名的域名规则 ──────────────────
 # 内核自上而下第一条命中即止, 所以规则表的**顺序就是优先级**。本项目会自动往规则表里塞两批
-# 规则: WDA 解锁(unlock.txt 那批, 目标是 jp 直出 → 渲染成 DIRECT)与 MITM 接管(mitm_hijack.txt
-# 那批 → MITM-OUT)。它们排在用户点名规则前面时, 用户那条规则就成了死规则 —— 配置里两条都在,
+# 规则: WDA 解锁(unlock.txt 那批, 目标是 jp 直出 → 渲染成 DIRECT); 以及老机器上 WLOC 退役前
+# 渲染进去、迁移还没清掉的 MITM 接管那批(→ MITM-OUT)。它们排在用户点名规则前面时, 用户那条
+# 规则就成了死规则 —— 配置里两条都在,
 # 面板、`测域名`、`pdg doctor` 以前全都看不出来, 只有把 clash_api /rules 拉出来数才发现
 # (.200 现场: netflix.com 点名指到 hkt, 实际一直走直连)。
 #
@@ -2143,7 +2052,7 @@ def _covers(kind, value, other_kind, other_value):
     return False
 
 
-def _auto_batches(dom_rules, unlock, mitm):
+def _auto_batches(dom_rules, unlock):
     """哪些规则是**自动生成**的 → {下标: 批次名}。按位置认, 不按域名文本认。
 
     为什么不能只看域名在不在 unlock.txt 里: 用户点名 netflix.com 时, 他那条规则与 WDA 自动
@@ -2151,14 +2060,17 @@ def _auto_batches(dom_rules, unlock, mitm):
     被用户规则接管"这两件相反的事会被判成同一件(第一版就是这么把现场那条漏掉的)。
 
     位置判据来自渲染方式本身:
-      · MITM 接管那批的目标是 MITM-OUT —— 这个出站名是渲染器造出来的, 别处不会有;
+      · MITM 接管那批的目标是 MITM-OUT —— 这个出站名是渲染器造出来的, 别处不会有。
+        WLOC 退役后它不再被渲染, 但**还没跑到退役迁移的老机器**盘上那份配置里仍然有, 所以
+        这条识别要留着: 删了它, 那台机器上的 MITM-OUT 批次会被当成用户自己写的规则, 报出
+        一条根本不存在的冲突。判据不再读 mitm_hijack.txt(那份表已随退役作废), 只认出站名;
       · WDA 那批由 model 里**一条** domain_suffix 规则展开, 因此是一段**连续**、同目标、
         域名都在 unlock.txt 里的 DOMAIN-SUFFIX。取覆盖最多的那一段: 用户自己那条同名规则
         是孤立的一两条, 不会被算成批次。"""
     auto = {}
     for i, _kind, value, target in dom_rules:
-        if target == "MITM-OUT" and (not mitm or value in mitm):
-            auto[i] = "MITM 接管"
+        if target == "MITM-OUT":
+            auto[i] = "MITM 接管(已退役)"
     best, run = [], []
     for i, kind, value, target in dom_rules:
         member = kind == "DOMAIN-SUFFIX" and value in unlock and i not in auto
@@ -2199,10 +2111,9 @@ def rule_precedence_scan(cfg=None):
         return res
 
     unlock = set(_domain_list(UNLOCK_FILE))
-    mitm = set(_domain_list(MITM_HIJACK_FILE))
     direct = set(_domain_list(CUSTOM_DIRECT_FILE))
     dom_rules = _rendered_domain_rules(rules)
-    auto = _auto_batches(dom_rules, unlock, mitm)
+    auto = _auto_batches(dom_rules, unlock)
 
     taken = []                             # WDA 域名被用户点名规则接管(修好之后的正常形态)
     for idx, kind, value, target in dom_rules:
@@ -2264,15 +2175,16 @@ def check_rule_precedence():
         # 两批自动规则的处置**不一样**, 不能给一句通用建议:
         #   · WDA 那批本就该排在点名规则之后 —— 出现在这里说明是老顺序, 下一次 model 写入
         #     会自愈, 也可以立刻关一次再开 🔓 WDA;
-        #   · MITM 接管那批**故意**排在最前(iOS 的 WLOC 要先终止 TLS 才改得了坐标), 它不会
-        #     给点名规则让路 —— 要么删掉那条规则, 要么关掉 WLOC。说反了会让人白等自愈。
+        #   · MITM 接管那批是 WLOC 退役前渲染进去的残留。WLOC 已经没有开关可关了, 所以
+        #     建议必须换成"跑退役迁移把它清掉", 而不是照旧叫人去关一个不存在的按钮。
         how = []
         if any(b == "WDA 解锁" for *_x, b in scan["auto"]):
             how.append("WDA 这批: 在 bot 里改一次这几个域名的规则, 或关一次再开 🔓 WDA "
                        "—— 新版把系统自动规则排在用户指定的域名规则之后")
-        if any(b == "MITM 接管" for *_x, b in scan["auto"]):
-            how.append("MITM 接管这批是**故意**排在最前的(WLOC 要先接管 TLS), 不会给用户指定的域名规则"
-                       "让路 —— 要么删掉那条规则, 要么关掉 WLOC")
+        if any(b == "MITM 接管(已退役)" for *_x, b in scan["auto"]):
+            how.append("MITM 接管这批是 WLOC 退役前留在内核配置里的残留(它排在最前, 会压过用户指定的"
+                       "域名规则)。WLOC 已退役, 没有开关可关 —— 运行 <code>sudo pdg __migrate</code> "
+                       "把它清掉并重渲内核配置")
         return ("warn", "分流优先级",
                 "有 %d 条用户指定的域名规则被系统自动规则抢先匹配, 当前无法生效 —— 自动生成的规则排在它前面: %s%s。"
                 "内核自上而下第一条命中即止, 所以配置里两条都在也没用。→ %s。"
@@ -2827,7 +2739,7 @@ ALL = [check_platform, check_services, check_bot_credentials, check_health_timer
        check_mosdns_ratelimit, check_mosdns_explicit_proxy, check_ruleset_hijack,
        check_nft_extra, check_rescue_firewall, check_geosite_db, check_mem,
        check_cert, check_cert_dir_sync, check_dns, check_core_config, check_rulesets, check_rule_precedence,
-       check_mitm_structure, check_mitm, check_transactions]
+       check_transactions]
 ALERT = [check_services, check_dns, check_cert]  # healthcheck 用的轻量子集(运行期故障)
 DEEP = [check_deep_lan_acl,
         check_deep_dot_handshake, check_deep_probe81, check_deep_dot_witness, check_deep_dns_cn,

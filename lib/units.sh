@@ -25,19 +25,6 @@ WantedBy=multi-user.target
 EOF
 }
 
-pdg_unit_pdg_mitm(){ cat <<'EOF'
-[Unit]
-Description=pdg-mitm (PrivDNS Gateway MITM plugins)
-After=network-online.target
-Wants=network-online.target
-[Service]
-ExecStart=/usr/bin/python3 /opt/pdg-bot/mitm_server.py 7894
-Restart=on-failure
-RestartSec=3
-[Install]
-WantedBy=multi-user.target
-EOF
-}
 
 # 内网面板(方案 B)的反代。$1 = 是否需要放宽 TLS 套件(1/空)。
 #

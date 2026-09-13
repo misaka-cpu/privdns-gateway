@@ -76,14 +76,17 @@ deploy/bot/healthcheck.py healthcheck.py 755"
 PDG_IOS_MODULES="deploy/bot/iosprofile.py iosprofile.py 755
 deploy/bot/iosstate.py iosstate.py 755
 deploy/bot/mitm_ca.py mitm_ca.py 755
-deploy/bot/mitm_server.py mitm_server.py 755
-deploy/bot/mitm_wloc.py mitm_wloc.py 755
 deploy/ios/pdg-dot-ondemand.mobileconfig.tmpl pdg-dot.mobileconfig.tmpl 644"
 
 # 早期版本装过、现在不再安装的运行文件(只有目标名, 没有源)。卸载要一并收走 —— 老机器上
 # 留着一份不再被任何东西调用的旧脚本, 既误导人, 也让"卸载干净了吗"这个问题没有确定答案。
 # nftpurge.py: 卸载改成直接从仓库跑它之后就不再往 /opt/pdg-bot 装, `.200` 上那份是旧版遗留。
-PDG_LEGACY_MODULES="nftpurge.py"
+# mitm_server.py / mitm_wloc.py: WLOC 位置改写连同它专属的 MITM 执行能力已退役 —— 新装不装,
+# 但老机器上那两份还躺着。它们是**能跑起来的东西**(一个 HTTP 代理宿主加一个 gs-loc 改写
+# 插件), 留着就留了一条把能力接回来的路: 手工 `python3 mitm_server.py 7894` 就够了。
+PDG_LEGACY_MODULES="nftpurge.py
+mitm_server.py
+mitm_wloc.py"
 
 # 逐行输出清单(供 bash 侧遍历)
 pdg_runtime_modules(){ printf '%s\n' "$PDG_RUNTIME_MODULES"; }

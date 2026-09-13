@@ -184,10 +184,16 @@ fi
 
 # ── 2. 起 3 个 mock SOCKS5 出口 ──
 LOGA="$WORK/a.log"; LOGB="$WORK/b.log"; LOGD="$WORK/d.log"
-: > "$LOGA"; : > "$LOGB"; : > "$LOGD"
+# 就绪探测**自己一个出口、自己一份日志**: 它的记录不能混进 A/B/D —— 否则
+# "错误出口必须为空"与 MATCH 兜底那几条断言会被探测流污染。
+LOGR="$WORK/r.log"
+: > "$LOGA"; : > "$LOGB"; : > "$LOGD"; : > "$LOGR"
 python3 "$HERE/mock_socks.py" 11080 "$LOGA" & PIDS+=($!)
 python3 "$HERE/mock_socks.py" 11081 "$LOGB" & PIDS+=($!)
 python3 "$HERE/mock_socks.py" 11082 "$LOGD" & PIDS+=($!)
+python3 "$HERE/mock_socks.py" 11083 "$LOGR" & PIDS+=($!)
+# 本轮专属、可识别的探测标识: 同机并跑的两轮不会互相认领对方的记录。
+READY_SNI="rdy-$$-$(date +%s%N | tail -c 8).probe.test"
 
 # ── 3. 写 mihomo 测试配置: redir 入口 + sniffer 覆盖目的地, 按域名分流, 其余走 MATCH ──
 # (JSON 即合法 YAML —— 与生产渲染出的 /etc/mihomo/config.yaml 同一形态)
@@ -203,9 +209,11 @@ cat > "$WORK/cfg.yaml" <<'JSON'
   "proxies": [
     { "name": "exitA",       "type": "socks5", "server": "127.0.0.1", "port": 11080 },
     { "name": "exitB",       "type": "socks5", "server": "127.0.0.1", "port": 11081 },
-    { "name": "exitDefault", "type": "socks5", "server": "127.0.0.1", "port": 11082 }
+    { "name": "exitDefault", "type": "socks5", "server": "127.0.0.1", "port": 11082 },
+    { "name": "exitReady",   "type": "socks5", "server": "127.0.0.1", "port": 11083 }
   ],
   "rules": [
+    "DOMAIN-SUFFIX,__READY_SNI__,exitReady",
     "DOMAIN-SUFFIX,alpha.test,exitA",
     "DOMAIN-SUFFIX,beta.test,exitB",
     "DOMAIN-SUFFIX,mtalk.google.com,exitB",
@@ -214,16 +222,11 @@ cat > "$WORK/cfg.yaml" <<'JSON'
 }
 JSON
 
+# 占位符换成本轮那个唯一 SNI(配置本体仍是静态 heredoc, 只有这一处随轮次变)
+sed -i "s/__READY_SNI__/$READY_SNI/" "$WORK/cfg.yaml"
 "$MH" -t -d "$WORK" -f "$WORK/cfg.yaml" || fail "mihomo -t 未通过(配置无效)"
 "$MH" -d "$WORK" -f "$WORK/cfg.yaml" > "$WORK/mh.out" 2>&1 & PIDS+=($!)
 
-# 等入口端口就绪
-ready=0
-for _ in $(seq 1 50); do
-  if python3 -c 'import socket,sys; s=socket.socket(); s.settimeout(.2); sys.exit(0 if s.connect_ex(("127.0.0.1",18443))==0 else 1)'; then ready=1; break; fi
-  sleep 0.1
-done
-[[ "$ready" == 1 ]] || { dump_mihomo; fail "mihomo 入口 :18443 未就绪"; }
 
 # ── 4. 各 SNI 断言落到正确出口(只比对 host, 端口随入口口子) ──
 # 出口为空 = 连接在进入路由前就没了。mihomo 在那条路上一个字都不打(handleRedir 里
@@ -263,13 +266,81 @@ diag_empty_exits(){
 }
 
 check_case(){  # $1=SNI $2=期望日志文件 $3=出口名
-  local sni="$1" log="$2" name="$3"
-  python3 "$HERE/sni_client.py" 127.0.0.1 18443 "$sni"
+  local sni="$1" log="$2" name="$3" cli crc lp t0
+  t0="$(python3 -c 'import time;print("%.3f" % time.monotonic())')"
+  # 客户端的 rc/stdout/stderr 一律收下 —— 原来这里直接丢弃, 于是"连接被静默关掉"和
+  # "分流到错出口"在失败信息里长得一模一样。注意**不拿它当判据**: 按真实协议, mock 从不说
+  # TLS, 握手以 EOF/reset 结束是预期终止; 分流对不对只由出口记录说了算(见 sni_client.py 的
+  # 成功契约)。这里收它是为了让失败时说得清是哪一层。
+  cli="$(python3 "$HERE/sni_client.py" 127.0.0.1 18443 "$sni" 2>&1)"; crc=$?
   for _ in $(seq 1 30); do grep -q "^${sni}:" "$log" 2>/dev/null && { note "  $sni → $name ✓"; return 0; }; sleep 0.1; done
+  echo "---- 本次流取证(只读) ----" >&2
+  echo "  用例标识: sni=$sni 目标=127.0.0.1:18443 期望出口=$name" >&2
+  echo "  单调时间: 发起 $t0 → 判定 $(python3 -c 'import time;print("%.3f" % time.monotonic())')" >&2
+  echo "  客户端  : rc=$crc  ${cli:-(无输出)}" >&2
+  lp="$(sed -n 's/.*local=\([0-9.]*:[0-9]*\).*/\1/p' <<<"$cli" | tail -1)"
+  if [[ -n "$lp" ]]; then
+    echo "  核心日志中与本次流(${lp})相关的行: $(grep -c -- "${lp##*:}" "$WORK/mh.out" 2>/dev/null || echo 0) 条" >&2
+    grep -- "${lp##*:}" "$WORK/mh.out" 2>/dev/null | sed 's/^/    /' >&2
+  else
+    echo "  客户端没报出本地地址 —— 无法把本次流关联到核心日志" >&2
+  fi
+  echo "  各出口接收记录: A='$(tr '\n' ' ' <"$LOGA")' B='$(tr '\n' ' ' <"$LOGB")' D='$(tr '\n' ' ' <"$LOGD")' R(就绪专用)='$(tr '\n' ' ' <"$LOGR")'" >&2
+  echo "  核心 accepted socket 的 SO_ORIGINAL_DST 结果: **未直接观测**(要改核心才看得到)" >&2
+  echo "---- 本次流取证结束 ----" >&2
   if [[ ! -s "$LOGA" || ! -s "$LOGB" || ! -s "$LOGD" ]]; then diag_empty_exits; fi
   dump_mihomo
   fail "SNI=$sni 未按预期到达 $name (A='$(tr '\n' ' ' <"$LOGA")' B='$(tr '\n' ' ' <"$LOGB")' D='$(tr '\n' ' ' <"$LOGD")')"
 }
+
+# ── 就绪: 必须证明**本轮这条真实流**走通了入口, 而不是端口 bind 上了 ─────────────
+# 原判据是 connect_ex 到 18443 —— 它只证明 bind+listen。实测(隔离环境, 3/3 组)
+# conntrack 前提缺失时 mihomo 照样 accept 后静默 close, 而 connect_ex **仍然返回成功**,
+# 于是测试带着一个死掉的入口往下跑, 把 alpha.test 报成"域名规则分流错误"。
+#
+# 现在分两段, 共用原来那 5 秒预算(50×0.1s), 不放宽:
+#   1) 端口 bind —— 便宜的前置条件;
+#   2) **经同一个 TCP redir 入口**打一条带本轮唯一 SNI 的真实流, 它必须出现在就绪专属出口的
+#      日志里。到不了就报"入口未就绪", 不再误报成 SNI 分流错误。
+# 只认本轮这条探测流: 不看 [TCP]/[Sniffer] 日志条数, 也不拿别的连接或旧 exitDefault 记录顶替。
+READY_DEADLINE=$(python3 -c 'import time;print(time.monotonic()+5)')
+_before_deadline(){ python3 -c "import time,sys;sys.exit(0 if time.monotonic() < $READY_DEADLINE else 1)"; }
+
+ready=0
+while _before_deadline; do
+  if python3 -c 'import socket,sys; s=socket.socket(); s.settimeout(.2); sys.exit(0 if s.connect_ex(("127.0.0.1",18443))==0 else 1)'; then ready=1; break; fi
+  sleep 0.1
+done
+[[ "$ready" == 1 ]] || { dump_mihomo; fail "mihomo 入口 :18443 端口未 bind(连 connect 都不通)"; }
+
+READY_HIT=0; READY_TRIES=0; READY_CLI=""
+while _before_deadline; do
+  READY_TRIES=$((READY_TRIES+1))
+  READY_CLI="$(python3 "$HERE/sni_client.py" 127.0.0.1 18443 "$READY_SNI" 2>&1)"; READY_RC=$?
+  for _ in $(seq 1 5); do
+    grep -q "^${READY_SNI}:" "$LOGR" 2>/dev/null && { READY_HIT=1; break; }
+    sleep 0.1
+  done
+  [[ "$READY_HIT" == 1 ]] && break
+done
+if [[ "$READY_HIT" != 1 ]]; then
+  echo "---- 就绪失败取证(只读) ----" >&2
+  echo "  本轮探测 SNI : $READY_SNI (目标 127.0.0.1:18443 → 期望出口 exitReady :11083)" >&2
+  echo "  探测次数     : $READY_TRIES  最后一次客户端: ${READY_CLI:-(无输出)} rc=${READY_RC:-?}" >&2
+  echo "  就绪出口记录 : '$(tr '\n' ' ' <"$LOGR")'" >&2
+  echo "  其它出口记录 : A='$(tr '\n' ' ' <"$LOGA")' B='$(tr '\n' ' ' <"$LOGB")' D='$(tr '\n' ' ' <"$LOGD")'" >&2
+  _rl="$(sed -n 's/.*local=\([0-9.]*:[0-9]*\).*/\1/p' <<<"$READY_CLI" | tail -1)"
+  if [[ -n "$_rl" ]]; then
+    echo "  核心日志中与本探测流(${_rl})相关的行: $(grep -c -- "${_rl##*:}" "$WORK/mh.out" 2>/dev/null || echo 0) 条" >&2
+    grep -- "${_rl##*:}" "$WORK/mh.out" 2>/dev/null | sed 's/^/    /' >&2
+  fi
+  echo "  说明: 核心 accepted socket 的 SO_ORIGINAL_DST 结果**未直接观测**(要改核心才看得到)。" >&2
+  echo "---- 就绪失败取证结束 ----" >&2
+  diag_empty_exits
+  dump_mihomo
+  fail "入口未就绪: 本轮探测流 $READY_SNI 没有到达 exitReady —— 入口只 LISTEN 但没能处理连接, 不是 SNI 分流问题"
+fi
+note "入口就绪已证明: 探测流 $READY_SNI 经 :18443 到达 exitReady(第 $READY_TRIES 次; 客户端 $READY_CLI)"
 
 note "用例: 按 SNI 分流"
 check_case alpha.test "$LOGA" "exitA(域名规则)"

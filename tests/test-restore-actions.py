@@ -188,7 +188,6 @@ CASES = (
     ("ruleset:a.json", ("restart:mihomo",)),
     ("mosdns_conf", ("restart:mosdns",)),
     ("mosdns_rule:custom_direct.txt", ("restart:mosdns",)),
-    ("mitm_hijack", ("restart:mosdns",)),
     ("cert_fullchain", ("restart:mosdns",)),
     ("cert_privkey", ("restart:mosdns",)),
     ("nftables_conf", ("nft:apply",)),
@@ -211,7 +210,11 @@ if tx.actions_for_targets(["mosdns_conf", "model"]) == tx.actions_for_targets(["
     ok("映射: 与输入顺序无关(可测试的固定顺序)")
 else:
     bad("顺序依赖输入")
-for bad_t in ("mitm_json", "unknown_target", "ruleset:../x", "mosdns_rule:/etc/passwd"):
+# mitm_json / mitm_hijack 随 WLOC 退役从白名单里撤了 —— 它们现在落在"未知目标"这一类,
+# 与其它未知目标一样必须 fail-closed。这一格因此**变强**了: 以前 mitm_json 只是"需要显式
+# 声明动作", 现在它连目标都不是。
+for bad_t in ("mitm_json", "mitm_hijack", "unknown_target", "ruleset:../x",
+              "mosdns_rule:/etc/passwd"):
     try:
         tx.actions_for_targets([bad_t])
         bad("未知/需显式的目标没有 fail-closed: %s" % bad_t)

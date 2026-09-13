@@ -82,8 +82,10 @@ class Box:
         with open(self.root + "/etc/mosdns/config.yaml", "w") as f:
             f.write("log:\n  level: info\n")
 
-    def gen(self, host="dot.example.com", ca=b""):
-        return self.s.generate(host, "203.0.113.10", (), ca, bool(ca), TMPL,
+    def gen(self, host="dot.example.com"):
+        # WLOC 退役: 生成路径不再接受根证书, 夹具去掉 ca 这一维。这一支验的东西
+        # 与产物里有没有根证书无关, 判据本身一条没动。
+        return self.s.generate(host, "203.0.113.10", (), TMPL,
                                self.meta, self.art, True, False)
 
     def p(self, rel):
@@ -117,15 +119,15 @@ CA_C = iosprofile.ca_der_from_pem(open(mkca("PDG CA C"), encoding="utf-8").read(
 def rev1_source():
     """一台只走到 rev1 的机器: 记录里没有 previous, 盘上也没有。"""
     src = Box()
-    src.gen(ca=CA_A)
+    src.gen()
     return src
 
 
 def victim_rev2(box=None):
     """一台已经走到 rev2 的机器: 记录里有 previous, 盘上也有。"""
     v = box or Box()
-    v.gen(ca=CA_B)
-    v.gen(host="dot.v2.example", ca=CA_C)
+    v.gen()
+    v.gen(host="dot.v2.example")
     return v
 
 
@@ -333,7 +335,7 @@ else:
 print()
 print("══ 二、记录里没有 current: 两份产物都要删掉 ══")
 blank = Box()
-blank.gen(ca=CA_A)
+blank.gen()
 raw = json.load(open(blank.meta, encoding="utf-8"))
 raw["current"] = None
 raw["previous"] = None

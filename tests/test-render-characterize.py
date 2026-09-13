@@ -165,25 +165,11 @@ bot.RS_META = os.path.join(work, "does-not-exist.json")
 eq("_mihomo_rulesets(meta=...): 显式传入时不读盘", bot._mihomo_rulesets(META), EXPECT_RULESETS)
 bot.RS_META = RS_META_PATH
 
-# ══ 3. _mitm_domains: 平台门控 + 文件三态 ══════════════════════════════════
-print()
-print("── 3. _mitm_domains(平台 × 文件状态)──")
-HJ = os.path.join(work, "mitm_hijack.txt")
-bot.MITM_HIJACK_FILE = HJ                        # ← 既有 monkeypatch 点
-open(HJ, "w").write("domain:gs-loc.apple.com\n# 注释\n\ndomain:gs-loc-cn.apple.com\n")
-_plat = bot._platform
-try:
-    bot._platform = lambda: "android"
-    eq("_mitm_domains: Android 平台恒空(不看文件)", bot._mitm_domains(), [])
-    bot._platform = lambda: "ios"
-    eq("_mitm_domains: iOS + 文件存在 → 去 domain: 前缀, 跳过注释与空行",
-       bot._mitm_domains(), ["gs-loc.apple.com", "gs-loc-cn.apple.com"])
-    open(HJ, "w").write("")
-    eq("_mitm_domains: iOS + 空文件 → []", bot._mitm_domains(), [])
-    os.remove(HJ)
-    eq("_mitm_domains: iOS + 文件不存在 → [](不抛异常)", bot._mitm_domains(), [])
-finally:
-    bot._platform = _plat
+# ══ 3. (已退役)─────────────────────────────────────────────────────────────
+# 这里原本刻画 _mitm_domains 的"平台门控 × 文件三态"。WLOC 位置改写连同它专属的 MITM
+# 执行能力已退役: 渲染器不再读那份接管表, 这个函数也不存在了。
+# "残留的接管表不该把 MITM 路由长回来"这条判据搬到了 tests/test-wloc-retire-surface.py,
+# 那里从行为侧盯着 —— 比在这里刻画一个已经没有调用方的纯函数有用。
 
 # ══ 4. 整链渲染: 逐字节 + dropped / unknown_proxies ════════════════════════
 print()
@@ -200,12 +186,12 @@ BASE_MODEL = {
 }
 
 
-def render(model, meta=None, mitm=None, platform="android"):
+def render(model, meta=None, platform="android"):
     """固定所有环境输入后渲染 —— 结果必须只由入参决定(不受本机 /etc 影响)。"""
     _p = bot._platform
     bot._platform = lambda: platform
     try:
-        return bot._render_mihomo_bytes(model, rs_meta=meta, mitm_domains=mitm or [])
+        return bot._render_mihomo_bytes(model, rs_meta=meta)
     finally:
         bot._platform = _p
 

@@ -83,7 +83,7 @@ def seed(root, host="dot.seed.example"):
     code = (
         "import sys; sys.path.insert(0, %r)\n"
         "import iosstate as S\n"
-        "S.generate(%r, '203.0.113.10', (), b'', False, %r)\n" % (BOTDIR, host, TMPL))
+        "S.generate(%r, '203.0.113.10', (), %r)\n" % (BOTDIR, host, TMPL))
     r = subprocess.run([sys.executable, "-c", code], env=env_for(root),
                        capture_output=True, text=True, timeout=180)
     assert r.returncode == 0, r.stderr[-300:]
@@ -119,7 +119,7 @@ def patched(path=None):
 S.load = patched
 out = {"ok": False}
 try:
-    meta, lv, why, data, changed = S.generate(%(host)r, "203.0.113.10", (), b"", False, %(tmpl)r)
+    meta, lv, why, data, changed = S.generate(%(host)r, "203.0.113.10", (), %(tmpl)r)
     out = {"ok": True, "rev": meta["current"]["revision"],
            "host": meta["current"]["inputs"]["dot_host"],
            "sha": meta["current"]["sha256"]}
@@ -136,7 +136,7 @@ def run_plain(root, host):
         "import iosstate as S\n"
         "out={'ok':False}\n"
         "try:\n"
-        "    m,l,w,d,c = S.generate(%r, '203.0.113.10', (), b'', False, %r)\n"
+        "    m,l,w,d,c = S.generate(%r, '203.0.113.10', (), %r)\n"
         "    out={'ok':True,'rev':m['current']['revision'],"
         "'host':m['current']['inputs']['dot_host'],'sha':m['current']['sha256']}\n"
         "except Exception as e:\n"
@@ -226,7 +226,7 @@ def patched(path=None):
 S.load = patched
 out = {"ok": False}
 try:
-    m = S.repair_current(b"", %(tmpl)r)
+    m = S.repair_current(%(tmpl)r)
     out = {"ok": True, "rev": m["current"]["revision"]}
 except Exception as e:
     out = {"ok": False, "err": type(e).__name__, "msg": str(e)[:120]}
