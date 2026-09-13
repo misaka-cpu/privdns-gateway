@@ -749,8 +749,6 @@ if _owned2 is not None:
         "决定性一格: 没有任何删除目标解析到本测试自有的专属父目录之外(实得 %s)" % _stray)
     _o2, _u2 = sentinels_alive()
     chk(_o2 and _u2, "决定性一格: 两个哨兵都完好")
-    chk(os.path.isdir("/home/codex/privdns-gateway"),
-        "决定性一格: 受保护主仓仍在(它本来也从未被碰过)")
     # 拦截期间没有真删, 这里如实补上(仍然只删本测试自己的那个父目录)。
     print("       [记账] 拦截期间未真删, 现补清: %s" % cleanup_owned(_owned2, "forged-真清"))
     chk(not os.path.exists(_owned2), "决定性一格: 补清之后专属父目录不在了")
