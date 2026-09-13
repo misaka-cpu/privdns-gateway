@@ -468,11 +468,118 @@ print("       [记账] 执行器收尾: 未确认(受控注入) ｜ 测试兜底
 
 
 # ── C2. 停机要一直传到驱动层: 后续变异不得开跑 ──
-KEPT_CLEANED = []      # C2 触发停机后, 由本测试收掉的"留现场"目录
+# ── C2 的临时目录: 归属先于清理 ───────────────────────────────────────────────
+#
+# 上一版从子负控的日志里**读出**一条路径就 rmtree 它, 只检查 startswith(临时目录)。
+# 受控复核(删除调用全部拦截)证明这条通道给得太宽:
+#     "现场保留在 /tmp/../home/codex/privdns-gateway" → 它真的把受保护主仓选成了删除目标。
+# 换成 commonpath 也只能证明"在整个 /tmp 里", 证明不了"这个目录是本测试造的"。
+#
+# 所以干脆取消"日志内容赋予删除权限"这条通道:
+#   · C2 开跑前, 由本测试建一个**唯一、专属**的父目录, 路径从创建那一刻就握在手里;
+#   · 子负控的 TMPDIR 指到这个父目录(实测: tmpguard.mkdtemp 不传 dir 时走
+#     tempfile.gettempdir(), 它认 TMPDIR) —— 只改这一个子进程的环境, 不动全局临时目录配置;
+#   · 要删的永远只有这个父目录本身, 而不是日志里说的任何东西;
+#   · 日志只用来**核对**"现场确实落在这个父目录里", 核对结果单独记账。核对失败不影响
+#     清理本测试自己明确拥有、且已无进程使用的那个父目录 —— 那两件事互不代偿。
+C2_OWNED = []        # 事先创建、能证明归属的父目录; 删除目标只可能来自这里
+C2_LOGCHECK = []     # 日志核对结果(与删除授权无关)
+C2_CLEANED = []      # 实际清理结果, 逐条核实
+
+
+def _report_paths(out):
+    """从报告里取出它点名的现场路径。纯解析, 不产生任何删除目标。"""
+    return [ln.split("现场保留在 ", 1)[1].split("(")[0].strip()
+            for ln in out.splitlines() if "现场保留在 " in ln]
+
+
+def _verify_reported(owned, out):
+    """核对报告点名的现场是不是**本轮这个专属父目录**里的东西。返回 (是否核对通过, 结论)。"""
+    hits = _report_paths(out)
+    if len(hits) != 1:
+        return False, "报告里有 %d 条现场路径(应恰好 1 条), 不作数" % len(hits)
+    raw = hits[0]
+    real_owned, real = os.path.realpath(owned), os.path.realpath(raw)
+    if os.path.islink(raw):
+        return False, "报告路径是符号链接, 不认"
+    if real == real_owned:
+        return False, "报告指向专属父目录本身, 而不是它下面的现场"
+    if os.path.commonpath([real, real_owned]) != real_owned:
+        return False, "报告路径解析后落在专属父目录之外: %s" % real
+    if not os.path.isdir(real):
+        return False, "报告路径不是一个真实目录: %s" % raw
+    return True, "现场在专属父目录内: %s" % os.path.relpath(real, real_owned)
+
+
+def _users_of(path):
+    """还有哪些进程的 cwd 或已打开的 fd 落在 path 下。用来确认"确实没人在用了"。"""
+    real = os.path.realpath(path) + os.sep
+    found = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            if (os.path.realpath("/proc/%s/cwd" % entry) + os.sep).startswith(real):
+                found.append(entry + ":cwd")
+                continue
+            for fd in os.listdir("/proc/%s/fd" % entry):
+                if (os.path.realpath("/proc/%s/fd/%s" % (entry, fd)) + os.sep).startswith(real):
+                    found.append("%s:fd%s" % (entry, fd))
+                    break
+        except OSError:
+            continue
+    return found
+
+
+def _wait_unused(path, budget=10):
+    """有界等到没人用这个目录。不因为"日志打了一行"就假定进程已经结束。"""
+    t0 = time.monotonic()
+    while True:
+        users = _users_of(path)
+        if not users:
+            return True, "无进程占用"
+        if time.monotonic() - t0 >= budget:
+            return False, "%ds 后仍有进程占用: %s" % (budget, users[:3])
+        time.sleep(0.05)
+
+
+def _rmtree_owned(path):
+    """删掉本测试自己创建的那个父目录, 并**核实结果**。
+
+    不用 ignore_errors —— 那会把"删失败了"和"本来就没有"混成一句话。
+    rmtree 遇到目录内的符号链接是 unlink 掉它, 不会顺着链接删外面的东西; §4 有哨兵钉着这条。
+    """
+    if not os.path.isdir(path):
+        return "已不在"
+    try:
+        shutil.rmtree(path)
+    except OSError as e:
+        return "清理失败(%s)" % e
+    return "已删除" if not os.path.exists(path) else "调用了 rmtree 但目录仍在"
+
+
+def cleanup_owned(owned, label="C2", record=True):
+    """清理本测试事先掌握的那个父目录: 先确认没人用, 再删, 再核实。
+
+    record=False 用于"删除调用被拦截"的那一格 —— 那一次本来就不会真删, 记进账本会把
+    "拦截"和"清理失败"混为一谈。
+    """
+    free, why = _wait_unused(owned)
+    if not free:
+        if record:
+            C2_CLEANED.append((owned, "未清理(%s)" % why))
+        return "未清理(%s)" % why
+    how = _rmtree_owned(owned)
+    if record:
+        C2_CLEANED.append((owned, how))
+    return how
 
 
 def run_negctl_patched(patches, plan="healthy", phase=""):
-    """在假仓库里给负控**副本**打补丁再整支跑 —— 补丁只落在测试自有的副本上。"""
+    """在假仓库里给负控**副本**打补丁再整支跑 —— 补丁只落在测试自有的副本上。
+
+    返回 (rc, 输出, 本次专属父目录)。子负控的一切临时目录都落在那个父目录里。
+    """
     dest = build_fake()
     f = dest / "tests" / "negctl" / NEGCTL.name
     txt = f.read_text(encoding="utf-8")
@@ -481,25 +588,22 @@ def run_negctl_patched(patches, plan="healthy", phase=""):
             return None, "锚点命中 %d 次: %s" % (txt.count(old), old[:40])
         txt = txt.replace(old, new, 1)
     f.write_text(txt, encoding="utf-8")
-    env = dict(os.environ, STUB_PLAN=plan, STUB_BREAK_PHASE=phase)
-    env.pop("TMPDIR", None)
+    # 专属父目录: 路径从**创建**那一刻就握在手里, 后面要删的只可能是它。
+    owned = tmpguard.mkdtemp(prefix="pdg-negexec-c2own.")
+    C2_OWNED.append(owned)
+    # 只改这一个子进程的 TMPDIR —— 子负控的 tmpguard.mkdtemp 不传 dir, 走 gettempdir(),
+    # 于是它建的每个目录(含停机时故意留下的现场)都落在 owned 里。全局配置不受影响。
+    env = dict(os.environ, STUB_PLAN=plan, STUB_BREAK_PHASE=phase, TMPDIR=owned)
     env.pop(tmpguard.KEEP_ENV, None)
     r = subprocess.run([sys.executable, str(f)], cwd=str(dest), capture_output=True,
                        text=True, timeout=600, env=env)
     out = r.stdout + r.stderr
-    # 停机路径**故意**保留现场(PDG_KEEP_TMP), 那是它该有的行为。但那份现场是本测试的
-    # 子进程造出来的, 归本测试收 —— 否则每跑一次就在 /tmp 留一个目录。
-    # 只清报告里点名的那一个路径, 不按前缀扫(那会删掉并发跑的别人的沙箱)。
-    for ln in out.splitlines():
-        if "现场保留在 " in ln:
-            leftover = ln.split("现场保留在 ", 1)[1].split("(")[0].strip()
-            if leftover.startswith(tempfile.gettempdir() + os.sep) and os.path.isdir(leftover):
-                shutil.rmtree(leftover, ignore_errors=True)
-                KEPT_CLEANED.append(leftover)
-    return r.returncode, out
+    # 日志只用来**核对**, 不用来挑删除目标。核不过就如实记一笔, 不改变任何删除行为。
+    C2_LOGCHECK.append(_verify_reported(owned, out))
+    return r.returncode, out, owned
 
 
-rc, out = run_negctl_patched(
+rc, out, c2_owned = run_negctl_patched(
     [("SUITE_TIMEOUT = 900", "SUITE_TIMEOUT = 3"),
      ("def _confirm_group_gone(pgid, budget=REAP_BUDGET):",
       "def _confirm_group_gone(pgid, budget=REAP_BUDGET):\n"
@@ -529,7 +633,132 @@ for _label, _body, _want, _rc in (
         % (_label, _want, _rc, res.status, res.rc, res.halt))
 
 
-# ══ 4. 收尾 ════════════════════════════════════════════════════════════════
+# ══ 4. 清理的边界: 删谁由归属决定, 不由日志决定 ═════════════════════════════
+print()
+print("══ 4. C2 现场清理的边界 ══")
+# 上一版从子负控的日志里读一条路径就删它, 只检查 startswith(临时目录)。受控复核(删除调用
+# 全部拦截)证明这条通道能把 "/tmp/../home/codex/privdns-gateway" 选成删除目标。
+# 现在删除目标只可能是本测试**事先创建**的那个专属父目录; 日志降级成核对材料。
+# 所有危险反例只用两种方式跑: 拦截并记录删除调用, 或者全自有的哨兵目录。
+
+# 造哨兵: 一个在专属父目录**外面**(供符号链接逃逸用), 一个是系统临时目录里的无关目录。
+_out_sent = tmpguard.mkdtemp(prefix="pdg-negexec-outside.")
+Path(_out_sent, "SENTINEL").write_text("外部哨兵: 必须活下来\n", encoding="utf-8")
+_unrelated = tmpguard.mkdtemp(prefix="pdg-negexec-unrelated.")
+Path(_unrelated, "SENTINEL").write_text("无关目录哨兵: 必须活下来\n", encoding="utf-8")
+
+
+def sentinels_alive():
+    return (Path(_out_sent, "SENTINEL").exists(), Path(_unrelated, "SENTINEL").exists())
+
+
+# ── A. 合法路径: 真实停机现场确实落在专属父目录里, 并且能被正常清掉 ──
+_ok_log, _why = C2_LOGCHECK[-1] if C2_LOGCHECK else (False, "没有核对记录")
+chk(_ok_log, "A 日志核对: 报告点名的现场确实在本轮专属父目录内(%s)" % _why)
+_inside = sorted(os.listdir(c2_owned)) if os.path.isdir(c2_owned) else []
+chk(_inside, "A 停机现场真的留在专属父目录里(%s)" % (_inside[:2] or "空"))
+_reported = _report_paths(out)
+chk(len(_reported) == 1
+    and os.path.commonpath([os.path.realpath(_reported[0]), os.path.realpath(c2_owned)])
+    == os.path.realpath(c2_owned),
+    "A 子负控确实被圈在专属父目录里(TMPDIR 生效, 报告路径 %s)"
+    % (os.path.relpath(_reported[0], c2_owned) if _reported else "无"))
+
+# 符号链接逃逸的哨兵: 放在**将被删除**的父目录里, 指向外面。
+os.symlink(_out_sent, os.path.join(c2_owned, "escape-link"))
+
+_how = cleanup_owned(c2_owned, "A")
+chk(_how == "已删除",
+    "A 清理结果经核实(实得 %s) —— 不是「调用过 rmtree」就算数" % _how)
+chk(not os.path.exists(c2_owned), "A 专属父目录确已不在")
+_o, _u = sentinels_alive()
+chk(_o, "D 符号链接逃逸: 删父目录没有顺着链接删掉外部哨兵")
+chk(Path(_out_sent).is_dir(), "D 外部目录本身仍在")
+chk(_u, "C 无关目录(同在系统临时目录内)的哨兵完好")
+
+# ── B/C/D/E. 伪造日志一律不改变删除目标 ──
+# 这几格是**纯核对**: _verify_reported 不产生删除目标, 只给结论。
+_probe_owned = tmpguard.mkdtemp(prefix="pdg-negexec-probe.")
+_scene = os.path.join(_probe_owned, "pdg-lockid-negctl.fake")
+os.makedirs(_scene)
+os.symlink(_out_sent, os.path.join(_probe_owned, "link-out"))
+
+# `..` 越界: 从专属父目录走出去, 落到本测试自己的外部哨兵上。用自有目录而不是真实主仓 ——
+# 首份红灯里那次"解析到受保护主仓"的机制复现是在删除调用全程拦截下做的(见归档 10-red-first),
+# 提交进来的用例不拿受保护对象当实验材料。
+_ESCAPE = os.path.join(_probe_owned, "..", os.path.basename(_out_sent))
+
+FORGED = [
+    ("B  .. 越界(解析后落到专属父目录之外)",
+     "       ①: 现场保留在 %s(收尾未确认)" % _ESCAPE, "之外"),
+    ("C  无关目录(在系统临时目录内但不属于本次)",
+     "       ①: 现场保留在 %s(收尾未确认)" % _unrelated, "之外"),
+    ("D  符号链接",
+     "       ①: 现场保留在 %s(收尾未确认)" % os.path.join(_probe_owned, "link-out"), "符号链接"),
+    ("E1 父目录冒充子目录",
+     "       ①: 现场保留在 %s(收尾未确认)" % _probe_owned, "父目录本身"),
+    ("E2 报告缺失", "[FAIL] ①: 收尾**未完成**", "应恰好 1 条"),
+    ("E3 报告歧义(两条互相矛盾)",
+     "       ①: 现场保留在 %s(x)\n       ②: 现场保留在 %s(x)" % (_scene, _ESCAPE),
+     "应恰好 1 条"),
+]
+for _label, _log, _want in FORGED:
+    _got_ok, _got_why = _verify_reported(_probe_owned, _log)
+    chk(_got_ok is False and _want in _got_why,
+        "%s → 核对拒绝, 理由含「%s」(实得 %s)" % (_label, _want, _got_why[:56]))
+_got_ok, _got_why = _verify_reported(_probe_owned, "       ①: 现场保留在 %s(ok)" % _scene)
+chk(_got_ok, "A2 合法现场仍被接受 —— 不是「一律拒绝」的假修复(%s)" % _got_why)
+
+# ── 决定性一格: 端到端证明日志内容改变不了实际删除目标 ──
+# 给负控副本再打一行补丁, 让它**额外打印**几条伪造的"现场保留在"(含指向受保护主仓的那条),
+# 然后把 shutil.rmtree 换成记录器跑一遍: 记到的删除目标必须只有本测试自己的专属父目录。
+_FORGE = ('    print("       ①: 现场保留在 %s(伪造)")\n'
+          '    print("       ①: 现场保留在 %s(伪造)")\n' % (_ESCAPE, _unrelated))
+_calls = []
+_real_rmtree = shutil.rmtree
+shutil.rmtree = lambda path, *a, **kw: _calls.append(os.path.abspath(path))
+try:
+    _rc2, _out2, _owned2 = run_negctl_patched(
+        [("SUITE_TIMEOUT = 900", "SUITE_TIMEOUT = 3"),
+         ("def _confirm_group_gone(pgid, budget=REAP_BUDGET):",
+          "def _confirm_group_gone(pgid, budget=REAP_BUDGET):\n"
+          "    return False, '注入: 无权确认进程组状态'\n\n\n"
+          "def _shelved_confirm(pgid, budget=REAP_BUDGET):"),
+         ('    print("-" * 62)', _FORGE + '    print("-" * 62)')],
+        plan="hang", phase="m1")
+    if _rc2 is None:
+        bad("决定性一格: 打不上补丁(%s)" % _out2)
+        _owned2 = None
+    else:
+        cleanup_owned(_owned2, "forged", record=False)     # 这一次删除调用被拦截, 不记账
+finally:
+    shutil.rmtree = _real_rmtree
+
+if _owned2 is not None:
+    chk(_ESCAPE in _out2 and _unrelated in _out2,
+        "决定性一格: 伪造的越界路径与无关目录确实出现在了日志里(注入生效)")
+    chk(_calls == [os.path.abspath(_owned2)],
+        "决定性一格: 实际删除目标只有本测试自己的专属父目录, 伪造路径一个都没进来(实得 %s)"
+        % [os.path.basename(c) for c in _calls])
+    _owned_roots = [os.path.realpath(d) for d in C2_OWNED]
+    _stray = [c for c in _calls
+              if not any(os.path.realpath(c) == r
+                         or os.path.commonpath([os.path.realpath(c), r]) == r
+                         for r in _owned_roots)]
+    chk(not _stray,
+        "决定性一格: 没有任何删除目标解析到本测试自有的专属父目录之外(实得 %s)" % _stray)
+    _o2, _u2 = sentinels_alive()
+    chk(_o2 and _u2, "决定性一格: 两个哨兵都完好")
+    chk(os.path.isdir("/home/codex/privdns-gateway"),
+        "决定性一格: 受保护主仓仍在(它本来也从未被碰过)")
+    # 拦截期间没有真删, 这里如实补上(仍然只删本测试自己的那个父目录)。
+    print("       [记账] 拦截期间未真删, 现补清: %s" % cleanup_owned(_owned2, "forged-真清"))
+    chk(not os.path.exists(_owned2), "决定性一格: 补清之后专属父目录不在了")
+
+shutil.rmtree(_probe_owned, ignore_errors=True)
+
+
+# ══ 5. 收尾 ════════════════════════════════════════════════════════════════
 print()
 kids = []
 for entry in os.listdir("/proc"):
@@ -542,8 +771,14 @@ for entry in os.listdir("/proc"):
     except (OSError, IndexError, ValueError):
         continue
 chk(not kids, "子进程: 本支起的进程都已回收(残留 pid %s)" % (kids or "无",))
-chk(KEPT_CLEANED and not [d for d in KEPT_CLEANED if os.path.exists(d)],
-    "临时目录: C2 停机留下的现场已由本测试收掉(%d 个, 无残留)" % len(KEPT_CLEANED))
+chk(C2_OWNED and not [d for d in C2_OWNED if os.path.exists(d)],
+    "临时目录: 本测试事先创建的 %d 个专属父目录都已清掉, 无残留" % len(C2_OWNED))
+chk(all(how == "已删除" for _p, how in C2_CLEANED) and C2_CLEANED,
+    "临时目录: 每一次清理的结果都经过核实(%s)"
+    % ", ".join(sorted({how for _p, how in C2_CLEANED})))
+print("       [记账] 被测清理(子负控自己的收尾): 见 §3 的 [记账] 行 ｜ "
+      "本测试兜底清理: 专属父目录 %d 个, 日志核对 %d 次(通过 %d)"
+      % (len(C2_OWNED), len(C2_LOGCHECK), sum(1 for okk, _ in C2_LOGCHECK if okk)))
 
 print()
 print("[SUM] OK=%d FAIL=%d" % (PASS[0], FAIL[0]))
