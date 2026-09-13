@@ -96,18 +96,66 @@ bash /usr/local/bin/pdg __migrate >$E2E_TMP/mig2.log 2>&1
 { cmp -s $E2E_TMP/m1 /etc/mosdns/config.yaml && cmp -s $E2E_TMP/s1 /etc/sing-box/config.json; } \
   && ok "二跑幂等(mosdns 与 model 均无变化)" || bad "二跑改动了配置"
 
-# ══ 场景二: 平台已确认 ios ══════════════════════════════════════════════════
-echo; echo "── 场景二: 同样的老机器, 但平台已确认 ios ──"
+# ══ 场景二: 平台已确认 ios, 且盘上还有老版 WLOC 的执行面 ════════════════════
+echo; echo "── 场景二: 同样的老机器, 但平台已确认 ios(带 WLOC 残留) ──"
 seed_old_box ios
+# 老版开过 WLOC 的机器: MITM 宿主、两个模块、服务在跑, 还有一张 CA 和用户填过的地点。
+# 只写制品本身(与 tests/test-wloc-retire-migration.sh 造旧态的做法一致) —— 不调用新版
+# 已删除的开启入口, 也不恢复任何签发能力。造完先自检, 否则"已撤除"什么都证明不了。
+install -d -m755 /opt/pdg-bot /etc/privdns-gateway/ca
+printf '[Unit]\nDescription=PDG MITM (retired)\n[Service]\nExecStart=/usr/bin/false\n' \
+  > /etc/systemd/system/pdg-mitm.service
+printf '# retired module (pre-image only)\n' > /opt/pdg-bot/mitm_server.py
+printf '# retired module (pre-image only)\n' > /opt/pdg-bot/mitm_wloc.py
+printf '%s\n' '{"wloc":{"enabled":true,"accuracy":50,"active":"大阪","generation":1,"locations":[{"name":"大阪","lat":34.6937,"lon":135.5023}]}}' \
+  > /etc/privdns-gateway/mitm.json
+printf -- '-----BEGIN CERTIFICATE-----\nretired-ca-material\n-----END CERTIFICATE-----\n' \
+  > /etc/privdns-gateway/ca/ca.crt
+mkdir -p "$E2E_TMP/e2e-svc"; echo 1 > "$E2E_TMP/e2e-svc/pdg-mitm.ac"; echo 1 > "$E2E_TMP/e2e-svc/pdg-mitm.en"
+_pre=1
+for f in /etc/systemd/system/pdg-mitm.service /opt/pdg-bot/mitm_server.py /opt/pdg-bot/mitm_wloc.py; do
+  [[ -e "$f" ]] || _pre=0
+done
+[[ "$(systemctl is-active pdg-mitm)" == active ]] || _pre=0
+[[ "$_pre" == 1 ]] && ok "iOS: 残留前像就位(三件制品在盘上, pdg-mitm 报 active)" \
+  || bad "iOS: WLOC 残留前像没造出来, 撤除相关判据不作数"
+
+: > "$E2E_TMP/e2e-calls.log"
 bash /usr/local/bin/pdg __migrate >$E2E_TMP/mig3.log 2>&1
 [[ "$(gms)" == 0 ]] && ok "iOS: GMS 入站被清理干净(iOS 走 APNs 用不到)" || bad "iOS 仍有 $(gms) 条 GMS 入站"
 { [[ -e /opt/pdg-bot/probe81.py ]] && [[ -e /etc/systemd/system/pdg-probe81.service ]]; } \
   && ok "iOS: iOS 组件保留" || bad "iOS 组件被误删"
 [[ ! -e /etc/privdns-gateway/platform.guessed ]] && ok "iOS: 已确认平台不打推测标记" || bad "已确认平台仍被当成推测"
-[[ -e /etc/systemd/system/pdg-mitm.service ]] && ok "iOS: 补上 pdg-mitm 服务(WLOC 服务宿主)" || bad "缺 pdg-mitm unit"
+# ── 退役契约: 迁移必须**撤除**执行面, 而不是补上 ──
+for f in /etc/systemd/system/pdg-mitm.service /opt/pdg-bot/mitm_server.py /opt/pdg-bot/mitm_wloc.py; do
+  [[ -e "$f" ]] && bad "iOS: 迁移后仍残留已退役的 $f" || ok "iOS: 已撤除 $(basename "$f")"
+done
+# "文件不在"不够: 服务必须真的停过, 且现在确实不在跑。
+grep -qE 'disable --now pdg-mitm|stop pdg-mitm' "$E2E_TMP/e2e-calls.log" \
+  && ok "iOS: 确实对 pdg-mitm 发过 stop/disable(有调用记录)" || bad "iOS: 没看到停服务的调用"
+[[ "$(systemctl is-active pdg-mitm)" != active ]] \
+  && ok "iOS: pdg-mitm 现在确实不在运行" || bad "iOS: pdg-mitm 还活着"
+# 保留策略: 旧 CA 不销毁, 而且必须给出手机端撤信任的提示。
+[[ -s /etc/privdns-gateway/ca/ca.crt ]] \
+  && ok "iOS: 旧 CA 材料按保留策略未删" || bad "iOS: 旧 CA 被迁移删掉了"
+grep -q '按保留策略未删' $E2E_TMP/mig3.log && ok "iOS: 迁移点名了盘上仍有 CA 材料" \
+  || bad "iOS: 没提示 CA 残留: $(tail -3 $E2E_TMP/mig3.log)"
+grep -q '取消对 PrivDNS Gateway' $E2E_TMP/mig3.log \
+  && ok "iOS: 给出了手机端撤销信任的指引(退役不会自动取消已给出的信任)" \
+  || bad "iOS: 缺撤信任提示"
+# 共享劫持锚点保留且休眠 —— 撤的是 WLOC 专属面, 不是 force_hijack 结构。
+[[ -e /etc/mosdns/rules/mitm_hijack.txt && ! -s /etc/mosdns/rules/mitm_hijack.txt ]] \
+  && ok "iOS: 共享劫持锚点仍在且为空(休眠, 没被一并删掉)" \
+  || bad "iOS: mitm_hijack.txt 状态不对"
 cp /etc/sing-box/config.json $E2E_TMP/s2
-bash /usr/local/bin/pdg __migrate >/dev/null 2>&1
+bash /usr/local/bin/pdg __migrate >$E2E_TMP/mig4.log 2>&1
 cmp -s $E2E_TMP/s2 /etc/sing-box/config.json && ok "iOS: 二跑幂等" || bad "iOS 二跑改动了 model"
+# 退役迁移自己也要幂等: 没有残留时二跑不该报错, 也不该把制品弄回来。
+_again=0
+for f in /etc/systemd/system/pdg-mitm.service /opt/pdg-bot/mitm_server.py /opt/pdg-bot/mitm_wloc.py; do
+  [[ -e "$f" ]] && _again=1
+done
+[[ "$_again" == 0 ]] && ok "iOS: 二跑后退役制品仍然不在(退役迁移幂等)" || bad "iOS: 二跑把退役制品弄回来了"
 
 # ══ 场景三: 已是新形态 + gfw 模式 → 劫持门必须保留 ═══════════════════════════
 echo; echo "── 场景三: 新形态 + gfw 模式 ──"

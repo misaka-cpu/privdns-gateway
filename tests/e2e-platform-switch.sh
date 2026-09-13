@@ -48,6 +48,26 @@ e2e_fetch_mihomo || e2e_skip "取不到 mihomo 二进制"
 e2e_write_nft_stub
 nft -f /etc/nftables.conf
 
+# WLOC 退役后这三样在**两个平台上**都不该存在(对应 pdg.sh 的 _PLAT_RETIRED)。
+RETIRED=(/opt/pdg-bot/mitm_server.py /opt/pdg-bot/mitm_wloc.py /etc/systemd/system/pdg-mitm.service)
+
+# 造一台"老版开过 WLOC"的机器的**残留前像**。
+# 只写制品本身(unit 文件 + 两个模块 + 一份带地点的 mitm.json + 一张 CA), 与
+# tests/test-wloc-retire-migration.sh 造旧态的做法一致 —— 不调用新版已删除的开启入口,
+# 也不恢复任何签发能力。前像是用来被**撤除**的, 造完立刻自检它确实存在。
+seed_retired_residue(){
+  install -d -m755 /opt/pdg-bot /etc/privdns-gateway/ca
+  printf '[Unit]\nDescription=PDG MITM (retired)\n[Service]\nExecStart=/usr/bin/false\n' \
+    > /etc/systemd/system/pdg-mitm.service
+  printf '# retired module (pre-image only)\n' > /opt/pdg-bot/mitm_server.py
+  printf '# retired module (pre-image only)\n' > /opt/pdg-bot/mitm_wloc.py
+  printf '%s\n' '{"wloc":{"enabled":true,"accuracy":50,"active":"大阪","generation":1,"locations":[{"name":"大阪","lat":34.6937,"lon":135.5023}]}}' \
+    > /etc/privdns-gateway/mitm.json
+  printf -- '-----BEGIN CERTIFICATE-----\nretired-ca-material\n-----END CERTIFICATE-----\n' \
+    > /etc/privdns-gateway/ca/ca.crt
+  echo 1 > "$E2E_TMP/e2e-svc/pdg-mitm.ac"; echo 1 > "$E2E_TMP/e2e-svc/pdg-mitm.en"
+}
+
 gms_in_nft(){ grep -qE 'tcp dport [{][^}]*5228' /etc/nftables.conf; }
 gms_in_ruleset(){ grep -qE 'tcp dport [{][^}]*5228' $E2E_TMP/e2e-nft-ruleset 2>/dev/null; }
 mitm_out_in_core(){ grep -q 'MITM-OUT' /etc/mihomo/config.yaml 2>/dev/null; }
@@ -59,45 +79,74 @@ out=$(pdg platform ios 2>&1); rc=$?
 [[ "$(cat /etc/privdns-gateway/platform)" == ios ]] && ok "platform 标记=ios" || bad "1b: 标记没改"
 grep -q '^PDG_PLATFORM=ios$' /etc/privdns-gateway/profile.env \
   && ok "profile.env 的 PDG_PLATFORM 同步为 ios" || bad "1c: profile.env 没同步: $(cat /etc/privdns-gateway/profile.env)"
+# iOS 必需件 = pdg.sh 的 _PLAT_IOS_REQUIRED 那四项 + 两个公共件。
+# WLOC 退役后 mitm_server.py / mitm_wloc.py / pdg-mitm.service **不再是 iOS 组件**,
+# 见 _PLAT_RETIRED: 它们在两个平台上都不该存在。
 for f in /etc/systemd/system/pdg-probe81.service /opt/pdg-bot/probe81.py \
-         /opt/pdg-bot/pdg-dot.mobileconfig.tmpl /opt/pdg-bot/mitm_server.py; do
+         /opt/pdg-bot/pdg-dot.mobileconfig.tmpl /opt/pdg-bot/iosprofile.py \
+         /opt/pdg-bot/iosstate.py /opt/pdg-bot/mitm_ca.py; do
   [[ -e "$f" ]] && ok "已部署 $(basename "$f")" || bad "1d: 缺 $f"
 done
 [[ "$(systemctl is-active pdg-probe81)" == active ]] \
   && ok "pdg-probe81 已启用并运行" || bad "1e: probe81 未运行"
-[[ "$(systemctl is-active pdg-mitm)" == active ]] \
-  && ok "pdg-mitm 已启用并运行" || bad "1f: pdg-mitm 未运行"
+# 退役后的契约: 切 iOS **不再**安装、启动、启用 WLOC 专属执行模块与 pdg-mitm。
+for f in "${RETIRED[@]}"; do
+  [[ -e "$f" ]] && bad "1f: 切 iOS 又把已退役的 $f 装回来了" || ok "未安装已退役的 $(basename "$f")"
+done
+[[ "$(systemctl is-active pdg-mitm)" != active ]] \
+  && ok "pdg-mitm 未运行(服务宿主已退役)" || bad "1f: pdg-mitm 竟然被起起来了"
 gms_in_nft && bad "1g: iOS 的防火墙里仍有 GMS 5228-5230" || ok "iOS: 防火墙已无 GMS 5228-5230"
 
-# ══ 2. WLOC 开启后切回 Android: 安全休眠 + 运行时接管彻底撤掉 ═════════════
-echo; echo "── 2. WLOC 开启状态下切回 Android ──"
-python3 - > $E2E_TMP/plat-wloc-on.out 2>&1 <<'PY'
-import sys; sys.path.insert(0, "/opt/pdg-bot")
-import bot
-w = {"enabled": True, "accuracy": 50, "active": "大阪", "generation": 1,
-     "locations": [{"name": "大阪", "lat": 34.6937, "lon": 135.5023}]}
-okr, msg = bot._mitm_transact(w)
-print(("OK|" if okr else "FAIL|") + (msg or ""))
-PY
-grep -q '^OK|' $E2E_TMP/plat-wloc-on.out && ok "先把 WLOC 开起来(真实事务)" || bad "2: 开 WLOC 失败: $(cat $E2E_TMP/plat-wloc-on.out)"
-mitm_out_in_core && ok "开启后 mihomo 配置里有 MITM-OUT(切换前的现场)" || bad "2b: MITM-OUT 没进内核配置"
+# ══ 2. 老版 WLOC 残留: 切平台必须撤除, 而且切回去也不复活 ═════════════════
+# WLOC 已退役, 开启入口(bot._mitm_transact)随之删除 —— 本节不再"先开起来", 而是按
+# 退役后真正要守的那条契约来: 一台老机器盘上可能还留着 MITM 宿主与 pdg-mitm 服务,
+# **任一方向的平台切换都必须把它们撤掉**, 且旧 CA 与用户地点数据按保留策略不销毁。
+echo; echo "── 2. 老版 WLOC 残留的撤除 ──"
+seed_retired_residue
+# 前像自检: 造不出来的话后面"已撤除"什么都证明不了。
+_pre_ok=1
+for f in "${RETIRED[@]}"; do [[ -e "$f" ]] || _pre_ok=0; done
+[[ -s /etc/privdns-gateway/mitm.json && -s /etc/privdns-gateway/ca/ca.crt ]] || _pre_ok=0
+[[ "$(systemctl is-active pdg-mitm)" == active ]] || _pre_ok=0
+[[ "$_pre_ok" == 1 ]] && ok "前像就位: 三件退役制品在盘上, pdg-mitm 报 active, CA 与地点数据都在" \
+  || bad "2: 残留前像没造出来, 这一节证明不了任何东西"
 
+: > "$E2E_TMP/e2e-calls.log"
 out=$(pdg platform android 2>&1); rc=$?
-[[ "$rc" == 0 ]] && ok "切回 Android 返回 0" || bad "2c: rc=$rc: $(tail -5 <<<"$out")"
-python3 -c "
-import json,sys
-c=json.load(open('/etc/privdns-gateway/mitm.json'))
-sys.exit(0 if c.get('wloc',{}).get('enabled') is False else 1)" \
-  && ok "WLOC 已安全休眠(enabled=false)" || bad "2d: WLOC 仍开着"
+[[ "$rc" == 0 ]] && ok "带着残留切回 Android 返回 0" || bad "2b: rc=$rc: $(tail -5 <<<"$out")"
+for f in "${RETIRED[@]}"; do
+  [[ -e "$f" ]] && bad "2c: 切平台后仍残留 $f" || ok "已撤除 $(basename "$f")"
+done
+# "文件不在"还不够: 服务必须**真的停过**, 而且现在确实不在跑。
+grep -qE 'disable --now pdg-mitm|stop pdg-mitm' "$E2E_TMP/e2e-calls.log" \
+  && ok "确实对 pdg-mitm 发过 stop/disable(有调用记录)" || bad "2d: 没看到停服务的调用"
+[[ "$(systemctl is-active pdg-mitm)" != active ]] \
+  && ok "pdg-mitm 现在确实不在运行" || bad "2d: pdg-mitm 还活着"
+# 保留策略: 旧 CA 与用户地点意图**不销毁**。
+[[ -s /etc/privdns-gateway/ca/ca.crt ]] && ok "旧 CA 材料按保留策略留在盘上(不销毁)" || bad "2e: CA 被删了"
 python3 -c "
 import json,sys
 c=json.load(open('/etc/privdns-gateway/mitm.json'))
 locs=[l['name'] for l in c.get('wloc',{}).get('locations',[])]
 sys.exit(0 if '大阪' in locs else 1)" \
-  && ok "地点数据保留(休眠不销毁)" || bad "2e: 地点被删了"
-[[ -s /etc/privdns-gateway/ca/ca.crt ]] && ok "MITM CA 保留" || bad "2f: CA 被删"
-[[ ! -s /etc/mosdns/rules/mitm_hijack.txt ]] && ok "接管域名已清空" || bad "2g: hijack 表还有内容"
-mitm_out_in_core && bad "2h: mihomo 配置里仍残留 MITM-OUT" || ok "mihomo 配置里的 MITM-OUT 已随平台切换清掉"
+  && ok "用户地点数据保留(撤除执行面不销毁用户意图)" || bad "2f: 地点数据被删了"
+# 运行时接管面必须干净: 不再有 MITM 专属出站/路由, 共享劫持锚点保持休眠(空文件)。
+mitm_out_in_core && bad "2g: mihomo 配置里仍有 MITM-OUT" || ok "内核配置里没有 MITM-OUT(渲染器不再产生)"
+[[ -e /etc/mosdns/rules/mitm_hijack.txt && ! -s /etc/mosdns/rules/mitm_hijack.txt ]] \
+  && ok "共享劫持锚点 mitm_hijack.txt 仍在且为空(休眠, 不是被删)" \
+  || bad "2h: mitm_hijack.txt 状态不对: $(ls -l /etc/mosdns/rules/mitm_hijack.txt 2>&1 | tail -1)"
+
+# 再来一次, 这回切**到 iOS** —— 退役必须与平台无关, 否则切一次平台就复活一次。
+seed_retired_residue
+: > "$E2E_TMP/e2e-calls.log"
+out=$(pdg platform ios 2>&1); rc=$?
+[[ "$rc" == 0 ]] && ok "带着残留切到 iOS 也返回 0" || bad "2i: rc=$rc: $(tail -5 <<<"$out")"
+_rev=0; for f in "${RETIRED[@]}"; do [[ -e "$f" ]] && _rev=1; done
+[[ "$_rev" == 0 ]] && ok "切到 iOS 同样撤除干净(退役与平台无关, 不会复活)" \
+  || bad "2j: 切回 iOS 让退役制品复活了"
+[[ "$(systemctl is-active pdg-mitm)" != active ]] \
+  && ok "切到 iOS 后 pdg-mitm 仍不在运行" || bad "2j: pdg-mitm 在 iOS 上又活了"
+pdg platform android >/dev/null 2>&1     # 回到 android, 供下一节检查 GMS
 
 # ══ 3. Android 侧的防火墙必须把 GMS 5228-5230 加回来 ═══════════════════════
 echo; echo "── 3. Android 的 GMS 端口 ──"
@@ -105,7 +154,7 @@ gms_in_nft && ok "Android: 防火墙配置里有 GMS 5228-5230" || bad "3: GMS �
 gms_in_ruleset && ok "Android: 运行中的 ruleset 也有 GMS(真的应用了)" || bad "3b: 运行规则里没有 GMS"
 # 6.1B: probe81 已是 Android/iOS 公共件 —— 切到 Android **不许**把它清掉, 否则
 # Android 少一个必需服务, 来回切平台也不幂等。只有真正 iOS 专属的才该被清。
-for f in /opt/pdg-bot/pdg-dot.mobileconfig.tmpl /opt/pdg-bot/mitm_server.py; do
+for f in /opt/pdg-bot/pdg-dot.mobileconfig.tmpl /opt/pdg-bot/mitm_ca.py; do
   [[ -e "$f" ]] && bad "3c: Android 上仍残留 iOS 专属件 $f" || ok "已移除 $(basename "$f")"
 done
 for f in /etc/systemd/system/pdg-probe81.service /opt/pdg-bot/probe81.py; do
@@ -145,10 +194,13 @@ grep -q '^PDG_PLATFORM=android$' /etc/privdns-gateway/profile.env \
   && ok "失败后防火墙配置逐字节未变" || bad "5d: 防火墙被改了"
 grep -q '已恢复到原平台' <<<"$out" && ok "回滚有明确提示" || bad "5e: 没有回滚提示: $(tail -3 <<<"$out")"
 # 平台专属文件必须一并回去 —— 否则平台标记明明回到 android, 盘上却留着半个 iOS 现场
-for f in /opt/pdg-bot/pdg-dot.mobileconfig.tmpl \
-         /opt/pdg-bot/mitm_ca.py /opt/pdg-bot/mitm_server.py /opt/pdg-bot/mitm_wloc.py \
-         /etc/systemd/system/pdg-mitm.service; do
+for f in /opt/pdg-bot/pdg-dot.mobileconfig.tmpl /opt/pdg-bot/mitm_ca.py \
+         /opt/pdg-bot/iosprofile.py /opt/pdg-bot/iosstate.py; do
   [[ -e "$f" ]] && bad "5f: 回滚后仍残留 $f(半个 iOS 现场)" || ok "回滚已清除 $(basename "$f")"
+done
+# 退役制品既不该被装上, 失败回滚也不该把它们"恢复"出来。
+for f in "${RETIRED[@]}"; do
+  [[ -e "$f" ]] && bad "5f: 回滚把已退役的 $f 弄回来了" || ok "回滚后没有已退役的 $(basename "$f")"
 done
 # 公共件不参与平台回滚: 它在 android 上本来就该有, 回滚把它删掉才是错的。
 for f in /opt/pdg-bot/probe81.py /etc/systemd/system/pdg-probe81.service; do
@@ -163,8 +215,10 @@ done
 echo; echo "── 6. iOS→Android 失败: 组件要恢复 ──"
 out=$(pdg platform ios 2>&1); rc=$?
 [[ "$rc" == 0 ]] && ok "先正常切到 iOS(准备现场)" || bad "6: 切 iOS 失败: $(tail -4 <<<"$out")"
-IOS_SHA="$(sha256sum /opt/pdg-bot/mitm_server.py \
-                     /etc/systemd/system/pdg-mitm.service | sha256sum)"
+# 比的必须是**真实存在**的 iOS 必需件: 原来这里比的是两个已随退役删除的文件,
+# sha256sum 对不存在的路径报错并输出空, 两侧都是同一个"空哈希", 断言恒真。
+IOS_SHA="$(sha256sum /opt/pdg-bot/mitm_ca.py /opt/pdg-bot/iosprofile.py \
+                     /opt/pdg-bot/iosstate.py /opt/pdg-bot/pdg-dot.mobileconfig.tmpl | sha256sum)"
 cp /usr/local/bin/nft /usr/local/bin/nft.real
 cat > /usr/local/bin/nft <<'S'
 #!/bin/sh
@@ -177,8 +231,8 @@ cp -f /usr/local/bin/nft.real /usr/local/bin/nft
 [[ "$rc" != 0 ]] && ok "切 Android 失败 → 返回非 0" || bad "6b: 竟然成功了"
 [[ "$(cat /etc/privdns-gateway/platform)" == ios ]] \
   && ok "失败后平台标记回到 ios" || bad "6c: 平台标记停在 $(cat /etc/privdns-gateway/platform)"
-[[ "$(sha256sum /opt/pdg-bot/mitm_server.py \
-                /etc/systemd/system/pdg-mitm.service | sha256sum)" == "$IOS_SHA" ]] \
+[[ "$(sha256sum /opt/pdg-bot/mitm_ca.py /opt/pdg-bot/iosprofile.py \
+                /opt/pdg-bot/iosstate.py /opt/pdg-bot/pdg-dot.mobileconfig.tmpl | sha256sum)" == "$IOS_SHA" ]] \
   && ok "被清理的 iOS 组件已逐字节放回" || bad "6d: iOS 组件没恢复"
 [[ "$(systemctl is-active pdg-probe81)" == active ]] \
   && ok "回滚后 pdg-probe81 恢复运行" || bad "6e: probe81 没起回来"
@@ -228,8 +282,8 @@ snapshot_state(){
     grep '^PDG_PLATFORM=' /etc/privdns-gateway/profile.env 2>/dev/null
     sha256sum /etc/nftables.conf /etc/mihomo/config.yaml 2>/dev/null
     for f in /opt/pdg-bot/probe81.py /opt/pdg-bot/pdg-dot.mobileconfig.tmpl \
-             /opt/pdg-bot/mitm_ca.py /opt/pdg-bot/mitm_server.py /opt/pdg-bot/mitm_wloc.py \
-             /etc/systemd/system/pdg-probe81.service /etc/systemd/system/pdg-mitm.service; do
+             /opt/pdg-bot/mitm_ca.py /opt/pdg-bot/iosprofile.py /opt/pdg-bot/iosstate.py \
+             /etc/systemd/system/pdg-probe81.service "${RETIRED[@]}"; do
       printf '%s=%s\n' "$f" "$([[ -e $f ]] && echo yes || echo no)"
     done
     printf 'probe81=%s/%s mitm=%s/%s\n' \
@@ -241,16 +295,23 @@ snapshot_state(){
 # 只注入**平台专属**件: probe81.py / pdg-probe81.service 自 6.1B 起是公共件, 不归
 # 平台切换管(它们装失败要在 install 与 `pdg update` 里拦, 见 test-update-faults 的
 # 公共件注入那一组)。放在这里注入只会测出「平台切换不管公共件」这个既定设计。
-for target in deploy/bot/mitm_server.py deploy/bot/mitm_ca.py deploy/bot/mitm_wloc.py \
+# 注入目标取 _PLAT_IOS_REQUIRED 里**当前真实存在**的四项源文件。原来这里还注入
+# deploy/bot/mitm_server.py 与 mitm_wloc.py —— 它们已随退役删除, `mv` 直接失败, 于是
+# 那一轮根本没注入任何东西, 却拿"切换成功"当失败来判。
+for target in deploy/bot/mitm_ca.py deploy/bot/iosprofile.py deploy/bot/iosstate.py \
               deploy/ios/pdg-dot-ondemand.mobileconfig.tmpl; do
+  n="$(basename "$target")"
+  [[ -e "/opt/privdns-gateway/$target" ]] \
+    || { bad "8: 注入前提不成立 —— 源文件 $target 不存在"; continue; }
+  PLAT_BEFORE_INJ="$(cat /etc/privdns-gateway/platform)"   # 回滚要回到**本轮进入前**那个平台
   BEFORE="$(snapshot_state)"
   mv "/opt/privdns-gateway/$target" "/opt/privdns-gateway/$target.hidden"
   out=$(pdg platform ios 2>&1); rc=$?
   mv "/opt/privdns-gateway/$target.hidden" "/opt/privdns-gateway/$target"
-  n="$(basename "$target")"
   [[ "$rc" != 0 ]] && ok "$n 部署失败 → 返回非 0" || bad "8: $n 装不上却 RC=0: $(tail -3 <<<"$out")"
-  [[ "$(cat /etc/privdns-gateway/platform)" == android ]] \
-    && ok "$n: 平台标记已回滚到 android" || bad "8b: $n 平台停在 $(cat /etc/privdns-gateway/platform)"
+  [[ "$(cat /etc/privdns-gateway/platform)" == "$PLAT_BEFORE_INJ" ]] \
+    && ok "$n: 平台标记已回滚到 $PLAT_BEFORE_INJ" \
+    || bad "8b: $n 平台停在 $(cat /etc/privdns-gateway/platform), 应回到 $PLAT_BEFORE_INJ"
   [[ "$(snapshot_state)" == "$BEFORE" ]] \
     && ok "$n: 文件与服务状态完整回滚(逐项比对)" || bad "8c: $n 现场没回滚干净"
 done
@@ -258,12 +319,16 @@ done
 # 修好之后照常能切过去(证明上面失败不是因为环境坏了)
 out=$(pdg platform ios 2>&1); rc=$?
 [[ "$rc" == 0 ]] && ok "源文件恢复后切 iOS 正常成功" || bad "8d: rc=$rc: $(tail -4 <<<"$out")"
-for f in /opt/pdg-bot/mitm_ca.py /opt/pdg-bot/mitm_server.py /opt/pdg-bot/mitm_wloc.py \
-         /opt/pdg-bot/probe81.py /opt/pdg-bot/pdg-dot.mobileconfig.tmpl \
-         /etc/systemd/system/pdg-probe81.service /etc/systemd/system/pdg-mitm.service; do
-  [[ -s "$f" ]] || bad "8e: 成功路径缺 $f"
+_need=(/opt/pdg-bot/mitm_ca.py /opt/pdg-bot/iosprofile.py /opt/pdg-bot/iosstate.py \
+       /opt/pdg-bot/probe81.py /opt/pdg-bot/pdg-dot.mobileconfig.tmpl \
+       /etc/systemd/system/pdg-probe81.service)
+_miss=0
+for f in "${_need[@]}"; do [[ -s "$f" ]] || { bad "8e: 成功路径缺 $f"; _miss=1; }; done
+[[ "$_miss" == 0 ]] && ok "成功路径 ${#_need[@]} 个必需文件全部就位"
+# 成功路径同样不许把退役制品装回来。
+for f in "${RETIRED[@]}"; do
+  [[ -e "$f" ]] && bad "8e: 成功路径又出现了已退役的 $f" || ok "成功路径没有已退役的 $(basename "$f")"
 done
-ok "成功路径七个必需文件全部就位"
 pdg platform android >/dev/null 2>&1
 
 rm -f /usr/local/bin/nft.real $E2E_TMP/e2e-nft-ruleset
