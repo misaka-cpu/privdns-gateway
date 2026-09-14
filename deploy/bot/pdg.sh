@@ -1468,6 +1468,9 @@ cmd_rollback(){
   rm -rf "$tmp"
   (( panel_sanitized == 1 )) && c_g "  已净化回滚出的面板临时态 → 关闭"
   local unrestored=()                         # 未能恢复项(内核激活/仓库Git); 非空即"未完全回滚"
+  # 恢复策略必须在**任何服务动作之前**定好 —— 内核收敛也算服务动作。
+  # 这一步只解析与校验前像(并确认它属于正在回滚的这一份快照), 不碰任何服务。
+  _pdg_svcstate_plan "$target" || true
   # daemon-reload 失败必须计入: 后面 enable/start 全建立在它之上, 吞掉它等于谎报回滚成功。
   systemctl daemon-reload || unrestored+=("daemon-reload")
   _nft_apply_main >/dev/null 2>&1 || true
@@ -1490,10 +1493,12 @@ cmd_rollback(){
   # sing-box 残留只清"项目自己装的"(见 _pdg_singbox_is_ours), 第三方的原样保留
   _pdg_drop_singbox_files "快照带回的"
   systemctl daemon-reload || unrestored+=("daemon-reload(清理后)")
-  # 激活失败必须计入 unrestored: 内核没起来就不是"已回滚", 不能只 warn 后照报成功。
-  if ! _core_kernel_activate mihomo sing-box; then
-    c_y "  mihomo 起核核验未达标, 请 pdg doctor 复查"
-    unrestored+=("内核激活(mihomo)")
+  # 收敛失败必须计入 unrestored: 内核不对就不是"已回滚", 不能只 warn 后照报成功。
+  # 用 _pdg_kernel_converge 而不是 _core_kernel_activate —— 后者是装机/切核的语义(硬收敛成
+  # enabled+active), 回滚时会在恢复策略生效之前先把内核永久启用并起来, 再被纠正回去。
+  if ! _pdg_kernel_converge mihomo sing-box; then
+    c_y "  内核收敛未达标, 请 pdg doctor 复查"
+    unrestored+=("内核收敛(mihomo/sing-box)")
   fi
   # ── 服务收敛 ──────────────────────────────────────────────────────────────
   # **先**判定前像可不可用、把策略定好, 再动服务。以前是"先一律 restart 三个服务再按前像
@@ -4082,6 +4087,39 @@ _pdg_svcstate_plan(){   # $1=本次要回滚到的快照目录
 _pdg_now_ac(){ _pdg_svc_q is-active  "$1" | cut -f1; }
 _pdg_now_en(){ _pdg_svc_q is-enabled "$1" | cut -f1; }
 
+# 回滚时的内核收敛。
+#
+# 分工: 旧核冲突那一半**原样保留**(停掉并关自启, 并核验) —— 这一版只允许一个内核在跑,
+# 与快照记着什么无关。目标核那一半交给前像。
+# 为什么不能直接用 _core_kernel_activate: 它是把目标核硬收敛成 "enabled + active", 那是
+# **装机/切核**的语义。回滚时照搬, 会在恢复策略生效之前先把 mihomo 永久启用并起来, 然后
+# 再被 _pdg_restore_svcstate 纠正回去 —— 中间真的跑过一段, 自启也真的被改成过 enabled。
+# 只看最终状态看不出来, 但那是一次真实的状态变更。
+#
+#   有可信前像: 这里**不碰目标核**。目标核的自启与运行态由 _pdg_restore_svcstate 一处负责
+#               (单一归属, 两处不会互相覆盖)。旧核照停照核验, unit 缺失照样当场报。
+#   没有前像  : 原样调用 _core_kernel_activate —— 历史兼容路径, 并明说这不是按前像精确恢复。
+_pdg_kernel_converge(){   # $1=目标核 $2=旧核
+  local tgt="$1" old="$2" rc=0
+  if [[ "$_PDG_SVC_MODE" != plan ]]; then
+    c_y "  内核收敛: 这份快照没有可用的服务前像 → 按**历史行为**把 $tgt 收敛成 enabled+active。"
+    c_y "            这条是历史兼容路径, **不是按前像精确恢复**。"
+    _core_kernel_activate "$tgt" "$old"
+    return
+  fi
+  c_y "  内核收敛: 按本次前像恢复 $tgt(自启=${_PDG_WANT_EN[$tgt]:-未记录} 运行=${_PDG_WANT_AC[$tgt]:-未记录});"
+  c_y "            旧核 $old 仍按「只能有一个内核」的安全前提停用并关自启。"
+  systemctl disable --now "$old" >/dev/null 2>&1 || true
+  [[ "$(systemctl is-active  "$old" 2>/dev/null)" != active  ]] || { echo "  旧核 $old 仍 active"; rc=1; }
+  [[ "$(systemctl is-enabled "$old" 2>/dev/null)" == enabled ]] && { echo "  旧核 $old 仍 enabled(重启会双起)"; rc=1; }
+  # 起不起得来由前像决定, 但"根本没有这个 unit"必须当场看出来 —— 那说明快照没把它带回来。
+  if [[ "$(systemctl show -p LoadState --value "$tgt" 2>/dev/null)" == not-found ]]; then
+    echo "  $tgt 的 unit 不存在(快照没带回来?)"; rc=1
+  fi
+  systemctl reset-failed "$tgt" >/dev/null 2>&1 || true
+  return "$rc"
+}
+
 # 恢复服务的运行态与自启态。**依赖调用方作用域里的 unrestored 数组**。
 # 纪律:
 #   · 先定策略再动手 —— 不先通用重启再纠正, 本来没在跑的**一次都不会被启动**;
@@ -4141,6 +4179,10 @@ _pdg_restore_svcstate(){   # $1=本次快照目录
         rc=0; systemctl restart "$u" >/dev/null 2>&1 || rc=$?
         [[ "$rc" == 0 ]] || unrestored+=("$u 启动动作失败(restart rc=$rc)")
         now="$(_pdg_now_ac "$u")"
+        # 起服务不是瞬时的: 头一眼没 active 就再等两拍再看(原来 _core_kernel_activate 里那句
+        # `sleep 2` 就是干这个的)。桩化测试里第一眼就 active, 不会真的睡。
+        local _try=0
+        while [[ "$now" != active && "$_try" -lt 3 ]]; do sleep 1; _try=$((_try+1)); now="$(_pdg_now_ac "$u")"; done
         if [[ "$now" != active ]]; then
           unrestored+=("$u 后置状态不符(目标 active, 实得 $now)")
         elif [[ "$u" != *.timer ]]; then
@@ -4210,6 +4252,9 @@ _pdg_restore_svcstate(){   # $1=本次快照目录
 # 所以"最终返回非零"不等于"危险动作被挡住了"; 每一处真正要动手的地方都得自己问一次,
 # 而且必须得到**同一个答案** —— 否则就是"这边拒了、那边照做"的半截现场。
 _PDG_RETIRE_OK=""     # "" 未判 / 1 允许 / 0 拒绝
+# 这一次**确实撤除过**退役件(unit / MITM 模块 / 劫持表 / mitm.json)吗。
+# 平台切换的失败善后要靠它分岔: 撤除过的那几样不在局部备份里, 局部还原补不回来。
+_PDG_RETIRE_DONE=0
 _retire_allowed(){
   if [[ -z "$_PDG_RETIRE_OK" ]]; then
     if _retire_caller_gate; then _PDG_RETIRE_OK=1; else _PDG_RETIRE_OK=0; fi
@@ -5295,6 +5340,7 @@ migrate_android_cleanup(){
   fi
   # 有启用中的 WLOC → 先安全休眠: 清运行时接管 + enabled=false(保留地点/CA 数据)
   if grep -q '"enabled": *true' "$R/etc/privdns-gateway/mitm.json" 2>/dev/null; then
+    _PDG_RETIRE_DONE=1
     : > "$R/etc/mosdns/rules/mitm_hijack.txt" 2>/dev/null || true
     python3 - "$R/etc/privdns-gateway/mitm.json" <<'PY' 2>/dev/null || true
 import json, sys
@@ -5311,12 +5357,12 @@ PY
   # SC2043, 而且读的人会以为这里还有别的 unit 要清。
   if [[ -f "$R/etc/systemd/system/pdg-mitm.service" ]]; then
     systemctl disable --now pdg-mitm 2>/dev/null
-    rm -f "$R/etc/systemd/system/pdg-mitm.service"; removed=1
+    rm -f "$R/etc/systemd/system/pdg-mitm.service"; removed=1; _PDG_RETIRE_DONE=1
   fi
   for f in "$R/opt/pdg-bot/mitm_ca.py" "$R/opt/pdg-bot/mitm_server.py" "$R/opt/pdg-bot/mitm_wloc.py" \
            "$R/opt/pdg-bot/iosprofile.py" "$R/opt/pdg-bot/iosstate.py" \
            "$R/opt/pdg-bot/pdg-dot.mobileconfig.tmpl" "$R/opt/pdg-bot/pdg-mitm.mobileconfig.tmpl"; do
-    [[ -f "$f" ]] && { rm -f "$f"; removed=1; }
+    [[ -f "$f" ]] && { rm -f "$f"; removed=1; _PDG_RETIRE_DONE=1; }
   done
   [[ "$removed" == 1 ]] && { systemctl daemon-reload 2>/dev/null || true
     c_g "Android: 已清理 iOS 专属残留(pdg-mitm 服务 + mitm 模块 + 描述文件模板; CA/地点数据保留为休眠)。"; }
@@ -6301,6 +6347,7 @@ _plat_purge_retired(){
     _retire_allowed || return 1
   fi
   if [[ -f "$R/etc/systemd/system/pdg-mitm.service" ]]; then
+    _PDG_RETIRE_DONE=1
     systemctl disable --now pdg-mitm >/dev/null 2>&1
     rm -f "$R/etc/systemd/system/pdg-mitm.service" || rc=1
     systemctl daemon-reload >/dev/null 2>&1 || true
@@ -6312,7 +6359,7 @@ _plat_purge_retired(){
     [[ "$(systemctl is-active pdg-mitm 2>/dev/null)" == active ]] && rc=1
   fi
   for f in "${_PLAT_RETIRED[@]}"; do
-    [[ -e "$R$f" ]] && { rm -f "$R$f" || rc=1; }
+    [[ -e "$R$f" ]] && { _PDG_RETIRE_DONE=1; rm -f "$R$f" || rc=1; }
   done
   return "$rc"
 }
@@ -6989,47 +7036,101 @@ cmd_platform(){
       fi
     done
     systemctl daemon-reload 2>/dev/null || true
-    # 服务状态回到切换前: unit 已经不在了就只停不启
-    local svc en ac
+    # 服务状态回到切换前。两点与以前不同:
+    #   · 自启按记下来的**那个值**还原(enabled / enabled-runtime / disabled), 不再一律
+    #     `enable --now` —— 那会把 enabled-runtime 提升成永久 enabled;
+    #   · 动作之后复核后置状态, 对不上就登记, 不再一律 `|| true` 吞掉。
+    local svc en ac _miss=()
     while IFS='|' read -r svc en ac; do
       [[ -n "$svc" ]] || continue
-      if [[ -e "/etc/systemd/system/$svc.service" ]] && [[ "$en" == enabled || "$ac" == active ]]; then
-        systemctl reset-failed "$svc" >/dev/null 2>&1 || true
-        if [[ "$ac" == active ]]; then
-          systemctl enable --now "$svc" >/dev/null 2>&1 || true
-        else
-          systemctl enable "$svc" >/dev/null 2>&1 || true      # 切换前就是"开机启动但没在跑"
-        fi
-      else
-        systemctl disable --now "$svc" >/dev/null 2>&1 || true
+      if [[ ! -e "/etc/systemd/system/$svc.service" ]]; then
+        # unit 已经不在了(这一步补不回来 —— 那几样只在快照里)。
+        [[ "$en" == enabled || "$en" == enabled-runtime || "$ac" == active ]] \
+          && _miss+=("$svc(unit 已不在, 局部还原补不回来)")
+        continue
       fi
+      systemctl reset-failed "$svc" >/dev/null 2>&1 || true
+      case "$en" in
+        enabled)         systemctl enable "$svc"           >/dev/null 2>&1 || true;;
+        enabled-runtime) systemctl enable --runtime "$svc" >/dev/null 2>&1 || true;;
+        disabled)        systemctl disable "$svc"          >/dev/null 2>&1 || true;;
+      esac
+      [[ "$(systemctl is-enabled "$svc" 2>/dev/null | head -1)" == "$en" ]] || _miss+=("$svc 自启(目标 $en)")
+      if [[ "$ac" == active ]]; then
+        systemctl start "$svc" >/dev/null 2>&1 || true
+      elif [[ "$(systemctl is-active "$svc" 2>/dev/null | head -1)" == active ]]; then
+        systemctl stop "$svc" >/dev/null 2>&1 || true
+      fi
+      local _nowac; _nowac="$(systemctl is-active "$svc" 2>/dev/null | head -1)"
+      [[ "$_nowac" == "$ac" ]] || _miss+=("$svc 运行态(目标 $ac, 实得 ${_nowac:-读不到})")
     done <<< "$_pstate"
     _plat_write_profile "$cur" >/dev/null 2>&1 || true
     systemctl restart "$(_pdg_core_svc)" mosdns >/dev/null 2>&1 || true
-    c_y "已恢复到原平台 $cur 与原配置(含平台专属文件与服务状态; 快照仍在, 必要时可 sudo pdg rollback)。"
+    if [[ ${#_miss[@]} -eq 0 ]]; then
+      c_y "已恢复到原平台 $cur 与原配置(平台专属文件与服务状态已逐项复核; 快照仍在, 必要时可 sudo pdg rollback)。"
+      return 0
+    fi
+    c_r "⚠️ 已恢复原平台 $cur 与配置, 但以下项**没有确认恢复**: ${_miss[*]}"
+    c_y "   快照仍在, 可 sudo pdg rollback --dir $_psnap 做整体恢复。"
+    return 1
+  }
+
+  # 失败善后的统一入口。分岔只有一处判据: 这一次**有没有真的撤除过退役件**。
+  #   撤除过 → 那几样(pdg-mitm.service / mitm_server.py / mitm_wloc.py)根本不在局部备份里,
+  #            `_plat_rollback` 补不回来。改用本次快照做整体恢复 —— 它带着完整文件树和服务
+  #            前像, 四个维度都能核验, 做不到的会进未恢复项。
+  #            tar 覆盖删不掉"这次新多出来的"文件, 所以先把本次新装的平台专属件撤掉,
+  #            再让快照覆盖 —— 两步互补, 不是两套互相覆盖的恢复。
+  #   没撤除 → 还是走局部还原(改动面就那几个配置文件, 局部更精确、更快)。
+  # 两条路**不会同时对同一个文件动手**。
+  _plat_fail_restore(){
+    if [[ "${_PDG_RETIRE_DONE:-0}" != 1 ]]; then _plat_rollback; return; fi
+    c_y "  本次已经撤除过退役件 —— 那几样不在局部备份里, 改用本次快照做整体恢复。"
+    local nf
+    if [[ -s "$wd/newfiles" ]]; then
+      while read -r nf; do [[ -n "$nf" ]] && rm -f "$nf" 2>/dev/null; done < "$wd/newfiles"
+    fi
+    if cmd_rollback --dir "$_psnap" --no-git; then
+      c_g "  已按本次快照恢复到切换前(文件/运行态/自启态已逐项核验)。"
+      return 0
+    fi
+    c_r "❌ 按本次快照恢复**未完成**(未恢复项见上)。**不声称已恢复原平台与服务状态**。"
+    c_r "   可用材料仍在: $_psnap —— 请据此人工收尾。"
+    return 1
   }
   # 3) 落平台标记(platform 文件 + profile.env 同步)
   install -d -m700 /etc/privdns-gateway
-  printf '%s\n' "$p" > /etc/privdns-gateway/platform || { _plat_rollback; rm -rf "$wd"; return 1; }
+  printf '%s\n' "$p" > /etc/privdns-gateway/platform || { _plat_fail_restore; rm -rf "$wd"; return 1; }
   rm -f /etc/privdns-gateway/platform.guessed
-  _plat_write_profile "$p" || { c_y "profile.env 写入失败"; _plat_rollback; rm -rf "$wd"; return 1; }
+  _plat_write_profile "$p" || { c_y "profile.env 写入失败"; _plat_fail_restore; rm -rf "$wd"; return 1; }
 
   # 4) 按目标平台部署 / 清理组件
   # 先保证**公共件**就位: pdg-probe81 两平台都必需, 而 _pdg_required_svcs 下面就要
   # 校验它。6.1B 之前装的机器盘上根本没有这个 unit —— 不先补上, `pdg platform` 会因
   # "服务未稳定运行"整体回滚, 而用户什么都没做错。这一步幂等, 已就位则空转。
+  # 本次**新多出来**的平台专属件: 快照是 tar 覆盖, 删不掉盘上多出来的东西, 所以先记下来,
+  # 失败善后时按这份名单撤掉。只记"现在还不存在"的, 已经在盘上的由快照覆盖回原内容。
+  local _ent _dst
+  : > "$wd/newfiles"
+  for _ent in "${_PLAT_IOS_REQUIRED[@]}"; do
+    _dst="$(cut -d'|' -f2 <<<"$_ent")"
+    [[ -e "$_dst" ]] || printf '%s\n' "$_dst" >> "$wd/newfiles"
+  done
+  for _dst in "${_PLAT_RETIRED[@]}"; do
+    [[ -e "$_dst" ]] || printf '%s\n' "$_dst" >> "$wd/newfiles"
+  done
   migrate_probe81_public || true
   if [[ "$p" == ios ]]; then
     if ! _plat_deploy_ios; then
       echo "❌ iOS 组件部署失败(描述文件模板 / MITM 模块 / pdg-mitm 服务)"
-      _plat_rollback; rm -rf "$wd"; return 1
+      _plat_fail_restore; rm -rf "$wd"; return 1
     fi
   else
     # 返回值必须看: 它现在会在"调用方没有回滚能力"时拒绝动手并返回非 0。吞掉的话,
     # 平台切换就会在**退役没做**的情况下宣布成功 —— 那正是要避免的半截现场。
     if ! migrate_android_cleanup; then   # 安全休眠 WLOC + 移除 iOS unit/模块/模板(保留地点与 CA)
       echo "❌ Android 组件清理未完成(详见上方), 平台切换回退"
-      _plat_rollback; rm -rf "$wd"; return 1
+      _plat_fail_restore; rm -rf "$wd"; return 1
     fi
   fi
 
@@ -7037,17 +7138,17 @@ cmd_platform(){
   #    (用户其它表逐字节保留)→ nft -c → 应用, 任一步失败它自己会把现网还原。
   if ! _switchcore_nft mihomo; then
     echo "❌ 防火墙按新平台重建失败"
-    _plat_rollback; rm -rf "$wd"; return 1
+    _plat_fail_restore; rm -rf "$wd"; return 1
   fi
 
   # 6) 重渲内核配置(两个方向都不会再有 MITM-OUT: WLOC 已退役, 渲染器不再产生那条出站与路由)
   if ! ( cd /opt/pdg-bot && python3 -c 'import bot; bot._render_mihomo_file()' ) >/dev/null 2>&1; then
     echo "❌ 重新渲染 mihomo 配置失败"
-    _plat_rollback; rm -rf "$wd"; return 1
+    _plat_fail_restore; rm -rf "$wd"; return 1
   fi
   if command -v mihomo >/dev/null 2>&1 && ! mihomo -t -d /etc/mihomo -f /etc/mihomo/config.yaml >/dev/null 2>&1; then
     echo "❌ 新平台的 mihomo 配置校验(mihomo -t)未过"
-    _plat_rollback; rm -rf "$wd"; return 1
+    _plat_fail_restore; rm -rf "$wd"; return 1
   fi
   systemctl restart "$(_pdg_core_svc)" >/dev/null 2>&1 || true
   systemctl restart mosdns >/dev/null 2>&1 || true
@@ -7058,12 +7159,12 @@ cmd_platform(){
   local _nftexe; _nftexe="$(_pdg_nft_bin)"
   if [[ -n "$_nftexe" ]] && ! "$_nftexe" -c -f /etc/nftables.conf >/dev/null 2>&1; then
     echo "❌ 切换后的 nftables 配置校验未过"
-    _plat_rollback; rm -rf "$wd"; return 1
+    _plat_fail_restore; rm -rf "$wd"; return 1
   fi
   if [[ "$(_pdg_bot_cred)" == partial ]]; then
     echo "❌ Bot 凭据只配了一项(token 与允许 id 必须成对)—— 这是配置错误, 先用 pdg-set-token"
     echo "   补齐或把两项都留空(彻底禁用 bot), 再切平台。"
-    _plat_rollback; rm -rf "$wd"; return 1
+    _plat_fail_restore; rm -rf "$wd"; return 1
   fi
   local svc bad=()
   # 必需服务集按凭据状态算: 没配 bot 的机器不该因为 pdg-bot 没跑而切不了平台
@@ -7072,24 +7173,24 @@ cmd_platform(){
   done
   if [[ ${#bad[@]} -gt 0 ]]; then
     echo "❌ 切换后这些服务未稳定运行: ${bad[*]}"
-    _plat_rollback; rm -rf "$wd"; return 1
+    _plat_fail_restore; rm -rf "$wd"; return 1
   fi
   # 8) 返回 0 之前复核现场: 目标平台该有的都在、该没有的都清干净了
   if ! _plat_verify "$p"; then
-    _plat_rollback; rm -rf "$wd"; return 1
+    _plat_fail_restore; rm -rf "$wd"; return 1
   fi
   # 关键迁移必须在**删掉回滚材料、宣布成功之前**跑完: 它失败就走 _plat_rollback,
   # 而 _plat_rollback 依赖 $wd 里的材料 —— 顺序颠倒的话就只能 best-effort 了。
   if ! migrate_ios_gms_cleanup; then
     echo "❌ iOS GMS 残留清理失败(详见上方), 平台切换回退"
-    _plat_rollback; rm -rf "$wd"; return 1
+    _plat_fail_restore; rm -rf "$wd"; return 1
   fi
   # probe81 是两个平台**都必需**的公共件(链路诊断的 HTTP 会话入口)。切完平台如果它没就位,
   # 那台机器就少了一整块能力, 而后面那句"平台已确认"会把这件事盖过去。与 GMS 同样待遇:
   # 在删回滚材料之前单独跑一次并传播失败(幂等, 下面的 run_all_migrations 再跑就是空转)。
   if ! migrate_probe81_public; then
     echo "❌ pdg-probe81 公共件迁移失败(详见上方), 平台切换回退"
-    _plat_rollback; rm -rf "$wd"; return 1
+    _plat_fail_restore; rm -rf "$wd"; return 1
   fi
   rm -rf "$wd"
   run_all_migrations || true                    # 其余平台无关的幂等迁移照常跑(上面两步已单独跑过)

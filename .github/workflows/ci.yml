@@ -1052,8 +1052,14 @@ jobs:
         run: bash tests/test-retire-sideeffect-barrier.sh
 
       # 辅助函数自己"没有服务动作"证明不了整条回滚链没先把服务启动过 —— 这一支跑真实 cmd_rollback。
-      - name: "回滚链服务恢复 (真实 cmd_rollback: 本来停着的一次都没被启动/缺前像不报完全回滚)"
+      # 它在 unshare 私有挂载里把 /etc /opt /usr/local/bin 绑到一次性目录, 真的落盘、真的核验文件属性;
+      # 建不出隔离就报"未执行"并非 0 退出(不靠权限失败兜底)。
+      - name: "回滚链服务恢复 (真实 cmd_rollback + 自有根: 内核收敛不先永久启用/缺前像不报完全回滚)"
         run: bash tests/test-rollback-svcstate-chain.sh
+
+      # "存了前像"不等于"失败时会用": 局部备份里根本没有 pdg-mitm unit 与 MITM 模块。
+      - name: "平台切换失败善后 (退役件撤除后注入失败: 四维恢复到位/恢复不完整不声称已恢复)"
+        run: bash tests/test-platform-fail-restore.sh
 
       - name: "平台文案/门控回归 (客户端·状态 按平台/内核 + README 文案一致)"
         run: python3 tests/test-platform-copy.py

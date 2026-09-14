@@ -68,9 +68,24 @@ awk '/cmd_snapshot --source cli --op platform/{s=NR}
   || bad "B3: 顺序不对"
 grep -q '中止切换(未改动任何东西)' "$pl" && ok "B4: 存不下就中止, 并明说此刻未改动任何东西" || bad "B4"
 grep -q 'export PDG_UPDATE_SVCSTATE="\$_psnap/svcstate.tsv"' "$pl" && ok "B5: 句柄交给后续所有退役类动作" || bad "B5"
-awk '/if ! migrate_android_cleanup; then/{a=NR} /_plat_rollback; rm -rf "\$wd"; return 1/{if(a&&NR>a&&!done){done=NR}} END{exit !(a&&done)}' "$pl" \
+awk '/if ! migrate_android_cleanup; then/{a=NR} /_plat_fail_restore; rm -rf "\$wd"; return 1/{if(a&&NR>a&&!done){done=NR}} END{exit !(a&&done)}' "$pl" \
   && ok "B6: migrate_android_cleanup 的返回值被检查, 失败即回退切换(不会「退役失败但成功」)" \
   || bad "B6: 仍然吞掉了 Android 清理的返回值"
+
+echo
+echo "══ 二之二. 失败善后: 撤除过退役件就必须用快照整体恢复 ══"
+n_old="$(grep -c '_plat_rollback; rm -rf "\$wd"; return 1' "$PDG")"
+[[ "$n_old" == 0 ]] && ok "B7: 没有任何失败点再直接走局部还原(统一经 _plat_fail_restore 分岔)" || bad "B7: 还有 $n_old 处直接走 _plat_rollback"
+n_new="$(grep -c '_plat_fail_restore; rm -rf "\$wd"; return 1' "$PDG")"
+[[ "$n_new" -ge 10 ]] && ok "B8: $n_new 处失败点统一走 _plat_fail_restore" || bad "B8: 只有 $n_new 处"
+grep -q '_plat_fail_restore(){' "$pl" && ok "B9: 分岔入口就在 cmd_platform 里(看得到 \$wd/\$_psnap)" || bad "B9"
+grep -q 'cmd_rollback --dir "\$_psnap" --no-git' "$pl" \
+  && ok "B10: 撤除过退役件时接的是**已经修好的快照恢复**, 不是另造一套" || bad "B10"
+grep -q '不声称已恢复原平台与服务状态' "$pl" && ok "B11: 恢复没完成时明确不声称已恢复" || bad "B11"
+for fn in migrate_android_cleanup _plat_purge_retired; do
+  grep -q '_PDG_RETIRE_DONE=1' "$(fnfile "$PDG" "$fn")" \
+    && ok "B12: $fn 真的动手之后会立下「撤除过」的记号" || bad "B12: $fn 没立记号"
+done
 
 echo
 echo "══ 三. 拦截点: 每一处真正要动手的地方都自己问一次, 且答案一致 ══"
