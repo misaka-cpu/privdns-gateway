@@ -29,7 +29,15 @@ pass=0; nfail=0
 ok(){ echo "[OK]   $1"; pass=$((pass+1)); }
 bad(){ echo "[FAIL] $1"; nfail=$((nfail+1)); }
 
-c_g(){ :; }; c_y(){ :; }; c_r(){ :; }
+# 颜色输出函数**从产品文件里抽出来用**, 测试不提供替代实现。
+# 这三行以前是 `c_g(){ :; }; c_y(){ :; }; c_r(){ :; }` —— 而生产里压根没有 c_r,
+# 于是测试替生产补了一个它没有的函数, WLOC 退役的拒绝/失败路径在测试里永远不报错(假绿)。
+# 生产里缺哪一个, 这里就缺哪一个; 缺失的后果由 tests/test-wloc-retire-error-reporting.sh
+# 用具名行为断言钉住(标题在不在), 不靠静态检查。
+for _f in c_g c_y c_r; do
+  eval "$(grep -m1 -E "^$_f\(\)\{.*\}[[:space:]]*\$" "$ROOT/deploy/bot/pdg.sh")"
+done
+unset _f
 
 # 抽出被测函数。**只抽 shell 侧**: Python 那一半必须是真模块, 否则这支测试什么都证明不了。
 eval "$(sed -n '/^_retire_ios_schema(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh")"

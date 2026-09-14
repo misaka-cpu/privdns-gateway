@@ -24,7 +24,15 @@ pass=0; nfail=0
 ok(){ echo "[OK]   $1"; pass=$((pass+1)); }
 bad(){ echo "[FAIL] $1"; nfail=$((nfail+1)); }
 
-c_g(){ :; }; c_y(){ :; }; c_r(){ :; }
+# 颜色输出函数**从产品文件里抽出来用**, 测试不提供替代实现。
+# 这三行以前是 `c_g(){ :; }; c_y(){ :; }; c_r(){ :; }` —— 而生产里压根没有 c_r,
+# 于是测试替生产补了一个它没有的函数, WLOC 退役的拒绝/失败路径在测试里永远不报错(假绿)。
+# 生产里缺哪一个, 这里就缺哪一个; 缺失的后果由 tests/test-wloc-retire-error-reporting.sh
+# 用具名行为断言钉住(标题在不在), 不靠静态检查。
+for _f in c_g c_y c_r; do
+  eval "$(grep -m1 -E "^$_f\(\)\{.*\}[[:space:]]*\$" "$ROOT/deploy/bot/pdg.sh")"
+done
+unset _f
 # 回滚账本是个数组, 按函数抽取拿不到 —— 显式声明一份(与 pdg.sh 同名同义)。
 _RETIRE_UNDO=()
 _RETIRE_TMP=""
@@ -82,6 +90,12 @@ _retire_rerender_core(){ echo "rerender" >> "$SC_LOG"; return "$RENDER_RC"; }
 # 改过的每一样都要回去"。
 SCHEMA_FAIL=""
 _retire_ios_schema(){ echo "iosschema" >> "$SC_LOG"; [[ -n "$SCHEMA_FAIL" ]] && return 1; return 0; }
+
+# 内核服务名也从产品里抽 —— 它是**单行**定义, 下面那个区间写法(到独占一行的 `}` 为止)
+# 抽不到它, 会一路抽到文件末尾。以前这里根本没抽: 于是 `_retire_track_svc "$(_pdg_core_svc)"`
+# 拿到的是**空服务名**, 屏幕上一行 "_pdg_core_svc: command not found", 而"内核这一路有没有
+# 被正确登记/还原"这件事从来没被真的验过 —— 断言数不变, 覆盖是空的。
+eval "$(grep -m1 -E '^_pdg_core_svc\(\)\{.*\}[[:space:]]*$' "$ROOT/deploy/bot/pdg.sh")"
 
 # 抽出被测函数与它的两个产品侧辅助。**不**抽 _retire_rerender_core / _retire_ios_schema:
 # 它们在生产里都要起 /opt/pdg-bot 下的真模块, 上面用可控旋钮替代(本支关心的是编排:

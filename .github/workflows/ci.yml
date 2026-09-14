@@ -1024,6 +1024,11 @@ jobs:
       - name: "WLOC 退役 · 事务闭环 (文件+mode+uid/gid、enabled、运行态、已加载配置全恢复)"
         run: bash tests/test-wloc-retire-txn-closure.sh
 
+      # PDG-WLOC-CR-01: pdg.sh 调用 c_r 七处却从未定义, WLOC 退役的拒绝/失败/回滚不完整
+      # 三类标题整句丢失。判据是"那句话在不在"(具名行为), 并自带撤销产品定义的反向对照。
+      - name: "WLOC 退役错误输出 (拒绝/失败/回滚不完整的标题必须真实可见; 撤销定义即转红)"
+        run: bash tests/test-wloc-retire-error-reporting.sh
+
       - name: "平台文案/门控回归 (客户端·状态 按平台/内核 + README 文案一致)"
         run: python3 tests/test-platform-copy.py
 

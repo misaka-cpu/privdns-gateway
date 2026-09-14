@@ -13,6 +13,13 @@ export SAFE_PATHS="${SAFE_PATHS:-/etc/sing-box/ui/dist}"
 
 c_g(){ echo -e "\033[1;32m$*\033[0m"; }
 c_y(){ echo -e "\033[1;33m$*\033[0m"; }
+# 红色一档。**它一直是缺的**: 本文件调用 c_r 七处(WLOC 退役的拒绝/失败/回滚不完整各条,
+# 以及 iOS GMS 清理的回滚不完整), 而全仓没有任何地方定义它 —— 跑到那些路径时 bash 打
+# "c_r: command not found", 而给用户的那句「❌ …: 本次未做任何改动」**整句丢失**。
+# 丢的恰恰是"发生了什么、现场动没动"这一句; 后续解释(c_y)反倒都在, 于是输出读起来像
+# 一段没有起因的补充说明。判定与退出码一直是对的, 缺的只是把原因说出来的能力。
+# 与 c_g / c_y 同流(stdout)、同风格: 标题与紧随其后的解释必须保持先后顺序, 分流会乱序。
+c_r(){ echo -e "\033[1;31m$*\033[0m"; }
 need_root(){ [[ $EUID -eq 0 ]] || { echo "请用 root: sudo pdg $*"; exit 1; }; }
 # 活动内核后端: v1.6.0 起恒 mihomo(彻底移除 sing-box 运行时)。旧机器的 backend 标记里可能还
 # 写着 singbox, 但由 migrate_drop_singbox 在 update 时迁移 —— 判定一律按 mihomo。
