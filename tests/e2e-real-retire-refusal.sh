@@ -942,14 +942,105 @@ switch_repo_to_candidate(){
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# 本轮按审查意见补的几件夹具
+# ═════════════════════════════════════════════════════════════════════════════
+
+# ── 前像必须先达到**合法稳定状态**再采样 ────────────────────────────────────
+# activating / deactivating 是过渡态: 在那一刻采前像, 产品会按"过渡态不猜"如实登记为
+# 未恢复, 而测试自己晚一拍采到的却是 active —— 两边对不上, 判据就失去意义。
+wait_stable(){   # $1=unit  [$2=最多等几秒, 默认 25]
+  local u="$1" n="${2:-25}" st i
+  for ((i=0; i<n; i++)); do
+    st="$(systemctl show -p ActiveState --value "$u" 2>/dev/null)"
+    case "$st" in activating|deactivating|reloading|"") sleep 1;; *) printf '%s\n' "$st"; return 0;; esac
+  done
+  printf '%s\n' "${st:-<读不到>}"; return 1
+}
+
+# ── 测试指纹 vs 产品自己写的 svcstate.tsv, 逐项对账 ──────────────────────────
+# 两边在**不同时刻**采样就会对不上。这里直接比同一批 unit 的自启/运行值。
+svcstate_cross_check(){   # $1=svcstate.tsv 路径  $2=标签
+  local f="$1" tag="$2" u pen pac men mac n_ok=0 n_bad=0
+  [[ -s "$f" ]] || { bad "$tag: 产品没写出 svcstate.tsv($f)"; return 1; }
+  while IFS=$'\t' read -r k u pen _urc pac _arc _sub _inv; do
+    [[ "$k" == unit && -n "$u" ]] || continue
+    men="$(sc_state is-enabled "$u")"; mac="$(sc_state is-active "$u")"
+    if [[ "$pen" == "$men" && "$pac" == "$mac" ]]; then n_ok=$((n_ok+1)); continue; fi
+    n_bad=$((n_bad+1))
+    printf '    %-22s 产品记: %s/%s   测试此刻看到: %s/%s\n' "$u" "$pen" "$pac" "$men" "$mac"
+  done < "$f"
+  [[ "$n_bad" == 0 ]] \
+    && ok "$tag: 产品的 svcstate.tsv 与测试指纹逐项一致($n_ok 个 unit)" \
+    || bad "$tag: 有 $n_bad 个 unit 两边对不上(上面逐项列出), 一致 $n_ok"
+}
+
+# ── 历史残留: 每一项写明来源与指纹, 不笼统豁免也不一律拒绝 ──────────────────
+RESIDUE_MANIFEST="$EVID/residue-manifest.tsv"
+residue_record(){   # $1=路径 $2=来源说明
+  [[ -e "$1" ]] || { printf '%s\t%s\t<不存在>\n' "$1" "$2" >> "$RESIDUE_MANIFEST"; return 1; }
+  printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$(sha256sum "$1" 2>/dev/null | awk '{print $1}')" \
+    "$(stat -c '%a %u:%g' "$1")" >> "$RESIDUE_MANIFEST"
+}
+residue_report(){   # 打印清单并逐项确认
+  local n; n="$(grep -c . "$RESIDUE_MANIFEST" 2>/dev/null || echo 0)"
+  echo "── 预先构造的历史残留(逐项来源 + 指纹) ──"
+  sed 's/^/    /' "$RESIDUE_MANIFEST" 2>/dev/null
+  [[ "$n" -ge 1 ]] && ok "残留清单已逐项记账($n 项, 见 $RESIDUE_MANIFEST)" || bad "残留清单是空的"
+  chmod 600 "$RESIDUE_MANIFEST" 2>/dev/null || true
+}
+
+# ── 候选部署身份: 与历史残留**分开**核验 ────────────────────────────────────
+assert_candidate_identity(){   # $1=平台
+  local plat="$1" mis=0 dif=0 n=0 src name mode
+  [[ "$(sha256sum /usr/local/bin/pdg | awk '{print $1}')" == "$(sha256sum "$CANDSRC/deploy/bot/pdg.sh" | awk '{print $1}')" ]] \
+    && ok "部署身份: /usr/local/bin/pdg 逐字节等于冻结候选" || bad "部署身份: pdg 不是候选那一份"
+  # shellcheck source=/dev/null
+  source "$CANDSRC/lib/modules.sh" 2>/dev/null || { bad "部署身份: 读不到候选的 modules.sh"; return 1; }
+  while read -r src name mode; do
+    [[ -n "$name" ]] || continue
+    n=$((n+1))
+    [[ -e "/opt/pdg-bot/$name" ]] || { mis=$((mis+1)); continue; }
+    cmp -s "$CANDSRC/$src" "/opt/pdg-bot/$name" || dif=$((dif+1))
+  done < <(pdg_platform_modules "$plat")
+  { [[ "$mis" == 0 && "$dif" == 0 ]]; } \
+    && ok "部署身份: $n 项受管模块与冻结候选逐字节一致(缺 $mis / 不符 $dif)" \
+    || bad "部署身份: 受管模块与候选不一致(缺 $mis / 不符 $dif)"
+  _evn 00-identity.txt "候选部署身份: pdg+${n} 模块; 缺 $mis 不符 $dif"
+}
+
+# ── 已加载配置: 用**可区分的真实 DNS 行为**验, 并带对照 ─────────────────────
+# 自有配置特征: WLOC 时期的接管表把 gs-loc.apple.com 劫持到本机网关地址。
+# 只有恢复出来的那份 mosdns 配置真的被加载, 这个域名才会拿到劫持答案;
+# 对照域名不在接管集里, 结果必然不同。端口/hash/InvocationID 只作辅助。
+dns_answer(){   # $1=域名 → 打印 "rcode|answer"
+  local out
+  out="$(dig +time=3 +tries=1 @127.0.0.1 "$1" A 2>&1)"
+  printf '%s|%s\n' "$(grep -o 'status: [A-Z]*' <<<"$out" | head -1 | awk '{print $2}')" \
+                   "$(awk '/^;; ANSWER SECTION/{f=1;next} f&&/^[^;]/{print $NF; exit}' <<<"$out")"
+}
+dns_feature_probe(){   # $1=标签 → 打印 "劫持域答案 :: 对照域答案"
+  local hij ctl
+  hij="$(dns_answer gs-loc.apple.com)"
+  ctl="$(dns_answer control-not-hijacked.e2e.test)"
+  printf '%s :: %s\n' "$hij" "$ctl"
+  _evn "dns-probe-$1.txt" "hijacked=gs-loc.apple.com -> $hij"
+  _evn "dns-probe-$1.txt" "control =control-not-hijacked.e2e.test -> $ctl"
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
 # 四维指纹: 文件(存在性/内容/mode/uid:gid) / 运行态 / 自启态 / 已加载配置的独立依据
 # ═════════════════════════════════════════════════════════════════════════════
 FP_FILES=(/etc/systemd/system/pdg-mitm.service
           /opt/pdg-bot/mitm_server.py /opt/pdg-bot/mitm_wloc.py
+          /opt/pdg-bot/mitm_ca.py /opt/pdg-bot/iosprofile.py /opt/pdg-bot/iosstate.py
+          /opt/pdg-bot/pdg-dot.mobileconfig.tmpl
           /etc/mosdns/rules/mitm_hijack.txt /etc/privdns-gateway/mitm.json
+          /etc/privdns-gateway/platform /etc/privdns-gateway/profile.env
           /etc/privdns-gateway/ca/ca.crt /etc/privdns-gateway/ca/ca.key
           /etc/privdns-gateway/ios-profile.json
           /var/lib/privdns-gateway/ios-profile/current.mobileconfig
+          /var/lib/privdns-gateway/ios-profile/previous.mobileconfig
+          /etc/nftables.conf
           /etc/mihomo/config.yaml)
 FP_SVCS=(pdg-mitm mosdns mihomo pdg-bot pdg-probe81)
 fp_capture(){   # $1=标签 → 写 $EVID/fp-$1.tsv
@@ -984,7 +1075,11 @@ fp_capture(){   # $1=标签 → 写 $EVID/fp-$1.tsv
   chmod 600 "$f"
 }
 fp_get(){   # $1=标签 $2=类型 $3=键 → 打印那一行的其余字段
-  awk -F'\t' -v t="$2" -v k="$3" '$1==t && $2==k {sub(/^[^\t]*\t[^\t]*\t/,""); print; exit}' "$EVID/fp-$1.tsv"
+  # 按**字段**拼回去, 不用 [^\t] 这类方括号反斜杠转义 —— 那种写法在 POSIX grep/awk 下会被
+  # 截断解释(仓库的 test-false-green-guard.sh 专门盯这一条)。分隔符用真正的制表符。
+  local TAB; TAB="$(printf '\t')"
+  awk -F"$TAB" -v t="$2" -v k="$3" \
+      '$1==t && $2==k {out=$3; for(i=4;i<=NF;i++) out=out FS $i; print out; exit}' "$EVID/fp-$1.tsv"
 }
 fp_cmp_files(){   # $1=before $2=after $3=场景名 —— 四维逐项比对
   local q b a n_ok=0 n_bad=0
@@ -999,16 +1094,126 @@ fp_cmp_files(){   # $1=before $2=after $3=场景名 —— 四维逐项比对
     || bad "$3: 有 $n_bad 个文件没回到前像(上面逐项列出), 一致 $n_ok"
 }
 
+# ── 测试前置: 把冻结退役候选安装上去(只用于 A0 的阶段观测, 不是合法升级路径)──────
+install_candidate(){   # $1=平台(默认取 $FROM)
+  local n=0 name src mode plat="${1:-${FROM:-ios}}"
+  install -m755 "$CANDSRC/deploy/bot/pdg.sh" /usr/local/bin/pdg || return 1
+  # shellcheck source=/dev/null
+  source "$CANDSRC/lib/modules.sh" || return 1
+  while read -r src name mode; do
+    [[ -n "$name" ]] || continue
+    install -m"${mode:-644}" "$CANDSRC/$src" "/opt/pdg-bot/$name" 2>/dev/null || return 1
+    n=$((n+1))
+  done < <(pdg_platform_modules "$plat")
+  printf '%s\n' "$n"
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
+SECT "③ 场景 A0 —— **阶段观测**: 只看「新版迁移跑到门拒绝」这一段, 不含任何回滚"
+# ═════════════════════════════════════════════════════════════════════════════
+note "为什么要单独这一段: 完整链路里, 原版回滚**允许**重启 pdg-mitm, 于是「整段前后」的"
+note "  PID / InvocationID / journal 停止记录分不出「退役停的」还是「回滚重启的」。"
+note "  这一段把候选装上之后**只跑 __migrate**(旧 CLI 的子进程形态), 观测落在拒绝的那一刻,"
+note "  后面没有任何回滚来覆盖现场。它与下面的完整链路各自成立, 不互相替代。"
+build_preimage ios on
+# 前像先稳下来再采样: activating/deactivating 时采到的东西两边对不上(见 helpers 里的说明)。
+for _u in pdg-mitm mosdns mihomo pdg-probe81; do
+  printf '    %-14s 稳定后 ActiveState=%s\n' "$_u" "$(wait_stable "$_u")"
+done
+assert_preimage_A
+: > "$RESIDUE_MANIFEST"
+residue_record /etc/systemd/system/pdg-mitm.service "v1.11.15 的 unit 模板(pdg_write_unit pdg_unit_pdg_mitm)"
+residue_record /opt/pdg-bot/mitm_server.py         "v1.11.15 源码树 deploy/bot/mitm_server.py"
+residue_record /opt/pdg-bot/mitm_wloc.py           "v1.11.15 源码树 deploy/bot/mitm_wloc.py"
+residue_record /etc/mosdns/rules/mitm_hijack.txt   "旧版接管表(WLOC 自有域名)"
+residue_record /etc/privdns-gateway/mitm.json      "旧版 WLOC 配置(enabled=true + 用户地点)"
+residue_record /etc/privdns-gateway/ios-profile.json "旧版 schema-1 记录"
+residue_report
+
+if [[ "$PREIMAGE_OK" != 1 ]]; then
+  nrun "场景 A0: 前像不成立, 本段未执行"
+else
+A0_INV="$(systemctl show -p InvocationID --value pdg-mitm 2>/dev/null)"
+A0_PID="$(systemctl show -p MainPID --value pdg-mitm 2>/dev/null)"
+A0_UNIT="$(sha256sum /etc/systemd/system/pdg-mitm.service | awk '{print $1}')"
+A0_SCHEMA="$(python3 -c 'import json;print(json.load(open("/etc/privdns-gateway/ios-profile.json")).get("schema"))' 2>/dev/null)"
+A0_HIJ="$(sha256sum /etc/mosdns/rules/mitm_hijack.txt | awk '{print $1}')"
+A0_DNS="$(dns_feature_probe A0-before)"
+note "A0: 前像的 DNS 行为特征 = $A0_DNS"
+# 装候选(测试前置), 并把部署身份与历史残留**分开**核验
+install_candidate ios >/dev/null || bad "A0: 装候选失败"
+switch_repo_to_candidate ios >/dev/null 2>&1 || true
+systemctl daemon-reload
+assert_candidate_identity ios
+echo
+echo "── 只跑新版 __migrate(不带前像句柄, 正是旧 CLI 子进程的形态) ──"
+MG="$(bash /usr/local/bin/pdg __migrate 2>&1)"; MGRC=$?
+printf '%s\n' "$MG" | _ev 03-A0-migrate.log
+_evn 03-A0-migrate.log "### rc=$MGRC"
+echo "$MG" | tail -30 | sed 's/^/    /'
+grep -q '不执行 WLOC 退役迁移: 调用方不具备可靠回滚能力' <<<"$MG" \
+  && ok "A0-1: 门在这一刻**拒绝**了(无句柄调用)" || bad "A0-1: 没看到拒绝"
+[[ "$MGRC" != 0 ]] && ok "A0-1: __migrate 返回非 0(实得 $MGRC)" || bad "A0-1: 返回 0"
+echo "── 拒绝这一刻的现场(**没有任何回滚覆盖过**) ──"
+[[ "$(systemctl show -p InvocationID --value pdg-mitm 2>/dev/null)" == "$A0_INV" ]] \
+  && ok "A0-2: pdg-mitm 的 InvocationID 未变($A0_INV) —— 它没有被停过" || bad "A0-2: InvocationID 变了"
+[[ "$(systemctl show -p MainPID --value pdg-mitm 2>/dev/null)" == "$A0_PID" ]] \
+  && ok "A0-2: MainPID 未变($A0_PID) —— 还是同一个进程" || bad "A0-2: MainPID 变了"
+[[ "$(sc_state is-active pdg-mitm)" == active ]] && ok "A0-2: pdg-mitm 仍在运行" || bad "A0-2: pdg-mitm 不在运行"
+[[ "$(sc_state is-enabled pdg-mitm)" == enabled ]] && ok "A0-2: 自启仍是 enabled(没有被 disable 过)" || bad "A0-2: 自启=$(sc_state is-enabled pdg-mitm)"
+[[ "$(sha256sum /etc/systemd/system/pdg-mitm.service 2>/dev/null | awk '{print $1}')" == "$A0_UNIT" ]] \
+  && ok "A0-2: pdg-mitm unit 还在盘上且逐字节未变" || bad "A0-2: unit 被动过"
+[[ -e /opt/pdg-bot/mitm_server.py && -e /opt/pdg-bot/mitm_wloc.py ]] \
+  && ok "A0-2: 两个 WLOC 执行件都还在" || bad "A0-2: 执行件被删了"
+[[ "$(python3 -c 'import json;print(json.load(open("/etc/privdns-gateway/ios-profile.json")).get("schema"))' 2>/dev/null)" == "$A0_SCHEMA" ]] \
+  && ok "A0-2: iOS 记录仍是 schema $A0_SCHEMA(格式没有被推进)" || bad "A0-2: schema 被推进了"
+[[ "$(sha256sum /etc/mosdns/rules/mitm_hijack.txt | awk '{print $1}')" == "$A0_HIJ" ]] \
+  && ok "A0-2: 接管表逐字节未变" || bad "A0-2: 接管表被动过"
+A0_DNS_AFTER="$(dns_feature_probe A0-after)"
+[[ "$A0_DNS_AFTER" == "$A0_DNS" ]] \
+  && ok "A0-3: 已加载配置: 拒绝前后 DNS 行为特征一致($A0_DNS_AFTER) —— 解析器没有被改过" \
+  || bad "A0-3: DNS 行为变了($A0_DNS → $A0_DNS_AFTER)"
+ss -lnt 2>/dev/null | grep -q ':7894 ' && ok "A0-3: 7894 仍有监听" || bad "A0-3: 7894 没有监听"
+fi
+
 # ═════════════════════════════════════════════════════════════════════════════
 SECT "③ 场景 A —— 原版旧 CLI 直接跳退役候选: 被门拒绝, 再由原版自己回滚"
 # ═════════════════════════════════════════════════════════════════════════════
 note "前像构造方式: 旧版(v1.11.15)自己的模块、unit 模板与渲染器 + 自造证书/配置。"
 note "**这是「旧版文件与服务构造的前像」, 不是「完整执行过旧安装器 install.sh」。** 两者本报告分开记。"
 build_preimage ios on
+# 前像先达到合法稳定状态再采样。pdg-bot 没有凭据 —— 用**产品支持的停用态**, 不造假凭据、
+# 不为了凑 active 起一个起不来的服务。
+systemctl disable pdg-bot >/dev/null 2>&1 || true
+systemctl stop    pdg-bot >/dev/null 2>&1 || true
+# enabled-runtime 选一个**能稳定运行的真实受管服务**: pdg-probe81。
+systemctl disable pdg-probe81 >/dev/null 2>&1 || true
+systemctl enable --runtime pdg-probe81 >/dev/null 2>&1 || true
+systemctl start pdg-probe81 >/dev/null 2>&1 || true
+for _u in pdg-mitm mosdns mihomo pdg-probe81 pdg-bot; do
+  printf '    %-14s 稳定后 ActiveState=%s UnitFileState=%s\n' "$_u" "$(wait_stable "$_u")" \
+    "$(systemctl show -p UnitFileState --value "$_u" 2>/dev/null)"
+done
+[[ "$(sc_state is-enabled pdg-probe81)" == enabled-runtime ]] \
+  && ok "A: 前像里 pdg-probe81 的自启是 enabled-runtime(真 systemd 实测)" \
+  || bad "A: pdg-probe81 自启=$(sc_state is-enabled pdg-probe81), 不是 enabled-runtime"
+{ [[ "$(sc_state is-active pdg-bot)" != active && "$(sc_state is-enabled pdg-bot)" != enabled ]]; } \
+  && ok "A: 前像里 pdg-bot 是产品支持的停用态(没配凭据; 不造假凭据)" \
+  || bad "A: pdg-bot 不是停用态(active=$(sc_state is-active pdg-bot) enabled=$(sc_state is-enabled pdg-bot))"
 assert_preimage_A
+: > "$RESIDUE_MANIFEST"
+residue_record /etc/systemd/system/pdg-mitm.service "v1.11.15 的 unit 模板(pdg_write_unit pdg_unit_pdg_mitm)"
+residue_record /opt/pdg-bot/mitm_server.py         "v1.11.15 源码树 deploy/bot/mitm_server.py"
+residue_record /opt/pdg-bot/mitm_wloc.py           "v1.11.15 源码树 deploy/bot/mitm_wloc.py"
+residue_record /etc/mosdns/rules/mitm_hijack.txt   "旧版接管表(WLOC 自有域名)"
+residue_record /etc/privdns-gateway/mitm.json      "旧版 WLOC 配置(enabled=true + 用户地点)"
+residue_record /etc/privdns-gateway/ios-profile.json "旧版 schema-1 记录"
+residue_report
 snap_state A-before
 fp_capture A-before
 svc_snapshot "$E2E_TMP/svc-A-before.tsv"
+A_DNS_BEFORE="$(dns_feature_probe A-before)"
+note "A: 前像的 DNS 行为特征 = $A_DNS_BEFORE"
 
 if [[ "$PREIMAGE_OK" != 1 ]]; then
   nrun "场景 A: 前像不成立, 本场景未执行(既不算通过也不算产品失败)"
@@ -1054,33 +1259,29 @@ grep -q '新版文件已经装上了' <<<"$UP" && ok "A-1: 文案**没有**谎�
 grep -q '已可完整回滚' <<<"$UP" && bad "A-1: 未经实测就承诺已可完整回滚" || ok "A-1: 没有未经实测地承诺完整回滚"
 
 echo
-echo "── A-2. 拒绝前有没有撤除 WLOC 服务 / 执行件 / 推进 schema ──"
-note "判据说明: 拒绝之后原版回滚会把快照整棵树盖回去, 所以**文件 inode 不能用作见证**。"
-note "          能跨过回滚活下来的见证是: pdg-mitm 这个服务的 InvocationID/MainPID/NRestarts"
-note "          (原版回滚的 pdg-mitm 分支要求 is-enabled 成立, 快照不收 wants/ 故不触发),"
-note "          以及整份升级日志里有没有出现退役各步骤的**进度输出**。"
-MITM_INV_AFTER="$(systemctl show -p InvocationID --value pdg-mitm 2>/dev/null)"
-MITM_PID_AFTER="$(systemctl show -p MainPID --value pdg-mitm 2>/dev/null)"
-MITM_NR_AFTER="$(systemctl show -p NRestarts --value pdg-mitm 2>/dev/null)"
-{ [[ -n "$MITM_INV_BEFORE" && "$MITM_INV_AFTER" == "$MITM_INV_BEFORE" ]]; } \
-  && ok "A-2: pdg-mitm 的 InvocationID 全程未变($MITM_INV_BEFORE) —— 它一次都没有被停过" \
-  || bad "A-2: pdg-mitm 的 InvocationID 变了($MITM_INV_BEFORE → $MITM_INV_AFTER)"
-[[ "$MITM_PID_AFTER" == "$MITM_PID_BEFORE" ]] \
-  && ok "A-2: pdg-mitm 的 MainPID 全程未变($MITM_PID_BEFORE) —— 还是同一个进程" \
-  || bad "A-2: MainPID 变了($MITM_PID_BEFORE → $MITM_PID_AFTER)"
-[[ "$MITM_NR_AFTER" == "$MITM_NR_BEFORE" ]] \
-  && ok "A-2: pdg-mitm 的 NRestarts 未变($MITM_NR_BEFORE)" || bad "A-2: NRestarts $MITM_NR_BEFORE → $MITM_NR_AFTER"
+echo "── A-2. 阶段关系: 拒绝在前, 回滚在后(整段判据只作辅助) ──"
+note "本段**不再**要求「整个过程 pdg-mitm 的 PID / InvocationID 不变」或「journal 里没有停止记录」——"
+note "  原版回滚里那句 `systemctl is-enabled pdg-mitm && { reset-failed; restart pdg-mitm; }`"
+note "  在自启仍是 enabled 时**会触发**, 于是它自己就会重启一次。那属于「允许旧回滚执行其既有"
+note "  重启动作」, 必须列明(见 A-5), 不能当成「被退役停过」。"
+note "  「拒绝前没有撤除」这件事由上面的**场景 A0 阶段观测**单独给出; 这里只核对先后顺序。"
+LN_REFUSE="$(grep -n '不执行 WLOC 退役迁移' <<<"$UP" | head -1 | cut -d: -f1)"
+LN_ROLL="$(grep -n '回滚到更新前快照' <<<"$UP" | head -1 | cut -d: -f1)"
+{ [[ -n "$LN_REFUSE" && -n "$LN_ROLL" && "$LN_REFUSE" -lt "$LN_ROLL" ]]; } \
+  && ok "A-2: 同一条输出流里, 拒绝(第 $LN_REFUSE 行)排在回滚(第 $LN_ROLL 行)**之前**" \
+  || bad "A-2: 先后关系取不到或反了(拒绝=$LN_REFUSE, 回滚=$LN_ROLL)"
 grep -q 'iOS 描述文件记录已迁移到新格式' <<<"$UP" \
   && bad "A-2: 日志里出现了「记录已迁移到新格式」—— schema 被推进过" \
   || ok "A-2: 日志里没有「记录已迁移到新格式」—— schema 没有被推进"
 grep -qE '已清理 iOS 专属残留|WLOC 退役: 已' <<<"$UP" \
   && bad "A-2: 日志里出现了退役完成类输出" || ok "A-2: 日志里没有退役完成类输出"
-sudo journalctl -u pdg-mitm --since "$JSTART" --no-pager 2>/dev/null | _ev 03-A-journal-pdg-mitm.txt
-JN="$(journalctl -u pdg-mitm --since "$JSTART" --no-pager 2>/dev/null | grep -cE 'Stopping|Stopped|Deactivated' || true)"
-[[ "${JN:-0}" == 0 ]] && ok "A-2: journal 里 pdg-mitm 没有任何 Stopping/Stopped 记录" \
-                      || bad "A-2: journal 里有 $JN 条 pdg-mitm 停止记录"
+# 辅助(不单独作证): 自启仍是 enabled ⇒ 从没被 disable 过 —— 快照不收 wants/, disable 补不回来。
+[[ "$(sc_state is-enabled pdg-mitm)" == enabled ]] \
+  && ok "A-2(辅助): 回滚后自启仍是 enabled —— 退役那一步的 disable 从未发生(快照不收 wants/, 补不回来)" \
+  || note "A-2(辅助): 回滚后自启=$(sc_state is-enabled pdg-mitm)"
+journalctl -u pdg-mitm --since "$JSTART" --no-pager 2>/dev/null | _ev 03-A-journal-pdg-mitm.txt
+note "A-2: pdg-mitm 的 journal 已留证(03-A-journal-pdg-mitm.txt), 作为回滚重启动作的记录, 不作判据。"
 
-echo
 echo "── A-3. 随后的**原版**回滚是否实际执行 ──"
 grep -q '回滚到更新前快照' <<<"$UP" && ok "A-3: 升级失败后触发了回滚" || bad "A-3: 没有触发回滚"
 grep -qE '✅ 已回滚并重启服务|已回滚配置/服务' <<<"$UP" && ok "A-3: 回滚跑到了它自己的收尾输出" || bad "A-3: 回滚没有收尾输出"
@@ -1106,6 +1307,22 @@ L7894_B="$(fp_get A-before L 7894)"; L7894_A="$(fp_get A-after L 7894)"
 [[ "$L7894_B" == "$L7894_A" ]] \
   && ok "A-4 已加载配置(独立依据): 7894 的真实监听数与前像一致($L7894_A) —— 服务确实在按恢复出来的配置提供服务" \
   || bad "A-4 已加载配置: 7894 监听数 前像=$L7894_B 现在=$L7894_A"
+# 产品自己写下的前像与测试指纹逐项对账(两边必须看到同一件事)
+A_SNAP="$(ls -1dt "${SNAP_DIR:-/var/lib/privdns-gateway/backups}"/* 2>/dev/null | head -1)"
+if [[ -n "$A_SNAP" && -s "$A_SNAP/svcstate.tsv" ]]; then
+  note "A-4: 产品写的前像 = $A_SNAP/svcstate.tsv"
+  svcstate_cross_check "$A_SNAP/svcstate.tsv" "A-4"
+else
+  note "A-4: 这一轮没找到产品写的 svcstate.tsv(旧 CLI 的快照本来就没有这一份, 属预期)"
+fi
+A_DNS_AFTER="$(dns_feature_probe A-after)"
+[[ "$A_DNS_AFTER" == "$A_DNS_BEFORE" ]] \
+  && ok "A-4 已加载配置(可区分行为): 恢复后 DNS 特征与前像一致($A_DNS_AFTER)" \
+  || bad "A-4 已加载配置: DNS 特征变了($A_DNS_BEFORE → $A_DNS_AFTER)"
+A_HIJ_ANS="${A_DNS_AFTER%% ::*}"; A_CTL_ANS="${A_DNS_AFTER##*:: }"
+[[ -n "$A_HIJ_ANS" && "$A_HIJ_ANS" != "$A_CTL_ANS" ]] \
+  && ok "A-4 已加载配置(对照): 被接管的域名与对照域名结果**不同**($A_HIJ_ANS vs $A_CTL_ANS) —— 特征确实在起作用" \
+  || bad "A-4 已加载配置: 接管域与对照域结果相同($A_HIJ_ANS vs $A_CTL_ANS), 这条特征证明不了配置被加载"
 L53_B="$(fp_get A-before L 53)"; L53_A="$(fp_get A-after L 53)"
 [[ "$L53_B" == "$L53_A" ]] && ok "A-4 已加载配置: 53/udp 监听数与前像一致($L53_A)" || bad "A-4 已加载配置: 53 监听 $L53_B → $L53_A"
 if command -v dig >/dev/null 2>&1; then
