@@ -18,37 +18,52 @@
 # ─────────────────────────────────────────────────────────────────────────────
 set -uo pipefail
 
-if [[ "${PDG_CHAIN_NS:-}" != 1 ]]; then
+# ── 隔离入口 ────────────────────────────────────────────────────────────────
+# 三段式: 未进隔离(变量空) → 进了 unshare(=1) → 进了 bwrap(=2)。
+# 最外层判据必须是"变量为空", 不能写成 `!= 1` —— bwrap 那条回退路径会把变量设成 2,
+# 用 `!= 1` 判就会**再进一次初始化分支**, 变成递归入口。
+# 自有根一建出来就先挂上清理; 交接给 exec 出去的进程时再撤掉(那边有自己的清理)。
+if [[ -z "${PDG_CHAIN_NS:-}" ]]; then
   HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  FAKE="$(mktemp -d)"
+  FAKE="$(mktemp -d)" || { echo "[未执行] 建不出自有根"; exit 1; }
+  trap 'rm -rf "$FAKE"' EXIT          # 这一段里任何退出路径都归它清
   mkdir -p "$FAKE/etc/privdns-gateway" "$FAKE/etc/systemd/system" "$FAKE/etc/mosdns/rules" \
-           "$FAKE/etc/mihomo" "$FAKE/opt/pdg-bot" "$FAKE/usr/local/bin"
-  # /etc 整个被换掉之后, 走 /etc/alternatives 的那些命令(awk 就是)会消失。把必需的几样
-  # 复制进自有根 —— 复制的是符号链接本身, 指向的仍是 /usr/bin 下的真文件。
+           "$FAKE/etc/mihomo" "$FAKE/opt/pdg-bot" "$FAKE/usr/local/bin" "$FAKE/run" \
+    || { echo "[未执行] 自有根建不全"; exit 1; }
+  # /etc 整个被换掉会让走 /etc/alternatives 的命令(awk)消失, 先把必需的几样放进去。
   cp -a /etc/alternatives "$FAKE/etc/" 2>/dev/null
-  for _f in passwd group nsswitch.conf localtime hosts resolv.conf; do
-    cp -a "/etc/$_f" "$FAKE/etc/" 2>/dev/null
-  done
-  export FAKE PDG_CHAIN_NS=1
+  for _f in passwd group nsswitch.conf localtime hosts resolv.conf; do cp -a "/etc/$_f" "$FAKE/etc/" 2>/dev/null; done
+  export FAKE
   if unshare --map-root-user --mount --propagation private true 2>/dev/null; then
+    export PDG_CHAIN_NS=1; trap - EXIT      # 所有权交给下面 exec 出去的那个进程
     exec unshare --map-root-user --mount --propagation private bash "$HERE/$(basename "${BASH_SOURCE[0]}")" "$@"
-  elif command -v bwrap >/dev/null 2>&1; then
+  elif bwrap --version >/dev/null 2>&1; then   # 看它**能不能用**, 不只是 PATH 里有
+    export PDG_CHAIN_NS=2; trap - EXIT
     exec bwrap --dev-bind / / --bind "$FAKE/etc" /etc --bind "$FAKE/opt" /opt \
-               --bind "$FAKE/usr/local/bin" /usr/local/bin \
-               -- env PDG_CHAIN_NS=2 FAKE="$FAKE" bash "$HERE/$(basename "${BASH_SOURCE[0]}")" "$@"
-  else
-    echo "[未执行] 建不出挂载隔离(没有可用的 unshare/bwrap)。"
-    echo "         这一支会让真实 cmd_rollback 往 /etc、/opt、/usr/local/bin 落盘,"
-    echo "         没有自有根就不能跑 —— 不靠权限失败兜底, 也不冒充通过。"
-    exit 1
+               --bind "$FAKE/usr/local/bin" /usr/local/bin --bind "$FAKE/run" /run \
+               -- bash "$HERE/$(basename "${BASH_SOURCE[0]}")" "$@"
   fi
+  echo "[未执行] 建不出挂载隔离(没有可用的 unshare/bwrap)。"
+  echo "         这一支会让真实 cmd_rollback 会往 /etc /opt /usr/local/bin 落盘, 没有自有根就不能跑 ——"
+  echo "         不靠权限失败兜底, 也不冒充通过。"
+  exit 1
 fi
-if [[ "${PDG_CHAIN_NS:-}" == 1 ]]; then
+# 进到这里说明已经在隔离里。先把清理挂上, 再做挂载 —— 挂载失败也有人负责清。
+trap 'rm -rf "${WORK:-}" "$FAKE"' EXIT
+if [[ "${PDG_CHAIN_NS}" == 1 ]]; then
   mount --bind "$FAKE/etc" /etc || { echo "[未执行] 绑定 /etc 失败"; exit 1; }
   mount --bind "$FAKE/opt" /opt || { echo "[未执行] 绑定 /opt 失败"; exit 1; }
   mount --bind "$FAKE/usr/local/bin" /usr/local/bin || { echo "[未执行] 绑定 /usr/local/bin 失败"; exit 1; }
+  mount --bind "$FAKE/run" /run || { echo "[未执行] 绑定 /run 失败"; exit 1; }
 fi
-
+# 隔离自检: **只读**核实归属 —— 比 /etc 与自有根里那一份的 dev:inode 是不是同一个。
+# 不往宿主路径写探针: 真要没隔离住, 那一笔就落到宿主上了, 判据本身成了事故。
+for _m in etc opt usr/local/bin run; do
+  if [[ "$(stat -c '%d:%i' "/$_m" 2>/dev/null)" != "$(stat -c '%d:%i' "$FAKE/$_m" 2>/dev/null)" ]]; then
+    echo "[未执行] 隔离自检失败: /$_m 不是自有根里的那一份(只读核实, 未做任何写入)"
+    exit 1
+  fi
+done
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 PDG="${PDG_UNDER_TEST:-$ROOT/deploy/bot/pdg.sh}"
@@ -57,10 +72,6 @@ pass=0; nfail=0
 ok(){ echo "[OK]   $1"; pass=$((pass+1)); }
 bad(){ echo "[FAIL] $1"; nfail=$((nfail+1)); }
 [[ -f "$PDG" ]] || { bad "找不到 $PDG"; echo "通过 0, 失败 1"; exit 1; }
-# 自证隔离真的生效: 往 /etc 写一笔, 必须落在自有根里
-echo probe > /etc/pdg-chain-isolation-probe
-[[ -f "$FAKE/etc/pdg-chain-isolation-probe" ]] || { echo "[未执行] 隔离自检失败: 写 /etc 没有落进自有根"; exit 1; }
-rm -f /etc/pdg-chain-isolation-probe
 
 _fn1(){ grep -m1 -E "^$2\(\)\{.*\}[[:space:]]*\$" "$1"; }
 _fnN(){ sed -n "/^$2(){/,/^}/p" "$1"; }
