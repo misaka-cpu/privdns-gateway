@@ -1034,6 +1034,18 @@ jobs:
       - name: "WLOC 退役 · 旧 CA 残留报告 (Android 也要报; 三态各自具名; 撤销依赖或兜底即转红)"
         run: bash tests/test-wloc-retire-ca-report.sh
 
+      # 快照只收文件, enable 的符号链接在 multi-user.target.wants/ 下从不入快照 —— 于是
+      # "文件都回来了、服务却停着且不自启"会被回滚自报成"已回滚并重启服务"。这三支盯的就是
+      # 这一格: 前像怎么存、怎么判"是不是本次操作的"、恢复到什么程度算恢复。
+      - name: "服务前像恢复 (三态各自恢复/enabled-runtime 不提升/动作成功但状态不符也算未恢复; 两条撤销对照)"
+        run: bash tests/test-svcstate-restore.sh
+
+      - name: "退役迁移调用方门 (旧记录·错快照·缺记录·不完整·查询异常·无锁分别拒绝; 拒绝前零服务动作; 撤掉门即进入停服务路径)"
+        run: bash tests/test-migrate-caller-gate.sh
+
+      - name: "迁移入口契约 (总入口逐字节未变/门只在动手前那一处/无旁路开关/前像存不下即中止)"
+        run: bash tests/test-migrate-entry-contract.sh
+
       - name: "平台文案/门控回归 (客户端·状态 按平台/内核 + README 文案一致)"
         run: python3 tests/test-platform-copy.py
 
