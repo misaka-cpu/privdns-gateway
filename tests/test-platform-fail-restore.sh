@@ -93,6 +93,10 @@ systemctl(){
             *) echo "";;
           esac; return 0;;
   esac
+  # 动作层的两个钩子: .fail_<动作> 返回 1 且不改状态; .lie_<动作> 返回 0 但也不改状态。
+  # 有了它们才构造得出"动作失败 / 动作说成功但没生效"这两格 —— 缺一格就分不清是哪种失败。
+  [[ -e "$SC_DIR/$u.fail_$act" ]] && return 1
+  [[ -e "$SC_DIR/$u.lie_$act"  ]] && return 0
   case "$act" in
     enable)  if [[ "$2" == --runtime ]]; then now=enabled-runtime; else now=enabled; fi
              _chg "$u" en "$now"
@@ -224,6 +228,17 @@ run_platform(){   # $1=目标平台 $2=fail|nofail $3=场景目录 [$4=被测 pd
       echo "    \"\$( [[ -e /etc/systemd/system/pdg-mitm.service ]] && echo present || echo gone )\" \\"
       echo "    \"\$( [[ -e /opt/pdg-bot/mitm_server.py ]] && echo present || echo gone )\" \\"
       echo "    \"\$( [[ -e /opt/pdg-bot/mitm_wloc.py ]] && echo present || echo gone )\" > \"$d/stage-proof\"; return 1; }"
+    elif [[ "$mode" == fail-early ]]; then
+      # **退役件一件都还没撤**就失败(profile.env 写入失败那一格, 排在 _plat_deploy_ios /
+      # migrate_android_cleanup 之前)。此时 _PDG_RETIRE_DONE=0, 失败善后走**局部还原**
+      # _plat_rollback —— 这一支正是要验它的失败传播。
+      echo '_plat_write_profile(){ [[ -n "${1:-}" ]] && printf "PROFILE-%s\n" "$1" > /etc/privdns-gateway/profile.env; return 1; }'
+    elif [[ "$mode" == fail-early-enrc ]]; then
+      # 同上, 外加: 让**自启恢复动作**返回非零, 而此刻的自启值**恰好就等于目标**。
+      echo "_plat_write_profile(){ : > \"\$SC_DIR/pdg-mitm.fail_enable\"; return 1; }"
+    elif [[ "$mode" == fail-early-lie ]]; then
+      # 同上, 外加: 自启值被改掉, 而恢复动作**返回 0 却不生效** —— 后置不符那一格。
+      echo "_plat_write_profile(){ echo disabled > \"\$SC_DIR/pdg-mitm.en\"; : > \"\$SC_DIR/pdg-mitm.lie_enable\"; return 1; }"
     elif [[ "$mode" == fail ]]; then
       echo "_switchcore_nft(){ printf 'unit=%s server=%s wloc=%s\n' \\"
       echo "  \"\$( [[ -e /etc/systemd/system/pdg-mitm.service ]] && echo present || echo gone )\" \\"
@@ -367,6 +382,52 @@ else
   [[ ! -e /etc/systemd/system/pdg-mitm.service ]] && ok "D1: 局部还原补不回 pdg-mitm.service —— 这正是原来的现场" || bad "D1: 反向对照没体现差异"
   [[ ! -e /opt/pdg-bot/mitm_server.py ]] && ok "D2: 也补不回 mitm_server.py" || bad "D2: 反向对照没体现差异"
 fi
+
+echo
+echo "══ 四之二. 局部还原(_plat_rollback)的自启失败必须穿透 ══"
+# 这一节跑的是**真实的 _plat_rollback**: 失败点排在退役件撤除之前(_PDG_RETIRE_DONE=0),
+# 失败善后因此自然走局部还原那一支, 不用改产品也不用反向副本。
+# 三格分开: ① 动作失败但最终值恰好等于目标 ② 动作返回 0 却没生效 ③ 完整健康恢复。
+
+# ── ① 动作返回非零, 而最终观察值**恰好等于目标** ────────────────────────────
+seed_machine android; d="$WORK/enrc"; mkdir -p "$d"
+o="$(run_platform ios fail-early-enrc "$d")"; p="$(plain "$o")"
+exec_valid "$o" "F"
+grep -q 'PLAT_RC=0' <<<"$p" && bad "F1: 切换失败却返回 0" || ok "F1: 返回非 0"
+[[ "$(cat "$SC/pdg-mitm.en" 2>/dev/null)" == enabled ]] \
+  && ok "F2: 前提成立 —— 自启的最终观察值确实等于目标(enabled)" \
+  || bad "F2: 前提不成立, 最终值是 $(cat "$SC/pdg-mitm.en" 2>/dev/null)"
+grep -qE 'pdg-mitm 自启恢复动作失败\(目标 enabled, rc=[1-9]' <<<"$p" \
+  && ok "F3: 动作失败被**具名**记下(带返回码), 没有因为最终值一样就被吞掉" \
+  || { bad "F3: 动作失败被吞了"; grep -E '未能恢复|没有确认恢复|自启' <<<"$p" | tail -4 | sed 's/^/      /'; }
+# "已恢复**到**原平台…"是无保留的成功句(_miss 为空才打); 有失败项时只能打带"没有确认恢复"的那句。
+grep -q '已恢复到原平台' <<<"$p" && bad "F4: 打出了无保留的成功句, 等于宣称局部恢复全部成功" \
+                                 || ok "F4: **没有**宣称局部恢复全部成功"
+grep -qE '没有确认恢复' <<<"$p" && ok "F5: 明说有项目没有确认恢复" || bad "F5: 没说"
+grep -qE '快照仍在, 可 sudo pdg rollback --dir' <<<"$p" \
+  && ok "F6: 给出了仍有用途的材料路径(快照)" || bad "F6: 没给材料路径"
+grep -q '^start pdg-mitm$' "$d/sc.log" \
+  && ok "F7: 自启那一步失败之后, **运行态恢复照常继续**(安全且独立的动作没被中断)" \
+  || { bad "F7: 后面的恢复动作被带停了"; tail -8 "$d/sc.log" | sed 's/^/      /'; }
+
+# ── ② 动作返回 0, 但状态没生效(后置不符)——与①分开记 ────────────────────────
+seed_machine android; d="$WORK/enlie"; mkdir -p "$d"
+o="$(run_platform ios fail-early-lie "$d")"; p="$(plain "$o")"
+exec_valid "$o" "G"
+grep -q 'PLAT_RC=0' <<<"$p" && bad "G1: 切换失败却返回 0" || ok "G1: 返回非 0"
+grep -qE 'pdg-mitm 自启\(目标 enabled\)' <<<"$p" \
+  && ok "G2: 后置不符被具名记下" || { bad "G2"; grep -E '未能恢复|没有确认恢复' <<<"$p" | tail -3 | sed 's/^/      /'; }
+grep -qE 'pdg-mitm 自启恢复动作失败' <<<"$p" \
+  && bad "G3: 动作明明返回 0, 却记成了动作失败(两类混算)" || ok "G3: 动作成功与后置不符**分开**记"
+
+# ── ③ 完整健康恢复: 不该冒出任何未恢复项 ────────────────────────────────────
+seed_machine android; d="$WORK/enok"; mkdir -p "$d"
+o="$(run_platform ios fail-early "$d")"; p="$(plain "$o")"
+exec_valid "$o" "H"
+grep -q 'PLAT_RC=0' <<<"$p" && bad "H1: 切换失败却返回 0" || ok "H1: 返回非 0(原始操作确实失败了)"
+grep -qE 'pdg-mitm 自启' <<<"$p" && bad "H2: 健康路径冒出了自启未恢复项" || ok "H2: 健康路径没有多余的未恢复项"
+grep -qE '没有确认恢复' <<<"$p" && bad "H3: 健康路径却说有项目没确认恢复" || ok "H3: 局部还原被判为完整"
+grep -q '已恢复到原平台' <<<"$p" && ok "H4: 健康路径打的是无保留的成功句(逐项复核过)" || bad "H4: 连恢复都没报"
 
 echo
 echo "══ 五. 恢复动作自身失败: 不能被后续成功盖过去 ══"
