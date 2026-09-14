@@ -54,6 +54,20 @@ note(){ echo "[NOTE] $1"; }
 E2E_NOTRUN=0
 nrun(){ echo "[未执行] $1"; E2E_NOTRUN=$((E2E_NOTRUN+1)); }
 
+# ── 自检: 脚本里不许再出现"把 ca_der_from_pem 当成 mitm_ca 的成员"这种调用 ──────────
+# 上一轮只改对了两处里的一处, 另一处照旧 AttributeError, 场景 A 与晚期恢复整场未执行。
+# 判据只看**可执行行**(注释里的来龙去脉不必清零); 模式是拼出来的, 免得这条自检自己命中。
+_selfcheck_badcall(){
+  local pat n
+  pat="mitm_ca"".""ca_der_from_pem"
+  n="$(grep -vE '^[[:space:]]*#' "${BASH_SOURCE[0]}" | grep -cF -- "$pat" || true)"
+  if [[ "$n" == 0 ]]; then
+    ok "自检: 可执行行里没有 ${pat} 这种调用(它定义在 iosprofile, 不在 mitm_ca)"
+  else
+    bad "自检: 可执行行里还有 $n 处 ${pat} —— 上一轮就是漏了第二处"
+  fi
+}
+
 e2e_enter "$@"
 
 # 两个提交分工明确, 报告里也分开记:
@@ -139,6 +153,7 @@ for c in git python3 openssl ss curl sha256sum; do
   command -v "$c" >/dev/null 2>&1 || _hard "缺命令: $c"
 done
 ok "基础命令齐备(git/python3/openssl/ss/curl/sha256sum)"
+_selfcheck_badcall
 
 e2e_mihomo_is_real 2>/dev/null && ok "mihomo 是真钉死版二进制" || _hard "mihomo 不是真二进制(夹具没装上?)"
 [[ -f /usr/local/bin/mosdns && "$(stat -c %s /usr/local/bin/mosdns)" -gt 1000000 ]] \
@@ -652,8 +667,9 @@ if inp.get("wloc_enabled") is not wl:    fail.append("inputs.wloc_enabled=%r(应
 if inp.get("ssids") != ["HomeWiFi"]:     fail.append("SSID 意图没写进 current.inputs.ssids(实得 %r)" % (inp.get("ssids"),))
 if b"HomeWiFi" not in data:              fail.append("产物里没有预置的 SSID")
 if wl:
-    import mitm_ca
-    der = mitm_ca.ca_der_from_pem(mitm_ca.ca_cert_pem())
+    # ca_der_from_pem 定义在 **iosprofile**(v1.11.15 与候选都一样), mitm_ca 里没有这个名字。
+    import iosprofile, mitm_ca
+    der = iosprofile.ca_der_from_pem(mitm_ca.ca_cert_pem())
     if inp.get("wloc_ca_sha256") != hashlib.sha256(der).hexdigest():
         fail.append("记录里的 CA 指纹与盘上 CA 对不上")
     if b"com.apple.security.root" not in data:
