@@ -51,10 +51,13 @@ systemctl(){
   local u="${*: -1}"
   case "$1" in
     is-enabled) [[ -e "$SC_DIR/$u.broken" ]] && { echo; return 1; }
-                cat "$SC_DIR/$u.en" 2>/dev/null || { echo not-found; return 1; }; return 0;;
-    is-active)  cat "$SC_DIR/$u.ac" 2>/dev/null || { echo inactive; return 3; }; return 0;;
+                local v; v="$(cat "$SC_DIR/$u.en" 2>/dev/null)" || { echo not-found; return 1; }
+                echo "$v"; case "$v" in enabled|enabled-runtime|static|indirect|generated|alias) return 0;; *) return 1;; esac;;
+    is-active)  [[ -e "$SC_DIR/$u.abroken" ]] && { echo; return 1; }
+                local a; a="$(cat "$SC_DIR/$u.ac" 2>/dev/null)" || { echo inactive; return 3; }
+                echo "$a"; [[ "$a" == active ]] && return 0 || return 3;;
     show) case "$3" in
-            LoadState)    [[ -e "$SC_DIR/$u.en" || -e "$SC_DIR/$u.broken" ]] && echo loaded || echo not-found;;
+            LoadState)    [[ -e "$SC_DIR/$u.en" || -e "$SC_DIR/$u.broken" || -e "$SC_DIR/$u.abroken" ]] && echo loaded || echo not-found;;
             SubState)     cat "$SC_DIR/$u.sub" 2>/dev/null || echo dead;;
             InvocationID) cat "$SC_DIR/$u.inv" 2>/dev/null || echo "";;
             *) echo "";;
@@ -81,9 +84,10 @@ mk_child(){     # $1=场景目录 ; 子进程 = 扮演 `pdg __migrate`, 跑**产
     echo "SC_DIR=\"$d/sc\"; SC_LOG=\"$d/sc.log\"; LOCK=\"$d/lock\""
     echo "$STUB"
     _fn1 "$PDG" c_g; _fn1 "$PDG" c_y; _fn1 "$PDG" c_r
-    _fnN "$PDG" _lock_inherited          # 真家伙, 不是桩
+    echo "_pdg_module(){ printf '%s\\n' \"$ROOT/deploy/bot/\$1\"; }"
+    _fnN "$PDG" _pdg_lock_proof          # 真家伙(只读 OFD 证明), 不是桩
     _fnN "$PDG" _pdg_svcstate_units
-    _fnN "$PDG" _pdg_svc_q
+    _fnN "$PDG" _pdg_svc_known; _fnN "$PDG" _pdg_svc_q
     _fnN "$PDG" _pdg_svcstate_valid
     _fnN "$PDG" _retire_caller_gate
     echo '_retire_caller_gate'
@@ -101,7 +105,7 @@ run_case(){
     echo "$STUB"
     _fn1 "$PDG" c_g; _fn1 "$PDG" c_y
     _fnN "$PDG" _pdg_svcstate_units
-    _fnN "$PDG" _pdg_svc_q
+    _fnN "$PDG" _pdg_svc_known; _fnN "$PDG" _pdg_svc_q
     _fnN "$PDG" _pdg_save_svcstate
     echo "exec 9>\"$d/lock\"; flock -n 9 || { echo LOCK_FAILED; exit 1; }"
     echo "printf 'snapshot-bytes' > \"$d/snap/snap.tar.gz\""
@@ -165,7 +169,7 @@ d="$BOX/C1"; mkdir -p "$d/snap" "$d/sc"; seed_units "$d/sc"; mk_child "$d"
   echo "SC_DIR=\"$d/sc\"; SC_LOG=\"$d/sc.log\"; : > \"\$SC_LOG\""
   echo "$STUB"
   _fn1 "$PDG" c_g; _fn1 "$PDG" c_y
-  _fnN "$PDG" _pdg_svcstate_units; _fnN "$PDG" _pdg_svc_q; _fnN "$PDG" _pdg_save_svcstate
+  _fnN "$PDG" _pdg_svcstate_units; _fnN "$PDG" _pdg_svc_known; _fnN "$PDG" _pdg_svc_q; _fnN "$PDG" _pdg_save_svcstate
   echo "printf 'snapshot-bytes' > \"$d/snap/snap.tar.gz\""
   echo "_pdg_save_svcstate \"$d/snap\" >/dev/null"
 } > "$d/old-parent.sh"
@@ -186,8 +190,9 @@ d="$BOX/C4"; mkdir -p "$d/snap" "$d/sc"; seed_units "$d/sc"
   echo "SC_DIR=\"$d/sc\"; SC_LOG=\"$d/sc.log\"; : > \"\$SC_LOG\"; LOCK=\"$d/lock\""
   echo "$STUB"
   _fn1 "$PDG" c_g; _fn1 "$PDG" c_y; _fn1 "$PDG" c_r
-  _fnN "$PDG" _lock_inherited
-  _fnN "$PDG" _pdg_svcstate_units; _fnN "$PDG" _pdg_svc_q
+  echo "_pdg_module(){ printf '%s\\n' \"$ROOT/deploy/bot/\$1\"; }"
+  _fnN "$PDG" _pdg_lock_proof
+  _fnN "$PDG" _pdg_svcstate_units; _fnN "$PDG" _pdg_svc_known; _fnN "$PDG" _pdg_svc_q
   _fnN "$PDG" _pdg_save_svcstate; _fnN "$PDG" _pdg_svcstate_valid
   _fnN "$PDG" _retire_caller_gate
   echo "exec 9>\"$d/lock\"; flock -n 9"
@@ -234,7 +239,7 @@ mk_child "$d"
   echo "SC_DIR=\"$d/sc\"; SC_LOG=\"$d/sc.log\"; : > \"\$SC_LOG\""
   echo "$STUB"
   _fn1 "$PDG" c_g; _fn1 "$PDG" c_y
-  _fnN "$PDG" _pdg_svcstate_units; _fnN "$PDG" _pdg_svc_q; _fnN "$PDG" _pdg_save_svcstate
+  _fnN "$PDG" _pdg_svcstate_units; _fnN "$PDG" _pdg_svc_known; _fnN "$PDG" _pdg_svc_q; _fnN "$PDG" _pdg_save_svcstate
   echo "exec 9>\"$d/lock\"; flock -n 9"
   echo "printf 'snapshot-bytes' > \"$d/snap/snap.tar.gz\""
   echo "_pdg_save_svcstate \"$d/snap\" >/dev/null"
@@ -247,10 +252,10 @@ grep -q $'^unit\tmihomo\tQUERY-FAILED' "$d/snap/svcstate.tsv" \
 expect_refuse F2 "$o" "观测失败"
 
 echo
-echo "══ 七. 前像与此刻现状对不上 ══"
-o="$(run_case G1 'echo disabled > "$D/sc/pdg-mitm.en"')"
-expect_refuse G1 "$o" "前像与现状对不上"
-
+echo "══ 七. 前像与现状不一致**不是**拒绝理由 ══"
+# 这一格以前是反的(现状与前像不符就拒)。真实链路里门执行时, 同一次操作里排在前面的迁移
+# 早就合法地改过服务状态了 —— 那样判会把每一次合法的完整调用都误拒。
+# 归属由 pid+starttime / snap_id / boot_id 判定; 具体断言见下面第十二节。
 echo
 echo "══ 八. 前置判据: 没有不可逆的事要做时, 不要求能力证明 ══"
 s1(){   # $1=场景 $2=need 五元组 $3=iOS 记录里的 schema(空=没有记录)
@@ -269,36 +274,198 @@ grep -q 'IRR=1' <<<"$(s1 H3 '0 0 0 0 0' '')"  && ok "H3: 全干净且没有 iOS 
 grep -q 'IRR=1' <<<"$(s1 H4 '0 0 0 0 0' '2')" && ok "H4: 记录已是新 schema ⇒ 幂等复跑照常" || bad "H4"
 
 echo
-echo "══ 九. 撤销对照: 把门去掉, 旧调用方会**真的**走进副作用路径 ══"
-NOGATE="$BOX/pdg-nogate.sh"
-grep -v '_retire_caller_gate || return 1' "$PDG" > "$NOGATE"
-if cmp -s "$PDG" "$NOGATE"; then
-  bad "I1: 没造出反向副本(锚点漂了), 对照失效"
-else
-  ok "I1: 反向副本就位(只删掉调用门那一行, 其余逐字节相同)"
-  d="$BOX/I2"; mkdir -p "$d/sc"; seed_units "$d/sc"
+echo "══ 九. 撤销对照 ══"
+echo "  (撤掉门之后真实迁移代码会不会动手, 由 tests/test-retire-sideeffect-barrier.sh 第五节"
+echo "   验 —— 那里跑的是**产品原文**的 migrate_android_cleanup / _plat_purge_retired。"
+echo "   本支只验判定本身, 不在这里重复一个较弱的版本。)"
+
+echo
+echo "══ 十. 运行态查询失败必须**单独**被抓住 ══"
+# 自启查得好好的, 只有 is-active 查不出来。门原来用 `read … ufs rest` 之后判
+# `case "$rest" in QUERY-FAILED*)`, 而 rest 的第一段是**自启查询的 rc**, 不是运行值 ——
+# 于是这一格永远检测不到。判据必须逐字段解析。
+parent_run(){   # $1=场景目录; 用真实 flock + 真实 fd 9 继承跑一次门
+  local d="$1"
   { echo 'set -uo pipefail'
     echo "SC_DIR=\"$d/sc\"; SC_LOG=\"$d/sc.log\"; : > \"\$SC_LOG\""
     echo "$STUB"
-    _fn1 "$PDG" c_g; _fn1 "$PDG" c_y; _fn1 "$PDG" c_r
-    _fnN "$PDG" _pdg_svcstate_units; _fnN "$PDG" _pdg_svc_q; _fnN "$PDG" _pdg_svcstate_valid
-    _fnN "$NOGATE" _retire_has_irreversible_work
-    # 把"门之后紧接着会做的第一件不可逆的事"原样搬来: 停 + 禁用 pdg-mitm
-    echo 'if _retire_has_irreversible_work 1 0 0 0 0; then systemctl disable --now pdg-mitm >/dev/null 2>&1; fi'
-  } > "$d/run.sh"
-  bash "$d/run.sh" >/dev/null 2>&1
-  grep -q 'disable --now pdg-mitm' "$d/sc.log" \
-    && ok "I2: 撤掉门之后**真的执行了** disable --now pdg-mitm(不是少一行提示)" \
-    || bad "I2: 反向对照没有触到副作用路径"
-  [[ "$(cat "$d/sc/pdg-mitm.en" 2>/dev/null)" == disabled ]] \
-    && ok "I3: 且服务状态真的被改了(enabled → disabled)" || bad "I3: 状态没变, 对照无效"
-  # 反过来: 门在的时候, 同一条路上**一个服务动作都没有**
-  d2="$BOX/B1"
-  if [[ -f "$d2/sc.log" ]]; then
-    if grep -qE '^(stop|disable|start|enable|mask) ' "$d2/sc.log"; then
-      bad "I4: 拒绝之前动了服务: $(grep -E '^(stop|disable|start|enable|mask) ' "$d2/sc.log" | head -3 | tr '\n' ';')"
-    else ok "I4: 拒绝之前没有任何 stop/disable/start/enable/mask 动作(只有查询)"; fi
-  else bad "I4: 拿不到 systemctl 记账"; fi
+    _fn1 "$PDG" c_g; _fn1 "$PDG" c_y
+    _fnN "$PDG" _pdg_svcstate_units; _fnN "$PDG" _pdg_svc_known; _fnN "$PDG" _pdg_svc_q; _fnN "$PDG" _pdg_save_svcstate
+    echo "exec 9>\"$d/lock\"; flock -n 9 || { echo LOCK_FAILED; exit 1; }"
+    echo "printf 'snapshot-bytes' > \"$d/snap/snap.tar.gz\""
+    echo "_pdg_save_svcstate \"$d/snap\" >/dev/null || { echo SAVE_FAILED; exit 1; }"
+    echo "PDG_UPDATE_SVCSTATE=\"$d/snap/svcstate.tsv\" bash \"$d/child.sh\""
+    echo 'rc=$?'
+    echo "printf 'LOCKS_AFTER=%s\n' \"\$(grep -c \":\$(stat -c %i \"$d/lock\") \" /proc/locks 2>/dev/null || echo 0)\""
+    echo 'echo "GATE_RC=$rc"'
+  } > "$d/parent.sh"
+  bash "$d/parent.sh" 2>&1
+}
+d="$BOX/J1"; mkdir -p "$d/snap" "$d/sc"; seed_units "$d/sc"; : > "$d/sc/mosdns.abroken"
+mk_child "$d"; o="$(parent_run "$d")"
+awk -F'\t' '$1=="unit" && $2=="mosdns"{ok=($3!="QUERY-FAILED" && $5=="QUERY-FAILED")} END{exit !ok}' "$d/snap/svcstate.tsv" \
+  && ok "J1a: 自启记成正常值、运行态记成 QUERY-FAILED(两件事分开记)" \
+  || bad "J1a: 记录形态不对: $(grep -P '^unit\tmosdns\t' "$d/snap/svcstate.tsv" | tr '\t' '|')"
+expect_refuse J1 "$o" "运行态是观测失败"
+
+echo
+echo "══ 十一. 正常 disabled / inactive / not-found 不是查询异常 ══"
+d="$BOX/J2"; mkdir -p "$d/snap" "$d/sc"; seed_units "$d/sc"
+echo disabled > "$d/sc/pdg-mitm.en"; echo inactive > "$d/sc/pdg-mitm.ac"
+rm -f "$d/sc/mihomo.en" "$d/sc/mihomo.ac"
+mk_child "$d"; o="$(parent_run "$d")"
+grep -qP '^unit\tpdg-mitm\tdisabled\t1\tinactive\t3\t' "$d/snap/svcstate.tsv" \
+  && ok "J2a: disabled(rc=1)/inactive(rc=3) 原样记下 —— 非零返回码不等于查询异常" \
+  || bad "J2a: $(grep -P '^unit\tpdg-mitm\t' "$d/snap/svcstate.tsv" | tr '\t' '|')"
+grep -qP '^unit\tmihomo\tnot-found\t' "$d/snap/svcstate.tsv" \
+  && ok "J2b: unit 不存在记成 not-found, 不是 QUERY-FAILED" \
+  || bad "J2b: $(grep -P '^unit\tmihomo\t' "$d/snap/svcstate.tsv" | tr '\t' '|')"
+expect_pass J2 "$o"
+
+echo
+echo "══ 十二. 合法调用不因「较早的迁移改过服务状态」被误拒 ══"
+# 真实链路里, 门执行时排在前面的迁移早就动过服务了(dotwitness/health_timer/deploy_units/
+# drop_singbox…), 平台切换更是先切完平台。拿现状比前像, 每一次合法调用都会被误拒。
+o="$(run_case J3 'echo disabled > "$D/sc/pdg-mitm.en"; echo inactive > "$D/sc/pdg-mitm.ac"
+echo enabled-runtime > "$D/sc/pdg-dotwitness.en"; echo failed > "$D/sc/mosdns.ac"')"
+expect_pass J3 "$o"
+
+echo
+echo "══ 十三. 持锁证明必须是只读的 ══"
+lockcnt(){ grep -c ":$(stat -c %i "$1") " /proc/locks 2>/dev/null || true; }
+# (a) fd 9 打开了但**没人持锁** → 拒绝; 且判定不许顺手锁上一把
+d="$BOX/J4"; mkdir -p "$d/snap" "$d/sc"; seed_units "$d/sc"; : > "$d/lock"
+mk_child "$d"
+{ echo 'set -uo pipefail'
+  echo "SC_DIR=\"$d/sc\"; SC_LOG=\"$d/sc.log\"; : > \"\$SC_LOG\""
+  echo "$STUB"
+  _fn1 "$PDG" c_g; _fn1 "$PDG" c_y
+  _fnN "$PDG" _pdg_svcstate_units; _fnN "$PDG" _pdg_svc_known; _fnN "$PDG" _pdg_svc_q; _fnN "$PDG" _pdg_save_svcstate
+  echo "exec 9>\"$d/lock\""        # 只 open, **不** flock
+  echo "printf 'snapshot-bytes' > \"$d/snap/snap.tar.gz\""
+  echo "_pdg_save_svcstate \"$d/snap\" >/dev/null"
+  echo "PDG_UPDATE_SVCSTATE=\"$d/snap/svcstate.tsv\" bash \"$d/child.sh\""
+  echo 'rc=$?'
+  echo "printf 'LOCKS_AFTER=%s\n' \"\$(grep -c \":\$(stat -c %i \"$d/lock\") \" /proc/locks 2>/dev/null || echo 0)\""
+  echo 'echo "GATE_RC=$rc"'
+} > "$d/parent.sh"
+before="$(lockcnt "$d/lock")"; o="$(bash "$d/parent.sh" 2>&1)"
+expect_refuse J4 "$o" "没有持有 pdg 操作锁"
+after="$(grep -o 'LOCKS_AFTER=[0-9]*' <<<"$o" | cut -d= -f2)"
+[[ "${before:-0}" == 0 && "${after:-9}" == 0 ]] \
+  && ok "J4b: 判定前后这把锁上都没有持有者 —— 判定**没有**顺手取到一把新锁" \
+  || bad "J4b: 判定前 ${before:-?} 把, 判定后 ${after:-?} 把 —— 证明变成了制造"
+# (b) 父进程真持锁 → 子进程继承 → 放行, 且判定后那把锁还在(没被解掉)
+d="$BOX/J5"; mkdir -p "$d/snap" "$d/sc"; seed_units "$d/sc"
+mk_child "$d"; o="$(parent_run "$d")"
+expect_pass J5 "$o"
+[[ "$(grep -o 'LOCKS_AFTER=[0-9]*' <<<"$o" | cut -d= -f2)" == 1 ]] \
+  && ok "J5b: 判定之后父进程那把锁**还在**(没有被解掉)" \
+  || bad "J5b: 判定后锁数 $(grep -o 'LOCKS_AFTER=[0-9]*' <<<"$o" | cut -d= -f2), 期望 1"
+
+echo
+echo "══ 十四. 撤销对照: 把本轮三处修复分别撤回, 对应判据必须转红 ══"
+# 撤的是**修复本身**(最小反向补丁), 不是把整支测试指到旧提交 —— 那样只会同源码跑两遍。
+mk_child_src(){   # 与 mk_child 同构, 但用指定的 pdg.sh
+  local d="$1" src="$2"
+  { echo 'set -uo pipefail'
+    echo "SC_DIR=\"$d/sc\"; SC_LOG=\"$d/sc.log\"; LOCK=\"$d/lock\""
+    echo "$STUB"
+    _fn1 "$src" c_g; _fn1 "$src" c_y; _fn1 "$src" c_r
+    echo "_pdg_module(){ printf '%s\\n' \"$ROOT/deploy/bot/\$1\"; }"
+    _fnN "$src" _pdg_lock_proof
+    _fnN "$src" _pdg_svcstate_units; _fnN "$src" _pdg_svc_known; _fnN "$src" _pdg_svc_q
+    _fnN "$src" _pdg_svcstate_valid
+    _fnN "$src" _retire_caller_gate
+    echo '_retire_caller_gate'
+  } > "$d/child.sh"
+}
+run_with(){   # $1=场景目录 $2=src $3=场景布置脚本(可空) ; 真 flock + 真 fd 9 继承
+  local d="$1" src="$2" setup="${3:-}"
+  mkdir -p "$d/snap" "$d/sc"; seed_units "$d/sc"
+  eval "$setup"
+  mk_child_src "$d" "$src"
+  { echo 'set -uo pipefail'
+    echo "SC_DIR=\"$d/sc\"; SC_LOG=\"$d/sc.log\"; : > \"\$SC_LOG\""
+    echo "$STUB"
+    _fn1 "$src" c_g; _fn1 "$src" c_y
+    _fnN "$src" _pdg_svcstate_units; _fnN "$src" _pdg_svc_known; _fnN "$src" _pdg_svc_q
+    _fnN "$src" _pdg_save_svcstate
+    echo "${LOCKLINE:-exec 9>\"$d/lock\"; flock -n 9}"
+    echo "printf 'snapshot-bytes' > \"$d/snap/snap.tar.gz\""
+    echo "_pdg_save_svcstate \"$d/snap\" >/dev/null"
+    echo "PDG_UPDATE_SVCSTATE=\"$d/snap/svcstate.tsv\" bash \"$d/child.sh\""
+    echo 'rc=$?'
+    echo "printf 'LOCKS_AFTER=%s\n' \"\$(grep -c \":\$(stat -c %i \"$d/lock\") \" /proc/locks 2>/dev/null || echo 0)\""
+    echo 'echo "GATE_RC=$rc"'
+  } > "$d/parent.sh"
+  bash "$d/parent.sh" 2>&1
+}
+
+# ① 逐字段解析 → 撤回成"看错字段"(原来 rest 的第一段是自启 rc, 不是运行值)
+REV1="$BOX/rev-fields.sh"
+sed 's/if \[\[ "\$asv" == QUERY-FAILED \]\]; then/if [[ "$urc" == QUERY-FAILED ]]; then/' "$PDG" > "$REV1"
+if cmp -s "$PDG" "$REV1" || ! bash -n "$REV1" 2>/dev/null; then
+  bad "K1: 没造出「看错字段」的反向副本 —— 本格记无效"
+else
+  o="$(run_with "$BOX/K1" "$REV1" ': > "$d/sc/mosdns.abroken"')"
+  grep -q 'GATE_RC=0' <<<"$o" \
+    && ok "K1: 撤回逐字段解析后, 「运行态查询失败」这一格**放行**了 —— J1 确实由这处修复保住" \
+    || bad "K1: 反向对照没体现差异(仍然拒绝: $(why "$o"))"
+fi
+
+# ② 只读持锁证明 → 撤回成原来那套"能不能 flock 上"
+REV2="$BOX/rev-lock.sh"
+awk '/^_pdg_lock_proof\(\)\{/{print "_pdg_lock_proof(){ [[ -e \"/proc/$$/fd/9\" ]] || return 1; flock -n 9 2>/dev/null || return 1; return 0; }"; skip=1; next}
+     skip && /^\}/{skip=0; next}
+     !skip{print}' "$PDG" > "$REV2"
+if cmp -s "$PDG" "$REV2" || ! bash -n "$REV2" 2>/dev/null; then
+  bad "K2: 没造出「靠 flock 探锁」的反向副本 —— 本格记无效"
+else
+  LOCKLINE="exec 9>\"$BOX/K2/lock\"" o="$(run_with "$BOX/K2" "$REV2")"
+  after="$(grep -o 'LOCKS_AFTER=[0-9]*' <<<"$o" | cut -d= -f2)"
+  if grep -q 'GATE_RC=0' <<<"$o" && [[ "${after:-0}" -ge 1 ]]; then
+    ok "K2: 撤回只读证明后, 「fd 9 打开但没人持锁」被放行, 而且判定**自己锁上了一把**(锁数 $after) —— J4/J4b 确实由这处修复保住"
+  else
+    bad "K2: 反向对照没体现差异(rc=$(grep -o 'GATE_RC=.*' <<<"$o"), 判定后锁数 ${after:-?})"
+  fi
+fi
+
+# ③ 去掉"前像与现状一致"这条判据 → 撤回成把它加回去
+REV3="$BOX/rev-statematch.sh"
+awk '/^  # 必要条件\(\*\*不是\*\*归属证明\)/{
+       print "  if [[ -z \"$why\" ]]; then"
+       print "    while IFS=$'"'"'\\t'"'"' read -r _k u ufs _urc _asv _arc _sub _inv; do"
+       print "      [[ \"$_k\" == unit && -n \"$u\" ]] || continue"
+       print "      now=\"$(_pdg_svc_q is-enabled \"$u\" | cut -f1)\""
+       print "      [[ \"$now\" == \"$ufs\" ]] || { why=\"前像与现状对不上($u)\"; break; }"
+       print "    done < \"$f\""
+       print "  fi"
+     } {print}' "$PDG" > "$REV3"
+if cmp -s "$PDG" "$REV3" || ! bash -n "$REV3" 2>/dev/null; then
+  bad "K3: 没造出「拿现状比前像」的反向副本 —— 本格记无效"
+else
+  o="$(run_with "$BOX/K3" "$REV3" 'true')"
+  # 布置一次"较早迁移改过服务状态"的合法现场: 存完前像之后再改
+  d="$BOX/K3b"; mkdir -p "$d/snap" "$d/sc"; seed_units "$d/sc"
+  mk_child_src "$d" "$REV3"
+  { echo 'set -uo pipefail'
+    echo "SC_DIR=\"$d/sc\"; SC_LOG=\"$d/sc.log\"; : > \"\$SC_LOG\""
+    echo "$STUB"
+    _fn1 "$REV3" c_g; _fn1 "$REV3" c_y
+    _fnN "$REV3" _pdg_svcstate_units; _fnN "$REV3" _pdg_svc_known; _fnN "$REV3" _pdg_svc_q
+    _fnN "$REV3" _pdg_save_svcstate
+    echo "exec 9>\"$d/lock\"; flock -n 9"
+    echo "printf 'snapshot-bytes' > \"$d/snap/snap.tar.gz\""
+    echo "_pdg_save_svcstate \"$d/snap\" >/dev/null"
+    echo "echo disabled > \"$d/sc/pdg-mitm.en\""      # 模拟"排在前面的迁移动过服务"
+    echo "PDG_UPDATE_SVCSTATE=\"$d/snap/svcstate.tsv\" bash \"$d/child.sh\""
+    echo 'echo "GATE_RC=$?"'
+  } > "$d/parent.sh"
+  o="$(bash "$d/parent.sh" 2>&1)"
+  grep -q 'GATE_RC=0' <<<"$o" \
+    && bad "K3: 反向对照没体现差异(加回那条判据后仍然放行)" \
+    || ok "K3: 加回「拿现状比前像」之后, 一次**合法完整调用**被误拒 —— J3 确实由去掉这条保住"
 fi
 
 echo "────────────────────────────────────────"

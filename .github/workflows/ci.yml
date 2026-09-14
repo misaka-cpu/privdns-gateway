@@ -1043,8 +1043,17 @@ jobs:
       - name: "退役迁移调用方门 (旧记录·错快照·缺记录·不完整·查询异常·无锁分别拒绝; 拒绝前零服务动作; 撤掉门即进入停服务路径)"
         run: bash tests/test-migrate-caller-gate.sh
 
-      - name: "迁移入口契约 (总入口逐字节未变/门只在动手前那一处/无旁路开关/前像存不下即中止)"
+      - name: "迁移入口契约 (总入口逐字节未变/cmd_platform 契约变更处/三处拦截点各在动手之前)"
         run: bash tests/test-migrate-entry-contract.sh
+
+      # 拒绝之后还能不能动手, 与"最终返回非零"是两件事: migrate_wloc_retire 返回非零只会让
+      # run_all_migrations 记个 rc, 后面的 migrate_android_cleanup 照样删 unit 删模块。
+      - name: "退役副作用拦截 (拒绝后真实 android_cleanup/_plat_purge_retired 零动作; 撤掉拦截即真的删)"
+        run: bash tests/test-retire-sideeffect-barrier.sh
+
+      # 辅助函数自己"没有服务动作"证明不了整条回滚链没先把服务启动过 —— 这一支跑真实 cmd_rollback。
+      - name: "回滚链服务恢复 (真实 cmd_rollback: 本来停着的一次都没被启动/缺前像不报完全回滚)"
+        run: bash tests/test-rollback-svcstate-chain.sh
 
       - name: "平台文案/门控回归 (客户端·状态 按平台/内核 + README 文案一致)"
         run: python3 tests/test-platform-copy.py

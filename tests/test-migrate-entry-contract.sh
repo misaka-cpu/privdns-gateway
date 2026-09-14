@@ -38,48 +38,77 @@ fnbody(){ sed -n "/^$2(){/,/^}/p" "$1"; }
 fnfile(){ local o="$BOX/fn-$2.sh"; fnbody "$1" "$2" > "$o"; echo "$o"; }
 lineno(){ grep -n -- "$2" "$1" | head -1 | cut -d: -f1; }
 
-echo "══ 一. 总入口契约一个字都不能变 ══"
+echo "══ 一. 总入口与派发块的契约 ══"
 if [[ -n "$BASE" && -f "$BASE" ]]; then
-  for fn in run_all_migrations cmd_platform; do
-    if diff -q <(fnbody "$BASE" "$fn") <(fnbody "$PDG" "$fn") >/dev/null; then
-      ok "A: $fn 与基线逐字节相同(没有在总入口加无条件拒绝)"
-    else
-      bad "A: $fn 被改过"; diff <(fnbody "$BASE" "$fn") <(fnbody "$PDG" "$fn") | head -20
-    fi
-  done
+  if diff -q <(fnbody "$BASE" run_all_migrations) <(fnbody "$PDG" run_all_migrations) >/dev/null; then
+    ok "A1: run_all_migrations 与基线逐字节相同(没有在总入口加无条件拒绝)"
+  else bad "A1: run_all_migrations 被改过"; diff <(fnbody "$BASE" run_all_migrations) <(fnbody "$PDG" run_all_migrations) | head -12; fi
   if diff -q <(grep -A3 '^    __migrate)' "$BASE") <(grep -A3 '^    __migrate)' "$PDG") >/dev/null; then
-    ok "A: __migrate 派发块与基线逐字节相同"
-  else bad "A: __migrate 派发块被改过"; fi
+    ok "A2: __migrate 派发块与基线逐字节相同"
+  else bad "A2: __migrate 派发块被改过"; fi
 else
   na "A: 没给 PDG_BASELINE, 跳过与冻结基线的逐字节对比"
 fi
 
 echo
-echo "══ 二. 门只挂在真正要动手的那一处 ══"
-n_call="$(grep -c '_retire_caller_gate || return 1' "$PDG")"
-[[ "$n_call" == 1 ]] && ok "B1: 门的调用点只有 1 处" || bad "B1: 门被调用了 $n_call 次"
-if grep -q '_retire_caller_gate || return 1' "$(fnfile "$PDG" migrate_wloc_retire)"; then
-  ok "B2: 那一处在 migrate_wloc_retire 里(不在 run_all_migrations, 也不在总派发)"
-else bad "B2: 门不在 migrate_wloc_retire 里"; fi
-for fn in run_all_migrations cmd_platform cmd_update cmd_rollback; do
-  grep -q '_retire_caller_gate' "$(fnfile "$PDG" "$fn")" \
-    && bad "B3: $fn 里也有门(会波及与退役无关的路径)" || ok "B3: $fn 里没有门"
+echo "══ 二. cmd_platform: 契约变了, 变在哪里(行为判据, 不是逐字节) ══"
+# 本轮明确改了这个入口: 它自己就会做退役类的不可逆动作(切 iOS 经 _plat_purge_retired,
+# 切 Android 经 migrate_android_cleanup), 所以它必须**在动第一样东西之前**具备回滚能力,
+# 并且不能把"退役没做成"吞掉当成切换成功。
+pl="$(fnfile "$PDG" cmd_platform)"
+grep -q 'run_all_migrations || true' "$pl" \
+  && ok "B1: 总迁移那一句仍是 \`run_all_migrations || true\`(与退役无关的幂等迁移照旧不拖垮切换)" \
+  || bad "B1: 总迁移的失败善后被改了"
+grep -q '_pdg_save_svcstate "\$_psnap"' "$pl" && ok "B2: 建完快照就存服务前像(它自己成为有能力的调用方)" || bad "B2: 没存前像"
+awk '/cmd_snapshot --source cli --op platform/{s=NR}
+     /_pdg_save_svcstate "\$_psnap"/{v=NR}
+     /mktemp -d/{m=NR}
+     END{exit !(s&&v&&m&&s<v&&v<m)}' "$pl" \
+  && ok "B3: 存前像排在快照之后、\`mktemp -d\` 建工作区之前 —— 拒绝发生在任何改动之前" \
+  || bad "B3: 顺序不对"
+grep -q '中止切换(未改动任何东西)' "$pl" && ok "B4: 存不下就中止, 并明说此刻未改动任何东西" || bad "B4"
+grep -q 'export PDG_UPDATE_SVCSTATE="\$_psnap/svcstate.tsv"' "$pl" && ok "B5: 句柄交给后续所有退役类动作" || bad "B5"
+awk '/if ! migrate_android_cleanup; then/{a=NR} /_plat_rollback; rm -rf "\$wd"; return 1/{if(a&&NR>a&&!done){done=NR}} END{exit !(a&&done)}' "$pl" \
+  && ok "B6: migrate_android_cleanup 的返回值被检查, 失败即回退切换(不会「退役失败但成功」)" \
+  || bad "B6: 仍然吞掉了 Android 清理的返回值"
+
+echo
+echo "══ 三. 拦截点: 每一处真正要动手的地方都自己问一次, 且答案一致 ══"
+n_def="$(grep -c '^_retire_allowed(){' "$PDG")"
+[[ "$n_def" == 1 ]] && ok "C1: 判定只有一处实现(_retire_allowed), 全进程记住同一个答案" || bad "C1: 有 $n_def 处实现"
+n_call="$(grep -c '_retire_allowed || return 1' "$PDG")"
+[[ "$n_call" == 3 ]] && ok "C2: 拦截点正好 3 处" || bad "C2: 拦截点有 $n_call 处(期望 3)"
+for fn in migrate_wloc_retire migrate_android_cleanup _plat_purge_retired; do
+  grep -q '_retire_allowed || return 1' "$(fnfile "$PDG" "$fn")" \
+    && ok "C3: $fn 里有拦截点" || bad "C3: $fn 里没有拦截点"
+done
+for fn in run_all_migrations cmd_update cmd_rollback; do
+  grep -q '_retire_allowed' "$(fnfile "$PDG" "$fn")" \
+    && bad "C4: $fn 里也有拦截(会波及与退役无关的路径)" || ok "C4: $fn 里没有拦截"
 done
 
 echo
-echo "══ 三. 门排在只读判据之后、第一个不可逆动作之前 ══"
+echo "══ 三之二. 拦截点排在各自的第一个不可逆动作之前 ══"
 body="$(fnfile "$PDG" migrate_wloc_retire)"
-g="$(lineno "$body" '_retire_caller_gate || return 1')"
+g="$(lineno "$body" '_retire_allowed || return 1')"
 r1="$(lineno "$body" '归属不清就不能一把清空')"
 r2="$(lineno "$body" '可还原的只有 enabled / enabled-runtime / disabled 三种')"
 s1="$(lineno "$body" '_retire_ios_schema || return 1')"
 s2="$(lineno "$body" '_RETIRE_TMP="$(mktemp -d)"')"
 s3="$(grep -n 'systemctl disable\|systemctl stop\|rm -f "\$R/opt/pdg-bot/mitm' "$body" | head -1 | cut -d: -f1)"
-[[ -n "$g" && -n "$r1" && "$r1" -lt "$g" ]] && ok "C1: 排在既有的「劫持表有外来行」拒绝之后" || bad "C1: 位置不对(gate=$g, 既有拒绝=$r1)"
-[[ -n "$r2" && "$r2" -lt "$g" ]] && ok "C2: 排在既有的「自启状态不支持」拒绝之后" || bad "C2: 位置不对(gate=$g, 既有拒绝=$r2)"
-[[ -n "$s1" && "$g" -lt "$s1" ]] && ok "C3: 排在 _retire_ios_schema(推进记录格式)之前" || bad "C3: 位置不对(gate=$g, schema=$s1)"
-[[ -n "$s2" && "$g" -lt "$s2" ]] && ok "C4: 排在 mktemp -d(开始动手)之前" || bad "C4: 位置不对(gate=$g, mktemp=$s2)"
-[[ -n "$s3" && "$g" -lt "$s3" ]] && ok "C5: 排在第一处停服务/删文件之前" || bad "C5: 位置不对(gate=$g, 首个副作用=$s3)"
+[[ -n "$g" && -n "$r1" && "$r1" -lt "$g" ]] && ok "D1: 排在既有的「劫持表有外来行」拒绝之后" || bad "D1(gate=$g, 既有拒绝=$r1)"
+[[ -n "$r2" && "$r2" -lt "$g" ]] && ok "D2: 排在既有的「自启状态不支持」拒绝之后" || bad "D2(gate=$g, 既有拒绝=$r2)"
+[[ -n "$s1" && "$g" -lt "$s1" ]] && ok "D3: 排在 _retire_ios_schema(推进记录格式)之前" || bad "D3(gate=$g, schema=$s1)"
+[[ -n "$s2" && "$g" -lt "$s2" ]] && ok "D4: 排在 mktemp -d(开始动手)之前" || bad "D4(gate=$g, mktemp=$s2)"
+[[ -n "$s3" && "$g" -lt "$s3" ]] && ok "D5: 排在第一处停服务/删文件之前" || bad "D5(gate=$g, 首个副作用=$s3)"
+body="$(fnfile "$PDG" migrate_android_cleanup)"
+g="$(lineno "$body" '_retire_allowed || return 1')"
+f1="$(grep -n 'mitm_hijack.txt\|systemctl disable --now pdg-mitm\|rm -f "\$R' "$body" | head -1 | cut -d: -f1)"
+[[ -n "$g" && -n "$f1" && "$g" -lt "$f1" ]] && ok "D6: Android 清理的拦截点排在第一处改动之前(第 $g 行 vs 第 $f1 行)" || bad "D6(gate=$g, 首个副作用=$f1)"
+body="$(fnfile "$PDG" _plat_purge_retired)"
+g="$(lineno "$body" '_retire_allowed || return 1')"
+f1="$(grep -n 'systemctl disable --now pdg-mitm\|rm -f "\$R' "$body" | head -1 | cut -d: -f1)"
+[[ -n "$g" && -n "$f1" && "$g" -lt "$f1" ]] && ok "D7: 平台清理的拦截点排在第一处改动之前(第 $g 行 vs 第 $f1 行)" || bad "D7(gate=$g, 首个副作用=$f1)"
 
 echo
 echo "══ 四. 放行判据不是「某个文件缺不缺」也不是单一环境变量 ══"
