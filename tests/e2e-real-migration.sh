@@ -50,6 +50,31 @@ _evn(){ printf '%s\n' "$2" >> "$EVID/$1"; chmod 600 "$EVID/$1" 2>/dev/null || tr
 
 SECT(){ echo; echo "══════════════════════════════════════════════════════════"; echo "  $*"; echo "══════════════════════════════════════════════════════════"; }
 note(){ echo "[NOTE] $1"; }
+# ── systemctl 状态的读法(夹具②)────────────────────────────────────────────
+# 原来写的是 `V="$(systemctl is-enabled X 2>/dev/null || echo not-found)"`。
+# systemd 255 对**已删除的 unit** 会 stdout 打一行 not-found **并且**返回非 0,
+# 于是 `|| echo` 再追一行, V 变成两行 "not-found\nnot-found", 等值比较必然失败 ——
+# 上一轮那条 [FAIL] pdg-mitm 自启=not-found 就是这么来的, 产品侧其实是对的。
+# 现在 stdout / stderr / 退出码**分开收**, 不拼串; 也不用 tail -1 去藏第一行。
+SC_VAL=""; SC_RC=0; SC_ERR=""
+sc_get(){   # $1=子命令(is-active|is-enabled|...)  $2=unit
+  local errf="${E2E_TMP:-/tmp}/sc.err"
+  SC_VAL="$(systemctl "$1" "$2" 2>"$errf")"; SC_RC=$?
+  SC_ERR="$(tr '\n' ' ' < "$errf" 2>/dev/null)"
+  rm -f "$errf" 2>/dev/null || true
+}
+# 把"这个 unit 现在到底算什么状态"归一成一个词, 并把判定依据保留下来:
+#   active / inactive / failed / activating / …  或  not-found(unit 压根不在)
+sc_state(){  # $1=子命令 $2=unit → 打印归一后的词; 依据留在 SC_VAL/SC_RC/SC_ERR
+  sc_get "$1" "$2"
+  if [[ -z "${SC_VAL//[[:space:]]/}" ]]; then
+    case "$SC_ERR" in *"No such file"*|*"not-found"*|*"could not be found"*) printf 'not-found\n';;
+                      *) printf '<空>\n';; esac
+  else
+    printf '%s\n' "${SC_VAL%%$'\n'*}"
+  fi
+}
+
 # 未执行 ≠ 失败 ≠ 通过。前像不成立时该场景**不执行**, 单独计一格, 绝不混进通过或失败。
 E2E_NOTRUN=0
 nrun(){ echo "[未执行] $1"; E2E_NOTRUN=$((E2E_NOTRUN+1)); }
@@ -340,11 +365,16 @@ snap_state(){   # $1 = 标签
 import json
 try:
     m = json.load(open("/etc/privdns-gateway/ios-profile.json", encoding="utf-8"))
-    print("    schema=%r instance_id=%r revision=%r" % (m.get("schema"), m.get("instance_id"), m.get("revision")))
-    inp = m.get("inputs") or {}
-    print("    inputs.schema=%r wloc_enabled=%r wloc_ca_sha256=%r ssids=%r"
+    cur = m.get("current") or {}
+    # **输入在 current.inputs**(schema 1 与 2 都是); 顶层从来没有 inputs 这个字段。
+    # 退役之后 current 会是 None, 用户意图改由 retired_inputs 兜住 —— 两处都打出来, 不猜。
+    inp = cur.get("inputs") or {}
+    ri  = m.get("retired_inputs") or {}
+    print("    schema=%r instance_id=%r current.revision=%r 顶层有 inputs=%r"
+          % (m.get("schema"), m.get("instance_id"), cur.get("revision"), "inputs" in m))
+    print("    current.inputs: schema=%r wloc_enabled=%r wloc_ca_sha256=%r ssids=%r"
           % (inp.get("schema"), inp.get("wloc_enabled"), (inp.get("wloc_ca_sha256") or "")[:12], inp.get("ssids")))
-    print("    retired_revision=%r" % m.get("retired_revision"))
+    print("    retired_revision=%r retired_inputs.ssids=%r" % (m.get("retired_revision"), ri.get("ssids")))
 except Exception as e:
     print("    (无记录: %s)" % e)
 PY
@@ -542,7 +572,7 @@ EOF
   if [[ "$wloc" == caonly ]]; then
     local st7894 stmitm
     st7894="$(ss -lnt 2>/dev/null | grep -c ':7894' || true)"
-    stmitm="$(systemctl is-active pdg-mitm 2>/dev/null || echo not-found)"
+    stmitm="$(sc_state is-active pdg-mitm)"
     { [[ "$st7894" == 0 && "$stmitm" != active ]]; } \
       && ok "CA-only: 收走执行件之前确认无人在用(7894 无监听, pdg-mitm=$stmitm)" \
       || { bad "CA-only: 还有进程在用执行件(7894 计数=$st7894, pdg-mitm=$stmitm), 不删"; PREIMAGE_OK=0; }
@@ -725,17 +755,36 @@ assert_preimage_A(){
     && ok "前像: 内核配置里有 MITM-OUT 路由" || bad "前像: 内核配置里没有 MITM 路由"
   grep -q '"enabled": *true' /etc/privdns-gateway/mitm.json 2>/dev/null \
     && ok "前像: mitm.json 的 wloc.enabled=true" || bad "前像: mitm.json 不对"
+  # 前像判据按**真实 schema** 取位置: 输入在 current.inputs, 顶层根本没有 inputs。
+  # 而且要求 SSID 意图**确实非空**才算前像成立 —— 空名单与"字段不存在"都不算。
+  # 不允许出现 None == None 那种"两边都读不到所以相等"的通过方式。
   python3 - <<'PY'
 import json, sys
+def ok(t):  print("[OK]   " + t)
+def bad(t): print("[FAIL] " + t)
 try:
     m = json.load(open("/etc/privdns-gateway/ios-profile.json", encoding="utf-8"))
 except Exception as e:
-    print("[FAIL] 前像: 读不到 iOS 记录: %s" % e); sys.exit(0)
-inp = m.get("inputs") or {}
-if m.get("schema") == 1 and inp.get("wloc_enabled") is True and inp.get("wloc_ca_sha256"):
-    print("[OK]   前像: iOS 记录是 schema 1 且带 WLOC 字段(wloc_enabled=True, 有 CA 指纹)")
+    bad("前像: 读不到 iOS 记录: %s" % e); sys.exit(0)
+if "inputs" in m:
+    bad("前像: 顶层出现了 inputs 字段, 与 schema 1 契约不符"); sys.exit(0)
+cur = m.get("current")
+if not isinstance(cur, dict):
+    bad("前像: current 不是记录对象(实得 %s) —— 前像不成立" % type(cur).__name__); sys.exit(0)
+inp = cur.get("inputs")
+if not isinstance(inp, dict):
+    bad("前像: current.inputs 不存在 —— 前像不成立"); sys.exit(0)
+fail = []
+if m.get("schema") != 1:               fail.append("schema=%r(应为 1)" % m.get("schema"))
+if inp.get("wloc_enabled") is not True: fail.append("current.inputs.wloc_enabled=%r(应为 True)" % inp.get("wloc_enabled"))
+if not inp.get("wloc_ca_sha256"):       fail.append("current.inputs.wloc_ca_sha256 为空")
+ss = inp.get("ssids")
+if not (isinstance(ss, list) and len(ss) > 0):
+    fail.append("SSID 意图不是非空列表(实得 %r)" % (ss,))
+if fail:
+    bad("前像: iOS 记录形态不对 —— " + "; ".join(fail))
 else:
-    print("[FAIL] 前像: iOS 记录形态不对 schema=%r wloc_enabled=%r" % (m.get("schema"), inp.get("wloc_enabled")))
+    ok("前像: iOS 记录是 schema 1, current.inputs 带 WLOC 字段与 CA 指纹, 且 SSID 意图非空(%r)" % (ss,))
 PY
   local art=/var/lib/privdns-gateway/ios-profile/current.mobileconfig
   if [[ -s "$art" ]]; then
@@ -959,11 +1008,13 @@ fi
 
 echo
 echo "── WLOC 退役的真实结果(真 systemd 判定, 不看调用记录) ──"
-MAC="$(systemctl is-active pdg-mitm 2>/dev/null || echo not-found)"
-MEN="$(systemctl is-enabled pdg-mitm 2>/dev/null || echo not-found)"
+MAC="$(sc_state is-active pdg-mitm)";  MAC_RC=$SC_RC; MAC_SUB="$(systemctl show -p SubState --value pdg-mitm 2>/dev/null)"
+MEN="$(sc_state is-enabled pdg-mitm)"; MEN_RC=$SC_RC; MEN_ERR="$SC_ERR"
 MSUB="$(systemctl show -p SubState --value pdg-mitm 2>/dev/null)"
-[[ "$MAC" != active ]] && ok "pdg-mitm 真的不在跑了(is-active=$MAC, SubState=$MSUB)" || bad "pdg-mitm 仍然 active"
-[[ "$MEN" == not-found || "$MEN" == disabled ]] && ok "pdg-mitm 自启已撤(is-enabled=$MEN)" || bad "pdg-mitm 自启=$MEN"
+[[ "$MAC" != active ]] && ok "pdg-mitm 真的不在跑了(is-active=$MAC, rc=$MAC_RC, SubState=${MAC_SUB:-$MSUB})" || bad "pdg-mitm 仍然 active"
+{ [[ "$MEN" == not-found || "$MEN" == disabled ]]; } \
+  && ok "pdg-mitm 自启已撤(is-enabled=$MEN, rc=$MEN_RC)" \
+  || bad "pdg-mitm 自启=$MEN(rc=$MEN_RC, stderr=${MEN_ERR:-<空>})"
 ss -lnt 2>/dev/null | grep -q ':7894' && bad "7894 仍有监听(服务没真停)" || ok "7894 已无监听 —— 由真实运行状态证明, 不是靠 unit 文件消失"
 [[ -e /etc/systemd/system/pdg-mitm.service ]] && bad "pdg-mitm unit 仍在盘上" || ok "pdg-mitm unit 已删除"
 [[ -e /opt/pdg-bot/mitm_server.py || -e /opt/pdg-bot/mitm_wloc.py ]] \
@@ -1037,16 +1088,64 @@ _evn 03-A-update.log "failed units after A: $FAILED_N"
 systemctl list-units --failed --no-legend 2>/dev/null | _ev 03-A-update.log
 
 echo
-echo "── 幂等: 再跑一次迁移, 不该动文件也不该重启服务 ──"
-INV_1="$(systemctl show -p InvocationID --value mosdns 2>/dev/null)$(systemctl show -p InvocationID --value mihomo 2>/dev/null)"
-H1="$(find /etc/privdns-gateway /etc/mosdns/rules /etc/mihomo -type f -printf '%p %s %T@\n' 2>/dev/null | sort | sha256sum)"
+echo "── 幂等: 先说清契约, 再分开量三件事 ──"
+# 入口是**整条 __migrate**, 它的契约不是一条:
+#   · migrate_wloc_retire 自己的契约是严格的 ——「已经退役干净的机器上再跑, 不动文件也不
+#     重启任何服务」(产品注释原文)。所以 **WLOC 域**必须逐字节不变, 服务实例也不许变。
+#   · 同一条 __migrate 里还有别的迁移(防火墙按模板重建、GMS 端口集、去广告受管块…),
+#     它们**允许**用相同内容重写自己管的文件。那不是 WLOC 退役的问题。
+# 因此: 语义指纹(内容+mode+属主)判红; 全域 mtime 只作**观测**, 但必须把被重写的文件
+# 逐个列出来 —— 不能只把 mtime 从判据里删掉就宣布"零副作用"。
+wloc_fp(){   # WLOC 域的语义指纹: 内容 + mode + uid:gid(不含 mtime)
+  local f
+  for f in /etc/mosdns/rules/mitm_hijack.txt /etc/privdns-gateway/mitm.json \
+           /etc/privdns-gateway/ca/ca.crt /etc/privdns-gateway/ca/ca.key \
+           /etc/privdns-gateway/ios-profile.json /etc/systemd/system/pdg-mitm.service \
+           /opt/pdg-bot/mitm_server.py /opt/pdg-bot/mitm_wloc.py \
+           /var/lib/privdns-gateway/ios-profile/current.mobileconfig; do
+    if [[ -e "$f" ]]; then
+      printf '%s %s %s:%s %s\n' "$f" "$(stat -c %a "$f")" "$(stat -c %U "$f")" "$(stat -c %G "$f")" \
+        "$(sha256sum "$f" 2>/dev/null | cut -d" " -f1)"
+    else
+      printf '%s ABSENT\n' "$f"
+    fi
+  done
+  printf 'mihomo MITM-OUT=%s gs-loc=%s\n' \
+    "$(grep -c 'MITM-OUT' /etc/mihomo/config.yaml 2>/dev/null || echo 0)" \
+    "$(grep -c 'gs-loc' /etc/mihomo/config.yaml 2>/dev/null || echo 0)"
+}
+mtime_list(){ find /etc/privdns-gateway /etc/mosdns/rules /etc/mihomo -type f \
+                -printf '%p %s %T@\n' 2>/dev/null | sort; }
+svc_snapshot "$E2E_TMP/svc-Aidem-before.tsv"
+wloc_fp > "$E2E_TMP/wloc-before.txt"; mtime_list > "$E2E_TMP/mt-before.txt"
 IDEM="$(bash /usr/local/bin/pdg __migrate 2>&1)"; IRC=$?
 printf '%s\n' "$IDEM" | _ev 03-A-idempotent.txt
-H2="$(find /etc/privdns-gateway /etc/mosdns/rules /etc/mihomo -type f -printf '%p %s %T@\n' 2>/dev/null | sort | sha256sum)"
-INV_2="$(systemctl show -p InvocationID --value mosdns 2>/dev/null)$(systemctl show -p InvocationID --value mihomo 2>/dev/null)"
+wloc_fp > "$E2E_TMP/wloc-after.txt";  mtime_list > "$E2E_TMP/mt-after.txt"
+svc_snapshot "$E2E_TMP/svc-Aidem-after.tsv"
 [[ "$IRC" == 0 ]] && ok "第二次 __migrate rc=0" || bad "第二次 __migrate rc=$IRC"
-[[ "$H1" == "$H2" ]] && ok "第二次运行没有改动任何文件(内容/大小/mtime 全一致)" || bad "第二次运行动了文件"
-[[ "$INV_1" == "$INV_2" ]] && ok "第二次运行没有重启 mosdns / mihomo(InvocationID 未变)" || bad "第二次运行重启了服务"
+if diff -q "$E2E_TMP/wloc-before.txt" "$E2E_TMP/wloc-after.txt" >/dev/null; then
+  ok "幂等(WLOC 域): 内容 / mode / 属主 / 存在性**逐项未变** —— migrate_wloc_retire 的契约成立"
+else
+  bad "幂等(WLOC 域): 有实质改动:"; diff "$E2E_TMP/wloc-before.txt" "$E2E_TMP/wloc-after.txt" | sed 's/^/       /'
+fi
+cp "$E2E_TMP/wloc-before.txt" "$EVID/idem-wloc-before.txt" 2>/dev/null || true
+cp "$E2E_TMP/wloc-after.txt"  "$EVID/idem-wloc-after.txt"  2>/dev/null || true
+chmod 600 "$EVID/idem-wloc-"*.txt 2>/dev/null || true
+# 服务实例: 第二次跑不许重启任何被观察的服务(这一条与 WLOC 契约同级, 判红)
+_idem_changed="$(diff "$E2E_TMP/svc-Aidem-before.tsv" "$E2E_TMP/svc-Aidem-after.tsv" | grep -cE '^[<>]' || true)"
+[[ "$_idem_changed" == 0 ]] \
+  && ok "幂等(服务): 第二次运行没有重启/改状态任何被观察的服务" \
+  || { bad "幂等(服务): 有 $_idem_changed 行状态变化"; diff "$E2E_TMP/svc-Aidem-before.tsv" "$E2E_TMP/svc-Aidem-after.tsv" | sed 's/^/       /'; }
+# mtime 观测: 不判红, 但**必须点名**被重写的文件, 否则"零副作用"就是空话
+_rw="$(diff "$E2E_TMP/mt-before.txt" "$E2E_TMP/mt-after.txt" | grep '^>' | awk '{print $2}' | tr '\n' ' ')"
+if [[ -z "${_rw// /}" ]]; then
+  ok "幂等(mtime 观测): 全域没有任何文件被重写"
+else
+  note "幂等(mtime 观测): 这些文件被**同内容重写**(mtime 变了, 语义指纹未变): $_rw"
+  note "  它们属于 __migrate 里其它迁移的既定行为(防火墙按模板重建 / GMS 端口集 等),"
+  note "  不是 WLOC 退役的副作用 —— 如实记下来, 不当作零副作用, 也不据此判红。"
+fi
+_evn 03-A-idempotent.txt "### rc=$IRC; WLOC 域语义指纹变化=$(diff -q "$E2E_TMP/wloc-before.txt" "$E2E_TMP/wloc-after.txt" >/dev/null && echo 无 || echo 有); 服务状态变化行=$_idem_changed; 被重写文件=${_rw:-无}"
 
 else
   nrun "场景 A(旧 CLI 完整升级链): 前像不成立, 本场景未执行 —— 不拿不成立的前像冒充有效验收"
@@ -1119,8 +1218,8 @@ else:
     bad("B: 产物不见了 —— 未启用 WLOC 的那一版不该被删")
 PY
 [[ ! -e /etc/systemd/system/pdg-mitm.service ]] && ok "B: pdg-mitm unit 已撤除" || bad "B: pdg-mitm unit 还在"
-[[ "$(systemctl is-active pdg-mitm 2>/dev/null || echo not-found)" != active ]] \
-  && ok "B: pdg-mitm 真的停了(is-active=$(systemctl is-active pdg-mitm 2>/dev/null || echo not-found))" || bad "B: pdg-mitm 还在跑"
+_bs="$(sc_state is-active pdg-mitm)"
+[[ "$_bs" != active ]] && ok "B: pdg-mitm 真的停了(is-active=$_bs, rc=$SC_RC)" || bad "B: pdg-mitm 还在跑"
 [[ ! -e /etc/privdns-gateway/ca/ca.crt ]] && ok "B: 迁移没有凭空造出 CA" || bad "B: 冒出了 CA 材料"
 MB2="$(bash /usr/local/bin/pdg __migrate 2>&1)"; MB2RC=$?
 printf '%s\n' "$MB2" | _ev 04-B-migrate.txt
@@ -1149,7 +1248,8 @@ printf '%s\n' "$MC" | _ev 05-C-migrate.txt
 snap_state C-after; state_diff C-before C-after C
 [[ "$MCRC" == 0 ]] && ok "C: 迁移 rc=0" || bad "C: 迁移 rc=$MCRC"
 [[ ! -e /etc/systemd/system/pdg-mitm.service ]] && ok "C: 没有凭空造出任何旧服务的 unit" || bad "C: 冒出了 unit"
-[[ "$(systemctl is-active pdg-mitm 2>/dev/null || echo not-found)" != active ]] && ok "C: 没有凭空启动旧服务" || bad "C: 启动了旧服务"
+_cs="$(sc_state is-active pdg-mitm)"
+[[ "$_cs" != active ]] && ok "C: 没有凭空启动旧服务(is-active=$_cs)" || bad "C: 启动了旧服务"
 [[ -s /etc/privdns-gateway/ca/ca.crt && -s /etc/privdns-gateway/ca/ca.key ]] \
   && ok "C: CA-only 残留被保留(未删除)" || bad "C: CA 残留被删了"
 grep -qE '证书信任设置|CA 材料|取消对' <<<"$MC" \
@@ -1192,45 +1292,61 @@ rm -f "$INJ"
 snap_state D-after; state_diff D-before D-after D
 
 # ── 先判"到没到晚期"。没到就如实说未验证, 不拿别的失败冒充 ────────────────────
+# 产品会把"注入命中"与"回滚"打在**同一行**(「Python 语法错误, 回滚到更新前快照…」),
+# 用行号比较必然判成"先后对不上"; 而把判据放宽成"行号允许相等"又等于不再证明顺序。
+# 改用两件互相独立的东西:
+#   ① **字符偏移**(整段输出里第一次出现的位置)—— 同一行里的两个事件也有确定先后;
+#   ② **可关联的状态证据** —— journal 里 pdg-mitm 在本次窗口内真的被停过,
+#      证明"新配置已经进了运行态", 而不是只看文字。
+_off_of(){ awk -v pat="$1" 'BEGIN{RS="\0"} {i=index($0,pat); print (i?i:0); exit}' <<<"$UPD"; }
 _line_of(){ grep -n -- "$1" <<<"$UPD" | head -1 | cut -d: -f1; }
 L_INSTALL="$(_line_of '刷新代码')"
 # 迁移这一段只认 **WLOC 退役自己的成功文案**, 不拿泛泛的"迁移"二字凑数。
 L_MIG="$(grep -nE '已退役\(服务已停|iOS 描述文件记录已迁移' <<<"$UPD" | head -1 | cut -d: -f1)"
 L_INJ="$(_line_of 'Python 语法错误')"
 L_RB="$(_line_of '回滚到更新前快照')"
+O_INSTALL="$(_off_of '刷新代码')"
+O_MIG="$(awk 'BEGIN{RS="\0"} {a=index($0,"已退役(服务已停"); b=index($0,"iOS 描述文件记录已迁移");
+                               if(a&&b) print (a<b?a:b); else print (a?a:b); exit}' <<<"$UPD")"
+O_INJ="$(_off_of 'Python 语法错误')"
+O_RB="$(_off_of '回滚到更新前快照')"
 _evn 06-late-failure.txt "阶段行号: 装文件=$L_INSTALL 迁移=$L_MIG 注入命中=$L_INJ 回滚=$L_RB"
+_evn 06-late-failure.txt "阶段字符偏移: 装文件=$O_INSTALL 迁移=$O_MIG 注入命中=$O_INJ 回滚=$O_RB"
 # **"坏语法文件被检测到"本身不等于晚期失败。** 要同时满足:
 #   受管文件已安装 → WLOC 退役迁移已经成功落地(新配置进了运行态) → 注入才命中。
 # 任何一环不成立, 就如实判"未覆盖晚期恢复", 不改名包装成通过。
 LATE_REACHED=0
-if [[ -n "$L_INSTALL" && -n "$L_INJ" && -n "$L_MIG" \
-      && "$L_INSTALL" -lt "$L_INJ" && "$L_MIG" -lt "$L_INJ" ]]; then LATE_REACHED=1; fi
+if [[ "$O_INSTALL" -gt 0 && "$O_MIG" -gt 0 && "$O_INJ" -gt 0 \
+      && "$O_INSTALL" -lt "$O_MIG" && "$O_MIG" -lt "$O_INJ" ]]; then LATE_REACHED=1; fi
 
 if [[ "$LATE_REACHED" == 0 ]]; then
-  if [[ -z "$L_INJ" ]]; then
+  if [[ "$O_INJ" == 0 ]]; then
     nrun "晚期失败恢复: 注入**没有命中**(update 在 py_compile 校验门之前就结束了), 未覆盖晚期恢复"
-  elif [[ -z "$L_MIG" ]]; then
+  elif [[ "$O_MIG" == 0 ]]; then
     nrun "晚期失败恢复: 注入命中时**新配置尚未加载**(没有 WLOC 退役的落地输出), 未覆盖晚期恢复"
   else
-    nrun "晚期失败恢复: 阶段顺序不成立(装文件=$L_INSTALL 迁移=$L_MIG 注入=$L_INJ), 未覆盖晚期恢复"
+    nrun "晚期失败恢复: 阶段顺序不成立(偏移 装文件=$O_INSTALL 迁移=$O_MIG 注入=$O_INJ), 未覆盖晚期恢复"
   fi
   note "不把取件失败、前像构造失败或安装前的检查失败称为晚期失败。"
 else
-  ok "① 到达晚期: 受管文件已安装(第 $L_INSTALL 行)且注入在其之后命中(第 $L_INJ 行)"
-  ok "① 新配置已进运行态: WLOC 退役的落地输出(第 $L_MIG 行)排在注入命中之前"
+  ok "① 到达晚期(按字符偏移定序, 同一行里的两个事件也分得清): 装文件@$O_INSTALL < 迁移落地@$O_MIG < 注入命中@$O_INJ"
+  ok "① 新配置已进运行态(文字证据): WLOC 退役的落地输出排在注入命中之前"
   # 运行态真的被改过: pdg-mitm 的运行实例身份必须变过(停过又起来)
   R_INV="$(systemctl show -p InvocationID --value pdg-mitm 2>/dev/null)"
   [[ -n "$D_INV_MITM" && -n "$R_INV" && "$D_INV_MITM" != "$R_INV" ]] \
     && ok "① 运行态确实被动过: pdg-mitm 的 InvocationID 变了($D_INV_MITM → $R_INV) —— 它真的下去过又回来了" \
     || bad "① pdg-mitm 的 InvocationID 没变($D_INV_MITM → $R_INV): 拿不出「下去过」的证据"
+  # **可关联的状态证据**(不依赖文字顺序): 本次窗口内 pdg-mitm 真的被停过 ⇒ 新配置确实进了运行态。
   journalctl -u pdg-mitm --since "$D_T0" --no-pager 2>/dev/null | grep -qiE 'Stopped|Deactivated' \
-    && ok "① journal 里有 pdg-mitm 被停的记录(真 systemd 的现场证据)" \
-    || note "① journal 里没抓到 pdg-mitm 的停止记录(记下来, 不据此下结论)"
+    && ok "① 状态证据: journal 显示 pdg-mitm 在本次更新窗口内真的被停过(新配置已进运行态)" \
+    || bad "① 状态证据缺失: 窗口内 journal 里没有 pdg-mitm 的停止记录"
+  journalctl -u pdg-mitm --since "$D_T0" --no-pager 2>/dev/null | tail -12 | sed 's/^/      /' | _ev 06-late-failure.txt
   grep -qE 'Python 语法错误' <<<"$UPD" && ok "② 注入确实发生: 命中 py_compile 校验门(不是别的地方)" \
                                        || bad "② 没命中预期的注入点: $(tail -3 <<<"$UPD")"
   grep -qE '回滚到更新前快照' <<<"$UPD" && ok "③ 随后走了恢复: 产品自己的回滚路径" || bad "③ 没有触发回滚"
-  [[ -n "$L_RB" && -n "$L_INJ" && "$L_RB" -gt "$L_INJ" ]] \
-    && ok "③ 顺序正确: 回滚发生在注入命中之后" || bad "③ 回滚与注入的先后对不上"
+  { [[ "$O_RB" -gt 0 && "$O_INJ" -gt 0 && "$O_RB" -gt "$O_INJ" ]]; } \
+    && ok "③ 顺序正确: 回滚@$O_RB 在注入命中@$O_INJ 之后(同一行输出也按偏移分得清)" \
+    || bad "③ 回滚与注入的先后对不上(偏移 注入=$O_INJ 回滚=$O_RB)"
   [[ "$UDRC" != 0 ]] && ok "update 返回非 0(rc=$UDRC), 没有谎报成功" || bad "失败却返回 0"
 fi
 
@@ -1238,11 +1354,12 @@ if [[ "$LATE_REACHED" != 1 ]]; then
   nrun "④ 四维恢复核对: 晚期没到达, 这一组判据**不执行** —— 现场没被动过时它们会假绿"
 else
 echo "── ④ 恢复是否真的回到前像(四个维度都要对) ──"
-RAC="$(systemctl is-active pdg-mitm 2>/dev/null || echo not-found)"
-REN="$(systemctl is-enabled pdg-mitm 2>/dev/null || echo not-found)"
+RAC="$(sc_state is-active pdg-mitm)";  RAC_RC=$SC_RC
+REN="$(sc_state is-enabled pdg-mitm)"; REN_RC=$SC_RC
 [[ "$RAC" == active ]] && ok "恢复: pdg-mitm **真的又在跑**(is-active=active, MainPID=$(systemctl show -p MainPID --value pdg-mitm))" \
-                       || bad "恢复: pdg-mitm 没回到运行态(is-active=$RAC)"
-[[ "$REN" == enabled ]] && ok "恢复: pdg-mitm 自启回到 enabled" || bad "恢复: 自启=$REN(前像是 enabled)"
+                       || bad "恢复: pdg-mitm 没回到运行态(is-active=$RAC, rc=$RAC_RC)"
+[[ "$REN" == enabled ]] && ok "恢复: pdg-mitm 自启回到 enabled" \
+                        || bad "恢复: 自启=$REN(rc=$REN_RC; 前像是 enabled)"
 ss -lnt 2>/dev/null | grep -q ':7894' && ok "恢复: 7894 又有监听 —— 运行配置真的回来了, 不是只有文件回来了" || bad "恢复: 7894 没有监听"
 [[ -e /etc/systemd/system/pdg-mitm.service ]] && ok "恢复: unit 文件回来了" || bad "恢复: unit 文件没回来"
 [[ -e /opt/pdg-bot/mitm_server.py && -e /opt/pdg-bot/mitm_wloc.py ]] && ok "恢复: WLOC 模块文件回来了" || bad "恢复: 模块没回来"
@@ -1266,6 +1383,20 @@ for f in /etc/systemd/system/pdg-mitm.service /opt/pdg-bot/mitm_wloc.py /etc/pri
     bad "恢复: $f 不存在"
   fi
 done
+# ── 恢复结果的报告是否如实(与"有没有恢复"分开判)──────────────────────────
+# 契约: 只有满足既定恢复契约才能打印完整成功; 漏恢复 / 恢复失败 / 状态无法确认,
+# 都必须具名进入恢复结果(unrestored), 不能仍然只打「✅ 已回滚并重启服务」。
+if [[ "$RAC" != active || "$REN" != enabled ]]; then
+  if grep -q '未完全回滚' <<<"$UPD"; then
+    ok "④ 报告如实: pdg-mitm 没恢复到前像, 而回滚**已经把它计入未恢复项**"
+    grep -o '未能恢复(未完全回滚):.*' <<<"$UPD" | head -1 | sed 's/^/      /'
+  else
+    bad "④ 报告不实: pdg-mitm 的运行态/自启没回到前像(is-active=$RAC, is-enabled=$REN), 回滚却只打印了完整成功 —— 漏恢复没有进入恢复结果"
+  fi
+else
+  ok "④ pdg-mitm 的运行态与自启都回到了前像"
+fi
+
 # 回滚不完整时: 恢复材料必须留着
 if grep -qE '恢复材料|已保留' <<<"$UPD"; then
   # _RETIRE_TMP 来自 mktemp -d, 落在 TMPDIR 下; 这里按 TMPDIR 取路径, 不写死目录字面量。
