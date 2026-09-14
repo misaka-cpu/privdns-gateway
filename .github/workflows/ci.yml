@@ -1037,6 +1037,10 @@ jobs:
       - name: "桥接版边界 (只改 cmd_update/cmd_rollback; 不含任何退役动作; 旧能力出现次数不变)"
         run: bash tests/test-svcstate-bridge-scope.sh
 
+      # 辅助函数自己"没有服务动作"证明不了整条回滚链没先把服务启动过 —— 这一支跑真实 cmd_rollback。
+      - name: "回滚链服务恢复 (真实 cmd_rollback: 本来停着的一次都没被启动/缺前像不报完全回滚)"
+        run: bash tests/test-rollback-svcstate-chain.sh
+
   core-startlimit:
     needs: prepare-mosdns-fixture
     runs-on: ubuntu-latest

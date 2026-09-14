@@ -1,19 +1,22 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# 服务前像的**恢复**这一格。
+# 服务前像的**恢复**这一格(函数级)。整条回滚链的接线由
+# tests/test-rollback-svcstate-chain.sh 跑真实 cmd_rollback 验, 两支不互相替代。
 #
-# 要补的洞: 快照只收文件。`multi-user.target.wants/` 下那些 enable 符号链接全仓从不快照,
-# 所以"文件都回来了"≠"服务回到了原来的运行态与自启态"。原来的回滚在这种现场会自报
-# "✅ 已回滚并重启服务"。
+# 要补的洞: 快照只收文件。enable 的符号链接在 multi-user.target.wants/ 下, 全仓从不快照,
+# 所以"文件都回来了"≠"服务回到了原来的运行态与自启态"。
 #
-# 这一支验的是恢复判定本身: 用**产品原文**的函数(sed 抽取), systemctl 是本用例自己的
-# 可控桩 —— 只回答状态、记账、按指令改自己的假状态, **不管理任何真实服务**。
-# 桩额外支持两种坏情况: 动作返回失败, 以及**动作返回成功但状态没真的变**。
-# 真 systemd 那一格由 tests/e2e-real-migration.sh 负责, 这里不冒充。
+# 本轮重做的几条纪律, 每条都在下面有具名判据:
+#   · **先定策略再动手** —— 不再"先一律 restart 三个服务再纠正"; 本来停着的服务一次都不会被启动;
+#   · 动作返回码与后置状态是**两个独立**的失败条件;
+#   · 停必须停稳(过渡态/查询失败都不算), failed 与 inactive 的差别如实登记;
+#   · 想要 active 的用 restart 并要求 InvocationID 变过 —— 光是 active 证明不了恢复出来的
+#     配置被读进去了(已经在跑的服务 start 是空转);
+#   · enabled-runtime 不提升成永久 enabled; static/masked/未知不先改再说不支持;
+#   · 记录必须属于**实际选中的那份快照**(snap_dir + snap_id), 光结构合法不算;
+#   · 没有可用前像时保留原来那套通用重启与安全检查, 但如实登记、不冒充完整恢复。
 #
-# 三态恢复与失败报告各自带撤销对照: 把关键那几行换成"天真实现"跑同一场景, 证明结论
-# 确实由被测代码得出, 而不是夹具初始状态凑出来的。
-# 退出码 0=全过。
+# 产品函数一个都没打桩; 打桩的只有外部系统边界 systemctl。
 # ─────────────────────────────────────────────────────────────────────────────
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -28,79 +31,83 @@ bad(){ echo "[FAIL] $1"; nfail=$((nfail+1)); }
 _fn1(){ grep -m1 -E "^$2\(\)\{.*\}[[:space:]]*\$" "$1"; }
 _fnN(){ sed -n "/^$2(){/,/^}/p" "$1"; }
 
-# ── 可控 systemctl 桩 ────────────────────────────────────────────────────────
-# 每个 unit 一组小文件: .en 自启值 / .ac 运行值 / .sub / .inv
-#   .fail_<动作>  → 那个动作返回 1 且不改状态
-#   .lie_<动作>   → 那个动作返回 0 但**不改状态**(用来验"返回成功≠真的恢复了")
+# systemctl 桩: 记账 + 回答状态。每次 start/restart 换一个 InvocationID(真 systemd 就是这样),
+# 所以"进程有没有真的被换掉"这条判据在这里是可观测的。
+#   .fail_<动作>  → 动作返回 1 且不改状态
+#   .lie_<动作>   → 动作返回 0 但不改状态(验"返回成功≠真的恢复了")
+#   .stale_start  → restart 返回 0、状态变 active, 但 InvocationID **不变**
+#                   (对应真实世界里"服务其实没被换掉, 旧配置还在跑"的那一格)
 STUB='
 systemctl(){
   echo "$*" >> "$SC_LOG"
   local u="${*: -1}" act="$1"
   case "$act" in
-    is-enabled) cat "$SC_DIR/$u.en" 2>/dev/null || { echo not-found; return 1; }; return 0;;
-    is-active)  cat "$SC_DIR/$u.ac" 2>/dev/null || { echo inactive; return 3; }; return 0;;
+    is-enabled) local v; v="$(cat "$SC_DIR/$u.en" 2>/dev/null)" || { echo not-found; return 1; }
+                echo "$v"; case "$v" in enabled|enabled-runtime|static|indirect|generated|alias) return 0;; *) return 1;; esac;;
+    is-active)  local a; a="$(cat "$SC_DIR/$u.ac" 2>/dev/null)" || { echo inactive; return 3; }
+                echo "$a"; [[ "$a" == active ]] && return 0 || return 3;;
     show) case "$3" in
             LoadState)    [[ -e "$SC_DIR/$u.en" ]] && echo loaded || echo not-found;;
             SubState)     cat "$SC_DIR/$u.sub" 2>/dev/null || echo dead;;
             InvocationID) cat "$SC_DIR/$u.inv" 2>/dev/null || echo "";;
             *) echo "";;
           esac; return 0;;
+    reset-failed) return 0;;
   esac
   [[ -e "$SC_DIR/$u.fail_$act" ]] && return 1
   [[ -e "$SC_DIR/$u.lie_$act"  ]] && return 0
   case "$act" in
     enable)  [[ "$2" == --runtime ]] && echo enabled-runtime > "$SC_DIR/$u.en" || echo enabled > "$SC_DIR/$u.en";;
     disable) echo disabled > "$SC_DIR/$u.en";;
-    start)   echo active   > "$SC_DIR/$u.ac";;
-    stop)    echo inactive > "$SC_DIR/$u.ac";;
+    start|restart)
+             echo active > "$SC_DIR/$u.ac"
+             [[ -e "$SC_DIR/$u.stale_start" ]] || echo "INV-$u-$RANDOM$RANDOM" > "$SC_DIR/$u.inv";;
+    stop)    echo inactive > "$SC_DIR/$u.ac"; : > "$SC_DIR/$u.inv";;
   esac
   return 0
 }'
 
 U_ALL="pdg-mitm pdg-bot pdg-probe81 mosdns mihomo pdg-dotwitness pdg-health.timer pdg-rules-update.timer"
-set_u(){ # $1=SC_DIR $2=unit $3=enabled值 $4=active值
-  echo "$3" > "$1/$2.en"; echo "$4" > "$1/$2.ac"
-  echo running > "$1/$2.sub"; echo "INV-$2" > "$1/$2.inv"
-}
-seed(){  # $1=SC_DIR : 先把八个都摆成 enabled/active, 各用例再单独改
-  local d="$1" u; mkdir -p "$d"; for u in $U_ALL; do set_u "$d" "$u" enabled active; done
+set_u(){ echo "$3" > "$1/$2.en"; echo "$4" > "$1/$2.ac"; echo running > "$1/$2.sub"; echo "INV-$2-orig" > "$1/$2.inv"; }
+seed(){ local d="$1" u; mkdir -p "$d"; for u in $U_ALL; do set_u "$d" "$u" enabled active; done; }
+
+# 产品原文的那一组(含本轮新增的 plan/now_* 与全局表)
+prodfns(){ local src="$PDG"
+  _fn1 "$src" c_g; _fn1 "$src" c_y; _fn1 "$src" c_r
+  _fnN "$src" _pdg_svcstate_units; _fnN "$src" _pdg_svc_known; _fnN "$src" _pdg_svc_q
+  _fnN "$src" _pdg_save_svcstate; _fnN "$src" _pdg_svcstate_valid
+  grep -m1 '^declare -A _PDG_WANT_EN' "$src"
+  grep -m1 '^_PDG_SVC_MODE=' "$src"; grep -m1 '^_PDG_SVC_WHY=' "$src"; grep -m1 '^_PDG_SVC_SRC=' "$src"
+  _fnN "$src" _pdg_svcstate_plan; _fn1 "$src" _pdg_now_ac; _fn1 "$src" _pdg_now_en
+  _fnN "$src" _pdg_restore_svcstate
 }
 
-# 造一份合法前像(用产品原文的保存函数, 不手搓格式)
-save_preimage(){ # $1=场景目录
+save_preimage(){ # $1=场景目录: 用产品原文的保存函数造一份合法前像
   local d="$1"
   { echo 'set -uo pipefail'
     echo "SC_DIR=\"$d/sc\"; SC_LOG=\"$d/save.log\"; : > \"\$SC_LOG\""
-    echo "$STUB"
-    _fn1 "$PDG" c_g; _fn1 "$PDG" c_y
-    _fnN "$PDG" _pdg_svcstate_units; _fnN "$PDG" _pdg_svc_q; _fnN "$PDG" _pdg_save_svcstate
+    echo "$STUB"; prodfns
     echo "printf 'snapshot-bytes' > \"$d/snap/snap.tar.gz\""
     echo "_pdg_save_svcstate \"$d/snap\" >/dev/null"
   } > "$d/save.sh"
   bash "$d/save.sh"
 }
 
-# 跑恢复(可选: 用"天真实现"替换被测函数, 做撤销对照)
-run_restore(){ # $1=场景目录 [$2=naive|"" ]
+run_restore(){ # $1=场景目录 [$2=naive-restart|naive-norecheck]
   local d="$1" mode="${2:-}"
   { echo 'set -uo pipefail'
     echo "SC_DIR=\"$d/sc\"; SC_LOG=\"$d/restore.log\"; : > \"\$SC_LOG\""
-    echo "$STUB"
-    _fn1 "$PDG" c_g; _fn1 "$PDG" c_y; _fn1 "$PDG" c_r
-    _fnN "$PDG" _pdg_svcstate_units; _fnN "$PDG" _pdg_svc_q; _fnN "$PDG" _pdg_svcstate_valid
+    echo "$STUB"; prodfns
     case "$mode" in
       naive-restart)
-        # 撤销对照(三态): 换成回滚原来那套 —— 一律 restart, 不看前像
         echo 'naive(){ local u; for u in '"$U_ALL"'; do systemctl restart "$u" >/dev/null 2>&1; systemctl start "$u" >/dev/null 2>&1; done; }';;
       naive-norecheck)
-        # 撤销对照(失败报告): 只看动作返回码, 不复核后置状态
-        echo 'naive(){ local u ufs asv rc
+        echo 'naive(){ local u ufs asv
           while IFS=$'"'"'\t'"'"' read -r _k u ufs _urc asv _arc _sub _inv; do
             [[ "$_k" == unit && -n "$u" ]] || continue
             case "$ufs" in enabled) systemctl enable "$u" >/dev/null 2>&1 || unrestored+=("$u enable 失败");; esac
-            case "$asv" in active)  systemctl start  "$u" >/dev/null 2>&1 || unrestored+=("$u start 失败");;  esac
+            case "$asv" in active)  systemctl restart "$u" >/dev/null 2>&1 || unrestored+=("$u restart 失败");; esac
           done < "$1/svcstate.tsv"; }';;
-      *) _fnN "$PDG" _pdg_restore_svcstate;;
     esac
     echo 'unrestored=()'
     case "$mode" in
@@ -110,6 +117,7 @@ run_restore(){ # $1=场景目录 [$2=naive|"" ]
     esac
     echo 'printf "RC=%s\n" "$rc"'
     echo 'for x in "${unrestored[@]+"${unrestored[@]}"}"; do printf "UNRESTORED\t%s\n" "$x"; done'
+    local u
     for u in $U_ALL; do
       echo "printf 'FINAL\t$u\t%s\t%s\n' \"\$(cat \"$d/sc/$u.en\" 2>/dev/null)\" \"\$(cat \"$d/sc/$u.ac\" 2>/dev/null)\""
     done
@@ -120,125 +128,144 @@ run_restore(){ # $1=场景目录 [$2=naive|"" ]
 fin(){ grep -P "^FINAL\t$2\t" <<<"$1" | cut -f3,4 | tr '\t' '/'; }
 unl(){ grep -P '^UNRESTORED\t' <<<"$1" | cut -f2-; }
 nun(){ unl "$1" | grep -c . ; }
-
 mk(){ local d="$BOX/$1"; mkdir -p "$d/snap" "$d/sc"; seed "$d/sc"; echo "$d"; }
 
-echo "══ 一. 三态恢复: active+enabled / inactive+disabled / enabled-runtime ══"
+echo "══ 一. 三态恢复, 且本来停着的服务**一次都没被启动过** ══"
 d="$(mk A)"
-set_u "$d/sc" pdg-mitm enabled         active      # 原本: 开着且自启
-set_u "$d/sc" pdg-bot  disabled        inactive    # 原本: 关着且不自启
-set_u "$d/sc" mosdns   enabled-runtime active      # 原本: 只这次开机有效
+set_u "$d/sc" pdg-mitm enabled         active
+set_u "$d/sc" pdg-bot  disabled        inactive
+set_u "$d/sc" mosdns   enabled-runtime active
 save_preimage "$d"
-# 把现场弄成"回滚之后的样子": 自启链接全没了(快照不收 wants/), 且通用 restart 把该关的也拉起来了
-for u in $U_ALL; do set_u "$d/sc" "$u" disabled active; done
+for u in $U_ALL; do set_u "$d/sc" "$u" disabled inactive; done   # 回滚刚落盘: 自启链接没了, 服务也没起
 o="$(run_restore "$d")"
 [[ "$(fin "$o" pdg-mitm)" == "enabled/active" ]] && ok "A1: active+enabled 恢复回 enabled/active" || bad "A1: 实得 $(fin "$o" pdg-mitm)"
-[[ "$(fin "$o" pdg-bot)"  == "disabled/inactive" ]] && ok "A2: inactive+disabled 恢复回 disabled/inactive(通用 restart 拉起来的被停回去)" || bad "A2: 实得 $(fin "$o" pdg-bot)"
+[[ "$(fin "$o" pdg-bot)"  == "disabled/inactive" ]] && ok "A2: inactive+disabled 恢复回 disabled/inactive" || bad "A2: 实得 $(fin "$o" pdg-bot)"
 [[ "$(fin "$o" mosdns)"   == "enabled-runtime/active" ]] && ok "A3: enabled-runtime **没有**被提升成永久 enabled" || bad "A3: 实得 $(fin "$o" mosdns)"
-[[ "$(nun "$o")" == 0 ]] && ok "A4: 全部恢复成功 ⇒ 未恢复项为空" || { bad "A4: 冒出了未恢复项"; unl "$o" | sed 's/^/      /'; }
+grep -qE '^(start|restart) ([^ ]+ )*pdg-bot( |$)' "$d/restore.log" \
+  && bad "A4: 本来停着的 pdg-bot 被启动过(先启后停那条老路)" \
+  || ok "A4: 本来停着的 pdg-bot **一次都没被启动**(先定策略再动手)"
+[[ "$(nun "$o")" == 0 ]] && ok "A5: 全部恢复成功 ⇒ 未恢复项为空" || { bad "A5: 冒出了未恢复项"; unl "$o" | sed 's/^/      /'; }
 
 echo
-echo "══ 二. 撤销对照(三态): 换成原来那套「一律 restart」, 同一场景恢复不回来 ══"
+echo "══ 二. 撤销对照(三态): 换回「一律 restart」, 同一场景恢复不回来且一声不吭 ══"
 d="$(mk B)"
 set_u "$d/sc" pdg-mitm enabled active; set_u "$d/sc" pdg-bot disabled inactive; set_u "$d/sc" mosdns enabled-runtime active
 save_preimage "$d"
-for u in $U_ALL; do set_u "$d/sc" "$u" disabled active; done
+for u in $U_ALL; do set_u "$d/sc" "$u" disabled inactive; done
 o="$(run_restore "$d" naive-restart)"
-[[ "$(fin "$o" pdg-mitm)" == "disabled/active" ]] && ok "B1: 天真实现下 pdg-mitm 仍不自启(enabled 没回来)—— A1 确实是被测代码的功劳" || bad "B1: 对照没体现差异, 实得 $(fin "$o" pdg-mitm)"
-[[ "$(fin "$o" pdg-bot)"  == "disabled/active" ]] && ok "B2: 天真实现下 pdg-bot 被留在 active(本该是 inactive)" || bad "B2: 实得 $(fin "$o" pdg-bot)"
+[[ "$(fin "$o" pdg-mitm)" == "disabled/active" ]] && ok "B1: 天真实现下 pdg-mitm 仍不自启 —— A1 确实是被测代码的功劳" || bad "B1: 实得 $(fin "$o" pdg-mitm)"
+[[ "$(fin "$o" pdg-bot)"  == "disabled/active" ]] && ok "B2: 天真实现把本该停着的 pdg-bot 拉起来了" || bad "B2: 实得 $(fin "$o" pdg-bot)"
 [[ "$(fin "$o" mosdns)"   == "disabled/active" ]] && ok "B3: 天真实现下 enabled-runtime 丢失" || bad "B3: 实得 $(fin "$o" mosdns)"
-[[ "$(nun "$o")" == 0 ]] && ok "B4: 而且它**一声不吭**(未恢复项为空)—— 这正是原来那句「✅ 已回滚并重启服务」的来历" || bad "B4: 对照意外报了未恢复项"
+[[ "$(nun "$o")" == 0 ]] && ok "B4: 而且它一声不吭(未恢复项为空)—— 那句「✅ 已回滚并重启服务」就是这么来的" || bad "B4"
 
 echo
 echo "══ 三. 动作返回成功、后置状态却不符 → 计入未恢复 ══"
-d="$(mk C)"
-set_u "$d/sc" pdg-mitm enabled active
-save_preimage "$d"
+d="$(mk C)"; set_u "$d/sc" pdg-mitm enabled active; save_preimage "$d"
 for u in $U_ALL; do set_u "$d/sc" "$u" disabled active; done
-: > "$d/sc/pdg-mitm.lie_enable"      # enable 返回 0, 状态纹丝不动
+: > "$d/sc/pdg-mitm.lie_enable"
 o="$(run_restore "$d")"
-unl "$o" | grep -q 'pdg-mitm 自启未恢复(目标 enabled, 实得 disabled' \
-  && ok "C1: 动作返回成功但状态没变 → 如实登记为未恢复" || { bad "C1: 没登记"; unl "$o" | sed 's/^/      /'; }
-grep -q 'RC=0' <<<"$o" && ok "C2: 恢复函数本身仍走完(未恢复项由调用方汇总)" || bad "C2"
+unl "$o" | grep -q 'pdg-mitm 自启后置状态不符(目标 enabled, 实得 disabled)' \
+  && ok "C1: 动作返回成功但状态没变 → 如实登记" || { bad "C1: 没登记"; unl "$o" | sed 's/^/      /'; }
+unl "$o" | grep -q 'pdg-mitm 自启恢复动作失败' && bad "C2: 动作明明返回 0, 却报成了动作失败" || ok "C2: 没有把'状态不符'混成'动作失败'"
 
 echo
 echo "══ 四. 撤销对照(失败报告): 只看返回码不复核 → 同一现场被漏报 ══"
-d="$(mk D)"
-set_u "$d/sc" pdg-mitm enabled active
-save_preimage "$d"
+d="$(mk D)"; set_u "$d/sc" pdg-mitm enabled active; save_preimage "$d"
 for u in $U_ALL; do set_u "$d/sc" "$u" disabled active; done
 : > "$d/sc/pdg-mitm.lie_enable"
 o="$(run_restore "$d" naive-norecheck)"
-[[ "$(nun "$o")" == 0 ]] && ok "D1: 天真实现(只看 rc)对同一现场零登记 —— C1 确实来自「动作之后复核状态」这一条" || { bad "D1: 对照没体现差异"; unl "$o" | sed 's/^/      /'; }
-[[ "$(fin "$o" pdg-mitm)" == "disabled/active" ]] && ok "D2: 而状态确实没恢复" || bad "D2: 实得 $(fin "$o" pdg-mitm)"
+[[ "$(nun "$o")" == 0 ]] && ok "D1: 天真实现(只看 rc)对同一现场零登记 —— C1 确实来自「动作之后复核状态」" || { bad "D1"; unl "$o" | sed 's/^/      /'; }
 
 echo
-echo "══ 五. 恢复动作本身失败 → 计入未恢复 ══"
-d="$(mk E)"
-set_u "$d/sc" pdg-mitm enabled active; set_u "$d/sc" mihomo enabled active
-save_preimage "$d"
+echo "══ 五. 恢复动作失败 → 与后置状态分开各记一条 ══"
+d="$(mk E)"; set_u "$d/sc" pdg-mitm enabled active; set_u "$d/sc" mihomo enabled active; save_preimage "$d"
 for u in $U_ALL; do set_u "$d/sc" "$u" disabled inactive; done
-: > "$d/sc/pdg-mitm.fail_enable"
-: > "$d/sc/mihomo.fail_start"
+: > "$d/sc/pdg-mitm.fail_enable"; : > "$d/sc/mihomo.fail_restart"
 o="$(run_restore "$d")"
-unl "$o" | grep -q 'pdg-mitm 自启未恢复(目标 enabled, 实得 disabled, enable rc=1)' \
-  && ok "E1: enable 失败 → 登记且带上 rc" || { bad "E1"; unl "$o" | sed 's/^/      /'; }
-unl "$o" | grep -q 'mihomo 未回到运行态(目标 active, 实得 inactive, start rc=1)' \
-  && ok "E2: start 失败 → 登记且带上 rc" || { bad "E2"; unl "$o" | sed 's/^/      /'; }
-unl "$o" | grep -q 'pdg-bot' && bad "E3: 好的那些也被误报了" || ok "E3: 没有牵连其它已恢复的服务"
+unl "$o" | grep -q 'pdg-mitm 自启恢复动作失败(目标 enabled, rc=1)' && ok "E1: enable 返回非 0 → 独立登记一条「动作失败」" || { bad "E1"; unl "$o" | sed 's/^/      /'; }
+unl "$o" | grep -q 'pdg-mitm 自启后置状态不符' && ok "E2: 同时还登记了「后置状态不符」—— 两个条件各记各的" || bad "E2"
+unl "$o" | grep -q 'mihomo 启动动作失败(restart rc=1)' && ok "E3: restart 返回非 0 → 独立登记" || { bad "E3"; unl "$o" | sed 's/^/      /'; }
+unl "$o" | grep -q 'pdg-bot' && bad "E4: 牵连了其它已恢复的服务" || ok "E4: 没有牵连其它已恢复的服务"
 
 echo
-echo "══ 六. 旧快照没有前像: 不冒充完整恢复 ══"
-d="$(mk F)"; rm -f "$d/snap/svcstate.tsv"
+echo "══ 六. start + active 不证明旧配置被加载: 进程没换要报出来 ══"
+d="$(mk F)"; set_u "$d/sc" mosdns enabled active; save_preimage "$d"
+: > "$d/sc/mosdns.stale_start"          # restart 返回 0、状态 active, 但 InvocationID 不变
 o="$(run_restore "$d")"
-grep -q 'RC=1' <<<"$o" && ok "F1: 返回非 0(调用方据此不得报「完全回滚」)" || bad "F1: 返回了 0"
-unl "$o" | grep -q '服务前像缺失(旧快照; 运行态/自启未确认)' && ok "F2: 登记为「未确认」而不是「已恢复」" || { bad "F2"; unl "$o" | sed 's/^/      /'; }
-grep -q '无法确认' <<<"$(sed 's/\x1b\[[0-9;]*m//g' <<<"$o")" && ok "F3: 明说无法确认, 并指出要人工复核哪些 unit" || bad "F3"
-grep -qE '^(enable|disable|start|stop) ' "$d/restore.log" 2>/dev/null \
-  && bad "F4: 没有前像却动了服务(等于凭空推断历史)" || ok "F4: 没有前像时**不推断、不乱动**(日志里没有 enable/disable/start/stop)"
+[[ "$(fin "$o" mosdns)" == "enabled/active" ]] && ok "F1: 表面上看 enabled/active, 一切正常" || bad "F1: 实得 $(fin "$o" mosdns)"
+unl "$o" | grep -q 'mosdns 仍是回滚前那个进程, 恢复出来的配置没有被重新加载' \
+  && ok "F2: 但 InvocationID 没变 → 如实报「配置没有被重新加载」" || { bad "F2"; unl "$o" | sed 's/^/      /'; }
+grep -q '^restart mosdns' "$d/restore.log" && ok "F3: 用的是 restart 而不是 start(已经在跑的服务 start 是空转)" || bad "F3: $(grep -c . "$d/restore.log") 行日志里没有 restart mosdns"
 
 echo
-echo "══ 七. 前像损坏: 登记, 不假装恢复过 ══"
-d="$(mk G)"; save_preimage "$d"
-sed -i 's|^created_at\t.*|created_at\tTAMPERED|' "$d/snap/svcstate.tsv"
+echo "══ 七. 停必须停稳; failed 与 inactive 的差别如实登记 ══"
+d="$(mk G)"; set_u "$d/sc" pdg-bot inactive_placeholder active
+set_u "$d/sc" pdg-bot disabled inactive; set_u "$d/sc" pdg-probe81 disabled failed
+save_preimage "$d"
+for u in $U_ALL; do set_u "$d/sc" "$u" disabled active; done   # 回滚后两者都在跑
+: > "$d/sc/pdg-bot.fail_stop"                                   # 停不下来
 o="$(run_restore "$d")"
-grep -q 'RC=1' <<<"$o" && ok "G1: 返回非 0" || bad "G1"
-unl "$o" | grep -q '服务前像不可用(正文摘要对不上' && ok "G2: 说清了是哪一条不过" || { bad "G2"; unl "$o" | sed 's/^/      /'; }
+unl "$o" | grep -q 'pdg-bot 停止动作失败(stop rc=1)' && ok "G1: 停止动作失败 → 独立登记" || { bad "G1"; unl "$o" | sed 's/^/      /'; }
+unl "$o" | grep -q 'pdg-bot 前像是 inactive, 但现在是 active —— 没有停稳' && ok "G2: 并且后置状态不符也单独登记" || bad "G2"
+unl "$o" | grep -q 'pdg-probe81 前像是 failed(启动失败态), 现为 inactive —— 未复现该状态' \
+  && ok "G3: failed 停成 inactive 如实登记为「未复现」, 不当成已恢复" || { bad "G3"; unl "$o" | sed 's/^/      /'; }
 
 echo
-echo "══ 八. 记录时就没查到 / 不是 enable-disable 能表达的 / 过渡态 ══"
-d="$(mk H)"
+echo "══ 八. 旧快照没有前像: 保留原来那套通用重启与安全检查, 但不冒充完整恢复 ══"
+d="$(mk H)"; rm -f "$d/snap/svcstate.tsv"; printf 'x' > "$d/snap/snap.tar.gz"
+o="$(run_restore "$d")"
+grep -q 'RC=1' <<<"$o" && ok "H1: 返回非 0(调用方据此不得报「完全回滚」)" || bad "H1: 返回了 0"
+unl "$o" | grep -q '服务前像缺失/不可用' && ok "H2: 登记为「未确认」而不是「已恢复」" || { bad "H2"; unl "$o" | sed 's/^/      /'; }
+grep -q '^restart mosdns pdg-bot pdg-probe81' "$d/restore.log" && ok "H3: 保留了原来那句明确列名的通用重启(没有 pdg-* 通配)" || bad "H3"
+grep -qE '^(enable|disable) ' "$d/restore.log" && bad "H4: 没有前像却动了自启(等于凭空推断历史)" || ok "H4: 没有前像时不碰任何 enable/disable"
+
+echo
+echo "══ 九. 记录必须属于**实际选中的那份快照** ══"
+d="$(mk I)"; save_preimage "$d"
+printf 'DIFFERENT-BYTES' > "$d/snap/snap.tar.gz"        # 换了快照 ⇒ snap_id 对不上
+o="$(run_restore "$d")"
+grep -q 'RC=1' <<<"$o" && unl "$o" | grep -q '快照身份与这一份对不上' \
+  && ok "I1: 结构合法但钉的不是这一份快照 → 按不可用处理" || { bad "I1"; unl "$o" | sed 's/^/      /'; }
+d="$(mk I2)"; save_preimage "$d"
+sed -i "s|^snap_dir\t.*|snap_dir\t/var/lib/pdg/snapshots/other|" "$d/snap/svcstate.tsv"
+python3 - "$d/snap/svcstate.tsv" <<'PY'
+import hashlib, sys
+p=sys.argv[1]; L=[l for l in open(p,encoding="utf-8").read().split("\n") if not l.startswith("end\t")]
+while L and L[-1]=="": L.pop()
+b="\n".join(L)+"\n"; n=sum(1 for l in L if l.startswith("unit\t"))
+open(p,"w",encoding="utf-8").write(b+"end\t%d\t%s\n"%(n,hashlib.sha256(b.encode()).hexdigest()))
+PY
+chmod 600 "$d/snap/svcstate.tsv"
+o="$(run_restore "$d")"
+unl "$o" | grep -q '记的是别的快照' && ok "I2: 记录指向别的快照目录(且已重新封口)→ 同样按不可用处理" || { bad "I2"; unl "$o" | sed 's/^/      /'; }
+
+echo
+echo "══ 十. 记录时就没查到 / enable-disable 表达不了 / 过渡态 ══"
+d="$(mk J)"
 set_u "$d/sc" pdg-probe81 static   active
 set_u "$d/sc" pdg-dotwitness masked inactive
 save_preimage "$d"
-# 手工把两格改成"记录时查询失败"与"过渡态"(桩造不出来这两种, 直接按格式写进记录再封口)
 python3 - "$d/snap/svcstate.tsv" <<'PY'
 import hashlib, sys
-p = sys.argv[1]
-out = []
-for l in open(p, encoding="utf-8").read().split("\n"):
-    if l.startswith("end\t"):
-        continue
-    f = l.split("\t")
-    if f[0] == "unit" and f[1] == "mihomo":
-        f[2] = "QUERY-FAILED"; f[3] = "3"; l = "\t".join(f)
-    if f[0] == "unit" and f[1] == "pdg-health.timer":
-        f[4] = "activating"; l = "\t".join(f)
+p=sys.argv[1]; out=[]
+for l in open(p,encoding="utf-8").read().split("\n"):
+    if l.startswith("end\t"): continue
+    f=l.split("\t")
+    if f[0]=="unit" and f[1]=="mihomo": f[2]="QUERY-FAILED"; f[3]="3"; l="\t".join(f)
+    if f[0]=="unit" and f[1]=="pdg-health.timer": f[4]="activating"; l="\t".join(f)
     out.append(l)
-while out and out[-1] == "":
-    out.pop()
-body = "\n".join(out) + "\n"
-n = sum(1 for l in out if l.startswith("unit\t"))
-open(p, "w", encoding="utf-8").write(body + "end\t%d\t%s\n" % (n, hashlib.sha256(body.encode()).hexdigest()))
+while out and out[-1]=="": out.pop()
+b="\n".join(out)+"\n"; n=sum(1 for l in out if l.startswith("unit\t"))
+open(p,"w",encoding="utf-8").write(b+"end\t%d\t%s\n"%(n,hashlib.sha256(b.encode()).hexdigest()))
 PY
 chmod 600 "$d/snap/svcstate.tsv"
-set_u "$d/sc" pdg-probe81 disabled active      # 现状与 static 前像不符
+set_u "$d/sc" pdg-probe81 disabled active
 o="$(run_restore "$d")"
-unl "$o" | grep -q 'mihomo 自启前像无法确认(记录时查询 rc=3)' && ok "H1: 记录时查询失败 → 登记为无法确认(不是两个空串相等就算过)" || { bad "H1"; unl "$o" | sed 's/^/      /'; }
-unl "$o" | grep -q 'pdg-probe81 自启状态 static 无法用 enable/disable 恢复(现为 disabled)' && ok "H2: static 不先改再说不支持, 只如实登记" || { bad "H2"; unl "$o" | sed 's/^/      /'; }
-unl "$o" | grep -q 'pdg-health.timer 前像是过渡态 activating, 未恢复' && ok "H3: 过渡态不猜, 登记" || { bad "H3"; unl "$o" | sed 's/^/      /'; }
-grep -qE '^(enable|disable) pdg-probe81' "$d/restore.log" && bad "H4: 对 static 的 unit 动了 enable/disable" || ok "H4: 没对 static 的 unit 动 enable/disable"
-grep -qE '^(enable|disable) mihomo' "$d/restore.log" && bad "H5: 对「记录时没查到」的 unit 擅自动手" || ok "H5: 没对无法确认的 unit 擅自动手"
+unl "$o" | grep -q 'mihomo 自启前像无法确认(记录时查询 rc=3)' && ok "J1: 记录时查询失败 → 登记为无法确认" || { bad "J1"; unl "$o" | sed 's/^/      /'; }
+unl "$o" | grep -q 'pdg-probe81 自启状态 static 无法用 enable/disable 恢复(现为 disabled)' && ok "J2: static 不先改再说不支持, 只如实登记" || bad "J2"
+unl "$o" | grep -q 'pdg-health.timer 前像是过渡态 activating, 未恢复' && ok "J3: 过渡态不猜, 登记" || bad "J3"
+grep -qE '^(enable|disable) pdg-probe81' "$d/restore.log" && bad "J4: 对 static 的 unit 动了 enable/disable" || ok "J4: 没对 static 的 unit 动 enable/disable"
+grep -qE '^(enable|disable) mihomo' "$d/restore.log" && bad "J5: 对「记录时没查到」的 unit 擅自动手" || ok "J5: 没对无法确认的 unit 擅自动手"
 
 echo "────────────────────────────────────────"
 echo "通过 $pass, 失败 $nfail"

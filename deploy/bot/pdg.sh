@@ -1331,16 +1331,33 @@ _pdg_svcstate_units(){
                 pdg-health.timer pdg-rules-update.timer
 }
 
+# systemd 对这两个查询会给出的**全部**取值。判"查到了没有"靠的是它, 不是"输出非空"。
+# 特别注意: 非零返回码**不等于**查询失败 —— `is-enabled` 对 disabled 就返回 1,
+# `is-active` 对 inactive/failed 返回 3。那是正常答案, 必须原样记下。
+_pdg_svc_known(){   # $1=子命令 $2=值
+  case "$1" in
+    is-enabled)
+      case "$2" in enabled|enabled-runtime|linked|linked-runtime|alias|masked|masked-runtime|\
+static|indirect|disabled|generated|transient|not-found) return 0;; esac;;
+    is-active)
+      case "$2" in active|reloading|inactive|failed|activating|deactivating|maintenance|not-found) return 0;; esac;;
+  esac
+  return 1
+}
+
 # 读一个属性, 把「值」与「查询成不成功」分开。
 # 空输出只有在 systemd 明确说 LoadState=not-found 时才算"这个 unit 不存在";
-# 其余空输出一律记 QUERY-FAILED —— 那是观测失败, 不是一种状态。
+# 其余空输出、以及任何**不在词表里**的输出, 一律记 QUERY-FAILED —— 那是观测失败, 不是一种状态。
 _pdg_svc_q(){   # $1=子命令 $2=unit → 打印 "值<TAB>rc"
   local out rc ls
   out="$(systemctl "$1" "$2" 2>/dev/null)"; rc=$?
   out="${out%%$'\n'*}"
-  if [[ -z "${out//[[:space:]]/}" ]]; then
+  out="${out//[[:space:]]/}"
+  if [[ -z "$out" ]]; then
     ls="$(systemctl show -p LoadState --value "$2" 2>/dev/null)"
     if [[ "$ls" == not-found ]]; then out=not-found; else out=QUERY-FAILED; fi
+  elif ! _pdg_svc_known "$1" "$out"; then
+    out=QUERY-FAILED          # 认不出来的答案不能当成一种状态往下传
   fi
   printf '%s\t%s\n' "$out" "$rc"
 }
@@ -1399,12 +1416,31 @@ _pdg_svcstate_valid(){   # $1=文件 → 0=可用
   got="$(sha256sum "$body" | awk '{print $1}')"
   rm -f "$body"
   [[ "$got" == "$want" ]] || { _PDG_SVCSTATE_WHY="正文摘要对不上(记录被改过或写坏了)"; return 1; }
-  local k
+  # 头部: 六个字段一个都不能少、不能空、不能重复。
+  # **摘要对得上只说明"没被改过", 不说明"内容是完整的"** —— 少一列、重复一行、字段非法,
+  # 都可以是当初就写坏的, 那种记录照样能通过摘要。所以这里逐条查。
+  local k n_k
   for k in boot_id holder_pid holder_start snap_dir snap_id created_at; do
-    grep -q "^$k"$'\t' "$f" || { _PDG_SVCSTATE_WHY="记录缺头部字段 $k"; return 1; }
+    n_k="$(grep -c "^$k"$'\t' "$f")"
+    [[ "$n_k" -ge 1 ]] || { _PDG_SVCSTATE_WHY="记录缺头部字段 $k"; return 1; }
+    [[ "$n_k" == 1 ]]  || { _PDG_SVCSTATE_WHY="记录的头部字段 $k 出现了 $n_k 次(重复头部)"; return 1; }
     [[ -n "$(awk -F'\t' -v k="$k" '$1==k{print $2; exit}' "$f")" ]] \
       || { _PDG_SVCSTATE_WHY="记录的头部字段 $k 是空的"; return 1; }
   done
+  # 每一条服务行: 恰好 8 列; 两个取值必须在词表里(或 QUERY-FAILED); 两个 rc 必须是整数。
+  local _k _u _ufs _urc _asv _arc _sub _inv _extra
+  while IFS=$'\t' read -r _k _u _ufs _urc _asv _arc _sub _inv _extra; do
+    [[ "$_k" == unit ]] || continue
+    [[ -n "$_u" ]] || { _PDG_SVCSTATE_WHY="有一条服务行没有 unit 名"; return 1; }
+    [[ -z "$_extra" ]] || { _PDG_SVCSTATE_WHY="$_u 那一行多了列(格式不对)"; return 1; }
+    [[ -n "$_inv" || -n "$_sub" ]] || { _PDG_SVCSTATE_WHY="$_u 那一行缺列(格式不对)"; return 1; }
+    [[ "$_ufs" == QUERY-FAILED ]] || _pdg_svc_known is-enabled "$_ufs" \
+      || { _PDG_SVCSTATE_WHY="$_u 的自启取值非法($_ufs)"; return 1; }
+    [[ "$_asv" == QUERY-FAILED ]] || _pdg_svc_known is-active "$_asv" \
+      || { _PDG_SVCSTATE_WHY="$_u 的运行取值非法($_asv)"; return 1; }
+    [[ "$_urc" =~ ^[0-9]+$ ]] || { _PDG_SVCSTATE_WHY="$_u 的自启查询返回码不是整数($_urc)"; return 1; }
+    [[ "$_arc" =~ ^[0-9]+$ ]] || { _PDG_SVCSTATE_WHY="$_u 的运行查询返回码不是整数($_arc)"; return 1; }
+  done < "$f"
   local n_have n_uniq n_need
   n_have="$(grep -c $'^unit\t' "$f")"
   n_uniq="$(grep $'^unit\t' "$f" | cut -f2 | sort -u | wc -l)"
@@ -1424,75 +1460,140 @@ _pdg_svcstate_valid(){   # $1=文件 → 0=可用
 
 # 按前像恢复服务状态。失败或无法确认的逐项计入 unrestored(调用方的数组)。
 # **不做**的事: 不推断、不补造历史状态、不因为"通用 restart"把原本 inactive 的服务拉起来。
-_pdg_restore_svcstate(){   # $1=本次快照目录; 依赖调用方作用域里的 unrestored 数组
-  local sd="$1" f u ufs urc asv arc sub inv now rc
+# 恢复策略**必须在动任何服务之前**定好。
+# 以前的写法是"先一律 systemctl restart mosdns pdg-bot pdg-probe81, 再按前像纠正":
+# 那会把本来停着的服务先拉起来再停回去(中间真的跑过一段), 而且辅助函数自己"没有服务动作"
+# 也证明不了整条回滚链没有先启动过什么。所以这里先解析、先判定, 再一次性收敛。
+#
+# 解析结果放进三张表: 想要的自启值 / 想要的运行值 / 记录时的 InvocationID。
+declare -A _PDG_WANT_EN=() _PDG_WANT_AC=() _PDG_WANT_URC=() _PDG_WANT_ARC=()
+_PDG_SVC_MODE=""      # plan=有可用前像 / blind=没有(旧快照或记录不可用)
+_PDG_SVC_WHY=""
+_PDG_SVC_SRC=""       # 已经解析过的快照目录, 避免重复解析
+
+# 解析并**确认这份记录属于实际选中的那份快照**。
+# 只做结构校验是不够的: 一份结构完好、但属于别的快照的记录, 拿来恢复就是按错误的历史动手。
+_pdg_svcstate_plan(){   # $1=本次要回滚到的快照目录
+  local sd="$1" f k u ufs urc asv arc sid now
+  [[ "$_PDG_SVC_SRC" == "$sd" ]] && return 0
+  _PDG_WANT_EN=(); _PDG_WANT_AC=(); _PDG_WANT_URC=(); _PDG_WANT_ARC=()
+  _PDG_SVC_SRC="$sd"; _PDG_SVC_MODE=blind; _PDG_SVC_WHY=""
   f="$sd/svcstate.tsv"
-  if [[ ! -f "$f" ]]; then
-    # 老快照没有这一份。**不推断成 disabled**, 也不假装恢复过。
-    c_y "  ⚠️ 这份快照没有服务前像(旧格式): 文件已按快照恢复, 但**运行态与自启状态无法确认**。"
-    c_y "     请自行复核 $(_pdg_svcstate_units | tr '\n' ' ')的 is-active / is-enabled。"
-    unrestored+=("服务前像缺失(旧快照; 运行态/自启未确认)")
-    return 1
+  if [[ ! -f "$f" ]]; then _PDG_SVC_WHY="这份快照没有服务前像(旧格式)"; return 1; fi
+  if ! _pdg_svcstate_valid "$f"; then _PDG_SVC_WHY="前像不可用: ${_PDG_SVCSTATE_WHY:-未知}"; return 1; fi
+  k="$(awk -F'\t' '$1=="snap_dir"{print $2; exit}' "$f")"
+  if [[ "$k" != "$sd" ]]; then
+    _PDG_SVC_WHY="这份前像记的是别的快照($k), 不是正在回滚的这一份"; return 1
   fi
-  if ! _pdg_svcstate_valid "$f"; then
-    c_y "  ⚠️ 服务前像不可用: ${_PDG_SVCSTATE_WHY:-未知}。运行态与自启状态**未按前像恢复**。"
-    unrestored+=("服务前像不可用(${_PDG_SVCSTATE_WHY:-未知})")
-    return 1
+  sid="$(awk -F'\t' '$1=="snap_id"{print $2; exit}' "$f")"
+  now="$(stat -c '%d:%i:%s:%Y' "$sd/snap.tar.gz" 2>/dev/null)"
+  if [[ -z "$sid" || -z "$now" || "$sid" != "$now" ]]; then
+    _PDG_SVC_WHY="前像钉的快照身份与这一份对不上(记录=${sid:-空}, 现在=${now:-读不到})"; return 1
   fi
-  while IFS=$'\t' read -r _k u ufs urc asv arc sub inv; do
-    [[ "$_k" == unit && -n "$u" ]] || continue
-    # ── 自启 ──────────────────────────────────────────────────────────────
-    if [[ "$ufs" == QUERY-FAILED ]]; then
-      unrestored+=("$u 自启前像无法确认(记录时查询 rc=$urc)")
-    else
-      case "$ufs" in
-        enabled)
-          systemctl enable "$u" >/dev/null 2>&1; rc=$?
-          now="$(_pdg_svc_q is-enabled "$u" | cut -f1)"
-          [[ "$now" == enabled ]] || unrestored+=("$u 自启未恢复(目标 enabled, 实得 $now, enable rc=$rc)");;
-        enabled-runtime)
-          # **不得**恢复成永久 enabled: runtime 的语义是"这次开机有效", 提升会改变用户的意思。
-          systemctl enable --runtime "$u" >/dev/null 2>&1; rc=$?
-          now="$(_pdg_svc_q is-enabled "$u" | cut -f1)"
-          [[ "$now" == enabled-runtime ]] || unrestored+=("$u 自启未恢复(目标 enabled-runtime, 实得 $now, enable --runtime rc=$rc)");;
-        disabled)
-          systemctl disable "$u" >/dev/null 2>&1; rc=$?
-          now="$(_pdg_svc_q is-enabled "$u" | cut -f1)"
-          [[ "$now" == disabled ]] || unrestored+=("$u 自启未恢复(目标 disabled, 实得 $now, disable rc=$rc)");;
-        static|masked|masked-runtime|indirect|generated|transient|alias|not-found)
-          # 这几种不是 enable/disable 能表达的。**先不动**, 只在现状与前像不符时如实登记 ——
-          # 不先改再说一句"不支持"。
-          now="$(_pdg_svc_q is-enabled "$u" | cut -f1)"
-          [[ "$now" == "$ufs" ]] || unrestored+=("$u 自启状态 $ufs 无法用 enable/disable 恢复(现为 $now)");;
-        *)
-          unrestored+=("$u 自启前像是无法处理的取值($ufs)");;
-      esac
-    fi
-    # ── 运行态 ────────────────────────────────────────────────────────────
-    if [[ "$asv" == QUERY-FAILED ]]; then
-      unrestored+=("$u 运行态前像无法确认(记录时查询 rc=$arc)")
-    else
-      case "$asv" in
-        active)
-          systemctl start "$u" >/dev/null 2>&1; rc=$?
-          now="$(_pdg_svc_q is-active "$u" | cut -f1)"
-          [[ "$now" == active ]] || unrestored+=("$u 未回到运行态(目标 active, 实得 $now, start rc=$rc)");;
-        inactive|failed)
-          # 原本没在跑的, **不能**因为上面那句通用 restart 就留在 active。
-          now="$(_pdg_svc_q is-active "$u" | cut -f1)"
-          if [[ "$now" == active ]]; then
-            systemctl stop "$u" >/dev/null 2>&1; rc=$?
-            now="$(_pdg_svc_q is-active "$u" | cut -f1)"
-            [[ "$now" != active ]] || unrestored+=("$u 前像是 $asv 却仍在跑(stop rc=$rc)")
-          fi;;
-        activating|deactivating|reloading)
-          # 过渡态不猜: 复制不出来, 也不该随便定成 active 或 inactive。
-          unrestored+=("$u 前像是过渡态 $asv, 未恢复(现为 $(_pdg_svc_q is-active "$u" | cut -f1))");;
-        *)
-          unrestored+=("$u 运行态前像是无法处理的取值($asv)");;
-      esac
-    fi
+  while IFS=$'\t' read -r k u ufs urc asv arc _sub _inv; do
+    [[ "$k" == unit && -n "$u" ]] || continue
+    _PDG_WANT_EN["$u"]="$ufs"; _PDG_WANT_URC["$u"]="$urc"
+    _PDG_WANT_AC["$u"]="$asv"; _PDG_WANT_ARC["$u"]="$arc"
   done < "$f"
+  _PDG_SVC_MODE=plan
+  return 0
+}
+
+# 一个 unit 现在的运行值(读不出来就是 QUERY-FAILED, 不是空串)
+_pdg_now_ac(){ _pdg_svc_q is-active  "$1" | cut -f1; }
+_pdg_now_en(){ _pdg_svc_q is-enabled "$1" | cut -f1; }
+
+# 恢复服务的运行态与自启态。**依赖调用方作用域里的 unrestored 数组**。
+# 纪律:
+#   · 先定策略再动手 —— 不先通用重启再纠正, 本来没在跑的**一次都不会被启动**;
+#   · 动作返回码与后置状态是**两个独立**的失败条件, 各记各的;
+#   · 停必须停稳: 过渡态、查询失败都不算停稳; failed 与 inactive 的差别如实登记;
+#   · 想要 active 的那些用 restart(不是 start): 已经在跑的服务 start 是空转, 进程不换,
+#     刚恢复出来的配置根本没被读进去 —— 所以还要求 InvocationID 变过才算数;
+#   · enabled-runtime 不提升成永久 enabled; static/masked/未知一律不先改再说不支持;
+#   · 没有可用前像时保留原来那套通用重启与安全检查, 但如实登记"运行态/自启未确认",
+#     并让调用方拿不到"完全回滚"。
+_pdg_restore_svcstate(){   # $1=本次快照目录
+  local u rc now inv0 inv1 want
+  _pdg_svcstate_plan "$1" || true
+  if [[ "$_PDG_SVC_MODE" != plan ]]; then
+    c_y "  ⚠️ ${_PDG_SVC_WHY:-前像不可用}: 文件已按快照恢复, 但**运行态与自启状态无法确认**。"
+    c_y "     请自行复核 $(_pdg_svcstate_units | tr '\n' ' ')的 is-active / is-enabled。"
+    # 退回原来那套: 明确列出 unit, 绝不用 pdg-* 通配(那会把救援服务一起重启掉)。
+    systemctl restart mosdns pdg-bot pdg-probe81 2>/dev/null || true
+    systemctl is-enabled pdg-mitm >/dev/null 2>&1 && { systemctl reset-failed pdg-mitm 2>/dev/null; systemctl restart pdg-mitm 2>/dev/null; }
+    unrestored+=("服务前像缺失/不可用(${_PDG_SVC_WHY:-未知}; 运行态/自启未确认)")
+    return 1
+  fi
+  # ── ① 自启 ────────────────────────────────────────────────────────────────
+  for u in $(_pdg_svcstate_units); do
+    want="${_PDG_WANT_EN[$u]:-}"
+    [[ -n "$want" ]] || { unrestored+=("$u 前像里没有自启记录"); continue; }
+    case "$want" in
+      QUERY-FAILED)
+        unrestored+=("$u 自启前像无法确认(记录时查询 rc=${_PDG_WANT_URC[$u]:-?})");;
+      enabled|enabled-runtime|disabled)
+        rc=0
+        case "$want" in
+          enabled)         systemctl enable "$u"           >/dev/null 2>&1 || rc=$?;;
+          enabled-runtime) systemctl enable --runtime "$u" >/dev/null 2>&1 || rc=$?;;  # 不提升成永久
+          disabled)        systemctl disable "$u"          >/dev/null 2>&1 || rc=$?;;
+        esac
+        [[ "$rc" == 0 ]] || unrestored+=("$u 自启恢复动作失败(目标 $want, rc=$rc)")
+        now="$(_pdg_now_en "$u")"
+        [[ "$now" == "$want" ]] || unrestored+=("$u 自启后置状态不符(目标 $want, 实得 $now)");;
+      static|masked|masked-runtime|indirect|generated|transient|alias|linked|linked-runtime|not-found)
+        # 这几种不是 enable/disable 能表达的。**先不动**, 只在现状与前像不符时如实登记。
+        now="$(_pdg_now_en "$u")"
+        [[ "$now" == "$want" ]] || unrestored+=("$u 自启状态 $want 无法用 enable/disable 恢复(现为 $now)");;
+      *) unrestored+=("$u 自启前像是无法处理的取值($want)");;
+    esac
+  done
+  # ── ② 运行态 ──────────────────────────────────────────────────────────────
+  for u in $(_pdg_svcstate_units); do
+    want="${_PDG_WANT_AC[$u]:-}"
+    [[ -n "$want" ]] || { unrestored+=("$u 前像里没有运行态记录"); continue; }
+    case "$want" in
+      QUERY-FAILED)
+        unrestored+=("$u 运行态前像无法确认(记录时查询 rc=${_PDG_WANT_ARC[$u]:-?})");;
+      active)
+        inv0="$(systemctl show -p InvocationID --value "$u" 2>/dev/null)"
+        systemctl reset-failed "$u" >/dev/null 2>&1 || true
+        rc=0; systemctl restart "$u" >/dev/null 2>&1 || rc=$?
+        [[ "$rc" == 0 ]] || unrestored+=("$u 启动动作失败(restart rc=$rc)")
+        now="$(_pdg_now_ac "$u")"
+        if [[ "$now" != active ]]; then
+          unrestored+=("$u 后置状态不符(目标 active, 实得 $now)")
+        elif [[ "$u" != *.timer ]]; then
+          # 光是 active 证明不了"恢复出来的配置已经被读进去" —— 本来就在跑的服务 start 是
+          # 空转。InvocationID 变过才说明进程真的被换掉了, 那一刻读的才是刚恢复的文件。
+          inv1="$(systemctl show -p InvocationID --value "$u" 2>/dev/null)"
+          if [[ -z "$inv1" ]]; then
+            unrestored+=("$u 无法确认是否重新加载了恢复出来的配置(读不到 InvocationID)")
+          elif [[ -n "$inv0" && "$inv1" == "$inv0" ]]; then
+            unrestored+=("$u 仍是回滚前那个进程, 恢复出来的配置没有被重新加载")
+          fi
+        fi;;
+      inactive|failed)
+        now="$(_pdg_now_ac "$u")"
+        if [[ "$now" == active || "$now" == activating || "$now" == reloading ]]; then
+          rc=0; systemctl stop "$u" >/dev/null 2>&1 || rc=$?
+          [[ "$rc" == 0 ]] || unrestored+=("$u 停止动作失败(stop rc=$rc)")
+          now="$(_pdg_now_ac "$u")"
+        fi
+        case "$now" in
+          inactive|failed|not-found) : ;;       # 停稳了
+          *) unrestored+=("$u 前像是 $want, 但现在是 $now —— 没有停稳");;
+        esac
+        # failed 与 inactive 是两种状态, 复制不出来就如实说, 不当成"已恢复"。
+        [[ "$want" == failed && "$now" == inactive ]] \
+          && unrestored+=("$u 前像是 failed(启动失败态), 现为 inactive —— 未复现该状态");;
+      activating|deactivating|reloading)
+        # 过渡态不猜: 复制不出来, 也不该随便定成 active 或 inactive。
+        unrestored+=("$u 前像是过渡态 $want, 未恢复(现为 $(_pdg_now_ac "$u"))");;
+      *) unrestored+=("$u 运行态前像是无法处理的取值($want)");;
+    esac
+  done
   return 0
 }
 
@@ -1671,13 +1772,15 @@ cmd_rollback(){
     c_y "  mihomo 起核核验未达标, 请 pdg doctor 复查"
     unrestored+=("内核激活(mihomo)")
   fi
-  # 明确列出要重启的 unit, 绝不用 `pdg-*` 之类的通配 —— 那会把救援服务一起重启掉。
-  systemctl restart mosdns pdg-bot pdg-probe81 2>/dev/null || true
-  systemctl is-enabled pdg-mitm >/dev/null 2>&1 && { systemctl reset-failed pdg-mitm 2>/dev/null; systemctl restart pdg-mitm 2>/dev/null; }   # iOS/WLOC: 清 start-limit + 一并恢复 MITM 服务
-  systemctl restart systemd-journald 2>/dev/null || true   # journald CanReload=no: 还原封顶需 restart 才生效
-  # 上面那几句是"把恢复出来的配置装进运行态"; 它们**不知道**每个服务原本是开着还是关着。
-  # 这一步按前像逐项纠正, 并把做不到的登记进 unrestored —— 文件回来了不等于服务回来了。
+  # ── 服务收敛 ──────────────────────────────────────────────────────────────
+  # **先**判定前像可不可用、把策略定好, 再动服务。以前是"先一律 restart 三个服务再按前像
+  # 纠正" —— 那会把本来停着的服务先拉起来再停回去(中间真的跑过一段), 而且"辅助函数自己
+  # 没有服务动作"也证明不了整条回滚链没有启动过什么。
+  # 前像可用: 只重启前像说"本来在跑"的那些, 且要求 InvocationID 变过 —— 光是 active 证明
+  # 不了恢复出来的配置被读进去了(已经在跑的服务 start 是空转, 进程根本没换)。
+  # 前像缺失/不可用: 退回原来那套通用重启 + pdg-mitm 守卫, 并如实登记"运行态/自启未确认"。
   _pdg_restore_svcstate "$target" || true
+  systemctl restart systemd-journald 2>/dev/null || true   # journald CanReload=no: 还原封顶需 restart 才生效
   # 仓库 Git 复位(update 回滚: 让 REPO_DIR 与还原出的旧脚本版本一致); 记录未能恢复项, 不谎报"完全回滚"
   if [[ -n "$git_ref" ]]; then
     if [[ -d "${REPO_DIR:-}/.git" ]] && git -C "$REPO_DIR" reset --hard -q "$git_ref" 2>/dev/null; then
