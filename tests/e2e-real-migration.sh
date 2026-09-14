@@ -50,11 +50,18 @@ _evn(){ printf '%s\n' "$2" >> "$EVID/$1"; chmod 600 "$EVID/$1" 2>/dev/null || tr
 
 SECT(){ echo; echo "══════════════════════════════════════════════════════════"; echo "  $*"; echo "══════════════════════════════════════════════════════════"; }
 note(){ echo "[NOTE] $1"; }
+# 未执行 ≠ 失败 ≠ 通过。前像不成立时该场景**不执行**, 单独计一格, 绝不混进通过或失败。
+E2E_NOTRUN=0
+nrun(){ echo "[未执行] $1"; E2E_NOTRUN=$((E2E_NOTRUN+1)); }
 
 e2e_enter "$@"
 
+# 两个提交分工明确, 报告里也分开记:
+#   · CAND_SHA(候选 X)= **产品**候选。装到机器上的每一个受管文件都只能来自它。
+#   · 本脚本所在的验收分支(Y)只提供**验收脚本**; 它的工作区**不是**产品来源。
 OLD_SHA="${PDG_OLD_SHA:-242602c17bd92900df81f468aae8c66e18c7a4ff}"   # v1.11.15 peeled
-CAND_SHA="${PDG_CAND_SHA:-95caf26f108a7740fc6fbacb7181f775b6f41971}" # 冻结候选(main 合并提交)
+CAND_SHA="${PDG_CAND_SHA:-ab4882c2f6aba0a44e174e5230ddc4feb29584b7}" # 产品候选 X
+CAND_BASE="${PDG_CAND_BASE:-95caf26f108a7740fc6fbacb7181f775b6f41971}"  # X 与 Y 共同的 base
 OLD_TAG="v1.11.15"
 TEST_TAG="v9.9.9-wloc-real-migration-TEST-ONLY"
 
@@ -182,9 +189,54 @@ fi
 e2e_git "$ORIGIN" tag -f "$TEST_TAG" "$CAND_SHA" >/dev/null 2>&1 || _hard "建测试候选 tag 失败"
 T_PEEL="$(git -C "$ORIGIN" rev-parse "$TEST_TAG^{commit}" 2>/dev/null)"
 [[ "$T_PEEL" == "$CAND_SHA" ]] || _hard "测试 tag 没指向冻结候选($T_PEEL)"
+# **裸库必须真的有 refs/heads/main**: 旧 CLI 的 pdg_fetch_release_tags 跑的是
+# `git fetch --tags origin main` —— 上一轮就栽在这里(裸库是从只有验收分支的工作区 clone 的,
+# 远端没有 main, 于是整条升级链停在取件)。它指向**产品候选 X**, 不是验收分支。
+e2e_git "$ORIGIN" update-ref refs/heads/main "$CAND_SHA" || _hard "裸库建 refs/heads/main 失败"
+[[ "$(git -C "$ORIGIN" rev-parse refs/heads/main)" == "$CAND_SHA" ]] \
+  && ok "裸库 refs/heads/main → 产品候选 X($CAND_SHA)" || _hard "裸库 main 指错了"
+# 顺手把验收分支自己的 ref 从裸库里去掉 —— 产品来源只能是 X, 不留第二条可能被选中的分支。
+for _br in $(git -C "$ORIGIN" for-each-ref --format='%(refname)' refs/heads | grep -v '^refs/heads/main$'); do
+  e2e_git "$ORIGIN" update-ref -d "$_br" >/dev/null 2>&1 || true
+done
+# 裸库的 HEAD 也指过去 —— 否则它还指着被删掉的那条分支, clone 出来没有工作树(只是个
+# warning, 但后面"装的是旧版"这件事就没有干净的起点了)。
+git -C "$ORIGIN" symbolic-ref HEAD refs/heads/main 2>/dev/null || true
+BRLIST="$(git -C "$ORIGIN" for-each-ref --format='%(refname)' refs/heads | tr '\n' ' ')"
+[[ "$BRLIST" == "refs/heads/main " ]] \
+  && ok "裸库里只剩 refs/heads/main 一条分支(产品来源唯一)" || bad "裸库里还有别的分支: $BRLIST"
+
 SEL="$(git -C "$ORIGIN" tag -l 'v*' --sort=-v:refname | head -1)"
 [[ "$SEL" == "$TEST_TAG" ]] || _hard "旧 CLI 会选中的 tag 是 $SEL, 不是本轮的测试 tag —— 源映射无效, 停。"
 ok "旧 CLI 的选择逻辑(tag -l 'v*' --sort=-v:refname | head -1)选中 $TEST_TAG → $CAND_SHA"
+
+# ── 用**旧 CLI 实际使用的那两条查询**证明映射可用, 不是"对象存在就算数" ──────
+# 一次性探针 clone: 不碰后面真正要被升级的 /opt/privdns-gateway。
+PROBE="$E2E_TMP/mapping-probe"
+rm -rf "$PROBE"
+if git clone -q "$ORIGIN" "$PROBE" 2>/dev/null; then
+  e2e_guard_repo "$PROBE" || _hard "探针 clone 没通过 ref 库守卫"
+  # 产品里那一句原样搬过来: git -C "$dir" fetch -q --tags origin main
+  # 与产品 pdg_fetch_release_tags 里那一句逐字相同, 只是外面多一层 ref 库守卫。
+  if e2e_git "$PROBE" fetch -q --tags origin main 2>"$E2E_TMP/probe.err"; then
+    ok "旧 CLI 的取件查询可用(fetch --tags origin main)rc=0"
+  else
+    _hard "旧 CLI 的取件查询失败(这正是上一轮的 H1): $(head -2 "$E2E_TMP/probe.err" | tr '\n' ' ')"
+  fi
+  PFH="$(git -C "$PROBE" rev-parse FETCH_HEAD 2>/dev/null)"
+  [[ "$PFH" == "$CAND_SHA" ]] && ok "FETCH_HEAD == 产品候选 X" || bad "FETCH_HEAD=$PFH"
+  PSEL="$(git -C "$PROBE" tag -l 'v*' --sort=-v:refname | head -1)"
+  PPEEL="$(git -C "$PROBE" rev-parse "$PSEL^{commit}" 2>/dev/null)"
+  { [[ "$PSEL" == "$TEST_TAG" && "$PPEEL" == "$CAND_SHA" ]]; } \
+    && ok "取件之后再查一次: 最新 v* tag = $PSEL → X(与产品的选择逻辑逐字一致)" \
+    || _hard "取件后选出的是 $PSEL → $PPEEL"
+  POLD="$(git -C "$PROBE" rev-parse "$OLD_TAG^{commit}" 2>/dev/null)"
+  [[ "$POLD" == "$OLD_SHA" ]] && ok "真实 v1.11.15 tag 对象与旧提交在裸库里保持正确" \
+                              || bad "v1.11.15 peel 成了 $POLD"
+  rm -rf "$PROBE"
+else
+  _hard "建映射探针 clone 失败"
+fi
 {
   echo "# 测试源映射"
   echo "裸库: $ORIGIN (本机自有, 一次性)"
@@ -216,13 +268,18 @@ git -C "$ORIGIN" archive "$CAND_SHA" | tar -x -C "$CANDSRC" || _hard "展开冻�
 [[ ! -e "$CANDSRC/deploy/bot/mitm_wloc.py" && ! -e "$CANDSRC/deploy/bot/mitm_server.py" ]] \
   && ok "候选源码树里 WLOC 执行模块已不存在(退役后的形态)" || _hard "候选源码树不对: 还有 WLOC 模块"
 
-# **测试分支 HEAD 不是产品候选**: 产品面必须与冻结候选逐字节相同, 差异只许出现在 tests/ 与 .github/
-PRODDIFF="$(git -C "$E2E_ROOT_REAL" diff --name-only "$CAND_SHA" -- deploy lib install.sh uninstall.sh tools 2>/dev/null)"
-[[ -z "$PRODDIFF" ]] \
-  && ok "测试分支的产品面(deploy/ lib/ install.sh uninstall.sh tools/)与冻结候选**零差异**" \
-  || bad "测试分支改了产品面: $PRODDIFF"
-BRDIFF="$(git -C "$E2E_ROOT_REAL" diff --name-only "$CAND_SHA" 2>/dev/null | tr '\n' ' ')"
-_evn 02-source-map.txt "测试分支相对冻结候选的全部改动: ${BRDIFF:-<无>}"
+# **验收分支(Y)不是产品候选**。两条各自对账, 不混:
+#   · Y 相对共同 base 的产品面必须零差异 —— 验收脚本不许夹带产品改动;
+#   · X 相对同一个 base 的产品面差异, 逐文件列出来 —— 那才是本轮要验的产品改动。
+YPROD="$(git -C "$E2E_ROOT_REAL" diff --name-only "$CAND_BASE" -- deploy lib install.sh uninstall.sh tools 2>/dev/null)"
+[[ -z "$YPROD" ]] \
+  && ok "验收分支 Y 相对 base 的产品面**零差异**(它只提供验收脚本)" \
+  || bad "验收分支改了产品面: $YPROD"
+XPROD="$(git -C "$E2E_ROOT_REAL" diff --name-only "$CAND_BASE" "$CAND_SHA" -- deploy lib install.sh uninstall.sh tools 2>/dev/null | tr '\n' ' ')"
+_evn 02-source-map.txt "产品候选 X 相对 base 的产品面改动: ${XPROD:-<无>}"
+ok "产品候选 X 相对 base 的产品面改动: ${XPROD:-<无>}"
+YALL="$(git -C "$E2E_ROOT_REAL" diff --name-only "$CAND_BASE" 2>/dev/null | tr '\n' ' ')"
+_evn 02-source-map.txt "验收分支 Y 相对 base 的全部改动: ${YALL:-<无>}"
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 状态采集器: 每个场景操作前后都跑一次, 结果写进证据目录
@@ -302,9 +359,19 @@ state_diff(){   # $1=before 标签  $2=after 标签  $3=场景名
 # 前像构造: 用**旧版自己的代码与模板**造。明确记账 ——
 #   这是"建立了真实运行前像", **不是**"完整执行过旧安装器"。两者不互相冒充。
 # ═════════════════════════════════════════════════════════════════════════════
+PREIMAGE_OK=1     # 每次 build_preimage 复位; 任一前像判据不成立即置 0
 build_preimage(){   # $1 = ios|android   $2 = wloc on|off|caonly
   local plat="$1" wloc="$2"
+  PREIMAGE_OK=1
   e2e_reset_box
+  # 场景之间必须互不污染: 上一场景的服务、unit、配置、模块都要先真的没了。
+  local leftover=""
+  [[ -e /etc/systemd/system/pdg-mitm.service ]] && leftover="$leftover pdg-mitm.service"
+  [[ -e /opt/pdg-bot/mitm_wloc.py ]] && leftover="$leftover mitm_wloc.py"
+  [[ "$(systemctl is-active pdg-mitm 2>/dev/null || echo not-found)" == active ]] && leftover="$leftover pdg-mitm(running)"
+  [[ -e /etc/privdns-gateway/ca/ca.key ]] && leftover="$leftover ca.key"
+  [[ -z "$leftover" ]] && ok "场景隔离: 进场时上一场景的残留已清空" \
+                       || bad "场景隔离: 进场时仍有残留:$leftover"
   local SAVE="$E2E_ROOT"; E2E_ROOT="$OLDSRC"
   e2e_seed_install    >/dev/null 2>&1 || { bad "e2e_seed_install 失败"; E2E_ROOT="$SAVE"; return 1; }
   e2e_seed_mosdns all >/dev/null 2>&1 || { bad "e2e_seed_mosdns 失败"; E2E_ROOT="$SAVE"; return 1; }
@@ -326,16 +393,26 @@ build_preimage(){   # $1 = ios|android   $2 = wloc on|off|caonly
   # 新 tag 只留在 origin 上, 逼 update 真的去 fetch
   e2e_git "$REPO" tag -d "$TEST_TAG" >/dev/null 2>&1 || true
 
-  # 机器上装的是**旧版**的脚本与模块 —— 这才是存量用户的现场
+  # 机器上装的是**旧版**的脚本与模块 —— 这才是存量用户的现场。
+  # 清单**从旧版自己的 lib/modules.sh 推导**, 不再手写 `deploy/bot/*.py` 循环:
+  # 那个循环漏掉了跨目录的一项 —— deploy/ios/pdg-dot-ondemand.mobileconfig.tmpl
+  # → /opt/pdg-bot/pdg-dot.mobileconfig.tmpl, 而 iosprofile.TEMPLATE 正指着它。
+  # 上一轮 iosstate.generate() 因此必然抛错, schema-1 记录与产物一个都没造出来(H2)。
   install -m755 "$REPO/deploy/bot/pdg.sh" /usr/local/bin/pdg
   e2e_reset_botdir >/dev/null 2>&1
-  local f; for f in "$REPO"/deploy/bot/*.py; do install -m755 "$f" /opt/pdg-bot/; done
-  install -m755 "$REPO/deploy/bot/pdg-bot.py" /opt/pdg-bot/bot.py
+  # shellcheck source=/dev/null
+  source "$REPO/lib/modules.sh" || { bad "读不到旧版 lib/modules.sh"; E2E_ROOT="$SAVE"; return 1; }
+  # CA-only 场景(android + caonly)要先有 iOS 那几件才造得出 CA —— 按 iOS 清单先装齐,
+  # 造完 CA 再按 android 形态收走执行件(H3: 顺序反了就 import 不到 mitm_ca)。
+  local inst_plat="$plat"
+  [[ "$wloc" == caonly ]] && inst_plat=ios
+  pdg_install_runtime_modules "$REPO" /opt/pdg-bot "$inst_plat" \
+    || { bad "按旧版清单装运行模块失败(平台 $inst_plat)"; E2E_ROOT="$SAVE"; return 1; }
   echo dot.e2e.test > /opt/pdg-bot/dot-domain
-  # Android 不该有 iOS 三件 + 模板
-  if [[ "$plat" == android ]]; then
-    rm -f /opt/pdg-bot/iosprofile.py /opt/pdg-bot/iosstate.py /opt/pdg-bot/mitm_ca.py \
-          /opt/pdg-bot/mitm_server.py /opt/pdg-bot/mitm_wloc.py
+  if [[ "$inst_plat" == ios ]]; then
+    [[ -f /opt/pdg-bot/pdg-dot.mobileconfig.tmpl ]] \
+      && ok "前像: iOS 描述文件模板已按旧版清单就位(跨目录那一项没漏)" \
+      || bad "前像: 缺 /opt/pdg-bot/pdg-dot.mobileconfig.tmpl"
   fi
 
   # 真 unit(照旧版 install.sh 的写法), 然后真的起起来
@@ -367,10 +444,33 @@ EOF
   fi
   E2E_ROOT="$SAVE"
 
-  # 真 CA(自造, 用旧版自己的 mitm_ca) —— 场景 A 与 CA-only 都要
+  # 真 CA: 用**旧版自己的 mitm_ca** 现签一份自造根证书。必须在收走执行件**之前**做 ——
+  # 上一轮正是先 rm 了 mitm_ca.py 再去 import 它(H3), CA-only 前像根本没造出来。
   if [[ "$wloc" == on || "$wloc" == caonly ]]; then
-    ( cd /opt/pdg-bot 2>/dev/null && python3 -c 'import mitm_ca; mitm_ca.ensure_ca()' ) >/dev/null 2>&1 \
-      || note "ensure_ca 失败(后续 CA 断言会如实反映)"
+    if ( cd /opt/pdg-bot && python3 -c 'import mitm_ca; mitm_ca.ensure_ca()' ) >"$E2E_TMP/ca.log" 2>&1; then
+      ok "前像: 用旧版 mitm_ca 真实签出自造 CA"
+    else
+      bad "前像: ensure_ca 失败: $(tail -2 "$E2E_TMP/ca.log" | tr '\n' ' ')"; PREIMAGE_OK=0
+    fi
+  fi
+
+  # CA-only: 现在才把执行能力收走, 并先确认没有进程还在用它们。
+  if [[ "$wloc" == caonly ]]; then
+    local st7894 stmitm
+    st7894="$(ss -lnt 2>/dev/null | grep -c ':7894' || true)"
+    stmitm="$(systemctl is-active pdg-mitm 2>/dev/null || echo not-found)"
+    { [[ "$st7894" == 0 && "$stmitm" != active ]]; } \
+      && ok "CA-only: 收走执行件之前确认无人在用(7894 无监听, pdg-mitm=$stmitm)" \
+      || { bad "CA-only: 还有进程在用执行件(7894 计数=$st7894, pdg-mitm=$stmitm), 不删"; PREIMAGE_OK=0; }
+    if [[ "$st7894" == 0 && "$stmitm" != active ]]; then
+      # 逐个具名删除, 不按前缀扫。删的是**本场景刚刚自己装上去的**那几件。
+      local m
+      for m in iosprofile.py iosstate.py mitm_ca.py mitm_server.py mitm_wloc.py pdg-dot.mobileconfig.tmpl; do
+        rm -f "/opt/pdg-bot/$m"
+      done
+      rm -f /etc/systemd/system/pdg-mitm.service
+      systemctl daemon-reload
+    fi
   fi
 
   # iOS 未启用 WLOC 的真机形态: mitm.json 在, 但 enabled=false; 没有 CA, 劫持表空
@@ -407,24 +507,69 @@ os.chmod("/etc/mihomo/config.yaml", 0o600)
 PY
   fi
 
-  # iOS 描述文件记录与产物: 用**旧版自己的 iosstate.generate** 造, 不手写 JSON
+  # iOS 描述文件记录与产物: 用**旧版自己的 iosstate.generate** 造, 不手写 JSON。
+  # 失败不再吞: 前像不成立就把 PREIMAGE_OK 置 0, 该场景后面的判据按"未执行"报, 不冒充有效前像。
   if [[ "$plat" == ios ]]; then
     local wl=False; [[ "$wloc" == on ]] && wl=True
-    ( cd /opt/pdg-bot && PDG_WL="$wl" python3 - <<'PY' ) >/dev/null 2>&1 || note "生成 iOS 记录失败(后续断言会如实反映)"
+    if ( cd /opt/pdg-bot && PDG_WL="$wl" python3 - <<'PY'
 import os, sys
 sys.path.insert(0, "/opt/pdg-bot")
 import iosstate
 ca_der = b""
 wl = os.environ.get("PDG_WL") == "True"
 if wl:
-    try:
-        import mitm_ca
-        ca_der = mitm_ca.ca_der_from_pem(mitm_ca.ca_cert_pem())
-    except Exception:
-        ca_der = b""
+    import mitm_ca
+    ca_der = mitm_ca.ca_der_from_pem(mitm_ca.ca_cert_pem())
 iosstate.generate("dot.e2e.test", ["203.0.113.1"], ssids=["HomeWiFi"],
                   ca_der=ca_der, wloc_enabled=wl)
 PY
+       ) >"$E2E_TMP/gen.log" 2>&1; then
+      ok "前像: iosstate.generate 成功(旧版自己的生成器)"
+    else
+      bad "前像: iosstate.generate 失败 —— 前像不成立: $(tail -3 "$E2E_TMP/gen.log" | tr '\n' ' ')"
+      PREIMAGE_OK=0
+    fi
+    # 逐项自证: 记录 / 产物 / 摘要 / 身份 / CA 内容。任何一项不成立 ⇒ 前像不成立。
+    if ! ( cd /opt/pdg-bot && PDG_WL="$wl" python3 - <<'PY'
+import hashlib, json, os, sys
+sys.path.insert(0, "/opt/pdg-bot")
+wl = os.environ.get("PDG_WL") == "True"
+m = json.load(open("/etc/privdns-gateway/ios-profile.json", encoding="utf-8"))
+cur = m.get("current") or {}
+inp = cur.get("inputs") or m.get("inputs") or {}
+art = "/var/lib/privdns-gateway/ios-profile/current.mobileconfig"
+data = open(art, "rb").read()
+fail = []
+if m.get("schema") != 1:                 fail.append("schema=%r(应为 1)" % m.get("schema"))
+if not m.get("instance_id"):             fail.append("instance_id 为空")
+if not cur.get("revision"):              fail.append("revision 为空")
+if cur.get("sha256") != hashlib.sha256(data).hexdigest():
+    fail.append("记录里的 sha256 与盘上产物对不上")
+if inp.get("wloc_enabled") is not wl:    fail.append("inputs.wloc_enabled=%r(应为 %r)" % (inp.get("wloc_enabled"), wl))
+if inp.get("ssids") != ["HomeWiFi"]:     fail.append("SSID 意图=%r" % (inp.get("ssids"),))
+if wl:
+    import mitm_ca
+    der = mitm_ca.ca_der_from_pem(mitm_ca.ca_cert_pem())
+    if inp.get("wloc_ca_sha256") != hashlib.sha256(der).hexdigest():
+        fail.append("记录里的 CA 指纹与盘上 CA 对不上")
+    if b"com.apple.security.root" not in data:
+        fail.append("产物里没有根证书 payload")
+    import base64, re
+    if base64.b64encode(der)[:32] not in re.sub(rb"\s", b"", data):
+        fail.append("产物里嵌的不是盘上那张 CA")
+else:
+    if b"com.apple.security.root" in data:
+        fail.append("未启用 WLOC 却嵌了根证书 payload")
+if fail:
+    sys.stderr.write("; ".join(fail) + "\n"); sys.exit(1)
+print("schema=%s revision=%s instance_id=%s" % (m.get("schema"), cur.get("revision"), m.get("instance_id")[:12]))
+PY
+         ) >"$E2E_TMP/gencheck.log" 2>&1; then
+      bad "前像: iOS 记录/产物自证不通过 —— 前像不成立: $(tail -2 "$E2E_TMP/gencheck.log" | tr '\n' ' ')"
+      PREIMAGE_OK=0
+    else
+      ok "前像: iOS 记录/产物逐项自证通过($(cat "$E2E_TMP/gencheck.log"))"
+    fi
   fi
 
   systemctl daemon-reload
@@ -482,6 +627,40 @@ PY
   fi
 }
 
+
+# ── 直接迁移的部署源身份(H5)─────────────────────────────────────────────────
+# 上一轮栽在这: 只把候选模块 install 到 /opt/pdg-bot, 却没动 $REPO_DIR。候选 pdg.sh 的
+# __migrate 第一步就是 migrate_deploy_botfiles —— 它按 **$REPO_DIR** 重装 /opt/pdg-bot,
+# 而那个仓库还停在 v1.11.15, 于是刚装上去的候选模块被换回旧版, 随后
+# _retire_ios_schema 调 iosstate.migrate_schema() 得到 AttributeError。
+# 所以每次进入"直接迁移"之前, 都要把 REPO_DIR 真的切到 X, 并逐项核对身份。
+switch_repo_to_candidate(){
+  e2e_git "$REPO" checkout -q "$CAND_SHA" 2>/dev/null \
+    || { bad "把 $REPO 切到候选 X 失败"; return 1; }
+  local head; head="$(git -C "$REPO" rev-parse HEAD 2>/dev/null)"
+  [[ "$head" == "$CAND_SHA" ]] && ok "部署源身份: $REPO 的 HEAD == 候选 X" \
+                              || { bad "部署源 HEAD=$head(应为 X)"; return 1; }
+  # 关键源文件逐字节等于 X 的那一份(拿独立展开的 $CANDSRC 当权威, 不自证)
+  local miss=0 f
+  for f in deploy/bot/pdg.sh deploy/bot/iosstate.py deploy/bot/pdg-bot.py lib/modules.sh; do
+    cmp -s "$REPO/$f" "$CANDSRC/$f" || { miss=$((miss+1)); echo "       不符: $f"; }
+  done
+  [[ "$miss" == 0 ]] && ok "部署源身份: 关键源文件($REPO)逐字节等于候选 X" \
+                     || { bad "部署源里有 $miss 个关键文件不是 X 的"; return 1; }
+  # 按候选自己的清单装 —— 与 __migrate 里的 migrate_deploy_botfiles 同一份真源, 不会再被换回去
+  install -m755 "$REPO/deploy/bot/pdg.sh" /usr/local/bin/pdg
+  ( # shellcheck source=/dev/null
+    source "$REPO/lib/modules.sh" && pdg_install_runtime_modules "$REPO" /opt/pdg-bot "$1" ) \
+    || { bad "按候选清单装模块失败"; return 1; }
+  [[ "$(sha256sum /usr/local/bin/pdg | awk '{print $1}')" == "$(sha256sum "$CANDSRC/deploy/bot/pdg.sh" | awk '{print $1}')" ]] \
+    && ok "部署源身份: /usr/local/bin/pdg 就是候选 X 的那一份" || bad "装上去的 pdg 不是 X 的"
+  # 行为身份, 不只是文件名: 候选的 iosstate 必须真的有 migrate_schema
+  ( cd /opt/pdg-bot && python3 -c 'import iosstate,sys; sys.exit(0 if hasattr(iosstate,"migrate_schema") else 1)' ) 2>/dev/null \
+    && ok "部署源身份: 装上去的 iosstate 具备 migrate_schema(候选形态)" \
+    || { bad "装上去的 iosstate 没有 migrate_schema —— 部署源仍是旧版"; return 1; }
+  return 0
+}
+
 # ═════════════════════════════════════════════════════════════════════════════
 SECT "③ 场景 A —— iOS + WLOC 已启用: 旧版 CLI 完整升级链"
 # ═════════════════════════════════════════════════════════════════════════════
@@ -490,6 +669,7 @@ note "**这是「建立了真实运行前像」, 不是「完整执行过旧安�
 build_preimage ios on
 assert_preimage_A
 snap_state A-before
+if [[ "$PREIMAGE_OK" == 1 ]]; then
 
 IID_A_BEFORE="$(python3 -c 'import json;print((json.load(open("/etc/privdns-gateway/ios-profile.json")) or {}).get("instance_id",""))' 2>/dev/null || echo "")"
 PDG_SHA_BEFORE="$(sha256sum /usr/local/bin/pdg | awk '{print $1}')"
@@ -620,6 +800,10 @@ INV_2="$(systemctl show -p InvocationID --value mosdns 2>/dev/null)$(systemctl s
 [[ "$H1" == "$H2" ]] && ok "第二次运行没有改动任何文件(内容/大小/mtime 全一致)" || bad "第二次运行动了文件"
 [[ "$INV_1" == "$INV_2" ]] && ok "第二次运行没有重启 mosdns / mihomo(InvocationID 未变)" || bad "第二次运行重启了服务"
 
+else
+  nrun "场景 A(旧 CLI 完整升级链): 前像不成立, 本场景未执行 —— 不拿不成立的前像冒充有效验收"
+fi
+
 # ═════════════════════════════════════════════════════════════════════════════
 SECT "④ 场景 B —— iOS + WLOC 未启用"
 # ═════════════════════════════════════════════════════════════════════════════
@@ -639,14 +823,15 @@ PY
   && ok "前像 B: pdg-mitm 真的在跑(未启用 WLOC 只是没加载插件)" || bad "前像 B: pdg-mitm 没起来"
 IID_B_BEFORE="$(python3 -c 'import json;print((json.load(open("/etc/privdns-gateway/ios-profile.json")) or {}).get("instance_id",""))' 2>/dev/null)"
 snap_state B-before
+if [[ "$PREIMAGE_OK" == 1 ]]; then
 INVB1="$(systemctl show -p InvocationID --value mosdns 2>/dev/null)$(systemctl show -p InvocationID --value mihomo 2>/dev/null)"
 # 直接装候选的 pdg 再跑迁移 —— 这是**补充测试**, 不当作完整升级证据
-install -m755 "$CANDSRC/deploy/bot/pdg.sh" /usr/local/bin/pdg
-for f in "$CANDSRC"/deploy/bot/*.py; do install -m755 "$f" /opt/pdg-bot/; done
-install -m755 "$CANDSRC/deploy/bot/pdg-bot.py" /opt/pdg-bot/bot.py
-rm -f /opt/pdg-bot/mitm_server.py /opt/pdg-bot/mitm_wloc.py
-note "场景 B/C 用的是**直接迁移**(装候选 pdg 后跑 __migrate), 明确不等于完整升级链。"
-MB="$(bash /usr/local/bin/pdg __migrate 2>&1)"; MBRC=$?
+note "场景 B/C 用的是**直接迁移**(把部署源切到候选后跑 __migrate), 明确不等于完整升级链。"
+if switch_repo_to_candidate ios; then
+  MB="$(bash /usr/local/bin/pdg __migrate 2>&1)"; MBRC=$?
+else
+  MB="(部署源身份不成立, 本场景未执行迁移)"; MBRC=127
+fi
 printf '%s\n' "$MB" | _ev 04-B-migrate.txt
 snap_state B-after; state_diff B-before B-after B
 [[ "$MBRC" == 0 ]] && ok "B: 迁移 rc=0" || bad "B: 迁移 rc=$MBRC"
@@ -670,6 +855,10 @@ MB2="$(bash /usr/local/bin/pdg __migrate 2>&1)"; MB2RC=$?
 printf '%s\n' "$MB2" | _ev 04-B-migrate.txt
 [[ "$MB2RC" == 0 ]] && ok "B: 二次执行幂等(rc=0)" || bad "B: 二次执行非 0(rc=$MB2RC)"
 
+else
+  nrun "场景 B(iOS 未启用 WLOC 的直接迁移): 前像不成立, 本场景未执行"
+fi
+
 # ═════════════════════════════════════════════════════════════════════════════
 SECT "⑤ 场景 C —— Android / 仅 CA 残留"
 # ═════════════════════════════════════════════════════════════════════════════
@@ -678,10 +867,13 @@ build_preimage android caonly
 [[ -s /etc/privdns-gateway/ca/ca.crt ]] && ok "前像 C: 盘上确有 CA 残留(切过平台的机器形态)" || bad "前像 C: 没造出 CA 残留"
 [[ ! -e /etc/systemd/system/pdg-mitm.service ]] && ok "前像 C: 没有 pdg-mitm unit" || bad "前像 C: 不该有 unit"
 snap_state C-before
+if [[ "$PREIMAGE_OK" == 1 ]]; then
 INVC1="$(systemctl show -p InvocationID --value mosdns 2>/dev/null)$(systemctl show -p InvocationID --value mihomo 2>/dev/null)"
-install -m755 "$CANDSRC/deploy/bot/pdg.sh" /usr/local/bin/pdg
-for f in "$CANDSRC"/deploy/bot/*.py; do install -m755 "$f" /opt/pdg-bot/ 2>/dev/null || true; done
-MC="$(bash /usr/local/bin/pdg __migrate 2>&1)"; MCRC=$?
+if switch_repo_to_candidate android; then
+  MC="$(bash /usr/local/bin/pdg __migrate 2>&1)"; MCRC=$?
+else
+  MC="(部署源身份不成立, 本场景未执行迁移)"; MCRC=127
+fi
 printf '%s\n' "$MC" | _ev 05-C-migrate.txt
 snap_state C-after; state_diff C-before C-after C
 [[ "$MCRC" == 0 ]] && ok "C: 迁移 rc=0" || bad "C: 迁移 rc=$MCRC"
@@ -695,6 +887,10 @@ INVC2="$(systemctl show -p InvocationID --value mosdns 2>/dev/null)$(systemctl s
 [[ "$INVC1" == "$INVC2" ]] && ok "C: 不相关服务没被重启" || bad "C: 重启了不相关服务"
 bash /usr/local/bin/pdg __migrate >/dev/null 2>&1 && ok "C: 二次执行幂等(rc=0)" || bad "C: 二次执行非 0"
 
+else
+  nrun "场景 C(Android / 仅 CA 残留): 前像不成立, 本场景未执行"
+fi
+
 # ═════════════════════════════════════════════════════════════════════════════
 SECT "⑥ 晚期失败恢复 —— 新配置已进运行态之后才失败"
 # ═════════════════════════════════════════════════════════════════════════════
@@ -706,10 +902,17 @@ SECT "⑥ 晚期失败恢复 —— 新配置已进运行态之后才失败"
 build_preimage ios on
 assert_preimage_A >/dev/null 2>&1
 snap_state D-before
+if [[ "$PREIMAGE_OK" == 1 ]]; then
+# 前像的运行实例身份: 恢复之后这几个要能证明"服务真的下去过又回来了"。
+D_INV_MITM="$(systemctl show -p InvocationID --value pdg-mitm 2>/dev/null)"
+D_NR_MITM="$(systemctl show -p NRestarts --value pdg-mitm 2>/dev/null)"
+D_T0="$(date -u +%Y-%m-%d\ %H:%M:%S)"
 INJ=/opt/pdg-bot/zz_e2e_late_failure_inject.py
 printf 'def broken(:\n' > "$INJ"
 note "故障注入点: $INJ(语法错误的额外模块) —— 只影响 update 的 py_compile 校验门, 不改产品实现"
 _evn 06-late-failure.txt "注入点: $INJ, 内容: 'def broken(:'  —— 触发 cmd_update 的 py_compile 校验门"
+_evn 06-late-failure.txt "注入副本与候选 X 的差异: 仅多出这一个文件; 产品文件一个字节未改"
+_evn 06-late-failure.txt "前像运行实例: pdg-mitm InvocationID=$D_INV_MITM NRestarts=$D_NR_MITM"
 UPD="$(bash /usr/local/bin/pdg update 2>&1)"; UDRC=$?
 printf '%s\n' "$UPD" | _ev 06-late-failure.txt
 _evn 06-late-failure.txt "### rc=$UDRC"
@@ -717,11 +920,41 @@ echo "$UPD" | tail -25 | sed 's/^/    /'
 rm -f "$INJ"
 snap_state D-after; state_diff D-before D-after D
 
-grep -qE 'Python 语法错误' <<<"$UPD" && ok "注入确实命中了 py_compile 校验门(而不是别的地方)" || bad "没命中预期的注入点: $(tail -3 <<<"$UPD")"
-grep -qE '回滚到更新前快照' <<<"$UPD" && ok "产品走了自己的回滚路径" || bad "没有触发回滚"
-[[ "$UDRC" != 0 ]] && ok "update 返回非 0(rc=$UDRC), 没有谎报成功" || bad "失败却返回 0"
+# ── 先判"到没到晚期"。没到就如实说未验证, 不拿别的失败冒充 ────────────────────
+_line_of(){ grep -n -- "$1" <<<"$UPD" | head -1 | cut -d: -f1; }
+L_INSTALL="$(_line_of '刷新代码')"
+L_MIG="$(grep -nE 'WLOC 退役|已停用|迁移' <<<"$UPD" | head -1 | cut -d: -f1)"
+L_INJ="$(_line_of 'Python 语法错误')"
+L_RB="$(_line_of '回滚到更新前快照')"
+_evn 06-late-failure.txt "阶段行号: 装文件=$L_INSTALL 迁移=$L_MIG 注入命中=$L_INJ 回滚=$L_RB"
+LATE_REACHED=0
+if [[ -n "$L_INSTALL" && -n "$L_INJ" && "$L_INSTALL" -lt "$L_INJ" ]]; then LATE_REACHED=1; fi
 
-echo "── 恢复是否真的回到前像(四个维度都要对) ──"
+if [[ "$LATE_REACHED" == 0 ]]; then
+  bad "**晚期失败恢复: 未验证** —— update 在装文件/迁移之前就结束了(取件或更早失败), 这不算晚期失败"
+  note "不把取件失败、前像构造失败或安装前的检查失败称为晚期失败; 本项按未执行报。"
+else
+  ok "① 到达晚期: 受管文件已安装(第 $L_INSTALL 行)且注入在其之后命中(第 $L_INJ 行)"
+  [[ -n "$L_MIG" && "$L_MIG" -lt "$L_INJ" ]] \
+    && ok "① 新配置已进运行态: 迁移输出(第 $L_MIG 行)排在注入命中之前" \
+    || bad "① 迁移输出没出现在注入之前(迁移=$L_MIG 注入=$L_INJ)"
+  # 运行态真的被改过: pdg-mitm 的运行实例身份必须变过(停过又起来)
+  R_INV="$(systemctl show -p InvocationID --value pdg-mitm 2>/dev/null)"
+  [[ -n "$D_INV_MITM" && -n "$R_INV" && "$D_INV_MITM" != "$R_INV" ]] \
+    && ok "① 运行态确实被动过: pdg-mitm 的 InvocationID 变了($D_INV_MITM → $R_INV) —— 它真的下去过又回来了" \
+    || bad "① pdg-mitm 的 InvocationID 没变($D_INV_MITM → $R_INV): 拿不出「下去过」的证据"
+  journalctl -u pdg-mitm --since "$D_T0" --no-pager 2>/dev/null | grep -qiE 'Stopped|Deactivated' \
+    && ok "① journal 里有 pdg-mitm 被停的记录(真 systemd 的现场证据)" \
+    || note "① journal 里没抓到 pdg-mitm 的停止记录(记下来, 不据此下结论)"
+  grep -qE 'Python 语法错误' <<<"$UPD" && ok "② 注入确实发生: 命中 py_compile 校验门(不是别的地方)" \
+                                       || bad "② 没命中预期的注入点: $(tail -3 <<<"$UPD")"
+  grep -qE '回滚到更新前快照' <<<"$UPD" && ok "③ 随后走了恢复: 产品自己的回滚路径" || bad "③ 没有触发回滚"
+  [[ -n "$L_RB" && -n "$L_INJ" && "$L_RB" -gt "$L_INJ" ]] \
+    && ok "③ 顺序正确: 回滚发生在注入命中之后" || bad "③ 回滚与注入的先后对不上"
+  [[ "$UDRC" != 0 ]] && ok "update 返回非 0(rc=$UDRC), 没有谎报成功" || bad "失败却返回 0"
+fi
+
+echo "── ④ 恢复是否真的回到前像(四个维度都要对) ──"
 RAC="$(systemctl is-active pdg-mitm 2>/dev/null || echo not-found)"
 REN="$(systemctl is-enabled pdg-mitm 2>/dev/null || echo not-found)"
 [[ "$RAC" == active ]] && ok "恢复: pdg-mitm **真的又在跑**(is-active=active, MainPID=$(systemctl show -p MainPID --value pdg-mitm))" \
@@ -759,6 +992,10 @@ if grep -qE '恢复材料|已保留' <<<"$UPD"; then
 fi
 ls -la /var/lib/privdns-gateway/backups 2>/dev/null | _ev 06-late-failure.txt
 
+else
+  nrun "晚期失败恢复: 前像不成立, 本项未执行"
+fi
+
 # ═════════════════════════════════════════════════════════════════════════════
 SECT "⑦ 收尾"
 # ═════════════════════════════════════════════════════════════════════════════
@@ -777,4 +1014,6 @@ SECT "⑦ 收尾"
 chmod 600 "$EVID"/* 2>/dev/null || true
 
 echo
+echo "未执行(前像不成立而跳过)的场景数: $E2E_NOTRUN"
+_evn 99-cleanup.txt "未执行场景数: $E2E_NOTRUN"
 e2e_summary

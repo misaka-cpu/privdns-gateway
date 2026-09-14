@@ -14,6 +14,14 @@ on:
         type: choice
         options: ["false", "true"]
         default: "false"
+      product_candidate:
+        description: "产品候选 X 的完整 SHA(装到被测机上的每一个受管文件只来自它)"
+        type: string
+        default: ""
+      product_base:
+        description: "X 与本验收分支的共同 base(用于产品面对账)"
+        type: string
+        default: "95caf26f108a7740fc6fbacb7181f775b6f41971"
 
 permissions:
   contents: read
@@ -1696,8 +1704,28 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          # 旧版对象(v1.11.15)与冻结候选都要从本地取, 浅克隆拿不到。
+          # 旧版对象(v1.11.15)与产品候选都要从本地取, 浅克隆拿不到。
           fetch-depth: 0
+      # 产品候选 X 在**另一条分支**上。把它取成一个本地分支, 后面建裸库时才带得过去。
+      # 这一步也是"产品来源 = X"这条约束的落点: 检出的是 Y, 装机的却只能是 X。
+      - name: "取产品候选 X, 并报告 X 与 Y 两个身份"
+        env:
+          PDG_CAND_SHA: ${{ github.event.inputs.product_candidate }}
+        run: |
+          set -euo pipefail
+          test -n "$PDG_CAND_SHA" || { echo "必须显式指定产品候选 X"; exit 1; }
+          git fetch --no-tags origin \
+            "+refs/heads/fix/wloc-retire-error-reporting:refs/heads/pdg-candidate-x"
+          git fetch --tags origin
+          got=$(git rev-parse refs/heads/pdg-candidate-x)
+          echo "产品候选 X (fix/wloc-retire-error-reporting) = $got"
+          echo "验收提交 Y (本次 checkout)                  = ${{ github.sha }}"
+          test "$got" = "$PDG_CAND_SHA" || { echo "X 分支 head 与派发时指定的 SHA 不符"; exit 1; }
+          echo "X 相对 base 的产品面改动:"
+          git diff --name-only "${{ github.event.inputs.product_base }}" "$got" \
+            -- deploy lib install.sh uninstall.sh tools | sed 's/^/  /'
+          echo "Y 相对 base 的全部改动:"
+          git diff --name-only "${{ github.event.inputs.product_base }}" "${{ github.sha }}" | sed 's/^/  /'
       - name: "PID 1 必须是真 systemd(不是就判失败, 不 SKIP)"
         run: |
           set -euo pipefail
@@ -1726,6 +1754,9 @@ jobs:
           PDG_E2E_ISOLATED: "1"
           PDG_REAL_MIGRATION_OK: "1"
           PDG_REAL_MIG_EVID: "/tmp/real-migration-evidence"
+          # 产品来源只此一个。脚本会把裸库的 refs/heads/main 指向它, 并把裸库里其它分支删掉。
+          PDG_CAND_SHA: ${{ github.event.inputs.product_candidate }}
+          PDG_CAND_BASE: ${{ github.event.inputs.product_base }}
         run: sudo -E bash tests/e2e-real-migration.sh
       - name: "留证: 把证据文件与 journal 打进 job 日志(成败都留)"
         if: ${{ always() }}
