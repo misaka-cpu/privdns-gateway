@@ -1028,6 +1028,15 @@ jobs:
       - name: "平台隔离回归 (Android 无 iOS 按钮/回调/后端; iOS 原功能; checks 平台一致)"
         run: python3 tests/test-platform-isolation.py
 
+      # 快照只收文件, enable 的符号链接在 multi-user.target.wants/ 下从不入快照 —— 于是
+      # "文件都回来了、服务却停着且不自启"会被回滚自报成"已回滚并重启服务"。这两支盯这一格,
+      # 外加钉住本版的边界: 只补前像, 不退役 WLOC、不推进记录格式、不删旧能力。
+      - name: "服务前像恢复 (三态各自恢复/enabled-runtime 不提升/动作成功但状态不符也算未恢复; 两条撤销对照)"
+        run: bash tests/test-svcstate-restore.sh
+
+      - name: "桥接版边界 (只改 cmd_update/cmd_rollback; 不含任何退役动作; 旧能力出现次数不变)"
+        run: bash tests/test-svcstate-bridge-scope.sh
+
   core-startlimit:
     needs: prepare-mosdns-fixture
     runs-on: ubuntu-latest
