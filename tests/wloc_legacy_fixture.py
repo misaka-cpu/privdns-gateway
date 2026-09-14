@@ -41,7 +41,17 @@ def _mods(modules):
 def ca_der(modules, workdir=None):
     """一张真的自签 CA(DER)。不能用随便一串字节 —— 产物校验会拿它过 X.509 解析。"""
     iosprofile, _ = _mods(modules)
-    d = workdir or tempfile.mkdtemp(prefix="pdg-legacy-ca.")
+    # 顶层沙箱走 tmpguard(仓库的临时物卫生门要求): 它登记之后, 测试退出时会自己清掉。
+    # 拿不到 tmpguard(比如被单独当脚本跑在别处)时退回 tempfile, 但**显式给 dir**, 免得
+    # 落到别人管不着的地方。
+    if workdir:
+        d = workdir
+    else:
+        try:
+            import tmpguard
+            d = tmpguard.mkdtemp(prefix="pdg-legacy-ca.")
+        except Exception:  # noqa: BLE001
+            d = tempfile.mkdtemp(prefix="pdg-legacy-ca.", dir=tempfile.gettempdir())
     os.makedirs(d, exist_ok=True)
     subprocess.run(["openssl", "req", "-x509", "-newkey", "ec",
                     "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes",

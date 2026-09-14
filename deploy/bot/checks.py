@@ -318,7 +318,8 @@ def check_health_timer():
     if sub == "elapsed" or not has_next:
         return ("fail", NAME,
                 "健康检查定时器没有安排下一次运行。它看上去是启用且在运行的, 但不会再触发 —— "
-                "服务异常时你不会收到通知。跑 <code>sudo pdg __migrate</code> 让它重新排程。")
+                "服务异常时你不会收到通知。跑 <code>sudo pdg migrate</code> 让它重新排程"
+                "(它会先建快照并保存服务前像; <code>pdg __migrate</code> 是内部入口, 不要手打)。")
 
     # 具体的绝对时间只进诊断日志: 机器是 UTC 而人按本地时区读, 摆出来容易看错四五个小时。
     sys.stderr.write("health-timer: sub=%s next_mono=%s next_real=%s\n"
@@ -1090,7 +1091,8 @@ def check_gms():
             residue.append("nft 端口集")
         if residue:
             return ("warn", "GMS 残留", "iOS 不应有 GMS 5228-5230, 检出于 " + "、".join(residue)
-                    + "; 运行 sudo pdg __migrate 清理(自定义防火墙形态需手动移除)。")
+                    + "; 运行 sudo pdg migrate 清理(它会先建快照并保存服务前像; "
+                      "自定义防火墙形态需手动移除)。")
         return None
     # mihomo(唯一内核): 5228-5230 由 nft prerouting REDIRECT 到 redir 端口 + sniffer 处理,
     # 不在 input accept。判据同样取自共享判定的 kind="gms" 那一档 —— 它在 nftlive 里被归为
@@ -2183,8 +2185,9 @@ def check_rule_precedence():
                        "—— 新版把系统自动规则排在用户指定的域名规则之后")
         if any(b == "MITM 接管(已退役)" for *_x, b in scan["auto"]):
             how.append("MITM 接管这批是 WLOC 退役前留在内核配置里的残留(它排在最前, 会压过用户指定的"
-                       "域名规则)。WLOC 已退役, 没有开关可关 —— 运行 <code>sudo pdg __migrate</code> "
-                       "把它清掉并重渲内核配置")
+                       "域名规则)。WLOC 已退役, 没有开关可关 —— 运行 <code>sudo pdg migrate</code> "
+                       "把它清掉并重渲内核配置(这条入口会先建快照并保存服务前像; "
+                       "<code>pdg __migrate</code> 是内部入口, 不带前像句柄, 会被能力门拒绝)")
         return ("warn", "分流优先级",
                 "有 %d 条用户指定的域名规则被系统自动规则抢先匹配, 当前无法生效 —— 自动生成的规则排在它前面: %s%s。"
                 "内核自上而下第一条命中即止, 所以配置里两条都在也没用。→ %s。"

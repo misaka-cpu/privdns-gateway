@@ -75,6 +75,11 @@ run_case(){
     _fn "$src" c_g
     _fn "$src" c_y
     _fn "$src" c_r
+    # 失败分支现在会调它给"该重跑什么"的指引 —— 同样从产品里抽真身, 不补替代实现。
+    _fn "$src" _retire_rerun_hint
+    # 这一条**本来就漏了**(冻结候选上 ④ 就因为它报 command not found): 少了它,
+    # `if _retire_has_irreversible_work …` 恒为假, 能力门那一段在本支里从来没被走到过。
+    _fn "$src" _retire_has_irreversible_work
     grep -m1 -E '^REPO_DIR=' "$src"      # _retire_ca_reader_dir 用得到, 从产品里取免得漂移
     echo '_RETIRE_UNDO=(); _RETIRE_TMP=""'
     echo '_retire_core_has_mitm(){ return 1; }'

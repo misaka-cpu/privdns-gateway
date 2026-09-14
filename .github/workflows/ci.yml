@@ -1040,8 +1040,19 @@ jobs:
       - name: "服务前像恢复 (三态各自恢复/enabled-runtime 不提升/动作成功但状态不符也算未恢复; 两条撤销对照)"
         run: bash tests/test-svcstate-restore.sh
 
+      # 持久自启(/etc 的 wants)与运行时自启(/run 的 wants)是两套独立链接: 只调目标那一条
+      # systemctl 命令, "前像 enabled-runtime 而现状被永久 enable"与"前像 disabled 而现状是
+      # enabled-runtime"这两种都回不去。桩分别维护两套链接, 不做目标字符串赋值。
+      - name: "自启恢复的持久/运行时两层 (撤掉妨碍恢复的那一层再置目标层; 不顺带启停服务)"
+        run: bash tests/test-svcstate-enable-runtime-restore.sh
+
       - name: "退役迁移调用方门 (旧记录·错快照·缺记录·不完整·查询异常·无锁分别拒绝; 拒绝前零服务动作; 撤掉门即进入停服务路径)"
         run: bash tests/test-migrate-caller-gate.sh
+
+      # 门拒绝之后用户该敲什么, 按**行为**验: 真跑指引函数与门的拒绝分支看实际输出,
+      # 并真跑 cmd_migrate 确认"指引点名的那个入口"确实建快照、存前像、交句柄。
+      - name: "退役迁移的重跑指引 (按实际入口分岔/不指望回滚后的机器有新版能力/入口名副其实)"
+        run: bash tests/test-retire-rerun-guidance.sh
 
       - name: "迁移入口契约 (总入口逐字节未变/cmd_platform 契约变更处/三处拦截点各在动手之前)"
         run: bash tests/test-migrate-entry-contract.sh

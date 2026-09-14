@@ -225,10 +225,30 @@ if _ra:
     "调用点没有 `|| true` 吞掉非零(实得 %r)" % (_call.group(0).strip() if _call else None))
 (ok if _call and ("rc=1" in _call.group(0) or "return" in _call.group(0)) else bad)(
     "失败被记进返回状态(实得 %r)" % (_call.group(0).strip() if _call else None))
-upd = re.search(r"if ! bash /usr/local/bin/pdg __migrate; then.*?fi", PDGSH, re.S)
-(ok if upd and "cmd_rollback" in upd.group(0) else bad)(
-    "cmd_update 里 __migrate 失败会走回滚")
-(ok if upd and "return 1" in upd.group(0) else bad)("并且不谎报更新完成")
+# cmd_update 现在是**带服务前像句柄**地调内部迁移入口:
+#     if ! PDG_UPDATE_SVCSTATE="$snap_dir/svcstate.tsv" bash /usr/local/bin/pdg __migrate; then
+# 原来的锚点写死了 `if ! bash /usr/local/bin/pdg __migrate`, 多一个环境变量前缀就对不上了。
+# 放宽的方向**不是**"文件里哪儿有这几个词", 而是: 在 cmd_update 的**函数体内**, 找到那一行
+# 真正的 `if ! [前缀…] bash /usr/local/bin/pdg __migrate; then`(行首缩进 + `; then` 收尾,
+# 注释和字符串都满足不了), 再按缩进配对到它自己的 `fi`, 只在这个块里判失败分支。
+_upd = extract("cmd_update")
+(ok if _upd else bad)("抽到了 cmd_update(前提成立)")
+_MIGCALL = re.compile(
+    r'^(?P<ind>[ \t]*)if ! (?P<pre>(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"\n]*"|\'[^\'\n]*\'|\S+)[ \t]+)*)'
+    r'bash /usr/local/bin/pdg __migrate; then\n'
+    r'(?P<body>.*?)'
+    r'^(?P=ind)fi$', re.S | re.M)
+_upd_mig = _MIGCALL.search(_upd) if _upd else None
+(ok if _upd_mig else bad)(
+    "cmd_update 里有一处真正的内部迁移调用(按 `if ! …; then` 到同缩进 `fi` 成块)")
+(ok if _upd_mig and "PDG_UPDATE_SVCSTATE=" in _upd_mig.group("pre") else bad)(
+    "这一处调用**带着本次服务前像的句柄**(实得前缀 %r)"
+    % (_upd_mig.group("pre").strip() if _upd_mig else None))
+_upd_fail = _upd_mig.group("body") if _upd_mig else ""
+(ok if "cmd_rollback" in _upd_fail else bad)(
+    "cmd_update 里 __migrate 失败会走回滚(失败分支实得 %r)" % (_upd_fail.strip()[:90] or None))
+(ok if re.search(r"^\s*(?:.*;\s*)?return 1\s*$", _upd_fail, re.M) else bad)(
+    "并且不谎报更新完成(失败分支以 return 1 收尾)")
 
 # ═══ 10b. run_all_migrations 真的把非零传出来(行为级, 不是读源码)═════════
 print()
@@ -261,11 +281,89 @@ _disp = re.search(r"^\s*__migrate\)\s+need_root[^\n]*", PDGSH, re.M)
 (ok if _disp and "|| true" not in _disp.group(0) and "|| :" not in _disp.group(0)
  else bad)("分派行没有吞掉非零")
 _cp = extract("cmd_platform")
-_cpm = re.search(r"if ! migrate_probe81_public; then.*?fi", _cp, re.S)
+_cpm = re.search(r"if ! migrate_probe81_public; then.*?^  fi$", _cp, re.S | re.M)
 (ok if _cpm else bad)("平台切换里单独跑了 probe81 迁移并判失败")
-(ok if _cpm and "_plat_rollback" in _cpm.group(0) else bad)(
-    "失败时走 _plat_rollback(不留半切换状态)")
+# 原来的锚点要的是字面量 `_plat_rollback`。现在失败分支统一走 `_plat_fail_restore` ——
+# 它是**包含** _plat_rollback 的调度器, 不是绕开它。所以判据改成两段:
+#   ① 结构: 失败分支确实调 _plat_fail_restore 并返回非零;
+#   ② 行为: 真跑 _plat_fail_restore, 看它在两种情形下**各自进了哪条恢复分支**。
+(ok if _cpm and "_plat_fail_restore" in _cpm.group(0) else bad)(
+    "失败时交给失败善后入口 _plat_fail_restore(实得 %r)"
+    % (_cpm.group(0).strip().splitlines()[-2].strip() if _cpm else None))
 (ok if _cpm and "return 1" in _cpm.group(0) else bad)("并且返回非零")
+
+
+def extract_nested(fn):
+    """抽 cmd_platform 里**缩进定义**的内嵌函数(extract() 只认顶格的)。"""
+    m = re.search(r"^(?P<ind>[ \t]+)%s\(\)\s*\{.*?^(?P=ind)\}" % re.escape(fn),
+                  _cp, re.S | re.M)
+    return m.group(0) if m else ""
+
+
+_pfr = extract_nested("_plat_fail_restore")
+(ok if _pfr else bad)("抽到了 _plat_fail_restore(行为判据的前提)")
+
+
+def run_pfr(retire_done, snap_rc=0, newfiles=()):
+    """真跑 _plat_fail_restore, 只把它**依赖的外部动作**桩住并留痕。"""
+    box = tempfile.mkdtemp(prefix="pdg-pfr.", dir=tempfile.gettempdir())
+    wd = os.path.join(box, "wd"); os.makedirs(wd)
+    made = []
+    for nf in newfiles:
+        f = os.path.join(box, nf); open(f, "w").write("x"); made.append(f)
+    if made:
+        open(os.path.join(wd, "newfiles"), "w").write("\n".join(made) + "\n")
+    script = (
+        "set -u\n"
+        'c_y(){ :; }; c_r(){ printf "%s\\n" "$*"; }; c_g(){ :; }\n'
+        'SEQ="' + box + '/seq"\n'
+        '_plat_rollback(){ echo _plat_rollback >> "$SEQ"; return 0; }\n'
+        'cmd_rollback(){ echo "cmd_rollback $*" >> "$SEQ"; return ' + str(snap_rc) + '; }\n'
+        'wd="' + wd + '"; _psnap="' + box + '/snap"\n'
+        '_PDG_RETIRE_DONE=' + str(retire_done) + '\n'
+        + textwrap_dedent(_pfr) +
+        '\n_plat_fail_restore; echo "RC=$?"\n')
+    r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60)
+    seq = ""
+    if os.path.exists(os.path.join(box, "seq")):
+        seq = open(os.path.join(box, "seq")).read()
+    out = {"seq": seq, "stdout": r.stdout, "stderr": r.stderr,
+           "wd_gone": not os.path.isdir(wd),
+           "left": [f for f in made if os.path.exists(f)]}
+    shutil.rmtree(box, ignore_errors=True)
+    return out
+
+
+def textwrap_dedent(block):
+    lines = block.split("\n")
+    ind = len(lines[0]) - len(lines[0].lstrip())
+    return "\n".join(l[ind:] if l[:ind].strip() == "" else l for l in lines)
+
+
+if _pfr:
+    r0 = run_pfr(0)
+    (ok if "_plat_rollback" in r0["seq"] else bad)(
+        "行为: 本次**没有**撤除过退役件 ⇒ 走局部还原 _plat_rollback(实得调用序列 %r)"
+        % r0["seq"].replace("\n", " "))
+    (ok if "cmd_rollback" not in r0["seq"] else bad)(
+        "行为: 这一支不该动整体快照(实得 %r)" % r0["seq"].replace("\n", " "))
+    (ok if "RC=0" in r0["stdout"] else bad)(
+        "行为: 局部还原成功 ⇒ 返回 0(实得 %r)" % r0["stdout"].strip()[-40:])
+    (ok if r0["wd_gone"] else bad)("行为: 完整恢复才清理本轮材料")
+
+    r1 = run_pfr(1, snap_rc=0, newfiles=("newly-installed.py",))
+    (ok if "cmd_rollback" in r1["seq"] else bad)(
+        "行为: 本次**撤除过**退役件 ⇒ 改用本次快照整体恢复(实得 %r)"
+        % r1["seq"].replace("\n", " "))
+    (ok if not r1["left"] else bad)(
+        "行为: 先撤掉本次新装的平台专属件(tar 覆盖删不掉多出来的东西)")
+    (ok if "RC=0" in r1["stdout"] else bad)("行为: 两步都成 ⇒ 返回 0")
+
+    r2 = run_pfr(1, snap_rc=1, newfiles=("newly-installed.py",))
+    (ok if "RC=1" in r2["stdout"] else bad)("行为: 快照恢复失败 ⇒ 返回非零")
+    (ok if "恢复未完成" in r2["stdout"] else bad)(
+        "行为: 恢复没做完就明说未完成, 不被上一步的成功盖过")
+    (ok if not r2["wd_gone"] else bad)("行为: 恢复不完整就**保留**本轮材料")
 
 # ═══ 11. doctor 仍把 probe81 当两平台必需 ════════════════════════════════
 print()

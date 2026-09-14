@@ -103,6 +103,7 @@ STOP_LEAVES_ON_ROLLBACK=""
 for _fn in _retire_svc_stopped _retire_core_has_mitm _retire_undo_push _retire_undo_run \
            _retire_track_file _retire_restore_file _retire_reload_svc _retire_track_svc \
            _retire_enable_supported _retire_restore_svc _retire_cleanup _retire_fail \
+           _pdg_now_en _pdg_svc_q _pdg_svc_known _pdg_set_enable_state \
            _retire_report_ca _retire_rerender_core _retire_ios_schema \
            _retire_disable_wloc_json _retire_ca_report migrate_wloc_retire; do
   eval "$(sed -n "/^$_fn(){/,/^}/p" "$ROOT/deploy/bot/pdg.sh")"

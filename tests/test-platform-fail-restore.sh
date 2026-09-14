@@ -246,6 +246,8 @@ run_platform(){   # $1=目标平台 $2=fail|nofail $3=场景目录 [$4=被测 pd
     grep -m1 '^declare -A _PDG_WANT_EN' "$src"
     grep -m1 '^_PDG_SVC_MODE=' "$src"; grep -m1 '^_PDG_SVC_WHY=' "$src"; grep -m1 '^_PDG_SVC_SRC=' "$src"
     _fnN "$src" _pdg_svcstate_plan; _fn1 "$src" _pdg_now_ac; _fn1 "$src" _pdg_now_en
+    # 自启恢复现在由 _pdg_set_enable_state 一处负责(持久/运行时两层要分别撤) —— 抽真身, 不补替代实现。
+    _fnN "$src" _pdg_set_enable_state
     _fnN "$src" _pdg_restore_svcstate; _fnN "$src" cmd_rollback
     _fnN "$src" _retire_caller_gate; _fnN "$src" _retire_allowed
     _fnN "$src" _retire_android_pending; _fnN "$src" _retire_plat_pending

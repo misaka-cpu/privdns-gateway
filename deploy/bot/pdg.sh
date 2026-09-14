@@ -4087,6 +4087,49 @@ _pdg_svcstate_plan(){   # $1=本次要回滚到的快照目录
 _pdg_now_ac(){ _pdg_svc_q is-active  "$1" | cut -f1; }
 _pdg_now_en(){ _pdg_svc_q is-enabled "$1" | cut -f1; }
 
+# 把 $1 的自启状态设成 $2。**只动这一个 unit**: 不碰 wants/ 目录、不用通配、不动别的 unit;
+# 这里只改自启 —— 一个 start/stop 都不发, 原本停着的服务不会被顺带启动。
+#
+# 为什么不是一句 systemctl 就完事: 持久自启与运行时自启是**两套独立的链接**
+#     持久   /etc/systemd/system/<target>.wants/<unit>
+#     运行时 /run/systemd/system/<target>.wants/<unit>
+# 在真 systemd 上实测过(用户作用域的一次性 unit, 不碰任何宿主系统服务):
+#     enable                                → enabled
+#     已经 enabled 再 enable --runtime      → 仍然 **enabled**        ← 缺口一
+#     disable(不带 --runtime)               → enabled-runtime(只撤掉持久那一层)
+#     enabled-runtime 上只 disable          → 仍然 **enabled-runtime** ← 缺口二
+#     disable --runtime                     → disabled
+# 也就是说: 只调目标那一条命令, "前像是 enabled-runtime 而现状被永久 enable 了"和
+# "前像是 disabled 而现状是 enabled-runtime"这两种都**永远回不去**。
+#
+# 所以先按真实语义撤掉**妨碍这一次恢复的那一层**, 再置目标层。撤哪一层由**当前实际状态**
+# 决定 —— 没有妨碍就一层都不撤(不做多余动作), 也不会对 static/masked 这类没有链接的
+# unit 先动手再说不支持(调用方只在三种可还原取值上调本函数)。
+#
+# 返回 0 = 每一步动作都成功; 非 0 = 有动作失败。
+# **后置状态由调用方另行核对** —— 动作成功与后置相符是两件事, 分开记。
+_pdg_set_enable_state(){   # $1=unit $2=目标(enabled|enabled-runtime|disabled)
+  local u="$1" want="$2" rc=0
+  case "$want" in
+    enabled)
+      systemctl enable "$u" >/dev/null 2>&1 || rc=$?;;
+    enabled-runtime)
+      # 妨碍项 = 持久链接。只在它确实在的时候撤, 撤的是**这一个 unit** 的那一条。
+      if [[ "$(_pdg_now_en "$u")" == enabled ]]; then
+        systemctl disable "$u" >/dev/null 2>&1 || rc=$?
+      fi
+      systemctl enable --runtime "$u" >/dev/null 2>&1 || rc=$?;;
+    disabled)
+      systemctl disable "$u" >/dev/null 2>&1 || rc=$?
+      # 妨碍项 = 运行时链接(上面那句不带 --runtime, 撤不掉 /run 里的那一条)。
+      if [[ "$(_pdg_now_en "$u")" == enabled-runtime ]]; then
+        systemctl disable --runtime "$u" >/dev/null 2>&1 || rc=$?
+      fi;;
+    *) return 2;;          # 调用方负责只传这三种可还原取值
+  esac
+  return "$rc"
+}
+
 # 回滚时的内核收敛。
 #
 # 分工: 旧核冲突那一半**原样保留**(停掉并关自启, 并核验) —— 这一版只允许一个内核在跑,
@@ -4151,11 +4194,8 @@ _pdg_restore_svcstate(){   # $1=本次快照目录
         unrestored+=("$u 自启前像无法确认(记录时查询 rc=${_PDG_WANT_URC[$u]:-?})");;
       enabled|enabled-runtime|disabled)
         rc=0
-        case "$want" in
-          enabled)         systemctl enable "$u"           >/dev/null 2>&1 || rc=$?;;
-          enabled-runtime) systemctl enable --runtime "$u" >/dev/null 2>&1 || rc=$?;;  # 不提升成永久
-          disabled)        systemctl disable "$u"          >/dev/null 2>&1 || rc=$?;;
-        esac
+        # 持久与运行时是两套链接, 只调目标那一条命令回不去 —— 详见 _pdg_set_enable_state。
+        _pdg_set_enable_state "$u" "$want" || rc=$?
         [[ "$rc" == 0 ]] || unrestored+=("$u 自启恢复动作失败(目标 $want, rc=$rc)")
         now="$(_pdg_now_en "$u")"
         [[ "$now" == "$want" ]] || unrestored+=("$u 自启后置状态不符(目标 $want, 实得 $now)");;
@@ -4401,6 +4441,19 @@ _retire_caller_gate(){
   c_y "   这一步会做**不可逆**的事: 停并禁用 pdg-mitm、删除 WLOC 执行件与 unit、"
   c_y "   推进 iOS 描述文件记录格式(推进之后, 嵌着根证书的旧产物会被删掉)。"
   c_y "   只有能在动手之前保存服务前像、并据此恢复的升级调用方才允许执行。"
+  c_y "   接下来怎么办 —— 按这台机器**回滚之后会停在哪一版**来说:"
+  if [[ "${_PDG_CLI_VERB:-}" == __migrate && -z "${PDG_UPDATE_SVCSTATE:-}" ]]; then
+    c_y "     · 你是手打 sudo pdg __migrate 进来的。那是内部入口, 不建快照也不保存服务前像。"
+    c_y "       这台机器既然已经是这一版, 请改用 **sudo pdg migrate** —— 它会建快照、保存前像"
+    c_y "       并把句柄交给迁移。"
+  else
+    c_y "     · 调用方接下来会执行它自己的回滚。回滚之后这台机器**回到调用方原来那一版**,"
+    c_y "       而那一版没有这一步退役迁移 —— 所以没有哪条命令可以'再跑一遍'把它补上。"
+    c_y "     · 要让这次升级真正完成, 需要一个**在动手之前就保存服务前像**的升级入口。"
+    c_y "       当前安装路径上还没有它: 这不是敲对命令就能解决的事, 请等该入口发布。"
+  fi
+  c_y "   另: 没有任何环境变量或参数可以绕过这道门, 也不要去伪造一份服务前像来骗过它 ——"
+  c_y "   门验的是那份记录**属于本次操作**(boot_id / 调用方 pid+启动时刻 / 快照身份), 不是它存在。"
   c_y "   现在的现场: **本次尚未执行任何退役副作用** —— 服务没停、没禁用、没删任何产物、"
   c_y "   iOS 记录格式没有推进。但这一刻**新版文件已经装上了**(受管模块、/usr/local/bin/pdg 等),"
   c_y "   所以这不是「整机未改动」。调用方接下来会执行它自己的回滚; 那次回滚做到什么程度, 以它的输出为准。"
@@ -4549,9 +4602,9 @@ _retire_restore_svc(){   # $1=服务 $2=原 enabled $3=原运行状态 [$4=confi
   # 后者只在 /run 里(重启就没了)。把 runtime 的还原成永久自启, 等于替用户做了一个他没做过
   # 的决定, 而且下次重启才看得出来。
   case "$en" in
-    enabled)         systemctl enable "$svc" >/dev/null 2>&1 || rc=1;;
-    enabled-runtime) systemctl enable --runtime "$svc" >/dev/null 2>&1 || rc=1;;
-    disabled)        systemctl disable "$svc" >/dev/null 2>&1 || rc=1;;
+    enabled|enabled-runtime|disabled)
+      # 与 _pdg_restore_svcstate 用**同一份**实现: 先撤妨碍这次还原的那一层, 再置目标层。
+      _pdg_set_enable_state "$svc" "$en" || rc=1;;
     *) echo "$svc 原来的自启状态是 ${en:-查不到}, 不在可还原之列 —— 未改动它"; rc=1;;
   esac
   # ── 运行状态 ──
@@ -4654,6 +4707,31 @@ _retire_fail(){   # $1 = 给用户的话
 # 销毁 —— 销毁私钥不可逆, 而那张根证书很可能还被他手机信任着, 取消信任只有他自己能做。
 #
 # 幂等: 已经退役干净的机器上再跑, 不动文件也不重启任何服务。
+# 退役迁移失败之后, 用户到底该重跑什么 —— 这不是一句固定文案。
+#
+#   · `pdg __migrate` 是**内部入口**: 它不建快照、不保存服务前像, 拿不到能力门要的句柄。
+#     有不可逆的退役待办时手打它必定被拒 —— 所以任何面向用户的提示都不再指向它。
+#   · 从 `pdg update` 进来的这一次, 上游会回滚到更新前快照, 机器**回到更新前那一版**。
+#     那一版根本没有 WLOC 退役这一步, 也就没有什么"迁移"可以重跑 —— 该做的是修好原因后
+#     重新 update。让他去跑只有新版才有的命令, 是在指望一台已经回滚的机器具备新版能力。
+#   · 机器**已经是这一版**(从 `pdg migrate` / `pdg platform` / 手打 `pdg __migrate` 进来),
+#     那就用 `pdg migrate`: 它先建快照, 再 _pdg_save_svcstate 保存服务前像, 并把句柄交给迁移。
+#
+# 判据只用两个已有信号: 本次 CLI 动词, 以及调用方有没有交句柄。不引入任何绕过门的开关。
+_retire_rerun_hint(){
+  c_y "   修好之后怎么重跑 —— 取决于你此刻是从哪个入口进来的:"
+  if [[ "${_PDG_CLI_VERB:-}" == __migrate && -n "${PDG_UPDATE_SVCSTATE:-}" ]]; then
+    c_y "     · 你现在是在 sudo pdg update 里面。这一次更新会回滚到更新前快照,"
+    c_y "       回滚之后这台机器**回到更新前那一版** —— 那一版没有这一步退役迁移,"
+    c_y "       没有什么命令可以单独'重跑'它。处理掉上面的原因之后, 重新跑 sudo pdg update。"
+  else
+    c_y "     · 这台机器已经是这一版: 处理掉上面的原因之后跑 **sudo pdg migrate**。"
+    c_y "       它会先建快照、再保存服务前像, 并把句柄交给迁移 —— 这是受支持的重跑入口。"
+  fi
+  c_y "     · 不要手打 sudo pdg __migrate: 那是内部入口, 不建快照也不保存服务前像,"
+  c_y "       有不可逆的退役待办时会被能力门直接拒绝。也没有任何变量或参数可以绕过这道门。"
+}
+
 migrate_wloc_retire(){
   local R="${PDG_RETIRE_ROOT:-}"          # 测试用的整体前缀; 生产为空
   local unit="$R/etc/systemd/system/pdg-mitm.service"
@@ -4695,7 +4773,8 @@ migrate_wloc_retire(){
       c_r "❌ WLOC 退役: $hij 里有不属于 WLOC 的条目, 本次未做任何改动。"
       c_y "   这张表历来只由 WLOC 写入, 出现别的域名说明有人手工改过 —— 归属不清就不能一把清空。"
       printf '%s\n' "$stray" | sed 's/^/     /'
-      c_y "   自己确认后清掉这些行(或整表清空), 再重跑 sudo pdg __migrate。"
+      c_y "   自己确认后清掉这些行(或整表清空)。"
+      _retire_rerun_hint
       return 1
     fi
   fi
@@ -4709,7 +4788,7 @@ migrate_wloc_retire(){
       c_y "   可还原的只有 enabled / enabled-runtime / disabled 三种 —— 其余状态一旦动过就"
       c_y "   回不去原样(static 没有 enable/disable 可言, masked 需要先 unmask)。"
       c_y "   与其改完再说一句「不一致」, 不如现在就停下: 请自行确认该服务该是什么状态,"
-      c_y "   处理后重跑 sudo pdg __migrate。"
+      _retire_rerun_hint
       return 1
     fi
   fi
@@ -4745,7 +4824,8 @@ migrate_wloc_retire(){
       local st; st="$(systemctl is-active pdg-mitm 2>/dev/null | tr -d '[:space:]')"
       c_y "   ${st:-查不到} 不等于已停: 进程可能还在, 7894 可能还开着。这时**不会**去删它的"
       c_y "   执行文件 —— 代码删了而进程还在, 等于留下一个没有源码可查的 MITM 在转发流量。"
-      c_y "   查 systemctl status pdg-mitm 与 ss -lntp | grep 7894, 处理后重跑 sudo pdg __migrate。"
+      c_y "   查 systemctl status pdg-mitm 与 ss -lntp | grep 7894。"
+      _retire_rerun_hint
       _retire_fail "pdg-mitm 没有停稳(is-active=${st:-查不到}), 本次不再往下做。"; return 1
     fi
   fi
@@ -4774,7 +4854,8 @@ migrate_wloc_retire(){
     _retire_track_svc "$(_pdg_core_svc)" cfg
     _retire_track_file "$mc" || { _retire_fail "备份内核配置失败。"; return 1; }
     if ! _retire_rerender_core; then
-      c_y "   查 sudo pdg doctor 与 mihomo -t 的输出, 处理后重跑 sudo pdg __migrate。"
+      c_y "   查 sudo pdg doctor 与 mihomo -t 的输出。"
+      _retire_rerun_hint
       _retire_fail "重新渲染或启用内核配置失败。"; return 1
     fi
   fi
@@ -4807,7 +4888,8 @@ migrate_wloc_retire(){
   # 退役根证书的描述文件再发一次"这个能力。它排在最后, 因为它一提交就删掉带 CA 的产物,
   # 而那一步不可逆 —— 它后面不许再有任何可能失败的破坏性步骤。
   if ! _retire_ios_schema; then
-    c_y "   上面的服务/劫持/路由/模块改动会被回滚。修好之后重跑 sudo pdg __migrate。"
+    c_y "   上面的服务/劫持/路由/模块改动会被回滚。"
+    _retire_rerun_hint
     _retire_fail "iOS 描述文件记录的格式迁移失败。"; return 1
   fi
 
@@ -7054,9 +7136,9 @@ cmd_platform(){
       fi
       systemctl reset-failed "$svc" >/dev/null 2>&1 || true
       case "$en" in
-        enabled)         systemctl enable "$svc"           >/dev/null 2>&1 || true;;
-        enabled-runtime) systemctl enable --runtime "$svc" >/dev/null 2>&1 || true;;
-        disabled)        systemctl disable "$svc"          >/dev/null 2>&1 || true;;
+        enabled|enabled-runtime|disabled)
+          # 同上, 走同一份实现; 这里的后置核对在下面的 _miss 里, 与动作返回码分开。
+          _pdg_set_enable_state "$svc" "$en" >/dev/null 2>&1 || true;;
       esac
       [[ "$(systemctl is-enabled "$svc" 2>/dev/null | head -1)" == "$en" ]] || _miss+=("$svc 自启(目标 $en)")
       if [[ "$ac" == active ]]; then
@@ -9410,6 +9492,9 @@ cmd_tx(){
 # 默认值(rollback 的序号 0、log 的 40 行)由各自的函数兜底, 不在这里替它们塞 ——
 # 分发器一塞, "有没有给参数"这件事在函数里就再也分辨不出来了。
 # tests/test-cli-dispatch.py 把这段 case 抽出来逐条跑, 不是靠这条注释守着。
+# 本次 CLI 的动词。只用于**面向用户的提示**该怎么写(见 _retire_rerun_hint):
+# `__migrate` 是内部入口, 从 cmd_update 的子进程和用户手打两条路都会到这儿, 两者要分开说。
+_PDG_CLI_VERB="${1:-menu}"
 case "${1:-menu}" in
   menu|"")       menu;;
   # 内部: cmd_update 装好新脚本后据此跑"新版"迁移。

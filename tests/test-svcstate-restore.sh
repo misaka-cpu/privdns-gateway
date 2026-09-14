@@ -79,6 +79,8 @@ prodfns(){ local src="$PDG"
   grep -m1 '^declare -A _PDG_WANT_EN' "$src"
   grep -m1 '^_PDG_SVC_MODE=' "$src"; grep -m1 '^_PDG_SVC_WHY=' "$src"; grep -m1 '^_PDG_SVC_SRC=' "$src"
   _fnN "$src" _pdg_svcstate_plan; _fn1 "$src" _pdg_now_ac; _fn1 "$src" _pdg_now_en
+  # 自启恢复现在由 _pdg_set_enable_state 一处负责(持久/运行时两层要分别撤) —— 抽真身, 不补替代实现。
+  _fnN "$src" _pdg_set_enable_state
   _fnN "$src" _pdg_restore_svcstate
 }
 

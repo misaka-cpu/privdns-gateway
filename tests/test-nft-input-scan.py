@@ -519,7 +519,12 @@ table inet filter {
         _set_candidates(repo, (nft_path,))
 
         # 守卫本身: nft 不在 PATH 上, 校验依然要发生
+        # 守卫失败之后交出去的是 **_plat_fail_restore**(失败善后的统一入口), 它内部才按
+        # "这次有没有真撤除过退役件"分岔到 _plat_rollback 或整体快照恢复。
+        # 这里两个都定义: 判据仍是"有没有交出去恢复", 不是哪个名字被喊到。
+        # (冻结候选上只桩了 _plat_rollback, 于是真跑时报 _plat_fail_restore: command not found。)
         harness = ('_plat_rollback(){ echo ROLLBACK; }\n'
+                   '_plat_fail_restore(){ echo ROLLBACK; }\n'
                    'g(){ local wd="%s"; mkdir -p "$wd"\n%s\n  echo PASSED_GUARD\n}\n'
                    'g; echo "rc=$?"\n' % (os.path.join(tmp, "wd"), guard_src))
         write_nft(1)                                   # nft -c 判这份配置不合法
