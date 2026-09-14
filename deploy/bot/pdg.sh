@@ -4937,8 +4937,11 @@ except iosstate.StateError as e:
     printf '%s\n' "$out" | sed 's/^/     /'
     return 1
   fi
-  printf '%s' "$out" | grep -q '"changed": true' && \
-    c_g "  ✅ iOS 描述文件记录已迁移到新格式(不再含 WLOC 字段)。"
+  # 记录格式一旦推进就回不去(嵌着根证书的旧产物会被删掉), 与删模块/删 unit 同级 ——
+  # 后面的失败必须走"整体恢复"那条路, 局部还原补不回一条已经改写的记录。
+  printf '%s' "$out" | grep -q '"changed": true' && {
+    _PDG_RETIRE_DONE=1
+    c_g "  ✅ iOS 描述文件记录已迁移到新格式(不再含 WLOC 字段)。"; }
   printf '%s' "$out" | grep -q '"retired_revision": [0-9]' && \
     c_y "  ⚠️ 有历史版本的描述文件里嵌着已退役的根证书, 已不再保留 —— 请重新生成一份。"
   return 0
@@ -7083,26 +7086,57 @@ cmd_platform(){
   #            再让快照覆盖 —— 两步互补, 不是两套互相覆盖的恢复。
   #   没撤除 → 还是走局部还原(改动面就那几个配置文件, 局部更精确、更快)。
   # 两条路**不会同时对同一个文件动手**。
+  # 失败善后。**它自己负责决定要不要清掉本轮材料** —— 调用点只管 `return 1`。
+  #
+  # 两条纪律:
+  #   · 恢复过程里每一步的失败都要**具名累计**, 不能被后一步的成功盖过去。快照只能把
+  #     原有文件覆盖回去, 解释不了"本次新增、但没能删掉"的东西 —— 留下快照 ≠ 留下完整材料;
+  #   · 恢复不完整就**保留**实际还有用的材料($wd 里的新增文件清单与局部备份, 以及快照),
+  #     并把路径打出来。只有完整恢复才清理。
   _plat_fail_restore(){
-    if [[ "${_PDG_RETIRE_DONE:-0}" != 1 ]]; then _plat_rollback; return; fi
-    c_y "  本次已经撤除过退役件 —— 那几样不在局部备份里, 改用本次快照做整体恢复。"
-    local nf
-    if [[ -s "$wd/newfiles" ]]; then
-      while read -r nf; do [[ -n "$nf" ]] && rm -f "$nf" 2>/dev/null; done < "$wd/newfiles"
+    local left=() nf
+    if [[ "${_PDG_RETIRE_DONE:-0}" != 1 ]]; then
+      if _plat_rollback; then rm -rf "$wd"; return 0; fi
+      c_r "   本轮材料保留在: $wd (局部备份) 与 $_psnap (快照)"
+      return 1
     fi
-    if cmd_rollback --dir "$_psnap" --no-git; then
+    c_y "  本次已经撤除过退役件/推进过记录格式 —— 那几样不在局部备份里, 改用本次快照做整体恢复。"
+    # ① 先撤掉本次新装上去的平台专属件。tar 覆盖删不掉多出来的东西, 只能一件件删;
+    #    某一件删不掉**不影响**继续删其余的, 但要如实记下来。
+    if [[ -s "$wd/newfiles" ]]; then
+      while read -r nf; do
+        [[ -n "$nf" ]] || continue
+        [[ -e "$nf" || -L "$nf" ]] || continue
+        rm -f "$nf" 2>/dev/null
+        [[ -e "$nf" || -L "$nf" ]] && left+=("$nf")
+      done < "$wd/newfiles"
+    fi
+    # ② 再让快照把原有文件与服务状态恢复回去。① 失败也要做 ② —— 能恢复的部分照恢复。
+    local snap_ok=1
+    cmd_rollback --dir "$_psnap" --no-git || snap_ok=0
+    if [[ "$snap_ok" == 1 && ${#left[@]} -eq 0 ]]; then
       c_g "  已按本次快照恢复到切换前(文件/运行态/自启态已逐项核验)。"
+      rm -rf "$wd"
       return 0
     fi
-    c_r "❌ 按本次快照恢复**未完成**(未恢复项见上)。**不声称已恢复原平台与服务状态**。"
-    c_r "   可用材料仍在: $_psnap —— 请据此人工收尾。"
+    # 恢复没做完: 原始操作的失败与恢复本身的失败**分开报**。
+    c_r "❌ 恢复未完成 —— 这与上面那次操作失败是两件事, 分开看:"
+    [[ "$snap_ok" == 1 ]] && c_r "   · 快照恢复: 已完成" || c_r "   · 快照恢复: **未完成**(未恢复项见上方)"
+    if [[ ${#left[@]} -gt 0 ]]; then
+      c_r "   · 本次新增、**没能删掉**的文件(快照解释不了它们, 仍留在盘上):"
+      printf '     %s\n' "${left[@]}"
+    fi
+    c_r "   **不声称已恢复原平台与服务状态。** 材料保留在:"
+    c_r "     新增文件清单: $wd/newfiles"
+    c_r "     局部备份    : $wd"
+    c_r "     本次快照    : $_psnap"
     return 1
   }
   # 3) 落平台标记(platform 文件 + profile.env 同步)
   install -d -m700 /etc/privdns-gateway
-  printf '%s\n' "$p" > /etc/privdns-gateway/platform || { _plat_fail_restore; rm -rf "$wd"; return 1; }
+  printf '%s\n' "$p" > /etc/privdns-gateway/platform || { _plat_fail_restore; return 1; }
   rm -f /etc/privdns-gateway/platform.guessed
-  _plat_write_profile "$p" || { c_y "profile.env 写入失败"; _plat_fail_restore; rm -rf "$wd"; return 1; }
+  _plat_write_profile "$p" || { c_y "profile.env 写入失败"; _plat_fail_restore; return 1; }
 
   # 4) 按目标平台部署 / 清理组件
   # 先保证**公共件**就位: pdg-probe81 两平台都必需, 而 _pdg_required_svcs 下面就要
@@ -7123,14 +7157,14 @@ cmd_platform(){
   if [[ "$p" == ios ]]; then
     if ! _plat_deploy_ios; then
       echo "❌ iOS 组件部署失败(描述文件模板 / MITM 模块 / pdg-mitm 服务)"
-      _plat_fail_restore; rm -rf "$wd"; return 1
+      _plat_fail_restore; return 1
     fi
   else
     # 返回值必须看: 它现在会在"调用方没有回滚能力"时拒绝动手并返回非 0。吞掉的话,
     # 平台切换就会在**退役没做**的情况下宣布成功 —— 那正是要避免的半截现场。
     if ! migrate_android_cleanup; then   # 安全休眠 WLOC + 移除 iOS unit/模块/模板(保留地点与 CA)
       echo "❌ Android 组件清理未完成(详见上方), 平台切换回退"
-      _plat_fail_restore; rm -rf "$wd"; return 1
+      _plat_fail_restore; return 1
     fi
   fi
 
@@ -7138,17 +7172,17 @@ cmd_platform(){
   #    (用户其它表逐字节保留)→ nft -c → 应用, 任一步失败它自己会把现网还原。
   if ! _switchcore_nft mihomo; then
     echo "❌ 防火墙按新平台重建失败"
-    _plat_fail_restore; rm -rf "$wd"; return 1
+    _plat_fail_restore; return 1
   fi
 
   # 6) 重渲内核配置(两个方向都不会再有 MITM-OUT: WLOC 已退役, 渲染器不再产生那条出站与路由)
   if ! ( cd /opt/pdg-bot && python3 -c 'import bot; bot._render_mihomo_file()' ) >/dev/null 2>&1; then
     echo "❌ 重新渲染 mihomo 配置失败"
-    _plat_fail_restore; rm -rf "$wd"; return 1
+    _plat_fail_restore; return 1
   fi
   if command -v mihomo >/dev/null 2>&1 && ! mihomo -t -d /etc/mihomo -f /etc/mihomo/config.yaml >/dev/null 2>&1; then
     echo "❌ 新平台的 mihomo 配置校验(mihomo -t)未过"
-    _plat_fail_restore; rm -rf "$wd"; return 1
+    _plat_fail_restore; return 1
   fi
   systemctl restart "$(_pdg_core_svc)" >/dev/null 2>&1 || true
   systemctl restart mosdns >/dev/null 2>&1 || true
@@ -7159,12 +7193,12 @@ cmd_platform(){
   local _nftexe; _nftexe="$(_pdg_nft_bin)"
   if [[ -n "$_nftexe" ]] && ! "$_nftexe" -c -f /etc/nftables.conf >/dev/null 2>&1; then
     echo "❌ 切换后的 nftables 配置校验未过"
-    _plat_fail_restore; rm -rf "$wd"; return 1
+    _plat_fail_restore; return 1
   fi
   if [[ "$(_pdg_bot_cred)" == partial ]]; then
     echo "❌ Bot 凭据只配了一项(token 与允许 id 必须成对)—— 这是配置错误, 先用 pdg-set-token"
     echo "   补齐或把两项都留空(彻底禁用 bot), 再切平台。"
-    _plat_fail_restore; rm -rf "$wd"; return 1
+    _plat_fail_restore; return 1
   fi
   local svc bad=()
   # 必需服务集按凭据状态算: 没配 bot 的机器不该因为 pdg-bot 没跑而切不了平台
@@ -7173,27 +7207,35 @@ cmd_platform(){
   done
   if [[ ${#bad[@]} -gt 0 ]]; then
     echo "❌ 切换后这些服务未稳定运行: ${bad[*]}"
-    _plat_fail_restore; rm -rf "$wd"; return 1
+    _plat_fail_restore; return 1
   fi
   # 8) 返回 0 之前复核现场: 目标平台该有的都在、该没有的都清干净了
   if ! _plat_verify "$p"; then
-    _plat_fail_restore; rm -rf "$wd"; return 1
+    _plat_fail_restore; return 1
   fi
   # 关键迁移必须在**删掉回滚材料、宣布成功之前**跑完: 它失败就走 _plat_rollback,
   # 而 _plat_rollback 依赖 $wd 里的材料 —— 顺序颠倒的话就只能 best-effort 了。
   if ! migrate_ios_gms_cleanup; then
     echo "❌ iOS GMS 残留清理失败(详见上方), 平台切换回退"
-    _plat_fail_restore; rm -rf "$wd"; return 1
+    _plat_fail_restore; return 1
   fi
   # probe81 是两个平台**都必需**的公共件(链路诊断的 HTTP 会话入口)。切完平台如果它没就位,
   # 那台机器就少了一整块能力, 而后面那句"平台已确认"会把这件事盖过去。与 GMS 同样待遇:
   # 在删回滚材料之前单独跑一次并传播失败(幂等, 下面的 run_all_migrations 再跑就是空转)。
   if ! migrate_probe81_public; then
     echo "❌ pdg-probe81 公共件迁移失败(详见上方), 平台切换回退"
-    _plat_fail_restore; rm -rf "$wd"; return 1
+    _plat_fail_restore; return 1
+  fi
+  # WLOC 退役(含 iOS 记录格式推进)与上面两步同样待遇: **在删掉回滚材料之前**单独跑一次
+  # 并传播失败。以前它只在下面那句 `run_all_migrations || true` 里跑 —— 那时 $wd 已经删了,
+  # 失败又被 `|| true` 吞掉, 最后照样打印"平台已确认"并返回 0。
+  # 它自己是幂等的, 所以下面那句再跑一遍就是空转。
+  if ! migrate_wloc_retire; then
+    echo "❌ WLOC 退役迁移未完成(详见上方), 平台切换回退"
+    _plat_fail_restore; return 1
   fi
   rm -rf "$wd"
-  run_all_migrations || true                    # 其余平台无关的幂等迁移照常跑(上面两步已单独跑过)
+  run_all_migrations || true                    # 其余平台无关的幂等迁移照常跑(上面三步已单独跑过)
   c_g "平台已确认: $cur → $p"
   if [[ -x /opt/pdg-bot/doctor.py ]] || [[ -f /opt/pdg-bot/doctor.py ]]; then
     python3 /opt/pdg-bot/doctor.py || c_y "自检有未通过项(见上), 平台切换本身已完成。"

@@ -68,7 +68,7 @@ awk '/cmd_snapshot --source cli --op platform/{s=NR}
   || bad "B3: 顺序不对"
 grep -q '中止切换(未改动任何东西)' "$pl" && ok "B4: 存不下就中止, 并明说此刻未改动任何东西" || bad "B4"
 grep -q 'export PDG_UPDATE_SVCSTATE="\$_psnap/svcstate.tsv"' "$pl" && ok "B5: 句柄交给后续所有退役类动作" || bad "B5"
-awk '/if ! migrate_android_cleanup; then/{a=NR} /_plat_fail_restore; rm -rf "\$wd"; return 1/{if(a&&NR>a&&!done){done=NR}} END{exit !(a&&done)}' "$pl" \
+awk '/if ! migrate_android_cleanup; then/{a=NR} /_plat_fail_restore; return 1/{if(a&&NR>a&&!done){done=NR}} END{exit !(a&&done)}' "$pl" \
   && ok "B6: migrate_android_cleanup 的返回值被检查, 失败即回退切换(不会「退役失败但成功」)" \
   || bad "B6: 仍然吞掉了 Android 清理的返回值"
 
@@ -76,12 +76,28 @@ echo
 echo "══ 二之二. 失败善后: 撤除过退役件就必须用快照整体恢复 ══"
 n_old="$(grep -c '_plat_rollback; rm -rf "\$wd"; return 1' "$PDG")"
 [[ "$n_old" == 0 ]] && ok "B7: 没有任何失败点再直接走局部还原(统一经 _plat_fail_restore 分岔)" || bad "B7: 还有 $n_old 处直接走 _plat_rollback"
-n_new="$(grep -c '_plat_fail_restore; rm -rf "\$wd"; return 1' "$PDG")"
+n_new="$(grep -c '_plat_fail_restore; return 1' "$PDG")"
 [[ "$n_new" -ge 10 ]] && ok "B8: $n_new 处失败点统一走 _plat_fail_restore" || bad "B8: 只有 $n_new 处"
+n_rm="$(grep -c '_plat_fail_restore; rm -rf "\$wd"' "$PDG")"
+[[ "$n_rm" == 0 ]] && ok "B8b: 失败点不再自己删材料 —— 删不删由 _plat_fail_restore 按恢复结果决定" || bad "B8b: 还有 $n_rm 处"
 grep -q '_plat_fail_restore(){' "$pl" && ok "B9: 分岔入口就在 cmd_platform 里(看得到 \$wd/\$_psnap)" || bad "B9"
 grep -q 'cmd_rollback --dir "\$_psnap" --no-git' "$pl" \
   && ok "B10: 撤除过退役件时接的是**已经修好的快照恢复**, 不是另造一套" || bad "B10"
 grep -q '不声称已恢复原平台与服务状态' "$pl" && ok "B11: 恢复没完成时明确不声称已恢复" || bad "B11"
+grep -q '新增文件清单: \$wd/newfiles' "$pl" && ok "B11b: 恢复不完整时打出新增文件清单的可定位路径" || bad "B11b"
+awk '/left\+=\("\$nf"\)/{a=1} /cmd_rollback --dir "\$_psnap"/{if(a)b=1} END{exit !(a&&b)}' "$pl" \
+  && ok "B11c: 删除失败先具名累计, 之后**照样**继续做快照恢复(不因第一项失败就放弃其余)" || bad "B11c"
+
+echo
+echo "══ 二之三. WLOC/schema 的提交点 ══"
+awk '/if ! migrate_wloc_retire; then/{w=NR} /^  rm -rf "\$wd"$/{r=NR} /run_all_migrations \|\| true/{m=NR} /平台已确认/{c=NR}
+     END{exit !(w&&r&&m&&c&&w<r&&r<m&&m<c)}' "$pl" \
+  && ok "B13: WLOC 退役排在 \`rm -rf \$wd\` **之前**, 而 run_all_migrations 与「平台已确认」都在其后" \
+  || bad "B13: 提交顺序不对"
+awk '/if ! migrate_wloc_retire; then/{w=NR} /_plat_fail_restore; return 1/{if(w&&NR>w&&!d)d=NR} END{exit !(w&&d&&d-w<4)}' "$pl" \
+  && ok "B14: 它失败就走失败善后(不是 || true 吞掉)" || bad "B14"
+grep -q '_PDG_RETIRE_DONE=1' "$(fnfile "$PDG" _retire_ios_schema)" \
+  && ok "B15: 记录格式真的推进过也会立「撤除过」记号 —— 后续失败走整体恢复" || bad "B15: schema 路径没立记号"
 for fn in migrate_android_cleanup _plat_purge_retired; do
   grep -q '_PDG_RETIRE_DONE=1' "$(fnfile "$PDG" "$fn")" \
     && ok "B12: $fn 真的动手之后会立下「撤除过」的记号" || bad "B12: $fn 没立记号"
