@@ -917,13 +917,24 @@ switch_repo_to_candidate(){
     && ok "部署源身份: $plat 平台应装的 $nmod 个文件全部就位且逐字节等于候选 X" \
     || { bad "部署源身份: $plat 平台清单 $nmod 项里有 $nbad 项缺失或指纹不符"; return 1; }
   if [[ "$plat" == android ]]; then
-    # 反面契约 ①: iOS 专属那四件不该出现在 Android 上
-    local ios_only="" f
+    # 反面契约 ①: iOS 专属那几件不该由**候选的 Android 安装**带上来。
+    # 但"盘上有"不等于"候选装的" —— 本轮的前像里它们是**预先构造的历史残留**, 已经逐项
+    # 记进了残留清单(来源 + sha256 + mode + uid:gid)。所以判据是**对账**, 不是看名字:
+    #   · 在清单里且指纹对得上 → 已记账的历史残留, 不算异常(但要列出来, 不笼统豁免);
+    #   · 不在清单里, 或指纹与清单里记的不一样 → 就是**没记账的额外文件**, 当场判红。
+    # 这样既不因为平台标记是 android 就一律拒绝, 也不给任何文件开白名单。
+    local ios_unaccounted="" ios_accounted="" f fsum msum
     for f in iosprofile.py iosstate.py mitm_ca.py pdg-dot.mobileconfig.tmpl; do
-      [[ -e "/opt/pdg-bot/$f" ]] && ios_only="$ios_only $f"
+      [[ -e "/opt/pdg-bot/$f" ]] || continue
+      fsum="$(sha256sum "/opt/pdg-bot/$f" 2>/dev/null | awk '{print $1}')"
+      msum="$(awk -F"$(printf '\t')" -v k="/opt/pdg-bot/$f" '$1==k{print $3; exit}' "$RESIDUE_MANIFEST" 2>/dev/null)"
+      if [[ -n "$msum" && "$msum" == "$fsum" ]]; then ios_accounted="$ios_accounted $f"
+      else ios_unaccounted="$ios_unaccounted $f(盘上 ${fsum:0:12} / 清单 ${msum:-无记录})"; fi
     done
-    [[ -z "$ios_only" ]] && ok "部署源身份: Android 上没有 iOS 专属件(平台契约成立)" \
-                         || bad "部署源身份: Android 上出现了 iOS 专属件:$ios_only"
+    [[ -n "$ios_accounted" ]] && note "部署源身份: 这几件 iOS 专属件是**已记账的历史残留**, 指纹与清单一致:$ios_accounted"
+    [[ -z "$ios_unaccounted" ]] \
+      && ok "部署源身份: Android 上没有**未记账**的 iOS 专属件(候选安装没有多带东西)" \
+      || bad "部署源身份: Android 上有未记账的 iOS 专属件:$ios_unaccounted"
   else
     # 反面契约 ②: iOS 上装的 iosstate 必须是候选形态(行为身份, 不只是文件名)
     ( cd /opt/pdg-bot && python3 -c 'import iosstate,sys; sys.exit(0 if hasattr(iosstate,"migrate_schema") else 1)' ) 2>/dev/null \
@@ -1027,6 +1038,44 @@ dns_feature_probe(){   # $1=标签 → 打印 "劫持域答案 :: 对照域答�
   _evn "dns-probe-$1.txt" "control =control-not-hijacked.e2e.test -> $ctl"
 }
 
+# ── 仪器标定: 这台机器上, DNS 特征到底分不分得出两份产品配置 ──────────────────
+# 上一轮两支都栽在这里: 接管域与对照域拿到**同一个**答案(NOERROR|203.0.113.1), 因为
+# E2E 夹具的上游对任何域名都返回同一个地址。那种情况下 "NOERROR" 什么也不证明。
+# 所以**先标定再用**: 拿同一个查询名, 在只差一条接管表条目的两份产品配置下各问一次,
+# 两次答案必须不同; 不同才说明这台机器上的 DNS 结果确实由产品配置决定。
+# 标定过程只动一条本轮自造的域名, 做完逐字节还原接管表并核对 sha256。
+DNS_INSTRUMENT_OK=0
+_dns_apply_hijack(){   # 让 mosdns 真的重读接管表
+  systemctl reload-or-restart mosdns >/dev/null 2>&1 || systemctl restart mosdns >/dev/null 2>&1 || true
+  wait_stable mosdns >/dev/null 2>&1 || true
+}
+dns_instrument_calibrate(){
+  local hij=/etc/mosdns/rules/mitm_hijack.txt
+  local name="dns-calib-$$.e2e.test" entry a_off a_on sum0 sum1
+  [[ -f "$hij" ]] || { bad "仪器标定: 找不到接管表, 无法标定 → 停用 DNS 仪器"; return 1; }
+  entry="full:$name"
+  sum0="$(sha256sum "$hij" | awk '{print $1}')"
+  a_off="$(dns_answer "$name")"                       # 配置甲: 这个名字**不在**接管表里
+  printf '%s\n' "$entry" >> "$hij"; _dns_apply_hijack
+  a_on="$(dns_answer "$name")"                        # 配置乙: 只多了这一条
+  grep -vxF "$entry" "$hij" > "$hij.calib" 2>/dev/null && mv "$hij.calib" "$hij"
+  _dns_apply_hijack
+  sum1="$(sha256sum "$hij" | awk '{print $1}')"
+  _evn dns-calibration.txt "同一查询 $name: 不在接管表 -> $a_off ; 在接管表 -> $a_on"
+  if [[ "$sum0" != "$sum1" ]]; then
+    bad "仪器标定: 接管表没有逐字节还原($sum0 → $sum1)"; DNS_INSTRUMENT_OK=0; return 1
+  fi
+  ok "仪器标定: 接管表已逐字节还原(sha256 未变)"
+  if [[ -n "$a_off" && "$a_off" != "$a_on" ]]; then
+    DNS_INSTRUMENT_OK=1
+    ok "仪器标定: 同一查询在两份产品配置下**结果不同**($a_off vs $a_on) —— DNS 特征可作判据"
+  else
+    DNS_INSTRUMENT_OK=0
+    bad "仪器标定: 同一查询在两份产品配置下结果**相同**($a_off) —— 本环境的 DNS 结果不由产品配置决定, 停用该仪器"
+    note "  停用的含义: 后面不拿 DNS 结果当「配置已加载」的证据, 也**不**把 NOERROR 当成恢复成功。"
+  fi
+}
+
 # ═════════════════════════════════════════════════════════════════════════════
 # 四维指纹: 文件(存在性/内容/mode/uid:gid) / 运行态 / 自启态 / 已加载配置的独立依据
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1115,13 +1164,18 @@ printf '%s\n' "$STRAY_DOMAIN" >> /etc/mosdns/rules/mitm_hijack.txt
 # ② 这台机器当前的平台标记
 printf '%s\n' "$FROM" > /etc/privdns-gateway/platform
 rm -f /etc/privdns-gateway/platform.guessed
-# ③ iOS→Android 方向: mitm.json 必须是 enabled=false, 否则 migrate_android_cleanup 会
-#    **先把接管表清空**, 那条历史条目就没了, 失败点也就到不了(上一轮 ⑤b 正是栽在这里)。
-#    可达性已在 tests/test-platform-nft-injection-scope.sh 的同构现场里沿调用链验证过。
-#    Android→iOS 方向走 _plat_purge_retired, 它不碰接管表, 所以保持 enabled=true。
+# ③ iOS→Android 方向: mitm.json 置成 enabled=false。
+#    理由仍然是可达性 —— migrate_android_cleanup 只在 `"enabled": true` 时才把接管表整表
+#    截断, 截断之后那条历史条目就没了, 失败点也就到不了。
+#    **但光改盘是不够的**: 上一轮只写了文件没让服务重读, 于是前像变成"进程在内存里跑着一份
+#    盘上已经不存在的配置"(7894 还监听着, 而盘上说 WLOC 是关的)。那是个自相矛盾的现场,
+#    据它做的恢复验收不作数。这里改完配置就用**合法操作**(restart)让 pdg-mitm 真的去读它,
+#    然后**测量**结果, 不预设"一定还监听"。
 if [[ "$DIR" == i2a ]]; then
   printf '{"wloc": {"enabled": false, "locations": {"osaka": [34.7, 135.5]}}}\n' > /etc/privdns-gateway/mitm.json
 fi
+# 两个方向都走一遍: 让盘上那份配置成为**进程正在跑的**那一份。
+systemctl restart pdg-mitm >/dev/null 2>&1 || true
 # ④ 一个**本来就停着且不自启**的服务(全程不该被启动)
 systemctl disable pdg-health.timer >/dev/null 2>&1 || true
 systemctl stop    pdg-health.timer >/dev/null 2>&1 || true
@@ -1152,8 +1206,25 @@ grep -q "$STRAY_DOMAIN" /etc/mosdns/rules/mitm_hijack.txt \
   && ok "前像: 接管表里有一条非 WLOC 的历史条目($STRAY_DOMAIN)" || { bad "前像: 残留条目没写进去"; PREIMAGE_OK=0; }
 [[ -e /etc/systemd/system/pdg-mitm.service && -e /opt/pdg-bot/mitm_server.py && -e /opt/pdg-bot/mitm_wloc.py ]] \
   && ok "前像: 退役件(unit + 两个 MITM 模块)确实在盘上" || { bad "前像: 退役件不全"; PREIMAGE_OK=0; }
-[[ "$(sc_state is-active pdg-mitm)" == active ]] \
-  && ok "前像: pdg-mitm 真的在跑" || { bad "前像: pdg-mitm 没起来"; PREIMAGE_OK=0; }
+# ── 前像自洽核验: 盘上的配置与进程的实际行为必须对得上 ──────────────────────
+# 不再硬性要求"WLOC 关着而旧监听还在"。判据是**一致性**: 盘上 wloc.enabled 说什么,
+# 7894 上就该是什么。测出来是什么就记什么, 后面的恢复判据拿这个测量值作参照。
+MITM_AC_BEFORE="$(wait_stable pdg-mitm)"
+MITM_WLOC_ON="$(python3 -c 'import json,sys
+try: print("1" if json.load(open("/etc/privdns-gateway/mitm.json",encoding="utf-8")).get("wloc",{}).get("enabled") else "0")
+except Exception: print("?")' 2>/dev/null)"
+MITM_LISTEN_BEFORE="$(ss -lnt 2>/dev/null | grep -c ':7894 ')"
+note "前像: 盘上 wloc.enabled=$MITM_WLOC_ON, pdg-mitm=$MITM_AC_BEFORE, 7894 监听数=$MITM_LISTEN_BEFORE"
+case "$MITM_WLOC_ON:$([[ "$MITM_LISTEN_BEFORE" -ge 1 ]] && echo L || echo N)" in
+  1:L) ok "前像自洽: WLOC 开着, 7894 确实在监听(盘上配置就是进程正在跑的那一份)";;
+  0:N) ok "前像自洽: WLOC 关着, 7894 确实没有监听(盘上配置就是进程正在跑的那一份)";;
+  1:N) bad "前像不自洽: 盘上 WLOC 开着, 7894 却没有监听"; PREIMAGE_OK=0;;
+  0:L) bad "前像不自洽: 盘上 WLOC 关着, 7894 却还在监听 —— 进程没有读盘上那份配置"; PREIMAGE_OK=0;;
+  *)   bad "前像: 读不出 mitm.json 的 wloc.enabled"; PREIMAGE_OK=0;;
+esac
+[[ "$MITM_AC_BEFORE" == active ]] \
+  && ok "前像: pdg-mitm 处在稳定运行态(active)" \
+  || note "前像: pdg-mitm 稳定后是 $MITM_AC_BEFORE —— 这就是本方向的合法前像, 恢复判据按它比"
 : > "$RESIDUE_MANIFEST"
 residue_record /etc/systemd/system/pdg-mitm.service "v1.11.15 的 unit 模板(pdg_write_unit pdg_unit_pdg_mitm)"
 residue_record /opt/pdg-bot/mitm_server.py         "v1.11.15 源码树 deploy/bot/mitm_server.py"
@@ -1161,6 +1232,14 @@ residue_record /opt/pdg-bot/mitm_wloc.py           "v1.11.15 源码树 deploy/bo
 residue_record /opt/pdg-bot/mitm_ca.py             "v1.11.15 源码树 deploy/bot/mitm_ca.py(iOS 专属件)"
 residue_record /opt/pdg-bot/iosprofile.py          "v1.11.15 源码树 deploy/bot/iosprofile.py(iOS 专属件)"
 residue_record /opt/pdg-bot/iosstate.py            "v1.11.15 源码树 deploy/bot/iosstate.py(iOS 专属件)"
+# 这一件上一轮**漏记**了, 于是身份判据把它判成异常。追清之后: 它由本脚本自己的
+# build_preimage ios → pdg_install_runtime_modules(…, ios) 按**旧版 lib/modules.sh 的
+# PDG_IOS_MODULES** 装上, 源文件是 v1.11.15 的 deploy/ios/pdg-dot-ondemand.mobileconfig.tmpl
+# (清单里写着改名 → /opt/pdg-bot/pdg-dot.mobileconfig.tmpl)。
+# 候选的 **android** 受管清单里没有它 —— 上一轮"android 应装的 30 个文件逐字节一致"那条
+# 也通过了, 所以**不是产品异常新增**。这里补记来源与指纹, 不是给它开白名单。
+residue_record /opt/pdg-bot/pdg-dot.mobileconfig.tmpl \
+  "v1.11.15 源码树 deploy/ios/pdg-dot-ondemand.mobileconfig.tmpl → 由 build_preimage ios 按旧版 PDG_IOS_MODULES 装上(iOS 专属件)"
 residue_record /etc/mosdns/rules/mitm_hijack.txt   "旧版接管表 + 一条手工加的非 WLOC 条目"
 residue_record /etc/privdns-gateway/mitm.json      "旧版 WLOC 配置(本方向 enabled=$( [[ "$DIR" == i2a ]] && echo false || echo true ))"
 residue_record /etc/privdns-gateway/platform       "把平台标记置成 $FROM(本方向的起点)"
@@ -1188,6 +1267,8 @@ assert_candidate_identity "$FROM"
 switch_repo_to_candidate "$FROM" || PREIMAGE_OK=0
 systemctl daemon-reload
 
+# 先标定再用: DNS 特征在这台机器上分不分得出两份产品配置, 由 dns_instrument_calibrate 说了算。
+dns_instrument_calibrate
 snap_state "B-$DIR-before"
 fp_capture "B-$DIR-before"
 svc_snapshot "$E2E_TMP/svc-B-$DIR-before.tsv"
@@ -1282,21 +1363,28 @@ HT_AC_AFTER="$(sc_state is-active pdg-health.timer)"
 
 echo "── 已加载配置的**独立依据**(不靠磁盘 hash, 也不靠 InvocationID) ──"
 L7894="$(ss -lnt 2>/dev/null | grep -c ':7894 ')"
-[[ "$L7894" -ge 1 ]] && ok "⑤-3 已加载配置: pdg-mitm 恢复后**真的在 7894 上监听**(服务在按恢复出来的配置提供服务)" \
-                     || bad "⑤-3 已加载配置: 7894 没有监听(pdg-mitm 没有按恢复出来的配置跑起来)"
+# 判据是"回到前像", 不是"一定要有监听": 前像 WLOC 关着的方向本来就不该监听。
+[[ "$L7894" == "$MITM_LISTEN_BEFORE" ]] \
+  && ok "⑤-3 已加载配置: 7894 的监听数回到前像($MITM_LISTEN_BEFORE) —— 与盘上 wloc.enabled=$MITM_WLOC_ON 一致" \
+  || bad "⑤-3 已加载配置: 7894 监听数 $MITM_LISTEN_BEFORE → $L7894, 与前像不符"
 if grep -q "$STRAY_DOMAIN" /etc/mosdns/rules/mitm_hijack.txt 2>/dev/null; then
   ok "⑤-3 已加载配置: 接管表里那条历史条目也回来了(内容层面的独立特征)"
 else
   bad "⑤-3 已加载配置: 接管表里的历史条目没回来"
 fi
 B_DNS_AFTER="$(dns_feature_probe "$DIR-after")"
-[[ "$B_DNS_AFTER" == "$B_DNS_BEFORE" ]] \
-  && ok "⑤-3 已加载配置(可区分行为): 恢复后 DNS 特征与前像一致($B_DNS_AFTER)" \
-  || bad "⑤-3 已加载配置: DNS 特征变了($B_DNS_BEFORE → $B_DNS_AFTER)"
-B_HIJ_ANS="${B_DNS_AFTER%% ::*}"; B_CTL_ANS="${B_DNS_AFTER##*:: }"
-[[ -n "$B_HIJ_ANS" && "$B_HIJ_ANS" != "$B_CTL_ANS" ]] \
-  && ok "⑤-3 已加载配置(对照): 被接管的域名与对照域名结果**不同**($B_HIJ_ANS vs $B_CTL_ANS)" \
-  || bad "⑤-3 已加载配置: 接管域与对照域结果相同($B_HIJ_ANS vs $B_CTL_ANS), 证明不了配置被加载"
+if [[ "$DNS_INSTRUMENT_OK" == 1 ]]; then
+  [[ "$B_DNS_AFTER" == "$B_DNS_BEFORE" ]] \
+    && ok "⑤-3 已加载配置(可区分行为): 恢复后 DNS 特征与前像一致($B_DNS_AFTER)" \
+    || bad "⑤-3 已加载配置: DNS 特征变了($B_DNS_BEFORE → $B_DNS_AFTER)"
+  B_HIJ_ANS="${B_DNS_AFTER%% ::*}"; B_CTL_ANS="${B_DNS_AFTER##*:: }"
+  [[ -n "$B_HIJ_ANS" && "$B_HIJ_ANS" != "$B_CTL_ANS" ]] \
+    && ok "⑤-3 已加载配置(对照): 被接管的域名与对照域名结果**不同**($B_HIJ_ANS vs $B_CTL_ANS)" \
+    || bad "⑤-3 已加载配置: 接管域与对照域结果相同($B_HIJ_ANS vs $B_CTL_ANS), 证明不了配置被加载"
+else
+  note "⑤-3 已加载配置: DNS 仪器**未通过标定**, 本轮不拿它作证据(实测 $B_DNS_BEFORE → $B_DNS_AFTER, 仅留档)。"
+  note "  「配置已加载」这一维在本方向因此**未取得**证据 —— 不用 NOERROR 顶替。"
+fi
 note "⑤-3: 端口监听 / 磁盘 hash / InvocationID 只作辅助, 不单独作为「配置已加载」的证据。"
 journalctl -u mosdns -u mihomo -u pdg-mitm --since "$(date -u -d '10 min ago' +%FT%T)" --no-pager 2>/dev/null \
   | tail -120 | _ev "05-$DIR-journal.txt"

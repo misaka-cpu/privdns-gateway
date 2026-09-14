@@ -1027,6 +1027,44 @@ dns_feature_probe(){   # $1=标签 → 打印 "劫持域答案 :: 对照域答�
   _evn "dns-probe-$1.txt" "control =control-not-hijacked.e2e.test -> $ctl"
 }
 
+# ── 仪器标定: 这台机器上, DNS 特征到底分不分得出两份产品配置 ──────────────────
+# 上一轮两支都栽在这里: 接管域与对照域拿到**同一个**答案(NOERROR|203.0.113.1), 因为
+# E2E 夹具的上游对任何域名都返回同一个地址。那种情况下 "NOERROR" 什么也不证明。
+# 所以**先标定再用**: 拿同一个查询名, 在只差一条接管表条目的两份产品配置下各问一次,
+# 两次答案必须不同; 不同才说明这台机器上的 DNS 结果确实由产品配置决定。
+# 标定过程只动一条本轮自造的域名, 做完逐字节还原接管表并核对 sha256。
+DNS_INSTRUMENT_OK=0
+_dns_apply_hijack(){   # 让 mosdns 真的重读接管表
+  systemctl reload-or-restart mosdns >/dev/null 2>&1 || systemctl restart mosdns >/dev/null 2>&1 || true
+  wait_stable mosdns >/dev/null 2>&1 || true
+}
+dns_instrument_calibrate(){
+  local hij=/etc/mosdns/rules/mitm_hijack.txt
+  local name="dns-calib-$$.e2e.test" entry a_off a_on sum0 sum1
+  [[ -f "$hij" ]] || { bad "仪器标定: 找不到接管表, 无法标定 → 停用 DNS 仪器"; return 1; }
+  entry="full:$name"
+  sum0="$(sha256sum "$hij" | awk '{print $1}')"
+  a_off="$(dns_answer "$name")"                       # 配置甲: 这个名字**不在**接管表里
+  printf '%s\n' "$entry" >> "$hij"; _dns_apply_hijack
+  a_on="$(dns_answer "$name")"                        # 配置乙: 只多了这一条
+  grep -vxF "$entry" "$hij" > "$hij.calib" 2>/dev/null && mv "$hij.calib" "$hij"
+  _dns_apply_hijack
+  sum1="$(sha256sum "$hij" | awk '{print $1}')"
+  _evn dns-calibration.txt "同一查询 $name: 不在接管表 -> $a_off ; 在接管表 -> $a_on"
+  if [[ "$sum0" != "$sum1" ]]; then
+    bad "仪器标定: 接管表没有逐字节还原($sum0 → $sum1)"; DNS_INSTRUMENT_OK=0; return 1
+  fi
+  ok "仪器标定: 接管表已逐字节还原(sha256 未变)"
+  if [[ -n "$a_off" && "$a_off" != "$a_on" ]]; then
+    DNS_INSTRUMENT_OK=1
+    ok "仪器标定: 同一查询在两份产品配置下**结果不同**($a_off vs $a_on) —— DNS 特征可作判据"
+  else
+    DNS_INSTRUMENT_OK=0
+    bad "仪器标定: 同一查询在两份产品配置下结果**相同**($a_off) —— 本环境的 DNS 结果不由产品配置决定, 停用该仪器"
+    note "  停用的含义: 后面不拿 DNS 结果当「配置已加载」的证据, 也**不**把 NOERROR 当成恢复成功。"
+  fi
+}
+
 # ═════════════════════════════════════════════════════════════════════════════
 # 四维指纹: 文件(存在性/内容/mode/uid:gid) / 运行态 / 自启态 / 已加载配置的独立依据
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1138,6 +1176,8 @@ A0_PID="$(systemctl show -p MainPID --value pdg-mitm 2>/dev/null)"
 A0_UNIT="$(sha256sum /etc/systemd/system/pdg-mitm.service | awk '{print $1}')"
 A0_SCHEMA="$(python3 -c 'import json;print(json.load(open("/etc/privdns-gateway/ios-profile.json")).get("schema"))' 2>/dev/null)"
 A0_HIJ="$(sha256sum /etc/mosdns/rules/mitm_hijack.txt | awk '{print $1}')"
+# 先标定再用: DNS 特征在这台机器上分不分得出两份产品配置, 由 dns_instrument_calibrate 说了算。
+dns_instrument_calibrate
 A0_DNS="$(dns_feature_probe A0-before)"
 note "A0: 前像的 DNS 行为特征 = $A0_DNS"
 # 装候选(测试前置), 并把部署身份与历史残留**分开**核验
@@ -1170,9 +1210,14 @@ echo "── 拒绝这一刻的现场(**没有任何回滚覆盖过**) ──"
 [[ "$(sha256sum /etc/mosdns/rules/mitm_hijack.txt | awk '{print $1}')" == "$A0_HIJ" ]] \
   && ok "A0-2: 接管表逐字节未变" || bad "A0-2: 接管表被动过"
 A0_DNS_AFTER="$(dns_feature_probe A0-after)"
-[[ "$A0_DNS_AFTER" == "$A0_DNS" ]] \
-  && ok "A0-3: 已加载配置: 拒绝前后 DNS 行为特征一致($A0_DNS_AFTER) —— 解析器没有被改过" \
-  || bad "A0-3: DNS 行为变了($A0_DNS → $A0_DNS_AFTER)"
+if [[ "$DNS_INSTRUMENT_OK" == 1 ]]; then
+  [[ "$A0_DNS_AFTER" == "$A0_DNS" ]] \
+    && ok "A0-3: 已加载配置: 拒绝前后 DNS 行为特征一致($A0_DNS_AFTER) —— 解析器没有被改过" \
+    || bad "A0-3: DNS 行为变了($A0_DNS → $A0_DNS_AFTER)"
+else
+  note "A0-3: DNS 仪器未通过标定 —— 「前后一致」在一个对任何域名都同答案的环境里说明不了问题, 只留档($A0_DNS → $A0_DNS_AFTER)。"
+  note "  「解析器没有被改过」这一条改由上面的接管表逐字节比对承担。"
+fi
 ss -lnt 2>/dev/null | grep -q ':7894 ' && ok "A0-3: 7894 仍有监听" || bad "A0-3: 7894 没有监听"
 fi
 
@@ -1316,21 +1361,26 @@ else
   note "A-4: 这一轮没找到产品写的 svcstate.tsv(旧 CLI 的快照本来就没有这一份, 属预期)"
 fi
 A_DNS_AFTER="$(dns_feature_probe A-after)"
-[[ "$A_DNS_AFTER" == "$A_DNS_BEFORE" ]] \
-  && ok "A-4 已加载配置(可区分行为): 恢复后 DNS 特征与前像一致($A_DNS_AFTER)" \
-  || bad "A-4 已加载配置: DNS 特征变了($A_DNS_BEFORE → $A_DNS_AFTER)"
-A_HIJ_ANS="${A_DNS_AFTER%% ::*}"; A_CTL_ANS="${A_DNS_AFTER##*:: }"
-[[ -n "$A_HIJ_ANS" && "$A_HIJ_ANS" != "$A_CTL_ANS" ]] \
-  && ok "A-4 已加载配置(对照): 被接管的域名与对照域名结果**不同**($A_HIJ_ANS vs $A_CTL_ANS) —— 特征确实在起作用" \
-  || bad "A-4 已加载配置: 接管域与对照域结果相同($A_HIJ_ANS vs $A_CTL_ANS), 这条特征证明不了配置被加载"
+if [[ "$DNS_INSTRUMENT_OK" == 1 ]]; then
+  [[ "$A_DNS_AFTER" == "$A_DNS_BEFORE" ]] \
+    && ok "A-4 已加载配置(可区分行为): 恢复后 DNS 特征与前像一致($A_DNS_AFTER)" \
+    || bad "A-4 已加载配置: DNS 特征变了($A_DNS_BEFORE → $A_DNS_AFTER)"
+  A_HIJ_ANS="${A_DNS_AFTER%% ::*}"; A_CTL_ANS="${A_DNS_AFTER##*:: }"
+  [[ -n "$A_HIJ_ANS" && "$A_HIJ_ANS" != "$A_CTL_ANS" ]] \
+    && ok "A-4 已加载配置(对照): 被接管的域名与对照域名结果**不同**($A_HIJ_ANS vs $A_CTL_ANS) —— 特征确实在起作用" \
+    || bad "A-4 已加载配置: 接管域与对照域结果相同($A_HIJ_ANS vs $A_CTL_ANS), 这条特征证明不了配置被加载"
+else
+  note "A-4 已加载配置: DNS 仪器**未通过标定**, 本轮不拿它作证据(实测 $A_DNS_BEFORE → $A_DNS_AFTER, 仅留档)。"
+  note "  「配置已加载」这一维在场景① 因此**仍未取得**证据 —— 不用 NOERROR 顶替。"
+fi
 L53_B="$(fp_get A-before L 53)"; L53_A="$(fp_get A-after L 53)"
-[[ "$L53_B" == "$L53_A" ]] && ok "A-4 已加载配置: 53/udp 监听数与前像一致($L53_A)" || bad "A-4 已加载配置: 53 监听 $L53_B → $L53_A"
+[[ "$L53_B" == "$L53_A" ]] && ok "A-4(辅助) 53/udp 监听数与前像一致($L53_A)" || bad "A-4(辅助) 53 监听 $L53_B → $L53_A"
 if command -v dig >/dev/null 2>&1; then
   DR="$(dig +time=3 +tries=1 @127.0.0.1 example.com A 2>&1 | head -20)"
   printf '%s\n' "$DR" | _ev 03-A-dig.txt
   grep -qE 'status: (NOERROR|NXDOMAIN)' <<<"$DR" \
-    && ok "A-4 已加载配置: 本机 53 真的能应答(status=$(grep -o 'status: [A-Z]*' <<<"$DR" | head -1))" \
-    || note "A-4 已加载配置: 本机 53 未能应答(runner 出网受限时属预期, 已留证不作判据)"
+    && ok "A-4(辅助) 本机 53 真的能应答(status=$(grep -o 'status: [A-Z]*' <<<"$DR" | head -1)) —— 只说明解析器活着, **不**说明加载的是哪一份配置" \
+    || note "A-4(辅助) 本机 53 未能应答(runner 出网受限时属预期, 已留证不作判据)"
 fi
 
 echo
