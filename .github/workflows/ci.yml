@@ -6,6 +6,26 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    # 真实验收默认**关着**: push / pull_request 以及不勾这一项的手动派发, 行为与以前逐字节一致。
+    # 只有显式选 true 的那一次派发才会多跑下面三个真实验收 job。
+    inputs:
+      real_acceptance:
+        description: "真实 systemd 验收(旧 CLI 直跳被拒 + 平台切换失败善后)"
+        type: choice
+        options: ["false", "true"]
+        default: "false"
+      product_candidate:
+        description: "冻结退役候选的完整 SHA(装到被测机上的每一个受管文件只来自它)"
+        type: string
+        default: ""
+      candidate_branch:
+        description: "冻结退役候选所在的分支名(取件用; 它的 head 必须等于上面的 SHA)"
+        type: string
+        default: ""
+      product_base:
+        description: "候选与官方 main 的共同 base(用于产品面对账)"
+        type: string
+        default: "95caf26f108a7740fc6fbacb7181f775b6f41971"
 
 permissions:
   contents: read
@@ -1710,3 +1730,227 @@ jobs:
             e2e-rescue-migration-lock.sh e2e-hijack-mode-tx.sh e2e-snapshot-meta.sh
             e2e-config-transaction.sh e2e-config-transaction-recovery.sh
         run: bash tests/e2e-serial-hermetic.sh
+
+  real-retire-refusal:
+    needs: prepare-mosdns-fixture
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.real_acceptance == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    name: "真实验收①: 旧 CLI 直跳退役候选被拒, 再由原版自己回滚"
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # 旧版对象(v1.11.15)与冻结候选都要从本地取, 浅克隆拿不到。
+          fetch-depth: 0
+      - name: "取冻结候选分支, 并核对它的 head == 派发时指定的 SHA"
+        env:
+          PDG_CAND_SHA: ${{ github.event.inputs.product_candidate }}
+          PDG_CAND_BR:  ${{ github.event.inputs.candidate_branch }}
+        run: |
+          set -euo pipefail
+          test -n "$PDG_CAND_SHA" || { echo "必须显式指定冻结候选 SHA"; exit 1; }
+          test -n "$PDG_CAND_BR"  || { echo "必须显式指定候选分支名"; exit 1; }
+          git fetch --no-tags origin "+refs/heads/$PDG_CAND_BR:refs/heads/pdg-candidate"
+          git fetch --tags origin
+          got=$(git rev-parse refs/heads/pdg-candidate)
+          echo "冻结候选分支 $PDG_CAND_BR = $got"
+          echo "验收 checkout                = ${{ github.sha }}"
+          test "$got" = "$PDG_CAND_SHA" || { echo "候选分支 head 与派发时指定的 SHA 不符"; exit 1; }
+          echo "候选相对 base 的产品面改动:"
+          git diff --name-only "${{ github.event.inputs.product_base }}" "$got" \
+            -- deploy lib install.sh uninstall.sh tools | sed 's/^/  /'
+          echo "验收分支相对候选的全部改动(应只有 tests/ 与 workflow):"
+          git diff --name-only "$got" "${{ github.sha }}" | sed 's/^/  /'
+      - name: "PID 1 必须是真 systemd, systemctl 必须是真二进制(不是就判失败, 不 SKIP)"
+        run: |
+          set -euo pipefail
+          comm=$(cat /proc/1/comm); echo "PID 1 = $comm"; test "$comm" = systemd
+          w="$(command -v systemctl)"; echo "systemctl = $w"
+          test -x "$w" && { test "$w" = /usr/bin/systemctl || test "$w" = /bin/systemctl; }
+      - name: 装依赖
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            nftables dnsutils iproute2 openssl python3 git unzip psmisc procps >/dev/null
+          nft --version
+      - name: "推导 mosdns artifact 名"
+        run: echo "MOSDNS_ARTIFACT=$(bash tests/mosdns-artifact-name.sh)" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ env.MOSDNS_ARTIFACT }}
+          path: /tmp/mosdns-fixture
+      - name: "校验并安装钉定 mosdns (自算 SHA / manifest 交叉 / 自报版本 / 生产判据)"
+        run: sudo -E bash tests/install-mosdns-artifact.sh /tmp/mosdns-fixture
+      - name: "校验并安装钉定 mihomo (自算 SHA / manifest 交叉 / 自报版本 / 生产判据)"
+        run: sudo -E bash tests/install-mihomo-artifact.sh /tmp/mosdns-fixture
+      - name: "真实验收①: 旧 CLI 直跳退役候选被拒, 再由原版自己回滚"
+        env:
+          PDG_E2E_ISOLATED: "1"
+          PDG_REAL_MIGRATION_OK: "1"
+          PDG_REAL_MIG_EVID: "/tmp/real-acceptance-evidence"
+          PDG_CAND_SHA: ${{ github.event.inputs.product_candidate }}
+          PDG_CAND_BASE: ${{ github.event.inputs.product_base }}
+        run: sudo -E bash tests/e2e-real-retire-refusal.sh
+      - name: "留证: 把证据文件与 journal 打进 job 日志(成败都留)"
+        if: ${{ always() }}
+        run: |
+          set +e
+          echo "########## journal(相关 unit, 末 200 行) ##########"
+          sudo journalctl -u pdg-mitm -u mosdns -u mihomo -u pdg-bot --no-pager -n 200 2>&1 | tail -200
+          echo
+          for f in $(sudo ls -1 /tmp/real-acceptance-evidence 2>/dev/null); do
+            echo "########## EVIDENCE $f ##########"
+            sudo cat "/tmp/real-acceptance-evidence/$f"
+            echo
+          done
+
+  real-platform-fail-a2i:
+    needs: prepare-mosdns-fixture
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.real_acceptance == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    name: "真实验收⑤a: 平台切换 Android→iOS 在退役件撤除后失败的善后"
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # 旧版对象(v1.11.15)与冻结候选都要从本地取, 浅克隆拿不到。
+          fetch-depth: 0
+      - name: "取冻结候选分支, 并核对它的 head == 派发时指定的 SHA"
+        env:
+          PDG_CAND_SHA: ${{ github.event.inputs.product_candidate }}
+          PDG_CAND_BR:  ${{ github.event.inputs.candidate_branch }}
+        run: |
+          set -euo pipefail
+          test -n "$PDG_CAND_SHA" || { echo "必须显式指定冻结候选 SHA"; exit 1; }
+          test -n "$PDG_CAND_BR"  || { echo "必须显式指定候选分支名"; exit 1; }
+          git fetch --no-tags origin "+refs/heads/$PDG_CAND_BR:refs/heads/pdg-candidate"
+          git fetch --tags origin
+          got=$(git rev-parse refs/heads/pdg-candidate)
+          echo "冻结候选分支 $PDG_CAND_BR = $got"
+          echo "验收 checkout                = ${{ github.sha }}"
+          test "$got" = "$PDG_CAND_SHA" || { echo "候选分支 head 与派发时指定的 SHA 不符"; exit 1; }
+          echo "候选相对 base 的产品面改动:"
+          git diff --name-only "${{ github.event.inputs.product_base }}" "$got" \
+            -- deploy lib install.sh uninstall.sh tools | sed 's/^/  /'
+          echo "验收分支相对候选的全部改动(应只有 tests/ 与 workflow):"
+          git diff --name-only "$got" "${{ github.sha }}" | sed 's/^/  /'
+      - name: "PID 1 必须是真 systemd, systemctl 必须是真二进制(不是就判失败, 不 SKIP)"
+        run: |
+          set -euo pipefail
+          comm=$(cat /proc/1/comm); echo "PID 1 = $comm"; test "$comm" = systemd
+          w="$(command -v systemctl)"; echo "systemctl = $w"
+          test -x "$w" && { test "$w" = /usr/bin/systemctl || test "$w" = /bin/systemctl; }
+      - name: 装依赖
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            nftables dnsutils iproute2 openssl python3 git unzip psmisc procps >/dev/null
+          nft --version
+      - name: "推导 mosdns artifact 名"
+        run: echo "MOSDNS_ARTIFACT=$(bash tests/mosdns-artifact-name.sh)" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ env.MOSDNS_ARTIFACT }}
+          path: /tmp/mosdns-fixture
+      - name: "校验并安装钉定 mosdns (自算 SHA / manifest 交叉 / 自报版本 / 生产判据)"
+        run: sudo -E bash tests/install-mosdns-artifact.sh /tmp/mosdns-fixture
+      - name: "校验并安装钉定 mihomo (自算 SHA / manifest 交叉 / 自报版本 / 生产判据)"
+        run: sudo -E bash tests/install-mihomo-artifact.sh /tmp/mosdns-fixture
+      - name: "真实验收⑤a: 平台切换 Android→iOS 在退役件撤除后失败的善后"
+        env:
+          PDG_E2E_ISOLATED: "1"
+          PDG_REAL_MIGRATION_OK: "1"
+          PDG_REAL_MIG_EVID: "/tmp/real-acceptance-evidence"
+          PDG_CAND_SHA: ${{ github.event.inputs.product_candidate }}
+          PDG_CAND_BASE: ${{ github.event.inputs.product_base }}
+          PDG_PLAT_DIR: "a2i"
+        run: sudo -E bash tests/e2e-real-platform-fail.sh
+      - name: "留证: 把证据文件与 journal 打进 job 日志(成败都留)"
+        if: ${{ always() }}
+        run: |
+          set +e
+          echo "########## journal(相关 unit, 末 200 行) ##########"
+          sudo journalctl -u pdg-mitm -u mosdns -u mihomo -u pdg-bot --no-pager -n 200 2>&1 | tail -200
+          echo
+          for f in $(sudo ls -1 /tmp/real-acceptance-evidence 2>/dev/null); do
+            echo "########## EVIDENCE $f ##########"
+            sudo cat "/tmp/real-acceptance-evidence/$f"
+            echo
+          done
+
+  real-platform-fail-i2a:
+    needs: prepare-mosdns-fixture
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.real_acceptance == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    name: "真实验收⑤b: 平台切换 iOS→Android 在退役件撤除后失败的善后"
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # 旧版对象(v1.11.15)与冻结候选都要从本地取, 浅克隆拿不到。
+          fetch-depth: 0
+      - name: "取冻结候选分支, 并核对它的 head == 派发时指定的 SHA"
+        env:
+          PDG_CAND_SHA: ${{ github.event.inputs.product_candidate }}
+          PDG_CAND_BR:  ${{ github.event.inputs.candidate_branch }}
+        run: |
+          set -euo pipefail
+          test -n "$PDG_CAND_SHA" || { echo "必须显式指定冻结候选 SHA"; exit 1; }
+          test -n "$PDG_CAND_BR"  || { echo "必须显式指定候选分支名"; exit 1; }
+          git fetch --no-tags origin "+refs/heads/$PDG_CAND_BR:refs/heads/pdg-candidate"
+          git fetch --tags origin
+          got=$(git rev-parse refs/heads/pdg-candidate)
+          echo "冻结候选分支 $PDG_CAND_BR = $got"
+          echo "验收 checkout                = ${{ github.sha }}"
+          test "$got" = "$PDG_CAND_SHA" || { echo "候选分支 head 与派发时指定的 SHA 不符"; exit 1; }
+          echo "候选相对 base 的产品面改动:"
+          git diff --name-only "${{ github.event.inputs.product_base }}" "$got" \
+            -- deploy lib install.sh uninstall.sh tools | sed 's/^/  /'
+          echo "验收分支相对候选的全部改动(应只有 tests/ 与 workflow):"
+          git diff --name-only "$got" "${{ github.sha }}" | sed 's/^/  /'
+      - name: "PID 1 必须是真 systemd, systemctl 必须是真二进制(不是就判失败, 不 SKIP)"
+        run: |
+          set -euo pipefail
+          comm=$(cat /proc/1/comm); echo "PID 1 = $comm"; test "$comm" = systemd
+          w="$(command -v systemctl)"; echo "systemctl = $w"
+          test -x "$w" && { test "$w" = /usr/bin/systemctl || test "$w" = /bin/systemctl; }
+      - name: 装依赖
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            nftables dnsutils iproute2 openssl python3 git unzip psmisc procps >/dev/null
+          nft --version
+      - name: "推导 mosdns artifact 名"
+        run: echo "MOSDNS_ARTIFACT=$(bash tests/mosdns-artifact-name.sh)" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ env.MOSDNS_ARTIFACT }}
+          path: /tmp/mosdns-fixture
+      - name: "校验并安装钉定 mosdns (自算 SHA / manifest 交叉 / 自报版本 / 生产判据)"
+        run: sudo -E bash tests/install-mosdns-artifact.sh /tmp/mosdns-fixture
+      - name: "校验并安装钉定 mihomo (自算 SHA / manifest 交叉 / 自报版本 / 生产判据)"
+        run: sudo -E bash tests/install-mihomo-artifact.sh /tmp/mosdns-fixture
+      - name: "真实验收⑤b: 平台切换 iOS→Android 在退役件撤除后失败的善后"
+        env:
+          PDG_E2E_ISOLATED: "1"
+          PDG_REAL_MIGRATION_OK: "1"
+          PDG_REAL_MIG_EVID: "/tmp/real-acceptance-evidence"
+          PDG_CAND_SHA: ${{ github.event.inputs.product_candidate }}
+          PDG_CAND_BASE: ${{ github.event.inputs.product_base }}
+          PDG_PLAT_DIR: "i2a"
+        run: sudo -E bash tests/e2e-real-platform-fail.sh
+      - name: "留证: 把证据文件与 journal 打进 job 日志(成败都留)"
+        if: ${{ always() }}
+        run: |
+          set +e
+          echo "########## journal(相关 unit, 末 200 行) ##########"
+          sudo journalctl -u pdg-mitm -u mosdns -u mihomo -u pdg-bot --no-pager -n 200 2>&1 | tail -200
+          echo
+          for f in $(sudo ls -1 /tmp/real-acceptance-evidence 2>/dev/null); do
+            echo "########## EVIDENCE $f ##########"
+            sudo cat "/tmp/real-acceptance-evidence/$f"
+            echo
+          done
