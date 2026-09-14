@@ -1034,6 +1034,12 @@ jobs:
       - name: "服务前像恢复 (三态各自恢复/enabled-runtime 不提升/动作成功但状态不符也算未恢复; 两条撤销对照)"
         run: bash tests/test-svcstate-restore.sh
 
+      # 持久自启(/etc 的 wants)与运行时自启(/run 的 wants)是两套独立链接: 只调目标那一条
+      # systemctl 命令, "前像 enabled-runtime 而现状被永久 enable"与"前像 disabled 而现状是
+      # enabled-runtime"这两种都回不去。桩分别维护两套链接, 不做目标字符串赋值。
+      - name: "自启恢复的持久/运行时两层 (撤掉妨碍恢复的那一层再置目标层; 不顺带启停服务)"
+        run: bash tests/test-svcstate-enable-runtime-restore.sh
+
       - name: "桥接版边界 (只改 cmd_update/cmd_rollback; 不含任何退役动作; 旧能力出现次数不变)"
         run: bash tests/test-svcstate-bridge-scope.sh
 

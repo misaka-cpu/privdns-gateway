@@ -144,6 +144,8 @@ prodfns(){
   grep -m1 '^declare -A _PDG_WANT_EN' "$PDG"
   grep -m1 '^_PDG_SVC_MODE=' "$PDG"; grep -m1 '^_PDG_SVC_WHY=' "$PDG"; grep -m1 '^_PDG_SVC_SRC=' "$PDG"
   grep -q '^_pdg_svcstate_plan(){' "$PDG" && { _fnN "$PDG" _pdg_svcstate_plan; _fn1 "$PDG" _pdg_now_ac; _fn1 "$PDG" _pdg_now_en; }
+  # 自启恢复现在由 _pdg_set_enable_state 一处负责(持久/运行时两层要分别撤) —— 抽真身, 不补替代实现。
+  grep -q '^_pdg_set_enable_state(){' "$PDG" && _fnN "$PDG" _pdg_set_enable_state
   _fnN "$PDG" _pdg_restore_svcstate
   _fnN "$PDG" cmd_rollback
 }

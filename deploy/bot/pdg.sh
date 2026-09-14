@@ -1503,6 +1503,49 @@ _pdg_svcstate_plan(){   # $1=本次要回滚到的快照目录
 _pdg_now_ac(){ _pdg_svc_q is-active  "$1" | cut -f1; }
 _pdg_now_en(){ _pdg_svc_q is-enabled "$1" | cut -f1; }
 
+# 把 $1 的自启状态设成 $2。**只动这一个 unit**: 不碰 wants/ 目录、不用通配、不动别的 unit;
+# 这里只改自启 —— 一个 start/stop 都不发, 原本停着的服务不会被顺带启动。
+#
+# 为什么不是一句 systemctl 就完事: 持久自启与运行时自启是**两套独立的链接**
+#     持久   /etc/systemd/system/<target>.wants/<unit>
+#     运行时 /run/systemd/system/<target>.wants/<unit>
+# 在真 systemd 上实测过(用户作用域的一次性 unit, 不碰任何宿主系统服务):
+#     enable                                → enabled
+#     已经 enabled 再 enable --runtime      → 仍然 **enabled**        ← 缺口一
+#     disable(不带 --runtime)               → enabled-runtime(只撤掉持久那一层)
+#     enabled-runtime 上只 disable          → 仍然 **enabled-runtime** ← 缺口二
+#     disable --runtime                     → disabled
+# 也就是说: 只调目标那一条命令, "前像是 enabled-runtime 而现状被永久 enable 了"和
+# "前像是 disabled 而现状是 enabled-runtime"这两种都**永远回不去**。
+#
+# 所以先按真实语义撤掉**妨碍这一次恢复的那一层**, 再置目标层。撤哪一层由**当前实际状态**
+# 决定 —— 没有妨碍就一层都不撤(不做多余动作), 也不会对 static/masked 这类没有链接的
+# unit 先动手再说不支持(调用方只在三种可还原取值上调本函数)。
+#
+# 返回 0 = 每一步动作都成功; 非 0 = 有动作失败。
+# **后置状态由调用方另行核对** —— 动作成功与后置相符是两件事, 分开记。
+_pdg_set_enable_state(){   # $1=unit $2=目标(enabled|enabled-runtime|disabled)
+  local u="$1" want="$2" rc=0
+  case "$want" in
+    enabled)
+      systemctl enable "$u" >/dev/null 2>&1 || rc=$?;;
+    enabled-runtime)
+      # 妨碍项 = 持久链接。只在它确实在的时候撤, 撤的是**这一个 unit** 的那一条。
+      if [[ "$(_pdg_now_en "$u")" == enabled ]]; then
+        systemctl disable "$u" >/dev/null 2>&1 || rc=$?
+      fi
+      systemctl enable --runtime "$u" >/dev/null 2>&1 || rc=$?;;
+    disabled)
+      systemctl disable "$u" >/dev/null 2>&1 || rc=$?
+      # 妨碍项 = 运行时链接(上面那句不带 --runtime, 撤不掉 /run 里的那一条)。
+      if [[ "$(_pdg_now_en "$u")" == enabled-runtime ]]; then
+        systemctl disable --runtime "$u" >/dev/null 2>&1 || rc=$?
+      fi;;
+    *) return 2;;          # 调用方负责只传这三种可还原取值
+  esac
+  return "$rc"
+}
+
 # 回滚时的内核收敛。
 #
 # 分工: 旧核冲突那一半**原样保留**(停掉并关自启, 并核验) —— 这一版只允许一个内核在跑,
@@ -1567,11 +1610,8 @@ _pdg_restore_svcstate(){   # $1=本次快照目录
         unrestored+=("$u 自启前像无法确认(记录时查询 rc=${_PDG_WANT_URC[$u]:-?})");;
       enabled|enabled-runtime|disabled)
         rc=0
-        case "$want" in
-          enabled)         systemctl enable "$u"           >/dev/null 2>&1 || rc=$?;;
-          enabled-runtime) systemctl enable --runtime "$u" >/dev/null 2>&1 || rc=$?;;  # 不提升成永久
-          disabled)        systemctl disable "$u"          >/dev/null 2>&1 || rc=$?;;
-        esac
+        # 持久与运行时是两套链接, 只调目标那一条命令回不去 —— 详见 _pdg_set_enable_state。
+        _pdg_set_enable_state "$u" "$want" || rc=$?
         [[ "$rc" == 0 ]] || unrestored+=("$u 自启恢复动作失败(目标 $want, rc=$rc)")
         now="$(_pdg_now_en "$u")"
         [[ "$now" == "$want" ]] || unrestored+=("$u 自启后置状态不符(目标 $want, 实得 $now)");;

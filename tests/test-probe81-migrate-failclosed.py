@@ -225,10 +225,30 @@ if _ra:
     "调用点没有 `|| true` 吞掉非零(实得 %r)" % (_call.group(0).strip() if _call else None))
 (ok if _call and ("rc=1" in _call.group(0) or "return" in _call.group(0)) else bad)(
     "失败被记进返回状态(实得 %r)" % (_call.group(0).strip() if _call else None))
-upd = re.search(r"if ! bash /usr/local/bin/pdg __migrate; then.*?fi", PDGSH, re.S)
-(ok if upd and "cmd_rollback" in upd.group(0) else bad)(
-    "cmd_update 里 __migrate 失败会走回滚")
-(ok if upd and "return 1" in upd.group(0) else bad)("并且不谎报更新完成")
+# cmd_update 现在是**带服务前像句柄**地调内部迁移入口:
+#     if ! PDG_UPDATE_SVCSTATE="$snap_dir/svcstate.tsv" bash /usr/local/bin/pdg __migrate; then
+# 原来的锚点写死了 `if ! bash /usr/local/bin/pdg __migrate`, 多一个环境变量前缀就对不上了。
+# 放宽的方向**不是**"文件里哪儿有这几个词", 而是: 在 cmd_update 的**函数体内**, 找到那一行
+# 真正的 `if ! [前缀…] bash /usr/local/bin/pdg __migrate; then`(行首缩进 + `; then` 收尾,
+# 注释和字符串都满足不了), 再按缩进配对到它自己的 `fi`, 只在这个块里判失败分支。
+_upd = extract("cmd_update")
+(ok if _upd else bad)("抽到了 cmd_update(前提成立)")
+_MIGCALL = re.compile(
+    r'^(?P<ind>[ \t]*)if ! (?P<pre>(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"\n]*"|\'[^\'\n]*\'|\S+)[ \t]+)*)'
+    r'bash /usr/local/bin/pdg __migrate; then\n'
+    r'(?P<body>.*?)'
+    r'^(?P=ind)fi$', re.S | re.M)
+_upd_mig = _MIGCALL.search(_upd) if _upd else None
+(ok if _upd_mig else bad)(
+    "cmd_update 里有一处真正的内部迁移调用(按 `if ! …; then` 到同缩进 `fi` 成块)")
+(ok if _upd_mig and "PDG_UPDATE_SVCSTATE=" in _upd_mig.group("pre") else bad)(
+    "这一处调用**带着本次服务前像的句柄**(实得前缀 %r)"
+    % (_upd_mig.group("pre").strip() if _upd_mig else None))
+_upd_fail = _upd_mig.group("body") if _upd_mig else ""
+(ok if "cmd_rollback" in _upd_fail else bad)(
+    "cmd_update 里 __migrate 失败会走回滚(失败分支实得 %r)" % (_upd_fail.strip()[:90] or None))
+(ok if re.search(r"^\s*(?:.*;\s*)?return 1\s*$", _upd_fail, re.M) else bad)(
+    "并且不谎报更新完成(失败分支以 return 1 收尾)")
 
 # ═══ 10b. run_all_migrations 真的把非零传出来(行为级, 不是读源码)═════════
 print()

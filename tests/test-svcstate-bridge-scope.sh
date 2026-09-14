@@ -44,7 +44,11 @@ if [[ -n "$BASE" && -f "$BASE" ]]; then
   # 新增的顶层函数必须只有前像那一组
   newfn="$(comm -13 <(grep -oE '^[a-zA-Z_][a-zA-Z0-9_]*\(\)\{' "$BASE" | sed 's/(){$//' | sort) \
                     <(grep -oE '^[a-zA-Z_][a-zA-Z0-9_]*\(\)\{' "$PDG"  | sed 's/(){$//' | sort) | tr '\n' ' ')"
-  want="_pdg_kernel_converge _pdg_now_ac _pdg_now_en _pdg_restore_svcstate _pdg_save_svcstate _pdg_svc_known _pdg_svc_q _pdg_svcstate_plan _pdg_svcstate_units _pdg_svcstate_valid "
+  # _pdg_set_enable_state 是前像恢复那一组里的一员: 自启恢复要分别撤"持久"与"运行时"两层
+  # 链接(真 systemd 上 `enable --runtime` 撤不掉持久链接、`disable` 撤不掉运行时链接),
+  # 这段逻辑从 _pdg_restore_svcstate 里提出来单独成函数, 两条线共用同一份。
+  # 它**不**是新能力, 更不是退役相关 —— 下面第二节仍然逐条确认桥接版没有任何退役面。
+  want="_pdg_kernel_converge _pdg_now_ac _pdg_now_en _pdg_restore_svcstate _pdg_save_svcstate _pdg_set_enable_state _pdg_svc_known _pdg_svc_q _pdg_svcstate_plan _pdg_svcstate_units _pdg_svcstate_valid "
   [[ "$newfn" == "$want" ]] \
     && ok "A2: 新增函数就是前像那一组(保存/校验/解析/查询/恢复), 没有别的: $newfn" \
     || bad "A2: 新增函数超出范围: $newfn"
