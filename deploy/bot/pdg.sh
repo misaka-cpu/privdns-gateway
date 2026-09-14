@@ -4278,15 +4278,27 @@ migrate_wloc_retire(){
 _retire_report_ca(){
   local R="${1:-}" careport
   careport="$(_retire_ca_report "$R")"
+  # 分支必须**盖满**报告的取值域: 少一格就会静默, 而静默正是这条路径最糟的结果 ——
+  # 用户以为现场干净, 手机上那份信任却还在。所以末尾有一条兜底的 `*)`。
   case "$careport" in
-    *'"present"'*|*'"residue"'*|*'"damaged"'*)
+    *'"present"'*|*'"residue"'*)
       c_y "  ⚠️ 盘上仍有 WLOC 时期的 CA 材料(按保留策略未删): $R/etc/privdns-gateway/ca/"
       c_y "     请到 iPhone「设置 → 通用 → 关于本机 → 证书信任设置」取消对 PrivDNS Gateway"
       c_y "     MITM CA 的信任, 并到「VPN 与设备管理」删掉旧描述文件 —— 网关退役不会自动"
       c_y "     取消手机上已经给出的信任。确认之后可以自行删除该目录。"
       c_y "     iOS 描述文件请重新生成一份: 新版本不含根证书。";;
-    *'"unknown"'*)
-      c_y "  ⚠️ 无法确认 $R/etc/privdns-gateway/ca/ 下是否还有 CA 材料(目录不可达?), 请自行检查。";;
+    *'"damaged"'*)
+      c_y "  ⚠️ 盘上有 WLOC 时期的 CA 材料, 但那张证书**没通过校验**: $R/etc/privdns-gateway/ca/"
+      c_y "     按保留策略未删, 也不替你判断它是什么。请自行确认后再决定处置。"
+      c_y "     如果手机上还信任着 PrivDNS Gateway MITM CA, 撤信任仍然只有你自己能做:"
+      c_y "     iPhone「设置 → 通用 → 关于本机 → 证书信任设置」。";;
+    *'"absent"'*)
+      : ;;   # 确认不在: 没有要说的。这一格**必须显式写出来**, 否则会掉进下面的兜底。
+    *)
+      # unknown / 空产出 / 格式异常都落在这里。说不清就说说不清, 不许沉默。
+      c_y "  ⚠️ 无法确认 $R/etc/privdns-gateway/ca/ 下是否还有 CA 材料, 请自行检查。"
+      c_y "     如果那张根证书还在, 手机上的信任也还在 —— 撤信任只有你自己能做。"
+      c_y "     检查结论: ${careport:-<检查器没有任何产出>}";;
   esac
 }
 
@@ -4307,20 +4319,56 @@ RETIREPY
 }
 
 # 盘上 CA 材料的只读报告(JSON 一行)。读不到就回空串 —— 报告不出来不该让退役失败。
+# 只读检查器从哪儿来: **先 /opt/pdg-bot, 再 $R$REPO_DIR/deploy/bot**。
+#
+# 为什么要第二个位置: mitm_ca.py 属于 iOS 专属清单(lib/modules.sh 的 PDG_IOS_MODULES),
+# **Android 按平台契约根本不装它** —— 而"盘上还留着 WLOC 时期的 CA"恰恰最常出现在从 iOS
+# 切到 Android 的那台机器上。只看 /opt/pdg-bot 的后果不是少一行提示, 是**整段静默**:
+# import 失败被吞成空串, 上层 case 一个分支都不匹配, 连它自己那条"无法确认"都不会打。
+#
+# 第二个位置**同样带 $R 前缀** —— 原来那条"不回退到宿主 /opt"的纪律一个字没松: 测试给了
+# PDG_RETIRE_ROOT 就只在那个根里找, 永远读不到宿主那一份。
+# 它只做**只读解析**(ca_material_readonly 不写盘、不建目录、不建锁、不生成), 盘上的执行
+# 能力(签发 / MITM / 服务)一样都没有恢复 —— 这里只是找到一份能读的解析器, 不是装回去。
+_retire_ca_reader_dir(){
+  local R="${1:-}" d
+  for d in "$R/opt/pdg-bot" "$R${REPO_DIR}/deploy/bot"; do
+    [[ -f "$d/mitm_ca.py" && -f "$d/iosprofile.py" ]] && { printf '%s\n' "$d"; return 0; }
+  done
+  return 1
+}
+
+# 三态必须分得清, 而且**一态都不许落空**:
+#   ① 确认没有材料  → absent
+#   ② 材料存在      → present / residue
+#   ③ 说不清        → damaged(在, 但没通过校验) / unknown(看不见、读不出、检查器跑不了)
+# 导入失败、检查失败、空产出、格式异常一律归入 ③ 并**具名**, 绝不吞成"没有 CA"。
 _retire_ca_report(){
-  # **不回退到宿主 /opt**: 取不到就什么都不报(返回空串), 而不是去读另一台"机器"的模块。
-  # 回退的后果不是少一行提示, 是测试里读到宿主那一份 —— 结果与被改的代码无关。
-  ( cd "${1:-}/opt/pdg-bot" 2>/dev/null || exit 0
-    PDG_CA_DIR="${1:-}/etc/privdns-gateway/ca" python3 -c '
-import json, os, sys
+  local R="${1:-}" dir out
+  if ! dir="$(_retire_ca_reader_dir "$R")"; then
+    printf '{"state":"unknown","reader":null,"reason":"找不到只读检查器: %s/opt/pdg-bot 与 %s%s/deploy/bot 下都没有 mitm_ca.py + iosprofile.py"}\n' \
+      "$R" "$R" "$REPO_DIR"
+    return 0
+  fi
+  out="$( cd "$dir" 2>/dev/null && PDG_CA_DIR="$R/etc/privdns-gateway/ca" PDG_CA_READER="$dir" python3 -c '
+import json, os
+d = os.environ.get("PDG_CA_DIR")
+reader = os.environ.get("PDG_CA_READER")
 try:
     import mitm_ca
-except Exception:
-    sys.exit(0)
-d = os.environ.get("PDG_CA_DIR")
-if d:
-    mitm_ca.CA_DIR = d
-print(json.dumps(mitm_ca.ca_material_readonly(), ensure_ascii=False))' 2>/dev/null ) || true
+    if d:
+        mitm_ca.CA_DIR = d
+    r = mitm_ca.ca_material_readonly()
+except Exception as e:                      # noqa: BLE001
+    # 只带异常**类型名**, 不带正文 —— 正文里可能正是证书或私钥。
+    r = {"state": "unknown", "reason": "只读检查器无法完成检查(%s)" % type(e).__name__}
+r["reader"] = reader
+print(json.dumps(r, ensure_ascii=False))' 2>/dev/null )"
+  if [[ -z "${out//[[:space:]]/}" ]]; then
+    printf '{"state":"unknown","reader":"%s","reason":"只读检查器没有任何产出"}\n' "$dir"
+    return 0
+  fi
+  printf '%s\n' "$out"
 }
 
 # iOS 描述文件记录的 schema 1 → 2 迁移。判据与实现都在 iosstate.migrate_schema 里 ——

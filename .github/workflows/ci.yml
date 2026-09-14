@@ -1029,6 +1029,11 @@ jobs:
       - name: "WLOC 退役错误输出 (拒绝/失败/回滚不完整的标题必须真实可见; 撤销定义即转红)"
         run: bash tests/test-wloc-retire-error-reporting.sh
 
+      # PDG-WLOC-CAREPORT-02: 报告旧 CA 残留的路径只在 /opt/pdg-bot 找 mitm_ca, 而那是
+      # iOS 专属件 —— Android 上整段静默。判据是"报不报、报的是哪一态", 并自带两条反向对照。
+      - name: "WLOC 退役 · 旧 CA 残留报告 (Android 也要报; 三态各自具名; 撤销依赖或兜底即转红)"
+        run: bash tests/test-wloc-retire-ca-report.sh
+
       - name: "平台文案/门控回归 (客户端·状态 按平台/内核 + README 文案一致)"
         run: python3 tests/test-platform-copy.py
 

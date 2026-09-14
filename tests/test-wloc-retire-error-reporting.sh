@@ -75,6 +75,7 @@ run_case(){
     _fn "$src" c_g
     _fn "$src" c_y
     _fn "$src" c_r
+    grep -m1 -E '^REPO_DIR=' "$src"      # _retire_ca_reader_dir 用得到, 从产品里取免得漂移
     echo '_RETIRE_UNDO=(); _RETIRE_TMP=""'
     echo '_retire_core_has_mitm(){ return 1; }'
     case "$what" in
@@ -100,6 +101,9 @@ run_case(){
       _fn "$src" _retire_enable_supported
       # 「无事可做」那条短路仍会走到 schema 与 CA 报告两步 —— 它们也要用产品原文,
       # 少抽一个就会在正常路径上冒出别的 "command not found", 把本用例的判据搅浑。
+      # _retire_ca_report 现在先问 _retire_ca_reader_dir "检查器在哪儿" —— 少抽它,
+      # 正常路径会冒出一条与本用例无关的 command not found, 把 stderr 判据搅浑。
+      _fn "$src" _retire_ca_reader_dir
       _fn "$src" _retire_ca_report
       _fn "$src" _retire_report_ca
       _fn "$src" _retire_ios_schema

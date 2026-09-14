@@ -96,6 +96,8 @@ _retire_ios_schema(){ echo "iosschema" >> "$SC_LOG"; [[ -n "$SCHEMA_FAIL" ]] && 
 # 拿到的是**空服务名**, 屏幕上一行 "_pdg_core_svc: command not found", 而"内核这一路有没有
 # 被正确登记/还原"这件事从来没被真的验过 —— 断言数不变, 覆盖是空的。
 eval "$(grep -m1 -E '^_pdg_core_svc\(\)\{.*\}[[:space:]]*$' "$ROOT/deploy/bot/pdg.sh")"
+# REPO_DIR: _retire_ca_reader_dir 要用它找"两平台都有的那份受管源码"。从产品里取, 不写死。
+eval "$(grep -m1 -E '^REPO_DIR=' "$ROOT/deploy/bot/pdg.sh")"
 
 # 抽出被测函数与它的两个产品侧辅助。**不**抽 _retire_rerender_core / _retire_ios_schema:
 # 它们在生产里都要起 /opt/pdg-bot 下的真模块, 上面用可控旋钮替代(本支关心的是编排:
@@ -103,7 +105,7 @@ eval "$(grep -m1 -E '^_pdg_core_svc\(\)\{.*\}[[:space:]]*$' "$ROOT/deploy/bot/pd
 for _fn in _retire_svc_stopped _retire_core_has_mitm _retire_undo_push _retire_undo_run \
            _retire_track_file _retire_restore_file _retire_reload_svc _retire_track_svc \
            _retire_enable_supported _retire_restore_svc _retire_cleanup _retire_fail \
-           _retire_report_ca \
+           _retire_report_ca _retire_ca_reader_dir _retire_ca_report \
            migrate_wloc_retire _retire_disable_wloc_json _retire_ca_report; do
   eval "$(sed -n "/^$_fn(){/,/^}/p" "$ROOT/deploy/bot/pdg.sh")"
   declare -F "$_fn" >/dev/null || bad "pdg.sh 里抽不出 $_fn"
