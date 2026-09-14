@@ -62,97 +62,30 @@ import iosprofile  # noqa: E402
 import iosstate as S  # noqa: E402
 
 TMPL = str(ROOT / "deploy/ios/pdg-dot-ondemand.mobileconfig.tmpl")
-DOT, IP = "dot.example.com", "203.0.113.10"
 
+# 造"退役前那台机器"的那几个构造函数已经提取到 tests/wloc_legacy_fixture.py ——
+# shell 那边的组合用例(test-platform-schema-restore.sh)要用**同一套**构造方式, 各造各的
+# 就等于两边对"什么叫一份合法的旧记录"各有一套说法。这里只留薄薄一层转接, 行为不变。
+import wloc_legacy_fixture as F  # noqa: E402
 
-def _ca_der():
-    """一张真的自签 CA(DER)。不能用随便一串字节 —— 产物校验会拿它过 X.509 解析。"""
-    d = tmpguard.mkdtemp(prefix="pdg-schema-ca.")
-    import subprocess
-    subprocess.run(["openssl", "req", "-x509", "-newkey", "ec",
-                    "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes",
-                    "-keyout", os.path.join(d, "k.pem"), "-out", os.path.join(d, "c.pem"),
-                    "-days", "30", "-subj", "/CN=PDG Retire Test CA"],
-                   check=True, capture_output=True)
-    return iosprofile.ca_der_from_pem(open(os.path.join(d, "c.pem"), encoding="utf-8").read())
-
-
-CA_DER = _ca_der()
+DOT, IP = F.DOT, F.IP
+CA_DER = F.ca_der(str(BOT), tmpguard.mkdtemp(prefix="pdg-schema-ca."))
 
 
 def _render_legacy(ssids, der, ids):
-    """手工摆出一份**退役前**的 .mobileconfig 字节。
-
-    不能用 iosprofile.render 造带根证书的那一版 —— 它已经不接受 ca_der 了, 而那正是退役
-    做对了的证明。所以这里照着 schema 1 的产物形态自己拼: 先渲染出不含 CA 的那一份, 再把
-    根证书那一格按老格式追加回去。这也更贴近事实 —— 老机器盘上躺着的就是这样一份东西,
-    它不是当前代码的产物。
-    """
-    raw = iosprofile.render(DOT, IP, ssids, ids, TMPL)
-    if not der:
-        return raw
-    pl = plistlib.loads(raw)
-    pl["PayloadContent"].append({
-        "PayloadType": "com.apple.security.root",
-        "PayloadVersion": 1,
-        "PayloadIdentifier": iosprofile.ID_CA,
-        "PayloadUUID": ids["ca"],
-        "PayloadDisplayName": iosprofile.CA_DISPLAY,
-        "PayloadContent": der,
-        "PayloadCertificateFileName": iosprofile.CA_FILENAME,
-    })
-    return plistlib.dumps(pl)
+    return F.render_legacy(str(BOT), TMPL, ssids, der, ids)
 
 
 def legacy_meta(work, *, wloc, ssids=(), revisions=2):
-    """造一台**退役前**的机器: schema 1 的记录 + 对应产物。
-
-    刻意不用当前代码去生成 —— 当前代码已经产不出 schema 1 了。这里照着 schema 1 的契约
-    手工摆出来, 那才是老机器上真实躺着的东西。
-    """
-    meta_p = os.path.join(work, "ios-profile.json")
-    art = os.path.join(work, "art")
-    os.makedirs(art, exist_ok=True)
-    iid = "8f14e45f-ceea-4d4c-a3e6-5b0a1c2d3e4f"
-    ids = S.derive_ids(iid)
-    der = CA_DER if wloc else b""
-    recs = []
-    for rev in range(1, revisions + 1):
-        data = _render_legacy(ssids, der, ids)
-        inp = {
-            "schema": 1,
-            "dot_host": iosprofile.norm_host(DOT),
-            "server_addresses": iosprofile.norm_addrs(IP),
-            "dns_protocol": "TLS",
-            "probe_url": S.probe_url_for(IP),
-            "ondemand_core": S.ondemand_core(TMPL),
-            "ssids": iosprofile.norm_ssids(ssids),
-            "wloc_enabled": bool(wloc),
-            "wloc_ca_sha256": hashlib.sha256(der).hexdigest() if der else "",
-        }
-        recs.append({"revision": rev, "digest": S.digest_of(inp), "inputs": inp,
-                     "sha256": hashlib.sha256(data).hexdigest(),
-                     "generated_at": "2026-01-0%dT00:00:00Z" % rev, "sent_at": None})
-        if rev == revisions:
-            open(os.path.join(art, S.CUR), "wb").write(data)
-        elif rev == revisions - 1:
-            open(os.path.join(art, S.PREV), "wb").write(data)
-    meta = {"schema": 1, "instance_id": iid, "created_at": "2026-01-01T00:00:00Z",
-            "migration_pending": False,
-            "current": recs[-1],
-            "previous": recs[-2] if revisions >= 2 else None}
-    open(meta_p, "w", encoding="utf-8").write(json.dumps(meta, ensure_ascii=False, indent=2,
-                                                         sort_keys=True) + "\n")
-    return meta_p, art, meta
+    return F.legacy_meta(work, wloc=wloc, ssids=ssids, revisions=revisions,
+                         modules=str(BOT), tmpl=TMPL, der=CA_DER if wloc else b"")
 
 
-def has_ca(path):
-    try:
-        p = plistlib.loads(open(path, "rb").read())
-    except Exception:  # noqa: BLE001
-        return None
-    return any((x or {}).get("PayloadType") == "com.apple.security.root"
-               for x in (p.get("PayloadContent") or []) if isinstance(x, dict))
+def _ca_der():
+    return F.ca_der(str(BOT), tmpguard.mkdtemp(prefix="pdg-schema-ca."))
+
+
+has_ca = F.has_ca
 
 
 # ══ 0. 版本常量 ══════════════════════════════════════════════════════════════
