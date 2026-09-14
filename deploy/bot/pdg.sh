@@ -1503,6 +1503,39 @@ _pdg_svcstate_plan(){   # $1=本次要回滚到的快照目录
 _pdg_now_ac(){ _pdg_svc_q is-active  "$1" | cut -f1; }
 _pdg_now_en(){ _pdg_svc_q is-enabled "$1" | cut -f1; }
 
+# 回滚时的内核收敛。
+#
+# 分工: 旧核冲突那一半**原样保留**(停掉并关自启, 并核验) —— 这一版只允许一个内核在跑,
+# 与快照记着什么无关。目标核那一半交给前像。
+# 为什么不能直接用 _core_kernel_activate: 它是把目标核硬收敛成 "enabled + active", 那是
+# **装机/切核**的语义。回滚时照搬, 会在恢复策略生效之前先把 mihomo 永久启用并起来, 然后
+# 再被 _pdg_restore_svcstate 纠正回去 —— 中间真的跑过一段, 自启也真的被改成过 enabled。
+# 只看最终状态看不出来, 但那是一次真实的状态变更。
+#
+#   有可信前像: 这里**不碰目标核**。目标核的自启与运行态由 _pdg_restore_svcstate 一处负责
+#               (单一归属, 两处不会互相覆盖)。旧核照停照核验, unit 缺失照样当场报。
+#   没有前像  : 原样调用 _core_kernel_activate —— 历史兼容路径, 并明说这不是按前像精确恢复。
+_pdg_kernel_converge(){   # $1=目标核 $2=旧核
+  local tgt="$1" old="$2" rc=0
+  if [[ "$_PDG_SVC_MODE" != plan ]]; then
+    c_y "  内核收敛: 这份快照没有可用的服务前像 → 按**历史行为**把 $tgt 收敛成 enabled+active。"
+    c_y "            这条是历史兼容路径, **不是按前像精确恢复**。"
+    _core_kernel_activate "$tgt" "$old"
+    return
+  fi
+  c_y "  内核收敛: 按本次前像恢复 $tgt(自启=${_PDG_WANT_EN[$tgt]:-未记录} 运行=${_PDG_WANT_AC[$tgt]:-未记录});"
+  c_y "            旧核 $old 仍按「只能有一个内核」的安全前提停用并关自启。"
+  systemctl disable --now "$old" >/dev/null 2>&1 || true
+  [[ "$(systemctl is-active  "$old" 2>/dev/null)" != active  ]] || { echo "  旧核 $old 仍 active"; rc=1; }
+  [[ "$(systemctl is-enabled "$old" 2>/dev/null)" == enabled ]] && { echo "  旧核 $old 仍 enabled(重启会双起)"; rc=1; }
+  # 起不起得来由前像决定, 但"根本没有这个 unit"必须当场看出来 —— 那说明快照没把它带回来。
+  if [[ "$(systemctl show -p LoadState --value "$tgt" 2>/dev/null)" == not-found ]]; then
+    echo "  $tgt 的 unit 不存在(快照没带回来?)"; rc=1
+  fi
+  systemctl reset-failed "$tgt" >/dev/null 2>&1 || true
+  return "$rc"
+}
+
 # 恢复服务的运行态与自启态。**依赖调用方作用域里的 unrestored 数组**。
 # 纪律:
 #   · 先定策略再动手 —— 不先通用重启再纠正, 本来没在跑的**一次都不会被启动**;
@@ -1562,6 +1595,10 @@ _pdg_restore_svcstate(){   # $1=本次快照目录
         rc=0; systemctl restart "$u" >/dev/null 2>&1 || rc=$?
         [[ "$rc" == 0 ]] || unrestored+=("$u 启动动作失败(restart rc=$rc)")
         now="$(_pdg_now_ac "$u")"
+        # 起服务不是瞬时的: 头一眼没 active 就再等两拍再看(原来 _core_kernel_activate 里那句
+        # `sleep 2` 就是干这个的)。桩化测试里第一眼就 active, 不会真的睡。
+        local _try=0
+        while [[ "$now" != active && "$_try" -lt 3 ]]; do sleep 1; _try=$((_try+1)); now="$(_pdg_now_ac "$u")"; done
         if [[ "$now" != active ]]; then
           unrestored+=("$u 后置状态不符(目标 active, 实得 $now)")
         elif [[ "$u" != *.timer ]]; then
@@ -1745,6 +1782,9 @@ cmd_rollback(){
   rm -rf "$tmp"
   (( panel_sanitized == 1 )) && c_g "  已净化回滚出的面板临时态 → 关闭"
   local unrestored=()                         # 未能恢复项(内核激活/仓库Git); 非空即"未完全回滚"
+  # 恢复策略必须在**任何服务动作之前**定好 —— 内核收敛也算服务动作。
+  # 这一步只解析与校验前像(并确认它属于正在回滚的这一份快照), 不碰任何服务。
+  _pdg_svcstate_plan "$target" || true
   # daemon-reload 失败必须计入: 后面 enable/start 全建立在它之上, 吞掉它等于谎报回滚成功。
   systemctl daemon-reload || unrestored+=("daemon-reload")
   _nft_apply_main >/dev/null 2>&1 || true
@@ -1767,10 +1807,12 @@ cmd_rollback(){
   # sing-box 残留只清"项目自己装的"(见 _pdg_singbox_is_ours), 第三方的原样保留
   _pdg_drop_singbox_files "快照带回的"
   systemctl daemon-reload || unrestored+=("daemon-reload(清理后)")
-  # 激活失败必须计入 unrestored: 内核没起来就不是"已回滚", 不能只 warn 后照报成功。
-  if ! _core_kernel_activate mihomo sing-box; then
-    c_y "  mihomo 起核核验未达标, 请 pdg doctor 复查"
-    unrestored+=("内核激活(mihomo)")
+  # 收敛失败必须计入 unrestored: 内核不对就不是"已回滚", 不能只 warn 后照报成功。
+  # 用 _pdg_kernel_converge 而不是 _core_kernel_activate —— 后者是装机/切核的语义(硬收敛成
+  # enabled+active), 回滚时会在恢复策略生效之前先把内核永久启用并起来, 再被纠正回去。
+  if ! _pdg_kernel_converge mihomo sing-box; then
+    c_y "  内核收敛未达标, 请 pdg doctor 复查"
+    unrestored+=("内核收敛(mihomo/sing-box)")
   fi
   # ── 服务收敛 ──────────────────────────────────────────────────────────────
   # **先**判定前像可不可用、把策略定好, 再动服务。以前是"先一律 restart 三个服务再按前像
