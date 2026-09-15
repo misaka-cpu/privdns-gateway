@@ -101,6 +101,9 @@ trap on_exit EXIT
 # 硬门不成立是一次**有定义的**停止, 不是"执行异常": 用 bad 计一条真失败(唯一计数源),
 # 同时标记已到达停止点, 免得再叠一条"没走到收尾"。退出码仍由 on_exit → _final_verdict 给。
 _hard(){ bad "硬门不成立: $1"; REACHED_END=1; exit 1; }
+# 准备阶段的硬停。**必须**发生在创建 unit / daemon-reload / start 之前 ——
+# 这是一次有定义的停止: 计一条真失败, 保留材料, 退出码仍由 on_exit → _final_verdict 给。
+_prep_fail(){ bad "准备未完成: $1"; KEEP_MATERIAL=1; REACHED_END=1; exit 1; }
 
 # 负控专用: 在**子 shell**里跑, 它的 ok/bad 一律不影响主计数(独立计账, 不清零也不覆盖)
 NEG_OUT="$E2E_TMP/negctl.out"
@@ -122,7 +125,60 @@ ok "硬门: PID1=systemd / root / 真 systemctl / 真 dig 全部成立"
 # 不调 e2e_seed_install —— 它会 cp 整个仓库到 /opt/privdns-gateway、装 /usr/local/bin/pdg
 # 与全部 bot 模块, 对本支一件都用不上。只调 e2e_seed_mosdns(既有最小函数)。
 echo; echo "══ 一. 最小环境准备(逐项列明本轮实际生成的文件)══"
-e2e_seed_mosdns all >/dev/null 2>&1 || _hard "e2e_seed_mosdns 失败"
+# ── 前置目录: 从 e2e_seed_mosdns 的**实际读写**推导, 不照搬完整安装器 ──────────
+# 它开头就往 /etc/mosdns/rules/ 里 `: > 各规则文件`, 末尾往 /etc/privdns-gateway/profile.env
+# 写 —— 两个目录都**假定已存在**。过去是 e2e_seed_install 顺手建的(e2e-lib.sh 那句
+# `mkdir -p /opt/pdg-bot /etc/mosdns/rules /etc/privdns-gateway`), 本 job 不调那个安装器,
+# 所以这里显式补上, 而且**只补这两个** —— 不建 /opt/pdg-bot, 不 cp 仓库, 不装 bot 模块。
+# 权限沿用夹具约定: e2e-lib.sh 里就是 mkdir -p(755)。
+for _d in /etc/mosdns/rules /etc/privdns-gateway; do
+  if [[ -e "$_d" && ! -d "$_d" ]]; then _prep_fail "$_d 已存在但不是目录, 归属不明 —— 不覆盖"; fi
+  if [[ -d "$_d" && -n "$(ls -A "$_d" 2>/dev/null)" ]]; then
+    _prep_fail "$_d 已存在且非空, 归属不明 —— 本支只在一次性隔离验收环境里跑, 不覆盖现有对象"
+  fi
+  mkdir -p "$_d" || _prep_fail "建不出 $_d"
+  [[ -d "$_d" && -w "$_d" ]] || _prep_fail "$_d 建出来了却不可写"
+done
+ok "一-0: 前置目录已按夹具约定建好 —— /etc/mosdns/rules($(stat -c %a /etc/mosdns/rules)) 与 /etc/privdns-gateway($(stat -c %a /etc/privdns-gateway))"
+
+# ── 播种: 诊断留着, 但**不拿它的返回码当准备完成** ──────────────────────────
+# 上一次(run 34932738273)就是栽在这: 目录不在, 函数中途一路写失败, 而它最后一句是
+# `chmod … || true`, 于是整体返回 0, `|| _hard` 根本没触发 —— 配置压根没生成。
+SEED_LOG="$E2E_TMP/seed.log"
+e2e_seed_mosdns all > "$SEED_LOG" 2>&1; SEED_RC=$?
+note "一-1: e2e_seed_mosdns all 退出码 = $SEED_RC(**只作诊断** —— 下面按实际产物判)"
+if [[ -s "$SEED_LOG" ]]; then note "  播种输出(末 20 行):"; tail -20 "$SEED_LOG" | sed 's/^/    /'; fi
+cp "$SEED_LOG" "$EVID/00-seed-output.txt" 2>/dev/null && chmod 600 "$EVID/00-seed-output.txt"
+
+# ── 产物门: 运行真正需要的东西在不在, 在 unit / daemon-reload / start **之前**判 ──
+MC=/etc/mosdns/config.yaml
+[[ -s "$MC" ]] || _prep_fail "播种之后 $MC 不存在或为空(播种退出码=$SEED_RC —— 它返回 0 也不等于准备完成)"
+# 只管 e2e_seed_mosdns **负责渲染**的那几个。__DOT_DOMAIN__ 不归它管(由 dotwitness 那条
+# 迁移渲染), 在本夹具里留着是正常形态, mosdns 照样加载 —— 不能一律判错。
+_left="$(grep -oE '__(SERVER_IP|INTERNAL_CIDR|CERT_DIR|MOSDNS_CACHE|HIJACK_SET_FILE)__' "$MC" | sort -u | tr '\n' ' ')"
+[[ -z "${_left// /}" ]] || _prep_fail "配置里还留着播种本该渲染掉的占位符: $_left"
+for _t in 'tag: force_hijack' 'tag: internal_sequence' 'tag: udp_server' 'tag: local_upstream'; do
+  grep -q "$_t" "$MC" || _prep_fail "配置形态不成立: 缺 $_t"
+done
+ok "一-2: config.yaml 非空、播种负责的占位符全部渲染、关键插件齐(force_hijack / internal_sequence / udp_server / local_upstream)"
+# 配置**实际引用**的规则与集合文件必须存在。按夹具契约它们**允许为空** ——
+# 空文件是"该功能休眠"的正常形态, 不能因为空就判错。
+_miss=""; _n=0
+while read -r _p; do
+  [[ -n "$_p" ]] || continue
+  _n=$((_n+1)); [[ -e "$_p" ]] || _miss="$_miss $_p"
+done < <(grep -vE '^[[:space:]]*#' "$MC" \
+         | grep -oE '/etc/mosdns/rules/[A-Za-z0-9_.!@+-]+\.txt|/var/lib/privdns-gateway/adblock/[A-Za-z0-9_]+\.txt' \
+         | sort -u)
+[[ "$_n" -gt 0 ]] || _prep_fail "从配置里一个规则文件路径都没解析到 —— 产物门等于没判"
+[[ -z "$_miss" ]] || _prep_fail "配置引用的规则/集合文件缺失:$_miss"
+ok "一-3: 配置实际引用的 $_n 个规则/集合文件全部就位(按契约允许为空, 没因为空判错)"
+[[ -s /etc/privdns-gateway/profile.env ]] || _prep_fail "profile.env 缺失或为空"
+[[ -s /etc/mosdns/certs/fullchain.pem && -s /etc/mosdns/certs/privkey.pem ]] || _prep_fail "DoT 证书或私钥不全"
+[[ "$(stat -c %a /etc/mosdns/certs/privkey.pem)" == 600 ]] \
+  || _prep_fail "私钥权限是 $(stat -c %a /etc/mosdns/certs/privkey.pem), 约定是 600"
+ok "一-4: profile.env 与 DoT 证书/私钥就位, 私钥权限 600(符合夹具约定)"
+
 SEEDED=(/etc/mosdns/config.yaml /etc/privdns-gateway/profile.env
         /etc/mosdns/certs/fullchain.pem /etc/mosdns/certs/privkey.pem)
 for f in /etc/mosdns/rules/*.txt; do SEEDED+=("$f"); done
@@ -154,11 +210,13 @@ ok "二-0: $LISTEN_IP:$LISTEN_PORT 实读为空闲(runner 上的 systemd-resolve
 # 只把监听从 0.0.0.0 收窄到**查询端用的同一个地址** —— dns_probe 问的就是 @127.0.0.1,
 # 不另写一条"容易通过"的查询路径, 也不改被测的 DNS 函数。
 sed -i "s|listen: \"0.0.0.0:53\"|listen: \"$LISTEN_IP:$LISTEN_PORT\"|g; s|listen: \"0.0.0.0:853\"|listen: \"$LISTEN_IP:$DOT_PORT\"|g" /etc/mosdns/config.yaml
+# 监听改不成功同样要在建 unit / daemon-reload / start **之前**停 —— 不带着一份没改成的
+# 配置去起服务, 那只会把真因埋到 journal 里。
 grep -q "listen: \"$LISTEN_IP:$LISTEN_PORT\"" /etc/mosdns/config.yaml \
   && ok "二-1: 配置里的监听已收窄到 $LISTEN_IP:$LISTEN_PORT(与 dns_probe 的查询端一致)" \
-  || bad "二-1: 监听没改成功"
+  || _prep_fail "监听没改成 $LISTEN_IP:$LISTEN_PORT"
 grep -c 'listen: "0.0.0.0' /etc/mosdns/config.yaml | grep -qx 0 \
-  && ok "二-2: 配置里不再有 0.0.0.0 监听" || bad "二-2: 还有 0.0.0.0 监听"
+  && ok "二-2: 配置里不再有 0.0.0.0 监听" || _prep_fail "配置里还有 0.0.0.0 监听"
 
 # ── 自建 unit: 登记归属之后再起 ─────────────────────────────────────────────
 OWN_UNIT=mosdns.service; OWN_UNIT_PATH=/etc/systemd/system/mosdns.service
