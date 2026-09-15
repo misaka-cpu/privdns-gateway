@@ -35,7 +35,7 @@ REACHED_END=0
 
 # ── 收尾: 结果要进最终判定, 不能"先打印全通过, 再由 EXIT trap 静默失败" ──────
 _cleanup(){
-  local rc=0 st
+  local rc=0 st _urc
   # ① 自建服务: 停 + 复核 + 撤 unit。只动本轮登记的那一个, 不按名字宽杀。
   if [[ -n "$OWN_UNIT" ]]; then
     systemctl stop "$OWN_UNIT" >/dev/null 2>&1
@@ -56,9 +56,13 @@ _cleanup(){
   if [[ -n "$DNS_STUB_PID" ]]; then
     kill "$DNS_STUB_PID" 2>/dev/null; wait "$DNS_STUB_PID" 2>/dev/null
     kill -0 "$DNS_STUB_PID" 2>/dev/null && { echo "[FAIL] 收尾: 自有上游 PID $DNS_STUB_PID 还活着"; rc=1; }
-    if ss -lnu 2>/dev/null | grep -q "127.0.0.1:${DNS_UP_PORT:-15301}"; then
-      echo "[FAIL] 收尾: 自有上游的监听 127.0.0.1:${DNS_UP_PORT:-15301} 没放掉"; rc=1
-    fi
+    # 同一套口径: 地址与端口精确, 查询出错**不算**已释放。
+    sock_conflict udp 127.0.0.1 "${DNS_UP_PORT:-15301}"; _urc=$?
+    case "$_urc" in
+      0) echo "[FAIL] 收尾: 自有上游的监听 127.0.0.1:${DNS_UP_PORT:-15301} 没放掉 —— $SOCK_WHY"; rc=1;;
+      1) : ;;
+      *) echo "[FAIL] 收尾: 无法确认自有上游的监听是否释放 —— $SOCK_WHY"; rc=1;;
+    esac
   fi
   # ③ 临时物: **只有正常完成才删**; 恢复没确认就留着
   if (( KEEP_MATERIAL )); then
@@ -104,6 +108,71 @@ _hard(){ bad "硬门不成立: $1"; REACHED_END=1; exit 1; }
 # 准备阶段的硬停。**必须**发生在创建 unit / daemon-reload / start 之前 ——
 # 这是一次有定义的停止: 计一条真失败, 保留材料, 退出码仍由 on_exit → _final_verdict 给。
 _prep_fail(){ bad "准备未完成: $1"; KEEP_MATERIAL=1; REACHED_END=1; exit 1; }
+
+# ── 统一的 socket 观测口径(三态)────────────────────────────────────────────
+# 上一次(run 34936173665)栽在这: 两处都写 `ss -lnup | awk '$5==地址'`, 而
+# **只 UDP(不带 -t)时 ss 不打印 Netid 列** —— 本地地址是 $4, $5 是对端 0.0.0.0:*,
+# 于是归属检查永远匹配不到; 同一个错列还让"端口空闲"检查**永远查不出占用**(假绿)。
+# 所以不是把 $5 换成 $4 就完事 —— 固定一套选项, 并用**实际输出**校准字段:
+#   `-H`         不打表头; `-l -n` 只看监听、不解析名字;
+#   `-t -u` 一起 ⇒ Netid 恒为 $1、本地地址恒为 $5(单协议时列会少一个, 就是上次的坑);
+#   `-p`         带进程; `sport = :<端口>` 用 ss **自带的过滤**, 端口精确匹配
+#                (实测 `sport = :1535` 不会命中 :15353, 相近端口前缀不误报)。
+# 三态分开: 0=查到相关监听 / 1=查询成功但没有 / 2=查询失败或字段对不上。
+# 第三种**绝不**当成"空闲""已释放""归属成立"。原始输出/stderr/退出码一并留作诊断。
+SOCK_ROWS=""; SOCK_WHY=""; SOCK_RAW=""; SOCK_ERR=""; SOCK_HIT_PIDS=""
+sock_query(){   # $1=端口 → 0 有行 / 1 无行 / 2 查询或解析不可靠
+  local port="$1" raw errf rc line n a
+  SOCK_ROWS=""; SOCK_WHY=""; SOCK_RAW=""; SOCK_ERR=""
+  errf="$(mktemp "${TMPDIR:-/tmp}/sockq.XXXXXX")"
+  raw="$(ss -H -l -n -t -u -p "sport = :$port" 2>"$errf")"; rc=$?
+  SOCK_RAW="$raw"; SOCK_ERR="$(head -3 "$errf" | tr '\n' ' ')"; rm -f "$errf"
+  if [[ "$rc" != 0 ]]; then
+    SOCK_WHY="ss 退出码 $rc: ${SOCK_ERR:-（无 stderr）}; 原始输出: ${SOCK_RAW:-（空）}"; return 2
+  fi
+  [[ -n "$raw" ]] || return 1
+  while IFS= read -r line; do
+    [[ -n "${line// /}" ]] || continue
+    n="$(awk '{print $1}' <<<"$line")"; a="$(awk '{print $5}' <<<"$line")"
+    case "$n" in tcp|udp) ;; *) SOCK_WHY="字段口径对不上(第 1 列不是 tcp/udp): $line"; return 2;; esac
+    [[ "$a" == *:"$port" ]] || { SOCK_WHY="字段口径对不上(第 5 列不像 :$port 的本地地址): $line"; return 2; }
+    SOCK_ROWS+="$n	$a	$(grep -o 'pid=[0-9]*' <<<"$line" | sed 's/pid=//' | tr '\n' ',')
+"
+  done <<<"$raw"
+  return 0
+}
+# 某 endpoint 上有没有**会冲突**的监听。冲突 = 同一地址, 或会覆盖它的通配绑定。
+# 127.0.0.53 / 127.0.0.54 上的现有解析器与它不冲突, 不算占用; 端口必须精确相等。
+sock_conflict(){   # $1=tcp|udp $2=地址 $3=端口 → 0 冲突 / 1 不冲突 / 2 查不清
+  local n a pids ip pt hit=""
+  SOCK_HIT_PIDS=""
+  sock_query "$3"; local q=$?
+  [[ "$q" == 2 ]] && return 2
+  [[ "$q" == 1 ]] && return 1
+  while IFS=$'\t' read -r n a pids; do
+    [[ -n "$n" ]] || continue
+    [[ "$n" == "$1" ]] || continue
+    ip="${a%:*}"; pt="${a##*:}"
+    [[ "$pt" == "$3" ]] || continue
+    case "$ip" in
+      "$2"|'0.0.0.0'|'*'|'[::]'|'::') hit="$hit $a"; SOCK_HIT_PIDS="$SOCK_HIT_PIDS,${pids%,},";;
+    esac
+  done <<<"$SOCK_ROWS"
+  [[ -n "$hit" ]] || return 1
+  SOCK_WHY="$1 $2:$3 上有冲突监听:$hit (pid:${SOCK_HIT_PIDS})"
+  return 0
+}
+# 归属: 目标 endpoint 上的监听是不是**本轮服务**的。PID 用带边界的比法 ——
+# 裸 `pid=123` 子串会把 pid=1234 认成同一个进程。
+sock_owned_by(){   # $1=tcp|udp $2=地址 $3=端口 $4=期望 PID → 0 是 / 1 不是 / 2 查不清
+  sock_conflict "$1" "$2" "$3"; local c=$?
+  [[ "$c" == 2 ]] && return 2
+  [[ "$c" == 1 ]] && { SOCK_WHY="$1 $2:$3 上没有监听"; return 1; }
+  [[ -n "$4" && "$4" != 0 ]] || { SOCK_WHY="没有可用的 MainPID"; return 1; }
+  [[ "$SOCK_HIT_PIDS" == *",$4,"* ]] && return 0
+  SOCK_WHY="$1 $2:$3 上的监听不属于 PID $4(实得 pid:${SOCK_HIT_PIDS})"
+  return 1
+}
 
 # 监听残留检查, **三态**。上一次(run 34934021143)就是栽在这条上:
 # 原来写 `grep -c … | grep -qx 0`, 而 grep 在**零匹配**时退出码是 1, 脚本开头的
@@ -223,12 +292,24 @@ LISTEN_IP=127.0.0.1; LISTEN_PORT=53; DOT_PORT=8853
 note "启动前实读 :53 / :$DOT_PORT 的占用情况:"
 ss -lntup 2>/dev/null | awk 'NR==1 || /:53 |:53$|:8853 /' | sed 's/^/    /' | tee -a "$EVID/01-ports-before.txt"
 chmod 600 "$EVID/01-ports-before.txt" 2>/dev/null || true
-OCC="$(ss -lnup 2>/dev/null | awk -v a="$LISTEN_IP:$LISTEN_PORT" '$5==a{print}')"
-if [[ -n "$OCC" ]]; then
-  bad "二-0: $LISTEN_IP:$LISTEN_PORT 已被占用, 本轮不抢也不杀占用者: $OCC"
-  KEEP_MATERIAL=1; REACHED_END=1; exit 1
-fi
-ok "二-0: $LISTEN_IP:$LISTEN_PORT 实读为空闲(runner 上的 systemd-resolved 在 127.0.0.53, 不动它)"
+# 逐个核**本轮实际要用的三个 endpoint**。只观察 —— 不停、不覆盖、不杀占用者;
+# 冲突或查不清都在建 unit / daemon-reload / start **之前**拒绝。
+for _ep in "udp $LISTEN_IP $LISTEN_PORT" "tcp $LISTEN_IP $LISTEN_PORT" "tcp $LISTEN_IP $DOT_PORT"; do
+  # shellcheck disable=SC2086
+  set -- $_ep
+  sock_conflict "$1" "$2" "$3"; _sc=$?
+  case "$_sc" in
+    0) bad "二-0($1 $2:$3): 已被占用 —— $SOCK_WHY(只观察, 不停也不杀)"
+       KEEP_MATERIAL=1; REACHED_END=1; exit 1;;
+    1) ok "二-0($1 $2:$3): 查询成功且没有会冲突的监听";;
+    *) bad "二-0($1 $2:$3): **无法可靠观测** —— $SOCK_WHY(不把查不清当成空闲)"
+       KEEP_MATERIAL=1; REACHED_END=1; exit 1;;
+  esac
+done
+# 现有解析器在 127.0.0.53/54 上, 与 127.0.0.1 不冲突 —— 看见了, 但一个字都不动它。
+sock_query "$LISTEN_PORT" >/dev/null 2>&1 || true
+note "二-0(旁证): :$LISTEN_PORT 上现有的监听如下, 本轮只观察不动:"
+printf '%s\n' "${SOCK_ROWS:-（无）}" | sed 's/^/    /'
 # 只把监听从 0.0.0.0 收窄到**查询端用的同一个地址** —— dns_probe 问的就是 @127.0.0.1,
 # 不另写一条"容易通过"的查询路径, 也不改被测的 DNS 函数。
 sed -i "s|listen: \"0.0.0.0:53\"|listen: \"$LISTEN_IP:$LISTEN_PORT\"|g; s|listen: \"0.0.0.0:853\"|listen: \"$LISTEN_IP:$DOT_PORT\"|g" /etc/mosdns/config.yaml
@@ -282,8 +363,11 @@ dns_ready(){   # $1=期望能答出预期答案的域名 $2=期望答案(空=只
       if [[ -z "$inv0" ]]; then inv0="$inv"; nr0="$nr1"
       elif [[ "$inv" == "$inv0" && "$nr1" == "$nr0" ]]; then
         # 观察窗内没有实例更替、没有 NRestarts 增长 → 再看监听归属与真实行为
-        local owner; owner="$(ss -lnup 2>/dev/null | awk -v a="$LISTEN_IP:$LISTEN_PORT" '$5==a{print}')"
-        if grep -q "pid=$pid" <<<"$owner"; then
+        # 监听归属只是**必要条件**: 下面还要真实 DNS 查询有效且答案符合预期。
+        sock_owned_by udp "$LISTEN_IP" "$LISTEN_PORT" "$pid"; local _own=$?
+        if [[ "$_own" == 2 ]]; then
+          DNS_READY_WHY="无法可靠观测监听 —— $SOCK_WHY(不当成归属成立)"
+        elif [[ "$_own" == 0 ]]; then
           local p; p="$(dns_probe "$1")"
           if dns_probe_ok "$p"; then
             if [[ -z "${2:-}" || "$(dns_answer_of "$p")" == "$2" ]]; then
@@ -293,7 +377,7 @@ dns_ready(){   # $1=期望能答出预期答案的域名 $2=期望答案(空=只
           fi
           DNS_READY_WHY="服务看着正常(pid=$pid)且监听归属本轮, 但 DNS 还没就绪: $p"
         else
-          DNS_READY_WHY="$LISTEN_IP:$LISTEN_PORT 上的监听不属于本轮服务(MainPID=$pid; 实读: ${owner:-无})"
+          DNS_READY_WHY="$SOCK_WHY"
         fi
       else
         DNS_READY_WHY="观察窗内实例更替或重启计数增长(inv $inv0→$inv, NRestarts $nr0→$nr1)"

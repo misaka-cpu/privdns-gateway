@@ -43,14 +43,27 @@ mount --bind "$FAKE/var/lib" /var/lib || { echo "[未执行] 绑定 /var/lib 失
   || { echo "[未执行] /var/lib 隔离自检没过"; exit 1; }
 
 P=0; F=0
-ok(){ printf '[OK]   %s\n' "$1"; P=$((P+1)); }
-bad(){ printf '[FAIL] %s\n' "$1"; F=$((F+1)); }
+# 断言台账: 每条断言除了打印, 再往 $ALOG 记一行。末尾拿 P+F 与台账行数对账 ——
+# "打印了 [OK]/[FAIL] 却没进总数"这种计数漏洞, 只有对账查得出来(本轮就查出了一处)。
+ALOG=""
+ok(){ printf '[OK]   %s\n' "$1"; P=$((P+1)); printf 'OK\t%s\n' "$1" >> "${ALOG:-/dev/null}"; }
+bad(){ printf '[FAIL] %s\n' "$1"; F=$((F+1)); printf 'FAIL\t%s\n' "$1" >> "${ALOG:-/dev/null}"; }
 note(){ printf '[NOTE] %s\n' "$1"; }
+# 跑"被测脚本自己也会调 ok/bad"的那几段时, 用这一对把计数与台账一起冻住再回滚,
+# 免得被测方的断言混进本支的数。**必须在本支自己的判据之前** _release, 否则连自己的
+# 失败都会被一起抹掉(6b/6c 原来就是这么丢的)。
+_HP=0; _HF=0; _HA=0
+_hold(){ _HP="$P"; _HF="$F"; _HA="$(awk 'END{print NR}' "$ALOG" 2>/dev/null)"; _HA="${_HA:-0}"; }
+_release(){ P="$_HP"; F="$_HF"
+  local t; t="$(mktemp "${TMPDIR:-/tmp}/alog.XXXXXX")"
+  head -n "$_HA" "$ALOG" > "$t" 2>/dev/null; mv "$t" "$ALOG"
+}
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC="${PDG_ACCEPT_SH:-$HERE/e2e-real-platform-fail.sh}"
 [[ -f "$SRC" ]] || { echo "[未执行] 找不到 $SRC"; exit 1; }
 WORK="$(mktemp -d)"; EVID="$WORK/evid"; mkdir -p "$EVID"
+ALOG="$WORK/assert.log"; : > "$ALOG"
 E2E_TMP="$WORK"; E2E_ROOT="$(cd "$HERE/.." && pwd)"; E2E_SIP=203.0.113.1
 export E2E_TMP E2E_ROOT E2E_SIP
 HIJ=/etc/mosdns/rules/mitm_hijack.txt
@@ -136,17 +149,17 @@ RC=0
 # 被测函数自己也调 ok/bad/note —— 跑它时换成写文件, 否则它的计数会混进本支的计数。
 run_calib(){
   DNS_INSTRUMENT_OK=0; DNS_CALIB_WHY=""; DNS_RESTORE_DISK=0; DNS_RESTORE_RUN=0
-  local _P="$P" _F="$F"; : > "$WORK/out"
+  _hold; : > "$WORK/out"
   ok(){ printf '  [被测] OK   %s\n' "$1" >> "$WORK/out"; }
   bad(){ printf '  [被测] FAIL %s\n' "$1" >> "$WORK/out"; }
   note(){ printf '  [被测] NOTE %s\n' "$1" >> "$WORK/out"; }
   dns_instrument_calibrate >>"$WORK/out" 2>&1; RC=$?
   printf 'WHY=%s DISK=%s RUN=%s\n' "${DNS_CALIB_WHY:-（空）}" "$DNS_RESTORE_DISK" "$DNS_RESTORE_RUN" >> "$WORK/out"
   unset -f ok bad note
-  ok(){ printf '[OK]   %s\n' "$1"; P=$((P+1)); }
-  bad(){ printf '[FAIL] %s\n' "$1"; F=$((F+1)); }
+  ok(){ printf '[OK]   %s\n' "$1"; P=$((P+1)); printf 'OK\t%s\n' "$1" >> "${ALOG:-/dev/null}"; }
+  bad(){ printf '[FAIL] %s\n' "$1"; F=$((F+1)); printf 'FAIL\t%s\n' "$1" >> "${ALOG:-/dev/null}"; }
   note(){ printf '[NOTE] %s\n' "$1"; }
-  P="$_P"; F="$_F"
+  _release
 }
 
 echo "══ 1. 两份有效配置精确走出 U/H → 标定成功 ══"
@@ -197,21 +210,21 @@ echo; echo "══ 6. 正式取证无效时不能因为文本相等判恢复通�
 seed
 BEFORE="$(printf 'INVALID\t观测不满足成功契约(见证=9\tNO-STATUS\tNO-ANSWER\ttimed out ; 对照=9\tNO-STATUS\tNO-ANSWER\ttimed out)')"
 AFTER="$BEFORE"
-_P="$P"; _F="$F"; dns_verdict "6" "$BEFORE" "$AFTER" > "$WORK/v.out" 2>&1
-P="$_P"; F="$_F"
+_hold; dns_verdict "6" "$BEFORE" "$AFTER" > "$WORK/v.out" 2>&1
+_release
 grep -q '前像或恢复后的观测\*\*无效\*\*' "$WORK/v.out" \
   && ok "6a: 前后两份**无效**观测即使逐字相等也判红, 且理由就是'观测无效'" \
   || { bad "6a: 没有以'观测无效'为由判红"; sed 's/^/      /' "$WORK/v.out"; }
-_P="$P"; _F="$F"
+_hold
 dns_verdict "6" "$(printf 'VALID\t%s\t%s' "$DNS_H" "$DNS_U")" "$(printf 'VALID\t%s\t%s' "$DNS_H" "$DNS_U")" > "$WORK/v2.out" 2>&1
+_release
 grep -q '见证与对照都回到前像' "$WORK/v2.out" && grep -q '差异确实来自接管规则' "$WORK/v2.out" \
-  && ok "6b: 两份**有效**且等于预期 U/H 时才判通过" || { bad "6b"; cat "$WORK/v2.out" | sed 's/^/      /'; }
-P="$_P"; F="$_F"
-_P="$P"; _F="$F"
+  && ok "6b: 两份**有效**且等于预期 U/H 时才判通过" || { bad "6b"; sed 's/^/      /' "$WORK/v2.out"; }
+_hold
 dns_verdict "6" "$(printf 'VALID\t%s\t%s' "$DNS_U" "$DNS_U")" "$(printf 'VALID\t%s\t%s' "$DNS_U" "$DNS_U")" > "$WORK/v3.out" 2>&1
+_release
 grep -q '不符合预先固定的 U/H' "$WORK/v3.out" \
-  && ok "6c: 前后一致但见证不等于 H(两边都是 U)也判红 —— 不是'两个非空串相等就行'" || { bad "6c"; cat "$WORK/v3.out" | sed 's/^/      /'; }
-P="$_P"; F="$_F"
+  && ok "6c: 前后一致但见证不等于 H(两边都是 U)也判红 —— 不是'两个非空串相等就行'" || { bad "6c"; sed 's/^/      /' "$WORK/v3.out"; }
 
 PIN="${PDG_PINPOINT_SH:-$HERE/e2e-dns-instrument-systemd.sh}"
 echo; echo "══ 7. 定点脚本的最小环境准备链(真播种函数; 自有根, 不写宿主 /etc 与 /var/lib)══"
@@ -439,6 +452,163 @@ printf '%s|%s\n' \"\$rc\" \"\${_LISTEN_WHY:-}\""
   [[ "$same" == 1 ]] && ok "8f: 无关注释对照 —— 三个用例结果逐一相同, 零新增失败" || bad "8f: 加一行注释竟然改变了结果"
 fi
 
+
+echo; echo "══ 9. socket 观测口径: 用**真 socket** 在自有私有网络命名空间里标定 ══"
+# 上一次 run 34936173665 栽在 `ss -lnup | awk '$5==…'` —— 只 UDP 时没有 Netid 列, 本地地址是 $4。
+# 这一节不造 ss 文本, 而是在**自有 netns** 里真的 bind/listen, 看观测口径认不认得出来。
+# netns 是私有的: 不占开发宿主的 53, 不改宿主 DNS / 服务 / 路由 / nft。
+SOCKRUN="$WORK/sockcal-runner.sh"
+cat > "$SOCKRUN" <<'SOCKRUNEOF'
+#!/usr/bin/env bash
+# 在**自有私有网络命名空间**里用真 socket 标定 socket 观测口径。
+# 由 test-dns-calibration-contract.sh 通过 unshare 调起; 打印 KEY=value 供上层判定。
+set -uo pipefail
+PIN="$1"; FAKE2="$2"; REPO="$3"; OUT="$4"
+ip link set lo up 2>/dev/null
+# 自有根: /etc /var/lib /etc/systemd/system, 免得脚本那一段写到宿主
+mount --bind "$FAKE2/etc" /etc 2>/dev/null
+mount --bind "$FAKE2/var/lib" /var/lib 2>/dev/null
+# systemctl 记账桩
+mount --bind "$FAKE2/systemctl" /usr/bin/systemctl 2>/dev/null
+: > "$FAKE2/calls"
+_fn(){ awk -v f="$2" 'index($0,f"(){")==1{p=1} p{print} p&&/^}$/{exit}' "$1"; }
+eval "$(_fn "$PIN" sock_query)"; eval "$(_fn "$PIN" sock_conflict)"; eval "$(_fn "$PIN" sock_owned_by)"
+SOCK_ROWS=""; SOCK_WHY=""; SOCK_RAW=""; SOCK_ERR=""; SOCK_HIT_PIDS=""
+say(){ printf '%s\n' "$1" >> "$OUT"; }
+
+hold(){   # $1=proto(u|t) $2=addr $3=port → 打印 pid
+  python3 -c "
+import socket,sys,time
+p,a,port=sys.argv[1],sys.argv[2],int(sys.argv[3])
+s=socket.socket(socket.AF_INET, socket.SOCK_DGRAM if p=='u' else socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,0)
+s.bind((a,port))
+if p=='t': s.listen(1)
+time.sleep(120)" "$1" "$2" "$3" >/dev/null 2>&1 & 
+  local bg=$!; sleep 0.6; echo "$bg"   # 只回 bash 的后台 PID; python 的 stdout 已丢弃
+}
+q(){ sock_conflict "$1" "$2" "$3"; echo $?; }
+drop(){ [[ -n "${1:-}" ]] || return 0; kill "$1" 2>/dev/null; sleep 0.2; kill -9 "$1" 2>/dev/null; wait "$1" 2>/dev/null; return 0; }
+
+# 1. 空闲
+say "C1=$(q udp 127.0.0.1 53)"
+# 2. 自有进程占住 UDP/53
+P_U53="$(hold u 127.0.0.1 53)"; say "C2=$(q udp 127.0.0.1 53)"; say "C2_PID=$P_U53"
+# 6. 归属: 真实 socket 属于预期 PID / 属于另一进程
+sock_owned_by udp 127.0.0.1 53 "$P_U53"; say "C6_self=$?"
+sock_owned_by udp 127.0.0.1 53 999999;   say "C6_other=$?"
+drop "$P_U53"; sleep 0.4
+# 8. 占用者退出并回收后再观测
+say "C8=$(q udp 127.0.0.1 53)"
+# 3. TCP/53 与 TCP/8853
+P_T53="$(hold t 127.0.0.1 53)";   say "C3_tcp53=$(q tcp 127.0.0.1 53)"
+say "C3_udp53_while_tcp=$(q udp 127.0.0.1 53)"
+drop "$P_T53"; sleep 0.3
+P_T88="$(hold t 127.0.0.1 8853)"; say "C3_tcp8853=$(q tcp 127.0.0.1 8853)"
+drop "$P_T88"; sleep 0.3
+# 4. 通配绑定被识别; 不冲突的回环地址与不同端口不误报
+P_W="$(hold u 0.0.0.0 53)";       say "C4_wild=$(q udp 127.0.0.1 53)"
+drop "$P_W"; sleep 0.3
+ip addr add 127.0.0.53/8 dev lo 2>/dev/null
+P_O="$(hold u 127.0.0.53 53)";    say "C4_otheraddr=$(q udp 127.0.0.1 53)"
+drop "$P_O"; sleep 0.3
+P_P="$(hold u 127.0.0.1 5353)";   say "C4_otherport=$(q udp 127.0.0.1 53)"
+drop "$P_P"; sleep 0.3
+# 7. ss 查询失败 → 第三态
+mkdir -p "$FAKE2/binshim"; printf '#!/bin/sh\necho "boom" >&2\nexit 2\n' > "$FAKE2/binshim/ss"; chmod +x "$FAKE2/binshim/ss"
+say "C7=$(PATH="$FAKE2/binshim:$PATH" q udp 127.0.0.1 53)"
+# 5. 被拒之后: 没有 unit / daemon-reload / start; 占用者仍存活且未被改变
+P_K="$(hold u 127.0.0.1 53)"
+rm -rf /etc/mosdns /etc/privdns-gateway /var/lib/privdns-gateway /etc/systemd/system/mosdns.service
+: > "$FAKE2/calls"
+E2E_ROOT="$REPO" PDG_REAL_MIG_EVID="$FAKE2/evid" timeout 180 bash "$PIN" > "$FAKE2/run.out" 2>&1
+say "C5_rc=$?"
+say "C5_unit=$([[ -e /etc/systemd/system/mosdns.service ]] && echo yes || echo no)"
+say "C5_reload=$(grep -c '^daemon-reload' "$FAKE2/calls" 2>/dev/null || echo 0)"
+say "C5_start=$(grep -c '^start ' "$FAKE2/calls" 2>/dev/null || echo 0)"
+say "C5_holder_alive=$(kill -0 "$P_K" 2>/dev/null && echo yes || echo no)"
+say "C5_rejected=$(grep -c '已被占用' "$FAKE2/run.out" 2>/dev/null || echo 0)"
+drop "$P_K"
+SOCKRUNEOF
+chmod +x "$SOCKRUN"
+F2="$WORK/fake2"; mkdir -p "$F2/etc/mosdns/rules" "$F2/etc/privdns-gateway" "$F2/etc/systemd/system" "$F2/var/lib" "$F2/evid"
+cp -a /etc/alternatives "$F2/etc/" 2>/dev/null; cp -a /etc/ssl "$F2/etc/" 2>/dev/null
+for _f in passwd group nsswitch.conf localtime hosts resolv.conf; do cp -a "/etc/$_f" "$F2/etc/" 2>/dev/null; done
+printf '#!/bin/sh\necho "$@" >> %s/calls\ncase $1 in is-active) echo inactive;; is-enabled) echo disabled;; show) echo "";; esac\nexit 0\n' "$F2" > "$F2/systemctl"
+chmod +x "$F2/systemctl"
+SOUT="$WORK/sockcal.out"; : > "$SOUT"
+if unshare --map-root-user --net --mount --propagation private \
+     bash "$SOCKRUN" "$PIN" "$F2" "$(cd "$HERE/.." && pwd)" "$SOUT" >"$WORK/sockcal.log" 2>&1; then
+  ok "9-0: 自有私有网络命名空间建起来了, 标定跑完(宿主 :53 一个字没动)"
+else
+  bad "9-0: 标定跑不起来"; tail -8 "$WORK/sockcal.log" | sed 's/^/      /'
+fi
+gv(){ grep -m1 "^$1=" "$SOUT" 2>/dev/null | cut -d= -f2-; }
+[[ "$(gv C1)" == 1 ]] && ok "9a: 没有占用时正确放行(rc=1 = 查询成功且没有)" || bad "9a: 实得 $(gv C1)"
+[[ "$(gv C2)" == 0 ]] && ok "9b: 自有进程占住 UDP/53 → 判为占用(rc=0)" || bad "9b: 实得 $(gv C2)"
+{ [[ "$(gv C3_tcp53)" == 0 ]] && [[ "$(gv C3_tcp8853)" == 0 ]]; } \
+  && ok "9c: 分别占住 TCP/53 与 TCP/8853 → 都判为占用" || bad "9c: 实得 tcp53=$(gv C3_tcp53) tcp8853=$(gv C3_tcp8853)"
+[[ "$(gv C3_udp53_while_tcp)" == 1 ]] \
+  && ok "9c2: 只占 TCP/53 时, UDP/53 仍判为空闲(协议分得清)" || bad "9c2: 实得 $(gv C3_udp53_while_tcp)"
+[[ "$(gv C4_wild)" == 0 ]] && ok "9d: 通配绑定 0.0.0.0:53 被识别为冲突" || bad "9d: 实得 $(gv C4_wild)"
+[[ "$(gv C4_otheraddr)" == 1 ]] && ok "9d2: 127.0.0.53:53 与 127.0.0.1 不冲突, 不误报" || bad "9d2: 实得 $(gv C4_otheraddr)"
+[[ "$(gv C4_otherport)" == 1 ]] && ok "9d3: 127.0.0.1:5353 与 :53 不同端口, 不误报" || bad "9d3: 实得 $(gv C4_otherport)"
+[[ "$(gv C6_self)" == 0 ]] && ok "9f: 真实 socket 属于预期 PID 时能识别(rc=0)" || bad "9f: 实得 $(gv C6_self)"
+[[ "$(gv C6_other)" == 1 ]] && ok "9f2: 属于另一个 PID 时不冒充本轮服务(rc=1)" || bad "9f2: 实得 $(gv C6_other)"
+[[ "$(gv C7)" == 2 ]] && ok "9g: ss 查询失败 → 第三态(rc=2), **没有**报空闲或释放完成" || bad "9g: 实得 $(gv C7)"
+[[ "$(gv C8)" == 1 ]] && ok "9h: 自有占用者退出并回收后, 重新观测确实为空" || bad "9h: 实得 $(gv C8)"
+{ [[ "$(gv C5_rc)" != 0 ]] && [[ "$(gv C5_rejected)" != 0 ]]; } \
+  && ok "9e: 目标端口被占时定点脚本当场拒绝(rc=$(gv C5_rc))" || bad "9e: rc=$(gv C5_rc) 拒绝行数=$(gv C5_rejected)"
+[[ "$(gv C5_unit)" == no ]] && ok "9e2: 被拒后没有本轮 unit" || bad "9e2: unit 竟然建了"
+{ [[ "$(gv C5_reload)" == 0 ]] && [[ "$(gv C5_start)" == 0 ]]; } \
+  && ok "9e3: 被拒后没有 daemon-reload / start" || bad "9e3: reload=$(gv C5_reload) start=$(gv C5_start)"
+[[ "$(gv C5_holder_alive)" == yes ]] && ok "9e4: 占用者仍存活且未被改变(只观察, 没停没杀)" || bad "9e4: 占用者没了"
+note "9: 这一节的 systemctl 是**模型**记录器; 它证明脚本没去动服务, 不代表真 systemd 就绪已通过。"
+
+# ── 撤销对照 ─────────────────────────────────────────────────────────────
+# N1: 撤销正确字段解析 —— 改回只 UDP(去掉 -t); 取第 5 列的写法不变, 但少了 Netid 那列后第 5 列就成了对端地址
+sed 's|ss -H -l -n -t -u -p "sport = :$port"|ss -H -l -n -u -p "sport = :$port"|' "$PIN" > "$WORK/pin-n1.sh"
+: > "$WORK/sockcal-n1.out"
+unshare --map-root-user --net --mount --propagation private \
+  bash "$SOCKRUN" "$WORK/pin-n1.sh" "$F2" "$(cd "$HERE/.." && pwd)" "$WORK/sockcal-n1.out" >/dev/null 2>&1
+gv1(){ grep -m1 "^$1=" "$WORK/sockcal-n1.out" 2>/dev/null | cut -d= -f2-; }
+{ [[ "$(gv1 C2)" != 0 ]] || [[ "$(gv1 C6_self)" != 0 ]]; } \
+  && ok "N1: 撤销正确字段解析 → 重现'有占用却放行'/'实际监听识别不到'(C2=$(gv1 C2) C6_self=$(gv1 C6_self))" \
+  || bad "N1: 没重现出来(C2=$(gv1 C2) C6_self=$(gv1 C6_self))"
+# N2: 撤销错误传播 —— 把 ss 非零当成"没有匹配"
+python3 - "$PIN" "$WORK/pin-n2.sh" <<'PYN2'
+import sys
+src,dst=sys.argv[1],sys.argv[2]
+s=open(src,encoding="utf-8").read()
+a='  if [[ "$rc" != 0 ]]; then\n'
+i=s.index(a); j=s.index("  fi\n", i)+len("  fi\n")
+open(dst,"w",encoding="utf-8").write(s[:i]+'  if [[ "$rc" != 0 ]]; then return 1; fi\n'+s[j:])
+PYN2
+: > "$WORK/sockcal-n2.out"
+unshare --map-root-user --net --mount --propagation private \
+  bash "$SOCKRUN" "$WORK/pin-n2.sh" "$F2" "$(cd "$HERE/.." && pwd)" "$WORK/sockcal-n2.out" >/dev/null 2>&1
+[[ "$(grep -m1 '^C7=' "$WORK/sockcal-n2.out" | cut -d= -f2-)" != 2 ]] \
+  && ok "N2: 撤销错误传播 → 查询失败那格转红(不再是第三态)" || bad "N2: 没转红"
+# N3: 无关注释对照
+sed '0,/^SOCK_ROWS=""/s//# 本行仅为无关注释对照\nSOCK_ROWS=""/' "$PIN" > "$WORK/pin-n3.sh"
+: > "$WORK/sockcal-n3.out"
+unshare --map-root-user --net --mount --propagation private \
+  bash "$SOCKRUN" "$WORK/pin-n3.sh" "$F2" "$(cd "$HERE/.." && pwd)" "$WORK/sockcal-n3.out" >/dev/null 2>&1
+same=1
+for k in C1 C2 C3_tcp53 C4_wild C6_self C7 C8; do
+  [[ "$(grep -m1 "^$k=" "$SOUT" | cut -d= -f2-)" == "$(grep -m1 "^$k=" "$WORK/sockcal-n3.out" | cut -d= -f2-)" ]] || same=0
+done
+[[ "$same" == 1 ]] && ok "N3: 无关注释对照 —— 七个用例结果逐一相同, 零新增失败" || bad "N3: 加一行注释改变了结果"
+
+
+# ── 计数对账: 打印出来的断言条数必须等于进了总数的条数 ──────────────────────
+A_ALL="$(awk 'END{print NR}' "$ALOG" 2>/dev/null)"; A_ALL="${A_ALL:-0}"
+if [[ "$((P+F))" == "$A_ALL" ]]; then
+  ok "计数对账: 打印 $A_ALL 条断言, 全部进了总数"
+else
+  bad "计数对账: 打印 $A_ALL 条断言, 只有 $((P+F)) 条进了总数 —— 有断言没计数"
+  awk -F'\t' 'NR>0{print "      未对上的台账行: " $0}' "$ALOG" | tail -5
+fi
 
 echo "──────────────────────────────────────────────"
 echo "通过 $P, 失败 $F"
