@@ -27,6 +27,9 @@ _evn(){ printf '%s\n' "$2" >> "$EVID/$1"; chmod 600 "$EVID/$1" 2>/dev/null || tr
 # ── 归属登记: 只对**本轮登记过**的资源动手 ──────────────────────────────────
 OWN_UNIT=""          # 本轮自建的 unit 名(建出来才登记)
 OWN_UNIT_PATH=""
+BUDGET_UNIT=""       # 只给**本轮自建的 mosdns unit** 记启动帐(第八节会临时借用 OWN_UNIT)
+SELF_STARTS=0        # 脚本**主动**发起的 start/restart 次数 —— 与 NRestarts 是两回事
+START_LOG=""         # 每一次主动启动记一行, 末尾与预算对账
 OWN_TMP="$E2E_TMP"   # 本轮自建的临时目录
 DNS_STUB_PID=""      # 由 dns_fix_conditions 起的自有上游(它自己登记到这个变量)
 KEEP_MATERIAL=0      # 恢复无法确认 ⇒ 保留材料, 不删临时目录
@@ -200,6 +203,22 @@ _listen_wildcard_check(){   # $1=配置文件 → 0 放行 / 1 有违规 / 2 检
 NEG_OUT="$E2E_TMP/negctl.out"
 negctl(){ ( "$@" ) > "$NEG_OUT" 2>&1; return 0; }
 
+# ── 主动启动预算(本轮脚本自己会发起多少次 start/restart)────────────────────
+# 上一次(run 34941133783)栽在这: 六-2 那次 restart 撞上 systemd 的**启动频率限制**
+# (系统默认 StartLimitIntervalSec=10s / StartLimitBurst=5 —— 本机实测确认), journal 里是
+#   "Start request repeated too quickly" → "Failed with result 'start-limit-hit'"。
+# 按实际执行路径把同一个 mosdns unit 的主动启动逐条列清(正常路径 7 次):
+#   1 初次启动(建完 unit)                       2 固定 DNS 实验条件(dns_fix_conditions → _dns_reload)
+#   3 标定配置甲(_dns_reload)                   4 标定配置乙(_dns_reload)
+#   5 还原配置甲(_dns_calib_restore → _dns_reload)
+#   6 正式前后像取证之间的 restart               7 第七节停服务负控之后的恢复启动
+# 另有**有界**的失败收尾: 标定失败时 _calib_fail 会再做一次 _dns_calib_restore,
+# 最多多出 1 次 _dns_reload(它之后立即 return, 不反复重试) ⇒ 最坏 7+1=8。
+# 预算就取这个数, 不凭空加"保险次数"; 第九节拿实际计数与它对账。
+START_PLAN=7             # 正常路径的主动启动次数(逐条列在上面)
+START_BUDGET=8           # = 7 + 1 次有界的失败恢复启动
+START_WINDOW_SEC=300     # 频率窗口: 仍然有限, 但要盖住整段脚本
+                         # (run 34941133783 实测首末两次启动相距 24s: 07:20:08 → 07:20:32)
 # ── 硬门 ────────────────────────────────────────────────────────────────────
 [[ "$(cat /proc/1/comm)" == systemd ]] || _hard "PID 1 不是 systemd"
 [[ "$(id -u)" == 0 ]] || _hard "要 root(要起 unit、改 /etc)"
@@ -211,6 +230,23 @@ case "$GOT_VER" in "$WANT_VER"*) ok "硬门: mosdns 是钉死的那一版($GOT_V
 command -v dig >/dev/null 2>&1 || _hard "没有 dig"
 [[ -f "$ACC" ]] || _hard "找不到 $ACC"
 ok "硬门: PID1=systemd / root / 真 systemctl / 真 dig 全部成立"
+
+# 透明计数包装(**必须放在硬门之后**: 硬门用 `command -v systemctl` 验真二进制,
+#  先定义同名函数会让它只看到函数名, 白白判失败): 动作一律交给**真** systemctl 二进制执行, 这里只记账, 不改任何行为。
+# 被抽出来的 _dns_reload 直接写 `systemctl restart mosdns`, 只有包一层才数得到它。
+systemctl(){
+  local v="${1:-}" u="${2:-}"
+  case "$v" in
+    start|restart|try-restart|reload-or-restart|condrestart)
+      if [[ -n "$BUDGET_UNIT" && "${u%.service}" == "${BUDGET_UNIT%.service}" ]]; then
+        SELF_STARTS=$((SELF_STARTS+1))
+        [[ -n "$START_LOG" ]] && printf '%2d  %-14s %s  %s\n' \
+          "$SELF_STARTS" "$v" "$u" "$(date -u +%H:%M:%S.%3N)" >> "$START_LOG"
+      fi;;
+  esac
+  command systemctl "$@"
+}
+
 
 # ── 最小环境: **只**准备 mosdns 要的东西 ────────────────────────────────────
 # 不调 e2e_seed_install —— 它会 cp 整个仓库到 /opt/privdns-gateway、装 /usr/local/bin/pdg
@@ -338,15 +374,62 @@ grep -q 'preset: "0.0.0.0"' /etc/mosdns/config.yaml \
 # ── 自建 unit: 登记归属之后再起 ─────────────────────────────────────────────
 OWN_UNIT=mosdns.service; OWN_UNIT_PATH=/etc/systemd/system/mosdns.service
 [[ -e "$OWN_UNIT_PATH" ]] && { bad "二-3: $OWN_UNIT_PATH 本来就存在, 归属不明 —— 停止, 不覆盖现有对象"; OWN_UNIT=""; OWN_UNIT_PATH=""; KEEP_MATERIAL=1; REACHED_END=1; exit 1; }
-cat > "$OWN_UNIT_PATH" <<'EOF'
+# 配额**只**写在本轮这一个自建 unit 里: 不动 system.conf、不动宿主全局默认值、
+# 不动任何生产 unit, 也不用 reset-failed 去清额度。窗口与 Burst 都是有限值 ——
+# 这是为了容纳**测试自身**密集的主动重启, 不是在验证生产默认的频率限制。
+# StartLimitIntervalSec/StartLimitBurst 属于 [Unit] 段: 本机实测把它们写进 [Service],
+# Interval 会**静默退回 10s**(Burst 却生效) —— 所以下面一定要读实际生效值, 不能只看文件。
+cat > "$OWN_UNIT_PATH" <<EOF
 [Unit]
 Description=mosdns (DNS instrument pinpoint, this run only)
+StartLimitIntervalSec=$START_WINDOW_SEC
+StartLimitBurst=$START_BUDGET
 [Service]
 ExecStart=/usr/local/bin/mosdns start -d /etc/mosdns
 Restart=no
 EOF
 ok "二-3: 自建 unit $OWN_UNIT_PATH 已登记归属(Restart=no —— 崩溃就是崩溃, 不靠重启循环遮掩)"
+BUDGET_UNIT="$OWN_UNIT"; START_LOG="$EVID/02-unit-starts.txt"; : > "$START_LOG"; chmod 600 "$START_LOG" 2>/dev/null || true
 systemctl daemon-reload
+# ── 首次启动**之前**: 读这个 unit 实际生效的属性; 没生效或不是有限预算就停 ──────
+_dur2s(){   # systemd 打出来的人类可读时长 → 秒。只认它真会打出来的那几种写法。
+  local in="$1" tot=0 t n un seen=0
+  [[ -n "$in" ]] || { echo ""; return 1; }
+  case "$in" in infinity|0) echo "$in"; return 0;; esac
+  for t in $in; do
+    n="${t%%[a-z]*}"; un="${t#"$n"}"
+    [[ "$n" =~ ^[0-9]+$ ]] || { echo ""; return 1; }
+    case "$un" in
+      h)    tot=$((tot+n*3600));;
+      min)  tot=$((tot+n*60));;
+      s|"") tot=$((tot+n));;
+      ms)   tot=$((tot+n/1000));;
+      us)   tot=$((tot+n/1000000));;
+      *)    echo ""; return 1;;
+    esac
+    seen=1
+  done
+  (( seen )) || { echo ""; return 1; }
+  echo "$tot"
+}
+EFF_RESTART="$(command systemctl show -p Restart --value "$OWN_UNIT" 2>/dev/null)"
+EFF_INT="$(command systemctl show -p StartLimitIntervalUSec --value "$OWN_UNIT" 2>/dev/null)"
+EFF_BURST="$(command systemctl show -p StartLimitBurst --value "$OWN_UNIT" 2>/dev/null)"
+EFF_INT_S="$(_dur2s "$EFF_INT")"
+_evn 02-unit-starts.txt "自建 unit 实际生效属性: Restart=$EFF_RESTART StartLimitIntervalUSec=$EFF_INT(=${EFF_INT_S}s) StartLimitBurst=$EFF_BURST"
+[[ "$EFF_RESTART" == no ]] \
+  || _prep_fail "自建 unit 的 Restart 实际生效值是 '$EFF_RESTART'(要 no) —— 不靠自动重启遮掩崩溃"
+case "$EFF_INT_S" in
+  ""|infinity|0) _prep_fail "启动频率窗口实际生效值是 '$EFF_INT' —— 0/infinity/读不懂都不接受, 频率限制必须仍然开着";;
+esac
+[[ "$EFF_INT_S" == "$START_WINDOW_SEC" ]] \
+  || _prep_fail "启动频率窗口没按写的生效: 实得 $EFF_INT(=${EFF_INT_S}s), 要 ${START_WINDOW_SEC}s(写错段会静默退回默认 10s)"
+[[ "$EFF_BURST" =~ ^[1-9][0-9]*$ ]] \
+  || _prep_fail "启动配额 Burst 实际生效值是 '$EFF_BURST' —— 必须是有限的正整数(0 等于把限制关掉)"
+[[ "$EFF_BURST" == "$START_BUDGET" ]] \
+  || _prep_fail "启动配额没按写的生效: 实得 $EFF_BURST, 要 $START_BUDGET"
+ok "二-3b: 本轮自建 unit 的启动配额**实际生效**且仍有限 —— 窗口 $EFF_INT(=${EFF_INT_S}s), Burst=$EFF_BURST, Restart=$EFF_RESTART(读的是生效属性, 不是 unit 文件文本)"
+note "二-3b 说明: 这是**测试环境差异** —— 系统默认 10s/5, 本轮为容纳脚本自身 $START_PLAN 次主动启动才放宽到有限的 ${START_WINDOW_SEC}s/$START_BUDGET; 不能据此说真实升级节奏已验证。"
 systemctl start "$OWN_UNIT" >/dev/null 2>&1
 
 # ── 稳定就绪: 状态 + 实例 + 监听归属 + 真实 DNS 行为, 四样一起判 ────────────
@@ -485,5 +568,38 @@ if dns_ready "$DNS_WITNESS" "$DNS_H"; then
 else
   bad "八-3: 健康对照没过 —— $DNS_READY_WHY"
 fi
+
+# 三种量必须分开说: ①脚本**主动**发起的启动 ②systemd **自动**重启(NRestarts)
+# ③频率**预算**(Burst)。NRestarts=0 只说明没有自动重启, 证明不了①有没有发生。
+# 判词单独成函数, 契约测试可以抽出来用各种数值直接驱动。
+_start_budget_verdict(){   # $1=主动启动 $2=计划 $3=预算 $4=NRestarts → 每行 "OK|文案" 或 "BAD|文案"; 有 BAD 则返回 1
+  local rc=0
+  if [[ "$1" -le "$3" ]]; then
+    echo "OK|九-1: 脚本主动启动 $1 次 ≤ 预算 $3(计划 $2 + 1 次有界失败恢复), 没超支"
+  else
+    echo "BAD|九-1: 主动启动 $1 次, 超过预算 $3 —— 预算与执行路径必有一个说不通"; rc=1
+  fi
+  if [[ "$1" -ge "$2" ]]; then
+    echo "OK|九-2: 计划里的 $2 次主动启动确实都发生了(实得 $1) —— 没靠少跑一段省配额"
+  else
+    echo "BAD|九-2: 只发生了 $1 次主动启动, 少于计划的 $2 —— 有一段没真跑"; rc=1
+  fi
+  if [[ "$4" == 0 ]]; then
+    echo "OK|九-3: systemd **自动**重启 NRestarts=0(Restart=no) —— 与上面 $1 次**主动**启动是两回事, 它证明不了后者"
+  else
+    echo "BAD|九-3: NRestarts=$4 —— 本轮不该有自动重启(它与主动启动分开计, 不能互相顶替)"; rc=1
+  fi
+  return $rc
+}
+
+echo; echo "══ 九. 启动预算对账(脚本主动启动 / systemd 自动重启 / 频率预算, 三种量分开)══"
+_NR_END="$(command systemctl show -p NRestarts --value "$OWN_UNIT" 2>/dev/null)"
+note "本轮对 $BUDGET_UNIT 的主动启动记录(逐条):"
+sed 's/^/    /' "$START_LOG" 2>/dev/null || true
+while IFS='|' read -r _v _t; do
+  [[ -n "${_t:-}" ]] || continue
+  case "$_v" in OK) ok "$_t";; *) bad "$_t";; esac
+done < <(_start_budget_verdict "$SELF_STARTS" "$START_PLAN" "$START_BUDGET" "${_NR_END:-读不到}")
+_evn 02-unit-starts.txt "对账: 主动启动=$SELF_STARTS 计划=$START_PLAN 预算(Burst)=$START_BUDGET 自动重启 NRestarts=$_NR_END"
 
 REACHED_END=1

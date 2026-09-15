@@ -238,10 +238,35 @@ else
   # systemctl 桩: **绑到 /usr/bin/systemctl 上** —— 定点脚本的硬门要求它就在那个路径,
   # 放到 PATH 前面会被硬门判掉。桩把每一次调用记下来, 用来验"被拒之后没有 daemon-reload/start"。
   SCLOG="$WORK/systemctl.calls"; : > "$SCLOG"
+  # 桩要会答 `show -p <属性> --value`: 定点脚本在**首次启动之前**要读自建 unit
+  # 实际生效的 Restart / StartLimitIntervalUSec / StartLimitBurst。这里按真 systemd 的
+  # 语义建模(本机 systemd 252 实测): StartLimitIntervalSec **只有写在 [Unit] 段才生效**,
+  # 写进 [Service] 会静默退回默认 10s; 而 StartLimitBurst 在两段里都认。不设时 10s/5。
   cat > "$WORK/systemctl" <<EOS
 #!/bin/sh
 echo "\$@" >> "$SCLOG"
-case "\$1" in is-active) echo inactive;; is-enabled) echo disabled;; show) echo "";; esac
+_u=/etc/systemd/system/mosdns.service
+_val(){ [ -f "\$_u" ] || return 0; awk -v sec="\$1" -v key="\$2" -F= '
+  /^\\[/{s=\$0} s=="["sec"]" && \$1==key{v=\$2} END{if(v!="")print v}' "\$_u"; }
+_human(){ n="\$1"
+  case "\$n" in infinity|0) echo "\$n"; return;; esac
+  if [ "\$n" -lt 60 ] 2>/dev/null; then echo "\${n}s"
+  elif [ \$((n % 60)) -eq 0 ]; then echo "\$((n / 60))min"
+  else echo "\$((n / 60))min \$((n % 60))s"; fi; }
+case "\$1" in
+  is-active) echo inactive;;
+  is-enabled) echo disabled;;
+  show)
+    _p=""; _prev=""
+    for _a in "\$@"; do [ "\$_prev" = "-p" ] && _p="\$_a"; _prev="\$_a"; done
+    case "\$_p" in
+      Restart)                 v="\$(_val Service Restart)"; echo "\${v:-no}";;
+      StartLimitIntervalUSec)  v="\$(_val Unit StartLimitIntervalSec)"; v="\${v%s}"; _human "\${v:-10}";;
+      StartLimitBurst)         v="\$(_val Unit StartLimitBurst)"; [ -z "\$v" ] && v="\$(_val Service StartLimitBurst)"; echo "\${v:-5}";;
+      NRestarts)               echo 0;;
+      *)                       echo "";;
+    esac;;
+esac
 exit 0
 EOS
   chmod +x "$WORK/systemctl"
@@ -599,6 +624,166 @@ for k in C1 C2 C3_tcp53 C4_wild C6_self C7 C8; do
   [[ "$(grep -m1 "^$k=" "$SOUT" | cut -d= -f2-)" == "$(grep -m1 "^$k=" "$WORK/sockcal-n3.out" | cut -d= -f2-)" ]] || same=0
 done
 [[ "$same" == 1 ]] && ok "N3: 无关注释对照 —— 七个用例结果逐一相同, 零新增失败" || bad "N3: 加一行注释改变了结果"
+
+
+echo; echo "══ 10. 主动启动预算 与 systemd 启动频率限制(只给自建 unit 的有限配额)══"
+if ! declare -F run_prep >/dev/null; then
+  bad "10-0: 第 7 节没建起准备链(run_prep 不在), 这一节无从谈起"
+else
+# 上一次 run 34941133783 的唯一失败: 第六节那次 restart 撞上默认 10s/5 的启动频率限制,
+# journal 里是 "Start request repeated too quickly" / "start-limit-hit"。
+# 这一节验的是修法本身: 配额只落在本轮自建 unit 上、仍然有限、**实际生效**才放行,
+# 以及"脚本主动启动 / systemd 自动重启 / 频率预算"这三种量没有互相顶替。
+# ⚠️ 本节的 systemctl 仍是第 7 节那个**桩**(按本机 systemd 252 实测语义建模);
+#    真 systemd 上的那一半只能由定点派发回答, 两类证据分列。
+UNITTXT="$(awk '/^cat > "\$OWN_UNIT_PATH" <<EOF$/{f=1;next} f&&/^EOF$/{exit} f' "$PIN")"
+_k(){ grep -m1 "^$1=" "$PIN" | sed 's/[^=]*=//; s/ *#.*//'; }
+SP="$(_k START_PLAN)"; SB="$(_k START_BUDGET)"; SW="$(_k START_WINDOW_SEC)"
+[[ -n "$UNITTXT" ]] && ok "10-0: 抽到了自建 unit 的原文与预算常量(计划=$SP 预算=$SB 窗口=${SW}s)" \
+  || bad "10-0: 抽不到 unit 原文"
+
+# 10a 配额写在 [Unit] 段 —— 本机实测: 写进 [Service], Interval 会静默退回 10s
+_u_line="$(grep -n '^\[Unit\]'    <<<"$UNITTXT" | cut -d: -f1)"
+_s_line="$(grep -n '^\[Service\]' <<<"$UNITTXT" | cut -d: -f1)"
+_i_line="$(grep -n '^StartLimitIntervalSec=' <<<"$UNITTXT" | cut -d: -f1)"
+_b_line="$(grep -n '^StartLimitBurst='       <<<"$UNITTXT" | cut -d: -f1)"
+{ [[ -n "$_i_line" && -n "$_b_line" && "$_i_line" -gt "$_u_line" && "$_i_line" -lt "$_s_line" \
+     && "$_b_line" -gt "$_u_line" && "$_b_line" -lt "$_s_line" ]]; } \
+  && ok "10a: 两条配额都写在 [Unit] 段(不是 [Service] —— 那样 Interval 会静默退回默认)" \
+  || bad "10a: 配额行的位置不对(Unit 在第 $_u_line 行, Service 在第 $_s_line 行, Interval 第 ${_i_line:-无}, Burst 第 ${_b_line:-无})"
+grep -q '^Restart=no$' <<<"$UNITTXT" && ok "10b: Restart=no 仍在(没有为了绕限额改成自动重启)" || bad "10b: Restart 不是 no"
+
+# 10c 数值: 有限、正、由计划推导(预算 = 计划 + 1 次有界失败恢复), 不是随手加的保险
+{ [[ "$SP" =~ ^[1-9][0-9]*$ && "$SB" =~ ^[1-9][0-9]*$ && "$SW" =~ ^[1-9][0-9]*$ ]]; } \
+  && ok "10c-1: 计划/预算/窗口都是有限正整数(不是 0, 不是 infinity)" \
+  || bad "10c-1: 有值不是有限正整数(计划=$SP 预算=$SB 窗口=$SW)"
+[[ "$SB" == "$((SP+1))" ]] \
+  && ok "10c-2: 预算 $SB = 计划 $SP + 1 次有界失败恢复 —— 由执行路径推导, 没凭空加保险次数" \
+  || bad "10c-2: 预算 $SB 与计划 $SP 对不上(应为 $((SP+1)))"
+{ [[ "$SW" -ge 30 && "$SW" -le 3600 ]]; } \
+  && ok "10c-3: 频率窗口 ${SW}s 有限且盖得住整段脚本(run 34941133783 实测首末启动相距 24s)" \
+  || bad "10c-3: 窗口 ${SW}s 不合适(要有限, 且盖得住整段)"
+
+# 10d 只作用于自建 unit: 不动全局默认, 不用 reset-failed 清额度
+_bad_scope=0; _scope_hit=""
+_nc="$WORK/pin-nocomment.txt"; grep -vE '^[[:space:]]*#' "$PIN" > "$_nc"
+_scope_hit="$(grep -nE 'system\.conf|DefaultStartLimit|reset-failed' "$_nc" | head -3)"
+[[ -n "$_scope_hit" ]] && _bad_scope=1
+(( _bad_scope == 0 )) \
+  && ok "10d-1: 没碰 system.conf / 全局 DefaultStartLimit*, 也没用 reset-failed 清额度" \
+  || { bad "10d-1: 出现了全局改动或 reset-failed"; sed 's/^/      /' <<<"$_scope_hit"; }
+_wr="$(grep -oE '> *"\$(OWN_UNIT_PATH|PROBE_PATH)"|> *"/etc/systemd/system/[^"]*"' "$PIN" | sort -u)"
+[[ "$(grep -c '/etc/systemd/system/' <<<"$_wr")" == 0 ]] \
+  && ok "10d-2: 写 unit 只经本轮登记过的两个变量(自建 mosdns 与反例 unit), 没有写死别的路径" \
+  || bad "10d-2: 有写死的 unit 路径: $_wr"
+
+# 10e 计数包装: 动作仍交给真二进制, 且定义在硬门之后(否则硬门只看得到函数名)
+WRAPTXT="$(_fn "$PIN" systemctl)"
+grep -q 'command systemctl "\$@"' <<<"$WRAPTXT" \
+  && ok "10e-1: 计数包装把动作原样转给 \`command systemctl\`(只记账, 不改行为)" || bad "10e-1: 包装没转给真二进制"
+{ [[ "$(grep -n '^SCTL=' "$PIN" | cut -d: -f1)" -lt "$(grep -n '^systemctl(){' "$PIN" | cut -d: -f1)" ]]; } \
+  && ok "10e-2: 包装定义在硬门之后 —— 硬门验的仍是真 systemctl 二进制" || bad "10e-2: 包装定义得太早, 会挡住硬门"
+_sl="$(grep -n 'start-limit' "$PIN" | grep -vcE '^[0-9]+:#')"
+[[ "$_sl" == 0 ]] \
+  && ok "10f: 'start-limit' 只出现在注释里 —— 没把它加进容忍列表, 也没改成 SKIP" \
+  || bad "10f: 有 $_sl 处非注释的 start-limit 处理"
+
+# ── 行为: 生效属性门(桩按真语义作答; 不生效/不有限 ⇒ 首次启动之前就拒绝)──────
+_mk(){   # $1=改法(python 片段名) → 生成一份改过的定点脚本副本, 回显路径
+  python3 - "$PIN" "$WORK/pin-$1.sh" "$1" <<'PYQ'
+import sys
+src,dst,how=sys.argv[1],sys.argv[2],sys.argv[3]
+s=open(src,encoding="utf-8").read()
+i=s.index('cat > "$OWN_UNIT_PATH" <<EOF'); j=s.index("\nEOF\n", i)+len("\nEOF\n")
+unit=s[i:j]
+if how=="service":      # 两条配额挪进 [Service] 段(真 systemd 下 Interval 会静默退回 10s)
+    u=unit.replace("StartLimitIntervalSec=$START_WINDOW_SEC\n","").replace("StartLimitBurst=$START_BUDGET\n","")
+    u=u.replace("Restart=no\n","Restart=no\nStartLimitIntervalSec=$START_WINDOW_SEC\nStartLimitBurst=$START_BUDGET\n")
+elif how=="infinity":
+    u=unit.replace("StartLimitIntervalSec=$START_WINDOW_SEC","StartLimitIntervalSec=infinity")
+elif how=="burst0":
+    u=unit.replace("StartLimitBurst=$START_BUDGET","StartLimitBurst=0")
+elif how=="always":
+    u=unit.replace("Restart=no","Restart=always")
+elif how=="none":       # 撤销配额设置: 回到系统默认 10s/5
+    u=unit.replace("StartLimitIntervalSec=$START_WINDOW_SEC\n","").replace("StartLimitBurst=$START_BUDGET\n","")
+elif how=="cmt":        # 无关注释对照: unit 一个字不动, 只在别处插一行注释
+    u=unit
+else: raise SystemExit("unknown "+how)
+out=s[:i]+u+s[j:]
+if how=="cmt":
+    out=out.replace("# ── 硬门 ──","# 本行仅为无关注释对照\n# ── 硬门 ──",1)
+open(dst,"w",encoding="utf-8").write(out)
+PYQ
+  echo "$WORK/pin-$1.sh"
+}
+_gate_case(){   # $1=脚本 $2=期望(pass|reject) $3=标签 $4=具名关键字
+  local rc; rc="$(run_prep "$1")"
+  local started=0; grep -qE '^start mosdns' "$SCLOG" && started=1
+  if [[ "$2" == reject ]]; then
+    { pg '准备未完成' && pg "$4" && [[ "$started" == 0 ]]; } \
+      && ok "$3(rc=$rc; 具名拒绝, 且**首次启动之前**就停了 —— 没有 start)" \
+      || { bad "$3: rc=$rc started=$started"; grep -E '^\[(FAIL|OK)\]' "$WORK/prep.out" | tail -4 | sed 's/^/      /'; }
+  else
+    { pg '二-3b: 本轮自建 unit 的启动配额\*\*实际生效\*\*' && [[ "$started" == 1 ]]; } \
+      && ok "$3(配额生效门放行, 之后确实发出了 start)" \
+      || { bad "$3: started=$started"; grep -E '^\[(FAIL|OK)\]' "$WORK/prep.out" | tail -4 | sed 's/^/      /'; }
+  fi
+}
+_gate_case "$PIN"                  pass   "10g: 健康路径 —— 配额实际生效(桩按 [Unit] 段作答)"     ""
+_gate_case "$(_mk service)"        reject "10h: 配额错写进 [Service] 段 ⇒ 窗口退回 10s, 当场拒绝" '启动频率窗口没按写的生效'
+_gate_case "$(_mk infinity)"       reject "10i: 窗口 infinity(等效无限制) ⇒ 拒绝"                 '频率限制必须仍然开着'
+_gate_case "$(_mk burst0)"         reject "10j: Burst=0(等于关掉限制) ⇒ 拒绝"                     '必须是有限的正整数'
+_gate_case "$(_mk always)"         reject "10k: Restart=always ⇒ 拒绝(不靠自动重启遮掩崩溃)"      '不靠自动重启遮掩崩溃'
+
+# ── 行为: 计数包装只给自建 mosdns unit 记帐, 且每次都真的转发出去 ─────────────
+CB="$WORK/cntbin"; mkdir -p "$CB"
+printf '#!/bin/sh\necho "$@" >> "%s"\nexit 0\n' "$WORK/fwd.log" > "$CB/systemctl"; chmod +x "$CB/systemctl"
+: > "$WORK/fwd.log"
+( eval "$WRAPTXT"
+  # 这三个由 eval 进来的包装函数读, shellcheck 看不到
+  SELF_STARTS=0; START_LOG="$WORK/starts.log"; : > "$START_LOG"
+  # shellcheck disable=SC2034
+  BUDGET_UNIT=mosdns.service
+  PATH="$CB:$PATH"
+  systemctl restart mosdns            >/dev/null 2>&1   # _dns_reload 的写法: 不带 .service
+  systemctl start   mosdns.service    >/dev/null 2>&1
+  systemctl start   pdg-dnsinst-flap-TESTONLY.service >/dev/null 2>&1   # 第八节的反例 unit
+  systemctl stop    mosdns            >/dev/null 2>&1
+  systemctl show -p MainPID --value mosdns >/dev/null 2>&1
+  echo "$SELF_STARTS" > "$WORK/cnt" )
+CNT="$(cat "$WORK/cnt" 2>/dev/null)"
+[[ "$CNT" == 2 ]] && ok "10l-1: 只给自建 mosdns 的 start/restart 记帐(实得 $CNT 次; 反例 unit、stop、show 都不计)" \
+  || { bad "10l-1: 记成了 $CNT 次(应为 2)"; cat "$WORK/starts.log" 2>/dev/null | sed 's/^/      /'; }
+[[ "$(wc -l < "$WORK/fwd.log")" == 5 ]] \
+  && ok "10l-2: 五次调用**全部**转发到了真二进制位置(记账不吞动作)" \
+  || { bad "10l-2: 转发了 $(wc -l < "$WORK/fwd.log") 次(应 5)"; sed 's/^/      /' "$WORK/fwd.log"; }
+[[ "$(wc -l < "$WORK/starts.log")" == 2 ]] && ok "10l-3: 每一次主动启动都逐条留了记录(可与预算对账)" \
+  || bad "10l-3: 启动记录 $(wc -l < "$WORK/starts.log") 行(应 2)"
+
+# ── 行为: 三种量分开 —— 预算对账判词 ────────────────────────────────────────
+VTXT="$(_fn "$PIN" _start_budget_verdict)"
+eval "$VTXT"
+_vc(){ _start_budget_verdict "$1" "$2" "$3" "$4" 2>/dev/null; }
+V_OK="$(_vc 7 7 8 0)";  V_OVER="$(_vc 9 7 8 0)"; V_UNDER="$(_vc 5 7 8 0)"; V_AUTO="$(_vc 7 7 8 2)"
+[[ "$(grep -c '^BAD|' <<<"$V_OK")" == 0 ]] && ok "10m-1: 计划内(主动 7 / 预算 8 / 自动 0)判全成立" || { bad "10m-1"; sed 's/^/      /' <<<"$V_OK"; }
+grep -q '^BAD|九-1' <<<"$V_OVER"  && ok "10m-2: 主动启动 9 次超预算 8 ⇒ 九-1 判红" || bad "10m-2: 超支没判红"
+grep -q '^BAD|九-2' <<<"$V_UNDER" && ok "10m-3: 只启动 5 次少于计划 7 ⇒ 九-2 判红(不能靠少跑一段省配额)" || bad "10m-3: 少跑没判红"
+grep -q '^BAD|九-3' <<<"$V_AUTO"  && ok "10m-4: NRestarts=2 ⇒ 九-3 判红(自动重启与主动启动分开计)" || bad "10m-4"
+grep -q '证明不了' <<<"$V_OK" && ok "10m-5: NRestarts=0 那条明说了它**证明不了**主动启动次数" || bad "10m-5: 文案没说清三种量的区别"
+
+# ── 撤销对照 ────────────────────────────────────────────────────────────────
+_gate_case "$(_mk none)" reject "N4: 撤销配额设置 ⇒ 退回默认 10s/5, 生效属性门当场拒绝(模型)" '启动频率窗口没按写的生效'
+note "N4 说明: 这是**模型**层(桩按实测语义作答)。真实层的反例有两处实测, 单列不混算:"
+note "  ① run 34941133783: 真 systemd 默认 10s/5 下第 6 次 restart 被拒, Result=start-limit-hit;"
+note "  ② 本机自有一次性 unit 实测: 默认 10s/5 连做 8 次 → 第 6 次起被拒; 300s/8 → 8 次全过, 第 9 次仍被拒(限制确实还开着)。"
+CMT="$(_mk cmt)"
+_c1="$(run_prep "$CMT")"; _c1g=0; pg '二-3b: 本轮自建 unit 的启动配额\*\*实际生效\*\*' && _c1g=1
+_c2="$(run_prep "$PIN")"; _c2g=0; pg '二-3b: 本轮自建 unit 的启动配额\*\*实际生效\*\*' && _c2g=1
+{ [[ "$_c1" == "$_c2" && "$_c1g" == "$_c2g" ]]; } \
+  && ok "N5: 无关注释对照 —— 退出码与配额门结论都相同(rc=$_c1, 门=$_c1g), 零新增失败" \
+  || bad "N5: 加一行注释改变了结果(rc $_c1 vs $_c2, 门 $_c1g vs $_c2g)"
+fi
 
 
 # ── 计数对账: 打印出来的断言条数必须等于进了总数的条数 ──────────────────────
