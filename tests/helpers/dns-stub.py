@@ -9,7 +9,14 @@
 "命中了谁"根本分不出来 —— 所以这里把路径做成必填参数, 不给默认值。
 
 用法: dns-stub.py --port P --count FILE --log FILE [--mode M] [--answer IP]
-mode: answer(默认) | silent | truncate | wrongid | servfail | die
+mode: answer(默认) | answer-a | silent | truncate | wrongid | servfail | die
+
+`answer` 是历史默认: NOERROR 但 **ANCOUNT=0**(不带任何记录)。已有调用方依赖这一点,
+所以它一个字节都没改。
+
+`answer-a` 是**新增的可选模式**: 在 `answer` 的基础上带一条 A 记录, 地址由 --answer 指定。
+它是给"要用上游答案作判据"的场景准备的 —— 没有它就分不出"上游答了什么"和"根本没问上游"。
+不指定 --mode 时行为与以前完全一致。
 """
 import argparse
 import os
@@ -28,6 +35,38 @@ def qname_of(pkt):
         out.append(pkt[i + 1:i + 1 + n].decode("ascii", "replace"))
         i += 1 + n
     return ".".join(out)
+
+
+def _qname_end(pkt):
+    """问题段里名字结束后的偏移(指向 QTYPE 的第一个字节)。"""
+    i = 12
+    while i < len(pkt):
+        n = pkt[i]
+        if n == 0:
+            return i + 1
+        if n & 0xC0:
+            return i + 2
+        i += 1 + n
+    return i
+
+
+def qtype_of(pkt):
+    """问题段的 QTYPE。名字走完之后紧跟 2 字节 QTYPE。"""
+    i = _qname_end(pkt)
+    if i + 2 > len(pkt):
+        return 0
+    return struct.unpack("!H", pkt[i:i + 2])[0]
+
+
+def question_only(pkt):
+    """只取问题段(名字 + QTYPE + QCLASS)。
+
+    为什么必须截: dig 的查询包里**还带着 EDNS0 的 OPT 记录**(附加段)。直接把 pkt[12:]
+    原样抄回去, 再在后面接一条 A 记录, 那条 OPT 就落在答案段的位置上被当成第一条记录读,
+    客户端看到的是一坨 base64 垃圾。默认的 answer 模式因为 ANCOUNT=0 没人去读, 所以一直
+    没暴露 —— 但一旦真的带记录就必须截干净。
+    """
+    return pkt[12:_qname_end(pkt) + 4]
 
 
 def bump(path):
@@ -76,8 +115,21 @@ def main():
         if a.mode == "wrongid":
             qid = bytes([pkt[0] ^ 0xFF, pkt[1] ^ 0xFF])
         rcode = 0x02 if a.mode == "servfail" else 0x00
-        head = qid + bytes([0x81, 0x80 | rcode]) + pkt[4:6] + b"\x00\x00\x00\x00\x00\x00"
-        resp = head + pkt[12:]
+        # answer-a: 带一条 A 记录(仅对 qtype=A 的查询); 其余模式与以前逐字节相同。
+        ancount = b"\x00\x00"
+        rr = b""
+        if a.mode == "answer-a" and qtype_of(pkt) == 1:
+            ancount = b"\x00\x01"
+            rr = (b"\xc0\x0c"                      # 指回问题段的名字
+                  + b"\x00\x01\x00\x01"           # TYPE=A CLASS=IN
+                  + struct.pack("!I", 60)            # TTL
+                  + b"\x00\x04"
+                  + bytes(int(x) for x in a.answer.split(".")))
+        head = qid + bytes([0x81, 0x80 | rcode]) + pkt[4:6] + ancount + b"\x00\x00\x00\x00"
+        if rr:
+            resp = head + question_only(pkt) + rr      # 带记录时必须只留问题段(见 question_only)
+        else:
+            resp = head + pkt[12:]                     # 历史默认: 一个字节都不变
         if a.mode == "truncate":
             resp = resp[:6]                            # 明显截断的半截包
         try:

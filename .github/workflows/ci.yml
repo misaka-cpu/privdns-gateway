@@ -1095,6 +1095,11 @@ jobs:
       - name: "DNS 标定契约 (成功契约/不可区分/查询异常/重载失败/可靠还原, 桩化模型)"
         run: bash tests/test-dns-calibration-contract.sh
 
+      # 真二进制那一半: 真钉版 mosdns + 真 dig + 自有 DNS 上游, 全在自有根与回环高位端口上,
+      # 不碰宿主的 systemd/DNS/nft/路由。它回答"同答到底为什么"以及"U→H→U 走不走得出来"。
+      - name: "DNS 仪器真二进制验证 (真 mosdns + 自有上游: 同答归因 / 缓存 / U→H→U)"
+        run: bash tests/test-dns-instrument-real.sh
+
       # 组合验证: **合法**旧记录 → 平台切换 → schema 真正推进 → 失败善后选中整体恢复 →
       # 记录与产物一起回到前像。坏记录那支只证明"拒绝传得出去", schema 单测只证明"转换本身"。
       - name: "合法旧记录迁移与恢复 (schema 1→2 真推进/带 CA 产物真退役/失败后记录—产物一起还原)"

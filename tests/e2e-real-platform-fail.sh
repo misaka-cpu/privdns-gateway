@@ -1019,35 +1019,37 @@ assert_candidate_identity(){   # $1=平台
   _evn 00-identity.txt "候选部署身份: pdg+${n} 模块; 缺 $mis 不符 $dif"
 }
 
-# ── 已加载配置: 用**可区分的真实 DNS 行为**验, 并带对照 ─────────────────────
-# 自有配置特征: WLOC 时期的接管表把 gs-loc.apple.com 劫持到本机网关地址。
-# 只有恢复出来的那份 mosdns 配置真的被加载, 这个域名才会拿到劫持答案;
-# 对照域名不在接管集里, 结果必然不同。端口/hash/InvocationID 只作辅助。
-dns_answer(){   # $1=域名 → 打印 "rcode|answer"
-  local out
-  out="$(dig +time=3 +tries=1 @127.0.0.1 "$1" A 2>&1)"
-  printf '%s|%s\n' "$(grep -o 'status: [A-Z]*' <<<"$out" | head -1 | awk '{print $2}')" \
-                   "$(awk '/^;; ANSWER SECTION/{f=1;next} f&&/^[^;]/{print $NF; exit}' <<<"$out")"
-}
-dns_feature_probe(){   # $1=标签 → 打印 "劫持域答案 :: 对照域答案"
-  local hij ctl
-  hij="$(dns_answer gs-loc.apple.com)"
-  ctl="$(dns_answer control-not-hijacked.e2e.test)"
-  printf '%s :: %s\n' "$hij" "$ctl"
-  _evn "dns-probe-$1.txt" "hijacked=gs-loc.apple.com -> $hij"
-  _evn "dns-probe-$1.txt" "control =control-not-hijacked.e2e.test -> $ctl"
-}
-
-# ── DNS 仪器: 先标定成**有效仪器**, 再允许进入验收 ──────────────────────────
-# 上一轮两支都栽在这里: 接管域与对照域拿到**同一个**答案(NOERROR|203.0.113.1) —— E2E 夹具
-# 的上游对任何域名都返回同一个地址。那种环境里 "NOERROR" 什么也不证明。
-# 上一版的标定条件只看 "a_off 非空且 a_off != a_on", 于是**查询超时、空输出、错误结果**
-# 都可能被当成"两份配置结果不同"而判成标定成功。这一版把成功契约写死在前面。
+# ── DNS 仪器: 固定实验条件 → 标定 → 正式取证, 三处用**同一套**有效性要求 ────────
+#
+# 为什么要先固定实验条件(这一段是实测出来的, 不是推的; 证据见 22-correction-dns-attribution):
+#   · 夹具用的是 `all` 形态 —— _mosdns_hijack_shape 会把 `!qname $hijack_set → 上游` 那道门
+#     **整段移除**, 于是任何没被前面分支处理掉的名字都落到 internal_sequence 末尾那条
+#     `qtype 1 → black_hole __SERVER_IP__`。把名字从 mitm_hijack 里删掉**不会**让它走上游。
+#   · force_hijack_seq 与末尾那条普通劫持对 A 记录**是同一个动作**(都 black_hole 到同一个
+#     地址)。所以"加一条 mitm_hijack 条目看答案变不变"在 all 形态下先天测不出东西。
+#   · 真钉版 mosdns 实测: 上一轮那种同答, 两个自有上游**一次都没收到过查询** ——
+#     不是"上游对谁都答同一个地址", 是压根没问上游。
+# 固定条件因此是两件事, 都用**既有合法输入**, 不改产品规则/优先级/劫持模式:
+#   ① 只把**外围上游**指到自有可控端(mosdns、配置加载、真实查询都不打桩);
+#   ② 把待测名/见证名/对照名写进 geosite_cn.txt —— internal_sequence 里
+#      `qname $force_hijack` 排在 `qname $geosite_cn` **之前**, 于是
+#         不在 mitm_hijack → geosite_cn 分支 → $local_upstream → 自有上游 → **U**
+#         在   mitm_hijack → force_hijack_seq → black_hole        → **H**
+# 这两件事在**标定之前**做一次, 之后甲乙两次测量之间一个字都不动。
 DNS_INSTRUMENT_OK=0
 DNS_CALIB_WHY=""
+DNS_U="198.51.100.7"                 # 自有上游固定给的 A —— 未接管时的期望答案
+DNS_H="${E2E_SIP:-203.0.113.1}"      # 产品配置规定的劫持地址 —— 接管时的期望答案
+DNS_UP_PORT=15301
+DNS_WITNESS="gs-loc.apple.com"                    # 业务见证名(前像里真的在接管表里)
+DNS_CONTROL="control-not-hijacked.e2e.test"       # 对照名(两种配置下都该是 U)
+DNS_CALIB_NAME=""
+DNS_STUB_PID=""
+DNS_RESTORE_DISK=0
+DNS_RESTORE_RUN=0
 
-# 一次查询的**完整**观测: 退出码 / DNS 状态 / 规范化答案 / stderr 首行。四样一起记, 一起判。
-dns_probe(){   # $1=域名 → 打印 "rc<TAB>status<TAB>answer<TAB>stderr首行"
+# 一次查询的**完整**观测: 退出码 / DNS 状态 / 规范化答案 / stderr 首行。四样一起记一起判。
+dns_probe(){   # $1=域名 → "rc<TAB>status<TAB>answer<TAB>stderr首行"
   local out err rc st ans
   err="$(mktemp "${TMPDIR:-/tmp}/dnsprobe.XXXXXX")"
   out="$(dig +time=3 +tries=1 +retry=0 @127.0.0.1 "$1" A 2>"$err")"; rc=$?
@@ -1057,15 +1059,17 @@ dns_probe(){   # $1=域名 → 打印 "rc<TAB>status<TAB>answer<TAB>stderr首行
   rm -f "$err"
 }
 # **预先写死的成功契约**: 退出码 0 + 状态 NOERROR + 有真答案 + stderr 空。
-# 差一样就不是"一次有效观测" —— 超时/空输出/异常一律不得充当"两份配置结果不同"的证据。
+# 超时 / SERVFAIL / 空答案 / 任何异常都不是一次有效观测, 不得充当"两份配置结果不同"的证据,
+# 也不得在正式取证里因为"两份错误文本恰好相等"就判恢复通过。
 dns_probe_ok(){   # $1=dns_probe 的一行
   local rc st ans er; IFS=$'\t' read -r rc st ans er <<<"$1"
   [[ "$rc" == 0 && "$st" == NOERROR && -n "$ans" && "$ans" != NO-ANSWER && -z "$er" ]]
 }
+dns_answer_of(){ cut -f3 <<<"$1"; }
 
-# 让 mosdns 真的重读接管表。**失败必须传出去** —— 不能 `|| true` 吞成"标定有效"。
-# 用 restart 而不是 reload: InvocationID 换没换是"配置确实被重新读过"的独立依据。
-_dns_apply_hijack(){
+# 让 mosdns 重新起来。InvocationID 变过**只证明实例换了** —— 它不证明加载的是哪一份配置;
+# "预期配置有没有生效"一律由随后的真实 DNS 行为回答(见 dns_expect)。
+_dns_reload(){
   local inv0 inv1 ac
   inv0="$(systemctl show -p InvocationID --value mosdns 2>/dev/null)"
   systemctl restart mosdns >/dev/null 2>&1 || { DNS_CALIB_WHY="mosdns 重启动作失败"; return 1; }
@@ -1073,78 +1077,178 @@ _dns_apply_hijack(){
   [[ "$ac" == active ]] || { DNS_CALIB_WHY="mosdns 重启后停在 $ac, 没有稳定运行"; return 1; }
   inv1="$(systemctl show -p InvocationID --value mosdns 2>/dev/null)"
   [[ -n "$inv1" && "$inv1" != "$inv0" ]] \
-    || { DNS_CALIB_WHY="mosdns 的 InvocationID 没变($inv0 → ${inv1:-读不到}), 无法确认配置被重读"; return 1; }
+    || { DNS_CALIB_WHY="mosdns 实例没有更替(InvocationID $inv0 → ${inv1:-读不到})"; return 1; }
+  return 0
+}
+# 用**真实 DNS 行为**确认某个名字此刻拿到的就是期望答案。
+dns_expect(){   # $1=域名 $2=期望答案 → 0/1, 失败时把原因写进 DNS_CALIB_WHY
+  local p a
+  p="$(dns_probe "$1")"
+  if ! dns_probe_ok "$p"; then DNS_CALIB_WHY="查询 $1 无效($p)"; return 1; fi
+  a="$(dns_answer_of "$p")"
+  [[ "$a" == "$2" ]] || { DNS_CALIB_WHY="查询 $1 得到 $a, 期望 $2"; return 1; }
   return 0
 }
 
-# 标定: **同一个查询名**, 只差接管表里的一条条目, 两份配置都要给出**有效**观测, 且结果不同。
-# 全程只动本轮自造的那一条域名; 自有配置先整份存下来, 退出时按内容 + 属性可靠还原并核对。
-# 不用 `grep -v` 删行: 过滤后为空时 grep 返回非零, 那种写法可能根本没把文件换回去。
+# 固定实验条件。只做一次; 做完之后甲乙两次测量之间上游、域名归属、监听地址都不再动。
+dns_fix_conditions(){
+  local hij=/etc/mosdns/rules/mitm_hijack.txt cn=/etc/mosdns/rules/geosite_cn.txt
+  local mc=/etc/mosdns/config.yaml
+  command -v dig >/dev/null 2>&1 || { DNS_CALIB_WHY="机器上没有 dig"; return 1; }
+  [[ -f "$mc" && -f "$hij" && -f "$cn" ]] || { DNS_CALIB_WHY="mosdns 配置或规则文件不齐"; return 1; }
+  DNS_CALIB_NAME="dns-calib-$$-${RANDOM}.e2e.test"   # 每次新名字, 排除缓存带来的假差异
+  # ① 自有上游(本轮事先登记归属的资源: 退出时按 PID 清理, 不按名字宽杀)
+  "$E2E_ROOT/tests/helpers/dns-stub.py" --port "$DNS_UP_PORT" \
+      --count "$E2E_TMP/dns-up.count" --log "$E2E_TMP/dns-up.log" \
+      --mode answer-a --answer "$DNS_U" > "$E2E_TMP/dns-up.out" 2>&1 &
+  DNS_STUB_PID=$!
+  sleep 1
+  kill -0 "$DNS_STUB_PID" 2>/dev/null || { DNS_CALIB_WHY="自有 DNS 上游没起来: $(tail -2 "$E2E_TMP/dns-up.out" 2>/dev/null)"; return 1; }
+  # ② local_upstream 整行换成自有可控端(上游列表里本来就有 {}, 用 [^}]* 会在第一个右括号停住)
+  python3 - "$mc" "$DNS_UP_PORT" <<'PYUP'
+import re, sys
+p, port = sys.argv[1], sys.argv[2]
+lines = open(p, encoding="utf-8").read().split("\n")
+tag = None; done = False
+for i, ln in enumerate(lines):
+    if re.match(r'  - tag: local_upstream$', ln): tag = 1; continue
+    if tag and ln.startswith("    args: "):
+        lines[i] = '    args: { concurrent: 1, upstreams: [ {addr: "udp://127.0.0.1:%s"} ] }' % port
+        tag = None; done = True
+open(p, "w", encoding="utf-8").write("\n".join(lines))
+raise SystemExit(0 if done else 1)
+PYUP
+  [[ $? == 0 ]] || { DNS_CALIB_WHY="没能把 local_upstream 指到自有上游"; return 1; }
+  # ③ 三个名字都进 geosite_cn(既有合法输入): 未接管时它们才会真的走正常解析路径
+  printf 'full:%s\nfull:%s\nfull:%s\n' "$DNS_CALIB_NAME" "$DNS_WITNESS" "$DNS_CONTROL" >> "$cn"
+  _dns_reload || return 1
+  # 自证: 此刻对照名确实从自有上游拿到 U, 且上游日志里按名记到了它
+  dns_expect "$DNS_CONTROL" "$DNS_U" || return 1
+  grep -q " q=$DNS_CONTROL " "$E2E_TMP/dns-up.log" \
+    || { DNS_CALIB_WHY="对照名答对了, 但自有上游日志里没有它 —— 答案不是上游给的"; return 1; }
+  ok "仪器条件: 自有上游已就位, 对照名 $DNS_CONTROL 经 local_upstream 取得 U=$DNS_U(上游日志按名可核)"
+  return 0
+}
+
+# 标定: 同一个查询名, **只**让 mitm_hijack 里那一条变。U→H→U 三段都要有效且等于预期。
 dns_instrument_calibrate(){
   local hij=/etc/mosdns/rules/mitm_hijack.txt
-  local name entry bak sum0 mode0 own0 sum1 mode1 own1 p_off p_on
-  DNS_INSTRUMENT_OK=0; DNS_CALIB_WHY=""
-  command -v dig >/dev/null 2>&1 || { DNS_CALIB_WHY="机器上没有 dig, 无法标定"; bad "仪器标定: $DNS_CALIB_WHY"; return 1; }
-  [[ -f "$hij" ]] || { DNS_CALIB_WHY="找不到接管表 $hij"; bad "仪器标定: $DNS_CALIB_WHY"; return 1; }
-  # 每次用一个**没被任何缓存见过**的新名字, 排除缓存造成的假差异。
-  name="dns-calib-$$-${RANDOM}.e2e.test"; entry="full:$name"
-
-  # ① 整份保存自有配置(内容 + 属性), 并立刻挂上退出兜底
+  local bak sum0 mode0 own0 sum1 mode1 own1 entry
+  DNS_INSTRUMENT_OK=0; DNS_CALIB_WHY=""; DNS_RESTORE_DISK=0; DNS_RESTORE_RUN=0
+  dns_fix_conditions || { bad "仪器标定: 固定实验条件失败 —— $DNS_CALIB_WHY"; return 1; }
+  [[ "$DNS_U" != "$DNS_H" ]] || { bad "仪器标定: U 与 H 相同($DNS_U), 这组预期本身没有区分力"; return 1; }
+  entry="full:$DNS_CALIB_NAME"
   bak="${E2E_TMP:-${TMPDIR:-/tmp}}/hijack-calib.bak"
-  cat "$hij" > "$bak" || { DNS_CALIB_WHY="存不下接管表副本"; bad "仪器标定: $DNS_CALIB_WHY"; return 1; }
+  cat "$hij" > "$bak" || { bad "仪器标定: 存不下接管表副本"; return 1; }
   sum0="$(sha256sum "$hij" | awk '{print $1}')"
   mode0="$(stat -c %a "$hij")"; own0="$(stat -c %u:%g "$hij")"
-  _dns_calib_restore(){   # 按内容整份写回, 再补回属性。不依赖过滤删行。
+  # 还原分成**磁盘**与**运行配置**两件事, 分别判定 —— 只写回磁盘不算已恢复。
+  _dns_calib_restore(){
+    DNS_RESTORE_DISK=0; DNS_RESTORE_RUN=0
     cat "$bak" > "$hij" 2>/dev/null || return 1
     chmod "$mode0" "$hij" 2>/dev/null || true
     chown "$own0"  "$hij" 2>/dev/null || true
+    sum1="$(sha256sum "$hij" | awk '{print $1}')"
+    mode1="$(stat -c %a "$hij")"; own1="$(stat -c %u:%g "$hij")"
+    [[ -f "$hij" && "$sum1" == "$sum0" && "$mode1" == "$mode0" && "$own1" == "$own0" ]] || return 1
+    DNS_RESTORE_DISK=1
+    _dns_reload || return 1
+    dns_expect "$DNS_CALIB_NAME" "$DNS_U" || return 1      # 运行配置真的回到"未接管"
+    DNS_RESTORE_RUN=1
+    return 0
   }
-  # 失败也要走还原 —— 用显式收尾, 不靠 RETURN trap(它会留在全局上,
-  # 而这一段后面还要继续用这份文件)。
-  _calib_fail(){ _dns_calib_restore || DNS_CALIB_WHY="$DNS_CALIB_WHY(而且还原也失败了)"
-                 bad "仪器标定: $DNS_CALIB_WHY"; return 1; }
+  _calib_fail(){   # 失败收尾: 先还原, 再把两件事分别报清楚
+    if _dns_calib_restore; then
+      bad "仪器标定: $DNS_CALIB_WHY(磁盘与运行配置都已还原并核对)"
+    else
+      bad "仪器标定: $DNS_CALIB_WHY"
+      bad "仪器标定: 收尾未完成 —— 磁盘还原=$( ((DNS_RESTORE_DISK)) && echo 已完成 || echo 未完成), 运行配置还原=$( ((DNS_RESTORE_RUN)) && echo 已确认 || echo 未确认)"
+      c_keep_note
+    fi
+    return 1
+  }
+  c_keep_note(){
+    note "  本轮自有恢复材料保留在: $bak(接管表原件, sha256=$sum0 mode=$mode0 owner=$own0)"
+    note "  环境可能已被污染, 后续场景不再继续 —— 不拿一个说不清的现场做验收。"
+  }
 
-  # ② 配置甲: 这个名字**不在**接管表里
-  _dns_apply_hijack || { DNS_CALIB_WHY="$DNS_CALIB_WHY —— 重载失败不算标定成功"; _calib_fail; return 1; }
-  p_off="$(dns_probe "$name")"
-  # ③ 配置乙: **只**多这一条条目, 别的一个字不动
+  # ── 配置甲: 待测名**不在** mitm_hijack ──
+  _dns_reload || { _calib_fail; return 1; }
+  local p_off p_on a_off a_on
+  p_off="$(dns_probe "$DNS_CALIB_NAME")"
+  local up_off; up_off="$(grep -c " q=$DNS_CALIB_NAME " "$E2E_TMP/dns-up.log" 2>/dev/null | tr -d '\n')"
+  # ── 配置乙: **只**多这一条条目, 其余一个字不动 ──
   printf '%s\n' "$entry" >> "$hij"
-  _dns_apply_hijack || { DNS_CALIB_WHY="$DNS_CALIB_WHY —— 重载失败不算标定成功"; _calib_fail; return 1; }
-  p_on="$(dns_probe "$name")"
-  _evn dns-calibration.txt "查询名 $name(每次新造, 排除缓存)"
-  _evn dns-calibration.txt "配置甲(不在接管表) rc/status/answer/stderr = $p_off"
-  _evn dns-calibration.txt "配置乙(在接管表)   rc/status/answer/stderr = $p_on"
+  _dns_reload || { _calib_fail; return 1; }
+  p_on="$(dns_probe "$DNS_CALIB_NAME")"
+  local up_on; up_on="$(grep -c " q=$DNS_CALIB_NAME " "$E2E_TMP/dns-up.log" 2>/dev/null | tr -d '\n')"
+  _evn dns-calibration.txt "查询名 $DNS_CALIB_NAME(每次新造; 两次测量之间重启 mosdns 清缓存)"
+  _evn dns-calibration.txt "配置甲(不在接管表) rc/status/answer/stderr = $p_off  自有上游累计收到=$up_off"
+  _evn dns-calibration.txt "配置乙(在接管表)   rc/status/answer/stderr = $p_on   自有上游累计收到=$up_on"
 
-  # ④ 还原并核对: 内容 + 权限 + 属主, 再确认服务**重新读过**还原后的配置
-  _dns_calib_restore || { DNS_CALIB_WHY="接管表还原失败"; bad "仪器标定: $DNS_CALIB_WHY"; return 1; }
-  sum1="$(sha256sum "$hij" | awk '{print $1}')"
-  mode1="$(stat -c %a "$hij")"; own1="$(stat -c %u:%g "$hij")"
-  if [[ "$sum0" != "$sum1" || "$mode0" != "$mode1" || "$own0" != "$own1" ]]; then
-    DNS_CALIB_WHY="接管表没有原样还原(sha $sum0→$sum1, mode $mode0→$mode1, owner $own0→$own1)"
-    bad "仪器标定: $DNS_CALIB_WHY"; return 1
+  # ── 还原甲, 并确认**运行配置**也回到未接管 ──
+  if ! _dns_calib_restore; then
+    DNS_CALIB_WHY="${DNS_CALIB_WHY:-还原失败}"; _calib_fail; return 1
   fi
-  ok "仪器标定: 接管表按内容与属性逐项还原(sha256/mode/uid:gid 都对得上)"
-  _dns_apply_hijack || { bad "仪器标定: 还原后 $DNS_CALIB_WHY"; return 1; }
-  ok "仪器标定: 服务已按**还原后**的配置重新起过(InvocationID 变过)"
+  ok "仪器标定: 接管表按内容与属性逐项还原, 且**运行配置**经真实查询确认回到未接管($DNS_U)"
 
-  # ⑤ 判定 —— 三种失败分别说清, 不混成一句
+  # ── 判定 ──
   if ! dns_probe_ok "$p_off" || ! dns_probe_ok "$p_on"; then
-    DNS_CALIB_WHY="两次查询里有观测不满足成功契约(甲=$p_off ; 乙=$p_on)"
-    bad "仪器标定: $DNS_CALIB_WHY —— 超时/空输出/异常不得充当'结果不同'"
+    DNS_CALIB_WHY="两次测量里有观测不满足成功契约(甲=$p_off ; 乙=$p_on)"
+    bad "仪器标定: $DNS_CALIB_WHY —— 超时/SERVFAIL/空答案不得充当'结果不同'"
     return 1
   fi
-  ok "仪器标定: 两次查询都满足成功契约(rc=0 + NOERROR + 有答案 + stderr 空)"
-  local a_off a_on; a_off="$(cut -f3 <<<"$p_off")"; a_on="$(cut -f3 <<<"$p_on")"
-  if [[ "$a_off" == "$a_on" ]]; then
-    DNS_CALIB_WHY="同一查询在两份产品配置下答案相同($a_off) —— 这台机器上 DNS 结果不由产品配置决定"
-    bad "仪器标定: $DNS_CALIB_WHY"
-    note "  停用该仪器: 后面不拿 DNS 结果当「配置已加载」的证据, 也不把 NOERROR 当恢复成功。"
+  a_off="$(dns_answer_of "$p_off")"; a_on="$(dns_answer_of "$p_on")"
+  if [[ "$a_off" != "$DNS_U" || "$a_on" != "$DNS_H" ]]; then
+    DNS_CALIB_WHY="答案不符合预先固定的 U/H(甲=$a_off 期望 $DNS_U; 乙=$a_on 期望 $DNS_H)"
+    bad "仪器标定: $DNS_CALIB_WHY —— 只要求'两个非空串不同'是不够的"
     return 1
   fi
+  [[ "$up_on" == "$up_off" ]] \
+    && ok "仪器标定: 配置乙那次**没有**问上游(累计仍是 $up_on) —— 答案确实来自接管分支" \
+    || bad "仪器标定: 配置乙那次仍然问了上游($up_off → $up_on), 与'接管优先'不符"
   DNS_INSTRUMENT_OK=1
-  ok "仪器标定: 同一查询在两份产品配置下结果**不同**($a_off vs $a_on) —— DNS 特征可作判据"
+  ok "仪器标定: 同一查询名 U→H 精确命中($DNS_U → $DNS_H), 两次观测都满足成功契约"
   return 0
 }
+
+# 正式取证: 与标定**同一套**有效性要求。
+# 输出 "VALID<TAB>见证答案<TAB>对照答案" 或 "INVALID<TAB>原因"。
+dns_feature_probe(){   # $1=标签
+  local ph pc
+  ph="$(dns_probe "$DNS_WITNESS")"; pc="$(dns_probe "$DNS_CONTROL")"
+  _evn "dns-probe-$1.txt" "见证 $DNS_WITNESS  rc/status/answer/stderr = $ph"
+  _evn "dns-probe-$1.txt" "对照 $DNS_CONTROL rc/status/answer/stderr = $pc"
+  if ! dns_probe_ok "$ph" || ! dns_probe_ok "$pc"; then
+    printf 'INVALID\t观测不满足成功契约(见证=%s ; 对照=%s)\n' "$ph" "$pc"; return 1
+  fi
+  printf 'VALID\t%s\t%s\n' "$(dns_answer_of "$ph")" "$(dns_answer_of "$pc")"
+}
+# 判一次"前后像 DNS 行为"。两边都必须是**有效观测**, 且见证=H、对照=U。
+dns_verdict(){   # $1=标签 $2=before $3=after
+  local bs bw bc as aw ac
+  IFS=$'\t' read -r bs bw bc <<<"$2"; IFS=$'\t' read -r as aw ac <<<"$3"
+  if [[ "$bs" != VALID || "$as" != VALID ]]; then
+    bad "$1 已加载配置: 前像或恢复后的观测**无效**, 不能因为两边文本相等就判恢复通过"
+    note "  前像: $2"; note "  恢复后: $3"
+    return 1
+  fi
+  { [[ "$bw" == "$aw" && "$bc" == "$ac" ]]; } \
+    && ok "$1 已加载配置(可区分行为): 见证与对照都回到前像(见证 $aw / 对照 $ac)" \
+    || bad "$1 已加载配置: DNS 行为变了(见证 $bw→$aw, 对照 $bc→$ac)"
+  { [[ "$aw" == "$DNS_H" && "$ac" == "$DNS_U" ]]; } \
+    && ok "$1 已加载配置(对预期): 见证=H($DNS_H) 对照=U($DNS_U) —— 差异确实来自接管规则" \
+    || bad "$1 已加载配置: 不符合预先固定的 U/H(见证=$aw 期望 $DNS_H; 对照=$ac 期望 $DNS_U)"
+}
+
+# 本轮自有资源的清理: **只**按事先登记的 PID 收自己起的那个上游, 不按名字宽杀。
+_dns_cleanup(){
+  [[ -n "${DNS_STUB_PID:-}" ]] || return 0
+  kill "$DNS_STUB_PID" 2>/dev/null || true
+  wait "$DNS_STUB_PID" 2>/dev/null || true
+  DNS_STUB_PID=""
+}
+trap '_dns_cleanup' EXIT
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 四维指纹: 文件(存在性/内容/mode/uid:gid) / 运行态 / 自启态 / 已加载配置的独立依据
@@ -1347,7 +1451,8 @@ svc_snapshot "$E2E_TMP/svc-B-$DIR-before.tsv"
 PROBE_EN_BEFORE="$(sc_state is-enabled pdg-probe81)"
 BOT_EN_BEFORE="$(sc_state is-enabled pdg-bot)"
 B_DNS_BEFORE="$(dns_feature_probe "$DIR-before")"
-note "前像的 DNS 行为特征 = $B_DNS_BEFORE"
+note "前像的 DNS 观测 = $B_DNS_BEFORE"
+[[ "$B_DNS_BEFORE" == VALID* ]] || { bad "验收前置未成立: 前像的 DNS 观测本身就无效 —— $B_DNS_BEFORE"; PREIMAGE_OK=0; }
 HT_INV_BEFORE="$(systemctl show -p InvocationID --value pdg-health.timer 2>/dev/null)"
 HT_AC_BEFORE="$(sc_state is-active pdg-health.timer)"
 
@@ -1446,18 +1551,13 @@ else
 fi
 B_DNS_AFTER="$(dns_feature_probe "$DIR-after")"
 if [[ "$DNS_INSTRUMENT_OK" == 1 ]]; then
-  [[ "$B_DNS_AFTER" == "$B_DNS_BEFORE" ]] \
-    && ok "⑤-3 已加载配置(可区分行为): 恢复后 DNS 特征与前像一致($B_DNS_AFTER)" \
-    || bad "⑤-3 已加载配置: DNS 特征变了($B_DNS_BEFORE → $B_DNS_AFTER)"
-  B_HIJ_ANS="${B_DNS_AFTER%% ::*}"; B_CTL_ANS="${B_DNS_AFTER##*:: }"
-  [[ -n "$B_HIJ_ANS" && "$B_HIJ_ANS" != "$B_CTL_ANS" ]] \
-    && ok "⑤-3 已加载配置(对照): 被接管的域名与对照域名结果**不同**($B_HIJ_ANS vs $B_CTL_ANS)" \
-    || bad "⑤-3 已加载配置: 接管域与对照域结果相同($B_HIJ_ANS vs $B_CTL_ANS), 证明不了配置被加载"
+  dns_verdict "⑤-3" "$B_DNS_BEFORE" "$B_DNS_AFTER"
 else
-  note "⑤-3 已加载配置: DNS 仪器**未通过标定**, 本轮不拿它作证据(实测 $B_DNS_BEFORE → $B_DNS_AFTER, 仅留档)。"
-  note "  「配置已加载」这一维在本方向因此**未取得**证据 —— 不用 NOERROR 顶替。"
+  note "⑤-3 已加载配置: 仪器没有通过标定, 本场景本不该走到这里(前置门应已拦下)。实测留档:"
+  note "  前像 $B_DNS_BEFORE"; note "  恢复后 $B_DNS_AFTER"
 fi
-note "⑤-3: 端口监听 / 磁盘 hash / InvocationID 只作辅助, 不单独作为「配置已加载」的证据。"
+note "⑤-3: 端口监听 / 磁盘 hash 只作辅助。InvocationID 只证明**实例换了**, 不证明加载的是"
+note "  哪一份配置 —— 那一条由上面的真实 DNS 行为(见证=H / 对照=U)回答。"
 journalctl -u mosdns -u mihomo -u pdg-mitm --since "$(date -u -d '10 min ago' +%FT%T)" --no-pager 2>/dev/null \
   | tail -120 | _ev "05-$DIR-journal.txt"
 
