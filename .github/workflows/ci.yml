@@ -1115,6 +1115,10 @@ jobs:
       - name: "平台前像的持续稳定 (瞬时 active/自动重启/实例更替/观测无效各自判得对)"
         run: bash tests/test-platform-preimage-stability.sh
 
+      # 桥接验收复用来源函数原文, 抽错就什么都别想验 —— 这一支单独盯抽取本身。
+      - name: "桥接验收的函数抽取契约 (heredoc 不截断/边界不对就拒绝/失败即阻断)"
+        run: bash tests/test-bridge-extract-contract.sh
+
       # 定性 e2e-platform-switch.sh §6 的红灯: 那里的注入让**每一次** `nft -c` 都失败, 而
       # cmd_rollback 在铺开快照之前自己就要 `nft -c` 校验快照里的 nftables.conf —— 于是恢复
       # 在它自己的安全门上中止。这支把"只坏前向"与"连恢复条件一起坏"分成两例, 分别核验:
@@ -2154,6 +2158,11 @@ jobs:
         run: sudo -E bash tests/install-mosdns-artifact.sh /tmp/mosdns-fixture
       - name: "校验并安装钉定 mihomo"
         run: sudo -E bash tests/install-mihomo-artifact.sh /tmp/mosdns-fixture
+      # 抽取正控排在验收**之前**: 上一次(run 34976950055)就是抽取被 heredoc 骗到, 前像没建起来。
+      # 放在这里而不是 lint 后段 —— 后者可能因为别的红灯根本跑不到。
+      - name: "前置: 函数抽取契约 (标记唯一成对/片段与组合语法/抽不对就阻断)"
+        run: bash tests/test-bridge-extract-contract.sh
+
       - name: "真实验收②: 公开入口 install.sh --ref 把 v1.11.15 升到桥接版"
         env:
           PDG_E2E_ISOLATED: "1"

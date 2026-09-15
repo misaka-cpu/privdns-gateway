@@ -37,15 +37,68 @@ mkdir -p "$EVID" && chmod 700 "$EVID"
 
 PLAT_SRC="$E2E_ROOT/tests/e2e-real-platform-fail.sh"
 [[ -f "$PLAT_SRC" ]] || _hard "找不到 $PLAT_SRC(要从它原文取前像与状态采集那几支)"
-_fn(){ awk -v f="$2" 'index($0,f"(){")==1{p=1} p{print} p&&/^}$/{exit}' "$1"; }
-# 复用**已验收过**的那几支原文: 前像构造、状态采集、稳定性判据。不改那个文件, 只抽原文。
-for _f in _ev _evn SECT note sc_get sc_state nrun snap_state reset_units_strict reset_proof \
-          build_preimage svc_class svc_snapshot svc_verdict wait_stable unit_identify \
-          _unit_wants_mainpid svc_stable_window svc_stable_assert mitm_listen_verdict \
-          _j_why_file _j_err_file _j_fail _j_why _j_err _j_sync _j_mark _j_starts_after \
-          _j_tag_after _j_interval; do
-  _b="$(_fn "$PLAT_SRC" "$_f")"; [[ -n "$_b" ]] || _hard "从 $PLAT_SRC 抽不到 $_f"
-  eval "$_b"
+# ── 按**唯一成对标记**定点抽函数原文 ────────────────────────────────────────
+# 上一次(run 34976950055)栽在这: 抽法是"从 name(){ 读到第一行顶格 }", 而 build_preimage
+# 里写 mitm.json 的那段 heredoc 正文就有一行顶格 } —— 抽取在那里提前收尾, 把 EOF 和后面的
+# 代码全切了, eval 当场语法错, 前像根本没开始建。
+# 现在改成: 只认来源脚本里那对 `# >>> PDG-EXTRACT-BEGIN <名字>` / `# <<< PDG-EXTRACT-END <名字>`
+# 注释标记(它们只是注释, 不改被抽函数的任何行为)。规矩:
+#   · 标记必须唯一、成对、BEGIN 在 END 之前 —— 缺失/重复/倒置一律当场拒绝;
+#   · 片段必须以 `<名字>(){` 开头、以顶格 `}` 结尾(heredoc、闭合符、函数尾一个都不少);
+#   · 每个片段先**单独** bash -n, 全部拼成一个加载单元后**再** bash -n;
+#   · 只有都过了才 source; 任何一步失败就 _hard —— 不进前像构造、不动任何服务;
+#   · 绝不 source 整支来源脚本(它有运行副作用)。
+EXTRACT_NAMES=(_ev _evn SECT note sc_get sc_state nrun snap_state reset_units_strict reset_proof
+               build_preimage svc_class svc_snapshot svc_verdict wait_stable unit_identify
+               _unit_wants_mainpid svc_stable_window svc_stable_assert mitm_listen_verdict
+               _j_why_file _j_err_file _j_fail _j_why _j_err _j_sync _j_mark _j_starts_after
+               _j_tag_after _j_interval)
+# >>> PDG-EXTRACT-BEGIN extract_marked_fns
+extract_marked_fns(){   # $1=来源脚本 $2=落点(加载单元) $3..=函数名 → 0 成功 / 非 0 并具名说明
+  local src="$1" out="$2"; shift 2
+  local n b e nb ne frag tmp rc=0
+  [[ -f "$src" ]] || { echo "抽取: 找不到来源 $src" >&2; return 2; }
+  : > "$out" || { echo "抽取: 写不了落点 $out" >&2; return 2; }
+  tmp="$(mktemp "${TMPDIR:-/tmp}/frag.XXXXXX")" || { echo "抽取: 建不出临时文件" >&2; return 2; }
+  for n in "$@"; do
+    nb="$(grep -c "^# >>> PDG-EXTRACT-BEGIN $n\$" "$src")"
+    ne="$(grep -c "^# <<< PDG-EXTRACT-END $n\$" "$src")"
+    if [[ "$nb" != 1 || "$ne" != 1 ]]; then
+      echo "抽取: $n 的标记不是唯一成对(BEGIN $nb 个 / END $ne 个)" >&2; rc=1; break
+    fi
+    b="$(grep -n "^# >>> PDG-EXTRACT-BEGIN $n\$" "$src" | cut -d: -f1)"
+    e="$(grep -n "^# <<< PDG-EXTRACT-END $n\$" "$src" | cut -d: -f1)"
+    if (( b >= e )); then echo "抽取: $n 的标记顺序不对(BEGIN 在第 $b 行, END 在第 $e 行)" >&2; rc=1; break; fi
+    # 相邻两行 = 标记之间根本没有内容。必须显式判: sed 的倒置范围会**只打一行**, 靠 -z 兜不住。
+    if (( e - b < 2 )); then echo "抽取: $n 的标记之间是空的(BEGIN 第 $b 行, END 第 $e 行)" >&2; rc=1; break; fi
+    frag="$(sed -n "$((b+1)),$((e-1))p" "$src")"
+    if [[ -z "$frag" ]]; then echo "抽取: $n 的标记之间是空的" >&2; rc=1; break; fi
+    if ! grep -q "^$n(){" <<<"$frag"; then echo "抽取: $n 的片段不是以 $n(){ 开头" >&2; rc=1; break; fi
+    if ! { [[ "$(tail -1 <<<"$frag")" == "}" ]] || [[ "$(tail -1 <<<"$frag")" =~ \}[[:space:]]*(#.*)?$ ]]; }; then
+      echo "抽取: $n 的片段结尾不是函数闭合(实得: $(tail -1 <<<"$frag"))" >&2; rc=1; break
+    fi
+    printf '%s\n' "$frag" > "$tmp"
+    if ! bash -n "$tmp" 2>"$tmp.err"; then
+      echo "抽取: $n 的片段单独语法检查不过: $(head -2 "$tmp.err" | tr '\n' ' ')" >&2; rc=1; break
+    fi
+    printf '%s\n' "$frag" >> "$out"
+  done
+  rm -f "$tmp" "$tmp.err"
+  (( rc == 0 )) || return "$rc"
+  if ! bash -n "$out" 2>"$out.err"; then
+    echo "抽取: 组合后的加载单元语法检查不过: $(head -2 "$out.err" | tr '\n' ' ')" >&2; return 1
+  fi
+  rm -f "$out.err"
+  return 0
+}
+# <<< PDG-EXTRACT-END extract_marked_fns
+EXTRACT_UNIT="${E2E_TMP:-${TMPDIR:-/tmp}}/plat-fns.sh"
+extract_marked_fns "$PLAT_SRC" "$EXTRACT_UNIT" "${EXTRACT_NAMES[@]}" \
+  || _hard "函数抽取没通过(见上一行) —— 前像构造与任何服务动作都还没开始, 就停在这里。"
+# shellcheck source=/dev/null
+source "$EXTRACT_UNIT" || _hard "加载抽取单元失败 —— 同样停在前像之前。"
+for _f in "${EXTRACT_NAMES[@]}"; do
+  declare -F "$_f" >/dev/null || _hard "抽取单元里少了 $_f"
 done
 # 这几个是给上面 eval 进来的那些原文函数读的(界桩/前像/状态采集), 本文件自己不直接引用
 # shellcheck disable=SC2034

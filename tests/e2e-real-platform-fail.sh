@@ -26,6 +26,14 @@
 #   · 不使用 PDG_UPDATE_FORCE, 不绕版本关系 / 锁 / 完整性 / 安全校验。
 # ─────────────────────────────────────────────────────────────────────────────
 set -uo pipefail
+# ─────────────────────────────────────────────────────────────────────────────
+# 关于下面成对出现的抽取标记(每支函数各一对, 名字写在标记行尾):
+# 它们**只是注释**, 对本脚本的行为没有任何影响。加它们是因为 tests/e2e-real-bridge-hop.sh
+# 要复用这里几支函数的原文, 而"从 name(){ 读到第一行顶格 }"那种抽法会被函数里的 heredoc
+# 正文骗到(build_preimage 里写 mitm.json 的那段 JSON 就有一行顶格 })——
+# run 34976950055 正是这么截断的。改成按这对唯一标记定点取, 抽出来的片段还要逐个 bash -n。
+# 标记必须唯一、成对、BEGIN 在前; 缺失/重复/倒置都由抽取方当场拒绝。
+# ─────────────────────────────────────────────────────────────────────────────
 
 E2E_ROOT="${E2E_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 E2E_ROOT_REAL="$E2E_ROOT"
@@ -45,11 +53,19 @@ source "$(dirname "${BASH_SOURCE[0]}")/e2e-lib.sh"
 
 EVID="${PDG_REAL_MIG_EVID:-${TMPDIR:-/tmp}/real-migration-evidence}"
 mkdir -p "$EVID" && chmod 700 "$EVID"
+# >>> PDG-EXTRACT-BEGIN _ev
 _ev(){ cat >> "$EVID/$1"; chmod 600 "$EVID/$1" 2>/dev/null || true; }
+# <<< PDG-EXTRACT-END _ev
+# >>> PDG-EXTRACT-BEGIN _evn
 _evn(){ printf '%s\n' "$2" >> "$EVID/$1"; chmod 600 "$EVID/$1" 2>/dev/null || true; }
+# <<< PDG-EXTRACT-END _evn
 
+# >>> PDG-EXTRACT-BEGIN SECT
 SECT(){ echo; echo "══════════════════════════════════════════════════════════"; echo "  $*"; echo "══════════════════════════════════════════════════════════"; }
+# <<< PDG-EXTRACT-END SECT
+# >>> PDG-EXTRACT-BEGIN note
 note(){ echo "[NOTE] $1"; }
+# <<< PDG-EXTRACT-END note
 # ── systemctl 状态的读法(夹具②)────────────────────────────────────────────
 # 原来写的是 `V="$(systemctl is-enabled X 2>/dev/null || echo not-found)"`。
 # systemd 255 对**已删除的 unit** 会 stdout 打一行 not-found **并且**返回非 0,
@@ -57,14 +73,17 @@ note(){ echo "[NOTE] $1"; }
 # 上一轮那条 [FAIL] pdg-mitm 自启=not-found 就是这么来的, 产品侧其实是对的。
 # 现在 stdout / stderr / 退出码**分开收**, 不拼串; 也不用 tail -1 去藏第一行。
 SC_VAL=""; SC_RC=0; SC_ERR=""
+# >>> PDG-EXTRACT-BEGIN sc_get
 sc_get(){   # $1=子命令(is-active|is-enabled|...)  $2=unit
   local errf="${E2E_TMP:-/tmp}/sc.err"
   SC_VAL="$(systemctl "$1" "$2" 2>"$errf")"; SC_RC=$?
   SC_ERR="$(tr '\n' ' ' < "$errf" 2>/dev/null)"
   rm -f "$errf" 2>/dev/null || true
 }
+# <<< PDG-EXTRACT-END sc_get
 # 把"这个 unit 现在到底算什么状态"归一成一个词, 并把判定依据保留下来:
 #   active / inactive / failed / activating / …  或  not-found(unit 压根不在)
+# >>> PDG-EXTRACT-BEGIN sc_state
 sc_state(){  # $1=子命令 $2=unit → 打印归一后的词; 依据留在 SC_VAL/SC_RC/SC_ERR
   sc_get "$1" "$2"
   if [[ -z "${SC_VAL//[[:space:]]/}" ]]; then
@@ -74,10 +93,13 @@ sc_state(){  # $1=子命令 $2=unit → 打印归一后的词; 依据留在 SC_V
     printf '%s\n' "${SC_VAL%%$'\n'*}"
   fi
 }
+# <<< PDG-EXTRACT-END sc_state
 
 # 未执行 ≠ 失败 ≠ 通过。前像不成立时该场景**不执行**, 单独计一格, 绝不混进通过或失败。
 E2E_NOTRUN=0
+# >>> PDG-EXTRACT-BEGIN nrun
 nrun(){ echo "[未执行] $1"; E2E_NOTRUN=$((E2E_NOTRUN+1)); }
+# <<< PDG-EXTRACT-END nrun
 
 # ── 自检: 脚本里不许再出现"把 ca_der_from_pem 当成 mitm_ca 的成员"这种调用 ──────────
 # 上一轮只改对了两处里的一处, 另一处照旧 AttributeError, 场景 A 与晚期恢复整场未执行。
@@ -348,6 +370,7 @@ _evn 02-source-map.txt "验收分支 Y 相对 base 的全部改动: ${YALL:-<无
 # ═════════════════════════════════════════════════════════════════════════════
 # 状态采集器: 每个场景操作前后都跑一次, 结果写进证据目录
 # ═════════════════════════════════════════════════════════════════════════════
+# >>> PDG-EXTRACT-BEGIN snap_state
 snap_state(){   # $1 = 标签
   local tag="$1" f="$EVID/state-$1.txt" s q
   {
@@ -416,6 +439,7 @@ PY
   chmod 600 "$f"
   echo "  [状态已采集] $f"
 }
+# <<< PDG-EXTRACT-END snap_state
 
 state_diff(){   # $1=before 标签  $2=after 标签  $3=场景名
   local d="$EVID/diff-$3.txt"
@@ -439,6 +463,7 @@ E2E_OWNED_UNITS=(pdg-mitm.service pdg-bot.service pdg-probe81.service
                  pdg-rules-update.service pdg-rules-update.timer)
 
 # 逐个 unit 复位, 每个动作留自己的退出码并**立刻复核真实状态**。不吞失败。
+# >>> PDG-EXTRACT-BEGIN reset_units_strict
 reset_units_strict(){
   local u ls as ufs rc acted=0 notthere=0 fail=0
   echo "── 逐项复位(白名单 ${#E2E_OWNED_UNITS[@]} 个 unit; 不泛扫宿主服务)──"
@@ -481,9 +506,11 @@ reset_units_strict(){
   fi
   return "$fail"
 }
+# <<< PDG-EXTRACT-END reset_units_strict
 
 # 复位之后必须**证明**现场干净: 服务、监听、配置、本轮网络资源各查一遍。
 # 证明不了就停 —— 不让下一场景在污染状态下继续。
+# >>> PDG-EXTRACT-BEGIN reset_proof
 reset_proof(){   # $1 = 场景名
   local u as bad_list="" n
   for u in "${E2E_OWNED_UNITS[@]}"; do
@@ -502,8 +529,10 @@ reset_proof(){   # $1 = 场景名
   bad "场景隔离($1): 收尾无法确认, 残留:$bad_list"
   _hard "上一场景收尾无法确认, 停止 —— 不让下一场景在污染状态下继续。"
 }
+# <<< PDG-EXTRACT-END reset_proof
 
 PREIMAGE_OK=1     # 每次 build_preimage 复位; 任一前像判据不成立即置 0
+# >>> PDG-EXTRACT-BEGIN build_preimage
 build_preimage(){   # $1 = ios|android   $2 = wloc on|off|caonly
   local plat="$1" wloc="$2"
   PREIMAGE_OK=1
@@ -755,6 +784,7 @@ PY
   sleep 2
   return 0
 }
+# <<< PDG-EXTRACT-END build_preimage
 
 assert_preimage_A(){
   echo "── 前像自证(必须先证明"确实有一台开着 WLOC 的旧机器") ──"
@@ -827,6 +857,7 @@ PY
 # 服务动作一律准许" —— 下面每一条都写明来自 run_all_migrations 的哪一支、为什么会动。
 # 依据: 冻结候选 X 的 run_all_migrations 调用链 + 本场景的输入条件
 # (一台按 v1.11.15 形态播种、从未跑过新迁移的老机器)。
+# >>> PDG-EXTRACT-BEGIN svc_class
 svc_class(){   # $1=unit → 打印 "<类别>|<原因>"
   case "$1" in
     mosdns)
@@ -845,9 +876,11 @@ svc_class(){   # $1=unit → 打印 "<类别>|<原因>"
       printf '意外|不在执行前确定的允许清单里';;
   esac
 }
+# <<< PDG-EXTRACT-END svc_class
 # 被观察的服务集合: 允许清单里的 + 几个**本轮从不安装、因此绝不该变**的见证者。
 SVC_WATCH=(mosdns mihomo pdg-bot pdg-probe81 pdg-dotwitness pdg-health.timer pdg-mitm
            sing-box pdg-rescue.socket ssh cron)
+# >>> PDG-EXTRACT-BEGIN svc_snapshot
 svc_snapshot(){   # $1=落点文件
   local u
   : > "$1"
@@ -861,6 +894,8 @@ svc_snapshot(){   # $1=落点文件
       "$(systemctl show -p NRestarts    --value "$u" 2>/dev/null)" >> "$1"
   done
 }
+# <<< PDG-EXTRACT-END svc_snapshot
+# >>> PDG-EXTRACT-BEGIN svc_verdict
 svc_verdict(){   # $1=before  $2=after  $3=场景名
   # 用 awk 按**字段**取行, 不用 grep -P: PCRE 不是哪儿都有, 而它一旦不可用, 这里会静默
   # 变成"两边都取不到 ⇒ 没有变化", 那正是最难发现的一种假绿。
@@ -890,6 +925,7 @@ svc_verdict(){   # $1=before  $2=after  $3=场景名
   [[ "$n_wloc" -ge 1 ]] && ok "$3: WLOC 退役专属动作确实发生(pdg-mitm)" \
                         || note "$3: 本场景没有 WLOC 退役专属动作(与前像条件是否一致, 见上文)"
 }
+# <<< PDG-EXTRACT-END svc_verdict
 
 # ── 直接迁移的部署源身份(H5)─────────────────────────────────────────────────
 # 上一轮栽在这: 只把候选模块 install 到 /opt/pdg-bot, 却没动 $REPO_DIR。候选 pdg.sh 的
@@ -976,6 +1012,7 @@ switch_repo_to_candidate(){
 # ── 前像必须先达到**合法稳定状态**再采样 ────────────────────────────────────
 # activating / deactivating 是过渡态: 在那一刻采前像, 产品会按"过渡态不猜"如实登记为
 # 未恢复, 而测试自己晚一拍采到的却是 active —— 两边对不上, 判据就失去意义。
+# >>> PDG-EXTRACT-BEGIN wait_stable
 wait_stable(){   # $1=unit  [$2=最多等几秒, 默认 25]
   local u="$1" n="${2:-25}" st i
   for ((i=0; i<n; i++)); do
@@ -984,6 +1021,7 @@ wait_stable(){   # $1=unit  [$2=最多等几秒, 默认 25]
   done
   printf '%s\n' "${st:-<读不到>}"; return 1
 }
+# <<< PDG-EXTRACT-END wait_stable
 
 # ── 启动频率预算: 只**读**产品自己的设置, 不改它 ────────────────────────────
 # 为什么要管这个: 本支在正式操作之前会为了标定 DNS 仪器连着重启 mosdns 四次
@@ -1014,13 +1052,26 @@ JBOUND_TAG="pdg-e2e-jbound"
 # 这几个函数多数在 $( ) 里被调用 —— 子壳里给变量赋的值回不到调用方, 上一版的"原因"
 # 因此总是空的。改成写文件: 写在子壳里, 调用方读得到。stdout(计数) / stderr(原始报错) /
 # 退出码三者分开留证, 不混成一句。
+# >>> PDG-EXTRACT-BEGIN _j_why_file
 _j_why_file(){ printf '%s\n' "${E2E_TMP:-${TMPDIR:-/tmp}}/j-why.txt"; }
+# <<< PDG-EXTRACT-END _j_why_file
+# >>> PDG-EXTRACT-BEGIN _j_err_file
 _j_err_file(){ printf '%s\n' "${E2E_TMP:-${TMPDIR:-/tmp}}/j-err.txt"; }
+# <<< PDG-EXTRACT-END _j_err_file
+# >>> PDG-EXTRACT-BEGIN _j_fail
 _j_fail(){ printf '%s\n' "$1" > "$(_j_why_file)" 2>/dev/null; }   # 原因只走文件, 子壳里也回得来
+# <<< PDG-EXTRACT-END _j_fail
+# >>> PDG-EXTRACT-BEGIN _j_why
 _j_why(){  cat "$(_j_why_file)" 2>/dev/null; }
+# <<< PDG-EXTRACT-END _j_why
+# >>> PDG-EXTRACT-BEGIN _j_err
 _j_err(){  cat "$(_j_err_file)" 2>/dev/null; }
+# <<< PDG-EXTRACT-END _j_err
 _now_j(){ date +'%Y-%m-%d %H:%M:%S'; }        # **只**用于人读的时刻, 不做事件归属
+# >>> PDG-EXTRACT-BEGIN _j_sync
 _j_sync(){ journalctl --sync >/dev/null 2>&1; }   # 尽力刷盘; 真正的可见性由界桩自证
+# <<< PDG-EXTRACT-END _j_sync
+# >>> PDG-EXTRACT-BEGIN _j_mark
 _j_mark(){   # $1=界桩名 → 打印该界桩自己的游标; 取不到回空(观测无效, 由调用方判前置)
   local id="$1-$$-${RANDOM}" i cur
   if command -v logger >/dev/null 2>&1; then
@@ -1049,6 +1100,8 @@ print(out)' "$id" 2>/dev/null)"
   done
   _j_fail "界桩写进去了却读不回来(journal 可见性未确认, 等了 6s)"; return 1
 }
+# <<< PDG-EXTRACT-END _j_mark
+# >>> PDG-EXTRACT-BEGIN _j_starts_after
 _j_starts_after(){   # $1=unit $2=界桩游标 → 打印该界桩之后的启动条数; 观测无效回空并置 J_WHY
   local u="$1" cur="$2" errf raw rc n grc
   J_ERR=""; : > "$(_j_why_file)" 2>/dev/null
@@ -1065,6 +1118,8 @@ _j_starts_after(){   # $1=unit $2=界桩游标 → 打印该界桩之后的启�
   [[ "$n" =~ ^[0-9]+$ ]] || { _j_fail "解析结果不是数字: [$n]"; echo ""; return 1; }
   printf '%s\n' "$n"; return 0
 }
+# <<< PDG-EXTRACT-END _j_starts_after
+# >>> PDG-EXTRACT-BEGIN _j_tag_after
 _j_tag_after(){   # $1=界桩游标 → 该游标之后**界桩自己**那条 tag 的记录数(用来验边界有效与先后)
   local cur="$1" errf raw rc n grc
   [[ -n "$cur" ]] || { _j_fail "没有界桩游标(边界缺失)"; echo ""; return 1; }
@@ -1076,6 +1131,8 @@ _j_tag_after(){   # $1=界桩游标 → 该游标之后**界桩自己**那条 ta
   [[ "$n" =~ ^[0-9]+$ ]] || { _j_fail "界桩计数不是数字: [$n]"; echo ""; return 1; }
   printf '%s\n' "$n"; return 0
 }
+# <<< PDG-EXTRACT-END _j_tag_after
+# >>> PDG-EXTRACT-BEGIN _j_interval
 _j_interval(){   # $1=unit $2=起界桩 $3=止界桩 → (起,止] 的启动条数; 观测无效回空
   local a b ta tb
   a="$(_j_starts_after "$1" "$2")" || { echo ""; return 1; }
@@ -1091,6 +1148,7 @@ _j_interval(){   # $1=unit $2=起界桩 $3=止界桩 → (起,止] 的启动条�
   fi
   printf '%s\n' "$(( a - b ))"; return 0
 }
+# <<< PDG-EXTRACT-END _j_interval
 _dur2s_real(){   # systemd 的人类可读时长 → 秒; infinity/0 原样回显
   local in="$1" tot=0 t n un seen=0
   [[ -n "$in" ]] || { echo ""; return 1; }
@@ -1210,6 +1268,7 @@ SVC_STABLE_WHY=""
 #   · 适用却缺失、查询失败、格式非法 ⇒ 仍记观测无效;
 #   · service 要不要求非零 MainPID, 取决于它的 Type(oneshot 正常就是 0)。
 UNIT_ID=""; UNIT_LOAD=""; UNIT_KIND=""; UNIT_TYPE=""; UNIT_WHY=""
+# >>> PDG-EXTRACT-BEGIN unit_identify
 unit_identify(){   # $1=unit → 0 可观测 / 1 加载状态不可用 / 2 身份读不出来
   UNIT_ID=""; UNIT_LOAD=""; UNIT_KIND=""; UNIT_TYPE=""; UNIT_WHY=""
   local id load
@@ -1230,9 +1289,13 @@ unit_identify(){   # $1=unit → 0 可观测 / 1 加载状态不可用 / 2 身�
   fi
   return 0
 }
+# <<< PDG-EXTRACT-END unit_identify
+# >>> PDG-EXTRACT-BEGIN _unit_wants_mainpid
 _unit_wants_mainpid(){   # service 的 Type 决定"活着时该不该有非零 MainPID"
   case "$1" in simple|exec|notify|notify-reload|forking|idle) return 0;; *) return 1;; esac
 }
+# <<< PDG-EXTRACT-END _unit_wants_mainpid
+# >>> PDG-EXTRACT-BEGIN svc_stable_window
 svc_stable_window(){   # $1=unit $2=running|stopped [$3=窗口秒数, 默认 8] → 0 成立 / 1 不成立 / 2 观测无效
   local u="$1" want="$2" secs="${3:-8}" i st sub pid inv nr0 nr1 pid0 inv0 c0 c1 evs
   local has_nr=0 has_pid=0 wants_pid=0
@@ -1303,11 +1366,13 @@ svc_stable_window(){   # $1=unit $2=running|stopped [$3=窗口秒数, 默认 8] 
   SVC_STABLE_WHY="窗口 ${secs}s 内持续 ${want}: $UNIT_ID($UNIT_KIND${UNIT_TYPE:+/$UNIT_TYPE}, LoadState=$UNIT_LOAD) ActiveState=$st SubState=$sub MainPID=$( ((has_pid)) && echo "${pid0}" || echo 不适用) Invocation=${inv0:-无} NRestarts=$nr0 启动事件 0 次"
   return 0
 }
+# <<< PDG-EXTRACT-END svc_stable_window
 
 # 进程在不在 ↔ 7894 有没有监听。判据来自 v1.11.15 的 mitm_server.serve():
 # 它**无条件** bind 127.0.0.1:7894, 与 wloc.enabled 无关 —— enabled 决定的是
 # load_from_config 登不登记接管插件。所以: 活着就该有监听; 停了就不该有。
 MITM_VERDICT_WHY=""
+# >>> PDG-EXTRACT-BEGIN mitm_listen_verdict
 mitm_listen_verdict(){   # $1=ActiveState $2=7894 监听数 → 0 自洽 / 1 不自洽
   local ac="$1" n="${2:-0}"
   [[ "$n" =~ ^[0-9]+$ ]] || { MITM_VERDICT_WHY="监听数读不出来([$2])"; return 1; }
@@ -1318,6 +1383,8 @@ mitm_listen_verdict(){   # $1=ActiveState $2=7894 监听数 → 0 自洽 / 1 不
   (( n == 0 )) && { MITM_VERDICT_WHY="pdg-mitm 是 $ac, 7894 也没有监听"; return 0; }
   MITM_VERDICT_WHY="pdg-mitm 是 $ac, 7894 却还有 $n 个监听 —— 有进程没被停干净"; return 1
 }
+# <<< PDG-EXTRACT-END mitm_listen_verdict
+# >>> PDG-EXTRACT-BEGIN svc_stable_assert
 svc_stable_assert(){   # $1=unit $2=running|stopped $3=标签 → 顺带把前置置红
   local rc
   svc_stable_window "$1" "$2" "${4:-8}"; rc=$?
@@ -1328,6 +1395,7 @@ svc_stable_assert(){   # $1=unit $2=running|stopped $3=标签 → 顺带把前�
   esac
   return "$rc"
 }
+# <<< PDG-EXTRACT-END svc_stable_assert
 
 # ── 测试指纹 vs 产品自己写的 svcstate.tsv, 逐项对账 ──────────────────────────
 # 两边在**不同时刻**采样就会对不上。这里直接比同一批 unit 的自启/运行值。
