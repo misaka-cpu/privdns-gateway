@@ -105,6 +105,28 @@ _hard(){ bad "硬门不成立: $1"; REACHED_END=1; exit 1; }
 # 这是一次有定义的停止: 计一条真失败, 保留材料, 退出码仍由 on_exit → _final_verdict 给。
 _prep_fail(){ bad "准备未完成: $1"; KEEP_MATERIAL=1; REACHED_END=1; exit 1; }
 
+# 监听残留检查, **三态**。上一次(run 34934021143)就是栽在这条上:
+# 原来写 `grep -c … | grep -qx 0`, 而 grep 在**零匹配**时退出码是 1, 脚本开头的
+# `set -uo pipefail` 把整条管道拖成非零 —— 于是配置正确的时候反而判红。
+# 修法不是改成 `! grep -q`(那会把 grep 的**执行错误**也一并当成"没有违规"),
+# 也不是 `|| true`(那等于不判)。这里显式取 grep 的退出码, 三种情况分开处理:
+#   0  = 找到了禁止的通配监听 → 具名拒绝
+#   1  = 正常跑完且零匹配     → 放行
+#   其它 = 读取/执行出错      → 具名说明"无法完成监听检查", 同样拒绝
+# 匹配范围只针对**真正的 listen 配置**: `listen: "0.0.0.0:…`。
+# ECS 插件那句 `preset: "0.0.0.0"` 不是监听, 不能判成违规。
+_LISTEN_WHY=""
+_listen_wildcard_check(){   # $1=配置文件 → 0 放行 / 1 有违规 / 2 检查本身没做成
+  local f="$1" out rc errf
+  errf="$(mktemp "${TMPDIR:-/tmp}/lsnchk.XXXXXX")"
+  out="$(grep -nE 'listen:[[:space:]]*"0\.0\.0\.0:' "$f" 2>"$errf")"; rc=$?
+  case "$rc" in
+    0) _LISTEN_WHY="还有通配监听: $(head -2 <<<"$out" | tr '\n' ' ')"; rm -f "$errf"; return 1;;
+    1) _LISTEN_WHY=""; rm -f "$errf"; return 0;;
+    *) _LISTEN_WHY="grep 退出码 $rc: $(head -1 "$errf")"; rm -f "$errf"; return 2;;
+  esac
+}
+
 # 负控专用: 在**子 shell**里跑, 它的 ok/bad 一律不影响主计数(独立计账, 不清零也不覆盖)
 NEG_OUT="$E2E_TMP/negctl.out"
 negctl(){ ( "$@" ) > "$NEG_OUT" 2>&1; return 0; }
@@ -215,8 +237,22 @@ sed -i "s|listen: \"0.0.0.0:53\"|listen: \"$LISTEN_IP:$LISTEN_PORT\"|g; s|listen
 grep -q "listen: \"$LISTEN_IP:$LISTEN_PORT\"" /etc/mosdns/config.yaml \
   && ok "二-1: 配置里的监听已收窄到 $LISTEN_IP:$LISTEN_PORT(与 dns_probe 的查询端一致)" \
   || _prep_fail "监听没改成 $LISTEN_IP:$LISTEN_PORT"
-grep -c 'listen: "0.0.0.0' /etc/mosdns/config.yaml | grep -qx 0 \
-  && ok "二-2: 配置里不再有 0.0.0.0 监听" || _prep_fail "配置里还有 0.0.0.0 监听"
+_listen_wildcard_check /etc/mosdns/config.yaml; _lrc=$?
+case "$_lrc" in
+  0) ok "二-2: 配置里没有 0.0.0.0 通配监听(grep 正常跑完且零匹配)";;
+  1) _prep_fail "$_LISTEN_WHY";;
+  *) _prep_fail "无法完成监听检查 —— $_LISTEN_WHY";;
+esac
+# 三处 server(udp/tcp/dot)**都**要收窄到位, 不是"有一个正确监听就算全部正确"。
+_n53="$(grep -cE "listen:[[:space:]]*\"$LISTEN_IP:$LISTEN_PORT\"" /etc/mosdns/config.yaml || true)"
+_ndot="$(grep -cE "listen:[[:space:]]*\"$LISTEN_IP:$DOT_PORT\"" /etc/mosdns/config.yaml || true)"
+{ [[ "$_n53" == 2 && "$_ndot" == 1 ]]; } \
+  && ok "二-2b: 三处 server 全部收窄(udp/tcp 各一条 $LISTEN_IP:$LISTEN_PORT, dot 一条 $LISTEN_IP:$DOT_PORT)" \
+  || _prep_fail "收窄不全: $LISTEN_IP:$LISTEN_PORT 有 $_n53 条(应 2), $LISTEN_IP:$DOT_PORT 有 $_ndot 条(应 1)"
+# ECS 插件的 preset 不是监听, 必须原样留着 —— 收窄不该误伤它。
+grep -q 'preset: "0.0.0.0"' /etc/mosdns/config.yaml \
+  && ok "二-2c: ECS 插件的 preset: \"0.0.0.0\" 原样保留(没被当成违规监听改掉)" \
+  || _prep_fail "ECS preset 被改掉了 —— 收窄误伤了非监听配置"
 
 # ── 自建 unit: 登记归属之后再起 ─────────────────────────────────────────────
 OWN_UNIT=mosdns.service; OWN_UNIT_PATH=/etc/systemd/system/mosdns.service

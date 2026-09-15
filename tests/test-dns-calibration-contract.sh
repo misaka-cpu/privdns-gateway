@@ -16,7 +16,7 @@ if [[ -z "${PDG_DNSCAL_NS:-}" ]]; then
   HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   FAKE="$(mktemp -d)" || { echo "[未执行] 建不出自有根"; exit 1; }
   trap 'rm -rf "$FAKE"' EXIT
-  mkdir -p "$FAKE/etc/mosdns/rules" "$FAKE/etc/privdns-gateway" "$FAKE/var/lib" || { echo "[未执行] 自有根建不全"; exit 1; }
+  mkdir -p "$FAKE/etc/mosdns/rules" "$FAKE/etc/privdns-gateway" "$FAKE/etc/systemd/system" "$FAKE/var/lib" || { echo "[未执行] 自有根建不全"; exit 1; }
   cp -a /etc/alternatives "$FAKE/etc/" 2>/dev/null
   # 第 7 节的播种末尾要用 openssl 签一张自签证书, 它要读 /etc/ssl/openssl.cnf ——
   # 自有根里没有的话 openssl 会静默失败, 证书生不出来(那是**本测试的隔离根缺东西**,
@@ -213,12 +213,12 @@ grep -q '不符合预先固定的 U/H' "$WORK/v3.out" \
   && ok "6c: 前后一致但见证不等于 H(两边都是 U)也判红 —— 不是'两个非空串相等就行'" || { bad "6c"; cat "$WORK/v3.out" | sed 's/^/      /'; }
 P="$_P"; F="$_F"
 
+PIN="${PDG_PINPOINT_SH:-$HERE/e2e-dns-instrument-systemd.sh}"
 echo; echo "══ 7. 定点脚本的最小环境准备链(真播种函数; 自有根, 不写宿主 /etc 与 /var/lib)══"
 # 上一次 run 34932738273 栽在这里: e2e_seed_mosdns 假定 /etc/mosdns/rules 与
 # /etc/privdns-gateway 已存在(以前由 e2e_seed_install 顺手建), 目录不在时它一路写失败,
 # 末句 `chmod … || true` 却让它**返回 0** —— 配置压根没生成, 而 `|| _hard` 没触发。
 # 这一节用**真的** e2e_seed_mosdns 把整条准备链跑一遍, 判产物, 并验"被拒时没动服务"。
-PIN="${PDG_PINPOINT_SH:-$HERE/e2e-dns-instrument-systemd.sh}"
 if [[ ! -f "$PIN" ]]; then
   bad "7-0: 找不到定点脚本 $PIN"
 else
@@ -297,12 +297,45 @@ EOS
   note "7e 说明: 这里用的是 systemctl 桩的调用记录, 它证明的是'脚本没去动服务',"
   note "  **不是**真 systemd 上的启动证据 —— 那一条只能由定点派发回答。"
 
-  # ── 7f 健康准备能到达下一阶段, 且没顺带装产品 ───────────────────────────
-  RC_H2="$(run_prep "$PIN")"
-  pg '二. 监听地址与归属' && ok "7f-1: 健康准备确实走到了下一阶段(监听地址与归属)" || { bad "7f-1"; tail -6 "$WORK/prep.out" | sed 's/^/      /'; }
-  pg '一-1: \*\*没有\*\*安装 /usr/local/bin/pdg' && ok "7f-2: 没有安装 pdg" || bad "7f-2"
-  pg '一-2: \*\*没有\*\*复制仓库' && ok "7f-3: 没有复制仓库到 /opt/privdns-gateway" || bad "7f-3"
-  pg '一-3: \*\*没有\*\*安装任何 bot 模块' && ok "7f-4: 没有安装 bot 模块" || bad "7f-4"
+  # ── 7f 健康准备必须**真正跨过启动前边界** ────────────────────────────────
+  # 旧版只看"打印了下一节标题"就算过 —— 那证明不了它真的走完 目录准备 → 真实播种 →
+  # 产物核对 → 监听改写 → 监听核对 → 自建 unit 与启动调用 这一整条。
+  run_prep "$PIN" >/dev/null
+  PRE="$(awk '/二-3: 自建 unit/{exit} {print}' "$WORK/prep.out")"
+  PREFAIL="$(grep -c '^\[FAIL\]' <<<"$PRE" || true)"
+  [[ "$PREFAIL" == 0 ]] && ok "7f-1: 启动前范围内没有真实失败(0 条 [FAIL])" \
+    || { bad "7f-1: 启动前就有 $PREFAIL 条失败"; grep '^\[FAIL\]' <<<"$PRE" | head -4 | sed 's/^/      /'; }
+  pg '二-3: 自建 unit' && ok "7f-2: 走到了自建 unit 那段**实际代码**(不是打印标题)" \
+    || { bad "7f-2: 没走到"; tail -8 "$WORK/prep.out" | sed 's/^/      /'; }
+  # unit **确实被写出来过** —— 二-3 那行是在 `cat > $OWN_UNIT_PATH` 之后才打的;
+  # 跑完之后它不在了, 是收尾按设计撤掉的(这一格顺带验到了"正常清理"在模型里成立)。
+  [[ ! -e /etc/systemd/system/mosdns.service ]] \
+    && ok "7f-3: 跑完之后自建 unit 已被收尾撤除(创建本身由 7f-2 与 start 调用记录佐证)" \
+    || bad "7f-3: 自建 unit 跑完还留着 —— 收尾没撤掉"
+  grep -qE '^daemon-reload' "$SCLOG" && ok "7f-4: 有 daemon-reload 调用记录" || bad "7f-4: 没有 daemon-reload"
+  grep -qE '^start mosdns' "$SCLOG" && ok "7f-5: 有 start mosdns 调用记录" || { bad "7f-5: 没有 start"; head -8 "$SCLOG" | sed 's/^/      /'; }
+  pg '一-1: \*\*没有\*\*安装 /usr/local/bin/pdg' && ok "7f-6: 没有安装 pdg" || bad "7f-6"
+  pg '一-2: \*\*没有\*\*复制仓库' && ok "7f-7: 没有复制仓库到 /opt/privdns-gateway" || bad "7f-7"
+  pg '一-3: \*\*没有\*\*安装任何 bot 模块' && ok "7f-8: 没有安装 bot 模块" || bad "7f-8"
+  POSTFAIL="$(awk '/二-3: 自建 unit/{f=1} f' "$WORK/prep.out" | grep -c '^\[FAIL\]' || true)"
+  note "7f-9: 启动前 0 条失败; 启动**之后** $POSTFAIL 条 —— 后者是模型里没有真 mosdns 造成的,"
+  note "  与'启动前准备通过'分开报告; 不拿后段的预期失败去解释前段的任何失败。"
+
+  # ── 7h 违规监听同样要在动作之前停(撤掉监听收窄作反例)──────────────────────
+  python3 - "$PIN" "$WORK/nolisten.sh" <<'PYN'
+import sys
+src,dst=sys.argv[1],sys.argv[2]
+s=open(src,encoding="utf-8").read()
+a='sed -i "s|listen: \\"0.0.0.0:53\\"'
+i=s.index(a); j=s.index("\n", i)
+open(dst,"w",encoding="utf-8").write(s[:i]+"true  # 负控: 撤掉监听收窄\n"+s[j+1:])
+PYN
+  RC_NL="$(run_prep "$WORK/nolisten.sh")"
+  { [[ "$RC_NL" != 0 ]] && { pg '还有通配监听' || pg '监听没改成' || pg '收窄不全'; }; } \
+    && ok "7h-1: 监听没收窄时当场具名拒绝(rc=$RC_NL)" || { bad "7h-1"; tail -6 "$WORK/prep.out" | sed 's/^/      /'; }
+  [[ ! -e /etc/systemd/system/mosdns.service ]] && ok "7h-2: 被拒之后没有创建本轮 unit" || bad "7h-2: unit 竟然被创建了"
+  grep -qE '^daemon-reload|^start ' "$SCLOG" && bad "7h-3: 被拒之后仍动了服务" || ok "7h-3: 被拒之后没有 daemon-reload / start"
+
 
   # ── 7g 失败保留诊断; 汇总与退出码符合既有执行有效性契约 ──────────────────
   # 播种**没有输出**是正常的 —— 判"这份诊断在不在", 不判它非空。
@@ -311,9 +344,14 @@ EOS
     || bad "7g-1: 播种诊断没留"
   grep -qE '^通过 [0-9]+, 失败 [0-9]+$' "$WORK/prep.out" \
     && ok "7g-2: 仍然打出了汇总行" || bad "7g-2: 没有汇总行"
-  { [[ "$RC_H2" != 0 ]] && grep -qE '^\[FAIL\]' "$WORK/prep.out"; } \
-    && ok "7g-3: 退出码与日志里的 [FAIL] 一致(本机没有真 mosdns, 后面阶段本来就该红)" \
-    || note "7g-3: rc=$RC_H2(本机无真 mosdns, 这一格只看一致性)"
+  # 一致性: 日志里有 [FAIL] 就必须非零退出。用一次健康准备跑的结果来看。
+  RC_C="$(run_prep "$PIN")"
+  if grep -qE '^\[FAIL\]' "$WORK/prep.out"; then
+    [[ "$RC_C" != 0 ]] && ok "7g-3: 日志里有 [FAIL] 且退出码非零($RC_C) —— 两者一致" \
+                       || bad "7g-3: 日志里有 [FAIL] 却返回 0"
+  else
+    [[ "$RC_C" == 0 ]] && ok "7g-3: 日志里没有 [FAIL] 且返回 0 —— 两者一致" || bad "7g-3: 没有 [FAIL] 却非零($RC_C)"
+  fi
 
   # ── 撤销对照 ─────────────────────────────────────────────────────────────
   U="$WORK/u.sh"
@@ -340,6 +378,67 @@ PYU
     || { bad "U2: 撤掉硬门却没往下走, 这一格没验到东西"; tail -6 "$WORK/prep.out" | sed 's/^/      /'; }
   rm -rf /etc/mosdns /etc/privdns-gateway /var/lib/privdns-gateway /etc/systemd/system/mosdns.service
 fi
+
+echo; echo "══ 8. 监听残留检查的三态(真实 set -uo pipefail 条件下)══"
+# 上一次 run 34934021143 的唯一失败就出在这条检查: 写成 `grep -c … | grep -qx 0`,
+# 而 grep 零匹配退 1 + pipefail ⇒ **配置正确时反而判红**。
+# 三态: 0=发现违规(拒) / 1=正常跑完且零匹配(放行) / 其它=检查本身没做成(也拒)。
+CHK="$(_fn "$PIN" _listen_wildcard_check)"
+if [[ -z "$CHK" ]]; then
+  bad "8-0: 抽不到 _listen_wildcard_check"
+else
+  ok "8-0: 从定点脚本原文抽到了 _listen_wildcard_check"
+  L="$WORK/lsn"; mkdir -p "$L"
+  # 健康: 三处都收窄, 且 ECS 的 preset 原样留着
+  cat > "$L/ok.yaml" <<'EOS'
+  - tag: ecs_neutral
+    args: {forward: false, send: true, preset: "0.0.0.0", mask4: 24, mask6: 48}
+  - tag: udp_server
+    args: {entry: main_sequence, listen: "127.0.0.1:53"}
+  - tag: tcp_server
+    args: {entry: main_sequence, listen: "127.0.0.1:53"}
+  - tag: dot_server
+    args: {entry: main_sequence, listen: "127.0.0.1:8853", cert: "/c/f.pem", key: "/c/k.pem"}
+EOS
+  # 违规: 只留一处没收窄
+  sed 's|listen: "127.0.0.1:8853"|listen: "0.0.0.0:853"|' "$L/ok.yaml" > "$L/bad.yaml"
+  # 读取错误: 自指符号链接(ELOOP) —— 错误发生在**这条检查**上, 不是靠更早的"文件不存在"门
+  ln -sf "$L/loop.yaml" "$L/loop.yaml"
+  # 在真实 set -uo pipefail 条件下驱动
+  run_chk(){   # $1=函数体 $2=目标 → "rc|why"
+    bash -c "set -uo pipefail
+_LISTEN_WHY=''
+$1
+_listen_wildcard_check '$2'; rc=\$?
+printf '%s|%s\n' \"\$rc\" \"\${_LISTEN_WHY:-}\""
+  }
+  R="$(run_chk "$CHK" "$L/ok.yaml")"
+  [[ "${R%%|*}" == 0 ]] && ok "8a: 三处都收窄且 ECS preset 保留 → 放行(rc=0)" || { bad "8a: 实得 $R"; }
+  R="$(run_chk "$CHK" "$L/bad.yaml")"
+  { [[ "${R%%|*}" == 1 ]] && [[ "$R" == *'0.0.0.0:853'* ]]; } \
+    && ok "8b: 留一处禁止监听 → 具名拒绝(rc=1, 点名了那一行)" || bad "8b: 实得 $R"
+  R="$(run_chk "$CHK" "$L/loop.yaml")"
+  { [[ "${R%%|*}" != 0 && "${R%%|*}" != 1 ]] && [[ "$R" == *'退出码'* ]]; } \
+    && ok "8c: 检查本身读取出错 → 第三态(rc=${R%%|*}), 没有把错误反转成通过" || bad "8c: 实得 $R"
+  # 8d 换回原管道: 健康配置重新转红
+  OLDCHK='_listen_wildcard_check(){ _LISTEN_WHY="旧管道"; grep -c '"'"'listen: "0.0.0.0'"'"' "$1" | grep -qx 0; }'
+  R="$(run_chk "$OLDCHK" "$L/ok.yaml")"
+  [[ "${R%%|*}" != 0 ]] && ok "8d: 换回 \`grep -c … | grep -qx 0\` → 健康配置重新转红(rc=${R%%|*}) —— 正是上一次那个误判" \
+                        || bad "8d: 旧管道居然没复现误判($R)"
+  # 8e 换成单纯 ! grep: 读取错误用例被当成"干净"
+  NOTCHK='_listen_wildcard_check(){ _LISTEN_WHY="单纯!grep"; ! grep -q '"'"'listen:[[:space:]]*"0\.0\.0\.0:'"'"' "$1"; }'
+  R="$(run_chk "$NOTCHK" "$L/loop.yaml")"
+  [[ "${R%%|*}" == 0 ]] && ok "8e: 换成单纯 \`! grep\` → 读取错误被当成'没有违规'(rc=0) —— 所以不能那么写" \
+                        || bad "8e: 没复现出来($R)"
+  # 8f 无关注释对照: 只在函数体里加一行注释, 三态结果一个都不变
+  CMTCHK="$(printf '%s\n' "$CHK" | sed '2i\  # 本行仅为无关注释对照' )"
+  same=1
+  for t in ok bad loop; do
+    [[ "$(run_chk "$CHK" "$L/$t.yaml")" == "$(run_chk "$CMTCHK" "$L/$t.yaml")" ]] || same=0
+  done
+  [[ "$same" == 1 ]] && ok "8f: 无关注释对照 —— 三个用例结果逐一相同, 零新增失败" || bad "8f: 加一行注释竟然改变了结果"
+fi
+
 
 echo "──────────────────────────────────────────────"
 echo "通过 $P, 失败 $F"
