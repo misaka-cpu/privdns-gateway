@@ -25,6 +25,28 @@ curl -fsSL https://raw.githubusercontent.com/misaka-cpu/privdns-gateway/main/ins
 
 入口脚本只负责自举,实际安装会自动切到最新 `v*` 发布 tag,不安装 main 上未发布的中间提交。
 
+### 装**指定**的已发布版本:`--ref <版本 tag>`
+
+不给这个参数时行为与以前完全一样(装最新发布)。需要停在某一个已发布版本时:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/misaka-cpu/privdns-gateway/main/install.sh | sudo bash -s -- --ref v1.11.15
+# 或在仓库目录里
+sudo ./install.sh --ref v1.11.15
+```
+
+几条有意做窄的约束:
+
+* 只接受**版本 tag 名**(`v` 开头,只含数字/字母/点/加号/连字符)。分支名、裸 commit SHA、
+  任意 shell 内容都会被直接拒绝。
+* 目标必须在取件到的仓库里真的存在;**取不到就停,不会改装最新版**。取件本身失败同样直接停。
+* 这个目标会贯穿两段自举,并在真正开始安装之前再核一次仓库 HEAD ——
+  中途"重新选最新"会被当场判失败。
+* 没有 `FORCE` / `SKIP` / `BYPASS` 之类的开关,不绕过任何既有校验(二进制 SHA256 等照旧)。
+
+> 说明:这是**新版安装入口**提供的参数。旧机器上的做法是去取这一份新的 `install.sh` 再带参数运行,
+> 并不要求机器上已装的旧版 CLI 认识这个参数。
+
 或克隆后运行:
 
 ```bash

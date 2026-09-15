@@ -561,6 +561,11 @@ jobs:
       - name: "install 二进制事务回归 (备份失败即中止/半截安装可恢复/强制重装也还原/清理失败不假报)"
         run: bash tests/test-install-bintxn.sh
 
+      # 公开入口 --ref <版本 tag>: 指定的版本必须真的被装上, 不许悄悄回退到最新版。
+      # 用自有一次性测试源(裸库 + 三个版本 tag), 跑真的两段自举, 判据落在 git 实读的 HEAD 上。
+      - name: "安装入口 --ref (指定版本贯穿两段自举; 不存在/非法/取件失败一律拒绝)"
+        run: bash tests/test-install-ref-entry.sh
+
       - name: "bot 导航回归 (操作结果不刷一级菜单)"
         run: python3 tests/test-bot-nav.py
 
