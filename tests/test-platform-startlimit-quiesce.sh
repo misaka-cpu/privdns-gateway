@@ -332,8 +332,17 @@ if [[ -f "$CI" ]]; then
   { [[ "$SEL" == 2 ]] && [[ "$RET" == 1 ]] && [[ "$ALL" == 3 ]] && [[ "$EMP" == 3 ]]; } \
     && ok "7a: 三个真实验收 job 都挂了范围条件(platform 2 / retire 1 / all 与空各 3)" \
     || bad "7a: platform=$SEL retire=$RET all=$ALL 空=$EMP"
-  grep -q 'options: \["all", "platform", "retire"\]' "$CI" \
-    && ok "7b: real_scope 是显式选项(all/platform/retire)" || bad "7b: 选项不对"
+  # 选项集合可以增加(例如后来加了 bridge), 但必须仍然是**显式枚举**, 且 all/platform/retire 都在。
+  _opt="$(grep -m1 'options: \["all"' "$CI")"
+  { [[ "$_opt" == *'"all"'* ]] && [[ "$_opt" == *'"platform"'* ]] && [[ "$_opt" == *'"retire"'* ]]; } \
+    && ok "7b: real_scope 仍是显式枚举, 且 all/platform/retire 都在($(sed 's/^ *//' <<<"$_opt"))" \
+    || bad "7b: 选项不对: $_opt"
+  # 新增的范围必须**也**挂在某个 job 的条件上, 不能只加选项却没人用
+  for _extra in $(sed -E 's/.*options: \[(.*)\].*/\1/' <<<"$_opt" | tr -d '" ' | tr ',' ' '); do
+    case "$_extra" in all) continue;; esac
+    grep -q "real_scope == '$_extra'" "$CI" \
+      && ok "7b+: 范围 '$_extra' 有 job 真的用它" || bad "7b+: 选项里有 '$_extra' 却没有任何 job 用它"
+  done
   awk '/^      real_scope:/{f=1} f&&/default:/{print; exit}' "$CI" | grep -q 'default: "all"' \
     && ok "7c: 默认值仍是 all(老式派发语义逐字保留)" || bad "7c: 默认值不是 all"
   grep -n 'continue-on-error' "$CI" | grep -qE 'real-(platform|retire)' \

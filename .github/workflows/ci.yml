@@ -22,6 +22,14 @@ on:
         description: "冻结退役候选所在的分支名(取件用; 它的 head 必须等于上面的 SHA)"
         type: string
         default: ""
+      bridge_candidate:
+        description: "桥接候选的完整 SHA(② 这一跳要装上去的那一版)"
+        type: string
+        default: ""
+      bridge_branch:
+        description: "桥接候选所在的分支名(取件用; head 必须等于上面的 SHA)"
+        type: string
+        default: ""
       product_base:
         description: "候选与官方 main 的共同 base(用于产品面对账)"
         type: string
@@ -36,9 +44,9 @@ on:
         # 选 platform 就只跑⑤a/⑤b 两个平台方向, 选 retire 就只跑④旧 CLI 直跳被拒。
         # 是**显式范围选择**, 不是用 continue-on-error 把失败绕过去 —— 被选中的 job
         # 该红照样红, 没被选中的 job 直接不启动(不产生结果, 也不冒充通过)。
-        description: "真实验收的范围(默认 all = 三个都跑; platform = 只跑⑤a/⑤b; retire = 只跑④)"
+        description: "真实验收的范围(默认 all; platform = 只跑⑤a/⑤b; retire = 只跑④; bridge = 只跑② v1.11.15→桥接)"
         type: choice
-        options: ["all", "platform", "retire"]
+        options: ["all", "platform", "retire", "bridge"]
         default: "all"
 
 permissions:
@@ -2079,6 +2087,82 @@ jobs:
           PDG_PLAT_DIR: "i2a"
         run: sudo -E bash tests/e2e-real-platform-fail.sh
       - name: "留证: 把证据文件与 journal 打进 job 日志(成败都留)"
+        if: ${{ always() }}
+        run: |
+          set +e
+          echo "########## journal(相关 unit, 末 200 行) ##########"
+          sudo journalctl -u pdg-mitm -u mosdns -u mihomo -u pdg-bot --no-pager -n 200 2>&1 | tail -200
+          echo
+          for f in $(sudo ls -1 /tmp/real-acceptance-evidence 2>/dev/null); do
+            echo "########## EVIDENCE $f ##########"
+            sudo cat "/tmp/real-acceptance-evidence/$f"
+            echo
+          done
+
+  real-bridge-hop:
+    needs: prepare-mosdns-fixture
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.real_acceptance == 'true'
+            && (github.event.inputs.real_scope == 'bridge') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    name: "真实验收②: v1.11.15 → 桥接版(公开入口 install.sh --ref)"
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0          # 旧版对象与两个候选都要从本地取
+      - name: "取桥接/退役候选分支, 并核对 head == 派发时指定的 SHA"
+        env:
+          PDG_BRIDGE_SHA: ${{ github.event.inputs.bridge_candidate }}
+          PDG_BRIDGE_BR:  ${{ github.event.inputs.bridge_branch }}
+          PDG_CAND_SHA:   ${{ github.event.inputs.product_candidate }}
+          PDG_CAND_BR:    ${{ github.event.inputs.candidate_branch }}
+        run: |
+          set -euo pipefail
+          test -n "$PDG_BRIDGE_SHA" || { echo "必须显式指定桥接候选 SHA"; exit 1; }
+          test -n "$PDG_BRIDGE_BR"  || { echo "必须显式指定桥接候选分支名"; exit 1; }
+          test -n "$PDG_CAND_SHA"   || { echo "必须显式指定退役候选 SHA(只用来证明它没被误装)"; exit 1; }
+          test -n "$PDG_CAND_BR"    || { echo "必须显式指定退役候选分支名"; exit 1; }
+          git fetch --no-tags origin "+refs/heads/$PDG_BRIDGE_BR:refs/heads/pdg-bridge"
+          git fetch --no-tags origin "+refs/heads/$PDG_CAND_BR:refs/heads/pdg-candidate"
+          git fetch --tags origin
+          gotb=$(git rev-parse refs/heads/pdg-bridge); gotc=$(git rev-parse refs/heads/pdg-candidate)
+          echo "桥接候选 $PDG_BRIDGE_BR = $gotb"
+          echo "退役候选 $PDG_CAND_BR  = $gotc"
+          echo "验收 checkout            = ${{ github.sha }}"
+          test "$gotb" = "$PDG_BRIDGE_SHA" || { echo "桥接候选 head 与派发时指定的 SHA 不符"; exit 1; }
+          test "$gotc" = "$PDG_CAND_SHA"   || { echo "退役候选 head 与派发时指定的 SHA 不符"; exit 1; }
+      - name: "PID 1 必须是真 systemd, systemctl 必须是真二进制(不是就判失败, 不 SKIP)"
+        run: |
+          set -euo pipefail
+          comm=$(cat /proc/1/comm); echo "PID 1 = $comm"; test "$comm" = systemd
+          w="$(command -v systemctl)"; echo "systemctl = $w"
+          test -x "$w" && { test "$w" = /usr/bin/systemctl || test "$w" = /bin/systemctl; }
+      - name: 装依赖
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            nftables dnsutils iproute2 openssl python3 git unzip psmisc procps >/dev/null
+          nft --version
+      - name: "推导 mosdns artifact 名"
+        run: echo "MOSDNS_ARTIFACT=$(bash tests/mosdns-artifact-name.sh)" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ env.MOSDNS_ARTIFACT }}
+          path: /tmp/mosdns-fixture
+      - name: "校验并安装钉定 mosdns"
+        run: sudo -E bash tests/install-mosdns-artifact.sh /tmp/mosdns-fixture
+      - name: "校验并安装钉定 mihomo"
+        run: sudo -E bash tests/install-mihomo-artifact.sh /tmp/mosdns-fixture
+      - name: "真实验收②: 公开入口 install.sh --ref 把 v1.11.15 升到桥接版"
+        env:
+          PDG_E2E_ISOLATED: "1"
+          PDG_REAL_MIGRATION_OK: "1"
+          PDG_REAL_MIG_EVID: "/tmp/real-acceptance-evidence"
+          PDG_BRIDGE_SHA: ${{ github.event.inputs.bridge_candidate }}
+          PDG_RETIRE_SHA: ${{ github.event.inputs.product_candidate }}
+        run: sudo -E bash tests/e2e-real-bridge-hop.sh
+      - name: "留证: 证据文件与 journal(成败都留)"
         if: ${{ always() }}
         run: |
           set +e
