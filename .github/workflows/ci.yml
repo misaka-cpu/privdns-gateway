@@ -26,6 +26,11 @@ on:
         description: "候选与官方 main 的共同 base(用于产品面对账)"
         type: string
         default: "95caf26f108a7740fc6fbacb7181f775b6f41971"
+      dns_instrument:
+        description: "DNS 仪器定点验收(**只**验仪器与收尾; 不装退役候选, 不跑 update/迁移/平台切换)"
+        type: choice
+        options: ["false", "true"]
+        default: "false"
 
 permissions:
   contents: read
@@ -1822,6 +1827,57 @@ jobs:
             echo "########## EVIDENCE $f ##########"
             sudo cat "/tmp/real-acceptance-evidence/$f"
             echo
+          done
+
+  dns-instrument:
+    needs: prepare-mosdns-fixture
+    # 默认关着: push / pull_request 与不勾这一项的手动派发, 行为逐字节不变。
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dns_instrument == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    name: "DNS 仪器定点验收: 真 systemd + 钉死 mosdns, 只验仪器与收尾"
+    steps:
+      - uses: actions/checkout@v5
+      - name: "说清这一次到底装了什么(不装退役候选)"
+        run: |
+          set -euo pipefail
+          echo "验收 checkout = ${{ github.sha }}"
+          echo "产品来源      = **不涉及** —— 本 job 不安装任何退役/桥接候选,"
+          echo "                只用 checkout 里的 tests/ 夹具 + 钉死版 mosdns 二进制。"
+          echo "被测对象      = tests/e2e-real-platform-fail.sh 里那九个 DNS 函数的原文"
+      - name: "PID 1 必须是真 systemd, systemctl 必须是真二进制(不是就判失败, 不 SKIP)"
+        run: |
+          set -euo pipefail
+          comm=$(cat /proc/1/comm); echo "PID 1 = $comm"; test "$comm" = systemd
+          w="$(command -v systemctl)"; echo "systemctl = $w"
+          test -x "$w" && { test "$w" = /usr/bin/systemctl || test "$w" = /bin/systemctl; }
+      - name: 装依赖
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            nftables dnsutils iproute2 openssl python3 git unzip psmisc procps >/dev/null
+      - name: "推导 mosdns artifact 名"
+        run: echo "MOSDNS_ARTIFACT=$(bash tests/mosdns-artifact-name.sh)" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ env.MOSDNS_ARTIFACT }}
+          path: /tmp/mosdns-fixture
+      - name: "校验并安装钉定 mosdns (自算 SHA / manifest 交叉 / 自报版本 / 生产判据)"
+        run: sudo -E bash tests/install-mosdns-artifact.sh /tmp/mosdns-fixture
+      - name: "DNS 仪器定点验收"
+        env:
+          PDG_E2E_ISOLATED: "1"
+          PDG_REAL_MIG_EVID: "/tmp/dns-instrument-evidence"
+        run: sudo -E bash tests/e2e-dns-instrument-systemd.sh
+      - name: "留证: 证据文件与 mosdns journal(成败都留)"
+        if: ${{ always() }}
+        run: |
+          set +e
+          echo "########## journal(mosdns, 末 120 行) ##########"
+          sudo journalctl -u mosdns --no-pager -n 120 2>&1 | tail -120
+          for f in $(sudo ls -1 /tmp/dns-instrument-evidence 2>/dev/null); do
+            echo "########## EVIDENCE $f ##########"; sudo cat "/tmp/dns-instrument-evidence/$f"; echo
           done
 
   real-platform-fail-a2i:
