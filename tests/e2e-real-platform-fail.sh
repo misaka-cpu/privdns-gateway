@@ -997,8 +997,100 @@ wait_stable(){   # $1=unit  [$2=最多等几秒, 默认 25]
 #   · 等待长度由**实际生效的有限窗口**推出来, 并且有上限 —— 不做无界等待;
 #   · 静置是**测试前置**: 期间只要出现自动重启、状态不稳, 就判前置不成立, 不重试到绿。
 STARTLIMIT_CAP=60          # 静置上限(秒): 生效窗口超过它就判前置不成立, 不无界等
-PH_T0=""; T_CAL0=""; T_CAL1=""; T_PROD0=""; T_PROD1=""
-_now_j(){ date +'%Y-%m-%d %H:%M:%S'; }        # journalctl --since/--until 认的本地时刻
+# ── 事件边界: 用**自有标记自身的 journal 游标**当界桩 ────────────────────────
+# 上一次(run 34960827400)栽在这: 边界取 `date +秒`, 而 `journalctl --since` 是秒级且**含边界**,
+# 标定末尾那几次重启正好落在同一秒里, 被重复算进了静置窗口。
+# 现在: 秒级时刻**只留给人读**, 不再裁决任何事件的归属。归属一律由界桩决定 ——
+#   · 往 journal 写一条自有标记, 取**它自己的 __CURSOR** 当界桩(本机实测: 同一秒内
+#     写在界桩之前的记录不会被算进 --after-cursor, 之后的一条不漏);
+#   · 游标是不透明串: 只拿去 --after-cursor, 绝不比较大小来判先后;
+#   · 界桩必须**自证落地**: 写完 sync 后要能按标记内容把它自己的游标读回来, 读不到 = 观测无效;
+#   · 相邻阶段**共享同一个界桩** ⇒ 每条记录只归一个区间。区间 (A,B] 的条数 =
+#     after(A) − after(B), 两次查询都在 B 落地之后做, 其后新到的事件对两边等量影响。
+PH_T0=""; T_CAL0=""; T_CAL1=""; T_PROD0=""; T_PROD1=""      # 仅供阅读的秒级时刻
+C_PREP0=""; C_CAL0=""; C_CAL1=""; C_PROD0=""; C_PROD1=""    # 裁决归属的界桩游标
+J_ERR=""
+JBOUND_TAG="pdg-e2e-jbound"
+# 这几个函数多数在 $( ) 里被调用 —— 子壳里给变量赋的值回不到调用方, 上一版的"原因"
+# 因此总是空的。改成写文件: 写在子壳里, 调用方读得到。stdout(计数) / stderr(原始报错) /
+# 退出码三者分开留证, 不混成一句。
+_j_why_file(){ printf '%s\n' "${E2E_TMP:-${TMPDIR:-/tmp}}/j-why.txt"; }
+_j_err_file(){ printf '%s\n' "${E2E_TMP:-${TMPDIR:-/tmp}}/j-err.txt"; }
+_j_fail(){ printf '%s\n' "$1" > "$(_j_why_file)" 2>/dev/null; }   # 原因只走文件, 子壳里也回得来
+_j_why(){  cat "$(_j_why_file)" 2>/dev/null; }
+_j_err(){  cat "$(_j_err_file)" 2>/dev/null; }
+_now_j(){ date +'%Y-%m-%d %H:%M:%S'; }        # **只**用于人读的时刻, 不做事件归属
+_j_sync(){ journalctl --sync >/dev/null 2>&1; }   # 尽力刷盘; 真正的可见性由界桩自证
+_j_mark(){   # $1=界桩名 → 打印该界桩自己的游标; 取不到回空(观测无效, 由调用方判前置)
+  local id="$1-$$-${RANDOM}" i cur
+  if command -v logger >/dev/null 2>&1; then
+    logger -t "$JBOUND_TAG" "BOUNDARY $id" 2>/dev/null || { _j_fail "写不进 journal 界桩(logger 失败)"; return 1; }
+  elif command -v systemd-cat >/dev/null 2>&1; then
+    printf 'BOUNDARY %s\n' "$id" | systemd-cat -t "$JBOUND_TAG" 2>/dev/null \
+      || { _j_fail "写不进 journal 界桩(systemd-cat 失败)"; return 1; }
+  else
+    _j_fail "这台机器上没有 logger / systemd-cat, 建不出界桩"; return 1
+  fi
+  # journald 是异步的: sync 之后按标记内容**读回它自己的游标**, 读不到就重试, 超时判无效。
+  for ((i=0; i<20; i++)); do
+    _j_sync
+    cur="$(journalctl -t "$JBOUND_TAG" --no-pager -o json --output-fields=MESSAGE 2>/dev/null \
+           | python3 -c '
+import sys, json
+want = "BOUNDARY " + sys.argv[1]
+out = ""
+for line in sys.stdin:
+    try: d = json.loads(line)
+    except Exception: continue
+    if d.get("MESSAGE") == want and d.get("__CURSOR"): out = d["__CURSOR"]
+print(out)' "$id" 2>/dev/null)"
+    [[ -n "$cur" ]] && { printf '%s\n' "$cur"; return 0; }
+    sleep 0.3
+  done
+  _j_fail "界桩写进去了却读不回来(journal 可见性未确认, 等了 6s)"; return 1
+}
+_j_starts_after(){   # $1=unit $2=界桩游标 → 打印该界桩之后的启动条数; 观测无效回空并置 J_WHY
+  local u="$1" cur="$2" errf raw rc n grc
+  J_ERR=""; : > "$(_j_why_file)" 2>/dev/null
+  [[ -n "$cur" ]] || { _j_fail "没有界桩游标(边界缺失)"; echo ""; return 1; }
+  errf="$(_j_err_file)"
+  raw="$(journalctl -u "$u" --after-cursor "$cur" --no-pager -o short-iso 2>"$errf")"; rc=$?
+  J_ERR="$(head -3 "$errf" 2>/dev/null | tr '\n' ' ')"
+  # 查询失败与"查询成功但零匹配"是两件事: 前者观测无效, 后者是合法的 0。
+  if [[ "$rc" != 0 ]]; then
+    _j_fail "journalctl 退出码 $rc: ${J_ERR:-（无 stderr）}"; echo ""; return 1
+  fi
+  n="$(grep -cE "Started ${u}(\.service)?[ .]" <<<"$raw")"; grc=$?
+  if [[ "$grc" -gt 1 ]]; then _j_fail "解析失败(grep 退出码 $grc; stderr: ${J_ERR:-无})"; echo ""; return 1; fi
+  [[ "$n" =~ ^[0-9]+$ ]] || { _j_fail "解析结果不是数字: [$n]"; echo ""; return 1; }
+  printf '%s\n' "$n"; return 0
+}
+_j_tag_after(){   # $1=界桩游标 → 该游标之后**界桩自己**那条 tag 的记录数(用来验边界有效与先后)
+  local cur="$1" errf raw rc n grc
+  [[ -n "$cur" ]] || { _j_fail "没有界桩游标(边界缺失)"; echo ""; return 1; }
+  errf="$(_j_err_file)"
+  raw="$(journalctl -t "$JBOUND_TAG" --after-cursor "$cur" --no-pager -o cat 2>"$errf")"; rc=$?
+  [[ "$rc" == 0 ]] || { _j_fail "界桩查询失败(journalctl 退出码 $rc: $(head -1 "$errf" 2>/dev/null))"; echo ""; return 1; }
+  n="$(grep -c '^BOUNDARY ' <<<"$raw")"; grc=$?
+  [[ "$grc" -gt 1 ]] && { _j_fail "界桩解析失败(grep 退出码 $grc)"; echo ""; return 1; }
+  [[ "$n" =~ ^[0-9]+$ ]] || { _j_fail "界桩计数不是数字: [$n]"; echo ""; return 1; }
+  printf '%s\n' "$n"; return 0
+}
+_j_interval(){   # $1=unit $2=起界桩 $3=止界桩 → (起,止] 的启动条数; 观测无效回空
+  local a b ta tb
+  a="$(_j_starts_after "$1" "$2")" || { echo ""; return 1; }
+  b="$(_j_starts_after "$1" "$3")" || { echo ""; return 1; }
+  if [[ "$a" -lt "$b" ]]; then _j_fail "区间条数为负(起=$a 止=$b) —— 界桩顺序不对"; echo ""; return 1; fi
+  # 边界有效性与先后, 不靠比较游标字符串: 界桩自己也在 journal 里, 止界桩那条记录必然
+  # 落在 (起,止] 内 ⇒ 起界桩之后的界桩条数至少要比止界桩之后的多一条。
+  ta="$(_j_tag_after "$2")" || { echo ""; return 1; }
+  tb="$(_j_tag_after "$3")" || { echo ""; return 1; }
+  if (( ta - tb < 1 )); then
+    _j_fail "界桩自证不成立(起界桩之后的界桩数 $ta, 止界桩之后 $tb) —— 边界无效或顺序不对"
+    echo ""; return 1
+  fi
+  printf '%s\n' "$(( a - b ))"; return 0
+}
 _dur2s_real(){   # systemd 的人类可读时长 → 秒; infinity/0 原样回显
   local in="$1" tot=0 t n un seen=0
   [[ -n "$in" ]] || { echo ""; return 1; }
@@ -1019,12 +1111,6 @@ _dur2s_real(){   # systemd 的人类可读时长 → 秒; infinity/0 原样回�
   (( seen )) || { echo ""; return 1; }
   echo "$tot"
 }
-_unit_starts(){   # $1=unit $2=起 [$3=止] → 这段时间里该 unit 被**启动**了几次(journal 实读)
-  local u="$1" a="$2" b="${3:-}"
-  local args=(-u "$u" --since "$a" --no-pager)
-  [[ -n "$b" ]] && args+=(--until "$b")
-  journalctl "${args[@]}" 2>/dev/null | grep -cE "Started ${u}(\.service)?[ .]" || true
-}
 startlimit_inventory(){   # 清点: 产品这份 unit 实际生效的限制 + 计划内的准备重启次数
   local u=mosdns int burst ints
   int="$(systemctl show -p StartLimitIntervalUSec --value "$u" 2>/dev/null)"
@@ -1038,7 +1124,7 @@ startlimit_inventory(){   # 清点: 产品这份 unit 实际生效的限制 + �
   _evn "06-$DIR-phases.txt" "启动预算: $u 生效 Interval=$int(=${ints:-?}s) Burst=$burst"
 }
 quiesce_startlimit(){   # $1=阶段说明 —— 依生效窗口做**有界**静置, 并证明静置期间什么都没起
-  local u=mosdns wait_s nr0 nr1 st during t0
+  local u=mosdns wait_s nr0 nr1 st during q0 q1 t0
   [[ -n "${SL_INT_S:-}" ]] || { bad "静置($1): 还没清点生效窗口"; PREIMAGE_OK=0; return 1; }
   case "$SL_INT_S" in
     ""|infinity|0)
@@ -1047,34 +1133,52 @@ quiesce_startlimit(){   # $1=阶段说明 —— 依生效窗口做**有界**静
   esac
   [[ "$SL_INT_S" -le "$STARTLIMIT_CAP" ]] \
     || { bad "静置($1): 生效窗口 ${SL_INT_S}s 超过上限 ${STARTLIMIT_CAP}s —— 不做无界等待, 前置不成立"; PREIMAGE_OK=0; return 1; }
-  wait_s=$(( SL_INT_S + 3 ))     # 窗口 + 3s 余量: 让窗口内的计数确实滑出去
+  wait_s=$(( SL_INT_S + 3 ))     # 窗口 + 3s 余量: 让窗口内的计数确实滑出去(不是保险时间)
+  # 起界桩: 取不到就是**观测无效**, 不生成"0 次启动"的结论。
+  q0="$(_j_mark "quiesce-$1-start")" \
+    || { bad "静置($1): 观测无效 —— 起界桩没建成: $(_j_why)"; PREIMAGE_OK=0; return 1; }
   nr0="$(systemctl show -p NRestarts --value "$u" 2>/dev/null)"
-  t0="$(_now_j)"
+  [[ "$nr0" =~ ^[0-9]+$ ]] \
+    || { bad "静置($1): 观测无效 —— NRestarts 读不到合法数值(实得 '''${nr0:-空}''')"; PREIMAGE_OK=0; return 1; }
+  t0="$(_now_j)"                 # 仅供阅读
   sleep "$wait_s"
   nr1="$(systemctl show -p NRestarts --value "$u" 2>/dev/null)"
+  [[ "$nr1" =~ ^[0-9]+$ ]] \
+    || { bad "静置($1): 观测无效 —— 静置后 NRestarts 读不到合法数值(实得 '''${nr1:-空}''')"; PREIMAGE_OK=0; return 1; }
+  q1="$(_j_mark "quiesce-$1-end")" \
+    || { bad "静置($1): 观测无效 —— 止界桩没建成: $(_j_why)"; PREIMAGE_OK=0; return 1; }
+  during="$(_j_interval "$u" "$q0" "$q1")" \
+    || { bad "静置($1): 观测无效 —— $(_j_why)(stderr: $(_j_err | head -1))"; PREIMAGE_OK=0; return 1; }
   st="$(wait_stable "$u")"
-  during="$(_unit_starts "$u" "$t0")"
-  _evn "06-$DIR-phases.txt" "静置($1): $t0 起 ${wait_s}s(窗口 ${SL_INT_S}s+3s); 期间启动 $during 次; NRestarts $nr0→$nr1; 稳定后 $st"
+  _evn "06-$DIR-phases.txt" "静置($1): $t0 起 ${wait_s}s(窗口 ${SL_INT_S}s+3s; 归属由界桩裁决, 时刻仅供阅读); 区间内启动 $during 次; NRestarts $nr0→$nr1; 稳定后 $st"
   { [[ "$during" == 0 ]] && [[ "$nr1" == "$nr0" ]] && [[ "$st" == active ]]; } \
-    && ok "静置($1): 按实际生效窗口 $SL_INT 静置 ${wait_s}s —— 期间 0 次启动, 没有自动重启(NRestarts=$nr0), $u 稳定在 $st" \
-    || { bad "静置($1): 期间启动 $during 次 / NRestarts $nr0→$nr1 / 稳定后 $st —— 前置不成立(不重试到绿)"; PREIMAGE_OK=0; return 1; }
+    && ok "静置($1): 按实际生效窗口 $SL_INT 静置 ${wait_s}s —— 界桩区间内 0 次启动, 没有自动重启(NRestarts=$nr0), $u 稳定在 $st" \
+    || { bad "静置($1): 区间内启动 $during 次 / NRestarts $nr0→$nr1 / 稳定后 $st —— 前置不成立(不重试到绿)"; PREIMAGE_OK=0; return 1; }
   return 0
 }
 phase_report(){   # 把"准备动作"与"产品动作"的边界连同实际启动记录一起留证
-  local u=mosdns
-  echo "── 阶段边界与 $u 的实际启动记录(journal 实读, 原始日志一行不删)──"
-  printf '    %-26s %s\n' "准备阶段(含造前像/装候选)" "$PH_T0 → $T_CAL0   启动 $(_unit_starts "$u" "$PH_T0" "$T_CAL0") 次"
-  printf '    %-26s %s\n' "标定阶段(仪器自己的重启)"   "$T_CAL0 → $T_CAL1   启动 $(_unit_starts "$u" "$T_CAL0" "$T_CAL1") 次"
-  printf '    %-26s %s\n' "静置#2 + 正式前像采集"      "$T_CAL1 → $T_PROD0  启动 $(_unit_starts "$u" "$T_CAL1" "$T_PROD0") 次"
-  printf '    %-26s %s\n' "**产品动作** pdg platform"  "$T_PROD0 → $T_PROD1 启动 $(_unit_starts "$u" "$T_PROD0" "$T_PROD1") 次"
+  local u=mosdns a b c d
+  a="$(_j_interval "$u" "$C_PREP0" "$C_CAL0")";  a="${a:-观测无效}"
+  b="$(_j_interval "$u" "$C_CAL0"  "$C_CAL1")";  b="${b:-观测无效}"
+  c="$(_j_interval "$u" "$C_CAL1"  "$C_PROD0")"; c="${c:-观测无效}"
+  d="$(_j_interval "$u" "$C_PROD0" "$C_PROD1")"; d="${d:-观测无效}"
+  echo "── 阶段边界与 $u 的实际启动记录(界桩裁决归属; 时刻仅供阅读, 原始日志一行不删)──"
+  printf '    %-28s %s\n' "准备阶段(造前像/装候选)"   "$PH_T0 → $T_CAL0    启动 $a 次"
+  printf '    %-28s %s\n' "标定阶段(仪器自己的重启)"   "$T_CAL0 → $T_CAL1   启动 $b 次"
+  printf '    %-28s %s\n' "静置#2 + 正式前像采集"      "$T_CAL1 → $T_PROD0  启动 $c 次"
+  printf '    %-28s %s\n' "**产品动作** pdg platform"  "$T_PROD0 → $T_PROD1 启动 $d 次"
   {
-    echo "# 阶段边界(本地时刻)与 $u 启动次数"
-    echo "准备阶段   $PH_T0 → $T_CAL0   $(_unit_starts "$u" "$PH_T0" "$T_CAL0")"
-    echo "标定阶段   $T_CAL0 → $T_CAL1   $(_unit_starts "$u" "$T_CAL0" "$T_CAL1")"
-    echo "静置+采前像 $T_CAL1 → $T_PROD0  $(_unit_starts "$u" "$T_CAL1" "$T_PROD0")"
-    echo "产品动作   $T_PROD0 → $T_PROD1 $(_unit_starts "$u" "$T_PROD0" "$T_PROD1")"
-    echo "说明: 准备阶段的重启计在准备阶段, **不**计成产品动作; 两段之间的静置使产品动作"
-    echo "      拿到完整的启动额度。产品 unit 的 StartLimit 一个字没改, 也没有 reset-failed。"
+    echo "# 阶段边界与 $u 启动次数(归属由 journal 界桩裁决; 下面的时刻只是给人读的)"
+    echo "准备阶段    $PH_T0 → $T_CAL0    $a"
+    echo "标定阶段    $T_CAL0 → $T_CAL1   $b"
+    echo "静置+采前像 $T_CAL1 → $T_PROD0  $c"
+    echo "产品动作    $T_PROD0 → $T_PROD1 $d   ← 窗口只围住 pdg platform 这一次调用"
+    echo "界桩(不透明, 只用于 --after-cursor, 不比大小):"
+    echo "  C_PREP0=$C_PREP0"; echo "  C_CAL0 =$C_CAL0"; echo "  C_CAL1 =$C_CAL1"
+    echo "  C_PROD0=$C_PROD0"; echo "  C_PROD1=$C_PROD1"
+    echo "相邻阶段共享同一个界桩 ⇒ 每条记录只归一个区间, 合计不重不漏。"
+    echo "说明: 准备阶段的重启计在准备阶段, **不**计成产品动作; 前像采集也不算产品动作。"
+    echo "      产品 unit 的 StartLimit 一个字没改, 也没有 reset-failed。"
   } | _ev "06-$DIR-phases.txt"
 }
 
@@ -1453,7 +1557,8 @@ note "失败点: **可达的产品路径** —— 合法历史残留(有人手�
 note "  会让 migrate_wloc_retire 按「归属不清就不能一把清空」合法拒绝。那一步排在平台组件"
 note "  清理**之后**、切换提交**之前**。不是桩, 也没有替换任何清理/回滚/systemctl/nft/渲染。"
 
-PH_T0="$(_now_j)"        # 准备阶段起点: 造前像 / 装候选 / 标定都在这之后
+PH_T0="$(_now_j)"        # 仅供阅读
+C_PREP0="$(_j_mark prep-start)" || note "阶段记账: 准备阶段起界桩没建成($(_j_why)) —— 该段记账将报观测无效"
 build_preimage ios on
 # ── 合法历史残留: 每一项写明来源, 并在下面逐项记指纹 ────────────────────────
 # ① 接管表里有一条**非 WLOC** 的域名(有人手工改过的痕迹)
@@ -1573,15 +1678,16 @@ quiesce_startlimit "标定前" || true    # 失败已置 PREIMAGE_OK=0, 下面�
 # 那样等于拿一个证明不了东西的仪器走完四维验收再说一句"这项没取到"。
 # 所以它直接置 PREIMAGE_OK=0, 由下面的前置门把整个场景报成**未执行**(诊断数据仍然留档)。
 T_CAL0="$(_now_j)"
+C_CAL0="$(_j_mark cal-start)" || note "阶段记账: 标定起界桩没建成($(_j_why))"
 dns_instrument_calibrate || { PREIMAGE_OK=0; bad "验收前置未成立: DNS 仪器没有通过标定(${DNS_CALIB_WHY:-未知})"; }
 T_CAL1="$(_now_j)"
+C_CAL1="$(_j_mark cal-end)" || note "阶段记账: 标定止界桩没建成($(_j_why))"
 # 标定把配置还原了、服务也该稳住了 —— 再静置一次, 让**产品动作**拿到完整的启动额度,
 # 然后才统一采集正式前像(准备阶段的那些重启因此落在前像之前, 不会算进产品动作)。
 quiesce_startlimit "正式取证与平台操作前" || true
 [[ "$(wait_stable mosdns)" == active ]] \
   && ok "正式前像之前: mosdns 已回到稳定运行态(标定的配置还原已生效)" \
   || { bad "正式前像之前: mosdns 没有稳定在 active —— 前置不成立"; PREIMAGE_OK=0; }
-T_PROD0="$(_now_j)"
 snap_state "B-$DIR-before"
 fp_capture "B-$DIR-before"
 svc_snapshot "$E2E_TMP/svc-B-$DIR-before.tsv"
@@ -1598,8 +1704,11 @@ if [[ "$PREIMAGE_OK" != 1 ]]; then
 else
 
 echo; echo "── 真正跑候选的 pdg platform $TO ──"
+T_PROD0="$(_now_j)"
+C_PROD0="$(_j_mark prod-start)" || note "阶段记账: 产品动作起界桩没建成($(_j_why))"
 PL="$(bash /usr/local/bin/pdg platform "$TO" 2>&1)"; PRC=$?
 T_PROD1="$(_now_j)"
+C_PROD1="$(_j_mark prod-end)" || note "阶段记账: 产品动作止界桩没建成($(_j_why))"
 printf '%s\n' "$PL" | _ev "05-$DIR-platform.log"
 phase_report
 _evn "05-$DIR-platform.log" "### 平台切换退出码 rc=$PRC"
