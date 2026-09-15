@@ -1,30 +1,112 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
 # DNS 仪器的**真 systemd 定点验收**。只验仪器与它的收尾 ——
-# 不装退役候选、不跑 update、不跑迁移、不跑平台切换。
+# 不装 pdg、不装 bot 模块、不跑 update / 迁移 / 平台切换。
 #
-# 为什么还要这一支: 本地那支真二进制验证(tests/test-dns-instrument-real.sh)把 mosdns 当普通
-# 进程起, 而 _dns_reload / dns_fix_conditions / dns_instrument_calibrate 里那几句
-# `systemctl restart mosdns` + InvocationID 更替**从来没在真 systemd 上跑过**。这一支补的就是它。
-#
-# 被测的是验收脚本里那几个函数的**原文**(按名抽取, 不抄一份):
-#   dns_probe / dns_probe_ok / dns_answer_of / _dns_reload / dns_expect /
-#   dns_fix_conditions / dns_instrument_calibrate / dns_feature_probe / dns_verdict
-# mosdns、配置加载、systemd、真实 DNS 查询都是真的; 只有**外围 DNS 上游**是自有可控端。
+# 上一次(run 34927398571)这一支在 GitHub 上显示 success, 而日志里有 6 条 [FAIL] ——
+# 那是**执行器假绿**: 脚本先自定义 ok/bad(记 P/F), 之后才 source e2e-lib.sh, 而后者
+# 重定义 ok/bad 改记 E2E_PASS/E2E_FAIL, 于是汇总只看见 source 之前那两条。
+# 这一版的第一条纪律就是: **计数只有一个来源** —— 先 source, 全程用库的 ok/bad 与
+# E2E_PASS/E2E_FAIL, 自己一个计数器都不建; 退出码统一由 _final_verdict 给,
+# 并且把"零断言 / 执行异常 / 收尾未完成"都算进去。
 # ─────────────────────────────────────────────────────────────────────────────
 set -uo pipefail
-P=0; F=0
-ok(){ printf '[OK]   %s\n' "$1"; P=$((P+1)); }
-bad(){ printf '[FAIL] %s\n' "$1"; F=$((F+1)); }
-note(){ printf '[NOTE] %s\n' "$1"; }
-_hard(){ echo "[HARD-STOP] $1" >&2; exit 1; }
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 E2E_ROOT="${E2E_ROOT:-$(cd "$HERE/.." && pwd)}"
-ACC="$E2E_ROOT/tests/e2e-real-platform-fail.sh"
-[[ -f "$ACC" ]] || _hard "找不到 $ACC"
+# ── 计数唯一来源: **先**加载夹具, 再开始任何断言 ─────────────────────────────
+# shellcheck source=tests/e2e-lib.sh
+source "$HERE/e2e-lib.sh" || { echo "[FAIL] 读不到 e2e-lib.sh"; echo "通过 0, 失败 1"; exit 1; }
+note(){ echo "[NOTE] $1"; }
 
-# ── 硬门: 真 systemd / root / 真 systemctl / 钉死版 mosdns。任一条不成立就硬停, 不退回桩。──
+ACC="$E2E_ROOT/tests/e2e-real-platform-fail.sh"
+E2E_TMP="$(mktemp -d "${TMPDIR:-/tmp}/dnsinst.XXXXXX")"
+EVID="${PDG_REAL_MIG_EVID:-${TMPDIR:-/tmp}/dns-instrument-evidence}"; mkdir -p "$EVID"; chmod 700 "$EVID"
+_evn(){ printf '%s\n' "$2" >> "$EVID/$1"; chmod 600 "$EVID/$1" 2>/dev/null || true; }
+
+# ── 归属登记: 只对**本轮登记过**的资源动手 ──────────────────────────────────
+OWN_UNIT=""          # 本轮自建的 unit 名(建出来才登记)
+OWN_UNIT_PATH=""
+OWN_TMP="$E2E_TMP"   # 本轮自建的临时目录
+DNS_STUB_PID=""      # 由 dns_fix_conditions 起的自有上游(它自己登记到这个变量)
+KEEP_MATERIAL=0      # 恢复无法确认 ⇒ 保留材料, 不删临时目录
+CLEANUP_RC=-1        # -1 没跑过 / 0 成功 / 1 失败
+REACHED_END=0
+
+# ── 收尾: 结果要进最终判定, 不能"先打印全通过, 再由 EXIT trap 静默失败" ──────
+_cleanup(){
+  local rc=0 st
+  # ① 自建服务: 停 + 复核 + 撤 unit。只动本轮登记的那一个, 不按名字宽杀。
+  if [[ -n "$OWN_UNIT" ]]; then
+    systemctl stop "$OWN_UNIT" >/dev/null 2>&1
+    st="$(systemctl is-active "$OWN_UNIT" 2>/dev/null)"
+    if [[ "$st" == active || "$st" == activating ]]; then
+      echo "[FAIL] 收尾: 自建服务 $OWN_UNIT 停不下来(is-active=$st)"; rc=1
+    fi
+    # 本轮从来没给它设过自启(下面起服务时用的是 start, 不是 enable), 这里核一次
+    st="$(systemctl is-enabled "$OWN_UNIT" 2>/dev/null)"
+    [[ "$st" == enabled || "$st" == enabled-runtime ]] && { echo "[FAIL] 收尾: $OWN_UNIT 竟然是 $st(本轮不该给它加自启)"; rc=1; }
+    if [[ -n "$OWN_UNIT_PATH" && -e "$OWN_UNIT_PATH" ]]; then
+      rm -f "$OWN_UNIT_PATH" || { echo "[FAIL] 收尾: 撤不掉自建 unit 文件 $OWN_UNIT_PATH"; rc=1; }
+      systemctl daemon-reload >/dev/null 2>&1
+      [[ -e "$OWN_UNIT_PATH" ]] && { echo "[FAIL] 收尾: $OWN_UNIT_PATH 还在"; rc=1; }
+    fi
+  fi
+  # ② 自有上游: 退出并回收, 监听要真的放掉
+  if [[ -n "$DNS_STUB_PID" ]]; then
+    kill "$DNS_STUB_PID" 2>/dev/null; wait "$DNS_STUB_PID" 2>/dev/null
+    kill -0 "$DNS_STUB_PID" 2>/dev/null && { echo "[FAIL] 收尾: 自有上游 PID $DNS_STUB_PID 还活着"; rc=1; }
+    if ss -lnu 2>/dev/null | grep -q "127.0.0.1:${DNS_UP_PORT:-15301}"; then
+      echo "[FAIL] 收尾: 自有上游的监听 127.0.0.1:${DNS_UP_PORT:-15301} 没放掉"; rc=1
+    fi
+  fi
+  # ③ 临时物: **只有正常完成才删**; 恢复没确认就留着
+  if (( KEEP_MATERIAL )); then
+    echo "[NOTE] 收尾: 恢复无法确认 → 保留本轮材料, **不删** $OWN_TMP"
+    ls -la "$OWN_TMP" 2>/dev/null | sed 's/^/    /'
+    cp -a "$OWN_TMP"/. "$EVID/keep-material/" 2>/dev/null && \
+      echo "[NOTE] 收尾: 材料已另存一份到 $EVID/keep-material(可实际取用, 不只打印路径)"
+  elif (( rc == 0 )); then
+    rm -rf "$OWN_TMP" || { echo "[FAIL] 收尾: 删不掉 $OWN_TMP"; rc=1; }
+  else
+    echo "[NOTE] 收尾: 前面有失败 → 保留 $OWN_TMP 供查"
+  fi
+  CLEANUP_RC="$rc"
+  return "$rc"
+}
+
+_final_verdict(){
+  local n=$((E2E_PASS + E2E_FAIL)) rc=0
+  echo "────────────────────────────────────────"
+  if (( n == 0 )); then
+    echo "[FAIL] 零断言: 一条判据都没跑到 —— 不拿'没红'冒充通过"; E2E_FAIL=$((E2E_FAIL+1)); rc=1
+  fi
+  if (( REACHED_END == 0 )); then
+    echo "[FAIL] 执行异常: 脚本没有走到正常收尾点"; E2E_FAIL=$((E2E_FAIL+1)); rc=1
+  fi
+  if [[ "$CLEANUP_RC" != 0 ]]; then
+    echo "[FAIL] 收尾未完成(CLEANUP_RC=$CLEANUP_RC) —— 收尾结果计入最终判定"; E2E_FAIL=$((E2E_FAIL+1)); rc=1
+  fi
+  echo "通过 $E2E_PASS, 失败 $E2E_FAIL"
+  [[ "$E2E_FAIL" == 0 ]] || rc=1
+  return "$rc"
+}
+on_exit(){
+  local rc=$?
+  trap - EXIT
+  [[ "$CLEANUP_RC" == -1 ]] && _cleanup
+  _final_verdict; exit $?
+}
+trap on_exit EXIT
+# 硬门不成立是一次**有定义的**停止, 不是"执行异常": 用 bad 计一条真失败(唯一计数源),
+# 同时标记已到达停止点, 免得再叠一条"没走到收尾"。退出码仍由 on_exit → _final_verdict 给。
+_hard(){ bad "硬门不成立: $1"; REACHED_END=1; exit 1; }
+
+# 负控专用: 在**子 shell**里跑, 它的 ok/bad 一律不影响主计数(独立计账, 不清零也不覆盖)
+NEG_OUT="$E2E_TMP/negctl.out"
+negctl(){ ( "$@" ) > "$NEG_OUT" 2>&1; return 0; }
+
+# ── 硬门 ────────────────────────────────────────────────────────────────────
 [[ "$(cat /proc/1/comm)" == systemd ]] || _hard "PID 1 不是 systemd"
 [[ "$(id -u)" == 0 ]] || _hard "要 root(要起 unit、改 /etc)"
 SCTL="$(command -v systemctl)"; [[ -x "$SCTL" ]] || _hard "没有 systemctl"
@@ -33,50 +115,105 @@ WANT_VER="$(grep -m1 '^MOSDNS_VER=' "$E2E_ROOT/lib/versions.sh" | cut -d'"' -f2)
 GOT_VER="$(/usr/local/bin/mosdns version 2>&1 | head -1)"
 case "$GOT_VER" in "$WANT_VER"*) ok "硬门: mosdns 是钉死的那一版($GOT_VER)";; *) _hard "mosdns 版本 $GOT_VER ≠ 钉死的 $WANT_VER";; esac
 command -v dig >/dev/null 2>&1 || _hard "没有 dig"
-ok "硬门: PID1=systemd / root / 真 systemctl / 钉死版 mosdns 全部成立"
+[[ -f "$ACC" ]] || _hard "找不到 $ACC"
+ok "硬门: PID1=systemd / root / 真 systemctl / 真 dig 全部成立"
 
-E2E_TMP="$(mktemp -d /tmp/dnsinst.XXXXXX)"
-EVID="${PDG_REAL_MIG_EVID:-/tmp/dns-instrument-evidence}"; mkdir -p "$EVID"; chmod 700 "$EVID"
-_evn(){ printf '%s\n' "$2" >> "$EVID/$1"; chmod 600 "$EVID/$1" 2>/dev/null || true; }
-DNS_STUB_PID=""
-cleanup(){
-  [[ -n "$DNS_STUB_PID" ]] && { kill "$DNS_STUB_PID" 2>/dev/null; wait "$DNS_STUB_PID" 2>/dev/null; }
-  rm -rf "$E2E_TMP"
-}
-trap cleanup EXIT
-
-# ── 夹具: 与两支验收脚本同一套播种 + 同一份 mosdns unit ──────────────────────
-# shellcheck source=/dev/null
-. "$E2E_ROOT/tests/e2e-lib.sh" || _hard "读不到 e2e-lib.sh"
-e2e_seed_install    >/dev/null 2>&1 || _hard "e2e_seed_install 失败"
+# ── 最小环境: **只**准备 mosdns 要的东西 ────────────────────────────────────
+# 不调 e2e_seed_install —— 它会 cp 整个仓库到 /opt/privdns-gateway、装 /usr/local/bin/pdg
+# 与全部 bot 模块, 对本支一件都用不上。只调 e2e_seed_mosdns(既有最小函数)。
+echo; echo "══ 一. 最小环境准备(逐项列明本轮实际生成的文件)══"
 e2e_seed_mosdns all >/dev/null 2>&1 || _hard "e2e_seed_mosdns 失败"
-cat > /etc/systemd/system/mosdns.service <<'EOF'
+SEEDED=(/etc/mosdns/config.yaml /etc/privdns-gateway/profile.env
+        /etc/mosdns/certs/fullchain.pem /etc/mosdns/certs/privkey.pem)
+for f in /etc/mosdns/rules/*.txt; do SEEDED+=("$f"); done
+for f in /var/lib/privdns-gateway/adblock/*.txt; do SEEDED+=("$f"); done
+{ echo "本轮实际生成/写入的文件(e2e_seed_mosdns all):"
+  for f in "${SEEDED[@]}"; do [[ -e "$f" ]] && printf '  %-56s %s\n' "$f" "$(stat -c '%a %u:%g %s字节' "$f")"; done
+} | tee -a "$EVID/00-seeded-files.txt" | sed 's/^/    /'
+chmod 600 "$EVID/00-seeded-files.txt"
+[[ -f /usr/local/bin/pdg ]] && bad "一-1: /usr/local/bin/pdg 竟然被装上了(本支不该装产品)" \
+                            || ok "一-1: **没有**安装 /usr/local/bin/pdg"
+[[ -d /opt/privdns-gateway ]] && bad "一-2: /opt/privdns-gateway 竟然被铺开了" \
+                              || ok "一-2: **没有**复制仓库到 /opt/privdns-gateway"
+compgen -G "/opt/pdg-bot/*.py" >/dev/null 2>&1 && bad "一-3: bot 模块被装上了" \
+                                               || ok "一-3: **没有**安装任何 bot 模块"
+[[ -s /etc/mosdns/config.yaml ]] && ok "一-4: mosdns 配置已生成" || bad "一-4: 没有 mosdns 配置"
+
+# ── 端口: 先实读占用, 再把监听收窄到与查询端一致的回环地址 ──────────────────
+echo; echo "══ 二. 监听地址与归属 ══"
+LISTEN_IP=127.0.0.1; LISTEN_PORT=53; DOT_PORT=8853
+note "启动前实读 :53 / :$DOT_PORT 的占用情况:"
+ss -lntup 2>/dev/null | awk 'NR==1 || /:53 |:53$|:8853 /' | sed 's/^/    /' | tee -a "$EVID/01-ports-before.txt"
+chmod 600 "$EVID/01-ports-before.txt" 2>/dev/null || true
+OCC="$(ss -lnup 2>/dev/null | awk -v a="$LISTEN_IP:$LISTEN_PORT" '$5==a{print}')"
+if [[ -n "$OCC" ]]; then
+  bad "二-0: $LISTEN_IP:$LISTEN_PORT 已被占用, 本轮不抢也不杀占用者: $OCC"
+  KEEP_MATERIAL=1; REACHED_END=1; exit 1
+fi
+ok "二-0: $LISTEN_IP:$LISTEN_PORT 实读为空闲(runner 上的 systemd-resolved 在 127.0.0.53, 不动它)"
+# 只把监听从 0.0.0.0 收窄到**查询端用的同一个地址** —— dns_probe 问的就是 @127.0.0.1,
+# 不另写一条"容易通过"的查询路径, 也不改被测的 DNS 函数。
+sed -i "s|listen: \"0.0.0.0:53\"|listen: \"$LISTEN_IP:$LISTEN_PORT\"|g; s|listen: \"0.0.0.0:853\"|listen: \"$LISTEN_IP:$DOT_PORT\"|g" /etc/mosdns/config.yaml
+grep -q "listen: \"$LISTEN_IP:$LISTEN_PORT\"" /etc/mosdns/config.yaml \
+  && ok "二-1: 配置里的监听已收窄到 $LISTEN_IP:$LISTEN_PORT(与 dns_probe 的查询端一致)" \
+  || bad "二-1: 监听没改成功"
+grep -c 'listen: "0.0.0.0' /etc/mosdns/config.yaml | grep -qx 0 \
+  && ok "二-2: 配置里不再有 0.0.0.0 监听" || bad "二-2: 还有 0.0.0.0 监听"
+
+# ── 自建 unit: 登记归属之后再起 ─────────────────────────────────────────────
+OWN_UNIT=mosdns.service; OWN_UNIT_PATH=/etc/systemd/system/mosdns.service
+[[ -e "$OWN_UNIT_PATH" ]] && { bad "二-3: $OWN_UNIT_PATH 本来就存在, 归属不明 —— 停止, 不覆盖现有对象"; OWN_UNIT=""; OWN_UNIT_PATH=""; KEEP_MATERIAL=1; REACHED_END=1; exit 1; }
+cat > "$OWN_UNIT_PATH" <<'EOF'
 [Unit]
-Description=mosdns
-After=network-online.target
-Wants=network-online.target
+Description=mosdns (DNS instrument pinpoint, this run only)
 [Service]
 ExecStart=/usr/local/bin/mosdns start -d /etc/mosdns
-Restart=on-failure
-RestartSec=3
-[Install]
-WantedBy=multi-user.target
+Restart=no
 EOF
+ok "二-3: 自建 unit $OWN_UNIT_PATH 已登记归属(Restart=no —— 崩溃就是崩溃, 不靠重启循环遮掩)"
 systemctl daemon-reload
-systemctl enable --now mosdns >/dev/null 2>&1
-wait_stable(){   # $1=unit [$2=秒] —— 轮询到不是过渡态
-  local u="$1" lim="${2:-25}" i=0 st
+systemctl start "$OWN_UNIT" >/dev/null 2>&1
+
+# ── 稳定就绪: 状态 + 实例 + 监听归属 + 真实 DNS 行为, 四样一起判 ────────────
+# 瞬时 active 不算就绪。预算是既有的那个上限, 不靠延长等待或反复重启碰绿。
+dns_ready(){   # $1=期望能答出预期答案的域名 $2=期望答案(空=只要有效观测)
+  local u="$OWN_UNIT" i=0 lim="${DNS_READY_BUDGET:-20}" st pid inv nr0 nr1 inv0
+  inv0=""; nr0=""
   while (( i < lim )); do
     st="$(systemctl is-active "$u" 2>/dev/null)"
-    case "$st" in activating|deactivating|reloading) ;; *) printf '%s' "$st"; return 0;; esac
+    pid="$(systemctl show -p MainPID --value "$u" 2>/dev/null)"
+    inv="$(systemctl show -p InvocationID --value "$u" 2>/dev/null)"
+    nr1="$(systemctl show -p NRestarts --value "$u" 2>/dev/null)"
+    if [[ "$st" == active && -n "$pid" && "$pid" != 0 && -n "$inv" ]]; then
+      if [[ -z "$inv0" ]]; then inv0="$inv"; nr0="$nr1"
+      elif [[ "$inv" == "$inv0" && "$nr1" == "$nr0" ]]; then
+        # 观察窗内没有实例更替、没有 NRestarts 增长 → 再看监听归属与真实行为
+        local owner; owner="$(ss -lnup 2>/dev/null | awk -v a="$LISTEN_IP:$LISTEN_PORT" '$5==a{print}')"
+        if grep -q "pid=$pid" <<<"$owner"; then
+          local p; p="$(dns_probe "$1")"
+          if dns_probe_ok "$p"; then
+            if [[ -z "${2:-}" || "$(dns_answer_of "$p")" == "$2" ]]; then
+              DNS_READY_WHY="active pid=$pid inv=$inv NRestarts=$nr1 监听归属=本轮 answer=$(dns_answer_of "$p")"
+              return 0
+            fi
+          fi
+          DNS_READY_WHY="服务看着正常(pid=$pid)且监听归属本轮, 但 DNS 还没就绪: $p"
+        else
+          DNS_READY_WHY="$LISTEN_IP:$LISTEN_PORT 上的监听不属于本轮服务(MainPID=$pid; 实读: ${owner:-无})"
+        fi
+      else
+        DNS_READY_WHY="观察窗内实例更替或重启计数增长(inv $inv0→$inv, NRestarts $nr0→$nr1)"
+        inv0="$inv"; nr0="$nr1"
+      fi
+    else
+      DNS_READY_WHY="服务不在预期运行态(is-active=$st MainPID=${pid:-?})"
+    fi
     sleep 1; i=$((i+1))
   done
-  printf '%s' "$(systemctl is-active "$u" 2>/dev/null)"
+  return 1
 }
-[[ "$(wait_stable mosdns)" == active ]] || _hard "mosdns 没在真 systemd 下起来: $(journalctl -u mosdns -n 20 --no-pager 2>&1 | tail -10)"
-ok "夹具: mosdns 以真 unit 起来了(all 形态, 与两支验收脚本同一套播种)"
 
-# ── 抽验收脚本里那几个函数的原文 ────────────────────────────────────────────
+# ── 抽验收脚本里那几个 DNS 函数的原文 ───────────────────────────────────────
 _fn(){ awk -v f="$2" 'index($0,f"(){")==1{p=1} p{print} p&&/^}$/{exit}' "$1"; }
 for f in dns_probe dns_probe_ok dns_answer_of _dns_reload dns_expect \
          dns_fix_conditions dns_instrument_calibrate dns_feature_probe dns_verdict; do
@@ -84,68 +221,91 @@ for f in dns_probe dns_probe_ok dns_answer_of _dns_reload dns_expect \
   eval "$b"
 done
 eval "$(grep -E '^DNS_(U|H|UP_PORT|WITNESS|CONTROL)=' "$ACC")"
+# 这几个由被测函数写回来, 本支只读。DNS_CALIB_NAME 在下面的"标定后仍满足预期"里用到。
 DNS_INSTRUMENT_OK=0; DNS_CALIB_WHY=""; DNS_CALIB_NAME=""
-DNS_RESTORE_DISK=0; DNS_RESTORE_RUN=0
-c_keep_note(){ note "  自有恢复材料保留在 $E2E_TMP/hijack-calib.bak"; }
-ok "前提: 九个函数都从验收脚本原文抽到(不是本支自己写的一份)"
+DNS_RESTORE_DISK=0; DNS_RESTORE_RUN=0; DNS_READY_WHY=""
+c_keep_note(){ KEEP_MATERIAL=1; note "  恢复无法确认 → 本轮材料保留(收尾时会另存一份到 $EVID/keep-material)"; }
+wait_stable(){ systemctl is-active "$1" 2>/dev/null; }   # _dns_reload 用它; 真正的就绪判据是 dns_ready
+ok "二-4: 九个 DNS 函数都从验收脚本原文抽到(不是本支自己写的一份)"
 
+echo; echo "══ 三. 健康前像: 见证=H / 对照=U / 标定域起初=U ══"
 HIJ=/etc/mosdns/rules/mitm_hijack.txt
-SUM_BEFORE="$(sha256sum "$HIJ" | awk '{print $1}')"
-MODE_BEFORE="$(stat -c %a "$HIJ")"; OWN_BEFORE="$(stat -c %u:%g "$HIJ")"
-
-echo; echo "══ 一. 标定: 在真 systemd 上走一遍 ══"
-INV0="$(systemctl show -p InvocationID --value mosdns)"
-if dns_instrument_calibrate; then
-  ok "1a: 标定通过(DNS_INSTRUMENT_OK=$DNS_INSTRUMENT_OK)"
+printf 'full:%s\n' "$DNS_WITNESS" > "$HIJ"; chmod 640 "$HIJ"
+ok "三-0: 接管表里放入业务见证域 $DNS_WITNESS(它的预期就是 H=$DNS_H)"
+if dns_ready "$DNS_WITNESS" "$DNS_H"; then
+  ok "三-1: 服务稳定就绪 —— $DNS_READY_WHY"
 else
-  bad "1a: 标定没过 —— $DNS_CALIB_WHY"
-fi
-INV1="$(systemctl show -p InvocationID --value mosdns)"
-[[ -n "$INV1" && "$INV1" != "$INV0" ]] \
-  && ok "1b: 真 systemd 下 mosdns 实例确实更替过($INV0 → $INV1)" || bad "1b: 实例没换"
-note "1b 说明: InvocationID 只证明**实例换了**; 加载的是不是预期配置由下面的真实查询回答。"
-[[ "$DNS_INSTRUMENT_OK" == 1 ]] \
-  && ok "1c: 同一查询名在真 systemd 上精确走出 U=$DNS_U → H=$DNS_H" || bad "1c: 没走出 U→H"
-
-echo; echo "══ 二. 收尾: 磁盘与运行配置分别判定 ══"
-{ [[ "$(sha256sum "$HIJ" | awk '{print $1}')" == "$SUM_BEFORE" \
-   && "$(stat -c %a "$HIJ")" == "$MODE_BEFORE" && "$(stat -c %u:%g "$HIJ")" == "$OWN_BEFORE" ]]; } \
-  && ok "2a: 接管表按内容 + mode + uid:gid 逐项还原" \
-  || bad "2a: 没还原(sha/mode/owner: $(sha256sum "$HIJ"|awk '{print $1}') / $(stat -c '%a %u:%g' "$HIJ"))"
-[[ "$DNS_RESTORE_DISK" == 1 && "$DNS_RESTORE_RUN" == 1 ]] \
-  && ok "2b: 磁盘还原与**运行配置**还原都已确认(DISK=$DNS_RESTORE_DISK RUN=$DNS_RESTORE_RUN)" \
-  || bad "2b: DISK=$DNS_RESTORE_DISK RUN=$DNS_RESTORE_RUN"
-if dns_expect "$DNS_CALIB_NAME" "$DNS_U"; then
-  ok "2c: 还原之后用**真实查询**确认运行配置回到未接管($DNS_U)"
-else
-  bad "2c: $DNS_CALIB_WHY"
+  bad "三-1: 没能稳定就绪 —— $DNS_READY_WHY"
+  journalctl -u "$OWN_UNIT" -n 30 --no-pager 2>&1 | tail -20 | sed 's/^/    /'
+  KEEP_MATERIAL=1; REACHED_END=1; exit 1
 fi
 
-echo; echo "══ 三. 正式取证: 见证=H / 对照=U, 且前后一致 ══"
+echo; echo "══ 四. 标定: 甲→乙→还原甲 ══"
+if dns_instrument_calibrate; then ok "四-1: 标定通过"; else bad "四-1: 标定没过 —— $DNS_CALIB_WHY"; fi
+[[ "$DNS_INSTRUMENT_OK" == 1 ]] && ok "四-2: 同一查询名精确走出 U=$DNS_U → H=$DNS_H" || bad "四-2: 没走出 U→H"
+[[ "$DNS_RESTORE_DISK" == 1 ]] && ok "四-3: 磁盘还原已确认" || bad "四-3: 磁盘还原未确认(DISK=$DNS_RESTORE_DISK)"
+[[ "$DNS_RESTORE_RUN"  == 1 ]] && ok "四-4: **运行配置**还原已用真实查询确认" || bad "四-4: 运行配置还原未确认(RUN=$DNS_RESTORE_RUN)"
+[[ "$(sha256sum "$HIJ" | awk '{print $1}')" == "$(printf 'full:%s\n' "$DNS_WITNESS" | sha256sum | awk '{print $1}')" ]] \
+  && ok "四-5: 标定结束后接管表回到健康前像(只剩见证域那一条)" || bad "四-5: 接管表没回到前像: $(cat "$HIJ")"
+
+echo; echo "══ 五. 标定之后, 见证与对照仍各自满足预期 ══"
+dns_expect "$DNS_WITNESS" "$DNS_H" && ok "五-1: 见证域仍是 H=$DNS_H" || bad "五-1: $DNS_CALIB_WHY"
+dns_expect "$DNS_CONTROL" "$DNS_U" && ok "五-2: 对照域仍是 U=$DNS_U" || bad "五-2: $DNS_CALIB_WHY"
+dns_expect "$DNS_CALIB_NAME" "$DNS_U" && ok "五-2b: 标定域($DNS_CALIB_NAME)也回到 U=$DNS_U" || bad "五-2b: $DNS_CALIB_WHY"
+grep -q " q=$DNS_CONTROL " "$E2E_TMP/dns-up.log" 2>/dev/null \
+  && ok "五-3: 对照域的答案确实来自自有上游(按名有记录)" || bad "五-3: 上游日志里没有对照域"
+grep -q " q=$DNS_WITNESS " "$E2E_TMP/dns-up.log" 2>/dev/null \
+  && bad "五-4: 见证域竟然问过上游 —— 与'接管优先'不符" || ok "五-4: 见证域**没有**问过上游(答案来自接管分支)"
+
+echo; echo "══ 六. 正式取证 ══"
 BEF="$(dns_feature_probe systemd-before)"
-[[ "$BEF" == VALID* ]] && ok "3a: 前像观测有效" || bad "3a: 前像观测无效 —— $BEF"
-systemctl restart mosdns >/dev/null 2>&1; wait_stable mosdns >/dev/null
+[[ "$BEF" == VALID* ]] && ok "六-1: 前像观测有效" || bad "六-1: 前像观测无效 —— $BEF"
+systemctl restart "$OWN_UNIT" >/dev/null 2>&1
+dns_ready "$DNS_WITNESS" "$DNS_H" || bad "六-2: 重启之后没能稳定就绪 —— $DNS_READY_WHY"
 AFT="$(dns_feature_probe systemd-after)"
-_P="$P"; _F="$F"; dns_verdict "3" "$BEF" "$AFT"
-[[ "$F" == "$_F" ]] && ok "3b: 重启之后前后像判据全绿(见证与对照都回到前像且符合 U/H)" \
-                    || note "3b: 上面已按具名项报出, 不重复计数"
+dns_verdict "六" "$BEF" "$AFT"
 
-echo; echo "══ 四. 负控: 解析器停掉之后, 正式取证必须判无效而不是'文本相等所以通过' ══"
-systemctl stop mosdns >/dev/null 2>&1
-BAD1="$(dns_feature_probe systemd-dead-1)"; BAD2="$(dns_feature_probe systemd-dead-2)"
-systemctl start mosdns >/dev/null 2>&1; wait_stable mosdns >/dev/null
-[[ "$BAD1" == INVALID* && "$BAD2" == INVALID* ]] \
-  && ok "4a: 解析器停掉时两次取证都判 INVALID" || bad "4a: 实得 $BAD1 / $BAD2"
-_P="$P"; _F="$F"; dns_verdict "4" "$BAD1" "$BAD2" >"$E2E_TMP/v.out" 2>&1; P="$_P"; F="$_F"
-grep -q '观测\*\*无效\*\*' "$E2E_TMP/v.out" \
-  && ok "4b: 两份无效观测即使**逐字相等**也判红, 理由就是'观测无效'" \
-  || { bad "4b: 没有以观测无效为由判红"; sed 's/^/      /' "$E2E_TMP/v.out"; }
+echo; echo "══ 七. 负控(**独立计账**: 在子 shell 里跑, 不动主计数)══"
+systemctl stop "$OWN_UNIT" >/dev/null 2>&1
+negctl bash -c 'true'   # 占位: 下面直接在子 shell 里取观测
+D1="$(dns_feature_probe systemd-dead-1)"; D2="$(dns_feature_probe systemd-dead-2)"
+[[ "$D1" == INVALID* && "$D2" == INVALID* ]] \
+  && ok "七-1: 解析器停掉时两次取证都判 INVALID" || bad "七-1: 实得 $D1 / $D2"
+( dns_verdict "七-负控" "$D1" "$D2" ) > "$NEG_OUT" 2>&1
+grep -q '观测\*\*无效\*\*' "$NEG_OUT" \
+  && ok "七-2: 两份**逐字相等**的无效观测仍以'观测无效'为由判红" \
+  || { bad "七-2: 没有以观测无效为由判红"; sed 's/^/      /' "$NEG_OUT"; }
+NEG_FAIL_SEEN="$(grep -c '^\[FAIL\]' "$NEG_OUT")"
+(( NEG_FAIL_SEEN > 0 )) && ok "七-3: 负控自己确实产生了 $NEG_FAIL_SEEN 条失败, 但它跑在子 shell 里 —— 主计数未受影响" \
+                        || bad "七-3: 负控没产生失败, 这一格没验到东西"
+# 再起回来, 让收尾在一个正常现场上做
+systemctl start "$OWN_UNIT" >/dev/null 2>&1
+dns_ready "$DNS_WITNESS" "$DNS_H" >/dev/null 2>&1 || note "七: 负控之后服务没能再就绪(不影响上面的判据, 收尾照做)"
 
-echo; echo "══ 五. 本轮自有资源清理 ══"
-[[ -n "$DNS_STUB_PID" ]] && kill -0 "$DNS_STUB_PID" 2>/dev/null \
-  && ok "5a: 自有 DNS 上游按登记的 PID 在管(退出时按 PID 收, 不按名字宽杀)" \
-  || note "5a: 自有上游已不在(可能已退出)"
+echo; echo "══ 八. 瞬时 active 的具名反例(与健康对照)══"
+# 造一个"起来就退"的 unit: is-active 会有一瞬间是 active, 但它不是就绪。
+PROBE_UNIT=pdg-dnsinst-flap-TESTONLY.service; PROBE_PATH="/etc/systemd/system/$PROBE_UNIT"
+if [[ -e "$PROBE_PATH" ]]; then
+  bad "八-0: $PROBE_PATH 本来就存在, 归属不明 —— 跳过这一格, 不覆盖现有对象"
+else
+  printf '[Unit]\nDescription=flap probe (this run only)\n[Service]\nExecStart=/bin/sh -c "sleep 0.3; exit 1"\nRestart=no\n' > "$PROBE_PATH"
+  systemctl daemon-reload; systemctl start "$PROBE_UNIT" >/dev/null 2>&1
+  ST_FLAP="$(systemctl is-active "$PROBE_UNIT" 2>/dev/null)"
+  OWN_UNIT_SAVE="$OWN_UNIT"; OWN_UNIT="$PROBE_UNIT"
+  DNS_READY_BUDGET=4
+  if dns_ready "$DNS_WITNESS" "$DNS_H"; then
+    bad "八-1: 一个起来就退的服务竟然被判成'稳定就绪'"
+  else
+    ok "八-1: 瞬时 is-active=$ST_FLAP 的崩溃服务**没有**被判成就绪 —— $DNS_READY_WHY"
+  fi
+  unset DNS_READY_BUDGET; OWN_UNIT="$OWN_UNIT_SAVE"
+  systemctl stop "$PROBE_UNIT" >/dev/null 2>&1; rm -f "$PROBE_PATH"; systemctl daemon-reload
+  [[ -e "$PROBE_PATH" ]] && bad "八-2: 反例 unit 没撤干净" || ok "八-2: 反例 unit 已撤除(本轮自建, 按路径收)"
+fi
+if dns_ready "$DNS_WITNESS" "$DNS_H"; then
+  ok "八-3: 健康对照 —— 真正就绪的服务仍然判得过($DNS_READY_WHY)"
+else
+  bad "八-3: 健康对照没过 —— $DNS_READY_WHY"
+fi
 
-echo "──────────────────────────────────────────────"
-echo "通过 $P, 失败 $F"
-[[ "$F" == 0 ]]
+REACHED_END=1

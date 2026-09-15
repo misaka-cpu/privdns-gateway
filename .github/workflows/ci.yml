@@ -1100,6 +1100,11 @@ jobs:
       - name: "DNS 标定契约 (成功契约/不可区分/查询异常/重载失败/可靠还原, 桩化模型)"
         run: bash tests/test-dns-calibration-contract.sh
 
+      # 定点验收脚本**自身**的执行有效性: 计数/汇总/退出码必须一致。
+      # 堵的是 run 34927398571 那次"日志 6 条 FAIL、GitHub 却 success"的执行器假绿。
+      - name: "定点验收执行有效性 (单一计数源/零断言/中途退出/收尾失败都不能冒充通过)"
+        run: bash tests/test-pinpoint-exec-validity.sh
+
       # 真二进制那一半: 真钉版 mosdns + 真 dig + 自有 DNS 上游, 全在自有根与回环高位端口上,
       # 不碰宿主的 systemd/DNS/nft/路由。它回答"同答到底为什么"以及"U→H→U 走不走得出来"。
       - name: "DNS 仪器真二进制验证 (真 mosdns + 自有上游: 同答归因 / 缓存 / U→H→U)"
@@ -1843,7 +1848,11 @@ jobs:
           set -euo pipefail
           echo "验收 checkout = ${{ github.sha }}"
           echo "产品来源      = **不涉及** —— 本 job 不安装任何退役/桥接候选,"
-          echo "                只用 checkout 里的 tests/ 夹具 + 钉死版 mosdns 二进制。"
+          echo "                也不调 e2e_seed_install(那个会 cp 整个仓库到 /opt/privdns-gateway、"
+          echo "                装 /usr/local/bin/pdg 与全部 bot 模块; 本 job 一件都用不上)。"
+          echo "                只调 e2e_seed_mosdns —— 准备 mosdns 要的配置/规则/证书。"
+          echo "本轮实际生成的文件清单由脚本在运行时逐项打印(见下面「最小环境准备」一节),"
+          echo "并另存一份到证据目录 00-seeded-files.txt。"
           echo "被测对象      = tests/e2e-real-platform-fail.sh 里那九个 DNS 函数的原文"
       - name: "PID 1 必须是真 systemd, systemctl 必须是真二进制(不是就判失败, 不 SKIP)"
         run: |
@@ -1865,6 +1874,15 @@ jobs:
           path: /tmp/mosdns-fixture
       - name: "校验并安装钉定 mosdns (自算 SHA / manifest 交叉 / 自报版本 / 生产判据)"
         run: sudo -E bash tests/install-mosdns-artifact.sh /tmp/mosdns-fixture
+      # 这三支也在 lint 里登记着, 但 lint 会被一条与本轮无关的旧红灯挡在更早的步骤上,
+      # 于是它们在 CI 里一次都没跑到过。这里**显式**接进定点 job, 不动 lint 的登记,
+      # 也不给任何标准门加 continue-on-error。
+      - name: "定点验收执行有效性 (计数/汇总/退出码一致)"
+        run: bash tests/test-pinpoint-exec-validity.sh
+      - name: "DNS 标定契约 (桩化模型)"
+        run: bash tests/test-dns-calibration-contract.sh
+      - name: "DNS 仪器真二进制验证 (真 mosdns + 自有上游)"
+        run: bash tests/test-dns-instrument-real.sh
       - name: "DNS 仪器定点验收"
         env:
           PDG_E2E_ISOLATED: "1"
