@@ -1182,6 +1182,85 @@ phase_report(){   # 把"准备动作"与"产品动作"的边界连同实际启�
   } | _ev "06-$DIR-phases.txt"
 }
 
+# ── 持续稳定 vs 瞬时 active: 在**有界观测窗口**里判, 不靠某一次 systemctl 返回 ────
+# 上一次(run 34966909411 的 ⑤b)栽在这: pdg-mitm 其实在崩溃循环(每 3s 被 Restart=on-failure
+# 拉起来一次), 而前像判据只取了一瞬的 is-active=active, 就报了"处在稳定运行态"。
+# 这里把两件事分开:
+#   · wait_stable  : 等它**进入**非过渡态(activating/deactivating/reloading 不算数);
+#   · svc_stable_window: 进入之后在窗口内**持续**符合目标, 而且没有悄悄换过实例。
+# 判据(窗口内逐次采样 + journal 界桩裁决的启动事件):
+#   预期运行: ActiveState 一直是 active; MainPID 有效且不变; InvocationID 有效且不变;
+#             NRestarts 两端都能解析且不增长; 窗口内没有新的 "Started <unit>" 事件。
+#   预期停止: ActiveState 一直不是 active/activating; 没有 MainPID; 窗口内没有启动事件。
+#   任何一次状态查询失败 / 字段缺不出来 / journal 观测无效 ⇒ 记**观测无效**(既不算稳定,
+#   也不算零事件), 由调用方判前置不成立 —— 不靠"多等一会儿碰巧 active"蒙混过去。
+SVC_STABLE_WHY=""
+svc_stable_window(){   # $1=unit $2=running|stopped [$3=窗口秒数, 默认 8] → 0 成立 / 1 不成立 / 2 观测无效
+  local u="$1" want="$2" secs="${3:-8}" i st pid inv nr0 nr1 pid0 inv0 c0 c1 evs
+  SVC_STABLE_WHY=""
+  c0="$(_j_mark "stable-$u-start")" || { SVC_STABLE_WHY="观测无效: 起界桩没建成($(_j_why))"; return 2; }
+  nr0="$(systemctl show -p NRestarts --value "$u" 2>/dev/null)"
+  [[ "$nr0" =~ ^[0-9]+$ ]] || { SVC_STABLE_WHY="观测无效: NRestarts 读不到合法数值(实得 [${nr0}])"; return 2; }
+  st="$(wait_stable "$u" "$secs")"          # 先等它进入非过渡态
+  case "$st" in
+    activating|deactivating|reloading|""|"<读不到>")
+      SVC_STABLE_WHY="窗口内没能进入非过渡态(停在 ${st:-读不到})"; return 1;;
+  esac
+  pid0="$(systemctl show -p MainPID --value "$u" 2>/dev/null)"
+  inv0="$(systemctl show -p InvocationID --value "$u" 2>/dev/null)"
+  for ((i=0; i<secs; i++)); do
+    sleep 1
+    st="$(systemctl show -p ActiveState --value "$u" 2>/dev/null)"
+    [[ -n "$st" ]] || { SVC_STABLE_WHY="观测无效: 第 $i 次取不到 ActiveState"; return 2; }
+    pid="$(systemctl show -p MainPID --value "$u" 2>/dev/null)"
+    inv="$(systemctl show -p InvocationID --value "$u" 2>/dev/null)"
+    if [[ "$want" == running ]]; then
+      [[ "$st" == active ]] || { SVC_STABLE_WHY="窗口内掉出 active(第 ${i}s 是 $st)"; return 1; }
+      [[ -n "$pid" && "$pid" != 0 ]] || { SVC_STABLE_WHY="窗口内 MainPID 无效(第 ${i}s 实得 [${pid}])"; return 1; }
+      [[ "$pid" == "$pid0" ]] || { SVC_STABLE_WHY="窗口内实例换过(MainPID $pid0 → $pid)"; return 1; }
+      [[ -n "$inv" && "$inv" == "$inv0" ]] || { SVC_STABLE_WHY="窗口内实例换过(InvocationID $inv0 → ${inv:-读不到})"; return 1; }
+    else
+      case "$st" in
+        active|activating) SVC_STABLE_WHY="期望停止, 窗口内却是 $st(第 ${i}s)"; return 1;;
+      esac
+      [[ -z "$pid" || "$pid" == 0 ]] || { SVC_STABLE_WHY="期望停止, 却还有 MainPID=$pid"; return 1; }
+    fi
+  done
+  nr1="$(systemctl show -p NRestarts --value "$u" 2>/dev/null)"
+  [[ "$nr1" =~ ^[0-9]+$ ]] || { SVC_STABLE_WHY="观测无效: 窗口后 NRestarts 读不到合法数值(实得 [${nr1}])"; return 2; }
+  [[ "$nr1" == "$nr0" ]] || { SVC_STABLE_WHY="窗口内发生了自动重启(NRestarts $nr0 → $nr1)"; return 1; }
+  c1="$(_j_mark "stable-$u-end")" || { SVC_STABLE_WHY="观测无效: 止界桩没建成($(_j_why))"; return 2; }
+  evs="$(_j_interval "$u" "$c0" "$c1")" || { SVC_STABLE_WHY="观测无效: 启动事件查不清($(_j_why))"; return 2; }
+  [[ "$evs" == 0 ]] || { SVC_STABLE_WHY="窗口内有 $evs 次启动事件(界桩裁决) —— 不是持续稳定"; return 1; }
+  SVC_STABLE_WHY="窗口 ${secs}s 内持续 ${want}: ActiveState=$st MainPID=${pid0:-无} Invocation=${inv0:-无} NRestarts=$nr0 启动事件 0 次"
+  return 0
+}
+# 进程在不在 ↔ 7894 有没有监听。判据来自 v1.11.15 的 mitm_server.serve():
+# 它**无条件** bind 127.0.0.1:7894, 与 wloc.enabled 无关 —— enabled 决定的是
+# load_from_config 登不登记接管插件。所以:
+#   活着就该有监听; 停了就不该有。两边对不上 = 前像不自洽(有进程没停干净, 或根本没起来)。
+MITM_VERDICT_WHY=""
+mitm_listen_verdict(){   # $1=ActiveState $2=7894 监听数 → 0 自洽 / 1 不自洽
+  local ac="$1" n="${2:-0}"
+  [[ "$n" =~ ^[0-9]+$ ]] || { MITM_VERDICT_WHY="监听数读不出来([$2])"; return 1; }
+  if [[ "$ac" == active ]]; then
+    (( n >= 1 )) && { MITM_VERDICT_WHY="pdg-mitm 活着, 7894 有监听($n)(serve() 无条件 bind, 与 enabled 无关)"; return 0; }
+    MITM_VERDICT_WHY="pdg-mitm 说是 active, 7894 却没有监听 —— 进程没真正起来"; return 1
+  fi
+  (( n == 0 )) && { MITM_VERDICT_WHY="pdg-mitm 是 $ac, 7894 也没有监听"; return 0; }
+  MITM_VERDICT_WHY="pdg-mitm 是 $ac, 7894 却还有 $n 个监听 —— 有进程没被停干净"; return 1
+}
+svc_stable_assert(){   # $1=unit $2=running|stopped $3=标签 → 顺带把前置置红
+  local rc
+  svc_stable_window "$1" "$2" "${4:-8}"; rc=$?
+  case "$rc" in
+    0) ok "$3: $SVC_STABLE_WHY";;
+    1) bad "$3: 不是持续稳定 —— $SVC_STABLE_WHY"; PREIMAGE_OK=0;;
+    *) bad "$3: **观测无效** —— $SVC_STABLE_WHY"; PREIMAGE_OK=0;;
+  esac
+  return "$rc"
+}
+
 # ── 测试指纹 vs 产品自己写的 svcstate.tsv, 逐项对账 ──────────────────────────
 # 两边在**不同时刻**采样就会对不上。这里直接比同一批 unit 的自启/运行值。
 svcstate_cross_check(){   # $1=svcstate.tsv 路径  $2=标签
@@ -1567,18 +1646,40 @@ printf '%s\n' "$STRAY_DOMAIN" >> /etc/mosdns/rules/mitm_hijack.txt
 # ② 这台机器当前的平台标记
 printf '%s\n' "$FROM" > /etc/privdns-gateway/platform
 rm -f /etc/privdns-gateway/platform.guessed
-# ③ iOS→Android 方向: mitm.json 置成 enabled=false。
-#    理由仍然是可达性 —— migrate_android_cleanup 只在 `"enabled": true` 时才把接管表整表
-#    截断, 截断之后那条历史条目就没了, 失败点也就到不了。
-#    **但光改盘是不够的**: 上一轮只写了文件没让服务重读, 于是前像变成"进程在内存里跑着一份
-#    盘上已经不存在的配置"(7894 还监听着, 而盘上说 WLOC 是关的)。那是个自相矛盾的现场,
-#    据它做的恢复验收不作数。这里改完配置就用**合法操作**(restart)让 pdg-mitm 真的去读它,
-#    然后**测量**结果, 不预设"一定还监听"。
+# ③ iOS→Android 方向: WLOC 关闭态。
+#    为什么必须关: 候选的 migrate_android_cleanup 只在 `"enabled": true` 时把接管表整表截断,
+#    截断之后那条手工历史条目就没了, migrate_wloc_retire 的归属拒绝(本方向的失败点)也就到不了。
+#    **合法的关闭态长什么样, 按 v1.11.15 的原文推**:
+#      · mitm_server.load_from_config 先算 _wloc_active(w) 再看 enabled —— 它要求
+#        wloc.locations 是**列表**(里面是 {name,lat,lon})。上一轮这里写成了字典
+#        {"osaka": [34.7,135.5]}, 于是旧版遍历到的是字符串键, 抛
+#        AttributeError: 'str' object has no attribute 'get' ⇒ 进程起来就退, 被
+#        Restart=on-failure 拉成崩溃循环(run 34966909411 的 ⑤b 现场, 重启计数到 10)。
+#        那是**本测试写坏了配置**, 不是旧版在关闭态下站不住。
+#      · 旧版真正的"关 WLOC"路径是 pdg-bot 的 _mitm_transact: 动作顺序固定 ——
+#        关闭: 落盘 → stop:pdg-mitm → restart:mihomo → restart:mosdns。
+#        所以合法的关闭态是 **pdg-mitm 停着(inactive)**、7894 没有监听, 而 unit 与模块
+#        仍在盘上(待退役的残留), UnitFileState 仍是 enabled(stop 不等于 disable)。
+#    下面就按这条真实路径建立, 不关 Restart、不忽略退出码、不清重启计数、不改旧版代码。
 if [[ "$DIR" == i2a ]]; then
-  printf '{"wloc": {"enabled": false, "locations": {"osaka": [34.7, 135.5]}}}\n' > /etc/privdns-gateway/mitm.json
+  cat > /etc/privdns-gateway/mitm.json <<'EOF'
+{
+  "wloc": {
+    "enabled": false,
+    "accuracy": 50,
+    "locations": [ { "name": "osaka", "lat": 34.6937, "lon": 135.5023 } ]
+  }
+}
+EOF
+  chmod 600 /etc/privdns-gateway/mitm.json
+  # 与 _mitm_transact 的关闭顺序一致(stop:pdg-mitm → restart:mihomo → restart:mosdns)
+  systemctl stop pdg-mitm >/dev/null 2>&1 || true
+  systemctl restart mihomo >/dev/null 2>&1 || true
+  systemctl restart mosdns >/dev/null 2>&1 || true
+else
+  # a2i: WLOC 开着 —— 让盘上那份配置成为进程正在跑的那一份(开启顺序里就有 start:pdg-mitm)
+  systemctl restart pdg-mitm >/dev/null 2>&1 || true
 fi
-# 两个方向都走一遍: 让盘上那份配置成为**进程正在跑的**那一份。
-systemctl restart pdg-mitm >/dev/null 2>&1 || true
 # ④ 一个**本来就停着且不自启**的服务(全程不该被启动)
 systemctl disable pdg-health.timer >/dev/null 2>&1 || true
 systemctl stop    pdg-health.timer >/dev/null 2>&1 || true
@@ -1598,13 +1699,13 @@ done
 [[ "$(sc_state is-enabled pdg-probe81)" == enabled-runtime ]] \
   && ok "前像: pdg-probe81 的自启是 enabled-runtime(真 systemd 实测)" \
   || { bad "前像: pdg-probe81 自启=$(sc_state is-enabled pdg-probe81)"; PREIMAGE_OK=0; }
-[[ "$(sc_state is-active pdg-probe81)" == active ]] \
-  && ok "前像: pdg-probe81 稳定运行中" || { bad "前像: pdg-probe81 没稳定起来"; PREIMAGE_OK=0; }
-{ [[ "$(sc_state is-active pdg-bot)" != active && "$(sc_state is-enabled pdg-bot)" != enabled ]]; } \
-  && ok "前像: pdg-bot 是产品支持的停用态(没配凭据)" \
-  || { bad "前像: pdg-bot 不是停用态"; PREIMAGE_OK=0; }
-[[ "$(sc_state is-active pdg-health.timer)" != active ]] \
-  && ok "前像: pdg-health.timer 本来就停着" || { bad "前像: pdg-health.timer 还在跑"; PREIMAGE_OK=0; }
+# 运行/停止都在**有界窗口**里判(瞬时 active、崩溃循环、实例更替都过不去)
+svc_stable_assert pdg-probe81    running "前像: pdg-probe81 持续运行" 5
+[[ "$(sc_state is-enabled pdg-bot)" != enabled ]] \
+  && ok "前像: pdg-bot 的自启是产品支持的停用态($(sc_state is-enabled pdg-bot), 没配凭据)" \
+  || { bad "前像: pdg-bot 自启不该是 enabled"; PREIMAGE_OK=0; }
+svc_stable_assert pdg-bot        stopped "前像: pdg-bot 持续停止(没配凭据)" 5
+svc_stable_assert pdg-health.timer stopped "前像: pdg-health.timer 持续停止(全程不该被启动)" 5
 grep -q "$STRAY_DOMAIN" /etc/mosdns/rules/mitm_hijack.txt \
   && ok "前像: 接管表里有一条非 WLOC 的历史条目($STRAY_DOMAIN)" || { bad "前像: 残留条目没写进去"; PREIMAGE_OK=0; }
 [[ -e /etc/systemd/system/pdg-mitm.service && -e /opt/pdg-bot/mitm_server.py && -e /opt/pdg-bot/mitm_wloc.py ]] \
@@ -1612,22 +1713,48 @@ grep -q "$STRAY_DOMAIN" /etc/mosdns/rules/mitm_hijack.txt \
 # ── 前像自洽核验: 盘上的配置与进程的实际行为必须对得上 ──────────────────────
 # 不再硬性要求"WLOC 关着而旧监听还在"。判据是**一致性**: 盘上 wloc.enabled 说什么,
 # 7894 上就该是什么。测出来是什么就记什么, 后面的恢复判据拿这个测量值作参照。
-MITM_AC_BEFORE="$(wait_stable pdg-mitm)"
+# ── 前像必须**持续稳定**, 而不是某一瞬 is-active=active ────────────────────
+# 本方向的目标态由 v1.11.15 的原文决定(见上面那段推导):
+#   a2i(WLOC 开): pdg-mitm 持续 active, 7894 有监听;
+#   i2a(WLOC 关): 走完真实关闭路径后 pdg-mitm 持续 inactive, 7894 没有监听。
+if [[ "$DIR" == i2a ]]; then MITM_WANT=stopped; else MITM_WANT=running; fi
+svc_stable_assert pdg-mitm "$MITM_WANT" "前像: pdg-mitm 在有界窗口内持续 $MITM_WANT(不是瞬时取样)"
+MITM_AC_BEFORE="$(sc_state is-active pdg-mitm)"
 MITM_WLOC_ON="$(python3 -c 'import json,sys
 try: print("1" if json.load(open("/etc/privdns-gateway/mitm.json",encoding="utf-8")).get("wloc",{}).get("enabled") else "0")
 except Exception: print("?")' 2>/dev/null)"
+# 旧版的形状自证: locations 必须是**列表**, 否则 mitm_server._wloc_active 会抛
+# AttributeError 而崩溃循环 —— 上一轮 ⑤b 的现场就是这么来的。
+MITM_LOC_SHAPE="$(python3 -c 'import json,sys
+try:
+    w=json.load(open("/etc/privdns-gateway/mitm.json",encoding="utf-8")).get("wloc",{})
+    l=w.get("locations")
+    print("list" if isinstance(l,list) else type(l).__name__)
+except Exception: print("?")' 2>/dev/null)"
+[[ "$MITM_LOC_SHAPE" == list ]] \
+  && ok "前像: mitm.json 的 wloc.locations 是旧版解析得了的**列表**形状(不会把它拖进崩溃循环)" \
+  || { bad "前像: wloc.locations 形状是 $MITM_LOC_SHAPE, 旧版 _wloc_active 会抛 AttributeError"; PREIMAGE_OK=0; }
 MITM_LISTEN_BEFORE="$(ss -lnt 2>/dev/null | grep -c ':7894 ')"
-note "前像: 盘上 wloc.enabled=$MITM_WLOC_ON, pdg-mitm=$MITM_AC_BEFORE, 7894 监听数=$MITM_LISTEN_BEFORE"
-case "$MITM_WLOC_ON:$([[ "$MITM_LISTEN_BEFORE" -ge 1 ]] && echo L || echo N)" in
-  1:L) ok "前像自洽: WLOC 开着, 7894 确实在监听(盘上配置就是进程正在跑的那一份)";;
-  0:N) ok "前像自洽: WLOC 关着, 7894 确实没有监听(盘上配置就是进程正在跑的那一份)";;
-  1:N) bad "前像不自洽: 盘上 WLOC 开着, 7894 却没有监听"; PREIMAGE_OK=0;;
-  0:L) bad "前像不自洽: 盘上 WLOC 关着, 7894 却还在监听 —— 进程没有读盘上那份配置"; PREIMAGE_OK=0;;
-  *)   bad "前像: 读不出 mitm.json 的 wloc.enabled"; PREIMAGE_OK=0;;
+note "前像: 盘上 wloc.enabled=$MITM_WLOC_ON, pdg-mitm=$MITM_AC_BEFORE, 7894 监听数=$MITM_LISTEN_BEFORE, locations 形状=$MITM_LOC_SHAPE"
+# 语义按旧版原文对: **监听跟着进程在不在**, enabled 决定的是有没有接管插件。
+#   serve() 无条件 bind 7894 ⇒ 进程活着就该有监听, 停了就不该有。
+mitm_listen_verdict "$MITM_AC_BEFORE" "$MITM_LISTEN_BEFORE"
+case "$?" in
+  0) ok "前像自洽: $MITM_VERDICT_WHY";;
+  *) bad "前像不自洽: $MITM_VERDICT_WHY"; PREIMAGE_OK=0;;
 esac
-[[ "$MITM_AC_BEFORE" == active ]] \
-  && ok "前像: pdg-mitm 处在稳定运行态(active)" \
-  || note "前像: pdg-mitm 稳定后是 $MITM_AC_BEFORE —— 这就是本方向的合法前像, 恢复判据按它比"
+# 关闭态还要多一条: 盘上说关, 就不该再有接管插件在跑(7894 没有监听已经说明了这一点)。
+if [[ "$DIR" == i2a ]]; then
+  { [[ "$MITM_WLOC_ON" == 0 ]] && [[ "$MITM_LISTEN_BEFORE" == 0 ]]; } \
+    && ok "前像: 本方向的 WLOC 是**按旧版真实关闭路径**关掉的(enabled=false + pdg-mitm 已停 + 7894 无监听)" \
+    || { bad "前像: WLOC 关闭态没建立起来(enabled=$MITM_WLOC_ON 监听=$MITM_LISTEN_BEFORE)"; PREIMAGE_OK=0; }
+  note "说明: 这一格证明的是「**关闭态** iOS→Android 的失败恢复」; 它不证明「活跃 WLOC 的 iOS→Android 恢复」。"
+else
+  { [[ "$MITM_WLOC_ON" == 1 ]] && [[ "$MITM_LISTEN_BEFORE" -ge 1 ]]; } \
+    && ok "前像: 本方向 WLOC 开着且 7894 在监听(接管链路真的在)" \
+    || { bad "前像: WLOC 开启态没建立起来(enabled=$MITM_WLOC_ON 监听=$MITM_LISTEN_BEFORE)"; PREIMAGE_OK=0; }
+fi
+note "前像: pdg-mitm 的合法目标态 = $MITM_WANT, 实测 $MITM_AC_BEFORE —— 恢复判据按它比"
 : > "$RESIDUE_MANIFEST"
 residue_record /etc/systemd/system/pdg-mitm.service "v1.11.15 的 unit 模板(pdg_write_unit pdg_unit_pdg_mitm)"
 residue_record /opt/pdg-bot/mitm_server.py         "v1.11.15 源码树 deploy/bot/mitm_server.py"

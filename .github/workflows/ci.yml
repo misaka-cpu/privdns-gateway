@@ -1101,6 +1101,12 @@ jobs:
       - name: "平台验收的启动额度静置 (依生效窗口/有界/期间零启动; 范围选择仍要求 real_acceptance)"
         run: bash tests/test-platform-startlimit-quiesce.sh
 
+      # ⑤b 的前像: "瞬时 active" 不算稳定。上一轮 pdg-mitm 其实在崩溃循环(每 3s 被
+      # Restart=on-failure 拉起来一次), 判据只取一瞬就报了"稳定运行态"。这一支验
+      # 有界窗口里的持续稳定/持续停止, 以及"监听跟着进程在不在"这条一致性判据。
+      - name: "平台前像的持续稳定 (瞬时 active/自动重启/实例更替/观测无效各自判得对)"
+        run: bash tests/test-platform-preimage-stability.sh
+
       # 定性 e2e-platform-switch.sh §6 的红灯: 那里的注入让**每一次** `nft -c` 都失败, 而
       # cmd_rollback 在铺开快照之前自己就要 `nft -c` 校验快照里的 nftables.conf —— 于是恢复
       # 在它自己的安全门上中止。这支把"只坏前向"与"连恢复条件一起坏"分成两例, 分别核验:
