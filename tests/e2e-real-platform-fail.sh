@@ -315,10 +315,27 @@ git -C "$ORIGIN" archive "$CAND_SHA" | tar -x -C "$CANDSRC" || _hard "展开冻�
 #   · X 相对同一个 base 的产品面差异, 逐文件列出来 —— 那才是本轮要验的产品改动。
 # 验收分支建在**冻结候选之上**, 所以这里比的是"验收分支相对候选有没有动产品面" ——
 # 它只该多出 tests/ 与 workflow。比 base 没有意义(那会把候选自己的产品改动算到验收分支头上)。
+# 两种"验收分支产品面与候选不同"要分开判, 不能混成一条:
+#   (a) 验收分支**自己改了**产品面 —— 验收脚本夹带产品改动, 判红;
+#   (b) 验收分支只是停在**更旧的对象**上(候选后来又往前走了) —— 如实报告, 不判红:
+#       装到这台机器上的每一个产品文件都只来自候选($CANDSRC / 裸库 main), 下面逐项断言过。
+# 判别方式: 拿两者的共同祖先当基准, 看**验收分支这一侧**有没有动过产品面。
+YMB="$(git -C "$E2E_ROOT_REAL" merge-base "$CAND_SHA" HEAD 2>/dev/null)"
 YPROD="$(git -C "$E2E_ROOT_REAL" diff --name-only "$CAND_SHA" -- deploy lib install.sh uninstall.sh tools 2>/dev/null)"
-[[ -z "$YPROD" ]] \
-  && ok "验收分支相对**冻结候选**的产品面**零差异**(它只提供验收脚本与 workflow)" \
-  || bad "验收分支改了产品面: $YPROD"
+YOWN="$(git -C "$E2E_ROOT_REAL" diff --name-only "$YMB" HEAD -- deploy lib install.sh uninstall.sh tools 2>/dev/null)"
+_evn 02-source-map.txt "验收分支 HEAD=${GITHUB_SHA:-$(git -C "$E2E_ROOT_REAL" rev-parse HEAD 2>/dev/null)}; 与候选的共同祖先=$YMB"
+_evn 02-source-map.txt "验收分支自己动过的产品面: ${YOWN:-<无>}; 相对候选的产品面差异: $(tr '\n' ' ' <<<"$YPROD")"
+if [[ -n "$YOWN" ]]; then
+  bad "验收分支**自己改了**产品面(相对共同祖先 $YMB): $(tr '\n' ' ' <<<"$YOWN")"
+elif [[ -n "$YPROD" ]]; then
+  ok "验收分支自己没动过产品面(相对共同祖先 ${YMB:0:12} 零差异)"
+  note "验收分支的产品树仍是**旧对象**: 相对候选差这几个文件 —— $(tr '\n' ' ' <<<"$YPROD")"
+  note "  原因: 验收线建在共同祖先 ${YMB:0:12} 上, 候选 ${CAND_SHA:0:12} 之后又往前走了。"
+  note "  被测产品**不取自验收分支**: /usr/local/bin/pdg 与 /opt/pdg-bot 全部来自候选源码树,"
+  note "  裸库 refs/heads/main 也指向候选 —— 下面逐项断言(部署身份/受管清单/回滚实现)。"
+else
+  ok "验收分支相对**冻结候选**的产品面**零差异**(它只提供验收脚本与 workflow)"
+fi
 YEXTRA="$(git -C "$E2E_ROOT_REAL" diff --name-only "$CAND_SHA" 2>/dev/null | tr '\n' ' ')"
 _evn 02-source-map.txt "验收分支相对候选的全部改动: ${YEXTRA:-<无>}"
 ok "验收分支相对候选只多出: ${YEXTRA:-<无>}"
@@ -968,6 +985,99 @@ wait_stable(){   # $1=unit  [$2=最多等几秒, 默认 25]
   printf '%s\n' "${st:-<读不到>}"; return 1
 }
 
+# ── 启动频率预算: 只**读**产品自己的设置, 不改它 ────────────────────────────
+# 为什么要管这个: 本支在正式操作之前会为了标定 DNS 仪器连着重启 mosdns 四次
+# (固定实验条件 / 配置甲 / 配置乙 / 还原甲)。产品自己的 mosdns unit 写的是
+# Restart=on-failure + RestartSec=3, **没有**设 StartLimit*, 所以吃系统默认 10s/5。
+# 准备阶段把额度用掉, 随后 `pdg platform` 自己的 `systemctl restart mosdns` 就可能撞上
+# "Start request repeated too quickly" —— 那是**测试准备污染了被测过程**, 不是产品缺陷。
+# 处理办法只有一个方向: 在准备与被测操作之间**等**。
+#   · 不改产品 unit(独立定点那支的 300s/8 是它自己的测试条件, 不往这里套);
+#   · 不用 reset-failed, 不把窗口设成 0/infinity, 不延长产品操作的任何期限;
+#   · 等待长度由**实际生效的有限窗口**推出来, 并且有上限 —— 不做无界等待;
+#   · 静置是**测试前置**: 期间只要出现自动重启、状态不稳, 就判前置不成立, 不重试到绿。
+STARTLIMIT_CAP=60          # 静置上限(秒): 生效窗口超过它就判前置不成立, 不无界等
+PH_T0=""; T_CAL0=""; T_CAL1=""; T_PROD0=""; T_PROD1=""
+_now_j(){ date +'%Y-%m-%d %H:%M:%S'; }        # journalctl --since/--until 认的本地时刻
+_dur2s_real(){   # systemd 的人类可读时长 → 秒; infinity/0 原样回显
+  local in="$1" tot=0 t n un seen=0
+  [[ -n "$in" ]] || { echo ""; return 1; }
+  case "$in" in infinity|0) echo "$in"; return 0;; esac
+  for t in $in; do
+    n="${t%%[a-z]*}"; un="${t#"$n"}"
+    [[ "$n" =~ ^[0-9]+$ ]] || { echo ""; return 1; }
+    case "$un" in
+      h)    tot=$((tot+n*3600));;
+      min)  tot=$((tot+n*60));;
+      s|"") tot=$((tot+n));;
+      ms)   tot=$((tot+n/1000));;
+      us)   tot=$((tot+n/1000000));;
+      *)    echo ""; return 1;;
+    esac
+    seen=1
+  done
+  (( seen )) || { echo ""; return 1; }
+  echo "$tot"
+}
+_unit_starts(){   # $1=unit $2=起 [$3=止] → 这段时间里该 unit 被**启动**了几次(journal 实读)
+  local u="$1" a="$2" b="${3:-}"
+  local args=(-u "$u" --since "$a" --no-pager)
+  [[ -n "$b" ]] && args+=(--until "$b")
+  journalctl "${args[@]}" 2>/dev/null | grep -cE "Started ${u}(\.service)?[ .]" || true
+}
+startlimit_inventory(){   # 清点: 产品这份 unit 实际生效的限制 + 计划内的准备重启次数
+  local u=mosdns int burst ints
+  int="$(systemctl show -p StartLimitIntervalUSec --value "$u" 2>/dev/null)"
+  burst="$(systemctl show -p StartLimitBurst --value "$u" 2>/dev/null)"
+  ints="$(_dur2s_real "$int")"
+  SL_INT="$int"; SL_INT_S="$ints"
+  note "启动预算清点($u, **产品自己的 unit, 只读不改**):"
+  note "  实际生效: StartLimitIntervalUSec=$int(=${ints:-读不懂}s)  StartLimitBurst=$burst  Restart=$(systemctl show -p Restart --value "$u" 2>/dev/null)"
+  note "  本支准备阶段计划内的主动重启: 标定 4 次(固定实验条件/配置甲/配置乙/还原甲)"
+  note "  被测的产品动作自己还要重启 mosdns —— 所以两段之间必须静置, 让额度窗口过去"
+  _evn "06-$DIR-phases.txt" "启动预算: $u 生效 Interval=$int(=${ints:-?}s) Burst=$burst"
+}
+quiesce_startlimit(){   # $1=阶段说明 —— 依生效窗口做**有界**静置, 并证明静置期间什么都没起
+  local u=mosdns wait_s nr0 nr1 st during t0
+  [[ -n "${SL_INT_S:-}" ]] || { bad "静置($1): 还没清点生效窗口"; PREIMAGE_OK=0; return 1; }
+  case "$SL_INT_S" in
+    ""|infinity|0)
+      bad "静置($1): $u 的启动频率窗口实际生效值是 '$SL_INT' —— 读不懂/等于没有限制, 前置不成立"
+      PREIMAGE_OK=0; return 1;;
+  esac
+  [[ "$SL_INT_S" -le "$STARTLIMIT_CAP" ]] \
+    || { bad "静置($1): 生效窗口 ${SL_INT_S}s 超过上限 ${STARTLIMIT_CAP}s —— 不做无界等待, 前置不成立"; PREIMAGE_OK=0; return 1; }
+  wait_s=$(( SL_INT_S + 3 ))     # 窗口 + 3s 余量: 让窗口内的计数确实滑出去
+  nr0="$(systemctl show -p NRestarts --value "$u" 2>/dev/null)"
+  t0="$(_now_j)"
+  sleep "$wait_s"
+  nr1="$(systemctl show -p NRestarts --value "$u" 2>/dev/null)"
+  st="$(wait_stable "$u")"
+  during="$(_unit_starts "$u" "$t0")"
+  _evn "06-$DIR-phases.txt" "静置($1): $t0 起 ${wait_s}s(窗口 ${SL_INT_S}s+3s); 期间启动 $during 次; NRestarts $nr0→$nr1; 稳定后 $st"
+  { [[ "$during" == 0 ]] && [[ "$nr1" == "$nr0" ]] && [[ "$st" == active ]]; } \
+    && ok "静置($1): 按实际生效窗口 $SL_INT 静置 ${wait_s}s —— 期间 0 次启动, 没有自动重启(NRestarts=$nr0), $u 稳定在 $st" \
+    || { bad "静置($1): 期间启动 $during 次 / NRestarts $nr0→$nr1 / 稳定后 $st —— 前置不成立(不重试到绿)"; PREIMAGE_OK=0; return 1; }
+  return 0
+}
+phase_report(){   # 把"准备动作"与"产品动作"的边界连同实际启动记录一起留证
+  local u=mosdns
+  echo "── 阶段边界与 $u 的实际启动记录(journal 实读, 原始日志一行不删)──"
+  printf '    %-26s %s\n' "准备阶段(含造前像/装候选)" "$PH_T0 → $T_CAL0   启动 $(_unit_starts "$u" "$PH_T0" "$T_CAL0") 次"
+  printf '    %-26s %s\n' "标定阶段(仪器自己的重启)"   "$T_CAL0 → $T_CAL1   启动 $(_unit_starts "$u" "$T_CAL0" "$T_CAL1") 次"
+  printf '    %-26s %s\n' "静置#2 + 正式前像采集"      "$T_CAL1 → $T_PROD0  启动 $(_unit_starts "$u" "$T_CAL1" "$T_PROD0") 次"
+  printf '    %-26s %s\n' "**产品动作** pdg platform"  "$T_PROD0 → $T_PROD1 启动 $(_unit_starts "$u" "$T_PROD0" "$T_PROD1") 次"
+  {
+    echo "# 阶段边界(本地时刻)与 $u 启动次数"
+    echo "准备阶段   $PH_T0 → $T_CAL0   $(_unit_starts "$u" "$PH_T0" "$T_CAL0")"
+    echo "标定阶段   $T_CAL0 → $T_CAL1   $(_unit_starts "$u" "$T_CAL0" "$T_CAL1")"
+    echo "静置+采前像 $T_CAL1 → $T_PROD0  $(_unit_starts "$u" "$T_CAL1" "$T_PROD0")"
+    echo "产品动作   $T_PROD0 → $T_PROD1 $(_unit_starts "$u" "$T_PROD0" "$T_PROD1")"
+    echo "说明: 准备阶段的重启计在准备阶段, **不**计成产品动作; 两段之间的静置使产品动作"
+    echo "      拿到完整的启动额度。产品 unit 的 StartLimit 一个字没改, 也没有 reset-failed。"
+  } | _ev "06-$DIR-phases.txt"
+}
+
 # ── 测试指纹 vs 产品自己写的 svcstate.tsv, 逐项对账 ──────────────────────────
 # 两边在**不同时刻**采样就会对不上。这里直接比同一批 unit 的自启/运行值。
 svcstate_cross_check(){   # $1=svcstate.tsv 路径  $2=标签
@@ -1016,7 +1126,20 @@ assert_candidate_identity(){   # $1=平台
   { [[ "$mis" == 0 && "$dif" == 0 ]]; } \
     && ok "部署身份: $n 项受管模块与冻结候选逐字节一致(缺 $mis / 不符 $dif)" \
     || bad "部署身份: 受管模块与候选不一致(缺 $mis / 不符 $dif)"
-  _evn 00-identity.txt "候选部署身份: pdg+${n} 模块; 缺 $mis 不符 $dif"
+  # 本轮真正要看的两段代码就在这个文件里: 被调用的 CLI 与失败善后用的回滚实现。
+  # 文件整体逐字节相同已经断言过, 这里再把**这两段**单独抽出来对一遍, 免得"整体一致"
+  # 变成一句笼统的话。
+  local _rbok=1 _fn
+  for _fn in cmd_platform _plat_fail_restore _plat_rollback _pdg_restore_svcstate migrate_wloc_retire; do
+    local a b
+    a="$(awk -v f="$_fn" 'index($0,f"(){")==1{p=1} p{print} p&&/^\}$/{exit}' /usr/local/bin/pdg | sha256sum | awk '{print $1}')"
+    b="$(awk -v f="$_fn" 'index($0,f"(){")==1{p=1} p{print} p&&/^\}$/{exit}' "$CANDSRC/deploy/bot/pdg.sh" | sha256sum | awk '{print $1}')"
+    [[ "$a" == "$b" ]] || { _rbok=0; echo "       $_fn 不是候选那一份"; }
+  done
+  (( _rbok )) \
+    && ok "部署身份: 本轮要调用的 CLI 与**回滚实现**(cmd_platform/_plat_fail_restore/_plat_rollback/_pdg_restore_svcstate/migrate_wloc_retire)逐段等于候选" \
+    || bad "部署身份: 回滚实现或 CLI 不是候选那一份"
+  _evn 00-identity.txt "候选部署身份: pdg+${n} 模块; 缺 $mis 不符 $dif; 回滚实现逐段一致=$_rbok"
 }
 
 # ── DNS 仪器: 固定实验条件 → 标定 → 正式取证, 三处用**同一套**有效性要求 ────────
@@ -1330,6 +1453,7 @@ note "失败点: **可达的产品路径** —— 合法历史残留(有人手�
 note "  会让 migrate_wloc_retire 按「归属不清就不能一把清空」合法拒绝。那一步排在平台组件"
 note "  清理**之后**、切换提交**之前**。不是桩, 也没有替换任何清理/回滚/systemctl/nft/渲染。"
 
+PH_T0="$(_now_j)"        # 准备阶段起点: 造前像 / 装候选 / 标定都在这之后
 build_preimage ios on
 # ── 合法历史残留: 每一项写明来源, 并在下面逐项记指纹 ────────────────────────
 # ① 接管表里有一条**非 WLOC** 的域名(有人手工改过的痕迹)
@@ -1441,10 +1565,23 @@ assert_candidate_identity "$FROM"
 switch_repo_to_candidate "$FROM" || PREIMAGE_OK=0
 systemctl daemon-reload
 
+# ── 准备与被测操作之间的启动额度: 先清点, 再有界静置 ────────────────────────
+startlimit_inventory
+quiesce_startlimit "标定前" || true    # 失败已置 PREIMAGE_OK=0, 下面的前置门会报未执行
+
 # 先标定再用。**标定不过 = 验收前置不成立** —— 不是"把 DNS 那一项降成 note 然后照常跑完",
 # 那样等于拿一个证明不了东西的仪器走完四维验收再说一句"这项没取到"。
 # 所以它直接置 PREIMAGE_OK=0, 由下面的前置门把整个场景报成**未执行**(诊断数据仍然留档)。
+T_CAL0="$(_now_j)"
 dns_instrument_calibrate || { PREIMAGE_OK=0; bad "验收前置未成立: DNS 仪器没有通过标定(${DNS_CALIB_WHY:-未知})"; }
+T_CAL1="$(_now_j)"
+# 标定把配置还原了、服务也该稳住了 —— 再静置一次, 让**产品动作**拿到完整的启动额度,
+# 然后才统一采集正式前像(准备阶段的那些重启因此落在前像之前, 不会算进产品动作)。
+quiesce_startlimit "正式取证与平台操作前" || true
+[[ "$(wait_stable mosdns)" == active ]] \
+  && ok "正式前像之前: mosdns 已回到稳定运行态(标定的配置还原已生效)" \
+  || { bad "正式前像之前: mosdns 没有稳定在 active —— 前置不成立"; PREIMAGE_OK=0; }
+T_PROD0="$(_now_j)"
 snap_state "B-$DIR-before"
 fp_capture "B-$DIR-before"
 svc_snapshot "$E2E_TMP/svc-B-$DIR-before.tsv"
@@ -1462,7 +1599,9 @@ else
 
 echo; echo "── 真正跑候选的 pdg platform $TO ──"
 PL="$(bash /usr/local/bin/pdg platform "$TO" 2>&1)"; PRC=$?
+T_PROD1="$(_now_j)"
 printf '%s\n' "$PL" | _ev "05-$DIR-platform.log"
+phase_report
 _evn "05-$DIR-platform.log" "### 平台切换退出码 rc=$PRC"
 echo "$PL" | tail -60 | sed 's/^/    /'
 svc_snapshot "$E2E_TMP/svc-B-$DIR-after.tsv"

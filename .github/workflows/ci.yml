@@ -31,6 +31,15 @@ on:
         type: choice
         options: ["false", "true"]
         default: "false"
+      real_scope:
+        # 只在 real_acceptance=true 时有意义。默认 all = 与以前逐字节相同的三 job 语义;
+        # 选 platform 就只跑⑤a/⑤b 两个平台方向, 选 retire 就只跑④旧 CLI 直跳被拒。
+        # 是**显式范围选择**, 不是用 continue-on-error 把失败绕过去 —— 被选中的 job
+        # 该红照样红, 没被选中的 job 直接不启动(不产生结果, 也不冒充通过)。
+        description: "真实验收的范围(默认 all = 三个都跑; platform = 只跑⑤a/⑤b; retire = 只跑④)"
+        type: choice
+        options: ["all", "platform", "retire"]
+        default: "all"
 
 permissions:
   contents: read
@@ -1086,6 +1095,12 @@ jobs:
       - name: "平台切换失败善后 (退役件撤除后注入失败: 四维恢复到位/恢复不完整不声称已恢复)"
         run: bash tests/test-platform-fail-restore.sh
 
+      # 真实平台验收在正式操作前要为标定连着重启 mosdns 四次, 而产品自己的 mosdns unit
+      # 没设 StartLimit*(吃系统默认 10s/5)。这一支验"准备与被测操作之间的有界静置"判得对不对:
+      # 依生效窗口、有上限、期间有动静就判前置不成立, 不用 reset-failed 也不改产品 unit。
+      - name: "平台验收的启动额度静置 (依生效窗口/有界/期间零启动; 范围选择仍要求 real_acceptance)"
+        run: bash tests/test-platform-startlimit-quiesce.sh
+
       # 定性 e2e-platform-switch.sh §6 的红灯: 那里的注入让**每一次** `nft -c` 都失败, 而
       # cmd_rollback 在铺开快照之前自己就要 `nft -c` 校验快照里的 nftables.conf —— 于是恢复
       # 在它自己的安全门上中止。这支把"只坏前向"与"连恢复条件一起坏"分成两例, 分别核验:
@@ -1762,7 +1777,9 @@ jobs:
 
   real-retire-refusal:
     needs: prepare-mosdns-fixture
-    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.real_acceptance == 'true' }}
+    # real_scope 未给(老式派发)时等同 all —— 原有默认语义逐字保留。
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.real_acceptance == 'true'
+            && (github.event.inputs.real_scope == '' || github.event.inputs.real_scope == 'all' || github.event.inputs.real_scope == 'retire') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 50
     name: "真实验收①: 旧 CLI 直跳退役候选被拒, 再由原版自己回滚"
@@ -1918,7 +1935,8 @@ jobs:
 
   real-platform-fail-a2i:
     needs: prepare-mosdns-fixture
-    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.real_acceptance == 'true' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.real_acceptance == 'true'
+            && (github.event.inputs.real_scope == '' || github.event.inputs.real_scope == 'all' || github.event.inputs.real_scope == 'platform') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 50
     name: "真实验收⑤a: 平台切换 Android→iOS 在退役件撤除后失败的善后"
@@ -1993,7 +2011,8 @@ jobs:
 
   real-platform-fail-i2a:
     needs: prepare-mosdns-fixture
-    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.real_acceptance == 'true' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.real_acceptance == 'true'
+            && (github.event.inputs.real_scope == '' || github.event.inputs.real_scope == 'all' || github.event.inputs.real_scope == 'platform') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 50
     name: "真实验收⑤b: 平台切换 iOS→Android 在退役件撤除后失败的善后"
