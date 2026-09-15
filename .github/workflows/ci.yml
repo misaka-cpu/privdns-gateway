@@ -1874,20 +1874,38 @@ jobs:
           path: /tmp/mosdns-fixture
       - name: "校验并安装钉定 mosdns (自算 SHA / manifest 交叉 / 自报版本 / 生产判据)"
         run: sudo -E bash tests/install-mosdns-artifact.sh /tmp/mosdns-fixture
-      # 这三支也在 lint 里登记着, 但 lint 会被一条与本轮无关的旧红灯挡在更早的步骤上,
-      # 于是它们在 CI 里一次都没跑到过。这里**显式**接进定点 job, 不动 lint 的登记,
-      # 也不给任何标准门加 continue-on-error。
-      - name: "定点验收执行有效性 (计数/汇总/退出码一致)"
+      # 这三支也在 lint 里登记着(登记原样保留), 但 lint 会被一条与本轮无关的旧红灯挡在更早的
+      # 步骤上, 于是它们在 CI 里一次都没跑到过。这里**显式**接进定点 job。
+      # 不给任何标准门加 continue-on-error, 也不用 `|| true` 吞失败。
+      #
+      # 顺序有讲究(上一次 run 34931969481 就是栽在顺序上): 依赖、钉版制品校验、真实环境硬门
+      # 都过了之后 ——
+      #   ① 执行有效性(非特权) —— 它保证后面任何一步的失败都真的会被记账并顶成非零退出;
+      #   ② 真 systemd 定点验收 —— 本 job 真正要验的那一段, **排在模型测试之前**,
+      #      免得一支"可能未执行"的模型测试把它挡掉(上一次就是这么丢掉的);
+      #   ③ 真二进制验证(非特权);
+      #   ④ 标定契约模型 —— 只有这一支需要 sudo。
+      # 失败传播保持默认: 定点验收(或它的收尾)失败, 后面几步就不再跑 ——
+      # 不在一个可能被污染的现场上继续测。只有留证那一步用 always()。
+      - name: "① 定点验收执行有效性 (计数/汇总/退出码一致; 非特权)"
         run: bash tests/test-pinpoint-exec-validity.sh
-      - name: "DNS 标定契约 (桩化模型)"
-        run: bash tests/test-dns-calibration-contract.sh
-      - name: "DNS 仪器真二进制验证 (真 mosdns + 自有上游)"
-        run: bash tests/test-dns-instrument-real.sh
-      - name: "DNS 仪器定点验收"
+      - name: "② DNS 仪器定点验收 (真 systemd + 钉死 mosdns)"
         env:
           PDG_E2E_ISOLATED: "1"
           PDG_REAL_MIG_EVID: "/tmp/dns-instrument-evidence"
         run: sudo -E bash tests/e2e-dns-instrument-systemd.sh
+      - name: "③ DNS 仪器真二进制验证 (真 mosdns + 自有上游; 非特权)"
+        run: bash tests/test-dns-instrument-real.sh
+      # ④ 模型那一支要在**私有挂载命名空间**里把自有 /etc 绑上去、过完 dev:inode 自检, 才跑被测
+      #    函数 —— 它写的是 /etc 的绝对路径(当初就是为了不给产品加"测试专用路径开关")。
+      #    ubuntu-24.04 的 runner 上非特权用户建不出那个命名空间, 所以这一支(**也只有这一支**)
+      #    需要 sudo。但**提权不等于隔离**: 脚本的唯一入口仍是先 unshare 再 mount --bind 再自检,
+      #    root 也绕不过去; 建不出隔离时它照旧 "[未执行] + 非零", 不降级成无隔离执行。
+      #    这里显式清掉 PDG_DNSCAL_NS 与 FAKE —— 它们是"已进入隔离"的标记, 继承进来就会冒充;
+      #    其余环境按 sudo 默认清理, 不用 -E 无差别保留。
+      #    不动 runner 的 AppArmor / userns 策略, 也不改任何全局 sysctl。
+      - name: "④ DNS 标定契约 (桩化模型; 仅此一支用 sudo, 隔离仍由脚本自己建)"
+        run: sudo env -u PDG_DNSCAL_NS -u FAKE bash tests/test-dns-calibration-contract.sh
       - name: "留证: 证据文件与 mosdns journal(成败都留)"
         if: ${{ always() }}
         run: |
