@@ -1195,12 +1195,64 @@ phase_report(){   # 把"准备动作"与"产品动作"的边界连同实际启�
 #   任何一次状态查询失败 / 字段缺不出来 / journal 观测无效 ⇒ 记**观测无效**(既不算稳定,
 #   也不算零事件), 由调用方判前置不成立 —— 不靠"多等一会儿碰巧 active"蒙混过去。
 SVC_STABLE_WHY=""
+# ── 先认身份与类型, 再决定该读哪些字段 ──────────────────────────────────────
+# 上一次(run 34972537688)栽在这: 判据无条件要求 NRestarts 能解析成数字, 而
+# **NRestarts 是 Service 的属性** —— .timer / .socket 根本没有这一项, 于是
+# pdg-health.timer 被判成"观测无效", 两个方向都停在前置门。
+# 本机真 systemd 实测(只读, 没动任何生产服务):
+#   .service(simple, active) : Type=simple  MainPID=693 InvocationID=有 NRestarts=0
+#   .service(oneshot, active): Type=oneshot MainPID=**0**(RemainAfterExit 的正常形态) NRestarts=0
+#   .timer(active)           : Type=空 MainPID=**空** InvocationID=有 NRestarts=**空** SubState=elapsed/waiting
+#   .socket(active)          : 同上(Type/MainPID/NRestarts 皆空)
+#   **不存在**的 unit        : LoadState=not-found, 而 MainPID=**0**、NRestarts=**0**(不是空!)
+# 所以三件事必须分开: 数字 0 / 空字符串 / 类型上就不适用。
+#   · 不适用要有**类型依据**(按 Id 的后缀定), 不能因为"读出来是空"就自动算不适用;
+#   · 适用却缺失、查询失败、格式非法 ⇒ 仍记观测无效;
+#   · service 要不要求非零 MainPID, 取决于它的 Type(oneshot 正常就是 0)。
+UNIT_ID=""; UNIT_LOAD=""; UNIT_KIND=""; UNIT_TYPE=""; UNIT_WHY=""
+unit_identify(){   # $1=unit → 0 可观测 / 1 加载状态不可用 / 2 身份读不出来
+  UNIT_ID=""; UNIT_LOAD=""; UNIT_KIND=""; UNIT_TYPE=""; UNIT_WHY=""
+  local id load
+  id="$(systemctl show -p Id --value "$1" 2>/dev/null)"
+  load="$(systemctl show -p LoadState --value "$1" 2>/dev/null)"
+  { [[ -n "$id" ]] && [[ -n "$load" ]]; } || { UNIT_WHY="读不出 Id/LoadState(Id=[$id] LoadState=[$load])"; return 2; }
+  UNIT_ID="$id"; UNIT_LOAD="$load"
+  case "$id" in
+    *.timer)   UNIT_KIND=timer;;
+    *.socket)  UNIT_KIND=socket;;
+    *.service) UNIT_KIND=service;;
+    *)         UNIT_WHY="不认识的 unit 类型: $id"; return 2;;
+  esac
+  [[ "$load" == loaded ]] || { UNIT_WHY="$id 的 LoadState=$load(不是 loaded) —— 这是具名结果, 不是'不适用'"; return 1; }
+  if [[ "$UNIT_KIND" == service ]]; then
+    UNIT_TYPE="$(systemctl show -p Type --value "$1" 2>/dev/null)"
+    [[ -n "$UNIT_TYPE" ]] || { UNIT_WHY="$id 是 service 却读不到 Type"; return 2; }
+  fi
+  return 0
+}
+_unit_wants_mainpid(){   # service 的 Type 决定"活着时该不该有非零 MainPID"
+  case "$1" in simple|exec|notify|notify-reload|forking|idle) return 0;; *) return 1;; esac
+}
 svc_stable_window(){   # $1=unit $2=running|stopped [$3=窗口秒数, 默认 8] → 0 成立 / 1 不成立 / 2 观测无效
-  local u="$1" want="$2" secs="${3:-8}" i st pid inv nr0 nr1 pid0 inv0 c0 c1 evs
+  local u="$1" want="$2" secs="${3:-8}" i st sub pid inv nr0 nr1 pid0 inv0 c0 c1 evs
+  local has_nr=0 has_pid=0 wants_pid=0
   SVC_STABLE_WHY=""
+  unit_identify "$u"; local idrc=$?
+  case "$idrc" in
+    2) SVC_STABLE_WHY="观测无效: $UNIT_WHY"; return 2;;
+    1) SVC_STABLE_WHY="$UNIT_WHY"; return 1;;
+  esac
+  if [[ "$UNIT_KIND" == service ]]; then
+    has_nr=1; has_pid=1
+    _unit_wants_mainpid "$UNIT_TYPE" && wants_pid=1
+  fi
   c0="$(_j_mark "stable-$u-start")" || { SVC_STABLE_WHY="观测无效: 起界桩没建成($(_j_why))"; return 2; }
-  nr0="$(systemctl show -p NRestarts --value "$u" 2>/dev/null)"
-  [[ "$nr0" =~ ^[0-9]+$ ]] || { SVC_STABLE_WHY="观测无效: NRestarts 读不到合法数值(实得 [${nr0}])"; return 2; }
+  if (( has_nr )); then
+    nr0="$(systemctl show -p NRestarts --value "$u" 2>/dev/null)"
+    [[ "$nr0" =~ ^[0-9]+$ ]] || { SVC_STABLE_WHY="观测无效: $UNIT_ID 是 service, NRestarts 适用却读不到合法数值(实得 [${nr0}])"; return 2; }
+  else
+    nr0="不适用"
+  fi
   st="$(wait_stable "$u" "$secs")"          # 先等它进入非过渡态
   case "$st" in
     activating|deactivating|reloading|""|"<读不到>")
@@ -1208,37 +1260,53 @@ svc_stable_window(){   # $1=unit $2=running|stopped [$3=窗口秒数, 默认 8] 
   esac
   pid0="$(systemctl show -p MainPID --value "$u" 2>/dev/null)"
   inv0="$(systemctl show -p InvocationID --value "$u" 2>/dev/null)"
+  if (( has_pid )) && [[ ! "$pid0" =~ ^[0-9]+$ ]]; then
+    SVC_STABLE_WHY="观测无效: $UNIT_ID 是 service, MainPID 适用却读不到合法数值(实得 [${pid0}])"; return 2
+  fi
   for ((i=0; i<secs; i++)); do
     sleep 1
     st="$(systemctl show -p ActiveState --value "$u" 2>/dev/null)"
-    [[ -n "$st" ]] || { SVC_STABLE_WHY="观测无效: 第 $i 次取不到 ActiveState"; return 2; }
+    sub="$(systemctl show -p SubState --value "$u" 2>/dev/null)"
+    { [[ -n "$st" ]] && [[ -n "$sub" ]]; } \
+      || { SVC_STABLE_WHY="观测无效: 第 ${i}s 取不到 ActiveState/SubState(实得 [$st]/[$sub])"; return 2; }
     pid="$(systemctl show -p MainPID --value "$u" 2>/dev/null)"
     inv="$(systemctl show -p InvocationID --value "$u" 2>/dev/null)"
     if [[ "$want" == running ]]; then
-      [[ "$st" == active ]] || { SVC_STABLE_WHY="窗口内掉出 active(第 ${i}s 是 $st)"; return 1; }
-      [[ -n "$pid" && "$pid" != 0 ]] || { SVC_STABLE_WHY="窗口内 MainPID 无效(第 ${i}s 实得 [${pid}])"; return 1; }
-      [[ "$pid" == "$pid0" ]] || { SVC_STABLE_WHY="窗口内实例换过(MainPID $pid0 → $pid)"; return 1; }
+      [[ "$st" == active ]] || { SVC_STABLE_WHY="窗口内掉出 active(第 ${i}s 是 $st/$sub)"; return 1; }
+      if (( wants_pid )); then
+        { [[ "$pid" =~ ^[0-9]+$ ]] && [[ "$pid" != 0 ]]; } \
+          || { SVC_STABLE_WHY="Type=$UNIT_TYPE 的 service 活着时该有非零 MainPID, 第 ${i}s 实得 [${pid}]"; return 1; }
+        [[ "$pid" == "$pid0" ]] || { SVC_STABLE_WHY="窗口内实例换过(MainPID $pid0 → $pid)"; return 1; }
+      fi
       [[ -n "$inv" && "$inv" == "$inv0" ]] || { SVC_STABLE_WHY="窗口内实例换过(InvocationID $inv0 → ${inv:-读不到})"; return 1; }
     else
       case "$st" in
-        active|activating) SVC_STABLE_WHY="期望停止, 窗口内却是 $st(第 ${i}s)"; return 1;;
+        active|activating) SVC_STABLE_WHY="期望停止, 窗口内却是 $st/$sub(第 ${i}s)"; return 1;;
+        failed)            SVC_STABLE_WHY="期望停止, 实得 failed/$sub —— 那是崩溃之后的停, 不是合法停止态"; return 1;;
       esac
-      [[ -z "$pid" || "$pid" == 0 ]] || { SVC_STABLE_WHY="期望停止, 却还有 MainPID=$pid"; return 1; }
+      if (( has_pid )); then
+        [[ "$pid" =~ ^[0-9]+$ ]] || { SVC_STABLE_WHY="观测无效: service 停着时 MainPID 仍适用, 却读不到数值(实得 [${pid}])"; return 2; }
+        [[ "$pid" == 0 ]] || { SVC_STABLE_WHY="期望停止, 却还有 MainPID=$pid"; return 1; }
+      fi
     fi
   done
-  nr1="$(systemctl show -p NRestarts --value "$u" 2>/dev/null)"
-  [[ "$nr1" =~ ^[0-9]+$ ]] || { SVC_STABLE_WHY="观测无效: 窗口后 NRestarts 读不到合法数值(实得 [${nr1}])"; return 2; }
-  [[ "$nr1" == "$nr0" ]] || { SVC_STABLE_WHY="窗口内发生了自动重启(NRestarts $nr0 → $nr1)"; return 1; }
+  if (( has_nr )); then
+    nr1="$(systemctl show -p NRestarts --value "$u" 2>/dev/null)"
+    [[ "$nr1" =~ ^[0-9]+$ ]] || { SVC_STABLE_WHY="观测无效: 窗口后 NRestarts 读不到合法数值(实得 [${nr1}])"; return 2; }
+    [[ "$nr1" == "$nr0" ]] || { SVC_STABLE_WHY="窗口内发生了自动重启(NRestarts $nr0 → $nr1)"; return 1; }
+  fi
+  # 动作窗口证据对所有类型都保留: timer 省掉的是 NRestarts, **不是**"有没有被启动"这一问。
+  # (本机实测: 启动 timer 时 journal 写的是 "Started <unit>.timer - …", 同一条匹配式认得出来。)
   c1="$(_j_mark "stable-$u-end")" || { SVC_STABLE_WHY="观测无效: 止界桩没建成($(_j_why))"; return 2; }
   evs="$(_j_interval "$u" "$c0" "$c1")" || { SVC_STABLE_WHY="观测无效: 启动事件查不清($(_j_why))"; return 2; }
-  [[ "$evs" == 0 ]] || { SVC_STABLE_WHY="窗口内有 $evs 次启动事件(界桩裁决) —— 不是持续稳定"; return 1; }
-  SVC_STABLE_WHY="窗口 ${secs}s 内持续 ${want}: ActiveState=$st MainPID=${pid0:-无} Invocation=${inv0:-无} NRestarts=$nr0 启动事件 0 次"
+  [[ "$evs" == 0 ]] || { SVC_STABLE_WHY="窗口内有 $evs 次启动事件(界桩裁决) —— 不是持续 $want"; return 1; }
+  SVC_STABLE_WHY="窗口 ${secs}s 内持续 ${want}: $UNIT_ID($UNIT_KIND${UNIT_TYPE:+/$UNIT_TYPE}, LoadState=$UNIT_LOAD) ActiveState=$st SubState=$sub MainPID=$( ((has_pid)) && echo "${pid0}" || echo 不适用) Invocation=${inv0:-无} NRestarts=$nr0 启动事件 0 次"
   return 0
 }
+
 # 进程在不在 ↔ 7894 有没有监听。判据来自 v1.11.15 的 mitm_server.serve():
 # 它**无条件** bind 127.0.0.1:7894, 与 wloc.enabled 无关 —— enabled 决定的是
-# load_from_config 登不登记接管插件。所以:
-#   活着就该有监听; 停了就不该有。两边对不上 = 前像不自洽(有进程没停干净, 或根本没起来)。
+# load_from_config 登不登记接管插件。所以: 活着就该有监听; 停了就不该有。
 MITM_VERDICT_WHY=""
 mitm_listen_verdict(){   # $1=ActiveState $2=7894 监听数 → 0 自洽 / 1 不自洽
   local ac="$1" n="${2:-0}"
