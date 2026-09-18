@@ -80,9 +80,26 @@ if [[ -n "$BASE" && -f "$BASE" ]]; then
   # ① 多一个未授权函数
   cp "$PDG" "$BOX/a2-extra.sh"; printf '\n_a2_unauthorized_probe(){ :; }\n' >> "$BOX/a2-extra.sh"
   _a2_probe "多一个未授权函数" "$BOX/a2-extra.sh" reject
-  # ② 少一个应有函数(把定义行写成 `名(){ ` 之外的形态, 它就不再是一个顶层定义)
-  sed 's/^_update_pin_still(){/_update_pin_still() {/' "$PDG" > "$BOX/a2-missing.sh"
-  _a2_probe "少一个应有函数(_update_pin_still)" "$BOX/a2-missing.sh" reject
+  # ② 少一个应有函数: **真的把定义整段删掉**。
+  #    以前这里是 `sed 's/^_update_pin_still(){/_update_pin_still() {/'` —— 只在括号和大括号
+  #    之间加了个空格, 函数其实还在(独立跑 bash -n 与 declare -F 都成功), 那只是在考守卫
+  #    那条正则对空格敏不敏感, 不是"少了一个函数"。
+  awk 'BEGIN{skip=0}
+       /^_update_pin_still\(\)\{/{skip=1; next}
+       skip && /^\}$/{skip=0; next}
+       !skip{print}' "$PDG" > "$BOX/a2-missing.sh"
+  # 删干净了吗 + 其余内容有没有被误删
+  _gone=$(grep -c '^_update_pin_still' "$BOX/a2-missing.sh" || true)
+  _fnlen=$(sed -n '/^_update_pin_still(){/,/^}$/p' "$PDG" | wc -l)
+  _delta=$(( $(wc -l < "$PDG") - $(wc -l < "$BOX/a2-missing.sh") ))
+  [[ "$_gone" == 0 ]] && ok "  A2-区分力[删除自检]: 副本里确实**没有** _update_pin_still 的定义了" \
+                      || bad "  A2-区分力[删除自检]: 副本里还剩 $_gone 处定义"
+  [[ "$_delta" == "$_fnlen" ]] \
+    && ok "  A2-区分力[删除自检]: 只少了这一个函数的 $_fnlen 行, 其余未被误删" \
+    || bad "  A2-区分力[删除自检]: 行数少了 $_delta, 但该函数只有 $_fnlen 行 —— 误删了别的"
+  bash -n "$BOX/a2-missing.sh" 2>/dev/null \
+    && ok "  A2-区分力[删除自检]: 删后语法仍有效" || bad "  A2-区分力[删除自检]: 删后语法不过"
+  _a2_probe "少一个应有函数(_update_pin_still, 真删除)" "$BOX/a2-missing.sh" reject
   # ③ 无关注释: 结论必须不变
   sed '1a\# 对照: 这行注释不参与任何判定' "$PDG" > "$BOX/a2-comment.sh"
   _a2_probe "无关注释对照" "$BOX/a2-comment.sh" pass
