@@ -508,6 +508,9 @@ jobs:
       - name: "update 前置 mosdns 完整性预检 (缺失/命令非零/摘要不符在第一次副作用前停下)"
         run: bash tests/test-update-mosdns-preflight.sh
 
+      - name: "update --to 钉版 (参数三态/不被更高 tag 带偏/四态方向/目标移动/预览同源/dry-run 持锁)"
+        run: bash tests/test-update-to-pin.sh
+
       # 判据本体自 v1.11.9 起已是"先算摘要再执行", 但预检的**诊断路径**为了分辨版本漂移
       # 又把候选文件跑了一遍 —— 判据挡在门外的东西, 诊断又请了进来。这一支用 marker 证明
       # 行为, 不看源码形状: 换个写法照样能执行, 只有 marker 在不在是判据。

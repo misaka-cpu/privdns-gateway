@@ -2273,6 +2273,45 @@ _update_in_sync(){                      # 0 = 已装文件逐个等于仓库版�
 #
 # 判不出来一律非 0(fail-closed): 上游拿它当"要不要拒绝"的依据, 那就绝不能在存疑时
 # 退回某个默认关系 —— 默认成 behind 就等于把"判不出来"变成了"那就 reset 吧"。
+# ── `pdg update --to <tag>` 的目标解析 ───────────────────────────────────────
+# 解析**只做一次**, 结果是一个提交 SHA; 之后每次要用它之前再复核 tag 没被挪走。
+# 为什么不是"每次用到就 rev-parse 一遍": tag 是可移动的引用。一次更新要经过方向判断、
+# same 短路、reset、装文件、身份核对好几步, 中间任何一步之后 tag 被重打(上游改了发布、
+# 或者本地 fetch 到了新的同名 tag), 后面几步就会悄悄换成另一个对象 —— 而屏幕上显示的
+# 还是同一个 tag 名。固定一次 + 每次复核, 变了就明确停止, 不成功短路到别的提交。
+_update_pin_resolve(){
+  local repo="$1" tag="$2" commit
+  # 钉版要求仓库本身是可判断的: .git 缺失时默认路径走的是"重新 clone"自愈, 那条路上
+  # 无从确认"现在这台机器与目标的关系", 而 --to 的前提正是关系可判。明确停, 不改装。
+  [[ -d "$repo/.git" ]] || { c_y "❌ $repo 不是 git 仓库, 无法钉版更新(--to 要求关系可判)。" >&2; return 1; }
+  # 取件失败就是"目标无法确认", 不是"目标不存在" —— 两者的处置都是停, 但理由要说对。
+  pdg_fetch_release_tags "$repo" >&2 || { c_y "❌ 取件失败 → 无法确认钉版目标 $tag, 中止(不改装别的版本)。" >&2; return 1; }
+  # `^{commit}` 必须写: 附注 tag 自己的对象哈希不是它指向的提交, 少了它后面与 HEAD 的
+  # 比较会永远不相等, 而且没有任何迹象。
+  commit="$(git -C "$repo" rev-parse -q --verify "refs/tags/$tag^{commit}" 2>/dev/null)"
+  [[ -n "$commit" ]] || { c_y "❌ 指定的版本 tag 在取件到的仓库里不存在: $tag(不会改装最新版)" >&2; return 1; }
+  printf '%s\n' "$commit"
+}
+# 目标还是最初固定的那个吗? 不是就停 —— 不猜、不重新解析、不退回最新发布。
+_update_pin_still(){
+  local repo="$1" tag="$2" want="$3" now
+  now="$(git -C "$repo" rev-parse -q --verify "refs/tags/$tag^{commit}" 2>/dev/null)"
+  [[ -n "$want" && "$now" == "$want" ]] && return 0
+  c_y "❌ 钉版目标 $tag 在执行过程中被移动了(最初固定 $want, 现在 ${now:-解析不出})→ 拒绝继续。" >&2
+  return 1
+}
+# 当前进程执行的是**哪一份** pdg.sh。旧版 CLI 不认识 --to, 跨版本升级要从一份经核验的
+# 入口副本里直接运行新版脚本(docs/BRIDGE-ENTRY.md), 那时 /usr/local/bin/pdg 还是旧的。
+# 被更新的对象**始终**是现役仓库 $REPO_DIR —— 入口在哪跑与改谁是两件事, 屏幕上必须分得清,
+# 否则事后无从判断"当时到底跑的是谁"。
+_pdg_entry_src(){
+  local src="${BASH_SOURCE[0]}" d b
+  [[ -n "$src" ]] || { echo "(未知)"; return 0; }
+  d="$(cd "$(dirname "$src")" 2>/dev/null && pwd -P)" || { printf '%s\n' "$src"; return 0; }
+  b="$(basename "$src")"
+  printf '%s/%s\n' "$d" "$b"
+}
+
 _update_release_relation(){
   local repo="${1:-}" tag="${2:-}" cur tgt rc
   [[ -n "$repo" && -d "$repo/.git" && -n "$tag" ]] || return 1
@@ -2389,12 +2428,55 @@ _update_mosdns_preflight(){
 
 cmd_update(){
   need_root update
-  # --dry-run 只查看: 不装 git、不迁移、不写任何东西。任一步失败都要返回非 0 并说清是哪一步 ——
+  # ── `--to <tag>`: 把这次更新钉在指定发布上 ────────────────────────────────
+  # 默认契约是"选仓库里最高的 v* tag"。当线上同时存在更高的**退役线** tag、或者要做
+  # 跨版本验收时, 那条默认会把机器带到不想要的版本上 —— `--to` 只收窄目标, 不放宽任何门。
+  #
+  # 参数三态必须分开, 不能合并成一个 `[[ -n $x ]]`:
+  #   省略 `--to`        → 保持既有默认(最高 v* tag), 行为一个字节都不变;
+  #   `--to` 后面没取值  → 用户漏写, 报错;
+  #   `--to ""` / `--to=`→ **显式空目标**, 报错。它与"省略"不是一回事: 把空值当省略的话,
+  #                        用户以为钉了版, 实际装的是最新发布, 而屏幕上看不出区别。
+  # 非法输入一律在**取件之前**拒绝 —— 取件会写现役仓库的 git 元数据, 参数错了不该留痕。
+  local _to_given=0 _to_tag="" _to_commit="" _argv=()
+  while (( $# )); do
+    case "$1" in
+      --to)
+        _to_given=1
+        (( $# >= 2 )) || { c_y "❌ --to 缺少取值(要跟一个版本 tag, 例: --to v1.11.15)"; return 1; }
+        _to_tag="$2"; shift 2;;
+      --to=*) _to_given=1; _to_tag="${1#--to=}"; shift;;
+      *) _argv+=("$1"); shift;;
+    esac
+  done
+  # 解析完再把其余参数放回去: `--dry-run` 与 `--to` 谁先谁后都成立, 不靠位置约定。
+  set -- ${_argv[@]+"${_argv[@]}"}
+  if (( _to_given )); then
+    [[ -n "${_to_tag//[[:space:]]/}" ]] \
+      || { c_y "❌ --to 给的是**空目标**。显式空值与省略 --to 不是一回事: 省略才走默认最新发布, 空值一律拒绝。"; return 1; }
+    # 只收版本 tag 名。挡的不只是笔误: 取值会拼进 `refs/tags/<x>`, 放行 `-` 开头、`..`、
+    # 路径分隔符等于把 git 的 ref 语法暴露到命令行上。
+    [[ "$_to_tag" =~ ^v[0-9][0-9A-Za-z.+_-]*$ && "$_to_tag" != *".."* && "$_to_tag" != *.lock ]] \
+      || { c_y "❌ --to 只接受版本 tag 名(v 开头, 例 v1.11.15); 收到: $_to_tag"; return 1; }
+    # 入口出身与被更新对象分别登记 —— 这两个在跨版本升级时**不是同一个目录**。
+    c_g "钉版更新: --to $_to_tag"
+    echo "  入口代码来源: $(_pdg_entry_src)"
+    echo "  被更新的对象: $REPO_DIR(现役受管仓库; 入口在哪运行都不改这一点)"
+  fi
+  # --dry-run 只查看: 不装 git、不迁移、不改任何生产文件。任一步失败都要返回非 0 并说清是哪一步 ——
   # 以前 fetch/describe/tag 全用 `2>/dev/null` 吞掉, 拿不到就打印"最新发布: (无 tag)"再 return 0,
   # 用户会当成"已经是最新版", 实际是网络不通或仓库读不了。
   if [[ "${1:-}" == "--dry-run" ]]; then
     command -v git >/dev/null 2>&1 || { c_y "❌ 没有 git, 无法查看更新(dry-run 不安装任何东西)"; return 1; }
     [[ -d "$REPO_DIR/.git" ]] || { c_y "❌ $REPO_DIR 不是 git 仓库, 无法查看更新"; return 1; }
+    # ── dry-run 也持锁 ────────────────────────────────────────────────────
+    # **行为变化, 如实登记**: dry-run 不是完全只读。下面的 pdg_fetch_release_tags 会写
+    # 现役仓库的 FETCH_HEAD 与 refs/tags —— 与执行路径写的是同一批 git 元数据, 所以必须
+    # 受**同一把锁**保护, 而不是"因为它叫 dry-run 就不用锁"。
+    # 位置: 第一次可能写现役仓库的取件**之前**; 锁一直持到预览返回(fd 9 由 _lock 打开并
+    # flock, 进程退出时内核释放, 与执行路径完全一致)。复用既有锁协议, 没有第二把锁。
+    # 锁忙时 _lock 自己就停(退出 1): 立即拒绝, **不取件**, 不重试。
+    _lock
     local cur_desc tgt
     if ! pdg_fetch_release_tags "$REPO_DIR"; then
       c_y "❌ 拉取远端 tag 失败(网络不通 / 仓库地址无效 / 属主异常)→ 无法判断是否有新版"; return 1
@@ -2402,9 +2484,20 @@ cmd_update(){
     if ! cur_desc="$(git -C "$REPO_DIR" describe --tags --always 2>/dev/null)" || [[ -z "$cur_desc" ]]; then
       c_y "❌ 读不到当前版本(git describe 失败: 仓库损坏 / 无提交 / 属主异常)"; return 1
     fi
+    # 预览与执行**共用同一套选版契约**: 钉了版就预览钉的那一版, 否则才是默认最新发布。
+    # 两边各写一份的话, 用户看到的与实际装上的迟早会是两个东西。
+    if (( _to_given )); then
+      _to_commit="$(_update_pin_resolve "$REPO_DIR" "$_to_tag")" || return 1
+      tgt="$_to_commit"
+      echo "预览目标(钉版): $_to_tag → $_to_commit"
+    else
     tgt="$(git -C "$REPO_DIR" tag -l 'v*' --sort=-v:refname 2>/dev/null | head -1)"
     [[ -n "$tgt" ]] || { c_y "❌ 仓库里没有任何发布 tag(v*)→ 无法确定目标版本"; return 1; }
-    echo "当前: $cur_desc   最新发布: $tgt"
+    fi
+    # 钉版时这一行不能仍写"最新发布" —— 显示的是钉的那个目标, 与最新发布往往不是一回事。
+    if (( _to_given )); then echo "当前: $cur_desc   钉版目标: $_to_tag($_to_commit)"
+    else                     echo "当前: $cur_desc   最新发布: $tgt"
+    fi
     # 关系先判、再决定说什么。以前无论什么关系都打印一段 "待更新提交(HEAD..$tgt):" ——
     # HEAD 领先 tag 时那个区间是**空的**, 于是屏幕上只剩一个标题, 读起来正好是"没有待更新
     # 的提交, 已经最新了"。而真相相反: 正式 update 会把机器退回 $tgt。
@@ -2443,7 +2536,47 @@ cmd_update(){
   #
   # .git 缺失时不判: 那条路是"重新 clone"的自愈: 一个不是 git 仓库的目录里, 也不可能有
   # 未发布的本地提交需要保护。
-  if [[ -d "${REPO_DIR:-}/.git" ]] && pdg_fetch_release_tags "$REPO_DIR" >/dev/null 2>&1; then
+  # 钉版时走这条: 目标在方向门**之前**解析并固定, 之后方向判断、same 短路、reset、
+  # 身份核对用的都是这同一个提交。
+  #
+  # 与默认路径的一处**有意不同**: 默认路径上"不是仓库 / 拉不到 tag"会整段跳过方向门,
+  # 由后面各步给出自己的失败理由; 钉版不允许这样 —— 目标确认不了就是停, 不把"没得到
+  # 方向裁决"当成可以继续。ahead / diverged 仍然拒绝: --to 只收窄目标, 不兼作降级后门。
+  if (( _to_given )); then
+    _to_commit="$(_update_pin_resolve "$REPO_DIR" "$_to_tag")" || return 1
+    c_g "钉版目标已固定(一次, 在方向门之前): $_to_tag → $_to_commit"
+    local _rel_to
+    if ! _rel_to="$(_update_release_relation "$REPO_DIR" "$_to_commit")"; then
+      c_y "❌ 判不出当前提交与钉版目标 $_to_tag 的关系(仓库损坏 / 对象缺失), 中止更新。"
+      echo "  没动任何文件: 未建快照, 未 reset, 未重启服务。"
+      return 1
+    fi
+    case "$_rel_to" in
+      ahead)
+        c_y "❌ 当前跑的是**尚未发布**的提交(领先钉版目标 $_to_tag), 拒绝更新。"
+        echo "  update 只往前走; --to 收窄的是目标, 不是方向。退回某一版走 pdg rollback 或重装那一版。"
+        echo "  没动任何文件: 未建快照, 未 reset, 未重启服务。"
+        return 1;;
+      diverged)
+        c_y "❌ 当前提交与钉版目标 $_to_tag 已**分叉**(互不为祖先), 拒绝更新。"
+        echo "  两个方向都不是「更新」, 而 update 不猜方向。"
+        echo "  没动任何文件: 未建快照, 未 reset, 未重启服务。"
+        return 1;;
+    esac
+    if [[ "$_rel_to" == behind ]] && ! _update_mosdns_preflight; then
+      return 1
+    fi
+    # 短路之前再复核一次: 要短路的前提是"现在就在目标上", 目标被挪走了这个前提就不成立。
+    _update_pin_still "$REPO_DIR" "$_to_tag" "$_to_commit" || return 1
+    if [[ -z "${PDG_UPDATE_FORCE:-}" && "$_rel_to" == same ]] \
+       && git -C "$REPO_DIR" diff --quiet HEAD -- 2>/dev/null \
+       && _update_in_sync "$REPO_DIR"; then
+      c_g "已是钉版目标 $_to_tag($_to_commit), 且已装文件逐个与仓库一致 —— 无需更新(未建快照, 未重启任何服务)。"
+      echo "  要强制重装同一版本: PDG_UPDATE_FORCE=1 pdg update --to $_to_tag"
+      return 0
+    fi
+    # same 但不同步 → 不短路, 照走下面的完整流程(那正是 `pdg update` 作为修复路径的用法)。
+  elif [[ -d "${REPO_DIR:-}/.git" ]] && pdg_fetch_release_tags "$REPO_DIR" >/dev/null 2>&1; then
     local _tgt_tag _rel
     _tgt_tag="$(git -C "$REPO_DIR" tag -l 'v*' --sort=-v:refname 2>/dev/null | head -1)"
     if [[ -n "$_tgt_tag" ]]; then
@@ -2505,14 +2638,37 @@ cmd_update(){
   if ! pdg_fetch_release_tags "$REPO_DIR"; then
     c_y "拉取发布 tag 失败, 中止更新。"; return 1
   fi
+  # 钉版时**不重新选版**: 用方向门之前固定的那个提交, 用之前再复核 tag 没被挪走。
+  # 这里重新 `tag -l | head -1` 的话, 前面所有基于目标的判断就都白做了 —— 装上去的会是
+  # 此刻最高的那个 tag, 而不是用户钉的那一个。
+  local tgt
+  if (( _to_given )); then
+    if ! _update_pin_still "$REPO_DIR" "$_to_tag" "$_to_commit"; then
+      c_y "回滚到更新前快照…"; cmd_rollback --dir "$snap_dir" --git "$pre_sha"; return 1
+    fi
+    tgt="$_to_commit"
+  else
   local tgt; tgt=$(git -C "$REPO_DIR" tag -l 'v*' --sort=-v:refname | head -1)
+  fi
   if [[ -z "$tgt" ]]; then
     c_y "仓库没有发布 tag(v*), 中止更新。"; return 1
   fi
   if ! git -C "$REPO_DIR" reset --hard -q "$tgt"; then
     c_y "git reset 到 $tgt 失败, 回滚到更新前快照…"; cmd_rollback --dir "$snap_dir" --git "$pre_sha"; return 1
   fi
+  if (( _to_given )); then
+    # 装上去的到底是不是钉的那一版: 读仓库**真实 HEAD**, 不是解析时记下的值。
+    # 拿记下的值自比等于自证, reset 被别的东西改掉时照样"通过"。
+    local _head_now; _head_now="$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null)"
+    if [[ "$_head_now" != "$_to_commit" ]]; then
+      c_y "❌ 钉版目标没有贯穿到实际安装(现役仓库 HEAD=${_head_now:-读不到}, 应为 $_to_commit)→ 回滚…"
+      cmd_rollback --dir "$snap_dir" --git "$pre_sha"; return 1
+    fi
+    c_g "钉版目标已贯穿到实际安装: $_to_tag → $_to_commit"
+    c_g "→ 已切到发布 $_to_tag($_to_commit)"
+  else
   c_g "→ 已切到发布 $tgt"
+  fi
   c_g "刷新代码(配置/出口/token/证书均不动)…"
   # 运行模块清单的单一事实源(与 install.sh 共用)。读不到就别装 —— 宁可这次不更新, 也不要
   # 按一份残缺的清单装出新旧混装。
@@ -8509,5 +8665,5 @@ case "${1:-menu}" in
   link)          shift || true; cmd_link "$@";;
   uninstall|rm)  shift || true; cmd_uninstall "$@";;
   rescue)        shift || true; cmd_rescue "$@";;
-  *) echo "用法: pdg [menu|status|doctor [--json|--deep]|update [--dry-run]|snapshot|rollback [n]|token|restart|log [n]|traffic|ios [status|diff|previous|ack|recover|repair](仅 iOS)|report [--redact-ip|--full]|detect-cidr|platform <ios|android>|hijack-mode <all|gfw>|ssh-source [status|tailnet|any|confirm]|link status|link session <start|status|stop>|lan <status|list|check|routes|add|rm>|adblock <status|status-line|enable|disable|update|check <域名>|rule-add <域名>|rule-del <域名>|source <list [--json]|add <URL>|del <URL>|reset>>|migrate|migrate-fw|tx <list|show|recover|abort>|rescue <enable|disable|status|fingerprint|bind <IPv4>|rotate-token|rotate-cert>|uninstall [--purge]]";;
+  *) echo "用法: pdg [menu|status|doctor [--json|--deep]|update [--dry-run] [--to <版本tag>]|snapshot|rollback [n]|token|restart|log [n]|traffic|ios [status|diff|previous|ack|recover|repair](仅 iOS)|report [--redact-ip|--full]|detect-cidr|platform <ios|android>|hijack-mode <all|gfw>|ssh-source [status|tailnet|any|confirm]|link status|link session <start|status|stop>|lan <status|list|check|routes|add|rm>|adblock <status|status-line|enable|disable|update|check <域名>|rule-add <域名>|rule-del <域名>|source <list [--json]|add <URL>|del <URL>|reset>>|migrate|migrate-fw|tx <list|show|recover|abort>|rescue <enable|disable|status|fingerprint|bind <IPv4>|rotate-token|rotate-cert>|uninstall [--purge]]";;
 esac
