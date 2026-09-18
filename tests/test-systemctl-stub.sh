@@ -291,6 +291,58 @@ rm -f "/etc/systemd/system/$U"; reset_state
 # EXIT hook 仍然留着管异常路径; 这里显式调用是为了让下面的正向断言能在本脚本里完成 ——
 # 桩没清干净这件事必须在这里被抓住, 而不是留给几十步之后的另一支测试。
 echo
+echo
+echo "── 14. 运行周期身份(InvocationID): 只有进入新周期才换 ──"
+# 产品的回滚判据靠"重启后 InvocationID 变过"确认恢复出来的配置被重新读进去了。
+# 桩以前既不生成也不更换 ID(实测: restart 之后仍为空; 预填固定值后 restart 也不变),
+# 于是那条判据在沙箱里只能永远登记"无法确认"。这一节钉住补齐后的语义。
+# unit 名**不带** .service 后缀: 桩在"没有状态记录"时按 /etc/systemd/system/<u>.service
+# 判断它是否装着(14g 的初始前像正是走这条回退), 带后缀会让它去找 <u>.service.service。
+SVC=stubinv
+mk_svc(){ printf '[Unit]\nDescription=inv test\n[Service]\nExecStart=/bin/true\n' > "/etc/systemd/system/$SVC.service"; }
+mk_svc; rm -f "$D/$SVC".* "$D/.invseq" 2>/dev/null
+inv(){ "$SC" show -p InvocationID --value "$SVC"; }
+# 14a 起不来的 unit: 没有健康实例 ⇒ 没有 ID(不许伪造)
+: > "$D/$SVC.fail"; "$SC" start "$SVC" >/dev/null 2>&1
+{ [[ -z "$(inv)" ]] && [[ "$("$SC" is-active "$SVC" 2>/dev/null)" == inactive ]]; } \
+  && t_ok "14a: 起不来 ⇒ inactive 且**没有** ID(失败启动不伪造健康实例)" \
+  || t_bad "14a: 起不来却给了 ID='$(inv)' / 状态='$("$SC" is-active "$SVC" 2>/dev/null)'"
+rm -f "$D/$SVC.fail"
+# 14b 首次 start: 进入新周期 ⇒ 生成 ID
+"$SC" start "$SVC" >/dev/null 2>&1; I1="$(inv)"
+[[ -n "$I1" ]] && t_ok "14b: 首次 start ⇒ 生成运行周期身份($I1)" || t_bad "14b: start 之后仍没有 ID"
+# 14c 只读查询不改 ID(连查三次)
+I2="$(inv)"; "$SC" is-active "$SVC" >/dev/null 2>&1; "$SC" show -p ActiveState --value "$SVC" >/dev/null 2>&1; I3="$(inv)"
+{ [[ "$I1" == "$I2" ]] && [[ "$I2" == "$I3" ]]; } \
+  && t_ok "14c: 只读查询**不改变** ID(三次读都是 $I1)" || t_bad "14c: 读一次就变了($I1 / $I2 / $I3)"
+# 14d 对**已在跑**的 unit 再 start: 空转, 不冒充 restart
+"$SC" start "$SVC" >/dev/null 2>&1; I4="$(inv)"
+[[ "$I4" == "$I1" ]] && t_ok "14d: 已在跑时 start 是空转 ⇒ ID 不变(不冒充 restart)" \
+                     || t_bad "14d: start 换了 ID($I1 → $I4) —— 把空转当成了重启"
+# 14e restart: 一定进新周期 ⇒ ID 必须变
+"$SC" restart "$SVC" >/dev/null 2>&1; I5="$(inv)"
+{ [[ -n "$I5" ]] && [[ "$I5" != "$I1" ]]; } \
+  && t_ok "14e: restart ⇒ 进入新周期, ID 变了($I1 → $I5)" || t_bad "14e: restart 后 ID 仍是 '$I5'"
+# 14f stop: 实例没了 ⇒ ID 也没了
+"$SC" stop "$SVC" >/dev/null 2>&1
+[[ -z "$(inv)" ]] && t_ok "14f: stop 之后没有实例 ⇒ 没有 ID" || t_bad "14f: stop 后仍有 ID='$(inv)'"
+# 14g 初始前像自洽: 从没记录过但 unit 文件在 ⇒ is-active 当它在跑, 那就该有 ID; 补一次之后恒定
+rm -f "$D/$SVC".* 2>/dev/null
+J1="$(inv)"; J2="$(inv)"
+{ [[ "$("$SC" is-active "$SVC" 2>/dev/null)" == active ]] && [[ -n "$J1" ]] && [[ "$J1" == "$J2" ]]; } \
+  && t_ok "14g: 初始运行前像自洽(当它在跑就有 ID=$J1, 且**再读不变**)" \
+  || t_bad "14g: 初始前像不自洽(active=$("$SC" is-active "$SVC" 2>/dev/null) J1='$J1' J2='$J2')"
+# 14h 两种失败覆盖仍在: 读不到 ID / 重启后 ID 未变 —— 用**不存在的 unit** 与 .fail 各造一次
+[[ -z "$("$SC" show -p InvocationID --value no-such-unit.service)" ]] \
+  && t_ok "14h-1: 读不到 ID 这种失败仍可复现(未知 unit ⇒ 空)" || t_bad "14h-1: 未知 unit 竟有 ID"
+rm -f "$D/$SVC".* 2>/dev/null; : > "$D/$SVC.fail"
+K1="$(inv)"; "$SC" restart "$SVC" >/dev/null 2>&1; K2="$(inv)"
+{ [[ "$K1" == "$K2" ]]; } \
+  && t_ok "14h-2: '重启后 ID 未变'这种失败仍可复现(起不来的 unit: '$K1' → '$K2')" \
+  || t_bad "14h-2: 起不来的 unit 竟然换了 ID($K1 → $K2)"
+rm -f "$D/$SVC".* "/etc/systemd/system/$SVC.service" 2>/dev/null
+t_ok "14i: 如实登记 —— 以上都是**模型**证据, 不代表真实服务或真实配置加载已验收"
+
 echo "── 收尾: 桩清理与命令解析恢复 ──"
 stub_cleanup && t_ok "清理返回 0" || t_bad "清理失败(见上面的 [!] 行)"
 NOW_NFT_CMD="$(command -v nft 2>/dev/null || true)"
