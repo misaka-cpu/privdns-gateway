@@ -56,6 +56,18 @@ sleep(){ :; }
 _pdg_platform(){ echo "${PLATFORM:-android}"; }
 _pdg_core(){ echo singbox; }
 pdg_fetch_release_tags(){ return 0; }
+_pdg_bot_cred(){ echo "${CRED:-unset}"; }
+# 「已装文件是否逐个与仓库一致」: 本壳的 git 桩让 HEAD 与 tag 同值(关系恒为 same), 所以这一项
+# 决定走"健康短路"还是"修复路径"。本壳测的是**故障传播**, 必须走完整编排 —— 默认取"不同步"。
+# 判据本体另有专测(tests/test-update-release-relation.sh 的 same 两路), 这里只当可控输入。
+_update_in_sync(){ return "${INSYNC_RC:-1}"; }
+# 服务前像保存: **可控替身**, 不是恒真。真实前像属真实 systemd 验收, 本壳不冒充;
+# 但"前像保存失败就中止更新"这道门必须还能被测到 —— 见文末 N 节的定向反例。
+_pdg_save_svcstate(){
+  printf "SVCSTATE_SAVE %s rc=%s\n" "${1:-<无参>}" "${SVCSTATE_RC:-0}" >> "$WORK/side.log"
+  [[ -n "${1:-}" && -d "${1:-}" ]] && printf "modeled-svcstate\n" > "$1/svcstate.tsv"
+  return "${SVCSTATE_RC:-0}"
+}
 # 全桩 git: 只控制 reset 成败, 其余给出稳定输出
 git(){
   local a=("$@"); [[ "${a[0]:-}" == "-C" ]] && a=("${a[@]:2}")
@@ -233,6 +245,20 @@ done
 r=$(run "PLATFORM=ios"); rc="${r%%|*}"; out="${r#*|}"
 { [[ "$rc" == 0 ]] && grep -q '✅ 已更新' <<<"$out" && ! grep -q ROLLBACK_CALLED <<<"$out"; } \
   && ok "iOS: 五个平台组件均安装成功 → 正常完成" || bad "iOS happy: rc=$rc out=$out"
+
+echo
+echo "══ N. 接线自检: 本轮新接的两个替身都不是恒真 ══"
+# N1/N2: 前像保存失败必须中止更新, 且不能走到装文件那一步。
+: > "$WORK"/e2e-inject-hit; : > "$WORK"/e2e-inject-count
+_r=$(run "SVCSTATE_RC=1"); _rc="${_r%%|*}"; _out="${_r#*|}"
+{ [[ "$_rc" != 0 ]] && grep -q '服务前像保存失败' <<<"$_out"; } \
+  && ok "N1: 前像保存失败 ⇒ 中止更新(rc=$_rc)并点名原因" || bad "N1: 没挡住(rc=$_rc): $(tail -2 <<<"$_out")"
+[[ -s "$WORK"/e2e-inject-count ]] && bad "N2: 前像保存失败却仍然装了受管文件" || ok "N2: 且一个受管目标都没装(受管计数为空)"
+# N3: _update_in_sync 取"已同步"时应走健康短路 —— 证明它是可控输入, 而不是被写死
+_r=$(run "INSYNC_RC=0"); _rc="${_r%%|*}"; _out="${_r#*|}"
+{ [[ "$_rc" == 0 ]] && grep -q '无需更新' <<<"$_out"; } \
+  && ok "N3: 喂'已同步' ⇒ 健康短路(rc=0), 说明本壳默认走的是修复路径而非被写死" \
+  || bad "N3: 喂'已同步'没短路(rc=$_rc): $(tail -2 <<<"$_out")"
 
 echo "────────────────────────────────────────"
 echo "通过 $pass, 失败 $nfail"

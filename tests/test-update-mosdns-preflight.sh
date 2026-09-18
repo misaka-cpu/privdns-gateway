@@ -182,6 +182,17 @@ _pdg_core(){ echo mihomo; }
 _pdg_bot_cred(){ echo unset; }
 pdg_fetch_release_tags(){ return 0; }
 _update_in_sync(){ return 1; }
+# ── 服务前像保存: **可控替身**, 不是恒真 ────────────────────────────────────
+# 本壳的被测对象是更新编排/方向/预检/故障传播, 不是前像本身 —— 真实前像(systemctl show
+# 那一套)属于真实 systemd 验收, 这里不冒充。
+# 但**不能**拿 `return 0` 把这道门抹掉: cmd_update 的契约是"前像保存失败就中止更新",
+# 那条判据必须还能被测到。所以替身做成: 默认成功, 写一份自有留痕文件(证明确实被调到、
+# 参数是哪个快照目录); SVCSTATE_RC 非 0 时按该码失败。
+_pdg_save_svcstate(){
+  printf "SVCSTATE_SAVE %s rc=%s\\n" "${1:-<无参>}" "${SVCSTATE_RC:-0}" >> "$WORK/side.log"
+  [[ -n "${1:-}" && -d "${1:-}" ]] && printf "modeled-svcstate\\n" > "$1/svcstate.tsv"
+  return "${SVCSTATE_RC:-0}"
+}
 git(){ printf '%s
 ' "$*" >> "$WORK/git.log"; command git "$@"; }
 install(){ printf 'install %s
@@ -289,6 +300,18 @@ side ROLLBACK && ok "触发了既有回滚(安全门没被放松)" || bad "没�
 grep -q '✅ 已更新' <<<"$out" && bad "谎报成功" || ok "没谎报成功"
 fi
 echo '[{"level":"ok","check":"服务","detail":"都在"}]' > "$WORK/doctor.json"
+
+echo
+echo "══ N. 接线自检: 前像保存这道门没有被替身抹掉 ══"
+# 同 test-update-release-relation.sh 的 N 节: 本轮补的 _pdg_save_svcstate 是**可控**替身,
+# 这里把它喂失败, 确认 cmd_update 仍会中止 —— 替身不是恒真。
+mkrepo "$WORK/repo" real >/dev/null 2>&1
+: > "$WORK/side.log"; : > "$WORK/git.log"
+_nrc=0
+_nout=$(SVCSTATE_RC=1 bash -c "source '$WORK/harness.sh'; source '$WORK/pre.sh'; source '$WORK/upd.sh'; cmd_update" 2>&1) || _nrc=$?
+{ [[ "$_nrc" != 0 ]] && grep -q '服务前像保存失败' <<<"$_nout"; } \
+  && ok "N1: 前像保存失败 ⇒ 中止更新(rc=$_nrc)并点名原因" || bad "N1: 前像失败没挡住(rc=$_nrc): $(tail -2 <<<"$_nout")"
+grep -qE '(^| )reset ' "$WORK/git.log" && bad "N2: 前像保存失败却仍然 reset 了" || ok "N2: 且**没有** reset"
 
 echo "────────────────────────────────────────"
 echo "test-update-mosdns-preflight.sh: 通过 $pass, 失败 $nfail"
