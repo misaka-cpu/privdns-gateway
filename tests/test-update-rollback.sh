@@ -94,15 +94,25 @@ SNAP="$WORK/snaps"; mkdir -p "$SNAP"
 # 预期清单: 在**前像准备阶段**记下本支声明要恢复的东西(相对路径 / 内容摘要 / mode / uid)。
 # 恢复之后直接拿它与隔离目标里的实际文件比 —— 不从恢复后的目标反推期望, 也不是"打印一下
 # 实测值就算核验过"。模式一律**显式 chmod 声明**, 免得期望其实来自当时的 umask。
-mkexpect(){   # $1=快照目录  ($1/tree 必须还在)
-  local d="$1" rel
-  : > "$d/expect.tsv"
-  while IFS= read -r -d '' rel; do
-    rel="${rel#./}"
-    printf '%s\t%s\t%s\t%s\n' "$rel" \
-      "$(sha256sum "$d/tree/$rel" | cut -d' ' -f1)" \
-      "$(stat -c %a "$d/tree/$rel")" "$(stat -c %u "$d/tree/$rel")" >> "$d/expect.tsv"
-  done < <(cd "$d/tree" && find . -mindepth 1 -type f -print0)
+mkexpect(){   # $1=快照目录  $2..=本支**显式**列出的相对路径($1/tree 必须还在)
+  # 不做通用枚举: 路径由调用处逐个写死。以前这里是 `find`, 而进程替换里的失败不会成为
+  # while 的失败 —— 已复现: find 吐出一条真实路径后返回 7, mkexpect 仍返回 0, 清单只剩一条,
+  # 于是"完整清单"变成了"碰巧枚举到的那几条"。
+  local d="$1"; shift
+  local rel sha mode uid
+  (( $# > 0 )) || { echo "mkexpect: 没给预期路径" >&2; return 1; }
+  : > "$d/expect.tsv" || return 1
+  for rel in "$@"; do
+    [[ -f "$d/tree/$rel" ]] || { echo "mkexpect: 源树里没有这个预期路径: $rel" >&2; return 1; }
+    # 每一步读取都查退出码, 失败就**向上传播**, 不留下残缺清单给调用方消费
+    sha="$(sha256sum "$d/tree/$rel" | cut -d' ' -f1)" || { echo "mkexpect: 读摘要失败 $rel" >&2; return 1; }
+    mode="$(stat -c %a "$d/tree/$rel")" || { echo "mkexpect: 读 mode 失败 $rel" >&2; return 1; }
+    uid="$(stat -c %u "$d/tree/$rel")"  || { echo "mkexpect: 读 uid 失败 $rel" >&2; return 1; }
+    [[ -n "$sha" && -n "$mode" && -n "$uid" ]] || { echo "mkexpect: 读到空值 $rel" >&2; return 1; }
+    printf '%s\t%s\t%s\t%s\n' "$rel" "$sha" "$mode" "$uid" >> "$d/expect.tsv" || return 1
+  done
+  # 条数必须与要求的条数相等 —— 残缺就不是清单
+  [[ "$(grep -c . "$d/expect.tsv")" == "$#" ]] || { echo "mkexpect: 清单条数不符" >&2; return 1; }
 }
 mksnap(){ # $1=目录名 $2=标记
   local d="$SNAP/$1"; mkdir -p "$d/tree/etc/privdns-gateway"
@@ -110,10 +120,12 @@ mksnap(){ # $1=目录名 $2=标记
   printf '%s\n' "$2" > "$d/tree/etc/privdns-gateway/snapid"
   chmod 644 "$d/tree/etc/privdns-gateway/backend"
   chmod 640 "$d/tree/etc/privdns-gateway/snapid"     # 与 backend 取不同的 mode: 属性判据才有区分力
-  mkexpect "$d"
-  tar czf "$d/snap.tar.gz" -C "$d/tree" etc 2>/dev/null; rm -rf "$d/tree"
+  mkexpect "$d" etc/privdns-gateway/backend etc/privdns-gateway/snapid || return 1
+  tar czf "$d/snap.tar.gz" -C "$d/tree" etc 2>/dev/null || return 1; rm -rf "$d/tree"
 }
-mksnap A OLD; sleep 1; mksnap B NEW    # B 更新(mtime 更晚 → ls -t 里 index 0)
+mksnap A OLD || { echo "[FAIL] 造快照 A 失败"; exit 1; }
+sleep 1
+mksnap B NEW || { echo "[FAIL] 造快照 B 失败"; exit 1; }    # B 更新(mtime 更晚 → ls -t 里 index 0)
 
 # ── 沙箱 REPO_DIR: 两提交的 git 仓库 ─────────────────────────────────────────
 REPO="$WORK/repo"; mkdir -p "$REPO"
@@ -241,34 +253,31 @@ export WORK
 # 按预期清单核对隔离目标里的实际文件。四维分别判, 每一维都参与判定(不是只打印)。
 # 返回: 0=全部相符; 非 0=有不符, 具体差异写进 $EXPECT_WHY。
 EXPECT_WHY=""
-expect_check_filtered(){   # $1=快照目录 $2=只核这些相对路径的 ERE
-  local d="$1" pat="$2" tmp; tmp="$(mktemp)"
-  grep -E "^($pat)"$'\t' "$d/expect.tsv" > "$tmp" 2>/dev/null
+expect_check_paths(){   # $1=快照目录  $2..=本场景**要求全部在场**的相对路径
+  # 以前是按正则过滤 + "至少匹配一条就算数" —— 清单残缺时, 没在清单里的必需路径根本不会
+  # 被检查(已复现: config.yaml 与 mihomo 不存在也照样通过)。现在逐个点名要, 缺一条即判红。
+  local d="$1"; shift
+  local rel line n=0
   EXPECT_WHY=""
-  if [[ ! -s "$tmp" ]]; then EXPECT_WHY="预期清单里没有匹配 $pat 的条目"; rm -f "$tmp"; return 1; fi
-  _expect_cmp "$tmp"; local rc=$?; rm -f "$tmp"; return $rc
-}
-expect_check(){   # $1=快照目录: 核清单里全部条目
-  local d="$1"
-  EXPECT_WHY=""
-  [[ -s "$d/expect.tsv" ]] || { EXPECT_WHY="没有预期清单(前像准备阶段没记)"; return 1; }
-  _expect_cmp "$d/expect.tsv"
-}
-_expect_cmp(){    # $1=清单文件
-  local f="$1" rel want_sha want_mode want_uid got_sha got_mode got_uid n=0
-  while IFS=$'\t' read -r rel want_sha want_mode want_uid; do
-    [[ -n "$rel" ]] || continue
-    n=$((n+1))
-    if [[ ! -f "/$rel" ]]; then EXPECT_WHY="$EXPECT_WHY /$rel:不存在;"; continue; fi
-    got_sha="$(sha256sum "/$rel" | cut -d' ' -f1)"
-    got_mode="$(stat -c %a "/$rel")"
-    got_uid="$(stat -c %u "/$rel")"
-    [[ "$got_sha"  == "$want_sha"  ]] || EXPECT_WHY="$EXPECT_WHY /$rel:内容不符;"
-    [[ "$got_mode" == "$want_mode" ]] || EXPECT_WHY="$EXPECT_WHY /$rel:mode ${got_mode}≠${want_mode};"
-    [[ "$got_uid"  == "$want_uid"  ]] || EXPECT_WHY="$EXPECT_WHY /$rel:uid ${got_uid}≠${want_uid};"
-  done < "$f"
-  (( n > 0 )) || { EXPECT_WHY="预期清单是空的"; return 1; }
+  [[ -s "$d/expect.tsv" ]] || { EXPECT_WHY="没有预期清单(前像准备阶段没记或失败了)"; return 1; }
+  for rel in "$@"; do
+    line="$(awk -F'\t' -v r="$rel" '$1==r{print; exit}' "$d/expect.tsv")"
+    if [[ -z "$line" ]]; then EXPECT_WHY="$EXPECT_WHY 清单缺必需路径 $rel;"; continue; fi
+    n=$((n+1)); _expect_cmp_line "$line"
+  done
+  (( n == $# )) || return 1
   [[ -z "$EXPECT_WHY" ]]
+}
+_expect_cmp_line(){   # $1=清单里的一行: 四维逐个比, 每一维都参与判定
+  local rel want_sha want_mode want_uid got_sha got_mode got_uid
+  IFS=$'\t' read -r rel want_sha want_mode want_uid <<<"$1"
+  if [[ ! -f "/$rel" ]]; then EXPECT_WHY="$EXPECT_WHY /$rel:不存在;"; return 0; fi
+  got_sha="$(sha256sum "/$rel" | cut -d' ' -f1)"
+  got_mode="$(stat -c %a "/$rel")"
+  got_uid="$(stat -c %u "/$rel")"
+  [[ "$got_sha"  == "$want_sha"  ]] || EXPECT_WHY="$EXPECT_WHY /$rel:内容不符;"
+  [[ "$got_mode" == "$want_mode" ]] || EXPECT_WHY="$EXPECT_WHY /$rel:mode ${got_mode}≠${want_mode};"
+  [[ "$got_uid"  == "$want_uid"  ]] || EXPECT_WHY="$EXPECT_WHY /$rel:uid ${got_uid}≠${want_uid};"
 }
 cat > "$WORK/model.sh" <<'MODELEOF'
 # ── 外部服务动作: **唯一**的模型点(systemctl 状态机) ────────────────────────
@@ -362,9 +371,22 @@ rc=0; out=$(run "--dir '$SNAP/A' --git '$GOOD_REF'") || rc=$?
 # 四维(存在性/内容/mode/uid)对着**前像准备阶段记下的预期**逐条比, 每一维都参与判定。
 # 注: backend 那一个由 cmd_rollback 在落盘之后按"当前唯一内核"改写成 mihomo, 属产品行为,
 # 不在快照恢复的预期之列 —— 所以预期清单只核 snapid 这类快照原样恢复的文件(见下一行过滤)。
-if expect_check_filtered "$SNAP/A" 'etc/privdns-gateway/snapid'; then
+if expect_check_paths "$SNAP/A" etc/privdns-gateway/snapid; then
   ok "B-file: 目标文件四维全符(存在/内容/mode $(stat -c %a /etc/privdns-gateway/snapid)/uid $(stat -c %u /etc/privdns-gateway/snapid))"
 else bad "B-file: $EXPECT_WHY"; fi
+# 两类契约要分开: snapid 这类**按快照原样恢复**; backend 则由产品在落盘之后按"当前唯一内核"
+# 收敛成 mihomo(快照里存的是 singbox)。上一轮改四维比对时只核了 snapid, 这条覆盖掉了, 补回。
+[[ "$(cat /etc/privdns-gateway/backend 2>/dev/null)" == mihomo ]] \
+  && ok "B-backend: backend 按产品规则收敛为 mihomo(快照里是 singbox, 不是原样恢复)" \
+  || bad "B-backend: backend=$(cat /etc/privdns-gateway/backend 2>/dev/null) 期望 mihomo"
+# 反例: 其它文件正确、**只有 backend 错**, 这条断言必须判红(而四维比对照样通过)
+printf 'singbox\n' > /etc/privdns-gateway/backend
+if expect_check_paths "$SNAP/A" etc/privdns-gateway/snapid; then
+  [[ "$(cat /etc/privdns-gateway/backend)" == mihomo ]] \
+    && bad "B-backend-neg: 只改坏 backend 却仍判通过" \
+    || ok "B-backend-neg: 只有 backend 错(其它文件四维仍全符)⇒ 这条断言**判红** —— 它确实在起作用"
+else bad "B-backend-neg: 其它文件本不该受影响: $EXPECT_WHY"; fi
+printf 'mihomo\n' > /etc/privdns-gateway/backend
 [[ "$rc" != 0 ]] && ok "B-rc: 缺前像 ⇒ 返回非零($rc), 不当成完整成功" || bad "B-rc: 缺前像却返回 0"
 grep -q '运行态/自启未确认' <<<"$out" \
   && ok "B-unrestored: 未恢复项里明确列出'运行态/自启未确认'" || bad "B-unrestored: 未列出, out=$out"
@@ -439,7 +461,7 @@ bash -c "source '$WORK/harness.sh'; source '$WORK/model.sh'; svc_init disabled i
 e2e_git "$REPO" reset --hard -q "$HEAD_REF"
 rm -f "$WORK/applied_snapid"; rc=0; out=$(run "--dir '$SNAP/H' --git '$GOOD_REF'") || rc=$?
 [[ "$rc" == 0 ]] && ok "A-rc: 有效前像的健康快照 ⇒ rc=0" || bad "A-rc: rc=$rc out=$out"
-if expect_check_filtered "$SNAP/H" 'etc/privdns-gateway/snapid'; then
+if expect_check_paths "$SNAP/H" etc/privdns-gateway/snapid; then
   ok "A-file: 目标文件四维全符(存在/内容/mode $(stat -c %a /etc/privdns-gateway/snapid)/uid $(stat -c %u /etc/privdns-gateway/snapid))"
 else bad "A-file: $EXPECT_WHY"; fi
 [[ "$(git -C "$REPO" rev-parse HEAD)" == "$GOOD_REF" ]] \
@@ -480,7 +502,8 @@ mkmihomo_snap(){  # $1=目录名 $2=快照内核的 check 退出码
   printf '#!/bin/sh\nexit %s\n' "$2" > "$d/tree/usr/local/bin/mihomo"; chmod 755 "$d/tree/usr/local/bin/mihomo"
   chmod 644 "$d/tree/etc/privdns-gateway/backend"; chmod 640 "$d/tree/etc/privdns-gateway/snapid"
   chmod 600 "$d/tree/etc/mihomo/config.yaml"
-  mkexpect "$d"
+  mkexpect "$d" etc/privdns-gateway/backend etc/privdns-gateway/snapid \
+                etc/mihomo/config.yaml usr/local/bin/mihomo || return 1
   # 按 cmd_snapshot 的方式打**显式成员路径**: 递归打 usr 会带出 usr/ 目录项, 触发越界守卫
   tar czf "$d/snap.tar.gz" -C "$d/tree" etc/privdns-gateway etc/mihomo usr/local/bin/mihomo 2>/dev/null
   rm -rf "$d/tree"
@@ -499,7 +522,7 @@ mkmihomo_snap M_OK 0            # 快照自带的 mihomo 接受旧配置
 mkpre "$SNAP/M_OK"
 bash -c "source '$WORK/harness.sh'; source '$WORK/model.sh'; svc_init enabled active" >/dev/null 2>&1
 rm -f "$WORK/applied_snapid"; rc=0; out=$(runm "--dir '$SNAP/M_OK'") || rc=$?
-if [[ "$rc" == 0 ]] && expect_check_filtered "$SNAP/M_OK" 'etc/privdns-gateway/snapid|etc/mihomo/config.yaml|usr/local/bin/mihomo'; then
+if [[ "$rc" == 0 ]] && expect_check_paths "$SNAP/M_OK" etc/privdns-gateway/snapid etc/mihomo/config.yaml usr/local/bin/mihomo; then
   ok "C4a: 快照内核接受旧配置 → 回滚成功落盘, 且三个文件四维全符(含 mihomo mode $(stat -c %a /usr/local/bin/mihomo))"
 else bad "C4a: rc=$rc $EXPECT_WHY out=$(tail -2 <<<"$out")"; fi
 
@@ -570,6 +593,48 @@ brc=0; bout=$(runbroken "--dir '$SNAP/H' --git '$GOOD_REF'") || brc=$?
 rm -rf /etc/privdns-gateway/snapid
 
 echo
+echo "══ J. 预期清单必须完整且可信 ══"
+# 本节只考**清单这一层**(生成是否完整、比较是否要求全部在场)。J 的夹具文件从没被恢复到
+# 隔离目标里, 所以下面的 EXPECT_WHY 里会附带"/…:不存在"这类条目 —— 那是预料之中的,
+# 本节的判据是"缺必需路径"那一条, 不是目标里有没有文件。
+# J1: **输出部分条目后失败** —— 读到一半失败必须向上传播, 不能留下残缺清单给调用方消费。
+JD="$SNAP/J"; rm -rf "$JD"; mkdir -p "$JD/tree/etc/privdns-gateway" "$JD/tree/etc/mihomo"
+printf 'mihomo\n' > "$JD/tree/etc/privdns-gateway/backend"
+printf 'J\n'      > "$JD/tree/etc/privdns-gateway/snapid"
+printf 'x: 1\n'   > "$JD/tree/etc/mihomo/config.yaml"
+JBIN="$WORK/jbin"; mkdir -p "$JBIN"
+# 受控 stat: 头两次照常转发, 第三次(也就是第二个路径)起失败 —— 于是清单已经写了一条
+printf '#!/usr/bin/env bash\nn=$(( $(cat "$J_N" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$J_N"\n(( n <= 2 )) && exec /usr/bin/stat "$@"\nexit 1\n' > "$JBIN/stat"
+chmod +x "$JBIN/stat"; export J_N="$WORK/j-n"; : > "$J_N"
+jrc=0; PATH="$JBIN:$PATH" mkexpect "$JD" etc/privdns-gateway/backend etc/privdns-gateway/snapid etc/mihomo/config.yaml 2>/dev/null || jrc=$?
+[[ "$jrc" != 0 ]] && ok "J1: 准备阶段读到一半失败 ⇒ mkexpect **返回非零**($jrc), 失败向上传播" \
+                  || bad "J1: 读失败却返回 0"
+_jn=$(grep -c . "$JD/expect.tsv" 2>/dev/null || echo 0)
+(( _jn < 3 )) && ok "J1b: 此刻盘上确实是**残缺清单**($_jn/3 条) —— 正是不能被消费的那种" \
+              || bad "J1b: 清单竟然是全的($_jn 条), 这一格没造出来"
+if expect_check_paths "$JD" etc/privdns-gateway/backend etc/privdns-gateway/snapid etc/mihomo/config.yaml; then
+  bad "J1c: 残缺清单被当成完整清单用了"
+else ok "J1c: 比较阶段拒绝残缺清单并点名: $EXPECT_WHY"; fi
+unset J_N
+# J2: **清单缺一个必需路径** —— 先造一份完整的, 再删掉其中一条
+rm -rf "$JD"; mkdir -p "$JD/tree/etc/privdns-gateway" "$JD/tree/etc/mihomo"
+printf 'mihomo\n' > "$JD/tree/etc/privdns-gateway/backend"
+printf 'J\n'      > "$JD/tree/etc/privdns-gateway/snapid"
+printf 'x: 1\n'   > "$JD/tree/etc/mihomo/config.yaml"
+mkexpect "$JD" etc/privdns-gateway/backend etc/privdns-gateway/snapid etc/mihomo/config.yaml \
+  && ok "J2: 完整清单造得出来(3 条)" || bad "J2: 健康对照就失败了"
+grep -v '^etc/mihomo/config.yaml' "$JD/expect.tsv" > "$JD/expect.cut" && mv "$JD/expect.cut" "$JD/expect.tsv"
+if expect_check_paths "$JD" etc/privdns-gateway/backend etc/privdns-gateway/snapid etc/mihomo/config.yaml; then
+  bad "J2b: 清单缺一条必需路径却判通过"
+else
+  grep -q '清单缺必需路径 etc/mihomo/config.yaml' <<<"$EXPECT_WHY" \
+    && ok "J2b: 缺必需路径 ⇒ **判红并点名是哪一条**: $EXPECT_WHY" \
+    || bad "J2b: 判红了但没点名: $EXPECT_WHY"
+fi
+ok "J3: 两格的失败都来自**本项判据**(mkexpect 退出码 / 清单缺必需路径), 全程没调用 cmd_rollback, 因此不可能借后续服务失败代偿"
+rm -rf "$JD"
+
+echo
 echo "══ H. 枚举失败不能被目标里的旧文件掩盖 ══"
 # 直接反例: 目标里**预先**就有一份同名旧文件(内容与快照一致, 但 mode 不同), 这一次的枚举
 # 受控失败。只看内容的话完全看不出区别 —— 本节要求失败照样传出去。
@@ -621,21 +686,29 @@ echo "══ I. 属性必须参与判定 ══"
 bash -c "source '$WORK/harness.sh'; source '$WORK/model.sh'; svc_init enabled active" >/dev/null 2>&1
 e2e_git "$REPO" reset --hard -q "$HEAD_REF"; rm -f "$WORK/applied_snapid"
 out=$(run "--dir '$SNAP/H' --git '$GOOD_REF'") || true
-if expect_check_filtered "$SNAP/H" 'etc/privdns-gateway/snapid'; then
+if expect_check_paths "$SNAP/H" etc/privdns-gateway/snapid; then
   ok "I1: 健康对照 —— 四维全符"
 else bad "I1: 健康对照就不符: $EXPECT_WHY"; fi
 chmod 600 /etc/privdns-gateway/snapid      # **只改 mode**, 内容一字未动(改的是隔离根里的文件)
-if expect_check_filtered "$SNAP/H" 'etc/privdns-gateway/snapid'; then
+if expect_check_paths "$SNAP/H" etc/privdns-gateway/snapid; then
   bad "I2: 仅 mode 错却判通过 —— 属性没参与判定"
 else ok "I2: 仅 mode 错(内容仍正确)⇒ **判红**并点名: $EXPECT_WHY"; fi
+# 进 I3 之前**先把 I2 改坏的 mode 恢复并确认** —— 否则一旦 uid 也错, 两项同时错会被说成
+# "仅 uid 错", 那条结论就不成立了。
+chmod 640 /etc/privdns-gateway/snapid
+if expect_check_paths "$SNAP/H" etc/privdns-gateway/snapid; then
+  ok "I2b: I2 改坏的 mode 已恢复并确认四维全符 —— I3 的前提干净"
+else bad "I2b: 恢复后仍不符($EXPECT_WHY), I3 不成立"; fi
 # uid 维: 能不能在本机构造反例, 如实记
 if chown 1:1 /etc/privdns-gateway/snapid 2>/dev/null; then
-  if expect_check_filtered "$SNAP/H" 'etc/privdns-gateway/snapid'; then
+  if expect_check_paths "$SNAP/H" etc/privdns-gateway/snapid; then
     bad "I3: 仅 uid 错却判通过"
   else ok "I3: 仅 uid 错 ⇒ 判红并点名: $EXPECT_WHY"; fi
   chown 0:0 /etc/privdns-gateway/snapid 2>/dev/null
+  expect_check_paths "$SNAP/H" etc/privdns-gateway/snapid \
+    && ok "I3b: uid 已复原并确认四维全符" || bad "I3b: uid 复原后仍不符($EXPECT_WHY)"
 else
-  note "I3: **未验证** —— 本命名空间只映射了一个 uid, chown 到别的 uid 不可行, 无法构造仅 uid 错的反例。uid 仍然参与判定(见 _expect_cmp), 但它的区分力本机没证到, 不计入已验证。"
+  note "I3: **未验证** —— 本命名空间只映射了一个 uid, chown 到别的 uid 不可行, 无法构造仅 uid 错的反例。uid 仍然参与判定(见 _expect_cmp_line), 但它的区分力本机没证到, 不计入已验证。"
 fi
 chmod 640 /etc/privdns-gateway/snapid
 
