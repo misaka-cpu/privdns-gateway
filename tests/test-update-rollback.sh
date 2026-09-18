@@ -138,14 +138,24 @@ grep -q '^_snap_meta_commit(){' "$WORK/rollback.sh" \
   || { echo "[FAIL] 抽不到 _snap_meta_commit —— 改名了? 后面的判据全部无效"; exit 1; }
 # 快照里不含 etc/sing-box/config.json 与 etc/nftables.conf → 内核/nft 校验分支被跳过,
 # 无需真 sing-box/mihomo/nft 二进制(也就不必打桩带连字符的函数名)。
-cat > "$WORK/harness.sh" <<EOF
+# harness 的生成分两段, 把"要展开的"和"要原样保留的"**显式分开** ——
+# 以前整段用未引用的 <<EOF: 正文里需要展开的只有 WORK/SNAP/REPO 三个路径, 代价却是**整段**
+# 都进了 shell 的展开: 注释里的 `cp -a` 被当成命令替换, 在**生成阶段**真的执行了一次
+# (生成段 rc 仍是 0, 只在 stderr 留下两行 "cp: missing file operand"), 而那段注释被替换成空。
+# 现在: 三个路径用 printf %q 显式写在前面(引号安全), 其余正文一律走带引号的 heredoc。
+# --- harness-gen: BEGIN(G 节按这两行标记抽出本段单独运行) ---
+{ printf 'WORK=%q\n'  "$WORK"
+  printf 'SNAP=%q\n'  "$SNAP"
+  printf 'REPO=%q\n'  "$REPO"
+} > "$WORK/harness.sh"
+cat >> "$WORK/harness.sh" <<'HARNESSEOF'
 SNAP_DIR="$SNAP"
 # _lan_nft_reapply 读这个全局(产品有意不写死路径)。指到本壳自有文件: 不存在即早退,
 # 于是不会去碰隔离根外的任何 nft 配置。
 LAN_NFT_CONF="$WORK/lan-nft.conf"
 REPO_DIR="$REPO"
 need_root(){ :; }; _lock(){ :; }
-c_g(){ echo "\$*"; }; c_y(){ echo "\$*"; }
+c_g(){ echo "$*"; }; c_y(){ echo "$*"; }
 _pdg_core(){ echo singbox; }
 _pdg_core_svc(){ echo sing-box; }
 _pdg_mktemp_dir(){ mktemp -d; }
@@ -157,26 +167,39 @@ pdg_unit_mihomo(){ echo "[Unit]"; }
 _pdg_drop_singbox_files(){ :; }
 _pdg_singbox_is_ours(){ return 1; }
 nft(){ return 0; }
-# 覆写落盘: 不碰真 /, 把被应用快照的判别标记抄到沙箱, 供断言"回滚到了哪份"
+# 快照落盘: 隔离已成立, 这里**真的把树落到隔离根的 /**。
 APPLIED="$WORK/applied_snapid"
-# 快照落盘: 隔离已成立, 这里**真的把树落到隔离根的 /**(不再只记个标记),
-# 同时把判别标记抄出来, 保留"落的是哪一份快照"的断言能力。
 _pdg_apply_snapshot_tree(){
-  local tree="\$1" dest="\${3:-/}"
-  # 用 tar 落盘, 并带 --no-overwrite-dir: 快照里可能有 usr/local/bin/... 这种路径,
-  # 而隔离根只绑了 /usr/local/bin、没绑 /usr —— `cp -a` 会去改 /usr、/usr/local 这些
-  # **已存在目录**的属主/时间戳而被拒(Operation not permitted), 于是明明文件落好了却返回 1。
-  # --no-overwrite-dir 只写文件、不动已存在目录的元数据, 正好避开这一点。
-  tar cf - -C "\$tree" . 2>/dev/null | tar xf - -C "\$dest" --no-overwrite-dir 2>/dev/null
-  [[ "\${PIPESTATUS[0]}" == 0 ]] || return 1
-  cat "\$tree/etc/privdns-gateway/snapid" > "\$APPLIED" 2>/dev/null; return 0; }
+  # 逐文件落盘: 目录用 mkdir -p 现建(不碰已存在目录的元数据), 文件用 `cp -PpT`。
+  #
+  # 为什么不是一句 tar: 隔离根只绑了 /usr/local/bin、没绑 /usr, 而快照里有 usr/local/bin/...。
+  # tar 会去给归档里的目录成员(含 `.` 也就是 / 本身)设模式, 在命名空间里被拒:
+  #   tar: .: Cannot change mode to rwx------: Operation not permitted   → rc=2
+  # 加 --no-overwrite-dir 也没挡住(本机实测)。逐文件复制就没有这一类"改目录元数据"的动作。
+  #
+  # `-T` 不能省: 少了它, 当目标同路径**已经是一个目录**时, `cp` 会把文件拷进那个目录里
+  # (变成 .../snapid/snapid)并返回 0 —— 落盘其实没发生, 却报成功。-T 让这种情形直接失败。
+  #
+  # 任何一步失败都**立刻返回非零**, 并且**不生成任何代表"恢复成功"的标记** ——
+  # 失败要传回真正的调用方 cmd_rollback, 不是在辅助函数里记一笔就算了。
+  local tree="$1" dest="${3:-/}" rel
+  while IFS= read -r -d '' rel; do
+    rel="${rel#./}"
+    mkdir -p "$dest/${rel%/*}" 2>/dev/null || return 1
+    cp -PpT "$tree/$rel" "$dest/$rel" 2>/dev/null || return 1
+  done < <(cd "$tree" && find . -mindepth 1 \( -type f -o -type l \) -print0)
+  # 判别标记从**目标**读回, 不是从源树抄 —— 源树里那份一直都在, 抄它证明不了落盘发生过。
+  # 它只用来辅助辨认"落的是哪一份快照"; 文件是否真的恢复由断言直接查隔离目标里的实际文件。
+  cat "$dest/etc/privdns-gateway/snapid" > "$APPLIED" 2>/dev/null || return 1
+  return 0; }
 # 覆盖生产文件之前的 iOS 联合校验(见 pdg.sh _pdg_ios_verify_tree)。这些快照里根本没有
 # iOS 生命周期成员, 生产里它会直接 return 0 —— 这里打桩只是因为本壳没抽那一批函数。
 _pdg_ios_verify_tree(){ return 0; }
 # 内网面板的回滚收敛(见 pdg.sh _lan_rollback_converge)。同样是"本壳没抽那一批函数"才打的桩 ——
 # 收敛本身由 tests/test-lan-rollback-convergence.sh 跑真函数覆盖, 这里只要它不影响本壳的判据。
 _lan_rollback_converge(){ return 0; }
-EOF
+HARNESSEOF
+# --- harness-gen: END ---
 
 
 # ── 外部服务动作的模型, 单独一份文件(**带引号 heredoc**, 内容原样保留) ──────
@@ -269,8 +292,12 @@ rc=0; out=$(run "--dir '$SNAP/A' --git '$GOOD_REF'") || rc=$?
 [[ "$(git -C "$REPO" rev-parse HEAD)" == "$GOOD_REF" ]] \
   && ok "B-git: --git 指定的提交**确实复位了**(HEAD=${GOOD_REF:0:12})" \
   || bad "B-git: HEAD=$(git -C "$REPO" rev-parse HEAD) 期望 ${GOOD_REF:0:12}"
-[[ "$(cat "$WORK/applied_snapid" 2>/dev/null)" == OLD ]] \
-  && ok "B-file: 文件按契约恢复(落盘的是 A 那份)" || bad "B-file: applied=$(cat "$WORK/applied_snapid" 2>/dev/null)"
+# 文件判据直接查**隔离目标里的实际文件**: 存在性 + 内容 + 属性。
+# applied_snapid 只作辅助辨认(它本身也是从目标读回的), 不能替代落盘证据。
+{ [[ -f /etc/privdns-gateway/snapid ]] && [[ "$(cat /etc/privdns-gateway/snapid)" == OLD ]] \
+  && [[ "$(cat /etc/privdns-gateway/backend 2>/dev/null)" == mihomo ]]; } \
+  && ok "B-file: 隔离目标里确有恢复出来的普通文件(snapid=OLD, 权限 $(stat -c %a /etc/privdns-gateway/snapid))" \
+  || bad "B-file: 目标文件不对(存在=$( [[ -f /etc/privdns-gateway/snapid ]] && echo 是 || echo 否) 内容=$(cat /etc/privdns-gateway/snapid 2>/dev/null))"
 [[ "$rc" != 0 ]] && ok "B-rc: 缺前像 ⇒ 返回非零($rc), 不当成完整成功" || bad "B-rc: 缺前像却返回 0"
 grep -q '运行态/自启未确认' <<<"$out" \
   && ok "B-unrestored: 未恢复项里明确列出'运行态/自启未确认'" || bad "B-unrestored: 未列出, out=$out"
@@ -345,8 +372,9 @@ bash -c "source '$WORK/harness.sh'; source '$WORK/model.sh'; svc_init disabled i
 e2e_git "$REPO" reset --hard -q "$HEAD_REF"
 rm -f "$WORK/applied_snapid"; rc=0; out=$(run "--dir '$SNAP/H' --git '$GOOD_REF'") || rc=$?
 [[ "$rc" == 0 ]] && ok "A-rc: 有效前像的健康快照 ⇒ rc=0" || bad "A-rc: rc=$rc out=$out"
-[[ "$(cat "$WORK/applied_snapid" 2>/dev/null)" == HEALTHY ]] \
-  && ok "A-file: 文件落盘的是 H 那份(隔离根里真的写了)" || bad "A-file: applied=$(cat "$WORK/applied_snapid" 2>/dev/null)"
+{ [[ -f /etc/privdns-gateway/snapid ]] && [[ "$(cat /etc/privdns-gateway/snapid)" == HEALTHY ]]; } \
+  && ok "A-file: 隔离目标里确有恢复出来的普通文件(snapid=HEALTHY, 权限 $(stat -c %a /etc/privdns-gateway/snapid))" \
+  || bad "A-file: 目标文件不对(存在=$( [[ -f /etc/privdns-gateway/snapid ]] && echo 是 || echo 否) 内容=$(cat /etc/privdns-gateway/snapid 2>/dev/null))"
 [[ "$(git -C "$REPO" rev-parse HEAD)" == "$GOOD_REF" ]] \
   && ok "A-git: 仓库复位到指定提交" || bad "A-git: HEAD=$(git -C "$REPO" rev-parse HEAD)"
 _bad_svc=""
@@ -401,8 +429,10 @@ mkmihomo_snap M_OK 0            # 快照自带的 mihomo 接受旧配置
 mkpre "$SNAP/M_OK"
 bash -c "source '$WORK/harness.sh'; source '$WORK/model.sh'; svc_init enabled active" >/dev/null 2>&1
 rm -f "$WORK/applied_snapid"; rc=0; out=$(runm "--dir '$SNAP/M_OK'") || rc=$?
-{ [[ "$rc" == 0 ]] && [[ "$(cat "$WORK/applied_snapid" 2>/dev/null)" == SNAP-M ]]; } \
-  && ok "快照内核接受旧配置 → 回滚成功落盘(不被当前新内核挡住)" || bad "C4a: rc=$rc out=$out"
+{ [[ "$rc" == 0 ]] && [[ -f /etc/privdns-gateway/snapid ]] && [[ "$(cat /etc/privdns-gateway/snapid)" == SNAP-M ]] \
+  && [[ -x /usr/local/bin/mihomo ]]; } \
+  && ok "快照内核接受旧配置 → 回滚成功落盘(目标里 snapid=SNAP-M 且快照自带的 mihomo 可执行)" \
+  || bad "C4a: rc=$rc 目标 snapid=$(cat /etc/privdns-gateway/snapid 2>/dev/null) out=$out"
 
 mkmihomo_snap M_BAD 1           # 快照自带的 mihomo 也拒绝 → 这份快照真的不可用
 rm -f "$WORK/applied_snapid"; rc=0; out=$(runm "--dir '$SNAP/M_BAD'") || rc=$?
@@ -435,6 +465,69 @@ for _bad in 'var/lib/privdns-gateway/tx/abc/before' 'var/lib/privdns-gateway/bac
   _chk "$_bad" || bad "D5: 守卫放行了不该进快照的 $_bad"
 done
 ok "守卫仍然拦住 tx 记录/备份包/其它 var 路径(没有放宽成整个 var/lib)"
+
+echo
+echo "══ F. 落盘失败必须传到调用方; 文件证据必须来自目标 ══"
+# 直接反例(真实文件系统, 不是模拟): 目标同路径是一个**带哨兵的非空目录**, 源里是普通文件。
+rm -f /etc/privdns-gateway/snapid
+mkdir -p /etc/privdns-gateway/snapid && printf 'SENTINEL\n' > /etc/privdns-gateway/snapid/keep
+rm -f "$WORK/applied_snapid"
+e2e_git "$REPO" reset --hard -q "$HEAD_REF"
+rc=0; out=$(run "--dir '$SNAP/H' --git '$GOOD_REF'") || rc=$?
+[[ "$rc" != 0 ]] && ok "F1: 落盘失败 ⇒ **调用方** cmd_rollback 返回非零($rc), 不是只在辅助函数里记一笔" \
+                 || bad "F1: 落盘失败却返回 0"
+grep -q '快照落盘失败' <<<"$out" && ok "F2: 并点名是落盘这一步失败" || bad "F2: 没点名, out=$(tail -2 <<<"$out")"
+[[ ! -s "$WORK/applied_snapid" ]] \
+  && ok "F3: **没有生成**代表恢复成功的标记(applied 为空)" || bad "F3: 仍写了标记: $(cat "$WORK/applied_snapid")"
+[[ -d /etc/privdns-gateway/snapid && "$(cat /etc/privdns-gateway/snapid/keep 2>/dev/null)" == SENTINEL ]] \
+  && ok "F4: 目标那一路径仍是原来的非空目录, 哨兵还在(确实没落盘)" || bad "F4: 目标被改了"
+[[ ! -f /etc/privdns-gateway/snapid ]] \
+  && ok "F5: 目标处**没有**出现那个普通文件 —— 与'函数返回成功'区分开" || bad "F5: 竟然出现了普通文件"
+# 撤销对照: 把替身改回"只看生产端 + 从源树抄标记", 同一反例必须重新暴露
+cat > "$WORK/apply-broken.sh" <<'BROKENEOF'
+_pdg_apply_snapshot_tree(){
+  local tree="$1" dest="${3:-/}"
+  tar cf - -C "$tree" . 2>/dev/null | tar xf - -C "$dest" --no-overwrite-dir 2>/dev/null
+  [[ "${PIPESTATUS[0]}" == 0 ]] || return 1
+  cat "$tree/etc/privdns-gateway/snapid" > "$APPLIED" 2>/dev/null; return 0; }
+BROKENEOF
+runbroken(){ bash -c "source '$WORK/harness.sh'; source '$WORK/model.sh'; source '$WORK/apply-broken.sh'; source '$WORK/rollback.sh'; cmd_rollback $1" 2>&1; }
+rm -f "$WORK/applied_snapid"; e2e_git "$REPO" reset --hard -q "$HEAD_REF"
+brc=0; bout=$(runbroken "--dir '$SNAP/H' --git '$GOOD_REF'") || brc=$?
+{ [[ "$(cat "$WORK/applied_snapid" 2>/dev/null)" == HEALTHY ]] && [[ ! -f /etc/privdns-gateway/snapid ]] \
+  && ! grep -q '快照落盘失败' <<<"$bout"; } \
+  && ok "F6: 撤销修复后**同一反例重新暴露**(标记写成 HEALTHY, 目标文件却不存在, 也没报落盘失败)" \
+  || bad "F6: 撤销对照没重现(applied=$(cat "$WORK/applied_snapid" 2>/dev/null) rc=$brc)"
+rm -rf /etc/privdns-gateway/snapid
+
+echo
+echo "══ G. 生成阶段: 注释不能变成命令 ══"
+# 单独把生成段抽出来跑一遍, 生成阶段与被测执行阶段的 stdout/stderr/rc **分别**记。
+GENDIR="$WORK/gencheck"; mkdir -p "$GENDIR"
+{ printf 'WORK=%q\nSNAP=%q\nREPO=%q\n' "$GENDIR" "$GENDIR/snaps" "$GENDIR/repo"
+  # 取**第一个**范围就停(`/END/q`): 本行自己也含这两个标记字样, 不停的话 sed 会在这里
+  # 重新开一个范围并一路抄到文件尾。
+  sed -n '/# --- harness-gen: BEGIN/,/# --- harness-gen: END/{p; /# --- harness-gen: END/q}' \
+      "${BASH_SOURCE[0]}"; } > "$GENDIR/gen.sh"
+grc=0; bash "$GENDIR/gen.sh" > "$GENDIR/gen.out" 2> "$GENDIR/gen.err" || grc=$?
+echo "    生成阶段: rc=$grc  stdout=$(wc -l < "$GENDIR/gen.out") 行  stderr=$(wc -l < "$GENDIR/gen.err") 行"
+[[ "$grc" == 0 ]] && ok "G1: 生成阶段退出码 0" || bad "G1: 生成阶段 rc=$grc"
+[[ ! -s "$GENDIR/gen.err" ]] \
+  && ok "G2: 生成阶段 stderr **为空** —— 没有任何命令被顺带执行" \
+  || { bad "G2: 生成阶段 stderr 非空(注释里的东西被执行了?)"; sed 's/^/        /' "$GENDIR/gen.err"; }
+bash -n "$GENDIR/harness.sh" 2>/dev/null && ok "G3: 生成出来的 harness 语法有效" || bad "G3: 生成物语法不过"
+{ grep -qx "WORK=$GENDIR" "$GENDIR/harness.sh" && grep -q "^SNAP=" "$GENDIR/harness.sh" && grep -q "^REPO=" "$GENDIR/harness.sh"; } \
+  && ok "G4: 需要展开的三个路径**正确传入**(WORK/SNAP/REPO 各一行)" || bad "G4: 路径没正确传入"
+grep -qF '`cp -PpT`' "$GENDIR/harness.sh" \
+  && ok "G5: 注释里的反引号片段**原样保留**(以前这种片段会在生成阶段被当成命令执行掉)" \
+  || bad "G5: 注释片段丢失或被改写"
+# 更一般的判据: 生成段里有多少个反引号, 生成物里就该有多少个。命令替换发生过的话, 成对的
+# 反引号连同中间的内容会一起消失, 这个计数立刻对不上 —— 不用逐条盯某一句注释。
+_gen_bt="$(grep -o '`' "$GENDIR/gen.sh" | wc -l)"
+_out_bt="$(grep -o '`' "$GENDIR/harness.sh" | wc -l)"
+[[ "$_gen_bt" == "$_out_bt" && "$_gen_bt" -gt 0 ]] \
+  && ok "G6: 反引号逐个守恒(生成段 $_gen_bt 个 → 生成物 $_out_bt 个), 没有一对被当成命令替换吃掉" \
+  || bad "G6: 反引号数量对不上(生成段 $_gen_bt, 生成物 $_out_bt)"
 
 echo "────────────────────────────────────────"
 echo "通过 $pass, 失败 $nfail"

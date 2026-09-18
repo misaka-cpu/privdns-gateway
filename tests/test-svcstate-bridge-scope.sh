@@ -41,17 +41,51 @@ if [[ -n "$BASE" && -f "$BASE" ]]; then
   exp=" cmd_rollback cmd_update"
   [[ "$changed" == "$exp" ]] && ok "A1: 基线里已有的函数只有 cmd_rollback 与 cmd_update 被改过" \
     || bad "A1: 被改过的函数是「$changed」, 预期「$exp」"
-  # 新增的顶层函数必须只有前像那一组
-  newfn="$(comm -13 <(grep -oE '^[a-zA-Z_][a-zA-Z0-9_]*\(\)\{' "$BASE" | sed 's/(){$//' | sort) \
-                    <(grep -oE '^[a-zA-Z_][a-zA-Z0-9_]*\(\)\{' "$PDG"  | sed 's/(){$//' | sort) | tr '\n' ' ')"
-  # _pdg_set_enable_state 是前像恢复那一组里的一员: 自启恢复要分别撤"持久"与"运行时"两层
-  # 链接(真 systemd 上 `enable --runtime` 撤不掉持久链接、`disable` 撤不掉运行时链接),
-  # 这段逻辑从 _pdg_restore_svcstate 里提出来单独成函数, 两条线共用同一份。
-  # 它**不**是新能力, 更不是退役相关 —— 下面第二节仍然逐条确认桥接版没有任何退役面。
-  want="_pdg_kernel_converge _pdg_now_ac _pdg_now_en _pdg_restore_svcstate _pdg_save_svcstate _pdg_set_enable_state _pdg_svc_known _pdg_svc_q _pdg_svcstate_plan _pdg_svcstate_units _pdg_svcstate_valid "
+  # 新增的顶层函数必须**恰好**是下面这份允许集合 —— 判据是精确相等, 不是前缀泛放行,
+  # 也不从当前候选自动生成期望(那等于让被测对象自己定义"正确")。
+  a2_newfn(){   # $1=基线 $2=候选 → 打印"候选相对基线新增的顶层函数名", 空格分隔
+    comm -13 <(grep -oE '^[a-zA-Z_][a-zA-Z0-9_]*\(\)\{' "$1" | sed 's/(){$//' | sort) \
+             <(grep -oE '^[a-zA-Z_][a-zA-Z0-9_]*\(\)\{' "$2" | sed 's/(){$//' | sort) | tr '\n' ' '
+  }
+  newfn="$(a2_newfn "$BASE" "$PDG")"
+  # 允许集合 = 前像那一组 + **已批准的三个正式入口函数**。
+  #
+  # 前像那一组(保存/校验/解析/查询/恢复): 桥接版存在的理由本身。其中 _pdg_set_enable_state
+  # 是这一组里的一员 —— 自启恢复要分别撤"持久"与"运行时"两层链接(真 systemd 上
+  # `enable --runtime` 撤不掉持久链接、`disable` 撤不掉运行时链接), 这段逻辑从
+  # _pdg_restore_svcstate 里提出来单独成函数, 两条线共用同一份。它不是新能力。
+  #
+  # 入口那三个(_update_pin_resolve / _update_pin_still / _pdg_entry_src): 属于 `pdg update
+  # --to <版本tag>` 这个已批准的正式入口 —— 解析并固定钉版目标、每次用前复核 tag 没被挪走、
+  # 如实打印当前进程执行的是哪一份 pdg.sh。它们同样**不是**退役面, 也不推进任何格式。
+  #
+  # 这条边界没有被取消: 集合仍然是逐名精确的, 多一个、少一个都判红(见本节末的区分力自检)。
+  want="_pdg_entry_src _pdg_kernel_converge _pdg_now_ac _pdg_now_en _pdg_restore_svcstate _pdg_save_svcstate _pdg_set_enable_state _pdg_svc_known _pdg_svc_q _pdg_svcstate_plan _pdg_svcstate_units _pdg_svcstate_valid _update_pin_resolve _update_pin_still "
   [[ "$newfn" == "$want" ]] \
-    && ok "A2: 新增函数就是前像那一组(保存/校验/解析/查询/恢复), 没有别的: $newfn" \
+    && ok "A2: 新增函数恰好是「前像那一组 + 已批准的三个入口函数」, 没有别的: $newfn" \
     || bad "A2: 新增函数超出范围: $newfn"
+
+  # ── A2 的区分力自检: 在**自有副本**上造反例, 不改正式产品 ────────────────────
+  # 只更新允许集合而不验区分力的话, 万一哪天判据被写松(比如改成前缀匹配), 这一节照样全绿。
+  _a2_probe(){ # $1=说明 $2=副本路径 $3=expect(pass|reject)
+    local got; got="$(a2_newfn "$BASE" "$2")"
+    if [[ "$3" == pass ]]; then
+      [[ "$got" == "$want" ]] && ok "  A2-区分力[$1]: 结论不变(仍恰好等于允许集合)" \
+                              || bad "  A2-区分力[$1]: 结论变了: $got"
+    else
+      [[ "$got" != "$want" ]] && ok "  A2-区分力[$1]: **被拒**(实得: $got)" \
+                              || bad "  A2-区分力[$1]: 竟然通过了"
+    fi
+  }
+  # ① 多一个未授权函数
+  cp "$PDG" "$BOX/a2-extra.sh"; printf '\n_a2_unauthorized_probe(){ :; }\n' >> "$BOX/a2-extra.sh"
+  _a2_probe "多一个未授权函数" "$BOX/a2-extra.sh" reject
+  # ② 少一个应有函数(把定义行写成 `名(){ ` 之外的形态, 它就不再是一个顶层定义)
+  sed 's/^_update_pin_still(){/_update_pin_still() {/' "$PDG" > "$BOX/a2-missing.sh"
+  _a2_probe "少一个应有函数(_update_pin_still)" "$BOX/a2-missing.sh" reject
+  # ③ 无关注释: 结论必须不变
+  sed '1a\# 对照: 这行注释不参与任何判定' "$PDG" > "$BOX/a2-comment.sh"
+  _a2_probe "无关注释对照" "$BOX/a2-comment.sh" pass
 else
   na "A: 没给 PDG_BASELINE, 跳过与冻结基线的逐函数对比"
 fi
