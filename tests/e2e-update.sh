@@ -132,14 +132,43 @@ grep -qE '当前|最新发布' <<<"$out" && ok "--dry-run 打印当前/最新版
 # ── 4. 快照 → 手工回滚: 配置真的被换回去 ═════════════════════════════════════
 echo; echo "── 4. snapshot + rollback ──"
 printf 'MARK=before-snapshot\n' >> /etc/privdns-gateway/profile.env
-bash /usr/local/bin/pdg snapshot >/dev/null 2>&1
-printf 'MARK=after-snapshot\n' >> /etc/privdns-gateway/profile.env
-out=$(bash /usr/local/bin/pdg rollback 0 2>&1); rc=$?
-{ [[ "$rc" == 0 ]] && grep -q '✅ 已回滚' <<<"$out"; } \
-  && ok "pdg rollback 0 成功" || bad "回滚失败 rc=$rc: $(tail -3 <<<"$out")"
-{ grep -q 'before-snapshot' /etc/privdns-gateway/profile.env \
-  && ! grep -q 'after-snapshot' /etc/privdns-gateway/profile.env; } \
-  && ok "配置被换回快照时刻的内容(快照后的改动已消失)" || bad "配置没回到快照状态"
+# snapshot 的输出与退出码**完整保留**: 上一次 CI 里这一步被重定向到 /dev/null, 于是回滚失败时
+# 无从判断快照是成功了、失败了, 还是产出了指向别处的记录。成功时的警告(例如"前像里有 N 处
+# QUERY-FAILED")同样要留 —— 它正是判断后面那次回滚为什么非零的关键。
+# 注意: 只打 pdg snapshot 自己的输出, 不打配置正文与凭据(本节不 cat 任何配置文件)。
+e2e_dirset_mark /var/lib/privdns-gateway/backups
+snap_out=$(bash /usr/local/bin/pdg snapshot 2>&1); snap_rc=$?
+echo "  4-snap: pdg snapshot rc=$snap_rc; 完整输出如下:"
+printf '%s\n' "$snap_out" | sed 's/^/    | /'
+_snap_ok=1
+[[ "$snap_rc" == 0 ]] && ok "pdg snapshot 成功(rc=0)" || { bad "4-snap: pdg snapshot rc=$snap_rc"; _snap_ok=0; }
+# 本次目录**按身份**认: 用既有的目录差集助手取"恰好新增的那一个", 不用数量增长或最新排序代替。
+_snap_new=""
+if [[ "$_snap_ok" == 1 ]]; then
+  if _snap_new="$(e2e_dirset_created 4-snap)"; then
+    _snap_new="${_snap_new%/}"
+    ok "  本次新增的那一个快照目录: $_snap_new"
+  else
+    _snap_ok=0                      # 助手自己已经 bad 过了(0 个或多于 1 个), 这里只接住失败
+  fi
+fi
+if [[ "$_snap_ok" == 1 ]]; then
+  if [[ -f "$_snap_new/svcstate.tsv" ]]; then
+    ok "  本次快照目录里有服务前像; 它记的 snap_dir = $(awk -F'\t' '$1=="snap_dir"{print $2}' "$_snap_new/svcstate.tsv")"
+  else bad "4-snap: 本次快照目录里没有 svcstate.tsv"; _snap_ok=0; fi
+fi
+if [[ "$_snap_ok" != 1 ]]; then
+  # 快照失败、或本次目录没确定下来 ⇒ 本节到此为止: 不再改配置, 也不去回滚**别的**旧快照。
+  bad "4: 快照未确定 ⇒ 本节停止(不继续改配置, 不回滚旧快照)"
+else
+  printf 'MARK=after-snapshot\n' >> /etc/privdns-gateway/profile.env
+  out=$(bash /usr/local/bin/pdg rollback 0 2>&1); rc=$?
+  { [[ "$rc" == 0 ]] && grep -q '✅ 已回滚' <<<"$out"; } \
+    && ok "pdg rollback 0 成功" || bad "回滚失败 rc=$rc: $out"
+  { grep -q 'before-snapshot' /etc/privdns-gateway/profile.env \
+    && ! grep -q 'after-snapshot' /etc/privdns-gateway/profile.env; } \
+    && ok "配置被换回快照时刻的内容(快照后的改动已消失)" || bad "配置没回到快照状态"
+fi
 
 # ══ 静态文件全集在 update 后逐项同步 ═══════════════════════════════════════
 # 这条以前没有。11 个项目静态文件曾经只在 install.sh 里各写一行装, 不在任何清单里 ——

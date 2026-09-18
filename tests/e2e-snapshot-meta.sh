@@ -238,7 +238,12 @@ out=$(printf 'n\n' | pdg rollback 2>&1)
 grep -q '来源未知' <<<"$out" && ok "坏元数据显示为「来源未知」" || bad "6b: $(tail -3 <<<"$out")"
 [[ "$(stat -c '%a' "$BADD/snapshot.json")" == 644 ]] \
   && ok "读它不会顺手改权限(没有扩权)" || bad "6c: 权限被改成 $(stat -c '%a' "$BADD/snapshot.json")"
+# 6d 的取证: 先记下**所选目录**与它的前像状况, 失败时把**完整回滚输出**一起带出来 ——
+# 上一次 CI 里这一条只打了 rc, 没有任何输出, 无从判断原因。
+echo "  6d-取证: 目标目录 = $BADD"
+echo "  6d-取证: svcstate.tsv $( [[ -f "$BADD/svcstate.tsv" ]] && echo "在场, 记的 snap_dir = $(awk -F'\t' '$1=="snap_dir"{print $2}' "$BADD/svcstate.tsv")" || echo '不在场')"
 out=$(pdg rollback --dir "$BADD" 2>&1); rc=$?
-[[ "$rc" == 0 ]] && ok "坏元数据不挡回滚" || bad "6d: rc=$rc"
+[[ "$rc" == 0 ]] && ok "坏元数据不挡回滚" || bad "6d: rc=$rc; 完整输出如下:
+$out"
 
 e2e_summary

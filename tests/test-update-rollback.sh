@@ -593,6 +593,70 @@ brc=0; bout=$(runbroken "--dir '$SNAP/H' --git '$GOOD_REF'") || brc=$?
 rm -rf /etc/privdns-gateway/snapid
 
 echo
+echo "══ L. 快照目录的路径表示: 序号与 --dir 必须指向同一份 ══"
+# 序号那条路走 `ls -1dt "$SNAP_DIR"/*/`, 每一项**带末尾斜杠**; 服务前像里记的 snap_dir 不带。
+# 直接比字符串的话, `pdg rollback 0` 回滚自己刚拍的那一份也会被判成"记的是别的快照"。
+_l_reset(){ bash -c "source '$WORK/harness.sh'; source '$WORK/model.sh'; svc_init disabled inactive" >/dev/null 2>&1
+            e2e_git "$REPO" reset --hard -q "$HEAD_REF"; }
+_l_run(){   # $1=cmd_rollback 的选择参数 $2=用哪一份 rollback 壳
+  local rb="${2:-$WORK/rollback.sh}"
+  _l_reset
+  L_OUT="$(bash -c "source '$WORK/harness.sh'; source '$WORK/model.sh'; source '$rb'
+                    svc_init disabled inactive; cmd_rollback $1; echo LRC=\$?" 2>&1)"
+  L_RC="$(grep -o 'LRC=[0-9]*' <<<"$L_OUT" | tail -1 | cut -d= -f2)"
+}
+_l_fresh(){ rm -rf "$SNAP/L"; mksnap L LCASE || return 1; mkpre "$SNAP/L" || return 1
+            printf '{"id":"L","source":"cli","op":"update","git_commit":"%s"}\n' "$GOOD_REF" > "$SNAP/L/snapshot.json"; }
+_l_fresh || bad "L-前提: 造不出快照"
+# 这一支的 SNAP_DIR 里同时有 A/B/H 等夹具, 序号 0 未必是 L —— 直接按 ls -1dt 取 L 的序号
+_l_idx=-1; _l_i=0
+  while IFS= read -r _d; do [[ "${_d%/}" == "$SNAP/L" ]] && { _l_idx=$_l_i; break; }; _l_i=$((_l_i+1)); done \
+    < <(ls -1dt "$SNAP"/*/ 2>/dev/null)
+if (( _l_idx >= 0 )); then
+  _l_run "$_l_idx"
+  { [[ "$L_RC" == 0 ]] && grep -q '按本次前像恢复' <<<"$L_OUT"; } \
+    && ok "L1: **按序号选择**(带末尾斜杠那条路)⇒ rc=0 且按前像恢复" \
+    || bad "L1: rc=$L_RC: $(grep -o '记的是别的快照[^;]*' <<<"$L_OUT" | head -1)"
+else bad "L1: 找不到 L 的序号"; fi
+_l_run "--dir '$SNAP/L'"
+{ [[ "$L_RC" == 0 ]] && grep -q '按本次前像恢复' <<<"$L_OUT"; } \
+  && ok "L2: --dir **不带**斜杠 ⇒ rc=0" || bad "L2: rc=$L_RC"
+_l_run "--dir '$SNAP/L/'"
+{ [[ "$L_RC" == 0 ]] && grep -q '按本次前像恢复' <<<"$L_OUT"; } \
+  && ok "L3: --dir **带**斜杠 ⇒ rc=0(同一份, 不因一个斜杠被拒)" || bad "L3: rc=$L_RC"
+# 安全校验没有被放宽: 真正不同的目录、以及 tarball 身份变了, 仍然要拒
+rm -rf "$SNAP/L2"; mkdir -p "$SNAP/L2"
+cp "$SNAP/L/snap.tar.gz" "$SNAP/L2/snap.tar.gz"; cp "$SNAP/L/svcstate.tsv" "$SNAP/L2/svcstate.tsv"
+_l_run "--dir '$SNAP/L2'"
+{ [[ "$L_RC" != 0 ]] && grep -q '记的是别的快照' <<<"$L_OUT"; } \
+  && ok "L4: 前像记的是**真正另一个**目录 ⇒ 仍然被拒(目录绑定没被放宽)" || bad "L4: rc=$L_RC 没拒"
+rm -rf "$SNAP/L2"
+_l_fresh && cp "$SNAP/L/snap.tar.gz" "$WORK/l-new.tgz" && mv -f "$WORK/l-new.tgz" "$SNAP/L/snap.tar.gz"
+_l_run "--dir '$SNAP/L'"
+{ [[ "$L_RC" != 0 ]] && grep -q '前像钉的快照身份与这一份对不上' <<<"$L_OUT"; } \
+  && ok "L5: tarball 身份变了 ⇒ 仍然被拒(身份绑定没被放宽)" || bad "L5: rc=$L_RC 没拒"
+_l_fresh && printf 'unit\tbogus\tenabled\t0\tactive\t0\trunning\tX\n' >> "$SNAP/L/svcstate.tsv"
+_l_run "--dir '$SNAP/L'"
+{ [[ "$L_RC" != 0 ]] && grep -q '前像不可用' <<<"$L_OUT"; } \
+  && ok "L6: 记录被改坏 ⇒ 仍然被拒(损坏记录没被放宽)" || bad "L6: rc=$L_RC 没拒"
+# 撤销对照: 把统一路径表示那一行去掉, 序号那条路必须重新失守
+_l_fresh
+sed '/^  while \[\[ "\$target" == \*\/ && "\$target" != \/ \]\]; do target="\${target%\/}"; done$/d' \
+  "$WORK/rollback.sh" > "$WORK/rollback-noslash.sh"
+if cmp -s "$WORK/rollback.sh" "$WORK/rollback-noslash.sh"; then
+  bad "L7: 撤销没打上(锚点没命中) —— 这一格不算证据"
+else
+  bash -n "$WORK/rollback-noslash.sh" 2>/dev/null || bad "L7: 撤销版本语法不过"
+  _l_idx=-1; _l_i=0
+    while IFS= read -r _d; do [[ "${_d%/}" == "$SNAP/L" ]] && { _l_idx=$_l_i; break; }; _l_i=$((_l_i+1)); done \
+      < <(ls -1dt "$SNAP"/*/ 2>/dev/null)
+  _l_run "$_l_idx" "$WORK/rollback-noslash.sh"
+  { [[ "$L_RC" != 0 ]] && grep -q '记的是别的快照' <<<"$L_OUT"; } \
+    && ok "L7: 撤掉统一路径那一行 ⇒ **原反例重新出现**(序号选择被判成'别的快照')" \
+    || bad "L7: 撤销对照没重现(rc=$L_RC)"
+fi
+rm -rf "$SNAP/L"
+
 echo "══ K. 更新前确认与回滚是**两个**校验阶段(同一进程内) ══"
 # 缺陷的形态是"同一个进程里, 后一阶段沿用了前一阶段的结论"。所以这一节必须在**同一个
 # bash 进程**里跑完: 真前检验 → 确认缓存确实建起来了 → 保持或破坏记录/归档身份 → 真 cmd_rollback。

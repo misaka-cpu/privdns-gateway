@@ -80,7 +80,10 @@ mkrepo(){
 }
 sha_of(){ command git -C "$WORK/repo" rev-parse -q --verify "$1^{commit}"; }
 
-cat > "$WORK/harness.sh" <<'EOF'
+# 守卫要在**子壳里**也能用: harness 会被 `bash -c "source harness; …"` 加载, 那里没有
+# repoguard。路径用 printf 显式写进去(下面的 heredoc 带引号, 不展开)。
+printf 'source %q\n' "$ROOT/tests/repoguard.sh" > "$WORK/harness.sh"
+cat >> "$WORK/harness.sh" <<'EOF'
 REPO_DIR="$WORK/repo"; REPO_URL="file:///dev/null"; ENVF="$WORK/none.env"
 need_root(){ :; }
 _lock(){ echo "LOCK_TAKEN" >> "$WORK/side.log"; }
@@ -99,7 +102,11 @@ pdg_fetch_release_tags(){ echo "FETCH_CALLED" >> "$WORK/side.log"; [[ -n "${FAIL
 git(){
   printf '%s\n' "$*" >> "$WORK/git.log"
   if [[ -n "${HIJACK_RESET:-}" && "$1" == -C && "$3" == reset ]]; then
-    command git -C "$2" reset --hard -q "$HIJACK_RESET"; return $?
+    # 这一次写操作走**既有归属守卫**(先守后写)。e2e_git 内部还会调回本 wrapper, 所以先把
+    # 注入变量清空再委托 —— 否则就是无限递归; 调用完原样放回, 注入对后续调用仍然有效。
+    local _hj="$HIJACK_RESET"; HIJACK_RESET=""
+    e2e_git "$2" reset --hard -q "$_hj"; local _rc=$?
+    HIJACK_RESET="$_hj"; return "$_rc"
   fi
   command git "$@"
 }
@@ -119,7 +126,7 @@ cmd_snapshot(){ echo "SNAPSHOT_CALLED" >> "$WORK/side.log"
   _PDG_SNAP_CREATED="$WORK/snap"; mkdir -p "$_PDG_SNAP_CREATED"; : | gzip > "$_PDG_SNAP_CREATED/snap.tar.gz"
   _pdg_save_svcstate "$_PDG_SNAP_CREATED" || { _PDG_SNAP_CREATED=""; return 1; }
   # MOVE_TAG_AT_SNAP: 在快照这一刻把钉的 tag 挪到别的提交上 —— 复现"目标在过程中被移动"。
-  [[ -n "${MOVE_TAG_AT_SNAP:-}" ]] && command git -C "$REPO_DIR" tag -f -a "$MOVE_TAG_AT_SNAP" -m moved HEAD >/dev/null 2>&1
+  [[ -n "${MOVE_TAG_AT_SNAP:-}" ]] && e2e_git "$REPO_DIR" tag -f -a "$MOVE_TAG_AT_SNAP" -m moved HEAD >/dev/null 2>&1
   return 0; }
 _pdg_save_svcstate(){ echo "SVCSTATE_SAVED" >> "$WORK/side.log"
   [[ -n "${1:-}" && -d "${1:-}" ]] && printf 'modeled-svcstate\n' > "$1/svcstate.tsv"
@@ -304,15 +311,31 @@ printf '%s\n' "$*" >> "$SUDO_LOG"
 [[ -n "${SUDO_FAIL_DRYRUN:-}" && "$*" == *--dry-run* ]] && exit 7
 exit 0
 SU
-cat > "$BIN/git" <<'GW'
-#!/usr/bin/env bash
-# 受控查询哨兵。默认: 原样转发真 git。
+# 哨兵脚本自己也要能调守卫: 同样用 printf 把绝对路径写进去。
+{ printf '#!/usr/bin/env bash\n'
+  printf '# 受控查询哨兵。默认: 原样转发真 git。\n'
+  printf 'source %q\n' "$ROOT/tests/repoguard.sh"; } > "$BIN/git"
+cat >> "$BIN/git" <<'GW'
 if [[ -n "${FAIL_STATUS:-}" && " $* " == *" status "* ]]; then exit 1; fi   # 失败且 stdout 为空
 if [[ -n "${LOCK_AT_CHECKOUT:-}" && " $* " == *" checkout "* ]]; then
   # 先真的检出到**另一个干净提交**(旧入口那一版), 再放一个**自有** index.lock,
   # 于是接下来这次真 checkout 会被真 git 拒绝 —— 锁是真的, 失败也是真的。
-  /usr/bin/git -C "$LOCK_REPO" checkout -q --detach "$LOCK_OTHER" 2>/dev/null
-  : > "$LOCK_REPO/.git/index.lock"
+  # 先守后写。e2e_git 会再调 `git`, 而 PATH 首位就是本脚本 —— 先把注入开关清掉再委托,
+  # 否则无限递归; 清掉之后本脚本对那次内部调用就是纯转发, 注入语义不受影响
+  # (本格只需注入命中一次: 检出到另一个提交 + 放下 index.lock)。
+  LOCK_AT_CHECKOUT=""
+  # 守卫拒绝就**当场停**: 不吞它给的理由, 不继续放 index.lock(那会把"没写成"冒充成
+  # "注入已成立"), 也不再执行末尾那次真 git —— 否则被守卫挡下的写操作反而以另一种形式发生了。
+  if ! _gw_err="$(e2e_git "$LOCK_REPO" checkout -q --detach "$LOCK_OTHER" 2>&1)"; then
+    printf '%s\n' "$_gw_err" >&2
+    echo "[哨兵] 归属守卫拒绝了这次检出 ⇒ 不创建 index.lock, 不执行后续 git" >&2
+    exit 1
+  fi
+  # 锁文件没放下去同样要停: 注入的前提就是"锁真的在", 放不下去就不能假装命中。
+  if ! : > "$LOCK_REPO/.git/index.lock"; then
+    echo "[哨兵] index.lock 创建失败 ⇒ 注入未成立, 停止(不冒充)" >&2
+    exit 1
+  fi
 fi
 exec /usr/bin/git "$@"
 GW
@@ -372,6 +395,41 @@ if [[ "$H_LOCK" == "$OLD_C" ]]; then
 else bad "10c-3: 副本停在 ${H_LOCK:0:12}, 场景没造出来"; fi
 rm -f "$FENT/.git/index.lock"
 
+echo "  ── 10c2 守卫拒绝时, 哨兵必须当场停(自建仓库 + 它的 linked worktree) ──"
+# 用**自有**的一次性仓库造一个 linked worktree: 它与上游共享 ref 库, 正是守卫要拦的形态。
+GW_REPO="$WORK/gw-repo"; GW_WT="$WORK/gw-wt"; rm -rf "$GW_REPO" "$GW_WT"
+command git init -q -b main "$GW_REPO"
+g "$GW_REPO" config user.email t@t; g "$GW_REPO" config user.name t; g "$GW_REPO" config commit.gpgsign false
+echo a > "$GW_REPO/f"; g "$GW_REPO" add -A; g "$GW_REPO" commit -qm a
+echo b > "$GW_REPO/f"; g "$GW_REPO" add -A; g "$GW_REPO" commit -qm b
+GW_OTHER="$(command git -C "$GW_REPO" rev-parse HEAD~1)"
+g "$GW_REPO" worktree add -q --detach "$GW_WT" HEAD >/dev/null 2>&1
+if [[ -e "$GW_WT/.git" ]]; then
+  ok "10c2-前提: 造出了共享 ref 库的 linked worktree(守卫该拦的正是它)"
+  _h0="$(command git -C "$GW_WT" rev-parse HEAD)"
+  _r0="$(command git -C "$GW_REPO" show-ref | sha256sum | cut -d' ' -f1)"
+  _i0="$( [[ -f "$GW_REPO/.git/index" ]] && sha256sum "$GW_REPO/.git/index" | cut -d' ' -f1 || echo none)"
+  _lock0="$(find "$GW_REPO/.git" "$GW_WT" -name 'index.lock' 2>/dev/null | wc -l)"
+  _grc=0
+  # 这一格的被测对象**就是哨兵脚本自己**, 所以按路径直接调它(不是裸 git, 也不该走 e2e_git ——
+  # 走了就在哨兵之外先被拦掉, 那就测不到"哨兵内部守卫拒绝后它怎么办")。
+  _gw_sentinel="$BIN/git"
+  _gout="$(env PATH="$BIN:/usr/bin:/bin" LOCK_AT_CHECKOUT=1 LOCK_REPO="$GW_WT" LOCK_OTHER="$GW_OTHER" \
+           "$_gw_sentinel" -C "$GW_WT" checkout -q --detach "$GW_OTHER" 2>&1)" || _grc=$?
+  [[ "$_grc" != 0 ]] && ok "10c2-a: 守卫拒绝 ⇒ 哨兵**立即非零退出**(rc=$_grc)" || bad "10c2-a: 竟然返回 0"
+  grep -q '拒绝对' <<<"$_gout" && ok "10c2-b: 保留了守卫给出的**拒绝原因**(没被吞掉)" \
+                              || bad "10c2-b: 没有拒绝原因: $(head -2 <<<"$_gout")"
+  [[ "$(find "$GW_REPO/.git" "$GW_WT" -name 'index.lock' 2>/dev/null | wc -l)" == "$_lock0" ]] \
+    && ok "10c2-c: **没有新增锁文件**(index.lock 数仍是 $_lock0)" || bad "10c2-c: 多了锁文件"
+  [[ "$(command git -C "$GW_WT" rev-parse HEAD)" == "$_h0" ]] \
+    && ok "10c2-d: worktree 的 HEAD 未变(${_h0:0:12})" || bad "10c2-d: HEAD 被改了"
+  [[ "$(command git -C "$GW_REPO" show-ref | sha256sum | cut -d' ' -f1)" == "$_r0" ]] \
+    && ok "10c2-e: 上游仓库的 refs 一条都没动" || bad "10c2-e: refs 变了"
+  [[ "$( [[ -f "$GW_REPO/.git/index" ]] && sha256sum "$GW_REPO/.git/index" | cut -d' ' -f1 || echo none)" == "$_i0" ]] \
+    && ok "10c2-f: index 未变" || bad "10c2-f: index 变了"
+else bad "10c2-前提: 建不出 linked worktree(本环境可能不支持), 这一格没测到东西"; fi
+rm -rf "$GW_WT"; e2e_git "$GW_REPO" worktree prune >/dev/null 2>&1
+
 echo "  ── 10d status 查询失败且 stdout 为空 ──"
 runflow statusfail FAIL_STATUS=1
 { (( FRC != 0 )) && [[ "$FOUT$FERR" == *"状态查询失败"* ]]; } \
@@ -419,9 +477,11 @@ rev(){ # $1=名字 $2=sed 表达式 $3=场景env $4=期望(pass=应当放行/sto
                  || bad "10g[$nm]: 撤掉后被放行(哨兵 $n 次)"
   fi
 }
-rev "撤⑤检出rc"      's|^(git -C "\$ENTRY" checkout -q --detach "\$WANT").*$|\1|'            "LOCK_AT_CHECKOUT=1" stop
+# 锚在 `|| stop "检出失败…"` 那一段上: 效果与"撤掉 ⑤ 的退出码检查"一样, 而表达式里
+# 不出现 git 字样 —— 守卫的文本扫描不会再把这条 sed **字符串**当成真实调用。
+rev "撤⑤检出rc"      's# \|\| stop "检出失败[^"]*"##'  "LOCK_AT_CHECKOUT=1" stop
 rev "撤⑥读回HEAD"    '/^HEAD_SHA=|^\[ "\$HEAD_SHA" = "\$WANT" \]/d'                          "LOCK_AT_CHECKOUT=1" stop
-rev "撤⑤+⑥"        's|^(git -C "\$ENTRY" checkout -q --detach "\$WANT").*$|\1|; /^HEAD_SHA=|^\[ "\$HEAD_SHA" = "\$WANT" \]/d' "LOCK_AT_CHECKOUT=1" pass
+rev "撤⑤+⑥"        's# \|\| stop "检出失败[^"]*"##; /^HEAD_SHA=|^\[ "\$HEAD_SHA" = "\$WANT" \]/d' "LOCK_AT_CHECKOUT=1" pass
 rev "⑦改回吞错写法"  's|^if ! ST=.*$|ST="$(git -C "$ENTRY" status --porcelain)"|'             "FAIL_STATUS=1"      pass
 rev "撤⑧预览阻断"    's|^sudo bash "\$ENTRY/deploy/bot/pdg.sh" update --dry-run --to "\$TAG" \\\\$|sudo bash "$ENTRY/deploy/bot/pdg.sh" update --dry-run --to "$TAG" \|\| true|; /^  \|\| stop "预览失败/d' "SUDO_FAIL_DRYRUN=1" pass
 rev "无关注释(对照)"  '1a\# 对照: 这行注释不参与任何判定'                                      ""                   ctrl
