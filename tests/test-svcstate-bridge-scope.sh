@@ -38,8 +38,13 @@ if [[ -n "$BASE" && -f "$BASE" ]]; then
   while read -r fn; do
     diff -q <(sed -n "/^$fn(){/,/^}/p" "$BASE") <(sed -n "/^$fn(){/,/^}/p" "$PDG") >/dev/null || changed="$changed $fn"
   done < <(grep -oE '^[a-zA-Z_][a-zA-Z0-9_]*\(\)\{' "$BASE" | sed 's/(){$//')
-  exp=" cmd_rollback cmd_update"
-  [[ "$changed" == "$exp" ]] && ok "A1: 基线里已有的函数只有 cmd_rollback 与 cmd_update 被改过" \
+  # cmd_snapshot 也进了这个集合: 服务前像的保存从 cmd_update 移进了 cmd_snapshot ——
+  # 手打的 `pdg snapshot` 拍出来的快照以前没有前像, 回滚它只能还原文件、运行态无法确认。
+  # _pdg_svcstate_plan 只改了"缺前像"那一句提示的措辞(不再一概称旧格式), 语义未变。
+  # 顺序随基线文件里的出现顺序(这一段是逐个函数比出来的, 不排序)。
+  # _pdg_svcstate_plan 是桥接版**新增**的函数, 归 A2 的允许集合管, 不出现在这里。
+  exp=" cmd_snapshot cmd_rollback cmd_update"
+  [[ "$changed" == "$exp" ]] && ok "A1: 基线里已有的函数只有 cmd_snapshot / cmd_rollback / cmd_update 被改过" \
     || bad "A1: 被改过的函数是「$changed」, 预期「$exp」"
   # 新增的顶层函数必须**恰好**是下面这份允许集合 —— 判据是精确相等, 不是前缀泛放行,
   # 也不从当前候选自动生成期望(那等于让被测对象自己定义"正确")。
@@ -131,29 +136,36 @@ ok "C3: lib/*.sh 里没有前像动作(不是常量、不是 unit 生成器、�
 
 echo
 echo "══ 四. 存前像排在一切副作用之前; 存不下就中止 ══"
-ln_save="$(grep -n 'if ! _pdg_save_svcstate "$snap_dir"; then' "$PDG" | head -1 | cut -d: -f1)"
+# 前像现在在 cmd_snapshot 里存, cmd_update 在动手之前**确认**它可用。两处分别定位:
+ln_snapsave="$(grep -n 'if ! _pdg_save_svcstate "\$d"; then' "$PDG" | head -1 | cut -d: -f1)"
+ln_save="$(grep -n 'if \[\[ ! -f "\$snap_dir/svcstate.tsv" \]\] || ! _pdg_svcstate_plan "\$snap_dir"; then' "$PDG" | head -1 | cut -d: -f1)"
 ln_mig="$(grep -n '^\s*if ! .*bash /usr/local/bin/pdg __migrate' "$PDG" | head -1 | cut -d: -f1)"
 ln_inst="$(grep -n 'install -m755 "$REPO_DIR"\|install -m644 "$REPO_DIR"' "$PDG" | head -1 | cut -d: -f1)"
-[[ -n "$ln_save" ]] && ok "D1: cmd_update 里有存前像这一步" || bad "D1: 没有"
+[[ -n "$ln_snapsave" ]] && ok "D1a: cmd_snapshot 里有**存**前像这一步(手打的 pdg snapshot 也有前像)" || bad "D1a: 没有"
+[[ -n "$ln_save" ]] && ok "D1b: cmd_update 里有**确认本次前像可用**这一步(不再重复保存)" || bad "D1b: 没有"
+_n_save="$(grep -c '_pdg_save_svcstate "' "$PDG")"
+[[ "$_n_save" == 1 ]] && ok "D1c: 全文件只有 1 处调用 _pdg_save_svcstate —— update 不会再采样一次" \
+  || bad "D1c: _pdg_save_svcstate 被调用了 $_n_save 处"
 [[ -n "$ln_mig" && "$ln_save" -lt "$ln_mig" ]] && ok "D2: 排在 __migrate 子进程之前" || bad "D2: 顺序不对($ln_save vs $ln_mig)"
 [[ -n "$ln_inst" && "$ln_save" -lt "$ln_inst" ]] && ok "D3: 排在第一处 install 之前(记的确实是动手前的状态)" || bad "D3: 顺序不对($ln_save vs $ln_inst)"
 grep -q 'PDG_UPDATE_SVCSTATE="$snap_dir/svcstate.tsv" bash /usr/local/bin/pdg __migrate' "$PDG" \
   && ok "D4: 把本次句柄交给了迁移子进程" || bad "D4: 没交句柄"
 { echo 'set -uo pipefail'
   echo 'c_y(){ echo "$*"; }'
-  echo '_pdg_save_svcstate(){ return 1; }'
+  echo '_pdg_svcstate_plan(){ _PDG_SVC_WHY="注入: 前像不可用"; return 1; }'
   echo 'launched=0'
   echo 'bash(){ launched=1; }'
   echo 'guard(){'
   echo "  local snap_dir=\"$BOX/snap\""   # 用本用例的一次性目录, 不写死 /tmp 路径
-  sed -n "${ln_save},$((ln_save+2))p" "$PDG"
+  echo "  mkdir -p \"$BOX/snap\"; : > \"$BOX/snap/svcstate.tsv\""   # 文件在场, 由 plan 判不可用
+  sed -n "${ln_save},$((ln_save+3))p" "$PDG"   # 新判据块是 4 行: if / c_y / return 1 / fi
   echo '  bash /usr/local/bin/pdg __migrate'
   echo '  return 0'
   echo '}'
   echo 'guard; echo "RC=$?"; echo "LAUNCHED=$launched"'
 } > "$BOX/guard.sh"
 o="$(bash "$BOX/guard.sh" 2>&1)"
-grep -q 'RC=1' <<<"$o" && ok "D5: 存前像失败 → 中止" || { bad "D5: 没中止"; echo "$o" | sed 's/^/      /'; }
+grep -q 'RC=1' <<<"$o" && ok "D5: 本次前像不可用 → 中止" || { bad "D5: 没中止"; echo "$o" | sed 's/^/      /'; }
 grep -q 'LAUNCHED=0' <<<"$o" && ok "D6: 且没有启动迁移子进程" || bad "D6: 仍然启动了"
 
 echo

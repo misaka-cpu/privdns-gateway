@@ -1308,6 +1308,35 @@ cmd_snapshot(){
   if ! _snap_meta_write "$d" "$ts" "$src" "$op"; then
     c_y "❌ 快照元数据写入失败 → 本次快照作废(未留下半份)"; rm -rf "$d"; return 1
   fi
+  # ── 服务前像: 由 cmd_snapshot 自己存 ──────────────────────────────────────
+  # 以前只有 cmd_update 在建完快照之后另存。于是用户手打的 `pdg snapshot` 拍出来的那一份
+  # **没有前像**, 回滚它只能还原文件、运行态与自启无法确认, 并且必然返回非零。
+  # 位置不能随意: _pdg_save_svcstate 把 snap_id 钉在 snap.tar.gz 的 设备:inode:字节数:mtime 上,
+  # 所以必须等打包**最终完成**(含上面的 gzip 与 chmod)之后再存, 否则钉的是一个还会变的对象。
+  if ! _pdg_save_svcstate "$d"; then
+    c_y "❌ 服务前像保存失败 → 本次快照作废(不留下半份)"
+    rm -rf "$d" 2>/dev/null
+    [[ -e "$d" ]] && c_y "   ⚠️ 本次快照目录未能清理干净, 残留在: $d(只涉及本次材料, 请确认后删除)"
+    return 1
+  fi
+  # 存下来了不等于可用。结构与**绑定**都要当场校验: 格式完整、记的 snap_dir 就是这一份、
+  # 钉的 snap_id 与这一份的 snap.tar.gz 对得上。不校验等于把"能不能按前像恢复"留到回滚当天才发现。
+  if ! _pdg_svcstate_plan "$d"; then
+    c_y "❌ 服务前像校验未通过(${_PDG_SVC_WHY:-未知}) → 本次快照作废(不留下半份)"
+    rm -rf "$d" 2>/dev/null
+    [[ -e "$d" ]] && c_y "   ⚠️ 本次快照目录未能清理干净, 残留在: $d(只涉及本次材料, 请确认后删除)"
+    return 1
+  fi
+  # 校验用完就把解析缓存清掉: 让后续真正的回滚**重新**按那一刻的文件解析一遍,
+  # 而不是复用拍快照时留下的内存状态。
+  _PDG_SVC_SRC=""; _PDG_SVC_MODE=blind
+  # 记录里允许有 QUERY-FAILED(当时那一项就是问不出来)。它是**合法取值**, 不是失败 ——
+  # 但也**不等于**这一份快照将来能完整恢复。如实说出来, 不因为"快照要成功"就把未知说成正常。
+  local _qf; _qf="$(grep -c 'QUERY-FAILED' "$d/svcstate.tsv" 2>/dev/null || true)"
+  if [[ "${_qf:-0}" != 0 ]]; then
+    c_y "  ⚠️ 服务前像里有 $_qf 处 QUERY-FAILED(当时问不出该项状态) —— 回滚时这些项只能登记为无法确认。"
+  fi
+  # 以上全部成立之后, 才置成功标记、打印成功、轮换历史快照。
   _PDG_SNAP_CREATED="$d"
   echo "✅ 快照: $d/snap.tar.gz ($src/$op)"
   ls -1dt "$SNAP_DIR"/*/ 2>/dev/null | tail -n +11 | xargs -r rm -rf   # 只留最近 10 份
@@ -1479,7 +1508,10 @@ _pdg_svcstate_plan(){   # $1=本次要回滚到的快照目录
   _PDG_WANT_EN=(); _PDG_WANT_AC=(); _PDG_WANT_URC=(); _PDG_WANT_ARC=()
   _PDG_SVC_SRC="$sd"; _PDG_SVC_MODE=blind; _PDG_SVC_WHY=""
   f="$sd/svcstate.tsv"
-  if [[ ! -f "$f" ]]; then _PDG_SVC_WHY="这份快照没有服务前像(旧格式)"; return 1; fi
+  # 措辞只陈述**事实与限制**: 这份快照目录里没有 svcstate.tsv, 因此运行态/自启无从按前像恢复。
+  # 不推断成因 —— 早期版本拍的、手工拼的目录、创建之后文件丢失, 都能造成同一个现象,
+  # 从这里看不出是哪一种。以前一概称"旧格式", 把当前版本刚拍的快照也说成旧的。
+  if [[ ! -f "$f" ]]; then _PDG_SVC_WHY="这份快照没有服务前像(目录里缺 svcstate.tsv ⇒ 运行态/自启无从按前像恢复)"; return 1; fi
   if ! _pdg_svcstate_valid "$f"; then _PDG_SVC_WHY="前像不可用: ${_PDG_SVCSTATE_WHY:-未知}"; return 1; fi
   k="$(awk -F'\t' '$1=="snap_dir"{print $2; exit}' "$f")"
   if [[ "$k" != "$sd" ]]; then
@@ -1824,6 +1856,12 @@ cmd_rollback(){
   local unrestored=()                         # 未能恢复项(内核激活/仓库Git); 非空即"未完全回滚"
   # 恢复策略必须在**任何服务动作之前**定好 —— 内核收敛也算服务动作。
   # 这一步只解析与校验前像(并确认它属于正在回滚的这一份快照), 不碰任何服务。
+  #
+  # **回滚是独立的校验阶段**: 同一个进程里, 更新前的那次确认与此刻的回滚不是一回事 ——
+  # 中间机器上发生过什么(记录被改坏、tarball 被换掉)只有现在重读才知道。
+  # _pdg_svcstate_plan 会对"目录与上次相同"直接沿用旧结论, 所以这里先把那条短路清掉,
+  # 强制按**当时选中的这一份快照**重新核验结构与绑定。
+  _PDG_SVC_SRC=""
   _pdg_svcstate_plan "$target" || true
   # daemon-reload 失败必须计入: 后面 enable/start 全建立在它之上, 吞掉它等于谎报回滚成功。
   systemctl daemon-reload || unrestored+=("daemon-reload")
@@ -2627,11 +2665,16 @@ cmd_update(){
     c_y "❌ 更新前快照失败, 中止更新(拒绝在无法回滚的前提下继续)。"; return 1
   fi
   local snap_dir="$_PDG_SNAP_CREATED"                                    # 精确回滚目标(不靠 index 0 猜)
-  # 在**动第一样东西之前**把服务前像存进本次快照目录。存不下就别往下走 ——
-  # 那等于又回到"文件能回滚、服务不能"的老样子。
-  if ! _pdg_save_svcstate "$snap_dir"; then
-    c_y "❌ 服务前像保存失败, 中止更新(拒绝在无法完整回滚的前提下继续)。"; return 1
+  # 前像现在由 cmd_snapshot 在建快照时一并存好并校验过(见那里的注释)。这里**不再重复保存,
+  # 也不重新采样** —— 再采一次会覆盖掉"操作前"那一刻的记录, 而两次采样之间机器状态可能已经变了。
+  # 动第一样已装产品之前, 确认用的就是本次这份快照、且它的前像有效并钉在这一份上。存疑即中止。
+  if [[ ! -f "$snap_dir/svcstate.tsv" ]] || ! _pdg_svcstate_plan "$snap_dir"; then
+    c_y "❌ 本次快照的服务前像不可用(${_PDG_SVC_WHY:-svcstate.tsv 不存在}), 中止更新(拒绝在无法完整回滚的前提下继续)。"
+    return 1
   fi
+  # 这次确认只为"现在能不能动手", 结论**不留给后面的阶段**。失败回滚时会按那一刻的磁盘记录
+  # 重新核验一遍(见 cmd_rollback 里那一处) —— 两者是不同的校验阶段, 不共用结论。
+  _PDG_SVC_SRC=""; _PDG_SVC_MODE=blind
   local pre_sha; pre_sha="$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null)"   # 升级前精确提交, 回滚据此复位仓库
   c_g "拉取最新发布 tag…"
   [[ -d "$REPO_DIR/.git" ]] || { rm -rf "$REPO_DIR"; git clone -q "$REPO_URL" "$REPO_DIR"; }

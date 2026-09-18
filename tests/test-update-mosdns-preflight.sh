@@ -206,8 +206,15 @@ python3(){ case "$*" in *py_compile*) return 0;;
   *doctor.py*) cat "$WORK/doctor.json";; *) command python3 "$@";; esac; }
 mihomo(){ return 0; }
 nft(){ return 0; }
+# 本轮契约变化: 服务前像由 **cmd_snapshot** 保存并校验, cmd_update 只**确认**它可用。
+# 所以这里的 cmd_snapshot 桩也得按新契约产出前像 —— 不产出的话 cmd_update 会在动手之前就中止,
+# 后面所有断言都测不到。SVCSTATE_RC 非 0 时**桩自己也失败**(对应"前像存不下 ⇒ 快照失败")。
+# _pdg_svcstate_plan 是 cmd_update 用来确认的那一步: 文件在且 PLAN_RC=0 才算可用。
+_pdg_svcstate_plan(){ _PDG_SVC_WHY="注入: 前像不可用"; [[ -f "$1/svcstate.tsv" ]] && return "${PLAN_RC:-0}"; return 1; }
 cmd_snapshot(){ echo SNAPSHOT >> "$WORK/side.log"
-  _PDG_SNAP_CREATED="$WORK/snap"; mkdir -p "$_PDG_SNAP_CREATED"; : | gzip > "$_PDG_SNAP_CREATED/snap.tar.gz"; return 0; }
+  _PDG_SNAP_CREATED="$WORK/snap"; mkdir -p "$_PDG_SNAP_CREATED"; : | gzip > "$_PDG_SNAP_CREATED/snap.tar.gz"
+  _pdg_save_svcstate "$_PDG_SNAP_CREATED" || { _PDG_SNAP_CREATED=""; return 1; }
+  return 0; }
 cmd_rollback(){ echo "ROLLBACK $*" >> "$WORK/side.log"; return 0; }
 EOF
 export WORK
@@ -309,9 +316,14 @@ mkrepo "$WORK/repo" real >/dev/null 2>&1
 : > "$WORK/side.log"; : > "$WORK/git.log"
 _nrc=0
 _nout=$(SVCSTATE_RC=1 bash -c "source '$WORK/harness.sh'; source '$WORK/pre.sh'; source '$WORK/upd.sh'; cmd_update" 2>&1) || _nrc=$?
-{ [[ "$_nrc" != 0 ]] && grep -q '服务前像保存失败' <<<"$_nout"; } \
-  && ok "N1: 前像保存失败 ⇒ 中止更新(rc=$_nrc)并点名原因" || bad "N1: 前像失败没挡住(rc=$_nrc): $(tail -2 <<<"$_nout")"
-grep -qE '(^| )reset ' "$WORK/git.log" && bad "N2: 前像保存失败却仍然 reset 了" || ok "N2: 且**没有** reset"
+{ [[ "$_nrc" != 0 ]] && grep -q '快照失败' <<<"$_nout"; } \
+  && ok "N1: 前像存不下 ⇒ 快照创建失败 ⇒ 中止更新(rc=$_nrc)" || bad "N1: 没挡住(rc=$_nrc): $(tail -2 <<<"$_nout")"
+grep -qE '(^| )reset ' "$WORK/git.log" && bad "N2: 前像存不下却仍然 reset 了" || ok "N2: 且**没有** reset"
+: > "$WORK/git.log"; _n2rc=0
+_n2out=$(PLAN_RC=1 bash -c "source '$WORK/harness.sh'; source '$WORK/pre.sh'; source '$WORK/upd.sh'; cmd_update" 2>&1) || _n2rc=$?
+{ [[ "$_n2rc" != 0 ]] && grep -q '服务前像不可用' <<<"$_n2out"; } \
+  && ok "N3: 前像**校验**不过 ⇒ 动手之前中止(rc=$_n2rc)" || bad "N3: 没挡住(rc=$_n2rc): $(tail -2 <<<"$_n2out")"
+grep -qE '(^| )reset ' "$WORK/git.log" && bad "N4: 校验不过却仍然 reset 了" || ok "N4: 且**没有** reset"
 
 echo "────────────────────────────────────────"
 echo "test-update-mosdns-preflight.sh: 通过 $pass, 失败 $nfail"

@@ -22,6 +22,7 @@ command -v git >/dev/null || { echo "[未执行] 没有 git"; exit 1; }
 unshare --map-root-user --mount true 2>/dev/null || { echo "[未执行] 建不出用户命名空间(拿不到 EUID=0), 不退回真 root, 也不冒充通过"; exit 1; }
 WORK="$(mktemp -d)" || { echo "[未执行] 建不出临时目录"; exit 1; }
 trap 'rm -rf "$WORK"' EXIT
+PWNED="$WORK/pwned-sentinel"   # "带 shell 内容"那一格的哨兵: 真被执行才会出现
 
 P=0; F=0; ALOG="$WORK/assert.log"; : > "$ALOG"
 ok(){  printf '[OK]   %s\n' "$1"; P=$((P+1)); printf 'OK\t%s\n' "$1" >> "$ALOG"; }
@@ -105,7 +106,13 @@ rej(){   # $1=说明 $2..=参数
 rej "不存在的 tag"            --ref v9.9.7-nope-TEST
 rej "分支名当版本"            --ref main
 rej "裸 SHA 当版本"           --ref "$C_BRIDGE"
-rej "带 shell 内容"           --ref 'v1.0; touch /tmp/pwned'
+# 这一格喂的是**单个**恶意参数, 不是让它执行。哨兵放在本支自有的临时目录里:
+# 写死 /tmp/pwned 会被临时物卫生守卫判红(它盯的就是写死的 /tmp 路径), 而且真被执行时
+# 会在宿主 /tmp 里留下东西。$PWNED 随 $WORK 一起被 EXIT trap 清掉。
+rej "带 shell 内容"           --ref "v1.0; touch $PWNED"
+[[ ! -e "$PWNED" ]] \
+  && ok "4: 那段 shell 内容**没有被执行**(哨兵未生成: $PWNED)" \
+  || bad "4: 哨兵被创建了 —— 参数里的 shell 内容真的跑了: $PWNED"
 rej "带路径分隔符"            --ref refs/tags/v1.11.15
 rej "--ref 后面没跟值"        --ref
 # tag 存在但 peel 不出提交(指向 blob 的轻量 tag)⇒ 也要停

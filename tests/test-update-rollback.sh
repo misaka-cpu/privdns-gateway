@@ -593,6 +593,89 @@ brc=0; bout=$(runbroken "--dir '$SNAP/H' --git '$GOOD_REF'") || brc=$?
 rm -rf /etc/privdns-gateway/snapid
 
 echo
+echo "══ K. 更新前确认与回滚是**两个**校验阶段(同一进程内) ══"
+# 缺陷的形态是"同一个进程里, 后一阶段沿用了前一阶段的结论"。所以这一节必须在**同一个
+# bash 进程**里跑完: 真前检验 → 确认缓存确实建起来了 → 保持或破坏记录/归档身份 → 真 cmd_rollback。
+# 分两个进程跑的话缓存天然是空的, 什么都没测到(本节上一版就是这么写的)。
+# 缓存也**不由测试去清** —— 那等于替产品把活干了。
+_k_fresh(){   # 每一格都重建一份**绑定自洽**的快照
+  rm -rf "$SNAP/K"
+  mksnap K KCASE || { bad "K-前提: 造不出快照"; return 1; }
+  mkpre "$SNAP/K" || { bad "K-前提: 造不出前像"; return 1; }
+  printf '{"id":"K","source":"cli","op":"update","git_commit":"%s"}\n' "$GOOD_REF" > "$SNAP/K/snapshot.json"
+}
+_k_same(){   # $1=在"前检验之后、回滚之前"执行的变异片段(可空) $2=用哪一份 rollback 壳(默认真身)
+  local mut="$1" rbsh="${2:-$WORK/rollback.sh}"
+  bash -c "source '$WORK/harness.sh'; svc_init enabled active" >/dev/null 2>&1
+  e2e_git "$REPO" reset --hard -q "$HEAD_REF"
+  K_OUT="$(bash -c "
+    source '$WORK/harness.sh'; source '$WORK/model.sh'; source '$rbsh'
+    svc_init enabled active
+    # ① 真前检验(就是 cmd_update 动手之前调的那一个判据函数本身)
+    if _pdg_svcstate_plan '$SNAP/K'; then echo 'KPRE=OK'; else echo 'KPRE=BAD'; fi
+    # ② 确认缓存**确实建立**了 —— 非空且指向这一份快照, 模式是 plan
+    echo \"KCACHE_SRC=\$_PDG_SVC_SRC\"; echo \"KCACHE_MODE=\$_PDG_SVC_MODE\"
+    # ③ 变异(保持不变 / 改坏记录 / 换归档身份)
+    $mut
+    svc_init disabled inactive
+    # ④ 进 cmd_rollback 之前**再看一眼**缓存: 它必须仍是非空、且是此前那次有效前检验留下的
+    echo \"KCACHE_AT_ENTRY=\$_PDG_SVC_SRC\"
+    cmd_rollback --dir '$SNAP/K' --git '$GOOD_REF'; echo \"KRC=\$?\"
+  " 2>&1)"
+  K_RC="$(grep -o 'KRC=[0-9]*' <<<"$K_OUT" | tail -1 | cut -d= -f2)"
+}
+_k_cache_ok(){   # 本格的"缓存确实建立且带进了回滚入口"三条
+  local tag="$1"
+  grep -q 'KPRE=OK' <<<"$K_OUT" && ok "$tag-pre: 真前检验通过" || bad "$tag-pre: 前检验没过"
+  [[ "$(grep -o 'KCACHE_SRC=.*' <<<"$K_OUT" | head -1 | cut -d= -f2-)" == "$SNAP/K" ]] \
+    && ok "$tag-cache: 前检验之后缓存**确实建立**(_PDG_SVC_SRC 指向这一份快照)" \
+    || bad "$tag-cache: 缓存没建立: $(grep -o 'KCACHE_SRC=.*' <<<"$K_OUT" | head -1)"
+  grep -q 'KCACHE_MODE=plan' <<<"$K_OUT" && ok "$tag-mode: 且当时判定为可用(plan)" || bad "$tag-mode: 不是 plan"
+  [[ "$(grep -o 'KCACHE_AT_ENTRY=.*' <<<"$K_OUT" | head -1 | cut -d= -f2-)" == "$SNAP/K" ]] \
+    && ok "$tag-entry: 进 cmd_rollback 入口时缓存**仍非空**(测试没有替它清掉)" \
+    || bad "$tag-entry: 入口处缓存已空 —— 那就不是在测'会不会沿用'"
+}
+echo "  ── K1 健康对照: 记录与归档都不变 ──"
+_k_fresh && _k_same ""
+_k_cache_ok K1
+[[ "$K_RC" == 0 ]] && ok "K1: 什么都没变 ⇒ 回滚正常路径成立(rc=0)" || bad "K1: rc=$K_RC: $(tail -3 <<<"$K_OUT")"
+grep -q '按本次前像恢复' <<<"$K_OUT" && ok "K1b: 且确实是**按前像**恢复" || bad "K1b: 不是按前像"
+echo "  ── K2 前检验通过之后把记录改坏(同进程, 缓存仍在) ──"
+_k_fresh && _k_same "printf 'unit\tbogus\tenabled\t0\tactive\t0\trunning\tX\n' >> '$SNAP/K/svcstate.tsv'"
+_k_cache_ok K2
+[[ "$K_RC" != 0 ]] && ok "K2: 回滚阶段**重新核验**并识别出不可用(rc=$K_RC), 没沿用入口处那份有效缓存" \
+                   || bad "K2: 沿用了旧结论(rc=$K_RC)"
+grep -q '前像不可用' <<<"$K_OUT" && ok "K2b: 并具名: $(grep -o '前像不可用[^;)]*' <<<"$K_OUT" | head -1)" || bad "K2b: 没具名"
+if expect_check_paths "$SNAP/K" etc/privdns-gateway/snapid; then
+  ok "K2c: 文件仍按快照恢复(前像不可用**不**阻断文件这一层)"
+else bad "K2c: 文件没恢复: $EXPECT_WHY"; fi
+grep -q '运行态与自启状态无法确认' <<<"$K_OUT" && ok "K2d: 服务侧**单独**报告为无法确认" || bad "K2d: 没单独报告"
+echo "  ── K3 前检验通过之后换归档身份(内容不变、归档可解) ──"
+_k_fresh && _k_same "cp '$SNAP/K/snap.tar.gz' '$WORK/k-new.tgz' && mv -f '$WORK/k-new.tgz' '$SNAP/K/snap.tar.gz'"
+_k_cache_ok K3
+[[ "$K_RC" != 0 ]] && ok "K3: 回滚阶段识别出**绑定不符**(rc=$K_RC)" || bad "K3: 沿用了旧结论(rc=$K_RC)"
+grep -q '前像钉的快照身份与这一份对不上' <<<"$K_OUT" && ok "K3b: 并点名是绑定不符, 不是格式问题" || bad "K3b: 没点名绑定"
+tar tzf "$SNAP/K/snap.tar.gz" >/dev/null 2>&1 && ok "K3c: 归档仍然可解(换的只是身份, 不是把包弄坏)" || bad "K3c: 归档被弄坏了, 这一格测的就不是绑定"
+echo "  ── K4 撤销对照: 只撤掉**回滚侧**那一行清理 ──"
+# 回滚侧的防护是 cmd_rollback 解析前像之前那一句 _PDG_SVC_SRC=""。把它撤掉, 同进程反例必须失守。
+sed '0,/^  _PDG_SVC_SRC=""$/{/^  _PDG_SVC_SRC=""$/d}' "$WORK/rollback.sh" > "$WORK/rollback-nocache.sh"
+if cmp -s "$WORK/rollback.sh" "$WORK/rollback-nocache.sh"; then
+  bad "K4: 撤销没打上(锚点没命中) —— 这一格不算证据"
+else
+  bash -n "$WORK/rollback-nocache.sh" 2>/dev/null || bad "K4: 撤销版本语法不过"
+  _k_fresh && _k_same "printf 'unit\tbogus\tenabled\t0\tactive\t0\trunning\tX\n' >> '$SNAP/K/svcstate.tsv'" "$WORK/rollback-nocache.sh"
+  { [[ "$K_RC" == 0 ]] && grep -q '按本次前像恢复' <<<"$K_OUT"; } \
+    && ok "K4: 撤掉回滚侧那一行后, **同一反例重新失守**(rc=0 且仍按已失效的旧结论恢复)" \
+    || { bad "K4: 撤销对照没重现(rc=$K_RC)"; printf '%s\n' "$K_OUT" | tail -12 | sed 's/^/        /'; }
+fi
+# 更新侧那道清理是**另一处**防护, 与上面这一处互相独立 —— 不能拿一处的区分力去替另一处背书。
+# 它的位置由源码顺序判(本壳不驱动 cmd_update, 那是 tests/test-update-*.sh 的事)。
+_upd_blk="$(grep -A8 'if \[\[ ! -f "\$snap_dir/svcstate.tsv" \]\]' "$ROOT/deploy/bot/pdg.sh")"
+grep -q '_PDG_SVC_SRC=""' <<<"$_upd_blk" \
+  && ok "K5: 更新侧也有**各自的**清理(cmd_update 前确认之后就把结论清掉) —— 两道防护分别成立, 不互相兜底" \
+  || bad "K5: 更新侧没有自己的清理"
+rm -rf "$SNAP/K"
+
 echo "══ J. 预期清单必须完整且可信 ══"
 # 本节只考**清单这一层**(生成是否完整、比较是否要求全部在场)。J 的夹具文件从没被恢复到
 # 隔离目标里, 所以下面的 EXPECT_WHY 里会附带"/…:不存在"这类条目 —— 那是预料之中的,

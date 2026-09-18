@@ -142,9 +142,86 @@ out=$(printf 'n\n' | pdg rollback 2>&1)
 grep -q '20200101-000000' <<<"$out" && ok "列表里能看到老快照" || bad "5b: 列表没列出来"
 grep -q '来源未知' <<<"$out" && ok "老快照显示「来源未知(旧快照)」" || bad "5c: $(grep 20200101 <<<"$out")"
 grep -qE 'cli/snapshot' <<<"$out" && ok "新快照显示来源/操作" || bad "5d: 新快照没显示来源"
-# 真回滚到老快照: 不能因为缺元数据就被拒
+# 真回滚到老快照。判据全部落在**实际对象**上, 不拿提示当行为; 每一次读取都先确认**观测有效**,
+# 读不出来就判"观测无效", 不让它混进"恢复通过"的比较里。
+[[ ! -f "$OLD/snapshot.json" ]] && ok "5e-前提a: 目录里确实没有 snapshot.json(查文件, 不看提示)" \
+                               || bad "5e-前提a: 竟然有 snapshot.json"
+[[ ! -f "$OLD/svcstate.tsv" ]] && ok "5e-前提b: 目录里确实没有 svcstate.tsv(真历史快照)" \
+                              || bad "5e-前提b: 竟然有 svcstate.tsv"
+_ctl=/etc/privdns-gateway/profile.env
+_ctl_member=etc/privdns-gateway/profile.env
+# ── 从快照里取预期值: 内容摘要 + **精确 mode**(八进制数字, 不是 tar 的字符串) ──
+_obs_ok=1
+_want_sha="$(tar xzOf "$OLD/snap.tar.gz" "$_ctl_member" 2>/dev/null | sha256sum | cut -d' ' -f1)" \
+  || { bad "5e-观测: 从快照读受控文件内容失败"; _obs_ok=0; }
+_tarline="$(tar tvzf "$OLD/snap.tar.gz" "$_ctl_member" 2>/dev/null | head -1)" \
+  || { bad "5e-观测: 从快照读受控文件属性失败"; _obs_ok=0; }
+# tar 的 "-rw-r--r--" 转成八进制: 只认十个字符的权限串, 认不出就是观测无效
+_perm="${_tarline%% *}"
+if [[ "$_perm" =~ ^[-dlbcps]([-r][-w][-xsS]){3}$ ]]; then
+  _o=0; for _i in 1 4 7; do _b=0
+    [[ "${_perm:$_i:1}"   == r ]] && _b=$((_b+4))
+    [[ "${_perm:$((_i+1)):1}" == w ]] && _b=$((_b+2))
+    [[ "${_perm:$((_i+2)):1}" =~ [xs] ]] && _b=$((_b+1))
+    _o=$((_o*8+_b)); done
+  _want_mode="$_o"
+else
+  bad "5e-观测: 快照里那一行权限串认不出($_perm) ⇒ 观测无效"; _obs_ok=0; _want_mode=""
+fi
+[[ -n "$_want_sha" && -n "$_want_mode" ]] || { [[ "$_obs_ok" == 1 ]] && { bad "5e-观测: 预期值读到空值 ⇒ 观测无效"; _obs_ok=0; }; }
+[[ "$_obs_ok" == 1 ]] && ok "5e-观测a: 从快照读到受控文件的预期内容与精确 mode(${_want_mode})"
+# ── 快照之后把它改坏, 并确认**内容与 mode 都确实变了** ──
+if [[ "$_obs_ok" == 1 ]]; then
+  printf 'MARK=broken-after-snapshot\n' >> "$_ctl" || { bad "5e-观测: 改不动受控文件"; _obs_ok=0; }
+  chmod 604 "$_ctl" || { bad "5e-观测: chmod 失败"; _obs_ok=0; }
+fi
+if [[ "$_obs_ok" == 1 ]]; then
+  _broken_sha="$(sha256sum "$_ctl" 2>/dev/null | cut -d' ' -f1)"
+  _broken_mode="$(stat -c '%a' "$_ctl" 2>/dev/null)"
+  if [[ -z "$_broken_sha" || -z "$_broken_mode" ]]; then
+    bad "5e-观测: 改坏之后读不出内容/属性 ⇒ 观测无效"; _obs_ok=0
+  elif [[ "$_broken_sha" == "$_want_sha" || "$_broken_mode" == "$_want_mode" ]]; then
+    bad "5e-观测: 改坏没有产生预期变化(内容或 mode 与快照里的仍相同) ⇒ 这一格测不到恢复"; _obs_ok=0
+  else
+    ok "5e-观测b: 受控文件确实被改坏(内容与 mode 都不同于快照里的 ${_want_mode})"
+  fi
+fi
+# ── Git: 前后各自查, 各自检查退出码与提交身份; 任一侧失败都不判"未变" ──
+_h1=""; _h1_ok=0
+if _h1="$(git -C /opt/privdns-gateway rev-parse HEAD 2>/dev/null)" && [[ "$_h1" =~ ^[0-9a-f]{40}$ ]]; then _h1_ok=1; fi
 out=$(pdg rollback --dir "$OLD" 2>&1); rc=$?
-[[ "$rc" == 0 ]] && ok "老快照可以真回滚(缺元数据不挡)" || bad "5e: rc=$rc: $(tail -3 <<<"$out")"
+_h2=""; _h2_ok=0
+if _h2="$(git -C /opt/privdns-gateway rev-parse HEAD 2>/dev/null)" && [[ "$_h2" =~ ^[0-9a-f]{40}$ ]]; then _h2_ok=1; fi
+# ── 行为: 受控文件逐项相等 ──
+if [[ "$_obs_ok" == 1 ]]; then
+  _got_sha="$(sha256sum "$_ctl" 2>/dev/null | cut -d' ' -f1)"
+  _got_mode="$(stat -c '%a' "$_ctl" 2>/dev/null)"
+  if [[ -z "$_got_sha" || -z "$_got_mode" ]]; then
+    bad "5e-观测: 回滚后读不出受控文件 ⇒ 观测无效, 不做恢复判定"
+  else
+    [[ "$_got_sha" == "$_want_sha" ]] \
+      && ok "5e-文件内容: 与快照里那一份**逐字节相等**" \
+      || bad "5e-文件内容: ${_got_sha:0:12} ≠ 期望 ${_want_sha:0:12}"
+    [[ "$_got_mode" == "$_want_mode" ]] \
+      && ok "5e-文件属性: mode **等于**快照里的 $_want_mode" \
+      || bad "5e-文件属性: 实得 $_got_mode, 期望 $_want_mode"
+  fi
+else
+  bad "5e-文件: 前置观测无效, 本格不给出恢复结论"
+fi
+# ── Git 结果 ──
+if [[ "$_h1_ok" == 1 && "$_h2_ok" == 1 ]]; then
+  [[ "$_h2" == "$_h1" ]] && ok "5e-Git: 操作前后实际 HEAD 相同(${_h1:0:12}) —— 这份没记提交, 仓库就不该动" \
+                         || bad "5e-Git: HEAD 从 ${_h1:0:12} 变成 ${_h2:0:12}"
+else
+  bad "5e-Git: 前($_h1_ok)/后($_h2_ok)查询有一侧无效 ⇒ **不判 HEAD 未变**"
+fi
+# ── 退出码 / 提示 / 服务无法确认, 分别查 ──
+[[ "$rc" != 0 ]] && ok "5e-退出码: 返回非零($rc) —— 不把'无法确认'说成成功" || bad "5e-退出码: rc=$rc"
+grep -q '未完全回滚' <<<"$out" && ok "5e-提示a: 明说未完全回滚" || bad "5e-提示a: $(tail -3 <<<"$out")"
+grep -q '这份快照没有服务前像' <<<"$out" && ok "5e-提示b: 点名缺的是服务前像" || bad "5e-提示b: $(tail -3 <<<"$out")"
+grep -q '运行态与自启状态无法确认' <<<"$out" \
+  && ok "5e-服务: 运行态/自启**如实登记为无法确认**" || bad "5e-服务: 没登记: $(tail -3 <<<"$out")"
 
 # ══ 6. 元数据损坏: 只显示未知, 不扩权、不执行 ══════════════════════════════
 echo; echo "── 6. 损坏的元数据 ──"

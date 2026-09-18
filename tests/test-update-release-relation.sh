@@ -113,8 +113,15 @@ systemctl(){ printf 'systemctl %s\n' "$*" >> "$WORK/side.log"; return 0; }
 python3(){ case "$*" in *py_compile*) return 0;; *doctor.py*) echo '[{"level":"ok","check":"服务","detail":"都在"}]'; return 0;; *) command python3 "$@";; esac; }
 mihomo(){ return 0; }
 nft(){ return 0; }
+# 本轮契约变化: 服务前像由 **cmd_snapshot** 保存并校验, cmd_update 只**确认**它可用。
+# 所以这里的 cmd_snapshot 桩也得按新契约产出前像 —— 不产出的话 cmd_update 会在动手之前就中止,
+# 后面所有断言都测不到。SVCSTATE_RC 非 0 时**桩自己也失败**(对应"前像存不下 ⇒ 快照失败")。
+# _pdg_svcstate_plan 是 cmd_update 用来确认的那一步: 文件在且 PLAN_RC=0 才算可用。
+_pdg_svcstate_plan(){ _PDG_SVC_WHY="注入: 前像不可用"; [[ -f "$1/svcstate.tsv" ]] && return "${PLAN_RC:-0}"; return 1; }
 cmd_snapshot(){ echo "SNAPSHOT_CALLED" >> "$WORK/side.log"
-  _PDG_SNAP_CREATED="$WORK/snap"; mkdir -p "$_PDG_SNAP_CREATED"; : | gzip > "$_PDG_SNAP_CREATED/snap.tar.gz"; return 0; }
+  _PDG_SNAP_CREATED="$WORK/snap"; mkdir -p "$_PDG_SNAP_CREATED"; : | gzip > "$_PDG_SNAP_CREATED/snap.tar.gz"
+  _pdg_save_svcstate "$_PDG_SNAP_CREATED" || { _PDG_SNAP_CREATED=""; return 1; }
+  return 0; }
 cmd_rollback(){ echo "ROLLBACK_CALLED $*" >> "$WORK/side.log"; return 0; }
 EOF
 export WORK
@@ -228,11 +235,19 @@ echo
 echo "══ N. 接线自检: 前像保存这道门没有被替身抹掉 ══"
 # 本轮给本壳补了 _pdg_save_svcstate 的可控替身。替身若写成恒真, "前像保存失败就中止更新"
 # 这条产品契约会静默失效而本壳照样全绿 —— 所以这里用**最小定向反例**直接把它喂失败。
+# 契约位置变了: 前像现在在**建快照**时存并校验, 所以"存不下"表现为**快照创建失败**,
+# cmd_update 据此中止; "校验不过"则由 cmd_update 动手之前那一步确认出来。两条分别喂。
 r=$(run v1.0.0 1 "SVCSTATE_RC=1"); rc="${r%%|*}"; out="${r#*|}"
-{ [[ "$rc" != 0 ]] && grep -q '服务前像保存失败' <<<"$out"; } \
-  && ok "N1: 前像保存失败 ⇒ 中止更新(rc=$rc)并点名原因" || bad "N1: 前像失败没挡住(rc=$rc): $(tail -2 <<<"$out")"
-did_reset && bad "N2: 前像保存失败却仍然 reset 了" || ok "N2: 且**没有** reset —— 这道门确实还在"
-grep -q 'SVCSTATE_SAVE' "$WORK/side.log" && ok "N3: 替身确实被调到(留痕在 side.log, 不是没走到)" || bad "N3: 替身没被调用"
+{ [[ "$rc" != 0 ]] && grep -q '快照失败' <<<"$out"; } \
+  && ok "N1: 前像存不下 ⇒ 快照创建失败 ⇒ 中止更新(rc=$rc)并点名原因" \
+  || bad "N1: 前像存不下没挡住(rc=$rc): $(tail -2 <<<"$out")"
+did_reset && bad "N2: 前像存不下却仍然 reset 了" || ok "N2: 且**没有** reset —— 这道门确实还在"
+grep -q 'SVCSTATE_SAVE' "$WORK/side.log" && ok "N3: 存前像那一步确实被调到(留痕在 side.log)" || bad "N3: 没被调用"
+r=$(run v1.0.0 1 "PLAN_RC=1"); rc="${r%%|*}"; out="${r#*|}"
+{ [[ "$rc" != 0 ]] && grep -q '服务前像不可用' <<<"$out"; } \
+  && ok "N4: 前像**校验**不过 ⇒ cmd_update 在动手之前中止(rc=$rc)并点名原因" \
+  || bad "N4: 校验不过没挡住(rc=$rc): $(tail -2 <<<"$out")"
+did_reset && bad "N5: 校验不过却仍然 reset 了" || ok "N5: 且**没有** reset"
 
 echo "────────────────────────────────────────"
 echo "test-update-release-relation.sh: 通过 $pass, 失败 $nfail"

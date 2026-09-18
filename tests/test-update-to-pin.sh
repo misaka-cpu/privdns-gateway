@@ -111,12 +111,19 @@ systemctl(){ printf 'systemctl %s\n' "$*" >> "$WORK/side.log"; return 0; }
 python3(){ case "$*" in *py_compile*) return 0;; *doctor.py*) echo '[{"level":"ok","check":"服务","detail":"都在"}]'; return 0;; *) command python3 "$@";; esac; }
 mihomo(){ return 0; }
 nft(){ return 0; }
+# 本轮契约变化: 服务前像由 **cmd_snapshot** 保存并校验, cmd_update 只**确认**它可用。
+# 桩也照此产出前像; SVCSTATE_RC 非 0 时桩自己失败(= 前像存不下 ⇒ 快照失败),
+# PLAN_RC 非 0 时确认那一步不过(= 前像校验失败)。
+_pdg_svcstate_plan(){ _PDG_SVC_WHY="注入: 前像不可用"; [[ -f "$1/svcstate.tsv" ]] && return "${PLAN_RC:-0}"; return 1; }
 cmd_snapshot(){ echo "SNAPSHOT_CALLED" >> "$WORK/side.log"
   _PDG_SNAP_CREATED="$WORK/snap"; mkdir -p "$_PDG_SNAP_CREATED"; : | gzip > "$_PDG_SNAP_CREATED/snap.tar.gz"
+  _pdg_save_svcstate "$_PDG_SNAP_CREATED" || { _PDG_SNAP_CREATED=""; return 1; }
   # MOVE_TAG_AT_SNAP: 在快照这一刻把钉的 tag 挪到别的提交上 —— 复现"目标在过程中被移动"。
   [[ -n "${MOVE_TAG_AT_SNAP:-}" ]] && command git -C "$REPO_DIR" tag -f -a "$MOVE_TAG_AT_SNAP" -m moved HEAD >/dev/null 2>&1
   return 0; }
-_pdg_save_svcstate(){ echo "SVCSTATE_SAVED" >> "$WORK/side.log"; return 0; }
+_pdg_save_svcstate(){ echo "SVCSTATE_SAVED" >> "$WORK/side.log"
+  [[ -n "${1:-}" && -d "${1:-}" ]] && printf 'modeled-svcstate\n' > "$1/svcstate.tsv"
+  return "${SVCSTATE_RC:-0}"; }
 cmd_rollback(){ echo "ROLLBACK_CALLED $*" >> "$WORK/side.log"; return 0; }
 EOF
 export WORK
