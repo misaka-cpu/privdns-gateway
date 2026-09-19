@@ -457,10 +457,12 @@ state_diff(){   # $1=before 标签  $2=after 标签  $3=场景名
 # 从不安装的名字 —— 上一轮 e2e_reset_box 的合并命令里恰好有它们, 在真 systemd 下
 # "列表里有不存在的 unit" 会让整条 `disable --now` 返回非 0, 既有 unit 未必真被停,
 # 而那条命令的返回值被 `|| true` 吞掉 ⇒ 进入下一场景时 pdg-mitm 还在跑(H6)。
+# >>> PDG-EXTRACT-BEGIN E2E_OWNED_UNITS
 E2E_OWNED_UNITS=(pdg-mitm.service pdg-bot.service pdg-probe81.service
                  mosdns.service mihomo.service pdg-dotwitness.service
                  pdg-health.service pdg-health.timer
                  pdg-rules-update.service pdg-rules-update.timer)
+# <<< PDG-EXTRACT-END E2E_OWNED_UNITS
 
 # 逐个 unit 复位, 每个动作留自己的退出码并**立刻复核真实状态**。不吞失败。
 # >>> PDG-EXTRACT-BEGIN reset_units_strict
@@ -878,8 +880,10 @@ svc_class(){   # $1=unit → 打印 "<类别>|<原因>"
 }
 # <<< PDG-EXTRACT-END svc_class
 # 被观察的服务集合: 允许清单里的 + 几个**本轮从不安装、因此绝不该变**的见证者。
+# >>> PDG-EXTRACT-BEGIN SVC_WATCH
 SVC_WATCH=(mosdns mihomo pdg-bot pdg-probe81 pdg-dotwitness pdg-health.timer pdg-mitm
            sing-box pdg-rescue.socket ssh cron)
+# <<< PDG-EXTRACT-END SVC_WATCH
 # >>> PDG-EXTRACT-BEGIN svc_snapshot
 svc_snapshot(){   # $1=落点文件
   local u

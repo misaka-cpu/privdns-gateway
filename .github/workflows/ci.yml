@@ -1119,6 +1119,11 @@ jobs:
       - name: "桥接验收的函数抽取契约 (heredoc 不截断/边界不对就拒绝/失败即阻断)"
         run: bash tests/test-bridge-extract-contract.sh
 
+      # 抽得到只是第一步: 抽来的东西得**真被消费**, 判据得**真有区分力**。这一支盯三处观测缺口
+      # (依赖自检/保留项与 schema/服务归类与观测有效性), 外加空 --ref 的定点复现。
+      - name: "桥接验收的观测契约 (空数组顶不上/零台账不算保留/查询失败不写成空状态/空 --ref 复现)"
+        run: bash tests/test-bridge-observation-contract.sh
+
       # 定性 e2e-platform-switch.sh §6 的红灯: 那里的注入让**每一次** `nft -c` 都失败, 而
       # cmd_rollback 在铺开快照之前自己就要 `nft -c` 校验快照里的 nftables.conf —— 于是恢复
       # 在它自己的安全门上中止。这支把"只坏前向"与"连恢复条件一起坏"分成两例, 分别核验:
@@ -2109,7 +2114,7 @@ jobs:
             && (github.event.inputs.real_scope == 'bridge') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 50
-    name: "真实验收②: v1.11.15 → 桥接版(公开入口 install.sh --ref)"
+    name: "真实验收②: v1.11.15 → 桥接版(桥接入口流程: 核验副本 → pdg.sh update --to)"
     steps:
       - uses: actions/checkout@v5
         with:
@@ -2162,8 +2167,12 @@ jobs:
       # 放在这里而不是 lint 后段 —— 后者可能因为别的红灯根本跑不到。
       - name: "前置: 函数抽取契约 (标记唯一成对/片段与组合语法/抽不对就阻断)"
         run: bash tests/test-bridge-extract-contract.sh
+      # 同样排在验收之前: 上一次(run 34978387896)抽取过了, 但 E2E_OWNED_UNITS 没抽,
+      # set -u 直接把前像打断。这一支把"依赖缺失/集合不全/查询失败"三种盲区挡在前像之前。
+      - name: "前置: 观测契约 (依赖自检/保留项台账/服务归类与观测有效性)"
+        run: bash tests/test-bridge-observation-contract.sh
 
-      - name: "真实验收②: 公开入口 install.sh --ref 把 v1.11.15 升到桥接版"
+      - name: "真实验收②: 按 docs/BRIDGE-ENTRY.md 的入口流程把 v1.11.15 升到桥接版(从核验过的副本跑 update --to)"
         env:
           PDG_E2E_ISOLATED: "1"
           PDG_REAL_MIGRATION_OK: "1"
