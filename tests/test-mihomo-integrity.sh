@@ -191,10 +191,39 @@ PDG_CORE_BINDIR="$BIN"; PDG_RUNTIME_DIR="$RT"
 need_root(){ :; }; _lock(){ :; }; c_g(){ echo "\$*"; }; c_y(){ echo "\$*"; }; sleep(){ :; }
 _pdg_platform(){ echo android; }; _pdg_core(){ echo mihomo; }; _pdg_bot_cred(){ echo unset; }
 pdg_fetch_release_tags(){ return 0; }
+# ── 快照产出与前像确认: **可控替身**, 两个都是模型 ──────────────────────────
+# 本分支的契约: 服务前像由 cmd_snapshot 保存并校验, cmd_update 只**确认**它可用 ——
+# 缺 svcstate.tsv 或 _pdg_svcstate_plan 不过, 就在动第一样东西之前中止(见 pdg.sh)。
+# 原来这个壳只造 snap.tar.gz、也没有 _pdg_svcstate_plan 的定义, 于是 cmd_update 卡在那道
+# 门上, 根本走不到换核 —— 第 4 节测的东西整个落空。
+#
+# 这两个替身**明确是模型**: 它们不读 systemctl、不代表真实服务前像已验收(那属于真实
+# systemd 验收与 test-update-rollback / bridge-scope 那几支)。这里只是把"快照产出"和
+# "前像确认"这两个前置条件接上, 让第 4 节能问它真正要问的那个问题。
+# 也**不能**写成恒真: 那等于把生产的两道门从壳里抹掉。沿用 relation/preflight 两支已有
+# 的做法 —— 默认成功且留痕, SVCSTATE_RC / PLAN_RC 两个旋钮可以按码喂失败;
+# PLAN_ALWAYS_OK 只给"定向撤销对照"那一格用, 用来证明这个替身本身不是恒真。
+_pdg_save_svcstate(){
+  printf 'SVCSTATE_SAVE %s rc=%s\n' "\${1:-<无参>}" "\${SVCSTATE_RC:-0}" >> "$WORK/side.log"
+  [[ -n "\${1:-}" && -d "\${1:-}" ]] && printf 'modeled-svcstate\n' > "\$1/svcstate.tsv"
+  return "\${SVCSTATE_RC:-0}"
+}
+_pdg_svcstate_plan(){
+  if [[ "\${PLAN_ALWAYS_OK:-0}" == 1 ]]; then echo "PLAN always-ok" >> "$WORK/side.log"; return 0; fi
+  printf 'PLAN %s rc=%s\n' "\${1:-<无参>}" "\${PLAN_RC:-0}" >> "$WORK/side.log"
+  if [[ ! -f "\$1/svcstate.tsv" ]]; then _PDG_SVC_WHY="svcstate.tsv 不存在(模型)"; return 1; fi
+  _PDG_SVC_WHY="前像确认不通过(模型注入)"
+  return "\${PLAN_RC:-0}"
+}
 cmd_snapshot(){ echo SNAPSHOT >> "$WORK/side.log"
   _PDG_SNAP_CREATED="$WORK/snap"; mkdir -p "\$_PDG_SNAP_CREATED"
-  : | gzip > "\$_PDG_SNAP_CREATED/snap.tar.gz"; return 0; }
+  : | gzip > "\$_PDG_SNAP_CREATED/snap.tar.gz"
+  # 前像存不下 ⇒ 这次快照就不算成功(与生产同形: 前像是快照的一部分)
+  _pdg_save_svcstate "\$_PDG_SNAP_CREATED" || { _PDG_SNAP_CREATED=""; return 1; }
+  return 0; }
 cmd_rollback(){ echo ROLLBACK >> "$WORK/side.log"; return 0; }
+# 动没动现役仓库要看得见: reset 是"已经开始动手"的分界线。
+git(){ printf 'git %s\n' "\$*" >> "$WORK/git.log"; command git "\$@"; }
 _update_core_binary(){ echo CORE_STEP >> "$WORK/side.log"; return 0; }
 _update_mosdns_binary(){ return 0; }
 install(){ echo "install \$*" >> "$WORK/side.log"; return 0; }
@@ -204,14 +233,86 @@ mihomo(){ return 0; }; nft(){ return 0; }
 bash(){ [[ "\$*" == *__migrate* ]] && { echo migrate >> "$WORK/side.log"; return 0; }; command bash "\$@"; }
 _pdg_bot_cred(){ echo unset; }
 EOF
-: > "$WORK/side.log"
-out=$(PATH="$WORK/shadow:$PATH" bash -c "source '$WORK/h.sh'; source '$WORK/upd.sh'; cmd_update" 2>&1) || true
-printf '%s\n' "$out" > "$WORK/upd.out"
-if grep -q CORE_STEP "$WORK/side.log"; then
-  ok "内核内容漂移时 update 不再被「已是最新」短路挡住(走到了换核这一步)"
+# ── 执行有效性先于结论 ────────────────────────────────────────────────────────
+# 抽出来的产品片段与壳都得先过 bash -n。语法不过、函数没定义、变量没绑定, 这些都会让
+# cmd_update 在半路非零退出 —— 那时"没到换核"是壳坏了, 不是产品短路, 两者处置完全不同。
+bash -n "$WORK/upd.sh" 2>"$WORK/n-upd.err" \
+  && ok "4-0a: 抽出的 cmd_update 片段语法通过" \
+  || bad "4-0a: 抽出的片段语法不过 —— 本节结论无效: $(head -2 "$WORK/n-upd.err" | tr '\n' ' ')"
+bash -n "$WORK/h.sh" 2>"$WORK/n-h.err" \
+  && ok "4-0b: 壳语法通过" \
+  || bad "4-0b: 壳语法不过 —— 本节结论无效: $(head -2 "$WORK/n-h.err" | tr '\n' ' ')"
+
+C4_OUT=""; C4_RC=0
+_c4(){   # $@ = 形如 VAR=值 的旋钮; 结果落在 C4_OUT / C4_RC 与 side.log / git.log
+  : > "$WORK/side.log"; : > "$WORK/git.log"
+  C4_RC=0
+  C4_OUT=$(env "$@" PATH="$WORK/shadow:$PATH" \
+           bash -c "source '$WORK/h.sh'; source '$WORK/upd.sh'; cmd_update" 2>&1) || C4_RC=$?
+  printf '%s\n' "$C4_OUT" > "$WORK/upd.out"
+}
+# 诊断干净 = 没有"壳坏了"的三种症状。它们一旦出现, 本格无论走没走到 CORE_STEP 都不算数。
+_c4_clean(){ ! grep -qE 'command not found|未找到命令|unbound variable|syntax error' <<<"$C4_OUT"; }
+# 还一样东西都没动: 没换核、没装文件、没动现役仓库的 ref
+_c4_untouched(){
+  ! grep -q CORE_STEP "$WORK/side.log" \
+  && ! grep -q '^install ' "$WORK/side.log" \
+  && ! grep -qE '(^| )reset ' "$WORK/git.log"
+}
+_c4_tail(){ tail -3 "$WORK/upd.out" | tr '\n' ' '; }
+
+# ── 4a 健康前提: same 但内核内容漂移 ⇒ 必须走到换核 ──────────────────────────
+# 这一格只证明**更新编排能够到达换核这一步**。它不是"update 全流程成功"的验收:
+# 快照、前像、迁移、三道校验门、doctor 自检门在这个壳里都是替身或模型。
+_c4
+if ! _c4_clean; then
+  bad "4a: 壳自身出错(command not found / unbound variable / syntax error), 结论无效: $(_c4_tail)"
+elif grep -q CORE_STEP "$WORK/side.log"; then
+  ok "4a: 内核内容漂移时 update 不再被「已是最新」短路挡住(走到了换核这一步; cmd_update rc=$C4_RC)"
+  # 退出码单独核对: 到达换核之后要么一路走完(rc=0), 要么停在**点得出名字**的那一处。
+  # 不把任意非零当预期 —— 那会把"壳半路炸了"读成"受控终止"。
+  if [[ "$C4_RC" == 0 ]]; then
+    ok "4a-rc: cmd_update 在本壳里一路返回 0(替身齐备时没有受控终止)"
+  elif grep -qE '回滚到更新前快照|中止更新' <<<"$C4_OUT"; then
+    ok "4a-rc: cmd_update 以**点了名的**受控终止收场(rc=$C4_RC): $(grep -m1 -E '回滚到更新前快照|中止更新' <<<"$C4_OUT")"
+  else
+    bad "4a-rc: rc=$C4_RC 但输出里没有任何点得出名字的终止 —— 不按预期失败记: $(_c4_tail)"
+  fi
 else
-  bad "内核内容漂移时没走到换核这一步。链路末尾: $(tail -3 <<<"$out" | tr '\n' ' ')"
+  bad "4a: 内核内容漂移时没走到换核这一步(rc=$C4_RC)。链路末尾: $(_c4_tail)"
 fi
+
+# ── 4b 快照/前像产出失败 ⇒ 在安装与换核之前就停 ──────────────────────────────
+_c4 SVCSTATE_RC=1
+{ [[ "$C4_RC" != 0 ]] && grep -q '快照失败' <<<"$C4_OUT" && _c4_clean; } \
+  && ok "4b: 前像存不下 ⇒ 快照不算成功 ⇒ 中止更新(rc=$C4_RC)" \
+  || bad "4b: 没按'快照失败'挡住(rc=$C4_RC): $(_c4_tail)"
+_c4_untouched \
+  && ok "4b-2: 且此时**没有**换核、没有装文件、没有动现役仓库 ref" \
+  || bad "4b-2: 已经动手了 —— side.log: $(tr '\n' ' ' < "$WORK/side.log") git.log: $(tr '\n' ' ' < "$WORK/git.log")"
+
+# ── 4c 文件在、但前像**确认**不过 ⇒ 同样提前停, 且点明原因 ────────────────────
+_c4 PLAN_RC=1
+{ [[ "$C4_RC" != 0 ]] && grep -q '服务前像不可用' <<<"$C4_OUT" && _c4_clean; } \
+  && ok "4c: 前像确认不过 ⇒ 动手之前中止(rc=$C4_RC)" \
+  || bad "4c: 没按'服务前像不可用'挡住(rc=$C4_RC): $(_c4_tail)"
+grep -q '前像确认不通过(模型注入)' <<<"$C4_OUT" \
+  && ok "4c-2: 中止文案点明了原因(带出 _PDG_SVC_WHY, 不是一句笼统的失败)" \
+  || bad "4c-2: 中止文案没带出原因: $(grep -m1 '服务前像不可用' <<<"$C4_OUT" || echo 无)"
+grep -q "^PLAN $WORK/snap " "$WORK/side.log" \
+  && ok "4c-3: 确认这一步确实被调到, 且参数是本次那份快照目录" \
+  || bad "4c-3: 没有 PLAN 留痕(替身没被调到?): $(tr '\n' ' ' < "$WORK/side.log")"
+_c4_untouched \
+  && ok "4c-4: 且此时**没有**换核、没有装文件、没有动现役仓库 ref" \
+  || bad "4c-4: 已经动手了 —— side.log: $(tr '\n' ' ' < "$WORK/side.log") git.log: $(tr '\n' ' ' < "$WORK/git.log")"
+
+# ── 4d 定向撤销对照: 把前像确认的替身改成恒真, 4c 的拦截必须随之消失 ──────────
+# 撤的是**替身的可控性**(产品一个字节不动)。4c 的红要是与这道门无关, 这里就不会有变化 ——
+# 那说明上面拦住更新的是别的东西, 4c 的区分力是假的。
+_c4 PLAN_RC=1 PLAN_ALWAYS_OK=1
+{ ! grep -q '服务前像不可用' <<<"$C4_OUT" && grep -q CORE_STEP "$WORK/side.log" && _c4_clean; } \
+  && ok "4d: 替身恒真后同一次运行不再被前像门拦住, 并走到了换核 ⇒ 4c 拦的确实是那道门" \
+  || bad "4d: 撤销对照没生效(rc=$C4_RC) —— 4c 的区分力未验: $(_c4_tail)"
 
 echo "────────────────────────────────────────"
 echo "$(basename "$0"): 通过 $pass, 失败 $nfail"
