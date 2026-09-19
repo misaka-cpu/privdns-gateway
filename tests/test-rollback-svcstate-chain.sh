@@ -207,10 +207,26 @@ run_chain(){   # $1=场景目录
       echo "printf 'FINAL\t$u\t%s\t%s\n' \"\$(cat \"$SC/$u.en\" 2>/dev/null)\" \"\$(cat \"$SC/$u.ac\" 2>/dev/null)\""
     done
   } > "$d/chain.sh"
-  # tee 留证(退役线带来的)。**必须把退出码带回来**: 管道的状态是 tee 的, 不是链本身的 ——
-  # 直接 `| tee` 会让"链跑挂了"与"链跑完了"在返回值上不可区分。
+  # 留证与被测结果**分开结算**。本支开着 pipefail:
+  #   · 只返回管道值 → 链跑挂了与 tee 写不下去在返回值上混成一个, 而且会把**留证故障**
+  #     报成"产品恢复失败";
+  #   · 只返回 PIPESTATUS[0] → 又把 tee 失败整个吞掉, 证据没留下却一切看着正常。
+  # 所以两边各记各的: 链的码是**被测结果**, tee 的码是**留证**的成败, 文案也分开。
+  # PIPESTATUS **只对紧接着的那一条命令有效**, 而且第一次赋值就会把它重置 ——
+  # 先 CHAIN_RC="${PIPESTATUS[0]}" 再读 [1], 在 set -u 下直接是 unbound variable。
+  # 所以整个数组一次性拷出来再分别取。
+  CHAIN_RC=0; TEE_RC=0
   bash "$d/chain.sh" 2>&1 | tee "$d/chain.out"
-  return "${PIPESTATUS[0]}"
+  local _ps=("${PIPESTATUS[@]}")
+  CHAIN_RC="${_ps[0]}"; TEE_RC="${_ps[1]}"
+  if [[ "$TEE_RC" != 0 ]]; then
+    echo "[留证失败] tee 写 $d/chain.out 返回 $TEE_RC —— 这是**留证**故障, 与产品的恢复结果无关" >&2
+  fi
+  # 链自己失败时**保留链的码**(留证成不成都不改写它);
+  # 链没问题但证据没留下, 仍判非零, 用专属码 90 与产品失败区分开。
+  [[ "$CHAIN_RC" != 0 ]] && return "$CHAIN_RC"
+  [[ "$TEE_RC"   != 0 ]] && return 90
+  return 0
 }
 plain(){ sed 's/\x1b\[[0-9;]*m//g' <<<"$1"; }
 fin(){ grep -P "^FINAL\t$2\t" <<<"$1" | cut -f3,4 | tr '\t' '/'; }
@@ -309,6 +325,39 @@ cat <<'NOTE'
   systemctl                         → 未覆盖: 真实 systemd 的状态机与时序
   ⇒ 这一支证明的是**编排顺序与状态判据**, 不是真实 systemd 行为。
 NOTE
+echo
+echo "══ R. 留证与被测结果分开结算(四种组合各验一次)══"
+# 直接驱动 run_chain 那一段的**同一套记账规则**: 造一个可控的 chain.sh 与可控的 tee 落点,
+# 四种组合分别核 CHAIN_RC / TEE_RC 与最终返回值。不改被测实现, 只把它的记账拿出来跑。
+_rd="$WORK/rcacct"; mkdir -p "$_rd"
+_acct(){   # $1=链退出码 $2=留证是否可写(ok/bad) → 打印 "chain=<> tee=<> rc=<>"
+  printf '#!/bin/sh\necho CHAIN-OUT\nexit %s\n' "$1" > "$_rd/chain.sh"
+  local out="$_rd/chain.out"
+  if [[ "$2" == bad ]]; then rm -rf "$out"; mkdir -p "$out"   # 目标是目录 ⇒ tee 写不进去
+  else rm -rf "$out"; fi
+  local CHAIN_RC=0 TEE_RC=0 rc=0
+  ( set -uo pipefail
+    bash "$_rd/chain.sh" 2>&1 | tee "$out"
+    _p=("${PIPESTATUS[@]}"); c="${_p[0]}"; e="${_p[1]}"
+    printf 'chain=%s tee=%s\n' "$c" "$e" >&2
+    [[ "$c" != 0 ]] && exit "$c"
+    [[ "$e" != 0 ]] && exit 90
+    exit 0 ) >/dev/null 2>"$_rd/err"
+  rc=$?
+  printf '%s rc=%s\n' "$(cat "$_rd/err" | grep -o 'chain=[0-9]* tee=[0-9]*' | tail -1)" "$rc"
+}
+_r1="$(_acct 0 ok)";  [[ "$_r1" == "chain=0 tee=0 rc=0" ]] \
+  && ok "R1: 链 0 + 留证 0 ⇒ 成功($_r1)" || bad "R1: 实得 $_r1"
+_r2="$(_acct 7 ok)";  [[ "$_r2" == "chain=7 tee=0 rc=7" ]] \
+  && ok "R2: 链 7 + 留证 0 ⇒ **保留链的失败码 7**(不被留证成功冲掉)($_r2)" || bad "R2: 实得 $_r2"
+_r3="$(_acct 0 bad)"; [[ "$_r3" == "chain=0 tee=1 rc=90" ]] \
+  && ok "R3: 链 0 + 留证失败 ⇒ 仍判非零, 且用专属码 90 标明是**留证**失败($_r3)" || bad "R3: 实得 $_r3"
+_r4="$(_acct 7 bad)"; [[ "$_r4" == "chain=7 tee=1 rc=7" ]] \
+  && ok "R4: 两边都失败 ⇒ 返回值保留**链**的 7, 留证失败另行记账($_r4)" || bad "R4: 实得 $_r4"
+grep -q '留证失败' <<<"$(sed -n '/留证失败/p' "$0")" \
+  && ok "R5: 留证失败有自己的文案, 没有归进产品恢复失败" || bad "R5: 留证失败的文案没分开"
+rm -rf "$_rd"
+
 echo "────────────────────────────────────────"
 echo "通过 $pass, 失败 $nfail"
 [[ "$nfail" == 0 ]]

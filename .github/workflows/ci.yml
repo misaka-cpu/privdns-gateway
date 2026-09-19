@@ -1121,10 +1121,20 @@ jobs:
         run: |
           set -euo pipefail
           BR=9c9b2681f3ada2155b32ebe372cbc2a154792079
-          git cat-file -e "$BR^{commit}" || { echo "取不到冻结桥接对象 $BR"; exit 1; }
-          d="$(mktemp -d)"; git archive "$BR" | tar -x -C "$d"
-          echo "在隔离副本 $d 上跑桥接那一版自己的边界守卫(证据归属: 桥接候选 $BR)"
-          ( cd "$d" && bash tests/test-svcstate-bridge-scope.sh )
+          BASE=242602c17bd92900df81f468aae8c66e18c7a4ff   # v1.11.15 peeled: 守卫要比的真实基线
+          git cat-file -e "$BR^{commit}"   || { echo "取不到冻结桥接对象 $BR"; exit 1; }
+          git cat-file -e "$BASE^{commit}" || { echo "取不到冻结基线对象 $BASE"; exit 1; }
+          d="$(mktemp -d)"; b="$(mktemp)"
+          # 副本与基线都用完就清 —— 失败路径也要清, 所以挂 trap, 不靠 runner 一次性兜底。
+          trap 'rm -rf "$d" "$b"' EXIT
+          git archive "$BR" | tar -x -C "$d"
+          # 基线**必须**来自真实基线对象: 不拿当前候选充数, 取不到或取到空就当场失败,
+          # 不跳过、不降级 —— 守卫少了基线就只剩一半判据(实测: 18/0 跳过 2)。
+          git show "$BASE:deploy/bot/pdg.sh" > "$b"
+          test -s "$b" || { echo "基线 pdg.sh 取到的是空文件($BASE)"; exit 1; }
+          echo "隔离副本 $d; 基线 $BASE 的 pdg.sh $(wc -c < "$b") 字节"
+          echo "证据归属: 桥接候选 $BR 的边界, **不代表**当前退役候选"
+          ( cd "$d" && PDG_BASELINE="$b" bash tests/test-svcstate-bridge-scope.sh )
 
       # 整合接缝: 前像函数不许重复、保存责任只有 cmd_snapshot 一处、三个消费者只确认不再采样,
       # 两侧各自的修复都还在, 调用方门的 holder 判据没有被改宽。

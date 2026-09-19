@@ -66,10 +66,20 @@ for c in cmd_update cmd_platform cmd_migrate; do
 done
 
 echo; echo "══ 三. 确认排在各自第一处破坏性动作之前 ══"
+# 顺序判据比**第一处**: 用最后一处的话, 在确认之前塞一处动作、把原来那处留在后面,
+# 判据照样绿 —— 实测过, 三条顺序判据都能被这样绕过去。
+# 另外"抽不到函数体"与"找不到目标动作"一律判红, 不许因为找不到而默认通过。
 _before(){   # $1=函数 $2=破坏性动作的正则 $3=说明
   local b; b="$(fnbody "$1")"
-  awk -v pat="$2" '/_pdg_svcstate_plan/{p=NR} $0~pat{d=NR} END{exit !(p&&d&&p<d)}' <<<"$b" \
-    && ok "3: $1 的确认排在 $3 之前" || bad "3: $1 的确认没有排在 $3 之前"
+  if [[ -z "$b" ]]; then bad "3: 抽不到 $1 的函数体 —— 这一条判据无效"; return; fi
+  local pfirst dfirst
+  pfirst="$(awk '/_pdg_svcstate_plan/{print NR; exit}' <<<"$b")"
+  dfirst="$(awk -v pat="$2" '$0~pat{print NR; exit}' <<<"$b")"
+  if [[ -z "$pfirst" ]]; then bad "3: $1 里根本没有前像确认 —— 判据无效"; return; fi
+  if [[ -z "$dfirst" ]]; then bad "3: $1 里找不到目标动作($3) —— 判据失去依据, 不按通过记"; return; fi
+  [[ "$pfirst" -lt "$dfirst" ]] \
+    && ok "3: $1 的确认(第 $pfirst 行)排在**第一处** $3(第 $dfirst 行)之前" \
+    || bad "3: $1 的确认在第 $pfirst 行, 而**第一处** $3 在第 $dfirst 行 —— 顺序不对"
 }
 _before cmd_update   'bash /usr/local/bin/pdg __migrate' '迁移子进程'
 _before cmd_update   'install -m755'                      '第一处 install'
@@ -78,7 +88,20 @@ _before cmd_migrate  'run_all_migrations'                'run_all_migrations'
 
 echo; echo "══ 四. 两侧各自的修复都还在 ══"
 _has(){ grep -qF -- "$2" "$PDG" && ok "4: $1" || bad "4: $1 —— 合并把它丢了"; }
-_has "桥接: 回滚是独立校验阶段(强制重读前像)" '_PDG_SVC_SRC=""'
+# 限定到 cmd_rollback **内部**并核顺序: 全文件 grep 会被别处的同名赋值顶掉 ——
+# 实测把 cmd_rollback 入口那处清缓存撤掉, 全文件判据照样绿。
+_RB="$(fnbody cmd_rollback)"
+if [[ -z "$_RB" ]]; then
+  bad "4: 抽不到 cmd_rollback 的函数体 —— 这一条判据无效"
+else
+  _rb_clr="$(awk '/_PDG_SVC_SRC=""/{print NR; exit}' <<<"$_RB")"
+  _rb_plan="$(awk '/_pdg_svcstate_plan "\$target"/{print NR; exit}' <<<"$_RB")"
+  if [[ -z "$_rb_plan" ]]; then bad "4: cmd_rollback 里找不到 _pdg_svcstate_plan \"\$target\" —— 判据失去依据"
+  elif [[ -z "$_rb_clr" ]]; then bad "4: 桥接: 回滚是独立校验阶段(强制重读前像)—— cmd_rollback 里没有清缓存那一句"
+  elif [[ "$_rb_clr" -lt "$_rb_plan" ]]; then
+    ok "4: 桥接: 回滚是独立校验阶段 —— cmd_rollback 在解析前像(第 $_rb_plan 行)之前先清了缓存(第 $_rb_clr 行)"
+  else bad "4: 清缓存在第 $_rb_clr 行, 却排在解析(第 $_rb_plan 行)之后 —— 等于没清"; fi
+fi
 _has "桥接: 回滚目录路径表示归一(去尾斜杠)" 'while [[ "$target" == */ && "$target" != / ]]'
 _has "桥接: 钉版目标贯穿到实际安装" '钉版目标已贯穿到实际安装'
 _has "桥接: 快照缺前像的措辞只陈述事实" '这份快照没有服务前像(目录里缺 svcstate.tsv'
@@ -88,8 +111,27 @@ done
 for f in _retire_caller_gate migrate_wloc_retire _retire_ios_schema _plat_purge_retired; do
   [[ "$(fnline "$f" | grep -c .)" == 1 ]] && ok "4: 退役: $f 在" || bad "4: 退役: $f 缺失或重复"
 done
-# dry-run 仍持锁: 预览不是"只读看看", 它会取件并动现役仓库的 ref
-grep -q '_lock' <<<"$(fnbody cmd_update)" && ok "4: cmd_update(含 --dry-run 预览)仍在锁内" || bad "4: cmd_update 不再持锁"
+# dry-run 仍持锁: 预览不是"只读看看", 它会写现役仓库的 FETCH_HEAD 与 refs/tags。
+# 判据必须落在**那条分支内**、且锁排在**第一次取件之前** —— 只在整个 cmd_update 里
+# grep 一个 _lock 的话, 执行路径那把锁会替 dry-run 顶包(实测撤掉 dry-run 的锁仍全绿)。
+_UP="$(fnbody cmd_update)"
+if [[ -z "$_UP" ]]; then
+  bad "4: 抽不到 cmd_update 的函数体 —— dry-run 持锁判据无效"
+else
+  _dr="$(awk '/if \[\[ "\$\{1:-\}" == "--dry-run" \]\]; then/{print NR; exit}' <<<"$_UP")"
+  if [[ -z "$_dr" ]]; then bad "4: cmd_update 里找不到 --dry-run 分支 —— 判据失去依据"
+  else
+    # 只认**真正的调用**: 注释里也提到 pdg_fetch_release_tags(解释为什么要上锁),
+    # 把注释算进去的话锁永远"排在取件之后"。
+    _fetch="$(awk -v s="$_dr" 'NR>s && $0 !~ /^ *#/ && /pdg_fetch_release_tags/{print NR; exit}' <<<"$_UP")"
+    _lk="$(awk -v s="$_dr" 'NR>s && /^ *_lock *$/{print NR; exit}' <<<"$_UP")"
+    if [[ -z "$_fetch" ]]; then bad "4: --dry-run 分支里找不到取件调用 —— 判据失去依据"
+    elif [[ -z "$_lk" ]]; then bad "4: --dry-run 分支里没有 _lock —— 预览会在无锁状态下写现役仓库的 git 元数据"
+    elif [[ "$_lk" -lt "$_fetch" ]]; then
+      ok "4: 桥接: --dry-run 分支自己持锁(第 $_lk 行), 且排在第一次取件(第 $_fetch 行)之前"
+    else bad "4: --dry-run 的锁在第 $_lk 行, 排在取件(第 $_fetch 行)之后 —— 取件那一刻还没上锁"; fi
+  fi
+fi
 
 echo; echo "══ 五. 调用方门的 holder 判据没有被改宽 ══"
 G="$(fnbody _retire_caller_gate)"
