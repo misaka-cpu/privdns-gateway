@@ -54,6 +54,7 @@ SECT_EXPECT='1.依赖:8
 6.空ref:5
 7.顺序:8
 8.记账:8
+9.串联:7
 N.撤销:7'
 SECT_LOG="$WORK/sect.log"; : > "$SECT_LOG"; _SECT_MARK=0
 # 开始与落幕分别记, 于是三种毛病分得开:
@@ -976,6 +977,115 @@ else
   bad "N7: 撤销版本语法不过, 这一格没跑"
 fi
 sect_end "N.撤销"
+
+echo; echo "══ 9. 真实链路串联: 调用点 → 采样 → 裁决 → 汇总(**整段原文当脚本跑**) ══"
+sect_begin "9.串联"
+# 为什么必须"当脚本跑"而不是把函数抽出来放进 if / || 里调:
+#   `if f; then` 与 `f || x` 会把被调用命令放进**条件上下文**, errexit 在那里本来就不生效 ——
+#   于是"调用点悄悄打开了 errexit"这类毛病, 用那种驱动方式**永远测不出来**。
+#   run 35436339744 死在这上面: 跳后第一处采样遇到 `systemctl is-active <inactive>` 的正常
+#   返回码 3, 整支脚本以 exit 3 终止, 服务动作对账 / ⑥ 收尾 / 汇总一步都没跑(证据 211 号)。
+# 所以这一节: 按标记取**调用点与观测段的原文**, 与被测函数原文拼成一个脚本, 在顶层顺序执行,
+# 前后的 Shell 选项与被测脚本头部逐字相同(set -uo pipefail)。
+grab2(){ sed -n "/^# --- $1: BEGIN/,/^# --- $1: END ---\$/p" "$2" | sed '1d;$d'; }
+CH="$WORK/chain"; mkdir -p "$CH/evid"
+INV_SRC="$(grab2 hop-chain-invoke "$HOP")"; OBS_SRC="$(grab2 hop-chain-observe "$HOP")"
+if [[ -z "$INV_SRC" || -z "$OBS_SRC" ]]; then
+  bad "9-0: 从 e2e-real-bridge-hop.sh 按标记取不到调用点/观测段原文 —— 这一节执行无效"
+else
+  ok "9-0: 调用点原文 $(grep -c . <<<"$INV_SRC") 行 / 观测段原文 $(grep -c . <<<"$OBS_SRC") 行(按唯一成对标记取)"
+  # 组装: 头部与壳(壳只提供被测范围**之外**的东西, 被测原文一个字节不换)
+  _chain_build(){   # $1=落点 $2=调用点原文 $3=额外注释(可空)
+    { echo '#!/usr/bin/env bash'
+      echo 'set -uo pipefail'          # 与 e2e-real-bridge-hop.sh 第 22 行逐字相同
+      printf 'E2E_TMP=%q\n' "$CH"; printf 'EVID=%q\n' "$CH/evid"
+      printf 'FLOW=%q\n' "$CH/flow.sh"; printf 'HOP_OUT=%q\n' "$CH/hop.log"
+      printf 'ENTRYDIR=%q\n' "$CH/entry"; printf 'ORIGIN=%q\n' "$CH/origin.git"
+      echo 'BRIDGE_TAG=v9.9.8-bridge-TEST'
+      echo 'BRIDGE_SHA=9c9b2681f3ada2155b32ebe372cbc2a154792079'
+      echo 'P=0; F=0'
+      echo 'ok(){  P=$((P+1)); echo "[链OK]   $1"; }'
+      echo 'bad(){ F=$((F+1)); echo "[链FAIL] $1"; }'
+      echo 'note(){ echo "[链NOTE] $1"; }'
+      echo '_evn(){ :; }'
+      echo 'snap_state(){ echo "[链] snap_state $1"; }'
+      echo '_j_mark(){ echo "cursor-$1"; }'
+      echo '_j_why(){ echo "<模型: 无 journal>"; }'
+      echo '_j_interval(){ echo 0; }'
+      echo 'SVC_WATCH=(chain-run chain-stopped chain-off)'
+      cat "$UT"                         # 被测函数原文(采样/有效性/集合/归类/裁决)
+      echo 'bridge_svc_sample "$E2E_TMP/svc-hop-before.tsv"; echo "BEFORE_RC=$?"'
+      echo 'C_PROD0="$(_j_mark hop-start)"'
+      [[ -n "${3:-}" ]] && printf '%s\n' "$3"
+      printf '%s\n' "$2"                # ← 调用点原文
+      echo 'C_PROD1="$(_j_mark hop-end)"'
+      echo 'echo "HOP_RC=$HOP_RC"'
+      # 这一条是壳里的**替身判据**(真脚本的 ⑤-0 在标记之外): 只为把"升级非零"带进汇总,
+      # 证明后段健康不会把它冲掉。
+      echo '[[ "$HOP_RC" == 0 ]] && ok "升级返回 0" || bad "升级返回 $HOP_RC(原始退出码保留)"'
+      printf '%s\n' "$OBS_SRC"          # ← 观测段原文(采样 → 窗口 → 裁决)
+      echo 'echo "CHAIN-SUMMARY P=$P F=$F"'
+      echo '(( F == 0 )) || exit 1'
+      echo 'exit 0'
+    } > "$1"
+  }
+  _chain_run(){   # $1=场景名 $2=flow 退出码 → 结果落 $OUT/chain-$1
+    printf '#!/bin/sh\nexit %s\n' "$2" > "$CH/flow.sh"; chmod +x "$CH/flow.sh"
+    rm -f "$CH"/svc-hop-*.tsv
+    bash "$CH/chain.sh" > "$OUT/chain-$1" 2>&1; echo $?
+  }
+  # 现场: 三个 unit —— 在跑 / 合法 inactive(is-active rc=3) / 合法 disabled(is-enabled rc=1)
+  _chain_stage(){
+    reset_stub
+    mkunit chain-run
+    mkunit chain-stopped inactive enabled 0 ""; sset chain-stopped isactive inactive 3
+    sset chain-stopped SubState dead
+    mkunit chain-off active disabled; sset chain-off isenabled disabled 1
+  }
+  # ── 9a 健康 + 合法 inactive/disabled: 采样集合完整, 裁决与汇总**实际到达** ──
+  _chain_stage; _chain_build "$CH/chain.sh" "$INV_SRC"
+  RC9="$(_chain_run 9a 0)"
+  { grep -q '^BEFORE_RC=0' "$OUT/chain-9a" && grep -q '^HOP_RC=0' "$OUT/chain-9a" \
+    && grep -q '服务动作对账' "$OUT/chain-9a" && grep -q '^CHAIN-SUMMARY' "$OUT/chain-9a" \
+    && [[ "$RC9" == 0 ]]; } \
+    && ok "9a: 健康升级 + 合法 inactive(rc=3)/disabled(rc=1) ⇒ 采样 $(sed -n 's/^BEFORE_RC=//p' "$OUT/chain-9a") · 裁决与汇总都到达 · 最终退出码 $RC9" \
+    || { bad "9a: 链路没走完(最终退出码 $RC9)"; tail -5 "$OUT/chain-9a" | sed 's/^/      /'; }
+  grep -q '意外 0' "$OUT/chain-9a" \
+    && ok "9a-2: 合法的 inactive/disabled 仍被当成**状态答案**, 没被算成意外动作" \
+    || { bad "9a-2: 合法状态被算成了意外"; grep -m1 '小计' "$OUT/chain-9a" | sed 's/^/      /'; }
+  # ── 9b 查询真正失败 ⇒ 具名观测无效, 最终非零 ──
+  _chain_stage; sset chain-run ActiveState "" 3 "Connection timed out"
+  RC9B="$(_chain_run 9b 0)"
+  { [[ "$RC9B" != 0 ]] && grep -q '观测无效' "$OUT/chain-9b" && grep -q 'ActiveState 查询失败' "$OUT/chain-9b" \
+    && grep -q '^CHAIN-SUMMARY' "$OUT/chain-9b"; } \
+    && ok "9b: 查询真的失败 ⇒ 具名观测无效并进汇总, 最终退出码 $RC9B(非零)" \
+    || { bad "9b: 查询失败没进观测无效或没判非零(退出码 $RC9B)"; tail -5 "$OUT/chain-9b" | sed 's/^/      /'; }
+  # ── 9c 升级返回非零 ⇒ 原始退出码保留, 后段健康冲不掉它 ──
+  _chain_stage
+  RC9C="$(_chain_run 9c 7)"
+  { grep -q '^HOP_RC=7' "$OUT/chain-9c" && grep -q '服务动作对账' "$OUT/chain-9c" \
+    && grep -q '^CHAIN-SUMMARY' "$OUT/chain-9c" && [[ "$RC9C" != 0 ]]; } \
+    && ok "9c: 升级返回 7 ⇒ HOP_RC 原样是 7, 后段采样/裁决照样跑完, 最终仍判非零($RC9C)" \
+    || { bad "9c: 非零退出码没保留或被后段健康冲掉(退出码 $RC9C)"; grep -E '^HOP_RC=|CHAIN-SUMMARY' "$OUT/chain-9c" | sed 's/^/      /'; }
+  # ── 9d 撤回本次修复(把 set +e / set -e 那一对放回去)⇒ 提前退出重新出现 ──
+  INV_OLD="$(printf '%s\n' "$INV_SRC" \
+    | awk '{ sub(/ \|\| HOP_RC=\$\?$/,""); if ($0=="HOP_RC=0") next; print }' \
+    | { echo 'set +e'; cat; echo 'HOP_RC=$?'; echo 'set -e'; })"
+  _chain_stage; _chain_build "$CH/chain.sh" "$INV_OLD"
+  RC9D="$(_chain_run 9d 0)"
+  { [[ "$RC9D" == 3 ]] && ! grep -q '^CHAIN-SUMMARY' "$OUT/chain-9d" && ! grep -q '服务动作对账' "$OUT/chain-9d"; } \
+    && ok "9d: 撤回修复 ⇒ 老毛病原样重现 —— 脚本在跳后第一处采样以 exit $RC9D 提前终止, 裁决与汇总都没到达" \
+    || { bad "9d: 撤销对照没重现提前退出(退出码 $RC9D)"; tail -4 "$OUT/chain-9d" | sed 's/^/      /'; }
+  # ── 9e 无关注释对照: 结论不变 ──
+  _chain_stage; _chain_build "$CH/chain.sh" "$INV_SRC" '# 无关注释: 只为对照, 不改任何行为'
+  RC9E="$(_chain_run 9e 0)"
+  { [[ "$RC9E" == "$RC9" ]] && grep -q '^CHAIN-SUMMARY' "$OUT/chain-9e" \
+    && [[ "$(sed -n 's/^CHAIN-SUMMARY //p' "$OUT/chain-9e")" == "$(sed -n 's/^CHAIN-SUMMARY //p' "$OUT/chain-9a")" ]]; } \
+    && ok "9e: 插一行无关注释 ⇒ 通过/失败计数与最终退出码都与 9a 逐字相同($(sed -n 's/^CHAIN-SUMMARY //p' "$OUT/chain-9e"), rc=$RC9E)" \
+    || { bad "9e: 无关注释改变了结论(rc=$RC9E vs $RC9)"; tail -3 "$OUT/chain-9e" | sed 's/^/      /'; }
+fi
+sect_end "9.串联"
+
 echo "── 执行有效性: 声明集合 vs 实际登记 ──"
 sect_audit "$SECT_LOG" "$SECT_EXPECT" "$SECT_BEG" >"$OUT/audit" 2>&1; _AUDRC=$?
 sed 's/^/  /' "$OUT/audit"

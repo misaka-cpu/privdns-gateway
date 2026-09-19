@@ -802,12 +802,19 @@ _evn 03-hop-identity.txt "显式目标        = $BRIDGE_TAG → $BRIDGE_SHA (tag
 ENTRY_SHA="$FLOW_SHA"    # 交付里"入口身份"这一列现在记的是流程原文的摘要
 C_PROD0="$(_j_mark hop-start)" || note "阶段记账: 起界桩没建成($(_j_why))"
 HOP_OUT="$E2E_TMP/hop.log"
-set +e
+# --- hop-chain-invoke: BEGIN (契约测试按这两行标记抽本段原文, 串起"调用点→采样→裁决→汇总") ---
+# 退出码**显式捕获**, 且**一个 Shell 选项都不动**。
+# 原来这里是 `set +e … <调用> … HOP_RC=$? … set -e`: 前半句是空操作(本支头部只有
+# set -uo pipefail, errexit 本来就关着), 后半句却把 errexit **打开**了 —— 于是从这一行往后,
+# 任何一个**正常的**非零返回码都会当场打死脚本。实测 run 35436339744 就死在跳后第一处采样:
+# `systemctl is-active pdg-bot` 对 inactive 服务正常返回 3, 脚本以 exit 3 终止,
+# 服务动作对账 / ⑥ 收尾 / 最终汇总一步都没跑(证据 211 号)。
+# 现在用 `|| HOP_RC=$?` 取子进程的原始返回值: 成功就是 0, 失败就是它自己的码, 不丢、不改、不吞。
+HOP_RC=0
 env -u PDG_TAG_BOOTSTRAPPED -u PDG_PLATFORM \
     TAG="$BRIDGE_TAG" WANT="$BRIDGE_SHA" ENTRY="$ENTRYDIR" SRC="$ORIGIN" \
-    bash "$FLOW" > "$HOP_OUT" 2>&1
-HOP_RC=$?
-set -e
+    bash "$FLOW" > "$HOP_OUT" 2>&1 || HOP_RC=$?
+# --- hop-chain-invoke: END ---
 C_PROD1="$(_j_mark hop-end)" || note "阶段记账: 止界桩没建成($(_j_why))"
 cp "$HOP_OUT" "$EVID/04-hop-install.log" 2>/dev/null; chmod 600 "$EVID/04-hop-install.log" 2>/dev/null || true
 tail -40 "$HOP_OUT" | sed 's/^/    /'
@@ -963,6 +970,7 @@ _DNSA="$(dig +time=3 +tries=1 @127.0.0.1 gs-loc.apple.com A +short 2>/dev/null |
   || bad "⑤-4 实际功能: :53 答不出接管域名(实得 '${_DNSA:-空}')"
 _PDGV="$(pdg version 2>&1 | head -1 || true)"
 note "⑤-4 已安装 CLI 自报: ${_PDGV:-<无输出>}"
+# --- hop-chain-observe: BEGIN (与上面那段合起来就是被契约测试串联驱动的真实链路) ---
 snap_state "hop-after"; bridge_svc_sample "$E2E_TMP/svc-hop-after.tsv"
 # 窗口观测先收成文件, 再交给裁决 —— 读不出来就是 INVALID, 不是"没动过"。
 # 只写 note 然后照报"意外 0", 等于把"没看见"说成"没发生"。
@@ -979,6 +987,7 @@ for _u in "${SVC_WATCH[@]}"; do
 done
 sed 's/^/    /' "$WIN_TSV"
 bridge_svc_verdict "$E2E_TMP/svc-hop-before.tsv" "$E2E_TMP/svc-hop-after.tsv" "hop" "$WIN_TSV"
+# --- hop-chain-observe: END ---
 
 SECT "⑥ 收尾"
 {
