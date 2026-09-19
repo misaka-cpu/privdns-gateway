@@ -649,6 +649,17 @@ e2e_stub_system(){
     cat <<'S'
 mkdir -p "$D"
 echo "systemctl $*" >> "$CALLS"
+# ── 运行周期身份(InvocationID) ────────────────────────────────────────────────
+# 真 systemd 给每一次**运行周期**一个新的 InvocationID: 进入新周期才换, 只读查询不换,
+# 起不来就没有实例、也就没有 ID。产品的回滚判据正是靠"ID 变过"来确认恢复出来的配置被重新
+# 读进去了 —— 桩里不实现它, 那条判据在沙箱里就只能永远登记"无法确认"。
+# 单调计数器放在状态目录里: **不按查询随机生成**(那样每次读都不同, 等于恒真),
+# 也不是固定字符串(那样永远"没变过", 等于恒假)。
+_inv_new(){   # $1=unit: 进入新运行周期 —— 取号并写下
+  n=$(cat "$D/.invseq" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$D/.invseq"
+  printf 'inv-%s-%s\n' "$1" "$n" > "$D/${1}.inv"
+}
+_inv_clear(){ rm -f "$D/${1}.inv"; }   # 没有运行实例就没有 ID
 verb="$1"; shift
 # 选项在这里一次剥干净。真 systemd 的 `--quiet` 只是**不打印**, 判定与退出码分毫不变。
 # 原来只剥 `--now`, 于是 `is-active --quiet mosdns` 里的 `--quiet` 被当成了 unit 名 ——
@@ -708,31 +719,59 @@ _dw_start(){
 }
 _dw_alive(){ [ -f "/run/pdg-e2e-dw.pid" ] && kill -0 "$(cat "/run/pdg-e2e-dw.pid" 2>/dev/null)" 2>/dev/null; }
 
+# ── 一次启动动作到底有没有进入新运行周期 ──────────────────────────────────────
+# 真 systemd: 对**已经在跑**的 unit, `start` 与 `enable --now` 都是空转 —— 进程不换,
+# 运行周期不变, InvocationID 也不变; 只有真正起来的新实例与 `restart` 才是新周期。
+# 两条路必须共用同一份判定。原来 enable --now 自己写了一份, 对已 active 且 ID 非空的
+# 服务照样取新号 —— 于是"不该重启时 ID 必须不变"那条判据在这条路上恒绿。
+#
+# witness 那一路还多一层: _dw_start 会先 kill 掉在跑的真进程再拉一个新的。所以空转
+# 必须在**调它之前**就返回, 否则就成了"号保住了, 进程却被偷偷换掉" —— 比换号更坏:
+# 那让"还是不是原来那个进程"这件事从外面根本验不出来。
+_svc_running(){   # $1=unit: 现在是否已经有运行实例
+  _r=$(cat "$D/${1}.ac" 2>/dev/null)
+  # 从没记录过的: 有 unit 文件就当它在跑 —— 与 is-active 的回退同一套, 不另立标准
+  [ -z "$_r" ] && { [ -f "/etc/systemd/system/${1}.service" ] && _r=1 || _r=0; }
+  [ "$_r" = 1 ] || return 1
+  # witness 记着在跑、真进程却已经没了 ⇒ 不算在跑, 该真起一次
+  _dw_is "$1" && { _dw_alive || return 1; }
+  return 0
+}
+_svc_up(){   # $1=unit $2=verb(start|restart|enable): 起一个 unit, 顺带定它的运行周期身份
+  # .fail 标记 = 这个 unit "起得来但立刻崩" → 起完仍是 inactive; 没有健康实例就没有 ID
+  if [ -f "$D/${1}.fail" ]; then echo 0 > "$D/${1}.ac"; _inv_clear "$1"; return 0; fi
+  if [ "$2" != restart ] && _svc_running "$1"; then
+    echo 1 > "$D/${1}.ac"
+    # 判成"已经在跑"就得有身份: 从没记录过的在这里补一次(与 InvocationID 查询那条回退
+    # 同源), 已经有号的一律原样留着 —— 空转绝不换号。
+    [ -f "$D/${1}.inv" ] || _inv_new "$1"
+    return 0
+  fi
+  if _dw_is "$1"; then
+    if _dw_start; then echo 1 > "$D/${1}.ac"; _inv_new "$1"
+    else echo 0 > "$D/${1}.ac"; _inv_clear "$1"; fi
+  else
+    echo 1 > "$D/${1}.ac"; _inv_new "$1"
+  fi
+}
+
 case "$verb" in
   daemon-reload|reset-failed|preset|mask|unmask) exit 0;;
   enable)  for u in "$@"; do echo 1 > "$D/${u}.en"
-             # .fail 标记 = 这个 unit "起得来但立刻崩" → 起完仍是 inactive
-             if [ "$now" = 1 ]; then
-               if [ -f "$D/${u}.fail" ]; then echo 0 > "$D/${u}.ac"
-               elif _dw_is "$u"; then _dw_start && echo 1 > "$D/${u}.ac" || echo 0 > "$D/${u}.ac"
-               else echo 1 > "$D/${u}.ac"; fi
-             fi
+             # --now 只是"顺手起一下", 起的语义与 start 逐字相同 —— 走同一条路
+             [ "$now" = 1 ] && _svc_up "$u" enable
            done; exit 0;;
   disable) for u in "$@"; do echo 0 > "$D/${u}.en"
              if [ "$now" = 1 ]; then echo 0 > "$D/${u}.ac"; _dw_is "$u" && _dw_stop; fi
            done; exit 0;;
-  start|restart) for u in "$@"; do
-                   if [ -f "$D/${u}.fail" ]; then echo 0 > "$D/${u}.ac"
-                   elif _dw_is "$u"; then _dw_start && echo 1 > "$D/${u}.ac" || echo 0 > "$D/${u}.ac"
-                   else echo 1 > "$D/${u}.ac"; fi
-                 done; exit 0;;
-  stop)    for u in "$@"; do echo 0 > "$D/${u}.ac"; _dw_is "$u" && _dw_stop; done; exit 0;;
+  start|restart) for u in "$@"; do _svc_up "$u" "$verb"; done; exit 0;;
+  stop)    for u in "$@"; do echo 0 > "$D/${u}.ac"; _inv_clear "$u"; _dw_is "$u" && _dw_stop; done; exit 0;;
   is-active)
       u="$1"; v=$(cat "$D/${u}.ac" 2>/dev/null)
       # 没记录过的: 有 unit 文件就当它在跑(模拟装好即运行), 否则 inactive
       [ -z "$v" ] && { [ -f "/etc/systemd/system/${u}.service" ] && v=1 || v=0; }
       # witness 起的是真进程: 它自己崩了就不能再说 active(真 systemd 也不会)
-      if _dw_is "$u" && [ "$v" = 1 ] && ! _dw_alive; then v=0; echo 0 > "$D/${u}.ac"; fi
+      if _dw_is "$u" && [ "$v" = 1 ] && ! _dw_alive; then v=0; echo 0 > "$D/${u}.ac"; _inv_clear "$u"; fi
       [ "$v" = 1 ] && { _say active; exit 0; }; _say inactive; exit 3;;
   is-enabled)
       u="$1"; v=$(cat "$D/${u}.en" 2>/dev/null)
@@ -794,7 +833,15 @@ case "$verb" in
             [ "$v" = 1 ] && echo enabled || echo disabled;;
           LoadState) echo loaded;;
           Result)    [ -f "$D/${u}.failed" ] && echo failed || echo success;;
-          InvocationID) cat "$D/${u}.inv" 2>/dev/null || echo "";;
+          InvocationID)
+            # 只读查询**不改变**已有 ID。唯一的例外是"从没记录过、但 unit 文件在"那种初始态:
+            # is-active 会把它当成在跑, 那它就该有一个运行周期身份 —— 补一次, 让前像自洽。
+            # 这一次补号之后再读就恒定, 不会每次查询都换。
+            if [ ! -f "$D/${u}.inv" ] && [ ! -f "$D/${u}.ac" ] \
+               && [ -f "/etc/systemd/system/${u}.service" ] && [ ! -f "$D/${u}.fail" ]; then
+              _inv_new "$u"
+            fi
+            cat "$D/${u}.inv" 2>/dev/null || echo "";;
           MainPID)   [ "$(_st)" = 1 ] && { cat "$D/${u}.pid" 2>/dev/null || echo 1234; } || echo 0;;
           NRestarts) cat "$D/${u}.nr" 2>/dev/null || echo 0;;
           Triggers)  case "$u" in *.timer) echo "${u%.timer}.service";; *) echo "";; esac;;

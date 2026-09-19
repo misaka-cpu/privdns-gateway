@@ -508,6 +508,9 @@ jobs:
       - name: "update 前置 mosdns 完整性预检 (缺失/命令非零/摘要不符在第一次副作用前停下)"
         run: bash tests/test-update-mosdns-preflight.sh
 
+      - name: "update --to 钉版 (参数三态/不被更高 tag 带偏/四态方向/目标移动/预览同源/dry-run 持锁)"
+        run: bash tests/test-update-to-pin.sh
+
       # 判据本体自 v1.11.9 起已是"先算摘要再执行", 但预检的**诊断路径**为了分辨版本漂移
       # 又把候选文件跑了一遍 —— 判据挡在门外的东西, 诊断又请了进来。这一支用 marker 证明
       # 行为, 不看源码形状: 换个写法照样能执行, 只有 marker 在不在是判据。
@@ -560,6 +563,11 @@ jobs:
 
       - name: "install 二进制事务回归 (备份失败即中止/半截安装可恢复/强制重装也还原/清理失败不假报)"
         run: bash tests/test-install-bintxn.sh
+
+      # 公开入口 --ref <版本 tag>: 指定的版本必须真的被装上, 不许悄悄回退到最新版。
+      # 用自有一次性测试源(裸库 + 三个版本 tag), 跑真的两段自举, 判据落在 git 实读的 HEAD 上。
+      - name: "安装入口 --ref (指定版本贯穿两段自举; 不存在/非法/取件失败一律拒绝)"
+        run: bash tests/test-install-ref-entry.sh
 
       - name: "bot 导航回归 (操作结果不刷一级菜单)"
         run: python3 tests/test-bot-nav.py
@@ -1095,6 +1103,37 @@ jobs:
 
       - name: "平台隔离回归 (Android 无 iOS 按钮/回调/后端; iOS 原功能; checks 平台一致)"
         run: python3 tests/test-platform-isolation.py
+
+      # 快照只收文件, enable 的符号链接在 multi-user.target.wants/ 下从不入快照 —— 于是
+      # "文件都回来了、服务却停着且不自启"会被回滚自报成"已回滚并重启服务"。这两支盯这一格,
+      # 外加钉住本版的边界: 只补前像, 不退役 WLOC、不推进记录格式、不删旧能力。
+
+      # 持久自启(/etc 的 wants)与运行时自启(/run 的 wants)是两套独立链接: 只调目标那一条
+      # systemctl 命令, "前像 enabled-runtime 而现状被永久 enable"与"前像 disabled 而现状是
+      # enabled-runtime"这两种都回不去。桩分别维护两套链接, 不做目标字符串赋值。
+
+      # 桥接线带来的边界守卫。**判据本体一个字节不放宽** —— 但它盯的是"桥接那一版只改了
+      # cmd_update/cmd_rollback、不含任何退役动作", 而本候选是**整合后**的树, 本来就含退役实现。
+      # 所以它在**冻结桥接 SHA 的隔离副本**上跑, 用那一版自己的判据核那一版自己的树。
+      # 证据归属: 它证明的是桥接候选 9c9b2681f3ada2155b32ebe372cbc2a154792079 的边界,
+      # **不是**本候选的边界; 本候选由整合接缝契约与退役各支验收。
+      - name: "桥接版边界 (在冻结桥接 SHA 的隔离副本上跑; 证据归属=桥接候选, 不代表本候选)"
+        run: |
+          set -euo pipefail
+          BR=9c9b2681f3ada2155b32ebe372cbc2a154792079
+          git cat-file -e "$BR^{commit}" || { echo "取不到冻结桥接对象 $BR"; exit 1; }
+          d="$(mktemp -d)"; git archive "$BR" | tar -x -C "$d"
+          echo "在隔离副本 $d 上跑桥接那一版自己的边界守卫(证据归属: 桥接候选 $BR)"
+          ( cd "$d" && bash tests/test-svcstate-bridge-scope.sh )
+
+      # 整合接缝: 前像函数不许重复、保存责任只有 cmd_snapshot 一处、三个消费者只确认不再采样,
+      # 两侧各自的修复都还在, 调用方门的 holder 判据没有被改宽。
+      - name: "桥接×退役 整合接缝契约 (前像单份/保存唯一/消费者不重采样/两侧修复都在/门未放宽)"
+        run: bash tests/test-retire-bridge-integration.sh
+
+      # 辅助函数自己"没有服务动作"证明不了整条回滚链没先把服务启动过 —— 这一支跑真实 cmd_rollback。
+      # 它在 unshare 私有挂载里把 /etc /opt /usr/local/bin 绑到一次性目录, 真的落盘、真的核验文件属性;
+      # 建不出隔离就报"未执行"并非 0 退出(不靠权限失败兜底)。
 
   core-startlimit:
     needs: prepare-mosdns-fixture

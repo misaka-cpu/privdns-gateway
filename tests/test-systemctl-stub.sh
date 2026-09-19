@@ -291,6 +291,264 @@ rm -f "/etc/systemd/system/$U"; reset_state
 # EXIT hook 仍然留着管异常路径; 这里显式调用是为了让下面的正向断言能在本脚本里完成 ——
 # 桩没清干净这件事必须在这里被抓住, 而不是留给几十步之后的另一支测试。
 echo
+echo
+echo "── 14. 运行周期身份(InvocationID): 只有进入新周期才换 ──"
+# 产品的回滚判据靠"重启后 InvocationID 变过"确认恢复出来的配置被重新读进去了。
+# 桩以前既不生成也不更换 ID(实测: restart 之后仍为空; 预填固定值后 restart 也不变),
+# 于是那条判据在沙箱里只能永远登记"无法确认"。这一节钉住补齐后的语义。
+# unit 名**不带** .service 后缀: 桩在"没有状态记录"时按 /etc/systemd/system/<u>.service
+# 判断它是否装着(14g 的初始前像正是走这条回退), 带后缀会让它去找 <u>.service.service。
+SVC=stubinv
+mk_svc(){ printf '[Unit]\nDescription=inv test\n[Service]\nExecStart=/bin/true\n' > "/etc/systemd/system/$SVC.service"; }
+mk_svc; rm -f "$D/$SVC".* "$D/.invseq" 2>/dev/null
+inv(){ "$SC" show -p InvocationID --value "$SVC"; }
+# 14a 起不来的 unit: 没有健康实例 ⇒ 没有 ID(不许伪造)
+: > "$D/$SVC.fail"; "$SC" start "$SVC" >/dev/null 2>&1
+{ [[ -z "$(inv)" ]] && [[ "$("$SC" is-active "$SVC" 2>/dev/null)" == inactive ]]; } \
+  && t_ok "14a: 起不来 ⇒ inactive 且**没有** ID(失败启动不伪造健康实例)" \
+  || t_bad "14a: 起不来却给了 ID='$(inv)' / 状态='$("$SC" is-active "$SVC" 2>/dev/null)'"
+rm -f "$D/$SVC.fail"
+# 14b 首次 start: 进入新周期 ⇒ 生成 ID
+"$SC" start "$SVC" >/dev/null 2>&1; I1="$(inv)"
+[[ -n "$I1" ]] && t_ok "14b: 首次 start ⇒ 生成运行周期身份($I1)" || t_bad "14b: start 之后仍没有 ID"
+# 14c 只读查询不改 ID(连查三次)
+I2="$(inv)"; "$SC" is-active "$SVC" >/dev/null 2>&1; "$SC" show -p ActiveState --value "$SVC" >/dev/null 2>&1; I3="$(inv)"
+{ [[ "$I1" == "$I2" ]] && [[ "$I2" == "$I3" ]]; } \
+  && t_ok "14c: 只读查询**不改变** ID(三次读都是 $I1)" || t_bad "14c: 读一次就变了($I1 / $I2 / $I3)"
+# 14d 对**已在跑**的 unit 再 start: 空转, 不冒充 restart
+"$SC" start "$SVC" >/dev/null 2>&1; I4="$(inv)"
+[[ "$I4" == "$I1" ]] && t_ok "14d: 已在跑时 start 是空转 ⇒ ID 不变(不冒充 restart)" \
+                     || t_bad "14d: start 换了 ID($I1 → $I4) —— 把空转当成了重启"
+# 14d-2 对**已在跑**的 unit 用 enable --now: 同样是空转 —— 真 systemd 只建链接, 不重起
+# (冻结版 aea4929e 在这条路上会取新号: enable --now 自己写了一份启动逻辑, 不看"本来在不在跑"。)
+"$SC" enable --now "$SVC" >/dev/null 2>&1; I4B="$(inv)"
+{ [[ "$I4B" == "$I1" ]] && [[ "$("$SC" is-active "$SVC" 2>/dev/null)" == active ]]; } \
+  && t_ok "14d-2: 已在跑时 enable --now 是空转 ⇒ ID 不变(仍是 $I1)" \
+  || t_bad "14d-2: enable --now 换了 ID($I1 → $I4B) 或没保持 active($("$SC" is-active "$SVC" 2>/dev/null))"
+# 14e restart: 一定进新周期 ⇒ ID 必须变
+"$SC" restart "$SVC" >/dev/null 2>&1; I5="$(inv)"
+{ [[ -n "$I5" ]] && [[ "$I5" != "$I1" ]]; } \
+  && t_ok "14e: restart ⇒ 进入新周期, ID 变了($I1 → $I5)" || t_bad "14e: restart 后 ID 仍是 '$I5'"
+# 14f stop: 实例没了 ⇒ ID 也没了
+"$SC" stop "$SVC" >/dev/null 2>&1
+[[ -z "$(inv)" ]] && t_ok "14f: stop 之后没有实例 ⇒ 没有 ID" || t_bad "14f: stop 后仍有 ID='$(inv)'"
+# 14g 初始前像自洽: 从没记录过但 unit 文件在 ⇒ is-active 当它在跑, 那就该有 ID; 补一次之后恒定
+rm -f "$D/$SVC".* 2>/dev/null
+J1="$(inv)"; J2="$(inv)"
+{ [[ "$("$SC" is-active "$SVC" 2>/dev/null)" == active ]] && [[ -n "$J1" ]] && [[ "$J1" == "$J2" ]]; } \
+  && t_ok "14g: 初始运行前像自洽(当它在跑就有 ID=$J1, 且**再读不变**)" \
+  || t_bad "14g: 初始前像不自洽(active=$("$SC" is-active "$SVC" 2>/dev/null) J1='$J1' J2='$J2')"
+# 14h 两种失败覆盖仍在: 读不到 ID / 重启后 ID 未变 —— 用**不存在的 unit** 与 .fail 各造一次
+[[ -z "$("$SC" show -p InvocationID --value no-such-unit.service)" ]] \
+  && t_ok "14h-1: 读不到 ID 这种失败仍可复现(未知 unit ⇒ 空)" || t_bad "14h-1: 未知 unit 竟有 ID"
+# 14h-2 **改正**上一轮的记法: 起不来的 unit 在 restart 前后都**没有** ID —— 两边都是空串。
+# 空等于空证明不了"非空的 ID 没换过", 它属于 14h-1 那一类(读不到 ID), 不是第二种失败。
+# 真正的"前后都非空且相等"健康桩造不出来(restart 一定换号), 只能注入 —— 见 14j-2。
+rm -f "$D/$SVC".* 2>/dev/null; : > "$D/$SVC.fail"
+K1="$(inv)"; "$SC" restart "$SVC" >/dev/null 2>&1; K2="$(inv)"
+{ [[ -z "$K1" ]] && [[ -z "$K2" ]] && [[ "$("$SC" is-active "$SVC" 2>/dev/null)" == inactive ]]; } \
+  && t_ok "14h-2: 起不来的 unit 自始至终没有 ID(两侧皆空 ⇒ 仍属'读不到 ID'一类)" \
+  || t_bad "14h-2: 起不来的 unit 给出了 ID('$K1' → '$K2') 或没停在 inactive($("$SC" is-active "$SVC" 2>/dev/null))"
+# ── 14j 两种失败必须**分开**: 产品的恢复判据认出来的是哪一种 ─────────────────
+# pdg.sh 的 _pdg_restore_svcstate ② 对"前像是 active"的 unit 有两条不同的失败登记:
+#     inv1 为空            → "无法确认是否重新加载了恢复出来的配置(读不到 InvocationID)"
+#     inv0/inv1 都非空且相等 → "仍是回滚前那个进程, 恢复出来的配置没有被重新加载"
+# 前一种桩自己就造得出(未知 unit); 后一种**健康的桩造不出来** —— 它的 restart 一定换号,
+# 那正是它该有的样子。所以后一种只能注入: 在桩前面放一个只改 `show -p InvocationID`
+# 答案的外壳, 其余一律原样转给真桩。注入是显式的、只经这一份 PATH 生效, 健康桩本身
+# 绝不恒返固定 ID(否则 14b/14e 立刻变成恒绿)。
+#
+# 判据落在**产品真函数**上: 从 pdg.sh 抽出来执行, 不复制一份"应该长这样"的模型。
+INVW="$(mktemp -d)"
+_x(){   # $1=函数名 → 抽出整个定义(单行函数只抽那一行, 不会顺带吞掉后面的函数)
+  awk -v f="$1(){" 'index($0,f)==1{
+        print; if($0 ~ /\}[ \t]*$/) exit
+        while((getline l)>0){ print l; if(l=="}") exit }
+        exit }' "$ROOT/deploy/bot/pdg.sh"
+}
+_xok=1
+: > "$INVW/prod.sh"
+for _f in _pdg_svcstate_units _pdg_svc_known _pdg_svc_q _pdg_now_en _pdg_now_ac \
+          _pdg_svcstate_valid _pdg_svcstate_plan _pdg_save_svcstate \
+          _pdg_set_enable_state _pdg_restore_svcstate; do
+  _x "$_f" >> "$INVW/prod.sh"
+  grep -q "^${_f}(){" "$INVW/prod.sh" || { t_bad "14j: 抽不到产品函数 $_f(改名了?) —— 这一组判据无效"; _xok=0; break; }
+done
+[[ "$_xok" == 1 ]] && { bash -n "$INVW/prod.sh" 2>/dev/null || { t_bad "14j: 抽出来的产品函数拼不成合法脚本 —— 执行无效"; _xok=0; }; }
+
+# 故障注入器: 只回答 InvocationID(值由 PDG_FI_INV 给), 其余原样转给真桩。
+mkdir -p "$INVW/fi"
+cat > "$INVW/fi/systemctl" <<'FIEOF'
+#!/bin/sh
+# ⚠ 故障注入 —— 只在 test-systemctl-stub.sh 的 14j 里、只经它自己的 PATH 生效。
+# 把 `show -p InvocationID` 的答案换掉(PDG_FI_INV 为空就答空), 其余一律转给真桩。
+for a in "$@"; do
+  if [ "$a" = InvocationID ]; then
+    [ -n "${PDG_FI_INV:-}" ] && echo "$PDG_FI_INV"
+    exit 0
+  fi
+done
+exec /usr/local/bin/systemctl "$@"
+FIEOF
+chmod 755 "$INVW/fi/systemctl"
+
+cat > "$INVW/harn.sh" <<'HARNEOF'
+set -uo pipefail
+MODE="$1"; W="$2"
+c_g(){ echo "$*"; }; c_y(){ echo "$*"; }
+declare -A _PDG_WANT_EN _PDG_WANT_AC _PDG_WANT_URC _PDG_WANT_ARC
+_PDG_SVC_SRC=""; _PDG_SVC_MODE=blind; _PDG_SVC_WHY=""; _PDG_SVCSTATE_WHY=""
+unrestored=()
+. "$W/prod.sh"
+# 仪器校准: 产品函数调的是**裸** systemctl, 必须解析到桩。万一解析到真 systemctl,
+# 这里发出去的 restart 会打在真机的服务上 —— 所以解析不对就立刻停, 不往下跑。
+PATH="/usr/local/bin:$PATH"; export PATH
+[[ "$(command -v systemctl)" == /usr/local/bin/systemctl ]] \
+  || { echo "HARN=NOT-STUB:$(command -v systemctl)"; exit 7; }
+SNAP="$W/snap-$MODE"; mkdir -p "$SNAP"
+echo payload > "$SNAP/payload"
+tar -czf "$SNAP/snap.tar.gz" -C "$SNAP" payload 2>/dev/null || { echo "HARN=NO-TAR"; exit 9; }
+# 前像用**真桩**拍(注入还没上场): 记下来的就是"回滚前它确实在跑"。
+_pdg_save_svcstate "$SNAP" >/dev/null 2>&1 || { echo "HARN=SAVE-FAILED"; exit 8; }
+grep -q "^unit	mosdns	enabled	0	active	0" "$SNAP/svcstate.tsv" || echo "HARN=PRE-NOT-ACTIVE"
+if [[ "$MODE" != healthy ]]; then
+  PATH="$W/fi:$PATH"; export PATH
+  [[ "$(command -v systemctl)" == "$W/fi/systemctl" ]] \
+    || { echo "HARN=NO-INJECT:$(command -v systemctl)"; exit 6; }
+fi
+I0="$(systemctl show -p InvocationID --value mosdns)"
+R0="$(/usr/local/bin/systemctl show -p InvocationID --value mosdns)"
+_PDG_SVC_SRC=""
+_pdg_restore_svcstate "$SNAP" >/dev/null 2>&1
+I1="$(systemctl show -p InvocationID --value mosdns)"
+R1="$(/usr/local/bin/systemctl show -p InvocationID --value mosdns)"
+echo "I0=$I0"; echo "I1=$I1"; echo "R0=$R0"; echo "R1=$R1"
+echo "AC=$(/usr/local/bin/systemctl is-active mosdns 2>/dev/null)"
+echo "N=${#unrestored[@]}"
+for x in ${unrestored[@]+"${unrestored[@]}"}; do echo "U| $x"; done
+HARNEOF
+
+# 这一组用的是产品那八个 unit 名(_pdg_svcstate_units 那一份清单), 但**只种桩自己的状态**:
+# 桩的 is-active / is-enabled / InvocationID 读的都是 $D 下的状态文件, 不需要
+# /etc/systemd/system 里有同名 unit。以前这里为了走"已在跑"那条回退去写产品 unit 文件,
+# 在 CI 上撞了车: 同一个 lint job 里这支跑两次(#174 / #207), 中间那些要真 systemd 的步骤
+# 会把**真的** pdg-bot.service 装进去, 第二次跑到这里就只能放弃这一组 —— 而严格模式下
+# 放弃即判红。现在一个字节都不往那儿写, 冲突不复存在;下面 14j-8 把"没动过"验出来。
+_ETC=/etc/systemd/system
+_PU=(pdg-mitm pdg-bot pdg-probe81 mosdns mihomo pdg-dotwitness)
+_PT=(pdg-health.timer pdg-rules-update.timer)
+_etc_img(){   # 八条产品 unit 路径的像: 存在性 + 内容摘要 + 属性(权限/属主/大小)
+  local u p
+  for u in "${_PU[@]}"; do p="$_ETC/$u.service"
+    printf '%s\t%s\t%s\n' "$p" "$([[ -e "$p" ]] && _sha "$p" || echo '<不存在>')" \
+                           "$([[ -e "$p" ]] && stat -c '%a:%u:%g:%s' "$p" || echo -)"; done
+  for u in "${_PT[@]}"; do p="$_ETC/$u"
+    printf '%s\t%s\t%s\n' "$p" "$([[ -e "$p" ]] && _sha "$p" || echo '<不存在>')" \
+                           "$([[ -e "$p" ]] && stat -c '%a:%u:%g:%s' "$p" || echo -)"; done
+}
+_ETC_BEFORE="$(_etc_img)"
+if [[ "$_xok" == 1 ]]; then
+  # 前像里那八个 unit 的现场: 五个普通服务在跑, 两个 timer 在跑, witness 明确停着
+  # (它起真进程, 四件套不齐就起不来 —— 不让它在这一组里制造无关噪声)。
+  _units_made=1
+  # 五个普通服务在跑(各带一个初始运行周期身份)、两个 timer 在跑、witness 明确停着 ——
+  # witness 起的是真进程, 四件套不齐就起不来, 不让它在这一组里制造无关噪声。
+  for _u in pdg-mitm pdg-bot pdg-probe81 mosdns mihomo; do
+    echo 1 > "$D/$_u.en"; echo 1 > "$D/$_u.ac"; printf 'inv-%s-seed\n' "$_u" > "$D/$_u.inv"
+  done
+  for _u in "${_PT[@]}"; do echo 1 > "$D/$_u.en"; echo 1 > "$D/$_u.ac"; done
+  echo 0 > "$D/pdg-dotwitness.en"; echo 0 > "$D/pdg-dotwitness.ac"; rm -f "$D/pdg-dotwitness.inv"
+  _harn(){ PDG_FI_INV="$2" bash "$INVW/harn.sh" "$1" "$INVW" 2>&1; }
+  _v(){ sed -n "s/^$2=//p" <<<"$1" | head -1; }   # $1=输出 $2=键
+  H0="$(_harn healthy "")"
+  H1="$(_harn empty   "")"
+  H2="$(_harn frozen  "inv-frozen-9999")"
+  for _h in "$H0" "$H1" "$H2"; do
+    grep -q '^N=' <<<"$_h" || { t_bad "14j: 壳没跑完(原因: $(grep -m1 '^HARN=' <<<"$_h" || echo 未知)) —— 这一组判据无效"; _xok=0; }
+  done
+fi
+if [[ "$_xok" == 1 ]]; then
+
+  # 14j-0 正控: 桩健康时这条判据**不**登记未恢复 —— 否则下面两格的红是恒红, 没有区分力
+  { [[ "$(_v "$H0" N)" == 0 ]] && [[ "$(_v "$H0" AC)" == active ]] \
+    && [[ -n "$(_v "$H0" I0)" ]] && [[ "$(_v "$H0" I0)" != "$(_v "$H0" I1)" ]]; } \
+    && t_ok "14j-0: 健康桩 ⇒ 恢复判据零登记(restart 换了号: $(_v "$H0" I0) → $(_v "$H0" I1))" \
+    || t_bad "14j-0: 健康桩下判据就不干净(N=$(_v "$H0" N) AC=$(_v "$H0" AC) $(_v "$H0" I0)→$(_v "$H0" I1)); 后两格的红无意义
+$(grep '^U|' <<<"$H0" | head -3)"
+
+  # 14j-1 注入"读不到 ID": 必须落在那一条失败上, 且不许串到另一条
+  { grep -q '^U| mosdns 无法确认是否重新加载了恢复出来的配置(读不到 InvocationID)$' <<<"$H1" \
+    && ! grep -q '仍是回滚前那个进程' <<<"$H1" && [[ -z "$(_v "$H1" I1)" ]]; } \
+    && t_ok "14j-1: 注入'读不到 ID' ⇒ 判据登记的是'无法确认…(读不到 InvocationID)'" \
+    || t_bad "14j-1: 登记不符(I1='$(_v "$H1" I1)')
+$(grep '^U| mosdns' <<<"$H1" | head -2)"
+
+  # 14j-2 注入"ID 冻住": 前后都非空且相等、服务仍 active —— 这一种既不是空 ID 也不是没起来
+  { grep -q '^U| mosdns 仍是回滚前那个进程, 恢复出来的配置没有被重新加载$' <<<"$H2" \
+    && ! grep -q '读不到 InvocationID' <<<"$H2" && ! grep -q '后置状态不符' <<<"$H2" \
+    && [[ -n "$(_v "$H2" I0)" ]] && [[ "$(_v "$H2" I0)" == "$(_v "$H2" I1)" ]] \
+    && [[ "$(_v "$H2" AC)" == active ]]; } \
+    && t_ok "14j-2: 注入'ID 冻住'(前后都是 $(_v "$H2" I0)、仍 active) ⇒ 判据登记的是'仍是回滚前那个进程'" \
+    || t_bad "14j-2: 登记不符(I0='$(_v "$H2" I0)' I1='$(_v "$H2" I1)' AC='$(_v "$H2" AC)')
+$(grep '^U| mosdns' <<<"$H2" | head -2)"
+
+  # 14j-3 注入是**注入**: 真桩那一侧确实换了号 ⇒ restart 真的发生过, 红不是"没重启"造成的
+  { [[ -n "$(_v "$H2" R0)" ]] && [[ "$(_v "$H2" R0)" != "$(_v "$H2" R1)" ]]; } \
+    && t_ok "14j-3: 同一次运行里真桩换了号($(_v "$H2" R0) → $(_v "$H2" R1)) ⇒ 失败来自注入, 不是没重启" \
+    || t_bad "14j-3: 真桩那侧也没换号($(_v "$H2" R0) → $(_v "$H2" R1)) —— 这一格证明不了失败的来源"
+fi
+# 收尾放在两个 if 之外: 壳没跑完、判据无效, 本轮造出来的东西照样必须收干净。
+if [[ "${_units_made:-0}" == 1 ]]; then
+  # 只清**本轮自己种下的**模型状态(桩状态目录里那几份), 别的一概不碰。
+  for _u in "${_PU[@]}" "${_PT[@]}"; do rm -f "$D/$_u".*; done
+  _left=0
+  for _u in "${_PU[@]}" "${_PT[@]}"; do
+    for _f in "$D/$_u".*; do [[ -e "$_f" ]] && _left=$((_left+1)); done
+  done
+  [[ "$_left" == 0 ]] && t_ok "14j-9: 本组种下的模型状态已全部清掉(只清自己拥有的那几份)" \
+                      || t_bad "14j-9: 桩状态目录里还剩 $_left 个本组种下的文件"
+fi
+# 14j-8 这一组自始至终没碰过 /etc/systemd/system 里的产品 unit —— 存在性、内容、属性逐项比。
+# 前像在本组**开始之前**取, 所以"本来就有 pdg-bot.service"这种现场也照样验得出没被动过。
+if [[ "$(_etc_img)" == "$_ETC_BEFORE" ]]; then
+  t_ok "14j-8: 全程没有创建/覆盖/删除任何产品名 unit 文件(8 条路径的存在性、内容摘要与属性逐项不变)"
+else
+  t_bad "14j-8: /etc/systemd/system 被动过: $(diff <(printf '%s\n' "$_ETC_BEFORE") <(_etc_img) | head -4 | tr '\n' ' ')"
+fi
+rm -rf "$INVW"
+
+# ── 14k witness 分支: "已在跑"的空转必须在碰真进程**之前**就返回 ──────────────
+# 这一个 unit 起的是真进程, 而 _dw_start 会先 kill 掉在跑的那个再拉新的。空转要是走到
+# 那里, 结果就是"号保住了、进程被悄悄换掉" —— 比换号更难查, 因为从外面完全看不出来。
+# 这里不拉真 witness(那要四件套齐全且 5399 真在听), 而是放一个我们自己的睡眠进程冒充
+# "在跑的实例", 并**故意不**准备四件套: 一旦 _dw_start 被调到, 它会先杀掉这个进程、
+# 再因缺件失败 —— 进程死亡与 ID 被清空两样都会被抓住。
+DW=pdg-dotwitness
+if [[ -e /opt/pdg-bot/dotwitness.py ]]; then
+  skipf "14k: 机器上有 /opt/pdg-bot/dotwitness.py, 这一格要求四件套**不**齐全"
+elif [[ -e /run/pdg-e2e-dw.pid ]]; then
+  skipf "14k: /run/pdg-e2e-dw.pid 已经在了 —— 不动别人起的 witness"
+elif ! mkdir -p /run 2>/dev/null || ! : > /run/pdg-e2e-dw.pid 2>/dev/null; then
+  skipf "14k: /run 不可写, 造不出'在跑的 witness'现场"
+else
+  rm -f "$D/$DW".* 2>/dev/null
+  sleep 300 & _dwpid=$!
+  echo "$_dwpid" > /run/pdg-e2e-dw.pid
+  echo 1 > "$D/$DW.ac"; printf 'inv-%s-keep\n' "$DW" > "$D/$DW.inv"
+  W0="$("$SC" show -p InvocationID --value "$DW")"
+  "$SC" start "$DW" >/dev/null 2>&1
+  W1="$("$SC" show -p InvocationID --value "$DW")"
+  kill -0 "$_dwpid" 2>/dev/null && _alive=1 || _alive=0
+  { [[ "$_alive" == 1 ]] && [[ -n "$W1" ]] && [[ "$W1" == "$W0" ]] \
+    && [[ "$("$SC" is-active "$DW" 2>/dev/null)" == active ]]; } \
+    && t_ok "14k: 已在跑的 witness 再 start 是真空转(进程 $_dwpid 还活着, ID 仍是 $W1)" \
+    || t_bad "14k: witness 的空转不实(进程存活=$_alive, ID '$W0' → '$W1', 状态=$("$SC" is-active "$DW" 2>/dev/null))"
+  kill "$_dwpid" 2>/dev/null; wait "$_dwpid" 2>/dev/null
+  rm -f /run/pdg-e2e-dw.pid "$D/$DW".* 2>/dev/null
+fi
+rm -f "$D/$SVC".* "/etc/systemd/system/$SVC.service" 2>/dev/null
+t_ok "14i: 如实登记 —— 以上都是**模型**证据, 不代表真实服务或真实配置加载已验收"
+
 echo "── 收尾: 桩清理与命令解析恢复 ──"
 stub_cleanup && t_ok "清理返回 0" || t_bad "清理失败(见上面的 [!] 行)"
 NOW_NFT_CMD="$(command -v nft 2>/dev/null || true)"

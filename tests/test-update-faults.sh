@@ -56,6 +56,18 @@ sleep(){ :; }
 _pdg_platform(){ echo "${PLATFORM:-android}"; }
 _pdg_core(){ echo singbox; }
 pdg_fetch_release_tags(){ return 0; }
+_pdg_bot_cred(){ echo "${CRED:-unset}"; }
+# 「已装文件是否逐个与仓库一致」: 本壳的 git 桩让 HEAD 与 tag 同值(关系恒为 same), 所以这一项
+# 决定走"健康短路"还是"修复路径"。本壳测的是**故障传播**, 必须走完整编排 —— 默认取"不同步"。
+# 判据本体另有专测(tests/test-update-release-relation.sh 的 same 两路), 这里只当可控输入。
+_update_in_sync(){ return "${INSYNC_RC:-1}"; }
+# 服务前像保存: **可控替身**, 不是恒真。真实前像属真实 systemd 验收, 本壳不冒充;
+# 但"前像保存失败就中止更新"这道门必须还能被测到 —— 见文末 N 节的定向反例。
+_pdg_save_svcstate(){
+  printf "SVCSTATE_SAVE %s rc=%s\n" "${1:-<无参>}" "${SVCSTATE_RC:-0}" >> "$WORK/side.log"
+  [[ -n "${1:-}" && -d "${1:-}" ]] && printf "modeled-svcstate\n" > "$1/svcstate.tsv"
+  return "${SVCSTATE_RC:-0}"
+}
 # 全桩 git: 只控制 reset 成败, 其余给出稳定输出
 git(){
   local a=("$@"); [[ "${a[0]:-}" == "-C" ]] && a=("${a[@]:2}")
@@ -124,7 +136,13 @@ sing-box(){ return 0; }
 mihomo(){ return 0; }
 nft(){ return 0; }
 # 快照: 造真文件让门通过; 回滚: 只记录被调用(并返回0, 便于观察上层是否谎报成功)
-cmd_snapshot(){ _PDG_SNAP_CREATED="$WORK/snap"; mkdir -p "$_PDG_SNAP_CREATED"; : | gzip > "$_PDG_SNAP_CREATED/snap.tar.gz"; return 0; }
+# 本轮契约变化: 服务前像由 **cmd_snapshot** 保存并校验, cmd_update 只**确认**它可用。
+# 桩也照此产出前像; SVCSTATE_RC 非 0 时桩自己失败(= 前像存不下 ⇒ 快照失败),
+# PLAN_RC 非 0 时确认那一步不过(= 前像校验失败)。
+_pdg_svcstate_plan(){ _PDG_SVC_WHY="注入: 前像不可用"; [[ -f "$1/svcstate.tsv" ]] && return "${PLAN_RC:-0}"; return 1; }
+cmd_snapshot(){ _PDG_SNAP_CREATED="$WORK/snap"; mkdir -p "$_PDG_SNAP_CREATED"; : | gzip > "$_PDG_SNAP_CREATED/snap.tar.gz"
+  _pdg_save_svcstate "$_PDG_SNAP_CREATED" || { _PDG_SNAP_CREATED=""; return 1; }
+  return 0; }
 cmd_rollback(){ echo "ROLLBACK_CALLED $*"; return 0; }
 EOF
 
@@ -236,6 +254,34 @@ done
 r=$(run "PLATFORM=ios"); rc="${r%%|*}"; out="${r#*|}"
 { [[ "$rc" == 0 ]] && grep -q '✅ 已更新' <<<"$out" && ! grep -q ROLLBACK_CALLED <<<"$out"; } \
   && ok "iOS: 五个平台组件均安装成功 → 正常完成" || bad "iOS happy: rc=$rc out=$out"
+
+echo
+echo "══ N. 接线自检: 本轮新接的两个替身都不是恒真 ══"
+# 两个失败门**各跑各的**: 每一格跑完立刻核验并把自己的安装计数**留一份**, 再清空进下一格。
+# 以前 N2 是在 PLAN_RC 那一格跑完之后才去读 e2e-inject-count —— 读到的是后一格的记录,
+# 于是"SVCSTATE_RC=1 有没有装文件"这件事其实没被验到。
+# ── 门一: 前像存不下(契约位置在**建快照**那一步, 表现为快照创建失败) ──
+: > "$WORK"/e2e-inject-hit; : > "$WORK"/e2e-inject-count
+_r=$(run "SVCSTATE_RC=1"); _rc="${_r%%|*}"; _out="${_r#*|}"
+_n_save="$(wc -l < "$WORK"/e2e-inject-count)"          # 本格自己的计数, 当场留存
+{ [[ "$_rc" != 0 ]] && grep -q '快照失败' <<<"$_out"; } \
+  && ok "N1: 前像存不下 ⇒ 快照创建失败 ⇒ 中止更新(rc=$_rc)" || bad "N1: 没挡住(rc=$_rc): $(tail -2 <<<"$_out")"
+[[ "$_n_save" == 0 ]] && ok "N2: 这一格一个受管目标都没装(本格计数=$_n_save)" \
+                      || bad "N2: 前像存不下却装了 $_n_save 个受管目标"
+# ── 门二: 前像校验不过(在 cmd_update 动手之前那一步) ──
+: > "$WORK"/e2e-inject-hit; : > "$WORK"/e2e-inject-count
+_r=$(run "PLAN_RC=1"); _prc="${_r%%|*}"; _pout="${_r#*|}"
+_n_plan="$(wc -l < "$WORK"/e2e-inject-count)"          # 本格自己的计数, 当场留存
+{ [[ "$_prc" != 0 ]] && grep -q '服务前像不可用' <<<"$_pout"; } \
+  && ok "N1b: 前像**校验**不过 ⇒ 动手之前中止(rc=$_prc)" || bad "N1b: 没挡住(rc=$_prc): $(tail -2 <<<"$_pout")"
+[[ "$_n_plan" == 0 ]] && ok "N1c: 这一格一个受管目标都没装(本格计数=$_n_plan)" \
+                      || bad "N1c: 校验不过却装了 $_n_plan 个受管目标"
+: > "$WORK"/e2e-inject-hit; : > "$WORK"/e2e-inject-count   # 进下一格前清理, 不留给别人读
+# N3: _update_in_sync 取"已同步"时应走健康短路 —— 证明它是可控输入, 而不是被写死
+_r=$(run "INSYNC_RC=0"); _rc="${_r%%|*}"; _out="${_r#*|}"
+{ [[ "$_rc" == 0 ]] && grep -q '无需更新' <<<"$_out"; } \
+  && ok "N3: 喂'已同步' ⇒ 健康短路(rc=0), 说明本壳默认走的是修复路径而非被写死" \
+  || bad "N3: 喂'已同步'没短路(rc=$_rc): $(tail -2 <<<"$_out")"
 
 echo "────────────────────────────────────────"
 echo "通过 $pass, 失败 $nfail"

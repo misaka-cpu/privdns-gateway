@@ -1,31 +1,131 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
 # 更新快照 + 精确回滚回归(Item 10)。
-#   A. cmd_rollback --dir 精确指定快照: 即使有更新的快照(index 0)也回滚到**指定**那份;
-#      不带 --dir 时仍按 index 0(最近)。
-#   B. cmd_rollback --git <ref>: 回滚后把 REPO_DIR 复位到该提交(还原仓库版本)。
-#   C. 部分恢复失败(git ref 不存在)→ 不谎报"完全回滚", 打印"未完全回滚"并返回 1。
-#   D. 静态: cmd_update 快照失败即中止; 用 --dir "$snap_dir" --git "$pre_sha"(非 cmd_rollback 0);
-#      快照 cand 覆盖已装脚本 + 全部 unit; 越界守卫放行 usr/local/bin。
-# 沙箱化: 覆写 _pdg_apply_snapshot_tree 落到沙箱(不碰真 /), 打桩 systemctl/nft/内核 check。
+#   A. 有效服务前像的健康快照: 文件 / Git / 服务模型后置状态**分别**成立, rc=0, 完整恢复文案;
+#   A0. 精确快照选择(--dir 指定的那份, 不被 index0 顶掉)与默认 index0;
+#   B. **缺**服务前像的历史快照: 文件与 Git 仍按契约恢复, 但"运行态/自启未确认"必须计入
+#      未恢复项、返回非零、不声称完整恢复 —— 这条真实兼容性边界保留, 不改成成功;
+#   C. 指定故障各自命中自己的原因: Git 目标失效 / 内核收敛失败 / 快照内核校验失败;
+#   B2/B3. 元数据派生 Git 目标与字面量 unknown 的处置;
+#   D. 静态: cmd_update 快照失败即中止; 精确 --dir+--git; 快照候选集; 越界守卫。
+#
+# ── 隔离(本轮加) ────────────────────────────────────────────────────────────
+# cmd_rollback 会**直接写绝对路径**(/etc/privdns-gateway/backend、/etc/mihomo、
+# /etc/systemd/system/... )。以前本壳只覆写了"快照落盘"那一个函数, 其余绝对路径写入照样
+# 打在宿主上 —— 在开发机上表现为 Permission denied, 在有权限的机器上就是真的改了宿主。
+# 现在整支在 `unshare -rm`(用户+挂载命名空间)里跑, 把 /etc、/var/lib、/usr/local/bin、
+# /opt、/run 绑到本轮自有的隔离根。**隔离先成立, 才允许运行被测函数**; 隔离不成立就明确
+# 报"未执行"并非零退出, 不退回宿主、不靠"宿主没权限"兜底, 也不给产品加测试开关。
+#
+# ── 真身 / 模型的边界 ───────────────────────────────────────────────────────
+# 真身(抽自 deploy/bot/pdg.sh, 本壳正在核验的就是它们的决策与未恢复项累计):
+#   cmd_rollback · _snap_meta_commit · _snap_meta_label · _pdg_svcstate_plan ·
+#   _pdg_svcstate_valid · _pdg_svcstate_units · _pdg_save_svcstate · _pdg_restore_svcstate ·
+#   _pdg_kernel_converge · _pdg_svc_q · _pdg_svc_known · _pdg_now_en · _pdg_now_ac ·
+#   _pdg_set_enable_state · _nft_apply_main
+# 模型(外部世界, 不冒充真实服务验证):
+#   systemctl —— 按产品注释里记录的真实 enable/disable 语义做的状态机, 不连真 systemd;
+#   nft / mihomo / sing-box 二进制 · _core_kernel_activate(可控) · 内网面板收敛 · iOS 校验。
+# 因此本壳的"服务后置状态成立"指的是**模型后置状态**, 不是真实 systemd 验收。
 # ─────────────────────────────────────────────────────────────────────────────
 set -uo pipefail
+# ═══ 隔离层: 先成立, 再运行被测函数 ═══════════════════════════════════════════
+if [[ -z "${PDG_RB_ISO:-}" ]]; then
+  echo "── 本壳可达的绝对路径写入面(清点, 也是必须隔离的理由) ──"
+  echo "   /etc/privdns-gateway/backend · /etc/mihomo · /etc/systemd/system/*.service ·"
+  echo "   /etc/sing-box 残留清理 · 快照树落盘到 / · /run 与 /var/lib 下的派生物"
+  echo "   外部服务动作: systemctl(daemon-reload/enable/disable/start/stop/show) · nft · 内核二进制"
+  if ! unshare -rm true 2>/dev/null; then
+    echo "[未执行] 本环境不支持 unshare -rm(用户+挂载命名空间)。"
+    echo "         隔离不成立 ⇒ **没有运行任何被测函数**; 不退回宿主, 也不靠'宿主没权限'兜底。"
+    exit 2
+  fi
+  ISO="$(mktemp -d "${TMPDIR:-/tmp}/pdg-rbiso.XXXXXX")" || { echo "[未执行] 建不出隔离根"; exit 2; }
+  mkdir -p "$ISO"/etc "$ISO"/varlib "$ISO"/localbin "$ISO"/opt "$ISO"/run || { echo "[未执行] 隔离根建不全"; rm -rf "$ISO"; exit 2; }
+  cp -a /etc/. "$ISO/etc/" 2>/dev/null || true       # 产品有大量写死的 /etc 路径, 整份复制一次最干净
+  mkdir -p "$ISO/etc/privdns-gateway" "$ISO/etc/systemd/system" "$ISO/etc/mihomo" "$ISO/etc/sing-box"
+  : > "$ISO/etc/.pdg-rollback-iso"                   # 自检标记: 内层看到它才说明 /etc 是本轮的隔离根
+  # 宿主对照**只读取**, 不往宿主写任何探针
+  _host_be="/etc/privdns-gateway/backend"
+  _host_before="$( [[ -e "$_host_be" ]] && sha256sum "$_host_be" 2>/dev/null | cut -d" " -f1 || echo "<不存在>")"
+  # 隔离保护的**定向反例**: 给一个缺自检标记的隔离根, 必须报"未执行"并非零,
+  # 且一条被测断言都不许跑 —— 否则"隔离先成立才运行"这句话就没有实据。
+  _neg="$(mktemp -d)"; mkdir -p "$_neg"/etc "$_neg"/varlib "$_neg"/localbin "$_neg"/opt "$_neg"/run
+  _nrc=0; _nout="$(PDG_RB_ISO="$_neg" unshare -rm bash "$0" 2>&1)" || _nrc=$?
+  rm -rf "$_neg"
+  if [[ "$_nrc" != 0 && "$_nout" == *"[未执行]"* && "$_nout" != *"[OK]"* ]]; then
+    echo "[OK]   隔离反例: 隔离根缺自检标记 ⇒ 报'未执行'并非零退出($_nrc), 零断言"
+  else
+    echo "[FAIL] 隔离反例: 缺标记时没有停(rc=$_nrc)"; echo "$_nout" | head -3 | sed 's/^/       /'
+    _neg_failed=1
+  fi
+  _rc=0
+  PDG_RB_ISO="$ISO" unshare -rm bash "$0" "$@" || _rc=$?
+  [[ -n "${_neg_failed:-}" ]] && _rc=1
+  _host_after="$( [[ -e "$_host_be" ]] && sha256sum "$_host_be" 2>/dev/null | cut -d" " -f1 || echo "<不存在>")"
+  if [[ "$_host_before" == "$_host_after" ]]; then
+    echo "[OK]   隔离复核(宿主侧): $_host_be 在整支运行前后一致($_host_before)"
+  else
+    echo "[FAIL] 隔离复核(宿主侧): $_host_be 被改动了($_host_before → $_host_after)"; _rc=1
+  fi
+  rm -rf "$ISO"
+  exit "$_rc"
+fi
+# ── 内层: 绑定挂载 + 自检 ────────────────────────────────────────────────────
+for _m in "$PDG_RB_ISO/etc:/etc" "$PDG_RB_ISO/varlib:/var/lib" "$PDG_RB_ISO/localbin:/usr/local/bin" \
+          "$PDG_RB_ISO/opt:/opt" "$PDG_RB_ISO/run:/run"; do
+  mount --bind "${_m%%:*}" "${_m##*:}" 2>/dev/null \
+    || { echo "[未执行] 绑定失败: $_m ⇒ 隔离不成立, 未运行被测函数"; exit 2; }
+done
+[[ -e /etc/.pdg-rollback-iso ]] \
+  || { echo "[未执行] 隔离自检失败: /etc 不是本轮隔离根 ⇒ 未运行被测函数"; exit 2; }
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
 pass=0; nfail=0
 ok(){ echo "[OK]   $1"; pass=$((pass+1)); }
 bad(){ echo "[FAIL] $1"; nfail=$((nfail+1)); }
+# 既不算通过也不算失败: 本机无法构造反例的维度如实记在这里, **不计入通过数**。
+nnote=0
+note(){ echo "[NOTE] $1"; nnote=$((nnote+1)); }
 
 # ── 造两份快照(旧 A=OLD / 新 B=NEW), 各含 backend + 判别标记 ──────────────────
 SNAP="$WORK/snaps"; mkdir -p "$SNAP"
+# 预期清单: 在**前像准备阶段**记下本支声明要恢复的东西(相对路径 / 内容摘要 / mode / uid)。
+# 恢复之后直接拿它与隔离目标里的实际文件比 —— 不从恢复后的目标反推期望, 也不是"打印一下
+# 实测值就算核验过"。模式一律**显式 chmod 声明**, 免得期望其实来自当时的 umask。
+mkexpect(){   # $1=快照目录  $2..=本支**显式**列出的相对路径($1/tree 必须还在)
+  # 不做通用枚举: 路径由调用处逐个写死。以前这里是 `find`, 而进程替换里的失败不会成为
+  # while 的失败 —— 已复现: find 吐出一条真实路径后返回 7, mkexpect 仍返回 0, 清单只剩一条,
+  # 于是"完整清单"变成了"碰巧枚举到的那几条"。
+  local d="$1"; shift
+  local rel sha mode uid
+  (( $# > 0 )) || { echo "mkexpect: 没给预期路径" >&2; return 1; }
+  : > "$d/expect.tsv" || return 1
+  for rel in "$@"; do
+    [[ -f "$d/tree/$rel" ]] || { echo "mkexpect: 源树里没有这个预期路径: $rel" >&2; return 1; }
+    # 每一步读取都查退出码, 失败就**向上传播**, 不留下残缺清单给调用方消费
+    sha="$(sha256sum "$d/tree/$rel" | cut -d' ' -f1)" || { echo "mkexpect: 读摘要失败 $rel" >&2; return 1; }
+    mode="$(stat -c %a "$d/tree/$rel")" || { echo "mkexpect: 读 mode 失败 $rel" >&2; return 1; }
+    uid="$(stat -c %u "$d/tree/$rel")"  || { echo "mkexpect: 读 uid 失败 $rel" >&2; return 1; }
+    [[ -n "$sha" && -n "$mode" && -n "$uid" ]] || { echo "mkexpect: 读到空值 $rel" >&2; return 1; }
+    printf '%s\t%s\t%s\t%s\n' "$rel" "$sha" "$mode" "$uid" >> "$d/expect.tsv" || return 1
+  done
+  # 条数必须与要求的条数相等 —— 残缺就不是清单
+  [[ "$(grep -c . "$d/expect.tsv")" == "$#" ]] || { echo "mkexpect: 清单条数不符" >&2; return 1; }
+}
 mksnap(){ # $1=目录名 $2=标记
   local d="$SNAP/$1"; mkdir -p "$d/tree/etc/privdns-gateway"
   printf 'singbox\n' > "$d/tree/etc/privdns-gateway/backend"
   printf '%s\n' "$2" > "$d/tree/etc/privdns-gateway/snapid"
-  tar czf "$d/snap.tar.gz" -C "$d/tree" etc 2>/dev/null; rm -rf "$d/tree"
+  chmod 644 "$d/tree/etc/privdns-gateway/backend"
+  chmod 640 "$d/tree/etc/privdns-gateway/snapid"     # 与 backend 取不同的 mode: 属性判据才有区分力
+  mkexpect "$d" etc/privdns-gateway/backend etc/privdns-gateway/snapid || return 1
+  tar czf "$d/snap.tar.gz" -C "$d/tree" etc 2>/dev/null || return 1; rm -rf "$d/tree"
 }
-mksnap A OLD; sleep 1; mksnap B NEW    # B 更新(mtime 更晚 → ls -t 里 index 0)
+mksnap A OLD || { echo "[FAIL] 造快照 A 失败"; exit 1; }
+sleep 1
+mksnap B NEW || { echo "[FAIL] 造快照 B 失败"; exit 1; }    # B 更新(mtime 更晚 → ls -t 里 index 0)
 
 # ── 沙箱 REPO_DIR: 两提交的 git 仓库 ─────────────────────────────────────────
 REPO="$WORK/repo"; mkdir -p "$REPO"
@@ -52,15 +152,41 @@ sed -n '/^cmd_rollback(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh" > "$WORK/rollback.sh
 # 它只依赖 python3(读 snapshot.json 的 git_commit, 且只认合法哈希 —— 字面量 "unknown"
 # 会被正则挡掉), 抽进来零成本, 比任何桩都忠实。
 sed -n '/^_snap_meta_commit(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh" >> "$WORK/rollback.sh"
+# 本轮补齐: 恢复决策与未恢复项累计**必须用真身**, 不能拿恒真替身顶替 ——
+# 那正是本壳在核验的东西。这批各自的依赖也一并抽进来(按实际调用路径清点, 见交付说明),
+# 只有真正属于"外部世界"的才做模型(systemctl / nft / 内核二进制 / 面板收敛 / iOS 校验)。
+for _f in _snap_meta_label _pdg_svcstate_units _pdg_svc_known _pdg_svc_q _pdg_now_en _pdg_now_ac \
+          _pdg_svcstate_valid _pdg_svcstate_plan _pdg_save_svcstate _pdg_set_enable_state \
+          _pdg_restore_svcstate _pdg_kernel_converge _nft_apply_main _lan_nft_reapply; do
+  sed -n "/^${_f}(){/,/^}/p" "$ROOT/deploy/bot/pdg.sh" >> "$WORK/rollback.sh"
+  grep -q "^${_f}(){" "$WORK/rollback.sh" \
+    || { echo "[FAIL] 抽不到 $_f —— 改名了? 后面的判据全部无效"; exit 1; }
+done
+# 语法必须在**实际加载顺序**下成立: 抽取拼接出来的这一份先 bash -n, 不过就停 ——
+# 语法错误/未定义符号都算执行无效, 不能让它冒充某个故障用例的"预期失败"。
+bash -n "$WORK/rollback.sh" || { echo "[FAIL] 抽取拼出来的壳语法不过 —— 执行无效, 停止"; exit 1; }
 grep -q '^_snap_meta_commit(){' "$WORK/rollback.sh" \
   || { echo "[FAIL] 抽不到 _snap_meta_commit —— 改名了? 后面的判据全部无效"; exit 1; }
 # 快照里不含 etc/sing-box/config.json 与 etc/nftables.conf → 内核/nft 校验分支被跳过,
 # 无需真 sing-box/mihomo/nft 二进制(也就不必打桩带连字符的函数名)。
-cat > "$WORK/harness.sh" <<EOF
+# harness 的生成分两段, 把"要展开的"和"要原样保留的"**显式分开** ——
+# 以前整段用未引用的 <<EOF: 正文里需要展开的只有 WORK/SNAP/REPO 三个路径, 代价却是**整段**
+# 都进了 shell 的展开: 注释里的 `cp -a` 被当成命令替换, 在**生成阶段**真的执行了一次
+# (生成段 rc 仍是 0, 只在 stderr 留下两行 "cp: missing file operand"), 而那段注释被替换成空。
+# 现在: 三个路径用 printf %q 显式写在前面(引号安全), 其余正文一律走带引号的 heredoc。
+# --- harness-gen: BEGIN(G 节按这两行标记抽出本段单独运行) ---
+{ printf 'WORK=%q\n'  "$WORK"
+  printf 'SNAP=%q\n'  "$SNAP"
+  printf 'REPO=%q\n'  "$REPO"
+} > "$WORK/harness.sh"
+cat >> "$WORK/harness.sh" <<'HARNESSEOF'
 SNAP_DIR="$SNAP"
+# _lan_nft_reapply 读这个全局(产品有意不写死路径)。指到本壳自有文件: 不存在即早退,
+# 于是不会去碰隔离根外的任何 nft 配置。
+LAN_NFT_CONF="$WORK/lan-nft.conf"
 REPO_DIR="$REPO"
 need_root(){ :; }; _lock(){ :; }
-c_g(){ echo "\$*"; }; c_y(){ echo "\$*"; }
+c_g(){ echo "$*"; }; c_y(){ echo "$*"; }
 _pdg_core(){ echo singbox; }
 _pdg_core_svc(){ echo sing-box; }
 _pdg_mktemp_dir(){ mktemp -d; }
@@ -71,20 +197,153 @@ pdg_write_unit(){ return 0; }
 pdg_unit_mihomo(){ echo "[Unit]"; }
 _pdg_drop_singbox_files(){ :; }
 _pdg_singbox_is_ours(){ return 1; }
-systemctl(){ return 0; }
 nft(){ return 0; }
-# 覆写落盘: 不碰真 /, 把被应用快照的判别标记抄到沙箱, 供断言"回滚到了哪份"
+# 快照落盘: 隔离已成立, 这里**真的把树落到隔离根的 /**。
 APPLIED="$WORK/applied_snapid"
-_pdg_apply_snapshot_tree(){ cat "\$1/etc/privdns-gateway/snapid" > "\$APPLIED" 2>/dev/null; return 0; }
+_pdg_apply_snapshot_tree(){
+  # 逐文件落盘: 目录用 mkdir -p 现建(不碰已存在目录的元数据), 文件用 `cp -PpT`。
+  #
+  # 为什么不是一句 tar: 隔离根只绑了 /usr/local/bin、没绑 /usr, 而快照里有 usr/local/bin/...。
+  # tar 会去给归档里的目录成员(含 `.` 也就是 / 本身)设模式, 在命名空间里被拒:
+  #   tar: .: Cannot change mode to rwx------: Operation not permitted   → rc=2
+  # 加 --no-overwrite-dir 也没挡住(本机实测)。逐文件复制就没有这一类"改目录元数据"的动作。
+  #
+  # `-T` 不能省: 少了它, 当目标同路径**已经是一个目录**时, `cp` 会把文件拷进那个目录里
+  # (变成 .../snapid/snapid)并返回 0 —— 落盘其实没发生, 却报成功。-T 让这种情形直接失败。
+  #
+  # 任何一步失败都**立刻返回非零**, 并且**不生成任何代表"恢复成功"的标记** ——
+  # 失败要传回真正的调用方 cmd_rollback, 不是在辅助函数里记一笔就算了。
+  local tree="$1" dest="${3:-/}" rel list
+  # **先确认枚举成功, 再开始复制**。以前是 `done < <(cd "$tree" && find …)`: 进程替换里的
+  # 失败不会变成 while 的失败, 一条都没枚举到时循环体一次都不跑, 函数照样走到最后 ——
+  # 而目标里预先存在的旧同名文件会把这一切掩盖成"本次恢复成功"(已复现: 受控 find 返回 7,
+  # 以及源目录不存在导致 cd 失败, 两种都返回 0 并重新生成 APPLIED=HEALTHY)。
+  # 改成: 枚举结果先落到**本次自有清单**, 显式查退出码, 再据清单复制。
+  list="$(mktemp)" || return 1
+  if ! ( cd "$tree" && find . -mindepth 1 \( -type f -o -type l \) -print0 ) > "$list" 2>/dev/null; then
+    rm -f "$list"; return 1                      # cd 失败或 find 非零 —— 清单不可信, 不动目标
+  fi
+  # 空清单不当成"这份快照没东西要恢复": 本壳造的快照都至少有 etc/privdns-gateway 下那两个文件,
+  # 枚举成功却一条都没有, 只能是枚举本身出了问题。
+  # (rc=0 且非空 是这里能拿到的完整性信号; find 自己遇到错误会以非零退出, 上面那一关已经挡住。)
+  [[ -s "$list" ]] || { rm -f "$list"; return 1; }
+  while IFS= read -r -d '' rel; do
+    rel="${rel#./}"
+    mkdir -p "$dest/${rel%/*}" 2>/dev/null || { rm -f "$list"; return 1; }
+    cp -PpT "$tree/$rel" "$dest/$rel" 2>/dev/null || { rm -f "$list"; return 1; }
+  done < "$list"
+  rm -f "$list"
+  # 判别标记从**目标**读回, 不是从源树抄 —— 源树里那份一直都在, 抄它证明不了落盘发生过。
+  # 它只用来辅助辨认"落的是哪一份快照"; 文件是否真的恢复由断言直接查隔离目标里的实际文件。
+  cat "$dest/etc/privdns-gateway/snapid" > "$APPLIED" 2>/dev/null || return 1
+  return 0; }
 # 覆盖生产文件之前的 iOS 联合校验(见 pdg.sh _pdg_ios_verify_tree)。这些快照里根本没有
 # iOS 生命周期成员, 生产里它会直接 return 0 —— 这里打桩只是因为本壳没抽那一批函数。
 _pdg_ios_verify_tree(){ return 0; }
 # 内网面板的回滚收敛(见 pdg.sh _lan_rollback_converge)。同样是"本壳没抽那一批函数"才打的桩 ——
 # 收敛本身由 tests/test-lan-rollback-convergence.sh 跑真函数覆盖, 这里只要它不影响本壳的判据。
 _lan_rollback_converge(){ return 0; }
-EOF
+HARNESSEOF
+# --- harness-gen: END ---
 
-run(){ bash -c "source '$WORK/harness.sh'; source '$WORK/rollback.sh'; cmd_rollback $1" 2>&1; }
+
+# ── 外部服务动作的模型, 单独一份文件(**带引号 heredoc**, 内容原样保留) ──────
+# model.sh 用的是**带引号**的 heredoc, 里面的 $WORK 要到 source 时才展开 —— 必须导出。
+export WORK
+# 按预期清单核对隔离目标里的实际文件。四维分别判, 每一维都参与判定(不是只打印)。
+# 返回: 0=全部相符; 非 0=有不符, 具体差异写进 $EXPECT_WHY。
+EXPECT_WHY=""
+expect_check_paths(){   # $1=快照目录  $2..=本场景**要求全部在场**的相对路径
+  # 以前是按正则过滤 + "至少匹配一条就算数" —— 清单残缺时, 没在清单里的必需路径根本不会
+  # 被检查(已复现: config.yaml 与 mihomo 不存在也照样通过)。现在逐个点名要, 缺一条即判红。
+  local d="$1"; shift
+  local rel line n=0
+  EXPECT_WHY=""
+  [[ -s "$d/expect.tsv" ]] || { EXPECT_WHY="没有预期清单(前像准备阶段没记或失败了)"; return 1; }
+  for rel in "$@"; do
+    line="$(awk -F'\t' -v r="$rel" '$1==r{print; exit}' "$d/expect.tsv")"
+    if [[ -z "$line" ]]; then EXPECT_WHY="$EXPECT_WHY 清单缺必需路径 $rel;"; continue; fi
+    n=$((n+1)); _expect_cmp_line "$line"
+  done
+  (( n == $# )) || return 1
+  [[ -z "$EXPECT_WHY" ]]
+}
+_expect_cmp_line(){   # $1=清单里的一行: 四维逐个比, 每一维都参与判定
+  local rel want_sha want_mode want_uid got_sha got_mode got_uid
+  IFS=$'\t' read -r rel want_sha want_mode want_uid <<<"$1"
+  if [[ ! -f "/$rel" ]]; then EXPECT_WHY="$EXPECT_WHY /$rel:不存在;"; return 0; fi
+  got_sha="$(sha256sum "/$rel" | cut -d' ' -f1)"
+  got_mode="$(stat -c %a "/$rel")"
+  got_uid="$(stat -c %u "/$rel")"
+  [[ "$got_sha"  == "$want_sha"  ]] || EXPECT_WHY="$EXPECT_WHY /$rel:内容不符;"
+  [[ "$got_mode" == "$want_mode" ]] || EXPECT_WHY="$EXPECT_WHY /$rel:mode ${got_mode}≠${want_mode};"
+  [[ "$got_uid"  == "$want_uid"  ]] || EXPECT_WHY="$EXPECT_WHY /$rel:uid ${got_uid}≠${want_uid};"
+}
+cat > "$WORK/model.sh" <<'MODELEOF'
+# ── 外部服务动作: **唯一**的模型点(systemctl 状态机) ────────────────────────
+# 不连真 systemd。语义照 pdg.sh 里 _pdg_set_enable_state 上方那段"在真 systemd 上实测过"
+# 的记录来: enable→enabled; 已 enabled 再 enable --runtime 仍 enabled; disable→enabled-runtime;
+# enabled-runtime 上只 disable 仍 enabled-runtime; disable --runtime→disabled。
+# 状态落在自有文件里, 断言据此核对"服务模型后置状态", **不冒充真实 systemd 验收**。
+SVCD="$WORK/svc"; mkdir -p "$SVCD"
+svc_set(){ printf '%s\n' "$2" > "$SVCD/$1.en"; printf '%s\n' "$3" > "$SVCD/$1.ac"
+           printf '%s\n' "${4:-running}" > "$SVCD/$1.sub"; printf 'INV-%s-0\n' "$1" > "$SVCD/$1.inv"; }
+svc_en(){ cat "$SVCD/$1.en" 2>/dev/null || echo not-found; }
+svc_ac(){ cat "$SVCD/$1.ac" 2>/dev/null || echo not-found; }
+systemctl(){
+  local sub="${1:-}"; shift || true
+  local rt=0; [[ "${1:-}" == "--runtime" ]] && { rt=1; shift; }
+  [[ "${1:-}" == "--now" ]] && shift
+  local u="${1:-}"
+  case "$sub" in
+    daemon-reload|reset-failed) return 0;;
+    is-enabled) svc_en "$u";;
+    is-active)  svc_ac "$u";;
+    show)
+      local prop="" val=""
+      for a in "$@"; do [[ "$a" == -p ]] && continue; [[ "$a" == --value ]] && continue
+                        [[ "$a" == LoadState || "$a" == SubState || "$a" == InvocationID ]] && prop="$a"; done
+      u="${@: -1}"
+      case "$prop" in
+        LoadState)    [[ -e "$SVCD/$u.en" ]] && val=loaded || val=not-found;;
+        SubState)     val="$(cat "$SVCD/$u.sub" 2>/dev/null)";;
+        InvocationID) val="$(cat "$SVCD/$u.inv" 2>/dev/null)";;
+      esac
+      printf '%s\n' "$val";;
+    enable)
+      local cur; cur="$(svc_en "$u")"
+      if (( rt )); then [[ "$cur" == enabled ]] || printf 'enabled-runtime\n' > "$SVCD/$u.en"
+      else printf 'enabled\n' > "$SVCD/$u.en"; fi;;
+    disable)
+      local cur; cur="$(svc_en "$u")"
+      if (( rt )); then printf 'disabled\n' > "$SVCD/$u.en"
+      else [[ "$cur" == enabled ]] && printf 'enabled-runtime\n' > "$SVCD/$u.en"
+           [[ "$cur" == disabled ]] && printf 'disabled\n' > "$SVCD/$u.en"; fi
+      [[ "$DISABLE_NOW_STOPS" == 1 ]] && printf 'inactive\n' > "$SVCD/$u.ac";;
+    start|restart)
+      printf 'active\n' > "$SVCD/$u.ac"; printf 'running\n' > "$SVCD/$u.sub"
+      printf 'INV-%s-%s\n' "$u" "$RANDOM$RANDOM" > "$SVCD/$u.inv";;
+    stop) printf 'inactive\n' > "$SVCD/$u.ac"; printf 'dead\n' > "$SVCD/$u.sub";;
+    *) return 0;;
+  esac
+  return 0
+}
+DISABLE_NOW_STOPS=1
+# 八个 unit 的初始模型状态(与 _pdg_svcstate_units 的清单一致)
+svc_init(){
+  local u
+  for u in pdg-mitm pdg-bot pdg-probe81 mosdns mihomo pdg-dotwitness pdg-health.timer pdg-rules-update.timer; do
+    svc_set "$u" "${1:-enabled}" "${2:-active}"
+  done
+}
+nft(){ return 0; }
+# _pdg_svcstate_plan / _pdg_restore_svcstate 用到的全局: 关联数组必须先声明, 否则赋值会变成
+# 普通变量; _PDG_SVC_SRC 初值为空(plan 靠它判"同一份快照不重复解析")。
+declare -A _PDG_WANT_EN=() _PDG_WANT_AC=() _PDG_WANT_URC=() _PDG_WANT_ARC=()
+_PDG_SVC_SRC=""; _PDG_SVC_MODE=blind; _PDG_SVC_WHY=""; _PDG_SVCSTATE_WHY=""
+MODELEOF
+
+run(){ bash -c "source '$WORK/harness.sh'; source '$WORK/model.sh'; source '$WORK/rollback.sh'; cmd_rollback $1" 2>&1; }
 
 # ── A. --dir 精确回滚(指到旧的 A, 而非 index0 的 B) ─────────────────────────
 rm -f "$WORK/applied_snapid"; out=$(run "--dir '$SNAP/A'")
@@ -96,11 +355,43 @@ rm -f "$WORK/applied_snapid"; out=$(run "0")
 [[ "$(cat "$WORK/applied_snapid" 2>/dev/null)" == NEW ]] \
   && ok "无 --dir → 默认 index0 仍回滚到最近 B" || bad "A2: applied=$(cat "$WORK/applied_snapid" 2>/dev/null) out=$out"
 
-# ── B. --git 复位仓库 ────────────────────────────────────────────────────────
+# ── B 类. **缺**服务前像的历史快照: 文件与 Git 照旧恢复, 但运行态/自启未确认 ─────────
+# 快照 A 是老格式(没有 svcstate.tsv)。这是真实存在的兼容性边界, 不能改成"成功":
+# 文件和 Git 该恢复的仍要恢复, 但"运行态/自启无法确认"必须计入未恢复项、返回非零、
+# 且不得声称完整恢复。
+# 四件事**分别判** —— 原来它们挤在一个 && 链里, 于是"HEAD 其实已经复位"会被"没有完整成功
+# 文案"一起判成失败, 读起来像 HEAD 没复位(134 号原始日志里 '仓库已复位到…' 就在那儿)。
 e2e_git "$REPO" reset --hard -q "$HEAD_REF"
-out=$(run "--dir '$SNAP/A' --git '$GOOD_REF'")
+rc=0; out=$(run "--dir '$SNAP/A' --git '$GOOD_REF'") || rc=$?
 [[ "$(git -C "$REPO" rev-parse HEAD)" == "$GOOD_REF" ]] \
-  && echo "$out" | grep -q '已回滚并重启服务' && ok "--git: REPO_DIR 复位到指定提交 + 报完全回滚" || bad "B: HEAD=$(git -C "$REPO" rev-parse HEAD) out=$out"
+  && ok "B-git: --git 指定的提交**确实复位了**(HEAD=${GOOD_REF:0:12})" \
+  || bad "B-git: HEAD=$(git -C "$REPO" rev-parse HEAD) 期望 ${GOOD_REF:0:12}"
+# 文件判据直接查**隔离目标里的实际文件**: 存在性 + 内容 + 属性。
+# applied_snapid 只作辅助辨认(它本身也是从目标读回的), 不能替代落盘证据。
+# 四维(存在性/内容/mode/uid)对着**前像准备阶段记下的预期**逐条比, 每一维都参与判定。
+# 注: backend 那一个由 cmd_rollback 在落盘之后按"当前唯一内核"改写成 mihomo, 属产品行为,
+# 不在快照恢复的预期之列 —— 所以预期清单只核 snapid 这类快照原样恢复的文件(见下一行过滤)。
+if expect_check_paths "$SNAP/A" etc/privdns-gateway/snapid; then
+  ok "B-file: 目标文件四维全符(存在/内容/mode $(stat -c %a /etc/privdns-gateway/snapid)/uid $(stat -c %u /etc/privdns-gateway/snapid))"
+else bad "B-file: $EXPECT_WHY"; fi
+# 两类契约要分开: snapid 这类**按快照原样恢复**; backend 则由产品在落盘之后按"当前唯一内核"
+# 收敛成 mihomo(快照里存的是 singbox)。上一轮改四维比对时只核了 snapid, 这条覆盖掉了, 补回。
+[[ "$(cat /etc/privdns-gateway/backend 2>/dev/null)" == mihomo ]] \
+  && ok "B-backend: backend 按产品规则收敛为 mihomo(快照里是 singbox, 不是原样恢复)" \
+  || bad "B-backend: backend=$(cat /etc/privdns-gateway/backend 2>/dev/null) 期望 mihomo"
+# 反例: 其它文件正确、**只有 backend 错**, 这条断言必须判红(而四维比对照样通过)
+printf 'singbox\n' > /etc/privdns-gateway/backend
+if expect_check_paths "$SNAP/A" etc/privdns-gateway/snapid; then
+  [[ "$(cat /etc/privdns-gateway/backend)" == mihomo ]] \
+    && bad "B-backend-neg: 只改坏 backend 却仍判通过" \
+    || ok "B-backend-neg: 只有 backend 错(其它文件四维仍全符)⇒ 这条断言**判红** —— 它确实在起作用"
+else bad "B-backend-neg: 其它文件本不该受影响: $EXPECT_WHY"; fi
+printf 'mihomo\n' > /etc/privdns-gateway/backend
+[[ "$rc" != 0 ]] && ok "B-rc: 缺前像 ⇒ 返回非零($rc), 不当成完整成功" || bad "B-rc: 缺前像却返回 0"
+grep -q '运行态/自启未确认' <<<"$out" \
+  && ok "B-unrestored: 未恢复项里明确列出'运行态/自启未确认'" || bad "B-unrestored: 未列出, out=$out"
+grep -q '✅ 已回滚并重启服务' <<<"$out" \
+  && bad "B-文案: 缺前像却打了完整恢复文案" || ok "B-文案: 没有声称完整恢复(打的是'未完全回滚')"
 
 # ── B2. 不带 --git 时, 目标从**快照自己记的** git_commit 派生 ────────────────
 # 这一格是补上来的: 本壳原来每个用例都显式传 --git, 于是 _snap_meta_commit 那条路径
@@ -142,11 +433,63 @@ _pdg_core(){ if [[ -s "\$PRE" ]]; then echo singbox; else echo mihomo; printf x 
 pdg_write_unit(){ return 0; }
 _core_kernel_activate(){ return 1; }        # 注入: 快照核激活失败
 EOF
-runx(){ bash -c "source '$WORK/harness.sh'; source '$WORK/xcore.sh'; source '$WORK/rollback.sh'; cmd_rollback $1" 2>&1; }
+runx(){ bash -c "source '$WORK/harness.sh'; source '$WORK/model.sh'; source '$WORK/xcore.sh'; source '$WORK/rollback.sh'; cmd_rollback $1" 2>&1; }
 rc=0; out=$(runx "--dir '$SNAP/A'") || rc=$?
 { [[ "$rc" != 0 ]] && grep -q '未完全回滚' <<<"$out" && ! grep -q '✅ 已回滚并重启服务' <<<"$out"; } \
   && ok "跨内核回滚: 内核激活失败 → 非0 + '未完全回滚' + 不报'✅ 已回滚'" || bad "C3: rc=$rc out=$out"
-grep -q '内核激活' <<<"$out" && ok "  未恢复项明确列出'内核激活'" || bad "C3b: 未列出失败项 out=$out"
+# 具名原因按**产品实际用到的标签**核: 产品累计的是"内核收敛(mihomo/sing-box)";
+# "内核激活"只出现在一句注释里(pdg.sh 里 grep 得到 1 处, 且是注释)。
+# 这里不是放宽 —— 仍然要求点名到内核这一项, 只是对账到产品真正会打出来的那个词。
+grep -q '内核收敛' <<<"$out" \
+  && ok "  未恢复项明确点名内核那一项('内核收敛')" || bad "C3b: 未列出失败项 out=$out"
+
+# ── A 类. 有效服务前像的健康快照: 文件 / Git / 服务模型后置状态**分别**成立 ──────────
+# 前像用**产品既有的 _pdg_save_svcstate 真身**生成(不伪造有效标签): 先把模型里的服务状态
+# 摆成"回滚目标应有的样子", 让产品自己拍下前像; 再把现状打乱; 回滚后逐项核对是否收敛回去。
+mksnap H HEALTHY
+mkpre(){   # $1=快照目录: 跑产品真身写 svcstate.tsv
+  bash -c "source '$WORK/harness.sh'; source '$WORK/model.sh'; source '$WORK/rollback.sh'; \
+           svc_init enabled active; _pdg_save_svcstate '$1'" >/dev/null 2>&1
+}
+mkpre "$SNAP/H"
+[[ -s "$SNAP/H/svcstate.tsv" ]] \
+  && ok "A-pre: 前像由产品真身 _pdg_save_svcstate 生成($(grep -c $'^unit\t' "$SNAP/H/svcstate.tsv") 个 unit), 不是伪造的标签" \
+  || bad "A-pre: 前像没生成出来"
+printf '{"id":"H","source":"cli","op":"update","git_commit":"%s"}\n' "$GOOD_REF" > "$SNAP/H/snapshot.json"
+# 打乱现状: 全部停用 + 关自启 —— 回滚要把它们按前像收敛回 enabled+active
+bash -c "source '$WORK/harness.sh'; source '$WORK/model.sh'; svc_init disabled inactive" >/dev/null 2>&1
+e2e_git "$REPO" reset --hard -q "$HEAD_REF"
+rm -f "$WORK/applied_snapid"; rc=0; out=$(run "--dir '$SNAP/H' --git '$GOOD_REF'") || rc=$?
+[[ "$rc" == 0 ]] && ok "A-rc: 有效前像的健康快照 ⇒ rc=0" || bad "A-rc: rc=$rc out=$out"
+if expect_check_paths "$SNAP/H" etc/privdns-gateway/snapid; then
+  ok "A-file: 目标文件四维全符(存在/内容/mode $(stat -c %a /etc/privdns-gateway/snapid)/uid $(stat -c %u /etc/privdns-gateway/snapid))"
+else bad "A-file: $EXPECT_WHY"; fi
+[[ "$(git -C "$REPO" rev-parse HEAD)" == "$GOOD_REF" ]] \
+  && ok "A-git: 仓库复位到指定提交" || bad "A-git: HEAD=$(git -C "$REPO" rev-parse HEAD)"
+_bad_svc=""
+for u in mosdns mihomo pdg-bot pdg-probe81; do
+  [[ "$(cat "$WORK/svc/$u.en" 2>/dev/null)" == enabled && "$(cat "$WORK/svc/$u.ac" 2>/dev/null)" == active ]] \
+    || _bad_svc="$_bad_svc $u($(cat "$WORK/svc/$u.en" 2>/dev/null)/$(cat "$WORK/svc/$u.ac" 2>/dev/null))"
+done
+[[ -z "$_bad_svc" ]] \
+  && ok "A-svc: **服务模型**后置状态按前像收敛回 enabled+active(不是真实 systemd 验收)" \
+  || bad "A-svc: 未收敛:$_bad_svc"
+grep -q '✅ 已回滚并重启服务' <<<"$out" \
+  && ok "A-文案: 允许完整恢复文案(未恢复项为空时才打)" || bad "A-文案: out=$out"
+
+# ── A 反例. 前像判据不是恒真: 把 H 的前像改坏, 必须被具名拒绝并计入未恢复项 ──────────
+cp "$SNAP/H/svcstate.tsv" "$WORK/svcstate.good"
+printf 'unit\tbogus\tenabled\t0\tactive\t0\trunning\tX\n' >> "$SNAP/H/svcstate.tsv"   # 摘要当场对不上
+bash -c "source '$WORK/harness.sh'; source '$WORK/model.sh'; svc_init disabled inactive" >/dev/null 2>&1
+e2e_git "$REPO" reset --hard -q "$HEAD_REF"
+rc=0; out=$(run "--dir '$SNAP/H' --git '$GOOD_REF'") || rc=$?
+[[ "$rc" != 0 ]] && ok "A-neg-rc: 前像被改坏 ⇒ 非零($rc), 没有当成健康快照" || bad "A-neg-rc: 改坏了还返回 0"
+grep -q '前像不可用' <<<"$out" \
+  && ok "A-neg-why: 具名拒绝($(grep -o '前像不可用[^;)]*' <<<"$out" | head -1))" || bad "A-neg-why: 没说为什么, out=$out"
+grep -q '运行态/自启未确认' <<<"$out" \
+  && ok "A-neg-unrestored: 并计入未恢复项, 不是静默降级" || bad "A-neg-unrestored: 未计入"
+grep -q '✅ 已回滚并重启服务' <<<"$out" && bad "A-neg-文案: 仍打了完整恢复文案" || ok "A-neg-文案: 未声称完整恢复"
+cp "$WORK/svcstate.good" "$SNAP/H/svcstate.tsv"
 
 # ── C4. 校验快照旧配置要用**快照自带的内核**, 不能用当前(新)内核 ──────────────
 # 场景: 新内核拒绝旧配置(正是要回滚的原因)。若拿当前新内核去校验快照里的旧配置, 它当然
@@ -157,6 +500,10 @@ mkmihomo_snap(){  # $1=目录名 $2=快照内核的 check 退出码
   printf 'SNAP-M\n'  > "$d/tree/etc/privdns-gateway/snapid"
   printf 'mixed-port: 7890\n' > "$d/tree/etc/mihomo/config.yaml"
   printf '#!/bin/sh\nexit %s\n' "$2" > "$d/tree/usr/local/bin/mihomo"; chmod 755 "$d/tree/usr/local/bin/mihomo"
+  chmod 644 "$d/tree/etc/privdns-gateway/backend"; chmod 640 "$d/tree/etc/privdns-gateway/snapid"
+  chmod 600 "$d/tree/etc/mihomo/config.yaml"
+  mkexpect "$d" etc/privdns-gateway/backend etc/privdns-gateway/snapid \
+                etc/mihomo/config.yaml usr/local/bin/mihomo || return 1
   # 按 cmd_snapshot 的方式打**显式成员路径**: 递归打 usr 会带出 usr/ 目录项, 触发越界守卫
   tar czf "$d/snap.tar.gz" -C "$d/tree" etc/privdns-gateway etc/mihomo usr/local/bin/mihomo 2>/dev/null
   rm -rf "$d/tree"
@@ -167,12 +514,17 @@ mihomo(){ return 1; }
 _pdg_core(){ echo mihomo; }
 _pdg_core_svc(){ echo mihomo; }
 EOF
-runm(){ bash -c "source '$WORK/harness.sh'; source '$WORK/curkernel.sh'; source '$WORK/rollback.sh'; cmd_rollback $1" 2>&1; }
+runm(){ bash -c "source '$WORK/harness.sh'; source '$WORK/model.sh'; source '$WORK/curkernel.sh'; source '$WORK/rollback.sh'; cmd_rollback $1" 2>&1; }
 
 mkmihomo_snap M_OK 0            # 快照自带的 mihomo 接受旧配置
+# 这一格的被测对象是"用哪一个内核去校验旧配置", 不是前像。给它一份**真身生成的**有效前像,
+# 否则它会因为"缺服务前像"必然非零 —— 那就测不到内核校验这件事了。
+mkpre "$SNAP/M_OK"
+bash -c "source '$WORK/harness.sh'; source '$WORK/model.sh'; svc_init enabled active" >/dev/null 2>&1
 rm -f "$WORK/applied_snapid"; rc=0; out=$(runm "--dir '$SNAP/M_OK'") || rc=$?
-{ [[ "$rc" == 0 ]] && [[ "$(cat "$WORK/applied_snapid" 2>/dev/null)" == SNAP-M ]]; } \
-  && ok "快照内核接受旧配置 → 回滚成功落盘(不被当前新内核挡住)" || bad "C4a: rc=$rc out=$out"
+if [[ "$rc" == 0 ]] && expect_check_paths "$SNAP/M_OK" etc/privdns-gateway/snapid etc/mihomo/config.yaml usr/local/bin/mihomo; then
+  ok "C4a: 快照内核接受旧配置 → 回滚成功落盘, 且三个文件四维全符(含 mihomo mode $(stat -c %a /usr/local/bin/mihomo))"
+else bad "C4a: rc=$rc $EXPECT_WHY out=$(tail -2 <<<"$out")"; fi
 
 mkmihomo_snap M_BAD 1           # 快照自带的 mihomo 也拒绝 → 这份快照真的不可用
 rm -f "$WORK/applied_snapid"; rc=0; out=$(runm "--dir '$SNAP/M_BAD'") || rc=$?
@@ -206,6 +558,336 @@ for _bad in 'var/lib/privdns-gateway/tx/abc/before' 'var/lib/privdns-gateway/bac
 done
 ok "守卫仍然拦住 tx 记录/备份包/其它 var 路径(没有放宽成整个 var/lib)"
 
+echo
+echo "══ F. 落盘失败必须传到调用方; 文件证据必须来自目标 ══"
+# 直接反例(真实文件系统, 不是模拟): 目标同路径是一个**带哨兵的非空目录**, 源里是普通文件。
+rm -f /etc/privdns-gateway/snapid
+mkdir -p /etc/privdns-gateway/snapid && printf 'SENTINEL\n' > /etc/privdns-gateway/snapid/keep
+rm -f "$WORK/applied_snapid"
+e2e_git "$REPO" reset --hard -q "$HEAD_REF"
+rc=0; out=$(run "--dir '$SNAP/H' --git '$GOOD_REF'") || rc=$?
+[[ "$rc" != 0 ]] && ok "F1: 落盘失败 ⇒ **调用方** cmd_rollback 返回非零($rc), 不是只在辅助函数里记一笔" \
+                 || bad "F1: 落盘失败却返回 0"
+grep -q '快照落盘失败' <<<"$out" && ok "F2: 并点名是落盘这一步失败" || bad "F2: 没点名, out=$(tail -2 <<<"$out")"
+[[ ! -s "$WORK/applied_snapid" ]] \
+  && ok "F3: **没有生成**代表恢复成功的标记(applied 为空)" || bad "F3: 仍写了标记: $(cat "$WORK/applied_snapid")"
+[[ -d /etc/privdns-gateway/snapid && "$(cat /etc/privdns-gateway/snapid/keep 2>/dev/null)" == SENTINEL ]] \
+  && ok "F4: 目标那一路径仍是原来的非空目录, 哨兵还在(确实没落盘)" || bad "F4: 目标被改了"
+[[ ! -f /etc/privdns-gateway/snapid ]] \
+  && ok "F5: 目标处**没有**出现那个普通文件 —— 与'函数返回成功'区分开" || bad "F5: 竟然出现了普通文件"
+# 撤销对照: 把替身改回"只看生产端 + 从源树抄标记", 同一反例必须重新暴露
+cat > "$WORK/apply-broken.sh" <<'BROKENEOF'
+_pdg_apply_snapshot_tree(){
+  local tree="$1" dest="${3:-/}"
+  tar cf - -C "$tree" . 2>/dev/null | tar xf - -C "$dest" --no-overwrite-dir 2>/dev/null
+  [[ "${PIPESTATUS[0]}" == 0 ]] || return 1
+  cat "$tree/etc/privdns-gateway/snapid" > "$APPLIED" 2>/dev/null; return 0; }
+BROKENEOF
+runbroken(){ bash -c "source '$WORK/harness.sh'; source '$WORK/model.sh'; source '$WORK/apply-broken.sh'; source '$WORK/rollback.sh'; cmd_rollback $1" 2>&1; }
+rm -f "$WORK/applied_snapid"; e2e_git "$REPO" reset --hard -q "$HEAD_REF"
+brc=0; bout=$(runbroken "--dir '$SNAP/H' --git '$GOOD_REF'") || brc=$?
+{ [[ "$(cat "$WORK/applied_snapid" 2>/dev/null)" == HEALTHY ]] && [[ ! -f /etc/privdns-gateway/snapid ]] \
+  && ! grep -q '快照落盘失败' <<<"$bout"; } \
+  && ok "F6: 撤销修复后**同一反例重新暴露**(标记写成 HEALTHY, 目标文件却不存在, 也没报落盘失败)" \
+  || bad "F6: 撤销对照没重现(applied=$(cat "$WORK/applied_snapid" 2>/dev/null) rc=$brc)"
+rm -rf /etc/privdns-gateway/snapid
+
+echo
+echo "══ L. 快照目录的路径表示: 序号与 --dir 必须指向同一份 ══"
+# 序号那条路走 `ls -1dt "$SNAP_DIR"/*/`, 每一项**带末尾斜杠**; 服务前像里记的 snap_dir 不带。
+# 直接比字符串的话, `pdg rollback 0` 回滚自己刚拍的那一份也会被判成"记的是别的快照"。
+_l_reset(){ bash -c "source '$WORK/harness.sh'; source '$WORK/model.sh'; svc_init disabled inactive" >/dev/null 2>&1
+            e2e_git "$REPO" reset --hard -q "$HEAD_REF"; }
+_l_run(){   # $1=cmd_rollback 的选择参数 $2=用哪一份 rollback 壳
+  local rb="${2:-$WORK/rollback.sh}"
+  _l_reset
+  L_OUT="$(bash -c "source '$WORK/harness.sh'; source '$WORK/model.sh'; source '$rb'
+                    svc_init disabled inactive; cmd_rollback $1; echo LRC=\$?" 2>&1)"
+  L_RC="$(grep -o 'LRC=[0-9]*' <<<"$L_OUT" | tail -1 | cut -d= -f2)"
+}
+_l_fresh(){ rm -rf "$SNAP/L"; mksnap L LCASE || return 1; mkpre "$SNAP/L" || return 1
+            printf '{"id":"L","source":"cli","op":"update","git_commit":"%s"}\n' "$GOOD_REF" > "$SNAP/L/snapshot.json"; }
+_l_fresh || bad "L-前提: 造不出快照"
+# 这一支的 SNAP_DIR 里同时有 A/B/H 等夹具, 序号 0 未必是 L —— 直接按 ls -1dt 取 L 的序号
+_l_idx=-1; _l_i=0
+  while IFS= read -r _d; do [[ "${_d%/}" == "$SNAP/L" ]] && { _l_idx=$_l_i; break; }; _l_i=$((_l_i+1)); done \
+    < <(ls -1dt "$SNAP"/*/ 2>/dev/null)
+if (( _l_idx >= 0 )); then
+  _l_run "$_l_idx"
+  { [[ "$L_RC" == 0 ]] && grep -q '按本次前像恢复' <<<"$L_OUT"; } \
+    && ok "L1: **按序号选择**(带末尾斜杠那条路)⇒ rc=0 且按前像恢复" \
+    || bad "L1: rc=$L_RC: $(grep -o '记的是别的快照[^;]*' <<<"$L_OUT" | head -1)"
+else bad "L1: 找不到 L 的序号"; fi
+_l_run "--dir '$SNAP/L'"
+{ [[ "$L_RC" == 0 ]] && grep -q '按本次前像恢复' <<<"$L_OUT"; } \
+  && ok "L2: --dir **不带**斜杠 ⇒ rc=0" || bad "L2: rc=$L_RC"
+_l_run "--dir '$SNAP/L/'"
+{ [[ "$L_RC" == 0 ]] && grep -q '按本次前像恢复' <<<"$L_OUT"; } \
+  && ok "L3: --dir **带**斜杠 ⇒ rc=0(同一份, 不因一个斜杠被拒)" || bad "L3: rc=$L_RC"
+# 安全校验没有被放宽: 真正不同的目录、以及 tarball 身份变了, 仍然要拒
+rm -rf "$SNAP/L2"; mkdir -p "$SNAP/L2"
+cp "$SNAP/L/snap.tar.gz" "$SNAP/L2/snap.tar.gz"; cp "$SNAP/L/svcstate.tsv" "$SNAP/L2/svcstate.tsv"
+_l_run "--dir '$SNAP/L2'"
+{ [[ "$L_RC" != 0 ]] && grep -q '记的是别的快照' <<<"$L_OUT"; } \
+  && ok "L4: 前像记的是**真正另一个**目录 ⇒ 仍然被拒(目录绑定没被放宽)" || bad "L4: rc=$L_RC 没拒"
+rm -rf "$SNAP/L2"
+_l_fresh && cp "$SNAP/L/snap.tar.gz" "$WORK/l-new.tgz" && mv -f "$WORK/l-new.tgz" "$SNAP/L/snap.tar.gz"
+_l_run "--dir '$SNAP/L'"
+{ [[ "$L_RC" != 0 ]] && grep -q '前像钉的快照身份与这一份对不上' <<<"$L_OUT"; } \
+  && ok "L5: tarball 身份变了 ⇒ 仍然被拒(身份绑定没被放宽)" || bad "L5: rc=$L_RC 没拒"
+_l_fresh && printf 'unit\tbogus\tenabled\t0\tactive\t0\trunning\tX\n' >> "$SNAP/L/svcstate.tsv"
+_l_run "--dir '$SNAP/L'"
+{ [[ "$L_RC" != 0 ]] && grep -q '前像不可用' <<<"$L_OUT"; } \
+  && ok "L6: 记录被改坏 ⇒ 仍然被拒(损坏记录没被放宽)" || bad "L6: rc=$L_RC 没拒"
+# 撤销对照: 把统一路径表示那一行去掉, 序号那条路必须重新失守
+_l_fresh
+sed '/^  while \[\[ "\$target" == \*\/ && "\$target" != \/ \]\]; do target="\${target%\/}"; done$/d' \
+  "$WORK/rollback.sh" > "$WORK/rollback-noslash.sh"
+if cmp -s "$WORK/rollback.sh" "$WORK/rollback-noslash.sh"; then
+  bad "L7: 撤销没打上(锚点没命中) —— 这一格不算证据"
+else
+  bash -n "$WORK/rollback-noslash.sh" 2>/dev/null || bad "L7: 撤销版本语法不过"
+  _l_idx=-1; _l_i=0
+    while IFS= read -r _d; do [[ "${_d%/}" == "$SNAP/L" ]] && { _l_idx=$_l_i; break; }; _l_i=$((_l_i+1)); done \
+      < <(ls -1dt "$SNAP"/*/ 2>/dev/null)
+  _l_run "$_l_idx" "$WORK/rollback-noslash.sh"
+  { [[ "$L_RC" != 0 ]] && grep -q '记的是别的快照' <<<"$L_OUT"; } \
+    && ok "L7: 撤掉统一路径那一行 ⇒ **原反例重新出现**(序号选择被判成'别的快照')" \
+    || bad "L7: 撤销对照没重现(rc=$L_RC)"
+fi
+rm -rf "$SNAP/L"
+
+echo "══ K. 更新前确认与回滚是**两个**校验阶段(同一进程内) ══"
+# 缺陷的形态是"同一个进程里, 后一阶段沿用了前一阶段的结论"。所以这一节必须在**同一个
+# bash 进程**里跑完: 真前检验 → 确认缓存确实建起来了 → 保持或破坏记录/归档身份 → 真 cmd_rollback。
+# 分两个进程跑的话缓存天然是空的, 什么都没测到(本节上一版就是这么写的)。
+# 缓存也**不由测试去清** —— 那等于替产品把活干了。
+_k_fresh(){   # 每一格都重建一份**绑定自洽**的快照
+  rm -rf "$SNAP/K"
+  mksnap K KCASE || { bad "K-前提: 造不出快照"; return 1; }
+  mkpre "$SNAP/K" || { bad "K-前提: 造不出前像"; return 1; }
+  printf '{"id":"K","source":"cli","op":"update","git_commit":"%s"}\n' "$GOOD_REF" > "$SNAP/K/snapshot.json"
+}
+_k_same(){   # $1=在"前检验之后、回滚之前"执行的变异片段(可空) $2=用哪一份 rollback 壳(默认真身)
+  local mut="$1" rbsh="${2:-$WORK/rollback.sh}"
+  bash -c "source '$WORK/harness.sh'; svc_init enabled active" >/dev/null 2>&1
+  e2e_git "$REPO" reset --hard -q "$HEAD_REF"
+  K_OUT="$(bash -c "
+    source '$WORK/harness.sh'; source '$WORK/model.sh'; source '$rbsh'
+    svc_init enabled active
+    # ① 真前检验(就是 cmd_update 动手之前调的那一个判据函数本身)
+    if _pdg_svcstate_plan '$SNAP/K'; then echo 'KPRE=OK'; else echo 'KPRE=BAD'; fi
+    # ② 确认缓存**确实建立**了 —— 非空且指向这一份快照, 模式是 plan
+    echo \"KCACHE_SRC=\$_PDG_SVC_SRC\"; echo \"KCACHE_MODE=\$_PDG_SVC_MODE\"
+    # ③ 变异(保持不变 / 改坏记录 / 换归档身份)
+    $mut
+    svc_init disabled inactive
+    # ④ 进 cmd_rollback 之前**再看一眼**缓存: 它必须仍是非空、且是此前那次有效前检验留下的
+    echo \"KCACHE_AT_ENTRY=\$_PDG_SVC_SRC\"
+    cmd_rollback --dir '$SNAP/K' --git '$GOOD_REF'; echo \"KRC=\$?\"
+  " 2>&1)"
+  K_RC="$(grep -o 'KRC=[0-9]*' <<<"$K_OUT" | tail -1 | cut -d= -f2)"
+}
+_k_cache_ok(){   # 本格的"缓存确实建立且带进了回滚入口"三条
+  local tag="$1"
+  grep -q 'KPRE=OK' <<<"$K_OUT" && ok "$tag-pre: 真前检验通过" || bad "$tag-pre: 前检验没过"
+  [[ "$(grep -o 'KCACHE_SRC=.*' <<<"$K_OUT" | head -1 | cut -d= -f2-)" == "$SNAP/K" ]] \
+    && ok "$tag-cache: 前检验之后缓存**确实建立**(_PDG_SVC_SRC 指向这一份快照)" \
+    || bad "$tag-cache: 缓存没建立: $(grep -o 'KCACHE_SRC=.*' <<<"$K_OUT" | head -1)"
+  grep -q 'KCACHE_MODE=plan' <<<"$K_OUT" && ok "$tag-mode: 且当时判定为可用(plan)" || bad "$tag-mode: 不是 plan"
+  [[ "$(grep -o 'KCACHE_AT_ENTRY=.*' <<<"$K_OUT" | head -1 | cut -d= -f2-)" == "$SNAP/K" ]] \
+    && ok "$tag-entry: 进 cmd_rollback 入口时缓存**仍非空**(测试没有替它清掉)" \
+    || bad "$tag-entry: 入口处缓存已空 —— 那就不是在测'会不会沿用'"
+}
+echo "  ── K1 健康对照: 记录与归档都不变 ──"
+_k_fresh && _k_same ""
+_k_cache_ok K1
+[[ "$K_RC" == 0 ]] && ok "K1: 什么都没变 ⇒ 回滚正常路径成立(rc=0)" || bad "K1: rc=$K_RC: $(tail -3 <<<"$K_OUT")"
+grep -q '按本次前像恢复' <<<"$K_OUT" && ok "K1b: 且确实是**按前像**恢复" || bad "K1b: 不是按前像"
+echo "  ── K2 前检验通过之后把记录改坏(同进程, 缓存仍在) ──"
+_k_fresh && _k_same "printf 'unit\tbogus\tenabled\t0\tactive\t0\trunning\tX\n' >> '$SNAP/K/svcstate.tsv'"
+_k_cache_ok K2
+[[ "$K_RC" != 0 ]] && ok "K2: 回滚阶段**重新核验**并识别出不可用(rc=$K_RC), 没沿用入口处那份有效缓存" \
+                   || bad "K2: 沿用了旧结论(rc=$K_RC)"
+grep -q '前像不可用' <<<"$K_OUT" && ok "K2b: 并具名: $(grep -o '前像不可用[^;)]*' <<<"$K_OUT" | head -1)" || bad "K2b: 没具名"
+if expect_check_paths "$SNAP/K" etc/privdns-gateway/snapid; then
+  ok "K2c: 文件仍按快照恢复(前像不可用**不**阻断文件这一层)"
+else bad "K2c: 文件没恢复: $EXPECT_WHY"; fi
+grep -q '运行态与自启状态无法确认' <<<"$K_OUT" && ok "K2d: 服务侧**单独**报告为无法确认" || bad "K2d: 没单独报告"
+echo "  ── K3 前检验通过之后换归档身份(内容不变、归档可解) ──"
+_k_fresh && _k_same "cp '$SNAP/K/snap.tar.gz' '$WORK/k-new.tgz' && mv -f '$WORK/k-new.tgz' '$SNAP/K/snap.tar.gz'"
+_k_cache_ok K3
+[[ "$K_RC" != 0 ]] && ok "K3: 回滚阶段识别出**绑定不符**(rc=$K_RC)" || bad "K3: 沿用了旧结论(rc=$K_RC)"
+grep -q '前像钉的快照身份与这一份对不上' <<<"$K_OUT" && ok "K3b: 并点名是绑定不符, 不是格式问题" || bad "K3b: 没点名绑定"
+tar tzf "$SNAP/K/snap.tar.gz" >/dev/null 2>&1 && ok "K3c: 归档仍然可解(换的只是身份, 不是把包弄坏)" || bad "K3c: 归档被弄坏了, 这一格测的就不是绑定"
+echo "  ── K4 撤销对照: 只撤掉**回滚侧**那一行清理 ──"
+# 回滚侧的防护是 cmd_rollback 解析前像之前那一句 _PDG_SVC_SRC=""。把它撤掉, 同进程反例必须失守。
+sed '0,/^  _PDG_SVC_SRC=""$/{/^  _PDG_SVC_SRC=""$/d}' "$WORK/rollback.sh" > "$WORK/rollback-nocache.sh"
+if cmp -s "$WORK/rollback.sh" "$WORK/rollback-nocache.sh"; then
+  bad "K4: 撤销没打上(锚点没命中) —— 这一格不算证据"
+else
+  bash -n "$WORK/rollback-nocache.sh" 2>/dev/null || bad "K4: 撤销版本语法不过"
+  _k_fresh && _k_same "printf 'unit\tbogus\tenabled\t0\tactive\t0\trunning\tX\n' >> '$SNAP/K/svcstate.tsv'" "$WORK/rollback-nocache.sh"
+  { [[ "$K_RC" == 0 ]] && grep -q '按本次前像恢复' <<<"$K_OUT"; } \
+    && ok "K4: 撤掉回滚侧那一行后, **同一反例重新失守**(rc=0 且仍按已失效的旧结论恢复)" \
+    || { bad "K4: 撤销对照没重现(rc=$K_RC)"; printf '%s\n' "$K_OUT" | tail -12 | sed 's/^/        /'; }
+fi
+# 更新侧那道清理是**另一处**防护, 与上面这一处互相独立 —— 不能拿一处的区分力去替另一处背书。
+# 它的位置由源码顺序判(本壳不驱动 cmd_update, 那是 tests/test-update-*.sh 的事)。
+_upd_blk="$(grep -A8 'if \[\[ ! -f "\$snap_dir/svcstate.tsv" \]\]' "$ROOT/deploy/bot/pdg.sh")"
+grep -q '_PDG_SVC_SRC=""' <<<"$_upd_blk" \
+  && ok "K5: 更新侧也有**各自的**清理(cmd_update 前确认之后就把结论清掉) —— 两道防护分别成立, 不互相兜底" \
+  || bad "K5: 更新侧没有自己的清理"
+rm -rf "$SNAP/K"
+
+echo "══ J. 预期清单必须完整且可信 ══"
+# 本节只考**清单这一层**(生成是否完整、比较是否要求全部在场)。J 的夹具文件从没被恢复到
+# 隔离目标里, 所以下面的 EXPECT_WHY 里会附带"/…:不存在"这类条目 —— 那是预料之中的,
+# 本节的判据是"缺必需路径"那一条, 不是目标里有没有文件。
+# J1: **输出部分条目后失败** —— 读到一半失败必须向上传播, 不能留下残缺清单给调用方消费。
+JD="$SNAP/J"; rm -rf "$JD"; mkdir -p "$JD/tree/etc/privdns-gateway" "$JD/tree/etc/mihomo"
+printf 'mihomo\n' > "$JD/tree/etc/privdns-gateway/backend"
+printf 'J\n'      > "$JD/tree/etc/privdns-gateway/snapid"
+printf 'x: 1\n'   > "$JD/tree/etc/mihomo/config.yaml"
+JBIN="$WORK/jbin"; mkdir -p "$JBIN"
+# 受控 stat: 头两次照常转发, 第三次(也就是第二个路径)起失败 —— 于是清单已经写了一条
+printf '#!/usr/bin/env bash\nn=$(( $(cat "$J_N" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$J_N"\n(( n <= 2 )) && exec /usr/bin/stat "$@"\nexit 1\n' > "$JBIN/stat"
+chmod +x "$JBIN/stat"; export J_N="$WORK/j-n"; : > "$J_N"
+jrc=0; PATH="$JBIN:$PATH" mkexpect "$JD" etc/privdns-gateway/backend etc/privdns-gateway/snapid etc/mihomo/config.yaml 2>/dev/null || jrc=$?
+[[ "$jrc" != 0 ]] && ok "J1: 准备阶段读到一半失败 ⇒ mkexpect **返回非零**($jrc), 失败向上传播" \
+                  || bad "J1: 读失败却返回 0"
+_jn=$(grep -c . "$JD/expect.tsv" 2>/dev/null || echo 0)
+(( _jn < 3 )) && ok "J1b: 此刻盘上确实是**残缺清单**($_jn/3 条) —— 正是不能被消费的那种" \
+              || bad "J1b: 清单竟然是全的($_jn 条), 这一格没造出来"
+if expect_check_paths "$JD" etc/privdns-gateway/backend etc/privdns-gateway/snapid etc/mihomo/config.yaml; then
+  bad "J1c: 残缺清单被当成完整清单用了"
+else ok "J1c: 比较阶段拒绝残缺清单并点名: $EXPECT_WHY"; fi
+unset J_N
+# J2: **清单缺一个必需路径** —— 先造一份完整的, 再删掉其中一条
+rm -rf "$JD"; mkdir -p "$JD/tree/etc/privdns-gateway" "$JD/tree/etc/mihomo"
+printf 'mihomo\n' > "$JD/tree/etc/privdns-gateway/backend"
+printf 'J\n'      > "$JD/tree/etc/privdns-gateway/snapid"
+printf 'x: 1\n'   > "$JD/tree/etc/mihomo/config.yaml"
+mkexpect "$JD" etc/privdns-gateway/backend etc/privdns-gateway/snapid etc/mihomo/config.yaml \
+  && ok "J2: 完整清单造得出来(3 条)" || bad "J2: 健康对照就失败了"
+grep -v '^etc/mihomo/config.yaml' "$JD/expect.tsv" > "$JD/expect.cut" && mv "$JD/expect.cut" "$JD/expect.tsv"
+if expect_check_paths "$JD" etc/privdns-gateway/backend etc/privdns-gateway/snapid etc/mihomo/config.yaml; then
+  bad "J2b: 清单缺一条必需路径却判通过"
+else
+  grep -q '清单缺必需路径 etc/mihomo/config.yaml' <<<"$EXPECT_WHY" \
+    && ok "J2b: 缺必需路径 ⇒ **判红并点名是哪一条**: $EXPECT_WHY" \
+    || bad "J2b: 判红了但没点名: $EXPECT_WHY"
+fi
+ok "J3: 两格的失败都来自**本项判据**(mkexpect 退出码 / 清单缺必需路径), 全程没调用 cmd_rollback, 因此不可能借后续服务失败代偿"
+rm -rf "$JD"
+
+echo
+echo "══ H. 枚举失败不能被目标里的旧文件掩盖 ══"
+# 直接反例: 目标里**预先**就有一份同名旧文件(内容与快照一致, 但 mode 不同), 这一次的枚举
+# 受控失败。只看内容的话完全看不出区别 —— 本节要求失败照样传出去。
+HBIN="$WORK/hbin"; mkdir -p "$HBIN"
+printf '#!/usr/bin/env bash\necho hit >> "$H_HIT"\nexit 7\n' > "$HBIN/find"; chmod +x "$HBIN/find"
+export H_HIT="$WORK/h-hit"; : > "$H_HIT"
+rm -rf /etc/privdns-gateway/snapid
+printf 'HEALTHY\n' > /etc/privdns-gateway/snapid      # 与 H 快照内容一致
+chmod 600 /etc/privdns-gateway/snapid                 # 但 mode 与声明的 640 不同 —— 用来认"是不是这次复制的"
+rm -f "$WORK/applied_snapid"
+e2e_git "$REPO" reset --hard -q "$HEAD_REF"
+_hsvc_before="$(cat "$WORK/svc/mosdns.ac" 2>/dev/null)"
+rc=0; out=$(PATH="$HBIN:$PATH" run "--dir '$SNAP/H' --git '$GOOD_REF'") || rc=$?
+[[ -s "$H_HIT" ]] && ok "H1: 枚举失败**命中证据**在(受控 find 被调到 $(wc -l < "$H_HIT") 次并返回 7)" \
+                  || bad "H1: 注入没命中 —— 这一格没测到任何东西"
+[[ "$rc" != 0 ]] && ok "H2: 失败传到**真实调用方** cmd_rollback(rc=$rc)" || bad "H2: 枚举失败却返回 0"
+grep -q '快照落盘失败' <<<"$out" && ok "H3: 具名为**落盘失败**" || bad "H3: 没具名, out=$(tail -2 <<<"$out")"
+[[ ! -s "$WORK/applied_snapid" ]] \
+  && ok "H4: **没有**产生本次成功标记(旧目标文件没能把它掩盖过去)" || bad "H4: 仍写了标记 $(cat "$WORK/applied_snapid")"
+[[ "$(stat -c %a /etc/privdns-gateway/snapid)" == 600 ]] \
+  && ok "H5: 目标文件仍是调用前那一份(mode 600, 不是声明的 640)—— 一条都没复制, 空清单没被当成完整清单" \
+  || bad "H5: 目标被改成了 mode $(stat -c %a /etc/privdns-gateway/snapid)"
+{ ! grep -q '未完全回滚' <<<"$out" && [[ "$(cat "$WORK/svc/mosdns.ac" 2>/dev/null)" == "$_hsvc_before" ]]; } \
+  && ok "H6: 非零不是靠后续服务失败代偿 —— 停在落盘这一步, 服务模型状态未动" \
+  || bad "H6: 走到了服务阶段(out 含未完全回滚 或 服务状态变了)"
+# 撤销对照: 把枚举改回"进程替换直接喂 while", 同一反例必须重新暴露
+cat > "$WORK/enum-broken.sh" <<'ENUMEOF'
+_pdg_apply_snapshot_tree(){
+  local tree="$1" dest="${3:-/}" rel
+  while IFS= read -r -d '' rel; do
+    rel="${rel#./}"
+    mkdir -p "$dest/${rel%/*}" 2>/dev/null || return 1
+    cp -PpT "$tree/$rel" "$dest/$rel" 2>/dev/null || return 1
+  done < <(cd "$tree" && find . -mindepth 1 \( -type f -o -type l \) -print0)
+  cat "$dest/etc/privdns-gateway/snapid" > "$APPLIED" 2>/dev/null || return 1
+  return 0; }
+ENUMEOF
+runenumbroken(){ bash -c "source '$WORK/harness.sh'; source '$WORK/model.sh'; source '$WORK/enum-broken.sh'; source '$WORK/rollback.sh'; cmd_rollback $1" 2>&1; }
+: > "$H_HIT"; rm -f "$WORK/applied_snapid"; e2e_git "$REPO" reset --hard -q "$HEAD_REF"
+brc=0; bout=$(PATH="$HBIN:$PATH" runenumbroken "--dir '$SNAP/H' --git '$GOOD_REF'") || brc=$?
+{ [[ "$(cat "$WORK/applied_snapid" 2>/dev/null)" == HEALTHY ]] && ! grep -q '快照落盘失败' <<<"$bout"; } \
+  && ok "H7: 撤销修复后**同一反例重新暴露**(标记写成 HEALTHY, 也没报落盘失败)" \
+  || bad "H7: 撤销对照没重现(applied=$(cat "$WORK/applied_snapid" 2>/dev/null) rc=$brc)"
+unset H_HIT; rm -f /etc/privdns-gateway/snapid
+
+echo
+echo "══ I. 属性必须参与判定 ══"
+# 先恢复出一份健康的落点, 再只改属性 —— 内容仍然正确, 判据必须照样判红。
+bash -c "source '$WORK/harness.sh'; source '$WORK/model.sh'; svc_init enabled active" >/dev/null 2>&1
+e2e_git "$REPO" reset --hard -q "$HEAD_REF"; rm -f "$WORK/applied_snapid"
+out=$(run "--dir '$SNAP/H' --git '$GOOD_REF'") || true
+if expect_check_paths "$SNAP/H" etc/privdns-gateway/snapid; then
+  ok "I1: 健康对照 —— 四维全符"
+else bad "I1: 健康对照就不符: $EXPECT_WHY"; fi
+chmod 600 /etc/privdns-gateway/snapid      # **只改 mode**, 内容一字未动(改的是隔离根里的文件)
+if expect_check_paths "$SNAP/H" etc/privdns-gateway/snapid; then
+  bad "I2: 仅 mode 错却判通过 —— 属性没参与判定"
+else ok "I2: 仅 mode 错(内容仍正确)⇒ **判红**并点名: $EXPECT_WHY"; fi
+# 进 I3 之前**先把 I2 改坏的 mode 恢复并确认** —— 否则一旦 uid 也错, 两项同时错会被说成
+# "仅 uid 错", 那条结论就不成立了。
+chmod 640 /etc/privdns-gateway/snapid
+if expect_check_paths "$SNAP/H" etc/privdns-gateway/snapid; then
+  ok "I2b: I2 改坏的 mode 已恢复并确认四维全符 —— I3 的前提干净"
+else bad "I2b: 恢复后仍不符($EXPECT_WHY), I3 不成立"; fi
+# uid 维: 能不能在本机构造反例, 如实记
+if chown 1:1 /etc/privdns-gateway/snapid 2>/dev/null; then
+  if expect_check_paths "$SNAP/H" etc/privdns-gateway/snapid; then
+    bad "I3: 仅 uid 错却判通过"
+  else ok "I3: 仅 uid 错 ⇒ 判红并点名: $EXPECT_WHY"; fi
+  chown 0:0 /etc/privdns-gateway/snapid 2>/dev/null
+  expect_check_paths "$SNAP/H" etc/privdns-gateway/snapid \
+    && ok "I3b: uid 已复原并确认四维全符" || bad "I3b: uid 复原后仍不符($EXPECT_WHY)"
+else
+  note "I3: **未验证** —— 本命名空间只映射了一个 uid, chown 到别的 uid 不可行, 无法构造仅 uid 错的反例。uid 仍然参与判定(见 _expect_cmp_line), 但它的区分力本机没证到, 不计入已验证。"
+fi
+chmod 640 /etc/privdns-gateway/snapid
+
+echo
+echo "══ G. 生成阶段: 注释不能变成命令 ══"
+# 单独把生成段抽出来跑一遍, 生成阶段与被测执行阶段的 stdout/stderr/rc **分别**记。
+GENDIR="$WORK/gencheck"; mkdir -p "$GENDIR"
+{ printf 'WORK=%q\nSNAP=%q\nREPO=%q\n' "$GENDIR" "$GENDIR/snaps" "$GENDIR/repo"
+  # 取**第一个**范围就停(`/END/q`): 本行自己也含这两个标记字样, 不停的话 sed 会在这里
+  # 重新开一个范围并一路抄到文件尾。
+  sed -n '/# --- harness-gen: BEGIN/,/# --- harness-gen: END/{p; /# --- harness-gen: END/q}' \
+      "${BASH_SOURCE[0]}"; } > "$GENDIR/gen.sh"
+grc=0; bash "$GENDIR/gen.sh" > "$GENDIR/gen.out" 2> "$GENDIR/gen.err" || grc=$?
+echo "    生成阶段: rc=$grc  stdout=$(wc -l < "$GENDIR/gen.out") 行  stderr=$(wc -l < "$GENDIR/gen.err") 行"
+[[ "$grc" == 0 ]] && ok "G1: 生成阶段退出码 0" || bad "G1: 生成阶段 rc=$grc"
+[[ ! -s "$GENDIR/gen.err" ]] \
+  && ok "G2: 生成阶段 stderr **为空** —— 没有任何命令被顺带执行" \
+  || { bad "G2: 生成阶段 stderr 非空(注释里的东西被执行了?)"; sed 's/^/        /' "$GENDIR/gen.err"; }
+bash -n "$GENDIR/harness.sh" 2>/dev/null && ok "G3: 生成出来的 harness 语法有效" || bad "G3: 生成物语法不过"
+{ grep -qx "WORK=$GENDIR" "$GENDIR/harness.sh" && grep -q "^SNAP=" "$GENDIR/harness.sh" && grep -q "^REPO=" "$GENDIR/harness.sh"; } \
+  && ok "G4: 需要展开的三个路径**正确传入**(WORK/SNAP/REPO 各一行)" || bad "G4: 路径没正确传入"
+grep -qF '`cp -PpT`' "$GENDIR/harness.sh" \
+  && ok "G5: 注释里的反引号片段**原样保留**(以前这种片段会在生成阶段被当成命令执行掉)" \
+  || bad "G5: 注释片段丢失或被改写"
+# 更一般的判据: 生成段里有多少个反引号, 生成物里就该有多少个。命令替换发生过的话, 成对的
+# 反引号连同中间的内容会一起消失, 这个计数立刻对不上 —— 不用逐条盯某一句注释。
+_gen_bt="$(grep -o '`' "$GENDIR/gen.sh" | wc -l)"
+_out_bt="$(grep -o '`' "$GENDIR/harness.sh" | wc -l)"
+[[ "$_gen_bt" == "$_out_bt" && "$_gen_bt" -gt 0 ]] \
+  && ok "G6: 反引号逐个守恒(生成段 $_gen_bt 个 → 生成物 $_out_bt 个), 没有一对被当成命令替换吃掉" \
+  || bad "G6: 反引号数量对不上(生成段 $_gen_bt, 生成物 $_out_bt)"
+
 echo "────────────────────────────────────────"
-echo "通过 $pass, 失败 $nfail"
+echo "通过 $pass, 失败 $nfail, 未验证 $nnote"
 [[ "$nfail" == 0 ]]

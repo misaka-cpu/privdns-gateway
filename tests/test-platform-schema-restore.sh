@@ -285,7 +285,12 @@ run_platform(){
     echo 'mihomo(){ return 0; }'
     echo "cmd_snapshot(){ local s=\"$d/snaps/\$(date +%s%N)\"; mkdir -p \"\$s\""
     echo '  tar czf "$s/snap.tar.gz" -C / etc/privdns-gateway etc/systemd/system etc/mosdns etc/mihomo opt/pdg-bot var/lib/privdns-gateway/ios-profile 2>/dev/null'
-    echo '  chmod 600 "$s/snap.tar.gz"; _PDG_SNAP_CREATED="$s"; return 0; }'
+    echo '  chmod 600 "$s/snap.tar.gz"'
+      # 方案1: 前像由 cmd_snapshot 在打包之后保存 —— 调的是**抽进来的产品真函数**,
+      # 存不下就让快照失败(与产品同形)。SNAPSAVE_RC 可把它喂成失败, 不补恒真前像。
+      echo '  if [[ "${SNAPSAVE_RC:-0}" != 0 ]]; then return "$SNAPSAVE_RC"; fi'
+      echo '  _pdg_save_svcstate "$s" >/dev/null 2>&1 || return 1'
+      echo '  _PDG_SNAP_CREATED="$s"; return 0; }'
     # 产品原文
     grep -m1 '^_PDG_IOS_STATE_REL=' "$src"; grep -m1 '^_PDG_IOS_ART_REL=' "$src"
     grep -m1 '^_PDG_RETIRE_OK=' "$src"; grep -m1 '^_PDG_RETIRE_DONE=' "$src"

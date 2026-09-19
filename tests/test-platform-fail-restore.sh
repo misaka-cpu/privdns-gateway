@@ -217,7 +217,12 @@ run_platform(){   # $1=目标平台 $2=fail|nofail $3=场景目录 [$4=被测 pd
     # cmd_snapshot: 本轮不涉及它的实现, 但**材料必须是真的** —— 真打一份 tar。
     echo "cmd_snapshot(){ local s=\"$d/snaps/\$(date +%s%N)\"; mkdir -p \"\$s\""
     echo '  tar czf "$s/snap.tar.gz" -C / etc/privdns-gateway etc/systemd/system etc/mosdns etc/mihomo opt/pdg-bot 2>/dev/null'
-    echo '  chmod 600 "$s/snap.tar.gz"; _PDG_SNAP_CREATED="$s"; return 0; }'
+    echo '  chmod 600 "$s/snap.tar.gz"'
+      # 方案1: 前像由 cmd_snapshot 在打包之后保存 —— 调的是**抽进来的产品真函数**,
+      # 存不下就让快照失败(与产品同形)。SNAPSAVE_RC 可把它喂成失败, 不补恒真前像。
+      echo '  if [[ "${SNAPSAVE_RC:-0}" != 0 ]]; then return "$SNAPSAVE_RC"; fi'
+      echo '  _pdg_save_svcstate "$s" >/dev/null 2>&1 || return 1'
+      echo '  _PDG_SNAP_CREATED="$s"; return 0; }'
     # 失败注入点: 退役件已经撤除之后、切换宣布成功之前的第一处可失败步骤。
     if [[ "$mode" == fail-delete ]]; then
       # 退役件已经撤除、平台件已经装上之后失败; 同时把**本次新增**的一件变成非空目录 ——

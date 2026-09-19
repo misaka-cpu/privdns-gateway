@@ -1315,9 +1315,402 @@ cmd_snapshot(){
   if ! _snap_meta_write "$d" "$ts" "$src" "$op"; then
     c_y "❌ 快照元数据写入失败 → 本次快照作废(未留下半份)"; rm -rf "$d"; return 1
   fi
+  # ── 服务前像: 由 cmd_snapshot 自己存 ──────────────────────────────────────
+  # 以前只有 cmd_update 在建完快照之后另存。于是用户手打的 `pdg snapshot` 拍出来的那一份
+  # **没有前像**, 回滚它只能还原文件、运行态与自启无法确认, 并且必然返回非零。
+  # 位置不能随意: _pdg_save_svcstate 把 snap_id 钉在 snap.tar.gz 的 设备:inode:字节数:mtime 上,
+  # 所以必须等打包**最终完成**(含上面的 gzip 与 chmod)之后再存, 否则钉的是一个还会变的对象。
+  if ! _pdg_save_svcstate "$d"; then
+    c_y "❌ 服务前像保存失败 → 本次快照作废(不留下半份)"
+    rm -rf "$d" 2>/dev/null
+    [[ -e "$d" ]] && c_y "   ⚠️ 本次快照目录未能清理干净, 残留在: $d(只涉及本次材料, 请确认后删除)"
+    return 1
+  fi
+  # 存下来了不等于可用。结构与**绑定**都要当场校验: 格式完整、记的 snap_dir 就是这一份、
+  # 钉的 snap_id 与这一份的 snap.tar.gz 对得上。不校验等于把"能不能按前像恢复"留到回滚当天才发现。
+  if ! _pdg_svcstate_plan "$d"; then
+    c_y "❌ 服务前像校验未通过(${_PDG_SVC_WHY:-未知}) → 本次快照作废(不留下半份)"
+    rm -rf "$d" 2>/dev/null
+    [[ -e "$d" ]] && c_y "   ⚠️ 本次快照目录未能清理干净, 残留在: $d(只涉及本次材料, 请确认后删除)"
+    return 1
+  fi
+  # 校验用完就把解析缓存清掉: 让后续真正的回滚**重新**按那一刻的文件解析一遍,
+  # 而不是复用拍快照时留下的内存状态。
+  _PDG_SVC_SRC=""; _PDG_SVC_MODE=blind
+  # 记录里允许有 QUERY-FAILED(当时那一项就是问不出来)。它是**合法取值**, 不是失败 ——
+  # 但也**不等于**这一份快照将来能完整恢复。如实说出来, 不因为"快照要成功"就把未知说成正常。
+  local _qf; _qf="$(grep -c 'QUERY-FAILED' "$d/svcstate.tsv" 2>/dev/null || true)"
+  if [[ "${_qf:-0}" != 0 ]]; then
+    c_y "  ⚠️ 服务前像里有 $_qf 处 QUERY-FAILED(当时问不出该项状态) —— 回滚时这些项只能登记为无法确认。"
+  fi
+  # 以上全部成立之后, 才置成功标记、打印成功、轮换历史快照。
   _PDG_SNAP_CREATED="$d"
   echo "✅ 快照: $d/snap.tar.gz ($src/$op)"
   ls -1dt "$SNAP_DIR"/*/ 2>/dev/null | tail -n +11 | xargs -r rm -rf   # 只留最近 10 份
+}
+
+
+# ── 服务前像: 保存与恢复 ─────────────────────────────────────────────────────
+# 为什么需要它: 快照只收文件。而 `/etc/systemd/system/<u>.service` 恢复回来, **不等于**
+# 那个服务回到了原来的运行态与自启态 —— enable 的符号链接在
+# multi-user.target.wants/ 下, 全仓从不快照它。于是"文件都回来了、服务却停着且不自启"
+# 这种现场会被回滚自报成"已回滚并重启服务"。这一组就是补这一格。
+#
+# 三条纪律:
+#   · active 与 enabled 是**两件独立的事**, 分别记、分别恢复;
+#   · 查不到 ≠ 没有。查询失败写 QUERY-FAILED, 绝不写成空串再让两个空串相等;
+#   · 记录**不是**通用凭据, 它只服务于"这一次操作的回滚", 所以要和本次操作绑死。
+
+# 要保前像的服务集合。**固定一份**, 不按平台裁剪 —— 少记一个就等于那一格无法恢复。
+_pdg_svcstate_units(){
+  printf '%s\n' pdg-mitm pdg-bot pdg-probe81 mosdns mihomo pdg-dotwitness \
+                pdg-health.timer pdg-rules-update.timer
+}
+
+# systemd 对这两个查询会给出的**全部**取值。判"查到了没有"靠的是它, 不是"输出非空"。
+# 特别注意: 非零返回码**不等于**查询失败 —— `is-enabled` 对 disabled 就返回 1,
+# `is-active` 对 inactive/failed 返回 3。那是正常答案, 必须原样记下。
+_pdg_svc_known(){   # $1=子命令 $2=值
+  case "$1" in
+    is-enabled)
+      case "$2" in enabled|enabled-runtime|linked|linked-runtime|alias|masked|masked-runtime|\
+static|indirect|disabled|generated|transient|not-found) return 0;; esac;;
+    is-active)
+      case "$2" in active|reloading|inactive|failed|activating|deactivating|maintenance|not-found) return 0;; esac;;
+  esac
+  return 1
+}
+
+# 读一个属性, 把「值」与「查询成不成功」分开。
+# 空输出只有在 systemd 明确说 LoadState=not-found 时才算"这个 unit 不存在";
+# 其余空输出、以及任何**不在词表里**的输出, 一律记 QUERY-FAILED —— 那是观测失败, 不是一种状态。
+_pdg_svc_q(){   # $1=子命令 $2=unit → 打印 "值<TAB>rc"
+  local out rc ls
+  out="$(systemctl "$1" "$2" 2>/dev/null)"; rc=$?
+  out="${out%%$'\n'*}"
+  out="${out//[[:space:]]/}"
+  if [[ -z "$out" ]]; then
+    ls="$(systemctl show -p LoadState --value "$2" 2>/dev/null)"
+    if [[ "$ls" == not-found ]]; then out=not-found; else out=QUERY-FAILED; fi
+  elif ! _pdg_svc_known "$1" "$out"; then
+    out=QUERY-FAILED          # 认不出来的答案不能当成一种状态往下传
+  fi
+  printf '%s\t%s\n' "$out" "$rc"
+}
+
+# 把**操作前**的服务状态写进本次快照目录。
+# 头部记的是"这条记录属于谁、属于哪一次": boot_id + 持锁进程的 pid/starttime + 快照目录。
+# 尾部记条数与正文摘要 —— 截断、少行、重复都能当场看出来。
+_pdg_save_svcstate(){   # $1=本次快照目录
+  local sd="$1" f body u ufs asv sub inv n=0 st tb
+  [[ -d "$sd" ]] || { c_y "❌ 服务前像: 快照目录不存在: $sd"; return 1; }
+  tb="$sd/snap.tar.gz"
+  # 前像必须写在**回滚真正会用到的那份快照**旁边, 且把那份快照的身份记进来。
+  # 否则"记录是这一次的"与"快照是这一次的"是两件没有关联的事。
+  [[ -f "$tb" ]] || { c_y "❌ 服务前像: 快照目录里没有 snap.tar.gz: $sd"; return 1; }
+  f="$sd/svcstate.tsv"
+  body="$(mktemp)" || return 1
+  {
+    printf '#pdg-svcstate\t1\n'
+    printf 'boot_id\t%s\n'      "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"
+    printf 'holder_pid\t%s\n'   "$$"
+    # /proc/<pid>/stat 第 22 个字段是进程启动时刻(自开机起的 tick)。pid 会复用, pid+starttime 不会。
+    printf 'holder_start\t%s\n' "$(awk '{print $22}' "/proc/$$/stat" 2>/dev/null)"
+    printf 'snap_dir\t%s\n'     "$sd"
+    # 快照身份: 设备:inode + 字节数 + mtime。回滚会用这一份; 记录就钉在这一份上。
+    printf 'snap_id\t%s\n'      "$(stat -c '%d:%i:%s:%Y' "$tb" 2>/dev/null)"
+    printf 'created_at\t%s\n'   "$(date -u +%FT%TZ)"
+    while read -r u; do
+      [[ -n "$u" ]] || continue
+      ufs="$(_pdg_svc_q is-enabled "$u")"
+      asv="$(_pdg_svc_q is-active  "$u")"
+      sub="$(systemctl show -p SubState     --value "$u" 2>/dev/null)"
+      inv="$(systemctl show -p InvocationID --value "$u" 2>/dev/null)"
+      printf 'unit\t%s\t%s\t%s\t%s\t%s\n' "$u" "$ufs" "$asv" "${sub:-QUERY-FAILED}" "${inv:-}"
+      n=$((n+1))
+    done < <(_pdg_svcstate_units)
+  } > "$body" || { rm -f "$body"; return 1; }
+  n="$(grep -c $'^unit\t' "$body")"
+  st="$(sha256sum "$body" | awk '{print $1}')"
+  { cat "$body"; printf 'end\t%s\t%s\n' "$n" "$st"; } > "$f" || { rm -f "$body"; return 1; }
+  rm -f "$body"
+  chmod 600 "$f" || return 1
+  c_g "  已保存服务前像($n 个 unit): $f"
+}
+
+# 读并**校验**一份前像。$1=记录路径; 校验不过就说清是哪一条不过。
+# 只做结构与完整性校验 —— "这条记录是不是本次操作的"由调用方另判(见退役版的调用方门)。
+_pdg_svcstate_valid(){   # $1=文件 → 0=可用
+  local f="$1" tail cnt want got body
+  [[ -f "$f" ]] || { _PDG_SVCSTATE_WHY="记录不存在"; return 1; }
+  head -1 "$f" | grep -qx $'#pdg-svcstate\t1' || { _PDG_SVCSTATE_WHY="不是认识的前像格式/版本"; return 1; }
+  tail="$(tail -1 "$f")"
+  [[ "$tail" == end$'\t'* ]] || { _PDG_SVCSTATE_WHY="记录没有结尾行(可能被截断)"; return 1; }
+  cnt="$(cut -f2 <<<"$tail")"; want="$(cut -f3 <<<"$tail")"
+  body="$(mktemp)" || return 1
+  head -n -1 "$f" > "$body"
+  got="$(sha256sum "$body" | awk '{print $1}')"
+  rm -f "$body"
+  [[ "$got" == "$want" ]] || { _PDG_SVCSTATE_WHY="正文摘要对不上(记录被改过或写坏了)"; return 1; }
+  # 头部: 六个字段一个都不能少、不能空、不能重复。
+  # **摘要对得上只说明"没被改过", 不说明"内容是完整的"** —— 少一列、重复一行、字段非法,
+  # 都可以是当初就写坏的, 那种记录照样能通过摘要。所以这里逐条查。
+  local k n_k
+  for k in boot_id holder_pid holder_start snap_dir snap_id created_at; do
+    n_k="$(grep -c "^$k"$'\t' "$f")"
+    [[ "$n_k" -ge 1 ]] || { _PDG_SVCSTATE_WHY="记录缺头部字段 $k"; return 1; }
+    [[ "$n_k" == 1 ]]  || { _PDG_SVCSTATE_WHY="记录的头部字段 $k 出现了 $n_k 次(重复头部)"; return 1; }
+    [[ -n "$(awk -F'\t' -v k="$k" '$1==k{print $2; exit}' "$f")" ]] \
+      || { _PDG_SVCSTATE_WHY="记录的头部字段 $k 是空的"; return 1; }
+  done
+  # 每一条服务行: 恰好 8 列; 两个取值必须在词表里(或 QUERY-FAILED); 两个 rc 必须是整数。
+  local _k _u _ufs _urc _asv _arc _sub _inv _extra
+  while IFS=$'\t' read -r _k _u _ufs _urc _asv _arc _sub _inv _extra; do
+    [[ "$_k" == unit ]] || continue
+    [[ -n "$_u" ]] || { _PDG_SVCSTATE_WHY="有一条服务行没有 unit 名"; return 1; }
+    [[ -z "$_extra" ]] || { _PDG_SVCSTATE_WHY="$_u 那一行多了列(格式不对)"; return 1; }
+    [[ -n "$_inv" || -n "$_sub" ]] || { _PDG_SVCSTATE_WHY="$_u 那一行缺列(格式不对)"; return 1; }
+    [[ "$_ufs" == QUERY-FAILED ]] || _pdg_svc_known is-enabled "$_ufs" \
+      || { _PDG_SVCSTATE_WHY="$_u 的自启取值非法($_ufs)"; return 1; }
+    [[ "$_asv" == QUERY-FAILED ]] || _pdg_svc_known is-active "$_asv" \
+      || { _PDG_SVCSTATE_WHY="$_u 的运行取值非法($_asv)"; return 1; }
+    [[ "$_urc" =~ ^[0-9]+$ ]] || { _PDG_SVCSTATE_WHY="$_u 的自启查询返回码不是整数($_urc)"; return 1; }
+    [[ "$_arc" =~ ^[0-9]+$ ]] || { _PDG_SVCSTATE_WHY="$_u 的运行查询返回码不是整数($_arc)"; return 1; }
+  done < "$f"
+  local n_have n_uniq n_need
+  n_have="$(grep -c $'^unit\t' "$f")"
+  n_uniq="$(grep $'^unit\t' "$f" | cut -f2 | sort -u | wc -l)"
+  n_need="$(_pdg_svcstate_units | grep -c .)"
+  [[ "$n_have" == "$cnt" ]]   || { _PDG_SVCSTATE_WHY="服务行数与结尾行不符($n_have vs $cnt)"; return 1; }
+  [[ "$n_have" -gt 0 ]]       || { _PDG_SVCSTATE_WHY="一条服务记录都没有"; return 1; }
+  [[ "$n_have" == "$n_uniq" ]]|| { _PDG_SVCSTATE_WHY="有重复的 unit 记录"; return 1; }
+  local miss="" u
+  while read -r u; do
+    [[ -n "$u" ]] || continue
+    grep -q "^unit"$'\t'"$u"$'\t' "$f" || miss="$miss $u"
+  done < <(_pdg_svcstate_units)
+  [[ -z "$miss" ]] || { _PDG_SVCSTATE_WHY="缺少必需服务的前像:$miss"; return 1; }
+  [[ "$n_uniq" == "$n_need" ]] || { _PDG_SVCSTATE_WHY="服务集合与本版清单不一致($n_uniq vs $n_need)"; return 1; }
+  return 0
+}
+
+# 按前像恢复服务状态。失败或无法确认的逐项计入 unrestored(调用方的数组)。
+# **不做**的事: 不推断、不补造历史状态、不因为"通用 restart"把原本 inactive 的服务拉起来。
+# 恢复策略**必须在动任何服务之前**定好。
+# 以前的写法是"先一律 systemctl restart mosdns pdg-bot pdg-probe81, 再按前像纠正":
+# 那会把本来停着的服务先拉起来再停回去(中间真的跑过一段), 而且辅助函数自己"没有服务动作"
+# 也证明不了整条回滚链没有先启动过什么。所以这里先解析、先判定, 再一次性收敛。
+#
+# 解析结果放进三张表: 想要的自启值 / 想要的运行值 / 记录时的 InvocationID。
+declare -A _PDG_WANT_EN=() _PDG_WANT_AC=() _PDG_WANT_URC=() _PDG_WANT_ARC=()
+_PDG_SVC_MODE=""      # plan=有可用前像 / blind=没有(旧快照或记录不可用)
+_PDG_SVC_WHY=""
+_PDG_SVC_SRC=""       # 已经解析过的快照目录, 避免重复解析
+
+# 解析并**确认这份记录属于实际选中的那份快照**。
+# 只做结构校验是不够的: 一份结构完好、但属于别的快照的记录, 拿来恢复就是按错误的历史动手。
+_pdg_svcstate_plan(){   # $1=本次要回滚到的快照目录
+  local sd="$1" f k u ufs urc asv arc sid now
+  [[ "$_PDG_SVC_SRC" == "$sd" ]] && return 0
+  _PDG_WANT_EN=(); _PDG_WANT_AC=(); _PDG_WANT_URC=(); _PDG_WANT_ARC=()
+  _PDG_SVC_SRC="$sd"; _PDG_SVC_MODE=blind; _PDG_SVC_WHY=""
+  f="$sd/svcstate.tsv"
+  # 措辞只陈述**事实与限制**: 这份快照目录里没有 svcstate.tsv, 因此运行态/自启无从按前像恢复。
+  # 不推断成因 —— 早期版本拍的、手工拼的目录、创建之后文件丢失, 都能造成同一个现象,
+  # 从这里看不出是哪一种。以前一概称"旧格式", 把当前版本刚拍的快照也说成旧的。
+  if [[ ! -f "$f" ]]; then _PDG_SVC_WHY="这份快照没有服务前像(目录里缺 svcstate.tsv ⇒ 运行态/自启无从按前像恢复)"; return 1; fi
+  if ! _pdg_svcstate_valid "$f"; then _PDG_SVC_WHY="前像不可用: ${_PDG_SVCSTATE_WHY:-未知}"; return 1; fi
+  k="$(awk -F'\t' '$1=="snap_dir"{print $2; exit}' "$f")"
+  if [[ "$k" != "$sd" ]]; then
+    _PDG_SVC_WHY="这份前像记的是别的快照($k), 不是正在回滚的这一份"; return 1
+  fi
+  sid="$(awk -F'\t' '$1=="snap_id"{print $2; exit}' "$f")"
+  now="$(stat -c '%d:%i:%s:%Y' "$sd/snap.tar.gz" 2>/dev/null)"
+  if [[ -z "$sid" || -z "$now" || "$sid" != "$now" ]]; then
+    _PDG_SVC_WHY="前像钉的快照身份与这一份对不上(记录=${sid:-空}, 现在=${now:-读不到})"; return 1
+  fi
+  while IFS=$'\t' read -r k u ufs urc asv arc _sub _inv; do
+    [[ "$k" == unit && -n "$u" ]] || continue
+    _PDG_WANT_EN["$u"]="$ufs"; _PDG_WANT_URC["$u"]="$urc"
+    _PDG_WANT_AC["$u"]="$asv"; _PDG_WANT_ARC["$u"]="$arc"
+  done < "$f"
+  _PDG_SVC_MODE=plan
+  return 0
+}
+
+# 一个 unit 现在的运行值(读不出来就是 QUERY-FAILED, 不是空串)
+_pdg_now_ac(){ _pdg_svc_q is-active  "$1" | cut -f1; }
+_pdg_now_en(){ _pdg_svc_q is-enabled "$1" | cut -f1; }
+
+# 把 $1 的自启状态设成 $2。**只动这一个 unit**: 不碰 wants/ 目录、不用通配、不动别的 unit;
+# 这里只改自启 —— 一个 start/stop 都不发, 原本停着的服务不会被顺带启动。
+#
+# 为什么不是一句 systemctl 就完事: 持久自启与运行时自启是**两套独立的链接**
+#     持久   /etc/systemd/system/<target>.wants/<unit>
+#     运行时 /run/systemd/system/<target>.wants/<unit>
+# 在真 systemd 上实测过(用户作用域的一次性 unit, 不碰任何宿主系统服务):
+#     enable                                → enabled
+#     已经 enabled 再 enable --runtime      → 仍然 **enabled**        ← 缺口一
+#     disable(不带 --runtime)               → enabled-runtime(只撤掉持久那一层)
+#     enabled-runtime 上只 disable          → 仍然 **enabled-runtime** ← 缺口二
+#     disable --runtime                     → disabled
+# 也就是说: 只调目标那一条命令, "前像是 enabled-runtime 而现状被永久 enable 了"和
+# "前像是 disabled 而现状是 enabled-runtime"这两种都**永远回不去**。
+#
+# 所以先按真实语义撤掉**妨碍这一次恢复的那一层**, 再置目标层。撤哪一层由**当前实际状态**
+# 决定 —— 没有妨碍就一层都不撤(不做多余动作), 也不会对 static/masked 这类没有链接的
+# unit 先动手再说不支持(调用方只在三种可还原取值上调本函数)。
+#
+# 返回 0 = 每一步动作都成功; 非 0 = 有动作失败。
+# **后置状态由调用方另行核对** —— 动作成功与后置相符是两件事, 分开记。
+_pdg_set_enable_state(){   # $1=unit $2=目标(enabled|enabled-runtime|disabled)
+  local u="$1" want="$2" rc=0
+  case "$want" in
+    enabled)
+      systemctl enable "$u" >/dev/null 2>&1 || rc=$?;;
+    enabled-runtime)
+      # 妨碍项 = 持久链接。只在它确实在的时候撤, 撤的是**这一个 unit** 的那一条。
+      if [[ "$(_pdg_now_en "$u")" == enabled ]]; then
+        systemctl disable "$u" >/dev/null 2>&1 || rc=$?
+      fi
+      systemctl enable --runtime "$u" >/dev/null 2>&1 || rc=$?;;
+    disabled)
+      systemctl disable "$u" >/dev/null 2>&1 || rc=$?
+      # 妨碍项 = 运行时链接(上面那句不带 --runtime, 撤不掉 /run 里的那一条)。
+      if [[ "$(_pdg_now_en "$u")" == enabled-runtime ]]; then
+        systemctl disable --runtime "$u" >/dev/null 2>&1 || rc=$?
+      fi;;
+    *) return 2;;          # 调用方负责只传这三种可还原取值
+  esac
+  return "$rc"
+}
+
+# 回滚时的内核收敛。
+#
+# 分工: 旧核冲突那一半**原样保留**(停掉并关自启, 并核验) —— 这一版只允许一个内核在跑,
+# 与快照记着什么无关。目标核那一半交给前像。
+# 为什么不能直接用 _core_kernel_activate: 它是把目标核硬收敛成 "enabled + active", 那是
+# **装机/切核**的语义。回滚时照搬, 会在恢复策略生效之前先把 mihomo 永久启用并起来, 然后
+# 再被 _pdg_restore_svcstate 纠正回去 —— 中间真的跑过一段, 自启也真的被改成过 enabled。
+# 只看最终状态看不出来, 但那是一次真实的状态变更。
+#
+#   有可信前像: 这里**不碰目标核**。目标核的自启与运行态由 _pdg_restore_svcstate 一处负责
+#               (单一归属, 两处不会互相覆盖)。旧核照停照核验, unit 缺失照样当场报。
+#   没有前像  : 原样调用 _core_kernel_activate —— 历史兼容路径, 并明说这不是按前像精确恢复。
+_pdg_kernel_converge(){   # $1=目标核 $2=旧核
+  local tgt="$1" old="$2" rc=0
+  if [[ "$_PDG_SVC_MODE" != plan ]]; then
+    c_y "  内核收敛: 这份快照没有可用的服务前像 → 按**历史行为**把 $tgt 收敛成 enabled+active。"
+    c_y "            这条是历史兼容路径, **不是按前像精确恢复**。"
+    _core_kernel_activate "$tgt" "$old"
+    return
+  fi
+  c_y "  内核收敛: 按本次前像恢复 $tgt(自启=${_PDG_WANT_EN[$tgt]:-未记录} 运行=${_PDG_WANT_AC[$tgt]:-未记录});"
+  c_y "            旧核 $old 仍按「只能有一个内核」的安全前提停用并关自启。"
+  systemctl disable --now "$old" >/dev/null 2>&1 || true
+  [[ "$(systemctl is-active  "$old" 2>/dev/null)" != active  ]] || { echo "  旧核 $old 仍 active"; rc=1; }
+  [[ "$(systemctl is-enabled "$old" 2>/dev/null)" == enabled ]] && { echo "  旧核 $old 仍 enabled(重启会双起)"; rc=1; }
+  # 起不起得来由前像决定, 但"根本没有这个 unit"必须当场看出来 —— 那说明快照没把它带回来。
+  if [[ "$(systemctl show -p LoadState --value "$tgt" 2>/dev/null)" == not-found ]]; then
+    echo "  $tgt 的 unit 不存在(快照没带回来?)"; rc=1
+  fi
+  systemctl reset-failed "$tgt" >/dev/null 2>&1 || true
+  return "$rc"
+}
+
+# 恢复服务的运行态与自启态。**依赖调用方作用域里的 unrestored 数组**。
+# 纪律:
+#   · 先定策略再动手 —— 不先通用重启再纠正, 本来没在跑的**一次都不会被启动**;
+#   · 动作返回码与后置状态是**两个独立**的失败条件, 各记各的;
+#   · 停必须停稳: 过渡态、查询失败都不算停稳; failed 与 inactive 的差别如实登记;
+#   · 想要 active 的那些用 restart(不是 start): 已经在跑的服务 start 是空转, 进程不换,
+#     刚恢复出来的配置根本没被读进去 —— 所以还要求 InvocationID 变过才算数;
+#   · enabled-runtime 不提升成永久 enabled; static/masked/未知一律不先改再说不支持;
+#   · 没有可用前像时保留原来那套通用重启与安全检查, 但如实登记"运行态/自启未确认",
+#     并让调用方拿不到"完全回滚"。
+_pdg_restore_svcstate(){   # $1=本次快照目录
+  local u rc now inv0 inv1 want
+  _pdg_svcstate_plan "$1" || true
+  if [[ "$_PDG_SVC_MODE" != plan ]]; then
+    c_y "  ⚠️ ${_PDG_SVC_WHY:-前像不可用}: 文件已按快照恢复, 但**运行态与自启状态无法确认**。"
+    c_y "     请自行复核 $(_pdg_svcstate_units | tr '\n' ' ')的 is-active / is-enabled。"
+    # 退回原来那套: 明确列出 unit, 绝不用 pdg-* 通配(那会把救援服务一起重启掉)。
+    systemctl restart mosdns pdg-bot pdg-probe81 2>/dev/null || true
+    systemctl is-enabled pdg-mitm >/dev/null 2>&1 && { systemctl reset-failed pdg-mitm 2>/dev/null; systemctl restart pdg-mitm 2>/dev/null; }
+    unrestored+=("服务前像缺失/不可用(${_PDG_SVC_WHY:-未知}; 运行态/自启未确认)")
+    return 1
+  fi
+  # ── ① 自启 ────────────────────────────────────────────────────────────────
+  for u in $(_pdg_svcstate_units); do
+    want="${_PDG_WANT_EN[$u]:-}"
+    [[ -n "$want" ]] || { unrestored+=("$u 前像里没有自启记录"); continue; }
+    case "$want" in
+      QUERY-FAILED)
+        unrestored+=("$u 自启前像无法确认(记录时查询 rc=${_PDG_WANT_URC[$u]:-?})");;
+      enabled|enabled-runtime|disabled)
+        rc=0
+        # 持久与运行时是两套链接, 只调目标那一条命令回不去 —— 详见 _pdg_set_enable_state。
+        _pdg_set_enable_state "$u" "$want" || rc=$?
+        [[ "$rc" == 0 ]] || unrestored+=("$u 自启恢复动作失败(目标 $want, rc=$rc)")
+        now="$(_pdg_now_en "$u")"
+        [[ "$now" == "$want" ]] || unrestored+=("$u 自启后置状态不符(目标 $want, 实得 $now)");;
+      static|masked|masked-runtime|indirect|generated|transient|alias|linked|linked-runtime|not-found)
+        # 这几种不是 enable/disable 能表达的。**先不动**, 只在现状与前像不符时如实登记。
+        now="$(_pdg_now_en "$u")"
+        [[ "$now" == "$want" ]] || unrestored+=("$u 自启状态 $want 无法用 enable/disable 恢复(现为 $now)");;
+      *) unrestored+=("$u 自启前像是无法处理的取值($want)");;
+    esac
+  done
+  # ── ② 运行态 ──────────────────────────────────────────────────────────────
+  for u in $(_pdg_svcstate_units); do
+    want="${_PDG_WANT_AC[$u]:-}"
+    [[ -n "$want" ]] || { unrestored+=("$u 前像里没有运行态记录"); continue; }
+    case "$want" in
+      QUERY-FAILED)
+        unrestored+=("$u 运行态前像无法确认(记录时查询 rc=${_PDG_WANT_ARC[$u]:-?})");;
+      active)
+        inv0="$(systemctl show -p InvocationID --value "$u" 2>/dev/null)"
+        systemctl reset-failed "$u" >/dev/null 2>&1 || true
+        rc=0; systemctl restart "$u" >/dev/null 2>&1 || rc=$?
+        [[ "$rc" == 0 ]] || unrestored+=("$u 启动动作失败(restart rc=$rc)")
+        now="$(_pdg_now_ac "$u")"
+        # 起服务不是瞬时的: 头一眼没 active 就再等两拍再看(原来 _core_kernel_activate 里那句
+        # `sleep 2` 就是干这个的)。桩化测试里第一眼就 active, 不会真的睡。
+        local _try=0
+        while [[ "$now" != active && "$_try" -lt 3 ]]; do sleep 1; _try=$((_try+1)); now="$(_pdg_now_ac "$u")"; done
+        if [[ "$now" != active ]]; then
+          unrestored+=("$u 后置状态不符(目标 active, 实得 $now)")
+        elif [[ "$u" != *.timer ]]; then
+          # 光是 active 证明不了"恢复出来的配置已经被读进去" —— 本来就在跑的服务 start 是
+          # 空转。InvocationID 变过才说明进程真的被换掉了, 那一刻读的才是刚恢复的文件。
+          inv1="$(systemctl show -p InvocationID --value "$u" 2>/dev/null)"
+          if [[ -z "$inv1" ]]; then
+            unrestored+=("$u 无法确认是否重新加载了恢复出来的配置(读不到 InvocationID)")
+          elif [[ -n "$inv0" && "$inv1" == "$inv0" ]]; then
+            unrestored+=("$u 仍是回滚前那个进程, 恢复出来的配置没有被重新加载")
+          fi
+        fi;;
+      inactive|failed)
+        now="$(_pdg_now_ac "$u")"
+        if [[ "$now" == active || "$now" == activating || "$now" == reloading ]]; then
+          rc=0; systemctl stop "$u" >/dev/null 2>&1 || rc=$?
+          [[ "$rc" == 0 ]] || unrestored+=("$u 停止动作失败(stop rc=$rc)")
+          now="$(_pdg_now_ac "$u")"
+        fi
+        case "$now" in
+          inactive|failed|not-found) : ;;       # 停稳了
+          *) unrestored+=("$u 前像是 $want, 但现在是 $now —— 没有停稳");;
+        esac
+        # failed 与 inactive 是两种状态, 复制不出来就如实说, 不当成"已恢复"。
+        [[ "$want" == failed && "$now" == inactive ]] \
+          && unrestored+=("$u 前像是 failed(启动失败态), 现为 inactive —— 未复现该状态");;
+      activating|deactivating|reloading)
+        # 过渡态不猜: 复制不出来, 也不该随便定成 active 或 inactive。
+        unrestored+=("$u 前像是过渡态 $want, 未恢复(现为 $(_pdg_now_ac "$u"))");;
+      *) unrestored+=("$u 运行态前像是无法处理的取值($want)");;
+    esac
+  done
+  return 0
 }
 
 cmd_rollback(){
@@ -1353,6 +1746,14 @@ cmd_rollback(){
     (( idx >= ${#snaps[@]} )) && { echo "无效序号 $idx"; return 1; }
     target="${snaps[$idx]}"
   fi
+  # ── 路径表示统一一次 ────────────────────────────────────────────────────────
+  # 序号那条路走的是 `ls -1dt "$SNAP_DIR"/*/`, 它给出的每一项都**带末尾斜杠**; 而服务前像里
+  # 记的 snap_dir 是 cmd_snapshot 当时的 "$SNAP_DIR/$ts"(不带)。两边直接比字符串, 于是
+  # `pdg rollback 0` 回滚自己刚拍的那一份也会被判成"这份前像记的是别的快照" —— 同一个目录,
+  # 只因为一个斜杠。--dir 由调用方给, 带不带斜杠都可能, 同样要统一。
+  # 这里**只统一表示**: 去掉末尾斜杠, 不做符号链接解析(符号链接策略保持原样),
+  # 也不放宽后面的任何校验 —— 目录绑定、tarball 身份、损坏记录该拒的照拒。
+  while [[ "$target" == */ && "$target" != / ]]; do target="${target%/}"; done
   # ── 仓库一并带回去 ──────────────────────────────────────────────────────────
   # 以前只有 `cmd_update` 失败时的**自动**回滚会传 `--git`; 手动 `pdg rollback` 只还原文件。
   # 于是盘上跑着快照里的旧代码, 而 REPO_DIR 还停在新版本 —— `pdg version` 与 doctor 都走
@@ -1470,6 +1871,12 @@ cmd_rollback(){
   local unrestored=()                         # 未能恢复项(内核激活/仓库Git); 非空即"未完全回滚"
   # 恢复策略必须在**任何服务动作之前**定好 —— 内核收敛也算服务动作。
   # 这一步只解析与校验前像(并确认它属于正在回滚的这一份快照), 不碰任何服务。
+  #
+  # **回滚是独立的校验阶段**: 同一个进程里, 更新前的那次确认与此刻的回滚不是一回事 ——
+  # 中间机器上发生过什么(记录被改坏、tarball 被换掉)只有现在重读才知道。
+  # _pdg_svcstate_plan 会对"目录与上次相同"直接沿用旧结论, 所以这里先把那条短路清掉,
+  # 强制按**当时选中的这一份快照**重新核验结构与绑定。
+  _PDG_SVC_SRC=""
   _pdg_svcstate_plan "$target" || true
   # daemon-reload 失败必须计入: 后面 enable/start 全建立在它之上, 吞掉它等于谎报回滚成功。
   systemctl daemon-reload || unrestored+=("daemon-reload")
@@ -1919,6 +2326,45 @@ _update_in_sync(){                      # 0 = 已装文件逐个等于仓库版�
 #
 # 判不出来一律非 0(fail-closed): 上游拿它当"要不要拒绝"的依据, 那就绝不能在存疑时
 # 退回某个默认关系 —— 默认成 behind 就等于把"判不出来"变成了"那就 reset 吧"。
+# ── `pdg update --to <tag>` 的目标解析 ───────────────────────────────────────
+# 解析**只做一次**, 结果是一个提交 SHA; 之后每次要用它之前再复核 tag 没被挪走。
+# 为什么不是"每次用到就 rev-parse 一遍": tag 是可移动的引用。一次更新要经过方向判断、
+# same 短路、reset、装文件、身份核对好几步, 中间任何一步之后 tag 被重打(上游改了发布、
+# 或者本地 fetch 到了新的同名 tag), 后面几步就会悄悄换成另一个对象 —— 而屏幕上显示的
+# 还是同一个 tag 名。固定一次 + 每次复核, 变了就明确停止, 不成功短路到别的提交。
+_update_pin_resolve(){
+  local repo="$1" tag="$2" commit
+  # 钉版要求仓库本身是可判断的: .git 缺失时默认路径走的是"重新 clone"自愈, 那条路上
+  # 无从确认"现在这台机器与目标的关系", 而 --to 的前提正是关系可判。明确停, 不改装。
+  [[ -d "$repo/.git" ]] || { c_y "❌ $repo 不是 git 仓库, 无法钉版更新(--to 要求关系可判)。" >&2; return 1; }
+  # 取件失败就是"目标无法确认", 不是"目标不存在" —— 两者的处置都是停, 但理由要说对。
+  pdg_fetch_release_tags "$repo" >&2 || { c_y "❌ 取件失败 → 无法确认钉版目标 $tag, 中止(不改装别的版本)。" >&2; return 1; }
+  # `^{commit}` 必须写: 附注 tag 自己的对象哈希不是它指向的提交, 少了它后面与 HEAD 的
+  # 比较会永远不相等, 而且没有任何迹象。
+  commit="$(git -C "$repo" rev-parse -q --verify "refs/tags/$tag^{commit}" 2>/dev/null)"
+  [[ -n "$commit" ]] || { c_y "❌ 指定的版本 tag 在取件到的仓库里不存在: $tag(不会改装最新版)" >&2; return 1; }
+  printf '%s\n' "$commit"
+}
+# 目标还是最初固定的那个吗? 不是就停 —— 不猜、不重新解析、不退回最新发布。
+_update_pin_still(){
+  local repo="$1" tag="$2" want="$3" now
+  now="$(git -C "$repo" rev-parse -q --verify "refs/tags/$tag^{commit}" 2>/dev/null)"
+  [[ -n "$want" && "$now" == "$want" ]] && return 0
+  c_y "❌ 钉版目标 $tag 在执行过程中被移动了(最初固定 $want, 现在 ${now:-解析不出})→ 拒绝继续。" >&2
+  return 1
+}
+# 当前进程执行的是**哪一份** pdg.sh。旧版 CLI 不认识 --to, 跨版本升级要从一份经核验的
+# 入口副本里直接运行新版脚本(docs/BRIDGE-ENTRY.md), 那时 /usr/local/bin/pdg 还是旧的。
+# 被更新的对象**始终**是现役仓库 $REPO_DIR —— 入口在哪跑与改谁是两件事, 屏幕上必须分得清,
+# 否则事后无从判断"当时到底跑的是谁"。
+_pdg_entry_src(){
+  local src="${BASH_SOURCE[0]}" d b
+  [[ -n "$src" ]] || { echo "(未知)"; return 0; }
+  d="$(cd "$(dirname "$src")" 2>/dev/null && pwd -P)" || { printf '%s\n' "$src"; return 0; }
+  b="$(basename "$src")"
+  printf '%s/%s\n' "$d" "$b"
+}
+
 _update_release_relation(){
   local repo="${1:-}" tag="${2:-}" cur tgt rc
   [[ -n "$repo" && -d "$repo/.git" && -n "$tag" ]] || return 1
@@ -2035,12 +2481,55 @@ _update_mosdns_preflight(){
 
 cmd_update(){
   need_root update
-  # --dry-run 只查看: 不装 git、不迁移、不写任何东西。任一步失败都要返回非 0 并说清是哪一步 ——
+  # ── `--to <tag>`: 把这次更新钉在指定发布上 ────────────────────────────────
+  # 默认契约是"选仓库里最高的 v* tag"。当线上同时存在更高的**退役线** tag、或者要做
+  # 跨版本验收时, 那条默认会把机器带到不想要的版本上 —— `--to` 只收窄目标, 不放宽任何门。
+  #
+  # 参数三态必须分开, 不能合并成一个 `[[ -n $x ]]`:
+  #   省略 `--to`        → 保持既有默认(最高 v* tag), 行为一个字节都不变;
+  #   `--to` 后面没取值  → 用户漏写, 报错;
+  #   `--to ""` / `--to=`→ **显式空目标**, 报错。它与"省略"不是一回事: 把空值当省略的话,
+  #                        用户以为钉了版, 实际装的是最新发布, 而屏幕上看不出区别。
+  # 非法输入一律在**取件之前**拒绝 —— 取件会写现役仓库的 git 元数据, 参数错了不该留痕。
+  local _to_given=0 _to_tag="" _to_commit="" _argv=()
+  while (( $# )); do
+    case "$1" in
+      --to)
+        _to_given=1
+        (( $# >= 2 )) || { c_y "❌ --to 缺少取值(要跟一个版本 tag, 例: --to v1.11.15)"; return 1; }
+        _to_tag="$2"; shift 2;;
+      --to=*) _to_given=1; _to_tag="${1#--to=}"; shift;;
+      *) _argv+=("$1"); shift;;
+    esac
+  done
+  # 解析完再把其余参数放回去: `--dry-run` 与 `--to` 谁先谁后都成立, 不靠位置约定。
+  set -- ${_argv[@]+"${_argv[@]}"}
+  if (( _to_given )); then
+    [[ -n "${_to_tag//[[:space:]]/}" ]] \
+      || { c_y "❌ --to 给的是**空目标**。显式空值与省略 --to 不是一回事: 省略才走默认最新发布, 空值一律拒绝。"; return 1; }
+    # 只收版本 tag 名。挡的不只是笔误: 取值会拼进 `refs/tags/<x>`, 放行 `-` 开头、`..`、
+    # 路径分隔符等于把 git 的 ref 语法暴露到命令行上。
+    [[ "$_to_tag" =~ ^v[0-9][0-9A-Za-z.+_-]*$ && "$_to_tag" != *".."* && "$_to_tag" != *.lock ]] \
+      || { c_y "❌ --to 只接受版本 tag 名(v 开头, 例 v1.11.15); 收到: $_to_tag"; return 1; }
+    # 入口出身与被更新对象分别登记 —— 这两个在跨版本升级时**不是同一个目录**。
+    c_g "钉版更新: --to $_to_tag"
+    echo "  入口代码来源: $(_pdg_entry_src)"
+    echo "  被更新的对象: $REPO_DIR(现役受管仓库; 入口在哪运行都不改这一点)"
+  fi
+  # --dry-run 只查看: 不装 git、不迁移、不改任何生产文件。任一步失败都要返回非 0 并说清是哪一步 ——
   # 以前 fetch/describe/tag 全用 `2>/dev/null` 吞掉, 拿不到就打印"最新发布: (无 tag)"再 return 0,
   # 用户会当成"已经是最新版", 实际是网络不通或仓库读不了。
   if [[ "${1:-}" == "--dry-run" ]]; then
     command -v git >/dev/null 2>&1 || { c_y "❌ 没有 git, 无法查看更新(dry-run 不安装任何东西)"; return 1; }
     [[ -d "$REPO_DIR/.git" ]] || { c_y "❌ $REPO_DIR 不是 git 仓库, 无法查看更新"; return 1; }
+    # ── dry-run 也持锁 ────────────────────────────────────────────────────
+    # **行为变化, 如实登记**: dry-run 不是完全只读。下面的 pdg_fetch_release_tags 会写
+    # 现役仓库的 FETCH_HEAD 与 refs/tags —— 与执行路径写的是同一批 git 元数据, 所以必须
+    # 受**同一把锁**保护, 而不是"因为它叫 dry-run 就不用锁"。
+    # 位置: 第一次可能写现役仓库的取件**之前**; 锁一直持到预览返回(fd 9 由 _lock 打开并
+    # flock, 进程退出时内核释放, 与执行路径完全一致)。复用既有锁协议, 没有第二把锁。
+    # 锁忙时 _lock 自己就停(退出 1): 立即拒绝, **不取件**, 不重试。
+    _lock
     local cur_desc tgt
     if ! pdg_fetch_release_tags "$REPO_DIR"; then
       c_y "❌ 拉取远端 tag 失败(网络不通 / 仓库地址无效 / 属主异常)→ 无法判断是否有新版"; return 1
@@ -2048,9 +2537,20 @@ cmd_update(){
     if ! cur_desc="$(git -C "$REPO_DIR" describe --tags --always 2>/dev/null)" || [[ -z "$cur_desc" ]]; then
       c_y "❌ 读不到当前版本(git describe 失败: 仓库损坏 / 无提交 / 属主异常)"; return 1
     fi
+    # 预览与执行**共用同一套选版契约**: 钉了版就预览钉的那一版, 否则才是默认最新发布。
+    # 两边各写一份的话, 用户看到的与实际装上的迟早会是两个东西。
+    if (( _to_given )); then
+      _to_commit="$(_update_pin_resolve "$REPO_DIR" "$_to_tag")" || return 1
+      tgt="$_to_commit"
+      echo "预览目标(钉版): $_to_tag → $_to_commit"
+    else
     tgt="$(git -C "$REPO_DIR" tag -l 'v*' --sort=-v:refname 2>/dev/null | head -1)"
     [[ -n "$tgt" ]] || { c_y "❌ 仓库里没有任何发布 tag(v*)→ 无法确定目标版本"; return 1; }
-    echo "当前: $cur_desc   最新发布: $tgt"
+    fi
+    # 钉版时这一行不能仍写"最新发布" —— 显示的是钉的那个目标, 与最新发布往往不是一回事。
+    if (( _to_given )); then echo "当前: $cur_desc   钉版目标: $_to_tag($_to_commit)"
+    else                     echo "当前: $cur_desc   最新发布: $tgt"
+    fi
     # 关系先判、再决定说什么。以前无论什么关系都打印一段 "待更新提交(HEAD..$tgt):" ——
     # HEAD 领先 tag 时那个区间是**空的**, 于是屏幕上只剩一个标题, 读起来正好是"没有待更新
     # 的提交, 已经最新了"。而真相相反: 正式 update 会把机器退回 $tgt。
@@ -2089,7 +2589,47 @@ cmd_update(){
   #
   # .git 缺失时不判: 那条路是"重新 clone"的自愈: 一个不是 git 仓库的目录里, 也不可能有
   # 未发布的本地提交需要保护。
-  if [[ -d "${REPO_DIR:-}/.git" ]] && pdg_fetch_release_tags "$REPO_DIR" >/dev/null 2>&1; then
+  # 钉版时走这条: 目标在方向门**之前**解析并固定, 之后方向判断、same 短路、reset、
+  # 身份核对用的都是这同一个提交。
+  #
+  # 与默认路径的一处**有意不同**: 默认路径上"不是仓库 / 拉不到 tag"会整段跳过方向门,
+  # 由后面各步给出自己的失败理由; 钉版不允许这样 —— 目标确认不了就是停, 不把"没得到
+  # 方向裁决"当成可以继续。ahead / diverged 仍然拒绝: --to 只收窄目标, 不兼作降级后门。
+  if (( _to_given )); then
+    _to_commit="$(_update_pin_resolve "$REPO_DIR" "$_to_tag")" || return 1
+    c_g "钉版目标已固定(一次, 在方向门之前): $_to_tag → $_to_commit"
+    local _rel_to
+    if ! _rel_to="$(_update_release_relation "$REPO_DIR" "$_to_commit")"; then
+      c_y "❌ 判不出当前提交与钉版目标 $_to_tag 的关系(仓库损坏 / 对象缺失), 中止更新。"
+      echo "  没动任何文件: 未建快照, 未 reset, 未重启服务。"
+      return 1
+    fi
+    case "$_rel_to" in
+      ahead)
+        c_y "❌ 当前跑的是**尚未发布**的提交(领先钉版目标 $_to_tag), 拒绝更新。"
+        echo "  update 只往前走; --to 收窄的是目标, 不是方向。退回某一版走 pdg rollback 或重装那一版。"
+        echo "  没动任何文件: 未建快照, 未 reset, 未重启服务。"
+        return 1;;
+      diverged)
+        c_y "❌ 当前提交与钉版目标 $_to_tag 已**分叉**(互不为祖先), 拒绝更新。"
+        echo "  两个方向都不是「更新」, 而 update 不猜方向。"
+        echo "  没动任何文件: 未建快照, 未 reset, 未重启服务。"
+        return 1;;
+    esac
+    if [[ "$_rel_to" == behind ]] && ! _update_mosdns_preflight; then
+      return 1
+    fi
+    # 短路之前再复核一次: 要短路的前提是"现在就在目标上", 目标被挪走了这个前提就不成立。
+    _update_pin_still "$REPO_DIR" "$_to_tag" "$_to_commit" || return 1
+    if [[ -z "${PDG_UPDATE_FORCE:-}" && "$_rel_to" == same ]] \
+       && git -C "$REPO_DIR" diff --quiet HEAD -- 2>/dev/null \
+       && _update_in_sync "$REPO_DIR"; then
+      c_g "已是钉版目标 $_to_tag($_to_commit), 且已装文件逐个与仓库一致 —— 无需更新(未建快照, 未重启任何服务)。"
+      echo "  要强制重装同一版本: PDG_UPDATE_FORCE=1 pdg update --to $_to_tag"
+      return 0
+    fi
+    # same 但不同步 → 不短路, 照走下面的完整流程(那正是 `pdg update` 作为修复路径的用法)。
+  elif [[ -d "${REPO_DIR:-}/.git" ]] && pdg_fetch_release_tags "$REPO_DIR" >/dev/null 2>&1; then
     local _tgt_tag _rel
     _tgt_tag="$(git -C "$REPO_DIR" tag -l 'v*' --sort=-v:refname 2>/dev/null | head -1)"
     if [[ -n "$_tgt_tag" ]]; then
@@ -2140,24 +2680,53 @@ cmd_update(){
     c_y "❌ 更新前快照失败, 中止更新(拒绝在无法回滚的前提下继续)。"; return 1
   fi
   local snap_dir="$_PDG_SNAP_CREATED"                                    # 精确回滚目标(不靠 index 0 猜)
-  # 与桥接版同一套契约: 动第一样东西之前存服务前像, 存不下就别往下走。
-  if ! _pdg_save_svcstate "$snap_dir"; then
-    c_y "❌ 服务前像保存失败, 中止更新(拒绝在无法完整回滚的前提下继续)。"; return 1
+  # 前像现在由 cmd_snapshot 在建快照时一并存好并校验过(见那里的注释)。这里**不再重复保存,
+  # 也不重新采样** —— 再采一次会覆盖掉"操作前"那一刻的记录, 而两次采样之间机器状态可能已经变了。
+  # 动第一样已装产品之前, 确认用的就是本次这份快照、且它的前像有效并钉在这一份上。存疑即中止。
+  if [[ ! -f "$snap_dir/svcstate.tsv" ]] || ! _pdg_svcstate_plan "$snap_dir"; then
+    c_y "❌ 本次快照的服务前像不可用(${_PDG_SVC_WHY:-svcstate.tsv 不存在}), 中止更新(拒绝在无法完整回滚的前提下继续)。"
+    return 1
   fi
+  # 这次确认只为"现在能不能动手", 结论**不留给后面的阶段**。失败回滚时会按那一刻的磁盘记录
+  # 重新核验一遍(见 cmd_rollback 里那一处) —— 两者是不同的校验阶段, 不共用结论。
+  _PDG_SVC_SRC=""; _PDG_SVC_MODE=blind
   local pre_sha; pre_sha="$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null)"   # 升级前精确提交, 回滚据此复位仓库
   c_g "拉取最新发布 tag…"
   [[ -d "$REPO_DIR/.git" ]] || { rm -rf "$REPO_DIR"; git clone -q "$REPO_URL" "$REPO_DIR"; }
   if ! pdg_fetch_release_tags "$REPO_DIR"; then
     c_y "拉取发布 tag 失败, 中止更新。"; return 1
   fi
+  # 钉版时**不重新选版**: 用方向门之前固定的那个提交, 用之前再复核 tag 没被挪走。
+  # 这里重新 `tag -l | head -1` 的话, 前面所有基于目标的判断就都白做了 —— 装上去的会是
+  # 此刻最高的那个 tag, 而不是用户钉的那一个。
+  local tgt
+  if (( _to_given )); then
+    if ! _update_pin_still "$REPO_DIR" "$_to_tag" "$_to_commit"; then
+      c_y "回滚到更新前快照…"; cmd_rollback --dir "$snap_dir" --git "$pre_sha"; return 1
+    fi
+    tgt="$_to_commit"
+  else
   local tgt; tgt=$(git -C "$REPO_DIR" tag -l 'v*' --sort=-v:refname | head -1)
+  fi
   if [[ -z "$tgt" ]]; then
     c_y "仓库没有发布 tag(v*), 中止更新。"; return 1
   fi
   if ! git -C "$REPO_DIR" reset --hard -q "$tgt"; then
     c_y "git reset 到 $tgt 失败, 回滚到更新前快照…"; cmd_rollback --dir "$snap_dir" --git "$pre_sha"; return 1
   fi
+  if (( _to_given )); then
+    # 装上去的到底是不是钉的那一版: 读仓库**真实 HEAD**, 不是解析时记下的值。
+    # 拿记下的值自比等于自证, reset 被别的东西改掉时照样"通过"。
+    local _head_now; _head_now="$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null)"
+    if [[ "$_head_now" != "$_to_commit" ]]; then
+      c_y "❌ 钉版目标没有贯穿到实际安装(现役仓库 HEAD=${_head_now:-读不到}, 应为 $_to_commit)→ 回滚…"
+      cmd_rollback --dir "$snap_dir" --git "$pre_sha"; return 1
+    fi
+    c_g "钉版目标已贯穿到实际安装: $_to_tag → $_to_commit"
+    c_g "→ 已切到发布 $_to_tag($_to_commit)"
+  else
   c_g "→ 已切到发布 $tgt"
+  fi
   c_g "刷新代码(配置/出口/token/证书均不动)…"
   # 运行模块清单的单一事实源(与 install.sh 共用)。读不到就别装 —— 宁可这次不更新, 也不要
   # 按一份残缺的清单装出新旧混装。
@@ -2185,7 +2754,8 @@ cmd_update(){
   install -m644 "$REPO_DIR"/deploy/bot/pdg-health.timer    /etc/systemd/system/ 2>/dev/null || true
   install -m755 "$REPO_DIR"/deploy/cert/99-reload-cert.deploy-hook.sh     /etc/letsencrypt/renewal-hooks/deploy/99-pdg-cert.sh 2>/dev/null || true
   # 迁移用"刚装好的新脚本"跑(本进程还是旧 bash, 直接调会用旧版函数 → 新迁移要等下次命令才生效)。
-  # 把本次前像的句柄交给迁移子进程 —— 下一版的门会去验它是不是属于这一次操作。
+  # 把本次前像的**句柄**交给迁移子进程。句柄本身不是证据 —— 新版会去验它指向的那份记录
+  # 是否属于本次操作(见退役版的调用方门)。旧版迁移看不懂这个变量, 也不受影响。
   if ! PDG_UPDATE_SVCSTATE="$snap_dir/svcstate.tsv" bash /usr/local/bin/pdg __migrate; then
     c_y "迁移(__migrate)失败, 回滚到更新前快照…"; cmd_rollback --dir "$snap_dir" --git "$pre_sha"; return 1
   fi
@@ -3896,366 +4466,6 @@ _retire_core_has_mitm(){
   local mc="${PDG_RETIRE_ROOT:-}${PDG_MIHOMO_CFG:-/etc/mihomo/config.yaml}"
   [[ -f "$mc" ]] || return 1
   grep -q 'MITM-OUT' "$mc"
-}
-
-# ── 服务前像: 保存与恢复 ─────────────────────────────────────────────────────
-# 为什么需要它: 快照只收文件。而 `/etc/systemd/system/<u>.service` 恢复回来, **不等于**
-# 那个服务回到了原来的运行态与自启态 —— enable 的符号链接在
-# multi-user.target.wants/ 下, 全仓从不快照它。于是"文件都回来了、服务却停着且不自启"
-# 这种现场会被回滚自报成"已回滚并重启服务"。这一组就是补这一格。
-#
-# 三条纪律:
-#   · active 与 enabled 是**两件独立的事**, 分别记、分别恢复;
-#   · 查不到 ≠ 没有。查询失败写 QUERY-FAILED, 绝不写成空串再让两个空串相等;
-#   · 记录**不是**通用凭据, 它只服务于"这一次操作的回滚", 所以要和本次操作绑死。
-
-# 要保前像的服务集合。**固定一份**, 不按平台裁剪 —— 少记一个就等于那一格无法恢复。
-_pdg_svcstate_units(){
-  printf '%s\n' pdg-mitm pdg-bot pdg-probe81 mosdns mihomo pdg-dotwitness \
-                pdg-health.timer pdg-rules-update.timer
-}
-
-# systemd 对这两个查询会给出的**全部**取值。判"查到了没有"靠的是它, 不是"输出非空"。
-# 特别注意: 非零返回码**不等于**查询失败 —— `is-enabled` 对 disabled 就返回 1,
-# `is-active` 对 inactive/failed 返回 3。那是正常答案, 必须原样记下。
-_pdg_svc_known(){   # $1=子命令 $2=值
-  case "$1" in
-    is-enabled)
-      case "$2" in enabled|enabled-runtime|linked|linked-runtime|alias|masked|masked-runtime|\
-static|indirect|disabled|generated|transient|not-found) return 0;; esac;;
-    is-active)
-      case "$2" in active|reloading|inactive|failed|activating|deactivating|maintenance|not-found) return 0;; esac;;
-  esac
-  return 1
-}
-
-# 读一个属性, 把「值」与「查询成不成功」分开。
-# 空输出只有在 systemd 明确说 LoadState=not-found 时才算"这个 unit 不存在";
-# 其余空输出、以及任何**不在词表里**的输出, 一律记 QUERY-FAILED —— 那是观测失败, 不是一种状态。
-_pdg_svc_q(){   # $1=子命令 $2=unit → 打印 "值<TAB>rc"
-  local out rc ls
-  out="$(systemctl "$1" "$2" 2>/dev/null)"; rc=$?
-  out="${out%%$'\n'*}"
-  out="${out//[[:space:]]/}"
-  if [[ -z "$out" ]]; then
-    ls="$(systemctl show -p LoadState --value "$2" 2>/dev/null)"
-    if [[ "$ls" == not-found ]]; then out=not-found; else out=QUERY-FAILED; fi
-  elif ! _pdg_svc_known "$1" "$out"; then
-    out=QUERY-FAILED          # 认不出来的答案不能当成一种状态往下传
-  fi
-  printf '%s\t%s\n' "$out" "$rc"
-}
-
-# 把**操作前**的服务状态写进本次快照目录。
-# 头部记的是"这条记录属于谁、属于哪一次": boot_id + 持锁进程的 pid/starttime + 快照目录。
-# 尾部记条数与正文摘要 —— 截断、少行、重复都能当场看出来。
-_pdg_save_svcstate(){   # $1=本次快照目录
-  local sd="$1" f body u ufs asv sub inv n=0 st tb
-  [[ -d "$sd" ]] || { c_y "❌ 服务前像: 快照目录不存在: $sd"; return 1; }
-  tb="$sd/snap.tar.gz"
-  # 前像必须写在**回滚真正会用到的那份快照**旁边, 且把那份快照的身份记进来。
-  # 否则"记录是这一次的"与"快照是这一次的"是两件没有关联的事。
-  [[ -f "$tb" ]] || { c_y "❌ 服务前像: 快照目录里没有 snap.tar.gz: $sd"; return 1; }
-  f="$sd/svcstate.tsv"
-  body="$(mktemp)" || return 1
-  {
-    printf '#pdg-svcstate\t1\n'
-    printf 'boot_id\t%s\n'      "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"
-    printf 'holder_pid\t%s\n'   "$$"
-    # /proc/<pid>/stat 第 22 个字段是进程启动时刻(自开机起的 tick)。pid 会复用, pid+starttime 不会。
-    printf 'holder_start\t%s\n' "$(awk '{print $22}' "/proc/$$/stat" 2>/dev/null)"
-    printf 'snap_dir\t%s\n'     "$sd"
-    # 快照身份: 设备:inode + 字节数 + mtime。回滚会用这一份; 记录就钉在这一份上。
-    printf 'snap_id\t%s\n'      "$(stat -c '%d:%i:%s:%Y' "$tb" 2>/dev/null)"
-    printf 'created_at\t%s\n'   "$(date -u +%FT%TZ)"
-    while read -r u; do
-      [[ -n "$u" ]] || continue
-      ufs="$(_pdg_svc_q is-enabled "$u")"
-      asv="$(_pdg_svc_q is-active  "$u")"
-      sub="$(systemctl show -p SubState     --value "$u" 2>/dev/null)"
-      inv="$(systemctl show -p InvocationID --value "$u" 2>/dev/null)"
-      printf 'unit\t%s\t%s\t%s\t%s\t%s\n' "$u" "$ufs" "$asv" "${sub:-QUERY-FAILED}" "${inv:-}"
-      n=$((n+1))
-    done < <(_pdg_svcstate_units)
-  } > "$body" || { rm -f "$body"; return 1; }
-  n="$(grep -c $'^unit\t' "$body")"
-  st="$(sha256sum "$body" | awk '{print $1}')"
-  { cat "$body"; printf 'end\t%s\t%s\n' "$n" "$st"; } > "$f" || { rm -f "$body"; return 1; }
-  rm -f "$body"
-  chmod 600 "$f" || return 1
-  c_g "  已保存服务前像($n 个 unit): $f"
-}
-
-# 读并**校验**一份前像。$1=记录路径; 校验不过就说清是哪一条不过。
-# 只做结构与完整性校验 —— "这条记录是不是本次操作的"由调用方另判(见退役版的调用方门)。
-_pdg_svcstate_valid(){   # $1=文件 → 0=可用
-  local f="$1" tail cnt want got body
-  [[ -f "$f" ]] || { _PDG_SVCSTATE_WHY="记录不存在"; return 1; }
-  head -1 "$f" | grep -qx $'#pdg-svcstate\t1' || { _PDG_SVCSTATE_WHY="不是认识的前像格式/版本"; return 1; }
-  tail="$(tail -1 "$f")"
-  [[ "$tail" == end$'\t'* ]] || { _PDG_SVCSTATE_WHY="记录没有结尾行(可能被截断)"; return 1; }
-  cnt="$(cut -f2 <<<"$tail")"; want="$(cut -f3 <<<"$tail")"
-  body="$(mktemp)" || return 1
-  head -n -1 "$f" > "$body"
-  got="$(sha256sum "$body" | awk '{print $1}')"
-  rm -f "$body"
-  [[ "$got" == "$want" ]] || { _PDG_SVCSTATE_WHY="正文摘要对不上(记录被改过或写坏了)"; return 1; }
-  # 头部: 六个字段一个都不能少、不能空、不能重复。
-  # **摘要对得上只说明"没被改过", 不说明"内容是完整的"** —— 少一列、重复一行、字段非法,
-  # 都可以是当初就写坏的, 那种记录照样能通过摘要。所以这里逐条查。
-  local k n_k
-  for k in boot_id holder_pid holder_start snap_dir snap_id created_at; do
-    n_k="$(grep -c "^$k"$'\t' "$f")"
-    [[ "$n_k" -ge 1 ]] || { _PDG_SVCSTATE_WHY="记录缺头部字段 $k"; return 1; }
-    [[ "$n_k" == 1 ]]  || { _PDG_SVCSTATE_WHY="记录的头部字段 $k 出现了 $n_k 次(重复头部)"; return 1; }
-    [[ -n "$(awk -F'\t' -v k="$k" '$1==k{print $2; exit}' "$f")" ]] \
-      || { _PDG_SVCSTATE_WHY="记录的头部字段 $k 是空的"; return 1; }
-  done
-  # 每一条服务行: 恰好 8 列; 两个取值必须在词表里(或 QUERY-FAILED); 两个 rc 必须是整数。
-  local _k _u _ufs _urc _asv _arc _sub _inv _extra
-  while IFS=$'\t' read -r _k _u _ufs _urc _asv _arc _sub _inv _extra; do
-    [[ "$_k" == unit ]] || continue
-    [[ -n "$_u" ]] || { _PDG_SVCSTATE_WHY="有一条服务行没有 unit 名"; return 1; }
-    [[ -z "$_extra" ]] || { _PDG_SVCSTATE_WHY="$_u 那一行多了列(格式不对)"; return 1; }
-    [[ -n "$_inv" || -n "$_sub" ]] || { _PDG_SVCSTATE_WHY="$_u 那一行缺列(格式不对)"; return 1; }
-    [[ "$_ufs" == QUERY-FAILED ]] || _pdg_svc_known is-enabled "$_ufs" \
-      || { _PDG_SVCSTATE_WHY="$_u 的自启取值非法($_ufs)"; return 1; }
-    [[ "$_asv" == QUERY-FAILED ]] || _pdg_svc_known is-active "$_asv" \
-      || { _PDG_SVCSTATE_WHY="$_u 的运行取值非法($_asv)"; return 1; }
-    [[ "$_urc" =~ ^[0-9]+$ ]] || { _PDG_SVCSTATE_WHY="$_u 的自启查询返回码不是整数($_urc)"; return 1; }
-    [[ "$_arc" =~ ^[0-9]+$ ]] || { _PDG_SVCSTATE_WHY="$_u 的运行查询返回码不是整数($_arc)"; return 1; }
-  done < "$f"
-  local n_have n_uniq n_need
-  n_have="$(grep -c $'^unit\t' "$f")"
-  n_uniq="$(grep $'^unit\t' "$f" | cut -f2 | sort -u | wc -l)"
-  n_need="$(_pdg_svcstate_units | grep -c .)"
-  [[ "$n_have" == "$cnt" ]]   || { _PDG_SVCSTATE_WHY="服务行数与结尾行不符($n_have vs $cnt)"; return 1; }
-  [[ "$n_have" -gt 0 ]]       || { _PDG_SVCSTATE_WHY="一条服务记录都没有"; return 1; }
-  [[ "$n_have" == "$n_uniq" ]]|| { _PDG_SVCSTATE_WHY="有重复的 unit 记录"; return 1; }
-  local miss="" u
-  while read -r u; do
-    [[ -n "$u" ]] || continue
-    grep -q "^unit"$'\t'"$u"$'\t' "$f" || miss="$miss $u"
-  done < <(_pdg_svcstate_units)
-  [[ -z "$miss" ]] || { _PDG_SVCSTATE_WHY="缺少必需服务的前像:$miss"; return 1; }
-  [[ "$n_uniq" == "$n_need" ]] || { _PDG_SVCSTATE_WHY="服务集合与本版清单不一致($n_uniq vs $n_need)"; return 1; }
-  return 0
-}
-
-# 按前像恢复服务状态。失败或无法确认的逐项计入 unrestored(调用方的数组)。
-# **不做**的事: 不推断、不补造历史状态、不因为"通用 restart"把原本 inactive 的服务拉起来。
-# 恢复策略**必须在动任何服务之前**定好。
-# 以前的写法是"先一律 systemctl restart mosdns pdg-bot pdg-probe81, 再按前像纠正":
-# 那会把本来停着的服务先拉起来再停回去(中间真的跑过一段), 而且辅助函数自己"没有服务动作"
-# 也证明不了整条回滚链没有先启动过什么。所以这里先解析、先判定, 再一次性收敛。
-#
-# 解析结果放进三张表: 想要的自启值 / 想要的运行值 / 记录时的 InvocationID。
-declare -A _PDG_WANT_EN=() _PDG_WANT_AC=() _PDG_WANT_URC=() _PDG_WANT_ARC=()
-_PDG_SVC_MODE=""      # plan=有可用前像 / blind=没有(旧快照或记录不可用)
-_PDG_SVC_WHY=""
-_PDG_SVC_SRC=""       # 已经解析过的快照目录, 避免重复解析
-
-# 解析并**确认这份记录属于实际选中的那份快照**。
-# 只做结构校验是不够的: 一份结构完好、但属于别的快照的记录, 拿来恢复就是按错误的历史动手。
-_pdg_svcstate_plan(){   # $1=本次要回滚到的快照目录
-  local sd="$1" f k u ufs urc asv arc sid now
-  [[ "$_PDG_SVC_SRC" == "$sd" ]] && return 0
-  _PDG_WANT_EN=(); _PDG_WANT_AC=(); _PDG_WANT_URC=(); _PDG_WANT_ARC=()
-  _PDG_SVC_SRC="$sd"; _PDG_SVC_MODE=blind; _PDG_SVC_WHY=""
-  f="$sd/svcstate.tsv"
-  if [[ ! -f "$f" ]]; then _PDG_SVC_WHY="这份快照没有服务前像(旧格式)"; return 1; fi
-  if ! _pdg_svcstate_valid "$f"; then _PDG_SVC_WHY="前像不可用: ${_PDG_SVCSTATE_WHY:-未知}"; return 1; fi
-  k="$(awk -F'\t' '$1=="snap_dir"{print $2; exit}' "$f")"
-  if [[ "$k" != "$sd" ]]; then
-    _PDG_SVC_WHY="这份前像记的是别的快照($k), 不是正在回滚的这一份"; return 1
-  fi
-  sid="$(awk -F'\t' '$1=="snap_id"{print $2; exit}' "$f")"
-  now="$(stat -c '%d:%i:%s:%Y' "$sd/snap.tar.gz" 2>/dev/null)"
-  if [[ -z "$sid" || -z "$now" || "$sid" != "$now" ]]; then
-    _PDG_SVC_WHY="前像钉的快照身份与这一份对不上(记录=${sid:-空}, 现在=${now:-读不到})"; return 1
-  fi
-  while IFS=$'\t' read -r k u ufs urc asv arc _sub _inv; do
-    [[ "$k" == unit && -n "$u" ]] || continue
-    _PDG_WANT_EN["$u"]="$ufs"; _PDG_WANT_URC["$u"]="$urc"
-    _PDG_WANT_AC["$u"]="$asv"; _PDG_WANT_ARC["$u"]="$arc"
-  done < "$f"
-  _PDG_SVC_MODE=plan
-  return 0
-}
-
-# 一个 unit 现在的运行值(读不出来就是 QUERY-FAILED, 不是空串)
-_pdg_now_ac(){ _pdg_svc_q is-active  "$1" | cut -f1; }
-_pdg_now_en(){ _pdg_svc_q is-enabled "$1" | cut -f1; }
-
-# 把 $1 的自启状态设成 $2。**只动这一个 unit**: 不碰 wants/ 目录、不用通配、不动别的 unit;
-# 这里只改自启 —— 一个 start/stop 都不发, 原本停着的服务不会被顺带启动。
-#
-# 为什么不是一句 systemctl 就完事: 持久自启与运行时自启是**两套独立的链接**
-#     持久   /etc/systemd/system/<target>.wants/<unit>
-#     运行时 /run/systemd/system/<target>.wants/<unit>
-# 在真 systemd 上实测过(用户作用域的一次性 unit, 不碰任何宿主系统服务):
-#     enable                                → enabled
-#     已经 enabled 再 enable --runtime      → 仍然 **enabled**        ← 缺口一
-#     disable(不带 --runtime)               → enabled-runtime(只撤掉持久那一层)
-#     enabled-runtime 上只 disable          → 仍然 **enabled-runtime** ← 缺口二
-#     disable --runtime                     → disabled
-# 也就是说: 只调目标那一条命令, "前像是 enabled-runtime 而现状被永久 enable 了"和
-# "前像是 disabled 而现状是 enabled-runtime"这两种都**永远回不去**。
-#
-# 所以先按真实语义撤掉**妨碍这一次恢复的那一层**, 再置目标层。撤哪一层由**当前实际状态**
-# 决定 —— 没有妨碍就一层都不撤(不做多余动作), 也不会对 static/masked 这类没有链接的
-# unit 先动手再说不支持(调用方只在三种可还原取值上调本函数)。
-#
-# 返回 0 = 每一步动作都成功; 非 0 = 有动作失败。
-# **后置状态由调用方另行核对** —— 动作成功与后置相符是两件事, 分开记。
-_pdg_set_enable_state(){   # $1=unit $2=目标(enabled|enabled-runtime|disabled)
-  local u="$1" want="$2" rc=0
-  case "$want" in
-    enabled)
-      systemctl enable "$u" >/dev/null 2>&1 || rc=$?;;
-    enabled-runtime)
-      # 妨碍项 = 持久链接。只在它确实在的时候撤, 撤的是**这一个 unit** 的那一条。
-      if [[ "$(_pdg_now_en "$u")" == enabled ]]; then
-        systemctl disable "$u" >/dev/null 2>&1 || rc=$?
-      fi
-      systemctl enable --runtime "$u" >/dev/null 2>&1 || rc=$?;;
-    disabled)
-      systemctl disable "$u" >/dev/null 2>&1 || rc=$?
-      # 妨碍项 = 运行时链接(上面那句不带 --runtime, 撤不掉 /run 里的那一条)。
-      if [[ "$(_pdg_now_en "$u")" == enabled-runtime ]]; then
-        systemctl disable --runtime "$u" >/dev/null 2>&1 || rc=$?
-      fi;;
-    *) return 2;;          # 调用方负责只传这三种可还原取值
-  esac
-  return "$rc"
-}
-
-# 回滚时的内核收敛。
-#
-# 分工: 旧核冲突那一半**原样保留**(停掉并关自启, 并核验) —— 这一版只允许一个内核在跑,
-# 与快照记着什么无关。目标核那一半交给前像。
-# 为什么不能直接用 _core_kernel_activate: 它是把目标核硬收敛成 "enabled + active", 那是
-# **装机/切核**的语义。回滚时照搬, 会在恢复策略生效之前先把 mihomo 永久启用并起来, 然后
-# 再被 _pdg_restore_svcstate 纠正回去 —— 中间真的跑过一段, 自启也真的被改成过 enabled。
-# 只看最终状态看不出来, 但那是一次真实的状态变更。
-#
-#   有可信前像: 这里**不碰目标核**。目标核的自启与运行态由 _pdg_restore_svcstate 一处负责
-#               (单一归属, 两处不会互相覆盖)。旧核照停照核验, unit 缺失照样当场报。
-#   没有前像  : 原样调用 _core_kernel_activate —— 历史兼容路径, 并明说这不是按前像精确恢复。
-_pdg_kernel_converge(){   # $1=目标核 $2=旧核
-  local tgt="$1" old="$2" rc=0
-  if [[ "$_PDG_SVC_MODE" != plan ]]; then
-    c_y "  内核收敛: 这份快照没有可用的服务前像 → 按**历史行为**把 $tgt 收敛成 enabled+active。"
-    c_y "            这条是历史兼容路径, **不是按前像精确恢复**。"
-    _core_kernel_activate "$tgt" "$old"
-    return
-  fi
-  c_y "  内核收敛: 按本次前像恢复 $tgt(自启=${_PDG_WANT_EN[$tgt]:-未记录} 运行=${_PDG_WANT_AC[$tgt]:-未记录});"
-  c_y "            旧核 $old 仍按「只能有一个内核」的安全前提停用并关自启。"
-  systemctl disable --now "$old" >/dev/null 2>&1 || true
-  [[ "$(systemctl is-active  "$old" 2>/dev/null)" != active  ]] || { echo "  旧核 $old 仍 active"; rc=1; }
-  [[ "$(systemctl is-enabled "$old" 2>/dev/null)" == enabled ]] && { echo "  旧核 $old 仍 enabled(重启会双起)"; rc=1; }
-  # 起不起得来由前像决定, 但"根本没有这个 unit"必须当场看出来 —— 那说明快照没把它带回来。
-  if [[ "$(systemctl show -p LoadState --value "$tgt" 2>/dev/null)" == not-found ]]; then
-    echo "  $tgt 的 unit 不存在(快照没带回来?)"; rc=1
-  fi
-  systemctl reset-failed "$tgt" >/dev/null 2>&1 || true
-  return "$rc"
-}
-
-# 恢复服务的运行态与自启态。**依赖调用方作用域里的 unrestored 数组**。
-# 纪律:
-#   · 先定策略再动手 —— 不先通用重启再纠正, 本来没在跑的**一次都不会被启动**;
-#   · 动作返回码与后置状态是**两个独立**的失败条件, 各记各的;
-#   · 停必须停稳: 过渡态、查询失败都不算停稳; failed 与 inactive 的差别如实登记;
-#   · 想要 active 的那些用 restart(不是 start): 已经在跑的服务 start 是空转, 进程不换,
-#     刚恢复出来的配置根本没被读进去 —— 所以还要求 InvocationID 变过才算数;
-#   · enabled-runtime 不提升成永久 enabled; static/masked/未知一律不先改再说不支持;
-#   · 没有可用前像时保留原来那套通用重启与安全检查, 但如实登记"运行态/自启未确认",
-#     并让调用方拿不到"完全回滚"。
-_pdg_restore_svcstate(){   # $1=本次快照目录
-  local u rc now inv0 inv1 want
-  _pdg_svcstate_plan "$1" || true
-  if [[ "$_PDG_SVC_MODE" != plan ]]; then
-    c_y "  ⚠️ ${_PDG_SVC_WHY:-前像不可用}: 文件已按快照恢复, 但**运行态与自启状态无法确认**。"
-    c_y "     请自行复核 $(_pdg_svcstate_units | tr '\n' ' ')的 is-active / is-enabled。"
-    # 退回原来那套: 明确列出 unit, 绝不用 pdg-* 通配(那会把救援服务一起重启掉)。
-    systemctl restart mosdns pdg-bot pdg-probe81 2>/dev/null || true
-    systemctl is-enabled pdg-mitm >/dev/null 2>&1 && { systemctl reset-failed pdg-mitm 2>/dev/null; systemctl restart pdg-mitm 2>/dev/null; }
-    unrestored+=("服务前像缺失/不可用(${_PDG_SVC_WHY:-未知}; 运行态/自启未确认)")
-    return 1
-  fi
-  # ── ① 自启 ────────────────────────────────────────────────────────────────
-  for u in $(_pdg_svcstate_units); do
-    want="${_PDG_WANT_EN[$u]:-}"
-    [[ -n "$want" ]] || { unrestored+=("$u 前像里没有自启记录"); continue; }
-    case "$want" in
-      QUERY-FAILED)
-        unrestored+=("$u 自启前像无法确认(记录时查询 rc=${_PDG_WANT_URC[$u]:-?})");;
-      enabled|enabled-runtime|disabled)
-        rc=0
-        # 持久与运行时是两套链接, 只调目标那一条命令回不去 —— 详见 _pdg_set_enable_state。
-        _pdg_set_enable_state "$u" "$want" || rc=$?
-        [[ "$rc" == 0 ]] || unrestored+=("$u 自启恢复动作失败(目标 $want, rc=$rc)")
-        now="$(_pdg_now_en "$u")"
-        [[ "$now" == "$want" ]] || unrestored+=("$u 自启后置状态不符(目标 $want, 实得 $now)");;
-      static|masked|masked-runtime|indirect|generated|transient|alias|linked|linked-runtime|not-found)
-        # 这几种不是 enable/disable 能表达的。**先不动**, 只在现状与前像不符时如实登记。
-        now="$(_pdg_now_en "$u")"
-        [[ "$now" == "$want" ]] || unrestored+=("$u 自启状态 $want 无法用 enable/disable 恢复(现为 $now)");;
-      *) unrestored+=("$u 自启前像是无法处理的取值($want)");;
-    esac
-  done
-  # ── ② 运行态 ──────────────────────────────────────────────────────────────
-  for u in $(_pdg_svcstate_units); do
-    want="${_PDG_WANT_AC[$u]:-}"
-    [[ -n "$want" ]] || { unrestored+=("$u 前像里没有运行态记录"); continue; }
-    case "$want" in
-      QUERY-FAILED)
-        unrestored+=("$u 运行态前像无法确认(记录时查询 rc=${_PDG_WANT_ARC[$u]:-?})");;
-      active)
-        inv0="$(systemctl show -p InvocationID --value "$u" 2>/dev/null)"
-        systemctl reset-failed "$u" >/dev/null 2>&1 || true
-        rc=0; systemctl restart "$u" >/dev/null 2>&1 || rc=$?
-        [[ "$rc" == 0 ]] || unrestored+=("$u 启动动作失败(restart rc=$rc)")
-        now="$(_pdg_now_ac "$u")"
-        # 起服务不是瞬时的: 头一眼没 active 就再等两拍再看(原来 _core_kernel_activate 里那句
-        # `sleep 2` 就是干这个的)。桩化测试里第一眼就 active, 不会真的睡。
-        local _try=0
-        while [[ "$now" != active && "$_try" -lt 3 ]]; do sleep 1; _try=$((_try+1)); now="$(_pdg_now_ac "$u")"; done
-        if [[ "$now" != active ]]; then
-          unrestored+=("$u 后置状态不符(目标 active, 实得 $now)")
-        elif [[ "$u" != *.timer ]]; then
-          # 光是 active 证明不了"恢复出来的配置已经被读进去" —— 本来就在跑的服务 start 是
-          # 空转。InvocationID 变过才说明进程真的被换掉了, 那一刻读的才是刚恢复的文件。
-          inv1="$(systemctl show -p InvocationID --value "$u" 2>/dev/null)"
-          if [[ -z "$inv1" ]]; then
-            unrestored+=("$u 无法确认是否重新加载了恢复出来的配置(读不到 InvocationID)")
-          elif [[ -n "$inv0" && "$inv1" == "$inv0" ]]; then
-            unrestored+=("$u 仍是回滚前那个进程, 恢复出来的配置没有被重新加载")
-          fi
-        fi;;
-      inactive|failed)
-        now="$(_pdg_now_ac "$u")"
-        if [[ "$now" == active || "$now" == activating || "$now" == reloading ]]; then
-          rc=0; systemctl stop "$u" >/dev/null 2>&1 || rc=$?
-          [[ "$rc" == 0 ]] || unrestored+=("$u 停止动作失败(stop rc=$rc)")
-          now="$(_pdg_now_ac "$u")"
-        fi
-        case "$now" in
-          inactive|failed|not-found) : ;;       # 停稳了
-          *) unrestored+=("$u 前像是 $want, 但现在是 $now —— 没有停稳");;
-        esac
-        # failed 与 inactive 是两种状态, 复制不出来就如实说, 不当成"已恢复"。
-        [[ "$want" == failed && "$now" == inactive ]] \
-          && unrestored+=("$u 前像是 failed(启动失败态), 现为 inactive —— 未复现该状态");;
-      activating|deactivating|reloading)
-        # 过渡态不猜: 复制不出来, 也不该随便定成 active 或 inactive。
-        unrestored+=("$u 前像是过渡态 $want, 未恢复(现为 $(_pdg_now_ac "$u"))");;
-      *) unrestored+=("$u 运行态前像是无法处理的取值($want)");;
-    esac
-  done
-  return 0
 }
 
 
@@ -7055,13 +7265,16 @@ cmd_platform(){
   # 1) 先留快照。拿不到就别开始 —— 后面要改 nft、删/装 unit、重渲内核, 没有回退手段不能动手。
   cmd_snapshot --source cli --op platform >/dev/null 2>&1 || { echo "❌ 快照失败 → 中止切换(未改动任何东西)"; return 1; }
   # 切平台会做退役类的**不可逆**动作(切 iOS 经 _plat_deploy_ios → _plat_purge_retired,
-  # 切 Android 经 migrate_android_cleanup)。既然这里已经有一份刚建的快照, 就在**动第一样
-  # 东西之前**把服务前像存进去并自带句柄 —— 否则那两步会被能力门拦下, 平台切换就变成
-  # "部分退役后成功"或"退役失败但成功"。存不下就在这里停: 此刻还没有改动任何东西。
+  # 切 Android 经 migrate_android_cleanup)。那两步要能力门放行, 门要的是"这一次操作的前像"。
+  # 前像由上面那次 cmd_snapshot 在打包之后一并存好并校验过 —— 这里**只确认, 不再采样**:
+  # 再采一次会覆盖掉"动手之前"那一刻的记录, 而两次采样之间机器状态可能已经变了。
+  # 确认不过就在这里停: 此刻还没有改动任何东西。
   local _psnap="${_PDG_SNAP_CREATED:-}"
-  if [[ -z "$_psnap" ]] || ! _pdg_save_svcstate "$_psnap"; then
-    echo "❌ 服务前像保存失败 → 中止切换(未改动任何东西)"; return 1
+  if [[ -z "$_psnap" ]] || [[ ! -f "$_psnap/svcstate.tsv" ]] || ! _pdg_svcstate_plan "$_psnap"; then
+    echo "❌ 本次快照的服务前像不可用(${_PDG_SVC_WHY:-svcstate.tsv 不存在}) → 中止切换(未改动任何东西)"; return 1
   fi
+  # 这次确认只为"现在能不能动手", 结论不留给后面的阶段(与 cmd_update 同一套分阶段规矩)。
+  _PDG_SVC_SRC=""; _PDG_SVC_MODE=blind
   export PDG_UPDATE_SVCSTATE="$_psnap/svcstate.tsv"
   # 2) 就地备份直接会被改写的几样(快照是整体回退, 这些用于精确还原)
   local wd; wd="$(mktemp -d)" || { echo "❌ 无法创建临时目录"; return 1; }
@@ -9426,11 +9639,13 @@ cmd_migrate(){
     c_y "❌ 快照失败, 拒绝在无法回滚的前提下迁移。"; return 1
   fi
   local snap="$_PDG_SNAP_CREATED" rc=0
-  # 显式迁移同样要在动手之前保住服务前像 —— 否则它自己就成了"不具备回滚能力的调用方",
-  # 会被下面的退役门挡住(那是对的, 但更该做的是把前像存下来)。
-  if ! _pdg_save_svcstate "$snap"; then
-    c_y "❌ 服务前像保存失败, 拒绝在无法完整回滚的前提下迁移。"; return 1
+  # 显式迁移同样要在动手之前**确认**服务前像 —— 否则它自己就成了"不具备回滚能力的调用方",
+  # 会被下面的退役门挡住。前像由上面那次 cmd_snapshot 存好并校验过, 这里**不再采样**
+  # (再采一次会覆盖掉动手之前那一刻的记录)。确认不过就停在这里, 迁移一步都没开始。
+  if [[ ! -f "$snap/svcstate.tsv" ]] || ! _pdg_svcstate_plan "$snap"; then
+    c_y "❌ 本次快照的服务前像不可用(${_PDG_SVC_WHY:-svcstate.tsv 不存在}), 拒绝在无法完整回滚的前提下迁移。"; return 1
   fi
+  _PDG_SVC_SRC=""; _PDG_SVC_MODE=blind
   PDG_UPDATE_SVCSTATE="$snap/svcstate.tsv" run_all_migrations || rc=$?
   if [[ $rc == 0 ]]; then
     _tx_audit cli migrate COMMITTED "snapshot=$snap"
@@ -9524,5 +9739,5 @@ case "${1:-menu}" in
   link)          shift || true; cmd_link "$@";;
   uninstall|rm)  shift || true; cmd_uninstall "$@";;
   rescue)        shift || true; cmd_rescue "$@";;
-  *) echo "用法: pdg [menu|status|doctor [--json|--deep]|update [--dry-run]|snapshot|rollback [n]|token|restart|log [n]|traffic|ios [status|diff|previous|ack|recover|repair](仅 iOS)|report [--redact-ip|--full]|detect-cidr|platform <ios|android>|hijack-mode <all|gfw>|ssh-source [status|tailnet|any|confirm]|link status|link session <start|status|stop>|lan <status|list|check|routes|add|rm>|adblock <status|status-line|enable|disable|update|check <域名>|rule-add <域名>|rule-del <域名>|source <list [--json]|add <URL>|del <URL>|reset>>|migrate|migrate-fw|tx <list|show|recover|abort>|rescue <enable|disable|status|fingerprint|bind <IPv4>|rotate-token|rotate-cert>|uninstall [--purge]]";;
+  *) echo "用法: pdg [menu|status|doctor [--json|--deep]|update [--dry-run] [--to <版本tag>]|snapshot|rollback [n]|token|restart|log [n]|traffic|ios [status|diff|previous|ack|recover|repair](仅 iOS)|report [--redact-ip|--full]|detect-cidr|platform <ios|android>|hijack-mode <all|gfw>|ssh-source [status|tailnet|any|confirm]|link status|link session <start|status|stop>|lan <status|list|check|routes|add|rm>|adblock <status|status-line|enable|disable|update|check <域名>|rule-add <域名>|rule-del <域名>|source <list [--json]|add <URL>|del <URL>|reset>>|migrate|migrate-fw|tx <list|show|recover|abort>|rescue <enable|disable|status|fingerprint|bind <IPv4>|rotate-token|rotate-cert>|uninstall [--purge]]";;
 esac

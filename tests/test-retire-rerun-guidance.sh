@@ -113,13 +113,20 @@ grep -qF '不要去伪造一份服务前像' <<<"$G1" && ok "3-4: 明说不要�
 
 # ── 三. 行为闭环: 指引点名的入口**真的**会建快照 + 存前像 + 交句柄 ──────────
 echo; echo '══ 三. pdg migrate 到底是不是一个带前像的入口(真跑 cmd_migrate)══'
-run_migrate(){   # $1=save 结果(0/1) → 打印观测
+# 方案1 之后的接线: 前像由 **cmd_snapshot** 存(替身照产品的形状, 存不下就让快照失败),
+# cmd_migrate 只**确认**。三类覆盖都留着, 各有自己的旋钮, 谁也不是恒真:
+#   $1=0/1 保存成败   $2=0/1 确认成败
+run_migrate(){   # $1=save 结果(0/1) $2=plan 结果(0/1, 省略=0) → 打印观测
   { echo 'set -u'; need c_y; need c_g
     echo "SNAPDIR='$BOX/snap'"
     echo 'need_root(){ :; }; _lock(){ :; }; _tx_audit(){ :; }'
     echo "SEQ='$BOX/seq'"
-    echo 'cmd_snapshot(){ mkdir -p "$SNAPDIR"; : > "$SNAPDIR/snap.tar.gz"; _PDG_SNAP_CREATED="$SNAPDIR"; echo cmd_snapshot >> "$SEQ"; }'
     echo "_pdg_save_svcstate(){ echo _pdg_save_svcstate >> \"\$SEQ\"; [[ '$1' == 0 ]] || return 1; printf 'v\\t1\\n' > \"\$1/svcstate.tsv\"; }"
+    echo "_pdg_svcstate_plan(){ echo _pdg_svcstate_plan >> \"\$SEQ\"; [[ '${2:-0}' == 0 ]] || { _PDG_SVC_WHY='注入: 确认不过'; return 1; }; return 0; }"
+    # 快照替身按新契约: 打完包**自己**存前像并把失败传出去(与产品同形, 不补恒真前像)。
+    echo 'cmd_snapshot(){ mkdir -p "$SNAPDIR"; : > "$SNAPDIR/snap.tar.gz"; echo cmd_snapshot >> "$SEQ"
+            _pdg_save_svcstate "$SNAPDIR" || return 1
+            _PDG_SNAP_CREATED="$SNAPDIR"; return 0; }'
     echo 'run_all_migrations(){ echo run_all_migrations >> "$SEQ"; echo "CALL=run_all_migrations HANDLE=${PDG_UPDATE_SVCSTATE:-（空）}"; return 0; }'
     need cmd_migrate
     echo 'cmd_migrate; echo "RC=$?"'
@@ -127,19 +134,25 @@ run_migrate(){   # $1=save 结果(0/1) → 打印观测
   rm -rf "$BOX/snap" "$BOX/seq"; : > "$BOX/seq"
   bash "$BOX/m.sh" 2>"$BOX/m.err"
 }
-M="$(run_migrate 0)"
+M="$(run_migrate 0 0)"
 [[ -s "$BOX/m.err" ]] && bad "3-0: 执行有问题: $(head -1 "$BOX/m.err")" || ok "3-0: cmd_migrate 真的跑起来了"
 grep -q 'CALL=run_all_migrations HANDLE=.*/svcstate.tsv' <<<"$M" \
   && ok "3a: 迁移确实拿到了句柄(不是空): $(grep -o 'HANDLE=.*' <<<"$M")" \
   || bad "3a: 迁移没拿到句柄 —— 指引点名的入口名不副实: $M"
-[[ -f "$BOX/snap/svcstate.tsv" ]] && ok "3b: 服务前像**真的落盘**在本次快照目录里" || bad "3b: 前像没落盘"
+[[ -f "$BOX/snap/svcstate.tsv" ]] && ok "3b: 服务前像**真的落盘**在本次快照目录里(由 cmd_snapshot 存)" || bad "3b: 前像没落盘"
 SEQ_ACTUAL="$(tr '\n' ' ' < "$BOX/seq")"
-[[ "$SEQ_ACTUAL" == "cmd_snapshot _pdg_save_svcstate run_all_migrations " ]] \
-  && ok "3c: 调用顺序确实是 建快照 → 存前像 → 再迁移(动手之前就保住了前像)" \
+[[ "$SEQ_ACTUAL" == "cmd_snapshot _pdg_save_svcstate _pdg_svcstate_plan run_all_migrations " ]] \
+  && ok "3c: 调用顺序是 建快照(内含存前像) → 确认前像 → 再迁移(动手之前就保住并核过了)" \
   || bad "3c: 顺序不对: $SEQ_ACTUAL"
-M2="$(run_migrate 1)"
+grep -c '_pdg_save_svcstate' "$BOX/seq" | grep -qx 1 \
+  && ok "3c2: 整条路上 _pdg_save_svcstate **只被调了一次**(没有二次采样覆盖)" \
+  || bad "3c2: 前像被采样了 $(grep -c '_pdg_save_svcstate' "$BOX/seq") 次"
+M2="$(run_migrate 1 0)"
 grep -q 'RC=1' <<<"$M2" && ok "3d: 前像存不下时**拒绝**往下迁移" || bad "3d: 前像存不下还往下走了: $M2"
 grep -q 'run_all_migrations' "$BOX/seq" && bad "3e: 前像存不下却仍调了迁移" || ok "3e: 前像存不下就一步都不往下做"
+M3="$(run_migrate 0 1)"
+grep -q 'RC=1' <<<"$M3" && ok "3f: 前像**校验不过**时也拒绝往下迁移(与存不下分开的一类)" || bad "3f: 校验不过还往下走了: $M3"
+grep -q 'run_all_migrations' "$BOX/seq" && bad "3g: 校验不过却仍调了迁移" || ok "3g: 校验不过就一步都不往下做"
 
 # ── 四. 版本对账: 回滚之后那一版有没有前像能力 ──────────────────────────────
 echo; echo "══ 四. 提示出现后用户手上是哪一版 ══"

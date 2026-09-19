@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
 # PrivDNS Gateway 一键安装 (Debian 12+ / Ubuntu 22+, 需 root)
-#   sudo ./install.sh
+#   sudo ./install.sh                     装最新发布版(默认行为, 与以前一致)
+#   sudo ./install.sh --ref v1.11.15      装**指定**的已发布版本(只认版本 tag 名)
 # 非交互/自动化: 预置 PDG_* 环境变量 + PDG_NONINTERACTIVE=1 (见 docs/INSTALL.md)。
 #   PDG_SERVER_IP PDG_SSH_PORT PDG_INTERNAL_CIDR PDG_BOT_TOKEN PDG_ALLOWED PDG_DOT_DOMAIN
 #   PDG_SKIP_CERT=1  跳过 certbot, 生成自签占位证书 (之后用 bot 补正式证书)
@@ -37,20 +38,71 @@ ask(){
   printf -v "$__var" '%s' "${__ans:-$__def}"
 }
 
-pdg_checkout_latest_tag(){
-  local dir="$1" tag cur target
-  git -C "$dir" fetch -q --tags origin main
+# ── 公开入口: --ref <版本 tag> —— 显式指定要安装的版本 ──────────────────────
+# 为什么要有它: 升级链需要能**指到某一个已发布版本**, 而不是"永远装最新"。
+# 有意做窄(不是通用的任意 ref 开关):
+#   · 只接受版本 tag 名: 必须 v 开头, 只含数字/字母/点/加号/连字符 ——
+#     分支名、裸 SHA、任意 shell 内容一律拒;
+#   · 目标必须在取件后的仓库里真的存在, 解析出 tag 对象与 peeled commit 并打印;
+#   · 不给这个参数时, 行为与以前逐字节相同(仍是"最新发布 tag");
+#   · 没有 FORCE/SKIP/BYPASS, 不绕过任何既有校验;
+#   · 两段自举都把它原样传下去, 最后在**实际安装前**再核一次 HEAD —— 内部自举标记
+#     (PDG_TAG_BOOTSTRAPPED)只管控制流, 不能替代这次身份核验。
+PDG_TARGET_REF=""
+_pdg_args=()
+while (( $# )); do
+  case "$1" in
+    --ref)
+      [[ $# -ge 2 ]] || die "--ref 后面要跟一个版本 tag, 例: --ref v1.11.15"
+      PDG_TARGET_REF="$2"; _pdg_args+=("$1" "$2"); shift 2;;
+    --ref=*)
+      PDG_TARGET_REF="${1#--ref=}"; _pdg_args+=("$1"); shift;;
+    *) _pdg_args+=("$1"); shift;;
+  esac
+done
+set -- ${_pdg_args[@]+"${_pdg_args[@]}"}
+if [[ -n "$PDG_TARGET_REF" ]]; then
+  [[ "$PDG_TARGET_REF" =~ ^v[0-9][0-9A-Za-z.+-]*$ ]] \
+    || die "--ref 只接受版本 tag 名(v 开头, 只含数字/字母/点/加号/连字符); 收到: $PDG_TARGET_REF"
+fi
+
+pdg_checkout_release_tag(){   # $1=仓库目录 [$2=显式目标 tag; 空=沿用"最新发布 tag"]
+  local dir="$1" want="${2:-}" tag cur target
+  # 取件失败必须**当场停**: 这一条以前是裸跑的, 而 `TAG=$(...)` 这种形态下 set -e 拦不住
+  # (本机实测: git fetch 返回 128, 函数照样往下走、外层 rc 还是 0) —— 于是取不到新版本时
+  # 会拿本地已有对象接着装。指定了版本更不能这样: 宁可停, 不许悄悄换目标。
+  git -C "$dir" fetch -q --tags origin main \
+    || die "取件失败: git fetch --tags origin main(origin=$(git -C "$dir" remote get-url origin 2>/dev/null || echo 读不到)), 中止安装。"
   if [[ "$(git -C "$dir" rev-parse --is-shallow-repository 2>/dev/null)" == "true" ]]; then
-    git -C "$dir" fetch -q --unshallow --tags origin main
+    git -C "$dir" fetch -q --unshallow --tags origin main \
+      || die "取件失败: git fetch --unshallow --tags origin main, 中止安装。"
   fi
-  tag=$(git -C "$dir" tag -l 'v*' --sort=-v:refname | head -1)
-  [[ -n "$tag" ]] || die "仓库没有发布 tag(v*), 中止安装。"
+  if [[ -n "$want" ]]; then
+    # 指定了就必须命中: 取不到就停, **不回退到最新版**。
+    git -C "$dir" rev-parse -q --verify "refs/tags/$want" >/dev/null 2>&1 \
+      || die "指定的版本 tag 在取件到的仓库里不存在: $want(不会改装最新版)"
+    tag="$want"
+  else
+    tag=$(git -C "$dir" tag -l 'v*' --sort=-v:refname | head -1)
+    [[ -n "$tag" ]] || die "仓库没有发布 tag(v*), 中止安装。"
+  fi
   cur=$(git -C "$dir" rev-parse HEAD 2>/dev/null || true)
   target=$(git -C "$dir" rev-parse "$tag^{commit}" 2>/dev/null || true)
+  [[ -n "$target" ]] || die "版本 tag $tag 解析不出提交对象, 中止安装。"
   if [[ "$cur" != "$target" ]]; then
-    git -C "$dir" checkout -q "$tag"
+    git -C "$dir" checkout -q "$tag" || die "检出 $tag 失败, 中止安装。"
   fi
   echo "$tag"
+}
+_pdg_say_target(){   # $1=仓库目录 $2=tag —— 把 tag 对象类型与 peeled commit 一并留在日志里
+  local dir="$1" tag="$2" kind peeled
+  kind=$(git -C "$dir" cat-file -t "refs/tags/$tag" 2>/dev/null || echo '?')
+  peeled=$(git -C "$dir" rev-parse HEAD 2>/dev/null || echo '?')
+  if [[ -n "$PDG_TARGET_REF" ]]; then
+    c_g "使用**指定**发布 $tag (tag 对象类型=$kind, commit=$peeled)"
+  else
+    c_g "使用最新发布 $tag (tag 对象类型=$kind, commit=$peeled)"
+  fi
 }
 
 [[ $EUID -eq 0 ]] || die "请用 root 运行: sudo ./install.sh  (或 curl ... | sudo bash)"
@@ -69,8 +121,9 @@ if [[ ! -f "$SRC/deploy/mosdns/config.yaml" ]]; then
   if [[ ! -d "$DEST/.git" ]]; then
     rm -rf "$DEST"; git clone -q "$REPO_URL" "$DEST"
   fi
-  TAG=$(pdg_checkout_latest_tag "$DEST")
-  c_g "使用最新发布 $TAG"
+  TAG=$(pdg_checkout_release_tag "$DEST" "$PDG_TARGET_REF") \
+    || die "取件/检出版本失败(原因见上), 中止安装。"
+  _pdg_say_target "$DEST" "$TAG"
   # 有可用控制终端就把 stdin 接回它(交互), 否则直接重跑(靠 PDG_* 环境变量非交互)
   export PDG_TAG_BOOTSTRAPPED=1
   if { true < /dev/tty; } 2>/dev/null; then exec bash "$DEST/install.sh" "$@" < /dev/tty
@@ -79,11 +132,22 @@ fi
 REPO_DIR="$SRC"
 if [[ -d "$REPO_DIR/.git" && "${PDG_TAG_BOOTSTRAPPED:-}" != "1" ]]; then
   command -v git >/dev/null || { apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git; }
-  TAG=$(pdg_checkout_latest_tag "$REPO_DIR")
+  TAG=$(pdg_checkout_release_tag "$REPO_DIR" "$PDG_TARGET_REF") \
+    || die "取件/检出版本失败(原因见上), 中止安装。"
   export PDG_TAG_BOOTSTRAPPED=1
-  c_g "使用最新发布 $TAG"
+  _pdg_say_target "$REPO_DIR" "$TAG"
   if { true < /dev/tty; } 2>/dev/null; then exec bash "$REPO_DIR/install.sh" "$@" < /dev/tty
   else exec bash "$REPO_DIR/install.sh" "$@"; fi
+fi
+
+# ── 显式目标必须**贯穿到实际安装**: 这里读的是仓库的真实状态, 不是自举标记 ──────
+# (两段自举中间任何一处"重新选最新"都会在这里露馅; 没给 --ref 时这一段不做任何事。)
+if [[ -n "$PDG_TARGET_REF" ]]; then
+  _want_c="$(git -C "$REPO_DIR" rev-parse "refs/tags/$PDG_TARGET_REF^{commit}" 2>/dev/null || true)"
+  _head_c="$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null || true)"
+  { [[ -n "$_want_c" ]] && [[ "$_want_c" == "$_head_c" ]]; } \
+    || die "指定版本没有贯穿到实际安装: --ref $PDG_TARGET_REF → ${_want_c:-解析不出}, 而当前 HEAD=${_head_c:-读不到}"
+  c_g "指定版本已贯穿到实际安装: $PDG_TARGET_REF → $_head_c"
 fi
 
 # ── 版本 + 钉死 SHA256(供应链校验)──

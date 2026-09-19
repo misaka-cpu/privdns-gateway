@@ -67,8 +67,15 @@ done
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 PDG="${PDG_UNDER_TEST:-$ROOT/deploy/bot/pdg.sh}"
+# PDG_CHAIN_KEEP: 留现场用的调试开关(退役线带来的)。留的是**本轮自己建的** WORK;
+# $FAKE 是另一处 mktemp -d 的自有根, 无论留不留现场都照常清掉 —— 开关只管"留证据",
+# 不该顺带把清理一起关掉。
 WORK="${PDG_CHAIN_KEEP:-$(mktemp -d)}"
-[[ -n "${PDG_CHAIN_KEEP:-}" ]] || trap 'rm -rf "$WORK" "$FAKE"' EXIT
+if [[ -n "${PDG_CHAIN_KEEP:-}" ]]; then
+  trap 'rm -rf "$FAKE"; echo "[留证] WORK 保留在 $WORK(PDG_CHAIN_KEEP)"' EXIT
+else
+  trap 'rm -rf "$WORK" "$FAKE"' EXIT
+fi
 pass=0; nfail=0
 ok(){ echo "[OK]   $1"; pass=$((pass+1)); }
 bad(){ echo "[FAIL] $1"; nfail=$((nfail+1)); }
@@ -200,7 +207,10 @@ run_chain(){   # $1=场景目录
       echo "printf 'FINAL\t$u\t%s\t%s\n' \"\$(cat \"$SC/$u.en\" 2>/dev/null)\" \"\$(cat \"$SC/$u.ac\" 2>/dev/null)\""
     done
   } > "$d/chain.sh"
+  # tee 留证(退役线带来的)。**必须把退出码带回来**: 管道的状态是 tee 的, 不是链本身的 ——
+  # 直接 `| tee` 会让"链跑挂了"与"链跑完了"在返回值上不可区分。
   bash "$d/chain.sh" 2>&1 | tee "$d/chain.out"
+  return "${PIPESTATUS[0]}"
 }
 plain(){ sed 's/\x1b\[[0-9;]*m//g' <<<"$1"; }
 fin(){ grep -P "^FINAL\t$2\t" <<<"$1" | cut -f3,4 | tr '\t' '/'; }

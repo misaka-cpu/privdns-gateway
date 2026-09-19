@@ -59,14 +59,19 @@ pl="$(fnfile "$PDG" cmd_platform)"
 grep -q 'run_all_migrations || true' "$pl" \
   && ok "B1: 总迁移那一句仍是 \`run_all_migrations || true\`(与退役无关的幂等迁移照旧不拖垮切换)" \
   || bad "B1: 总迁移的失败善后被改了"
-grep -q '_pdg_save_svcstate "\$_psnap"' "$pl" && ok "B2: 建完快照就存服务前像(它自己成为有能力的调用方)" || bad "B2: 没存前像"
+# 方案1 之后: 前像由 cmd_snapshot 存, 平台切换**只确认**同一份 —— 不再二次采样覆盖。
+grep -q '_pdg_svcstate_plan "\$_psnap"' "$pl" \
+  && ok "B2: 建完快照就**确认**同一份服务前像(它自己成为有能力的调用方; 不再二次采样)" || bad "B2: 没确认前像"
+grep -q '_pdg_save_svcstate' "$pl" \
+  && bad "B2b: cmd_platform 里仍有二次采样(_pdg_save_svcstate) —— 会覆盖动手前那一刻的记录" \
+  || ok "B2b: cmd_platform 里**没有**二次采样(保存责任只在 cmd_snapshot)"
 awk '/cmd_snapshot --source cli --op platform/{s=NR}
-     /_pdg_save_svcstate "\$_psnap"/{v=NR}
+     /_pdg_svcstate_plan "\$_psnap"/{v=NR}
      /mktemp -d/{m=NR}
      END{exit !(s&&v&&m&&s<v&&v<m)}' "$pl" \
-  && ok "B3: 存前像排在快照之后、\`mktemp -d\` 建工作区之前 —— 拒绝发生在任何改动之前" \
+  && ok "B3: 确认前像排在快照之后、\`mktemp -d\` 建工作区之前 —— 拒绝发生在任何改动之前" \
   || bad "B3: 顺序不对"
-grep -q '中止切换(未改动任何东西)' "$pl" && ok "B4: 存不下就中止, 并明说此刻未改动任何东西" || bad "B4"
+grep -q '中止切换(未改动任何东西)' "$pl" && ok "B4: 确认不过就中止, 并明说此刻未改动任何东西" || bad "B4"
 grep -q 'export PDG_UPDATE_SVCSTATE="\$_psnap/svcstate.tsv"' "$pl" && ok "B5: 句柄交给后续所有退役类动作" || bad "B5"
 awk '/if ! migrate_android_cleanup; then/{a=NR} /_plat_fail_restore; return 1/{if(a&&NR>a&&!done){done=NR}} END{exit !(a&&done)}' "$pl" \
   && ok "B6: migrate_android_cleanup 的返回值被检查, 失败即回退切换(不会「退役失败但成功」)" \
@@ -155,9 +160,19 @@ newenv="$(grep -oE '\$\{?PDG_[A-Z_]+' "$gate" "$irr" | sed 's/.*\${\?//' | sort 
 grep -qiE 'FORCE|SKIP_|BYPASS|NOCHECK|UNSAFE' "$gate" "$irr" \
   && { bad "D3: 门里出现了疑似旁路开关"; grep -niE 'FORCE|SKIP_|BYPASS|NOCHECK|UNSAFE' "$gate" "$irr"; } \
   || ok "D3: 没有 FORCE/SKIP/BYPASS 一类的旁路开关"
-grep -q 'PDG_UPDATE_FORCE' "$PDG" && grep -c 'PDG_UPDATE_FORCE' "$PDG" >/dev/null
-[[ "$(grep -c 'PDG_UPDATE_FORCE' "$PDG")" == "$(grep -c 'PDG_UPDATE_FORCE' "${BASE:-$PDG}")" ]] \
-  && ok "D4: PDG_UPDATE_FORCE 的出现次数没有变化(没有借它开口子)" || bad "D4: 动了 PDG_UPDATE_FORCE"
+# 基线是**退役单线**那一版。整合进桥接的 `--to` 之后, "强制重装同一版本"这条提示与它的守卫
+# 在 --to 那一路各多一份 —— 同一语义的合法复制, 不是新开的口子。判据改成两条:
+#   ① 一处都不许少(没有被删掉或放宽); ② 每一处都必须是已知的三种形态。
+_FN="$(grep -c 'PDG_UPDATE_FORCE' "$PDG")"; _FB="$(grep -c 'PDG_UPDATE_FORCE' "${BASE:-$PDG}")"
+[[ "$_FN" -ge "$_FB" ]] \
+  && ok "D4a: PDG_UPDATE_FORCE 一处都没少(基线 $_FB → 现在 $_FN)" \
+  || bad "D4a: 比基线少了(基线 $_FB → 现在 $_FN) —— 守卫被删或被放宽"
+_FBAD="$(grep -n 'PDG_UPDATE_FORCE' "$PDG" | grep -vE ':\s*#' \
+  | grep -vE '\[\[ -z "\$\{PDG_UPDATE_FORCE:-\}" && ' \
+  | grep -vE 'PDG_UPDATE_FORCE=1 pdg update')"
+[[ -z "$_FBAD" ]] \
+  && ok "D4b: $_FN 处 PDG_UPDATE_FORCE 全部是已知形态(注释 / same 守卫 / 强制重装提示), 没有新开的旁路" \
+  || { bad "D4b: 出现了形态不明的 PDG_UPDATE_FORCE 用法"; sed 's/^/      /' <<<"$_FBAD"; }
 
 echo
 echo "══ 五. 恢复动作没有被塞进别的地方 ══"
@@ -177,37 +192,42 @@ grep -q '_pdg_restore_svcstate' "$(fnfile "$PDG" cmd_rollback)" \
 
 echo
 echo "══ 六. 前像存不下就中止, 且中止在装任何文件之前 ══"
-ln_save="$(lineno "$PDG" 'if ! _pdg_save_svcstate "$snap_dir"; then')"
+# 方案1: cmd_update 不再保存, 改为确认。判据跟着换到确认那一行。
+ln_save="$(grep -n 'if \[\[ ! -f "\$snap_dir/svcstate.tsv" \]\] || ! _pdg_svcstate_plan "\$snap_dir"; then' "$PDG" | head -1 | cut -d: -f1)"
 ln_mig="$(grep -n '^\s*if ! .*bash /usr/local/bin/pdg __migrate' "$PDG" | head -1 | cut -d: -f1)"
 ln_inst="$(grep -n 'install -m755 "$REPO_DIR"\|install -m644 "$REPO_DIR"' "$PDG" | head -1 | cut -d: -f1)"
-[[ -n "$ln_save" && -n "$ln_mig" && "$ln_save" -lt "$ln_mig" ]] && ok "F1: 存前像排在 __migrate 子进程之前" || bad "F1: 顺序不对($ln_save vs $ln_mig)"
-[[ -n "$ln_inst" && "$ln_save" -lt "$ln_inst" ]] && ok "F2: 存前像排在第一处 install 之前(前像记的确实是**动手前**的状态)" || bad "F2: 顺序不对($ln_save vs $ln_inst)"
+[[ -n "$ln_save" && -n "$ln_mig" && "$ln_save" -lt "$ln_mig" ]] && ok "F1: 确认前像排在 __migrate 子进程之前" || bad "F1: 顺序不对($ln_save vs $ln_mig)"
+[[ -n "$ln_inst" && "$ln_save" -lt "$ln_inst" ]] && ok "F2: 确认前像排在第一处 install 之前(动手之前就已经拒绝)" || bad "F2: 顺序不对($ln_save vs $ln_inst)"
 # 行为证据: 把产品那四行原样拿出来跑, 存前像失败必须 return 1
 { echo 'set -uo pipefail'
   echo 'c_y(){ echo "$*"; }'
-  echo '_pdg_save_svcstate(){ return 1; }'
+  echo '_pdg_svcstate_plan(){ _PDG_SVC_WHY="注入: 确认不过"; return 1; }'
   echo 'launched=0'
   echo 'bash(){ launched=1; }'
   echo 'guard(){'
   echo "  local snap_dir=\"$BOX/snap\""   # 用本用例的一次性目录, 不写死 /tmp 路径
-  sed -n "${ln_save},$((ln_save+2))p" "$PDG"
+  # 方案1 的确认块是 4 行(if / c_y / return 1 / fi) —— 少取一行 fi 就被切掉, 生成的壳语法不过,
+  # "没有中止"会被读成产品没拦。按 fi 收尾动态取, 不写死行数。
+  awk -v s="$ln_save" 'NR>=s{print; if($0 ~ /^  fi$/) exit}' "$PDG"
   echo '  bash /usr/local/bin/pdg __migrate'
   echo '  return 0'
   echo '}'
   echo 'guard; echo "RC=$?"; echo "LAUNCHED=$launched"'
 } > "$BOX/guard.sh"
 o="$(bash "$BOX/guard.sh" 2>&1)"
-grep -q 'RC=1' <<<"$o" && ok "F3: 存前像失败 → 中止(return 1)" || { bad "F3: 没有中止"; echo "$o" | sed 's/^/      /'; }
+grep -q 'RC=1' <<<"$o" && ok "F3: 前像确认失败 → 中止(return 1)" || { bad "F3: 没有中止"; echo "$o" | sed 's/^/      /'; }
 grep -q 'LAUNCHED=0' <<<"$o" && ok "F4: 且**没有**启动迁移子进程" || bad "F4: 仍然启动了迁移子进程"
 
 echo
 echo "══ 七. cmd_migrate 变成了「有能力的调用方」而不是被挡住 ══"
 mg="$(fnfile "$PDG" cmd_migrate)"
-grep -q '_pdg_save_svcstate "$snap"' "$mg" && ok "G1: 显式迁移也在动手前存前像" || bad "G1: 没存"
+grep -q '_pdg_svcstate_plan "$snap"' "$mg" && ok "G1: 显式迁移也在动手前**确认**前像" || bad "G1: 没确认"
+grep -q '_pdg_save_svcstate' "$mg" \
+  && bad "G1b: cmd_migrate 里仍有二次采样" || ok "G1b: cmd_migrate 里**没有**二次采样"
 grep -q 'PDG_UPDATE_SVCSTATE="$snap/svcstate.tsv" run_all_migrations' "$mg" && ok "G2: 并把本次句柄交给迁移" || bad "G2: 没交句柄"
-awk '/_pdg_save_svcstate "\$snap"/{s=NR} /run_all_migrations/{m=NR} END{exit !(s&&m&&s<m)}' "$mg" \
-  && ok "G3: 存前像排在 run_all_migrations 之前" || bad "G3: 顺序不对"
-grep -q '拒绝在无法完整回滚的前提下迁移' "$mg" && ok "G4: 存不下就拒绝(不是存不下也照跑)" || bad "G4"
+awk '/_pdg_svcstate_plan "\$snap"/{s=NR} /run_all_migrations/{m=NR} END{exit !(s&&m&&s<m)}' "$mg" \
+  && ok "G3: 确认前像排在 run_all_migrations 之前" || bad "G3: 顺序不对"
+grep -q '拒绝在无法完整回滚的前提下迁移' "$mg" && ok "G4: 确认不过就拒绝(不是确认不过也照跑)" || bad "G4"
 
 echo
 echo "══ 八. 三个调用方各自的失败善后责任(行为) ══"
@@ -233,8 +253,8 @@ grep -q 'run_all_migrations || true' "$(fnfile "$PDG" cmd_platform)" \
 grep -q '__migrate)     need_root __migrate; _lock; run_all_migrations;;' "$PDG" \
   && ok "H4: __migrate 派发仍是 need_root + _lock + run_all_migrations —— 失败照旧传回父进程由它回滚" \
   || bad "H4: __migrate 派发被改了"
-awk '/_pdg_save_svcstate "\$snap"/{s=1} /run_all_migrations/{if(s)m=1} END{exit !m}' "$(fnfile "$PDG" cmd_migrate)" \
-  && ok "H5: cmd_migrate 自建快照 + 自存前像 + 自带句柄 —— 它是有能力的调用方, 不会被自己的门挡住" \
+awk '/_pdg_svcstate_plan "\$snap"/{s=1} /run_all_migrations/{if(s)m=1} END{exit !m}' "$(fnfile "$PDG" cmd_migrate)" \
+  && ok "H5: cmd_migrate 自建快照 + 确认同一份前像 + 自带句柄 —— 它是有能力的调用方, 不会被自己的门挡住" \
   || bad "H5"
 
 echo "────────────────────────────────────────"

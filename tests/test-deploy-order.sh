@@ -118,6 +118,19 @@ echo
 echo "── C. 正常 cmd_update 在 __migrate 之后是否还会重启 ──"
 # 抽出 cmd_update 里 `__migrate` 之后那段, 真跑一遍看它发什么命令。
 # 不是读源码断言 —— 那段代码是不是真的会执行到 restart, 只有跑过才知道。
+#
+# 这一节**只**证明一件事: cmd_update 在迁移之后确实发得出那几条重启。它不证明整条升级链
+# 跑得通 —— 快照、二进制收敛、三道校验门、doctor 自检门都不在这个片段里, 那些归 e2e。
+#
+# 锚点为什么要分两层定。盘上的迁移调用带着环境前缀:
+#     PDG_UPDATE_SVCSTATE="$snap_dir/svcstate.tsv" bash /usr/local/bin/pdg __migrate
+# 而原来的锚点写死 `if ! bash /usr/local/bin/pdg __migrate; then` —— 前缀一加它就是 0 处,
+# awk 范围取空, 判据从"迁移之后有没有重启"退化成"抽没抽到", 整节只剩一条红。
+# 现在: ① 先切 cmd_update 的函数体(把"仍在 cmd_update 内"这个约束落成范围);
+#       ② 在体内找**恰好一处**迁移调用(前缀随便怎么写都认, 但不能有第二处);
+#       ③ 从它切到 `sleep 2`, 于是"迁移之后"是**位置**保证的, 不靠文本碰运气。
+# 抽取失败 / 片段无效 / 执行失败 三种各自判红, 不合并成一句"没重启" —— 它们的处置完全不同。
+# 不新建通用 Bash 解析器: 仍然只做行范围切分 + 选出 systemctl 动作行。
 C="$(mktemp -d)"; mkdir -p "$C/bin"
 cat > "$C/bin/systemctl" <<S
 #!/bin/sh
@@ -126,21 +139,75 @@ case "\$1" in is-enabled) exit 0;; esac
 exit 0
 S
 chmod 755 "$C/bin/systemctl"; : > "$C/calls.log"
-SEG="$(awk '/if ! bash \/usr\/local\/bin\/pdg __migrate; then/,/^  sleep 2$/' "$ROOT/deploy/bot/pdg.sh" \
-      | grep -vE '^\s*(if ! bash /usr/local/bin/pdg __migrate|c_y "迁移|fi$|if ! _update_core_binary|if ! python3 -m py_compile|if ! mihomo -t|if ! nft -c|if ! systemctl daemon-reload|c_g "校验新版本)' \
-      | grep -E 'systemctl (restart|is-enabled|reset-failed)')"
-if [[ -z "$SEG" ]]; then
-  bad "C: 抽不到 cmd_update 在迁移之后的重启段"
-else
-  ok "C: 抽到了迁移之后的重启段($(grep -c . <<<"$SEG") 行)"
-  bash -c "PATH=\"$C/bin:\$PATH\"
-$SEG" >/dev/null 2>&1
-  CC="$(cat "$C/calls.log" 2>/dev/null)"
-  grep -qE 'restart pdg-bot' <<<"$CC" \
-    && ok "C: 正常 update 在迁移之后**无条件**重启 pdg-bot(实发: $(grep -m1 'restart' <<<"$CC"))" \
-    || bad "C: 正常 update 没有重启 pdg-bot —— 那普通用户升级也会留旧进程。实发: ${CC:-无}"
-  grep -q 'pdg-probe81' <<<"$CC" && ok "C: pdg-probe81 也在" || bad "C: 漏了 pdg-probe81"
-  grep -q 'pdg-mitm' <<<"$CC" && ok "C: pdg-mitm 也在(iOS)" || bad "C: 漏了 pdg-mitm"
+# ① cmd_update 的函数体
+CU="$C/cmd_update.txt"
+awk '/^cmd_update\(\)\{/{f=1} f{print} f&&/^\}$/{exit}' "$ROOT/deploy/bot/pdg.sh" > "$CU"
+C_OK=1
+if [[ ! -s "$CU" ]] || ! grep -q '^cmd_update(){' "$CU" || [[ "$(tail -1 "$CU")" != "}" ]]; then
+  bad "C: 抽不到 cmd_update 的完整函数体(改名或结构变了)—— 本节判据无效, 不按'没重启'记"; C_OK=0
+fi
+# ② 体内恰好一处迁移调用
+if [[ "$C_OK" == 1 ]]; then
+  MIG_N="$(grep -cE 'bash /usr/local/bin/pdg __migrate' "$CU")"
+  if [[ "$MIG_N" != 1 ]]; then
+    bad "C: cmd_update 里的迁移调用有 $MIG_N 处(要求恰好 1 处)—— 锚点不成立, 本节判据无效"; C_OK=0
+  fi
+fi
+# ③ 迁移调用 → sleep 2
+if [[ "$C_OK" == 1 ]]; then
+  MIG_L="$(grep -nE 'bash /usr/local/bin/pdg __migrate' "$CU" | head -1 | cut -d: -f1)"
+  END_L="$(awk -v s="$MIG_L" 'NR>s && $0=="  sleep 2"{print NR; exit}' "$CU")"
+  if [[ -z "$END_L" ]]; then
+    bad "C: 迁移调用之后找不到 \`sleep 2\` 这个收尾锚点 —— 切不出'迁移之后'那段, 本节判据无效"; C_OK=0
+  fi
+fi
+if [[ "$C_OK" == 1 ]]; then
+  sed -n "${MIG_L},${END_L}p" "$CU" > "$C/post.txt"
+  ok "C: 迁移调用在 cmd_update 体内第 $MIG_L 行, 取到 $END_L 行(\`sleep 2\`)为止 —— 片段整体位于迁移之后"
+  # 选出这段里的 systemctl 重启类动作。反例走的是同一个函数, 不另写一份。
+  _c_seg(){ grep -E 'systemctl (restart|is-enabled|reset-failed)' < "$1" > "$2"; }
+  # 执行片段并收集实发命令; 退出码单独带回, 不吞。
+  _c_run(){ : > "$C/calls.log"
+            bash -c "PATH=\"$C/bin:\$PATH\"
+$(cat "$1")" >/dev/null 2>&1; }
+  _c_seg "$C/post.txt" "$C/seg.sh"
+  if [[ ! -s "$C/seg.sh" ]]; then
+    bad "C: 迁移之后那段里一条 systemctl 重启类动作都没有 —— 片段无效"
+  elif ! bash -n "$C/seg.sh" 2>/dev/null; then
+    bad "C: 抽出来的片段语法不过 —— 执行无效, 不能记成'没重启'"
+  else
+    ok "C: 抽到了迁移之后的重启段($(grep -c . "$C/seg.sh") 行)"
+    C_RC=0; _c_run "$C/seg.sh" || C_RC=$?
+    CC="$(cat "$C/calls.log" 2>/dev/null)"
+    if [[ "$C_RC" != 0 ]]; then
+      bad "C: 片段执行失败(rc=$C_RC)—— 本组判据无效, 同样不记成'没重启'。实发: ${CC:-无}"
+    elif [[ -z "$CC" ]]; then
+      bad "C: 片段跑完一条 systemctl 都没发出 —— 执行无效"
+    else
+      # 认的是**具体哪条 restart 打到哪个 unit**, 不是日志里出现过 restart 三个字。
+      grep -qE '^systemctl restart( [^ ]+)* pdg-bot( |$)' <<<"$CC" \
+        && ok "C: 正常 update 在迁移之后**无条件**重启 pdg-bot(实发: $(grep -m1 '^systemctl restart' <<<"$CC"))" \
+        || bad "C: 没有一条 restart 打到 pdg-bot —— 那普通用户升级也会留旧进程。实发: ${CC:-无}"
+      grep -qE '^systemctl restart( [^ ]+)* pdg-probe81( |$)' <<<"$CC" \
+        && ok "C: pdg-probe81 也在同一条 restart 里" || bad "C: 没有 restart 打到 pdg-probe81。实发: ${CC:-无}"
+      grep -qE '^systemctl restart( [^ ]+)* pdg-mitm( |$)' <<<"$CC" \
+        && ok "C: pdg-mitm 也被重启(iOS)" || bad "C: 没有 restart 打到 pdg-mitm。实发: ${CC:-无}"
+      # ── 反例: 把重启动作从同一段原文里摘掉, 其余逐字不动 ──────────────────
+      # 只替换动词, 不删整行: 片段照样跑得起来、照样发得出 systemctl(is-enabled/reset-failed),
+      # 所以上面那三条要是还绿, 只可能是它认的东西不对 —— 不是"片段空了"蒙混过去。
+      sed 's/systemctl restart/: removed-restart/g' "$C/post.txt" > "$C/post-neg.txt"
+      if ! diff -q "$C/post.txt" "$C/post-neg.txt" >/dev/null; then
+        _c_seg "$C/post-neg.txt" "$C/seg-neg.sh"
+        _c_run "$C/seg-neg.sh"
+        NCC="$(cat "$C/calls.log" 2>/dev/null)"
+        { ! grep -qE '^systemctl restart( [^ ]+)* pdg-bot( |$)' <<<"$NCC"; } \
+          && ok "C-反例: 摘掉重启动作后同一条判据认不到 pdg-bot 的 restart(片段仍发出: ${NCC:-无}) —— 判据有区分力" \
+          || bad "C-反例: 重启动作已摘掉, 判据竟仍然通过 —— 它认的不是重启"
+      else
+        bad "C-反例: 没能在原文里摘掉任何一条 restart —— 反例没有生效, 区分力未验"
+      fi
+    fi
+  fi
 fi
 rm -rf "$C"
 
