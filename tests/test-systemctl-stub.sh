@@ -428,20 +428,35 @@ echo "N=${#unrestored[@]}"
 for x in ${unrestored[@]+"${unrestored[@]}"}; do echo "U| $x"; done
 HARNEOF
 
-_units_ok=1
-for _u in pdg-mitm pdg-bot pdg-probe81 mosdns mihomo; do
-  [[ -e "/etc/systemd/system/$_u.service" ]] && { _units_ok=0; break; }
-done
-[[ "$_units_ok" == 1 ]] || { skipf "14j: /etc/systemd/system 里已有同名 unit 文件($_u) —— 绝不覆盖别人的东西"; _xok=0; }
+# 这一组用的是产品那八个 unit 名(_pdg_svcstate_units 那一份清单), 但**只种桩自己的状态**:
+# 桩的 is-active / is-enabled / InvocationID 读的都是 $D 下的状态文件, 不需要
+# /etc/systemd/system 里有同名 unit。以前这里为了走"已在跑"那条回退去写产品 unit 文件,
+# 在 CI 上撞了车: 同一个 lint job 里这支跑两次(#174 / #207), 中间那些要真 systemd 的步骤
+# 会把**真的** pdg-bot.service 装进去, 第二次跑到这里就只能放弃这一组 —— 而严格模式下
+# 放弃即判红。现在一个字节都不往那儿写, 冲突不复存在;下面 14j-8 把"没动过"验出来。
+_ETC=/etc/systemd/system
+_PU=(pdg-mitm pdg-bot pdg-probe81 mosdns mihomo pdg-dotwitness)
+_PT=(pdg-health.timer pdg-rules-update.timer)
+_etc_img(){   # 八条产品 unit 路径的像: 存在性 + 内容摘要 + 属性(权限/属主/大小)
+  local u p
+  for u in "${_PU[@]}"; do p="$_ETC/$u.service"
+    printf '%s\t%s\t%s\n' "$p" "$([[ -e "$p" ]] && _sha "$p" || echo '<不存在>')" \
+                           "$([[ -e "$p" ]] && stat -c '%a:%u:%g:%s' "$p" || echo -)"; done
+  for u in "${_PT[@]}"; do p="$_ETC/$u"
+    printf '%s\t%s\t%s\n' "$p" "$([[ -e "$p" ]] && _sha "$p" || echo '<不存在>')" \
+                           "$([[ -e "$p" ]] && stat -c '%a:%u:%g:%s' "$p" || echo -)"; done
+}
+_ETC_BEFORE="$(_etc_img)"
 if [[ "$_xok" == 1 ]]; then
   # 前像里那八个 unit 的现场: 五个普通服务在跑, 两个 timer 在跑, witness 明确停着
   # (它起真进程, 四件套不齐就起不来 —— 不让它在这一组里制造无关噪声)。
   _units_made=1
+  # 五个普通服务在跑(各带一个初始运行周期身份)、两个 timer 在跑、witness 明确停着 ——
+  # witness 起的是真进程, 四件套不齐就起不来, 不让它在这一组里制造无关噪声。
   for _u in pdg-mitm pdg-bot pdg-probe81 mosdns mihomo; do
-    printf '[Unit]\nDescription=inv harness\n[Service]\nExecStart=/bin/true\n' > "/etc/systemd/system/$_u.service"
-    "$SC" enable --now "$_u" >/dev/null 2>&1
+    echo 1 > "$D/$_u.en"; echo 1 > "$D/$_u.ac"; printf 'inv-%s-seed\n' "$_u" > "$D/$_u.inv"
   done
-  for _u in pdg-health.timer pdg-rules-update.timer; do echo 1 > "$D/$_u.en"; echo 1 > "$D/$_u.ac"; done
+  for _u in "${_PT[@]}"; do echo 1 > "$D/$_u.en"; echo 1 > "$D/$_u.ac"; done
   echo 0 > "$D/pdg-dotwitness.en"; echo 0 > "$D/pdg-dotwitness.ac"; rm -f "$D/pdg-dotwitness.inv"
   _harn(){ PDG_FI_INV="$2" bash "$INVW/harn.sh" "$1" "$INVW" 2>&1; }
   _v(){ sed -n "s/^$2=//p" <<<"$1" | head -1; }   # $1=输出 $2=键
@@ -484,16 +499,21 @@ $(grep '^U| mosdns' <<<"$H2" | head -2)"
 fi
 # 收尾放在两个 if 之外: 壳没跑完、判据无效, 本轮造出来的东西照样必须收干净。
 if [[ "${_units_made:-0}" == 1 ]]; then
-  for _u in pdg-mitm pdg-bot pdg-probe81 mosdns mihomo; do
-    rm -f "/etc/systemd/system/$_u.service" "$D/$_u".*
-  done
-  rm -f "$D/pdg-health.timer".* "$D/pdg-rules-update.timer".* "$D/pdg-dotwitness".*
+  # 只清**本轮自己种下的**模型状态(桩状态目录里那几份), 别的一概不碰。
+  for _u in "${_PU[@]}" "${_PT[@]}"; do rm -f "$D/$_u".*; done
   _left=0
-  for _u in pdg-mitm pdg-bot pdg-probe81 mosdns mihomo; do
-    [[ -e "/etc/systemd/system/$_u.service" ]] && _left=$((_left+1))
+  for _u in "${_PU[@]}" "${_PT[@]}"; do
+    for _f in "$D/$_u".*; do [[ -e "$_f" ]] && _left=$((_left+1)); done
   done
-  [[ "$_left" == 0 ]] && t_ok "14j-9: 本组造出来的 5 个 unit 文件已全部清掉" \
-                      || t_bad "14j-9: 还剩 $_left 个本组造的 unit 文件在 /etc/systemd/system"
+  [[ "$_left" == 0 ]] && t_ok "14j-9: 本组种下的模型状态已全部清掉(只清自己拥有的那几份)" \
+                      || t_bad "14j-9: 桩状态目录里还剩 $_left 个本组种下的文件"
+fi
+# 14j-8 这一组自始至终没碰过 /etc/systemd/system 里的产品 unit —— 存在性、内容、属性逐项比。
+# 前像在本组**开始之前**取, 所以"本来就有 pdg-bot.service"这种现场也照样验得出没被动过。
+if [[ "$(_etc_img)" == "$_ETC_BEFORE" ]]; then
+  t_ok "14j-8: 全程没有创建/覆盖/删除任何产品名 unit 文件(8 条路径的存在性、内容摘要与属性逐项不变)"
+else
+  t_bad "14j-8: /etc/systemd/system 被动过: $(diff <(printf '%s\n' "$_ETC_BEFORE") <(_etc_img) | head -4 | tr '\n' ' ')"
 fi
 rm -rf "$INVW"
 

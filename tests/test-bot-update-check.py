@@ -117,15 +117,90 @@ for base, want_has in (("v1.11.3", True), ("v1.11.10", True), ("v1.11.13", True)
     good = has == want_has and len(txt) <= bot.UPD_MSG_BUDGET
     (ok if good else bad)("%-9s → has=%s 消息 %d 字符 ≤ 预算 %d"
                           % (base, has, len(txt), bot.UPD_MSG_BUDGET))
-at("v1.11.14") or at("HEAD")
-_head = _REAL_GIT("rev-parse", "HEAD").stdout.strip()
-_tag = _REAL_GIT("rev-parse", "v1.11.14^{commit}").stdout.strip()
-if _head == _tag:
-    has, txt = bot.update_check()
-    (ok if (not has and "🟢" in txt and "❌" not in txt) else
-     bad)("已是最新 → has=False 且报绿(实得 has=%s, %r)" % (has, txt[:50]))
+# ── 「无更新」那一格: 目标版本从**这个隔离克隆**里现查, 不写死 ────────────────
+# 原来这里把 v1.11.14 写死成"最新发布"。仓库后来有了 v1.11.15, 于是站在 v1.11.14 上
+# 确实**有**新发布 —— 判据过期, 报出来的红与产品无关(CI #226 就是它)。
+# 只把版本号往上挪一位治不了本: 下次再发一版又是同一条红。
+#
+# 前提逐步确认, 每一步都具名; 任何一步不成立都判**失败或执行无效** —— 不回退 HEAD、
+# 不吞退出码、也不拿两个空值相等放行(空等于空是这条链上栽过的坑), 更不会把用例删掉。
+def _top_tag():
+    """在隔离克隆里确定最高版本 tag。成功返回 (tag, commit); 失败返回 (None, 具名原因)。"""
+    r = _REAL_GIT("tag", "-l", "v*", "--sort=-v:refname")
+    if r.returncode != 0:
+        return None, "git tag 查询失败(返回 %d)" % r.returncode
+    tags = r.stdout.split()
+    if not tags:
+        return None, "隔离克隆里一条 v* tag 都没读到"
+    top = tags[0]
+    rr = _REAL_GIT("rev-parse", "%s^{commit}" % top)
+    commit = rr.stdout.strip()
+    if rr.returncode != 0 or not commit:
+        return None, "%s 解析不成提交(rev-parse 返回 %d, 输出 %r)" % (top, rr.returncode, rr.stdout[:20])
+    return top, commit
+
+
+_TOP, _TOPC = _top_tag()
+if _TOP is None:
+    bad("无更新用例前提不成立: %s —— 这一格执行无效, 不按通过记" % _TOPC)
+elif not at(_TOP):
+    bad("无更新用例前提不成立: 在隔离克隆里 checkout %s 失败 —— 这一格执行无效" % _TOP)
 else:
-    print("  [SKIP] 当前不在 v1.11.14 上, 无更新那一格未执行")
+    _head = _REAL_GIT("rev-parse", "HEAD").stdout.strip()
+    if not _head or not _TOPC or _head != _TOPC:
+        bad("无更新用例前提不成立: 实际 HEAD=%s 与目标 %s=%s 不一致 —— 这一格执行无效"
+            % (_head or "<空>", _TOP, _TOPC or "<空>"))
+    else:
+        ok("无更新用例前提: 隔离克隆里最高 tag=%s, 已检出且实际 HEAD 与它一致(%s)"
+           % (_TOP, _head[:12]))
+        has, txt = bot.update_check()          # 真实实现, 不是桩
+        (ok if (not has and "🟢" in txt and "❌" not in txt) else
+         bad)("已是最新 → has=False 且报绿(实得 has=%s, %r)" % (has, txt[:50]))
+
+# ── 最小正反对照: 在**自有克隆**里造一个更高的版本 ────────────────────────────
+# 只动这份一次性克隆(tmpguard 管的临时目录)。源仓库与官方 refs 一概不碰, 也不推任何东西。
+# 正: 出现更高版本之后, 站在原来那个最高对象上应当报"有更新";
+# 反: 检出新的最高版本之后应当报"无更新"。两格都走真实 update_check, 不给它恒定返回值。
+_FX = "v99.99.99"
+_FXCFG = ["-c", "user.name=pdg-test", "-c", "user.email=pdg-test@invalid",
+          "-c", "commit.gpgsign=false"]
+
+
+def _fxgit(*args):
+    return subprocess.run(["git"] + _FXCFG + ["-C", REPO] + list(args),
+                          capture_output=True, text=True)
+
+
+if _TOP is None:
+    bad("正反对照前提不成立: 上一格已经确定不了最高 tag —— 这两格执行无效")
+else:
+    _c = _fxgit("commit", "--allow-empty", "-q", "-m", "fixture: 更高的一版(只在本克隆里)")
+    _tg = _fxgit("tag", "-a", _FX, "-m", "fixture", "HEAD") if _c.returncode == 0 else _c
+    _NT, _NC = _top_tag()
+    if _c.returncode != 0 or _tg.returncode != 0:
+        bad("正反对照前提不成立: 自有克隆里造不出更高版本(commit 返回 %d, tag 返回 %d) —— 执行无效"
+            % (_c.returncode, _tg.returncode))
+    elif _NT != _FX:
+        bad("正反对照前提不成立: 造出来的 %s 没有排到最高(现最高 %r) —— 执行无效" % (_FX, _NT))
+    else:
+        ok("正反对照前提: 自有克隆里最高 tag 已变成 %s(源仓库与官方 refs 未动)" % _FX)
+        if not at(_TOPC):
+            bad("正反对照: 回不到原最高对象 %s —— 正向这一格执行无效" % (_TOPC or "<空>")[:12])
+        else:
+            has, txt = bot.update_check()
+            (ok if (has and "❌" not in txt) else
+             bad)("正: 出现更高版本后, 原对象报**有更新**(实得 has=%s, %r)" % (has, txt[:50]))
+        if not at(_FX):
+            bad("正反对照: 检不出 %s —— 反向这一格执行无效" % _FX)
+        else:
+            _h2 = _REAL_GIT("rev-parse", "HEAD").stdout.strip()
+            if not _h2 or not _NC or _h2 != _NC:
+                bad("正反对照: 检出后实际 HEAD=%s 与 %s=%s 不一致 —— 反向这一格执行无效"
+                    % (_h2 or "<空>", _FX, _NC or "<空>"))
+            else:
+                has, txt = bot.update_check()
+                (ok if (not has and "🟢" in txt and "❌" not in txt) else
+                 bad)("反: 检出新的最高版本后报**无更新**(实得 has=%s, %r)" % (has, txt[:50]))
 
 # 这条标题长到「不裁就放不进预算」——于是能同时验两件事: 整条消息仍在预算内, 而且那条提交
 # 是被**裁短后展示**的, 不是整条丢掉(丢掉的话用户一条摘要也看不到)。
