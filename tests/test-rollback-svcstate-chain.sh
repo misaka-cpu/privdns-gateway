@@ -207,26 +207,96 @@ run_chain(){   # $1=场景目录
       echo "printf 'FINAL\t$u\t%s\t%s\n' \"\$(cat \"$SC/$u.en\" 2>/dev/null)\" \"\$(cat \"$SC/$u.ac\" 2>/dev/null)\""
     done
   } > "$d/chain.sh"
-  # 留证与被测结果**分开结算**。本支开着 pipefail:
-  #   · 只返回管道值 → 链跑挂了与 tee 写不下去在返回值上混成一个, 而且会把**留证故障**
-  #     报成"产品恢复失败";
-  #   · 只返回 PIPESTATUS[0] → 又把 tee 失败整个吞掉, 证据没留下却一切看着正常。
-  # 所以两边各记各的: 链的码是**被测结果**, tee 的码是**留证**的成败, 文案也分开。
-  # PIPESTATUS **只对紧接着的那一条命令有效**, 而且第一次赋值就会把它重置 ——
-  # 先 CHAIN_RC="${PIPESTATUS[0]}" 再读 [1], 在 set -u 下直接是 unbound variable。
-  # 所以整个数组一次性拷出来再分别取。
-  CHAIN_RC=0; TEE_RC=0
-  bash "$d/chain.sh" 2>&1 | tee "$d/chain.out"
+  chain_account "$d/chain.sh" "$d/chain.out" "$d/rc"
+}
+# 留证与被测结果**分开结算**。单独成函数, 是为了让下面 R 节能**直接驱动这一份实现** ——
+# 另抄一份逻辑去验, 验的是抄件, 不是被测对象。
+# 本支开着 pipefail:
+#   · 只返回管道值 → 链跑挂了与 tee 写不下去在返回值上混成一个, 而且会把**留证故障**
+#     报成"产品恢复失败";
+#   · 只返回 PIPESTATUS[0] → 又把 tee 失败整个吞掉, 证据没留下却一切看着正常。
+# 所以两边各记各的: 链的码是**被测结果**, tee 的码是**留证**的成败, 文案也分开。
+# PIPESTATUS **只对紧接着的那一条命令有效**, 而且第一次赋值就会把它重置 ——
+# 先 CHAIN_RC="${PIPESTATUS[0]}" 再读 [1], 在 set -u 下直接是 unbound variable。
+# 所以整个数组一次性拷出来再分别取。
+# 变量名从 CHAIN_RC 改成 SCRIPT_RC: 链的 stdout 里本来就有一行 "CHAIN_RC=<产品返回码>",
+# 两者是**完全不同的两个数** —— 一个是生成脚本的进程退出码, 一个是 cmd_rollback 自己报的码。
+# 撞名会让人(和判据)拿输出里的字样去顶替进程退出码, 那正是要避免的。
+chain_account(){   # $1=链脚本 $2=留证落点 $3=rc 落点前缀(可省) → 返回最终码; 链的输出流到 stdout
+  SCRIPT_RC=0; TEE_RC=0
+  bash "$1" 2>&1 | tee "$2"
   local _ps=("${PIPESTATUS[@]}")
-  CHAIN_RC="${_ps[0]}"; TEE_RC="${_ps[1]}"
-  if [[ "$TEE_RC" != 0 ]]; then
-    echo "[留证失败] tee 写 $d/chain.out 返回 $TEE_RC —— 这是**留证**故障, 与产品的恢复结果无关" >&2
+  SCRIPT_RC="${_ps[0]}"; TEE_RC="${_ps[1]}"
+  # 调用处是命令替换子壳 —— 变量传不出去, 只有退出码能传。所以两个码同时落盘,
+  # 让调用处能**分别**报告, 而不是只看到一个合成码。
+  # 写入**必须检查**: 原来两行都挂着 `|| true`, 落点不可写时静静地什么也没留下,
+  # 调用处读回空值却照样判"成功"(实测: 把 rc.script 做成目录 ⇒ 整支仍 34/0、退出 0)。
+  # 这里只如实说写没写成; 判定仍由调用处按**读回来的原始值**做, 不靠 stderr。
+  if [[ -n "${3:-}" ]]; then
+    printf '%s' "$SCRIPT_RC" > "${3}.script" 2>/dev/null \
+      || echo "[记录失败] 写不了 ${3}.script —— 生成脚本退出码没留下" >&2
+    printf '%s' "$TEE_RC"    > "${3}.tee"    2>/dev/null \
+      || echo "[记录失败] 写不了 ${3}.tee —— tee 退出码没留下" >&2
   fi
-  # 链自己失败时**保留链的码**(留证成不成都不改写它);
-  # 链没问题但证据没留下, 仍判非零, 用专属码 90 与产品失败区分开。
-  [[ "$CHAIN_RC" != 0 ]] && return "$CHAIN_RC"
-  [[ "$TEE_RC"   != 0 ]] && return 90
+  if [[ "$TEE_RC" != 0 ]]; then
+    echo "[留证失败] tee 写 $2 返回 $TEE_RC —— 这是**留证**故障, 与产品的恢复结果无关" >&2
+  fi
+  # 生成脚本自己失败时**保留它的码**(留证成不成都不改写它);
+  # 脚本没问题但证据没留下, 仍判非零, 用专属码 90 与执行失败区分开。
+  [[ "$SCRIPT_RC" != 0 ]] && return "$SCRIPT_RC"
+  [[ "$TEE_RC"    != 0 ]] && return 90
   return 0
+}
+# ── 实际调用处的失败传播 ──────────────────────────────────────────────────────
+# 原来 A–E 五处都用命令替换接 run_chain 的输出 —— 那样**只取 stdout, 退出码直接丢**。
+# 实测(自有副本注入, R 节原样不动): ① 把 chain.out 做成目录让 tee 真失败,
+# ② 让生成脚本打完原有输出后 exit 7 —— 两种情况整支都仍是"通过 29, 失败 0"、退出 0。
+# R 节验的是 chain_account 自己的返回值, 验不到调用处, 所以那两格全绿挡不住这类假绿。
+# take 把退出码就地接住, 并把**三个数分开报**:
+#   · 生成脚本的进程退出码(rc.script)   · tee 的退出码(rc.tee)
+#   · 产品 cmd_rollback 的返回码 —— 那一维由各场景自己从链输出里的 CHAIN_RC= 判(D 场景就靠它)
+# 注意: take 会调 ok/bad, 所以**不能**放进命令替换里跑(那样计数和文案都会丢进 $o);
+# 链输出改放全局 CHAIN_OUT_TXT, 调用处再取。
+CHAIN_OUT_TXT=""
+# 读一条 rc 记录: 只有"读得出来且是十进制整数"才算可用。
+# 落点被占成目录、权限不足、写了一半 —— 都只会让这里读不出合法值, 于是判**记录不可用**,
+# 而不是当成 0, 也不是算到产品头上。
+_rcrec(){   # $1=文件 → 打印数值并返回 0; 不可用则打印原因并返回 1
+  local f="$1" v
+  [[ -f "$f" && -r "$f" ]] || { printf '不可用(不是可读的普通文件)'; return 1; }
+  v="$(cat "$f" 2>/dev/null)" || { printf '不可用(读失败)'; return 1; }
+  [[ "$v" =~ ^[0-9]+$ ]] || { printf '不可用(内容不是退出码: %q)' "$v"; return 1; }
+  printf '%s' "$v"; return 0
+}
+take(){   # $1=场景名 $2=场景目录
+  local tag="$1" d="$2" rc=0 s t sok=0 tok=0 want
+  rm -f "$d/rc.script" "$d/rc.tee"
+  CHAIN_OUT_TXT="$(run_chain "$d")" || rc=$?
+  s="$(_rcrec "$d/rc.script")" && sok=1
+  t="$(_rcrec "$d/rc.tee")"    && tok=1
+  # ── 记录本身不可用: 三种失败里单独的一种, 不许当成通过 ──
+  if (( sok == 0 || tok == 0 )); then
+    bad "$tag-run: **退出码记录不可用**(生成脚本=$s / 留证=$t; run_chain 合成码 $rc) —— 判不出这一场跑成什么样, 不按通过记, 也不算产品恢复失败"
+    return
+  fi
+  # ── 分类只看**原始状态**, 不看合成码 ──
+  # 反例: 子脚本自己 exit 90 时合成码也是 90, 按合成码猜就会报成"留证失败(证据没留下)",
+  # 而 tee 明明返回 0 —— 文案与事实相反。
+  want=0; (( s != 0 )) && want="$s" || { (( t != 0 )) && want=90; }
+  if [[ "$rc" != "$want" ]]; then
+    bad "$tag-run: **记账不自洽**(生成脚本 $s / 留证 $t ⇒ 应得 $want, 实得 $rc)"
+    return
+  fi
+  if (( s != 0 && t != 0 )); then
+    bad "$tag-run: **执行失败**(生成脚本退出 $s) —— 链没跑完, 本场景的行为断言不算数"
+    bad "$tag-run: **另有留证失败**(tee 退出 $t) —— 与上一条是两件事, 分别记"
+  elif (( s != 0 )); then
+    bad "$tag-run: **执行失败**(生成脚本退出 $s, 留证退出 $t) —— 链没跑完, 本场景的行为断言不算数"
+  elif (( t != 0 )); then
+    bad "$tag-run: **留证失败**(tee 退出 $t, 生成脚本退出 $s) —— 证据没留下, 本场景的行为断言不算数"
+  else
+    ok "$tag-run: 生成脚本退出 $s, 留证退出 $t —— 执行与留证都成功(产品自己的返回码另判)"
+  fi
 }
 plain(){ sed 's/\x1b\[[0-9;]*m//g' <<<"$1"; }
 fin(){ grep -P "^FINAL\t$2\t" <<<"$1" | cut -f3,4 | tr '\t' '/'; }
@@ -236,7 +306,7 @@ echo "隔离: $( [[ "${PDG_CHAIN_NS}" == 1 ]] && echo 'unshare 私有挂载' || 
 echo
 echo "══ 一. 前像 = mihomo 本来 disabled/inactive ══"
 d="$(mkcase A disabled inactive)"
-o="$(run_chain "$d")"; p="$(plain "$o")"
+take A "$d"; o="$CHAIN_OUT_TXT"; p="$(plain "$o")"
 echo "   —— 文件四维(自有根内真实内容与属性) ——"
 # 注: /etc/privdns-gateway/backend 会被 cmd_rollback 自己按"唯一内核"重写成 mihomo,
 # 所以文件这一维的判据取**回滚不再改写**的那几个。
@@ -253,7 +323,7 @@ grep -q 'CHAIN_RC=0' <<<"$p" && ok "A4: 整条链返回 0" || bad "A4: $(grep -o
 echo
 echo "══ 二. 前像 = mihomo 本来 enabled-runtime/active ══"
 d="$(mkcase B enabled-runtime active)"
-o="$(run_chain "$d")"; p="$(plain "$o")"
+take B "$d"; o="$CHAIN_OUT_TXT"; p="$(plain "$o")"
 [[ "$(fin "$o" mihomo)" == "enabled-runtime/active" ]] && ok "B1: mihomo 最终回到 enabled-runtime/active(没被提升成永久 enabled)" || bad "B1: 实得 $(fin "$o" mihomo)"
 # 盯的是**任意一次**中途变更, 不只是最后一次 —— 先永久 enable 再纠正回 runtime 也算。
 if grep -qE '^mihomo en .* -> enabled$' "$d/chain.chg"; then
@@ -271,14 +341,14 @@ set_u pdg-bot disabled inactive
 bash "$d/save.sh"
 for u in $U_ALL; do set_u "$u" disabled inactive; done
 set_u mihomo disabled inactive
-o="$(run_chain "$d")"
+take C "$d"; o="$CHAIN_OUT_TXT"
 [[ "$(fin "$o" pdg-bot)" == "disabled/inactive" ]] && ok "C1: pdg-bot 最终仍是 disabled/inactive" || bad "C1: 实得 $(fin "$o" pdg-bot)"
 [[ "$(chg "$d" pdg-bot)" == 0 ]] && ok "C2: 全过程里 pdg-bot 状态零改写" || { bad "C2: 被改写 $(chg "$d" pdg-bot) 次"; grep '^pdg-bot ' "$d/chain.chg" | sed 's/^/        /'; }
 
 echo
 echo "══ 四. 没有前像(旧快照): 历史兼容路径要单独说清 ══"
 d="$(mkcase D enabled active no-preimage)"
-o="$(run_chain "$d")"; p="$(plain "$o")"
+take D "$d"; o="$CHAIN_OUT_TXT"; p="$(plain "$o")"
 grep -q 'CHAIN_RC=1' <<<"$p" && ok "D1: 整条链返回 1" || bad "D1: $(grep -o 'CHAIN_RC=.*' <<<"$p")"
 grep -q '✅ 已回滚并重启服务' <<<"$p" && bad "D2: 仍然报了「已回滚并重启服务」" || ok "D2: 没有报「已回滚并重启服务」"
 grep -q '服务前像缺失/不可用' <<<"$p" && ok "D3: 未恢复项点名了服务前像这一格" || bad "D3"
@@ -298,7 +368,7 @@ if grep -q '^_pdg_kernel_converge(){' "$PDG"; then
     ok "E0: 反向副本就位(只把内核收敛换回 _core_kernel_activate)"
     _pdg_keep="$PDG"; PDG="$REV"
     d="$(mkcase E disabled inactive)"
-    o="$(run_chain "$d")"
+    take E "$d"; o="$CHAIN_OUT_TXT"
     PDG="$_pdg_keep"
     [[ "$(chg "$d" mihomo)" -ge 1 ]] && ok "E1: 撤回之后 mihomo 的状态**中途真的被改写**了 $(chg "$d" mihomo) 次 —— A2 确实由这处修复保住" \
       || bad "E1: 反向对照没体现差异 —— 本格记无效"
@@ -327,36 +397,35 @@ cat <<'NOTE'
 NOTE
 echo
 echo "══ R. 留证与被测结果分开结算(四种组合各验一次)══"
-# 直接驱动 run_chain 那一段的**同一套记账规则**: 造一个可控的 chain.sh 与可控的 tee 落点,
-# 四种组合分别核 CHAIN_RC / TEE_RC 与最终返回值。不改被测实现, 只把它的记账拿出来跑。
-_rd="$WORK/rcacct"; mkdir -p "$_rd"
-_acct(){   # $1=链退出码 $2=留证是否可写(ok/bad) → 打印 "chain=<> tee=<> rc=<>"
-  printf '#!/bin/sh\necho CHAIN-OUT\nexit %s\n' "$1" > "$_rd/chain.sh"
-  local out="$_rd/chain.out"
-  if [[ "$2" == bad ]]; then rm -rf "$out"; mkdir -p "$out"   # 目标是目录 ⇒ tee 写不进去
-  else rm -rf "$out"; fi
-  local CHAIN_RC=0 TEE_RC=0 rc=0
-  ( set -uo pipefail
-    bash "$_rd/chain.sh" 2>&1 | tee "$out"
-    _p=("${PIPESTATUS[@]}"); c="${_p[0]}"; e="${_p[1]}"
-    printf 'chain=%s tee=%s\n' "$c" "$e" >&2
-    [[ "$c" != 0 ]] && exit "$c"
-    [[ "$e" != 0 ]] && exit 90
-    exit 0 ) >/dev/null 2>"$_rd/err"
-  rc=$?
-  printf '%s rc=%s\n' "$(cat "$_rd/err" | grep -o 'chain=[0-9]* tee=[0-9]*' | tail -1)" "$rc"
-}
-_r1="$(_acct 0 ok)";  [[ "$_r1" == "chain=0 tee=0 rc=0" ]] \
-  && ok "R1: 链 0 + 留证 0 ⇒ 成功($_r1)" || bad "R1: 实得 $_r1"
-_r2="$(_acct 7 ok)";  [[ "$_r2" == "chain=7 tee=0 rc=7" ]] \
-  && ok "R2: 链 7 + 留证 0 ⇒ **保留链的失败码 7**(不被留证成功冲掉)($_r2)" || bad "R2: 实得 $_r2"
-_r3="$(_acct 0 bad)"; [[ "$_r3" == "chain=0 tee=1 rc=90" ]] \
-  && ok "R3: 链 0 + 留证失败 ⇒ 仍判非零, 且用专属码 90 标明是**留证**失败($_r3)" || bad "R3: 实得 $_r3"
-_r4="$(_acct 7 bad)"; [[ "$_r4" == "chain=7 tee=1 rc=7" ]] \
-  && ok "R4: 两边都失败 ⇒ 返回值保留**链**的 7, 留证失败另行记账($_r4)" || bad "R4: 实得 $_r4"
-grep -q '留证失败' <<<"$(sed -n '/留证失败/p' "$0")" \
-  && ok "R5: 留证失败有自己的文案, 没有归进产品恢复失败" || bad "R5: 留证失败的文案没分开"
-rm -rf "$_rd"
+# **直接驱动被测实现**: 下面调的就是 run_chain 用的那一个 chain_account, 不另抄一份逻辑。
+# 先自证它确实在符号表里, 抽不到/没定义一律按执行无效处理, 不按通过记。
+if ! declare -F chain_account >/dev/null; then
+  bad "R0: chain_account 没定义 —— R 节无法驱动被测实现, 按执行无效处理"
+else
+  ok "R0: R 节驱动的是 run_chain 用的同一个 chain_account(declare -F 确认在符号表里)"
+  _rd="$WORK/rcacct"; mkdir -p "$_rd"
+  _acct(){   # $1=链退出码 $2=留证可写?(ok/bad) → 打印 "chain=<> tee=<> rc=<>"; stderr 落 $_rd/err
+    printf '#!/bin/sh\necho CHAIN-OUT\nexit %s\n' "$1" > "$_rd/chain.sh"
+    local out="$_rd/chain.out"
+    rm -rf "$out"; [[ "$2" == bad ]] && mkdir -p "$out"   # 目标是目录 ⇒ tee 写不进去
+    local rc=0
+    chain_account "$_rd/chain.sh" "$out" >/dev/null 2>"$_rd/err" || rc=$?
+    printf 'chain=%s tee=%s rc=%s\n' "$SCRIPT_RC" "$TEE_RC" "$rc"
+  }
+  _r1="$(_acct 0 ok)";  [[ "$_r1" == "chain=0 tee=0 rc=0" ]] \
+    && ok "R1: 链 0 + 留证 0 ⇒ 成功($_r1)" || bad "R1: 实得 $_r1"
+  _r2="$(_acct 7 ok)";  [[ "$_r2" == "chain=7 tee=0 rc=7" ]] \
+    && ok "R2: 链 7 + 留证 0 ⇒ **保留链的失败码 7**(不被留证成功冲掉)($_r2)" || bad "R2: 实得 $_r2"
+  _r3="$(_acct 0 bad)"; [[ "$_r3" == "chain=0 tee=1 rc=90" ]] \
+    && ok "R3: 链 0 + 留证失败 ⇒ 仍判非零, 且用专属码 90 标明是**留证**失败($_r3)" || bad "R3: 实得 $_r3"
+  # R4 的 stderr 留在 $_rd/err, R5 直接读**实际输出**, 不搜本支自己的断言文字。
+  _r4="$(_acct 7 bad)"; [[ "$_r4" == "chain=7 tee=1 rc=7" ]] \
+    && ok "R4: 两边都失败 ⇒ 返回值保留**链**的 7($_r4)" || bad "R4: 实得 $_r4"
+  { grep -q '留证失败' "$_rd/err" && grep -q '与产品的恢复结果无关' "$_rd/err"; } \
+    && ok "R5: 两边都失败时**实际 stderr** 另行点名了留证失败, 且明说与产品恢复无关: $(grep -m1 '留证失败' "$_rd/err" | cut -c1-72)" \
+    || { bad "R5: 实际输出里没有独立的留证失败文案"; sed 's/^/      /' "$_rd/err"; }
+  rm -rf "$_rd"
+fi
 
 echo "────────────────────────────────────────"
 echo "通过 $pass, 失败 $nfail"
