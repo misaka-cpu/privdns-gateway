@@ -98,64 +98,221 @@ bash /usr/local/bin/pdg __migrate >$E2E_TMP/mig2.log 2>&1
 
 # ══ 场景二: 平台已确认 ios, 且盘上还有老版 WLOC 的执行面 ════════════════════
 echo; echo "── 场景二: 同样的老机器, 但平台已确认 ios(带 WLOC 残留) ──"
-seed_old_box ios
 # 老版开过 WLOC 的机器: MITM 宿主、两个模块、服务在跑, 还有一张 CA 和用户填过的地点。
 # 只写制品本身(与 tests/test-wloc-retire-migration.sh 造旧态的做法一致) —— 不调用新版
 # 已删除的开启入口, 也不恢复任何签发能力。造完先自检, 否则"已撤除"什么都证明不了。
-install -d -m755 /opt/pdg-bot /etc/privdns-gateway/ca
-printf '[Unit]\nDescription=PDG MITM (retired)\n[Service]\nExecStart=/usr/bin/false\n' \
-  > /etc/systemd/system/pdg-mitm.service
-printf '# retired module (pre-image only)\n' > /opt/pdg-bot/mitm_server.py
-printf '# retired module (pre-image only)\n' > /opt/pdg-bot/mitm_wloc.py
-printf '%s\n' '{"wloc":{"enabled":true,"accuracy":50,"active":"大阪","generation":1,"locations":[{"name":"大阪","lat":34.6937,"lon":135.5023}]}}' \
-  > /etc/privdns-gateway/mitm.json
-printf -- '-----BEGIN CERTIFICATE-----\nretired-ca-material\n-----END CERTIFICATE-----\n' \
-  > /etc/privdns-gateway/ca/ca.crt
-mkdir -p "$E2E_TMP/e2e-svc"; echo 1 > "$E2E_TMP/e2e-svc/pdg-mitm.ac"; echo 1 > "$E2E_TMP/e2e-svc/pdg-mitm.en"
-_pre=1
-for f in /etc/systemd/system/pdg-mitm.service /opt/pdg-bot/mitm_server.py /opt/pdg-bot/mitm_wloc.py; do
-  [[ -e "$f" ]] || _pre=0
-done
-[[ "$(systemctl is-active pdg-mitm)" == active ]] || _pre=0
-[[ "$_pre" == 1 ]] && ok "iOS: 残留前像就位(三件制品在盘上, pdg-mitm 报 active)" \
-  || bad "iOS: WLOC 残留前像没造出来, 撤除相关判据不作数"
+#
+# CA 得是**真的一张 X.509 公钥证书**: 产品那边的 CA 报告走 mitm_ca 的只读探测, 正文认不出
+# 就判 damaged, 走的是另一条措辞。拿占位文本造出来的现场, 验的根本不是"盘上还留着一张手机
+# 可能仍在信任的根证书"那一格 —— 而那一格正是下面几条保留判据要看的。自签一张放到盘上,
+# 与造 unit / 模块前像同理: 只是把老现场摆出来, 不恢复任何签发能力。
+#
+# 这一段造两次(二-0 反例一次、二-1 正常退役一次), 所以收成函数; 两次的自检各报各的,
+# 否则"前像就位"是哪一次造的分不出来。
+seed_wloc_residue(){   # $1=这一格的名字(前像自检用)
+  local tag="$1" _pre=1 f
+  install -d -m755 /opt/pdg-bot /etc/privdns-gateway/ca
+  printf '[Unit]\nDescription=PDG MITM (retired)\n[Service]\nExecStart=/usr/bin/false\n' \
+    > /etc/systemd/system/pdg-mitm.service
+  printf '# retired module (pre-image only)\n' > /opt/pdg-bot/mitm_server.py
+  printf '# retired module (pre-image only)\n' > /opt/pdg-bot/mitm_wloc.py
+  printf '%s\n' '{"wloc":{"enabled":true,"accuracy":50,"active":"大阪","generation":1,"locations":[{"name":"大阪","lat":34.6937,"lon":135.5023}]}}' \
+    > /etc/privdns-gateway/mitm.json
+  rm -f /etc/privdns-gateway/ca/ca.crt /etc/privdns-gateway/ca/ca.key
+  openssl req -x509 -newkey rsa:2048 -nodes -days 7300 \
+      -subj '/CN=PrivDNS Gateway MITM CA (retired pre-image)' \
+      -keyout /etc/privdns-gateway/ca/ca.key -out /etc/privdns-gateway/ca/ca.crt \
+      >/dev/null 2>&1 \
+    || bad "$tag 造不出 WLOC 时期的 CA(openssl 不可用?) —— CA 保留判据不作数"
+  mkdir -p "$E2E_TMP/e2e-svc"; echo 1 > "$E2E_TMP/e2e-svc/pdg-mitm.ac"; echo 1 > "$E2E_TMP/e2e-svc/pdg-mitm.en"
+  for f in /etc/systemd/system/pdg-mitm.service /opt/pdg-bot/mitm_server.py /opt/pdg-bot/mitm_wloc.py; do
+    [[ -e "$f" ]] || _pre=0
+  done
+  [[ -s /etc/privdns-gateway/ca/ca.crt ]] || _pre=0
+  [[ "$(systemctl is-active pdg-mitm)" == active ]] || _pre=0
+  [[ "$_pre" == 1 ]] && ok "$tag 残留前像就位(三件制品 + 一张真 CA 在盘上, pdg-mitm 报 active)" \
+    || bad "$tag WLOC 残留前像没造出来, 撤除相关判据不作数"
+}
 
+# ── 二-0(反例): 内部入口交不出本次操作的服务前像句柄 → 退役一件都不许做 ──────
+# 这一格与二-1 是同一台机器的两种调用形态, 必须分开留着。门放行的判据是"调用方能在动手
+# 之前保存服务前像、并据此恢复", **不是**"这台机器需不需要退役"。手打 `pdg __migrate`
+# 没有句柄, 于是受保护的退役对象一个不许撤、服务一个不许停 —— 半截现场比不动更糟。
+# 这里不设任何环境变量、不造任何凭据: 要验的正是"补不出来就得被拒"。
+seed_old_box ios
+seed_wloc_residue "iOS 二-0:"
 : > "$E2E_TMP/e2e-calls.log"
-bash /usr/local/bin/pdg __migrate >$E2E_TMP/mig3.log 2>&1
-[[ "$(gms)" == 0 ]] && ok "iOS: GMS 入站被清理干净(iOS 走 APNs 用不到)" || bad "iOS 仍有 $(gms) 条 GMS 入站"
-{ [[ -e /opt/pdg-bot/probe81.py ]] && [[ -e /etc/systemd/system/pdg-probe81.service ]]; } \
-  && ok "iOS: iOS 组件保留" || bad "iOS 组件被误删"
-[[ ! -e /etc/privdns-gateway/platform.guessed ]] && ok "iOS: 已确认平台不打推测标记" || bad "已确认平台仍被当成推测"
-# ── 退役契约: 迁移必须**撤除**执行面, 而不是补上 ──
+bash /usr/local/bin/pdg __migrate >$E2E_TMP/mig2n.log 2>&1
+RC2N=$?
+[[ "$RC2N" != 0 ]] \
+  && ok "iOS 二-0: 无句柄的 __migrate 返回非零(rc=$RC2N)" \
+  || bad "iOS 二-0: 无句柄却整体报成功(rc=$RC2N)"
+grep -q '不执行 WLOC 退役迁移' $E2E_TMP/mig2n.log \
+  && ok "iOS 二-0: 明确拒绝执行 WLOC 退役迁移" \
+  || bad "iOS 二-0: 没说明为什么不退役: $(tail -3 $E2E_TMP/mig2n.log)"
+grep -q 'PDG_UPDATE_SVCSTATE 未设' $E2E_TMP/mig2n.log \
+  && ok "iOS 二-0: 点名缺的就是本次操作的服务前像句柄" \
+  || bad "iOS 二-0: 没点名缺的是什么"
 for f in /etc/systemd/system/pdg-mitm.service /opt/pdg-bot/mitm_server.py /opt/pdg-bot/mitm_wloc.py; do
-  [[ -e "$f" ]] && bad "iOS: 迁移后仍残留已退役的 $f" || ok "iOS: 已撤除 $(basename "$f")"
+  [[ -e "$f" ]] && ok "iOS 二-0: 受保护的 $(basename "$f") 没被撤除" \
+    || bad "iOS 二-0: 被拒的这一次却撤掉了 $f"
 done
-# "文件不在"不够: 服务必须真的停过, 且现在确实不在跑。
+[[ "$(systemctl is-active pdg-mitm)" == active ]] \
+  && ok "iOS 二-0: pdg-mitm 仍在运行(没被停)" || bad "iOS 二-0: pdg-mitm 被停了"
 grep -qE 'disable --now pdg-mitm|stop pdg-mitm' "$E2E_TMP/e2e-calls.log" \
-  && ok "iOS: 确实对 pdg-mitm 发过 stop/disable(有调用记录)" || bad "iOS: 没看到停服务的调用"
-[[ "$(systemctl is-active pdg-mitm)" != active ]] \
-  && ok "iOS: pdg-mitm 现在确实不在运行" || bad "iOS: pdg-mitm 还活着"
-# 保留策略: 旧 CA 不销毁, 而且必须给出手机端撤信任的提示。
+  && bad "iOS 二-0: 竟然对 pdg-mitm 发过 stop/disable" \
+  || ok "iOS 二-0: 一条停/禁用 pdg-mitm 的调用都没有"
+grep -q '"enabled": *true' /etc/privdns-gateway/mitm.json \
+  && ok "iOS 二-0: mitm.json 的 wloc.enabled 原样未动" || bad "iOS 二-0: mitm.json 被改了"
 [[ -s /etc/privdns-gateway/ca/ca.crt ]] \
-  && ok "iOS: 旧 CA 材料按保留策略未删" || bad "iOS: 旧 CA 被迁移删掉了"
-grep -q '按保留策略未删' $E2E_TMP/mig3.log && ok "iOS: 迁移点名了盘上仍有 CA 材料" \
-  || bad "iOS: 没提示 CA 残留: $(tail -3 $E2E_TMP/mig3.log)"
-grep -q '取消对 PrivDNS Gateway' $E2E_TMP/mig3.log \
-  && ok "iOS: 给出了手机端撤销信任的指引(退役不会自动取消已给出的信任)" \
-  || bad "iOS: 缺撤信任提示"
-# 共享劫持锚点保留且休眠 —— 撤的是 WLOC 专属面, 不是 force_hijack 结构。
-[[ -e /etc/mosdns/rules/mitm_hijack.txt && ! -s /etc/mosdns/rules/mitm_hijack.txt ]] \
-  && ok "iOS: 共享劫持锚点仍在且为空(休眠, 没被一并删掉)" \
-  || bad "iOS: mitm_hijack.txt 状态不对"
-cp /etc/sing-box/config.json $E2E_TMP/s2
-bash /usr/local/bin/pdg __migrate >$E2E_TMP/mig4.log 2>&1
-cmp -s $E2E_TMP/s2 /etc/sing-box/config.json && ok "iOS: 二跑幂等" || bad "iOS 二跑改动了 model"
-# 退役迁移自己也要幂等: 没有残留时二跑不该报错, 也不该把制品弄回来。
-_again=0
-for f in /etc/systemd/system/pdg-mitm.service /opt/pdg-bot/mitm_server.py /opt/pdg-bot/mitm_wloc.py; do
-  [[ -e "$f" ]] && _again=1
-done
-[[ "$_again" == 0 ]] && ok "iOS: 二跑后退役制品仍然不在(退役迁移幂等)" || bad "iOS: 二跑把退役制品弄回来了"
+  && ok "iOS 二-0: 旧 CA 材料仍在" || bad "iOS 二-0: 旧 CA 被删了"
+
+# ── 二-1: 走公开入口 `pdg migrate` —— 快照、服务前像、句柄三样都由真实产品自己做 ──
+# 产品被拒时指的就是这条路(见 _retire_caller_gate 的提示 ③)。这里**不手工补造凭据、
+# 不设 PDG_UPDATE_SVCSTATE、也不动门的任何判据**: cmd_migrate 先 _lock、再 cmd_snapshot
+# (前像在打包之后一并存好并校验)、然后把那份记录的路径交给 run_all_migrations。门验的是
+# "这份记录属于本次操作"(boot_id / 调用方 pid+启动时刻 / 快照绑定), 所以退役真的做成了
+# 这件事本身, 就是句柄确实被产品自己生成并传下去了的证据。
+seed_old_box ios
+seed_wloc_residue "iOS 二-1:"
+: > "$E2E_TMP/e2e-calls.log"
+# 本次到底产出了哪一份快照, 要拿**盘上的目录**说话, 不拿日志里的预告说话: 跑之前记下
+# 已有哪些, 跑完做差集。
+#
+# 观测本身也会坏, 而坏掉的观测**看起来和正常结果一模一样**: 操作前那次 ls 失败会留下一份
+# 空清单, 差集于是把盘上原有的旧快照算成"本次新增", "本次真的建出快照了"这条判据就被一份
+# 2020 年的旧目录顶了上去。同理, 后一次 ls 先吐完内容再以非零退出, 半截输出照样被消费。
+# 所以建目录 / 采清单 / 算差集三步, 每一步都要看**它自己的实际退出码**; 失败命令留下的空
+# 清单或半截输出一律不消费, 一律具名报"观测无效"并进失败结算 —— 观测坏了就说观测坏了,
+# 不把它冒称成关于产品的结论。
+SNAPD=/var/lib/privdns-gateway/backups
+snap_list(){   # $1=清单落点 $2=具名前缀 → 0=采到了; 非0=观测无效(已经具名报过红)
+  local out="$1" tag="$2" raw="$1.raw" err="$1.err" rc=0 n=0
+  rm -f "$out" "$raw" "$err"
+  ls -1 "$SNAPD/" > "$raw" 2>"$err" || rc=$?
+  if (( rc != 0 )); then
+    n="$(grep -c '' "$raw" 2>/dev/null || true)"
+    bad "$tag **观测无效** —— 列快照目录失败(ls 退出 $rc); 它已经吐出的 ${n:-0} 行一律不采信: $(head -1 "$err" 2>/dev/null)"
+    rm -f "$raw" "$err"; return 1
+  fi
+  # `if ! sort …; then rc=$?` 记下来的是 `!` 取反之后的 0, 不是 sort 自己的码。
+  # 阻断不变, 但记账要记原始码 —— 事后查"到底怎么失败的"全靠这个数。
+  sort "$raw" > "$out" 2>>"$err" || rc=$?
+  if (( rc != 0 )); then
+    bad "$tag **观测无效** —— 清单排序失败(sort 退出 $rc)"
+    rm -f "$raw" "$err" "$out"; return 1
+  fi
+  rm -f "$raw" "$err"; return 0
+}
+SNAPOBS=1
+mkdir -p "$SNAPD" || { bad "iOS 二-1: **观测无效** —— 建不出快照目录 $SNAPD(mkdir 退出 $?)"; SNAPOBS=0; }
+(( SNAPOBS == 1 )) && { snap_list "$E2E_TMP/snapdirs.before" "iOS 二-1(操作前):" || SNAPOBS=0; }
+if (( SNAPOBS == 0 )); then
+  # 操作前的清单是差集的**被减数**: 它没采到, 这一格再跑迁移也解释不了结果, 所以不跑。
+  bad "iOS 二-1: 操作前的快照观测没成立 → **本格迁移不执行**(本格的退出码 / 现场 / 幂等判据本轮都不产出)"
+else
+  bash /usr/local/bin/pdg migrate >$E2E_TMP/mig3.log 2>&1
+  RC3=$?
+  SNAPNEW=""; SNAPOK=0; SNAPN=0; SNAPTXT=""; SNAPARR=()
+  if snap_list "$E2E_TMP/snapdirs.after" "iOS 二-1(操作后):"; then
+    comm -13 "$E2E_TMP/snapdirs.before" "$E2E_TMP/snapdirs.after" \
+      > "$E2E_TMP/snapdirs.new" 2> "$E2E_TMP/snapdirs.new.err"
+    RCCOMM=$?
+    if (( RCCOMM != 0 )); then
+      bad "iOS 二-1: **观测无效** —— 差集计算失败(comm 退出 $RCCOMM), 它的输出一律不采信: $(head -1 "$E2E_TMP/snapdirs.new.err" 2>/dev/null)"
+      rm -f "$E2E_TMP/snapdirs.new"
+    else
+      # 份数与目录名出自**同一次受检读取**。以前这里是 `grep -c` 数一遍、后面再 `cat` 读一遍:
+      # 两次都没看退出码, 于是读失败留下的空输出被当成"零份"(→ 误报"产品没建快照"), 半截
+      # 输出被当成路径(→ 误报"产物成立")。换成一次 cat: 它对空文件就是退出 0、输出为空,
+      # 所以"正常的零份"与"读取错误"天然分得开(不像 grep -c 空集合也返回 1)。
+      SNAPRD=0
+      SNAPTXT="$(cat "$E2E_TMP/snapdirs.new")" || SNAPRD=$?
+      if (( SNAPRD != 0 )); then
+        bad "iOS 二-1: **观测无效** —— 读本次新增清单失败(cat 退出 $SNAPRD), 它已经吐出的内容一律不采信"
+      else
+        SNAPOK=1
+        if [[ -n "$SNAPTXT" ]]; then
+          mapfile -t SNAPARR <<< "$SNAPTXT"
+          SNAPN="${#SNAPARR[@]}"; SNAPNEW="${SNAPARR[0]}"
+        fi
+      fi
+    fi
+  fi
+  echo "   [记录] iOS 二-1: pdg migrate 退出码 = $RC3(阶段证据在 mig3.log)"
+  # 正常调用的**真实退出码**自成一条判据。"退役那几样撤干净了"是**局部**证据, 可以单列,
+  # 但顶替不了"这一次整体跑成功了" —— 半截成功不许按通过记。本机取不到 mihomo 时这一条
+  # 会真红: 那就是真红, 不放宽、不特判。
+  [[ "$RC3" == 0 ]] \
+    && ok "iOS 二-1: 公开入口整体成功(实际退出码 0)" \
+    || bad "iOS 二-1: **正常调用没跑成功**(实际退出码 $RC3) —— 下面的现场判据即使全绿, 也只是局部证据, 不算这一次通过: $(tail -3 $E2E_TMP/mig3.log)"
+  # 「迁移前留快照…」是**动手之前打的预告**, 只证明它先说了这件事。
+  grep -q '迁移前留快照' $E2E_TMP/mig3.log \
+    && ok "iOS 二-1: 动手之前先打了留快照的准备提示(仅准备阶段提示)" \
+    || bad "iOS 二-1: 连留快照的准备提示都没有: $(head -3 $E2E_TMP/mig3.log)"
+  # 观测健康正控 —— 与"真实迁移成功"那条正控**分开**: 这一条只说这次观测本身站不站得住。
+  (( SNAPOK == 1 )) \
+    && ok "iOS 二-1: 快照观测三步(建目录 / 前后清单 / 差集)都成立, 本次新增 $SNAPN 份" \
+    || bad "iOS 二-1: 快照观测没有成立(具体哪一步见上面的「观测无效」)"
+  # 「快照确实建出来了」必须核**本次的实际产物**: 恰好新出现一份目录, 且归档与服务前像都在。
+  if (( SNAPOK == 0 )); then
+    : # 观测无效已经各自报过红了 —— 不再拿一个"产品没建快照"的结论去盖观测自己的毛病
+  elif (( SNAPN == 0 )); then
+    bad "iOS 二-1: 本次没有新增任何快照目录 —— 没有本次的实际快照产物, 预告文字不算数"
+  elif (( SNAPN > 1 )); then
+    bad "iOS 二-1: **观测无效** —— 本次新增了 $SNAPN 个目录(${SNAPARR[*]}), 认不出哪一份是这次的, 不猜选"
+  else
+    # 目录名就是上面那一次受检读取里的第一项, 不再另读一遍。
+    { [[ -s "$SNAPD/$SNAPNEW/snap.tar.gz" ]] && [[ -s "$SNAPD/$SNAPNEW/svcstate.tsv" ]]; } \
+      && ok "iOS 二-1: 本次实际产出了快照 $SNAPNEW(归档 + 服务前像都在盘上)" \
+      || bad "iOS 二-1: 本次新增目录 $SNAPNEW 里缺归档或服务前像"
+  fi
+  grep -q '不具备可靠回滚能力' $E2E_TMP/mig3.log \
+    && bad "iOS 二-1: 合法调用方仍被门拒(产品侧问题, 本轮不改产品): $(grep -A2 '不具备可靠回滚能力' $E2E_TMP/mig3.log | head -3)" \
+    || ok "iOS 二-1: 带句柄的公开入口没有被退役门拦下"
+  [[ "$(gms)" == 0 ]] && ok "iOS: GMS 入站被清理干净(iOS 走 APNs 用不到)" || bad "iOS 仍有 $(gms) 条 GMS 入站"
+  { [[ -e /opt/pdg-bot/probe81.py ]] && [[ -e /etc/systemd/system/pdg-probe81.service ]]; } \
+    && ok "iOS: iOS 组件保留" || bad "iOS 组件被误删"
+  [[ ! -e /etc/privdns-gateway/platform.guessed ]] && ok "iOS: 已确认平台不打推测标记" || bad "已确认平台仍被当成推测"
+  # ── 退役契约: 迁移必须**撤除**执行面, 而不是补上 ──
+  for f in /etc/systemd/system/pdg-mitm.service /opt/pdg-bot/mitm_server.py /opt/pdg-bot/mitm_wloc.py; do
+    [[ -e "$f" ]] && bad "iOS: 迁移后仍残留已退役的 $f" || ok "iOS: 已撤除 $(basename "$f")"
+  done
+  # "文件不在"不够: 服务必须真的停过, 且现在确实不在跑。
+  grep -qE 'disable --now pdg-mitm|stop pdg-mitm' "$E2E_TMP/e2e-calls.log" \
+    && ok "iOS: 确实对 pdg-mitm 发过 stop/disable(有调用记录)" || bad "iOS: 没看到停服务的调用"
+  [[ "$(systemctl is-active pdg-mitm)" != active ]] \
+    && ok "iOS: pdg-mitm 现在确实不在运行" || bad "iOS: pdg-mitm 还活着"
+  # 保留策略: 旧 CA 不销毁, 而且必须给出手机端撤信任的提示。
+  [[ -s /etc/privdns-gateway/ca/ca.crt ]] \
+    && ok "iOS: 旧 CA 材料按保留策略未删" || bad "iOS: 旧 CA 被迁移删掉了"
+  grep -q '按保留策略未删' $E2E_TMP/mig3.log && ok "iOS: 迁移点名了盘上仍有 CA 材料" \
+    || bad "iOS: 没提示 CA 残留: $(tail -3 $E2E_TMP/mig3.log)"
+  grep -q '取消对 PrivDNS Gateway' $E2E_TMP/mig3.log \
+    && ok "iOS: 给出了手机端撤销信任的指引(退役不会自动取消已给出的信任)" \
+    || bad "iOS: 缺撤信任提示"
+  # 共享劫持锚点保留且休眠 —— 撤的是 WLOC 专属面, 不是 force_hijack 结构。
+  [[ -e /etc/mosdns/rules/mitm_hijack.txt && ! -s /etc/mosdns/rules/mitm_hijack.txt ]] \
+    && ok "iOS: 共享劫持锚点仍在且为空(休眠, 没被一并删掉)" \
+    || bad "iOS: mitm_hijack.txt 状态不对"
+  cp /etc/sing-box/config.json $E2E_TMP/s2
+  # 二跑同样走公开入口(退役已经做完, 这里验的是它自己幂等)。
+  bash /usr/local/bin/pdg migrate >$E2E_TMP/mig3b.log 2>&1
+  RC3B=$?
+  echo "   [记录] iOS 二-2: 二跑 pdg migrate 退出码 = $RC3B(阶段证据在 mig3b.log)"
+  # 同上: 二跑的真实退出码也自成一条判据。"配置没变、制品没回来"在**根本没执行产品**的时候
+  # 一样成立 —— 那正是它顶替不了退出码的原因。
+  [[ "$RC3B" == 0 ]] \
+    && ok "iOS 二-2: 二跑整体成功(实际退出码 0)" \
+    || bad "iOS 二-2: **二跑没跑成功**(实际退出码 $RC3B) —— 下面的幂等判据即使全绿, 也不算这一次通过: $(tail -3 $E2E_TMP/mig3b.log)"
+  cmp -s $E2E_TMP/s2 /etc/sing-box/config.json && ok "iOS: 二跑幂等" || bad "iOS 二跑改动了 model"
+  # 退役迁移自己也要幂等: 没有残留时二跑不该报错, 也不该把制品弄回来。
+  _again=0
+  for f in /etc/systemd/system/pdg-mitm.service /opt/pdg-bot/mitm_server.py /opt/pdg-bot/mitm_wloc.py; do
+    [[ -e "$f" ]] && _again=1
+  done
+  [[ "$_again" == 0 ]] && ok "iOS: 二跑后退役制品仍然不在(退役迁移幂等)" || bad "iOS: 二跑把退役制品弄回来了"
+fi
 
 # ══ 场景三: 已是新形态 + gfw 模式 → 劫持门必须保留 ═══════════════════════════
 echo; echo "── 场景三: 新形态 + gfw 模式 ──"
