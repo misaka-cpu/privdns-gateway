@@ -211,31 +211,244 @@ done
 [[ "$(systemctl is-active pdg-mitm)" != active ]] \
   && ok "回滚后 pdg-mitm 未在运行" || bad "5i: pdg-mitm 还在跑"
 
-# ══ 6. 反向: iOS 上切 Android 失败, 被清掉的 iOS 组件要放回来 ══════════════
-echo; echo "── 6. iOS→Android 失败: 组件要恢复 ──"
-out=$(pdg platform ios 2>&1); rc=$?
-[[ "$rc" == 0 ]] && ok "先正常切到 iOS(准备现场)" || bad "6: 切 iOS 失败: $(tail -4 <<<"$out")"
-# 比的必须是**真实存在**的 iOS 必需件: 原来这里比的是两个已随退役删除的文件,
-# sha256sum 对不存在的路径报错并输出空, 两侧都是同一个"空哈希", 断言恒真。
-IOS_SHA="$(sha256sum /opt/pdg-bot/mitm_ca.py /opt/pdg-bot/iosprofile.py \
-                     /opt/pdg-bot/iosstate.py /opt/pdg-bot/pdg-dot.mobileconfig.tmpl | sha256sum)"
-cp /usr/local/bin/nft /usr/local/bin/nft.real
-cat > /usr/local/bin/nft <<'S'
+# ══ 6. 反向: iOS 上切 Android 失败 ═════════════════════════════════════════
+# 拆成两档, 区别只有一个 —— **注入的范围**:
+#   甲 只打前向(_switchcore_nft 合并出来的候选 …/merged.conf), 恢复那一路的 nft -c 照常
+#      放行 ⇒ 现场该完整回到 iOS;
+#   乙 前向与恢复校验一起打(所有 -c 都判失败) ⇒ 不许谎报恢复成功, 材料必须留下来。
+# 原来一个桩对**所有** -c 判失败, 两件事被搅在一格里: 恢复到底是"没能恢复"还是"连恢复自己
+# 的校验也被同一发子弹打掉了", 分不出来。
+#
+# 桩顺带记一条调用轨迹, 按**被校验的是哪个文件**归档:
+#   前向 …/merged.conf          恢复 …/tree/etc/nftables.conf 与 …/nft.cand
+# 轨迹只用来把"故障有没有命中目标阶段"**单独结算**: 没到达的阶段记**未执行**,
+# 不拿"整支红了"冒充"注入生效了", 也不拿它替代现场判据。
+echo; echo "── 6. iOS→Android 失败: 按注入范围分两档 ──"
+IOS6=(/opt/pdg-bot/mitm_ca.py /opt/pdg-bot/iosprofile.py /opt/pdg-bot/iosstate.py
+      /opt/pdg-bot/pdg-dot.mobileconfig.tmpl)
+
+plat6_stub(){   # $1=fwd(只打前向) | all(前向与恢复校验一起打)   $2=轨迹落点
+  export PDG_NFT_MODE="$1" PDG_NFT_TRACE="$2"
+  : > "$PDG_NFT_TRACE"
+  cp /usr/local/bin/nft /usr/local/bin/nft.real
+  cat > /usr/local/bin/nft <<'S'
 #!/bin/sh
-[ "$1" = "-c" ] && { echo "Error: 注入的校验失败" >&2; exit 1; }
+printf 'CALL\t%s\n' "$*" >> "$PDG_NFT_TRACE"
+if [ "$1" = "-c" ]; then
+  case "$PDG_NFT_MODE:$3" in
+    all:*)            printf 'FAIL\t%s\n' "$3" >> "$PDG_NFT_TRACE"
+                      echo "Error: 注入的校验失败" >&2; exit 1;;
+    fwd:*merged.conf) printf 'FAIL\t%s\n' "$3" >> "$PDG_NFT_TRACE"
+                      echo "Error: 注入的校验失败" >&2; exit 1;;
+    *)                printf 'PASSC\t%s\n' "$3" >> "$PDG_NFT_TRACE";;
+  esac
+fi
 exec /usr/local/bin/nft.real "$@"
 S
-chmod 755 /usr/local/bin/nft
+  chmod 755 /usr/local/bin/nft
+}
+plat6_unstub(){ cp -f /usr/local/bin/nft.real /usr/local/bin/nft; unset PDG_NFT_MODE PDG_NFT_TRACE; }
+
+# 轨迹是**观察手段**, 它自己会坏在两处: 读不进来, 或者读进来之后数不出来。
+# `grep -c` 的退出码有三种含义, 必须分开: 0=有匹配, 1=**正常的零匹配**, >=2=读取/执行错误。
+# 出错那一档它照样会先打印一个 "0" —— 那个 0 一律不采信, 否则"数不出来"会被读成"没命中"。
+plat6_cnt(){   # $1=具名前缀 $2=正则 $3=文本 → 设 CNT_OUT; 0=有效(含正常零匹配)
+  local tag="$1" re="$2" txt="$3" v rc=0
+  CNT_OUT=0
+  v="$(grep -cE "$re" <<<"$txt")" || rc=$?
+  if (( rc >= 2 )); then
+    bad "$tag **观测无效** —— 轨迹计数失败(grep 退出 $rc), 它已经吐出的「$v」一律不采信"
+    return 1
+  fi
+  if [[ ! "$v" =~ ^[0-9]+$ ]]; then
+    bad "$tag **观测无效** —— 轨迹计数结果不是数字($(printf '%q' "$v"))"
+    return 1
+  fi
+  CNT_OUT="$v"; return 0
+}
+# 设 T_FWD(前向被判失败几次) / T_RECF(恢复校验被判失败几次) / T_RECP(恢复校验被放行几次)。
+plat6_trace(){   # $1=轨迹文件 $2=具名前缀 → 0=可用
+  local f="$1" tag="$2" rd=0 txt
+  T_FWD=0; T_RECF=0; T_RECP=0
+  txt="$(cat "$f")" || rd=$?
+  if (( rd != 0 )); then
+    bad "$tag **观测无效** —— 读 nft 调用轨迹失败(cat 退出 $rd), 它已经吐出的内容一律不采信"
+    return 1
+  fi
+  plat6_cnt "$tag" '^FAIL	.*merged\.conf$'                          "$txt" || return 1
+  T_FWD="$CNT_OUT"
+  plat6_cnt "$tag" '^FAIL	.*(/tree/etc/nftables\.conf|/nft\.cand)$'  "$txt" || return 1
+  T_RECF="$CNT_OUT"
+  plat6_cnt "$tag" '^PASSC	.*(/tree/etc/nftables\.conf|/nft\.cand)$' "$txt" || return 1
+  T_RECP="$CNT_OUT"
+  return 0
+}
+
+# 每一档都自己造一次可核对的前像: 四件 iOS 必需文件必须**真的在盘上且非空**。
+# 原来直接 sha256sum 四个路径就算前像 —— 文件不在时它报错并输出空, 前后两次拿到的是同一个
+# "空哈希", "逐字节放回"那条判据恒真。所以先自检, 不成立就明说后面那条不作数。
+# 四文件指纹。**每一次取指纹都自己检查两件事**: sha256sum 真的成功了, 且四行一个不少。
+# "文件在且非空"不替代"摘要读到了": sha256sum 读不到某一件时会少输出一行并退出非零, 而
+# 外面再套一层 sha256sum 永远成功 —— 于是"少读了一件"被压成一个看着很正常的哈希。
+# 结果经 FP_OUT 回传而不是走 stdout: bad/ok 是往 stdout 打的, 命令替换会把红字一起吞掉。
+plat6_fp(){   # $1=具名前缀 $2=这一次的名字 → 设 FP_OUT; 0=拿到了完整指纹
+  local tag="$1" whose="$2" raw rc=0 good=0 l
+  local -a lines=()
+  FP_OUT=""
+  raw="$(sha256sum "${IOS6[@]}" 2>/dev/null)" || rc=$?
+  if (( rc != 0 )); then
+    bad "$tag **观测无效** —— ${whose}的四文件摘要没读成(sha256sum 退出 $rc), 它已经吐出的几行一律不采信"
+    return 1
+  fi
+  mapfile -t lines <<< "$raw"
+  for l in "${lines[@]}"; do [[ "$l" =~ ^[0-9a-f]{64}\ \  ]] && good=$((good+1)); done
+  if (( good != ${#IOS6[@]} )); then
+    bad "$tag **观测无效** —— ${whose}的摘要集合不完整(拿到 $good 条, 应为 ${#IOS6[@]} 条)"
+    return 1
+  fi
+  FP_OUT="$raw"; return 0
+}
+plat6_seed(){   # $1=具名前缀 → 设 IOS_SHA; 0=前像成立
+  local tag="$1" f miss=() out rc=0
+  out=$(pdg platform ios 2>&1) || rc=$?
+  [[ "$rc" == 0 ]] \
+    && ok "$tag 健康对照: 正常切到 iOS 成功(rc=0), 现场备好" \
+    || { bad "$tag 健康对照: 切 iOS 失败(rc=$rc): $(tail -4 <<<"$out")"; return 1; }
+  IOS_SHA=""
+  for f in "${IOS6[@]}"; do [[ -s "$f" ]] || miss+=("$f"); done
+  if (( ${#miss[@]} != 0 )); then
+    bad "$tag 前像没造出来(缺: ${miss[*]}) —— 「逐字节放回」这条不作数"
+    return 1
+  fi
+  plat6_fp "$tag" 前像 || return 1
+  ok "$tag 前像就位: 四件 iOS 必需文件都在盘上且非空, 四条摘要也都读到了"
+  IOS_SHA="$FP_OUT"
+  return 0
+}
+
+# ── 6 甲: 只打前向, 恢复校验照常可用 → 必须完整恢复 ─────────────────────────
+echo; echo "── 6 甲: 只破坏前向(恢复校验可用) ──"
+A_SEEDOK=1; plat6_seed "6甲:" || A_SEEDOK=0
+plat6_stub fwd "$E2E_TMP/nft-trace-a.log"
 out=$(pdg platform android 2>&1); rc=$?
-cp -f /usr/local/bin/nft.real /usr/local/bin/nft
-[[ "$rc" != 0 ]] && ok "切 Android 失败 → 返回非 0" || bad "6b: 竟然成功了"
+plat6_unstub
+A_TRACE=1; plat6_trace "$E2E_TMP/nft-trace-a.log" "6甲:" || A_TRACE=0
+# ① 故障命中(与产品结论分开记)
+if (( A_TRACE == 1 )); then
+  (( T_FWD >= 1 )) \
+    && ok "6甲-命中: 前向候选(merged.conf)的 nft -c 确实被判失败 $T_FWD 次" \
+    || bad "6甲-命中: 前向根本没被打中(T_FWD=$T_FWD) —— 这一档什么都没验到"
+  # ② 恢复校验有没有被**同一发注入**打掉 —— 这正是甲要排除的。
+  #    恢复阶段根本没被调用到时, "一次都没判失败"是**平凡为真**: 既证不出范围没溢出,
+  #    也证不出恢复可用。这一档要的就是"恢复那一路确实被走到且放行", 所以**必需阶段没到达
+  #    就不能让最终结算成功** —— 记成具名的「场景未执行」进失败结算, 但它**不是**产品恢复失败。
+  if (( T_RECF + T_RECP >= 1 )); then
+    (( T_RECF == 0 )) \
+      && ok "6甲-范围: 恢复那一路的 nft -c 被调用 $T_RECP 次且全部放行 —— 这发注入没有溢出到恢复" \
+      || bad "6甲-范围: 恢复校验也被同一注入判失败 $T_RECF 次 —— 这一档的前提不成立"
+  else
+    bad "6甲-场景未执行: 必需的恢复校验阶段一次都没被调用到(T_RECF=$T_RECF T_RECP=$T_RECP) —— 这一档没跑成, **不是**产品恢复失败"
+  fi
+else
+  bad "6甲-场景未执行: 轨迹观测无效 ⇒ 命中与范围都没有结论(见上面的「观测无效」) —— **不是**产品恢复失败"
+fi
+# ③ 产品退出码
+[[ "$rc" != 0 ]] && ok "6甲-rc: 切 Android 失败 → 返回非 0(rc=$rc)" || bad "6甲-rc: 竟然成功了(rc=$rc)"
+# ④ 现场结果(原 6c–6e 的判据一条不减; 不用日志代替现场)
 [[ "$(cat /etc/privdns-gateway/platform)" == ios ]] \
-  && ok "失败后平台标记回到 ios" || bad "6c: 平台标记停在 $(cat /etc/privdns-gateway/platform)"
-[[ "$(sha256sum /opt/pdg-bot/mitm_ca.py /opt/pdg-bot/iosprofile.py \
-                /opt/pdg-bot/iosstate.py /opt/pdg-bot/pdg-dot.mobileconfig.tmpl | sha256sum)" == "$IOS_SHA" ]] \
-  && ok "被清理的 iOS 组件已逐字节放回" || bad "6d: iOS 组件没恢复"
+  && ok "6甲-现场: 平台标记回到 ios" || bad "6甲-现场: 平台标记停在 $(cat /etc/privdns-gateway/platform)"
+if (( A_SEEDOK == 1 )); then
+  # 先各自确认"这一次的摘要真的读到了、四条一个不少", 再比。读不到 ≠ 内容不一致:
+  # 前者是观测坏了, 后者才是产品没恢复 —— 两件事分开报。
+  if plat6_fp "6甲:" 现场; then
+    [[ "$FP_OUT" == "$IOS_SHA" ]] \
+      && ok "6甲-现场: 被清理的 iOS 组件已逐字节放回(四条摘要逐条相同)" \
+      || bad "6甲-现场: iOS 组件没恢复成原样(四条摘要与前像不一致)"
+  else
+    bad "6甲-场景未执行: 现场摘要没读成 ⇒ 「逐字节放回」没有结论 —— **不是**产品恢复失败"
+  fi
+else
+  bad "6甲-场景未执行: 前像不成立 ⇒ 「逐字节放回」没有结论 —— **不是**产品恢复失败"
+fi
 [[ "$(systemctl is-active pdg-probe81)" == active ]] \
-  && ok "回滚后 pdg-probe81 恢复运行" || bad "6e: probe81 没起回来"
+  && ok "6甲-现场: 回滚后 pdg-probe81 恢复运行" || bad "6甲-现场: probe81 没起回来"
+
+# ── 6 乙: 前向与恢复校验同时被打掉 → 不许谎报恢复成功 ───────────────────────
+# 乙**不替代**甲: 它验的是"恢复自己也坏掉时产品怎么说", 不是"恢复能不能做成"。
+echo; echo "── 6 乙: 前向与恢复校验同时被破坏 ──"
+plat6_seed "6乙:" || true
+plat6_stub all "$E2E_TMP/nft-trace-b.log"
+out=$(pdg platform android 2>&1); rc=$?
+plat6_unstub
+B_TRACE=1; plat6_trace "$E2E_TMP/nft-trace-b.log" "6乙:" || B_TRACE=0
+if (( B_TRACE == 1 )); then
+  (( T_FWD >= 1 )) \
+    && ok "6乙-命中: 前向候选的 nft -c 被判失败 $T_FWD 次" \
+    || bad "6乙-命中: 前向没被打中(T_FWD=$T_FWD)"
+  # 三态要分开: T_RECF=0 既可能是"根本没调用到", 也可能是"调用了但被放行"。
+  # 拿 T_RECF=0 直接解释成"没有调用"会把后者说成前者 —— 那是两种完全不同的现场。
+  if (( T_RECF >= 1 )); then
+    ok "6乙-命中: 恢复校验的 nft -c 也被判失败 $T_RECF 次(这一档的前提成立)"
+  elif (( T_RECP >= 1 )); then
+    bad "6乙-场景未执行: 恢复校验被调用了 $T_RECP 次却**全部放行**(T_RECF=0) —— 这一档的破坏没生效, **不是**产品恢复失败"
+  else
+    bad "6乙-场景未执行: 恢复校验一次都没被调用到(T_RECF=0 T_RECP=0, 恢复在更早的一步就停了) —— **不是**产品恢复失败"
+  fi
+else
+  bad "6乙-场景未执行: 轨迹观测无效 ⇒ 命中没有结论(见上面的「观测无效」) —— **不是**产品恢复失败"
+fi
+[[ "$rc" != 0 ]] && ok "6乙-rc: 返回非 0(rc=$rc)" || bad "6乙-rc: 竟然成功了(rc=$rc)"
+# 先把 ANSI 颜色码去掉再看: 不去的话抓路径会把行尾的 `[0m` 一起抓进来, 于是"盘上没有"
+# 报的是夹具自己造出来的假路径, 与产品无关。
+_outp="$(sed 's/\x1b\[[0-9;]*m//g' <<<"$out")"
+grep -q '恢复未完成' <<<"$_outp" \
+  && ok "6乙-说法: 具名说明本次恢复未完成" || bad "6乙-说法: 没有具名说明恢复未完成: $(tail -4 <<<"$_outp")"
+grep -q '不声称已恢复' <<<"$_outp" \
+  && ok "6乙-说法: 明说不声称已恢复原平台与服务状态" || bad "6乙-说法: 缺「不声称已恢复」"
+grep -q '已恢复到原平台' <<<"$_outp" \
+  && bad "6乙-说法: 恢复没做完却报了「已恢复到原平台」(谎报)" || ok "6乙-说法: 没有谎报恢复成功"
+# 产品声明保留的材料必须**真的在盘上** —— 只打印路径不算数。
+# 但"逐项检查"之前得先确认**这份清单本身是完整枚举出来的**: 原来走的是进程替换,
+# grep 与 sort 的退出码一个都看不见, 于是"枚举先吐一条再失败"留下的半截清单会被当成全部,
+# 检查完还报"都在盘上"。所以枚举落到文件、逐步查码, 再用一次受检读取把它读回来。
+# grep -o 的退出码同样三分: 0=有匹配, 1=**正常的零匹配**, >=2=读取/执行错误。
+_KEPT_RAW="$E2E_TMP/p6-kept.raw"; _KEPT_LST="$E2E_TMP/p6-kept.lst"
+rm -f "$_KEPT_RAW" "$_KEPT_LST"
+_enum_ok=1; _enum_rc=0
+grep -oE '(/tmp/[^ ]+|/var/lib/privdns-gateway/backups/[0-9-]+)' <<<"$_outp" > "$_KEPT_RAW" || _enum_rc=$?
+if (( _enum_rc >= 2 )); then
+  rm -f "$_KEPT_RAW"
+  bad "6乙-场景未执行: 保留材料的路径枚举失败(grep 退出 $_enum_rc), 它已经吐出的半截清单一律不消费 —— **不是**材料真的缺失"
+  _enum_ok=0
+else
+  _sort_rc=0
+  sort -u "$_KEPT_RAW" > "$_KEPT_LST" || _sort_rc=$?
+  if (( _sort_rc != 0 )); then
+    rm -f "$_KEPT_LST"
+    bad "6乙-场景未执行: 保留材料清单排序失败(sort 退出 $_sort_rc), 部分结果不消费 —— **不是**材料真的缺失"
+    _enum_ok=0
+  fi
+fi
+if (( _enum_ok == 1 )); then
+  _rd_rc=0; _kept_txt="$(cat "$_KEPT_LST")" || _rd_rc=$?
+  if (( _rd_rc != 0 )); then
+    bad "6乙-场景未执行: 读保留材料清单失败(cat 退出 $_rd_rc), 已吐出的内容不消费 —— **不是**材料真的缺失"
+  else
+    _kept=0; _keptmiss=(); _keptarr=()
+    [[ -n "$_kept_txt" ]] && mapfile -t _keptarr <<< "$_kept_txt"
+    for _p in ${_keptarr+"${_keptarr[@]}"}; do
+      [[ -n "$_p" ]] || continue
+      _kept=$((_kept+1)); [[ -e "$_p" ]] || _keptmiss+=("$_p")
+    done
+    if (( _kept == 0 )); then
+      bad "6乙-材料: 枚举成功但输出里一个保留材料的路径都没给出(产品没说材料留在哪)"
+    elif (( ${#_keptmiss[@]} == 0 )); then
+      ok "6乙-材料: 枚举完整($_kept 个路径), 逐个核过都确实在盘上"
+    else
+      bad "6乙-材料: 枚举完整($_kept 个), 但声明保留的这些盘上没有: ${_keptmiss[*]}"
+    fi
+  fi
+fi
 
 # ══ 7. Bot 凭据未配置(合法禁用态): 双向切换都必须成功 ═════════════════════
 # bot.env 两项都空 = 这台机器不用 Telegram 管理, pdg-bot 不运行是正常的。以前平台切换的
