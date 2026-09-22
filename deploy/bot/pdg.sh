@@ -2358,6 +2358,50 @@ _pdg_entry_src(){
   printf '%s/%s\n' "$d" "$b"
 }
 
+# 装机唯一放置现役 CLI 的位置。写成常量而不是可覆盖的变量: 这不是开关, 是"哪一种形态
+# 算已安装 CLI"的定义, 一旦可被环境改写就等于给依赖来源开了后门。
+_PDG_INSTALLED_CLI="/usr/local/bin/pdg"
+
+# 这一份 pdg.sh 配套的 lib/ 在哪 —— 只回答"**这段判据自己的依赖**该从哪来", 与
+# "被更新的对象是谁"无关(那永远是 $REPO_DIR)。
+#
+# 两种形态显式分开, 不靠"文件在不在"猜:
+#   · **完整入口副本**: <root>/deploy/bot/pdg.sh, 同一棵树里有 <root>/lib/ 与 <root>/.git
+#     —— 跨版本升级时从这里直接跑新版脚本(docs/BRIDGE-ENTRY.md), 那时现役 CLI 还是旧的;
+#   · **现役已安装 CLI**: /usr/local/bin/pdg —— 装机是单文件 install, 身边没有 lib/,
+#     它配套的库本来就在 $REPO_DIR 里, 行为一个字不变。
+#
+# 身份要核: 副本里的 lib/versions.sh 必须是这棵树**受版本控制且未被改动**的那一份 ——
+# 与 BRIDGE-ENTRY 流程第④–⑦步核过的那个提交同源。核不过就报坏, **不回退**到 $REPO_DIR:
+# "缺了就随便换一份库"正是要消除的隐式兜底。
+#
+# 出口: 0 = 是入口副本, 打印它自己的 libdir / 1 = 是明确支持的已安装 CLI, 照旧用 $REPO_DIR
+#       2 = **来源无法确认**(查询失败 / 答不出绝对路径 / 形态既不是入口副本也不是已安装 CLI),
+#           **或**是入口副本但它的库取不到、身份核不过 —— 两类都归这里, 一律不回退
+_pdg_entry_libdir(){
+  local src d root st rc=0
+  # 来源查询本身失败, 或答不出一个绝对路径("(未知)"就是这一种)⇒ 说不清, 不是"已安装 CLI"。
+  src="$(_pdg_entry_src)" || return 2
+  [[ "$src" == /* ]] || return 2
+  # **只有明确支持的那一种已安装形态**才回退到受管库: 装机把 deploy/bot 下那份脚本
+  # 装成 $_PDG_INSTALLED_CLI(见 cmd_update 里的安装那一步)。其余任何路径都按"说不清"
+  # 处理 —— 不拿"反正不在 deploy/bot 里"当作"那一定是已安装 CLI"。
+  [[ "$src" == "$_PDG_INSTALLED_CLI" ]] && return 1
+  d="$(dirname "$src")"
+  [[ "$(basename "$d")" == bot && "$(basename "$(dirname "$d")")" == deploy ]] || return 2
+  root="$(cd "$d/../.." 2>/dev/null && pwd -P)" || return 2
+  [[ -d "$root/.git" ]] || return 2
+  [[ -f "$root/lib/versions.sh" ]] || return 2
+  command -v git >/dev/null 2>&1 || return 2
+  git -C "$root" ls-files --error-unmatch lib/versions.sh >/dev/null 2>&1 || return 2
+  # **先确认查询成功, 再看输出是不是空**。查询失败时输出同样是空的 —— 拿"空"当"没改过",
+  # 等于在最该拦住的那一格(库被动过、而且连查都查不了)上放行。
+  st="$(git -C "$root" status --porcelain -- lib/versions.sh 2>/dev/null)" || rc=$?
+  (( rc == 0 )) || return 2
+  [[ -z "$st" ]] || return 2
+  printf '%s/lib\n' "$root"
+}
+
 _update_release_relation(){
   local repo="${1:-}" tag="${2:-}" cur tgt rc
   [[ -n "$repo" && -d "$repo/.git" && -n "$tag" ]] || return 1
@@ -2409,8 +2453,21 @@ _update_mosdns_preflight(){
   (
     # 放子 shell: versions.sh 定义的 MOSDNS_VER / PDG_SHA256 不该泄漏进 cmd_update 后面
     # 那些步骤的作用域。
+    # 依赖来源: 跑这段代码的**这一份** pdg.sh 配套的那个 lib。
+    # 一律用 $REPO_DIR 的那份会在跨版本升级时错配: 入口副本是新的、现役受管仓库还是旧的,
+    # 新代码的符号与钉值键在旧库里不存在, 于是预检在一个**与被测二进制无关**的地方失败,
+    # 打出来的原因还是错的(旧库里明明有这个架构的条目)。
+    # **换的只是这段判据自己的依赖**: REPO_DIR 仍指现役受管仓库, 方向判断、pre_sha、快照、
+    # reset、回滚对象一个都不跟着换。
+    local _libdir _lrc=0
+    _libdir="$(_pdg_entry_libdir)" || _lrc=$?
+    case "$_lrc" in
+      0) ;;                                   # 完整入口副本: 用它自己的
+      1) _libdir="$REPO_DIR/lib";;            # 现役已安装 CLI: 照旧
+      *) exit 12;;                            # 来源说不清, 或副本的库不可用/核不过 —— 不回退, 具名拒绝
+    esac
     # shellcheck source=lib/versions.sh
-    source "$REPO_DIR/lib/versions.sh" 2>/dev/null || exit 10
+    source "$_libdir/versions.sh" 2>/dev/null || exit 10
     march=$(dpkg --print-architecture 2>/dev/null); [[ "$march" == arm64 ]] || march=amd64
     # 裁决仍然走生产共用的那一份判据(与 install.sh 的严格短路、doctor 的 check_mosdns_binary
     # 同一个函数)。它自 v1.11.9 起就是"先算摘要、再执行", 不在这里另立一套。
@@ -2463,7 +2520,14 @@ _update_mosdns_preflight(){
         echo "  手工换过内核的机器请先恢复可信内核(重装或 pdg rollback), 例行更新不会替你抹平它。";;
     7)  echo "  $bin **不是普通文件**(目录 / 设备 / 指向异常的链接)";;
     8)  echo "  算不出 $bin 的 SHA256(读不了 / sha256sum 不可用)—— 无从对照, 不在存疑时动手";;
-    10) echo "  读不到 $REPO_DIR/lib/versions.sh —— 无从对照, 不在存疑时动手";;
+    10) echo "  读不到本次判据所用的 lib/versions.sh —— 无从对照, 不在存疑时动手";
+        echo "     (入口副本用它自己那一份; 现役已安装 CLI 用 $REPO_DIR/lib/versions.sh)";;
+    12) echo "  **来源无法确认**, 或入口副本的 lib/versions.sh 不可用 / 身份核不过。";
+        echo "     两类情形都落这里: ① 说不清本进程是从哪一份脚本跑的(来源查询失败, 或那个";
+        echo "     位置既不是完整入口副本、也不是明确支持的已安装 CLI); ② 是入口副本, 但它";
+        echo "     自己那份库取不到, 或不是该副本受版本控制、未被改动的文件。";
+        echo "     **不会**改用 $REPO_DIR 里的那一份来凑合: 依赖与代码必须同源。";
+        echo "     按 docs/BRIDGE-ENTRY.md 取一份干净副本, 从副本里直接运行再试。";;
     11) echo "  本架构($march)在钉值表里没有条目 —— 无从对照, 不在存疑时动手";;
     *)  echo "  判据未通过(rc=$rc)";;
   esac
