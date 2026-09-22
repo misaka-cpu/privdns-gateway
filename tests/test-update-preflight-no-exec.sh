@@ -28,7 +28,20 @@ pass=0; nfail=0
 ok(){  echo "[OK]   $1"; pass=$((pass+1)); }
 bad(){ echo "[FAIL] $1"; nfail=$((nfail+1)); }
 
-sed -n '/^_update_mosdns_preflight(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh" > "$WORK/pre.sh"
+# 预检的依赖来源由 _pdg_entry_libdir 回答(它又用 _pdg_entry_src 与 _PDG_INSTALLED_CLI)。
+# 三样都要抽**产品原文**进来 —— 不给的话它们在这个外壳里要么 command not found、要么
+# unbound, 预检会一律走"来源说不清"那条退出码 12, 每一格都变红, 而红的原因与被测判据无关。
+# **不给产品加"缺函数就放行"的兜底** —— 那是 fail-open。
+grep -m1 '^_PDG_INSTALLED_CLI='             "$ROOT/deploy/bot/pdg.sh" >  "$WORK/pre.sh"
+sed -n '/^_pdg_entry_src(){/,/^}/p'         "$ROOT/deploy/bot/pdg.sh" >> "$WORK/pre.sh"
+sed -n '/^_pdg_entry_libdir(){/,/^}/p'      "$ROOT/deploy/bot/pdg.sh" >> "$WORK/pre.sh"
+sed -n '/^_update_mosdns_preflight(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh" >> "$WORK/pre.sh"
+# 〔模型〕本支验的是**现役已安装 CLI** 那条路径(预检拿受管库的钉值表裁决一个二进制)。
+# 这个外壳的脚本落点不是装机那个路径, 按产品分类就是"说不清" —— 那是对的。
+# 所以显式给一个来源查询替身并如实登记它是模型: 只替换"我是谁"这一问, 分类逻辑与
+# 预检本体仍是产品原文。真实来源分类由 tests/test-update-mosdns-preflight.sh 第九节负责。
+printf '_pdg_entry_src(){ echo "%s"; }\n' \
+  "$(grep -m1 '^_PDG_INSTALLED_CLI=' "$ROOT/deploy/bot/pdg.sh" | cut -d'"' -f2)" >> "$WORK/pre.sh"
 [[ -s "$WORK/pre.sh" ]] || { bad "抽不出 _update_mosdns_preflight"; echo "通过 $pass, 失败 $nfail"; exit 1; }
 
 BIN="$WORK/bin"; mkdir -p "$BIN"

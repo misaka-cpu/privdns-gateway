@@ -43,8 +43,11 @@ if [[ -n "$BASE" && -f "$BASE" ]]; then
   # _pdg_svcstate_plan 只改了"缺前像"那一句提示的措辞(不再一概称旧格式), 语义未变。
   # 顺序随基线文件里的出现顺序(这一段是逐个函数比出来的, 不排序)。
   # _pdg_svcstate_plan 是桥接版**新增**的函数, 归 A2 的允许集合管, 不出现在这里。
-  exp=" cmd_snapshot cmd_rollback cmd_update"
-  [[ "$changed" == "$exp" ]] && ok "A1: 基线里已有的函数只有 cmd_snapshot / cmd_rollback / cmd_update 被改过" \
+  # 本轮**精确**多允许一项: _update_mosdns_preflight 只改了"依赖从哪来"(见
+  # docs/BRIDGE-ENTRY.md 的依赖来源一节), 预检强度、锁、选版、快照与回滚对象都没动。
+  # 其余边界一个字不放宽 —— 多一个 / 少一个 / 无关注释三条区分力对照仍按原样跑。
+  exp=" cmd_snapshot cmd_rollback _update_mosdns_preflight cmd_update"
+  [[ "$changed" == "$exp" ]] && ok "A1: 基线里已有的函数只有 cmd_snapshot / cmd_rollback / cmd_update / _update_mosdns_preflight 被改过" \
     || bad "A1: 被改过的函数是「$changed」, 预期「$exp」"
   # 新增的顶层函数必须**恰好**是下面这份允许集合 —— 判据是精确相等, 不是前缀泛放行,
   # 也不从当前候选自动生成期望(那等于让被测对象自己定义"正确")。
@@ -60,14 +63,17 @@ if [[ -n "$BASE" && -f "$BASE" ]]; then
   # `enable --runtime` 撤不掉持久链接、`disable` 撤不掉运行时链接), 这段逻辑从
   # _pdg_restore_svcstate 里提出来单独成函数, 两条线共用同一份。它不是新能力。
   #
-  # 入口那三个(_update_pin_resolve / _update_pin_still / _pdg_entry_src): 属于 `pdg update
-  # --to <版本tag>` 这个已批准的正式入口 —— 解析并固定钉版目标、每次用前复核 tag 没被挪走、
-  # 如实打印当前进程执行的是哪一份 pdg.sh。它们同样**不是**退役面, 也不推进任何格式。
+  # 入口那一组(_update_pin_resolve / _update_pin_still / _pdg_entry_src / _pdg_entry_libdir):
+  # 属于 `pdg update --to <版本tag>` 这个已批准的正式入口 —— 解析并固定钉版目标、每次用前
+  # 复核 tag 没被挪走、如实打印当前进程执行的是哪一份 pdg.sh、回答这段判据自己的依赖从哪来。
+  # 它们同样**不是**退役面, 也不推进任何格式。
   #
   # 这条边界没有被取消: 集合仍然是逐名精确的, 多一个、少一个都判红(见本节末的区分力自检)。
-  want="_pdg_entry_src _pdg_kernel_converge _pdg_now_ac _pdg_now_en _pdg_restore_svcstate _pdg_save_svcstate _pdg_set_enable_state _pdg_svc_known _pdg_svc_q _pdg_svcstate_plan _pdg_svcstate_units _pdg_svcstate_valid _update_pin_resolve _update_pin_still "
+  # 本轮**精确**多允许一项: _pdg_entry_libdir —— 它只回答"预检自己的依赖从哪来",
+  # 与 _pdg_entry_src 同属入口那一组, 不参与退役、不碰 REPO_DIR、不新增绕过参数。
+  want="_pdg_entry_libdir _pdg_entry_src _pdg_kernel_converge _pdg_now_ac _pdg_now_en _pdg_restore_svcstate _pdg_save_svcstate _pdg_set_enable_state _pdg_svc_known _pdg_svc_q _pdg_svcstate_plan _pdg_svcstate_units _pdg_svcstate_valid _update_pin_resolve _update_pin_still "
   [[ "$newfn" == "$want" ]] \
-    && ok "A2: 新增函数恰好是「前像那一组 + 已批准的三个入口函数」, 没有别的: $newfn" \
+    && ok "A2: 新增函数恰好是「前像那一组 + 已批准的入口那一组」, 没有别的: $newfn" \
     || bad "A2: 新增函数超出范围: $newfn"
 
   # ── A2 的区分力自检: 在**自有副本**上造反例, 不改正式产品 ────────────────────
