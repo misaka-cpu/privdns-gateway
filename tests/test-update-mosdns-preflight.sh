@@ -353,8 +353,15 @@ mkentry(){   # $1=副本根; 造一份完整入口副本(deploy/bot/pdg.sh + 只
   local e="$1"; mkdir -p "$e/deploy/bot"
   cp "$ROOT/deploy/bot/pdg.sh" "$e/deploy/bot/pdg.sh"
   mkvers "$e"
-  ( cd "$e" && git init -q && git add -A >/dev/null 2>&1 \
-    && git -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -qm entry >/dev/null 2>&1 )
+  # 这里建的是**本支自有的新目录**里的一个独立仓库。`git init` 留在守卫之外是有理由的:
+  # e2e_guard_repo 第一句就要求"这个目录已经是 git 仓库", 把 init 塞进去等于要求它先有再建
+  # (扫描器自己也把 init/clone 列为不受限, 见 tests/test-e2e-repo-guard.py 的说明)。
+  # init 之后每一次会动 ref/config 的调用都**显式传目标目录**走 e2e_git —— 守卫与动作绑成
+  # 一件事, 这正是 2026-07-31 丢 56 个 tag 之后立的那道门。提交身份参数原样保留。
+  git -C "$e" init -q || return 1
+  e2e_git "$e" add -A >/dev/null || return 1
+  e2e_git "$e" -c user.email=t@t -c user.name=t -c commit.gpgsign=false \
+          commit -qm entry >/dev/null || return 1
 }
 mkold(){     # $1=受管库根; 造一份**旧**库: 没有 pdg_mosdns_binary_ok, 键名也是旧的
   mkdir -p "$1/lib"
