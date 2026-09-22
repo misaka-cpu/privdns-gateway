@@ -40,9 +40,19 @@ lineno(){ grep -n -- "$2" "$1" | head -1 | cut -d: -f1; }
 
 echo "══ 一. 总入口与派发块的契约 ══"
 if [[ -n "$BASE" && -f "$BASE" ]]; then
-  if diff -q <(fnbody "$BASE" run_all_migrations) <(fnbody "$PDG" run_all_migrations) >/dev/null; then
-    ok "A1: run_all_migrations 与基线逐字节相同(没有在总入口加无条件拒绝)"
-  else bad "A1: run_all_migrations 被改过"; diff <(fnbody "$BASE" run_all_migrations) <(fnbody "$PDG" run_all_migrations) | head -12; fi
+  # A1 **本轮按批准的「有条件提前拒绝」精确更新**(原文: 与基线逐字节相同)。
+  # 改后的契约: run_all_migrations 相对基线**只允许多出这一处有条件前置**, 一行都不许少。
+  # 「无条件拒绝」仍然禁止 —— 下面 A1b 正着钉住它是有条件的。
+  _d="$BOX/a1.diff"; diff <(fnbody "$BASE" run_all_migrations) <(fnbody "$PDG" run_all_migrations) > "$_d"
+  _del="$(grep -c '^<' "$_d" || true)"; _add="$(grep -c '^>' "$_d" || true)"
+  _addok="$(grep '^>' "$_d" | grep -cE '_retire_precheck \|\| return 1|^> *#' || true)"
+  if [[ "${_del:-0}" == 0 && "${_add:-0}" == "${_addok:-0}" && "${_add:-0}" -ge 1 ]] \
+     && grep -q '_retire_precheck || return 1' "$_d"; then
+    ok "A1: run_all_migrations 相对基线**只多**那一处有条件前置(新增 ${_add} 行: 前置调用 + 说明; 删除 0 行)"
+  else
+    bad "A1: run_all_migrations 的改动超出「只多一处有条件前置」(新增 ${_add:-?} / 其中合规 ${_addok:-?} / 删除 ${_del:-?})"
+    head -14 "$_d"
+  fi
   if diff -q <(grep -A3 '^    __migrate)' "$BASE") <(grep -A3 '^    __migrate)' "$PDG") >/dev/null; then
     ok "A2: __migrate 派发块与基线逐字节相同"
   else bad "A2: __migrate 派发块被改过"; fi
@@ -118,10 +128,69 @@ for fn in migrate_wloc_retire migrate_android_cleanup _plat_purge_retired; do
   grep -q '_retire_allowed || return 1' "$(fnfile "$PDG" "$fn")" \
     && ok "C3: $fn 里有拦截点" || bad "C3: $fn 里没有拦截点"
 done
-for fn in run_all_migrations cmd_update cmd_rollback; do
-  grep -q '_retire_allowed' "$(fnfile "$PDG" "$fn")" \
-    && bad "C4: $fn 里也有拦截(会波及与退役无关的路径)" || ok "C4: $fn 里没有拦截"
+# C4 **本轮精确更新**: cmd_update / cmd_rollback 仍然一处都不许有;
+# run_all_migrations 改为"不许有 _retire_allowed 拦截, 只允许那一处**有条件**前置"。
+for fn in cmd_update cmd_rollback; do
+  grep -qE '_retire_allowed|_retire_precheck' "$(fnfile "$PDG" "$fn")" \
+    && bad "C4: $fn 里也有门(会波及与退役无关的路径)" || ok "C4: $fn 里没有门"
 done
+_ram="$(fnfile "$PDG" run_all_migrations)"
+grep -q '_retire_allowed' "$_ram" \
+  && bad "C4: run_all_migrations 里出现了 _retire_allowed 拦截(那是无条件的口径)" \
+  || ok "C4: run_all_migrations 里没有 _retire_allowed 拦截"
+_np="$(grep -c '_retire_precheck || return 1' "$_ram" || true)"
+[[ "${_np:-0}" == 1 ]] && ok "C5: run_all_migrations 里有且只有 1 处有条件前置" \
+                       || bad "C5: 有条件前置有 ${_np:-0} 处(期望 1)"
+_first="$(grep -nE '^[[:space:]]*[a-z_]+' "$_ram" | grep -vE 'run_all_migrations\(\)|local rc=0' | head -1)"
+grep -q '_retire_precheck' <<<"$_first" \
+  && ok "C6: 前置是链子里**第一句可执行语句**(排在 migrate_* 全部之前): $(sed 's/^ *//' <<<"${_first#*:}")" \
+  || bad "C6: 前置不是第一句, 第一句是: $_first"
+_pc="$(fnfile "$PDG" _retire_precheck)"
+# 前置是**有条件**的, 并且条件是三态里的"**确认**没有"那一态 —— 不是"非 0 就放行"。
+awk '/_retire_work_pending; w=\$\?/{f=1} f&&/1\) return 0;;/{print; exit}' "$_pc" | grep -q 'return 0' \
+  && ok "A1b: 前置有条件放行, 且只在「**确认**没有退役工作」(w==1)那一态放行" \
+  || bad "A1b: 前置里找不到「只在确认没有时放行」那一句"
+grep -qE '\*\) *kind=.*无法确认' "$_pc" \
+  && ok "C13: 「无法确认」单列一态, 与「确有待办」分开说, 且**不**走放行" \
+  || bad "C13: 无法确认没有单列"
+# 三态必须真的是三态: 只读查询要能返回 2
+for fn in _retire_work_pending _retire_core_has_mitm _retire_has_irreversible_work; do
+  grep -q 'return 2' "$(fnfile "$PDG" "$fn")" \
+    && ok "C14: $fn 有「无法确认」这一态(return 2)" || bad "C14: $fn 还是两态"
+done
+# 观测失败不能被读成一种状态: 运行态要退出码与状态词成对判
+grep -q 'srv_rc' "$(fnfile "$PDG" _retire_work_pending)" \
+  && ok "C15: 运行态查询把**退出码**单独留下来判(不是只看输出那半截)" \
+  || bad "C15: 运行态查询仍然丢掉了退出码"
+# 只读必须包含传递调用: schema 那一维不许生成字节码
+_ir="$(fnfile "$PDG" _retire_has_irreversible_work)"
+{ grep -q 'python3 -B' "$_ir" && grep -q 'PYTHONDONTWRITEBYTECODE=1' "$_ir"; } \
+  && ok "C16: schema 查询走 -B + PYTHONDONTWRITEBYTECODE(不在现场留 __pycache__)" \
+  || bad "C16: schema 查询仍可能写出字节码"
+# 覆盖面与后续保护点对齐: 按 migrate_android_cleanup 自己的条件问它自己的判据
+_wp2="$(fnfile "$PDG" _retire_work_pending)"
+{ grep -q '_retire_android_pending' "$_wp2" && grep -q '_pdg_platform' "$_wp2" \
+  && grep -q 'platform.guessed' "$_wp2"; } \
+  && ok "C17: 扫描器按 migrate_android_cleanup 的**适用条件**(平台确凿是 android)问它自己的判据" \
+  || bad "C17: 扫描器与 Android 那一支的范围没对齐"
+grep -q '_retire_allowed && return 0' "$_pc" \
+  && ok "C7: 能力判定**复用** _retire_allowed(没有另立一套判据)" \
+  || bad "C7: 前置没有复用 _retire_allowed"
+grep -qE 'PDG_UPDATE_SVCSTATE|holder_pid|boot_id|flock' "$_pc" \
+  && bad "C8: 前置里自己动手判句柄/持锁 —— 那是另立一套, 会绕开 _retire_caller_gate" \
+  || ok "C8: 前置不自己判句柄/快照绑定/持锁, 一律交给 _retire_caller_gate"
+# 只读: 扫描器不许写盘、不许调 systemctl 的写动作
+_wp="$(fnfile "$PDG" _retire_work_pending)"
+grep -qE 'systemctl (start|stop|enable|disable|restart|daemon-reload)|rm -|mv |install -|> *"\$' "$_wp" \
+  && bad "C9: 只读扫描器里出现了写动作" || ok "C9: 只读扫描器没有任何写动作"
+grep -q '_retire_has_irreversible_work' "$_wp" \
+  && ok "C10: 「什么算退役工作」仍由既有的 _retire_has_irreversible_work 裁决(不另立定义)" \
+  || bad "C10: 扫描器没有复用既有的退役工作定义"
+# 措辞: 只能承诺迁移链没动手, 不能宣称整个 update 零写入
+grep -q '迁移链动第一样东西' "$_pc" && ok "C11: 拒绝文案承诺的是「迁移链」未动手" || bad "C11: 文案没说清范围"
+grep -qE '取件、切版本与装文件' "$_pc" \
+  && ok "C12: 文案明确把取件/切版本/装文件排除在外(不宣称整次 update 零写入)" \
+  || bad "C12: 文案没有把此前已发生的写入排除在外"
 
 echo
 echo "══ 三之二. 拦截点排在各自的第一个不可逆动作之前 ══"
@@ -233,20 +302,40 @@ echo
 echo "══ 八. 三个调用方各自的失败善后责任(行为) ══"
 # 把**真的** run_all_migrations 拿出来跑: 其余 migrate_* 一律打桩返回 0, 只让
 # migrate_wloc_retire 按门的判定返回。验的是"门拒绝了之后, 这条失败到底传不传得出去"。
-runall(){ # $1 = migrate_wloc_retire 的返回码
-  local d="$BOX/runall-$1"; mkdir -p "$d"
+# $2 是本轮新增的那一处有条件前置的返回码。这里把它打桩, 是因为 H1/H2 验的是
+# **失败传播**(门拒了传不传得出去), 不是前置本身; 前置自己的判定由
+# tests/test-migrate-caller-gate.sh 第十五/十六节用产品原文驱动。
+# 打桩必须显式写出来 —— 不定义它的话 `_retire_precheck || return 1` 会 127, 于是每一格
+# 都返回 1, H2 那条反向对照就永远"成立", 等于没验。
+runall(){ # $1 = migrate_wloc_retire 的返回码  $2 = _retire_precheck 的返回码
+  local d="$BOX/runall-$1-$2"; mkdir -p "$d"; : > "$d/calls.log"
   { echo 'set -uo pipefail'
+    echo "CALLS=\"$d/calls.log\""
     echo 'for f in $(grep -oE "migrate_[a-z0-9_]+" "'"$PDG"'" | sort -u); do'
-    echo '  eval "$f(){ return 0; }"'
+    echo '  eval "$f(){ echo \"$f\" >> \"$CALLS\"; return 0; }"'
     echo 'done'
-    echo "migrate_wloc_retire(){ return $1; }"
+    echo "migrate_wloc_retire(){ echo migrate_wloc_retire >> \"\$CALLS\"; return $1; }"
+    echo "_retire_precheck(){ return $2; }"
     sed -n "/^run_all_migrations(){/,/^}/p" "$PDG"
     echo 'run_all_migrations; echo "RC=$?"'
   } > "$d/run.sh"
-  bash "$d/run.sh" 2>&1 | tail -1
+  RUNALL_OUT="$(bash "$d/run.sh" 2>&1 | tail -1)"
+  local _n _rc=0
+  _n="$(wc -l < "$d/calls.log")" || _rc=$?
+  (( _rc == 0 )) && RUNALL_N="${_n//[[:space:]]/}" || RUNALL_N=ERR
 }
-[[ "$(runall 1)" == "RC=1" ]] && ok "H1: 门拒绝 → migrate_wloc_retire 返回 1 → run_all_migrations 返回非 0(半截现场不会被吞成成功)" || bad "H1: 实得 $(runall 1)"
-[[ "$(runall 0)" == "RC=0" ]] && ok "H2: 反向对照 —— 只有这一格返回 0 时整体就是 0(H1 不是别的迁移造成的)" || bad "H2: 实得 $(runall 0)"
+RUNALL_N=0; RUNALL_OUT=""
+runall 1 0; [[ "$RUNALL_OUT" == "RC=1" ]] && ok "H1: 门拒绝 → migrate_wloc_retire 返回 1 → run_all_migrations 返回非 0(半截现场不会被吞成成功)" || bad "H1: 实得 $RUNALL_OUT"
+runall 0 0; _r="$RUNALL_OUT"
+[[ "$_r" == "RC=0" ]] && ok "H2: 反向对照 —— 只有这一格返回 0 时整体就是 0(H1 不是别的迁移造成的)" || bad "H2: 实得 $_r"
+_n_ok="$RUNALL_N"
+runall 0 1; _r2="$RUNALL_OUT"
+[[ "$_r2" == "RC=1" ]] \
+  && ok "H2b: 有条件前置拒绝 ⇒ run_all_migrations 直接返回非 0(不靠后面任何一个迁移)" \
+  || bad "H2b: 前置拒了却返回 $_r2"
+[[ "${RUNALL_N:-0}" == 0 && "${_n_ok:-0}" -gt 0 ]] \
+  && ok "H2c: 前置拒绝时**一个 migrate_* 都没被调用**(健康那一格调了 $_n_ok 个作对照)" \
+  || bad "H2c: 前置拒了仍调了 ${RUNALL_N:-?} 个迁移(健康对照 ${_n_ok:-?} 个)"
 grep -q 'run_all_migrations || true' "$(fnfile "$PDG" cmd_platform)" \
   && ok "H3: cmd_platform 仍是 \`run_all_migrations || true\` —— 退役被拒不会让平台切换失败(那一步顺延到下次 update/migrate)" \
   || bad "H3: cmd_platform 的失败善后被改了"

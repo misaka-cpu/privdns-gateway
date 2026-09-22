@@ -468,6 +468,198 @@ else
     || ok "K3: 加回「拿现状比前像」之后, 一次**合法完整调用**被误拒 —— J3 确实由去掉这条保住"
 fi
 
+
+echo
+echo "══ 十五. 只读扫描器: 这台机器上到底有没有退役工作 ══"
+# 判据来源必须是**既有定义** —— 扫描器把五个 need_* 现场扫一遍, 裁决交给
+# _retire_has_irreversible_work(它自己还管 iOS 记录格式那一维)。这里逐面摆场景验它。
+# $3 形如 "词/码": 状态词与退出码**分开给**, 这样才摆得出"答了词却以别的码收场"。
+# gone = systemctl 整个问不出来。$4 = 平台(默认 ios, 走不到 Android 清理那一支)。
+wp(){   # $1=场景名 $2=摆场景片段(在场景根下执行) $3=is-active 的「词/码」 $4=平台
+  local d="$BOX/wp-$1" ans="${3:-inactive/3}" plat="${4:-ios}"
+  mkdir -p "$d/etc/privdns-gateway" "$d/opt/pdg-bot" "$d/etc/systemd/system" \
+           "$d/etc/mosdns/rules" "$d/etc/mihomo"
+  printf 'SCHEMA = 2\n' > "$d/opt/pdg-bot/iosstate.py"
+  printf '%s\n' "$plat" > "$d/etc/privdns-gateway/platform"
+  ( cd "$d" && eval "${2:-:}" )
+  { echo 'set -uo pipefail'
+    echo '_RETIRE_WHY=""'
+    echo "_pdg_platform(){ cat \"$d/etc/privdns-gateway/platform\" 2>/dev/null || echo android; }"
+    echo "PDG_PLATFORM_FILE=\"$d/etc/privdns-gateway/platform\""
+    if [[ "$ans" == gone ]]; then echo 'systemctl(){ return 127; }'
+    else echo "systemctl(){ [ \"\$1\" = is-active ] && { echo ${ans%%/*}; return ${ans##*/}; }; return 0; }"; fi
+    _fnN "$PDG" _retire_core_has_mitm
+    _fnN "$PDG" _retire_android_pending
+    _fnN "$PDG" _retire_has_irreversible_work
+    _fnN "$PDG" _retire_work_pending
+    echo "PDG_RETIRE_ROOT=\"$d\" _retire_work_pending"
+    echo 'echo "WORK=$?  WHY=$_RETIRE_WHY"'
+  } > "$d/run.sh"
+  bash "$d/run.sh" 2>&1 | tail -1
+}
+_w(){ grep -q "WORK=$2" <<<"$3" && ok "$1 —— $(sed 's/.*WHY=//' <<<"$3")" || bad "$1: 实得 $3"; }
+_w "W1: 盘上还有 pdg-mitm.service ⇒ 有活"            0 "$(wp W1 'touch etc/systemd/system/pdg-mitm.service')"
+_w "W2: 劫持表非空 ⇒ 有活"                           0 "$(wp W2 'echo full:gs-loc.apple.com > etc/mosdns/rules/mitm_hijack.txt')"
+_w "W3: mitm.json 还开着 ⇒ 有活"                     0 "$(wp W3 'printf "{\"enabled\": true}" > etc/privdns-gateway/mitm.json')"
+_w "W4: 内核配置里还留着 MITM 出站 ⇒ 有活"           0 "$(wp W4 'printf "proxies:\n  - MITM-OUT\n" > etc/mihomo/config.yaml')"
+_w "W5: 执行件还在 /opt ⇒ 有活"                      0 "$(wp W5 'touch opt/pdg-bot/mitm_wloc.py')"
+_w "W6: pdg-mitm 还在跑 ⇒ 有活"                      0 "$(wp W6 '' active/0)"
+_w "W7: iOS 记录还停在旧 schema ⇒ 有活(记录格式那一维)" 0 "$(wp W7 'printf "{\"schema\": 1}" > etc/privdns-gateway/ios-profile.json')"
+_w "W8: 全干净、没有 iOS 记录 ⇒ **没有**活(新装机不被误拒)" 1 "$(wp W8 '')"
+_w "W9: 已退役幂等(记录已是新 schema)⇒ **没有**活"   1 "$(wp W9 'printf "{\"schema\": 2}" > etc/privdns-gateway/ios-profile.json')"
+_w "W10: 运行态整个问不出来 ⇒ **无法确认**(不冒充没有退役工作)" 2 "$(wp W10 '' gone)"
+
+# ── 观测失败三条: 答了一半再失败, 一律落「无法确认」, 不许混进「确认没有」 ──
+_wwhy(){ # $1=名 $2=期望码 $3=输出 $4=理由关键字
+  if grep -q "WORK=$2" <<<"$3" && grep -q "$4" <<<"$3"; then ok "$1 —— $(sed 's/.*WHY=//' <<<"$3")"
+  else bad "$1: 实得 $3"; fi
+}
+_wwhy "N1: is-active 答了 inactive 却以 7 收场 ⇒ 无法确认(保留原始退出码 7)" 2       "$(wp N1 '' inactive/7)" '退出码 7'
+_wwhy "N2: iOS 记录解析失败 ⇒ 无法确认(保留 python 退出码)" 2       "$(wp N2 'printf "{ not json" > etc/privdns-gateway/ios-profile.json')" 'iOS 记录读不出来'
+_wwhy "N3: MITM-OUT 配置查询出错(rc=2) ⇒ 无法确认" 2       "$(wp N3 'mkdir -p etc/mihomo/config.yaml')" '核心配置查不出来'
+_w "N0: 同一套现场但三项观测都正常 ⇒ **确认**没有活(三条反例不是靠恒红取胜)" 1 "$(wp N0 '')"
+
+# ── 与后续保护点的适用范围对齐 ──────────────────────────────────────────────
+o="$(wp W11 'touch opt/pdg-bot/iosprofile.py' inactive/3 android)"
+_wwhy "W11: Android 现场只剩 iosprofile.py ⇒ 有活(与 migrate_android_cleanup 用的同一个判据)" 0       "$o" '_retire_android_pending'
+_w "W12: 同样只剩 iosprofile.py, 但平台是 iOS ⇒ 不走 Android 那一支(不无条件合并各平台文件集)" 1    "$(wp W12 'touch opt/pdg-bot/iosprofile.py' inactive/3 ios)"
+# 只读必须包含**传递调用**: W7 那一格真的跑过 `import iosstate`(schema 那一维), 所以拿它
+# 的场景目录看有没有留下 __pycache__/.pyc —— 查的是**目录前后的实际差异**, 不是源码里
+# 有没有写 -B。
+find "$BOX/wp-W7" \( -name '__pycache__' -o -name '*.pyc' \) 2>/dev/null > "$BOX/pyc.txt"
+[[ ! -s "$BOX/pyc.txt" ]] \
+  && ok "W13: 只读判定跑完(含 import iosstate 那一步), 场景目录里**没有** __pycache__/.pyc" \
+  || { bad "W13: 只读判定留下了现场产物"; sed 's/^/      /' "$BOX/pyc.txt"; }
+
+echo
+echo "══ 十六. 有条件前置: 拒在迁移链动第一样东西之前 ══"
+# 这一节跑**产品原文的 run_all_migrations**。除 migrate_rescue_plane 之外的 migrate_* 一律
+# 打桩返回 0; migrate_rescue_plane 的桩做一件事 —— 把 socket unit 落到场景根上, 用它当
+# "迁移链已经产生持久化副作用"的实物证据。门与扫描器都是产品原文。
+chain(){   # $1=场景名 $2=句柄 real|none $3=前置 keep|drop|ia0keep
+           #   ia0keep = 保留前置, 但把产品里那个 inactive/0 例外**加回去**(单处撤销对照)
+  local name="$1" hmode="$2" keep="$3"
+  local d="$BOX/ch-$name"
+  mkdir -p "$d/etc/privdns-gateway" "$d/opt/pdg-bot" "$d/etc/systemd/system" \
+           "$d/etc/mosdns/rules" "$d/etc/mihomo" "$d/snap" "$d/sc"
+  printf 'SCHEMA = 2\n' > "$d/opt/pdg-bot/iosstate.py"
+  seed_units "$d/sc"
+  if [[ "$name" == *nowork* ]]; then
+    # 真正"没有退役工作"的机器: 盘上没有退役件, pdg-mitm 也**明确**不在跑。
+    # seed_units 造的是"开着 WLOC 的 iOS 机器"(pdg-mitm=active), 那一格本来就有活要干。
+    echo inactive > "$d/sc/pdg-mitm.ac"; echo dead > "$d/sc/pdg-mitm.sub"; rm -f "$d/sc/pdg-mitm.inv"
+  elif [[ "$name" == *ia0* ]]; then
+    # 盘上没有任何退役材料; 唯一的异常就是 is-active 答了 inactive 却以 0 收场。
+    echo inactive > "$d/sc/pdg-mitm.ac"; echo dead > "$d/sc/pdg-mitm.sub"; rm -f "$d/sc/pdg-mitm.inv"
+  elif [[ "$name" == *unsure* ]]; then
+    # 没有任何退役材料, 但内核配置查不出来(是目录, 不是普通文件)⇒ 观测存疑
+    echo inactive > "$d/sc/pdg-mitm.ac"; echo dead > "$d/sc/pdg-mitm.sub"; rm -f "$d/sc/pdg-mitm.inv"
+    mkdir -p "$d/etc/mihomo/config.yaml"
+  else
+    touch "$d/etc/systemd/system/pdg-mitm.service"   # 退役材料
+  fi
+  { echo 'set -uo pipefail'
+    echo "SC_DIR=\"$d/sc\"; SC_LOG=\"$d/sc.log\"; : > \"\$SC_LOG\"; LOCK=\"$d/lock\""
+    echo "CALLS=\"$d/calls.log\"; : > \"\$CALLS\""
+    echo "$STUB"
+    # 只给 pdg-mitm 换一张嘴: 状态词 inactive, 退出码 0(真 systemd 不会这么答)。
+    # 其余 unit 仍走上面那份共享桩, 免得连带影响 _pdg_save_svcstate 的采样。
+    if [[ "$name" == *ia0* ]]; then
+      echo 'eval "_sc_orig() $(declare -f systemctl | tail -n +2)"'
+      echo 'systemctl(){ if [ "$1" = is-active ] && [ "${*: -1}" = pdg-mitm ]; then echo inactive; return 0; fi; _sc_orig "$@"; }'
+    fi
+    _fn1 "$PDG" c_g; _fn1 "$PDG" c_y; _fn1 "$PDG" c_r
+    echo "_pdg_module(){ printf '%s\n' \"$ROOT/deploy/bot/\$1\"; }"
+    _fnN "$PDG" _pdg_lock_proof
+    _fnN "$PDG" _pdg_svcstate_units; _fnN "$PDG" _pdg_svc_known; _fnN "$PDG" _pdg_svc_q
+    _fnN "$PDG" _pdg_svcstate_valid; _fnN "$PDG" _pdg_save_svcstate
+    echo '_PDG_RETIRE_OK=""; _PDG_RETIRE_DONE=0; _RETIRE_WHY=""'
+    _fnN "$PDG" _retire_caller_gate; _fnN "$PDG" _retire_allowed
+    _fnN "$PDG" _retire_rerun_hint
+    _fnN "$PDG" _retire_core_has_mitm; _fnN "$PDG" _retire_has_irreversible_work
+    if [[ "$keep" == ia0keep ]]; then
+      # 单处撤销: 只把 `inactive/3|failed/3` 改回 `inactive/3|failed/3|inactive/0`,
+      # 其余一个字不动 —— 用来证明同一输入会重新被放行。
+      _fnN "$PDG" _retire_work_pending | sed 's#inactive/3|failed/3)#inactive/3|failed/3|inactive/0)#'
+    else
+      _fnN "$PDG" _retire_work_pending
+    fi
+    _fnN "$PDG" _retire_precheck
+    echo 'for f in $(grep -oE "migrate_[a-z0-9_]+" "'"$PDG"'" | sort -u); do'
+    echo '  eval "$f(){ echo \"$f\" >> \"$CALLS\"; return 0; }"'
+    echo 'done'
+    echo "migrate_rescue_plane(){ echo migrate_rescue_plane >> \"\$CALLS\"; : > \"$d/etc/systemd/system/pdg-rescue.socket\"; return 0; }"
+    # 退役那一支不全打桩: 保留它**真实的第一道拦截**(`_retire_allowed || return 1`),
+    # 否则撤销对照量不到"把门搬早之后后面的保护还在不在"。
+    # 形状照抄真函数: **有活才问能力**(真函数的只读段算出 need_* 全 0 时根本不问门),
+    # 否则干净机器上这一支会凭空返回 1, 把"没有退役工作也不误拒"那一格量成红的。
+    echo "migrate_wloc_retire(){ echo migrate_wloc_retire >> \"\$CALLS\"; _retire_work_pending || return 0; _retire_allowed || return 1; return 0; }"
+    if [[ "$keep" == keep ]]; then sed -n "/^run_all_migrations(){/,/^}/p" "$PDG"
+    else sed -n "/^run_all_migrations(){/,/^}/p" "$PDG" | grep -v '_retire_precheck || return 1'; fi
+    echo "exec 9>\"$d/lock\"; flock -n 9 || { echo LOCK_FAILED; exit 1; }"
+    echo "printf 'snapshot-bytes' > \"$d/snap/snap.tar.gz\""
+    echo "_pdg_save_svcstate \"$d/snap\" >/dev/null || { echo SAVE_FAILED; exit 1; }"
+    [[ "$hmode" == real ]] && echo "export PDG_UPDATE_SVCSTATE=\"$d/snap/svcstate.tsv\""
+    echo "PDG_RETIRE_ROOT=\"$d\" run_all_migrations; echo \"CHAIN_RC=\$?\""
+    echo "echo \"RESCUE_CALLED=\$(grep -c migrate_rescue_plane \"\$CALLS\" || true)\""
+    echo "[ -e \"$d/etc/systemd/system/pdg-rescue.socket\" ] && echo SOCKET=yes || echo SOCKET=no"
+  } > "$d/run.sh"
+  bash "$d/run.sh" 2>&1
+}
+o="$(chain refuse none keep)"; op="$(plain "$o")"
+grep -q 'CHAIN_RC=1'     <<<"$op" && ok "L1: 有退役工作 + 调用方拿不出能力 ⇒ 迁移链返回非 0" || bad "L1: $(grep CHAIN_RC <<<"$op")"
+grep -q 'RESCUE_CALLED=0'<<<"$op" && ok "L1: 救援迁移**一次都没被调用**" || bad "L1: 救援迁移仍被调用"
+grep -q 'SOCKET=no'      <<<"$op" && ok "L1: 原本不存在的 pdg-rescue.socket **没有**被生成" || bad "L1: socket 还是落盘了"
+grep -q '不执行迁移' <<<"$op" && ok "L1: 拒绝具名(点名本次不执行迁移)" || bad "L1: 没有具名拒绝"
+grep -q '迁移链动第一样东西' <<<"$op" && ok "L1: 只承诺「迁移链」未动手" || bad "L1: 承诺范围不清"
+grep -q '取件、切版本与装文件' <<<"$op" \
+  && ok "L1: 明确把此前的取件/切版本/装文件排除在外(不宣称整次 update 零写入)" || bad "L1: 措辞越界"
+
+# 观测存疑那一格: 没有待办材料, 但有一项查不出来 —— 也必须走同一条拒绝路径
+o="$(chain unsure none keep)"; op="$(plain "$o")"
+grep -q 'CHAIN_RC=1'      <<<"$op" && ok "L4: **观测存疑** + 无句柄 ⇒ 迁移链同样返回非 0(不当成没有待办放行)" || bad "L4: $(grep CHAIN_RC <<<"$op")"
+grep -q 'RESCUE_CALLED=0' <<<"$op" && ok "L4: 救援迁移调用数 0" || bad "L4: 救援迁移仍被调用"
+grep -q 'SOCKET=no'       <<<"$op" && ok "L4: socket 未生成" || bad "L4: socket 落盘了"
+grep -q '无法确认' <<<"$op" && ok "L4: 拒绝文案点名是**无法确认**, 与「确有待办」分开说" || bad "L4: 没区分两种理由"
+
+o="$(chain nowork none keep)"; op="$(plain "$o")"
+grep -q 'CHAIN_RC=0'      <<<"$op" && ok "L2: 没有退役工作时, 旧调用方**不被误拒**" || bad "L2: $(grep CHAIN_RC <<<"$op")"
+grep -q 'RESCUE_CALLED=1' <<<"$op" && ok "L2: 且迁移链照常走(救援迁移被调用)" || bad "L2: 迁移链被挡住了"
+
+o="$(chain legit real keep)"; op="$(plain "$o")"
+grep -q 'CHAIN_RC=0'      <<<"$op" && ok "L3: 有退役工作但调用方合法(真锁 + 本次句柄 + 快照绑定)⇒ 正常继续" || bad "L3: 合法调用被拦 —— $(why "$o")"
+grep -q 'RESCUE_CALLED=1' <<<"$op" && ok "L3: 迁移链照常执行" || bad "L3: 迁移链没跑"
+
+# ── inactive/0: 状态词与退出码不成对, 不是一种"没在跑"的状态 ──────────────
+_w "P1: is-active 答 inactive 却 return 0 ⇒ 扫描器判**无法确认**(不是确认没有)" 2 "$(wp P1 '' inactive/0)"
+_w "P1b: 健康对照 inactive/3 仍判**确认没有**" 1 "$(wp P1b '' inactive/3)"
+_w "P1c: 健康对照 failed/3 仍判**确认没有**"   1 "$(wp P1c '' failed/3)"
+o="$(chain ia0 none keep)"; op="$(plain "$o")"
+grep -q 'CHAIN_RC=1'      <<<"$op" && ok "P2: 同一现场驱动**真实迁移链** ⇒ 返回非 0" || bad "P2: $(grep CHAIN_RC <<<"$op")"
+grep -q 'RESCUE_CALLED=0' <<<"$op" && ok "P2: 救援迁移调用数 0" || bad "P2: 救援迁移仍被调用"
+grep -q 'SOCKET=no'       <<<"$op" && ok "P2: 救援 socket 未生成" || bad "P2: socket 落盘了"
+grep -q '无法确认' <<<"$op" && ok "P2: 拒绝理由归入「无法确认」" || bad "P2: 理由没归对"
+
+echo
+echo "══ 十七. 撤销对照: 只撤掉这一处前置, 同一反例重新到达救援副作用 ══"
+o="$(chain refuse-drop none drop)"; op="$(plain "$o")"; op2="$op"
+if grep -q 'RESCUE_CALLED=1' <<<"$op" && grep -q 'SOCKET=yes' <<<"$op"; then
+  ok "M1: 撤掉 \`_retire_precheck || return 1\` 之后, **同一个**反例重新跑到救援迁移并落下 socket —— L1 那三条确实由这一处保住"
+else
+  bad "M1: 撤销对照没体现差异($(grep -E 'RESCUE_CALLED|SOCKET' <<<"$op" | tr '\n' ' '))"
+fi
+o="$(chain ia0-drop none ia0keep)"; op="$(plain "$o")"
+if grep -q 'CHAIN_RC=0' <<<"$op" && grep -q 'SOCKET=yes' <<<"$op"; then
+  ok "M3: **单处**把 inactive/0 例外加回去(其余一字不动), 同一输入重新被放行 —— 链子跑完并落下 socket"
+else
+  bad "M3: 撤销对照没体现差异($(grep -E 'CHAIN_RC|RESCUE_CALLED|SOCKET' <<<"$op" | tr '\n' ' '))"
+fi
+
+grep -q 'CHAIN_RC=1' <<<"$op2" \
+  && ok "M2: 撤销之后链子仍以非 0 收场(退役那一步照旧被三个拦截点挡住)—— 差别只在**副作用有没有发生**" \
+  || bad "M2: 撤销之后链子返回 0, 说明后面的拦截点被动过"
+
+
 echo "────────────────────────────────────────"
 echo "通过 $pass, 失败 $nfail"
 [[ "$nfail" == 0 ]]

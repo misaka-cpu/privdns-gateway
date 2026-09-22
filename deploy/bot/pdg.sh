@@ -4462,10 +4462,15 @@ _retire_svc_stopped(){
 # **不拿劫持表当判据**: 一台机器可能劫持表早就空了(被手工清过、或上一次迁移清到一半),
 # 而 mihomo 配置里那条 MITM-OUT 还在。按"表空就不用管内核"处置的话, 那条指向 7894 的路由
 # 永远撤不掉, 而迁移每次都报成功。两样东西, 各查各的。
+# 0 = 内核里还留着 MITM 出站 / 1 = **确认**没有 / 2 = **查不出来**
+# 原来只有两态: 不是普通文件、读不了、grep 自己出错(rc>=2)统统落到"没有" —— 那是把观测
+# 失败读成了一种状态。三态之后调用方才有机会把"查不出来"按有活处理。
 _retire_core_has_mitm(){
-  local mc="${PDG_RETIRE_ROOT:-}${PDG_MIHOMO_CFG:-/etc/mihomo/config.yaml}"
-  [[ -f "$mc" ]] || return 1
-  grep -q 'MITM-OUT' "$mc"
+  local mc="${PDG_RETIRE_ROOT:-}${PDG_MIHOMO_CFG:-/etc/mihomo/config.yaml}" rc=0
+  [[ -e "$mc" ]] || return 1              # 压根没有这份配置 = 确认没有
+  [[ -f "$mc" && -r "$mc" ]] || return 2  # 在那儿但不是普通文件 / 读不了 = 查不出来
+  grep -q 'MITM-OUT' "$mc"; rc=$?
+  case "$rc" in 0) return 0;; 1) return 1;; *) return 2;; esac
 }
 
 
@@ -4512,6 +4517,87 @@ _retire_allowed(){
     c_y "   (本次运行已判定过: 调用方不具备可靠回滚能力 —— 这一步同样不执行)"
   fi
   [[ "$_PDG_RETIRE_OK" == 1 ]]
+}
+
+# 这一次判出"有退役工作"时, 依据是什么 —— 只用于把拒绝说清楚, 不参与任何判定。
+_RETIRE_WHY=""
+
+# 这台机器上还有没有**退役类**的活 —— 纯只读: 不写盘、不调 systemctl 的写动作、
+# 不留任何现场产物(schema 那一维经 -B / PYTHONDONTWRITEBYTECODE, 不生成 __pycache__)。
+#
+# 三态, 不是两态:
+#   0 = 有活          1 = **确认**没有活          2 = **无法确认**
+# 观测失败(systemctl 答了却以非零收场 / 配置读不了 / iOS 记录解析不了)一律落 2, 不许
+# 混进 1。调用处再决定怎么对待 2 —— 但**不能**当成 1 放行。
+#
+# **裁决不在这里做**: 五个 need_* 按 migrate_wloc_retire 只读段同一套判据现场扫一遍,
+# 交给既有的 _retire_has_irreversible_work; Android 那一支按 migrate_android_cleanup
+# **自己的适用条件**(平台确凿是 android)问既有的 _retire_android_pending。
+# 两个后续保护点各自的范围就是这里的范围, 不把所有平台的文件集合无条件并起来。
+_retire_work_pending(){   # 0=有 / 1=确认没有 / 2=无法确认
+  local R="${PDG_RETIRE_ROOT:-}" f st srv_rc=0 q=0
+  local unit="$R/etc/systemd/system/pdg-mitm.service"
+  local hij="$R/etc/mosdns/rules/mitm_hijack.txt"
+  local mj="$R/etc/privdns-gateway/mitm.json"
+  local mods=("$R/opt/pdg-bot/mitm_server.py" "$R/opt/pdg-bot/mitm_wloc.py")
+  local need_svc=0 need_hij=0 need_core=0 need_json=0 need_mods=0
+  _RETIRE_WHY=""
+
+  # ── 后续保护点之二: migrate_android_cleanup ────────────────────────────────
+  # 它只在"平台确凿是 android"时才动手(推测出来的 android 会自己跳过), 所以这里照它的
+  # 条件问, 用的也是它用的那个判据。iosprofile.py 这类只在它清单里的件, 由它覆盖。
+  if [[ "$(_pdg_platform)" == android ]] \
+     && [[ ! -e "$(dirname "${PDG_PLATFORM_FILE:-/etc/privdns-gateway/platform}")/platform.guessed" ]] \
+     && _retire_android_pending "$R"; then
+    _RETIRE_WHY="Android 清理那一支还有退役件要删(_retire_android_pending 判有活)"; return 0
+  fi
+
+  # ── 后续保护点之一: migrate_wloc_retire 的五个 need_* ─────────────────────
+  # 运行态: 退出码与输出**分开**判。产品自己的约定是 is-active 用退出码表态(active=0,
+  # 其余=3), 答了一个状态词却以别的码收场 = 观测无效, 不采信那半截输出。
+  st="$(systemctl is-active pdg-mitm 2>/dev/null)" || srv_rc=$?
+  st="$(tr -d '[:space:]' <<<"$st")"
+  case "${st}/${srv_rc}" in
+    active/0)                 need_svc=1;;
+    inactive/3|failed/3) ;;                       # 明确的"没在跑"(is-active 的正常退出码)
+    *) _RETIRE_WHY="pdg-mitm 的运行态观测无效(状态词「${st:-空}」/ 退出码 $srv_rc 不成对)"; return 2;;
+  esac
+  [[ -f "$unit" ]] && need_svc=1
+  [[ -s "$hij" ]] && need_hij=1
+  _retire_core_has_mitm; q=$?
+  case "$q" in
+    0) need_core=1;;
+    1) ;;
+    *) _RETIRE_WHY="内网核心配置查不出来(不是普通文件/读不了/grep 出错)"; return 2;;
+  esac
+  [[ -f "$mj" ]] && grep -q '"enabled": *true' "$mj" 2>/dev/null && need_json=1
+  for f in "${mods[@]}" "$unit"; do [[ -e "$f" ]] && need_mods=1; done
+  [[ $need_mods -eq 1 && "$st" != inactive && "$st" != failed ]] && need_svc=1
+
+  _retire_has_irreversible_work "$need_svc" "$need_hij" "$need_core" "$need_json" "$need_mods"; q=$?
+  case "$q" in
+    0) _RETIRE_WHY="待办: svc=$need_svc hij=$need_hij core=$need_core json=$need_json mods=$need_mods(或 iOS 记录格式待推进)"; return 0;;
+    1) return 1;;
+    *) return 2;;                                  # _RETIRE_WHY 已由它填好
+  esac
+}
+
+_retire_precheck(){   # 0 = 可以往下走 / 1 = 本次迁移链一步都不执行
+  local w=0 kind=""
+  _retire_work_pending; w=$?
+  case "$w" in
+    1) return 0;;                                  # **确认**没有退役工作: 不拒
+    0) kind="这台机器上有 WLOC 退役工作";;
+    *) kind="退役待办**无法确认**(观测失败, 不当成没有)";;
+  esac
+  _retire_allowed && return 0                      # 有工作(或判不定), 且调用方有能力: 正常继续
+  c_r "❌ 本次不执行迁移: ${kind}, 而调用方不具备可靠回滚能力。"
+  c_y "   判定依据: ${_RETIRE_WHY:-（未记录）}"
+  c_y "   已停在迁移链动第一样东西**之前** —— 本次迁移一步都没跑, 没有留下迁移产生的对象。"
+  c_y "   注意: 这句话只覆盖**迁移链**的副作用。本次 update 在此之前的取件、切版本与装文件"
+  c_y "   都已经发生, 不在此列, 由调用方自己的回滚负责。"
+  _retire_rerun_hint
+  return 1
 }
 
 # Android 清理这一支有没有不可逆的活要干。没有就不问能力 —— 新装机、已经清干净的机器、
@@ -4667,16 +4753,26 @@ _retire_caller_gate(){
 # 这一次到底有没有"不可逆的事"要做。没有就不必要求能力证明 —— 新装机、已经退役干净的机器、
 # 幂等复跑、平台切换都走这一格, 它们本来就不动任何不可逆的东西。
 # 判据是**待办本身**, 不是"某个文件在不在"或"某个环境变量设没设"。
+# 0 = 有不可逆的事要做 / 1 = **确认**没有 / 2 = **判不出来**(iOS 记录那一维查询失败)
 _retire_has_irreversible_work(){   # $1..$5 = need_svc need_hij need_core need_json need_mods
   [[ "$1" == 1 || "$2" == 1 || "$3" == 1 || "$4" == 1 || "$5" == 1 ]] && return 0
   # 服务/文件都干净了, 但 iOS 记录还停在旧 schema ⇒ 推进 schema 仍是不可逆的一步。
   local R="${PDG_RETIRE_ROOT:-}"
   local st="$R/etc/privdns-gateway/ios-profile.json"
   [[ -f "$st" ]] || return 1
-  local cur want
-  cur="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1],encoding="utf-8")).get("schema",""))' "$st" 2>/dev/null)"
-  want="$(cd "$R/opt/pdg-bot" 2>/dev/null && python3 -c 'import iosstate;print(iosstate.SCHEMA)' 2>/dev/null)"
-  [[ -n "$cur" && -n "$want" && "$cur" != "$want" ]]
+  # `-B` 必须带: 不带的话 `import iosstate` 会在 /opt/pdg-bot 下写出 __pycache__ ——
+  # 那是一次**只读判定**留下的现场产物, 与"一个字节都不动"相抵触。环境变量一并给上,
+  # 覆盖被调进程再起解释器的情形。
+  local cur want rc=0
+  cur="$(PYTHONDONTWRITEBYTECODE=1 python3 -B -c 'import json,sys;print(json.load(open(sys.argv[1],encoding="utf-8")).get("schema",""))' "$st" 2>/dev/null)" || rc=$?
+  { (( rc == 0 )) && [[ -n "$cur" ]]; } || { _RETIRE_WHY="iOS 记录读不出来(解析失败或缺 schema 字段; python 退出码 $rc)"; return 2; }
+  # 模块**压根不在**这台机器上 ⇒ 没有 schema 活要干, 这是"确认没有", 不是"查不出来"。
+  # 与 _retire_ios_schema 自己的适用条件一致(它也是 `[[ -f "$st" ]] || return 0`)。
+  [[ -f "$R/opt/pdg-bot/iosstate.py" ]] || return 1
+  rc=0
+  want="$(cd "$R/opt/pdg-bot" 2>/dev/null && PYTHONDONTWRITEBYTECODE=1 python3 -B -c 'import iosstate;print(iosstate.SCHEMA)' 2>/dev/null)" || rc=$?
+  { (( rc == 0 )) && [[ -n "$want" ]]; } || { _RETIRE_WHY="读不到 iosstate.SCHEMA(模块导入失败; 退出码 $rc)"; return 2; }
+  [[ "$cur" != "$want" ]]
 }
 
 # ── WLOC 退役迁移 ────────────────────────────────────────────────────────────
@@ -4948,7 +5044,7 @@ migrate_wloc_retire(){
   _RETIRE_UNDO=(); _RETIRE_TMP=""
 
   # ══ 第一段: 只读。该拒的在这里全拒掉, 一个 systemctl 都不调。 ══════════════
-  local was_active=0
+  local was_active=0 _q=0
   [[ "$(systemctl is-active pdg-mitm 2>/dev/null | tr -d '[:space:]')" == active ]] && was_active=1
   local need_svc=0 need_hij=0 need_core=0 need_json=0 need_mods=0
   # need_svc 曾经只看 `-f unit || was_active`。漏掉的那一格很具体: unit 文件被手工删过、
@@ -4960,7 +5056,9 @@ migrate_wloc_retire(){
   local svc_state; svc_state="$(systemctl is-active pdg-mitm 2>/dev/null | tr -d '[:space:]')"
   [[ -f "$unit" || $was_active -eq 1 ]] && need_svc=1
   [[ -s "$hij" ]] && need_hij=1
-  _retire_core_has_mitm && need_core=1
+  # 三态: 查不出来也算 need_core —— 这一支接下来真要动手, 宁可多问一次能力证明。
+  _retire_core_has_mitm; _q=$?
+  case "$_q" in 0) need_core=1;; 2) need_core=1;; esac
   [[ -f "$mj" ]] && grep -q '"enabled": *true' "$mj" 2>/dev/null && need_json=1
   for f in "${mods[@]}" "$unit"; do [[ -e "$f" ]] && need_mods=1; done
   # 有模块残留而服务状态**不是明确的"没在跑"** ⇒ 也要走停止判据。
@@ -5003,7 +5101,11 @@ migrate_wloc_retire(){
   # 位置有讲究: 排在所有只读判据**之后**(该拒的先按既有理由拒), 排在
   # `_retire_ios_schema` 与 `mktemp -d` 这两处**第一个不可逆动作之前**。
   # 只在这一次确实有不可逆的事要做时才要求能力证明。
-  if _retire_has_irreversible_work "$need_svc" "$need_hij" "$need_core" "$need_json" "$need_mods"; then
+  _retire_has_irreversible_work "$need_svc" "$need_hij" "$need_core" "$need_json" "$need_mods"; _q=$?
+  if (( _q == 0 || _q == 2 )); then
+    # 2 = 判不出来。这一支接下来会真的动手(schema 推进也算), 所以按有活处理, 先要能力证明 ——
+    # 观测失败不能当成一种"没活"的状态放行。
+    (( _q == 2 )) && c_y "   (退役待办判不出来: ${_RETIRE_WHY:-观测失败} —— 按有活处理, 先要能力证明)"
     _retire_allowed || return 1
   fi
 
@@ -6242,6 +6344,8 @@ migrate_cidr_single_source(){
 
 run_all_migrations(){
   local rc=0
+  # 有条件的提前拒绝 —— 只在"确有退役工作 + 调用方能力不足"时成立, 见 _retire_precheck。
+  _retire_precheck || return 1
   migrate_platform_marker || true          # 先统一平台判定源(后续平台相关迁移据此走)
   migrate_rescue_plane || true             # 老机首次获得救援平面(用户停用过则不动)
   migrate_backend_marker || true           # 再把内核标记落地(别再靠默认值兜底)

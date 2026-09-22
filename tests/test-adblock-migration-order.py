@@ -99,6 +99,15 @@ print()
 print("══ 1. run_all_migrations 里的相对顺序(真跑)══")
 _fns = re.findall(r"^\s*(migrate_[a-z0-9_]+)", RA, re.M)
 _stub = "\n".join("%s(){ echo CALLED:%s >>\"$LOG\"; return 0; }" % (f, f) for f in set(_fns))
+# run_all_migrations 第一句是那处有条件前置。上面的桩只认名字形如 migrate_* 的函数, 不会
+# 覆盖它 —— 不给替身的话它在这个外壳里是 command not found(127), 链子当场 return,
+# order.log 一行都不会有, 这一节就变成"崩溃"而不是"顺序不对"。
+#
+# 这个替身**只提供本格的健康前提**(把"调用方有能力"这件事当成既定), 它**不验证**能力门,
+# 也不代表门被绕过: 门本身由 tests/test-migrate-caller-gate.sh 与
+# tests/test-migrate-entry-contract.sh 驱动产品原文来验。
+# 产品侧**不得**因为这个函数缺失就跳过检查 —— 那会是 fail-open; 真实现里它是无条件调用的。
+_stub += "\n_retire_precheck(){ return 0; }"
 _log = tmpguard.mkdtemp(prefix="pdg-adblock-order.") + "/order.log"
 _r = subprocess.run(["bash", "-c", "set -u\nLOG=%s\n" % _log + _stub
                      + "\nc_y(){ :; }; c_g(){ :; }; c_r(){ :; }\n"
