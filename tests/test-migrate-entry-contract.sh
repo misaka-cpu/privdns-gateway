@@ -45,12 +45,15 @@ if [[ -n "$BASE" && -f "$BASE" ]]; then
   # 「无条件拒绝」仍然禁止 —— 下面 A1b 正着钉住它是有条件的。
   _d="$BOX/a1.diff"; diff <(fnbody "$BASE" run_all_migrations) <(fnbody "$PDG" run_all_migrations) > "$_d"
   _del="$(grep -c '^<' "$_d" || true)"; _add="$(grep -c '^>' "$_d" || true)"
-  _addok="$(grep '^>' "$_d" | grep -cE '_retire_precheck \|\| return 1|^> *#' || true)"
-  if [[ "${_del:-0}" == 0 && "${_add:-0}" == "${_addok:-0}" && "${_add:-0}" -ge 1 ]] \
+  # 275 按裁决再精确放宽**一处**: 标记迁移那一句由 `|| true` 改为"只在平台观测失败(返回 2)时停链"。
+  # 允许删掉的只有原来那一句; 允许新增的只有: 有条件前置、注释、改后的那一句。
+  _delok="$(grep '^<' "$_d" | grep -cE '^< +migrate_platform_marker \|\| true( |$)' || true)"
+  _addok="$(grep '^>' "$_d" | grep -cE '_retire_precheck \|\| return 1|^> *#|^> +migrate_platform_marker \|\| \{ \[\[ \$\? == 2 \]\] && \{ c_r .*; return 1; \}; \}$' || true)"
+  if [[ "${_del:-0}" == "${_delok:-0}" && "${_del:-0}" -le 1 && "${_add:-0}" == "${_addok:-0}" && "${_add:-0}" -ge 1 ]] \
      && grep -q '_retire_precheck || return 1' "$_d"; then
-    ok "A1: run_all_migrations 相对基线**只多**那一处有条件前置(新增 ${_add} 行: 前置调用 + 说明; 删除 0 行)"
+    ok "A1: run_all_migrations 相对基线只多那一处有条件前置, 且只把标记迁移那一句换成「平台观测失败才停链」(新增 ${_add} / 删除 ${_del})"
   else
-    bad "A1: run_all_migrations 的改动超出「只多一处有条件前置」(新增 ${_add:-?} / 其中合规 ${_addok:-?} / 删除 ${_del:-?})"
+    bad "A1: run_all_migrations 的改动超出批准范围(新增 ${_add:-?} / 其中合规 ${_addok:-?} / 删除 ${_del:-?} / 其中合规 ${_delok:-?})"
     head -14 "$_d"
   fi
   if diff -q <(grep -A3 '^    __migrate)' "$BASE") <(grep -A3 '^    __migrate)' "$PDG") >/dev/null; then
@@ -58,6 +61,14 @@ if [[ -n "$BASE" && -f "$BASE" ]]; then
   else bad "A2: __migrate 派发块被改过"; fi
 else
   na "A: 没给 PDG_BASELINE, 跳过与冻结基线的逐字节对比"
+fi
+# A1c(不依赖基线): 标记迁移那一句只在返回 2(平台证据读不出来)时停链, 其余返回照旧 best-effort
+_ram0="$(fnfile "$PDG" run_all_migrations)"
+if grep -qE '^  migrate_platform_marker \|\| \{ \[\[ \$\? == 2 \]\] && \{ c_r .*; return 1; \}; \}$' "$_ram0" \
+   && ! grep -qE '^  migrate_platform_marker \|\| true' "$_ram0"; then
+  ok "A1c: 迁移链不再吞掉平台观测失败(只对返回 2 停链, 其余仍 best-effort)"
+else
+  bad "A1c: 迁移链对平台观测失败的处理不是「只对返回 2 停链」"
 fi
 
 echo
@@ -169,10 +180,28 @@ _ir="$(fnfile "$PDG" _retire_has_irreversible_work)"
   || bad "C16: schema 查询仍可能写出字节码"
 # 覆盖面与后续保护点对齐: 按 migrate_android_cleanup 自己的条件问它自己的判据
 _wp2="$(fnfile "$PDG" _retire_work_pending)"
-{ grep -q '_retire_android_pending' "$_wp2" && grep -q '_pdg_platform' "$_wp2" \
-  && grep -q 'platform.guessed' "$_wp2"; } \
-  && ok "C17: 扫描器按 migrate_android_cleanup 的**适用条件**(平台确凿是 android)问它自己的判据" \
+# C17 改后形态: 扫描器排在标记迁移之前, 不能读此刻盘面上还没写出来的 platform / platform.guessed;
+# 它经 _pdg_platform_plan(标记迁移与前置共用的那一份判定)问"标记迁移将会定出什么",
+# 只对**确认的** android(非推测)才去问 migrate_android_cleanup 用的同一个判据。
+{ grep -q '_pdg_platform_plan' "$_wp2" && grep -q '_retire_android_pending' "$_wp2" \
+  && grep -qF '"$_PDG_PLAN_PLAT" == android && "$_PDG_PLAN_GUESSED" == 0' "$_wp2"; } \
+  && ok "C17: 扫描器按标记迁移**将会**定出的平台判 Android 那一支(确认 android 才问 _retire_android_pending)" \
   || bad "C17: 扫描器与 Android 那一支的范围没对齐"
+{ ! grep -qE '\$\(_pdg_platform\)|platform\.guessed' "$_wp2"; } \
+  && ok "C17b: 扫描器不再直接读盘面上的平台标记 / .guessed(前置时它们可能还不存在)" \
+  || bad "C17b: 扫描器仍在读此刻盘面的平台标记 —— 标记迁移之前那是不作数的"
+_pp="$(fnfile "$PDG" _pdg_platform_plan)"; _pm="$(fnfile "$PDG" migrate_platform_marker)"
+{ grep -q '_pdg_platform_plan' "$_pm" && [[ "$(grep -c "s/^PDG_PLATFORM=//p" "$PDG")" == 1 ]] \
+  && grep -q "s/^PDG_PLATFORM=//p" "$_pp"; } \
+  && ok "C17c: 标记迁移与前置共用 _pdg_platform_plan, 平台判定规则全文件只有一份" \
+  || bad "C17c: 平台判定规则不止一处, 或标记迁移没有用共享判定"
+{ grep -q 'return 2' "$_pp" && grep -qE 'prc.*!= 0|prc" != 0' "$_wp2"; } \
+  && ok "C17d: 平台判定读不出来是单独一态(return 2), 扫描器据此判**无法确认**" \
+  || bad "C17d: 平台判定的读失败没有单列"
+# 只读必须包含传递调用: 扫描器经 _pdg_platform_plan 取平台, 它也不许有任何写动作
+grep -qE 'systemctl (start|stop|enable|disable|restart|daemon-reload)|rm -|mv |install -|mktemp|> *"\$|: *> ' "$_pp" \
+  && bad "C9b: 扫描器传递调用的 _pdg_platform_plan 里出现了写动作" \
+  || ok "C9b: 扫描器传递调用的 _pdg_platform_plan 没有任何写动作"
 grep -q '_retire_allowed && return 0' "$_pc" \
   && ok "C7: 能力判定**复用** _retire_allowed(没有另立一套判据)" \
   || bad "C7: 前置没有复用 _retire_allowed"

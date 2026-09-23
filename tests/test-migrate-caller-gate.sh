@@ -475,23 +475,29 @@ echo "══ 十五. 只读扫描器: 这台机器上到底有没有退役工作
 # _retire_has_irreversible_work(它自己还管 iOS 记录格式那一维)。这里逐面摆场景验它。
 # $3 形如 "词/码": 状态词与退出码**分开给**, 这样才摆得出"答了词却以别的码收场"。
 # gone = systemctl 整个问不出来。$4 = 平台(默认 ios, 走不到 Android 清理那一支)。
-wp(){   # $1=场景名 $2=摆场景片段(在场景根下执行) $3=is-active 的「词/码」 $4=平台
-  local d="$BOX/wp-$1" ans="${3:-inactive/3}" plat="${4:-ios}"
+wp(){   # $1=场景名 $2=摆场景片段(在场景根下执行) $3=is-active 的「词/码」
+        # $4=平台(ios|android|none=不打标, 默认 ios) $5=可选: 在调用前注入的代码(造读失败用)
+  local d="$BOX/wp-$1" ans="${3:-inactive/3}" plat="${4:-ios}" pre="${5:-}"
   mkdir -p "$d/etc/privdns-gateway" "$d/opt/pdg-bot" "$d/etc/systemd/system" \
            "$d/etc/mosdns/rules" "$d/etc/mihomo"
   printf 'SCHEMA = 2\n' > "$d/opt/pdg-bot/iosstate.py"
-  printf '%s\n' "$plat" > "$d/etc/privdns-gateway/platform"
+  [[ "$plat" == none ]] || printf '%s\n' "$plat" > "$d/etc/privdns-gateway/platform"
   ( cd "$d" && eval "${2:-:}" )
   { echo 'set -uo pipefail'
     echo '_RETIRE_WHY=""'
-    echo "_pdg_platform(){ cat \"$d/etc/privdns-gateway/platform\" 2>/dev/null || echo android; }"
-    echo "PDG_PLATFORM_FILE=\"$d/etc/privdns-gateway/platform\""
+    # 平台判定的四条输入一律指向场景根(否则助手会去读宿主 /etc)。扫描器现在经
+    # _pdg_platform_plan 判平台, **不再**读 _pdg_platform —— 所以这里故意不给它桩:
+    # 谁退回旧形态, 这一节就会 127 判红, 而不是悄悄读到一个默认 android。
+    echo "export PDG_PLATFORM_FILE=\"$d/etc/privdns-gateway/platform\" PROFILE_ENV=\"$d/etc/privdns-gateway/profile.env\""
+    echo "export PDG_MITM_JSON=\"$d/etc/privdns-gateway/mitm.json\" PDG_MITM_UNIT=\"$d/etc/systemd/system/pdg-mitm.service\""
     if [[ "$ans" == gone ]]; then echo 'systemctl(){ return 127; }'
     else echo "systemctl(){ [ \"\$1\" = is-active ] && { echo ${ans%%/*}; return ${ans##*/}; }; return 0; }"; fi
     _fnN "$PDG" _retire_core_has_mitm
     _fnN "$PDG" _retire_android_pending
     _fnN "$PDG" _retire_has_irreversible_work
+    _fnN "$PDG" _pdg_platform_plan
     _fnN "$PDG" _retire_work_pending
+    [[ -n "$pre" ]] && echo "$pre"
     echo "PDG_RETIRE_ROOT=\"$d\" _retire_work_pending"
     echo 'echo "WORK=$?  WHY=$_RETIRE_WHY"'
   } > "$d/run.sh"
@@ -530,6 +536,40 @@ find "$BOX/wp-W7" \( -name '__pycache__' -o -name '*.pyc' \) 2>/dev/null > "$BOX
 [[ ! -s "$BOX/pyc.txt" ]] \
   && ok "W13: 只读判定跑完(含 import iosstate 那一步), 场景目录里**没有** __pycache__/.pyc" \
   || { bad "W13: 只读判定留下了现场产物"; sed 's/^/      /' "$BOX/pyc.txt"; }
+
+# ── 平台判定按标记迁移**将会**定出的状态(扫描器层) ─────────────────────────
+# 前置排在标记迁移之前: 此刻盘上的 platform / platform.guessed 可能还没写出来。扫描器要问的是
+# _pdg_platform_plan(标记迁移与前置共用的那一份判定), 不是此刻的盘面。
+IOSKIT='touch opt/pdg-bot/iosprofile.py opt/pdg-bot/mitm_ca.py opt/pdg-bot/pdg-dot.mobileconfig.tmpl'
+_w    "W14: 无标记、无明确平台证据, 只有 v1.4.x 普装的 iOS 组件 ⇒ **确认没有**(将被推测为 android, 清理那一支不适用)" \
+      1 "$(wp W14 "$IOSKIT" inactive/3 none)"
+[[ -z "$(find "$BOX/wp-W14/etc/privdns-gateway" -mindepth 1 2>/dev/null)" ]] \
+  && ok "W14b: 扫描器判完之后, 场景里**没有**生成 platform / platform.guessed / 临时标记文件" \
+  || { bad "W14b: 扫描器在现场留下了平台标记"; find "$BOX/wp-W14/etc/privdns-gateway" -mindepth 1 | sed 's/^/      /'; }
+_wwhy "W15: 无标记但 profile.env 明确 android + 同样的 iOS 组件 ⇒ 有活(Android 那一支适用)" \
+      0 "$(wp W15 "$IOSKIT; printf 'PDG_PLATFORM=android\n' > etc/privdns-gateway/profile.env" inactive/3 none)" '平台据 profile 确认为 android'
+_wwhy "W15b: 已有确认 android(无 .guessed)+ iOS 组件 ⇒ 有活" \
+      0 "$(wp W15b "$IOSKIT" inactive/3 android)" '平台据 existing 确认为 android'
+_w    "W16: 已有**推测** android(带 .guessed)+ iOS 组件 ⇒ 确认没有(推测态语义不变)" \
+      1 "$(wp W16 "$IOSKIT; : > etc/privdns-gateway/platform.guessed" inactive/3 android)"
+o="$(wp W17 "$IOSKIT; touch etc/systemd/system/pdg-mitm.service" inactive/3 none)"
+if grep -q 'WORK=0' <<<"$o" && ! grep -q 'Android 清理那一支' <<<"$o"; then
+  ok "W17: 无标记但有 pdg-mitm unit(明确 iOS 证据)⇒ 不走 Android 那一支, 但 WLOC 待办照样判有活 —— $(sed 's/.*WHY=//' <<<"$o")"
+else bad "W17: 实得 $o"; fi
+# 读失败 / 读到一半再失败: 无法确认, 不消费半截结论
+_wwhy "R1: 无标记, profile.env 不是普通文件 ⇒ 无法确认" 2 \
+      "$(wp R1 "$IOSKIT; mkdir -p etc/privdns-gateway/profile.env" inactive/3 none)" '平台判定所需的证据读不出来'
+_wwhy "R2: 无标记, mitm.json 查不出来(grep rc=2)⇒ 无法确认" 2 \
+      "$(wp R2 "$IOSKIT; mkdir -p etc/privdns-gateway/mitm.json" inactive/3 none)" 'mitm.json 查不出来'
+_wwhy "R3: 平台标记本身读不出来 ⇒ 无法确认" 2 \
+      "$(wp R3 "$IOSKIT; rm -f etc/privdns-gateway/platform; mkdir -p etc/privdns-gateway/platform" inactive/3 none)" '平台标记读不出来'
+# 半截输出: profile.env 里写的是 ios; 注入的读取先吐出 "android" 再以非 0 收场。
+# 若采信半截输出, 会判成"确认 android"并因 iOS 组件判有活(0); 正确结论是无法确认(2)。
+HALF='sed(){ if [[ "$*" == *PDG_PLATFORM=* ]]; then echo android; return 1; fi; command sed "$@"; }'
+_wwhy "R4: profile.env 读到一半(先输出 android)再失败 ⇒ 无法确认, 不采信那半截" 2 \
+      "$(wp R4 "$IOSKIT; printf 'PDG_PLATFORM=ios\n' > etc/privdns-gateway/profile.env" inactive/3 none "$HALF")" 'profile.env 读不出来'
+_w    "R4h: 同一现场不注入(完整读到 ios)⇒ 确认没有(R4 不是靠恒红取胜)" \
+      1 "$(wp R4h "$IOSKIT; printf 'PDG_PLATFORM=ios\n' > etc/privdns-gateway/profile.env" inactive/3 none)"
 
 echo
 echo "══ 十六. 有条件前置: 拒在迁移链动第一样东西之前 ══"
@@ -577,6 +617,12 @@ chain(){   # $1=场景名 $2=句柄 real|none $3=前置 keep|drop|ia0keep
     _fnN "$PDG" _retire_caller_gate; _fnN "$PDG" _retire_allowed
     _fnN "$PDG" _retire_rerun_hint
     _fnN "$PDG" _retire_core_has_mitm; _fnN "$PDG" _retire_has_irreversible_work
+    # 扫描器的 Android 那一支经 _pdg_platform_plan 判平台, 连同它要问的 _retire_android_pending
+    # 一并抽真身; 平台四条输入指向场景根。(先前这里两者都没抽: 旧判定里 $(_pdg_platform) 127
+    # 成空串, 那一支在本节**从未被执行过**。)
+    _fnN "$PDG" _retire_android_pending; _fnN "$PDG" _pdg_platform_plan
+    echo "export PDG_PLATFORM_FILE=\"$d/etc/privdns-gateway/platform\" PROFILE_ENV=\"$d/etc/privdns-gateway/profile.env\""
+    echo "export PDG_MITM_JSON=\"$d/etc/privdns-gateway/mitm.json\" PDG_MITM_UNIT=\"$d/etc/systemd/system/pdg-mitm.service\""
     if [[ "$keep" == ia0keep ]]; then
       # 单处撤销: 只把 `inactive/3|failed/3` 改回 `inactive/3|failed/3|inactive/0`,
       # 其余一个字不动 —— 用来证明同一输入会重新被放行。
@@ -659,6 +705,205 @@ grep -q 'CHAIN_RC=1' <<<"$op2" \
   && ok "M2: 撤销之后链子仍以非 0 收场(退役那一步照旧被三个拦截点挡住)—— 差别只在**副作用有没有发生**" \
   || bad "M2: 撤销之后链子返回 0, 说明后面的拦截点被动过"
 
+
+echo
+echo "══ 十八. 平台判定时序: 前置按标记迁移**将会**定出的状态判(真实标记迁移 + 真实 Android 清理) ══"
+# 在 chain() 的基础上, 把 migrate_platform_marker 与 migrate_android_cleanup 换回**产品原文**,
+# 其余 migrate_* 仍打桩。平台四条输入与 $R 一律指向场景根; _pdg_platform 由产品原文那一行
+# 派生(只把写死的路径换成 $PDG_PLATFORM_FILE), migrate_android_cleanup 用的就是它。
+# 场景统一放 v1.4.x 普装的 iOS 组件: iosprofile.py / mitm_ca.py / pdg-dot 模板 / iosstate.py。
+cat > "$BOX/revert-timing.py" <<'REVERTPY'
+# 单处撤销: 只把扫描器里 Android 那一支换回旧形态(读此刻盘面的 _pdg_platform 与 platform.guessed),
+# 助手、标记迁移与其余一字不动。
+import sys
+t = sys.stdin.read()
+head = "  # Android 清理那一支只对**确认的** android 适用。"
+tail = '平台据 ${_PDG_PLAN_SRC} 确认为 android)"; return 0\n  fi\n'
+a = t.find(head); k = t.find(tail)
+if a < 0 or k < 0:
+    sys.stdout.write(t + '\necho REVERT_FAILED\n'); sys.exit(0)
+old = ('  if [[ "$(_pdg_platform)" == android ]] \\\n'
+       '     && [[ ! -e "$(dirname "${PDG_PLATFORM_FILE:-/etc/privdns-gateway/platform}")/platform.guessed" ]] \\\n'
+       '     && _retire_android_pending "$R"; then\n'
+       '    _RETIRE_WHY="Android 清理那一支还有退役件要删(_retire_android_pending 判有活)"; return 0\n'
+       '  fi\n')
+sys.stdout.write(t[:a] + old + t[k + len(tail):])
+REVERTPY
+cat > "$BOX/revert-marker.py" <<'REVMARKERPY'
+# 单处撤销: 只把标记迁移"证据读不出来"那一支改回 274 的写法(推测 android 并落盘), 其余一字不动。
+import sys
+t = sys.stdin.read()
+new = '    c_r "❌ 平台判定所需的证据读不出来(${_PDG_PLAN_WHY:-未知}): 本次不补、不改平台标记。"\n    return 2\n'
+old = '    c_y "平台证据读不出来(${_PDG_PLAN_WHY:-未知}), 按推测处理。"\n    plat=android; guessed=1\n'
+sys.stdout.write(t.replace(new, old) if new in t else t + '\necho REVERT_FAILED\n')
+REVMARKERPY
+cat > "$BOX/revert-chain.py" <<'REVCHAINPY'
+# 单处撤销: 只把迁移链里标记迁移那一句改回 `|| true`(吞掉平台观测失败), 其余一字不动。
+import sys
+t = sys.stdin.read()
+new = '  migrate_platform_marker || { [[ $? == 2 ]] && { c_r "❌ 平台判不出来, 迁移链停在这里(后续迁移一个都没跑)。"; return 1; }; }\n'
+old = '  migrate_platform_marker || true\n'
+sys.stdout.write(t.replace(new, old) if new in t else t + '\necho REVERT_FAILED\n')
+REVCHAINPY
+KIT4='iosprofile.py mitm_ca.py pdg-dot.mobileconfig.tmpl iosstate.py'
+treesnap(){ ( cd "$1" && find etc opt \( -type f -o -type d \) | sort | while read -r x; do
+    if [[ -f "$x" ]]; then printf 'f %s %s\n' "$(sha256sum < "$x" | cut -c1-16)" "$x"; else printf 'd %s\n' "$x"; fi
+  done ); }
+chainp(){  # $1=场景名 $2=句柄 real|none $3=平台布置 $4=变体 cur|revert|pre-only|rev-marker|rev-chain
+           # 平台布置: none | profile-android | profile-dir | profile-dir-unit | android | android-guessed
+           #           | ios | ios-readfail | mitm-unit
+  local name="$1" hmode="$2" pmode="$3" var="${4:-cur}"
+  local d="$BOX/cp-$name" f
+  mkdir -p "$d/etc/privdns-gateway" "$d/opt/pdg-bot" "$d/etc/systemd/system" \
+           "$d/etc/mosdns/rules" "$d/etc/mihomo" "$d/snap" "$d/sc"
+  printf 'SCHEMA = 2\n' > "$d/opt/pdg-bot/iosstate.py"
+  for f in iosprofile.py mitm_ca.py pdg-dot.mobileconfig.tmpl; do : > "$d/opt/pdg-bot/$f"; done
+  seed_units "$d/sc"
+  echo inactive > "$d/sc/pdg-mitm.ac"; echo dead > "$d/sc/pdg-mitm.sub"; rm -f "$d/sc/pdg-mitm.inv"
+  case "$pmode" in
+    none) ;;
+    profile-android) printf 'PDG_PLATFORM=android\n' > "$d/etc/privdns-gateway/profile.env" ;;
+    profile-dir)     mkdir -p "$d/etc/privdns-gateway/profile.env" ;;
+    android)         printf 'android\n' > "$d/etc/privdns-gateway/platform" ;;
+    android-guessed) printf 'android\n' > "$d/etc/privdns-gateway/platform"; : > "$d/etc/privdns-gateway/platform.guessed" ;;
+    ios)             printf 'ios\n' > "$d/etc/privdns-gateway/platform" ;;
+    mitm-unit)       : > "$d/etc/systemd/system/pdg-mitm.service" ;;
+    profile-dir-unit) mkdir -p "$d/etc/privdns-gateway/profile.env"; : > "$d/etc/systemd/system/pdg-mitm.service" ;;
+    ios-readfail)    printf 'ios\n' > "$d/etc/privdns-gateway/platform" ;;   # 读取失败在运行时注入
+  esac
+  treesnap "$d" > "$d.before"
+  { echo 'set -uo pipefail'
+    echo "SC_DIR=\"$d/sc\"; SC_LOG=\"$d/sc.log\"; : > \"\$SC_LOG\"; LOCK=\"$d/lock\""
+    echo "CALLS=\"$d/calls.log\"; : > \"\$CALLS\""
+    echo "$STUB"
+    _fn1 "$PDG" c_g; _fn1 "$PDG" c_y; _fn1 "$PDG" c_r
+    echo "_pdg_module(){ printf '%s\n' \"$ROOT/deploy/bot/\$1\"; }"
+    _fnN "$PDG" _pdg_lock_proof
+    _fnN "$PDG" _pdg_svcstate_units; _fnN "$PDG" _pdg_svc_known; _fnN "$PDG" _pdg_svc_q
+    _fnN "$PDG" _pdg_svcstate_valid; _fnN "$PDG" _pdg_save_svcstate
+    echo '_PDG_RETIRE_OK=""; _PDG_RETIRE_DONE=0; _RETIRE_WHY=""'
+    _fnN "$PDG" _retire_caller_gate; _fnN "$PDG" _retire_allowed
+    _fnN "$PDG" _retire_rerun_hint
+    _fnN "$PDG" _retire_core_has_mitm; _fnN "$PDG" _retire_has_irreversible_work
+    _fnN "$PDG" _retire_android_pending; _fnN "$PDG" _pdg_platform_plan
+    if [[ "$var" == revert ]]; then _fnN "$PDG" _retire_work_pending | python3 "$BOX/revert-timing.py"
+    else _fnN "$PDG" _retire_work_pending; fi
+    _fnN "$PDG" _retire_precheck
+    echo "export PDG_PLATFORM_FILE=\"$d/etc/privdns-gateway/platform\" PROFILE_ENV=\"$d/etc/privdns-gateway/profile.env\""
+    echo "export PDG_MITM_JSON=\"$d/etc/privdns-gateway/mitm.json\" PDG_MITM_UNIT=\"$d/etc/systemd/system/pdg-mitm.service\""
+    _fn1 "$PDG" _pdg_platform | sed 's#/etc/privdns-gateway/platform#${PDG_PLATFORM_FILE}#'
+    echo 'for f in $(grep -oE "migrate_[a-z0-9_]+" "'"$PDG"'" | sort -u); do'
+    echo '  eval "$f(){ echo \"$f\" >> \"$CALLS\"; return 0; }"'
+    echo 'done'
+    # 这两条换回产品原文(定义在桩循环之后, 覆盖桩)
+    if [[ "$var" == rev-marker ]]; then _fnN "$PDG" migrate_platform_marker | python3 "$BOX/revert-marker.py"
+    else _fnN "$PDG" migrate_platform_marker; fi
+    _fnN "$PDG" migrate_android_cleanup
+    echo "migrate_rescue_plane(){ echo migrate_rescue_plane >> \"\$CALLS\"; : > \"$d/etc/systemd/system/pdg-rescue.socket\"; return 0; }"
+    echo "migrate_wloc_retire(){ echo migrate_wloc_retire >> \"\$CALLS\"; _retire_work_pending || return 0; _retire_allowed || return 1; return 0; }"
+    if [[ "$var" == rev-chain ]]; then sed -n "/^run_all_migrations(){/,/^}/p" "$PDG" | python3 "$BOX/revert-chain.py"
+    else sed -n "/^run_all_migrations(){/,/^}/p" "$PDG"; fi
+    echo "exec 9>\"$d/lock\"; flock -n 9 || { echo LOCK_FAILED; exit 1; }"
+    echo "printf 'snapshot-bytes' > \"$d/snap/snap.tar.gz\""
+    echo "_pdg_save_svcstate \"$d/snap\" >/dev/null || { echo SAVE_FAILED; exit 1; }"
+    [[ "$hmode" == real ]] && echo "export PDG_UPDATE_SVCSTATE=\"$d/snap/svcstate.tsv\""
+    # 已有 ios 标记但读取失败: 只对平台标记这一个路径, 先吐 ios 再以非 0 收场(root 下同样生效)
+    [[ "$pmode" == ios-readfail ]] && echo "cat(){ if [[ \"\${*: -1}\" == \"$d/etc/privdns-gateway/platform\" ]]; then echo ios; return 1; fi; command cat \"\$@\"; }"
+    if [[ "$var" == pre-only ]]; then
+      echo "PDG_RETIRE_ROOT=\"$d\" _retire_precheck; echo \"PRE_RC=\$?\""
+    else
+      echo "PDG_RETIRE_ROOT=\"$d\" run_all_migrations; echo \"CHAIN_RC=\$?\""
+    fi
+    echo "echo \"RESCUE_CALLED=\$(grep -c migrate_rescue_plane \"\$CALLS\" || true)\""
+    echo "[ -e \"$d/etc/systemd/system/pdg-rescue.socket\" ] && echo SOCKET=yes || echo SOCKET=no"
+    echo "echo \"CALLS_N=\$(grep -c . \"\$CALLS\" || true)\""
+    echo "echo \"PLATFORM=[\$(command cat \"$d/etc/privdns-gateway/platform\" 2>/dev/null)]\""
+    echo "[ -e \"$d/etc/privdns-gateway/platform.guessed\" ] && echo GUESSED=yes || echo GUESSED=no"
+    echo "n=0; for f in $KIT4; do [ -f \"$d/opt/pdg-bot/\$f\" ] && n=\$((n+1)); done; echo \"KIT=\$n/4\""
+  } > "$d/run.sh"
+  bash "$d/run.sh" 2>&1
+}
+has(){ grep -q -- "$2" <<<"$1"; }
+cp_check(){ # $1=格名 $2=输出 $3...=必须出现的片段
+  local nm="$1" o="$2" x miss=""; shift 2
+  for x in "$@"; do has "$o" "$x" || miss="$miss [$x]"; done
+  if [[ -z "$miss" ]]; then ok "$nm"
+  else bad "$nm —— 缺:$miss | $(grep -E 'CHAIN_RC|PRE_RC|RESCUE|SOCKET|PLATFORM|GUESSED|KIT|REVERT|判定依据' <<<"$o" | tr '\n' ' ')"; fi
+}
+
+# 1) 无标记、无明确平台证据, 只有普装的 iOS 组件: 不误拒; 标记迁移落为推测 android; 清理跳过; 组件保留
+o="$(plain "$(chainp PL1 none none)")"
+cp_check "PL1: 无标记 + 仅普装 iOS 组件 + 无句柄 ⇒ 前置**不误拒**, 迁移链照常走" "$o" 'CHAIN_RC=0' 'RESCUE_CALLED=1'
+cp_check "PL1: 实际标记迁移落为**推测** android(platform=android + .guessed)" "$o" 'PLATFORM=\[android\]' 'GUESSED=yes'
+cp_check "PL1: 后续真实 Android 清理见推测态而跳过, 四件 iOS 组件全部保留" "$o" '跳过 iOS 组件清理' 'KIT=4/4'
+# 2) 无标记但 profile.env 明确 android / 已有确认 android: 有清理待办、无句柄 ⇒ 链首拒绝
+o="$(plain "$(chainp PL2 none profile-android)")"
+cp_check "PL2: 无标记但 profile.env=android + iOS 组件 + 无句柄 ⇒ 链首拒绝, 救援迁移 0 次, socket 未生成" "$o" \
+  'CHAIN_RC=1' 'RESCUE_CALLED=0' 'SOCKET=no' 'Android 清理那一支' '平台据 profile 确认为 android'
+cp_check "PL2: 拒绝发生在标记迁移之前 —— 前置没有写平台标记, 组件原样" "$o" 'PLATFORM=\[\]' 'GUESSED=no' 'KIT=4/4'
+o="$(plain "$(chainp PL3 none android)")"
+cp_check "PL3: 已有确认 android + iOS 组件 + 无句柄 ⇒ 链首拒绝, 救援迁移 0 次" "$o" \
+  'CHAIN_RC=1' 'RESCUE_CALLED=0' 'SOCKET=no' '平台据 existing 确认为 android'
+# 3) 已有推测 android、明确 ios: 平台语义不变; ios 不走 Android 清理, 但真正 WLOC 待办不漏
+o="$(plain "$(chainp PL4 none android-guessed)")"
+cp_check "PL4: 已有推测 android ⇒ 不拒, .guessed 保留, 清理跳过, 组件保留" "$o" 'CHAIN_RC=0' 'GUESSED=yes' '跳过 iOS 组件清理' 'KIT=4/4'
+o="$(plain "$(chainp PL5 none ios)")"
+cp_check "PL5: 已有 ios + 普装组件(无 WLOC 待办)⇒ 不拒, 平台仍是 ios, 组件保留" "$o" 'CHAIN_RC=0' 'PLATFORM=\[ios\]' 'KIT=4/4'
+o="$(plain "$(chainp PL6 none mitm-unit)")"
+if has "$o" 'CHAIN_RC=1' && has "$o" 'RESCUE_CALLED=0' && has "$o" '待办: svc=1' && ! has "$o" 'Android 清理那一支'; then
+  ok "PL6: 无标记但有 pdg-mitm unit(将定为 ios)+ 无句柄 ⇒ 仍在链首拒绝, 依据是 WLOC 待办而不是 Android 那一支"
+else bad "PL6: $(grep -E 'CHAIN_RC|RESCUE|判定依据' <<<"$o" | tr '\n' ' ')"; fi
+# 4) 调用处: 助手读失败 ⇒ 无法确认, 走能力门(不当成缺失、不当成确认无待办)
+o="$(plain "$(chainp PL7 none profile-dir)")"
+cp_check "PL7: 平台证据读不出来 + 无句柄 ⇒ 链首拒绝, 理由是**无法确认**" "$o" 'CHAIN_RC=1' 'RESCUE_CALLED=0' '无法确认' '平台判定所需的证据读不出来'
+# 合法调用方对照: 确认 android + 本次句柄 ⇒ 正常继续, 且真实 Android 清理确实动手
+o="$(plain "$(chainp PL8 real profile-android)")"
+cp_check "PL8: profile.env=android + 合法调用方(真锁 + 本次句柄 + 快照绑定)⇒ 正常继续, 标记落为确认 android" "$o" \
+  'CHAIN_RC=0' 'RESCUE_CALLED=1' 'PLATFORM=\[android\]' 'GUESSED=no'
+cp_check "PL8: 合法调用方下真实 Android 清理照常动手(iOS 专属件已清)" "$o" 'KIT=0/4'
+# 5) 前置本身不写平台标记、不留下其它现场产物(只跑 _retire_precheck, 前后比对 etc/ 与 opt/)
+o="$(plain "$(chainp PL9 none none pre-only)")"
+treesnap "$BOX/cp-PL9" > "$BOX/cp-PL9.after"
+if has "$o" 'PRE_RC=0' && cmp -s "$BOX/cp-PL9.before" "$BOX/cp-PL9.after"; then
+  ok "PL9: 只跑前置(无标记现场)⇒ 放行, 且 etc/ 与 opt/ 前后逐项相同(没写平台标记、没留临时文件)"
+else bad "PL9: $(grep PRE_RC <<<"$o") | 差异: $(diff "$BOX/cp-PL9.before" "$BOX/cp-PL9.after" | head -3 | tr '\n' ' ')"; fi
+# 6) 单处撤销: 只把扫描器 Android 那一支换回旧形态 ⇒ 同一无标记反例重新被误拒; 健康与合法对照仍成立
+o="$(plain "$(chainp PR1 none none revert)")"
+if ! has "$o" 'REVERT_FAILED' && has "$o" 'CHAIN_RC=1' && has "$o" 'RESCUE_CALLED=0' && has "$o" 'Android 清理那一支'; then
+  ok "PR1: **单处**撤回时序修复 ⇒ PL1 同一输入重新在链首被误拒(依据回到旧的 Android 那一支)"
+else bad "PR1: 撤销对照没体现差异 —— $(grep -E 'REVERT|CHAIN_RC|RESCUE|判定依据' <<<"$o" | tr '\n' ' ')"; fi
+o="$(plain "$(chainp PR3 none android revert)")"
+cp_check "PR3: 撤销下健康对照不变 —— 确认 android + 无句柄仍被拒" "$o" 'CHAIN_RC=1' 'RESCUE_CALLED=0'
+o="$(plain "$(chainp PR8 real profile-android revert)")"
+cp_check "PR8: 撤销下合法调用方对照不变 —— 仍正常继续" "$o" 'CHAIN_RC=0' 'RESCUE_CALLED=1'
+
+# ── 平台观测失败: 迁移链不吞, 依赖平台的迁移一个都不跑 ──────────────────────────────
+# 用**合法句柄**驱动, 并确认输出里没有前置拒绝文案 —— 证明挡住链条的不是能力门, 而是标记迁移
+# 的观测失败。CALLS_N = 被打桩的其余 migrate_* 实际被调用的笔数(标记迁移本身是原文, 不计)。
+cg_stop(){ # $1=格名 $2=输出 $3=期望平台行
+  local o="$2"
+  if ! has "$o" '本次不执行迁移' && has "$o" '平台判定所需的证据读不出来' && has "$o" '迁移链停在这里' \
+     && has "$o" 'CHAIN_RC=1' && has "$o" 'CALLS_N=0' && has "$o" 'RESCUE_CALLED=0' && has "$o" "$3"; then ok "$1"
+  else bad "$1 —— $(grep -E 'CHAIN_RC|CALLS_N|RESCUE|PLATFORM|GUESSED|本次不执行迁移|迁移链停在这里|REVERT' <<<"$o" | tr '\n' ' ' | cut -c1-260)"; fi
+}
+o="$(plain "$(chainp PL10 real profile-dir-unit)")"
+cg_stop "PL10: 无标记 + profile 读不出来 + 有 MITM unit + **合法句柄** ⇒ 过了能力门; 标记迁移判无法确认, 链返回 1、其后迁移 0 笔、不落平台标记" "$o" 'PLATFORM=\[\]'
+has "$o" 'GUESSED=no' && ok "PL10b: .guessed 未生成(没有落推测 android)" || bad "PL10b: .guessed 被生成"
+o="$(plain "$(chainp PL11 real ios-readfail)")"
+cg_stop "PL11: 已有 ios 标记但读取失败 + 合法句柄 ⇒ 链返回 1、其后迁移 0 笔, 原标记仍是 ios" "$o" 'PLATFORM=\[ios\]'
+has "$o" 'GUESSED=no' && ok "PL11b: .guessed 状态不变(仍无)" || bad "PL11b: .guessed 被改"
+o="$(plain "$(chainp PL12 real none)")"
+cp_check "PL12: 健康对照 —— 正常读完、确无证据 + 合法句柄 ⇒ 推测 android, 链照走" "$o" \
+  'CHAIN_RC=0' 'RESCUE_CALLED=1' 'PLATFORM=\[android\]' 'GUESSED=yes'
+# 撤销对照(只在副本里改, 各撤一处)
+o="$(plain "$(chainp PR10c real profile-dir-unit rev-chain)")"
+if ! has "$o" 'REVERT_FAILED' && ! has "$o" 'CALLS_N=0' && has "$o" 'RESCUE_CALLED=1'; then
+  ok "PR10c: 只把链里那一句改回 \`|| true\` ⇒ 同一输入下后续迁移重新被执行(PL10 的判据有牙)"
+else bad "PR10c: $(grep -E 'REVERT|CHAIN_RC|CALLS_N|RESCUE' <<<"$o" | tr '\n' ' ')"; fi
+o="$(plain "$(chainp PR10m real profile-dir-unit rev-marker)")"
+if ! has "$o" 'REVERT_FAILED' && has "$o" 'PLATFORM=\[android\]' && has "$o" 'GUESSED=yes'; then
+  ok "PR10m: 只把标记迁移那一支改回「读不出来就推测」⇒ 同一输入重新落盘推测 android(PL10b 的判据有牙)"
+else bad "PR10m: $(grep -E 'REVERT|CHAIN_RC|PLATFORM|GUESSED' <<<"$o" | tr '\n' ' ')"; fi
 
 echo "────────────────────────────────────────"
 echo "通过 $pass, 失败 $nfail"

@@ -38,7 +38,8 @@ run_ok(){
 }
 
 # ── A. migrate_platform_marker(路径 env 注入)──────────────────────────────────
-use_fn migrate_platform_marker
+# 平台怎么定由 _pdg_platform_plan 决定(标记迁移与退役前置共用), 一并抽真身。
+use_fn _pdg_platform_plan migrate_platform_marker
 c_g(){ :; }; c_y(){ :; }
 mk_marker(){ PDG_PLATFORM_FILE="$WORK/platform" PROFILE_ENV="$WORK/profile.env" \
              PDG_MITM_JSON="$WORK/mitm.json" PDG_MITM_UNIT="$WORK/pdg-mitm.service" \
@@ -74,6 +75,91 @@ reset_ev; mk_marker
 reset_ev; printf 'PDG_PLATFORM=android\n' > "$WORK/profile.env"; mk_marker
 { [[ "$(cat "$WORK/platform")" == android ]] && [[ ! -e "$WORK/platform.guessed" ]]; } \
   && ok "有确凿证据(profile.env) → 不打 .guessed" || bad "A2b: 确凿证据也被当成推测"
+reset_ev; printf 'android\n' > "$WORK/platform"; : > "$WORK/platform.guessed"; mk_marker
+{ [[ "$(cat "$WORK/platform")" == android ]] && [[ -e "$WORK/platform.guessed" ]]; } \
+  && ok "A2e: 已有推测 android → 幂等, .guessed 原样保留" || bad "A2e: 推测态被改动"
+# 读不出来的证据: 不采信, 也**不**新建或覆盖 platform / platform.guessed —— 标记迁移返回 2(无法确认),
+# 交给迁移链停下。只有正常读完、确实没有证据时才走推测 android(见上面 A2)。
+c_r(){ :; }
+mk_marker_rc(){ PDG_PLATFORM_FILE="$WORK/platform" PROFILE_ENV="$WORK/profile.env" \
+                PDG_MITM_JSON="$WORK/mitm.json" PDG_MITM_UNIT="$WORK/pdg-mitm.service" \
+                migrate_platform_marker; }
+nomark(){ [[ ! -e "$WORK/platform" && ! -e "$WORK/platform.guessed" ]]; }
+reset_ev; mkdir -p "$WORK/profile.env"; mk_marker_rc; r=$?
+{ [[ "$r" == 2 ]] && nomark; } \
+  && ok "A2f: profile.env 不是普通文件(读不出来)→ 标记迁移返回 2, 不新建平台标记 / .guessed" \
+  || bad "A2f: rc=$r platform=$(cat "$WORK/platform" 2>/dev/null)"
+rmdir "$WORK/profile.env"
+reset_ev; mkdir -p "$WORK/mitm.json"; mk_marker_rc; r=$?
+{ [[ "$r" == 2 ]] && nomark; } \
+  && ok "A2g: mitm.json 查不出来(grep rc=2)→ 返回 2, 不落盘" || bad "A2g: rc=$r platform=$(cat "$WORK/platform" 2>/dev/null)"
+rmdir "$WORK/mitm.json"
+# 半截输出: profile.env 写的是 ios; 读取先吐出 android 再以非 0 收场 —— 不采信, 不落盘
+reset_ev; printf 'PDG_PLATFORM=ios\n' > "$WORK/profile.env"
+sed(){ if [[ "$*" == *PDG_PLATFORM=* ]]; then echo android; return 1; fi; command sed "$@"; }
+mk_marker_rc; r=$?; unset -f sed
+{ [[ "$r" == 2 ]] && nomark; } \
+  && ok "A2h: profile.env 读到一半(先吐 android)再失败 → 返回 2, 不采信半截、不落盘" \
+  || bad "A2h: rc=$r platform=$(cat "$WORK/platform" 2>/dev/null) guessed=$([[ -e "$WORK/platform.guessed" ]] && echo y || echo n)"
+reset_ev; printf 'PDG_PLATFORM=ios\n' > "$WORK/profile.env"; mk_marker
+[[ "$(cat "$WORK/platform")" == ios ]] && ok "A2i: 同一 profile.env 完整读到 → ios(A2h 不是靠恒失败取胜)" || bad "A2i: 健康对照不成立"
+# 取末行那一步先吐再失败, 同样不采信
+reset_ev; printf 'PDG_PLATFORM=ios\n' > "$WORK/profile.env"
+tail(){ echo android; return 1; }
+mk_marker_rc; r=$?; unset -f tail
+{ [[ "$r" == 2 ]] && nomark; } \
+  && ok "A2m: 取末行那一步先吐 android 再失败 → 返回 2, 不落盘" || bad "A2m: rc=$r platform=$(cat "$WORK/platform" 2>/dev/null)"
+# 已有 ios 标记但读取失败(先吐 ios 再非 0): 原文件逐字节不变, .guessed 状态不变
+for gs in absent present; do
+  reset_ev; printf 'ios\n' > "$WORK/platform"; [[ "$gs" == present ]] && : > "$WORK/platform.guessed"
+  h0="$(sha256sum < "$WORK/platform")"
+  cat(){ if [[ "${*: -1}" == "$WORK/platform" ]]; then echo ios; return 1; fi; command cat "$@"; }
+  mk_marker_rc; r=$?; unset -f cat
+  g1=absent; [[ -e "$WORK/platform.guessed" ]] && g1=present
+  if [[ "$r" == 2 && "$(sha256sum < "$WORK/platform")" == "$h0" && "$g1" == "$gs" ]]; then
+    ok "A2j($gs): 已有 ios 标记但读取失败 → 返回 2, 原文件逐字节不变, .guessed 仍为 $gs"
+  else
+    bad "A2j($gs): rc=$r 文件$([[ "$(sha256sum < "$WORK/platform")" == "$h0" ]] && echo 未变 || echo 被改) .guessed=$g1"
+  fi
+done
+# 无标记、profile 读不出来、但有 MITM unit: 不得落推测 android(也不据残缺证据猜 ios)
+reset_ev; mkdir -p "$WORK/profile.env"; : > "$WORK/pdg-mitm.service"; mk_marker_rc; r=$?
+{ [[ "$r" == 2 ]] && nomark; } \
+  && ok "A2k: 无标记 + profile 读不出来 + 有 MITM unit → 返回 2, 不落推测 android" \
+  || bad "A2k: rc=$r platform=$(cat "$WORK/platform" 2>/dev/null) guessed=$([[ -e "$WORK/platform.guessed" ]] && echo y || echo n)"
+rmdir "$WORK/profile.env"
+# _pdg_platform_plan 本身: 原有"最后一条匹配"语义(含末尾空值)、单值、末条覆盖、读取/取末行失败
+plan(){ # $1=profile 内容(printf 格式) $2=可选注入 $3=可选: 换用的助手函数体 → "rc plat guessed src"
+  reset_ev; printf "$1" > "$WORK/profile.env"
+  ( [[ -n "${3:-}" ]] && eval "$3"
+    [[ -n "${2:-}" ]] && eval "$2"
+    PDG_PLATFORM_FILE="$WORK/platform" PROFILE_ENV="$WORK/profile.env" \
+    PDG_MITM_JSON="$WORK/mitm.json" PDG_MITM_UNIT="$WORK/pdg-mitm.service" _pdg_platform_plan
+    printf '%s %s %s %s' "$?" "$_PDG_PLAN_PLAT" "$_PDG_PLAN_GUESSED" "$_PDG_PLAN_SRC" )
+}
+HALF_SED='sed(){ if [[ "$*" == *PDG_PLATFORM=* ]]; then echo android; return 1; fi; command sed "$@"; }'
+HALF_TAIL='tail(){ echo android; return 1; }'
+pchk(){ local got; got="$(plan "$2" "${4:-}")"
+        [[ "$got" == "$3" ]] && ok "$1 → [$got]" || bad "$1: 期望 [$3] 实得 [$got]"; }
+pchk "P1: 末两条 ios + 空值(末条为空 = 没给平台)→ 回退推测 android" 'PDG_PLATFORM=ios\nPDG_PLATFORM=\n' '0 android 1 fallback'
+pchk "P2a: 单值 ios"                'PDG_PLATFORM=ios\n'                      '0 ios 0 profile'
+pchk "P2b: 单值 android"            'PDG_PLATFORM=android\n'                  '0 android 0 profile'
+pchk "P2c: 末条合法值覆盖前一条"     'PDG_PLATFORM=ios\nPDG_PLATFORM=android\n' '0 android 0 profile'
+pchk "P3a: 读取先吐合法词再非 0"     'PDG_PLATFORM=ios\n'                      '2  0 ' "$HALF_SED"
+pchk "P3b: 取末行先吐合法词再非 0"   'PDG_PLATFORM=ios\n'                      '2  0 ' "$HALF_TAIL"
+# 撤销对照: 只把读取那一句退回 274 的写法(先收进变量再取末行、且不查末行那一步), P1/P3b 必须重新出错
+_pp="$(xt _pdg_platform_plan)"
+_new='    pp="$(set -o pipefail; sed -n '"'"'s/^PDG_PLATFORM=//p'"'"' "$prof" 2>/dev/null | tail -n 1)" \'
+_old='    pp="$(sed -n '"'"'s/^PDG_PLATFORM=//p'"'"' "$prof" 2>/dev/null)" \'
+_why='      || { _PDG_PLAN_WHY="profile.env 读不出来($prof)"; return 2; }'
+_rev="${_pp/"$_new"/"$_old"}"; _rev="${_rev/"$_why"/"$_why"$'\n''    pp="$(tail -n 1 <<<"$pp")"'}"
+if [[ "$_rev" == "$_pp" ]]; then bad "P-rev: 副本没改成(找不到读取那一句)"
+else
+  g="$(plan 'PDG_PLATFORM=ios\nPDG_PLATFORM=\n' '' "$_rev")"
+  [[ "$g" == '0 ios 0 profile' ]] && ok "P-rev1: 退回 274 写法 → P1 重新被判成 ios(末尾空值被吞)—— P1 判据有牙" || bad "P-rev1: 退回后实得 [$g]"
+  g="$(plan 'PDG_PLATFORM=ios\n' "$HALF_TAIL" "$_rev")"
+  [[ "$g" == '0 android 0 profile' ]] && ok "P-rev2: 退回 274 写法 → P3b 重新采信半截 android —— P3b 判据有牙" || bad "P-rev2: 退回后实得 [$g]"
+fi
 
 # 推测状态下 migrate_android_cleanup 必须跳过破坏性清理
 use_fn migrate_android_cleanup
@@ -354,21 +440,53 @@ grep -q "$WORK/state" <<<"$out" && ok "回滚不完整时给出保留的材料�
 rm -rf "$WORK/state"/iosgms.* 2>/dev/null
 GMS_RESTART_FAIL=""; GMS_CORE_UNSTABLE=""
 
-# 8) 失败必须被这些调用方收到 —— 用真函数体 + 注入一个必失败的迁移
+# 8) 目标失败传播: migrate_ios_gms_cleanup 失败必须被 run_all_migrations 传出(cmd_update /
+#    cmd_migrate 据此回滚 / 点名快照)。本格**只验这一条传播**:
+#    - 其余迁移一律打桩返回 0 并记账, 名单从真函数体里取, 不手抄;
+#    - _retire_precheck 给恒放行的替身: 只提供本格的健康前提, 不验证能力门(能力门由
+#      caller-gate / entry-contract 驱动产品原文验)。
+#    先前这里既没定义 _retire_precheck、手抄的桩名单也缺了好几条: 链首 127 后 `|| return 1`,
+#    "失败被传出"其实是缺函数造成的非零, 与目标无关(250 起的假绿)。现在分三种判定:
+#    PASS / FAIL / INVALID(外壳执行无效: 缺依赖、目标没被调用)—— INVALID 不计作通过。
+g8(){ # $1=格名 $2=目标返回码 $3=run_all_migrations 函数体 $4=是否给 _retire_precheck 替身(yes|no)
+  local log="$WORK/g8-$1.calls" err="$WORK/g8-$1.err" f
+  : > "$log"
+  ( eval "$3"
+    for f in $(grep -oE 'migrate_[a-z0-9_]+' <<<"$3" | sort -u); do
+      eval "$f(){ echo $f >> '$log'; return 0; }"
+    done
+    eval "migrate_ios_gms_cleanup(){ echo migrate_ios_gms_cleanup >> '$log'; return $2; }"
+    if [[ "$4" == yes ]]; then _retire_precheck(){ echo _retire_precheck >> "$log"; return 0; }; fi
+    c_r(){ :; }
+    run_all_migrations ) > /dev/null 2> "$err"
+  echo $? > "$WORK/g8-$1.rc"
+}
+g8_judge(){ # $1=健康格 $2=失败格 → PASS | FAIL | INVALID
+  local x
+  for x in "$1" "$2"; do
+    if grep -q 'command not found' "$WORK/g8-$x.err" || ! grep -qx migrate_ios_gms_cleanup "$WORK/g8-$x.calls" \
+       || ! grep -qx _retire_precheck "$WORK/g8-$x.calls"; then echo INVALID; return; fi
+  done
+  [[ "$(cat "$WORK/g8-$1.rc")" == 0 && "$(cat "$WORK/g8-$2.rc")" == 1 ]] && echo PASS || echo FAIL
+}
+g8_show(){ echo "      [记录] $1: 原始退出码=$(cat "$WORK/g8-$1.rc") 调用=$(grep -c . "$WORK/g8-$1.calls")笔 目标被调用=$(grep -cx migrate_ios_gms_cleanup "$WORK/g8-$1.calls") stderr=[$(head -c 100 "$WORK/g8-$1.err" | tr '\n' ' ')]"; }
 _rams="$(xt run_all_migrations)"
 [[ -n "$_rams" ]] || bad "抽不到 run_all_migrations"
-( eval "$_rams"
-  for f in migrate_platform_marker migrate_backend_marker migrate_botenv migrate_firewall_to_pdg \
-           migrate_mosdns_concurrent migrate_mosdns_unlock migrate_fw_gms migrate_mosdns_ratelimit \
-           migrate_lowmem migrate_mihomo_safepaths migrate_deploy_botfiles migrate_deploy_units \
-           migrate_mosdns_hijack_shape migrate_custom_hijack migrate_mosdns_mitm \
-           migrate_pdg_mitm_service migrate_android_cleanup migrate_drop_singbox; do
-    eval "$f(){ return 0; }"
-  done
-  migrate_ios_gms_cleanup(){ return 1; }
-  run_all_migrations >/dev/null 2>&1 ) \
-  && bad "run_all_migrations 吞掉了 iOS GMS 清理的失败" \
-  || ok "run_all_migrations 把 iOS GMS 清理的失败传出(cmd_update/cmd_migrate 据此回滚/点名快照)"
+g8 real-ok 0 "$_rams" yes; g8 real-fail 1 "$_rams" yes
+v="$(g8_judge real-ok real-fail)"; g8_show real-ok; g8_show real-fail
+[[ "$v" == PASS ]] \
+  && ok "8a: 前提健康、目标返回 0 → 链返回 0; 只让目标返回 1 → 目标确实被调用、链返回 1 —— 失败传播成立" \
+  || bad "8a: 判定=$v"
+# 撤销对照(只在副本里): 把目标那一句改回 `|| true`, 同一组输入的判定必须转为 FAIL
+_rev8="${_rams/"migrate_ios_gms_cleanup || rc=1"/"migrate_ios_gms_cleanup || true"}"
+[[ "$_rev8" != "$_rams" ]] || bad "8b: 副本没改成(找不到目标那一句)"
+g8 rev-ok 0 "$_rev8" yes; g8 rev-fail 1 "$_rev8" yes
+v="$(g8_judge rev-ok rev-fail)"; g8_show rev-fail
+[[ "$v" == FAIL ]] && ok "8b: 副本里撤掉目标的失败传播 → 判定转为 FAIL(8a 的判据有牙)" || bad "8b: 撤销后判定=$v"
+# 外壳有效性: 故意不给必需依赖 _retire_precheck → 必须登记为「外壳执行无效」, 不能当传播成立
+g8 miss-ok 0 "$_rams" no; g8 miss-fail 1 "$_rams" no
+v="$(g8_judge miss-ok miss-fail)"; g8_show miss-fail
+[[ "$v" == INVALID ]] && ok "8c: 缺必需依赖 → 登记为「外壳执行无效」, 没有冒充失败传播通过" || bad "8c: 缺依赖时判定=$v"
 grep -q 'migrate_ios_gms_cleanup || true' "$ROOT/deploy/bot/pdg.sh" \
   && bad "pdg.sh 里还有 `migrate_ios_gms_cleanup || true`" \
   || ok "pdg.sh 里不再用 || true 吞掉这条关键迁移"

@@ -4388,29 +4388,74 @@ migrate_rescue_plane(){
 # 统一平台判定源: 确保 /etc/privdns-gateway/platform 存在且合法(canonical)。幂等。
 # 缺失/非法时按证据回退: profile.env 的 PDG_PLATFORM → 明确 iOS 证据(pdg-mitm unit / WLOC 配置) → android。
 # 仍无法确定=android, 但 status/doctor 会另行提示"标记缺失回退"(见 _pdg_platform_present / check_platform)。
-migrate_platform_marker(){
-  # 路径可用 env 覆盖(供测试注入), 生产用默认 /etc/privdns-gateway/*。
+# 平台标记迁移**将会**落成什么 —— 只读, 不写任何文件。标记迁移与退役前置共用这一份判定,
+# 「平台怎么定、算不算推测」全项目只在这里定义一次。
+# 之所以要单独提出来: 退役前置排在迁移链第一句, 那时标记迁移还没跑, platform.guessed 还不存在;
+# 前置若直接读盘, 会把一台"还没打标、按规则只会被推测为 android"的老机器当成**确认的** android,
+# 进而去问 Android 清理那一支 —— 而链条自己到时候并不会做那次清理(见 migrate_android_cleanup)。
+# 优先级与标记迁移原来完全相同:
+#   0) 已有合法标记 → 照旧(幂等); 推测与否看现有 platform.guessed
+#   1) profile.env 的 PDG_PLATFORM        → 确定
+#   2) 明确 iOS 证据: pdg-mitm unit / WLOC 配置 → 确定 ios
+#   3) 仍无法确定 → android, **推测**。v1.4.x 把 probe81/描述文件装给所有机器, 它们的存在
+#      证明不了平台; 贸然按 android 做破坏性清理会把真 iPhone 部署的 iOS 组件删掉。
+# 结果放在 _PDG_PLAN_PLAT(ios|android) / _PDG_PLAN_GUESSED(0|1) / _PDG_PLAN_SRC(来源)。
+# 返回 0 = 判定成立; 2 = 判定要读的东西读不出来(无法确认)。读失败**不**当成"没有这项证据",
+# 读到一半再失败的内容也不采信 —— 否则一次读错就会把平台改判成别的。
+_pdg_platform_plan(){
   local pf="${PDG_PLATFORM_FILE:-/etc/privdns-gateway/platform}"
   local prof="${PROFILE_ENV:-/etc/privdns-gateway/profile.env}"
   local mj="${PDG_MITM_JSON:-/etc/privdns-gateway/mitm.json}"
   local mu="${PDG_MITM_UNIT:-/etc/systemd/system/pdg-mitm.service}"
-  local cur; cur="$(cat "$pf" 2>/dev/null)"
-  [[ "$cur" == ios || "$cur" == android ]] && return 0        # 已合法 → 幂等
-  local plat=""
-  # 1) profile.env 的 PDG_PLATFORM
-  if [[ -f "$prof" ]]; then
-    local pp; pp="$(sed -n 's/^PDG_PLATFORM=//p' "$prof" | tail -1)"
-    [[ "$pp" == ios || "$pp" == android ]] && plat="$pp"
+  local cur="" pp="" rc=0 gd=""
+  _PDG_PLAN_PLAT=""; _PDG_PLAN_GUESSED=0; _PDG_PLAN_SRC=""; _PDG_PLAN_WHY=""
+  if [[ -e "$pf" ]]; then
+    cur="$(cat -- "$pf" 2>/dev/null)" || { _PDG_PLAN_WHY="平台标记读不出来($pf)"; return 2; }
   fi
-  # 2) 明确 iOS 证据: 已装 pdg-mitm unit 或存在 WLOC 配置(启用过接管)
-  if [[ -z "$plat" ]]; then
-    if [[ -f "$mu" ]] || grep -q '"wloc"' "$mj" 2>/dev/null; then plat=ios; fi
+  if [[ "$cur" == ios || "$cur" == android ]]; then
+    gd="$(dirname -- "$pf")" || { _PDG_PLAN_WHY="平台标记所在目录取不出来($pf)"; return 2; }
+    _PDG_PLAN_PLAT="$cur"; _PDG_PLAN_SRC=existing
+    [[ -e "$gd/platform.guessed" ]] && _PDG_PLAN_GUESSED=1
+    return 0
   fi
-  # 3) 仍无法确定 → 安全回退 android, 但**标记为推测**。v1.4.x 把 probe81/描述文件装给所有
-  #    机器, 它们的存在证明不了平台; 贸然按 android 做破坏性清理会把真 iPhone 部署的 iOS
-  #    组件删掉。打上 .guessed 后: 破坏性清理一律不做, doctor 持续提示, 等人工确认。
-  local guessed=0
-  [[ -n "$plat" ]] || { plat=android; guessed=1; }
+  if [[ -e "$prof" ]]; then
+    [[ -f "$prof" ]] || { _PDG_PLAN_WHY="profile.env 不是普通文件($prof)"; return 2; }
+    # 与原实现同一语义: 取**最后一条**匹配, 末条为空值也算最后一条(那就是"没给平台")。
+    # 必须在管线里先取末行再收进变量 —— 先收进变量的话, $() 会吃掉末尾空行, 倒数第二条
+    # 就被当成了最后一条。整条管线的退出码都要查(pipefail 只作用于这个子壳), 读到一半
+    # 或取末行失败时, 已经吐出来的内容一律不采信。
+    pp="$(set -o pipefail; sed -n 's/^PDG_PLATFORM=//p' "$prof" 2>/dev/null | tail -n 1)" \
+      || { _PDG_PLAN_WHY="profile.env 读不出来($prof)"; return 2; }
+    if [[ "$pp" == ios || "$pp" == android ]]; then
+      _PDG_PLAN_PLAT="$pp"; _PDG_PLAN_SRC=profile; return 0
+    fi
+  fi
+  if [[ -f "$mu" ]]; then _PDG_PLAN_PLAT=ios; _PDG_PLAN_SRC=mitm-unit; return 0; fi
+  if [[ -e "$mj" ]]; then
+    grep -q '"wloc"' "$mj" 2>/dev/null; rc=$?
+    case "$rc" in
+      0) _PDG_PLAN_PLAT=ios; _PDG_PLAN_SRC=wloc-config; return 0;;
+      1) ;;
+      *) _PDG_PLAN_WHY="mitm.json 查不出来($mj; grep rc=$rc)"; return 2;;
+    esac
+  fi
+  _PDG_PLAN_PLAT=android; _PDG_PLAN_GUESSED=1; _PDG_PLAN_SRC=fallback
+  return 0
+}
+
+migrate_platform_marker(){
+  # 路径可用 env 覆盖(供测试注入), 生产用默认 /etc/privdns-gateway/*。
+  local pf="${PDG_PLATFORM_FILE:-/etc/privdns-gateway/platform}"
+  local rc=0
+  _pdg_platform_plan || rc=$?
+  [[ "$rc" == 0 && "$_PDG_PLAN_SRC" == existing ]] && return 0        # 已合法 → 幂等
+  local plat="$_PDG_PLAN_PLAT" guessed="$_PDG_PLAN_GUESSED"
+  if [[ "$rc" != 0 ]]; then
+    # 证据**读不出来**不是"没有证据": 不新建、不覆盖 platform / platform.guessed, 返回 2 交给
+    # 调用方(迁移链据此停下)。只有正常读完、确实没有证据时, 才走下面那条推测 android 的回退。
+    c_r "❌ 平台判定所需的证据读不出来(${_PDG_PLAN_WHY:-未知}): 本次不补、不改平台标记。"
+    return 2
+  fi
   mkdir -p "$(dirname "$pf")" 2>/dev/null || true
   local t; t="$(mktemp "$(dirname "$pf")/.platform.XXXXXX" 2>/dev/null)" || return 0
   if printf '%s\n' "$plat" > "$t" && mv -f "$t" "$pf"; then
@@ -4610,10 +4655,16 @@ _retire_work_pending(){   # 0=有 / 1=确认没有 / 2=无法确认
   # ── 后续保护点之二: migrate_android_cleanup ────────────────────────────────
   # 它只在"平台确凿是 android"时才动手(推测出来的 android 会自己跳过), 所以这里照它的
   # 条件问, 用的也是它用的那个判据。iosprofile.py 这类只在它清单里的件, 由它覆盖。
-  if [[ "$(_pdg_platform)" == android ]] \
-     && [[ ! -e "$(dirname "${PDG_PLATFORM_FILE:-/etc/privdns-gateway/platform}")/platform.guessed" ]] \
-     && _retire_android_pending "$R"; then
-    _RETIRE_WHY="Android 清理那一支还有退役件要删(_retire_android_pending 判有活)"; return 0
+  # Android 清理那一支只对**确认的** android 适用。前置排在标记迁移之前, 所以这里问的是
+  # 标记迁移**将会**定出的平台与推测性(_pdg_platform_plan), 不是此刻盘上还没写出来的文件。
+  # 判定读不出来 → 无法确认(不当成"不是 android", 也不当成"确认没有待办")。
+  local prc=0
+  _pdg_platform_plan || prc=$?
+  if [[ "$prc" != 0 ]]; then
+    _RETIRE_WHY="平台判定所需的证据读不出来(${_PDG_PLAN_WHY:-未知}), 无法确认 Android 清理那一支是否适用"; return 2
+  fi
+  if [[ "$_PDG_PLAN_PLAT" == android && "$_PDG_PLAN_GUESSED" == 0 ]] && _retire_android_pending "$R"; then
+    _RETIRE_WHY="Android 清理那一支还有退役件要删(_retire_android_pending 判有活; 平台据 ${_PDG_PLAN_SRC} 确认为 android)"; return 0
   fi
 
   # ── 后续保护点之一: migrate_wloc_retire 的五个 need_* ─────────────────────
@@ -6410,7 +6461,9 @@ run_all_migrations(){
   local rc=0
   # 有条件的提前拒绝 —— 只在"确有退役工作 + 调用方能力不足"时成立, 见 _retire_precheck。
   _retire_precheck || return 1
-  migrate_platform_marker || true          # 先统一平台判定源(后续平台相关迁移据此走)
+  # 先统一平台判定源(后续平台相关迁移据此走)。平台证据读不出来(返回 2)时不吞: 判不出平台,
+  # 依赖平台的迁移一个都不跑。其余情形仍是 best-effort, 不拖垮后续。
+  migrate_platform_marker || { [[ $? == 2 ]] && { c_r "❌ 平台判不出来, 迁移链停在这里(后续迁移一个都没跑)。"; return 1; }; }
   migrate_rescue_plane || true             # 老机首次获得救援平面(用户停用过则不动)
   migrate_backend_marker || true           # 再把内核标记落地(别再靠默认值兜底)
   migrate_cidr_single_source || true       # 先立真源: 后续 nft/mosdns/救援都从它读
