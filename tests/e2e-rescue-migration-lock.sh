@@ -79,8 +79,12 @@ _prev_sha="$(git -C "$E2E_ROOT" rev-parse "$PREV^{commit}")"
 # 失败原因与被测对象毫无关系。每格进场先把这些清干净。
 # 冻结桥接对象 —— 这支测试里它是"旧调用方撞上退役门之后, 唯一一条合法的升级路线"的起点。
 # 它在本仓库里确实是 $PREV 的后代、本版的祖先; 合成链照抄这个先后, 不制造假祖先关系。
-BRIDGE_SHA="${PDG_BRIDGE_SHA:-9c9b2681f3ada2155b32ebe372cbc2a154792079}"
+# 当前整合验收所用的冻结桥接身份。显式输入仍然优先(PDG_BRIDGE_SHA), 默认值随整合候选走。
+# 历史证据里的旧对象 9c9b2681f3ada2155b32ebe372cbc2a154792079 不动 —— 那是它当时的结论。
+BRIDGE_SHA="${PDG_BRIDGE_SHA:-6843905e07af5957a3013cab06f11890757fc5e9}"
 BRIDGE_TAG="${PDG_BRIDGE_TAG:-v9.9.8}"     # 排在 $NEW_TAG(v9.9.9) 之前, 语义化顺序与真实顺序一致
+# 本次到底选中了哪一个 —— **完整**打出来, 不靠源码默认值声称。
+echo "   [记录] 本次冻结桥接身份: $BRIDGE_SHA  (来源: ${PDG_BRIDGE_SHA:+显式输入}${PDG_BRIDGE_SHA:-源码默认})"
 EXPECT_DESC="$PREV"                        # 回滚判据里"应当回到哪个 describe"; 桥接跳之后会改写
 
 SNAPD=/var/lib/privdns-gateway/backups

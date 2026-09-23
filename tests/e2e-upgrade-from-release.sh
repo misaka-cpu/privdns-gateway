@@ -45,8 +45,12 @@ echo "══════════ 上一个发布: $PREV → 本版($NEW_TAG,
 # 版本身份一律以**真实文件的内容摘要**为准, 符号计数只作辅助说明。
 # 这几份基准在**任何沙箱重置之前**从 $E2E_ROOT(只读)取出来, 放在 $E2E_TMP 里,
 # e2e_reset_box 不碰 $E2E_TMP 里这几个名字, 所以两条路径用的是同一批基准。
-BRIDGE_SHA="${PDG_BRIDGE_SHA:-9c9b2681f3ada2155b32ebe372cbc2a154792079}"
+# 当前整合验收所用的冻结桥接身份。显式输入仍然优先(PDG_BRIDGE_SHA), 默认值随整合候选走。
+# 历史证据里的旧对象 9c9b2681f3ada2155b32ebe372cbc2a154792079 不动 —— 那是它当时的结论。
+BRIDGE_SHA="${PDG_BRIDGE_SHA:-6843905e07af5957a3013cab06f11890757fc5e9}"
 BRIDGE_TAG="${PDG_BRIDGE_TAG:-v9.9.8}"
+# 本次到底选中了哪一个 —— **完整**打出来, 不靠源码默认值声称。
+echo "   [记录] 本次冻结桥接身份: $BRIDGE_SHA  (来源: ${PDG_BRIDGE_SHA:+显式输入}${PDG_BRIDGE_SHA:-源码默认})"
 CAND_SHA="$(git -C "$E2E_ROOT" rev-parse -q --verify 'HEAD^{commit}')" || CAND_SHA=""
 PREV_SHA="$(git -C "$E2E_ROOT" rev-parse -q --verify "$PREV^{commit}")" || PREV_SHA=""
 [[ -n "$CAND_SHA" && -n "$PREV_SHA" ]] || e2e_skip "读不回 HEAD / $PREV 的提交对象"

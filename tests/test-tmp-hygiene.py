@@ -75,6 +75,11 @@ TMP_LITERAL_OK = {
     ("test-hijack-shape.sh", "/tmp/nocert"),
     # 判据本身就是"凭据不许落在 /tmp", 不提这个词就没法验。
     ("test-rescue-constants.sh", "/tmp/*"),
+    # 这是一个**只读枚举模式**: 它是 `grep -oE` 的正则字符类, 用来从产品输出里把
+    # "本次留下了哪些临时目录"挑出来做残留判据。它自己**不建、不写、不删**任何路径 ——
+    # 落盘的是 $_KEPT_RAW(在 $E2E_TMP 下)。放行的只有 `/tmp/[^ ]+` 这个字符类本身,
+    # 不是整份文件、不是所有 grep、也不是所有 /tmp: 该串在全 tests/ 里只此一处。
+    ("e2e-platform-switch.sh", "/tmp/[^ ]+"),
     # ── python(都是"被拒绝/被记录的路径字面量", 谁也不会去创建它) ──
     ("test-e2e-repo-guard.py", "/tmp/nope.git"),      # 守卫必须拒掉的 remote URL
     ("test-e2e-repo-guard.py", "/tmp/x.git"),         # 同上

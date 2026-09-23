@@ -345,6 +345,17 @@ e2e_tmp_cleanup(){
   return 0
 }
 
+# 取一个路径的设备号, 并**证明这次观测有效**: 退出码必须为 0, 输出必须确实是设备号。
+# 不提供默认值 —— 失败就是失败。用 x/空串顶替会让"没问成"和"真的换了文件系统"长得
+# 一模一样: 前查询失败拿到 x、后查询拿到真数字, 两者不等, 于是把一次失败的观测
+# 念成"私有 /run 已经建立"。半截输出同理: 先输出再失败时 rc 非零, 这里一律不采信。
+_e2e_devnum(){
+  local v
+  v="$(stat -c %d "$1" 2>/dev/null)" || return 1
+  [[ "$v" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$v"
+}
+
 # 重入 namespace: 外层建 overlay 目录并 unshare, 内层挂载
 e2e_enter(){
   # 已经身处一次性隔离环境且是 root(CI 的容器 job) → 直接跑, 不必再自建 namespace。
@@ -368,10 +379,44 @@ e2e_enter(){
     e2e_sandbox_init "${E2E_OVL:-/tmp/e2e-inner.$$}" || exit 1
     e2e_tmp_init || exit 1
     mount -t overlay overlay -o "lowerdir=/etc,upperdir=$E2E_OVL/eu,workdir=$E2E_OVL/ew" /etc \
-      || { echo "[SKIP] overlay /etc 挂不上"; exit 0; }
+      || e2e_skip "overlay /etc 挂不上"       # 经 e2e_skip: 严格模式(CI/PDG_TEST_STRICT)下判失败, 不拿裸 exit 0 冒充
     mount -t overlay overlay -o "lowerdir=/usr/local/bin,upperdir=$E2E_OVL/bu,workdir=$E2E_OVL/bw" /usr/local/bin
     mount -t overlay overlay -o "lowerdir=/opt,upperdir=$E2E_OVL/ou,workdir=$E2E_OVL/ow" /opt
-    mount -t tmpfs tmpfs /run 2>/dev/null || true            # pdg 的 flock 落在 /run(宿主归真 root)
+    # ── 私有 /run: 回收钩子的**前提**, 必须先成立、再武装 ────────────────────
+    # pdg 的 flock 落在 /run(宿主归真 root), 所以这里要盖一层自己的 tmpfs。
+    # 顺序是安全要点, 不是风格问题: e2e_dw_reap 读 /run/pdg-e2e-dw.pid。在这一行
+    # 之前, /run 还是**外层**的 —— 那时任何一步失败退出, EXIT 钩子都会拿外层登记表
+    # 里的 pid 去 kill、拿它登记的 rundir 去 rm -rf。隔离还没成立就动宿主的东西,
+    # 方向完全错了。所以回收钩子挪到确认之后注册; 在此之前一个钩子都不挂。
+    # 另外原先这里是 `|| true`: 挂不上也照跑, 于是"以为在私有 /run 里"跑完全程。
+    # 现在挂不上就停在这里, 一个被测程序都不跑。
+    # 前置查询: 问不到基准设备号就**不挂载**, 停在这里。没有基准就没有可比性,
+    # 挂上去之后也证明不了"换了文件系统", 那一步做了只会把现场弄得更难判。
+    if ! _run_dev0="$(_e2e_devnum /run)"; then
+      e2e_skip "私有 /run 前置查询失败(stat /run 无效) —— 不挂载、不注册回收、不跑被测程序"
+    fi
+    _run_ok=0
+    if mount -t tmpfs tmpfs /run 2>/dev/null; then
+      # 只看 mount 的退出码不够 —— 要拿 st_dev 变化证明**确实换了一个文件系统**,
+      # 再证明它可写(回收要在里面删登记表)。三条都成立才算私有 /run 真的成立。
+      if _run_dev1="$(_e2e_devnum /run)"; then
+        [[ "$_run_dev1" != "$_run_dev0" ]] \
+          && : > /run/.e2e-run-private 2>/dev/null && _run_ok=1
+      else
+        e2e_skip "私有 /run 后置查询失败(挂载后 stat /run 无效) —— 观测无效, 不据此声称隔离成立"
+      fi
+    fi
+    (( _run_ok == 1 )) \
+      || e2e_skip "私有 /run 没能建立 —— 隔离前提不成立: 不跑被测程序, 也不碰外层 /run"
+    # 到这里 /run 才是本轮自己的, 登记表只可能是本轮自己写的。现在才武装回收。
+    # 本地沙箱分支同样要收 dotwitness —— 上面容器分支挂了 e2e_dw_reap, 这里原先一个
+    # 钩子都没挂。而它恰恰是**唯一**能收的人: dotwitness 由内层起, pidfile 落在内层
+    # 自己的这层 /run 上, 外层进程根本看不见那个文件, 外层挂再多钩子也收不到。
+    # 又因为沙箱是 `unshare -rm`(用户+挂载), **没有** PID namespace, 进程不随 namespace
+    # 拆除而死 —— 于是它活到宿主上。实测: 连跑 12 次, 宿主就多了 12 个 dotwitness。
+    # 只挂进程回收, 不挂 e2e_sandbox_cleanup: 内层的 $E2E_OVL 上还压着几层 overlay,
+    # 其 workdir 归 namespace 内的 root, 本来就由外层再进一次 namespace 统一拆。
+    e2e_add_exit_hook e2e_dw_reap
     # 快照目录在 /var/lib/privdns-gateway; 宿主 /var/lib 归真 root, 不覆盖就建不了快照,
     # 而"快照失败即中止更新"是有意设计 → 不覆盖的话整条 update 路径根本走不到。
     mount -t overlay overlay -o "lowerdir=/var/lib,upperdir=$E2E_OVL/vu,workdir=$E2E_OVL/vw" /var/lib \
@@ -1175,6 +1220,14 @@ e2e_mosdns_start(){
       -e '/- tag: dot_server/,$d' /etc/mosdns/config.yaml > "$cfg"
   mosdns start -c "$cfg" -d "$E2E_TMP" >"$E2E_TMP/e2e-mos.log" 2>&1 &
   echo $! > "$E2E_TMP/e2e-mos.pid"
+  # 起了真进程就得有人收 —— 调用方在顺利路径上显式 stop 不够: 中途判红退出、超时被 TERM、
+  # 或 Ctrl-C, 这个 mosdns 都会活下来。沙箱是 `unshare -rm`(用户+挂载), **没有** PID
+  # namespace, 所以它不随沙箱拆除而消失; 而 e2e-serial 是同一个容器里连着跑十几支,
+  # 泄漏体会攥着 127.0.0.1:15353 活到后面那几支。
+  # 另外两个后台进程(tx 探针 / dotwitness)本来就是这么挂的, 这里补齐第三个。
+  # 幂等: e2e_add_exit_hook 自己去重; e2e_mosdns_stop 删 pidfile, 调用方显式调过之后
+  # 钩子再跑一次是 no-op。
+  e2e_add_exit_hook e2e_mosdns_stop
   local _i; for _i in $(seq 1 50); do
     dig +short +time=1 +tries=1 @127.0.0.1 -p 15353 probe.ready A >/dev/null 2>&1 && return 0
     sleep 0.1
