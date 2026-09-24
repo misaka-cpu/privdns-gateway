@@ -378,7 +378,9 @@ e2e_enter(){
   if [[ "${PDG_E2E_INNER:-}" == 1 ]]; then
     e2e_sandbox_init "${E2E_OVL:-/tmp/e2e-inner.$$}" || exit 1
     e2e_tmp_init || exit 1
-    mount -t overlay overlay -o "lowerdir=/etc,upperdir=$E2E_OVL/eu,workdir=$E2E_OVL/ew" /etc \
+    # userxattr: 非特权 userns 里 overlay 只能用 user.* 扩展属性记 opaque 目录; 不带它, 测试删掉一个 lowerdir 里
+    # 也有的目录后就建不回来(281 实测 install -d 失败)。挂不上照旧走下面的 e2e_skip, 不回退、不绕过隔离。
+    mount -t overlay overlay -o "lowerdir=/etc,upperdir=$E2E_OVL/eu,workdir=$E2E_OVL/ew,userxattr" /etc \
       || e2e_skip "overlay /etc 挂不上"       # 经 e2e_skip: 严格模式(CI/PDG_TEST_STRICT)下判失败, 不拿裸 exit 0 冒充
     mount -t overlay overlay -o "lowerdir=/usr/local/bin,upperdir=$E2E_OVL/bu,workdir=$E2E_OVL/bw" /usr/local/bin
     mount -t overlay overlay -o "lowerdir=/opt,upperdir=$E2E_OVL/ou,workdir=$E2E_OVL/ow" /opt
