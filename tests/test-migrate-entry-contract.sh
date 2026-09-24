@@ -46,12 +46,13 @@ if [[ -n "$BASE" && -f "$BASE" ]]; then
   _d="$BOX/a1.diff"; diff <(fnbody "$BASE" run_all_migrations) <(fnbody "$PDG" run_all_migrations) > "$_d"
   _del="$(grep -c '^<' "$_d" || true)"; _add="$(grep -c '^>' "$_d" || true)"
   # 275 按裁决再精确放宽**一处**: 标记迁移那一句由 `|| true` 改为"只在平台观测失败(返回 2)时停链"。
-  # 允许删掉的只有原来那一句; 允许新增的只有: 有条件前置、注释、改后的那一句。
-  _delok="$(grep '^<' "$_d" | grep -cE '^< +migrate_platform_marker \|\| true( |$)' || true)"
-  _addok="$(grep '^>' "$_d" | grep -cE '_retire_precheck \|\| return 1|^> *#|^> +migrate_platform_marker \|\| \{ \[\[ \$\? == 2 \]\] && \{ c_r .*; return 1; \}; \}$' || true)"
-  if [[ "${_del:-0}" == "${_delok:-0}" && "${_del:-0}" -le 1 && "${_add:-0}" == "${_addok:-0}" && "${_add:-0}" -ge 1 ]] \
+  # 282 按裁决再精确放宽**一处**: 自定义放行那一句由 `|| true` 改为"只把返回 3(受管落点准备失败)
+  # 记进最终失败"。允许删掉的只有这两句原文; 允许新增的只有: 有条件前置、注释、改后的这两句。
+  _delok="$(grep '^<' "$_d" | grep -cE '^< +migrate_platform_marker \|\| true( |$)|^< +migrate_nft_extra \|\| true$' || true)"
+  _addok="$(grep '^>' "$_d" | grep -cE '_retire_precheck \|\| return 1|^> *#|^> +migrate_platform_marker \|\| \{ \[\[ \$\? == 2 \]\] && \{ c_r .*; return 1; \}; \}$|^> +migrate_nft_extra \|\| \{ \[\[ \$\? == 3 \]\] && rc=1; \}$' || true)"
+  if [[ "${_del:-0}" == "${_delok:-0}" && "${_del:-0}" -le 2 && "${_add:-0}" == "${_addok:-0}" && "${_add:-0}" -ge 1 ]] \
      && grep -q '_retire_precheck || return 1' "$_d"; then
-    ok "A1: run_all_migrations 相对基线只多那一处有条件前置, 且只把标记迁移那一句换成「平台观测失败才停链」(新增 ${_add} / 删除 ${_del})"
+    ok "A1: run_all_migrations 相对基线只多那一处有条件前置, 只把标记迁移那一句换成「平台观测失败才停链」、自定义放行那一句换成「只把返回 3 记进失败」(新增 ${_add} / 删除 ${_del})"
   else
     bad "A1: run_all_migrations 的改动超出批准范围(新增 ${_add:-?} / 其中合规 ${_addok:-?} / 删除 ${_del:-?} / 其中合规 ${_delok:-?})"
     head -14 "$_d"
@@ -69,6 +70,13 @@ if grep -qE '^  migrate_platform_marker \|\| \{ \[\[ \$\? == 2 \]\] && \{ c_r .*
   ok "A1c: 迁移链不再吞掉平台观测失败(只对返回 2 停链, 其余仍 best-effort)"
 else
   bad "A1c: 迁移链对平台观测失败的处理不是「只对返回 2 停链」"
+fi
+# A1d(不依赖基线): 自定义放行那一句只把返回 3(受管落点准备失败)记进最终失败, 其余返回照旧 best-effort
+if grep -qE '^  migrate_nft_extra \|\| \{ \[\[ \$\? == 3 \]\] && rc=1; \}$' "$_ram0" \
+   && ! grep -qE '^  migrate_nft_extra \|\| true' "$_ram0"; then
+  ok "A1d: 迁移链只把自定义放行的落点准备失败(返回 3)记进最终失败, 其余返回仍 best-effort"
+else
+  bad "A1d: 迁移链对自定义放行落点准备失败的结算不是「只把返回 3 记进失败」"
 fi
 
 echo
@@ -336,14 +344,15 @@ echo "══ 八. 三个调用方各自的失败善后责任(行为) ══"
 # tests/test-migrate-caller-gate.sh 第十五/十六节用产品原文驱动。
 # 打桩必须显式写出来 —— 不定义它的话 `_retire_precheck || return 1` 会 127, 于是每一格
 # 都返回 1, H2 那条反向对照就永远"成立", 等于没验。
-runall(){ # $1 = migrate_wloc_retire 的返回码  $2 = _retire_precheck 的返回码
-  local d="$BOX/runall-$1-$2"; mkdir -p "$d"; : > "$d/calls.log"
+runall(){ # $1 = migrate_wloc_retire 的返回码  $2 = _retire_precheck 的返回码  $3 = migrate_nft_extra 的返回码(缺省 0)
+  local d="$BOX/runall-$1-$2-${3:-0}"; mkdir -p "$d"; : > "$d/calls.log"
   { echo 'set -uo pipefail'
     echo "CALLS=\"$d/calls.log\""
     echo 'for f in $(grep -oE "migrate_[a-z0-9_]+" "'"$PDG"'" | sort -u); do'
     echo '  eval "$f(){ echo \"$f\" >> \"$CALLS\"; return 0; }"'
     echo 'done'
     echo "migrate_wloc_retire(){ echo migrate_wloc_retire >> \"\$CALLS\"; return $1; }"
+    echo "migrate_nft_extra(){ echo migrate_nft_extra >> \"\$CALLS\"; return ${3:-0}; }"
     echo "_retire_precheck(){ return $2; }"
     sed -n "/^run_all_migrations(){/,/^}/p" "$PDG"
     echo 'run_all_migrations; echo "RC=$?"'
@@ -374,6 +383,173 @@ grep -q '__migrate)     need_root __migrate; _lock; run_all_migrations;;' "$PDG"
 awk '/_pdg_svcstate_plan "\$snap"/{s=1} /run_all_migrations/{if(s)m=1} END{exit !m}' "$(fnfile "$PDG" cmd_migrate)" \
   && ok "H5: cmd_migrate 自建快照 + 确认同一份前像 + 自带句柄 —— 它是有能力的调用方, 不会被自己的门挡住" \
   || bad "H5"
+runall 0 0 3; _r3="$RUNALL_OUT"; _n3="$RUNALL_N"
+[[ "$_r3" == "RC=1" ]] \
+  && ok "H6: migrate_nft_extra 返回 3(受管落点准备失败)⇒ run_all_migrations 最终非 0(其后各迁移都返回 0 也冲不掉)" \
+  || bad "H6: 返回 3 却得到 $_r3"
+[[ "${_n3:-x}" == "${_n_ok:-y}" ]] \
+  && ok "H6b: 这一类失败不截断后面的迁移(调用数 $_n3 = 健康对照 $_n_ok)" \
+  || bad "H6b: 调用数 ${_n3:-?} ≠ 健康对照 ${_n_ok:-?}"
+runall 0 0 1; _r4="$RUNALL_OUT"
+[[ "$_r4" == "RC=0" ]] \
+  && ok "H7: migrate_nft_extra 的其它非零(如 1)仍 best-effort, 不升级为失败(口径没有扩大)" \
+  || bad "H7: 返回 1 却得到 $_r4 —— 口径被扩大了"
+
+echo
+echo "══ 九. 自定义放行落点: 准备失败不许被吞(驱动产品原文 migrate_nft_extra; 模型) ══"
+# 这一节是**模型**验证: 取产品原文 migrate_nft_extra, 只把第一行两个落点路径整行换成本用例自己的临时树;
+# install 用 shell 函数注入(真 install 或注入失败), nftscan / nft 是桩(nft 只记调用, 不碰宿主),
+# mktemp 落在本用例目录。验的是本函数的判定与返回码, 不是真实挂载/真实 nft 的行为。
+NX_L1='  local f=/etc/nftables.conf d=/etc/privdns-gateway/nft-input.d'
+# 下面四个小工具都先看执行状态、再用内容; 失败时什么都不打印并返回 2, 调用方记观测无效。
+# 摘要: 文件确实不存在 → ABSENT(合法, N6 就是); 存在就必须读成功且是 64 位十六进制 —— 读失败不改写成"无文件"。
+nxsha(){ [[ -e "$1" || -L "$1" ]] || { [[ -d "${1%/*}" ]] && { printf 'ABSENT'; return 0; }; return 2; }
+         local o; o="$(sha256sum < "$1")" || return 2; o="${o%% *}"; [[ "$o" =~ ^[0-9a-f]{64}$ ]] || return 2; printf '%s' "$o"; }
+# 计数: grep -c 回 0/1 都是结果(1 = 正常零匹配), ≥2 是执行错误; 输出也必须是数字。
+nxcnt(){ local n r; n="$(grep -c -- "$1" "$2")"; r=$?; (( r <= 1 )) && [[ "$n" =~ ^[0-9]+$ ]] || return 2; printf '%s' "$n"; }
+# 生成脚本里被测函数 / 链的返回码: 输出里必须**恰好一行** RC=<数字>, 否则不采信。
+nxrc(){ local l n; l="$(grep -E '^RC=' "$1")" || return 2; n="$(grep -cE '^RC=' "$1")" || return 2
+        [[ "$n" == 1 && "$l" =~ ^RC=([0-9]+)$ ]] || return 2; printf '%s' "${BASH_REMATCH[1]}"; }
+# 在本格输出(落盘的 out.txt)里找产品原话: 0 有 / 1 确认没有; grep 自己出错就置 NX_GERR, 本格不下结论。
+hasout(){ grep -qF -- "$1" "$NX_D/out.txt"; local r=$?; (( r >= 2 )) && NX_GERR=1; return "$r"; }
+nx(){ # $1=案例名 $2=install 注入(real|fail-nodir|fail-leavedir|ok-nodir) $3=配置形态(none|fresh|withinc|nonpdg|weird) $4=nftscan 回码(缺省 1)
+  local d="$BOX/nx-$1" t; t="$d/t"; mkdir -p "$t" "$d/tmp"; : > "$d/calls.log"
+  NX_D="$d"; NX_T="$t"; NX_OBS=""; NX_PRC=""; NX_RC=""; NX_SUBST=""; NX_NFT=""; NX_INST=""; NX_SHA0=""; NX_SHA1=""; NX_DIR=""
+  local pdgconf='#!/usr/sbin/nft -f
+table inet pdg
+delete table inet pdg
+table inet pdg {
+    chain input {
+        type filter hook input priority 0; policy drop;
+        iif "lo" accept
+        tcp dport { 22 } accept
+    }
+}'
+  case "$3" in
+    none)    : ;;
+    fresh)   printf '%s\n' "$pdgconf" > "$t/nftables.conf" ;;
+    withinc) printf '%s\n' "$pdgconf" | sed 's#^    }$#        include "/etc/privdns-gateway/nft-input.d/*.conf"\n    }#' > "$t/nftables.conf" ;;
+    nonpdg)  printf 'table inet filter {\n    chain input {\n        type filter hook input priority 0;\n    }\n}\n' > "$t/nftables.conf" ;;
+    weird)   printf '#!/usr/sbin/nft -f\ntable inet pdg {\n  chain weird {\n    type filter hook forward priority 0;\n  }\n}\n' > "$t/nftables.conf" ;;
+  esac
+  NX_SHA0="$(nxsha "$t/nftables.conf")" || NX_OBS="$NX_OBS 调用前配置摘要"
+  printf 'import sys\nsys.exit(%s)\n' "${4:-1}" > "$d/nftscan.py"
+  printf '#!/bin/bash\necho "nft $*" >> "%s"\nexit 0\n' "$d/calls.log" > "$d/nft"; chmod +x "$d/nft"
+  # 执行前提(抽取原文、替换计数、写出替换后的原文)任何一步不成立都**立即返回、不执行**: 否则半截原文
+  # 或没替换到的产品原文会拿 /etc 下的真实路径去跑(模型只许落在本用例临时树)。错误记进 NX_OBS, 由 nxchk 记失败。
+  fnbody "$PDG" migrate_nft_extra > "$d/fn.raw" || { NX_OBS="$NX_OBS 抽取产品原文失败(rc=$?; 未执行)"; return 0; }
+  local src; NX_SUBST="$(grep -cxF -- "$NX_L1" "$d/fn.raw")"; src=$?
+  # 放行只有一种情形: 计数查询成功(rc 0)且结果恰好是 1。零份 / 多份 / 无输出 / 查询失败 / 半截输出一律阻断。
+  if (( src != 0 )) || [[ "$NX_SUBST" != 1 ]]; then NX_OBS="$NX_OBS 落点替换计数不成立(rc=$src 结果=${NX_SUBST:-空}; 未执行)"; return 0; fi
+  awk -v a="$NX_L1" -v b="  local f=\"$t/nftables.conf\" d=\"$t/nft-input.d\"" '$0==a{print b; next} {print}' "$d/fn.raw" > "$d/fn.sh" \
+    || { NX_OBS="$NX_OBS 写出替换后的原文"; return 0; }
+  { echo 'set -uo pipefail'
+    echo "export TMPDIR=\"$d/tmp\""
+    echo 'c_g(){ echo "$*"; }; c_y(){ echo "$*"; }; c_r(){ echo "$*"; }'
+    echo "_pdg_module(){ echo \"$d/nftscan.py\"; }"
+    echo "_pdg_nft_bin(){ echo \"$d/nft\"; }"
+    case "$2" in
+      real)          echo "install(){ echo \"install \$*\" >> \"$d/calls.log\"; command install \"\$@\"; }" ;;
+      fail-nodir)    echo "install(){ echo \"install \$*\" >> \"$d/calls.log\"; echo 'install: 注入: cannot create directory' >&2; return 1; }" ;;
+      fail-leavedir) echo "install(){ echo \"install \$*\" >> \"$d/calls.log\"; mkdir -p \"\${*: -1}\"; echo 'install: 注入: 建了目录但随后失败' >&2; return 1; }" ;;
+      ok-nodir)      echo "install(){ echo \"install \$*\" >> \"$d/calls.log\"; return 0; }" ;;
+    esac
+    cat "$d/fn.sh"
+    echo 'migrate_nft_extra; echo "RC=$?"'
+  } > "$d/run.sh"
+  # 生成脚本的**进程**退出码(正常是 0: 最后一句是 echo)与其中被测函数的返回码(RC=, 可能正当地是 3)分开记。
+  bash "$d/run.sh" > "$d/out.txt" 2>&1; NX_PRC=$?
+  NX_RC="$(nxrc "$d/out.txt")" || NX_OBS="$NX_OBS 返回码解析"
+  NX_SHA1="$(nxsha "$t/nftables.conf")" || NX_OBS="$NX_OBS 调用后配置摘要"
+  NX_NFT="$(nxcnt '^nft ' "$d/calls.log")" || NX_OBS="$NX_OBS nft调用计数"
+  NX_INST="$(nxcnt '^install ' "$d/calls.log")" || NX_OBS="$NX_OBS install调用计数"
+  NX_DIR=no; [[ -d "$t/nft-input.d" ]] && NX_DIR=yes
+}
+nxchk(){ # $1=编号 $2=说明 $3=条件表达式(bash) —— 执行无效 / 观测无效都记失败, 不下业务结论
+  if [[ -n "$NX_PRC" && "$NX_PRC" != 0 ]]; then
+    bad "$1: **执行无效** —— 生成脚本进程退出码 $NX_PRC(被测函数返回码 ${NX_RC:-未取得} 另记), 不判定: $2"; return; fi
+  if [[ -n "$NX_OBS" ]]; then bad "$1: **观测无效** ——${NX_OBS}, 不判定: $2"; return; fi
+  NX_GERR=0; local r=0; eval "$3" || r=1
+  if (( NX_GERR )); then bad "$1: **观测无效** —— 在本格输出里查找产品原话时 grep 出错, 不判定: $2"; return; fi
+  if (( r == 0 )); then ok "$1: $2"; else bad "$1: $2 —— 实得 RC=$NX_RC 配置变=$([[ $NX_SHA0 == "$NX_SHA1" ]] && echo 否 || echo 是) nft调用=$NX_NFT install调用=$NX_INST 目录=$NX_DIR"; head -6 "$NX_D/out.txt" 2>/dev/null | sed 's/^/      /'; fi
+}
+same(){ [[ "$NX_SHA0" == "$NX_SHA1" ]]; }
+named(){ hasout "$NX_T/nft-input.d" && hasout "$1"; }
+nx N1 real fresh 1
+nxchk N1 "健康创建: 目录建成、include 写入、校验与加载各一次、返回 0" \
+  '[[ $NX_RC == 0 && $NX_DIR == yes && $NX_NFT == 2 ]] && ! same && hasout "已加自定义放行 include 点"'
+nx N2 fail-nodir fresh 1
+nxchk N2 "install 失败且目录不存在: 不改配置、不进校验/加载, 返回 3, 具名报出目录/退出码/错误" \
+  '[[ $NX_RC == 3 && $NX_NFT == 0 && $NX_DIR == no ]] && same && named "退出码 1" && hasout "注入: cannot create directory" && ! hasout "已加自定义放行"'
+nx N3 fail-leavedir fresh 1
+nxchk N3 "install 失败但留下了目录: 仍按真实退出码判失败(返回 3), 不改配置" \
+  '[[ $NX_RC == 3 && $NX_NFT == 0 && $NX_DIR == yes ]] && same && named "退出码 1"'
+nx N4 ok-nodir fresh 1
+nxchk N4 "install 返回 0 却没有目录: 后置检查拒绝(返回 3), 不改配置" \
+  '[[ $NX_RC == 3 && $NX_NFT == 0 && $NX_DIR == no ]] && same && named "返回 0"'
+nx N5 fail-nodir withinc 1
+nxchk N5 "已有 include、目录缺失: 不被幂等短路掩盖(返回 3), 不改配置" \
+  '[[ $NX_RC == 3 && $NX_NFT == 0 ]] && same && named "退出码 1"'
+nx N5h real withinc 1
+nxchk N5h "已有 include、目录正常(健康对照): 幂等返回 0, 不改配置" '[[ $NX_RC == 0 && $NX_NFT == 0 && $NX_DIR == yes ]] && same'
+nx N6 fail-nodir none 1
+nxchk N6 "没有 nftables.conf(不适用): 返回 0, 连 install 都不调" '[[ $NX_RC == 0 && $NX_INST == 0 ]]'
+nx N7 fail-nodir nonpdg 1
+nxchk N7 "非 pdg 配置(不适用): 落点失败也不判, 返回 0, 不改配置" '[[ $NX_RC == 0 && $NX_NFT == 0 ]] && same && ! hasout "落点"'
+nx N8a fail-nodir fresh 0
+nxchk N8a "nftscan 回 0(有冲突, 安全跳过): 落点失败也不判, 返回 0, 不改配置" '[[ $NX_RC == 0 && $NX_NFT == 0 ]] && same && ! hasout "落点"'
+nx N8b fail-nodir fresh 2
+nxchk N8b "nftscan 回 2(读不到, 观测不足而安全跳过): 同上" '[[ $NX_RC == 0 && $NX_NFT == 0 ]] && same && ! hasout "落点"'
+nx N9 fail-nodir weird 1
+nxchk N9 "认不出的形态: 仍按原契约报「自定义形态」、返回 0、不改配置, 落点失败不判" \
+  '[[ $NX_RC == 0 && $NX_NFT == 0 ]] && same && hasout "防火墙是自定义形态" && ! hasout "落点"'
+
+# 链上: **真实** run_all_migrations 原文 + **真实** migrate_nft_extra 原文(同上替换落点), 其余迁移打桩返回 0
+nxchain(){ # $1=install 注入  → NXC_RC / NXC_AFTER(排在它后面的迁移是否被调用)
+  local d="$BOX/nxc-$1" t; t="$d/t"; mkdir -p "$t" "$d/tmp"; : > "$d/calls.log"
+  printf '%s\n' '#!/usr/sbin/nft -f' 'table inet pdg {' '    chain input {' '        type filter hook input priority 0; policy drop;' '    }' '}' > "$t/nftables.conf"
+  printf 'import sys\nsys.exit(1)\n' > "$d/nftscan.py"
+  printf '#!/bin/bash\nexit 0\n' > "$d/nft"; chmod +x "$d/nft"
+  NXC_PRC=""; NXC_RC=""; NXC_AFTER=""; NXC_OBS=""
+  # 与 nx 同一条执行前提: 抽取失败立即返回; 替换计数只有"查询成功且恰好 1"才放行。
+  fnbody "$PDG" migrate_nft_extra > "$d/fn.raw" || { NXC_OBS="$NXC_OBS 抽取产品原文失败(rc=$?; 未执行)"; return 0; }
+  local ns src; ns="$(grep -cxF -- "$NX_L1" "$d/fn.raw")"; src=$?
+  if (( src != 0 )) || [[ "$ns" != 1 ]]; then NXC_OBS="$NXC_OBS 落点替换计数不成立(rc=$src 结果=${ns:-空}; 未执行)"; return 0; fi
+  awk -v a="$NX_L1" -v b="  local f=\"$t/nftables.conf\" d=\"$t/nft-input.d\"" '$0==a{print b; next} {print}' "$d/fn.raw" > "$d/fn.sh" \
+    || { NXC_OBS="$NXC_OBS 写出替换后的原文"; return 0; }
+  { echo 'set -uo pipefail'
+    echo "export TMPDIR=\"$d/tmp\"; CALLS=\"$d/calls.log\""
+    echo 'c_g(){ echo "$*"; }; c_y(){ echo "$*"; }; c_r(){ echo "$*"; }'
+    echo 'for f in $(grep -oE "migrate_[a-z0-9_]+" "'"$PDG"'" | sort -u); do'
+    echo '  eval "$f(){ echo \"$f\" >> \"$CALLS\"; return 0; }"'
+    echo 'done'
+    echo '_retire_precheck(){ return 0; }'
+    echo "_pdg_module(){ echo \"$d/nftscan.py\"; }"
+    echo "_pdg_nft_bin(){ echo \"$d/nft\"; }"
+    case "$1" in
+      real)       echo 'install(){ command install "$@"; }' ;;
+      fail-nodir) echo "install(){ echo 'install: 注入: cannot create directory' >&2; return 1; }" ;;
+    esac
+    cat "$d/fn.sh"                                   # 覆盖上面给 migrate_nft_extra 的桩
+    sed -n "/^run_all_migrations(){/,/^}/p" "$PDG"
+    echo 'run_all_migrations; echo "RC=$?"'
+  } > "$d/run.sh"
+  bash "$d/run.sh" > "$d/out.txt" 2>&1; NXC_PRC=$?          # 进程退出码; 链返回码在 RC= 里, 二者分开记
+  NXC_RC="$(nxrc "$d/out.txt")" || NXC_OBS="$NXC_OBS 返回码解析"
+  grep -qx 'migrate_custom_hijack' "$d/calls.log"
+  case $? in 0) NXC_AFTER=yes ;; 1) NXC_AFTER=no ;; *) NXC_OBS="$NXC_OBS 调用记录查询" ;; esac
+}
+nxcchk(){ # $1=编号 $2=期望链返回码 $3=说明 [$4=yes: 还要求其后的迁移被调用]
+  if [[ -z "$NXC_PRC" ]]; then bad "$1: **观测无效** ——${NXC_OBS}, 不判定: $3"
+  elif [[ "$NXC_PRC" != 0 ]]; then bad "$1: **执行无效** —— 生成脚本进程退出码 $NXC_PRC(链返回码 ${NXC_RC:-未取得} 另记), 不判定: $3"
+  elif [[ -n "$NXC_OBS" ]]; then bad "$1: **观测无效** ——${NXC_OBS}, 不判定: $3"
+  elif [[ "$NXC_RC" == "$2" && ( "${4:-}" != yes || "$NXC_AFTER" == yes ) ]]; then ok "$1: $3"
+  else bad "$1: $3 —— 实得 RC=$NXC_RC 其后迁移被调用=$NXC_AFTER"; fi
+}
+nxchain fail-nodir
+nxcchk N10 1 "真实链 + 真实 migrate_nft_extra: 落点准备失败 ⇒ 链最终返回非 0, 且其后的迁移照常执行后也没把它冲成成功" yes
+nxchain real
+nxcchk N10h 0 "同一条链, 落点正常(健康对照)⇒ 返回 0"
 
 echo "────────────────────────────────────────"
 echo "通过 $pass, 失败 $nfail, 跳过 $skip"

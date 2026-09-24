@@ -6345,8 +6345,25 @@ migrate_nft_extra(){
   local f=/etc/nftables.conf d=/etc/privdns-gateway/nft-input.d
   local inc='        include "/etc/privdns-gateway/nft-input.d/*.conf"'
   [[ -f "$f" ]] || return 0
-  install -d -m755 "$d" 2>/dev/null || true
-  grep -q 'nft-input\.d/\*\.conf' "$f" && return 0          # 已有 → 幂等
+  # 落点准备: 结果(真实退出码 + 能取到的错误输出)先如实记下, 由**确实需要这个落点**的两条路径
+  # 决定是否致命 —— 配置里已经引用它的, 与本次将要写 include 的。其余路径(非 pdg 配置、冲突或
+  # 观测不足而安全跳过、认不出的形态)本来就不改防火墙, 照旧 best-effort, 不因这一步没做成判失败。
+  # 以前是 `install -d … 2>/dev/null || true`: 目录没建成也照样写 include、报"已加", 整条链返回 0。
+  # 返回 3 = 受管落点准备失败(本函数其余路径都不会给出 3), run_all_migrations 只把这一类记进最终失败。
+  local mk_rc=0 mk_err mk_why=""
+  mk_err="$(install -d -m755 "$d" 2>&1 >/dev/null)" || mk_rc=$?
+  if (( mk_rc != 0 )); then
+    mk_why="install -d 退出码 $mk_rc(${mk_err:-没有错误输出}); 事后该目录$([[ -d "$d" ]] && echo 存在 || echo 不存在)"
+  elif [[ ! -d "$d" ]]; then
+    mk_why="install -d 返回 0, 但事后 $d 不是目录"
+  fi
+  mk_why="${mk_why//$'\n'/ }"
+  if grep -q 'nft-input\.d/\*\.conf' "$f"; then          # 已有 include → 它指向的落点必须真的在
+    [[ -z "$mk_why" ]] && return 0                            # 幂等
+    c_r "❌ 自定义放行落点不可用: $d —— $mk_why"
+    c_y "   防火墙配置已经 include 这个目录, 但目录不在/建不出来: 本项迁移未完成(未改动防火墙)。"
+    return 3
+  fi
   grep -q '^table inet pdg {' "$f" || return 0                # 还没装 pdg 表 → 轮不到它
   # 本项目的约定: 现场有 input 链冲突、**或读不到运行 ruleset**时, 一个字节都不动防火墙
   # (见 e2e-custom-nft)。那种机器上别的迁移已经决定不碰这个文件, 这里再插一行就把那条保证
@@ -6382,6 +6399,13 @@ lines[chain_end:chain_end] = [inc]
 open(out, "w", encoding="utf-8").write("\n".join(lines))
 PY
     c_y "  防火墙是自定义形态, 未加自定义放行 include 点(不猜着改)。"; rm -rf "$wd"; return 0
+  fi
+  # 真要写 include 之前: 落点必须已经在。排在 nft -c 之前 —— 否则缺目录可能被读成"nft -c 未过"
+  # 而误走安全跳过; 失败时不校验、不备份、不写、不加载。
+  if [[ -n "$mk_why" ]]; then
+    c_r "❌ 自定义放行落点准备失败: $d —— $mk_why"
+    c_y "   未写 include(未改动防火墙): 本项迁移未完成。"
+    rm -rf "$wd"; return 3
   fi
   local nft; nft="$(_pdg_nft_bin)"
   if [[ -n "$nft" && -x "$nft" ]] && ! "$nft" -c -f "$wd/cand.conf" >/dev/null 2>&1; then
@@ -6486,7 +6510,9 @@ run_all_migrations(){
   # mosdns 起不来, 迁移整份还原并返回 1, 整次更新回滚, 这台机器就再也升不上去了。
   migrate_adblock || rc=1   # 去广告受管块(默认关闭; 失败要让整次更新回滚)
   migrate_ruleset_hijack || true
-  migrate_nft_extra || true
+  # 自定义放行落点准备失败(返回 3)要进最终失败: 目录没建成还写 include / 报"已加", 用户会往一个
+  # 不存在的目录里放规则。它的其它返回照旧 best-effort(不扩大口径)。
+  migrate_nft_extra || { [[ $? == 3 ]] && rc=1; }
   migrate_custom_hijack || true
   # force_hijack 那套结构仍要补: WLOC 退役后它不再服务于 MITM, 但 gfw 模式的 hijack_set、
   # custom_hijack 域名集、明确代理层与去广告受管块都拿它当**插入锚点**(见 lib/mosdns.sh)。
