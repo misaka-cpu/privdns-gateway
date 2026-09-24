@@ -314,12 +314,41 @@ else
   [[ "$_again" == 0 ]] && ok "iOS: 二跑后退役制品仍然不在(退役迁移幂等)" || bad "iOS: 二跑把退役制品弄回来了"
 fi
 
+# ══ 场景三起: 正常迁移走公开入口 `pdg migrate` ═══════════════════════════════
+# 277 基线查明: 场景三到九原先用无句柄的内部入口 `pdg __migrate`。这些格的机器都是**确认的**
+# android, 身上又有 iOS 专属件(共享夹具按通配装进来的), 于是退役前置整条拒掉, 目标迁移一个
+# 都没到达 —— 其中几条 OK 是"链根本没动"时的空转通过。公开入口 `pdg migrate` 由真实产品自己
+# 建快照、服务前像与句柄, 正是用户手打迁移的那条路。无句柄入口的拒绝由场景二-0 专门验,
+# 父子继承锁的内部入口由场景七a 专门验, 这里不混用。
+# 每次调用都把真实退出码和完整输出落到 $E2E_TMP/<名>.log, 不再丢弃 —— 否则判据会在调用
+# 根本没跑成的时候照样成立。$1 = 日志名; 退出码原样交回。
+pmig(){
+  bash /usr/local/bin/pdg migrate >"$E2E_TMP/$1.log" 2>&1
+  local rc=$?
+  echo "   [记录] $1: pdg migrate 退出码 = $rc(完整输出在 $1.log)"
+  return "$rc"
+}
+# 到达证据: 在日志里找**目标迁移自己**说的那句话(固定字符串, 取自产品源码, 归属唯一)。
+# "日志里没有报错文案"证明不了到达 —— 一次根本没执行的调用, 日志同样是空的。三态结算:
+# 找到 = OK; 确认没有 = FAIL; grep 自己出错 = 观测无效(单列, 既不当"没有"也不当"有")。
+# $1=日志名 $2=产品原句 $3=判据说明
+reach(){
+  [[ -n "$2" ]] || { bad "$3 —— 判据原句为空, 无从核对(不按\"找到\"算)"; return 0; }
+  grep -qF -- "$2" "$E2E_TMP/$1.log"
+  case $? in
+    0) ok "$3" ;;
+    1) bad "$3 —— $1.log 里没有目标迁移的这句输出: 「$2」" ;;
+    *) bad "**观测无效** —— 查 $1.log 失败(grep 出错), 不判定到达与否: $3" ;;
+  esac
+}
+
 # ══ 场景三: 已是新形态 + gfw 模式 → 劫持门必须保留 ═══════════════════════════
 echo; echo "── 场景三: 新形态 + gfw 模式 ──"
 rm -f /etc/privdns-gateway/platform.guessed
 printf 'android\n' > /etc/privdns-gateway/platform
 e2e_seed_mosdns gfw
-bash /usr/local/bin/pdg __migrate >/dev/null 2>&1
+pmig mig3g; rc=$?
+[[ "$rc" == 0 ]] && ok "gfw 模式: 迁移整体成功(实际退出码 0)" || bad "gfw 模式: 迁移退出码 $rc: $(tail -3 $E2E_TMP/mig3g.log)"
 { [[ "$(gate)" == 2 ]] && grep -q 'geosite_gfw.txt' /etc/mosdns/config.yaml; } \
   && ok "gfw 模式: 劫持门保留且指向 gfw 劫持集(迁移不把它当 all 拆掉)" || bad "gfw 门=$(gate)"
 
@@ -327,7 +356,7 @@ bash /usr/local/bin/pdg __migrate >/dev/null 2>&1
 # ══ 场景四: v1.7.0 机器 → 明确代理必须先于 geosite_cn 判断 ═══════════════════
 # v1.7.0 及更早, 用户在 bot 里点名指到出口的域名只在 hijack_set 那道门被查, 而那道门排在
 # geosite_cn **之后**。上游 geosite 一旦把某域名归进 CN, DNS 就先返真实地址, 流量根本不进
-# 内核 —— 规则在、doctor 绿、就是不生效。这里跑真的 `pdg __migrate`, 验的是"老机器升上来
+# 内核 —— 规则在、doctor 绿、就是不生效。这里跑真的 `pdg migrate`, 验的是"老机器升上来
 # 之后这件事被修好了, 而用户自己的东西一样没动"。
 echo; echo "── 场景四: v1.7.0 机器升级(指定域名优先级)──"
 # 迁移走 pdgtx: 候选要过 mosdns 强校验(**真启动 mosdns**)。拿不到二进制这条就没得验。
@@ -370,7 +399,7 @@ fhline(){ grep -n 'qname \$force_hijack'   /etc/mosdns/config.yaml | head -1 | c
 
 seed_v170_box
 grep -q explicit_proxy /etc/mosdns/config.yaml && bad "前置: 没退回 v1.7.0 形态"
-bash /usr/local/bin/pdg __migrate >$E2E_TMP/mig4.log 2>&1
+pmig mig4
 rc=$?
 [[ "$rc" == 0 ]] && ok "v1.7.0 迁移整体成功(exit 0)" || bad "迁移退出码 $rc: $(tail -5 $E2E_TMP/mig4.log)"
 
@@ -397,7 +426,9 @@ grep -q '未起 mosdns 校验' $E2E_TMP/mig4.log \
 seed_v170_box
 printf 'domain:admin-kept.example\ndomain:admin-kept2.example\n' > /etc/mosdns/rules/ruleset_hijack.txt
 RSH_BEFORE="$(sha256sum /etc/mosdns/rules/ruleset_hijack.txt | cut -d" " -f1)"
-bash /usr/local/bin/pdg __migrate >$E2E_TMP/mig4b.log 2>&1
+pmig mig4b; rc=$?
+[[ "$rc" == 0 ]] && ok "保留管理员内容的这一次迁移整体成功(实际退出码 0)" \
+  || bad "保留管理员内容的这一次迁移退出码 $rc —— 下面「逐字节保留」在链没跑时也成立, 不算通过: $(tail -3 $E2E_TMP/mig4b.log)"
 [[ "$(sha256sum /etc/mosdns/rules/ruleset_hijack.txt | cut -d" " -f1)" == "$RSH_BEFORE" ]] \
   && ok "已有内容的 ruleset_hijack.txt 逐字节保留(不许无条件清空)" \
   || bad "管理员写的 ruleset_hijack.txt 被迁移清掉了($(wc -l < /etc/mosdns/rules/ruleset_hijack.txt) 行)"
@@ -432,7 +463,9 @@ grep -q 'direct.example' /etc/mosdns/rules/custom_direct.txt \
 
 # 幂等 + 没有留下未完事务
 cp /etc/mosdns/config.yaml $E2E_TMP/m4
-bash /usr/local/bin/pdg __migrate >$E2E_TMP/mig5.log 2>&1
+pmig mig5; rc=$?
+[[ "$rc" == 0 ]] && ok "二跑整体成功(实际退出码 0)" \
+  || bad "二跑退出码 $rc —— 下面的幂等判据即使成立也不算这一次通过: $(tail -3 $E2E_TMP/mig5.log)"
 cmp -s $E2E_TMP/m4 /etc/mosdns/config.yaml && ok "二跑幂等(mosdns 配置逐字节不变)" || bad "二跑改动了 mosdns 配置"
 [[ -z "$(python3 /opt/pdg-bot/pdgtx.py pending 2>/dev/null)" ]] \
   && ok "没有遗留未完成事务" || bad "留下了 pending 事务"
@@ -449,16 +482,27 @@ seed_v170_box
 python3 "$E2E_ROOT/tests/helpers/break-mosdns-anchor.py" /etc/mosdns/config.yaml || bad "构造自定义形态失败"
 # 先跑一遍让**与本次无关**的迁移(如内存模式决定的 cache size)各自落定 —— 否则"配置有没有
 # 被改"会被别人的正常改动淹掉, 断言就成了对整条迁移链的模糊判断。
-bash /usr/local/bin/pdg __migrate >$E2E_TMP/mig6a.log 2>&1
+pmig mig6a; rc=$?
+# 两件事分开判: 明确代理那一步在认不出的形态上局部拒绝(fail-closed, 它自己 return 0, 链上是
+# `|| true`), 与整次命令成功(正常契约返回 0)。局部拒绝不会让整次命令非零 —— 任何非零都记失败,
+# 不当成"预期拒绝"。
+[[ "$rc" == 0 ]] && ok "自定义形态首跑: 整次命令成功(实际退出码 0)" \
+  || bad "自定义形态首跑: 整次命令异常退出(实际退出码 $rc) —— 预期拒绝时整次仍返回 0, 这不是预期拒绝: $(tail -3 $E2E_TMP/mig6a.log)"
+# 产品里好几处迁移都会说"自定义形态"; 这里认的是明确代理那一步自己的那句。
+reach mig6a '自定义形态, 指定域名优先级未迁移' "自定义形态: 首跑就到达了明确代理迁移的形态判断, 由它 fail-closed"
 grep -q explicit_proxy /etc/mosdns/config.yaml \
   && bad "自定义形态: 竟然把明确代理插进去了(该 fail-closed)" \
   || ok "自定义形态: 一次都没往认不出的配置里插东西(fail-closed)"
 cp /etc/mosdns/config.yaml $E2E_TMP/m5
-bash /usr/local/bin/pdg __migrate >$E2E_TMP/mig6.log 2>&1
+pmig mig6; rc=$?
+[[ "$rc" == 0 ]] && ok "自定义形态二跑: 整次命令成功(实际退出码 0)" \
+  || bad "自定义形态二跑: 整次命令异常退出(实际退出码 $rc) —— 预期拒绝时整次仍返回 0, 这不是预期拒绝: $(tail -3 $E2E_TMP/mig6.log)"
 cmp -s $E2E_TMP/m5 /etc/mosdns/config.yaml \
   && ok "自定义形态: 现网配置逐字节未被改(不猜着改)" \
   || bad "自定义形态下配置被改了: $(diff -u $E2E_TMP/m5 /etc/mosdns/config.yaml | head -20 | tr '\n' '|')"
-grep -q '自定义形态' $E2E_TMP/mig6.log && ok "自定义形态: 迁移明确说明未迁移" || bad "迁移日志没说明"
+# 二跑同样只认明确代理那一步自己的那句 —— 泛化的"自定义形态"别的迁移(防火墙 include 点、
+# 用户劫持表)也会说, 不能拿来证明这一步到达。
+reach mig6 '自定义形态, 指定域名优先级未迁移' "自定义形态: 迁移明确说明未迁移"
 [[ -z "$(python3 /opt/pdg-bot/pdgtx.py pending 2>/dev/null)" ]] \
   && ok "自定义形态: 没开事务, 也没留 pending" || bad "自定义形态下留了 pending 事务"
 python3 /opt/pdg-bot/doctor.py --json > $E2E_TMP/doc5.json 2>/dev/null
@@ -480,24 +524,35 @@ stale="$(python3 "$E2E_ROOT/tests/helpers/seed-stale-tx.py" "$TXROOT" PREPARING 
 python3 /opt/pdg-bot/pdgtx.py pending 2>/dev/null | grep -q "$stale" \
   && ok "前置: 陈旧 PREPARING 确实会出现在 pending 输出里(判据不能只看输出)" \
   || bad "前置: 没造出陈旧 PREPARING"
-bash /usr/local/bin/pdg __migrate >$E2E_TMP/mig7.log 2>&1
+pmig mig7; rc=$?
+[[ "$rc" == 0 ]] && ok "陈旧 PREPARING 在场: 迁移整体成功(实际退出码 0)" \
+  || bad "陈旧 PREPARING 在场: 迁移退出码 $rc: $(tail -3 $E2E_TMP/mig7.log)"
 ep_installed \
   && ok "陈旧 PREPARING 在场: 迁移照常完成(没被无关事务挡住)" \
-  || bad "被陈旧 PREPARING 挡住了: $(grep -i 事务 $E2E_TMP/mig7.log | head -2)"
+  || bad "陈旧 PREPARING 在场时明确代理没装上 —— 不预设是谁挡的, 日志里的拒绝/事务提示: $(grep -E '❌|事务' $E2E_TMP/mig7.log | head -2 | tr '\n' ' ')"
 
 # 6b. 真正需要收尾的事务(APPLYING)→ 必须挡住, 且现网一个字节不动
 seed_v170_box
 rm -rf "$TXROOT"; mkdir -p "$TXROOT"
-bash /usr/local/bin/pdg __migrate >$E2E_TMP/mig8a.log 2>&1   # 先让无关迁移落定
+pmig mig8a; rc=$?   # 先让无关迁移落定
+[[ "$rc" == 0 ]] && ok "6b 前置: 先让无关迁移落定的那一次整体成功(实际退出码 0)" \
+  || bad "6b 前置: 落定那一次退出码 $rc: $(tail -3 $E2E_TMP/mig8a.log)"
 python3 "$E2E_ROOT/tests/helpers/strip-explicit-proxy.py" /etc/mosdns/config.yaml || bad "6b 前置失败"
 applying="$(python3 "$E2E_ROOT/tests/helpers/seed-stale-tx.py" "$TXROOT" APPLYING 0)"
 cp /etc/mosdns/config.yaml $E2E_TMP/m6b
-bash /usr/local/bin/pdg __migrate >$E2E_TMP/mig8.log 2>&1
+pmig mig8; rc=$?
+# 拒绝必须由**事务检查那一层**做出: 到达明确代理迁移里的事务判断、点名本格那笔事务、配置未动。
+# 那一层拒绝后自己 return 0, 链上其余迁移照常, 整次命令正常返回 0 —— 两件事分开判: 任何非零
+# 都记失败, 不许拿退役门、缺依赖或别的提前失败顶替事务检查的拒绝。
+[[ "$rc" == 0 ]] && ok "APPLYING: 整次命令成功(实际退出码 0)" \
+  || bad "APPLYING: 整次命令异常退出(实际退出码 $rc) —— 预期拒绝时整次仍返回 0, 这不是预期拒绝: $(tail -3 $E2E_TMP/mig8.log)"
+reach mig8 '有需要收尾的配置事务' "APPLYING: 到达了明确代理迁移里的事务检查, 由它拒绝"
 ep_installed \
   && bad "APPLYING 事务在场却照样迁移了(该挡没挡)" \
   || ok "APPLYING 事务在场: 迁移拒绝执行"
 cmp -s $E2E_TMP/m6b /etc/mosdns/config.yaml && ok "拒绝时现网配置逐字节未动" || bad "拒绝了却改了配置"
-grep -q "$applying" $E2E_TMP/mig8.log && ok "迁移日志点名了挡路的事务 id" || bad "没说明是哪笔事务挡的"
+# 事务 id 为空时 `grep ""` 会匹配任何日志 —— reach 对空原句直接判失败。
+reach mig8 "$applying" "迁移日志点名了挡路的事务 id"
 rm -rf "$TXROOT"; mkdir -p "$TXROOT"
 
 
@@ -527,25 +582,170 @@ rm -rf "$TXROOT"; mkdir -p "$TXROOT"
 # v1.7.8 → v1.8.0 的用户就卡在这里。
 echo; echo "── 场景七a: cmd_update 那样持锁并传下 fd 时, 迁移照常完成 ──"
 seed_v170_box
+# 本格自己播出**具名**的待退役对象: 确认 android 机上的一件 iOS 专属模块, 取自仓库源码(与
+# v1.4.x "iOS 组件装给所有机器"同形)。前面各格走公开入口, Android 清理会合法地删掉这类件,
+# 所以不能指望它还在 —— 这里自己放一件并先确认。它在场, 退役前置就必须去问调用方能力。
+RETIRE_OBJ=/opt/pdg-bot/iosprofile.py
+install -m755 "$E2E_ROOT/deploy/bot/iosprofile.py" "$RETIRE_OBJ"
+{ [[ -f "$RETIRE_OBJ" && "$(cat /etc/privdns-gateway/platform)" == android && ! -e /etc/privdns-gateway/platform.guessed ]] \
+  && ! ep_installed; } \
+  && ok "七a 前置: 确认 android + 具名待退役件 $(basename "$RETIRE_OBJ") 在场 + 明确代理尚未迁移" \
+  || bad "七a 前置: 现场没播对(待退役件/平台/目标迁移状态不符), 本格结论不成立"
 LOCKF="${PDG_LOCKFILE:-/run/privdns-gateway.lock}"
 mkdir -p "$(dirname "$LOCKF")"
 cat > $E2E_TMP/mig9-parent.sh <<'MP'
-set -u
+# 与 cmd_update 同形: 持锁 → 在**自己进程里**调真实 cmd_snapshot(快照与服务前像由它一次存好
+# 并校验)→ 核同一份前像 → 起继承 fd 9 的子进程 `PDG_UPDATE_SVCSTATE=… pdg __migrate`。
+# cmd_snapshot 与它的依赖按名取自**当前已安装**的 /usr/local/bin/pdg(那个文件末尾是主分派,
+# 不能整份 source)。缺任何一件就停: 不补替身、不手写记录、不二次采样。cmd_snapshot 不放进
+# 命令替换或另一个进程 —— 那样写前像的就不是这个持锁父进程了。
+# 每一步的返回码都看: 快照返回非零、子进程接手前的任何观测取不到, 都**不启动**子迁移 ——
+# 不因为产物恰好在盘上就往下走, 也不重采样、不改写前像。
+set -uo pipefail
 exec 9>"${LOCKF}"
 flock -n 9 || { echo "PARENT-LOCK-FAILED"; exit 9; }
-bash /usr/local/bin/pdg __migrate; echo "CHILD-RC=$?"
+PDG_BIN=/usr/local/bin/pdg
+for v in 'REPO_DIR=' 'LOCK=' 'PDG_LOCKED=' 'SNAP_DIR=' '_PDG_SNAP_CREATED=' '_SNAP_SOURCES=' \
+         '_SNAP_OPS=' '_SNAP_META_SCHEMA=' 'declare -A _PDG_WANT_EN=' '_PDG_SVC_MODE=' \
+         '_PDG_SVC_WHY=' '_PDG_SVC_SRC='; do
+  l="$(grep -m1 -e "^$v" "$PDG_BIN")" && eval "$l" || { echo "PARENT-MISSING=var:$v"; exit 8; }
+done
+for f in c_g c_y need_root _lock_inherited _lock _pdg_mktemp_dir _pdg_svc_known _pdg_svc_q \
+         _pdg_svcstate_units _pdg_svcstate_valid _pdg_svcstate_plan _pdg_save_svcstate \
+         _sb_panel_managed_on _sb_write_sanitized _snap_meta_write cmd_snapshot; do
+  b="$(grep -m1 -E "^${f}\(\)\{.*\}[[:space:]]*\$" "$PDG_BIN")" || b="$(sed -n "/^${f}(){/,/^}/p" "$PDG_BIN")"
+  { [[ -n "$b" ]] && eval "$b" && declare -F "$f" >/dev/null; } || { echo "PARENT-MISSING=fn:$f"; exit 8; }
+done
+echo "PARENT-PID=$$"
+PSTART="$(awk '{print $22}' "/proc/$$/stat")" && [[ "$PSTART" =~ ^[0-9]+$ ]] \
+  || { echo "PARENT-OBS-INVALID=parent-start"; exit 6; }
+echo "PARENT-START=$PSTART"
+cmd_snapshot --source cli --op update >"$E2E_TMP/mig9-snap.log" 2>&1
+SRC=$?
+echo "SNAP-RC=$SRC"
+(( SRC == 0 )) || { echo "PARENT-SNAP-FAILED=rc"; exit 7; }
+SNAP="$_PDG_SNAP_CREATED"
+echo "SNAP-CREATED=$SNAP"
+[[ -n "$SNAP" && -f "$SNAP/snap.tar.gz" && -f "$SNAP/svcstate.tsv" ]] || { echo "PARENT-SNAP-FAILED=artifacts"; exit 7; }
+_pdg_svcstate_plan "$SNAP" || { echo "PARENT-PLAN-FAILED=${_PDG_SVC_WHY:-}"; exit 7; }
+_PDG_SVC_SRC=""; _PDG_SVC_MODE=blind
+HP="$(awk -F'\t' '$1=="holder_pid"{print $2; exit}' "$SNAP/svcstate.tsv")" && [[ "$HP" =~ ^[0-9]+$ ]] \
+  || { echo "PARENT-OBS-INVALID=holder_pid"; exit 6; }
+HS="$(awk -F'\t' '$1=="holder_start"{print $2; exit}' "$SNAP/svcstate.tsv")" && [[ "$HS" =~ ^[0-9]+$ ]] \
+  || { echo "PARENT-OBS-INVALID=holder_start"; exit 6; }
+echo "HOLDER-PID=$HP"
+echo "HOLDER-START=$HS"
+# 前像指纹: 摘要与两次 stat **各自**核退出码与输出格式, 三样都取得才输出; 任何一样失败就什么都
+# 不输出并返回非零 —— 不拼空白串, 两份无效结果也就不可能被比成"相等"。
+fp(){
+  local h s1 s2
+  h="$(sha256sum < "$SNAP/svcstate.tsv")" || return 1
+  h="${h%% *}"; [[ "$h" =~ ^[0-9a-f]{64}$ ]] || return 1
+  s1="$(stat -c '%d:%i:%s:%Y' "$SNAP/svcstate.tsv")" || return 1
+  [[ "$s1" =~ ^[0-9]+:[0-9]+:[0-9]+:[0-9]+$ ]] || return 1
+  s2="$(stat -c '%d:%i:%s:%Y' "$SNAP/snap.tar.gz")" || return 1
+  [[ "$s2" =~ ^[0-9]+:[0-9]+:[0-9]+:[0-9]+$ ]] || return 1
+  printf '%s %s %s' "$h" "$s1" "$s2"
+}
+PRE="$(fp)" || { echo "PRE-CHILD-OBS=INVALID"; exit 6; }
+echo "PRE-CHILD=$PRE"
+PDG_UPDATE_SVCSTATE="$SNAP/svcstate.tsv" bash /usr/local/bin/pdg __migrate; echo "CHILD-RC=$?"
+if POST="$(fp)"; then echo "POST-CHILD=$POST"; else echo "POST-CHILD-OBS=INVALID"; fi
+if nw="$(find "$SNAP_DIR" -name svcstate.tsv -newer "$SNAP/svcstate.tsv")"; then
+  n="$(printf '%s' "$nw" | grep -c .)"
+  if (( $? <= 1 )) && [[ "$n" =~ ^[0-9]+$ ]]; then echo "NEWER-SVCSTATE=$n"; else echo "NEWER-SVCSTATE=INVALID"; fi
+else
+  echo "NEWER-SVCSTATE=INVALID"
+fi
 MP
 LOCKF="$LOCKF" bash $E2E_TMP/mig9-parent.sh >$E2E_TMP/mig9.log 2>&1
+RC9P=$?
+echo "   [记录] 七a: 父进程退出码 = $RC9P(完整输出在 mig9.log; 父进程内 cmd_snapshot 的输出在 mig9-snap.log)"
+# 父进程的标记行一次读进来: 读失败就整体观测无效, 不消费半截内容; 只认"大写键=值"的第一次出现。
+M9OBS=0; declare -A M9=()
+if m9txt="$(cat "$E2E_TMP/mig9.log")"; then
+  while IFS= read -r m9ln; do
+    [[ "$m9ln" =~ ^([A-Z0-9-]+)=(.*)$ ]] || continue
+    [[ -n "${M9[${BASH_REMATCH[1]}]+x}" ]] || M9[${BASH_REMATCH[1]}]="${BASH_REMATCH[2]}"
+  done <<< "$m9txt"
+else
+  M9OBS=1
+  bad "**观测无效** —— 读不了 mig9.log(cat 失败), 七a 依赖父进程标记的判据一律不下结论"
+fi
+m9(){ printf '%s' "${M9[$1]-}"; }
 grep -q 'PARENT-LOCK-FAILED' $E2E_TMP/mig9.log \
   && bad "场景七a 前置: 父进程没拿到锁, 用例失去意义" \
   || ok "前置: 父进程持锁并把 fd 9 传给了子迁移(与 cmd_update 同形)"
+# 父外壳自己的退出码单独进结算 —— 与快照返回码、子迁移返回码分开记, 谁也不顶替谁。
+[[ "$RC9P" == 0 ]] && ok "七a: 父进程整体走完(父外壳退出码 0)" \
+  || bad "七a: 父外壳退出码 $RC9P —— 父进程没有正常走完(停止标记: [$(for k in "${!M9[@]}"; do [[ "$k" =~ ^PARENT-(MISSING|SNAP-FAILED|PLAN-FAILED|OBS-INVALID)$ || "$k" == *-OBS ]] && printf '%s=%s ' "$k" "${M9[$k]}"; done)] —— 为空表示父进程自己没留下停止标记)"
+# 以下各条都读父进程的标记; mig9.log 读不了时整段不下结论(上面已单列观测无效)。
+if (( M9OBS == 0 )); then
+  [[ -z "${M9[PARENT-MISSING]+x}" ]] \
+    && ok "七a: cmd_snapshot 及其依赖全部按名取自当前已安装的 pdg" \
+    || bad "七a: 从已安装的 pdg 按名取不到 $(m9 PARENT-MISSING) —— 缺件即停, 不补替身(本格以下结论都不成立)"
+  { [[ "$(m9 SNAP-RC)" == 0 && -n "$(m9 SNAP-CREATED)" ]] \
+    && [[ -z "${M9[PARENT-SNAP-FAILED]+x}" && -z "${M9[PARENT-PLAN-FAILED]+x}" ]]; } \
+    && ok "七a: 持锁父进程在自己进程里调真实 cmd_snapshot, 快照与前像建成并校验通过(目录取自它置的 _PDG_SNAP_CREATED)" \
+    || bad "七a: 父进程没建成快照/前像(SNAP-RC=$(m9 SNAP-RC); 快照停在=$(m9 PARENT-SNAP-FAILED); 前像校验=$(m9 PARENT-PLAN-FAILED)) —— 返回非零即停, 子迁移不启动: $(tail -2 $E2E_TMP/mig9-snap.log 2>/dev/null | tr '\n' ' ')"
+  if [[ -n "${M9[PARENT-OBS-INVALID]+x}" ]]; then
+    bad "**观测无效** —— 父进程读不到 $(m9 PARENT-OBS-INVALID), 不判定 holder, 子迁移未启动"
+  elif [[ -z "${M9[HOLDER-PID]+x}" ]]; then
+    bad "七a: 没取到前像 holder(父进程在读 holder 之前已停), 不判定 holder 是谁"
+  elif [[ "$(m9 HOLDER-PID)" =~ ^[0-9]+$ && "$(m9 HOLDER-PID)" == "$(m9 PARENT-PID)" \
+          && "$(m9 HOLDER-START)" =~ ^[0-9]+$ && "$(m9 HOLDER-START)" == "$(m9 PARENT-START)" ]]; then
+    ok "七a: 前像的 holder 就是持锁父进程(pid $(m9 HOLDER-PID), 启动时刻 $(m9 HOLDER-START))"
+  else
+    bad "七a: 前像 holder 不是持锁父进程(记录 $(m9 HOLDER-PID)/$(m9 HOLDER-START), 父进程 $(m9 PARENT-PID)/$(m9 PARENT-START))"
+  fi
+  S9P="$(grep -c '已保存服务前像' $E2E_TMP/mig9-snap.log)"; S9PR=$?
+  S9C="$(grep -c '已保存服务前像' $E2E_TMP/mig9.log)"; S9CR=$?
+  if (( S9PR >= 2 || S9CR >= 2 )); then
+    bad "**观测无效** —— 数前像保存次数失败(grep rc=$S9PR/$S9CR), 不判定保存了几次"
+  elif [[ "$S9P" == 1 && "$S9C" == 0 ]]; then
+    ok "七a: 前像只由这一次 cmd_snapshot 保存了 1 次, 子迁移没有再存"
+  else
+    bad "七a: 前像保存次数不对(父进程内 $S9P 次, 子迁移 $S9C 次)"
+  fi
+  # 指纹三态: 前置观测失败 = 子迁移不启动; 后置观测失败 = 不宣布前像未变; 都取得才比。
+  if [[ -n "${M9[PRE-CHILD-OBS]+x}" ]]; then
+    bad "**观测无效** —— 子进程接手前的前像指纹没取得, 子迁移未启动"
+  elif [[ -n "${M9[POST-CHILD-OBS]+x}" ]]; then
+    bad "**观测无效** —— 子迁移之后的前像指纹没取得, 不宣布前像未变"
+  elif [[ -z "$(m9 PRE-CHILD)" || -z "$(m9 POST-CHILD)" ]]; then
+    bad "七a: 前像指纹缺一份(前[$(m9 PRE-CHILD)] 后[$(m9 POST-CHILD)]) —— 父进程在取指纹之前已停"
+  elif [[ "$(m9 NEWER-SVCSTATE)" == INVALID ]]; then
+    bad "**观测无效** —— 查\"有没有更晚写出的前像\"失败, 不判定是否被重采样"
+  elif [[ "$(m9 PRE-CHILD)" == "$(m9 POST-CHILD)" && "$(m9 NEWER-SVCSTATE)" == 0 ]]; then
+    ok "七a: 子进程接手前后, 前像的摘要/inode/mtime 与快照身份都没变, 也没有更晚写出的前像(没有重采样覆盖)"
+  else
+    bad "七a: 前像在子进程接手后变了, 或有更晚的前像: 前[$(m9 PRE-CHILD)] 后[$(m9 POST-CHILD)] 更晚=$(m9 NEWER-SVCSTATE)"
+  fi
+fi
 grep -q 'CHILD-RC=0' $E2E_TMP/mig9.log \
   && ok "子迁移复用了继承来的那把锁, 返回 0" \
   || bad "子迁移没跑通: $(grep -iE 'BUSY|锁|CHILD-RC' $E2E_TMP/mig9.log | head -2)"
+# 父进程已经退出: 锁应能被别人重新取得。-E 把"锁被占着"与"试取本身出错"分开。
+flock -n -E 200 "$LOCKF" -c true 2>/dev/null; LKR=$?
+case "$LKR" in
+  0)   ok "七a: 父进程退出后锁可以重新取得(没有遗留的持锁者)" ;;
+  200) bad "七a: 父进程退出后锁仍被占着" ;;
+  *)   bad "**观测无效** —— 试取锁本身失败(flock rc=$LKR), 不判定锁是否已释放" ;;
+esac
+# 具名待退役件只有在能力门放行之后才会被 Android 清理撤除; 门里含 fd 9 的只读持锁证明。
+grep -qE '本次不执行迁移|不执行 WLOC 退役迁移|调用方不具备可靠回滚能力' $E2E_TMP/mig9.log; RF=$?
+grep -qF 'Android: 已清理 iOS 专属残留' $E2E_TMP/mig9.log; AC=$?
+if (( RF >= 2 || AC >= 2 )); then
+  bad "**观测无效** —— 查 mig9.log 失败(grep rc=$RF/$AC), 不判定能力门是否放行"
+elif [[ ! -e "$RETIRE_OBJ" ]] && (( AC == 0 && RF == 1 )); then
+  ok "七a: 退役能力门实际核验后放行 —— 具名待退役件已由 Android 清理合法撤除, 日志无拒绝"
+else
+  bad "七a: 能力门没放行或没走到 Android 清理(待退役件$([[ -e "$RETIRE_OBJ" ]] && echo 仍在 || echo 已不在); 清理句 grep=$AC; 拒绝句 grep=$RF)"
+fi
 
 ep_installed \
   && ok "持锁时迁移照样完成(复用同一把锁, 没有去抢第二把)" \
-  || bad "被锁挡住了: $(grep -iE 'BUSY|事务|锁' $E2E_TMP/mig9.log | head -2)"
+  || bad "持锁时明确代理没装上 —— 不预设是谁挡的, 日志里的拒绝/锁/事务提示: $(grep -E '❌|BUSY|事务|锁' $E2E_TMP/mig9.log | head -2 | tr '\n' ' ')"
 grep -qi 'BUSY' $E2E_TMP/mig9.log && bad "迁移日志里出现了 BUSY(说明还在走 pdgtx 事务)" \
   || ok "迁移日志里没有 BUSY"
 EP="$(epline)"; CN="$(cnline)"
@@ -553,7 +753,9 @@ EP="$(epline)"; CN="$(cnline)"
   && ok "持锁时迁出来的顺序同样正确(explicit_proxy $EP < geosite_cn $CN)" \
   || bad "顺序不对: explicit_proxy=$EP geosite_cn=$CN"
 cp /etc/mosdns/config.yaml $E2E_TMP/m7
-bash /usr/local/bin/pdg __migrate >/dev/null 2>&1
+pmig mig9c; rc=$?
+[[ "$rc" == 0 ]] && ok "持锁迁移后的二跑整体成功(实际退出码 0)" \
+  || bad "持锁迁移后的二跑退出码 $rc —— 下面的幂等判据即使成立也不算这一次通过: $(tail -3 $E2E_TMP/mig9c.log)"
 cmp -s $E2E_TMP/m7 /etc/mosdns/config.yaml && ok "持锁迁移后仍然幂等" || bad "二跑又改了配置"
 ls /etc/mosdns/config.yaml.preexplicit.* >/dev/null 2>&1 \
   && bad "成功后没清掉迁移备份: $(ls /etc/mosdns/config.yaml.preexplicit.* | head -1)" \
@@ -602,7 +804,8 @@ cat > /opt/pdg-bot/rulesets.json <<'RSMETA'
              "format": "source", "path": "/etc/sing-box/rs/rs_demo.json", "label": "演示集"}}
 RSMETA
 : > /etc/mosdns/rules/ruleset_hijack.txt
-bash /usr/local/bin/pdg __migrate >$E2E_TMP/mig10.log 2>&1
+pmig mig10; rc=$?
+[[ "$rc" == 0 ]] && ok "场景八: 迁移整体成功(实际退出码 0)" || bad "场景八: 迁移退出码 $rc: $(tail -3 $E2E_TMP/mig10.log)"
 
 grep -q '^domain:derived.example$'  /etc/mosdns/rules/ruleset_hijack.txt \
   && ok "按规则集派生: domain_suffix → domain:" || bad "缺 domain:derived.example"
@@ -617,12 +820,15 @@ grep -q '规则集派生劫持表' /etc/mosdns/rules/ruleset_hijack.txt \
 
 # 幂等: 二跑内容一字不变
 cp /etc/mosdns/rules/ruleset_hijack.txt $E2E_TMP/rsh1
-bash /usr/local/bin/pdg __migrate >/dev/null 2>&1
+pmig mig10b; rc=$?
+[[ "$rc" == 0 ]] && ok "场景八: 二跑整体成功(实际退出码 0)" \
+  || bad "场景八: 二跑退出码 $rc —— 下面的幂等判据即使成立也不算这一次通过: $(tail -3 $E2E_TMP/mig10b.log)"
 cmp -s $E2E_TMP/rsh1 /etc/mosdns/rules/ruleset_hijack.txt && ok "二跑幂等(派生表逐字节不变)" || bad "二跑改了派生表"
 
 # 管理员手填过的不许覆盖 —— 那是他自己维护的数据
 printf 'domain:handwritten.example\n' > /etc/mosdns/rules/ruleset_hijack.txt
-bash /usr/local/bin/pdg __migrate >$E2E_TMP/mig11.log 2>&1
+pmig mig11; rc=$?
+[[ "$rc" == 0 ]] && ok "手填表那一次迁移整体成功(实际退出码 0)" || bad "手填表那一次迁移退出码 $rc: $(tail -3 $E2E_TMP/mig11.log)"
 grep -q '^domain:handwritten.example$' /etc/mosdns/rules/ruleset_hijack.txt \
   && ok "手填的内容没被覆盖" || bad "把管理员手填的内容冲掉了"
 grep -q '手填的, 未覆盖' $E2E_TMP/mig11.log && ok "并且明确告诉了用户为什么没动" || bad "没说明"
@@ -638,7 +844,8 @@ if mihomo convert-ruleset domain text $E2E_TMP/mrssrc.txt /etc/sing-box/rs/rs_bi
             "path": "/etc/sing-box/rs/rs_bin.mrs", "label": "二进制集"}}
 RSMETA2
   : > /etc/mosdns/rules/ruleset_hijack.txt
-  bash /usr/local/bin/pdg __migrate >$E2E_TMP/mig12.log 2>&1
+  pmig mig12; rc=$?
+  [[ "$rc" == 0 ]] && ok ".mrs: 迁移整体成功(实际退出码 0)" || bad ".mrs: 迁移退出码 $rc: $(tail -3 $E2E_TMP/mig12.log)"
   grep -q '^full:mrsdomain.example$' /etc/mosdns/rules/ruleset_hijack.txt \
     && ok ".mrs: 精确域名派生成 full:" || bad ".mrs 没派生出 full:mrsdomain.example"
   grep -q '^domain:mrssuffix.example$' /etc/mosdns/rules/ruleset_hijack.txt \
@@ -663,7 +870,14 @@ json.dump({"rs_bin": {"url": "http://example.invalid/geo.mrs", "outbound": "jp",
 PY
 cp $E2E_TMP/rsmeta-bad.json /opt/pdg-bot/rulesets.json
 : > /etc/mosdns/rules/ruleset_hijack.txt
-bash /usr/local/bin/pdg __migrate >/dev/null 2>&1
+pmig mig12b; rc=$?
+# 派生那一步对坏档是 best-effort(读不出的规则集派生 0 条, 它自己 return 0, 链上是 `|| true`),
+# 整次命令正常返回 0 —— 两件事分开判。doctor 那一项在全部规则集都读不出时根本不看劫持表文件
+# (checks.py check_ruleset_hijack: 可派生数为 0 就跳过同步比对), 迁移没跑它照样告警, 所以替代不了
+# "派生那一步真的处理过这一份"; 这里要派生那一步写出新表之后自己说的那句。
+[[ "$rc" == 0 ]] && ok "坏 .mrs: 整次命令成功(实际退出码 0)" \
+  || bad "坏 .mrs: 整次命令异常退出(实际退出码 $rc) —— 坏档的预期是派生 0 条、整次仍返回 0, 这不是预期结果: $(tail -3 $E2E_TMP/mig12b.log)"
+reach mig12b '已按现有规则集生成劫持表' "坏 .mrs: 派生那一步实际处理了这份规则集并写出新表"
 python3 /opt/pdg-bot/doctor.py --json > $E2E_TMP/doc8b.json 2>/dev/null
 python3 - <<'PY' && ok "坏 .mrs → doctor 点名读不出域名" || bad "坏 .mrs 没被点名: $(head -c 200 $E2E_TMP/doc8b.json)"
 import json, os, sys
@@ -696,7 +910,8 @@ table inet pdg {
 }
 NFTC
 rm -rf /etc/privdns-gateway/nft-input.d
-bash /usr/local/bin/pdg __migrate >$E2E_TMP/mig13.log 2>&1
+pmig mig13; rc=$?
+[[ "$rc" == 0 ]] && ok "场景九: 迁移整体成功(实际退出码 0)" || bad "场景九: 迁移退出码 $rc: $(tail -3 $E2E_TMP/mig13.log)"
 [[ -d /etc/privdns-gateway/nft-input.d ]] \
   && ok "补出自定义放行目录" || bad "没建目录"
 grep -qF 'include "/etc/privdns-gateway/nft-input.d/*.conf"' /etc/nftables.conf \
@@ -715,7 +930,9 @@ sys.exit(0 if any("nft-input.d" in l for l in body) and "nft-input.d" in body[-1
 PY
 # 幂等
 cp /etc/nftables.conf $E2E_TMP/nft1
-bash /usr/local/bin/pdg __migrate >/dev/null 2>&1
+pmig mig13b; rc=$?
+[[ "$rc" == 0 ]] && ok "场景九: 二跑整体成功(实际退出码 0)" \
+  || bad "场景九: 二跑退出码 $rc —— 下面的幂等判据即使成立也不算这一次通过: $(tail -3 $E2E_TMP/mig13b.log)"
 cmp -s $E2E_TMP/nft1 /etc/nftables.conf && ok "二跑幂等(不重复插入)" || bad "二跑又插了一遍"
 [[ "$(grep -c 'nft-input\.d' /etc/nftables.conf)" == 1 ]] \
   && ok "include 只有一份" || bad "include 重复了 $(grep -c 'nft-input\.d' /etc/nftables.conf) 次"
@@ -724,7 +941,13 @@ cmp -s $E2E_TMP/nft1 /etc/nftables.conf && ok "二跑幂等(不重复插入)" ||
 seed_v170_box
 printf '#!/usr/sbin/nft -f\ntable inet pdg {\n  chain weird {\n    type filter hook forward priority 0;\n  }\n}\n' > /etc/nftables.conf
 cp /etc/nftables.conf $E2E_TMP/nft2
-bash /usr/local/bin/pdg __migrate >$E2E_TMP/mig14.log 2>&1
+pmig mig14; rc=$?
+# include 点那一步在认不出的形态上局部拒绝(不猜着改, 它自己 return 0, 链上是 `|| true`), 整次命令
+# 正常返回 0 —— 两件事分开判。"防火墙文件没变"在迁移根本没执行时也成立, 替代不了"那一步判断过";
+# 这里要它自己说的那句。
+[[ "$rc" == 0 ]] && ok "认不出的防火墙: 整次命令成功(实际退出码 0)" \
+  || bad "认不出的防火墙: 整次命令异常退出(实际退出码 $rc) —— 预期拒绝时整次仍返回 0, 这不是预期拒绝: $(tail -3 $E2E_TMP/mig14.log)"
+reach mig14 '防火墙是自定义形态, 未加自定义放行 include 点' "认不出的防火墙: 到达了 include 点那一步, 由它判定不猜着改"
 cmp -s $E2E_TMP/nft2 /etc/nftables.conf \
   && ok "pdg 表里没有 input chain → 不动防火墙(不猜着改)" || bad "改了认不出的配置"
 rm -f $E2E_TMP/nft1 $E2E_TMP/nft2
