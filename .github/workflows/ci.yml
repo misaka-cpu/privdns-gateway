@@ -1741,7 +1741,11 @@ jobs:
         run: |
           apt-get update -qq
           DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-            bash curl ca-certificates python3 tar gzip unzip dnsutils git coreutils openssl iproute2 >/dev/null
+            bash curl ca-certificates python3 tar gzip unzip dnsutils git coreutils openssl iproute2 procps >/dev/null
+          # procps 提供 pgrep: 串行 runner 每跑完一支都用它清点残留(_serial_leftovers)。缺它时清点只能报
+          # "观测失败"并停下 —— 不放松清点本身, 而是把依赖装上, 并在串行测试之前当场确认可用。
+          command -v pgrep >/dev/null || { echo "缺 pgrep(procps 没装上), 串行残留清点无法进行" >&2; exit 1; }
+          pgrep -V
       # e2e-serial 串行跑 e2e-install / e2e-update 等, 它们的夹具要真 mosdns。
       # 以前这个 job 没有取件步骤 —— 那次下载发生在夹具内部、被脚本的输出捕获吞掉,
       # job 日志上一个字都看不见(审计时才发现它也是消费者)。现在与别的消费者同路。

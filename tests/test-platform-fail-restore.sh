@@ -271,6 +271,8 @@ run_platform(){   # $1=目标平台 $2=fail|nofail $3=场景目录 [$4=被测 pd
     _fnN "$src" _pdg_restore_svcstate; _fnN "$src" cmd_rollback
     _fnN "$src" _retire_caller_gate; _fnN "$src" _retire_allowed
     _fnN "$src" _retire_android_pending; _fnN "$src" _retire_plat_pending
+    # _retire_work_pending 按"标记迁移将会定出的平台"判 Android 分支, 要用 _pdg_platform_plan —— 抽真身, 不补替代实现。
+    _fnN "$src" _pdg_platform_plan
     _fnN "$src" _pdg_lock_proof
     echo "_pdg_module(){ printf '%s\\n' \"$ROOT/deploy/bot/\$1\"; }"
     echo '_pdg_platform(){ cat /etc/privdns-gateway/platform 2>/dev/null; }'
