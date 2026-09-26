@@ -251,23 +251,100 @@ _upd_fail = _upd_mig.group("body") if _upd_mig else ""
     "并且不谎报更新完成(失败分支以 return 1 收尾)")
 
 # ═══ 10b. run_all_migrations 真的把非零传出来(行为级, 不是读源码)═════════
+# 这一节验的是"真实迁移链怎样传播 probe81 的结果", 不是退役能力门本身。外壳里:
+#   · run_all_migrations 是产品原文;
+#   · 链首的 _retire_precheck 给**健康前置替身**(记账后返回 0): 只提供本格的健康前提, 不验证能力门 ——
+#     门由 tests/test-migrate-caller-gate.sh / tests/test-migrate-entry-contract.sh 驱动产品原文验。
+#     先前这里没定义它: 链首 127 → `|| return 1`, probe81 一次都没被调用, "返回非零"照样成立(空判)。
+#   · 链内其它迁移一律"记账 + 返回 0"。名单从函数体的非注释代码里按词取全 —— 先前只按行首取,
+#     漏了同一行分号之后的五个调用(它们 127 后被 `|| true` 吞掉, 外壳其实不完整)。
+#   · probe81 替身记账后返回本格指定的值。
+# 每格分别结算外壳退出码、stderr、RC 记录与调用记录; 任一项不成立都算执行 / 观测无效,
+# 不拿它当"失败被传出来了"的证据。两格都有效之后才判传播。
 print()
 print("══ 10b. run_all_migrations 的 rc(真跑)══")
 _ra_body = extract("run_all_migrations")
-_probe = subprocess.run(
-    ["bash", "-c", "set -u\n"
-     # 把这一轮里除 probe81 外的迁移全桩成成功, 只让 probe81 失败 —— 判据是"这一个失败
-     # 能不能把整体 rc 顶成非零", 不是别的迁移的事。
-     + "\n".join("%s(){ return 0; }" % f for f in re.findall(r"^\s*(migrate_[a-z0-9_]+)",
-                                                             _ra_body, re.M))
-     + "\nmigrate_probe81_public(){ return 1; }\n"
-     + 'c_y(){ :; }; c_g(){ :; }\n'
-     + _ra_body + "\nrun_all_migrations; echo RC=$?"],
-    capture_output=True, text=True, timeout=60)
-_m = re.search(r"RC=(\d+)", _probe.stdout)
-(ok if _m and _m.group(1) != "0" else bad)(
-    "只有 probe81 失败时 run_all_migrations 返回非零(实得 %s)"
-    % (_m.group(1) if _m else _probe.stderr[-120:]))
+_ra_code = "\n".join(re.sub(r"(^|\s)#.*$", "", l) for l in _ra_body.splitlines())
+_ra_migs = sorted(set(re.findall(r"\bmigrate_[a-z0-9_]+\b", _ra_code)))
+# 外壳必需的函数定义: 链内全部迁移、链首前置、函数体里用到的提示函数(c_*)。执行前闸按它核生成的文本。
+_ra_need = set(_ra_migs) | {"_retire_precheck"} | set(re.findall(r"\bc_[a-z]+\b", _ra_code))
+
+
+def _ra_run(cell, target_rc):
+    """真跑一格。返回结算: why 为空才算执行有效; chain 是 RC 记录里的链返回码。"""
+    box = tmpguard.mkdtemp(prefix="pdg-ra10b.")
+    calls = os.path.join(box, "calls")
+    script = ("set -u\n" + 'CALLS="%s"\n' % calls
+              + "".join('%s(){ echo %s >> "$CALLS"; return 0; }\n' % (f, f) for f in _ra_migs)
+              + 'migrate_probe81_public(){ echo migrate_probe81_public >> "$CALLS"; return %d; }\n' % target_rc
+              + '_retire_precheck(){ echo _retire_precheck >> "$CALLS"; return 0; }\n'
+              + "c_y(){ :; }; c_g(){ :; }; c_r(){ :; }\n"
+              + _ra_body + '\nrun_all_migrations; echo "RC=$?"\n')
+    # 执行前闸: 在内存里核**实际生成的文本**(只认本节生成的两种写法: 行首 `名(){` 与同一行 `; 名(){`),
+    # 必需定义缺一个就不启动执行它的子进程 —— 不是先跑起来, 再从 stderr 里发现缺件。
+    _defs = set(re.findall(r"(?:^|;[ \t]*)([A-Za-z_][A-Za-z0-9_]*)\(\)\{", script[:script.index(_ra_body)], re.M))
+    if _ra_need - _defs:
+        return {"cell": cell, "launched": False, "chain": None, "rc": None, "n_t": None,
+                "why": ["执行前闸: 生成文本里缺必需函数定义 %r —— 未启动执行" % sorted(_ra_need - _defs)[:5]]}
+    r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60)
+    why, chain, seq, n_t = [], None, None, None
+    if r.returncode != 0:
+        why.append("外壳退出码 %d" % r.returncode)
+    if r.stderr.strip():
+        why.append("stderr 非空: %r" % r.stderr.strip()[-160:])
+    out = r.stdout.splitlines()
+    if len(out) == 1 and re.fullmatch(r"RC=\d+", out[0]):
+        chain = int(out[0][3:])
+    else:
+        why.append("RC 记录不是恰好一行合法的 RC=<数字>(实得 %r)" % r.stdout[-120:])
+    try:
+        seq = Path(calls).read_text(encoding="utf-8").splitlines()
+    except OSError as e:
+        why.append("调用记录读不出来(%s)" % e)
+    if seq is not None:
+        unknown = [s for s in seq if s not in set(_ra_migs) | {"_retire_precheck"}]
+        if unknown:
+            why.append("调用记录里有未知条目 %r" % unknown[:3])
+        if seq.count("_retire_precheck") != 1:
+            why.append("前置替身被调用 %d 次" % seq.count("_retire_precheck"))
+        n_t = seq.count("migrate_probe81_public")
+        if n_t != 1:
+            why.append("目标被调用 %d 次" % n_t)
+        got = {s for s in seq if s.startswith("migrate_")}
+        if got != set(_ra_migs):
+            why.append("实际调用的迁移与函数体名单不一致(没调到 %r, 名单外 %r)"
+                       % (sorted(set(_ra_migs) - got)[:3], sorted(got - set(_ra_migs))[:3]))
+    return {"cell": cell, "launched": True, "why": why, "chain": chain, "rc": r.returncode, "n_t": n_t}
+
+
+def _ra_got(c):
+    """实得值: 没启动就写"未执行 / 未取得", 不填 0; 启动了但没取到的也写"未取得"。"""
+    if not c["launched"]:
+        return "外壳 未执行, 链 未取得, 目标调用 未取得"
+    v = [("未取得" if x is None else x) for x in (c["rc"], c["chain"], c["n_t"])]
+    return "外壳 %s, 链 %s, 目标调用 %s" % tuple(v)
+
+
+_ra_pre = [w for w, bad_ in (("抽不到 run_all_migrations", not _ra_body),
+                             ("链内没有 migrate_probe81_public 调用", "migrate_probe81_public" not in _ra_migs)) if bad_]
+if _ra_pre:
+    bad("10b 前提不成立: %s —— 不生成、不执行外壳, 传播未判" % "; ".join(_ra_pre))
+else:
+    ok("10b 前提: 抽到 run_all_migrations, 链内 %d 个迁移调用都给了受控替身(含 probe81)" % len(_ra_migs))
+    _ra_h, _ra_f = _ra_run("健康", 0), _ra_run("失败", 1)
+    for _c in (_ra_h, _ra_f):
+        (ok if not _c["why"] else bad)(
+            "10b-%s格 执行有效(外壳退出 0 / stderr 空 / RC 恰一行 / 前置 1 次 / 目标 1 次 / 调用集合 = 名单;"
+            " 实得 %s)%s"
+            % (_c["cell"], _ra_got(_c),
+               "" if not _c["why"] else " —— **执行或观测无效**: " + "; ".join(_c["why"])))
+    if _ra_h["why"] or _ra_f["why"]:
+        bad("10b 失败传播: **未判定** —— 有执行 / 观测无效的格, 不拿它当传播成立")
+    else:
+        (ok if _ra_h["chain"] == 0 else bad)(
+            "10b-健康格: probe81 返回 0、其余迁移全成功 → 链返回 0(实得 %s)" % _ra_h["chain"])
+        (ok if _ra_f["chain"] == 1 else bad)(
+            "10b-失败格: 只让 probe81 返回 1(被调用 1 次, 其余迁移全成功)→ 链返回 1(实得 %s)" % _ra_f["chain"])
 
 print()
 print("══ 10c. __migrate 与平台切换这两层 ══")
