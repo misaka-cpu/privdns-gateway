@@ -308,6 +308,8 @@ run_platform(){
     _fnN "$src" _pdg_set_enable_state
     _fnN "$src" _pdg_restore_svcstate; _fnN "$src" cmd_rollback
     _fnN "$src" _pdg_lock_proof
+    # _retire_work_pending 按"标记迁移将会定出的平台"判 Android 分支, 要用 _pdg_platform_plan —— 抽真身, 不补替代实现。
+    _fnN "$src" _pdg_platform_plan
     grep -m1 '^_RETIRE_UNDO=' "$src"; grep -m1 '^_RETIRE_TMP=' "$src"
     grep -oE '^_retire_[a-z0-9_]+\(\)\{' "$src" | sed 's/(){$//' | sort -u | while read -r _rf; do _fnN "$src" "$_rf"; done
     _fnN "$src" migrate_wloc_retire
