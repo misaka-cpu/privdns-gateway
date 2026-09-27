@@ -20,8 +20,12 @@
 # 路径都落在本支临时目录:
 #   外部命令替身: systemctl / journalctl / logger 是 $T/bin 下的可执行脚本(只在格的子壳里放到 PATH 最前 —— ③ 的查询记账
 #     包装与真实运行一样经 PATH 截到它们): systemctl 按表作答(状态词 / 退出码 / stderr, 可指定"第 N 次调用"的应答),
-#     journalctl / logger 模拟界桩与启动事件记录; curl、dig、ss、sleep(空转)是格内函数 —— 每次被调都记进 $T/fk-<格名>;
-#   本格无关依赖: bridge_svc_sample(按夹具文件落盘)。
+#     journalctl / logger 模拟界桩与启动事件记录; curl、dig、ss、sleep(整数秒空转, 小数秒实睡 0.02 s)是格内函数 —— 每次被调都记进 $T/fk-<格名>;
+#   DNS(317): dig 替身是一个 mosdns 行为模型: systemctl restart 替身换"实例"(InvocationID / MainPID 随之变, 模拟 journal 记一条 Started)
+#     并按 mosdns 启动时加载的口径快照接管表 / geosite_cn / 明确代理集 / local_upstream 那一行; 查询按该实例的快照与缓存作答
+#     (接管 → H; 明确代理 → H; geosite_cn → local_upstream: 指向自有上游且上游进程在 ⇒ U 并代写上游日志 / 计数; 其余 → 末尾 all 劫持 H);
+#     自有上游由契约内的小 python 进程顶替(只写启动记录与就绪行、长睡、不监听端口)。③ 的仪器、标定、还原、观测、来源判据都执行原文;
+#   本格无关依赖: bridge_svc_sample(按夹具文件落盘)、e2e_add_exit_hook(与 e2e-lib 同义: 退出时执行登记的函数)。
 # 这些仍是模型验证, 不冒充真实 systemd、journal、DNS、HTTP 验收。
 # ③ 主流程在调用之后的其余接线(W2–W7、K、A4、A6 的调用点)只做静态核对(二-9 起), 读取器本身在三 / 四里受控驱动。
 # 临时仓库的写操作(add / commit / tag / checkout / config / remote)逐调用点走 e2e_git 并显式指定目标仓库。
@@ -34,7 +38,12 @@ pass=0; nfail=0
 ok(){ echo "[OK]   $1"; pass=$((pass+1)); }
 bad(){ echo "[FAIL] $1"; nfail=$((nfail+1)); }
 T="$(mktemp -d "${TMPDIR:-/tmp}/r3c.XXXXXX")" || { echo "[未执行] 建不出临时目录"; echo "通过 0, 失败 1"; exit 1; }
-trap 'rm -rf -- "$T"' EXIT
+reap_stubs(){ local p c; [[ -f "$T/stub-pids" ]] || return 0   # 受控上游进程只按登记 PID 且命令行相符时收
+  while IFS= read -r p; do
+    [[ "$p" =~ ^[0-9]+$ ]] || continue
+    c="$( { tr '\0' ' ' < "/proc/$p/cmdline"; } 2>/dev/null)"; [[ "$c" == *"$T/fake-stub.py"* ]] && kill "$p" 2>/dev/null
+  done < "$T/stub-pids"; }
+trap 'reap_stubs; rm -rf -- "$T"' EXIT
 for f in "$R3" "$HOP2" "$WF" "$ROOT/tests/repoguard.sh"; do [[ -f "$f" ]] || { bad "找不到 $f"; echo "通过 $pass, 失败 $nfail"; exit 1; }; done
 git -C "$ROOT" cat-file -e "$BASE^{commit}" 2>/dev/null \
   || { bad "取不到验收基线对象 $BASE —— 接线核对无从谈起"; echo "通过 $pass, 失败 $nfail"; exit 1; }
@@ -144,7 +153,7 @@ else bad "二-6 没有显式清掉 PDG_UPDATE_SVCSTATE"; fi
 grep -E '\b(cp|install|rsync|mv|ln)\b' "$T/r3code.txt" > "$T/r3write.txt"
 if grep -qE '(/usr/local/bin|/opt/|R3_CLI|R3_MODDIR|R3_REPO)' "$T/r3write.txt"; then bad "二-7 ③ 脚本在往现役目录写文件(拷候选冒充升级)"
 else ok "二-7 ③ 脚本不向 /usr/local/bin、/opt 或现役仓库拷文件"; fi
-for f in tests/e2e-real-bridge-hop.sh tests/e2e-lib.sh tests/e2e-real-platform-fail.sh tests/repoguard.sh deploy/bot/pdg.sh; do
+for f in tests/e2e-real-bridge-hop.sh tests/e2e-lib.sh tests/e2e-real-platform-fail.sh tests/repoguard.sh tests/helpers/dns-stub.py deploy/bot/pdg.sh; do
   if git -C "$ROOT" diff --quiet "$BASE" -- "$f" 2>/dev/null && git -C "$ROOT" diff --quiet -- "$f" 2>/dev/null; then ok "二-8 $f 相对基线逐字不变"
   else bad "二-8 $f 相对基线有改动"; fi
 done
@@ -158,7 +167,10 @@ only_in "comm 快照差集"      '(^|[^a-z_])comm[[:space:]]+-'   r3_snapdiff
 only_in "保留项元数据 stat"  "stat -c '%a %u:%g'"             r3_keepfp
 only_in "tag 查询"           'refs/tags/'                     r3_tagsha
 only_in "curl 状态码查询"    'curl -s -o'                     r3_http_code
-only_in "dig 查询"           'dig \+time'                     r3_dns_a
+only_in "dig 查询"           'dig \+time'                     r3_dns_probe
+only_in "mosdns 重启"        'systemctl restart mosdns'       r3_dns_restart
+only_in "前阶段 DNS 判据"    'r3_dns_phase pre'               r3_runtime_gate
+only_in "后阶段 DNS 判据"    'r3_dns_phase post'              r3_post_runtime
 only_in "is-active 查询"     'systemctl is-active'            r3_unit_q
 only_in "is-enabled 查询"    'systemctl is-enabled'           r3_unit_q
 only_in "LoadState 查询"     'show -p LoadState'              r3_unit_q
@@ -176,14 +188,30 @@ n_exp="$(grep -cE 'export\s+(-f\s+)?systemctl|declare\s+-[a-z]*x[a-z]*\s+-?f?\s*
   || bad "二-16 持续运行接线不对(直接调共享 $n_ssa / 经 ③ $n_rsa / 窗口调用 $n_win / 导出或同名 $n_exp)"
 grep -qF '运行态 / WLOC 前像门: 调用前逐项现查。契约测试在受控外部命令下执行它的判断原文' "$R3" && ! grep -qF '只能在真机上看' "$R3" \
   && ok "二-17 ③ 里'运行态门只能在真机上看, 所以不进契约'的过时注释已更正" || bad "二-17 过时注释还在"
+n_ctx="$(grep -cE 'r3_unit_q active [^;]+ "[^"]+"' "$T/r3code.txt")"
+[[ "$n_ctx" == 1 ]] && grep -qF 'if ! r3_unit_q active pdg-mitm "$ld"; then' "$T/r3code.txt" \
+  && ok "二-18 只有 W1 给 is-active 传同一 unit 已取得的 LoadState(其它 active 查询严格度不变)" || bad "二-18 带 LoadState 的 active 查询 $n_ctx 处(应只有 W1 那 1 处)"
+gi="$(awk '/^r3_gated_invoke\(\)\{/{f=1} f; f&&/^}/{exit}' "$R3")"
+o1="$(grep -nF 'r3_bridge_identity_gate; g=$?' <<<"$gi" | cut -d: -f1)"; o2="$(grep -nxF '  r3_dns_instrument || return 15' <<<"$gi" | cut -d: -f1)"
+o3="$(grep -nxF '  r3_runtime_gate || return 12' <<<"$gi" | cut -d: -f1)"; o4="$(grep -nxF '  r3_invoke || { echo "  调用前停止: $R3_WHY"; return 14; }' <<<"$gi" | cut -d: -f1)"
+{ [[ -n "$o1" && -n "$o2" && -n "$o3" && -n "$o4" ]] && (( o1 < o2 && o2 < o3 && o3 < o4 )) && [[ "$(grep -c 'r3_dns_instrument' "$T/r3code.txt")" == 2 ]]; } \
+  && ok "二-19 阶段顺序: 桥接身份门 → DNS 仪器(不成立返回 15, 不调用)→ 运行态门 → … → 唯一调用; 仪器只在门里被调 1 次" \
+  || bad "二-19 阶段顺序不对(身份门=$o1 仪器=$o2 运行态门=$o3 调用=$o4)"
+n_olddns="$(grep -cE '(^|[^A-Za-z0-9_])(r3_dns_a|r3_ip_in)([^A-Za-z0-9_]|$)|\+short' "$T/r3code.txt")"
+grep -qxF 'R3_STUB="$E2E_ROOT/tests/helpers/dns-stub.py"; R3_STUB_PID=""; R3_DNS_RESTARTS=0' "$R3" && [[ "$n_olddns" == 0 ]] \
+  && ok "二-20 自有上游 = 既有 tests/helpers/dns-stub.py(原样, 见二-8); 旧的 dig +short 读取器与'答 H 即接管'判据已不在" \
+  || bad "二-20 自有上游路径不对, 或旧 DNS 形态仍有 $n_olddns 处"
+n_w="$(grep -cE '(r3_dns_write [^;]*|>) *"\$(HIJ|R3_GEOCN|R3_MOSCFG)"' "$T/r3code.txt")"; n_mode="$(grep -cE 'PDG_HIJACK_MODE|_mosdns_hijack_shape|profile\.env' "$T/r3code.txt")"
+[[ "$n_w" == 4 && "$n_mode" == 0 ]] && ok "二-21 ③ 对 mosdns 配置 / geosite_cn / 接管表的写入只有 4 处(配置与 geosite_cn 各 1、接管表临时追加与还原各 1); 不碰劫持模式与 profile.env" \
+  || bad "二-21 mosdns 相关写入 $n_w 处(应 4), 碰劫持模式 / profile.env 的 $n_mode 处"
 n_old="$(grep -cE 'keep_fp|124=超时|\|\| *c=0' "$T/r3code.txt")"
 [[ "$n_old" == 0 ]] && ok "二-9 旧形态(② 的 keep_fp、「124=超时」、计数 0 兜底)已不在" || bad "二-9 旧形态仍有 $n_old 处"
 grep -qxF 'KREQ=("$CA_DIR/ca.crt" "$CA_DIR/ca.key" "$R3_ETC/platform")' "$R3" && grep -qxF 'KOPT=("$R3_ETC/bot.env" "$R3_MODDIR/dot-domain")' "$R3" \
   && ok "二-10 保留项: 必需 = CA 两件 + 平台标记, 可选 = bot.env / dot-domain(309 plan K1/K2)" || bad "二-10 保留项集合不是 309 plan 的 K1/K2"
 grep -qxF 'r3_count_init || { echo "[HARD-STOP] 调用计数初始化失败: $R3_WHY —— 不调用" >&2; exit 1; }   # 任何门之前先落 0 并读回' "$R3" \
   && ok "二-11 调用计数初始化失败即具名硬停" || bad "二-11 调用计数初始化没有具名硬停"
-n_case="$(grep -cE '^  (13|14|\*)\) +bad ' "$T/r3code.txt")"
-[[ "$n_case" == 3 ]] && ok "二-12 主流程对 13 / 14 与未登记的门返回值都停在调用之后的判据之前" || bad "二-12 主流程的门返回值分支不全($n_case/3)"
+n_case="$(grep -cE '^  (13|14|15|\*)\) +bad ' "$T/r3code.txt")"
+[[ "$n_case" == 4 ]] && ok "二-12 主流程对 13 / 14 / 15 与未登记的门返回值都停在调用之后的判据之前" || bad "二-12 主流程的门返回值分支不全($n_case/4)"
 
 echo; echo "══ 三. ③ 判据函数(受控输入) ══"
 xfn(){   # $1=来源 $2..=名字 → 打印唯一成对标记之间的原文; 标记不唯一成对即失败
@@ -194,7 +222,7 @@ xfn(){   # $1=来源 $2..=名字 → 打印唯一成对标记之间的原文; �
     sed -n "$((b+1)),$((e-1))p" "$src"
   done
 }
-R3_BLOCKS=(r3_count r3_read r3_real2_gate r3_bridge_identity_gate r3_keep r3_precapture r3_invoke r3_gated_invoke r3_arrival_verdict r3_svc_class r3_svc_verdict r3_stable r3_runtime_gate r3_post)
+R3_BLOCKS=(r3_count r3_read r3_real2_gate r3_bridge_identity_gate r3_keep r3_precapture r3_invoke r3_gated_invoke r3_arrival_verdict r3_svc_class r3_svc_verdict r3_stable r3_dns r3_runtime_gate r3_post)
 if xfn "$R3" "${R3_BLOCKS[@]}" > "$T/r3fns.sh" \
    && xfn "$HOP2" bridge_row_valid > "$T/hop2fns.sh" && bash -n "$T/r3fns.sh" && bash -n "$T/hop2fns.sh" \
    && xfn "$ROOT/tests/e2e-real-platform-fail.sh" svc_stable_window unit_identify wait_stable _unit_wants_mainpid \
@@ -216,6 +244,7 @@ stub_tail(){ cat <<'EOS'
 printf '%s\n' "$*" >> "${STUB_CALLS:?}"
 printf '%s\n' "${STUB_OUT:-}"
 sleep "${STUB_SLEEP:-0}"
+if [[ -n "${STUB_EFFECT:-}" ]]; then bash -c "$STUB_EFFECT" || exit 97; fi
 exit "${STUB_RC:-0}"
 EOS
 }
@@ -244,7 +273,8 @@ printf '%s\n' 'show:Id *|0|%u.service\n|' 'show:LoadState *|0|loaded\n|' 'show:T
   'show:ActiveState *|0|active\n|' 'show:SubState *|0|running\n|' 'show:MainPID *|0|4242\n|' 'show:InvocationID *|0|0123456789abcdef0123456789abcdef\n|' \
   'is-enabled pdg-mitm|0|enabled\n|' 'is-active pdg-mitm|3|inactive\n|' \
   'is-enabled mosdns|0|enabled\n|' 'is-enabled mihomo|0|enabled\n|' 'is-enabled pdg-probe81|0|enabled\n|' \
-  'is-active pdg-dotwitness|0|active\n|' 'is-active pdg-health.timer|0|active\n|' > "$T/sc-ok.tab"
+  'is-active pdg-dotwitness|0|active\n|' 'is-active pdg-health.timer|0|active\n|' \
+  'restart mosdns|0||' 'is-active mosdns|0|active\n|' 'show:InvocationID mosdns|0|%G\n|' 'show:MainPID mosdns|0|%P\n|' > "$T/sc-ok.tab"
 mkdir -p "$T/bin"
 cat > "$T/bin/systemctl" <<'EOS'
 #!/usr/bin/env bash
@@ -252,23 +282,34 @@ if [[ "$1" == show ]]; then k="show:$3 ${5:-}"; else k="$1 ${2:-}"; fi
 echo "systemctl $*" >> "$FK"
 cf="$FKDIR/n-${k//[^A-Za-z0-9._-]/_}"; n=0; [[ -f "$cf" ]] && n="$(<"$cf")"; n=$((n+1)); echo "$n" > "$cf"
 u="${k#* }"; p="${k%% *}"
-for want in "$k#$n" "$k" "$p *#$n" "$p *"; do
-  while IFS='|' read -r l rc out err; do
-    [[ "$l" == "$want" ]] || continue
-    echo "served $want -> rc=$rc" >> "$FK"
-    # FAKE_REC_RO=1: 应答非零查询之前把本 unit 本次调用的记账文件设只读(初始化早已成功、文件仍可读), 只让随后那次追加失败;
-    # 同一身份立即试探一次追加并记下结果(以 root 跑时只读挡不住, 试探会报 still-writable, 格判注入未命中)
-    if [[ -n "${FAKE_REC_RO:-}" && "$rc" != 0 ]]; then
-      for f in "${FAKE_REC_DIR:?}"/stableq-"$u"-*.rec; do
-        [[ -f "$f" ]] || continue
-        chmod a-w -- "$f" && echo "served rec-readonly $f" >> "$FK"
-        if ( : >> "$f" ) 2>/dev/null; then echo "served rec-append-probe still-writable" >> "$FK"; else echo "served rec-append-probe denied" >> "$FK"; fi
-      done
-    fi
-    out="${out//%u/$u}"; printf '%b' "$out"; [[ -z "$err" ]] || printf '%s\n' "$err" >&2; exit "$rc"
-  done < "$SCFIX"
-done
-echo "替身表里没有 [$k]" >&2; exit 99
+# 317: 一遍读表(原来按 4 个键各读一遍); 优先级不变: 键#第N次 → 键 → "属性 *"#第N次 → "属性 *", 每级取表里第一条
+wants=("$k#$n" "$k" "$p *#$n" "$p *"); best=4; hit=""
+while IFS= read -r line; do
+  l="${line%%|*}"
+  for ((i = 0; i < best; i++)); do [[ "$l" == "${wants[i]}" ]] && { best=$i; hit="$line"; break; }; done
+  (( best == 0 )) && break
+done < "$SCFIX"
+(( best < 4 )) || { echo "替身表里没有 [$k]" >&2; exit 99; }
+want="${wants[best]}"; r="${hit#*|}"; rc="${r%%|*}"; r="${r#*|}"; out="${r%%|*}"; err="${r#*|}"
+echo "served $want -> rc=$rc" >> "$FK"
+# FAKE_REC_RO=1: 应答非零查询之前把本 unit 本次调用的记账文件设只读(初始化早已成功、文件仍可读), 只让随后那次追加失败;
+# 同一身份立即试探一次追加并记下结果(以 root 跑时只读挡不住, 试探会报 still-writable, 格判注入未命中)
+if [[ -n "${FAKE_REC_RO:-}" && "$rc" != 0 ]]; then
+  for f in "${FAKE_REC_DIR:?}"/stableq-"$u"-*.rec; do
+    [[ -f "$f" ]] || continue
+    chmod a-w -- "$f" && echo "served rec-readonly $f" >> "$FK"
+    if ( : >> "$f" ) 2>/dev/null; then echo "served rec-append-probe still-writable" >> "$FK"; else echo "served rec-append-probe denied" >> "$FK"; fi
+  done
+fi
+if [[ "$p" == restart && "$rc" == 0 ]]; then   # 317: 换实例: 代数 +1、按新实例快照 mosdns 启动时加载的内容、模拟 journal 记一条 Started
+  g=0; [[ -f "$FKDIR/gen-$u" ]] && g="$(<"$FKDIR/gen-$u")"; g=$((g + 1)); echo "$g" > "$FKDIR/gen-$u"
+  [[ "$u" != mosdns ]] || pdg-model-snap "$FKDIR/snap-$g"
+  printf 'systemd\tStarted %s.service - 模拟重启\n' "$u" >> "$JFILE"; echo "served model-gen $u=$g" >> "$FK"
+fi
+g=0; [[ -f "$FKDIR/gen-$u" ]] && g="$(<"$FKDIR/gen-$u")"
+printf -v gid '%032x' $((0xabc000 + g))
+out="${out//%u/$u}"; out="${out//%G/$gid}"; out="${out//%P/$((5000 + g))}"
+printf '%b' "$out"; [[ -z "$err" ]] || printf '%s\n' "$err" >&2; exit "$rc"
 EOS
 cat > "$T/bin/journalctl" <<'EOS'
 #!/usr/bin/env bash
@@ -295,7 +336,101 @@ if [[ -n "${FAKE_START_IN:-}" && "$3" == *"stable-$FAKE_START_IN-end"* ]]; then
 fi
 printf '%s\t%s\n' "$2" "$3" >> "$JFILE"
 EOS
-chmod +x "$T/bin/systemctl" "$T/bin/journalctl" "$T/bin/logger"
+cat > "$T/bin/pdg-model-snap" <<'EOS'
+#!/usr/bin/env bash
+# $1=快照目录: 按 mosdns 启动时加载的口径抄下接管表 / geosite_cn / 明确代理集 / local_upstream 那一行(模型用)
+d="$1"; m="${MODEL_DIR:?}"; mkdir -p "$d" || exit 1
+cat "$m/rules/mitm_hijack.txt" > "$d/hij" 2>/dev/null || : > "$d/hij"
+cat "$m/rules/geosite_cn.txt" > "$d/cn" 2>/dev/null || : > "$d/cn"
+cat "$m/rules/custom_hijack.txt" "$m/rules/ruleset_hijack.txt" > "$d/xp" 2>/dev/null || : > "$d/xp"
+awk '/^  - tag: local_upstream$/{f=1; next} f && /^    args:/{print; exit}' "$m/config.yaml" > "$d/upline"
+EOS
+chmod +x "$T/bin/systemctl" "$T/bin/journalctl" "$T/bin/logger" "$T/bin/pdg-model-snap"
+# 受控自有上游: 与真实 dns-stub.py 同参数、同启动记录与就绪行; 不监听端口(上游日志 / 计数由模型代写); 按 FAKE_STUB_PIDS 登记自己的 PID
+cat > "$T/fake-stub.py" <<'EOS'
+import os, sys, time
+a = sys.argv[1:]
+def arg(k):
+    return a[a.index(k) + 1]
+if os.environ.get("FAKE_STUB_PIDS"):
+    with open(os.environ["FAKE_STUB_PIDS"], "a") as f:
+        f.write("%d\n" % os.getpid())
+if os.environ.get("FAKE_STUB_BAD"):
+    print("OSError: [Errno 98] Address already in use", flush=True)
+    sys.exit(1)
+open(arg("--count"), "a").close()
+with open(arg("--log"), "a") as f:
+    f.write("started mode=%s port=%s\n" % (arg("--mode"), arg("--port")))
+print("stub ready 127.0.0.1:%s mode=%s" % (arg("--port"), arg("--mode")), flush=True)
+time.sleep(float(os.environ.get("FAKE_STUB_LIFE", "100")))
+EOS
+# mosdns 夹具: 按 v1.11.15 模板在 all 形态下的形状(没有 hijack_set 门), 规则文件同 e2e_seed_mosdns + 两条 gs-loc 接管条目;
+# 另含一条 ip_set(带 IPv6 网段)与主序列里的内联 qname —— 规则匹配判据必须只认 domain_set 与内联 qname
+mkmos(){   # $1=目录
+  local d="$1"; mkdir -p "$d/rules"
+  printf '%s\n' 'domain:baidu.com' > "$d/rules/geosite_cn.txt"
+  printf '%s\n' 'domain:gs-loc.apple.com' 'domain:gs-loc-cn.apple.com' > "$d/rules/mitm_hijack.txt"
+  printf '%s\n' 'domain:blocked.test' > "$d/rules/geosite_gfw.txt"
+  : > "$d/rules/geosite_apple.txt"; : > "$d/rules/custom_direct.txt"; : > "$d/rules/custom_hijack.txt"; : > "$d/rules/ruleset_hijack.txt"
+  : > "$d/rules/geosite_geolocation-!cn.txt"
+  sed "s#@D@#$d#g" > "$d/config.yaml" <<'EOS'
+log:
+  level: warn
+# 契约夹具: 形状取自 v1.11.15 模板 all 形态
+plugins:
+  - tag: remote_upstream
+    type: forward
+    args: { concurrent: 2, upstreams: [ {addr: "https://1.1.1.1/dns-query"}, {addr: "udp://8.8.8.8:53"} ] }
+  - tag: local_upstream
+    type: forward
+    # 国内多厂商冗余(夹具照模板留一行注释)
+    args: { concurrent: 2, upstreams: [ {addr: "https://223.5.5.5/dns-query"}, {addr: "udp://223.5.5.5:53"}, {addr: "udp://119.29.29.29:53"} ] }
+  - tag: geosite_cn
+    type: domain_set
+    args: { files: ["@D@/rules/geosite_cn.txt","@D@/rules/geosite_apple.txt","@D@/rules/custom_direct.txt"] }
+  - tag: npn_clients
+    type: ip_set
+    args: { ips: ["127.0.0.1/32", "2001:db8::/32"] }
+  - tag: hijack_set
+    type: domain_set
+    args: { files: ["@D@/rules/geosite_geolocation-!cn.txt","@D@/rules/custom_hijack.txt"] }
+  - tag: force_hijack
+    type: domain_set
+    args: { files: ["@D@/rules/mitm_hijack.txt"] }
+  - tag: explicit_proxy
+    type: domain_set
+    args: { files: ["@D@/rules/custom_hijack.txt","@D@/rules/ruleset_hijack.txt"] }
+  - tag: internal_sequence
+    type: sequence
+    args:
+      - exec: $lazy_cache
+      - exec: jump has_resp
+      - matches: qname $force_hijack
+        exec: goto force_hijack_seq
+      - matches: qname $explicit_proxy
+        exec: goto explicit_proxy_seq
+      - matches: qname $geosite_cn
+        exec: $local_upstream
+      - exec: jump has_resp
+      - matches: qtype 1
+        exec: black_hole 203.0.113.1
+  - tag: main_sequence
+    type: sequence
+    args:
+      - matches:
+          - qname suffix probe.dot.e2e.example
+          - string_exp server_name eq dot.e2e.example
+        exec: goto probe_seq
+      - matches: client_ip $npn_clients
+        exec: goto internal_sequence
+EOS
+}
+mkmos "$T/fixmos"                            # 参照原件(各格自己的夹具与它同内容, 只是路径不同)
+# rawdig: 生成一段 %b 形式的 dig 应答(给 FAKE_DIG_RAW); $1=状态 $2=头部 ANSWER 数 $3..=答案行(列用 | 分)
+rawdig(){ local st="$1" n="$2" l; shift 2
+  printf '%s' ";; ->>HEADER<<- opcode: QUERY, status: $st, id: 7\n;; flags: qr rd ra; QUERY: 1, ANSWER: $n, AUTHORITY: 0, ADDITIONAL: 1\n\n"
+  if (( $# )); then printf '%s' ";; ANSWER SECTION:\n"; for l in "$@"; do printf '%s' "${l//|/\\t}\n"; done; printf '%s' "\n"; fi
+  printf '%s' ";; SERVER: 127.0.0.1#53(127.0.0.1) (UDP)\n"; }
 # 观测钩子(只在六节的格里经 BASH_ENV 载入): 只对 ③ 的记账包装生效, 把它自己的 stderr 另记一份 —— 共享窗口把查询 stderr
 # 丢进 /dev/null, 否则看不到包装里追加失败的报错。不改变任何输出或退出码。
 printf '%s\n' 'case "$0" in */stableq-*/systemctl|*/stableq-*/journalctl) exec 2>>"${R3Q_OBS:?}";; esac' > "$T/obs-bashenv.sh"
@@ -325,16 +460,62 @@ cell(){ ( set +u
   IOS_META="$L/ios-profile.json"; MJ="$L/mitm.json"; CA_DIR="$L/ca"; SNAPROOT="$L/backups"
   KREQ=("$CA_DIR/ca.crt" "$CA_DIR/ca.key" "$R3_ETC/platform"); KOPT=("$R3_ETC/bot.env" "$R3_MODDIR/dot-domain")
   SVC_WATCH=(pdg-mitm mosdns sing-box); SVC_FIX="$T/svc-fix-ok.tsv"; HIT="$T/hit-$1"
-  IOS_ART="$L/art"; HIJ="$L/hij.txt"; MC="$L/mc.yaml"; E2E_SIP=203.0.113.1; R3_MITM_UNIT="$T/无此目录/pdg-mitm.service"
+  IOS_ART="$L/art"; MC="$L/mc.yaml"; E2E_SIP=203.0.113.1; R3_MITM_UNIT="$T/无此目录/pdg-mitm.service"
+  # DNS 仪器(317): 每格一份 mosdns 夹具(接管表即其中的 mitm_hijack.txt); 自有上游由受控 python 进程顶替; 名字固定便于核对
+  mkmos "$R3_TMP/mosdns"; R3_MOSCFG="$R3_TMP/mosdns/config.yaml"; R3_GEOCN="$R3_TMP/mosdns/rules/geosite_cn.txt"; HIJ="$R3_TMP/mosdns/rules/mitm_hijack.txt"
+  R3_STUB="$T/fake-stub.py"; R3_STUB_PID=""; R3_DNS_RESTARTS=0; R3_DNS_U=198.51.100.7; R3_DNS_PORT=15301; R3_DNS_W=gs-loc.apple.com
+  R3_UPLOG="$R3_TMP/dns-up.log"; R3_UPCNT="$R3_TMP/dns-up.count"; R3_UPOUT="$R3_TMP/dns-up.out"
+  R3_DNS_K=r3k-t.e2e.test; R3_DNS_CPRE=r3c-pre-t.e2e.test; R3_DNS_CPOST=r3c-post-t.e2e.test; R3_DNS_PPRE=r3p-pre-t.e2e.test; R3_DNS_PPOST=r3p-post-t.e2e.test
   E2E_TMP="$R3_TMP"; JBOUND_TAG=pdg-e2e-jbound-r3
-  export PATH="$T/bin:$PATH" FK="$T/fk-$1" FKDIR="$T/fkd-$1" SCFIX="$T/sc-ok.tab" JFILE="$T/j-$1"; mkdir -p "$FKDIR"; : > "$JFILE"
+  export PATH="$T/bin:$PATH" FK="$T/fk-$1" FKDIR="$T/fkd-$1" SCFIX="$T/sc-ok.tab" JFILE="$T/j-$1" MODEL_DIR="$R3_TMP/mosdns" FAKE_STUB_PIDS="$T/stub-pids"
+  mkdir -p "$FKDIR"; : > "$JFILE"
   ok(){ echo "VOK $1"; }; bad(){ echo "VBAD $1"; }; note(){ echo "VNOTE $1"; }; _evn(){ printf '%s\n' "$2" >> "$EVID/$1"; }
   source "$T/pffns.sh"; source "$T/hop2fns.sh"; source "$T/r3fns.sh"
   # 显式登记的替身: systemctl / journalctl / logger 在 $T/bin(见上); 下面是格内函数形式的外部命令替身与本格无关依赖。
-  # 运行态门、持续运行判据(共享窗口全链)、调用后检查都不替换。
-  sleep(){ echo "sleep $*" >> "$FK"; }
+  # 运行态门、持续运行判据(共享窗口全链)、DNS 仪器与判据、调用后检查都不替换。
+  sleep(){ echo "sleep $*" >> "$FK"; [[ "${1:-}" != 0.* ]] || command sleep 0.02; }   # 小数秒(等进程就绪 / 回收)实睡一小下
+  # shellcheck disable=SC2064  # 有意此刻展开: 登记的是函数名本身
+  e2e_add_exit_hook(){ echo "hook $1" >> "$FK"; trap "$1" EXIT; }                      # 本格无关依赖: 与 e2e-lib 同义(退出时执行)
   curl(){ echo "curl $*" >> "$FK"; printf '%s' "${FAKE_CURL_OUT-200}"; return "${FAKE_CURL_RC:-0}"; }
-  dig(){ echo "dig $*" >> "$FK"; printf '%b' "${FAKE_DIG_OUT-203.0.113.1\n}"; return "${FAKE_DIG_RC:-0}"; }
+  # dig = mosdns 行为模型(见文件头)。注入旋钮只作用于 FAKE_ON 指定的名字(不给 = 全部):
+  #   FAKE_DIG_RC 打印后以该码退出; FAKE_DIG_ERR 写标准错误; FAKE_DIG_RAW 整段输出替换; FAKE_NOLOG 答 U 但不记上游;
+  #   FAKE_HLOG 答 H 也记一次上游; FAKE_DIG_SWAP 答完换实例; FAKE_MODEL_NOHIJ 忽略接管表; FAKE_MODEL_TAIL=remote 末尾改走远端; FAKE_DIG_EXTRA_A 多一条 A
+  model_in(){ local l v; [[ -f "$1" ]] || return 1
+    while IFS= read -r l || [[ -n "$l" ]]; do l="${l%%#*}"; l="${l//[[:space:]]/}"; [[ -n "$l" ]] || continue
+      case "$l" in full:*) [[ "$2" == "${l#full:}" ]] && return 0;; keyword:*) [[ "$2" == *"${l#keyword:}"* ]] && return 0;;
+        *) v="${l#domain:}"; [[ "$2" == "$v" || "$2" == *".$v" ]] && return 0;; esac
+    done < "$1"; return 1; }
+  model_uplog(){ printf '1790000000.000 q=%s len=40\n' "$1" >> "$R3_UPLOG"; printf '1\n' >> "$R3_UPCNT"; echo "served model-uplog $1" >> "$FK"; }
+  dig(){ echo "dig $*" >> "$FK"
+    local q="${4,,}" g sn cd ans="" st=NOERROR on=1 n=0 x=""
+    [[ -z "${FAKE_ON:-}" || "$q" == "${FAKE_ON,,}" ]] || on=0
+    g=0; [[ -f "$FKDIR/gen-mosdns" ]] && g="$(<"$FKDIR/gen-mosdns")"
+    sn="$FKDIR/snap-$g"; cd="$FKDIR/cache-$g"; [[ -d "$sn" ]] || pdg-model-snap "$sn"; mkdir -p "$cd"
+    if (( on )) && [[ -n "${FAKE_DIG_RAW+x}" ]]; then printf '%b' "$FAKE_DIG_RAW"; return "${FAKE_DIG_RC:-0}"; fi
+    if [[ -f "$cd/$q" ]]; then ans="$(<"$cd/$q")"; echo "served model-cache $q" >> "$FK"
+    elif ! { (( on )) && [[ -n "${FAKE_MODEL_NOHIJ:-}" ]]; } && model_in "$sn/hij" "$q"; then ans=203.0.113.1
+    elif model_in "$sn/xp" "$q"; then ans=203.0.113.1
+    elif model_in "$sn/cn" "$q"; then
+      if [[ "$(<"$sn/upline")" != *'"udp://127.0.0.1:15301"'* ]]; then ans=17.253.0.1
+      elif [[ -n "${R3_STUB_PID:-}" ]] && kill -0 "$R3_STUB_PID" 2>/dev/null; then
+        ans=198.51.100.7; { (( on )) && [[ -n "${FAKE_NOLOG:-}" ]]; } || model_uplog "$q"
+      else st=SERVFAIL; fi
+    elif (( on )) && [[ "${FAKE_MODEL_TAIL:-}" == remote ]]; then ans=17.253.0.1
+    else ans=203.0.113.1; fi
+    if (( on )) && [[ -n "${FAKE_HLOG:-}" && "$ans" == 203.0.113.1 ]]; then model_uplog "$q"; fi
+    [[ -z "$ans" ]] || printf '%s' "$ans" > "$cd/$q"
+    { (( on )) && [[ -n "${FAKE_DIG_EXTRA_A:-}" ]]; } && x="$FAKE_DIG_EXTRA_A"
+    [[ -n "$ans" ]] && n=1; [[ -n "$x" ]] && n=$((n + 1))
+    printf '; <<>> DiG 9.18(契约模型) <<>> +time=3 +tries=2 @127.0.0.1 %s A\n;; global options: +cmd\n;; Got answer:\n' "$q"
+    printf ';; ->>HEADER<<- opcode: QUERY, status: %s, id: 4242\n;; flags: qr rd ra; QUERY: 1, ANSWER: %s, AUTHORITY: 0, ADDITIONAL: 1\n\n' "$st" "$n"
+    printf ';; QUESTION SECTION:\n;%s.\t\t\tIN\tA\n\n' "$q"
+    if (( n > 0 )); then printf ';; ANSWER SECTION:\n'; [[ -z "$ans" ]] || printf '%s.\t\t300\tIN\tA\t%s\n' "$q" "$ans"
+      [[ -z "$x" ]] || printf '%s.\t\t300\tIN\tA\t%s\n' "$q" "$x"; printf '\n'; fi
+    printf ';; Query time: 0 msec\n;; SERVER: 127.0.0.1#53(127.0.0.1) (UDP)\n;; MSG SIZE  rcvd: 61\n'
+    if (( on )) && [[ -n "${FAKE_DIG_SWAP:-}" ]]; then echo $((g + 1)) > "$FKDIR/gen-mosdns"; echo "served model-swap" >> "$FK"; fi
+    if (( on )) && [[ -n "${FAKE_DIG_ERR:-}" ]]; then printf '%s\n' "$FAKE_DIG_ERR" >&2; fi
+    if (( on )); then return "${FAKE_DIG_RC:-0}"; fi
+    return 0; }
   ss(){ echo "ss $*" >> "$FK"; printf 'State  Recv-Q Send-Q Local Address:Port Peer Address:Port Process\n'
     [[ -z "${FAKE_SS_PORT-7894}" ]] || printf 'LISTEN 0 4096 0.0.0.0:%s 0.0.0.0:*\n' "${FAKE_SS_PORT-7894}"; }
   bridge_svc_sample(){ cp "$SVC_FIX" "$1"; }
@@ -348,11 +529,11 @@ served(){ local n; n="$(grep -c -- "served $2" "$T/fk-$1" 2>/dev/null)"; echo "$
 cell g-ok 'r3_gated_invoke; echo "GRC=$? W=$R3_WRAP_RC"'
 { grep -qx 'GRC=0 W=0' "$T/out-g-ok" && [[ "$(cnt g-ok)" == 1 && "$(calls g-ok)" == 1 ]] && grep -qx "update --to $RTT" "$T/calls-g-ok" \
   && [[ "$(grep -cE '^  B[0-9]' "$T/out-g-ok")" == 9 && "$(grep -cE '^  E ' "$T/out-g-ok")" == 10 ]] \
-  && [[ "$(grep -c '^VOK ③-0 前像' "$T/out-g-ok")" == 11 ]] && ! grep -q '^VBAD' "$T/out-g-ok" \
-  && (( $(fk g-ok curl) == 1 && $(fk g-ok dig) == 1 && $(fk g-ok 'systemctl is-enabled pdg-mitm') == 1 )) \
+  && [[ "$(grep -c '^VOK ③-0 前像' "$T/out-g-ok")" == 15 ]] && grep -q '^VOK ③-0 DNS 仪器标定' "$T/out-g-ok" && ! grep -q '^VBAD' "$T/out-g-ok" \
+  && (( $(fk g-ok curl) == 1 && $(fk g-ok 'dig ') == 6 && $(fk g-ok 'systemctl is-enabled pdg-mitm') == 1 )) \
   && [[ "$(cat "$T/rc-g-ok")" == 0 && ! -s "$T/toerr-g-ok" ]] \
   && ! grep -qE '不是|≠|不干净|没有前像|已含退役|观测无效|没取得|就不存在|写不出来|没建成|不全|无效行|调用前停止' "$T/out-g-ok"; } \
-  && ok "三-1 健康: 门全过(运行态门判断原文真跑, 11 条前像成立)、调用前观测 10 项取全, 调用恰 1 次(桩独立记录 1 次), 桩收到 update --to $RTT; 包装器返回码 0、产品退出码 0 分别取得" \
+  && ok "三-1 健康: 门全过(DNS 仪器标定真跑; 运行态门判断原文真跑, 15 条前像成立, 其中 DNS 前阶段 5 条)、调用前观测 10 项取全, 调用恰 1 次(桩独立记录 1 次), 桩收到 update --to $RTT; 包装器返回码 0、产品退出码 0 分别取得" \
   || bad "三-1 健康格: $(tr '\n' ' ' < "$T/out-g-ok" | head -c 400) 计数=$(cnt g-ok) 桩=$(calls g-ok)"
 gcase(){   # $1=格名 $2=期望 GRC $3=说明 $4=注入代码 $5=输出里必须出现的原因片段 $6=注入命中核对(父壳里 eval) $7=计数文件应有内容(默认 0)
   cell "$1" "$4"$'\n''r3_gated_invoke; echo "GRC=$?"'
@@ -574,29 +755,50 @@ rd h-junk 'FAKE_CURL_OUT=OK; r3_http_code http://127.0.0.1:81/; echo "R=$? V=[$R
 rd h-503  'FAKE_CURL_OUT=503; r3_http_code http://127.0.0.1:81/; echo "R=$? V=[$R3_VAL]"' "R=0 V=[503]" "四-H4 查询成功、状态码 503(业务条件由调用方判)"
 gcase p-http-rc    12 "四-H5 调用前 :81 打印 200 但 curl 退出 28 ⇒ 不调用" 'FAKE_CURL_RC=28' "前像观测无效(:81): 命令失败: curl 退出 28" '(( $(fk p-http-rc curl) >= 1 ))'
 gcase p-http-503   12 "四-H6 调用前 :81 查询成功但 503 ⇒ 不调用(业务不满足, 与观测无效分开说)" 'FAKE_CURL_OUT=503' ":81 查询成功但状态码是 503(要 200)" '(( $(fk p-http-503 curl) >= 1 ))'
-POK='FAKE_DIG_OUT="17.253.0.1\n"; '
+# 317: 调用后 F2 需要仪器状态(自有上游、调整后配置)。前缀真跑 ③ 的仪器条件建立 r3_dns_adjust(标定由八-A1 / A3 与八-B 组覆盖),
+#      再模拟产品撤除 WLOC 对 DNS 的两个动作(清空接管表、重启 mosdns)
+# shellcheck disable=SC2034  # 在格代码串(单引号)里经 eval / 展开使用, ShellCheck 看不到
+EFF=': > "$MODEL_DIR/rules/mitm_hijack.txt" && systemctl restart mosdns > /dev/null'
+POK='r3_dns_adjust > "$R3_TMP/instr.out" 2>&1 && eval "$EFF"; '
 pc f1-rc   "四-H7 调用后 F1 打印 200 但 curl 退出 28 ⇒ 功能未取得"   "${POK}FAKE_CURL_RC=28" r3_post_runtime "VBAD ③-4 F1 功能观测未取得: 命令失败: curl 退出 28" "VOK ③-4 F1" '(( $(fk f1-rc curl) == 1 ))'
 pc f1-503  "四-H8 调用后 F1 查询成功但 503 ⇒ 功能不成立"            "${POK}FAKE_CURL_OUT=503" r3_post_runtime "VBAD ③-4 F1 :81 查询成功但状态码是 503" "VOK ③-4 F1"
 pc f1-junk "四-H9 调用后 F1 输出无效 ⇒ 功能未取得"                  "${POK}FAKE_CURL_OUT=OK" r3_post_runtime "VBAD ③-4 F1 功能观测未取得: 输出无效" "VOK ③-4 F1"
 
-# ── DNS ──
-rd d-ok    'r3_dns_a gs-loc.apple.com; echo "R=$? V=[$R3_VAL]"' "R=0 V=[203.0.113.1]" "四-D1 健康: dig 退出 0、一条 A"
-rd d-rc    'FAKE_DIG_RC=9; r3_dns_a gs-loc.apple.com; echo "R=$? V=[$R3_VAL]"; echo "WHY=$R3_WHY"' "R=2 V=[]" "四-D2 打印地址但 dig 退出 9 ⇒ 命令失败, 输出不采信" "命令失败: dig 退出 9" '(( $(fk d-rc dig) == 1 ))'
-rd d-junk  'FAKE_DIG_OUT=";; connection timed out; no servers could be reached\n"; r3_dns_a gs-loc.apple.com; echo "R=$? V=[$R3_VAL]"; echo "WHY=$R3_WHY"' "R=2 V=[]" "四-D3 退出 0 但输出不是地址 ⇒ 输出无效" "输出无效"
-rd d-cname 'FAKE_DIG_OUT="gs-loc.g.aaplimg.com.\n17.253.0.1\n"; r3_dns_a gs-loc.apple.com; echo "R=$? V=[$R3_VAL]"' "R=0 V=[17.253.0.1]" "四-D4 健康: CNAME 链只取地址"
-rd d-empty 'FAKE_DIG_OUT=""; r3_dns_a gs-loc.apple.com; echo "R=$? V=[$R3_VAL]"' "R=0 V=[]" "四-D5 查询成功、没有 A 应答(答案, 由调用方判)"
-rd d-oct   'FAKE_DIG_OUT="300.1.1.1\n"; r3_dns_a gs-loc.apple.com; echo "R=$? V=[$R3_VAL]"; echo "WHY=$R3_WHY"' "R=2 V=[]" "四-D6 地址越界 ⇒ 输出无效" "越界"
-gcase p-dns-rc     12 "四-D7 调用前 :53 打印接管地址但 dig 退出 9 ⇒ 不调用" 'FAKE_DIG_RC=9' "前像观测无效(:53): 命令失败: dig 退出 9" '(( $(fk p-dns-rc dig) >= 1 ))'
-gcase p-dns-nohij  12 "四-D8 调用前 :53 查询成功但没有接管 ⇒ 不调用(业务不满足)" 'FAKE_DIG_OUT="17.253.0.1\n"' ":53 查询成功但没有接管 gs-loc(实得 [17.253.0.1])" '(( $(fk p-dns-nohij dig) >= 1 ))'
-pc f2-ok    "四-D9 健康: 调用后 ③-4 全部成立(F2 不再接管)"          "$POK" r3_post_runtime "VOK ③-4 F2 实际功能: :53 正常应答 gs-loc.apple.com(17.253.0.1), 不再接管到 203.0.113.1" "VBAD"
-pc f2-rc    "四-D10 调用后 F2 打印正常地址但 dig 退出 9 ⇒ 功能未取得" "${POK}FAKE_DIG_RC=9" r3_post_runtime "VBAD ③-4 F2 功能观测未取得: 命令失败: dig 退出 9" "VOK ③-4 F2" '(( $(fk f2-rc dig) == 1 ))'
-pc f2-hij   "四-D11 调用后 F2 仍接管"                                ':' r3_post_runtime "VBAD ③-4 F2 :53 仍把 gs-loc.apple.com 接管到 203.0.113.1" "VOK ③-4 F2"
-pc f2-empty "四-D12 调用后 F2 没有 A 应答 ⇒ 功能未取得"             'FAKE_DIG_OUT=""' r3_post_runtime "VBAD ③-4 F2 功能观测未取得: :53 查询成功但对 gs-loc.apple.com 没有 A 应答" "VOK ③-4 F2"
-pc f2-junk  "四-D13 调用后 F2 输出无效 ⇒ 功能未取得"                'FAKE_DIG_OUT=";; communications error\n"' r3_post_runtime "VBAD ③-4 F2 功能观测未取得: 输出无效" "VOK ③-4 F2"
-cell f2-grep 'grep(){ if [[ "$1" == -qw ]]; then echo hit >> "$HIT"; return 2; fi; command grep "$@"; }'$'\n''r3_post_runtime'
-if grep -qF 'VBAD ③-4 F2 :53 仍把' "$T/out-f2-grep" && ! grep -q 'VOK ③-4 F2' "$T/out-f2-grep" && ! hit f2-grep; then
-  ok "四-D14 310 的失效形态(匹配那一步 grep 出错)不再可能: 答出接管地址时判「仍接管」; grep 替身没被调(修后匹配不经 grep, 注入如期未命中)"
-else bad "四-D14 匹配形态: $(grep -E '^V(OK|BAD) ③-4 F2' "$T/out-f2-grep" | head -c 200) grep 替身被调=$(hit f2-grep && echo 是 || echo 否)"; fi
+# ── DNS(317 改写: 旧格驱动 dig +short 读取器 r3_dns_a 与"答 H 即接管 / 不是 H 即撤除"的旧判据; 新契约要完整观测与答案来源,
+#    同号格改驱动新读取器 r3_dns_probe 与新判据 r3_dns_phase, 原意逐条对应, 见 317 README) ──
+PS='r3_dns_stub_start > "$R3_TMP/stub.out" 2>&1 || echo "STUB-FAIL $R3_WHY"; '
+PROBE='r3_dns_probe gs-loc.apple.com d; echo "R=$? V=[$R3_DNS_ST|$R3_DNS_ANS|$R3_DNS_INC]"; echo "WHY=$R3_WHY"'
+rd d-ok    "${PS}${PROBE}" "R=0 V=[NOERROR|203.0.113.1|0]" "四-D1 健康(原: 退出 0、一条 A): 完整输出的状态行 / flags / 应答服务器 / 答案段逐项有效, 上游记录与实例身份前后都取得"
+rd d-rc    "${PS}FAKE_DIG_RC=9; ${PROBE}" "R=2 V=[||]" "四-D2 打印正常样子的完整应答后 dig 退出 9 ⇒ 命令失败, 已输出的不采信(原意不变)" "命令失败: dig 退出 9" '(( $(fk d-rc "dig ") == 1 ))'
+rd d-junk  "${PS}FAKE_DIG_RAW=\";; connection timed out; no servers could be reached\n\"; ${PROBE}" "R=2 V=[||]" "四-D3 退出 0 但输出不是 dig 应答 ⇒ 输出无效(原意不变)" "输出无效: 状态行 0 行"
+# shellcheck disable=SC2034  # 在格代码串里使用
+CN_RAW="$(rawdig NOERROR 3 'gs-loc.apple.com.|60|IN|CNAME|gs-loc.g.aaplimg.com.' 'gs-loc.g.aaplimg.com.|60|IN|A|17.253.0.1' 'gs-loc.g.aaplimg.com.|60|IN|A|17.253.0.2')"
+rd d-cname "${PS}FAKE_DIG_RAW=\"\$CN_RAW\"; ${PROBE}" "R=0 V=[NOERROR|17.253.0.1 17.253.0.2|0]" "四-D4 健康: CNAME 链(原: 只取地址); 现在链上全部 A 都取, 不只第一条"
+# shellcheck disable=SC2034  # 在格代码串里使用
+EMPTY_RAW="$(rawdig NOERROR 0)"
+rd d-empty "${PS}FAKE_DIG_RAW=\"\$EMPTY_RAW\"; ${PROBE}" "R=0 V=[NOERROR||0]" "四-D5 查询成功、没有 A 应答 ⇒ 有效观测、地址表为空(原意不变; 由路径判据判不成立, 见四-D12)"
+# shellcheck disable=SC2034  # 在格代码串里使用
+OCT_RAW="$(rawdig NOERROR 1 'gs-loc.apple.com.|60|IN|A|300.1.1.1')"
+rd d-oct   "${PS}FAKE_DIG_RAW=\"\$OCT_RAW\"; ${PROBE}" "R=2 V=[||]" "四-D6 地址越界 ⇒ 输出无效(原意不变)" "A 记录 [300.1.1.1] 不是合法 IPv4"
+gcase p-dns-rc     12 "四-D7 调用前 W 的查询打印正常应答后 dig 退出 9 ⇒ 前阶段观测无效, 不调用(原: 前像 dig 退出 9)" 'FAKE_ON=gs-loc.apple.com; FAKE_DIG_RC=9' \
+  "③-0 前像 DNS W(gs-loc.apple.com)走接管 H、自有上游未收到: WLOC 接管在 —— 观测无效: 命令失败: dig 退出 9" 'grep -q "dig 退出 9" "$T/evid/05-dns-probe-pre-w.txt"'
+gcase p-dns-nohij  12 "四-D8 调用前 W 没被接管(模型对 W 忽略接管表, W 经 geosite_cn 由自有上游答 U)⇒ 前阶段不成立, 不调用(原: 查询成功但没有接管)" 'FAKE_ON=gs-loc.apple.com; FAKE_MODEL_NOHIJ=1' \
+  "—— 不成立: gs-loc.apple.com 答案与期望 H=203.0.113.1 不符(status=NOERROR A=[198.51.100.7] 自有上游该名 +1" '(( $(served p-dns-nohij "model-uplog gs-loc.apple.com") == 1 ))'
+pc f2-ok    "四-D9 健康: 调用后 ③-4 全部成立(F2 = 仪器条件仍在 + W 经上游取得 U + C 取得 U + P 走 H)" "$POK" r3_post_runtime \
+  "VOK ③-4 F2 W(gs-loc.apple.com)经 local_upstream 由自有上游取得 U: WLOC 接管已撤除 —— 成立: gs-loc.apple.com = U(status=NOERROR A=[198.51.100.7] 自有上游该名 +1" "VBAD" \
+  '[[ "$(grep -c "^VOK ③-4 F2" "$T/out-f2-ok")" == 5 ]] && grep -qF "VOK ③-4 F2 P(普通劫持探针 r3p-post-t.e2e.test)走 H、自有上游未收到: 普通 DNS 代理劫持路径保留 —— 成立" "$T/out-f2-ok"'
+pc f2-rc    "四-D10 调用后 W 打印正常应答后 dig 退出 9 ⇒ 观测无效, 该功能结论未取得(原意不变)" "${POK}FAKE_ON=gs-loc.apple.com; FAKE_DIG_RC=9" r3_post_runtime \
+  "—— 观测无效: 命令失败: dig 退出 9(已输出的" "VOK ③-4 F2 W(" 'grep -q "dig 退出 9" "$T/evid/05-dns-probe-post-w.txt"'
+pc f2-hij   "四-D11 调用后 W 仍走接管(产品没清接管表, 只重启了 mosdns)⇒ 不成立(原意不变)" 'r3_dns_adjust > "$R3_TMP/instr.out" 2>&1 && systemctl restart mosdns > /dev/null; ' r3_post_runtime \
+  "VBAD ③-4 F2 W(gs-loc.apple.com)经 local_upstream 由自有上游取得 U: WLOC 接管已撤除 —— 不成立: gs-loc.apple.com 答案与期望 U=198.51.100.7 不符(status=NOERROR A=[203.0.113.1] 自有上游该名 +0" "VOK ③-4 F2 W("
+pc f2-empty "四-D12 调用后 W 查询成功但没有 A 应答 ⇒ 不成立(原: 功能未取得; 现: 有效观测、答案不是 U)" "${POK}FAKE_ON=gs-loc.apple.com; FAKE_DIG_RAW=\"\$EMPTY_RAW\"" r3_post_runtime \
+  "—— 不成立: gs-loc.apple.com 答案与期望 U=198.51.100.7 不符(status=NOERROR A=[无]" "VOK ③-4 F2 W("
+pc f2-junk  "四-D13 调用后 W 输出不是 dig 应答 ⇒ 观测无效, 该功能结论未取得(原意不变)" "${POK}FAKE_ON=gs-loc.apple.com; FAKE_DIG_RAW=\";; communications error to 127.0.0.1#53: timed out\n\"" r3_post_runtime \
+  "—— 观测无效: 输出无效: 状态行 0 行" "VOK ③-4 F2 W("
+cell f2-grep "${POK}"'grep(){ printf "%s\n" "$*" >> "$HIT"; command grep "$@"; }'$'\n''r3_dns_phase post; echo "PR=$?"'
+if grep -qx 'PR=0' "$T/out-f2-grep" && [[ "$(grep -c '^VOK ③-4 F2' "$T/out-f2-grep")" == 5 ]] && ! hit f2-grep; then
+  ok "四-D14 310 的失效形态(匹配那一步 grep 出错)仍不可能: 后阶段 DNS 判据的过滤、计数、匹配都不经 grep(本格 grep 替身一次没被调, 判据照常成立)"
+else bad "四-D14 后阶段判据: $(grep -E '^V(OK|BAD) ③-4 F2|^PR=' "$T/out-f2-grep" | tr '\n' ' ' | head -c 300) grep 替身被调=$(hit f2-grep && echo 是 || echo 否)"; fi
 
 # ── systemctl 状态词 × 退出码 ──
 mktab uq 'is-active u-a1|0|active\n|' 'is-active u-a2|3|inactive\n|' 'is-active u-a3|3|failed\n|' 'is-active u-a4|3|active\n|' \
@@ -654,7 +856,7 @@ mktab st-id  'show:Id mosdns|1|mosdns.service\n|'
 mktab st-as  'show:ActiveState mosdns#3|1|active\n|'
 mktab st-nr  'show:NRestarts mosdns#2|1|0\n|'
 mktab st-rt  'show:ActiveState mosdns#1|1|\n|'
-mktab st-inv 'show:InvocationID mosdns#4|1|0123456789abcdef0123456789abcdef\n|'
+mktab st-inv 'show:InvocationID mosdns#4|1|%G\n|'   # 317: mosdns 的 InvocationID 随实例代数(%G); 注入与当前实例同值的合法输出 + 退出 1
 mktab st-sub 'show:SubState mosdns#2|1|running\n|'
 mktab st-down 'show:ActiveState mosdns#3|0|failed\n|'
 mktab st-nr1 'show:NRestarts mosdns#2|0|1\n|'
@@ -708,6 +910,244 @@ grep -qx 'SR=2' "$T/out-rc-trap2" && grep -qx TRAPOK "$T/out-rc-trap2" && ! grep
 st rc-ok "六-0 健康: 观测钩子在场、记账通道正常 ⇒ 照常通过, 钩子没记到任何报错" 'export BASH_ENV="$T/obs-bashenv.sh" R3Q_OBS="$T/obs-$1"; : > "$R3Q_OBS"' 0 "VOK 五: mosdns 持续运行: 窗口 5s 内持续 running" "VBAD" '[[ -f "$T/obs-rc-ok" && ! -s "$T/obs-rc-ok" ]]'
 gcase rc-g 12 "六-G 调用前记账追加失败 ⇒ 实际门拒绝" "${RO}"'SCFIX="$T/sc-st-as.tab"' "③-0 前像: mosdns 持续运行: **观测无效** —— 记账通道失效" 'recev rc-g'
 pc rc-p "六-P 调用后记账追加失败 ⇒ 本项失败, 不输出持续运行" "${POK}${RO}"'SCFIX="$T/sc-st-as.tab"' r3_post_runtime "VBAD ③-4 运行态: mosdns 持续运行: **观测无效** —— 记账通道失效" "VOK ③-4 运行态: mosdns 持续运行" 'recev rc-p'
+
+
+echo; echo "══ 七. W1 状态观测: systemd 255 的 not-found / inactive / 4 兼容与拒绝对照 ══"
+# 依据: systemd v252 is-active 非运行态一律 3; v255 在 LoadState=not-found 时改用 LSB 4(systemctl-is-active.c); 315 runner 实测同此。
+mktab ctx 'is-active u-c1|4|inactive\n|' 'is-active u-c2|3|inactive\n|' 'is-active u-c3|4|inactive\n|' 'is-active u-c4|4|inactive\n|' \
+  'is-active u-c5|4|failed\n|' 'is-active u-c6|5|inactive\n|' 'is-active u-c7|0|active\n|' 'is-active u-c8|3|inactive\n|' 'is-active u-c9|4|active\n|'
+CTX_EXP="u-c1=0:inactive u-c2=0:inactive u-c3=2: u-c4=2: u-c5=2: u-c6=2: u-c7=0:active u-c8=0:inactive u-c9=2:"
+rd ctx-table 'SCFIX="$T/sc-ctx.tab"; r=""; for q in "u-c1 not-found" "u-c2 not-found" "u-c3 loaded" "u-c4 -" "u-c5 not-found" "u-c6 not-found" "u-c7 not-found" "u-c8 loaded" "u-c9 not-found"; do read -r u c <<<"$q"; [[ "$c" == - ]] && c=""; r3_unit_q active "$u" "$c"; r="$r $u=$?:$R3_VAL"; done; echo "R=${r# } V=[]"' \
+   "R=$CTX_EXP V=[]" "七-T is-active 带 LoadState 前提: not-found 时 inactive/3、inactive/4 都有效; loaded 或没给前提时 inactive/4 无效; failed/4、inactive/5、active/4 无效; active/0 照旧" "" '(( $(fk ctx-table "systemctl is-active") == 9 ))'
+W1B='FAKE_SS_PORT=""; '
+mktab w7-a 'show:LoadState pdg-mitm|0|not-found\n|' 'is-active pdg-mitm|4|inactive\n|'
+mktab w7-b 'show:LoadState pdg-mitm|0|loaded\n|' 'is-active pdg-mitm|3|inactive\n|'
+mktab w7-c 'show:LoadState pdg-mitm|0|loaded\n|' 'is-active pdg-mitm|4|inactive\n|'
+mktab w7-d 'show:LoadState pdg-mitm|1|not-found\n|' 'is-active pdg-mitm|4|inactive\n|'
+mktab w7-e 'show:LoadState pdg-mitm|0|not-found\nx\n|' 'is-active pdg-mitm|4|inactive\n|'
+mktab w7-f 'show:LoadState pdg-mitm|0|not-found\n|' 'is-active pdg-mitm|4|failed\n|'
+mktab w7-g 'show:LoadState pdg-mitm|0|not-found\n|' 'is-active pdg-mitm|0|active\n|'
+mktab w7-h 'show:LoadState pdg-mitm|0|not-found\n|' 'is-active pdg-mitm|4|inactive\nactive\n|'
+pc w7-a "七-W1a 315 的 runner 形态: LoadState=not-found/0 + is-active=inactive/4 ⇒ 观测有效且撤除成立" "${W1B}SCFIX=\"\$T/sc-w7-a.tab\"" r3_post_w1 "VOK ③-3 W1 pdg-mitm LoadState=not-found, is-active=inactive" "观测无效" '(( $(served w7-a "is-active pdg-mitm -> rc=4") == 1 ))'
+pc w7-b "七-W1b loaded/0 + inactive/3 ⇒ 观测有效(非运行), 但撤除不成立" "${W1B}SCFIX=\"\$T/sc-w7-b.tab\"" r3_post_w1 "VBAD ③-3 W1 pdg-mitm LoadState=[loaded] is-active=[inactive]" "观测无效" '(( $(served w7-b "is-active pdg-mitm -> rc=3") == 1 ))'
+pc w7-c "七-W1c loaded/0 + inactive/4(矛盾)⇒ 观测无效" "${W1B}SCFIX=\"\$T/sc-w7-c.tab\"" r3_post_w1 "VBAD ③-3 W1 观测无效: pdg-mitm is-active 打印 inactive 却退出 4(应为 3); 只有已取得 LoadState=not-found 时才可为 4(实得 LoadState=[loaded])" "VOK ③-3 W1 pdg-mitm LoadState" '(( $(served w7-c "is-active pdg-mitm -> rc=4") == 1 ))'
+pc w7-d "七-W1d LoadState 先输出 not-found 再退出 1 ⇒ 观测无效, 不再用 is-active 的结果" "${W1B}SCFIX=\"\$T/sc-w7-d.tab\"" r3_post_w1 "VBAD ③-3 W1 观测无效: pdg-mitm 的 LoadState 查询退出 1" "VOK ③-3 W1 pdg-mitm LoadState" '(( $(fk w7-d "systemctl is-active pdg-mitm") == 0 ))'
+pc w7-e "七-W1e LoadState 输出两行 ⇒ 观测无效" "${W1B}SCFIX=\"\$T/sc-w7-e.tab\"" r3_post_w1 "VBAD ③-3 W1 观测无效: pdg-mitm 的 load 查询输出不止一行" "VOK ③-3 W1 pdg-mitm LoadState" '(( $(fk w7-e "systemctl is-active pdg-mitm") == 0 ))'
+pc w7-f "七-W1f not-found + failed/4 ⇒ 观测无效(只对 inactive 兼容 4)" "${W1B}SCFIX=\"\$T/sc-w7-f.tab\"" r3_post_w1 "VBAD ③-3 W1 观测无效: pdg-mitm is-active 打印 failed 却退出 4(应为 3)" "VOK ③-3 W1 pdg-mitm LoadState" '(( $(served w7-f "is-active pdg-mitm -> rc=4") == 1 ))'
+pc w7-g "七-W1g not-found + active/0 ⇒ 观测有效, 撤除不成立(进程还在跑)" "${W1B}SCFIX=\"\$T/sc-w7-g.tab\"" r3_post_w1 "VBAD ③-3 W1 pdg-mitm LoadState=[not-found] is-active=[active]" "观测无效" '(( $(served w7-g "is-active pdg-mitm -> rc=0") == 1 ))'
+pc w7-h "七-W1h not-found + is-active 两行 / 4 ⇒ 观测无效(多行检查不放宽)" "${W1B}SCFIX=\"\$T/sc-w7-h.tab\"" r3_post_w1 "VBAD ③-3 W1 观测无效: pdg-mitm 的 active 查询输出不止一行" "VOK ③-3 W1 pdg-mitm LoadState" '(( $(served w7-h "is-active pdg-mitm -> rc=4") == 1 ))'
+
+
+echo; echo "══ 八. DNS 仪器与答案来源(317; 仪器、标定、还原、观测、来源判据执行原文, 受控 mosdns 模型) ══"
+# 健康: 仪器条件建立 + K 的 U→H→U + 还原
+cell i-ok 'cp -p "$HIJ" "$R3_TMP/hij.ref0"; a0="$(stat -c "%a %u:%g" "$HIJ")"
+r3_dns_instrument; echo "IR=$?"; echo "RS=$R3_DNS_RESTARTS DISK=$R3_CAL_DISK RUN=$R3_CAL_RUN"
+cmp -s "$R3_TMP/hij.ref0" "$HIJ" && [[ "$(stat -c "%a %u:%g" "$HIJ")" == "$a0" ]] && echo HIJ-SAME
+echo "CFGDIFF=$(diff "$EVID/05-dns-mosdns-config.before.yaml" "$R3_MOSCFG" | grep -c "^[<>]")"
+echo "GEO=$(tail -n 4 "$R3_GEOCN" | tr "\n" " ")"; echo "GEOHEAD=$(head -n 1 "$R3_GEOCN")"
+echo "KLOG=$(grep -c " q=r3k-t.e2e.test " "$R3_UPLOG")"; echo "STUBPID=$R3_STUB_PID"
+echo "HDIFF=$(grep -cE "^[-+][^-+]" "$EVID/05-dns-mitm_hijack.calib.diff")/$(grep -cx "+full:r3k-t.e2e.test" "$EVID/05-dns-mitm_hijack.calib.diff")"
+echo "INV=$(sed -s -n "1s/.*InvocationID \([0-9a-f]*\).*/\1/p" "$EVID"/05-dns-probe-calib-u1.txt "$EVID"/05-dns-probe-calib-h.txt "$EVID"/05-dns-probe-calib-u2.txt | sort -u | wc -l)"'
+spid="$(sed -n 's/^STUBPID=//p' "$T/out-i-ok")"
+if grep -qx 'IR=0' "$T/out-i-ok" && grep -qx 'RS=3 DISK=已核实 RUN=已核实' "$T/out-i-ok" && grep -qx HIJ-SAME "$T/out-i-ok" && grep -qx 'CFGDIFF=2' "$T/out-i-ok" \
+   && grep -qx 'GEO=full:gs-loc.apple.com full:r3k-t.e2e.test full:r3c-pre-t.e2e.test full:r3c-post-t.e2e.test ' "$T/out-i-ok" && grep -qx 'GEOHEAD=domain:baidu.com' "$T/out-i-ok" \
+   && grep -qx 'KLOG=2' "$T/out-i-ok" && grep -qx 'INV=3' "$T/out-i-ok" && grep -qx 'HDIFF=1/1' "$T/out-i-ok" && (( $(served i-ok "restart mosdns -> rc=0") == 3 && $(fk i-ok "dig ") == 3 )) \
+   && grep -q '^VOK ③-0 DNS 仪器标定' "$T/out-i-ok" && ! grep -q '^VBAD' "$T/out-i-ok" && grep -qx 'hook r3_dns_stub_stop' "$T/fk-i-ok" \
+   && [[ "$spid" =~ ^[0-9]+$ ]] && ! kill -0 "$spid" 2>/dev/null && [[ "$(tail -1 "$T/evid/05-dns-calibration.txt")" == *'磁盘还原=已核实; 运行还原=已核实'* ]]; then
+  ok "八-A1 健康标定: 配置只换 local_upstream 一行、geosite_cn 原文在前只追加 4 行; K 在 3 个不同实例里 U→H→U(上游记到 K 2 次、H 那次 0 次); 标定用接管表只比原件多一行 full:K(原有两条 gs-loc 逐字保留); 接管表按内容与 mode / owner 还原; 仪器重启 3 次; 退出时按登记 PID 收掉自有上游"
+else bad "八-A1 健康标定: $(grep -vE '^  I ' "$T/out-i-ok" | tr '\n' ' ' | head -c 400)"; fi
+cell p-ok 'r3_dns_instrument > "$R3_TMP/instr.out" 2>&1; r3_dns_phase pre; echo "PR=$?"'
+if grep -qx 'PR=0' "$T/out-p-ok" && [[ "$(grep -c '^VOK ③-0 前像 DNS' "$T/out-p-ok")" == 5 ]] && ! grep -q '^VBAD' "$T/out-p-ok" \
+   && grep -qF 'W(gs-loc.apple.com)走接管 H、自有上游未收到: WLOC 接管在 —— 成立: gs-loc.apple.com = H(status=NOERROR A=[203.0.113.1] 自有上游该名 +0' "$T/out-p-ok" \
+   && grep -qF '—— 成立: r3c-pre-t.e2e.test = U(status=NOERROR A=[198.51.100.7] 自有上游该名 +1' "$T/out-p-ok" \
+   && grep -qF '普通 DNS 代理劫持路径保留 —— 成立: r3p-pre-t.e2e.test = H(status=NOERROR A=[203.0.113.1] 自有上游该名 +0' "$T/out-p-ok"; then
+  ok "八-A2 健康前阶段: 仪器条件仍成立; P 不被任何规则匹配; W=H(上游 +0)、C 前=U(上游 +1)、P 前=H(上游 +0)"
+else bad "八-A2 健康前阶段: $(grep -E '^V(OK|BAD)|^PR=' "$T/out-p-ok" | tr '\n' ' ' | head -c 400)"; fi
+cell e2e 'export STUB_EFFECT="$EFF"; r3_gated_invoke; echo "GRC=$?"; C3_1="$(_j_mark retire-end)"; echo "WIN=$(_j_interval mosdns "$C3_0" "$C3_1")"
+echo "ALLSTART=$(grep -c "Started mosdns.service" "$JFILE")"; r3_post_runtime; echo "RS=$R3_DNS_RESTARTS"'
+if grep -qx 'GRC=0' "$T/out-e2e" && [[ "$(calls e2e)" == 1 && "$(cnt e2e)" == 1 ]] && grep -qx "update --to $RTT" "$T/calls-e2e" \
+   && grep -qx 'WIN=1' "$T/out-e2e" && grep -qx 'ALLSTART=4' "$T/out-e2e" && grep -qx 'RS=3' "$T/out-e2e" \
+   && [[ "$(grep -c '^VOK ③-0 前像 DNS' "$T/out-e2e")" == 5 && "$(grep -c '^VOK ③-4 F2' "$T/out-e2e")" == 5 ]] && ! grep -q '^VBAD' "$T/out-e2e"; then
+  ok "八-A3 全流程: ② 门 → 身份门 → 仪器标定 → 前阶段 W=H / C=U / P=H → 恰好一次升级调用(桩独立记录 1 次)→ 后阶段 W=U / C=U / P=H; mosdns 启动 4 次中只有产品那 1 次落在升级窗口里, 仪器重启 3 次都在起界桩之前"
+else bad "八-A3 全流程: 桩记录=$(calls e2e) 计数=$(cnt e2e) $(grep -E '^GRC=|^WIN=|^ALLSTART=|^RS=|^VBAD' "$T/out-e2e" | tr '\n' ' ' | head -c 400)"; fi
+
+# 仪器阶段阻断: 标定不符 / 还原失败 / 读取失败 / 上游与重启失败 ⇒ GRC=15, 桩 CLI 0 次
+FIXHIJ="$T/fixmos/rules/mitm_hijack.txt"
+hijsame(){ cmp -s "$FIXHIJ" "$T/r3tmp-$1/mosdns/rules/mitm_hijack.txt"; }
+nres(){ served "$1" "restart mosdns -> rc=0"; }
+gcase i-mis  15 "八-B1 标定不符(模型对 K 忽略接管表, 临时接管后仍答 U)⇒ 不调用; 失败路径照样还原并核验" 'FAKE_ON=r3k-t.e2e.test; FAKE_MODEL_NOHIJ=1' \
+  "标定第二段(K 临时接管)不成立: r3k-t.e2e.test 答案与期望 H=203.0.113.1 不符" 'hijsame i-mis && (( $(nres i-mis) == 3 )) && grep -qF "磁盘 已核实, 运行 已核实" "$T/out-i-mis"'
+gcase i-rwr  15 "八-B2 还原时写回原件失败 ⇒ 磁盘还原失败、运行还原不做(不再重启)⇒ 不调用" 'cat(){ if [[ "$*" == *hij.orig* ]]; then echo hit >> "$HIT"; return 1; fi; command cat "$@"; }' \
+  "还原不成立(磁盘 失败(写回原件失败), 运行 未核实(磁盘还原不成立, 不再重启))" 'hit i-rwr && (( $(nres i-rwr) == 2 ))'
+gcase i-rbad 15 "八-B3 还原写回退出 0 但内容与原件不同 ⇒ 指纹核验判失败, 不调用" 'cat(){ if [[ "$*" == *hij.orig* ]]; then echo hit >> "$HIT"; command head -n 1 -- "$R3_TMP/hij.orig"; return 0; fi; command cat "$@"; }' \
+  "磁盘 失败(还原后指纹" 'hit i-rbad && ! hijsame i-rbad && (( $(nres i-rbad) == 2 ))'
+gcase i-fp0  15 "八-B4 接管表原件指纹读取失败 ⇒ 不改接管表(逐字节仍是原件、标定没有重启), 不调用" 'sha256sum(){ if [[ "$*" == *mitm_hijack.txt* ]]; then echo hit >> "$HIT"; return 1; fi; command sha256sum "$@"; }' \
+  "接管表原件指纹没取得" 'hit i-fp0 && hijsame i-fp0 && (( $(nres i-fp0) == 1 ))'
+gcase i-fp1  15 "八-B5 还原后指纹读取失败(第二次读)⇒ 磁盘还原记为未核实, 不当成已还原, 不调用" \
+  'sha256sum(){ if [[ "$*" == *mitm_hijack.txt* ]]; then n=$(( $(command cat "$R3_TMP/shan" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$R3_TMP/shan"; if (( n == 2 )); then echo hit >> "$HIT"; return 1; fi; fi; command sha256sum "$@"; }' \
+  "磁盘 未核实(还原后指纹没取得" 'hit i-fp1 && (( $(nres i-fp1) == 2 ))'
+gcase i-u1   15 "八-B6 标定第一段答 U 但自有上游没收到 K ⇒ 来源不成立, 接管表不改, 不调用" 'FAKE_ON=r3k-t.e2e.test; FAKE_NOLOG=1' \
+  "标定第一段(K 不在接管表)不成立: r3k-t.e2e.test 答案是 U, 但本次查询窗口里自有上游没有收到该名" 'hijsame i-u1 && (( $(nres i-u1) == 1 ))'
+gcase i-hlog 15 "八-B7 标定第二段答 H 但自有上游收到了 K ⇒ 来源不成立(失败路径照样还原), 不调用" 'FAKE_ON=r3k-t.e2e.test; FAKE_HLOG=1' \
+  "标定第二段(K 临时接管)不成立: r3k-t.e2e.test 答案是 H, 但本次查询窗口里自有上游收到了该名" 'hijsame i-hlog && (( $(nres i-hlog) == 3 ))'
+gcase i-stub 15 "八-B8 自有上游起不来(端口被占, 进程退出)⇒ 配置与 geosite_cn 都没动, 不调用" 'export FAKE_STUB_BAD=1; cp "$R3_MOSCFG" "$R3_TMP/cfg.ref"; cp "$R3_GEOCN" "$R3_TMP/geo.ref"' \
+  "自有上游: 自有上游没报就绪(输出: OSError: [Errno 98]" 'cmp -s "$T/r3tmp-i-stub/cfg.ref" "$T/r3tmp-i-stub/mosdns/config.yaml" && cmp -s "$T/r3tmp-i-stub/geo.ref" "$T/r3tmp-i-stub/mosdns/rules/geosite_cn.txt" && (( $(nres i-stub) == 0 ))'
+mktab rs-fail 'restart mosdns|1||Job for mosdns.service failed because the control process exited with error code.'
+gcase i-rst  15 "八-B9 仪器重启失败 ⇒ 不调用" 'SCFIX="$T/sc-rs-fail.tab"' "仪器重启(仪器条件生效): systemctl restart mosdns 失败" '(( $(served i-rst "restart mosdns -> rc=1") == 1 ))'
+gcase i-cfg  15 "八-B10 配置里有两个 local_upstream ⇒ 结构不符, 配置一个字节都不改、不起上游, 不调用" \
+  'printf "  - tag: local_upstream\n    type: forward\n    args: { concurrent: 1 }\n" >> "$R3_MOSCFG"; cp "$R3_MOSCFG" "$R3_TMP/cfg.ref"' \
+  "mosdns 配置结构与预期不符(local_upstream 标签行 2 处(应恰 1))" 'cmp -s "$T/r3tmp-i-cfg/cfg.ref" "$T/r3tmp-i-cfg/mosdns/config.yaml" && (( $(nres i-cfg) == 0 )) && [[ ! -e "$T/r3tmp-i-cfg/dns-up.out" ]]'
+
+# 观测有效性: 半截输出、日志 / 计数、上游进程、实例身份
+PI='r3_dns_adjust > "$R3_TMP/instr.out" 2>&1 || echo "INSTR-FAIL $R3_WHY"; '   # 本组只验观测与来源判据: 只建立仪器条件(标定另有八-A / B 组)
+PC='r3_dns_path "$R3_DNS_CPRE" o U; echo "R=$? V=[$R3_DNS_ANS]"; echo "WHY=$R3_WHY"'
+rd o-dnsrc  "${PI}FAKE_DIG_RC=9; ${PC}" "R=2 V=[]" "八-O1 C 的查询打印正常 U 应答(上游也记了)后 dig 退出 9 ⇒ 观测无效, 半截输出不消费" "命令失败: dig 退出 9" '(( $(served o-dnsrc "model-uplog r3c-pre-t.e2e.test") == 1 ))'
+rd o-err    "${PI}FAKE_DIG_ERR=\";; Warning: 模拟告警\"; ${PC}" "R=2 V=[]" "八-O2 dig 退出 0 但标准错误非空 ⇒ 观测无效" "dig 有标准错误输出"
+rd o-logrd  "${PI}"'cat(){ if [[ "$*" == *dns-up.log* ]]; then echo hit >> "$HIT"; command cat "$@"; return 1; fi; command cat "$@"; }; '"${PC}" "R=2 V=[]" \
+  "八-O3 上游日志先输出全文再以 1 退出 ⇒ 日志不可读, 不当成没有查询" "自有上游日志读不了" 'hit o-logrd'
+rd o-logbad "${PI}"'printf "垃圾行\n" >> "$R3_UPLOG"; '"${PC}" "R=2 V=[]" "八-O4 上游日志有不认识的行 ⇒ 观测无效" "自有上游日志有不认识的行([垃圾行])"
+rd o-cnt    "${PI}"'printf "1\n" >> "$R3_UPCNT"; '"${PC}" "R=2 V=[]" "八-O5 上游计数比日志多 1 ⇒ 计数无效" "自有上游计数 1 与日志里的查询记录 0 条对不上"
+rd o-cntbad "${PI}"'printf "x\n" >> "$R3_UPCNT"; '"${PC}" "R=2 V=[]" "八-O5b 上游计数文件有异常行 ⇒ 计数无效" "自有上游计数文件有不认识的行([x])"
+rd o-swap   "${PI}FAKE_DIG_SWAP=1; ${PC}" "R=2 V=[]" "八-O6 查询期间 mosdns 换了实例 ⇒ 观测无效(答案对应不到一个实例)" "查询期间 mosdns 实例变了" '(( $(served o-swap "model-swap") == 1 ))'
+# shellcheck disable=SC2034  # 在格代码串里使用
+CNT_RAW="$(rawdig NOERROR 2 'r3c-pre-t.e2e.test.|60|IN|A|198.51.100.7')"
+rd o-ancnt  "${PI}FAKE_DIG_RAW=\"\$CNT_RAW\"; ${PC}" "R=2 V=[]" "八-O7 头部 ANSWER: 2 但答案段只有 1 条 ⇒ 输出无效(不完整)" "答案段 1 条, 头部 ANSWER: 2"
+rd o-mixa   "${PI}FAKE_DIG_EXTRA_A=203.0.113.1; ${PC}" "R=1 V=[198.51.100.7 203.0.113.1]" "八-O8 答案里 U 之外还有一条 H ⇒ 不算 U(全部 A 都要等于期望, 不只看第一条)" "答案与期望 U=198.51.100.7 不符"
+rd o-stub   "${PI}"'kill "$R3_STUB_PID"; wait "$R3_STUB_PID" 2>/dev/null; '"${PC}" "R=2 V=[]" "八-O9 自有上游进程已退出 ⇒ 观测无效(上游异常不当成没有查询)" "已不在"
+mktab pid-rc 'show:MainPID mosdns|1|%P\n|'
+rd o-pid    "${PI}"'SCFIX="$T/sc-pid-rc.tab"; '"${PC}" "R=2 V=[]" "八-O10 mosdns MainPID 查询输出合法值后退出 1 ⇒ 实例身份没取得, 观测无效" "mosdns 的 MainPID 查询退出 1" \
+  '(( $(served o-pid "show:MainPID mosdns -> rc=1") >= 1 ))'
+
+# 来源判据: 答案对了不等于来源成立
+rd s-nolog  "${PI}FAKE_NOLOG=1; ${PC}" "R=3 V=[198.51.100.7]" "八-R1 答案是 U 但窗口里自有上游没有收到该名 ⇒ 来源证据不成立(不通过)" "答案来源没有证据"
+rd s-cache  "${PI}"'r3_dns_path "$R3_DNS_CPRE" o1 U; a=$?; r3_dns_path "$R3_DNS_CPRE" o2 U; echo "R=$a/$? V=[$R3_DNS_INC]"; echo "WHY=$R3_WHY"' "R=0/3 V=[0]" \
+  "八-R2 同一实例里第二次问同一名字(缓存作答)⇒ 没有新上游查询, 来源判据不通过" "答案来源没有证据" '(( $(served s-cache "model-cache r3c-pre-t.e2e.test") == 1 ))'
+rd s-hlog   "${PI}"'FAKE_HLOG=1; r3_dns_path "$R3_DNS_PPRE" o H; echo "R=$? V=[$R3_DNS_ANS]"; echo "WHY=$R3_WHY"' "R=3 V=[203.0.113.1]" "八-R3 答案是 H 但窗口里自有上游收到了该名 ⇒ 来源证据不成立" "与接管 / 劫持路径对不上"
+
+# 前阶段(门): 规则匹配与来源
+gcase q-prule 12 "八-G1 调用前 P 被一条非逐字规则(keyword:r3p-, 文件里没有 P 的全名)匹配 ⇒ 前阶段不成立, 不调用" 'printf "keyword:r3p-\n" >> "$MODEL_DIR/rules/custom_hijack.txt"' \
+  "③-0 前像 DNS P 探针 r3p-pre-t.e2e.test 被规则匹配(" '! grep -qF r3p-pre-t.e2e.test "$T/r3tmp-q-prule/mosdns/rules/custom_hijack.txt" && ! grep -q "^VOK ③-0 前像 DNS P" "$T/out-q-prule" && grep -qF "P 的路径不判" "$T/out-q-prule"'
+gcase q-pcsrc 12 "八-G2 调用前 C 答 U 但自有上游没收到 ⇒ 来源不成立, 不调用" 'FAKE_ON=r3c-pre-t.e2e.test; FAKE_NOLOG=1' \
+  "③-0 前像 DNS C(独立上游对照 r3c-pre-t.e2e.test)经 local_upstream 取得 U —— 来源证据不成立" '! grep -q " q=r3c-pre-t.e2e.test " "$T/r3tmp-q-pcsrc/dns-up.log"'
+
+# 后阶段: 分别判红 / 未取得
+PP='r3_dns_phase post; echo "PR=$?"'
+pc q-tail  "八-P1 升级后普通劫持探针 P 不再走 H(末尾 all 劫持被换成走远端上游)⇒ 判红" "${POK}FAKE_MODEL_TAIL=remote" "$PP" \
+  "VBAD ③-4 F2 P(普通劫持探针 r3p-post-t.e2e.test)走 H、自有上游未收到: 普通 DNS 代理劫持路径保留 —— 不成立: r3p-post-t.e2e.test 答案与期望 H=203.0.113.1 不符(status=NOERROR A=[17.253.0.1]" "VOK ③-4 F2 P("
+pc q-geo   "八-P2 升级后 geosite_cn 被改(追加一行)⇒ 仪器条件被改动, 该功能结论未取得, 不再拿 W / C / P 的答案说事" "${POK}"'printf "domain:example.org\n" >> "$R3_GEOCN"' "$PP" \
+  "VBAD ③-4 F2 仪器条件被改动: geosite_cn 与调整后那一份对不上" "VOK ③-4 F2 W(" '(( $(fk q-geo "dig ") == 0 ))'
+pc q-up    "八-P3 升级后 local_upstream 那一行被换掉 ⇒ 仪器条件被改动, 该功能结论未取得" "${POK}"'sed -i "s#udp://127.0.0.1:15301#udp://223.5.5.5:53#" "$R3_MOSCFG"' "$PP" \
+  "VBAD ③-4 F2 仪器条件被改动: local_upstream 的 args 行已换成" "VOK ③-4 F2 W("
+pc q-stub  "八-P4 升级后自有上游进程不在 ⇒ 仪器条件观测失效, 该功能结论未取得" "${POK}"'kill "$R3_STUB_PID"; wait "$R3_STUB_PID" 2>/dev/null' "$PP" \
+  "VBAD ③-4 F2 仪器条件观测失效: 自有上游: 自有上游进程" "VOK ③-4 F2 W("
+pc q-rule  "八-P5 升级后 P 被一条非逐字规则(keyword:r3p-)匹配 ⇒ 不能代表普通劫持路径, 该结论未取得(行为上它照样答 H)" "${POK}"'printf "keyword:r3p-\n" >> "$MODEL_DIR/rules/custom_hijack.txt"' "$PP" \
+  "VBAD ③-4 F2 P 探针 r3p-post-t.e2e.test 被规则匹配(" "VOK ③-4 F2 P" 'grep -qF "VNOTE ③-4 F2 P 的路径不判" "$T/out-q-rule"'
+pc q-nolog "八-P6 升级后 W 答 U 但自有上游没收到 W ⇒ 来源证据不成立, 该功能结论未取得(不计通过)" "${POK}FAKE_ON=gs-loc.apple.com; FAKE_NOLOG=1" "$PP" \
+  "—— 来源证据不成立: gs-loc.apple.com 答案是 U, 但本次查询窗口里自有上游没有收到该名" "VOK ③-4 F2 W("
+pc q-cache "八-P7 升级前 W 已在同一实例里答过 H、产品清了接管表却没重启 mosdns ⇒ W 仍答 H(旧实例缓存), 判红" \
+  'r3_dns_instrument > "$R3_TMP/instr.out" 2>&1 && r3_dns_phase pre > "$R3_TMP/pre.out" 2>&1; : > "$HIJ"; ' "$PP" \
+  "—— 不成立: gs-loc.apple.com 答案与期望 U=198.51.100.7 不符(status=NOERROR A=[203.0.113.1]" "VOK ③-4 F2 W(" '(( $(served q-cache "model-cache gs-loc.apple.com") == 1 ))'
+
+# 规则匹配判据本身: mosdns v5.3.4 语义, 不靠逐字出现(318: regexp 改为一律不判, 本格去掉 regexp 那一行, 见八-M5 / 九-U2)
+ln_inline="$(grep -n 'qname suffix probe.dot.e2e.example' "$T/fixmos/config.yaml" | cut -d: -f1)"
+printf '%s\t%s\n' a.rm.example 'custom_hijack.txt:1,custom_hijack.txt:1' rm.example 'custom_hijack.txt:1,custom_hijack.txt:1' xrm.example '' \
+  yzz.test 'custom_hijack.txt:2,custom_hijack.txt:2' exact.test 'custom_hijack.txt:3,custom_hijack.txt:3' \
+  sub.exact.test '' probe.dot.e2e.example "配置第 ${ln_inline} 行内联" gs-loc.apple.com 'mitm_hijack.txt:1' nohit.test '' > "$T/rm-exp.txt"
+cell m-ok 'printf "%s\n" "domain:rm.example  # 注释" "keyword:zz" "full:exact.test" "" "# 整行注释" > "$MODEL_DIR/rules/custom_hijack.txt"
+r3_dns_rulematch a.rm.example RM.Example. xrm.example yzz.test exact.test sub.exact.test probe.dot.e2e.example gs-loc.apple.com nohit.test; echo "R=$?"
+printf "%s\n" "$R3_VAL" | sed "s#$MODEL_DIR/rules/##g" > "$R3_TMP/rm-got.txt"'
+if grep -qx 'R=0' "$T/out-m-ok" && cmp -s "$T/rm-exp.txt" "$T/r3tmp-m-ok/rm-got.txt"; then
+  ok "八-M1 规则匹配按 mosdns v5.3.4 语义求值: domain 含子域但不含'xrm'这类非边界后缀、full 只认全名、keyword 生效、# 注释剥掉、名字大小写与结尾点归一; 内联 qname 计入; ip_set 里的 IPv6 网段不当规则"
+else bad "八-M1 规则匹配表: $(tr '\n' ' ' < "$T/out-m-ok" | head -c 200) 差异: $(diff "$T/rm-exp.txt" "$T/r3tmp-m-ok/rm-got.txt" 2>&1 | tr '\n' ' ' | head -c 300)"; fi
+RMQ='r3_dns_rulematch x.test; echo "R=$? V=[$R3_VAL]"; echo "WHY=$R3_WHY"'
+rd m-type  'printf "foo:bar\n" > "$MODEL_DIR/rules/custom_hijack.txt"; '"$RMQ" "R=2 V=[]" "八-M2 规则类型认不出 ⇒ 判不了(不当成没匹配)" "不认识的规则类型 [foo]"
+rd m-gone  'rm -f "$MODEL_DIR/rules/ruleset_hijack.txt"; '"$RMQ" "R=2 V=[]" "八-M3 被引用的规则文件读不了 ⇒ 判不了" "规则文件读不了"
+rd m-exps  'printf "  - tag: extra\n    type: domain_set\n    args: { exps: [\"domain:x.test\"] }\n" >> "$R3_MOSCFG"; '"$RMQ" "R=2 V=[]" "八-M4 配置里有 exps(内联域名表达式)⇒ 判不了" "有 exps"
+rd m-re    'printf "regexp:([\n" > "$MODEL_DIR/rules/custom_hijack.txt"; '"$RMQ" "R=2 V=[]" "八-M5 regexp 规则一律不判(318 收窄: 不再用 Python re 冒充 Go RE2; 原格核'编译不了 ⇒ 判不了', 现在连能编译的也不判)⇒ 判不了" "regexp 规则不判"
+
+echo; echo "══ 九. 规则匹配判据(318: 支持的规则严格按 mosdns v5.3.4; 认不出 / 读不全 / 不支持 ⇒ 判不了) ══"
+# 语义依据: mosdns v5.3.4(提交 b7323188)的 pkg/matcher/domain、plugin/data_provider/domain_set、plugin/matcher/base_domain 源码
+# (318 证据 repro/mosdns-v5.3.4-src 有原文与 blob 哈希)。这是静态依据 + 受控输入, 不是运行真 mosdns 的结果。
+RMP='r="$?"; v="$(printf "%s" "$R3_VAL" | sed "s#$MODEL_DIR/rules/##g" | tr "\t\n" "=;")"; echo "R=$r V=[$v]"; echo "WHY=$R3_WHY"'
+RMU='r3_dns_rulematch r3p-pre-t.e2e.test; echo "R=$? V=[$R3_VAL]"; echo "WHY=$R3_WHY"'
+# 合法匹配不得判成未命中
+rd k-kw   'printf "keyword:r3p-.\n" > "$MODEL_DIR/rules/custom_hijack.txt"; r3_dns_rulematch r3p-pre-t.e2e.test r3c-pre-t.e2e.test; '"$RMP" \
+  "R=0 V=[r3p-pre-t.e2e.test=custom_hijack.txt:1,custom_hijack.txt:1;r3c-pre-t.e2e.test=]" \
+  "九-K1 keyword:r3p-.(带结尾点)按 v5.3.4 先归一化(去一个结尾点、转小写)再做包含 ⇒ 命中 P, 不命中 C(317 判 P 未命中)" "" \
+  '! grep -qF r3p-pre-t "$T/r3tmp-k-kw/mosdns/rules/custom_hijack.txt"'
+gcase k-kwg 12 "九-K2 调用前 custom_hijack 有 keyword:r3p-. ⇒ P 被匹配: 前阶段不成立、不作'普通 DNS 代理劫持路径保留'的结论, 不调用" \
+  'printf "keyword:r3p-.\n" >> "$MODEL_DIR/rules/custom_hijack.txt"' "③-0 前像 DNS P 探针 r3p-pre-t.e2e.test 被规则匹配(" \
+  '! grep -q "普通 DNS 代理劫持路径保留 —— 成立" "$T/out-k-kwg" && grep -qF "P 的路径不判" "$T/out-k-kwg"'
+printf '%s\t%s\n' a.sem.test 'ruleset_hijack.txt:1' sem.test 'ruleset_hijack.txt:1' full2.test '' full2.test '' a.x-kw-up 'ruleset_hijack.txt:3' \
+  def.test 'ruleset_hijack.txt:4' a.dot.test 'ruleset_hijack.txt:5' other.test '' > "$T/sem-exp.txt"
+cell k-sem 'printf "%s\n" "domain:.sem.test" "full:full2.test.." "keyword:KW-UP." ":def.test" "domain:dot.test." > "$MODEL_DIR/rules/ruleset_hijack.txt"
+r3_dns_rulematch a.sem.test sem.test full2.test full2.test. a.x-kw-up def.test a.dot.test other.test; echo "R=$?"
+printf "%s\n" "$R3_VAL" | sed "s#$MODEL_DIR/rules/##g" > "$R3_TMP/sem-got.txt"'
+if grep -qx 'R=0' "$T/out-k-sem" && cmp -s "$T/sem-exp.txt" "$T/r3tmp-k-sem/sem-got.txt"; then
+  ok "九-S1 v5.3.4 归一化逐条: domain:.sem.test 等同 sem.test(扫描器不产生开头空标签)、full 只去一个结尾点(full2.test.. 不认 full2.test)、keyword 去结尾点并转小写(名字 a.x-kw-up 里没有 'kw-up.', 不归一化就不命中)、':def.test' 空类型按 domain、domain:dot.test. 去结尾点"
+else bad "九-S1 语义表: $(tr '\n' ' ' < "$T/out-k-sem" | head -c 200) 差异: $(diff "$T/sem-exp.txt" "$T/r3tmp-k-sem/sem-got.txt" 2>&1 | tr '\n' ' ' | head -c 300)"; fi
+rd k-empty 'printf "domain:\n" > "$MODEL_DIR/rules/ruleset_hijack.txt"; r3_dns_rulematch anything.test r3p-pre-t.e2e.test; '"$RMP" \
+  "R=0 V=[anything.test=ruleset_hijack.txt:1;r3p-pre-t.e2e.test=ruleset_hijack.txt:1]" "九-S2 空的 domain 规则(domain:)在 v5.3.4 里存到根节点、匹配一切 ⇒ 任何名字都命中(317 判未命中)"
+rd k-tcm  'sed -i "/^  - tag: explicit_proxy\$/{n;s/^    type: domain_set\$/    type: domain_set   # 行尾注释(合法 YAML)/}" "$R3_MOSCFG"; printf "full:r3p-pre-t.e2e.test\n" > "$MODEL_DIR/rules/ruleset_hijack.txt"; r3_dns_rulematch r3p-pre-t.e2e.test; '"$RMP" \
+  "R=0 V=[r3p-pre-t.e2e.test=ruleset_hijack.txt:1]" "九-T1 explicit_proxy 的 type 行带合法行尾注释、规则只在它独有引用的 ruleset_hijack.txt 里 ⇒ 仍读到并命中(317 漏读该块、判未命中)" "" \
+  'grep -qF "    type: domain_set   # 行尾注释" "$T/r3tmp-k-tcm/mosdns/config.yaml"'
+pc k-tcp  "九-T2 升级后 explicit_proxy 的 type 行带行尾注释、其独有规则文件命中 P 后 ⇒ P 被匹配, 该功能结论未取得, 不打'普通 DNS 代理劫持路径保留'" \
+  "${POK}"'sed -i "/^  - tag: explicit_proxy\$/{n;s/^    type: domain_set\$/    type: domain_set   # 行尾注释(合法 YAML)/}" "$R3_MOSCFG"; printf "full:r3p-post-t.e2e.test\n" > "$MODEL_DIR/rules/ruleset_hijack.txt"' \
+  "$PP" "VBAD ③-4 F2 P 探针 r3p-post-t.e2e.test 被规则匹配(" "普通 DNS 代理劫持路径保留 —— 成立" 'grep -qF "VNOTE ③-4 F2 P 的路径不判" "$T/out-k-tcp"'
+rd q-path 'mv "$MODEL_DIR/rules/ruleset_hijack.txt" "$MODEL_DIR/rules/x-qname-domain_set-exps:1.txt"; sed -i "s|$MODEL_DIR/rules/ruleset_hijack.txt|$MODEL_DIR/rules/x-qname-domain_set-exps:1.txt|" "$R3_MOSCFG"; printf "full:r3p-pre-t.e2e.test\n" > "$MODEL_DIR/rules/x-qname-domain_set-exps:1.txt"; r3_dns_rulematch r3p-pre-t.e2e.test; '"$RMP" \
+  "R=0 V=[r3p-pre-t.e2e.test=x-qname-domain_set-exps:1.txt:1]" "九-Q1 规则文件路径里含 qname / domain_set / exps: 字样(在双引号里)⇒ 仍按模板写法读下并命中, 不因路径文字误判判不了" "" \
+  'grep -qF "x-qname-domain_set-exps:1.txt\"" "$T/r3tmp-q-path/mosdns/config.yaml"'
+# 认不出 / 读不全 / 不支持 ⇒ 判不了(不进"没有命中"的成功分支)
+rd u-amp  'sed -i "s|^      - matches: qname \\\$explicit_proxy\$|      - matches: qname \$explicit_proxy \&$MODEL_DIR/rules/amp.txt|" "$R3_MOSCFG"; printf "full:r3p-pre-t.e2e.test\n" > "$MODEL_DIR/rules/amp.txt"; '"$RMU" "R=2 V=[]" \
+  "九-U1 序列里 qname 直接引用规则文件(&文件: v5.3.4 支持, 本判据不支持)⇒ 判不了(317 当成一条 domain 规则、判未命中)" "直接引用规则文件" \
+  'grep -qF "&$T/r3tmp-u-amp/mosdns/rules/amp.txt" "$T/r3tmp-u-amp/mosdns/config.yaml"'
+rd u-re2  'printf "regexp:^r3p-[[:alpha:]]+-\n" > "$MODEL_DIR/rules/ruleset_hijack.txt"; '"$RMU" "R=2 V=[]" \
+  "九-U2 regexp 规则(这条用了 RE2 的 [[:alpha:]], Python re 另有解释)⇒ 不判(317 用 Python re 求值、判未命中)" "regexp 规则不判"
+rd u-sq   'sed -i "s|\"$MODEL_DIR/rules/ruleset_hijack.txt\"|'"'"'$MODEL_DIR/rules/ruleset_hijack.txt'"'"'|" "$R3_MOSCFG"; printf "full:r3p-pre-t.e2e.test\n" > "$MODEL_DIR/rules/ruleset_hijack.txt"; '"$RMU" "R=2 V=[]" \
+  "九-U3 domain_set 的文件路径用单引号(合法 YAML, 非模板写法)⇒ 判不了(317 只读双引号那几项, 漏读这一项、判未命中)" "写法不是模板那一种" \
+  'grep -q "ruleset_hijack.txt'"'"'" "$T/r3tmp-u-sq/mosdns/config.yaml"'
+rd u-ws   'printf "full:r3p-pre-t.e2e.test extra\n" > "$MODEL_DIR/rules/ruleset_hijack.txt"; '"$RMU" "R=2 V=[]" \
+  "九-U4 规则里有空白(v5.3.4 的 patternOnly 会拒绝加载)⇒ 判不了(317 当成一条 full 规则、判未命中)" "规则含空白或非 ASCII 可见字符"
+rd u-qp   'printf "  - tag: p_qname\n    type: qname\n    args: { files: [\"%s\"] }\n" "$MODEL_DIR/rules/qn.txt" >> "$R3_MOSCFG"; printf "full:r3p-pre-t.e2e.test\n" > "$MODEL_DIR/rules/qn.txt"; '"$RMU" "R=2 V=[]" \
+  "九-U5 配置里有带自己规则的 qname 匹配器插件 ⇒ 判不了(317 只看 domain_set, 漏读、判未命中)" "qname 匹配器插件"
+rd u-tag  'sed -i "s|^      - matches: qname \\\$explicit_proxy\$|      - matches: qname \$explicit_proxy \$no_such_set|" "$R3_MOSCFG"; '"$RMU" "R=2 V=[]" \
+  "九-U6 qname 引用了配置里没有的集合(mosdns 会起不来)⇒ 判不了(317 跳过、判未命中)" "认不出的集合 \$no_such_set"
+rd u-ml   'sed -i "/^  - tag: explicit_proxy\$/{n;n;s|^    args: { files: \\[\\(.*\\)\\] }\$|    args:\\n      files: [\\1]|}" "$R3_MOSCFG"; printf "full:r3p-pre-t.e2e.test\n" > "$MODEL_DIR/rules/ruleset_hijack.txt"; '"$RMU" "R=2 V=[]" \
+  "九-U7 domain_set 的 args 写成多行(合法 YAML, 非模板写法)⇒ 判不了" "写法不是模板那一种" \
+  'grep -qE "^      files: \[.*ruleset_hijack.txt\"\]$" "$T/r3tmp-u-ml/mosdns/config.yaml"'
+rd u-tab  'printf "# \t带制表符的注释\n" >> "$R3_MOSCFG"; '"$RMU" "R=2 V=[]" "九-U8 配置里有制表符 ⇒ 判不了(本判据不按 YAML 处理制表符)" "制表符"
+rd u-pos  'printf "  - type: domain_set\n    tag: extra_set\n    args: { files: [\"%s\"] }\n" "$MODEL_DIR/rules/ruleset_hijack.txt" >> "$R3_MOSCFG"; '"$RMU" "R=2 V=[]" \
+  "九-U9 plugin 块先写 type 后写 tag(合法 YAML, 非模板写法)⇒ 判不了" "缩进不是模板写法"
+# 升级前前提不成立 ⇒ 桩 CLI 0 次; 升级后观测无效 ⇒ 未取得; 两处都不打"普通 DNS 代理劫持路径保留"
+gcase k-reg0 15 "九-G1 调用前规则里就有 regexp ⇒ 标定前的规则匹配表判不了 ⇒ DNS 仪器不成立, 不调用, 不打'普通 DNS 代理劫持路径保留'" \
+  'printf "regexp:^r3p-[[:alpha:]]+-\n" > "$MODEL_DIR/rules/ruleset_hijack.txt"' "regexp 规则不判" '! grep -q "普通 DNS 代理劫持路径保留" "$T/out-k-reg0"'
+gcase k-reg1 12 "九-G2 regexp 在仪器之后、运行态门之前才出现 ⇒ 前阶段 P 规则匹配判不了 ⇒ 不作'普通 DNS 代理劫持路径保留'的结论, 不调用" \
+  'eval "$(declare -f r3_dns_instrument | sed "1s/^r3_dns_instrument/r3__orig_di/")"; r3_dns_instrument(){ r3__orig_di "$@" || return; printf "regexp:^r3p-\n" > "$MODEL_DIR/rules/ruleset_hijack.txt" && echo hit >> "$HIT"; }' \
+  "③-0 前像 DNS P 规则匹配判不了" 'hit k-reg1 && ! grep -q "普通 DNS 代理劫持路径保留 —— 成立" "$T/out-k-reg1" && grep -qF "P 的路径不判" "$T/out-k-reg1"'
+pc k-post "九-P1 升级后序列里出现 qname &文件 ⇒ P 规则匹配判不了, 该功能结论未取得, 不打'普通 DNS 代理劫持路径保留'" \
+  "${POK}"'sed -i "s|^      - matches: qname \\\$explicit_proxy\$|      - matches: qname \$explicit_proxy \&$MODEL_DIR/rules/amp.txt|" "$R3_MOSCFG"; printf "full:r3p-post-t.e2e.test\n" > "$MODEL_DIR/rules/amp.txt"' \
+  "$PP" "VBAD ③-4 F2 P 规则匹配判不了" "普通 DNS 代理劫持路径保留 —— 成立" 'grep -qF "VNOTE ③-4 F2 P 的路径不判" "$T/out-k-post"'
+# 健康对照: 仓库里真实的 mosdns 模板(与 v1.11.15 / 桥接 / 退役候选逐字节相同)按夹具占位符表渲染, 规则路径改到本格目录
+cell k-tpl 'd="$R3_TMP/tpl"; mkdir -p "$d/rules" "$d/adblock"
+sed -e "s|__SERVER_IP__|203.0.113.1|g" -e "s|__INTERNAL_CIDR__|10.0.0.0/8|g" -e "s|__CERT_DIR__|/etc/mosdns/certs|g" -e "s|__MOSDNS_CACHE__|1024|g" \
+    -e "s|__HIJACK_SET_FILE__|geosite_geolocation-!cn.txt|g" -e "s|/etc/mosdns/rules/|$d/rules/|g" -e "s|/var/lib/privdns-gateway/adblock/|$d/adblock/|g" "$ROOT/deploy/mosdns/config.yaml" > "$d/config.yaml"
+grep -oE "\"$d/[^\"]+\"" "$d/config.yaml" | tr -d "\"" | sort -u > "$d/files.txt"; while IFS= read -r f; do : > "$f"; done < "$d/files.txt"
+printf "domain:baidu.com\nfull:gs-loc.apple.com\nfull:r3k-t.e2e.test\nfull:r3c-pre-t.e2e.test\nfull:r3c-post-t.e2e.test\n" > "$d/rules/geosite_cn.txt"
+printf "domain:gs-loc.apple.com\ndomain:gs-loc-cn.apple.com\n" > "$d/rules/mitm_hijack.txt"
+R3_MOSCFG="$d/config.yaml"; r3_dns_rulematch gs-loc.apple.com r3p-pre-t.e2e.test r3p-post-t.e2e.test; a=$?; v="$(printf "%s" "$R3_VAL" | sed "s#$d/rules/##g" | tr "\t\n" "=;")"
+sed -i "/\"!qname \\\$hijack_set\"/,+1d" "$d/config.yaml"; n="$(grep -c "qname .hijack_set" "$d/config.yaml")"; r3_dns_rulematch r3p-pre-t.e2e.test
+echo "R=$a/$? G=$n F=$(wc -l < "$d/files.txt") V=[$v]"'
+if grep -qx 'R=0/0 G=0 F=12 V=\[gs-loc.apple.com=geosite_cn.txt:2,mitm_hijack.txt:1;r3p-pre-t.e2e.test=;r3p-post-t.e2e.test=\]' "$T/out-k-tpl"; then
+  ok "九-H1 健康对照: 仓库里真实的 mosdns 模板按夹具占位符表渲染后, 本判据完整读下 12 个规则文件; P 前 / 后都不被匹配, W 命中 geosite_cn 与接管表; 去掉 all 形态的劫持门(两处)后仍判得了"
+else bad "九-H1 健康对照: $(tr '\n' ' ' < "$T/out-k-tpl" | head -c 400)"; fi
+
+# 受控上游进程的回收(按登记 PID)
+nt=0; nz=0
+while IFS= read -r sp; do
+  [[ "$sp" =~ ^[0-9]+$ ]] || continue; nt=$((nt + 1))
+  [[ "$( { tr '\0' ' ' < "/proc/$sp/cmdline"; } 2>/dev/null)" == *"$T/fake-stub.py"* ]] && nz=$((nz + 1))
+done < "$T/stub-pids"
+(( nt > 0 && nz == 0 )) && ok "八-Z 本契约起过的 $nt 个受控上游进程都已由 ③ 的退出回收(按登记 PID)收掉" || bad "八-Z 受控上游进程: 起过 $nt 个, 仍在 $nz 个"
 
 echo "────────────────────────────────────────"
 echo "通过 $pass, 失败 $nfail"
