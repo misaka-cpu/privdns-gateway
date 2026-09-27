@@ -42,11 +42,12 @@ on:
       real_scope:
         # 只在 real_acceptance=true 时有意义。默认 all = 与以前逐字节相同的三 job 语义;
         # 选 platform 就只跑⑤a/⑤b 两个平台方向, 选 retire 就只跑④旧 CLI 直跳被拒。
+        # 选 retire-hop 就只跑③(已安装桥接 → 退役候选; 同一 job 里先原样跑 ② 取得真实桥接前像)。
         # 是**显式范围选择**, 不是用 continue-on-error 把失败绕过去 —— 被选中的 job
         # 该红照样红, 没被选中的 job 直接不启动(不产生结果, 也不冒充通过)。
-        description: "真实验收的范围(默认 all; platform = 只跑⑤a/⑤b; retire = 只跑④; bridge = 只跑② v1.11.15→桥接)"
+        description: "真实验收的范围(默认 all; platform = 只跑⑤a/⑤b; retire = 只跑④; bridge = 只跑② v1.11.15→桥接; retire-hop = ②+③ 同一 job)"
         type: choice
-        options: ["all", "platform", "retire", "bridge"]
+        options: ["all", "platform", "retire", "bridge", "retire-hop"]
         default: "all"
 
 permissions:
@@ -2191,4 +2192,110 @@ jobs:
             echo "########## EVIDENCE $f ##########"
             sudo cat "/tmp/real-acceptance-evidence/$f"
             echo
+          done
+
+  # ── 真实验收③: 已安装桥接 → 退役候选 ────────────────────────────────────────
+  # 与 real-bridge-hop 分开的 job(那个 job 一个字不动)。③ 的前像必须是**本次**真实桥接现场,
+  # 所以同一 runner 上先**原样**跑 ②(同一支脚本、同一组输入), ② 成功才启动 ③;
+  # ③ 起跑前自己再把桥接前像逐项现查一遍, 不成立就不调用。
+  real-retire-hop:
+    needs: prepare-mosdns-fixture
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.real_acceptance == 'true'
+            && github.event.inputs.real_scope == 'retire-hop' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    name: "真实验收③: 已安装桥接 → 退役候选(同一 runner 先原样跑 ②, 再用现役桥接 CLI 跑 update --to)"
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0          # 旧版对象与两个候选都要从本地取
+      - name: "取桥接/退役候选分支, 并核对 head == 派发时指定的 SHA"
+        env:
+          PDG_BRIDGE_SHA: ${{ github.event.inputs.bridge_candidate }}
+          PDG_BRIDGE_BR:  ${{ github.event.inputs.bridge_branch }}
+          PDG_CAND_SHA:   ${{ github.event.inputs.product_candidate }}
+          PDG_CAND_BR:    ${{ github.event.inputs.candidate_branch }}
+        run: |
+          set -euo pipefail
+          test -n "$PDG_BRIDGE_SHA" || { echo "必须显式指定桥接候选 SHA"; exit 1; }
+          test -n "$PDG_BRIDGE_BR"  || { echo "必须显式指定桥接候选分支名"; exit 1; }
+          test -n "$PDG_CAND_SHA"   || { echo "必须显式指定退役候选 SHA(③ 的升级目标)"; exit 1; }
+          test -n "$PDG_CAND_BR"    || { echo "必须显式指定退役候选分支名"; exit 1; }
+          git fetch --no-tags origin "+refs/heads/$PDG_BRIDGE_BR:refs/heads/pdg-bridge"
+          git fetch --no-tags origin "+refs/heads/$PDG_CAND_BR:refs/heads/pdg-candidate"
+          git fetch --tags origin
+          gotb=$(git rev-parse refs/heads/pdg-bridge); gotc=$(git rev-parse refs/heads/pdg-candidate)
+          echo "桥接候选 $PDG_BRIDGE_BR = $gotb"
+          echo "退役候选 $PDG_CAND_BR  = $gotc"
+          echo "验收 checkout            = ${{ github.sha }}"
+          test "$gotb" = "$PDG_BRIDGE_SHA" || { echo "桥接候选 head 与派发时指定的 SHA 不符"; exit 1; }
+          test "$gotc" = "$PDG_CAND_SHA"   || { echo "退役候选 head 与派发时指定的 SHA 不符"; exit 1; }
+      - name: "PID 1 必须是真 systemd, systemctl 必须是真二进制(不是就判失败, 不 SKIP)"
+        run: |
+          set -euo pipefail
+          comm=$(cat /proc/1/comm); echo "PID 1 = $comm"; test "$comm" = systemd
+          w="$(command -v systemctl)"; echo "systemctl = $w"
+          test -x "$w" && { test "$w" = /usr/bin/systemctl || test "$w" = /bin/systemctl; }
+      - name: 装依赖
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            nftables dnsutils iproute2 openssl python3 git unzip psmisc procps curl >/dev/null
+          nft --version
+      - name: "推导 mosdns artifact 名"
+        run: echo "MOSDNS_ARTIFACT=$(bash tests/mosdns-artifact-name.sh)" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ env.MOSDNS_ARTIFACT }}
+          path: /tmp/mosdns-fixture
+      - name: "校验并安装钉定 mosdns"
+        run: sudo -E bash tests/install-mosdns-artifact.sh /tmp/mosdns-fixture
+      - name: "校验并安装钉定 mihomo"
+        run: sudo -E bash tests/install-mihomo-artifact.sh /tmp/mosdns-fixture
+      - name: "前置: 函数抽取契约 (标记唯一成对/片段与组合语法/抽不对就阻断)"
+        run: bash tests/test-bridge-extract-contract.sh
+      - name: "前置: 观测契约 (依赖自检/保留项台账/服务归类与观测有效性)"
+        run: bash tests/test-bridge-observation-contract.sh
+      - name: "前置: ③ 契约 (接线/② 结果门/桥接身份门/目标到达与观测有效性/退役链服务对账)"
+        run: bash tests/test-retire-hop-contract.sh
+      - name: "② 原样: 按 docs/BRIDGE-ENTRY.md 的入口流程把 v1.11.15 升到桥接版(本次 ③ 的真实前像)"
+        id: real2
+        shell: bash
+        env:
+          PDG_E2E_ISOLATED: "1"
+          PDG_REAL_MIGRATION_OK: "1"
+          PDG_REAL_MIG_EVID: "/tmp/real-acceptance-evidence"
+          PDG_BRIDGE_SHA: ${{ github.event.inputs.bridge_candidate }}
+          PDG_RETIRE_SHA: ${{ github.event.inputs.product_candidate }}
+        run: |
+          set -o pipefail
+          # 与 real-bridge-hop 同一支脚本、同一组输入; 只多一份输出留档(tee 在 pipefail 下不吞 ② 的退出码),
+          # 供 ③ 核 ② 的汇总行与"未执行场景数" —— ② 的 nrun 不计失败, 退出码 0 不足以证明它跑完了。
+          sudo -E bash tests/e2e-real-bridge-hop.sh 2>&1 | tee /tmp/real2-stdout.log
+      - name: "真实验收③: 现役桥接 CLI 执行 update --to 退役候选(② 成功才启动)"
+        id: real3
+        if: ${{ success() && steps.real2.outcome == 'success' }}
+        env:
+          PDG_E2E_ISOLATED: "1"
+          PDG_REAL_MIGRATION_OK: "1"
+          PDG_RETIRE_HOP_EVID: "/tmp/real-acceptance-evidence-retire"
+          PDG_REAL2_LOG: "/tmp/real2-stdout.log"
+          PDG_BRIDGE_SHA: ${{ github.event.inputs.bridge_candidate }}
+          PDG_RETIRE_SHA: ${{ github.event.inputs.product_candidate }}
+        run: sudo -E bash tests/e2e-real-retire-hop.sh
+      - name: "留证: ② 与 ③ 的证据文件、③ 调用次数与 journal(成败都留)"
+        if: ${{ always() }}
+        run: |
+          set +e
+          echo "########## ③ 升级调用次数: $(sudo cat /tmp/real-acceptance-evidence-retire/00-retire-invoke-count.txt 2>/dev/null || echo '<未取得: ③ 没启动或没写>') ##########"
+          echo "########## journal(相关 unit, 末 400 行) ##########"
+          sudo journalctl -u pdg-mitm -u mosdns -u mihomo -u pdg-bot -u pdg-probe81 --no-pager -n 400 2>&1 | tail -400
+          echo
+          for d in /tmp/real-acceptance-evidence /tmp/real-acceptance-evidence-retire; do
+            for f in $(sudo ls -1 "$d" 2>/dev/null); do
+              echo "########## EVIDENCE $d/$f ##########"
+              sudo cat "$d/$f"
+              echo
+            done
           done
