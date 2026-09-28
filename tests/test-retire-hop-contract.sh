@@ -59,37 +59,79 @@ git -C "$ROOT" show "$BASE:.github/workflows/ci.yml" > "$T/base-ci.yml" || bad "
 python3 - "$T/base-ci.yml" "$WF" > "$T/wf.txt" 2>&1 <<'PY'
 import difflib, sys
 b = open(sys.argv[1], encoding="utf-8").read().split("\n"); c = open(sys.argv[2], encoding="utf-8").read().split("\n")
-expect_repl = {   # 基线旧行 → 唯一允许的新行
-    '        description: "真实验收的范围(默认 all; platform = 只跑⑤a/⑤b; retire = 只跑④; bridge = 只跑② v1.11.15→桥接)"':
-    '        description: "真实验收的范围(默认 all; platform = 只跑⑤a/⑤b; retire = 只跑④; bridge = 只跑② v1.11.15→桥接; retire-hop = ②+③ 同一 job)"',
-    '        options: ["all", "platform", "retire", "bridge"]':
-    '        options: ["all", "platform", "retire", "bridge", "retire-hop"]',
-}
+# real_scope 输入块: 基线与现在**各自的整块原文**逐字登记在下面。判据不是"含有某几个字符串就行" ——
+# 新增一个范围要同时动注释、说明与选项, 漏改一处、或顺手改了别的注释, 这一格都会红。
+BASE_SCOPE = [
+    '      real_scope:',
+    '        # 只在 real_acceptance=true 时有意义。默认 all = 与以前逐字节相同的三 job 语义;',
+    '        # 选 platform 就只跑⑤a/⑤b 两个平台方向, 选 retire 就只跑④旧 CLI 直跳被拒。',
+    '        # 是**显式范围选择**, 不是用 continue-on-error 把失败绕过去 —— 被选中的 job',
+    '        # 该红照样红, 没被选中的 job 直接不启动(不产生结果, 也不冒充通过)。',
+    '        description: "真实验收的范围(默认 all; platform = 只跑⑤a/⑤b; retire = 只跑④; bridge = 只跑② v1.11.15→桥接)"',
+    '        type: choice',
+    '        options: ["all", "platform", "retire", "bridge"]',
+    '        default: "all"',
+]
+NOW_SCOPE = [
+    '      real_scope:',
+    '        # 只在 real_acceptance=true 时有意义。默认 all = 与以前逐字节相同的三 job 语义;',
+    '        # 选 platform 就只跑⑤a/⑤b 两个平台方向, 选 retire 就只跑①旧 CLI 直跳被拒。',
+    '        # 选 retire-hop 就只跑③(已安装桥接 → 退役候选; 同一 job 里先原样跑 ② 取得真实桥接前像)。',
+    '        # 选 late-failure 就只跑④(退役成功后的晚期失败 → 产品自己回滚到本次快照; 同一 job 里先原样跑 ②)。',
+    '        # 是**显式范围选择**, 不是用 continue-on-error 把失败绕过去 —— 被选中的 job',
+    '        # 该红照样红, 没被选中的 job 直接不启动(不产生结果, 也不冒充通过)。',
+    '        description: "真实验收的范围(默认 all; platform = 只跑⑤a/⑤b; retire = 只跑①旧 CLI 直跳被拒; bridge = 只跑② v1.11.15→桥接; retire-hop = ②+③ 同一 job; late-failure = ②+④ 同一 job)"',
+    '        type: choice',
+    '        options: ["all", "platform", "retire", "bridge", "retire-hop", "late-failure"]',
+    '        default: "all"',
+]
+def region(lines, where):
+    """real_scope 输入块的行区间 [i, j)。定位不到就是判不了, 不按"没找到=没改"放过。"""
+    if lines.count("      real_scope:") != 1:
+        raise SystemExit("UNEXPECTED %s 里 real_scope 不是恰 1 处" % where)
+    i = lines.index("      real_scope:")
+    j = i
+    while j < len(lines) and lines[j] != '        default: "all"':
+        j += 1
+    if j >= len(lines):
+        raise SystemExit("UNEXPECTED %s 的 real_scope 块里没有 default 行" % where)
+    return i, j + 1
 bad = []
-for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, b, c, autojunk=False).get_opcodes():
+bi, bj = region(b, "基线"); ci, cj = region(c, "现在")
+if b[bi:bj] != BASE_SCOPE:
+    bad.append("基线的 real_scope 整块与登记原文不符(基线被动过, 或登记该更新了)")
+if c[ci:cj] != NOW_SCOPE:
+    bad.append("现在的 real_scope 整块与登记原文不符: %r" % ([x for x in c[ci:cj] if x not in NOW_SCOPE][:2],))
+else:
+    print("SCOPE 整块逐字相符(基线 %d 行 → 现在 %d 行)" % (len(BASE_SCOPE), len(NOW_SCOPE)))
+# 这一块遮成一行哨兵, 其余部分**只许**在文件末尾追加 job 块(内容另行核)。
+bm = b[:bi] + ["<<REAL_SCOPE>>"] + b[bj:]
+cm = c[:ci] + ["<<REAL_SCOPE>>"] + c[cj:]
+for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, bm, cm, autojunk=False).get_opcodes():
     if tag == "equal":
         continue
-    old, new = b[i1:i2], c[j1:j2]
-    if tag == "insert" and i1 >= len(b) - 1 and b[-1] == "":
-        print("APPEND %d 行" % len(new)); continue            # 文件末尾追加的 job 块(内容另行核)
-    if tag == "insert" and new == ["        # 选 retire-hop 就只跑③(已安装桥接 → 退役候选; 同一 job 里先原样跑 ② 取得真实桥接前像)。"]:
-        print("INSERT 注释 1 行"); continue
-    if tag == "replace" and len(old) == len(new) and all(o in expect_repl and expect_repl[o] == n for o, n in zip(old, new)):
-        print("REPLACE %d 行(real_scope 的说明与选项)" % len(old)); continue
-    bad.append("%s 基线 %d-%d → 现 %d-%d: %r → %r" % (tag, i1 + 1, i2, j1 + 1, j2, old[:2], new[:2]))
+    if tag == "insert" and i1 >= len(bm) - 1 and bm[-1] == "":
+        print("APPEND %d 行" % (j2 - j1)); continue            # 文件末尾追加的 job 块(内容另行核)
+    bad.append("%s 基线 %d-%d → 现 %d-%d: %r → %r" % (tag, i1 + 1, i2, j1 + 1, j2, bm[i1:i2][:2], cm[j1:j2][:2]))
 for x in bad:
     print("UNEXPECTED " + x)
 sys.exit(1 if bad else 0)
 PY
 case $? in
-  0) ok "一-1 相对基线的改动只有: real_scope 注释 1 行 + 说明/选项 2 行 + 末尾追加的 job 块 ($(tr '\n' ';' < "$T/wf.txt"))";;
+  0) ok "一-1 相对基线: real_scope 输入块整块与登记原文逐字相符, 其余改动只有文件末尾追加的 job 块 ($(tr '\n' ';' < "$T/wf.txt"))";;
   *) bad "一-1 workflow 有基线之外的改动: $(grep UNEXPECTED "$T/wf.txt" | head -3 | tr '\n' ' ')";;
 esac
-grep -q 'options: \["all", "platform", "retire", "bridge", "retire-hop"\]' "$WF" \
-  && ok "一-2 real_scope 选项里有 retire-hop(原有四项顺序不变)" || bad "一-2 real_scope 选项不对"
-# 新 job 块: 从 "  real-retire-hop:" 到文件末尾
-awk '/^  real-retire-hop:$/{f=1} f' "$WF" > "$T/job.yml"
-[[ -s "$T/job.yml" ]] && ok "一-3 找到 job real-retire-hop" || bad "一-3 没有 job real-retire-hop"
+grep -qxF '        options: ["all", "platform", "retire", "bridge", "retire-hop", "late-failure"]' "$WF" \
+  && ok "一-2 real_scope 选项整行逐字相符(原有五项顺序不变, 末尾是 late-failure)" || bad "一-2 real_scope 选项整行不对"
+# 本节以下只看 **real-retire-hop 这一个 job**: 从它的头一行取到**下一个 job 的头一行之前**。
+# 以前是 `awk '/^  real-retire-hop:$/{f=1} f'` 一直读到文件末尾 —— 末尾再追加别的 job(如 ④),
+# 那个 job 的 env / 步骤 / 顺序就会被一起读进来当成 ③ 的, 本节的结论也就不再只关于 ③。
+job_block(){ awk -v h="  $1:" '$0==h{f=1} f && $0!=h && /^  [a-z][a-z0-9-]*:$/{exit} f' "$WF"; }
+job_block real-retire-hop > "$T/job.yml"
+if [[ -s "$T/job.yml" ]] && [[ "$(head -1 "$T/job.yml")" == "  real-retire-hop:" ]] \
+   && [[ "$(grep -cE '^  [a-z][a-z0-9-]*:$' "$T/job.yml")" == 1 ]]; then
+  ok "一-3 取到的是 real-retire-hop 自身($(grep -c '' "$T/job.yml") 行, 块内只有它一个 job 头 —— 没有把后面的 job 读进来)"
+else bad "一-3 job 抽取边界不对(首行 [$(head -1 "$T/job.yml" 2>/dev/null)], 块内 job 头 $(grep -cE '^  [a-z][a-z0-9-]*:$' "$T/job.yml" 2>/dev/null) 个)"; fi
 grep -qF "github.event.inputs.real_scope == 'retire-hop'" "$T/job.yml" && ! grep -qE "real_scope == '(all|)'" "$T/job.yml" \
   && ok "一-4 real-retire-hop 只在 real_scope=retire-hop 时启动" || bad "一-4 real-retire-hop 的启动条件不对"
 grep -q 'continue-on-error' "$T/job.yml" && bad "一-5 新 job 里有 continue-on-error" || ok "一-5 新 job 里没有 continue-on-error"
@@ -110,7 +152,7 @@ def env_of(block):
     m = re.search(r"\n        env:\n((?:          [A-Z0-9_]+: .*\n)+)", block)
     return m.group(1) if m else None
 jb = s.split("\n  real-bridge-hop:\n", 1)[1].split("\n  real-retire-hop:\n", 1)[0]
-jr = s.split("\n  real-retire-hop:\n", 1)[1]
+jr = re.split(r"\n  [a-z][a-z0-9-]*:\n", s.split("\n  real-retire-hop:\n", 1)[1], maxsplit=1)[0]   # 只到下一个 job 之前
 a = env_of(jb.split("run: sudo -E bash tests/e2e-real-bridge-hop.sh", 1)[0].rsplit("      - name:", 1)[1])
 b = env_of(jr.split("        id: real2\n", 1)[1].split("      - name:", 1)[0])
 print(a); print("----"); print(b)
