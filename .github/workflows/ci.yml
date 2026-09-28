@@ -2288,6 +2288,59 @@ jobs:
         if: ${{ always() }}
         run: |
           set +e
+          # 321: ③ 结束之后, 先对 pdg-dotwitness 取证: 查询只读(不改任何服务状态), 留证会写本步骤自有的临时目录。
+          # 每项分别留下命令、查询原始退出码、stdout / stderr 原文及各自的读取退出码(读取失败只算不完整原文, 具名记缺口);
+          # 命令直接执行, 不接管道。某项失败照样继续其它项, 缺口只增不减, 在本段末尾单独列出。
+          # 本段只是取证: 执行完不等于取证完整, 也不改变本步骤与 ③ 的结论。
+          DG="$(mktemp -d)"
+          dg_rc=$?
+          GAPS=""
+          diag() {
+            local n="$1" rc ro re
+            shift
+            echo "########## DIAG $n ##########"
+            printf '命令:'; printf ' %q' "$@"; echo
+            if [ "$dg_rc" -eq 0 ] && [ -d "$DG" ]; then
+              "$@" >"$DG/$n.out" 2>"$DG/$n.err"
+              rc=$?
+              echo "查询原始退出码: $rc"
+              echo "---------- stdout ----------"
+              cat "$DG/$n.out"
+              ro=$?
+              echo
+              echo "---------- stdout 读取退出码: $ro ----------"
+              echo "---------- stderr ----------"
+              cat "$DG/$n.err"
+              re=$?
+              echo
+              echo "---------- stderr 读取退出码: $re ----------"
+              if [ "$rc" -ne 0 ]; then echo "未取得: 查询退出码 $rc(上面的输出只作原文留档, 不采信)"; GAPS="$GAPS $n"; fi
+              if [ "$ro" -ne 0 ]; then echo "未取得: stdout 读取退出 $ro(已输出的部分只是不完整原文)"; GAPS="$GAPS $n:stdout-read"; fi
+              if [ "$re" -ne 0 ]; then echo "未取得: stderr 读取退出 $re(已输出的部分只是不完整原文)"; GAPS="$GAPS $n:stderr-read"; fi
+            else
+              echo "未取得: 临时目录没建成(mktemp 退出 $dg_rc), 本项没有执行"; GAPS="$GAPS $n"
+            fi
+            return 0
+          }
+          diag boot-id cat /proc/sys/kernel/random/boot_id
+          diag systemd-version systemctl --version
+          diag clock-realtime date -u +%Y-%m-%dT%H:%M:%S.%NZ
+          diag clock-uptime cat /proc/uptime
+          diag dotwitness-show systemctl show pdg-dotwitness.service -p LoadState -p ActiveState -p SubState -p Result -p ExecMainCode -p ExecMainStatus -p MainPID -p InvocationID -p NRestarts -p StartLimitIntervalUSec -p StartLimitBurst -p PartOf -p FragmentPath -p DropInPaths
+          for p in LoadState ActiveState SubState Result ExecMainCode ExecMainStatus MainPID InvocationID NRestarts StartLimitIntervalUSec StartLimitBurst PartOf FragmentPath DropInPaths; do
+            grep -q "^$p=" "$DG/dotwitness-show.out" 2>/dev/null
+            r=$?
+            case "$r" in
+              0) ;;
+              1) echo "未取得: 属性 $p 不在 systemctl show 的输出里"; GAPS="$GAPS dotwitness-show:$p" ;;
+              *) echo "未取得: 属性 $p 核对失败(grep 退出 $r)"; GAPS="$GAPS dotwitness-show:$p" ;;
+            esac
+          done
+          diag dotwitness-cat systemctl cat pdg-dotwitness.service
+          diag dotwitness-journal sudo journalctl -b 0 -u pdg-dotwitness.service --no-pager -o short-monotonic
+          diag mosdns-journal sudo journalctl -b 0 -u mosdns.service --no-pager -o short-monotonic
+          echo "########## DIAG 留证缺口: ${GAPS:- 无} ##########"
+          echo
           echo "########## ③ 升级调用次数: $(sudo cat /tmp/real-acceptance-evidence-retire/00-retire-invoke-count.txt 2>/dev/null || echo '<未取得: ③ 没启动或没写>') ##########"
           echo "########## journal(相关 unit, 末 400 行) ##########"
           sudo journalctl -u pdg-mitm -u mosdns -u mihomo -u pdg-bot -u pdg-probe81 --no-pager -n 400 2>&1 | tail -400
