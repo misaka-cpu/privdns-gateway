@@ -11,6 +11,8 @@
 # 起自有上游(tests/helpers/dns-stub.py, 固定答 U)只接 local_upstream 一行; geosite_cn 末尾追加见证 / 标定 / 分阶段对照名;
 # 标定时临时往接管表加一条标定名、随后按内容与属性还原并核验。劫持模式、规则顺序、其它规则不动。
 # 因此 ③ 的前像 = ② 的真实现场 + 上述仪器调整; 本支不再声称现场未经调整。仪器重启单独登记, 不混入升级服务窗口。
+# 准备阶段静置(325): 仪器标定与还原核验之后、运行态门之前, 对 pdg-dotwitness(PartOf=mosdns, 324 实证被准备阶段的连带启动用满
+# 5 次 / 300 s 额度)先核实限额仍是 5min / 5, 再做且只做一次 303 s 静置; 不成立就停在调用之前(r3_quiesce, 返回 16)。
 #
 # 这一跳验的是: 目标确实到达(退役候选)、WLOC 位置改写及其专属 MITM 执行能力按产品规则撤除、
 # 该保留的用户数据 / 身份 / 凭据原样、允许迁移的记录按产品规则迁移、服务动作都点得出来源、
@@ -469,8 +471,9 @@ r3_invoke(){   # **唯一**升级入口 → 0 已调用(结果在 R3_WRAP_RC / R
 }
 # <<< PDG-EXTRACT-END r3_invoke
 # >>> PDG-EXTRACT-BEGIN r3_gated_invoke
-r3_gated_invoke(){   # 门全过、调用前观测全部取得才调用。返回(10–15 都**没有**调用):
-                     #   10=② 结果门 11=桥接身份门 15=DNS 仪器条件 / 标定 / 还原核验 12=运行态 / WLOC 前像门(含前阶段 DNS 路径)
+r3_gated_invoke(){   # 门全过、调用前观测全部取得才调用。返回(10–16 都**没有**调用):
+                     #   10=② 结果门 11=桥接身份门 15=DNS 仪器条件 / 标定 / 还原核验 16=准备阶段静置(pdg-dotwitness 启动额度)
+                     #   12=运行态 / WLOC 前像门(含前阶段 DNS 路径)
                      #   13=调用前观测没取全 14=计数或退出码留档不可用; 0=已调用
   local g
   r3_real2_gate "$R3_REAL2_LOG"; g=$?
@@ -479,6 +482,7 @@ r3_gated_invoke(){   # 门全过、调用前观测全部取得才调用。返回
   r3_bridge_identity_gate; g=$?
   (( g == 0 )) || return 11
   r3_dns_instrument || return 15
+  r3_quiesce || return 16
   r3_runtime_gate || return 12
   r3_precapture || return 13
   r3_invoke || { echo "  调用前停止: $R3_WHY"; return 14; }
@@ -696,6 +700,7 @@ declare -A KFP=()                             # 调用前指纹; 由 r3_keep_cap
 R3_DNS_U=198.51.100.7; R3_DNS_PORT=15301; R3_DNS_W=gs-loc.apple.com
 R3_STUB="$E2E_ROOT/tests/helpers/dns-stub.py"; R3_STUB_PID=""; R3_DNS_RESTARTS=0
 R3_UPLOG="$R3_TMP/dns-up.log"; R3_UPCNT="$R3_TMP/dns-up.count"; R3_UPOUT="$R3_TMP/dns-up.out"
+R3_MONO=(python3 -c 'import time; print(time.clock_gettime_ns(time.CLOCK_MONOTONIC))')   # 准备阶段静置的实得时长以它(CLOCK_MONOTONIC)为准
 R3_MOSCFG=/etc/mosdns/config.yaml; R3_GEOCN=/etc/mosdns/rules/geosite_cn.txt
 _sfx="$$-$RANDOM"
 R3_DNS_K="r3k-$_sfx.e2e.test"; R3_DNS_CPRE="r3c-pre-$_sfx.e2e.test"; R3_DNS_CPOST="r3c-post-$_sfx.e2e.test"
@@ -1217,6 +1222,122 @@ r3_dns_phase(){   # $1=pre|post → 0 仪器条件仍成立且 W / C / P 的期�
   return "$st"
 }
 # <<< PDG-EXTRACT-END r3_dns
+# >>> PDG-EXTRACT-BEGIN r3_quiesce
+# 准备阶段静置(325)。只处理 324 已直接证实的一件事: pdg-dotwitness 带 PartOf=mosdns, ② 的迁移与本支三次仪器重启连带启动了它,
+# 300 s 内用满 5 次启动额度, 产品升级时那次连带启动被 start-limit-hit 拒掉。本段排在仪器标定与还原核验之后、运行态门之前:
+# 先有效读取实际限额并确认仍是冻结前提(StartLimitIntervalUSec=5min、StartLimitBurst=5), 再做且只做一次 303 s 静置(300 s 窗口 + 3 s 余量)。
+# 不循环等到成功、不重新计时、不 reset-failed、不启停任何服务、不改 unit / drop-in。判据(事先定义, 见 325 证据 work/plan325.txt):
+#   静置前 LoadState=loaded、ActiveState=active、SubState=running(否则直接阻断, 不等待); sleep 退出 0; CLOCK_MONOTONIC 实得 ≥ 303 s;
+#   静置后运行态不变, MainPID / InvocationID / NRestarts 与静置前逐项相同, 限额未变; 界桩区间内 "Started pdg-dotwitness" 0 次。
+#   任一查询失败 / 半截 / 空 / 多行 / 格式不认都判观测无效。界桩区间只计 Started 事件; 这些证据说明窗口里没看到新启动、实例没换,
+#   并非 systemd 内部启动计数的直接读数。
+R3_Q_UNIT=pdg-dotwitness; R3_Q_INT=5min; R3_Q_BURST=5; R3_Q_SECS=303; R3_Q_NEED_NS=303000000000
+r3_q_prop(){   # $1=ActiveState|SubState|NRestarts|StartLimitIntervalUSec|StartLimitBurst $2=unit → 0 取得(R3_VAL) / 2 查询失败、空、多行或格式不认(输出不采信)
+  local out rc; R3_VAL=""
+  out="$(systemctl show -p "$1" --value "$2" 2>/dev/null)"; rc=$?
+  (( rc == 0 )) || { R3_WHY="$2 的 $1 查询退出 $rc(输出 [${out:0:40}] 不采信)"; return 2; }
+  [[ -n "$out" && "$out" != *$'\n'* ]] || { R3_WHY="$2 的 $1 查询输出空或不止一行([${out//$'\n'/|}])"; return 2; }
+  case "$1" in
+    ActiveState|SubState)      [[ "$out" =~ ^[a-z-]+$ ]] || { R3_WHY="$2 的 $1 不是状态词([${out:0:40}])"; return 2; };;
+    NRestarts|StartLimitBurst) [[ "$out" =~ ^(0|[1-9][0-9]*)$ ]] || { R3_WHY="$2 的 $1 不是非负整数([${out:0:40}])"; return 2; };;
+    StartLimitIntervalUSec)    [[ "$out" =~ ^[0-9a-z\ ]+$ ]] || { R3_WHY="$2 的 $1 不是 systemd 的时长写法([${out:0:40}])"; return 2; };;
+    *) R3_WHY="r3_q_prop 不认识的属性 [$1]"; return 2;;
+  esac
+  R3_VAL="$out"
+}
+r3_q_limits(){   # → 0 两项都等于冻结前提(R3_VAL="StartLimitIntervalUSec=… StartLimitBurst=…") / 1 有效读到但与冻结前提不同 / 2 观测无效
+  local i b; R3_VAL=""
+  r3_q_prop StartLimitIntervalUSec "$R3_Q_UNIT" || return 2; i="$R3_VAL"
+  r3_q_prop StartLimitBurst "$R3_Q_UNIT" || return 2; b="$R3_VAL"
+  R3_VAL="StartLimitIntervalUSec=$i StartLimitBurst=$b"
+  [[ "$i" == "$R3_Q_INT" && "$b" == "$R3_Q_BURST" ]] \
+    || { R3_WHY="限额与冻结前提不同: $R3_VAL(冻结前提 StartLimitIntervalUSec=$R3_Q_INT 即 300 s、StartLimitBurst=$R3_Q_BURST)"; return 1; }
+}
+r3_q_sample(){   # $1=静置前|静置后 → 0 正常运行且身份取全(R3_Q_S 全部采样, R3_Q_ID="MainPID InvocationID NRestarts") / 1 有效读到但没在正常运行 / 2 观测无效
+  local ld ac sb pid inv nr; R3_Q_S=""; R3_Q_ID=""
+  r3_unit_q load "$R3_Q_UNIT" || return 2; ld="$R3_VAL"
+  r3_q_prop ActiveState "$R3_Q_UNIT" || return 2; ac="$R3_VAL"
+  r3_q_prop SubState "$R3_Q_UNIT" || return 2; sb="$R3_VAL"
+  R3_Q_S="LoadState=$ld ActiveState=$ac SubState=$sb"
+  [[ "$ld" == loaded && "$ac" == active && "$sb" == running ]] || { R3_WHY="$1 $R3_Q_UNIT 没在正常运行($R3_Q_S)"; return 1; }
+  r3_proc_prop MainPID "$R3_Q_UNIT" || return 2; pid="$R3_VAL"
+  r3_proc_prop InvocationID "$R3_Q_UNIT" || return 2; inv="$R3_VAL"
+  r3_q_prop NRestarts "$R3_Q_UNIT" || return 2; nr="$R3_VAL"
+  R3_Q_S="$R3_Q_S MainPID=$pid InvocationID=$inv NRestarts=$nr"; R3_Q_ID="$pid $inv $nr"
+}
+r3_q_clock(){   # → 0 取得(R3_VAL=CLOCK_MONOTONIC 纳秒) / 2 读不了或输出不是正整数(不采信)
+  local out rc; R3_VAL=""
+  [[ -n "${R3_MONO[0]:-}" ]] || { R3_WHY="没有登记单调时钟读取命令(R3_MONO)"; return 2; }
+  out="$("${R3_MONO[@]}" 2>/dev/null)"; rc=$?
+  (( rc == 0 )) || { R3_WHY="单调时钟读取退出 $rc(输出 [${out:0:30}] 不采信)"; return 2; }
+  [[ "$out" =~ ^[1-9][0-9]{0,17}$ ]] || { R3_WHY="单调时钟输出不是正整数纳秒([${out:0:30}])"; return 2; }
+  R3_VAL="$out"
+}
+r3_q_rec(){ { printf '%s\n' "$1" >> "$EVID/06-quiesce-dotwitness.txt"; } 2>/dev/null || R3_Q_RECBAD=1; }   # 记录写不进 ⇒ 本阶段不成立
+r3_q_ns(){ printf '%d.%09d' "$(( $1 / 1000000000 ))" "$(( $1 % 1000000000 ))"; }
+r3_quiesce(){   # → 0 静置成立 / 1 不成立或观测无效(逐项已打印; 调用方据此不调用, 不重新计时再等一轮)
+  local r q0 q1 t0 t1 el="" els=未取得 sr n why="" lim k
+  local -a id0 id1 idn=(MainPID InvocationID NRestarts)
+  R3_Q_RECBAD=0
+  r3_q_rec "# ③ 准备阶段静置(325) $R3_Q_UNIT: 计划一次 ${R3_Q_SECS} s(300 s 窗口 + 3 s 余量), 实得以 CLOCK_MONOTONIC 为准; 不循环、不重试、不 reset-failed、不启停服务"
+  r3_q_limits; r=$?
+  if (( r != 0 )); then
+    (( r == 1 )) && why="$R3_WHY" || why="限额观测无效: $R3_WHY"
+    r3_q_rec "限额(静置前): $why; 结论: 不成立(没有等待)"; bad "③-0 静置: $why —— 不等待"; return 1
+  fi
+  lim="$R3_VAL"; r3_q_rec "限额(静置前): $lim"; echo "  Q 限额: $R3_Q_UNIT $lim(与冻结前提 300 s / 5 次相同)"
+  r3_q_sample 静置前; r=$?
+  if (( r != 0 )); then
+    (( r == 1 )) && why="$R3_WHY" || why="静置前采样观测无效: $R3_WHY"
+    r3_q_rec "静置前: $why; 结论: 不成立(没有等待)"; bad "③-0 静置: $why —— 直接阻断, 不等待"; return 1
+  fi
+  read -r -a id0 <<<"$R3_Q_ID"; r3_q_rec "静置前: $R3_Q_S"; echo "  Q 静置前: $R3_Q_S"
+  if ! q0="$(_j_mark "quiesce-$R3_Q_UNIT-start")" || [[ -z "$q0" ]]; then
+    why="起界桩没建成($(_j_why))"; r3_q_rec "$why; 结论: 不成立(没有等待)"; bad "③-0 静置观测无效: $why —— 不等待"; return 1
+  fi
+  if ! r3_q_clock; then
+    why="t0: $R3_WHY"; r3_q_rec "$why; 结论: 不成立(没有等待)"; bad "③-0 静置观测无效: $why —— 不等待"; return 1
+  fi
+  t0="$R3_VAL"
+  sleep "$R3_Q_SECS"; sr=$?
+  if r3_q_clock; then
+    t1="$R3_VAL"
+    if (( t1 < t0 )); then why="$why 观测无效: 单调时钟倒退(t0=$t0 t1=$t1);"
+    else el=$(( t1 - t0 )); els="$(r3_q_ns "$el") s"; fi
+  else why="$why 观测无效: t1: $R3_WHY;"; t1=""; fi
+  r3_q_rec "等待: 计划 ${R3_Q_SECS} s; sleep 退出 $sr; t0=$t0 ns t1=${t1:-未取得} ns 实得=$els"
+  echo "  Q 静置: 计划 ${R3_Q_SECS} s; sleep 退出 $sr; CLOCK_MONOTONIC 实得 $els"
+  (( sr == 0 )) || why="$why 等待失败: sleep 退出 $sr;"
+  if [[ -n "$el" ]] && (( el < R3_Q_NEED_NS )); then why="$why 实得 $els < ${R3_Q_SECS} s(sleep 返回 $sr 不作数);"; fi
+  r3_q_sample 静置后; r=$?
+  case "$r" in
+    0) r3_q_rec "静置后: $R3_Q_S"; echo "  Q 静置后: $R3_Q_S"
+       read -r -a id1 <<<"$R3_Q_ID"
+       for k in 0 1 2; do [[ "${id1[k]}" == "${id0[k]}" ]] || why="$why 静置期间 ${idn[k]} ${id0[k]} → ${id1[k]};"; done;;
+    1) r3_q_rec "静置后: $R3_WHY"; why="$why $R3_WHY;";;
+    *) r3_q_rec "静置后采样观测无效: $R3_WHY"; why="$why 静置后采样观测无效: $R3_WHY;";;
+  esac
+  r3_q_limits; r=$?
+  case "$r" in
+    0) r3_q_rec "限额(静置后): $R3_VAL";;
+    1) r3_q_rec "限额(静置后): $R3_WHY"; why="$why 静置后$R3_WHY;";;
+    *) r3_q_rec "限额(静置后)观测无效: $R3_WHY"; why="$why 静置后限额观测无效: $R3_WHY;";;
+  esac
+  if ! q1="$(_j_mark "quiesce-$R3_Q_UNIT-end")" || [[ -z "$q1" ]]; then
+    why="$why 观测无效: 止界桩没建成($(_j_why));"; r3_q_rec "止界桩没建成($(_j_why))"
+  elif n="$(_j_interval "$R3_Q_UNIT" "$q0" "$q1")" && [[ "$n" =~ ^[0-9]+$ ]]; then
+    r3_q_rec "界桩区间 Started $R3_Q_UNIT: $n 次(口径只计 Started 事件; 并非 systemd 内部启动计数的直接读数)"
+    echo "  Q journal 界桩区间(静置起 → 静置后采样之后)Started $R3_Q_UNIT $n 次(口径只计 Started 事件)"
+    (( n == 0 )) || why="$why 静置期间界桩区间内 Started $R3_Q_UNIT $n 次;"
+  else
+    why="$why 观测无效: 界桩区间的启动事件查不清($(_j_why));"; r3_q_rec "界桩区间观测无效: $(_j_why)"
+  fi
+  r3_q_rec "结论: ${why:+不成立:}${why:-成立}"
+  (( R3_Q_RECBAD == 0 )) || why="$why 静置记录写不进证据目录($EVID/06-quiesce-dotwitness.txt);"
+  if [[ -n "$why" ]]; then bad "③-0 静置不成立 ——${why%;}(不重新计时, 不再等一轮)"; return 1; fi
+  ok "③-0 静置: $R3_Q_UNIT 限额仍为 $R3_Q_INT / $R3_Q_BURST; 一次静置 sleep 退出 0、单调时钟实得 $els(≥ ${R3_Q_SECS} s); 前后运行态、MainPID / InvocationID / NRestarts 与限额一致, 界桩区间内 Started 0 次(口径只计 Started, 并非 systemd 内部启动计数的直接读数)"
+}
+# <<< PDG-EXTRACT-END r3_quiesce
 # 运行态 / WLOC 前像门: 调用前逐项现查。契约测试在受控外部命令下执行它的判断原文(模型验证, 不冒充真实服务验收)。
 # >>> PDG-EXTRACT-BEGIN r3_runtime_gate
 r3_runtime_gate(){
@@ -1313,12 +1434,13 @@ case "$GRC" in
   10) bad "③-0 ② 的结果门不成立 —— 本场景未执行, 调用计数 $(_cnt_say)"; nrun "场景 ③: ② 不成立"; e2e_summary; exit 1;;
   11) bad "③-0 桥接身份门不成立(见上面逐项) —— 本场景未执行, 调用计数 $(_cnt_say)"; nrun "场景 ③: 桥接前像不成立"; e2e_summary; exit 1;;
   15) bad "③-0 DNS 仪器条件 / 标定 / 还原核验不成立(见上面 I 项) —— 本场景未执行, 调用计数 $(_cnt_say)"; nrun "场景 ③: DNS 仪器不成立"; e2e_summary; exit 1;;
+  16) bad "③-0 准备阶段静置不成立(见上面 Q 项) —— 本场景未执行, 调用计数 $(_cnt_say)"; nrun "场景 ③: 准备阶段静置不成立"; e2e_summary; exit 1;;
   12) bad "③-0 运行态 / WLOC 前像门不成立 —— 本场景未执行, 调用计数 $(_cnt_say)"; nrun "场景 ③: 桥接前像不成立"; e2e_summary; exit 1;;
   13) bad "③-0 调用前观测没取全(见上面 E 项) —— 本场景未执行, 调用计数 $(_cnt_say)"; nrun "场景 ③: 调用前观测不全"; e2e_summary; exit 1;;
   14) bad "③-0 调用计数或退出码留档不可用(见上) —— 本场景未执行, 调用计数 $(_cnt_say)"; nrun "场景 ③: 计数不可用"; e2e_summary; exit 1;;
   *)  bad "③-0 门返回了未登记的值 $GRC —— 按未执行处理"; nrun "场景 ③: 门状态不明"; e2e_summary; exit 1;;
 esac
-ok "③-0 ② 结果门、桥接身份门、DNS 仪器(条件 / 标定 / 还原)、运行态 / WLOC 前像门全部成立且调用前观测取全后才调用(调用计数 $(_cnt_say))"
+ok "③-0 ② 结果门、桥接身份门、DNS 仪器(条件 / 标定 / 还原)、准备阶段静置、运行态 / WLOC 前像门全部成立且调用前观测取全后才调用(调用计数 $(_cnt_say))"
 C3_1="$(_j_mark retire-end)" || { C3_1=""; note "阶段记账: 止界桩没建成($(_j_why)) —— 窗口将判观测无效"; }
 cp "$R3_LOG" "$EVID/04-retire-update.log" 2>/dev/null && chmod 600 "$EVID/04-retire-update.log" 2>/dev/null \
   || note "升级日志没能复制进证据目录"
@@ -1424,6 +1546,7 @@ SECT "③-5 收尾"
   echo "# 本支在这台一次性 runner 上的动作: 只有一次 bash $R3_CLI update --to $RETIRE_TAG(调用计数 $(_cnt_say))"
   echo "# 前像来源: 同一 job 上一步 ② 的真实现场(本支调用前逐项现查), 调用前经 DNS 仪器调整(05-dns-instrument-adjustments.txt); 取件源 $R3_ORIGIN"
   echo "# DNS 仪器重启 $R3_DNS_RESTARTS 次(05-dns-instrument-restarts.txt), 都在调用前观测起界桩之前, 不计入升级服务窗口"
+  echo "# 准备阶段静置: $R3_Q_UNIT 一次 ${R3_Q_SECS} s, 限额、前后采样、实得时长与界桩区间见 06-quiesce-dotwitness.txt(区间口径只计 Started 事件)"
   echo "# 退出码: 包装器(timeout)返回码 ${R3_WRAP_RC:-未取得}; 产品原始退出码 ${R3_RC:-未取得}"
   echo "# 窗口口径: journal 'Started <unit>' 条数 —— 不是完整的服务动作审计(停止 / 禁用 / reload / socket 激活不在其内)"
   echo "# 不覆盖: ④ 晚期失败恢复、v1.7.8、完整旧安装器、官方分发来源、发布"

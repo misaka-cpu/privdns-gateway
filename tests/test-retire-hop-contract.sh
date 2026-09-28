@@ -26,6 +26,9 @@
 #     (接管 → H; 明确代理 → H; geosite_cn → local_upstream: 指向自有上游且上游进程在 ⇒ U 并代写上游日志 / 计数; 其余 → 末尾 all 劫持 H);
 #     自有上游由契约内的小 python 进程顶替(只写启动记录与就绪行、长睡、不监听端口)。③ 的仪器、标定、还原、观测、来源判据都执行原文;
 #   本格无关依赖: bridge_svc_sample(按夹具文件落盘)、e2e_add_exit_hook(与 e2e-lib 同义: 退出时执行登记的函数)。
+#   准备阶段静置(325): 判断原文照常执行; 等待走格内 sleep 替身(整数秒不实睡), 单调时钟换成受控替身 $T/bin/fake-mono
+#     (第 n 次读 = 1e12 + (n-1)·步长, 步长默认 303 s), pdg-dotwitness 的属性由健康表通配行作答(限额两项 5min / 5 是 325 新加的通配行)。
+#     本契约只含静置阶段的接线静态格(二-22 / 二-23)与让健康路径能通过静置的替身; 静置判据的定向矩阵另行运行, 不叠进本支整支运行。
 # 这些仍是模型验证, 不冒充真实 systemd、journal、DNS、HTTP 验收。
 # ③ 主流程在调用之后的其余接线(W2–W7、K、A4、A6 的调用点)只做静态核对(二-9 起), 读取器本身在三 / 四里受控驱动。
 # 临时仓库的写操作(add / commit / tag / checkout / config / remote)逐调用点走 e2e_git 并显式指定目标仓库。
@@ -212,6 +215,23 @@ grep -qxF 'r3_count_init || { echo "[HARD-STOP] 调用计数初始化失败: $R3
   && ok "二-11 调用计数初始化失败即具名硬停" || bad "二-11 调用计数初始化没有具名硬停"
 n_case="$(grep -cE '^  (13|14|15|\*)\) +bad ' "$T/r3code.txt")"
 [[ "$n_case" == 4 ]] && ok "二-12 主流程对 13 / 14 / 15 与未登记的门返回值都停在调用之后的判据之前" || bad "二-12 主流程的门返回值分支不全($n_case/4)"
+qa="$(grep -nxF '  r3_dns_instrument || return 15' <<<"$gi" | cut -d: -f1)"; qb="$(grep -nxF '  r3_quiesce || return 16' <<<"$gi" | cut -d: -f1)"
+qc="$(grep -nxF '  r3_runtime_gate || return 12' <<<"$gi" | cut -d: -f1)"
+n_q="$(grep -cE '(^|[^a-z_])r3_quiesce([^a-z_]|$)' "$T/r3code.txt")"; n_16="$(grep -cE '^  16\) +bad .*nrun .*exit 1;;$' "$T/r3code.txt")"
+lq="$(grep -nx '# >>> PDG-EXTRACT-BEGIN r3_quiesce' "$R3" | cut -d: -f1)"; lm="$(grep -nE "^R3_MONO=\(python3 -c 'import time; print\(time\.clock_gettime_ns\(time\.CLOCK_MONOTONIC\)\)'\)( |$)" "$R3" | cut -d: -f1)"
+lg="$(grep -nx 'r3_gated_invoke; GRC=$?' "$R3" | cut -d: -f1)"
+{ [[ -n "$qa" && -n "$qb" && -n "$qc" && -n "$lq" && -n "$lm" && -n "$lg" ]] && (( qb == qa + 1 && qc == qb + 1 && lq < lg && lm < lg )) && [[ "$n_q" == 2 && "$n_16" == 1 ]]; } \
+  && ok "二-22 准备阶段静置接线: DNS 仪器(15)→ r3_quiesce || return 16 → 运行态门(12)紧邻相接; r3_quiesce 只在门里被调 1 次; 主流程对 16 停在调用之前; 段定义与单调时钟命令都在主流程调用之前(真实加载顺序)" \
+  || bad "二-22 静置接线不对(仪器=$qa 静置=$qb 运行态门=$qc 出现=$n_q 分支16=$n_16 段起=$lq 时钟=$lm 主调用=$lg)"
+qblk="$(awk '/^# >>> PDG-EXTRACT-BEGIN r3_quiesce$/{f=1; next} /^# <<< PDG-EXTRACT-END r3_quiesce$/{f=0} f && !/^[[:space:]]*#/' "$R3")"
+# 按命令形态数(不去引号: 命令替换常写在双引号里); 判词里的"sleep 退出 / 返回""不 reset-failed"不是命令形态
+n_sc="$(grep -c 'systemctl' <<<"$qblk")"; n_scshow="$(grep -cF 'out="$(systemctl show -p "$1" --value "$2" 2>/dev/null)"; rc=$?' <<<"$qblk")"
+n_mut="$(grep -cE 'systemctl[[:space:]]+(start|stop|restart|try-restart|reload|reload-or-restart|reset-failed|enable|disable|reenable|kill|mask|unmask|set-property|edit|revert|daemon-reload|daemon-reexec|isolate)|/etc/systemd|(^|[;&|{(]|then|do|else)[[:space:]]*(kill|systemd-run|rm|mv|cp|tee)[[:space:]]|r3_dns_(restart|calibrate|adjust|write)' <<<"$qblk")"
+n_sl="$(grep -cE 'sleep[[:space:]]+["$0-9]' <<<"$qblk")"; n_sl1="$(grep -cxF '  sleep "$R3_Q_SECS"; sr=$?' <<<"$qblk")"
+n_k="$(grep -cxF 'R3_Q_UNIT=pdg-dotwitness; R3_Q_INT=5min; R3_Q_BURST=5; R3_Q_SECS=303; R3_Q_NEED_NS=303000000000' <<<"$qblk")"
+[[ -n "$qblk" && "$n_sc" == 1 && "$n_scshow" == 1 && "$n_mut" == 0 && "$n_sl" == 1 && "$n_sl1" == 1 && "$n_k" == 1 ]] \
+  && ok "二-23 静置段边界: systemctl 只有 1 处且是 show 读取; 没有 reset-failed / 改 unit / 杀进程 / 仪器重启; sleep 只有 1 处(R3_Q_SECS); 常量 = pdg-dotwitness / 5min / 5 / 303 s" \
+  || bad "二-23 静置段边界不对(systemctl=$n_sc show 读取=$n_scshow 改状态=$n_mut sleep=$n_sl/$n_sl1 常量=$n_k)"
 
 echo; echo "══ 三. ③ 判据函数(受控输入) ══"
 xfn(){   # $1=来源 $2..=名字 → 打印唯一成对标记之间的原文; 标记不唯一成对即失败
@@ -222,7 +242,7 @@ xfn(){   # $1=来源 $2..=名字 → 打印唯一成对标记之间的原文; �
     sed -n "$((b+1)),$((e-1))p" "$src"
   done
 }
-R3_BLOCKS=(r3_count r3_read r3_real2_gate r3_bridge_identity_gate r3_keep r3_precapture r3_invoke r3_gated_invoke r3_arrival_verdict r3_svc_class r3_svc_verdict r3_stable r3_dns r3_runtime_gate r3_post)
+R3_BLOCKS=(r3_count r3_read r3_real2_gate r3_bridge_identity_gate r3_keep r3_precapture r3_invoke r3_gated_invoke r3_arrival_verdict r3_svc_class r3_svc_verdict r3_stable r3_dns r3_quiesce r3_runtime_gate r3_post)
 if xfn "$R3" "${R3_BLOCKS[@]}" > "$T/r3fns.sh" \
    && xfn "$HOP2" bridge_row_valid > "$T/hop2fns.sh" && bash -n "$T/r3fns.sh" && bash -n "$T/hop2fns.sh" \
    && xfn "$ROOT/tests/e2e-real-platform-fail.sh" svc_stable_window unit_identify wait_stable _unit_wants_mainpid \
@@ -274,7 +294,8 @@ printf '%s\n' 'show:Id *|0|%u.service\n|' 'show:LoadState *|0|loaded\n|' 'show:T
   'is-enabled pdg-mitm|0|enabled\n|' 'is-active pdg-mitm|3|inactive\n|' \
   'is-enabled mosdns|0|enabled\n|' 'is-enabled mihomo|0|enabled\n|' 'is-enabled pdg-probe81|0|enabled\n|' \
   'is-active pdg-dotwitness|0|active\n|' 'is-active pdg-health.timer|0|active\n|' \
-  'restart mosdns|0||' 'is-active mosdns|0|active\n|' 'show:InvocationID mosdns|0|%G\n|' 'show:MainPID mosdns|0|%P\n|' > "$T/sc-ok.tab"
+  'restart mosdns|0||' 'is-active mosdns|0|active\n|' 'show:InvocationID mosdns|0|%G\n|' 'show:MainPID mosdns|0|%P\n|' \
+  'show:StartLimitIntervalUSec *|0|5min\n|' 'show:StartLimitBurst *|0|5\n|' > "$T/sc-ok.tab"
 mkdir -p "$T/bin"
 cat > "$T/bin/systemctl" <<'EOS'
 #!/usr/bin/env bash
@@ -346,6 +367,19 @@ cat "$m/rules/custom_hijack.txt" "$m/rules/ruleset_hijack.txt" > "$d/xp" 2>/dev/
 awk '/^  - tag: local_upstream$/{f=1; next} f && /^    args:/{print; exit}' "$m/config.yaml" > "$d/upline"
 EOS
 chmod +x "$T/bin/systemctl" "$T/bin/journalctl" "$T/bin/logger" "$T/bin/pdg-model-snap"
+# 325 受控单调时钟(替身, 不读真实时钟): 第 n 次读 = 1e12 + (n-1) × FAKE_MONO_STEP(默认 303 s 的纳秒数), 每次读记进 $FK;
+# 注入: FAKE_MONO_RC_AT=<n> 第 n 次先打印合法值再退出 1; FAKE_MONO_OUT_AT=<n>:<文本> 第 n 次只打印该文本、退出 0
+cat > "$T/bin/fake-mono" <<'EOS'
+#!/usr/bin/env bash
+echo "fake-mono $*" >> "$FK"
+cf="$FKDIR/mono-n"; n=0; [[ -f "$cf" ]] && n="$(<"$cf")"; n=$((n + 1)); echo "$n" > "$cf"
+if [[ -n "${FAKE_MONO_OUT_AT:-}" && "${FAKE_MONO_OUT_AT%%:*}" == "$n" ]]; then printf '%s\n' "${FAKE_MONO_OUT_AT#*:}"; echo "served mono-out n=$n" >> "$FK"; exit 0; fi
+v=$(( 1000000000000 + (n - 1) * ${FAKE_MONO_STEP:-303000000000} ))
+printf '%s\n' "$v"; echo "served mono n=$n -> $v" >> "$FK"
+if [[ "${FAKE_MONO_RC_AT:-}" == "$n" ]]; then echo "served mono-rc n=$n" >> "$FK"; exit 1; fi
+exit 0
+EOS
+chmod +x "$T/bin/fake-mono"
 # 受控自有上游: 与真实 dns-stub.py 同参数、同启动记录与就绪行; 不监听端口(上游日志 / 计数由模型代写); 按 FAKE_STUB_PIDS 登记自己的 PID
 cat > "$T/fake-stub.py" <<'EOS'
 import os, sys, time
@@ -464,6 +498,7 @@ cell(){ ( set +u
   # DNS 仪器(317): 每格一份 mosdns 夹具(接管表即其中的 mitm_hijack.txt); 自有上游由受控 python 进程顶替; 名字固定便于核对
   mkmos "$R3_TMP/mosdns"; R3_MOSCFG="$R3_TMP/mosdns/config.yaml"; R3_GEOCN="$R3_TMP/mosdns/rules/geosite_cn.txt"; HIJ="$R3_TMP/mosdns/rules/mitm_hijack.txt"
   R3_STUB="$T/fake-stub.py"; R3_STUB_PID=""; R3_DNS_RESTARTS=0; R3_DNS_U=198.51.100.7; R3_DNS_PORT=15301; R3_DNS_W=gs-loc.apple.com
+  R3_MONO=("$T/bin/fake-mono")                # 325: 准备阶段静置的单调时钟 = 受控替身(见上)
   R3_UPLOG="$R3_TMP/dns-up.log"; R3_UPCNT="$R3_TMP/dns-up.count"; R3_UPOUT="$R3_TMP/dns-up.out"
   R3_DNS_K=r3k-t.e2e.test; R3_DNS_CPRE=r3c-pre-t.e2e.test; R3_DNS_CPOST=r3c-post-t.e2e.test; R3_DNS_PPRE=r3p-pre-t.e2e.test; R3_DNS_PPOST=r3p-post-t.e2e.test
   E2E_TMP="$R3_TMP"; JBOUND_TAG=pdg-e2e-jbound-r3
