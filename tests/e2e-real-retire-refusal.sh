@@ -56,16 +56,16 @@ note(){ echo "[NOTE] $1"; }
 # 于是 `|| echo` 再追一行, V 变成两行 "not-found\nnot-found", 等值比较必然失败 ——
 # 上一轮那条 [FAIL] pdg-mitm 自启=not-found 就是这么来的, 产品侧其实是对的。
 # 现在 stdout / stderr / 退出码**分开收**, 不拼串; 也不用 tail -1 去藏第一行。
-SC_VAL=""; SC_RC=0; SC_ERR=""
+SC_VAL=""; SC_ERR=""
 sc_get(){   # $1=子命令(is-active|is-enabled|...)  $2=unit
   local errf="${E2E_TMP:-/tmp}/sc.err"
-  SC_VAL="$(systemctl "$1" "$2" 2>"$errf")"; SC_RC=$?
+  SC_VAL="$(systemctl "$1" "$2" 2>"$errf")"
   SC_ERR="$(tr '\n' ' ' < "$errf" 2>/dev/null)"
   rm -f "$errf" 2>/dev/null || true
 }
 # 把"这个 unit 现在到底算什么状态"归一成一个词, 并把判定依据保留下来:
 #   active / inactive / failed / activating / …  或  not-found(unit 压根不在)
-sc_state(){  # $1=子命令 $2=unit → 打印归一后的词; 依据留在 SC_VAL/SC_RC/SC_ERR
+sc_state(){  # $1=子命令 $2=unit → 打印归一后的词; 依据留在 SC_VAL/SC_ERR(不看退出码; 四维取证改用下面的 r1_unit_q, 见 341)
   sc_get "$1" "$2"
   if [[ -z "${SC_VAL//[[:space:]]/}" ]]; then
     case "$SC_ERR" in *"No such file"*|*"not-found"*|*"could not be found"*) printf 'not-found\n';;
@@ -73,6 +73,46 @@ sc_state(){  # $1=子命令 $2=unit → 打印归一后的词; 依据留在 SC_V
   else
     printf '%s\n' "${SC_VAL%%$'\n'*}"
   fi
+}
+# 341: 四维取证用的单元查询。与 ③ 的 r3_unit_q(tests/e2e-real-retire-hop.sh)同一套配对规则 —— 状态词与**原始退出码**必须成对:
+#   合法的非零码照收(不在运行 3; 未启用 / 不存在 非零; systemd 255 对 LoadState=not-found 的 is-active 用 4);
+#   先打印一个词再以不合规的码退出 = 观测无效, 那个词不采信; 输出必须恰一行。
+#   在**本壳**里调用(不放进命令替换), 结果留在 R1_VAL / R1_RC / R1_WHY —— sc_state 放在 $(…) 里时 SC_RC 回不到调用方(341 复现 R1)。
+R1_VAL=""; R1_RC=""; R1_WHY=""
+r1_unit_q(){   # $1=active|enabled|load $2=unit [$3=同一 unit 已有效取得的 LoadState] → 0 取得(R1_VAL) / 2 观测无效(R1_WHY)
+  local k="$1" u="$2" out rc err ef="${E2E_TMP:-/tmp}/r1unitq.err"; R1_VAL=""; R1_RC=""
+  case "$k" in
+    active)  out="$(systemctl is-active "$u" 2>"$ef")"; rc=$?;;
+    enabled) out="$(systemctl is-enabled "$u" 2>"$ef")"; rc=$?;;
+    load)    out="$(systemctl show -p LoadState --value "$u" 2>"$ef")"; rc=$?;;
+    *) R1_WHY="r1_unit_q 不认识的查询 [$k]"; return 2;;
+  esac
+  R1_RC="$rc"
+  err="$(tr '\n' ' ' < "$ef" 2>/dev/null)"; rm -f "$ef" 2>/dev/null || true
+  [[ "$out" != *$'\n'* ]] || { R1_WHY="$u 的 $k 查询输出不止一行([${out//$'\n'/|}], rc=$rc)"; return 2; }
+  case "$k" in
+    active)
+      case "$out" in
+        active|reloading|refreshing) (( rc == 0 )) || { R1_WHY="$u is-active 打印 $out 却退出 $rc(应为 0)"; return 2; };;
+        inactive) (( rc == 3 )) || { (( rc == 4 )) && [[ "${3:-}" == not-found ]]; } \
+            || { R1_WHY="$u is-active 打印 inactive 却退出 $rc(应为 3; 只有已取得 LoadState=not-found 时才可为 4, 实得 LoadState=[${3:-未提供}])"; return 2; };;
+        failed|activating|deactivating|maintenance) (( rc == 3 )) || { R1_WHY="$u is-active 打印 $out 却退出 $rc(应为 3)"; return 2; };;
+        *) R1_WHY="$u is-active 输出不是状态词([${out:0:30}], rc=$rc, stderr: ${err:-无})"; return 2;;
+      esac;;
+    enabled)
+      case "$out" in
+        enabled|enabled-runtime|alias|static|indirect|generated|transient) (( rc == 0 )) || { R1_WHY="$u is-enabled 打印 $out 却退出 $rc(应为 0)"; return 2; };;
+        linked|linked-runtime|masked|masked-runtime|disabled|not-found) (( rc != 0 )) || { R1_WHY="$u is-enabled 打印 $out 却退出 0(应非零)"; return 2; };;
+        "") if (( rc != 0 )) && [[ "$err" == *"No such file or directory"* ]]; then out=not-found     # systemd 252 对不存在的 unit 只在 stderr 报这句
+            else R1_WHY="$u is-enabled 没有输出(rc=$rc, stderr: ${err:-无})"; return 2; fi;;
+        *) R1_WHY="$u is-enabled 输出不是状态词([${out:0:30}], rc=$rc, stderr: ${err:-无})"; return 2;;
+      esac;;
+    load)
+      (( rc == 0 )) || { R1_WHY="$u 的 LoadState 查询退出 $rc(输出 [${out:0:30}] 不采信)"; return 2; }
+      case "$out" in loaded|not-found|bad-setting|error|masked|merged|stub) ;;
+        *) R1_WHY="$u 的 LoadState 不是状态词([${out:0:30}])"; return 2;; esac;;
+  esac
+  R1_VAL="$out"
 }
 
 # 未执行 ≠ 失败 ≠ 通过。前像不成立时该场景**不执行**, 单独计一格, 绝不混进通过或失败。
@@ -107,6 +147,8 @@ TEST_TAG="v9.9.9-wloc-retire-refusal-TEST-ONLY"
 [[ -n "$CAND_SHA" ]] || _hard "必须显式给出 PDG_CAND_SHA(冻结退役候选) —— 不接受默认值。"
 
 REPO=/opt/privdns-gateway
+R1_BOTDIR=/opt/pdg-bot             # 342: A0 装候选与身份核对用的模块目录(值不变; 只是不再散写字面量)
+R1_CLI=/usr/local/bin/pdg          # 341: 场景 A / A0 的产品调用与旧版身份核对都指这一个入口(值不变, 只是不再散写字面量)
 ORIGIN="$E2E_TMP/real-mig-origin.git"
 OLDSRC="$E2E_TMP/oldsrc"          # v1.11.15 的源码树(造前像用的模板都从这里取)
 CANDSRC="$E2E_TMP/candsrc"        # **冻结候选**的源码树(装候选产品文件只从这里取)
@@ -310,23 +352,68 @@ git -C "$ORIGIN" archive "$CAND_SHA" | tar -x -C "$CANDSRC" || _hard "展开冻�
 [[ ! -e "$CANDSRC/deploy/bot/mitm_wloc.py" && ! -e "$CANDSRC/deploy/bot/mitm_server.py" ]] \
   && ok "候选源码树里 WLOC 执行模块已不存在(退役后的形态)" || _hard "候选源码树不对: 还有 WLOC 模块"
 
-# **验收分支(Y)不是产品候选**。两条各自对账, 不混:
-#   · Y 相对共同 base 的产品面必须零差异 —— 验收脚本不许夹带产品改动;
-#   · X 相对同一个 base 的产品面差异, 逐文件列出来 —— 那才是本轮要验的产品改动。
-# 验收分支建在**冻结候选之上**, 所以这里比的是"验收分支相对候选有没有动产品面" ——
-# 它只该多出 tests/ 与 workflow。比 base 没有意义(那会把候选自己的产品改动算到验收分支头上)。
-YPROD="$(git -C "$E2E_ROOT_REAL" diff --name-only "$CAND_SHA" -- deploy lib install.sh uninstall.sh tools 2>/dev/null)"
-[[ -z "$YPROD" ]] \
-  && ok "验收分支相对**冻结候选**的产品面**零差异**(它只提供验收脚本与 workflow)" \
-  || bad "验收分支改了产品面: $YPROD"
-YEXTRA="$(git -C "$E2E_ROOT_REAL" diff --name-only "$CAND_SHA" 2>/dev/null | tr '\n' ' ')"
-_evn 02-source-map.txt "验收分支相对候选的全部改动: ${YEXTRA:-<无>}"
-ok "验收分支相对候选只多出: ${YEXTRA:-<无>}"
-XPROD="$(git -C "$E2E_ROOT_REAL" diff --name-only "$CAND_BASE" "$CAND_SHA" -- deploy lib install.sh uninstall.sh tools 2>/dev/null | tr '\n' ' ')"
-_evn 02-source-map.txt "产品候选 X 相对 base 的产品面改动: ${XPROD:-<无>}"
-ok "产品候选 X 相对 base 的产品面改动: ${XPROD:-<无>}"
-YALL="$(git -C "$E2E_ROOT_REAL" diff --name-only "$CAND_BASE" 2>/dev/null | tr '\n' ' ')"
-_evn 02-source-map.txt "验收分支 Y 相对 base 的全部改动: ${YALL:-<无>}"
+# 341(M1): 撤掉"验收分支产品面必须等于候选"这条前提 —— 本验收分支建在更早的候选之上, 产品面与 CAND_SHA 本来就不同;
+#   而 ① 里验收分支的产品文件**从不上机**: 前像与旧 CLI 取自 OLDSRC / 裸库里的 OLD_SHA, A0 的候选取自 CANDSRC,
+#   A 的候选由旧 CLI 从裸库测试 tag 取件(tag → CAND_SHA 上面已硬核)。所以差异只**如实登记**(连同查询退出码), 不作判据;
+#   真正的来源判据是下面 r1_src_check 的两条逐文件对象身份 —— 不成立就阻断用到它的那一次产品调用(r1_a0_invoke / r1_a_invoke)。
+r1_diff_note(){   # $1=说明 $2..=git diff 的参数 → 只登记
+  local what="$1" out rc; shift
+  out="$(git -C "$E2E_ROOT_REAL" diff --name-only "$@" 2>/dev/null)"; rc=$?
+  if (( rc == 0 )); then
+    out="$(tr '\n' ' ' <<<"$out")"; _evn 02-source-map.txt "$what: ${out:-<无>}"; note "$what(只登记): ${out:-<无>}"
+  else
+    _evn 02-source-map.txt "$what: 查询失败(git diff rc=$rc)"; note "$what: 查询失败(git diff rc=$rc) —— 没登记到"
+  fi
+}
+r1_diff_note "验收分支相对候选的产品面差异(这些文件在 ① 里不上机)" "$CAND_SHA" -- deploy lib install.sh uninstall.sh tools
+r1_diff_note "验收分支相对候选的全部改动" "$CAND_SHA"
+r1_diff_note "产品候选 X 相对 base 的产品面改动" "$CAND_BASE" "$CAND_SHA" -- deploy lib install.sh uninstall.sh tools
+r1_diff_note "验收分支 Y 相对 base 的全部改动" "$CAND_BASE"
+# 源码树 ⇔ 提交: 产品面(deploy lib install.sh uninstall.sh tools)每个文件与该提交里的对象逐一相同。
+# 0 一致 / 1 有文件缺失或不同 / 2 读取失败(清单、摘要或条数任一取不到 —— 失败前输出的内容不采信)
+r1_src_identity(){   # $1=源码树 $2=提交 → R1_WHY
+  local dir="$1" sha="$2" ls rc l meta path m t o n i
+  local -a paths=() objs=() got=()
+  ls="$(git -C "$ORIGIN" ls-tree -r "$sha" -- deploy lib install.sh uninstall.sh tools 2>/dev/null)"; rc=$?
+  { (( rc == 0 )) && [[ -n "$ls" ]]; } || { R1_WHY="读不到 ${sha:0:12} 的产品面文件清单(ls-tree rc=$rc)"; return 2; }
+  while IFS= read -r l; do
+    meta="${l%%$'\t'*}"; path="${l#*$'\t'}"
+    read -r m t o <<<"$meta"
+    { [[ "$t" == blob && "$m" != 120000 && "$o" =~ ^[0-9a-f]{40}$ ]]; } || { R1_WHY="清单里有本判据不覆盖的项([$l])"; return 2; }
+    { [[ -f "$dir/$path" && ! -L "$dir/$path" ]]; } || { R1_WHY="源码树里缺 $path"; return 1; }
+    paths+=("$dir/$path"); objs+=("$o")
+  done <<<"$ls"
+  n=${#paths[@]}
+  printf '%s\n' "${paths[@]}" > "$E2E_TMP/r1src.paths" || { R1_WHY="写不下路径清单"; return 2; }
+  git hash-object --no-filters --stdin-paths < "$E2E_TMP/r1src.paths" > "$E2E_TMP/r1src.objs" 2>/dev/null; rc=$?
+  (( rc == 0 )) || { R1_WHY="计算源码树的对象摘要失败(hash-object rc=$rc)"; return 2; }
+  mapfile -t got < "$E2E_TMP/r1src.objs" || { R1_WHY="读不回对象摘要"; return 2; }
+  (( ${#got[@]} == n )) || { R1_WHY="对象摘要条数 ${#got[@]} ≠ 文件数 $n"; return 2; }
+  for ((i=0; i<n; i++)); do
+    [[ "${got[$i]}" == "${objs[$i]}" ]] \
+      || { R1_WHY="${paths[$i]#"$dir"/} 与提交里的对象不同(实得 ${got[$i]:0:12}, 应为 ${objs[$i]:0:12})"; return 1; }
+  done
+  R1_WHY="$n 个文件逐个与 ${sha:0:12} 的对象相同"
+  return 0
+}
+R1_SRC_OLD=0; R1_SRC_CAND=0
+r1_src_check(){   # 核两棵源码树, 置 R1_SRC_OLD / R1_SRC_CAND(1 成立 / 0 不成立或未核实), 逐条打 ok / bad
+  local r
+  r1_src_identity "$OLDSRC" "$OLD_SHA"; r=$?
+  case "$r" in
+    0) R1_SRC_OLD=1; ok "来源: 旧版源码树(前像与旧 CLI 取自这里)与 OLD_SHA 逐文件对象相同 —— $R1_WHY";;
+    1) R1_SRC_OLD=0; bad "来源: 旧版源码树与 OLD_SHA 不符 —— $R1_WHY; 用到它的产品调用(A0 / A)一律不执行";;
+    *) R1_SRC_OLD=0; bad "来源: 旧版源码树的身份读取失败 —— $R1_WHY; 未核实, 用到它的产品调用(A0 / A)一律不执行";;
+  esac
+  r1_src_identity "$CANDSRC" "$CAND_SHA"; r=$?
+  case "$r" in
+    0) R1_SRC_CAND=1; ok "来源: 冻结候选源码树(A0 装候选取自这里)与 CAND_SHA 逐文件对象相同 —— $R1_WHY";;
+    1) R1_SRC_CAND=0; bad "来源: 冻结候选源码树与 CAND_SHA 不符 —— $R1_WHY; A0 的 __migrate 不执行";;
+    *) R1_SRC_CAND=0; bad "来源: 冻结候选源码树的身份读取失败 —— $R1_WHY; 未核实, A0 的 __migrate 不执行";;
+  esac
+  _evn 02-source-map.txt "来源核对: 旧版源码树=$R1_SRC_OLD 候选源码树=$R1_SRC_CAND(1 成立 / 0 不成立或未核实)"
+}
+r1_src_check
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 状态采集器: 每个场景操作前后都跑一次, 结果写进证据目录
@@ -874,6 +961,39 @@ svc_verdict(){   # $1=before  $2=after  $3=场景名
                         || note "$3: 本场景没有 WLOC 退役专属动作(与前像条件是否一致, 见上文)"
 }
 
+# 342: A0 身份核对的直接依赖 —— 摘要、模块清单、逐文件比较都要"读取有效"才参与判定; 读不到 ≠ 不符 ≠ 相符。
+R1_DG=""
+r1_digest(){   # $1=文件 → 0 取得(R1_DG=64 位十六进制) / 2 读取失败(失败前打印的内容不采信; 342 复现 XA1 / XA2)
+  local out rc; R1_DG=""
+  out="$(sha256sum -- "$1" 2>/dev/null)"; rc=$?
+  out="${out%% *}"
+  { (( rc == 0 )) && [[ "$out" =~ ^[0-9a-f]{64}$ ]]; } || { R1_WHY="读不到 $1 的摘要(sha256sum 退出 $rc)"; return 2; }
+  R1_DG="$out"
+}
+r1_same_file(){   # $1=实际 $2=权威 → 0 相同 / 1 不同 / 2 读取失败(R1_WHY)
+  local a b
+  r1_digest "$1" || return 2; a="$R1_DG"
+  r1_digest "$2" || return 2; b="$R1_DG"
+  [[ "$a" == "$b" ]] && return 0
+  R1_WHY="$1(${a:0:12}) 与 $2(${b:0:12}) 不同"; return 1
+}
+R1_MANIFEST=()
+r1_manifest(){   # $1=平台 → 0 取得(R1_MANIFEST 每项 "src name mode") / 2 生成失败或内容无效(342 复现 XA3)
+  local out rc l src name mode extra
+  R1_MANIFEST=()
+  out="$( ( source "$CANDSRC/lib/modules.sh" && pdg_platform_modules "$1" ) 2>/dev/null )"; rc=$?
+  (( rc == 0 )) || { R1_WHY="候选模块清单生成失败(退出 $rc; 已输出的部分不采信)"; return 2; }
+  while IFS= read -r l; do
+    [[ -n "$l" ]] || continue
+    read -r src name mode extra <<<"$l"
+    { [[ -n "$src" && -n "$name" && -z "$extra" && "$name" != */* && "$mode" =~ ^[0-7]{3}$ ]]; } \
+      || { R1_WHY="候选模块清单有无法解析的行([$l])"; return 2; }
+    R1_MANIFEST+=("$src $name $mode")
+  done <<<"$out"
+  (( ${#R1_MANIFEST[@]} > 0 )) || { R1_WHY="候选模块清单为空"; return 2; }
+  return 0
+}
+
 # ── 直接迁移的部署源身份(H5)─────────────────────────────────────────────────
 # 上一轮栽在这: 只把候选模块 install 到 /opt/pdg-bot, 却没动 $REPO_DIR。候选 pdg.sh 的
 # __migrate 第一步就是 migrate_deploy_botfiles —— 它按 **$REPO_DIR** 重装 /opt/pdg-bot,
@@ -883,56 +1003,69 @@ svc_verdict(){   # $1=before  $2=after  $3=场景名
 switch_repo_to_candidate(){
   e2e_git "$REPO" checkout -q "$CAND_SHA" 2>/dev/null \
     || { bad "把 $REPO 切到候选 X 失败"; return 1; }
-  local head; head="$(git -C "$REPO" rev-parse HEAD 2>/dev/null)"
+  # 343: HEAD 查询接上原始退出码与输出形态 —— 先打印正确 SHA 再以非零退出的那次查询不采信(343 复现 H2)
+  local head hrc; head="$(git -C "$REPO" rev-parse HEAD 2>/dev/null)"; hrc=$?
+  if (( hrc != 0 )) || [[ ! "$head" =~ ^[0-9a-f]{40}$ ]]; then
+    bad "部署源身份: 读不到 $REPO 的 HEAD(git 退出 $hrc; 已输出的 [${head:0:12}] 不采信) —— 未取得"; return 1
+  fi
   [[ "$head" == "$CAND_SHA" ]] && ok "部署源身份: $REPO 的 HEAD == 候选 X" \
                               || { bad "部署源 HEAD=$head(应为 X)"; return 1; }
   # 关键源文件逐字节等于 X 的那一份(拿独立展开的 $CANDSRC 当权威, 不自证)
-  local miss=0 f
+  local miss=0 f r
   for f in deploy/bot/pdg.sh deploy/bot/iosstate.py deploy/bot/pdg-bot.py lib/modules.sh; do
-    cmp -s "$REPO/$f" "$CANDSRC/$f" || { miss=$((miss+1)); echo "       不符: $f"; }
+    cmp -s "$REPO/$f" "$CANDSRC/$f"; r=$?
+    case "$r" in 0) ;; 1) miss=$((miss+1)); echo "       不符: $f";; *) miss=$((miss+1)); echo "       比较失败(cmp 退出 $r): $f";; esac
   done
   [[ "$miss" == 0 ]] && ok "部署源身份: 关键源文件($REPO)逐字节等于候选 X" \
-                     || { bad "部署源里有 $miss 个关键文件不是 X 的"; return 1; }
+                     || { bad "部署源里有 $miss 个关键文件不是 X 的或比较失败"; return 1; }
   # 按候选自己的清单装 —— 与 __migrate 里的 migrate_deploy_botfiles 同一份真源, 不会再被换回去
-  install -m755 "$REPO/deploy/bot/pdg.sh" /usr/local/bin/pdg
+  install -m755 "$REPO/deploy/bot/pdg.sh" "$R1_CLI"
   ( # shellcheck source=/dev/null
-    source "$REPO/lib/modules.sh" && pdg_install_runtime_modules "$REPO" /opt/pdg-bot "$1" ) \
+    source "$REPO/lib/modules.sh" && pdg_install_runtime_modules "$REPO" "$R1_BOTDIR" "$1" ) \
     || { bad "按候选清单装模块失败"; return 1; }
-  [[ "$(sha256sum /usr/local/bin/pdg | awk '{print $1}')" == "$(sha256sum "$CANDSRC/deploy/bot/pdg.sh" | awk '{print $1}')" ]] \
-    && ok "部署源身份: /usr/local/bin/pdg 就是候选 X 的那一份" || bad "装上去的 pdg 不是 X 的"
+  # 342: 读取失败不再当成"两边相等"; 不符或读不到都不往下走(由 r1_a0_invoke 阻断 __migrate)
+  r1_same_file "$R1_CLI" "$CANDSRC/deploy/bot/pdg.sh"; r=$?
+  case "$r" in
+    0) ok "部署源身份: $R1_CLI 就是候选 X 的那一份";;
+    1) bad "装上去的 pdg 不是 X 的($R1_WHY)"; return 1;;
+    *) bad "部署源身份: 装上去的 pdg 身份读取失败 —— $R1_WHY; 未取得"; return 1;;
+  esac
   # ── 按**平台契约**核对装机身份 ────────────────────────────────────────────
   # 上一轮这里写死了"iosstate 必须有 migrate_schema" —— 而 iosstate.py 属于 PDG_IOS_MODULES,
   # **Android 本来就不装它**(平台契约, 不是装机失败)。判据换成: 该平台**实际应装**的每个
   # 文件都在, 且逐字节等于候选 X 的那一份; 再加三条反面契约。
-  local plat="$1" nmod=0 nbad=0 src name _mode
-  while read -r src name _mode; do
-    [[ -n "$src" ]] || continue
+  local plat="$1" nmod=0 nbad=0 nerr=0 src name _mode l
+  # 342: 清单生成失败 / 为空 / 有解析不了的行 ⇒ 装机身份未取得(不再按已输出的半截清单判)
+  if ! r1_manifest "$plat"; then bad "部署源身份: $plat 平台$R1_WHY —— 装机身份未取得"; return 1; fi
+  for l in "${R1_MANIFEST[@]}"; do
+    read -r src name _mode <<<"$l"
     nmod=$((nmod+1))
-    if [[ ! -e "/opt/pdg-bot/$name" ]]; then
+    if [[ ! -e "$R1_BOTDIR/$name" ]]; then
       nbad=$((nbad+1)); echo "       缺 $name"; continue
     fi
-    cmp -s "$CANDSRC/$src" "/opt/pdg-bot/$name" || { nbad=$((nbad+1)); echo "       指纹不符 $name"; }
-  done < <( ( source "$CANDSRC/lib/modules.sh" && pdg_platform_modules "$plat" ) 2>/dev/null )
-  { [[ "$nmod" -gt 0 && "$nbad" == 0 ]]; } \
+    cmp -s "$CANDSRC/$src" "$R1_BOTDIR/$name"; r=$?
+    case "$r" in 0) ;; 1) nbad=$((nbad+1)); echo "       指纹不符 $name";; *) nerr=$((nerr+1)); echo "       比较失败(cmp 退出 $r) $name";; esac
+  done
+  { [[ "$nmod" -gt 0 && "$nbad" == 0 && "$nerr" == 0 ]]; } \
     && ok "部署源身份: $plat 平台应装的 $nmod 个文件全部就位且逐字节等于候选 X" \
-    || { bad "部署源身份: $plat 平台清单 $nmod 项里有 $nbad 项缺失或指纹不符"; return 1; }
+    || { bad "部署源身份: $plat 平台清单 $nmod 项里有 $nbad 项缺失或指纹不符、$nerr 项比较失败"; return 1; }
   if [[ "$plat" == android ]]; then
     # 反面契约 ①: iOS 专属那四件不该出现在 Android 上
     local ios_only="" f
     for f in iosprofile.py iosstate.py mitm_ca.py pdg-dot.mobileconfig.tmpl; do
-      [[ -e "/opt/pdg-bot/$f" ]] && ios_only="$ios_only $f"
+      [[ -e "$R1_BOTDIR/$f" ]] && ios_only="$ios_only $f"
     done
     [[ -z "$ios_only" ]] && ok "部署源身份: Android 上没有 iOS 专属件(平台契约成立)" \
                          || bad "部署源身份: Android 上出现了 iOS 专属件:$ios_only"
   else
     # 反面契约 ②: iOS 上装的 iosstate 必须是候选形态(行为身份, 不只是文件名)
-    ( cd /opt/pdg-bot && python3 -c 'import iosstate,sys; sys.exit(0 if hasattr(iosstate,"migrate_schema") else 1)' ) 2>/dev/null \
+    ( cd "$R1_BOTDIR" && python3 -c 'import iosstate,sys; sys.exit(0 if hasattr(iosstate,"migrate_schema") else 1)' ) 2>/dev/null \
       && ok "部署源身份: iOS 上装的 iosstate 具备 migrate_schema(候选形态)" \
       || { bad "部署源身份: iOS 上的 iosstate 没有 migrate_schema —— 部署源仍是旧版"; return 1; }
   fi
   # 反面契约 ③: 两平台均应退役的三件, 迁移之后一件都不许在(此刻迁移还没跑, 只记录现状)
   local retired="" r
-  for r in /opt/pdg-bot/mitm_server.py /opt/pdg-bot/mitm_wloc.py /etc/systemd/system/pdg-mitm.service; do
+  for r in "$R1_BOTDIR/mitm_server.py" "$R1_BOTDIR/mitm_wloc.py" /etc/systemd/system/pdg-mitm.service; do
     [[ -e "$r" ]] && retired="$retired $r"
   done
   [[ -z "$retired" ]] && ok "部署源身份: 两平台均应退役的三件在候选装机后已不存在" \
@@ -990,22 +1123,31 @@ residue_report(){   # 打印清单并逐项确认
 }
 
 # ── 候选部署身份: 与历史残留**分开**核验 ────────────────────────────────────
-assert_candidate_identity(){   # $1=平台
-  local plat="$1" mis=0 dif=0 n=0 src name mode
-  [[ "$(sha256sum /usr/local/bin/pdg | awk '{print $1}')" == "$(sha256sum "$CANDSRC/deploy/bot/pdg.sh" | awk '{print $1}')" ]] \
-    && ok "部署身份: /usr/local/bin/pdg 逐字节等于冻结候选" || bad "部署身份: pdg 不是候选那一份"
-  # shellcheck source=/dev/null
-  source "$CANDSRC/lib/modules.sh" 2>/dev/null || { bad "部署身份: 读不到候选的 modules.sh"; return 1; }
-  while read -r src name mode; do
-    [[ -n "$name" ]] || continue
+assert_candidate_identity(){   # $1=平台 → 0 成立 / 1 不成立或未取得(341: 由 r1_a0_invoke 阻断 __migrate; 342: 读不到 ≠ 相符)
+  local plat="$1" mis=0 dif=0 err=0 n=0 src name mode st=0 r l
+  r1_same_file "$R1_CLI" "$CANDSRC/deploy/bot/pdg.sh"; r=$?
+  case "$r" in
+    0) ok "部署身份: $R1_CLI 逐字节等于冻结候选";;
+    1) bad "部署身份: pdg 不是候选那一份($R1_WHY)"; st=1;;
+    *) bad "部署身份: pdg 的身份读取失败 —— $R1_WHY; 未取得"; st=1;;
+  esac
+  if ! r1_manifest "$plat"; then
+    bad "部署身份: $R1_WHY —— 受管模块的身份未取得"
+    _evn 00-identity.txt "候选部署身份: 模块清单未取得($R1_WHY)"
+    return 1
+  fi
+  for l in "${R1_MANIFEST[@]}"; do
+    read -r src name mode <<<"$l"
     n=$((n+1))
-    [[ -e "/opt/pdg-bot/$name" ]] || { mis=$((mis+1)); continue; }
-    cmp -s "$CANDSRC/$src" "/opt/pdg-bot/$name" || dif=$((dif+1))
-  done < <(pdg_platform_modules "$plat")
-  { [[ "$mis" == 0 && "$dif" == 0 ]]; } \
+    [[ -e "$R1_BOTDIR/$name" ]] || { mis=$((mis+1)); continue; }
+    cmp -s "$CANDSRC/$src" "$R1_BOTDIR/$name"; r=$?
+    case "$r" in 0) ;; 1) dif=$((dif+1));; *) err=$((err+1));; esac
+  done
+  { [[ "$mis" == 0 && "$dif" == 0 && "$err" == 0 ]]; } \
     && ok "部署身份: $n 项受管模块与冻结候选逐字节一致(缺 $mis / 不符 $dif)" \
-    || bad "部署身份: 受管模块与候选不一致(缺 $mis / 不符 $dif)"
-  _evn 00-identity.txt "候选部署身份: pdg+${n} 模块; 缺 $mis 不符 $dif"
+    || { bad "部署身份: 受管模块与候选不一致(缺 $mis / 不符 $dif / 比较失败 $err)"; st=1; }
+  _evn 00-identity.txt "候选部署身份: pdg+${n} 模块; 缺 $mis 不符 $dif 比较失败 $err"
+  return "$st"
 }
 
 # ── DNS 仪器: 固定实验条件 → 标定 → 正式取证, 三处用**同一套**有效性要求 ────────
@@ -1255,66 +1397,295 @@ FP_FILES=(/etc/systemd/system/pdg-mitm.service
           /etc/nftables.conf
           /etc/mihomo/config.yaml)
 FP_SVCS=(pdg-mitm mosdns mihomo pdg-bot pdg-probe81)
-fp_capture(){   # $1=标签 → 写 $EVID/fp-$1.tsv
-  local tag="$1" q u
-  local f="$EVID/fp-$tag.tsv"
-  : > "$f"
+# 341: 取证与读取链 —— 查询失败、记录缺失与真实状态不同分开记:
+#   F 行: 有 / 无 / 查询失败(摘要或属性读不到; 失败前打印的内容不采信)
+#   S 行: 运行态 / 自启态各是状态词, 或 FP_BAD(原因记在同一文件的 Q 行); R 行记**本次**查询的真实退出码
+#   L 行: 监听数, 或 FP_BAD(ss 失败时它打印的内容不采信)
+FP_BAD='!无效'
+# 342: 采样完成度 —— 先在内存里拼好, 删掉旧文件后一次写出, 再读回核对行数; 三步都成才记 FP_DONE[标签]=1。
+#      删不掉旧文件 / 写失败 / 行数对不上 ⇒ 未完成, 之后的读取一律拒绝(342 复现 XB4 / XB5: 以前会读到上一次留下的旧文件)。
+declare -A FP_DONE=()
+fp_capture(){   # $1=标签 → 0 已完成 / 2 未完成(R1_WHY); 写 $EVID/fp-$1.tsv
+  local q u f="$EVID/fp-$1.tsv" dg st rc ld lrc av arc ev erc out n pt fm fu fg buf="" line nl=0 got
+  FP_DONE[$1]=0
   for q in "${FP_FILES[@]}"; do
-    if [[ -e "$q" ]]; then
-      printf 'F\t%s\t有\t%s\t%s\t%s\t%s\n' "$q" \
-        "$(sha256sum "$q" 2>/dev/null | awk '{print $1}')" \
-        "$(stat -c %a "$q")" "$(stat -c %u "$q")" "$(stat -c %g "$q")" >> "$f"
+    if [[ -e "$q" || -L "$q" ]]; then
+      dg="$(sha256sum -- "$q" 2>/dev/null)"; rc=$?; dg="${dg%% *}"
+      if (( rc != 0 )) || [[ ! "$dg" =~ ^[0-9a-f]{64}$ ]]; then
+        printf -v line 'F\t%s\t查询失败\tsha256sum 退出 %s\n' "$q" "$rc"; buf+="$line"; nl=$((nl+1)); continue
+      fi
+      st="$(stat -c '%a %u %g' -- "$q" 2>/dev/null)"; rc=$?
+      if (( rc != 0 )) || [[ ! "$st" =~ ^[0-7]+\ [0-9]+\ [0-9]+$ ]]; then
+        printf -v line 'F\t%s\t查询失败\tstat 退出 %s\n' "$q" "$rc"; buf+="$line"; nl=$((nl+1)); continue
+      fi
+      read -r fm fu fg <<<"$st"
+      printf -v line 'F\t%s\t有\t%s\t%s\t%s\t%s\n' "$q" "$dg" "$fm" "$fu" "$fg"; buf+="$line"; nl=$((nl+1))
     else
-      printf 'F\t%s\t无\t-\t-\t-\t-\n' "$q" >> "$f"
+      printf -v line 'F\t%s\t无\t-\t-\t-\t-\n' "$q"; buf+="$line"; nl=$((nl+1))
     fi
   done
-  local av ar ev er
   for u in "${FP_SVCS[@]}"; do
-    # 状态与**退出码**分开记: systemd 对已删除的 unit 会既打印 not-found 又返回非 0,
-    # 只看 stdout 或只看 rc 都会误判。
-    av="$(sc_state is-active  "$u")"; ar="$SC_RC"
-    ev="$(sc_state is-enabled "$u")"; er="$SC_RC"
-    printf 'R\t%s\tis-active rc=%s\tis-enabled rc=%s\n' "$u" "$ar" "$er" >> "$f"
-    printf 'S\t%s\t%s\t%s\t%s\t%s\t%s\n' "$u" \
-      "$av" "$ev" \
+    ld=""; av="$FP_BAD"; ev="$FP_BAD"
+    if r1_unit_q load "$u"; then ld="$R1_VAL"; else printf -v line 'Q\t%s\tload\t%s\n' "$u" "$R1_WHY"; buf+="$line"; nl=$((nl+1)); fi; lrc="$R1_RC"
+    if r1_unit_q active "$u" "$ld"; then av="$R1_VAL"; else printf -v line 'Q\t%s\tactive\t%s\n' "$u" "$R1_WHY"; buf+="$line"; nl=$((nl+1)); fi; arc="$R1_RC"
+    if r1_unit_q enabled "$u"; then ev="$R1_VAL"; else printf -v line 'Q\t%s\tenabled\t%s\n' "$u" "$R1_WHY"; buf+="$line"; nl=$((nl+1)); fi; erc="$R1_RC"
+    printf -v line 'R\t%s\tis-active rc=%s\tis-enabled rc=%s\tLoadState rc=%s\n' "$u" "${arc:-?}" "${erc:-?}" "${lrc:-?}"; buf+="$line"; nl=$((nl+1))
+    printf -v line 'S\t%s\t%s\t%s\t%s\t%s\t%s\n' "$u" "$av" "$ev" \
       "$(systemctl show -p MainPID --value "$u" 2>/dev/null)" \
       "$(systemctl show -p InvocationID --value "$u" 2>/dev/null)" \
-      "$(systemctl show -p NRestarts --value "$u" 2>/dev/null)" >> "$f"
+      "$(systemctl show -p NRestarts --value "$u" 2>/dev/null)"; buf+="$line"; nl=$((nl+1))
   done
-  # 已加载配置的独立依据: 真实监听(不是磁盘 hash)
-  printf 'L\t7894\t%s\n' "$(ss -lnt 2>/dev/null | grep -c ':7894 ')" >> "$f"
-  printf 'L\t53\t%s\n'   "$(ss -lnu 2>/dev/null | grep -c ':53 ')" >> "$f"
-  chmod 600 "$f"
+  # 已加载配置的独立依据: 真实监听(不是磁盘 hash)。7894 看 TCP、53 看 UDP, 与冻结版同口径
+  for pt in 7894 53; do
+    if [[ "$pt" == 7894 ]]; then out="$(ss -lnt 2>/dev/null)"; rc=$?; else out="$(ss -lnu 2>/dev/null)"; rc=$?; fi
+    if (( rc != 0 )); then
+      printf -v line 'L\t%s\t%s\nQ\tL%s\tss\tss 退出 %s(它打印的内容不采信)\n' "$pt" "$FP_BAD" "$pt" "$rc"; buf+="$line"; nl=$((nl+2)); continue
+    fi
+    n="$(grep -c ":$pt " <<<"$out")"; rc=$?
+    if (( rc > 1 )) || [[ ! "$n" =~ ^[0-9]+$ ]]; then
+      printf -v line 'L\t%s\t%s\nQ\tL%s\tgrep\t计数失败(grep 退出 %s)\n' "$pt" "$FP_BAD" "$pt" "$rc"; buf+="$line"; nl=$((nl+2)); continue
+    fi
+    printf -v line 'L\t%s\t%s\n' "$pt" "$n"; buf+="$line"; nl=$((nl+1))
+  done
+  rm -f -- "$f" 2>/dev/null
+  [[ ! -e "$f" && ! -L "$f" ]] || { R1_WHY="删不掉旧的 $f"; return 2; }
+  printf '%s' "$buf" > "$f" 2>/dev/null || { R1_WHY="写 $f 失败"; return 2; }
+  got="$(wc -l < "$f" 2>/dev/null)"; rc=$?
+  { (( rc == 0 )) && [[ "$got" =~ ^[[:space:]]*[0-9]+[[:space:]]*$ ]] && (( got == nl )); } \
+    || { R1_WHY="$f 读回行数 [$got] 与写入的 $nl 行对不上(wc 退出 $rc)"; return 2; }
+  chmod 600 "$f" 2>/dev/null || true
+  FP_DONE[$1]=1
+  return 0
 }
-fp_get(){   # $1=标签 $2=类型 $3=键 → 打印那一行的其余字段
-  # 按**字段**拼回去, 不用 [^\t] 这类方括号反斜杠转义 —— 那种写法在 POSIX grep/awk 下会被
-  # 截断解释(仓库的 test-false-green-guard.sh 专门盯这一条)。分隔符用真正的制表符。
-  local TAB; TAB="$(printf '\t')"
-  awk -F"$TAB" -v t="$2" -v k="$3" \
-      '$1==t && $2==k {out=$3; for(i=4;i<=NF;i++) out=out FS $i; print out; exit}' "$EVID/fp-$1.tsv"
+# 341: 读指纹 —— 0 取到恰一条(FP_REC=其余字段) / 1 该标签里确实没有这条记录 / 2 指纹文件读不了或同键重复。
+#   在本壳里调用; 两边都读不到时不再因为"两个空串相等"而判恢复(341 复现 R2)。
+#   按**字段**拼回去, 不用 [^\t] 这类方括号反斜杠转义 —— 那种写法在 POSIX grep/awk 下会被
+#   截断解释(仓库的 test-false-green-guard.sh 专门盯这一条)。分隔符用真正的制表符。
+FP_REC=""
+fp_get(){   # $1=标签 $2=类型 $3=键 → 0 取到恰一条(FP_REC) / 1 确认没有 / 2 采样未完成、读不了、读取不完整或同键重复
+  local f="$EVID/fp-$1.tsv" TAB out rc rest n; FP_REC=""
+  [[ "${FP_DONE[$1]:-0}" == 1 ]] || return 2      # 342: 只读本进程里写成功并核过行数的那一份
+  [[ -f "$f" && -r "$f" ]] || return 2      # gawk 读目录只告警、仍退出 0, 所以先核文件本身(341 复现 R2b)
+  TAB="$(printf '\t')"
+  out="$(awk -F"$TAB" -v t="$2" -v k="$3" \
+      '$1==t && $2==k {n++; o=$3; for(i=4;i<=NF;i++) o=o FS $i} END {printf "R1FP%s%d%s%s\n", FS, n, FS, o}' "$f" 2>/dev/null)"; rc=$?
+  (( rc == 0 )) || return 2                      # 先输出后失败: 输出不采信
+  [[ "$out" == "R1FP$TAB"* ]] || return 2        # 没有完整的结尾行 = 输出不完整
+  rest="${out#"R1FP$TAB"}"; n="${rest%%"$TAB"*}"
+  [[ "$n" =~ ^[0-9]+$ ]] || return 2
+  (( n == 0 )) && return 1
+  (( n == 1 )) || return 2
+  FP_REC="${rest#*"$TAB"}"
+  return 0
 }
-fp_cmp_files(){   # $1=before $2=after $3=场景名 —— 四维逐项比对
-  local q b a n_ok=0 n_bad=0
+# 341: 一项的前后对照 —— 0 两边都有效且相等 / 1 两边都有效但不同 / 2 任一边缺记录、读不了或观测无效(FP_WHY)。
+FP_B=""; FP_A=""; FP_WHY=""
+# 342: 记录结构(与 fp_capture 写出的形态一一对应)——
+#   F = 有<TAB>64 位十六进制<TAB>一至四位八进制 mode(stat %a 不补前导零: 0 / 7 / 44 / 644 / 4755 都是它的真实输出)<TAB>uid<TAB>gid | 无<TAB>-<TAB>-<TAB>-<TAB>- | 查询失败<TAB>原因
+#   S = 运行态<TAB>自启态<TAB>MainPID<TAB>InvocationID<TAB>NRestarts(前两个非空)    L = 数字或 FP_BAD
+#   结构不完整 = 观测无效, 不算真实差异(342 复现 XB2 / XB3)。
+r1_fp_rec_ok(){   # $1=类型 $2=记录 → 0 结构完整 / 2 不完整
+  local T=$'\t' re
+  case "$1" in
+    F) re="^(有${T}[0-9a-f]{64}${T}[0-7]{1,4}${T}[0-9]+${T}[0-9]+|无${T}-${T}-${T}-${T}-|查询失败${T}[^${T}]+)$";;
+    S) re="^[^${T}]+${T}[^${T}]+${T}[^${T}]*${T}[^${T}]*${T}[^${T}]*$";;
+    L) re="^([0-9]+|${FP_BAD})$";;
+    *) return 2;;
+  esac
+  [[ "$2" =~ $re ]] && return 0
+  return 2
+}
+R1_FV=""
+r1_fp_field(){   # $1=记录 $2=第几个字段 → 0 取得(R1_FV) / 2 提取失败(cut 先输出后失败不采信; 342 复现 XB1)
+  local out rc; R1_FV=""
+  out="$(cut -f"$2" <<<"$1")"; rc=$?
+  (( rc == 0 )) || { R1_WHY="取第 $2 个字段失败(cut 退出 $rc)"; return 2; }
+  R1_FV="$out"
+}
+# 342: 一项读取 = 采样已完成 + 恰一条记录 + 结构完整 + 字段提取有效 + 不是"查询失败 / 无效"标记; 缺一样都不参与比较。
+r1_fp_read(){   # $1=标签 $2=类型 $3=键 [$4=S 行的第几个字段] → 0 有效值(R1_FV) / 1 确认没有这条 / 2 观测无效(R1_WHY)
+  local r
+  R1_FV=""
+  fp_get "$1" "$2" "$3"; r=$?
+  case "$r" in
+    0) ;;
+    1) R1_WHY="$1 缺记录"; return 1;;
+    *) if [[ "${FP_DONE[$1]:-0}" == 1 ]]; then R1_WHY="$1 读不了或同键重复"; else R1_WHY="$1 采样未完成"; fi; return 2;;
+  esac
+  r1_fp_rec_ok "$2" "$FP_REC" || { R1_WHY="$1 记录结构不完整([${FP_REC//$'\t'/|}])"; return 2; }
+  if [[ -n "${4:-}" ]]; then
+    r1_fp_field "$FP_REC" "$4" || { R1_WHY="$1 $R1_WHY"; return 2; }
+  else
+    R1_FV="$FP_REC"
+  fi
+  if [[ "$2" == F ]]; then
+    [[ "${R1_FV%%$'\t'*}" != 查询失败 ]] || { R1_WHY="$1 查询失败(${R1_FV#*$'\t'})"; return 2; }
+  else
+    { [[ -n "$R1_FV" && "$R1_FV" != "$FP_BAD" ]]; } || { R1_WHY="$1 观测无效"; return 2; }
+  fi
+  return 0
+}
+r1_fp_item(){   # $1=before $2=after $3=类型(F|S|L) $4=键 [$5=S 行的第几个字段: 1 运行态 / 2 自启态] → 0 相等 / 1 不同 / 2 未取得(FP_WHY)
+  local rb ra wb="" wa=""
+  FP_B=""; FP_A=""; FP_WHY=""
+  r1_fp_read "$1" "$3" "$4" "${5:-}"; rb=$?; FP_B="$R1_FV"; (( rb == 0 )) || wb="$R1_WHY"
+  r1_fp_read "$2" "$3" "$4" "${5:-}"; ra=$?; FP_A="$R1_FV"; (( ra == 0 )) || wa="$R1_WHY"
+  FP_WHY="$wb${wb:+${wa:+; }}$wa"
+  [[ -z "$FP_WHY" ]] || return 2
+  [[ "$FP_B" == "$FP_A" ]] && return 0
+  return 1
+}
+# 341: 本场景的恢复账 —— 只由 A-4 / A-4b 在各项判定处记; A-7 只读这里(不看全局失败计数, 也不看有没有 FAIL 字样)。
+A4_RESTORED=(); A4_DIFFER=(); A4_NOTOBT=()
+r1_tally(){   # $1=ok|diff|na $2=项名
+  case "$1" in ok) A4_RESTORED+=("$2");; diff) A4_DIFFER+=("$2");; *) A4_NOTOBT+=("$2");; esac
+}
+fp_cmp_files(){   # $1=before $2=after $3=场景名 —— 文件维逐项比对; 真实不同与观测无效 / 缺记录分开计
+  local q n_ok=0 n_bad=0 n_na=0 r
   for q in "${FP_FILES[@]}"; do
-    b="$(fp_get "$1" F "$q")"; a="$(fp_get "$2" F "$q")"
-    if [[ "$b" == "$a" ]]; then n_ok=$((n_ok+1)); continue; fi
-    n_bad=$((n_bad+1))
-    printf '    %-58s\n      前: %s\n      后: %s\n' "$q" "${b:-<无记录>}" "${a:-<无记录>}"
+    r1_fp_item "$1" "$2" F "$q"; r=$?
+    case "$r" in
+      0) n_ok=$((n_ok+1)); r1_tally ok "文件 $q";;
+      1) n_bad=$((n_bad+1)); r1_tally diff "文件 $q"
+         printf '    %-58s\n      前: %s\n      后: %s\n' "$q" "$FP_B" "$FP_A";;
+      *) n_na=$((n_na+1)); r1_tally na "文件 $q"
+         printf '    %-58s\n      未取得: %s\n' "$q" "$FP_WHY";;
+    esac
   done
-  [[ "$n_bad" == 0 ]] \
-    && ok "$3: ${#FP_FILES[@]} 个受关注文件的**存在性/内容/mode/uid/gid** 四项全部回到前像" \
-    || bad "$3: 有 $n_bad 个文件没回到前像(上面逐项列出), 一致 $n_ok"
+  (( n_bad == 0 && n_na == 0 )) && ok "$3: ${#FP_FILES[@]} 个受关注文件的**存在性/内容/mode/uid/gid** 四项全部回到前像"
+  (( n_bad > 0 )) && bad "$3: 有 $n_bad 个文件没回到前像(上面逐项列出), 一致 $n_ok"
+  (( n_na > 0 )) && bad "$3: 有 $n_na 个文件的前后观测无效或缺记录(上面逐项列出) —— 这些项的恢复结论未取得"
+  return 0
+}
+# 341: 调用前必需观测是否齐且有效: 每个受关注文件恰一条且不是"查询失败"; 每个 unit 的运行态与自启态都取得; 两个监听数都取得。
+r1_fp_valid(){   # $1=标签 → 0 齐且有效 / 2 不成立(R1_WHY 列出)
+  local tag="$1" q u pt why=""
+  [[ "${FP_DONE[$tag]:-0}" == 1 ]] || { R1_WHY="$tag 的采样没有完成(写入或读回核对失败)"; return 2; }
+  for q in "${FP_FILES[@]}"; do r1_fp_read "$tag" F "$q" || why="$why 文件 $q: $R1_WHY;"; done
+  for u in "${FP_SVCS[@]}"; do
+    r1_fp_read "$tag" S "$u" 1 || why="$why $u 运行态: $R1_WHY;"
+    r1_fp_read "$tag" S "$u" 2 || why="$why $u 自启态: $R1_WHY;"
+  done
+  for pt in 7894 53; do r1_fp_read "$tag" L "$pt" || why="$why 监听 $pt: $R1_WHY;"; done
+  R1_WHY="${why# }"
+  [[ -z "$why" ]] || return 2
+  return 0
+}
+# 341: DNS 这一项进本场景的恢复账(判词仍由 dns_verdict 给 —— 那个函数与 ⑤ / 42 号所用版本逐字节相同, 不动它)。
+r1_dns_tally(){   # $1=前像 $2=恢复后(dns_feature_probe 的输出)
+  local bs bw bc as aw ac
+  IFS=$'\t' read -r bs bw bc <<<"$1"; IFS=$'\t' read -r as aw ac <<<"$2"
+  if [[ "$DNS_INSTRUMENT_OK" != 1 || "$bs" != VALID || "$as" != VALID ]]; then r1_tally na "DNS 见证/对照"
+  elif [[ "$bw" == "$aw" && "$bc" == "$ac" && "$aw" == "$DNS_H" && "$ac" == "$DNS_U" ]]; then r1_tally ok "DNS 见证/对照"
+  else r1_tally diff "DNS 见证/对照"; fi
+}
+# 341: 旧版身份 —— $R1_CLI 与 OLD_SHA 里的 deploy/bot/pdg.sh 是同一对象; $REPO 的 HEAD == OLD_SHA。
+#   每一步查询各自核退出码与输出形态; 读不到 ≠ 不符 ≠ 相符。A0 不用它(A0 按候选身份单独判)。
+R1_ID_CLI=na; R1_ID_HEAD=na
+r1_old_identity(){   # $1=标签 → 0 两项都成立 / 1 有效观测确认有不符 / 2 有观测无效(且没有确认的不符); R1_ID_CLI / R1_ID_HEAD = ok|diff|na
+  local tag="$1" want got head rc
+  R1_ID_CLI=na; R1_ID_HEAD=na
+  want="$(git -C "$ORIGIN" rev-parse -q --verify "$OLD_SHA:deploy/bot/pdg.sh" 2>/dev/null)"; rc=$?
+  if (( rc != 0 )) || [[ ! "$want" =~ ^[0-9a-f]{40}$ ]]; then
+    bad "$tag 身份: 取不到 OLD_SHA 里 deploy/bot/pdg.sh 的对象(rc=$rc) —— $R1_CLI 的身份未取得"
+  else
+    got="$(git hash-object --no-filters -- "$R1_CLI" 2>/dev/null)"; rc=$?
+    if (( rc != 0 )) || [[ ! "$got" =~ ^[0-9a-f]{40}$ ]]; then
+      bad "$tag 身份: 读不到 $R1_CLI 的对象摘要(rc=$rc) —— 未取得"
+    elif [[ "$got" == "$want" ]]; then
+      R1_ID_CLI=ok; ok "$tag 身份: $R1_CLI 与 OLD_SHA 的 deploy/bot/pdg.sh 是同一对象(${got:0:12})"
+    else
+      R1_ID_CLI="diff"; bad "$tag 身份: $R1_CLI 不是 OLD_SHA 那一份(实得 ${got:0:12}, 应为 ${want:0:12})"
+    fi
+  fi
+  head="$(git -C "$REPO" rev-parse -q --verify HEAD 2>/dev/null)"; rc=$?
+  if (( rc != 0 )) || [[ ! "$head" =~ ^[0-9a-f]{40}$ ]]; then
+    bad "$tag 身份: 读不到 $REPO 的 HEAD(rc=$rc) —— 未取得"
+  elif [[ "$head" == "$OLD_SHA" ]]; then
+    R1_ID_HEAD=ok; ok "$tag 身份: $REPO 的 HEAD == OLD_SHA(${OLD_SHA:0:12})"
+  else
+    R1_ID_HEAD="diff"; bad "$tag 身份: $REPO 的 HEAD 是 ${head:0:12}, 不是 OLD_SHA(${OLD_SHA:0:12})"
+  fi
+  [[ "$R1_ID_CLI" == diff || "$R1_ID_HEAD" == diff ]] && return 1
+  [[ "$R1_ID_CLI" == ok && "$R1_ID_HEAD" == ok ]] && return 0
+  return 2
+}
+# 341: 产品调用只在下面两个函数里发生; 调用前条件任一不成立就不调用, 原因留在 R1_GATE_WHY(由调用处记"未执行")。
+R1_GATE_WHY=""
+r1_a0_invoke(){   # A0 唯一的产品调用点 → 0 已调用(MG / MGRC) / 1 未调用
+  MG=""; MGRC=""; R1_GATE_WHY=""
+  if [[ "$R1_SRC_OLD" != 1 || "$R1_SRC_CAND" != 1 ]]; then R1_GATE_WHY="来源未核实成立(旧版=$R1_SRC_OLD 候选=$R1_SRC_CAND)"; return 1; fi
+  install_candidate ios >/dev/null || { bad "A0: 装候选失败"; R1_GATE_WHY="装候选失败"; return 1; }
+  switch_repo_to_candidate ios || { R1_GATE_WHY="部署源没有切到候选(见上)"; return 1; }
+  systemctl daemon-reload
+  assert_candidate_identity ios || { R1_GATE_WHY="候选部署身份不成立(见上)"; return 1; }
+  echo
+  echo "── 只跑新版 __migrate(不带前像句柄, 正是旧 CLI 子进程的形态) ──"
+  MG="$(bash "$R1_CLI" __migrate 2>&1)"; MGRC=$?
+  return 0
+}
+r1_a_invoke(){   # 场景 A 唯一的产品调用点(旧 CLI 的 dry-run 与正式 update) → 0 已调用(DRY / DRC / UP / URC) / 1 未调用
+  DRY=""; DRC=""; UP=""; URC=""; R1_GATE_WHY=""
+  if [[ "$R1_SRC_OLD" != 1 ]]; then R1_GATE_WHY="旧版来源(OLDSRC ⇔ OLD_SHA)未核实成立"; return 1; fi
+  if ! r1_fp_valid A-before; then bad "A: 调用前必需观测无效 —— $R1_WHY"; R1_GATE_WHY="调用前必需观测无效"; return 1; fi
+  r1_old_identity "A 升级前" || { R1_GATE_WHY="升级前旧版身份未成立(见上)"; return 1; }
+  DRY="$(bash "$R1_CLI" update --dry-run 2>&1)"; DRC=$?
+  UP="$(bash "$R1_CLI" update 2>&1)"; URC=$?
+  return 0
+}
+# 341(M2): 报告与恢复分账。只用 A-4 / A-4b 记下的本场景观测; 措辞只覆盖已检查范围; 旧版能力之外不为完整成功声明免责。
+# 342: 固定串查询 —— 0 有 / 1 没有 / 2 查询失败(以前把查询失败当成"没有"; 342 复现 XC1 / XC2)
+r1_text_has(){   # $1=固定串 $2=文本
+  local r
+  grep -qF -- "$1" <<<"$2"; r=$?
+  (( r <= 1 )) && return "$r"
+  return 2
+}
+r1_report_verdict(){
+  local claim_ok=0 claim_part=0 named="" nd=${#A4_DIFFER[@]} nn=${#A4_NOTOBT[@]} nr=${#A4_RESTORED[@]} scope r_ok r_part rc
+  scope="${#FP_FILES[@]} 个受关注文件的存在/内容/mode/属主、${#FP_SVCS[@]} 个 unit 的运行态与自启态、7894 与 53 的监听数、DNS 见证/对照、回滚后 CLI 与仓库 HEAD 的身份"
+  r1_text_has '✅ 已回滚并重启服务' "$UP"; r_ok=$?
+  r1_text_has '已回滚配置/服务, 但以下项未能恢复(未完全回滚)' "$UP"; r_part=$?
+  if (( r_ok == 2 || r_part == 2 )); then
+    bad "A-7 报告: 回滚收尾文字的查询失败(「✅ 已回滚并重启服务」=$r_ok /「未完全回滚」=$r_part; 0 有 / 1 没有 / 2 查询失败) —— 观测无效, 报告结论未取得"
+    return 1
+  fi
+  (( r_ok == 0 )) && claim_ok=1
+  if (( r_part == 0 )); then
+    claim_part=1
+    # 点名内容只作原文留存, 不参与判定、不作背书; 取不到就如实写"读取失败", 不写成"没点名"(342 复现 XC4)
+    named="$(sed -n 's/.*已回滚配置\/服务, 但以下项未能恢复(未完全回滚): *//p' <<<"$UP")"; rc=$?
+    if (( rc == 0 )); then named="${named%%$'\n'*}"; named="${named%%$'\e'*}"; else named="<读取失败(sed 退出 $rc)>"; fi
+  fi
+  if (( nr + nd + nn == 0 )); then bad "A-7 报告: 本场景没有记下任何恢复观测 —— 报告结论未取得"; return 1; fi
+  if (( claim_ok && claim_part )); then bad "A-7 报告: 结局矛盾 —— 同一次输出里既有「✅ 已回滚并重启服务」又有「未完全回滚」"; return 1; fi
+  if (( ! claim_ok && ! claim_part )); then bad "A-7 报告: 没有回滚收尾文字(报告缺失) —— 报告结论未取得"; return 1; fi
+  if (( nd > 0 )); then
+    if (( claim_ok )); then
+      bad "A-7 报告与现场不符: 产品宣告「✅ 已回滚并重启服务」, 但有效观测确认 $nd 项未恢复: ${A4_DIFFER[*]}"
+    else
+      ok "A-7 报告项成立(只到「不完整」这一层): 产品没有宣告完整成功、报了未完全回滚, 与有效观测确认的 $nd 项未恢复一致($(printf '%s; ' "${A4_DIFFER[@]}")); 它点名的内容未经核验、不作背书(原文: ${named:-<空>}); 恢复项仍失败(见 A-4 / A-4b)"
+    fi
+    (( nn > 0 )) && note "A-7: 另有 $nn 项观测无效或缺记录(${A4_NOTOBT[*]}), 不进上面的结论"
+    return 0
+  fi
+  if (( nn > 0 )); then bad "A-7 报告: 有 $nn 项观测无效或缺记录(${A4_NOTOBT[*]}) —— 报告是否与现场一致未取得"; return 1; fi
+  if (( claim_ok )); then
+    ok "A-7 报告: 已检查范围内恢复成立($nr 项), 成功声明与这些观测一致 —— 只覆盖 $scope, 不代表整个系统逐项恢复"
+  else
+    bad "A-7 报告: 产品报了未完全回滚(点名原文, 未核验: ${named:-<空>}), 而已检查的 $nr 项全部恢复 —— 它说的未恢复项是否在已检查范围之外未经核验, 报告是否属实未取得"
+  fi
 }
 
 # ── 测试前置: 把冻结退役候选安装上去(只用于 A0 的阶段观测, 不是合法升级路径)──────
 install_candidate(){   # $1=平台(默认取 $FROM)
   local n=0 name src mode plat="${1:-${FROM:-ios}}"
-  install -m755 "$CANDSRC/deploy/bot/pdg.sh" /usr/local/bin/pdg || return 1
+  install -m755 "$CANDSRC/deploy/bot/pdg.sh" "$R1_CLI" || return 1
   # shellcheck source=/dev/null
   source "$CANDSRC/lib/modules.sh" || return 1
   while read -r src name mode; do
     [[ -n "$name" ]] || continue
-    install -m"${mode:-644}" "$CANDSRC/$src" "/opt/pdg-bot/$name" 2>/dev/null || return 1
+    install -m"${mode:-644}" "$CANDSRC/$src" "$R1_BOTDIR/$name" 2>/dev/null || return 1
     n=$((n+1))
   done < <(pdg_platform_modules "$plat")
   printf '%s\n' "$n"
@@ -1358,14 +1729,10 @@ A0_HIJ="$(sha256sum /etc/mosdns/rules/mitm_hijack.txt | awk '{print $1}')"
 A0_DNS="$(dns_feature_probe A0-before)"
 note "A0: 前像的 DNS 观测 = $A0_DNS"
 [[ "$A0_DNS" == VALID* ]] || bad "A0: 前像的 DNS 观测本身就无效 —— $A0_DNS"
-# 装候选(测试前置), 并把部署身份与历史残留**分开**核验
-install_candidate ios >/dev/null || bad "A0: 装候选失败"
-switch_repo_to_candidate ios >/dev/null 2>&1 || true
-systemctl daemon-reload
-assert_candidate_identity ios
-echo
-echo "── 只跑新版 __migrate(不带前像句柄, 正是旧 CLI 子进程的形态) ──"
-MG="$(bash /usr/local/bin/pdg __migrate 2>&1)"; MGRC=$?
+# 装候选(测试前置), 并把部署身份与历史残留**分开**核验 —— 341: 连同 __migrate 一起收进 r1_a0_invoke, 任一前置不成立就不调用
+if ! r1_a0_invoke; then
+  nrun "场景 A0: 未调用 __migrate —— $R1_GATE_WHY"
+else
 printf '%s\n' "$MG" | _ev 03-A0-migrate.log
 _evn 03-A0-migrate.log "### rc=$MGRC"
 echo "$MG" | tail -30 | sed 's/^/    /'
@@ -1394,6 +1761,7 @@ else
   note "A0-3: 仪器没有通过标定, 本段本不该走到这里。实测留档: $A0_DNS → $A0_DNS_AFTER"
 fi
 ss -lnt 2>/dev/null | grep -q ':7894 ' && ok "A0-3: 7894 仍有监听" || bad "A0-3: 7894 没有监听"
+fi
 fi
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1430,7 +1798,7 @@ residue_record /etc/privdns-gateway/mitm.json      "旧版 WLOC 配置(enabled=t
 residue_record /etc/privdns-gateway/ios-profile.json "旧版 schema-1 记录"
 residue_report
 snap_state A-before
-fp_capture A-before
+fp_capture A-before || note "A: 调用前采样没有完成 —— $R1_WHY(随后的前置门据此不调用)"
 svc_snapshot "$E2E_TMP/svc-A-before.tsv"
 A_DNS_BEFORE="$(dns_feature_probe A-before)"
 note "A: 前像的 DNS 观测 = $A_DNS_BEFORE"
@@ -1440,32 +1808,30 @@ if [[ "$PREIMAGE_OK" != 1 ]]; then
   nrun "场景 A: 前像不成立, 本场景未执行(既不算通过也不算产品失败)"
 else
 
-PDG_SHA_BEFORE="$(sha256sum /usr/local/bin/pdg | awk '{print $1}')"
-OLD_PDG_SHA="$(sha256sum "$OLDSRC/deploy/bot/pdg.sh" | awk '{print $1}')"
-[[ "$PDG_SHA_BEFORE" == "$OLD_PDG_SHA" ]] \
-  && ok "A: 升级前 /usr/local/bin/pdg 逐字节等于 v1.11.15 的 deploy/bot/pdg.sh(更新器确实是原版)" \
-  || bad "A: 更新器不是原版(装的 $PDG_SHA_BEFORE vs 旧版 $OLD_PDG_SHA)"
+# 341: 原来这里按 OLDSRC 的 sha256 核"更新器是原版", 不成立只打 FAIL 仍照常升级; 现并入 r1_a_invoke 的旧版身份门
+#      (CLI 与 OLD_SHA 同一对象 + 仓库 HEAD == OLD_SHA), 连同来源与调用前必需观测, 任一不成立就不调用。
 MITM_INV_BEFORE="$(systemctl show -p InvocationID --value pdg-mitm 2>/dev/null)"
 MITM_PID_BEFORE="$(systemctl show -p MainPID --value pdg-mitm 2>/dev/null)"
 MITM_NR_BEFORE="$(systemctl show -p NRestarts --value pdg-mitm 2>/dev/null)"
 note "A: 前像里 pdg-mitm  MainPID=$MITM_PID_BEFORE  InvocationID=$MITM_INV_BEFORE  NRestarts=$MITM_NR_BEFORE"
 JSTART="$(date -u +%FT%T)"
 
+if ! r1_a_invoke; then
+  nrun "场景 A: 未执行正式升级 —— $R1_GATE_WHY(dry-run 与 update 都没有调用)"
+else
+svc_snapshot "$E2E_TMP/svc-A-after.tsv"
 echo "── 旧 CLI 的 dry-run(先看它怎么判关系) ──"
-DRY="$(bash /usr/local/bin/pdg update --dry-run 2>&1)"; DRC=$?
 printf '%s\n' "$DRY" | _ev 03-A-dryrun.txt
 echo "$DRY" | sed 's/^/    /' | head -20
 [[ "$DRC" == 0 ]] && ok "A: dry-run rc=0" || bad "A: dry-run rc=$DRC"
 grep -q "$TEST_TAG" <<<"$DRY" && ok "A: dry-run 认出目标是本轮的测试候选 tag" || bad "A: dry-run 没认出目标 tag"
 
 echo; echo "── 真正跑**原版** pdg update(它会取件、装候选、调新版 __migrate, 被拒后调自己的 cmd_rollback) ──"
-UP="$(bash /usr/local/bin/pdg update 2>&1)"; URC=$?
-svc_snapshot "$E2E_TMP/svc-A-after.tsv"
 printf '%s\n' "$UP" | _ev 03-A-update.log
 _evn 03-A-update.log "### 原始升级退出码 rc=$URC"
 echo "$UP" | tail -60 | sed 's/^/    /'
 snap_state A-after
-fp_capture A-after
+fp_capture A-after || note "A: 回滚后采样没有完成 —— $R1_WHY(A-4 各项因此未取得)"
 state_diff A-before A-after A
 
 echo
@@ -1516,18 +1882,29 @@ note "A-3: 原版回滚跑在**同一个旧 bash 进程**里(函数体在定义�
 note "     上面那条判据是它在真机上的独立佐证。"
 
 echo
-echo "── A-4. 原版回滚的四维结果(逐项比对前像) ──"
+echo "── A-4. 原版回滚的四维结果(逐项比对前像; 真实不同与观测无效 / 缺记录分开记) ──"
+A4_RESTORED=(); A4_DIFFER=(); A4_NOTOBT=()
 fp_cmp_files A-before A-after "A-4 文件"
 for u in "${FP_SVCS[@]}"; do
-  b="$(fp_get A-before S "$u" | cut -f1)"; a="$(fp_get A-after S "$u" | cut -f1)"
-  eb="$(fp_get A-before S "$u" | cut -f2)"; ea="$(fp_get A-after S "$u" | cut -f2)"
-  if [[ "$b" == "$a" ]]; then ok "A-4 运行态: $u 回到前像($a)"; else bad "A-4 运行态: $u 前像=$b 现在=$a"; fi
-  if [[ "$eb" == "$ea" ]]; then ok "A-4 自启态: $u 回到前像($ea)"; else bad "A-4 自启态: $u 前像=$eb 现在=$ea"; fi
+  r1_fp_item A-before A-after S "$u" 1
+  case $? in
+    0) ok "A-4 运行态: $u 回到前像($FP_A)"; r1_tally ok "运行态 $u";;
+    1) bad "A-4 运行态: $u 前像=$FP_B 现在=$FP_A"; r1_tally diff "运行态 $u";;
+    *) bad "A-4 运行态: $u 前后观测无效或缺记录($FP_WHY) —— 未取得"; r1_tally na "运行态 $u";;
+  esac
+  r1_fp_item A-before A-after S "$u" 2
+  case $? in
+    0) ok "A-4 自启态: $u 回到前像($FP_A)"; r1_tally ok "自启态 $u";;
+    1) bad "A-4 自启态: $u 前像=$FP_B 现在=$FP_A"; r1_tally diff "自启态 $u";;
+    *) bad "A-4 自启态: $u 前后观测无效或缺记录($FP_WHY) —— 未取得"; r1_tally na "自启态 $u";;
+  esac
 done
-L7894_B="$(fp_get A-before L 7894)"; L7894_A="$(fp_get A-after L 7894)"
-[[ "$L7894_B" == "$L7894_A" ]] \
-  && ok "A-4 已加载配置(独立依据): 7894 的真实监听数与前像一致($L7894_A) —— 服务确实在按恢复出来的配置提供服务" \
-  || bad "A-4 已加载配置: 7894 监听数 前像=$L7894_B 现在=$L7894_A"
+r1_fp_item A-before A-after L 7894
+case $? in
+  0) ok "A-4 已加载配置(独立依据): 7894 的真实监听数与前像一致($FP_A) —— 服务确实在按恢复出来的配置提供服务"; r1_tally ok "7894 监听";;
+  1) bad "A-4 已加载配置: 7894 监听数 前像=$FP_B 现在=$FP_A"; r1_tally diff "7894 监听";;
+  *) bad "A-4 已加载配置: 7894 监听数观测无效或缺记录($FP_WHY) —— 未取得"; r1_tally na "7894 监听";;
+esac
 # 产品自己写下的前像与测试指纹逐项对账(两边必须看到同一件事)
 A_SNAP="$(ls -1dt "${SNAP_DIR:-/var/lib/privdns-gateway/backups}"/* 2>/dev/null | head -1)"
 if [[ -n "$A_SNAP" && -s "$A_SNAP/svcstate.tsv" ]]; then
@@ -1543,8 +1920,13 @@ else
   note "A-4: 仪器没有通过标定, 本场景本不该走到这里。实测留档:"
   note "  前像 $A_DNS_BEFORE"; note "  恢复后 $A_DNS_AFTER"
 fi
-L53_B="$(fp_get A-before L 53)"; L53_A="$(fp_get A-after L 53)"
-[[ "$L53_B" == "$L53_A" ]] && ok "A-4(辅助) 53/udp 监听数与前像一致($L53_A)" || bad "A-4(辅助) 53 监听 $L53_B → $L53_A"
+r1_dns_tally "$A_DNS_BEFORE" "$A_DNS_AFTER"   # 341: 判词仍由上面 dns_verdict 给; 这里只把 DNS 这一项记进本场景的恢复账
+r1_fp_item A-before A-after L 53
+case $? in
+  0) ok "A-4(辅助) 53/udp 监听数与前像一致($FP_A)"; r1_tally ok "53 监听";;
+  1) bad "A-4(辅助) 53 监听 $FP_B → $FP_A"; r1_tally diff "53 监听";;
+  *) bad "A-4(辅助) 53 监听数观测无效或缺记录($FP_WHY) —— 未取得"; r1_tally na "53 监听";;
+esac
 if command -v dig >/dev/null 2>&1; then
   DR="$(dig +time=3 +tries=1 @127.0.0.1 example.com A 2>&1 | head -20)"
   printf '%s\n' "$DR" | _ev 03-A-dig.txt
@@ -1552,6 +1934,12 @@ if command -v dig >/dev/null 2>&1; then
     && ok "A-4(辅助) 本机 53 真的能应答(status=$(grep -o 'status: [A-Z]*' <<<"$DR" | head -1)) —— 只说明解析器活着, **不**说明加载的是哪一份配置" \
     || note "A-4(辅助) 本机 53 未能应答(runner 出网受限时属预期, 已留证不作判据)"
 fi
+
+echo
+echo "── A-4b. 回滚后的旧版身份(独立结算; 不以产品「仓库已复位」的文案代替) ──"
+r1_old_identity "A-4b 回滚后"
+r1_tally "$R1_ID_CLI" "身份 $R1_CLI"; r1_tally "$R1_ID_HEAD" "身份 $REPO HEAD"
+note "A-4 / A-4b 小计(本场景已检查范围): 已恢复 ${#A4_RESTORED[@]} / 未恢复 ${#A4_DIFFER[@]} / 未取得 ${#A4_NOTOBT[@]}"
 
 echo
 echo "── A-5. 服务动作对账(原版回滚允许它重启服务, 这里逐项列明) ──"
@@ -1566,9 +1954,10 @@ _evn 03-A-update.log "### 原始升级 rc=$URC"
 RB_LINE="$(grep -E '✅ 已回滚并重启服务|已回滚配置/服务.*未完全回滚' <<<"$UP" | head -1)"
 note "A-6: 回滚收尾文字: ${RB_LINE:-<没有>}"
 _evn 03-A-update.log "### 回滚收尾文字: ${RB_LINE:-<没有>}"
-if grep -q '✅ 已回滚并重启服务' <<<"$UP"; then
-  # 原版回滚自报完全成功 —— 那么上面四维必须真的全回来; 若没有, 那是**产品缺陷**, 如实留证。
-  note "A-6: 原版回滚自报「已回滚并重启服务」。四维结果以上面 A-4 的逐项判据为准。"
+
+echo
+echo "── A-7. 回滚报告与现场(与 A-4 的恢复结论分开结算; 只用本场景的有效观测) ──"
+r1_report_verdict
 fi
 fi
 
