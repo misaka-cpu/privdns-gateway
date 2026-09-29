@@ -577,6 +577,9 @@ PREIMAGE_OK=1     # 每次 build_preimage 复位; 任一前像判据不成立即
 build_preimage(){   # $1 = ios|android   $2 = wloc on|off|caonly
   local plat="$1" wloc="$2"
   PREIMAGE_OK=1
+  # 346: 重建前像会重新播种 mosdns(下面的 e2e_seed_mosdns all), 之前任何场景建立的 DNS 条件与标定随之失效 ——
+  #      先作废, 由本场景自己重新建立(r1_dns_premise); 不继承上一场景的成功标志(345: A0 的标定放行了 A)。
+  r1_dns_invalidate
   reset_units_strict || bad "逐项复位过程中有动作未达预期(详见上面的逐条记录)"
   e2e_reset_box
   reset_proof "进入 $plat/$wloc 之前"
@@ -852,22 +855,29 @@ assert_preimage_A(){
   # 前像判据按**真实 schema** 取位置: 输入在 current.inputs, 顶层根本没有 inputs。
   # 而且要求 SSID 意图**确实非空**才算前像成立 —— 空名单与"字段不存在"都不算。
   # 不允许出现 None == None 那种"两边都读不到所以相等"的通过方式。
-  python3 - <<'PY'
+  # 346: 这段 python 以前自己定义 ok()/bad(), 只打印、不进计数, 判 FAIL 也不让前像不成立(345: [OK] 行 121 条对"通过 119")。
+  #      现在它只输出**一行**结构化结论(R1PY<TAB>种类<TAB>说明), 由外层按"退出码 + 结论行"一起结算:
+  #      业务相符 = 0 + OK; 业务不符 = 10 + FAIL; 读不到记录 = 11 + READFAIL。其它退出码(未捕获的异常、被杀)、
+  #      结论行缺失 / 不止一行 / 与退出码对不上, 一律按"自检异常"判失败。三种失败都让前像不成立(随后的产品调用不执行)。
+  local pyf="${E2E_TMP:-/tmp}/r1-preimage-py.out" pyrc pyn pyl pyk pyt grc
+  python3 - > "$pyf" 2>&1 <<'PY'
 import json, sys
-def ok(t):  print("[OK]   " + t)
-def bad(t): print("[FAIL] " + t)
+def emit(kind, text, code):
+    sys.stdout.write("R1PY\t%s\t%s\n" % (kind, str(text).replace("\t", " ").replace("\n", " ")))
+    sys.stdout.flush()
+    sys.exit(code)
 try:
     m = json.load(open("/etc/privdns-gateway/ios-profile.json", encoding="utf-8"))
 except Exception as e:
-    bad("前像: 读不到 iOS 记录: %s" % e); sys.exit(0)
+    emit("READFAIL", "读不到 iOS 记录: %s" % e, 11)
 if "inputs" in m:
-    bad("前像: 顶层出现了 inputs 字段, 与 schema 1 契约不符"); sys.exit(0)
+    emit("FAIL", "顶层出现了 inputs 字段, 与 schema 1 契约不符", 10)
 cur = m.get("current")
 if not isinstance(cur, dict):
-    bad("前像: current 不是记录对象(实得 %s) —— 前像不成立" % type(cur).__name__); sys.exit(0)
+    emit("FAIL", "current 不是记录对象(实得 %s)" % type(cur).__name__, 10)
 inp = cur.get("inputs")
 if not isinstance(inp, dict):
-    bad("前像: current.inputs 不存在 —— 前像不成立"); sys.exit(0)
+    emit("FAIL", "current.inputs 不存在", 10)
 fail = []
 if m.get("schema") != 1:               fail.append("schema=%r(应为 1)" % m.get("schema"))
 if inp.get("wloc_enabled") is not True: fail.append("current.inputs.wloc_enabled=%r(应为 True)" % inp.get("wloc_enabled"))
@@ -876,10 +886,25 @@ ss = inp.get("ssids")
 if not (isinstance(ss, list) and len(ss) > 0):
     fail.append("SSID 意图不是非空列表(实得 %r)" % (ss,))
 if fail:
-    bad("前像: iOS 记录形态不对 —— " + "; ".join(fail))
-else:
-    ok("前像: iOS 记录是 schema 1, current.inputs 带 WLOC 字段与 CA 指纹, 且 SSID 意图非空(%r)" % (ss,))
+    emit("FAIL", "; ".join(fail), 10)
+emit("OK", "iOS 记录是 schema 1, current.inputs 带 WLOC 字段与 CA 指纹, 且 SSID 意图非空(%r)" % (ss,), 0)
 PY
+  pyrc=$?
+  pyn="$(grep -c '^R1PY' "$pyf" 2>/dev/null)"; grc=$?
+  if (( grc > 1 )) || [[ ! "$pyn" =~ ^[0-9]+$ ]]; then
+    bad "前像: iOS 记录自检的输出读不回(grep 退出 $grc) —— 前像不成立"; PREIMAGE_OK=0
+  elif (( pyn != 1 )); then
+    bad "前像: iOS 记录自检异常(退出 $pyrc, 结论行 $pyn 条; 末尾输出: $(tail -2 "$pyf" 2>/dev/null | tr '\n' ' ')) —— 前像不成立"; PREIMAGE_OK=0
+  else
+    pyl="$(grep '^R1PY' "$pyf" 2>/dev/null)"; grc=$?
+    IFS=$'\t' read -r _ pyk pyt <<<"$pyl"
+    case "$grc:$pyrc:$pyk" in
+      0:0:OK)        ok "前像: $pyt";;
+      0:10:FAIL)     bad "前像: iOS 记录形态不对 —— $pyt; 前像不成立"; PREIMAGE_OK=0;;
+      0:11:READFAIL) bad "前像: $pyt —— 观测无效, 前像不成立"; PREIMAGE_OK=0;;
+      *)             bad "前像: iOS 记录自检异常(退出 $pyrc, 结论 [${pyk:-无}], 读取 $grc) —— 前像不成立"; PREIMAGE_OK=0;;
+    esac
+  fi
   local art=/var/lib/privdns-gateway/ios-profile/current.mobileconfig
   if [[ -s "$art" ]]; then
     grep -q 'com.apple.security.root' "$art" \
@@ -892,73 +917,198 @@ PY
 
 
 
-# ── 服务动作的**执行前**允许清单 ────────────────────────────────────────────
-# 清单在这里(源码里)就定死, 不是跑完看到哪个变了再补进来; 也不是"X 源码里可能出现的
-# 服务动作一律准许" —— 下面每一条都写明来自 run_all_migrations 的哪一支、为什么会动。
-# 依据: 冻结候选 X 的 run_all_migrations 调用链 + 本场景的输入条件
-# (一台按 v1.11.15 形态播种、从未跑过新迁移的老机器)。
-svc_class(){   # $1=unit → 打印 "<类别>|<原因>"
-  case "$1" in
-    mosdns)
-      printf '正常首次迁移|migrate_lowmem 归一 cache size / migrate_mosdns_{concurrent,unlock,ratelimit,hijack_shape,explicit_proxy} / migrate_dotwitness 受管路由 / migrate_adblock 受管块 —— 这些都要让解析器带新配置起来';;
-    mihomo)
-      printf '正常首次迁移|migrate_mosdns_mitm 与 migrate_wloc_retire 撤掉 MITM 路由后重渲内核; migrate_ios_gms_cleanup 同步内核配置';;
-    pdg-bot|pdg-probe81)
-      printf '正常首次迁移|migrate_deploy_botfiles 更新运行模块后重启(probe81 另有 migrate_probe81_public 补公共件 unit)';;
-    pdg-dotwitness)
-      printf '正常首次迁移|migrate_dotwitness 首次就位并启用';;
-    pdg-health.timer|pdg-health.service)
-      printf '正常首次迁移|migrate_health_timer 重新排程';;
-    pdg-mitm)
-      printf 'WLOC 退役专属|migrate_wloc_retire: 停止 + 禁用 + 删除 unit';;
-    *)
-      printf '意外|不在执行前确定的允许清单里';;
-  esac
-}
-# 被观察的服务集合: 允许清单里的 + 几个**本轮从不安装、因此绝不该变**的见证者。
+# ── ① 专用的服务动作依据(346)─────────────────────────────────────────────
+# 以前这里沿用正常迁移链(run_all_migrations)的分类与理由: 于是 ① 里旧回滚对 pdg-mitm 的那次重启被记成
+# 「WLOC 退役专属」并打了"确实发生"的 OK; 而前后快照相同的短暂启动(345: pdg-bot 被旧回滚拉起后自行退出)根本看不见。
+# 现在的依据是**冻结旧版 cmd_update / cmd_rollback 在本场景条件下的执行路径**(行号是 v1.11.15 的 deploy/bot/pdg.sh):
+#   · 旧 update 在调 __migrate(2167)之前不启停任何服务; 候选 __migrate 在迁移链之前就拒绝, 路径上只有只读查询;
+#   · 随后的旧 cmd_rollback: 1487 enable --now mihomo(已 active 不重启)、1492 restart mosdns pdg-bot pdg-probe81、
+#     1493 自启为 enabled 时 reset-failed + restart pdg-mitm、1494 restart systemd-journald(不在观测集合内);
+#   · 2195–2197 的 enable / restart 在 __migrate 失败后到不了, 不计入。
+# 写法: [unit]="Started 上限 Stopped 上限|出处与说明"。不是按 345 实际看到的变化倒补的。
+declare -A R1_SVC_BASIS=(
+  [mosdns]="1 1|旧回滚 1492 行 restart mosdns"
+  [pdg-bot]="1 1|旧回滚 1492 行 restart pdg-bot(前像停用 ⇒ 表现为一次启动; 凭据为空时进程自行退出属其后果)"
+  [pdg-probe81]="1 1|旧回滚 1492 行 restart pdg-probe81"
+  [pdg-mitm]="1 1|旧回滚 1493 行: 自启为 enabled 时 reset-failed + restart —— 旧回滚的既有重启, 不是退役动作"
+  [mihomo]="0 0|旧回滚 1487 行 enable --now mihomo: 前像已 active, 不重启"
+  [pdg-dotwitness]="0 0|执行路径上没有它的启停"
+  [pdg-health.timer]="0 0|旧 update 只装了 unit 文件; enable 那一步(2195)在 __migrate 失败后到不了"
+  [sing-box]="0 0|disable --now sing-box 对不存在的 unit 没有启停"
+  [pdg-rescue.socket]="0 0|本测试从不安装"
+  [ssh]="0 0|本测试从不触碰"
+  [cron]="0 0|本测试从不触碰"
+)
+# 被观察的服务集合: 依据里的 + 几个**本轮从不安装、因此绝不该变**的见证者。
 SVC_WATCH=(mosdns mihomo pdg-bot pdg-probe81 pdg-dotwitness pdg-health.timer pdg-mitm
            sing-box pdg-rescue.socket ssh cron)
-svc_snapshot(){   # $1=落点文件
-  local u
-  : > "$1"
+# 347: A-5 的实例交叉核对直接读这份快照, 所以每个属性查询都核退出码(失败 / 输出不止一行 ⇒ 该字段记 FP_BAD, 失败前的输出不采信);
+#      先在内存里拼好, 删旧件后一次写出、读回核行数, 三步都成才记 SVC_SNAP_DONE[文件]=1(与 342 的 FP_DONE 同一做法)。
+#      合法的空值照原样记(不存在 / 未运行的 unit 没有 InvocationID), 不与查询失败混在一起。
+declare -A SVC_SNAP_DONE=()
+svc_snapshot(){   # $1=落点文件 → 0 写出并读回完成 / 2 未完成
+  local u p v rc line buf="" nl=0 got TAB=$'\t'
+  SVC_SNAP_DONE[$1]=0
   for u in "${SVC_WATCH[@]}"; do
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$u" \
-      "$(systemctl show -p ActiveState  --value "$u" 2>/dev/null)" \
-      "$(systemctl show -p SubState     --value "$u" 2>/dev/null)" \
-      "$(systemctl show -p UnitFileState --value "$u" 2>/dev/null)" \
-      "$(systemctl show -p MainPID      --value "$u" 2>/dev/null)" \
-      "$(systemctl show -p InvocationID --value "$u" 2>/dev/null)" \
-      "$(systemctl show -p NRestarts    --value "$u" 2>/dev/null)" >> "$1"
+    line="$u"
+    for p in ActiveState SubState UnitFileState MainPID InvocationID NRestarts; do
+      v="$(systemctl show -p "$p" --value "$u" 2>/dev/null)"; rc=$?
+      { (( rc == 0 )) && [[ "$v" != *$'\n'* && "$v" != *"$TAB"* ]]; } || v="$FP_BAD"
+      line+="$TAB$v"
+    done
+    buf+="$line"$'\n'; nl=$((nl+1))
+  done
+  rm -f -- "$1" 2>/dev/null
+  [[ ! -e "$1" && ! -L "$1" ]] || return 2
+  printf '%s' "$buf" > "$1" 2>/dev/null || return 2
+  got="$(wc -l < "$1" 2>/dev/null)"; rc=$?
+  { (( rc == 0 )) && [[ "$got" =~ ^[[:space:]]*[0-9]+[[:space:]]*$ ]] && (( got == nl )); } || return 2
+  SVC_SNAP_DONE[$1]=1
+  return 0
+}
+# 347: 从快照里取某个 unit 的 InvocationID —— 0 取得(R1_SV, 可以是合法的空) / 2 取不到(R1_WHY: 快照未完成 / 读不回 / 缺行或重复 / 结构不完整 / 查询失败)
+R1_SV=""
+r1_svc_inv(){   # $1=快照文件 $2=unit
+  local out rc n nf v TAB=$'\t'
+  R1_SV=""
+  [[ "${SVC_SNAP_DONE[$1]:-0}" == 1 ]] || { R1_WHY="快照没有在本次运行里写出完成"; return 2; }
+  out="$(awk -F"$TAB" -v u="$2" '$1==u {n++; nf=NF; v=$6} END {printf "R1SV%s%d%s%d%s%s\n", FS, n, FS, nf, FS, v}' "$1" 2>/dev/null)"; rc=$?
+  { (( rc == 0 )) && [[ "$out" == "R1SV$TAB"* ]]; } || { R1_WHY="快照读不回(awk 退出 $rc)"; return 2; }
+  out="${out#"R1SV$TAB"}"; n="${out%%"$TAB"*}"; out="${out#*"$TAB"}"; nf="${out%%"$TAB"*}"; v="${out#*"$TAB"}"
+  [[ "$n" == 1 ]] || { R1_WHY="快照里 $2 有 ${n:-?} 行(应恰 1 行)"; return 2; }
+  [[ "$nf" == 7 ]] || { R1_WHY="快照里 $2 那一行结构不完整(${nf:-?} 个字段, 应为 7)"; return 2; }
+  [[ "$v" != "$FP_BAD" ]] || { R1_WHY="$2 的 InvocationID 查询失败"; return 2; }
+  R1_SV="$v"
+}
+# 346: 窗口 = 调用前取得的 journal 游标之后(r1_a_invoke 里, 所有前置门都过了之后才取), 到调用一返回就逐 unit 查询的那一刻。
+#      游标取不到 / 查询失败 ⇒ 该窗口记录未取得, 不当成"没有动作"。
+R1_JCUR=""; R1_JCUR_WHY=""
+r1_jcursor(){   # → 0 取得(R1_JCUR) / 2 未取得(R1_JCUR_WHY)
+  local out rc c re='^[A-Za-z0-9=;_-]+$'
+  R1_JCUR=""; R1_JCUR_WHY=""
+  out="$(journalctl -q -n 1 --show-cursor --no-pager -o short-iso 2>/dev/null)"; rc=$?
+  (( rc == 0 )) || { R1_JCUR_WHY="取窗口起点的 journal 查询退出 $rc"; return 2; }
+  c="$(sed -n 's/^-- cursor: //p' <<<"$out")"; rc=$?
+  (( rc == 0 )) || { R1_JCUR_WHY="提取游标的 sed 退出 $rc(已输出的内容不采信)"; return 2; }   # 347
+  c="${c##*$'\n'}"
+  [[ "$c" =~ $re ]] || { R1_JCUR_WHY="取不到窗口起点的游标(输出里没有有效的 cursor 行)"; return 2; }
+  R1_JCUR="$c"
+}
+# 347: 查询的原始退出码、证据写出是否完成、证据读取是否有效分开核: 先删旧件(删不掉就不写), 查询结果落内存再写文件, 退出码另写一份;
+#      都成才记 R1WIN_W[场景/unit]=1。A-5 只读本次运行里写出完成的那几份 —— 上一次留下的旧件不采信。
+declare -A R1WIN_W=()
+r1_svc_collect(){   # $1=场景名 —— 调用一返回就逐 unit 取窗口内的 journal, 原样落到 $E2E_TMP(判定在 A-5)
+  local u o f out qrc
+  [[ -n "$R1_JCUR" ]] || return 0
+  for u in "${SVC_WATCH[@]}"; do
+    R1WIN_W[$1/$u]=0; o="$E2E_TMP/r1win-$1-$u.out"; f="$E2E_TMP/r1win-$1-$u.rc"
+    rm -f -- "$o" "$f" 2>/dev/null
+    { [[ ! -e "$o" && ! -e "$f" ]]; } || continue
+    out="$(journalctl -q --no-pager -o short-iso --after-cursor="$R1_JCUR" -u "$u" 2>/dev/null)"; qrc=$?
+    { [[ -z "$out" ]] || printf '%s\n' "$out"; } > "$o" 2>/dev/null || continue
+    printf '%s\n' "$qrc" > "$f" 2>/dev/null || continue
+    R1WIN_W[$1/$u]=1
   done
 }
-svc_verdict(){   # $1=before  $2=after  $3=场景名
-  # 用 awk 按**字段**取行, 不用 grep -P: PCRE 不是哪儿都有, 而它一旦不可用, 这里会静默
-  # 变成"两边都取不到 ⇒ 没有变化", 那正是最难发现的一种假绿。
-  local u b a cls reason n_norm=0 n_wloc=0 n_un=0 unexpected="" TAB
-  TAB="$(printf '\t')"
-  echo "── 服务动作对账($3): 逐项前后证据 ──"
-  while IFS="$TAB" read -r u _ _ _ _ _ _; do
-    b="$(awk -F"$TAB" -v u="$u" '$1==u' "$1" | head -1)"
-    a="$(awk -F"$TAB" -v u="$u" '$1==u' "$2" | head -1)"
-    [[ -n "$b" && -n "$a" ]] || { bad "$3: 取不到 $u 的前后快照行(对账失效)"; continue; }
-    [[ "$b" == "$a" ]] && continue
-    cls="$(svc_class "$u")"; reason="${cls#*|}"; cls="${cls%%|*}"
-    printf '    %-20s %s\n      前: %s\n      后: %s\n      原因: %s\n' \
-      "$u" "[$cls]" "${b#*"$TAB"}" "${a#*"$TAB"}" "$reason"
-    case "$cls" in
-      正常首次迁移) n_norm=$((n_norm+1));;
-      "WLOC 退役专属") n_wloc=$((n_wloc+1));;
-      *) n_un=$((n_un+1)); unexpected="$unexpected $u";;
-    esac
-  done < "$1"
-  printf '    小计: 正常首次迁移 %d / WLOC 退役专属 %d / **意外 %d**\n' "$n_norm" "$n_wloc" "$n_un"
-  _evn "07-service-actions-$3.txt" "正常=$n_norm WLOC=$n_wloc 意外=$n_un;$unexpected"
+# 346: 服务动作分三件事表述 —— 终态(A-4 已逐项判)、实例变化(前后 MainPID / InvocationID, 只作描述与交叉核对)、
+#      窗口内实际记录到的启停(判据, 对照上面的依据)。逐 unit 结算: 符合依据 / 超出依据(意外) / 未取得:
+#   · 只认 PID 1(systemd[1])的记录; 单元自己进程的输出不算动作; 认不出的 PID 1 记录 ⇒ 该 unit 未取得(不猜);
+#   · Started / Stopped 按依据的上限; 停了没再起、失败、自动重启、重载都不在依据内; Deactivated 必须对应本窗口记录到的一次启或停;
+#   · 前后实例换了(InvocationID 都非空且不同)却没有记录到 Started ⇒ 记录不完整, 该 unit 未取得;
+#   · 348: 两次读取都有效之后, 前空后有 = "实例标识出现", 没有 Started 记录 ⇒ 未取得; 前有后空 = "实例标识消失", 没有同 unit 的结束记录
+#     (Stopped 或 Deactivated; 自行退出只记 Deactivated, 不要求 Stopped)⇒ 未取得。前后都合法为空只按窗口记录判, 不据此断言没有启动。
+#     有记录不等于获准: 上面的上限 / 失败 / 自动重启 / 重载判据照旧先判; 不从实例标识推断顺序、调用者或 enable / disable。
+#   · journal 不按 unit 记 enable / disable / reset-failed / daemon-reload, 所以结论只到"记录到的启停", 不宣称整个过程零意外。
+r1_svc_window(){   # $1=前快照 $2=后快照 $3=场景名 → 0 记录到的全部符合 / 1 有超出依据的 / 2 有未取得(且没有超出的)
+  local u rc crc out line msg ns nst nd nf nr nre no odd basis maxs maxt reason b a ib ia wb wa wi inst viol TAB f
+  local re_pid1='^[^ ]+ [^ ]+ systemd\[1\]: (.*)$' n_bad=0 n_na=0 bads="" nas="" chg="" same="" unk="" appear="" gone=""
+  TAB="$(printf '\t')"; f="07-service-window-$3.txt"
+  echo "── 服务动作($3): 窗口内实际记录到的启停(依据 = 冻结旧版在本场景条件下的执行路径, 不是正常迁移链) ──"
   cp "$1" "$EVID/svc-$3-before.tsv" 2>/dev/null; cp "$2" "$EVID/svc-$3-after.tsv" 2>/dev/null
   chmod 600 "$EVID/svc-$3-before.tsv" "$EVID/svc-$3-after.tsv" 2>/dev/null || true
-  [[ "$n_un" == 0 ]] && ok "$3: 服务动作全部落在执行前确定的允许清单内(意外 0)" \
-                     || bad "$3: 出现清单外的服务动作:$unexpected"
-  [[ "$n_wloc" -ge 1 ]] && ok "$3: WLOC 退役专属动作确实发生(pdg-mitm)" \
-                        || note "$3: 本场景没有 WLOC 退役专属动作(与前像条件是否一致, 见上文)"
+  if [[ -z "$R1_JCUR" ]]; then
+    _evn "$f" "窗口起点未取得: $R1_JCUR_WHY"
+    bad "$3 服务动作: 窗口起点未取得($R1_JCUR_WHY) —— 窗口内的启停记录全部未取得, 过程动作结论未取得"
+    return 2
+  fi
+  _evn "$f" "窗口起点游标: $R1_JCUR"
+  for u in "${SVC_WATCH[@]}"; do
+    basis="${R1_SVC_BASIS[$u]:-}"
+    if [[ -z "$basis" ]]; then n_na=$((n_na+1)); nas="$nas $u(没有写定的依据)"; printf '    %-18s 未取得: 没有写定的依据\n' "$u"; continue; fi
+    read -r maxs maxt <<<"${basis%%|*}"; reason="${basis#*|}"
+    if [[ "${R1WIN_W[$3/$u]:-0}" != 1 ]]; then   # 347: 只认本次运行里写出完成的窗口记录
+      _evn "$f" "## $u  窗口记录没有在本次运行里写出完成(旧件不采信)"
+      n_na=$((n_na+1)); nas="$nas $u(窗口记录没有写出完成)"; printf '    %-18s 未取得: 窗口记录没有在本次运行里写出完成(旧件不采信)\n' "$u"; continue
+    fi
+    rc="$(cat "$E2E_TMP/r1win-$3-$u.rc" 2>/dev/null)"; crc=$?
+    if (( crc != 0 )); then   # 347: 读退出码记录失败 ⇒ 已输出的内容不采信
+      _evn "$f" "## $u  退出码记录读不回(cat 退出 $crc)"
+      n_na=$((n_na+1)); nas="$nas $u(退出码记录读不回)"; printf '    %-18s 未取得: 退出码记录读不回(cat 退出 %s; 已输出的内容不采信)\n' "$u" "$crc"; continue
+    fi
+    if [[ ! "$rc" =~ ^[0-9]+$ ]] || (( rc != 0 )) || [[ ! -f "$E2E_TMP/r1win-$3-$u.out" ]]; then
+      _evn "$f" "## $u  journal 查询未取得(退出码记录=[${rc:-无}])"
+      n_na=$((n_na+1)); nas="$nas $u(journal 查询退出 ${rc:-未记录})"; printf '    %-18s 未取得: journal 查询退出 %s\n' "$u" "${rc:-未记录}"; continue
+    fi
+    out="$(cat "$E2E_TMP/r1win-$3-$u.out" 2>/dev/null)" || { n_na=$((n_na+1)); nas="$nas $u(窗口记录读不回)"; printf '    %-18s 未取得: 窗口记录读不回\n' "$u"; continue; }
+    { printf '## %s  journal 退出 0\n' "$u"; [[ -n "$out" ]] && printf '%s\n' "$out"; } | _ev "$f"
+    ns=0; nst=0; nd=0; nf=0; nr=0; nre=0; no=0; odd=""
+    while IFS= read -r line; do
+      [[ "$line" =~ $re_pid1 ]] || continue
+      msg="${BASH_REMATCH[1]}"
+      case "$msg" in
+        "Starting "*|"Stopping "*) ;;
+        "Started "*) ns=$((ns+1));;
+        "Stopped "*) nst=$((nst+1));;
+        *": Deactivated successfully.") nd=$((nd+1));;
+        *": Failed with result "*|"Failed to start "*) nf=$((nf+1));;
+        *": Scheduled restart job"*) nr=$((nr+1));;
+        "Reloading "*|"Reloaded "*) nre=$((nre+1));;
+        *": Consumed "*" CPU time"*) ;;
+        *) no=$((no+1)); odd="$odd [${msg:0:60}]";;
+      esac
+    done <<<"$out"
+    r1_svc_inv "$1" "$u"; ib=$?; b="$R1_SV"; wb="$R1_WHY"   # 347: 缺行 / 结构不完整 / 查询失败 / 快照未完成 ⇒ 取不到(不再降成"无从比较")
+    r1_svc_inv "$2" "$u"; ia=$?; a="$R1_SV"; wa="$R1_WHY"
+    if (( ib != 0 || ia != 0 )); then inst="取不到"; wi="$( ((ib)) && printf '前: %s; ' "$wb")$( ((ia)) && printf '后: %s' "$wa")"
+    elif [[ -n "$b" && -n "$a" && "$b" != "$a" ]]; then inst="换了"; chg="$chg $u"
+    elif [[ -n "$b" && "$b" == "$a" ]]; then inst="未换"; same="$same $u"
+    elif [[ -z "$b" && -n "$a" ]]; then inst="实例标识出现"; appear="$appear $u"   # 348
+    elif [[ -n "$b" && -z "$a" ]]; then inst="实例标识消失"; gone="$gone $u"     # 348
+    else inst="无从比较(前后都没有实例标识)"; unk="$unk $u"; fi
+    printf '    %-18s 记录: Started %s / Stopped %s / Deactivated %s / 失败 %s / 自动重启 %s / 重载 %s / 未识别 %s;  实例: %s\n' \
+      "$u" "$ns" "$nst" "$nd" "$nf" "$nr" "$nre" "$no" "$inst"
+    if (( no > 0 )); then n_na=$((n_na+1)); nas="$nas $u(有未识别的 PID 1 记录:$odd)"; printf '      → 未取得: 有未识别的 PID 1 记录%s\n' "$odd"; continue; fi
+    if [[ "$inst" == 取不到 ]]; then n_na=$((n_na+1)); nas="$nas $u(实例对照取不到: $wi)"; printf '      → 未取得: 前后快照的实例记录取不到(%s), 记录完整性无从交叉核对\n' "$wi"; continue; fi
+    viol=""
+    (( ns > maxs )) && viol="$viol Started $ns 次(依据至多 $maxs)"
+    (( nst > maxt )) && viol="$viol Stopped $nst 次(依据至多 $maxt)"
+    (( nst > ns )) && viol="$viol 停了 $nst 次却只起了 $ns 次"
+    (( nf > 0 )) && viol="$viol 失败 $nf 次"
+    (( nr > 0 )) && viol="$viol 自动重启 $nr 次"
+    (( nre > 0 )) && viol="$viol 重载 $nre 次"
+    (( nd > ns + nst )) && viol="$viol Deactivated $nd 次多于记录到的启停"
+    if [[ -n "$viol" ]]; then n_bad=$((n_bad+1)); bads="$bads $u:$viol"; printf '      → 超出依据:%s(依据: %s)\n' "$viol" "$reason"; continue; fi
+    if [[ "$inst" == 换了 ]] && (( ns == 0 )); then
+      n_na=$((n_na+1)); nas="$nas $u(实例换了却没有 Started 记录)"; printf '      → 未取得: 实例换了却没有记录到 Started —— 窗口记录不完整\n'; continue
+    fi
+    if [[ "$inst" == 实例标识出现 ]] && (( ns == 0 )); then   # 348
+      n_na=$((n_na+1)); nas="$nas $u(实例标识出现却没有 Started 记录)"; printf '      → 未取得: 实例标识出现, 窗口里却没有这个 unit 的 Started 记录 —— 过程证据不完整\n'; continue
+    fi
+    if [[ "$inst" == 实例标识消失 ]] && (( nst + nd == 0 )); then   # 348: 失败记录已在上面按超出依据判过
+      n_na=$((n_na+1)); nas="$nas $u(实例标识消失却没有结束记录)"; printf '      → 未取得: 实例标识消失, 窗口里却没有这个 unit 的结束记录(Stopped / Deactivated) —— 过程证据不完整\n'; continue
+    fi
+    if (( ns + nst + nd == 0 )); then printf '      → 符合依据: 窗口内没有记录到启停\n'
+    else printf '      → 符合依据: %s\n' "$reason"; fi
+  done
+  note "$3 实例变化(前后 InvocationID; 只作描述与交叉核对): 换了:${chg:- 无}; 未换:${same:- 无}; 出现:${appear:- 无}; 消失:${gone:- 无}; 前后都没有:${unk:- 无}"
+  (( n_bad > 0 )) && bad "$3 服务动作: 窗口内记录到依据之外的动作:$bads"
+  (( n_na > 0 )) && bad "$3 服务动作: 有 $n_na 个 unit 的窗口记录未取得:$nas —— 这些 unit 的过程动作结论未取得"
+  (( n_bad == 0 && n_na == 0 )) && ok "$3 服务动作: 窗口内 journal 记录到的启停都在 ① 依据之内(${#SVC_WATCH[@]} 个 unit 逐项见上)"
+  note "$3 服务动作: 结论只覆盖 journal 记录到的启停。enable / disable / reset-failed / daemon-reload 不按 unit 记录, 过程中是否发生取不到"
+  note "  (自启态只由 A-4 的终态比对覆盖); systemd-journald 在窗口内被旧回滚重启过(1494)。不宣称整个过程零意外。"
+  (( n_bad > 0 )) && return 1
+  (( n_na > 0 )) && return 2
+  return 0
 }
 
 # 342: A0 身份核对的直接依赖 —— 摘要、模块清单、逐文件比较都要"读取有效"才参与判定; 读不到 ≠ 不符 ≠ 相符。
@@ -1178,6 +1328,10 @@ DNS_CALIB_NAME=""
 DNS_STUB_PID=""
 DNS_RESTORE_DISK=0
 DNS_RESTORE_RUN=0
+DNS_PREMISE_SCENE=""   # 346: 当前 DNS 条件与标定属于哪个场景; 重建前像时清空(r1_dns_invalidate)
+DNS_PRE_WHY=""
+DNS_STUB_ID=""         # 346: 自有上游的登记身份(/proc/<pid>/cmdline, NUL 换成空格), 撤除前逐字核对
+DNS_STUB_LOG=""        # 346: 当前场景那一份上游日志(dns-up-<场景>.log); 上一场景的日志原样保留, 不覆盖
 
 # 一次查询的**完整**观测: 退出码 / DNS 状态 / 规范化答案 / stderr 首行。四样一起记一起判。
 dns_probe(){   # $1=域名 → "rc<TAB>status<TAB>answer<TAB>stderr首行"
@@ -1221,20 +1375,83 @@ dns_expect(){   # $1=域名 $2=期望答案 → 0/1, 失败时把原因写进 DN
   return 0
 }
 
-# 固定实验条件。只做一次; 做完之后甲乙两次测量之间上游、域名归属、监听地址都不再动。
-dns_fix_conditions(){
+# 346: 自有上游按场景**撤除后重起**, 不复用上一场景的进程, 也不在同一端口上直接再起一个:
+#   · 起新的之前先撤旧的。撤除只按登记的 PID, 且 /proc/<pid>/cmdline 必须与起的时候登记的逐字相同 —— 对不上就不杀, 判"未撤除";
+#   · 撤除后核端口已释放; 起之前端口仍有监听或查不了, 就不起(条件不成立);
+#   · 每个场景一份自己的日志与计数(dns-up-<场景>.*), 上一场景那份原样保留; 同名日志已存在就不起(不覆盖)。
+# 347: 读进程命令行要核退出码 —— 先输出(哪怕是相符的内容)再失败的那一次不采信; 空命令行也不算取得。
+DNS_STUB_CUR=""
+_dns_stub_cmdline(){   # $1=pid → 0 取得(DNS_STUB_CUR) / 2 读取失败
+  local out rc
+  DNS_STUB_CUR=""
+  out="$(tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null)"; rc=$?
+  { (( rc == 0 )) && [[ -n "$out" ]]; } || return 2
+  DNS_STUB_CUR="$out"
+}
+# 347: 端口查询三态 —— grep 出错(退出 ≥2)以前会落进"没有监听", 现在与 ss 失败一样记"查询失败"。
+_dns_port_busy(){   # → 0 端口有监听 / 1 确认无监听 / 2 查询失败
+  local out rc
+  out="$(ss -lnu 2>/dev/null)"; rc=$?
+  (( rc == 0 )) || return 2
+  grep -qE "[:.]${DNS_UP_PORT}[[:space:]]" <<<"$out"; rc=$?
+  case "$rc" in 0) return 0;; 1) return 1;; *) return 2;; esac
+}
+_dns_port_word(){ case "$1" in 0) printf '有监听';; 1) printf '确认无监听';; *) printf '查询失败';; esac; }
+dns_stub_stop(){   # → 0 已撤除(或本来就没有) / 1 未能确认撤除(DNS_CALIB_WHY)
+  local pid="$DNS_STUB_PID" cur i r=2
+  [[ -n "$pid" ]] || return 0
+  if kill -0 "$pid" 2>/dev/null; then
+    if ! _dns_stub_cmdline "$pid"; then
+      DNS_CALIB_WHY="登记的自有上游 PID $pid 的命令行读取失败(已输出的内容不采信) —— 身份未取得, 不杀, 未撤除"; return 1
+    fi
+    cur="$DNS_STUB_CUR"
+    [[ -n "$DNS_STUB_ID" && "$cur" == "$DNS_STUB_ID" ]] \
+      || { DNS_CALIB_WHY="登记的自有上游 PID $pid 身份对不上(登记 [${DNS_STUB_ID:0:100}] / 现在 [${cur:0:100}]) —— 不杀, 未撤除"; return 1; }
+    kill "$pid" 2>/dev/null || { DNS_CALIB_WHY="向自有上游 PID $pid 发信号失败"; return 1; }
+  fi
+  wait "$pid" 2>/dev/null
+  for ((i=0; i<25; i++)); do
+    _dns_port_busy; r=$?
+    (( r == 1 )) && break
+    sleep 0.2
+  done
+  (( r == 1 )) || { DNS_CALIB_WHY="撤除自有上游后端口 $DNS_UP_PORT 仍有监听或查不了(结果 $r) —— 端口查询: $(_dns_port_word "$r")"; return 1; }
+  DNS_STUB_PID=""; DNS_STUB_ID=""
+  return 0
+}
+dns_stub_start(){   # $1=场景 → 0 已起且身份已登记 / 1 不成立(DNS_CALIB_WHY)
+  local sc="$1" r
+  dns_stub_stop || return 1
+  _dns_port_busy; r=$?
+  (( r == 1 )) || { DNS_CALIB_WHY="起自有上游之前端口 $DNS_UP_PORT 已有监听或查不了(结果 $r) —— 不在同一端口上再起一个(端口查询: $(_dns_port_word "$r"))"; return 1; }
+  DNS_STUB_LOG="$E2E_TMP/dns-up-$sc.log"
+  [[ ! -e "$DNS_STUB_LOG" ]] || { DNS_CALIB_WHY="本场景的上游日志 $DNS_STUB_LOG 已经存在 —— 不覆盖, 不起"; return 1; }
+  "$E2E_ROOT/tests/helpers/dns-stub.py" --port "$DNS_UP_PORT" \
+      --count "$E2E_TMP/dns-up-$sc.count" --log "$DNS_STUB_LOG" \
+      --mode answer-a --answer "$DNS_U" > "$E2E_TMP/dns-up-$sc.out" 2>&1 &
+  DNS_STUB_PID=$!
+  sleep 1
+  kill -0 "$DNS_STUB_PID" 2>/dev/null \
+    || { DNS_CALIB_WHY="自有 DNS 上游没起来: $(tail -2 "$E2E_TMP/dns-up-$sc.out" 2>/dev/null)"; DNS_STUB_PID=""; return 1; }
+  if ! _dns_stub_cmdline "$DNS_STUB_PID"; then
+    DNS_STUB_ID=""; DNS_CALIB_WHY="自有上游 PID $DNS_STUB_PID 的命令行读取失败(已输出的内容不采信) —— 身份未取得, 不登记; 进程留在现场, 不按名字清理"; return 1
+  fi
+  DNS_STUB_ID="$DNS_STUB_CUR"
+  [[ "$DNS_STUB_ID" == *"dns-stub.py --port $DNS_UP_PORT "*"--log $DNS_STUB_LOG "* ]] \
+    || { DNS_CALIB_WHY="自有上游 PID $DNS_STUB_PID 的命令行不是本场景起的那一个([${DNS_STUB_ID:0:120}]) —— 不登记"; DNS_STUB_ID=""; return 1; }
+  _evn dns-calibration.txt "[$sc] 自有上游 PID $DNS_STUB_PID 已登记(日志 ${DNS_STUB_LOG##*/})"
+  return 0
+}
+
+# 固定实验条件。每个场景在自己的前像上做一次; 做完之后甲乙两次测量之间上游、域名归属、监听地址都不再动。
+dns_fix_conditions(){   # $1=场景
   local hij=/etc/mosdns/rules/mitm_hijack.txt cn=/etc/mosdns/rules/geosite_cn.txt
   local mc=/etc/mosdns/config.yaml
   command -v dig >/dev/null 2>&1 || { DNS_CALIB_WHY="机器上没有 dig"; return 1; }
   [[ -f "$mc" && -f "$hij" && -f "$cn" ]] || { DNS_CALIB_WHY="mosdns 配置或规则文件不齐"; return 1; }
   DNS_CALIB_NAME="dns-calib-$$-${RANDOM}.e2e.test"   # 每次新名字, 排除缓存带来的假差异
-  # ① 自有上游(本轮事先登记归属的资源: 退出时按 PID 清理, 不按名字宽杀)
-  "$E2E_ROOT/tests/helpers/dns-stub.py" --port "$DNS_UP_PORT" \
-      --count "$E2E_TMP/dns-up.count" --log "$E2E_TMP/dns-up.log" \
-      --mode answer-a --answer "$DNS_U" > "$E2E_TMP/dns-up.out" 2>&1 &
-  DNS_STUB_PID=$!
-  sleep 1
-  kill -0 "$DNS_STUB_PID" 2>/dev/null || { DNS_CALIB_WHY="自有 DNS 上游没起来: $(tail -2 "$E2E_TMP/dns-up.out" 2>/dev/null)"; return 1; }
+  # ① 自有上游(本轮事先登记归属的资源; 346: 按场景撤除后重起, 身份核对后才动, 不按名字宽杀)
+  dns_stub_start "$1" || return 1
   # ② local_upstream 整行换成自有可控端(上游列表里本来就有 {}, 用 [^}]* 会在第一个右括号停住)
   python3 - "$mc" "$DNS_UP_PORT" <<'PYUP'
 import re, sys
@@ -1255,21 +1472,21 @@ PYUP
   _dns_reload || return 1
   # 自证: 此刻对照名确实从自有上游拿到 U, 且上游日志里按名记到了它
   dns_expect "$DNS_CONTROL" "$DNS_U" || return 1
-  grep -q " q=$DNS_CONTROL " "$E2E_TMP/dns-up.log" \
-    || { DNS_CALIB_WHY="对照名答对了, 但自有上游日志里没有它 —— 答案不是上游给的"; return 1; }
-  ok "仪器条件: 自有上游已就位, 对照名 $DNS_CONTROL 经 local_upstream 取得 U=$DNS_U(上游日志按名可核)"
+  grep -q " q=$DNS_CONTROL " "$DNS_STUB_LOG" \
+    || { DNS_CALIB_WHY="对照名答对了, 但本场景的自有上游日志里没有它 —— 答案不是上游给的"; return 1; }
+  ok "仪器条件($1): 自有上游已就位, 对照名 $DNS_CONTROL 经 local_upstream 取得 U=$DNS_U(本场景上游日志按名可核)"
   return 0
 }
 
 # 标定: 同一个查询名, **只**让 mitm_hijack 里那一条变。U→H→U 三段都要有效且等于预期。
-dns_instrument_calibrate(){
-  local hij=/etc/mosdns/rules/mitm_hijack.txt
+dns_instrument_calibrate(){   # $1=场景(346: 条件、上游、日志、副本与证据都按场景分开)
+  local sc="$1" hij=/etc/mosdns/rules/mitm_hijack.txt
   local bak sum0 mode0 own0 sum1 mode1 own1 entry
   DNS_INSTRUMENT_OK=0; DNS_CALIB_WHY=""; DNS_RESTORE_DISK=0; DNS_RESTORE_RUN=0
-  dns_fix_conditions || { bad "仪器标定: 固定实验条件失败 —— $DNS_CALIB_WHY"; return 1; }
+  dns_fix_conditions "$sc" || { bad "仪器标定($sc): 固定实验条件失败 —— $DNS_CALIB_WHY"; return 1; }
   [[ "$DNS_U" != "$DNS_H" ]] || { bad "仪器标定: U 与 H 相同($DNS_U), 这组预期本身没有区分力"; return 1; }
   entry="full:$DNS_CALIB_NAME"
-  bak="${E2E_TMP:-${TMPDIR:-/tmp}}/hijack-calib.bak"
+  bak="${E2E_TMP:-${TMPDIR:-/tmp}}/hijack-calib-$sc.bak"
   cat "$hij" > "$bak" || { bad "仪器标定: 存不下接管表副本"; return 1; }
   sum0="$(sha256sum "$hij" | awk '{print $1}')"
   mode0="$(stat -c %a "$hij")"; own0="$(stat -c %u:%g "$hij")"
@@ -1307,15 +1524,15 @@ dns_instrument_calibrate(){
   _dns_reload || { _calib_fail; return 1; }
   local p_off p_on a_off a_on
   p_off="$(dns_probe "$DNS_CALIB_NAME")"
-  local up_off; up_off="$(grep -c " q=$DNS_CALIB_NAME " "$E2E_TMP/dns-up.log" 2>/dev/null | tr -d '\n')"
+  local up_off; up_off="$(grep -c " q=$DNS_CALIB_NAME " "$DNS_STUB_LOG" 2>/dev/null | tr -d '\n')"
   # ── 配置乙: **只**多这一条条目, 其余一个字不动 ──
   printf '%s\n' "$entry" >> "$hij"
   _dns_reload || { _calib_fail; return 1; }
   p_on="$(dns_probe "$DNS_CALIB_NAME")"
-  local up_on; up_on="$(grep -c " q=$DNS_CALIB_NAME " "$E2E_TMP/dns-up.log" 2>/dev/null | tr -d '\n')"
-  _evn dns-calibration.txt "查询名 $DNS_CALIB_NAME(每次新造; 两次测量之间重启 mosdns 清缓存)"
-  _evn dns-calibration.txt "配置甲(不在接管表) rc/status/answer/stderr = $p_off  自有上游累计收到=$up_off"
-  _evn dns-calibration.txt "配置乙(在接管表)   rc/status/answer/stderr = $p_on   自有上游累计收到=$up_on"
+  local up_on; up_on="$(grep -c " q=$DNS_CALIB_NAME " "$DNS_STUB_LOG" 2>/dev/null | tr -d '\n')"
+  _evn dns-calibration.txt "[$sc] 查询名 $DNS_CALIB_NAME(每次新造; 两次测量之间重启 mosdns 清缓存)"
+  _evn dns-calibration.txt "[$sc] 配置甲(不在接管表) rc/status/answer/stderr = $p_off  自有上游累计收到=$up_off"
+  _evn dns-calibration.txt "[$sc] 配置乙(在接管表)   rc/status/answer/stderr = $p_on   自有上游累计收到=$up_on"
 
   # ── 还原甲, 并确认**运行配置**也回到未接管 ──
   if ! _dns_calib_restore; then
@@ -1355,30 +1572,109 @@ dns_feature_probe(){   # $1=标签
   fi
   printf 'VALID\t%s\t%s\n' "$(dns_answer_of "$ph")" "$(dns_answer_of "$pc")"
 }
-# 判一次"前后像 DNS 行为"。两边都必须是**有效观测**, 且见证=H、对照=U。
-dns_verdict(){   # $1=标签 $2=before $3=after
-  local bs bw bc as aw ac
-  IFS=$'\t' read -r bs bw bc <<<"$2"; IFS=$'\t' read -r as aw ac <<<"$3"
-  if [[ "$bs" != VALID || "$as" != VALID ]]; then
-    bad "$1 已加载配置: 前像或恢复后的观测**无效**, 不能因为两边文本相等就判恢复通过"
-    note "  前像: $2"; note "  恢复后: $3"
-    return 1
+# 346: DNS 前提**按场景**建立, 不继承上一场景的成功标志。
+#   345 实跑: A0 标定成功后, 场景 A 重建前像(e2e_seed_mosdns all)使条件失效, 对照名在调用前就答 H;
+#   而旧的 DNS_INSTRUMENT_OK=1 仍在, 于是 A 照样调用了产品, 事后又把"前像 H/H"记成"未恢复"。
+#   现在: 重建前像即作废(build_preimage → r1_dns_invalidate); 每个场景自己固定条件、标定(含磁盘与运行配置的还原核验),
+#   结果绑在场景名上; 调用前再用本场景的正式观测核"查询有效 + 见证=H + 对照=U"。任一不成立或未取得, 对应产品调用一次都不做。
+#   不为了满足前提去改产品的劫持契约: 条件只动外围上游与 geosite_cn 两件既有合法输入(见上面 dns_fix_conditions 的说明)。
+r1_dns_invalidate(){ DNS_INSTRUMENT_OK=0; DNS_PREMISE_SCENE=""; DNS_PRE_WHY=""; }
+r1_dns_premise(){   # $1=场景 → 0 本场景的条件与标定(含还原核验)成立 / 1 不成立(DNS_PRE_WHY)
+  r1_dns_invalidate
+  dns_instrument_calibrate "$1" || { DNS_PRE_WHY="条件建立或标定未通过(${DNS_CALIB_WHY:-未知})"; return 1; }
+  DNS_PREMISE_SCENE="$1"
+  return 0
+}
+# 346 / 347: 场景 A 的标定在调用前要连着重启 mosdns 四次, 加上前像那一次启动共五次。按 systemd 的默认启动限额(5 次 / 10 s)与这段流程的
+#      启动次数**推断**, 旧回滚那一次 restart mosdns(1492)有可能落进同一个限额窗口而被拒, 被误读成"产品没恢复"(③ 324 的 dotwitness 是同一机理)。
+#      这是有源码依据的风险推断, 没有真实 runner 的实测证据。所以标定之后、采前像之前, 按 mosdns 自己的限额窗口**一次**有界等待:
+#      不 reset-failed、不改限额、不重试; 读不到窗口或窗口超过 60 s ⇒ 前提不成立。
+#      347: sleep 退出 0 不等于已经等够 —— 前后各读一次 CLOCK_MONOTONIC(读取失败 / 格式不对 / 倒退 / 实得不足 都阻断调用),
+#      只报请求时长、sleep 退出码、两次读数的退出码与实得时长; 不声称 systemd 的内部计数已归零, 也不声称等待期间没有启动。
+R1_MONO=(python3 -c 'import time; print(time.clock_gettime_ns(time.CLOCK_MONOTONIC))')
+R1_MV=""; R1_MRC=""
+r1_mono(){   # → 0 取得(R1_MV = CLOCK_MONOTONIC 纳秒) / 2 读取失败或输出不是正整数(已输出的内容不采信); 原始退出码留在 R1_MRC
+  local out
+  R1_MV=""
+  out="$("${R1_MONO[@]}" 2>/dev/null)"; R1_MRC=$?
+  { (( R1_MRC == 0 )) && [[ "$out" =~ ^[0-9]+$ ]]; } || return 2
+  R1_MV="$out"
+}
+r1_mosdns_quiesce(){   # → 0 已静置 / 1 不成立(DNS_PRE_WHY)
+  local iv rc sec re_s='^([0-9]+)s$' re_m='^([0-9]+)min$' re_ms='^([0-9]+)min ([0-9]+)s$'
+  iv="$(systemctl show -p StartLimitIntervalUSec --value mosdns 2>/dev/null)"; rc=$?
+  (( rc == 0 )) || { DNS_PRE_WHY="读不到 mosdns 的启动限额窗口(systemctl 退出 $rc)"; return 1; }
+  if [[ "$iv" == 0 ]]; then sec=0
+  elif [[ "$iv" =~ $re_s ]]; then sec=$((10#${BASH_REMATCH[1]}))
+  elif [[ "$iv" =~ $re_m ]]; then sec=$((10#${BASH_REMATCH[1]} * 60))
+  elif [[ "$iv" =~ $re_ms ]]; then sec=$((10#${BASH_REMATCH[1]} * 60 + 10#${BASH_REMATCH[2]}))
+  else DNS_PRE_WHY="mosdns 的启动限额窗口认不出([$iv])"; return 1; fi
+  (( sec <= 60 )) || { DNS_PRE_WHY="mosdns 的启动限额窗口 ${sec} s 超过静置上限 60 s"; return 1; }
+  local req=$((sec + 1)) t0 t1 r0 r1 sr el els
+  r1_mono; r0="$R1_MRC"
+  [[ -n "$R1_MV" ]] || { DNS_PRE_WHY="等待前读单调时钟失败(退出 $r0; 输出不是正整数则不采信) —— 不等待"; return 1; }
+  t0="$R1_MV"
+  sleep "$req"; sr=$?
+  (( sr == 0 )) || { DNS_PRE_WHY="等待 $req s 没有完成(sleep 退出 $sr)"; return 1; }
+  r1_mono; r1="$R1_MRC"
+  [[ -n "$R1_MV" ]] || { DNS_PRE_WHY="等待后读单调时钟失败(退出 $r1; 输出不是正整数则不采信) —— 实得时长未取得"; return 1; }
+  t1="$R1_MV"
+  (( t1 >= t0 )) || { DNS_PRE_WHY="单调时钟读数倒退($t0 → $t1) —— 实得时长无效"; return 1; }
+  el=$(( t1 - t0 )); els="$(( el / 1000000000 )).$(printf '%03d' $(( (el % 1000000000) / 1000000 )))"
+  _evn dns-calibration.txt "[A] 等待: 请求 $req s; sleep 退出 $sr; 单调时钟读数退出 $r0 / $r1; 实得 $els s"
+  (( el >= req * 1000000000 )) || { DNS_PRE_WHY="等待实得 $els s, 不足请求的 $req s(sleep 退出 0 不算已经等够)"; return 1; }
+  note "A: 标定之后按 mosdns 的启动限额窗口($iv)请求等待 $req s: sleep 退出 $sr, 单调时钟读数退出 $r0 / $r1, 实得 $els s(不代表 systemd 内部计数已归零)"
+  return 0
+}
+r1_dns_ready(){   # $1=场景 $2=本场景调用前的 dns_feature_probe 输出 → 0 前提成立 / 1 不成立(DNS_PRE_WHY)
+  local st w c
+  { [[ "$DNS_INSTRUMENT_OK" == 1 && "$DNS_PREMISE_SCENE" == "$1" ]]; } \
+    || { DNS_PRE_WHY="DNS 条件与标定不属于本场景(标定成立=$DNS_INSTRUMENT_OK, 所属场景=${DNS_PREMISE_SCENE:-无}, 本场景=$1)"; return 1; }
+  IFS=$'\t' read -r st w c <<<"$2"
+  [[ "$st" == VALID ]] || { DNS_PRE_WHY="调用前的 DNS 观测无效(${2//$'\t'/ })"; return 1; }
+  { [[ "$w" == "$DNS_H" && "$c" == "$DNS_U" ]]; } \
+    || { DNS_PRE_WHY="调用前的 DNS 查询有效, 但不是 见证=H、对照=U(见证=$w 对照=$c) —— 实验前提不成立"; return 1; }
+  return 0
+}
+# 346: DNS 这一维的结算, 四种情形分开(345: 前像 H/H、回滚后 H/H 被同时打成"可区分行为回到前像"的 OK 和"未恢复"):
+#   查询失败 ⇒ 观测无效; 前像有效但不是 H/U ⇒ 实验前提不成立, 恢复结论未取得;
+#   前像 H/U 有效、之后有效但不是 H/U ⇒ 恢复失败; 前后都有效且都是 H/U ⇒ 恢复成立。本场景没有自己的有效标定 ⇒ 未取得。
+#   $5=1 时把结论记进本场景的恢复账(A-4); A0-3 是阶段观测, 不记账。
+r1_dns_settle(){   # $1=标签 $2=场景 $3=前像 $4=之后 $5=是否记账(1/0) → 0 成立 / 1 恢复失败 / 2 未取得
+  local lb="$1" sc="$2" bs bw bc as aw ac item="DNS 见证/对照"
+  IFS=$'\t' read -r bs bw bc <<<"$3"; IFS=$'\t' read -r as aw ac <<<"$4"
+  if [[ "$DNS_INSTRUMENT_OK" != 1 || "$DNS_PREMISE_SCENE" != "$sc" ]]; then
+    bad "$lb 已加载配置(DNS): 本场景没有自己的有效标定(标定成立=$DNS_INSTRUMENT_OK, 所属场景=${DNS_PREMISE_SCENE:-无}) —— 结论未取得"
+    [[ "$5" == 1 ]] && r1_tally na "$item(本场景未标定)"
+    return 2
   fi
-  { [[ "$bw" == "$aw" && "$bc" == "$ac" ]]; } \
-    && ok "$1 已加载配置(可区分行为): 见证与对照都回到前像(见证 $aw / 对照 $ac)" \
-    || bad "$1 已加载配置: DNS 行为变了(见证 $bw→$aw, 对照 $bc→$ac)"
-  { [[ "$aw" == "$DNS_H" && "$ac" == "$DNS_U" ]]; } \
-    && ok "$1 已加载配置(对预期): 见证=H($DNS_H) 对照=U($DNS_U) —— 差异确实来自接管规则" \
-    || bad "$1 已加载配置: 不符合预先固定的 U/H(见证=$aw 期望 $DNS_H; 对照=$ac 期望 $DNS_U)"
+  if [[ "$bs" != VALID ]]; then
+    bad "$lb 已加载配置(DNS): 前像的观测无效(${3//$'\t'/ }) —— 结论未取得"
+    [[ "$5" == 1 ]] && r1_tally na "$item(前像观测无效)"
+    return 2
+  fi
+  if [[ "$bw" != "$DNS_H" || "$bc" != "$DNS_U" ]]; then
+    bad "$lb 已加载配置(DNS): 前像查询有效但不是 见证=H、对照=U(见证=$bw 对照=$bc) —— 实验前提不成立, 恢复结论未取得"
+    [[ "$5" == 1 ]] && r1_tally na "$item(前提不成立: 前像 见证=$bw 对照=$bc)"
+    return 2
+  fi
+  if [[ "$as" != VALID ]]; then
+    bad "$lb 已加载配置(DNS): 之后的观测无效(${4//$'\t'/ }) —— 结论未取得"
+    [[ "$5" == 1 ]] && r1_tally na "$item(之后观测无效)"
+    return 2
+  fi
+  if [[ "$aw" == "$DNS_H" && "$ac" == "$DNS_U" ]]; then
+    ok "$lb 已加载配置(DNS): 前后都是 见证=H($DNS_H)、对照=U($DNS_U) —— 可区分行为与前像一致"
+    [[ "$5" == 1 ]] && r1_tally ok "$item"
+    return 0
+  fi
+  bad "$lb 已加载配置(DNS): 前像 H/U 有效, 之后有效但不符(见证 $bw→$aw, 对照 $bc→$ac) —— 与前像不一致"
+  [[ "$5" == 1 ]] && r1_tally diff "$item"
+  return 1
 }
 
-# 本轮自有资源的清理: **只**按事先登记的 PID 收自己起的那个上游, 不按名字宽杀。
-_dns_cleanup(){
-  [[ -n "${DNS_STUB_PID:-}" ]] || return 0
-  kill "$DNS_STUB_PID" 2>/dev/null || true
-  wait "$DNS_STUB_PID" 2>/dev/null || true
-  DNS_STUB_PID=""
-}
+# 本轮自有资源的清理: **只**按事先登记的 PID 收自己起的那个上游, 不按名字宽杀(346: 身份对不上就不杀)。
+_dns_cleanup(){ dns_stub_stop >/dev/null 2>&1 || true; }
 trap '_dns_cleanup' EXIT
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1571,14 +1867,6 @@ r1_fp_valid(){   # $1=标签 → 0 齐且有效 / 2 不成立(R1_WHY 列出)
   [[ -z "$why" ]] || return 2
   return 0
 }
-# 341: DNS 这一项进本场景的恢复账(判词仍由 dns_verdict 给 —— 那个函数与 ⑤ / 42 号所用版本逐字节相同, 不动它)。
-r1_dns_tally(){   # $1=前像 $2=恢复后(dns_feature_probe 的输出)
-  local bs bw bc as aw ac
-  IFS=$'\t' read -r bs bw bc <<<"$1"; IFS=$'\t' read -r as aw ac <<<"$2"
-  if [[ "$DNS_INSTRUMENT_OK" != 1 || "$bs" != VALID || "$as" != VALID ]]; then r1_tally na "DNS 见证/对照"
-  elif [[ "$bw" == "$aw" && "$bc" == "$ac" && "$aw" == "$DNS_H" && "$ac" == "$DNS_U" ]]; then r1_tally ok "DNS 见证/对照"
-  else r1_tally diff "DNS 见证/对照"; fi
-}
 # 341: 旧版身份 —— $R1_CLI 与 OLD_SHA 里的 deploy/bot/pdg.sh 是同一对象; $REPO 的 HEAD == OLD_SHA。
 #   每一步查询各自核退出码与输出形态; 读不到 ≠ 不符 ≠ 相符。A0 不用它(A0 按候选身份单独判)。
 R1_ID_CLI=na; R1_ID_HEAD=na
@@ -1615,6 +1903,9 @@ R1_GATE_WHY=""
 r1_a0_invoke(){   # A0 唯一的产品调用点 → 0 已调用(MG / MGRC) / 1 未调用
   MG=""; MGRC=""; R1_GATE_WHY=""
   if [[ "$R1_SRC_OLD" != 1 || "$R1_SRC_CAND" != 1 ]]; then R1_GATE_WHY="来源未核实成立(旧版=$R1_SRC_OLD 候选=$R1_SRC_CAND)"; return 1; fi
+  # 346: 前像与本场景的 DNS 前提也在这里再核一次(装候选之前) —— 不只靠调用处的分支
+  [[ "$PREIMAGE_OK" == 1 ]] || { R1_GATE_WHY="前像不成立"; return 1; }
+  r1_dns_ready A0 "${A0_DNS:-}" || { R1_GATE_WHY="DNS 前提不成立: $DNS_PRE_WHY"; return 1; }
   install_candidate ios >/dev/null || { bad "A0: 装候选失败"; R1_GATE_WHY="装候选失败"; return 1; }
   switch_repo_to_candidate ios || { R1_GATE_WHY="部署源没有切到候选(见上)"; return 1; }
   systemctl daemon-reload
@@ -1627,8 +1918,13 @@ r1_a0_invoke(){   # A0 唯一的产品调用点 → 0 已调用(MG / MGRC) / 1 �
 r1_a_invoke(){   # 场景 A 唯一的产品调用点(旧 CLI 的 dry-run 与正式 update) → 0 已调用(DRY / DRC / UP / URC) / 1 未调用
   DRY=""; DRC=""; UP=""; URC=""; R1_GATE_WHY=""
   if [[ "$R1_SRC_OLD" != 1 ]]; then R1_GATE_WHY="旧版来源(OLDSRC ⇔ OLD_SHA)未核实成立"; return 1; fi
+  # 346: 前像与本场景的 DNS 前提在调用点再核一次 —— dry-run 与 update 都在它之后
+  [[ "$PREIMAGE_OK" == 1 ]] || { R1_GATE_WHY="前像不成立"; return 1; }
+  r1_dns_ready A "${A_DNS_BEFORE:-}" || { R1_GATE_WHY="DNS 前提不成立: $DNS_PRE_WHY"; return 1; }
   if ! r1_fp_valid A-before; then bad "A: 调用前必需观测无效 —— $R1_WHY"; R1_GATE_WHY="调用前必需观测无效"; return 1; fi
   r1_old_identity "A 升级前" || { R1_GATE_WHY="升级前旧版身份未成立(见上)"; return 1; }
+  # 346: 服务动作窗口的起点 —— 所有前置门都过了才取; 取不到只让 A-5 的窗口记录记"未取得", 不阻断调用
+  r1_jcursor || note "A: 服务动作窗口的起点未取得($R1_JCUR_WHY) —— A-5 的窗口记录将记未取得"
   DRY="$(bash "$R1_CLI" update --dry-run 2>&1)"; DRC=$?
   UP="$(bash "$R1_CLI" update 2>&1)"; URC=$?
   return 0
@@ -1716,10 +2012,13 @@ residue_report
 # 先标定再用。**标定不过 = 验收前置不成立** —— 不是"把 DNS 那一项降成 note 然后照常跑完",
 # 那样等于拿一个证明不了东西的仪器走完四维验收再说一句"这项没取到"。
 # 所以它直接置 PREIMAGE_OK=0, 由下面的前置门把整个场景报成**未执行**(诊断数据仍然留档)。
-dns_instrument_calibrate || { PREIMAGE_OK=0; bad "验收前置未成立: DNS 仪器没有通过标定(${DNS_CALIB_WHY:-未知})"; }
+# 346: 条件与标定由**本场景**自己建立(r1_dns_premise A0), 结果绑在场景名上; 前像已不成立时不再标定。
+if [[ "$PREIMAGE_OK" == 1 ]]; then
+  r1_dns_premise A0 || { PREIMAGE_OK=0; bad "验收前置未成立(A0): DNS $DNS_PRE_WHY"; }
+fi
 
 if [[ "$PREIMAGE_OK" != 1 ]]; then
-  nrun "场景 A0: 前像/前置不成立(含 DNS 仪器未通过标定), 本段未执行"
+  nrun "场景 A0: 前像/前置不成立(含 DNS 条件未建立或未通过标定), 本段未执行"
 else
 A0_INV="$(systemctl show -p InvocationID --value pdg-mitm 2>/dev/null)"
 A0_PID="$(systemctl show -p MainPID --value pdg-mitm 2>/dev/null)"
@@ -1728,7 +2027,8 @@ A0_SCHEMA="$(python3 -c 'import json;print(json.load(open("/etc/privdns-gateway/
 A0_HIJ="$(sha256sum /etc/mosdns/rules/mitm_hijack.txt | awk '{print $1}')"
 A0_DNS="$(dns_feature_probe A0-before)"
 note "A0: 前像的 DNS 观测 = $A0_DNS"
-[[ "$A0_DNS" == VALID* ]] || bad "A0: 前像的 DNS 观测本身就无效 —— $A0_DNS"
+# 346: 调用前必须"查询有效 + 见证=H + 对照=U"(以前只在观测无效时打一条 FAIL, 仍然照常调用)
+r1_dns_ready A0 "$A0_DNS" || bad "验收前置未成立(A0): $DNS_PRE_WHY —— __migrate 不调用"
 # 装候选(测试前置), 并把部署身份与历史残留**分开**核验 —— 341: 连同 __migrate 一起收进 r1_a0_invoke, 任一前置不成立就不调用
 if ! r1_a0_invoke; then
   nrun "场景 A0: 未调用 __migrate —— $R1_GATE_WHY"
@@ -1755,11 +2055,7 @@ echo "── 拒绝这一刻的现场(**没有任何回滚覆盖过**) ──"
 [[ "$(sha256sum /etc/mosdns/rules/mitm_hijack.txt | awk '{print $1}')" == "$A0_HIJ" ]] \
   && ok "A0-2: 接管表逐字节未变" || bad "A0-2: 接管表被动过"
 A0_DNS_AFTER="$(dns_feature_probe A0-after)"
-if [[ "$DNS_INSTRUMENT_OK" == 1 ]]; then
-  dns_verdict "A0-3" "$A0_DNS" "$A0_DNS_AFTER"
-else
-  note "A0-3: 仪器没有通过标定, 本段本不该走到这里。实测留档: $A0_DNS → $A0_DNS_AFTER"
-fi
+r1_dns_settle "A0-3" A0 "$A0_DNS" "$A0_DNS_AFTER" 0
 ss -lnt 2>/dev/null | grep -q ':7894 ' && ok "A0-3: 7894 仍有监听" || bad "A0-3: 7894 没有监听"
 fi
 fi
@@ -1797,12 +2093,20 @@ residue_record /etc/mosdns/rules/mitm_hijack.txt   "旧版接管表(WLOC 自有�
 residue_record /etc/privdns-gateway/mitm.json      "旧版 WLOC 配置(enabled=true + 用户地点)"
 residue_record /etc/privdns-gateway/ios-profile.json "旧版 schema-1 记录"
 residue_report
+# 346: 上面的 build_preimage 已让 A0 的 DNS 条件与标定失效(345 就栽在这: 对照名在调用前已答 H)。
+#      场景 A 自己固定条件、标定并核还原, 再按 mosdns 的启动限额静置 —— 都在采前像与调用之前完成; 前像已不成立时不再做。
+if [[ "$PREIMAGE_OK" == 1 ]]; then
+  if ! r1_dns_premise A; then PREIMAGE_OK=0; bad "验收前置未成立(A): DNS $DNS_PRE_WHY"
+  elif ! r1_mosdns_quiesce; then PREIMAGE_OK=0; bad "验收前置未成立(A): $DNS_PRE_WHY"
+  fi
+fi
 snap_state A-before
 fp_capture A-before || note "A: 调用前采样没有完成 —— $R1_WHY(随后的前置门据此不调用)"
 svc_snapshot "$E2E_TMP/svc-A-before.tsv"
 A_DNS_BEFORE="$(dns_feature_probe A-before)"
 note "A: 前像的 DNS 观测 = $A_DNS_BEFORE"
-[[ "$A_DNS_BEFORE" == VALID* ]] || { bad "验收前置未成立: 前像的 DNS 观测本身就无效 —— $A_DNS_BEFORE"; PREIMAGE_OK=0; }
+# 346: 查询有效之外还必须真的是 见证=H、对照=U; 不成立 ⇒ dry-run 与 update 都不调用
+if [[ "$PREIMAGE_OK" == 1 ]] && ! r1_dns_ready A "$A_DNS_BEFORE"; then bad "验收前置未成立(A): $DNS_PRE_WHY"; PREIMAGE_OK=0; fi
 
 if [[ "$PREIMAGE_OK" != 1 ]]; then
   nrun "场景 A: 前像不成立, 本场景未执行(既不算通过也不算产品失败)"
@@ -1820,6 +2124,7 @@ if ! r1_a_invoke; then
   nrun "场景 A: 未执行正式升级 —— $R1_GATE_WHY(dry-run 与 update 都没有调用)"
 else
 svc_snapshot "$E2E_TMP/svc-A-after.tsv"
+r1_svc_collect A     # 346: 调用一返回就取窗口内的 journal(判定在 A-5)
 echo "── 旧 CLI 的 dry-run(先看它怎么判关系) ──"
 printf '%s\n' "$DRY" | _ev 03-A-dryrun.txt
 echo "$DRY" | sed 's/^/    /' | head -20
@@ -1848,7 +2153,7 @@ grep -q '已可完整回滚' <<<"$UP" && bad "A-1: 未经实测就承诺已可�
 echo
 echo "── A-2. 阶段关系: 拒绝在前, 回滚在后(整段判据只作辅助) ──"
 note "本段**不再**要求「整个过程 pdg-mitm 的 PID / InvocationID 不变」或「journal 里没有停止记录」——"
-note "  原版回滚里那句 `systemctl is-enabled pdg-mitm && { reset-failed; restart pdg-mitm; }`"
+note '  原版回滚里那句 `systemctl is-enabled pdg-mitm && { reset-failed; restart pdg-mitm; }`'   # 346: 单引号 —— 以前双引号里的反引号在 runner 上被当命令执行了
 note "  在自启仍是 enabled 时**会触发**, 于是它自己就会重启一次。那属于「允许旧回滚执行其既有"
 note "  重启动作」, 必须列明(见 A-5), 不能当成「被退役停过」。"
 note "  「拒绝前没有撤除」这件事由上面的**场景 A0 阶段观测**单独给出; 这里只核对先后顺序。"
@@ -1914,13 +2219,7 @@ else
   note "A-4: 这一轮没找到产品写的 svcstate.tsv(旧 CLI 的快照本来就没有这一份, 属预期)"
 fi
 A_DNS_AFTER="$(dns_feature_probe A-after)"
-if [[ "$DNS_INSTRUMENT_OK" == 1 ]]; then
-  dns_verdict "A-4" "$A_DNS_BEFORE" "$A_DNS_AFTER"
-else
-  note "A-4: 仪器没有通过标定, 本场景本不该走到这里。实测留档:"
-  note "  前像 $A_DNS_BEFORE"; note "  恢复后 $A_DNS_AFTER"
-fi
-r1_dns_tally "$A_DNS_BEFORE" "$A_DNS_AFTER"   # 341: 判词仍由上面 dns_verdict 给; 这里只把 DNS 这一项记进本场景的恢复账
+r1_dns_settle "A-4" A "$A_DNS_BEFORE" "$A_DNS_AFTER" 1   # 346: 判词与记账同一处给出; 前提不成立 / 观测无效 ⇒ 未取得, 不进"未恢复"
 r1_fp_item A-before A-after L 53
 case $? in
   0) ok "A-4(辅助) 53/udp 监听数与前像一致($FP_A)"; r1_tally ok "53 监听";;
@@ -1942,10 +2241,10 @@ r1_tally "$R1_ID_CLI" "身份 $R1_CLI"; r1_tally "$R1_ID_HEAD" "身份 $REPO HEA
 note "A-4 / A-4b 小计(本场景已检查范围): 已恢复 ${#A4_RESTORED[@]} / 未恢复 ${#A4_DIFFER[@]} / 未取得 ${#A4_NOTOBT[@]}"
 
 echo
-echo "── A-5. 服务动作对账(原版回滚允许它重启服务, 这里逐项列明) ──"
-svc_verdict "$E2E_TMP/svc-A-before.tsv" "$E2E_TMP/svc-A-after.tsv" A
-note "A-5: 「门前零退役动作」与「整个拒绝—回滚过程零服务动作」是两件事 —— 上面列出的就是"
-note "     整个过程里实际发生的服务动作; 本报告不把前者写成后者。"
+echo "── A-5. 服务动作(终态 / 实例变化 / 窗口内记录到的启停 分开表述; 依据是冻结旧版的执行路径) ──"
+note "A-5 终态: 各 unit 的运行态 / 自启态是否回到前像, 见上面 A-4 的逐项结论(这里不重复判)。"
+r1_svc_window "$E2E_TMP/svc-A-before.tsv" "$E2E_TMP/svc-A-after.tsv" A
+note "A-5: 「门前零退役动作」由场景 A0 的阶段观测给出; 这里列的是整个拒绝—回滚过程里记录到的启停, 不把前者写成后者。"
 
 echo
 echo "── A-6. 退出码与用户看到的文字 ──"
