@@ -242,7 +242,7 @@ r4_fw_live(){   # → 0 取得(R3_VAL=运行中 inet pdg 表原文) / 2 观测�
 }
 # <<< PDG-EXTRACT-END r4_fw
 # >>> PDG-EXTRACT-BEGIN r4_inject
-# 注入: 给 /etc/nftables.conf 建**一个**硬链接。它是本支唯一的测试动作, 也是产品自己定义为
+# 注入: 给 /etc/nftables.conf 建**一个**硬链接。它是本支唯一的故障注入(本支另有已登记的 DNS 仪器调整、仪器重启与一次静置), 也是产品自己定义为
 # "不安全的事务目标"并具名拒绝的现场条件(退役版 migrate_ios_gms_cleanup: `stat -c '%h'` ≠ 1 ⇒
 # 打印"是硬链接(nlink=N), 改它会波及另一个名字 → 未改动任何文件"并 return 1)。
 R4_ROOT="${PDG_LATE_FAIL_ROOT:-}"      # 测试用的整体前缀; 生产为空串(与产品 PDG_RETIRE_ROOT 同款约定, 行为不变)
@@ -250,19 +250,41 @@ R4_TARGET="$R4_ROOT/etc/nftables.conf"
 R4_LINK_DIR="$R4_ROOT/var/lib/pdg-accept4"
 R4_LINK="$R4_LINK_DIR/nftables.conf.link"
 R4_INJ=""                      # 登记的 设备:inode; 空 = 没有建立(善后据此不动任何东西)
-r4_trigger_ready(){   # GMS 清理的触发前提(见 T:5890/T:5902)→ 0 成立 / 1 有效答案: 不成立 / 2 观测无效(前提判不了, 同样不注入)
-  # 330: 否定查询分清"没匹配"(答案)与"查询失败"(观测无效)。以前 `grep … && 拒绝` 把 grep 出错当成
-  #      "没有救援标记 / 没配监听地址"放行, 5228 查询出错则被说成"没有 5228 端口集"。
-  local plat rc pe
+r4_trigger_ready(){   # GMS 清理在**更新中途**的触发前提 → 0 成立 / 1 有效答案: 不成立 / 2 观测无效(前提判不了; 两者都不注入、不调用)
+  # 330: 否定查询分清"没匹配"(答案)与"查询失败"(观测无效)。
+  # 335: GMS 清理(T:5902)是在**执行那一刻**看 /etc/nftables.conf 有没有 5228 端口集; 这个端口集由更新中途的模板同步
+  #      (T:6496 migrate_firewall_template_sync: 按 $REPO_DIR/deploy/firewall/nftables-mihomo.conf 渲染, T:884 `cat >` 原地写)带回来,
+  #      之后才是 WLOC 退役(T:6523)与 GMS 清理(T:6531)。333 的 ② 已把调用前现役文件里的 5228 清掉, 旧门据此在注入前拦下、调用 0 次。
+  #      所以不再要求调用前现役文件含 5228, 改为: 从冻结退役提交($RETIRE_SHA, ④-0 已核对象类型, 取件源 tag 指向它)直接取那份模板,
+  #      去掉注释后用产品同一条触发正则判 —— 只读冻结退役提交, 不读现役桥接仓库; 注释里的 5228 不算。
+  #      模板同步只在现役文件已是 inet pdg 时才动手(T:754), 这一条照查。其余解析前提(SSH 端口 / 内网段 / 救援端口唯一)不在这里复算:
+  #      同步没写的话 GMS 不会动手, 更新会自报「✅ 已更新。」, 由 ④-1 判本次 ④ 无效(不会误判通过)。
+  local plat rc pe lst tpl eff intent cidr addrs n
   plat="$(cat -- "$R3_ETC/platform" 2>/dev/null)"; rc=$?
   (( rc == 0 )) || { R3_WHY="平台标记读不了(cat rc=$rc)"; return 2; }
   [[ "$plat" == ios ]] || { R3_WHY="平台是 [$plat], GMS 清理只在 ios 上动手"; return 1; }
   [[ -f "$R4_TARGET" ]] || { R3_WHY="$R4_TARGET 不在"; return 1; }
-  r3_grepq -E 'tcp dport [{][^}]*5228' "$R4_TARGET"; rc=$?
+  r3_grepq -F 'table inet pdg' "$R4_TARGET"; rc=$?
   case "$rc" in
     0) ;;
-    1) R3_WHY="$R4_TARGET 里没有 5228 端口集 —— 本次不会走到 GMS 清理"; return 1;;
-    *) R3_WHY="5228 端口集查询失败($R3_WHY) —— 触发前提判不了"; return 2;;
+    1) R3_WHY="$R4_TARGET 还不是 inet pdg —— 模板同步不会动手(T:754), 更新中途不会带回 5228"; return 1;;
+    *) R3_WHY="inet pdg 查询失败($R3_WHY) —— 触发前提判不了"; return 2;;
+  esac
+  lst="$(git -C "$R3_OBJ" ls-tree --name-only "$RETIRE_SHA" -- deploy/firewall/nftables-mihomo.conf 2>/dev/null)"; rc=$?
+  (( rc == 0 )) || { R3_WHY="冻结退役提交的树查询失败(git ls-tree rc=$rc) —— 触发前提判不了"; return 2; }
+  [[ "$lst" == deploy/firewall/nftables-mihomo.conf ]] \
+    || { R3_WHY="冻结退役提交 ${RETIRE_SHA:0:12} 里没有 deploy/firewall/nftables-mihomo.conf —— 模板同步不会动手(T:756)"; return 1; }
+  tpl="$R4_TMP/retire-nft-template.conf"; eff="$R4_TMP/retire-nft-template.effective"
+  git -C "$R3_OBJ" show "$RETIRE_SHA:deploy/firewall/nftables-mihomo.conf" > "$tpl" 2>/dev/null; rc=$?
+  (( rc == 0 )) || { R3_WHY="冻结退役模板读取失败(git show rc=$rc) —— 已输出的部分不采信"; return 2; }
+  # 去注释: 引号外的 # 起到行尾都不算有效规则
+  awk '{ o = ""; q = 0; for (i = 1; i <= length($0); i++) { c = substr($0, i, 1); if (c == "\"") q = !q; else if (c == "#" && !q) break; o = o c } print o }' "$tpl" > "$eff"; rc=$?
+  (( rc == 0 )) || { R3_WHY="冻结退役模板去注释失败(awk rc=$rc)"; return 2; }
+  r3_grepq -E 'tcp dport [{][^}]*5228' "$eff"; rc=$?
+  case "$rc" in
+    0) ;;
+    1) R3_WHY="冻结退役模板的有效规则里没有 5228 端口集(注释里的不算)—— 更新中途不会带回, GMS 清理不会动手"; return 1;;
+    *) R3_WHY="模板触发条件查询失败($R3_WHY) —— 触发前提判不了"; return 2;;
   esac
   # 救援平面若被启用, 它的放行/摘除走 `mv -f`(T:7023 / T:7042), 会换掉目标 inode, 链接就活不到 GMS 那一步。
   r3_grepq -F 'comment "pdg-rescue"' "$R4_TARGET"; rc=$?
@@ -279,7 +301,47 @@ r4_trigger_ready(){   # GMS 清理的触发前提(见 T:5890/T:5902)→ 0 成立
       1) ;;
       *) R3_WHY="profile.env 在却查不了($R3_WHY) —— 不能当成「没配监听地址」"; return 2;;
     esac
-  fi                                  # 文件不存在 = 没配(答案), 与产品读 profile.env 的语义一致
+    # 335: 没配监听地址时还有**自动选址**分支(T:4346–4351): 意图不是 0, 且来源段 PDG_INTERNAL_CIDR 里恰有 1 个本机全局 IPv4,
+    #      migrate_rescue_plane 就会自动启用救援平面, 其放行走 `mv -f`(T:7023)换掉目标 inode。只读探测, 取值口径与产品相同
+    #      (profile.env 取最后一次赋值; 来源段去掉一层引号; `ip -4 -o addr show scope global` 里落在段内的地址数)。
+    # 336: "取最后一次赋值"必须在命令替换吞掉末尾换行之前做(sed 先落文件, 再 tail -n 1)—— 否则末条是空值时会被吞掉、取成上一条:
+    #      意图 0 / 空 会被当成 0(错放行), 来源段 有效 / 空 会被当成有效(多拦)。产品是 `sed -n … | tail -1`(T:7122; lib/rescue.sh:231)。
+    sed -n 's/^[[:space:]]*PDG_RESCUE_ENABLED=//p' "$pe" > "$R4_TMP/rescue-intent.all" 2>/dev/null; rc=$?
+    (( rc == 0 )) || { R3_WHY="救援意图读取失败(sed rc=$rc)"; return 2; }
+    intent="$(tail -n 1 -- "$R4_TMP/rescue-intent.all" 2>/dev/null)"; rc=$?
+    (( rc == 0 )) || { R3_WHY="救援意图取最后一次赋值失败(tail rc=$rc)"; return 2; }
+    if [[ "$intent" != 0 ]]; then
+      sed -n 's/^[[:space:]]*PDG_INTERNAL_CIDR=//p' "$pe" > "$R4_TMP/rescue-cidr.all" 2>/dev/null; rc=$?
+      (( rc == 0 )) || { R3_WHY="来源段读取失败(sed rc=$rc)"; return 2; }
+      cidr="$(tail -n 1 -- "$R4_TMP/rescue-cidr.all" 2>/dev/null)"; rc=$?
+      (( rc == 0 )) || { R3_WHY="来源段取最后一次赋值失败(tail rc=$rc)"; return 2; }
+      cidr="${cidr%\"}"; cidr="${cidr#\"}"; cidr="${cidr%\'}"; cidr="${cidr#\'}"
+      if [[ -n "$cidr" ]]; then
+        addrs="$(ip -4 -o addr show scope global 2>/dev/null)"; rc=$?
+        (( rc == 0 )) || { R3_WHY="本机地址查询失败(ip rc=$rc) —— 自动选址判不了"; return 2; }
+        n="$(printf '%s\n' "$addrs" | python3 -c '
+import ipaddress, sys
+try:
+    net = ipaddress.ip_network(sys.argv[1], strict=False)
+except Exception:
+    print("bad-cidr"); sys.exit(0)
+hits = 0
+for line in sys.stdin:
+    parts = line.split()
+    for i, tok in enumerate(parts):
+        if tok == "inet" and i + 1 < len(parts):
+            try:
+                ip = ipaddress.ip_address(parts[i + 1].split("/")[0])
+            except ValueError:
+                continue
+            if ip in net:
+                hits += 1
+print(hits)' "$cidr" 2>/dev/null)"; rc=$?
+        (( rc == 0 )) && [[ "$n" =~ ^([0-9]+|bad-cidr)$ ]] || { R3_WHY="来源段内地址计数失败(python3 rc=$rc) —— 自动选址判不了"; return 2; }
+        [[ "$n" == 1 ]] && { R3_WHY="来源段 $cidr 里恰有 1 个本机全局地址 —— 救援平面会自动选址启用(T:4348–4351), 目标 inode 可能被换掉"; return 1; }
+      fi
+    fi
+  fi                                  # 文件不存在 = 没配、没有来源段(答案), 与产品读 profile.env 的语义一致
   return 0
 }
 r4_inject_create(){   # → 0 已建立并核过(R4_INJ=设备:inode) / 1 前提不成立或观测失败, 未建立 / 3 建了但核验不过或核验查询失败(已按登记善后)
@@ -325,6 +387,38 @@ r4_inject_remove(){   # 只按登记身份删自己那一个 → 0 已删 / 1 �
 }
 # <<< PDG-EXTRACT-END r4_inject
 # >>> PDG-EXTRACT-BEGIN r4_pre
+R4_STAT_RE='^[a-z ]+[|][0-7]{1,4}[|][0-9]+:[0-9]+[|][0-9]+:[0-9]+:[0-9]+[|][0-9]+$'
+r4_nft_disk_record(){   # $1=落点前缀 → 0 已留原文(.conf)与身份(.id), R3_VAL=sha256 / 2 取不到(已写出的不采信)
+  # 335: 调用前磁盘上的 /etc/nftables.conf 原文、摘要与文件身份(333 只留了运行态与清单摘要)。
+  local id rc sha sha2
+  cat -- "$R4_TARGET" > "$1.conf" 2>/dev/null; rc=$?
+  (( rc == 0 )) || { R3_WHY="原文读取失败(cat rc=$rc)"; return 2; }
+  sha="$(sha256sum -- "$R4_TARGET" 2>/dev/null)"; rc=$?; sha="${sha%% *}"
+  (( rc == 0 )) && [[ "$sha" =~ ^[0-9a-f]{64}$ ]] || { R3_WHY="摘要查询失败(sha256sum rc=$rc)"; return 2; }
+  sha2="$(sha256sum < "$1.conf" 2>/dev/null)"; rc=$?; sha2="${sha2%% *}"
+  (( rc == 0 )) && [[ "$sha2" == "$sha" ]] || { R3_WHY="留存的原文与现文件摘要对不上(rc=$rc)"; return 2; }
+  id="$(stat -c '%F|%a|%u:%g|%d:%i:%h|%s' -- "$R4_TARGET" 2>/dev/null)"; rc=$?
+  (( rc == 0 )) && [[ "$id" =~ $R4_STAT_RE ]] || { R3_WHY="文件身份查询失败(stat rc=$rc)"; return 2; }
+  printf 'path\t%s\nsha256\t%s\nstat(类型|mode|属主|设备:inode:nlink|字节)\t%s\n' "$R4_TARGET" "$sha" "$id" > "$1.id" 2>/dev/null \
+    || { R3_WHY="身份记录写不出来"; return 2; }
+  R3_VAL="$sha"
+}
+r4_pretpl_record(){   # $1=落点 → 0 已登记(R3_VAL=一句话) / 2 查询失败 —— .pre-tplsync 不是快照成员, 只登记, 不进"回滚必须逐字恢复"的范围
+  local p="$R4_TARGET.pre-tplsync" id sha="-" rc
+  if [[ ! -e "$p" && ! -L "$p" ]]; then
+    printf 'path\t%s\n状态\t不存在\n' "$p" > "$1" 2>/dev/null || { R3_WHY=".pre-tplsync 登记写不出来"; return 2; }
+    R3_VAL="不存在"; return 0
+  fi
+  id="$(stat -c '%F|%a|%u:%g|%d:%i:%h|%s' -- "$p" 2>/dev/null)"; rc=$?
+  (( rc == 0 )) && [[ "$id" =~ $R4_STAT_RE ]] || { R3_WHY=".pre-tplsync 身份查询失败(stat rc=$rc)"; return 2; }
+  if [[ "${id%%|*}" == "regular file" || "${id%%|*}" == "regular empty file" ]]; then
+    sha="$(sha256sum -- "$p" 2>/dev/null)"; rc=$?; sha="${sha%% *}"
+    (( rc == 0 )) && [[ "$sha" =~ ^[0-9a-f]{64}$ ]] || { R3_WHY=".pre-tplsync 摘要查询失败(sha256sum rc=$rc)"; return 2; }
+  fi
+  printf 'path\t%s\n状态\t存在\nstat(类型|mode|属主|设备:inode:nlink|字节)\t%s\nsha256\t%s\n' "$p" "$id" "$sha" > "$1" 2>/dev/null \
+    || { R3_WHY=".pre-tplsync 登记写不出来"; return 2; }
+  R3_VAL="存在($id; sha256 ${sha:0:16})"
+}
 r4_precapture(){   # ④ 自己的调用前观测(在 ③ 的 r3_precapture 之前跑)→ 0 全取得 / 1 有没取到的
   local st=0
   if r4_fs_manifest "$R4_TMP/fs-before.tsv"; then
@@ -339,6 +433,10 @@ r4_precapture(){   # ④ 自己的调用前观测(在 ③ 的 r3_precapture 之�
   else echo "  E 运行中防火墙没取得: $R3_WHY"; st=1; fi
   if r3_lsdir "$SNAPROOT"; then R4_SNAP_BEFORE="$R3_VAL"; echo "  E 快照目录清单已取得(${R3_NOTE:-$(grep -c . <<<"$R4_SNAP_BEFORE") 项})"
   else echo "  E 快照目录清单没取得: $R3_WHY"; st=1; fi
+  if r4_nft_disk_record "$EVID/07-nft-disk-before"; then echo "  E 调用前磁盘 $R4_TARGET 原文、摘要(${R3_VAL:0:16})与文件身份已留存(07-nft-disk-before.*)"
+  else echo "  E 调用前磁盘 $R4_TARGET 没取得: $R3_WHY"; st=1; fi
+  if r4_pretpl_record "$EVID/08-pre-tplsync-before.txt"; then echo "  E 调用前 $R4_TARGET.pre-tplsync: $R3_VAL(只登记; 不是快照成员)"
+  else echo "  E 调用前 .pre-tplsync 登记没取得: $R3_WHY"; st=1; fi
   return "$st"
 }
 r4_inject_stage(){   # 触发前提 + 建立注入 + 登记 → 0 成立 / 1 不成立(已按登记善后)
@@ -349,14 +447,14 @@ r4_inject_stage(){   # 触发前提 + 建立注入 + 登记 → 0 成立 / 1 不
     1) bad "④-0 注入前提不成立: $R3_WHY —— 不注入、不调用"; return 1;;
     *) bad "④-0 注入前提观测无效: $R3_WHY —— 不注入、不调用"; return 1;;
   esac
-  ok "④-0 GMS 清理的触发前提成立(平台 ios; $R4_TARGET 里有 5228 端口集; 救援平面未启用 ⇒ 没有已知路径会换掉目标 inode)"
+  ok "④-0 GMS 清理的触发前提(有限检查)成立: 平台 ios; $R4_TARGET 是 inet pdg; 冻结退役模板的有效规则含 5228 端口集(不要求调用前现役文件已含; 本次是否带回仍待实际更新验证); 救援的已知启用路径(标记 / 监听地址 / 自动选址)都没命中 —— 这只是有限的前提检查, 不保证链接一定活到 GMS 那一步(以 M2 为准)"
   r4_inject_create; rc=$?
   case "$rc" in
     0) ;;
     3) bad "④-0 注入建立后核验不过: $R3_WHY —— 已按登记善后, 不调用"; return 1;;
     *) bad "④-0 注入未建立: $R3_WHY —— 不调用"; return 1;;
   esac
-  { echo "# ④ 的唯一测试动作: 给 $R4_TARGET 建一个硬链接, 让退役版 migrate_ios_gms_cleanup 的形态守卫真实拒绝"
+  { echo "# ④ 的唯一故障注入: 给 $R4_TARGET 建一个硬链接, 让退役版 migrate_ios_gms_cleanup 的形态守卫真实拒绝(另有已登记的 DNS 调整、重启与静置)"
     echo "目标 = $R4_TARGET; 链接 = $R4_LINK; 登记身份(设备:inode) = $R4_INJ; 建立后核验 nlink = 2"
     echo "链接**不是备份**: 产品原地写会穿透到它, 本支绝不从它恢复任何文件; 撤除只按登记身份删这一个"
   } > "$EVID/03-injection.txt" 2>/dev/null || { bad "④-0 注入登记写不进证据目录"; r4_inject_remove >/dev/null; return 1; }
@@ -382,7 +480,7 @@ r4_gated_invoke(){   # 门全过、注入成立、调用前观测取全才调用
 }
 # <<< PDG-EXTRACT-END r4_pre
 # >>> PDG-EXTRACT-BEGIN r4_markers
-# B 段: 有序且具名的四个标记。每一条都只认产品自己的原句(冻结源码里的出处写在旁边),
+# B 段: 有序且具名的五个标记(M0–M4)。每一条都只认产品自己的原句(冻结源码里的出处写在旁边),
 # 不拿"最后恢复了"倒推中间退役发生过, 也不拿 update 的非零退出码代替其中任何一条。
 r4_mark_line(){   # $1=日志 $2=固定串 → 0 恰 1 处(R3_VAL=行号) / 1 没有 / 3 不止一处 / 2 查询失败
   # 330: 取行号那一次 grep 也核退出码(以前先输出再失败的行号照样被用)。
@@ -403,14 +501,20 @@ r4_mark_line(){   # $1=日志 $2=固定串 → 0 恰 1 处(R3_VAL=行号) / 1 �
 R4_OTHER_FAIL=('缺 unit 模板' '当前部署源缺少 pdg-probe81 unit 模板' 'pdg-probe81 未能启用'
                '去广告受管块' '未迁移(已回滚标记)' '迁移失败, 已回滚' '内核未稳定运行'
                '加 include 点后 nft -c 未过' 'daemon-reload 失败, pdg-probe81 可能未生效')
-r4_markers(){   # → 0 四个标记有序且各恰 1 次、其它失败文案扫描有效且全未出现 / 1 不成立或观测无效(逐项已打印)
-  local st=0 rc p hit="" scanbad="" l_ret="" l_gms="" l_mig="" l_rb=""
+# 335: M0 = 退役版模板同步写盘**之前**打印的那一句(T:883)。它只说明同步走到了写盘那一步之前, 不单独证明写入成功;
+#      写入是否把 5228 带回来, 以 M2(GMS 守卫只在触发条件成立时才会跑到)为准。
+R4_M0='防火墙按模板重建(同步模板改动; 你在 nft-input.d/ 里的规则不受影响)…'
+r4_markers(){   # → 0 五个标记有序且各恰 1 次、其它失败文案扫描有效且全未出现 / 1 不成立或观测无效(逐项已打印)
+  local st=0 rc p hit="" scanbad="" l_m0="" l_ret="" l_gms="" l_mig="" l_rb=""
   r3_grepq -F '✅ 已更新。' "$R3_LOG"; rc=$?
   case "$rc" in
     0) bad "④-1 产品自报「✅ 已更新。」—— 本次升级**没有**按预期失败, 不是有效 ④"; st=1;;
     1) ;;
     *) bad "④-1 升级日志读不了($R3_WHY)"; st=1;;
   esac
+  r4_mark_line "$R3_LOG" "$R4_M0"; rc=$?
+  if (( rc == 0 )); then l_m0="$R3_VAL"; ok "④-1 M0 模板重建的**写入前提示**(T:883): 第 $l_m0 行 —— 不单独证明写入成功, 带回 5228 以 M2 为准"
+  else bad "④-1 M0 没有「模板重建」这一句: $R3_WHY"; st=1; fi
   r4_mark_line "$R3_LOG" '✅ WLOC 位置改写及其专属 MITM 执行能力已退役'; rc=$?
   if (( rc == 0 )); then l_ret="$R3_VAL"; ok "④-1 M1 本次 WLOC 退役**成功**(产品原句, 只在退役各步含最后一个提交点 _retire_ios_schema 全过之后才打印): 第 $l_ret 行"
   else bad "④-1 M1 没有本次 WLOC 退役成功的直接证据: $R3_WHY"; st=1; fi
@@ -426,10 +530,10 @@ r4_markers(){   # → 0 四个标记有序且各恰 1 次、其它失败文案�
     if (( rc == 0 )); then l_rb="$R3_VAL"; ok "④-1 M4 回滚点名的就是本次新建的快照 $R4_SNAP_NEW: 第 $l_rb 行"
     else bad "④-1 M4 日志里没有「回滚到 $R4_SNAP_NEW」: $R3_WHY"; st=1; fi
   else bad "④-1 M4 本次新建快照还没确定, 无法核对回滚点名的是哪一份"; st=1; fi
-  if [[ -n "$l_ret" && -n "$l_gms" && -n "$l_mig" && -n "$l_rb" ]] \
-     && (( l_ret < l_gms && l_gms < l_mig && l_mig < l_rb )); then
-    ok "④-1 顺序成立: 退役成功($l_ret) → 硬链接拒绝($l_gms) → 迁移失败触发回滚($l_mig) → 回滚到本次快照($l_rb)"
-  else bad "④-1 顺序不成立(退役 ${l_ret:-无} / 拒绝 ${l_gms:-无} / 迁移失败 ${l_mig:-无} / 回滚 ${l_rb:-无})"; st=1; fi
+  if [[ -n "$l_m0" && -n "$l_ret" && -n "$l_gms" && -n "$l_mig" && -n "$l_rb" ]] \
+     && (( l_m0 < l_ret && l_ret < l_gms && l_gms < l_mig && l_mig < l_rb )); then
+    ok "④-1 顺序成立: 模板重建($l_m0) → 退役成功($l_ret) → 硬链接拒绝($l_gms) → 迁移失败触发回滚($l_mig) → 回滚到本次快照($l_rb)"
+  else bad "④-1 顺序不成立(模板重建 ${l_m0:-无} / 退役 ${l_ret:-无} / 拒绝 ${l_gms:-无} / 迁移失败 ${l_mig:-无} / 回滚 ${l_rb:-无})"; st=1; fi
   # 其它迁移的具名失败文案: 每一条都分清"没出现"与"查询失败"(330)。
   for p in "${R4_OTHER_FAIL[@]}"; do
     r3_grepq -F -- "$p" "$R3_LOG"; rc=$?
@@ -571,12 +675,30 @@ r4_dns_back(){   # 回滚后的 DNS: W=H(接管回来) / C=U / P=H; 用**调用�
   r3_dns_path "$R3_DNS_CPOST" post-c U; r3_dns_say "④-4" "C(独立上游对照 $R3_DNS_CPOST)经 local_upstream 取得 U" $? || st=1
   return "$st"
 }
+r4_target_after(){   # 回滚后目标与测试链接的文件身份 → 0 目标是新 inode、nlink=1, 登记的旧 inode 只剩链接一个名字 / 1 不成立 / 2 观测无效
+  # 335: 登记的 R4_INJ = 注入前目标的 设备:inode。产品回滚按快照 tar 落盘(B:1107–1108)会换出新 inode; 旧 inode 此时只剩测试链接
+  #      一个名字(内容是模板同步之后那份, 不是备份, 不读、不用)。目标仍是旧 inode ⇒ 不是产品换出的, 不当成恢复成立。
+  local t l rc lr
+  R3_VAL=""
+  [[ "$R4_INJ" =~ ^[0-9]+:[0-9]+$ ]] || { R3_WHY="没有登记过注入身份(R4_INJ=[$R4_INJ])"; return 2; }
+  t="$(stat -c '%d:%i:%h' -- "$R4_TARGET" 2>/dev/null)"; rc=$?
+  (( rc == 0 )) && [[ "$t" =~ ^[0-9]+:[0-9]+:[0-9]+$ ]] || { R3_WHY="目标身份查询失败(stat rc=$rc, 实得 [${t:0:40}])"; return 2; }
+  [[ -e "$R4_LINK" || -L "$R4_LINK" ]] || { R3_WHY="测试链接已不在 —— 旧 inode 的去向判不了"; return 1; }
+  [[ ! -L "$R4_LINK" ]] || { R3_WHY="测试链接变成了符号链接 —— 与登记不符"; return 1; }
+  l="$(stat -c '%d:%i:%h' -- "$R4_LINK" 2>/dev/null)"; lr=$?
+  (( lr == 0 )) && [[ "$l" =~ ^[0-9]+:[0-9]+:[0-9]+$ ]] || { R3_WHY="测试链接身份查询失败(stat rc=$lr, 实得 [${l:0:40}])"; return 2; }
+  R3_VAL="目标 $t / 链接 $l / 登记 $R4_INJ"
+  [[ "${t%%:*}" == "${R4_INJ%%:*}" ]] || { R3_WHY="目标不在登记的设备上($R3_VAL)"; return 1; }
+  [[ "${t%:*}" != "$R4_INJ" ]] || { R3_WHY="目标仍是登记的旧 inode(与测试链接同一个)—— 不是产品回滚换出的新文件($R3_VAL)"; return 1; }
+  [[ "${t##*:}" == 1 ]] || { R3_WHY="目标 nlink 不是 1($R3_VAL)"; return 1; }
+  [[ "${l%:*}" == "$R4_INJ" && "${l##*:}" == 1 ]] || { R3_WHY="测试链接不再是登记的旧 inode 或 nlink 不是 1($R3_VAL)"; return 1; }
+}
 # <<< PDG-EXTRACT-END r4_rollback
 
 snap_state "late-before"      # 仅留档, 不参与任何判据
 
 SECT "④-0 前置: ② 的结果、桥接前像、DNS 仪器、静置、运行态门、前像采集与注入"
-for c in git python3 ss dig curl sha256sum timeout comm cmp stat diff nft find join; do command -v "$c" >/dev/null || _hard "缺命令: $c"; done
+for c in git python3 ss dig curl sha256sum timeout comm cmp stat diff nft find join ip; do command -v "$c" >/dev/null || _hard "缺命令: $c"; done
 for s in "$BRIDGE_SHA" "$RETIRE_SHA"; do
   [[ "$(git -C "$R3_OBJ" cat-file -t "$s" 2>/dev/null)" == commit ]] || _hard "本 job 的检出里取不到对象 $s"
 done
@@ -643,6 +765,14 @@ if r4_fs_manifest "$R4_TMP/fs-after.tsv"; then
     *) bad "④-3 文件清单比不了: $R3_WHY";;
   esac
 else bad "④-3 调用后文件清单没取得: $R3_WHY"; fi
+r4_target_after; _ta=$?
+case "$_ta" in
+  0) ok "④-3 回滚后目标换成了新 inode、nlink=1, 登记的旧 inode 只剩测试链接一个名字 —— 由产品落盘换出, 不是原地改回($R3_VAL)";;
+  1) bad "④-3 回滚后目标 / 测试链接的文件身份不对: $R3_WHY";;
+  *) bad "④-3 回滚后目标 / 测试链接的文件身份观测无效: $R3_WHY —— 不当成恢复成立";;
+esac
+if r4_pretpl_record "$EVID/08-pre-tplsync-after.txt"; then note "④-3 调用后 $R4_TARGET.pre-tplsync: $R3_VAL(只登记; 不是快照成员, 不进逐字恢复范围, 不据此判成败)"
+else note "④-3 调用后 .pre-tplsync 登记没取得: $R3_WHY(只登记项)"; fi
 r3_keep_verdict
 if _p="$(cat -- "$R3_ETC/platform" 2>/dev/null)"; then
   [[ "$_p" == ios ]] && ok "④-3 平台标记仍是 ios" || bad "④-3 平台标记变了([$_p])"
@@ -690,11 +820,11 @@ elif [[ "$_nl" == 1 ]]; then ok "④-5 $R4_TARGET 的 nlink 回到 1"
 else note "④-5 $R4_TARGET 的 nlink 现为 $_nl(登记实测, 不据此判成败)"; fi
 snap_state "late-after"
 {
-  echo "# 本支在这台一次性 runner 上的动作: 一次 bash $R3_CLI update --to $RETIRE_TAG(调用计数 $(_cnt_say)), 以及建 / 删一个硬链接"
+  echo "# 本支在这台一次性 runner 上的动作: 一次 bash $R3_CLI update --to $RETIRE_TAG(调用计数 $(_cnt_say)); 唯一的故障注入是建 / 删一个硬链接; 另有已登记的 DNS 仪器调整、仪器重启与一次静置"
   echo "# 前像来源: 同一 job 上一步 ② 的真实现场; 调用前经 DNS 仪器调整与一次 ${R3_Q_SECS:-303} s 静置"
   echo "# 故障点: 退役版 migrate_ios_gms_cleanup 的事务目标形态守卫(硬链接 ⇒ 具名拒绝, 未改动任何文件)"
   echo "# 退出码: 包装器(timeout)返回码 ${R4_WRAP_RC:-未取得}; 产品原始退出码 ${R4_PROD_RC:-未取得} —— 都不代替'回滚成功'"
-  echo "# 本次快照: ${R4_SNAP_NEW:-未取得}; 注入登记见 03-injection.txt; 前后清单见 01/05; 前后防火墙原文见 02/06"
+  echo "# 本次快照: ${R4_SNAP_NEW:-未取得}; 注入登记见 03-injection.txt; 前后清单见 01/05; 前后防火墙运行态原文见 02/06; 调用前磁盘原文见 07; .pre-tplsync 前后见 08"
   echo "# 不覆盖: v1.7.8、完整旧安装器、官方分发来源、发布"
   echo "# 证据文件"; ls -1 "$EVID" | sed 's/^/  /'
 } | _ev 99-late-summary.txt

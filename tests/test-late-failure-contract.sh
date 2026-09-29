@@ -16,6 +16,8 @@
 #   正常输出之后异常退出 = 这一格执行无效; 调用记录读不到 = 读不到, 不补 0。
 #   331: 格的有效性把子壳退出码、退出码文件读取、末行读取、收尾标记分开核(读取失败 = 观测无效, 与子壳异常分开说);
 #        第一、二节宣布"没有违规形态"的查询分清找到 / 确认没找到 / 查询出错, 计数的退出码与条数必须一致。
+#   335(路径 A): 注入前提门改为核冻结退役提交里模板的有效规则(调用前现役文件不再要求含 5228)、救援自动选址的只读探测;
+#        有序证据加 M0「模板重建」; 调用前补采磁盘防火墙原文与 .pre-tplsync; 回滚后核目标 / 链接的设备 / inode / nlink。
 #
 # 复用与替换: ④ 的判据执行**原文**; 只替换它的外部依赖 —— 文件类判据经 PDG_LATE_FAIL_ROOT 指到沙箱树
 # (与产品 migrate_wloc_retire 的 PDG_RETIRE_ROOT 同款约定), nft / ③ 的各道门用格内函数顶替, 并逐项登记。
@@ -191,10 +193,29 @@ bash -n "$T/r4fns.sh" && bash -n "$T/r3fns.sh" && bash -n "$T/r3dns.sh" && ok "�
 
 mkroot(){   # $1=沙箱根 [$2=nftables.conf 内容]
   mkdir -p "$1/etc/mosdns/rules" "$1/etc/privdns-gateway" "$1/var/lib/pdg-accept4" "$1/opt/pdg-bot" "$1/usr/local/bin"
-  printf '%s\n' "${2:-    ip saddr 10.0.0.0/16 tcp dport { 53, 80, 81, 443, 853, 5228-5230, 8445 } accept}" > "$1/etc/nftables.conf"
+  # 335: 缺省按真实前像的形态 —— 已是 inet pdg、端口集里没有 5228(333: ② 已把它清掉)
+  if [[ -n "${2:-}" ]]; then printf '%s\n' "$2"
+  else printf 'table inet pdg {\n    chain input {\n        ip saddr 10.0.0.0/16 tcp dport { 53, 81, 853, 7893, 8445 } accept\n    }\n}\n'; fi > "$1/etc/nftables.conf"
   chmod 644 "$1/etc/nftables.conf"; printf 'ios\n' > "$1/etc/privdns-gateway/platform"
   printf 'x\n' > "$1/opt/pdg-bot/a.py"; printf 'y\n' > "$1/usr/local/bin/pdg"
+  # 335: 冻结退役模板从受控替身仓库读(整支共用、各格只读); 格可以把 RETIRE_SHA / BRIDGE_SHA 换成别的形态
+  # shellcheck disable=SC2034  # 由 source 进来的 ④ 原文按名字读取
+  R3_OBJ="$T/robj" RETIRE_SHA="$TPL_GOOD" BRIDGE_SHA="$TPL_GOOD"
 }
+mktplrepo(){   # $1=目录 → 置 TPL_GOOD / TPL_COMMENT / TPL_NONE / TPL_MISSING(每种模板形态一个提交; 仓库改动一律经 e2e_git)
+  local r="$1" f="$1/deploy/firewall/nftables-mihomo.conf"
+  mkdir -p "$r/deploy/firewall" && git -C "$r" init -q || return 1
+  _tc(){ e2e_git "$r" add -A && e2e_git "$r" -c user.name=t -c user.email=t@example.invalid -c commit.gpgsign=false -c core.hooksPath=/dev/null commit -q --allow-empty -m "$1" >/dev/null && git -C "$r" rev-parse HEAD; }
+  printf '%s\n' '# 80/443/5228-5230 在 prerouting 被改写为 7893(注释里的端口不算)' 'table inet pdg {' '    chain prerouting {' \
+    '        ip saddr __INTERNAL_CIDR__ tcp dport { 80, 443, 5228-5230 } redirect to :7893' '    }' '}' > "$f" && TPL_GOOD="$(_tc good)" || return 1
+  printf '%s\n' '# ip saddr __INTERNAL_CIDR__ tcp dport { 80, 443, 5228-5230 } redirect to :7893' 'table inet pdg {' '    chain prerouting {' \
+    '        ip saddr __INTERNAL_CIDR__ tcp dport { 80, 443 } redirect to :7893   # 以前是 tcp dport { 80, 443, 5228-5230 }' '    }' '}' > "$f" && TPL_COMMENT="$(_tc comment)" || return 1
+  printf '%s\n' 'table inet pdg {' '    chain prerouting {' '        ip saddr __INTERNAL_CIDR__ tcp dport { 80, 443 } redirect to :7893' '    }' '}' > "$f" \
+    && TPL_NONE="$(_tc none)" || return 1
+  rm -f -- "$f" && TPL_MISSING="$(_tc missing)" || return 1
+  [[ "$TPL_GOOD$TPL_COMMENT$TPL_NONE$TPL_MISSING" =~ ^([0-9a-f]{40}){4}$ ]]
+}
+E2E_ROOT="$ROOT" mktplrepo "$T/robj" || { bad "三-0 冻结退役模板的受控替身仓库建不出来"; echo "通过 $pass, 失败 $nfail"; exit 1; }
 cell(){   # $1=格名 $2=代码 → 输出进 $T/out-$1(子壳里跑, 装载被测原文 + 受控依赖)
   ( set +u
     SB="$T/sb-$1"; mkdir -p "$SB"; mkroot "$SB"
@@ -249,9 +270,10 @@ cell a-plat 'printf "android\n" > "$R3_ETC/platform"; r4_trigger_ready; echo "TR
 cell_ok a-plat && grep -qx 'TRC=1' "$T/out-a-plat" && grep -qF 'GMS 清理只在 ios 上动手' "$T/out-a-plat" \
   && ok "三-A2 平台不是 ios ⇒ 触发前提不成立(GMS 清理第一行就返回 0, 守卫轮不到)" \
   || bad "三-A2 触发前提的原因不对: $(inval a-plat) $(grep TWHY "$T/out-a-plat" | head -c 150)"
-cell a-5228 'sed -i "s/, 5228-5230//" "$R4_TARGET"; r4_trigger_ready; echo "TRC=$?"; echo "TWHY=$R3_WHY"'
-cell_ok a-5228 && grep -qx 'TRC=1' "$T/out-a-5228" && grep -qF '没有 5228 端口集' "$T/out-a-5228" \
-  && ok "三-A3 没有 5228 端口集 ⇒ 触发前提不成立(守卫根本轮不到, 不是有效 ④)" || bad "三-A3 没被拒: $(inval a-5228) $(tr '\n' ' ' < "$T/out-a-5228" | head -c 200)"
+cell a-5228 '! grep -q 5228 "$R4_TARGET" || exit 7; r4_trigger_ready; echo "TRC=$?"; echo "TWHY=$R3_WHY"'
+cell_ok a-5228 && grep -qx 'TRC=0' "$T/out-a-5228" \
+  && ok "三-A3 调用前现役文件没有 5228(真实前像形态), 冻结退役模板的有效规则有 ⇒ 触发前提成立(5228 由更新中途的模板同步带回)" \
+  || bad "三-A3 新前提有效却没进入: $(inval a-5228) $(tr '\n' ' ' < "$T/out-a-5228" | head -c 200)"
 cell a-resc 'printf "PDG_RESCUE_BIND=10.1.0.5\n" > "$R3_ETC/profile.env"; r4_trigger_ready; echo "TRC=$?"; echo "TWHY=$R3_WHY"'
 cell_ok a-resc && grep -qx 'TRC=1' "$T/out-a-resc" && grep -qF '救援平面' "$T/out-a-resc" \
   && ok "三-A4 救援平面会被启用 ⇒ 触发前提不成立(它的 mv -f 会换掉目标 inode)" || bad "三-A4 没被拒 $(inval a-resc)"
@@ -291,6 +313,7 @@ mklog(){   # $1=文件 $2..=按顺序写进去的行
 }
 L_RET='  ✅ WLOC 位置改写及其专属 MITM 执行能力已退役(服务已停, 专属劫持与路由已撤)。'
 L_MIG='迁移(__migrate)失败, 回滚到更新前快照…'
+L_M0='防火墙按模板重建(同步模板改动; 你在 nft-input.d/ 里的规则不受影响)…'
 mk(){   # $1=格名 $2=期望返回码 $3=说明 $4=日志模板(\n 分行, @GMS@ = 命中句) $5=期望片段
   # shellcheck disable=SC2034  # 经父壳变量传进格(格是子壳, 看得见), 在格代码里展开
   TPL="$4"
@@ -302,15 +325,20 @@ printf "%b\n" "${TPL//@GMS@/$G}" > "$R3_LOG"'$'\n''r4_markers; echo "MRC=$?"'
   [[ -z "${5:-}" ]] || grep -qF -- "$5" "$T/out-$1" || why="${why:+$why; }缺「$5」"
   [[ -z "$why" ]] && ok "$3" || bad "$3: $why —— $(grep -E '^V(OK|BAD)' "$T/out-$1" | tr '\n' '|' | head -c 260)"
 }
-HEALTHY="$L_RET\n@GMS@\n$L_MIG\n回滚到 20260101-000000 …"
-mk c-ok   0 "三-C1 健康: 四个标记齐全且有序 ⇒ 成立" "$HEALTHY" '顺序成立'
-mk c-noret 1 "三-C2 没有退役成功句 ⇒ 不成立(不拿'最后恢复了'倒推退役发生过)" "@GMS@\n$L_MIG\n回滚到 20260101-000000 …" 'M1 没有本次 WLOC 退役成功的直接证据'
-mk c-nogms 1 "三-C3 没命中 GMS 形态守卫 ⇒ 不成立" "$L_RET\n  某别的迁移炸了\n$L_MIG\n回滚到 20260101-000000 …" 'M2 故障没有命中'
-mk c-order 1 "三-C4 顺序不对(命中排在退役成功之前)⇒ 不成立" "@GMS@\n$L_RET\n$L_MIG\n回滚到 20260101-000000 …" '顺序不成立'
-mk c-dup   1 "三-C5 退役成功句出现两次 ⇒ 不成立(应恰 1 次)" "$L_RET\n$L_RET\n@GMS@\n$L_MIG\n回滚到 20260101-000000 …" '应恰 1 次'
+HEALTHY="$L_M0\n$L_RET\n@GMS@\n$L_MIG\n回滚到 20260101-000000 …"
+mk c-ok   0 "三-C1 健康: 五个标记(M0–M4)齐全且有序 ⇒ 成立" "$HEALTHY" '顺序成立'
+mk c-noret 1 "三-C2 没有退役成功句 ⇒ 不成立(不拿'最后恢复了'倒推退役发生过)" "$L_M0\n@GMS@\n$L_MIG\n回滚到 20260101-000000 …" 'M1 没有本次 WLOC 退役成功的直接证据'
+mk c-nogms 1 "三-C3 没命中 GMS 形态守卫 ⇒ 不成立" "$L_M0\n$L_RET\n  某别的迁移炸了\n$L_MIG\n回滚到 20260101-000000 …" 'M2 故障没有命中'
+mk c-order 1 "三-C4 顺序不对(命中排在退役成功之前)⇒ 不成立" "$L_M0\n@GMS@\n$L_RET\n$L_MIG\n回滚到 20260101-000000 …" '顺序不成立'
+mk c-dup   1 "三-C5 退役成功句出现两次 ⇒ 不成立(应恰 1 次)" "$L_M0\n$L_RET\n$L_RET\n@GMS@\n$L_MIG\n回滚到 20260101-000000 …" '应恰 1 次'
 mk c-upd   1 "三-C6 产品自报「✅ 已更新。」⇒ 本次没有按预期失败, 不是有效 ④" "$HEALTHY\n    ✅ 已更新。" '没有**按预期失败'
 mk c-other 1 "三-C7 还扫到别的迁移的具名失败文案 ⇒ 失败来源不止一处, 不是有效 ④" "$HEALTHY\n  ❌ pdg-probe81 未能启用 —— 链路诊断的 HTTP 会话入口不可用。" '还扫到别的迁移失败文案'
-mk c-snap  1 "三-C8 回滚点名的不是本次新建的快照 ⇒ 不成立" "$L_RET\n@GMS@\n$L_MIG\n回滚到 20251231-235959 …" 'M4 日志里没有'
+mk c-snap  1 "三-C8 回滚点名的不是本次新建的快照 ⇒ 不成立" "$L_M0\n$L_RET\n@GMS@\n$L_MIG\n回滚到 20251231-235959 …" 'M4 日志里没有'
+# 335: M0「模板重建」只是写入前提示; 缺失 / 重复 / 乱序都不成立, 有 M0 没有 M2 也不能判故障命中
+mk c-m0miss  1 "三-C10 没有 M0「模板重建」⇒ 不成立" "$L_RET\n@GMS@\n$L_MIG\n回滚到 20260101-000000 …" 'M0 没有「模板重建」这一句'
+mk c-m0dup   1 "三-C11 M0 出现两次 ⇒ 不成立(应恰 1 次)" "$L_M0\n$L_M0\n$L_RET\n@GMS@\n$L_MIG\n回滚到 20260101-000000 …" '应恰 1 次'
+mk c-m0order 1 "三-C12 M0 排在退役成功之后 ⇒ 顺序不成立" "$L_RET\n$L_M0\n@GMS@\n$L_MIG\n回滚到 20260101-000000 …" '顺序不成立'
+mk c-m0only  1 "三-C13 有 M0 但没有 M2(模板同步写了, 守卫没拒)⇒ 不能判故障命中" "$L_M0\n$L_RET\n$L_MIG\n回滚到 20260101-000000 …" 'M2 故障没有命中'
 cell c-read 'R4_SNAP_NEW=20260101-000000; R3_LOG="$T/没有这个文件"; r4_markers; echo "MRC=$?"'
 cell_ok c-read && grep -qx 'MRC=1' "$T/out-c-read" && grep -qF '日志读不了' "$T/out-c-read" \
   && ok "三-C9 升级日志读不了 ⇒ 观测无效, 不消费半截结果" || bad "三-C9 读取失败没被具名: $(inval c-read) $(tr '\n' ' ' < "$T/out-c-read" | head -c 200)"
@@ -408,7 +436,7 @@ g g-q  16 "三-G5 准备阶段静置不成立 ⇒ 不调用" 'G_Q=1' ''
 g g-rt 12 "三-G6 运行态 / WLOC 前像门不成立 ⇒ 不调用" 'G_RT=1' ''
 g g-fs 17 "三-G7 ④ 的前像清单取不到 ⇒ 不调用" 'r4_fs_manifest(){ R3_WHY="清单取不到"; return 2; }' '前像文件清单没取得'
 g g-fw 17 "三-G8 运行中的防火墙读不到 ⇒ 不调用" 'nft(){ return 1; }' '运行中防火墙没取得'
-g g-trig 18 "三-G9 GMS 触发前提不成立(没有 5228)⇒ 不注入、不调用" 'sed -i "s/, 5228-5230//" "$SB/etc/nftables.conf"' '注入前提不成立'
+g g-trig 0 "三-G9 调用前现役文件没有 5228、冻结退役模板有效 ⇒ 进入注入, 调用恰 1 次" '! grep -q 5228 "$SB/etc/nftables.conf" || exit 7' '注入已建立并核过'
 g g-inj 18 "三-G10 注入建不起来(位置被占)⇒ 不调用" 'echo occupant > "$SB/var/lib/pdg-accept4/nftables.conf.link"' '注入未建立'
 g g-pre 13 "三-G11 ③ 的调用前观测没取全 ⇒ 不调用" 'G_PRE=1' ''
 g g-cnt 14 "三-G12 计数或退出码留档不可用 ⇒ 不调用" 'r3_invoke(){ R3_WHY="退出码留档准备不了"; return 2; }' '调用前停止'
@@ -427,7 +455,7 @@ GERR='grep(){ if [[ "$*" == *"$P"* ]]; then echo hit >> "$HIT"; return 2; fi; co
 LNREC='ln(){ echo "ln $*" >> "$STUB_CALLS"; command ln "$@"; }'
 DEVFAIL='stat(){ if [[ "$*" == "-c %d -- "*pdg-accept4 ]]; then command stat -c %d -- "$R4_TARGET"; echo hit >> "$HIT"; return 1; fi; command stat "$@"; }'
 VERFAIL='N="$R3_TMP/statn"; stat(){ if [[ "$*" == "-c %d:%i:%h -- $R4_TARGET" ]]; then local c=0; [[ -f "$N" ]] && c="$(cat "$N")"; c=$((c+1)); echo "$c" > "$N"; if (( c == 2 )); then command stat "$@"; echo hit >> "$HIT"; return 1; fi; fi; command stat "$@"; }'
-g g-q5228 18 "三-G14 5228 端口集的查询自身出错 ⇒ 前提观测无效, 不注入、不调用" "P=5228; $GERR" '注入前提观测无效' hit
+g g-qtpl 18 "三-G14 模板触发条件(5228 端口集)的查询自身出错 ⇒ 前提观测无效, 不注入、不调用" "P='[^}]*5228'; $GERR" '模板触发条件查询失败' hit
 g g-qresc 18 "三-G15 救援标记的查询自身出错 ⇒ 不当成「没有标记」, 不注入、不调用" "P=pdg-rescue; $GERR" '注入前提观测无效' hit
 g g-qdev 18 "三-G16 注入目录设备号先输出「同设备」再失败 ⇒ 不建链接(ln 替身 0 次)、不调用" "$LNREC; $DEVFAIL" '注入目录设备号查询失败' hit
 g g-qver 18 "三-G17 建完核验的查询先输出「nlink=2」再失败 ⇒ 按登记善后、不调用" "$VERFAIL" '建完核验不过或核验查询失败' hit
@@ -456,7 +484,7 @@ ob h-sort 2 "三-H5 调用后一侧按路径排序写出结果后失败(且内�
 sort(){ local last="${!#}"; if [[ "$*" == *-k5* && "$last" == */b ]]; then command sort "$@"; echo hit >> "$HIT"; return 2; fi; command sort "$@"; }'$'\n''r4_fs_diff "$R3_TMP/a" "$R3_TMP/b"; echo "XRC=$?"; echo "XWHY=$R3_WHY"' '调用后清单按路径排序失败(sort rc=2)'
 TRIG='r4_trigger_ready; echo "XRC=$?"; echo "XWHY=$R3_WHY"'
 ob h-resc 2 "三-H6 救援标记的查询自身出错 ⇒ 前提观测无效(不当成「没有标记」)" "P=pdg-rescue; $GERR"$'\n'"$TRIG" '救援标记查询失败'
-ob h-5228 2 "三-H7 5228 端口集的查询自身出错 ⇒ 前提观测无效, 不说成「没有 5228 端口集」" "P=5228; $GERR"$'\n'"$TRIG" '5228 端口集查询失败' '没有 5228 端口集'
+ob h-tplq 2 "三-H7 模板触发条件(5228 端口集)的查询自身出错 ⇒ 前提观测无效, 不说成「没有 5228 端口集」" "P='[^}]*5228'; $GERR"$'\n'"$TRIG" '模板触发条件查询失败' '没有 5228 端口集'
 if [[ "$(id -u)" == 0 ]]; then echo "[NOTE] 三-H8 以 root 跑, chmod 000 挡不住读取 —— 这一格未验(不计入通过)"
 else ob h-pe 2 "三-H8 profile.env 在却读不了 ⇒ 前提观测无效(不当成「没配 PDG_RESCUE_BIND」)" 'printf "PDG_RESCUE_BIND=10.1.0.5\n" > "$R3_ETC/profile.env"; chmod 000 "$R3_ETC/profile.env"; [[ -r "$R3_ETC/profile.env" ]] || echo hit >> "$HIT"'$'\n'"$TRIG" 'profile.env 在却查不了'; fi
 cell h-pe-none "$TRIG"
@@ -478,7 +506,7 @@ RBO='printf "✅ 已回滚并重启服务\n" > "$R3_LOG"'
 ob h-rbpart 1 "三-H13 「未完全回滚」的查询自身出错 ⇒ 不当成「没有」, 回滚结局不成立" "P=未能恢复; $GERR; $RBO"$'\n''r4_rollback_outcome; echo "XRC=$?"' '「未完全回滚」查询失败' '恰 1 次'
 ob h-rberr 1 "三-H14 回滚阶段 ❌ 的查询自身出错 ⇒ 不当成「没有」" "P=❌; $GERR; $RBO"$'\n''r4_rollback_outcome; echo "XRC=$?"' '回滚阶段 ❌ 的查询失败' '恰 1 次'
 ob h-scan 1 "三-H15 其它迁移失败文案的扫描查询出错 ⇒ 不说成「一条都没扫到」" "P='pdg-probe81 未能启用'; $GERR"$'\n''R4_SNAP_NEW=20260101-000000; G="  iOS GMS 清理: $R4_TARGET 是硬链接(nlink=2), 改它会波及另一个名字 → 未改动任何文件"
-printf "%s\n" "$L_RET" "$G" "$L_MIG" "回滚到 20260101-000000 …" > "$R3_LOG"; r4_markers; echo "XRC=$?"' '扫描查询失败' 'VNOTE ④-1 其它会传出失败的迁移'
+printf "%s\n" "$L_M0" "$L_RET" "$G" "$L_MIG" "回滚到 20260101-000000 …" > "$R3_LOG"; r4_markers; echo "XRC=$?"' '扫描查询失败' 'VNOTE ④-1 其它会传出失败的迁移'
 ob h-lineno 2 "三-H16 取行号的 grep 先输出再失败 ⇒ 行号不采信" 'printf "a\n回滚到 s1 …\n" > "$R3_LOG"; grep(){ if [[ "$1" == -nF ]]; then command grep "$@"; echo hit >> "$HIT"; return 2; fi; command grep "$@"; }'$'\n''r4_mark_line "$R3_LOG" "回滚到 s1"; echo "XRC=$?"; echo "XWHY=$R3_WHY"; echo "VAL=[$R3_VAL]"' '取行号的查询失败'
 SNV='R4_SNAP_BEFORE="old-1"; mkdir -p "$SNAPROOT/old-1"'$'\n'"$NEWSNAP"
 if [[ "$(id -u)" == 0 ]]; then echo "[NOTE] 三-H17 以 root 跑, chmod 000 挡不住读取 —— 这一格未验(不计入通过)"
@@ -597,6 +625,98 @@ dnb l-wu 1 "三-L6 W 由自有上游答 U ⇒ WLOC 接管没随回滚回来" 'PR
 dnb l-ch 1 "三-L7 C 答成 H ⇒ 独立上游对照不成立" 'PR_C=H' 'C(独立上游对照 c-post.example)经 local_upstream 取得 U —— 不成立' "$PWC"
 dnb l-cu0 1 "三-L8 C 答 U 但自有上游没收到 ⇒ 来源证据不成立(缓存或别的来源)" 'PR_C=U0' '来源证据不成立' "$PWC"
 dnb l-pbad 1 "三-L9 P 的探针观测无效 ⇒ 不算成立" 'PR_P=bad' '观测无效' "$PWC"
+
+# ── 三-N 注入前提门(335, 路径 A): 冻结退役模板的有效规则、inet pdg、救援自动选址 ─────────────
+TRC_CODE='r4_trigger_ready; echo "TRC=$?"; echo "TWHY=$R3_WHY"'
+tg(){   # $1=格名 $2=期望 TRC $3=说明 $4=布置 $5=期望原因片段(可空) [$6=hit: 注入必须命中]
+  cell "$1" "$4"$'\n'"$TRC_CODE"
+  local why; why="$(inval "$1")"
+  grep -qx "TRC=$2" "$T/out-$1" || why="${why:+$why; }返回 [$(grep -m1 '^TRC=' "$T/out-$1")], 期望 $2"
+  [[ -z "${5:-}" ]] || grep -qF -- "$5" "$T/out-$1" || why="${why:+$why; }缺原因「$5」"
+  [[ "${6:-}" != hit ]] || hit "$1" || why="${why:+$why; }注入没命中"
+  [[ -z "$why" ]] && ok "$3" || bad "$3: $why —— $(grep -E '^(TRC|TWHY|VBAD)' "$T/out-$1" | tr '\n' ' ' | head -c 240)"
+}
+GSHOW='git(){ if [[ "$1" == -C && "$3" == show ]]; then command git "$@"; echo hit >> "$HIT"; return 1; fi; command git "$@"; }'
+GLSTREE='git(){ if [[ "$1" == -C && "$3" == ls-tree ]]; then command git "$@"; echo hit >> "$HIT"; return 1; fi; command git "$@"; }'
+AUTO='printf "PDG_INTERNAL_CIDR=10.9.0.0/16\n" > "$R3_ETC/profile.env"; ip(){ echo "ip $*" >> "$R3_TMP/ip.calls"; printf "%s\n" "2: eth0    inet 10.9.1.5/24 brd 10.9.1.255 scope global eth0" "3: eth1    inet 192.168.7.2/24 brd 192.168.7.255 scope global eth1"; }'
+tg n-comment 1 "三-N1 冻结退役模板只在注释里有 5228(整行注释与行尾注释)⇒ 不成立(注释不算有效规则)" 'RETIRE_SHA="$TPL_COMMENT"' '注释里的不算'
+tg n-none 1 "三-N2 冻结退役模板里没有 5228 端口集 ⇒ 不成立" 'RETIRE_SHA="$TPL_NONE"' '有效规则里没有 5228 端口集'
+tg n-missing 1 "三-N3 冻结退役提交里没有模板文件 ⇒ 不成立" 'RETIRE_SHA="$TPL_MISSING"' '里没有 deploy/firewall/nftables-mihomo.conf'
+tg n-bridge 1 "三-N4 现役桥接那份(提交与现役仓库)有 5228、冻结退役那份没有 ⇒ 不成立(只认冻结退役模板)" 'RETIRE_SHA="$TPL_NONE"; BRIDGE_SHA="$TPL_GOOD"; R3_REPO="$SB/live"; mkdir -p "$R3_REPO/deploy/firewall"; git -C "$T/robj" show "$TPL_GOOD:deploy/firewall/nftables-mihomo.conf" > "$R3_REPO/deploy/firewall/nftables-mihomo.conf" || exit 9' '有效规则里没有 5228 端口集'
+tg n-show 2 "三-N5 模板读取先输出全文再失败 ⇒ 观测无效(已输出的不采信)" "$GSHOW" '冻结退役模板读取失败(git show rc=1)' hit
+tg n-lstree 2 "三-N6 退役树查询先输出再失败 ⇒ 观测无效" "$GLSTREE" '树查询失败(git ls-tree rc=1)' hit
+tg n-notpdg 1 "三-N7 现役文件还不是 inet pdg ⇒ 模板同步不会动手, 不成立" 'printf "ip saddr 10.0.0.0/16 tcp dport { 53 } accept\n" > "$R4_TARGET"' '还不是 inet pdg'
+tg n-pdgq 2 "三-N8 inet pdg 的查询自身出错 ⇒ 观测无效" "P='table inet pdg'; $GERR" 'inet pdg 查询失败' hit
+tg n-auto1 1 "三-N9 没配监听地址、来源段里恰有 1 个本机全局地址 ⇒ 救援平面会自动选址启用, 不成立" "$AUTO" '会自动选址启用'
+tg n-auto2 0 "三-N10 来源段里有 2 个本机全局地址 ⇒ 不会自动选址(与产品同口径), 前提成立" 'printf "PDG_INTERNAL_CIDR=10.9.0.0/16\n" > "$R3_ETC/profile.env"; ip(){ printf "%s\n" "2: eth0    inet 10.9.1.5/24 scope global eth0" "3: eth1    inet 10.9.2.6/24 scope global eth1"; }' ''
+tg n-auto0 0 "三-N11 救援意图明确为 0 ⇒ 来源段里恰有 1 个地址也不会自动启用, 前提成立" "$AUTO"'; printf "PDG_RESCUE_ENABLED=0\n" >> "$R3_ETC/profile.env"' ''
+tg n-autoq 2 "三-N12 本机地址查询先输出再失败 ⇒ 自动选址判不了, 观测无效" 'printf "PDG_INTERNAL_CIDR=10.9.0.0/16\n" > "$R3_ETC/profile.env"; ip(){ printf "%s\n" "2: eth0    inet 10.9.1.5/24 scope global eth0"; echo hit >> "$HIT"; return 1; }' '本机地址查询失败(ip rc=1)' hit
+tg n-autoquote 1 "三-N13 来源段最后一次赋值带引号(产品去掉一层引号)⇒ 同样判到自动选址" "$AUTO"'; printf "PDG_INTERNAL_CIDR=\"10.9.0.0/16\"\n" >> "$R3_ETC/profile.env"' '会自动选址启用'
+tg n-autolast 0 "三-N14 来源段取最后一次赋值(与产品同口径): 后一次改成不含本机地址的段 ⇒ 不会自动选址" "$AUTO"'; printf "PDG_INTERNAL_CIDR=172.31.0.0/16\n" >> "$R3_ETC/profile.env"' ''
+# 336: 救援意图 / 来源段取"最后一次赋值"时保留末条空值(与产品 `sed -n … | tail -1` 同义); 读取与选取两步的失败各自具名
+tg n-lastintent 1 "三-N15 意图末两条为 0、空 ⇒ 末条空值 = 意图为空, 自动选址会启用, 不成立(不被上一条 0 放行)" "$AUTO"'; printf "PDG_RESCUE_ENABLED=0\nPDG_RESCUE_ENABLED=\n" >> "$R3_ETC/profile.env"' '会自动选址启用'
+tg n-lastcidr 0 "三-N16 来源段末两条为有效、空 ⇒ 末条空值 = 没有来源段, 不会自动选址, 不多拦" "$AUTO"'; printf "PDG_INTERNAL_CIDR=\n" >> "$R3_ETC/profile.env"' ''
+tg n-empintent 1 "三-N17 意图连续两条空 ⇒ 意图为空, 自动选址会启用(对照)" "$AUTO"'; printf "PDG_RESCUE_ENABLED=\nPDG_RESCUE_ENABLED=\n" >> "$R3_ETC/profile.env"' '会自动选址启用'
+tg n-empcidr 0 "三-N18 来源段连续两条空 ⇒ 没有来源段(对照)" 'printf "PDG_INTERNAL_CIDR=\nPDG_INTERNAL_CIDR=\n" > "$R3_ETC/profile.env"; ip(){ echo "ip $*" >> "$R3_TMP/ip.calls"; printf "%s\n" "2: eth0    inet 10.9.1.5/24 scope global eth0"; }' ''
+SEDI='sed(){ if [[ "$*" == *PDG_RESCUE_ENABLED* ]]; then command sed "$@"; echo hit >> "$HIT"; return 4; fi; command sed "$@"; }'
+tg n-sedintent 2 "三-N19 救援意图读取先输出再失败 ⇒ 观测无效(已写出的不采信)" "$AUTO; $SEDI" '救援意图读取失败(sed rc=4)' hit
+tg n-tailcidr 2 "三-N20 来源段取最后一次赋值先输出再失败 ⇒ 观测无效" "$AUTO"'; tail(){ if [[ "$*" == *rescue-cidr.all* ]]; then command tail "$@"; echo hit >> "$HIT"; return 1; fi; command tail "$@"; }' '来源段取最后一次赋值失败(tail rc=1)' hit
+tg n-tailintent 2 "三-N21 救援意图取最后一次赋值失败 ⇒ 观测无效" "$AUTO"'; tail(){ if [[ "$*" == *rescue-intent.all* ]]; then command tail "$@"; echo hit >> "$HIT"; return 1; fi; command tail "$@"; }' '救援意图取最后一次赋值失败(tail rc=1)' hit
+tg n-sedcidr 2 "三-N22 来源段读取先输出再失败 ⇒ 观测无效" "$AUTO"'; sed(){ if [[ "$*" == *PDG_INTERNAL_CIDR* ]]; then command sed "$@"; echo hit >> "$HIT"; return 4; fi; command sed "$@"; }' '来源段读取失败(sed rc=4)' hit
+# 门不成立 / 观测无效 ⇒ 注入(ln 替身)与桩 CLI 都由替身自己记, 都必须 0 次
+g g-nmissing 18 "三-G19 冻结退役提交里没有模板 ⇒ 不注入、不调用(ln 与 CLI 都 0 次)" "$LNREC"'; RETIRE_SHA="$TPL_MISSING"' '注入前提不成立'
+g g-nshow 18 "三-G20 模板读取先输出再失败 ⇒ 不注入、不调用(ln 与 CLI 都 0 次)" "$LNREC; $GSHOW" '注入前提观测无效' hit
+g g-nauto 18 "三-G21 救援会自动选址启用 ⇒ 不注入、不调用(ln 与 CLI 都 0 次)" "$LNREC; $AUTO" '注入前提不成立'
+g g-ncomment 18 "三-G22 模板只在注释里有 5228 ⇒ 不注入、不调用(ln 与 CLI 都 0 次)" "$LNREC"'; RETIRE_SHA="$TPL_COMMENT"' '注入前提不成立'
+# 336: 末条空值与读取失败的门控格 —— ln 写自己的记录文件(事先建空), 与桩 CLI 分开记; 读不到不补 0
+LNSEP=': > "$R3_TMP/ln.calls"; ln(){ echo "ln $*" >> "$R3_TMP/ln.calls"; command ln "$@"; }'
+lncnt(){ local f="$T/tmp-$1/ln.calls" n rc; [[ -f "$f" && -r "$f" ]] || { printf '读不到'; return 2; }; n="$(grep -c . "$f" 2>/dev/null)"; rc=$?; (( rc <= 1 )) && [[ "$n" =~ ^[0-9]+$ ]] || { printf '读不到'; return 2; }; printf '%s' "$n"; }   # ln 替身自己的记录 → 条数 / 读不到
+g g-lastintent 18 "三-G26 意图末两条为 0、空 ⇒ 自动选址会启用, 不注入、不调用(桩 CLI 0 次; ln 另见三-G29)" "$LNSEP; $AUTO"'; printf "PDG_RESCUE_ENABLED=0\nPDG_RESCUE_ENABLED=\n" >> "$R3_ETC/profile.env"' '注入前提不成立'
+g g-lastcidr 0 "三-G27 来源段末两条为有效、空 ⇒ 不多拦, 照常注入并调用 1 次(ln 另见三-G29)" "$LNSEP; $AUTO"'; printf "PDG_INTERNAL_CIDR=\n" >> "$R3_ETC/profile.env"' '注入已建立并核过'
+g g-sedintent 18 "三-G28 救援意图读取先输出再失败 ⇒ 前提观测无效, 不注入、不调用(桩 CLI 0 次; ln 另见三-G29)" "$LNSEP; $AUTO; $SEDI" '注入前提观测无效' hit
+q1="$(lncnt g-lastintent)"; r1=$?; q2="$(lncnt g-sedintent)"; r2=$?; q3n="$(lncnt g-lastcidr)"; r3n=$?
+if cell_ok g-lastintent && cell_ok g-sedintent && cell_ok g-lastcidr && (( r1 == 0 && r2 == 0 && r3n == 0 )) && [[ "$q1" == 0 && "$q2" == 0 && "$q3n" == 1 ]]; then
+  ok "三-G29 ln 替身独立记账: 三-G26 0 次、三-G28 0 次(阻断格没建链接), 三-G27 1 次(健康格照常建链接)"
+else bad "三-G29 ln 独立记账不对: G26 [$q1/$r1] G28 [$q2/$r2] G27 [$q3n/$r3n] $(inval g-lastintent) $(inval g-sedintent) $(inval g-lastcidr)"; fi
+
+# ── 三-P 调用前补采: 磁盘防火墙原文 / 摘要 / 文件身份, .pre-tplsync 单独登记 ────────────────
+if cell_ok g-ok && cmp -s "$T/evid-g-ok/07-nft-disk-before.conf" "$T/sb-g-ok/etc/nftables.conf" \
+   && grep -qxE "sha256	$(sha256sum < "$T/sb-g-ok/etc/nftables.conf" | cut -c1-64)" "$T/evid-g-ok/07-nft-disk-before.id" \
+   && grep -qE '^stat\(类型\|mode\|属主\|设备:inode:nlink\|字节\)	regular file\|644\|[0-9]+:[0-9]+\|[0-9]+:[0-9]+:1\|[0-9]+$' "$T/evid-g-ok/07-nft-disk-before.id" \
+   && grep -qx '状态	不存在' "$T/evid-g-ok/08-pre-tplsync-before.txt"; then
+  ok "三-P1 健康: 调用前磁盘原文逐字留存、摘要与文件身份(注入前 nlink=1)已记; .pre-tplsync 不存在也如实登记"
+else bad "三-P1 调用前补采不完整: $(inval g-ok) $(ls "$T/evid-g-ok" 2>/dev/null | tr '\n' ' ')"; fi
+g g-ptpl 0 "三-G23 .pre-tplsync 已存在(普通文件)⇒ 只登记, 不当前提, 照常进入注入" 'printf "old\n" > "$SB/etc/nftables.conf.pre-tplsync"' '注入已建立并核过'
+cell_ok g-ptpl && grep -qx '状态	存在' "$T/evid-g-ptpl/08-pre-tplsync-before.txt" \
+  && grep -qx "sha256	$(printf 'old\n' | sha256sum | cut -c1-64)" "$T/evid-g-ptpl/08-pre-tplsync-before.txt" \
+  && [[ "$(cat "$T/sb-g-ptpl/etc/nftables.conf.pre-tplsync" 2>/dev/null)" == old ]] \
+  && ok "三-P2 .pre-tplsync 存在: 类型 / mode / 属主 / 身份 / 摘要都登记, 文件原样未动(不删除、不修整)" \
+  || bad "三-P2 .pre-tplsync 登记不对: $(inval g-ptpl) $(tr '\n' ' ' < "$T/evid-g-ptpl/08-pre-tplsync-before.txt" 2>/dev/null)"
+g g-ptplq 17 "三-G24 .pre-tplsync 的身份查询先输出再失败 ⇒ 调用前观测不全, 不注入、不调用(ln 与 CLI 都 0 次)" "$LNREC"'; printf "old\n" > "$SB/etc/nftables.conf.pre-tplsync"; stat(){ if [[ "$*" == *pre-tplsync* ]]; then command stat "$@"; echo hit >> "$HIT"; return 1; fi; command stat "$@"; }' '.pre-tplsync 登记没取得' hit
+g g-ndisk 17 "三-G25 调用前磁盘原文读取先输出再失败 ⇒ 调用前观测不全, 不注入、不调用(ln 与 CLI 都 0 次)" "$LNREC"'; cat(){ if [[ "$*" == "-- $R4_TARGET" ]]; then command cat "$@"; echo hit >> "$HIT"; return 1; fi; command cat "$@"; }' '原文读取失败(cat rc=1)' hit
+
+# ── 三-T 回滚后目标与测试链接的文件身份(与登记的旧 inode 区分; 查询失败不当成恢复成立)──────────
+TAPRE='r4_inject_create >/dev/null || exit 8'
+REPLACE='cp -- "$R4_TARGET" "$R3_TMP/restore" && rm -f -- "$R4_TARGET" && cp -- "$R3_TMP/restore" "$R4_TARGET" || exit 9'
+ta(){   # $1=格名 $2=期望 XRC $3=说明 $4=注入之后的布置 $5=期望原因片段(可空) [$6=hit]
+  cell "$1" "$TAPRE"$'\n'"$4"$'\n''r4_target_after; echo "XRC=$?"; echo "XWHY=$R3_WHY"'
+  local why; why="$(inval "$1")"
+  grep -qx "XRC=$2" "$T/out-$1" || why="${why:+$why; }返回 [$(grep -m1 '^XRC=' "$T/out-$1")], 期望 $2"
+  [[ -z "${5:-}" ]] || grep -qF -- "$5" "$T/out-$1" || why="${why:+$why; }缺原因「$5」"
+  [[ "${6:-}" != hit ]] || hit "$1" || why="${why:+$why; }注入没命中"
+  [[ -z "$why" ]] && ok "$3" || bad "$3: $why —— $(grep -E '^(XRC|XWHY)' "$T/out-$1" | tr '\n' ' ' | head -c 240)"
+}
+ta t-ok 0 "三-T1 回滚按产品方式换出新文件 ⇒ 目标新 inode、nlink=1, 旧 inode 只剩链接 ⇒ 成立" "$REPLACE" ''
+ta t-inplace 1 "三-T2 目标被原地改回(仍是登记的旧 inode, 与链接同一个)⇒ 不是产品换出的新文件, 不成立" 'printf "restored\n" > "$R4_TARGET"' '仍是登记的旧 inode'
+ta t-statt 2 "三-T3 目标身份查询先输出再失败 ⇒ 观测无效, 不当成恢复成立" "$REPLACE"'; stat(){ if [[ "$*" == "-c %d:%i:%h -- $R4_TARGET" ]]; then command stat "$@"; echo hit >> "$HIT"; return 1; fi; command stat "$@"; }' '目标身份查询失败(stat rc=1' hit
+ta t-statl 2 "三-T4 链接身份查询先输出再失败 ⇒ 观测无效" "$REPLACE"'; stat(){ if [[ "$*" == "-c %d:%i:%h -- $R4_LINK" ]]; then command stat "$@"; echo hit >> "$HIT"; return 1; fi; command stat "$@"; }' '测试链接身份查询失败(stat rc=1' hit
+ta t-nolink 1 "三-T5 测试链接已不在 ⇒ 旧 inode 的去向判不了, 不成立" "$REPLACE"'; rm -f -- "$R4_LINK"' '测试链接已不在'
+ta t-other 1 "三-T7 测试链接被换成了别的文件(不再是登记的旧 inode)⇒ 不成立" "$REPLACE"'; printf "other\n" > "$R3_TMP/other" && mv -f -- "$R3_TMP/other" "$R4_LINK" || exit 9' '不再是登记的旧 inode'
+cell t-noreg 'R4_INJ=""; r4_target_after; echo "XRC=$?"; echo "XWHY=$R3_WHY"'
+cell_ok t-noreg && grep -qx 'XRC=2' "$T/out-t-noreg" && grep -qF '没有登记过注入身份' "$T/out-t-noreg" \
+  && ok "三-T6 没有登记过注入身份 ⇒ 观测无效(不拿当前文件凑一个)" || bad "三-T6 没登记时的处置不对: $(inval t-noreg) $(tr '\n' ' ' < "$T/out-t-noreg" | head -c 160)"
+ob h-m0q 1 "三-H19 M0 的查询自身出错 ⇒ 不成立(不当成有 M0)" "P='防火墙按模板重建'; $GERR"$'\n''R4_SNAP_NEW=20260101-000000; G="  iOS GMS 清理: $R4_TARGET 是硬链接(nlink=2), 改它会波及另一个名字 → 未改动任何文件"
+printf "%s\n" "$L_M0" "$L_RET" "$G" "$L_MIG" "回滚到 20260101-000000 …" > "$R3_LOG"; r4_markers; echo "XRC=$?"' '计数查询失败(grep rc=2'
 
 # ── 三-M 契约自身: 格的有效性与调用记录 ──────────────────────────────────────
 cell m-crash 'echo "XRC=0"; exit 3'
