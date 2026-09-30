@@ -198,7 +198,8 @@ else bad "二-6 没有显式清掉 PDG_UPDATE_SVCSTATE"; fi
 grep -E '\b(cp|install|rsync|mv|ln)\b' "$T/r3code.txt" > "$T/r3write.txt"
 if grep -qE '(/usr/local/bin|/opt/|R3_CLI|R3_MODDIR|R3_REPO)' "$T/r3write.txt"; then bad "二-7 ③ 脚本在往现役目录写文件(拷候选冒充升级)"
 else ok "二-7 ③ 脚本不向 /usr/local/bin、/opt 或现役仓库拷文件"; fi
-for f in tests/e2e-real-bridge-hop.sh tests/e2e-lib.sh tests/e2e-real-platform-fail.sh tests/repoguard.sh tests/helpers/dns-stub.py deploy/bot/pdg.sh; do
+# 353: ⑤(tests/e2e-real-platform-fail.sh)不在这张整文件清单里 —— 它自己的验收器要修; 改由三节开头的二-8 核「②、③ 与本契约实际抽取的共享输入」不变。
+for f in tests/e2e-real-bridge-hop.sh tests/e2e-lib.sh tests/repoguard.sh tests/helpers/dns-stub.py deploy/bot/pdg.sh; do
   if git -C "$ROOT" diff --quiet "$BASE" -- "$f" 2>/dev/null && git -C "$ROOT" diff --quiet -- "$f" 2>/dev/null; then ok "二-8 $f 相对基线逐字不变"
   else bad "二-8 $f 相对基线有改动"; fi
 done
@@ -284,6 +285,137 @@ xfn(){   # $1=来源 $2..=名字 → 打印唯一成对标记之间的原文; �
     sed -n "$((b+1)),$((e-1))p" "$src"
   done
 }
+# ── 二-8(353): ⑤ 只核 ②、③ 与本契约**实际抽取**的共享输入相对基线逐字节不变 ────────────────────────
+#   · 抽取点从消费者源码现取(② 的两处调用及其 EXTRACT_NAMES / EXTRACT_DEPS、③ 的两处调用、本契约的 xfn 调用), 不在这里另抄名单;
+#     消费者里出现认不出的用法(别的变量、source、别的取法)一律判不成立 —— 新用法不会被静默漏掉;
+#   · 取法用消费者自己的原文: ②③ 用 ② 的 extract_marked_fns / extract_marked_decls(③ 运行时也是从 ② 引导出这两支), 本契约用 xfn;
+#   · 基线一侧 = git show BASE:⑤(核退出码与非空), 现在一侧 = 工作区的 ⑤; 两侧各取一次, 逐抽取点逐字节比;
+#   · 对象读不到或先输出后失败、抽取点认不出或名单为空、任一取法返回非 0(哪怕已写出内容)、取出为空 —— 都记 FAIL, 不当成"相同"。
+PF_REL=tests/e2e-real-platform-fail.sh
+pf_uses(){   # $1=消费者源码 $2=说明 $3=hop|self → 每个抽取点一行「fns|decls|xfn 名字…」; 认不出或有未登记的用法 ⇒ 非 0(原因行以 UNREG 开头)
+  python3 - "$1" "$2" "$3" "$PF_REL" <<'PY'
+import re, sys
+src, who, mode, rel = sys.argv[1:5]
+try:
+    raw = open(src, encoding="utf-8").read().split("\n")
+except Exception as e:
+    print("UNREG %s: 读不了(%s)" % (who, e)); sys.exit(1)
+code = [l for l in raw if not re.match(r"\s*#", l)]
+logical, buf = [], ""
+for l in code:
+    if l.endswith("\\"):
+        buf += l[:-1] + " "; continue
+    logical.append(buf + l); buf = ""
+arrays = {m.group(1): m.group(2).split() for m in re.finditer(r"^([A-Z0-9_]+)=\(([^)]*)\)", "\n".join(code), re.M)}
+keys = [rel] + (["PLAT_SRC"] if mode == "hop" else [])
+out, bad = [], []
+for l in logical:
+    if not any(k in l for k in keys):
+        continue
+    s = l.strip()
+    if mode == "self":
+        if s == "PF_REL=" + rel:
+            continue
+        hits = list(re.finditer(r'xfn "\$ROOT/%s" ((?:[A-Za-z_][A-Za-z0-9_]* +)+)> "' % re.escape(rel), s))
+        if not hits or s.count(rel) != len(hits):
+            bad.append("认不出的用法: " + s[:100]); continue
+        out += ["xfn " + " ".join(h.group(1).split()) for h in hits]
+        continue
+    if s == 'PLAT_SRC="$E2E_ROOT/%s"' % rel or re.fullmatch(r'\[\[ -f "\$PLAT_SRC" \]\] \|\| _hard "[^"]*"', s):
+        continue
+    m = re.fullmatch(r'(extract_marked_fns|extract_marked_decls) "\$PLAT_SRC" "[^"]+" (.+?) *\|\| *_hard "[^"]*"', s)
+    if not m:
+        bad.append("认不出的用法: " + s[:100]); continue
+    names = []
+    for t in m.group(2).split():
+        a = re.fullmatch(r'"\$\{([A-Z0-9_]+)\[@\]\}"', t)
+        if a and a.group(1) in arrays:
+            names += arrays[a.group(1)]
+        elif a:
+            bad.append("数组 %s 在源码里取不到" % a.group(1))
+        elif re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", t):
+            names.append(t)
+        else:
+            bad.append("认不出的参数 %s" % t)
+    if not names:
+        bad.append("%s 的名单为空" % m.group(1))
+    out.append(("fns " if m.group(1) == "extract_marked_fns" else "decls ") + " ".join(names))
+if not out:
+    bad.append("一个抽取点都没认出来")
+for b in bad:
+    print("UNREG %s: %s" % (who, b))
+if bad:
+    sys.exit(1)
+print("\n".join(out))
+print("END %s %d" % (who, len(out)))   # 354: 每段以「END 说明 条数」收尾, 读的一侧据此核清单读全
+PY
+}
+PF_WHO=(② ③ 本契约)   # 354: 三段清单的收尾顺序(pf_uses 每段最后打「END 说明 条数」)
+pf_list(){   # $1=清单文件 → 0 读全、三段收尾齐且条数对得上、每行合法(抽取点放进 PF_PTS) / 1 不完整或不合法(原因在 PF_WHY)
+  local -a lines; local l seg=0 cnt=0
+  PF_PTS=(); PF_WHY=""
+  mapfile -t lines < "$1" || { PF_WHY="抽取点清单读不了"; return 1; }
+  for l in "${lines[@]}"; do
+    if [[ "$l" =~ ^END\ ([^\ ]+)\ ([0-9]+)$ ]]; then
+      { (( seg < ${#PF_WHO[@]} )) && [[ "${BASH_REMATCH[1]}" == "${PF_WHO[$seg]}" ]]; } \
+        || { PF_WHY="第 $((seg+1)) 段的收尾不对([${l:0:40}])"; return 1; }
+      (( BASH_REMATCH[2] == cnt && cnt > 0 )) || { PF_WHY="${PF_WHO[$seg]} 登记 ${BASH_REMATCH[2]} 个抽取点, 读到 $cnt 个"; return 1; }
+      seg=$((seg+1)); cnt=0; continue
+    fi
+    [[ "$l" =~ ^(fns|decls|xfn)(\ [A-Za-z_][A-Za-z0-9_]*)+$ ]] || { PF_WHY="认不出的清单行 [${l:0:60}]"; return 1; }
+    (( seg < ${#PF_WHO[@]} )) || { PF_WHY="最后一段收尾之后还有抽取点"; return 1; }
+    PF_PTS+=("$l"); cnt=$((cnt+1))
+  done
+  (( seg == ${#PF_WHO[@]} && cnt == 0 )) || { PF_WHY="只读到 $seg / ${#PF_WHO[@]} 段收尾(末段之后另有 $cnt 行)"; return 1; }
+}
+pf_take(){   # $1=⑤ 文件 $2=落点目录 → 0 PF_PTS 里每个抽取点都取得且非空 / 1 有取法失败(原因写进 $2/why)
+  local f="$1" d="$2" kind rest i=0 rc p
+  mkdir -p "$d" || return 1
+  for p in "${PF_PTS[@]}"; do
+    i=$((i+1)); kind="${p%% *}"; rest="${p#* }"
+    # 名字已由 pf_uses 与 pf_list 逐个核成标识符, 按词展开就是消费者自己的参数形态; 抽取器是 ② 的原文(运行时才生成)
+    # shellcheck disable=SC2086 source=/dev/null
+    case "$kind" in
+      fns)   ( source "$T/pf-extractor.sh" && TMPDIR="$d" extract_marked_fns "$f" "$d/$i.out" $rest ) > "$d/$i.err" 2>&1; rc=$?;;
+      decls) ( source "$T/pf-extractor.sh" && TMPDIR="$d" extract_marked_decls "$f" "$d/$i.out" $rest ) > "$d/$i.err" 2>&1; rc=$?;;
+      xfn)   xfn "$f" $rest > "$d/$i.out" 2> "$d/$i.err"; rc=$?;;
+      *)     echo "第 $i 个抽取点的类型认不出: $kind" >> "$d/why"; return 1;;
+    esac
+    (( rc == 0 )) || { echo "第 $i 个抽取点($kind)取法返回 $rc(已写出的内容不采信): $(head -1 "$d/$i.err")" >> "$d/why"; return 1; }
+    [[ -s "$d/$i.out" ]] || { echo "第 $i 个抽取点($kind)取出为空" >> "$d/why"; return 1; }
+  done
+  (( i > 0 && i == ${#PF_PTS[@]} )) || { echo "抽取点清单是空的或没取全($i / ${#PF_PTS[@]})" >> "$d/why"; return 1; }
+}
+if ! git -C "$ROOT" show "$BASE:$PF_REL" > "$T/pf-base.sh" 2> "$T/pf-base.err" || [[ ! -s "$T/pf-base.sh" ]]; then
+  bad "二-8 $PF_REL: 基线对象读不到、为空或先输出后失败($(head -1 "$T/pf-base.err")) —— 共享输入无从比较"
+elif ! { pf_uses "$HOP2" ② hop && pf_uses "$R3" ③ hop && pf_uses "$ROOT/tests/test-retire-hop-contract.sh" 本契约 self; } > "$T/pf-uses.txt" 2>&1; then
+  bad "二-8 $PF_REL: 消费者的抽取点认不全 —— $(grep -m2 '^UNREG' "$T/pf-uses.txt" | tr '\n' ' ')"
+elif ! pf_list "$T/pf-uses.txt"; then
+  bad "二-8 $PF_REL: 抽取点清单不完整或不合法 —— $PF_WHY"
+elif ! xfn "$HOP2" extract_marked_fns extract_marked_decls > "$T/pf-extractor.sh" 2>/dev/null || ! bash -n "$T/pf-extractor.sh"; then
+  bad "二-8 $PF_REL: 取不到 ② 的抽取器原文"
+elif ! pf_take "$T/pf-base.sh" "$T/pf-b"; then
+  bad "二-8 $PF_REL: 基线一侧取不到 —— $(head -1 "$T/pf-b/why")"
+elif ! pf_take "$ROOT/$PF_REL" "$T/pf-c"; then
+  bad "二-8 $PF_REL: 现在一侧取不到 —— $(head -1 "$T/pf-c/why")"
+else
+  # 354: 比较次数取自核过的清单(不另做计数查询); 每点分 相同 / 不同 / 比较本身失败 三种, 后者记未取得, 不冒充源码改变
+  pf_nm=0; pf_same=0; pf_df=""; pf_na=""
+  for pf_p in "${PF_PTS[@]}"; do read -r -a pf_w <<<"$pf_p"; pf_nm=$((pf_nm + ${#pf_w[@]} - 1)); done
+  for ((pf_i=1; pf_i<=${#PF_PTS[@]}; pf_i++)); do
+    cmp -s "$T/pf-b/$pf_i.out" "$T/pf-c/$pf_i.out"; pf_rc=$?
+    case "$pf_rc" in
+      0) pf_same=$((pf_same+1));;
+      1) pf_df="$pf_df 第${pf_i}个(${PF_PTS[$((pf_i-1))]:0:24}…)";;
+      *) pf_na="$pf_na 第${pf_i}个(cmp 退出 $pf_rc)";;
+    esac
+  done
+  if [[ -n "$pf_na" ]]; then bad "二-8 $PF_REL: 未取得 —— 比较本身失败:$pf_na${pf_df:+; 另有不同:$pf_df}"
+  elif [[ -n "$pf_df" ]]; then bad "二-8 $PF_REL: 共享输入相对基线变了:$pf_df"
+  elif (( pf_same > 0 && pf_same == ${#PF_PTS[@]} )); then
+    ok "二-8 $PF_REL: ②、③ 与本契约实际抽取的共享输入相对基线逐字节不变(${#PF_PTS[@]} 个抽取点逐个比较相同、$pf_nm 个名字; 取法 = 各自原文)"
+  else bad "二-8 $PF_REL: 未取得 —— 只比较了 $pf_same / ${#PF_PTS[@]} 个抽取点"; fi
+fi
 R3_BLOCKS=(r3_count r3_read r3_real2_gate r3_bridge_identity_gate r3_keep r3_precapture r3_invoke r3_gated_invoke r3_arrival_verdict r3_svc_class r3_svc_verdict r3_stable r3_dns r3_quiesce r3_runtime_gate r3_post)
 if xfn "$R3" "${R3_BLOCKS[@]}" > "$T/r3fns.sh" \
    && xfn "$HOP2" bridge_row_valid > "$T/hop2fns.sh" && bash -n "$T/r3fns.sh" && bash -n "$T/hop2fns.sh" \

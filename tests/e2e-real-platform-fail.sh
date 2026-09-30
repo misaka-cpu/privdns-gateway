@@ -73,6 +73,7 @@ note(){ echo "[NOTE] $1"; }
 # 上一轮那条 [FAIL] pdg-mitm 自启=not-found 就是这么来的, 产品侧其实是对的。
 # 现在 stdout / stderr / 退出码**分开收**, 不拼串; 也不用 tail -1 去藏第一行。
 SC_VAL=""; SC_RC=0; SC_ERR=""
+# shellcheck disable=SC2034  # 保留共享接口 SC_RC(sc_get 的抽取原文不动); ⑤ 自 353 起的新判据不再消费 SC_RC
 # >>> PDG-EXTRACT-BEGIN sc_get
 sc_get(){   # $1=子命令(is-active|is-enabled|...)  $2=unit
   local errf="${E2E_TMP:-/tmp}/sc.err"
@@ -940,9 +941,10 @@ svc_verdict(){   # $1=before  $2=after  $3=场景名
 switch_repo_to_candidate(){
   e2e_git "$REPO" checkout -q "$CAND_SHA" 2>/dev/null \
     || { bad "把 $REPO 切到候选 X 失败"; return 1; }
-  local head; head="$(git -C "$REPO" rev-parse HEAD 2>/dev/null)"
-  [[ "$head" == "$CAND_SHA" ]] && ok "部署源身份: $REPO 的 HEAD == 候选 X" \
-                              || { bad "部署源 HEAD=$head(应为 X)"; return 1; }
+  # 353: HEAD 的读取核原始退出码 —— 先打印出正确 SHA 再以非零退出, 同样不采信
+  local head hrc; head="$(git -C "$REPO" rev-parse HEAD 2>/dev/null)"; hrc=$?
+  { (( hrc == 0 )) && [[ "$head" == "$CAND_SHA" ]]; } && ok "部署源身份: $REPO 的 HEAD == 候选 X" \
+                              || { bad "部署源 HEAD=${head:-读不到}(rc=$hrc, 应为 X)"; return 1; }
   # 关键源文件逐字节等于 X 的那一份(拿独立展开的 $CANDSRC 当权威, 不自证)
   local miss=0 f
   for f in deploy/bot/pdg.sh deploy/bot/iosstate.py deploy/bot/pdg-bot.py lib/modules.sh; do
@@ -951,25 +953,29 @@ switch_repo_to_candidate(){
   [[ "$miss" == 0 ]] && ok "部署源身份: 关键源文件($REPO)逐字节等于候选 X" \
                      || { bad "部署源里有 $miss 个关键文件不是 X 的"; return 1; }
   # 按候选自己的清单装 —— 与 __migrate 里的 migrate_deploy_botfiles 同一份真源, 不会再被换回去
-  install -m755 "$REPO/deploy/bot/pdg.sh" /usr/local/bin/pdg
+  install -m755 "$REPO/deploy/bot/pdg.sh" "$P5_CLI" || { bad "装 $P5_CLI 失败"; return 1; }
   ( # shellcheck source=/dev/null
-    source "$REPO/lib/modules.sh" && pdg_install_runtime_modules "$REPO" /opt/pdg-bot "$1" ) \
+    source "$REPO/lib/modules.sh" && pdg_install_runtime_modules "$REPO" "$P5_MODDIR" "$1" ) \
     || { bad "按候选清单装模块失败"; return 1; }
-  [[ "$(sha256sum /usr/local/bin/pdg | awk '{print $1}')" == "$(sha256sum "$CANDSRC/deploy/bot/pdg.sh" | awk '{print $1}')" ]] \
-    && ok "部署源身份: /usr/local/bin/pdg 就是候选 X 的那一份" || bad "装上去的 pdg 不是 X 的"
+  # 353: 两边摘要都要有效取得且相等; 不符或取不到都返回非 0(以前只记一条 FAIL, 照样放行)
+  p5_same_file "$P5_CLI" "$CANDSRC/deploy/bot/pdg.sh" \
+    && ok "部署源身份: $P5_CLI 就是候选 X 的那一份" || { bad "装上去的 pdg 不是 X 的或摘要取不到: $P5_WHY"; return 1; }
   # ── 按**平台契约**核对装机身份 ────────────────────────────────────────────
   # 上一轮这里写死了"iosstate 必须有 migrate_schema" —— 而 iosstate.py 属于 PDG_IOS_MODULES,
   # **Android 本来就不装它**(平台契约, 不是装机失败)。判据换成: 该平台**实际应装**的每个
   # 文件都在, 且逐字节等于候选 X 的那一份; 再加三条反面契约。
-  local plat="$1" nmod=0 nbad=0 src name _mode
+  # 353: 清单先整份生成并核退出码与结构(先输出后失败、为空都不采信), 再逐项比。
+  local plat="$1" nmod=0 nbad=0 src name _mode lst
+  lst="${E2E_TMP:?}/p5-modlist-$plat.txt"
+  p5_modlist "$CANDSRC" "$plat" "$lst" || { bad "部署源身份: $P5_WHY"; return 1; }
   while read -r src name _mode; do
     [[ -n "$src" ]] || continue
     nmod=$((nmod+1))
-    if [[ ! -e "/opt/pdg-bot/$name" ]]; then
+    if [[ ! -e "$P5_MODDIR/$name" ]]; then
       nbad=$((nbad+1)); echo "       缺 $name"; continue
     fi
-    cmp -s "$CANDSRC/$src" "/opt/pdg-bot/$name" || { nbad=$((nbad+1)); echo "       指纹不符 $name"; }
-  done < <( ( source "$CANDSRC/lib/modules.sh" && pdg_platform_modules "$plat" ) 2>/dev/null )
+    cmp -s "$CANDSRC/$src" "$P5_MODDIR/$name" || { nbad=$((nbad+1)); echo "       指纹不符 $name"; }
+  done < "$lst"
   { [[ "$nmod" -gt 0 && "$nbad" == 0 ]]; } \
     && ok "部署源身份: $plat 平台应装的 $nmod 个文件全部就位且逐字节等于候选 X" \
     || { bad "部署源身份: $plat 平台清单 $nmod 项里有 $nbad 项缺失或指纹不符"; return 1; }
@@ -978,29 +984,29 @@ switch_repo_to_candidate(){
     # 但"盘上有"不等于"候选装的" —— 本轮的前像里它们是**预先构造的历史残留**, 已经逐项
     # 记进了残留清单(来源 + sha256 + mode + uid:gid)。所以判据是**对账**, 不是看名字:
     #   · 在清单里且指纹对得上 → 已记账的历史残留, 不算异常(但要列出来, 不笼统豁免);
-    #   · 不在清单里, 或指纹与清单里记的不一样 → 就是**没记账的额外文件**, 当场判红。
+    #   · 不在清单里, 或指纹与清单里记的不一样(包括盘上指纹取不到)→ 就是**没记账的额外文件**, 当场判红并阻断调用。
     # 这样既不因为平台标记是 android 就一律拒绝, 也不给任何文件开白名单。
-    local ios_unaccounted="" ios_accounted="" f fsum msum
+    local ios_unaccounted="" ios_accounted="" fsum msum
     for f in iosprofile.py iosstate.py mitm_ca.py pdg-dot.mobileconfig.tmpl; do
-      [[ -e "/opt/pdg-bot/$f" ]] || continue
-      fsum="$(sha256sum "/opt/pdg-bot/$f" 2>/dev/null | awk '{print $1}')"
-      msum="$(awk -F"$(printf '\t')" -v k="/opt/pdg-bot/$f" '$1==k{print $3; exit}' "$RESIDUE_MANIFEST" 2>/dev/null)"
-      if [[ -n "$msum" && "$msum" == "$fsum" ]]; then ios_accounted="$ios_accounted $f"
+      [[ -e "$P5_MODDIR/$f" ]] || continue
+      if p5_digest "$P5_MODDIR/$f"; then fsum="$P5_VAL"; else fsum=""; fi
+      msum="$(awk -F"$(printf '\t')" -v k="$P5_MODDIR/$f" '$1==k{print $3; exit}' "$RESIDUE_MANIFEST" 2>/dev/null)"
+      if [[ -n "$fsum" && -n "$msum" && "$msum" == "$fsum" ]]; then ios_accounted="$ios_accounted $f"
       else ios_unaccounted="$ios_unaccounted $f(盘上 ${fsum:0:12} / 清单 ${msum:-无记录})"; fi
     done
     [[ -n "$ios_accounted" ]] && note "部署源身份: 这几件 iOS 专属件是**已记账的历史残留**, 指纹与清单一致:$ios_accounted"
     [[ -z "$ios_unaccounted" ]] \
       && ok "部署源身份: Android 上没有**未记账**的 iOS 专属件(候选安装没有多带东西)" \
-      || bad "部署源身份: Android 上有未记账的 iOS 专属件:$ios_unaccounted"
+      || { bad "部署源身份: Android 上有未记账的 iOS 专属件:$ios_unaccounted"; return 1; }
   else
     # 反面契约 ②: iOS 上装的 iosstate 必须是候选形态(行为身份, 不只是文件名)
-    ( cd /opt/pdg-bot && python3 -c 'import iosstate,sys; sys.exit(0 if hasattr(iosstate,"migrate_schema") else 1)' ) 2>/dev/null \
+    ( cd "$P5_MODDIR" && python3 -c 'import iosstate,sys; sys.exit(0 if hasattr(iosstate,"migrate_schema") else 1)' ) 2>/dev/null \
       && ok "部署源身份: iOS 上装的 iosstate 具备 migrate_schema(候选形态)" \
       || { bad "部署源身份: iOS 上的 iosstate 没有 migrate_schema —— 部署源仍是旧版"; return 1; }
   fi
   # 反面契约 ③: 两平台均应退役的三件, 迁移之后一件都不许在(此刻迁移还没跑, 只记录现状)
   local retired="" r
-  for r in /opt/pdg-bot/mitm_server.py /opt/pdg-bot/mitm_wloc.py /etc/systemd/system/pdg-mitm.service; do
+  for r in "$P5_MODDIR/mitm_server.py" "$P5_MODDIR/mitm_wloc.py" /etc/systemd/system/pdg-mitm.service; do
     [[ -e "$r" ]] && retired="$retired $r"
   done
   [[ -z "$retired" ]] && ok "部署源身份: 两平台均应退役的三件在候选装机后已不存在" \
@@ -1401,22 +1407,9 @@ svc_stable_assert(){   # $1=unit $2=running|stopped $3=标签 → 顺带把前�
 }
 # <<< PDG-EXTRACT-END svc_stable_assert
 
-# ── 测试指纹 vs 产品自己写的 svcstate.tsv, 逐项对账 ──────────────────────────
-# 两边在**不同时刻**采样就会对不上。这里直接比同一批 unit 的自启/运行值。
-svcstate_cross_check(){   # $1=svcstate.tsv 路径  $2=标签
-  local f="$1" tag="$2" u pen pac men mac n_ok=0 n_bad=0
-  [[ -s "$f" ]] || { bad "$tag: 产品没写出 svcstate.tsv($f)"; return 1; }
-  while IFS=$'\t' read -r k u pen _urc pac _arc _sub _inv; do
-    [[ "$k" == unit && -n "$u" ]] || continue
-    men="$(sc_state is-enabled "$u")"; mac="$(sc_state is-active "$u")"
-    if [[ "$pen" == "$men" && "$pac" == "$mac" ]]; then n_ok=$((n_ok+1)); continue; fi
-    n_bad=$((n_bad+1))
-    printf '    %-22s 产品记: %s/%s   测试此刻看到: %s/%s\n' "$u" "$pen" "$pac" "$men" "$mac"
-  done < "$f"
-  [[ "$n_bad" == 0 ]] \
-    && ok "$tag: 产品的 svcstate.tsv 与测试指纹逐项一致($n_ok 个 unit)" \
-    || bad "$tag: 有 $n_bad 个 unit 两边对不上(上面逐项列出), 一致 $n_ok"
-}
+# ── 测试指纹 vs 产品自己写的 svcstate.tsv ──────────────────────────────────────
+# 353: svcstate_cross_check 改为"产品记录的操作前像 vs 调用前的独立采样"(A5 的第一件), 定义挪到下面「p5段 公共函数」里。
+#      以前拿**恢复后的现场**去比产品前像 —— 那说明不了产品前像记对没有, 还能零项通过。
 
 # ── 历史残留: 每一项写明来源与指纹, 不笼统豁免也不一律拒绝 ──────────────────
 RESIDUE_MANIFEST="$EVID/residue-manifest.tsv"
@@ -1434,35 +1427,42 @@ residue_report(){   # 打印清单并逐项确认
 }
 
 # ── 候选部署身份: 与历史残留**分开**核验 ────────────────────────────────────
-assert_candidate_identity(){   # $1=平台
-  local plat="$1" mis=0 dif=0 n=0 src name mode
-  [[ "$(sha256sum /usr/local/bin/pdg | awk '{print $1}')" == "$(sha256sum "$CANDSRC/deploy/bot/pdg.sh" | awk '{print $1}')" ]] \
-    && ok "部署身份: /usr/local/bin/pdg 逐字节等于冻结候选" || bad "部署身份: pdg 不是候选那一份"
-  # shellcheck source=/dev/null
-  source "$CANDSRC/lib/modules.sh" 2>/dev/null || { bad "部署身份: 读不到候选的 modules.sh"; return 1; }
-  while read -r src name mode; do
-    [[ -n "$name" ]] || continue
-    n=$((n+1))
-    [[ -e "/opt/pdg-bot/$name" ]] || { mis=$((mis+1)); continue; }
-    cmp -s "$CANDSRC/$src" "/opt/pdg-bot/$name" || dif=$((dif+1))
-  done < <(pdg_platform_modules "$plat")
-  { [[ "$mis" == 0 && "$dif" == 0 ]]; } \
-    && ok "部署身份: $n 项受管模块与冻结候选逐字节一致(缺 $mis / 不符 $dif)" \
-    || bad "部署身份: 受管模块与候选不一致(缺 $mis / 不符 $dif)"
-  # 本轮真正要看的两段代码就在这个文件里: 被调用的 CLI 与失败善后用的回滚实现。
-  # 文件整体逐字节相同已经断言过, 这里再把**这两段**单独抽出来对一遍, 免得"整体一致"
-  # 变成一句笼统的话。
-  local _rbok=1 _fn
-  for _fn in cmd_platform _plat_fail_restore _plat_rollback _pdg_restore_svcstate migrate_wloc_retire; do
-    local a b
-    a="$(awk -v f="$_fn" 'index($0,f"(){")==1{p=1} p{print} p&&/^\}$/{exit}' /usr/local/bin/pdg | sha256sum | awk '{print $1}')"
-    b="$(awk -v f="$_fn" 'index($0,f"(){")==1{p=1} p{print} p&&/^\}$/{exit}' "$CANDSRC/deploy/bot/pdg.sh" | sha256sum | awk '{print $1}')"
-    [[ "$a" == "$b" ]] || { _rbok=0; echo "       $_fn 不是候选那一份"; }
+assert_candidate_identity(){   # $1=平台 → 0 身份成立 / 1 不成立或未取得(调用方据此置前提不成立)
+  local plat="$1" mis=0 dif=0 n=0 src name _mode lst fn a b rc=0 _rbok=1
+  if p5_same_file "$P5_CLI" "$CANDSRC/deploy/bot/pdg.sh"; then ok "部署身份: $P5_CLI 逐字节等于冻结候选"
+  else bad "部署身份: pdg 不是候选那一份或摘要取不到 —— $P5_WHY"; rc=1; fi
+  lst="${E2E_TMP:?}/p5-ident-$plat.txt"
+  if p5_modlist "$CANDSRC" "$plat" "$lst"; then
+    while read -r src name _mode; do
+      [[ -n "$name" ]] || continue
+      n=$((n+1))
+      [[ -e "$P5_MODDIR/$name" ]] || { mis=$((mis+1)); continue; }
+      cmp -s "$CANDSRC/$src" "$P5_MODDIR/$name" || dif=$((dif+1))
+    done < "$lst"
+    { (( n > 0 )) && [[ "$mis" == 0 && "$dif" == 0 ]]; } \
+      && ok "部署身份: $n 项受管模块与冻结候选逐字节一致(缺 $mis / 不符 $dif)" \
+      || { bad "部署身份: 受管模块与候选不一致(清单 $n 项, 缺 $mis / 不符 $dif)"; rc=1; }
+  else bad "部署身份: $P5_WHY"; rc=1; fi
+  # 本轮真正要看的两段代码就在这个文件里: 被调用的 CLI 与失败善后用的恢复实现。
+  # 353: 逐段核对改为"有源码依据的有效范围"。候选里 _plat_fail_restore / _plat_rollback 是 cmd_platform 里的
+  #      **嵌套**函数(候选 deploy/bot/pdg.sh 7639 / 7558 行, 行首缩进两格), 按"顶格 名(){"去抽只会得到空串 ——
+  #      以前两边空串相等就打了通过。现在: cmd_platform 按顶格起止取整段, 这一段里必须真的含那两处嵌套定义;
+  #      其余三支按顶格取, 取不到完整函数体就判不成立。
+  for fn in cmd_platform _pdg_restore_svcstate migrate_wloc_retire cmd_rollback; do
+    if ! a="$(p5_fnrange "$P5_CLI" "$fn")" || ! b="$(p5_fnrange "$CANDSRC/deploy/bot/pdg.sh" "$fn")"; then
+      _rbok=0; echo "       $fn 在已装或候选的 pdg 里取不到完整函数体"; continue
+    fi
+    [[ "$a" == "$b" ]] || { _rbok=0; echo "       $fn 不是候选那一份"; continue; }
+    if [[ "$fn" == cmd_platform ]]; then
+      { grep -qx '  _plat_rollback(){' <<<"$a" && grep -qx '  _plat_fail_restore(){' <<<"$a"; } \
+        || { _rbok=0; echo "       cmd_platform 里找不到嵌套的 _plat_rollback / _plat_fail_restore 定义"; }
+    fi
   done
   (( _rbok )) \
-    && ok "部署身份: 本轮要调用的 CLI 与**回滚实现**(cmd_platform/_plat_fail_restore/_plat_rollback/_pdg_restore_svcstate/migrate_wloc_retire)逐段等于候选" \
-    || bad "部署身份: 回滚实现或 CLI 不是候选那一份"
-  _evn 00-identity.txt "候选部署身份: pdg+${n} 模块; 缺 $mis 不符 $dif; 回滚实现逐段一致=$_rbok"
+    && ok "部署身份: 本轮要调用的 CLI 与恢复实现(cmd_platform 整段含嵌套的 _plat_rollback / _plat_fail_restore, _pdg_restore_svcstate, migrate_wloc_retire, cmd_rollback)逐段等于候选" \
+    || { bad "部署身份: 回滚实现或 CLI 不是候选那一份, 或取不到有效范围"; rc=1; }
+  _evn 00-identity.txt "候选部署身份: pdg+${n} 模块; 缺 $mis 不符 $dif; 恢复实现逐段一致=$_rbok; 结论 rc=$rc"
+  return "$rc"
 }
 
 # ── DNS 仪器: 固定实验条件 → 标定 → 正式取证, 三处用**同一套**有效性要求 ────────
@@ -1712,56 +1712,671 @@ FP_FILES=(/etc/systemd/system/pdg-mitm.service
           /etc/nftables.conf
           /etc/mihomo/config.yaml)
 FP_SVCS=(pdg-mitm mosdns mihomo pdg-bot pdg-probe81)
-fp_capture(){   # $1=标签 → 写 $EVID/fp-$1.tsv
-  local tag="$1" q u
-  local f="$EVID/fp-$tag.tsv"
-  : > "$f"
-  for q in "${FP_FILES[@]}"; do
-    if [[ -e "$q" ]]; then
-      printf 'F\t%s\t有\t%s\t%s\t%s\t%s\n' "$q" \
-        "$(sha256sum "$q" 2>/dev/null | awk '{print $1}')" \
-        "$(stat -c %a "$q")" "$(stat -c %u "$q")" "$(stat -c %g "$q")" >> "$f"
-    else
-      printf 'F\t%s\t无\t-\t-\t-\t-\n' "$q" >> "$f"
+# ── p5段 公共函数 起 ──
+# ═════════════════════════════════════════════════════════════════════════════
+# 353: ⑤ 专有的读取与判定(A1–A9)。不带抽取标记; 被 ②③④、DNS 仪器与各契约抽取的共享原文一字不动。
+# 规矩: 每一次读取分别核原始退出码、输出结构与业务条件; 先输出后失败的内容不采信;
+#       读不到 / 缺记录 / 旧记录 / 空对空 = 观测无效(未取得), 不当成零、空状态或"相等"。
+# 命名: 一律 p5 前缀, 且不以任何被按名 / 按子串定位的共享函数名结尾(见 352 的共享影响表)。
+# ═════════════════════════════════════════════════════════════════════════════
+P5_WHY=""; P5_VAL=""; P5_RC=""; P5_LN=""; P5_ROW=""
+P5_CLI=/usr/local/bin/pdg; P5_MODDIR=/opt/pdg-bot; P5_HIJACK=/etc/mosdns/rules/mitm_hijack.txt
+P5_SNAPDIR="${SNAP_DIR:-/var/lib/privdns-gateway/backups}"
+# 候选 _pdg_svcstate_units(候选 deploy/bot/pdg.sh 1365)写进服务前像的 8 个 unit
+P5_SVC8=(pdg-mitm pdg-bot pdg-probe81 mosdns mihomo pdg-dotwitness pdg-health.timer pdg-rules-update.timer)
+# A7 依据(353 证据目录 basis/A7-basis.tsv): 失败路径 + 整体恢复里会 restart 的 unit; pdg-mitm 只在 a2i 方向另加
+P5_START_OK=(mosdns mihomo pdg-probe81)
+declare -A P5_RES=()      # 恢复结果: 键 = 项名, 值 = ok(已恢复) / diff(未恢复) / na(未取得)
+declare -A P5_FPN=()      # 四维采样: 标签 → 本次采样的 nonce(防旧记录冒充)
+declare -A P5_MAT=()      # 产品自报的三处材料路径
+P5_OKDEF="$(declare -f ok)"; P5_BADDEF="$(declare -f bad)"
+p5_tally(){ P5_RES["$2"]="$1"; }
+
+# 单元查询: 状态词与**原始退出码**配对(与 ① r1_unit_q、③ r3_unit_q 同一规则); 在本壳里调用, 结果留在 P5_VAL / P5_RC / P5_WHY
+p5_uq(){   # $1=active|enabled|load $2=unit [$3=已有效取得的 LoadState] → 0 取得 / 2 观测无效
+  local k="$1" u="$2" out rc err ef="${E2E_TMP:-/tmp}/p5uq.err"
+  P5_VAL=""; P5_RC=""; P5_WHY=""
+  case "$k" in
+    active)  out="$(systemctl is-active "$u" 2>"$ef")"; rc=$?;;
+    enabled) out="$(systemctl is-enabled "$u" 2>"$ef")"; rc=$?;;
+    load)    out="$(systemctl show -p LoadState --value "$u" 2>"$ef")"; rc=$?;;
+    *) P5_WHY="p5_uq 不认识的查询 [$k]"; return 2;;
+  esac
+  P5_RC="$rc"
+  err="$(tr '\n' ' ' < "$ef" 2>/dev/null)"; rm -f "$ef" 2>/dev/null
+  [[ "$out" != *$'\n'* ]] || { P5_WHY="$u 的 $k 查询输出不止一行(rc=$rc)"; return 2; }
+  case "$k" in
+    active)
+      case "$out" in
+        active|reloading|refreshing) (( rc == 0 )) || { P5_WHY="$u is-active 打印 $out 却退出 $rc"; return 2; };;
+        inactive) { (( rc == 3 )) || { (( rc == 4 )) && [[ "${3:-}" == not-found ]]; }; } \
+                    || { P5_WHY="$u is-active 打印 inactive 却退出 $rc(LoadState=${3:-未提供})"; return 2; };;
+        failed|activating|deactivating|maintenance) (( rc == 3 )) || { P5_WHY="$u is-active 打印 $out 却退出 $rc"; return 2; };;
+        *) P5_WHY="$u is-active 输出不是状态词([${out:0:30}], rc=$rc, stderr: ${err:-无})"; return 2;;
+      esac;;
+    enabled)
+      case "$out" in
+        enabled|enabled-runtime|alias|static|indirect|generated|transient) (( rc == 0 )) || { P5_WHY="$u is-enabled 打印 $out 却退出 $rc"; return 2; };;
+        linked|linked-runtime|masked|masked-runtime|disabled|not-found) (( rc != 0 )) || { P5_WHY="$u is-enabled 打印 $out 却退出 0"; return 2; };;
+        "") if (( rc != 0 )) && [[ "$err" == *"No such file or directory"* ]]; then out=not-found
+            else P5_WHY="$u is-enabled 没有输出(rc=$rc, stderr: ${err:-无})"; return 2; fi;;
+        *) P5_WHY="$u is-enabled 输出不是状态词([${out:0:30}], rc=$rc)"; return 2;;
+      esac;;
+    load)
+      (( rc == 0 )) || { P5_WHY="$u 的 LoadState 查询退出 $rc(输出不采信)"; return 2; }
+      case "$out" in loaded|not-found|bad-setting|error|masked|merged|stub) ;;
+        *) P5_WHY="$u 的 LoadState 不是状态词([${out:0:30}])"; return 2;; esac;;
+  esac
+  P5_VAL="$out"
+}
+p5_show(){   # $1=属性 $2=unit → 0 取得(P5_VAL, 可为空) / 2 观测无效(退出非零或多行)
+  local out rc; P5_VAL=""; P5_WHY=""
+  out="$(systemctl show -p "$1" --value "$2" 2>/dev/null)"; rc=$?
+  (( rc == 0 )) || { P5_WHY="$2 的 $1 查询退出 $rc(输出不采信)"; return 2; }
+  [[ "$out" != *$'\n'* ]] || { P5_WHY="$2 的 $1 输出不止一行"; return 2; }
+  P5_VAL="$out"
+}
+p5_digest(){   # $1=文件 → 0 取得(P5_VAL = 64 位十六进制) / 2 取不到
+  local out rc; P5_VAL=""; P5_WHY=""
+  out="$(sha256sum -- "$1" 2>/dev/null)"; rc=$?
+  { (( rc == 0 )) && [[ "${out:0:64}" =~ ^[0-9a-f]{64}$ ]]; } || { P5_WHY="$1 的 sha256 取不到(rc=$rc)"; return 2; }
+  P5_VAL="${out:0:64}"
+}
+p5_meta(){   # $1=文件 → 0 取得(P5_VAL = mode<TAB>uid<TAB>gid) / 2 取不到
+  local out rc; P5_VAL=""; P5_WHY=""
+  out="$(stat -c '%a %u %g' -- "$1" 2>/dev/null)"; rc=$?
+  { (( rc == 0 )) && [[ "$out" =~ ^[0-7]{1,4}\ [0-9]+\ [0-9]+$ ]]; } || { P5_WHY="$1 的属性取不到(rc=$rc)"; return 2; }
+  P5_VAL="${out// /$'\t'}"
+}
+p5_same_file(){   # $1 $2 → 0 两边摘要都有效且相等 / 1 都有效但不同 / 2 有一边取不到
+  local a b
+  p5_digest "$1" || return 2; a="$P5_VAL"
+  p5_digest "$2" || return 2; b="$P5_VAL"
+  [[ "$a" == "$b" ]] || { P5_WHY="$1 与 $2 摘要不同(${a:0:12} / ${b:0:12})"; return 1; }
+}
+p5_listen(){   # $1=端口 $2=tcp|udp → 0 取得(P5_LN = 监听条数, 0 是有效的"确认没有") / 2 观测无效
+  local out rc lrc opt=-lnt; P5_LN=""; P5_WHY=""
+  [[ "$2" == udp ]] && opt=-lnu
+  out="$(ss "$opt" 2>/dev/null)"; rc=$?
+  (( rc == 0 )) || { P5_WHY="ss $opt 退出 $rc(输出不采信)"; return 2; }
+  [[ "${out%%$'\n'*}" == *"Local Address:Port"* ]] || { P5_WHY="ss $opt 的输出没有表头"; return 2; }
+  # 354: 计数本身的退出码也核 —— 解析失败时哪怕已经打出一个合法数字也不采信
+  P5_LN="$(awk -v p=":$1" 'NR>1 && length($4) >= length(p) && substr($4, length($4)-length(p)+1) == p {n++} END{print n+0}' <<<"$out")"; lrc=$?
+  { (( lrc == 0 )) && [[ "$P5_LN" =~ ^[0-9]+$ ]]; } || { P5_WHY="监听计数解析失败(awk rc=$lrc, 输出不采信)"; P5_LN=""; return 2; }
+}
+p5_modlist(){   # $1=源码根 $2=平台 $3=落点 → 0 清单有效(非空行 ≥ 1, 每行三段) / 2 无效(生成失败、先输出后失败、为空、结构不对、计数读不了)
+  local rc n grc; P5_WHY=""
+  ( # shellcheck source=/dev/null
+    source "$1/lib/modules.sh" && pdg_platform_modules "$2" ) > "$3" 2>/dev/null; rc=$?
+  (( rc == 0 )) || { P5_WHY="$2 平台清单生成失败(rc=$rc, 已输出的内容不采信)"; return 2; }
+  # 354: 条数查询的退出码分开认 —— 0 = 有、1 = 确实一行都没有(合法的空)、其余 = 查询出错(输出不采信)
+  n="$(grep -c . "$3")"; grc=$?
+  { (( grc <= 1 )) && [[ "$n" =~ ^[0-9]+$ ]]; } || { P5_WHY="$2 平台清单的条数计数读不了(grep rc=$grc, 输出不采信)"; return 2; }
+  (( n >= 1 )) || { P5_WHY="$2 平台清单是空的"; return 2; }
+  awk 'NF > 0 && NF != 3 {bad=1} END{exit bad}' "$3" || { P5_WHY="$2 平台清单有行不是「源 目标名 mode」三段(或结构检查本身失败)"; return 2; }
+}
+p5_fnrange(){   # $1=文件 $2=函数名 → 打印"名(){"顶格起、到第一个顶格 } 止的原文; 找不到开头或结尾 ⇒ 2
+  local out rc
+  out="$(awk -v f="$2" 'index($0,f"(){")==1{p=1} p{print} p&&/^}$/{c=1; exit} END{exit (p&&c)?0:3}' "$1" 2>/dev/null)"; rc=$?
+  { (( rc == 0 )) && [[ -n "$out" ]]; } || return 2
+  printf '%s\n' "$out"
+}
+
+# ── A9: 记账包装 —— 共享函数原样执行, 只给这一次调用在 PATH 最前放 systemctl / journalctl 记账 ──
+# 任何一次非零退出都记下 ⇒ 整次观测无效(一次失败不会被随后的成功覆盖); 例外只有 `journalctl --sync`(共享的尽力刷盘, 输出不被任何判据消费)。
+# 记账追加失败 ⇒ 包装向本壳发 USR1 ⇒ 粘性标志; 记账读不回来 ⇒ 观测无效。被测函数自己打的 ok / bad 先进缓冲,
+# 外层核完有效性再由 p5_acct_flush 采信或作废(包装里提前打印的 OK 不会在外层判无效之后仍算成立)。
+# 调用一返回就复原 PATH(只在那次调用的前缀里)、ok / bad 的定义与 USR1 处置; 不定义同名函数、不导出 —— 产品进程继承不到。
+P5_ACCT_FAULT=0; P5_ACCT_RC=""; P5_ACCT_BUFFILE=""; P5_ACCT_PID=""
+p5_acct(){   # $1=标签 $2=stdout 落点 $3..=命令(在本壳里执行) → 0 有效 / 2 观测无效(P5_WHY); 命令返回码在 P5_ACCT_RC
+  local lbl="$1" out="$2"; shift 2
+  local wd rec c real rc raw n prev_usr1 ex
+  P5_ACCT_RC=""; P5_WHY=""; P5_ACCT_BUFFILE=""
+  wd="${E2E_TMP:?}/p5acct-$BASHPID-$RANDOM"; rec="$wd.rec"
+  if ! { mkdir -p -- "$wd" && : > "$rec" && : > "$wd.buf"; } 2>/dev/null; then P5_WHY="$lbl: 查询记账建不出来"; return 2; fi
+  for c in systemctl journalctl; do
+    real="$(type -P "$c")"
+    [[ -n "$real" && "$real" != "$wd/$c" ]] || { P5_WHY="$lbl: 找不到真实的 $c"; rm -rf -- "$wd" "$rec" "$wd.buf"; return 2; }
+    # 354: journalctl --sync 的例外只给 journalctl(共享的尽力刷盘), 不扩大到 systemctl 或别的命令
+    ex=""; [[ "$c" == journalctl ]] && ex=' && [[ "$*" != --sync ]]'
+    if ! printf '#!/usr/bin/env bash\n%q "$@"; rc=$?\nif (( rc != 0 ))%s; then printf "%%s\\t%%s\\t%%s\\n" %q "$rc" "$*" >> %q || kill -USR1 %q; fi\nexit "$rc"\n' \
+         "$real" "$ex" "$c" "$rec" "$BASHPID" > "$wd/$c" 2>/dev/null || ! chmod +x "$wd/$c" 2>/dev/null; then
+      P5_WHY="$lbl: $c 的记账包装写不出来"; rm -rf -- "$wd" "$rec" "$wd.buf"; return 2
     fi
   done
-  local av ar ev er
-  for u in "${FP_SVCS[@]}"; do
-    # 状态与**退出码**分开记: systemd 对已删除的 unit 会既打印 not-found 又返回非 0,
-    # 只看 stdout 或只看 rc 都会误判。
-    av="$(sc_state is-active  "$u")"; ar="$SC_RC"
-    ev="$(sc_state is-enabled "$u")"; er="$SC_RC"
-    printf 'R\t%s\tis-active rc=%s\tis-enabled rc=%s\n' "$u" "$ar" "$er" >> "$f"
-    printf 'S\t%s\t%s\t%s\t%s\t%s\t%s\n' "$u" \
-      "$av" "$ev" \
-      "$(systemctl show -p MainPID --value "$u" 2>/dev/null)" \
-      "$(systemctl show -p InvocationID --value "$u" 2>/dev/null)" \
-      "$(systemctl show -p NRestarts --value "$u" 2>/dev/null)" >> "$f"
+  mv -f -- "$wd.buf" "$rec.buf" 2>/dev/null || { P5_WHY="$lbl: 原判缓冲建不出来"; rm -rf -- "$wd" "$rec" "$wd.buf"; return 2; }
+  P5_ACCT_BUFFILE="$rec.buf"; P5_ACCT_PID="$BASHPID"
+  ok(){ printf 'OK\t%s\n' "$1" >> "$P5_ACCT_BUFFILE" 2>/dev/null || kill -USR1 "$P5_ACCT_PID"; }
+  bad(){ printf 'FAIL\t%s\n' "$1" >> "$P5_ACCT_BUFFILE" 2>/dev/null || kill -USR1 "$P5_ACCT_PID"; }
+  prev_usr1="$(trap -p USR1)"; P5_ACCT_FAULT=0; trap 'P5_ACCT_FAULT=1' USR1
+  PATH="$wd:$PATH" "$@" > "$out"; rc=$?
+  if [[ -n "$prev_usr1" ]]; then eval "$prev_usr1"; else trap - USR1; fi
+  eval "$P5_OKDEF"; eval "$P5_BADDEF"
+  rm -rf -- "$wd"
+  P5_ACCT_RC="$rc"
+  if (( P5_ACCT_FAULT )); then P5_WHY="$lbl: 记账通道失效(有记录没写进去)"; rm -f -- "$rec"; return 2; fi
+  raw="$(cat -- "$rec" 2>/dev/null)" || { P5_WHY="$lbl: 查询记账读不了"; return 2; }
+  rm -f -- "$rec"
+  if [[ -n "$raw" ]]; then n="$(grep -c . <<<"$raw")"; P5_WHY="$lbl: 有 $n 次查询非零退出(首条: ${raw%%$'\n'*})"; return 2; fi
+  return 0
+}
+p5_acct_flush(){   # $1=外层结论(0 有效 / 非 0 无效) $2=标签 → 按结论采信或作废缓冲里的 ok / bad
+  local raw r k m
+  [[ -n "$P5_ACCT_BUFFILE" ]] || return 0
+  raw="$(cat -- "$P5_ACCT_BUFFILE" 2>/dev/null)"; r=$?
+  rm -f -- "$P5_ACCT_BUFFILE" 2>/dev/null; P5_ACCT_BUFFILE=""
+  (( r == 0 )) || { bad "$2: 被测判据的原判读不回来 —— 不采信"; PREIMAGE_OK=0; return 2; }
+  [[ -n "$raw" ]] || return 0
+  while IFS=$'\t' read -r k m; do
+    [[ -n "$k" ]] || continue
+    if [[ "$1" == 0 ]]; then case "$k" in OK) ok "$m";; *) bad "$m";; esac
+    else note "  (外层判观测无效, 这条原判不采信) [$k] $m"; fi
+  done <<<"$raw"
+}
+p5_stable_assert(){   # 参数同共享 svc_stable_assert → 0 持续 / 1 不稳定 / 2 观测无效(1、2 都置 PREIMAGE_OK=0)
+  local u="$1" want="$2" lbl="$3" secs="${4:-8}" arc frc
+  p5_acct "$lbl" "${E2E_TMP:?}/p5sw.out" svc_stable_window "$u" "$want" "$secs"; arc=$?
+  p5_acct_flush "$arc" "$lbl"; frc=$?
+  if (( arc != 0 )); then
+    bad "$lbl: **观测无效** —— $P5_WHY; 共享窗口给的 rc=${P5_ACCT_RC:-无}(${SVC_STABLE_WHY:-无}) 不采信"; PREIMAGE_OK=0; return 2
+  fi
+  # 354: 缓冲读不回 ⇒ 本项无效, 不再给成立的 OK(缓冲读取失败本身已由 p5_acct_flush 记 FAIL 并置 PREIMAGE_OK=0)
+  (( frc == 0 )) || { bad "$lbl: **观测无效** —— 被测判据的原判读不回来; 共享窗口给的 rc=${P5_ACCT_RC:-无} 不采信"; PREIMAGE_OK=0; return 2; }
+  case "$P5_ACCT_RC" in
+    0) ok "$lbl: $SVC_STABLE_WHY"; return 0;;
+    1) bad "$lbl: 不是持续稳定 —— $SVC_STABLE_WHY"; PREIMAGE_OK=0; return 1;;
+    *) bad "$lbl: **观测无效** —— $SVC_STABLE_WHY"; PREIMAGE_OK=0; return 2;;
+  esac
+}
+p5_wait_active(){   # $1=unit $2=标签 → 0 查询全部有效且稳定在 active / 1 不是 active / 2 观测无效(1、2 都置 PREIMAGE_OK=0)
+  local f="${E2E_TMP:?}/p5wait.out" arc frc v
+  p5_acct "$2" "$f" wait_stable "$1"; arc=$?
+  p5_acct_flush "$arc" "$2"; frc=$?
+  (( arc == 0 )) || { bad "$2: **观测无效** —— $P5_WHY"; PREIMAGE_OK=0; return 2; }
+  # 354: 缓冲读不回 ⇒ 本项无效, 不再给成立的 OK
+  (( frc == 0 )) || { bad "$2: **观测无效** —— 被测判据的原判读不回来"; PREIMAGE_OK=0; return 2; }
+  v="$(cat -- "$f" 2>/dev/null)" || { bad "$2: 结果读不了"; PREIMAGE_OK=0; return 2; }
+  { [[ "$P5_ACCT_RC" == 0 ]] && [[ "$v" == active ]]; } && { ok "$2: $1 稳定在 active(查询全部 0 退出)"; return 0; }
+  bad "$2: $1 没有稳定在 active(实得 [$v], rc=$P5_ACCT_RC)"; PREIMAGE_OK=0; return 1
+}
+
+# ── A8: 静置只量那一次目标 sleep ─────────────────────────────────────────────
+# 共享 quiesce_startlimit 原样执行(经 p5_acct 记账); 只在这一次调用期间以同名函数截下参数恰为「窗口 + 3」的那一次 sleep:
+# 取它的原始退出码, 前后各读一次 CLOCK_MONOTONIC(只括住那一觉, 不含界桩重试与稳定窗口的耗时)。
+# 那一觉在共享函数里位于起止两个界桩之间(1200-1211 行的代码顺序), 界桩区间内 0 次启动由共享判据判 ——
+# 两者合起来才是"界桩区间里至少有「窗口 + 3」秒没有启动"。不加重试、不改限额、不 reset-failed。
+P5_MONO=(python3 -c 'import time; print(time.clock_gettime_ns(time.CLOCK_MONOTONIC))')
+P5_MV=""; P5_MRC=""
+p5_mono(){ local out; P5_MV=""; out="$("${P5_MONO[@]}" 2>/dev/null)"; P5_MRC=$?; { (( P5_MRC == 0 )) && [[ "$out" =~ ^[0-9]+$ ]]; } || return 2; P5_MV="$out"; }
+P5Q_WANT=""; P5Q_N=0; P5Q_SRC=""; P5Q_FAULT=0; P5Q_T0=""; P5Q_T1=""; P5Q_M0RC=""; P5Q_M1RC=""; P5Q_REC=""
+p5q_sleep(){
+  if [[ "$#" == 1 && "$1" == "$P5Q_WANT" ]]; then
+    P5Q_N=$((P5Q_N+1))
+    p5_mono; P5Q_M0RC="$P5_MRC"; P5Q_T0="$P5_MV"
+    command sleep "$1"; P5Q_SRC=$?
+    p5_mono; P5Q_M1RC="$P5_MRC"; P5Q_T1="$P5_MV"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$P5Q_SRC" "$P5Q_M0RC" "$P5Q_T0" "$P5Q_M1RC" "$P5Q_T1" >> "$P5Q_REC" 2>/dev/null || P5Q_FAULT=1
+    return "$P5Q_SRC"
+  fi
+  command sleep "$@"
+}
+p5_quiesce(){   # $1=阶段 → 0 成立 / 1 不成立(已置 PREIMAGE_OK=0)
+  local arc qrc want why="" out="${E2E_TMP:?}/p5q.out"
+  if ! [[ "${SL_INT_S:-}" =~ ^[0-9]+$ ]]; then quiesce_startlimit "$1"; PREIMAGE_OK=0; return 1; fi
+  want=$(( SL_INT_S + 3 ))
+  P5Q_WANT="$want"; P5Q_N=0; P5Q_SRC=""; P5Q_FAULT=0; P5Q_T0=""; P5Q_T1=""; P5Q_M0RC=""; P5Q_M1RC=""
+  P5Q_REC="${E2E_TMP:?}/p5q-$BASHPID-$RANDOM.rec"
+  : > "$P5Q_REC" 2>/dev/null || { bad "静置($1): 等待记录建不出来"; PREIMAGE_OK=0; return 1; }
+  sleep(){ p5q_sleep "$@"; }
+  p5_acct "静置($1)" "$out" quiesce_startlimit "$1"; arc=$?; qrc="$P5_ACCT_RC"
+  unset -f sleep
+  cat -- "$out" 2>/dev/null
+  (( arc == 0 )) || why="$why; 查询记账: $P5_WHY"
+  [[ "$(type -t sleep)" == file ]] || why="$why; sleep 的截取没撤掉"
+  (( P5Q_FAULT == 0 )) || why="$why; 等待记录写不进去"
+  if [[ "$P5Q_N" != 1 ]]; then why="$why; 截到目标 sleep $P5Q_N 次(应恰 1 次)"
+  else
+    [[ "$P5Q_SRC" == 0 ]] || why="$why; 那一次 sleep 退出 $P5Q_SRC"
+    if [[ "$P5Q_M0RC" == 0 && "$P5Q_M1RC" == 0 && "$P5Q_T0" =~ ^[0-9]+$ && "$P5Q_T1" =~ ^[0-9]+$ ]] && (( P5Q_T1 >= P5Q_T0 )); then
+      (( P5Q_T1 - P5Q_T0 >= want * 1000000000 )) || why="$why; 那一次 sleep 实得 $(( (P5Q_T1 - P5Q_T0) / 1000000 )) ms, 不足 ${want} s"
+    else why="$why; 单调时钟读数无效(读取码 ${P5Q_M0RC:-无} / ${P5Q_M1RC:-无})"; fi
+  fi
+  # 354: 缓冲读不回 ⇒ 静置不成立, 外层不再打成立的 OK
+  if [[ -z "$why" ]]; then p5_acct_flush 0 "静置($1)" || why="被测判据的原判读不回来"; else p5_acct_flush 2 "静置($1)"; fi
+  if [[ -n "$why" ]]; then bad "静置($1): **不成立** —— ${why#; }"; PREIMAGE_OK=0; return 1; fi
+  (( qrc == 0 )) || { PREIMAGE_OK=0; return 1; }
+  ok "静置($1): 那一次 sleep 退出 0, 实得 $(( (P5Q_T1 - P5Q_T0) / 1000000 )) ms ≥ ${want} s(读数只括住那一觉)"
+  return 0
+}
+p5_nowrap_check(){   # 产品调用前: 没有残留的包装目录、同名函数截取与信号处置, ok / bad 是原定义 → 0 干净 / 2 有残留
+  local c; P5_WHY=""
+  [[ ":$PATH:" != *"/p5acct-"* ]] || { P5_WHY="PATH 里还有记账包装目录"; return 2; }
+  for c in sleep systemctl journalctl; do
+    [[ "$(type -t "$c")" == file ]] || { P5_WHY="$c 不是外部命令(type=$(type -t "$c"))"; return 2; }
   done
-  # 已加载配置的独立依据: 真实监听(不是磁盘 hash)
-  printf 'L\t7894\t%s\n' "$(ss -lnt 2>/dev/null | grep -c ':7894 ')" >> "$f"
-  printf 'L\t53\t%s\n'   "$(ss -lnu 2>/dev/null | grep -c ':53 ')" >> "$f"
-  chmod 600 "$f"
+  [[ -z "$(trap -p USR1)" ]] || { P5_WHY="USR1 处置没复原"; return 2; }
+  { [[ "$(declare -f ok)" == "$P5_OKDEF" ]] && [[ "$(declare -f bad)" == "$P5_BADDEF" ]]; } || { P5_WHY="ok / bad 不是原定义"; return 2; }
 }
-fp_get(){   # $1=标签 $2=类型 $3=键 → 打印那一行的其余字段
-  # 按**字段**拼回去, 不用 [^\t] 这类方括号反斜杠转义 —— 那种写法在 POSIX grep/awk 下会被
-  # 截断解释(仓库的 test-false-green-guard.sh 专门盯这一条)。分隔符用真正的制表符。
-  local TAB; TAB="$(printf '\t')"
-  awk -F"$TAB" -v t="$2" -v k="$3" \
-      '$1==t && $2==k {out=$3; for(i=4;i<=NF;i++) out=out FS $i; print out; exit}' "$EVID/fp-$1.tsv"
+p5_dns_ready(){   # $1=dns_feature_probe 的输出 → 0 查询有效且见证 = H、对照 = U / 2 不成立(P5_WHY)
+  local st w c extra
+  IFS=$'\t' read -r st w c extra <<<"$1"
+  { [[ "$st" == VALID ]] && [[ -z "${extra:-}" ]]; } || { P5_WHY="前像的 DNS 观测无效($1)"; return 2; }
+  { [[ "$w" == "$DNS_H" ]] && [[ "$c" == "$DNS_U" ]]; } \
+    || { P5_WHY="前像的 DNS 不是本方向要求的条件(见证=$w 期望 H=$DNS_H; 对照=$c 期望 U=$DNS_U)"; return 2; }
 }
-fp_cmp_files(){   # $1=before $2=after $3=场景名 —— 四维逐项比对
-  local q b a n_ok=0 n_bad=0
+
+# ── A1: 四维指纹(文件 / 运行态 / 自启态 / 监听)——每项三态, 带本次 nonce 与 END 行 ─────────────
+fp_capture(){   # $1=标签 → 写 $EVID/fp-$1.tsv; 0 完整且每项有效 / 2 有观测无效(照样写出, 无效项标 INVALID; P5_WHY 列出)
+  local tag="$1" f="$EVID/fp-$1.tsv" q u d ld av ev ar er pid inv nr n why="" nonce
+  nonce="$$-$BASHPID-$RANDOM-$(date +%s%N)"
+  if ! {
+    printf 'H\t%s\t%s\n' "$tag" "$nonce"
+    for q in "${FP_FILES[@]}"; do
+      if [[ -e "$q" ]]; then
+        if p5_digest "$q" && d="$P5_VAL" && p5_meta "$q"; then printf 'F\t%s\t有\t%s\t%s\n' "$q" "$d" "$P5_VAL"
+        else printf 'F\t%s\tINVALID\t-\t-\t-\t-\n' "$q"; why="$why 文件 $q"; fi
+      elif [[ -L "$q" ]]; then printf 'F\t%s\tINVALID\t-\t-\t-\t-\n' "$q"; why="$why 文件 $q(悬空链接)"
+      else printf 'F\t%s\t无\t-\t-\t-\t-\n' "$q"; fi
+    done
+    for u in "${FP_SVCS[@]}"; do
+      ld=INVALID; av=INVALID; ev=INVALID; pid=INVALID; inv=INVALID; nr=INVALID
+      if p5_uq load "$u"; then ld="$P5_VAL"; else why="$why $u(LoadState)"; fi
+      if p5_uq active "$u" "$ld"; then av="$P5_VAL"; else why="$why $u(运行态: $P5_WHY)"; fi; ar="$P5_RC"
+      if p5_uq enabled "$u"; then ev="$P5_VAL"; else why="$why $u(自启态: $P5_WHY)"; fi; er="$P5_RC"
+      p5_show MainPID "$u" && pid="$P5_VAL"
+      p5_show InvocationID "$u" && inv="$P5_VAL"
+      p5_show NRestarts "$u" && nr="$P5_VAL"
+      printf 'R\t%s\tis-active rc=%s\tis-enabled rc=%s\n' "$u" "${ar:-?}" "${er:-?}"
+      printf 'S\t%s\t%s\t%s\t%s\t%s\t%s\n' "$u" "$av" "$ev" "$pid" "$inv" "$nr"
+    done
+    if p5_listen 7894 tcp; then printf 'L\t7894\t%s\n' "$P5_LN"; else printf 'L\t7894\tINVALID\n'; why="$why 7894"; fi
+    if p5_listen 53 udp; then printf 'L\t53\t%s\n' "$P5_LN"; else printf 'L\t53\tINVALID\n'; why="$why 53"; fi
+  } > "$f.tmp" 2>/dev/null; then P5_WHY="四维采样写不出来($f)"; return 2; fi
+  n="$(wc -l < "$f.tmp")" || { P5_WHY="四维采样读不回来"; return 2; }
+  { printf 'END\t%s\n' "$n" >> "$f.tmp" && mv -f -- "$f.tmp" "$f"; } 2>/dev/null || { P5_WHY="四维采样收尾写不出来"; return 2; }
+  chmod 600 "$f" 2>/dev/null
+  P5_FPN["$tag"]="$nonce"
+  fp_get "$tag" H "$tag" >/dev/null || { P5_WHY="四维采样读回不通过(头行 / 本次 nonce / END 条数)"; return 2; }
+  [[ -z "$why" ]] || { P5_WHY="有观测无效:$why"; return 2; }
+  return 0
+}
+fp_get(){   # $1=标签 $2=类型 $3=键 → 0 恰一条且字段数与必要字段格式合规(打印其余字段) / 1 确认没有 / 2 读不了、不完整、不是本次采样、有重复或那一条残缺
+  local f="$EVID/fp-$1.tsv" raw rc TAB out
+  TAB="$(printf '\t')"
+  raw="$(cat -- "$f" 2>/dev/null)"; rc=$?
+  (( rc == 0 )) || return 2
+  # 354: 除头尾、nonce、条数外, 再核被取那一条的字段数与必要字段格式(F 行 mode 是 1–4 位八进制; S 行实例标识可以是合法的空, 但列不能少)
+  out="$(awk -F"$TAB" -v t="$2" -v k="$3" -v nonce="${P5_FPN[$1]:-}" -v tag="$1" '
+    function num(x) { return x ~ /^[0-9]+$/ }
+    function word(x) { return x ~ /^[a-z][a-z-]*$/ || x == "INVALID" }
+    function okrow() {
+      if (t == "H") return NF == 3
+      if (t == "F") {
+        if (NF != 7) return 0
+        if ($3 == "有") return length($4) == 64 && $4 ~ /^[0-9a-f]+$/ && length($5) >= 1 && length($5) <= 4 && $5 ~ /^[0-7]+$/ && num($6) && num($7)
+        return ($3 == "无" || $3 == "INVALID") && $4 == "-" && $5 == "-" && $6 == "-" && $7 == "-" }
+      if (t == "S") return NF == 7 && word($3) && word($4) && ($5 == "" || num($5) || $5 == "INVALID") && ($7 == "" || num($7) || $7 == "INVALID")
+      if (t == "R") return NF == 4 && $3 ~ /^is-active rc=/ && $4 ~ /^is-enabled rc=/
+      if (t == "L") return NF == 3 && (num($3) || $3 == "INVALID")
+      return 0 }
+    NR==1 { if ($1!="H" || $2!=tag || nonce=="" || $3!=nonce) bad=1 }
+    $1=="END" { endn++; endcnt=$2; endat=NR }
+    $1==t && $2==k { hits++; if (!okrow()) broken=1; out=$3; for (i=4; i<=NF; i++) out=out FS $i }
+    END { if (bad || endn!=1 || endat!=NR || endcnt+0 != NR-1) exit 2
+          if (hits==0) exit 1
+          if (hits>1 || broken) exit 2
+          print out; exit 0 }' <<<"$raw")"; rc=$?
+  (( rc == 0 )) || return "$(( rc == 1 ? 1 : 2 ))"
+  printf '%s\n' "$out"
+}
+fp_cmp_files(){   # $1=前 $2=后 $3=标签 —— 文件维: 两边都有效 ⇒ 相同 = 已恢复 / 不同 = 未恢复; 任一边无效或缺记录 ⇒ 未取得
+  local q b a rb ra n_ok=0 n_diff=0 n_na=0
   for q in "${FP_FILES[@]}"; do
-    b="$(fp_get "$1" F "$q")"; a="$(fp_get "$2" F "$q")"
-    if [[ "$b" == "$a" ]]; then n_ok=$((n_ok+1)); continue; fi
-    n_bad=$((n_bad+1))
-    printf '    %-58s\n      前: %s\n      后: %s\n' "$q" "${b:-<无记录>}" "${a:-<无记录>}"
+    b="$(fp_get "$1" F "$q")"; rb=$?; a="$(fp_get "$2" F "$q")"; ra=$?
+    if (( rb != 0 || ra != 0 )) || [[ "$b" == INVALID* || "$a" == INVALID* ]]; then
+      n_na=$((n_na+1)); p5_tally na "文件 $q"
+      printf '    %-58s 未取得(前 rc=%s [%s] / 后 rc=%s [%s])\n' "$q" "$rb" "${b:-无}" "$ra" "${a:-无}"; continue
+    fi
+    if [[ "$b" == "$a" ]]; then n_ok=$((n_ok+1)); p5_tally ok "文件 $q"; continue; fi
+    n_diff=$((n_diff+1)); p5_tally diff "文件 $q"
+    printf '    %-58s\n      前: %s\n      后: %s\n' "$q" "$b" "$a"
   done
-  [[ "$n_bad" == 0 ]] \
-    && ok "$3: ${#FP_FILES[@]} 个受关注文件的**存在性/内容/mode/uid/gid** 四项全部回到前像" \
-    || bad "$3: 有 $n_bad 个文件没回到前像(上面逐项列出), 一致 $n_ok"
+  if (( n_diff == 0 && n_na == 0 )); then
+    ok "$3: ${#FP_FILES[@]} 个受关注文件的**存在性/内容/mode/uid/gid** 四项全部回到前像"; return 0
+  fi
+  (( n_diff == 0 )) || bad "$3: 有 $n_diff 个文件没回到前像(上面逐项列出), 一致 $n_ok"
+  (( n_na == 0 )) || bad "$3: 有 $n_na 个文件前后读取无效或缺记录 —— 未取得(不算恢复, 也不算未恢复)"
+  return 1
 }
+p5_cmp3(){   # $1 $2=前后读取码 $3 $4=前后值 $5=结果键 $6=标签
+  if [[ "$1" != 0 || "$2" != 0 || -z "$3" || -z "$4" || "$3" == INVALID || "$4" == INVALID ]]; then
+    p5_tally na "$5"; bad "$6 未取得(前 [${3:-无}] rc=$1 / 后 [${4:-无}] rc=$2)"; return 2
+  fi
+  if [[ "$3" == "$4" ]]; then p5_tally ok "$5"; ok "$6 回到前像($4)"; return 0; fi
+  p5_tally diff "$5"; bad "$6 前像=$3 现在=$4"; return 1
+}
+p5_cut(){   # 354: $1=一行(制表符分隔) $2=字段号 → 0 取得(P5_VAL, 可为空) / 2 提取失败(退出非零或多行; 输出不采信)
+  local out rc; P5_VAL=""
+  out="$(cut -f"$2" <<<"$1")"; rc=$?
+  { (( rc == 0 )) && [[ "$out" != *$'\n'* ]]; } || return 2
+  P5_VAL="$out"
+}
+p5_count(){   # 354: $1=基本正则 $2=文本 → 0 取得(P5_VAL = 匹配行数; 0 是有效的"没有") / 2 查询出错(退出码 ≥ 2 或输出不是数字; 输出不采信)
+  local out rc; P5_VAL=""
+  out="$(grep -c -- "$1" <<<"$2")"; rc=$?
+  { (( rc <= 1 )) && [[ "$out" =~ ^[0-9]+$ ]]; } || return 2
+  P5_VAL="$out"
+}
+p5_fp_svc(){   # $1=前 $2=后 $3=标签 → FP_SVCS 每个 unit 的运行态 / 自启态逐项三态
+  local u b a rb ra ba bn aa an
+  for u in "${FP_SVCS[@]}"; do
+    b="$(fp_get "$1" S "$u")"; rb=$?; a="$(fp_get "$2" S "$u")"; ra=$?
+    # 354: 字段提取核自己的退出码(不沿用 fp_get 的); 取不到的一侧按读取无效算
+    ba=""; bn=""; aa=""; an=""
+    if (( rb == 0 )); then { p5_cut "$b" 1 && ba="$P5_VAL" && p5_cut "$b" 2 && bn="$P5_VAL"; } || rb=2; fi
+    if (( ra == 0 )); then { p5_cut "$a" 1 && aa="$P5_VAL" && p5_cut "$a" 2 && an="$P5_VAL"; } || ra=2; fi
+    p5_cmp3 "$rb" "$ra" "$ba" "$aa" "运行态 $u" "$3 运行态: $u"
+    p5_cmp3 "$rb" "$ra" "$bn" "$an" "自启态 $u" "$3 自启态: $u"
+  done
+}
+
+# ── A5 / A7: 服务快照(每个观察 unit 一行, 无效字段标 INVALID, 末尾 END)────────────────────────
+p5_svc_snap(){   # $1=落点 → 0 全部有效 / 2 有无效(照样写出)
+  local u ld av ev sub pid inv nr why="" n
+  if ! {
+    for u in "${SVC_WATCH[@]}"; do
+      ld=INVALID; av=INVALID; ev=INVALID; sub=INVALID; pid=INVALID; inv=INVALID; nr=INVALID
+      if p5_uq load "$u"; then ld="$P5_VAL"; else why="$why $u(LoadState)"; fi
+      if p5_uq active "$u" "$ld"; then av="$P5_VAL"; else why="$why $u(运行态)"; fi
+      if p5_uq enabled "$u"; then ev="$P5_VAL"; else why="$why $u(自启态)"; fi
+      if p5_show SubState "$u"; then sub="$P5_VAL"; else why="$why $u(SubState)"; fi
+      if p5_show MainPID "$u"; then pid="$P5_VAL"; else why="$why $u(MainPID)"; fi
+      if p5_show InvocationID "$u"; then inv="$P5_VAL"; else why="$why $u(InvocationID)"; fi
+      if p5_show NRestarts "$u"; then nr="$P5_VAL"; else why="$why $u(NRestarts)"; fi
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$u" "$ld" "$av" "$ev" "$sub" "$pid" "$inv" "$nr"
+    done
+  } > "$1.tmp" 2>/dev/null; then P5_WHY="服务快照写不出来"; return 2; fi
+  n="$(wc -l < "$1.tmp")" || { P5_WHY="服务快照读不回来"; return 2; }
+  { printf 'END\t%s\n' "$n" >> "$1.tmp" && mv -f -- "$1.tmp" "$1"; } 2>/dev/null || { P5_WHY="服务快照收尾写不出来"; return 2; }
+  chmod 600 "$1" 2>/dev/null
+  [[ -z "$why" ]] || { P5_WHY="有观测无效:$why"; return 2; }
+}
+p5_svc_get(){   # $1=快照 $2=unit → 0 恰一行、8 列且各列格式合规(P5_ROW) / 2 读不了、不完整、行数不对、残缺或提取失败
+  local raw out rc; P5_ROW=""
+  raw="$(cat -- "$1" 2>/dev/null)" || return 2
+  # 354: 一次核完结构(END 条数与位置、该 unit 恰一行、8 列、状态词 / 数字格式), 提取核自己的退出码
+  out="$(awk -F'\t' -v u="$2" '
+      function word(x) { return x ~ /^[a-z][a-z-]*$/ || x == "INVALID" }
+      $1=="END" { endn++; endcnt=$2; endat=NR; next }
+      $1==u { hits++; row=$0
+              if (NF != 8 || !word($2) || !word($3) || !word($4) || ($5 != "" && !word($5)) || ($6 != "" && $6 !~ /^[0-9]+$/ && $6 != "INVALID") || ($8 != "" && $8 !~ /^[0-9]+$/ && $8 != "INVALID")) broken=1 }
+      END { if (endn != 1 || endat != NR || endcnt+0 != NR-1 || hits != 1 || broken) exit 2; print row }' <<<"$raw")"; rc=$?
+  { (( rc == 0 )) && [[ -n "$out" ]]; } || return 2
+  P5_ROW="$out"
+}
+p5_win_starts(){   # $1=unit → 0 取得(P5_VAL = 产品调用窗口 (C_PROD0, C_PROD1] 内的 Started 条数) / 2 未取得
+  local n; P5_VAL=""; P5_WHY=""
+  { [[ -n "${C_PROD0:-}" ]] && [[ -n "${C_PROD1:-}" ]]; } || { P5_WHY="产品调用窗口的界桩缺失"; return 2; }
+  n="$(_j_interval "$1" "$C_PROD0" "$C_PROD1")" || { P5_WHY="窗口计数无效: $(_j_why)"; return 2; }
+  [[ "$n" =~ ^[0-9]+$ ]] || { P5_WHY="窗口计数不是数字"; return 2; }
+  P5_VAL="$n"
+}
+p5_svc_settle(){   # $1=调用前快照 $2=调用后快照 $3=标签 → 0 窗口记录都在依据之内且全部取得 / 1 有超出依据 / 2 有未取得
+  local u x allowed b a bterm aterm binv ainv inst n cls n_over=0 n_na=0 b3 b4 a3 a4
+  for u in "${SVC_WATCH[@]}"; do
+    allowed=0; for x in "${P5_START_OK[@]}"; do [[ "$x" == "$u" ]] && allowed=1; done
+    [[ "$u" == pdg-mitm && "$DIR" == a2i ]] && allowed=1
+    b=""; a=""
+    p5_svc_get "$1" "$u" && b="$P5_ROW"
+    p5_svc_get "$2" "$u" && a="$P5_ROW"
+    # 354: 每一列的提取都核退出码; 终态(运行 / 自启)读不到的 unit 单独记未取得, 不被实例与窗口的正常结果盖掉
+    bterm=未取得; aterm=未取得
+    if [[ -n "$b" && -n "$a" ]] && p5_cut "$b" 3 && b3="$P5_VAL" && p5_cut "$b" 4 && b4="$P5_VAL" \
+       && p5_cut "$a" 3 && a3="$P5_VAL" && p5_cut "$a" 4 && a4="$P5_VAL" \
+       && [[ "$b3" != INVALID && "$b4" != INVALID && "$a3" != INVALID && "$a4" != INVALID ]]; then
+      bterm="$b3/$b4"; aterm="$a3/$a4"
+    fi
+    inst=未取得
+    if [[ -n "$b" && -n "$a" ]] && p5_cut "$b" 7 && binv="$P5_VAL" && p5_cut "$a" 7 && ainv="$P5_VAL" \
+       && [[ "$binv" != INVALID && "$ainv" != INVALID ]]; then
+      if [[ -z "$binv" && -z "$ainv" ]]; then inst=前后都没有
+      elif [[ "$binv" == "$ainv" ]]; then inst=未换
+      elif [[ -z "$binv" ]]; then inst=出现
+      elif [[ -z "$ainv" ]]; then inst=消失
+      else inst=换了; fi
+    fi
+    if p5_win_starts "$u"; then n="$P5_VAL"; else n=""; fi
+    if [[ -z "$n" ]]; then cls="未取得(窗口: $P5_WHY)"; n_na=$((n_na+1))
+    elif (( n > 0 )) && (( ! allowed )); then cls="超出依据(窗口内 $n 次启动)"; n_over=$((n_over+1))
+    elif [[ "$inst" == 未取得 ]]; then cls="未取得(实例标识读不到)"; n_na=$((n_na+1))
+    elif [[ "$inst" == 换了 || "$inst" == 出现 ]] && (( n == 0 )); then cls="未取得(实例$inst 却没有启动记录)"; n_na=$((n_na+1))
+    elif [[ "$inst" == 消失 && "$u" != pdg-mitm ]]; then cls="未取得(实例标识消失, 没有依据)"; n_na=$((n_na+1))
+    elif [[ "$bterm" == 未取得 ]]; then cls="未取得(终态读不到)"; n_na=$((n_na+1))
+    else cls="符合依据"; fi
+    printf '    %-20s 终态 %s → %s   实例 %s   窗口内启动 %s   %s\n' "$u" "$bterm" "$aterm" "$inst" "${n:-未取得}" "$cls"
+  done
+  _evn "07-service-actions-$3.txt" "超出依据=$n_over 未取得=$n_na(依据: 353 basis/A7-basis.tsv)"
+  (( n_over == 0 )) || bad "$3: 有 $n_over 个 unit 在调用窗口内出现了依据之外的启动"
+  (( n_na == 0 )) || bad "$3: 有 $n_na 个 unit 的终态、实例对照或窗口记录未取得 —— 不给总体通过"
+  if (( n_over == 0 && n_na == 0 )); then
+    ok "$3: 调用窗口内记录到的启动都在依据之内(${#SVC_WATCH[@]} 个 unit 逐项见上; 只覆盖 journal 记到的启动, 不宣称全程没有别的服务动作)"; return 0
+  fi
+  (( n_over == 0 )) || return 1
+  return 2
+}
+p5_quiet_unit(){   # $1=unit $2=标签 $3=前像自启(可空) → 终态与调用窗口内的启动记录分开判
+  local u="$1" lbl="$2" ld ac en n
+  if p5_uq load "$u" && ld="$P5_VAL" && p5_uq active "$u" "$ld" && ac="$P5_VAL" && p5_uq enabled "$u" && en="$P5_VAL"; then
+    if [[ "$ac" != active && "$ac" != activating && "$en" != enabled ]]; then
+      p5_tally ok "$u 终态停用"; ok "$lbl: 终态仍是停用(运行=$ac 自启=$en; 前像自启=${3:-未单列})"
+    else p5_tally diff "$u 终态停用"; bad "$lbl: 终态被改了(运行=$ac 自启=$en)"; fi
+  else p5_tally na "$u 终态停用"; bad "$lbl: 终态读数无效 —— 未取得($P5_WHY)"; fi
+  if p5_win_starts "$u"; then
+    n="$P5_VAL"
+    if (( n == 0 )); then ok "$lbl: 调用窗口内没有它的启动记录(界桩裁决; 只说明窗口内 journal 没记到启动)"
+    else bad "$lbl: 调用窗口内有 $n 次启动记录 —— 被拉起过(终态相同也不能写成没动过)"; fi
+  else bad "$lbl: 调用窗口内的启动记录未取得 —— $P5_WHY"; fi
+}
+
+# ── A5: 本次快照绑定与产品前像的独立核对 ──────────────────────────────────────
+p5_presample(){   # $1=落点 → 调用前对 8 个 unit 独立采样(自启态与运行态) → 0 全部有效 / 2 有无效
+  local u ld ev av why=""
+  if ! {
+    for u in "${P5_SVC8[@]}"; do
+      ev=INVALID; av=INVALID
+      if p5_uq load "$u"; then ld="$P5_VAL"
+        if p5_uq enabled "$u"; then ev="$P5_VAL"; else why="$why $u(自启)"; fi
+        if p5_uq active "$u" "$ld"; then av="$P5_VAL"; else why="$why $u(运行)"; fi
+      else why="$why $u(LoadState)"; fi
+      printf '%s\t%s\t%s\n' "$u" "$ev" "$av"
+    done
+  } > "$1" 2>/dev/null; then P5_WHY="独立采样写不出来"; return 2; fi
+  [[ -z "$why" ]] || { P5_WHY="独立采样有无效读取:$why"; return 2; }
+}
+p5_snap_list(){   # $1=落点 → 0 取得(首行 ABSENT = 目录不存在 / PRESENT = 存在, 其后逐条「名<TAB>类型」; 空目录也有首行) / 2 取不到
+  P5_WHY=""
+  if [[ ! -e "$P5_SNAPDIR" && ! -L "$P5_SNAPDIR" ]]; then
+    printf 'ABSENT\n' > "$1" 2>/dev/null || { P5_WHY="清单落点写不出来"; return 2; }
+    return 0
+  fi
+  { [[ -d "$P5_SNAPDIR" ]] && [[ ! -L "$P5_SNAPDIR" ]]; } || { P5_WHY="$P5_SNAPDIR 不是普通目录"; return 2; }
+  { printf 'PRESENT\n' && find "$P5_SNAPDIR" -mindepth 1 -maxdepth 1 -printf '%f\t%y\n'; } > "$1" 2>/dev/null || { P5_WHY="列 $P5_SNAPDIR 失败"; return 2; }
+}
+P5_SNAP=""; P5_BIND_DONE=""
+p5_snap_bind(){   # $1=调用前清单 $2=去掉颜色的产品输出 → 0 绑定成立(P5_SNAP) / 2 未取得(P5_WHY; 已核的步骤在 P5_BIND_DONE)
+  local after new n nm rb rs ref dd raw hdr sd sid bid cur got want cnt dig units last lst d2 drc rc
+  P5_SNAP=""; P5_WHY=""; P5_BIND_DONE=""
+  after="${E2E_TMP:?}/p5-snap-after.txt"
+  { [[ -s "$1" ]] && read -r hdr < "$1" && [[ "$hdr" == PRESENT || "$hdr" == ABSENT ]]; } 2>/dev/null \
+    || { P5_WHY="调用前的快照目录清单缺失或没有首行"; return 2; }
+  p5_snap_list "$after" || return 2
+  new="$(awk -F'\t' 'NR==FNR { if (FNR > 1) seen[$1]=1; next } FNR > 1 && !($1 in seen) { print $1 "\t" $2 }' "$1" "$after")" \
+    || { P5_WHY="调用前后清单比较失败"; return 2; }
+  # 354: 下面每一步的计数 / 提取 / 摘要 / 排序先核执行有效再用内容; grep 的"没匹配"(退出 1)是合法的 0, 退出 ≥ 2 才是查询出错
+  p5_count . "$new" || { P5_WHY="新出现条目的计数查询失败(输出不采信)"; return 2; }
+  n="$P5_VAL"
+  [[ "$n" == 1 ]] || { P5_WHY="调用前后新出现的快照目录不是恰好一个(实得 $n)"; return 2; }
+  p5_cut "$new" 2 || { P5_WHY="新出现条目的类型提取失败"; return 2; }
+  [[ "$P5_VAL" == d ]] || { P5_WHY="新出现的条目不是目录"; return 2; }
+  { p5_cut "$new" 1 && [[ -n "$P5_VAL" ]]; } || { P5_WHY="新出现条目的名字提取失败"; return 2; }
+  nm="$P5_VAL"; dd="$P5_SNAPDIR/$nm"; P5_BIND_DONE="新目录唯一($nm)"
+  p5_count '^回滚到 .* …$' "$2" || { P5_WHY="产品输出里'回滚到'行的计数查询失败(输出不采信)"; return 2; }
+  rb="$P5_VAL"
+  p5_count '^ *本次快照    : ' "$2" || { P5_WHY="产品输出里'本次快照'行的计数查询失败(输出不采信)"; return 2; }
+  rs="$P5_VAL"
+  { (( rb <= 1 )) && (( rs <= 1 )) && (( rb + rs >= 1 )); } \
+    || { P5_WHY="产品输出里指向快照的行数不对(回滚到 $rb 行 / 本次快照 $rs 行)"; return 2; }
+  if (( rb == 1 )); then ref="$(sed -n 's/^回滚到 \(.*\) …$/\1/p' <<<"$2")" || { P5_WHY="'回滚到'行的快照名提取失败"; return 2; }
+    [[ "$ref" == "$nm" ]] || { P5_WHY="产品输出的快照名 [$ref] 与新目录 [$nm] 不符"; return 2; }; fi
+  if (( rs == 1 )); then ref="$(sed -n 's/^ *本次快照    : //p' <<<"$2")" || { P5_WHY="'本次快照'行的路径提取失败"; return 2; }
+    [[ "${ref%/}" == "$dd" ]] || { P5_WHY="产品输出的快照路径 [$ref] 与新目录 [$dd] 不符"; return 2; }; fi
+  P5_BIND_DONE="$P5_BIND_DONE, 与产品输出同名"
+  { [[ -d "$dd" ]] && [[ ! -L "$dd" ]] && [[ -f "$dd/snap.tar.gz" ]] && [[ -f "$dd/svcstate.tsv" ]]; } \
+    || { P5_WHY="$dd 不是含 snap.tar.gz 与 svcstate.tsv 的普通目录"; return 2; }
+  raw="$(cat -- "$dd/svcstate.tsv" 2>/dev/null)" || { P5_WHY="svcstate.tsv 读不了"; return 2; }
+  [[ "${raw%%$'\n'*}" == "#pdg-svcstate"$'\t'"1" ]] || { P5_WHY="svcstate.tsv 的头行不对"; return 2; }
+  hdr="$(awk -F'\t' '$1=="snap_dir" || $1=="snap_id" || $1=="boot_id" { c[$1]++; v[$1]=$2 }
+         END { if (c["snap_dir"]!=1 || c["snap_id"]!=1 || c["boot_id"]!=1) exit 3; printf "%s\t%s\t%s\n", v["snap_dir"], v["snap_id"], v["boot_id"] }' <<<"$raw")" \
+    || { P5_WHY="svcstate 的 snap_dir / snap_id / boot_id 缺失或重复"; return 2; }
+  { p5_cut "$hdr" 1 && sd="$P5_VAL" && p5_cut "$hdr" 2 && sid="$P5_VAL" && p5_cut "$hdr" 3 && bid="$P5_VAL"; } \
+    || { P5_WHY="svcstate 头部三个字段的提取失败"; return 2; }
+  [[ "${sd%/}" == "${dd%/}" ]] || { P5_WHY="svcstate 的 snap_dir [$sd] 不是这个目录"; return 2; }
+  cur="$(stat -c '%d:%i:%s:%Y' -- "$dd/snap.tar.gz" 2>/dev/null)" && [[ -n "$cur" ]] || { P5_WHY="snap.tar.gz 的身份读不了"; return 2; }
+  [[ "$sid" == "$cur" ]] || { P5_WHY="svcstate 的 snap_id [$sid] 与这份 snap.tar.gz [$cur] 不符"; return 2; }
+  got="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" && [[ -n "$got" ]] || { P5_WHY="本机 boot_id 读不了"; return 2; }
+  [[ "$bid" == "$got" ]] || { P5_WHY="svcstate 的 boot_id 不是本次开机"; return 2; }
+  P5_BIND_DONE="$P5_BIND_DONE, snap_dir / snap_id / boot_id"
+  awk -F'\t' '$1=="end" { n++; ln=NR } END { exit (n==1 && ln==NR) ? 0 : 3 }' <<<"$raw" \
+    || { P5_WHY="end 行不是恰好一行且在末尾"; return 2; }
+  last="${raw##*$'\n'}"
+  { p5_cut "$last" 2 && cnt="$P5_VAL" && p5_cut "$last" 3 && dig="$P5_VAL"; } || { P5_WHY="end 行的条数 / 摘要提取失败"; return 2; }
+  { units="$(awk -F'\t' '$1=="unit" {n++} END{print n+0}' <<<"$raw")" && [[ "$units" =~ ^[0-9]+$ ]]; } || { P5_WHY="unit 行计数失败"; return 2; }
+  [[ "$cnt" == "$units" ]] || { P5_WHY="end 行记 $cnt 条, 实有 unit 行 $units 条"; return 2; }
+  d2="$(printf '%s\n' "${raw%$'\n'*}" | sha256sum)"; drc=$?
+  { (( drc == 0 )) && (( ${#d2} >= 64 )) && [[ "${d2:0:64}" =~ ^[0-9a-f]+$ ]]; } || { P5_WHY="正文摘要计算失败(rc=$drc, 输出不采信)"; return 2; }
+  [[ "${d2:0:64}" == "$dig" ]] || { P5_WHY="end 行的正文摘要与正文对不上"; return 2; }
+  P5_BIND_DONE="$P5_BIND_DONE, end 条数与正文摘要"
+  lst="$(awk -F'\t' '$1=="unit" { if (NF != 8) bad=1; print $2 } END { exit bad ? 3 : 0 }' <<<"$raw")"; rc=$?
+  (( rc != 3 )) || { P5_WHY="有 unit 行字段数不对"; return 2; }
+  (( rc == 0 )) || { P5_WHY="unit 名的提取失败(rc=$rc)"; return 2; }
+  got="$(LC_ALL=C sort <<<"$lst")" || { P5_WHY="unit 名的排序失败"; return 2; }
+  want="$(printf '%s\n' "${P5_SVC8[@]}" | LC_ALL=C sort)" || { P5_WHY="候选 unit 集合的排序失败"; return 2; }
+  [[ "$got" == "$want" ]] || { P5_WHY="svcstate 的 unit 集合不是候选那 8 个(缺、多或重复)"; return 2; }
+  P5_BIND_DONE="$P5_BIND_DONE, 8 个 unit 完整且唯一"
+  P5_SNAP="$dd"
+}
+
+# ── A6: 产品自报的解析与报告诚实性 ────────────────────────────────────────────
+P5_CLAIM=""; P5_RESTAT=""; P5_LEFTBAD=""; P5_LEFTN=0; P5_LEFTQ=""; P5_WHYQ=""; P5_PLXQ=""
+p5_report_parse(){   # $1=去掉颜色的产品输出 → P5_CLAIM(complete / incomplete / none / both / unknown = 查询失败)、P5_RESTAT、P5_MAT[newfiles|localbak|snap]、未删文件核对
+  local t="$1" nc="" ni="" cnt i path lst r qf=""
+  local -a keys=(newfiles localbak snap) pfx=('新增文件清单: ' '局部备份    : ' '本次快照    : ')
+  P5_WHYQ=""
+  # 354: 每一次查询先核执行有效; grep 的"没匹配"是合法的 0, 查询出错不当成 0、缺失或空清单
+  if p5_count '已按本次快照恢复到切换前' "$t"; then nc="$P5_VAL"; else qf="$qf 完成"; fi
+  if p5_count '恢复未完成' "$t"; then ni="$P5_VAL"; else qf="$qf 未完成"; fi
+  if [[ -n "$qf" ]]; then P5_CLAIM=unknown; P5_WHYQ="自报的计数查询失败:$qf"
+  elif (( nc >= 1 && ni >= 1 )) || (( nc > 1 || ni > 1 )); then P5_CLAIM=both
+  elif (( nc == 1 )); then P5_CLAIM=complete
+  elif (( ni == 1 )); then P5_CLAIM=incomplete
+  else P5_CLAIM=none; fi
+  if ! p5_count '快照恢复: ' "$t"; then P5_RESTAT=未取得
+  else
+    cnt="$P5_VAL"
+    if (( cnt == 1 )); then
+      grep -q '快照恢复: 已完成' <<<"$t"; r=$?
+      if (( r == 0 )); then P5_RESTAT=已完成
+      elif (( r == 1 )); then
+        grep -q '快照恢复: \*\*未完成\*\*' <<<"$t"; r=$?
+        if (( r == 0 )); then P5_RESTAT=未完成; elif (( r == 1 )); then P5_RESTAT=认不出; else P5_RESTAT=未取得; fi
+      else P5_RESTAT=未取得; fi
+    elif (( cnt > 1 )); then P5_RESTAT=重复; else P5_RESTAT=缺失; fi
+  fi
+  P5_MAT=()
+  for i in 0 1 2; do
+    if ! p5_count "^ *${pfx[$i]}" "$t"; then P5_MAT[${keys[$i]}]="未取得(查询失败)"; continue; fi
+    cnt="$P5_VAL"
+    if (( cnt == 0 )); then P5_MAT[${keys[$i]}]=缺失
+    elif (( cnt > 1 )); then P5_MAT[${keys[$i]}]=多处
+    elif ! path="$(sed -n "s/^ *${pfx[$i]}//p" <<<"$t")"; then P5_MAT[${keys[$i]}]="未取得(路径提取失败)"
+    elif [[ -e "$path" || -L "$path" ]]; then P5_MAT[${keys[$i]}]="在盘上 $path"
+    else P5_MAT[${keys[$i]}]="不在盘上 $path"; fi
+  done
+  P5_LEFTBAD=""; P5_LEFTN=0; P5_LEFTQ=ok
+  if ! lst="$(awk '/本次新增、\*\*没能删掉\*\*的文件/ {f=1; next} f && /^     [^ ]/ {sub(/^     /, ""); print; next} f {f=0}' <<<"$t")"; then P5_LEFTQ=未取得; lst=""; fi
+  while IFS= read -r path; do
+    [[ -n "$path" ]] || continue
+    P5_LEFTN=$((P5_LEFTN+1))
+    [[ -e "$path" || -L "$path" ]] || P5_LEFTBAD="$P5_LEFTBAD $path"
+  done <<<"$lst"
+}
+p5_honesty(){   # 报告诚实性, 与恢复结果分开结算(352 settlement-A5-A6 的 A6): 互不抵消
+  local k n_ok=0 n_diff=0 n_na=0 matbad=0 matna="" diffs="" nas=""
+  for k in "${!P5_RES[@]}"; do
+    case "${P5_RES[$k]}" in
+      ok) n_ok=$((n_ok+1));;
+      diff) n_diff=$((n_diff+1)); diffs="$diffs [$k]";;
+      *) n_na=$((n_na+1)); nas="$nas [$k]";;
+    esac
+  done
+  note "恢复结果(已检查范围): 已恢复 $n_ok / 未恢复 $n_diff / 未取得 $n_na${diffs:+; 未恢复:$diffs}${nas:+; 未取得:$nas}"
+  case "$P5_CLAIM" in
+    unknown) bad "报告诚实性: 未取得 —— ${P5_WHYQ:-自报的查询失败}(不当成没有自报, 也不据此判报告不实)"; return 2;;
+    none) bad "报告诚实性: 产品既没报恢复完成也没报恢复未完成 —— 没有自报"; return 1;;
+    both) bad "报告诚实性: 产品的自报自相矛盾(完成与未完成同时出现或重复)"; return 1;;
+    complete)
+      if (( n_diff > 0 )); then bad "报告诚实性: 自报恢复完成, 现场有 $n_diff 项未恢复 —— 报告与现场不符"; return 1; fi
+      if (( n_na > 0 )); then bad "报告诚实性: 未取得 —— 自报恢复完成, 已核部分一致, 但有 $n_na 项观测无效(不背书)"; return 2; fi
+      ok "报告诚实性: 自报恢复完成, 与已检查范围($n_ok 项)一致"; return 0;;
+    incomplete) ;;
+    *) bad "报告诚实性: 产品自报没有解析出来($P5_CLAIM)"; return 1;;
+  esac
+  note "报告诚实性: 自报恢复未完成; 报告点名没能删掉的文件 $P5_LEFTN 个"
+  # 354: 报告自己的材料有缺失 / 矛盾(matbad)与"材料的查询失败"(matna)分开; 后者记未取得, 不冒充报告缺材料
+  for k in newfiles localbak snap; do
+    case "${P5_MAT[$k]:-缺失}" in
+      在盘上*) ;;
+      未取得*) note "报告诚实性: 材料路径 $k: ${P5_MAT[$k]}"; matna="$matna 材料路径 $k";;
+      *) bad "报告诚实性: 材料路径 $k: ${P5_MAT[$k]:-缺失}"; matbad=1;;
+    esac
+  done
+  case "$P5_RESTAT" in 已完成|未完成) ;; 未取得) matna="$matna '快照恢复'那一行";; *) bad "报告诚实性: '快照恢复: …'那一行 $P5_RESTAT"; matbad=1;; esac
+  [[ "$P5_LEFTQ" == ok ]] || matna="$matna 没能删掉的文件清单"
+  [[ -z "$P5_LEFTBAD" ]] || { bad "报告诚实性: 报告说没能删掉、却不在盘上的文件:$P5_LEFTBAD"; matbad=1; }
+  if (( n_diff > 0 )); then
+    if (( matbad )); then bad "报告诚实性: 自报恢复未完成, 但报告自身的收尾材料有缺失 / 矛盾 / 读不了(上面逐项)"; return 1; fi
+    if [[ -n "$matna" ]]; then bad "报告诚实性: 未取得 —— 自报恢复未完成, 但这些报告材料的查询失败:$matna(不据此判报告不实, 也不背书)"; return 2; fi
+    ok "报告诚实性: 自报恢复未完成, 与现场 $n_diff 项真实未恢复一致(只核总述与材料; 报告里点名的内容没有逐项核对, 不背书)"; return 0
+  fi
+  if (( n_na > 0 )); then bad "报告诚实性: 未取得 —— 自报恢复未完成, 现场没有核实的未恢复项, 只有 $n_na 项观测无效(不据此背书)"; return 2; fi
+  bad "报告诚实性: 自报恢复未完成而已检查范围全部已恢复 —— 单列(不是产品失败的证据, 但本项不能给通过)"; return 2
+}
+
+# ── A5(a): 产品记录的操作前像 vs 调用前的独立采样 ──────────────────────────────
+svcstate_cross_check(){   # $1=已绑定的 svcstate.tsv $2=调用前独立采样 $3=标签 → 0 一致 / 1 有不一致 / 2 未取得
+  local raw praw u pen pac men mac n_ok=0 n_bad=0 n_na=0
+  raw="$(cat -- "$1" 2>/dev/null)" || { bad "$3: 产品前像读不了 —— 未取得"; return 2; }
+  praw="$(cat -- "$2" 2>/dev/null)" || { bad "$3: 调用前的独立采样读不了 —— 未取得"; return 2; }
+  for u in "${P5_SVC8[@]}"; do
+    # 354: 四个字段的提取各核退出码且只许恰好一行; 提取失败不能当"一致"
+    if ! pen="$(awk -F'\t' -v u="$u" '$1=="unit" && $2==u {print $3}' <<<"$raw")" || ! pac="$(awk -F'\t' -v u="$u" '$1=="unit" && $2==u {print $5}' <<<"$raw")" \
+       || [[ "$pen" == *$'\n'* || "$pac" == *$'\n'* ]]; then
+      n_na=$((n_na+1)); printf '    %-24s 产品前像字段提取失败\n' "$u"; continue; fi
+    if ! men="$(awk -F'\t' -v u="$u" '$1==u {print $2}' <<<"$praw")" || ! mac="$(awk -F'\t' -v u="$u" '$1==u {print $3}' <<<"$praw")" \
+       || [[ "$men" == *$'\n'* || "$mac" == *$'\n'* ]]; then
+      n_na=$((n_na+1)); printf '    %-24s 调用前独立采样字段提取失败\n' "$u"; continue; fi
+    if [[ -z "$men" || -z "$mac" || "$men" == INVALID || "$mac" == INVALID ]]; then
+      n_na=$((n_na+1)); printf '    %-24s 调用前独立采样无效\n' "$u"; continue; fi
+    if [[ -z "$pen" || -z "$pac" || "$pen" == QUERY-FAILED || "$pac" == QUERY-FAILED ]]; then
+      n_na=$((n_na+1)); printf '    %-24s 产品记的是观测失败或缺项(%s / %s)\n' "$u" "${pen:-无}" "${pac:-无}"; continue; fi
+    if [[ "$pen" == "$men" && "$pac" == "$mac" ]]; then n_ok=$((n_ok+1)); continue; fi
+    n_bad=$((n_bad+1)); printf '    %-24s 产品记: %s/%s   调用前独立采样: %s/%s\n' "$u" "$pen" "$pac" "$men" "$mac"
+  done
+  (( n_bad == 0 )) || { bad "$3: 产品记录的操作前像与调用前独立采样有 $n_bad 项不一致(上面逐项)"; return 1; }
+  (( n_na == 0 )) || { bad "$3: 有 $n_na 项未取得 —— 产品前像的独立核对不成立"; return 2; }
+  ok "$3: 产品记录的操作前像与调用前独立采样逐项一致(${#P5_SVC8[@]} 个 unit; 比的是调用前, 不是恢复后的现场)"
+}
+# ── p5段 公共函数 止 ──
 
 
 DIR="${PDG_PLAT_DIR:-a2i}"        # a2i = Android→iOS, i2a = iOS→Android
@@ -1778,7 +2393,7 @@ note "  清理**之后**、切换提交**之前**。不是桩, 也没有替换�
 
 PH_T0="$(_now_j)"        # 仅供阅读
 C_PREP0="$(_j_mark prep-start)" || note "阶段记账: 准备阶段起界桩没建成($(_j_why)) —— 该段记账将报观测无效"
-build_preimage ios on
+build_preimage ios on || { bad "前像构造返回非 0 —— 前像不成立(353: 以前不看这个返回值, 照样往下走到调用)"; PREIMAGE_OK=0; }
 # ── 合法历史残留: 每一项写明来源, 并在下面逐项记指纹 ────────────────────────
 # ① 接管表里有一条**非 WLOC** 的域名(有人手工改过的痕迹)
 STRAY_DOMAIN="full:legacy-hand-edited.example"
@@ -1832,20 +2447,21 @@ systemctl start pdg-probe81 >/dev/null 2>&1 || true
 systemctl disable pdg-bot >/dev/null 2>&1 || true
 systemctl stop    pdg-bot >/dev/null 2>&1 || true
 # ── 前像先稳下来再采样 ──────────────────────────────────────────────────────
+# ── p5段 前像判据 起 ──
 for _u in pdg-mitm mosdns mihomo pdg-probe81 pdg-bot pdg-health.timer; do
   printf '    %-18s 稳定后 ActiveState=%s UnitFileState=%s\n' "$_u" "$(wait_stable "$_u")" \
     "$(systemctl show -p UnitFileState --value "$_u" 2>/dev/null)"
 done
-[[ "$(sc_state is-enabled pdg-probe81)" == enabled-runtime ]] \
-  && ok "前像: pdg-probe81 的自启是 enabled-runtime(真 systemd 实测)" \
-  || { bad "前像: pdg-probe81 自启=$(sc_state is-enabled pdg-probe81)"; PREIMAGE_OK=0; }
+# 353: 上面那段只作展示。下面的判据: 自启态按「状态词 + 原始退出码」配对读取(合法非零照收, 查询失败不当成任何状态);
+#      持续运行 / 停止经 ⑤ 的记账包装跑共享窗口(窗口里任何一次查询非零退出 ⇒ 观测无效, 后续成功不能清掉)。
+if p5_uq enabled pdg-probe81 && [[ "$P5_VAL" == enabled-runtime ]]; then ok "前像: pdg-probe81 的自启是 enabled-runtime(真 systemd 实测, 读数有效)"
+else bad "前像: pdg-probe81 自启读数无效或不是 enabled-runtime(${P5_WHY:-实得 $P5_VAL})"; PREIMAGE_OK=0; fi
 # 运行/停止都在**有界窗口**里判(瞬时 active、崩溃循环、实例更替都过不去)
-svc_stable_assert pdg-probe81    running "前像: pdg-probe81 持续运行" 5
-[[ "$(sc_state is-enabled pdg-bot)" != enabled ]] \
-  && ok "前像: pdg-bot 的自启是产品支持的停用态($(sc_state is-enabled pdg-bot), 没配凭据)" \
-  || { bad "前像: pdg-bot 自启不该是 enabled"; PREIMAGE_OK=0; }
-svc_stable_assert pdg-bot        stopped "前像: pdg-bot 持续停止(没配凭据)" 5
-svc_stable_assert pdg-health.timer stopped "前像: pdg-health.timer 持续停止(全程不该被启动)" 5
+p5_stable_assert pdg-probe81    running "前像: pdg-probe81 持续运行" 5
+if p5_uq enabled pdg-bot && [[ "$P5_VAL" != enabled ]]; then ok "前像: pdg-bot 的自启是产品支持的停用态($P5_VAL, 没配凭据; 读数有效)"
+else bad "前像: pdg-bot 自启读数无效或是 enabled(${P5_WHY:-实得 $P5_VAL})"; PREIMAGE_OK=0; fi
+p5_stable_assert pdg-bot        stopped "前像: pdg-bot 持续停止(没配凭据)" 5
+p5_stable_assert pdg-health.timer stopped "前像: pdg-health.timer 持续停止(全程不该被启动)" 5
 grep -q "$STRAY_DOMAIN" /etc/mosdns/rules/mitm_hijack.txt \
   && ok "前像: 接管表里有一条非 WLOC 的历史条目($STRAY_DOMAIN)" || { bad "前像: 残留条目没写进去"; PREIMAGE_OK=0; }
 [[ -e /etc/systemd/system/pdg-mitm.service && -e /opt/pdg-bot/mitm_server.py && -e /opt/pdg-bot/mitm_wloc.py ]] \
@@ -1858,8 +2474,10 @@ grep -q "$STRAY_DOMAIN" /etc/mosdns/rules/mitm_hijack.txt \
 #   a2i(WLOC 开): pdg-mitm 持续 active, 7894 有监听;
 #   i2a(WLOC 关): 走完真实关闭路径后 pdg-mitm 持续 inactive, 7894 没有监听。
 if [[ "$DIR" == i2a ]]; then MITM_WANT=stopped; else MITM_WANT=running; fi
-svc_stable_assert pdg-mitm "$MITM_WANT" "前像: pdg-mitm 在有界窗口内持续 $MITM_WANT(不是瞬时取样)"
-MITM_AC_BEFORE="$(sc_state is-active pdg-mitm)"
+p5_stable_assert pdg-mitm "$MITM_WANT" "前像: pdg-mitm 在有界窗口内持续 $MITM_WANT(不是瞬时取样)"
+MITM_AC_BEFORE=""
+if p5_uq load pdg-mitm && P5_LD="$P5_VAL" && p5_uq active pdg-mitm "$P5_LD"; then MITM_AC_BEFORE="$P5_VAL"
+else bad "前像: pdg-mitm 运行态读数无效 —— $P5_WHY"; PREIMAGE_OK=0; fi
 MITM_WLOC_ON="$(python3 -c 'import json,sys
 try: print("1" if json.load(open("/etc/privdns-gateway/mitm.json",encoding="utf-8")).get("wloc",{}).get("enabled") else "0")
 except Exception: print("?")' 2>/dev/null)"
@@ -1874,10 +2492,14 @@ except Exception: print("?")' 2>/dev/null)"
 [[ "$MITM_LOC_SHAPE" == list ]] \
   && ok "前像: mitm.json 的 wloc.locations 是旧版解析得了的**列表**形状(不会把它拖进崩溃循环)" \
   || { bad "前像: wloc.locations 形状是 $MITM_LOC_SHAPE, 旧版 _wloc_active 会抛 AttributeError"; PREIMAGE_OK=0; }
-MITM_LISTEN_BEFORE="$(ss -lnt 2>/dev/null | grep -c ':7894 ')"
-note "前像: 盘上 wloc.enabled=$MITM_WLOC_ON, pdg-mitm=$MITM_AC_BEFORE, 7894 监听数=$MITM_LISTEN_BEFORE, locations 形状=$MITM_LOC_SHAPE"
+# 353: 7894 的监听数分"确认没有(0)"与"观测无效"; ss 失败不再当成 0。
+MITM_LISTEN_BEFORE=""
+if p5_listen 7894 tcp; then MITM_LISTEN_BEFORE="$P5_LN"
+else bad "前像: 7894 监听查询无效 —— $P5_WHY"; PREIMAGE_OK=0; fi
+note "前像: 盘上 wloc.enabled=$MITM_WLOC_ON, pdg-mitm=${MITM_AC_BEFORE:-读不到}, 7894 监听数=${MITM_LISTEN_BEFORE:-读不到}, locations 形状=$MITM_LOC_SHAPE"
 # 语义按旧版原文对: **监听跟着进程在不在**, enabled 决定的是有没有接管插件。
 #   serve() 无条件 bind 7894 ⇒ 进程活着就该有监听, 停了就不该有。
+if [[ -n "$MITM_AC_BEFORE" && -n "$MITM_LISTEN_BEFORE" ]]; then
 mitm_listen_verdict "$MITM_AC_BEFORE" "$MITM_LISTEN_BEFORE"
 case "$?" in
   0) ok "前像自洽: $MITM_VERDICT_WHY";;
@@ -1894,7 +2516,11 @@ else
     && ok "前像: 本方向 WLOC 开着且 7894 在监听(接管链路真的在)" \
     || { bad "前像: WLOC 开启态没建立起来(enabled=$MITM_WLOC_ON 监听=$MITM_LISTEN_BEFORE)"; PREIMAGE_OK=0; }
 fi
-note "前像: pdg-mitm 的合法目标态 = $MITM_WANT, 实测 $MITM_AC_BEFORE —— 恢复判据按它比"
+else
+  bad "前像: pdg-mitm 运行态或 7894 监听数没有有效读数 —— 自洽与方向条件无从判定"; PREIMAGE_OK=0
+fi
+note "前像: pdg-mitm 的合法目标态 = $MITM_WANT, 实测 ${MITM_AC_BEFORE:-读不到} —— 恢复判据按它比"
+# ── p5段 前像判据 止 ──
 : > "$RESIDUE_MANIFEST"
 residue_record /etc/systemd/system/pdg-mitm.service "v1.11.15 的 unit 模板(pdg_write_unit pdg_unit_pdg_mitm)"
 residue_record /opt/pdg-bot/mitm_server.py         "v1.11.15 源码树 deploy/bot/mitm_server.py"
@@ -1919,72 +2545,96 @@ note "  与「候选部署身份」是两回事, 下面分开核验; 既不因�
 note "  也不笼统豁免任何额外文件(上面清单逐项记了来源与指纹)。"
 
 # ── 测试前置: 把冻结退役候选安装上去(只是前置, 不是合法升级路径)──────────────
-install_candidate(){   # $1=平台(默认取 $FROM)
-  local n=0 name src mode plat="${1:-${FROM:-ios}}"
-  install -m755 "$CANDSRC/deploy/bot/pdg.sh" /usr/local/bin/pdg || return 1
-  # shellcheck source=/dev/null
-  source "$CANDSRC/lib/modules.sh" || return 1
+# ── p5段 候选安装 起 ──
+install_candidate(){   # $1=平台(默认取 $FROM) → 打印装上的项数; 清单无效 / 为空 / 任一件装不上 ⇒ 非 0
+  local n=0 name src mode plat="${1:-${FROM:-ios}}" lst
+  lst="${E2E_TMP:?}/p5-install-$plat.txt"
+  install -m755 "$CANDSRC/deploy/bot/pdg.sh" "$P5_CLI" || return 1
+  p5_modlist "$CANDSRC" "$plat" "$lst" || return 1
   while read -r src name mode; do
     [[ -n "$name" ]] || continue
-    install -m"${mode:-644}" "$CANDSRC/$src" "/opt/pdg-bot/$name" 2>/dev/null || return 1
+    install -m"${mode:-644}" "$CANDSRC/$src" "$P5_MODDIR/$name" 2>/dev/null || return 1
     n=$((n+1))
-  done < <(pdg_platform_modules "$plat")
+  done < "$lst"
+  (( n > 0 )) || return 1
   printf '%s\n' "$n"
 }
-CN="$(install_candidate "$FROM")" || { bad "测试前置: 安装冻结候选失败"; PREIMAGE_OK=0; }
-note "测试前置: 已装候选($CN 项受管模块)。下面单独核验部署身份 —— 与上面的历史残留分开看。"
-assert_candidate_identity "$FROM"
+CN="$(install_candidate "$FROM")" || { bad "测试前置: 安装冻结候选失败(清单无效、为空或有件装不上)"; PREIMAGE_OK=0; }
+note "测试前置: 已装候选(${CN:-0} 项受管模块)。下面单独核验部署身份 —— 与上面的历史残留分开看。"
+assert_candidate_identity "$FROM" || { bad "测试前置: 候选部署身份不成立 —— 不调用产品"; PREIMAGE_OK=0; }
 switch_repo_to_candidate "$FROM" || PREIMAGE_OK=0
 systemctl daemon-reload
+# ── p5段 候选安装 止 ──
 
 # ── 准备与被测操作之间的启动额度: 先清点, 再有界静置 ────────────────────────
-startlimit_inventory
-quiesce_startlimit "标定前" || true    # 失败已置 PREIMAGE_OK=0, 下面的前置门会报未执行
+# ── p5段 准备与标定 起 ──
+# 353: 清点、静置、标定用到的共享函数原文一字不动; 它们内部的 systemctl / journalctl 查询经 ⑤ 的记账包装执行,
+#      任何一次非零退出 ⇒ 整项观测无效(不能被随后的成功覆盖); 静置只量那一次目标 sleep(p5_quiesce)。
+p5_acct "启动额度清点" "${E2E_TMP:?}/p5-inv.out" startlimit_inventory; P5_ARC=$?
+cat -- "$E2E_TMP/p5-inv.out" 2>/dev/null
+p5_acct_flush "$P5_ARC" "启动额度清点" || { P5_ARC=2; P5_WHY="${P5_WHY:+$P5_WHY; }被测判据的原判读不回来"; }   # 354: 缓冲读不回 ⇒ 本项无效
+(( P5_ARC == 0 )) || { bad "启动额度清点: **观测无效** —— $P5_WHY"; PREIMAGE_OK=0; SL_INT_S=""; }
+p5_quiesce "标定前" || true    # 失败已置 PREIMAGE_OK=0, 下面的前置门会报未执行
 
 # 先标定再用。**标定不过 = 验收前置不成立** —— 不是"把 DNS 那一项降成 note 然后照常跑完",
 # 那样等于拿一个证明不了东西的仪器走完四维验收再说一句"这项没取到"。
 # 所以它直接置 PREIMAGE_OK=0, 由下面的前置门把整个场景报成**未执行**(诊断数据仍然留档)。
 T_CAL0="$(_now_j)"
 C_CAL0="$(_j_mark cal-start)" || note "阶段记账: 标定起界桩没建成($(_j_why))"
-dns_instrument_calibrate || { PREIMAGE_OK=0; bad "验收前置未成立: DNS 仪器没有通过标定(${DNS_CALIB_WHY:-未知})"; }
+p5_acct "仪器标定" "${E2E_TMP:?}/p5-cal.out" dns_instrument_calibrate; P5_ARC=$?
+cat -- "$E2E_TMP/p5-cal.out" 2>/dev/null
+p5_acct_flush "$P5_ARC" "仪器标定" || { P5_ARC=2; P5_WHY="${P5_WHY:+$P5_WHY; }被测判据的原判读不回来"; }   # 354: 缓冲读不回 ⇒ 标定无效
+if (( P5_ARC != 0 )); then PREIMAGE_OK=0; DNS_INSTRUMENT_OK=0; bad "验收前置未成立: DNS 标定期间有查询无效 —— $P5_WHY"
+elif [[ "$P5_ACCT_RC" != 0 ]]; then PREIMAGE_OK=0; bad "验收前置未成立: DNS 仪器没有通过标定(${DNS_CALIB_WHY:-未知})"; fi
 T_CAL1="$(_now_j)"
 C_CAL1="$(_j_mark cal-end)" || note "阶段记账: 标定止界桩没建成($(_j_why))"
 # 标定把配置还原了、服务也该稳住了 —— 再静置一次, 让**产品动作**拿到完整的启动额度,
 # 然后才统一采集正式前像(准备阶段的那些重启因此落在前像之前, 不会算进产品动作)。
-quiesce_startlimit "正式取证与平台操作前" || true
-[[ "$(wait_stable mosdns)" == active ]] \
-  && ok "正式前像之前: mosdns 已回到稳定运行态(标定的配置还原已生效)" \
-  || { bad "正式前像之前: mosdns 没有稳定在 active —— 前置不成立"; PREIMAGE_OK=0; }
+p5_quiesce "正式取证与平台操作前" || true
+p5_wait_active mosdns "正式前像之前: mosdns 已回到稳定运行态(标定的配置还原已生效)" || true
+# ── p5段 准备与标定 止 ──
+# ── p5段 正式采样 起 ──
 snap_state "B-$DIR-before"
-fp_capture "B-$DIR-before"
-svc_snapshot "$E2E_TMP/svc-B-$DIR-before.tsv"
-PROBE_EN_BEFORE="$(sc_state is-enabled pdg-probe81)"
-BOT_EN_BEFORE="$(sc_state is-enabled pdg-bot)"
+fp_capture "B-$DIR-before" || { bad "正式前像: 四维采样有观测无效 —— $P5_WHY; 恢复无从比对, 不调用产品"; PREIMAGE_OK=0; }
+p5_svc_snap "$EVID/svc-B-$DIR-before.tsv" || { bad "正式前像: 服务快照有观测无效 —— $P5_WHY"; PREIMAGE_OK=0; }
+p5_presample "$EVID/p5-presample-$DIR.tsv" || { bad "正式前像: 8 个 unit 的调用前独立采样无效 —— $P5_WHY"; PREIMAGE_OK=0; }
+PROBE_EN_BEFORE=""; BOT_EN_BEFORE=""
+if p5_uq enabled pdg-probe81; then PROBE_EN_BEFORE="$P5_VAL"; else bad "正式前像: pdg-probe81 自启读数无效 —— $P5_WHY"; PREIMAGE_OK=0; fi
+if p5_uq enabled pdg-bot; then BOT_EN_BEFORE="$P5_VAL"; else bad "正式前像: pdg-bot 自启读数无效 —— $P5_WHY"; PREIMAGE_OK=0; fi
 B_DNS_BEFORE="$(dns_feature_probe "$DIR-before")"
 note "前像的 DNS 观测 = $B_DNS_BEFORE"
-[[ "$B_DNS_BEFORE" == VALID* ]] || { bad "验收前置未成立: 前像的 DNS 观测本身就无效 —— $B_DNS_BEFORE"; PREIMAGE_OK=0; }
-HT_INV_BEFORE="$(systemctl show -p InvocationID --value pdg-health.timer 2>/dev/null)"
-HT_AC_BEFORE="$(sc_state is-active pdg-health.timer)"
+# 353: 前像的 DNS 不只看 VALID 前缀 —— 本场景要求见证 = H、对照 = U(两个方向的接管表里都有 gs-loc)
+p5_dns_ready "$B_DNS_BEFORE" || { bad "验收前置未成立: $P5_WHY"; PREIMAGE_OK=0; }
+P5_SNAPLIST_BEFORE="${E2E_TMP:?}/p5-snap-before.txt"
+p5_snap_list "$P5_SNAPLIST_BEFORE" || { bad "正式前像: 调用前列不出快照目录 —— $P5_WHY; 本次快照无从绑定"; PREIMAGE_OK=0; }
+p5_nowrap_check || { bad "产品调用前: 包装没撤干净 —— $P5_WHY"; PREIMAGE_OK=0; }
+# ── p5段 正式采样 止 ──
 
+# ── p5段 调用 起 ──
 if [[ "$PREIMAGE_OK" != 1 ]]; then
   nrun "场景 ⑤($DIR): 前像/前置不成立, 本场景未执行(既不算通过也不算产品失败)"
 else
 
 echo; echo "── 真正跑候选的 pdg platform $TO ──"
 T_PROD0="$(_now_j)"
-C_PROD0="$(_j_mark prod-start)" || note "阶段记账: 产品动作起界桩没建成($(_j_why))"
-PL="$(bash /usr/local/bin/pdg platform "$TO" 2>&1)"; PRC=$?
+C_PROD0="$(_j_mark prod-start)" || note "阶段记账: 产品动作起界桩没建成($(_j_why)) —— 调用窗口内的启动记录将记未取得"
+PL="$(bash "$P5_CLI" platform "$TO" 2>&1)"; PRC=$?
 T_PROD1="$(_now_j)"
-C_PROD1="$(_j_mark prod-end)" || note "阶段记账: 产品动作止界桩没建成($(_j_why))"
+C_PROD1="$(_j_mark prod-end)" || note "阶段记账: 产品动作止界桩没建成($(_j_why)) —— 调用窗口内的启动记录将记未取得"
+# ── p5段 调用 止 ──
 printf '%s\n' "$PL" | _ev "05-$DIR-platform.log"
 phase_report
 _evn "05-$DIR-platform.log" "### 平台切换退出码 rc=$PRC"
 echo "$PL" | tail -60 | sed 's/^/    /'
-svc_snapshot "$E2E_TMP/svc-B-$DIR-after.tsv"
+# ── p5段 调用后采样 起 ──
+if P5_PLX="$(sed 's/\x1b\[[0-9;]*m//g' <<<"$PL")"; then P5_PLXQ=ok; else P5_PLX=""; P5_PLXQ=失败; fi    # 去掉颜色码后才按行解析产品自报(c_r / c_y / c_g 会包一层颜色); 354: 去色失败不采信
+p5_svc_snap "$EVID/svc-B-$DIR-after.tsv" || note "调用后的服务快照有观测无效项(逐行标 INVALID): $P5_WHY"
 snap_state "B-$DIR-after"
-fp_capture "B-$DIR-after"
+fp_capture "B-$DIR-after" || note "调用后的四维采样有观测无效项: $P5_WHY —— 相应项记未取得"
 state_diff "B-$DIR-before" "B-$DIR-after" "B-$DIR"
+# ── p5段 调用后采样 止 ──
 
+# ── p5段 阶段 起 ──
 echo
 echo "── ⑤-1. 阶段证据: 真的走到了「退役件已撤除、切换尚未提交」那一段吗 ──"
 STAGE_OK=1
@@ -2006,68 +2656,75 @@ grep -q '平台已确认' <<<"$PL" && { bad "⑤-1: 居然打印了「平台已�
 if [[ "$STAGE_OK" != 1 ]]; then
   nrun "场景 ⑤($DIR): **未到达注入点** —— 恢复判据不执行(前后相同不算恢复通过)"
 else
+# ── p5段 阶段 止 ──
 
+# ── p5段 自报 起 ──
 echo
-echo "── ⑤-2. 恢复选的是哪条路 ──"
-grep -q '改用本次快照做整体恢复' <<<"$PL" \
-  && ok "⑤-2: 选的是**整体快照恢复**(局部备份里没有 unit 与 MITM 模块)" || bad "⑤-2: 没走整体恢复"
-if grep -q '已按本次快照恢复到切换前' <<<"$PL"; then
-  RESTORE_CLAIM=complete; ok "⑤-2: 候选自报**恢复完成**(下面逐项核对它说的对不对)"
-elif grep -q '恢复未完成' <<<"$PL"; then
-  RESTORE_CLAIM=incomplete
-  ok "⑤-2: 候选自报**恢复未完成**并给出材料路径"
-  grep -qE '新增文件清单: |局部备份    : |本次快照    : ' <<<"$PL" && ok "⑤-2: 三处材料路径都打出来了" || bad "⑤-2: 材料路径不全"
+echo "── ⑤-2. 恢复选的是哪条路, 产品自报了什么(这里只登记; 报告是否属实在 ⑤-5 与恢复结果分开结算) ──"
+# 354: 去色失败或查询出错不当成"没走整体恢复"或"没有自报"
+if [[ "$P5_PLXQ" != ok ]]; then
+  bad "⑤-2: 未取得 —— 产品输出去颜色失败, 恢复路径与自报都无从解析"; P5_CLAIM=unknown; P5_WHYQ="产品输出去颜色失败"
 else
-  RESTORE_CLAIM=none; bad "⑤-2: 既没报完成也没报未完成"
+  grep -q '改用本次快照做整体恢复' <<<"$P5_PLX"; P5_GRC=$?
+  case "$P5_GRC" in
+    0) ok "⑤-2: 选的是**整体快照恢复**(局部备份里没有 unit 与 MITM 模块)";;
+    1) bad "⑤-2: 没走整体恢复";;
+    *) bad "⑤-2: 未取得 —— 恢复路径的查询失败(grep rc=$P5_GRC)";;
+  esac
+  p5_report_parse "$P5_PLX"
 fi
-_evn "05-$DIR-platform.log" "### 恢复自报: $RESTORE_CLAIM"
+case "$P5_CLAIM" in
+  complete)   note "⑤-2: 候选自报**恢复完成**(下面逐项核对它说的对不对)";;
+  incomplete) note "⑤-2: 候选自报**恢复未完成**; '快照恢复'那一行=$P5_RESTAT; 材料: 新增文件清单=${P5_MAT[newfiles]:-} / 局部备份=${P5_MAT[localbak]:-} / 本次快照=${P5_MAT[snap]:-}";;
+  both)       note "⑤-2: 候选的自报自相矛盾(完成与未完成同时出现或重复)";;
+  unknown)    note "⑤-2: 候选的自报未取得 —— $P5_WHYQ";;
+  *)          note "⑤-2: 候选既没报完成也没报未完成";;
+esac
+_evn "05-$DIR-platform.log" "### 恢复自报: $P5_CLAIM"
+# ── p5段 自报 止 ──
 
+# ── p5段 四维 起 ──
 echo
-echo "── ⑤-3. 四维核对(文件 / 运行态 / 自启态 / 已加载配置) ──"
+echo "── ⑤-3. 四维核对(文件 / 运行态 / 自启态 / 已加载配置): 两边读取都有效才判已恢复 / 未恢复, 其余记未取得 ──"
 fp_cmp_files "B-$DIR-before" "B-$DIR-after" "⑤-3 文件"
-for u in "${FP_SVCS[@]}"; do
-  b="$(fp_get "B-$DIR-before" S "$u" | cut -f1)"; a="$(fp_get "B-$DIR-after" S "$u" | cut -f1)"
-  eb="$(fp_get "B-$DIR-before" S "$u" | cut -f2)"; ea="$(fp_get "B-$DIR-after" S "$u" | cut -f2)"
-  [[ "$b" == "$a" ]]   && ok "⑤-3 运行态: $u 回到前像($a)"   || bad "⑤-3 运行态: $u 前像=$b 现在=$a"
-  [[ "$eb" == "$ea" ]] && ok "⑤-3 自启态: $u 回到前像($ea)" || bad "⑤-3 自启态: $u 前像=$eb 现在=$ea"
-done
-PROBE_EN_AFTER="$(sc_state is-enabled pdg-probe81)"
-[[ "$PROBE_EN_AFTER" == enabled-runtime ]] \
-  && ok "⑤-3 enabled-runtime **没有**被提升成永久 enabled(pdg-probe81: 前像=$PROBE_EN_BEFORE 现在=$PROBE_EN_AFTER)" \
-  || bad "⑤-3 enabled-runtime 被改成了 $PROBE_EN_AFTER(前像=$PROBE_EN_BEFORE)"
-BOT_EN_AFTER="$(sc_state is-enabled pdg-bot)"
-{ [[ "$BOT_EN_AFTER" != enabled && "$(sc_state is-active pdg-bot)" != active ]]; } \
-  && ok "⑤-3 没配凭据的 pdg-bot 仍是停用态(前像=$BOT_EN_BEFORE 现在=$BOT_EN_AFTER)" \
-  || bad "⑤-3 pdg-bot 被拉起来了(enabled=$BOT_EN_AFTER active=$(sc_state is-active pdg-bot))"
-# 产品自己写下的前像与测试指纹逐项对账
-B_SNAP="$(ls -1dt "${SNAP_DIR:-/var/lib/privdns-gateway/backups}"/* 2>/dev/null | head -1)"
-if [[ -n "$B_SNAP" && -s "$B_SNAP/svcstate.tsv" ]]; then
-  note "⑤-3: 产品写的前像 = $B_SNAP/svcstate.tsv"
-  svcstate_cross_check "$B_SNAP/svcstate.tsv" "⑤-3"
+p5_fp_svc "B-$DIR-before" "B-$DIR-after" "⑤-3"
+if p5_uq enabled pdg-probe81; then
+  if [[ "$P5_VAL" == enabled-runtime ]]; then
+    p5_tally ok "pdg-probe81 自启未被提升"; ok "⑤-3 enabled-runtime **没有**被提升成永久 enabled(pdg-probe81: 前像=$PROBE_EN_BEFORE 现在=$P5_VAL)"
+  else p5_tally diff "pdg-probe81 自启未被提升"; bad "⑤-3 enabled-runtime 被改成了 $P5_VAL(前像=$PROBE_EN_BEFORE)"; fi
+else p5_tally na "pdg-probe81 自启未被提升"; bad "⑤-3 pdg-probe81 自启读数无效 —— 未取得($P5_WHY)"; fi
+p5_quiet_unit pdg-bot "⑤-3 没配凭据的 pdg-bot" "$BOT_EN_BEFORE"
+p5_quiet_unit pdg-health.timer "⑤-3 本来停着的 pdg-health.timer" ""
+# A5: 本次快照的绑定; 绑定成立之后, 才拿产品记录的操作前像与**调用前**的独立采样比(不拿恢复后的现场替它)
+if [[ "$P5_PLXQ" != ok ]]; then
+  bad "⑤-3 本次快照绑定: 未取得 —— 产品输出去颜色失败; 产品前像的独立核对也未取得"
+elif p5_snap_bind "$P5_SNAPLIST_BEFORE" "$P5_PLX"; then
+  ok "⑤-3 本次快照绑定成立: $P5_SNAP($P5_BIND_DONE)"
+  svcstate_cross_check "$P5_SNAP/svcstate.tsv" "$EVID/p5-presample-$DIR.tsv" "⑤-3 产品前像(调用前的独立核对)" || true
 else
-  bad "⑤-3: 找不到产品写的 svcstate.tsv(cmd_platform 应当在建完快照后就写)"
+  bad "⑤-3 本次快照绑定: 未取得 —— $P5_WHY(已核: ${P5_BIND_DONE:-无}); 产品前像的独立核对也未取得"
 fi
-HT_INV_AFTER="$(systemctl show -p InvocationID --value pdg-health.timer 2>/dev/null)"
-HT_AC_AFTER="$(sc_state is-active pdg-health.timer)"
-{ [[ "$HT_AC_AFTER" != active ]] && [[ "$HT_INV_AFTER" == "$HT_INV_BEFORE" ]]; } \
-  && ok "⑤-3 本来停着的 pdg-health.timer 全程没被启动过(is-active=$HT_AC_AFTER, InvocationID 未变)" \
-  || bad "⑤-3 pdg-health.timer 被动过(active=$HT_AC_BEFORE→$HT_AC_AFTER, Invocation=$HT_INV_BEFORE→$HT_INV_AFTER)"
-
 echo "── 已加载配置的**独立依据**(不靠磁盘 hash, 也不靠 InvocationID) ──"
-L7894="$(ss -lnt 2>/dev/null | grep -c ':7894 ')"
-# 判据是"回到前像", 不是"一定要有监听": 前像 WLOC 关着的方向本来就不该监听。
-[[ "$L7894" == "$MITM_LISTEN_BEFORE" ]] \
-  && ok "⑤-3 已加载配置: 7894 的监听数回到前像($MITM_LISTEN_BEFORE) —— 与盘上 wloc.enabled=$MITM_WLOC_ON 一致" \
-  || bad "⑤-3 已加载配置: 7894 监听数 $MITM_LISTEN_BEFORE → $L7894, 与前像不符"
-if grep -q "$STRAY_DOMAIN" /etc/mosdns/rules/mitm_hijack.txt 2>/dev/null; then
-  ok "⑤-3 已加载配置: 接管表里那条历史条目也回来了(内容层面的独立特征)"
-else
-  bad "⑤-3 已加载配置: 接管表里的历史条目没回来"
-fi
+# 判据是"回到前像", 不是"一定要有监听": 前像 WLOC 关着的方向本来就不该监听。两边都要有效读数。
+if [[ -n "$MITM_LISTEN_BEFORE" ]] && p5_listen 7894 tcp; then
+  if [[ "$P5_LN" == "$MITM_LISTEN_BEFORE" ]]; then
+    p5_tally ok "7894 监听数"; ok "⑤-3 已加载配置: 7894 的监听数回到前像($MITM_LISTEN_BEFORE) —— 与盘上 wloc.enabled=$MITM_WLOC_ON 一致"
+  else p5_tally diff "7894 监听数"; bad "⑤-3 已加载配置: 7894 监听数 $MITM_LISTEN_BEFORE → $P5_LN, 与前像不符"; fi
+else p5_tally na "7894 监听数"; bad "⑤-3 已加载配置: 7894 监听数未取得(前像=${MITM_LISTEN_BEFORE:-读不到}; ${P5_WHY:-})"; fi
+grep -qF -- "$STRAY_DOMAIN" "$P5_HIJACK" 2>/dev/null; P5_GRC=$?
+case "$P5_GRC" in
+  0) p5_tally ok "接管表历史条目"; ok "⑤-3 已加载配置: 接管表里那条历史条目仍在(与前像相同; 失败路径没有改动接管表)";;
+  1) p5_tally diff "接管表历史条目"; bad "⑤-3 已加载配置: 接管表里的历史条目不在了";;
+  *) p5_tally na "接管表历史条目"; bad "⑤-3 已加载配置: 接管表读不了 —— 未取得";;
+esac
 B_DNS_AFTER="$(dns_feature_probe "$DIR-after")"
 if [[ "$DNS_INSTRUMENT_OK" == 1 ]]; then
   dns_verdict "⑤-3" "$B_DNS_BEFORE" "$B_DNS_AFTER"
+  if [[ "$B_DNS_BEFORE" == VALID* && "$B_DNS_AFTER" == VALID* ]]; then
+    if [[ "$B_DNS_BEFORE" == "$B_DNS_AFTER" ]]; then p5_tally ok "DNS 见证/对照"; else p5_tally diff "DNS 见证/对照"; fi
+  else p5_tally na "DNS 见证/对照"; fi
 else
+  p5_tally na "DNS 见证/对照"
   note "⑤-3 已加载配置: 仪器没有通过标定, 本场景本不该走到这里(前置门应已拦下)。实测留档:"
   note "  前像 $B_DNS_BEFORE"; note "  恢复后 $B_DNS_AFTER"
 fi
@@ -2075,10 +2732,19 @@ note "⑤-3: 端口监听 / 磁盘 hash 只作辅助。InvocationID 只证明**�
 note "  哪一份配置 —— 那一条由上面的真实 DNS 行为(见证=H / 对照=U)回答。"
 journalctl -u mosdns -u mihomo -u pdg-mitm --since "$(date -u -d '10 min ago' +%FT%T)" --no-pager 2>/dev/null \
   | tail -120 | _ev "05-$DIR-journal.txt"
+# ── p5段 四维 止 ──
 
+# ── p5段 服务过程 起 ──
 echo
-echo "── ⑤-4. 不相关服务有没有清单外动作 ──"
-svc_verdict "$E2E_TMP/svc-B-$DIR-before.tsv" "$E2E_TMP/svc-B-$DIR-after.tsv" "B-$DIR"
+echo "── ⑤-4. 服务过程: 终态 / 实例变化 / 调用窗口内的启动记录 分开判(依据 = 冻结候选 cmd_platform 失败路径 + 整体恢复; 不用未执行的 run_all_migrations) ──"
+p5_svc_settle "$EVID/svc-B-$DIR-before.tsv" "$EVID/svc-B-$DIR-after.tsv" "B-$DIR" || true
+# ── p5段 服务过程 止 ──
+
+# ── p5段 报告诚实性 起 ──
+echo
+echo "── ⑤-5. 恢复结果与报告诚实性分开结算(原始退出码与目标到达见 ⑤-1; 两项互不抵消) ──"
+p5_honesty || true
+# ── p5段 报告诚实性 止 ──
 
 fi
 fi
