@@ -44,11 +44,12 @@ on:
         # 选 platform 就只跑⑤a/⑤b 两个平台方向, 选 retire 就只跑①旧 CLI 直跳被拒。
         # 选 retire-hop 就只跑③(已安装桥接 → 退役候选; 同一 job 里先原样跑 ② 取得真实桥接前像)。
         # 选 late-failure 就只跑④(退役成功后的晚期失败 → 产品自己回滚到本次快照; 同一 job 里先原样跑 ②)。
+        # 选 retire-hop-bc 就只跑 B / C2 两跳(前像在本 job 里构造, 再经桥接入口与已装桥接 CLI 两跳到退役候选; b / c2 各一格)。
         # 是**显式范围选择**, 不是用 continue-on-error 把失败绕过去 —— 被选中的 job
         # 该红照样红, 没被选中的 job 直接不启动(不产生结果, 也不冒充通过)。
-        description: "真实验收的范围(默认 all; platform = 只跑⑤a/⑤b; retire = 只跑①旧 CLI 直跳被拒; bridge = 只跑② v1.11.15→桥接; retire-hop = ②+③ 同一 job; late-failure = ②+④ 同一 job)"
+        description: "真实验收的范围(默认 all; platform = 只跑⑤a/⑤b; retire = 只跑①旧 CLI 直跳被拒; bridge = 只跑② v1.11.15→桥接; retire-hop = ②+③ 同一 job; late-failure = ②+④ 同一 job; retire-hop-bc = B/C2 两跳)"
         type: choice
-        options: ["all", "platform", "retire", "bridge", "retire-hop", "late-failure"]
+        options: ["all", "platform", "retire", "bridge", "retire-hop", "late-failure", "retire-hop-bc"]
         default: "all"
 
 permissions:
@@ -2454,4 +2455,93 @@ jobs:
               sudo cat "$d/$f"
               echo
             done
+          done
+
+  real-retire-hop-bc:
+    # ── 真实验收 B / C2 两跳: v1.11.15 前像(b = 从未启用 WLOC; c2 = 仅 CA 残留)→ 桥接入口 → 已装桥接 CLI update --to 退役候选 ──
+    # 与 real-retire-hop 分开的 job(那个 job 一个字不动)。前像在本 job 里构造(b: 夹具组装 + v1.11.15 自己的 pdg migrate 一次;
+    # c2: 共享 build_preimage ios on + 防火墙加载 + v1.11.15 自己的 pdg platform android 一次); 两跳都在同一台一次性 runner 上
+    # 由产品自己的入口完成。前像构造或任一门不成立就不调用(计数 0)。b / c2 两格互不依赖(fail-fast: false)。
+    needs: prepare-mosdns-fixture
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.real_acceptance == 'true'
+            && github.event.inputs.real_scope == 'retire-hop-bc' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        preimage: [b, c2]
+    name: "真实验收 B/C2 两跳(${{ matrix.preimage }}): v1.11.15 前像 → 桥接入口 → 已装桥接 CLI update --to 退役候选"
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0          # 旧版对象与两个候选都要从本地取; 新契约还要核 3dcaee00 的共享输入
+      - name: "取桥接/退役候选分支, 并核对 head == 派发时指定的 SHA"
+        env:
+          PDG_BRIDGE_SHA: ${{ github.event.inputs.bridge_candidate }}
+          PDG_BRIDGE_BR:  ${{ github.event.inputs.bridge_branch }}
+          PDG_CAND_SHA:   ${{ github.event.inputs.product_candidate }}
+          PDG_CAND_BR:    ${{ github.event.inputs.candidate_branch }}
+        run: |
+          set -euo pipefail
+          test -n "$PDG_BRIDGE_SHA" || { echo "必须显式指定桥接候选 SHA"; exit 1; }
+          test -n "$PDG_BRIDGE_BR"  || { echo "必须显式指定桥接候选分支名"; exit 1; }
+          test -n "$PDG_CAND_SHA"   || { echo "必须显式指定退役候选 SHA(第三跳的升级目标)"; exit 1; }
+          test -n "$PDG_CAND_BR"    || { echo "必须显式指定退役候选分支名"; exit 1; }
+          git fetch --no-tags origin "+refs/heads/$PDG_BRIDGE_BR:refs/heads/pdg-bridge"
+          git fetch --no-tags origin "+refs/heads/$PDG_CAND_BR:refs/heads/pdg-candidate"
+          git fetch --tags origin
+          gotb=$(git rev-parse refs/heads/pdg-bridge); gotc=$(git rev-parse refs/heads/pdg-candidate)
+          echo "桥接候选 $PDG_BRIDGE_BR = $gotb"
+          echo "退役候选 $PDG_CAND_BR  = $gotc"
+          echo "验收 checkout            = ${{ github.sha }}"
+          test "$gotb" = "$PDG_BRIDGE_SHA" || { echo "桥接候选 head 与派发时指定的 SHA 不符"; exit 1; }
+          test "$gotc" = "$PDG_CAND_SHA"   || { echo "退役候选 head 与派发时指定的 SHA 不符"; exit 1; }
+      - name: "PID 1 必须是真 systemd, systemctl 必须是真二进制(不是就判失败, 不 SKIP)"
+        run: |
+          set -euo pipefail
+          comm=$(cat /proc/1/comm); echo "PID 1 = $comm"; test "$comm" = systemd
+          w="$(command -v systemctl)"; echo "systemctl = $w"
+          test -x "$w" && { test "$w" = /usr/bin/systemctl || test "$w" = /bin/systemctl; }
+      - name: 装依赖
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            nftables dnsutils iproute2 openssl python3 git unzip psmisc procps curl >/dev/null
+          nft --version
+      - name: "推导 mosdns artifact 名"
+        run: echo "MOSDNS_ARTIFACT=$(bash tests/mosdns-artifact-name.sh)" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ env.MOSDNS_ARTIFACT }}
+          path: /tmp/mosdns-fixture
+      - name: "校验并安装钉定 mosdns"
+        run: sudo -E bash tests/install-mosdns-artifact.sh /tmp/mosdns-fixture
+      - name: "校验并安装钉定 mihomo"
+        run: sudo -E bash tests/install-mihomo-artifact.sh /tmp/mosdns-fixture
+      - name: "前置: B/C2 两跳契约 (接线/共享输入相对 3dcaee00 逐字/本地模型格)"
+        run: bash tests/test-retire-hop-bc-contract.sh
+      - name: "真实验收 B/C2 两跳: 前像构造 → 第二跳(桥接入口) → 第三跳(现役桥接 CLI update --to 退役候选)"
+        env:
+          PDG_E2E_ISOLATED: "1"
+          PDG_REAL_MIGRATION_OK: "1"
+          PDG_BC_PREIMAGE: ${{ matrix.preimage }}
+          PDG_BC_EVID: "/tmp/real-acceptance-evidence-bc"
+          PDG_BRIDGE_SHA: ${{ github.event.inputs.bridge_candidate }}
+          PDG_RETIRE_SHA: ${{ github.event.inputs.product_candidate }}
+        run: sudo -E bash tests/e2e-real-retire-hop-bc.sh
+      - name: "留证: B/C2 的证据文件、两跳与旧版 CLI 调用次数与 journal(成败都留)"
+        if: ${{ always() }}
+        run: |
+          set +e
+          d=/tmp/real-acceptance-evidence-bc
+          echo "########## 调用次数: 第二跳 $(sudo cat "$d/00-hop2-invoke-count.txt" 2>/dev/null || echo '<未取得>') / 第三跳 $(sudo cat "$d/00-hop3-invoke-count.txt" 2>/dev/null || echo '<未取得>') / 旧版 CLI $(sudo cat "$d/00-old-cli-invoke-count.txt" 2>/dev/null || echo '<未取得>') ##########"
+          echo "########## journal(相关 unit, 末 600 行) ##########"
+          sudo journalctl -u pdg-mitm -u mosdns -u mihomo -u pdg-bot -u pdg-probe81 -u pdg-dotwitness --no-pager -n 600 2>&1 | tail -600
+          echo
+          for f in $(sudo ls -1 "$d" 2>/dev/null); do
+            echo "########## EVIDENCE $d/$f ##########"
+            sudo cat "$d/$f"
+            echo
           done
