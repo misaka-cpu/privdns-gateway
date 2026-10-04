@@ -5,9 +5,10 @@
 # run_all_migrations 有三个调用方, 各自的锁/快照/失败善后责任完全不同:
 #   · cmd_platform  —— 平台切换, `|| true` 吞掉失败, 自己没有快照(自己的材料已经 rm -rf);
 #   · cmd_migrate   —— 用户显式迁移, 自己建快照, 失败给手工回滚提示;
-#   · __migrate 派发 —— 升级子进程, 锁从父进程继承, 失败由父进程回滚。
+#   · __migrate 派发 —— 升级子进程, 锁从父进程继承, 失败由父进程回滚。370 起迁移链返回 0
+#     之后再接一步 `_dw_settle --after-migrate`(链失败时它不执行, 返回码原样传出)。
 # 所以"总入口第一句无条件拒绝无句柄调用"会把前两个直接弄坏。本支就是把这条边界钉住:
-# 入口契约一个字都不能变, 门只挂在真正要动手的那一处。
+# 入口契约除逐条批准的改动(写在 A1 / A2 里)外一个字都不能变, 门只挂在真正要动手的那一处。
 #
 # 这一支比对的是**产品源码**(候选 vs 冻结基线), 断言都写成"哪一条契约没有被动过"。
 # 需要行为证据的那一条(前像存不下就中止, 且中止在装任何文件之前)单独跑一段真代码。
@@ -57,9 +58,41 @@ if [[ -n "$BASE" && -f "$BASE" ]]; then
     bad "A1: run_all_migrations 的改动超出批准范围(新增 ${_add:-?} / 其中合规 ${_addok:-?} / 删除 ${_del:-?} / 其中合规 ${_delok:-?})"
     head -14 "$_d"
   fi
-  if diff -q <(grep -A3 '^    __migrate)' "$BASE") <(grep -A3 '^    __migrate)' "$PDG") >/dev/null; then
-    ok "A2: __migrate 派发块与基线逐字节相同"
-  else bad "A2: __migrate 派发块被改过"; fi
+  # A2 370 修正抽取: 原来的 `grep -A3 '^    __migrate)'` 要求 4 个空格缩进, 派发行却是 2 个 ——
+  # 基线与现稿都抽到 0 行, 空对空比较恒为"相同", 实际什么都没保护(370 已复现)。
+  # 现在按完整分支边界抽: 只在顶层分发器(case "${1:-menu}" in … esac)里找 `  __migrate)` 开头的
+  # 分支, 从这一行起到第一个以 ;; 收尾的行止。两边都必须读取成功、恰好一条且结构完整;
+  # 读取失败、零匹配、多匹配、结构不完整一律判失败, 不当成相同。
+  # 370 按裁决精确放宽**一处**: 迁移链成功之后才调新步骤(`run_all_migrations && _dw_settle --after-migrate`)。
+  # 除此之外 need_root、_lock、调用顺序与分支其余文字都必须与基线逐字节相同。
+  migarm(){ # $1=源文件 $2=落盘  返回 0=唯一完整 1=读取失败 2=零匹配 3=多匹配 4=结构不完整
+    [[ -r "$1" ]] || return 1
+    awk '
+      /^case "[$][{]1:-menu[}]" in$/ { hd++; inq=1; next }
+      inq && /^esac$/ { if (open) bad=1; inq=0; next }
+      inq && open { print; if ($0 ~ /;;[ \t]*$/) open=0; else if ($0 ~ /^  [^ ]/) bad=1; next }
+      inq && /^  __migrate\)/ { n++; print; if ($0 !~ /;;[ \t]*$/) open=1 }
+      END { if (hd != 1 || inq || open || bad) exit 14; if (n == 0) exit 12; if (n > 1) exit 13; exit 0 }
+    ' "$1" > "$2"
+    case $? in
+      0) if [[ -s "$2" ]]; then return 0; else return 4; fi ;;
+      12) return 2 ;; 13) return 3 ;; 14) return 4 ;; *) return 1 ;;
+    esac
+  }
+  _a2b="$BOX/a2-base.txt"; _a2c="$BOX/a2-cur.txt"
+  migarm "$BASE" "$_a2b"; _rb=$?
+  migarm "$PDG" "$_a2c"; _rc=$?
+  A2_OLD='  __migrate)     need_root __migrate; _lock; run_all_migrations;;'
+  A2_NEW='  __migrate)     need_root __migrate; _lock; run_all_migrations && _dw_settle --after-migrate;;'
+  if (( _rb != 0 || _rc != 0 )); then
+    bad "A2: __migrate 派发块取不到唯一完整的一条(基线 $_rb / 现稿 $_rc; 1=读取失败 2=零匹配 3=多匹配 4=结构不完整), 不能判相同"
+  elif [[ "$(< "$_a2b")" != "$A2_OLD" ]]; then
+    bad "A2: 基线的 __migrate 派发块不是预期的那一行, 这一处放宽无从套用: $(head -2 "$_a2b")"
+  elif [[ "$(< "$_a2c")" == "$A2_NEW" ]]; then
+    ok "A2: __migrate 派发块相对基线只多了「迁移链返回 0 之后才调 _dw_settle --after-migrate」这一处(need_root / _lock / 顺序逐字节不变)"
+  else
+    bad "A2: __migrate 派发块的改动超出批准范围: $(head -2 "$_a2c")"
+  fi
 else
   na "A: 没给 PDG_BASELINE, 跳过与冻结基线的逐字节对比"
 fi
@@ -377,8 +410,8 @@ runall 0 1; _r2="$RUNALL_OUT"
 grep -q 'run_all_migrations || true' "$(fnfile "$PDG" cmd_platform)" \
   && ok "H3: cmd_platform 仍是 \`run_all_migrations || true\` —— 退役被拒不会让平台切换失败(那一步顺延到下次 update/migrate)" \
   || bad "H3: cmd_platform 的失败善后被改了"
-grep -q '__migrate)     need_root __migrate; _lock; run_all_migrations;;' "$PDG" \
-  && ok "H4: __migrate 派发仍是 need_root + _lock + run_all_migrations —— 失败照旧传回父进程由它回滚" \
+grep -qF '__migrate)     need_root __migrate; _lock; run_all_migrations && _dw_settle --after-migrate;;' "$PDG" \
+  && ok "H4: __migrate 派发仍是 need_root + _lock + run_all_migrations, 只在链返回 0 之后才接 _dw_settle —— 链失败照旧原样传回父进程由它回滚" \
   || bad "H4: __migrate 派发被改了"
 awk '/_pdg_svcstate_plan "\$snap"/{s=1} /run_all_migrations/{if(s)m=1} END{exit !m}' "$(fnfile "$PDG" cmd_migrate)" \
   && ok "H5: cmd_migrate 自建快照 + 确认同一份前像 + 自带句柄 —— 它是有能力的调用方, 不会被自己的门挡住" \

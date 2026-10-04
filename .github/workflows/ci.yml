@@ -424,6 +424,9 @@ jobs:
 
       - name: "witness 迁移的失败理由 (每条出口都可定位 / 缺失与非法分开 / 不回显域名)"
         run: python3 tests/test-dotwitness-error-reasons.py
+      # 真 systemd 那一半在 core-startlimit job(tests/e2e-dotwitness-settle.sh)。
+      - name: "迁移链成功后的 witness 核验 (只经 __migrate 派发且链返回 0 / 固定参数 / 恒返回 0 / 限额命中只恢复一次; 模型)"
+        run: bash tests/test-dotwitness-settle.sh
       # 这支的动态段要真跑 `nft -c`, 非 root 下 nft 连缓存都初始化不了 —— 会自报 SKIP
       # 并说明原因(不算通过)。用 sudo 跑, 让那段真正当裁判; runner 上 nft 是现成的。
       - name: "nft 模板渲染点必须替换每一个占位符 (含真 nft -c)"
@@ -1183,6 +1186,8 @@ jobs:
           sudo -E env PDG_TEST_MOSDNS="$PWD/tests/.bin/mosdns" \
                       PDG_TEST_MOSDNS_LEGACY="$PWD/tests/.bin/mosdns-legacy" \
                       bash tests/e2e-mosdns-crossver-swap.sh
+      - name: "迁移链成功后的 witness 核验 (真 systemd: 真实 start-limit-hit 只恢复一次 / 起不来不动 / 端口被占不杀 / disabled 只观察)"
+        run: sudo -E bash tests/e2e-dotwitness-settle.sh
       - name: "收尾: 现场必须不留 unit/进程/端口"
         if: always()
         run: |
@@ -1190,6 +1195,10 @@ jobs:
           test ! -e /etc/systemd/system/mosdns.service || { echo "残留 unit"; exit 1; }
           test "$(pgrep -c -x mosdns || true)" = 0 || { echo "残留进程"; exit 1; }
           test "$(ss -lntu 2>/dev/null | grep -cE ':(15353|15853)' || true)" = 0 || { echo "残留端口"; exit 1; }
+          test ! -e /etc/systemd/system/pdg-dotwitness.service || { echo "残留 witness 替身 unit"; exit 1; }
+          test ! -e /run/pdg-e2e-dws || { echo "残留 witness 替身目录"; exit 1; }
+          test "$(pgrep -c -f /run/pdg-e2e-dws/stand.py || true)" = 0 || { echo "残留 witness 替身进程"; exit 1; }
+          test "$(ss -lnu 2>/dev/null | grep -c '127\.0\.0\.1:5399' || true)" = 0 || { echo "残留 5399 监听"; exit 1; }
 
   functional:
     needs: prepare-mosdns-fixture

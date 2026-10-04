@@ -122,6 +122,12 @@ HARNESS = [
     "_lock(){ :; }",          # 门, 不是分发目标 —— 与 need_root 同样桩掉
 ]
 HARNESS += ["%s(){ _recv %s \"$@\"; }" % (s, s) for s in STUBS]
+# __migrate 是唯一一条"有条件双调用"的分支(370 乙): `run_all_migrations && _dw_settle --after-migrate`。
+# 上面的解析只认最后一个 `;` 段的第一个词, 所以 _dw_settle 不在 STUBS 里 —— 给它单独一个记录桩,
+# 下面按两次调用写出完整期望; 返回码与顺序在 3b 用各自的替身核。
+MIGRATE_ARM = ("__migrate", "run_all_migrations", ("_dw_settle", "--after-migrate"))
+if MIGRATE_ARM[2][0] not in STUBS:
+    HARNESS.append("%s(){ _recv %s \"$@\"; }" % (MIGRATE_ARM[2][0], MIGRATE_ARM[2][0]))
 HARNESS.append(DISPATCH)
 _h = tmpguard.mkdtemp(prefix="pdgdisp-")
 TMPS.append(_h)
@@ -152,12 +158,63 @@ for names, body, primary, shifts in arms:
         _checked += 1
         out = dispatch(name, *PROBE)
         want = call(primary, *PROBE) if shifts else call(primary)
+        if name == MIGRATE_ARM[0]:
+            # 桩都返回 0, 所以两次调用都该出现; 两边都不收外来参数(这条分支不 shift)。
+            want = call(MIGRATE_ARM[1]) + "\n" + call(*MIGRATE_ARM[2])
         if out != want:
             _lost.append("pdg %s … → %r(应为 %r)" % (name, out, want))
 if not _lost:
     ok("%d 个子命令(含别名)都把参数原样交给了后端, 一个字节没丢" % _checked)
 else:
     bad("这些子命令丢了参数: %s" % "; ".join(_lost))
+
+# ── 3b. __migrate 的有条件双调用: 各自的替身记调用、参数、顺序, 外层退出码原样核 ─────────
+# need_root / _lock 在这里**不是**空桩: 它们也记录, 并且可以按格拒绝(与生产一样 exit 1),
+# 于是"去掉 _lock"或"拒绝之后仍往下走"在这一节都会露馅(通用循环里它们只是门, 不记录)。
+_arms_mig = [a for a in arms if MIGRATE_ARM[0] in a[0]]
+if len(_arms_mig) == 1 and _arms_mig[0][2] == MIGRATE_ARM[1]:
+    ok("3b 前提: 解析出恰好一条 __migrate 分支, 最后一段的目标是 run_all_migrations")
+else:
+    bad("3b 前提不成立: __migrate 分支 %d 条, 目标 %r"
+        % (len(_arms_mig), [a[2] for a in _arms_mig]))
+MIG = "\n".join([
+    "set -uo pipefail",
+    "_rec(){ local n=\"$1\"; shift; { printf '%s' \"$n\"; local a; for a in \"$@\"; do printf ' [%s]' \"$a\"; done; printf '\\n'; } >> \"$MIGLOG\"; }",
+    "need_root(){ _rec need_root \"$@\"; [[ \"${T_DENY:-}\" == root ]] && exit 1; return 0; }",
+    "_lock(){ _rec _lock \"$@\"; [[ \"${T_DENY:-}\" == lock ]] && exit 1; return 0; }",
+    "run_all_migrations(){ _rec run_all_migrations \"$@\"; return \"$T_MIG\"; }",
+    "_dw_settle(){ _rec _dw_settle \"$@\"; return 0; }",
+    DISPATCH,
+]) + "\n"
+MPATH = os.path.join(_h, "migrate.sh")
+open(MPATH, "w", encoding="utf-8").write(MIG)
+
+
+def migrate(t_mig, deny=""):
+    log = os.path.join(_h, "mig-%s-%s.log" % (t_mig, deny or "none"))
+    open(log, "w").close()
+    env = dict(os.environ, MIGLOG=log, T_MIG=str(t_mig), T_DENY=deny)
+    r = subprocess.run(["bash", MPATH, "__migrate", *PROBE], capture_output=True,
+                       text=True, timeout=120, env=env)
+    return r.returncode, open(log, encoding="utf-8").read().splitlines(), \
+        ((r.stdout or "") + (r.stderr or "")).strip()
+
+
+_GATES = ["need_root [__migrate]", "_lock"]
+for t_mig, deny, want_rc, want_log, label in (
+        (0, "", 0, _GATES + ["run_all_migrations", "_dw_settle [--after-migrate]"],
+         "迁移链返回 0 ⇒ 新步骤恰好一次、只带固定参数"),
+        (1, "", 1, _GATES + ["run_all_migrations"], "迁移链返回 1 ⇒ 新步骤不执行, 退出码 1"),
+        (2, "", 2, _GATES + ["run_all_migrations"], "迁移链返回 2 ⇒ 新步骤不执行, 退出码 2"),
+        (137, "", 137, _GATES + ["run_all_migrations"], "迁移链返回 137 ⇒ 新步骤不执行, 退出码 137"),
+        (0, "root", 1, ["need_root [__migrate]"], "权限拒绝 ⇒ 迁移链与新步骤都不执行"),
+        (0, "lock", 1, _GATES, "锁拒绝 ⇒ 迁移链与新步骤都不执行"),
+):
+    rc, log, out = migrate(t_mig, deny)
+    if rc == want_rc and log == want_log and not out:
+        ok("pdg __migrate: %s(记录 %s)" % (label, " → ".join(log)))
+    else:
+        bad("pdg __migrate: %s —— 实得退出 %d, 记录 %r, 输出 %r" % (label, rc, log, out[:200]))
 
 # 报障原样复现: 目录 + git ref 两对参数都得到。
 _want = call("cmd_rollback", "--dir", "/var/lib/privdns-gateway/backups/2026-07-31-070000",

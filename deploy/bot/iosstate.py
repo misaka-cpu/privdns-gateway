@@ -1873,13 +1873,16 @@ def main(argv=None):
         elif a.cmd == "verify-restore":
             # CLI 回滚在**覆盖生产文件之前**调它。与 Bot、救援平面走同一份 plan_restore ——
             # "这是本机快照所以一定可信"不成立: 快照可能损坏、被换掉、或者只恢复了一半。
-            plan, note = plan_from_tree(a.tree)
+            # 只按同一次 plan_from_tree 的结果选措辞。plan_summary 与 note 描述的是"按计划恢复后"
+            # 的状态(删除当前版本 / 不会放回 / 旧格式标记), 而 CLI 不执行计划, 落盘的是快照原样,
+            # 所以这里不再打印它们。拒绝路径(抛 StateError)不变: 原因进 stderr, 返回 3。
+            plan, _note = plan_from_tree(a.tree)
             if plan is None:
-                print("快照里没有 iOS 生命周期记录, 这一组不做改动。")
+                print("iOS 描述文件: 快照里没有这一组的记录与描述文件, 没有可校验的内容。"
+                      "CLI 回滚按快照成员清单处理这一组, 结果以随后的回滚结果为准。")
             else:
-                print(plan_summary(plan))
-                if note:
-                    print(note)
+                print("iOS 描述文件: 快照里的这一组已通过联合校验。CLI 回滚会按快照原样写回这一组, "
+                      "是否恢复成功以随后的回滚结果为准。回滚不会撤销手机上已经给出的证书信任。")
         elif a.cmd == "status":
             meta = load()
             inputs = None

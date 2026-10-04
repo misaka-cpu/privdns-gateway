@@ -331,6 +331,20 @@ if v.group() == want:
     ok("CLI 快照回滚: 这一组逐字节等于快照那一刻, previous 已清掉")
 else:
     bad("CLI 快照回滚后对不上: %r" % sorted(v.group()))
+# verify-restore 的措辞(370 C2): CLI 不执行恢复计划, 落盘的是快照原样; 所以只说"通过了联合校验、
+# 按快照原样写回、结果以回滚为准", 不再打印"删除当前版本 / 删除上一版"这类计划摘要。
+C2_PASS = ("iOS 描述文件: 快照里的这一组已通过联合校验。CLI 回滚会按快照原样写回这一组, "
+           "是否恢复成功以随后的回滚结果为准。回滚不会撤销手机上已经给出的证书信任。")
+C2_NONE = ("iOS 描述文件: 快照里没有这一组的记录与描述文件, 没有可校验的内容。"
+           "CLI 回滚按快照成员清单处理这一组, 结果以随后的回滚结果为准。")
+if C2_PASS in (r.stdout or ""):
+    ok("CLI 快照回滚: 校验通过时打出通用措辞(已通过联合校验 / 按快照原样写回 / 以回滚结果为准)")
+else:
+    bad("CLI 快照回滚: 没有通过时的通用措辞: %r" % (r.stdout or "")[-300:])
+if not any(w in (r.stdout or "") for w in ("删除当前版本", "删除上一版", "不会把它放回来")):
+    ok("CLI 快照回滚: 不再打印按计划恢复后的删除 / 不放回措辞")
+else:
+    bad("CLI 快照回滚: 仍打印计划摘要式措辞: %r" % (r.stdout or "")[-300:])
 
 print()
 print("══ 二、记录里没有 current: 两份产物都要删掉 ══")
@@ -383,6 +397,23 @@ for label, run in (("Bot", bot_restore), ("救援平面", rescue_restore)):
         ok("%s: 当前版本如实标成 %s, 没谎报完整恢复" % (label, st))
     else:
         bad("%s: 当前版本竟被判成健康" % label)
+# CLI 回滚同一份旧格式快照: 校验照过, 但 CLI 落盘的是快照原样(不做旧格式那一套标记),
+# 所以 verify-restore 不许再打印"上一版已标记为不可用"之类只有按计划恢复才成立的话。
+v = victim_rev2()
+r = cli_rollback(v, legacy_blob)
+_lo = r.stdout or ""
+if r.returncode == 0 and C2_PASS in _lo:
+    ok("CLI / 旧格式快照: 校验通过, 打出通用措辞")
+else:
+    bad("CLI / 旧格式快照: rc=%d 输出 %r" % (r.returncode, (_lo + (r.stderr or ""))[-300:]))
+if "旧格式" not in _lo and "已标记为不可用" not in _lo:
+    ok("CLI / 旧格式快照: 不再打印只对按计划恢复成立的旧格式提示")
+else:
+    bad("CLI / 旧格式快照: 仍打印旧格式提示: %r" % _lo[-300:])
+if v.rd(ARC_META) == legacy_src.rd(ARC_META):
+    ok("CLI / 旧格式快照: 落盘的记录与快照逐字节相同(措辞里的「按快照原样写回」属实)")
+else:
+    bad("CLI / 旧格式快照: 落盘的记录与快照不同")
 
 print()
 print("══ 四、恶意/损坏的一组: 三个入口都要在覆盖之前拒掉 ══")
@@ -498,6 +529,27 @@ if r.returncode == 0 and v.group() == before:
     ok("CLI 回滚: 不含这一组的快照不碰它")
 else:
     bad("CLI 回滚碰了不该碰的: rc=%d" % r.returncode)
+# 产物目录在成员清单里, 但记录与两份描述文件都不在(只有一份无关文件): verify-restore 被调用、
+# plan 为 None。旧措辞"这一组不做改动"在这里不成立(落盘后按成员清单对账), 改成稿 B。
+stray_dir = tmpguard.mkdtemp(prefix="iosplan-stray-")
+TMPS.append(stray_dir)
+for rel in BASE_MEMBERS:
+    os.makedirs(os.path.dirname(os.path.join(stray_dir, rel)), exist_ok=True)
+    shutil.copy2(evil.p(rel), os.path.join(stray_dir, rel))
+os.makedirs(os.path.join(stray_dir, SUB), exist_ok=True)
+with open(os.path.join(stray_dir, SUB, "stray.txt"), "w") as _f:
+    _f.write("not a profile\n")
+v = victim_rev2()
+r = cli_rollback(v, pack(stray_dir, BASE_MEMBERS + [SUB + "/stray.txt"]))
+_so = r.stdout or ""
+if r.returncode == 0 and C2_NONE in _so:
+    ok("CLI / 只有产物目录、三件全无: 打出「没有可校验的内容, 按成员清单处理」")
+else:
+    bad("CLI / 只有产物目录、三件全无: rc=%d 输出 %r" % (r.returncode, (_so + (r.stderr or ""))[-300:]))
+if "这一组不做改动" not in _so:
+    ok("CLI / 只有产物目录、三件全无: 不再声称「这一组不做改动」")
+else:
+    bad("CLI / 只有产物目录、三件全无: 仍声称不做改动: %r" % _so[-300:])
 
 print()
 print("══ 六之二、有产物却没有记录 = 这一组坏了, 不是「没带这一组」 ══")

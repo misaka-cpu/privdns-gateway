@@ -29,7 +29,11 @@ grep -vE '^\s*#' <<<"$disp" | grep -q 'run_all_migrations' \
 # 造一个只保留"函数定义 + 分派"的可执行副本, 把会真动系统的函数打桩。
 build(){
   {
-    echo 'run_all_migrations(){ echo "MIGRATE" >> "$WORK/order"; }'
+    # MIGRATE_RC 缺省 0: 只在第 4 节的失败格里注入, 其它格的行为与以前相同。
+    echo 'run_all_migrations(){ echo "MIGRATE" >> "$WORK/order"; return "${MIGRATE_RC:-0}"; }'
+    # __migrate 派发在迁移链返回 0 之后接 `_dw_settle --after-migrate`(370 乙)。替身把每次调用连同每个参数
+    # 记进同一份顺序记录; 不给它替身的话, 那一格会因 command not found 被下面的执行有效性判据判无效。
+    echo '_dw_settle(){ { printf "SETTLE"; for a in "$@"; do printf " [%s]" "$a"; done; printf "\n"; } >> "$WORK/order"; }'
     echo 'cmd_status(){ echo "STATUS" >> "$WORK/order"; }'
     echo 'cmd_restart(){ echo "RESTART" >> "$WORK/order"; }'
     echo 'menu(){ echo "MENU" >> "$WORK/order"; }'
@@ -117,10 +121,34 @@ out="$(PLAN_RC=1 run migrate)"
   || bad "3c: 实得 rc=$(rc) order=[$out] 执行有效=$(_exec_ok && echo 是 || echo "否: $(_exec_why)")"
 
 # ── 4. 内部入口 __migrate 仍然可用(cmd_update 装好新脚本后靠它跑新版迁移)──
+# 按替身自己的顺序记录逐行核(不是"记录里出现某个词"): 锁 → 迁移 → 新步骤, 各 1 次, 新步骤只收到 --after-migrate。
+order_lines(){ tr '\n' '|' < "$WORK/order" 2>/dev/null; }
 out="$(run __migrate)"
-{ _exec_ok && grep -q MIGRATE <<<"$out"; } \
-  && ok "pdg __migrate 仍执行迁移(更新流程的内部入口)" \
-  || bad "__migrate 不迁移了: [$out] 执行有效=$(_exec_ok && echo 是 || echo "否: $(_exec_why)")"
+if ! _exec_ok; then
+  bad "__migrate 健康: 壳自身出错, 本格无效: $(_exec_why)"
+elif [[ "$(rc)" == 0 && "$(order_lines)" == "LOCK|MIGRATE|SETTLE [--after-migrate]|" ]]; then
+  ok "pdg __migrate 仍执行迁移: 锁 → 迁移 → 新步骤(各 1 次, 参数只有 --after-migrate), 退出码 0"
+else
+  bad "__migrate 健康: 实得 rc=$(rc) 记录=[$(order_lines)]"
+fi
+# 4b 迁移链返回非 0 ⇒ 新步骤零调用, 退出码原样传出
+for _m in 1 2 137; do
+  out="$(MIGRATE_RC=$_m run __migrate)"
+  if ! _exec_ok; then
+    bad "4b-$_m: 壳自身出错, 本格无效: $(_exec_why)"
+  elif [[ "$(rc)" == "$_m" && "$(order_lines)" == "LOCK|MIGRATE|" ]]; then
+    ok "4b-$_m: 迁移链返回 $_m ⇒ 新步骤 0 次, 退出码原样是 $_m"
+  else
+    bad "4b-$_m: 实得 rc=$(rc) 记录=[$(order_lines)]"
+  fi
+done
+# 4c 普通命令与 cmd_migrate 都不触发新步骤(上面各格原样保留; 这里只补"新步骤 0 次"这一条)
+_trig=""
+for _c in status restart menu migrate; do
+  out="$(run "$_c")"
+  { _exec_ok && ! grep -q '^SETTLE' "$WORK/order"; } || _trig="$_trig $_c(rc=$(rc) 记录=[$(order_lines)] 执行有效=$(_exec_ok && echo 是 || echo 否))"
+done
+[[ -z "$_trig" ]] && ok "4c: status / restart / menu / migrate 都不触发新步骤" || bad "4c: 触发了新步骤或壳出错:$_trig"
 
 echo "────────────────────────────────────────"
 echo "通过 $pass, 失败 $nfail"

@@ -5782,6 +5782,205 @@ migrate_dotwitness(){
   return 0
 }
 
+# >>> dw-settle(tests/test-dotwitness-settle.sh 按这对标记抽取原文执行; 两个标记各只许出现一次)
+# 迁移链成功之后对 pdg-dotwitness 做一次核验。只有 `__migrate` 派发那一行在迁移链返回 0 之后
+# 才调它(`run_all_migrations && _dw_settle --after-migrate`); cmd_migrate / cmd_platform 不调。
+# 升级子进程里迁移链会多次重启 dotwitness, 可能撞上 StartLimitBurst; 迁移链本身照样返回 0,
+# 而 migrate_dotwitness 的 ⑥⑦ 只在它自己那一刻看过一次。这一步补的是"迁移链收尾时"的那一眼:
+#   · 恒返回 0: 观察不到、确认未就绪、恢复没成都只具名警告, 不把成功的迁移改成失败;
+#     判定全在子壳里跑, 子壳里的任何意外(含 set -u)都只结束子壳, 不改变返回值 —— 但不静默:
+#     子壳非 0 退出时记下原始退出码, 具名警告"本次核验未完成", 不推断故障、不声称恢复。
+#   · 参数必须恰好是 --after-migrate, 否则什么都不查、不做、不说。它只是"从派发那一行来"的
+#     约定, 不是身份或能力凭据; 手工 `pdg __migrate` 也会走到这里, 但没有自动回滚保证。
+#   · 只对**有效确认**的 start-limit-hit 做一次定向恢复: reset-failed 至多一次, 失败就不 start;
+#     reset 成功后 start 至多一次。不提高限额、不重试恢复、不 enable / restart、不杀占用者、
+#     不推断原因 —— 报告里只写观察到的事实与两条命令的退出码。
+#   · 不复用 _dw_svc_id / _dw_kv / ⑦b 里的 _dw_listener_pids: 它们不看退出码, 查询失败会被读成"空"。
+_dw_settle(){
+  [[ $# -eq 1 && "$1" == --after-migrate ]] || return 0
+  local r=0
+  ( _dws_run ) || r=$?
+  if (( r != 0 )); then
+    c_y "  ⚠️  DoT 证据端: 本次核验未完成(核验过程异常退出, 退出码 $r); 不据此判断服务是否故障, 也不代表已恢复; 本步不再做任何动作。"
+  fi
+  return 0
+}
+
+# 一次状态查询。返回 0=有效 1=查询失败 2=输出无效; 值写进调用方的 d_*, 原因写进 d_why。
+# 先看退出码: 非 0 时已经输出的内容一概不采信。再核格式: 七个键各恰一行、没有多余的键、取值在已知集合里。
+_dws_show(){
+  local raw rc line k v seen=" "
+  d_load="" d_ufs="" d_act="" d_sub="" d_res="" d_nr="" d_inv="" d_why=""
+  raw="$(systemctl show pdg-dotwitness -p LoadState -p UnitFileState -p ActiveState -p SubState \
+         -p Result -p NRestarts -p InvocationID --no-pager 2>/dev/null)"; rc=$?
+  if (( rc != 0 )); then d_why="systemctl show 退出 $rc, 已输出的内容不采信"; return 1; fi
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    if [[ "$line" != ?*=* ]]; then d_why="systemctl show 输出无效(有无法解析的行)"; return 2; fi
+    k="${line%%=*}"; v="${line#*=}"
+    if [[ "$seen" == *" $k "* ]]; then d_why="systemctl show 输出无效($k 重复)"; return 2; fi
+    seen="$seen$k "
+    case "$k" in
+      LoadState) d_load="$v" ;; UnitFileState) d_ufs="$v" ;; ActiveState) d_act="$v" ;;
+      SubState) d_sub="$v" ;; Result) d_res="$v" ;; NRestarts) d_nr="$v" ;; InvocationID) d_inv="$v" ;;
+      *) d_why="systemctl show 输出无效(多出未请求的键 $k)"; return 2 ;;
+    esac
+  done <<< "$raw"
+  for k in LoadState UnitFileState ActiveState SubState Result NRestarts InvocationID; do
+    if [[ "$seen" != *" $k "* ]]; then d_why="systemctl show 输出无效(缺 $k)"; return 2; fi
+  done
+  if ! [[ "$d_nr" =~ ^[0-9]+$ ]]; then d_why="systemctl show 输出无效(NRestarts=$d_nr)"; return 2; fi
+  # 取值必须是 systemd 对 service 单元会给出的值; 不认识就是输出无效(观察未取得), 不当成"未就绪"。
+  case "$d_load" in
+    stub|loaded|not-found|bad-setting|error|merged|masked) ;;
+    *) d_why="systemctl show 输出无效(LoadState=$d_load 不认识)"; return 2 ;;
+  esac
+  case "$d_ufs" in
+    ''|enabled|enabled-runtime|linked|linked-runtime|alias|masked|masked-runtime|static|disabled|indirect|generated|transient|bad) ;;
+    *) d_why="systemctl show 输出无效(UnitFileState=$d_ufs 不认识)"; return 2 ;;
+  esac
+  case "$d_act" in
+    active|reloading|inactive|failed|activating|deactivating|maintenance|refreshing) ;;
+    *) d_why="systemctl show 输出无效(ActiveState=$d_act)"; return 2 ;;
+  esac
+  case "$d_sub" in
+    dead|condition|start-pre|start|start-post|running|exited|reload|reload-signal|reload-notify|stop|stop-watchdog|stop-sigterm|stop-sigkill) ;;
+    stop-post|final-watchdog|final-sigterm|final-sigkill|failed|dead-before-auto-restart|failed-before-auto-restart) ;;
+    dead-resources-pinned|auto-restart|auto-restart-queued|cleaning) ;;
+    *) d_why="systemctl show 输出无效(SubState=$d_sub 不认识)"; return 2 ;;
+  esac
+  case "$d_res" in
+    success|resources|protocol|timeout|exit-code|signal|core-dump|watchdog|start-limit-hit|oom-kill|exec-condition) ;;
+    *) d_why="systemctl show 输出无效(Result=$d_res 不认识)"; return 2 ;;
+  esac
+  if ! [[ -z "$d_inv" || "$d_inv" =~ ^[0-9a-f]{32}$ ]]; then d_why="systemctl show 输出无效(InvocationID 不合格式)"; return 2; fi
+  if [[ "$d_act" == active && -z "$d_inv" ]]; then d_why="systemctl show 输出无效(active 但没有 InvocationID)"; return 2; fi
+  return 0
+}
+
+# 127.0.0.1:5399 的监听者。返回 0=取得(d_pids 为空 = 没有监听) 1=未取得。
+# 只认某一列恰好是 127.0.0.1:5399 的行; 这样的行里取不到 pid= 就是归属未取得, 不是"没人在听"。
+_dws_listen(){
+  local raw rc line f hit rest p
+  local -a fs
+  d_pids=()
+  raw="$(ss -lunp 2>/dev/null)"; rc=$?
+  if (( rc != 0 )); then d_why="ss 退出 $rc"; return 1; fi
+  while IFS= read -r line; do
+    read -ra fs <<< "$line"; hit=0
+    for f in "${fs[@]}"; do [[ "$f" == 127.0.0.1:5399 ]] && hit=1; done
+    (( hit )) || continue
+    rest="$line"; p=""
+    while [[ "$rest" =~ pid=([0-9]+) ]]; do
+      p="${BASH_REMATCH[1]}"; d_pids+=("$p"); rest="${rest#*pid="$p"}"
+    done
+    if [[ -z "$p" ]]; then d_why="127.0.0.1:5399 的监听行里取不到 pid"; return 1; fi
+  done <<< "$raw"
+  return 0
+}
+
+# d_pids 归不归 pdg-dotwitness 管: 监听进程 /proc/<pid>/cgroup 的 0:: 行与 unit 的 ControlGroup 比。
+# 返回 0=有一个归它管 1=未取得 2=全部取得且都不是它的(d_saw 记看到的 pid:cgroup)。
+# 每个监听者都要读到, 不在第一个匹配处提前返回: 否则排在后面的读不到根本不会发生(短路未读),
+# 排在前面的读不到也会被后面的匹配盖掉。任何一个读不到 ⇒ 归属未取得, 不报健康。
+_dws_own(){
+  local cg rc p raw l pc match=0 fail=""
+  d_saw=""
+  cg="$(systemctl show pdg-dotwitness -p ControlGroup --value 2>/dev/null)"; rc=$?
+  if (( rc != 0 )) || [[ "$cg" != /* ]]; then d_why="取不到 pdg-dotwitness 的 ControlGroup(退出 $rc)"; return 1; fi
+  d_cg="$cg"
+  for p in "${d_pids[@]}"; do
+    if ! raw="$(cat "/proc/$p/cgroup" 2>/dev/null)"; then fail="$fail $p"; continue; fi
+    pc=""
+    while IFS= read -r l; do [[ "$l" == 0::* ]] && pc="${l#0::}"; done <<< "$raw"
+    if [[ -z "$pc" ]]; then fail="$fail $p"; continue; fi
+    if [[ "$pc" == "$cg" ]]; then match=1; else d_saw="$d_saw $p:$pc"; fi
+  done
+  if [[ -n "$fail" ]]; then d_why="读不到 127.0.0.1:5399 监听进程的 cgroup(pid:$fail)"; return 1; fi
+  (( match )) && return 0
+  return 2
+}
+
+# 有界观察: 次数与间隔写死(最多 10 次, 间隔 0.5 s), 不做成配置。每次观察按完整健康条件判:
+# loaded + enabled + active / running + 5399 归它管; 连续两次成立且是同一个 InvocationID 才算成立。
+# 有效但不满足 ⇒ 有效未就绪, 继续观察; 任何一次读取失败或输出无效立刻结束并判未取得 —— 后面的成功读数冲不掉它。
+# 返回 0=成立 1=未取得(d_why) 2=确认未就绪(d_lastk 是最后一次观察的类别, d_last 是描述)。
+_dws_watch(){
+  local i=0 prev="" r
+  d_last="" d_lastk=""
+  while (( i < 10 )); do
+    (( i > 0 )) && sleep 0.5
+    i=$((i+1))
+    if ! _dws_show; then d_why="第 $i 次观察: $d_why"; return 1; fi
+    if [[ "$d_load" != loaded || "$d_ufs" != enabled || "$d_act" != active || "$d_sub" != running ]]; then
+      d_lastk=down; d_last="最后一次观察 ActiveState=$d_act, SubState=$d_sub, Result=$d_res, LoadState=$d_load, UnitFileState=${d_ufs:-空}"
+      prev=""; continue
+    fi
+    if ! _dws_listen; then d_why="第 $i 次观察: $d_why"; return 1; fi
+    if (( ${#d_pids[@]} == 0 )); then
+      d_lastk=nolisten; d_last="最后一次观察 active 但 127.0.0.1:5399 没有监听"; prev=""; continue
+    fi
+    _dws_own; r=$?
+    if (( r == 1 )); then d_why="第 $i 次观察: $d_why"; return 1; fi
+    if (( r == 2 )); then
+      d_lastk=foreign; d_last="最后一次观察 active 但 127.0.0.1:5399 由别的进程持有(unit: $d_cg; 监听者:$d_saw)"; prev=""; continue
+    fi
+    [[ -n "$prev" && "$prev" == "$d_inv" ]] && return 0
+    if [[ -n "$prev" ]]; then
+      d_lastk=churn; d_last="10 次观察里没有连续两次是同一个实例(InvocationID 在变)"
+    else
+      d_lastk=once; d_last="10 次观察里没有连续两次成立"
+    fi
+    prev="$d_inv"
+  done
+  return 2
+}
+
+_dws_run(){
+  local d_load d_ufs d_act d_sub d_res d_nr d_inv d_why="" d_cg="" d_saw="" d_last="" d_lastk="" r h
+  local -a d_pids=()
+  _dws_show; r=$?
+  if (( r != 0 )); then c_y "  ⚠️  DoT 证据端: 状态未取得($d_why), 本步不做任何动作。"; return 0; fi
+  if [[ "$d_load" == masked || "$d_ufs" == disabled || "$d_ufs" == masked || "$d_ufs" == masked-runtime ]]; then
+    c_y "  ⚠️  DoT 证据端: 本次观察到自启态 ${d_ufs:-空}(LoadState=$d_load, 运行态 $d_act), 本步不启动、不改自启; 迁移链前面的步骤是否改动过它的自启状态, 本步不作结论。"
+    return 0
+  fi
+  if [[ "$d_load" != loaded ]]; then c_y "  ⚠️  DoT 证据端: 状态未取得(unit 未加载: LoadState=$d_load), 本步不做任何动作。"; return 0; fi
+  if [[ "$d_ufs" != enabled ]]; then c_y "  ⚠️  DoT 证据端: 状态未取得(自启态 ${d_ufs:-空} 不在本步的判定范围), 本步不做任何动作。"; return 0; fi
+
+  if [[ "$d_act" == active ]]; then
+    _dws_watch; r=$?
+    if (( r == 0 )); then c_g "  DoT 证据端: 核验通过 —— 运行中, 127.0.0.1:5399 由 pdg-dotwitness 持有。"
+    elif (( r == 1 )); then c_y "  ⚠️  DoT 证据端: 状态未取得($d_why), 本步不做任何动作。"
+    elif [[ "$d_lastk" == nolisten ]]; then c_y "  ⚠️  DoT 证据端: 服务 active, 但 127.0.0.1:5399 没有监听; 本步不处理。"
+    elif [[ "$d_lastk" == foreign ]]; then c_y "  ⚠️  DoT 证据端: 服务 active, 但 127.0.0.1:5399 由别的进程持有(unit: $d_cg; 监听者:$d_saw); 本步不处理。"
+    else c_y "  ⚠️  DoT 证据端: 未就绪(观察期内没能确认就绪; $d_last), 本步不重置、不启动。查看 journalctl -u pdg-dotwitness。"
+    fi
+    return 0
+  fi
+
+  if [[ "$d_act" == failed && "$d_res" == start-limit-hit ]]; then
+    h="观察到启动限额命中(Result=start-limit-hit, NRestarts=$d_nr)"
+    systemctl reset-failed pdg-dotwitness >/dev/null 2>&1; r=$?
+    if (( r != 0 )); then c_y "  ⚠️  DoT 证据端: $h; 定向恢复的 reset-failed 退出 $r, 未执行 start; 不再重试。"; return 0; fi
+    systemctl start pdg-dotwitness >/dev/null 2>&1; r=$?
+    if (( r != 0 )); then c_y "  ⚠️  DoT 证据端: $h; 定向恢复: reset-failed 退出 0, start 退出 $r; 不再重试。"; return 0; fi
+    _dws_watch; r=$?
+    if (( r == 0 )); then
+      c_g "  DoT 证据端: $h; 已做一次定向恢复(reset-failed 退出 0, start 退出 0), 恢复后运行中, 127.0.0.1:5399 由 pdg-dotwitness 持有 —— 本次核验已恢复。"
+    elif (( r == 1 )); then
+      c_y "  ⚠️  DoT 证据端: $h; 已做一次定向恢复(reset-failed 退出 0, start 退出 0), 但恢复后观察未取得($d_why), 不能确认已恢复; 不再重试。"
+    else
+      c_y "  ⚠️  DoT 证据端: $h; 已做一次定向恢复(reset-failed 退出 0, start 退出 0), 但恢复后确认未就绪($d_last); 不再重试。查看 journalctl -u pdg-dotwitness。"
+    fi
+    return 0
+  fi
+
+  c_y "  ⚠️  DoT 证据端: 未就绪(ActiveState=$d_act, SubState=$d_sub, Result=$d_res), 本步不重置、不启动。查看 journalctl -u pdg-dotwitness。"
+  return 0
+}
+# <<< dw-settle
+
 migrate_probe81_public(){
   # probe81 自 6.1B 起是 **Android/iOS 公共必需**服务(链路诊断的 HTTP 会话入口)。
   # 所以"模板不在就跳过"这条前提已经不成立了 —— 它现在是硬失败。
@@ -9962,7 +10161,7 @@ case "${1:-menu}" in
   # 这期间必须独占。两种来路都要照顾到, 而 _lock 自己分得清:
   #   · 由 cmd_update 调起 → 继承父进程那把锁, 复用同一个 OFD(不重开、不重抢);
   #   · 用户手打 sudo pdg __migrate → 没有可继承的 fd, 自己去取, 取不到就 BUSY 退出。
-  __migrate)     need_root __migrate; _lock; run_all_migrations;;
+  __migrate)     need_root __migrate; _lock; run_all_migrations && _dw_settle --after-migrate;;
   migrate)       cmd_migrate;;
   tx)            shift || true; cmd_tx "$@";;
   status|st)     cmd_status;;
