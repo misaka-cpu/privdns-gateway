@@ -79,11 +79,12 @@ NOW_SCOPE = [
     '        # 选 retire-hop 就只跑③(已安装桥接 → 退役候选; 同一 job 里先原样跑 ② 取得真实桥接前像)。',
     '        # 选 late-failure 就只跑④(退役成功后的晚期失败 → 产品自己回滚到本次快照; 同一 job 里先原样跑 ②)。',
     '        # 选 retire-hop-bc 就只跑 B / C2 两跳(前像在本 job 里构造, 再经桥接入口与已装桥接 CLI 两跳到退役候选; b / c2 各一格)。',
+    '        # 选 first-upgrade 就只跑 S-1(已安装桥接 → 新候选的首次升级, 不施加准备阶段静置; 同一 job 里先原样跑 ②; 观测 pdg-dotwitness 触限、恢复与父进程收尾)。',
     '        # 是**显式范围选择**, 不是用 continue-on-error 把失败绕过去 —— 被选中的 job',
     '        # 该红照样红, 没被选中的 job 直接不启动(不产生结果, 也不冒充通过)。',
-    '        description: "真实验收的范围(默认 all; platform = 只跑⑤a/⑤b; retire = 只跑①旧 CLI 直跳被拒; bridge = 只跑② v1.11.15→桥接; retire-hop = ②+③ 同一 job; late-failure = ②+④ 同一 job; retire-hop-bc = B/C2 两跳)"',
+    '        description: "真实验收的范围(默认 all; platform = 只跑⑤a/⑤b; retire = 只跑①旧 CLI 直跳被拒; bridge = 只跑② v1.11.15→桥接; retire-hop = ②+③ 同一 job; late-failure = ②+④ 同一 job; retire-hop-bc = B/C2 两跳; first-upgrade = ②+S-1 同一 job)"',
     '        type: choice',
-    '        options: ["all", "platform", "retire", "bridge", "retire-hop", "late-failure", "retire-hop-bc"]',
+    '        options: ["all", "platform", "retire", "bridge", "retire-hop", "late-failure", "retire-hop-bc", "first-upgrade"]',
     '        default: "all"',
 ]
 def region(lines, where):
@@ -122,8 +123,8 @@ case $? in
   0) ok "一-1 相对基线: real_scope 输入块整块与登记原文逐字相符, 其余改动只有文件末尾追加的 job 块 ($(tr '\n' ';' < "$T/wf.txt"))";;
   *) bad "一-1 workflow 有基线之外的改动: $(grep UNEXPECTED "$T/wf.txt" | head -3 | tr '\n' ' ')";;
 esac
-grep -qxF '        options: ["all", "platform", "retire", "bridge", "retire-hop", "late-failure", "retire-hop-bc"]' "$WF" \
-  && ok "一-2 real_scope 选项整行逐字相符(原有六项顺序不变, 末尾是 retire-hop-bc)" || bad "一-2 real_scope 选项整行不对"
+grep -qxF '        options: ["all", "platform", "retire", "bridge", "retire-hop", "late-failure", "retire-hop-bc", "first-upgrade"]' "$WF" \
+  && ok "一-2 real_scope 选项整行逐字相符(原有七项顺序不变, 末尾是 first-upgrade)" || bad "一-2 real_scope 选项整行不对"
 # 本节以下只看 **real-retire-hop 这一个 job**: 从它的头一行取到**下一个 job 的头一行之前**。
 # 以前是 `awk '/^  real-retire-hop:$/{f=1} f'` 一直读到文件末尾 —— 末尾再追加别的 job(如 ④),
 # 那个 job 的 env / 步骤 / 顺序就会被一起读进来当成 ③ 的, 本节的结论也就不再只关于 ③。

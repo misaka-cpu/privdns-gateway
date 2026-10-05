@@ -46,8 +46,8 @@ for f in "$R4" "$R3" "$HOP2" "$WF" "$ROOT/tests/repoguard.sh"; do [[ -f "$f" ]] 
 source "$ROOT/tests/repoguard.sh" || { bad "repoguard.sh 装载失败"; echo "通过 $pass, 失败 $nfail"; exit 1; }
 
 echo "══ 一. workflow 接线(只看 real-late-failure 这一个 job) ══"
-grep -qxF '        options: ["all", "platform", "retire", "bridge", "retire-hop", "late-failure", "retire-hop-bc"]' "$WF" \
-  && ok "一-1 real_scope 选项整行逐字相符(late-failure 仍在原位, 末尾追加 retire-hop-bc, 原有六项顺序不变)" || bad "一-1 real_scope 选项整行不对"
+grep -qxF '        options: ["all", "platform", "retire", "bridge", "retire-hop", "late-failure", "retire-hop-bc", "first-upgrade"]' "$WF" \
+  && ok "一-1 real_scope 选项整行逐字相符(late-failure 仍在原位, 末尾依次是 retire-hop-bc、first-upgrade, 原有项顺序不变)" || bad "一-1 real_scope 选项整行不对"
 grep -qF 'late-failure = ②+④ 同一 job' "$WF" \
   && ok "一-1b real_scope 的说明里写明了 late-failure 是 ②+④ 同一 job" || bad "一-1b real_scope 说明没跟上"
 job_block(){ awk -v h="  $1:" '$0==h{f=1} f && $0!=h && /^  [a-z][a-z0-9-]*:$/{exit} f' "$WF"; }

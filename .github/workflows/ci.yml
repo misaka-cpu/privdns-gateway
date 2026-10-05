@@ -45,11 +45,12 @@ on:
         # 选 retire-hop 就只跑③(已安装桥接 → 退役候选; 同一 job 里先原样跑 ② 取得真实桥接前像)。
         # 选 late-failure 就只跑④(退役成功后的晚期失败 → 产品自己回滚到本次快照; 同一 job 里先原样跑 ②)。
         # 选 retire-hop-bc 就只跑 B / C2 两跳(前像在本 job 里构造, 再经桥接入口与已装桥接 CLI 两跳到退役候选; b / c2 各一格)。
+        # 选 first-upgrade 就只跑 S-1(已安装桥接 → 新候选的首次升级, 不施加准备阶段静置; 同一 job 里先原样跑 ②; 观测 pdg-dotwitness 触限、恢复与父进程收尾)。
         # 是**显式范围选择**, 不是用 continue-on-error 把失败绕过去 —— 被选中的 job
         # 该红照样红, 没被选中的 job 直接不启动(不产生结果, 也不冒充通过)。
-        description: "真实验收的范围(默认 all; platform = 只跑⑤a/⑤b; retire = 只跑①旧 CLI 直跳被拒; bridge = 只跑② v1.11.15→桥接; retire-hop = ②+③ 同一 job; late-failure = ②+④ 同一 job; retire-hop-bc = B/C2 两跳)"
+        description: "真实验收的范围(默认 all; platform = 只跑⑤a/⑤b; retire = 只跑①旧 CLI 直跳被拒; bridge = 只跑② v1.11.15→桥接; retire-hop = ②+③ 同一 job; late-failure = ②+④ 同一 job; retire-hop-bc = B/C2 两跳; first-upgrade = ②+S-1 同一 job)"
         type: choice
-        options: ["all", "platform", "retire", "bridge", "retire-hop", "late-failure", "retire-hop-bc"]
+        options: ["all", "platform", "retire", "bridge", "retire-hop", "late-failure", "retire-hop-bc", "first-upgrade"]
         default: "all"
 
 permissions:
@@ -2544,4 +2545,159 @@ jobs:
             echo "########## EVIDENCE $d/$f ##########"
             sudo cat "$d/$f"
             echo
+          done
+
+  real-first-upgrade:
+    needs: prepare-mosdns-fixture
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.real_acceptance == 'true'
+            && github.event.inputs.real_scope == 'first-upgrade' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    name: "真实验收 S-1: 已安装桥接 → 新候选的首次升级(同一 runner 先原样跑 ②; 不静置; 观测 pdg-dotwitness 触限、恢复与父进程收尾)"
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0          # 旧版对象与两个候选都要从本地取
+      - name: "取桥接/退役候选分支, 并核对 head == 派发时指定的 SHA"
+        env:
+          PDG_BRIDGE_SHA: ${{ github.event.inputs.bridge_candidate }}
+          PDG_BRIDGE_BR:  ${{ github.event.inputs.bridge_branch }}
+          PDG_CAND_SHA:   ${{ github.event.inputs.product_candidate }}
+          PDG_CAND_BR:    ${{ github.event.inputs.candidate_branch }}
+        run: |
+          set -euo pipefail
+          test -n "$PDG_BRIDGE_SHA" || { echo "必须显式指定桥接候选 SHA"; exit 1; }
+          test -n "$PDG_BRIDGE_BR"  || { echo "必须显式指定桥接候选分支名"; exit 1; }
+          test -n "$PDG_CAND_SHA"   || { echo "必须显式指定退役候选 SHA(③ 的升级目标)"; exit 1; }
+          test -n "$PDG_CAND_BR"    || { echo "必须显式指定退役候选分支名"; exit 1; }
+          git fetch --no-tags origin "+refs/heads/$PDG_BRIDGE_BR:refs/heads/pdg-bridge"
+          git fetch --no-tags origin "+refs/heads/$PDG_CAND_BR:refs/heads/pdg-candidate"
+          git fetch --tags origin
+          gotb=$(git rev-parse refs/heads/pdg-bridge); gotc=$(git rev-parse refs/heads/pdg-candidate)
+          echo "桥接候选 $PDG_BRIDGE_BR = $gotb"
+          echo "退役候选 $PDG_CAND_BR  = $gotc"
+          echo "验收 checkout            = ${{ github.sha }}"
+          test "$gotb" = "$PDG_BRIDGE_SHA" || { echo "桥接候选 head 与派发时指定的 SHA 不符"; exit 1; }
+          test "$gotc" = "$PDG_CAND_SHA"   || { echo "退役候选 head 与派发时指定的 SHA 不符"; exit 1; }
+      - name: "PID 1 必须是真 systemd, systemctl 必须是真二进制(不是就判失败, 不 SKIP)"
+        run: |
+          set -euo pipefail
+          comm=$(cat /proc/1/comm); echo "PID 1 = $comm"; test "$comm" = systemd
+          w="$(command -v systemctl)"; echo "systemctl = $w"
+          test -x "$w" && { test "$w" = /usr/bin/systemctl || test "$w" = /bin/systemctl; }
+      - name: 装依赖
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            nftables dnsutils iproute2 openssl python3 git unzip psmisc procps curl >/dev/null
+          nft --version
+      - name: "推导 mosdns artifact 名"
+        run: echo "MOSDNS_ARTIFACT=$(bash tests/mosdns-artifact-name.sh)" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ env.MOSDNS_ARTIFACT }}
+          path: /tmp/mosdns-fixture
+      - name: "校验并安装钉定 mosdns"
+        run: sudo -E bash tests/install-mosdns-artifact.sh /tmp/mosdns-fixture
+      - name: "校验并安装钉定 mihomo"
+        run: sudo -E bash tests/install-mihomo-artifact.sh /tmp/mosdns-fixture
+      - name: "前置: 函数抽取契约 (标记唯一成对/片段与组合语法/抽不对就阻断)"
+        run: bash tests/test-bridge-extract-contract.sh
+      - name: "前置: 观测契约 (依赖自检/保留项台账/服务归类与观测有效性)"
+        run: bash tests/test-bridge-observation-contract.sh
+      - name: "前置: S-1 契约 (接线/共享输入与抽取/门与唯一调用/触限·恢复·报告·健康分层结算; 模型)"
+        run: bash tests/test-first-upgrade-contract.sh
+      - name: "② 原样: 按 docs/BRIDGE-ENTRY.md 的入口流程把 v1.11.15 升到桥接版(本次 S-1 的真实前像)"
+        id: real2
+        shell: bash
+        env:
+          PDG_E2E_ISOLATED: "1"
+          PDG_REAL_MIGRATION_OK: "1"
+          PDG_REAL_MIG_EVID: "/tmp/real-acceptance-evidence"
+          PDG_BRIDGE_SHA: ${{ github.event.inputs.bridge_candidate }}
+          PDG_RETIRE_SHA: ${{ github.event.inputs.product_candidate }}
+        run: |
+          set -o pipefail
+          # 与 real-bridge-hop 同一支脚本、同一组输入; 只多一份输出留档(tee 在 pipefail 下不吞 ② 的退出码),
+          # 供 ③ 核 ② 的汇总行与"未执行场景数" —— ② 的 nrun 不计失败, 退出码 0 不足以证明它跑完了。
+          sudo -E bash tests/e2e-real-bridge-hop.sh 2>&1 | tee /tmp/real2-stdout.log
+      - name: "真实验收 S-1: 现役桥接 CLI 执行 update --to 新候选(② 成功才启动; 不施加准备阶段静置)"
+        id: s1
+        if: ${{ success() && steps.real2.outcome == 'success' }}
+        env:
+          PDG_E2E_ISOLATED: "1"
+          PDG_REAL_MIGRATION_OK: "1"
+          PDG_S1_EVID: "/tmp/real-acceptance-evidence-s1"
+          PDG_REAL2_LOG: "/tmp/real2-stdout.log"
+          PDG_BRIDGE_SHA: ${{ github.event.inputs.bridge_candidate }}
+          PDG_RETIRE_SHA: ${{ github.event.inputs.product_candidate }}
+        run: sudo -E bash tests/e2e-real-first-upgrade.sh
+      - name: "留证: ② 与 S-1 的证据文件、S-1 调用次数与 journal(成败都留)"
+        if: ${{ always() }}
+        run: |
+          set +e
+          # 382(同 321): S-1 结束之后, 先对 pdg-dotwitness 取证: 查询只读(不改任何服务状态), 留证会写本步骤自有的临时目录。
+          # 每项分别留下命令、查询原始退出码、stdout / stderr 原文及各自的读取退出码(读取失败只算不完整原文, 具名记缺口);
+          # 命令直接执行, 不接管道。某项失败照样继续其它项, 缺口只增不减, 在本段末尾单独列出。
+          # 本段只是取证: 执行完不等于取证完整, 也不改变本步骤与 S-1 的结论。
+          DG="$(mktemp -d)"
+          dg_rc=$?
+          GAPS=""
+          diag() {
+            local n="$1" rc ro re
+            shift
+            echo "########## DIAG $n ##########"
+            printf '命令:'; printf ' %q' "$@"; echo
+            if [ "$dg_rc" -eq 0 ] && [ -d "$DG" ]; then
+              "$@" >"$DG/$n.out" 2>"$DG/$n.err"
+              rc=$?
+              echo "查询原始退出码: $rc"
+              echo "---------- stdout ----------"
+              cat "$DG/$n.out"
+              ro=$?
+              echo
+              echo "---------- stdout 读取退出码: $ro ----------"
+              echo "---------- stderr ----------"
+              cat "$DG/$n.err"
+              re=$?
+              echo
+              echo "---------- stderr 读取退出码: $re ----------"
+              if [ "$rc" -ne 0 ]; then echo "未取得: 查询退出码 $rc(上面的输出只作原文留档, 不采信)"; GAPS="$GAPS $n"; fi
+              if [ "$ro" -ne 0 ]; then echo "未取得: stdout 读取退出 $ro(已输出的部分只是不完整原文)"; GAPS="$GAPS $n:stdout-read"; fi
+              if [ "$re" -ne 0 ]; then echo "未取得: stderr 读取退出 $re(已输出的部分只是不完整原文)"; GAPS="$GAPS $n:stderr-read"; fi
+            else
+              echo "未取得: 临时目录没建成(mktemp 退出 $dg_rc), 本项没有执行"; GAPS="$GAPS $n"
+            fi
+            return 0
+          }
+          diag boot-id cat /proc/sys/kernel/random/boot_id
+          diag systemd-version systemctl --version
+          diag clock-realtime date -u +%Y-%m-%dT%H:%M:%S.%NZ
+          diag clock-uptime cat /proc/uptime
+          diag dotwitness-show systemctl show pdg-dotwitness.service -p LoadState -p ActiveState -p SubState -p Result -p ExecMainCode -p ExecMainStatus -p MainPID -p InvocationID -p NRestarts -p StartLimitIntervalUSec -p StartLimitBurst -p PartOf -p FragmentPath -p DropInPaths
+          for p in LoadState ActiveState SubState Result ExecMainCode ExecMainStatus MainPID InvocationID NRestarts StartLimitIntervalUSec StartLimitBurst PartOf FragmentPath DropInPaths; do
+            grep -q "^$p=" "$DG/dotwitness-show.out" 2>/dev/null
+            r=$?
+            case "$r" in
+              0) ;;
+              1) echo "未取得: 属性 $p 不在 systemctl show 的输出里"; GAPS="$GAPS dotwitness-show:$p" ;;
+              *) echo "未取得: 属性 $p 核对失败(grep 退出 $r)"; GAPS="$GAPS dotwitness-show:$p" ;;
+            esac
+          done
+          diag dotwitness-cat systemctl cat pdg-dotwitness.service
+          diag dotwitness-journal sudo journalctl -b 0 -u pdg-dotwitness.service --no-pager -o short-monotonic
+          diag mosdns-journal sudo journalctl -b 0 -u mosdns.service --no-pager -o short-monotonic
+          echo "########## DIAG 留证缺口: ${GAPS:- 无} ##########"
+          echo
+          echo "########## S-1 升级调用次数: $(sudo cat /tmp/real-acceptance-evidence-s1/00-s1-invoke-count.txt 2>/dev/null || echo '<未取得: S-1 没启动或没写>') ##########"
+          echo "########## journal(相关 unit, 末 400 行) ##########"
+          sudo journalctl -u pdg-mitm -u mosdns -u mihomo -u pdg-bot -u pdg-probe81 --no-pager -n 400 2>&1 | tail -400
+          echo
+          for d in /tmp/real-acceptance-evidence /tmp/real-acceptance-evidence-s1; do
+            for f in $(sudo ls -1 "$d" 2>/dev/null); do
+              echo "########## EVIDENCE $d/$f ##########"
+              sudo cat "$d/$f"
+              echo
+            done
           done

@@ -57,8 +57,8 @@ job_block(){ awk -v h="  $1:" '$0==h{f=1} f && $0!=h && /^  [a-z][a-z0-9-]*:$/{e
 if [[ -z "$ONLY" ]]; then
 git -C "$ROOT" cat-file -e "$BASE^{commit}" 2>/dev/null || { bad "取不到验收基线对象 $BASE —— 共享输入与接线核对无从谈起"; fin; }
 echo "══ 一. workflow 接线 ══"
-grep -qxF '        options: ["all", "platform", "retire", "bridge", "retire-hop", "late-failure", "retire-hop-bc"]' "$WF" \
-  && ok "C4-1 real_scope 选项整行逐字相符(原有六项顺序不变, 末尾追加 retire-hop-bc)" || bad "C4-1 real_scope 选项整行不对"
+grep -qxF '        options: ["all", "platform", "retire", "bridge", "retire-hop", "late-failure", "retire-hop-bc", "first-upgrade"]' "$WF" \
+  && ok "C4-1 real_scope 选项整行逐字相符(原有六项顺序不变, 其后依次追加 retire-hop-bc、first-upgrade)" || bad "C4-1 real_scope 选项整行不对"
 grep -qF 'retire-hop-bc = B/C2 两跳' "$WF" && ok "C4-2 real_scope 的说明写明了 retire-hop-bc" || bad "C4-2 real_scope 说明没跟上"
 job_block real-retire-hop-bc > "$T/job.yml"; JRC=$?; JOB_OK=0
 if (( JRC == 0 )) && [[ -s "$T/job.yml" && "$(head -1 "$T/job.yml")" == "  real-retire-hop-bc:" ]] \
@@ -68,10 +68,10 @@ else bad "C4-3 job 抽取边界不对(awk rc=$JRC, 首行 [$(head -1 "$T/job.yml
 python3 - "$WF" > "$T/last.txt" 2>&1 <<'PY'
 import re, sys
 heads = re.findall(r"^  ([a-z][a-z0-9-]*):$", open(sys.argv[1], encoding="utf-8").read(), re.M)
-print(heads[-1] if heads else "<无>")
-sys.exit(0 if heads and heads[-1] == "real-retire-hop-bc" else 1)
+print(" ".join(heads[-2:]) if heads else "<无>")
+sys.exit(0 if len(heads) >= 2 and heads[-2] == "real-retire-hop-bc" and heads[-1] == "real-first-upgrade" else 1)
 PY
-[[ $? == 0 ]] && ok "C4-4 real-retire-hop-bc 是文件里最后一个 job(末尾追加)" || bad "C4-4 最后一个 job 是 [$(cat "$T/last.txt")]"
+[[ $? == 0 ]] && ok "C4-4 real-retire-hop-bc 是倒数第二个 job, 紧跟其后的最后一个 job 是 real-first-upgrade(末尾依次追加)" || bad "C4-4 最后两个 job 是 [$(cat "$T/last.txt")]"
 if [[ "$(jstate -F "github.event.inputs.real_scope == 'retire-hop-bc'")" == 有 \
       && "$(jstate -E "real_scope == '(all|platform|retire|bridge|retire-hop|late-failure|)'")" == 无 ]]; then
   ok "C4-5 新 job 只在 real_scope=retire-hop-bc 时启动(不搭别的范围的车)"
@@ -107,8 +107,9 @@ jneg C4-10 "新 job 不跑 ② / ③ / ④(第二跳在新验收器里经桥接�
   -E 'e2e-real-bridge-hop\.sh|e2e-real-retire-hop\.sh|e2e-real-late-failure\.sh'
 git -C "$ROOT" show "$BASE:.github/workflows/ci.yml" > "$T/base-ci.yml"; brc=$?
 python3 - "$T/base-ci.yml" "$WF" "$T/job.yml" > "$T/wf.txt" 2>&1 <<'PY'
-import difflib, sys
-b = open(sys.argv[1], encoding="utf-8").read().split("\n"); c = open(sys.argv[2], encoding="utf-8").read().split("\n")
+import difflib, re, sys
+ctext = open(sys.argv[2], encoding="utf-8").read()
+b = open(sys.argv[1], encoding="utf-8").read().split("\n"); c = ctext.split("\n")
 job = open(sys.argv[3], encoding="utf-8").read()
 def region(lines):
     i = lines.index("      real_scope:"); j = i
@@ -119,9 +120,16 @@ bi, bj = region(b); ci, cj = region(c)
 bm = "\n".join(b[:bi] + ["<<REAL_SCOPE>>"] + b[bj:]); cm = "\n".join(c[:ci] + ["<<REAL_SCOPE>>"] + c[cj:])
 d = [x for x in difflib.ndiff(b[bi:bj], c[ci:cj]) if x[:1] in "+-"]
 print("real_scope 块变化: %r" % d)
-# real_scope 块遮成一行哨兵之后, 现在的全文必须恰好等于"基线全文 + 一个空行 + real-retire-hop-bc 整块"
-if cm == bm + "\n" + job:
-    print("APPEND 1 个空行 + real-retire-hop-bc(%d 行)" % job.count("\n")); sys.exit(0)
+# real_scope 块遮成一行哨兵之后, 现在的全文必须恰好等于"基线全文 + 一个空行 + real-retire-hop-bc 整块(含其后的一个空行)+ real-first-upgrade 整块";
+# 382: real-first-upgrade 必须恰 1 处、从它的 job 头一直到文件末尾、块内只有它一个 job 头(内容由 S-1 契约核), 不接受任意附加 job。
+S1H = "\n  real-first-upgrade:\n"
+if ctext.count(S1H) != 1:
+    print("UNEXPECTED real-first-upgrade 的 job 头不是恰 1 处"); sys.exit(1)
+s1 = ctext[ctext.index(S1H) + 1:]
+if re.findall(r"^  ([a-z][a-z0-9-]*):$", s1, re.M) != ["real-first-upgrade"]:
+    print("UNEXPECTED real-first-upgrade 之后还有别的 job 头"); sys.exit(1)
+if cm == bm + "\n" + job + s1:
+    print("APPEND 1 个空行 + real-retire-hop-bc(%d 行)+ real-first-upgrade(%d 行)" % (job.count("\n"), s1.count("\n"))); sys.exit(0)
 for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, bm.split("\n"), cm.split("\n"), autojunk=False).get_opcodes():
     if tag != "equal":
         print("UNEXPECTED %s 基线 %d-%d → 现 %d-%d" % (tag, i1 + 1, i2, j1 + 1, j2))
@@ -129,7 +137,7 @@ sys.exit(1)
 PY
 wrc=$?
 if (( brc != 0 )); then bad "C4-11 基线 ci.yml 取不到(git show rc=$brc)"
-elif (( wrc == 0 )); then ok "C4-11 相对 3dcaee00: workflow 只改了 real_scope 输入块, 其余改动只有文件末尾追加的 real-retire-hop-bc"
+elif (( wrc == 0 )); then ok "C4-11 相对 3dcaee00: workflow 只改了 real_scope 输入块, 其余改动只有文件末尾依次追加的 real-retire-hop-bc 与 real-first-upgrade(后者内容由 S-1 契约核)"
 else bad "C4-11 workflow 有登记之外的改动: $(grep UNEXPECTED "$T/wf.txt" | head -3 | tr '\n' ' ')"; fi
 if python3 -c 'import yaml' 2>/dev/null; then
   python3 -c 'import sys, yaml; d = yaml.safe_load(open(sys.argv[1], encoding="utf-8")); assert d["jobs"]["real-retire-hop-bc"]["strategy"]["matrix"]["preimage"] == ["b", "c2"]' "$WF" \
@@ -150,8 +158,8 @@ done
 git -C "$ROOT" diff --name-only "$BASE" -- > "$T/changed.txt" 2>/dev/null; drc=$?
 if (( drc != 0 )); then bad "C3-2 相对基线的改动清单取不到(git diff rc=$drc)"
 else
-  extra="$(grep -vxE 'tests/e2e-real-retire-hop-bc\.sh|tests/test-retire-hop-bc-contract\.sh|\.github/workflows/ci\.yml|tests/test-retire-hop-contract\.sh|tests/test-late-failure-contract\.sh' "$T/changed.txt")"; grc=$?
-  if (( grc == 1 )); then ok "C3-2 相对 3dcaee00 的已跟踪改动只在登记的五个文件之内($(grep -c . "$T/changed.txt") 个: $(tr '\n' ' ' < "$T/changed.txt"))"
+  extra="$(grep -vxE 'tests/e2e-real-retire-hop-bc\.sh|tests/test-retire-hop-bc-contract\.sh|\.github/workflows/ci\.yml|tests/test-retire-hop-contract\.sh|tests/test-late-failure-contract\.sh|tests/e2e-real-first-upgrade\.sh|tests/test-first-upgrade-contract\.sh' "$T/changed.txt")"; grc=$?
+  if (( grc == 1 )); then ok "C3-2 相对 3dcaee00 的已跟踪改动只在登记的七个文件之内(B / C2 的五个 + S-1 的两个新文件; $(grep -c . "$T/changed.txt") 个: $(tr '\n' ' ' < "$T/changed.txt"))"
   elif (( grc == 0 )); then bad "C3-2 登记之外还有改动: $(tr '\n' ' ' <<<"$extra")"
   else bad "C3-2 未取得: 改动清单筛选出错(grep rc=$grc) —— 不说成没有登记外改动"; fi
 fi
