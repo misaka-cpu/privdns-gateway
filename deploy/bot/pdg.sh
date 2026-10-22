@@ -1629,7 +1629,11 @@ _pdg_restore_svcstate(){   # $1=本次快照目录
     c_y "     请自行复核 $(_pdg_svcstate_units | tr '\n' ' ')的 is-active / is-enabled。"
     # 退回原来那套: 明确列出 unit, 绝不用 pdg-* 通配(那会把救援服务一起重启掉)。
     systemctl restart mosdns pdg-bot pdg-probe81 2>/dev/null || true
-    systemctl is-enabled pdg-mitm >/dev/null 2>&1 && { systemctl reset-failed pdg-mitm 2>/dev/null; systemctl restart pdg-mitm 2>/dev/null; }
+    if [[ "${_update_keep_mitm_stopped:-0}" == 1 ]]; then
+      c_g "WLOC 已关闭, 自动回滚保留更新前的服务停止态(前像不可用仍按失败报告)。"
+    else
+      systemctl is-enabled pdg-mitm >/dev/null 2>&1 && { systemctl reset-failed pdg-mitm 2>/dev/null; systemctl restart pdg-mitm 2>/dev/null; }
+    fi
     unrestored+=("服务前像缺失/不可用(${_PDG_SVC_WHY:-未知}; 运行态/自启未确认)")
     return 1
   fi
@@ -2954,6 +2958,23 @@ cmd_update(){
   # 这次确认只为"现在能不能动手", 结论**不留给后面的阶段**。失败回滚时会按那一刻的磁盘记录
   # 重新核验一遍(见 cmd_rollback 里那一处) —— 两者是不同的校验阶段, 不共用结论。
   _PDG_SVC_SRC=""; _PDG_SVC_MODE=blind
+  # A-off: 只在本次可信前像为 enabled/inactive、且配置明确关闭时, 保留手工停止态。
+  # 不改自启、不推断缺失/坏配置是关闭; 开启态仍沿用更新后的重启与 doctor 门。
+  local _update_keep_mitm_stopped=0
+  if grep -q $'^unit\tpdg-mitm\tenabled\t0\tinactive\t3\t' "$snap_dir/svcstate.tsv" \
+     && python3 -c '
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        cfg = json.load(f)
+    w = cfg.get("wloc") if isinstance(cfg, dict) else None
+    off = isinstance(w, dict) and w.get("enabled") is False
+except (OSError, ValueError):
+    off = False
+sys.exit(0 if off else 1)
+' /etc/privdns-gateway/mitm.json 2>/dev/null; then
+    _update_keep_mitm_stopped=1
+  fi
   local pre_sha; pre_sha="$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null)"   # 升级前精确提交, 回滚据此复位仓库
   c_g "拉取最新发布 tag…"
   [[ -d "$REPO_DIR/.git" ]] || { rm -rf "$REPO_DIR"; git clone -q "$REPO_URL" "$REPO_DIR"; }
@@ -3020,7 +3041,7 @@ cmd_update(){
   # 迁移用"刚装好的新脚本"跑(本进程还是旧 bash, 直接调会用旧版函数 → 新迁移要等下次命令才生效)。
   # 把本次前像的**句柄**交给迁移子进程。句柄本身不是证据 —— 新版会去验它指向的那份记录
   # 是否属于本次操作(见退役版的调用方门)。旧版迁移看不懂这个变量, 也不受影响。
-  if ! PDG_UPDATE_SVCSTATE="$snap_dir/svcstate.tsv" bash /usr/local/bin/pdg __migrate; then
+  if ! _PDG_UPDATE_KEEP_MITM_STOPPED="$_update_keep_mitm_stopped" PDG_UPDATE_SVCSTATE="$snap_dir/svcstate.tsv" bash /usr/local/bin/pdg __migrate; then
     c_y "迁移(__migrate)失败, 回滚到更新前快照…"; cmd_rollback --dir "$snap_dir" --git "$pre_sha"; return 1
   fi
   # 二进制: mosdns 与 mihomo 都按 versions.sh 的钉死版本收敛。
@@ -3050,7 +3071,11 @@ cmd_update(){
   fi
   systemctl enable --now pdg-health.timer >/dev/null 2>&1 || true   # 老装升级时补上健康自检
   systemctl restart pdg-bot pdg-probe81 2>/dev/null || true
-  systemctl is-enabled pdg-mitm >/dev/null 2>&1 && { systemctl reset-failed pdg-mitm 2>/dev/null; systemctl restart pdg-mitm 2>/dev/null; }   # iOS/WLOC: 清 start-limit + 载新插件代码, 否则 doctor 判 pdg-mitm 未运行而误回滚
+  if (( _update_keep_mitm_stopped )); then
+    c_g "WLOC 已关闭, 保留本次前像的服务停止态(自启设置不变)。"
+  else
+    systemctl is-enabled pdg-mitm >/dev/null 2>&1 && { systemctl reset-failed pdg-mitm 2>/dev/null; systemctl restart pdg-mitm 2>/dev/null; }   # iOS/WLOC: 清 start-limit + 载新插件代码, 否则 doctor 判 pdg-mitm 未运行而误回滚
+  fi
   sleep 2
 
   # token 是否已配置(未配则 pdg-bot 不在跑属正常, 不据此回滚)
@@ -4517,7 +4542,7 @@ migrate_deploy_botfiles(){
   # try-restart 而不是 restart: 没装/没启用的服务直接跳过, 不报错 —— Android 上没有
   # pdg-mitm, 早期机器上也可能还没有 pdg-probe81, 那些都不该让整条迁移失败。
   local _svcs="pdg-bot pdg-probe81"
-  [[ "$(_pdg_platform)" == ios ]] && _svcs="$_svcs pdg-mitm"
+  [[ "$(_pdg_platform)" == ios && "${_PDG_UPDATE_KEEP_MITM_STOPPED:-0}" != 1 ]] && _svcs="$_svcs pdg-mitm"
   # shellcheck disable=SC2086  # 有意按空白分词
   systemctl try-restart $_svcs >/dev/null 2>&1 || true
   c_g "  运行模块已更新 → 已重启:$(printf ' %s' $_svcs)"
@@ -4721,7 +4746,11 @@ migrate_pdg_mitm_service(){
   source "$REPO_DIR/lib/units.sh" 2>/dev/null || return 0
   pdg_write_unit pdg_unit_pdg_mitm /etc/systemd/system/pdg-mitm.service
   systemctl daemon-reload 2>/dev/null || true
-  systemctl reset-failed pdg-mitm 2>/dev/null; systemctl enable --now pdg-mitm >/dev/null 2>&1 || true
+  if [[ "${_PDG_UPDATE_KEEP_MITM_STOPPED:-0}" == 1 ]]; then
+    c_g "WLOC 已关闭, 服务补装保留更新前的停止态(自启设置不变)。"
+  else
+    systemctl reset-failed pdg-mitm 2>/dev/null; systemctl enable --now pdg-mitm >/dev/null 2>&1 || true
+  fi
   c_g "  ✅ 已补 iOS pdg-mitm 服务(WLOC 服务宿主)。"
 }
 
@@ -5917,7 +5946,11 @@ SCPY
     journalctl -u mihomo -n 15 --no-pager -o cat 2>/dev/null | sed 's/^/    /'
     return 1
   fi
-  [[ "$plat" == ios ]] && { systemctl reset-failed pdg-mitm 2>/dev/null; systemctl enable --now pdg-mitm >/dev/null 2>&1 || true; }
+  if [[ "${_PDG_UPDATE_KEEP_MITM_STOPPED:-0}" == 1 ]]; then
+    c_g "WLOC 已关闭, 内核迁移保留更新前的服务停止态(自启设置不变)。"
+  else
+    [[ "$plat" == ios ]] && { systemctl reset-failed pdg-mitm 2>/dev/null; systemctl enable --now pdg-mitm >/dev/null 2>&1 || true; }
+  fi
   rm -f /etc/nftables.conf.scbak
   return 0
 }

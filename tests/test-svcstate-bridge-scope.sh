@@ -50,8 +50,9 @@ if [[ -n "$BASE" && -f "$BASE" ]]; then
   # _lan_apply_proxy / _lan_rollback_converge / _lan_nft_reapply —— 只在 cmd_rollback 的局部开关
   # 打开时记下白名单补回、相关重启与状态查询的结果; 开关关闭时(回滚以外的调用者)行为与原文相同。
   # 仍是整串精确相等: 不改成子集匹配, 也不兼容旧的四项串。
-  exp=" cmd_snapshot cmd_rollback _update_mosdns_preflight cmd_update _lan_apply_proxy _lan_rollback_converge _lan_nft_reapply"
-  [[ "$changed" == "$exp" ]] && ok "A1: 基线里已有的函数只有 cmd_snapshot / cmd_rollback / _update_mosdns_preflight / cmd_update / _lan_apply_proxy / _lan_rollback_converge / _lan_nft_reapply 被改过" \
+  # A-off: 三处迁移也遵守本次更新的停止态; 只增加这三项, 仍逐名精确比较。
+  exp=" cmd_snapshot cmd_rollback _update_mosdns_preflight cmd_update migrate_deploy_botfiles migrate_pdg_mitm_service _activate_mihomo_core _lan_apply_proxy _lan_rollback_converge _lan_nft_reapply"
+  [[ "$changed" == "$exp" ]] && ok "A1: 基线里已有的函数只有 cmd_snapshot / cmd_rollback / _update_mosdns_preflight / cmd_update / migrate_deploy_botfiles / migrate_pdg_mitm_service / _activate_mihomo_core / _lan_apply_proxy / _lan_rollback_converge / _lan_nft_reapply 被改过" \
     || bad "A1: 被改过的函数是「$changed」, 预期「$exp」"
   # 新增的顶层函数必须**恰好**是下面这份允许集合 —— 判据是精确相等, 不是前缀泛放行,
   # 也不从当前候选自动生成期望(那等于让被测对象自己定义"正确")。
@@ -130,6 +131,8 @@ done
 if [[ -n "$BASE" && -f "$BASE" ]]; then
   for cap in 'mitm_server.py' 'mitm_wloc.py' 'pdg-mitm.service' 'wloc'; do
     b="$(grep -c "$cap" "$BASE")"; c="$(grep -c "$cap" "$PDG")"
+    # S-3: cmd_update 多一处读取 wloc.enabled; 不增加/删除旧能力。
+    [[ "$cap" == wloc ]] && b=$((b+1))
     [[ "$b" == "$c" ]] && ok "B: 旧能力 $cap 的出现次数没变($c 处)" || bad "B: $cap 次数从 $b 变成 $c(动了旧能力)"
   done
 else na "B: 没给基线, 跳过旧能力计数对比"; fi
