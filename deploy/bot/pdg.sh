@@ -1240,6 +1240,178 @@ print("%s/%s  %s" % (src, op, ver or "-"))
 PY
 }
 
+# 仅撤除本次快照明确记录为不存在、当前又与项目模板一致的 witness 文件。
+# 老快照没有此记录时不推断缺失；不删除自定义 unit、链接或状态不明的文件。
+_pdg_witness_absence(){
+  python3 - "$1" "$2" "$REPO_DIR" <<'PY'
+import hashlib, json, os, re, stat, subprocess, sys, tarfile
+from pathlib import Path
+
+mode, directory, repo = sys.argv[1:]
+snap = Path(directory)
+record = snap / "witness-absence.json"
+unit = Path("/etc/systemd/system/pdg-dotwitness.service")
+env = Path("/etc/privdns-gateway/dotwitness.env")
+module = Path("/opt/pdg-bot/dotwitness.py")
+paths = (unit, env, module)
+links = (Path("/etc/systemd/system/multi-user.target.wants/pdg-dotwitness.service"),
+         Path("/run/systemd/system/multi-user.target.wants/pdg-dotwitness.service"))
+
+def enable_link(path):
+    for parent in reversed(path.parents):
+        try:
+            s = parent.lstat()
+        except FileNotFoundError:
+            return False
+        if not stat.S_ISDIR(s.st_mode):
+            raise ValueError("link parent identity")
+    try:
+        s = path.lstat()
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISLNK(s.st_mode) or os.readlink(path) != str(unit):
+        raise ValueError("foreign enable link")
+    return True
+
+def regular(path):
+    for parent in reversed(path.parents):
+        if not stat.S_ISDIR(parent.lstat().st_mode):
+            raise ValueError("parent identity")
+    try:
+        s = path.lstat()
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISREG(s.st_mode) or s.st_nlink != 1:
+        raise ValueError("file identity")
+    return True
+
+def digest(path):
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for block in iter(lambda: f.read(65536), b""):
+            h.update(block)
+    return h.hexdigest()
+
+def call(*args):
+    p = subprocess.run(["systemctl", *args], capture_output=True, text=True, timeout=20)
+    if p.returncode:
+        raise ValueError("systemctl failed")
+    return p
+
+def state():
+    p = call("show", "pdg-dotwitness", "-p", "LoadState", "-p", "FragmentPath",
+             "-p", "DropInPaths", "-p", "ActiveState", "-p", "UnitFileState", "-p", "Names")
+    if p.stderr:
+        raise ValueError("state stderr")
+    d = {}
+    for line in p.stdout.splitlines():
+        k, v = line.split("=", 1)
+        if k in d:
+            raise ValueError("duplicate state")
+        d[k] = v
+    if set(d) != {"LoadState", "FragmentPath", "DropInPaths", "ActiveState", "UnitFileState", "Names"}:
+        raise ValueError("incomplete state")
+    return d
+
+def absent_state(d):
+    return (d["LoadState"] == "not-found" and d["FragmentPath"] == "" and d["DropInPaths"] == ""
+            and d["ActiveState"] == "inactive" and d["UnitFileState"] == "")
+
+def unique(pairs):
+    d = {}
+    for k, v in pairs:
+        if k in d:
+            raise ValueError("duplicate record")
+        d[k] = v
+    return d
+
+try:
+    if mode == "save":
+        if record.exists() or record.is_symlink():
+            raise ValueError("record already exists")
+        d = state()
+        absent = []
+        if d["LoadState"] == "not-found":
+            if not absent_state(d) or regular(unit):
+                raise ValueError("absence not confirmed")
+            if any(enable_link(p) for p in links):
+                raise ValueError("preexisting enable link")
+            absent = [str(p) for p in paths if not regular(p)]
+        elif d["LoadState"] != "loaded":
+            raise ValueError("unknown preimage")
+        with tarfile.open(snap / "snap.tar.gz", "r:gz") as archive:
+            names = {m.name.rstrip("/").removeprefix("./") for m in archive}
+        if any(p.lstrip("/") in names for p in absent):
+            raise ValueError("archive contradicts absence")
+        body = {"version": 2, "snapshot_sha256": digest(snap / "snap.tar.gz"), "absent": absent}
+        with record.open("x", encoding="utf-8") as f:
+            os.chmod(record, 0o600)
+            json.dump(body, f, sort_keys=True)
+            f.write("\n")
+    elif mode == "restore":
+        if not regular(record):
+            sys.exit(0)  # 旧快照没有提供撤除权限。
+        with record.open("rb") as f:
+            raw = f.read(4097)
+        if len(raw) > 4096:
+            raise ValueError("oversize record")
+        d = json.loads(raw, object_pairs_hook=unique)
+        if (set(d) != {"version", "snapshot_sha256", "absent"} or type(d["version"]) is not int
+                or d["version"] != 2 or d["snapshot_sha256"] != digest(snap / "snap.tar.gz")):
+            raise ValueError("snapshot binding")
+        absent = d["absent"]
+        allowed = [str(p) for p in paths]
+        if (not isinstance(absent, list) or any(type(p) is not str or p not in allowed for p in absent)
+                or len(set(absent)) != len(absent) or (absent and str(unit) not in absent)):
+            raise ValueError("invalid absence list")
+        if not absent:
+            sys.exit(0)
+        present = [p for p in paths if str(p) in absent and regular(p)]
+        s = state()
+        if unit in present:
+            if (s["LoadState"] != "loaded" or s["FragmentPath"] != str(unit) or s["DropInPaths"]
+                    or s["UnitFileState"] not in ("enabled", "disabled")
+                    or s["Names"].split() != ["pdg-dotwitness.service"]):
+                raise ValueError("foreign unit")
+        elif not absent_state(s):
+            raise ValueError("unit state not confirmed")
+        for link in links:
+            enable_link(link)  # 读取失败或非登记目标的链接不获得删除权限。
+        # 先核对全部候选，任何不符都在停服务/删除之前拒绝。
+        for p in present:
+            if p == env:
+                domain = Path("/opt/pdg-bot/dot-domain").read_text().strip()
+                if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+", domain):
+                    raise ValueError("domain identity")
+                expected = ("PDG_DOTWITNESS_SUFFIX=probe." + domain + "\n").encode()
+            else:
+                source = Path(repo) / "deploy/bot" / p.name
+                if not regular(source):
+                    raise ValueError("template unavailable")
+                expected = source.read_bytes()
+            if p.read_bytes() != expected:
+                raise ValueError("managed content differs")
+        if unit in present:
+            call("stop", "pdg-dotwitness")
+            if state()["ActiveState"] != "inactive":
+                raise ValueError("unit did not stop")
+            call("disable", "pdg-dotwitness")
+            if state()["UnitFileState"] != "disabled" or any(enable_link(p) for p in links):
+                raise ValueError("disable not confirmed")
+        for p in present:
+            p.unlink()
+        call("daemon-reload")
+        if not absent_state(state()) or any(regular(p) for p in paths if str(p) in absent):
+            raise ValueError("absence not restored")
+        print("  已撤除快照之后新增的 DoT 证据服务文件(仅限已核验的不存在项)。")
+    else:
+        raise ValueError("unknown operation")
+except (OSError, ValueError, TypeError, KeyError, tarfile.TarError, subprocess.TimeoutExpired) as exc:
+    print("  DoT 证据服务不存在状态未能安全恢复/记录: " + type(exc).__name__, file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
 cmd_snapshot(){
   need_root snapshot; _lock
   _PDG_SNAP_CREATED=""
@@ -1303,6 +1475,10 @@ cmd_snapshot(){
     c_y "❌ 快照打包失败"; rm -f "$d/snap.tar.gz"; rmdir "$d" 2>/dev/null; return 1
   fi
   chmod 600 "$d/snap.tar.gz"
+  if ! _pdg_witness_absence save "$d"; then
+    c_y "❌ DoT 证据服务前像无法确认, 本次快照不用于更新。"
+    return 1
+  fi
   # 元数据写不成 → 整份作废。留下"有归档、没来源"的新格式快照比没有更糟: 列表会把它显示成
   # 旧快照, 而它其实是本次刚拍的, 于是"这份到底是哪次操作之前的"永远说不清了。
   if ! _snap_meta_write "$d" "$ts" "$src" "$op"; then
@@ -1865,12 +2041,17 @@ cmd_rollback(){
     rm -rf "$tmp"; return 1
   fi
   echo "回滚到 $(basename "$target") …"
+  local _witness_absence_rc=0
+  if [[ -e "$target/witness-absence.json" || -L "$target/witness-absence.json" ]]; then
+    _pdg_witness_absence restore "$target" || _witness_absence_rc=$?
+  fi
   if ! _pdg_apply_snapshot_tree "$tree" "$members" /; then
     echo "❌ 快照落盘失败, 系统可能已部分恢复, 请立即检查"; rm -rf "$tmp"; return 1
   fi
   rm -rf "$tmp"
   (( panel_sanitized == 1 )) && c_g "  已净化回滚出的面板临时态 → 关闭"
   local unrestored=()                         # 未能恢复项(内核激活/仓库Git); 非空即"未完全回滚"
+  (( _witness_absence_rc == 0 )) || unrestored+=("DoT 证据服务新增文件未能安全撤除")
   # 恢复策略必须在**任何服务动作之前**定好 —— 内核收敛也算服务动作。
   # 这一步只解析与校验前像(并确认它属于正在回滚的这一份快照), 不碰任何服务。
   #

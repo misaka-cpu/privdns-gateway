@@ -76,7 +76,7 @@ if [[ -n "$BASE" && -f "$BASE" ]]; then
   # 这条边界没有被取消: 集合仍然是逐名精确的, 多一个、少一个都判红(见本节末的区分力自检)。
   # 本轮**精确**多允许一项: _pdg_entry_libdir —— 它只回答"预检自己的依赖从哪来",
   # 与 _pdg_entry_src 同属入口那一组, 不参与退役、不碰 REPO_DIR、不新增绕过参数。
-  want="_pdg_entry_libdir _pdg_entry_src _pdg_kernel_converge _pdg_now_ac _pdg_now_en _pdg_restore_svcstate _pdg_save_svcstate _pdg_set_enable_state _pdg_svc_known _pdg_svc_q _pdg_svcstate_plan _pdg_svcstate_units _pdg_svcstate_valid _update_pin_resolve _update_pin_still "
+  want="_pdg_entry_libdir _pdg_entry_src _pdg_kernel_converge _pdg_now_ac _pdg_now_en _pdg_restore_svcstate _pdg_save_svcstate _pdg_set_enable_state _pdg_svc_known _pdg_svc_q _pdg_svcstate_plan _pdg_svcstate_units _pdg_svcstate_valid _pdg_witness_absence _update_pin_resolve _update_pin_still "
   [[ "$newfn" == "$want" ]] \
     && ok "A2: 新增函数恰好是「前像那一组 + 已批准的入口那一组」, 没有别的: $newfn" \
     || bad "A2: 新增函数超出范围: $newfn"

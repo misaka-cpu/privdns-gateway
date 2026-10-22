@@ -506,6 +506,8 @@ jobs:
         run: bash tests/test-update-faults.sh
       - name: "A-off 更新保留停止态"
         run: python3 tests/test-update-aoff.py
+      - name: Rollback newly added witness
+        run: python3 tests/test-rollback-witness-absence.py
 
       - name: "update 与最新发布的关系四态 (相同幂等/落后升级/领先拒绝/分叉拒绝; 真 git 判祖先)"
         run: bash tests/test-update-release-relation.sh
