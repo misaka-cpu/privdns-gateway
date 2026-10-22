@@ -1,0 +1,272 @@
+--- a/deploy/bot/pdg.sh
++++ b/deploy/bot/pdg.sh
+@@ -1240,6 +1240,178 @@
+ PY
+ }
+ 
++# 仅撤除本次快照明确记录为不存在、当前又与项目模板一致的 witness 文件。
++# 老快照没有此记录时不推断缺失；不删除自定义 unit、链接或状态不明的文件。
++_pdg_witness_absence(){
++  python3 - "$1" "$2" "$REPO_DIR" <<'PY'
++import hashlib, json, os, re, stat, subprocess, sys, tarfile
++from pathlib import Path
++
++mode, directory, repo = sys.argv[1:]
++snap = Path(directory)
++record = snap / "witness-absence.json"
++unit = Path("/etc/systemd/system/pdg-dotwitness.service")
++env = Path("/etc/privdns-gateway/dotwitness.env")
++module = Path("/opt/pdg-bot/dotwitness.py")
++paths = (unit, env, module)
++links = (Path("/etc/systemd/system/multi-user.target.wants/pdg-dotwitness.service"),
++         Path("/run/systemd/system/multi-user.target.wants/pdg-dotwitness.service"))
++
++def enable_link(path):
++    for parent in reversed(path.parents):
++        try:
++            s = parent.lstat()
++        except FileNotFoundError:
++            return False
++        if not stat.S_ISDIR(s.st_mode):
++            raise ValueError("link parent identity")
++    try:
++        s = path.lstat()
++    except FileNotFoundError:
++        return False
++    if not stat.S_ISLNK(s.st_mode) or os.readlink(path) != str(unit):
++        raise ValueError("foreign enable link")
++    return True
++
++def regular(path):
++    for parent in reversed(path.parents):
++        if not stat.S_ISDIR(parent.lstat().st_mode):
++            raise ValueError("parent identity")
++    try:
++        s = path.lstat()
++    except FileNotFoundError:
++        return False
++    if not stat.S_ISREG(s.st_mode) or s.st_nlink != 1:
++        raise ValueError("file identity")
++    return True
++
++def digest(path):
++    h = hashlib.sha256()
++    with path.open("rb") as f:
++        for block in iter(lambda: f.read(65536), b""):
++            h.update(block)
++    return h.hexdigest()
++
++def call(*args):
++    p = subprocess.run(["systemctl", *args], capture_output=True, text=True, timeout=20)
++    if p.returncode:
++        raise ValueError("systemctl failed")
++    return p
++
++def state():
++    p = call("show", "pdg-dotwitness", "-p", "LoadState", "-p", "FragmentPath",
++             "-p", "DropInPaths", "-p", "ActiveState", "-p", "UnitFileState", "-p", "Names")
++    if p.stderr:
++        raise ValueError("state stderr")
++    d = {}
++    for line in p.stdout.splitlines():
++        k, v = line.split("=", 1)
++        if k in d:
++            raise ValueError("duplicate state")
++        d[k] = v
++    if set(d) != {"LoadState", "FragmentPath", "DropInPaths", "ActiveState", "UnitFileState", "Names"}:
++        raise ValueError("incomplete state")
++    return d
++
++def absent_state(d):
++    return (d["LoadState"] == "not-found" and d["FragmentPath"] == "" and d["DropInPaths"] == ""
++            and d["ActiveState"] == "inactive" and d["UnitFileState"] == "")
++
++def unique(pairs):
++    d = {}
++    for k, v in pairs:
++        if k in d:
++            raise ValueError("duplicate record")
++        d[k] = v
++    return d
++
++try:
++    if mode == "save":
++        if record.exists() or record.is_symlink():
++            raise ValueError("record already exists")
++        d = state()
++        absent = []
++        if d["LoadState"] == "not-found":
++            if not absent_state(d) or regular(unit):
++                raise ValueError("absence not confirmed")
++            if any(enable_link(p) for p in links):
++                raise ValueError("preexisting enable link")
++            absent = [str(p) for p in paths if not regular(p)]
++        elif d["LoadState"] != "loaded":
++            raise ValueError("unknown preimage")
++        with tarfile.open(snap / "snap.tar.gz", "r:gz") as archive:
++            names = {m.name.rstrip("/").removeprefix("./") for m in archive}
++        if any(p.lstrip("/") in names for p in absent):
++            raise ValueError("archive contradicts absence")
++        body = {"version": 2, "snapshot_sha256": digest(snap / "snap.tar.gz"), "absent": absent}
++        with record.open("x", encoding="utf-8") as f:
++            os.chmod(record, 0o600)
++            json.dump(body, f, sort_keys=True)
++            f.write("\n")
++    elif mode == "restore":
++        if not regular(record):
++            sys.exit(0)  # 旧快照没有提供撤除权限。
++        with record.open("rb") as f:
++            raw = f.read(4097)
++        if len(raw) > 4096:
++            raise ValueError("oversize record")
++        d = json.loads(raw, object_pairs_hook=unique)
++        if (set(d) != {"version", "snapshot_sha256", "absent"} or type(d["version"]) is not int
++                or d["version"] != 2 or d["snapshot_sha256"] != digest(snap / "snap.tar.gz")):
++            raise ValueError("snapshot binding")
++        absent = d["absent"]
++        allowed = [str(p) for p in paths]
++        if (not isinstance(absent, list) or any(type(p) is not str or p not in allowed for p in absent)
++                or len(set(absent)) != len(absent) or (absent and str(unit) not in absent)):
++            raise ValueError("invalid absence list")
++        if not absent:
++            sys.exit(0)
++        present = [p for p in paths if str(p) in absent and regular(p)]
++        s = state()
++        if unit in present:
++            if (s["LoadState"] != "loaded" or s["FragmentPath"] != str(unit) or s["DropInPaths"]
++                    or s["UnitFileState"] not in ("enabled", "disabled")
++                    or s["Names"].split() != ["pdg-dotwitness.service"]):
++                raise ValueError("foreign unit")
++        elif not absent_state(s):
++            raise ValueError("unit state not confirmed")
++        for link in links:
++            enable_link(link)  # 读取失败或非登记目标的链接不获得删除权限。
++        # 先核对全部候选，任何不符都在停服务/删除之前拒绝。
++        for p in present:
++            if p == env:
++                domain = Path("/opt/pdg-bot/dot-domain").read_text().strip()
++                if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+", domain):
++                    raise ValueError("domain identity")
++                expected = ("PDG_DOTWITNESS_SUFFIX=probe." + domain + "\n").encode()
++            else:
++                source = Path(repo) / "deploy/bot" / p.name
++                if not regular(source):
++                    raise ValueError("template unavailable")
++                expected = source.read_bytes()
++            if p.read_bytes() != expected:
++                raise ValueError("managed content differs")
++        if unit in present:
++            call("stop", "pdg-dotwitness")
++            if state()["ActiveState"] != "inactive":
++                raise ValueError("unit did not stop")
++            call("disable", "pdg-dotwitness")
++            if state()["UnitFileState"] != "disabled" or any(enable_link(p) for p in links):
++                raise ValueError("disable not confirmed")
++        for p in present:
++            p.unlink()
++        call("daemon-reload")
++        if not absent_state(state()) or any(regular(p) for p in paths if str(p) in absent):
++            raise ValueError("absence not restored")
++        print("  已撤除快照之后新增的 DoT 证据服务文件(仅限已核验的不存在项)。")
++    else:
++        raise ValueError("unknown operation")
++except (OSError, ValueError, TypeError, KeyError, tarfile.TarError, subprocess.TimeoutExpired) as exc:
++    print("  DoT 证据服务不存在状态未能安全恢复/记录: " + type(exc).__name__, file=sys.stderr)
++    sys.exit(1)
++PY
++}
++
+ cmd_snapshot(){
+   need_root snapshot; _lock
+   _PDG_SNAP_CREATED=""
+@@ -1303,6 +1475,10 @@
+     c_y "❌ 快照打包失败"; rm -f "$d/snap.tar.gz"; rmdir "$d" 2>/dev/null; return 1
+   fi
+   chmod 600 "$d/snap.tar.gz"
++  if ! _pdg_witness_absence save "$d"; then
++    c_y "❌ DoT 证据服务前像无法确认, 本次快照不用于更新。"
++    return 1
++  fi
+   # 元数据写不成 → 整份作废。留下"有归档、没来源"的新格式快照比没有更糟: 列表会把它显示成
+   # 旧快照, 而它其实是本次刚拍的, 于是"这份到底是哪次操作之前的"永远说不清了。
+   if ! _snap_meta_write "$d" "$ts" "$src" "$op"; then
+@@ -1455,12 +1631,17 @@
+     rm -rf "$tmp"; return 1
+   fi
+   echo "回滚到 $(basename "$target") …"
++  local _witness_absence_rc=0
++  if [[ -e "$target/witness-absence.json" || -L "$target/witness-absence.json" ]]; then
++    _pdg_witness_absence restore "$target" || _witness_absence_rc=$?
++  fi
+   if ! _pdg_apply_snapshot_tree "$tree" "$members" /; then
+     echo "❌ 快照落盘失败, 系统可能已部分恢复, 请立即检查"; rm -rf "$tmp"; return 1
+   fi
+   rm -rf "$tmp"
+   (( panel_sanitized == 1 )) && c_g "  已净化回滚出的面板临时态 → 关闭"
+   local unrestored=()                         # 未能恢复项(内核激活/仓库Git); 非空即"未完全回滚"
++  (( _witness_absence_rc == 0 )) || unrestored+=("DoT 证据服务新增文件未能安全撤除")
+   # daemon-reload 失败必须计入: 后面 enable/start 全建立在它之上, 吞掉它等于谎报回滚成功。
+   systemctl daemon-reload || unrestored+=("daemon-reload")
+   _nft_apply_main >/dev/null 2>&1 || true
+@@ -1490,7 +1671,11 @@
+   fi
+   # 明确列出要重启的 unit, 绝不用 `pdg-*` 之类的通配 —— 那会把救援服务一起重启掉。
+   systemctl restart mosdns pdg-bot pdg-probe81 2>/dev/null || true
+-  systemctl is-enabled pdg-mitm >/dev/null 2>&1 && { systemctl reset-failed pdg-mitm 2>/dev/null; systemctl restart pdg-mitm 2>/dev/null; }   # iOS/WLOC: 清 start-limit + 一并恢复 MITM 服务
++  if [[ "${_update_keep_mitm_stopped:-0}" == 1 ]]; then
++    c_g "WLOC 已关闭, 自动回滚保留更新前的服务停止态(自启设置不变)。"
++  else
++    systemctl is-enabled pdg-mitm >/dev/null 2>&1 && { systemctl reset-failed pdg-mitm 2>/dev/null; systemctl restart pdg-mitm 2>/dev/null; }   # iOS/WLOC: 清 start-limit + 一并恢复 MITM 服务
++  fi
+   systemctl restart systemd-journald 2>/dev/null || true   # journald CanReload=no: 还原封顶需 restart 才生效
+   # 仓库 Git 复位(update 回滚: 让 REPO_DIR 与还原出的旧脚本版本一致); 记录未能恢复项, 不谎报"完全回滚"
+   if [[ -n "$git_ref" ]]; then
+@@ -2123,6 +2308,26 @@
+     c_y "❌ 更新前快照失败, 中止更新(拒绝在无法回滚的前提下继续)。"; return 1
+   fi
+   local snap_dir="$_PDG_SNAP_CREATED"                                    # 精确回滚目标(不靠 index 0 猜)
++  # v1.11.15 兼容补丁: 只为明确关闭、enabled/inactive 的 A-off 保留停止态。
++  # 读不到或不符合不推断为关闭; 不更改 unit、自启和配置, 不替换更新的其余流程。
++  local _update_keep_mitm_stopped=0
++  if python3 -c '
++import json, subprocess, sys
++try:
++    with open("/etc/privdns-gateway/mitm.json", encoding="utf-8") as f:
++        cfg = json.load(f)
++    w = cfg.get("wloc") if isinstance(cfg, dict) else None
++    off = isinstance(w, dict) and w.get("enabled") is False
++    if off:
++        ac = subprocess.run(["systemctl", "is-active", "pdg-mitm"], capture_output=True, text=True, timeout=10)
++        en = subprocess.run(["systemctl", "is-enabled", "pdg-mitm"], capture_output=True, text=True, timeout=10)
++        off = (ac.returncode, ac.stdout, ac.stderr) == (3, "inactive\n", "") and (en.returncode, en.stdout, en.stderr) == (0, "enabled\n", "")
++except (OSError, ValueError, subprocess.TimeoutExpired):
++    off = False
++sys.exit(0 if off else 1)
++' 2>/dev/null; then
++    _update_keep_mitm_stopped=1
++  fi
+   local pre_sha; pre_sha="$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null)"   # 升级前精确提交, 回滚据此复位仓库
+   c_g "拉取最新发布 tag…"
+   [[ -d "$REPO_DIR/.git" ]] || { rm -rf "$REPO_DIR"; git clone -q "$REPO_URL" "$REPO_DIR"; }
+@@ -2164,7 +2369,7 @@
+   install -m644 "$REPO_DIR"/deploy/bot/pdg-health.timer    /etc/systemd/system/ 2>/dev/null || true
+   install -m755 "$REPO_DIR"/deploy/cert/99-reload-cert.deploy-hook.sh     /etc/letsencrypt/renewal-hooks/deploy/99-pdg-cert.sh 2>/dev/null || true
+   # 迁移用"刚装好的新脚本"跑(本进程还是旧 bash, 直接调会用旧版函数 → 新迁移要等下次命令才生效)。
+-  if ! bash /usr/local/bin/pdg __migrate; then
++  if ! _PDG_UPDATE_KEEP_MITM_STOPPED="$_update_keep_mitm_stopped" bash /usr/local/bin/pdg __migrate; then
+     c_y "迁移(__migrate)失败, 回滚到更新前快照…"; cmd_rollback --dir "$snap_dir" --git "$pre_sha"; return 1
+   fi
+   # 二进制: mosdns 与 mihomo 都按 versions.sh 的钉死版本收敛。
+@@ -2194,7 +2399,11 @@
+   fi
+   systemctl enable --now pdg-health.timer >/dev/null 2>&1 || true   # 老装升级时补上健康自检
+   systemctl restart pdg-bot pdg-probe81 2>/dev/null || true
+-  systemctl is-enabled pdg-mitm >/dev/null 2>&1 && { systemctl reset-failed pdg-mitm 2>/dev/null; systemctl restart pdg-mitm 2>/dev/null; }   # iOS/WLOC: 清 start-limit + 载新插件代码, 否则 doctor 判 pdg-mitm 未运行而误回滚
++  if (( _update_keep_mitm_stopped )); then
++    c_g "WLOC 已关闭, 保留本次前像的服务停止态(自启设置不变)。"
++  else
++    systemctl is-enabled pdg-mitm >/dev/null 2>&1 && { systemctl reset-failed pdg-mitm 2>/dev/null; systemctl restart pdg-mitm 2>/dev/null; }   # iOS/WLOC: 清 start-limit + 载新插件代码, 否则 doctor 判 pdg-mitm 未运行而误回滚
++  fi
+   sleep 2
+ 
+   # token 是否已配置(未配则 pdg-bot 不在跑属正常, 不据此回滚)
