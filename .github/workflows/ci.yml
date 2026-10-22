@@ -322,6 +322,9 @@ jobs:
       - name: "内网面板回滚收敛: 派生产物跟随已恢复的模型, 且 render/apply 不假成功"
         run: bash tests/test-lan-rollback-convergence.sh
 
+      - name: "回滚的防火墙结算: 主规则失败照实计入; 白名单补回/重启/状态查询逐次记录, 失败或未取得不报完全回滚"
+        run: bash tests/test-rollback-fw-record.sh
+
       - name: "去广告规则编译/校验/LKG/check 判定(不起 mosdns, 盯落盘之前那一段)"
         run: python3 tests/test-adblock-rules.py
 

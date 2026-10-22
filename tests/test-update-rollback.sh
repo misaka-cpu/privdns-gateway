@@ -242,7 +242,7 @@ _pdg_apply_snapshot_tree(){
 _pdg_ios_verify_tree(){ return 0; }
 # 内网面板的回滚收敛(见 pdg.sh _lan_rollback_converge)。同样是"本壳没抽那一批函数"才打的桩 ——
 # 收敛本身由 tests/test-lan-rollback-convergence.sh 跑真函数覆盖, 这里只要它不影响本壳的判据。
-_lan_rollback_converge(){ return 0; }
+_lan_rollback_converge(){ [[ "${_pdg_rb_fw:-}" == 1 ]] && _pdg_rb_fwrec+=("C:begin n=$(( ${#_pdg_rb_fwrec[@]} + 1 )) t=${EPOCHREALTIME:-} intent=off" "C:end n=$(( ${#_pdg_rb_fwrec[@]} + 2 )) t=${EPOCHREALTIME:-} br=off dis=none rc=0"); return 0; }
 HARNESSEOF
 # --- harness-gen: END ---
 

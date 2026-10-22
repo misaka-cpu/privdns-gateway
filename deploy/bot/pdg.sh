@@ -1710,6 +1710,11 @@ cmd_rollback(){
   need_root rollback; _lock
   # 参数: <序号>(默认0) | --dir <快照目录>(精确指定, 供 update 用) | --git <ref>(回滚后把 REPO_DIR 复位到该提交)
   local idx="" dir="" git_ref="" git_ref_src="" target preserve=0 no_git=0
+  # 本次回滚的防火墙过程记录: 一个开关 + 一份只追加的记录。两个都是**局部**变量 —— 只在这一次
+  # cmd_rollback 及它调到的函数里可见, 返回即失效; 回滚以外的调用者看到的开关为空, 那几个函数
+  # 对它们的行为与输出不变。记录在本函数末尾结算一次(见"防火墙这一段的结算")。
+  local _pdg_rb_fw=1
+  local -a _pdg_rb_fwrec=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --dir) dir="${2:-}"; shift 2 || { echo "--dir 缺参数"; return 1; };;
@@ -1873,7 +1878,12 @@ cmd_rollback(){
   _pdg_svcstate_plan "$target" || true
   # daemon-reload 失败必须计入: 后面 enable/start 全建立在它之上, 吞掉它等于谎报回滚成功。
   systemctl daemon-reload || unrestored+=("daemon-reload")
-  _nft_apply_main >/dev/null 2>&1 || true
+  # 主规则加载的结果单独计入。原来是 `>/dev/null 2>&1 || true`: 加载失败照样报"✅ 已回滚",
+  # 而那份输出(nft 的报错、白名单补回失败的警告)一起被吞了。入口仍只有 _nft_apply_main ——
+  # 它在主规则之后补回白名单的顺序不变; 失败之后后面的恢复步骤照常做, 只是不再报完全回滚。
+  local _fw_main_rc=0
+  _nft_apply_main || _fw_main_rc=$?
+  (( _fw_main_rc == 0 )) || unrestored+=("防火墙主规则加载(nft 返回 $_fw_main_rc)")
   # v1.6.0: mihomo 是唯一内核。无论快照记录的是 mihomo 还是迁移前的 singbox, 一律起 mihomo ——
   # config.json 是核无关数据模型, mihomo 总能从它渲染。并清掉快照可能带回来的 sing-box 残留。
   # shellcheck source=/dev/null
@@ -1930,10 +1940,207 @@ cmd_rollback(){
   if ! _lan_rollback_converge; then
     unrestored+=("内网面板派生产物")
   fi
-  if [[ ${#unrestored[@]} -eq 0 ]]; then
+  # ── 防火墙这一段的结算(主规则加载 + 内网面板出站白名单) ──────────────────────
+  # 记录由 _lan_nft_reapply / _lan_apply_proxy / _lan_rollback_converge 在回滚模式下逐条追加
+  # (只追加不改写), 只在这里读一遍。完整性按**实际经过的分支**核:
+  #   · ① 主规则加载之后那一次补回: 必有一对开始/结束; 收敛的开始/结束两条必有;
+  #   · ② 反代入口只在收敛记下"进了反代入口"时才应有; ③ 只在 ② 记下"进入后续分支"时才应有,
+  #     且必须是 ② 记下的那一条(指纹相同 → 补回, 不同 → 重启);
+  #   · 每条结束记录的结论要能由它自己的读数重新推出; 收敛自报的返回值要与它真实的返回值
+  #     (上面是否计入了"内网面板派生产物")一致。
+  # 缺条、多条、字段缺失或取值不在登记集合内、字段之间对不上、序号不连续、整份为空, 一律记
+  # "白名单记录不完整" —— 不能拿"没有失败条目"当成功。任何一次过程失败、未取得、推断依据未取得
+  # 或记录不完整都不报"✅"、返回 1, 后来的成功不抹掉此前的记录。非零只表示"本次回滚未能确认
+  # 完全成功", 不等于终态已确认仍然错误。
+  local _fw_e _fw_k _fw_pt _fw_need _fw_nn _fw_got _fw_q _fw_qv _fw_qc _fw_svc _fw_want _fw_res
+  local _fw_nx _fw_tag _fw_desc _fw_obs _fw_line _fw_i=0 _fw_st=R1 _fw_int=off _fw_sres="" _fw_conv=0
+  local _fw_inc="" _fw_last="" _fw_term="" _fw_ok=1
+  local -a _fw_tok=() _fw_fail=() _fw_unc=() _fw_late=() _fw_why=() _fw_all=()
+  local -A _fw_f=()
+  for _fw_e in "${unrestored[@]}"; do [[ "$_fw_e" == "内网面板派生产物" ]] && _fw_conv=1; done
+  (( ${#_pdg_rb_fwrec[@]} > 0 )) || _fw_inc="记录意外为空"
+  for _fw_e in "${_pdg_rb_fwrec[@]}"; do
+    [[ -z "$_fw_inc" ]] || break
+    _fw_i=$(( _fw_i + 1 )); _fw_f=()
+    if [[ "$_fw_e" == *$'\t'* || "$_fw_e" == *$'\n'* ]]; then _fw_inc="第 $_fw_i 条格式无效"; break; fi
+    IFS=' ' read -r -a _fw_tok <<< "$_fw_e"
+    _fw_pt="${_fw_tok[0]:-}"
+    for _fw_k in "${_fw_tok[@]:1}"; do
+      if [[ "$_fw_k" =~ ^([a-z]+)=([^=]*)$ && -z "${_fw_f[${BASH_REMATCH[1]}]+x}" ]]; then
+        _fw_f[${BASH_REMATCH[1]}]="${BASH_REMATCH[2]}"
+      else
+        _fw_inc="第 $_fw_i 条字段无效或重复"; break
+      fi
+    done
+    [[ -z "$_fw_inc" ]] || break
+    case "$_fw_pt" in
+      R:begin|P:begin|S:begin) _fw_need="n t";;
+      R:end) _fw_need="n t svc q ls file load res";;
+      P:end) _fw_need="n t svc q ls res dg";;
+      S:end) _fw_need="n t nd esp file rs post res";;
+      C:begin) _fw_need="n t intent";;
+      C:end) _fw_need="n t br dis rc";;
+      *) _fw_inc="第 $_fw_i 条类别未登记($_fw_pt)"; break;;
+    esac
+    _fw_nn=0; _fw_got=0
+    for _fw_k in $_fw_need; do
+      _fw_nn=$(( _fw_nn + 1 )); [[ -n "${_fw_f[$_fw_k]+x}" ]] && _fw_got=$(( _fw_got + 1 ))
+    done
+    if (( _fw_got != _fw_nn || ${#_fw_f[@]} != _fw_nn )); then _fw_inc="第 $_fw_i 条字段缺失或多余"; break; fi
+    if [[ "${_fw_f[n]}" != "$_fw_i" ]]; then _fw_inc="序号不连续(第 $_fw_i 条记的是 ${_fw_f[n]})"; break; fi
+    if [[ ! "${_fw_f[t]}" =~ ^[0-9]+([.,][0-9]+)?$ ]]; then _fw_inc="第 $_fw_i 条观察时刻无效"; break; fi
+    _fw_res="${_fw_f[res]:-}"
+    if [[ -n "${_fw_f[q]+x}" ]]; then
+      # 由读数重新推出服务状态, 与记录自报的那一个对照
+      _fw_q="${_fw_f[q]}"; _fw_qv="${_fw_q%/*}"; _fw_qc="${_fw_q##*/}"
+      if [[ ! "$_fw_q" =~ ^[A-Za-z-]+/[0-9]+$ || ! "${_fw_f[ls]}" =~ ^[A-Za-z-]+$ ]]; then
+        _fw_inc="第 $_fw_i 条查询读数无效"; break
+      fi
+      _fw_svc=unk
+      if [[ "$_fw_q" == active/0 ]]; then _fw_svc=run
+      elif [[ "$_fw_q" == inactive/3 || "$_fw_q" == failed/3 ]]; then _fw_svc=stop
+      elif [[ "${_fw_f[ls]}" == not-found ]] \
+           && { [[ "$_fw_qv" == not-found ]] || [[ "$_fw_qc" != 0 && ( "$_fw_qv" == inactive || "$_fw_qv" == failed ) ]]; }; then
+        _fw_svc=stop
+      fi
+      if [[ "${_fw_f[svc]}" != "$_fw_svc" ]]; then _fw_inc="第 $_fw_i 条服务状态与读数对不上"; break; fi
+    fi
+    _fw_want=x
+    case "$_fw_pt" in
+      R:end)
+        _fw_want=""
+        case "${_fw_f[file]}/${_fw_f[load]}" in
+          nonempty/ok|nonempty/fail) [[ "$_fw_qc" == 0 ]] && _fw_want=x;;
+          nonempty/none) [[ "$_fw_qc" != 0 ]] && _fw_want=x;;
+          empty/none|absent/none|unk/none) _fw_want=x;;
+        esac
+        if [[ -n "$_fw_want" ]]; then
+          case "$_fw_svc/${_fw_f[load]}" in
+            run/ok) _fw_want=reapplied;;
+            */fail) _fw_want=loadfail;;
+            run/none) if [[ "${_fw_f[file]}" == unk ]]; then _fw_want=needunk; else _fw_want=needfile; fi;;
+            stop/none) _fw_want=notneeded;;
+            *) _fw_want=unk;;
+          esac
+          [[ "$_fw_res" == "$_fw_want" ]] || _fw_want=""
+        fi;;
+      P:end)
+        _fw_want=""
+        if [[ "$_fw_qc" == 0 ]]; then
+          [[ "$_fw_res" == enter && ( "${_fw_f[dg]}" == same || "${_fw_f[dg]}" == diff ) ]] && _fw_want=x
+        elif [[ "${_fw_f[dg]}" == - ]]; then
+          [[ "$_fw_svc" == stop && "$_fw_res" == skipstop ]] && _fw_want=x
+          [[ "$_fw_svc" != stop && "$_fw_res" == skipunk ]] && _fw_want=x
+        fi;;
+      S:end)
+        _fw_want=""
+        case "${_fw_f[esp]}/${_fw_f[file]}/${_fw_f[rs]}" in
+          ok/*/fail|bad/*/fail|unk/*/fail) [[ "${_fw_f[post]}" == - ]] && _fw_want=restartfail;;
+          ok/*/ok|bad/*/ok|unk/*/ok)
+            if [[ "${_fw_f[post]}" =~ ^[A-Za-z-]+/[0-9]+$ ]]; then
+              if [[ "${_fw_f[nd]}" == no && "${_fw_f[esp]}" == ok && "${_fw_f[file]}" == nonempty && "${_fw_f[post]}" == active/0 ]]; then
+                _fw_want=restarted
+              else
+                _fw_want=restartunk
+              fi
+            fi;;
+        esac
+        case "${_fw_f[file]}" in nonempty|empty|absent|unk) ;; *) _fw_want="";; esac
+        [[ "${_fw_f[nd]}" =~ ^[A-Za-z-]+$ && "$_fw_res" == "$_fw_want" ]] || _fw_want="";;
+      C:begin) [[ "${_fw_f[intent]}" == on || "${_fw_f[intent]}" == off ]] || _fw_want="";;
+      C:end)
+        _fw_want=""
+        case "${_fw_f[br]}/${_fw_f[dis]}" in
+          off/fail|renderfail/-) _fw_want=1;;
+          off/none|off/ok) _fw_want=0;;
+          apply/-) if [[ "$_fw_sres" == restartfail ]]; then _fw_want=1; else _fw_want=0; fi;;
+        esac
+        [[ -n "$_fw_want" && "${_fw_f[rc]}" == "$_fw_want" && "${_fw_f[rc]}" == "$_fw_conv" ]] || _fw_want="";;
+    esac
+    if [[ -z "$_fw_want" ]]; then _fw_inc="第 $_fw_i 条($_fw_pt)自相矛盾或与真实返回值对不上"; break; fi
+    # 按实际经过的分支推进: 不在这张表里的下一条, 就是多出来的或与分支不符的那一条
+    _fw_nx=""; _fw_tag=""
+    case "$_fw_st/$_fw_pt" in
+      R1/R:begin) _fw_nx=R2;;
+      R2/R:end) _fw_nx=C1; _fw_tag="①主规则之后的补回";;
+      C1/C:begin) _fw_nx=C2; _fw_int="${_fw_f[intent]}";;
+      C2/P:begin) [[ "$_fw_int" == on ]] && _fw_nx=P2;;
+      P2/P:end)
+        _fw_tag="②反代入口"
+        case "$_fw_res/${_fw_f[dg]}" in enter/same) _fw_nx=X1;; enter/diff) _fw_nx=S1;; skip*/-) _fw_nx=C3;; esac;;
+      X1/R:begin) _fw_nx=X2;;
+      X2/R:end) _fw_nx=C3; _fw_tag="③指纹相同时的补回";;
+      S1/S:begin) _fw_nx=S2;;
+      S2/S:end) _fw_nx=C3; _fw_tag="③重启 pdg-lan"; _fw_sres="$_fw_res";;
+      C2/C:end) case "$_fw_int/${_fw_f[br]}" in on/renderfail|off/off) _fw_nx=END;; esac;;
+      C3/C:end) [[ "${_fw_f[br]}" == apply ]] && _fw_nx=END;;
+    esac
+    if [[ -z "$_fw_nx" ]]; then _fw_inc="第 $_fw_i 条($_fw_pt)与实际经过的分支不符"; break; fi
+    _fw_st="$_fw_nx"
+    [[ -n "$_fw_tag" ]] || continue
+    # 结论: 每一条都单独列, 写明第几条、在哪个调用点; 只追加, 后来的成功不抹掉前面的
+    _fw_obs=unk
+    case "$_fw_res" in
+      reapplied) _fw_desc="已补回"; _fw_obs=run;;
+      notneeded) _fw_desc="本观察时点无需补回(pdg-lan 确认不在运行)"; _fw_obs=stop;;
+      loadfail) _fw_desc="补回加载失败"; _fw_obs="${_fw_f[svc]}";;
+      needfile) _fw_desc="需要补回但所需文件缺失或为空"; _fw_obs=run;;
+      needunk) _fw_desc="需要补回, 文件状态未取得"; _fw_obs=run;;
+      unk) _fw_desc="是否需要补回未取得";;
+      skipstop) _fw_desc="pdg-lan 确认不在运行, 未进入后续分支"; _fw_obs=stop;;
+      skipunk) _fw_desc="pdg-lan 状态未取得而跳过";;
+      enter) _fw_desc="进入后续分支"; _fw_obs="${_fw_f[svc]}";;
+      restarted) _fw_desc="pdg-lan 已重启; 按有效 unit 推断白名单已随重启加载, 未独立观测"; _fw_obs=run;;
+      restartunk) _fw_desc="pdg-lan 已重启, 白名单是否随之加载未确认"
+                  [[ "${_fw_f[post]}" == active/0 ]] && _fw_obs=run;;
+      restartfail) _fw_desc="pdg-lan 重启失败";;
+    esac
+    _fw_line="第 $_fw_i 条记录($_fw_tag, 时刻 ${_fw_f[t]}): $_fw_desc"
+    _fw_all+=("$_fw_line")
+    case "$_fw_res/$_fw_tag/$_fw_obs" in
+      reapplied/*|restarted/*|skipstop/*|notneeded/①*|enter/*/run)
+        if [[ "$_fw_res" == reapplied || "$_fw_res" == restarted ]] && (( ${#_fw_fail[@]} + ${#_fw_unc[@]} > 0 )); then
+          _fw_late+=("$_fw_line")
+        fi;;
+      loadfail/*|needfile/*|restartfail/*) _fw_fail+=("$_fw_line"); _fw_why+=("$_fw_desc(第 $_fw_i 条)");;
+      *) _fw_unc+=("$_fw_line"); _fw_why+=("$_fw_desc(第 $_fw_i 条)");;
+    esac
+    _fw_last="第 $_fw_i 条记录(时刻 ${_fw_f[t]})|$_fw_desc|$_fw_obs"
+  done
+  if [[ -z "$_fw_inc" && "$_fw_st" != END ]]; then
+    case "$_fw_st" in
+      R1|R2) _fw_inc="应有的记录缺失(①主规则之后的补回)";;
+      C1|C2|C3) _fw_inc="应有的记录缺失(收敛的开始或结束)";;
+      P2) _fw_inc="应有的记录缺失(②反代入口的结束)";;
+      *) _fw_inc="应有的记录缺失(③)";;
+    esac
+  fi
+  _fw_desc="${_fw_last#*|}"; _fw_desc="${_fw_desc%|*}"
+  if [[ -n "$_fw_inc" ]]; then
+    _fw_unc+=("白名单记录不完整: $_fw_inc"); _fw_why+=("白名单记录不完整($_fw_inc)")
+  elif [[ "${_fw_last##*|}" == unk ]]; then
+    _fw_term="截至${_fw_last%%|*}: $_fw_desc"; _fw_why+=("终态未取得")
+  fi
+  (( ${#_fw_fail[@]} == 0 && ${#_fw_unc[@]} == 0 )) && [[ -z "$_fw_term" ]] || _fw_ok=0
+  if (( _fw_ok == 1 )); then
+    echo "  内网面板出站白名单: 截至${_fw_last%%|*}: $_fw_desc"
+  else
+    c_y "  内网面板出站白名单: 本次回滚未能确认完全成功(非零只表示未能确认, 不代表终态已确认仍然错误)"
+    for _fw_e in "${_fw_all[@]}"; do c_y "    记录: $_fw_e"; done
+    for _fw_e in "${_fw_fail[@]}"; do c_y "    过程失败: $_fw_e"; done
+    for _fw_e in "${_fw_unc[@]}"; do c_y "    过程未确认: $_fw_e"; done
+    for _fw_e in "${_fw_late[@]}"; do c_y "    后续成功: $_fw_e"; done
+    if [[ -n "$_fw_term" ]]; then
+      c_y "    终态未取得: $_fw_term"
+    elif [[ -z "$_fw_inc" ]]; then
+      c_y "    终态: 截至${_fw_last%%|*}: $_fw_desc"
+    fi
+  fi
+  if [[ ${#unrestored[@]} -eq 0 && "$_fw_ok" == 1 ]]; then
     echo "✅ 已回滚并重启服务"
   else
-    c_y "⚠️ 已回滚配置/服务, 但以下项未能恢复(未完全回滚): ${unrestored[*]}"
+    [[ ${#unrestored[@]} -eq 0 ]] || c_y "⚠️ 已回滚配置/服务, 但以下项未能恢复(未完全回滚): ${unrestored[*]}"
+    [[ "$_fw_ok" == 1 ]] || c_y "⚠️ 已回滚配置/服务, 但内网面板出站白名单这一段未能确认完全回滚: ${_fw_why[*]}"
     return 1
   fi
 }
@@ -7338,6 +7545,88 @@ _lan_artifacts_digest(){
 # 偏保守 —— 静默地少一次重启, 比多一次重启危险得多。
 _lan_apply_proxy(){
   local before="${1:-}"
+  # 回滚模式(开关见 _lan_nft_reapply 上方): 入口判断、指纹比较、补回或重启与下面原文逐一相同,
+  # 一个动作都不多做; 只把"为什么跳过 / 进了哪条分支 / 重启的结果与推断依据"逐条记下来。
+  # 入口要分清"确认不在运行"与"状态没取到" —— 原文的 is-active --quiet 把两者都当成跳过。
+  # 重启那条路上白名单由 unit 的 ExecStartPre 加载, 这里**不独立观测**, 只按 systemd 实际生效的
+  # unit 配置推断: NeedDaemonReload=no(加载的就是盘上那一份)、ExecStartPre 里有一条不忽略失败的
+  # `…/nft -f <白名单文件>`、重启时文件非空、重启返回 0 且随后确认在运行。缺一项就记"未确认"。
+  if [[ "${_pdg_rb_fw:-}" == 1 ]]; then
+    local _q _v _c _ls=- _svc=unk _x _nd=QUERY-FAILED _esp=unk _fs=unk _seg _post=-
+    local _err _rc _prop _seen _valid
+    local -a _fields=()
+    _pdg_rb_fwrec+=("P:begin n=$(( ${#_pdg_rb_fwrec[@]} + 1 )) t=${EPOCHREALTIME:-}")
+    # FD 3 把 stdout 送到外层, 内层只收 stderr; 分隔符在命令退出后追加,
+    # 保留末尾换行以拒绝多行读数。不借用会截行/去空白的 _pdg_svc_q。
+    _q="$( { _err="$( _rc=0; systemctl is-active pdg-lan 2>&1 1>&3 || _rc=$?; printf '\036%s' "$_rc" )"; printf '\037%s' "$_err"; } 3>&1 )"
+    _c="${_q##*$'\036'}"; _q="${_q%$'\036'*}"
+    _err="${_q##*$'\037'}"; _v="${_q%$'\037'*}"; _v="${_v%$'\n'}"
+    if [[ -n "$_err" || ! "$_c" =~ ^[0-9]+$ ]] || ! _pdg_svc_known is-active "$_v"; then _v=QUERY-FAILED; fi
+    if [[ "$_v/$_c" == active/0 ]]; then _svc=run
+    elif [[ "$_v/$_c" == inactive/3 || "$_v/$_c" == failed/3 ]]; then _svc=stop
+    elif [[ "$_v" == not-found ]] || [[ "$_c" != 0 && ( "$_v" == inactive || "$_v" == failed ) ]]; then
+      _q="$( { _err="$( _rc=0; systemctl show -p LoadState --value pdg-lan 2>&1 1>&3 || _rc=$?; printf '\036%s' "$_rc" )"; printf '\037%s' "$_err"; } 3>&1 )"
+      _rc="${_q##*$'\036'}"; _q="${_q%$'\036'*}"
+      _err="${_q##*$'\037'}"; _x="${_q%$'\037'*}"; _x="${_x%$'\n'}"
+      if [[ "$_rc" == 0 && -z "$_err" && "$_x" =~ ^[a-z-]+$ ]]; then _ls="$_x"; else _ls=QUERY-FAILED; fi
+      [[ "$_ls" == not-found ]] && _svc=stop
+    fi
+    if [[ "$_c" != 0 ]]; then
+      if [[ "$_svc" == stop ]]; then _x=skipstop; else _x=skipunk; fi
+      _pdg_rb_fwrec+=("P:end n=$(( ${#_pdg_rb_fwrec[@]} + 1 )) t=${EPOCHREALTIME:-} svc=$_svc q=$_v/$_c ls=$_ls res=$_x dg=-")
+      return 0
+    fi
+    if [[ -n "$before" && "$before" == "$(_lan_artifacts_digest)" ]]; then
+      _pdg_rb_fwrec+=("P:end n=$(( ${#_pdg_rb_fwrec[@]} + 1 )) t=${EPOCHREALTIME:-} svc=$_svc q=$_v/$_c ls=$_ls res=enter dg=same")
+      _lan_nft_reapply
+      return 0
+    fi
+    _pdg_rb_fwrec+=("P:end n=$(( ${#_pdg_rb_fwrec[@]} + 1 )) t=${EPOCHREALTIME:-} svc=$_svc q=$_v/$_c ls=$_ls res=enter dg=diff")
+    _pdg_rb_fwrec+=("S:begin n=$(( ${#_pdg_rb_fwrec[@]} + 1 )) t=${EPOCHREALTIME:-}")
+    for _prop in NeedDaemonReload ExecStartPre; do
+      _q="$( { _err="$( _rc=0; systemctl show -p "$_prop" --value pdg-lan 2>&1 1>&3 || _rc=$?; printf '\036%s' "$_rc" )"; printf '\037%s' "$_err"; } 3>&1 )"
+      _rc="${_q##*$'\036'}"; _q="${_q%$'\036'*}"
+      _err="${_q##*$'\037'}"; _x="${_q%$'\037'*}"; _x="${_x%$'\n'}"
+      [[ "$_rc" == 0 && -z "$_err" && -n "$_x" && "$_x" != *$'\n'* ]] || continue
+      if [[ "$_prop" == NeedDaemonReload ]]; then
+        case "$_x" in yes|no) _nd="$_x";; esac
+        continue
+      fi
+      _esp=bad
+      # 只接受一个命令块。实际可执行文件、完整 argv 和失败策略都必须各出现一次且精确相等。
+      [[ "$_x" =~ ^\{[^{}]*\}$ ]] || continue
+      IFS=';' read -r -a _fields <<< "${_x:1:${#_x}-2}"
+      _seen=""; _valid=1
+      for _seg in "${_fields[@]}"; do
+        _seg="${_seg#"${_seg%%[![:space:]]*}"}"; _seg="${_seg%"${_seg##*[![:space:]]}"}"
+        case "$_seg" in
+          path=*) [[ "$_seen" != *p* && "$_seg" == path=/usr/sbin/nft ]] || { _valid=0; break; }; _seen+=p;;
+          argv\[\]=*) [[ "$_seen" != *a* && "$_seg" == "argv[]=/usr/sbin/nft -f $LAN_NFT_CONF" ]] || { _valid=0; break; }; _seen+=a;;
+          ignore_errors=*) [[ "$_seen" != *i* && "$_seg" == ignore_errors=no ]] || { _valid=0; break; }; _seen+=i;;
+          *) continue;;
+        esac
+      done
+      # 验证整个列表, 包括关键字段之后的重复项; 不能在凑齐三项时提前放行。
+      [[ "$_valid" == 1 && "${#_seen}" == 3 ]] && _esp=ok
+    done
+    if [[ -s "$LAN_NFT_CONF" ]]; then _fs=nonempty
+    elif [[ -e "$LAN_NFT_CONF" ]]; then _fs=empty
+    elif [[ ! -L "$LAN_NFT_CONF" && -d "${LAN_NFT_CONF%/*}" && -x "${LAN_NFT_CONF%/*}" ]]; then _fs=absent
+    fi
+    if systemctl restart pdg-lan >/dev/null 2>&1; then
+      _q="$( { _err="$( _rc=0; systemctl is-active pdg-lan 2>&1 1>&3 || _rc=$?; printf '\036%s' "$_rc" )"; printf '\037%s' "$_err"; } 3>&1 )"
+      _c="${_q##*$'\036'}"; _q="${_q%$'\036'*}"
+      _err="${_q##*$'\037'}"; _v="${_q%$'\037'*}"; _v="${_v%$'\n'}"
+      if [[ -n "$_err" || ! "$_c" =~ ^[0-9]+$ ]] || ! _pdg_svc_known is-active "$_v"; then _v=QUERY-FAILED; fi
+      _post="$_v/$_c"
+      if [[ "$_nd" == no && "$_esp" == ok && "$_fs" == nonempty && "$_post" == active/0 ]]; then _x=restarted; else _x=restartunk; fi
+      _pdg_rb_fwrec+=("S:end n=$(( ${#_pdg_rb_fwrec[@]} + 1 )) t=${EPOCHREALTIME:-} nd=$_nd esp=$_esp file=$_fs rs=ok post=$_post res=$_x")
+      return 0
+    fi
+    _pdg_rb_fwrec+=("S:end n=$(( ${#_pdg_rb_fwrec[@]} + 1 )) t=${EPOCHREALTIME:-} nd=$_nd esp=$_esp file=$_fs rs=fail post=- res=restartfail")
+    c_y "⚠️ pdg-lan 重启失败 —— 新的反代配置与出站白名单都还没生效。"
+    return 1
+  fi
   systemctl is-active --quiet pdg-lan 2>/dev/null || return 0
   if [[ -n "$before" && "$before" == "$(_lan_artifacts_digest)" ]]; then
     _lan_nft_reapply
@@ -7368,6 +7657,13 @@ _lan_rollback_converge(){
   local intent active=0
   intent="$(_lan_intent)"
   systemctl is-active --quiet pdg-lan 2>/dev/null && active=1
+  # 回滚模式(开关见 _lan_nft_reapply 上方)下只多记两条分支标记: 开始(意图)与结束(走了哪条分支、
+  # 是否进了反代入口、本函数返回什么)。cmd_rollback 拿它们核对 ② ③ 那几条该不该有 ——
+  # 完整性不靠记录自己说自己全不全。动作与返回值一律不变。
+  local _lan_rb=0 _lan_ci=off _lan_dis=none
+  [[ "${_pdg_rb_fw:-}" == 1 ]] && _lan_rb=1
+  [[ "$intent" == 1 ]] && _lan_ci=on
+  (( _lan_rb )) && _pdg_rb_fwrec+=("C:begin n=$(( ${#_pdg_rb_fwrec[@]} + 1 )) t=${EPOCHREALTIME:-} intent=$_lan_ci")
 
   if [[ "$intent" == 1 ]]; then
     # 渲染**之前**取指纹: 回滚收敛在绝大多数机器上会渲出一份与现网逐字节相同的产物
@@ -7376,13 +7672,16 @@ _lan_rollback_converge(){
     if ! _lan_render; then
       c_y "⚠️ LAN 回滚不完整: 派生产物没能按恢复出来的面板表重新生成(第一失败点: 渲染/落盘)。"
       c_y "   面板表与 profile 已经回滚到位; 反代仍在用回滚前的配置。手工补: sudo pdg lan render"
+      (( _lan_rb )) && _pdg_rb_fwrec+=("C:end n=$(( ${#_pdg_rb_fwrec[@]} + 1 )) t=${EPOCHREALTIME:-} br=renderfail dis=- rc=1")
       return 1
     fi
     if ! _lan_apply_proxy "$_lan_d0"; then
       c_y "⚠️ LAN 回滚不完整: 产物已按面板表更新, 但反代没能重启(第一失败点: 重启 pdg-lan)。"
       c_y "   此刻磁盘是新的、进程还用着旧的。手工补: sudo systemctl restart pdg-lan"
+      (( _lan_rb )) && _pdg_rb_fwrec+=("C:end n=$(( ${#_pdg_rb_fwrec[@]} + 1 )) t=${EPOCHREALTIME:-} br=apply dis=- rc=1")
       return 1
     fi
+    (( _lan_rb )) && _pdg_rb_fwrec+=("C:end n=$(( ${#_pdg_rb_fwrec[@]} + 1 )) t=${EPOCHREALTIME:-} br=apply dis=- rc=0")
     return 0
   fi
 
@@ -7392,9 +7691,12 @@ _lan_rollback_converge(){
   if (( active == 1 )) || [[ -e "$LAN_UNIT" || -s "$LAN_NFT_CONF" ]]; then
     if ! _lan_disable >/dev/null; then
       c_y "⚠️ LAN 回滚不完整: 面板已回到停用态, 但反代没能停下来(第一失败点: 停用 pdg-lan)。"
+      (( _lan_rb )) && _pdg_rb_fwrec+=("C:end n=$(( ${#_pdg_rb_fwrec[@]} + 1 )) t=${EPOCHREALTIME:-} br=off dis=fail rc=1")
       return 1
     fi
+    _lan_dis=ok
   fi
+  (( _lan_rb )) && _pdg_rb_fwrec+=("C:end n=$(( ${#_pdg_rb_fwrec[@]} + 1 )) t=${EPOCHREALTIME:-} br=off dis=$_lan_dis rc=0")
   return 0
 }
 
@@ -7693,6 +7995,48 @@ _nft_apply_main(){
 _lan_nft_reapply(){
   # 路径走 $LAN_NFT_CONF, 不写死 —— 同一个文件有两个真源, 迟早对不上; 而且写死之后沙箱
   # 测试根本指不到假根, 于是这个函数在测试里永远走"文件不存在"那条早退, 什么都没验到。
+  #
+  # 回滚模式(只由 cmd_rollback 的局部开关 _pdg_rb_fw 打开; 回滚以外的调用者看到的是空, 走下面
+  # 原文): 加载与否的判定、警告、返回值都与原文相同 —— 文件非空且 is-active 退出码为 0 才加载。
+  # 多出来的只有只读查询与记账, 而且两件事分开判: "要不要补回"只看 pdg-lan 此刻在不在运行
+  # (状态词与退出码配对成立才算确认), 文件状态只决定"能不能补回"。状态没取到就记"未取得",
+  # 不由文件缺失推出"无需"。每次进来追加一条开始、一条结束, 不改写已有记录。
+  if [[ "${_pdg_rb_fw:-}" == 1 ]]; then
+    local _q _v _c _ls=- _svc=unk _fs=unk _ld=none _res=unk _err _rc _x
+    _pdg_rb_fwrec+=("R:begin n=$(( ${#_pdg_rb_fwrec[@]} + 1 )) t=${EPOCHREALTIME:-}")
+    _q="$( { _err="$( _rc=0; systemctl is-active pdg-lan 2>&1 1>&3 || _rc=$?; printf '\036%s' "$_rc" )"; printf '\037%s' "$_err"; } 3>&1 )"
+    _c="${_q##*$'\036'}"; _q="${_q%$'\036'*}"
+    _err="${_q##*$'\037'}"; _v="${_q%$'\037'*}"; _v="${_v%$'\n'}"
+    if [[ -n "$_err" || ! "$_c" =~ ^[0-9]+$ ]] || ! _pdg_svc_known is-active "$_v"; then _v=QUERY-FAILED; fi
+    if [[ "$_v/$_c" == active/0 ]]; then _svc=run
+    elif [[ "$_v/$_c" == inactive/3 || "$_v/$_c" == failed/3 ]]; then _svc=stop
+    elif [[ "$_v" == not-found ]] || [[ "$_c" != 0 && ( "$_v" == inactive || "$_v" == failed ) ]]; then
+      # not-found 不靠退出码判(systemd 255 对不存在的 unit 报 inactive 并返回 4), 只认取得的 LoadState
+      _q="$( { _err="$( _rc=0; systemctl show -p LoadState --value pdg-lan 2>&1 1>&3 || _rc=$?; printf '\036%s' "$_rc" )"; printf '\037%s' "$_err"; } 3>&1 )"
+      _rc="${_q##*$'\036'}"; _q="${_q%$'\036'*}"
+      _err="${_q##*$'\037'}"; _x="${_q%$'\037'*}"; _x="${_x%$'\n'}"
+      if [[ "$_rc" == 0 && -z "$_err" && "$_x" =~ ^[a-z-]+$ ]]; then _ls="$_x"; else _ls=QUERY-FAILED; fi
+      [[ "$_ls" == not-found ]] && _svc=stop
+    fi
+    if [[ -s "$LAN_NFT_CONF" ]]; then _fs=nonempty
+    elif [[ -e "$LAN_NFT_CONF" ]]; then _fs=empty
+    elif [[ ! -L "$LAN_NFT_CONF" && -d "${LAN_NFT_CONF%/*}" && -x "${LAN_NFT_CONF%/*}" ]]; then _fs=absent
+    fi
+    if [[ "$_fs" == nonempty && "$_c" == 0 ]]; then
+      if nft -f "$LAN_NFT_CONF" 2>/dev/null; then _ld=ok; else _ld=fail; fi
+    fi
+    case "$_svc/$_ld" in
+      run/ok) _res=reapplied;;
+      */fail) _res=loadfail;;
+      run/none) if [[ "$_fs" == unk ]]; then _res=needunk; else _res=needfile; fi;;
+      stop/none) _res=notneeded;;
+    esac
+    _pdg_rb_fwrec+=("R:end n=$(( ${#_pdg_rb_fwrec[@]} + 1 )) t=${EPOCHREALTIME:-} svc=$_svc q=$_v/$_c ls=$_ls file=$_fs load=$_ld res=$_res")
+    [[ "$_ld" == fail ]] || return 0
+    c_y "⚠️ 内网面板的出站白名单没能重新加载 —— 反代此刻**能连到内网任意地址**。"
+    c_y "   跑 sudo systemctl restart pdg-lan 补上。"
+    return 0
+  fi
   [[ -s "$LAN_NFT_CONF" ]] || return 0
   systemctl is-active --quiet pdg-lan 2>/dev/null || return 0
   nft -f "$LAN_NFT_CONF" 2>/dev/null && return 0

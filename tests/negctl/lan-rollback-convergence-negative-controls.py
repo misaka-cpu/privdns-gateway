@@ -20,7 +20,7 @@
   ② 收敛函数改成空转 return 0           —— C 组该转红: 模型回去了产物没跟上;
   ③ _lan_render 落盘失败洗成 return 0   —— A 组该转红, 这正是修掉的那个假成功;
   ④ 摘掉失败时的前像退回                —— "半套状态"那两条该转红;
-  ⑤ 恢复 `_lan_apply_proxy || true`     —— B 组该转红, 这是被吞掉的失败;
+  ⑤ 恢复 `_lan_apply_proxy "$_lan_d0" || true`     —— B 组该转红, 这是被吞掉的失败;
   ⑥ 摘掉停用方向的收敛分支              —— C3 该转红(只顾启用方向是最容易漏的那半);
   ⑦ 门四只报"缺少"不报"多出"            —— 漂移里最危险的那个方向该转红;
   ⑧ 门四把"读不到"判成 fail             —— 假红也是坏判据: 把"没跑成"说成"不一致";
@@ -101,7 +101,7 @@ CONV_BODY_ANCHOR = """_lan_rollback_converge(){
   local intent active=0"""
 RENDER_FAIL = """    c_y "❌ 派生产物落盘失败 → 整笔退回本次调用前的状态。"
     _lan_restore_pre "$pre\""""
-APPLY_SYNC = """  _lan_apply_proxy || return 1
+APPLY_SYNC = """  _lan_apply_proxy "$_lan_d0" || return 1
   c_g "✅ 反代配置、出站白名单、DNS 劫持集与分流已同步。\""""
 DISABLED_BRANCH = """  if (( active == 1 )) || [[ -e "$LAN_UNIT" || -s "$LAN_NFT_CONF" ]]; then
     if ! _lan_disable >/dev/null; then"""
@@ -118,8 +118,8 @@ MUTATIONS = [
        '    rm -rf "$stg"; return 0\n  fi\n  rm -rf "$stg"\n  return 0', 1)], "A"),
     ("④ 摘掉失败时的前像退回", PDG,
      [(RENDER_FAIL, '    c_y "❌ 派生产物落盘失败 → 整笔退回本次调用前的状态。"', 1)], "半套状态"),
-    ("⑤ 恢复 `_lan_apply_proxy || true`", PDG,
-     [(APPLY_SYNC, '  _lan_apply_proxy || true\n  c_g "✅ 反代配置、出站白名单、DNS 劫持集与分流已同步。"', 1)], "B"),
+    ("⑤ 恢复 `_lan_apply_proxy \"$_lan_d0\" || true`", PDG,
+     [(APPLY_SYNC, '  _lan_apply_proxy "$_lan_d0" || true\n  c_g "✅ 反代配置、出站白名单、DNS 劫持集与分流已同步。"', 1)], "B"),
     ("⑥ 摘掉停用方向的收敛分支", PDG,
      [(DISABLED_BRANCH, '  if false; then\n    if ! _lan_disable >/dev/null; then', 1)], "C3"),
     ("⑦ 门四只报缺少、不报多出", CHK,

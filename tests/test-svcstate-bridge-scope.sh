@@ -46,8 +46,12 @@ if [[ -n "$BASE" && -f "$BASE" ]]; then
   # 本轮**精确**多允许一项: _update_mosdns_preflight 只改了"依赖从哪来"(见
   # docs/BRIDGE-ENTRY.md 的依赖来源一节), 预检强度、锁、选版、快照与回滚对象都没动。
   # 其余边界一个字不放宽 —— 多一个 / 少一个 / 无关注释三条区分力对照仍按原样跑。
-  exp=" cmd_snapshot cmd_rollback _update_mosdns_preflight cmd_update"
-  [[ "$changed" == "$exp" ]] && ok "A1: 基线里已有的函数只有 cmd_snapshot / cmd_rollback / cmd_update / _update_mosdns_preflight 被改过" \
+  # 再**精确**多登记三项(S-2 桥接回滚的防火墙部分), 按基线里的出现顺序接在后面:
+  # _lan_apply_proxy / _lan_rollback_converge / _lan_nft_reapply —— 只在 cmd_rollback 的局部开关
+  # 打开时记下白名单补回、相关重启与状态查询的结果; 开关关闭时(回滚以外的调用者)行为与原文相同。
+  # 仍是整串精确相等: 不改成子集匹配, 也不兼容旧的四项串。
+  exp=" cmd_snapshot cmd_rollback _update_mosdns_preflight cmd_update _lan_apply_proxy _lan_rollback_converge _lan_nft_reapply"
+  [[ "$changed" == "$exp" ]] && ok "A1: 基线里已有的函数只有 cmd_snapshot / cmd_rollback / _update_mosdns_preflight / cmd_update / _lan_apply_proxy / _lan_rollback_converge / _lan_nft_reapply 被改过" \
     || bad "A1: 被改过的函数是「$changed」, 预期「$exp」"
   # 新增的顶层函数必须**恰好**是下面这份允许集合 —— 判据是精确相等, 不是前缀泛放行,
   # 也不从当前候选自动生成期望(那等于让被测对象自己定义"正确")。
