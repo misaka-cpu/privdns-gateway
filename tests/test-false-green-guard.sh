@@ -76,12 +76,38 @@ else
   bad "非 0 返回被吞掉: rc=$rc $(head -c 200 <<<"$out")"
 fi
 
-# ── 4. 未注入时: 现行用例必须全绿, 且一条 command not found 都不能有 ──
+# ── 4. 现行用例必须全绿; 只识别已核实的缺依赖自检, 不放过其它缺调用 ──
+# test-platform-install 的 8c 故意撤掉 _retire_precheck, 并要求判为 INVALID。
+# 只允许它的一条精确原始记录, 且必须同时看到 8c 通过; 不按含糊的“记录/预期”字样过滤。
+unexpected_missing(){
+  local output="$1" line allowed=0 control=0
+  local marker='[OK]   8c: 缺必需依赖 → 登记为「外壳执行无效」, 没有冒充失败传播通过'
+  local pattern='^[[:space:]]{6}\[记录\] miss-fail: 原始退出码=1 调用=0笔 目标被调用=0 stderr=\[[^][]+: line [0-9]+: _retire_precheck: command not found \]$'
+  grep -qxF "$marker" <<<"$output" && control=1
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    if [[ "$control" == 1 && "$allowed" == 0 && "$line" =~ $pattern ]]; then
+      allowed=1
+    else
+      printf '%s\n' "$line"
+    fi
+  done <<<"$(grep -i 'command not found\|未找到命令' <<<"$output")"
+  if [[ "$control" == 1 && "$allowed" != 1 ]]; then echo '8c 缺少精确的故障注入原始记录'; fi
+}
+_intent='      [记录] miss-fail: 原始退出码=1 调用=0笔 目标被调用=0 stderr=[/test.sh: line 457: _retire_precheck: command not found ]'
+_marker='[OK]   8c: 缺必需依赖 → 登记为「外壳执行无效」, 没有冒充失败传播通过'
+[[ -z "$(unexpected_missing "$_intent"$'\n'"$_marker")" ]] \
+  && ok "缺依赖自检的精确记录 + INVALID 断言通过 → 单独识别" || bad "缺依赖自检识别失败"
+for _sample in "$_intent" "$_marker" "$_intent"$'\n'"$_marker"$'\n''/test.sh: line 1: other: command not found' "$_intent"$'\n'"$_intent"$'\n'"$_marker"; do
+  [[ -n "$(unexpected_missing "$_sample")" ]] \
+    && ok "反向对照: 缺证明、缺原始记录、额外缺调用或重复记录仍拒绝" || bad "缺调用被误放行"
+done
 out="$(bash "$TARGET" 2>&1)"; rc=$?
 [[ "$rc" == 0 ]] && ok "现行 test-platform-install.sh 全绿(rc=0)" || bad "现行用例未通过: rc=$rc"
-grep -qi 'command not found\|未找到命令' <<<"$out" \
-  && bad "现行用例里仍有 command not found: $(grep -i 'command not found\|未找到命令' <<<"$out" | head -2)" \
-  || ok "现行用例执行期间没有 command not found"
+_unexpected="$(unexpected_missing "$out")"
+[[ -z "$_unexpected" ]] \
+  && ok "现行用例没有未经核实的缺调用; 8c 的刻意 INVALID 单独结算" \
+  || bad "现行用例有未经核实的缺调用: $_unexpected"
 grep -q '^\[FAIL\]' <<<"$out" && bad "现行用例有 FAIL 行" || ok "现行用例没有 FAIL 行"
 n="$(grep -c '^\[OK\]' <<<"$out")"
 [[ "$n" -ge 30 ]] && ok "现行用例断言数 $n 条(不是零断言绿)" || bad "断言数只有 $n 条, 疑似整段被跳过"
