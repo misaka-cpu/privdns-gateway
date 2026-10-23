@@ -205,7 +205,10 @@ run_platform(){   # $1=目标平台 $2=fail|nofail $3=场景目录 [$4=被测 pd
     echo '_sb_panel_managed_on(){ return 1; }'
     echo 'pdg_write_unit(){ printf "[Unit]\n" > "$2"; return 0; }; pdg_unit_mihomo(){ echo "[Unit]"; }'
     echo '_pdg_drop_singbox_files(){ :; }; _pdg_singbox_is_ours(){ return 1; }'
-    echo '_lan_rollback_converge(){ return 0; }; _nft_apply_main(){ return 0; }; _snap_meta_commit(){ echo ""; }'
+    # 防火墙本身由定向测试覆盖; 成功替身也必须提供真实回滚结算要求的过程记录。
+    echo '_lan_rollback_converge(){ [[ "${_pdg_rb_fw:-}" == 1 ]] && _pdg_rb_fwrec+=("C:begin n=$(( ${#_pdg_rb_fwrec[@]} + 1 )) t=${EPOCHREALTIME:-} intent=off" "C:end n=$(( ${#_pdg_rb_fwrec[@]} + 2 )) t=${EPOCHREALTIME:-} br=off dis=none rc=0"); return 0; }'
+    echo '_nft_apply_main(){ [[ "${_pdg_rb_fw:-}" == 1 ]] && _pdg_rb_fwrec+=("R:begin n=$(( ${#_pdg_rb_fwrec[@]} + 1 )) t=${EPOCHREALTIME:-}" "R:end n=$(( ${#_pdg_rb_fwrec[@]} + 2 )) t=${EPOCHREALTIME:-} svc=stop q=inactive/3 ls=- file=absent load=none res=notneeded"); return 0; }'
+    echo '_snap_meta_commit(){ echo ""; }'
     echo '_pdg_ios_verify_tree(){ return 0; }'
     echo '_plat_write_profile(){ printf "PROFILE-%s\n" "$1" > /etc/privdns-gateway/profile.env; return 0; }'
     echo 'migrate_probe81_public(){ return 0; }'
