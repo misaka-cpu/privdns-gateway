@@ -114,6 +114,8 @@ if ! declare -F migrate_wloc_retire >/dev/null; then
   bad "pdg.sh 里没有 migrate_wloc_retire —— 老装升级没有退役迁移可跑"
   echo; echo "[SUM] OK=$pass FAIL=$nfail"; exit 1
 fi
+# shellcheck source=tests/helpers/wloc-retire-caller.sh
+source "$HERE/helpers/wloc-retire-caller.sh" || exit 1
 
 # ── 现场构造 ────────────────────────────────────────────────────────────────
 scene(){   # $1=名字  $2=enabled/disabled/never
@@ -340,5 +342,6 @@ fi
   || bad "K: 服务被停掉之后没恢复 —— 只恢复文件不算零半状态"
 
 echo
+retire_caller_check && ok "真实调用方前像与函数闭包完整" || bad "调用方夹具/闭包无效"
 echo "[SUM] OK=$pass FAIL=$nfail"
 [[ $nfail -eq 0 ]]

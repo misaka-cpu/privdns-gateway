@@ -66,6 +66,8 @@ for _fn in _retire_svc_stopped _retire_core_has_mitm _retire_undo_push _retire_u
 done
 _RETIRE_UNDO=()
 _RETIRE_TMP=""
+# shellcheck source=tests/helpers/wloc-retire-caller.sh
+source "$HERE/helpers/wloc-retire-caller.sh" || exit 1
 
 # ── 造一台**退役前的完整机器** ───────────────────────────────────────────────
 full_machine(){   # $1 = SSID(可空)
@@ -199,5 +201,6 @@ out="$( ( exec 9>"$PDG_LOCKFILE"; flock -n 9; migrate_wloc_retire ) 2>&1 )"; rc4
 sbox_rm
 
 echo
+retire_caller_check && ok "真实调用方前像与函数闭包完整" || bad "调用方夹具/闭包无效"
 echo "[SUM] OK=$pass FAIL=$nfail"
 [[ $nfail -eq 0 ]]

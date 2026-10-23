@@ -110,6 +110,8 @@ for _fn in _retire_svc_stopped _retire_core_has_mitm _retire_undo_push _retire_u
   declare -F "$_fn" >/dev/null || bad "pdg.sh 里抽不出 $_fn"
 done
 _RETIRE_UNDO=()
+# shellcheck source=tests/helpers/wloc-retire-caller.sh
+source "$HERE/helpers/wloc-retire-caller.sh" || exit 1
 # 真的那一份改名留着: schema 迁移本身是真跑的(它有自己的原子性), 这里只在需要时让它失败。
 # `declare -f f` 打印的是 `f () \n{ … }`, 去掉函数名再拼上新名字就是一份同体的副本。
 # 恢复文件那一步: 指名的目标可以按需失败(它是产品函数, 这里包一层, 不改被测逻辑)。
@@ -548,5 +550,6 @@ done
 
 unset TMPDIR
 echo
+retire_caller_check && ok "真实调用方前像与函数闭包完整" || bad "调用方夹具/闭包无效"
 echo "[SUM] OK=$pass FAIL=$nfail"
 [[ $nfail -eq 0 ]]
