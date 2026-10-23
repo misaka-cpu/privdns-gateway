@@ -285,6 +285,8 @@ echo "══ 十. 运行态查询失败必须**单独**被抓住 ══"
 # `case "$rest" in QUERY-FAILED*)`, 而 rest 的第一段是**自启查询的 rc**, 不是运行值 ——
 # 于是这一格永远检测不到。判据必须逐字段解析。
 parent_run(){   # $1=场景目录; 用真实 flock + 真实 fd 9 继承跑一次门
+  # flock 子进程退出后, PID 命名空间中的 /proc/locks 可能不显示它留下的锁。
+  # 从继承的 fd 9 的 fdinfo 只读观察 FLOCK; 读取失败不当作零把锁。
   local d="$1"
   { echo 'set -uo pipefail'
     echo "SC_DIR=\"$d/sc\"; SC_LOG=\"$d/sc.log\"; : > \"\$SC_LOG\""
@@ -296,7 +298,7 @@ parent_run(){   # $1=场景目录; 用真实 flock + 真实 fd 9 继承跑一次
     echo "_pdg_save_svcstate \"$d/snap\" >/dev/null || { echo SAVE_FAILED; exit 1; }"
     echo "PDG_UPDATE_SVCSTATE=\"$d/snap/svcstate.tsv\" bash \"$d/child.sh\""
     echo 'rc=$?'
-    echo "printf 'LOCKS_AFTER=%s\n' \"\$(grep -c \":\$(stat -c %i \"$d/lock\") \" /proc/locks 2>/dev/null || echo 0)\""
+    echo "if _lc=\$(awk '\$1==\"lock:\" && \$3==\"FLOCK\" && \$4==\"ADVISORY\" && \$5==\"WRITE\" {n++} END{print n+0}' /proc/self/fdinfo/9); then printf 'LOCKS_AFTER=%s\\n' \"\$_lc\"; else echo LOCKS_AFTER=unobtained; fi"
     echo 'echo "GATE_RC=$rc"'
   } > "$d/parent.sh"
   bash "$d/parent.sh" 2>&1
@@ -346,7 +348,7 @@ mk_child "$d"
   echo "_pdg_save_svcstate \"$d/snap\" >/dev/null"
   echo "PDG_UPDATE_SVCSTATE=\"$d/snap/svcstate.tsv\" bash \"$d/child.sh\""
   echo 'rc=$?'
-  echo "printf 'LOCKS_AFTER=%s\n' \"\$(grep -c \":\$(stat -c %i \"$d/lock\") \" /proc/locks 2>/dev/null || echo 0)\""
+  echo "if _lc=\$(awk '\$1==\"lock:\" && \$3==\"FLOCK\" && \$4==\"ADVISORY\" && \$5==\"WRITE\" {n++} END{print n+0}' /proc/self/fdinfo/9); then printf 'LOCKS_AFTER=%s\\n' \"\$_lc\"; else echo LOCKS_AFTER=unobtained; fi"
   echo 'echo "GATE_RC=$rc"'
 } > "$d/parent.sh"
 before="$(lockcnt "$d/lock")"; o="$(bash "$d/parent.sh" 2>&1)"
@@ -396,7 +398,7 @@ run_with(){   # $1=场景目录 $2=src $3=场景布置脚本(可空) ; 真 flock
     echo "_pdg_save_svcstate \"$d/snap\" >/dev/null"
     echo "PDG_UPDATE_SVCSTATE=\"$d/snap/svcstate.tsv\" bash \"$d/child.sh\""
     echo 'rc=$?'
-    echo "printf 'LOCKS_AFTER=%s\n' \"\$(grep -c \":\$(stat -c %i \"$d/lock\") \" /proc/locks 2>/dev/null || echo 0)\""
+    echo "if _lc=\$(awk '\$1==\"lock:\" && \$3==\"FLOCK\" && \$4==\"ADVISORY\" && \$5==\"WRITE\" {n++} END{print n+0}' /proc/self/fdinfo/9); then printf 'LOCKS_AFTER=%s\\n' \"\$_lc\"; else echo LOCKS_AFTER=unobtained; fi"
     echo 'echo "GATE_RC=$rc"'
   } > "$d/parent.sh"
   bash "$d/parent.sh" 2>&1
