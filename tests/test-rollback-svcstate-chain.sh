@@ -137,8 +137,8 @@ prodfns(){
   echo 'pdg_write_unit(){ printf "[Unit]\n" > "$2"; return 0; }'
   echo 'pdg_unit_mihomo(){ echo "[Unit]"; }'
   echo '_pdg_drop_singbox_files(){ :; }; _pdg_singbox_is_ours(){ return 1; }'
-  echo '_lan_rollback_converge(){ return 0; }'
-  echo '_nft_apply_main(){ return 0; }'
+  echo '_lan_rollback_converge(){ [[ "${_pdg_rb_fw:-}" == 1 ]] && _pdg_rb_fwrec+=("C:begin n=$(( ${#_pdg_rb_fwrec[@]} + 1 )) t=${EPOCHREALTIME:-} intent=off" "C:end n=$(( ${#_pdg_rb_fwrec[@]} + 2 )) t=${EPOCHREALTIME:-} br=off dis=none rc=0"); return 0; }'
+  echo '_nft_apply_main(){ [[ "${_pdg_rb_fw:-}" == 1 ]] && _pdg_rb_fwrec+=("R:begin n=$(( ${#_pdg_rb_fwrec[@]} + 1 )) t=${EPOCHREALTIME:-}" "R:end n=$(( ${#_pdg_rb_fwrec[@]} + 2 )) t=${EPOCHREALTIME:-} svc=stop q=inactive/3 ls=- file=absent load=none res=notneeded"); return 0; }'
   echo '_snap_meta_commit(){ echo ""; }'
   echo '_pdg_ios_verify_tree(){ return 0; }'
   # ↓ 本轮涉及的编排: 全部用产品原文
