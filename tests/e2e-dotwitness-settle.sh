@@ -6,6 +6,8 @@
 # 用一个替身服务冒名 pdg-dotwitness(与生产 unit 同样的 StartLimitIntervalSec=300 / StartLimitBurst=5 /
 # PartOf=mosdns.service / Restart=on-failure), 执行 pdg.sh 里按标记抽出的 _dw_settle 原文;
 # systemctl / ss / /proc 全是真的, systemctl 外面只包一层记录(数动作次数), 调用照样落到真 systemctl。
+# 记录放在 PATH 上(一个先记一行再 exec 真 systemctl 的包装脚本), 不用 shell 函数: 产品经 timeout 调 systemctl(S-5),
+# timeout 直接 exec 外部程序, 函数包装记不到; 每格的记录还要非空且每行都认得(acts_strict), 空记录不能冒充"零动作"。
 #   D0 健康 ⇒ 核验通过, reset-failed / start 都是 0 次
 #   D1 真实 start-limit-hit ⇒ reset-failed 1 次 + start 1 次, 恢复后 active、5399 归这个 unit 的 cgroup
 #      (375: 对已核实健康的替身连续发正常 restart 触限, 不再用"进程秒退 + 自动重启"; D1 / D1b 只用核过退出码的读取,
@@ -39,6 +41,9 @@ ok "前提: root + 真 systemd + 没有同名 unit + 5399 空闲"
 
 BOX="$(mktemp -d)"
 HOLD=""
+SC_REAL="$(type -P systemctl)"; [[ "$SC_REAL" == /* ]] || die "找不到真 systemctl"
+mkdir -p "$BOX/shim" && printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "$PDG_E2E_SCLOG"\nexec %q "$@"\n' "$SC_REAL" > "$BOX/shim/systemctl" \
+  && chmod 755 "$BOX/shim/systemctl" || die "记录用的 systemctl 包装写不出来"
 cleanup(){
   if [[ -n "$HOLD" ]]; then kill "$HOLD" 2>/dev/null; wait "$HOLD" 2>/dev/null; HOLD=""; fi
   timeout 30 systemctl stop "$U" >/dev/null 2>&1
@@ -117,25 +122,20 @@ held_by(){ local l; l="$(listen_pids)"; [[ $'\n'"$l"$'\n' == *$'\n'"$1"$'\n'* ]]
 # 跑一次 _dw_settle 原文。$1=格。留下 out / log; 返回生成脚本的退出码。
 settle(){
   local d="$BOX/$1"; mkdir -p "$d"; : > "$d/log"
-  { echo 'set -uo pipefail'; printf 'LOG=%q\n' "$d/log"
+  { echo 'set -uo pipefail'
     cat "$BOX/color.sh"
-    echo 'systemctl(){ printf "%s\n" "$*" >> "$LOG"; command systemctl "$@"; }'
+    printf 'export PDG_E2E_SCLOG=%q PATH=%q\n' "$d/log" "$BOX/shim:$PATH"
     cat "$BLK"
     echo '_dw_settle --after-migrate; echo "SETTLE_RC=$?"'; } > "$d/run.sh"
   timeout 60 bash "$d/run.sh" > "$d/out" 2>&1
 }
-acts(){ # reset-failed / start / 其它改状态的动作
-  local l="$BOX/$1/log"
-  printf '%s/%s/%s' "$(grep -cx "reset-failed $U" "$l")" "$(grep -cx "start $U" "$l")" \
-    "$(grep -cE '^(enable|disable|restart|stop|kill|mask|unmask|reload)( |$)' "$l")"
-}
 chk(){ # $1=格 $2=说明 $3=期望文字 $4=期望动作
   local c="$1" rc
   settle "$c"; rc=$?
-  if [[ "$rc" == 0 ]] && grep -q '^SETTLE_RC=0$' "$BOX/$c/out" && grep -qF -- "$3" "$BOX/$c/out" && [[ "$(acts "$c")" == "$4" ]]; then
-    ok "$c: $2(动作 $(acts "$c"))"
+  if [[ "$rc" == 0 ]] && grep -q '^SETTLE_RC=0$' "$BOX/$c/out" && grep -qF -- "$3" "$BOX/$c/out" && [[ "$(acts_strict "$c")" == "$4" ]]; then
+    ok "$c: $2(动作 $(acts_strict "$c"))"
   else
-    bad "$c: $2 —— 退出 $rc, 动作 $(acts "$c")(期望 $4), 输出: $(grep -v '^SETTLE_RC' "$BOX/$c/out" | head -3)"
+    bad "$c: $2 —— 退出 $rc, 动作 $(acts_strict "$c")(期望 $4), 输出: $(grep -v '^SETTLE_RC' "$BOX/$c/out" | head -3)"
   fi
 }
 

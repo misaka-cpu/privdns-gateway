@@ -7,7 +7,7 @@ AS_EXPECTED —— 多红、少红都是 MISMATCH。先跑一次不变异的基�
 测试自己没跑完(没有末尾的"通过 N, 失败 M", 或 M 与 [FAIL] 行数对不上, 或报了"未执行")记 INVALID,
 不拿它的"表现"下结论。
 
-不改仓库本身; 副本放在临时目录, 结束后删除。按项目惯例 tests/negctl/ 是本地手动门, 不进 CI。
+不改仓库本身; 副本放在 tmpguard 登记的临时目录, 结束后删除(PDG_KEEP_TMP=1 时按 tmpguard 的约定保留)。按项目惯例 tests/negctl/ 是本地手动门, 不进 CI。
 用法: python3 -I -B tests/negctl/retire-final-negative-controls.py [--out <留证目录>] [--only <变异名>]...
 """
 import argparse
@@ -16,7 +16,9 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import tmpguard  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 PDG_REL = os.path.join("deploy", "bot", "pdg.sh")
@@ -153,7 +155,7 @@ def main():
     a = ap.parse_args()
     if a.out:
         os.mkdir(a.out)
-    base = tempfile.mkdtemp(prefix="pdg-negctl-retire-final.")
+    base = tmpguard.mkdtemp(prefix="pdg-negctl-retire-final.")
     lines = []
 
     def emit(s):
@@ -223,7 +225,7 @@ def main():
         if a.out:
             with open(os.path.join(a.out, "VERDICTS.txt"), "w", encoding="utf-8") as f:
                 f.write("\n".join(lines) + "\n")
-        shutil.rmtree(base, ignore_errors=True)
+        tmpguard.cleanup(base)
 
 
 if __name__ == "__main__":
