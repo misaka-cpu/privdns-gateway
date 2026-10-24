@@ -6216,6 +6216,8 @@ migrate_dotwitness(){
 #     reset 成功后 start 至多一次。不提高限额、不重试恢复、不 enable / restart、不杀占用者、
 #     不推断原因 —— 报告里只写观察到的事实与两条命令的退出码。
 #   · 不复用 _dw_svc_id / _dw_kv / ⑦b 里的 _dw_listener_pids: 它们不看退出码, 查询失败会被读成"空"。
+#   · 有总时长上界: 每次外部查询 / 动作都经 _dws_t(timeout), 单次上限与本步剩余总时长(写死 120 s)取小;
+#     总时长用完就不再调用。超时与其它非 0 一样按"未取得 / 动作失败"处理, 报告写明超出时限。
 _dw_settle(){
   [[ $# -eq 1 && "$1" == --after-migrate ]] || return 0
   local r=0
@@ -6226,14 +6228,26 @@ _dw_settle(){
   return 0
 }
 
+# 带时限执行一次外部命令。$1=单次上限(秒) 其余=命令。截止点 _dws_end 由 _dws_run 定下(SECONDS 计);
+# 剩余时长用完就不执行, 直接按超时返回 124。TERM 之后再给 2 s, 仍不退就 KILL。
+_dws_t(){
+  local cap="$1" left; shift
+  left=$(( _dws_end - SECONDS ))
+  (( left > 0 )) || return 124
+  (( left < cap )) && cap=$left
+  timeout -k 2 "$cap" "$@"
+}
+# 退出码的说法: 124 是 timeout 的超时码, 单独写明; 其余照原样"退出 N"。
+_dws_rcw(){ if (( $1 == 124 )); then printf '超出本步时限(退出 124)'; else printf '退出 %s' "$1"; fi; }
+
 # 一次状态查询。返回 0=有效 1=查询失败 2=输出无效; 值写进调用方的 d_*, 原因写进 d_why。
 # 先看退出码: 非 0 时已经输出的内容一概不采信。再核格式: 七个键各恰一行、没有多余的键、取值在已知集合里。
 _dws_show(){
   local raw rc line k v seen=" "
   d_load="" d_ufs="" d_act="" d_sub="" d_res="" d_nr="" d_inv="" d_why=""
-  raw="$(systemctl show pdg-dotwitness -p LoadState -p UnitFileState -p ActiveState -p SubState \
+  raw="$(_dws_t 10 systemctl show pdg-dotwitness -p LoadState -p UnitFileState -p ActiveState -p SubState \
          -p Result -p NRestarts -p InvocationID --no-pager 2>/dev/null)"; rc=$?
-  if (( rc != 0 )); then d_why="systemctl show 退出 $rc, 已输出的内容不采信"; return 1; fi
+  if (( rc != 0 )); then d_why="systemctl show $(_dws_rcw "$rc"), 已输出的内容不采信"; return 1; fi
   while IFS= read -r line; do
     [[ -n "$line" ]] || continue
     if [[ "$line" != ?*=* ]]; then d_why="systemctl show 输出无效(有无法解析的行)"; return 2; fi
@@ -6284,8 +6298,8 @@ _dws_listen(){
   local raw rc line f hit rest p
   local -a fs
   d_pids=()
-  raw="$(ss -lunp 2>/dev/null)"; rc=$?
-  if (( rc != 0 )); then d_why="ss 退出 $rc"; return 1; fi
+  raw="$(_dws_t 10 ss -lunp 2>/dev/null)"; rc=$?
+  if (( rc != 0 )); then d_why="ss $(_dws_rcw "$rc")"; return 1; fi
   while IFS= read -r line; do
     read -ra fs <<< "$line"; hit=0
     for f in "${fs[@]}"; do [[ "$f" == 127.0.0.1:5399 ]] && hit=1; done
@@ -6300,14 +6314,15 @@ _dws_listen(){
 }
 
 # d_pids 归不归 pdg-dotwitness 管: 监听进程 /proc/<pid>/cgroup 的 0:: 行与 unit 的 ControlGroup 比。
-# 返回 0=有一个归它管 1=未取得 2=全部取得且都不是它的(d_saw 记看到的 pid:cgroup)。
+# 返回 0=全部归它管 1=未取得 2=全部取得且都不是它的 3=混合: 有归它管的, 也有外来的(d_saw 记外来的 pid:cgroup)。
 # 每个监听者都要读到, 不在第一个匹配处提前返回: 否则排在后面的读不到根本不会发生(短路未读),
 # 排在前面的读不到也会被后面的匹配盖掉。任何一个读不到 ⇒ 归属未取得, 不报健康。
+# 混合不算归属成立: 端口上还有外来监听者, 发到 5399 的查询未必落到证据端。
 _dws_own(){
   local cg rc p raw l pc match=0 fail=""
   d_saw=""
-  cg="$(systemctl show pdg-dotwitness -p ControlGroup --value 2>/dev/null)"; rc=$?
-  if (( rc != 0 )) || [[ "$cg" != /* ]]; then d_why="取不到 pdg-dotwitness 的 ControlGroup(退出 $rc)"; return 1; fi
+  cg="$(_dws_t 10 systemctl show pdg-dotwitness -p ControlGroup --value 2>/dev/null)"; rc=$?
+  if (( rc != 0 )) || [[ "$cg" != /* ]]; then d_why="取不到 pdg-dotwitness 的 ControlGroup($(_dws_rcw "$rc"))"; return 1; fi
   d_cg="$cg"
   for p in "${d_pids[@]}"; do
     if ! raw="$(cat "/proc/$p/cgroup" 2>/dev/null)"; then fail="$fail $p"; continue; fi
@@ -6317,12 +6332,15 @@ _dws_own(){
     if [[ "$pc" == "$cg" ]]; then match=1; else d_saw="$d_saw $p:$pc"; fi
   done
   if [[ -n "$fail" ]]; then d_why="读不到 127.0.0.1:5399 监听进程的 cgroup(pid:$fail)"; return 1; fi
-  (( match )) && return 0
+  if (( match )); then
+    [[ -z "$d_saw" ]] && return 0
+    return 3
+  fi
   return 2
 }
 
-# 有界观察: 次数与间隔写死(最多 10 次, 间隔 0.5 s), 不做成配置。每次观察按完整健康条件判:
-# loaded + enabled + active / running + 5399 归它管; 连续两次成立且是同一个 InvocationID 才算成立。
+# 有界观察: 次数与间隔写死(最多 10 次, 间隔 0.5 s), 不做成配置; 每次查询另受 _dws_t 的时限约束。每次观察按完整健康条件判:
+# loaded + enabled + active / running + 5399 的监听者全部归它管; 连续两次成立且是同一个 InvocationID 才算成立。
 # 有效但不满足 ⇒ 有效未就绪, 继续观察; 任何一次读取失败或输出无效立刻结束并判未取得 —— 后面的成功读数冲不掉它。
 # 返回 0=成立 1=未取得(d_why) 2=确认未就绪(d_lastk 是最后一次观察的类别, d_last 是描述)。
 _dws_watch(){
@@ -6345,6 +6363,9 @@ _dws_watch(){
     if (( r == 2 )); then
       d_lastk=foreign; d_last="最后一次观察 active 但 127.0.0.1:5399 由别的进程持有(unit: $d_cg; 监听者:$d_saw)"; prev=""; continue
     fi
+    if (( r == 3 )); then
+      d_lastk=mixed; d_last="最后一次观察 active 但 127.0.0.1:5399 除 pdg-dotwitness 外还有别的进程在监听(unit: $d_cg; 外来监听者:$d_saw)"; prev=""; continue
+    fi
     [[ -n "$prev" && "$prev" == "$d_inv" ]] && return 0
     if [[ -n "$prev" ]]; then
       d_lastk=churn; d_last="10 次观察里没有连续两次是同一个实例(InvocationID 在变)"
@@ -6359,6 +6380,7 @@ _dws_watch(){
 _dws_run(){
   local d_load d_ufs d_act d_sub d_res d_nr d_inv d_why="" d_cg="" d_saw="" d_last="" d_lastk="" r h
   local -a d_pids=()
+  local _dws_end=$(( SECONDS + 120 ))          # 本步总时长上界(写死, 不做成配置)
   _dws_show; r=$?
   if (( r != 0 )); then c_y "  ⚠️  DoT 证据端: 状态未取得($d_why), 本步不做任何动作。"; return 0; fi
   if [[ "$d_load" == masked || "$d_ufs" == disabled || "$d_ufs" == masked || "$d_ufs" == masked-runtime ]]; then
@@ -6374,6 +6396,7 @@ _dws_run(){
     elif (( r == 1 )); then c_y "  ⚠️  DoT 证据端: 状态未取得($d_why), 本步不做任何动作。"
     elif [[ "$d_lastk" == nolisten ]]; then c_y "  ⚠️  DoT 证据端: 服务 active, 但 127.0.0.1:5399 没有监听; 本步不处理。"
     elif [[ "$d_lastk" == foreign ]]; then c_y "  ⚠️  DoT 证据端: 服务 active, 但 127.0.0.1:5399 由别的进程持有(unit: $d_cg; 监听者:$d_saw); 本步不处理。"
+    elif [[ "$d_lastk" == mixed ]]; then c_y "  ⚠️  DoT 证据端: 服务 active, 但 127.0.0.1:5399 除它之外还有别的进程在监听(unit: $d_cg; 外来监听者:$d_saw); 本步不处理。"
     else c_y "  ⚠️  DoT 证据端: 未就绪(观察期内没能确认就绪; $d_last), 本步不重置、不启动。查看 journalctl -u pdg-dotwitness。"
     fi
     return 0
@@ -6381,9 +6404,10 @@ _dws_run(){
 
   if [[ "$d_act" == failed && "$d_res" == start-limit-hit ]]; then
     h="观察到启动限额命中(Result=start-limit-hit, NRestarts=$d_nr)"
-    systemctl reset-failed pdg-dotwitness >/dev/null 2>&1; r=$?
-    if (( r != 0 )); then c_y "  ⚠️  DoT 证据端: $h; 定向恢复的 reset-failed 退出 $r, 未执行 start; 不再重试。"; return 0; fi
-    systemctl start pdg-dotwitness >/dev/null 2>&1; r=$?
+    _dws_t 10 systemctl reset-failed pdg-dotwitness >/dev/null 2>&1; r=$?
+    if (( r != 0 )); then c_y "  ⚠️  DoT 证据端: $h; 定向恢复的 reset-failed $(_dws_rcw "$r"), 未执行 start; 不再重试。"; return 0; fi
+    _dws_t 30 systemctl start pdg-dotwitness >/dev/null 2>&1; r=$?
+    if (( r == 124 )); then c_y "  ⚠️  DoT 证据端: $h; 定向恢复: reset-failed 退出 0, start 超出本步时限(退出 124), 启动任务是否仍在进行未取得; 不再重试。"; return 0; fi
     if (( r != 0 )); then c_y "  ⚠️  DoT 证据端: $h; 定向恢复: reset-failed 退出 0, start 退出 $r; 不再重试。"; return 0; fi
     _dws_watch; r=$?
     if (( r == 0 )); then

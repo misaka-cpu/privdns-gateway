@@ -15,6 +15,10 @@
 #     观察次数与间隔写死, 读取失败不会被后面的成功冲掉; 报告不写原因推断。
 #   · (371)每次观察按完整健康条件判(loaded + enabled + active / running), 取值必须认识;
 #     多个监听者每个都要读到, 读不到不能被后面的匹配盖掉; 内部异常仍返回 0, 但具名告警并带原始退出码。
+#   · (S-6)监听者里有归 unit 的、也有外来的(混合)⇒ 不算归属成立, 按有效未就绪继续观察。
+#   · (S-5)每次外部调用都经 timeout(TERM 后 2 s 再 KILL), 单次上限与本步剩余总时长(120 s)取小;
+#     超时(124)与其它非 0 一样不采信、不当成功; 总时长用完就不再调用。timeout 也用替身:
+#     它记下上限后在本 shell 里调同名替身, 被测代码绕过 timeout 直接调的会记成 direct。
 # 模型通过只说明产品原文在这些输入下的判定与动作次数, 不等于真机上的修复成立
 # (真 systemd 的那一半见 tests/e2e-dotwitness-settle.sh, 只在 CI 的 core-startlimit job 里跑)。
 # ─────────────────────────────────────────────────────────────────────────────
@@ -67,6 +71,7 @@ _n(){ local n; n="$(command grep -cE "^$1( |\$)" "$LOG")"; printf '%s' "$((n))";
 _fx(){ local f="$FX/$1.$2" rc=0; [[ -e "$f" ]] || f="$FX/$1.dflt"
   [[ -e "$f" ]] && command cat "$f"; [[ -e "$f.rc" ]] && rc="$(command cat "$f.rc")"; return "$rc"; }
 systemctl(){
+  [[ -n "${_TO_ON:-}" ]] || echo "direct systemctl $1" >> "$LOG"
   case "$*" in
     "show pdg-dotwitness -p LoadState -p UnitFileState -p ActiveState -p SubState -p Result -p NRestarts -p InvocationID --no-pager")
       echo state >> "$LOG"; _fx show "$(_n state)" ;;
@@ -76,7 +81,25 @@ systemctl(){
     *) echo "systemctl-other $*" >> "$LOG"; return 0 ;;
   esac
 }
-ss(){ echo "ss $*" >> "$LOG"; _fx ss "$(_n ss)"; }
+ss(){ [[ -n "${_TO_ON:-}" ]] || echo "direct ss" >> "$LOG"; echo "ss $*" >> "$LOG"; _fx ss "$(_n ss)"; }
+# timeout 替身: 真 timeout 会 exec 外部程序、绕过上面的函数替身, 所以它也替。记下 -k 与单次上限,
+# 再在本 shell 里调同名替身。FX/to.<种类> 存在时: 命令照样执行(输出也照样出来), 但以 124 收场 ——
+# 模拟"跑了却没在时限内返回"; 被测代码必须不采信这次的输出。
+timeout(){
+  local k="" cap kind
+  [[ "$1" == -k ]] && { k="$2"; shift 2; }
+  cap="$1"; shift
+  case "$1 ${2:-}" in
+    "systemctl show") if [[ "$*" == *ControlGroup* ]]; then kind=cg; else kind=state; fi ;;
+    "systemctl reset-failed") kind=reset ;; "systemctl start") kind=start ;;
+    ss*) kind=ss ;; *) kind=other ;;
+  esac
+  echo "timeout k=$k cap=$cap $kind" >> "$LOG"
+  local _TO_ON=1 r=0
+  "$@" || r=$?
+  [[ -e "$FX/to.$kind" ]] && return 124
+  return "$r"
+}
 cat(){
   if [[ $# == 1 && "$1" == /proc/*/cgroup ]]; then
     echo "proc $1" >> "$LOG"; local p="${1#/proc/}"; p="${p%/cgroup}"
@@ -84,7 +107,9 @@ cat(){
   fi
   command cat "$@"
 }
-sleep(){ echo "sleep $*" >> "$LOG"; [[ -e "$FX/sleep.exit" ]] && exit "$(command cat "$FX/sleep.exit")"; return 0; }
+sleep(){ echo "sleep $*" >> "$LOG"; [[ -e "$FX/sleep.exit" ]] && exit "$(command cat "$FX/sleep.exit")"
+  # FX/sleep.adv: 每次 sleep 让 SECONDS 前进这么多秒(造"时间用完"; sleep 在观察循环本身的壳里调, 改得到)。
+  [[ -e "$FX/sleep.adv" ]] && SECONDS=$(( SECONDS + $(command cat "$FX/sleep.adv") )); return 0; }
 EOF
 
 # 直接调 _dw_settle 的一格。$1=格 其余=传给 _dw_settle 的参数。留下 out / log / rc。
@@ -232,16 +257,57 @@ for c in O1 O2; do
     && ok "$c: 两个监听者都真的读过一次(4242 / 4243 各 1 次), 没有在匹配处短路" \
     || bad "$c: 读取记录不对(4242 $(reads "$c" 4242) 次, 4243 $(reads "$c" 4243) 次)"
 done
+# S-6(2026-10-24 起): 混合不再算归属成立。原来 O3 期望"核验通过(有一个归它管)", 那是 371 记下的覆盖边界
+# (D371-11), 本轮按用户选择修掉; 期望随契约改, 撤回修复的反向对照见 tests/negctl/retire-final-negative-controls.py。
 healthy O3; two O3 4343 4242; fx O3 proc.4343 "0::$CG_FOREIGN"; settle O3 --after-migrate
-chk O3 "全部读到, 一个外来一个归 unit ⇒ 核验通过(有一个归它管)" "$T_S1" 0 0 3 1
+chk O3 "全部读到, 一个外来一个归 unit(混合)⇒ 不算归属成立, 10 次都混合 ⇒ 不处理" \
+  "$T_S7 除它之外还有别的进程在监听(unit: $CG_UNIT; 外来监听者: 4343:$CG_FOREIGN)" 0 0 11 9
+healthy O3m; two O3m 4242 4343; fx O3m proc.4343 "0::$CG_FOREIGN"; settle O3m --after-migrate
+chk O3m "顺序调换 [4242 归 unit, 4343 外来] ⇒ 同样不算归属成立" \
+  "$T_S7 除它之外还有别的进程在监听(unit: $CG_UNIT; 外来监听者: 4343:$CG_FOREIGN)" 0 0 11 9
+healthy O3r; fx O3r show.1 "$SLH"; two O3r 4343 4242; fx O3r proc.4343 "0::$CG_FOREIGN"; settle O3r --after-migrate
+chk O3r "恢复后一直混合 ⇒ 恢复后确认未就绪, 不写已恢复" \
+  "但恢复后确认未就绪(最后一次观察 active 但 127.0.0.1:5399 除 pdg-dotwitness 外还有别的进程在监听" 1 1 11 9
+# 混合只在头两次观察出现, 之后只剩它自己 ⇒ 第 3、4 次连续成立后核验通过(混合是"未就绪", 不是"未取得")。
+healthy O3t; fx O3t ss.1 "$SS_HDR"$'\n'"$(row 4343)"$'\n'"$(row 4242)"; fx O3t ss.2 "$SS_HDR"$'\n'"$(row 4242)"$'\n'"$(row 4343)"
+fx O3t proc.4343 "0::$CG_FOREIGN"; settle O3t --after-migrate
+chk O3t "头两次混合、之后只剩它自己 ⇒ 第 3、4 次连续成立后核验通过" "$T_S1" 0 0 5 3
 healthy O3b; two O3b 4242 4244; fx O3b proc.4244 "0::$CG_UNIT"; settle O3b --after-migrate
 chk O3b "全部读到, 两个都归 unit ⇒ 核验通过" "$T_S1" 0 0 3 1
 healthy O4; two O4 4343 4344; fx O4 proc.4343 "0::$CG_FOREIGN"; fx O4 proc.4344 "0::$CG_FOREIGN"; settle O4 --after-migrate
 chk O4 "全部读到, 都是外来 ⇒ 由别的进程持有" "$T_S7 由别的进程持有" 0 0 11 9
 healthy O5; fx O5 show.1 "$SLH"; two O5 4243 4242; settle O5 --after-migrate
 chk O5 "恢复后 [4243 读不到, 4242 归 unit] ⇒ 恢复后观察未取得, 不写已恢复" "但恢复后观察未取得(第 1 次观察: 读不到 127.0.0.1:5399 监听进程的 cgroup(pid: 4243))" 1 1 2 0
-_claim=""; for c in H1 H2 H3 H4 H5a H5b H5c H6 H7 O1 O2 O5; do grep -qE '核验通过|本次核验已恢复' "$BOX/c-$c/out" && _claim="$_claim $c"; done
-[[ -z "$_claim" ]] && ok "H* / O1 / O2 / O5: 都没有报核验通过或本次核验已恢复" || bad "这些格报了健康 / 已恢复:$_claim"
+_claim=""; for c in H1 H2 H3 H4 H5a H5b H5c H6 H7 O1 O2 O3 O3m O3r O5; do grep -qE '核验通过|本次核验已恢复' "$BOX/c-$c/out" && _claim="$_claim $c"; done
+[[ -z "$_claim" ]] && ok "H*/O*: H* / O1 / O2 / O3 / O3m / O3r / O5 都没有报核验通过或本次核验已恢复" || bad "H*/O*: 这些格报了健康 / 已恢复:$_claim"
+
+echo
+echo "══ 五之四. 时限(S-5): 每次外部调用都有上限, 本步总时长有上界 ══"
+# 超时格: 替身照样执行命令、照样吐出输出, 只是以 124 收场 —— 被测代码必须不采信那份输出。
+healthy TO1; : > "$BOX/c-TO1/fx/to.state"; settle TO1 --after-migrate
+chk TO1 "首次状态查询超时(输出是健康的)⇒ 状态未取得, 不采信那份输出, 不动作" \
+  "状态未取得(systemctl show 超出本步时限(退出 124), 已输出的内容不采信)" 0 0 1 0
+healthy TO2; fx TO2 show.1 "$SLH"; : > "$BOX/c-TO2/fx/to.reset"; settle TO2 --after-migrate
+chk TO2 "start-limit-hit, reset-failed 超时 ⇒ 不执行 start" "定向恢复的 reset-failed 超出本步时限(退出 124), 未执行 start; 不再重试" 1 0 1 0
+healthy TO3; fx TO3 show.1 "$SLH"; : > "$BOX/c-TO3/fx/to.start"; settle TO3 --after-migrate
+chk TO3 "start-limit-hit, start 超时 ⇒ 不观察、不重试, 写明启动任务是否仍在进行未取得" \
+  "start 超出本步时限(退出 124), 启动任务是否仍在进行未取得; 不再重试" 1 1 1 0
+healthy TO4; : > "$BOX/c-TO4/fx/to.ss"; settle TO4 --after-migrate
+chk TO4 "观察中 ss 超时 ⇒ 状态未取得" "状态未取得(第 1 次观察: ss 超出本步时限(退出 124))" 0 0 2 0
+healthy TO5; : > "$BOX/c-TO5/fx/to.cg"; settle TO5 --after-migrate
+chk TO5 "观察中 ControlGroup 查询超时 ⇒ 状态未取得" "取不到 pdg-dotwitness 的 ControlGroup(超出本步时限(退出 124))" 0 0 2 0
+# 总时长: 每次 sleep 让时钟前进 57 s, 实例一直在变(永远等不到连续两次同一个)。120 s 截止点下:
+# 第 1–3 次观察照常查询(第 3 次的单次上限被剩余时长压到 10 以下), 第 4 次在调用之前就因时长用完而停。
+healthy TO6; i=1; for h in 0 1 2 3 4 5 6 7 8 9 a; do fx TO6 "show.$i" "$(st loaded enabled active running success 0 "${h}123456789abcdef0123456789abcdef")"; i=$((i+1)); done
+printf '57\n' > "$BOX/c-TO6/fx/sleep.adv"; settle TO6 --after-migrate
+chk TO6 "时长用完 ⇒ 第 4 次观察不再调用, 判状态未取得(超出本步时限)" "状态未取得(第 4 次观察: systemctl show 超出本步时限(退出 124)" 0 0 4 3
+_caps="$(grep -E '^timeout k=[0-9]* cap=[0-9]+ state$' "$BOX/c-TO6/log" | sed -E 's/.*cap=([0-9]+).*/\1/' | tr '\n' ' ')"
+read -r _c1 _c2 _c3 _c4 _cx <<<"$_caps"
+if [[ "$_c1" == 10 && "$_c2" == 10 && "$_c3" == 10 && "${_c4:-x}" =~ ^[1-9]$ && -z "${_cx:-}" ]]; then
+  ok "TO6b: 状态查询的单次上限依次是 [$_caps], 最后一次被剩余时长压到 $_c4 s; 之后没有第 5 次调用"
+else bad "TO6b: 状态查询的单次上限是 [$_caps](期望 10 10 10 <10, 共 4 次)"; fi
+_claim=""; for c in TO1 TO2 TO3 TO4 TO5 TO6; do grep -qE '核验通过|本次核验已恢复' "$BOX/c-$c/out" && _claim="$_claim $c"; done
+[[ -z "$_claim" ]] && ok "TO*: 超时 / 时长用完的各格都没有报核验通过或已恢复" || bad "TO*: 超时却报了健康 / 已恢复:$_claim"
 
 echo
 echo "══ 六. 退出政策甲: 内部意外不外溢, 也不静默 ══"
@@ -365,6 +431,15 @@ for m in 0 1; do
     ok "$c: 真跑迁移链原文, 链返回 $m ⇒ 链内调用 $(grep -c . "$BOX/c-$c/log") 次替身, 新步骤 0 次"
   else bad "$c: 输出 $(tail -2 "$BOX/c-$c/out" | tr '\n' ' ') 记录里的新步骤 $(grep -c '^_dw_settle' "$BOX/c-$c/log") 次"; fi
 done
+
+echo
+echo "══ 十. 汇总: 时限(S-5)对全部格成立 ══"
+# 放在最后: 派发行(八)那几格跑的也是产品原文, 一并算进来。
+_direct="$(grep -l '^direct ' "$BOX"/c-*/log 2>/dev/null | sed 's#.*/c-##; s#/log##' | tr '\n' ' ')"
+[[ -z "$_direct" ]] && ok "TO7: 所有格里 systemctl / ss 都经 timeout 调用, 没有直接调用" || bad "TO7: 这些格有绕过 timeout 的直接调用: $_direct"
+_nto="$(cat "$BOX"/c-*/log 2>/dev/null | grep -c '^timeout ')"
+_nok="$(cat "$BOX"/c-*/log 2>/dev/null | grep '^timeout ' | grep -vc '^timeout k=2 cap=[0-9]* ')"
+[[ "$_nto" -gt 0 && "$_nok" == 0 ]] && ok "TO8: 全部 $_nto 次 timeout 调用都带 -k 2" || bad "TO8: $_nto 次 timeout 里有 $_nok 次没带 -k 2"
 
 echo "────────────────────────────────────────"
 echo "通过 $pass, 失败 $nfail"
