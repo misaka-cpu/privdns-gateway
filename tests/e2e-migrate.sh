@@ -612,7 +612,7 @@ for v in 'REPO_DIR=' 'LOCK=' 'PDG_LOCKED=' 'SNAP_DIR=' '_PDG_SNAP_CREATED=' '_SN
 done
 for f in c_g c_y need_root _lock_inherited _lock _pdg_mktemp_dir _pdg_svc_known _pdg_svc_q \
          _pdg_svcstate_units _pdg_svcstate_valid _pdg_svcstate_plan _pdg_save_svcstate \
-         _sb_panel_managed_on _sb_write_sanitized _snap_meta_write cmd_snapshot; do
+         _sb_panel_managed_on _sb_write_sanitized _pdg_witness_absence _snap_meta_write cmd_snapshot; do
   b="$(grep -m1 -E "^${f}\(\)\{.*\}[[:space:]]*\$" "$PDG_BIN")" || b="$(sed -n "/^${f}(){/,/^}/p" "$PDG_BIN")"
   { [[ -n "$b" ]] && eval "$b" && declare -F "$f" >/dev/null; } || { echo "PARENT-MISSING=fn:$f"; exit 8; }
 done
