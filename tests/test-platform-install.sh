@@ -469,7 +469,8 @@ g8_judge(){ # $1=健康格 $2=失败格 → PASS | FAIL | INVALID
   done
   [[ "$(cat "$WORK/g8-$1.rc")" == 0 && "$(cat "$WORK/g8-$2.rc")" == 1 ]] && echo PASS || echo FAIL
 }
-g8_show(){ echo "      [记录] $1: 原始退出码=$(cat "$WORK/g8-$1.rc") 调用=$(grep -c . "$WORK/g8-$1.calls")笔 目标被调用=$(grep -cx migrate_ios_gms_cleanup "$WORK/g8-$1.calls") stderr=[$(head -c 100 "$WORK/g8-$1.err" | tr '\n' ' ')]"; }
+# 守卫要核对完整故障记录；截取 100 字节会在 CI 的长绝对路径处截掉错误正文。
+g8_show(){ echo "      [记录] $1: 原始退出码=$(cat "$WORK/g8-$1.rc") 调用=$(grep -c . "$WORK/g8-$1.calls")笔 目标被调用=$(grep -cx migrate_ios_gms_cleanup "$WORK/g8-$1.calls") stderr=[$(tr '\n' ' ' < "$WORK/g8-$1.err")]"; }
 _rams="$(xt run_all_migrations)"
 [[ -n "$_rams" ]] || bad "抽不到 run_all_migrations"
 g8 real-ok 0 "$_rams" yes; g8 real-fail 1 "$_rams" yes

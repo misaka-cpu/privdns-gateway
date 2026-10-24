@@ -98,7 +98,10 @@ _intent='      [记录] miss-fail: 原始退出码=1 调用=0笔 目标被调用
 _marker='[OK]   8c: 缺必需依赖 → 登记为「外壳执行无效」, 没有冒充失败传播通过'
 [[ -z "$(unexpected_missing "$_intent"$'\n'"$_marker")" ]] \
   && ok "缺依赖自检的精确记录 + INVALID 断言通过 → 单独识别" || bad "缺依赖自检识别失败"
-for _sample in "$_intent" "$_marker" "$_intent"$'\n'"$_marker"$'\n''/test.sh: line 1: other: command not found' "$_intent"$'\n'"$_intent"$'\n'"$_marker"; do
+_long_intent='      [记录] miss-fail: 原始退出码=1 调用=0笔 目标被调用=0 stderr=[/home/runner/work/privdns-gateway/privdns-gateway/tests/test-platform-install.sh: line 457: _retire_precheck: command not found ]'
+[[ -z "$(unexpected_missing "$_long_intent"$'\n'"$_marker")" ]] \
+  && ok "CI 长路径的完整故障记录仍可核实" || bad "长路径故障记录识别失败"
+for _sample in "$_intent" "$_marker" "$_intent"$'\n'"$_marker"$'\n''/test.sh: line 1: other: command not found' "$_intent"$'\n'"$_intent"$'\n'"$_marker" "${_long_intent%command not found*}command no]"$'\n'"$_marker"; do
   [[ -n "$(unexpected_missing "$_sample")" ]] \
     && ok "反向对照: 缺证明、缺原始记录、额外缺调用或重复记录仍拒绝" || bad "缺调用被误放行"
 done
