@@ -83,8 +83,25 @@ echo "  盘上摘要 $A_BEFORE → $A_AFTER   rc=$A_RC"
 [[ "$A_BEFORE" != "$A_AFTER" ]] && ok "A: 模块确实被换成新版" || bad "A: 模块没换"
 grep -q 'try-restart' <<<"$A_CALLS" && ok "A: 发出了重启(实发: $(grep -m1 restart <<<"$A_CALLS"))" \
                                     || bad "A: 没有重启 —— 盘上新代码, 进程还是旧的"
-grep -q 'pdg-mitm' <<<"$A_CALLS" && ok "A: iOS 上 pdg-mitm 也在名单里" || bad "A: 漏了 pdg-mitm"
+[[ "$A_CALLS" == 'systemctl try-restart pdg-bot pdg-probe81' ]] \
+  && ok "A: 只重启公共服务, 不触碰已退役的 pdg-mitm" || bad "A: 服务调用不符: ${A_CALLS:-无}"
 rm -rf "$A"
+
+# 同一函数、同一前像: 加回已退役服务后, 上述精确调用判据必须拒绝。
+_anchor='local _svcs="pdg-bot pdg-probe81"'
+if [[ $(grep -cF "$_anchor" <<<"$FN") == 1 ]]; then
+  AN="$(mktemp -d)"; mkbox "$AN"
+  _original="$FN"
+  FN="${FN/$_anchor/local _svcs=\"pdg-bot pdg-probe81 pdg-mitm\"}"
+  AN_RC="$(run_migrate "$AN")"
+  AN_CALLS="$(cat "$AN/calls.log")"
+  [[ "$AN_RC" == 0 && "$AN_CALLS" == 'systemctl try-restart pdg-bot pdg-probe81 pdg-mitm' ]] \
+    && ok "A-反例: 加回 MITM 重启后不符合仅公共服务的判据" || bad "A-反例未命中: rc=$AN_RC 调用=$AN_CALLS"
+  FN="$_original"
+  rm -rf "$AN"
+else
+  bad "A-反例锚点不是唯一, 不执行无效变异"
+fi
 
 echo
 echo "── B. 先 pdg_install_runtime_modules, 再 __migrate(上一轮我用的顺序) ──"
@@ -117,9 +134,9 @@ rm -rf "$B"
 echo
 echo "── C. 正常 cmd_update 在 __migrate 之后是否还会重启 ──"
 # 抽出 cmd_update 里 `__migrate` 之后那段, 真跑一遍看它发什么命令。
-# 不是读源码断言 —— 那段代码是不是真的会执行到 restart, 只有跑过才知道。
+# 仅执行筛出的 systemctl 动作行; 外层条件没有保留, 不证明实际路径会进入这些分支。
 #
-# 这一节**只**证明一件事: cmd_update 在迁移之后确实发得出那几条重启。它不证明整条升级链
+# 这一节**只**证明一件事: 迁移之后的动作行在 is-enabled 成功的桩下会发出哪些重启。它不证明整条升级链
 # 跑得通 —— 快照、二进制收敛、三道校验门、doctor 自检门都不在这个片段里, 那些归 e2e。
 #
 # 锚点为什么要分两层定。盘上的迁移调用带着环境前缀:
@@ -186,12 +203,13 @@ $(cat "$1")" >/dev/null 2>&1; }
     else
       # 认的是**具体哪条 restart 打到哪个 unit**, 不是日志里出现过 restart 三个字。
       grep -qE '^systemctl restart( [^ ]+)* pdg-bot( |$)' <<<"$CC" \
-        && ok "C: 正常 update 在迁移之后**无条件**重启 pdg-bot(实发: $(grep -m1 '^systemctl restart' <<<"$CC"))" \
+        && ok "C: 抽出的动作行重启 pdg-bot(实发: $(grep -m1 '^systemctl restart' <<<"$CC"))" \
         || bad "C: 没有一条 restart 打到 pdg-bot —— 那普通用户升级也会留旧进程。实发: ${CC:-无}"
       grep -qE '^systemctl restart( [^ ]+)* pdg-probe81( |$)' <<<"$CC" \
         && ok "C: pdg-probe81 也在同一条 restart 里" || bad "C: 没有 restart 打到 pdg-probe81。实发: ${CC:-无}"
       grep -qE '^systemctl restart( [^ ]+)* pdg-mitm( |$)' <<<"$CC" \
-        && ok "C: pdg-mitm 也被重启(iOS)" || bad "C: 没有 restart 打到 pdg-mitm。实发: ${CC:-无}"
+        && ok "C: is-enabled 成功的桩使抽出的 MITM 动作执行, 不代表退役迁移后的实际状态" \
+        || bad "C: 条件桩下没有 restart 打到 pdg-mitm。实发: ${CC:-无}"
       # ── 反例: 把重启动作从同一段原文里摘掉, 其余逐字不动 ──────────────────
       # 只替换动词, 不删整行: 片段照样跑得起来、照样发得出 systemctl(is-enabled/reset-failed),
       # 所以上面那三条要是还绿, 只可能是它认的东西不对 —— 不是"片段空了"蒙混过去。
