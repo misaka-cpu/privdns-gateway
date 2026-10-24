@@ -96,6 +96,8 @@ grep -qE 'restart .*pdg-probe81' <<<"$CALLS" \
 grep -q 'try-restart' <<<"$CALLS" \
   && ok "用的是 try-restart —— 没装/没启用的服务不会因此报错" \
   || bad "不是 try-restart: 那样在没有该服务的平台上会失败。实发: ${CALLS:-无}"
+grep -q 'pdg-mitm' <<<"$CALLS" \
+  && bad "Android 模块刷新触碰了已退役的 pdg-mitm: $CALLS" || ok "Android 不触碰已退役的 pdg-mitm"
 
 echo
 echo "── 2. 模块没变 → 不做无意义重启 ──"
@@ -113,11 +115,26 @@ grep -qE 'restart' <<<"$CALLS" \
   && bad "装了一半还去重启: $CALLS" || ok "失败时不重启"
 
 echo
-echo "── 4. iOS 上还要照顾 pdg-mitm ──"
+echo "── 4. iOS 只处理公共服务, 不触碰已退役的 pdg-mitm ──"
 run_case ios change
-grep -qE 'restart .*pdg-mitm' <<<"$CALLS" \
-  && ok "iOS: pdg-mitm 也在重启名单里(它同样加载 /opt/pdg-bot 下的模块)" \
-  || bad "iOS 没重启 pdg-mitm。实发: ${CALLS:-无}"
+[[ "$RC" == 0 && "$DEST_B" == 'v2-新内容' ]] \
+  && ok "iOS: 模块实际更新且返回 0" || bad "iOS 模块更新失败: rc=$RC 内容=$DEST_B"
+[[ "$CALLS" == 'systemctl try-restart pdg-bot pdg-probe81' ]] \
+  && ok "iOS: 公共服务照常处理, pdg-mitm 不在调用里" || bad "iOS 服务调用不符: ${CALLS:-无}"
+
+echo
+echo "── 5. 反向对照: 把 pdg-mitm 加回名单必须被检出 ──"
+_anchor='local _svcs="pdg-bot pdg-probe81"'
+if [[ $(grep -cF "$_anchor" <<<"$FN") == 1 ]]; then
+  _original="$FN"
+  FN="${FN/$_anchor/local _svcs=\"pdg-bot pdg-probe81 pdg-mitm\"}"
+  run_case ios change
+  [[ "$RC" == 0 && "$CALLS" == 'systemctl try-restart pdg-bot pdg-probe81 pdg-mitm' ]] \
+    && ok "撤回退役保护后确实多发 MITM 重启, 不符合仅公共服务的判据" || bad "反向对照未命中: rc=$RC 调用=$CALLS"
+  FN="$_original"
+else
+  bad "反向对照锚点不是唯一, 不执行无效变异"
+fi
 
 echo "────────────────────────────────────────"
 echo "通过 $PASS, 失败 $FAIL"
