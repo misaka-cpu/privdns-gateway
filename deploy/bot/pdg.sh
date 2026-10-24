@@ -7281,9 +7281,19 @@ _switchcore_nft(){   # $1=target(mihomo)  渲染并应用 mihomo nft(用当前 S
   if ! _nft_apply_main; then
     rc=1
     if [[ -e "$bak" ]]; then
-      cp -a "$bak" /etc/nftables.conf 2>/dev/null
-      _nft_apply_main >/dev/null 2>&1 || true
-      echo "应用新防火墙失败 → 已还原并重新应用原配置"
+      # 写回与重新应用各自看结果(原来 `|| true` 吞掉重新应用的失败, 照样报"已还原并重新应用")。
+      # 返回值不变, 仍是 1; 变的只是报告不再替没成的那一步说成功。
+      local _rarc=0
+      if ! cp -a "$bak" /etc/nftables.conf 2>/dev/null || ! cmp -s "$bak" /etc/nftables.conf; then
+        echo "应用新防火墙失败, 且还原 /etc/nftables.conf 也失败 → 盘上配置与运行中的规则都未确认, 请手工检查"
+      else
+        _nft_apply_main >/dev/null 2>&1 || _rarc=$?
+        if [[ "$_rarc" == 0 ]]; then
+          echo "应用新防火墙失败 → 已还原并重新应用原配置"
+        else
+          echo "应用新防火墙失败 → 已还原 /etc/nftables.conf, 但重新应用原配置也失败(nft 返回 $_rarc), 运行中的防火墙规则未确认"
+        fi
+      fi
     fi
     rm -rf "$wd"; return "$rc"
   fi
@@ -8174,11 +8184,20 @@ cmd_platform(){
   _pac="$(systemctl is-active  "$_psvc" 2>/dev/null | head -1)"
   _pstate="$_psvc|${_pen:-disabled}|${_pac:-inactive}"$'\n'
   _plat_rollback(){
-    local g
+    local g _nfrc _miss=()
     for g in platform profile.env mitm.json nftables.conf config.yaml mitm_hijack.txt; do
       case "$g" in
         platform|profile.env|mitm.json) [[ -e "$wd/$g" ]] && cp -a "$wd/$g" "/etc/privdns-gateway/$g";;
-        nftables.conf) [[ -e "$wd/$g" ]] && { cp -a "$wd/$g" /etc/nftables.conf; _nft_apply_main >/dev/null 2>&1 || true; };;
+        nftables.conf)
+          # 写回与重新加载各自看结果, 失败进未恢复项(原来 `|| true` 吞掉重新加载的失败, 最后照样报"已恢复")。
+          if [[ -e "$wd/$g" ]]; then
+            if ! cp -a "$wd/$g" /etc/nftables.conf; then
+              _miss+=("/etc/nftables.conf(写回失败)")
+            else
+              _nfrc=0; _nft_apply_main >/dev/null 2>&1 || _nfrc=$?
+              [[ "$_nfrc" == 0 ]] || _miss+=("防火墙主规则重新加载(nft 返回 $_nfrc)")
+            fi
+          fi;;
         config.yaml)   [[ -e "$wd/$g" ]] && cp -a "$wd/$g" /etc/mihomo/config.yaml;;
         mitm_hijack.txt) [[ -e "$wd/$g" ]] && cp -a "$wd/$g" /etc/mosdns/rules/mitm_hijack.txt;;
       esac
@@ -8199,7 +8218,8 @@ cmd_platform(){
     #   · 自启按记下来的**那个值**还原(enabled / enabled-runtime / disabled), 不再一律
     #     `enable --now` —— 那会把 enabled-runtime 提升成永久 enabled;
     #   · 动作之后复核后置状态, 对不上就登记, 不再一律 `|| true` 吞掉。
-    local svc en ac _enrc _miss=()
+    # (_miss 在函数开头声明: 防火墙那一步的未恢复项也记在里面, 这里不能再清空它。)
+    local svc en ac _enrc
     while IFS='|' read -r svc en ac; do
       [[ -n "$svc" ]] || continue
       if [[ ! -e "/etc/systemd/system/$svc.service" ]]; then

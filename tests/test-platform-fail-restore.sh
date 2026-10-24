@@ -241,6 +241,11 @@ run_platform(){   # $1=目标平台 $2=fail|nofail $3=场景目录 [$4=被测 pd
       # migrate_android_cleanup 之前)。此时 _PDG_RETIRE_DONE=0, 失败善后走**局部还原**
       # _plat_rollback —— 这一支正是要验它的失败传播。
       echo '_plat_write_profile(){ [[ -n "${1:-}" ]] && printf "PROFILE-%s\n" "$1" > /etc/privdns-gateway/profile.env; return 1; }'
+    elif [[ "$mode" == fail-early-nft ]]; then
+      # 同 fail-early(走局部还原), 外加: 局部还原里重新加载防火墙主规则失败(nft 返回 3)。
+      # 每次加载记一行, 用来核"只在局部还原里加载过一次"这个前提。
+      echo '_plat_write_profile(){ [[ -n "${1:-}" ]] && printf "PROFILE-%s\n" "$1" > /etc/privdns-gateway/profile.env; return 1; }'
+      echo '_nft_apply_main(){ echo "NFT-APPLY rc=3 conf=$(cat /etc/nftables.conf 2>/dev/null)" >> "$MIG_LOG"; return 3; }'
     elif [[ "$mode" == fail-early-enrc ]]; then
       # 同上, 外加: 让**自启恢复动作**返回非零, 而此刻的自启值**恰好就等于目标**。
       echo "_plat_write_profile(){ : > \"\$SC_DIR/pdg-mitm.fail_enable\"; return 1; }"
@@ -440,6 +445,132 @@ grep -qE '没有确认恢复' <<<"$p" && bad "H3: 健康路径却说有项目没
 grep -q '已恢复到原平台' <<<"$p" && ok "H4: 健康路径打的是无保留的成功句(逐项复核过)" || bad "H4: 连恢复都没报"
 
 echo
+echo "══ 四之三. 局部还原里重新加载防火墙主规则失败必须穿透(S-2) ══"
+# 原来 _plat_rollback 写的是 `cp …; _nft_apply_main >/dev/null 2>&1 || true`: 加载失败被吞, 最后照样打无保留的成功句。
+seed_machine android; printf 'NFT-ORIG\n' > /etc/nftables.conf; d="$WORK/nftfail"; mkdir -p "$d"
+o="$(run_platform ios fail-early-nft "$d")"; p="$(plain "$o")"
+exec_valid "$o" "NF"
+[[ "$(grep -c '^NFT-APPLY rc=3 conf=NFT-ORIG$' "$d/mig.log")" == 1 && "$(grep -c '^NFT-APPLY' "$d/mig.log")" == 1 ]] \
+  && ok "NF1: 前提成立 —— 只在局部还原里、对写回后的原配置加载了 1 次, 并以 3 失败" \
+  || bad "NF1: 前提不成立, 加载记录: $(grep '^NFT-APPLY' "$d/mig.log" | tr '\n' '|')"
+[[ "$(cat /etc/nftables.conf 2>/dev/null)" == NFT-ORIG ]] && ok "NF2: /etc/nftables.conf 已写回原内容(写回本身成功)" || bad "NF2: 盘上是 $(cat /etc/nftables.conf 2>/dev/null)"
+grep -q 'PLAT_RC=0' <<<"$p" && bad "NF3: 切换失败却返回 0" || ok "NF3: 返回非 0"
+grep -qF '防火墙主规则重新加载(nft 返回 3)' <<<"$p" \
+  && ok "NF4: 重新加载失败被具名记进未恢复项(带 nft 返回码)" \
+  || { bad "NF4: 重新加载失败被吞了"; grep -E '没有确认恢复|已恢复' <<<"$p" | tail -3 | sed 's/^/      /'; }
+grep -q '已恢复到原平台' <<<"$p" && bad "NF5: 打出了无保留的成功句" || ok "NF5: **没有**宣称局部恢复全部成功"
+grep -qE '没有确认恢复' <<<"$p" && ok "NF6: 明说有项目没有确认恢复" || bad "NF6: 没说"
+# 对照: 同一现场、加载成功 ⇒ 照常判完整恢复(K 组不是靠恒红取胜)
+seed_machine android; printf 'NFT-ORIG\n' > /etc/nftables.conf; d="$WORK/nftok"; mkdir -p "$d"
+o="$(run_platform ios fail-early "$d")"; p="$(plain "$o")"
+exec_valid "$o" "NFc"
+if grep -q '已恢复到原平台' <<<"$p" && ! grep -qE '没有确认恢复' <<<"$p" && [[ "$(cat /etc/nftables.conf 2>/dev/null)" == NFT-ORIG ]]; then
+  ok "NF7: 对照 —— 同一现场加载成功时照常判为完整恢复"
+else bad "NF7: 对照不成立"; fi
+# 撤销对照: 只把防火墙那一支改回 `|| true` 的写法 ⇒ 同一反例重新打出无保留的成功句
+REVK="$WORK/pdg-rev-platnft.sh"
+python3 - "$PDG" "$REVK" <<'PYREV'
+import sys
+s = open(sys.argv[1], encoding="utf-8").read()
+a = """        nftables.conf)
+          # 写回与重新加载各自看结果, 失败进未恢复项(原来 `|| true` 吞掉重新加载的失败, 最后照样报"已恢复")。
+          if [[ -e "$wd/$g" ]]; then
+            if ! cp -a "$wd/$g" /etc/nftables.conf; then
+              _miss+=("/etc/nftables.conf(写回失败)")
+            else
+              _nfrc=0; _nft_apply_main >/dev/null 2>&1 || _nfrc=$?
+              [[ "$_nfrc" == 0 ]] || _miss+=("防火墙主规则重新加载(nft 返回 $_nfrc)")
+            fi
+          fi;;"""
+b = """        nftables.conf) [[ -e "$wd/$g" ]] && { cp -a "$wd/$g" /etc/nftables.conf; _nft_apply_main >/dev/null 2>&1 || true; };;"""
+assert s.count(a) == 1, s.count(a)
+open(sys.argv[2], "w", encoding="utf-8").write(s.replace(a, b, 1))
+PYREV
+if ! bash -n "$REVK" 2>/dev/null || cmp -s "$PDG" "$REVK"; then
+  bad "NF8: 没造出「防火墙那一支改回 || true」的反向副本 —— 本格记无效"
+else
+  seed_machine android; printf 'NFT-ORIG\n' > /etc/nftables.conf; d="$WORK/revnft"; mkdir -p "$d"
+  o="$(run_platform ios fail-early-nft "$d" "$REVK")"; p="$(plain "$o")"
+  if [[ "$(grep -c '^NFT-APPLY rc=3' "$d/mig.log")" == 1 ]] && grep -q '已恢复到原平台' <<<"$p" && ! grep -qF '防火墙主规则重新加载' <<<"$p"; then
+    ok "NF8: 撤回之后, 同一次加载失败(rc=3)重新被吞, 照样打无保留的成功句 —— K4/K5 由这处修复保住"
+  else bad "NF8: 反向对照没体现差异 —— 本格记无效($(grep -c '^NFT-APPLY' "$d/mig.log") 次加载)"; fi
+fi
+
+echo
+echo "══ 四之四. 换核防火墙: 应用新配置失败后的还原与重新应用(S-2) ══"
+# 跑**真实**的 _switchcore_nft 原文, 在本支隔离出来的 /etc 上读写 /etc/nftables.conf。
+# 渲染与合并的外部边界(内网段探测、救援常量、来源匹配、合并器、nft -c)用替身, 只为走到"应用"那一步。
+# _nft_apply_main 按 NFTSEQ 逐次给返回码(第 1 次 = 应用新配置, 第 2 次 = 写回原配置后重新应用),
+# 每次记下当时盘上配置的摘要; SWCP_FAIL=1 时只让"把备份写回 /etc/nftables.conf"那一次 cp 失败。
+SW_ORIG=$'table inet pdg {\n  chain input {\n    tcp dport { 22 } accept\n  }\n}'
+run_swnft(){   # $1=场景目录 $2=返回码序列(空格分隔) [$3=1: 写回失败] [$4=被测 pdg.sh]
+  local d="$1" src="${4:-$PDG}"; mkdir -p "$d/repo/deploy/firewall"
+  printf 'table inet pdg {\n  chain input { tcp dport { __SSH_PORT__ } accept }\n}\n' > "$d/repo/deploy/firewall/nftables-mihomo.conf"
+  printf '%s\n' "$SW_ORIG" > /etc/nftables.conf; : > "$d/apply.log"
+  { echo 'set -uo pipefail'
+    _fn1 "$src" c_g; _fn1 "$src" c_y; _fn1 "$src" c_r
+    printf 'REPO_DIR=%q; SWD=%q; SWCP_FAIL=%q; NFTSEQ=(%s)\n' "$d/repo" "$d" "${3:-0}" "$2"
+    echo 'python3(){ echo 10.9.0.0/16; }'
+    echo '_pdg_nft_foreign_input_chains(){ return 1; }; _fw_ssh_match(){ echo ""; return 0; }'
+    echo '_rescue_load(){ PDG_RESCUE_PORT=9999; return 0; }; _fw_tailnet_direct(){ echo ""; }; _pdg_nft_strip_gms(){ :; }'
+    echo '_pdg_nft_splice(){ { cat "$2"; echo "# merged"; cat "$1"; } > "$3"; }'
+    echo 'nft(){ return 0; }'
+    echo '_nft_apply_main(){ local n; n="$(grep -c "^apply" "$SWD/apply.log")"; echo "apply $(md5sum < /etc/nftables.conf | cut -c1-12)" >> "$SWD/apply.log"; return "${NFTSEQ[$n]:-0}"; }'
+    echo 'cp(){ if [[ "$SWCP_FAIL" == 1 && "$1" == -a && "$2" == */nftables.conf.bak && "$3" == /etc/nftables.conf ]]; then echo cp-restore-fail >> "$SWD/apply.log"; return 1; fi; command cp "$@"; }'
+    _fnN "$src" _switchcore_nft
+    echo '_switchcore_nft mihomo; echo "SW_RC=$?"'
+  } > "$d/run.sh"
+  bash "$d/run.sh" 2>&1
+}
+SW_OSUM="$(printf '%s\n' "$SW_ORIG" | md5sum | cut -c1-12)"
+sw_applies(){ grep '^apply ' "$1/apply.log" | cut -d' ' -f2 | tr '\n' ' '; }
+T_SWOK='应用新防火墙失败 → 已还原并重新应用原配置'
+d="$WORK/sw0"; mkdir -p "$d"; o="$(run_swnft "$d" "0")"; exec_valid "$o" "SW-0"
+if grep -q '^SW_RC=0$' <<<"$o" && grep -q '^# merged$' /etc/nftables.conf && [[ "$(grep -c '^apply ' "$d/apply.log")" == 1 ]]; then
+  ok "SW0: 对照 —— 应用成功 ⇒ 返回 0, 盘上是合并后的新配置, 只加载 1 次(说明替身确实把原文带到了应用那一步)"
+else bad "SW0: 返回 $(grep -o 'SW_RC=.*' <<<"$o"), 加载 $(sw_applies "$d")"; fi
+d="$WORK/sw1"; mkdir -p "$d"; o="$(run_swnft "$d" "1 0")"; exec_valid "$o" "SW-1"
+if grep -q '^SW_RC=1$' <<<"$o" && grep -qF "$T_SWOK" <<<"$o" && [[ "$(cat /etc/nftables.conf)" == "$SW_ORIG" ]] \
+   && [[ "$(sw_applies "$d")" == *" $SW_OSUM " ]]; then
+  ok "SW1: 应用失败、重新应用原配置成功 ⇒ 返回 1, 报已还原并重新应用, 第 2 次加载的确实是原配置"
+else bad "SW1: 返回 $(grep -o 'SW_RC=.*' <<<"$o"), 输出 $(grep -E '应用新防火墙' <<<"$o"), 加载 $(sw_applies "$d")"; fi
+d="$WORK/sw2"; mkdir -p "$d"; o="$(run_swnft "$d" "1 4")"; exec_valid "$o" "SW-2"
+if grep -q '^SW_RC=1$' <<<"$o" && grep -qF '已还原 /etc/nftables.conf, 但重新应用原配置也失败(nft 返回 4), 运行中的防火墙规则未确认' <<<"$o" \
+   && ! grep -qF "$T_SWOK" <<<"$o" && [[ "$(cat /etc/nftables.conf)" == "$SW_ORIG" && "$(grep -c '^apply ' "$d/apply.log")" == 2 ]]; then
+  ok "SW2: 重新应用原配置也失败(4)⇒ 具名报出且带返回码, 不再说已重新应用; 盘上已写回原配置"
+else bad "SW2: 返回 $(grep -o 'SW_RC=.*' <<<"$o"), 输出 $(grep -E '应用新防火墙' <<<"$o"), 加载 $(sw_applies "$d")"; fi
+d="$WORK/sw3"; mkdir -p "$d"; o="$(run_swnft "$d" "1 0" 1)"; exec_valid "$o" "SW-3"
+if grep -q '^SW_RC=1$' <<<"$o" && grep -qF '应用新防火墙失败, 且还原 /etc/nftables.conf 也失败' <<<"$o" && ! grep -qF "$T_SWOK" <<<"$o" \
+   && grep -q '^cp-restore-fail$' "$d/apply.log" && [[ "$(grep -c '^apply ' "$d/apply.log")" == 1 ]]; then
+  ok "SW3: 写回失败 ⇒ 具名报出, 不再重新应用(只加载 1 次), 不说已还原"
+else bad "SW3: 返回 $(grep -o 'SW_RC=.*' <<<"$o"), 输出 $(grep -E '应用新防火墙' <<<"$o"), 记录 $(tr '\n' '|' < "$d/apply.log")"; fi
+# 撤销对照: 改回原来的三行(`cp …; _nft_apply_main … || true; echo 已还原并重新应用`)⇒ SW2 的反例重新报成功
+REVSW="$WORK/pdg-rev-swnft.sh"
+python3 - "$PDG" "$REVSW" <<'PYREV'
+import sys
+s = open(sys.argv[1], encoding="utf-8").read()
+i = s.index("      # 写回与重新应用各自看结果(原来 `|| true` 吞掉重新应用的失败")
+j = s.index("    rm -rf \"$wd\"; return \"$rc\"", i)
+b = """      cp -a "$bak" /etc/nftables.conf 2>/dev/null
+      _nft_apply_main >/dev/null 2>&1 || true
+      echo "应用新防火墙失败 → 已还原并重新应用原配置"
+    fi
+"""
+assert s.count("      # 写回与重新应用各自看结果(原来 `|| true` 吞掉重新应用的失败") == 1
+open(sys.argv[2], "w", encoding="utf-8").write(s[:i] + b + s[j:])
+PYREV
+if ! bash -n "$REVSW" 2>/dev/null || cmp -s "$PDG" "$REVSW"; then
+  bad "SW4: 没造出「改回 || true」的反向副本 —— 本格记无效"
+else
+  d="$WORK/swrev"; mkdir -p "$d"; o="$(run_swnft "$d" "1 4" 0 "$REVSW")"
+  if grep -qF "$T_SWOK" <<<"$o" && [[ "$(grep -c '^apply ' "$d/apply.log")" == 2 ]]; then
+    ok "SW4: 撤回之后, 重新应用失败(4)照样报「已还原并重新应用原配置」—— SW2 由这处修复保住"
+  else bad "SW4: 反向对照没体现差异 —— 本格记无效($(sw_applies "$d"))"; fi
+fi
+# 四之三 / 四之四 之前现场里没有 /etc/nftables.conf; 撤掉, 后面各节的现场与本轮之前相同。
+rm -f /etc/nftables.conf
+
+echo
 echo "══ 五. 恢复动作自身失败: 不能被后续成功盖过去 ══"
 # 确定性反例: 退役件已经撤除, 随后失败; 恢复时**只让一项本次新增文件删不掉**
 # (把它变成非空目录, rm -f 必然 EISDIR), 而快照恢复本身正常成功。
@@ -587,7 +718,8 @@ cat <<'NOTE'
   cmd_snapshot            → 未覆盖: 快照清单裁剪与元数据写入(材料本身是真打的 tar)
   _plat_write_profile     → 未覆盖: profile.env 的真实渲染内容
   migrate_probe81_public / migrate_ios_gms_cleanup / _plat_verify → 未覆盖: 这三步自身的判据
-  _switchcore_nft         → 被用作失败注入点; 未覆盖: 防火墙按平台重建
+  _switchcore_nft         → 被用作失败注入点; 四之四跑它的原文, 只覆盖"应用失败后的写回与重新应用";
+                            未覆盖: 防火墙按平台重建(渲染、来源匹配、合并器与 nft -c 都是替身)
   mihomo / nft            → 未覆盖: 真实 mihomo -t 校验与真实 nft 装载
   /opt/pdg-bot/bot.py     → 本支放的是**最小但真**的渲染器(产品原文的 _retire_rerender_core
                             会对它的产物做空产出/MITM-OUT/mihomo -t/属性跟随/原子替换/重启核验);
