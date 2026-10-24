@@ -527,6 +527,25 @@ _wwhy "N2: iOS 记录解析失败 ⇒ 无法确认(保留 python 退出码)" 2  
 _wwhy "N3: MITM-OUT 配置查询出错(rc=2) ⇒ 无法确认" 2       "$(wp N3 'mkdir -p etc/mihomo/config.yaml')" '核心配置查不出来'
 _w "N0: 同一套现场但三项观测都正常 ⇒ **确认**没有活(三条反例不是靠恒红取胜)" 1 "$(wp N0 '')"
 
+# ── S-1(2026-10-24): systemd 255 起, 不存在的 unit 在 is-active 上答 inactive / 4 ──────────
+# 只有 LoadState 查询本身成功、且恰好答 not-found, 才按"没在跑"采信; 其余照旧无法确认。
+# 第 5 个参数注入一个按完整参数应答的 systemctl, 覆盖 wp 的默认替身(默认替身对 show 一律空输出、返回 0)。
+lsq(){ # $1=is-active 的词/码 $2=LoadState 的输出 $3=LoadState 查询的退出码
+  printf 'systemctl(){ case "$*" in "is-active pdg-mitm") echo %s; return %s;; "show -p LoadState --value pdg-mitm") echo %s; return %s;; esac; return 0; }' \
+    "${1%%/*}" "${1##*/}" "$2" "$3"; }
+_w    "IA1: inactive/4 且 LoadState 恰为 not-found(查询退出 0)⇒ 按没在跑采信, 全干净时**确认**没有活" \
+      1 "$(wp K1 '' inactive/4 ios "$(lsq inactive/4 not-found 0)")"
+_wwhy "IA2: inactive/4 但 LoadState=loaded ⇒ 无法确认(unit 在, 却答了「没有这个 unit」的码)" \
+      2 "$(wp K2 '' inactive/4 ios "$(lsq inactive/4 loaded 0)")" 'LoadState 查询退出 0、取值「loaded」'
+_wwhy "IA3: inactive/4, LoadState 先输出 not-found 再以 1 收场 ⇒ 无法确认(不采信半截)" \
+      2 "$(wp K3 '' inactive/4 ios "$(lsq inactive/4 not-found 1)")" 'LoadState 查询退出 1'
+_wwhy "IA4: inactive/4 且 not-found, 但盘上还有 pdg-mitm.service ⇒ 有活(盘面那一维照判)" \
+      0 "$(wp K4 'touch etc/systemd/system/pdg-mitm.service' inactive/4 ios "$(lsq inactive/4 not-found 0)")" 'svc=1'
+_wwhy "IA5: inactive/4, LoadState 查询空输出(默认替身)⇒ 无法确认" \
+      2 "$(wp K5 '' inactive/4)" '取值「空」'
+_wwhy "IA6: failed/4 即使 LoadState=not-found ⇒ 仍无法确认(只放宽 inactive/4 这一对)" \
+      2 "$(wp K6 '' failed/4 ios "$(lsq failed/4 not-found 0)")" '退出码 4 不成对'
+
 # ── 与后续保护点的适用范围对齐 ──────────────────────────────────────────────
 o="$(wp W11 'touch opt/pdg-bot/iosprofile.py' inactive/3 android)"
 _wwhy "W11: Android 现场只剩 iosprofile.py ⇒ 有活(与 migrate_android_cleanup 用的同一个判据)" 0       "$o" '_retire_android_pending'

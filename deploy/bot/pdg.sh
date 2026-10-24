@@ -5056,7 +5056,7 @@ _RETIRE_WHY=""
 # **自己的适用条件**(平台确凿是 android)问既有的 _retire_android_pending。
 # 两个后续保护点各自的范围就是这里的范围, 不把所有平台的文件集合无条件并起来。
 _retire_work_pending(){   # 0=有 / 1=确认没有 / 2=无法确认
-  local R="${PDG_RETIRE_ROOT:-}" f st srv_rc=0 q=0
+  local R="${PDG_RETIRE_ROOT:-}" f st srv_rc=0 q=0 lst lst_rc=0
   local unit="$R/etc/systemd/system/pdg-mitm.service"
   local hij="$R/etc/mosdns/rules/mitm_hijack.txt"
   local mj="$R/etc/privdns-gateway/mitm.json"
@@ -5087,6 +5087,14 @@ _retire_work_pending(){   # 0=有 / 1=确认没有 / 2=无法确认
   case "${st}/${srv_rc}" in
     active/0)                 need_svc=1;;
     inactive/3|failed/3) ;;                       # 明确的"没在跑"(is-active 的正常退出码)
+    inactive/4)
+      # systemd 255 起, 对**不存在**的 unit, is-active 答 inactive 却以 4("没有这个 unit")收场。
+      # 只有 systemd 再确认 LoadState=not-found(查询退出 0、取值恰为这个词)才按"没在跑"采信;
+      # 确认不了照旧是观测无效 —— 不凭退出码 4 本身推断。
+      lst="$(systemctl show -p LoadState --value pdg-mitm 2>/dev/null)" || lst_rc=$?
+      if [[ "$lst_rc" != 0 || "$lst" != not-found ]]; then
+        _RETIRE_WHY="pdg-mitm 的运行态观测无效(状态词「inactive」/ 退出码 4, LoadState 查询退出 $lst_rc、取值「${lst:-空}」, 不能确认 unit 不存在)"; return 2
+      fi;;
     *) _RETIRE_WHY="pdg-mitm 的运行态观测无效(状态词「${st:-空}」/ 退出码 $srv_rc 不成对)"; return 2;;
   esac
   [[ -f "$unit" ]] && need_svc=1
