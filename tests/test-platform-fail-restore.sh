@@ -222,8 +222,9 @@ run_platform(){   # $1=目标平台 $2=fail|nofail $3=场景目录 [$4=被测 pd
     echo '  tar czf "$s/snap.tar.gz" -C / etc/privdns-gateway etc/systemd/system etc/mosdns etc/mihomo opt/pdg-bot 2>/dev/null'
     echo '  chmod 600 "$s/snap.tar.gz"'
       # 方案1: 前像由 cmd_snapshot 在打包之后保存 —— 调的是**抽进来的产品真函数**,
-      # 存不下就让快照失败(与产品同形)。SNAPSAVE_RC 可把它喂成失败, 不补恒真前像。
-      echo '  if [[ "${SNAPSAVE_RC:-0}" != 0 ]]; then return "$SNAPSAVE_RC"; fi'
+      # 存不下就让快照失败(与产品同形)。SNAPSAVE_RC 可把它喂成失败, 不补恒真前像;
+      # 失败时像真身那样把原因打到标准输出(七之二核它有没有转给用户)。
+      echo '  if [[ "${SNAPSAVE_RC:-0}" != 0 ]]; then echo "❌ 注入: 服务前像保存失败(SNAPSAVE_RC=$SNAPSAVE_RC)"; return "$SNAPSAVE_RC"; fi'
       echo '  _pdg_save_svcstate "$s" >/dev/null 2>&1 || return 1'
       echo '  _PDG_SNAP_CREATED="$s"; return 0; }'
     # 失败注入点: 退役件已经撤除之后、切换宣布成功之前的第一处可失败步骤。
@@ -631,6 +632,21 @@ grep -q 'PLAT_RC=0' <<<"$p" && ok "G1: 正常切换返回 0" || { bad "G1"; grep
 grep -q 'MIGRATE-NOOP migrate_drop_singbox' "$d/mig.log" && ok "G3: 链尾那几支也点到了(不是只跑了前半截)" || bad "G3"
 grep -q '材料保留在' <<<"$p" && bad "G4: 成功路径却进了「保留材料」分支" \
   || ok "G4: 成功路径没有保留材料(只有恢复不完整时才留)"
+
+echo
+echo "══ 七之二. 快照失败: 快照自己给出的原因要转给用户 ══"
+# 以前 cmd_platform 对 cmd_snapshot 是 `>/dev/null 2>&1`: 失败只剩一句"快照失败 → 中止切换", 原因被丢掉。
+seed_machine android; d="$WORK/snapfail"; mkdir -p "$d"
+o="$(SNAPSAVE_RC=1 run_platform ios nofail "$d")"; p="$(plain "$o")"
+exec_valid "$o" "PS"
+if grep -q 'PLAT_RC=0' <<<"$p"; then bad "PS1: 快照失败却返回 0"
+elif grep -qF '快照失败 → 中止切换(未改动任何东西)' <<<"$p"; then ok "PS1: 快照失败 ⇒ 中止切换并返回非 0"
+else bad "PS1: 没打出中止切换: $(grep -vE '^FINAL' <<<"$p" | tail -4 | tr '\n' ' ')"; fi
+grep -qF '注入: 服务前像保存失败(SNAPSAVE_RC=1)' <<<"$p" \
+  && ok "PS2: 快照自己给出的原因原样转给了用户" \
+  || bad "PS2: 原因被吞了: $(grep -vE '^FINAL' <<<"$p" | tail -4 | tr '\n' ' ')"
+[[ "$(cat /etc/privdns-gateway/platform)" == android ]] && ok "PS3: 平台标记没动(仍是 android)" \
+  || bad "PS3: 平台标记是 $(cat /etc/privdns-gateway/platform)"
 
 echo
 echo "══ 八. 撤销对照: 把本轮两处修复分别撤回 ══"

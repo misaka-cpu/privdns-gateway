@@ -3132,9 +3132,16 @@ cmd_update(){
     fi
   fi
   c_g "更新前留快照…"
-  if ! cmd_snapshot --source cli --op update >/dev/null 2>&1 || [[ -z "$_PDG_SNAP_CREATED" || ! -f "$_PDG_SNAP_CREATED/snap.tar.gz" ]]; then
-    c_y "❌ 更新前快照失败, 中止更新(拒绝在无法回滚的前提下继续)。"; return 1
+  # cmd_snapshot 自己的输出先收进临时文件: 成功时照旧不打; 失败时原样转给用户 —— 具体原因与
+  # "快照目录残留在 …"的提示都在里面, 以前 `>/dev/null 2>&1` 把它们和成功输出一起丢掉了。
+  # 不用 $(…): cmd_snapshot 要在本进程里设 _PDG_SNAP_CREATED, 子 shell 里设的带不回来。
+  local _snl; _snl="$(mktemp 2>/dev/null)" || _snl=""
+  if ! cmd_snapshot --source cli --op update >"${_snl:-/dev/null}" 2>&1 || [[ -z "$_PDG_SNAP_CREATED" || ! -f "$_PDG_SNAP_CREATED/snap.tar.gz" ]]; then
+    c_y "❌ 更新前快照失败, 中止更新(拒绝在无法回滚的前提下继续)。"
+    [[ -n "$_snl" ]] && { sed 's/^/    /' "$_snl"; rm -f "$_snl"; }
+    return 1
   fi
+  [[ -n "$_snl" ]] && rm -f "$_snl"
   local snap_dir="$_PDG_SNAP_CREATED"                                    # 精确回滚目标(不靠 index 0 猜)
   # 前像现在由 cmd_snapshot 在建快照时一并存好并校验过(见那里的注释)。这里**不再重复保存,
   # 也不重新采样** —— 再采一次会覆盖掉"操作前"那一刻的记录, 而两次采样之间机器状态可能已经变了。
@@ -8169,7 +8176,14 @@ cmd_platform(){
   _lock
   c_g "切换平台: $cur → $p"
   # 1) 先留快照。拿不到就别开始 —— 后面要改 nft、删/装 unit、重渲内核, 没有回退手段不能动手。
-  cmd_snapshot --source cli --op platform >/dev/null 2>&1 || { echo "❌ 快照失败 → 中止切换(未改动任何东西)"; return 1; }
+  # 快照输出的收法同 cmd_update: 失败时把 cmd_snapshot 自己的原因原样转给用户, 成功时不打。
+  local _snl; _snl="$(mktemp 2>/dev/null)" || _snl=""
+  if ! cmd_snapshot --source cli --op platform >"${_snl:-/dev/null}" 2>&1; then
+    echo "❌ 快照失败 → 中止切换(未改动任何东西)"
+    [[ -n "$_snl" ]] && { sed 's/^/    /' "$_snl"; rm -f "$_snl"; }
+    return 1
+  fi
+  [[ -n "$_snl" ]] && rm -f "$_snl"
   # 切平台会做退役类的**不可逆**动作(切 iOS 经 _plat_deploy_ios → _plat_purge_retired,
   # 切 Android 经 migrate_android_cleanup)。那两步要能力门放行, 门要的是"这一次操作的前像"。
   # 前像由上面那次 cmd_snapshot 在打包之后一并存好并校验过 —— 这里**只确认, 不再采样**:
@@ -10688,9 +10702,14 @@ _pdg_hijack_transact(){
 cmd_migrate(){
   need_root migrate; _lock
   c_g "迁移前留快照…"
-  if ! cmd_snapshot --source cli --op migrate >/dev/null 2>&1 || [[ -z "$_PDG_SNAP_CREATED" ]]; then
-    c_y "❌ 快照失败, 拒绝在无法回滚的前提下迁移。"; return 1
+  # 快照输出的收法同 cmd_update: 失败时把 cmd_snapshot 自己的原因原样转给用户, 成功时不打。
+  local _snl; _snl="$(mktemp 2>/dev/null)" || _snl=""
+  if ! cmd_snapshot --source cli --op migrate >"${_snl:-/dev/null}" 2>&1 || [[ -z "$_PDG_SNAP_CREATED" ]]; then
+    c_y "❌ 快照失败, 拒绝在无法回滚的前提下迁移。"
+    [[ -n "$_snl" ]] && { sed 's/^/    /' "$_snl"; rm -f "$_snl"; }
+    return 1
   fi
+  [[ -n "$_snl" ]] && rm -f "$_snl"
   local snap="$_PDG_SNAP_CREATED" rc=0
   # 显式迁移同样要在动手之前**确认**服务前像 —— 否则它自己就成了"不具备回滚能力的调用方",
   # 会被下面的退役门挡住。前像由上面那次 cmd_snapshot 存好并校验过, 这里**不再采样**
@@ -10705,8 +10724,10 @@ cmd_migrate(){
     c_g "✅ 迁移完成(快照: $snap)"
     return 0
   fi
-  _tx_audit cli migrate ROLLBACK_FAILED "snapshot=$snap"
-  c_y "❌ 迁移失败。快照仍在: $snap"
+  # 这里没有尝试回滚, 审计不能记 ROLLBACK_FAILED(那是"回滚了但没回完整")。记 FAILED: 只写审计,
+  # 不进事务状态机(doctor 的"配置事务"扫的是事务目录, 不读这份审计)。
+  _tx_audit cli migrate FAILED "snapshot=$snap rollback=not-attempted"
+  c_y "❌ 迁移失败, 本命令没有自动回滚。快照仍在: $snap"
   c_y "   需要回退时: sudo pdg rollback --dir $snap"
   return 1
 }

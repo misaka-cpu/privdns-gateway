@@ -139,8 +139,10 @@ nft(){ return 0; }
 # 本轮契约变化: 服务前像由 **cmd_snapshot** 保存并校验, cmd_update 只**确认**它可用。
 # 桩也照此产出前像; SVCSTATE_RC 非 0 时桩自己失败(= 前像存不下 ⇒ 快照失败),
 # PLAN_RC 非 0 时确认那一步不过(= 前像校验失败)。
+# SNAP_FAIL_WHY 非空时桩像真身那样把这句原因打到标准输出, 然后失败(核"原因有没有转给用户")。
 _pdg_svcstate_plan(){ _PDG_SVC_WHY="注入: 前像不可用"; [[ -f "$1/svcstate.tsv" ]] && return "${PLAN_RC:-0}"; return 1; }
-cmd_snapshot(){ _PDG_SNAP_CREATED="$WORK/snap"; mkdir -p "$_PDG_SNAP_CREATED"; : | gzip > "$_PDG_SNAP_CREATED/snap.tar.gz"
+cmd_snapshot(){ [[ -n "${SNAP_FAIL_WHY:-}" ]] && { echo "$SNAP_FAIL_WHY"; return 1; }
+  _PDG_SNAP_CREATED="$WORK/snap"; mkdir -p "$_PDG_SNAP_CREATED"; : | gzip > "$_PDG_SNAP_CREATED/snap.tar.gz"
   _pdg_save_svcstate "$_PDG_SNAP_CREATED" || { _PDG_SNAP_CREATED=""; return 1; }
   return 0; }
 cmd_rollback(){ echo "ROLLBACK_CALLED $*"; return 0; }
@@ -282,6 +284,19 @@ _r=$(run "INSYNC_RC=0"); _rc="${_r%%|*}"; _out="${_r#*|}"
 { [[ "$_rc" == 0 ]] && grep -q '无需更新' <<<"$_out"; } \
   && ok "N3: 喂'已同步' ⇒ 健康短路(rc=0), 说明本壳默认走的是修复路径而非被写死" \
   || bad "N3: 喂'已同步'没短路(rc=$_rc): $(tail -2 <<<"$_out")"
+
+echo
+echo "══ S. 快照失败的原因要转给用户 ══"
+# 以前 cmd_update 对 cmd_snapshot 是 `>/dev/null 2>&1`: 失败只剩一句"更新前快照失败", 快照自己给出的
+# 具体原因(以及"快照目录残留在 …"的提示)一起被丢掉。
+: > "$WORK"/e2e-inject-hit; : > "$WORK"/e2e-inject-count
+_r=$(run "SNAP_FAIL_WHY=❌注入:快照打包失败-S1"); _rc="${_r%%|*}"; _out="${_r#*|}"
+_n_snap="$(wc -l < "$WORK"/e2e-inject-count)"
+{ [[ "$_rc" != 0 ]] && grep -q '更新前快照失败, 中止更新' <<<"$_out" && grep -qF '❌注入:快照打包失败-S1' <<<"$_out" \
+  && ! grep -q ROLLBACK_CALLED <<<"$_out" && ! grep -q '✅ 已更新' <<<"$_out" && [[ "$_n_snap" == 0 ]]; } \
+  && ok "S1: 快照失败 ⇒ 中止更新, 快照自己给出的原因原样转给了用户(rc=$_rc, 未装受管目标)" \
+  || bad "S1: rc=$_rc 装了 $_n_snap 个受管目标 out=$(tail -4 <<<"$_out" | tr '\n' ' ')"
+: > "$WORK"/e2e-inject-hit; : > "$WORK"/e2e-inject-count
 
 echo "────────────────────────────────────────"
 echo "通过 $pass, 失败 $nfail"

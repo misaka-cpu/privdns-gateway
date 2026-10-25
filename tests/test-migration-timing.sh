@@ -41,11 +41,11 @@ build(){
     # cmd_migrate 只确认。所以这里的替身必须真的产出 svcstate.tsv, 否则 cmd_migrate 会在
     # 确认那一步按契约拒绝 —— 那不是"顺序不对", 是现场没搭对。
     # 两个旋钮都**可控**, 不用恒真把安全门消掉:
-    #   SNAP_RC=1   快照自己失败
+    #   SNAP_RC=1   快照自己失败(像真身那样把原因打到标准输出)
     #   SNAP_NOPRE=1 快照成功但**不产出前像**(模拟前像缺失)
     #   PLAN_RC=1   前像在, 但确认不过
     echo 'cmd_snapshot(){ echo "SNAPSHOT" >> "$WORK/order"'
-    echo '  [[ "${SNAP_RC:-0}" == 0 ]] || return "$SNAP_RC"'
+    echo '  [[ "${SNAP_RC:-0}" == 0 ]] || { echo "❌ 注入: 快照打包失败(SNAP_RC=$SNAP_RC)"; return "$SNAP_RC"; }'
     echo '  _PDG_SNAP_CREATED="$WORK/snap"; mkdir -p "$WORK/snap"'
     echo '  [[ "${SNAP_NOPRE:-0}" == 1 ]] || printf "modeled\n" > "$WORK/snap/svcstate.tsv"'
     echo '  return 0; }'
@@ -55,7 +55,8 @@ build(){
     echo '  return 0; }'
     echo 'need_root(){ :; }'
     echo '_lock(){ echo "LOCK" >> "$WORK/order"; }'
-    echo 'c_g(){ :; }; c_y(){ :; }'
+    # c_y 照真身打到标准输出(run 把它收进 RUN_OUT), 提示文案才看得见; c_g 仍静默。
+    echo 'c_g(){ :; }; c_y(){ printf "%s\n" "$*"; }'
     echo '_tx_audit(){ echo "AUDIT:$3" >> "$WORK/order"; }'
     sed -n '/^# 5.1: \*\*取消命令分派前的隐藏迁移/,$p' "$ROOT/deploy/bot/pdg.sh" \
       | grep -v '^cmd_migrate(){' > /dev/null   # 分派段本身在下面整体取
@@ -66,13 +67,13 @@ build(){
 build
 export WORK
 # 退出码与执行有效性都要看得见: 只回顺序串的话, "壳自己炸了"与"产品按契约拒绝"没法区分。
-# RUN_RC=被测退出码; RUN_ERR=stderr 落点。
-RUN_ERR="$WORK/run.err"; RUN_RCF="$WORK/run.rc"
+# RUN_RC=被测退出码; RUN_ERR=stderr 落点; RUN_OUT=stdout 落点(提示文案)。
+RUN_ERR="$WORK/run.err"; RUN_RCF="$WORK/run.rc"; RUN_OUT="$WORK/run.out"
 # 注意: 调用方都写成 out="$(run …)", 那是**命令替换子壳** —— 在里面给变量赋值,
 # 外面读到的还是上一次的值(实测: 三个失败格都报 rc=0, 其实是健康那次留下的)。
 # 所以退出码落盘, 由 rc() 从文件读。
-run(){ : > "$WORK/order"; : > "$RUN_ERR"; rm -rf "$WORK/snap"
-       local _rc=0; bash "$WORK/disp.sh" "$@" >/dev/null 2>"$RUN_ERR" || _rc=$?
+run(){ : > "$WORK/order"; : > "$RUN_ERR"; : > "$RUN_OUT"; rm -rf "$WORK/snap"
+       local _rc=0; bash "$WORK/disp.sh" "$@" >"$RUN_OUT" 2>"$RUN_ERR" || _rc=$?
        printf '%s' "$_rc" > "$RUN_RCF"
        tr '\n' ' ' < "$WORK/order" 2>/dev/null; }
 rc(){ cat "$RUN_RCF" 2>/dev/null || echo "<未取得>"; }
@@ -119,6 +120,22 @@ out="$(PLAN_RC=1 run migrate)"
   && ! grep -q MIGRATE <<<"$out" && ! grep -q 'AUDIT:COMMITTED' <<<"$out"; } \
   && ok "3c: 确认不过 ⇒ 退出码 $(rc), 确认被调到但不进迁移、不记成功审计($out)" \
   || bad "3c: 实得 rc=$(rc) order=[$out] 执行有效=$(_exec_ok && echo 是 || echo "否: $(_exec_why)")"
+# 3a2 快照失败时, cmd_snapshot 自己给出的原因要原样转给用户(以前被 >/dev/null 2>&1 丢掉, 只剩一句"快照失败")
+out="$(SNAP_RC=1 run migrate)"
+{ _exec_ok && [[ "$(rc)" != 0 ]] && grep -q '快照失败, 拒绝在无法回滚的前提下迁移' "$RUN_OUT" \
+  && grep -qF '注入: 快照打包失败(SNAP_RC=1)' "$RUN_OUT"; } \
+  && ok "3a2: 快照失败 ⇒ 快照自己给出的原因原样转给了用户" \
+  || bad "3a2: 实得 rc=$(rc) 输出=[$(tr '\n' ' ' < "$RUN_OUT")] 执行有效=$(_exec_ok && echo 是 || echo "否: $(_exec_why)")"
+# 3d 迁移链失败 ⇒ 审计记 FAILED; cmd_migrate 不尝试回滚, 不能记 ROLLBACK_FAILED("回滚了但没回完整")
+out="$(MIGRATE_RC=1 run migrate)"
+{ _exec_ok && [[ "$(rc)" != 0 ]] && grep -q MIGRATE <<<"$out" && grep -q 'AUDIT:FAILED' <<<"$out" \
+  && ! grep -q 'AUDIT:ROLLBACK_FAILED' <<<"$out"; } \
+  && ok "3d: 迁移链失败 ⇒ 审计记 FAILED, 不记 ROLLBACK_FAILED($out)" \
+  || bad "3d: 实得 rc=$(rc) order=[$out] 执行有效=$(_exec_ok && echo 是 || echo "否: $(_exec_why)")"
+# 3e 同一次运行的提示: 明说本命令没有自动回滚, 并给出回退命令
+{ grep -q '没有自动回滚' "$RUN_OUT" && grep -q 'sudo pdg rollback --dir' "$RUN_OUT"; } \
+  && ok "3e: 迁移失败的提示明说没有自动回滚, 并给出回退命令" \
+  || bad "3e: 输出=[$(tr '\n' ' ' < "$RUN_OUT")]"
 
 # ── 4. 内部入口 __migrate 仍然可用(cmd_update 装好新脚本后靠它跑新版迁移)──
 # 按替身自己的顺序记录逐行核(不是"记录里出现某个词"): 锁 → 迁移 → 新步骤, 各 1 次, 新步骤只收到 --after-migrate。
