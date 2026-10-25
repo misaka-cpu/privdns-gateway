@@ -115,6 +115,8 @@ U
     || { echo "[FAIL] 播种后的 mihomo 过不了生产判据 pdg_mihomo_binary_ok"; exit 1; }
   export SB
 }
+# 防火墙备份不许留在 /etc: 每条返回路径(拒绝、失败、成功)之后都该已删掉。
+noscbak(){ [[ ! -e "$SB/etc/nftables.conf.scbak" ]]; }
 
 harness(){ cat <<'EOF'
 need_root(){ :; }; _lock(){ :; }
@@ -189,12 +191,14 @@ out=$(run "RENDER_MODE=unknown" migrate_drop_singbox)
   && ok "转换失败: backend 标记已回滚(不留半迁移态)" || bad "1b: backend=$(cat "$SB/etc/privdns-gateway/backend")"
 [[ -e "$SB/usr/local/bin/sing-box" && -e "$SB/etc/systemd/system/sing-box.service" ]] \
   && ok "转换失败: sing-box 运行时原样保留(用户仍可用旧版)" || bad "1c: sing-box 被误删"
+noscbak && ok "转换失败: 不留 /etc/nftables.conf.scbak" || bad "1d: 拒绝路径留下了 .scbak"
 
 # ── 2. 渲染抛异常 → 带出异常类型与信息 ──
 mk singbox
 out=$(run "RENDER_MODE=raise" migrate_drop_singbox)
 { grep -q 'ValueError' <<<"$out" && grep -q '缺 server 字段' <<<"$out" && grep -q 'RC=1' <<<"$out"; } \
   && ok "渲染异常: 带出异常类型与原始信息 + 非0" || bad "2: out=$out"
+noscbak && ok "渲染异常: 不留 /etc/nftables.conf.scbak" || bad "2d: 渲染异常路径留下了 .scbak"
 
 # ── 2b/2c. 迁移前的 P0 硬门槛: 现场还有别的 input base chain → 动任何东西之前中止 ──
 # (921e961) PDG 的 input chain 是 policy drop; 同一个 hook 上并存的别家 base chain 都会执行,
@@ -209,6 +213,10 @@ out=$(run "RENDER_MODE=ok FOREIGN_RC=0" migrate_drop_singbox)
   && [[ -e "$SB/usr/local/bin/sing-box" && -e "$SB/etc/systemd/system/sing-box.service" ]] \
   && ! grep -q 'RC=0' <<<"$out"; } \
   && ok "有其它 input base chain: 现场未被改动(标记未翻, sing-box 运行时原样)" || bad "2b2: out=$out"
+# 这道门排在迁移链倒数第二环, 前面的迁移已经跑过: 提示只能替这一步作保证, 不能说"现场未做任何改动"。
+{ ! grep -q '现场未做任何改动' <<<"$out" && grep -q '这一步没有动内核、防火墙与 sing-box' <<<"$out" \
+  && grep -q '排在这一步之前的迁移已经执行过' <<<"$out"; } \
+  && ok "有其它 input base chain: 提示只替这一步作保证, 并说明前面的迁移已经执行过" || bad "2b3: out=$out"
 
 # 判不了 ≠ 干净: 读不到运行中的 ruleset(非 root / nft 不可用)时, 内存里的冲突链没进视野。
 mk singbox
@@ -217,12 +225,16 @@ out=$(run "RENDER_MODE=ok FOREIGN_RC=2" migrate_drop_singbox)
   && ok "读不到运行中 ruleset: 按「无法确认」中止, 不当成干净" || bad "2c: out=$out"
 [[ "$(cat "$SB/etc/privdns-gateway/backend")" == singbox ]] \
   && ok "读不到运行中 ruleset: backend 未翻(现场未被改动)" || bad "2c2: backend=$(cat "$SB/etc/privdns-gateway/backend")"
+{ ! grep -q '现场未做任何改动' <<<"$out" && grep -q '这一步还没有动内核、防火墙与 sing-box' <<<"$out" \
+  && grep -q '排在这一步之前的迁移已经执行过' <<<"$out"; } \
+  && ok "读不到运行中 ruleset: 提示只替这一步作保证, 并说明前面的迁移已经执行过" || bad "2c3: out=$out"
 
 # ── 3. mihomo -t 不过 → 带出 mihomo 自己的报错 ──
 mk singbox
 out=$(run "RENDER_MODE=ok MIHOMO_T_FAIL=1 MIHOMO_T_ERR=rule_9_is_invalid_xyz" migrate_drop_singbox)
 { grep -q 'rule_9_is_invalid_xyz' <<<"$out" && grep -q 'mihomo 配置校验失败' <<<"$out" && grep -q 'RC=1' <<<"$out"; } \
   && ok "mihomo -t 失败: 带出内核真实报错 + 非0" || bad "3: out=$out"
+noscbak && ok "mihomo -t 失败: 不留 /etc/nftables.conf.scbak" || bad "3b: 校验失败路径留下了 .scbak"
 
 # ── 4. nft 应用失败 → 回滚标记 + 非0 ──
 mk singbox
@@ -233,6 +245,7 @@ out=$(run "RENDER_MODE=ok NFT_RC=1" migrate_drop_singbox)
   && ok "nft 失败: backend 标记已回滚" || bad "4b"
 [[ -s "$SB/nft-applied" ]] \
   && ok "nft 失败: 回滚把 nftables 真正应用回去了(不只是把文件拷回来)" || bad "4c: _nft_apply_main 没被调到"
+noscbak && ok "nft 失败: 写回之后不留 /etc/nftables.conf.scbak" || bad "4d: nft 失败路径留下了 .scbak"
 
 # ── 5. 内核起不来 → 回滚并附上日志线索 ──
 mk singbox
@@ -243,6 +256,7 @@ out=$(run "RENDER_MODE=ok ACTIVATE_RC=1" migrate_drop_singbox)
   && ok "内核起不来: sing-box 二进制未删(还能退回去)" || bad "5b: sing-box 被误删"
 [[ -s "$SB/nft-applied" ]] \
   && ok "内核起不来: 回滚把 nftables 真正应用回去了" || bad "5c: _nft_apply_main 没被调到"
+noscbak && ok "内核起不来: 不留 /etc/nftables.conf.scbak" || bad "5d: 起核失败路径留下了 .scbak"
 
 # ── 6. 一切正常 → 迁移成功, sing-box 运行时清干净, backend 落定 mihomo ──
 mk singbox
@@ -255,6 +269,26 @@ out=$(run "RENDER_MODE=ok" migrate_drop_singbox)
   && ok "正常路径: sing-box 二进制已删" || bad "6c: sing-box 二进制仍在"
 [[ ! -e "$SB/etc/systemd/system/sing-box.service" ]] \
   && ok "正常路径: sing-box.service 已删" || bad "6d: unit 仍在"
+noscbak && ok "正常路径: 不留 /etc/nftables.conf.scbak" || bad "6e: 成功路径留下了 .scbak"
+
+# ── 6b. 下载 / 校验失败 → 非0, 也不留 .scbak ──
+# 沙箱根里不放 mihomo, 生产判据不过 → 走下载; curl 是禁令桩(返回 7)。这一格把取件记进单独的
+# 一本账, 用来证明确实走到了下载分支; 末尾"全程零联网"看的仍是公共账本, 不受这一格影响。
+mk singbox; rm -f "$SB/usr/local/bin/mihomo"; : > "$WORK/net-dl.log"
+out=$(run "RENDER_MODE=ok NETLOG=$WORK/net-dl.log" migrate_drop_singbox)
+{ grep -q 'mihomo 下载/校验失败, 未迁移' <<<"$out" && grep -q 'RC=1' <<<"$out" && [[ -s "$WORK/net-dl.log" ]]; } \
+  && ok "下载失败: 走到了下载分支(禁令桩记下取件)并返回非0" || bad "9: out=$out"
+noscbak && ok "下载失败: 不留 /etc/nftables.conf.scbak" || bad "9b: 下载失败路径留下了 .scbak"
+
+# ── 6c. 上一次留下的 .scbak 不能顶替本次备份 ──
+# 这一次 nftables.conf 不在(cp 必然失败), 而 /etc 里躺着一份更早留下的 .scbak。nft 应用失败时的
+# 写回只能用本次建成的备份; 拿旧文件写回, 等于把一份不知何时的防火墙配置装回现网。
+mk singbox; rm -f "$SB/etc/nftables.conf"; printf 'STALE-FROM-EARLIER-RUN\n' > "$SB/etc/nftables.conf.scbak"
+out=$(run "RENDER_MODE=ok NFT_RC=1" migrate_drop_singbox)
+{ grep -q 'RC=1' <<<"$out" && ! grep -q 'STALE-FROM-EARLIER-RUN' "$SB/etc/nftables.conf" 2>/dev/null; } \
+  && ok "旧 .scbak: 本次备份没建成时, 不拿旧文件写回 nftables.conf" \
+  || bad "10: nftables.conf=[$(cat "$SB/etc/nftables.conf" 2>/dev/null || echo 不存在)] out=$out"
+noscbak && ok "旧 .scbak: 返回后 /etc 里不再留 .scbak" || bad "10b: 留下了 .scbak"
 
 # ── 7. 幂等: 已是纯 mihomo 的机器再跑一次 → 直接短路返回 0, 不重复迁移 ──
 mk mihomo

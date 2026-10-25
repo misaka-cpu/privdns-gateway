@@ -7361,6 +7361,9 @@ _activate_mihomo_core(){
   source "$REPO_DIR/lib/versions.sh" 2>/dev/null || { echo "❌ 读不到 versions.sh"; return 1; }
   # shellcheck source=/dev/null
   source "$REPO_DIR/lib/units.sh"   2>/dev/null || { echo "❌ 读不到 units.sh"; return 1; }
+  # 本次的防火墙备份。先删掉上一次留下的那份: 这次 cp 失败时, 下面的写回不能拿旧文件顶替。
+  # 之后每一条返回路径都把它删掉(以前拒绝与失败路径会把它留在 /etc 里)。
+  rm -f /etc/nftables.conf.scbak
   cp /etc/nftables.conf /etc/nftables.conf.scbak 2>/dev/null
 
   # 这是第三个装 mihomo 的地方(前两个是 install.sh 与 _update_core_binary), 判据必须同一份:
@@ -7370,10 +7373,10 @@ _activate_mihomo_core(){
     c_g "下载 mihomo $MIHOMO_VER…"; t=$(mktemp -d)
     if ! curl -fsSL "https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VER}/mihomo-linux-${march}-${MIHOMO_VER}.gz" -o "$t/m.gz" \
        || ! pdg_verify_sha256 "$t/m.gz" "${PDG_SHA256[mihomo-$march]:-}" "mihomo $MIHOMO_VER" \
-       || ! gunzip -c "$t/m.gz" > "$t/mihomo"; then rm -rf "$t"; echo "❌ mihomo 下载/校验失败, 未迁移"; return 1; fi
+       || ! gunzip -c "$t/m.gz" > "$t/mihomo"; then rm -rf "$t"; rm -f /etc/nftables.conf.scbak; echo "❌ mihomo 下载/校验失败, 未迁移"; return 1; fi
     # 落盘前核解压产物 —— 与 install.sh / _update_core_binary 同一道门, 同一份钉值。
     if ! pdg_verify_sha256 "$t/mihomo" "${PDG_SHA256[mihomo-bin-$march]:-}" "mihomo $MIHOMO_VER 二进制 ($march)"; then
-      rm -rf "$t"; echo "❌ mihomo 二进制内容与钉值不符, 未迁移"; return 1; fi
+      rm -rf "$t"; rm -f /etc/nftables.conf.scbak; echo "❌ mihomo 二进制内容与钉值不符, 未迁移"; return 1; fi
     install -m755 "$t/mihomo" /usr/local/bin/mihomo; rm -rf "$t"
   fi
   install -d -m700 /etc/mihomo
@@ -7402,18 +7405,18 @@ if drop:
     sys.exit(1)
 SCPY
   ); then
-    printf '%s\n' "${prev_backend:-singbox}" > /etc/privdns-gateway/backend
+    printf '%s\n' "${prev_backend:-singbox}" > /etc/privdns-gateway/backend; rm -f /etc/nftables.conf.scbak
     echo "❌ 未迁移(已回滚标记): ${why:-渲染 mihomo 配置失败(无输出)}"; return 1
   fi
   if ! why=$(mihomo -t -d /etc/mihomo -f /etc/mihomo/config.yaml 2>&1); then
-    printf '%s\n' "${prev_backend:-singbox}" > /etc/privdns-gateway/backend
+    printf '%s\n' "${prev_backend:-singbox}" > /etc/privdns-gateway/backend; rm -f /etc/nftables.conf.scbak
     echo "❌ 未迁移(已回滚标记): mihomo 配置校验失败:"
     printf '%s\n' "$why" | tail -c 400 | sed 's/^/    /'; return 1
   fi
   pdg_write_unit pdg_unit_mihomo /etc/systemd/system/mihomo.service   # 与装机同源(含 SAFE_PATHS)
   # (换核时曾在 iOS 上顺手补写 pdg-mitm.service; WLOC 已退役, 那个 unit 不再生成。)
   systemctl daemon-reload
-  _switchcore_nft mihomo || { printf '%s\n' "${prev_backend:-singbox}" > /etc/privdns-gateway/backend; [[ -f /etc/nftables.conf.scbak ]] && { cp /etc/nftables.conf.scbak /etc/nftables.conf; _nft_apply_main; }; echo "❌ nft 应用失败, 已回滚"; return 1; }
+  _switchcore_nft mihomo || { printf '%s\n' "${prev_backend:-singbox}" > /etc/privdns-gateway/backend; [[ -f /etc/nftables.conf.scbak ]] && { cp /etc/nftables.conf.scbak /etc/nftables.conf; _nft_apply_main; }; rm -f /etc/nftables.conf.scbak; echo "❌ nft 应用失败, 已回滚"; return 1; }
   if ! _core_kernel_activate mihomo sing-box; then
     c_y "mihomo 启动/自启核验失败 → 回滚"
     printf '%s\n' "${prev_backend:-singbox}" > /etc/privdns-gateway/backend
@@ -7447,14 +7450,17 @@ migrate_drop_singbox(){
   # 前置硬门槛: 现场若还有别的 input base chain, PDG 的 policy drop 会把它们的放行架空
   # (配置看着还在、端口实际不通)。必须在**动任何东西之前**中止 —— 下核、翻标记、渲染配置、
   # 写 unit、改 nft、切服务, 一个都还没做。
+  # 这只是本函数之内: 迁移链里排在它前面的迁移(退役、模块与 unit 部署、防火墙迁移等)已经跑过,
+  # 所以拒绝提示只能替这一步作保证, 不能说"现场未做任何改动"。
   local _fic _frc
   _fic="$(_pdg_nft_foreign_input_chains /etc/nftables.conf)"; _frc=$?
   # 2 = 读不到运行中的 ruleset(非 root / nft 不可用): 内存里的冲突链没进视野, 不能当成干净。
-  # 迁移本来就要写 nft 规则, 这台机器上迟早也过不去 —— 早停一步, 现场还没被动过。
+  # 迁移本来就要写 nft 规则, 这台机器上迟早也过不去 —— 早停一步, 本函数还没动过现场。
   if [[ "$_frc" == 2 ]]; then
-    c_y "无法确认现场是否存在其它 input base chain → 中止迁移(现场未做任何改动)。"
+    c_y "无法确认现场是否存在其它 input base chain → 中止迁移到 mihomo(这一步还没有动内核、防火墙与 sing-box)。"
     printf '%s\n' "$_fic" | sed 's/^/    /'
     c_y "  怎么办: 用 root 重试 sudo pdg update; 若本机确无 nftables, 请先装好 nftables 再迁移。"
+    c_y "  注意: 本次迁移链里排在这一步之前的迁移已经执行过, 不在上面这句话的范围内; 经 pdg update 进来时, 随后会按更新前快照回滚。"
     return 1
   fi
   if [[ "$_frc" == 0 ]]; then
@@ -7464,7 +7470,8 @@ migrate_drop_singbox(){
     c_y "        PDG 的 input chain 是 policy drop, 会把上面这些表里的放行(如自定义端口/VPN)架空,"
     c_y "        表面上配置都在, 实际端口不通。这种失效比直接报错更难排查, 故不自动处理。"
     c_y "  怎么办: 把上述表里需要的放行规则并入 table inet pdg 的 input chain(或改用非 input hook),"
-    c_y "          再重试 sudo pdg update。现场未做任何改动, sing-box 仍在正常运行。"
+    c_y "          再重试 sudo pdg update。这一步没有动内核、防火墙与 sing-box。"
+    c_y "  注意: 本次迁移链里排在这一步之前的迁移已经执行过, 不在上面这句话的范围内; 经 pdg update 进来时, 随后会按更新前快照回滚。"
     return 1
   fi
   c_y "检测到 sing-box 运行时(v1.6.0 已移除)→ 迁移到 mihomo 唯一内核(出口/分流/证书/DoT 不动)…"

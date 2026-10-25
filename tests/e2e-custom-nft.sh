@@ -46,7 +46,7 @@ e2e_write_nft_stub
 # ── 目标原句(与 deploy/bot/pdg.sh 的输出逐字一致) ─────────────────────────────
 CN_CALLS="$E2E_TMP/e2e-calls.log"      # 共享桩的调用记录: nft / systemctl 每调用一次记一行
 CN_GATE1='检测到自定义 input base chain, 无法保证与 PDG 默认拒绝策略(policy drop)兼容 → 中止迁移。'
-CN_GATE3='无法确认现场是否存在其它 input base chain → 中止迁移(现场未做任何改动)。'
+CN_GATE3='无法确认现场是否存在其它 input base chain → 中止迁移到 mihomo(这一步还没有动内核、防火墙与 sing-box)。'
 CN_DONE2='已迁移到 mihomo 内核, sing-box 运行时已移除。'
 CN_DONE2B='✅ 迁移完成(快照: '
 
