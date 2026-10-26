@@ -4,6 +4,7 @@
 # S-1 验收器(tests/e2e-real-first-upgrade.sh)的接线契约与本地模型格(不碰真实服务; 不需要 root / systemd; 本机与 CI 都能跑)。
 #   一、workflow 接线: real_scope 多了 first-upgrade 这一个选项(整块原文登记); 文件末尾追加的 real-first-upgrade 是最后一个 job;
 #       它的准备步骤与 ③ job 逐字相同、② 步只换名称行、S-1 步与留证步按登记生成; 相对 2982aa54 只有这两处改动。
+#       F-1(f1 证据 reg/REG-F1-01.txt)登记性更新: 末尾又追加了 real-f1, 选项多了 f1, 允许改动的路径多了 F-1 的三个新文件; 其余判据不变。
 #   二、静态: 只有六个路径相对 2982aa54 有变化; 共享输入逐字节不变; 验收器按它自己的抽法从"现在"与 2982aa54 各抽一次逐名逐字相同且非空;
 #       不得调用 r3_gated_invoke / r3_quiesce / r3_q_*; 没有 _dw_settle、没有对 dotwitness 的 systemctl 动作、没有 systemctl 包装;
 #       唯一调用入口 r3_invoke 恰一处; ③ 的环境常量与内联判据逐字照抄(后者只换判词前缀)。
@@ -81,7 +82,7 @@ ctext = open(wf, encoding="utf-8").read(); btext = open(basewf, encoding="utf-8"
 c = ctext.split("\n"); b = btext.split("\n")
 def R(i, good, mok, mbad):
     print(("OK" if good else "BAD") + "\t" + i + "\t" + (mok if good else mbad))
-OPT = '        options: ["all", "platform", "retire", "bridge", "retire-hop", "late-failure", "retire-hop-bc", "first-upgrade"]'
+OPT = '        options: ["all", "platform", "retire", "bridge", "retire-hop", "late-failure", "retire-hop-bc", "first-upgrade", "f1"]'
 NOW = [
     '      real_scope:',
     '        # 只在 real_acceptance=true 时有意义。默认 all = 与以前逐字节相同的三 job 语义;',
@@ -90,11 +91,12 @@ NOW = [
     '        # 选 late-failure 就只跑④(退役成功后的晚期失败 → 产品自己回滚到本次快照; 同一 job 里先原样跑 ②)。',
     '        # 选 retire-hop-bc 就只跑 B / C2 两跳(前像在本 job 里构造, 再经桥接入口与已装桥接 CLI 两跳到退役候选; b / c2 各一格)。',
     '        # 选 first-upgrade 就只跑 S-1(已安装桥接 → 新候选的首次升级, 不施加准备阶段静置; 同一 job 里先原样跑 ②; 观测 pdg-dotwitness 触限、恢复与父进程收尾)。',
+    '        # 选 f1 就只跑 F-1 的 a / b 两格(已安装桥接 → 新候选的首次升级里, 外来进程占住 127.0.0.1:5399 时新步骤的分支、政策与报告; 同一 job 里先原样跑 ②; a 先静置, b 不静置)。',
     '        # 是**显式范围选择**, 不是用 continue-on-error 把失败绕过去 —— 被选中的 job',
     '        # 该红照样红, 没被选中的 job 直接不启动(不产生结果, 也不冒充通过)。',
-    '        description: "真实验收的范围(默认 all; platform = 只跑⑤a/⑤b; retire = 只跑①旧 CLI 直跳被拒; bridge = 只跑② v1.11.15→桥接; retire-hop = ②+③ 同一 job; late-failure = ②+④ 同一 job; retire-hop-bc = B/C2 两跳; first-upgrade = ②+S-1 同一 job)"',
+    '        description: "真实验收的范围(默认 all; platform = 只跑⑤a/⑤b; retire = 只跑①旧 CLI 直跳被拒; bridge = 只跑② v1.11.15→桥接; retire-hop = ②+③ 同一 job; late-failure = ②+④ 同一 job; retire-hop-bc = B/C2 两跳; first-upgrade = ②+S-1 同一 job; f1 = ②+F-1a / ②+F-1b 各一格)"',
     '        type: choice',
-    '        options: ["all", "platform", "retire", "bridge", "retire-hop", "late-failure", "retire-hop-bc", "first-upgrade"]',
+    '        options: ["all", "platform", "retire", "bridge", "retire-hop", "late-failure", "retire-hop-bc", "first-upgrade", "f1"]',
     '        default: "all"'
 ]
 def region(lines):
@@ -104,21 +106,23 @@ def region(lines):
     while j < len(lines) and lines[j] != '        default: "all"':
         j += 1
     return (i, j + 1) if j < len(lines) else None
-R("W1", c.count(OPT) == 1, "real_scope 选项整行逐字相符(原有七项顺序不变, 末尾是 first-upgrade)", "real_scope 选项整行不对")
+R("W1", c.count(OPT) == 1, "real_scope 选项整行逐字相符(原有八项顺序不变, 末尾是 f1)", "real_scope 选项整行不对")
 rc, rb = region(c), region(b)
 R("W2", rc is not None and c[rc[0]:rc[1]] == NOW, "real_scope 整块与登记原文逐字相符(%d 行)" % len(NOW), "real_scope 整块与登记原文不符或定位不到")
-S1H = "\n  real-first-upgrade:\n"
-s1 = ctext[ctext.index(S1H) + 1:] if ctext.count(S1H) == 1 else ""
-heads_s1 = re.findall(r"^  ([a-z][a-z0-9-]*):$", s1, re.M)
+S1H = "\n  real-first-upgrade:\n"; F1H = "\n  real-f1:\n"   # F-1 登记性更新: 其后再接恰 1 处 real-f1(内容由 F-1 契约核)
+ok_h = ctext.count(S1H) == 1 and ctext.count(F1H) == 1 and ctext.index(F1H) > ctext.index(S1H)
+s1 = ctext[ctext.index(S1H) + 1:ctext.index(F1H) + 1] if ok_h else ""
+f1 = ctext[ctext.index(F1H) + 1:] if ok_h else ""
+heads_s1 = re.findall(r"^  ([a-z][a-z0-9-]*):$", s1, re.M); heads_f1 = re.findall(r"^  ([a-z][a-z0-9-]*):$", f1, re.M)
 good3 = False
-if rc and rb and s1 and heads_s1 == ["real-first-upgrade"]:
+if rc and rb and s1 and heads_s1 == ["real-first-upgrade"] and heads_f1 == ["real-f1"]:
     bm = "\n".join(b[:rb[0]] + ["<<REAL_SCOPE>>"] + b[rb[1]:]); cm = "\n".join(c[:rc[0]] + ["<<REAL_SCOPE>>"] + c[rc[1]:])
-    good3 = (cm == bm + "\n" + s1)
-R("W3", good3, "相对 2982aa54: 只改了 real_scope 块, 其余改动只有文件末尾追加的 1 个空行 + real-first-upgrade(%d 行, 块内只有它一个 job 头)" % s1.count("\n"),
-  "相对 2982aa54 有登记之外的改动, 或 real-first-upgrade 不是恰 1 处 / 后面还有别的 job")
+    good3 = (cm == bm + "\n" + s1 + f1)
+R("W3", good3, "相对 2982aa54: 只改了 real_scope 块, 其余改动只有文件末尾追加的 1 个空行 + real-first-upgrade(%d 行, 块内只有它一个 job 头), 其后是 real-f1(%d 行, 内容由 F-1 契约核)" % (s1.count("\n"), f1.count("\n")),
+  "相对 2982aa54 有登记之外的改动, 或 real-first-upgrade / real-f1 不是各恰 1 处 / 后面还有别的 job")
 heads = re.findall(r"^  ([a-z][a-z0-9-]*):$", ctext, re.M)
-R("W4", heads[-2:] == ["real-retire-hop-bc", "real-first-upgrade"], "最后一个 job 是 real-first-upgrade, 紧挨在 real-retire-hop-bc 之后",
-  "最后两个 job 是 %r" % (heads[-2:],))
+R("W4", heads[-3:] == ["real-retire-hop-bc", "real-first-upgrade", "real-f1"], "real-first-upgrade 紧挨在 real-retire-hop-bc 之后, 其后只有 real-f1(末尾依次追加)",
+  "最后三个 job 是 %r" % (heads[-3:],))
 def jb(name):
     h = "  %s:" % name
     if c.count(h) != 1:
@@ -209,10 +213,10 @@ fi
 if want static; then
 echo "══ 二. 静态: 六路径、共享输入、抽取块、禁用调用、照抄原文 ══"
 SIX="$(printf '%s\n' .github/workflows/ci.yml tests/e2e-real-first-upgrade.sh tests/test-first-upgrade-contract.sh tests/test-late-failure-contract.sh \
-  tests/test-retire-hop-bc-contract.sh tests/test-retire-hop-contract.sh | LC_ALL=C sort)"
+  tests/test-retire-hop-bc-contract.sh tests/test-retire-hop-contract.sh tests/e2e-real-f1.sh tests/helpers/f1-occupant.py tests/test-f1-contract.sh | LC_ALL=C sort)"
 if d1="$(git -C "$ROOT" diff --name-only "$BASE" -- 2>/dev/null)" && d2="$(git -C "$ROOT" ls-files --others --exclude-standard 2>/dev/null)"; then
   chg="$(printf '%s\n%s\n' "$d1" "$d2" | grep -v '^$' | LC_ALL=C sort -u)"
-  [[ "$chg" == "$SIX" ]] && ok "S1 相对 2982aa54 只有登记的六个路径有变化(已跟踪改动 + 未跟踪新文件)" || bad "S1 变化路径不是登记的六个: [$(tr '\n' ' ' <<< "$chg")]"
+  [[ "$chg" == "$SIX" ]] && ok "S1 相对 2982aa54 只有登记的九个路径有变化(S-1 的六个 + F-1 的三个新文件; 已跟踪改动 + 未跟踪新文件)" || bad "S1 变化路径不是登记的九个: [$(tr '\n' ' ' <<< "$chg")]"
 else bad "S1 未取得: 改动清单取不到(git diff / ls-files 失败) —— 不说成没有登记外改动"; fi
 n2=0; why2=""
 for rel in tests/e2e-real-bridge-hop.sh tests/e2e-real-retire-hop.sh tests/e2e-real-late-failure.sh tests/e2e-real-platform-fail.sh tests/e2e-real-retire-hop-bc.sh \
