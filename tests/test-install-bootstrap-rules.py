@@ -203,6 +203,30 @@ if "分类规则是空的" in inst and "更新规则库" in inst:
 else:
     bad("没说清影响")
 
+# ── 3b. 53 口要在 geosite 事务之前释放 ────────────────────────────────────────
+# 事务带 restart:mosdns, 并要求 mosdns 稳定 active。systemd-resolved 的 stub 还占着
+# 127.0.0.53:53 时, mosdns 绑 0.0.0.0:53 必定失败 → 整笔回滚 → 规则库落成空文件, doctor 🟡。
+# 2026-10-28 在全新 Debian 12 上装了五次(v1.11.15 与桥接版、iOS 与 Android), 次次如此。
+# e2e 的 systemctl 是桩, CI 的 DoT 夹具又先停了 resolved —— 两边都碰不到真冲突, 只能在这里
+# 按调用点的先后把顺序钉住。每个调用点先核"恰好一处", 免得抽不到也比出个顺序来。
+print()
+print("── 3b. 释放 53 口要排在 geosite 事务之前 ──")
+marks = {
+    "定义 _write_resolv": "_write_resolv(){",
+    "停 resolved": "systemctl disable --now systemd-resolved",
+    "改写 resolv.conf": '_write_resolv "nameserver 1.1.1.1"',
+    "geosite 事务": "PDG_TX_MODE=repair bash /opt/pdg-bot/update-rules.sh",
+}
+cnt = {k: inst.count(v) for k, v in marks.items()}
+if any(n != 1 for n in cnt.values()):
+    bad("调用点不是恰好一处, 顺序无从比对: %r" % (cnt,))
+else:
+    pos = {k: inst.find(v) for k, v in marks.items()}
+    if pos["定义 _write_resolv"] < pos["停 resolved"] < pos["改写 resolv.conf"] < pos["geosite 事务"]:
+        ok("停 resolved、改写 resolv.conf 都在 geosite 事务之前(事务重启 mosdns 时 53 口已空出)")
+    else:
+        bad("顺序不对: %r" % (pos,))
+
 # ── 4. 空的 geosite 文件确实能让 mosdns 起来 ─────────────────────────────────
 print()
 print("── 4. 真 mosdns: 规则文件是空的也要能起 ──")
