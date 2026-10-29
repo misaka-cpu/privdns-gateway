@@ -1034,7 +1034,28 @@ else
   install -m600 "/etc/letsencrypt/live/$DOT_DOMAIN/privkey.pem"   "$CERT_DIR/privkey.pem"
 fi
 
-# ── 7. geosite 规则库 (此时 DNS 仍可用) ──
+# ── 释放 53 口(必须在第 7 步之前) ──
+# systemd-resolved 的 stub 占 127.0.0.53:53, 会和 mosdns 0.0.0.0:53 冲突。第 7 步的 geosite 事务
+# 要重启 mosdns 并观察它稳定 active —— 这一段以前放在第 8 步, 于是全新机器上那次重启必定
+# bind 失败("address already in use"), 事务整笔回滚, 规则库落成空文件, doctor 报 🟡。
+# 之后本机自身解析走 1.1.1.1(装完后每天的规则更新本来就走它), 第 7 步的下载也一样。
+# 先备份原 resolv.conf(含符号链接), 供 uninstall 恢复
+[[ -e /etc/resolv.conf.pdg-orig ]] || cp -a /etc/resolv.conf /etc/resolv.conf.pdg-orig 2>/dev/null || true
+# LXC/Docker 之类的环境把 /etc/resolv.conf **bind-mount** 进来: 删不掉(EBUSY), 但能原地写。
+# 直接 `rm -f` 会被 set -e 判成致命错误, 整场安装在这里中止并转入回滚 —— 而回滚打印的是
+# "安装失败", 真原因(删不掉 resolv.conf)反倒看不见。删不掉就原地覆盖内容即可。
+# 连写都写不进去(只读挂载)也不该中止: 那只影响**网关自己**解析用哪个上游, 转发链路照常。
+_write_resolv(){
+  rm -f /etc/resolv.conf 2>/dev/null || true    # 常见是指向 resolved stub 的符号链接, 删掉才落得下实文件
+  printf '%s\n' "$@" > /etc/resolv.conf 2>/dev/null \
+    || c_y "写不了 /etc/resolv.conf(只读挂载?), 本机自身 DNS 维持原样; 转发不受影响。"
+}
+if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+  systemctl disable --now systemd-resolved 2>/dev/null && RESOLVED_DISABLED=1 || true
+fi
+_write_resolv "nameserver 1.1.1.1"
+
+# ── 7. geosite 规则库 ──
 # 先把 geosite 文件建成空文件: mosdns 的 domain_set 要求文件**存在**, 缺一个就 FATAL 起不来。
 # 下载失败(没网/被墙/源站抽风)本该只是"分类规则暂时是空的", 不该让整场安装失败回滚 ——
 # 装完还能用 bot『更新规则库』补上。
@@ -1052,22 +1073,6 @@ fi
 
 # ── 8. 启动 ──
 c_g "启动服务…"
-# 释放 53 口: systemd-resolved 的 stub 占 127.0.0.53:53, 会和 mosdns 0.0.0.0:53 冲突
-# 先备份原 resolv.conf(含符号链接), 供 uninstall 恢复
-[[ -e /etc/resolv.conf.pdg-orig ]] || cp -a /etc/resolv.conf /etc/resolv.conf.pdg-orig 2>/dev/null || true
-# LXC/Docker 之类的环境把 /etc/resolv.conf **bind-mount** 进来: 删不掉(EBUSY), 但能原地写。
-# 直接 `rm -f` 会被 set -e 判成致命错误, 整场安装在这里中止并转入回滚 —— 而回滚打印的是
-# "安装失败", 真原因(删不掉 resolv.conf)反倒看不见。删不掉就原地覆盖内容即可。
-# 连写都写不进去(只读挂载)也不该中止: 那只影响**网关自己**解析用哪个上游, 转发链路照常。
-_write_resolv(){
-  rm -f /etc/resolv.conf 2>/dev/null || true    # 常见是指向 resolved stub 的符号链接, 删掉才落得下实文件
-  printf '%s\n' "$@" > /etc/resolv.conf 2>/dev/null \
-    || c_y "写不了 /etc/resolv.conf(只读挂载?), 本机自身 DNS 维持原样; 转发不受影响。"
-}
-if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
-  systemctl disable --now systemd-resolved 2>/dev/null && RESOLVED_DISABLED=1 || true
-fi
-_write_resolv "nameserver 1.1.1.1"
 systemctl daemon-reload
 systemctl restart systemd-journald
 systemctl enable --now mosdns "$CORE_SVC" >/dev/null 2>&1 || true
