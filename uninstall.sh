@@ -147,7 +147,15 @@ fi
 [[ -e /etc/nftables.conf.pdg-orig ]] \
   && echo "装机前的防火墙配置仍保留在 /etc/nftables.conf.pdg-orig(仅供人工参考, 不会自动套用)"
 # DNS: 还原 systemd-resolved 与 resolv.conf
-systemctl list-unit-files 2>/dev/null | grep -q '^systemd-resolved' && systemctl enable --now systemd-resolved 2>/dev/null || true
+# 探测 resolved 时先把清单收进变量再判, 不能 `systemctl list-unit-files | grep -q`: 本脚本开着
+# pipefail, grep -q 命中就退, systemctl 后面的输出写进已关的管道挨 SIGPIPE(141), 整条判假,
+# resolved 就不被重新启用 —— 实测(.200)200 次里 77 次; 那一次卸载后 resolv.conf 指着 /run 里
+# 一份旧文件, 重启后不再生成, 整机没有 DNS。输出才十几 KB, 远没撑满管道缓冲也照样中: 风险在
+# 上游是不是还在写, 不只在量。
+_HAS_RESOLVED=0
+_unit_files="$(systemctl list-unit-files 2>/dev/null)" || true
+grep -q '^systemd-resolved' <<<"$_unit_files" && _HAS_RESOLVED=1
+[[ "$_HAS_RESOLVED" == 1 ]] && { systemctl enable --now systemd-resolved 2>/dev/null || true; }
 RESOLV_WARN=""
 if [[ -e /etc/resolv.conf.pdg-orig ]]; then
   # Docker/LXC 里 /etc/resolv.conf 是 bind mount: rm/mv 都会 EBUSY, 但**内容能原地写回**。
@@ -165,6 +173,11 @@ elif [[ -e /run/systemd/resolve/stub-resolv.conf ]]; then
   ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf 2>/dev/null \
     || RESOLV_WARN="1"
 fi
+# 上面先启动 resolved 是有意的: 装机备份通常是指向 /run/systemd/resolve/ 的符号链接, 重启过的
+# 机器上它得等 resolved 起来才有目标, 先还原会把备份判成不存在。代价是 resolved 启动那一刻读到的
+# 还是装机写的静态 resolv.conf, 会把里面的 127.0.0.1 收进全局 DNS, 之后换回它自己的文件也不清掉
+# (.200 实测: 卸载后 127.0.0.1:53 已无人监听)。还原完再重启一次, 让它按还原后的文件重读。
+[[ "$_HAS_RESOLVED" == 1 ]] && { systemctl restart systemd-resolved 2>/dev/null || true; }
 
 if [[ -n "$RESOLV_WARN" ]]; then
   echo "⚠️  /etc/resolv.conf 未能还原(可能是 Docker/LXC 的 bind mount, 删不掉也写不进)。"

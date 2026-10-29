@@ -933,6 +933,10 @@ jobs:
       - name: "卸载保留用户防火墙规则 (只摘项目管理块, 用户自加规则逐字节保留)"
         run: sudo -E python3 tests/test-uninstall-firewall.py
 
+      # 不需要 root: 卸载脚本里那段原样抽出, 路径改到临时根, systemctl 用替身。
+      - name: "卸载还原 resolved (pipefail 探测不被 SIGPIPE 反转 / 不把装机的 127.0.0.1 留在全局 DNS)"
+        run: python3 tests/test-uninstall-resolved-restore.py
+
       - name: "系统不变量捕获器 (schema/凭据只留摘要/不跟随软链/十条比较负控)"
         run: python3 tests/test-invariants.py
 
