@@ -545,7 +545,7 @@ jobs:
       - name: "装机取件的错误分类 (下载失败/空产物/内容不符报成三种话; 两个内核对称)"
         run: bash tests/test-download-error-classification.sh
 
-      - name: "pipefail + grep -q 条件反转守卫 (只拦真风险: 整体透传 >64KiB 文件)"
+      - name: "pipefail + grep -q 条件反转守卫 (测试脚本: 整体透传大文件; 生产脚本: 每处登记上游, 已知分次写的上游不许接 grep -q)"
         run: python3 tests/test-pipefail-grepq-guard.py
 
       - name: "沙箱夹具不得偷偷联网 (抽了含 curl 的生产函数就必须自带禁令桩)"
@@ -571,7 +571,7 @@ jobs:
       - name: "内核热切回归 (check/重启不稳定均还原旧核; 稳定后才删 .prev; 快照含内核二进制)"
         run: bash tests/test-core-swap.sh
 
-      - name: "install 回滚回归 (set -u 下不因未初始化变量二次崩溃; 系统级还原完整; 只删本次新装)"
+      - name: "install 回滚回归 (set -u 下不因未初始化变量二次崩溃; 系统级还原完整; 只删本次新装; 换回 resolv.conf 后重启 resolved)"
         run: bash tests/test-install-rollback.sh
 
       - name: "install 二进制事务回归 (备份失败即中止/半截安装可恢复/强制重装也还原/清理失败不假报)"
@@ -940,7 +940,7 @@ jobs:
         run: sudo -E python3 tests/test-uninstall-firewall.py
 
       # 不需要 root: 卸载脚本里那段原样抽出, 路径改到临时根, systemctl 用替身。
-      - name: "卸载还原 resolved (pipefail 探测不被 SIGPIPE 反转 / 不把装机的 127.0.0.1 留在全局 DNS)"
+      - name: "卸载还原 resolved (探测不被 SIGPIPE 反转 / 不把装机的 127.0.0.1 留在全局 DNS / 按装机记下的状态还原, 含 install.sh 那段的往返)"
         run: python3 tests/test-uninstall-resolved-restore.py
 
       - name: "系统不变量捕获器 (schema/凭据只留摘要/不跟随软链/十条比较负控)"
