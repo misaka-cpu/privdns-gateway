@@ -47,7 +47,9 @@ echo "══════════ 上一个发布: $PREV → 本版($NEW_TAG,
 # e2e_reset_box 不碰 $E2E_TMP 里这几个名字, 所以两条路径用的是同一批基准。
 # 当前整合验收所用的冻结桥接身份。显式输入仍然优先(PDG_BRIDGE_SHA), 默认值随整合候选走。
 # 历史证据里的旧对象 9c9b2681f3ada2155b32ebe372cbc2a154792079 不动 —— 那是它当时的结论。
-BRIDGE_SHA="${PDG_BRIDGE_SHA:-6843905e07af5957a3013cab06f11890757fc5e9}"
+# 默认取正式桥接提交(v1.11.16 的 tag 指向它; 上一个默认 6843905e 是更早的桥接候选)。本版必须以它为祖先,
+# 否则已装桥接的机器会被 pdg update 的方向门判成分叉、拒绝升级 —— 换桥接对象时这里要跟着换。
+BRIDGE_SHA="${PDG_BRIDGE_SHA:-542cc9177fc35c9d413ff3b62a7dac8bc468c136}"
 BRIDGE_TAG="${PDG_BRIDGE_TAG:-v9.9.8}"
 # 本次到底选中了哪一个 —— **完整**打出来, 不靠源码默认值声称。
 echo "   [记录] 本次冻结桥接身份: $BRIDGE_SHA  (来源: ${PDG_BRIDGE_SHA:+显式输入}${PDG_BRIDGE_SHA:-源码默认})"
