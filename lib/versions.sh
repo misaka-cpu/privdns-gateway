@@ -10,7 +10,7 @@
 # 哈希取自上游官方 GitHub Release(信任锚 = 官方发布页),装机/测试时逐字节比对,不符即拒装。
 # ─────────────────────────────────────────────────────────────────────────────
 MOSDNS_VER="v5.3.4"
-MIHOMO_VER="v1.19.30"         # 流量内核: mihomo/clash.meta, sniffer.override-destination 无版本天花板, 活跃维护可更新
+MIHOMO_VER="v1.19.33"         # 流量内核: mihomo/clash.meta, sniffer.override-destination 无版本天花板, 活跃维护可更新
 ZASHBOARD_VER="v3.15.0"       # 观测面板(纯静态前端, 由 external_ui 托管; dist-no-fonts 最小、不依赖 CDN; mihomo 原生 clash 核也可托管)
 
 # ── 内网面板(方案 B)专用: 反代 + 证书签发 ──────────────────────────────────
@@ -43,17 +43,17 @@ declare -A PDG_SHA256=(
   [mosdns-bin-amd64]="5357fbb83c89f0a7acad275b72c33aa70d4c720cb5590525660132b10cee8af9"
   [mosdns-bin-arm64]="5e651992dbec784df43e0e483428319b0f2892f5fadfd4e39a1462a5d62cb495"
   # mihomo(流量内核): 官方 release 的 mihomo-linux-<arch>-<ver>.gz
-  [mihomo-amd64]="cf06ce2c7d1421bdbda14ee4a5b6046672dc35ebf8eecd8e77504ec3c0ed9a84"
-  [mihomo-arm64]="58896873736d28628f66de3677c8654fa0f180662523148e136cff4f6e890069"
+  [mihomo-amd64]="132f6f3edf9a65e62f04853aed3358472e0b2b7666daa8419edfa2ddf5bb6323"
+  [mihomo-arm64]="ba408b317080ee265c46cb923a50018c1b82cbd708551cdd46a1e3e307396187"
   # ── mihomo: **解压后二进制**本身的 SHA256 ─────────────────────────────────
   # 与 mosdns 同一个道理, 而且这里的洞更大: 上面两行钉的是下载归档, 只在"真的下载了"
   # 那条路上起作用 —— 而跳过下载的短路条件曾经是 `pdg_mihomo_is_version`, 它问的是
-  # **PATH** 上的 mihomo、而且只比**自报版本**。于是 PATH 上放一个自报 v1.19.30 的壳,
+  # **PATH** 上的 mihomo、而且只比**自报版本**。于是 PATH 上放一个自报钉死版本的壳,
   # 或者把 /usr/local/bin/mihomo 的内容换掉、版本串留着, 整段下载与校验都会被跳过,
   # 而安装日志上连"下载 mihomo"这行都不会出现。落盘的那个文件本身从来没被钉过。
   #
   # 取值步骤(可复现, 换个人来照做应得到同一串):
-  #   1) 按**精确资产名** mihomo-linux-<arch>-v1.19.30.gz 取(同 tag 下有 20+ 个相似名:
+  #   1) 按**精确资产名** mihomo-linux-<arch>-<ver>.gz 取(同 tag 下有 20+ 个相似名:
   #      -compatible- / -v1- / -v2- / -v3- / -go120- / -go123- 以及 .deb/.rpm/.pkg.tar.zst,
   #      通配一下就会抓错文件);
   #   2) 与上面的 [mihomo-<arch>] 核对归档摘要;
@@ -61,13 +61,13 @@ declare -A PDG_SHA256=(
   #   4) 归档确认无误后才 gunzip;
   #   5) sha256sum 解压产物;
   #   6) 本机架构真跑一次 `-v` 核对自报版本, 另一架构核对完整 ELF 头。
-  # 版本 v1.19.30; 两个架构各自独立下载、独立校验、独立计算。
+  # 两个架构各自独立下载、独立校验、独立计算; 换版时由 tools/bump-kernel.sh 按这六步取值, 版本以上面的 MIHOMO_VER 为准。
   #
   # 关于 asset digest: 上游**没有**独立签名校验文件。GitHub 在 Release API 里给出
   # 服务器侧计算的 sha256 asset digest —— 它是一条**额外的交叉证据**, 与我们自己算的
   # 摘要相互印证; 它不构成独立的签名信任链(同一方既托管文件又给出摘要)。
-  [mihomo-bin-amd64]="3e92df24f5e80e86b9cf9183ceb7bb575f0bd132a9dc4081dae42e80f21076ae"
-  [mihomo-bin-arm64]="b9456718a8955364b9a77c80f74dca49ded10f071c1c6b4513a0ea68a3d87a50"
+  [mihomo-bin-amd64]="09c2cb429cf45fb56884ceb91a0e5b17cc8b2c866c07811bcf75dfb59fef7662"
+  [mihomo-bin-arm64]="8c73570d9a5f388bc2f58eee0b347ccfab84fb3cf1a0f8f2cf5eac7005fbcdc0"
   [zashboard]="403b351d3663f5fe65db053cb2f3dc980108d8f86e8c6968d56164d3452592e1"
   # Caddy 官方 release 的 caddy_<ver>_linux_<arch>.tar.gz。
   # 上游发布的校验和文件里是 **SHA-512**, 本项目统一用 SHA-256, 所以这两个值是

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# 真实换核: 前像 v1.19.29 → 钉死版 v1.19.30, 走**真的** _update_core_binary。
+# 真实换核: 前像(自报 v1.19.29 的旧核)→ 钉死版($MIHOMO_VER), 走**真的** _update_core_binary。
 #
 # 为什么不能用桩糊过去: 换核路径上唯一有意义的断言是"落盘的那个文件等于官方钉值",
 # 而放一个自报目标版本的桩, 短路判据当场返回 0 —— 整条路径根本不会被执行, 测试却是绿的。
-# 所以这里: 目标二进制是**真的** v1.19.30(tests/.bin/mihomo, 由 prepare-mihomo.sh 按
+# 所以这里: 目标二进制是**真的**钉死版(tests/.bin/mihomo, 由 prepare-mihomo.sh 按
 # lib/versions.sh 的 SHA256 下载并校验, 每个 CI run 只下一次, 本测试**不新增公网下载**),
 # 取件由本地桩喂那份真二进制, 内容钉值取**真的** lib/versions.sh。
 #
@@ -53,7 +53,8 @@ rules:
 Y
 printf 'BROKEN: [[[\n' > "$CFG/broken.yaml"
 # PATH 影子: 自报目标版本、内容完全无关。它**不得**影响任何判定。
-printf '#!/bin/sh\ncase "$1" in -v) echo "Mihomo Meta v1.19.30 linux amd64";; -t) exit 0;; esac\nexit 0\n' \
+# 自报的必须正是当前钉死版本: 写死旧版本号的话, 换版之后这个影子连旧判据都骗不过, 这一条就测空了。
+printf '#!/bin/sh\ncase "$1" in -v) echo "Mihomo Meta %s linux amd64";; -t) exit 0;; esac\nexit 0\n' "$MIHOMO_VER" \
   > "$WORK/shadow/mihomo"; chmod 755 "$WORK/shadow/mihomo"
 # 前像: 自报 v1.19.29 的旧核(内容与钉值无关) —— 短路判据必须因此**不**短路
 mkold(){ printf '#!/bin/sh\n# OLD-v1.19.29\ncase "$1" in -v) echo "Mihomo Meta v1.19.29 linux amd64";; esac\nexit 0\n' > "$BIN/mihomo"; chmod 755 "$BIN/mihomo"; }
@@ -159,7 +160,7 @@ install -m755 "$REAL" "$BIN/mihomo"
 : > "$WORK/log"; rc=$(run config.yaml active)
 { [[ "$rc" == 0 ]] && ! grep -q '更新 mihomo 内核' "$WORK/log"; } \
   && ok "内容已等于钉值 → 短路, 不取件" || bad "已是钉死版却仍然取件(rc=$rc)"
-printf '\n# tampered\n' >> "$BIN/mihomo"      # 版本仍自报 v1.19.30, 内容变了
+printf '\n# tampered\n' >> "$BIN/mihomo"      # 版本仍自报钉死版, 内容变了
 : > "$WORK/log"; rc=$(run config.yaml active)
 { [[ "$rc" == 0 ]] && grep -q '更新 mihomo 内核' "$WORK/log" \
   && [[ "$(sha256sum "$BIN/mihomo" | cut -d' ' -f1)" == "$PIN_BIN" ]]; } \
