@@ -117,10 +117,23 @@ WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
 systemctl start mosdns || { journalctl -u mosdns -n 20 --no-pager; die "mosdns 起不来"; }
-for _ in $(seq 1 30); do ss -lun 2>/dev/null | grep -q ':53 ' && break; sleep 1; done
-ss -lun 2>/dev/null | grep -q ':53 ' || { journalctl -u mosdns -n 20 --no-pager; die "mosdns 没监听 53"; }
-dig +short +time=3 +tries=2 @127.0.0.1 example.com A >/dev/null 2>&1 \
-  || die "mosdns 起来了但解析不通 —— 后面每条断言都无从判断"
+# 等的是 mosdns **自己**在 53 口上听。以前只看"有没有谁听 53"(ss | grep ':53 '), 别的进程占着 53
+# 也会被当成 mosdns 起来了; CI 里出过两次不到半秒就报"解析不通", dig 的输出被丢掉, 原因没拿到。
+# 现在按进程名认, 失败时把 dig 的原话和 53 口现场一并打出来。
+_ss53=""
+for _ in $(seq 1 30); do
+  _ss53="$(ss -Hlunp 'sport = :53' 2>/dev/null)" || true
+  grep -q '"mosdns"' <<<"$_ss53" && break
+  sleep 1
+done
+_dump53(){
+  echo "[fixture] 53 口上的 UDP 监听:"; printf '%s\n' "${_ss53:-(无)}"
+  echo "[fixture] systemd-resolved: $(systemctl is-active systemd-resolved 2>&1)"
+  journalctl -u mosdns -n 20 --no-pager
+}
+grep -q '"mosdns"' <<<"$_ss53" || { _dump53; die "mosdns 没监听 53"; }
+_dig="$(dig +short +time=3 +tries=2 @127.0.0.1 example.com A 2>&1)" \
+  || { echo "[fixture] dig 输出: $_dig"; _dump53; die "mosdns 起来了但解析不通 —— 后面每条断言都无从判断"; }
 say "mosdns active, 53 在听, 普通解析可用"
 
 # ── 5. 运行模块与 DoT 域名(真更新里由 migrate_deploy_botfiles 落地) ────────
