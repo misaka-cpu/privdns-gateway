@@ -89,6 +89,7 @@ PDG_BOT_TOKEN=<登记的测试 bot token, 可留空> PDG_ALLOWED=<登记的客�
 
 ### 桥接 ① 全新安装(两种平台; 那份清单第 22–39 行)
 至少跑 **iOS** 和 **Android** 两组(内核统一 mihomo)。全新安装要装到桥接版本身; 入口的两段来源与目标选择按"打 tag / 发布"的登记要求记录。
+装机前先记下 DNS 基线(`systemctl is-enabled systemd-resolved`、`systemctl is-active systemd-resolved`、`ls -l /etc/resolv.conf`), 桥接 ⑤ 要拿它对照。
 - [ ] (26)`pdg doctor` 全绿(无 🔴/🟡)。【前提: DoT 域名与内网卡段; doctor 的证书项含义见上】
 - [ ] (27)服务全 active: `systemctl is-active mosdns mihomo pdg-bot pdg-probe81`(iOS 追加 `pdg-mitm`); `pdg-probe81` 两个平台都 active;
       Android 上 `pdg-mitm` 不存在(`systemctl is-enabled` 报 not-found), 7894 不监听; sing-box 二进制 / 服务都不存在。【pdg-bot 的前提: bot 凭据】
@@ -126,12 +127,22 @@ bash uninstall.sh --purge
       `pdg-lan` 只有启用过内网面板的机器才有, 没启用过时这一项是空核【前提: 内网面板与 DNS API 凭据】;
       `pdg-mitm` 只在 iOS 有; `sing-box` 只在能证明是本项目装的时候才删, 新装桥接机上本来就没有。
 - [ ] (79)`--purge` 后 `/etc/privdns-gateway`、`/etc/mihomo` 都删掉。
+- [ ] (补)DNS 还原。桥接版那份清单里没有这一条, 本次补进, 依据同退役版 ⑤ 的同名一条。桥接版不记装机前 resolved 的状态,
+      机器上有 systemd-resolved 就启用它(装机前没在运行的也会被启用; 按装机前状态还原是退役版才有的),
+      所以这一条只在**装机前 resolved 在运行**的机器上判, 基线不是这样就记"未取得"并注明原因。
+      对照装机前在同一台机器上记下的基线(`systemctl is-enabled systemd-resolved`、`systemctl is-active systemd-resolved`、`ls -l /etc/resolv.conf`):
+      - systemd-resolved enabled 且 active;
+      - `/etc/resolv.conf` 与基线同形(基线是符号链接时目标相同且目标存在); `/etc/resolv.conf.pdg-orig` 不存在; 卸载输出里没有「未能还原」;
+      - `resolvectl dns` 的 `Global:` 与 `resolvectl status` 的 Global 段都没有 `127.0.0.1`; `/etc/resolv.conf` 里没有 `nameserver 127.0.0.1`;
+      - `getent hosts example.com` 成功。
+- [ ] (补)卸载后重启一次, 再核: systemd-resolved enabled 且 active、`/etc/resolv.conf` 的链接目标存在、`getent hosts example.com` 成功。
 
 ---
 
 ## ① 全新安装(两种平台; 只对退役版)
 
-至少跑 **iOS** 和 **Android** 两组(内核统一 mihomo)。装完:
+至少跑 **iOS** 和 **Android** 两组(内核统一 mihomo)。装机前先记下 DNS 基线(`systemctl is-enabled systemd-resolved`、
+`systemctl is-active systemd-resolved`、`ls -l /etc/resolv.conf`), ⑤ 要拿它对照。装完:
 
 - [ ] `pdg doctor` 全绿(无 🔴/🟡)。【前提: DoT 域名与内网卡段; doctor 的证书项含义见上】
 - [ ] 服务全 active: `systemctl is-active mosdns mihomo pdg-bot pdg-probe81`。【pdg-bot 的前提: bot 凭据】
@@ -277,6 +288,17 @@ bash uninstall.sh --purge
       `mosdns sing-box mihomo pdg-bot pdg-probe81 pdg-mitm pdg-dotwitness pdg-health.timer pdg-rules-update.timer pdg-rescue.socket pdg-rescue.service pdg-lan`。
       (后六个是本次补进核对的, 依据: 本版 uninstall.sh 对它们都有处理。)
 - [ ] `--purge` 后 `/etc/privdns-gateway`、`/etc/mihomo` 都删掉。
+- [ ] DNS 按装机前还原。本次补进, 依据: 卸载曾漏启用 systemd-resolved、或把装机写的 127.0.0.1 留在它的全局 DNS 里,
+      两种都会让机器卸载后没有可用的 DNS(修复与"按装机前状态还原"见 CHANGELOG v1.12.0)。
+      对照装机前在同一台机器上记下的基线(`systemctl is-enabled systemd-resolved`、`systemctl is-active systemd-resolved`、`ls -l /etc/resolv.conf`):
+      - systemd-resolved 的启用 / 运行状态与基线相同(基线在运行 → enabled 且 active; 基线没在运行 → 卸载不去启用它);
+      - `/etc/resolv.conf` 与基线同形(基线是符号链接时目标相同且目标存在);
+        `/etc/resolv.conf.pdg-orig` 与 `/etc/resolv.conf.pdg-resolved` 都不存在; 卸载输出里没有「未能还原」;
+      - resolved 在运行时, `resolvectl dns` 的 `Global:` 与 `resolvectl status` 的 Global 段都没有 `127.0.0.1`;
+        `/etc/resolv.conf` 里没有 `nameserver 127.0.0.1`;
+      - `getent hosts example.com` 成功。
+      两种基线各要一台机器才算都核过; 只核了一种时, 另一种记"未取得"。
+- [ ] 卸载后重启一次, 再核: systemd-resolved 的启用 / 运行状态仍与基线相同、`/etc/resolv.conf` 是链接时目标存在、`getent hosts example.com` 成功。
 
 ---
 
