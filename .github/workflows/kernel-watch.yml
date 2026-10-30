@@ -1,0 +1,32 @@
+name: kernel-watch
+
+# 每周查一次 mihomo 上游最新稳定版。比钉死的新, 就换钉值、推 kernel/mihomo-<版本> 分支、
+# 开 PR、派发 ci.yml。只到这一步: 合并、发版、机器升级都由人决定(见 tools/kernel-watch.sh)。
+#
+# 生效前提: schedule 只在默认分支上触发, 所以这个文件到了 main 才会按周跑;
+# 仓库设置 Actions → General → Workflow permissions 里要勾上
+# "Allow GitHub Actions to create and approve pull requests", 否则开 PR 那一步会失败。
+on:
+  schedule:
+    - cron: "23 2 * * 1"   # 每周一 02:23 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write        # 推 kernel/mihomo-<版本> 分支
+  pull-requests: write   # 开 PR
+  actions: write         # 派发 ci.yml —— GITHUB_TOKEN 推的分支、开的 PR 不会自己触发 CI
+
+concurrency:
+  group: kernel-watch
+  cancel-in-progress: false
+
+jobs:
+  mihomo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - name: "查 mihomo 上游最新稳定版; 新就换钉值、开 PR、派发 CI"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/kernel-watch.sh

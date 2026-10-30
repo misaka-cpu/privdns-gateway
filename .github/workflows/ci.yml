@@ -542,6 +542,11 @@ jobs:
       - name: "换内核工具契约 (只改钉值不提交/两种钉值形状/取件后核对版本与架构/离线改写)"
         run: bash tests/test-bump-kernel-tool.sh
 
+      # 每周查 mihomo 上游、开升级 PR 的那个工作流(kernel-watch.yml)本身不在这里跑 ——
+      # 它推分支、开 PR。这一支离线钉住它调用的脚本与工作流文件的契约。
+      - name: "内核上游监视 (只跟稳定版/比钉的新才动/幂等/只改 versions.sh/先推分支再开 PR 再派发 CI/只在 Actions 的 main 上跑)"
+        run: bash tests/test-kernel-watch.sh
+
       - name: "装机取件的错误分类 (下载失败/空产物/内容不符报成三种话; 两个内核对称)"
         run: bash tests/test-download-error-classification.sh
 
