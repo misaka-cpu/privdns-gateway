@@ -480,6 +480,14 @@ rollback(){
       failed+=("resolv.conf 还原")
     fi
   fi
+  # 装机前状态的记录跟着备份走: 备份用掉了才删, 还原失败时两样都留着
+  [[ -e /etc/resolv.conf.pdg-orig || -L /etc/resolv.conf.pdg-orig ]] || rm -f /etc/resolv.conf.pdg-resolved
+  # resolved 是在 resolv.conf 换回来之前起的, 那一刻读到的是装机写的静态文件(第 8 步之后含
+  # 127.0.0.1), 会把它收进全局 DNS 并一直留着(卸载那边在 .200 上实测过同一现象)。换回之后
+  # 重启一次, 让它按换回来的文件重读。
+  if [[ "${RESOLVED_DISABLED:-0}" == 1 ]]; then
+    systemctl restart systemd-resolved 2>/dev/null || failed+=("systemd-resolved 重启")
+  fi
   if [[ ${#failed[@]} -eq 0 ]]; then
     c_y "已回滚到安装前状态。修正问题后可重跑 install.sh。"
   else
@@ -1040,7 +1048,10 @@ fi
 # bind 失败("address already in use"), 事务整笔回滚, 规则库落成空文件, doctor 报 🟡。
 # 之后本机自身解析走 1.1.1.1(装完后每天的规则更新本来就走它), 第 7 步的下载也一样。
 # 先备份原 resolv.conf(含符号链接), 供 uninstall 恢复
-[[ -e /etc/resolv.conf.pdg-orig ]] || cp -a /etc/resolv.conf /etc/resolv.conf.pdg-orig 2>/dev/null || true
+_RESOLV_BAK_NEW=0
+if [[ ! -e /etc/resolv.conf.pdg-orig ]]; then
+  cp -a /etc/resolv.conf /etc/resolv.conf.pdg-orig 2>/dev/null && _RESOLV_BAK_NEW=1 || true
+fi
 # LXC/Docker 之类的环境把 /etc/resolv.conf **bind-mount** 进来: 删不掉(EBUSY), 但能原地写。
 # 直接 `rm -f` 会被 set -e 判成致命错误, 整场安装在这里中止并转入回滚 —— 而回滚打印的是
 # "安装失败", 真原因(删不掉 resolv.conf)反倒看不见。删不掉就原地覆盖内容即可。
@@ -1052,6 +1063,13 @@ _write_resolv(){
 }
 if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
   systemctl disable --now systemd-resolved 2>/dev/null && RESOLVED_DISABLED=1 || true
+fi
+# 记下装机前 resolved 的状态, 卸载按它还原: disabled = 本次装机停的, untouched = 装机前就没在跑。
+# 只在 resolv.conf 的备份也是这一次做的时候记 —— 已有备份说明之前装过, 那时 resolved 是什么
+# 状态这次看不到了(多半就是上次停的), 记成 untouched 会让卸载不再启用它; 不记, 卸载照旧处理。
+if [[ "$_RESOLV_BAK_NEW" == 1 ]]; then
+  if [[ "$RESOLVED_DISABLED" == 1 ]]; then echo disabled; else echo untouched; fi \
+    > /etc/resolv.conf.pdg-resolved 2>/dev/null || true
 fi
 _write_resolv "nameserver 1.1.1.1"
 

@@ -67,7 +67,7 @@ mk_sandbox(){   # 造一个"安装到一半"的现场
 harness(){ cat <<'EOF'
 BIN_TXN=()
 c_g(){ echo "$*"; }; c_y(){ echo "$*"; }
-systemctl(){ echo "systemctl $*" >> "$SB/../calls.log"; return "${SYSTEMCTL_RC:-0}"; }
+systemctl(){ echo "systemctl $* | resolv.conf=$(cat "$SB/etc/resolv.conf" 2>/dev/null)" >> "$SB/../calls.log"; return "${SYSTEMCTL_RC:-0}"; }
 nft(){ echo "nft $*" >> "$SB/../calls.log"; return "${NFT_RC:-0}"; }
 EOF
 }
@@ -192,6 +192,25 @@ if [[ ! -e "$SB/usr/local/bin/mihomo.pdg-preinstall" && ! -e "$SB/usr/local/bin/
 else bad "J: 成功后备份残留"; fi
 [[ -e "$SB/usr/local/bin/mihomo" && -e "$SB/usr/local/bin/sing-box" ]] \
   && ok "J: 成功路径不动二进制本身(只清备份)" || bad "J: 成功路径误删了二进制"
+
+# ── L. resolved: 换回 resolv.conf 之后再重启一次; 装机记录跟着备份删 ──────────
+# 装机停过 resolved 时回滚先 enable --now(那一刻读到的是装机写的 resolv.conf, 第 8 步之后含
+# 127.0.0.1), 换回原文件之后必须再 restart, 否则装机的 127.0.0.1 留在它的全局 DNS 里。
+mk_sandbox; printf 'disabled\n' > "$SB/etc/resolv.conf.pdg-resolved"
+out=$(run_rb 'INSTALL_OK=0; ROLLBACK_DONE=0; FORCED_REINSTALL=0; MOSDNS_INSTALLED=0; SINGBOX_INSTALLED=0; MIHOMO_INSTALLED=0; RESOLVED_DISABLED=1')
+en=$(grep -n 'systemctl enable --now systemd-resolved' "$WORK/calls.log" | head -1 | cut -d: -f1)
+rs=$(grep -n 'systemctl restart systemd-resolved' "$WORK/calls.log" | head -1 | cut -d: -f1)
+if [[ -n "$en" && -n "$rs" && "$rs" -gt "$en" ]] \
+   && grep -q 'systemctl restart systemd-resolved | resolv.conf=ORIG-RESOLV' "$WORK/calls.log"; then
+  ok "L: 装机停过 resolved → 先 enable, 换回 resolv.conf 之后再 restart"
+else bad "L: resolved 没有在换回 resolv.conf 之后重启: $(cat "$WORK/calls.log")"; fi
+[[ ! -e "$SB/etc/resolv.conf.pdg-resolved" ]] && ok "L: 备份用掉了 → 装机记录一并删" || bad "L: 装机记录残留"
+mk_sandbox; printf 'untouched\n' > "$SB/etc/resolv.conf.pdg-resolved"
+out=$(run_rb 'INSTALL_OK=0; ROLLBACK_DONE=0; FORCED_REINSTALL=0; MOSDNS_INSTALLED=0; SINGBOX_INSTALLED=0; MIHOMO_INSTALLED=0; RESOLVED_DISABLED=0')
+grep -qE 'systemctl (enable|restart|start) .*systemd-resolved' "$WORK/calls.log" \
+  && bad "L: 装机没停过 resolved, 回滚却去启用/重启它: $(cat "$WORK/calls.log")" \
+  || ok "L: 装机没停过 resolved → 回滚不碰它"
+[[ ! -e "$SB/etc/resolv.conf.pdg-resolved" ]] && ok "L: 装机记录一并删(没停过的也删)" || bad "L: 装机记录残留"
 
 # ── K. 静态守卫: 三个二进制的安装点前必须先 _stash_bin(将来新增安装路径不能漏留原件) ──
 for b in mosdns sing-box mihomo; do

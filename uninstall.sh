@@ -155,7 +155,11 @@ fi
 _HAS_RESOLVED=0
 _unit_files="$(systemctl list-unit-files 2>/dev/null)" || true
 grep -q '^systemd-resolved' <<<"$_unit_files" && _HAS_RESOLVED=1
-[[ "$_HAS_RESOLVED" == 1 ]] && { systemctl enable --now systemd-resolved 2>/dev/null || true; }
+# 按装机前的状态还原(装机时记在 /etc/resolv.conf.pdg-resolved): disabled = 装机停的, 要还它;
+# untouched = 装机前就没在跑, 不去启用它。没有记录(旧版本装的机器)就照旧: 有这个服务就启用。
+_RESOLVED_RESTORE="$_HAS_RESOLVED"
+[[ "$(head -c 32 /etc/resolv.conf.pdg-resolved 2>/dev/null)" == untouched ]] && _RESOLVED_RESTORE=0
+[[ "$_RESOLVED_RESTORE" == 1 ]] && { systemctl enable --now systemd-resolved 2>/dev/null || true; }
 RESOLV_WARN=""
 if [[ -e /etc/resolv.conf.pdg-orig ]]; then
   # Docker/LXC 里 /etc/resolv.conf 是 bind mount: rm/mv 都会 EBUSY, 但**内容能原地写回**。
@@ -177,7 +181,9 @@ fi
 # 机器上它得等 resolved 起来才有目标, 先还原会把备份判成不存在。代价是 resolved 启动那一刻读到的
 # 还是装机写的静态 resolv.conf, 会把里面的 127.0.0.1 收进全局 DNS, 之后换回它自己的文件也不清掉
 # (.200 实测: 卸载后 127.0.0.1:53 已无人监听)。还原完再重启一次, 让它按还原后的文件重读。
-[[ "$_HAS_RESOLVED" == 1 ]] && { systemctl restart systemd-resolved 2>/dev/null || true; }
+[[ "$_RESOLVED_RESTORE" == 1 ]] && { systemctl restart systemd-resolved 2>/dev/null || true; }
+# 装机前状态的记录跟着备份走: 备份用掉了才删, 还原失败时两样都留着
+[[ -e /etc/resolv.conf.pdg-orig || -L /etc/resolv.conf.pdg-orig ]] || rm -f /etc/resolv.conf.pdg-resolved
 
 if [[ -n "$RESOLV_WARN" ]]; then
   echo "⚠️  /etc/resolv.conf 未能还原(可能是 Docker/LXC 的 bind mount, 删不掉也写不进)。"
