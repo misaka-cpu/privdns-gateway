@@ -7632,10 +7632,14 @@ PYH
 
 # 内核里有没有(数的是我们标记过的那条, 不是"含救援端口的任意行")
 _rescue_nft_has_kernel(){
-  local bind; bind="$(_rescue_bind_addr || true)"
+  local bind tbl hit; bind="$(_rescue_bind_addr || true)"
   [[ -n "$bind" ]] || return 1
-  nft list table inet pdg 2>/dev/null | grep -q "comment \"pdg-rescue\"" || return 1
-  nft list table inet pdg 2>/dev/null | grep "comment \"pdg-rescue\"" | grep -q "$bind"
+  # 先收进变量再判, 不能 `nft list table … | grep -q`: nft 列表是分好几次写的, grep -q 一命中
+  # 就退, nft 后面的写挨 SIGPIPE(141), pipefail 下整条判假 —— 实测(nft 1.0.6, 默认规则不到
+  # 1KB)300 次里 296 次。
+  tbl="$(nft list table inet pdg 2>/dev/null)" || return 1
+  hit="$(grep "comment \"pdg-rescue\"" <<<"$tbl")" || return 1
+  grep -q "$bind" <<<"$hit"
 }
 
 # 我们的规则在磁盘/内核里各有几条(盯"恰好一条")
