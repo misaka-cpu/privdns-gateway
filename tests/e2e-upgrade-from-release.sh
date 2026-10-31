@@ -22,15 +22,27 @@ e2e_enter "$@"
 
 command -v git >/dev/null 2>&1 || e2e_skip "无 git"
 
+# 当前整合验收所用的冻结桥接身份。显式输入仍然优先(PDG_BRIDGE_SHA), 默认值随整合候选走。
+# 历史证据里的旧对象 9c9b2681f3ada2155b32ebe372cbc2a154792079 不动 —— 那是它当时的结论。
+# 默认取正式桥接提交(v1.11.16 的 tag 指向它; 上一个默认 6843905e 是更早的桥接候选)。本版必须以它为祖先,
+# 否则已装桥接的机器会被 pdg update 的方向门判成分叉、拒绝升级 —— 换桥接对象时这里要跟着换。
+BRIDGE_SHA="${PDG_BRIDGE_SHA:-542cc9177fc35c9d413ff3b62a7dac8bc468c136}"
+BRIDGE_TAG="${PDG_BRIDGE_TAG:-v9.9.8}"
 # "上一个发布" = 最新的 v* tag, 但**跳过指向 HEAD 自己的那个**。
 # 发布当天 HEAD 上会打上本版的 tag, 直接取最大值就变成"从本版升到本版" —— 一个恒过的空测试,
 # 而且恰恰是最需要它的那一天失效。
+# 也**跳过指向冻结桥接的那个**: 桥接 tag(v1.11.16)推出之后它就是最大的 v* tag。拿它当"上一个发布",
+# A 验的"旧版 CLI 直升被调用方门拒绝"用的就成了桥接版 CLI —— 正是被放行的那个调用方, A 必红;
+# B 的第一跳也成了"桥接升桥接"。A / B 要的是桥接之前的旧版; 桥接升本版那一跳由 B 的第二跳验。
 PREV="${PDG_PREV_TAG:-}"
 if [[ -z "$PREV" ]]; then
   _head_tags="$(git -C "$E2E_ROOT" tag --points-at HEAD 2>/dev/null)"
   while read -r _t; do
     [[ -n "$_t" ]] || continue
     grep -qxF "$_t" <<<"$_head_tags" && continue
+    if [[ "$(git -C "$E2E_ROOT" rev-parse -q --verify "$_t^{commit}" 2>/dev/null)" == "$BRIDGE_SHA" ]]; then
+      echo "   [记录] 跳过指向冻结桥接的 tag: $_t"; continue
+    fi
     PREV="$_t"; break
   done < <(git -C "$E2E_ROOT" tag -l 'v*' --sort=-v:refname)
 fi
@@ -45,12 +57,6 @@ echo "══════════ 上一个发布: $PREV → 本版($NEW_TAG,
 # 版本身份一律以**真实文件的内容摘要**为准, 符号计数只作辅助说明。
 # 这几份基准在**任何沙箱重置之前**从 $E2E_ROOT(只读)取出来, 放在 $E2E_TMP 里,
 # e2e_reset_box 不碰 $E2E_TMP 里这几个名字, 所以两条路径用的是同一批基准。
-# 当前整合验收所用的冻结桥接身份。显式输入仍然优先(PDG_BRIDGE_SHA), 默认值随整合候选走。
-# 历史证据里的旧对象 9c9b2681f3ada2155b32ebe372cbc2a154792079 不动 —— 那是它当时的结论。
-# 默认取正式桥接提交(v1.11.16 的 tag 指向它; 上一个默认 6843905e 是更早的桥接候选)。本版必须以它为祖先,
-# 否则已装桥接的机器会被 pdg update 的方向门判成分叉、拒绝升级 —— 换桥接对象时这里要跟着换。
-BRIDGE_SHA="${PDG_BRIDGE_SHA:-542cc9177fc35c9d413ff3b62a7dac8bc468c136}"
-BRIDGE_TAG="${PDG_BRIDGE_TAG:-v9.9.8}"
 # 本次到底选中了哪一个 —— **完整**打出来, 不靠源码默认值声称。
 echo "   [记录] 本次冻结桥接身份: $BRIDGE_SHA  (来源: ${PDG_BRIDGE_SHA:+显式输入}${PDG_BRIDGE_SHA:-源码默认})"
 CAND_SHA="$(git -C "$E2E_ROOT" rev-parse -q --verify 'HEAD^{commit}')" || CAND_SHA=""
