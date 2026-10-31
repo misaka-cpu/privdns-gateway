@@ -10,6 +10,13 @@
 #   自动识别公网IP / 内网卡段; DNS(域名 A 记录) 那步留给你自己做; 落地出口装好后用 bot 加。
 # 也支持 curl|bash 直接跑: curl -fsSL <raw>/install.sh | sudo bash  (脚本会自动拉取仓库)
 # ─────────────────────────────────────────────────────────────────────────────
+# 整份脚本包在 { … } 里, 一直到文件末尾那个 }: bash 要读到配对的 } 才开始执行任何一行。
+# 为什么: curl | bash 时 bash 从管道逐行读脚本, 读到下面自举那几行(约 3.4 KB)就 exec 到第二段,
+# 管道里剩下的没人读。脚本比管道缓冲(64 KiB)大, curl 就写不完, 报 "(23) Failure writing output
+# to destination" 并以 23 退出 —— 照 README 一键安装每次都多这一行, 开了 pipefail 的自动化还会把
+# 装好了的机器判成安装失败(2026-10-31 照 README 一键安装实测)。包起来之后, bash 先把整份读完再动手。
+# 顺带: 下载中途断了, bash 读不到配对的 }, 一行都不执行, 不会跑半截脚本。
+{
 set -euo pipefail
 
 REPO_URL="https://github.com/misaka-cpu/privdns-gateway.git"
@@ -1195,3 +1202,5 @@ cat <<EOF
 🛠 日常管理:  sudo pdg   (状态 / 更新 / 换 token / 重启 / 日志 / 卸载)
 ⚠️ SSH 端口当前按 $SSH_PORT 放行; 若你之后改 sshd Port, 记得同步改 /etc/nftables.conf 再 nft -f。
 EOF
+# 与开头的 { 配对。exit 跟在同一行: bash 读完这一行才动手, 文件里一个字节都不剩在管道里; } 之后哪怕多出内容也不执行。
+}; exit

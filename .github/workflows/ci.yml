@@ -943,6 +943,10 @@ jobs:
       - name: "卸载还原 resolved (探测不被 SIGPIPE 反转 / 不把装机的 127.0.0.1 留在全局 DNS / 按装机记下的状态还原, 含 install.sh 那段的往返)"
         run: python3 tests/test-uninstall-resolved-restore.py
 
+      # 不需要 root(root 下自己降到 nobody 跑): install.sh 原样从管道喂给 bash, 看它是不是先读完整份再执行。
+      - name: "install.sh 从管道读入时先读完整份再执行 (README 一键安装的 curl 不再以 23 退出)"
+        run: python3 tests/test-install-pipe-readall.py
+
       - name: "系统不变量捕获器 (schema/凭据只留摘要/不跟随软链/十条比较负控)"
         run: python3 tests/test-invariants.py
 
