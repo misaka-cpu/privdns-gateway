@@ -34,14 +34,17 @@ BRIDGE_TAG="${PDG_BRIDGE_TAG:-v9.9.8}"
 # 也**跳过指向冻结桥接的那个**: 桥接 tag(v1.11.16)推出之后它就是最大的 v* tag。拿它当"上一个发布",
 # A 验的"旧版 CLI 直升被调用方门拒绝"用的就成了桥接版 CLI —— 正是被放行的那个调用方, A 必红;
 # B 的第一跳也成了"桥接升桥接"。A / B 要的是桥接之前的旧版; 桥接升本版那一跳由 B 的第二跳验。
+# 桥接**之后**的 tag 同样跳过: 退役 tag(v1.12.0)推出后, main 上它就是 HEAD 之外最大的 v* tag,
+# 而它不在桥接之前, 下面的祖先关系核对会直接判红, A / B 都跑不到。
 PREV="${PDG_PREV_TAG:-}"
 if [[ -z "$PREV" ]]; then
   _head_tags="$(git -C "$E2E_ROOT" tag --points-at HEAD 2>/dev/null)"
   while read -r _t; do
     [[ -n "$_t" ]] || continue
     grep -qxF "$_t" <<<"$_head_tags" && continue
-    if [[ "$(git -C "$E2E_ROOT" rev-parse -q --verify "$_t^{commit}" 2>/dev/null)" == "$BRIDGE_SHA" ]]; then
-      echo "   [记录] 跳过指向冻结桥接的 tag: $_t"; continue
+    _c="$(git -C "$E2E_ROOT" rev-parse -q --verify "$_t^{commit}" 2>/dev/null)"
+    if [[ -n "$_c" ]] && git -C "$E2E_ROOT" merge-base --is-ancestor "$BRIDGE_SHA" "$_c" 2>/dev/null; then
+      echo "   [记录] 跳过冻结桥接及其之后的 tag: $_t"; continue
     fi
     PREV="$_t"; break
   done < <(git -C "$E2E_ROOT" tag -l 'v*' --sort=-v:refname)
@@ -299,6 +302,11 @@ seed_release_box(){   # $1=具名前缀 → 0=前像成立; 设 UD_BEFORE / PROF
   e2e_git "$REPO" config user.name t    >/dev/null || { bad "$tag 配 user.name 失败"; return 1; }
   e2e_git "$REPO" config commit.gpgsign false >/dev/null || { bad "$tag 配 gpgsign 失败"; return 1; }
   e2e_git "$REPO" remote remove origin >/dev/null 2>&1
+  # 先让 HEAD 游离再挪 main: push 到 main 的 CI 里 $E2E_ROOT 检出的就是 main, 克隆出来的
+  # $REPO 也停在 main 上, 而 git 不许强制移动当前检出的分支(rc=128)。游离不动工作树,
+  # 下面照样检出 $PREV。
+  e2e_git "$REPO" checkout -q --detach >/dev/null 2>&1 \
+    || { bad "$tag 让受管仓库 HEAD 游离失败(挪 main 之前要先离开它)"; return 1; }
   e2e_git "$REPO" branch -f main "$CAND_SHA" >/dev/null 2>&1 \
     || { bad "$tag 建不出 main(更新器取件走 fetch origin main)"; return 1; }
   # 隔离环境里的自建 tag —— docs/BRIDGE-ENTRY.md 第六节明说这是**模型**, 不是官方发布路径。
