@@ -455,7 +455,7 @@ def _nav(key):
             [{"text": "🔄 重启服务", "callback_data": "restart"}, {"text": "📦 更新规则库", "callback_data": "updgeo"}],
             [{"text": "💾 备份", "callback_data": "backup"}, {"text": "♻️ 恢复", "callback_data": "restore"}],
             [{"text": "🌐 DNS 上游", "callback_data": "dnsup"}, {"text": "🚀 TFO", "callback_data": "tfo"}],
-            [{"text": "📊 观测面板", "callback_data": "panel"}]]),
+            [{"text": "📊 观测面板", "callback_data": "panel"}, {"text": "🧬 内核", "callback_data": "krn"}]]),
     }
     if os.path.exists(LAN_TABLE_FILE):                # 配过内网面板才显示(没配的人不该多一个看不懂的按钮)
         subs["ops"][1].append([{"text": "🏠 内网面板", "callback_data": "nav:lan"}])
@@ -2865,6 +2865,93 @@ def start_update():
     except Exception:  # noqa: BLE001
         return False
 
+# ── 内核跟随(「🧬 内核」页): 只调 `pdg kernel`, 判定与记录都在 CLI / kernelfollow.py ──────────
+# 回调是闭集: krn(页) / krn_up / krn_up_ok / krn_rev / krn_rev_ok / krn_follow / krn_pin /
+# krn_pin_ok / krn_auto_on / krn_auto_off。回调里**不带版本号** —— 换到哪一版由 CLI 在执行
+# 那一刻向上游现查, 不让一条旧消息上的按钮决定装哪个二进制。
+KRN_BACK = {"inline_keyboard": [[{"text": "⬅️ 返回内核", "callback_data": "krn"}],
+                                [{"text": "⬅️ 返回运维", "callback_data": "nav:ops"}]]}
+KRN_MODE = {"pinned": "跟发布", "upstream": "跟上游"}
+KRN_SRC = {"pin": "发布钉值", "upstream": "跟随记录(上游)", "unknown": "⚠️ 与钉值和本机记录都对不上"}
+KRN_VERDICT = {"upgrade": "可以换", "same": "已是最新", "below_pin": "低于发布钉值, 不换",
+               "major": "跨大版本, 不换", "refuse": "不换", "error": "查不到"}
+
+
+def _kernel_kv(online=True):
+    """`pdg kernel status --kv` → 字典。键只认小写字母与下划线, 别的行不收。"""
+    r = sh([PDG_CLI, "kernel", "status", "--kv"] + (["--online"] if online else []))
+    kv = {}
+    for line in (r.stdout or "").splitlines():
+        k, sep, v = line.partition("=")
+        if sep and re.fullmatch(r"[a-z_]+", k):
+            kv[k] = v
+    return r.returncode, kv
+
+
+def kernel_page():
+    rc, kv = _kernel_kv(online=True)
+    if rc != 0 or "mode" not in kv:
+        return "❌ 读不到内核状态, 到服务器上跑 <code>sudo pdg kernel status</code> 看。", OPS_BACK
+    mode = kv.get("mode", "")
+    lines = ["🧬 <b>内核</b>",
+             "跟随: <b>%s</b>%s" % (KRN_MODE.get(mode, "⚠️ 记录读不出"),
+                                   ("(自动: %s)" % ("开" if kv.get("auto") == "on" else "关"))
+                                   if mode == "upstream" else ""),
+             "已装: <code>%s</code>(%s)" % (_esc(kv.get("installed") or "?"),
+                                             KRN_SRC.get(kv.get("source", ""), _esc(kv.get("source", "")))),
+             "发布钉值: <code>%s</code>" % _esc(kv.get("pin", ""))]
+    if kv.get("latest"):
+        lines.append("上游最新稳定版: <code>%s</code>(%s)→ %s" % (
+            _esc(kv["latest"]), _esc(kv.get("latest_published", "")),
+            KRN_VERDICT.get(kv.get("verdict", ""), _esc(kv.get("verdict", "")))))
+    else:
+        lines.append("上游最新稳定版: 查不到(%s)" % _esc(kv.get("verdict_why", "")))
+    if kv.get("last"):
+        lines.append("上次尝试: %s%s" % (_esc(kv["last"]),
+                                         (" —— " + _esc(kv["last_why"])) if kv.get("last_why") else ""))
+    if kv.get("state_error"):
+        lines.append("⚠️ " + _esc(kv["state_error"]))
+    lines.append("")
+    if mode == "upstream":
+        lines.append("跟上游: 不等项目发版, 直接换上游稳定版; 换核前后自动体检, 变差就换回旧核。"
+                     "新内核没经过项目的 E2E, 信任锚只有上游给的摘要。")
+    else:
+        lines.append("跟发布: 内核随项目发版走, 由「🔄 更新」收敛到发布钉值(默认, 最稳)。")
+    rows = []
+    if mode == "upstream":
+        if kv.get("verdict") == "upgrade":
+            rows.append([{"text": "⬆️ 换到 %s" % kv.get("latest", "上游最新"), "callback_data": "krn_up"}])
+        if kv.get("auto") == "on":
+            rows.append([{"text": "⏰ 自动: 开(点一下关)", "callback_data": "krn_auto_off"}])
+        else:
+            rows.append([{"text": "⏰ 自动: 关(点一下开)", "callback_data": "krn_auto_on"}])
+        if kv.get("source") != "pin":
+            rows.append([{"text": "↩️ 换回钉死版 %s" % kv.get("pin", ""), "callback_data": "krn_rev"}])
+        rows.append([{"text": "📌 改回跟发布", "callback_data": "krn_pin"}])
+    elif mode == "pinned":
+        rows.append([{"text": "🧬 改成跟上游", "callback_data": "krn_follow"}])
+    rows.append([{"text": "🔄 刷新", "callback_data": "krn"}, {"text": "⬅️ 返回运维", "callback_data": "nav:ops"}])
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def start_kernel_job(*args):
+    """换核 / 换回在独立的 systemd 瞬时单元里跑(同 start_update), 结果由 CLI 自己发 Telegram。"""
+    try:
+        r = subprocess.run(["systemd-run", "--collect", PDG_CLI, "kernel", *args, "--notify"],
+                           capture_output=True, text=True, timeout=15)
+        return r.returncode == 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _kernel_page_bg(chat, mid, note=""):
+    """内核页要向上游现查一次(几秒), 放后台, 不堵主轮询。"""
+    def go(chat=chat, mid=mid):
+        text, kb = kernel_page()
+        edit(chat, mid, (note + "\n\n" + text) if note else text, kb)
+    edit(chat, mid, (note + "\n\n" if note else "") + "🧬 查询内核状态(含上游最新版, 几秒)…", OPS_BACK)
+    run_bg(chat, go)
+
 # ── 规则集派生的劫持表 ────────────────────────────────────────────────────────
 # 为什么需要它: 规则集只写 mihomo 那一侧(rule-providers + RULE-SET 规则), 而流量能不能到
 # mihomo 由 mosdns 决定。all 模式下"不是国内就劫持"顺带把规则集的域名兜住了, 看不出问题;
@@ -4797,6 +4884,51 @@ def _handle_cb_inner(chat, mid, data, uid=None):
         edit(chat, mid, ("🚀 已开始后台更新, 约 30-60 秒后 bot 自动回来(期间可能短暂无响应)。\n"
                          "完成后点「🩺 自检」确认。" if ok
                          else "❌ 启动更新失败, 请在终端跑 sudo pdg update。"), BACK); return
+    if data == "krn":
+        _kernel_page_bg(chat, mid); return
+    if data == "krn_up":
+        edit(chat, mid, ("⬆️ <b>换到上游最新稳定版</b>\n\n换到哪一版以点确认时上游的最新稳定版为准。"
+                         "换核时代理会断几秒; 换完自动体检, 比换核前差就换回旧核。"
+                         "结果会单独发一条消息。"),
+             {"inline_keyboard": [[{"text": "✅ 确认换核", "callback_data": "krn_up_ok"}],
+                                  [{"text": "⬅️ 取消", "callback_data": "krn"}]]}); return
+    if data == "krn_up_ok":
+        ok = start_kernel_job("upgrade")
+        edit(chat, mid, ("🚀 已在后台换核, 结果会单独发一条消息(约半分钟到两分钟)。" if ok
+                         else "❌ 启动换核失败, 请在终端跑 sudo pdg kernel upgrade。"), KRN_BACK); return
+    if data == "krn_rev":
+        edit(chat, mid, ("↩️ <b>换回发布钉值那一版</b>\n\n模式不变(仍是跟上游)。"
+                         "换核时代理会断几秒; 结果会单独发一条消息。"),
+             {"inline_keyboard": [[{"text": "✅ 确认换回", "callback_data": "krn_rev_ok"}],
+                                  [{"text": "⬅️ 取消", "callback_data": "krn"}]]}); return
+    if data == "krn_rev_ok":
+        ok = start_kernel_job("revert")
+        edit(chat, mid, ("🚀 已在后台换回钉死版, 结果会单独发一条消息。" if ok
+                         else "❌ 启动失败, 请在终端跑 sudo pdg kernel revert。"), KRN_BACK); return
+    if data == "krn_follow":
+        r = sh([PDG_CLI, "kernel", "mode", "upstream"])
+        _kernel_page_bg(chat, mid, "✅ 已改成跟上游(自动默认关)。" if r.returncode == 0
+                        else "❌ 改模式失败: " + _esc(((r.stdout or "") + (r.stderr or "")).strip()[-300:])); return
+    if data == "krn_pin":
+        edit(chat, mid, ("📌 <b>改回跟发布</b>\n\n自动换核一并关闭。现在装着的若不是发布钉值, "
+                         "会在后台换回钉死版(结果单独发消息)。"),
+             {"inline_keyboard": [[{"text": "✅ 确认改回", "callback_data": "krn_pin_ok"}],
+                                  [{"text": "⬅️ 取消", "callback_data": "krn"}]]}); return
+    if data == "krn_pin_ok":
+        r = sh([PDG_CLI, "kernel", "mode", "pinned"])
+        if r.returncode != 0:
+            edit(chat, mid, "❌ 改模式失败: " + _esc(((r.stdout or "") + (r.stderr or "")).strip()[-300:]),
+                 KRN_BACK); return
+        ok = start_kernel_job("revert")
+        edit(chat, mid, ("✅ 已改回跟发布。若装着的不是钉死版, 正在后台换回, 结果单独发消息。" if ok
+                         else "✅ 已改回跟发布, 但没能启动换回钉死版: 下次「🔄 更新」会收敛回钉值,"
+                              "也可以在终端跑 sudo pdg kernel revert。"), KRN_BACK); return
+    if data in ("krn_auto_on", "krn_auto_off"):
+        r = sh([PDG_CLI, "kernel", "auto", "on" if data == "krn_auto_on" else "off"])
+        _kernel_page_bg(chat, mid, ("✅ 自动换核已" + ("打开: 上游稳定版发布满 3 天后由每日定时任务换上并通知。"
+                                                       if data == "krn_auto_on" else "关闭。"))
+                        if r.returncode == 0
+                        else "❌ 设置失败: " + _esc(((r.stdout or "") + (r.stderr or "")).strip()[-300:])); return
     if data == "traffic":
         edit(chat, mid, traffic_text(), BACK); return
     if data == "lan_list":

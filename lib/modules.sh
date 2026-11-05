@@ -61,7 +61,8 @@ deploy/bot/pdg-bot.py bot.py 755
 deploy/bot/parse-geosite.py parse-geosite.py 755
 deploy/bot/update-rules.sh update-rules.sh 755
 deploy/bot/scheduled-update.sh scheduled-update.sh 755
-deploy/bot/healthcheck.py healthcheck.py 755"
+deploy/bot/healthcheck.py healthcheck.py 755
+deploy/bot/kernelfollow.py kernelfollow.py 755"
 # rescue.sh 那行不是 Python: rescue_const 解析的常量单一事实源。装一份副本, 于是仓库不在时
 # 也读得到(它按 /opt/pdg-bot/rescue.sh → 仓库 lib/rescue.sh 的顺序找)。
 #
