@@ -78,6 +78,14 @@ sudo ./install.sh
 
 流量层统一使用 mihomo（clash.meta）：nft REDIRECT 入站 + redir 监听 + SNI 嗅探；提供 clash_api，可开观测面板。内核版本由 `pdg update` 随 PrivDNS Gateway 发布版指定并校验后安装。
 
+内核有两种跟法，每台机器自己选（`sudo pdg kernel mode`，或 Bot「🛠 运维 → 🧬 内核」）：
+
+- **跟发布**（默认）：内核就是本项目发布版钉死的那一版，`pdg update` 收敛到它。钉值是人看过、CI 跑过端到端测试的，最稳。
+- **跟上游**：不等项目发版，直接换 MetaCubeX/mihomo 的最新稳定版（`sudo pdg kernel upgrade`，或在 Bot 里点一下）。还可以打开自动（`sudo pdg kernel auto on`），由每日定时任务在上游稳定版发布满 3 天后换上，并发 Telegram 通知。
+  - 换核前会核对：必须是稳定版、不低于发布钉值、不跨大版本；下载物必须与上游给的 sha256 摘要一致，并且是本机架构的可执行文件，自报版本也要对得上。
+  - 换核前后各做一次体检（本机 DNS、各出口延迟测试），换完比换核前差就自动换回旧内核。
+  - 代价要知道：新内核**没经过本项目的端到端测试**，信任锚只剩上游 Release 给的摘要；上游被攻破时，开着自动就会自动装上。`pdg update` 不会把跟上游装上的版本降回钉值；改回跟发布后，`sudo pdg kernel revert` 立刻换回钉死版（不换的话下次 `pdg update` 也会换回）。
+
 > 早期版本曾支持 sing-box / mihomo 二选一。sing-box 1.13 移除了本网关依赖的 `sniff_override_destination`，导致它无法继续升级到 1.13 及后续版本，因此 **v1.6.0 起已彻底移除 sing-box 运行时**，mihomo 成为唯一内核。旧的 sing-box 机器执行 `sudo pdg update` 时会自动迁移到 mihomo（出口、分流、证书、DoT 全部保留；若有 mihomo 无法转换的出口，更新会中止并回滚，提示先在 Bot 里处理该出口）。
 
 ## 7. 手机接入
@@ -101,7 +109,7 @@ sudo ./install.sh
 - 📑 分流管理：把域名、`.list` / `.txt` 等规则集指到出口；默认其余国际走 VPS 直出。
 - 🔀 故障切换组：按探测延迟选择出口，并在出口不可用时切换。
 - 📱 客户端：Android 显示私密 DNS 主机名；iOS 显示 iOS 描述文件入口。两个平台都提供「🌐 DoT 自定义域名」和「✈️ Telegram 出口」。
-- 🛠 运维：重启服务、更新规则库、备份/恢复、DNS 上游、TFO、观测面板。
+- 🛠 运维：重启服务、更新规则库、备份/恢复、DNS 上游、TFO、观测面板、内核（跟发布 / 跟上游，见第 6 节）。
 
 Telegram 出口（Bot 内置 SOCKS5，端口 8445）用于给手机上的 Telegram 单独指定出口，在客户端菜单里配置。
 
@@ -129,10 +137,15 @@ sudo pdg link status                    # 链路诊断：服务器侧准备状�
 sudo pdg link session <start|status|stop>   # 手机协助诊断会话（一次性链接，5 分钟有效）
 sudo pdg ssh-source <status|tailnet|any|confirm>   # SSH 来源限制（收紧为只允许经 Tailscale 登录）
 sudo pdg lan <status|list|add|rm|cert|enable|disable|purge>   # 内网面板（见第 13 节）
+sudo pdg kernel [status [--online]]     # 内核跟随：模式 / 已装版本与来源 / 发布钉值；--online 另查上游最新稳定版
+sudo pdg kernel mode <pinned|upstream>  # 跟发布（默认）/ 跟上游（见第 6 节）
+sudo pdg kernel upgrade [vX.Y.Z]        # 跟上游时：换到上游最新稳定版（或指定版本），体检不过自动换回
+sudo pdg kernel auto <on|off>           # 跟上游时：每日自动检查，上游稳定版发布满 3 天才换
+sudo pdg kernel revert                  # 换回发布钉值那一版
 sudo pdg uninstall [--purge]            # 卸载（--purge 连配置删）
 ```
 
-`pdg update` 只跟随项目的 `v*` 发布 tag，不安装 main 上未发布的中间提交；更新会同时安装该发布版指定并校验过的内核版本。健康自检每 10 分钟自动运行，服务异常、DNS 不应答、证书临近到期会通过 Telegram 通知。生命周期（安装、更新、卸载、token、状态）用 `pdg` 命令管理；出口、分流、DNS 上游等运行时配置在 Telegram Bot 里。
+`pdg update` 只跟随项目的 `v*` 发布 tag，不安装 main 上未发布的中间提交；更新会同时安装该发布版指定并校验过的内核版本（「跟上游」的机器上，不低于钉值的上游版本会被保留）。健康自检每 10 分钟自动运行，服务异常、DNS 不应答、证书临近到期会通过 Telegram 通知。生命周期（安装、更新、卸载、token、状态）用 `pdg` 命令管理；出口、分流、DNS 上游等运行时配置在 Telegram Bot 里。
 
 ## 10. iOS 位置改写（WLOC）— 已退役
 
