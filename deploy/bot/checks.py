@@ -361,29 +361,40 @@ def check_core_version(_bin=None, _pin=None):
         return ("fail", name, "%s -v 的输出里**读不出版本号**" % b)
     got = "v" + m.group(1)
     if got != (want if want.startswith("v") else "v" + want):
-        fv = _kernel_follow_version(b, want)
+        fv, unreadable = _kernel_follow_version(b, want)
         if fv and fv == got:
             return ("ok", name, "%s ✓(跟随上游: 与本机跟随记录一致; 发布钉值是 %s)" % (got, want))
+        if unreadable:
+            return ("warn", name, "自报 %s, 发布钉值是 %s; 本机跟随记录读不到(要 root), 判不出它是不是跟随上游装上的"
+                                  " —— 本项无结论, 用 `sudo pdg doctor` 看" % (got, want))
         return ("fail", name, "自报版本 %s 与钉死版 %s **不符** —— `sudo pdg update` 会把它换回来"
                 % (got, want))
     return ("ok", name, "%s ✓(自报版本与钉死版一致; 文件内容另见「mihomo 二进制」)" % got)
 
 
 def _kernel_follow_version(b, pin):
-    """「跟上游」(pdg kernel)的机器上, 这个文件是否就是本机跟随记录里那一份。是 → 记录的版本; 否则空串。
+    """「跟上游」(pdg kernel)的机器上, 这个文件是否就是本机跟随记录里那一份。返回 (版本或空串, 记录读不到?)。
 
     判定只在 kernelfollow.py 一处(pdg update 的保留判据也调它): 模式是跟上游、记录来自上游
     且带 asset digest、版本不低于钉值且同一个大版本、内容摘要等于记录、自报版本等于记录。
-    模块不在 / 记录读不出 / 任一条不成立 → 空串, 调用方照旧按钉值判。"""
+    模块不在 / 记录不合规 / 任一条不成立 → ("", False), 调用方照旧按钉值判。
+    记录文件在但这个身份读不到(kernel.json 是 0600 root, 非 root 跑 doctor)→ ("", True):
+    这时判不出来, 调用方报"无结论", 不能把一台好好跟着上游的机器报成内容被换过。"""
     try:
         import kernelfollow
     except Exception:  # noqa: BLE001
-        return ""
+        return "", False
+    try:
+        kernelfollow.load_state()
+    except kernelfollow.KFUnreadable:
+        return "", True
+    except Exception:  # noqa: BLE001
+        return "", False
     try:
         good, ver, _why = kernelfollow.accept(b, pin)
     except Exception:  # noqa: BLE001
-        return ""
-    return ver if good else ""
+        return "", False
+    return (ver if good else ""), False
 
 
 def _pinned_mihomo_ver():
@@ -426,10 +437,13 @@ def check_mihomo_binary(_bin=None, _pin=None, _arch=None):
         return ("fail", name, "读不到 %s(%s)" % (b, e.strerror or e.errno))
     if got == pin:
         return ("ok", name, "内容与官方钉值一致 ✓(sha256 %s…)" % got[:12])
-    fv = _kernel_follow_version(b, _pinned_mihomo_ver() if _pin is None else "")
+    fv, unreadable = _kernel_follow_version(b, _pinned_mihomo_ver() if _pin is None else "")
     if fv:
         return ("ok", name, "内容与本机跟随记录一致 ✓(跟随上游 %s, sha256 %s…; 记录换核时与上游 asset digest "
                             "核对过; 不是发布钉值, 也没经过项目的 E2E)" % (fv, got[:12]))
+    if unreadable:
+        return ("warn", name, "内容不等于发布钉值(实得 %s…), 本机跟随记录读不到(要 root), 判不出它是不是跟随上游"
+                              "装上的 —— 本项无结论, 用 `sudo pdg doctor` 看" % got[:12])
     return ("fail", name,
             "二进制**内容**与官方钉值不一致: 实得 %s…, 钉死 %s… —— "
             "同一个版本号下内容被换过(或安装时跳过了校验)。`sudo pdg update` 会重下并修复。"

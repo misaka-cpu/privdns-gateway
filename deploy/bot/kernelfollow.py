@@ -25,8 +25,9 @@ pdg update 觉得没事, 或者反过来。
   kernelfollow.py state --get mode|auto             读一个字段
   kernelfollow.py set-mode pinned|upstream / set-auto on|off
   kernelfollow.py record --version V --sha S --source upstream|pin [--archive-digest D] [--if-exists]
-  kernelfollow.py note --result ok|fail|skip --version V [--why W]
-  kernelfollow.py last-failed --version V           rc 0 = 上次尝试这一版失败过
+  kernelfollow.py note --result ok|fail|error|skip --version V [--why W]
+  kernelfollow.py last-failed --version V           rc 0 = 上次尝试这一版是实质失败(error 那类临时失败不算)
+  kernelfollow.py baseline FILE                     rc 0 = 体检结果里至少一项 ok(有东西可对照)
   kernelfollow.py due --published-at T [--days N]   rc 0 已满 N 天 / 3 未满
   kernelfollow.py health                            换核体检, JSON 到 stdout
   kernelfollow.py compare BEFORE AFTER              rc 0 不比前像差 / 1 有退步(stdout 列出)
@@ -76,6 +77,11 @@ class KFError(Exception):
     """判不出来 / 数据不合规。调用方一律当"不能换 / 不认", 不退回某个默认值。"""
 
 
+class KFUnreadable(KFError):
+    """记录文件在, 但这个身份读不到(kernel.json 是 0600 root)。doctor 据此说"无结论",
+    而不是把一台好好跟着上游的机器报成内容被换过。"""
+
+
 def parse_ver(s):
     m = TAG_RE.match(s or "")
     return tuple(int(x) for x in m.groups()) if m else None
@@ -111,6 +117,8 @@ def load_state():
             raw = f.read()
     except FileNotFoundError:
         return _blank()
+    except PermissionError:
+        raise KFUnreadable("没有权限读 %s(要 root)" % STATE)
     except OSError as e:
         raise KFError("读不到 %s(%s)" % (STATE, e.strerror or e.errno))
     try:
@@ -200,10 +208,17 @@ def record(version, sha, source, archive_digest="", if_exists=False):
     return True
 
 
+RESULTS = ("ok", "fail", "error", "skip")
+
+
 def note(result, version, why=""):
-    """记下最近一次尝试(给 status 与"失败过就不自动重试"用)。没有记录文件就不建。"""
-    if result not in ("ok", "fail", "skip"):
-        raise KFError("result 只能是 ok / fail / skip")
+    """记下最近一次尝试(给 status 与"失败过就不自动重试"用)。没有记录文件就不建。
+
+    fail  = 这一版本身有问题(摘要不符 / 不是本机架构 / 换核校验没过 / 体检变差 / 没有可对照的体检);
+    error = 这一次没做成, 与版本无关(下载或上游 API 失败 / 建不出临时目录 / 备份失败 / 记录没写成)。
+    自动模式只对 fail 不再重试: 把一次网络抖动记成 fail, 自动就会永远停在那一版前面。"""
+    if result not in RESULTS:
+        raise KFError("result 只能是 " + " / ".join(RESULTS))
     if not os.path.exists(STATE):
         return False
     d = load_state()
@@ -440,6 +455,11 @@ def compare(before, after):
     return sorted(k for k, v in before.items() if v == "ok" and after.get(k) != "ok")
 
 
+def has_baseline(before):
+    """前像里至少有一项 ok。一项都没有时 compare 永远找不到退步 —— 那不是"体检通过", 是没体检。"""
+    return any(v == "ok" for v in before.values())
+
+
 # ── 通知 ──────────────────────────────────────────────────────────────────────
 def notify(text):
     """经 bot 的凭据发给允许的用户。与 healthcheck 同一套读凭据与发送, 不另存一份。
@@ -531,6 +551,7 @@ def main(argv=None):
     a = sp.add_parser("note"); a.add_argument("--result", required=True); a.add_argument("--version", default="")
     a.add_argument("--why", default="")
     a = sp.add_parser("last-failed"); a.add_argument("--version", required=True)
+    a = sp.add_parser("baseline"); a.add_argument("file")
     a = sp.add_parser("due"); a.add_argument("--published-at", required=True)
     a.add_argument("--days", type=int, default=AUTO_WAIT_DAYS)
     sp.add_parser("health")
@@ -576,6 +597,19 @@ def main(argv=None):
             return 0
         if o.cmd == "last-failed":
             return 0 if last_failed(o.version) else 1
+        if o.cmd == "baseline":
+            try:
+                with open(o.file, encoding="utf-8") as f:
+                    d = json.load(f)
+                if not isinstance(d, dict):
+                    raise ValueError
+            except (OSError, ValueError):
+                print("体检结果读不出")
+                return 2
+            if has_baseline(d):
+                return 0
+            print("换核前的体检没有一项是好的(%s), 无从对照" % "、".join("%s=%s" % kv for kv in sorted(d.items())))
+            return 1
         if o.cmd == "due":
             return 0 if due(o.published_at, o.days) else 3
         if o.cmd == "health":

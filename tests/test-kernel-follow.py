@@ -257,6 +257,26 @@ for args, why in ((("v1.19.35", "3" * 64, "upstream", ""), "上游来源不带 d
         ok("record: %s → 拒绝" % why)
 kf.note("fail", "v1.19.35", "体检变差")
 check(kf.last_failed("v1.19.35") and not kf.last_failed("v1.19.36"), "last_failed 只对同一版成立")
+kf.note("error", "v1.19.35", "下载失败")
+check(not kf.last_failed("v1.19.35"), "error(下载 / API 这类临时失败)不算失败过 —— 自动照样会再试")
+try:
+    kf.note("oops", "v1.19.35")
+    bad("不认识的 result 应当被拒")
+except kf.KFError:
+    ok("不认识的 result → 拒绝")
+if os.geteuid() != 0:
+    os.chmod(kf.STATE, 0)
+    try:
+        kf.load_state()
+        bad("读不到的记录应当报 KFUnreadable")
+    except kf.KFUnreadable:
+        ok("记录在但没权限读 → KFUnreadable(调用方据此说无结论)")
+    except kf.KFError:
+        bad("没权限读应当是 KFUnreadable, 不是一般的 KFError")
+    check(not kf.accept(os.path.join(WORK, "x"), PIN)[0], "读不到记录 → 不认")
+    os.chmod(kf.STATE, 0o600)
+else:
+    print("[SKIP] 以 root 运行, 权限位挡不住读 —— KFUnreadable 这一格未验, 不是通过")
 saved = kf.STATE
 kf.STATE = os.path.join(WORK, "no-such-dir", "kernel.json")
 try:
@@ -348,6 +368,9 @@ check(kf.compare({"dns": "ok", "out:a": "fail"}, {"dns": "ok", "out:a": "fail"})
 check(kf.compare({"dns": "ok"}, {"dns": "ok", "out:new": "fail"}) == [], "后像里新出现的项 → 无从对照, 不算")
 check(kf.compare({"dns": "ok", "ctrl": "ok"}, {"dns": "ok"}) == ["ctrl"], "后像里少了前像 ok 的项 → 退步")
 check(kf.compare({"ctrl": "na"}, {"ctrl": "na"}) == [], "管理面前后都没配 → 不算退步")
+check(kf.has_baseline({"dns": "ok", "ctrl": "na"}), "前像至少一项 ok → 有可对照的")
+check(not kf.has_baseline({"dns": "fail", "ctrl": "na"}) and not kf.has_baseline({}),
+      "前像一项 ok 都没有 → 没有可对照的(compare 在这时永远找不到退步, 不能当体检通过)")
 
 print()
 print("══ 8. 体检采样(管理面打桩, 不连任何端口) ══")
@@ -412,6 +435,10 @@ rc, out = run_main(["compare", b0, b1])
 check(rc == 1 and "dns" in out, "compare 有退步 → 1 并列出")
 open(b1, "w").write("nope")
 check(run_main(["compare", b0, b1])[0] == 2, "compare 读不出 → 2(不当成没退步)")
+check(run_main(["baseline", b0])[0] == 0, "baseline 有 ok 项 → 0")
+json.dump({"dns": "fail", "ctrl": "na"}, open(b1, "w"))
+rc, out = run_main(["baseline", b1])
+check(rc == 1 and "无从对照" in out, "baseline 一项 ok 都没有 → 1 并说明")
 reset_state()
 check(run_main(["state", "--get", "mode"]) == (0, "pinned\n"), "state --get mode 默认 pinned")
 check(run_main(["accept", "--pin", PIN, "--bin", BIN])[0] == 1, "accept 不认 → 1")
@@ -460,6 +487,16 @@ check(checks.check_mihomo_binary(_bin=BIN, _arch="amd64")[0] == "fail", "记录�
 up_state(nxt, sha)
 check(checks.check_mihomo_binary(_bin=BIN, _arch="amd64", _pin="f" * 64)[0] == "fail",
       "测试注入钉值时不走跟随分支(既有用例的口径不变)")
+if os.geteuid() != 0:
+    os.chmod(kf.STATE, 0)
+    lv, _, dv = checks.check_core_version(_bin=BIN)
+    lb, _, db = checks.check_mihomo_binary(_bin=BIN, _arch="amd64")
+    check(lv == "warn" and "无结论" in dv and "sudo pdg doctor" in dv,
+          "非 root 读不到跟随记录: 版本判据 warn + 无结论 + 指向 sudo(不报成不符)")
+    check(lb == "warn" and "无结论" in db, "非 root 读不到跟随记录: 内容判据 warn + 无结论(不报成内容被换过)")
+    os.chmod(kf.STATE, 0o600)
+else:
+    print("[SKIP] 以 root 运行, 读不到记录那一格未验, 不是通过")
 reset_state()
 
 print("-" * 62)

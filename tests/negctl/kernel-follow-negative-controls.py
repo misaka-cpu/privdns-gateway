@@ -178,11 +178,30 @@ nc(13, "跟发布下 upgrade 照样去换", P,
    '  if [[ "$mode" != upstream ]]; then\n    echo "现在是「跟发布」',
    '  if false; then\n    echo "现在是「跟发布」', [SH])
 nc(14, "doctor 内容判据在注入钉值时也走跟随分支", C,
-   'fv = _kernel_follow_version(b, _pinned_mihomo_ver() if _pin is None else "")',
-   'fv = _kernel_follow_version(b, _pinned_mihomo_ver())', [PY])
+   'fv, unreadable = _kernel_follow_version(b, _pinned_mihomo_ver() if _pin is None else "")',
+   'fv, unreadable = _kernel_follow_version(b, _pinned_mihomo_ver())', [PY])
 nc(15, "doctor 版本判据不核自报版本等于记录", C,
    "        if fv and fv == got:",
    "        if fv or got:", [PY])
+
+nc(16, "下载失败也记成 fail(自动从此不再试这一版)", P,
+   'arch="$(_kernel_arch)"; bindir="$(_core_bindir)"; KF_WHY=""; KF_KIND=error',
+   'arch="$(_kernel_arch)"; bindir="$(_core_bindir)"; KF_WHY=""; KF_KIND=fail', [SH])
+nc(17, "换核前一项 ok 都没有也照换", P,
+   '  if ! out="$(_kf baseline "$tmp/h0.json")"; then',
+   '  if false; then', [SH])
+nc(18, "revert 留在跟上游(第二天被自动换回)", P,
+   '  if [[ "$mode" == upstream ]]; then\n    if ! _kf set-mode pinned; then',
+   '  if false; then\n    if ! _kf set-mode pinned; then', [SH])
+nc(19, "后台任务拿不到锁时不补发通知", P,
+   '[[ " $* " == *" --notify "* ]] && { KF_NOTIFY=1; trap _kernel_exit_notify EXIT; }',
+   '[[ " $* " == *" --notify "* ]] && { KF_NOTIFY=1; }', [SH])
+nc(20, "doctor 把读不到记录当成没有记录(报不符)", C,
+   '    except kernelfollow.KFUnreadable:\n        return "", True',
+   '    except kernelfollow.KFUnreadable:\n        return "", False', [PY])
+nc(21, "error 也算失败过", K,
+   'return last.get("result") == "fail" and last.get("version") == version',
+   'return last.get("result") in ("fail", "error") and last.get("version") == version', [PY, SH])
 
 print("\n" + "═" * 66)
 for num, title, red, det in RESULTS:

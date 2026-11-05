@@ -81,10 +81,10 @@ sudo ./install.sh
 内核有两种跟法，每台机器自己选（`sudo pdg kernel mode`，或 Bot「🛠 运维 → 🧬 内核」）：
 
 - **跟发布**（默认）：内核就是本项目发布版钉死的那一版，`pdg update` 收敛到它。钉值是人看过、CI 跑过端到端测试的，最稳。
-- **跟上游**：不等项目发版，直接换 MetaCubeX/mihomo 的最新稳定版（`sudo pdg kernel upgrade`，或在 Bot 里点一下）。还可以打开自动（`sudo pdg kernel auto on`），由每日定时任务在上游稳定版发布满 3 天后换上，并发 Telegram 通知。
+- **跟上游**：不等项目发版，直接换 MetaCubeX/mihomo 的最新稳定版（`sudo pdg kernel upgrade`，或在 Bot 里点一下）。还可以打开自动（`sudo pdg kernel auto on`），由每日定时任务在上游稳定版发布满 3 天后换上，并发 Telegram 通知；同一版自动换失败过就不再自动重试（下载、网络这类临时失败不算）。
   - 换核前会核对：必须是稳定版、不低于发布钉值、不跨大版本；下载物必须与上游给的 sha256 摘要一致，并且是本机架构的可执行文件，自报版本也要对得上。
-  - 换核前后各做一次体检（本机 DNS、各出口延迟测试），换完比换核前差就自动换回旧内核。
-  - 代价要知道：新内核**没经过本项目的端到端测试**，信任锚只剩上游 Release 给的摘要；上游被攻破时，开着自动就会自动装上。`pdg update` 不会把跟上游装上的版本降回钉值；改回跟发布后，`sudo pdg kernel revert` 立刻换回钉死版（不换的话下次 `pdg update` 也会换回）。
+  - 换核前后各做一次体检（本机 DNS、各出口延迟测试），换完比换核前差就自动换回旧内核；换核前一项都测不通的话不换（那样验不出新内核好不好）。
+  - 代价要知道：新内核**没经过本项目的端到端测试**，信任锚只剩上游 Release 给的摘要；上游被攻破时，开着自动就会自动装上。`pdg update` 不会把跟上游装上的版本降回钉值。`sudo pdg kernel revert` 改回跟发布（自动一并关闭）并立刻换回钉死版。
 
 > 早期版本曾支持 sing-box / mihomo 二选一。sing-box 1.13 移除了本网关依赖的 `sniff_override_destination`，导致它无法继续升级到 1.13 及后续版本，因此 **v1.6.0 起已彻底移除 sing-box 运行时**，mihomo 成为唯一内核。旧的 sing-box 机器执行 `sudo pdg update` 时会自动迁移到 mihomo（出口、分流、证书、DoT 全部保留；若有 mihomo 无法转换的出口，更新会中止并回滚，提示先在 Bot 里处理该出口）。
 
@@ -141,7 +141,7 @@ sudo pdg kernel [status [--online]]     # 内核跟随：模式 / 已装版本�
 sudo pdg kernel mode <pinned|upstream>  # 跟发布（默认）/ 跟上游（见第 6 节）
 sudo pdg kernel upgrade [vX.Y.Z]        # 跟上游时：换到上游最新稳定版（或指定版本），体检不过自动换回
 sudo pdg kernel auto <on|off>           # 跟上游时：每日自动检查，上游稳定版发布满 3 天才换
-sudo pdg kernel revert                  # 换回发布钉值那一版
+sudo pdg kernel revert                  # 改回跟发布并换回发布钉值那一版
 sudo pdg uninstall [--purge]            # 卸载（--purge 连配置删）
 ```
 

@@ -10804,36 +10804,35 @@ _kernel_installed(){
   echo "|unknown"
 }
 
-# _kernel_install <目标版本> <归档 URL> <归档期望 sha256> <来源 upstream|pin>
-#   0 = 已换上、体检与换核前一致、记录已写; 1 = 没换成(现有内核没动, 或已还原)。原因写进 KF_WHY。
-KF_WHY=""
+# _kernel_install <目标版本> <归档 URL> <上游归档 sha256>: 换上一个上游稳定版。
+#   0 = 已换上、体检与换核前一致、记录已写; 1 = 没换成(现有内核没动, 或已还原)。
+#   原因写进 KF_WHY; KF_KIND 分两类(给"失败过就不自动重试"用, 见 kernelfollow.note):
+#     fail  = 这一版本身的问题(摘要不符 / 不是本机架构 / 自报版本不对 / 换核校验没过 / 体检变差 / 没有可对照的体检);
+#     error = 这一次没做成、与版本无关(建不出临时目录 / 下载失败 / 体检采不到 / 备份失败 / 记录没写成)。
+KF_WHY=""; KF_KIND=""
 _kernel_install(){
-  local ver="$1" url="$2" asha="$3" src="$4" arch bindir tmp crc out stash bak="" bsha="" i reg="" regressed=1
-  local what="上游稳定版"; [[ "$src" == pin ]] && what="发布钉值"
-  arch="$(_kernel_arch)"; bindir="$(_core_bindir)"; KF_WHY=""
+  local ver="$1" url="$2" asha="$3" arch bindir tmp crc out stash bak="" bsha="" i reg="" regressed=1 nsha
+  arch="$(_kernel_arch)"; bindir="$(_core_bindir)"; KF_WHY=""; KF_KIND=error
   if ! tmp="$(_pdg_mktemp_dir)"; then
     KF_WHY="建不出临时目录"; c_y "  $KF_WHY → 未取件, 现有内核一字节未动"; return 1
   fi
-  c_g "换 mihomo 内核 → $ver($what)…"
+  c_g "换 mihomo 内核 → $ver(上游稳定版)…"
   curl -fsSL --proto '=https' --connect-timeout "$PDG_CORE_CONNECT_TIMEOUT" --max-time "$PDG_CORE_MAX_TIME" \
     "$url" -o "$tmp/m.gz"
   crc=$?
   if [[ "$crc" != 0 ]]; then
     _core_dl_reason "$crc" "mihomo $ver ($arch)"; KF_WHY="下载失败(curl 退出码 $crc)"; rm -rf "$tmp"; return 1
   fi
+  KF_KIND=fail
   if ! pdg_verify_sha256 "$tmp/m.gz" "$asha" "mihomo $ver 归档 ($arch)"; then
-    KF_WHY="下载物与${what}的归档摘要不符"; c_y "  $KF_WHY → 拒绝换核, 现有内核一字节未动"; rm -rf "$tmp"; return 1
+    KF_WHY="下载物与上游的归档摘要不符"; c_y "  $KF_WHY → 拒绝换核, 现有内核一字节未动"; rm -rf "$tmp"; return 1
   fi
   if ! gunzip -c "$tmp/m.gz" > "$tmp/mihomo" 2>/dev/null || [[ ! -s "$tmp/mihomo" ]]; then
     KF_WHY="解压失败或产物为空"; c_y "  $KF_WHY"; rm -rf "$tmp"; return 1
   fi
   chmod 755 "$tmp/mihomo" 2>/dev/null || true
-  # 落盘之前先证内容: 钉值那一版有二进制钉值可比; 上游那一版没有, 至少核对它是本机架构的 ELF。
-  if [[ "$src" == pin ]]; then
-    if ! pdg_verify_sha256 "$tmp/mihomo" "${PDG_SHA256[mihomo-bin-$arch]:-}" "mihomo $ver 二进制 ($arch)"; then
-      KF_WHY="解压产物与二进制钉值不符"; c_y "  $KF_WHY → 拒绝换核"; rm -rf "$tmp"; return 1
-    fi
-  elif ! out="$(_kf elf --arch "$arch" "$tmp/mihomo")"; then
+  # 落盘之前先证内容: 上游那一版没有二进制钉值可比, 至少核对它是本机架构的 64 位 ELF。
+  if ! out="$(_kf elf --arch "$arch" "$tmp/mihomo")"; then
     KF_WHY="解压产物不是 $arch 可执行文件($out)"; c_y "  $KF_WHY → 拒绝换核"; rm -rf "$tmp"; return 1
   fi
   # 内容核过之后才执行它读版本; 自报版本必须**精确**等于目标(不经管道取退出码)。
@@ -10846,12 +10845,16 @@ _kernel_install(){
   fi
   # 体检前像必须在换核**之前**采。换完再采, 采到的已经是新核的结果, 对照永远相等。
   if ! _kf health > "$tmp/h0.json" 2>/dev/null; then
-    KF_WHY="换核前的体检采不到"; c_y "  $KF_WHY → 不换(没有前像就无从判断换完是不是变差了)"; rm -rf "$tmp"; return 1
+    KF_KIND=error; KF_WHY="换核前的体检采不到"; c_y "  $KF_WHY → 不换(没有前像就无从判断换完是不是变差了)"; rm -rf "$tmp"; return 1
+  fi
+  # 前像里一项 ok 都没有, 对照就永远找不到退步 —— 那不是"体检通过", 是没体检。不换。
+  if ! out="$(_kf baseline "$tmp/h0.json")"; then
+    KF_WHY="$out"; c_y "  $KF_WHY → 不换(换上去也验不出它好不好)"; rm -rf "$tmp"; return 1
   fi
   # _core_swap_verify 负责备份 / 配置校验 / 重启 / 稳定 / 监听对照, 任一步不过就还原。它成功时会
   # 删掉自己那份备份, 而体检在它之后 —— 所以另备一份旧核, 体检不过时用它还原。
   if ! stash="$(_core_stash_kernel mihomo "$bindir")"; then
-    KF_WHY="备份现有内核失败"; c_y "  $KF_WHY → 中止换核(不在无法回退的前提下装新内核)"; rm -rf "$tmp"; return 1
+    KF_KIND=error; KF_WHY="备份现有内核失败"; c_y "  $KF_WHY → 中止换核(不在无法回退的前提下装新内核)"; rm -rf "$tmp"; return 1
   fi
   IFS='|' read -r bak bsha <<<"$stash"
   if ! _core_swap_verify mihomo "$tmp/mihomo" "$bindir" "$ver"; then
@@ -10863,14 +10866,12 @@ _kernel_install(){
     _kf health > "$tmp/h1.json" 2>/dev/null || { reg="换核后的体检采不到"; continue; }
     if reg="$(_kf compare "$tmp/h0.json" "$tmp/h1.json")"; then regressed=0; break; fi
   done
-  # 记下"现在装着的是哪一份"。上游那一份带 asset digest; 钉值那一份只在已有记录时才写(跟发布的机器不建记录)。
-  local nsha rargs
+  # 记下"现在装着的是哪一份"(带上游 asset digest)。没有这条记录, 这一份就不被任何人认 ——
+  # doctor 报红、pdg update 换回钉值 —— 所以记不上就换回旧核。
   nsha="$(_pdg_sha "$bindir/mihomo")"
-  rargs=(record --version "$ver" --sha "$nsha" --source "$src")
-  if [[ "$src" == upstream ]]; then rargs+=(--archive-digest "sha256:$asha"); else rargs+=(--if-exists); fi
-  if (( regressed == 0 )) && ! _kf "${rargs[@]}" >/dev/null; then
-    # 记录没写成: 上游那一份没有记录就不被任何人认(doctor 报红、pdg update 换回钉值) —— 换回旧核。
-    regressed=1; reg="本机跟随记录没写成"
+  if (( regressed == 0 )) \
+     && ! _kf record --version "$ver" --sha "$nsha" --source upstream --archive-digest "sha256:$asha" >/dev/null; then
+    regressed=1; reg="本机跟随记录没写成"; KF_KIND=error
   fi
   if (( regressed )); then
     KF_WHY="换核后不如换核前: ${reg:-体检采不到}"
@@ -10882,75 +10883,102 @@ _kernel_install(){
   fi
   [[ -n "$bak" ]] && rm -f "$bak"
   rm -rf "$tmp"
+  KF_KIND=""
   c_g "  → mihomo $ver 已换上, 体检与换核前一致"
 }
 
-_kernel_note(){   # $1=ok|fail|skip $2=版本 $3=原因; $4=1 时同时发 Telegram($5=消息)
-  _kf note --result "$1" --version "$2" --why "${3:-}" >/dev/null 2>&1 || true
-  [[ "${4:-0}" == 1 ]] && _kf notify "$5" >/dev/null 2>&1
+# 带 --notify 的后台任务(bot 点的、定时任务调的)只有 Telegram 这一个出口能告诉用户结果。
+# 每条出口都经 _kernel_note 发一次; 没发出去就退出(拿不到锁时 _lock 直接 exit、或中途意外退出)
+# 由 EXIT trap 补一条, 免得 bot 说了"结果会单独发消息"之后什么都等不到。
+KF_NOTIFY=0; KF_NOTIFIED=0
+_kernel_note(){   # $1=ok|fail|error|skip|- $2=版本 $3=原因 $4=给 Telegram 的话("-" = 不记 last)
+  [[ "$1" != - ]] && { _kf note --result "$1" --version "$2" --why "${3:-}" >/dev/null 2>&1 || true; }
+  if [[ "$KF_NOTIFY" == 1 && -n "${4:-}" ]]; then
+    _kf notify "$4" >/dev/null 2>&1; KF_NOTIFIED=1
+  fi
   return 0
+}
+_kernel_exit_notify(){
+  [[ "$KF_NOTIFY" == 1 && "$KF_NOTIFIED" != 1 ]] || return 0
+  _kf notify "⚠️ <b>$(_kernel_host)</b> 内核任务没有做完: 已有别的 pdg 操作在运行, 或中途退出了 —— 内核没有动。稍后再试。" >/dev/null 2>&1
 }
 
 _kernel_host(){ hostname -s 2>/dev/null || echo 网关; }
 
 # pdg kernel upgrade [vX.Y.Z] [--notify]: 跟上游模式下换到上游最新稳定版(或指定的那一版)。
 _kernel_upgrade(){
-  local want="" notify=0 a mode arch pin bin inst rel tag url asha g grc prev
+  local want="" a mode arch pin bin inst rel tag url asha g grc prev h
   for a in "$@"; do
     case "$a" in
-      --notify) notify=1;;
+      --notify) KF_NOTIFY=1;;
       v[0-9]*)  want="$a";;
       *) echo "未知参数: $a"; return 2;;
     esac
   done
-  mode="$(_kf state --get mode)" || { echo "$mode"; return 1; }
+  h="<b>$(_kernel_host)</b>"
+  mode="$(_kf state --get mode)" || { echo "$mode"; _kernel_note - "" "" "❌ $h 内核跟随记录读不出: ${mode#❌ }"; return 1; }
   if [[ "$mode" != upstream ]]; then
     echo "现在是「跟发布」: 内核随项目发版走, 由 sudo pdg update 收敛到钉值。"
-    echo "要直接跟上游, 先 sudo pdg kernel mode upstream"; return 1
+    echo "要直接跟上游, 先 sudo pdg kernel mode upstream"
+    _kernel_note - "" "" "ℹ️ $h 现在是「跟发布」, 没有换内核。"; return 1
   fi
   # shellcheck source=/dev/null
-  source "$REPO_DIR/lib/versions.sh" 2>/dev/null || { echo "❌ 读不到 versions.sh, 无从确认发布钉值"; return 1; }
+  source "$REPO_DIR/lib/versions.sh" 2>/dev/null \
+    || { echo "❌ 读不到 versions.sh, 无从确认发布钉值"; _kernel_note - "" "" "❌ $h 读不到 versions.sh, 没有换内核。"; return 1; }
   arch="$(_kernel_arch)"; pin="$MIHOMO_VER"; bin="$(_core_bindir)/mihomo"
   IFS='|' read -r inst _ <<<"$(_kernel_installed "$arch" "$pin" "$bin")"
   prev="${inst:-未知}"
   local targs=(release --arch "$arch"); [[ -n "$want" ]] && targs+=(--tag "$want")
   if ! rel="$(_kf "${targs[@]}")"; then
-    echo "$rel"; _kernel_note fail "$want" "${rel#❌ }" "$notify" "❌ <b>$(_kernel_host)</b> 换 mihomo 内核没做成: ${rel#❌ }"
+    # 查不到上游(网络 / API / 应答不合规)记 error: 与某一版好不好无关, 自动明天照样会再查。
+    echo "$rel"; _kernel_note error "$want" "${rel#❌ }" "❌ $h 换 mihomo 内核没做成: ${rel#❌ }"
     return 1
   fi
   IFS=$'\t' read -r tag _ url asha _ <<<"$rel"
   g="$(_kf guard --pin "$pin" --target "$tag" --installed "$inst")"; grc=$?
   case "$grc" in
     0) ;;
-    3) echo "已是 $tag, 无需换核"; return 0;;
-    *) echo "不换: $g"; _kernel_note skip "$tag" "$g" "$notify" "ℹ️ <b>$(_kernel_host)</b> 没换 mihomo 内核: $g"; return 1;;
+    3) echo "已是 $tag, 无需换核"; _kernel_note - "" "" "ℹ️ $h mihomo 已是上游最新稳定版 $tag, 没有换。"; return 0;;
+    *) echo "不换: $g"; _kernel_note skip "$tag" "$g" "ℹ️ $h 没换 mihomo 内核: $g"; return 1;;
   esac
-  if _kernel_install "$tag" "$url" "$asha" upstream; then
-    _kernel_note ok "$tag" "" "$notify" "✅ <b>$(_kernel_host)</b> mihomo 内核已换到 $tag(上一版 $prev), 体检与换核前一致。"
+  if _kernel_install "$tag" "$url" "$asha"; then
+    _kernel_note ok "$tag" "" "✅ $h mihomo 内核已换到 $tag(上一版 $prev), 体检与换核前一致。"
     return 0
   fi
-  _kernel_note fail "$tag" "$KF_WHY" "$notify" "❌ <b>$(_kernel_host)</b> 换 mihomo 内核到 $tag 没成: $KF_WHY。现在跑的仍是 $prev。"
+  _kernel_note "${KF_KIND:-fail}" "$tag" "$KF_WHY" "❌ $h 换 mihomo 内核到 $tag 没成: $KF_WHY。现在跑的仍是 $prev。"
   return 1
 }
 
-# pdg kernel revert [--notify]: 换回发布钉值那一版(按钉值校验)。模式不变。
+# pdg kernel revert [--notify]: 改回「跟发布」并换回发布钉值那一版。
+# 先改模式再换: 换回之后若还留在跟上游, 每日自动会在第二天把它换回上游最新 —— 用户明确要回钉死版,
+# 自动就不该替他再换回去。换回本身走 _update_core_binary(与 pdg update 同一条钉值换核链)。
 _kernel_revert(){
-  local notify=0 a arch url
+  local a h mode ok=0
   for a in "$@"; do
-    case "$a" in --notify) notify=1;; *) echo "未知参数: $a"; return 2;; esac
+    case "$a" in --notify) KF_NOTIFY=1;; *) echo "未知参数: $a"; return 2;; esac
   done
+  h="<b>$(_kernel_host)</b>"
+  mode="$(_kf state --get mode)" || { echo "$mode"; _kernel_note - "" "" "❌ $h 内核跟随记录读不出: ${mode#❌ }"; return 1; }
+  # 只在确实是跟上游时才改模式: 没用过这个功能的机器(没有 kernel.json)不因一次 revert 多出一份记录。
+  if [[ "$mode" == upstream ]]; then
+    if ! _kf set-mode pinned; then
+      _kernel_note - "" "" "❌ $h 改回「跟发布」没成(内核跟随记录写不进), 内核没有动。"; return 1
+    fi
+    echo "已改成「跟发布」(自动一并关闭)。"
+  fi
   # shellcheck source=/dev/null
-  source "$REPO_DIR/lib/versions.sh" 2>/dev/null || { echo "❌ 读不到 versions.sh, 无从确认发布钉值"; return 1; }
-  arch="$(_kernel_arch)"
-  if pdg_mihomo_binary_ok "$arch" "$MIHOMO_VER" "$(_core_bindir)/mihomo"; then
-    echo "已是发布钉值 $MIHOMO_VER, 无需换回"; return 0
+  source "$REPO_DIR/lib/versions.sh" 2>/dev/null \
+    || { echo "❌ 读不到 versions.sh, 无从确认发布钉值"; _kernel_note - "" "" "❌ $h 读不到 versions.sh, 没有换回钉死版。"; return 1; }
+  if pdg_mihomo_binary_ok "$(_kernel_arch)" "$MIHOMO_VER" "$(_core_bindir)/mihomo"; then
+    echo "已是发布钉值 $MIHOMO_VER, 无需换回"
+    _kernel_note ok "$MIHOMO_VER" "改回跟发布" "✅ $h 已改回「跟发布」, 内核本来就是发布钉值 $MIHOMO_VER。"; return 0
   fi
-  url="https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VER}/mihomo-linux-${arch}-${MIHOMO_VER}.gz"
-  if _kernel_install "$MIHOMO_VER" "$url" "${PDG_SHA256[mihomo-$arch]:-}" pin; then
-    _kernel_note ok "$MIHOMO_VER" "换回发布钉值" "$notify" "✅ <b>$(_kernel_host)</b> mihomo 内核已换回发布钉值 $MIHOMO_VER。"
-    return 0
+  _update_core_binary && ok=1
+  if (( ok )); then
+    _kernel_note ok "$MIHOMO_VER" "改回跟发布" "✅ $h 已改回「跟发布」, mihomo 内核换回发布钉值 $MIHOMO_VER。"; return 0
   fi
-  _kernel_note fail "$MIHOMO_VER" "$KF_WHY" "$notify" "❌ <b>$(_kernel_host)</b> 换回发布钉值 $MIHOMO_VER 没成: $KF_WHY"
+  _kernel_note error "$MIHOMO_VER" "换回钉死版没成" \
+    "❌ $h 已改回「跟发布」, 但换回钉死版 $MIHOMO_VER 没成(见 sudo pdg kernel status)。下次 sudo pdg update 会再换。"
   return 1
 }
 
@@ -11014,8 +11042,11 @@ cmd_kernel(){
         echo "不换的话下次 sudo pdg update 也会把它收敛回钉值。"
       fi;;
     auto)    _lock; _kf set-auto "${1:-}" && echo "自动换核: ${1:-}(上游稳定版发布满 3 天后, 由每日定时任务换上并发 Telegram 通知)";;
-    upgrade) _lock; _kernel_upgrade "$@";;
-    revert)  _lock; _kernel_revert "$@";;
+    upgrade|revert)
+      # 后台任务(--notify)在取锁**之前**挂上补发: 拿不到锁时 _lock 直接 exit, 那一刻也要有一条消息。
+      [[ " $* " == *" --notify "* ]] && { KF_NOTIFY=1; trap _kernel_exit_notify EXIT; }
+      _lock
+      if [[ "$sub" == upgrade ]]; then _kernel_upgrade "$@"; else _kernel_revert "$@"; fi;;
     tick)    _kernel_tick;;
     *) echo "用法: pdg kernel [status [--online] [--kv]|mode <pinned|upstream>|auto <on|off>|upgrade [vX.Y.Z] [--notify]|revert [--notify]|tick]"
        return 2;;

@@ -2866,9 +2866,10 @@ def start_update():
         return False
 
 # ── 内核跟随(「🧬 内核」页): 只调 `pdg kernel`, 判定与记录都在 CLI / kernelfollow.py ──────────
-# 回调是闭集: krn(页) / krn_up / krn_up_ok / krn_rev / krn_rev_ok / krn_follow / krn_pin /
-# krn_pin_ok / krn_auto_on / krn_auto_off。回调里**不带版本号** —— 换到哪一版由 CLI 在执行
-# 那一刻向上游现查, 不让一条旧消息上的按钮决定装哪个二进制。
+# 回调是闭集: krn(页) / krn_up / krn_up_ok / krn_follow / krn_pin / krn_pin_ok / krn_auto_on /
+# krn_auto_off。回调里**不带版本号** —— 换到哪一版由 CLI 在执行那一刻向上游现查, 不让一条旧消息
+# 上的按钮决定装哪个二进制。"换回钉死版"只有一个入口(改回跟发布): 留在跟上游里换回钉死版,
+# 开着的自动第二天就会把它换回上游最新, 那不是用户要的。
 KRN_BACK = {"inline_keyboard": [[{"text": "⬅️ 返回内核", "callback_data": "krn"}],
                                 [{"text": "⬅️ 返回运维", "callback_data": "nav:ops"}]]}
 KRN_MODE = {"pinned": "跟发布", "upstream": "跟上游"}
@@ -2925,9 +2926,7 @@ def kernel_page():
             rows.append([{"text": "⏰ 自动: 开(点一下关)", "callback_data": "krn_auto_off"}])
         else:
             rows.append([{"text": "⏰ 自动: 关(点一下开)", "callback_data": "krn_auto_on"}])
-        if kv.get("source") != "pin":
-            rows.append([{"text": "↩️ 换回钉死版 %s" % kv.get("pin", ""), "callback_data": "krn_rev"}])
-        rows.append([{"text": "📌 改回跟发布", "callback_data": "krn_pin"}])
+        rows.append([{"text": "📌 改回跟发布(换回钉死版 %s)" % kv.get("pin", ""), "callback_data": "krn_pin"}])
     elif mode == "pinned":
         rows.append([{"text": "🧬 改成跟上游", "callback_data": "krn_follow"}])
     rows.append([{"text": "🔄 刷新", "callback_data": "krn"}, {"text": "⬅️ 返回运维", "callback_data": "nav:ops"}])
@@ -4896,33 +4895,20 @@ def _handle_cb_inner(chat, mid, data, uid=None):
         ok = start_kernel_job("upgrade")
         edit(chat, mid, ("🚀 已在后台换核, 结果会单独发一条消息(约半分钟到两分钟)。" if ok
                          else "❌ 启动换核失败, 请在终端跑 sudo pdg kernel upgrade。"), KRN_BACK); return
-    if data == "krn_rev":
-        edit(chat, mid, ("↩️ <b>换回发布钉值那一版</b>\n\n模式不变(仍是跟上游)。"
-                         "换核时代理会断几秒; 结果会单独发一条消息。"),
-             {"inline_keyboard": [[{"text": "✅ 确认换回", "callback_data": "krn_rev_ok"}],
-                                  [{"text": "⬅️ 取消", "callback_data": "krn"}]]}); return
-    if data == "krn_rev_ok":
-        ok = start_kernel_job("revert")
-        edit(chat, mid, ("🚀 已在后台换回钉死版, 结果会单独发一条消息。" if ok
-                         else "❌ 启动失败, 请在终端跑 sudo pdg kernel revert。"), KRN_BACK); return
     if data == "krn_follow":
         r = sh([PDG_CLI, "kernel", "mode", "upstream"])
         _kernel_page_bg(chat, mid, "✅ 已改成跟上游(自动默认关)。" if r.returncode == 0
                         else "❌ 改模式失败: " + _esc(((r.stdout or "") + (r.stderr or "")).strip()[-300:])); return
     if data == "krn_pin":
         edit(chat, mid, ("📌 <b>改回跟发布</b>\n\n自动换核一并关闭。现在装着的若不是发布钉值, "
-                         "会在后台换回钉死版(结果单独发消息)。"),
+                         "会在后台换回钉死版; 换核时代理会断几秒。结果会单独发一条消息。"),
              {"inline_keyboard": [[{"text": "✅ 确认改回", "callback_data": "krn_pin_ok"}],
                                   [{"text": "⬅️ 取消", "callback_data": "krn"}]]}); return
     if data == "krn_pin_ok":
-        r = sh([PDG_CLI, "kernel", "mode", "pinned"])
-        if r.returncode != 0:
-            edit(chat, mid, "❌ 改模式失败: " + _esc(((r.stdout or "") + (r.stderr or "")).strip()[-300:]),
-                 KRN_BACK); return
+        # 改模式与换回都在 `pdg kernel revert` 里(先改回跟发布, 再换回钉死版), 后台跑, 结果它自己发。
         ok = start_kernel_job("revert")
-        edit(chat, mid, ("✅ 已改回跟发布。若装着的不是钉死版, 正在后台换回, 结果单独发消息。" if ok
-                         else "✅ 已改回跟发布, 但没能启动换回钉死版: 下次「🔄 更新」会收敛回钉值,"
-                              "也可以在终端跑 sudo pdg kernel revert。"), KRN_BACK); return
+        edit(chat, mid, ("🚀 正在后台改回跟发布并换回钉死版, 结果会单独发一条消息。" if ok
+                         else "❌ 启动失败, 请在终端跑 sudo pdg kernel revert。"), KRN_BACK); return
     if data in ("krn_auto_on", "krn_auto_off"):
         r = sh([PDG_CLI, "kernel", "auto", "on" if data == "krn_auto_on" else "off"])
         _kernel_page_bg(chat, mid, ("✅ 自动换核已" + ("打开: 上游稳定版发布满 3 天后由每日定时任务换上并通知。"

@@ -48,7 +48,7 @@ xt(){
 }
 FNS=(_core_bindir _pdg_sha _core_stash_kernel _core_restore_prev _core_kernel_stable _core_restart_clean
      _core_listeners _core_swap_verify _pdg_mktemp_dir _core_dl_reason _update_core_binary _pdg_module
-     _kf _kernel_arch _kernel_installed _kernel_install _kernel_note _kernel_host _kernel_upgrade
+     _kf _kernel_arch _kernel_installed _kernel_install _kernel_note _kernel_exit_notify _kernel_host _kernel_upgrade
      _kernel_revert _kernel_tick _kernel_status cmd_kernel)
 : > "$WORK/h.sh"
 miss=""
@@ -62,7 +62,7 @@ BIN="$WORK/bin"; CFG="$WORK/etc-mihomo"; ETC="$WORK/etc"; SRV="$WORK/serve"
 mkdir -p "$BIN" "$CFG" "$ETC" "$SRV" "$WORK/repo/lib" "$WORK/repo/deploy/bot"
 {
   grep -E '^PDG_CORE_(CONNECT_TIMEOUT|MAX_TIME)=' "$ROOT/deploy/bot/pdg.sh"
-  echo 'KF_WHY=""'
+  grep -E '^KF_[A-Z]+=' "$ROOT/deploy/bot/pdg.sh"      # 全局状态行原样取自生产文件
   echo 'c_g(){ echo "$*"; }; c_y(){ echo "$*"; }; sleep(){ :; }; need_root(){ :; }; _lock(){ :; }'
   echo 'hostname(){ echo testgw; }; dpkg(){ echo amd64; }; ss(){ :; }'
   # 取件桩: 记下 URL, 按 URL 的文件名从本地目录喂; 没有这个文件 → curl 的 22(HTTP 错误)
@@ -181,6 +181,28 @@ rc="$(run _kernel_upgrade --notify)"
   && ok "失败记进 last 并通知" || bad "失败没留痕"
 
 echo
+echo "══ 4b. 下载失败(与版本无关)记 error, 自动第二天照样再试 ══"
+fresh; OLD="$(mkold)"; state upstream true; release "$PIN" "$GZ_SHA" false "$(date -u -d '-5 days' +%FT%TZ)"; health_seq "$HOK" "$HOK"
+mv "$SRV/mihomo-linux-amd64-$PIN.gz" "$SRV/hidden.gz"
+rc="$(run _kernel_upgrade "$PIN" --notify)"
+mv "$SRV/hidden.gz" "$SRV/mihomo-linux-amd64-$PIN.gz"
+[[ "$rc" == 1 && "$(binsha)" == "$OLD" && "$(field last.result)" == error ]] \
+  && ok "下载失败 → rc=1、旧核原样、记为 error(不是 fail)" || bad "下载失败的记法不对(rc=$rc, last=$(field last.result))"
+rm -f "$WORK/curl.log"
+rc="$(run _kernel_tick)"
+[[ "$rc" == 0 && "$(binsha)" == "$PIN_BIN" ]] && grep -q "$PIN" "$WORK/curl.log" 2>/dev/null \
+  && ok "上次只是下载失败 → 下一次自动照常重试并换上" || bad "一次下载失败把自动卡住了(rc=$rc)"
+
+echo
+echo "══ 4c. 换核前体检一项 ok 都没有 → 不换(没有可对照的前像) ══"
+fresh; OLD="$(mkold)"; state upstream false; release "$PIN" "$GZ_SHA"
+health_seq '{"ctrl":"na","dns":"fail"}'
+rc="$(run _kernel_upgrade)"
+[[ "$rc" == 1 && "$(binsha)" == "$OLD" && -z "$(field current.version)" ]] && grep -q 无从对照 "$WORK/out" \
+  && ok "前像全不 ok → 不换、说明无从对照" || bad "没有前像也换了(rc=$rc)"
+[[ "$(field last.result)" == fail ]] && ok "记为 fail(这一版换上去也验不出好坏, 自动不重复试)" || bad "无前像不该记成 $(field last.result)"
+
+echo
 echo "══ 5. 换核后体检持续变差 → 换回旧核 ══"
 fresh; OLD="$(mkold)"; state upstream false; release "$PIN" "$GZ_SHA"; health_seq "$HOK" "$HBAD"
 rc="$(run _kernel_upgrade --notify)"
@@ -230,15 +252,24 @@ rc="$(run _update_core_binary)"
   && ok "没有记录的机器: 行为与以前一样(换成钉值), 也不新建记录" || bad "没有记录的机器上行为变了(rc=$rc)"
 
 echo
-echo "══ 9. revert: 换回发布钉值, 模式不变 ══"
-fresh; NSHA="$(mknext "$NX")"; state upstream false "$(cur_json "$NX" "$NSHA")"; health_seq "$HOK"
+echo "══ 9. revert: 改回跟发布(自动一并关)并换回发布钉值 ══"
+fresh; NSHA="$(mknext "$NX")"; state upstream true "$(cur_json "$NX" "$NSHA")"; health_seq "$HOK"
 rc="$(run _kernel_revert --notify)"
 [[ "$rc" == 0 && "$(binsha)" == "$PIN_BIN" ]] && ok "revert → 内核等于钉值" || bad "revert 没换回(rc=$rc)"
-[[ "$(field mode)" == upstream && "$(field current.source)" == pin && "$(field previous.version)" == "$NX" ]] \
-  && ok "模式仍是 upstream, 记录改成 pin, 上游那份挪进 previous" || bad "revert 后记录不对"
-rm -f "$WORK/curl.log"
+[[ "$(field mode)" == pinned && "$(field auto)" == False ]] \
+  && ok "模式改成 pinned、自动关掉(不会第二天被自动换回上游)" || bad "revert 后模式不对: $(field mode)/$(field auto)"
+[[ "$(field current.source)" == pin && "$(field previous.version)" == "$NX" ]] \
+  && ok "记录改成 pin, 上游那份挪进 previous" || bad "revert 后记录不对"
+grep -q '✅' "$WORK/notify.log" 2>/dev/null && ok "--notify 发了结果" || bad "revert 没发结果"
+release "$NX" "$GZ_SHA" false "$(date -u -d '-5 days' +%FT%TZ)"; rm -f "$WORK/curl.log" "$WORK/api.n"
+rc="$(run _kernel_tick)"
+[[ "$rc" == 0 && "$(binsha)" == "$PIN_BIN" && "$(n_of api)" == 0 ]] && ok "revert 之后的定时检查不动内核" || bad "revert 之后被自动换回上游了"
 rc="$(run _kernel_revert)"
 [[ "$rc" == 0 && ! -e "$WORK/curl.log" ]] && grep -q 已是 "$WORK/out" && ok "已是钉值时 revert 什么都不做" || bad "已是钉值时不该取件"
+fresh; mkold >/dev/null
+rc="$(run _kernel_revert)"
+[[ "$rc" == 0 && "$(binsha)" == "$PIN_BIN" && ! -e "$ETC/kernel.json" ]] \
+  && ok "没用过跟随的机器: revert 换回钉值, 不多出一份记录" || bad "没有记录的机器上 revert 建了记录或没换回(rc=$rc)"
 
 echo
 echo "══ 10. tick: 只有跟上游 + 自动才动; 等待期; 失败过不重试 ══"
@@ -281,10 +312,22 @@ rc="$(run cmd_kernel mode pinned)"
 [[ "$rc" == 0 && "$(field mode)" == pinned && "$(field auto)" == False ]] && ok "mode pinned 一并关自动" || bad "mode pinned 不对"
 rc="$(run cmd_kernel mode latest)"
 [[ "$rc" != 0 && "$(field mode)" == pinned ]] && ok "不认识的模式 → 拒绝, 记录不变" || bad "不认识的模式被接受了"
+fresh; mkold >/dev/null; state upstream false; release "$PIN" "$GZ_SHA"; health_seq "$HOK"
+rc="$(run '_lock(){ echo "⛔ 已有 pdg 操作在运行"; exit 1; }; cmd_kernel upgrade --notify')"
+[[ "$rc" == 1 ]] && grep -q 没有做完 "$WORK/notify.log" 2>/dev/null \
+  && ok "后台任务拿不到锁 → 仍补发一条通知(不让 bot 那边干等)" || bad "拿不到锁时没有通知(rc=$rc)"
+rm -f "$WORK/notify.log"
+rc="$(run '_lock(){ exit 1; }; cmd_kernel upgrade')"
+[[ ! -e "$WORK/notify.log" ]] && ok "不带 --notify 时不发通知(终端里本来就看得到)" || bad "没要通知却发了"
+state upstream false "$(cur_json "$PIN" "$PIN_BIN")"; cp "$REAL" "$BIN/mihomo"
+rc="$(run cmd_kernel upgrade --notify)"
+[[ "$rc" == 0 && "$(grep -c . "$WORK/notify.log" 2>/dev/null)" == 1 ]] && grep -q 已是 "$WORK/notify.log" \
+  && ok "已是最新 → 恰好一条「没有换」的通知(不重复补发)" || bad "已是最新时通知不对: $(cat "$WORK/notify.log" 2>/dev/null)"
 rc="$(run cmd_kernel frobnicate)"
 [[ "$rc" == 2 ]] && grep -q '用法: pdg kernel' "$WORK/out" && ok "未知子命令 → 用法, rc=2" || bad "未知子命令处理不对(rc=$rc)"
 rc="$(run cmd_kernel status)"
-[[ "$rc" == 0 ]] && grep -q '内核跟随: 跟发布' "$WORK/out" && ok "status 可读" || bad "status 不可读(rc=$rc)"
+[[ "$rc" == 0 ]] && grep -q '内核跟随: 跟上游' "$WORK/out" && grep -q "已装: $PIN(发布钉值)" "$WORK/out" \
+  && ok "status 可读, 模式与已装来源对得上" || bad "status 不对(rc=$rc): $(head -3 "$WORK/out")"
 
 echo
 finish
