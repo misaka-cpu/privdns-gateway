@@ -68,10 +68,13 @@ fi
 _LAN_RESIDUE=""
 _LAN_REMOVED=""
 [[ -e /etc/pdg-lan || -e /opt/pdg-acme \
-   || -x /usr/local/bin/caddy || -e /etc/systemd/system/pdg-lan.service ]] && _LAN_REMOVED=1
-systemctl disable --now pdg-lan 2>/dev/null || true
-systemctl reset-failed pdg-lan 2>/dev/null || true
-rm -f /etc/systemd/system/pdg-lan.service /etc/nftables-pdg-lan.conf
+   || -x /usr/local/bin/caddy || -e /etc/systemd/system/pdg-lan.service \
+   || -e /etc/systemd/system/pdg-lan-cert.timer ]] && _LAN_REMOVED=1
+systemctl disable --now pdg-lan pdg-lan-cert.timer 2>/dev/null || true
+systemctl reset-failed pdg-lan pdg-lan-cert.service 2>/dev/null || true
+# pdg-lan-cert.*: 面板证书的续期定时器(lib/units.sh)。它调的 acme.sh 下面就删了, 留着只会每天空跑。
+rm -f /etc/systemd/system/pdg-lan.service /etc/nftables-pdg-lan.conf \
+      /etc/systemd/system/pdg-lan-cert.service /etc/systemd/system/pdg-lan-cert.timer
 [[ -n "$_UN_NFT" ]] && "$_UN_NFT" delete table inet pdglan 2>/dev/null || true
 # 注意这里**没有** /etc/privdns-gateway 下的任何路径: 普通卸载路径上碰那个目录是禁止的
 # (tests/test-ios-profile-persist.py 有守卫)。DNS 凭据放在 /etc/pdg-lan/dns.env, 跟着

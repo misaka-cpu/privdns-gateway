@@ -49,11 +49,14 @@ if [[ -n "$BASE" && -f "$BASE" ]]; then
   # 275 按裁决再精确放宽**一处**: 标记迁移那一句由 `|| true` 改为"只在平台观测失败(返回 2)时停链"。
   # 282 按裁决再精确放宽**一处**: 自定义放行那一句由 `|| true` 改为"只把返回 3(受管落点准备失败)
   # 记进最终失败"。允许删掉的只有这两句原文; 允许新增的只有: 有条件前置、注释、改后的这两句。
+  # 2026-11-07 按裁决再精确放宽**一处**新增: `migrate_lan_cert_timer || true`(存量机器补装面板证书的
+  # 续期定时器, best-effort, 失败不拖垮更新)。用户在问到"放宽 A1 这一行 / 不动迁移链 / 挂进已有迁移函数"
+  # 时选了"放宽 A1 这一行"。只认这一行原样(可带行尾注释), 不认任何变体。
   _delok="$(grep '^<' "$_d" | grep -cE '^< +migrate_platform_marker \|\| true( |$)|^< +migrate_nft_extra \|\| true$' || true)"
-  _addok="$(grep '^>' "$_d" | grep -cE '_retire_precheck \|\| return 1|^> *#|^> +migrate_platform_marker \|\| \{ \[\[ \$\? == 2 \]\] && \{ c_r .*; return 1; \}; \}$|^> +migrate_nft_extra \|\| \{ \[\[ \$\? == 3 \]\] && rc=1; \}$' || true)"
+  _addok="$(grep '^>' "$_d" | grep -cE '_retire_precheck \|\| return 1|^> *#|^> +migrate_platform_marker \|\| \{ \[\[ \$\? == 2 \]\] && \{ c_r .*; return 1; \}; \}$|^> +migrate_nft_extra \|\| \{ \[\[ \$\? == 3 \]\] && rc=1; \}$|^> +migrate_lan_cert_timer \|\| true( +#.*)?$' || true)"
   if [[ "${_del:-0}" == "${_delok:-0}" && "${_del:-0}" -le 2 && "${_add:-0}" == "${_addok:-0}" && "${_add:-0}" -ge 1 ]] \
      && grep -q '_retire_precheck || return 1' "$_d"; then
-    ok "A1: run_all_migrations 相对基线只多那一处有条件前置, 只把标记迁移那一句换成「平台观测失败才停链」、自定义放行那一句换成「只把返回 3 记进失败」(新增 ${_add} / 删除 ${_del})"
+    ok "A1: run_all_migrations 相对基线只多那一处有条件前置, 只把标记迁移那一句换成「平台观测失败才停链」、自定义放行那一句换成「只把返回 3 记进失败」、多一句面板证书续期定时器的迁移(新增 ${_add} / 删除 ${_del})"
   else
     bad "A1: run_all_migrations 的改动超出批准范围(新增 ${_add:-?} / 其中合规 ${_addok:-?} / 删除 ${_del:-?} / 其中合规 ${_delok:-?})"
     head -14 "$_d"

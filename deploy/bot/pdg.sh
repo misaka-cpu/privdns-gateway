@@ -7200,6 +7200,7 @@ run_all_migrations(){
   # cmd_update 据此回滚到更新前快照(其余迁移都是幂等自愈, 失败 best-effort 吞掉不挡后续)。
   migrate_drop_singbox || rc=1
   migrate_lan_caddy_reender || true   # 存量机器的反代配置跟上生成器(失败不拖垮更新)
+  migrate_lan_cert_timer || true      # 存量机器补上面板证书的续期定时器(失败不拖垮更新, doctor 会报)
   return $rc
 }
 
@@ -8865,6 +8866,12 @@ LAN_DNS_ENV="$LAN_ETC/dns.env"
 LAN_UNIT="/etc/systemd/system/pdg-lan.service"
 LAN_STATE_DIR="/var/lib/pdg-lan"
 ACME_HOME="/opt/pdg-acme"
+# 面板证书续期的定时器(生成函数在 lib/units.sh, 为什么要有它也写在那里)。
+LAN_CERT_SVC="/etc/systemd/system/pdg-lan-cert.service"
+LAN_CERT_TIMER="/etc/systemd/system/pdg-lan-cert.timer"
+# 反代的监听地址: lanpanel.render_caddy 的默认 bind 加 443, 而 _lan_render 不传 --bind。
+# 只用来**问反代此刻给出的是哪张证书**, 不用来配置它。
+LAN_LISTEN="127.0.0.1:443"
 
 _lan_arch(){ case "$(dpkg --print-architecture 2>/dev/null)" in amd64) echo amd64;; arm64) echo arm64;; *) return 1;; esac; }
 
@@ -9008,6 +9015,152 @@ _lan_cert(){
   fi
   chmod 640 "$LAN_CERT_DIR"/panel.crt "$LAN_CERT_DIR"/panel.key || return 1
   c_g "✅ 证书已就位: $LAN_CERT_DIR"
+  # 续期调度跟着签发走: 签过一次, 就该有东西在到期前去续。以前这里什么都不装(见 lib/units.sh
+  # 里 pdg_unit_lan_cert_service 上方的说明), 于是每张面板证书都是 90 天后一起过期。
+  if _lan_cert_timer_install; then
+    echo "   续期: pdg-lan-cert.timer 每天看一次, 到 acme.sh 记的续期时刻自动续, 续完让反代用上新证书。"
+  else
+    c_y "⚠️ 证书装好了, 但续期定时器没装上 —— 到期前不会自动续。修好上面的原因后重跑一次 pdg lan cert。"
+    return 1
+  fi
+}
+
+# 证书文件里第一张(叶子)证书的 SHA-256 指纹。读不出来打印空串。
+_lan_cert_fp(){ openssl x509 -in "$1" -noout -fingerprint -sha256 2>/dev/null | sed 's/^[^=]*=//'; }
+
+# 反代**此刻给出的**证书的指纹(向 $LAN_LISTEN 握手, SNI 取面板表第一个域名)。拿不到打印空串。
+# 只看叶子证书是哪一张, 不做链校验 —— 要回答的是"进程用的是不是盘上那张", 不是"这张可不可信"。
+_lan_served_fp(){
+  local h; h="$(_lan_hosts | head -1)"
+  [[ -n "$h" ]] || return 0
+  timeout 10 openssl s_client -connect "$LAN_LISTEN" -servername "$h" < /dev/null 2>/dev/null \
+    | openssl x509 -noout -fingerprint -sha256 2>/dev/null | sed 's/^[^=]*=//'
+}
+
+# 装 / 刷新面板证书的续期定时器(幂等: 内容没变就一个字节都不写, 只在状态不对时纠正)。
+# 判据是**排不排得出下一次触发**, 与 migrate_health_timer 同一条理由: `enable --now` 对一个已经
+# active 的 timer 什么都不做, 换了文件不重新 arm 的话, 盘上是新调度、跑着的还是旧的。
+_lan_cert_timer_install(){
+  local T changed=0
+  T="$(basename "$LAN_CERT_TIMER")"
+  # shellcheck source=lib/units.sh
+  source "$REPO_DIR/lib/units.sh" 2>/dev/null \
+    || { c_y "  读不到 lib/units.sh, 续期定时器没装"; return 1; }
+  if ! cmp -s <(pdg_unit_lan_cert_service 2>/dev/null) "$LAN_CERT_SVC"; then
+    pdg_write_unit pdg_unit_lan_cert_service "$LAN_CERT_SVC" \
+      || { c_y "  写不了 $LAN_CERT_SVC, 续期定时器没装"; return 1; }
+    changed=1
+  fi
+  if ! cmp -s <(pdg_unit_lan_cert_timer 2>/dev/null) "$LAN_CERT_TIMER"; then
+    pdg_write_unit pdg_unit_lan_cert_timer "$LAN_CERT_TIMER" \
+      || { c_y "  写不了 $LAN_CERT_TIMER, 续期定时器没装"; return 1; }
+    changed=1
+  fi
+  if (( changed )); then
+    systemctl daemon-reload >/dev/null 2>&1 || { c_y "  daemon-reload 失败, 续期定时器没生效"; return 1; }
+  fi
+  if [[ "$(systemctl is-enabled "$T" 2>/dev/null)" != enabled ]]; then
+    systemctl enable "$T" >/dev/null 2>&1 || { c_y "  启用 $T 失败"; return 1; }
+  fi
+  if (( changed )) || [[ "$(systemctl is-active "$T" 2>/dev/null)" != active ]] || ! _pdg_timer_next_ok "$T"; then
+    systemctl restart "$T" >/dev/null 2>&1 || { c_y "  启动 $T 失败"; return 1; }
+  fi
+  _pdg_timer_next_ok "$T" || { c_y "  $T 启动了, 但排不出下一次触发"; return 1; }
+  return 0
+}
+
+# 拆掉续期定时器(purge 用)。本来就没有就什么都不做。
+_lan_cert_timer_remove(){
+  [[ -e "$LAN_CERT_TIMER" || -e "$LAN_CERT_SVC" ]] || return 0
+  systemctl disable --now "$(basename "$LAN_CERT_TIMER")" >/dev/null 2>&1 || true
+  rm -f "$LAN_CERT_TIMER" "$LAN_CERT_SVC"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl reset-failed "$(basename "$LAN_CERT_SVC")" >/dev/null 2>&1 || true
+}
+
+# pdg lan renew [--notify]: 到点续签面板证书, 并让反代真的用上盘上那张。
+#
+# pdg-lan-cert.timer 每天调一次(带 --notify: 有事才发 Telegram, 没到续期时刻不发)。手工跑也
+# 安全 —— 续不续由 acme.sh 自己判, 没到它记的续期时刻就什么都不做。
+#
+# 收敛的判据是**反代此刻给出的证书 = 盘上那张**, 不是 acme.sh 打印的 "Reload successful"。
+# acme.sh 续期时跑的是签发那天记进它记录里的 reloadcmd, 而旧版记的是 reload 加 `|| true`:
+# admin off 下必败, 又被吞掉(见 tests/test-lan-proxy-reload-chokepoint.sh 开头)。那条记录只有
+# 重跑一次 `pdg lan cert` 才会改写。这里不去改 acme.sh 的内部记录, 而是续完当场握手比一比,
+# 不一样就走 _lan_apply_proxy(反代重启的唯一入口)。反代内存里留着旧证书的现场, 不管是怎么来的,
+# 也都在这一步收敛。
+_lan_renew(){
+  local notify=0 a
+  for a in "$@"; do
+    case "$a" in
+      --supported) return 0;;          # 给 unit 的 ExecCondition 用: 认得这个子命令(见 lib/units.sh)
+      --notify) notify=1;;
+      *) echo "未知参数: $a"; return 2;;
+    esac
+  done
+  need_root lan
+  local crt="$LAN_CERT_DIR/panel.crt"
+  if [[ ! -x "$ACME_HOME/acme.sh" ]]; then
+    echo "本机的面板证书不是本项目签的(没有 $ACME_HOME), 不归这里续。"; return 0
+  fi
+  if [[ ! -s "$crt" ]]; then
+    echo "还没有 $crt —— 先 sudo pdg lan cert <dns插件名> 签发。"; return 0
+  fi
+  local fp0 fp1 rc=0 renewed=0 conv=same n exp msg="" ret=0
+  fp0="$(_lan_cert_fp "$crt")"
+  # 凭据: dns.env 是 600 root 才读(与 _lan_cert 同一条要求), 否则交给 acme.sh 签发时存下的那份。
+  # 读它是为了换过 token 的机器: acme.sh 的 DNS 插件先认环境变量, 再认它自己存的旧值。
+  # 子 shell 圈住, 不污染当前进程。
+  (
+    if [[ -s "$LAN_DNS_ENV" && "$(stat -c '%a %U' "$LAN_DNS_ENV" 2>/dev/null)" == "600 root" ]]; then
+      set -a; # shellcheck disable=SC1090
+      source "$LAN_DNS_ENV"; set +a
+    fi
+    "$ACME_HOME/acme.sh" --home "$ACME_HOME/data" --cron
+  ) || rc=$?
+  fp1="$(_lan_cert_fp "$crt")"
+  [[ -n "$fp1" && "$fp1" != "$fp0" ]] && renewed=1
+
+  if [[ -z "$fp1" ]]; then
+    conv=unreadable
+  elif ! systemctl is-active --quiet pdg-lan 2>/dev/null; then
+    conv=inactive                      # 反代没在跑: 没有"内存里那张", 下次启动读的就是盘上的
+  elif [[ "$(_lan_served_fp)" != "$fp1" ]]; then
+    if _lan_apply_proxy; then
+      conv=stale
+      # 重启返回了不等于已经在听: 给它几秒, 以握手到的那张为准。
+      n=0
+      while (( n < 10 )); do
+        sleep 1; n=$((n + 1))
+        [[ "$(_lan_served_fp)" == "$fp1" ]] && { conv=restarted; break; }
+      done
+    else
+      conv=restartfail
+    fi
+  fi
+  exp="$(openssl x509 -in "$crt" -noout -enddate 2>/dev/null | cut -d= -f2)"
+
+  if [[ "$rc" != 0 ]]; then
+    msg="❌ 面板证书续期失败(acme.sh 返回 $rc)。现在这张 ${exp:-?} 到期 —— 原因看 journalctl -u pdg-lan-cert。"; ret=1
+  elif (( renewed )); then
+    msg="✅ 面板证书已续期, 新证书 ${exp:-?} 到期。"
+  elif ! openssl x509 -in "$crt" -checkend $((14 * 86400)) -noout >/dev/null 2>&1; then
+    # acme.sh 说没事、也没换证书, 可已经进了 14 天: 它记的续期时刻不对, 或者根本续不了。
+    msg="⚠️ 面板证书 ${exp:-?} 到期(14 天内), 而 acme.sh 这次没有续 —— 手工重签: sudo pdg lan cert <dns插件名>。"; ret=1
+  fi
+  case "$conv" in
+    restarted)   msg="${msg:+$msg }反代原来还在用旧证书, 已重启, 现在给出的就是盘上那张。";;
+    stale)       msg="${msg:+$msg }❌ 反代重启后给出的证书仍不是盘上那张 —— 面板可能还在用旧证书。"; ret=1;;
+    restartfail) msg="${msg:+$msg }❌ 反代重启失败 —— 面板还在用旧证书。"; ret=1;;
+    unreadable)  msg="${msg:+$msg }❌ 盘上的证书读不出来($crt)。"; ret=1;;
+  esac
+  if [[ -z "$msg" ]]; then
+    echo "面板证书还不到续期时间(${exp:-?} 到期)。$([[ "$conv" == inactive ]] && echo "反代没在跑, 没有比对。" || echo "反代给出的就是盘上这张。")"
+    return 0
+  fi
+  echo "$msg"
+  (( notify )) && _kf notify "<b>$(_kernel_host)</b> $msg" >/dev/null 2>&1
+  return "$ret"
 }
 
 # 由面板表**派生**反代配置与出站白名单。两份都从同一张表来 —— 这是门三成立的前提:
@@ -9483,6 +9636,8 @@ _lan_disable(){
   _profile_set PDG_LAN_ENABLED 0 || true
   c_g "✅ 内网面板已停用(反代已停、出站白名单已撤)。"
   echo "   保留: 面板表、证书、Caddy 二进制 —— 重新 enable 就能用。"
+  # 续期定时器**不停**: 停用只是先停一停, 证书照样到期前续上, 重新 enable 时才不会拿到一张过期的。
+  [[ -e "$LAN_CERT_TIMER" ]] && echo "   证书续期定时器照常跑(到期前自动续)。"
   echo "   要连这些一起清干净: pdg lan purge"
 }
 
@@ -9499,6 +9654,8 @@ _lan_purge(){
   rm -f "$LAN_NFT_CONF"
   nft delete table inet pdglan 2>/dev/null || true
   local removed="" had_creds=""
+  # 续期定时器先拆: 它要调的 acme.sh 与证书下面就删了, 留着它只会每天空跑一次。
+  [[ -e "$LAN_CERT_TIMER" || -e "$LAN_CERT_SVC" ]] && { _lan_cert_timer_remove; removed="$removed 证书续期定时器"; }
   [[ -e "$LAN_DNS_ENV" || -e "$ACME_HOME" ]] && had_creds=1
   [[ -e "$LAN_ETC" ]] && { rm -rf "$LAN_ETC"; removed="$removed 反代配置与证书($LAN_ETC)"; }
   [[ -e "$LAN_STATE_DIR" ]] && { rm -rf "$LAN_STATE_DIR"; removed="$removed 运行态($LAN_STATE_DIR)"; }
@@ -9564,6 +9721,25 @@ migrate_lan_caddy_reender(){
     return 1                                   # 调用侧(cmd_update)自带 `|| true`, 不拖垮整次更新
   fi
   c_g "  [面板迁移] 已重新生成并生效。"
+}
+
+# 存量机器补上面板证书的续期定时器(以前签完证书从来没装过任何续期调度, 见 lib/units.sh)。
+# 条件 = 本项目签过面板证书(acme.sh 在、panel.crt 在)。**不看面板启用着没有**: 停用只是先停
+# 一停, 证书照样该续, 不然重新 enable 时拿到的是一张过期的。
+# 失败不拖垮更新(调用侧 `|| true`): 面板证书出问题只是面板打不开, 与 doctor 证书项一律不判 fail
+# 是同一条理由; doctor 会接着报"没有续期调度"。
+# **不在这里顺手续一次**: 迁移之后紧跟着更新后的 doctor 校验门, 此时去重启反代, 白名单那一项
+# 可能正好撞在重启窗口里判成 fail, 把整次更新拖去回滚。第一次续期检查交给定时器。
+migrate_lan_cert_timer(){
+  [[ -x "$ACME_HOME/acme.sh" && -s "$LAN_CERT_DIR/panel.crt" ]] || return 0
+  command -v systemctl >/dev/null 2>&1 || return 0
+  local had=0; [[ -e "$LAN_CERT_TIMER" ]] && had=1
+  if _lan_cert_timer_install; then
+    (( had )) || c_g "  [面板迁移] 补上了面板证书的续期定时器(pdg-lan-cert.timer, 每天检查一次)"
+    return 0
+  fi
+  c_y "  [面板迁移] 面板证书的续期定时器没装上 —— 到期前不会自动续(doctor 会接着报)。"
+  return 1
 }
 
 # 幂等; 只认本项目的标准形态; 备份 → 生成 → 校验 → 失败还原。$1 可指定文件(供测试)。
@@ -10494,6 +10670,7 @@ cmd_lan(){
     enable)    _lan_enable;;
     disable)   _lan_disable;;
     cert)      need_root lan; _lan_cert "${1:-}" "${2:-}";;
+    renew)     _lan_renew "$@";;
     render)    need_root lan
                _lan_render || return 1
                # 只生成不重启 = 文件是新的、进程还用着旧的。撞过一次, 见 _lan_apply_proxy。
@@ -10519,6 +10696,8 @@ cmd_lan(){
       echo "  cert <dns插件名> [委派zone]  DNS-01 签发(凭据放 $LAN_DNS_ENV, 600 root:root)"
       echo "                            给了委派 zone, token 就只需要能改那一个 zone ——"
       echo "                            被拿下的网关签不了你自己的 DoT 域名(见 pdg lan status 的风险提示)"
+      echo "  renew [--notify]          到 acme.sh 记的续期时刻就续签, 并让反代用上盘上那张证书"
+      echo "                            (pdg-lan-cert.timer 每天调一次; 没到时刻什么都不做, 手工跑也安全)"
       echo "  enable / disable          启用/停用反代"
       echo "  render                    面板表改过之后重新生成全部派生物(反代/白名单/DNS/分流)"
       echo "  wire                      只同步 DNS 劫持集与 mihomo 分流(反代配置不动)"

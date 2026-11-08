@@ -310,6 +310,9 @@ jobs:
       - name: "LAN 产物没变就别重启反代(跳过重启的那条路仍要补回内核白名单)"
         run: bash tests/test-lan-restart-idempotent.sh
 
+      - name: "面板证书续期: 定时器装 / 拆 / 迁移, 续完握手比对、反代拿着旧证书就收敛(真 TLS 服务端扮演反代)"
+        run: bash tests/test-lan-cert-renew.sh
+
       - name: "功能测试成功路径也要打印 mihomo 日志(截断要说清楚)"
         run: bash tests/test-functional-log-visibility.sh
 
