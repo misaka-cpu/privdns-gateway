@@ -338,10 +338,22 @@ def no_zstd():
     只摘命令是不够的 —— mrs_behavior 先试 compression.zstd / pyzstd / zstandard, 只有全都
     没有才会退到外部命令。本地 Debian 12(3.11 且没装这些包)恰好两条路都没有, 于是"摘掉命令"
     看起来够用; 换到带这些模块的机器(CI runner 就是), 前提根本不成立, 这条负向用例便会失败 ——
-    它测的是"认不出来", 而那台机器其实认得出来。前提要自己造齐, 不能靠跑测试的机器碰巧没装。"""
+    它测的是"认不出来", 而那台机器其实认得出来。前提要自己造齐, 不能靠跑测试的机器碰巧没装。
+
+    还有一层缓存: `from compression import zstd` 先取**包对象上的属性**, 有就直接用, 根本不走
+    import 系统。前面的正向用例一旦导入过 compression.zstd(3.14 起是标准库), 光从 sys.modules
+    里拿掉、再挂 meta_path 钩子都挡不住 —— Ubuntu 26.04 的 runner(Python 3.14.4)上这条负向用例
+    就是这样失败的(2026-11-08)。所以父包上的同名属性也要一并摘掉, 退出时放回。"""
     d = tmpguard.mkdtemp(prefix="pdgnozstd")
     old = os.environ["PATH"]
     saved = {n: sys.modules.pop(n) for n in _ZSTD_MODS if n in sys.modules}   # 绕开 import 缓存
+    hidden = []                                   # (父包, 子模块名, 原属性): 绕开父包上的属性缓存
+    for n in _ZSTD_MODS:
+        parent, _, child = n.rpartition(".")
+        pm = sys.modules.get(parent) if parent else None
+        if pm is not None and hasattr(pm, child):
+            hidden.append((pm, child, getattr(pm, child)))
+            delattr(pm, child)
     blocker = _BlockZstdImport()
     sys.meta_path.insert(0, blocker)
     # 只保留必要目录里的其它命令: 造一个只含符号链接、独独没有 zstd 的 bin 目录
@@ -367,6 +379,8 @@ def no_zstd():
         except ValueError:
             pass
         sys.modules.update(saved)
+        for pm, child, v in hidden:
+            setattr(pm, child, v)
         shutil.rmtree(d, ignore_errors=True)
 
 
