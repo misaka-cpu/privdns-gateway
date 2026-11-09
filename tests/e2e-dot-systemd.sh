@@ -32,8 +32,26 @@ install -m644 "$R/deploy/bot/pdg-dotwitness.service" /etc/systemd/system/pdg-dot
 mkdir -p /etc/privdns-gateway
 printf 'PDG_DOTWITNESS_SUFFIX=probe.dot.sysd.test\n' > /etc/privdns-gateway/dotwitness.env
 systemctl daemon-reload
+# verify 会把它顺带加载到的**发行版自带 unit** 的告警也打出来: Ubuntu 26.04 的 systemd 259 删了
+# CPUAccounting=, 而 runner 自带的 xfs_scrub_all / system-xfs_scrub.slice / walinuxagent 还在用,
+# 每次都报(2026-11-08 起, 与本 unit 无关)。那种行以 /usr/lib/systemd/system/(或 /lib/…)下的
+# 文件路径加行号开头。只滤这一种, 而且路径里带 pdg- 的不滤; 本 unit 装在 /etc/systemd/system/,
+# 它自己的问题(带本文件路径的行)和不带路径前缀的告警(找不到依赖、命令不可执行……)全部保留,
+# 有保留行就判红。滤掉的行照样打出来, 不藏。
+_verify_is_vendor_noise(){
+  local re='^(/usr)?/lib/systemd/system/[^:]+:[0-9]+: ' p
+  [[ "$1" =~ $re ]] || return 1
+  p="${1%%:*}"
+  [[ "$p" != *pdg-* ]]
+}
 out=$(systemd-analyze verify /etc/systemd/system/pdg-dotwitness.service 2>&1)
-[ -z "$out" ] && ok "systemd-analyze verify 无输出" || bad "verify: $out"
+keep=""; noise=""
+while IFS= read -r l; do
+  [[ -z "$l" ]] && continue
+  if _verify_is_vendor_noise "$l"; then noise+="$l"$'\n'; else keep+="$l"$'\n'; fi
+done <<<"$out"
+[[ -n "$noise" ]] && printf '       (verify 顺带报了发行版自带 unit 的告警, 与本 unit 无关, 不计:)\n%s' "$noise"
+[ -z "$keep" ] && ok "systemd-analyze verify 对本 unit 无输出" || bad "verify: $keep"
 
 sec "1. 启动与实际生效值"
 systemctl start pdg-dotwitness.service; sleep 1.5

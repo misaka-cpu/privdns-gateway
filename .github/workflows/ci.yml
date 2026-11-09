@@ -1707,6 +1707,13 @@ jobs:
             sudo systemctl start systemd-resolved >/dev/null 2>&1 || true
           fi
           sudo rm -f /run/pdg-fixture-resolved.was
+          # 夹具为让出 53 停过的别的 service(26.04 runner 上偶尔有), 按它记下的名字开回去
+          if [ -f /run/pdg-fixture-53.was ]; then
+            while IFS= read -r u; do
+              [ -z "$u" ] || sudo systemctl start "$u" >/dev/null 2>&1 || true
+            done < /run/pdg-fixture-53.was
+          fi
+          sudo rm -f /run/pdg-fixture-53.was
           pgrep -f '[d]otwitness\.py' >/dev/null && { echo "残留 witness 进程"; fail=1; }
           pgrep -f '[m]osdns start' >/dev/null && { echo "残留 mosdns 进程"; fail=1; }
           ss -lun 2>/dev/null | grep -q ':5399' && { echo "5399 仍在监听"; fail=1; }

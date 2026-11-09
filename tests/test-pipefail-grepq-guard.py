@@ -16,6 +16,7 @@ pipefail 把整条管道判成失败 —— 于是 `if 上游 | grep -q P; then`
     nft list table inet pdg(783 字节)  → 300 次里 296 次 141(nft 1.0.6: 列表分好几次写)
     systemctl list-unit-files(约 15KB) → 200 次里 77 次 141(.200 真机)
     ss -lun(16KB)、内建 printf(16KB)、git config --get-all(4.7KB)、nft list tables → 都是 300 次 0 次
+    Ubuntu 26.04 runner: cat 整体透传 524275 字节 → rc=0(2026-11-08 两次 CI; 那台的 cat 是哪家实现未核, 见第 1 节)
 
 注意"读了多大"与"写了多少"是两回事: `sed -n '500p' pdg.sh` 读 416KB 却只输出一行,
 写完就不再写, 永远不会反转。所以按形态一刀切会得出"仓库里有几十处债务"的结论, 而逐处查上游,
@@ -45,21 +46,53 @@ def bad(m): print("[FAIL] %s" % m); FAIL[0] += 1
 
 
 print("══ 1. 判据本身是真的(现场实测, 不背书本)══")
-def probe(nbytes):
+# 两种上游:
+#   cat  —— 系统 cat 整体透传文件。生产机(Debian)上是 GNU coreutils: 写满缓冲之后再写就挨 SIGPIPE。
+#   loop —— bash 内建 printf 逐行写, 每行一次 write(2); 跟 cat 是哪家的实现无关。
+# Ubuntu 26.04 的 runner 上, cat 整体透传 524275 字节两次都是 rc=0(2026-11-08), 那台的 cat 未必是
+# GNU coreutils。所以: cat 是 GNU 的, 照旧必须反转(原判据不放宽); 不是 GNU 的, 只把实测结果记成
+# NOTE, 不计通过也不计失败。"远大于缓冲时会反转"改由 loop 证明 —— 这一条在哪台机器上都必须成立。
+def note(m): print("[NOTE] %s" % m)
+def cat_impl():
+    r = subprocess.run(["bash", "-c", "cat --version"], capture_output=True, text=True)
+    first = (r.stdout or r.stderr).splitlines()[:1]
+    return first[0].strip() if first else "(cat --version 没有输出, rc=%d)" % r.returncode
+UPSTREAM = {
+    "cat": "cat %s",
+    "loop": "while IFS= read -r l; do printf '%%s\\n' \"$l\"; done < %s",
+}
+def probe(nbytes, how="cat"):
     import tempfile
     with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
         f.write("MATCHME\n" + ("x" * 40 + "\n") * (nbytes // 41))
         p = f.name
     try:
-        r = subprocess.run(["bash", "-c", "set -o pipefail; cat %s | grep -q MATCHME" % p],
-                           capture_output=True)
-        return r.returncode, os.path.getsize(p)
+        # PIPESTATUS 紧跟着管道取; 整条的退出码按 pipefail 的规则算(最右边那个非零)
+        cmd = "set -o pipefail; %s | grep -q MATCHME; echo \"${PIPESTATUS[*]}\"" % (UPSTREAM[how] % p)
+        r = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)
+        st = [int(x) for x in r.stdout.split() if x.isdigit()]
+        rc = next((s for s in reversed(st) if s != 0), 0)
+        return rc, st, os.path.getsize(p)
     finally:
         os.unlink(p)
-rc_small, sz_small = probe(8 * 1024)
-rc_big, sz_big = probe(512 * 1024)
-(ok if rc_small == 0 else bad)("小于缓冲(%d 字节)时不反转(rc=%d)" % (sz_small, rc_small))
-(ok if rc_big != 0 else bad)("远大于缓冲(%d 字节)时确实反转(rc=%d) —— 判据成立" % (sz_big, rc_big))
+impl = cat_impl()
+gnu = "GNU coreutils" in impl
+rc_small, st_small, sz_small = probe(8 * 1024)
+rc_big, st_big, sz_big = probe(512 * 1024)
+rc_loop, st_loop, sz_loop = probe(512 * 1024, "loop")
+for what, st in (("小文件", st_small), ("cat 大文件", st_big), ("逐行写", st_loop)):
+    if len(st) != 2:
+        bad("%s探针没取到两段 PIPESTATUS(实得 %r) —— 探针本身坏了, 下面的结论都不作数" % (what, st))
+(ok if rc_small == 0 else bad)("小于缓冲(%d 字节)时不反转(rc=%d, PIPESTATUS=%s)" % (sz_small, rc_small, st_small))
+if rc_big != 0:
+    ok("远大于缓冲(%d 字节)时 cat 整体透传确实反转(rc=%d, PIPESTATUS=%s; %s)" % (sz_big, rc_big, st_big, impl))
+elif gnu:
+    bad("远大于缓冲(%d 字节)时 GNU cat 整体透传没反转(rc=0, PIPESTATUS=%s; %s) —— 判据不成立" % (sz_big, st_big, impl))
+else:
+    note("本机 cat 不是 GNU coreutils(%s): 整体透传 %d 字节没反转(rc=0, PIPESTATUS=%s)。"
+         "不计通过也不计失败; 下一条用逐行写的上游证明判据" % (impl, sz_big, st_big))
+(ok if rc_loop != 0 else bad)("远大于缓冲(%d 字节)、bash 内建 printf 逐行写时确实反转(rc=%d, PIPESTATUS=%s)"
+                              " —— 判据成立, 与 cat 是哪家的实现无关" % (sz_loop, rc_loop, st_loop))
 # 总量不是唯一判据: 十几个字节, 只要命中之后上游还要再写一次, 照样反转
 r = subprocess.run(["bash", "-c", "set -o pipefail; { echo MATCHME; sleep 0.5; echo tail; } | grep -q MATCHME"],
                    capture_output=True)

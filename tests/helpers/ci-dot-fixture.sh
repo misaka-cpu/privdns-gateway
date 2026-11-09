@@ -10,7 +10,8 @@
 # 纪律:
 # · 不复制生产的迁移或安装逻辑。配置走 install.sh 里那个正式 render 闭包(与
 #   e2e-dot-witness.sh / e2e-dot-isolation.sh 同一套抽法); 部署走生产的 migrate_dotwitness。
-#   本文件自己只做"把外部世界摆好": 证书、规则文件、unit、停掉抢 53 端口的 resolved。
+#   本文件自己只做"把外部世界摆好": 证书、规则文件、unit、停掉抢 53 端口的 resolved
+#   (以及 26.04 runner 上偶尔有的别的 service)。
 # · 不伪造 mosdns / systemctl / nft / DNS 客户端。抢不到真的就失败, 不降级。
 # · 只碰本夹具创建的东西; 卸载交给调用方的 cleanup 步骤(见 workflow)。
 set -uo pipefail
@@ -58,6 +59,43 @@ fi
 systemctl stop systemd-resolved >/dev/null 2>&1 || true
 # resolv.conf 指向 127.0.0.53 时 dig 默认走不通; 夹具全程用 @127.0.0.1 显式指定,
 # 所以这里不改 resolv.conf —— 少动一样东西, cleanup 就少一样要还原的。
+#
+# Ubuntu 26.04 的 runner 上偶尔还有别的进程占着 53: 2026-11-08 有一台是 dns-resolver 在
+# 127.0.0.100:53(同一镜像版本的另一台就没有; 镜像说明里没写它是什么)。mosdns 绑的是 0.0.0.0:53,
+# 跟本机任何一个地址上的 53 都冲突。这里只处理**直接归某个 systemd service 管**的占用者
+# (cgroup 最后一段就是 *.service): 停掉它, 名字记进 FIX53_WAS, workflow 的 cleanup 按记录开回去。
+# 别的(PID 1 自己拿着的 socket、scope 里的进程、看不出归属的)一律不杀, 把现场打出来然后停 ——
+# 不认识的东西不动。mosdns 自己的监听行不算占用(本夹具每个 job 只跑一次, 走到这里时它还没起)。
+FIX53_WAS=/run/pdg-fixture-53.was
+_ss53(){ ss -Hlnptu 'sport = :53' 2>/dev/null; }
+_others53(){ _ss53 | grep -v '"mosdns"'; }   # 连 users: 都看不到的行也算被占
+_pid_service(){
+  local l re='^0::/(.*/)?([^/]+\.service)$'
+  while IFS= read -r l; do
+    [[ "$l" =~ $re ]] && { printf '%s\n' "${BASH_REMATCH[2]}"; return 0; }
+  done 2>/dev/null < "/proc/$1/cgroup"
+  return 1
+}
+_free53(){
+  local pid comm unit
+  : > "$FIX53_WAS" || die "写不了 $FIX53_WAS"
+  for pid in $(_others53 | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u); do
+    unit="$(_pid_service "$pid")" || unit=""
+    comm="$(cat "/proc/$pid/comm" 2>/dev/null)"
+    say "53 口被占: pid=$pid comm=${comm:-?} unit=${unit:-?} exe=$(readlink "/proc/$pid/exe" 2>/dev/null || echo '?')"
+    [[ "$unit" == systemd-resolved.service ]] && continue    # 上面已经停过, 下面等它放手
+    [[ "$pid" != 1 && -n "$unit" ]] \
+      || { _ss53; die "53 口的占用者不直接归某个 service 管(pid=$pid unit=${unit:-?}), 不去杀它"; }
+    echo "$unit" >> "$FIX53_WAS"
+    systemctl stop "$unit" || die "停不掉 $unit"
+  done
+  for _ in $(seq 1 10); do
+    [[ -z "$(_others53)" ]] && return 0
+    sleep 1
+  done
+  _ss53; die "停过之后 53 口仍被别的进程占着"
+}
+_free53
 
 # ── 2. 自签证书(mosdns 的 853 tls_server 要) ───────────────────────────────
 install -d -m755 /etc/mosdns/certs
