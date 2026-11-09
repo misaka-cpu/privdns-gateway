@@ -83,7 +83,7 @@ echo
 echo "══ 2. caddy: 坏件一律硬失败, 且不落盘 ══"
 neg_caddy(){ # $1=场景 $2=期望出现在 [FAIL] 里的词 $3=准备命令(对 $D/dl 动手)
   local D="$W/cneg" out rc=0
-  stage "$D/dl" manifest.json "$CADDY_ARC"; rm -rf "$D/bin"
+  stage "$D/dl" manifest.json "$CADDY_ARC"; rm -rf "${D:?}/bin"
   eval "$3"
   out="$(bash "$ROOT/tests/install-caddy-artifact.sh" "$D/dl" "$ARCH" "$D/bin/caddy" 2>&1)" || rc=$?
   if [[ "$rc" != 0 ]] && grep -q "^\[FAIL\].*$2" <<<"$out"; then
