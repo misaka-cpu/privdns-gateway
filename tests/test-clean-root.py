@@ -334,8 +334,11 @@ had_pyc = os.path.isdir(os.path.join(STALE, "__pycache__"))
 if os.path.exists(victim):
     os.remove(victim)
 # 导入成功时把"到底导进来的是什么"打出来: Ubuntu 26.04 的 runner(Python 3.14)上这一格红过,
-# 而当时只有一句"导入成功了", 看不出是哪个文件、从哪条搜索路径来的(2026-11-08)。判据不变:
-# 仍是"rc 非 0 且没打出 IMPORTED"才算导入失败。
+# 而当时只有一句"导入成功了", 看不出是哪个文件、从哪条搜索路径来的(2026-11-08)。
+# 加了诊断才看清: 那次其实**没**导入成功(rc=1, ModuleNotFoundError), 是 Python 3.13 起
+# traceback 会把 -c 代码的源码行原样回显("    import emergency, sys; print('IMPORTED')"),
+# 子串判断把回显当成了"打出 IMPORTED"(2026-11-09)。所以 IMPORTED 只认**独占一行**的那句输出;
+# 导入失败的判定仍是"rc 非 0 且没打出 IMPORTED"。
 rc4, out4 = run_isolated(STALE, (
     "import emergency, sys; print('IMPORTED')\n"
     "print('  sys.version =', sys.version.split()[0])\n"
@@ -345,7 +348,7 @@ rc4, out4 = run_isolated(STALE, (
     "print('  sys.path =', sys.path)\n"))
 if not had_pyc:
     skip("本环境没有生成 __pycache__(PYTHONDONTWRITEBYTECODE?), 该分支未验证")
-elif rc4 != 0 and "IMPORTED" not in out4:
+elif rc4 != 0 and "IMPORTED" not in out4.splitlines():
     ok("源文件被删、只剩 __pycache__ 时导入失败(旧字节码冒充不了完整安装)")
 else:
     def _ls(d):
