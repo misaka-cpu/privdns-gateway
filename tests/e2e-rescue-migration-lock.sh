@@ -87,6 +87,9 @@ BRIDGE_SHA="${PDG_BRIDGE_SHA:-542cc9177fc35c9d413ff3b62a7dac8bc468c136}"
 BRIDGE_TAG="${PDG_BRIDGE_TAG:-v9.9.8}"     # 排在 $NEW_TAG(v9.9.9) 之前, 语义化顺序与真实顺序一致
 # 本次到底选中了哪一个 —— **完整**打出来, 不靠源码默认值声称。
 echo "   [记录] 本次冻结桥接身份: $BRIDGE_SHA  (来源: ${PDG_BRIDGE_SHA:+显式输入}${PDG_BRIDGE_SHA:-源码默认})"
+# 两跳里的换核(桥接取它钉的 mihomo、本版再取回现钉值)由离线镜像本地供件, 不现场去 GitHub ——
+# 件不在就停在这里具名失败, 不让 hop1 在半路以"内核收敛回滚"的样子红(见 tests/e2e-lib.sh)。
+e2e_release_mirror "$BRIDGE_SHA" || { e2e_summary; exit 1; }
 EXPECT_DESC="$PREV"                        # 回滚判据里"应当回到哪个 describe"; 桥接跳之后会改写
 
 SNAPD=/var/lib/privdns-gateway/backups

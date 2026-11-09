@@ -39,10 +39,14 @@ export LAN_FX_PEM_DIR="$WORK/pem"
 if ! lan_fx_make_pem "$LAN_FX_PEM_DIR"; then
   echo "[FAIL] 生成测试用 PEM 失败(缺 openssl?) —— 真 Caddy 校验这一条测不了, 不跳过"; exit 1
 fi
-CADDY_BIN="$(lan_fx_caddy "$ROOT" "$WORK")" || CADDY_BIN=""
+# 解析器的说明落到文件里再并进具名失败: 负控只收 [FAIL] 行, 原因若只在 stderr 的另一行,
+# 负控报告里就只剩一句"拿不到"(run 42482967890 的三格正是这样, 首因无从判断)。
+CADDY_BIN="$(lan_fx_caddy "$ROOT" "$WORK" 2>"$WORK/caddy-resolve.err")" || CADDY_BIN=""
 if [[ -z "$CADDY_BIN" ]]; then
-  echo "[FAIL] 拿不到 caddy(本地/PATH/按钉死 SHA 下载都不成) —— 这支要验真 Caddy 的行为, 不能跳过"; exit 1
+  echo "[FAIL] 拿不到 caddy —— 这支要验真 Caddy 的行为, 不能跳过。原因: $(tr '\n' ' ' < "$WORK/caddy-resolve.err")"; exit 1
 fi
+[[ -s "$WORK/caddy-resolve.err" ]] && sed 's/^/   [记录] /' "$WORK/caddy-resolve.err"
+echo "   [记录] 真 Caddy: $CADDY_BIN($("$CADDY_BIN" version 2>/dev/null | head -1 | awk '{print $1}'))"
 
 CLOSURE="$WORK/closure.sh"
 if ! lan_fx_emit "$CLOSURE"; then

@@ -72,6 +72,10 @@ git -C "$E2E_ROOT" cat-file -e "$BRIDGE_SHA^{commit}" 2>/dev/null \
   && ok "祖先关系成立: $PREV(${PREV_SHA:0:12}) → 桥接(${BRIDGE_SHA:0:12}) → 本版(${CAND_SHA:0:12})" \
   || { bad "祖先关系不成立: 桥接对象不在 $PREV 与本版之间, 两跳升级没有可验的基础"; e2e_summary; exit 1; }
 
+# 两跳里的换核(桥接取它钉的 mihomo、本版再取回现钉值)由离线镜像本地供件, 不现场去 GitHub ——
+# 件不在就停在这里具名失败, 不让 hop1 在半路以"内核收敛回滚"的样子红(见 tests/e2e-lib.sh)。
+e2e_release_mirror "$BRIDGE_SHA" || { e2e_summary; exit 1; }
+
 REF=$E2E_TMP/ref
 rm -rf "$REF"; mkdir -p "$REF"
 _refdump(){   # $1=提交 $2=落点名 → 取出 pdg.sh 与模块清单

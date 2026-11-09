@@ -16,7 +16,12 @@
   ⑥ artifact 名字要绑版本 + 架构 + 摘要前缀, 且由钉值生成而不是再写死一份;
   ⑦ 保留期取平台允许的最短值(1 天);
   ⑧ action 按仓库既有惯例钉定, 不许浮动引用;
-  ⑨ producer 取件后要走生产判据 pdg_mosdns_binary_ok 复核。
+  ⑨ producer 取件后要走生产判据 pdg_mosdns_binary_ok 复核;
+  ⑩ caddy 与升级类 E2E 的离线镜像(mihomo 官方归档: 现钉值 + 冻结桥接钉的那份)走同一个 producer:
+     producer 取件并写进 manifest, 要它们的 job 在用例之前用各自的消费者脚本复核, 消费者脚本
+     不联网、不 SKIP、自己按仓库钉值重算; 测试侧的解析器在严格模式下不现场下载。
+     由来: 2026-11-08 run 42482967890 —— lint 的 LAN 回滚负控每格现场 curl caddy, 三格没拿到就断了
+     整条串行链; 升级类 E2E 的「旧版→桥接」一跳每次现场 curl 桥接钉的 mihomo, 下载失败就回滚。
 """
 import os
 import re
@@ -48,8 +53,11 @@ D = yaml.safe_load(open(CI, encoding="utf-8"))
 JOBS = D["jobs"]
 TEXT = open(CI, encoding="utf-8").read()
 PRODUCER = "prepare-mosdns-fixture"
-# 官方 Release 的取件动作长什么样(两种既有形态)
-FETCH = re.compile(r"prepare-mosdns\.sh|mosdns-linux-\w+\.zip")
+# 官方 Release 的取件动作长什么样: 仓库里的取件入口脚本, 或直接拉 Release 资产。
+# 以前只认 mosdns 那两种形态 —— mihomo / 旧版 mosdns / caddy / 桥接 mihomo 的取件哪怕
+# 挪进了消费者 job, 这一格也看不见。
+FETCH = re.compile(r"\bprepare-(?:mosdns|mihomo|mosdns-legacy|mihomo-bridge|caddy)\.sh\b"
+                   r"|releases/download|mosdns-linux-\w+\.zip")
 NET = re.compile(r"\bcurl\b|\bwget\b|releases/download")
 
 
@@ -204,6 +212,122 @@ if PRODUCER in JOBS:
      bad)("producer 先移除 runner 上偶然存在的 mosdns(不把已有状态当隐式输入)")
     (ok if not re.search(r"token|secrets\.", code(body), re.I) else
      bad)("manifest / producer 步骤里不出现 token 或 secrets")
+
+print()
+print("══ 10. caddy 与升级类 E2E 离线镜像: 同一个 producer, 消费者自己复核 ══")
+
+
+def src_of(rel):
+    p = os.path.join(ROOT, rel)
+    return open(p, encoding="utf-8").read() if os.path.exists(p) else ""
+
+
+def job_text(j):
+    return yaml.safe_dump(JOBS[j], allow_unicode=True)
+
+
+if PRODUCER in JOBS:
+    fetch_body = "\n".join(r for _, _, r in runs(PRODUCER) if FETCH.search(r))
+    all_body = "\n".join(r for _, _, r in runs(PRODUCER))
+    for pat, why in (
+            (r"prepare-caddy\.sh", "取 caddy 官方归档(PDG_TEST_CADDY_ARCHIVE_DIR 原样留给消费者)"),
+            (r"PDG_TEST_CADDY_ARCHIVE_DIR=", "caddy 归档原样进 artifact(消费者要自己核归档 SHA)"),
+            (r"prepare-mihomo-bridge\.sh", "取冻结桥接钉的 mihomo 归档"),
+            (r"PDG_TEST_MIRROR_DIR=\S*\s*\\?\s*\n?\s*bash tests/prepare-mihomo\.sh|"
+             r"PDG_TEST_MIRROR_DIR=[^\n]*\n[^\n]*prepare-mihomo\.sh",
+             "现钉值 mihomo 的官方归档由**同一次**取件原样留下(不为它再取一次)")):
+        (ok if re.search(pat, fetch_body) else bad)("producer %s" % why)
+    for pat, why in ((r"PDG_SHA256\[caddy-", "按 lib/versions.sh 核 caddy 归档"),
+                     (r"caddy_archive_sha256", "manifest 记 caddy 归档摘要"),
+                     (r"caddy_binary_sha256", "manifest 记 caddy 解包产物摘要(供消费者对账)"),
+                     (r"mihomo-bridge-bin-", "按 tests/legacy-pins.sh 核桥接归档的解压产物"),
+                     (r"release_mirror", "manifest 记离线镜像的每一份归档")):
+        (ok if re.search(pat, all_body) else bad)("producer %s" % why)
+
+# 要 caddy 的用例 / 要离线镜像的用例。前者只按 run 判(lint 里逐支调用); 后者还要看 matrix
+# 与串行清单(env) —— 用例名不一定出现在 run 里。
+CADDY_TESTS = ("test-lan-location-live.sh", "test-lan-rollback-convergence.sh",
+               "lan-rollback-convergence-negative-controls.py")
+MIRROR_TESTS = ("e2e-upgrade-from-release.sh", "e2e-rescue-migration-lock.sh")
+SIDE = (("caddy", "tests/install-caddy-artifact.sh", CADDY_TESTS),
+        ("离线镜像", "tests/install-release-mirror-artifact.sh", MIRROR_TESTS))
+
+for what, installer, tests_ in SIDE:
+    if what == "caddy":
+        users = [j for j in JOBS if any(t in r for _, _, r in runs(j) for t in tests_)]
+    else:
+        users = [j for j in JOBS if j != PRODUCER and any(t in job_text(j) for t in tests_)]
+    (ok if users else bad)("%s: 现推出要它的 job(实得 %r)" % (what, sorted(users)))
+    for j in sorted(users):
+        need = JOBS[j].get("needs")
+        need = [need] if isinstance(need, str) else (need or [])
+        (ok if PRODUCER in need else bad)("%s: %s 的 needs 含 %s" % (what, j, PRODUCER))
+        dl = [i for i, s in enumerate(steps(j), 1) if "download-artifact" in str(s.get("uses") or "")]
+        ins = [i for i, n, r in runs(j) if installer in r]
+        if what == "caddy":
+            use = [i for i, n, r in runs(j) if any(t in r for t in tests_)]
+        else:
+            use = [i for i, s in enumerate(steps(j), 1)
+                   if re.search(r"bash tests/|e2e-serial-hermetic", str(s.get("run") or ""))
+                   and (any(t in yaml.safe_dump(s, allow_unicode=True) for t in tests_)
+                        or "matrix.script" in str(s.get("run") or "")
+                        or "e2e-serial-hermetic" in str(s.get("run") or ""))]
+        if not (dl and ins and use):
+            bad("%s: %s 缺 download-artifact(%r) / %s(%r) / 用例步骤(%r)"
+                % (what, j, dl, installer, ins, use))
+            continue
+        (ok if dl[0] < ins[0] < min(use) else
+         bad)("%s: %s 的顺序是 下载 artifact(step %d) → %s(step %d) → 用例(step %d)"
+              % (what, j, dl[0], installer.split("/")[-1], ins[0], min(use)))
+        netty = [i for i, n, r in runs(j) if i in ins and NET.search(code(r))]
+        (ok if not netty else bad)("%s: %s 的复核步骤里没有 curl/wget/Release 回退" % (what, j))
+
+INST_RULES = {
+    "tests/install-caddy-artifact.sh": (
+        (r"sha256sum", "自己算摘要(不认 artifact 服务端摘要)"),
+        (r"lib/versions\.sh", "期望值从当前 checkout 的 lib/versions.sh 读"),
+        (r"PDG_SHA256\[caddy-", "拿仓库钉值当权威(而不是 manifest)"),
+        (r"manifest\.json", "manifest 交叉核对"),
+        (r"==\s*\"\$CADDY_VER\"", "**比较**自报版本与钉值"),
+        (r"install\s+-m\s*755", "以 mode 755 安装")),
+    "tests/install-release-mirror-artifact.sh": (
+        (r"sha256sum", "自己算摘要(不认 artifact 服务端摘要)"),
+        (r"lib/versions\.sh", "现钉值从当前 checkout 的 lib/versions.sh 读"),
+        (r"legacy-pins\.sh", "桥接钉值从 tests/legacy-pins.sh 读"),
+        (r"mihomo-bin-\$arch", "核现钉值归档的解压产物"),
+        (r"mihomo-bridge-bin-\$arch", "核桥接归档的解压产物"),
+        (r"manifest\.json", "manifest 交叉核对"),
+        (r"==\s*\"\$ver\"", "**比较**自报版本与钉的版本")),
+}
+for rel, rules in INST_RULES.items():
+    src = src_of(rel)
+    if not src:
+        bad("缺 %s" % rel)
+        continue
+    for pat, why in rules:
+        (ok if re.search(pat, code(src)) else bad)("%s: %s" % (rel.split("/")[-1], why))
+    (ok if not NET.search(code(src)) else bad)("%s: 没有任何联网动作" % rel.split("/")[-1])
+    (ok if "SKIP" not in code(src) else bad)("%s: 不合格时硬失败, 不 SKIP" % rel.split("/")[-1])
+
+# 测试侧: caddy 解析器在严格模式下先停, 再谈取件; LAN 那几支不再自己 curl。
+cf = code(src_of("tests/caddy-fixture.sh"))
+i_strict = cf.find("_pdg_test_caddy_strict; then")
+i_fetch = cf.find("prepare-caddy.sh")
+(ok if 0 <= i_strict < i_fetch else
+ bad)("tests/caddy-fixture.sh: 严格模式的出口排在唯一取件入口之前(strict=%d fetch=%d)" % (i_strict, i_fetch))
+(ok if not NET.search(cf) else bad)("tests/caddy-fixture.sh 自己不联网(取件只走 prepare-caddy.sh)")
+for rel in ("tests/lan-fixture.sh", "tests/test-lan-location-live.sh"):
+    c = code(src_of(rel))
+    (ok if c and "pdg_test_caddy" in c else bad)("%s 经 tests/caddy-fixture.sh 取 caddy" % rel)
+    (ok if c and not re.search(r"\bcurl\b[^\n]*caddy|caddyserver/caddy/releases", c) else
+     bad)("%s 不再自己现场下载 caddy" % rel)
+# 测试侧: 两支升级类 E2E 在第一次调入口之前把离线镜像立起来。
+for rel in ("tests/e2e-upgrade-from-release.sh", "tests/e2e-rescue-migration-lock.sh"):
+    c = code(src_of(rel))
+    i_m = c.find('e2e_release_mirror "$BRIDGE_SHA"')
+    i_u = min([x for x in (c.find('bash "$FLOW"'), c.find("pdg update")) if x >= 0] or [-1])
+    (ok if 0 <= i_m < i_u else
+     bad)("%s: 离线镜像在第一次调入口/更新器之前就位(mirror=%d first=%d)" % (rel, i_m, i_u))
 
 print("-" * 62)
 print("test-ci-mosdns-topology.py: 通过 %d, 失败 %d" % (PASS[0], FAIL[0]))

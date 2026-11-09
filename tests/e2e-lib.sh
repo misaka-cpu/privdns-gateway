@@ -23,7 +23,11 @@ source "$(dirname "${BASH_SOURCE[0]}")/repoguard.sh"
 E2E_PASS=0; E2E_FAIL=0
 ok(){ echo "[OK]   $1"; E2E_PASS=$((E2E_PASS+1)); }
 bad(){ echo "[FAIL] $1"; E2E_FAIL=$((E2E_FAIL+1)); }
-e2e_summary(){ echo "────────────────────────────────────────"; echo "通过 $E2E_PASS, 失败 $E2E_FAIL"; [[ "$E2E_FAIL" == 0 ]]; }
+# 离线镜像就位过的脚本(见 e2e_release_mirror), 汇总前先给镜像的结论 —— 早退的几个出口也都走这里。
+e2e_summary(){
+  declare -F e2e_release_mirror_verdict >/dev/null && e2e_release_mirror_verdict
+  echo "────────────────────────────────────────"; echo "通过 $E2E_PASS, 失败 $E2E_FAIL"; [[ "$E2E_FAIL" == 0 ]]
+}
 # 缺能力时怎么办, 取决于**在哪跑**:
 #   · 开发者本机偶尔没网、拉不到内核 → 记 [SKIP] 并退 0 是合理的, 否则没法干活;
 #   · CI 或 PDG_TEST_STRICT=1 → 必须 FAIL。这里跳过的都是"取不到真二进制"这类前提,
@@ -1044,6 +1048,168 @@ e2e_fetch_mihomo(){
   if ! pdg_mihomo_binary_ok "$march" "$MIHOMO_VER" "$bin"; then
     echo "[FAIL] 夹具装完后 $bin 的内容与钉值不符" >&2; return 1
   fi
+}
+# ── 升级类 E2E 的离线镜像: mihomo 官方归档由夹具本地供件, 不现场联网 ────────────
+# e2e-upgrade-from-release / e2e-rescue-migration-lock 的两跳升级里, 换核的是**被测代码自己**:
+#   · 旧版→桥接: 冻结桥接钉 v1.19.30, 夹具预装的是现钉值 → 桥接的 _update_core_binary 去取 v1.19.30;
+#   · 桥接→本版: 本版的 _update_core_binary 再取回现钉值。
+# 两次都是对 github.com/MetaCubeX/mihomo/releases 的未认证 curl。2026-11-08 GitHub 抽风时
+# hop1 以「内核收敛: 按本次前像恢复 mihomo」回滚、整支红, 同一 run 的串行版又是绿的 ——
+# 测试结论成了网络运气的函数。冻结桥接不能改, 所以改夹具:
+#
+#   e2e_release_mirror <冻结桥接提交>
+#     · 从 ${PDG_TEST_RELEASE_MIRROR:-$E2E_ROOT/tests/.bin/release-mirror} 取两份官方归档
+#       (CI 由取件 job 每 run 取一次, 消费者 tests/install-release-mirror-artifact.sh 复核后放到这里);
+#     · 钉值**各取自各的源**: 本版读工作树的 lib/versions.sh, 桥接读冻结桥接对象**自己的**
+#       lib/versions.sh(git show) —— 镜像里的件必须是那一跳的被测代码会认的那一份;
+#       逐份核归档 SHA256、解压产物 SHA256、自报版本, 全过才放进本轮镜像;
+#     · 在 PATH 最前面放一个 curl 前置壳: 只对 mihomo 官方 Release 的**精确资产 URL**
+#       (download/<tag>/mihomo-linux-<arch>-<tag>.gz)作答 —— 镜像里有就原样交出字节, 没有就以
+#       curl 的 HTTP 错误码 22 失败并具名(**不联网兜底**); 其余请求原样透传给真 curl、逐条记账。
+#     被测代码照常自己做归档 SHA → 解压 → 二进制 SHA → 换核 → 重启 → 稳定判定, 夹具一步都不替它做。
+#   拿不到件 / 件不对 → bad 具名并返回 1(调用方据此停下), 不 SKIP、不现场下载。
+#
+#   e2e_summary 在镜像就位后会先给结论: 有没有未预置的 mihomo 取件(MISS), 供件几次, 透传了什么。
+E2E_MIRROR_DIR=""
+
+# 读一份 versions.sh 里的 mihomo 版本与 <架构> 的两份钉值 → "版本 归档摘要 解压产物摘要"。
+# 在子 shell 里 source: 两份 versions.sh 的同名变量互不覆盖, 也不污染调用方。
+_e2e_mirror_pins(){
+  (
+    # shellcheck source=/dev/null
+    . "$1" >/dev/null 2>&1 || exit 0
+    printf '%s %s %s\n' "${MIHOMO_VER:-}" "${PDG_SHA256[mihomo-$2]:-}" "${PDG_SHA256[mihomo-bin-$2]:-}"
+  )
+}
+
+e2e_release_mirror(){
+  local bridge="${1:-}" src d march i ver a b name f got gv real
+  local -a labels files
+  if [[ -z "$bridge" ]]; then bad "离线镜像: 没给冻结桥接提交"; return 1; fi
+  src="${PDG_TEST_RELEASE_MIRROR:-$E2E_ROOT/tests/.bin/release-mirror}"
+  d="$E2E_TMP/release-mirror"
+  march="$(dpkg --print-architecture 2>/dev/null)"; [[ "$march" == arm64 ]] || march=amd64
+  rm -rf "$d"
+  mkdir -p "$d/files" "$d/bin" || { bad "离线镜像: 建不出 $d"; return 1; }
+  : > "$d/calls.log"
+  if ! git -C "$E2E_ROOT" show "$bridge:lib/versions.sh" > "$d/bridge-versions.sh" 2>/dev/null \
+     || [[ ! -s "$d/bridge-versions.sh" ]]; then
+    bad "离线镜像: 取不到冻结桥接 ${bridge:0:12} 自己的 lib/versions.sh(浅克隆?) —— 桥接那一跳该供哪一份件无从确定"
+    return 1
+  fi
+  labels=("本版(工作树 lib/versions.sh)" "冻结桥接 ${bridge:0:12}(其 lib/versions.sh)")
+  files=("$E2E_ROOT/lib/versions.sh" "$d/bridge-versions.sh")
+  for i in 0 1; do
+    read -r ver a b < <(_e2e_mirror_pins "${files[$i]}" "$march")
+    if [[ -z "$ver" || -z "$a" || -z "$b" ]]; then
+      bad "离线镜像: ${labels[$i]} 读不出 mihomo 版本或 $march 的两份钉值"; return 1
+    fi
+    name="mihomo-linux-${march}-${ver}.gz"
+    printf 'PIN\t%s\t%s\n' "$name" "${labels[$i]}" >> "$d/calls.log"
+    if [[ -f "$d/files/$name" ]]; then
+      # 两份钉值是同一版本: 已核过的那份必须同样满足这一份钉值
+      got="$(sha256sum "$d/files/$name" | awk '{print $1}')"
+      [[ "$got" == "$a" ]] && continue
+      bad "离线镜像: $name 同时被两份钉值引用, 摘要却对不上(${labels[$i]})"; return 1
+    fi
+    f="$src/$name"
+    if [[ ! -f "$f" ]]; then
+      bad "离线镜像: 缺 ${labels[$i]} 钉的 $name(源目录 $src) —— 这一跳取不到件, 夹具不替它联网。CI 由取件 job 经 artifact 供件(tests/install-release-mirror-artifact.sh); 本地先跑 PDG_TEST_MIRROR_DIR=\"\$PWD/tests/.bin/release-mirror\" bash tests/prepare-mihomo.sh 和 bash tests/prepare-mihomo-bridge.sh"
+      return 1
+    fi
+    got="$(sha256sum "$f" | awk '{print $1}')"
+    if [[ "$got" != "$a" ]]; then
+      bad "离线镜像: $name 归档摘要 ${got:0:12}… 不是 ${labels[$i]} 钉的 ${a:0:12}… —— 拒绝供件"; return 1
+    fi
+    if ! gunzip -c "$f" > "$d/probe" 2>/dev/null || [[ ! -s "$d/probe" ]]; then
+      bad "离线镜像: $name 解压失败或产物为空"; rm -f "$d/probe"; return 1
+    fi
+    got="$(sha256sum "$d/probe" | awk '{print $1}')"
+    if [[ "$got" != "$b" ]]; then
+      bad "离线镜像: $name 解压产物摘要 ${got:0:12}… 不是 ${labels[$i]} 钉的 ${b:0:12}…"; rm -f "$d/probe"; return 1
+    fi
+    chmod 755 "$d/probe"
+    gv="$("$d/probe" -v 2>/dev/null | head -1 | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+    rm -f "$d/probe"
+    if [[ "$gv" != "$ver" ]]; then
+      bad "离线镜像: $name 自报版本 [${gv:-未知}] 不是 ${labels[$i]} 钉的 $ver"; return 1
+    fi
+    install -m644 "$f" "$d/files/$name" || { bad "离线镜像: 放不进 $d/files/$name"; return 1; }
+  done
+  # 真 curl 的位置在挂壳**之前**定下来, 透传时不会绕回壳自己
+  real="$(command -v curl 2>/dev/null)" || real=""
+  printf '%s\n' "$real" > "$d/real-curl"
+  cat > "$d/bin/curl" <<'SHIM'
+#!/usr/bin/env bash
+# E2E 离线镜像的 curl 前置壳(夹具, 不是被测代码)。由 tests/e2e-lib.sh 的 e2e_release_mirror 生成。
+# 只对 mihomo 官方 Release 的精确资产 URL 作答: 镜像里有就原样交出字节, 没有就 22 失败并具名,
+# 绝不联网兜底。其余请求透传给真 curl。每一次调用都记进 calls.log。
+d="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+url="" out="" want_out=0
+for a in "$@"; do
+  if (( want_out )); then out="$a"; want_out=0; continue; fi
+  case "$a" in
+    --output) want_out=1;;
+    --output=*) out="${a#--output=}";;
+    --*) ;;
+    -*o) want_out=1;;
+    -o?*) out="${a#-o}";;
+    http://*|https://*) url="$a";;
+  esac
+done
+pre="https://github.com/MetaCubeX/mihomo/releases/download/"
+case "$url" in
+  "$pre"*)
+    rest="${url#"$pre"}"; tag="${rest%%/*}"; name="${rest#*/}"
+    if [[ "$name" != */* && "$name" =~ ^mihomo-linux-(amd64|arm64)-(.+)\.gz$ \
+          && "${BASH_REMATCH[2]}" == "$tag" && -f "$d/files/$name" ]]; then
+      if [[ -n "$out" ]]; then
+        cp -- "$d/files/$name" "$out" \
+          || { printf 'FAIL\t%s\t写不进 %s\n' "$url" "$out" >> "$d/calls.log"; exit 23; }
+      else
+        cat -- "$d/files/$name" || exit 23
+      fi
+      printf 'SERVED\t%s\n' "$url" >> "$d/calls.log"
+      exit 0
+    fi
+    printf 'MISS\t%s\n' "$url" >> "$d/calls.log"
+    echo "curl: (22) [E2E 离线镜像] 未预置 $url —— 夹具只供钉值里有的官方归档, 不替它联网" >&2
+    exit 22;;
+esac
+real="$(cat "$d/real-curl" 2>/dev/null)"
+printf 'PASS\t%s\n' "${url:-<无 URL>}" >> "$d/calls.log"
+if [[ -z "$real" || ! -x "$real" ]]; then
+  echo "[E2E 离线镜像] 找不到真 curl, 无法透传: $*" >&2
+  exit 2
+fi
+exec "$real" "$@"
+SHIM
+  chmod 755 "$d/bin/curl" || { bad "离线镜像: curl 前置壳不可执行"; return 1; }
+  case ":$PATH:" in *":$d/bin:"*) ;; *) export PATH="$d/bin:$PATH";; esac
+  hash -r 2>/dev/null || true
+  E2E_MIRROR_DIR="$d"
+  ok "离线镜像就位: $(cd "$d/files" && ls | tr '\n' ' ')(本版与冻结桥接 ${bridge:0:12} 各按自己的钉值核过归档/解压产物/自报版本; mihomo 官方取件不联网)"
+}
+
+# 镜像的结论。由 e2e_summary 调(镜像没就位时什么都不做), 每轮只给一次。
+e2e_release_mirror_verdict(){
+  local log n_miss n_served n_pass
+  [[ -n "$E2E_MIRROR_DIR" ]] || return 0
+  log="$E2E_MIRROR_DIR/calls.log"
+  E2E_MIRROR_DIR=""
+  if [[ ! -f "$log" ]]; then bad "离线镜像: 调用记录不见了($log) —— 有没有未预置的取件无从判断"; return 1; fi
+  n_miss="$(grep -c '^MISS' "$log")"; n_served="$(grep -c '^SERVED' "$log")"; n_pass="$(grep -c '^PASS' "$log")"
+  if (( n_miss > 0 )); then
+    bad "离线镜像: $n_miss 次 mihomo 官方取件没有预置件(没有联网兜底, 那一跳因此拿不到件): $(grep '^MISS' "$log" | cut -f2 | sort | uniq -c | tr -s ' \n' ' ')"
+  elif (( n_served > 0 )); then
+    ok "离线镜像: mihomo 官方取件 $n_served 次全部由本地钉值归档供件, 0 次联网($(grep '^SERVED' "$log" | cut -f2 | sed 's|.*/||' | sort | uniq -c | tr -s ' \n' ' '))"
+  else
+    echo "   [记录] 离线镜像: 本轮没有发生 mihomo 官方取件"
+  fi
+  if (( n_pass > 0 )); then
+    echo "   [记录] 离线镜像透传给真 curl 的其它请求 $n_pass 次: $(grep '^PASS' "$log" | cut -f2 | sort | uniq -c | head -5 | tr -s ' \n' ' ')"
+  fi
+  return 0
 }
 # 播种**真实钉定**的 mosdns 二进制, 并用生产判据复核。
 #

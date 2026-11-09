@@ -14,7 +14,7 @@
 # 判据的取样方式也是刻意的: **从 lanpanel.py 现场生成的配置里抠出那一行**, 不手抄。
 # 手抄的那份迟早跟生成器分家, 而分家的方向恰恰是"测试还绿着、线上已经不对"。
 #
-# caddy 不在就地下载(版本与 SHA256 沿用 lib/versions.sh 那一套, 不另立信任链)。
+# caddy 的来源见 tests/caddy-fixture.sh(CI 经取件 job 的 artifact 供件; 版本与 SHA256 沿用 lib/versions.sh)。
 # ─────────────────────────────────────────────────────────────────────────────
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -32,24 +32,15 @@ cleanup(){
 trap cleanup EXIT
 
 # ── 取 caddy ────────────────────────────────────────────────────────────────
-if [[ -x /usr/local/bin/caddy ]]; then
-  CADDY=/usr/local/bin/caddy
-elif command -v caddy >/dev/null 2>&1; then
-  CADDY="$(command -v caddy)"
-else
-  # shellcheck source=lib/versions.sh
-  source "$ROOT/lib/versions.sh" 2>/dev/null || { bad "读不到 lib/versions.sh"; exit 1; }
-  arch="$(uname -m)"; case "$arch" in x86_64) arch=amd64;; aarch64) arch=arm64;; esac
-  url="https://github.com/caddyserver/caddy/releases/download/${CADDY_VER}/caddy_${CADDY_VER#v}_linux_${arch}.tar.gz"
-  if curl -fsSL --max-time 120 -o "$WD/caddy.tgz" "$url" 2>/dev/null \
-     && pdg_verify_sha256 "$WD/caddy.tgz" "${PDG_SHA256[caddy-$arch]:-}" "caddy $CADDY_VER" >/dev/null 2>&1 \
-     && tar -xzf "$WD/caddy.tgz" -C "$WD" caddy 2>/dev/null; then
-    CADDY="$WD/caddy"; chmod +x "$CADDY"
-  else
-    bad "拿不到 caddy(下载或校验失败) —— 这支测的就是真 Caddy 的行为, 不能跳过"
-    exit 1
-  fi
+# 与 tests/lan-fixture.sh 同一个解析入口(tests/caddy-fixture.sh): 经复核的钉死版优先, 严格模式
+# (CI)下只认它、不现场下载。拿不到就具名失败, 原因并进这一条 —— 不再 `2>/dev/null` 丢掉。
+# shellcheck source=tests/caddy-fixture.sh
+source "$ROOT/tests/caddy-fixture.sh" || { bad "读不到 tests/caddy-fixture.sh"; exit 1; }
+if ! CADDY="$(pdg_test_caddy "$ROOT" "$WD" 2>"$WD/caddy-resolve.err")"; then
+  bad "拿不到 caddy —— 这支测的就是真 Caddy 的行为, 不能跳过。原因: $(tr '\n' ' ' < "$WD/caddy-resolve.err")"
+  exit 1
 fi
+[[ -s "$WD/caddy-resolve.err" ]] && sed 's/^/   [记录] /' "$WD/caddy-resolve.err"
 ok "caddy 可用: $($CADDY version 2>/dev/null | head -1)"
 
 # ── 从生成器现场取那条指令 ──────────────────────────────────────────────────

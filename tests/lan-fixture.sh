@@ -197,18 +197,13 @@ lan_fx_make_pem(){
   [[ -s "$d/panel.crt" && -s "$d/panel.key" ]]
 }
 
-# 真 Caddy: 本地 → PATH → 按 lib/versions.sh 钉死的 SHA 下载。拿不到**硬失败**, 不跳过 ——
-# 口径与 tests/test-lan-location-live.sh 一致, 不另立一套信任链。
+# 真 Caddy。解析顺序与取件纪律在 tests/caddy-fixture.sh(与 test-lan-location-live.sh 同一份):
+# 经复核的钉死版优先; 严格模式(CI)下只认它、不现场下载; 开发机才退到本地 / PATH / 唯一取件入口。
+# 拿不到**硬失败**, 不跳过; 原因留在 stderr —— 以前这里 `curl … 2>/dev/null`, 负控三格
+# "拿不到 caddy" 时日志里一个字的首因都没有(run 42482967890)。
 lan_fx_caddy(){
-  local root="$1" wd="$2" arch url
-  if [[ -x /usr/local/bin/caddy ]]; then echo /usr/local/bin/caddy; return 0; fi
-  if command -v caddy >/dev/null 2>&1; then command -v caddy; return 0; fi
-  # shellcheck source=lib/versions.sh
-  source "$root/lib/versions.sh" 2>/dev/null || return 1
-  case "$(dpkg --print-architecture 2>/dev/null)" in amd64) arch=amd64;; arm64) arch=arm64;; *) return 1;; esac
-  url="https://github.com/caddyserver/caddy/releases/download/${CADDY_VER}/caddy_${CADDY_VER#v}_linux_${arch}.tar.gz"
-  curl -fsSL --max-time 120 -o "$wd/caddy.tgz" "$url" 2>/dev/null || return 1
-  pdg_verify_sha256 "$wd/caddy.tgz" "${PDG_SHA256[caddy-$arch]:-}" "caddy $CADDY_VER" >/dev/null 2>&1 || return 1
-  tar -xzf "$wd/caddy.tgz" -C "$wd" caddy 2>/dev/null || return 1
-  chmod +x "$wd/caddy"; echo "$wd/caddy"
+  local root="$1" wd="$2"
+  # shellcheck source=tests/caddy-fixture.sh
+  source "$root/tests/caddy-fixture.sh" || { echo "lan-fixture: 读不到 tests/caddy-fixture.sh" >&2; return 1; }
+  pdg_test_caddy "$root" "$wd"
 }

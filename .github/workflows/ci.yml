@@ -52,8 +52,19 @@ jobs:
           # mihomo 走同一条路、同一个 artifact: E2E 的夹具需要**真钉死版**内核(shell 桩
           # 自报版本对、内容不对, 会被 install.sh 的短路与 doctor 判据正确地拒掉)。
           # 放在这个 job 里 = 每 run 每架构仍然只取一次件, 消费者一律靠 artifact。
-          PDG_TEST_BIN_DIR="$PWD/artifact-mihomo" bash tests/prepare-mihomo.sh >/dev/null
+          # 同一次取件顺手把**校验过的官方归档**原样留进 release-mirror/: 升级类 E2E 的「桥接→本版」一跳里,
+          # 本版的 _update_core_binary 要的就是这个 .gz(它自己核归档 SHA、解压、再核二进制 SHA)。
+          PDG_TEST_BIN_DIR="$PWD/artifact-mihomo" PDG_TEST_MIRROR_DIR="$PWD/artifact/release-mirror" \
+            bash tests/prepare-mihomo.sh >/dev/null
           cp "$PWD/artifact-mihomo/mihomo" artifact/mihomo
+          # 「旧版→桥接」一跳: 冻结桥接钉 mihomo v1.19.30(夹具预装的是现钉值), 桥接自己的换核会去取它。
+          # 冻结桥接不能改, 所以这份归档也由这里每 run 取一次, E2E 经离线镜像离线供给(tests/e2e-lib.sh)。
+          # 钉值在 tests/legacy-pins.sh(抄自冻结桥接对象, tests/test-bridge-mihomo-pins.sh 逐字核对)。
+          PDG_TEST_MIRROR_DIR="$PWD/artifact/release-mirror" bash tests/prepare-mihomo-bridge.sh >/dev/null
+          # 内网面板那几支要真 Caddy。以前它们在测试里现场 curl GitHub(九格负控每格一次), run 42482967890
+          # 里三格没拿到, lint 串行链断在那里。官方归档原样进 artifact, 消费者自己核归档 SHA 再解。
+          PDG_TEST_CADDY_DIR="$PWD/artifact-caddy" PDG_TEST_CADDY_ARCHIVE_DIR="$PWD/artifact" \
+            bash tests/prepare-caddy.sh >/dev/null
           # 跨版本换核 E2E 的**旧版**起点(v5.3.3)。同样走这一个 job、同一个 artifact: 全 run 对
           # 上游只取这一次件, 消费者一律离线。钉值在 tests/legacy-pins.sh, 不进生产 lib/versions.sh。
           PDG_TEST_LEGACY_DIR="$PWD/artifact-legacy" bash tests/prepare-mosdns-legacy.sh >/dev/null
@@ -101,6 +112,48 @@ jobs:
           m["legacy_mosdns_evidence"]="exact-tag+exact-asset+computed-sha+self-version; upstream release predates asset digest"
           json.dump(m,open("artifact/manifest.json","w"))' \
             "$PDG_LEGACY_MOSDNS_VER" "${PDG_LEGACY_SHA256[mosdns-$ARCH]}" "$LG_GOT" "$LG_VER"
+          # caddy: 归档 SHA 对 lib/versions.sh 钉值 + 解包产物自报版本; 记下解包产物摘要供消费者对账。
+          CA="artifact/caddy_${CADDY_VER#v}_linux_${ARCH}.tar.gz"
+          CA_GOT="$(sha256sum "$CA" | awk '{print $1}')"
+          [ "$CA_GOT" = "${PDG_SHA256[caddy-$ARCH]}" ] || { echo "caddy 归档 SHA256 不符: $CA_GOT"; exit 1; }
+          CB_GOT="$(sha256sum artifact-caddy/caddy | awk '{print $1}')"
+          CV="$(artifact-caddy/caddy version 2>/dev/null | head -1 | awk '{print $1}')"
+          [ "$CV" = "$CADDY_VER" ] || { echo "caddy 自报版本不符: [$CV] != [$CADDY_VER]"; exit 1; }
+          # 离线镜像: 两份 mihomo 归档各按各的钉值核(现钉值读 lib/versions.sh, 桥接读 tests/legacy-pins.sh):
+          # 归档 SHA → 解压产物 SHA → 自报版本。成功时打印"归档摘要 解压产物摘要"给 manifest。
+          mirror_check(){
+            local f="artifact/release-mirror/mihomo-linux-$ARCH-$1.gz" a b v
+            a="$(sha256sum "$f" | awk '{print $1}')"
+            [ "$a" = "$2" ] || { echo "离线镜像归档 SHA256 不符: $f ($a)" >&2; return 1; }
+            gunzip -c "$f" > /tmp/mirror-probe
+            b="$(sha256sum /tmp/mirror-probe | awk '{print $1}')"
+            [ "$b" = "$3" ] || { echo "离线镜像解压产物 SHA256 不符: $f ($b)" >&2; return 1; }
+            chmod 755 /tmp/mirror-probe
+            v="$(/tmp/mirror-probe -v 2>/dev/null | head -1 | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+            rm -f /tmp/mirror-probe
+            [ "$v" = "$1" ] || { echo "离线镜像自报版本不符: $f [$v] != [$1]" >&2; return 1; }
+            echo "$a $b"
+          }
+          MR_CUR="$(mirror_check "$MIHOMO_VER" "${PDG_SHA256[mihomo-$ARCH]}" "${PDG_SHA256[mihomo-bin-$ARCH]}")"
+          MR_BRG="$(mirror_check "$PDG_BRIDGE_MIHOMO_VER" "${PDG_LEGACY_SHA256[mihomo-bridge-$ARCH]}" \
+                                 "${PDG_LEGACY_SHA256[mihomo-bridge-bin-$ARCH]}")"
+          python3 -c 'import json,sys
+          m=json.load(open("artifact/manifest.json"))
+          m["caddy_version"]=sys.argv[1]
+          m["caddy_archive_sha256"]=sys.argv[2]
+          m["caddy_binary_sha256"]=sys.argv[3]
+          m["caddy_source_release"]="https://github.com/caddyserver/caddy/releases/tag/"+sys.argv[1]
+          rm={}
+          for spec in sys.argv[4:]:
+              name,ver,sums,src=spec.split("|")
+              a,b=sums.split()
+              rm[name]={"version":ver,"archive_sha256":a,"binary_sha256":b,"pin_source":src,
+                        "source_release":"https://github.com/MetaCubeX/mihomo/releases/tag/"+ver}
+          m["release_mirror"]=rm
+          json.dump(m,open("artifact/manifest.json","w"))' \
+            "$CADDY_VER" "$CA_GOT" "$CB_GOT" \
+            "mihomo-linux-$ARCH-$MIHOMO_VER.gz|$MIHOMO_VER|$MR_CUR|lib/versions.sh" \
+            "mihomo-linux-$ARCH-$PDG_BRIDGE_MIHOMO_VER.gz|$PDG_BRIDGE_MIHOMO_VER|$MR_BRG|tests/legacy-pins.sh (frozen bridge $PDG_BRIDGE_PIN_COMMIT)"
           cat artifact/manifest.json
       - uses: actions/upload-artifact@v7
         with:
@@ -173,6 +226,13 @@ jobs:
           set -euo pipefail
           mkdir -p tests/.bin
           bash tests/install-mihomo-artifact.sh /tmp/mosdns-fixture "" "$PWD/tests/.bin/mihomo"
+      # 内网面板那几支要**真 Caddy**(Location 改写实测 / 回滚收敛 / 其九格负控)。以前它们在测试过程中
+      # 现场 curl GitHub, 负控每格重下一次; run 42482967890 里 ④⑤⑨ 三格没拿到, 整条串行链断在那里。
+      # 现在与内核同路: 取件 job 每 run 取一次官方归档, 这里自己复核后装到 tests/.bin/caddy ——
+      # tests/caddy-fixture.sh 在严格模式下只认这一份, 不认 runner 上偶然的 caddy, 也不现场下载。
+      # 和上面两步一样**必须排在所有用例之前**。
+      - name: "校验并安装钉定 caddy 到 tests/.bin (自算归档 SHA / manifest 交叉 / 解包产物对账 / 自报版本)"
+        run: bash tests/install-caddy-artifact.sh /tmp/mosdns-fixture "" "$PWD/tests/.bin/caddy"
 
 
 
@@ -579,6 +639,16 @@ jobs:
 
       - name: "mosdns artifact 往返 (两个消费者各自四层复核 / 改一字节与改 manifest 均硬失败 / 消费者不联网)"
         run: bash tests/test-mosdns-artifact-roundtrip.sh
+
+      # 下面三支吃的是本 job 开头下载的同一份 artifact(/tmp/mosdns-fixture), 不联网。
+      - name: "caddy / 离线镜像 artifact 往返 (两个消费者各自复核 / 坏件与改 manifest 均硬失败不落盘 / 不联网 / 严格模式解析器缺件具名失败且不 curl / 取件入口留下 curl 原始报错)"
+        run: bash tests/test-fixture-artifact-roundtrip.sh /tmp/mosdns-fixture
+
+      - name: "升级类 E2E 离线镜像夹具 (按本版与冻结桥接各自的钉值核件 / 精确资产 URL 本地供件 / 未预置 22 且不联网兜底 / 拿掉预置时就位即具名失败)"
+        run: bash tests/test-e2e-release-mirror.sh /tmp/mosdns-fixture
+
+      - name: "桥接一跳的 mihomo 钉值 (tests/legacy-pins.sh 逐字等于冻结桥接对象 / 两支 E2E 的默认桥接身份一致 / 三格负控)"
+        run: bash tests/test-bridge-mihomo-pins.sh
 
       - name: "全局锁继承八格 (父锁复用/独立取锁/BUSY/环境变量伪造/错文件/inode 变更/并发/释放)"
         run: bash tests/test-lock-inherit.sh
@@ -1376,6 +1446,12 @@ jobs:
         # 这三个 job 跑在 debian:12 容器里(本来就是 root, 镜像里没有 sudo) —— 与同 job
         # 既有的 mosdns 安装步写法保持一致, 不能照抄 lint/functional 那种宿主机上的 sudo -E。
         run: bash tests/install-mihomo-artifact.sh /tmp/mosdns-fixture
+      # 升级类 E2E(e2e-upgrade-from-release / e2e-rescue-migration-lock)两跳里的换核要官方 mihomo 归档:
+      # 冻结桥接钉的 v1.19.30 与现钉值各一份。以前被测代码每次现场 curl GitHub, 下载失败时 hop1 以
+      # 「内核收敛: 按本次前像恢复 mihomo」回滚。现在由取件 job 每 run 取一次, 这里自己复核后放进
+      # tests/.bin/release-mirror; 夹具(e2e_release_mirror)再按各自的钉值核一遍, 本地供件、不联网。
+      - name: "校验并放置升级类 E2E 的离线镜像 (两份 mihomo 官方归档: 自算 SHA / manifest 交叉 / 解压产物 / 自报版本)"
+        run: bash tests/install-release-mirror-artifact.sh /tmp/mosdns-fixture
       - name: "跑 ${{ matrix.script }}"
         env: { PDG_E2E_ISOLATED: "1" }
         run: bash tests/${{ matrix.script }}
@@ -1764,6 +1840,12 @@ jobs:
         # 这三个 job 跑在 debian:12 容器里(本来就是 root, 镜像里没有 sudo) —— 与同 job
         # 既有的 mosdns 安装步写法保持一致, 不能照抄 lint/functional 那种宿主机上的 sudo -E。
         run: bash tests/install-mihomo-artifact.sh /tmp/mosdns-fixture
+      # 升级类 E2E(e2e-upgrade-from-release / e2e-rescue-migration-lock)两跳里的换核要官方 mihomo 归档:
+      # 冻结桥接钉的 v1.19.30 与现钉值各一份。以前被测代码每次现场 curl GitHub, 下载失败时 hop1 以
+      # 「内核收敛: 按本次前像恢复 mihomo」回滚。现在由取件 job 每 run 取一次, 这里自己复核后放进
+      # tests/.bin/release-mirror; 夹具(e2e_release_mirror)再按各自的钉值核一遍, 本地供件、不联网。
+      - name: "校验并放置升级类 E2E 的离线镜像 (两份 mihomo 官方归档: 自算 SHA / manifest 交叉 / 解压产物 / 自报版本)"
+        run: bash tests/install-release-mirror-artifact.sh /tmp/mosdns-fixture
       - name: "跑 e2e-rescue-migration-lock.sh (iOS)"
         env:
           PDG_E2E_ISOLATED: "1"
@@ -1812,6 +1894,12 @@ jobs:
         # 这三个 job 跑在 debian:12 容器里(本来就是 root, 镜像里没有 sudo) —— 与同 job
         # 既有的 mosdns 安装步写法保持一致, 不能照抄 lint/functional 那种宿主机上的 sudo -E。
         run: bash tests/install-mihomo-artifact.sh /tmp/mosdns-fixture
+      # 升级类 E2E(e2e-upgrade-from-release / e2e-rescue-migration-lock)两跳里的换核要官方 mihomo 归档:
+      # 冻结桥接钉的 v1.19.30 与现钉值各一份。以前被测代码每次现场 curl GitHub, 下载失败时 hop1 以
+      # 「内核收敛: 按本次前像恢复 mihomo」回滚。现在由取件 job 每 run 取一次, 这里自己复核后放进
+      # tests/.bin/release-mirror; 夹具(e2e_release_mirror)再按各自的钉值核一遍, 本地供件、不联网。
+      - name: "校验并放置升级类 E2E 的离线镜像 (两份 mihomo 官方归档: 自算 SHA / manifest 交叉 / 解压产物 / 自报版本)"
+        run: bash tests/install-release-mirror-artifact.sh /tmp/mosdns-fixture
       - name: "E2E 串行 hermetic (同一容器里按原顺序连着跑, 每个都必须全绿)"
         env:
           PDG_E2E_ISOLATED: "1"

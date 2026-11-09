@@ -2,6 +2,30 @@
 
 本项目按语义化 `v1.x` tag 正式发布;以下按版本/日期记录主要变化,完整提交见 git 历史。
 
+## 未发布
+
+- 测试 / CI: 两类测试不再在测试过程中用未认证 curl 现场从 GitHub 下载二进制, 改由 CI 的取件 job
+  (每 run 每架构只取一次)经 artifact 供件, 消费者离线、自己复核。2026-11-08 GitHub 未认证请求超时那天,
+  这两处让 CI 随机变红, 与被测改动无关:
+  - 内网面板那几支真 Caddy 测试(Location 改写实测、回滚收敛及其九格负控): 以前每次调用都现场下 caddy,
+    负控每格一次; run 42482967890 里三格没拿到, lint 串行链断在那里, 而 curl 的报错被丢掉、首因无从判断。
+    现在取件 job 取一次官方归档, lint 用 `tests/install-caddy-artifact.sh` 自己核归档 SHA256、manifest、
+    解包产物与自报版本后装到 `tests/.bin/caddy`; 测试侧统一走 `tests/caddy-fixture.sh`, 严格模式(CI)下
+    只认这一份、拿不到就具名失败, 不认 runner 上偶然存在的 caddy, 也不现场下载。开发机仍可退到唯一取件入口
+    `tests/prepare-caddy.sh`, 它把 curl 的原始报错与退出码留在输出里。
+  - 升级类 E2E(`e2e-upgrade-from-release` / `e2e-rescue-migration-lock`, 含 iOS 变体)的两跳换核:
+    冻结桥接钉 mihomo v1.19.30、夹具预装的是现钉值, 于是「旧版→桥接」一跳里桥接自己去下 v1.19.30,
+    「桥接→本版」一跳再下回现钉值; 下载失败时 hop1 以「内核收敛: 按本次前像恢复 mihomo」回滚。冻结桥接不改:
+    取件 job 把两份官方归档(现钉值那份随同一次取件留下, v1.19.30 用 `tests/prepare-mihomo-bridge.sh` 取)放进
+    artifact, E2E job 用 `tests/install-release-mirror-artifact.sh` 复核, 夹具 `e2e_release_mirror` 再按
+    本版与冻结桥接对象各自的 `lib/versions.sh` 核一遍, 由 PATH 前置的 curl 壳只对精确资产 URL 本地供件;
+    未预置的 mihomo 资产以 22 具名失败, 不联网兜底。被测代码照常自己做归档 SHA → 解压 → 二进制 SHA → 换核。
+    v1.19.30 的钉值放在 `tests/legacy-pins.sh`(抄自冻结桥接对象, `tests/test-bridge-mihomo-pins.sh` 逐字核对)。
+  - CI 取件拓扑守卫 `tests/test-ci-mosdns-topology.py` 扩到 caddy 与离线镜像: 只有取件 job 去官方取件
+    (取件入口脚本 / Release 资产 URL 都算)、要件的 job 在用例之前复核、消费者脚本不联网不 SKIP、
+    解析器严格出口排在取件之前、两支 E2E 在第一次调入口之前把镜像立起来。新增三支 lint 测试:
+    `test-fixture-artifact-roundtrip.sh`、`test-e2e-release-mirror.sh`、`test-bridge-mihomo-pins.sh`。
+
 ## 2026-11-06 — v1.12.2(每台机器可以让 mihomo 内核直接跟上游, 不用等项目发版; 默认不变)
 
 本版加了一个**每台机器自己选、默认关闭**的功能: mihomo 内核可以从「跟发布」切到「跟上游」。
