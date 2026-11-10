@@ -8,7 +8,8 @@
   2. :81 探测端点: probe81.py 一直返回 **200**(iOS 的 URLStringProbe 只认 200), 而 unit
      描述和实战记录里写成 204 —— 有人照着去"修正"实现就把探测搞挂了。
   3. 端口清单: 写死一串全平台端口, 于是 iOS 机器上 doctor 声称 GMS 5228-5230 已就位
-     (那段装机就剥掉了), Android 上又提 :81(它根本不装 pdg-probe81)。
+     (那段装机就剥掉了)。:81 当初也按"仅 iOS"写; 6.1B 起 pdg-probe81 是两平台公共件
+     (install.sh 无条件装, nft 模板对内网卡段放行 81 无平台分叉), 文档再写"Android 不装"就是错的。
 """
 import re
 import sys
@@ -97,13 +98,34 @@ if "def platform_ports_text(" not in checks:
 ok("doctor 的端口清单由 platform_ports_text() 按平台生成")
 
 install_md = text("docs/INSTALL.md")
-for port, tag in (("| 81 |", "仅 iOS"), ("| 5228-5230 |", "仅 Android")):
+
+
+def port_row(port):
     row = next((ln for ln in install_md.splitlines() if ln.startswith(port)), "")
     if not row:
         bad(f"INSTALL.md 端口表里找不到 {port}")
-    if tag not in row:
-        bad(f"INSTALL.md 里 {port} 没标注「{tag}」: {row}")
-ok("INSTALL.md 端口表标注了 :81 仅 iOS / 5228-5230 仅 Android")
+    return row
+
+
+row = port_row("| 5228-5230 |")
+if "仅 Android" not in row:
+    bad(f"INSTALL.md 里 | 5228-5230 | 没标注「仅 Android」: {row}")
+row = port_row("| 81 |")
+if "两平台" not in row:
+    bad(f"INSTALL.md 里 | 81 | 没标注「两平台」(pdg-probe81 是公共件): {row}")
+for wrong in ("仅 iOS", "仅 Android", "不安装"):
+    if wrong in row:
+        bad(f"INSTALL.md 里 | 81 | 还写着「{wrong}」—— pdg-probe81 两平台都装: {row}")
+ok("INSTALL.md 端口表标注了 :81 两平台 / 5228-5230 仅 Android")
+
+# README 第 5 节同一件事: 不许再说哪个平台不装 pdg-probe81, 且要写明两个平台都装
+_probe_lines = [ln for ln in readme.splitlines() if "probe81" in ln]
+for ln in _probe_lines:
+    if re.search(r"不安装|不装|仅 iOS|仅 Android", ln):
+        bad(f"README 里 pdg-probe81 仍被说成某平台专属: {ln.strip()[:70]}")
+if not any("两个平台都装" in ln for ln in _probe_lines):
+    bad("README 没写明 pdg-probe81 两个平台都装")
+ok("README 写明 pdg-probe81 两个平台都装")
 
 # 8445 是两平台共用的 Telegram SOCKS5 —— 不许被标成某个平台专属
 if "8445" not in checks:

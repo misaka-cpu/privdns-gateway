@@ -70,9 +70,11 @@ sudo ./install.sh
 
 一台网关对应一个手机号，平台装机时确定（`PDG_PLATFORM=ios` 或 `android`；不指定则安装时询问），之后可以切换（见本节末尾）。平台决定客户端接入方式和是否提供 iOS 专属功能：
 
-- Android：手机在系统「私密 DNS」里直接填 DoT 域名。不安装 iOS 描述文件与 pdg-probe81。
-- iOS：通过 iOS 描述文件接入，另外安装 pdg-probe81（`:81` 探测）。
+- Android：手机在系统「私密 DNS」里直接填 DoT 域名。不安装 iOS 描述文件。
+- iOS：通过 iOS 描述文件接入。
   （MITM/WLOC 组件已退役，两个平台都不再安装 —— 见第 10 节。）
+
+pdg-probe81（`:81`，只对内网卡段放行）两个平台都装：iOS 的描述文件用它做 OnDemand 探测；两个平台的链路诊断都经它建立 HTTP 会话。
 
 换手机时（比如 SIM 卡从 Android 手机换到了 iPhone）可以切平台：Bot「🛠 运维 → 📱 手机平台」点一下，二次确认后在后台切换，结果单独发一条 Telegram；或在服务器上 `sudo pdg platform ios`（`android`）。切换前先做快照，部署 / 清理平台组件、防火墙（GMS 5228–5230）、内核配置任一步失败都整体还原到原平台。切到 iOS 后去「📱 客户端 → iOS 描述文件」生成描述文件；换了手机后建议 `sudo pdg detect-cidr` 核一下内网卡段。
 
