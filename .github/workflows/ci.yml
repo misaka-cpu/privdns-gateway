@@ -376,6 +376,12 @@ jobs:
       - name: "Telegram「🧬 内核」页: 闭集回调 / 回调不带版本号 / 按模式出按钮 / 换核走 systemd-run 交给 CLI"
         run: python3 tests/test-bot-kernel-page.py
 
+      - name: "Telegram「📱 手机平台」页: 闭集回调 / 按当前平台出按钮 / 二次确认 / 点确认时再核平台 / 切换走 systemd-run 交给 CLI"
+        run: python3 tests/test-bot-platform-page.py
+
+      - name: "pdg platform --notify: 每种结局恰发一条 Telegram(含拿不到锁的 EXIT 补发) / 原因转义 / 派发行只在带 --notify 时分流"
+        run: bash tests/test-platform-notify.sh
+
       - name: "去广告写入口并发闭包: 五个写命令共用全局锁 / 锁忙零副作用 / status 严格只读"
         run: bash tests/test-adblock-lock-closure.sh
 

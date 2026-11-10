@@ -455,7 +455,8 @@ def _nav(key):
             [{"text": "🔄 重启服务", "callback_data": "restart"}, {"text": "📦 更新规则库", "callback_data": "updgeo"}],
             [{"text": "💾 备份", "callback_data": "backup"}, {"text": "♻️ 恢复", "callback_data": "restore"}],
             [{"text": "🌐 DNS 上游", "callback_data": "dnsup"}, {"text": "🚀 TFO", "callback_data": "tfo"}],
-            [{"text": "📊 观测面板", "callback_data": "panel"}, {"text": "🧬 内核", "callback_data": "krn"}]]),
+            [{"text": "📊 观测面板", "callback_data": "panel"}, {"text": "🧬 内核", "callback_data": "krn"}],
+            [{"text": "📱 手机平台", "callback_data": "plat"}]]),
     }
     if os.path.exists(LAN_TABLE_FILE):                # 配过内网面板才显示(没配的人不该多一个看不懂的按钮)
         subs["ops"][1].append([{"text": "🏠 内网面板", "callback_data": "nav:lan"}])
@@ -664,13 +665,18 @@ def _platform():
         pass
     return "android"
 
+def _platform_guessed():
+    """平台标记是推测出来的(platform.guessed 在), 没人确认过。"""
+    return os.path.exists("/etc/privdns-gateway/platform.guessed")
+
 def _platform_unconfirmed():
     """平台标记是**推测**出来的(老装 v1.4.x 升上来且没有确凿证据)时的补充说明。
     推测态下不能断言"本机为 Android" —— 没人确认过。v1.4.2 的 iPhone 用户升级后落到这里,
     看到一句干巴巴的"仅 iOS 可用(本机为 Android)"会以为描述文件功能没了, 而其实只差一条确认命令。"""
     if _platform() != "ios" and os.path.exists("/etc/privdns-gateway/platform.guessed"):
         return ("\n⚠️ 这个 android 是**推测**的(老装升级时无确凿证据), 没人确认过。"
-                "\n若本网关服务的是 iPhone, 在服务器执行 sudo pdg platform ios 即可恢复 iOS 功能。")
+                "\n若本网关服务的是 iPhone, 在「🛠 运维 → 📱 手机平台」里确认 iOS, "
+                "或在服务器执行 sudo pdg platform ios, 即可恢复 iOS 功能。")
     return ""
 
 def _ios_only(chat, mid=None):
@@ -2951,6 +2957,69 @@ def _kernel_page_bg(chat, mid, note=""):
     edit(chat, mid, (note + "\n\n" if note else "") + "🧬 查询内核状态(含上游最新版, 几秒)…", OPS_BACK)
     run_bg(chat, go)
 
+# ── 手机平台(「📱 手机平台」页): 只调 `pdg platform`, 切换本身全在 CLI ─────────────────────
+# 快照、部署 / 清理平台组件、防火墙(GMS 5228–5230)、重渲内核、校验、失败整体还原, 都是 cmd_platform
+# 那一份实现; bot 只出页面、二次确认, 然后用 systemd-run 在后台跑 `pdg platform <目标> --notify`,
+# 结果由 CLI 自己发 Telegram(切换中 pdg-bot 可能被重启, 不能指望 bot 自己回报)。
+# 回调是闭集: plat(页) / plat_ios / plat_android / plat_ios_ok / plat_android_ok。
+# 目标平台写在回调名里(只有两个值, 不收任意参数)。点「确认」那一刻再读一次本机平台: 已经是目标平台
+# (另一条消息或 CLI 刚切过)就不再切 —— 旧消息上的按钮不能让机器来回切。平台是推测出来的
+# (platform.guessed)时例外: 那时按当前平台再确认一次, 正是要做的事。
+PLAT_NAME = {"ios": "iOS", "android": "Android"}
+PLAT_BACK = {"inline_keyboard": [[{"text": "⬅️ 返回手机平台", "callback_data": "plat"}],
+                                 [{"text": "⬅️ 返回运维", "callback_data": "nav:ops"}]]}
+
+
+def platform_page():
+    cur, guessed = _platform(), _platform_guessed()
+    lines = ["📱 <b>手机平台</b>",
+             "当前: <b>%s</b>%s" % (PLAT_NAME.get(cur, cur), "(⚠️ 推测值, 没人确认过)" if guessed else ""),
+             "",
+             "平台决定网关为哪种手机准备组件: iOS 用描述文件接入 DoT; Android 用私密 DNS, "
+             "防火墙另外放行 GMS 推送端口 5228–5230。",
+             "切换先做快照, 中途任一步失败都整体还原到原平台; 切换时代理会断几秒到几十秒。"]
+    if guessed:
+        lines.append("这个平台是升级时推测的: 点下面对应的那一项确认一次(确认也是跑一遍 pdg platform)。")
+    rows = []
+    if cur != "ios" or guessed:
+        rows.append([{"text": "✅ 确认是 iOS" if cur == "ios" else "🔁 切到 iOS", "callback_data": "plat_ios"}])
+    if cur != "android" or guessed:
+        rows.append([{"text": "✅ 确认是 Android" if cur == "android" else "🔁 切到 Android",
+                      "callback_data": "plat_android"}])
+    rows.append([{"text": "⬅️ 返回运维", "callback_data": "nav:ops"}])
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def _platform_stale(target):
+    """点的那一刻本机已经是 target(且不是推测值)→ 这条消息上的按钮已过期, 不再切。"""
+    return _platform() == target and not _platform_guessed()
+
+
+def _platform_confirm(target):
+    name = PLAT_NAME[target]
+    if target == "ios":
+        what = ("装上 iOS 组件(描述文件模板等), 去掉 GMS 5228–5230 的放行。"
+                "切完到「📱 客户端接入 → 📱 iOS 描述文件」生成描述文件装到 iPhone 上。")
+    else:
+        what = ("清掉 iOS 组件(描述文件模板等; iOS 描述文件功能随之停用), 加回 GMS 5228–5230 的放行。"
+                "切完在 Android 手机上把「私密 DNS」设成「📱 客户端接入」里给的主机名。")
+    text = ("🔁 <b>切到 %s</b>\n\n会在后台跑 <code>sudo pdg platform %s</code>: 先快照, 再%s\n\n"
+            "中途任一步失败都整体还原到原平台。切换时代理会断几秒到几十秒, bot 也可能短暂无响应; "
+            "结果会单独发一条消息。" % (name, target, what))
+    ok_cb = "plat_ios_ok" if target == "ios" else "plat_android_ok"
+    return text, {"inline_keyboard": [[{"text": "✅ 确认切换", "callback_data": ok_cb}],
+                                      [{"text": "⬅️ 取消", "callback_data": "plat"}]]}
+
+
+def start_platform_job(target):
+    """平台切换在独立的 systemd 瞬时单元里跑(同 start_kernel_job), 结果由 CLI 自己发 Telegram。"""
+    try:
+        r = subprocess.run(["systemd-run", "--collect", PDG_CLI, "platform", target, "--notify"],
+                           capture_output=True, text=True, timeout=15)
+        return r.returncode == 0
+    except Exception:  # noqa: BLE001
+        return False
+
 # ── 规则集派生的劫持表 ────────────────────────────────────────────────────────
 # 为什么需要它: 规则集只写 mihomo 那一侧(rule-providers + RULE-SET 规则), 而流量能不能到
 # mihomo 由 mosdns 决定。all 模式下"不是国内就劫持"顺带把规则集的域名兜住了, 看不出问题;
@@ -4915,6 +4984,21 @@ def _handle_cb_inner(chat, mid, data, uid=None):
                                                        if data == "krn_auto_on" else "关闭。"))
                         if r.returncode == 0
                         else "❌ 设置失败: " + _esc(((r.stdout or "") + (r.stderr or "")).strip()[-300:])); return
+    if data == "plat":
+        text, kb = platform_page(); edit(chat, mid, text, kb); return
+    if data in ("plat_ios", "plat_android"):
+        target = data[len("plat_"):]
+        if _platform_stale(target):
+            edit(chat, mid, "ℹ️ 现在已经是 %s 平台, 不用再切。" % PLAT_NAME[target], PLAT_BACK); return
+        text, kb = _platform_confirm(target); edit(chat, mid, text, kb); return
+    if data in ("plat_ios_ok", "plat_android_ok"):
+        target = data[len("plat_"):-len("_ok")]
+        if _platform_stale(target):
+            edit(chat, mid, "ℹ️ 现在已经是 %s 平台, 没有再切。" % PLAT_NAME[target], PLAT_BACK); return
+        ok = start_platform_job(target)
+        edit(chat, mid, ("🚀 已在后台切换到 %s, 结果会单独发一条消息(一般半分钟到两分钟; 期间 bot 可能短暂无响应)。"
+                         % PLAT_NAME[target]) if ok
+             else "❌ 启动平台切换失败, 请在终端跑 sudo pdg platform %s。" % target, PLAT_BACK); return
     if data == "traffic":
         edit(chat, mid, traffic_text(), BACK); return
     if data == "lan_list":

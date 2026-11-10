@@ -8489,6 +8489,82 @@ cmd_platform(){
   return 0
 }
 
+# pdg platform <ios|android> --notify: bot「📱 手机平台」页点的后台任务(systemd-run 起的瞬时单元)。
+# 切换本身仍是上面 cmd_platform 那一份实现, 这里一个字没动它; 只收它的输出, 按退出码和它自己打出的
+# 结论行拼一条 Telegram。后台任务只有 Telegram 这一个出口能告诉用户结果, 所以每种结局都发一条:
+#   成功 / 失败(已还原、没动过、或还原没做完)/ 没做完(_lock 拿不到锁直接 exit、need_root 不过、
+#   或中途意外退出 —— 这几种走不到函数末尾, 由 EXIT trap 补发)。同一次只发一条。
+# PF_OUT: 收输出之前另存一份原来的标准输出。exit 发生在 cmd_platform 里面时(拿不到锁), 跑 EXIT trap
+# 那一刻 fd 1 还指着临时日志 —— 往 fd 1 cat 等于把日志写回它自己, 那次的输出就丢了。
+# 替换串加引号: bash 5.2 默认开 patsub_replacement, 不加引号时替换串里的 & 是"匹配到的原文"。
+PF_NOTIFIED=0; PF_LOG=""; PF_OUT=1
+_platform_name(){ case "$1" in ios) echo iOS;; android) echo Android;; *) echo "$1";; esac; }
+_platform_html(){ local s="$1"; s="${s//&/"&amp;"}"; s="${s//</"&lt;"}"; s="${s//>/"&gt;"}"; printf '%s' "$s"; }
+_platform_note(){ _kf notify "$1" >/dev/null 2>&1; PF_NOTIFIED=1; }
+_platform_exit_notify(){
+  if [[ "$PF_NOTIFIED" != 1 ]]; then
+    [[ -n "$PF_LOG" && -s "$PF_LOG" ]] && cat "$PF_LOG" >&"$PF_OUT"   # 输出照样留进 journal
+    _platform_note "⚠️ <b>$(_kernel_host)</b> 平台切换没有做完: 已有别的 pdg 操作在运行, 或中途退出了。现在是哪个平台以 sudo pdg status 为准。"
+  fi
+  [[ -n "$PF_LOG" ]] && rm -f "$PF_LOG"
+  return 0
+}
+# 局部变量一律带 _pf_ 前缀: bash 的 local 是动态作用域, cmd_platform 往下调用的函数若给 rc / h 这类
+# 通用名赋值又没声明 local, 改到的就是这里的变量 —— 一次成功的切换会被报成失败。
+_platform_notify_run(){
+  local _pf_a _pf_p="" _pf_cur _pf_h _pf_rc=0 _pf_plain="" _pf_why _pf_doc _pf_next _pf_restored
+  for _pf_a in "$@"; do
+    case "$_pf_a" in
+      --notify) ;;
+      ios|android) _pf_p="$_pf_a";;
+      *) _pf_p=""; break;;
+    esac
+  done
+  _pf_h="<b>$(_kernel_host)</b>"
+  trap _platform_exit_notify EXIT                 # 在 cmd_platform 取锁之前挂上(同 pdg kernel 的后台任务)
+  if [[ -z "$_pf_p" ]]; then
+    cmd_platform; _platform_note "❌ $_pf_h 平台切换没有开始: 参数不对(只认 ios / android)。"; return 2
+  fi
+  _pf_cur="$(_pdg_platform)"
+  PF_LOG="$(mktemp 2>/dev/null)" || PF_LOG=""
+  exec {PF_OUT}>&1
+  if [[ -n "$PF_LOG" ]]; then
+    cmd_platform "$_pf_p" > "$PF_LOG" 2>&1 || _pf_rc=$?
+    cat "$PF_LOG"
+    _pf_plain="$(sed "s/$(printf '\033')\[[0-9;]*m//g" "$PF_LOG")"
+  else
+    cmd_platform "$_pf_p" || _pf_rc=$?
+  fi
+  if (( _pf_rc == 0 )); then
+    _pf_doc="$(grep -oE '\([0-9]+ 失败 / [0-9]+ 警告\)' <<<"$_pf_plain" | tail -1)"
+    if [[ "$_pf_doc" == "(0 失败 / 0 警告)" ]]; then _pf_doc=" 切换后自检全部正常。"
+    elif [[ -n "$_pf_doc" ]]; then _pf_doc=" ⚠️ 切换后自检 ${_pf_doc//[()]/}, 点「🩺 自检」看。"
+    elif grep -q '自检有未通过项' <<<"$_pf_plain"; then _pf_doc=" ⚠️ 切换后自检有未通过项, 点「🩺 自检」看。"
+    else _pf_doc=""; fi
+    if [[ "$_pf_p" == ios ]]; then
+      _pf_next="下一步: bot「📱 客户端接入 → 📱 iOS 描述文件」生成并装到 iPhone 上。"
+    else
+      _pf_next="下一步: 在 Android 手机上把「私密 DNS」设成「📱 客户端接入」里给的主机名。"
+    fi
+    _platform_note "✅ $_pf_h 手机平台已切到 <b>$(_platform_name "$_pf_p")</b>(原 $(_platform_name "$_pf_cur"))。$_pf_next 手机接上后建议在服务器跑 <code>sudo pdg detect-cidr</code> 核一下内网卡段。$_pf_doc"
+    return 0
+  fi
+  _pf_why="$(grep -m1 '❌' <<<"$_pf_plain")"; _pf_why="${_pf_why#"${_pf_why%%[![:space:]]*}"}"
+  [[ -n "$_pf_why" ]] || _pf_why="(没有打出原因, 见 journalctl)"
+  (( ${#_pf_why} > 300 )) && _pf_why="${_pf_why:0:300}…"
+  if grep -qE '已恢复到原平台|已按本次快照恢复到切换前' <<<"$_pf_plain"; then
+    _pf_restored="已恢复到原平台 $(_platform_name "$_pf_cur")。"
+  elif grep -qE '恢复未完成|没有确认恢复' <<<"$_pf_plain"; then
+    _pf_restored="⚠️ 还原没做完 —— 到服务器上跑 sudo pdg status 与 sudo pdg doctor 看; 本次快照仍在。"
+  elif grep -q '未改动任何东西' <<<"$_pf_plain"; then
+    _pf_restored="没有改动任何东西, 仍是 $(_platform_name "$_pf_cur")。"
+  else
+    _pf_restored="现在是哪个平台以 sudo pdg status 为准。"
+  fi
+  _platform_note "❌ $_pf_h 手机平台切到 $(_platform_name "$_pf_p") 没成: $(_platform_html "$_pf_why") $_pf_restored"
+  return "$_pf_rc"
+}
+
 # SIM/APN 链路诊断。6.1A 只有 `status` 一个子命令: **服务器准备状态**, 纯只读。
 #
 # 它不取全局配置写锁, 也不开事务 —— 这是有意的。这条命令是给"出事了想看看"的人用的,
@@ -11281,7 +11357,7 @@ case "${1:-menu}" in
   ios)           shift || true; cmd_ios "$@";;
   report)        shift || true; cmd_report "$@";;
   detect-cidr|cidr) shift || true; cmd_detect_cidr "$@";;
-  platform)      shift || true; cmd_platform "$@";;
+  platform)      shift || true; if [[ " $* " == *" --notify "* ]]; then _platform_notify_run "$@"; else cmd_platform "$@"; fi;;
   hijack-mode)   shift || true; cmd_hijack_mode "$@";;
   ssh-source)    shift || true; cmd_ssh_source "$@";;
   lan)           shift || true; cmd_lan "$@";;
