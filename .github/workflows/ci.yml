@@ -394,7 +394,7 @@ jobs:
       - name: "链路诊断采集器 (证书正常/临期/过期/错域名/损坏/误放私钥; 零写入零写锁)"
         run: python3 tests/test-link-status.py
 
-      - name: "链路诊断平台隔离 (Android 不要求 probe81 / iOS 检查它 / 文案不串台)"
+      - name: "链路诊断平台隔离 (probe81 两平台公共件 / iOS 第 3 层查服务器就绪 / 文案不串台)"
         run: python3 tests/test-link-platform.py
 
       - name: "probe81 转公共组件 (install/update/迁移/平台切换/doctor/卸载 全链路)"
