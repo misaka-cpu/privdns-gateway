@@ -8509,6 +8509,11 @@ _platform_exit_notify(){
   [[ -n "$PF_LOG" ]] && rm -f "$PF_LOG"
   return 0
 }
+# 派发入口: 带 --notify 的(bot 起的后台任务)走通知包装, 其余原样交给 cmd_platform。分流放在这里而不是
+# 派发行上: 顶层派发每一支都是 `shift || true; <函数> "$@";;`, tests/test-cli-dispatch.py 按这个形状逐支核参数转交。
+cmd_platform_entry(){
+  if [[ " $* " == *" --notify "* ]]; then _platform_notify_run "$@"; else cmd_platform "$@"; fi
+}
 # 局部变量一律带 _pf_ 前缀: bash 的 local 是动态作用域, cmd_platform 往下调用的函数若给 rc / h 这类
 # 通用名赋值又没声明 local, 改到的就是这里的变量 —— 一次成功的切换会被报成失败。
 _platform_notify_run(){
@@ -11357,7 +11362,7 @@ case "${1:-menu}" in
   ios)           shift || true; cmd_ios "$@";;
   report)        shift || true; cmd_report "$@";;
   detect-cidr|cidr) shift || true; cmd_detect_cidr "$@";;
-  platform)      shift || true; if [[ " $* " == *" --notify "* ]]; then _platform_notify_run "$@"; else cmd_platform "$@"; fi;;
+  platform)      shift || true; cmd_platform_entry "$@";;
   hijack-mode)   shift || true; cmd_hijack_mode "$@";;
   ssh-source)    shift || true; cmd_ssh_source "$@";;
   lan)           shift || true; cmd_lan "$@";;

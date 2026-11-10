@@ -139,9 +139,17 @@ run ok_green android --notify
 run ok_green android ios --notify bogus
 [[ "$RC" == 2 && -z "$CALL" ]] && ok "多出未知参数: 同样不动手" || bad "rc=$RC call=[$CALL]"
 
-echo "══ 4. 派发行 ══"
+echo "══ 4. 派发行与派发入口 ══"
 arm="$(grep -E '^  platform\)' "$PDG")"
 [[ "$(grep -cE '^  platform\)' "$PDG")" == 1 ]] && ok "顶层派发里 platform 分支恰一条" || bad "platform 分支不唯一"
-[[ "$arm" == *'if [[ " $* " == *" --notify "* ]]; then _platform_notify_run "$@"; else cmd_platform "$@"; fi;;' ]] \
-  && ok "带 --notify 才走通知包装, 否则原样 cmd_platform" || bad "派发行: $arm"
+[[ "$arm" == '  platform)      shift || true; cmd_platform_entry "$@";;' ]] \
+  && ok "派发行是标准形状(shift 后把参数原样交给 cmd_platform_entry)" || bad "派发行: $arm"
+ent="$(sed -n '/^cmd_platform_entry(){/,/^}/p' "$PDG")"
+if [[ -z "$ent" ]]; then bad "抽不到 cmd_platform_entry"; else
+  route(){ bash -c 'set -uo pipefail; eval "$1"; shift; _platform_notify_run(){ echo "NOTIFY $*"; }; cmd_platform(){ echo "PLAIN $*"; }; cmd_platform_entry "$@"' _ "$ent" "$@"; }
+  [[ "$(route ios --notify)" == "NOTIFY ios --notify" ]] && ok "带 --notify → 通知包装(参数原样)" || bad "带 --notify: $(route ios --notify)"
+  [[ "$(route android)" == "PLAIN android" ]] && ok "不带 --notify → 原样 cmd_platform" || bad "不带: $(route android)"
+  [[ "$(route)" == "PLAIN " ]] && ok "没有参数 → cmd_platform(由它打用法)" || bad "无参: [$(route)]"
+  [[ "$(route ios --notifyx)" == "PLAIN ios --notifyx" ]] && ok "只认整词 --notify" || bad "近似词: $(route ios --notifyx)"
+fi
 finish
