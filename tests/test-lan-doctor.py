@@ -237,11 +237,27 @@ ok("探测地址与面板同网段但不在表里: %s:%d" % (pick[0], pick[1]))
 # ══ ④ check_lan_cert ═══════════════════════════════════════════════════════
 # 判据用 `openssl x509 -checkend`, 不自己解析 notAfter —— 那个格式带时区缩写,
 # strptime 在不同 locale 下解出来的东西不一样。桩按 checkend 的秒数分支即可。
-def run_cert(have_crt=True, sans=None, expired=False, soon=False):
-    """所有面板**共用一张 SAN 证书**, 所以桩按"这一张"来造, 不是按面板逐张。"""
+DISK_DER = b"disk-leaf-certificate"     # 盘上那张的叶子(桩: 内容只要能区分"同一张"与"另一张")
+CALLS = {"served": 0}
+
+
+def run_cert(have_crt=True, sans=None, expired=False, soon=False,
+             active=True, served="same", pem=True, acme=False, timer=("enabled", "active")):
+    """所有面板**共用一张 SAN 证书**, 所以桩按"这一张"来造, 不是按面板逐张。
+
+    served: 反代此刻给出的那张 —— "same"(= 盘上)、"other"(内存里还是旧的)、None(握手没拿到)。
+    acme:   本项目签的(acme.sh 在) → 要看续期定时器; timer = (is-enabled, is-active)。
+    """
+    import base64
     d = tmpguard.mkdtemp(prefix="lan-doctor.")
     if have_crt:
-        open(os.path.join(d, "panel.crt"), "w").write("x")
+        body = ("-----BEGIN CERTIFICATE-----\n%s\n-----END CERTIFICATE-----\n"
+                "-----BEGIN CERTIFICATE-----\naW50ZXJtZWRpYXRl\n-----END CERTIFICATE-----\n"
+                % base64.b64encode(DISK_DER).decode()) if pem else "x"
+        open(os.path.join(d, "panel.crt"), "w").write(body)
+    acme_home = tmpguard.mkdtemp(prefix="lan-doctor-acme.")
+    if acme:
+        open(os.path.join(acme_home, "acme.sh"), "w").write("#!/bin/sh\n")
     hosts = [q["host"] for q in CFG["panels"]] if sans is None else sans
 
     def _run(cmd, t=10):
@@ -255,10 +271,19 @@ def run_cert(have_crt=True, sans=None, expired=False, soon=False):
             if secs > 0 and soon:
                 return (1, "", "")
             return (0, "", "")
+        if cmd[:1] == ["systemctl"] and cmd[-1] == C.LAN_CERT_TIMER:
+            v = {"is-enabled": timer[0], "is-active": timer[1]}.get(cmd[1])
+            return (0 if v in ("enabled", "active") else 1, (v or "") + "\n", "")
         return (1, "", "")
 
-    old = stub(_lan_cfg=lambda: CFG, _lan_on=lambda: (True, True),
-               LAN_CERT_DIR=d, _run=_run)
+    def _served(host):
+        CALLS["served"] += 1
+        assert host == CFG["panels"][0]["host"], host     # SNI 取面板表第一个域名
+        return {"same": DISK_DER, "other": b"old-leaf-in-memory", None: None}[served]
+
+    CALLS["served"] = 0
+    old = stub(_lan_cfg=lambda: CFG, _lan_on=lambda: (True, active),
+               LAN_CERT_DIR=d, ACME_HOME_DIR=acme_home, _run=_run, _lan_served_der=_served)
     try:
         return C.check_lan_cert()
     finally:
@@ -289,16 +314,81 @@ assert st == "warn" and "已过期" in msg, (st, msg)
 ok("证书已过期 → warn")
 
 # 空测: 整个证书项都不许出现 fail —— 否则升级路径又会被它挡住
-for _case in (dict(have_crt=False), dict(sans=["p0.home.example.com"]),
-              dict(expired=True), dict(soon=True), dict()):
+_ALL_CASES = (dict(have_crt=False), dict(sans=["p0.home.example.com"]),
+              dict(expired=True), dict(soon=True), dict(),
+              dict(served="other"), dict(served=None), dict(pem=False),
+              dict(acme=True), dict(acme=True, timer=("disabled", "inactive")),
+              dict(acme=True, timer=("unknown", "unknown")),
+              dict(acme=True, soon=True), dict(acme=True, soon=True, timer=("not-found", "inactive")))
+for _case in _ALL_CASES:
     _st, _n2, _m = run_cert(**_case)
     assert _st != "fail", "证书项返回了 fail(%r), 那会让 pdg update 回滚: %s" % (_case, _m)
-ok("证书项在所有分支上都不返回 fail")
+ok("证书项在所有分支上都不返回 fail(%d 种)" % len(_ALL_CASES))
 
 st, _n, msg = run_cert(soon=True)
 assert st == "warn" and "14 天内" in msg, msg
 assert "续期链" in msg, "临期要提醒续期链可能断了 —— 它断掉时不会有任何报错"
 ok("证书 14 天内到期 → warn 并提醒续期链")
+
+# ── 反代此刻给出的是不是盘上那张 ─────────────────────────────────────────────
+# 续期把新证书落了盘、Caddy 内存里还是旧的 —— 只看盘上那张永远是绿的(盘上的永远是新的)。
+st, _n, msg = run_cert(served="other")
+assert st == "warn" and "不是同一张" in msg and "pdg lan renew" in msg, (st, msg)
+ok("反代给出的不是盘上那张 → warn 并指向 pdg lan renew")
+
+st, _n, msg = run_cert(served=None)
+assert st == "warn" and "握手没拿到证书" in msg and "无结论" in msg, (st, msg)
+ok("握手拿不到证书 → warn(无结论), 不当成一致")
+
+st, _n, msg = run_cert(pem=False)
+assert st == "warn" and "解析不出来" in msg, (st, msg)
+ok("盘上那张解析不出来 → warn(无结论), 不当成一致")
+
+# 反代没在跑: 没有"内存里那张", 下次启动读的就是盘上的 —— 不该去握手, 也不该因此报。
+st, _n, msg = run_cert(active=False, served="other")
+assert st == "ok" and CALLS["served"] == 0, (st, msg, CALLS)
+ok("反代没在跑 → 不握手、不比对")
+
+# 正控: 一致时确实握过手(否则上面那几条 warn 的"有牙"就只是没走到这一步)
+st, _n, msg = run_cert(served="same")
+assert st == "ok" and CALLS["served"] == 1, (st, msg, CALLS)
+ok("反代给出的就是盘上那张 → ok, 且确实握过一次手")
+
+# ── 续期调度 ──────────────────────────────────────────────────────────────────
+st, _n, msg = run_cert(acme=True)
+assert st == "ok" and "续期定时器在跑" in msg, (st, msg)
+ok("本项目签的证书 + 定时器在跑 → ok 并说明")
+
+for _t in (("disabled", "inactive"), ("enabled", "inactive"), ("not-found", "inactive"), ("unknown", "unknown")):
+    st, _n, msg = run_cert(acme=True, timer=_t)
+    assert st == "warn" and "没有续期调度" in msg and C.LAN_CERT_TIMER in msg and _t[0] in msg, (_t, st, msg)
+ok("本项目签的证书 + 定时器没装 / 没启用 / 没在跑 / 读不到 → warn「没有续期调度」")
+
+st, _n, msg = run_cert(acme=False, timer=("not-found", "inactive"))
+assert st == "ok" and "续期定时器" not in msg, (st, msg)
+ok("不是本项目签的证书(没有 acme.sh) → 不查定时器")
+
+st, _n, msg = run_cert(acme=True, soon=True, timer=("not-found", "inactive"))
+assert st == "warn" and "14 天内" in msg and "没在跑" in msg and "pdg lan renew" in msg, (st, msg)
+ok("临期 + 定时器没在跑 → 一句话里两件事都说")
+
+st, _n, msg = run_cert(acme=True, soon=True)
+assert st == "warn" and "14 天内" in msg and "续了没成" in msg and "journalctl -u pdg-lan-cert" in msg, (st, msg)
+ok("临期 + 定时器在跑 → 指向续期日志")
+
+
+def _der_of(text):
+    p = os.path.join(tmpguard.mkdtemp(prefix="lan-doctor-pem."), "c.pem")
+    open(p, "w").write(text)
+    return C._pem_first_der(p)
+
+
+# 取的是**第一张**(叶子), 不是整条链 —— 反代握手给出的也是叶子
+assert _der_of("-----BEGIN CERTIFICATE-----\nYWJj\n-----END CERTIFICATE-----\n"
+               "-----BEGIN CERTIFICATE-----\nZGVm\n-----END CERTIFICATE-----\n") == b"abc"
+assert _der_of("not a pem") is None
+assert _der_of("-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n") is None
+ok("_pem_first_der: 取叶子那一张; 不是 PEM / base64 坏掉 → None")
 
 
 old = stub(_lan_cfg=lambda: CFG, _lan_on=lambda: (False, False))

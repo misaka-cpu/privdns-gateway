@@ -79,6 +79,50 @@ WantedBy=multi-user.target
 EOF
 }
 
+# 内网面板证书的续期(pdg-lan-cert.service + .timer)。由 `pdg lan cert` 签完证书时、以及
+# `pdg update` 的迁移(migrate_lan_cert_timer)装上, `pdg lan purge` / uninstall.sh 拆掉。
+#
+# 为什么要有它: 面板证书由钉死的 acme.sh 签, 而安装时只把 acme.sh git clone 下来, 从来没跑过
+# 它自己的 `--install`(那一步才会装 cron)。于是**根本没有任何东西会去续期** —— jp 上证书 08-24 签、
+# acme 记的续期时刻是 10-22, 到 11-07 一次都没跑过, 离过期只剩两周才被 doctor 看出来。而且那台
+# 机器上连 cron 服务都没装, 就算补一条 crontab 也不会跑 —— 所以用 systemd 定时器, 不靠 cron。
+#
+# ExecCondition 那一行是给**跨版本回滚**的: LAN 的产物都不在全局快照里, 回滚到不认识
+# `pdg lan renew` 的旧版之后, 这两个 unit 会留在盘上。旧版 cmd_lan 对不认识的子命令返回 1,
+# 而 ExecCondition 返回 1–254 时 systemd 只是**跳过**这一次(不记 failed) —— 残留的定时器每天
+# 空转一次, 而不是每天报一次失败。新版对 `--supported` 直接返回 0。
+#
+# HOME=/root: systemd 的系统服务不写 User= 时不设 HOME。acme.sh 显式给了 --home 时不依赖它,
+# 但 `pdg lan cert` 是在 root 的交互 shell 里跑的(HOME=/root) —— 让定时器那一次与手工签发时同一个环境。
+#
+# 续不续由 acme.sh 自己判(`--cron`: 没到它记的续期时刻就什么都不做, 返回 0), 所以每天跑一次
+# 是安全的。时间放在 01:00 起的三小时里, 避开 04:30 起的规则库更新; Persistent 让关机错过的
+# 那一次在开机后补跑。
+pdg_unit_lan_cert_service(){ cat <<'EOF'
+[Unit]
+Description=pdg-lan-cert (PrivDNS Gateway LAN panel certificate renewal)
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+Environment=HOME=/root
+ExecCondition=/usr/local/bin/pdg lan renew --supported
+ExecStart=/usr/local/bin/pdg lan renew --notify
+EOF
+}
+
+pdg_unit_lan_cert_timer(){ cat <<'EOF'
+[Unit]
+Description=pdg-lan-cert daily renewal check
+[Timer]
+OnCalendar=*-*-* 01:00:00
+RandomizedDelaySec=3h
+Persistent=true
+[Install]
+WantedBy=timers.target
+EOF
+}
+
 # 内核 svc 名 → 对应 unit 生成函数(mihomo 为唯一内核; 保留此壳以便将来扩展/调用方不改)。
 pdg_unit_for_core_svc(){
   case "$1" in

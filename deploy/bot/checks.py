@@ -2606,11 +2606,65 @@ def check_lan_whitelist():
     return ("fail", name, "; ".join(parts) + "。跑 sudo pdg lan render 后重启 pdg-lan。")
 
 
-def check_lan_cert():
-    """面板证书的剩余天数。
+LAN_LISTEN = ("127.0.0.1", 443)        # lanpanel.render_caddy 的默认 bind + 443(_lan_render 不传 --bind)
+LAN_CERT_TIMER = "pdg-lan-cert.timer"   # 面板证书的续期定时器(lib/units.sh)
 
-    反代读的是**落盘的**证书, 它自己不去续 —— 续期靠 acme.sh 装的 cron。那条链断掉时
-    不会有任何报错, 直到某天所有面板一起打不开。所以这一项存在的意义就是提前那两周。
+
+def _pem_first_der(path):
+    """证书文件里第一张(叶子)证书的 DER。读不出来返回 None。"""
+    import base64
+    try:
+        with open(path, encoding="ascii", errors="replace") as f:
+            txt = f.read()
+    except OSError:
+        return None
+    m = re.search(r"-----BEGIN CERTIFICATE-----\s*(.*?)\s*-----END CERTIFICATE-----", txt, re.S)
+    if not m:
+        return None
+    try:
+        return base64.b64decode("".join(m.group(1).split()), validate=True)
+    except ValueError:
+        return None
+
+
+def _lan_served_der(host):
+    """反代**此刻给出的**叶子证书(DER)。拿不到返回 None。
+
+    只取证书、不做链校验: 要回答的是"进程用的是不是盘上那张", 不是"这张可不可信"。
+    """
+    import socket
+    import ssl
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        with socket.create_connection(LAN_LISTEN, timeout=5) as s:
+            with ctx.wrap_socket(s, server_hostname=host) as t:
+                return t.getpeercert(binary_form=True)
+    except (OSError, ssl.SSLError, ValueError):
+        return None
+
+
+def _lan_renew_timer():
+    """续期定时器的 (is-enabled, is-active)。读不到的那一格是 "unknown"。"""
+    def _q(sub):
+        _rc, out, _e = _run(["systemctl", sub, LAN_CERT_TIMER], 8)
+        return (out or "").strip() or "unknown"
+    return _q("is-enabled"), _q("is-active")
+
+
+def check_lan_cert():
+    """面板证书: 剩余天数、反代在用的是不是盘上这张、有没有东西负责续期。
+
+    反代读的是**落盘的**证书, 它自己不去续。以前这里写的是"续期靠 acme.sh 装的 cron" ——
+    而那个 cron 从来没被装过(安装只 git clone acme.sh, 不跑它的 --install), jp 上的机器连 cron
+    服务都没有。于是续期从来不会发生, 全程没有任何报错, 直到某天所有面板一起打不开。
+    现在续期由 pdg-lan-cert.timer 负责(lib/units.sh), 这一项看三件事:
+      · 剩余天数(提前两周报);
+      · **反代此刻给出的证书 = 盘上那张**: 新证书落了盘、进程还拿着旧的, 是这个功能真机上
+        出过的形态(见 tests/test-lan-proxy-reload-chokepoint.sh 开头)。只看盘上那张看不见它 ——
+        盘上的永远是新的;
+      · 本项目签的证书要有续期定时器在跑。
 
     判据用 `openssl x509 -checkend`(与 check_cert 同一个惯用法), 不自己解析日期字符串:
     notAfter 的格式带时区缩写, strptime 在不同 locale 下解出来的东西不一样。
@@ -2619,7 +2673,7 @@ def check_lan_cert():
     cfg = _lan_cfg()
     if cfg is None:
         return None
-    on, _active = _lan_on()
+    on, active = _lan_on()
     if not on:
         return None                   # 停用中: 证书过不过期都不影响任何东西
     panels = [p for p in cfg.get("panels", []) if isinstance(p, dict) and p.get("name")]
@@ -2655,11 +2709,41 @@ def check_lan_cert():
     rc, _, _ = _run(["openssl", "x509", "-checkend", "0", "-noout", "-in", crt], 8)
     if rc != 0:
         return ("warn", name, "证书已过期 —— 面板全部打不开(不影响分流与 DNS)")
+    # 反代在跑时才有"内存里那张"可比。停着的反代下次启动读的就是盘上的。
+    if active:
+        disk = _pem_first_der(crt)
+        host = next((p["host"] for p in panels if p.get("host")), None)
+        served = _lan_served_der(host) if host else None
+        if disk is None:
+            return ("warn", name, "盘上的证书解析不出来(%s), 判不出反代在用哪张 —— 本项无结论" % crt)
+        if served is None:
+            return ("warn", name, "向反代(%s:%d)握手没拿到证书, 判不出它在用哪张 —— 本项无结论"
+                    % LAN_LISTEN)
+        if served != disk:
+            return ("warn", name,
+                    "反代此刻给出的证书与盘上那张不是同一张 —— 新证书落了盘、进程还拿着旧的"
+                    "(盘上那张没问题)。sudo pdg lan renew 会让它用上盘上那张")
+    # 本项目签的证书(acme.sh 在)要有续期定时器。别的来源的证书不归这里管, 不看。
+    sched = None
+    if os.path.exists(os.path.join(ACME_HOME_DIR, "acme.sh")):
+        en, ac = _lan_renew_timer()
+        sched = (en == "enabled" and ac == "active", en, ac)
     rc, _, _ = _run(["openssl", "x509", "-checkend", str(14 * 86400), "-noout", "-in", crt], 8)
     if rc != 0:
-        return ("warn", name, "证书 14 天内到期 —— 续期链(acme.sh 的 cron)可能已经断了, "
-                              "它断掉时不会有任何报错")
-    return ("ok", name, "一张 SAN 证书覆盖 %d 个面板, 还有 14 天以上" % len(panels))
+        tail = ""
+        if sched is not None:
+            tail = ("; 续期定时器 %s 在跑, 那就是续了没成 —— 看 journalctl -u pdg-lan-cert" % LAN_CERT_TIMER
+                    if sched[0] else
+                    "; 续期定时器 %s 没在跑(%s / %s), 不会自动续 —— sudo pdg lan renew 先续一次"
+                    % (LAN_CERT_TIMER, sched[1], sched[2]))
+        return ("warn", name, "证书 14 天内到期 —— 续期链可能已经断了, 它断掉时不会有任何报错" + tail)
+    if sched is not None and not sched[0]:
+        return ("warn", name,
+                "没有续期调度: %s 是 %s / %s —— 这张证书到期前不会自动续。"
+                "sudo pdg update(迁移会补上)或 sudo pdg lan cert <dns插件名>"
+                % (LAN_CERT_TIMER, sched[1], sched[2]))
+    return ("ok", name, "一张 SAN 证书覆盖 %d 个面板, 还有 14 天以上%s"
+            % (len(panels), "; 续期定时器在跑" if sched else ""))
 
 
 

@@ -177,10 +177,11 @@ WLOC 是 940 行 + 7 支(该功能此后已退役)—— 所以这个功能**比
 | 门二 面板表校验 / 反代生成 | `deploy/bot/lanpanel.py`(含五条设备毛病) |
 | 门三 出站白名单 | `lanpanel.py render_nft` + unit 的 `ExecStartPre` |
 | 风险② DNS token 权限升级 | `pdg lan status` 每次都会说, 不只写在第 7 节 |
-| CLI | `pdg lan status/list/check/routes/add/rm/cert/enable/disable/render/wire/purge` |
+| CLI | `pdg lan status/list/check/routes/add/rm/cert/renew/enable/disable/render/wire/purge` |
 | 反代与证书 | Caddy 官方原版(钉版本+SHA256) + acme.sh(钉 commit) |
 | 手机侧接线 | mosdns `lan_hijack.txt` 挂进 `explicit_proxy`; mihomo `hosts:` + 面板规则 |
-| doctor | 路由重叠 / 白名单漂移 / 证书剩余 / ACL 越界探测(--deep) |
+| 证书续期 | `pdg-lan-cert.timer`(lib/units.sh)每天调 `pdg lan renew`: acme.sh `--cron`, 再握手确认反代给出的就是盘上那张 |
+| doctor | 路由重叠 / 白名单漂移 / 证书剩余、反代在用的是否盘上那张、续期定时器 / ACL 越界探测(--deep) |
 | 卸载 | `pdg lan purge` 与 `uninstall.sh` 两条路, 残留逐条报出来 |
 
 ### 已在沙盒真机上验过的
@@ -216,7 +217,10 @@ WLOC 是 940 行 + 7 支(该功能此后已退役)—— 所以这个功能**比
 - **ACL 越界探测**打在真 tailnet 上的表现。判据的三种读法有单元测试覆盖(连上 / 被拒 /
   不可达), 但作者的 tailnet 上目前是默认全通(他判断 jp2 被拿下的概率低, 接受了风险①),
   所以这一项在真 ACL 上没跑过。
-- **续期**。acme.sh 装的 cron 是否真的把证书续上, 没有跨越 60 天验证过。
-  doctor 的证书项就是为这条不确定性存在的。
+- **续期**。这一条原来写的是"acme.sh 装的 cron 是否真的把证书续上, 没有跨越 60 天验证过"——
+  后来查实那个 cron 从来没被装过(安装只 git clone acme.sh, 不跑它的 `--install`), jp 上的机器连 cron
+  服务都没有; 2026-11-07 那张证书离过期只剩两周, 是手工 `pdg lan cert` 续上的。现在续期交给
+  `pdg-lan-cert.timer`, 本机测试覆盖了定时器的装 / 拆 / 迁移和续完后的握手收敛, 但**真的跨过一次
+  acme.sh 的续期时刻**还没有发生过。doctor 的证书项仍然是为这条不确定性存在的。
 - **别人的设备**。七台是作者家里那些(华为 UPS、Zyxel 交换机、TrueNAS、IPMI、ESXi、
   路由器、sub-store)。别的型号会有别的毛病 —— 生成器现在带的五条改写能力就是这么攒出来的。
