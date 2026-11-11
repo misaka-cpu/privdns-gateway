@@ -442,6 +442,9 @@ jobs:
       - name: "pdg platform --notify: 每种结局恰发一条 Telegram(含拿不到锁的 EXIT 补发) / 原因转义 / 派发行只在带 --notify 时分流"
         run: bash tests/test-platform-notify.sh
 
+      - name: "后台任务的 Telegram 出口: HTML 被拒收(400)退回纯文本再发一次 / 没有回应不重发"
+        run: python3 tests/test-healthcheck-notify.py
+
       - name: "去广告写入口并发闭包: 五个写命令共用全局锁 / 锁忙零副作用 / status 严格只读"
         run: bash tests/test-adblock-lock-closure.sh
 

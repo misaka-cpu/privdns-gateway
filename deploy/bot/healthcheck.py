@@ -47,9 +47,21 @@ def _problems():
     return out
 
 def _notify(text):
+    """发 HTML 给每个允许的用户; Telegram 以 400 拒收时退回纯文本再发一次。
+
+    这是后台任务(健康自检、`pdg kernel` / `pdg platform` / `pdg lan renew` 的 --notify)唯一的
+    Telegram 出口, 正文里常夹着别处来的文字 —— 自检项的说明、CLI 的提示。像
+    `sudo pdg lan cert <dns插件名>` 里的 <…>, 在 Telegram 看来是不认识的标签, 整条 400 拒收;
+    调用方又把输出丢进 /dev/null, 于是一条都收不到, 也没人知道。bot 自己的 send / edit 早就有
+    这一步回退, 这里补上同一条。
+    只在明确的 400 时回退: post 返回 {}(超时、断线)时不知道发没发出去, 再发一次可能让同一条
+    告警收两遍; 429 之类重发也不会好。"""
     for uid in ALLOWED:
-        bot.post("sendMessage", {"chat_id": uid, "text": text, "parse_mode": "HTML",
-                                 "disable_web_page_preview": True})
+        p = {"chat_id": uid, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+        r = bot.post("sendMessage", p) or {}
+        if not r.get("ok") and r.get("error_code") == 400:
+            p.pop("parse_mode", None)
+            bot.post("sendMessage", p)
 
 def main():
     # 凭据判据与 status / doctor / CLI / update 校验门同一份(checks.bot_credentials):
