@@ -9187,7 +9187,7 @@ _lan_renew(){
   if [[ ! -s "$crt" ]]; then
     echo "还没有 $crt —— 先 sudo pdg lan cert <dns插件名> 签发。"; return 0
   fi
-  local fp0 fp1 rc=0 renewed=0 conv=same n exp msg="" ret=0
+  local fp0 fp1 rc=0 renewed=0 conv=same n exp msg="" ret=0 served="" noans=0
   fp0="$(_lan_cert_fp "$crt")"
   # 凭据: dns.env 是 600 root 才读(与 _lan_cert 同一条要求), 否则交给 acme.sh 签发时存下的那份。
   # 读它是为了换过 token 的机器: acme.sh 的 DNS 插件先认环境变量, 再认它自己存的旧值。
@@ -9206,7 +9206,19 @@ _lan_renew(){
     conv=unreadable
   elif ! systemctl is-active --quiet pdg-lan 2>/dev/null; then
     conv=inactive                      # 反代没在跑: 没有"内存里那张", 下次启动读的就是盘上的
-  elif [[ "$(_lan_served_fp)" != "$fp1" ]]; then
+  else
+    # 握手**没拿到证书**和**拿到的是另一张**不是一回事。pdg-lan 是 simple 型 unit: restart 一返回
+    # 就算 active, Caddy 这时可能还没在听 443 —— acme.sh 续完刚按 reloadcmd 重启过它, 或者开机时
+    # Persistent 补跑的这一次比反代先到。不等一等就会把"还没起来"当成"还拿着旧证书", 再重启一次,
+    # 通知里还说它用的是旧证书(doctor 对这种情况也只报"本项无结论", 不判旧证书)。
+    # 所以拿不到时先等它几秒; 一直拿不到(活着却不应答)才重启, 并照实说是"没有回应"。
+    served="$(_lan_served_fp)"; n=0
+    while [[ -z "$served" ]] && (( n < 10 )); do
+      sleep 1; n=$((n + 1)); served="$(_lan_served_fp)"
+    done
+    [[ -z "$served" ]] && noans=1
+  fi
+  if [[ "$conv" == same && "$served" != "$fp1" ]]; then
     if _lan_apply_proxy; then
       conv=stale
       # 重启返回了不等于已经在听: 给它几秒, 以握手到的那张为准。
@@ -9230,7 +9242,11 @@ _lan_renew(){
     msg="⚠️ 面板证书 ${exp:-?} 到期(14 天内), 而 acme.sh 这次没有续 —— 手工重签: sudo pdg lan cert <dns插件名>。"; ret=1
   fi
   case "$conv" in
-    restarted)   msg="${msg:+$msg }反代原来还在用旧证书, 已重启, 现在给出的就是盘上那张。";;
+    restarted)   if (( noans )); then
+                   msg="${msg:+$msg }反代在跑, 但握手等了 10 秒都没有回应, 已重启, 现在给出的就是盘上那张。"
+                 else
+                   msg="${msg:+$msg }反代原来还在用旧证书, 已重启, 现在给出的就是盘上那张。"
+                 fi;;
     stale)       msg="${msg:+$msg }❌ 反代重启后给出的证书仍不是盘上那张 —— 面板可能还在用旧证书。"; ret=1;;
     restartfail) msg="${msg:+$msg }❌ 反代重启失败 —— 面板还在用旧证书。"; ret=1;;
     unreadable)  msg="${msg:+$msg }❌ 盘上的证书读不出来($crt)。"; ret=1;;
@@ -9240,7 +9256,10 @@ _lan_renew(){
     return 0
   fi
   echo "$msg"
-  (( notify )) && _kf notify "<b>$(_kernel_host)</b> $msg" >/dev/null 2>&1
+  # 通知走 Telegram 的 HTML 模式: 正文要转义(同平台切换的通知, 用同一个 _platform_html)。
+  # 不转义的话「<dns插件名>」这种字样会被当成不认识的标签, Telegram 整条拒收 —— 最该提醒的
+  # "进 14 天还没续"那一条恰恰带着它。终端 / journal 里的那一行(上面的 echo)照旧是原文。
+  (( notify )) && _kf notify "<b>$(_kernel_host)</b> $(_platform_html "$msg")" >/dev/null 2>&1
   return "$ret"
 }
 

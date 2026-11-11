@@ -48,7 +48,7 @@ LAN_FX_SRC="$PDG"
 # shellcheck source=tests/lan-fixture.sh
 source "$ROOT/tests/lan-fixture.sh"
 C="$WORK/closure.sh"
-lan_fx_emit "$C" _pdg_timer_next_ok _kernel_host \
+lan_fx_emit "$C" _pdg_timer_next_ok _kernel_host _platform_html \
   _lan_cert_fp _lan_served_fp _lan_cert_timer_install _lan_cert_timer_remove _lan_renew \
   migrate_lan_cert_timer || { bad "抽不出被测函数"; finish; }
 # _kf 是发 Telegram 的出口(kernelfollow.py notify): 沙箱里只记下发了什么。
@@ -62,7 +62,7 @@ lan_fx_model "$W/etc/privdns-gateway/lan-panels.json" "pa:a.lan.test:192.168.50.
 mkdir -p "$W/opt/pdg-acme/data" "$W/frozen"
 cp "$WORK/pem-old/panel.crt" "$WORK/pem-old/panel.key" "$W/frozen/"
 
-# acme.sh 替身: 按 state/acme-mode 演 skip / renew / fail。renew 时像真 acme.sh 一样**覆盖写**
+# acme.sh 替身: 按 state/acme-mode 演 skip / renew / renew-restart / fail。renew 时像真 acme.sh 一样**覆盖写**
 # 装好的两个文件, 然后跑签发那天记下的旧 reloadcmd —— 它什么都没换成(admin off 下必败、被吞)。
 cat > "$W/opt/pdg-acme/acme.sh" <<'STUB'
 #!/usr/bin/env bash
@@ -70,6 +70,16 @@ echo "acme.sh $* CF_Token=${CF_Token:-<unset>}" >> "$FX_ROOT/calls.log"
 case "$(cat "$FX_ROOT/state/acme-mode" 2>/dev/null)" in
   renew) cat "$FX_ROOT/pem-next/panel.crt" > "$LAN_CERT_DIR/panel.crt"
          cat "$FX_ROOT/pem-next/panel.key" > "$LAN_CERT_DIR/panel.key"
+         echo "Reload successful"; exit 0;;
+  # 新记录的 reloadcmd(systemctl restart pdg-lan)的样子: 旧进程立刻没了, 新进程过一会儿才听。
+  # pdg-lan 是 simple 型 unit, restart 一返回就算 active —— 这段空窗里握手拿不到证书。
+  renew-restart)
+         cat "$FX_ROOT/pem-next/panel.crt" > "$LAN_CERT_DIR/panel.crt"
+         cat "$FX_ROOT/pem-next/panel.key" > "$LAN_CERT_DIR/panel.key"
+         # shellcheck source=/dev/null
+         source "$FX_ROOT/caddy.sh"
+         kill "$(cat "$SPID_FILE")" 2>/dev/null
+         ( sleep 2; caddy_start "$LAN_CERT_DIR" ) < /dev/null > /dev/null 2>&1 &
          echo "Reload successful"; exit 0;;
   fail)  echo "Error renewing a.lan.test" >&2; exit 1;;
   *)     echo "Skipping. Next renewal time is: 2099-01-01"; exit 0;;
@@ -142,7 +152,9 @@ LAN_LISTEN="127.0.0.1:$PORT"
 FX_TIMER="$LAN_CERT_TIMER"
 export LAN_CERT_SVC LAN_CERT_TIMER LAN_LISTEN FX_TIMER
 
+keep_notify(){ [[ -s "$W/notify.log" ]] && cat "$W/notify.log" >> "$WORK/notify-all.log"; true; }
 reset_case(){   # 每一格从同一个前像开始: 盘上旧证书、Caddy 拿着旧证书、反代在跑
+  keep_notify     # 上一格发出的通知留一份, 最后统一核 Telegram 能不能收(HTML)
   cp "$WORK/pem-old/panel.crt" "$WORK/pem-old/panel.key" "$LAN_CERT_DIR/"
   rm -f "$W/state/"* "$W/notify.log"; : > "$FX_CALLS"
   cp -r "$WORK/pem-new/." "$W/pem-next/"
@@ -315,6 +327,11 @@ caddy_start "$LAN_CERT_DIR" || bad "\"Caddy\" 起不来"
 out="$(run _lan_renew --notify 2>&1)"; rc=$?
 [[ "$rc" == 1 && "$out" == *"14 天内"* ]] && grep -q '14 天内' "$W/notify.log" \
   && ok "没续、但已进 14 天 → rc 1 并通知" || bad "4i: rc=$rc out=$out"
+# 这条正文带着「<dns插件名>」: 终端里照原文, 发给 Telegram 的必须转义(否则整条 400 拒收, 一条都收不到)
+[[ "$out" == *"sudo pdg lan cert <dns插件名>"* ]] && grep -qF 'sudo pdg lan cert &lt;dns插件名&gt;' "$W/notify.log" \
+  && ! grep -qF '<dns插件名>' "$W/notify.log" \
+  && ok "4i: 终端里是原文 <dns插件名>, 发给 Telegram 的转义成 &lt;dns插件名&gt;" \
+  || bad "4i 转义: out=$out notify=$(cat "$W/notify.log" 2>/dev/null)"
 
 # 4j 不是本项目签的证书 / 还没签: 不归这里管
 reset_case; mv "$ACME_HOME/acme.sh" "$WORK/acme.sh.away"
@@ -322,6 +339,69 @@ out="$(run _lan_renew --notify 2>&1)"; rc=$?
 [[ "$rc" == 0 && "$out" == *"不归这里续"* && "$(calls 'restart pdg-lan$')" == 0 && ! -s "$W/notify.log" ]] \
   && ok "没有 acme.sh → 不归这里续, rc 0" || bad "4j: rc=$rc out=$out"
 mv "$WORK/acme.sh.away" "$ACME_HOME/acme.sh"
+
+# ── 握手没拿到证书 ≠ 反代拿着旧证书 ────────────────────────────────────────────
+# pdg-lan 是 simple 型 unit: restart 一返回就算 active, Caddy 这时可能还没在听。这几格让
+# "Caddy" 在 active 的同时暂时不应答, 看 renew 会不会把"还没起来"当成"还拿着旧证书"。
+caddy_stop(){ [[ -s "$SPID_FILE" ]] && { kill "$(cat "$SPID_FILE")" 2>/dev/null; wait "$(cat "$SPID_FILE")" 2>/dev/null; }; true; }
+
+# 4k 续期当天的真实形态: acme.sh 续完按新 reloadcmd 重启了反代, 新进程 2 秒后才听 →
+#    等它起来、握手拿到新证书, 不再多重启一次, 也不说"还在用旧证书"
+reset_case; echo renew-restart > "$W/state/acme-mode"
+out="$(run _lan_renew --notify 2>&1)"; rc=$?
+if [[ "$rc" == 0 && "$(served)" == "$FP_NEW" && "$(calls 'restart pdg-lan$')" == 0 \
+      && "$out" == *"已续期"* && "$out" != *"已重启"* && "$out" != *"旧证书"* ]] \
+   && grep -q '已续期' "$W/notify.log" && ! grep -q '已重启' "$W/notify.log"; then
+  ok "续完反代刚重启、还没在听 → 等它起来再比, 不多重启、不误报旧证书"
+else bad "4k: rc=$rc served=$(served) 重启=$(calls 'restart pdg-lan$') out=$out notify=$(cat "$W/notify.log" 2>/dev/null)"; fi
+
+# 4l 没续, 反代在跑但这会儿还没在听(开机时 Persistent 补跑比反代先到), 2 秒后自己起来 → 安静收工
+reset_case; echo skip > "$W/state/acme-mode"; caddy_stop
+( sleep 2; caddy_start "$LAN_CERT_DIR" ) < /dev/null > /dev/null 2>&1 &
+late=$!
+out="$(run _lan_renew --notify 2>&1)"; rc=$?
+wait "$late" 2>/dev/null
+[[ "$rc" == 0 && "$(calls 'restart pdg-lan$')" == 0 && ! -s "$W/notify.log" && "$out" == *"反代给出的就是盘上这张"* ]] \
+  && ok "反代一时没应答、随后自己起来 → 不重启、不通知" \
+  || bad "4l: rc=$rc 重启=$(calls 'restart pdg-lan$') out=$out notify=$(cat "$W/notify.log" 2>/dev/null)"
+
+# 4m 反代 active 却一直不应答 → 等满了才重启, 并照实说是"没有回应", 不说它拿着旧证书
+reset_case; echo skip > "$W/state/acme-mode"; caddy_stop
+out="$(run _lan_renew --notify 2>&1)"; rc=$?
+if [[ "$rc" == 0 && "$(served)" == "$FP_OLD" && "$(calls 'restart pdg-lan$')" == 1 \
+      && "$out" == *"没有回应"* && "$out" != *"旧证书"* ]] && grep -q '没有回应' "$W/notify.log"; then
+  ok "反代在跑却一直不应答 → 等满后重启一次, 说清是没有回应"
+else bad "4m: rc=$rc served=$(served) 重启=$(calls 'restart pdg-lan$') out=$out"; fi
+
+# ── 发给 Telegram 的每一条都要能被它收下 ────────────────────────────────────────
+# 出口是 HTML 模式(调用方自己写 <b>): 只认下面这几种标签, 别的 < > & 必须是实体, 否则整条 400 拒收。
+keep_notify; rm -f "$W/notify.log"
+tg_html_bad(){   # $1=文件, 每行一次 _kf 调用("notify <正文>"); 打印收不下的行, 有就返回 1
+  python3 -I - "$1" <<'PY'
+import re, sys
+TAGS = {"b", "strong", "i", "em", "u", "ins", "s", "strike", "del", "a", "code", "pre",
+        "tg-spoiler", "span", "blockquote", "tg-emoji"}
+bad = []
+for ln in open(sys.argv[1], encoding="utf-8"):
+    t = ln.rstrip("\n")
+    body = t[len("notify "):] if t.startswith("notify ") else t
+    s = re.sub(r"</?(%s)(\s[^<>]*)?>" % "|".join(map(re.escape, sorted(TAGS))), "", body)
+    s = re.sub(r"&(amp|lt|gt|quot|#[0-9]+|#x[0-9a-fA-F]+);", "", s)
+    if re.search(r"[<>&]", s):
+        bad.append(t)
+print("\n".join(bad))
+sys.exit(1 if bad else 0)
+PY
+}
+# 仪器校准: 一条已知收不下的(带 <dns插件名>)、一条收得下的
+printf 'notify <b>h</b> 手工重签: sudo pdg lan cert <dns插件名>。\nnotify <b>h</b> 手工重签: sudo pdg lan cert &lt;dns插件名&gt;。\n' > "$WORK/tg-cal.log"
+[[ "$(tg_html_bad "$WORK/tg-cal.log")" == 'notify <b>h</b> 手工重签: sudo pdg lan cert <dns插件名>。' ]] \
+  && ok "HTML 判据校准: 认出未转义的 <dns插件名>, 放过转义后的那条" || bad "HTML 判据不灵: $(tg_html_bad "$WORK/tg-cal.log")"
+n_note="$(wc -l < "$WORK/notify-all.log" 2>/dev/null || echo 0)"
+if (( n_note >= 8 )); then
+  bad_lines="$(tg_html_bad "$WORK/notify-all.log")" && ok "④ 里发出的 $n_note 条通知都是 Telegram 收得下的 HTML" \
+    || bad "有通知 Telegram 会拒收(未转义的 < > &): $bad_lines"
+else bad "④ 里只记到 $n_note 条通知(应 ≥ 8) —— 判据没东西可判"; fi
 
 # ══ ⑤ 接线: 入口、签发、清除、卸载、迁移链 ══════════════════════════════════════
 grep -qE '^\s+renew\)\s+_lan_renew "\$@";;' "$PDG" && ok "cmd_lan 接上 renew" || bad "cmd_lan 没有 renew 分支"
