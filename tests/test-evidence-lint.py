@@ -124,8 +124,8 @@ rule("E10", "warning",
      'scripts/ssh-r-retry.sh "$R" bash -s < "$S"\n',
      "ssh 包装不给 stdin(会挂住的那一种)")
 rule("E10", "warning",
-     "ssh jp uptime\n",
-     "ssh -n jp uptime\nSSH=(ssh -o BatchMode=yes jp)\ncat s.sh | ssh jp bash -s\n",
+     "ssh gw uptime\n",
+     "ssh -n gw uptime\nSSH=(ssh -o BatchMode=yes gw)\ncat s.sh | ssh gw bash -s\n",
      "裸 ssh 带命令; -n / 数组赋值 / 管道喂入不报")
 rule("E11", "warning",
      'journalctl -u x --since "$SINCE" --no-pager\n',
@@ -144,7 +144,7 @@ rc, got, out = lint('echo "提示: 别写 journalctl --since 2026-11-12T00:00:00
                     "printf '%s\\n' \"用 pgrep -af 会咬到自己\"\n")
 check(rc == 0 and not got, "提示语 / 注释里出现的命令字样一条都不报" + ("" if not got else "\n" + out))
 rc, got, out = lint("echo '下一步; cmp a b && echo ok; journalctl --since 2026-11-12T00:00:00Z 2>/dev/null'\n"
-                    "x=$'说明: ; ssh jp uptime'\n")
+                    "x=$'说明: ; ssh gw uptime'\n")
 check(rc == 0 and not got, "单引号 / $'…' 里分号后面跟着的命令字样也不报" + ("" if not got else "\n" + out))
 rc, got, out = lint('echo "计数=$(journalctl -u x --since \'2026-11-12 09:54:30 UTC\' -o cat 2>/dev/null | wc -l)"\n')
 check(("E2", "error") in got, "双引号里的 \"$(journalctl … 2>/dev/null)\" 照样报 E2(那里面的命令一样会执行)")
@@ -166,9 +166,9 @@ print()
 print("══ 4. 退出码 ══")
 rc, got, out = lint("echo hi\n")
 check(rc == 0 and out.strip().endswith("error 0, warning 0"), "干净的脚本 → 0")
-rc, got, out = lint("ssh jp uptime\n")
+rc, got, out = lint("ssh gw uptime\n")
 check(rc == 0, "只有 warning → 0")
-rc, got, out = lint("ssh jp uptime\n", "--strict")
+rc, got, out = lint("ssh gw uptime\n", "--strict")
 check(rc == 1, "--strict 下有 warning → 1")
 rc, got, out = lint("cmp a b && echo ok\n")
 check(rc == 1, "有 error → 1")
