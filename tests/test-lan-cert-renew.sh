@@ -50,9 +50,11 @@ source "$ROOT/tests/lan-fixture.sh"
 C="$WORK/closure.sh"
 lan_fx_emit "$C" _pdg_timer_next_ok _kernel_host _platform_html \
   _lan_cert_fp _lan_served_fp _lan_cert_timer_install _lan_cert_timer_remove _lan_renew \
-  migrate_lan_cert_timer || { bad "抽不出被测函数"; finish; }
+  migrate_lan_cert_timer _pdg_event || { bad "抽不出被测函数"; finish; }
 # _kf 是发 Telegram 的出口(kernelfollow.py notify): 沙箱里只记下发了什么。
 echo '_kf(){ printf "%s\n" "$*" >> "$FX_ROOT/notify.log"; }' >> "$C"
+# logger 是机读事件的出口(_pdg_event, docs/events.md): 沙箱里记进 event.log, 不写宿主的 journal。
+echo 'logger(){ local t=""; while [[ $# -gt 0 ]]; do case "$1" in -t) t="$2"; shift;; -p) shift;; --) shift; break;; esac; shift; done; printf "%s\n" "[$t] $*" >> "$FX_ROOT/event.log"; }' >> "$C"
 bash -n "$C" || { bad "闭包语法坏了 —— 后面所有断言都不作数"; finish; }
 
 # ── 沙箱 ──────────────────────────────────────────────────────────────────────
@@ -156,7 +158,7 @@ keep_notify(){ [[ -s "$W/notify.log" ]] && cat "$W/notify.log" >> "$WORK/notify-
 reset_case(){   # 每一格从同一个前像开始: 盘上旧证书、Caddy 拿着旧证书、反代在跑
   keep_notify     # 上一格发出的通知留一份, 最后统一核 Telegram 能不能收(HTML)
   cp "$WORK/pem-old/panel.crt" "$WORK/pem-old/panel.key" "$LAN_CERT_DIR/"
-  rm -f "$W/state/"* "$W/notify.log"; : > "$FX_CALLS"
+  rm -f "$W/state/"* "$W/notify.log" "$W/event.log"; : > "$FX_CALLS"
   cp -r "$WORK/pem-new/." "$W/pem-next/"
   touch "$W/state/active"
   caddy_start "$W/frozen" || { bad "\"Caddy\" 起不来(端口 $PORT)"; finish; }
@@ -172,6 +174,11 @@ run(){   # 在子 shell 里跑被测函数, 打印输出, 返回它的退出码;
   return "$rc"
 }
 calls(){ grep -c -- "$1" "$FX_CALLS" 2>/dev/null; true; }
+# ev 词…: 这一格恰好一行 lan.cert.renew 事件, 且同时含这些**整词**(不是子串)
+ev(){ local l t; [[ -f "$W/event.log" && "$(grep -c . "$W/event.log")" == 1 ]] || return 1
+  l="$(cat "$W/event.log")"; [[ "$l" == "[pdg-event] event=lan.cert.renew "* ]] || return 1
+  for t in "$@"; do [[ " $l " == *" $t "* ]] || return 1; done; }
+evshow(){ cat "$W/event.log" 2>/dev/null | tr '\n' ';'; }
 
 # ══ ① unit 的形态 ══════════════════════════════════════════════════════════════
 # shellcheck source=lib/units.sh
@@ -198,6 +205,7 @@ reset_case
 out="$(run _lan_renew --supported 2>&1)"; rc=$?
 [[ "$rc" == 0 && -z "$out" && "$(calls 'acme.sh')" == 0 ]] && ok "renew --supported → 0, 不出声、不调 acme.sh" \
   || bad "renew --supported: rc=$rc out=$out"
+[[ ! -e "$W/event.log" ]] && ok "renew --supported 不记事件(那是 unit 的 ExecCondition 在问认不认得)" || bad "--supported 记了事件: $(evshow)"
 out="$(run _lan_renew --bogus 2>&1)"; rc=$?
 [[ "$rc" == 2 && "$(calls 'acme.sh')" == 0 ]] && ok "未知参数 → 2, 不调 acme.sh" || bad "未知参数: rc=$rc out=$out"
 
@@ -276,6 +284,10 @@ grep -q -- "acme.sh --home $ACME_HOME/data --cron" "$FX_CALLS" && ok "acme.sh �
   || bad "acme.sh 调用形态不对: $(grep acme.sh "$FX_CALLS")"
 # 凭据文件不是 600 root(沙箱里属主是当前用户)→ 不读它, 交给 acme.sh 存下的那份
 grep -q 'CF_Token=<unset>' "$FX_CALLS" && ok "dns.env 不是 600 root → 不读(不把它的值带进 acme.sh)" || bad "读了一份属主不对的凭据"
+NA_OLD="$(date -u -d "$(openssl x509 -in "$WORK/pem-old/panel.crt" -noout -enddate | cut -d= -f2)" +%F)"
+ev result=noop via=notify renewed=0 conv=same acme_rc=0 "not_after=$NA_OLD" \
+  && ok "4a 事件: result=noop, not_after 是盘上那张的到期日($NA_OLD)" || bad "4a 事件: $(evshow)"
+grep -q 'CF_Token\|must-not-be-touched' "$W/event.log" 2>/dev/null && bad "事件里出现了凭据字样" || ok "事件里没有凭据字样"
 
 # 4b 真机上出过的那个形态: 续出了新证书, 旧 reloadcmd 什么都没换 → 必须握手发现并重启
 reset_case; echo renew > "$W/state/acme-mode"
@@ -285,17 +297,22 @@ if [[ "$rc" == 0 && "$(served)" == "$FP_NEW" && "$(calls 'restart pdg-lan$')" ==
 else bad "4b: rc=$rc served=$(served) out=$out"; fi
 [[ "$out" == *"已续期"* && "$out" == *"已重启"* ]] && grep -q '已续期' "$W/notify.log" \
   && ok "续期成功 → 说清楚并发 Telegram" || bad "4b 通知: out=$out notify=$(cat "$W/notify.log" 2>/dev/null)"
+NA_NEW="$(date -u -d "$(openssl x509 -in "$WORK/pem-new/panel.crt" -noout -enddate | cut -d= -f2)" +%F)"
+ev result=ok via=notify renewed=1 conv=restarted acme_rc=0 "not_after=$NA_NEW" \
+  && ok "4b 事件: result=ok renewed=1 conv=restarted not_after=$NA_NEW" || bad "4b 事件: $(evshow)"
 
 # 4c 不带 --notify(手工跑): 同样收敛, 但不发 Telegram
 reset_case; echo renew > "$W/state/acme-mode"
 out="$(run _lan_renew 2>&1)"; rc=$?
 [[ "$rc" == 0 && "$(served)" == "$FP_NEW" && ! -s "$W/notify.log" ]] && ok "手工跑(不带 --notify) → 收敛, 不发通知" || bad "4c: rc=$rc"
+ev result=ok via=cli renewed=1 && ok "4c 事件: 手工跑记 via=cli" || bad "4c 事件: $(evshow)"
 
 # 4d 盘上早就是新的、内存里还是旧的(不管怎么来的) → 没续也要收敛
 reset_case; cp "$WORK/pem-new/panel.crt" "$WORK/pem-new/panel.key" "$LAN_CERT_DIR/"; echo skip > "$W/state/acme-mode"
 out="$(run _lan_renew --notify 2>&1)"; rc=$?
 [[ "$rc" == 0 && "$(served)" == "$FP_NEW" && "$out" == *"还在用旧证书"* ]] && grep -q '已重启' "$W/notify.log" \
   && ok "没续期但反代内存里是旧证书 → 重启收敛并通知" || bad "4d: rc=$rc out=$out"
+ev result=converged renewed=0 conv=restarted && ok "4d 事件: 没续但收敛了 → result=converged" || bad "4d 事件: $(evshow)"
 
 # 4e acme.sh 失败 → 非 0(定时器那次记 failed)、点名、发通知; 反代给出的仍是盘上那张就不重启
 reset_case; echo fail > "$W/state/acme-mode"
@@ -303,12 +320,14 @@ caddy_start "$LAN_CERT_DIR" || bad "\"Caddy\" 起不来"
 out="$(run _lan_renew --notify 2>&1)"; rc=$?
 [[ "$rc" == 1 && "$out" == *"续期失败"* && "$(calls 'restart pdg-lan$')" == 0 ]] && grep -q '续期失败' "$W/notify.log" \
   && ok "acme.sh 失败 → rc 1, 点名并通知, 不乱重启" || bad "4e: rc=$rc out=$out"
+ev result=fail renewed=0 acme_rc=1 && ok "4e 事件: result=fail acme_rc=1" || bad "4e 事件: $(evshow)"
 
 # 4f 重启了也没换上(stale 注入) → 不许报成功
 reset_case; echo renew > "$W/state/acme-mode"; touch "$W/state/stale"
 out="$(run _lan_renew --notify 2>&1)"; rc=$?
 [[ "$rc" == 1 && "$out" == *"仍不是盘上那张"* ]] && grep -q '仍不是盘上那张' "$W/notify.log" \
   && ok "重启后握手仍是旧证书 → rc 1 并点名(不信重启的返回码)" || bad "4f: rc=$rc out=$out"
+ev result=fail renewed=1 conv=stale && ok "4f 事件: 续了但没收敛 → result=fail conv=stale(不因 renewed=1 记成 ok)" || bad "4f 事件: $(evshow)"
 
 # 4g 重启失败
 reset_case; echo renew > "$W/state/acme-mode"; touch "$W/state/restart-fails"
@@ -320,6 +339,7 @@ reset_case; rm -f "$W/state/active"; echo renew > "$W/state/acme-mode"
 out="$(run _lan_renew --notify 2>&1)"; rc=$?
 [[ "$rc" == 0 && "$(calls 'restart pdg-lan$')" == 0 && "$(fp "$LAN_CERT_DIR/panel.crt")" == "$FP_NEW" ]] \
   && ok "反代没在跑 → 照样续, 不重启" || bad "4h: rc=$rc out=$out"
+ev result=ok renewed=1 conv=inactive && ok "4h 事件: result=ok conv=inactive" || bad "4h 事件: $(evshow)"
 
 # 4i acme.sh 说没事, 可证书已经进了 14 天 → 不能安静
 reset_case; cp "$WORK/pem-soon/panel.crt" "$WORK/pem-soon/panel.key" "$LAN_CERT_DIR/"; echo skip > "$W/state/acme-mode"
@@ -327,6 +347,7 @@ caddy_start "$LAN_CERT_DIR" || bad "\"Caddy\" 起不来"
 out="$(run _lan_renew --notify 2>&1)"; rc=$?
 [[ "$rc" == 1 && "$out" == *"14 天内"* ]] && grep -q '14 天内' "$W/notify.log" \
   && ok "没续、但已进 14 天 → rc 1 并通知" || bad "4i: rc=$rc out=$out"
+ev result=fail renewed=0 acme_rc=0 && ok "4i 事件: acme.sh 说没事但进了 14 天 → result=fail" || bad "4i 事件: $(evshow)"
 # 这条正文带着「<dns插件名>」: 终端里照原文, 发给 Telegram 的必须转义(否则整条 400 拒收, 一条都收不到)
 [[ "$out" == *"sudo pdg lan cert <dns插件名>"* ]] && grep -qF 'sudo pdg lan cert &lt;dns插件名&gt;' "$W/notify.log" \
   && ! grep -qF '<dns插件名>' "$W/notify.log" \
@@ -338,6 +359,7 @@ reset_case; mv "$ACME_HOME/acme.sh" "$WORK/acme.sh.away"
 out="$(run _lan_renew --notify 2>&1)"; rc=$?
 [[ "$rc" == 0 && "$out" == *"不归这里续"* && "$(calls 'restart pdg-lan$')" == 0 && ! -s "$W/notify.log" ]] \
   && ok "没有 acme.sh → 不归这里续, rc 0" || bad "4j: rc=$rc out=$out"
+ev result=skip via=notify why=不是本项目签的 && ok "4j 事件: result=skip" || bad "4j 事件: $(evshow)"
 mv "$WORK/acme.sh.away" "$ACME_HOME/acme.sh"
 
 # ── 握手没拿到证书 ≠ 反代拿着旧证书 ────────────────────────────────────────────

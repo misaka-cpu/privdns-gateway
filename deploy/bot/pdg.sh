@@ -20,6 +20,27 @@ c_y(){ echo -e "\033[1;33m$*\033[0m"; }
 # 一段没有起因的补充说明。判定与退出码一直是对的, 缺的只是把原因说出来的能力。
 # 与 c_g / c_y 同流(stdout)、同风格: 标题与紧随其后的解释必须保持先后顺序, 分流会乱序。
 c_r(){ echo -e "\033[1;31m$*\033[0m"; }
+# _pdg_event <事件名> [键=值 ...]: 往 journal 打一行机读事件(SYSLOG_IDENTIFIER=pdg-event), 格式见 docs/events.md。
+# 给验收 / doctor / 监控按固定键找, 不用去对 c_g 那几行带颜色、措辞会改的人话。
+# 每个值都整理成一个不含空白的词: 空白换成 _, 控制字符删掉, 空值写 -, 超过 200 个**字符**截断
+# (函数内临时用 C.UTF-8 —— C 区域下 bash 按字节截, 截到半个汉字, journal 会把整行当成二进制)。
+# 只记操作本身: 不放凭据、token、用户 id、面板名 / 主机名。写不进去(没有 logger、没有 /dev/log)就算了,
+# 永远返回 0 —— 打日志失败不该改变任何操作的结果。
+_pdg_event(){
+  local LC_ALL=C.UTF-8 line="event=unknown" kv k v
+  [[ "${1:-}" =~ ^[a-z][a-z0-9_.]*$ ]] && line="event=$1"
+  shift || true
+  for kv in "$@"; do
+    [[ "$kv" == *=* ]] || continue
+    k="${kv%%=*}"; v="${kv#*=}"
+    [[ "$k" =~ ^[a-z][a-z0-9_]*$ ]] || continue
+    v="${v//[[:space:]]/_}"; v="${v//[[:cntrl:]]/}"
+    (( ${#v} > 200 )) && v="${v:0:200}…"
+    line+=" $k=${v:--}"
+  done
+  logger -t pdg-event -p user.info -- "$line" >/dev/null 2>&1 || true
+  return 0
+}
 need_root(){ [[ $EUID -eq 0 ]] || { echo "请用 root: sudo pdg $*"; exit 1; }; }
 # 活动内核后端: v1.6.0 起恒 mihomo(彻底移除 sing-box 运行时)。旧机器的 backend 标记里可能还
 # 写着 singbox, 但由 migrate_drop_singbox 在 update 时迁移 —— 判定一律按 mihomo。
@@ -8511,8 +8532,25 @@ _platform_exit_notify(){
 }
 # 派发入口: 带 --notify 的(bot 起的后台任务)走通知包装, 其余原样交给 cmd_platform。分流放在这里而不是
 # 派发行上: 顶层派发每一支都是 `shift || true; <函数> "$@";;`, tests/test-cli-dispatch.py 按这个形状逐支核参数转交。
+# 机读事件 platform.switch 也记在这里(两条路都经过): 只在参数里有 ios / android 时记 —— 无参是看用法 / 当前值。
+# 成不成按"退出码 0 且切完确实是目标平台"判, 不看输出文案。cmd_platform 拿不到锁时直接 exit, 走不到这一行
+# (通知那一路由 EXIT trap 另发 Telegram)。局部变量带 _pfe_ 前缀, 理由同 _platform_notify_run。
 cmd_platform_entry(){
-  if [[ " $* " == *" --notify "* ]]; then _platform_notify_run "$@"; else cmd_platform "$@"; fi
+  local _pfe_a _pfe_to="" _pfe_from="" _pfe_via=cli _pfe_rc=0 _pfe_now
+  for _pfe_a in "$@"; do
+    case "$_pfe_a" in ios|android) _pfe_to="$_pfe_a";; --notify) _pfe_via=notify;; esac
+  done
+  [[ -n "$_pfe_to" ]] && _pfe_from="$(_pdg_platform)"
+  if [[ " $* " == *" --notify "* ]]; then _platform_notify_run "$@" || _pfe_rc=$?; else cmd_platform "$@" || _pfe_rc=$?; fi
+  if [[ -n "$_pfe_to" ]]; then
+    _pfe_now="$(_pdg_platform)"
+    if [[ "$_pfe_rc" == 0 && "$_pfe_now" == "$_pfe_to" ]]; then
+      _pdg_event platform.switch result=ok via="$_pfe_via" from="$_pfe_from" to="$_pfe_to"
+    else
+      _pdg_event platform.switch result=fail via="$_pfe_via" from="$_pfe_from" to="$_pfe_to" now="$_pfe_now" rc="$_pfe_rc"
+    fi
+  fi
+  return "$_pfe_rc"
 }
 # 局部变量一律带 _pf_ 前缀: bash 的 local 是动态作用域, cmd_platform 往下调用的函数若给 rc / h 这类
 # 通用名赋值又没声明 local, 改到的就是这里的变量 —— 一次成功的切换会被报成失败。
@@ -9180,12 +9218,15 @@ _lan_renew(){
     esac
   done
   need_root lan
-  local crt="$LAN_CERT_DIR/panel.crt"
+  local crt="$LAN_CERT_DIR/panel.crt" via=cli
+  (( notify )) && via=notify               # 带 --notify 的是 pdg-lan-cert.timer 那一次
   if [[ ! -x "$ACME_HOME/acme.sh" ]]; then
-    echo "本机的面板证书不是本项目签的(没有 $ACME_HOME), 不归这里续。"; return 0
+    echo "本机的面板证书不是本项目签的(没有 $ACME_HOME), 不归这里续。"
+    _pdg_event lan.cert.renew result=skip via="$via" why="不是本项目签的"; return 0
   fi
   if [[ ! -s "$crt" ]]; then
-    echo "还没有 $crt —— 先 sudo pdg lan cert <dns插件名> 签发。"; return 0
+    echo "还没有 $crt —— 先 sudo pdg lan cert <dns插件名> 签发。"
+    _pdg_event lan.cert.renew result=skip via="$via" why="还没有证书"; return 0
   fi
   local fp0 fp1 rc=0 renewed=0 conv=same n exp msg="" ret=0 served="" noans=0
   fp0="$(_lan_cert_fp "$crt")"
@@ -9251,6 +9292,12 @@ _lan_renew(){
     restartfail) msg="${msg:+$msg }❌ 反代重启失败 —— 面板还在用旧证书。"; ret=1;;
     unreadable)  msg="${msg:+$msg }❌ 盘上的证书读不出来($crt)。"; ret=1;;
   esac
+  # 机读事件: ok = 续上了且反代给的就是新证书; converged = 没续(不到时候), 但把还拿着旧证书的反代收敛了;
+  # noop = 什么都不用做; fail = 上面任何一条 ret=1。not_after 是盘上那张的到期日(UTC)。
+  local res=noop na
+  if (( ret )); then res=fail; elif (( renewed )); then res=ok; elif [[ -n "$msg" ]]; then res=converged; fi
+  na=""; [[ -n "$exp" ]] && { na="$(date -u -d "$exp" +%F 2>/dev/null)" || na=""; }   # 空串给 date -d 会得到"今天"
+  _pdg_event lan.cert.renew result="$res" via="$via" renewed="$renewed" conv="$conv" acme_rc="$rc" not_after="$na"
   if [[ -z "$msg" ]]; then
     echo "面板证书还不到续期时间(${exp:-?} 到期)。$([[ "$conv" == inactive ]] && echo "反代没在跑, 没有比对。" || echo "反代给出的就是盘上这张。")"
     return 0
@@ -11169,7 +11216,7 @@ _kernel_install(){
 # 带 --notify 的后台任务(bot 点的、定时任务调的)只有 Telegram 这一个出口能告诉用户结果。
 # 每条出口都经 _kernel_note 发一次; 没发出去就退出(拿不到锁时 _lock 直接 exit、或中途意外退出)
 # 由 EXIT trap 补一条, 免得 bot 说了"结果会单独发消息"之后什么都等不到。
-KF_NOTIFY=0; KF_NOTIFIED=0
+KF_NOTIFY=0; KF_NOTIFIED=0; KF_VIA=cli
 _kernel_note(){   # $1=ok|fail|error|skip|- $2=版本 $3=原因 $4=给 Telegram 的话("-" = 不记 last)
   [[ "$1" != - ]] && { _kf note --result "$1" --version "$2" --why "${3:-}" >/dev/null 2>&1 || true; }
   if [[ "$KF_NOTIFY" == 1 && -n "${4:-}" ]]; then
@@ -11184,6 +11231,11 @@ _kernel_exit_notify(){
 
 _kernel_host(){ hostname -s 2>/dev/null || echo 网关; }
 
+# 内核那几条机读事件(kernel.switch / revert / tick / mode / auto, 见 docs/events.md), 统一带上 via:
+#   cli = 不带 --notify 直接调的(终端里敲的, 也包括 bot 同步调的 mode / auto);
+#   notify = 带 --notify 的后台任务(实际上只有 bot 这么起); auto = 每日定时 tick 换的。
+_kernel_ev(){ local op="$1" res="$2"; shift 2; _pdg_event "kernel.$op" "result=$res" "via=${KF_VIA:-cli}" "$@"; }
+
 # pdg kernel upgrade [vX.Y.Z] [--notify]: 跟上游模式下换到上游最新稳定版(或指定的那一版)。
 _kernel_upgrade(){
   local want="" a mode arch pin bin inst rel tag url asha g grc prev h
@@ -11195,35 +11247,44 @@ _kernel_upgrade(){
     esac
   done
   h="<b>$(_kernel_host)</b>"
-  mode="$(_kf state --get mode)" || { echo "$mode"; _kernel_note - "" "" "❌ $h 内核跟随记录读不出: ${mode#❌ }"; return 1; }
+  mode="$(_kf state --get mode)" || {
+    echo "$mode"; _kernel_ev switch error to="$want" why="内核跟随记录读不出:${mode#❌ }"
+    _kernel_note - "" "" "❌ $h 内核跟随记录读不出: ${mode#❌ }"; return 1; }
   if [[ "$mode" != upstream ]]; then
     echo "现在是「跟发布」: 内核随项目发版走, 由 sudo pdg update 收敛到钉值。"
     echo "要直接跟上游, 先 sudo pdg kernel mode upstream"
+    _kernel_ev switch skip to="$want" why="现在是跟发布"
     _kernel_note - "" "" "ℹ️ $h 现在是「跟发布」, 没有换内核。"; return 1
   fi
   # shellcheck source=/dev/null
   source "$REPO_DIR/lib/versions.sh" 2>/dev/null \
-    || { echo "❌ 读不到 versions.sh, 无从确认发布钉值"; _kernel_note - "" "" "❌ $h 读不到 versions.sh, 没有换内核。"; return 1; }
+    || { echo "❌ 读不到 versions.sh, 无从确认发布钉值"; _kernel_ev switch error to="$want" why="读不到versions.sh"
+         _kernel_note - "" "" "❌ $h 读不到 versions.sh, 没有换内核。"; return 1; }
   arch="$(_kernel_arch)"; pin="$MIHOMO_VER"; bin="$(_core_bindir)/mihomo"
   IFS='|' read -r inst _ <<<"$(_kernel_installed "$arch" "$pin" "$bin")"
   prev="${inst:-未知}"
   local targs=(release --arch "$arch"); [[ -n "$want" ]] && targs+=(--tag "$want")
   if ! rel="$(_kf "${targs[@]}")"; then
     # 查不到上游(网络 / API / 应答不合规)记 error: 与某一版好不好无关, 自动明天照样会再查。
-    echo "$rel"; _kernel_note error "$want" "${rel#❌ }" "❌ $h 换 mihomo 内核没做成: ${rel#❌ }"
+    echo "$rel"; _kernel_ev switch error from="$prev" to="$want" why="${rel#❌ }"
+    _kernel_note error "$want" "${rel#❌ }" "❌ $h 换 mihomo 内核没做成: ${rel#❌ }"
     return 1
   fi
   IFS=$'\t' read -r tag _ url asha _ <<<"$rel"
   g="$(_kf guard --pin "$pin" --target "$tag" --installed "$inst")"; grc=$?
   case "$grc" in
     0) ;;
-    3) echo "已是 $tag, 无需换核"; _kernel_note - "" "" "ℹ️ $h mihomo 已是上游最新稳定版 $tag, 没有换。"; return 0;;
-    *) echo "不换: $g"; _kernel_note skip "$tag" "$g" "ℹ️ $h 没换 mihomo 内核: $g"; return 1;;
+    3) echo "已是 $tag, 无需换核"; _kernel_ev switch noop from="$prev" to="$tag"
+       _kernel_note - "" "" "ℹ️ $h mihomo 已是上游最新稳定版 $tag, 没有换。"; return 0;;
+    *) echo "不换: $g"; _kernel_ev switch skip from="$prev" to="$tag" why="$g"
+       _kernel_note skip "$tag" "$g" "ℹ️ $h 没换 mihomo 内核: $g"; return 1;;
   esac
   if _kernel_install "$tag" "$url" "$asha"; then
+    _kernel_ev switch ok from="$prev" to="$tag"
     _kernel_note ok "$tag" "" "✅ $h mihomo 内核已换到 $tag(上一版 $prev), 体检与换核前一致。"
     return 0
   fi
+  _kernel_ev switch "${KF_KIND:-fail}" from="$prev" to="$tag" why="$KF_WHY"
   _kernel_note "${KF_KIND:-fail}" "$tag" "$KF_WHY" "❌ $h 换 mihomo 内核到 $tag 没成: $KF_WHY。现在跑的仍是 $prev。"
   return 1
 }
@@ -11237,25 +11298,31 @@ _kernel_revert(){
     case "$a" in --notify) KF_NOTIFY=1;; *) echo "未知参数: $a"; return 2;; esac
   done
   h="<b>$(_kernel_host)</b>"
-  mode="$(_kf state --get mode)" || { echo "$mode"; _kernel_note - "" "" "❌ $h 内核跟随记录读不出: ${mode#❌ }"; return 1; }
+  mode="$(_kf state --get mode)" || {
+    echo "$mode"; _kernel_ev revert error why="内核跟随记录读不出:${mode#❌ }"
+    _kernel_note - "" "" "❌ $h 内核跟随记录读不出: ${mode#❌ }"; return 1; }
   # 只在确实是跟上游时才改模式: 没用过这个功能的机器(没有 kernel.json)不因一次 revert 多出一份记录。
   if [[ "$mode" == upstream ]]; then
     if ! _kf set-mode pinned; then
+      _kernel_ev revert error why="改回跟发布没成"
       _kernel_note - "" "" "❌ $h 改回「跟发布」没成(内核跟随记录写不进), 内核没有动。"; return 1
     fi
     echo "已改成「跟发布」(自动一并关闭)。"
   fi
   # shellcheck source=/dev/null
   source "$REPO_DIR/lib/versions.sh" 2>/dev/null \
-    || { echo "❌ 读不到 versions.sh, 无从确认发布钉值"; _kernel_note - "" "" "❌ $h 读不到 versions.sh, 没有换回钉死版。"; return 1; }
+    || { echo "❌ 读不到 versions.sh, 无从确认发布钉值"; _kernel_ev revert error why="读不到versions.sh"
+         _kernel_note - "" "" "❌ $h 读不到 versions.sh, 没有换回钉死版。"; return 1; }
   if pdg_mihomo_binary_ok "$(_kernel_arch)" "$MIHOMO_VER" "$(_core_bindir)/mihomo"; then
-    echo "已是发布钉值 $MIHOMO_VER, 无需换回"
+    echo "已是发布钉值 $MIHOMO_VER, 无需换回"; _kernel_ev revert noop to="$MIHOMO_VER"
     _kernel_note ok "$MIHOMO_VER" "改回跟发布" "✅ $h 已改回「跟发布」, 内核本来就是发布钉值 $MIHOMO_VER。"; return 0
   fi
   _update_core_binary && ok=1
   if (( ok )); then
+    _kernel_ev revert ok to="$MIHOMO_VER"
     _kernel_note ok "$MIHOMO_VER" "改回跟发布" "✅ $h 已改回「跟发布」, mihomo 内核换回发布钉值 $MIHOMO_VER。"; return 0
   fi
+  _kernel_ev revert error to="$MIHOMO_VER" why="换回钉死版没成"
   _kernel_note error "$MIHOMO_VER" "换回钉死版没成" \
     "❌ $h 已改回「跟发布」, 但换回钉死版 $MIHOMO_VER 没成(见 sudo pdg kernel status)。下次 sudo pdg update 会再换。"
   return 1
@@ -11265,28 +11332,32 @@ _kernel_revert(){
 # AUTO_WAIT_DAYS 天才换; 同一版自动换失败过就不再自动重试(否则每天失败一次、通知一次)。
 _kernel_tick(){
   local mode auto arch pin inst rel tag pub g grc
-  mode="$(_kf state --get mode 2>/dev/null)" || { echo "内核跟随记录读不出, 跳过自动检查: $mode"; return 1; }
+  KF_VIA=auto
+  mode="$(_kf state --get mode 2>/dev/null)" || {
+    echo "内核跟随记录读不出, 跳过自动检查: $mode"; _kernel_ev tick error why="内核跟随记录读不出"; return 1; }
   auto="$(_kf state --get auto 2>/dev/null)"
-  [[ "$mode" == upstream && "$auto" == on ]] || return 0
+  [[ "$mode" == upstream && "$auto" == on ]] || { _kernel_ev tick off mode="$mode" auto="$auto"; return 0; }
   _lock
   # shellcheck source=/dev/null
-  source "$REPO_DIR/lib/versions.sh" 2>/dev/null || { echo "❌ 读不到 versions.sh"; return 1; }
+  source "$REPO_DIR/lib/versions.sh" 2>/dev/null || { echo "❌ 读不到 versions.sh"; _kernel_ev tick error why="读不到versions.sh"; return 1; }
   arch="$(_kernel_arch)"; pin="$MIHOMO_VER"
   IFS='|' read -r inst _ <<<"$(_kernel_installed "$arch" "$pin" "$(_core_bindir)/mihomo")"
-  rel="$(_kf release --arch "$arch")" || { echo "自动检查: $rel(明天再看)"; return 1; }
+  rel="$(_kf release --arch "$arch")" || { echo "自动检查: $rel(明天再看)"; _kernel_ev tick error why="${rel#❌ }"; return 1; }
   IFS=$'\t' read -r tag _ _ _ pub <<<"$rel"
   g="$(_kf guard --pin "$pin" --target "$tag" --installed "$inst")"; grc=$?
   case "$grc" in
     0) ;;
-    3) echo "自动检查: 已是上游最新稳定版 $tag"; return 0;;
-    *) echo "自动检查: 不换 —— $g"; return 0;;
+    3) echo "自动检查: 已是上游最新稳定版 $tag"; _kernel_ev tick latest target="$tag"; return 0;;
+    *) echo "自动检查: 不换 —— $g"; _kernel_ev tick skip target="$tag" why="$g"; return 0;;
   esac
   if ! _kf due --published-at "$pub" >/dev/null; then
-    echo "自动检查: 上游 $tag 发布于 $pub, 还没满等待期, 之后再换"; return 0
+    echo "自动检查: 上游 $tag 发布于 $pub, 还没满等待期, 之后再换"; _kernel_ev tick wait target="$tag" published="$pub"; return 0
   fi
   if _kf last-failed --version "$tag" >/dev/null; then
-    echo "自动检查: 上次自动换 $tag 失败过, 不再自动重试(手动: sudo pdg kernel upgrade $tag)"; return 0
+    echo "自动检查: 上次自动换 $tag 失败过, 不再自动重试(手动: sudo pdg kernel upgrade $tag)"
+    _kernel_ev tick held target="$tag"; return 0
   fi
+  _kernel_ev tick due target="$tag" published="$pub"
   _kernel_upgrade "$tag" --notify
 }
 
@@ -11313,17 +11384,22 @@ cmd_kernel(){
     status)  _kernel_status "$@";;
     mode)
       _lock
-      _kf set-mode "${1:-}" || return 1
+      _kf set-mode "${1:-}" || { _kernel_ev mode fail to="${1:-}"; return 1; }
+      _kernel_ev mode ok to="${1:-}"
       if [[ "${1:-}" == upstream ]]; then
         echo "已改成「跟上游」。sudo pdg kernel upgrade 换到上游最新稳定版; sudo pdg kernel auto on 打开每日自动。"
       else
         echo "已改成「跟发布」(自动一并关闭)。现在装着的若不是发布钉值, sudo pdg kernel revert 立刻换回,"
         echo "不换的话下次 sudo pdg update 也会把它收敛回钉值。"
       fi;;
-    auto)    _lock; _kf set-auto "${1:-}" && echo "自动换核: ${1:-}(上游稳定版发布满 3 天后, 由每日定时任务换上并发 Telegram 通知)";;
+    auto)
+      _lock
+      _kf set-auto "${1:-}" || { _kernel_ev auto fail to="${1:-}"; return 1; }
+      _kernel_ev auto ok to="${1:-}"
+      echo "自动换核: ${1:-}(上游稳定版发布满 3 天后, 由每日定时任务换上并发 Telegram 通知)";;
     upgrade|revert)
       # 后台任务(--notify)在取锁**之前**挂上补发: 拿不到锁时 _lock 直接 exit, 那一刻也要有一条消息。
-      [[ " $* " == *" --notify "* ]] && { KF_NOTIFY=1; trap _kernel_exit_notify EXIT; }
+      [[ " $* " == *" --notify "* ]] && { KF_NOTIFY=1; KF_VIA=notify; trap _kernel_exit_notify EXIT; }
       _lock
       if [[ "$sub" == upgrade ]]; then _kernel_upgrade "$@"; else _kernel_revert "$@"; fi;;
     tick)    _kernel_tick;;

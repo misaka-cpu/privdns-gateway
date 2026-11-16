@@ -151,5 +151,21 @@ if [[ -z "$ent" ]]; then bad "抽不到 cmd_platform_entry"; else
   [[ "$(route android)" == "PLAIN android" ]] && ok "不带 --notify → 原样 cmd_platform" || bad "不带: $(route android)"
   [[ "$(route)" == "PLAIN " ]] && ok "没有参数 → cmd_platform(由它打用法)" || bad "无参: [$(route)]"
   [[ "$(route ios --notifyx)" == "PLAIN ios --notifyx" ]] && ok "只认整词 --notify" || bad "近似词: $(route ios --notifyx)"
+  # 机读事件 platform.switch(docs/events.md): 只看事件本身, 两条路的输出上面已经核过。
+  # 切换桩按 $mode 演: ok = 退出码 0 且平台真的变了; fail = 退出码 1; lie = 退出码 0 但平台没变。
+  route_ev(){ bash -c 'set -uo pipefail; eval "$1"; mode="$2"; shift 2; P=android
+    _pdg_platform(){ echo "$P"; }; _pdg_event(){ echo "EVENT $*" >&2; }
+    sw(){ case "$mode" in ok) P="$1";; fail) return 1;; lie) return 0;; esac; }
+    _platform_notify_run(){ sw "$1"; }; cmd_platform(){ [[ -n "${1:-}" ]] || return 1; sw "$1"; }
+    cmd_platform_entry "$@" 2>&1 >/dev/null; echo "rc=$?"' _ "$ent" "$@"; }
+  [[ "$(route_ev ok ios --notify)" == $'EVENT platform.switch result=ok via=notify from=android to=ios\nrc=0' ]] \
+    && ok "事件: bot 起的切换成功 → result=ok via=notify from/to" || bad "成功事件: $(route_ev ok ios --notify)"
+  [[ "$(route_ev ok android)" == $'EVENT platform.switch result=ok via=cli from=android to=android\nrc=0' ]] \
+    && ok "事件: 终端里切 → via=cli" || bad "via=cli: $(route_ev ok android)"
+  [[ "$(route_ev fail ios)" == $'EVENT platform.switch result=fail via=cli from=android to=ios now=android rc=1\nrc=1' ]] \
+    && ok "事件: 切换失败 → result=fail, 带 now 与 rc, 退出码原样传出" || bad "失败事件: $(route_ev fail ios)"
+  [[ "$(route_ev lie ios)" == $'EVENT platform.switch result=fail via=cli from=android to=ios now=android rc=0\nrc=0' ]] \
+    && ok "事件: 退出码 0 但平台没变 → 仍记 fail(不信退出码)" || bad "lie 事件: $(route_ev lie ios)"
+  [[ "$(route_ev ok)" == "rc=1" ]] && ok "无参(看用法)→ 不记事件" || bad "无参记了事件: $(route_ev ok)"
 fi
 finish
