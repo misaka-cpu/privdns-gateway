@@ -442,6 +442,9 @@ jobs:
       - name: "pdg platform --notify: 每种结局恰发一条 Telegram(含拿不到锁的 EXIT 补发) / 原因转义 / 派发行只在带 --notify 时分流"
         run: bash tests/test-platform-notify.sh
 
+      - name: "机读事件(bot 一侧): 与 pdg.sh 的 _pdg_event 逐字同格式 / 按钮只记动作名 / 不记正文、文件名与用户 id / 只记放行用户"
+        run: python3 tests/test-bot-events.py
+
       - name: "后台任务的 Telegram 出口: HTML 被拒收(400)退回纯文本再发一次 / 没有回应不重发"
         run: python3 tests/test-healthcheck-notify.py
 

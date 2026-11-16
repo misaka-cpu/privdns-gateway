@@ -11,7 +11,7 @@ UI 原地编辑消息(editMessageText), 不刷屏。改 sing-box 前备份, chec
 注: 模块可被 import (供定时任务调用 refresh_rulesets), 此时无需 token。
 """
 from __future__ import annotations
-import base64, contextlib, fcntl, hashlib, html, http.client, io, json, os, re, shutil, signal, socket, subprocess, sys, tarfile, tempfile, threading, time, uuid
+import base64, contextlib, fcntl, hashlib, html, http.client, io, json, os, re, shutil, signal, socket, subprocess, sys, syslog, tarfile, tempfile, threading, time, uuid
 import concurrent.futures
 import urllib.parse, urllib.request, urllib.error
 from collections import Counter
@@ -599,6 +599,55 @@ def answer_cb_async(cb_id):
         except Exception:  # noqa: BLE001
             pass
     threading.Thread(target=go, daemon=True).start()
+
+# ── 机读事件(docs/events.md): 与 pdg.sh 的 _pdg_event 同一格式、同一个 SYSLOG_IDENTIFIER(pdg-event)。
+# bot 这一侧只记"放行用户点了 / 发了什么动作", 动作的结果由它调起的 pdg 命令自己记(kernel.switch 等)。
+_EV_NAME = re.compile(r"^[a-z][a-z0-9_.]*$")
+_EV_KEY = re.compile(r"^[a-z][a-z0-9_]*$")
+_EV_WORD = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
+_EV_CMD = re.compile(r"^/([a-z][a-z0-9_]{0,31})(?:@\S+)?(?:\s|$)")
+
+
+def _ev_val(v):
+    v = "".join(ch for ch in re.sub(r"\s", "_", str(v)) if ch.isprintable())
+    return (v[:200] + "…" if len(v) > 200 else v) or "-"
+
+
+def pdg_event(event, /, **fields):
+    """往 journal 打一行 `event=<名> 键=值 …`。写不进去就算了 —— 打日志失败不改变任何操作。
+    事件名只收位置参数: 字段里本来就有叫 name 的(bot.text 的命令名)。"""
+    try:
+        parts = ["event=" + (event if _EV_NAME.match(event) else "unknown")]
+        parts += ["%s=%s" % (k, _ev_val(v)) for k, v in fields.items() if _EV_KEY.match(k)]
+        syslog.openlog("pdg-event", 0, syslog.LOG_USER)
+        syslog.syslog(syslog.LOG_INFO, " ".join(parts))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def bot_update_event(u):
+    """放行用户的每次操作记一行; 只记动作名, 不记内容, 也不记用户 id / chat id:
+    · 按钮: 只取 callback_data 第一个 ':' 之前那段, 且须是小写词形 —— 后半段可能带域名、面板名、序号;
+    · 文字: 只记是不是 /命令、是哪条命令 —— 输入框里敲的可能是 token、密码、订阅地址;
+    · 文件: 不记文件名。
+    主循环里它排在处理之前: 这里出任何异常都吞掉, 不能让记一行日志挡住这次操作本身。"""
+    try:
+        if "callback_query" in u:
+            head = str((u["callback_query"] or {}).get("data") or "").split(":", 1)[0]
+            pdg_event("bot.callback", action=head if _EV_WORD.match(head) else "other")
+        elif "message" in u:
+            m = u["message"] or {}
+            if "text" in m:
+                c = _EV_CMD.match(m.get("text") or "")
+                if c:
+                    pdg_event("bot.text", kind="command", name=c.group(1))
+                else:
+                    pdg_event("bot.text", kind="input")
+            elif "document" in m:
+                pdg_event("bot.document")
+    except Exception:  # noqa: BLE001
+        pass
+
 
 def sh(cmd, input=None):          # noqa: A002 —— 与 subprocess.run 同名, 刻意保持一致
     """跑一条命令。`input` 走 stdin —— 批量域名条数由用户决定, argv 有长度上限, 超了会得到
@@ -5673,6 +5722,7 @@ def main():
                     m = u["message"]
                     if m["from"]["id"] not in ALLOWED:
                         continue
+                    bot_update_event(u)
                     if "text" in m:
                         handle_text(m["chat"]["id"], m["text"], m.get("message_id"), m["from"]["id"])
                     elif "document" in m:
@@ -5682,6 +5732,7 @@ def main():
                     # 先停按钮转圈, 再跑可能较慢的 handle_cb(检查更新/测出口/自检等)。
                     answer_cb_async(q["id"])
                     if q["from"]["id"] in ALLOWED:
+                        bot_update_event(u)
                         handle_cb(q["message"]["chat"]["id"], q["message"]["message_id"], q["data"], q["from"]["id"])
             except Exception as e:  # noqa: BLE001
                 print("handle err", e, flush=True)

@@ -7,7 +7,8 @@
 #   · 取件: curl 桩从本地目录喂文件(喂的是**真** mihomo 重新 gzip 的下载物);
 #   · 上游 API / 换核体检 / Telegram: kernelfollow.py 换成一个薄壳, 载入真模块后只替换
 #     _http_get、health、notify 三个函数(分别读夹具文件 / 按序列返回体检结果 / 记日志);
-#   · systemd: systemctl 桩(与 test-mihomo-real-swap.sh 同一套)。
+#   · systemd: systemctl 桩(与 test-mihomo-real-swap.sh 同一套);
+#   · journal: logger 桩, 把 _pdg_event 打出的机读事件(docs/events.md)逐行记进 event.log。
 #
 # 断言的是落盘结果, 不是输出文案: 内核文件的摘要、本机记录的字段、通知日志、取件次数。
 # 每一格先确认夹具真的执行过(函数抽得到、shim 真被调用), 再谈"没动"。
@@ -49,7 +50,7 @@ xt(){
 FNS=(_core_bindir _pdg_sha _core_stash_kernel _core_restore_prev _core_kernel_stable _core_restart_clean
      _core_listeners _core_swap_verify _pdg_mktemp_dir _core_dl_reason _update_core_binary _pdg_module
      _kf _kernel_arch _kernel_installed _kernel_install _kernel_note _kernel_exit_notify _kernel_host _kernel_upgrade
-     _kernel_revert _kernel_tick _kernel_status cmd_kernel)
+     _kernel_revert _kernel_tick _kernel_status cmd_kernel _pdg_event _kernel_ev)
 : > "$WORK/h.sh"
 miss=""
 for f in "${FNS[@]}"; do
@@ -65,6 +66,9 @@ mkdir -p "$BIN" "$CFG" "$ETC" "$SRV" "$WORK/repo/lib" "$WORK/repo/deploy/bot"
   grep -E '^KF_[A-Z]+=' "$ROOT/deploy/bot/pdg.sh"      # 全局状态行原样取自生产文件
   echo 'c_g(){ echo "$*"; }; c_y(){ echo "$*"; }; sleep(){ :; }; need_root(){ :; }; _lock(){ :; }'
   echo 'hostname(){ echo testgw; }; dpkg(){ echo amd64; }; ss(){ :; }'
+  # logger 桩: 记下标识 / 级别 / 正文, 好核对 _pdg_event 的调用形状, 而不只是正文
+  echo "logger(){ local t='' p=''; while [[ \$# -gt 0 ]]; do case \"\$1\" in -t) t=\"\$2\"; shift;; -p) p=\"\$2\"; shift;; --) shift; break;; esac; shift; done"
+  echo "          printf '%s\\n' \"[\$t|\$p] \$*\" >> '$WORK/event.log'; }"
   # 取件桩: 记下 URL, 按 URL 的文件名从本地目录喂; 没有这个文件 → curl 的 22(HTTP 错误)
   echo "curl(){ local o='' u=''; while [[ \$# -gt 0 ]]; do case \"\$1\" in -o) o=\"\$2\"; shift;; https://*) u=\"\$1\";; esac; shift; done"
   echo "        echo \"\$u\" >> '$WORK/curl.log'; [[ -f '$SRV/'\"\${u##*/}\" ]] || return 22; cp '$SRV/'\"\${u##*/}\" \"\$o\"; }"
@@ -134,7 +138,12 @@ cur_json(){ printf '{"version":"%s","sha256":"%s","source":"upstream","archive_d
 field(){ python3 -c 'import json,sys; d=json.load(open(sys.argv[1]));
 for k in sys.argv[2].split("."): d = (d or {}).get(k) if isinstance(d, dict) else None
 print("" if d is None else d)' "$ETC/kernel.json" "$1" 2>/dev/null; }
-fresh(){ rm -f "$WORK"/*.n "$WORK/curl.log" "$WORK/api.log" "$WORK/notify.log" "$ETC/kernel.json"; }
+fresh(){ rm -f "$WORK"/*.n "$WORK/curl.log" "$WORK/api.log" "$WORK/notify.log" "$WORK/event.log" "$ETC/kernel.json"; }
+# has_ev 词…: event.log 里有一行同时含这些**整词**(前后是空格或行首尾), 不是子串 —— to=v1.19.3 不算 to=v1.19.34
+has_ev(){ local l t hit; [[ -f "$WORK/event.log" ]] || return 1
+  while IFS= read -r l; do hit=1; for t in "$@"; do [[ " $l " == *" $t "* ]] || { hit=0; break; }; done
+    (( hit )) && return 0; done < "$WORK/event.log"; return 1; }
+n_ev(){ grep -c -F -- "$1" "$WORK/event.log" 2>/dev/null || true; }
 run(){ env REPO_DIR="$WORK/repo" PDG_CORE_BINDIR="$BIN" bash -c "source '$WORK/h.sh'; [[ \$HARNESS_OK == 1 ]] || exit 99; $*" \
          > "$WORK/out" 2>&1; echo $?; }
 n_of(){ cat "$WORK/$1.n" 2>/dev/null || echo 0; }
@@ -147,6 +156,8 @@ rc="$(run _kernel_upgrade)"
 [[ "$rc" == 1 ]] && grep -q 跟发布 "$WORK/out" && ok "没有记录(跟发布)→ 拒绝并说明" || bad "跟发布下 upgrade 应当拒绝(rc=$rc)"
 [[ "$(binsha)" == "$OLD" && "$(n_of api)" == 0 && ! -e "$WORK/curl.log" && ! -e "$ETC/kernel.json" ]] \
   && ok "内核未动、没查上游、没取件、没建记录" || bad "跟发布下 upgrade 有了副作用"
+has_ev '[pdg-event|user.info]' event=kernel.switch result=skip via=cli && ok "事件: kernel.switch result=skip(标识 pdg-event)" \
+  || bad "跟发布下的拒绝没有事件: $(cat "$WORK/event.log" 2>/dev/null)"
 
 echo
 echo "══ 2. 跟上游: 取件 → 核对 → 换核 → 体检一致 → 记录 ══"
@@ -163,6 +174,8 @@ grep -q "https://github.com/MetaCubeX/mihomo/releases/download/$PIN/mihomo-linux
   && ok "取件 URL 由 tag 拼出, 指向官方 Release" || bad "取件 URL 不对: $(cat "$WORK/curl.log" 2>/dev/null)"
 grep -q '✅' "$WORK/notify.log" 2>/dev/null && ok "--notify 发了成功通知" || bad "没发成功通知"
 ls "$BIN"/.mihomo.pdg-prev.* >/dev/null 2>&1 && bad "旧核备份没清掉" || ok "成功后旧核备份已清"
+[[ "$(n_ev event=kernel.switch)" == 1 ]] && has_ev event=kernel.switch result=ok via=cli "to=$PIN" \
+  && ok "事件: 恰好一行 kernel.switch result=ok to=$PIN" || bad "换核成功的事件不对: $(cat "$WORK/event.log" 2>/dev/null)"
 
 echo
 echo "══ 3. 已是目标版本 → 什么都不做 ══"
@@ -170,6 +183,7 @@ rm -f "$WORK"/*.n "$WORK/curl.log"
 rc="$(run _kernel_upgrade)"
 [[ "$rc" == 0 && "$(n_of health)" == 0 && ! -e "$WORK/curl.log" ]] && grep -q 已是 "$WORK/out" \
   && ok "上游最新 = 已装且被认 → 不取件、不体检" || bad "已是最新时不该再换(rc=$rc)"
+has_ev event=kernel.switch result=noop "to=$PIN" && ok "事件: result=noop" || bad "已是最新没有 noop 事件"
 
 echo
 echo "══ 4. 下载物与上游 digest 不符 → 拒绝, 内核与记录都不动 ══"
@@ -179,6 +193,8 @@ rc="$(run _kernel_upgrade --notify)"
   && ok "digest 不符 → rc=1、旧核原样、没有记录、没走到体检" || bad "digest 不符时有副作用(rc=$rc)"
 [[ "$(field last.result)" == fail ]] && grep -q '❌' "$WORK/notify.log" 2>/dev/null \
   && ok "失败记进 last 并通知" || bad "失败没留痕"
+has_ev event=kernel.switch result=fail "to=$PIN" why=下载物与上游的归档摘要不符 \
+  && ok "事件: result=fail, why 是整理成一个词的原因" || bad "digest 不符的事件不对: $(cat "$WORK/event.log" 2>/dev/null)"
 
 echo
 echo "══ 4b. 下载失败(与版本无关)记 error, 自动第二天照样再试 ══"
@@ -188,10 +204,13 @@ rc="$(run _kernel_upgrade "$PIN" --notify)"
 mv "$SRV/hidden.gz" "$SRV/mihomo-linux-amd64-$PIN.gz"
 [[ "$rc" == 1 && "$(binsha)" == "$OLD" && "$(field last.result)" == error ]] \
   && ok "下载失败 → rc=1、旧核原样、记为 error(不是 fail)" || bad "下载失败的记法不对(rc=$rc, last=$(field last.result))"
-rm -f "$WORK/curl.log"
+has_ev event=kernel.switch result=error && ok "事件: result=error" || bad "下载失败没有 error 事件"
+rm -f "$WORK/curl.log" "$WORK/event.log"
 rc="$(run _kernel_tick)"
 [[ "$rc" == 0 && "$(binsha)" == "$PIN_BIN" ]] && grep -q "$PIN" "$WORK/curl.log" 2>/dev/null \
   && ok "上次只是下载失败 → 下一次自动照常重试并换上" || bad "一次下载失败把自动卡住了(rc=$rc)"
+has_ev event=kernel.tick result=due via=auto "target=$PIN" && has_ev event=kernel.switch result=ok via=auto "to=$PIN" \
+  && ok "事件: tick result=due, 随后 switch result=ok via=auto" || bad "自动换核的事件不对: $(cat "$WORK/event.log" 2>/dev/null)"
 
 echo
 echo "══ 4c. 换核前体检一项 ok 都没有 → 不换(没有可对照的前像) ══"
@@ -211,6 +230,8 @@ rc="$(run _kernel_upgrade --notify)"
 grep -q 'out:jp' "$WORK/out" && ok "原因里点名了变差的那一项(out:jp)" || bad "原因没点名退步项"
 [[ "$(n_of health)" -ge 5 ]] && ok "后像有界重试过($(( $(n_of health) - 1 )) 次)再判" || bad "后像没重试就判了"
 ls "$BIN"/.mihomo.pdg-prev.* >/dev/null 2>&1 && bad "还原后残留备份" || ok "还原后不留备份文件"
+has_ev event=kernel.switch result=fail && grep -q 'why=换核后不如换核前' "$WORK/event.log" \
+  && ok "事件: 体检变差 → result=fail" || bad "体检变差的事件不对: $(cat "$WORK/event.log" 2>/dev/null)"
 
 echo
 echo "══ 6. 换核后头一次体检没就绪、重试后一致 → 不误判 ══"
@@ -226,6 +247,7 @@ rc="$(run _kernel_upgrade)"
 [[ "$rc" == 1 && "$(binsha)" == "$OLD" && ! -e "$WORK/curl.log" ]] && grep -q 钉值 "$WORK/out" \
   && ok "上游低于钉值 → 不换、不取件" || bad "低于钉值时不该换(rc=$rc)"
 [[ "$(field last.result)" == skip ]] && ok "记为 skip" || bad "last 不是 skip"
+has_ev event=kernel.switch result=skip to=v1.19.20 && ok "事件: 护栏拒绝 → result=skip" || bad "护栏拒绝没有 skip 事件"
 release "$PIN" "$GZ_SHA" true
 rc="$(run _kernel_upgrade)"
 [[ "$rc" == 1 && "$(binsha)" == "$OLD" && ! -e "$WORK/curl.log" ]] && ok "预发布 → 不换、不取件" || bad "预发布不该换(rc=$rc)"
@@ -261,6 +283,7 @@ rc="$(run _kernel_revert --notify)"
 [[ "$(field current.source)" == pin && "$(field previous.version)" == "$NX" ]] \
   && ok "记录改成 pin, 上游那份挪进 previous" || bad "revert 后记录不对"
 grep -q '✅' "$WORK/notify.log" 2>/dev/null && ok "--notify 发了结果" || bad "revert 没发结果"
+has_ev event=kernel.revert result=ok "to=$PIN" && ok "事件: kernel.revert result=ok" || bad "revert 没有 ok 事件"
 release "$NX" "$GZ_SHA" false "$(date -u -d '-5 days' +%FT%TZ)"; rm -f "$WORK/curl.log" "$WORK/api.n"
 rc="$(run _kernel_tick)"
 [[ "$rc" == 0 && "$(binsha)" == "$PIN_BIN" && "$(n_of api)" == 0 ]] && ok "revert 之后的定时检查不动内核" || bad "revert 之后被自动换回上游了"
@@ -277,6 +300,8 @@ fresh; OLD="$(mkold)"; health_seq "$HOK"
 release "$PIN" "$GZ_SHA" false "$(date -u -d '-5 days' +%FT%TZ)"
 rc="$(run _kernel_tick)"
 [[ "$rc" == 0 && "$(n_of api)" == 0 && "$(binsha)" == "$OLD" ]] && ok "没有记录 → tick 安静返回, 不查上游" || bad "跟发布的机器上 tick 有动作"
+has_ev event=kernel.tick result=off via=auto && ok "事件: 没开跟随也记一行 tick result=off(证明定时走到了 tick)" \
+  || bad "tick off 没有事件: $(cat "$WORK/event.log" 2>/dev/null)"
 state upstream false
 rc="$(run _kernel_tick)"
 [[ "$rc" == 0 && "$(n_of api)" == 0 ]] && ok "跟上游但自动关 → 不查上游" || bad "自动关时 tick 查了上游"
@@ -285,6 +310,7 @@ release "$PIN" "$GZ_SHA" false "$(date -u -d '-1 days' +%FT%TZ)"
 rc="$(run _kernel_tick)"
 [[ "$rc" == 0 && "$(binsha)" == "$OLD" && ! -e "$WORK/curl.log" ]] && grep -q 等待期 "$WORK/out" \
   && ok "上游发布不满 3 天 → 不换" || bad "等待期内换了(rc=$rc)"
+has_ev event=kernel.tick result=wait "target=$PIN" && ok "事件: tick result=wait" || bad "等待期没有 wait 事件"
 release "$PIN" "$GZ_SHA" false "$(date -u -d '-5 days' +%FT%TZ)"
 python3 - "$ETC/kernel.json" "$PIN" <<'P'
 import json, sys
@@ -294,6 +320,7 @@ P
 rc="$(run _kernel_tick)"
 [[ "$rc" == 0 && "$(binsha)" == "$OLD" && ! -e "$WORK/curl.log" ]] && grep -q 失败过 "$WORK/out" \
   && ok "同一版自动换失败过 → 不再自动重试" || bad "失败过的版本被自动重试了"
+has_ev event=kernel.tick result=held "target=$PIN" && ok "事件: tick result=held" || bad "失败过不重试没有 held 事件"
 state upstream true
 rc="$(run _kernel_tick)"
 [[ "$rc" == 0 && "$(binsha)" == "$PIN_BIN" ]] && grep -q '✅' "$WORK/notify.log" 2>/dev/null \
@@ -304,8 +331,10 @@ echo "══ 11. cmd_kernel: 模式 / 自动 / 用法 ══"
 fresh
 rc="$(run cmd_kernel auto on)"
 [[ "$rc" != 0 ]] && ok "跟发布下开自动 → 拒绝" || bad "跟发布下开自动应当拒绝"
+has_ev event=kernel.auto result=fail to=on && ok "事件: kernel.auto result=fail" || bad "开自动被拒没有事件"
 rc="$(run cmd_kernel mode upstream)"
 [[ "$rc" == 0 && "$(field mode)" == upstream ]] && ok "mode upstream 写进记录" || bad "mode upstream 失败(rc=$rc)"
+has_ev event=kernel.mode result=ok to=upstream && ok "事件: kernel.mode result=ok to=upstream" || bad "改模式没有事件"
 rc="$(run cmd_kernel auto on)"
 [[ "$rc" == 0 && "$(field auto)" == True ]] && ok "auto on" || bad "auto on 失败(rc=$rc, auto=$(field auto))"
 rc="$(run cmd_kernel mode pinned)"
@@ -323,11 +352,35 @@ state upstream false "$(cur_json "$PIN" "$PIN_BIN")"; cp "$REAL" "$BIN/mihomo"
 rc="$(run cmd_kernel upgrade --notify)"
 [[ "$rc" == 0 && "$(grep -c . "$WORK/notify.log" 2>/dev/null)" == 1 ]] && grep -q 已是 "$WORK/notify.log" \
   && ok "已是最新 → 恰好一条「没有换」的通知(不重复补发)" || bad "已是最新时通知不对: $(cat "$WORK/notify.log" 2>/dev/null)"
+has_ev event=kernel.switch result=noop via=notify && ok "事件: cmd_kernel … --notify → via=notify" || bad "后台任务的 via 不对: $(cat "$WORK/event.log" 2>/dev/null)"
 rc="$(run cmd_kernel frobnicate)"
 [[ "$rc" == 2 ]] && grep -q '用法: pdg kernel' "$WORK/out" && ok "未知子命令 → 用法, rc=2" || bad "未知子命令处理不对(rc=$rc)"
 rc="$(run cmd_kernel status)"
 [[ "$rc" == 0 ]] && grep -q '内核跟随: 跟上游' "$WORK/out" && grep -q "已装: $PIN(发布钉值)" "$WORK/out" \
   && ok "status 可读, 模式与已装来源对得上" || bad "status 不对(rc=$rc): $(head -3 "$WORK/out")"
+
+echo
+echo "══ 12. _pdg_event 本身: 一个值一个词、空值写 -、字符截断、写不进去也返回 0 ══"
+fresh
+long="$(printf '换%.0s' {1..230})"
+rc="$(run "_pdg_event kernel.test a='x y' b=\$'p\\tq\\nr' c= Bad=1 d=\$'\\e[1;32mok\\e[0m' e='$long'")"
+line="$(cat "$WORK/event.log" 2>/dev/null)"
+[[ "$rc" == 0 && "$(grep -c . "$WORK/event.log" 2>/dev/null)" == 1 ]] && ok "一次调用恰好一行" || bad "行数不对(rc=$rc): $line"
+[[ "$line" == "[pdg-event|user.info] event=kernel.test a=x_y b=p_q_r c=- d=[1;32mok[0m e="* ]] \
+  && ok "空白 → _、空值 → -、非法键(Bad)丢掉、ESC 删掉" || bad "整理不对: $line"
+e="${line##* e=}"
+[[ "$(LC_ALL=C.UTF-8 bash -c 'v="$1"; echo ${#v}' _ "$e")" == 201 && "$e" == *… ]] \
+  && ok "超长值按字符截到 200 个再加 …" || bad "截断不对(长度 $(LC_ALL=C.UTF-8 bash -c 'v="$1"; echo ${#v}' _ "$e"))"
+python3 -c 'import sys; open(sys.argv[1], "rb").read().decode("utf-8")' "$WORK/event.log" 2>/dev/null \
+  && ok "截断后整行仍是合法 UTF-8(没截到半个汉字)" || bad "截断产生了非法 UTF-8"
+rc="$(run "LC_ALL=C _pdg_event kernel.test e='$long'")"
+python3 -c 'import sys; open(sys.argv[1], "rb").read().decode("utf-8")' "$WORK/event.log" 2>/dev/null \
+  && ok "调用方在 C 区域下也按字符截" || bad "C 区域下截出了非法 UTF-8"
+rm -f "$WORK/event.log"
+rc="$(run "_pdg_event 'Bad Name' a=1")"
+has_ev event=unknown a=1 && ok "事件名不合词形 → event=unknown(不把任意文本当名字)" || bad "非法事件名: $(cat "$WORK/event.log" 2>/dev/null)"
+rc="$(run 'unset -f logger; PATH=/nonexistent; _pdg_event kernel.test a=1; echo "after rc=$?"')"
+[[ "$rc" == 0 && "$(cat "$WORK/out")" == "after rc=0" ]] && ok "没有 logger → 静默返回 0, 不打任何东西" || bad "没有 logger 时: rc=$rc out=$(cat "$WORK/out")"
 
 echo
 finish
