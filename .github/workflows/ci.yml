@@ -291,7 +291,7 @@ jobs:
         run: |
           command -v shellcheck >/dev/null || sudo apt-get install -y -q shellcheck
           shellcheck --severity=warning -e SC1091 \
-            install.sh uninstall.sh deploy/bot/*.sh deploy/cert/*.sh lib/*.sh tests/*.sh tools/*.sh
+            install.sh uninstall.sh deploy/bot/*.sh deploy/cert/*.sh lib/*.sh tests/*.sh tools/*.sh tools/evidence/*.sh
 
       - name: "防火墙迁移识别回归 (原装应迁移 / 自定义应跳过)"
         run: bash tests/test-fw-migration.sh
@@ -444,6 +444,12 @@ jobs:
 
       - name: "机读事件(bot 一侧): 与 pdg.sh 的 _pdg_event 逐字同格式 / 按钮只记动作名 / 不记正文、文件名与用户 id / 只记放行用户"
         run: python3 tests/test-bot-events.py
+
+      - name: "取证工具库 tools/evidence/evlib.sh: 仿 systemd 252 拒收 ISO 时刻 / 采不到不当 0 条 / 纯 bash 计数 / 守卫失败即停"
+        run: bash tests/test-evidence-lib.sh
+
+      - name: "取证脚本静态检查 ev-lint: 每条规则一正一反 / 引号与注释里的字不算 / ignore 只放过点名的规则"
+        run: python3 tests/test-evidence-lint.py
 
       - name: "后台任务的 Telegram 出口: HTML 被拒收(400)退回纯文本再发一次 / 没有回应不重发"
         run: python3 tests/test-healthcheck-notify.py
