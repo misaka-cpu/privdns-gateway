@@ -236,15 +236,27 @@ jobs:
 
 
 
+      # ── 从这里往下, 一支测试红了不再把后面的全部跳过 ─────────────────────────────────────
+      # 以前 lint 是一条串行链: 第一处红之后其余步骤全 skipped, 一次只看得到一个红, 修完推上去才知道下一个
+      # (换到 ubuntu-26.04 那次, 第一处红后面有 161 步没跑)。现在每一步都带 !cancelled(): 前面红了照跑,
+      # 任何一步红 job 照样判红。上面的取件 / 装件没成就没有 ready, 后面整段照旧跳过 —— 缺夹具时跑出来的红没有意义。
+      # 读红的时候先看**第一处**: 后面的红可能是前一支留下的现场连带出来的(桩、sysctl、残留进程)。
+      - name: "准备就绪 (取件 / 装件都成了; 之后的步骤不再因前一支失败而跳过)"
+        id: ready
+        run: echo "lint 准备就绪"
+
       - name: Python 语法 (py_compile)
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 -m py_compile deploy/bot/*.py tests/*.py
 
       - name: Shell 语法 (bash -n)
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: |
           bash -n install.sh uninstall.sh \
             deploy/bot/*.sh deploy/cert/*.sh lib/*.sh
 
       - name: JSON 模板渲染后可解析
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: |
           set -euo pipefail
           render() {
@@ -262,6 +274,7 @@ jobs:
           done
 
       - name: mobileconfig 模板是合法 plist/XML
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: |
           python3 - <<'PY'
           import plistlib, glob, sys
@@ -275,6 +288,7 @@ jobs:
           PY
 
       - name: systemd unit 静态检查 (best-effort, 不阻断)
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         continue-on-error: true
         run: |
           if command -v systemd-analyze >/dev/null; then
@@ -288,200 +302,263 @@ jobs:
           fi
 
       - name: "ShellCheck (阻断: 有 warning 即失败)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: |
           command -v shellcheck >/dev/null || sudo apt-get install -y -q shellcheck
           shellcheck --severity=warning -e SC1091 \
             install.sh uninstall.sh deploy/bot/*.sh deploy/cert/*.sh lib/*.sh tests/*.sh tools/*.sh tools/evidence/*.sh
 
       - name: "防火墙迁移识别回归 (原装应迁移 / 自定义应跳过)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-fw-migration.sh
 
       - name: "mosdns concurrent 迁移回归 (单上游=1/多上游=2/幂等)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-mosdns-concurrent.sh
 
       - name: "低内存模式回归 (fixture meminfo 解析/渲染/迁移幂等)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-lowmem.sh
 
       - name: "内核激活纪律回归 (假 systemctl+重启模拟: 只起一个内核/失败回滚/unit 无漂移)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-core-activate.sh
 
       - name: "sing-box→mihomo 迁移回归 (转不了的出口逐个列名/失败非0且回滚标记/成功清干净/幂等/第三方不删)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-migrate-drop-singbox.sh
 
       - name: "unit 写入原子性 (生成函数缺失/失败/空产出都不许截断既有 unit —— 跨版本回滚)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-write-unit-atomic.sh
 
       - name: "sing-box 归属保护 (uninstall/--purge 只删本项目装的, 第三方原样保留)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-singbox-ownership.sh
 
       - name: "第三方 sing-box 保护 (标准 ExecStart 也不认亲; 迁移/卸载/purge 后 sentinel 不变)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-singbox-thirdparty.sh
 
       - name: "平台隔离安装/迁移矩阵 (marker 证据回退/GMS 仅安卓/iOS GMS 清理/服务集按平台; 抽不到函数即 FAIL)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-platform-install.sh
 
       - name: "测试自身不许假绿 (抽不到函数/命令不存在/退出码非 0 必须记 FAIL)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-false-green-guard.sh
 
       - name: "P2 运行时缺陷回归 (锁 stderr / 快照提交 / start-limit / 已是最新短路)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-p2-runtime-fixes.sh
 
       - name: "SSH 来源限制必须活过模板重建 (收紧过的 22 端口不能被更新悄悄开回全网)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-ssh-source-persist.sh
 
       - name: "Tailscale 直连端口跟随 tailscaled 的 PORT= (切回 any 时按 comment 清除)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-tailnet-custom-port.sh
 
       - name: "E2E 探针生命周期回归(重复启动/退出/信号/并发/临时目录清理)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-e2e-probe-lifecycle.sh
 
       # 6.1A: 只读的链路准备状态。三支分别盯模型/采集器/平台隔离 —— 最怕的是"把不知道
       # 说成知道", 所以 NOT_OBSERVED 与退出码的关系单独有断言。
       - name: "链路诊断状态模型 (六状态闭集/未登记 code 拒绝/NOT_OBSERVED 不算故障/退出码)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-link-model.py
 
       - name: "事务 id 可排序 (同秒多笔不再靠随机后缀定顺序)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-txid-ordering.py
 
       - name: "doctor: 冲突制造者定位 + Tailscale 卸载残留"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-doctor-conflict-creator.py
 
       - name: "tailnet 直连端口: 证据等级与 PORT= 解析语义(无结论不得染绿)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-tailnet-port-evidence.py
 
       - name: "内网面板门一: 子网路由重叠拒绝(含每条判据的空测)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-lanroute.py
 
       - name: "内网面板门二: 面板表校验 + 反代生成(改写指令的空测)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-lanpanel.py
 
       - name: "内网面板接线: 面板规则必须排在反自环 REJECT 之前(含空测)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-lan-wire.py
 
       - name: "内网面板自检: 四项判据的每条分支(含 ACL 探测的三种读法)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-lan-doctor.py
 
       - name: "主防火墙重载的唯一入口(裸调会把内网面板白名单冲掉而不补回)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-lan-nft-chokepoint.sh
 
       - name: "反代重载的唯一入口(admin off 下 reload 必败, 只生成不重启=进程用着旧的)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-lan-proxy-reload-chokepoint.sh
 
       - name: "LAN 产物没变就别重启反代(跳过重启的那条路仍要补回内核白名单)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-lan-restart-idempotent.sh
 
       - name: "面板证书续期: 定时器装 / 拆 / 迁移, 续完握手比对、反代拿着旧证书就收敛(真 TLS 服务端扮演反代)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-lan-cert-renew.sh
 
       - name: "功能测试成功路径也要打印 mihomo 日志(截断要说清楚)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-functional-log-visibility.sh
 
       - name: "Location 改写: 真 Caddy 打真响应头(静态测试证明不了头被改了)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-lan-location-live.sh
 
       - name: "内网面板门四: 受管反代路由与面板表双向对账(回滚后的静默漂移)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-lan-proxy-drift.py
 
       - name: "内网面板回滚收敛: 派生产物跟随已恢复的模型, 且 render/apply 不假成功"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-lan-rollback-convergence.sh
 
       - name: "LAN 回滚收敛九格负控: 同一候选基线和逐项变异"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/negctl/lan-rollback-convergence-negative-controls.py
 
       - name: "回滚的防火墙结算: 主规则失败照实计入; 白名单补回/重启/状态查询逐次记录, 失败或未取得不报完全回滚"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-rollback-fw-record.sh
 
       - name: "去广告规则编译/校验/LKG/check 判定(不起 mosdns, 盯落盘之前那一段)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-adblock-rules.py
 
       - name: "去广告行为契约: 真 mosdns + 生产模板, 优先级六层与三协议一致"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-adblock-contracts.sh
 
       - name: "去广告基础设施闭包: ACME provider 的 API 域名能否枚举(枚举不到 ≠ 没有 provider)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-adblock-provider.py
 
       - name: "去广告启用门: 闭包不完整必须 fail-closed, 且失败后逐项不变"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-adblock-enable-gate.sh
 
       - name: "去广告下载器安全边界: scheme/host/端口/重定向/非公网地址/TLS/代理(本地真 TLS, 不碰外网)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-adblock-fetch-security.py
 
       - name: "去广告 check 的输入契约: 非法域名必须 fail-closed, 不答'未阻断'"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-adblock-cli-input.sh
 
       - name: "去广告受管块的迁移依赖: 排在 explicit_proxy 之后 + 缺前置时跳过而不是插坏块"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-adblock-migration-order.py
 
       - name: "去广告用户规则事务 CLI: 停用态只改源 / 幂等零重启 / 精确删除 / 失败整份回滚"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-adblock-rule-cli.sh
 
       - name: "去广告第三方源可配: add 当场校验 / 幂等 / 白名单只跟配置过的源走 / 进快照"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-adblock-sources.sh
 
       - name: "第三方表容错: 下划线主机名放行 / 少量坏行跳过计数 / 超阈值仍整份拒"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-adblock-upstream-tolerance.py
 
       - name: "用户 block 体积上限: compile 与 rule-add 两道门 / 满了不等于域名不合法"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-user-block-ceiling.py
 
       - name: "批量加规则是一笔事务(一次锁/一次编译/一次重启), 单域名旧契约不变"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-adblock-bulk-rules.py
 
       - name: "Telegram 内联按钮管理去广告规则: 闭集 callback / 跨用户隔离 / 只经 argv 调 CLI"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-bot-adblock-inline.py
 
       - name: "Telegram 里能管规则集(源)并让它生效: 下标按钮 / 点击时重新对照 / 慢操作走后台"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-bot-adblock-sources.py
 
       - name: "Telegram「🧬 内核」页: 闭集回调 / 回调不带版本号 / 按模式出按钮 / 换核走 systemd-run 交给 CLI"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-bot-kernel-page.py
 
       - name: "Telegram「📱 手机平台」页: 闭集回调 / 按当前平台出按钮 / 二次确认 / 点确认时再核平台 / 切换走 systemd-run 交给 CLI"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-bot-platform-page.py
 
       - name: "pdg platform --notify: 每种结局恰发一条 Telegram(含拿不到锁的 EXIT 补发) / 原因转义 / 派发行只在带 --notify 时分流"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-platform-notify.sh
 
       - name: "机读事件(bot 一侧): 与 pdg.sh 的 _pdg_event 逐字同格式 / 按钮只记动作名 / 不记正文、文件名与用户 id / 只记放行用户"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-bot-events.py
 
       - name: "取证工具库 tools/evidence/evlib.sh: 仿 systemd 252 拒收 ISO 时刻 / 采不到不当 0 条 / 纯 bash 计数 / 守卫失败即停"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-evidence-lib.sh
 
       - name: "取证脚本静态检查 ev-lint: 每条规则一正一反 / 引号与注释里的字不算 / ignore 只放过点名的规则"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-evidence-lint.py
 
       - name: "后台任务的 Telegram 出口: HTML 被拒收(400)退回纯文本再发一次 / 没有回应不重发"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-healthcheck-notify.py
 
       - name: "去广告写入口并发闭包: 五个写命令共用全局锁 / 锁忙零副作用 / status 严格只读"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-adblock-lock-closure.sh
 
       - name: "去广告受管块的插入锚点必须是结构而非注释(存量机器形态)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-adblock-anchor-shape.py
 
       - name: "跨版本迁移矩阵(历史 tag 的配置 → 当前迁移 → 真 mosdns 起得来)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-cross-version-migration.sh
 
       - name: "链路诊断采集器 (证书正常/临期/过期/错域名/损坏/误放私钥; 零写入零写锁)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-link-status.py
 
       - name: "链路诊断平台隔离 (probe81 两平台公共件 / iOS 第 3 层查服务器就绪 / 文案不串台)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-link-platform.py
 
       - name: "probe81 转公共组件 (install/update/迁移/平台切换/doctor/卸载 全链路)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-probe81-platform.py
 
       # .153 真机: 运行模块与 CLI 同步到新版本、$REPO_DIR 却还停在旧 commit 时, 迁移在第一行
       # 守卫静默 return 0 —— unit 没装出来, 整条链路却收到"成功"。probe81 已是两平台公共
       # 必需件, 模板缺失现在是硬失败。
       - name: "probe81 迁移 fail-closed (缺 unit 模板必须非零且零写入; 失败逐层传播)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-probe81-migrate-failclosed.py
 
       - name: "链路会话: token/TTL/单次消费/限流/隐私 + root↔DynamicUser 文件交接"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-link-session.py
 
       - name: "mosdns DNS 证据闸门 (API 暴露面: 阶段 3 因缓存导出/投喂端点停止)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-link-dns-evidence.py
 
       # 6.2A DoT 证据源。这六支是纯 Python, 不需要真 mosdns/systemd, 所以留在 lint;
@@ -489,37 +566,51 @@ jobs:
       # tests/helpers/dns-{stub,client}.py 是那两支 E2E 用的库, 没有断言输出,
       # 不作为独立测试登记; tests/negctl/ 下的负控按项目惯例是本地手动门。
       - name: "DoT 证据端契约 (SNI + 探测后缀双守卫; 只认 24 位小写 hex)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-dot-witness.py
       - name: "DoT 配置输入闭包 (占位符都有生产者; witness 端口单一真源)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-dot-render.py
       - name: "DoT 隐私与边界门 (每条判据先过反向夹具, 防扫不到也绿)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-dot-privacy.py
       - name: "DoT 故障矩阵 (DNS parser 25 格 + 状态文件 24 格 + 原子写)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-dot-faults.py
       - name: "DoT evidence 校验闭集与配置缺失时启动 fail-closed"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-dot-strict.py
       - name: "DoT 测试卫生 (异常/SystemExit/中断都要清掉临时目录)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-dot-tmpguard.py
       - name: "6.2B 会话关联与三态语义 (观察端不可用时永不 OBSERVED)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-dot-session.py
       - name: "6.2B evidence 留存期必须覆盖窗口+结算余量 (否则 NOT_OBSERVED 不可达)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-dot-ttl.py
       # 下面两支只读源码, 不碰 systemd/网络, 所以留在这个轻量 job 里。
       - name: "6.2B witness 生命周期接线 (装机闭包/enable 门/卸载/doctor 分级与严重级)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-dot-lifecycle.py
       - name: "6.2B 迁移矩阵子集选择器必须 fail-closed (误设不许静默只跑一部分)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-dot-matrix-selector.py
       - name: "6.2B 受管块标记契约 (state/strip 同一套精确语义, 九种变体)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-dot-route-markers.py
 
       - name: "witness 迁移的失败理由 (每条出口都可定位 / 缺失与非法分开 / 不回显域名)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-dotwitness-error-reasons.py
       # 真 systemd 那一半在 core-startlimit job(tests/e2e-dotwitness-settle.sh)。
       - name: "迁移链成功后的 witness 核验 (只经 __migrate 派发且链返回 0 / 固定参数 / 恒返回 0 / 限额命中只恢复一次; 模型)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-dotwitness-settle.sh
       # 这支的动态段要真跑 `nft -c`, 非 root 下 nft 连缓存都初始化不了 —— 会自报 SKIP
       # 并说明原因(不算通过)。用 sudo 跑, 让那段真正当裁判; runner 上 nft 是现成的。
       - name: "nft 模板渲染点必须替换每一个占位符 (含真 nft -c)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: |
           set -euo pipefail
           out="$(sudo -n python3 tests/test-firewall-render-tokens.py)"
@@ -528,278 +619,362 @@ jobs:
             || { echo "渲染门有失败, 或动态 nft -c 段被跳过了"; exit 1; }
 
       - name: "链路会话证据接进 linkstat (NOT_OBSERVED/PASS/STALE 语义与退出码隔离)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-link-live.py
 
       # 逐处钉字面量管不住"下一处新写的文案"。这道闸门从用户真正看到的输出入手, 统一扫
       # 越界结论(SIM/APN/DoT/整体联网正常), 并守住 NOT_OBSERVED 不被写成故障。
       - name: "手机侧证据的结论上限 (越界结论闸门 + NOT_OBSERVED 不是故障)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-link-copy-boundary.py
 
       # 6.1C 把会话接进 Bot。判据不在"功能跑得通", 而在接的过程中有没有把 6.1B 的克制
       # 弄丢: token 只在一次性按钮里、结论不越界、状态机只有一份、整条路只读。
       - name: "Bot 手机链路测试 (token 只在按钮/结论上限/只读/并发与故障释放)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-link-bot.py
 
       # .153 真机 P0: probe81 以 DynamicUser 跑, 读不到 0600 root 的 profile.env, 于是
       # "来源在不在内网卡段"这条证据永远产不出来。判据只能落在**真的换 UID**上 —— 同一个
       # uid 下怎么测都是空转。CI 是 root 容器, 严格模式下 SKIP 判失败。
       - name: "链路会话跨 UID 边界 (真 setuid: 会话快照网段 / 不读 profile.env / schema fail-closed)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-link-profile-uid.py
 
       # 夹具自己漏资源, 会以"产品偶发失败"的样子冒出来 —— 判据落在真实线程/端口/目录上。
       - name: "txbox 探针生命周期 (clean 后线程必须退出/端口必须释放/50 个 Box 回到基线)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-txbox-probes.py
 
       - name: "负控字节码缓存隔离(同一秒改坏/恢复源码不得读到陈旧 .pyc)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-pycache-isolation.py
 
       # 判法是"私有 TMPDIR 跑一遍, 跑完必须是空的" —— 不按前缀扫 /tmp 删(那删的是并发中
       # 别人的沙箱)。同时盯失败路径(异常/非 0/SIGTERM)与 PDG_KEEP_TMP 留现场。
       - name: "临时物卫生 (一支测试跑完不许留下自己建的临时目录; PDG_KEEP_TMP=1 才留现场)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-tmp-hygiene.py
 
       - name: "E2E 影子桩生命周期 (ip/python3 桩不许活过进场与退出清理)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-e2e-shadow-stub.sh
 
       # 判据是**逐调用点**的: 只数"这个文件里有守卫"会放过"守卫写在动作之后"和"这两行前面
       # 根本没有守卫"—— 2026-08-02 开发者 origin 被改指到 /tmp 裸库正是后一种。
       - name: "e2e 不许碰共享 git ref 库 (复现 07-31 丢 tag/remote + 08-02 改坏 origin; 逐调用点核对)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-e2e-repo-guard.py
 
       - name: "GMS 推送端口迁移回归 (fw/sing-box 补 5228-5230, 自定义跳过, 失败回滚)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-gms-migration.sh
 
       - name: "mosdns force_hijack 锚点结构迁移回归 (补 domain_set/seq/优先级规则, 幂等/自定义跳过/失败还原)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-mitm-migration.sh
 
       - name: "parse_link 多协议回归 (各协议链接 + Surge ss 行字段映射)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-parse-links.py
 
       - name: "内网卡段取值回归 (真 pty: 抓包/手输并行谁先用谁 + 形态校验 + 半截输入不漏)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-cidr-input.py
 
       - name: "老机器 unit 重部署 (sing-box 悬空依赖换 mihomo / 保住装机 CERT_DIR / 幂等)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-unit-redeploy.sh
 
       - name: "内核版本精确匹配 (v1.19.1 不得匹配 v1.19.10; 读不到版本不跳过安装)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-version-match.sh
 
       # 这是**静态守卫**(只核对源码里的标识符), 不是端到端。真实行为覆盖在
       # e2e-update.sh 与 e2e-upgrade-from-release.sh —— 名字必须说实话。
       - name: "发布链路静态守卫 (源码标识符核对; 真实行为见 e2e-update / e2e-upgrade-from-release)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-release-flow.sh
 
       - name: "更新快照+精确回滚回归 (--dir 精确目标/--git 复位/部分失败不谎报/快照覆盖脚本)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-update-rollback.sh
 
       - name: "update 关键步骤故障注入 (git reset/必需文件/迁移/内核/daemon-reload 失败均回滚且不谎报成功)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-update-faults.sh
       - name: "A-off 更新保留停止态"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-update-aoff.py
       - name: Rollback newly added witness
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-rollback-witness-absence.py
 
       - name: "update 与最新发布的关系四态 (相同幂等/落后升级/领先拒绝/分叉拒绝; 真 git 判祖先)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-update-release-relation.sh
 
       - name: "update 前置 mosdns 完整性预检 (缺失/命令非零/摘要不符在第一次副作用前停下)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-update-mosdns-preflight.sh
 
       - name: "update --to 钉版 (参数三态/不被更高 tag 带偏/四态方向/目标移动/预览同源/dry-run 持锁)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-update-to-pin.sh
 
       # 判据本体自 v1.11.9 起已是"先算摘要再执行", 但预检的**诊断路径**为了分辨版本漂移
       # 又把候选文件跑了一遍 —— 判据挡在门外的东西, 诊断又请了进来。这一支用 marker 证明
       # 行为, 不看源码形状: 换个写法照样能执行, 只有 marker 在不在是判据。
       - name: "update 预检不执行未验文件 (摘要没过就不许跑它; marker 证明行为而非源码形状)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-update-preflight-no-exec.sh
 
       - name: "mosdns 运行时换版路径 (短路判据/压缩包与解压产物双重校验/坏件绝不落盘/失败回滚/快照收二进制)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-update-mosdns-binary.sh
 
       - name: "换核取件的工作区与边界 (临时目录失败即停/不退化到根目录/有界超时/超时不冒充版本问题)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-core-download-workspace.sh
 
       - name: "内核判据先证内容后执行 (摘要不符时不得运行待验二进制; 摘要过关后版本仍须精确)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-core-verify-before-exec.sh
 
       - name: "换内核工具契约 (只改钉值不提交/两种钉值形状/取件后核对版本与架构/离线改写)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-bump-kernel-tool.sh
 
       # 每周查 mihomo 上游、开升级 PR 的那个工作流(kernel-watch.yml)本身不在这里跑 ——
       # 它推分支、开 PR。这一支离线钉住它调用的脚本与工作流文件的契约。
       - name: "内核上游监视 (只跟稳定版/比钉的新才动/幂等/只改 versions.sh/先推分支再开 PR 再派发 CI/只在 Actions 的 main 上跑)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-kernel-watch.sh
 
       - name: "内核跟随上游判定 (护栏/上游取件信息/ELF/本机记录/先证内容再执行/体检对照/doctor 跟随分支)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-kernel-follow.py
 
       # 真钉死版 mihomo 做配置校验(tests/.bin/mihomo 上面已装); 取件 / 上游 API / 体检 / 通知在测试侧打桩。
       - name: "内核跟随上游编排 (取件核对/体检变差换回/pdg update 不降级被认的上游核/revert/自动的等待期与不重试)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-kernel-follow-cli.sh
 
       - name: "装机取件的错误分类 (下载失败/空产物/内容不符报成三种话; 两个内核对称)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-download-error-classification.sh
 
       - name: "pipefail + grep -q 条件反转守卫 (测试脚本: 整体透传大文件; 生产脚本: 每处登记上游, 已知分次写的上游不许接 grep -q)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-pipefail-grepq-guard.py
 
       - name: "沙箱夹具不得偷偷联网 (抽了含 curl 的生产函数就必须自带禁令桩)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-fixture-network-guard.py
 
       - name: "E2E 夹具必须播真 mosdns (shell 假桩被生产判据拒绝 / 真钉定二进制被接受 / 夹具不联网)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-e2e-mosdns-fixture.py
 
       - name: "E2E mihomo 夹具闭包 (复用要版本+摘要都对; 归档与解压产物双重校验; 失败保全前像)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-e2e-mihomo-fixture.py
 
       - name: "CI 取件拓扑 (官方 Release 每 run 每架构只取一次 / 消费者靠 artifact 且自己复核 / action 钉定)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: |
           python3 -c 'import yaml' 2>/dev/null || sudo apt-get install -y -q python3-yaml
           python3 tests/test-ci-mosdns-topology.py
 
       - name: "mosdns artifact 往返 (两个消费者各自四层复核 / 改一字节与改 manifest 均硬失败 / 消费者不联网)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-mosdns-artifact-roundtrip.sh
 
       # 下面三支吃的是本 job 开头下载的同一份 artifact(/tmp/mosdns-fixture), 不联网。
       - name: "caddy / 离线镜像 artifact 往返 (两个消费者各自复核 / 坏件与改 manifest 均硬失败不落盘 / 不联网 / 严格模式解析器缺件具名失败且不 curl / 取件入口留下 curl 原始报错)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-fixture-artifact-roundtrip.sh /tmp/mosdns-fixture
 
       - name: "升级类 E2E 离线镜像夹具 (按本版与冻结桥接各自的钉值核件 / 精确资产 URL 本地供件 / 未预置 22 且不联网兜底 / 拿掉预置时就位即具名失败)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-e2e-release-mirror.sh /tmp/mosdns-fixture
 
       - name: "桥接一跳的 mihomo 钉值 (tests/legacy-pins.sh 逐字等于冻结桥接对象 / 两支 E2E 的默认桥接身份一致 / 三格负控)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-bridge-mihomo-pins.sh
 
       - name: "全局锁继承八格 (父锁复用/独立取锁/BUSY/环境变量伪造/错文件/inode 变更/并发/释放)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-lock-inherit.sh
 
       - name: "内核热切回归 (check/重启不稳定均还原旧核; 稳定后才删 .prev; 快照含内核二进制)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-core-swap.sh
 
       - name: "install 回滚回归 (set -u 下不因未初始化变量二次崩溃; 系统级还原完整; 只删本次新装; 换回 resolv.conf 后重启 resolved)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-install-rollback.sh
 
       - name: "install 二进制事务回归 (备份失败即中止/半截安装可恢复/强制重装也还原/清理失败不假报)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-install-bintxn.sh
 
       # 公开入口 --ref <版本 tag>: 指定的版本必须真的被装上, 不许悄悄回退到最新版。
       # 用自有一次性测试源(裸库 + 三个版本 tag), 跑真的两段自举, 判据落在 git 实读的 HEAD 上。
       - name: "安装入口 --ref (指定版本贯穿两段自举; 不存在/非法/取件失败一律拒绝)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-install-ref-entry.sh
 
       - name: "bot 导航回归 (操作结果不刷一级菜单)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-bot-nav.py
 
       - name: "WDA mihomo 切换回归 (内联域名规则/开关幂等/老 rule_set 迁移)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-wda-mihomo.py
 
       - name: "bot 凭据保护/后台执行器/BUSY 锁回归"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-bot-credential.py
 
       - name: "备份恢复解包安全 (绝对路径/../symlink/hardlink/设备/FIFO/压缩炸弹均不得越界)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-restore-tar-safety.py
 
       - name: "恢复备份事务化 (内核校验/dropped/mosdns/内核起不来: 全部目标逐字节还原)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-restore-transaction.py
 
       - name: "观测面板回归 (zashboard 开关 + clash_api secret)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-panel.py
 
       - name: "面板快照/回滚净化回归 (secret 不入档)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-panel-snapshot.sh
 
       - name: "规则集完整性 (dropped 非空即拒/.srs 拒/真实 YAML provider + 真实 .mrs fixture 走本地 HTTP)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-ruleset-integrity.py
 
       - name: "bot 测域名规则集显示名回归"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-domain-label.py
 
       - name: "出口改名级联回归 (规则/故障组/final/TG 同步)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-exit-rename.py
 
       - name: "iOS 描述文件回归 (Wi-Fi 探测判定 + SSID 直连名单)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-ios-ssid.py
 
       - name: "iOS 描述文件现状特征化 (随机身份 / Bot 与 CLI 的分歧)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-ios-profile-legacy.py
 
       - name: "iOS 描述文件统一生成器 (Bot 与 CLI 逐字节一致 + 私钥零外泄)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-ios-profile-shared.py
 
       - name: "iOS 描述文件生命周期 (稳定身份 / 三档判定 / 事务原子性)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-ios-profile-lifecycle.py
 
       - name: "iOS 描述文件交互 (Bot/CLI 同一份记录 + 不声称设备状态 + Android 全拒)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-ios-profile-ux.py
 
       - name: "iOS 临时下载通道收得回来 (HUP/EXIT 收尾 + 排在 tailnet 排除之后 + 按标记精确撤除)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-ios-offer-download-leak.py
 
       - name: "iOS 临时下载通道 fail-closed 与会话所有权 (失败不假成功 / 第二条会话 BUSY)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-ios-offer-lifecycle.py
 
       - name: "iOS 临时下载通道信号中止与服务所有权 (setup 三屏障 / 外来 200-302-代理 全拒)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-ios-offer-interrupt.py
 
       - name: "iOS 调用方 staging fail-closed (mktemp -d 失败不得把描述文件生成到 /)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-ios-caller-staging.py
 
       - name: "iOS 临时下载通道加固 (根路径不可枚举 / state 0600 原子落盘 / 孤儿身份核验 / 收尾不被二次信号打断)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-ios-offer-hardening.py
 
       - name: "iOS 临时下载通道会话目录所有权 (真实调用方 SIGKILL / PID 已消失的过期孤儿 / state 删除失败)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-ios-offer-session.py
 
       - name: "iOS 临时下载通道 pre-state 窗口与父目录信任顺序 (生成中/HTTP 已起未记录的 SIGKILL / 符号链接根不得被 chmod)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-ios-offer-prestate.py
 
       - name: "iOS 临时下载通道回收判定 (存活生成者 / 身份未知≠已退出 / 枚举失败不当空集合)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-ios-offer-reaper.py
 
       - name: "iOS 临时下载通道信号收尾停住本轮生成者 (HUP/INT/TERM 与整组 INT, 目录不得被重建)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-ios-offer-abortgen.py
 
       - name: "iOS 临时通道停止失败有界返回 (停不住/状态读不到时保留现场, 不得无界 wait)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-ios-offer-stopfail.py
 
       - name: "iOS 临时通道 HTTP 停不掉时保住恢复线索 (真 handler/回环随机口; 后继凭凭据回收)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-ios-offer-srvkeep.py
 
       - name: "iOS 描述文件身份持久性 (update/快照/备份恢复/平台来回切都不丢身份)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-ios-profile-persist.py
 
       - name: "iOS 描述文件产物完整性 (缺失/损坏/串位必须检出, 发送前一律 fail-closed)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-ios-profile-integrity.py
 
       - name: "iOS 描述文件恢复闭环 (快照/备份逐字节恢复 + 旧格式备份 + 失败整组回滚)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-ios-profile-restore.py
 
       - name: "iOS 描述文件并发 (整段读-改-写一把锁 + 标记发送认版本, 不丢更新)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-ios-profile-concurrency.py
 
       - name: "iOS 备份恢复联合校验 (三件套当一组验 + 只放行本项目会生成的 payload)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-ios-profile-backup-trust.py
 
       - name: "iOS 快照精确回滚 (回滚不留孤儿产物 + 备份按记录而不是按盘上有什么打包)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-ios-profile-snapshot-exact.py
 
       - name: "iOS 首次启用不许猜 (发 SSID 也要先问装没装过, 没回答就一个字节都不写)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-ios-profile-firsttime.py
 
       - name: "iOS 恢复计划三入口共用 (Bot/救援平面/CLI 回滚同一份判据, 缺失即删除)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-ios-profile-restore-plan.py
 
       - name: "iOS 根证书必须恰好是一张 DER (证书后拼私钥/垃圾字节一律拒, 四条可信路径同一道门)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-ios-ca-der-exact.py
 
       - name: "iOS schema 1 可信契约 (输入必须是规范形式 + 固定显示名 + 身份与时间; 恢复/健康/发送同一份判据)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-ios-profile-schema-contract.py
 
       - name: "iOS 元数据契约四入口一致 (load/恢复/健康/发送同一份完整判据 + 校验的字节就是返回的字节)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-ios-profile-meta-contract.py
 
       - name: "自检防火墙端口回归 (泄露判据/缺 7893/代理入口/GMS 分档/端口文案按平台)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-doctor-firewall.py
 
       # 6.1C: doctor 与 linkstat 曾对同一台健康机器给出相反结论 —— doctor 报 0 失败,
@@ -808,323 +983,409 @@ jobs:
       # 沙箱 nft 桩的契约。它以前对 `-j` 返回空, 于是 nftlive 按设计 fail-closed, 更新后
       # 自检判红整次回滚 —— 而最顺手的"修法"恰恰是把 fail-closed 降成 WARN。桩得有人看着。
       - name: "沙箱 nft 桩契约 (状态派生而非常量/表不在非零/空输入仍 fail-closed/双平台不串台)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-nftjson-stub.py
 
       # bind 是监听地址配置, `pdg rescue disable` 保留它是既定行为。拿它当"启没启用"用,
       # 停用过救援平面的机器会被判成"已启用却没放行" → doctor fail → 更新整次回滚。
       - name: "救援启用判据状态矩阵 (只看 PDG_RESCUE_ENABLED/停用后残留仍要发现/值损坏 fail-closed)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-rescue-intent-matrix.py
 
       # `.153` 真机一天内撞到三次同一形状: 读不到必需的值时塞个占位符继续走, 下游拿着必然
       # 不成立的东西干活, 界面却一切正常。占位符比"不知道"更糟 —— 它看起来像个答案。
       - name: "缺值必须如实说 (PDG_SERVER_IP fail-closed / DoT 域名不吞成 ? / probe81 两平台公共)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-missing-value-honesty.py
 
       # 盘上是新代码、跑着的是旧的 —— 从版本号和文件内容看都"已升级", 只有进程还是旧的。
       # 两天里手工部署踩了两次(菜单缺项 / RuntimeDirectory 没生效)。
       - name: "换过模块必须重启用它们的服务 (内容变才转/try-restart/失败不转)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-deploy-restart.sh
 
       # 部署顺序三格行为矩阵: 直接 __migrate(装+重启)、提前装模块再迁移(判据被掏空)、
       # cmd_update 迁移之后那段(无条件重启)。jp2 上"盘上新代码进程还是旧的"就出在中间那格。
       - name: "部署顺序矩阵 (直接迁移 vs 提前装模块 vs cmd_update; SOP 守卫)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-deploy-order.sh
 
       # 链路测试那几屏的退出键必须指回它自己的来处(入口挂在「客户端接入」下)。
       # 真机上用出来的: 从「📱 客户端」进去, 退出被送到「🩺 自检」那条不相干的支路。
       - name: "链路测试退出键指回入口菜单 (四屏一致/不回自检/保留主菜单)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-link-nav.py
 
       # jp2 上定时器停摆 8 天而 doctor 一路判绿 —— 那时它根本没有这一项。
       # 判据不能只看 enabled/active/failed 三态, 必须看有没有下一次触发时间。
       - name: "健康自检定时器判据 (elapsed+infinity 必须 FAIL / 正在跑不误报 / 只读)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-health-timer-doctor.py
 
       # .153 上 mosdns 读 /etc/dnsdist/certs 而续期钩子写 /etc/mosdns/certs, 靠一个看着
       # 该被清理的老钩子兜着。这种错在证书到期前毫无征兆: 文件在、没过期、续期成功、
       # doctor 全绿, 到期当天 DoT 对所有手机同时失效。
       - name: "证书路径一致性 (钩子写的目录必须就是 mosdns 读的目录; 缺省值与钩子同源)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-cert-dir-sync.py
 
       # Tailscale 节点地址与运营商 SIM/APN 都用 100.64.0.0/10 —— 只看源地址分不开。
       # 判据必须同时看入口接口, 所以这支用真 netns + 真 veth + 真 nft 加载 + 真流量;
       # 两侧客户端地址都在同一个配置段内, 换源 IP 冒充不了。环境不足会 SKIP 并说明原因。
       - name: "Tailscale 入口隔离 (真 netns: tailnet 不进数据面, 物理 CGNAT 照旧)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: sudo -n python3 tests/test-tailscale-ingress-isolation.py
 
       - name: "detect-cidr 不得把 tailnet 推成内网段 (按入口接口排除 / 拿不到接口就拒绝猜)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-detect-cidr-tailscale.py
 
       # 模板改了却传不到已装机器上 —— 那条缺口让 v1.10.1→本分支的升级在六个 E2E 里同时红。
       - name: "防火墙按模板重建 (已迁移的机器也要收到模板改动; 参数反解 fail-closed)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: sudo -n python3 tests/test-firewall-template-sync.py
 
       # 磁盘已是新版而内核仍跑旧规则 —— 据磁盘判 no-op 会让防火墙停在旧规则上。
       - name: "防火墙磁盘/内核漂移 (C 态只 reload 不写盘; B 态真 no-op; 失败注入)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: sudo -n python3 tests/test-firewall-live-drift.py
 
       # 转换器认不出的匹配会被静默丢弃, 判据据此看不见内核里确实存在的规则。
       - name: "nftjson 表达式覆盖 (iifname 等匹配不得在转换时丢失)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-nftjson-coverage.py
 
       # 夹具渲染不全会造出"不像真机"的沙箱: 漏一个占位符, 参数反解就失败。
       - name: "E2E 夹具模板渲染闭包 (模板每个占位符夹具都得替换)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-e2e-seed-render.py
 
       # jp 停在旧模板上, 救援端口只出现在注入规则里(saddr 与 dport 之间还有 ip daddr),
       # 只按当前模板形状反解 → 一条都匹配不到 → 同步跳过 → 更新每次回滚。
       - name: "救援端口反解 (注入形态与模板独立行都要认; 真多端口才算多值)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-rescue-port-derivation.sh
 
       # jp 上 certbot 每失败一次就多积一条 80 放行, 积到两条时 doctor 判红、升级整次回滚。
       - name: "证书续期钩子 (加在哪就能从哪撤; 有 nft 却解析不到时不许落 iptables)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-cert-hook-cleanup.sh
 
       # 本地只查几个手挑的文件, 新增的 tests/*.sh 就永远进不了门 —— 本地全绿, CI 判红。
       - name: "ShellCheck 范围守卫 (本地门必须与 CI 同范围, 范围从 ci.yml 读出)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-shellcheck-scope.sh
 
       - name: "Tailscale 入口隔离 负控 (撤排除/挪顺序/过度排除必须转红; 无关注释仍绿)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: sudo -n python3 tests/negctl/tailscale-isolation-negative-controls.py
 
       # 真 systemd: 死角复现、状态机、故障注入。容器里跑, 非 root 环境 SKIP(严格模式判失败)。
       - name: "健康自检定时器 真 systemd (死角/状态机/6 种故障注入; 环境不足则 SKIP)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: sudo -E bash tests/e2e-health-timer.sh
 
       # 共享 systemctl 桩的契约。它是测试基础设施: 坏了不会有人报警, 只会让上层测试
       # 悄悄变成恒绿。最危险的不是"答不出属性"(那会 fail-closed 判红, 看得见),
       # 而是"无条件回答健康值" —— 那时 timer 死角那组测试永远是绿的。
       - name: "共享 systemctl 桩契约 (多个 -p/KEY=VALUE/乱序/四种状态/故障注入)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: sudo -E env PDG_E2E_ISOLATED=1 bash tests/test-systemctl-stub.sh
 
       - name: "nft 语义判据 (nft 自身规范化不算漂移: 集合折叠/reject 默认展开/协议别名)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-nft-live-semantics.py
 
       - name: "nft 调用链 (doctor 与 linkstat 对同一状态结论一致, 不拦住建会话)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-nft-callchain.py
 
       - name: "nft 条件与故障矩阵 (15 格条件 × 20 格故障 × 三条链路; 专项故障不进链路硬门)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-nft-matrix.py
 
       - name: "nft input 链冲突判据 (单一来源 + 读不到≠没有 + platform 守卫不靠 PATH 找 nft)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-nft-input-scan.py
 
       - name: "配置事务核心 (状态机/白名单/前置检查/观察期/回滚/审计/runner 固定)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-config-transaction.py
 
       - name: "配置事务安全边界 (路径穿越/软硬链接/权限/凭据脱敏/恢复漂移保护)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-config-transaction-security.py
 
       - name: "配置事务故障注入 (锁 fail-closed/并发/before-image/部分替换/回滚失败)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-config-transaction-faults.py
 
       - name: "内网卡段真源 (profile.env 权威 / 漂移检出 / 迁移保守)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-cidr-single-source.py
 
       - name: "内网卡段变更事务化 (候选生成/校验门/观察期/回滚/ROLLBACK_FAILED/锁忙)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-cidr-transaction.py
 
       - name: "救援常量单一事实源 (端口/路径两侧一致, 全仓无字面量)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-rescue-constants.sh
 
       - name: "救援平面只读骨架 (真起 HTTPS: 前提缺失拒启动/未认证 401/无外部资源/路径穿越)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-rescue-server.py
 
       - name: "救援平面凭据与认证 (凭据不重建/CSRF/限速锁定/会话上限/轮换即失效)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-rescue-auth.py
 
       - name: "救援平面 socket 交接与抗畸形请求 (fd3 接管/四类不自洽拒启动/打不崩)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-rescue-socket.py
 
       - name: "救援平面 recover (枚举 txid/确认/CSRF/锁忙/漂移不覆盖/如实报告)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-rescue-recover.py
 
       - name: "恢复触发来源审计 (旧签名兼容/rescue 与 cli 各记各的/参数伪造无效/并发只跑一个)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-tx-recover-source.py
 
       - name: "救援平面配置恢复 (只换受管配置/快照边界/摘要复核/nonce 一次性/失败全回滚)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-rescue-cfgrestore.py
 
       - name: "受管恢复的表单闭环 (照页面原样提交/证书固定/confirm 必勾/nonce 一次性且绑会话)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-rescue-formflow.py
 
       - name: "恢复的服务动作推导 (按变化目标推导/映射唯一/未知即拒/顺序固定)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-restore-actions.py
 
       - name: "救援平面紧急完整恢复 (救援入口自保/pre-rescue 强制/结构化结果/不自动降级)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-rescue-breakglass.py
 
       - name: "旧结构强确认与降级边界 (LEGACY- 双条件/票绑结构版本/旧核心不支持不报500)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-rescue-legacy-confirm.py
 
       - name: "渲染链特征基线 (mrs/zstd behavior 真值表 + rulesets 分类 + 逐字节锚点)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-render-characterize.py
 
       - name: "共享渲染模块独立性 (bot 损坏/缺席/禁 import 时仍出候选 + monkeypatch 点仍生效)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-render-shared.py
 
       - name: "rule_set 数组形态 (字符串逐字节不变/数组按序展开/非法形态 fail-closed)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-ruleset-array.py
 
       - name: "渲染判废默认安全 (pdgtx 缺失/损坏/旧版时 str/repr/审计均不含用户值)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-render-refusal.py
 
       - name: "mihomo 完整性闭包 (绝对路径+退出码+自报版本+内容摘要; PATH 影子无效; 内容漂移仍可修)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-mihomo-integrity.sh
 
       - name: "mihomo doctor 四态 (版本不符/摘要不符 fail; 无从对照 warn 且明说无结论; 全中才 ok)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-mihomo-binary-evidence.py
 
       - name: "mihomo 真实换核 (v1.19.29→钉死版; 成功/配置检查失败/起来不稳 三态; 坏件绝不落盘)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-mihomo-real-swap.sh
 
       - name: "混合规则 AND 语义 (跨字段 AND/同字段 OR/不支持组合拒绝/真 mihomo -t)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-rule-mixed.py
 
       # 断言的是**真内核的判定**: 把渲染出来的配置交给钉死版 mihomo 跑起来, 从它自己的匹配
       # 日志与 clash_api /rules 读出"这个域名去了哪个出口" —— 与 .200 现场同一种取证方式。
       - name: "分流优先级 (点名规则不被 WDA/MITM 自动规则压过; 真内核判定 + doctor 可见)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-rule-precedence.py
 
       - name: "紧急默认出口 (只改 route.final/三目标同事务/原值不被覆盖/stale 拒绝)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-emergency-exit.py
 
       # 10b 硬门: 需要真 systemd(PID 1) + 真 nft + root。runner 上三者齐备就真跑;
       # 缺任何一样脚本自己 [SKIP] 并说明 —— 但**跳过不等于验收**, 正式记录在
       # docs/rescue-plane-acceptance.md, 那里只写真跑过的结论。
       - name: "救援平面 10b 硬门 (真 socket activation/硬化/真 nft; 环境不足则 SKIP)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: sudo -E bash tests/e2e-rescue-10b.sh
 
       # 真 systemd: 死角复现、迁移状态机、故障注入。非 root 环境 SKIP(严格模式判失败)。
       - name: "健康自检定时器 真 systemd (死角/状态机/6 种故障注入; 环境不足则 SKIP)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: sudo -E bash tests/e2e-health-timer.sh
 
       # 共享 systemctl 桩的契约: 它坏了不会有人报警, 只会让上层测试悄悄变成恒绿。
       - name: "共享 systemctl 桩契约 (多个 -p/KEY=VALUE/乱序/四种状态/故障注入)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: sudo -E env PDG_E2E_ISOLATED=1 bash tests/test-systemctl-stub.sh
 
       - name: "运行模块安装闭包 (真实入口传递依赖 vs 安装真源, 含动态导入点)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-install-closure.py
 
       # 以下六条此前**从未进过 CI** —— 其中四条是 5.2 这一路新写的。本地跑得好好的, 远端
       # 一次没跑过。tests/test-ci-coverage.py 现在会盯着这件事: 有测试文件没出现在本文件里
       # 就判红, 免得"写了用例"和"用例真的在跑"再次被当成一回事。
       - name: "跨版本快照矩阵 (清单取自各版本 cmd_snapshot; unknown/legacy/特征冲突 fail-closed)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-snapshot-matrix.py
 
       # 基准取的是 `git show v1.7.0:` 的真实产物 —— 所以这条也吃 fetch-depth: 0。
       - name: "明确代理优先级 (v1.7.0 模板幂等补齐/顺序自检/fail-closed + 事务回滚 + doctor 点名)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-mosdns-explicit-proxy.py
 
       # 全新 Debian 13 装不上的第二个报障: 装机时 mosdns 还没起、53/853 还没人听, 事务的
       # normal 模式把这当成"组件坏了"直接拒写 geosite; 规则文件因此一个都没落盘, mosdns 缺
       # domain_set 文件起不来, 整场安装失败回滚。装机侧要用 repair 模式, 且文件先建空的。
       - name: "装机引导规则库 (repair 模式写得进 / normal 门不拆 / 空文件 mosdns 能起)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-install-bootstrap-rules.py
 
       # 全新 Debian 13 装不上那个报障: iptables-nft 建出来的空 ip filter/ip nat 被
       # flush 门当成"会丢的表"拦掉。判据要能分辨空表与真有规则的表, 两个方向都得守住。
       - name: "nft flush 门 (空表放行 / Docker 有规则仍拒 / 读不出 fail-closed)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-nft-flush-inert.py
 
       - name: "救援来源过滤 (握手前按内核 peer 地址判; 不信 X-Forwarded-For)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-rescue-source.py
 
       - name: "救援资源边界与中断 (成员/单文件/总量上限; 断线与信号下的事务收尾)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         timeout-minutes: 12
         run: python3 tests/test-rescue-interrupt.py
 
       - name: "Mihomo 渲染与钉死版本 (缺二进制在严格模式下判失败, 不 SKIP 冒充通过)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-rescue-sets.py
 
       - name: "重装保留用户数据 (FORCE_REINSTALL 不重置 bot.env/模型/规则集)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-reinstall-preserve.py
 
       # 需要真 nft(netlink): 用 sudo -E 跑, 与上面的 e2e-rescue-10b.sh 同一套路。非 root 下
       # 那两条会 SKIP, 而 CI 里不允许拿 SKIP 冒充通过。
       - name: "卸载保留用户防火墙规则 (只摘项目管理块, 用户自加规则逐字节保留)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: sudo -E python3 tests/test-uninstall-firewall.py
 
       # 不需要 root: 卸载脚本里那段原样抽出, 路径改到临时根, systemctl 用替身。
       - name: "卸载还原 resolved (探测不被 SIGPIPE 反转 / 不把装机的 127.0.0.1 留在全局 DNS / 按装机记下的状态还原, 含 install.sh 那段的往返)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-uninstall-resolved-restore.py
 
       # 不需要 root(root 下自己降到 nobody 跑): install.sh 原样从管道喂给 bash, 看它是不是先读完整份再执行。
       - name: "install.sh 从管道读入时先读完整份再执行 (README 一键安装的 curl 不再以 23 退出)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-install-pipe-readall.py
 
       - name: "系统不变量捕获器 (schema/凭据只留摘要/不跟随软链/十条比较负控)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-invariants.py
 
       - name: "更新失败门与畸形产物 (阶段图/checksum/截断/穿越判据/manifest 结构校验)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-release-faults.py
 
       - name: "E2E 沙箱硬门 (破坏性操作只能落在带 nonce 的一次性根内; 真仓库不受影响)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-e2e-sandbox.py
 
       - name: "项目静态文件三集合 (install=update=uninstall; 平台切分; 用户数据不混入)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-file-sets.py
 
       - name: "CI 覆盖守卫 (每个测试文件都必须真的被本 workflow 调用)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-ci-coverage.py
 
       # 这条判据读的只有 rulesets.json 元数据, 却曾宣称"格式均可被 mihomo 加载" —— 那是一句
       # 运行期结论。本支盯证据等级: 静态无问题只能说到 warn, 不许冒充 ok。
       - name: "规则集证据等级 (静态形态 ≠ 已加载; 损坏不许当没配置; 不读 controller/不发请求)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-ruleset-evidence.py
 
       - name: "规则集运行期证据 (读 mihomo 管理面; 未加载/0 条判失败, 读不到仍只说无结论)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-ruleset-runtime-evidence.py
 
       - name: "管理面查询边界 (拒重定向/禁代理/地址族忠实; 确定性 FAIL 不被 WARN 遮住)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-provider-query-boundary.py
 
       # 用户反复遇到「检查更新中…」不结束。三个根因: 整段 git log 拼进一条消息超 Telegram
       # 长度上限、异常只包到前半段、检查同步占住主 getUpdates 轮询。这一支把整条链路钉死。
       # 隔离 git 仓库 + 假 Telegram 接收端, 不连真实 API、不用真实 token、不碰生产。
       - name: "Bot 更新检查链路 (消息长度预算/全链路终态/后台与归属/有界等待与清理)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-bot-update-check.py
 
       # 这一支只验 tests/negctl/mosdns-artifact-negative-controls.py 那几条判定本身有没有牙:
       # 负控是本地手动门、CI 不跑, 它悄悄退化不会有任何信号(PR #56 那次三格哑火了整整一版)。
       # 只吃合成输入、只跑纯函数 —— 不联网、不取件、不新增消费者 job。
       - name: "artifact 负控收口契约 (消费者数量现推/零命中不放行/拓扑不一致不合理化/子测试没跑不算绿)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-negctl-artifact-closure.py
 
       # 弃用期内 runner 会把 node20 的 action 强行拉到 node24 上跑 —— 流程照常绿, 只是每个
       # job 都打一条 warning。那种"不红只是提醒"的形态最容易被放过, 直到某天 runner 不再兜底。
       - name: "action 运行时守卫 (没有 action 停在已弃用的 Node 20 上; 不认识的 action 判失败)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-action-runtime.py
 
       - name: "clean-root 安装产物自足 (移出仓库/隔离解释器/无源码兜底)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-clean-root.py
 
       - name: "救援平面生命周期 (只绑内网/放行幂等且受源约束/停用不被升级开回/卸载无残留)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-rescue-lifecycle.sh
 
       - name: "迁移时机 (普通命令不暗中迁移; migrate 先锁先快照)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-migration-timing.sh
 
       - name: "分流规则→mosdns 劫持同步回归 (指到出口的域名必须被 mosdns 劫持, 否则规则是死的)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-rule-hijack-sync.py
 
 
       - name: "CLI/report/bot 杂项回归 (rollback 校验/inet pdg/菜单 exec)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-maintenance-polish.py
 
       - name: "顶层分发器参数传递 (每个子命令都把参数原样交出去; rollback --dir/--git 真跑一遍)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-cli-dispatch.py
 
       - name: "sb2mihomo 渲染层回归 (sing-box 配置→mihomo 各协议/组/规则映射)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-sb2mihomo.py
 
       - name: "Hysteria v1/v2 转换回归 (v1→hysteria, v2→hysteria2, 不支持→拒绝, 真 mihomo -t)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-hysteria-convert.py
 
       - name: "bot 内核后端切换回归 (mihomo/singbox 分支 + apply_sb 事务回滚)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-mihomo-backend.py
 
       - name: "TFO 状态回归 (持久化意图 + 加出口不冲掉 + 渲染映射)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-tfo.py
 
 
@@ -1133,89 +1394,111 @@ jobs:
 
 
       - name: "WLOC 退役 · CA 只读兼容 (五档不互冒充/零写入/拒私钥/复用严格证书门)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-wloc-retire-ca-readonly.py
 
       - name: "WLOC 退役 · 执行面闭合 (模块与 unit 已删/无悬空调用/旧按钮回退役提示/残留不复活路由)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-wloc-retire-surface.py
 
       - name: "WLOC 退役 · 老装迁移 (停服务→撤劫持→撤路由→删模块; 幂等/归属不清拒绝/失败还原)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-wloc-retire-migration.sh
 
       - name: "WLOC 退役 · 描述文件 schema 1→2 (三种老机器状态/严格验-迁移-复核/不再下发退役 CA)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-wloc-retire-schema.py
 
       - name: "WLOC 退役 · 配置锁交接 (CLI 持锁时走真实 __migrate 路径; 不抢锁/不中途释放)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-wloc-retire-lock-handoff.sh
 
       - name: "WLOC 退役 · 真模块回环 (真渲染器真撤 MITM 路由/候选先行/不回退宿主 /opt)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-wloc-retire-realrun.sh
 
       - name: "继承锁凭据 (真 flock: 未加锁的 fd 不算继承且不被意外持锁/错 inode/他人持锁)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-inherited-lock-proof.py
 
       - name: "锁负控的执行有效性 (崩溃/零断言/退出码越界不许冒充「基线全绿」或「有牙」)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-negctl-exec-verdict.py
 
       - name: "WLOC 退役 · 事务闭环 (文件+mode+uid/gid、enabled、运行态、已加载配置全恢复)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-wloc-retire-txn-closure.sh
 
       # PDG-WLOC-CR-01: pdg.sh 调用 c_r 七处却从未定义, WLOC 退役的拒绝/失败/回滚不完整
       # 三类标题整句丢失。判据是"那句话在不在"(具名行为), 并自带撤销产品定义的反向对照。
       - name: "WLOC 退役错误输出 (拒绝/失败/回滚不完整的标题必须真实可见; 撤销定义即转红)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-wloc-retire-error-reporting.sh
 
       # PDG-WLOC-CAREPORT-02: 报告旧 CA 残留的路径只在 /opt/pdg-bot 找 mitm_ca, 而那是
       # iOS 专属件 —— Android 上整段静默。判据是"报不报、报的是哪一态", 并自带两条反向对照。
       - name: "WLOC 退役 · 旧 CA 残留报告 (Android 也要报; 三态各自具名; 撤销依赖或兜底即转红)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-wloc-retire-ca-report.sh
 
       # 快照只收文件, enable 的符号链接在 multi-user.target.wants/ 下从不入快照 —— 于是
       # "文件都回来了、服务却停着且不自启"会被回滚自报成"已回滚并重启服务"。这三支盯的就是
       # 这一格: 前像怎么存、怎么判"是不是本次操作的"、恢复到什么程度算恢复。
       - name: "服务前像恢复 (三态各自恢复/enabled-runtime 不提升/动作成功但状态不符也算未恢复; 两条撤销对照)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-svcstate-restore.sh
 
       # 持久自启(/etc 的 wants)与运行时自启(/run 的 wants)是两套独立链接: 只调目标那一条
       # systemctl 命令, "前像 enabled-runtime 而现状被永久 enable"与"前像 disabled 而现状是
       # enabled-runtime"这两种都回不去。桩分别维护两套链接, 不做目标字符串赋值。
       - name: "自启恢复的持久/运行时两层 (撤掉妨碍恢复的那一层再置目标层; 不顺带启停服务)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-svcstate-enable-runtime-restore.sh
 
       - name: "退役迁移调用方门 (旧记录·错快照·缺记录·不完整·查询异常·无锁分别拒绝; 拒绝前零服务动作; 撤掉门即进入停服务路径)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-migrate-caller-gate.sh
 
       # 门拒绝之后用户该敲什么, 按**行为**验: 真跑指引函数与门的拒绝分支看实际输出,
       # 并真跑 cmd_migrate 确认"指引点名的那个入口"确实建快照、存前像、交句柄。
       - name: "退役迁移的重跑指引 (按实际入口分岔/不指望回滚后的机器有新版能力/入口名副其实)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-retire-rerun-guidance.sh
 
       - name: "迁移入口契约 (总入口逐字节未变/cmd_platform 契约变更处/三处拦截点各在动手之前)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-migrate-entry-contract.sh
 
       # 拒绝之后还能不能动手, 与"最终返回非零"是两件事: migrate_wloc_retire 返回非零只会让
       # run_all_migrations 记个 rc, 后面的 migrate_android_cleanup 照样删 unit 删模块。
       - name: "退役副作用拦截 (拒绝后真实 android_cleanup/_plat_purge_retired 零动作; 撤掉拦截即真的删)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-retire-sideeffect-barrier.sh
 
       # 辅助函数自己"没有服务动作"证明不了整条回滚链没先把服务启动过 —— 这一支跑真实 cmd_rollback。
       # 它在 unshare 私有挂载里把 /etc /opt /usr/local/bin 绑到一次性目录, 真的落盘、真的核验文件属性;
       # 建不出隔离就报"未执行"并非 0 退出(不靠权限失败兜底)。
       - name: "回滚链服务恢复 (真实 cmd_rollback + 自有根: 内核收敛不先永久启用/缺前像不报完全回滚)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-rollback-svcstate-chain.sh
 
       # "存了前像"不等于"失败时会用": 局部备份里根本没有 pdg-mitm unit 与 MITM 模块。
       - name: "平台切换失败善后 (退役件撤除后注入失败: 四维恢复到位/恢复不完整不声称已恢复)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-platform-fail-restore.sh
 
       # 组合验证: **合法**旧记录 → 平台切换 → schema 真正推进 → 失败善后选中整体恢复 →
       # 记录与产物一起回到前像。坏记录那支只证明"拒绝传得出去", schema 单测只证明"转换本身"。
       - name: "合法旧记录迁移与恢复 (schema 1→2 真推进/带 CA 产物真退役/失败后记录—产物一起还原)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-platform-schema-restore.sh
 
       - name: "平台文案/门控回归 (客户端·状态 按平台/内核 + README 文案一致)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-platform-copy.py
 
       - name: "诊断报告内核一致性 (版本/日志按当前后端取, mihomo 机上不再固定问 sing-box)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-report-backend.py
 
 
@@ -1223,12 +1506,15 @@ jobs:
 
 
       - name: "文案与当前行为一致 (WLOC 热加载/:81 返回 200/端口按平台)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-wording-accuracy.py
 
       - name: "Bot 凭据三态 (都空=正常禁用/只配一半=配置错/配齐才要求 pdg-bot 在跑)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-bot-credentials.py
 
       - name: "平台隔离回归 (Android 无 iOS 按钮/回调/后端; iOS 原功能; checks 平台一致)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-platform-isolation.py
 
       # 快照只收文件, enable 的符号链接在 multi-user.target.wants/ 下从不入快照 —— 于是
@@ -1245,6 +1531,7 @@ jobs:
       # 证据归属: 它证明的是正式桥接 542cc9177fc35c9d413ff3b62a7dac8bc468c136 的边界,
       # **不是**本候选的边界; 本候选由整合接缝契约与退役各支验收。
       - name: "桥接版边界 (在冻结桥接 SHA 的隔离副本上跑; 证据归属=桥接候选, 不代表本候选)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: |
           set -euo pipefail
           BR=542cc9177fc35c9d413ff3b62a7dac8bc468c136
@@ -1266,6 +1553,7 @@ jobs:
       # 整合接缝: 前像函数不许重复、保存责任只有 cmd_snapshot 一处、三个消费者只确认不再采样,
       # 两侧各自的修复都还在, 调用方门的 holder 判据没有被改宽。
       - name: "桥接×退役 整合接缝契约 (前像单份/保存唯一/消费者不重采样/两侧修复都在/门未放宽)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: bash tests/test-retire-bridge-integration.sh
 
       # 辅助函数自己"没有服务动作"证明不了整条回滚链没先把服务启动过 —— 这一支跑真实 cmd_rollback。
