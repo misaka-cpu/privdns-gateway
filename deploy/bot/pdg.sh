@@ -11516,7 +11516,11 @@ case "${1:-menu}" in
   # 这期间必须独占。两种来路都要照顾到, 而 _lock 自己分得清:
   #   · 由 cmd_update 调起 → 继承父进程那把锁, 复用同一个 OFD(不重开、不重抢);
   #   · 用户手打 sudo pdg __migrate → 没有可继承的 fd, 自己去取, 取不到就 BUSY 退出。
-  __migrate)     need_root __migrate; _lock; run_all_migrations && _dw_settle --after-migrate;;
+  # 链失败或入口被拒(R3, 第 342 条裁定): 交还给调用方回滚之前, 先撤掉**这次升级**新放的运行模块 ——
+  # 调用方是旧版时, 它的回滚只会 tar 覆盖写, 不删快照之后新出现的文件。只认这次的事前记录
+  # (记录里的进程号是本进程的祖先、同一次开机、一小时内), 退出码原样带出。内联而不另起函数:
+  # 有测试把分发器抽出来跑, 也有测试按行抽这一条分支, 所以写成一行。盘上没有 installset.py(手动跑、测试壳)就什么都不做。
+  __migrate)     need_root __migrate; _lock; run_all_migrations && _dw_settle --after-migrate || { _mrc=$?; [[ -f /opt/pdg-bot/installset.py ]] && python3 -I /opt/pdg-bot/installset.py undo-txn --ancestor-of "$$"; exit "$_mrc"; };;
   migrate)       cmd_migrate;;
   tx)            shift || true; cmd_tx "$@";;
   manifest)      shift || true; cmd_manifest "$@";;

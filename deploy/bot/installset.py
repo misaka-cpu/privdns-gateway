@@ -13,12 +13,14 @@ mode、类别、来源。放在 /var/lib/privdns-gateway/install/manifest.json(�
   installset.py reconcile [--dir <目录>] [--root <根>]
   installset.py uninstall-clean [--dir <目录>] [--root <根>]
   installset.py forget [--dir <目录>]
-后面五个见"事前记录与撤除"一节; 撤除类的退出码: 0 = 该撤的都撤了, 1 = 有留下来的(逐条报原因)。
+  installset.py undo-txn --ancestor-of <进程号> [--dir <目录>] [--root <根>] [--max-age <秒>]
+后面六个见"事前记录与撤除"一节; 撤除类的退出码: 0 = 该撤的都撤了, 1 = 有留下来的(逐条报原因)。
 
 verify 的退出码: 0 = 清单里每一项都与盘上相同、且清单记的提交就是装着的提交;
 1 = 有不同 / 缺失 / 提交对不上; 2 = 没有清单或清单读不了。
 """
 import ast
+import calendar
 import fnmatch
 import hashlib
 import json
@@ -615,6 +617,53 @@ def uninstall_clean(d=None, root="/"):
     return removed, kept
 
 
+def _ancestors(pid, proc="/proc", limit=64):
+    """pid 自己连同它的各级父进程(顺着 /proc/<pid>/stat 的第 4 个字段往上找)。读不到就停。"""
+    out, cur = [], str(pid)
+    for _ in range(limit):
+        if not cur.isdigit() or cur in out or int(cur) <= 1:
+            break
+        out.append(cur)
+        try:
+            raw = open(os.path.join(proc, cur, "stat"), encoding="utf-8", errors="replace").read()
+        except OSError:
+            break
+        rest = raw[raw.rfind(")") + 1:].split()      # 进程名里可能有空格和括号, 从最后一个 ) 之后取
+        if len(rest) < 2:
+            break
+        cur = rest[1]
+    return out
+
+
+def _boot_id(proc="/proc"):
+    try:
+        return open(os.path.join(proc, "sys/kernel/random/boot_id"), encoding="ascii").read().strip()
+    except OSError:
+        return ""
+
+
+def undo_txn(pid, d=None, root="/", max_age=3600, proc="/proc", now=None):
+    """R3: 新版 __migrate 失败或被拒时, 在交还给调用方(旧版)回滚之前, 撤掉**这次升级**新放的运行模块。
+    只认这次的事前记录: 记录里的进程号是当前进程的祖先、同一次开机、写于 max_age 秒内。
+    写之前就在的(被覆盖的)不动 —— 那些由随后的回滚从快照还原。返回 (撤掉的, 留着的, 认出的记录数)。"""
+    anc = set(_ancestors(pid, proc))
+    boot = _boot_id(proc)
+    now = time.time() if now is None else now
+    mine = []
+    for p, doc in _records(d)[0]:
+        if doc.get("pid") not in anc or not boot or doc.get("boot_id") != boot:
+            continue
+        try:
+            at = calendar.timegm(time.strptime(doc.get("at", ""), "%Y-%m-%dT%H:%M:%SZ"))
+        except (ValueError, TypeError):
+            continue
+        if not (now - max_age <= at <= now + 300):
+            continue
+        mine.append((p, doc))
+    removed, kept = _sweep(_created(mine), root)
+    return removed, kept, len(mine)
+
+
 def forget(d=None):
     """回到了没有安装清单的版本: 删掉那份只会描述一个已经不在盘上的版本的清单。"""
     p = os.path.join(_dir(d), MANIFEST)
@@ -642,7 +691,7 @@ def _opt(argv, name, default=None):
 
 def main(argv):
     if not argv or argv[0] not in ("write", "verify", "record", "rollback-clean", "reconcile",
-                                   "uninstall-clean", "forget"):
+                                   "uninstall-clean", "forget", "undo-txn"):
         print(__doc__.strip())
         return 2
     if argv[0] == "write":
@@ -692,6 +741,15 @@ def main(argv):
     if argv[0] == "uninstall-clean":
         removed, kept = uninstall_clean(_opt(argv, "--dir"), root)
         print("\n".join(_say(removed, kept, "删除以前没成功的升级留下的运行模块")) or "", end="\n" if removed or kept else "")
+        return 1 if kept else 0
+    if argv[0] == "undo-txn":
+        pid = _opt(argv, "--ancestor-of")
+        if not pid or not pid.isdigit():
+            print("undo-txn 要 --ancestor-of <进程号>", file=sys.stderr)
+            return 2
+        removed, kept, _n = undo_txn(pid, _opt(argv, "--dir"), root, int(_opt(argv, "--max-age", "3600")),
+                                     _opt(argv, "--proc", "/proc"))
+        print("\n".join(_say(removed, kept, "撤除这次升级新放的运行模块")) or "", end="\n" if removed or kept else "")
         return 1 if kept else 0
     if argv[0] == "forget":
         try:

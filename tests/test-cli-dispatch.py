@@ -71,7 +71,9 @@ ARM = re.compile(r"^\s*(?P<pat>[^)]*?)\)\s*(?P<body>.*?);;")
 # 命令位上出现但不是"被分发的目标"的东西。
 # _lock 与 need_root 同类: 都是执行前的门(权限 / 全局互斥), 不是这条命令要干的事。
 # __migrate 从 v1.8.1 起显式上锁 —— 更新子进程复用父进程继承来的那把, 用户手打时自己去取。
-NOT_A_TARGET = {"shift", "true", "false", "echo", "need_root", "_lock", "return", "exit", ":"}
+# `[[` 与 `}`: __migrate 分支在链失败时先撤掉这次新放的模块再原样退出(第 342 条裁定, R3) ——
+# `|| { …; [[ -f … ]] && python3 …; exit "$_mrc"; }` 里的条件与花括号不是被分发的目标。
+NOT_A_TARGET = {"shift", "true", "false", "echo", "need_root", "_lock", "return", "exit", ":", "[[", "}"}
 
 arms = []          # [(names, body, primary, shifts)]
 unparsed = []

@@ -88,13 +88,15 @@ if [[ -n "$BASE" && -f "$BASE" ]]; then
   migarm "$BASE" "$_a2b"; _rb=$?
   migarm "$PDG" "$_a2c"; _rc=$?
   A2_OLD='  __migrate)     need_root __migrate; _lock; run_all_migrations;;'
-  A2_NEW='  __migrate)     need_root __migrate; _lock; run_all_migrations && _dw_settle --after-migrate;;'
+  # 2026-11-19 按裁决(第 342 条)再精确放宽**一处**: 链失败或入口被拒时, 交还调用方回滚之前先撤掉这次升级
+  # 新放的运行模块(R3), 退出码原样带出。只认下面这一行原样, 不认任何变体。
+  A2_NEW='  __migrate)     need_root __migrate; _lock; run_all_migrations && _dw_settle --after-migrate || { _mrc=$?; [[ -f /opt/pdg-bot/installset.py ]] && python3 -I /opt/pdg-bot/installset.py undo-txn --ancestor-of "$$"; exit "$_mrc"; };;'
   if (( _rb != 0 || _rc != 0 )); then
     bad "A2: __migrate 派发块取不到唯一完整的一条(基线 $_rb / 现稿 $_rc; 1=读取失败 2=零匹配 3=多匹配 4=结构不完整), 不能判相同"
   elif [[ "$(< "$_a2b")" != "$A2_OLD" ]]; then
     bad "A2: 基线的 __migrate 派发块不是预期的那一行, 这一处放宽无从套用: $(head -2 "$_a2b")"
   elif [[ "$(< "$_a2c")" == "$A2_NEW" ]]; then
-    ok "A2: __migrate 派发块相对基线只多了「迁移链返回 0 之后才调 _dw_settle --after-migrate」这一处(need_root / _lock / 顺序逐字节不变)"
+    ok "A2: __migrate 派发块相对基线只多了「迁移链返回 0 之后才调 _dw_settle --after-migrate」与「失败时先撤掉这次新放的模块、原样带出退出码」两处(need_root / _lock / 顺序逐字节不变)"
   else
     bad "A2: __migrate 派发块的改动超出批准范围: $(head -2 "$_a2c")"
   fi
@@ -426,8 +428,9 @@ runall 0 1; _r2="$RUNALL_OUT"
 grep -q 'run_all_migrations || true' "$(fnfile "$PDG" cmd_platform)" \
   && ok "H3: cmd_platform 仍是 \`run_all_migrations || true\` —— 退役被拒不会让平台切换失败(那一步顺延到下次 update/migrate)" \
   || bad "H3: cmd_platform 的失败善后被改了"
-grep -qF '__migrate)     need_root __migrate; _lock; run_all_migrations && _dw_settle --after-migrate;;' "$PDG" \
-  && ok "H4: __migrate 派发仍是 need_root + _lock + run_all_migrations, 只在链返回 0 之后才接 _dw_settle —— 链失败照旧原样传回父进程由它回滚" \
+# 第 342 条裁定后: 链失败时先撤掉这次新放的模块(R3), 再原样带出退出码 —— 仍是"失败原样传回父进程由它回滚"。
+grep -qxF '  __migrate)     need_root __migrate; _lock; run_all_migrations && _dw_settle --after-migrate || { _mrc=$?; [[ -f /opt/pdg-bot/installset.py ]] && python3 -I /opt/pdg-bot/installset.py undo-txn --ancestor-of "$$"; exit "$_mrc"; };;' "$PDG" \
+  && ok "H4: __migrate 派发仍是 need_root + _lock + run_all_migrations, 只在链返回 0 之后才接 _dw_settle —— 链失败时先撤掉这次新放的模块, 再把退出码原样传回父进程由它回滚" \
   || bad "H4: __migrate 派发被改了"
 awk '/_pdg_svcstate_plan "\$snap"/{s=1} /run_all_migrations/{if(s)m=1} END{exit !m}' "$(fnfile "$PDG" cmd_migrate)" \
   && ok "H5: cmd_migrate 自建快照 + 确认同一份前像 + 自带句柄 —— 它是有能力的调用方, 不会被自己的门挡住" \

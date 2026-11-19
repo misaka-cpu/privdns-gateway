@@ -315,6 +315,74 @@ un = read("uninstall.sh")
 check('installset.py" uninstall-clean' in un and '[[ -n "$_ISM_OUT" ]] && printf' in un, "uninstall.sh 删记录认得出来的残留, 并把结果说出来")
 check(os.path.lexists(HOST_STATE) == HOST_BEFORE, "整支跑完, 宿主 %s 与开跑前一样(%s)" % (HOST_STATE, "在" if HOST_BEFORE else "不存在"))
 
+# ── 6. R3: __migrate 失败时撤掉这次升级新放的模块(undo-txn)──────────────────
+print("\n== 6. R3: undo-txn 只认这次升级的记录 ==")
+import calendar  # noqa: E402
+import time      # noqa: E402
+FP = os.path.join(TMP, "r6", "proc")
+os.makedirs(os.path.join(FP, "sys", "kernel", "random"))
+open(os.path.join(FP, "sys", "kernel", "random", "boot_id"), "w").write("boot-aaa\n")
+for pid, comm, ppid in (("300", "bash", "200"), ("200", "we ird) name", "100"), ("100", "pdg", "1")):
+    os.makedirs(os.path.join(FP, pid))
+    open(os.path.join(FP, pid, "stat"), "w").write("%s (%s) S %s 0 0 0\n" % (pid, comm, ppid))
+check(installset._ancestors("300", FP) == ["300", "200", "100"], "顺着 /proc/<pid>/stat 找祖先, 进程名里有空格和右括号也认得对")
+R6 = os.path.join(TMP, "r6", "root")
+MD6 = os.path.join(R6, "opt", "pdg-bot")
+UD6 = os.path.join(R6, "etc", "systemd", "system")
+D6 = os.path.join(TMP, "r6", "install")
+os.makedirs(MD6)
+os.makedirs(UD6)
+os.makedirs(os.path.join(D6, "txn"))
+NOW = calendar.timegm(time.strptime("2026-11-19T12:00:00Z", "%Y-%m-%dT%H:%M:%SZ"))
+
+
+def rec6(name, pid, boot, at, entries):
+    with open(os.path.join(D6, "txn", name), "w") as f:
+        json.dump({"schema": 1, "kind": "install-txn", "pid": pid, "boot_id": boot, "at": at, "entries": entries}, f)
+
+
+def mod6(n, data=None):
+    data = data if data is not None else ("# %s\n" % n).encode()
+    open(os.path.join(MD6, n), "wb").write(data)
+    return {"path": "/opt/pdg-bot/" + n, "before": None, "written": sha_b(data), "mode": "755"}
+
+
+ea, eb, ec, ed, ee, eu = (mod6(n) for n in ("new_a.py", "new_b.py", "new_c.py", "new_d.py", "new_e.py", "svc_new.py"))
+over = mod6("over.py")
+over["before"] = sha_b(b"# old over\n")
+open(os.path.join(UD6, "pdg-svcnew.service"), "w").write("ExecStart=/usr/bin/python3 /opt/pdg-bot/svc_new.py\n")
+rec6("a.json", "100", "boot-aaa", "2026-11-19T11:59:00Z", [ea, over, eu])
+rec6("b.json", "999", "boot-aaa", "2026-11-19T11:59:00Z", [eb])
+rec6("c.json", "100", "boot-zzz", "2026-11-19T11:59:00Z", [ec])
+rec6("d.json", "100", "boot-aaa", "2026-11-19T09:00:00Z", [ed])
+rec6("e.json", "100", "boot-aaa", "2026-11-19T14:00:00Z", [ee])
+removed, kept, n = installset.undo_txn("300", D6, R6, 3600, FP, NOW)
+present = set(os.listdir(MD6))
+check(n == 1 and removed == ["/opt/pdg-bot/new_a.py"] and "new_a.py" not in present,
+      "只认祖先进程写的、同一次开机、一小时内的那一份, 撤掉它新放的 new_a.py", "认出 %d 份, 撤掉 %s" % (n, removed))
+check({"new_b.py", "new_c.py", "new_d.py", "new_e.py"} <= present,
+      "别的进程写的、别的开机、太老的、时刻在未来的记录都不认, 那些文件不动")
+check("over.py" in present and "/opt/pdg-bot/over.py" not in dict(kept), "写之前就在的(被覆盖的)不动, 留给随后的回滚还原")
+check(dict(kept).get("/opt/pdg-bot/svc_new.py") == "还有服务在用", "这次新放的、但已经有 unit 在用 → 留着、报原因")
+check(installset.undo_txn("555", D6, R6, 3600, FP, NOW)[2] == 0, "进程链里没有记录的进程号(手动 pdg __migrate、pdg migrate): 一份都不认")
+open(os.path.join(FP, "sys", "kernel", "random", "boot_id"), "w").write("")
+check(installset.undo_txn("300", D6, R6, 3600, FP, NOW)[2] == 0, "读不到本次开机的 boot_id: 一份都不认")
+# 真进程: 外层 shell 落记录(进程号 = 它的 $$), 子 shell 里调 undo-txn --ancestor-of 自己的 $$
+RR = os.path.join(TMP, "r6-real")
+os.makedirs(os.path.join(RR, "root", "opt", "pdg-bot"))
+shutil.copyfile(os.path.join(ROOT, "deploy/bot/checks.py"), os.path.join(RR, "root", "opt", "pdg-bot", "zz-r3-probe.py"))
+script = ("set -u\n"
+          'printf "deploy/bot/checks.py /opt/pdg-bot/zz-r3-probe.py 755\\n" | python3 -I "$PY" record --repo "$REPO" --pid "$$" --dir "$D"\n'
+          'bash -c \'python3 -I "$PY" undo-txn --ancestor-of "$$" --dir "$D" --root "$R"\'\n')
+p = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=120,
+                   env=dict(os.environ, PY=PY, REPO=ROOT, D=os.path.join(RR, "inst"), R=os.path.join(RR, "root")))
+check(p.returncode == 0 and "撤除这次升级新放的运行模块: /opt/pdg-bot/zz-r3-probe.py" in p.stdout
+      and not os.path.exists(os.path.join(RR, "root", "opt", "pdg-bot", "zz-r3-probe.py")),
+      "真进程: 父 shell 写的记录, 子进程里的 undo-txn 认得出来并撤掉", "真进程不对: rc=%d out=%r err=%r" % (p.returncode, p.stdout, p.stderr[-200:]))
+LINE = ('  __migrate)     need_root __migrate; _lock; run_all_migrations && _dw_settle --after-migrate || '
+        '{ _mrc=$?; [[ -f /opt/pdg-bot/installset.py ]] && python3 -I /opt/pdg-bot/installset.py undo-txn --ancestor-of "$$"; exit "$_mrc"; };;')
+check(pdg.splitlines().count(LINE) == 1, "派发行: 链失败时先 undo-txn 再原样带出退出码(第 342 条裁定的那一行原样)")
+
 print("─" * 40)
 print("通过 %d, 失败 %d" % (PASS[0], FAIL[0]))
 sys.exit(1 if FAIL[0] else 0)

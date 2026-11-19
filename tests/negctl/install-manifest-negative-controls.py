@@ -282,6 +282,29 @@ nc(42, "写入不再拒绝重复目标(NC01 重登记)", I,
 nc(43, "写入放过目标里的 ..(NC02 重登记)", I,
    'if not dest.startswith("/") or ".." in dest.split("/") or "//" in dest',
    'if not dest.startswith("/") or "//" in dest', "目标带 ..: 竟然写进去了", gates=(T, TX))
+# ── 第 3 步: R3(undo-txn 与 __migrate 派发行, 第 342 条裁定)──
+CLI = "tests/test-cli-dispatch.py"
+nc(44, "undo-txn 不再认祖先进程", I,
+   '        if doc.get("pid") not in anc or not boot or doc.get("boot_id") != boot:\n',
+   '        if not boot or doc.get("boot_id") != boot:\n', "别的进程写的", gates=(TX,))
+nc(45, "undo-txn 不再认开机号", I,
+   '        if doc.get("pid") not in anc or not boot or doc.get("boot_id") != boot:\n',
+   '        if doc.get("pid") not in anc:\n', "读不到本次开机的 boot_id", gates=(TX,))
+nc(46, "undo-txn 不再看时间窗", I,
+   "        if not (now - max_age <= at <= now + 300):\n", "        if False:\n", "太老的", gates=(TX,))
+nc(47, "祖先按空格拆进程名", I,
+   '        rest = raw[raw.rfind(")") + 1:].split()      # 进程名里可能有空格和括号, 从最后一个 ) 之后取\n',
+   "        rest = raw.split()[2:]\n", "进程名里有空格和右括号", gates=(TX,))
+nc(48, "undo-txn 连被覆盖的文件一起撤", I,
+   "    removed, kept = _sweep(_created(mine), root)\n    return removed, kept, len(mine)\n",
+   '    removed, kept = _sweep({e["path"]: {e["written"]} for _q, dd in mine for e in dd["entries"]}, root)\n    return removed, kept, len(mine)\n',
+   "写之前就在的(被覆盖的)不动", gates=(TX,))
+nc(49, "派发行失败时丢掉原退出码", P,
+   ' --ancestor-of "$$"; exit "$_mrc"; };;\n', ' --ancestor-of "$$"; exit 0; };;\n',
+   "迁移链返回 1 ⇒ 新步骤不执行, 退出码 1", gates=(CLI,))
+nc(50, "派发行失败时不再撤除", P,
+   '|| { _mrc=$?; [[ -f /opt/pdg-bot/installset.py ]] && python3 -I /opt/pdg-bot/installset.py undo-txn --ancestor-of "$$"; exit "$_mrc"; };;\n',
+   '|| { _mrc=$?; exit "$_mrc"; };;\n', "派发行", gates=(TX,))
 
 print("\n" + "─" * 40)
 for num, title, valid, d in RESULTS:

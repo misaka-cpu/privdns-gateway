@@ -371,7 +371,8 @@ echo "══ 九. 其它两个调用方不执行新步骤 ══"
 fnx(){ sed -n "/^$2(){\$/,/^}\$/p" "$1"; }
 # 静态: 不是注释的 _dw_settle 只有定义行与派发行; 两个调用方与迁移链里都没有它。
 _uses="$(grep -n '_dw_settle' "$PDG" | grep -vE '^[0-9]+:[[:space:]]*#' | grep -v ':_dw_settle(){$')"
-[[ "$(grep -c . <<< "$_uses")" == 1 && "$_uses" == *'  __migrate)'*'run_all_migrations && _dw_settle --after-migrate;;' ]] \
+# 第 342 条裁定后: 派发行在链失败时先撤掉这次新放的模块(R3)再原样带出退出码; 只认那一行原样。
+[[ "$(grep -c . <<< "$_uses")" == 1 && "$_uses" == *':''  __migrate)     need_root __migrate; _lock; run_all_migrations && _dw_settle --after-migrate || { _mrc=$?; [[ -f /opt/pdg-bot/installset.py ]] && python3 -I /opt/pdg-bot/installset.py undo-txn --ancestor-of "$$"; exit "$_mrc"; };;' ]] \
   && ok "W7a: 新步骤的调用点只有派发行一处" || bad "W7a: 调用点不止派发行: $_uses"
 for f in cmd_migrate cmd_platform run_all_migrations; do
   fnx "$PDG" "$f" > "$BOX/fn-$f.sh"
