@@ -140,16 +140,17 @@ pdg_validate_modules(){
 # 记不下来不挡安装: 那只是失去"回滚时撤掉新增模块"这一项, 说一句就继续。
 _pdg_modules_record(){
   local repo="$1" dest="$2" plat="$3" py="$1/deploy/bot/installset.py" src name mode
-  local -a dir=()
+  # 数组名要独一份: ShellCheck 查 pdg.sh 时会把这个文件一起读进来, 别处有当字符串用的 `dir`(SC2178 / SC2128)。
+  local -a _pmr_dir=()
   [[ -f "$py" ]] || return 0
   [[ "$dest" == "${PDG_RUNTIME_DIR:-/opt/pdg-bot}" ]] || return 0
   [[ "$dest" == /opt/pdg-bot || -n "${PDG_INSTALLSET_DIR:-}" ]] || return 0
-  [[ -n "${PDG_INSTALLSET_DIR:-}" ]] && dir=(--dir "$PDG_INSTALLSET_DIR")
+  [[ -n "${PDG_INSTALLSET_DIR:-}" ]] && _pmr_dir=(--dir "$PDG_INSTALLSET_DIR")
   # 循环体用 if 而不是 `[[ ]] && printf`: 后者在空行上返回 1, pipefail 下会让整条记录被判失败。
   while read -r src name mode; do
     if [[ -n "$src" ]]; then printf '%s %s %s\n' "$src" "$dest/$name" "$mode"; fi
   done < <(pdg_platform_modules "$plat") \
-    | python3 -I "$py" record --repo "$repo" --pid "$$" "${dir[@]}"
+    | python3 -I "$py" record --repo "$repo" --pid "$$" "${_pmr_dir[@]}"
 }
 
 pdg_install_runtime_modules(){
