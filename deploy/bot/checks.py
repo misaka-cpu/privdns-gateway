@@ -2856,6 +2856,50 @@ def check_deep_lan_acl():
             pass
 
 
+def check_install_manifest():
+    """盘上的程序文件与安装清单是否一致(lib/installset.sh 定全集, installset.py 核对)。
+
+    只给 🟡 不给 🔴: doctor 一有 🔴, `pdg update` 的自检门就会回滚, 这一项哪怕误判一次也
+    不能把升级拖去回滚。也只按**每次更新都逐个重装**的运行模块与 /usr/local/bin 那几件给 🟡;
+    unit 与证书钩子有的只在装机时装过一次, 老机器上与仓库不同是部署缺口, 只在说明里提一句。
+    没有清单(还没在本版装机或更新过)是 ℹ️, 不是警告。只读, 不打印文件内容。"""
+    NAME = "安装清单"
+    try:
+        import installset
+    except Exception:  # noqa: BLE001
+        return None                      # 老版本还没有这个模块: 不显示这一项
+    try:
+        r = installset.verify()
+    except Exception:  # noqa: BLE001
+        return ("warn", NAME, "核对时出错, 无法确认已装的程序文件(sudo pdg manifest verify 看详情)")
+    if r["state"] == "absent":
+        return ("info", NAME, "还没有安装清单(本版装机或更新完成时会写)")
+    if r["state"] != "ok":
+        return ("warn", NAME, "清单读不了: %s(sudo pdg manifest verify 看详情)" % r.get("why"))
+    word = {"content": "内容不同", "mode": "权限不同", "type": "不是普通文件", "missing": "缺失", "unreadable": "读不了"}
+    strong = [i for i in r["items"] if i["status"] != "same" and i["class"] in installset.STRONG]
+    if strong:
+        shown = "、".join("%s(%s)" % (i["path"], word.get(i["status"], i["status"])) for i in strong[:3])
+        more = " 等" if len(strong) > 3 else ""
+        return ("warn", NAME, "%d 个程序文件与清单不一致: %s%s(sudo pdg manifest verify 看详情)"
+                % (len(strong), shown, more))
+    if r["commit_match"] is False:
+        return ("warn", NAME, "清单记的是 %s, 装着的是 %s —— 清单不是这一版写的(sudo pdg manifest verify 看详情)"
+                % ((r["commit"] or "-")[:12], (r["head"] or "-")[:12]))
+    n = sum(1 for i in r["items"] if i["class"] in installset.STRONG)
+    detail = "%d 个程序文件与清单一致" % n
+    weak = [i for i in r["items"] if i["status"] != "same"]
+    if weak:
+        detail += "; unit / 证书钩子有 %d 项与仓库这一版不同(只提示)" % len(weak)
+    if r["extra"]:
+        detail += "; %s 里有 %d 个清单外的文件" % (r["module_dir"], len(r["extra"]))
+    if weak or r["extra"]:
+        detail += "(sudo pdg manifest verify 看详情)"
+    if r["commit_match"] is None:
+        detail += "; 装着的版本读不到, 没比提交"
+    return ("ok", NAME, detail)
+
+
 ALL = [check_platform, check_services, check_bot_credentials, check_health_timer, check_core_version, check_mihomo_binary, check_mosdns_version, check_mosdns_binary, check_dot_arecord, check_dot_domain_sync,
        check_internal_cidr, check_cidr_drift, check_nft, check_nft_input_chains, check_redirect, check_gms,
        check_tailscale_isolation, check_tailscale_residue, check_tailnet_direct_port,
@@ -2864,7 +2908,7 @@ ALL = [check_platform, check_services, check_bot_credentials, check_health_timer
        check_mosdns_ratelimit, check_mosdns_explicit_proxy, check_ruleset_hijack,
        check_nft_extra, check_rescue_firewall, check_geosite_db, check_mem,
        check_cert, check_cert_dir_sync, check_dns, check_core_config, check_rulesets, check_rule_precedence,
-       check_transactions]
+       check_transactions, check_install_manifest]
 ALERT = [check_services, check_dns, check_cert]  # healthcheck 用的轻量子集(运行期故障)
 DEEP = [check_deep_lan_acl,
         check_deep_dot_handshake, check_deep_probe81, check_deep_dot_witness, check_deep_dns_cn,

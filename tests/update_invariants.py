@@ -201,7 +201,8 @@ def capture(args):
     # 反代/白名单生成; `pdg lan` 的候选生成也走它)。不装它们, `pdg lan` 与相关 doctor
     # 检查会直接 ImportError/找不到模块, 因此两个平台各 +2。
     # ios 36 → 34: WLOC 退役后 mitm_server.py / mitm_wloc.py 不再安装。
-    expect = {"android": 31, "ios": 35}.get(plat)   # +1: kernelfollow.py(内核跟随上游)
+    # +1: kernelfollow.py(内核跟随上游); 再 +1: installset.py(安装清单, doctor 的「安装清单」一项 import 它)。
+    expect = {"android": 32, "ios": 36}.get(plat)
     if expect is not None and len(members) != expect:
         raise SystemExit("manifest 数量漂移: %s 平台应为 %d 项, 实得 %d" % (plat, expect, len(members)))
 

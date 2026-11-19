@@ -266,6 +266,10 @@ print("══ 10b. run_all_migrations 的 rc(真跑)══")
 _ra_body = extract("run_all_migrations")
 _ra_code = "\n".join(re.sub(r"(^|\s)#.*$", "", l) for l in _ra_body.splitlines())
 _ra_migs = sorted(set(re.findall(r"\bmigrate_[a-z0-9_]+\b", _ra_code)))
+# 只在链全部成功时才跑的那一步(安装清单, 第 336 条裁定): 失败格里它**不该**被调, 健康格里恰好一次。
+# 调用集合按格算: 健康格 = 全部名单; 失败格 = 名单去掉这一步。不是把它从名单里拿掉了事 ——
+# 它没出现在函数体里、或者失败时也被调了, 都要判执行无效。
+_RA_ON_SUCCESS = {"migrate_install_manifest"}
 # 外壳必需的函数定义: 链内全部迁移、链首前置、函数体里用到的提示函数(c_*)。执行前闸按它核生成的文本。
 _ra_need = set(_ra_migs) | {"_retire_precheck"} | set(re.findall(r"\bc_[a-z]+\b", _ra_code))
 
@@ -311,9 +315,14 @@ def _ra_run(cell, target_rc):
         if n_t != 1:
             why.append("目标被调用 %d 次" % n_t)
         got = {s for s in seq if s.startswith("migrate_")}
-        if got != set(_ra_migs):
+        want = set(_ra_migs) if target_rc == 0 else set(_ra_migs) - _RA_ON_SUCCESS
+        if got != want:
             why.append("实际调用的迁移与函数体名单不一致(没调到 %r, 名单外 %r)"
-                       % (sorted(set(_ra_migs) - got)[:3], sorted(got - set(_ra_migs))[:3]))
+                       % (sorted(want - got)[:3], sorted(got - want)[:3]))
+        for f in sorted(_RA_ON_SUCCESS):
+            n_s = seq.count(f)
+            if n_s != (1 if target_rc == 0 else 0):
+                why.append("%s 在%s格被调用 %d 次(应为 %d)" % (f, cell, n_s, 1 if target_rc == 0 else 0))
     return {"cell": cell, "launched": True, "why": why, "chain": chain, "rc": r.returncode, "n_t": n_t}
 
 
@@ -326,7 +335,9 @@ def _ra_got(c):
 
 
 _ra_pre = [w for w, bad_ in (("抽不到 run_all_migrations", not _ra_body),
-                             ("链内没有 migrate_probe81_public 调用", "migrate_probe81_public" not in _ra_migs)) if bad_]
+                             ("链内没有 migrate_probe81_public 调用", "migrate_probe81_public" not in _ra_migs),
+                             ("链内没有只在成功时才跑的那一步 %r" % sorted(_RA_ON_SUCCESS),
+                              not _RA_ON_SUCCESS <= set(_ra_migs))) if bad_]
 if _ra_pre:
     bad("10b 前提不成立: %s —— 不生成、不执行外壳, 传播未判" % "; ".join(_ra_pre))
 else:

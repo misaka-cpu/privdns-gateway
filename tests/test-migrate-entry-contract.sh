@@ -52,11 +52,13 @@ if [[ -n "$BASE" && -f "$BASE" ]]; then
   # 2026-11-07 按裁决再精确放宽**一处**新增: `migrate_lan_cert_timer || true`(存量机器补装面板证书的
   # 续期定时器, best-effort, 失败不拖垮更新)。用户在问到"放宽 A1 这一行 / 不动迁移链 / 挂进已有迁移函数"
   # 时选了"放宽 A1 这一行"。只认这一行原样(可带行尾注释), 不认任何变体。
+  # 2026-11-19 按裁决再精确放宽**一处**新增: `(( rc == 0 )) && { migrate_install_manifest || true; }`
+  # (安装清单, 只在前面全部迁移成功时写, 写不成不拖垮更新)。用户同样选了"放宽 A1 这一行"。只认这一行原样。
   _delok="$(grep '^<' "$_d" | grep -cE '^< +migrate_platform_marker \|\| true( |$)|^< +migrate_nft_extra \|\| true$' || true)"
-  _addok="$(grep '^>' "$_d" | grep -cE '_retire_precheck \|\| return 1|^> *#|^> +migrate_platform_marker \|\| \{ \[\[ \$\? == 2 \]\] && \{ c_r .*; return 1; \}; \}$|^> +migrate_nft_extra \|\| \{ \[\[ \$\? == 3 \]\] && rc=1; \}$|^> +migrate_lan_cert_timer \|\| true( +#.*)?$' || true)"
+  _addok="$(grep '^>' "$_d" | grep -cE '_retire_precheck \|\| return 1|^> *#|^> +migrate_platform_marker \|\| \{ \[\[ \$\? == 2 \]\] && \{ c_r .*; return 1; \}; \}$|^> +migrate_nft_extra \|\| \{ \[\[ \$\? == 3 \]\] && rc=1; \}$|^> +migrate_lan_cert_timer \|\| true( +#.*)?$|^> +\(\( rc == 0 \)\) && \{ migrate_install_manifest \|\| true; \}$' || true)"
   if [[ "${_del:-0}" == "${_delok:-0}" && "${_del:-0}" -le 2 && "${_add:-0}" == "${_addok:-0}" && "${_add:-0}" -ge 1 ]] \
      && grep -q '_retire_precheck || return 1' "$_d"; then
-    ok "A1: run_all_migrations 相对基线只多那一处有条件前置, 只把标记迁移那一句换成「平台观测失败才停链」、自定义放行那一句换成「只把返回 3 记进失败」、多一句面板证书续期定时器的迁移(新增 ${_add} / 删除 ${_del})"
+    ok "A1: run_all_migrations 相对基线只多那一处有条件前置, 只把标记迁移那一句换成「平台观测失败才停链」、自定义放行那一句换成「只把返回 3 记进失败」、多一句面板证书续期定时器的迁移、多一句只在全部成功时写的安装清单(新增 ${_add} / 删除 ${_del})"
   else
     bad "A1: run_all_migrations 的改动超出批准范围(新增 ${_add:-?} / 其中合规 ${_addok:-?} / 删除 ${_del:-?} / 其中合规 ${_delok:-?})"
     head -14 "$_d"
@@ -397,12 +399,23 @@ runall(){ # $1 = migrate_wloc_retire 的返回码  $2 = _retire_precheck 的返�
   local _n _rc=0
   _n="$(wc -l < "$d/calls.log")" || _rc=$?
   (( _rc == 0 )) && RUNALL_N="${_n//[[:space:]]/}" || RUNALL_N=ERR
+  # 安装清单那一步只在链全部成功时跑(第 336 条裁定), 不算"后面的迁移"。另记两样:
+  # 它被调了几次(RUNALL_M)、去掉它之后的调用数(RUNALL_NX)。先落盘再数, 不接管道 grep -q。
+  local _m=0
+  _m="$(grep -cx 'migrate_install_manifest' "$d/calls.log" || true)"
+  RUNALL_M="${_m:-ERR}"
+  [[ "$RUNALL_N" == ERR || "$RUNALL_M" == ERR ]] && RUNALL_NX=ERR || RUNALL_NX=$(( RUNALL_N - RUNALL_M ))
+  RUNALL_LAST="$(tail -1 "$d/calls.log" 2>/dev/null)"
 }
-RUNALL_N=0; RUNALL_OUT=""
+RUNALL_N=0; RUNALL_M=0; RUNALL_NX=0; RUNALL_LAST=""; RUNALL_OUT=""
 runall 1 0; [[ "$RUNALL_OUT" == "RC=1" ]] && ok "H1: 门拒绝 → migrate_wloc_retire 返回 1 → run_all_migrations 返回非 0(半截现场不会被吞成成功)" || bad "H1: 实得 $RUNALL_OUT"
+[[ "$RUNALL_M" == 0 ]] && ok "H1b: 链失败时安装清单一次都没写(调用 0 次)" || bad "H1b: 链失败却调了安装清单 ${RUNALL_M:-?} 次"
 runall 0 0; _r="$RUNALL_OUT"
 [[ "$_r" == "RC=0" ]] && ok "H2: 反向对照 —— 只有这一格返回 0 时整体就是 0(H1 不是别的迁移造成的)" || bad "H2: 实得 $_r"
-_n_ok="$RUNALL_N"
+[[ "$RUNALL_M" == 1 && "$RUNALL_LAST" == migrate_install_manifest ]] \
+  && ok "H2d: 链全部成功时安装清单恰好写一次, 而且是最后一步" \
+  || bad "H2d: 健康那一格安装清单调用 ${RUNALL_M:-?} 次、最后一步是 ${RUNALL_LAST:-?}"
+_n_ok="$RUNALL_NX"
 runall 0 1; _r2="$RUNALL_OUT"
 [[ "$_r2" == "RC=1" ]] \
   && ok "H2b: 有条件前置拒绝 ⇒ run_all_migrations 直接返回非 0(不靠后面任何一个迁移)" \
@@ -419,13 +432,14 @@ grep -qF '__migrate)     need_root __migrate; _lock; run_all_migrations && _dw_s
 awk '/_pdg_svcstate_plan "\$snap"/{s=1} /run_all_migrations/{if(s)m=1} END{exit !m}' "$(fnfile "$PDG" cmd_migrate)" \
   && ok "H5: cmd_migrate 自建快照 + 确认同一份前像 + 自带句柄 —— 它是有能力的调用方, 不会被自己的门挡住" \
   || bad "H5"
-runall 0 0 3; _r3="$RUNALL_OUT"; _n3="$RUNALL_N"
+runall 0 0 3; _r3="$RUNALL_OUT"; _n3="$RUNALL_NX"; _m3="$RUNALL_M"
 [[ "$_r3" == "RC=1" ]] \
   && ok "H6: migrate_nft_extra 返回 3(受管落点准备失败)⇒ run_all_migrations 最终非 0(其后各迁移都返回 0 也冲不掉)" \
   || bad "H6: 返回 3 却得到 $_r3"
 [[ "${_n3:-x}" == "${_n_ok:-y}" ]] \
   && ok "H6b: 这一类失败不截断后面的迁移(调用数 $_n3 = 健康对照 $_n_ok)" \
   || bad "H6b: 调用数 ${_n3:-?} ≠ 健康对照 ${_n_ok:-?}"
+[[ "${_m3:-x}" == 0 ]] && ok "H6c: 这一类失败让链最终非 0, 安装清单也就不写(调用 0 次)" || bad "H6c: 链最终非 0 却调了安装清单 ${_m3:-?} 次"
 runall 0 0 1; _r4="$RUNALL_OUT"
 [[ "$_r4" == "RC=0" ]] \
   && ok "H7: migrate_nft_extra 的其它非零(如 1)仍 best-effort, 不升级为失败(口径没有扩大)" \

@@ -755,6 +755,12 @@ jobs:
         if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-kernel-follow.py
 
+      # 安装清单(lib/installset.sh + installset.py): 全集与 install.sh / cmd_update 的安装行逐条比对,
+      # 写与核对的每一种不一致都真造一遍, doctor 那一项只给 🟡 / ℹ️。
+      - name: "安装清单 (全集=模块清单+安装行/写入整份拒绝坏行/核对内容权限缺失类型提交/清单外只提示/doctor 不给 🔴/迁移与装机接线)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
+        run: python3 tests/test-install-manifest.py
+
       # 真钉死版 mihomo 做配置校验(tests/.bin/mihomo 上面已装); 取件 / 上游 API / 体检 / 通知在测试侧打桩。
       - name: "内核跟随上游编排 (取件核对/体检变差换回/pdg update 不降级被认的上游核/revert/自动的等待期与不重试)"
         if: ${{ !cancelled() && steps.ready.outcome == 'success' }}

@@ -1181,6 +1181,14 @@ if [[ "$svc_ok" != 1 ]]; then
   die "核心服务未能持续保持运行(见上日志)。"   # → 触发回滚
 fi
 INSTALL_OK=1   # 提交点: 核心服务已确认稳定 active, 后面只是打印, 不再回滚
+# 安装清单(lib/installset.sh): 放在提交点之后 —— 装机中途失败会整体回滚, 那时不该留下一份
+# 说"已经装好"的清单。写不成不改变安装结果, 只提示一句(doctor 的「安装清单」一项会接着报)。
+_ism_out=""
+# shellcheck source=lib/installset.sh
+if ! source "$REPO_DIR/lib/installset.sh" 2>/dev/null \
+   || ! _ism_out="$(pdg_installset_write "$REPO_DIR" "$PLATFORM" install 2>&1)"; then
+  c_y "⚠️ 安装清单没写成(${_ism_out:-读不到 lib/installset.sh}), 不影响使用; pdg doctor 会报这一项。"
+fi
 
 # ── 10. 自检 ──
 echo; c_g "安装完成($PLATFORM 平台)。状态:"

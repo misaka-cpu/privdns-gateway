@@ -4775,6 +4775,24 @@ migrate_deploy_botfiles(){
   c_g "  运行模块已更新 → 已重启:$(printf ' %s' $_svcs)"
 }
 
+# 安装清单(lib/installset.sh 定全集, installset.py 写): 按刚部署好的这一版重写
+# /var/lib/privdns-gateway/install/manifest.json。内容没变就不重写、什么都不打印。
+#
+# 为什么写在迁移里, 不写在 cmd_update 的成功出口: 从旧版升上来时, cmd_update 是**旧版**的代码,
+# 它不认识清单; 迁移跑的是刚装上的新脚本。只有这里能保证"升到本版的机器都有清单"。
+# 平台切换(cmd_platform)与 `pdg migrate` 也走 run_all_migrations, 换了平台清单跟着换。
+migrate_install_manifest(){
+  [[ -f "$REPO_DIR/lib/installset.sh" ]] || return 0      # 仓库还停在没有清单的版本: 不写
+  # shellcheck source=lib/installset.sh
+  source "$REPO_DIR/lib/installset.sh" 2>/dev/null || { c_y "  ⚠️ 读不到 lib/installset.sh, 安装清单没写"; return 1; }
+  local out
+  if ! out="$(pdg_installset_write "$REPO_DIR" "$(_pdg_platform)" migrate 2>&1)"; then
+    c_y "  ⚠️ 安装清单没写成: ${out:-原因不明}"; return 1
+  fi
+  [[ "$out" == 安装清单已更新* ]] && c_g "  $out"
+  return 0
+}
+
 # /opt/pdg-bot 下受管模块的整体摘要 —— 只用来判断"这次迁移有没有真的换过文件"。
 # 读不到就回显空串: 那会让前后两次比较不相等, 于是保守地重启一次(宁可多转一次,
 # 也不要留下"盘上新、跑着旧"的机器)。
@@ -7222,6 +7240,9 @@ run_all_migrations(){
   migrate_drop_singbox || rc=1
   migrate_lan_caddy_reender || true   # 存量机器的反代配置跟上生成器(失败不拖垮更新)
   migrate_lan_cert_timer || true      # 存量机器补上面板证书的续期定时器(失败不拖垮更新, doctor 会报)
+  # 安装清单排在最后, 且只在前面全部成功时写: 迁移失败的这一次会被回滚, 不该先留下一份
+  # 说"已经是这一版"的清单。写不成不拖垮更新(清单是记录; doctor 的「安装清单」一项会报)。
+  (( rc == 0 )) && { migrate_install_manifest || true; }
   return $rc
 }
 
@@ -11408,6 +11429,18 @@ cmd_kernel(){
   esac
 }
 
+# pdg manifest verify: 只读核对盘上的程序文件与安装清单(不取写锁, 不打印文件内容)。
+cmd_manifest(){
+  need_root manifest
+  case "${1:-verify}" in
+    verify)
+      shift || true
+      local m; m="$(_pdg_module installset.py)" || { echo "❌ 找不到 installset.py"; return 1; }
+      python3 -I "$m" verify --repo "$REPO_DIR" "$@";;
+    *) echo "用法: pdg manifest [verify [--json]]"; return 2;;
+  esac
+}
+
 # pdg tx: 查看/恢复事务。list/show 是只读的(不取写锁); recover 自己在核心里取同一把锁。
 cmd_tx(){
   need_root tx
@@ -11444,6 +11477,7 @@ case "${1:-menu}" in
   __migrate)     need_root __migrate; _lock; run_all_migrations && _dw_settle --after-migrate;;
   migrate)       cmd_migrate;;
   tx)            shift || true; cmd_tx "$@";;
+  manifest)      shift || true; cmd_manifest "$@";;
   status|st)     cmd_status;;
   doctor|dr)     shift || true; cmd_doctor "$@";;
   update|up)     shift || true; cmd_update "$@";;
@@ -11466,5 +11500,5 @@ case "${1:-menu}" in
   link)          shift || true; cmd_link "$@";;
   uninstall|rm)  shift || true; cmd_uninstall "$@";;
   rescue)        shift || true; cmd_rescue "$@";;
-  *) echo "用法: pdg [menu|status|doctor [--json|--deep]|update [--dry-run] [--to <版本tag>]|snapshot|rollback [n]|token|restart|log [n]|traffic|ios [status|diff|previous|ack|recover|repair](仅 iOS)|report [--redact-ip|--full]|detect-cidr|platform <ios|android>|hijack-mode <all|gfw>|ssh-source [status|tailnet|any|confirm]|link status|link session <start|status|stop>|lan <status|list|check|routes|add|rm>|adblock <status|status-line|enable|disable|update|check <域名>|rule-add <域名>|rule-del <域名>|source <list [--json]|add <URL>|del <URL>|reset>>|kernel [status [--online]|mode <pinned|upstream>|auto <on|off>|upgrade [vX.Y.Z]|revert]|migrate|migrate-fw|tx <list|show|recover|abort>|rescue <enable|disable|status|fingerprint|bind <IPv4>|rotate-token|rotate-cert>|uninstall [--purge]]";;
+  *) echo "用法: pdg [menu|status|doctor [--json|--deep]|update [--dry-run] [--to <版本tag>]|snapshot|rollback [n]|token|restart|log [n]|traffic|ios [status|diff|previous|ack|recover|repair](仅 iOS)|report [--redact-ip|--full]|detect-cidr|platform <ios|android>|hijack-mode <all|gfw>|ssh-source [status|tailnet|any|confirm]|link status|link session <start|status|stop>|lan <status|list|check|routes|add|rm>|adblock <status|status-line|enable|disable|update|check <域名>|rule-add <域名>|rule-del <域名>|source <list [--json]|add <URL>|del <URL>|reset>>|kernel [status [--online]|mode <pinned|upstream>|auto <on|off>|upgrade [vX.Y.Z]|revert]|migrate|migrate-fw|tx <list|show|recover|abort>|manifest [verify [--json]]|rescue <enable|disable|status|fingerprint|bind <IPv4>|rotate-token|rotate-cert>|uninstall [--purge]]";;
 esac
