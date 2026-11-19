@@ -1988,6 +1988,9 @@ cmd_rollback(){
   if ! mkdir -p "$tree" || ! tar tzf "$f" > "$members" 2>/dev/null || [[ ! -s "$members" ]]; then
     echo "❌ 快照目录或成员清单读取失败, 中止"; rm -rf "$tmp"; return 1
   fi
+  # 全量成员清单另存一份: 下面保护模式会把受保护成员从 $members 里拿掉, 而落盘之后撤除
+  # "快照之后才出现的运行模块"要看的是快照里**本来有什么**。
+  cp -f -- "$members" "$tmp/members.all" 2>/dev/null || :
   # 越界守卫的前缀集必须与 cmd_snapshot 的候选集对齐。放行 var/lib 下的**那一个子树**而不是
   # 整个 var/lib: 快照里本来就不该有 tx 记录、救援运行态、备份包这些东西, 放宽到 var/lib
   # 等于让一份构造出来的快照可以往那里写任意文件。
@@ -2023,6 +2026,7 @@ cmd_rollback(){
       fi
     done < "$members"
     mv -f "$_kept" "$members"
+    pdg_rescue_protected > "$tmp/keep" 2>/dev/null || :     # 撤除时同样不许碰它们
   fi
   if _sb_panel_managed_on "$tree/etc/sing-box/config.json"; then
     if ! _sb_sanitize_panel "$tree/etc/sing-box/config.json"; then
@@ -2076,10 +2080,27 @@ cmd_rollback(){
   if ! _pdg_apply_snapshot_tree "$tree" "$members" /; then
     echo "❌ 快照落盘失败, 系统可能已部分恢复, 请立即检查"; rm -rf "$tmp"; return 1
   fi
+  # 快照之后才出现的运行模块: tar 覆盖写不删它们(旧版回滚多留 kernelfollow.py 就是这么来的)。
+  # 按事前记录与安装清单撤掉"快照里没有、当时是新放的、至今没人动过、也没有服务在用"的那些;
+  # 认不准的留着并记进未能恢复项。在服务收敛之前做, 重启起来的就是还原后的那一套。
+  # 用落盘之后盘上那份 installset.py(就是快照那一版的); 快照比清单还老就用仓库里的(还没复位)。
+  local _rbc_rc=0 _rbc_py="" _rbc_out=""
+  local -a _rbc_args=(rollback-clean --members "$tmp/members.all")
+  [[ -n "${PDG_INSTALLSET_DIR:-}" ]] && _rbc_args+=(--dir "$PDG_INSTALLSET_DIR")
+  [[ -s "$tmp/keep" ]] && _rbc_args+=(--keep "$tmp/keep")
+  for _rbc_py in /opt/pdg-bot/installset.py "$REPO_DIR/deploy/bot/installset.py"; do
+    [[ -f "$_rbc_py" ]] && break
+    _rbc_py=""
+  done
+  if [[ -n "$_rbc_py" ]]; then
+    _rbc_out="$(python3 -I "$_rbc_py" "${_rbc_args[@]}" 2>&1)" || _rbc_rc=$?
+    [[ -n "$_rbc_out" ]] && printf '%s\n' "$_rbc_out" | sed 's/^/  /'
+  fi
   rm -rf "$tmp"
   (( panel_sanitized == 1 )) && c_g "  已净化回滚出的面板临时态 → 关闭"
   local unrestored=()                         # 未能恢复项(内核激活/仓库Git); 非空即"未完全回滚"
   (( _witness_absence_rc == 0 )) || unrestored+=("DoT 证据服务新增文件未能安全撤除")
+  (( _rbc_rc == 0 )) || unrestored+=("快照之后新增的运行模块未能全部撤除")
   # 恢复策略必须在**任何服务动作之前**定好 —— 内核收敛也算服务动作。
   # 这一步只解析与校验前像(并确认它属于正在回滚的这一份快照), 不碰任何服务。
   #
@@ -2147,6 +2168,21 @@ cmd_rollback(){
       c_y "  ⚠️ 仓库没能复位到 ${git_ref:0:12}(该提交在当前仓库里可能已不存在)。"
       c_y "     配置与服务已回滚; 代码仍是当前版本。要对齐就跑一次 pdg update, 或手工 git reset。"
     fi
+  fi
+  # 安装清单跟着回到盘上这一版(必须在仓库复位之后: 清单按复位后的仓库写)。不这样做的话,
+  # "升级失败 → 本版回滚"之后清单还停在失败的那一版, doctor 会报不一致。回到的版本没有清单
+  # (仓库里没有 lib/installset.sh)就删掉那份 —— 它描述的版本已经不在盘上了。写不成只提示:
+  # 清单是记录, 不算回滚没完成。写在这里而不另起函数: 有测试把 cmd_rollback 按名抽出来跑,
+  # 新的 shell 辅助函数在那些壳里是 command not found。
+  if [[ -f "$REPO_DIR/lib/installset.sh" ]]; then
+    local _ism_out=""
+    # shellcheck source=lib/installset.sh
+    if ! source "$REPO_DIR/lib/installset.sh" 2>/dev/null \
+       || ! _ism_out="$(pdg_installset_write "$REPO_DIR" "$(_pdg_platform)" rollback 2>&1)"; then
+      c_y "  ⚠️ 安装清单没能跟着刷新: ${_ism_out:-读不到 lib/installset.sh}(pdg doctor 会报这一项)"
+    fi
+  else
+    rm -f -- "${PDG_INSTALLSET_DIR:-/var/lib/privdns-gateway/install}/manifest.json" 2>/dev/null || true
   fi
   # 内网面板的派生产物在全局快照之外, 得从**刚恢复的**模型现渲一遍才算回滚完整。
   # 位置有讲究: 必须在上面的 git reset 之后 —— 生成器来自 REPO_DIR, 那一步才刚复位。
@@ -4790,6 +4826,12 @@ migrate_install_manifest(){
     c_y "  ⚠️ 安装清单没写成: ${out:-原因不明}"; return 1
   fi
   [[ "$out" == 安装清单已更新* ]] && c_g "  $out"
+  # 新清单写成了才收旧账: 以前没成功的那几次留下、这一版又不要的运行模块(只撤认得出来的)。
+  local rc=0
+  out="$(pdg_installset_reconcile "$REPO_DIR" 2>&1)" || rc=$?
+  if [[ -n "$out" ]]; then
+    if (( rc == 0 )); then c_g "  $out"; else c_y "  $out"; fi
+  fi
   return 0
 }
 

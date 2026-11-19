@@ -61,6 +61,13 @@ if [[ -f "$_UN_HERE/lib/rescue.sh" ]]; then
 else
   _RESCUE_RESIDUE="找不到 lib/rescue.sh, 救援平面(凭据/状态/放行规则)未清理"
 fi
+# 安装清单与事前记录(/var/lib/privdns-gateway/install, deploy/bot/installset.py):
+# 运行模块上面已经按清单删了; 这里再收走以前没成功的升级留下、事前记录认得出来的那些
+# (写之前不存在、至今没人动过、也没有服务在用), 然后删掉清单与记录本身。认不准的留着, 下面照实列出。
+_ISM_OUT=""
+if [[ -f "$_UN_HERE/deploy/bot/installset.py" ]]; then
+  _ISM_OUT="$(python3 -I "$_UN_HERE/deploy/bot/installset.py" uninstall-clean 2>&1)" || true
+fi
 # 内网面板(方案 B): 反代 unit、出站白名单、配置与证书、DNS API 凭据、acme 账户密钥、
 # caddy 二进制、专用用户。与救援平面同一条规矩 —— 残留要逐条报出来, 因为这里留下的是
 # **能改用户 DNS 记录的凭据**与**能签发证书的账户密钥**: 服务已经没了而凭据还在,
@@ -224,6 +231,7 @@ fi
 
 echo "保留: /etc/mosdns /etc/sing-box /etc/mihomo 与 Let's Encrypt 证书(配置与数据, 重装可复用)。"
 echo "已删除: /opt/pdg-bot 下的事务与救援运行模块(清单见 lib/modules.sh 的 PDG_RUNTIME_MODULES)。"
+[[ -n "$_ISM_OUT" ]] && printf '%s\n' "$_ISM_OUT"
 # 说"全部"是不准的: install.sh 另有一路把 Bot 本体(bot.py)、MITM 组件、探测脚本等装进同一个
 # 目录, 它们不在那份清单里, 卸载也不会删。`.200` 实测卸载完那里还剩 10 个项目程序文件, 而
 # 文案说的是"全部运行模块" —— 用户据此以为盘上干净了, 其实没有。这里如实列出剩了什么。

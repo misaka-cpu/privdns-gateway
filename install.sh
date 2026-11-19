@@ -1188,6 +1188,10 @@ _ism_out=""
 if ! source "$REPO_DIR/lib/installset.sh" 2>/dev/null \
    || ! _ism_out="$(pdg_installset_write "$REPO_DIR" "$PLATFORM" install 2>&1)"; then
   c_y "⚠️ 安装清单没写成(${_ism_out:-读不到 lib/installset.sh}), 不影响使用; pdg doctor 会报这一项。"
+elif _ism_out="$(pdg_installset_reconcile "$REPO_DIR" 2>&1)" && [[ -n "$_ism_out" ]]; then
+  c_g "$_ism_out"
+elif [[ -n "$_ism_out" ]]; then
+  c_y "$_ism_out"
 fi
 
 # ── 10. 自检 ──

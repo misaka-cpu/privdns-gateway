@@ -86,3 +86,12 @@ pdg_installset_write(){
   printf '%s\n' "$list" | python3 -I "$py" write --repo "$repo" --platform "$plat" --by "$by" \
     --dir "$PDG_INSTALLSET_DIR" --runtime "$(pdg_installset_runtime)" --legacy "$(pdg_legacy_modules)"
 }
+
+# 成功安装 / 升级、写完新清单之后: 收走以前没成功的那几次留下、又不在新清单里的运行模块,
+# 然后清空事前记录。只撤"当时写之前不存在、至今没人动过、也没有服务在用"的; 输出只有路径与原因。
+# 返回 1 = 有留下来的(调用方只提示, 不当失败)。
+pdg_installset_reconcile(){
+  local py="$1/deploy/bot/installset.py"
+  [[ -f "$py" ]] || return 0
+  python3 -I "$py" reconcile --dir "$PDG_INSTALLSET_DIR"
+}

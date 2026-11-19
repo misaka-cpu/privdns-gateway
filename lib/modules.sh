@@ -130,10 +130,34 @@ pdg_validate_modules(){
   return 1
 }
 
+# 事前记录: 写任何文件之前, 先记下这次要写哪些运行模块、每个写之前在不在、写进去的是什么
+# (deploy/bot/installset.py record, 落在 /var/lib/privdns-gateway/install/txn/)。
+# 回滚是 tar 覆盖写, 快照之后才出现的文件它从来不删; 有了这份记录, 本版以后的回滚、下一次成功的
+# 升级与卸载才认得出"这是那次新放的、而且没人动过", 把它撤掉。
+# 为什么放在这里: 从旧版升上来时, cmd_update 是**旧版**代码, 但它 source 的是新版这份文件、
+# 调的是新版这个函数 —— 这是旧版主导的升级里新版最早能插手的地方。
+# 只给真正的运行模块目录记(测试里把模块装到临时目录时不记, 免得往宿主写)。
+# 记不下来不挡安装: 那只是失去"回滚时撤掉新增模块"这一项, 说一句就继续。
+_pdg_modules_record(){
+  local repo="$1" dest="$2" plat="$3" py="$1/deploy/bot/installset.py" src name mode
+  local -a dir=()
+  [[ -f "$py" ]] || return 0
+  [[ "$dest" == "${PDG_RUNTIME_DIR:-/opt/pdg-bot}" ]] || return 0
+  [[ "$dest" == /opt/pdg-bot || -n "${PDG_INSTALLSET_DIR:-}" ]] || return 0
+  [[ -n "${PDG_INSTALLSET_DIR:-}" ]] && dir=(--dir "$PDG_INSTALLSET_DIR")
+  # 循环体用 if 而不是 `[[ ]] && printf`: 后者在空行上返回 1, pipefail 下会让整条记录被判失败。
+  while read -r src name mode; do
+    if [[ -n "$src" ]]; then printf '%s %s %s\n' "$src" "$dest/$name" "$mode"; fi
+  done < <(pdg_platform_modules "$plat") \
+    | python3 -I "$py" record --repo "$repo" --pid "$$" "${dir[@]}"
+}
+
 pdg_install_runtime_modules(){
   local repo="$1" dest="${2:-$PDG_RUNTIME_DIR}" plat="${3:-${PDG_PLATFORM:-}}" src name mode
   pdg_validate_modules "$plat" "$repo" || return 1
   install -d -m755 "$dest" || return 1
+  _pdg_modules_record "$repo" "$dest" "$plat" \
+    || echo "⚠️ 没记下这次要装哪些运行模块(之后回滚不会撤掉这次新增的模块)" >&2
   while read -r src name mode; do
     [[ -n "$src" ]] || continue
     [[ -f "$repo/$src" ]] || { echo "运行模块缺失: $src" >&2; return 1; }

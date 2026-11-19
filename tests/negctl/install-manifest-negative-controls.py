@@ -22,7 +22,7 @@ import tmpguard  # noqa: E402
 
 BAK = tmpguard.mkdtemp(prefix="negctl-installset.")
 TOUCHED = ["deploy/bot/installset.py", "deploy/bot/checks.py", "deploy/bot/pdg.sh",
-           "lib/installset.sh", "lib/modules.sh", "install.sh"]
+           "lib/installset.sh", "lib/modules.sh", "install.sh", "uninstall.sh"]
 SHA = {}
 for f in TOUCHED:
     shutil.copyfile(os.path.join(ROOT, f), os.path.join(BAK, f.replace("/", "__")))
@@ -217,6 +217,71 @@ nc(22, "写清单不再是迁移链的最后一步", P,
 nc(23, "写清单不再看迁移链的 rc(probe81 那支的 10b)", P,
    "  (( rc == 0 )) && { migrate_install_manifest || true; }\n", "  migrate_install_manifest || true\n",
    "10b-失败格 执行有效", gates=(PROBE,))
+
+# ── 第 2 步: 事前记录与撤除 ──
+TX = "tests/test-install-txn.py"
+U = "uninstall.sh"
+nc(24, "装模块前不再落事前记录", M,
+   '  _pdg_modules_record "$repo" "$dest" "$plat" \\\n    || echo "⚠️ 没记下这次要装哪些运行模块(之后回滚不会撤掉这次新增的模块)" >&2\n', "",
+   "事前记录排在建目录之后、写第一个文件之前", gates=(TX,))
+nc(25, "事前记录不再分辨写之前在不在", I,
+   "            before = _sha256(dest) if stat.S_ISREG(st.st_mode) else _BEFORE_NONREG\n",
+   "            before = None\n", "装之前就在的文件", gates=(TX,))
+nc(26, "测试目录也照记(不看 PDG_RUNTIME_DIR)", M,
+   '  [[ "$dest" == "${PDG_RUNTIME_DIR:-/opt/pdg-bot}" ]] || return 0\n', "",
+   "装到 PDG_RUNTIME_DIR 以外的目录", gates=(TX,))
+nc(27, "撤除不再核内容", I,
+   "    if h not in hashes:\n", "    if False and h not in hashes:\n", "内容被改过", gates=(TX,))
+nc(28, "撤除不再核硬链接", I,
+   "    if st.st_nlink != 1:\n", "    if False and st.st_nlink != 1:\n", "有别的硬链接", gates=(TX,))
+nc(29, "在用判断不再顺着 import 走", I,
+   "        stack.extend(sorted(r for r in refs if r not in seen))\n", "        pass\n",
+   "两个都留着", gates=(TX,))
+nc(30, "回滚撤除不再跳过快照里有的", I,
+   '    skip |= {p for p in cand if p.lstrip("/") in mem}\n', "", "快照里有的 old.py 不动", gates=(TX,))
+nc(31, "快照里没有运行模块目录也照撤", I,
+   "    if MODULE_DIR.lstrip(\"/\") not in mem:\n        return [], []\n", "", "什么都不做", gates=(TX,))
+nc(32, "回滚撤除不管受保护成员", I,
+   '    skip = {"/" + k for k in _members(keep)}\n', "    skip = set()\n", "受保护成员", gates=(TX,))
+nc(33, "收旧账不看新清单", I,
+   "    cand = {p: h for p, h in _created(recs).items() if p not in inman}\n",
+   "    cand = dict(_created(recs))\n", "新清单里有的", gates=(TX,))
+nc(34, "没有新清单也收旧账", I,
+   "    st, mdoc = load(d)\n    if st != \"ok\":\n        return [], [], False\n    recs, _badn = _records(d)\n",
+   "    st, mdoc = load(d)\n    if st != \"ok\":\n        mdoc = {\"entries\": []}\n    recs, _badn = _records(d)\n",
+   "没有可用的新清单", gates=(TX,))
+nc(35, "收完不清空记录", I,
+   "    removed, kept = _sweep(cand, root)\n    for p, _doc in recs:\n        try:\n            os.unlink(p)\n        except OSError:\n            pass\n    return removed, kept, True\n",
+   "    removed, kept = _sweep(cand, root)\n    return removed, kept, True\n", "收完清空事前记录", gates=(TX,))
+nc(36, "回滚撤除拿保护过滤后的成员清单", P,
+   '  local -a _rbc_args=(rollback-clean --members "$tmp/members.all")\n',
+   '  local -a _rbc_args=(rollback-clean --members "$members")\n', "撤除拿的是全量成员清单", gates=(TX,))
+nc(37, "撤除留下的不记进未能恢复项", P,
+   '  (( _rbc_rc == 0 )) || unrestored+=("快照之后新增的运行模块未能全部撤除")\n', "",
+   "cmd_rollback 里各处都在", gates=(TX,))
+nc(38, "回到没有清单的版本时不删旧清单", P,
+   '  rm -f -- "${PDG_INSTALLSET_DIR:-/var/lib/privdns-gateway/install}/manifest.json" 2>/dev/null || true\n', "",
+   "回到没有清单的版本", gates=(TX,))
+nc(39, "卸载不再清记录", U,
+   '  _ISM_OUT="$(python3 -I "$_UN_HERE/deploy/bot/installset.py" uninstall-clean 2>&1)" || true\n', "  :\n",
+   "uninstall.sh 删记录", gates=(TX,))
+# NC24 第一轮无效: 改坏之后记录目录没建, 测试列目录时抛异常(崩溃不算有效红灯)。
+# 测试改成目录不在就当空的之后, 同一处改法、同一个字样重新登记为 NC40。
+nc(40, "装模块前不再落事前记录(NC24 重登记)", M,
+   '  _pdg_modules_record "$repo" "$dest" "$plat" \\\n    || echo "⚠️ 没记下这次要装哪些运行模块(之后回滚不会撤掉这次新增的模块)" >&2\n', "",
+   "事前记录排在建目录之后、写第一个文件之前", gates=(TX,))
+# NC38 是在"刷新清单写成单独函数"时登记的; 那段后来内联进 cmd_rollback(按名抽取的测试壳里没有新函数),
+# 那一行成了 else 分支里唯一的一句, 照原样删掉会让 bash 语法错。同一个字样换成 ":" 重新登记为 NC41。
+nc(41, "回到没有清单的版本时不删旧清单(NC38 重登记)", P,
+   '    rm -f -- "${PDG_INSTALLSET_DIR:-/var/lib/privdns-gateway/install}/manifest.json" 2>/dev/null || true\n', "    :\n",
+   "回到没有清单的版本", gates=(TX,))
+# NC01 / NC02 的锚点是在 parse_lines 与 record 各写一遍校验时登记的; 两边合成 _check_line 之后
+# 锚点对不上(缩进变了), 同一处改法、同一个字样重新登记。现在一处改坏, 写清单与事前记录两边同时失守。
+nc(42, "写入不再拒绝重复目标(NC01 重登记)", I,
+   "    if dest in seen:\n", "    if False and dest in seen:\n", "目标重复: 竟然写进去了", gates=(T, TX))
+nc(43, "写入放过目标里的 ..(NC02 重登记)", I,
+   'if not dest.startswith("/") or ".." in dest.split("/") or "//" in dest',
+   'if not dest.startswith("/") or "//" in dest', "目标带 ..: 竟然写进去了", gates=(T, TX))
 
 print("\n" + "─" * 40)
 for num, title, valid, d in RESULTS:

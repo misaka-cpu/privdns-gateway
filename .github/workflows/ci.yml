@@ -761,6 +761,12 @@ jobs:
         if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-install-manifest.py
 
+      # 第 2 步: 装模块前的事前记录、回滚撤除快照之后才出现的模块、成功后收旧账、卸载清理、回滚后刷新清单。
+      # 每一条"不许删"(内容改过 / 硬链接 / 符号链接 / 还有服务在用 / 受保护 / 快照里有)都真造一遍, 只在临时根里删。
+      - name: "安装清单: 事前记录与撤除 (写之前先记/回滚只撤快照之后新放且没人动过没人在用的/成功后收旧账/卸载清理/回滚后清单跟版本)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
+        run: python3 tests/test-install-txn.py
+
       # 真钉死版 mihomo 做配置校验(tests/.bin/mihomo 上面已装); 取件 / 上游 API / 体检 / 通知在测试侧打桩。
       - name: "内核跟随上游编排 (取件核对/体检变差换回/pdg update 不降级被认的上游核/revert/自动的等待期与不重试)"
         if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
