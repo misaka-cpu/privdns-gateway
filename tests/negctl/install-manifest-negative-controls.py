@@ -305,6 +305,23 @@ nc(49, "派发行失败时丢掉原退出码", P,
 nc(50, "派发行失败时不再撤除", P,
    '|| { _mrc=$?; [[ -f /opt/pdg-bot/installset.py ]] && python3 -I /opt/pdg-bot/installset.py undo-txn --ancestor-of "$$"; exit "$_mrc"; };;\n',
    '|| { _mrc=$?; exit "$_mrc"; };;\n', "派发行", gates=(TX,))
+# ── R3 缺陷修复(第 351 条): R3 判"在用"只顺着这次新放的模块走; R2 照旧顺着全部 ──
+nc(51, "R3 判在用又顺着盘上全部(新版)文件走", I,
+   "    removed, kept = _sweep(_created(mine), root, only_new=True)\n",
+   "    removed, kept = _sweep(_created(mine), root)\n", "真实布局: R3 撤掉这次新放的", gates=(TX,))
+nc(52, "R2 也只顺着候选走", I,
+   "def _sweep(cand, root, skip=(), only_new=False):\n", "def _sweep(cand, root, skip=(), only_new=True):\n",
+   "R2 不收窄在用的范围", gates=(TX,))
+# NC51 第一轮无效: 登记字样取了那一格的 OK 文案, 它的 FAIL 文案是「真实布局: 撤掉的是 …」(测试确实红在那一格)。
+# 同一改法、改用 FAIL 文案的字样重新登记为 NC53。
+nc(53, "R3 判在用又顺着盘上全部(新版)文件走(NC51 重登记)", I,
+   "    removed, kept = _sweep(_created(mine), root, only_new=True)\n",
+   "    removed, kept = _sweep(_created(mine), root)\n", "真实布局: 撤掉的是", gates=(TX,))
+# NC48 的锚点是修 R3 之前登记的; 修复给那一行加了 only_new=True, 锚点对不上。同一改法(连被覆盖的一起撤)换新锚点重登记为 NC54。
+nc(54, "undo-txn 连被覆盖的文件一起撤(NC48 重登记)", I,
+   "    removed, kept = _sweep(_created(mine), root, only_new=True)\n    return removed, kept, len(mine)\n",
+   '    removed, kept = _sweep({e["path"]: {e["written"]} for _q, dd in mine for e in dd["entries"]}, root, only_new=True)\n    return removed, kept, len(mine)\n',
+   "写之前就在的(被覆盖的)不动", gates=(TX,))
 
 print("\n" + "─" * 40)
 for num, title, valid, d in RESULTS:

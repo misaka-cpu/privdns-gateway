@@ -196,6 +196,18 @@ check(kd.get("/opt/pdg-bot/svc.py") == "还有服务在用" and kd.get("/opt/pdg
 check("rescue.py" in present and "/opt/pdg-bot/rescue.py" not in kd, "受保护成员(救援完整恢复)不碰, 也不报")
 check("dotwitness.py" in present and "/opt/pdg-bot/dotwitness.py" not in kd, "DoT 证据服务的模块交给它自己那套, 不碰也不重复报")
 members = scene()
+# R2 照旧顺着**所有**模块找(回滚落盘之后盘上就是要留下的那一版): 快照里有的 keeper.py 被 unit 用着、它 import 新放的 newlib.py
+with open(os.path.join(MD, "keeper.py"), "w") as f:
+    f.write("import newlib\n")
+open(os.path.join(UD, "pdg-keeper.service"), "w").write("ExecStart=/usr/bin/python3 /opt/pdg-bot/keeper.py\n")
+nl_path, nl_sha = put("newlib.py", b"# newlib\n")
+rec_extra = os.path.join(D2, "txn", "20261119T000001Z-2.json")
+json.dump({"schema": 1, "kind": "install-txn", "pid": "2", "entries": [{"path": nl_path, "before": None, "written": nl_sha, "mode": "755"}]},
+          open(rec_extra, "w"))
+removed, kept = installset.rollback_clean(members + ["opt/pdg-bot/keeper.py"], ["opt/pdg-bot/rescue.py"], D2, R)
+check(dict(kept).get("/opt/pdg-bot/newlib.py") == "还有服务在用" and "newlib.py" in os.listdir(MD),
+      "R2: 快照里本来就有、unit 在用的模块 import 了新放的模块 → 新放的那个留着(R2 不收窄在用的范围)")
+members = scene()
 removed, kept = installset.rollback_clean(["etc/", "etc/nftables.conf"], [], D2, R)
 check(not removed and not kept and "new.py" in os.listdir(MD), "快照里根本没有运行模块目录: 什么都不做(判不出当时有没有)")
 members = scene()
@@ -379,6 +391,50 @@ p = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeo
 check(p.returncode == 0 and "撤除这次升级新放的运行模块: /opt/pdg-bot/zz-r3-probe.py" in p.stdout
       and not os.path.exists(os.path.join(RR, "root", "opt", "pdg-bot", "zz-r3-probe.py")),
       "真进程: 父 shell 写的记录, 子进程里的 undo-txn 认得出来并撤掉", "真进程不对: rc=%d out=%r err=%r" % (p.returncode, p.stdout, p.stderr[-200:]))
+# 真实布局(11-19 推演出的缺陷): R3 那一刻 /opt/pdg-bot 里是**新版**文件, 新版 checks.py import kernelfollow / installset,
+# 而 checks.py 被 bot 与健康自检用着。顺着新版文件的 import 找"在用", 这两个就永远撤不掉 —— v1.11.15 直跳的 A2 照旧差两行。
+R7 = os.path.join(TMP, "r7", "root")
+MD7 = os.path.join(R7, "opt", "pdg-bot")
+UD7 = os.path.join(R7, "etc", "systemd", "system")
+D7 = os.path.join(TMP, "r7", "install")
+os.makedirs(MD7)
+os.makedirs(UD7)
+os.makedirs(os.path.join(D7, "txn"))
+out7 = subprocess.run(["bash", "-c", "source lib/modules.sh && pdg_platform_modules ios"], cwd=ROOT,
+                      capture_output=True, text=True).stdout
+ents7 = []
+for ln in out7.splitlines():
+    src, name, _m = ln.split()
+    data = open(os.path.join(ROOT, src), "rb").read()
+    open(os.path.join(MD7, name), "wb").write(data)
+    new = name in ("kernelfollow.py", "installset.py")
+    ents7.append({"path": "/opt/pdg-bot/" + name, "before": None if new else sha_b(b"old " + data),
+                  "written": sha_b(data), "mode": "755"})
+for u in ("pdg-bot.service", "pdg-health.service", "pdg-probe81.service", "pdg-dotwitness.service", "pdg-rules-update.service"):
+    shutil.copyfile(os.path.join(ROOT, "deploy", "bot", u), os.path.join(UD7, u))
+for name, data in (("svcnew.py", b"import helpnew\n"), ("helpnew.py", b"# helper\n")):
+    open(os.path.join(MD7, name), "wb").write(data)
+    ents7.append({"path": "/opt/pdg-bot/" + name, "before": None, "written": sha_b(data), "mode": "755"})
+open(os.path.join(UD7, "pdg-svcnew.service"), "w").write("ExecStart=/usr/bin/python3 /opt/pdg-bot/svcnew.py\n")
+open(os.path.join(FP, "sys", "kernel", "random", "boot_id"), "w").write("boot-aaa\n")
+rec_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(NOW - 60))
+with open(os.path.join(D7, "txn", "r7.json"), "w") as f:
+    json.dump({"schema": 1, "kind": "install-txn", "pid": "100", "boot_id": "boot-aaa", "at": rec_at, "entries": ents7}, f)
+full = installset._in_use(R7)
+check({"kernelfollow.py", "installset.py"} <= full,
+      "对照: 不加限制地顺着盘上新版文件找, kernelfollow.py 与 installset.py 都会被判在用(缺陷能在这个布局里复现)")
+removed, kept, n = installset.undo_txn("300", D7, R7, 3600, FP, NOW)
+present7 = set(os.listdir(MD7))
+check(n == 1 and set(removed) == {"/opt/pdg-bot/kernelfollow.py", "/opt/pdg-bot/installset.py"}
+      and "kernelfollow.py" not in present7 and "installset.py" not in present7,
+      "真实布局: R3 撤掉这次新放的 kernelfollow.py 与 installset.py(新版 checks.py 里的 import 不算在用)",
+      "真实布局: 撤掉的是 %s, 留下 %s" % (removed, kept))
+kd7 = dict(kept)
+check(kd7.get("/opt/pdg-bot/svcnew.py") == "还有服务在用" and kd7.get("/opt/pdg-bot/helpnew.py") == "还有服务在用",
+      "真实布局: 新 unit 直接用的新模块、以及它 import 的另一个新模块, 都留着")
+check(all(os.path.exists(os.path.join(MD7, os.path.basename(e["path"]))) for e in ents7 if e["before"] is not None),
+      "真实布局: 写之前就在的 %d 个一个都没动" % sum(1 for e in ents7 if e["before"] is not None))
+
 LINE = ('  __migrate)     need_root __migrate; _lock; run_all_migrations && _dw_settle --after-migrate || '
         '{ _mrc=$?; [[ -f /opt/pdg-bot/installset.py ]] && python3 -I /opt/pdg-bot/installset.py undo-txn --ancestor-of "$$"; exit "$_mrc"; };;')
 check(pdg.splitlines().count(LINE) == 1, "派发行: 链失败时先 undo-txn 再原样带出退出码(第 342 条裁定的那一行原样)")

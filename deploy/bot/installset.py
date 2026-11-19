@@ -447,8 +447,11 @@ _REF = re.compile(r"/opt/pdg-bot/([A-Za-z0-9_.-]+)")
 _DYN = re.compile(r"""(?:_mod|__import__|import_module)\(\s*["']([A-Za-z0-9_]+)["']""")
 
 
-def _in_use(root):
-    """有服务在用的运行模块(文件名): unit 里写着路径的, 加上它们逐层 import / 引用到的。"""
+def _in_use(root, expand=None):
+    """有服务在用的运行模块(文件名): unit 里写着路径的, 加上它们逐层 import / 引用到的。
+    expand: 只顺着这些模块往下找(None = 全都找)。R3 用它: 那一刻盘上是新版文件, 写之前就在的那些
+    马上要被调用方的回滚还原成旧版, 新版里的 import 不代表回滚之后还有人用。只有这次新放的模块
+    之间的引用才会在回滚之后留下来。"""
     names = set()
     udir = _fs(root, UNIT_DIR)
     try:
@@ -469,6 +472,8 @@ def _in_use(root):
         if n in seen:
             continue
         seen.add(n)
+        if expand is not None and n not in expand:
+            continue
         try:
             text = open(os.path.join(mdir, n), encoding="utf-8", errors="replace").read()
         except OSError:
@@ -524,10 +529,11 @@ def _removable(root, logical, hashes, in_use):
     return True, ""
 
 
-def _sweep(cand, root, skip=()):
-    """按候选撤除。cand: 路径 → 可接受的哈希。返回 (撤掉的, [(留着的, 原因)])。"""
+def _sweep(cand, root, skip=(), only_new=False):
+    """按候选撤除。cand: 路径 → 可接受的哈希。返回 (撤掉的, [(留着的, 原因)])。
+    only_new: 判"在用"时只顺着候选本身往下找(见 _in_use 的 expand; R3 用)。"""
     removed, kept = [], []
-    in_use = _in_use(root)
+    in_use = _in_use(root, {os.path.basename(p) for p in cand} if only_new else None)
     for p in sorted(cand):
         if p in skip or p in ELSEWHERE or os.path.dirname(p) != MODULE_DIR:
             continue                            # 别的机制处理的不重复报
@@ -660,7 +666,7 @@ def undo_txn(pid, d=None, root="/", max_age=3600, proc="/proc", now=None):
         if not (now - max_age <= at <= now + 300):
             continue
         mine.append((p, doc))
-    removed, kept = _sweep(_created(mine), root)
+    removed, kept = _sweep(_created(mine), root, only_new=True)
     return removed, kept, len(mine)
 
 
