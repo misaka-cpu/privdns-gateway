@@ -123,6 +123,7 @@ Telegram 出口（Bot 内置 SOCKS5，端口 8445）用于给手机上的 Telegr
 sudo pdg            # 进管理菜单
 sudo pdg status     # 状态
 sudo pdg doctor     # 自检（只读）；--json 可脚本化；--deep 加端到端检查
+sudo pdg manifest verify  # 核对装着的程序文件与安装清单（只读）；--json 可脚本化
 sudo pdg update     # 更新（更新前自动快照，失败自动回滚；--dry-run 查看待更新）
 sudo pdg snapshot   # 手动留一份配置快照
 sudo pdg rollback   # 回滚到最近快照
