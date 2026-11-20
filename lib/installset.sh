@@ -54,10 +54,14 @@ ios-qr.png
 pdg-report-*.txt
 __pycache__"
 
-# 运行模块那部分现取 lib/modules.sh(没 source 过就从本文件旁边找), 不在这里抄第二份。
+# 运行模块那部分现取 lib/modules.sh(本文件旁边那份), 不在这里抄第二份。
+# **每次都重新 source**, 不看调用方 shell 里是不是已经有 pdg_platform_modules —— 那可能是别的版本的:
+# `pdg update` 失败时, 本版回滚与更新跑在同一个 shell 里, 更新早已 source 过新版的 modules.sh;
+# 仓库复位之后还拿那份清单写, 新版多出来的模块在复位后的仓库里没有源文件, 整份清单写不成
+# (回滚后清单停在失败的那一版, doctor 报 🟡); 新版少了的, 则会静默写出一份缺一项的清单。
+# modules.sh 只定义变量与函数(PDG_RUNTIME_DIR 保留调用方的值), 重复 source 没有副作用。
 # 必须在**调用方自己的 shell** 里 source —— 放进 $(…) 里做, 函数定义只活在那个子 shell。
 _pdg_installset_need_modules(){
-  declare -F pdg_platform_modules >/dev/null && declare -F pdg_legacy_modules >/dev/null && return 0
   # shellcheck source=lib/modules.sh
   source "${BASH_SOURCE[0]%/*}/modules.sh" 2>/dev/null
 }

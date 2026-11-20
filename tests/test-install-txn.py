@@ -309,6 +309,35 @@ for label, repo, want in (("回到有清单的版本", ROOT, True), ("回到没�
     check(fn and p.stdout.strip() == "RC=0" and exists == want and (by == "rollback" if want else True),
           "回滚刷新清单 %s: %s" % (label, "按复位后的仓库重写(写入者 rollback)" if want else "删掉旧清单"),
           "回滚刷新清单 %s 不对: out=%r exists=%s" % (label, p.stdout, exists))
+# 调用方 shell 里已经有**别版**的运行模块清单时也得按复位后的仓库写: `pdg update` 失败、本版回滚就是这样 ——
+# 更新早先在同一个 shell 里 source 过新版的 modules.sh, 回滚随后把仓库复位。别版多一项: 那个模块在复位后的
+# 仓库里没有源文件, 整份写不成; 别版少一项: 会静默写出一份缺一项的清单。两种都造一遍。
+MODS = read("lib/modules.sh")
+IS_LINE = "deploy/bot/installset.py installset.py 755"
+WANT_PATHS = sorted(ln.split()[1] for ln in subprocess.run(
+    ["bash", "-c", "source lib/installset.sh && pdg_installset ios"], cwd=ROOT, capture_output=True, text=True,
+    timeout=60).stdout.splitlines() if ln.strip())
+check(len(WANT_PATHS) == 47 and "/opt/pdg-bot/installset.py" in WANT_PATHS, "复位后的仓库这一版 iOS 全集 %d 项" % len(WANT_PATHS))
+for tag, label, stale in (("plus", "别版多一项", MODS.replace(IS_LINE, IS_LINE + "\ndeploy/bot/zz-stale-extra.py zz-stale-extra.py 755", 1)),
+                          ("minus", "别版少一项", MODS.replace("\n" + IS_LINE, "", 1))):
+    SD = os.path.join(TMP, "r5-stale-" + tag)
+    os.makedirs(os.path.join(SD, "lib"))
+    io.open(os.path.join(SD, "lib", "modules.sh"), "w", encoding="utf-8").write(stale)
+    # 先核"别版"真的不同(空测条件): 只 source 那份时 iOS 模块数应是 37 / 35, 不是本版的 36。
+    q = subprocess.run(["bash", "-c", 'source "$1/lib/modules.sh" && pdg_platform_modules ios | grep -c .', "x", SD],
+                       capture_output=True, text=True, timeout=60)
+    n_stale = int(q.stdout.strip() or 0)
+    check(stale != MODS and n_stale == (37 if tag == "plus" else 35), "%s: 别版那份 iOS 模块 %d 个" % (label, n_stale))
+    V3 = os.path.join(SD, "install")
+    p = subprocess.run(["bash", "-c", harness + '\nsource "$2/lib/modules.sh" || exit 7\nREPO_DIR="$1" _rb_manifest; echo "RC=$?"',
+                        "x", ROOT, SD], cwd=TMP, capture_output=True, text=True, timeout=120, env=dict(os.environ, PDG_INSTALLSET_DIR=V3))
+    mf = os.path.join(V3, "manifest.json")
+    doc = json.load(open(mf)) if os.path.exists(mf) else {}
+    got = sorted(e.get("path") for e in doc.get("entries", []))
+    check(fn and p.stdout.strip() == "RC=0" and doc.get("by") == "rollback" and got == WANT_PATHS,
+          "回滚刷新清单时调用方 shell 里已有别版的运行模块清单(%s): 照样按复位后的仓库写出 %d 项" % (label, len(got)),
+          "回滚刷新清单沿用了调用方 shell 里别版的运行模块清单(%s): out=%r 条目=%d 只在清单=%s 只在全集=%s" % (
+              label, p.stdout.strip()[-200:], len(got), sorted(set(got) - set(WANT_PATHS)), sorted(set(WANT_PATHS) - set(got))))
 m = re.search(r"^migrate_install_manifest\(\)\{\n.*?^\}\n", pdg, re.S | re.M)
 mig = m.group(0) if m else ""
 check(mig.find("pdg_installset_write") < mig.find("pdg_installset_reconcile") and "pdg_installset_reconcile" in mig,

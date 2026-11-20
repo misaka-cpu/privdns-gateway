@@ -322,6 +322,12 @@ nc(54, "undo-txn 连被覆盖的文件一起撤(NC48 重登记)", I,
    "    removed, kept = _sweep(_created(mine), root, only_new=True)\n    return removed, kept, len(mine)\n",
    '    removed, kept = _sweep({e["path"]: {e["written"]} for _q, dd in mine for e in dd["entries"]}, root, only_new=True)\n    return removed, kept, len(mine)\n',
    "写之前就在的(被覆盖的)不动", gates=(TX,))
+# ── 回滚刷新清单沿用别版运行模块清单(2026-11-20 隔离预验暴露): installset.sh 每次都重新 source modules.sh ──
+nc(55, "installset.sh 见 pdg_platform_modules 已定义就不重新 source", L,
+   '_pdg_installset_need_modules(){\n  # shellcheck source=lib/modules.sh\n  source "${BASH_SOURCE[0]%/*}/modules.sh" 2>/dev/null\n}\n',
+   '_pdg_installset_need_modules(){\n  declare -F pdg_platform_modules >/dev/null && declare -F pdg_legacy_modules >/dev/null && return 0\n'
+   '  # shellcheck source=lib/modules.sh\n  source "${BASH_SOURCE[0]%/*}/modules.sh" 2>/dev/null\n}\n',
+   "回滚刷新清单沿用了调用方 shell 里别版的运行模块清单", gates=(TX,))
 
 print("\n" + "─" * 40)
 for num, title, valid, d in RESULTS:
