@@ -178,7 +178,8 @@ def uninstall(tmp, name, mode, nounit=False):
     if left:
         bad("%s: 改写后仍有宿主绝对路径 %s —— 拒绝运行" % (name, left))
         return None
-    script = "%s\n%s\necho \"RESOLV_WARN=[$RESOLV_WARN]\"\n" % (setline.group(0), body)
+    # _DNS_NOTE 用 ${…-} 取: 负控(反向补丁)跑的是没有这个变量的旧段, set -u 下直接展开会让整段报错
+    script = "%s\n%s\necho \"RESOLV_WARN=[$RESOLV_WARN] DNS_NOTE=[${_DNS_NOTE-未定义}]\"\n" % (setline.group(0), body)
     before = len((read(tmp + "/calls") or "").splitlines())
     return state(tmp, run_sh(tmp, script, mode, nounit), before)
 
@@ -355,5 +356,111 @@ inst, un = roundtrip(n, pre_reinstall)
 if inst:
     (ok if inst["marker"] is None else bad)("%s: 备份不是这次做的 → 不写记录(实际 %r)" % (n, inst["marker"]))
 check_back_on(n, un)
+
+print()
+print("── 5. 同一台机器卸第二次: 没有备份时只认装机写的那两行, 别的一概不碰 ──")
+# .200 实测(2026-11-20): 非 purge 卸载之后再 purge, 第二次卸载没有备份可用, 走了"没有备份"那一支,
+# 把已经还原好的 resolv.conf 改指 stub, 还重启了一次 resolved。那一支本来是给 v1.0.0 装的机器的
+# (那一版装机不备份, resolv.conf 留着装机写的两行) —— 两种现场要分开。
+OURS = "nameserver 127.0.0.1\nnameserver 1.1.1.1\n"   # 各版本装机最后写进去的那份(第 8 步)
+
+
+def note(st):
+    m = re.search(r"DNS_NOTE=\[([^\]]*)\]", st["out"])
+    return m.group(1) if m else None
+
+
+def check_untouched(name, st, link=None, content=None, want_note="nothing", running=None):
+    """resolv.conf 一个字节不变, resolved 没被启用 / 启动 / 重启, 说明标记是该有的那种。"""
+    if st is None:
+        return
+    acts = resolved_actions(st["calls"])
+    (ok if not acts else bad)("%s: 没有启用 / 启动 / 重启 resolved%s" % (name, "" if not acts else "(实际 %r)" % acts))
+    if link is not None:
+        good = st["link"] == link
+        (ok if good else bad)("%s: /etc/resolv.conf 仍指向 %s%s" % (
+            name, link[len(st["tmp"]):], "" if good else "(实际 链接 %r 内容 %r)" % (st["link"], st["content"])))
+    else:
+        good = st["link"] is None and st["content"] == content
+        (ok if good else bad)("%s: /etc/resolv.conf 内容原样%s" % (
+            name, "" if good else "(实际 链接 %r 内容 %r)" % (st["link"], st["content"])))
+    (ok if "RESOLV_WARN=[]" in st["out"] else bad)("%s: 没有报还原失败" % name)
+    (ok if note(st) == want_note else bad)("%s: 说明标记 [%s](实际 [%s])" % (name, want_note, note(st)))
+    if running is not None:
+        (ok if st["running"] == running and st["enabled"] == running else bad)(
+            "%s: resolved 仍是%s" % (name, "启用、在跑" if running else "停用、没在跑"))
+
+
+def pre_uplink(tmp):         # .200 的镜像默认: resolved 在跑, resolv.conf 指向它的 uplink 文件
+    open(tmp + "/run/systemd/resolve/resolv.conf", "w").write("nameserver 8.8.8.8\n")
+    os.symlink(tmp + "/run/systemd/resolve/resolv.conf", tmp + "/etc/resolv.conf")
+    for f in ("running", "enabled", "global"):
+        open(tmp + "/" + f, "w").close()
+
+
+for n, pre, tail, running in (("卸第二次/装机前指 uplink(.200 那条路)", pre_uplink, "/run/systemd/resolve/resolv.conf", True),
+                              ("卸第二次/装机前指 stub", pre_running, "/run/systemd/resolve/stub-resolv.conf", True),
+                              ("卸第二次/装机前是静态文件", pre_static, None, False)):
+    inst, un = roundtrip(n, pre)
+    if un is None:
+        continue
+    t = un["tmp"]
+    first = (un["link"] == t + tail) if tail else (un["link"] is None and un["content"] == "nameserver 9.9.9.9\n")
+    (ok if first and note(un) == "" else bad)("%s: 第一次卸载按备份还原、没有说明标记%s" % (
+        n, "" if first and note(un) == "" else "(实际 链接 %r 内容 %r 标记 %r)" % (un["link"], un["content"], note(un))))
+    check_untouched(n + " 第二次", uninstall(t, n, "fast"), link=(t + tail) if tail else None,
+                    content=None if tail else "nameserver 9.9.9.9\n", running=running)
+
+n = "v1.0.0 装的机器(没备份、没记录、resolv.conf 是装机写的两行)"
+tmp = mkroot("pdg-v100.")
+open(tmp + "/etc/resolv.conf", "w").write(OURS)
+st = uninstall(tmp, n, "fast")
+check_back_on(n, st)                                   # 照旧: 启用 resolved、改指 stub、全局 DNS 不含 127.0.0.1
+if st is not None:
+    (ok if note(st) == "" else bad)("%s: 没有说明标记(实际 [%s])" % (n, note(st)))
+
+n = "没备份、resolv.conf 是用户自己的静态文件"
+tmp = mkroot("pdg-userconf.")
+open(tmp + "/etc/resolv.conf", "w").write("nameserver 9.9.9.9\n")
+check_untouched(n, uninstall(tmp, n, "fast"), content="nameserver 9.9.9.9\n", running=False)
+
+n = "没备份、有 127.0.0.1 但不是那两行原样"
+tmp = mkroot("pdg-local127.")
+open(tmp + "/etc/resolv.conf", "w").write(OURS + "search .\n")
+check_untouched(n, uninstall(tmp, n, "fast"), content=OURS + "search .\n", want_note="nothing local127", running=False)
+
+n = "v1.0.0 现场、机器上没有 resolved"
+tmp = mkroot("pdg-v100-nounit.")
+open(tmp + "/etc/resolv.conf", "w").write(OURS)
+st = uninstall(tmp, n, "fast", nounit=True)
+if st is not None:
+    acts = resolved_actions(st["calls"])
+    (ok if not acts else bad)("%s: 没有启用 / 启动 / 重启 resolved%s" % (n, "" if not acts else "(实际 %r)" % acts))
+    (ok if st["link"] is None and st["content"] == OURS else bad)("%s: 没替用户改 resolv.conf(实际 链接 %r 内容 %r)" % (
+        n, st["link"], st["content"]))
+    (ok if "RESOLV_WARN=[nostub]" in st["out"] else bad)("%s: 报 nostub, 让下面打手工恢复的提示%s" % (
+        n, "" if "RESOLV_WARN=[nostub]" in st["out"] else "(%r)" % st["out"][-200:]))
+
+n = "没备份、有装机记录 disabled、resolv.conf 不是装机写的"
+tmp = mkroot("pdg-markonly.")
+pre_uplink(tmp)
+for f in ("running", "enabled"):
+    os.remove(tmp + "/" + f)                           # 记录说装机停过它: 现在停着
+open(tmp + "/etc/resolv.conf.pdg-resolved", "w").write("disabled\n")
+st = uninstall(tmp, n, "fast")
+if st is not None:
+    (ok if st["running"] and st["enabled"] else bad)("%s: 按记录把 resolved 启用回来" % n)
+    want = tmp + "/run/systemd/resolve/resolv.conf"
+    (ok if st["link"] == want else bad)("%s: resolv.conf 不动(实际 链接 %r)" % (n, st["link"]))
+    (ok if note(st) == "" else bad)("%s: 有记录可还原, 不打'没有改动'那行(实际 [%s])" % (n, note(st)))
+    check_marker_gone(n, st)
+
+# 说明行在抽取段之外打(段内只设标记): 核它们各恰一处、挂在对应的标记上
+tailsrc = src[src.index(END):]
+for mark, text in (("nothing", "DNS: 没有本项目留下的改动"), ("local127", "里有 nameserver 127.0.0.1, 卸载后那里已没人监听"),
+                   ("nostub", "这台机器上没有 systemd-resolved 可以换回")):
+    hit = [l for l in tailsrc.splitlines() if text in l]
+    near = tailsrc[max(0, tailsrc.find(text) - 160):tailsrc.find(text)] if hit else ""
+    (ok if len(hit) == 1 and mark in near else bad)("卸载输出里「%s」恰一处、挂在 %s 上(实际 %d 处)" % (text, mark, len(hit)))
 
 finish()

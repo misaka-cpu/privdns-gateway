@@ -169,6 +169,27 @@ grep -q '^systemd-resolved' <<<"$_unit_files" && _HAS_RESOLVED=1
 # untouched = 装机前就没在跑, 不去启用它。没有记录(旧版本装的机器)就照旧: 有这个服务就启用。
 _RESOLVED_RESTORE="$_HAS_RESOLVED"
 [[ "$(head -c 32 /etc/resolv.conf.pdg-resolved 2>/dev/null)" == untouched ]] && _RESOLVED_RESTORE=0
+# 没有装机备份时, 只认"仍是本项目写的那份"才替它换回: 各版本装机最后写的都是同一个普通文件, 恰为
+# 下面这两行(install.sh 第 8 步之后)。不是这份的 —— 第一次卸载已经还原过的(备份那时就用掉了), 或者
+# 用户自己的 —— 一个字节都不碰; 那时也没有可还原的 resolved 状态(没有记录), resolved 一并不动。
+# 以前这里只看"有没有备份", 同一台机器卸第二次就会把还原好的 resolv.conf 改指 stub、再重启一次
+# resolved(.200 实测, 2026-11-20)。没有备份的另一种来源是 v1.0.0 —— 那一版装机不做备份, 它装的
+# 机器上 resolv.conf 正是这两行, 照旧换回。
+_RESOLV_OURS=0
+_DNS_NOTE=""
+if [[ ! -e /etc/resolv.conf.pdg-orig && ! -L /etc/resolv.conf.pdg-orig ]]; then
+  if [[ -f /etc/resolv.conf && ! -L /etc/resolv.conf ]] \
+     && [[ "$(cat /etc/resolv.conf 2>/dev/null; echo .)" == $'nameserver 127.0.0.1\nnameserver 1.1.1.1\n.' ]]; then
+    _RESOLV_OURS=1
+  else
+    if [[ ! -e /etc/resolv.conf.pdg-resolved ]]; then
+      _RESOLVED_RESTORE=0                 # 必须在下面 enable --now 之前定下来
+      _DNS_NOTE="nothing"
+    fi
+    # 不是那两行原样、却指着 127.0.0.1: 卸载后那里没人监听。形状不是本项目写的, 不替用户改, 只说一声。
+    grep -qx 'nameserver 127\.0\.0\.1' /etc/resolv.conf 2>/dev/null && _DNS_NOTE="${_DNS_NOTE:+$_DNS_NOTE }local127"
+  fi
+fi
 [[ "$_RESOLVED_RESTORE" == 1 ]] && { systemctl enable --now systemd-resolved 2>/dev/null || true; }
 RESOLV_WARN=""
 if [[ -e /etc/resolv.conf.pdg-orig ]]; then
@@ -183,9 +204,13 @@ if [[ -e /etc/resolv.conf.pdg-orig ]]; then
   else
     RESOLV_WARN="1"                       # 备份**不删**: 留着让用户能自己恢复
   fi
-elif [[ -e /run/systemd/resolve/stub-resolv.conf ]]; then
-  ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf 2>/dev/null \
-    || RESOLV_WARN="1"
+elif [[ "$_RESOLV_OURS" == 1 ]]; then
+  if [[ -e /run/systemd/resolve/stub-resolv.conf ]]; then
+    ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf 2>/dev/null \
+      || RESOLV_WARN="1"
+  else
+    RESOLV_WARN="nostub"                  # 机器上没有 resolved 可换回: 不替用户写公共 DNS, 下面给手工恢复的提示
+  fi
 fi
 # 上面先启动 resolved 是有意的: 装机备份通常是指向 /run/systemd/resolve/ 的符号链接, 重启过的
 # 机器上它得等 resolved 起来才有目标, 先还原会把备份判成不存在。代价是 resolved 启动那一刻读到的
@@ -196,8 +221,13 @@ fi
 [[ -e /etc/resolv.conf.pdg-orig || -L /etc/resolv.conf.pdg-orig ]] || rm -f /etc/resolv.conf.pdg-resolved
 
 if [[ -n "$RESOLV_WARN" ]]; then
-  echo "⚠️  /etc/resolv.conf 未能还原(可能是 Docker/LXC 的 bind mount, 删不掉也写不进)。"
-  echo "    现在它可能仍指向已被卸载的本机 mosdns → 整机 DNS 会不通。请手工恢复:"
+  if [[ "$RESOLV_WARN" == nostub ]]; then
+    echo "⚠️  /etc/resolv.conf 还是装机写的那份(没有装机备份), 而这台机器上没有 systemd-resolved 可以换回, 没替你改。"
+    echo "    它指向已被卸载的本机 mosdns → 整机 DNS 会不通。请手工恢复:"
+  else
+    echo "⚠️  /etc/resolv.conf 未能还原(可能是 Docker/LXC 的 bind mount, 删不掉也写不进)。"
+    echo "    现在它可能仍指向已被卸载的本机 mosdns → 整机 DNS 会不通。请手工恢复:"
+  fi
   [[ -e /etc/resolv.conf.pdg-orig ]] \
     && echo "      cat /etc/resolv.conf.pdg-orig > /etc/resolv.conf   # 备份已保留" \
     || echo "      在 /etc/resolv.conf 里填一个可用的 nameserver(如 nameserver 1.1.1.1)"
@@ -205,6 +235,10 @@ if [[ -n "$RESOLV_WARN" ]]; then
 else
   echo "已停止并移除 systemd 单元、防火墙表(inet pdg)、并尽量还原 DNS。"
 fi
+[[ " $_DNS_NOTE " == *" nothing "* ]] \
+  && echo "DNS: 没有本项目留下的改动(没有装机备份, /etc/resolv.conf 也不是本项目写的), resolv.conf 与 systemd-resolved 都没动。"
+[[ " $_DNS_NOTE " == *" local127 "* ]] \
+  && echo "⚠️  /etc/resolv.conf 里有 nameserver 127.0.0.1, 卸载后那里已没人监听 —— 它不是本项目写的那份, 没替你改; 请确认。"
 # 救援平面没清干净就必须逐条报出来: 残留的是仍然有效的 token 与 TLS 私钥。宁可让用户看见
 # 一段刺眼的清单, 也不能让卸载在有残留的情况下只丢一句"已完成"。
 if [[ -n "$_NFT_RESIDUE" ]]; then
