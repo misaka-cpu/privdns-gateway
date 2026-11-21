@@ -2,6 +2,42 @@
 
 本项目按语义化 `v1.x` tag 正式发布;以下按版本/日期记录主要变化,完整提交见 git 历史。
 
+## 2026-11-21 — v1.13.1(同一台机器卸第二次不再改写 /etc/resolv.conf)
+
+**同一台机器卸第二次, 不再把已经还原好的 `/etc/resolv.conf` 改指 systemd-resolved 的 stub。** 卸载时没有装机备份(`/etc/resolv.conf.pdg-orig`)的话,
+以前一律把 `/etc/resolv.conf` 改指 stub, 并启用、重启一次 resolved。第一次卸载已经把备份用掉了, 于是对同一台机器再跑一次卸载
+(例如非 purge 卸载之后再 `--purge`)会把已经还原好的 resolv.conf 改成 stub 模式(常见是 uplink → stub; DNS 仍可用, 但没有任何提示);
+两次卸载之间自己停掉的 resolved 也会被重新启用。2026-11-20 在测试机上实测到, v1.13.0 的条目与 Release 里记为已知问题。本版只改 `uninstall.sh`。
+
+### 怎么升到这一版
+- 已在 v1.13.0: 普通 `pdg update`。运行模块、`/usr/local/bin` 下的文件、内核钉值(mihomo v1.19.34)与 mosdns(v5.3.4)都与 v1.13.0 相同, 不换内核;
+  新版的迁移按新提交重写安装清单(内容没变, 只换记录的版本; 源码推断), 升完 `sudo pdg manifest verify` 仍应是「结论: 一致」。
+- 更早的版本: 升到本版的路径与 v1.13.0 的条目相同(内核、桥接版、v1.11.15 的入口流程都照那里)。
+- 卸载用的是仓库里那份 `uninstall.sh`(`pdg uninstall` 也是调它), 升到本版之后再卸载就是修好的这一份。
+
+### 修复
+- 现在没有备份时, 只在 `/etc/resolv.conf` 仍是装机写的那份(普通文件, 恰为 `nameserver 127.0.0.1` / `nameserver 1.1.1.1` 两行)时才替它换回;
+  否则 resolv.conf 与 resolved 都不动, 卸载输出多一行「DNS: 没有本项目留下的改动(…), resolv.conf 与 systemd-resolved 都没动。」。
+  不是那两行原样、却写着 `nameserver 127.0.0.1` 的, 另打一行 ⚠️ 提示(卸载后那里已没人监听), 不替你改。
+- v1.0.0 装的机器(那一版装机不做备份, resolv.conf 留着装机写的那两行)照旧换回 stub。没有备份、机器上又没有 systemd-resolved 的,
+  现在会打手工恢复的提示(以前什么也不说, 留着一份指向已卸载 mosdns 的 resolv.conf)。
+- 有装机备份的卸载(一次卸载、装了再卸)一个字节没变。
+
+### 已经卸过第二次的机器
+装机前 `/etc/resolv.conf` 指向 `/run/systemd/resolve/resolv.conf`、被以前版本的第二次卸载改成 stub 的, 本版不会替你改回(那次卸载已经结束)。想改回装机前的样子:
+`sudo ln -sfn /run/systemd/resolve/resolv.conf /etc/resolv.conf`。装机前本来就是 stub 的不用改。
+
+### 已知限制与验证边界
+- 本版发布提交自己的标准 CI 与验收结果登记在包外发布记录里, 不写进本条目; 官方取件验证与正式机升级到本文定稿时未取得, 以本版的 Release 为准。
+- 隔离预验(修复提交上, 一台测试机、只 iOS)走过两条路: 全新安装后一次普通 purge 卸载(卸载输出与以前逐行相同、DNS 回到装机前);
+  全新安装后非 purge 卸载、再 `--purge`(第二次多打那一行说明, resolv.conf 与 resolved 都没动, DNS 直接与装机前相同)。
+  v1.0.0 装的机器、没有 systemd-resolved 的机器、Android 只有本机测试。
+- v1.13.0 条目里的其它已知限制不变。
+
+### 测试 / CI
+- `test-uninstall-resolved-restore.py` 新增一节: 往返后再卸一次(装机前指 uplink / stub / 静态文件三种)、v1.0.0 现场、用户自己的静态文件、有 127.0.0.1 但不是原样、
+  v1.0.0 现场但没有 resolved、有记录没备份, 外加三句说明文字各恰一处、挂在对应的标记上。
+
 ## 2026-11-20 — v1.13.0(装了哪些程序文件有一份清单; 升级失败回滚后不再多留新版的模块)
 
 **装机与每次升级都写一份安装清单。** `/var/lib/privdns-gateway/install/manifest.json` 记下这一版放到盘上的每个程序文件
