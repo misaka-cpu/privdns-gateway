@@ -11,15 +11,12 @@ extract() 是共享的按名抽函数, 把各测试自己写正则时踩过的�
 同名定义不止一处就报错, 单行函数只取那一行, 缩进的嵌套定义按同一缩进的 `}` 收尾。
 现有测试在第 0 步只换"源码从哪来", 各自的抽取写法不动; extract() 给以后的新测试用。
 """
-import atexit
 import os
 import re
-import shutil
-import tempfile
+import sys
 
 _MARK = re.compile(r"^# @pdg-part ([a-z0-9][a-z0-9_-]*)$")
 _cache = {}
-_tmpdirs = []
 
 
 def _entry(root):
@@ -53,6 +50,19 @@ def _render(root):
     return "\n".join(out)
 
 
+def _mkdtemp():
+    """拼好的整份放进 tmpguard 登记的一次性目录: 进程退出时清, PDG_KEEP_TMP=1 时留现场(与其余测试同一规矩)。
+
+    tmpguard 是 tests/ 下的共享模块。bash 版按文件路径加载本模块时 tests/ 不一定在 sys.path 上,
+    所以到真要拼的时候才导入, 并按本文件所在目录补上路径。
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    import tmpguard
+    return tmpguard.mkdtemp(prefix="pdg-source-")
+
+
 def path(root):
     """逻辑上整份 pdg.sh 的路径。root 是 Path 就返回 Path, 是 str 就返回 str。
 
@@ -66,8 +76,7 @@ def path(root):
         if text is None:
             _cache[key] = None
         else:
-            d = tempfile.mkdtemp(prefix="pdg-source-")
-            _tmpdirs.append(d)
+            d = _mkdtemp()
             p = os.path.join(d, "pdg.sh")
             with open(p, "w", encoding="utf-8", newline="") as fh:
                 fh.write(text)
@@ -105,8 +114,3 @@ def extract(name, src):
             return "\n".join(lines[i:j + 1])
     raise LookupError("函数 %s() 从第 %d 行起找不到收尾的 }" % (name, i + 1))
 
-
-@atexit.register
-def _cleanup():
-    for d in _tmpdirs:
-        shutil.rmtree(d, ignore_errors=True)

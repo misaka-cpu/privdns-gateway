@@ -7,15 +7,14 @@
 4. 共享抽取 extract(): 多行 / 单行 / 嵌套各一例; 抽不到、同名多处、找不到收尾都报错, 不返回空串; 与 bash 的 pdg_extract_fn 输出相同。
 """
 import os
-import shutil
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tests"))
 import pdg_source  # noqa: E402
+import tmpguard  # noqa: E402
 
 LIB = str(ROOT / "tests" / "pdg-source-lib.sh")
 ENTRY = ROOT / "deploy" / "bot" / "pdg.sh"
@@ -32,8 +31,13 @@ def check(cond, msg):
         print("[FAIL] " + msg)
 
 
+# bash 版有标记时把拼好的文件放进 ${TMPDIR:-/tmp} 下、自己不清 —— 本测试调它时把 TMPDIR 指到登记过的目录, 退出时一并清掉。
+SH_TMP = tmpguard.mkdtemp(prefix="pdg-source-sh-")
+
+
 def sh_path(root):
-    p = subprocess.run(["bash", LIB, "path", str(root)], capture_output=True, text=True)
+    p = subprocess.run(["bash", LIB, "path", str(root)], capture_output=True, text=True,
+                       env=dict(os.environ, TMPDIR=SH_TMP))
     return p.returncode, p.stdout.rstrip("\n"), p.stderr
 
 
@@ -52,7 +56,7 @@ rc, out, err = sh_path(ROOT)
 check(rc == 0 and out == str(ENTRY) and err == "", "bash 版 path 给出同一个路径(rc=%d)" % rc)
 
 print("\n══ 2. 有标记: 临时树里拼回 ══")
-tmp = tempfile.mkdtemp(prefix="pdg-source-test-")
+tmp = tmpguard.mkdtemp(prefix="pdg-source-test-")
 try:
     t = Path(tmp)
     (t / "deploy" / "bot").mkdir(parents=True)
@@ -82,10 +86,10 @@ try:
     rc, out, err = sh_path(t)
     check(rc != 0 and "段文件不存在" in err, "段文件缺了, bash 版 rc≠0 并说明(rc=%d)" % rc)
 finally:
-    shutil.rmtree(tmp, ignore_errors=True)
+    tmpguard.cleanup(tmp)
 
 print("\n══ 3. 往返: 真 pdg.sh 剪出一段再拼回, 逐字节相同 ══")
-tmp = tempfile.mkdtemp(prefix="pdg-source-rt-")
+tmp = tmpguard.mkdtemp(prefix="pdg-source-rt-")
 try:
     t = Path(tmp)
     (t / "deploy" / "bot").mkdir(parents=True)
@@ -104,7 +108,7 @@ try:
     pdg_source._cache.clear()
     check(raw(pdg_source.path(str(t))) != real, "负控: 段里少一行时, 拼回的与原文件不同")
 finally:
-    shutil.rmtree(tmp, ignore_errors=True)
+    tmpguard.cleanup(tmp)
 
 print("\n══ 4. 共享抽取 extract() ══")
 src = real.decode("utf-8")
