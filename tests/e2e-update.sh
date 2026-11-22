@@ -108,6 +108,7 @@ e2e_git "$REPO" checkout -q v9.9.8                     # 退回旧版, 好再更
 e2e_reset_botdir || bad "重置 /opt/pdg-bot 失败"
 for f in "$E2E_ROOT"/deploy/bot/*.py; do install -m755 "$f" /opt/pdg-bot/; done
 install -m755 "$E2E_ROOT/deploy/bot/pdg-bot.py" /opt/pdg-bot/bot.py
+e2e_seed_parts || bad "装 pdg.sh 的段失败"
 # 让 doctor 报一条 fail(内核服务不在) —— 用有状态 systemd 桩把 mihomo 置为 inactive
 e2e_svc_fail mihomo
 before=$(sha256sum /opt/pdg-bot/checks.py | cut -d' ' -f1)

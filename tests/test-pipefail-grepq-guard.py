@@ -202,7 +202,8 @@ seen = {}
 nfiles = 0
 for rel in prod:
     txt = io.open(os.path.join(ROOT, rel), encoding="utf-8", errors="replace").read()
-    if not re.search(r"set\s+-[a-z]*o?\s*pipefail|set\s+-o\s+pipefail", txt):
+    # lib/pdg/<段>.sh 自己不写 set -o pipefail: 它们被 pdg.sh 在顶层 source, 跑在入口开好的 pipefail 里(建议 4)。
+    if not re.search(r"set\s+-[a-z]*o?\s*pipefail|set\s+-o\s+pipefail", txt) and not rel.startswith("lib/pdg/"):
         continue
     nfiles += 1
     for i, line in enumerate(txt.splitlines(), 1):

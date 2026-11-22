@@ -146,7 +146,9 @@ _unit_code = re.sub(r"^\s*#.*$", "", _unit, flags=re.M)
 # ── 5. dotwitness.env 必须有生产者 ──────────────────────────────────────────
 head("5. dotwitness.env 的生产者")
 producers = []
-for f in ("install.sh", os.path.join("deploy", "bot", "pdg.sh")):
+_parts = sorted(os.path.join("lib", "pdg", n) for n in os.listdir(os.path.join(ROOT, "lib", "pdg")) if n.endswith(".sh")) \
+    if os.path.isdir(os.path.join(ROOT, "lib", "pdg")) else []          # pdg.sh 拆出去的段(建议 4)
+for f in ["install.sh", os.path.join("deploy", "bot", "pdg.sh")] + _parts:
     p = os.path.join(ROOT, f)
     if os.path.isfile(p) and re.search(r">\s*\S*dotwitness\.env|dotwitness\.env\"?\s*$",
                                        open(p).read(), re.M):

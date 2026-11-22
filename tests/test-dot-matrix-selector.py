@@ -74,7 +74,10 @@ print("\n── CI 与生产路径里不得出现这个变量 ──")
 ci = open(os.path.join(ROOT, ".github/workflows/ci.yml"), encoding="utf-8").read()
 (ok if "PDG_MIGRATE_SECTIONS" not in ci else bad)("ci.yml 里没有 PDG_MIGRATE_SECTIONS")
 (ok if "PDG_NEGCTL" not in ci else bad)("ci.yml 里没有 PDG_NEGCTL")
-for rel in ("deploy/bot/pdg.sh", "install.sh", "uninstall.sh"):
+# lib/pdg/<段>.sh 是 pdg.sh 拆出去的段(建议 4), 同样是生产代码。
+_parts = sorted("lib/pdg/" + n for n in os.listdir(os.path.join(ROOT, "lib", "pdg")) if n.endswith(".sh")) \
+    if os.path.isdir(os.path.join(ROOT, "lib", "pdg")) else []
+for rel in ["deploy/bot/pdg.sh", "install.sh", "uninstall.sh"] + _parts:
     src = open(os.path.join(ROOT, rel), encoding="utf-8").read()
     (ok if "PDG_MIGRATE_SECTIONS" not in src else bad)("%s 里没有这个测试开关" % rel)
 

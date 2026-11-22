@@ -23,7 +23,51 @@ import pdg_source  # noqa: E402
 PROD = ("deploy/", "lib/", "install.sh", "uninstall.sh", "tools/")
 
 # 每拆一段登记一项: 这一步额外加进入口的代码(原文写死, 拼回的整份里必须恰好出现一次), 以及这一步允许改动的生产文件。
-STEPS = {}
+# 第一步(adblock)额外加的是载入器本身: _PDG_PART_DIR / _pdg_part / _pdg_part_missing, 插在 _pdg_entry_libdir 之后。
+ADBLOCK_LOADER = r'''
+# 拆出去的段(lib/pdg/<段>.sh, 建议 4)在哪。已安装的 CLI 读运行模块表装的那一份(lib/modules.sh,
+# 与入口一起进快照); 在一棵树里运行的入口(仓库检出 / docs/BRIDGE-ENTRY.md 的入口副本 /
+# git archive 出的快照)读同一棵树里的那一份。别的形态认不出配套的是哪一份, 一律拒绝: 不猜,
+# 也不回退到 $REPO_DIR。段在入口里原来的位置载入(各处 `# @pdg-part` 那 4 行), 载入顺序与拆分前
+# 一样; 而且必须在顶层载入 —— 在函数里 source, 段里的 declare 会变成局部变量。
+_PDG_PART_DIR="/opt/pdg-bot"
+_pdg_part(){
+  local n="$1" src p=""
+  src="$(_pdg_entry_src)"
+  if [[ "$src" == "$_PDG_INSTALLED_CLI" ]]; then p="$_PDG_PART_DIR/pdg-$n.sh"
+  elif [[ "$src" == /*/deploy/bot/pdg.sh ]]; then p="${src%/deploy/bot/pdg.sh}/lib/pdg/$n.sh"
+  fi
+  if [[ -n "$p" && -f "$p" && -r "$p" && -s "$p" ]]; then printf '%s\n' "$p"; return 0; fi
+  _pdg_part_missing "$n" "$src" "$p"
+  return 1
+}
+# 缺段时说清楚缺的是哪一段、在哪找的、怎么补。这时 pdg 的任何子命令都跑不起来(update / rollback
+# 也一样, 覆盖重装也要先跑 pdg snapshot), 所以给的修补办法必须不依赖 pdg 本身。
+_pdg_part_missing(){
+  local n="$1" src="$2" p="$3" why="不存在"
+  if [[ -n "$p" && -e "$p" ]]; then
+    if [[ ! -r "$p" ]]; then why="读不了"; elif [[ ! -s "$p" ]]; then why="是空文件"; else why="不是普通文件"; fi
+  fi
+  {
+    echo "❌ pdg 缺少拆出去的一段「$n」, 不能运行。"
+    if [[ "$src" == "$_PDG_INSTALLED_CLI" ]]; then
+      echo "   入口: $src; 应该在: $p($why)"
+      echo "   这时 pdg update、pdg rollback、覆盖重装都跑不起来(它们都要先运行 pdg)。先手工补上:"
+      echo "     sudo install -m644 $REPO_DIR/lib/pdg/$n.sh $p"
+      echo "   补完跑 sudo pdg doctor, 看「安装清单」那一项: 受管仓库与现役入口不是同一版时它会报不一致。"
+    elif [[ -n "$p" ]]; then
+      echo "   入口: $src; 应该在同一棵树里: $p($why)。这棵树不完整, 换一份完整的检出再运行。"
+    else
+      echo "   入口: $src —— 既不是已安装的 $_PDG_INSTALLED_CLI, 也不在 <仓库>/deploy/bot/ 下, 认不出配套的段在哪。"
+      echo "   pdg.sh 从这一版起不能单独拷到别处运行: 装机用 install.sh, 升级用 sudo pdg update。"
+    fi
+  } >&2
+}
+'''
+STEPS = {
+    "adblock": {"extra": ADBLOCK_LOADER,
+                "allow": {"deploy/bot/pdg.sh", "lib/pdg/adblock.sh", "lib/modules.sh"}},
+}
 
 PASS = [0]
 FAIL = [0]
@@ -117,6 +161,10 @@ def main():
             (ok if not pdg_source.markers(t) else bad)("lib/pdg/%s.sh 里没有拆分标记" % n)
         for n in names:
             (ok if n in STEPS else bad)("段「%s」在本测试的 STEPS 里登记过(新拆的段必须登记它那一步的新增代码)" % n)
+        ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8").split("\n")
+        k = next((i for i, l in enumerate(ci) if "shellcheck --severity=warning" in l), None)
+        scope = ci[k + 1].split() if k is not None and k + 1 < len(ci) else []
+        (ok if "lib/pdg/*.sh" in scope else bad)("CI 的 ShellCheck 范围里有 lib/pdg/*.sh(范围行: %s)" % " ".join(scope)[:100])
         try:
             p = pdg_source.path(ROOT)
             ok("拼得回: 每个标记后面都是固定的 3 行载入语句")

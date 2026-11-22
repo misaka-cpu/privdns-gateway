@@ -20,8 +20,9 @@ import tmpguard          # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 PDG = "deploy/bot/pdg.sh"
+PART = "lib/pdg/adblock.sh"   # pdg.sh 拆出去的 adblock 段(建议 4); 锚点落在段里的改坏器打在这里
 BOT = "deploy/bot/pdg-bot.py"
-TOUCHED = [ROOT / PDG, ROOT / BOT]
+TOUCHED = [ROOT / PDG, ROOT / PART, ROOT / BOT]
 PASS, FAIL = [0], [0]
 
 
@@ -77,34 +78,34 @@ BUSY = '''      if ! { exec 9>"$LOCK"; } 2>/dev/null || ! flock -n 9; then
       PDG_LOCKED=1'''
 
 MUT = [
-    ("① 摘掉 enable 的锁", PDG,
+    ("① 摘掉 enable 的锁", PART,
      [("    enable)\n      need_root adblock; _lock; _adblock_ensure_files",
        "    enable)\n      need_root adblock; _adblock_ensure_files", 1)],
      "[enable]"),
-    ("② 摘掉 disable 的锁", PDG,
+    ("② 摘掉 disable 的锁", PART,
      [("    disable)\n      need_root adblock; _lock; _adblock_ensure_files",
        "    disable)\n      need_root adblock; _adblock_ensure_files", 1)],
      "[disable]"),
-    ("③ 摘掉 update 的锁", PDG,
+    ("③ 摘掉 update 的锁", PART,
      [("    update)\n      need_root adblock; _lock; _adblock_ensure_files",
        "    update)\n      need_root adblock; _adblock_ensure_files", 1)],
      "[update]"),
-    ("④ rule-add 在取锁前就 ensure_files", PDG,
+    ("④ rule-add 在取锁前就 ensure_files", PART,
      [(BUSY, '      _adblock_ensure_files >/dev/null 2>&1\n' + BUSY, 1)],
      "锁忙却建了状态目录"),
-    ("⑤ 把 BUSY 换回「失败且已回滚」", PDG,
+    ("⑤ 把 BUSY 换回「失败且已回滚」", PART,
      [('        _adb_emit ADBLOCK_BUSY none; return 1',
        '        _adb_emit apply_failed_rolled_back none; return 1', 1)],
      "闭集"),
-    ("⑥ status 恢复 ensure_files", PDG,
+    ("⑥ status 恢复 ensure_files", PART,
      [('    status|"") _adblock_status;;',
        '    status|"") _adblock_ensure_files >/dev/null 2>&1; _adblock_status;;', 1)],
      "status"),
-    ("⑦ 让只读的 check 也去抢写锁", PDG,
+    ("⑦ 让只读的 check 也去抢写锁", PART,
      [("    check)\n      # **恰好一个参数。**",
        "    check)\n      _lock\n      # **恰好一个参数。**", 1)],
      "check"),
-    ("⑧ 内部 helper 自己去抢锁(另一个 fd)", PDG,
+    ("⑧ 内部 helper 自己去抢锁(另一个 fd)", PART,
      [('_adblock_apply(){\n  local want="$1" mod bak_b bak_l',
        '_adblock_apply(){\n  exec 8>"$LOCK"; flock -n 8 || return 1\n'
        '  local want="$1" mod bak_b bak_l', 1)],
@@ -113,7 +114,7 @@ MUT = [
      [('    "ADBLOCK_BUSY": "⏳ 另一个 PDG 操作正在进行，本次没有修改任何规则，请稍后重试。",',
        '    "ADBLOCK_BUSY": "❌ 应用失败，已回滚，规则未生效。",', 1)],
      "锁忙"),
-    ("⑩ 只加一行无关注释(反向对照)", PDG,
+    ("⑩ 只加一行无关注释(反向对照)", PART,
      [("migrate_adblock(){", "# (负控的空转对照, 不改变任何行为)\nmigrate_adblock(){", 1)],
      None),
 ]
@@ -125,7 +126,7 @@ try:
     for sub in ("tests", "deploy", "lib"):
         shutil.copytree(ROOT / sub, Path(wd) / sub, dirs_exist_ok=True,
                         symlinks=True, ignore=shutil.ignore_patterns("__pycache__"))
-    pristine = {rel: (Path(wd) / rel).read_text(encoding="utf-8") for rel in (PDG, BOT)}
+    pristine = {rel: (Path(wd) / rel).read_text(encoding="utf-8") for rel in (PDG, PART, BOT)}
     base = run_suites(wd)
     if base:
         bad("基线(未改坏)就有 %d 条失败 —— 后面每格的'新增'都算不出来: %s" % (len(base), sorted(base)[:2]))

@@ -44,10 +44,11 @@ import tmpguard          # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 PDG = "deploy/bot/pdg.sh"
+PART = "lib/pdg/adblock.sh"   # pdg.sh 拆出去的 adblock 段(建议 4); 锚点落在段里的改坏器打在这里
 CHK = "deploy/bot/checks.py"
 VER = "lib/versions.sh"
 INS = "install.sh"
-TOUCHED = [ROOT / PDG, ROOT / CHK, ROOT / VER, ROOT / INS]
+TOUCHED = [ROOT / PDG, ROOT / PART, ROOT / CHK, ROOT / VER, ROOT / INS]
 
 PASS, FAIL = [0], [0]
 
@@ -125,15 +126,15 @@ MUT = [
     ("⑨ 安装短路改回只看自报版本", INS,
      [('if ! pdg_mosdns_binary_ok "$MARCH" "$MOSDNS_VER" /usr/local/bin/mosdns; then',
        'if ! pdg_mosdns_is_version "$MOSDNS_VER"; then', 1)], [T_MOS]),
-    ("⑩ 去广告 unknown 折回 disabled", PDG,
+    ("⑩ 去广告 unknown 折回 disabled", PART,
      [("    *) printf 'unknown';;\n  esac\n}", "    *) printf 'disabled';;\n  esac\n}", 1)], [T_TRI]),
-    ("⑪ 缺规则文件仍显示 0 条", PDG,
+    ("⑪ 缺规则文件仍显示 0 条", PART,
      [("  if ! _adb_rules_readable \"$ADB_STATE_DIR/effective_list.txt\" \\\n"
        "     || ! _adb_rules_readable \"$ADB_USER_BLOCK\"; then",
        "  if false; then", 1)], [T_TRI]),
-    ("⑫ 自定义计数恒 0(假牙那一格)", PDG,
+    ("⑫ 自定义计数恒 0(假牙那一格)", PART,
      [('  usr="$(_adb_count_rules "$ADB_USER_BLOCK")"', "  usr=0", 1)], [T_LINE]),
-    ("⑬ 只加一行无关注释(反向对照)", PDG,
+    ("⑬ 只加一行无关注释(反向对照)", PART,
      [("_adb_rules_readable(){", "# (负控的空转对照, 不改变任何行为)\n_adb_rules_readable(){", 1)],
      [T_REL, T_TRI, T_LINE]),
 ]
@@ -148,7 +149,7 @@ try:
                         symlinks=True, ignore=shutil.ignore_patterns("__pycache__"))
     shutil.copy2(ROOT / INS, Path(wd) / INS)
     pristine = {rel: (Path(wd) / rel).read_text(encoding="utf-8")
-                for rel in (PDG, CHK, VER, INS)}
+                for rel in (PDG, PART, CHK, VER, INS)}
 
     print("══ 基线(未改坏的同一份副本)══")
     base = {}

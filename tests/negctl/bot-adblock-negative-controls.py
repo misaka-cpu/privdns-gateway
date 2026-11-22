@@ -22,8 +22,9 @@ import tmpguard          # noqa: E402
 ROOT = Path(__file__).resolve().parents[2]
 BOT = "deploy/bot/pdg-bot.py"
 PDG = "deploy/bot/pdg.sh"
+PART = "lib/pdg/adblock.sh"   # pdg.sh 拆出去的 adblock 段(建议 4); 锚点落在段里的改坏器打在这里
 ADB = "deploy/bot/adblock.py"
-TOUCHED = [ROOT / BOT, ROOT / PDG, ROOT / ADB]
+TOUCHED = [ROOT / BOT, ROOT / PDG, ROOT / PART, ROOT / ADB]
 PASS, FAIL = [0], [0]
 
 
@@ -115,7 +116,7 @@ MUT = [
      [('      if [[ "$(_adblock_intent)" != 1 ]]; then\n        rm -f "$_src_bak"',
        '      if false; then\n        rm -f "$_src_bak"', 1)],
      "停用态"),
-    ("⑪ 幂等操作也重启", PDG,
+    ("⑪ 幂等操作也重启", PART,
      [('      if [[ "$_change" == none ]]; then\n        rm -f "$_src_bak"',
        '      if false; then\n        rm -f "$_src_bak"', 1)],
      "already_exists"),
@@ -127,10 +128,10 @@ MUT = [
     ("⑬ mosdns 起不来仍然提交", PDG,
      [('        if ! systemctl is-active --quiet mosdns; then', '        if false; then', 1)],
      "没恢复"),
-    ("⑭ 重启失败不恢复前像", PDG,
+    ("⑭ 重启失败不恢复前像", PART,
      [('        cp -a "$_src_bak" "$ADB_USER_BLOCK" 2>/dev/null || _bad=1', "        :", 1)],
      "没恢复"),
-    ("⑮ LKG 被覆盖", PDG,
+    ("⑮ LKG 被覆盖", PART,
      [('      _adb_emit applied "$_change" "$_restarted" "$_ovr"',
        '      : > "$ADB_STATE_DIR/list.lkg"\n      _adb_emit applied "$_change" "$_restarted" "$_ovr"', 1)],
      "LKG"),
@@ -156,7 +157,7 @@ try:
     for sub in ("tests", "deploy", "lib"):
         shutil.copytree(ROOT / sub, Path(wd) / sub, dirs_exist_ok=True,
                         symlinks=True, ignore=shutil.ignore_patterns("__pycache__"))
-    pristine = {rel: (Path(wd) / rel).read_text(encoding="utf-8") for rel in (BOT, PDG, ADB)}
+    pristine = {rel: (Path(wd) / rel).read_text(encoding="utf-8") for rel in (BOT, PDG, PART, ADB)}
     base = run_suites(wd)
     if base:
         bad("基线(未改坏)就有 %d 条失败 —— 后面每格的'新增'都算不出来: %s" % (len(base), sorted(base)[:2]))

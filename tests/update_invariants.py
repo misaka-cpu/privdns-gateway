@@ -202,7 +202,8 @@ def capture(args):
     # 检查会直接 ImportError/找不到模块, 因此两个平台各 +2。
     # ios 36 → 34: WLOC 退役后 mitm_server.py / mitm_wloc.py 不再安装。
     # +1: kernelfollow.py(内核跟随上游); 再 +1: installset.py(安装清单, doctor 的「安装清单」一项 import 它)。
-    expect = {"android": 32, "ios": 36}.get(plat)
+    # 再 +1: pdg-adblock.sh(pdg.sh 拆出去的 adblock 段, 建议 4; 已安装的 CLI 启动时载入它)。
+    expect = {"android": 33, "ios": 37}.get(plat)
     if expect is not None and len(members) != expect:
         raise SystemExit("manifest 数量漂移: %s 平台应为 %d 项, 实得 %d" % (plat, expect, len(members)))
 

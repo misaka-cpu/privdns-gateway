@@ -32,7 +32,8 @@ import tmpguard          # noqa: E402
 ROOT = Path(__file__).resolve().parents[2]
 MOD = "deploy/bot/adblock.py"
 PDG = "deploy/bot/pdg.sh"
-TOUCHED = [ROOT / MOD, ROOT / PDG]
+PART = "lib/pdg/adblock.sh"   # pdg.sh 拆出去的 adblock 段(建议 4); 锚点落在段里的改坏器打在这里
+TOUCHED = [ROOT / MOD, ROOT / PDG, ROOT / PART]
 
 PASS, FAIL = [0], [0]
 
@@ -110,7 +111,7 @@ MUTATIONS = [
        '    return {"ok": False, "reason": "ADBLOCK_UPDATE_FAILED",\n'
        '            "detail": "全部源都不可用: " + "; ".join(errs[:3]), "count": 0}', 1)],
      "LKG"),
-    ("⑥ 恢复 shell→Python 字面量插值", PDG,
+    ("⑥ 恢复 shell→Python 字面量插值", PART,
      [('  count="$(python3 -c \'import json,sys\ntry: print(json.load(open(sys.argv[1] + "/meta.json")).get("count",0))\nexcept Exception: print(0)\' "$ADB_STATE_DIR" 2>/dev/null)"',
        '  count="$(python3 -c \'import json,sys\ntry: print(json.load(open("\'"$ADB_STATE_DIR"\'/meta.json")).get("count",0))\nexcept Exception: print(0)\' 2>/dev/null)"', 1)],
      "shell→Python 字面量插值"),
@@ -160,7 +161,7 @@ try:
     for sub in ("tests", "deploy", "lib"):
         shutil.copytree(ROOT / sub, Path(wd) / sub, dirs_exist_ok=True,
                         symlinks=True, ignore=shutil.ignore_patterns("__pycache__"))
-    pristine = {rel: (Path(wd) / rel).read_text(encoding="utf-8") for rel in (MOD, PDG)}
+    pristine = {rel: (Path(wd) / rel).read_text(encoding="utf-8") for rel in (MOD, PDG, PART)}
 
     base = run_suites(wd)
     if base:

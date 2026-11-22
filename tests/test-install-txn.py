@@ -319,17 +319,17 @@ IS_LINE = "deploy/bot/installset.py installset.py 755"
 WANT_PATHS = sorted(ln.split()[1] for ln in subprocess.run(
     ["bash", "-c", "source lib/installset.sh && pdg_installset ios"], cwd=ROOT, capture_output=True, text=True,
     timeout=60).stdout.splitlines() if ln.strip())
-check(len(WANT_PATHS) == 47 and "/opt/pdg-bot/installset.py" in WANT_PATHS, "复位后的仓库这一版 iOS 全集 %d 项" % len(WANT_PATHS))
+check(len(WANT_PATHS) == 48 and "/opt/pdg-bot/installset.py" in WANT_PATHS, "复位后的仓库这一版 iOS 全集 %d 项" % len(WANT_PATHS))
 for tag, label, stale in (("plus", "别版多一项", MODS.replace(IS_LINE, IS_LINE + "\ndeploy/bot/zz-stale-extra.py zz-stale-extra.py 755", 1)),
                           ("minus", "别版少一项", MODS.replace("\n" + IS_LINE, "", 1))):
     SD = os.path.join(TMP, "r5-stale-" + tag)
     os.makedirs(os.path.join(SD, "lib"))
     io.open(os.path.join(SD, "lib", "modules.sh"), "w", encoding="utf-8").write(stale)
-    # 先核"别版"真的不同(空测条件): 只 source 那份时 iOS 模块数应是 37 / 35, 不是本版的 36。
+    # 先核"别版"真的不同(空测条件): 只 source 那份时 iOS 模块数应是 38 / 36, 不是本版的 37。
     q = subprocess.run(["bash", "-c", 'source "$1/lib/modules.sh" && pdg_platform_modules ios | grep -c .', "x", SD],
                        capture_output=True, text=True, timeout=60)
     n_stale = int(q.stdout.strip() or 0)
-    check(stale != MODS and n_stale == (37 if tag == "plus" else 35), "%s: 别版那份 iOS 模块 %d 个" % (label, n_stale))
+    check(stale != MODS and n_stale == (38 if tag == "plus" else 36), "%s: 别版那份 iOS 模块 %d 个" % (label, n_stale))
     V3 = os.path.join(SD, "install")
     p = subprocess.run(["bash", "-c", harness + '\nsource "$2/lib/modules.sh" || exit 7\nREPO_DIR="$1" _rb_manifest; echo "RC=$?"',
                         "x", ROOT, SD], cwd=TMP, capture_output=True, text=True, timeout=120, env=dict(os.environ, PDG_INSTALLSET_DIR=V3))

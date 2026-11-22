@@ -1277,6 +1277,18 @@ e2e_reset_botdir(){
   return 0
 }
 
+# pdg.sh 拆出去的段(建议 4): 已安装的 /usr/local/bin/pdg 启动时从 /opt/pdg-bot/pdg-<段>.sh 载入, 缺了它拒绝运行。
+# 真机由运行模块表(lib/modules.sh)装; 夹具照同一个命名补上, 不改成整张表 —— 那会多装别的模块, 改变现有用例的前提。
+# 凡是把**当前版本**的入口装成 /usr/local/bin/pdg、或清过 /opt/pdg-bot 的夹具, 之后都要调它。
+e2e_seed_parts(){
+  local f
+  for f in "$E2E_ROOT"/lib/pdg/*.sh; do
+    [[ -f "$f" ]] || continue
+    install -m644 "$f" "/opt/pdg-bot/pdg-${f##*/}" || return 1
+  done
+  return 0
+}
+
 e2e_seed_install(){
   # 一台"已经装好的机器"必须有真实的 mosdns 二进制 —— 没有它, doctor 的完整性判据判 fail,
   # 而 cmd_update 的自检门看到 fail 就整个回滚。以前这些夹具压根不播种它, 于是
@@ -1286,6 +1298,7 @@ e2e_seed_install(){
   cp -a "$E2E_ROOT" /opt/privdns-gateway
   install -m755 "$E2E_ROOT/deploy/bot/pdg.sh" /usr/local/bin/pdg
   local f; for f in "$E2E_ROOT"/deploy/bot/*.py; do install -m755 "$f" /opt/pdg-bot/; done
+  e2e_seed_parts || return 1
   install -m755 "$E2E_ROOT/deploy/bot/pdg-bot.py" /opt/pdg-bot/bot.py
   # install.sh 从第一版公开装机脚本(62443ad)起就写这个文件, 它是 DoT 域名的唯一真源。
   # 夹具既然模拟"已装好的机器", 就得把它一起造出来 —— 少了它, 6.2B 的

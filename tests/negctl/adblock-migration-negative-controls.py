@@ -43,8 +43,9 @@ import tmpguard          # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 PDG = "deploy/bot/pdg.sh"
+PART = "lib/pdg/adblock.sh"   # pdg.sh 拆出去的 adblock 段(建议 4); 锚点落在段里的改坏器打在这里
 CHK = "deploy/bot/checks.py"
-TOUCHED = [ROOT / PDG, ROOT / CHK]
+TOUCHED = [ROOT / PDG, ROOT / PART, ROOT / CHK]
 
 PASS, FAIL = [0], [0]
 
@@ -122,28 +123,28 @@ MUTATIONS = [
     ("① 把 adblock 挪回 explicit_proxy 之前", PDG,
      [(ORDER_BLOCK, CALL + "  migrate_mosdns_explicit_proxy || true\n", 1)],
      "之后"),
-    ("② 删掉整个前置判据", PDG,
+    ("② 删掉整个前置判据", PART,
      [(GATE, "", 1)],
      "受管块"),
-    ("③ 前置判据反过来(有 explicit_proxy 才跳过 → 永久跳过)", PDG,
+    ("③ 前置判据反过来(有 explicit_proxy 才跳过 → 永久跳过)", PART,
      [(GATE_HEAD, "  if grep -qE '^ *- tag: explicit_proxy$' \"$mos\"; then\n", 1)],
      "永远跳过"),
-    ("④ 跳过时返回 1(又把整次更新拖进回滚)", PDG,
+    ("④ 跳过时返回 1(又把整次更新拖进回滚)", PART,
      [(SAY + "    return 0\n", SAY + "    return 1\n", 1)],
      "返回 0"),
-    ("⑤ 跳过时不吭声(静默缺件)", PDG,
+    ("⑤ 跳过时不吭声(静默缺件)", PART,
      [(SAY, "", 1)],
      "可观察"),
-    ("⑥ 判定成立却仍然插块", PDG,
+    ("⑥ 判定成立却仍然插块", PART,
      [(SAY + "    return 0\n  fi\n", SAY + "    :\n  fi\n", 1)],
      "没有被插入受管块"),
     ("⑦ 调用点改回 `|| true`", PDG,
      [(CALL, "  migrate_adblock || true   # 去广告受管块(默认关闭; 失败要让整次更新回滚)\n", 1)],
      "记进 rc"),
-    ("⑧ 判据放宽到裸 explicit_proxy(注释即可冒充定义)", PDG,
+    ("⑧ 判据放宽到裸 explicit_proxy(注释即可冒充定义)", PART,
      [(GATE_HEAD, "  if ! grep -q 'explicit_proxy' \"$mos\"; then\n", 1)],
      "注释里提到"),
-    ("⑨ 摘掉重复安装检查", PDG,
+    ("⑨ 摘掉重复安装检查", PART,
      [(DUP, "", 1)],
      "重复安装"),
     ("⑩ 判据挪到第一个写动作之后", PDG,
@@ -154,7 +155,7 @@ MUTATIONS = [
        '        if intent:\n'
        '            return ("ok", name, "去广告受管块不在, 但先当它没事 "\n', 1)],
      "doctor 判 fail"),
-    ("⑫ 只加一行无关注释(反向对照)", PDG,
+    ("⑫ 只加一行无关注释(反向对照)", PART,
      [("migrate_adblock(){", "# (负控的空转对照, 不改变任何行为)\nmigrate_adblock(){", 1)],
      None),
 ]
@@ -167,7 +168,7 @@ try:
     for sub in ("tests", "deploy", "lib"):
         shutil.copytree(ROOT / sub, Path(wd) / sub, dirs_exist_ok=True,
                         symlinks=True, ignore=shutil.ignore_patterns("__pycache__"))
-    pristine = {rel: (Path(wd) / rel).read_text(encoding="utf-8") for rel in (PDG, CHK)}
+    pristine = {rel: (Path(wd) / rel).read_text(encoding="utf-8") for rel in (PDG, PART, CHK)}
 
     base = run_suites(wd)
     if base:

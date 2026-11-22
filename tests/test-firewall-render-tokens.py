@@ -27,7 +27,10 @@ import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TPL = os.path.join(ROOT, "deploy", "firewall", "nftables-mihomo.conf")
-PROD = ["install.sh", os.path.join("deploy", "bot", "pdg.sh")]
+# lib/pdg/<段>.sh 是 pdg.sh 拆出去的段(建议 4): 渲染点挪进段里也要被找到, 函数内的检查同样适用。
+PROD = ["install.sh", os.path.join("deploy", "bot", "pdg.sh")] + (
+    sorted(os.path.join("lib", "pdg", n) for n in os.listdir(os.path.join(ROOT, "lib", "pdg")) if n.endswith(".sh"))
+    if os.path.isdir(os.path.join(ROOT, "lib", "pdg")) else [])
 
 
 def rescue_port():
@@ -159,7 +162,7 @@ for rel, lineno, subs, stmt, src in sites:
         bad("%s:%d 替换 __RESCUE_PORT__ 用的不是现有常量 $PDG_RESCUE_PORT" % (rel, lineno))
         continue
     ok("%s:%d 用现有常量 $PDG_RESCUE_PORT(不另立默认值)" % (rel, lineno))
-    if not rel.endswith("pdg.sh"):
+    if not (rel.endswith("pdg.sh") or rel.startswith(os.path.join("lib", "pdg") + os.sep)):
         continue
     fn, fstart, fend = enclosing_func(src, lineno)
     body = "\n".join(src.splitlines()[fstart - 1:fend])

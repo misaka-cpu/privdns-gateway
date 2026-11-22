@@ -57,6 +57,7 @@ deploy/rescue/rescue.py rescue.py 755
 deploy/rescue/rescue_cred.py rescue_cred.py 755
 deploy/rescue/breakglass.py breakglass.py 755
 lib/rescue.sh rescue.sh 644
+lib/pdg/adblock.sh pdg-adblock.sh 644
 deploy/bot/pdg-bot.py bot.py 755
 deploy/bot/parse-geosite.py parse-geosite.py 755
 deploy/bot/update-rules.sh update-rules.sh 755
@@ -65,6 +66,8 @@ deploy/bot/healthcheck.py healthcheck.py 755
 deploy/bot/kernelfollow.py kernelfollow.py 755
 deploy/bot/installset.py installset.py 755"
 # installset.py: 安装清单的写与核对(lib/installset.sh 定全集), doctor 的「安装清单」一项 import 它。
+# pdg-adblock.sh 那行: pdg.sh 拆出去的 adblock 段(建议 4)。已安装的 /usr/local/bin/pdg 启动时从
+# /opt/pdg-bot/pdg-<段>.sh 载入各段(入口里的 _pdg_part); 644, 只被 source, 从不单独执行。
 # rescue.sh 那行不是 Python: rescue_const 解析的常量单一事实源。装一份副本, 于是仓库不在时
 # 也读得到(它按 /opt/pdg-bot/rescue.sh → 仓库 lib/rescue.sh 的顺序找)。
 #

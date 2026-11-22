@@ -66,10 +66,11 @@ else:
 # 下面这两项是**数据**, 不该有执行位:
 #   · rescue.sh —— 被 source 的常量单一事实源, 从不执行;
 #   · pdg-dot.mobileconfig.tmpl —— 发给手机的描述文件模板。
+#   · lib/pdg/<段>.sh(装成 pdg-<段>.sh)—— pdg.sh 拆出去的段, 只被入口 source, 从不单独执行(建议 4)。
 # 这是测试里的期望表, 不是第二份部署清单 —— 部署仍然只有 lib/modules.sh 一处。
 # 仓库里所有文件的 git mode 都是 100644, 所以拿 git 的可执行位当判据是行不通的。
 _DATA_FILES = {"rescue.sh", "pdg-dot.mobileconfig.tmpl"}
-_want = {r[1]: ("644" if r[1] in _DATA_FILES else "755") for r in rows}
+_want = {r[1]: ("644" if r[1] in _DATA_FILES or r[0].startswith("lib/pdg/") else "755") for r in rows}
 _mode_bad = [(r[1], r[2], _want[r[1]]) for r in rows if r[2] != _want[r[1]]]
 if not _mode_bad:
     ok("mode 与文件类型一致(.py/.sh=755, 数据文件=644)")
