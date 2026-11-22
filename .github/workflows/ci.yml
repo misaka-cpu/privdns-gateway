@@ -1325,6 +1325,11 @@ jobs:
         if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-pdg-source.py
 
+      # 只搬不改那一节要取历史提交: 本 job 的检出是 fetch-depth: 0, 浅克隆会判失败(不跳过)。
+      - name: "pdg.sh 拆分段守门 (标记与段文件一一对应; 引入段的那一步拼回后与上一版逐字节相同)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
+        run: python3 tests/test-pdg-parts.py
+
       - name: "CI 覆盖守卫 (每个测试文件都必须真的被本 workflow 调用)"
         if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-ci-coverage.py
