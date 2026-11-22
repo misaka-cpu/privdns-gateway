@@ -56,6 +56,13 @@ iOS 靠描述文件的 OnDemand「探测 `:81` 成功才启用 DoT」。
 - bot 📈流量 的「实时」来自 clash_api = **内核本会话**(mihomo 重启即清零)且**只算经代理的流量**;不是机器总用量。
 - 要准确的今日/本月/累计看「总用量(vnstat·网卡真实)」或 `sudo pdg traffic`(vnstat 刚装需跑几分钟才有数)。
 
+## pdg 报「缺少拆出去的一段」
+- pdg.sh 的一部分拆到了 `/opt/pdg-bot/pdg-<段>.sh`。缺了它(被删、是空文件、读不了), pdg 的**所有**子命令都会在开头停下,
+  包括 `pdg update`、`pdg rollback`; 覆盖重装也要先跑 `pdg snapshot`, 同样走不通。
+- 按提示里那条命令从受管仓库补回来, 例如: `sudo install -m644 /opt/privdns-gateway/lib/pdg/adblock.sh /opt/pdg-bot/pdg-adblock.sh`。
+- 补完跑 `sudo pdg doctor`, 看「安装清单」那一项: 受管仓库与现役 CLI 不是同一版时它会报不一致, 那时再 `sudo pdg update` 或回滚。
+- 只把 `pdg.sh` 一个文件拷到别处运行不再支持(它认不出配套的段在哪, 会直接拒绝)。
+
 ## 改坏了想退回
 - `sudo pdg rollback`(默认回最近一次快照;`pdg snapshot` 可手动留底)。`pdg update` 失败会自动回滚。
 

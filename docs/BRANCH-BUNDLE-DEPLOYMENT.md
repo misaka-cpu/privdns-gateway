@@ -40,13 +40,18 @@ git bundle create <file>.bundle <commit-sha>
 **整棵树**同步到 `/opt/privdns-gateway`，不是只传几个改动过的文件。
 只传部分文件装出来的是一台半新半旧的机器，之后任何排查都不可信。
 
-### 5. 再从该目标 commit 安装 CLI
+### 5. 再从该目标 commit 安装 CLI（连同它拆出去的段）
 
 ```bash
 install -m755 <REPO_DIR>/deploy/bot/pdg.sh /usr/local/bin/pdg
+for p in <REPO_DIR>/lib/pdg/*.sh; do install -m644 "$p" "/opt/pdg-bot/pdg-$(basename "$p")"; done
 ```
 
 CLI 必须来自同一个 commit，否则接下来跑的迁移是"旧脚本读新仓库"。
+
+pdg.sh 已经把一部分拆到 `lib/pdg/<段>.sh`，装成 `/opt/pdg-bot/pdg-<段>.sh`。已安装的 CLI 启动时要读它们，
+缺了就拒绝运行，第 6 步根本跑不起来。这几个段只给 CLI 自己用，不属于任何服务，先装上它们不会让第 7 步
+"模块内容是否变化"的判断失准；第 8 步禁的是提前装**全部**运行模块。
 
 ### 6. 直接运行 pdg __migrate
 
