@@ -23,8 +23,8 @@ bad(){ echo "[FAIL] $1"; FAIL=$((FAIL+1)); }
 # 两个函数都要抽: migrate_deploy_botfiles 靠 _pdg_modules_digest 判断"有没有真的换过文件",
 # 只抽前者的话后者是 command not found, 前后摘要都成空串 → 判成"没变" → 永远不重启,
 # 那样这支测试会红得莫名其妙(第一版就是这么红的)。
-FN="$(awk '/^_pdg_modules_digest\(\)\{/,/^\}/' "$ROOT/deploy/bot/pdg.sh")
-$(awk '/^migrate_deploy_botfiles\(\)\{/,/^\}/' "$ROOT/deploy/bot/pdg.sh")"
+FN="$(awk '/^_pdg_modules_digest\(\)\{/,/^\}/' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")")
+$(awk '/^migrate_deploy_botfiles\(\)\{/,/^\}/' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")")"
 { [[ -n "$FN" ]] && grep -q "_pdg_modules_digest()" <<<"$FN"; } \
   && ok "抽到了 migrate_deploy_botfiles 与 _pdg_modules_digest($(grep -c . <<<"$FN") 行)" \
   || { bad "抽不到 —— 判据无从谈起"; echo "通过 $PASS, 失败 $FAIL"; exit 1; }

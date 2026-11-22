@@ -9,7 +9,9 @@ import tarfile
 import tempfile
 
 root = Path(__file__).resolve().parents[1]
-source = (root / 'deploy/bot/pdg.sh').read_text()
+import sys as _pdg_sys; _pdg_sys.path.insert(0, str(root) + "/tests")  # noqa: E702
+import pdg_source  # noqa: E402  共享 pdg.sh 源码入口(建议 4 第 0 步; 拆分后给出拼回的整份)
+source = pdg_source.path(root).read_text()
 helper = re.search(r'^_pdg_witness_absence\(\)\{\n.*?^\}\n', source, re.M | re.S).group()
 stub = r'''#!/usr/bin/python3
 import json, os, pathlib, sys

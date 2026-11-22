@@ -17,6 +17,8 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+import sys as _pdg_sys; _pdg_sys.path.insert(0, str(ROOT) + "/tests")  # noqa: E702
+import pdg_source  # noqa: E402  共享 pdg.sh 源码入口(建议 4 第 0 步; 拆分后给出拼回的整份)
 sys.path.insert(0, HERE)
 from txbox import Box, load_tx  # noqa: E402
 
@@ -576,7 +578,7 @@ box.clean()
 import re as _re  # noqa: E402
 import tmpguard  # noqa: E402
 
-PDG = os.path.join(ROOT, "deploy/bot/pdg.sh")
+PDG = pdg_source.path(ROOT)
 _src = open(PDG, encoding="utf-8").read()
 _body = _re.search(r"^migrate_cidr_single_source\(\)\{.*?^\}", _src, _re.S | _re.M).group(0)
 

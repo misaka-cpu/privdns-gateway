@@ -28,7 +28,9 @@ from pathlib import Path
 import tmpguard
 
 ROOT = Path(__file__).resolve().parents[1]
-PDG = (ROOT / "deploy" / "bot" / "pdg.sh").read_text(encoding="utf-8")
+import sys as _pdg_sys; _pdg_sys.path.insert(0, str(ROOT) + "/tests")  # noqa: E702
+import pdg_source  # noqa: E402  共享 pdg.sh 源码入口(建议 4 第 0 步; 拆分后给出拼回的整份)
+PDG = (pdg_source.path(ROOT)).read_text(encoding="utf-8")
 
 PASS = [0]
 FAIL = [0]
@@ -141,15 +143,15 @@ for fn in _ios_offer_download _ios_offer_teardown _ios_offer_abort _ios_offer_nf
           _nft_apply_main _lan_nft_reapply \
           _ios_offer_proc_state _ios_offer_stop_pid _ios_offer_list _ios_offer_gen_run \
           _ios_offer_stop_child _ios_offer_proc_dead; do
-  sed -n "/^$fn()/,/^}/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
+  sed -n "/^$fn()/,/^}/p" "$(bash tests/pdg-source-lib.sh path .)" >> "$CH_DIR/fn.sh"
 done
 # 常量也要跟着抽: `set -u` 下漏一个就是 unbound variable, 而那会让收尾在半途死掉 ——
 # 表现与"产品没撤规则"一模一样(HANDOFF §10.7)。
-grep -E '^(LAN_NFT_CONF|IOS_OFFER_MARK|IOS_OFFER_LOCK|IOS_OFFER_STATE|IOS_OFFER_ROOT|IOS_OFFER_SENTINEL|IOS_OFFER_PIDFILE|IOS_OFFER_GENFILE)=' deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
+grep -E '^(LAN_NFT_CONF|IOS_OFFER_MARK|IOS_OFFER_LOCK|IOS_OFFER_STATE|IOS_OFFER_ROOT|IOS_OFFER_SENTINEL|IOS_OFFER_PIDFILE|IOS_OFFER_GENFILE)=' "$(bash tests/pdg-source-lib.sh path .)" >> "$CH_DIR/fn.sh"
 # IOS_OFFER_PROBE 是**多行**单引号常量, `grep '^…='` 只会抓到第一行 —— 那样 set -u 下
 # 就绪判据当场炸掉, 现场看起来像"服务永远不就绪"。按范围抽。
-sed -n "/^IOS_OFFER_PROBE='/,/^'$/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
-sed -n "/^IOS_OFFER_SERVER='/,/^'$/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
+sed -n "/^IOS_OFFER_PROBE='/,/^'$/p" "$(bash tests/pdg-source-lib.sh path .)" >> "$CH_DIR/fn.sh"
+sed -n "/^IOS_OFFER_SERVER='/,/^'$/p" "$(bash tests/pdg-source-lib.sh path .)" >> "$CH_DIR/fn.sh"
 grep -q "^IOS_OFFER_PROBE=" "$CH_DIR/fn.sh" || { echo "EXTRACT-MISSING:IOS_OFFER_PROBE"; exit 9; }
 grep -q 'IOS_OFFER_SERVER=' "$CH_DIR/fn.sh" || { echo "EXTRACT-FAIL-server"; exit 9; }
 # 抽取自证: 函数**和常量**都要查。只查函数的话, 漏抽一个 IOS_OFFER_* 常量会变成 set -u 的

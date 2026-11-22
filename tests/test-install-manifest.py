@@ -17,6 +17,8 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+import sys as _pdg_sys; _pdg_sys.path.insert(0, str(ROOT) + "/tests")  # noqa: E702
+import pdg_source  # noqa: E402  共享 pdg.sh 源码入口(建议 4 第 0 步; 拆分后给出拼回的整份)
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(ROOT, "deploy", "bot"))
 import tmpguard        # noqa: E402
@@ -119,7 +121,7 @@ watched = ("/usr/local/bin/", "/etc/systemd/system/", "/etc/letsencrypt/renewal-
 missed = [s for s, (d, _m) in INST.items() if d.startswith(watched) and s not in EXTRA_SRC]
 check(not missed, "install.sh 往 /usr/local/bin、systemd、证书钩子目录照原样装的文件都登记了",
       "install.sh 装了却没进清单: %s" % missed)
-pdg = read("deploy/bot/pdg.sh")
+pdg = pdg_source.text(ROOT)
 m = re.search(r"^cmd_update\(\)\{\n(.*?)^\}\n", pdg, re.S | re.M)
 upd = install_lines(m.group(1)) if m else {}
 check(len(upd) >= 4, "cmd_update 里抽到了 %d 条安装行" % len(upd), "cmd_update 的安装行抽不到(抽法坏了)")

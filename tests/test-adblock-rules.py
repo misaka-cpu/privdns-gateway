@@ -21,6 +21,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import tmpguard          # noqa: E402 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = Path(__file__).resolve().parents[1]
+import sys as _pdg_sys; _pdg_sys.path.insert(0, str(ROOT) + "/tests")  # noqa: E702
+import pdg_source  # noqa: E402  共享 pdg.sh 源码入口(建议 4 第 0 步; 拆分后给出拼回的整份)
 MOD = ROOT / "deploy/bot/adblock.py"
 
 PASS, FAIL = [0], []
@@ -223,7 +225,7 @@ if A:
 # 第三方表是**可再生**的(随时能重下), 而全局快照只保留最近 10 份 —— 把一张几 MiB 的表
 # 塞进去, 十份轮转就是几十 MiB, 而且回滚回一份旧广告表毫无意义。
 # 用户自己写的 allow/block 是另一回事: 它们在 /etc/mosdns/rules/ 下, 本来就在快照里。
-pdgsh = (ROOT / "deploy/bot/pdg.sh").read_text(encoding="utf-8")
+pdgsh = (pdg_source.path(ROOT)).read_text(encoding="utf-8")
 import re as _re
 m = _re.search(r"local cand=\((.*?)\)\n", pdgsh, _re.S)
 if not m:

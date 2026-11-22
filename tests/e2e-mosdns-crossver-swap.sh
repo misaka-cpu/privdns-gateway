@@ -278,7 +278,7 @@ fi
 out6b="$(PDG_CORE_BINDIR="$XV_BINDIR" bash -c '
   c_g(){ echo "$*"; }; c_y(){ echo "$*"; }
   systemctl(){ case "$1" in reset-failed) echo "Unit not loaded." >&2; return 1;; restart) return 1;; esac; return 0; }
-  '"$(sed -n '/^_core_restart_clean(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh")"'
+  '"$(sed -n '/^_core_restart_clean(){/,/^}/p' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")")"'
   _core_restart_clean mosdns' 2>&1)"; rc6b=$?
 [[ "$rc6b" != 0 ]] && ok "6b: systemd 拒绝 start → _core_restart_clean 返回非零" || bad "6b: 拒绝了却返回 0"
 grep -q 'reset-failed' <<<"$out6b" \

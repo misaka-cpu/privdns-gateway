@@ -19,6 +19,8 @@ import sys
 import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+import sys as _pdg_sys; _pdg_sys.path.insert(0, str(ROOT) + "/tests")  # noqa: E702
+import pdg_source  # noqa: E402  共享 pdg.sh 源码入口(建议 4 第 0 步; 拆分后给出拼回的整份)
 PASS = [0]
 FAIL = [0]
 
@@ -77,7 +79,7 @@ def closure(entries):
 
 # 真实入口: 救援服务本体 + 另两个可执行入口 + pdg.sh 用 _pdg_module 拉起来的模块
 CLI_REFS = set(re.findall(r"_pdg_module ([a-z_0-9]+)\.py",
-                          open(os.path.join(ROOT, "deploy/bot/pdg.sh"), encoding="utf-8").read()))
+                          open(pdg_source.path(ROOT), encoding="utf-8").read()))
 ENTRIES = sorted({"rescue", "breakglass", "rescue_cred"} | (CLI_REFS & set(LOCAL)))
 NEED = closure(ENTRIES)
 
@@ -185,7 +187,7 @@ else:
 print()
 print("── 2. 装机与升级共用同一份清单 ──")
 inst = open(os.path.join(ROOT, "install.sh"), encoding="utf-8").read()
-pdg = open(os.path.join(ROOT, "deploy/bot/pdg.sh"), encoding="utf-8").read()
+pdg = open(pdg_source.path(ROOT), encoding="utf-8").read()
 if "pdg_install_runtime_modules" in inst and "lib/modules.sh" in inst:
     ok("install.sh 走真源")
 else:

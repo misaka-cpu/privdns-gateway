@@ -27,8 +27,10 @@ import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+import sys as _pdg_sys; _pdg_sys.path.insert(0, str(ROOT) + "/tests")  # noqa: E702
+import pdg_source  # noqa: E402  共享 pdg.sh 源码入口(建议 4 第 0 步; 拆分后给出拼回的整份)
 BOTDIR = os.path.join(ROOT, "deploy/bot")
-PDG = os.path.join(BOTDIR, "pdg.sh")
+PDG = pdg_source.path(ROOT)
 TMPL = os.path.join(ROOT, "deploy/ios/pdg-dot-ondemand.mobileconfig.tmpl")
 SUB = "var/lib/privdns-gateway/ios-profile"
 

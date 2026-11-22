@@ -327,7 +327,7 @@ snap_meta = open(b.meta, "rb").read()
 # CLI snapshot 的候选路径白名单
 cand = subprocess.run(
     ["bash", "-c",
-     r"""sed -n '/^cmd_snapshot()/,/^}/p' deploy/bot/pdg.sh """
+     r"""sed -n '/^cmd_snapshot()/,/^}/p' "$(bash tests/pdg-source-lib.sh path .)" """
      r"""| sed -n '/local cand=(/,/)$/p' | tr -d '\\' | tr ' ' '\n' """
      r"""| sed 's/local cand=(//;s/)$//' | grep -v '^$'"""],
     capture_output=True, text=True, cwd=ROOT, timeout=120).stdout.split()

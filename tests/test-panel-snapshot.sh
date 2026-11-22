@@ -15,16 +15,16 @@ pass=0; nfail=0
 ok(){ echo "[OK]   $1"; pass=$((pass+1)); }
 bad(){ echo "[FAIL] $1"; nfail=$((nfail+1)); }
 
-eval "$(sed -n '/^_sb_panel_managed_on(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh")"
-eval "$(sed -n '/^_pdg_mktemp_dir(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh")"
-eval "$(sed -n '/^_sb_write_sanitized(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh")"
-eval "$(sed -n '/^_sb_sanitize_panel(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh")"
-eval "$(sed -n '/^_pdg_apply_snapshot_tree(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh")"
+eval "$(sed -n '/^_sb_panel_managed_on(){/,/^}/p' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")")"
+eval "$(sed -n '/^_pdg_mktemp_dir(){/,/^}/p' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")")"
+eval "$(sed -n '/^_sb_write_sanitized(){/,/^}/p' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")")"
+eval "$(sed -n '/^_sb_sanitize_panel(){/,/^}/p' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")")"
+eval "$(sed -n '/^_pdg_apply_snapshot_tree(){/,/^}/p' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")")"
 # 落盘要先给 iOS 生命周期拍完整底片, 那套 helper 全在 pdg.sh 里。按前缀自动抽 —— 写死
 # 名字的话, 生产那边多加一个 helper 就变成 "command not found" 的假红(已经发生过两次)。
-eval "$(sed -n '/^_PDG_IOS_[A-Z_]*=/p' "$ROOT/deploy/bot/pdg.sh")"
-for _f in $(grep -oE '^_pdg_ios_[a-z_]+\(\)' "$ROOT/deploy/bot/pdg.sh" | tr -d '()'); do
-  eval "$(sed -n "/^$_f(){/,/^}/p" "$ROOT/deploy/bot/pdg.sh")"
+eval "$(sed -n '/^_PDG_IOS_[A-Z_]*=/p' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")")"
+for _f in $(grep -oE '^_pdg_ios_[a-z_]+\(\)' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" | tr -d '()'); do
+  eval "$(sed -n "/^$_f(){/,/^}/p" "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")")"
 done
 
 SECRET="SEKRET_LEAK_zzz"

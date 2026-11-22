@@ -16,7 +16,7 @@ pass=0; nfail=0
 ok(){ echo "[OK]   $1"; pass=$((pass+1)); }
 bad(){ echo "[FAIL] $1"; nfail=$((nfail+1)); }
 
-xt(){ sed -n "/^$1(){/,/^}/p" "$ROOT/deploy/bot/pdg.sh"; }
+xt(){ sed -n "/^$1(){/,/^}/p" "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")"; }
 eval "$(xt _core_bindir)"; eval "$(xt _core_config_check)"; eval "$(xt _core_kernel_stable)"
 eval "$(xt _core_listeners)"
 eval "$(xt _pdg_sha)"; eval "$(xt _core_stash_kernel)"; eval "$(xt _core_restore_prev)"; eval "$(xt _core_swap_verify)"; eval "$(xt _pdg_apply_snapshot_tree)"
@@ -24,9 +24,9 @@ eval "$(xt _pdg_mktemp_dir)"
 eval "$(xt _core_restart_clean)"   # 换核/回滚重启前清 failed 与启动限速计数
 # 落盘要先给 iOS 生命周期拍完整底片, 那套 helper 全在 pdg.sh 里。按前缀自动抽 —— 写死
 # 名字的话, 生产那边多加一个 helper 就变成 "command not found" 的假红(已经发生过两次)。
-eval "$(sed -n '/^_PDG_IOS_[A-Z_]*=/p' "$ROOT/deploy/bot/pdg.sh")"
-for _f in $(grep -oE '^_pdg_ios_[a-z_]+\(\)' "$ROOT/deploy/bot/pdg.sh" | tr -d '()'); do
-  eval "$(sed -n "/^$_f(){/,/^}/p" "$ROOT/deploy/bot/pdg.sh")"
+eval "$(sed -n '/^_PDG_IOS_[A-Z_]*=/p' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")")"
+for _f in $(grep -oE '^_pdg_ios_[a-z_]+\(\)' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" | tr -d '()'); do
+  eval "$(sed -n "/^$_f(){/,/^}/p" "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")")"
 done
 
 c_g(){ echo "$*"; }; c_y(){ echo "$*"; }
@@ -142,7 +142,7 @@ for svc in mihomo mosdns; do
 done
 
 # ── D. 快照含内核二进制, 且回滚能按内容还原(网络无关) ──
-grep -q 'usr/local/bin/mosdns usr/local/bin/mihomo usr/local/bin/sing-box' "$ROOT/deploy/bot/pdg.sh" \
+grep -q 'usr/local/bin/mosdns usr/local/bin/mihomo usr/local/bin/sing-box' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" \
   && ok "cmd_snapshot cand 已含 mosdns + 两内核二进制(回滚不依赖联网重下)" || bad "D1: 快照 cand 缺二进制"
 
 TREE="$WORK/tree"; DEST="$WORK/dest"; mkdir -p "$TREE/usr/local/bin" "$DEST"

@@ -31,6 +31,8 @@ from pathlib import Path
 import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = Path(__file__).resolve().parents[1]
+import sys as _pdg_sys; _pdg_sys.path.insert(0, str(ROOT) + "/tests")  # noqa: E702
+import pdg_source  # noqa: E402  共享 pdg.sh 源码入口(建议 4 第 0 步; 拆分后给出拼回的整份)
 BOT = ROOT / "deploy" / "bot"
 
 PASS = [0]
@@ -138,7 +140,7 @@ for f in ("mitm_server.py", "mitm_wloc.py"):
     # "卸载干净了吗"没有确定答案。项目已有 PDG_LEGACY_MODULES 就是干这个的。
     chk(f in legacy_blk, "PDG_LEGACY_MODULES 仍收走老机器上的 %s" % f)
 
-pdgsh = text_of(BOT / "pdg.sh")
+pdgsh = text_of(pdg_source.path(ROOT))
 inst = re.findall(r'"deploy/bot/(mitm_server|mitm_wloc)\.py\|', pdgsh)
 chk(not inst, "pdg.sh 的安装清单不再部署 MITM 宿主与插件(实得 %s)" % (inst or "0 条"))
 

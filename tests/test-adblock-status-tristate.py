@@ -31,6 +31,8 @@ import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+import sys as _pdg_sys; _pdg_sys.path.insert(0, str(ROOT) + "/tests")  # noqa: E702
+import pdg_source  # noqa: E402  共享 pdg.sh 源码入口(建议 4 第 0 步; 拆分后给出拼回的整份)
 sys.path.insert(0, os.path.join(ROOT, "tests"))
 import tmpguard                                              # noqa: E402
 
@@ -47,7 +49,7 @@ def bad(m):
     print("[FAIL] %s" % m)
 
 
-PDGSH = os.path.join(ROOT, "deploy/bot/pdg.sh")
+PDGSH = pdg_source.path(ROOT)
 SRC = open(PDGSH, encoding="utf-8").read()
 W = tmpguard.mkdtemp(prefix="pdg-adbtri.")
 

@@ -136,7 +136,7 @@ run_uninstall --purge >/dev/null
 # 再抽出被测的清理函数 —— 它认 PDG_ROOT_PREFIX, 沙箱路径无需改写。
 { echo ". '$ROOT/lib/singbox.sh'"
   echo '_pdg_singbox_is_ours(){ pdg_singbox_is_ours "$@"; }'
-  sed -n '/^_pdg_drop_singbox_files(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh"
+  sed -n '/^_pdg_drop_singbox_files(){/,/^}/p' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")"
 } > "$WORK/fn.sh"
 grep -q '^_pdg_drop_singbox_files(){' "$WORK/fn.sh" || { echo "抽取 _pdg_drop_singbox_files 失败"; exit 1; }
 mk thirdparty; before="$(snap)"

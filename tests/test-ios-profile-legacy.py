@@ -24,6 +24,8 @@ import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+import sys as _pdg_sys; _pdg_sys.path.insert(0, str(ROOT) + "/tests")  # noqa: E702
+import pdg_source  # noqa: E402  共享 pdg.sh 源码入口(建议 4 第 0 步; 拆分后给出拼回的整份)
 TMPL = os.path.join(ROOT, "deploy/ios/pdg-dot-ondemand.mobileconfig.tmpl")
 
 PASS = [0]
@@ -206,7 +208,7 @@ else:
 # 之后这两条断言翻转了(收敛本身由 test-ios-profile-shared.py 逐字节验证)。临时下载通道
 # 曾经**内联在 cmd_ios 里**, 也是 CLI 独有的一份; 现在它被抽成 _ios_offer_download, 由
 # 「生成当前版」和「取回上一版」共用 —— 后者以前只把文件写到服务器上, 手机拿不到。
-pdg_sh = open(os.path.join(ROOT, "deploy/bot/pdg.sh"), encoding="utf-8").read()
+pdg_sh = open(pdg_source.path(ROOT), encoding="utf-8").read()
 m = re.search(r"^cmd_ios\(\)\{.*?^\}", pdg_sh, re.S | re.M)
 cli = m.group(0) if m else ""
 m = re.search(r"^_ios_offer_download\(\)\{.*?^\}", pdg_sh, re.S | re.M)

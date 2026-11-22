@@ -16,7 +16,7 @@ bad(){ printf '[FAIL] %s\n' "$1"; F=$((F+1)); }
 note(){ printf '[NOTE] %s\n' "$1"; }
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PDG="${PDG_SH:-$HERE/../deploy/bot/pdg.sh}"
+PDG="${PDG_SH:-$(bash "$HERE/pdg-source-lib.sh" path "$HERE/..")}"
 CHECKS="$HERE/../deploy/bot/checks.py"
 [[ -f "$PDG" ]] || { echo "[未执行] 找不到 $PDG"; exit 1; }
 BOX="$(mktemp -d "${TMPDIR:-/tmp}/pdg-hint.XXXXXX")" || exit 1

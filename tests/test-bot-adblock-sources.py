@@ -24,6 +24,8 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+import sys as _pdg_sys; _pdg_sys.path.insert(0, str(ROOT) + "/tests")  # noqa: E702
+import pdg_source  # noqa: E402  共享 pdg.sh 源码入口(建议 4 第 0 步; 拆分后给出拼回的整份)
 sys.path.insert(0, str(ROOT / "tests"))
 import tmpguard          # noqa: E402
 PASS, FAIL = [0], [0]
@@ -263,7 +265,7 @@ os.makedirs(os.path.join(_W, "etc/privdns-gateway"), exist_ok=True)
 open(os.path.join(_W, "etc/privdns-gateway/adblock-sources.txt"), "w",
      encoding="utf-8").write("https://real.example.com/l.txt\n")
 _closure = os.path.join(_W, "c.sh")
-_pdgsh = str(ROOT / "deploy/bot/pdg.sh")
+_pdgsh = str(pdg_source.path(ROOT))
 with open(_closure, "w", encoding="utf-8") as f:
     f.write("set -uo pipefail\n")
     for fn in ("c_g", "c_y", "_pdg_module", "cmd_adblock"):

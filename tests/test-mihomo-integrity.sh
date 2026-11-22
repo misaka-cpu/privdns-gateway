@@ -26,7 +26,7 @@ command -v git >/dev/null 2>&1 || { echo "[SKIP] 无 git"; exit 0; }
 source "$ROOT/tests/repoguard.sh"
 
 xtv(){ sed -n "/^$1(){/,/^}/p" "$ROOT/lib/versions.sh"; }
-xtp(){ sed -n "/^$1(){/,/^}/p" "$ROOT/deploy/bot/pdg.sh"; }
+xtp(){ sed -n "/^$1(){/,/^}/p" "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")"; }
 PIN_VER="$(grep -oE 'MIHOMO_VER="[^"]+"' "$ROOT/lib/versions.sh" | cut -d'"' -f2)"
 
 echo "══ 1. lib/versions.sh 钉了**解压后二进制**的摘要 ══"
@@ -141,7 +141,7 @@ cnt(){ sed 's/#.*//' "$1" | grep -c "$2" || true; }   # 去注释后的命中数
 [[ "$(cnt "$ROOT/install.sh" 'pdg_mihomo_is_version')" == 0 ]] \
   && ok "install.sh 的跳过判据已换成内容级判据" \
   || bad "install.sh 仍用 pdg_mihomo_is_version 决定跳过下载(只比自报版本)"
-[[ "$(cnt "$ROOT/deploy/bot/pdg.sh" 'pdg_mihomo_is_version')" == 0 ]] \
+[[ "$(cnt "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" 'pdg_mihomo_is_version')" == 0 ]] \
   && ok "_update_core_binary 的跳过判据已换成内容级判据" \
   || bad "_update_core_binary 仍用 pdg_mihomo_is_version 决定跳过换核"
 [[ "$(cnt "$ROOT/install.sh" 'mihomo-bin-')" != 0 ]] \
@@ -151,9 +151,9 @@ echo
 echo "══ 4. 顶层「已是最新」短路不得堵死修复路径 ══"
 # 现场: 仓库精确在最新 tag、工作树干净、已装项目文件逐个一致, 但内核二进制内容漂移。
 # 这一格必须跑**完整 cmd_update**, 只测 helper 证明不了短路会不会先答话。
-sed -n '/^cmd_update(){/,/^}/p'               "$ROOT/deploy/bot/pdg.sh" >  "$WORK/upd.sh"
+sed -n '/^cmd_update(){/,/^}/p'               "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" >  "$WORK/upd.sh"
 for f in _update_release_relation _update_in_sync _pdg_same_file _core_bindir _update_mosdns_preflight; do
-  sed -n "/^$f(){/,/^}/p" "$ROOT/deploy/bot/pdg.sh" >> "$WORK/upd.sh"
+  sed -n "/^$f(){/,/^}/p" "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" >> "$WORK/upd.sh"
 done
 RT="$WORK/rt"; REPO="$WORK/repo"; mkdir -p "$RT" "$REPO/lib" "$REPO/deploy/bot" "$REPO/deploy/cert"
 cp "$ROOT/lib/versions.sh" "$REPO/lib/versions.sh"

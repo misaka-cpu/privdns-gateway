@@ -19,7 +19,9 @@ import re
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PDG = os.path.join(ROOT, "deploy", "bot", "pdg.sh")
+import sys as _pdg_sys; _pdg_sys.path.insert(0, str(ROOT) + "/tests")  # noqa: E702
+import pdg_source  # noqa: E402  共享 pdg.sh 源码入口(建议 4 第 0 步; 拆分后给出拼回的整份)
+PDG = pdg_source.path(ROOT)
 
 npass = nfail = 0
 

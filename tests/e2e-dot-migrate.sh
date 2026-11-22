@@ -77,9 +77,9 @@ fi
 export REPO_DIR="$E2E_ROOT"
 c_g(){ echo "$@"; }
 c_y(){ echo "$@"; }
-_fn="$(python3 - "$E2E_ROOT" <<'PY'
+_fn="$(python3 - "$(bash "$E2E_ROOT/tests/pdg-source-lib.sh" path "$E2E_ROOT")" <<'PY'
 import sys
-s = open(sys.argv[1] + "/deploy/bot/pdg.sh").read()
+s = open(sys.argv[1]).read()
 a = s.index("# ── 6.2B: DoT 证据端(observer)的生命周期状态机")
 b = s.index("migrate_probe81_public(){")
 sys.stdout.write(s[a:b])

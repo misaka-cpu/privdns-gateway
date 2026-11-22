@@ -120,7 +120,7 @@ render_and_migrate(){   # $1=tag  $2=盒子目录 ; 回显一行结果码
   # 跑当前版本的改写逻辑
   cp "$ROOT/deploy/mosdns/config.yaml" "$B/repo/tmpl.yaml"
   sed -i "s|/etc/mosdns/rules/|$B/etc/mosdns/rules/|g; s|/var/lib/privdns-gateway/adblock/|$B/var/adblock/|g" "$B/repo/tmpl.yaml"
-  sed -n "/^migrate_adblock()/,/^}/p" "$ROOT/deploy/bot/pdg.sh" \
+  sed -n "/^migrate_adblock()/,/^}/p" "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" \
     | sed -n "/<<'PYEOF'/,/^PYEOF/p" | sed '1d;$d' > "$B/rewrite.py"
   [[ -s "$B/rewrite.py" ]] || { echo "NO-REWRITE"; return; }
   if ! python3 "$B/rewrite.py" "$B/live.yaml" "$B/repo/tmpl.yaml" "$B/cand.yaml" 2>"$B/err.txt"; then

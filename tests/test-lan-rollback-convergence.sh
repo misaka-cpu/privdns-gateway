@@ -19,7 +19,7 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-export LAN_FX_SRC="$ROOT/deploy/bot/pdg.sh"
+LAN_FX_SRC="$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")"; export LAN_FX_SRC
 # shellcheck source=tests/lan-fixture.sh
 source "$ROOT/tests/lan-fixture.sh"
 

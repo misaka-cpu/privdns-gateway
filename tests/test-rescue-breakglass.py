@@ -28,6 +28,8 @@ import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+import sys as _pdg_sys; _pdg_sys.path.insert(0, str(ROOT) + "/tests")  # noqa: E702
+import pdg_source  # noqa: E402  共享 pdg.sh 源码入口(建议 4 第 0 步; 拆分后给出拼回的整份)
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(ROOT, "deploy", "bot"))
 sys.path.insert(0, os.path.join(ROOT, "deploy", "rescue"))
@@ -505,7 +507,7 @@ box5.clean()
 # ── 1h. 普通 CLI 不带保护模式时历史行为不变 ──────────────────────────────
 import subprocess as _sp  # noqa: E402
 
-_pdg_src = open(os.path.join(ROOT, "deploy/bot/pdg.sh"), encoding="utf-8").read()
+_pdg_src = open(pdg_source.path(ROOT), encoding="utf-8").read()
 # 锚在**意图**上(开关存在 + 默认 0), 不锚整行 local 声明: 那一行是 cmd_rollback 的全部
 # 局部变量, 任何无关的新局部变量都会让这条断言断掉 —— 断的是判据的写法, 不是产品的语义。
 _preserve_default = re.search(r"^\s*local\s+.*\bpreserve=0\b", _pdg_src, re.M)

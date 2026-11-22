@@ -15,6 +15,8 @@ from pathlib import Path
 import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = Path(__file__).resolve().parents[1]
+import sys as _pdg_sys; _pdg_sys.path.insert(0, str(ROOT) + "/tests")  # noqa: E702
+import pdg_source  # noqa: E402  共享 pdg.sh 源码入口(建议 4 第 0 步; 拆分后给出拼回的整份)
 sys.path.insert(0, str(ROOT / "deploy" / "bot"))
 spec = u.spec_from_file_location("pdg_bot", ROOT / "deploy/bot/pdg-bot.py")
 bot = u.module_from_spec(spec); spec.loader.exec_module(bot)
@@ -114,7 +116,7 @@ def main():
         bad("Python 侧 _profile_set 还在(它没有生产调用点, 是死代码)")
     else:
         ok("Python 侧 _profile_set 已删除(生产写 profile.env 只走 _profile_text_with + 事务)")
-    sh_src = (ROOT / "deploy/bot/pdg.sh").read_text(encoding="utf-8")
+    sh_src = (pdg_source.path(ROOT)).read_text(encoding="utf-8")
     if "_profile_set(){" in sh_src and "_profile_set PDG_PLATFORM" in sh_src:
         ok("pdg.sh 里仍在用的 Bash _profile_set 原样保留")
     else:
@@ -123,7 +125,7 @@ def main():
     # ── 跨语言回归: 真跑升级 __migrate 路径的 BASH profile.env 写入(pdg.sh 的 pdg_lowmem_resolve),
     #    证明升级后 PDG_TFO 不丢、_tfo_intent 仍以持久化值为准(无需手动重开) ──
     mem = os.path.join(tmp, "mem512"); open(mem, "w", encoding="utf-8").write("MemTotal: 512000 kB\n")
-    pdg_sh = (ROOT / "deploy" / "bot" / "pdg.sh").read_text(encoding="utf-8")
+    pdg_sh = (pdg_source.path(ROOT)).read_text(encoding="utf-8")
     m = re.search(r"(?sm)^LOWMEM_THRESHOLD_KB=.*?(?=^pdg_fetch_release_tags\(\)\{)", pdg_sh)
     assert m, "抽取 pdg.sh 低内存段失败"
     lowmem_section = m.group(0)

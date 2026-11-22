@@ -47,9 +47,9 @@ grep -q 'rev-parse -q --verify "refs/tags/$want"' "$ROOT/install.sh" \
 grep -q 'git -C "$dir" checkout -q "$tag"' "$ROOT/install.sh" \
   || fail "install.sh must checkout the selected release tag before re-exec"
 
-grep -q 'pdg_fetch_release_tags' "$ROOT/deploy/bot/pdg.sh" \
+grep -q 'pdg_fetch_release_tags' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" \
   || fail "pdg update must share a release-tag fetch helper"
-grep -q 'fetch -q --unshallow --tags origin main' "$ROOT/deploy/bot/pdg.sh" \
+grep -q 'fetch -q --unshallow --tags origin main' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" \
   || fail "pdg update must unshallow old installs before comparing tags"
 
 grep -q '_fetch_release_tags' "$ROOT/deploy/bot/pdg-bot.py" \

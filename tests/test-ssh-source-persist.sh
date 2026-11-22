@@ -61,7 +61,7 @@ ssh_form(){ # 打印配置里 SSH 那条规则的形态
 echo "── 一、对全网开放的形态: 重建后仍是对全网开放 ──"
 render "" "# (SSH 未收紧为 tailnet, 故不放行 Tailscale 直连端口)" "$WORK/a.conf"
 [[ "$(ssh_form "$WORK/a.conf")" == any ]] && ok "夹具就位: 初始为 any" || bad "夹具没造对"
-run_sync "$WORK/a.conf" "$ROOT/deploy/bot/pdg.sh" >/dev/null
+run_sync "$WORK/a.conf" "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" >/dev/null
 [[ "$(ssh_form "$WORK/a.conf")" == any ]] \
   && ok "重建后仍是 any(没把历史默认改掉)" || bad "any 被改成了 $(ssh_form "$WORK/a.conf")"
 
@@ -74,7 +74,7 @@ render 'iifname "tailscale0" ' 'udp dport 41641 accept comment "pdg-tailnet-dire
 # 删掉一行模板注释即可: 内容上无害, 但足以让候选 != 磁盘, 逼出真正的重建路径。
 sed -i '0,/^# 只用独立表 inet pdg/{/^# 只用独立表 inet pdg/d}' "$WORK/b.conf"
 [[ "$(ssh_form "$WORK/b.conf")" == tailnet ]] && ok "夹具就位: 初始为 tailnet 且与模板有差异" || bad "夹具没造对"
-out="$(run_sync "$WORK/b.conf" "$ROOT/deploy/bot/pdg.sh")"
+out="$(run_sync "$WORK/b.conf" "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")")"
 form="$(ssh_form "$WORK/b.conf")"
 if [[ "$form" == tailnet ]]; then
   ok "重建后仍只允许经 tailnet —— 设置活过了 pdg update"
@@ -90,7 +90,7 @@ echo "── 三、形态认不出时必须整体跳过(不猜) ──"
 render "" "# (SSH 未收紧为 tailnet, 故不放行 Tailscale 直连端口)" "$WORK/c.conf"
 sed -i 's/^\([[:space:]]*\)tcp dport { 22 } accept$/\1ip saddr 10.1.2.3 tcp dport { 22 } accept/' "$WORK/c.conf"
 before="$(sha256sum "$WORK/c.conf" | cut -d' ' -f1)"
-out="$(run_sync "$WORK/c.conf" "$ROOT/deploy/bot/pdg.sh")"
+out="$(run_sync "$WORK/c.conf" "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")")"
 { grep -q "CY:.*形态认不出" <<<"$out" \
   && [[ "$(sha256sum "$WORK/c.conf" | cut -d' ' -f1)" == "$before" ]]; } \
   && ok "第三种来源匹配 → 说明原因并跳过, 配置逐字节未动" \
@@ -101,7 +101,7 @@ echo "── 四、两种形态同时存在 → 也要跳过(配置被手改过�
 render "" "# (SSH 未收紧为 tailnet, 故不放行 Tailscale 直连端口)" "$WORK/d.conf"
 sed -i 's|^\([[:space:]]*\)tcp dport { 22 } accept$|\1tcp dport { 22 } accept\n\1iifname "tailscale0" tcp dport { 22 } accept|' "$WORK/d.conf"
 before="$(sha256sum "$WORK/d.conf" | cut -d' ' -f1)"
-out="$(run_sync "$WORK/d.conf" "$ROOT/deploy/bot/pdg.sh")"
+out="$(run_sync "$WORK/d.conf" "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")")"
 { grep -q "CY:.*命中多条" <<<"$out" \
   && [[ "$(sha256sum "$WORK/d.conf" | cut -d' ' -f1)" == "$before" ]]; } \
   && ok "两条并存 → 说明原因并跳过(不替用户挑一条)" \
@@ -111,8 +111,8 @@ echo
 echo "── 五、反向对照: 去掉 __SSH_MATCH__ 支持, 第二格必须转红 ──"
 # 反向补丁在**当前源码**上做, 不从 git 历史取 —— 锚在历史上的负控一提交就会静默失效。
 OLDSH="$WORK/pdg-old.sh"
-sed -e 's|^\([[:space:]]*\)-e "s|__SSH_MATCH__|\$sshm|g" \\\\$||' "$ROOT/deploy/bot/pdg.sh" > "$OLDSH" 2>/dev/null
-python3 - "$ROOT/deploy/bot/pdg.sh" "$OLDSH" <<'PY'
+sed -e 's|^\([[:space:]]*\)-e "s|__SSH_MATCH__|\$sshm|g" \\\\$||' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" > "$OLDSH" 2>/dev/null
+python3 - "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" "$OLDSH" <<'PY'
 import io, sys
 s = io.open(sys.argv[1], encoding="utf-8").read()
 # 把渲染时的 __SSH_MATCH__ 替换整行删掉 = 回到"模板里那个占位符永远留在原地"的状态,
@@ -150,8 +150,8 @@ sr(){ # $1=模式 $2=输入 $3=输出
   # 这里以前把 _SSH_TS_ACCEPT **假造成一个常量**。端口改成从 /etc/default/tailscaled 派生
   # 之后, 那个假常量就成了"测试自己造的现实" —— 真函数换了实现, 这支照样绿。引真的三个函数。
   { sed -n '/^_ssh_ts_probe(){/,/^}/p;/^_ssh_ts_port(){/,/^}/p;/^_ssh_ts_accept(){/,/^}/p' \
-        "$ROOT/deploy/bot/pdg.sh"
-    sed -n '/^_ssh_source_rewrite(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh"
+        "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")"
+    sed -n '/^_ssh_source_rewrite(){/,/^}/p' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")"
     echo "_ssh_source_rewrite '$1' '$2' '$3'"
   } > "$WORK/sr.sh"
   # 沙箱里没有 /etc/default/tailscaled → 派生回退到官方默认 41641, 与这支原本的期望一致。
@@ -180,7 +180,7 @@ sr any "$WORK/g1.conf" "$WORK/g2.conf"
 
 # 前置判据: 没有经 tailnet 的 SSH 会话时必须拒绝
 gate(){ { echo 'ss(){ :; }; tailscale(){ :; }'
-          sed -n '/^_ssh_via_tailnet(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh"
+          sed -n '/^_ssh_via_tailnet(){/,/^}/p' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")"
           echo 'if _ssh_via_tailnet; then echo YES; else echo NO; fi'; } > "$WORK/gate.sh"
         bash "$WORK/gate.sh"; }
 [[ "$(gate)" == NO ]] \
@@ -204,7 +204,7 @@ set +o pipefail
 
 for fn in _ssh_source_apply _ssh_via_tailnet; do
   # 先去掉注释再判 —— 那两处的说明文字里正好写着这个坏写法, 不去注释就自己命中自己。
-  body="$(sed -n "/^${fn}(){/,/^}/p" "$ROOT/deploy/bot/pdg.sh" | sed 's/#.*$//')"
+  body="$(sed -n "/^${fn}(){/,/^}/p" "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" | sed 's/#.*$//')"
   [[ -n "$body" ]] || { bad "取不到 $fn 的函数体 —— 判据失效"; continue; }
   if grep -qE '\|[[:space:]]*grep -[a-zA-Z]*q' <<<"$body"; then
     bad "$fn 里又出现了 \`| grep -q\` —— pipefail 下会把命中判成失败"

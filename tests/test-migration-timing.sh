@@ -18,7 +18,7 @@ bad(){ echo "[FAIL] $1"; nfail=$((nfail+1)); }
 
 # ── 1. 分派前不再有隐藏迁移 ──
 # 取 pdg.sh 里"分派段"的真实代码(case 之前到 case 之间), 确认它不再调用 run_all_migrations。
-disp="$(sed -n '/^# 5.1: \*\*取消命令分派前的隐藏迁移/,/^case "\${1:-menu}" in/p' "$ROOT/deploy/bot/pdg.sh")"
+disp="$(sed -n '/^# 5.1: \*\*取消命令分派前的隐藏迁移/,/^case "\${1:-menu}" in/p' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")")"
 [[ -n "$disp" ]] || bad "找不到分派段(pdg.sh 结构变了?)"
 # 只看**可执行行**(注释里会提到这个函数名, 那是说明为什么取消了它)
 grep -vE '^\s*#' <<<"$disp" | grep -q 'run_all_migrations' \
@@ -58,10 +58,10 @@ build(){
     # c_y 照真身打到标准输出(run 把它收进 RUN_OUT), 提示文案才看得见; c_g 仍静默。
     echo 'c_g(){ :; }; c_y(){ printf "%s\n" "$*"; }'
     echo '_tx_audit(){ echo "AUDIT:$3" >> "$WORK/order"; }'
-    sed -n '/^# 5.1: \*\*取消命令分派前的隐藏迁移/,$p' "$ROOT/deploy/bot/pdg.sh" \
+    sed -n '/^# 5.1: \*\*取消命令分派前的隐藏迁移/,$p' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" \
       | grep -v '^cmd_migrate(){' > /dev/null   # 分派段本身在下面整体取
-    sed -n '/^cmd_migrate(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh"
-    sed -n '/^case "\${1:-menu}" in/,/^esac/p' "$ROOT/deploy/bot/pdg.sh"
+    sed -n '/^cmd_migrate(){/,/^}/p' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")"
+    sed -n '/^case "\${1:-menu}" in/,/^esac/p' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")"
   } > "$WORK/disp.sh"
 }
 build

@@ -16,6 +16,8 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+import sys as _pdg_sys; _pdg_sys.path.insert(0, str(ROOT) + "/tests")  # noqa: E702
+import pdg_source  # noqa: E402  共享 pdg.sh 源码入口(建议 4 第 0 步; 拆分后给出拼回的整份)
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(ROOT, "deploy", "bot"))
 import tmpguard        # noqa: E402
@@ -276,7 +278,7 @@ i_d, i_r, i_w = body.find('install -d -m755 "$dest"'), body.find("_pdg_modules_r
 check(body and 0 <= i_d < i_r < i_w, "事前记录排在建目录之后、写第一个文件之前")
 check(re.search(r'_pdg_modules_record "\$repo" "\$dest" "\$plat" \\\n\s+\|\| echo "⚠️ 没记下', body) is not None,
       "记不下来只说一句, 不挡安装")
-pdg = read("deploy/bot/pdg.sh")
+pdg = pdg_source.text(ROOT)
 m = re.search(r"^cmd_rollback\(\)\{\n(.*?)^\}\n", pdg, re.S | re.M)
 rb = m.group(1) if m else ""
 idx = {k: rb.find(v) for k, v in (

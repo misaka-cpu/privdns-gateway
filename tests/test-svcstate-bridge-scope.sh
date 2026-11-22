@@ -11,7 +11,7 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
-PDG="$ROOT/deploy/bot/pdg.sh"
+PDG="$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")"
 BOX="$(mktemp -d)"; trap 'rm -rf "$BOX"' EXIT
 BASE="${PDG_BASELINE:-}"
 # 没显式给基线就从仓库里取冻结基线那一版。取不到(浅克隆 / 对象被裁掉)就如实跳过对比项,

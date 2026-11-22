@@ -16,6 +16,8 @@ from pathlib import Path
 import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = Path(__file__).resolve().parents[1]
+import sys as _pdg_sys; _pdg_sys.path.insert(0, str(ROOT) + "/tests")  # noqa: E702
+import pdg_source  # noqa: E402  共享 pdg.sh 源码入口(建议 4 第 0 步; 拆分后给出拼回的整份)
 sys.path.insert(0, str(ROOT / "deploy" / "bot"))
 spec = importlib.util.spec_from_file_location("pdg_checks", ROOT / "deploy/bot/checks.py")
 checks = importlib.util.module_from_spec(spec)
@@ -122,7 +124,7 @@ def main():
     ok("值带引号/空白/空引号都判得对")
 
     # ── 5. 各处用的是同一个判据(不许再各写一份) ──
-    pdg_sh = (ROOT / "deploy/bot/pdg.sh").read_text(encoding="utf-8")
+    pdg_sh = (pdg_source.path(ROOT)).read_text(encoding="utf-8")
     if "checks.bot_credentials()" not in pdg_sh:
         bad("pdg.sh 没有走 checks.bot_credentials")
     ok("CLI(pdg.sh)取的是 checks.bot_credentials 这一份判据")
@@ -135,7 +137,7 @@ def main():
     # 平台切换的校验门用的就是这个集合; 它必须与 checks.expected_services() 同语义, 否则
     # 没配 bot 的机器会因为"pdg-bot 未稳定运行"而切不了平台。
     import subprocess
-    pdg_sh = str(ROOT / "deploy/bot/pdg.sh")
+    pdg_sh = str(pdg_source.path(ROOT))
     shim = tmpguard.mkdtemp()
     with open(os.path.join(shim, "checks_shim.py"), "w", encoding="utf-8") as f:
         f.write("import sys\nsys.path.insert(0, %r)\nimport checks\n"

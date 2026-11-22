@@ -14,7 +14,7 @@ WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
 pass=0; nfail=0
 ok(){ echo "[OK]   $1"; pass=$((pass+1)); }
 bad(){ echo "[FAIL] $1"; nfail=$((nfail+1)); }
-xt(){ sed -n "/^$1(){/,/^}/p" "$ROOT/deploy/bot/pdg.sh"; }   # 抽取一个函数体
+xt(){ sed -n "/^$1(){/,/^}/p" "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")"; }   # 抽取一个函数体
 skip(){ echo "[SKIP] $1"; }                                  # 不计入 pass: 没断言就别冒充断言
 # 抽真身并确认它真的到位了。函数被改名/删除时 xt 只输出空串, eval "" 又是成功的 —— 后面的
 # `f x && bad || ok` 就会因为 127(command not found)稳稳落到 ok 分支, 整段变成假绿
@@ -217,7 +217,7 @@ source '$WORK/bmfn.sh'; migrate_backend_marker; cat '$BM/etc/privdns-gateway/bac
 # sing-box 侧的 migrate_singbox_gms 已随 sing-box 运行时一并退役, 原用例调的是一个不存在的
 # 函数(见文件头 use_fn 注释)。换成**当前仍在跑**的防火墙侧, 并钉住"它确实没了": 哪天再冒
 # 出来, 得连同它的平台跳过用例一起补回来, 而不是又静静地假绿。
-if grep -q '^migrate_singbox_gms()' "$ROOT/deploy/bot/pdg.sh"; then
+if grep -q '^migrate_singbox_gms()' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")"; then
   bad "migrate_singbox_gms 又回来了: 需要补回它的 iOS 跳过用例"
 else
   ok "migrate_singbox_gms 已随 sing-box 退役(不再有 model 入站迁移)"
@@ -488,7 +488,7 @@ v="$(g8_judge rev-ok rev-fail)"; g8_show rev-fail
 g8 miss-ok 0 "$_rams" no; g8 miss-fail 1 "$_rams" no
 v="$(g8_judge miss-ok miss-fail)"; g8_show miss-fail
 [[ "$v" == INVALID ]] && ok "8c: 缺必需依赖 → 登记为「外壳执行无效」, 没有冒充失败传播通过" || bad "8c: 缺依赖时判定=$v"
-grep -q 'migrate_ios_gms_cleanup || true' "$ROOT/deploy/bot/pdg.sh" \
+grep -q 'migrate_ios_gms_cleanup || true' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" \
   && bad "pdg.sh 里还有 `migrate_ios_gms_cleanup || true`" \
   || ok "pdg.sh 里不再用 || true 吞掉这条关键迁移"
 _cp="$(xt cmd_platform)"
@@ -692,7 +692,7 @@ grep -q '5228-5230' "$WORK/nfa" && ok "Android: _pdg_nft_strip_gms 空操作(保
 
 # ── D. migrate_android_cleanup: 删 iOS 残留 unit/文件, 保留 CA/地点数据 ──────────
 # 该函数用绝对路径(/etc/systemd/system, /opt/pdg-bot) → 沙箱难注入; 用静态断言核对关键行为。
-u="$ROOT/deploy/bot/pdg.sh"
+u="$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")"
 grep -q 'migrate_android_cleanup' "$u" && grep -q 'disable --now pdg-mitm' "$u" && ok "存在 Android 残留清理(停用+删 pdg-mitm unit; probe81 已是公共件不在此列)" || bad "缺 Android 清理逻辑"
 grep -q 'CA/地点数据保留为休眠' "$u" && ok "Android 清理保留 CA/地点数据(不永久删)" || bad "未保留用户数据"
 # ── D2. 按平台部署: 真跑一次部署, 不再用"源码里出现某一行"当证据 ──────────────

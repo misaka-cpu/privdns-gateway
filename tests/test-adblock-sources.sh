@@ -24,12 +24,12 @@ trap 'rm -rf "$WORK"' EXIT
 
 extract(){
   local fn="$1" ln
-  ln="$(grep -n "^${fn}()" "$ROOT/deploy/bot/pdg.sh" | head -1 | cut -d: -f1)"
+  ln="$(grep -n "^${fn}()" "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" | head -1 | cut -d: -f1)"
   [[ -n "$ln" ]] || { echo "抽不到 $fn" >&2; return 1; }
-  if sed -n "${ln}p" "$ROOT/deploy/bot/pdg.sh" | grep -qE '^[A-Za-z_][A-Za-z0-9_]*\(\)\{.*\}[[:space:]]*$'; then
-    sed -n "${ln}p" "$ROOT/deploy/bot/pdg.sh"
+  if sed -n "${ln}p" "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" | grep -qE '^[A-Za-z_][A-Za-z0-9_]*\(\)\{.*\}[[:space:]]*$'; then
+    sed -n "${ln}p" "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")"
   else
-    sed -n "${ln},/^}/p" "$ROOT/deploy/bot/pdg.sh"
+    sed -n "${ln},/^}/p" "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")"
   fi
 }
 CLOSURE="$WORK/closure.sh"; : > "$CLOSURE"
@@ -42,7 +42,7 @@ done
 # 这一类缺口已经栽过三次: PDG_LOCKED、LOCK、ACME_HOME。不再一个个补, 整体注入了事。
 # 安全性: 这 34 条里**零条含命令替换**(`grep -cE '^[A-Z][A-Z0-9_]*=.*\$\(' = 0`), 纯字面量
 # 与变量引用, 注入不会执行任何东西。沙箱随后 export 的同名变量会覆盖它们。
-grep -E '^[A-Z][A-Z0-9_]*=' "$ROOT/deploy/bot/pdg.sh" \
+grep -E '^[A-Z][A-Z0-9_]*=' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" \
   | sed -E 's/^([A-Z][A-Z0-9_]*)=(.*)$/\1="${\1:-}"; [[ -z "${\1}" ]] \&\& \1=\2/' >> "$CLOSURE"
 cat >> "$CLOSURE" <<'STUB'
 need_root(){ :; }

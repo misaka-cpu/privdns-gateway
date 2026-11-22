@@ -15,6 +15,8 @@ import re
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+import sys as _pdg_sys; _pdg_sys.path.insert(0, str(ROOT) + "/tests")  # noqa: E702
+import pdg_source  # noqa: E402  共享 pdg.sh 源码入口(建议 4 第 0 步; 拆分后给出拼回的整份)
 PASS, FAIL = [0], [0]
 
 
@@ -28,7 +30,7 @@ def bad(m):
     print("[FAIL] %s" % m)
 
 
-PDGSH = open(os.path.join(ROOT, "deploy/bot/pdg.sh"), encoding="utf-8").read()
+PDGSH = open(pdg_source.path(ROOT), encoding="utf-8").read()
 BOT = open(os.path.join(ROOT, "deploy/bot/pdg-bot.py"), encoding="utf-8").read()
 
 print("══ 1. CLI 的 pdg status 里有去广告一行 ══")
@@ -92,7 +94,7 @@ if not missing:
         f.write("set -uo pipefail\n")
         for fn in need:
             f.write(subprocess.run(["sed", "-n", "/^%s()/,/^}/p" % fn,
-                                    os.path.join(ROOT, "deploy/bot/pdg.sh")],
+                                    pdg_source.path(ROOT)],
                                    capture_output=True, text=True).stdout + "\n")
     env = dict(os.environ,
                ADB_STATE_DIR=os.path.join(W, "state"),

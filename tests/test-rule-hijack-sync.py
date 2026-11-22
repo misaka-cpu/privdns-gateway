@@ -22,6 +22,8 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+import sys as _pdg_sys; _pdg_sys.path.insert(0, str(ROOT) + "/tests")  # noqa: E702
+import pdg_source  # noqa: E402  共享 pdg.sh 源码入口(建议 4 第 0 步; 拆分后给出拼回的整份)
 sys.path.insert(0, str(ROOT / "tests"))
 from txbox import Box  # noqa: E402
 
@@ -152,7 +154,7 @@ def main():
         shutil.rmtree(box, ignore_errors=True)
 
     # ── 老装迁移: 把文件补进已有 config.yaml 的 hijack_set, 并回填已有出口域名 ──
-    pdg = (ROOT / "deploy/bot/pdg.sh").read_text(encoding="utf-8")
+    pdg = (pdg_source.path(ROOT)).read_text(encoding="utf-8")
     assert "migrate_custom_hijack" in pdg, "缺老装迁移 migrate_custom_hijack"
     assert "migrate_custom_hijack" in pdg[pdg.index("run_all_migrations(){"):], "迁移未接入 run_all_migrations"
     ok("pdg.sh: 老装迁移 migrate_custom_hijack 已接入")

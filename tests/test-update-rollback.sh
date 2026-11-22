@@ -140,7 +140,7 @@ GOOD_REF=$(git -C "$REPO" rev-parse HEAD~1)   # 第一提交
 HEAD_REF=$(git -C "$REPO" rev-parse HEAD)
 
 # ── 抽取 cmd_rollback + 打桩 ──────────────────────────────────────────────────
-sed -n '/^cmd_rollback(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh" > "$WORK/rollback.sh"
+sed -n '/^cmd_rollback(){/,/^}/p' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" > "$WORK/rollback.sh"
 # _snap_meta_commit 也要**抽真的**, 不能靠打桩、更不能不管。
 #
 # 它是 cmd_rollback 在"调用方没点名 --git"时用来取回滚目标提交的那一步。原来两样都没做:
@@ -151,14 +151,14 @@ sed -n '/^cmd_rollback(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh" > "$WORK/rollback.sh
 #
 # 它只依赖 python3(读 snapshot.json 的 git_commit, 且只认合法哈希 —— 字面量 "unknown"
 # 会被正则挡掉), 抽进来零成本, 比任何桩都忠实。
-sed -n '/^_snap_meta_commit(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh" >> "$WORK/rollback.sh"
+sed -n '/^_snap_meta_commit(){/,/^}/p' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" >> "$WORK/rollback.sh"
 # 本轮补齐: 恢复决策与未恢复项累计**必须用真身**, 不能拿恒真替身顶替 ——
 # 那正是本壳在核验的东西。这批各自的依赖也一并抽进来(按实际调用路径清点, 见交付说明),
 # 只有真正属于"外部世界"的才做模型(systemctl / nft / 内核二进制 / 面板收敛 / iOS 校验)。
 for _f in _snap_meta_label _pdg_svcstate_units _pdg_svc_known _pdg_svc_q _pdg_now_en _pdg_now_ac \
           _pdg_svcstate_valid _pdg_svcstate_plan _pdg_save_svcstate _pdg_set_enable_state \
           _pdg_restore_svcstate _pdg_kernel_converge _nft_apply_main _lan_nft_reapply; do
-  sed -n "/^${_f}(){/,/^}/p" "$ROOT/deploy/bot/pdg.sh" >> "$WORK/rollback.sh"
+  sed -n "/^${_f}(){/,/^}/p" "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" >> "$WORK/rollback.sh"
   grep -q "^${_f}(){" "$WORK/rollback.sh" \
     || { echo "[FAIL] 抽不到 $_f —— 改名了? 后面的判据全部无效"; exit 1; }
 done
@@ -532,7 +532,7 @@ rm -f "$WORK/applied_snapid"; rc=0; out=$(runm "--dir '$SNAP/M_BAD'") || rc=$?
   && ok "快照内核也拒绝旧配置 → 落盘前中止(不写坏现网)" || bad "C4b: rc=$rc applied=$(cat "$WORK/applied_snapid" 2>/dev/null)"
 
 # ── D. 静态断言: cmd_update / cmd_snapshot / 越界守卫 ─────────────────────────
-u="$ROOT/deploy/bot/pdg.sh"
+u="$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")"
 grep -q '更新前快照失败, 中止更新' "$u" && ok "cmd_update: 快照失败即中止(不在无法回滚下继续)" || bad "D1: 缺快照失败中止"
 grep -q 'cmd_rollback --dir "\$snap_dir" --git "\$pre_sha"' "$u" && ok "cmd_update: 回滚用精确 --dir+--git(非 cmd_rollback 0)" || bad "D2"
 grep -q "pre_sha=.*git -C .*rev-parse HEAD" "$u" && ok "cmd_update: 记录升级前 Git SHA" || bad "D3"
@@ -734,7 +734,7 @@ else
 fi
 # 更新侧那道清理是**另一处**防护, 与上面这一处互相独立 —— 不能拿一处的区分力去替另一处背书。
 # 它的位置由源码顺序判(本壳不驱动 cmd_update, 那是 tests/test-update-*.sh 的事)。
-_upd_blk="$(grep -A8 'if \[\[ ! -f "\$snap_dir/svcstate.tsv" \]\]' "$ROOT/deploy/bot/pdg.sh")"
+_upd_blk="$(grep -A8 'if \[\[ ! -f "\$snap_dir/svcstate.tsv" \]\]' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")")"
 grep -q '_PDG_SVC_SRC=""' <<<"$_upd_blk" \
   && ok "K5: 更新侧也有**各自的**清理(cmd_update 前确认之后就把结论清掉) —— 两道防护分别成立, 不互相兜底" \
   || bad "K5: 更新侧没有自己的清理"

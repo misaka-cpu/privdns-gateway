@@ -70,7 +70,7 @@ for _m in etc opt usr/local/bin run var; do
 done
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
-PDG="${PDG_UNDER_TEST:-$ROOT/deploy/bot/pdg.sh}"
+PDG="${PDG_UNDER_TEST:-$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")}"
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK" "$FAKE"' EXIT
 pass=0; nfail=0
 ok(){ echo "[OK]   $1"; pass=$((pass+1)); }

@@ -24,6 +24,8 @@ import sys
 import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+import sys as _pdg_sys; _pdg_sys.path.insert(0, str(ROOT) + "/tests")  # noqa: E702
+import pdg_source  # noqa: E402  共享 pdg.sh 源码入口(建议 4 第 0 步; 拆分后给出拼回的整份)
 sys.path.insert(0, os.path.join(ROOT, "deploy/bot"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import tmpguard                                             # noqa: E402
@@ -171,7 +173,7 @@ print()
 print("══ 9. 新的闭集成员必须一路认得 ══")
 # 闭集是三处手写: pdg.sh 的注释、pdg.sh 真正 emit 的值、Bot 的文案表。少一处, Bot 拿到一个
 # 它不认识的 result —— 那时它要么显示原始英文码, 要么什么都不说, 两种都是把内部状态漏给用户。
-_pdgsh = open(os.path.join(ROOT, "deploy/bot/pdg.sh"), encoding="utf-8").read()
+_pdgsh = open(pdg_source.path(ROOT), encoding="utf-8").read()
 _bot = open(os.path.join(ROOT, "deploy/bot/pdg-bot.py"), encoding="utf-8").read()
 (ok if "_adb_emit blocklist_full" in _pdgsh else bad)("pdg.sh 真的会 emit blocklist_full")
 (ok if "blocklist_full" in _pdgsh[_pdgsh.index("result ∈"):_pdgsh.index("result ∈") + 300] else

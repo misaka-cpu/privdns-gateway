@@ -30,7 +30,7 @@ bad(){ echo "[FAIL] $1"; nfail=$((nfail+1)); }
 # shellcheck source=tests/repoguard.sh
 source "$ROOT/tests/repoguard.sh"
 
-xt(){  sed -n "/^$1(){/,/^}/p" "$ROOT/deploy/bot/pdg.sh"; }
+xt(){  sed -n "/^$1(){/,/^}/p" "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")"; }
 xtv(){ sed -n "/^$1(){/,/^}/p" "$ROOT/lib/versions.sh"; }
 
 # 闭包清单。少抽一个就是 127, 而 127 会被下游判据当成普通返回值吞掉 —— 见 HANDOFF §9.11。
@@ -40,7 +40,7 @@ for f in _update_core_binary _update_mosdns_binary _core_bindir _pdg_mktemp_dir;
 done
 ok "从 deploy/bot/pdg.sh 抽到两条换核取件函数与 _core_bindir / _pdg_mktemp_dir"
 # 超时常量从 pdg.sh 原样取, 不在测试里另写一份数值(写两份迟早漂开)
-TMO="$(grep -E '^PDG_CORE_(CONNECT_TIMEOUT|MAX_TIME)=' "$ROOT/deploy/bot/pdg.sh")"
+TMO="$(grep -E '^PDG_CORE_(CONNECT_TIMEOUT|MAX_TIME)=' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")")"
 
 # ── 夹具 ─────────────────────────────────────────────────────────────────────
 BIN="$WORK/bin"; mkdir -p "$BIN"

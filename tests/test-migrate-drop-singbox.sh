@@ -34,10 +34,10 @@ pass=0; nfail=0
 ok(){ echo "[OK]   $1"; pass=$((pass+1)); }
 bad(){ echo "[FAIL] $1"; nfail=$((nfail+1)); }
 
-sed -n '/^_pdg_singbox_is_ours(){/,/^}/p'   "$ROOT/deploy/bot/pdg.sh"  > "$WORK/fn.sh"
-sed -n '/^_pdg_drop_singbox_files(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh" >> "$WORK/fn.sh"
-sed -n '/^_activate_mihomo_core(){/,/^}/p'   "$ROOT/deploy/bot/pdg.sh" >> "$WORK/fn.sh"
-sed -n '/^migrate_drop_singbox(){/,/^}/p'    "$ROOT/deploy/bot/pdg.sh" >> "$WORK/fn.sh"
+sed -n '/^_pdg_singbox_is_ours(){/,/^}/p'   "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")"  > "$WORK/fn.sh"
+sed -n '/^_pdg_drop_singbox_files(){/,/^}/p' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" >> "$WORK/fn.sh"
+sed -n '/^_activate_mihomo_core(){/,/^}/p'   "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" >> "$WORK/fn.sh"
+sed -n '/^migrate_drop_singbox(){/,/^}/p'    "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" >> "$WORK/fn.sh"
 grep -q '^_activate_mihomo_core(){' "$WORK/fn.sh" || { echo "抽取 _activate_mihomo_core 失败"; exit 1; }
 grep -q '^migrate_drop_singbox(){'  "$WORK/fn.sh" || { echo "抽取 migrate_drop_singbox 失败"; exit 1; }
 grep -q '^_pdg_singbox_is_ours(){' "$WORK/fn.sh" || { echo "抽取归属助手失败"; exit 1; }

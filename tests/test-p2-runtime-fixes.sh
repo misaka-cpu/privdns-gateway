@@ -17,7 +17,7 @@ WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
 # 的用例用的; 它对一次性独立仓库放行, 对本仓库/worktree 直接拒。
 # shellcheck source=tests/repoguard.sh
 source "$ROOT/tests/repoguard.sh"
-NEW="$ROOT/deploy/bot/pdg.sh"
+NEW="$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")"
 OLD="$WORK/pdg-old.sh"
 # 反向对照的"修复前那一版"由**当前源码做最小反向补丁**得到, 不从 git 历史取 ——
 # 锚在 HEAD 上只在修复尚未提交时成立, 提交之后四个对照格会安静地失去判别力。

@@ -22,6 +22,8 @@ import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+import sys as _pdg_sys; _pdg_sys.path.insert(0, str(ROOT) + "/tests")  # noqa: E702
+import pdg_source  # noqa: E402  共享 pdg.sh 源码入口(建议 4 第 0 步; 拆分后给出拼回的整份)
 BOTDIR = os.path.join(ROOT, "deploy/bot")
 TMPL = os.path.join(ROOT, "deploy/ios/pdg-dot-ondemand.mobileconfig.tmpl")
 
@@ -94,7 +96,7 @@ else:
 # ── 2. 快照 → 回滚 ────────────────────────────────────────────────────────
 # cmd_snapshot 打包的是一份**路径白名单**。这里直接跑那段真实的候选枚举, 看记录在不在。
 cand = sh(r"""
-sed -n '/^cmd_snapshot()/,/^}/p' deploy/bot/pdg.sh \
+sed -n '/^cmd_snapshot()/,/^}/p' "$(bash tests/pdg-source-lib.sh path .)" \
   | sed -n '/local cand=(/,/)$/p' | tr -d '\\' | tr ' ' '\n' | sed 's/local cand=(//;s/)$//' \
   | grep -v '^$'
 """).stdout.split()
@@ -188,7 +190,7 @@ else:
     bad("项目成员枚举里没有记录目录: %r" % bk.splitlines()[:6])
 
 # ── 4. 平台来回切不许造出第二个身份 ───────────────────────────────────────
-pdg = open(os.path.join(ROOT, "deploy/bot/pdg.sh"), encoding="utf-8").read()
+pdg = open(pdg_source.path(ROOT), encoding="utf-8").read()
 
 
 def block(name, pat):

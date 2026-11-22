@@ -18,7 +18,7 @@ pass=0; nfail=0
 ok(){ echo "[OK]   $1"; pass=$((pass+1)); }
 bad(){ echo "[FAIL] $1"; nfail=$((nfail+1)); }
 
-SRC="$ROOT/deploy/bot/pdg.sh"
+SRC="$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")"
 sed -n '/^_adb_count_rules(){/,/^}/p' "$SRC" > "$WORK/cnt.sh"
 
 echo "══ 1. 优化是局部的 ══"

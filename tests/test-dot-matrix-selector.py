@@ -16,6 +16,8 @@ import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+import sys as _pdg_sys; _pdg_sys.path.insert(0, str(ROOT) + "/tests")  # noqa: E702
+import pdg_source  # noqa: E402  共享 pdg.sh 源码入口(建议 4 第 0 步; 拆分后给出拼回的整份)
 MX = os.path.join(ROOT, "tests", "e2e-dot-migrate.sh")
 npass = nfail = 0
 
@@ -77,7 +79,7 @@ for rel in ("deploy/bot/pdg.sh", "install.sh", "uninstall.sh"):
     (ok if "PDG_MIGRATE_SECTIONS" not in src else bad)("%s 里没有这个测试开关" % rel)
 
 print("\n── 生产轮询次数没被动过 ──")
-pdg = open(os.path.join(ROOT, "deploy/bot/pdg.sh"), encoding="utf-8").read()
+pdg = open(pdg_source.path(ROOT), encoding="utf-8").read()
 (ok if "while [[ $i -lt 20 ]]" in pdg else bad)("5399 等待仍是 20 次循环(未被测试改小)")
 (ok if "sleep 0.25" in pdg else bad)("轮询间隔仍是 0.25s")
 

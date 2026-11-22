@@ -62,11 +62,11 @@ OLD_SHA="$(sha256sum "$CONF" | cut -d' ' -f1)"
 # shellcheck disable=SC2034  # 由下面 eval 进来的生产函数读取, 静态分析看不到那层引用
 REPO_DIR="$ROOT"
 # shellcheck disable=SC1090
-eval "$(sed -n '/^_rescue_load()/,/^}/p' "$ROOT/deploy/bot/pdg.sh")" 2>/dev/null || true
+eval "$(sed -n '/^_rescue_load()/,/^}/p' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")")" 2>/dev/null || true
 # 判据 helper 必须一并抽出: 第一次调用走 A 态(重建)不碰它, 第二次走 B/C 态才会调 ——
 # 漏了它, 幂等那格会以 command-not-found 的非零失败, 而现象看着像"同步不幂等"。
-eval "$(sed -n '/^_fw_live_has_template_invariants()/,/^}/p' "$ROOT/deploy/bot/pdg.sh")"
-eval "$(sed -n '/^migrate_firewall_template_sync()/,/^}/p' "$ROOT/deploy/bot/pdg.sh")"
+eval "$(sed -n '/^_fw_live_has_template_invariants()/,/^}/p' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")")"
+eval "$(sed -n '/^migrate_firewall_template_sync()/,/^}/p' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")")"
 c_g(){ echo "    [prod] $*"; }; c_y(){ echo "    [prod] $*"; }
 
 set +e

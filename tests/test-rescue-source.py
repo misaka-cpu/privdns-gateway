@@ -20,6 +20,8 @@ import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+import sys as _pdg_sys; _pdg_sys.path.insert(0, str(ROOT) + "/tests")  # noqa: E702
+import pdg_source  # noqa: E402  共享 pdg.sh 源码入口(建议 4 第 0 步; 拆分后给出拼回的整份)
 sys.path.insert(0, os.path.join(ROOT, "deploy", "rescue"))
 sys.path.insert(0, os.path.join(ROOT, "deploy", "bot"))
 PASS = [0]
@@ -170,7 +172,7 @@ for v, want, label in [("177.0.142.200", True, "公网可路由地址 → 判为
 # ── 3. 与来源段互不推导 ────────────────────────────────────────────────────
 print()
 print("── 3. 两个键互不推导 ──")
-pdg = open(os.path.join(ROOT, "deploy", "bot", "pdg.sh"), encoding="utf-8").read()
+pdg = open(pdg_source.path(ROOT), encoding="utf-8").read()
 fn = pdg[pdg.index("_rescue_bind_addr(){"):]
 fn = fn[:fn.index("\n}\n")]
 if "pdg_rescue_bind" in fn and "internal_cidr" not in fn:

@@ -20,6 +20,8 @@ import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+import sys as _pdg_sys; _pdg_sys.path.insert(0, str(ROOT) + "/tests")  # noqa: E702
+import pdg_source  # noqa: E402  共享 pdg.sh 源码入口(建议 4 第 0 步; 拆分后给出拼回的整份)
 sys.path.insert(0, os.path.join(ROOT, "deploy", "bot"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import tmpguard  # noqa: E402
@@ -50,7 +52,7 @@ def sh(script, **kw):
     return p.returncode, (p.stdout or "") + (p.stderr or "")
 
 
-PDGSH = os.path.join(ROOT, "deploy", "bot", "pdg.sh")
+PDGSH = pdg_source.path(ROOT)
 INSTALL = os.path.join(ROOT, "install.sh")
 UNINSTALL = os.path.join(ROOT, "uninstall.sh")
 MODULES = os.path.join(ROOT, "lib", "modules.sh")

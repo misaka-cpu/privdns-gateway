@@ -21,6 +21,8 @@ from pathlib import Path
 import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = Path(__file__).resolve().parents[1]
+import sys as _pdg_sys; _pdg_sys.path.insert(0, str(ROOT) + "/tests")  # noqa: E702
+import pdg_source  # noqa: E402  共享 pdg.sh 源码入口(建议 4 第 0 步; 拆分后给出拼回的整份)
 BOTDIR = str(ROOT / "deploy" / "bot")
 TMPL = str(ROOT / "deploy/ios/pdg-dot-ondemand.mobileconfig.tmpl")
 
@@ -363,7 +365,7 @@ else:
 # ── 8. CLI 的平台门控 ─────────────────────────────────────────────────────
 sh = subprocess.run(
     ["bash", "-c",
-     "set -e; sed -n '/^ic_gate()/,/^}/p' deploy/bot/pdg.sh > ${TMPDIR:-/tmp}/icg.$$;"
+     "set -e; sed -n '/^ic_gate()/,/^}/p' \"$(bash tests/pdg-source-lib.sh path .)\" > ${TMPDIR:-/tmp}/icg.$$;"
      " . ${TMPDIR:-/tmp}/icg.$$; _pdg_platform(){ echo android; };"
      " ic_gate && echo ALLOWED || echo REFUSED; rm -f ${TMPDIR:-/tmp}/icg.$$"],
     capture_output=True, text=True, cwd=str(ROOT), timeout=120)
@@ -374,7 +376,7 @@ else:
 
 sh = subprocess.run(
     ["bash", "-c",
-     "set -e; sed -n '/^ic_gate()/,/^}/p' deploy/bot/pdg.sh > ${TMPDIR:-/tmp}/icg2.$$;"
+     "set -e; sed -n '/^ic_gate()/,/^}/p' \"$(bash tests/pdg-source-lib.sh path .)\" > ${TMPDIR:-/tmp}/icg2.$$;"
      " . ${TMPDIR:-/tmp}/icg2.$$; _pdg_platform(){ echo ios; };"
      " ic_gate && echo ALLOWED || echo REFUSED; rm -f ${TMPDIR:-/tmp}/icg2.$$"],
     capture_output=True, text=True, cwd=str(ROOT), timeout=120)
@@ -383,7 +385,7 @@ if sh.stdout.strip() == "ALLOWED":
 else:
     bad("iOS 上被误拒: %r" % sh.stdout[:150])
 
-pdg = open(ROOT / "deploy/bot/pdg.sh", encoding="utf-8").read()
+pdg = open(pdg_source.path(ROOT), encoding="utf-8").read()
 if "ic_gate || return 1" in pdg and pdg.count("ic_gate || return 1") >= 2:
     ok("cmd_ios 与 cmd_ios_state 都在门控之后才做事")
 else:
@@ -408,7 +410,7 @@ if len(SUBS) >= 5:
     ok("从 iosstate.py 的 argparse 取到 %d 个 generate 之外的子命令: %s" % (len(SUBS), ", ".join(SUBS)))
 else:
     bad("取不到子命令清单: %r" % _help[:200])
-_pdgsrc = open(ROOT / "deploy/bot/pdg.sh", encoding="utf-8").read()
+_pdgsrc = open(pdg_source.path(ROOT), encoding="utf-8").read()
 _disp = re.search(r"^cmd_ios_state\(\)\{.*?^\}", _pdgsrc, re.S | re.M)
 for _s in sorted(INTERNAL_SUBS):
     if _s not in ALL_SUBS:
@@ -423,11 +425,11 @@ for _s in sorted(INTERNAL_SUBS):
 # 真的把 cmd_ios / cmd_ios_previous / ic_gate 抽出来跑一遍, 只把它依赖的外部动作换成桩。
 HARNESS = r"""
 set -u
-grep -E '^IOS_TMPL='                 deploy/bot/pdg.sh >  ${TMPDIR:-/tmp}/iosdisp.$$
-sed -n '/^ic_gate()/,/^}/p'          deploy/bot/pdg.sh >> ${TMPDIR:-/tmp}/iosdisp.$$
-sed -n '/^cmd_ios_state()/,/^}/p'    deploy/bot/pdg.sh >> ${TMPDIR:-/tmp}/iosdisp.$$
-sed -n '/^cmd_ios_previous()/,/^}/p' deploy/bot/pdg.sh >> ${TMPDIR:-/tmp}/iosdisp.$$
-sed -n '/^cmd_ios()/,/^}/p'          deploy/bot/pdg.sh >> ${TMPDIR:-/tmp}/iosdisp.$$
+grep -E '^IOS_TMPL='                 "$(bash tests/pdg-source-lib.sh path .)" >  ${TMPDIR:-/tmp}/iosdisp.$$
+sed -n '/^ic_gate()/,/^}/p'          "$(bash tests/pdg-source-lib.sh path .)" >> ${TMPDIR:-/tmp}/iosdisp.$$
+sed -n '/^cmd_ios_state()/,/^}/p'    "$(bash tests/pdg-source-lib.sh path .)" >> ${TMPDIR:-/tmp}/iosdisp.$$
+sed -n '/^cmd_ios_previous()/,/^}/p' "$(bash tests/pdg-source-lib.sh path .)" >> ${TMPDIR:-/tmp}/iosdisp.$$
+sed -n '/^cmd_ios()/,/^}/p'          "$(bash tests/pdg-source-lib.sh path .)" >> ${TMPDIR:-/tmp}/iosdisp.$$
 need_root(){ :; }
 _pdg_platform(){ echo ios; }
 _pdg_module(){ echo /nonexistent/$1; }
@@ -606,12 +608,12 @@ exit 0
 
 HARNESS_CH = r"""
 set -u
-sed -n '/^_ios_offer_download()/,/^}/p' deploy/bot/pdg.sh > "$CH_DIR/fn.sh"
+sed -n '/^_ios_offer_download()/,/^}/p' "$(bash tests/pdg-source-lib.sh path .)" > "$CH_DIR/fn.sh"
 # 收尾还原走 _nft_apply_main(它顺带把内网面板的白名单补回内核)。**抽取清单要跟着依赖走**
 # —— 漏了它, 那次还原调到一个未定义的名字, nft 日志里就没有 `-f /etc/nftables.conf`,
 # 断言看起来像"没还原防火墙"这个产品缺陷, 其实是夹具少抽了一个函数。
-sed -n '/^_nft_apply_main()/,/^}/p'  deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
-sed -n '/^_lan_nft_reapply()/,/^}/p' deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
+sed -n '/^_nft_apply_main()/,/^}/p'  "$(bash tests/pdg-source-lib.sh path .)" >> "$CH_DIR/fn.sh"
+sed -n '/^_lan_nft_reapply()/,/^}/p' "$(bash tests/pdg-source-lib.sh path .)" >> "$CH_DIR/fn.sh"
 # 收尾从"整表重载"改成"按标记精确删除"之后又多了三个依赖(见 tests/test-ios-offer-download-leak.py)。
 # 漏抽任何一个, 现场都长成"产品没撤规则"的样子 —— 与真缺陷一模一样。
 for _fn in _ios_offer_teardown _ios_offer_abort _ios_offer_nft_close \
@@ -622,16 +624,16 @@ for _fn in _ios_offer_teardown _ios_offer_abort _ios_offer_nft_close \
            _ios_offer_root_ok _ios_offer_reap_dir _ios_offer_dir_pid \
           _ios_offer_proc_state _ios_offer_stop_pid _ios_offer_list _ios_offer_gen_run \
           _ios_offer_stop_child _ios_offer_proc_dead; do
-  sed -n "/^$_fn()/,/^}/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
+  sed -n "/^$_fn()/,/^}/p" "$(bash tests/pdg-source-lib.sh path .)" >> "$CH_DIR/fn.sh"
 done
 # 常量也要跟着抽。`set -u` 下漏一个就是 unbound variable, 而那会让 _nft_apply_main 在
 # 调 _lan_nft_reapply 时半途死掉 —— 表现同样是"没还原防火墙", 与漏抽函数一模一样。
 # (_lan_nft_reapply 原先把这个路径写死在函数体里, 于是这里不抽也能跑; 路径收归常量之后
 #  就不行了 —— 写死路径让夹具"碰巧能用", 那本身就是它该被改掉的理由之一。)
-grep -E '^(LAN_NFT_CONF|IOS_OFFER_MARK|IOS_OFFER_LOCK|IOS_OFFER_STATE|IOS_OFFER_ROOT|IOS_OFFER_SENTINEL|IOS_OFFER_PIDFILE|IOS_OFFER_GENFILE)=' deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
+grep -E '^(LAN_NFT_CONF|IOS_OFFER_MARK|IOS_OFFER_LOCK|IOS_OFFER_STATE|IOS_OFFER_ROOT|IOS_OFFER_SENTINEL|IOS_OFFER_PIDFILE|IOS_OFFER_GENFILE)=' "$(bash tests/pdg-source-lib.sh path .)" >> "$CH_DIR/fn.sh"
 # IOS_OFFER_PROBE 是多行常量, grep 抓不全 —— set -u 下就绪判据会当场炸。
-sed -n "/^IOS_OFFER_PROBE='/,/^'$/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
-sed -n "/^IOS_OFFER_SERVER='/,/^'$/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
+sed -n "/^IOS_OFFER_PROBE='/,/^'$/p" "$(bash tests/pdg-source-lib.sh path .)" >> "$CH_DIR/fn.sh"
+sed -n "/^IOS_OFFER_SERVER='/,/^'$/p" "$(bash tests/pdg-source-lib.sh path .)" >> "$CH_DIR/fn.sh"
 grep -q 'IOS_OFFER_SERVER=' "$CH_DIR/fn.sh" || { echo "EXTRACT-FAIL"; exit 9; }
 # 抽取自证: 函数**和常量**都要查。只查函数的话, 漏抽一个 IOS_OFFER_* 常量会变成 set -u 的
 # 运行期报错, 现场长得像"服务永远不就绪"—— 本轮实测漏过一次(IOS_OFFER_STATE)。

@@ -95,8 +95,8 @@ xv_build_harness(){  # $1=输出文件 $2..=要抽的函数名
     echo 'set -uo pipefail'
     echo 'c_g(){ echo "$*"; }; c_y(){ echo "$*"; }'
     echo 'curl(){ local o=""; while [[ $# -gt 0 ]]; do [[ "$1" == -o ]] && { o="$2"; shift; }; shift; done; cp "$FEED" "$o"; }'
-    grep -E '^PDG_CORE_(CONNECT_TIMEOUT|MAX_TIME)=' "$XV_ROOT/deploy/bot/pdg.sh"
-    for f in "${fns[@]}"; do sed -n "/^$f(){/,/^}/p" "$XV_ROOT/deploy/bot/pdg.sh"; done
+    grep -E '^PDG_CORE_(CONNECT_TIMEOUT|MAX_TIME)=' "$(bash "$XV_ROOT/tests/pdg-source-lib.sh" path "$XV_ROOT")"
+    for f in "${fns[@]}"; do sed -n "/^$f(){/,/^}/p" "$(bash "$XV_ROOT/tests/pdg-source-lib.sh" path "$XV_ROOT")"; done
     echo 'HARNESS_OK=1'
   } > "$out"
   for f in "${fns[@]}"; do grep -q "^$f(){" "$out" || miss="$miss $f"; done

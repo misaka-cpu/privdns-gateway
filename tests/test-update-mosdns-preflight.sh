@@ -25,18 +25,18 @@ command -v git >/dev/null 2>&1 || { echo "[SKIP] 无 git"; exit 0; }
 # shellcheck source=tests/repoguard.sh
 source "$ROOT/tests/repoguard.sh"
 
-sed -n '/^cmd_update(){/,/^}/p'                   "$ROOT/deploy/bot/pdg.sh" >  "$WORK/upd.sh"
-sed -n '/^_update_release_relation(){/,/^}/p'     "$ROOT/deploy/bot/pdg.sh" >> "$WORK/upd.sh"
+sed -n '/^cmd_update(){/,/^}/p'                   "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" >  "$WORK/upd.sh"
+sed -n '/^_update_release_relation(){/,/^}/p'     "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" >> "$WORK/upd.sh"
 # 预检的依赖来源现在由 _pdg_entry_libdir 回答(它又用 _pdg_entry_src)。两个都要抽**产品原文**
 # 进来 —— 不给的话它们在这个外壳里是 command not found, 预检会一律走"入口副本核不过"那条
 # 退出码 12, 每一格都变成红的, 而红的原因与被测判据无关。
 # 这个外壳是 `source "$WORK/pre.sh"` 跑的, BASH_SOURCE 不是 <root>/deploy/bot/pdg.sh,
 # 所以 _pdg_entry_libdir 会如实答"这不是入口副本" ⇒ 照旧用 $REPO_DIR —— 下面这些既有
 # 场景验的正是**现役已安装 CLI** 那条路径。入口副本那条路径由第九节单独驱动。
-grep -m1 '^_PDG_INSTALLED_CLI=' "$ROOT/deploy/bot/pdg.sh"                          >  "$WORK/pre.sh"
-sed -n '/^_pdg_entry_src(){/,/^}/p'               "$ROOT/deploy/bot/pdg.sh" >> "$WORK/pre.sh"
-sed -n '/^_pdg_entry_libdir(){/,/^}/p'            "$ROOT/deploy/bot/pdg.sh" >> "$WORK/pre.sh"
-sed -n '/^_update_mosdns_preflight(){/,/^}/p'     "$ROOT/deploy/bot/pdg.sh" >> "$WORK/pre.sh"
+grep -m1 '^_PDG_INSTALLED_CLI=' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")"                          >  "$WORK/pre.sh"
+sed -n '/^_pdg_entry_src(){/,/^}/p'               "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" >> "$WORK/pre.sh"
+sed -n '/^_pdg_entry_libdir(){/,/^}/p'            "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" >> "$WORK/pre.sh"
+sed -n '/^_update_mosdns_preflight(){/,/^}/p'     "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" >> "$WORK/pre.sh"
 # 〔模型〕下面 1–8 节验的是**现役已安装 CLI** 那条路径。这个外壳是 `source "$WORK/pre.sh"`
 # 跑的, 脚本落点既不是 <root>/deploy/bot/pdg.sh 也不是装机那个路径, 按产品的分类就是
 # "说不清" —— 那是对的, 不能靠"反正不在 deploy/bot 里"去冒充已安装 CLI。
@@ -44,7 +44,7 @@ sed -n '/^_update_mosdns_preflight(){/,/^}/p'     "$ROOT/deploy/bot/pdg.sh" >> "
 # _pdg_entry_libdir 的分类逻辑与预检本体仍是产品原文。真实来源分类由第九节 E8a/E8b
 # (源码级直证)与 E11(无替身的未知来源)负责, 不靠这个替身。
 printf '_pdg_entry_src(){ echo "%s"; }\n' \
-  "$(grep -m1 '^_PDG_INSTALLED_CLI=' "$ROOT/deploy/bot/pdg.sh" | cut -d'"' -f2)" >> "$WORK/pre.sh"
+  "$(grep -m1 '^_PDG_INSTALLED_CLI=' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" | cut -d'"' -f2)" >> "$WORK/pre.sh"
 
 echo "══ 1. 预检函数存在, 且用的是生产共用判据 ══"
 if [[ -s "$WORK/pre.sh" ]]; then ok "pdg.sh 里有 _update_mosdns_preflight"; else
@@ -426,12 +426,12 @@ r="$(runentry "$E4" "$OLD1" "$WORK/mosdns.trap")"
 # ── 已安装 CLI 这一格: 分两半验 ──────────────────────────────────────────
 # (a) **真实来源分类**, 不打任何替身: 常量必须就是装机真正放 CLI 的那个路径。
 #     沙箱里写不了 /usr/local/bin, 所以这一半是**源码级**直证, 与下面那半互补。
-_inst="$(grep -m1 '^_PDG_INSTALLED_CLI=' "$ROOT/deploy/bot/pdg.sh" | cut -d'"' -f2)"
-_real="$(grep -oE 'install -m755 "\$REPO_DIR"/deploy/bot/pdg\.sh +[^ ]+' "$ROOT/deploy/bot/pdg.sh" | awk '{print $NF}' | head -1 | tr -d ';\\')"
+_inst="$(grep -m1 '^_PDG_INSTALLED_CLI=' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" | cut -d'"' -f2)"
+_real="$(grep -oE 'install -m755 "\$REPO_DIR"/deploy/bot/pdg\.sh +[^ ]+' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" | awk '{print $NF}' | head -1 | tr -d ';\\')"
 { [[ -n "$_inst" && "$_inst" == "$_real" ]]; } \
   && ok "E8a: 「算已安装 CLI」的那个常量($_inst)就是装机真正装到的路径 —— 分类不是凭空定的" \
   || bad "E8a: 常量「${_inst:-<没取到>}」与装机路径「${_real:-<没取到>}」对不上"
-grep -qE '^_PDG_INSTALLED_CLI="[^$]*"$' "$ROOT/deploy/bot/pdg.sh" \
+grep -qE '^_PDG_INSTALLED_CLI="[^$]*"$' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" \
   && ok "E8b: 它是常量, **不接受环境覆盖**(不给依赖来源开后门)" \
   || bad "E8b: 这个路径可被环境改写"
 # (b) 行为那一半用**来源查询替身**驱动 —— 这是**模型**, 明确登记: 它只替换"我是谁"这一问,

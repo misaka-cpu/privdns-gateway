@@ -40,7 +40,7 @@ PIN_BIN="${PDG_SHA256[mihomo-bin-$MARCH]:-}"
   && ok "前提: tests/.bin/mihomo 就是钉死版(内容 == [mihomo-bin-$MARCH])" \
   || { bad "tests/.bin/mihomo 与钉值不符 —— 夹具本身不可信, 后面的断言都不算数"; echo "通过 $pass, 失败 $nfail"; exit 1; }
 
-xt(){ sed -n "/^$1(){/,/^}/p" "$ROOT/deploy/bot/pdg.sh"; }
+xt(){ sed -n "/^$1(){/,/^}/p" "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")"; }
 BIN="$WORK/bin"; CFG="$WORK/etc-mihomo"; mkdir -p "$BIN" "$CFG" "$WORK/shadow"
 # 一份真 mihomo 认的最小配置(配置检查那一步跑的是**真内核**)
 cat > "$CFG/config.yaml" <<'Y'
@@ -89,7 +89,7 @@ for f in _core_bindir _pdg_sha _core_stash_kernel _core_restore_prev _core_kerne
 done
 {
   # 取件的超时常量原样取自 pdg.sh, 不在夹具里另写一份数值
-  grep -E '^PDG_CORE_(CONNECT_TIMEOUT|MAX_TIME)=' "$ROOT/deploy/bot/pdg.sh"
+  grep -E '^PDG_CORE_(CONNECT_TIMEOUT|MAX_TIME)=' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")"
   echo 'c_g(){ echo "$*"; }; c_y(){ echo "$*"; }; sleep(){ :; }'
   echo "curl(){ local o=\"\"; while [[ \$# -gt 0 ]]; do [[ \"\$1\" == -o ]] && { o=\"\$2\"; shift; }; shift; done; cp '$WORK/m.gz' \"\$o\"; }"
   echo "_core_config_check(){ \"\$2/mihomo\" -t -d '$CFG' -f \"$CFG/\$CFGF\" > '$WORK/cfgchk.log' 2>&1; }"

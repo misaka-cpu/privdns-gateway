@@ -17,7 +17,7 @@ WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
 pass=0; nfail=0
 ok(){   echo "[OK]   $1"; pass=$((pass+1)); }
 bad(){  echo "[FAIL] $1"; nfail=$((nfail+1)); }
-PDG="$ROOT/deploy/bot/pdg.sh"
+PDG="$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")"
 
 echo "══ 0. 先证明这个陷阱真的存在(否则下面几格证明不了什么)══"
 : > "$WORK/empty.txt"

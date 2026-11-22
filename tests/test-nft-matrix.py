@@ -31,6 +31,8 @@ from pathlib import Path
 import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = Path(__file__).resolve().parents[1]
+import sys as _pdg_sys; _pdg_sys.path.insert(0, str(ROOT) + "/tests")  # noqa: E702
+import pdg_source  # noqa: E402  共享 pdg.sh 源码入口(建议 4 第 0 步; 拆分后给出拼回的整份)
 sys.path.insert(0, str(ROOT / "deploy/bot"))
 
 PASS = [0]
@@ -474,7 +476,7 @@ finally:
 
 # 14. 各支持的 hijack-mode —— 同理: 模式从 CLI 的真源取(不是我背出来的), 并证明切换它
 # 只落 mosdns 与 profile.env 两个 target, 一条 nft 规则都不动。
-_shsrc = _io.open(str(ROOT / "deploy/bot/pdg.sh"), encoding="utf-8").read()
+_shsrc = _io.open(str(pdg_source.path(ROOT)), encoding="utf-8").read()
 _hm = _re.search(r"\ncmd_hijack_mode\(\)\{.*?\n\}\n", _shsrc, _re.S)
 (ok if _hm else bad)("[14 hijack-mode] 抽到了 cmd_hijack_mode")
 _hbody = _hm.group(0) if _hm else ""

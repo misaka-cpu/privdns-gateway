@@ -6,6 +6,8 @@ from pathlib import Path
 import re
 import subprocess
 import tempfile
+import sys as _pdg_sys; _pdg_sys.path.insert(0, str(Path(__file__).resolve().parents[1]) + "/tests")  # noqa: E702
+import pdg_source  # noqa: E402  共享 pdg.sh 源码入口(建议 4 第 0 步; 拆分后给出拼回的整份)
 
 
 def blocks(text):
@@ -115,7 +117,7 @@ def main():
     parser.add_argument('--baseline', type=Path)
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
-    text = (root/'deploy/bot/pdg.sh').read_text()
+    text = pdg_source.path(root).read_text()
     decision, action = blocks(text)
     inactive = 'enabled\t0\tinactive\t3'
     active = 'enabled\t0\tactive\t0'

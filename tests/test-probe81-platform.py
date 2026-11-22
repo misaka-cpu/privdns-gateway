@@ -23,6 +23,8 @@ from pathlib import Path
 import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = Path(__file__).resolve().parents[1]
+import sys as _pdg_sys; _pdg_sys.path.insert(0, str(ROOT) + "/tests")  # noqa: E702
+import pdg_source  # noqa: E402  共享 pdg.sh 源码入口(建议 4 第 0 步; 拆分后给出拼回的整份)
 sys.path.insert(0, str(ROOT / "deploy/bot"))
 
 PASS_N = [0]
@@ -137,7 +139,7 @@ for plat in ("android", "ios"):
     pre = '_pdg_core_svc(){ echo sing-box; }\n_pdg_platform(){ echo %s; }' % plat
     for fn in ("_pdg_svcs", "_pdg_required_svcs"):
         pre2 = pre + ('\n_pdg_bot_cred(){ echo ready; }' if fn == "_pdg_required_svcs" else "")
-        rc, out, err = sh_fn("deploy/bot/pdg.sh", fn, pre2, fn)
+        rc, out, err = sh_fn(pdg_source.path(ROOT), fn, pre2, fn)
         (ok if "pdg-probe81" in out else bad)(
             "%s / %s → %s" % (plat, fn, out or ("(空) " + err[:60])))
 
@@ -163,7 +165,7 @@ for pat, what in (
 # ── 6. 平台切换: Android 清理路径不许再删 probe81 ──────────────────────────
 print()
 print("── 6. 平台切换幂等: Android 清理不再删 probe81 ──")
-pdgsh = text("deploy/bot/pdg.sh")
+pdgsh = pdg_source.text(ROOT)
 # 查字符串会误伤注释(说明"不再清理 probe81"的那句本身就含这个词), 所以**真跑一遍**:
 # 进 mount namespace 把 /opt 和 /etc 铺成 tmpfs, 摆好 iOS 现场, 跑清理, 看谁活下来。
 _probe = r"""

@@ -25,7 +25,7 @@ bad(){  printf '[FAIL] %s\n' "$1"; F=$((F+1)); }
 note(){ printf '[NOTE] %s\n' "$1"; }
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SRC="${PDG_SH:-$HERE/../deploy/bot/pdg.sh}"
+SRC="${PDG_SH:-$(bash "$HERE/pdg-source-lib.sh" path "$HERE/..")}"
 [[ -f "$SRC" ]] || { echo "[未执行] 找不到 $SRC"; exit 1; }
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/pdg-enrt.XXXXXX")" || { echo "[未执行] 建不出临时目录"; exit 1; }

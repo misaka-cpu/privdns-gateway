@@ -17,7 +17,7 @@ pass=0; nfail=0
 ok(){ echo "[OK]   $1"; pass=$((pass+1)); }
 bad(){ echo "[FAIL] $1"; nfail=$((nfail+1)); }
 
-sed -n '/^migrate_deploy_units(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh" > "$WORK/fn.sh"
+sed -n '/^migrate_deploy_units(){/,/^}/p' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" > "$WORK/fn.sh"
 grep -q '^migrate_deploy_units(){' "$WORK/fn.sh" || { echo "[FAIL] pdg.sh 里没有 migrate_deploy_units —— update 不会为老机器更新 unit"; exit 1; }
 sed -i -e 's#/etc/#$SB/etc/#g' "$WORK/fn.sh"
 

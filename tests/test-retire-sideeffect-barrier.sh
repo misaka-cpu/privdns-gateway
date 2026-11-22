@@ -14,7 +14,7 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
-PDG="$ROOT/deploy/bot/pdg.sh"
+PDG="$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")"
 BOX="$(mktemp -d)"; trap 'rm -rf "$BOX"' EXIT
 pass=0; nfail=0
 ok(){ echo "[OK]   $1"; pass=$((pass+1)); }

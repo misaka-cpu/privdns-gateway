@@ -29,7 +29,7 @@ bad(){ echo "[FAIL] $1"; nfail=$((nfail+1)); }
 # 生产里缺哪一个, 这里就缺哪一个; 缺失的后果由 tests/test-wloc-retire-error-reporting.sh
 # 用具名行为断言钉住(标题在不在), 不靠静态检查。
 for _f in c_g c_y c_r; do
-  eval "$(grep -m1 -E "^$_f\(\)\{.*\}[[:space:]]*\$" "$ROOT/deploy/bot/pdg.sh")"
+  eval "$(grep -m1 -E "^$_f\(\)\{.*\}[[:space:]]*\$" "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")")"
 done
 unset _f
 
@@ -106,7 +106,7 @@ for _fn in _retire_svc_stopped _retire_core_has_mitm _retire_undo_push _retire_u
            _pdg_now_en _pdg_svc_q _pdg_svc_known _pdg_set_enable_state \
            _retire_report_ca _retire_rerender_core _retire_ios_schema \
            _retire_disable_wloc_json _retire_ca_report migrate_wloc_retire; do
-  eval "$(sed -n "/^$_fn(){/,/^}/p" "$ROOT/deploy/bot/pdg.sh")"
+  eval "$(sed -n "/^$_fn(){/,/^}/p" "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")")"
   declare -F "$_fn" >/dev/null || bad "pdg.sh 里抽不出 $_fn"
 done
 _RETIRE_UNDO=()

@@ -26,6 +26,8 @@ import tmpguard
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+import sys as _pdg_sys; _pdg_sys.path.insert(0, str(ROOT) + "/tests")  # noqa: E702
+import pdg_source  # noqa: E402  共享 pdg.sh 源码入口(建议 4 第 0 步; 拆分后给出拼回的整份)
 TPL = os.path.join(ROOT, "deploy", "firewall", "nftables-mihomo.conf")
 NS = "pdgdrift"
 
@@ -150,10 +152,11 @@ try:
     # 于是垫片明明在也用不上, 表现成"nft 返回非零" —— 看着像内核读不到。
     env = {**os.environ, "PATH": shim + ":/usr/sbin:/usr/bin:/sbin:/bin",
            "REPO_DIR": ROOT}
+    _src = pdg_source.path(ROOT)  # 抽函数读的源码走共享入口; REPO_DIR 仍是仓库根
     SYNC_CMD = (
         'export REPO_DIR=%s; nft(){ printf "%%s\\n" "$*" >> "$PDG_NFT_CALLS"; %s ip netns exec %s /usr/sbin/nft "$@"; }; '
         'c_g(){ echo "    [prod] $*"; }; c_y(){ echo "    [prod] $*"; }; '
-        'eval "$(sed -n "/^_rescue_load()/,/^}/p" %s/deploy/bot/pdg.sh)" 2>/dev/null; '
+        'eval "$(sed -n "/^_rescue_load()/,/^}/p" %s)" 2>/dev/null; '
         # 判据 helper 必须一并抽出 —— 漏了它, 生产函数调到一个未定义的名字, shell 返回
         # command-not-found 的非零, 而那会被当成"内核未收敛"。前一轮就栽在这里:
         # 同一判据单独跑是 ok, 放进测试就红, 差的不是环境, 是这一行。
@@ -163,18 +166,18 @@ try:
         # 主防火墙加载走 _nft_apply_main(它顺带把内网面板的白名单补回内核)。
         # **抽取清单要跟着依赖走** —— 少抽一个的后果不是报错, 而是被测函数里那次调用
         # 静默失败, 于是同步看起来是 no-op, 而失败信息指向别处。
-        'eval "$(sed -n "/^_nft_apply_main()/,/^}/p" %s/deploy/bot/pdg.sh)"; '
+        'eval "$(sed -n "/^_nft_apply_main()/,/^}/p" %s)"; '
         # 常量跟着抽: 路径已从函数体收归 $LAN_NFT_CONF, set -u 下漏了就是 unbound。
-        'eval "$(grep -E \'^LAN_NFT_CONF=\' %s/deploy/bot/pdg.sh)"; '
-        'eval "$(sed -n "/^_lan_nft_reapply()/,/^}/p" %s/deploy/bot/pdg.sh)"; '
-        'eval "$(sed -n "/^_fw_tailnet_direct()/,/^}/p" %s/deploy/bot/pdg.sh)"; '
-        'eval "$(sed -n "/^_fw_ssh_match()/,/^}/p" %s/deploy/bot/pdg.sh)"; '
-        'eval "$(sed -n "/^_fw_live_has_template_invariants()/,/^}/p" %s/deploy/bot/pdg.sh)"; '
-        'eval "$(sed -n "/^migrate_firewall_template_sync()/,/^}/p" %s/deploy/bot/pdg.sh)"; '
+        'eval "$(grep -E \'^LAN_NFT_CONF=\' %s)"; '
+        'eval "$(sed -n "/^_lan_nft_reapply()/,/^}/p" %s)"; '
+        'eval "$(sed -n "/^_fw_tailnet_direct()/,/^}/p" %s)"; '
+        'eval "$(sed -n "/^_fw_ssh_match()/,/^}/p" %s)"; '
+        'eval "$(sed -n "/^_fw_live_has_template_invariants()/,/^}/p" %s)"; '
+        'eval "$(sed -n "/^migrate_firewall_template_sync()/,/^}/p" %s)"; '
         'migrate_firewall_template_sync %s; echo "rc=$?"'
         # ROOT 的个数必须与上面 eval 行数一致 —— 少一个 shell 会拿到字面 "%s" 当路径,
       # sed 读不到文件、抽出空串、函数未定义, 而失败信息指向别处。
-      % (ROOT, SUDO, NS, ROOT, ROOT, ROOT, ROOT, ROOT, ROOT, ROOT, ROOT, conf))
+      % (ROOT, SUDO, NS, _src, _src, _src, _src, _src, _src, _src, _src, conf))
     fn = subprocess.run(SYNC_CMD, shell=True, capture_output=True, text=True, executable="/bin/bash", env=env)
     rc = re.search(r"rc=(\d+)", fn.stdout or "")
     rc = int(rc.group(1)) if rc else -1

@@ -22,7 +22,7 @@ bad(){ echo "[FAIL] $1"; nfail=$((nfail+1)); }
 
 # ── 抽取被测迁移函数 + 打桩 ──────────────────────────────────────────────────
 c_g(){ :; }; c_y(){ :; }
-eval "$(sed -n '/^migrate_mosdns_mitm(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh")"
+eval "$(sed -n '/^migrate_mosdns_mitm(){/,/^}/p' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")")"
 
 # ── 规则 fixture(都在 $WORK/rules, 迁移从 geosite_cn 路径推导目录)──
 mkdir -p "$WORK/rules"

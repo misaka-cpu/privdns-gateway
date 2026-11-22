@@ -364,7 +364,7 @@ _x(){   # $1=函数名 → 抽出整个定义(单行函数只抽那一行, 不�
   awk -v f="$1(){" 'index($0,f)==1{
         print; if($0 ~ /\}[ \t]*$/) exit
         while((getline l)>0){ print l; if(l=="}") exit }
-        exit }' "$ROOT/deploy/bot/pdg.sh"
+        exit }' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")"
 }
 _xok=1
 : > "$INVW/prod.sh"

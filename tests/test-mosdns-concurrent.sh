@@ -12,7 +12,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
 
-eval "$(sed -n '/^_mosdns_add_concurrent(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh")"
+eval "$(sed -n '/^_mosdns_add_concurrent(){/,/^}/p' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")")"
 
 pass=0; nfail=0
 ok(){ echo "[OK]   $1"; pass=$((pass+1)); }

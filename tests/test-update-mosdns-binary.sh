@@ -26,7 +26,7 @@ command -v python3 >/dev/null 2>&1 || { echo "[SKIP] 无 python3"; exit 0; }
 # shellcheck source=tests/repoguard.sh
 source "$ROOT/tests/repoguard.sh"
 
-xt(){ sed -n "/^$1(){/,/^}/p" "$ROOT/deploy/bot/pdg.sh"; }
+xt(){ sed -n "/^$1(){/,/^}/p" "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")"; }
 xtv(){ sed -n "/^$1(){/,/^}/p" "$ROOT/lib/versions.sh"; }
 
 echo "══ 1. 函数存在, 且判据/钉值都取自单一真源 ══"
@@ -89,7 +89,7 @@ run(){
     REPO_DIR="$repo" PDG_CORE_BINDIR="$BIN" ZIPSRC="$zip" CALLS="$WORK/calls.log" \
     bash -c '
       c_g(){ echo "$*"; }; c_y(){ echo "$*"; }
-      '"$(grep -E '^PDG_CORE_(CONNECT_TIMEOUT|MAX_TIME)=' "$ROOT/deploy/bot/pdg.sh")"'
+      '"$(grep -E '^PDG_CORE_(CONNECT_TIMEOUT|MAX_TIME)=' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")")"'
       '"$(xt _core_bindir)"'
       '"$(xt _pdg_mktemp_dir)"'
       '"$(xt _core_dl_reason)"'
@@ -169,7 +169,7 @@ grep -q 'versions.sh' <<<"$out" && ok "说清了是读不到 versions.sh" || bad
 
 echo
 echo "══ 7. cmd_update 里的位置与处置 ══"
-UPD="$(sed -n '/^cmd_update(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh")"
+UPD="$(sed -n '/^cmd_update(){/,/^}/p' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")")"
 grep -q '_update_mosdns_binary' <<<"$UPD" \
   && ok "cmd_update 真的调了它(不是只定义不用)" || bad "cmd_update 没调用 —— 定义了等于没有"
 P_MOS="$(grep -n '_update_mosdns_binary' <<<"$UPD" | head -1 | cut -d: -f1)"
@@ -189,7 +189,7 @@ echo
 echo "══ 8. 快照必须收进 mosdns 二进制 ══"
 # 换核成功、后面某一步失败 → cmd_rollback 得能把旧二进制放回去。快照不收它的话,
 # 机器会停在"新二进制 + 旧仓库"这个既不是前也不是后的状态。
-sed -n '/local cand=(/,/)$/p' "$ROOT/deploy/bot/pdg.sh" | grep -q 'usr/local/bin/mosdns' \
+sed -n '/local cand=(/,/)$/p' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" | grep -q 'usr/local/bin/mosdns' \
   && ok "cmd_snapshot cand 含 usr/local/bin/mosdns(回滚退得回去)" \
   || bad "快照不含 mosdns 二进制 —— 换核后回滚会退不干净"
 

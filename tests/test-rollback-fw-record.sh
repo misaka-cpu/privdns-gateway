@@ -26,7 +26,7 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
-PDG="${PDG_UNDER_TEST:-$ROOT/deploy/bot/pdg.sh}"
+PDG="${PDG_UNDER_TEST:-$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")}"
 MODE="${PDG_FW_MODE:-pass}"
 FROZEN_REF=6843905e07af5957a3013cab06f11890757fc5e9
 WORK="$(mktemp -d)" || { echo "[INVALID] 建不出临时目录"; exit 2; }

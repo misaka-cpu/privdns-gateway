@@ -69,8 +69,8 @@ NOBIN="$WORK/empty:/usr/bin:/bin"
   && bad "内核不存在却判成已是目标版本(会跳过安装)" || ok "读不到版本 → 判为非目标版本(不会跳过安装)"
 
 # ── 7. 三个调用点都不再用子串判断 ──
-if grep -nE 'mihomo -v [^|]*\| *grep -q' "$ROOT/install.sh" "$ROOT/deploy/bot/pdg.sh" >/dev/null 2>&1; then
-  bad "仍有 mihomo 版本子串判断: $(grep -nE 'mihomo -v [^|]*\| *grep -q' "$ROOT/install.sh" "$ROOT/deploy/bot/pdg.sh" | head -2)"
+if grep -nE 'mihomo -v [^|]*\| *grep -q' "$ROOT/install.sh" "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" >/dev/null 2>&1; then
+  bad "仍有 mihomo 版本子串判断: $(grep -nE 'mihomo -v [^|]*\| *grep -q' "$ROOT/install.sh" "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" | head -2)"
 else
   ok "install.sh / pdg.sh 已无 mihomo 版本子串判断"
 fi

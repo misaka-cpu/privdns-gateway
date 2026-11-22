@@ -39,6 +39,8 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+import sys as _pdg_sys; _pdg_sys.path.insert(0, str(ROOT) + "/tests")  # noqa: E702
+import pdg_source  # noqa: E402  共享 pdg.sh 源码入口(建议 4 第 0 步; 拆分后给出拼回的整份)
 sys.path.insert(0, str(ROOT / "tests"))
 import tmpguard          # noqa: E402
 
@@ -135,7 +137,7 @@ if rf and rf[0] == "fail":
 
 print("\n== 6. WARN 不改变 doctor 总退出码 ==")
 # 更新自检只按 level=="fail" 计数(deploy/bot/pdg.sh 的内嵌 python)。
-pdg = (ROOT / "deploy/bot/pdg.sh").read_text(encoding="utf-8")
+pdg = (pdg_source.path(ROOT)).read_text(encoding="utf-8")
 (ok if 'fails = [x for x in d if x.get("level") == "fail"]' in pdg else bad)(
     "更新自检只把 level==fail 计入失败数")
 (ok if 'warns = [x for x in d if x.get("level") == "warn"]' in pdg else bad)(

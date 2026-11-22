@@ -24,12 +24,12 @@ trap cleanup EXIT
 
 extract(){
   local fn="$1" ln
-  ln="$(grep -n "^${fn}()" "$ROOT/deploy/bot/pdg.sh" | head -1 | cut -d: -f1)"
+  ln="$(grep -n "^${fn}()" "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" | head -1 | cut -d: -f1)"
   [[ -n "$ln" ]] || { echo "抽不到 $fn" >&2; return 1; }
-  if sed -n "${ln}p" "$ROOT/deploy/bot/pdg.sh" | grep -qE '^[A-Za-z_][A-Za-z0-9_]*\(\)\{.*\}[[:space:]]*$'; then
-    sed -n "${ln}p" "$ROOT/deploy/bot/pdg.sh"
+  if sed -n "${ln}p" "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" | grep -qE '^[A-Za-z_][A-Za-z0-9_]*\(\)\{.*\}[[:space:]]*$'; then
+    sed -n "${ln}p" "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")"
   else
-    sed -n "${ln},/^}/p" "$ROOT/deploy/bot/pdg.sh"
+    sed -n "${ln},/^}/p" "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")"
   fi
 }
 CLOSURE="$WORK/closure.sh"; : > "$CLOSURE"

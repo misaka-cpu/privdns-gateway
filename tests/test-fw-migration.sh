@@ -15,7 +15,7 @@ ROOT="$(cd "$HERE/.." && pwd)"
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
 
 # 抽出被测函数(避免 source 整个 pdg.sh 触发它底部的命令分发)
-eval "$(sed -n '/^_fw_is_stock(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh")"
+eval "$(sed -n '/^_fw_is_stock(){/,/^}/p' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")")"
 
 # 生成一份"原装"防火墙: $1端口 $2内网段 $3端口集 $4是否有reject(1/0) $5排版(single|multi)
 gen_stock(){

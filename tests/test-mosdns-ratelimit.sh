@@ -21,7 +21,7 @@ ok(){ echo "[OK]   $1"; pass=$((pass+1)); }
 bad(){ echo "[FAIL] $1"; nfail=$((nfail+1)); }
 
 # ── A. 迁移幂等(纯文本, stub systemctl)──────────────────────────────────────
-eval "$(sed -n '/^migrate_mosdns_ratelimit(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh")"
+eval "$(sed -n '/^migrate_mosdns_ratelimit(){/,/^}/p' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")")"
 c_g(){ :; }; c_y(){ :; }
 SVC_STATE=active
 systemctl(){ [[ "$1" == is-active ]] && echo "$SVC_STATE"; return 0; }

@@ -16,7 +16,7 @@ bad(){ echo "[FAIL] $1"; nfail=$((nfail+1)); }
 eq(){ [[ "$1" == "$2" ]] && ok "$3 ($1)" || bad "$3: 期望 $2 实为 $1"; }
 
 # 抽出低内存整段(LOWMEM_THRESHOLD_KB ... 到 migrate_lowmem 结束, 即 pdg_fetch_release_tags 之前)
-sed -n '/^LOWMEM_THRESHOLD_KB=/,/^pdg_fetch_release_tags(){/p' "$ROOT/deploy/bot/pdg.sh" | sed '$d' > "$WORK/lowmem.sh"
+sed -n '/^LOWMEM_THRESHOLD_KB=/,/^pdg_fetch_release_tags(){/p' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" | sed '$d' > "$WORK/lowmem.sh"
 cat > "$WORK/harness.sh" <<EOF
 c_g(){ :; }; c_y(){ :; }
 SVC_STATE=active

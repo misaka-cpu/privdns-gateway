@@ -70,12 +70,12 @@ for fn in _ios_offer_teardown _ios_offer_nft_close _ios_offer_chain _ios_offer_m
           _ios_offer_state_write _ios_offer_dir_ok _ios_offer_root_ok _ios_offer_reap_dir \
           _ios_offer_dir_pid _ios_offer_proc_state _ios_offer_stop_pid _ios_offer_list \
           _ios_offer_stop_child _ios_offer_proc_dead; do
-  sed -n "/^$fn()/,/^}/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
+  sed -n "/^$fn()/,/^}/p" "$(bash tests/pdg-source-lib.sh path .)" >> "$CH_DIR/fn.sh"
 done
 grep -E '^(IOS_OFFER_MARK|IOS_OFFER_LOCK|IOS_OFFER_STATE|IOS_OFFER_ROOT|IOS_OFFER_SENTINEL|IOS_OFFER_PIDFILE|IOS_OFFER_GENFILE)=' \
-  deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
+  "$(bash tests/pdg-source-lib.sh path .)" >> "$CH_DIR/fn.sh"
 for v in IOS_OFFER_SERVER; do
-  sed -n "/^$v='/,/^'\$/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
+  sed -n "/^$v='/,/^'\$/p" "$(bash tests/pdg-source-lib.sh path .)" >> "$CH_DIR/fn.sh"
 done
 missing=""
 for fn in $(grep -oE '_ios_offer_[a-z_]+' "$CH_DIR/fn.sh" | sort -u); do

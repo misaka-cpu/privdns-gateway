@@ -20,7 +20,7 @@ pass=0; nfail=0
 ok(){   echo "[OK]   $1"; pass=$((pass+1)); }
 bad(){  echo "[FAIL] $1"; nfail=$((nfail+1)); }
 
-PDG="$ROOT/deploy/bot/pdg.sh"
+PDG="$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")"
 
 mkclosure(){   # 抽函数 + 打桩, 记录 systemctl 被怎么调的
   local c="$WORK/c.sh"

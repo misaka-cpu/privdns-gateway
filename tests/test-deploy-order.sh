@@ -20,8 +20,8 @@ PASS=0; FAIL=0
 ok(){ echo "[OK]   $1"; PASS=$((PASS+1)); }
 bad(){ echo "[FAIL] $1"; FAIL=$((FAIL+1)); }
 
-FN="$(awk '/^_pdg_modules_digest\(\)\{/,/^\}/' "$ROOT/deploy/bot/pdg.sh")
-$(awk '/^migrate_deploy_botfiles\(\)\{/,/^\}/' "$ROOT/deploy/bot/pdg.sh")"
+FN="$(awk '/^_pdg_modules_digest\(\)\{/,/^\}/' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")")
+$(awk '/^migrate_deploy_botfiles\(\)\{/,/^\}/' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")")"
 { [[ -n "$FN" ]] && grep -q "_pdg_modules_digest()" <<<"$FN"; } \
   || { bad "抽不到 migrate_deploy_botfiles / _pdg_modules_digest"; echo "通过 $PASS, 失败 $FAIL"; exit 1; }
 
@@ -158,7 +158,7 @@ S
 chmod 755 "$C/bin/systemctl"; : > "$C/calls.log"
 # ① cmd_update 的函数体
 CU="$C/cmd_update.txt"
-awk '/^cmd_update\(\)\{/{f=1} f{print} f&&/^\}$/{exit}' "$ROOT/deploy/bot/pdg.sh" > "$CU"
+awk '/^cmd_update\(\)\{/{f=1} f{print} f&&/^\}$/{exit}' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" > "$CU"
 C_OK=1
 if [[ ! -s "$CU" ]] || ! grep -q '^cmd_update(){' "$CU" || [[ "$(tail -1 "$CU")" != "}" ]]; then
   bad "C: 抽不到 cmd_update 的完整函数体(改名或结构变了)—— 本节判据无效, 不按'没重启'记"; C_OK=0

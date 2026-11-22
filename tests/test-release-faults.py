@@ -26,6 +26,8 @@ import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+import sys as _pdg_sys; _pdg_sys.path.insert(0, str(ROOT) + "/tests")  # noqa: E702
+import pdg_source  # noqa: E402  共享 pdg.sh 源码入口(建议 4 第 0 步; 拆分后给出拼回的整份)
 
 PASS = [0]
 FAIL = [0]
@@ -50,7 +52,7 @@ def sh(body, cwd=None):
     return r.returncode, r.stdout + r.stderr
 
 
-PDG = open(os.path.join(ROOT, "deploy/bot/pdg.sh"), encoding="utf-8").read()
+PDG = open(pdg_source.path(ROOT), encoding="utf-8").read()
 UPD = PDG[PDG.index("\ncmd_update(){"):]
 UPD = UPD[:UPD.index("\n}\n")]
 

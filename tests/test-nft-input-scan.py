@@ -20,6 +20,8 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+import sys as _pdg_sys; _pdg_sys.path.insert(0, str(ROOT) + "/tests")  # noqa: E702
+import pdg_source  # noqa: E402  共享 pdg.sh 源码入口(建议 4 第 0 步; 拆分后给出拼回的整份)
 NFTSCAN = ROOT / "deploy/bot/nftscan.py"
 
 spec = importlib.util.spec_from_file_location("nftscan", NFTSCAN)
@@ -440,7 +442,7 @@ table inet filter {
     checks.os.geteuid = os.geteuid
 
     # ── 8. 单一来源: pdg.sh 不得再自带一份解析实现 ──
-    pdg_src = (ROOT / "deploy/bot/pdg.sh").read_text(encoding="utf-8")
+    pdg_src = (pdg_source.path(ROOT)).read_text(encoding="utf-8")
     fn = pdg_src.split("_pdg_nft_foreign_input_chains(){", 1)[1].split("\n}\n", 1)[0]
     assert "nftscan.py" in fn, "pdg.sh 应调用共享的 nftscan.py"
     assert "hook\\s+input" not in fn and "hook input" not in fn.replace("hook input 的", ""), \
@@ -474,7 +476,7 @@ table inet filter {
     # /usr/sbin —— `su`(不带 -)、cron、精简容器的 root PATH 里没有 sbin, 于是整条校验被
     # 静默跳过: 平台切换会把一份 nft 根本不认的 nftables.conf 当成"校验通过"放行, 事务
     # 照常提交, 直到下次开机防火墙起不来才发作。
-    pdg_src_txt = (ROOT / "deploy/bot/pdg.sh").read_text(encoding="utf-8")
+    pdg_src_txt = (pdg_source.path(ROOT)).read_text(encoding="utf-8")
 
     def _fn_body(name):
         head = "%s(){" % name

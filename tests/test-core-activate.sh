@@ -22,8 +22,8 @@ bad(){ echo "[FAIL] $1"; nfail=$((nfail+1)); }
 
 # ── 抽取被测函数 + 单一事实源 unit 库 ────────────────────────────────────────
 # 逐个函数抽(不靠"下一个函数名"当结束标记 —— 那个标记一旦改名/删除就会把整份文件拖进来)
-sed -n '/^_core_kernel_activate(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh"  > "$WORK/helpers.sh"
-sed -n '/^_core_kernel_restore(){/,/^}/p'  "$ROOT/deploy/bot/pdg.sh" >> "$WORK/helpers.sh"
+sed -n '/^_core_kernel_activate(){/,/^}/p' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")"  > "$WORK/helpers.sh"
+sed -n '/^_core_kernel_restore(){/,/^}/p'  "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" >> "$WORK/helpers.sh"
 { grep -q '^_core_kernel_activate(){' "$WORK/helpers.sh" && grep -q '^_core_kernel_restore(){' "$WORK/helpers.sh"; } \
   && ok "抽出 activate/restore 两个收尾函数" || bad "抽取失败"
 
@@ -109,11 +109,11 @@ source "$ROOT/lib/units.sh"
 pdg_unit_mihomo | grep -q 'Environment=SAFE_PATHS=/etc/sing-box/ui/dist' && ok "mihomo unit 含 SAFE_PATHS(切核不再漏)" || bad "mihomo unit 缺 SAFE_PATHS"
 [[ "$(pdg_unit_mihomo)" == "$(pdg_unit_for_core_svc mihomo)" ]] && ok "pdg_unit_for_core_svc(mihomo) 与 pdg_unit_mihomo 同源" || bad "unit 生成不一致"
 # install.sh 与 switch-core 都调 pdg_write_unit pdg_unit_mihomo → 内容必然一致(同函数)
-grep -q 'pdg_write_unit pdg_unit_mihomo' "$ROOT/install.sh" && grep -q 'pdg_write_unit pdg_unit_mihomo' "$ROOT/deploy/bot/pdg.sh" \
+grep -q 'pdg_write_unit pdg_unit_mihomo' "$ROOT/install.sh" && grep -q 'pdg_write_unit pdg_unit_mihomo' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" \
   && ok "install.sh 与 迁移均用 pdg_write_unit pdg_unit_mihomo(无手写漂移)" || bad "两处未统一到 units.sh"
 
 # ── F. v1.6.0: 换核命令已移除 —— 不该再有 switch-core 入口/双核分支残留 ─────────
-{ ! grep -q 'cmd_switch_core' "$ROOT/deploy/bot/pdg.sh" && ! grep -q 'switch-core)' "$ROOT/deploy/bot/pdg.sh"; } \
+{ ! grep -q 'cmd_switch_core' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" && ! grep -q 'switch-core)' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")"; } \
   && ok "pdg.sh 无 switch-core 命令残留(mihomo 为唯一内核)" || bad "pdg.sh 仍有 switch-core 残留"
 # 只认**函数定义**: 注释里提到这个名字是合理的(pdg_write_unit 的原子化就是为了挡住
 # 旧 updater 调它), 拿裸 grep 会误报。

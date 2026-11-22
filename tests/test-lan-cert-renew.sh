@@ -15,7 +15,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PDG="$ROOT/deploy/bot/pdg.sh"
+PDG="$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")"
 WORK="$(mktemp -d)"
 SPID_FILE="$WORK/s_server.pid"
 cleanup(){ [[ -s "$SPID_FILE" ]] && kill "$(cat "$SPID_FILE")" 2>/dev/null; rm -rf "$WORK"; }

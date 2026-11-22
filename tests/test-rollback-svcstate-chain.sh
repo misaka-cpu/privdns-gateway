@@ -66,7 +66,7 @@ for _m in etc opt usr/local/bin run; do
 done
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
-PDG="${PDG_UNDER_TEST:-$ROOT/deploy/bot/pdg.sh}"
+PDG="${PDG_UNDER_TEST:-$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")}"
 # PDG_CHAIN_KEEP: 留现场用的调试开关(退役线带来的)。留的是**本轮自己建的** WORK;
 # $FAKE 是另一处 mktemp -d 的自有根, 无论留不留现场都照常清掉 —— 开关只管"留证据",
 # 不该顺带把清理一起关掉。

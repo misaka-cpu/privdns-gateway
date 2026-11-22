@@ -33,12 +33,12 @@ command -v git >/dev/null 2>&1 || { echo "[SKIP] 没有 git —— 这一支必�
 # shellcheck source=tests/repoguard.sh
 source "$ROOT/tests/repoguard.sh"
 
-sed -n '/^cmd_update(){/,/^}/p'                 "$ROOT/deploy/bot/pdg.sh" > "$WORK/upd.sh"
-sed -n '/^_update_release_relation(){/,/^}/p'   "$ROOT/deploy/bot/pdg.sh" > "$WORK/rel.sh"
+sed -n '/^cmd_update(){/,/^}/p'                 "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" > "$WORK/upd.sh"
+sed -n '/^_update_release_relation(){/,/^}/p'   "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" > "$WORK/rel.sh"
 # behind 那一路现在还要过一次 mosdns 完整性预检。判据本身另有专测
 # (test-update-mosdns-preflight.sh), 这一支只关心方向, 所以把真函数抽出来、再用一个
 # 恒真的替身盖住 —— 不抽的话是 command-not-found, 那测的既不是方向也不是完整性。
-sed -n '/^_update_mosdns_preflight(){/,/^}/p'  "$ROOT/deploy/bot/pdg.sh" >> "$WORK/rel.sh"
+sed -n '/^_update_mosdns_preflight(){/,/^}/p'  "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" >> "$WORK/rel.sh"
 printf '_update_mosdns_preflight(){ return 0; }\n' >> "$WORK/rel.sh"
 
 # ── 判据函数必须存在, 且**只有一份** ────────────────────────────────────────
@@ -48,9 +48,9 @@ if [[ -s "$WORK/rel.sh" ]]; then
 else
   bad "pdg.sh 里没有 _update_release_relation —— 关系判断没有单一事实源"
 fi
-_ndef=$(grep -c '^_update_release_relation(){' "$ROOT/deploy/bot/pdg.sh")
+_ndef=$(grep -c '^_update_release_relation(){' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")")
 [[ "$_ndef" == 1 ]] && ok "判据只定义了一次(实得 $_ndef)" || bad "判据定义了 $_ndef 次"
-_nuse=$(grep -c '_update_release_relation' "$ROOT/deploy/bot/pdg.sh")
+_nuse=$(grep -c '_update_release_relation' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")")
 [[ "$_nuse" -ge 3 ]] \
   && ok "判据被 dry-run 与正式路径共用(引用 $_nuse 处 ≥ 定义1+调用2)" \
   || bad "判据只出现 $_nuse 处 —— dry-run 与正式 update 没有共用它"

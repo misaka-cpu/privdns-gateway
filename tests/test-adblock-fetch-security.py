@@ -30,6 +30,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import tmpguard          # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
+import sys as _pdg_sys; _pdg_sys.path.insert(0, str(ROOT) + "/tests")  # noqa: E702
+import pdg_source  # noqa: E402  共享 pdg.sh 源码入口(建议 4 第 0 步; 拆分后给出拼回的整份)
 MOD = ROOT / "deploy/bot/adblock.py"
 
 PASS, FAIL = [0], []
@@ -315,7 +317,7 @@ srv.close()
 
 # ══ ⑧ shell → Python 字面量插值(静态)═════════════════════════════════════
 print("══ ⑧ shell/Python 边界 ══")
-pdgsh = (ROOT / "deploy/bot/pdg.sh").read_text(encoding="utf-8")
+pdgsh = (pdg_source.path(ROOT)).read_text(encoding="utf-8")
 import re as _re
 body = _re.search(r"^_adblock_status\(\)\{.*?^\}", pdgsh, _re.S | _re.M)
 if not body:

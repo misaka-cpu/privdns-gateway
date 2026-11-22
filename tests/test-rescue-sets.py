@@ -24,6 +24,8 @@ import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+import sys as _pdg_sys; _pdg_sys.path.insert(0, str(ROOT) + "/tests")  # noqa: E702
+import pdg_source  # noqa: E402  共享 pdg.sh 源码入口(建议 4 第 0 步; 拆分后给出拼回的整份)
 PASS = [0]
 FAIL = [0]
 
@@ -220,7 +222,7 @@ if "nftscan.py" in got_closure:
 else:
     bad("闭包漏了 nftscan.py")
 
-pdg = open(os.path.join(ROOT, "deploy/bot/pdg.sh"), encoding="utf-8").read()
+pdg = open(pdg_source.path(ROOT), encoding="utf-8").read()
 hand = re.findall(r"for \w+ in rescue\.py[^;]*;", pdg)
 if not hand:
     ok("pdg.sh 里没有手写的第二份模块名单(enable 与 status 都读闭包真源)")

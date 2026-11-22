@@ -31,6 +31,8 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+import sys as _pdg_sys; _pdg_sys.path.insert(0, str(ROOT) + "/tests")  # noqa: E702
+import pdg_source  # noqa: E402  共享 pdg.sh 源码入口(建议 4 第 0 步; 拆分后给出拼回的整份)
 sys.path.insert(0, str(ROOT / "deploy/bot"))
 TMPL = (ROOT / "deploy/mosdns/config.yaml").read_text(encoding="utf-8")
 
@@ -72,7 +74,7 @@ m = LINE_RE.search(TMPL)
 (ok if m else bad)("模板里找得到 `!$client_limiter` 那一行")
 (ok if m and m.group(2).strip().startswith("#") else bad)(
     "模板那一行**带行尾注释**(实得 %r)" % (m.group(2).strip()[:40] if m else None))
-mig = (ROOT / "deploy/bot/pdg.sh").read_text(encoding="utf-8")
+mig = (pdg_source.path(ROOT)).read_text(encoding="utf-8")
 mm = re.search(r"step='''(.*?)'''", mig, re.S)
 (ok if mm and "#" not in mm.group(1) else bad)(
     "migrate_mosdns_ratelimit 写出来的**不带**行尾注释")

@@ -200,9 +200,9 @@ REPO_DIR="$R"
 c_g(){ echo "$@"; }
 c_y(){ echo "$@"; }
 DW_MOS=/etc/mosdns/config.yaml
-_fn="$(python3 - "$R" <<'PY'
+_fn="$(python3 - "$(bash "$R/tests/pdg-source-lib.sh" path "$R")" <<'PY'
 import sys
-s = open(sys.argv[1] + "/deploy/bot/pdg.sh").read()
+s = open(sys.argv[1]).read()
 a = s.index("# ── 6.2B: DoT 证据端(observer)的生命周期状态机")
 b = s.index("migrate_probe81_public(){")
 sys.stdout.write(s[a:b])

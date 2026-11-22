@@ -13,7 +13,7 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
-PDG="$ROOT/deploy/bot/pdg.sh"
+PDG="$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/pdg-platnotify.XXXXXX")"
 [[ -n "${PDG_KEEP_TMP:-}" ]] || trap 'rm -rf "$WORK"' EXIT
 pass=0; nfail=0

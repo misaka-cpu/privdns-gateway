@@ -17,6 +17,8 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+import sys as _pdg_sys; _pdg_sys.path.insert(0, str(ROOT) + "/tests")  # noqa: E702
+import pdg_source  # noqa: E402  共享 pdg.sh 源码入口(建议 4 第 0 步; 拆分后给出拼回的整份)
 
 PASS = [0]
 FAIL = [0]
@@ -94,7 +96,7 @@ else:
 
 print("\n== 3. install / update / uninstall 三方都读同一份真源 ==")
 inst = open(os.path.join(ROOT, "install.sh"), encoding="utf-8").read()
-pdg = open(os.path.join(ROOT, "deploy/bot/pdg.sh"), encoding="utf-8").read()
+pdg = open(pdg_source.path(ROOT), encoding="utf-8").read()
 resc = open(os.path.join(ROOT, "lib/rescue.sh"), encoding="utf-8").read()
 
 # install.sh 里不许再出现"手写一行装进 /opt/pdg-bot"。注释行不算 —— 说明问题时会引用旧写法。

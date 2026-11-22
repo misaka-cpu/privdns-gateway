@@ -45,7 +45,7 @@ PIN="$MIHOMO_VER"; PIN_BIN="${PDG_SHA256[mihomo-bin-$MARCH]:-}"
 xt(){
   awk -v f="$1(){" '
     index($0, f) == 1 { print; if ($0 ~ /; *}[[:space:]]*$/) exit; on = 1; next }
-    on { print; if ($0 ~ /^}/) exit }' "$ROOT/deploy/bot/pdg.sh"
+    on { print; if ($0 ~ /^}/) exit }' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")"
 }
 FNS=(_core_bindir _pdg_sha _core_stash_kernel _core_restore_prev _core_kernel_stable _core_restart_clean
      _core_listeners _core_swap_verify _pdg_mktemp_dir _core_dl_reason _update_core_binary _pdg_module
@@ -62,8 +62,8 @@ done
 BIN="$WORK/bin"; CFG="$WORK/etc-mihomo"; ETC="$WORK/etc"; SRV="$WORK/serve"
 mkdir -p "$BIN" "$CFG" "$ETC" "$SRV" "$WORK/repo/lib" "$WORK/repo/deploy/bot"
 {
-  grep -E '^PDG_CORE_(CONNECT_TIMEOUT|MAX_TIME)=' "$ROOT/deploy/bot/pdg.sh"
-  grep -E '^KF_[A-Z]+=' "$ROOT/deploy/bot/pdg.sh"      # 全局状态行原样取自生产文件
+  grep -E '^PDG_CORE_(CONNECT_TIMEOUT|MAX_TIME)=' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")"
+  grep -E '^KF_[A-Z]+=' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")"      # 全局状态行原样取自生产文件
   echo 'c_g(){ echo "$*"; }; c_y(){ echo "$*"; }; sleep(){ :; }; need_root(){ :; }; _lock(){ :; }'
   echo 'hostname(){ echo testgw; }; dpkg(){ echo amd64; }; ss(){ :; }'
   # logger 桩: 记下标识 / 级别 / 正文, 好核对 _pdg_event 的调用形状, 而不只是正文

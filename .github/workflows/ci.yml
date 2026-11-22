@@ -1321,6 +1321,10 @@ jobs:
         if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-file-sets.py
 
+      - name: "tests 共享的 pdg.sh 源码入口 (未拆分时就是 pdg.sh 本身; 拆分后拼回逐字节相同; 按名抽函数抽不到就报错)"
+        if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
+        run: python3 tests/test-pdg-source.py
+
       - name: "CI 覆盖守卫 (每个测试文件都必须真的被本 workflow 调用)"
         if: ${{ !cancelled() && steps.ready.outcome == 'success' }}
         run: python3 tests/test-ci-coverage.py

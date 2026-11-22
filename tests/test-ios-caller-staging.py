@@ -61,7 +61,7 @@ set -uo pipefail
 cd "$CH_ROOT"
 : > "$CH_DIR/fn.sh"
 for fn in cmd_ios cmd_ios_previous; do
-  sed -n "/^$fn()/,/^}/p" deploy/bot/pdg.sh >> "$CH_DIR/fn.sh"
+  sed -n "/^$fn()/,/^}/p" "$(bash tests/pdg-source-lib.sh path .)" >> "$CH_DIR/fn.sh"
 done
 grep -q '_ios_offer_session_begin' "$CH_DIR/fn.sh" || { echo "EXTRACT-FAIL-session"; exit 9; }
 # 会话内部不是这一支要测的东西, 顶掉它: 成功时给一个本轮目录, 失败注入时直接返回非零。

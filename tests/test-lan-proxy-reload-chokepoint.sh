@@ -21,7 +21,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-F="$ROOT/deploy/bot/pdg.sh"
+F="$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")"
 PASS=0; FAIL=0
 ok(){  echo "[OK]   $1"; PASS=$((PASS+1)); }
 bad(){ echo "[FAIL] $1"; FAIL=$((FAIL+1)); }

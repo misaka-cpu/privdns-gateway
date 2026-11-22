@@ -18,6 +18,8 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+import sys as _pdg_sys; _pdg_sys.path.insert(0, str(ROOT) + "/tests")  # noqa: E702
+import pdg_source  # noqa: E402  共享 pdg.sh 源码入口(建议 4 第 0 步; 拆分后给出拼回的整份)
 sys.path.insert(0, str(ROOT / "tests"))
 import tmpguard          # noqa: E402
 PASS, FAIL = [0], [0]
@@ -52,7 +54,7 @@ spec = u.spec_from_file_location("pdg_bot", str(ROOT / "deploy/bot/pdg-bot.py"))
 bot = u.module_from_spec(spec)
 spec.loader.exec_module(bot)
 SRC = (ROOT / "deploy/bot/pdg-bot.py").read_text(encoding="utf-8")
-PDG = ROOT / "deploy/bot/pdg.sh"
+PDG = pdg_source.path(ROOT)
 
 LOG = []          # (ident, priority, message)
 _ident = [None]

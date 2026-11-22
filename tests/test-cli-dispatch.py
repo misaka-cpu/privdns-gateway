@@ -28,7 +28,9 @@ from pathlib import Path
 import tmpguard          # 一次性临时目录: 建了就登记, 退出即清
 
 ROOT = Path(__file__).resolve().parents[1]
-PDG = ROOT / "deploy" / "bot" / "pdg.sh"
+import sys as _pdg_sys; _pdg_sys.path.insert(0, str(ROOT) + "/tests")  # noqa: E702
+import pdg_source  # noqa: E402  共享 pdg.sh 源码入口(建议 4 第 0 步; 拆分后给出拼回的整份)
+PDG = pdg_source.path(ROOT)
 
 PASS = [0]
 FAIL = [0]

@@ -14,11 +14,11 @@ pass=0; nfail=0
 ok(){ echo "[OK]   $1"; pass=$((pass+1)); }
 bad(){ echo "[FAIL] $1"; nfail=$((nfail+1)); }
 
-sed -n '/^cmd_update(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh" > "$WORK/upd.sh"
+sed -n '/^cmd_update(){/,/^}/p' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" > "$WORK/upd.sh"
 # cmd_update 现在先问一次"这次到底是不是在往前走"(_update_release_relation)。判据要**真**跟着
 # 抽出来: 缺了它, cmd_update 会在第一道门上就 command-not-found → 判不出关系 → 拒绝执行,
 # 于是下面每一条故障注入都打在同一个空处, 而它们本来是要测后面那些阶段的。
-sed -n '/^_update_release_relation(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh" >> "$WORK/upd.sh"
+sed -n '/^_update_release_relation(){/,/^}/p' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" >> "$WORK/upd.sh"
 
 mkdir -p "$WORK/repo/.git"          # 让 [[ -d $REPO_DIR/.git ]] 为真, 跳过 clone
 # cmd_update 会 source 运行模块清单(lib/modules.sh)。桩仓库里给一份**同名同函数**的替身:
@@ -210,7 +210,7 @@ assert_fail_rollback "doctor 报 fail 项"        "DOCTOR_OUT=fail"
 # "未运行: pdg-bot" 的那条 fail 挑出来忽略 —— 只要 doctor 那句话改个措辞或多一个服务名,
 # 豁免就失效, 没配 bot 的机器会永远升级失败。现在改由 doctor 自己按凭据状态决定要不要把
 # pdg-bot 列进必需服务(checks.expected_services), 校验门只管"有没有 fail"。
-grep -q '未运行: pdg-bot' "$ROOT/deploy/bot/pdg.sh" \
+grep -q '未运行: pdg-bot' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" \
   && bad "pdg.sh 里仍有按文案豁免的逻辑(应改由 checks.expected_services 决定)" \
   || ok "校验门不再按 detail 文案豁免检查项"
 r=$(run "DOCTOR_OUT=onlybot"); rc="${r%%|*}"; out="${r#*|}"

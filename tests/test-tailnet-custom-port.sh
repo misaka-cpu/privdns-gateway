@@ -27,9 +27,9 @@ bad(){  echo "[FAIL] $1"; nfail=$((nfail+1)); }
 # 里那段说明: 只抽函数会漏掉顶层赋值, 而 pdg.sh 跑在 set -u 下, 漏一个就在某条分支上炸。
 CLOSURE="$WORK/closure.sh"; : > "$CLOSURE"
 extract(){
-  local ln; ln="$(grep -n "^$1()" "$ROOT/deploy/bot/pdg.sh" | head -1 | cut -d: -f1)" || return 1
+  local ln; ln="$(grep -n "^$1()" "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" | head -1 | cut -d: -f1)" || return 1
   [[ -n "$ln" ]] || return 1
-  sed -n "${ln},/^}/p" "$ROOT/deploy/bot/pdg.sh"
+  sed -n "${ln},/^}/p" "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")"
 }
 for fn in _fw_tailnet_direct _ssh_source_rewrite _ssh_ts_probe _ssh_ts_port _ssh_ts_why _ssh_ts_accept; do
   extract "$fn" >> "$CLOSURE" 2>/dev/null || true      # 后两个是本支要新增的, 现在抽不到
@@ -37,7 +37,7 @@ for fn in _fw_tailnet_direct _ssh_source_rewrite _ssh_ts_probe _ssh_ts_port _ssh
 done
 # `=(` 开头的是**多行数组**赋值(_PLAT_IOS_REQUIRED), 逐行改写会把它切碎, 整个闭包从那里
 # 语法错、后面的定义全部丢失 —— 而表现是"函数没定义、输出全空", 看不出根因在这里。跳过它们。
-grep -E '^[A-Z_][A-Z0-9_]*=' "$ROOT/deploy/bot/pdg.sh" \
+grep -E '^[A-Z_][A-Z0-9_]*=' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" \
   | grep -vE '^[A-Z_][A-Z0-9_]*=\(' \
   | sed -E 's/^([A-Z_][A-Z0-9_]*)=(.*)$/\1="${\1:-}"; [[ -z "${\1}" ]] \&\& \1=\2/' >> "$CLOSURE"
 # 闭包必须**能整份解析**。上面那类切碎一旦再发生, 这里立刻判死 —— 否则后面每一格都在
@@ -128,7 +128,7 @@ echo "══ 7. 状态显示与幂等判据也不许按端口号认 ══"
 #     而跑完还是这句, 用户被指向一个修不好的循环。
 #   · `ssh-source tailnet` 的"已经是 tailnet"判据同样按 41641 找 —— 自定义端口下判成"还没收紧",
 #     于是又走一遍 apply(幸好 rewrite 那边幂等), 并再次起自动回退定时器。
-_pdgsh="$ROOT/deploy/bot/pdg.sh"
+_pdgsh="$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")"
 _show_body="$(sed -n '/^_ssh_source_show()/,/^}/p' "$_pdgsh")"
 grep -qE 'udp dport 41641' <<<"$_show_body" \
   && bad "_ssh_source_show 仍按 41641 认放行" || ok "_ssh_source_show 不按端口号认"
@@ -156,7 +156,7 @@ echo "══ 9. 端口解析只有一份实现(不许 shell 里再造一个)═�
 # checks.py 的 _tailscaled_port 是唯一真源: EnvironmentFile 的覆盖语义、引号、范围校验
 # 都在那儿写好了。shell 里再写一遍正则, 两份迟早对不上 —— 而对不上的表现是防火墙放行了
 # 一个没人监听的端口, 不会有任何报错。
-_probe_body="$(sed -n "/^_ssh_ts_probe()/,/^}/p" "$ROOT/deploy/bot/pdg.sh")"
+_probe_body="$(sed -n "/^_ssh_ts_probe()/,/^}/p" "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")")"
 grep -q '_tailscaled_port' <<<"$_probe_body" \
   && ok "_ssh_ts_probe 复用 checks.py 的 _tailscaled_port" \
   || bad "_ssh_ts_probe 没有复用 checks.py 的解析器(或函数不存在)"
@@ -164,7 +164,7 @@ grep -q '_tailscaled_port' <<<"$_probe_body" \
 # 范围只取 `_ssh_ts_*` 三个函数体: 全文扫会扫到 PDG_RESCUE_PORT 之类完全无关的行(第一版
 # 就是这么误报的), 那种红灯除了让人学会忽略它以外没有别的作用。
 _ts_bodies="$(sed -n '/^_ssh_ts_probe()/,/^}/p;/^_ssh_ts_port()/,/^}/p;/^_ssh_ts_why()/,/^}/p' \
-              "$ROOT/deploy/bot/pdg.sh")"
+              "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")")"
 [[ -n "$_ts_bodies" ]] && ok "抽得到 _ssh_ts_* 函数体" || bad "抽不到 _ssh_ts_* 函数体, 这一格不作数"
 _shellparse="$(grep -nE '(grep|sed|awk|cut)[^#]*PORT' <<<"$_ts_bodies" | grep -vE '^[0-9]+:[[:space:]]*#' || true)"
 [[ -z "$_shellparse" ]] \

@@ -185,9 +185,9 @@ xv_wait_listeners 3 >/dev/null 2>&1
 
 echo
 echo "══ 源码判据: 恢复闭包里必须有 reset-failed ══"
-_rp="$(sed -n '/^_core_restore_prev(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh")"
-_sv="$(sed -n '/^_core_swap_verify(){/,/^}/p'  "$ROOT/deploy/bot/pdg.sh")"
-_rc="$(sed -n '/^_core_restart_clean(){/,/^}/p' "$ROOT/deploy/bot/pdg.sh")"
+_rp="$(sed -n '/^_core_restore_prev(){/,/^}/p' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")")"
+_sv="$(sed -n '/^_core_swap_verify(){/,/^}/p'  "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")")"
+_rc="$(sed -n '/^_core_restart_clean(){/,/^}/p' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")")"
 [[ -n "$_rc" ]] && ok "有共用的 _core_restart_clean" || bad "没有 _core_restart_clean"
 _i_reset="$(grep -n 'reset-failed' <<<"$_rc" | head -1 | cut -d: -f1)"
 _i_restart="$(grep -n 'systemctl restart' <<<"$_rc" | head -1 | cut -d: -f1)"

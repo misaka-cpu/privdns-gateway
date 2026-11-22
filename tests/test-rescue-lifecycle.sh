@@ -121,12 +121,12 @@ N
             _rescue_rotate cmd_rescue _rescue_enable _rescue_disable _rescue_status \
             _nft_apply_main _lan_nft_reapply \
             migrate_rescue_plane; do
-    sed -n "/^${fn}(){/,/^}/p" "$ROOT/deploy/bot/pdg.sh"
+    sed -n "/^${fn}(){/,/^}/p" "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")"
   done
   # 常量也要跟着抽: _lan_nft_reapply 现在从 $LAN_NFT_CONF 读路径(以前写死在函数体里, 被
   # 下面那条 sed 顺手改掉了)。`set -u` 下漏一个就是 unbound variable, 而它半途死掉的表现
   # 与"漏抽函数"一模一样 —— 报出来的是"防火墙放行失败", 看起来像救援平面自己的缺陷。
-  grep -E '^LAN_NFT_CONF=' "$ROOT/deploy/bot/pdg.sh"
+  grep -E '^LAN_NFT_CONF=' "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")"
 } > "$WORK/fns.sh"
 
   # _nft_apply_main / _lan_nft_reapply: 救援平面的放行走它们(主规则加载完顺带把内网面板的
@@ -882,7 +882,7 @@ echo; echo "── 16c. CLI 参数传递 ──"
 # 而 `pdg rescue rotate cert` 更糟 —— 参数丢了以后默认成 token, 用户要求换证书, 实际换的
 # 是 token(会话全断、指纹却没变)。这里跑**真正的 pdg.sh 分发行**, 只把 cmd_rescue 换成回显。
 DISP="$WORK/disp.sh"
-python3 - "$ROOT/deploy/bot/pdg.sh" "$DISP" <<'PY'
+python3 - "$(bash "$ROOT/tests/pdg-source-lib.sh" path "$ROOT")" "$DISP" <<'PY'
 import sys
 src, dst = sys.argv[1], sys.argv[2]
 t = open(src, encoding="utf-8").read()
