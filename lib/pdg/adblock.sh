@@ -345,6 +345,7 @@ cmd_adblock(){
       if ! flock -n 9; then
         echo '{"result":"ADBLOCK_BUSY","changed":0}'; return 1
       fi
+      # shellcheck disable=SC2034  # PDG_LOCKED 由入口(deploy/bot/pdg.sh)的 _lock 读; 段与入口分成两个文件后, ShellCheck 单看这一段看不到那次读
       PDG_LOCKED=1
       _adblock_ensure_files || { echo '{"result":"apply_failed_rolled_back","changed":0}'; return 1; }
       local _src_bak; _src_bak="$(mktemp)" || return 1
@@ -423,6 +424,7 @@ except Exception: print(0)')"
       if ! { exec 9>"$LOCK"; } 2>/dev/null || ! flock -n 9; then
         _adb_emit ADBLOCK_BUSY none; return 1
       fi
+      # shellcheck disable=SC2034  # PDG_LOCKED 由入口(deploy/bot/pdg.sh)的 _lock 读; 段与入口分成两个文件后, ShellCheck 单看这一段看不到那次读
       PDG_LOCKED=1
       _adblock_ensure_files || { _adb_emit apply_failed_rolled_back none; return 1; }
       local mod; mod="$(_pdg_module adblock.py)" || { _adb_emit apply_failed_rolled_back none; return 1; }

@@ -75,6 +75,7 @@ def run_suites(wd):
 BUSY = '''      if ! { exec 9>"$LOCK"; } 2>/dev/null || ! flock -n 9; then
         _adb_emit ADBLOCK_BUSY none; return 1
       fi
+      # shellcheck disable=SC2034  # PDG_LOCKED 由入口(deploy/bot/pdg.sh)的 _lock 读; 段与入口分成两个文件后, ShellCheck 单看这一段看不到那次读
       PDG_LOCKED=1'''
 
 MUT = [
