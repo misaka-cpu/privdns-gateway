@@ -300,6 +300,32 @@ bash uninstall.sh --purge
       两种基线各要一台机器才算都核过; 只核了一种时, 另一种记"未取得"。
 - [ ] 卸载后重启一次, 再核: systemd-resolved 的启用 / 运行状态仍与基线相同、`/etc/resolv.conf` 是链接时目标存在、`getent hosts example.com` 成功。
 
+## ⑤′ 同一台机器卸两次(v1.13.1 起的每个发布; 每个发布做一次)
+
+在全新安装那一轮(装的是本发布)里, 把⑤的一次 purge 换成: 先非 purge、再 purge, 两次之间不重装。
+装机前的 DNS 基线照 ① 记。两次都用 README 写的命令。
+不适用的记"不适用": 装着的 uninstall.sh 早于 v1.13.1 的(例如被拒回滚后停在旧版的那一轮);
+装着的是 v1.14.0 的(它的非 purge 卸载会删掉 pdg 的段, 第二次走不通, 见 v1.14.0 Release 的已知问题)。
+
+第一次: `sudo pdg uninstall`
+- [ ] 退出码 0; 输出里没有 ⚠️ 行, 也没有「DNS: 没有本项目留下的改动」那一行。
+- [ ] 服务全 disable + 删(清单同 ⑤); 防火墙表 inet pdg 不在。
+- [ ] 非 purge 该留的都在: /etc/privdns-gateway、/etc/mihomo、/opt/privdns-gateway、/usr/local/bin/pdg。
+- [ ] /opt/pdg-bot 里的程序文件(.py / .sh / .tmpl)只剩 pdg 的段 `pdg-<段>.sh`(`lib/modules.sh` 里源路径在 `lib/pdg/` 下的那几行),
+      与装机时逐字节相同、mode 644; 卸载输出里有一行「保留: /opt/pdg-bot 下 <这些段> —— pdg 命令拆出去的段, …」,
+      「不在上述清单内」那一行(如果有)里没有它们。
+- [ ] `pdg status` 不停在「缺少拆出去的一段」(退出码不判)。
+- [ ] DNS 按装机前还原(子项同 ⑤ 的 DNS 那一条)。
+- [ ] 记下这时 systemd-resolved 的 `InvocationID` 与 `ActiveEnterTimestamp`。
+
+第二次: `sudo pdg uninstall --purge`
+- [ ] 退出码 0; 与同一发布一次 purge 的输出相比, 只多出一行
+      「DNS: 没有本项目留下的改动(没有装机备份, /etc/resolv.conf 也不是本项目写的), resolv.conf 与 systemd-resolved 都没动。」, 没有 ⚠️ 行。
+- [ ] ⑤ 的服务与 `--purge` 路径两条都成立; /usr/local/bin/pdg、/opt/pdg-bot(连同段)、/opt/privdns-gateway 都删掉。
+- [ ] DNS 仍与基线相同(子项同 ⑤), 中间没有手工重启 resolved、没有手工改 /etc/resolv.conf。
+- [ ] systemd-resolved 的 `InvocationID` 与 `ActiveEnterTimestamp` 与第一次卸完时相同(第二次卸载没有重启它)。
+- [ ] 卸载后重启一次, 再核(同 ⑤ 最后一条)。
+
 ---
 
 ## 打 tag / 发布(路线: 先桥接后退役)
