@@ -97,6 +97,31 @@ rm -f "$T/lib/pdg/adblock.sh"
 rc="$(run_entry __probe)"
 [[ "$rc" == 1 ]] && grep -q '缺少拆出去的一段「adblock」' "$WORK/err" && ! grep -q '^用法' "$WORK/out" \
   && ok "段缺: 返回 1、提示缺段、没进分派" || bad "段缺: rc=$rc / out=$(head -c 60 "$WORK/out") / err=$(head -c 120 "$WORK/err")"
+rc="$(run_entry status)"
+[[ "$rc" == 1 ]] && grep -q '缺少拆出去的一段「adblock」' "$WORK/err" && [[ ! -s "$WORK/out" ]] \
+  && ok "段缺时 status 照旧停在缺段提示上(只有卸载提前分派)" || bad "段缺时 status: rc=$rc / out=$(head -c 60 "$WORK/out") / err=$(head -c 120 "$WORK/err")"
+# 卸载不靠段: 段缺时 uninstall / uninstall --purge / rm 照样走到 cmd_uninstall。测试不是 root 时,
+# cmd_uninstall 第一步 need_root 就停在「请用 root: sudo pdg uninstall」—— 这正好证明走到了, 也不会
+# 真去跑 /opt/privdns-gateway/uninstall.sh。root 下这几格会真的卸载本机, 所以只在非 root 时跑。
+if [[ "$(id -u)" != 0 ]]; then
+  for argv in "uninstall" "uninstall --purge" "rm"; do
+    read -ra a <<<"$argv"
+    rc="$(run_entry "${a[@]}")"
+    [[ "$rc" == 1 && "$(cat "$WORK/out")" == "请用 root: sudo pdg uninstall" ]] && ! grep -q '缺少拆出去的一段' "$WORK/err" \
+      && ok "段缺时 pdg $argv 照样走到卸载(停在要 root 那一步, 没有缺段提示)" \
+      || bad "段缺时 pdg $argv: rc=$rc / out=$(head -c 80 "$WORK/out") / err=$(head -c 120 "$WORK/err")"
+  done
+else
+  echo "[NOTE] 以 root 运行: 段缺时的 uninstall 那几格会真的卸载本机, 不跑"
+fi
+early_re='^case "\$\{1:-\}" in uninstall\|rm\) '
+n_early="$(grep -cE "$early_re" "$ENTRY")"
+l_early="$(grep -nE "$early_re" "$ENTRY" | head -1 | cut -d: -f1)"
+l_mark="$(grep -n -m1 '^# @pdg-part ' "$ENTRY" | cut -d: -f1)"
+l_def="$(grep -n -m1 '^cmd_uninstall(){' "$ENTRY" | cut -d: -f1)"
+[[ "$n_early" == 1 && -n "$l_mark" && -n "$l_def" ]] && (( l_def < l_early && l_early < l_mark )) \
+  && ok "入口里提前分派卸载的那一行恰 1 处, 在 cmd_uninstall 定义之后、第一个段之前(第 $l_def < $l_early < $l_mark 行)" \
+  || bad "提前分派卸载的那一行: 共 ${n_early:-0} 处, 行号 定义=${l_def:-?} 分派=${l_early:-?} 第一个段=${l_mark:-?}"
 mid="$(grep -n '^cmd_adblock(){' "$WORK/adblock.good" | cut -d: -f1)"
 head -n "$((mid + 3))" "$WORK/adblock.good" > "$T/lib/pdg/adblock.sh"
 rc="$(run_entry __probe)"

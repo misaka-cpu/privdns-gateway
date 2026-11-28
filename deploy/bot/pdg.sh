@@ -2889,8 +2889,8 @@ _pdg_part(){
   _pdg_part_missing "$n" "$src" "$p"
   return 1
 }
-# 缺段时说清楚缺的是哪一段、在哪找的、怎么补。这时 pdg 的任何子命令都跑不起来(update / rollback
-# 也一样, 覆盖重装也要先跑 pdg snapshot), 所以给的修补办法必须不依赖 pdg 本身。
+# 缺段时说清楚缺的是哪一段、在哪找的、怎么补。这时除了 uninstall(在载入段之前分派), pdg 的子命令都跑不起来
+# (update / rollback 也一样, 覆盖重装也要先跑 pdg snapshot), 所以给的修补办法必须不依赖 pdg 本身。
 _pdg_part_missing(){
   local n="$1" src="$2" p="$3" why="不存在"
   if [[ -n "$p" && -e "$p" ]]; then
@@ -10163,6 +10163,13 @@ _lan_nft_reapply(){
   c_y "   跑 sudo systemctl restart pdg-lan 补上。"
   return 0
 }
+
+# 卸载在载入段之前分派。cmd_uninstall 只是转给受管仓库里的 uninstall.sh, 用不到段里的任何东西;
+# 而段一缺(手工删了、磁盘清理, 或 v1.14.0 的非 purge 卸载删了它), 下面载入段那一步就让 pdg 整个停下 ——
+# 缺段提示里说 update、rollback、覆盖重装都跑不起来, 卸载得是那条始终能走的路。只提前这一条:
+# 其它命令照旧在文件末尾的 case 里、段载入之后分派(那里的 uninstall|rm 留着, 用法与测试都认它)。
+# tests/test-cli-dispatch.py 抽这一行跑参数与退出码; tests/test-pdg-part-loader.sh 核它在第一个段之前、缺段时真能走到。
+case "${1:-}" in uninstall|rm) shift || true; cmd_uninstall "$@"; exit $?;; esac
 
 # @pdg-part adblock
 _pdg_part_f="$(_pdg_part adblock)" || exit 1

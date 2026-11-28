@@ -220,6 +220,52 @@ for t_mig, deny, want_rc, want_log, label in (
     else:
         bad("pdg __migrate: %s —— 实得退出 %d, 记录 %r, 输出 %r" % (label, rc, log, out[:200]))
 
+# ── 3c. 载入段之前的那一条卸载分派 ────────────────────────────────────────
+# 段一缺, 入口在载入段那一步就整个停下(v1.14.0 非 purge 卸载之后 `pdg uninstall --purge` 就是这样),
+# 所以 uninstall|rm 在第一个段之前提前分派(deploy/bot/pdg.sh 里单独一行)。这里把那一行抽出来跑:
+# 参数原样交出去、cmd_uninstall 的退出码原样带出、别的命令一律落到后面(不提前退出)。
+_EARLY = re.compile(r'^case "\$\{1:-\}" in (?P<pat>[^)]*)\) (?P<body>.*?);; esac$')
+_early = [l for l in SRC.split("\n") if _EARLY.match(l)]
+_un_arm = [a[0] for a in arms if a[2] == "cmd_uninstall"]
+if len(_early) == 1 and len(_un_arm) == 1:
+    _em = _EARLY.match(_early[0])
+    _names = [n.strip() for n in _em.group("pat").split("|")]
+    if sorted(_names) == sorted(_un_arm[0]) and 'cmd_uninstall "$@"' in _em.group("body"):
+        ok("3c 前提: 提前分派那一行恰 1 处, 认的名字与分发器里那条一样(%s), 目标是 cmd_uninstall" % "|".join(_names))
+    else:
+        bad("3c: 提前分派那一行与分发器里的卸载分支对不上: %r / %r" % (_names, _un_arm[0]))
+    EH = "\n".join([
+        "set -uo pipefail",
+        "_recv(){ local n=\"$1\"; shift; printf 'CALL %s' \"$n\"; "
+        "local a; for a in \"$@\"; do printf ' [%s]' \"$a\"; done; printf '\\n'; }",
+        "cmd_uninstall(){ _recv cmd_uninstall \"$@\"; return \"${T_RC:-0}\"; }",
+        _early[0],
+        "echo FELL_THROUGH",
+    ]) + "\n"
+    EPATH = os.path.join(_h, "early.sh")
+    open(EPATH, "w", encoding="utf-8").write(EH)
+
+    def early(*argv, t_rc=0):
+        r = subprocess.run(["bash", EPATH, *argv], capture_output=True, text=True, timeout=120,
+                           env=dict(os.environ, T_RC=str(t_rc)))
+        return r.returncode, ((r.stdout or "") + (r.stderr or "")).strip()
+
+    for argv, t_rc, want_rc, want_out, label in (
+            (("uninstall",) + PROBE, 0, 0, call("cmd_uninstall", *PROBE), "uninstall 带参数: 原样交出去, 不落到后面"),
+            (("rm", "--purge"), 0, 0, call("cmd_uninstall", "--purge"), "rm --purge"),
+            (("uninstall", "--purge"), 3, 3, call("cmd_uninstall", "--purge"), "cmd_uninstall 返回 3 ⇒ 入口退出码 3"),
+            (("status",), 0, 0, "FELL_THROUGH", "status 不提前分派"),
+            ((), 0, 0, "FELL_THROUGH", "无参数(菜单)不提前分派"),
+            (("uninstallx",), 0, 0, "FELL_THROUGH", "只认整词 uninstall"),
+    ):
+        rc, out = early(*argv, t_rc=t_rc)
+        if rc == want_rc and out == want_out:
+            ok("3c: %s" % label)
+        else:
+            bad("3c: %s —— 实得退出 %d, 输出 %r(应为 %d / %r)" % (label, rc, out[:160], want_rc, want_out))
+else:
+    bad("3c: 提前分派卸载的那一行 %d 处(应为 1), 分发器里的卸载分支 %d 条" % (len(_early), len(_un_arm)))
+
 # 报障原样复现: 目录 + git ref 两对参数都得到。
 _want = call("cmd_rollback", "--dir", "/var/lib/privdns-gateway/backups/2026-07-31-070000",
              "--git", "v1.7.3")
