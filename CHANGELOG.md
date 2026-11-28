@@ -2,6 +2,54 @@
 
 本项目按语义化 `v1.x` tag 正式发布;以下按版本/日期记录主要变化,完整提交见 git 历史。
 
+## 2026-11-28 — v1.14.1(非 purge 卸载之后, `pdg uninstall --purge` 与覆盖重装又能用了)
+
+**v1.14.0 的非 purge 卸载会删掉 pdg 拆出去的段, 留下的 pdg 从此什么命令都跑不起来; 本版让段跟入口一起留下, 并让卸载不再依赖段。**
+v1.14.0 的非 purge 卸载(`sudo pdg uninstall`)把段文件 `/opt/pdg-bot/pdg-adblock.sh` 当成普通运行模块删掉, 却留着入口 `/usr/local/bin/pdg`;
+入口在分派子命令之前就载入段, 于是之后 pdg 的任何命令都停在「缺少拆出去的一段」上, 包括 README 写的第二步 `sudo pdg uninstall --purge`(什么都不卸),
+以及 `PDG_FORCE_REINSTALL=1` 覆盖重装要先跑的 `pdg snapshot`。2026-11-27 在测试机上实测到, v1.14.0 的 Release 里记为已知问题。
+
+### 怎么升到这一版
+- 已在 v1.14.0: 普通 `pdg update`。内核钉值没变(mihomo v1.19.34), 运行模块表没有增减, 安装清单项数不变;
+  变的是入口 `/usr/local/bin/pdg`、运行模块 `/opt/pdg-bot/rescue.sh`, 以及受管仓库里的 `uninstall.sh`、`lib/modules.sh`、`lib/rescue.sh`。
+  新版的迁移按新提交重写安装清单(源码推断), 升完 `sudo pdg manifest verify` 应是「结论: 一致」。
+- 更早的版本: 升到本版的路径与 v1.14.0 的条目相同。
+- 修复在卸载那一刻起作用: 升到本版之后再卸载, 用的就是修好的入口与 `uninstall.sh`。
+
+### 已经在 v1.14.0 上做过非 purge 卸载的机器
+留下的是 v1.14.0 的入口, 本版修不到它。要清掉剩下的配置, 照 v1.14.0 Release 写的绕行: `sudo bash /opt/privdns-gateway/uninstall.sh --purge`
+(不经过 pdg; 测试机上实测过, 照常 purge、DNS 不再被改动)。
+
+### 修复
+- 非 purge 卸载不再删入口的段。段跟入口同进同出: 非 purge 留下 `/usr/local/bin/pdg`, 也留下 `/opt/pdg-bot/pdg-<段>.sh`; `--purge` 删整个 `/opt/pdg-bot` 时一起删。
+  非 purge 的卸载输出多一行「保留: /opt/pdg-bot 下 pdg-adblock.sh —— pdg 命令拆出去的段, 跟 /usr/local/bin/pdg 一起留着(--purge 时一起删)。」;
+  `--purge` 的输出与 v1.14.0 逐字相同。哪些文件算段, 从运行模块表里源路径在 `lib/pdg/` 下的那几行算, 不另立名单。
+  于是非 purge 之后 pdg 照常能跑, `sudo pdg uninstall --purge` 与 `PDG_FORCE_REINSTALL=1` 覆盖重装都走得通。
+- `pdg uninstall`(及别名 `pdg rm`)改在载入段之前分派: 段不管因为什么缺了(手工删、磁盘清理), 卸载都能走。
+  其它命令照旧在载入段之后分派, 缺段时照旧停下并给出修补命令; 缺段提示的文字没改。`docs/TROUBLESHOOTING-PLAYBOOK.md` 那一条改成"除了 `pdg uninstall`",
+  并加了 v1.14.0 上已做过非 purge 卸载时的写法。
+
+### 发版清单
+- `docs/RELEASE-CHECKLIST.md` 加 ⑤′「同一台机器卸两次」: 每个发布在全新安装那一轮, 把一次 purge 换成先 `sudo pdg uninstall`、再 `sudo pdg uninstall --purge`,
+  核卸载输出、非 purge 后留下的东西(含段)、`pdg status` 不停在缺段、DNS 还原且第二次没有重启 resolved, 卸后重启再核。v1.14.0 这一项记为不适用。
+
+### 已知限制与验证边界
+- 本版发布提交自己的标准 CI 与验收结果登记在包外发布记录里, 不写进本条目; 官方取件验证与正式机升级到本文定稿时未取得, 以本版的 Release 为准。
+- 隔离预验(修复提交上, 一台测试机、只 iOS、本地模型取件源)走过两轮:
+  - 全新安装 → 非 purge → `pdg uninstall --purge` → 重启(新清单 ⑤′ 整条);
+  - 全新安装 → 非 purge → `PDG_FORCE_REINSTALL=1` 覆盖重装 → 移走段 → `pdg uninstall --purge`(缺段时卸载照常)。
+
+  Android 只在本机的 e2e 里测过(e2e 的装机用 Android); 从 v1.14.0 升上来之后再卸载, 预验里没有测, 留给官方取件验证(以本版的 Release 为准)。
+- v1.14.0 条目说隔离预验走过「非 purge 卸载再 `--purge`」, 那一次第二步用的是 `bash /opt/privdns-gateway/uninstall.sh --purge`, 不经过 pdg, 所以没测到这个问题。
+- v1.14.0 条目里的其它已知限制不变(例如缺段时救援页里会调用 pdg 的那几项照样跑不起来)。
+
+### 测试 / CI
+- `test-file-sets.py`: 段 = 运行模块表里源路径在 `lib/pdg/` 下的行; 卸载清理删的模块 = 安装全集减去段, 别的成员不变。
+- `test-rescue-lifecycle.sh`: 真跑卸载清理, 段原样留下(内容与权限), 其它运行模块删净。
+- `e2e-install.sh` 第 9 节: 用装好的 pdg 走非 purge 卸载 → `pdg status` → 覆盖重装 → `pdg uninstall --purge`。
+- `test-pdg-part-loader.sh`: 缺段时 `uninstall` / `uninstall --purge` / `rm` 走到卸载、`status` 照旧停; 提前分派那一行在第一个段之前。
+- `test-cli-dispatch.py` 3c: 提前分派那一行原样转交参数、带出退出码、不提前接走别的命令。
+
 ## 2026-11-24 — v1.14.0(pdg.sh 拆出第一段: 去广告那一段搬进 `lib/pdg/adblock.sh`)
 
 **`pdg.sh` 开始按段拆分, 第一段是去广告(adblock)。** 入口脚本有一万一千多行; 这一版把去广告那 730 行原样搬进 `lib/pdg/adblock.sh`,
