@@ -123,8 +123,12 @@ pdg_rescue_protected(){ printf '%s\n' "$PDG_RESCUE_PROTECTED_MEMBERS"; }
 #
 # 模块部分**直接读 10a-1 的运行模块真源**(lib/modules.sh), 不在这里抄第二份 —— 抄的那份
 # 迟早漏掉新模块, 而漏掉的表现只是"卸载完还留着几个 .py", 没人会注意到。
+#
+# $1=--without-entry-parts: 不列入口的段(lib/modules.sh 的 pdg_entry_parts)。非 purge 卸载用:
+# 段跟入口同进同出, 入口 /usr/local/bin/pdg 留着, 段就得留着; --purge 删整个 /opt/pdg-bot 时一起走。
+# 不带参数时仍是安装全集。
 pdg_project_members(){
-  local mod="${PDG_MODULES_LIB:-}" d name
+  local mod="${PDG_MODULES_LIB:-}" d name parts=""
   if [[ -z "$mod" ]]; then
     for d in "$(dirname "${BASH_SOURCE[0]}")/modules.sh" /opt/privdns-gateway/lib/modules.sh; do
       [[ -f "$d" ]] && { mod="$d"; break; }
@@ -133,11 +137,13 @@ pdg_project_members(){
   [[ -n "$mod" && -f "$mod" ]] || return 1     # 读不到真源 → 返回 1, 让调用方报出来, 不猜
   # shellcheck source=lib/modules.sh
   source "$mod" || return 1
+  [[ "${1:-}" == --without-entry-parts ]] && parts=$'\n'"$(pdg_entry_parts)"$'\n'
   # 卸载不知道这台机器当初装的是哪个平台(profile.env 可能已经被删), 所以取**两个平台的
   # 并集** —— 多列几个本来就不存在的文件是无害的(删不存在的文件不算失败), 少列一个则会把
   # iOS 机器上的 MITM 组件永远留在盘上。
   while read -r _ name _; do
     [[ -n "$name" ]] || continue
+    [[ "$parts" == *$'\n'"$name"$'\n'* ]] && continue
     printf '%s/%s\n' "${PDG_RUNTIME_DIR#/}" "$name"
   done < <(pdg_platform_modules ios)
   # 旧版装过、现在不装的运行文件也要收走。
@@ -203,9 +209,10 @@ pdg_rescue_cleanup(){
     fi
   fi
 
-  # 3) 凭据、状态、unit、全部运行模块 —— 逐条删并逐条复核
+  # 3) 凭据、状态、unit、运行模块 —— 逐条删并逐条复核。入口的段不在这里删(见 pdg_project_members):
+  #    非 purge 卸载留下入口, 段跟着留; --purge 随后整个删 /opt/pdg-bot, 段一起走。
   local members
-  if members="$(pdg_project_members)"; then
+  if members="$(pdg_project_members --without-entry-parts)"; then
     while read -r m; do
       [[ -n "$m" ]] || continue
       target="$root/$m"

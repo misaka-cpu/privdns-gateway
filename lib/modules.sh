@@ -109,6 +109,19 @@ pdg_platform_modules(){
 # 旧版遗留的运行文件目标名(逐行)。
 pdg_legacy_modules(){ printf '%s\n' "$PDG_LEGACY_MODULES"; }
 
+# 入口 /usr/local/bin/pdg 拆出去的段(建议 4)的目标名, 逐行: 通用清单里源路径在 lib/pdg/ 下的那几行。
+# 段是入口的一部分, 跟入口同进同出。入口在分派子命令之前就载入段, 缺一段整个 pdg 都跑不起来;
+# 所以非 purge 卸载留下入口, 也就得留下段 —— v1.14.0 的非 purge 卸载删了段, 之后
+# `pdg uninstall --purge` 停在缺段提示上, 什么都没卸。--purge 删整个 /opt/pdg-bot 时它们跟入口一起走。
+# 从上面那份清单算, 不另抄名单: 新拆一段只要在清单里登记一行。
+pdg_entry_parts(){
+  local src name _
+  while read -r src name _; do
+    [[ -n "$name" && "$src" == lib/pdg/* ]] && printf '%s\n' "$name"
+  done <<< "$PDG_RUNTIME_MODULES"
+  return 0
+}
+
 # 把清单里的模块装到目标目录。$1=仓库根, $2=目标目录(默认 /opt/pdg-bot)。
 # 任一项失败即返回非 0 —— 调用方据此走各自的回滚, 绝不留新旧混装。
 # $3=平台(默认取 $PDG_PLATFORM)。install 与 update 传同一个值, 于是同步范围必然一致。

@@ -143,10 +143,32 @@ un_set = {m.split("/", 2)[-1] for m in members if m.startswith("opt/pdg-bot/")}
 legacy = set(sh(SRC + "pdg_legacy_modules"))
 static = set(ios)
 if un_set == static | legacy:
-    ok("uninstall 删除集 = 静态全集(%d) + 旧版遗留(%d)" % (len(static), len(legacy)))
+    ok("安装全集里的模块 = 静态全集(%d) + 旧版遗留(%d)" % (len(static), len(legacy)))
 else:
     bad("卸载集与静态集对不上 少=%s 多=%s"
         % (sorted(static - un_set), sorted(un_set - static - legacy)))
+
+# 卸载清理(pdg_rescue_cleanup)真正删的那一份: 安装全集去掉入口的段。段跟入口同进同出 ——
+# 非 purge 卸载留下 /usr/local/bin/pdg, 也得留下段(入口在分派之前载入它们, v1.14.0 删了段之后
+# `pdg uninstall --purge` 就停在缺段提示上); --purge 整个删 /opt/pdg-bot 时它们一起走。
+parts = set(sh(SRC + "pdg_entry_parts"))
+want_parts = {r[1] for r in rows if r[0].startswith("lib/pdg/")}
+if want_parts and parts == want_parts:
+    ok("入口的段 = 清单里源路径在 lib/pdg/ 下的 %d 行(%s)" % (len(parts), "、".join(sorted(parts))))
+else:
+    bad("入口的段对不上: pdg_entry_parts=%s, 清单里 lib/pdg/ 行=%s" % (sorted(parts), sorted(want_parts)))
+np_members = sh("source lib/rescue.sh; PDG_MODULES_LIB=lib/modules.sh pdg_project_members --without-entry-parts")
+np_set = {m.split("/", 2)[-1] for m in np_members if m.startswith("opt/pdg-bot/")}
+if np_set and np_set == (static | legacy) - want_parts:
+    ok("卸载清理删的模块 = 安装全集 - 入口的段(%d = %d - %d)" % (len(np_set), len(un_set), len(want_parts)))
+else:
+    bad("卸载清理的模块集不对: 多=%s 少=%s"
+        % (sorted(np_set - ((static | legacy) - want_parts)), sorted(((static | legacy) - want_parts) - np_set)))
+_other = lambda ms: sorted(m for m in ms if not m.startswith("opt/pdg-bot/"))
+if _other(members) and _other(np_members) == _other(members):
+    ok("救援 unit / 凭据 / 状态两份里一样(%d 项), 只差入口的段" % len(_other(members)))
+else:
+    bad("去掉入口的段时连别的成员也变了: %r / %r" % (_other(members), _other(np_members)))
 
 print("\n== 5. 用户数据/运行状态/缓存不得混进静态集 ==")
 NOT_STATIC = {"rulesets.json": "用户持久数据", "dot-domain": "用户持久数据",

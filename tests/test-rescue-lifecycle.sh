@@ -407,15 +407,32 @@ if grep -q 'table inet mine' "$UBOX/etc/nftables.conf" \
    && grep -q 'comment "my own"' "$UBOX/etc/nftables.conf"; then
   ok "用户自己写的同端口规则**原样保留**(按标记精确删, 不按端口删行)"
 else bad "卸载把用户自己的同端口规则删掉了"; fi
-# 装的模块要一个不剩地收走 —— 清单读 10a-1 真源, 不在测试里另抄一份
+# 装的模块要一个不剩地收走 —— 清单读 10a-1 真源, 不在测试里另抄一份。
+# 入口的段例外(lib/modules.sh 的 pdg_entry_parts): 段跟入口同进同出, 非 purge 卸载留下
+# /usr/local/bin/pdg, 也得留下段, 否则留下的 pdg 在载入段那一步就停下, 连 `pdg uninstall --purge`
+# 都跑不起来(v1.14.0 实测)。--purge 随后整个删 /opt/pdg-bot, 段跟着走 —— 那一步不在这个函数里。
+PARTS="$(bash -c "source '$ROOT/lib/modules.sh'; pdg_entry_parts")"
 gone_miss=()
 while read -r _ name _; do
   [[ -n "$name" ]] || continue
+  [[ $'\n'"$PARTS"$'\n' == *$'\n'"$name"$'\n'* ]] && continue
   [[ -e "$UBOX/opt/pdg-bot/$name" ]] && gone_miss+=("$name")
 done < <(bash -c "source '$ROOT/lib/modules.sh'; pdg_runtime_modules")
 if ((${#gone_miss[@]}==0)); then
-  ok "真源里的运行模块**逐项**删净(含 pdgtx/checks 等业务模块, 不只救援那几个)"
+  ok "真源里除入口的段以外的运行模块**逐项**删净(含 pdgtx/checks 等业务模块, 不只救援那几个)"
 else bad "这些模块没删掉: ${gone_miss[*]}"; fi
+n_parts=0; parts_bad=()
+while read -r name; do
+  [[ -n "$name" ]] || continue
+  n_parts=$((n_parts+1))
+  if [[ -f "$UBOX/opt/pdg-bot/$name" && -f "$BOX/opt/pdg-bot/$name" ]] \
+     && cmp -s "$BOX/opt/pdg-bot/$name" "$UBOX/opt/pdg-bot/$name" \
+     && [[ "$(stat -c %a "$UBOX/opt/pdg-bot/$name")" == "$(stat -c %a "$BOX/opt/pdg-bot/$name")" ]]; then :
+  else parts_bad+=("$name"); fi
+done <<< "$PARTS"
+if (( n_parts >= 1 && ${#parts_bad[@]} == 0 )); then
+  ok "入口的 $n_parts 个段原样留下(内容与权限都没变): 入口留着, 段跟着留"
+else bad "入口的段(共 $n_parts 个)没留下或被改了: ${parts_bad[*]:-(一个段都没列出来)}"; fi
 # 但用户自己放进来的东西一个字节都不许动
 if [[ -e "$UBOX/opt/pdg-bot/my-hook.sh" && "$(cat "$UBOX/opt/pdg-bot/my-hook.sh")" == "USERFILE" ]]; then
   ok "用户自己放在 /opt/pdg-bot 的文件原样保留(只删我们装的那些)"

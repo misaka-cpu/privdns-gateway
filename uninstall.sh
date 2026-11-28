@@ -269,8 +269,20 @@ echo "已删除: /opt/pdg-bot 下的事务与救援运行模块(清单见 lib/mo
 # 说"全部"是不准的: install.sh 另有一路把 Bot 本体(bot.py)、MITM 组件、探测脚本等装进同一个
 # 目录, 它们不在那份清单里, 卸载也不会删。`.200` 实测卸载完那里还剩 10 个项目程序文件, 而
 # 文案说的是"全部运行模块" —— 用户据此以为盘上干净了, 其实没有。这里如实列出剩了什么。
+# 入口 pdg 的段(lib/modules.sh 的 pdg_entry_parts)在清单里, 是有意留下的(见 pdg_project_members):
+# 单独一行说清楚, 不混进"不在上述清单内"那一行。--purge 随后整个删 /opt/pdg-bot, 那时不说。
+_UN_PARTS=""
+# shellcheck source=lib/modules.sh
+[[ -f "$_UN_HERE/lib/modules.sh" ]] && _UN_PARTS="$(source "$_UN_HERE/lib/modules.sh" && pdg_entry_parts)"
 if [[ -d /opt/pdg-bot ]]; then
-  _left="$(find /opt/pdg-bot -maxdepth 1 -type f \( -name '*.py' -o -name '*.sh' -o -name '*.tmpl' \) -printf '%f ' 2>/dev/null)"
+  _left=""; _kept_parts=""
+  while read -r _f; do
+    [[ -n "$_f" ]] || continue
+    if [[ $'\n'"$_UN_PARTS"$'\n' == *$'\n'"$_f"$'\n'* ]]; then _kept_parts="$_kept_parts$_f "; else _left="$_left$_f "; fi
+  done < <(find /opt/pdg-bot -maxdepth 1 -type f \( -name '*.py' -o -name '*.sh' -o -name '*.tmpl' \) -printf '%f\n' 2>/dev/null)
+  if [[ -n "$_kept_parts" && "${1:-}" != "--purge" ]]; then
+    echo "保留: /opt/pdg-bot 下 $_kept_parts—— pdg 命令拆出去的段, 跟 /usr/local/bin/pdg 一起留着(--purge 时一起删)。"
+  fi
   if [[ -n "$_left" ]]; then
     echo "保留(不在上述清单内, 需要清干净请用 --purge): /opt/pdg-bot 下 $_left"
   fi

@@ -376,4 +376,53 @@ else
   echo "[SKIP] 本环境不允许 bind mount, 跳过卸载 resolv.conf 用例"
 fi
 
+# ══ 9. 非 purge 卸载之后: pdg 还能跑, 能覆盖重装, 能再 --purge ═══════════════
+# v1.14.0 的非 purge 卸载按运行模块表删掉了入口的段(/opt/pdg-bot/pdg-adblock.sh), 却留着入口
+# /usr/local/bin/pdg。入口在分派之前载入段, 于是之后 README 写的 `sudo pdg uninstall --purge` 停在
+# 缺段提示上, 什么都没卸(测试机实测); PDG_FORCE_REINSTALL=1 覆盖重装要先跑 `pdg snapshot`, 同样走不通。
+# 这一节全走装好的 /usr/local/bin/pdg(用户手里的那个), 不走仓库里的 uninstall.sh。
+echo; echo "── 9. 非 purge 卸载之后再用 pdg ──"
+reset_box; e2e_stub_system
+out=$(run_install ""); rc=$?
+[[ "$rc" == 0 ]] || bad "9: 准备现场的安装失败 rc=$rc: $(tail -4 <<<"$out")"
+# shellcheck source=lib/modules.sh
+parts="$(source "$E2E_ROOT/lib/modules.sh" && pdg_entry_parts)"
+parts_a=()
+[[ -n "$parts" ]] && mapfile -t parts_a <<<"$parts"
+if ((${#parts_a[@]})); then ok "9 前提: 清单里有入口的段(${parts_a[*]})"
+else bad "9 前提: 清单里一个段都没有, 下面的判据会空转"; fi
+declare -A part_sha=()
+for p in "${parts_a[@]}"; do
+  part_sha[$p]="$(sha256sum "/opt/pdg-bot/$p" 2>/dev/null | cut -d' ' -f1)"
+  [[ -n "${part_sha[$p]}" ]] || bad "9 前提: 装完没有 /opt/pdg-bot/$p"
+done
+out=$(/usr/local/bin/pdg uninstall 2>&1); rc=$?
+echo "  (非 purge 卸载 rc=$rc)"
+grep -F '⚠️' <<<"$out" | head -3 | sed 's/^/    /'   # rc 非 0 的原因(本节不判 rc, 只判结果)
+[[ -x /usr/local/bin/pdg && -f /opt/privdns-gateway/uninstall.sh ]] \
+  && ok "9a: 非 purge 卸载留下入口与受管仓库" || bad "9a: 入口或受管仓库没了"
+_pk=1
+for p in "${parts_a[@]}"; do
+  [[ "$(sha256sum "/opt/pdg-bot/$p" 2>/dev/null | cut -d' ' -f1)" == "${part_sha[$p]}" ]] || { _pk=0; bad "9b: 段 $p 没留下或被改了"; }
+  grep -qF "保留: /opt/pdg-bot 下 " <<<"$out" && grep -F "保留: /opt/pdg-bot 下 " <<<"$out" | grep -qF "$p" \
+    || { _pk=0; bad "9c: 卸载输出没说段 $p 跟入口一起留着: $(tail -4 <<<"$out")"; }
+  grep -F "不在上述清单内" <<<"$out" | grep -qF "$p" && { _pk=0; bad "9c: 段 $p 被说成不在清单内"; }
+done
+(( _pk == 1 )) && ok "9b/9c: 段原样留下, 卸载输出单独一行说它跟入口一起留着(不算在清单外)"
+out=$(/usr/local/bin/pdg status 2>&1)
+grep -q '缺少拆出去的一段' <<<"$out" && bad "9d: 非 purge 之后 pdg status 停在缺段: $(head -2 <<<"$out")" \
+  || ok "9d: 非 purge 之后 pdg status 不再停在缺段提示上"
+out=$(run_install "PDG_FORCE_REINSTALL=1"); rc=$?
+[[ "$rc" == 0 ]] && ok "9e: 非 purge 之后 PDG_FORCE_REINSTALL=1 覆盖重装成功(先跑的 pdg snapshot 走得通)" \
+  || bad "9e: 覆盖重装失败 rc=$rc: $(grep -m1 -E '快照失败|缺少拆出去' <<<"$out" || tail -4 <<<"$out")"
+/usr/local/bin/pdg uninstall >/dev/null 2>&1
+out=$(/usr/local/bin/pdg uninstall --purge 2>&1); rc=$?
+echo "  (第二次卸载 --purge rc=$rc)"
+grep -F '⚠️' <<<"$out" | head -3 | sed 's/^/    /'   # rc 非 0 的原因(本节不判 rc, 只判结果)
+grep -q '缺少拆出去的一段' <<<"$out" && bad "9f: pdg uninstall --purge 停在缺段: $(head -2 <<<"$out")" \
+  || ok "9f: 非 purge 之后 pdg uninstall --purge 不再停在缺段提示上"
+grep -q '^已 purge' <<<"$out" && [[ ! -e /usr/local/bin/pdg && ! -e /opt/pdg-bot && ! -e /opt/privdns-gateway ]] \
+  && ok "9g: 已 purge: 入口、/opt/pdg-bot(连同段)与受管仓库都删了" \
+  || bad "9g: 没 purge 干净: $(tail -3 <<<"$out") / $(ls -d /usr/local/bin/pdg /opt/pdg-bot /opt/privdns-gateway 2>/dev/null | tr '\n' ' ')"
+
 e2e_summary
